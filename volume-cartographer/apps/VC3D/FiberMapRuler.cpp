@@ -7,6 +7,7 @@
 #include <QGraphicsView>
 #include <QPainter>
 #include <QPen>
+#include <QTransform>
 
 #include <algorithm>
 #include <cmath>
@@ -36,8 +37,9 @@ constexpr double kMinWindingTickSpacingPx = 6.0;
 // Distance ticks carry longer labels, and a ladder step is at least this far
 // apart on screen at the tightest point of the visible range.
 constexpr double kMinDistanceTickSpacingPx = 72.0;
-// Cap on the ticks one paint may draw; the ladder keeps the count far below
-// this, it exists so a pathological transform can never spin.
+// Cap on the tick steps one paint may walk (two ticks each, major and
+// minor); the ladder keeps the count far below this, it exists so a
+// pathological transform can never spin.
 constexpr int kMaxTicksPerPaint = 2000;
 constexpr double kTwoPi = 2.0 * M_PI;
 
@@ -74,6 +76,25 @@ DistanceTicks chooseDistanceTicks(double minStepVx, const std::optional<double>&
     ticks.caption = QStringLiteral("vx");
     ticks.label = [](double valueVx) { return formatVoxels(valueVx); };
     return ticks;
+}
+
+// The inclusive range of tick indices k (tick at k * step) covering
+// [low, high] with one spare on each side, or nullopt when the range is not
+// finite or would exceed kMaxTicksPerPaint - decided in floating point, before
+// anything is narrowed to an integer.
+std::optional<std::pair<long long, long long>> tickIndexRange(double low, double high,
+                                                              double step)
+{
+    if (!(step > 0.0) || !std::isfinite(low) || !std::isfinite(high) || !(high >= low)) {
+        return std::nullopt;
+    }
+    const double first = std::ceil(low / step) - 1.0;
+    const double last = std::floor(high / step) + 1.0;
+    if (!std::isfinite(first) || !std::isfinite(last) || last - first > kMaxTicksPerPaint ||
+        std::abs(first) > 1e15 || std::abs(last) > 1e15) {
+        return std::nullopt;
+    }
+    return std::make_pair(static_cast<long long>(first), static_cast<long long>(last));
 }
 
 } // namespace
@@ -118,7 +139,7 @@ QString FiberMapRuler::toolTipText() const
             : tr("Height above the volume floor, in voxels (the package has no "
                  "voxel size).");
     case Mode::SheetDistance: {
-        QString text = tr("Distance along the sheet from winding 0.");
+        QString text = tr("Estimated distance along the sheet from winding 0.");
         if (_model.hasLayout && _model.sheet.pitchVx > 0.0) {
             const QString pitch = _model.voxelSizeUm
                 ? tr("%1 mm").arg(_model.sheet.pitchVx * *_model.voxelSizeUm / 1000.0, 0,
@@ -131,8 +152,8 @@ QString FiberMapRuler::toolTipText() const
                         .arg(pitch);
         } else if (_model.hasLayout) {
             text += QLatin1Char('\n') +
-                    tr("Measured at the reference radius: the placed fibers span too "
-                       "little winding to fit a pitch.");
+                    tr("Measured at the reference radius: no usable increasing-radius "
+                       "fit was available for the placed fibers.");
         }
         if (!_model.voxelSizeUm) {
             text += QLatin1Char('\n') + tr("In voxels: the package has no voxel size.");
@@ -149,37 +170,57 @@ QRect FiberMapRuler::bandRect(const QRect& viewport) const
         return QRect();
     }
     const int thickness = thicknessFor(_edge);
-    // The extent's four edges in viewport pixels; the band runs along the
-    // extent, cut to the viewport, and rests against its edge, clamped so
-    // the band never leaves the viewport.
-    const int ceiling = _view->mapFromScene(QPointF(0.0, _model.extentTopSceneY)).y();
-    const int floor = _view->mapFromScene(QPointF(0.0, _model.extentBottomSceneY)).y();
-    const int leftEdge = _view->mapFromScene(QPointF(_model.extentLeftSceneX, 0.0)).x();
-    const int rightEdge = _view->mapFromScene(QPointF(_model.extentRightSceneX, 0.0)).x();
-    const int runLeft = std::max(std::min(leftEdge, rightEdge), viewport.left());
-    const int runRight = std::min(std::max(leftEdge, rightEdge), viewport.right() + 1);
-    const int runTop = std::max(std::min(ceiling, floor), viewport.top());
-    const int runBottom = std::min(std::max(ceiling, floor), viewport.bottom() + 1);
+    // A viewport thinner than the band has no room for it.
+    if ((_edge == Edge::Left ? viewport.width() : viewport.height()) < thickness) {
+        return QRect();
+    }
+    // The extent's four edges in viewport pixels, kept floating-point until
+    // clipped to the viewport: far enough zoomed in, an off-screen edge lies
+    // beyond what an int can hold. The band runs along the extent, cut to
+    // the viewport, and rests against its edge, clamped so the band never
+    // leaves the viewport.
+    const QTransform toViewport = _view->viewportTransform();
+    const auto clipped = [](double value, int low, int high) {
+        if (!std::isfinite(value)) {
+            return low;
+        }
+        return static_cast<int>(std::lround(std::clamp<double>(value, low, high)));
+    };
+    const double ceilingF = toViewport.map(QPointF(0.0, _model.extentTopSceneY)).y();
+    const double floorF = toViewport.map(QPointF(0.0, _model.extentBottomSceneY)).y();
+    const double leftF = toViewport.map(QPointF(_model.extentLeftSceneX, 0.0)).x();
+    const double rightF = toViewport.map(QPointF(_model.extentRightSceneX, 0.0)).x();
+    if (!std::isfinite(ceilingF) || !std::isfinite(floorF) || !std::isfinite(leftF) ||
+        !std::isfinite(rightF)) {
+        return QRect();
+    }
+    // One past the viewport's far edge, so a run may reach the last pixel.
+    const int farRight = viewport.right() + 1;
+    const int farBottom = viewport.bottom() + 1;
+    const int runLeft = clipped(std::min(leftF, rightF), viewport.left(), farRight);
+    const int runRight = clipped(std::max(leftF, rightF), viewport.left(), farRight);
+    const int runTop = clipped(std::min(ceilingF, floorF), viewport.top(), farBottom);
+    const int runBottom = clipped(std::max(ceilingF, floorF), viewport.top(), farBottom);
     switch (_edge) {
     case Edge::Top: {
         if (runRight <= runLeft) {
             return QRect();
         }
-        const int bottom = std::clamp(ceiling, viewport.top() + thickness, viewport.bottom() + 1);
+        const int bottom = clipped(ceilingF, viewport.top() + thickness, farBottom);
         return QRect(runLeft, bottom - thickness, runRight - runLeft, thickness);
     }
     case Edge::Bottom: {
         if (runRight <= runLeft) {
             return QRect();
         }
-        const int top = std::clamp(floor, viewport.top(), viewport.bottom() + 1 - thickness);
+        const int top = clipped(floorF, viewport.top(), farBottom - thickness);
         return QRect(runLeft, top, runRight - runLeft, thickness);
     }
     case Edge::Left: {
         if (runBottom <= runTop) {
             return QRect();
         }
-        const int right = std::clamp(leftEdge, viewport.left() + thickness, viewport.right() + 1);
+        const int right = clipped(leftF, viewport.left() + thickness, farRight);
         return QRect(right - thickness, runTop, thickness, runBottom - runTop);
     }
     }
@@ -193,6 +234,9 @@ void FiberMapRuler::paint(QPainter& painter, const QRect& viewport)
         return;
     }
     painter.save();
+    // Nothing paints past the band: labels near the run's ends and the
+    // caption are cut where the data ends rather than overhanging it.
+    painter.setClipRect(band);
     painter.setRenderHint(QPainter::TextAntialiasing, true);
     painter.setRenderHint(QPainter::Antialiasing, false);
     painter.setFont(_font);
@@ -229,6 +273,11 @@ QRect FiberMapRuler::paintCaption(QPainter& painter, const QRect& band, const QS
     }
     const QFontMetrics metrics(_font);
     const int textWidth = metrics.horizontalAdvance(caption) + 6;
+    // A band too short to hold its caption goes without one.
+    if ((_edge == Edge::Left ? metrics.height() + 2 : textWidth + 6) >
+        (_edge == Edge::Left ? band.height() : band.width())) {
+        return QRect();
+    }
     QRect rect;
     // The caption takes the band's full height so descenders are not cut by
     // the tick zone; it sits at the far end, and labels keep clear of it.
@@ -323,14 +372,13 @@ void FiberMapRuler::paintSheetDistance(QPainter& painter, const QRect& band)
 
     const double distanceLeft = vc3d::fiber_map::sheetDistanceVx(sheet, sceneLeft);
     const double distanceRight = vc3d::fiber_map::sheetDistanceVx(sheet, sceneRight);
-    const long long first = static_cast<long long>(std::ceil(distanceLeft / ticks.stepVx)) - 1;
-    const long long last = static_cast<long long>(std::floor(distanceRight / ticks.stepVx)) + 1;
-    if (last - first > kMaxTicksPerPaint) {
+    const auto range = tickIndexRange(distanceLeft, distanceRight, ticks.stepVx);
+    if (!range) {
         return;
     }
     const QFontMetrics metrics(_font);
     const int textTop = band.top() + kMajorTickPx + 1;
-    for (long long k = first; k <= last; ++k) {
+    for (long long k = range->first; k <= range->second; ++k) {
         for (int half = 0; half < 2; ++half) {
             const double distance = (static_cast<double>(k) + 0.5 * half) * ticks.stepVx;
             const double sceneX = vc3d::fiber_map::sheetXForDistanceVx(sheet, distance);
@@ -373,8 +421,8 @@ void FiberMapRuler::paintHeight(QPainter& painter, const QRect& band)
     if (!(zHigh > zLow)) {
         return;
     }
-    // A scroll is never metres tall: the height axis stays in centimetres
-    // however far out the view is.
+    // A scroll is never metres tall: the height axis never climbs past
+    // centimetres however far out the view is.
     const DistanceTicks ticks = chooseDistanceTicks(
         kMinDistanceTickSpacingPx / scale, _model.voxelSizeUm, LengthUnit::Centimetre);
     if (!(ticks.stepVx > 0.0)) {
@@ -382,15 +430,14 @@ void FiberMapRuler::paintHeight(QPainter& painter, const QRect& band)
     }
     const QRect caption = paintCaption(painter, band, ticks.caption);
 
-    const long long first = static_cast<long long>(std::ceil(zLow / ticks.stepVx)) - 1;
-    const long long last = static_cast<long long>(std::floor(zHigh / ticks.stepVx)) + 1;
-    if (last - first > kMaxTicksPerPaint) {
+    const auto range = tickIndexRange(zLow, zHigh, ticks.stepVx);
+    if (!range) {
         return;
     }
     const QFontMetrics metrics(_font);
     const int tickEnd = band.right() - 1;
     const int textRight = band.right() - kMajorTickPx - 3;
-    for (long long k = first; k <= last; ++k) {
+    for (long long k = range->first; k <= range->second; ++k) {
         for (int half = 0; half < 2; ++half) {
             const double z = (static_cast<double>(k) + 0.5 * half) * ticks.stepVx;
             const int y = _view->mapFromScene(QPointF(0.0, -z)).y();

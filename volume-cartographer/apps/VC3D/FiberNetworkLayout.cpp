@@ -481,6 +481,38 @@ void snapComponentOffsets(const std::vector<std::size_t>& component,
     }
 }
 
+// The point of a polyline nearest to `point`; `point` itself when the
+// polyline is empty, its single vertex when it has one.
+QPointF nearestPointOnPolyline(const std::vector<QPointF>& polyline, const QPointF& point)
+{
+    if (polyline.empty()) {
+        return point;
+    }
+    QPointF best = polyline.front();
+    double bestDistance = std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i + 1 < polyline.size(); ++i) {
+        const QPointF a = polyline[i];
+        const QPointF b = polyline[i + 1];
+        const QPointF ab = b - a;
+        const double length2 = QPointF::dotProduct(ab, ab);
+        double t = 0.0;
+        if (length2 > 0.0) {
+            t = std::clamp(QPointF::dotProduct(point - a, ab) / length2, 0.0, 1.0);
+        }
+        const QPointF candidate = a + t * ab;
+        const QPointF delta = point - candidate;
+        const double distance = QPointF::dotProduct(delta, delta);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            best = candidate;
+        }
+    }
+    if (polyline.size() == 1) {
+        return polyline.front();
+    }
+    return best;
+}
+
 // Unroll one fiber at x = (thetaScale * theta + offsetRad) * rRef, y = z,
 // smooth and resample it, read the control points off the smoothed curve, and
 // clip to the control span. line_points overshoot the outermost control
@@ -1409,10 +1441,16 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         if (!drawable[crossing.hFiber]) {
             continue;
         }
+        // The solver's position is on the raw unrolled trace; the map draws
+        // a resampled (and possibly smoothed) curve, so the mark is projected
+        // onto the drawn polyline of the H fiber it belongs to, where the
+        // user will look for it.
         const double x =
             (crossing.psiH + kTwoPi * solve.placements[crossing.hFiber].turns) *
             rRefVx;
-        result.suspectCrossings.push_back(CrossingMark{QPointF(x, crossing.zVx)});
+        result.suspectCrossings.push_back(CrossingMark{
+            nearestPointOnPolyline(geometry[crossing.hFiber].samples,
+                                   QPointF(x, crossing.zVx))});
     }
 
     const double padX = std::max(kPadFraction * (hiX - loX), params.minPadXVx);
@@ -1516,7 +1554,10 @@ double sheetXForDistanceVx(const SheetModel& model, double distanceVx)
         if (discriminant < 0.0) {
             return std::numeric_limits<double>::quiet_NaN();
         }
-        w = (-model.radius0Vx + std::sqrt(discriminant)) / model.pitchVx;
+        // The rationalised form of (-radius0 + sqrt(disc)) / pitch: the naive
+        // one subtracts two nearly equal numbers as the pitch tends to zero
+        // and loses the answer; this one tends smoothly to the linear case.
+        w = 2.0 * target / (model.radius0Vx + std::sqrt(discriminant));
     } else {
         w = target / model.radius0Vx;
     }

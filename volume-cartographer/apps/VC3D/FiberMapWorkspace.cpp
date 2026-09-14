@@ -5,6 +5,7 @@
 
 #include "vc/core/util/Logging.hpp"
 
+#include <QAbstractButton>
 #include <QAction>
 #include <QColor>
 #include <QDockWidget>
@@ -423,8 +424,13 @@ public:
     {
         const qreal lod =
             QStyleOptionGraphicsItem::levelOfDetailFromTransform(painter->worldTransform());
-        const qreal radius =
-            scaledDotRadius(_radius, _minPixels, _maxPixels, _maxRadius, lod);
+        qreal radius = scaledDotRadius(_radius, _minPixels, _maxPixels, _maxRadius, lod);
+        // The outline is cosmetic, so at the scene-radius ceiling half its
+        // width would fall outside boundingRect(); the fill gives way to it.
+        if (lod > 0.0) {
+            const qreal strokeHalf = 0.5 * std::max<qreal>(_outline.widthF(), 1.0) / lod;
+            radius = std::max<qreal>(0.0, std::min(radius, _maxRadius - strokeHalf));
+        }
         painter->setRenderHint(QPainter::Antialiasing, true);
         painter->setPen(_outline);
         painter->setBrush(_fill);
@@ -1289,11 +1295,12 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild)
         job->hadFibers = !job->snapshot.fibers.empty();
         job->hadUmbilicus = !job->snapshot.umbilicusCenters.empty();
 
-        // No smoothing of the drawn fibers: the link markers and the
-        // winding-suspect rings are placed from the raw unrolled geometry,
-        // and a de-bumped curve sat visibly off them once the markers
-        // stopped covering the gap. The resampling stays (it only
-        // interpolates the raw polyline), so every marker lands on its line.
+        // No smoothing of the drawn fibers: with the markers pixel-capped,
+        // a de-bumped curve read as a distortion of where the fibers really
+        // run, and the winding-suspect rings (placed from the raw unrolled
+        // geometry, then projected onto the drawn curve) sat off it by the
+        // de-bumping. The resampling stays; it only interpolates the raw
+        // polyline.
         job->params.smoothVx = 0.0;
         // The layout and solver are unit-free, so the physical intents behind
         // their tuning lengths are converted here — once the voxel size is
@@ -2465,40 +2472,75 @@ void FiberMapWorkspace::confirmAndDeleteFiber(
     // Anything moved since the menu was built? Then this map is not the thing
     // to be deleting from; it refreshes instead (this runs outside any nested
     // loop, so the destructive half may run inline).
-    const StaleVerdict verdict = vc3d::fiber_map::staleVerdictFor(
-        menuDependencies, currentDependencies(), /*layoutBuilt=*/true, QString());
-    if (verdict.action != StaleVerdict::Action::Fresh) {
+    const auto dependenciesMoved = [this, &menuDependencies, &fileName](const char* when) {
+        const StaleVerdict verdict = vc3d::fiber_map::staleVerdictFor(
+            menuDependencies, currentDependencies(), /*layoutBuilt=*/true, QString());
+        if (verdict.action == StaleVerdict::Action::Fresh) {
+            return false;
+        }
         refreshStaleState();
-        Logger()->warn("Fiber map: dependencies changed while the menu was open; "
+        Logger()->warn("Fiber map: dependencies changed while the {} was open; "
                        "not deleting {}",
-                       fileName);
+                       when, fileName);
+        return true;
+    };
+    if (dependenciesMoved("menu")) {
         return;
     }
-    const QMessageBox::StandardButton answer = QMessageBox::question(
-        this,
+    // The confirmation is modeless (open(), not exec()): a nested loop with a
+    // parented dialog would be undefined if the workspace were torn down
+    // meanwhile, whereas this dialog simply dies with its parent and the
+    // handler, being connected in the workspace's context, is dropped.
+    auto* dialog = new QMessageBox(
+        QMessageBox::Question,
         tr("Delete fiber"),
         tr("Delete fiber %1?\n\nThis removes its file from the package and cannot be undone.")
             .arg(displayName),
         QMessageBox::Yes | QMessageBox::Cancel,
-        QMessageBox::Cancel);
-    if (answer != QMessageBox::Yes) {
-        return;
-    }
-    // The dialog ran its own event loop, so the id is resolved from the file
-    // name only now, and a name that no longer resolves means the map is not
-    // to be trusted until rebuilt - the one staleness that latches.
-    if (!_controller) {
-        return;
-    }
-    const uint64_t target = _controller->fiberIdForFileName(fileName);
-    if (target == 0) {
-        markStale(tr("Fibers changed — press Update"));
-        Logger()->warn("Fiber map: {} is no longer loaded; not deleting", fileName);
-        return;
-    }
-    Logger()->info("Fiber map: deleting fiber {}", fileName);
-    _controller->deleteFibers({target});
-    // The fiber generation moved; rather than wait for the visible-only
-    // poll's next tick, notice it now so the automatic update starts at once.
-    refreshStaleState();
+        this);
+    dialog->setDefaultButton(QMessageBox::Cancel);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    connect(dialog, &QMessageBox::buttonClicked, this,
+            [this, dialog, fileName, menuDependencies](QAbstractButton* button) {
+                if (dialog->standardButton(button) != QMessageBox::Yes || !_controller) {
+                    return;
+                }
+                // Anything could have happened while the dialog stood open
+                // (a reload, a package switch): the dependency set is checked
+                // again, and only then is the id resolved from the file name.
+                // A name that no longer resolves under unchanged dependencies
+                // means the map is not to be trusted until rebuilt - the one
+                // staleness that latches.
+                const StaleVerdict verdict = vc3d::fiber_map::staleVerdictFor(
+                    menuDependencies, currentDependencies(), /*layoutBuilt=*/true,
+                    QString());
+                if (verdict.action != StaleVerdict::Action::Fresh) {
+                    refreshStaleState();
+                    Logger()->warn("Fiber map: dependencies changed while the confirmation "
+                                   "was open; not deleting {}",
+                                   fileName);
+                    return;
+                }
+                const uint64_t target = _controller->fiberIdForFileName(fileName);
+                if (target == 0) {
+                    markStale(tr("Fibers changed — press Update"));
+                    Logger()->warn("Fiber map: {} is no longer loaded; not deleting",
+                                   fileName);
+                    return;
+                }
+                Logger()->info("Fiber map: deleting fiber {}", fileName);
+                // deleteFibers drains queued saves in a nested loop, during
+                // which this workspace could be destroyed; the guard keeps the
+                // epilogue off a dead object.
+                const QPointer<FiberMapWorkspace> self(this);
+                _controller->deleteFibers({target});
+                if (!self) {
+                    return;
+                }
+                // The fiber generation moved; rather than wait for the
+                // visible-only poll's next tick, notice it now so the
+                // automatic update starts at once.
+                refreshStaleState();
+            });
+    dialog->open();
 }

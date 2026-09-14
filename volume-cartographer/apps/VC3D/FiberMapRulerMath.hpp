@@ -34,7 +34,10 @@ inline double niceStepAtLeast(double minStep)
 // Winding rulers label integers only: the ladder value, never below 1.
 inline int niceIntegerStepAtLeast(double minStep)
 {
-    return static_cast<int>(std::lround(std::max(1.0, niceStepAtLeast(minStep))));
+    // Saturated well below INT_MAX: past this no winding label would ever
+    // be drawn anyway, and the narrowing stays defined.
+    constexpr double kMaxStep = 1e9;
+    return static_cast<int>(std::lround(std::clamp(niceStepAtLeast(minStep), 1.0, kMaxStep)));
 }
 
 enum class LengthUnit { Micrometre, Millimetre, Centimetre, Metre };

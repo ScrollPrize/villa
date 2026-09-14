@@ -45,6 +45,9 @@ private slots:
         QCOMPARE(niceIntegerStepAtLeast(3.0), 5);
         QCOMPARE(niceIntegerStepAtLeast(7.0), 10);
         QCOMPARE(niceIntegerStepAtLeast(11.0), 20);
+        // Saturates instead of overflowing the int.
+        QCOMPARE(niceIntegerStepAtLeast(1e30), 1000000000);
+        QCOMPARE(niceIntegerStepAtLeast(std::numeric_limits<double>::infinity()), 1);
     }
 
     void unitFollowsTheTickStep()
