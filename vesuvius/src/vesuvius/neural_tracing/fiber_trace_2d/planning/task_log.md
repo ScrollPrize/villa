@@ -8,6 +8,14 @@
 - User added next LRU anchor experiment; scheduled after refinement instead of stopping. Capacity4/8, admission128/512, nearest/average/EMA blend. Finer EMA results256/384/640/768/1024=74/72/87/84/73; no improvement yet. ShortK2 mixes.75/.9=91/76.
 # Latest continuation
 
+- Seventh boundary search complete:support-softmin transfer converged67 atK2/spacing1024/weight.10/T.03; improvement over prior71, final repeat pending. Plain nearestLRU boundary now running from66; sevenof15 searches complete, global64 unchanged.
+
+- New provisional support-softmin improvement67 atK2/spacing1024/weight.10/T.03 (`refine-0106`), versus prior71. Found from transferred seed; active72112 continues refinement and exact repeat remains pending. Global64 unchanged.
+
+- Sixth boundary search complete:support-softmin own-seed remains71 atK2/spacing512/weight.25/T.03. Alternative start follows; sixof15 complete, global64 and exact-repeat phase still pending.
+
+- Fifth boundary search complete:whole-path transferred seed72, does not improve own-seed70. Support-softmin own-seed family now active72112; fiveof15 complete, overall64 unchanged and final repeats pending.
+
 - Fourth boundary family complete:whole-path appearance own-seed converged70 atK1/spacing384/weight.25, versus previous72. AlternativeK2/.10 start now running (initial76). Fourof15 searches complete; final repeats pending, overall64 unchanged.
 
 - Whole-path own-seed refinement now provisional70 atK1/spacing384/weight.25, improving72→71 withK1 then70 on next spacing cycle. Active72112; no new global best or exact-repeat claim yet.
