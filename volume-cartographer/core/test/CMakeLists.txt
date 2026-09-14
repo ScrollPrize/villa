@@ -859,6 +859,8 @@ vc_add_test(NAME test_atlas LIBS doctest::doctest vc_atlas)
 # with the command-line tool so the tested code is the shipped code).
 vc_add_test(NAME test_tifxyz_selfcross LIBS doctest::doctest opencv_core)
 
+vc_add_test(NAME test_seg_add_overlap_metrics)
+
 # End-to-end CLI contract for the same tool: exit codes, report
 # serialization, collection envelope. Needs the binary, so it only exists
 # in configurations that build the apps -- the test shards configure with
@@ -869,6 +871,13 @@ if(TARGET vc_tifxyz_selfcross)
         LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
         DEFS VC_SELFCROSS_BIN="$<TARGET_FILE:vc_tifxyz_selfcross>")
     add_dependencies(test_tifxyz_selfcross_cli vc_tifxyz_selfcross)
+endif()
+
+if(TARGET vc_seg_add_overlap)
+    vc_add_test(NAME test_seg_add_overlap_cli
+        LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
+        DEFS VC_SEG_ADD_OVERLAP_BIN="$<TARGET_FILE:vc_seg_add_overlap>")
+    add_dependencies(test_seg_add_overlap_cli vc_seg_add_overlap)
 endif()
 
 if(TARGET vc_render_tifxyz)
@@ -947,6 +956,10 @@ vc_add_test(NAME test_zarr_helpers)
 vc_add_test(NAME test_chunked_plane_sampler)
 
 vc_add_test(NAME test_slicing)
+# The vc_render_tifxyz prefetch planner and PrefetchedArrayView (header-only
+# under apps/src, shared with the command-line tool so the tested code is the
+# shipped code).
+vc_add_test(NAME test_render_prefetch)
 
 vc_add_test(NAME test_volume_pkg)
 
