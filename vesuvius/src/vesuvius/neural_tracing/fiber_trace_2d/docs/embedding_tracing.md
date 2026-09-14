@@ -14,7 +14,7 @@ when an observation exactly matches or has cosine distance below the novelty
 threshold. Novel observations evict actual LRU without first touching their
 nearest anchor. Default `nearest` retains the original forced-nearest touch.
 This isolates replacement semantics without changing costs or memory. Native
-build and empirical evaluation are pending the running frozen-binary sweep.
+tests pass; empirical comparison is running on the frozen model/cache.
 
 `--embedding-reference-mode anchors` builds a compact observed appearance model.
 The regular bounded history is its observation bank (<=64); greedy medoid

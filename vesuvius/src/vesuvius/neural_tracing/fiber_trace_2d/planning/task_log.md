@@ -8,6 +8,12 @@
 - User added next LRU anchor experiment; scheduled after refinement instead of stopping. Capacity4/8, admission128/512, nearest/average/EMA blend. Finer EMA results256/384/640/768/1024=74/72/87/84/73; no improvement yet. ShortK2 mixes.75/.9=91/76.
 # Latest continuation
 
+- Mechanism grid finished exit0,15replays,64 winner exact. Seed weights.10/.25/.50=80/76/82; delays32/64/128/256=86/78/80/78 vs EMA69; hit mean66/nearest74 vs existing64. All rebuilt controls and delay0 exact. New-method refinement started session66263 via approved launcher:seed,hitmean,hitnearest,delayedEMA two weight seeds. Tests retain nonexclusive manager allocation after user-requested training stop. Prepared anchor boundary sweep remains next.
+
+- User requested stopping overfitting paired embedding training. Approved production-status identified the expected174110 launch; production-stop exited0 and verified root dead, manager task6f8a7826 finished with zero CPU/GPU allocation (generation67). Latest logged test update32000/4,096,000patches; do not infer final snapshot step from that log. Experiments continue under nonexclusive manager grants, frozen6500 EMA99 unchanged.
+
+- New native methods built/tested via approved launcher:2native suites pass1.90s;117Python pass42.27s (`cooperative-tests/20260914_061209_344524`). Committed83e695caf/3b2f79701. Started seed/delay/hit comparison through exact approved experiment launcher, session47701, nonexclusive manager request. Baseline and zero-delay hashes will be checked before interpretation.
+
 - Overnight all-family sweep finished exit0:270 replays, all13 family winners and global64 repeated identically (29+35). Other improved families windowed67, gated-seed73, best-history74, mean70. Native build/test now safe and started via exact approved runner. A nonessential manager-status command incorrectly triggered approval and delayed agent continuation overnight; do not repeat it or add approval-dependent diagnostics. Reuse only exact approved launchers/process handles for external actions.
 
 - Six families complete: novelty meanLRU finished its finite local refinement at64 (`refine-0118`); no later axis/weight neighbor improved it. Exact repeats remain scheduled after all13 families. Python-only approved runner117passed44.55s (`cooperative-tests/20260914_000935_303937`), including new hit-touch validation. Native tests intentionally wait for active binary users.

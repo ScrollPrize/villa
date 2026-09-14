@@ -8,5 +8,6 @@
 - [x] First independent refinement of all13 families and exact winner repeats (270 replays, best64)
 - [ ] Cross-seed and admission-boundary refinements
 - [ ] Repeat winners, examine further supported method improvements
-- [ ] Build/test/evaluate delayed EMA (implementation staged; preserve running sweep binary)
+- [x] Build/test seed-only, delayed EMA and hit-only LRU variants (2native suites,117Python tests)
+- [ ] Evaluate/refine new variants (seed/delay/hit comparison running)
 - [ ] Document full results

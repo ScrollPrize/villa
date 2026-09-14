@@ -8,7 +8,7 @@
   },
   "embedding_trace_sweep": {
     "pilot": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_reference_20260913_v1",
-    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_seed_delay_touch_20260914_v1",
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_new_method_refine_20260914_v1",
     "fill_missing": true,
     "gpu_manager": {
       "exclusive": false,
@@ -29,16 +29,6 @@
         "falloff": "gaussian"
       },
       {
-        "mode": "ema-delayed",
-        "weight": 0.25,
-        "half_life": 512,
-        "delay": 0,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "gaussian"
-      },
-      {
         "mode": "anchors-lru",
         "aggregation": "mean",
         "weight": 0.1,
@@ -49,96 +39,201 @@
         "window": 1024,
         "count": 8,
         "falloff": "uniform"
+      }
+    ],
+    "refine": [
+      {
+        "label": "seed",
+        "seed": {
+          "spacing": 128,
+          "window": 1024,
+          "count": 8,
+          "falloff": "uniform",
+          "mode": "seed",
+          "weight": 0.25
+        },
+        "axes": {
+          "weight": [
+            0.1,
+            0.25,
+            0.5
+          ]
+        },
+        "neighbor_weight": true
       },
       {
-        "mode": "anchors-lru",
-        "aggregation": "mean",
-        "weight": 0.1,
-        "anchors": 2,
-        "novelty": 0.1,
-        "touch": "hit",
-        "ema_mix": 0,
-        "spacing": 512,
-        "window": 1024,
-        "count": 8,
-        "falloff": "uniform"
+        "label": "hit-lru-mean",
+        "seed": {
+          "spacing": 512,
+          "window": 4096,
+          "count": 8,
+          "falloff": "uniform",
+          "mode": "anchors-lru",
+          "anchors": 2,
+          "novelty": 0.1,
+          "touch": "hit",
+          "ema_mix": 0,
+          "weight": 0.1,
+          "aggregation": "mean"
+        },
+        "axes": {
+          "weight": [
+            0.1,
+            0.25,
+            0.5
+          ],
+          "spacing": [
+            128,
+            256,
+            384,
+            512,
+            768,
+            1024
+          ],
+          "anchors": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "novelty": [
+            0.02,
+            0.05,
+            0.1,
+            0.2,
+            0.3
+          ],
+          "ema_mix": [
+            0,
+            0.5,
+            0.9
+          ]
+        },
+        "neighbor_weight": true
       },
       {
-        "mode": "anchors-lru",
-        "aggregation": "best",
-        "weight": 0.1,
-        "anchors": 2,
-        "novelty": 0.1,
-        "touch": "hit",
-        "ema_mix": 0,
-        "spacing": 512,
-        "window": 1024,
-        "count": 8,
-        "falloff": "uniform"
+        "label": "hit-lru-best",
+        "seed": {
+          "spacing": 512,
+          "window": 4096,
+          "count": 8,
+          "falloff": "uniform",
+          "mode": "anchors-lru",
+          "anchors": 2,
+          "novelty": 0.1,
+          "touch": "hit",
+          "ema_mix": 0,
+          "weight": 0.1,
+          "aggregation": "best"
+        },
+        "axes": {
+          "weight": [
+            0.1,
+            0.25,
+            0.5
+          ],
+          "spacing": [
+            128,
+            256,
+            384,
+            512,
+            768,
+            1024
+          ],
+          "anchors": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "novelty": [
+            0.02,
+            0.05,
+            0.1,
+            0.2,
+            0.3
+          ],
+          "ema_mix": [
+            0,
+            0.5,
+            0.9
+          ]
+        },
+        "neighbor_weight": true
       },
       {
-        "mode": "seed",
-        "weight": 0.1,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "uniform"
+        "label": "delayed-ema-start0.25",
+        "seed": {
+          "spacing": 128,
+          "window": 1024,
+          "count": 8,
+          "falloff": "gaussian",
+          "mode": "ema-delayed",
+          "half_life": 512,
+          "delay": 64,
+          "weight": 0.25
+        },
+        "axes": {
+          "delay": [
+            0,
+            16,
+            32,
+            64,
+            128,
+            256,
+            512
+          ],
+          "half_life": [
+            128,
+            256,
+            512,
+            1024,
+            2048
+          ],
+          "weight": [
+            0.1,
+            0.25,
+            0.5
+          ]
+        },
+        "neighbor_weight": true
       },
       {
-        "mode": "seed",
-        "weight": 0.25,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "uniform"
-      },
-      {
-        "mode": "seed",
-        "weight": 0.5,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "uniform"
-      },
-      {
-        "mode": "ema-delayed",
-        "weight": 0.25,
-        "half_life": 512,
-        "delay": 32,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "gaussian"
-      },
-      {
-        "mode": "ema-delayed",
-        "weight": 0.25,
-        "half_life": 512,
-        "delay": 64,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "gaussian"
-      },
-      {
-        "mode": "ema-delayed",
-        "weight": 0.25,
-        "half_life": 512,
-        "delay": 128,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "gaussian"
-      },
-      {
-        "mode": "ema-delayed",
-        "weight": 0.25,
-        "half_life": 512,
-        "delay": 256,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "gaussian"
+        "label": "delayed-ema-start0.1",
+        "seed": {
+          "spacing": 128,
+          "window": 1024,
+          "count": 8,
+          "falloff": "gaussian",
+          "mode": "ema-delayed",
+          "half_life": 512,
+          "delay": 64,
+          "weight": 0.1
+        },
+        "axes": {
+          "delay": [
+            0,
+            16,
+            32,
+            64,
+            128,
+            256,
+            512
+          ],
+          "half_life": [
+            128,
+            256,
+            512,
+            1024,
+            2048
+          ],
+          "weight": [
+            0.1,
+            0.25,
+            0.5
+          ]
+        },
+        "neighbor_weight": true
       }
     ]
   },

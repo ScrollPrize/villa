@@ -95,6 +95,14 @@ Opt-in anchors mode, deterministic greedy coverage selection, bounded bank, EMA 
 New multi-anchor report, embedding_tracing options, task log/status/changelog including failures and limits.
 
 ## Validation
+Prepared boundary/multi-start sweep in `embedding_anchor_boundaries_next.json`:
+all anchor policies start from their own completed-round winner and, where
+different, K2/weight.10 transferred seed. Extend spacing through2048 for
+no-expiry methods (unused window4096), through1024 for windowed anchors with
+their actual window1024; include K1. Keep earlier records as exact references.
+This config is prepared, not yet executed. New-method refinements follow initial
+seed/delay/hit results and remain separate from these anchor-policy comparisons.
+
 Prepared next mechanism grid in `embedding_methods_next.json`; after current
 sweep exits and native tests pass, use it as the existing experiment control's
 `embedding_trace_sweep` section. Same frozen pilot and manager allocation.
