@@ -6,6 +6,7 @@
 #include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
 #include "FiberSliceGeometry.hpp"
+#include "LineAnnotationFiberDeletion.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSaveJob.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
@@ -3046,6 +3047,8 @@ void LineAnnotationController::deleteFiber(uint64_t fiberId)
 
 void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
 {
+    namespace deletion = vc3d::line_annotation;
+
     std::sort(fiberIds.begin(), fiberIds.end());
     fiberIds.erase(std::unique(fiberIds.begin(), fiberIds.end()), fiberIds.end());
     fiberIds.erase(std::remove(fiberIds.begin(), fiberIds.end(), uint64_t{0}), fiberIds.end());
@@ -3062,41 +3065,85 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
     }
     _deletingFibers = true;
     const auto releaseDeleting = qScopeGuard([this]() { _deletingFibers = false; });
-    // Drain queued save jobs first: a save still in flight for one of these
-    // fibers would recreate the file right after the remove below.
-    waitForFiberSaves();
 
+    // Queued save jobs are drained first: a save still in flight for one of
+    // these fibers would recreate the file right after the remove below. The
+    // drain yields to the event loop, and anything that reloads the fiber
+    // list meanwhile (an import, a repair reload, a project switch) hands
+    // the runtime ids out again from 1 - so the fibers are captured by file
+    // name and package identity before the wait and re-resolved after it;
+    // see LineAnnotationFiberDeletion.hpp.
+    const auto identityNow = [this]() {
+        return deletion::FiberDeletePackageIdentity{packageGeneration(),
+                                                    fibersDir().string()};
+    };
+    const deletion::FiberDeleteResolution resolution =
+        deletion::resolveFiberDeletionAcrossWait(
+            fiberIds,
+            [this]() -> const std::vector<StoredFiber>& { return _fibers; },
+            identityNow,
+            [this]() { waitForFiberSaves(); });
+    for (const uint64_t notLoaded : resolution.notLoaded) {
+        Logger()->warn("deleteFibers: fiber {} is not loaded; skipping", notLoaded);
+    }
+    for (const uint64_t unnamed : resolution.unnamed) {
+        Logger()->warn("deleteFibers: fiber {} has no file name; skipping", unnamed);
+    }
+    if (resolution.aborted) {
+        Logger()->warn("deleteFibers: {} while pending saves were finishing; nothing deleted",
+                       resolution.abortReason);
+        showError(tr("The project changed while pending saves were finishing; "
+                     "no fibers were deleted."));
+        return;
+    }
+    for (const auto& target : resolution.missing) {
+        Logger()->warn("deleteFibers: {} is no longer loaded; skipping", target.fileName);
+    }
+    for (const auto& target : resolution.ambiguous) {
+        Logger()->warn("deleteFibers: {} names more than one loaded fiber; skipping",
+                       target.fileName);
+    }
+    if (resolution.resolvedIds.empty()) {
+        return;
+    }
+
+    // resolvedIds are the CURRENT runtime ids (sorted, unique). Removal
+    // failures are reported once after the cleanup rather than per file: a
+    // dialog inside this loop would yield to the event loop again.
     std::vector<std::pair<uint64_t, std::string>> deletedFibers;
-    deletedFibers.reserve(fiberIds.size());
+    deletedFibers.reserve(resolution.resolvedIds.size());
     std::vector<uint64_t> deletedIds;
-    deletedIds.reserve(fiberIds.size());
-    for (uint64_t fiberId : fiberIds) {
-        // Only a fiber still loaded is deleted, by the file it is loaded
-        // from. The drain above yielded to the event loop, and an id that
-        // vanished meanwhile must not be turned into a path by the
-        // "<id>.json" fallback of fiberPath(uint64_t): that could name an
-        // unrelated file.
+    deletedIds.reserve(resolution.resolvedIds.size());
+    QStringList removalErrors;
+    for (uint64_t fiberId : resolution.resolvedIds) {
         const auto fiberIt = std::find_if(_fibers.begin(),
                                           _fibers.end(),
                                           [fiberId](const StoredFiber& fiber) {
                                               return fiber.id == fiberId;
                                           });
         if (fiberIt == _fibers.end()) {
-            Logger()->warn("deleteFibers: fiber {} is no longer loaded; skipping", fiberId);
+            // Cannot happen without a yield between resolve and here; kept
+            // as a check rather than an assumption.
+            Logger()->warn("deleteFibers: fiber {} vanished before removal; skipping", fiberId);
             continue;
         }
         const auto path = fiberPath(*fiberIt);
         std::error_code ec;
         fs::remove(path, ec);
         if (ec) {
-            showError(tr("Could not delete fiber %1: %2")
-                          .arg(fiberId)
-                          .arg(QString::fromStdString(ec.message())));
+            removalErrors.push_back(tr("Could not delete fiber %1: %2")
+                                        .arg(QString::fromStdString(fiberIt->fileName))
+                                        .arg(QString::fromStdString(ec.message())));
             continue;
         }
         deletedIds.push_back(fiberId);
         deletedFibers.push_back({fiberId, fiberIt->fileName});
     }
+    const auto reportRemovalErrors = qScopeGuard([this, &removalErrors]() {
+        if (!removalErrors.isEmpty()) {
+            showError(removalErrors.join(QLatin1Char('\n')));
+        }
+    });
     if (deletedIds.empty()) {
         return;
     }
@@ -3123,10 +3170,24 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
     for (uint64_t deletedId : deletedIds) {
         invalidateFiberAlignmentMetrics(deletedId, false);
     }
+    // Open sessions keep the id they were opened with; a reload reassigns
+    // the stored fibers' ids without touching them. So a session is matched
+    // by its file name as well as by id, or a survivor could re-save the
+    // file just deleted.
     for (const auto& pane : _panes) {
-        if (pane.session && std::binary_search(deletedIds.begin(),
-                                               deletedIds.end(),
-                                               pane.session->fiberId)) {
+        if (!pane.session) {
+            continue;
+        }
+        const bool byId = std::binary_search(deletedIds.begin(),
+                                             deletedIds.end(),
+                                             pane.session->fiberId);
+        const bool byFileName =
+            !pane.session->fiberFileName.empty() &&
+            std::any_of(deletedFibers.begin(), deletedFibers.end(),
+                        [&pane](const std::pair<uint64_t, std::string>& deleted) {
+                            return deleted.second == pane.session->fiberFileName;
+                        });
+        if (byId || byFileName) {
             pane.session->suppressFiberSave = true;
         }
     }

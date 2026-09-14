@@ -323,6 +323,24 @@ add_test(NAME fiber_map_ruler_math COMMAND test_fiber_map_ruler_math)
 vc_register_test_target(test_fiber_map_ruler_math)
 vc_register_ctest(fiber_map_ruler_math test_fiber_map_ruler_math)
 
+add_executable(test_line_annotation_fiber_deletion
+    test_line_annotation_fiber_deletion.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberDeletion.hpp)
+
+set_target_properties(test_line_annotation_fiber_deletion PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_line_annotation_fiber_deletion PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_line_annotation_fiber_deletion PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME line_annotation_fiber_deletion COMMAND test_line_annotation_fiber_deletion)
+vc_register_test_target(test_line_annotation_fiber_deletion)
+vc_register_ctest(line_annotation_fiber_deletion test_line_annotation_fiber_deletion)
+
 add_executable(test_line_annotation_optimization_queue
     test_line_annotation_optimization_queue.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationOptimizationQueue.hpp)
