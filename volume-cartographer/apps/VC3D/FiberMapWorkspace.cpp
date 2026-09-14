@@ -1279,6 +1279,12 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild)
         job->hadFibers = !job->snapshot.fibers.empty();
         job->hadUmbilicus = !job->snapshot.umbilicusCenters.empty();
 
+        // No smoothing of the drawn fibers: the link markers and the
+        // winding-suspect rings are placed from the raw unrolled geometry,
+        // and a de-bumped curve sat visibly off them once the markers
+        // stopped covering the gap. The resampling stays (it only
+        // interpolates the raw polyline), so every marker lands on its line.
+        job->params.smoothVx = 0.0;
         // The layout and solver are unit-free, so the physical intents behind
         // their tuning lengths are converted here — once the voxel size is
         // known, exactly as documented on GlobalLayoutParams and SolverParams.
@@ -1286,7 +1292,6 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild)
         // 2.4 µm) stand in and the map still lays out sensibly.
         if (job->snapshot.voxelSizeUm) {
             const double vxPerCm = kUmPerCm / *job->snapshot.voxelSizeUm;
-            job->params.smoothVx = 0.12 * vxPerCm;         // 1.2 mm arclength sigma
             job->params.resampleStepVx = 0.025 * vxPerCm;  // 0.025 cm resample step
             job->params.minPadXVx = 2.2 * vxPerCm;         // 2.2 cm label pad across
             job->params.minPadYVx = 1.6 * vxPerCm;         // 1.6 cm label pad up
