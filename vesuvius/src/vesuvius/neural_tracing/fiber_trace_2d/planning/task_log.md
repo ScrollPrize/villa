@@ -8,6 +8,10 @@
 - User added next LRU anchor experiment; scheduled after refinement instead of stopping. Capacity4/8, admission128/512, nearest/average/EMA blend. Finer EMA results256/384/640/768/1024=74/72/87/84/73; no improvement yet. ShortK2 mixes.75/.9=91/76.
 # Latest continuation
 
+- Consolidated18 completed refinement entries with exact parameters/axes/hash prefixes and full report links in docs/embedding_refinement_summary_20260914.md; clearly pre-boundary, not a final claim. Active nearest-novelLRU improved71→68 atspacing768/K4/.25; still refining and final repeats pending.
+
+- Boundary sweep72112 first family complete:novelty meanLRU remains64 atK2/spacing512/weight.10. Testedspacing192/256/384/768/1024/1536/2048, K1/4/8, weights.05/.15/.25/.50 without gain. K1=71 andK8=68; exact final repeat still pending with otherfamilies. Nearest noveltyLRU own-seed family now running.
+
 - Independent completion audit: user-requested no-expiry appearance summaries/LRU/algorithmic variants and independent refinements covered. Remaining active15-family finite round+repeats, consolidated parameters/bounds/hashes and final state/docs. No diagnostic currently justifies conditional exemplar/reliability variants; retain as untested future hypotheses. Fiber is tuning data, not independent validation. Live72112 confirmed, first spacing192/256/384 trials did not improve64.
 
 - Normalized A/B4047 exited0:10 replays, all old control hashes preserved, overall64 exactrepeat. Three normalized seeds75 each (different hashes) vs ordinary64/68/66. All6 coherence histograms sum to positivecounts; mean.9752–.9817, nonebelow.1. Started approved boundary/multi-start sweep72112 at `embedding_ema99_anchor_boundaries_20260914_v1`:12 prepared anchor families plus3 normalized families for fair per-method tuning. Training stays stopped; nonexclusive manager grant.

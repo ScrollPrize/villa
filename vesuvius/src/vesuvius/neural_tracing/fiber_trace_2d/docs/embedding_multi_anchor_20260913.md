@@ -1,5 +1,8 @@
 # Multi-anchor appearance experiments
 
+See [consolidated completed refinements](embedding_refinement_summary_20260914.md)
+for per-family parameters, bounds and replay hashes (active boundary round pending).
+
 Goal: improve the69-restart EMA512 reference result. Same frozen current model
 EMA99 update6500/832000 patches, SHA256
 `0a2651b711e7e5ee6d445ac8c68ff482c1951798ced2f44896c25602e1c50417`.
