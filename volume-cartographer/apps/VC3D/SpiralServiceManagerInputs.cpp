@@ -133,8 +133,15 @@ void SpiralServiceManager::installInputCatalog(const QJsonArray& inputs)
             manifest[QStringLiteral("path")] = input.value(QStringLiteral("content")).toObject().value(QStringLiteral("path"));
             // This content belongs to the service; restores reference it without uploading a host path.
             manifest[QStringLiteral("restore_revision")] = input.value(QStringLiteral("accepted_revision"));
+            std::optional<vc3d::spiral::InputDraftContent> beforeDelete;
+            if (input.value(QStringLiteral("can_restore")).toBool()
+                && input.value(QStringLiteral("restore_revision")).toInteger() > 0) {
+                auto restored = manifest;
+                restored[QStringLiteral("restore_revision")] = input.value(QStringLiteral("restore_revision"));
+                beforeDelete = vc3d::spiral::InputDraftContent{restored, false};
+            }
             draft = std::make_shared<vc3d::spiral::InputDraft>(id,
-                vc3d::spiral::InputDraftContent{manifest, input.value(QStringLiteral("deleted")).toBool()}, accepted);
+                vc3d::spiral::InputDraftContent{manifest, input.value(QStringLiteral("deleted")).toBool()}, accepted, beforeDelete);
             _inputDrafts[id] = draft;
         }
         // Local content may have advanced while this catalog request ran.
@@ -326,8 +333,16 @@ void SpiralServiceManager::invalidateWorkingCopy(const QString& source)
 
 void SpiralServiceManager::workingCopyAsync(const QString& source, FetchPreviewFileCallback done)
 {
+    copyInputAsync(source, std::move(done), true);
+}
+
+void SpiralServiceManager::copyInputAsync(const QString& source, FetchPreviewFileCallback done,
+                                         bool reuseWorkingCopy)
+{
+    // Snapshot copies get unique keys so they never reuse mutable editor files.
+    const auto sourcePath = QFileInfo(source).absoluteFilePath();
     // Path construction is cheap; all source filesystem traversal stays in the worker.
-    const auto key = QFileInfo(source).absoluteFilePath();
+    const auto key = reuseWorkingCopy ? sourcePath : uuid();
     if (_workingCopies.contains(key)) {
         done(_workingCopies.value(key), {});
         return;
@@ -365,7 +380,7 @@ void SpiralServiceManager::workingCopyAsync(const QString& source, FetchPreviewF
             });
     if (!startCopy) return;
     emit inputCopyProgress(_workingCopyJobs.size(), tr("Copying input files…"));
-    watcher->setFuture(QtConcurrent::run([key](QPromise<vc3d::spiral::InputCopyResult>& promise) {
+    watcher->setFuture(QtConcurrent::run([sourcePath](QPromise<vc3d::spiral::InputCopyResult>& promise) {
         vc3d::spiral::InputCopyResult result;
         // The worker owns its temporary directory even if the UI is destroyed.
         result.directory = std::shared_ptr<QTemporaryDir>(new QTemporaryDir,
@@ -376,13 +391,13 @@ void SpiralServiceManager::workingCopyAsync(const QString& source, FetchPreviewF
         if (!result.directory->isValid()) {
             result.error = QObject::tr("Cannot create an input working directory");
         } else {
-            result.path = QDir(result.directory->path()).filePath(QFileInfo(key).fileName());
+            result.path = QDir(result.directory->path()).filePath(QFileInfo(sourcePath).fileName());
             int files = 0;
             qint64 bytes = 0;
             QElapsedTimer elapsed;
             elapsed.start();
             promise.setProgressRange(0, std::numeric_limits<int>::max());
-            copyInput(key, result.path, result.error, [&](qint64 size) {
+            copyInput(sourcePath, result.path, result.error, [&](qint64 size) {
                 if (promise.isCanceled()) return false;
                 if (size >= 0) { ++files; bytes += size; }
                 if (elapsed.elapsed() >= 100) {
@@ -686,42 +701,74 @@ void SpiralServiceManager::resolveInputConflict(const QJsonObject& conflict, con
     const auto id = conflict.value(QStringLiteral("id")).toString();
     const auto draft = _inputDrafts.value(id);
     if (!draft) return;
-    const auto captured = draft->snapshot();
-    postWithRetry(QStringLiteral("/session/resolve-input"),
-        {{QStringLiteral("command_id"), commandId()}, {QStringLiteral("id"), id},
-         {QStringLiteral("expected_revision"), conflict.value(QStringLiteral("expected_revision")).toInteger(draft->accepted())},
-         {QStringLiteral("review_token"), conflict.value(QStringLiteral("review_token"))},
-         {QStringLiteral("action"), action == QStringLiteral("save_as_new") ? QStringLiteral("use_current") : action}},
-        Timeout::LongCommand, 2,
-        [this, id, captured, action](const QJsonObject& response) {
-            if (!response.value(QStringLiteral("resolved")).toBool()) { emit errorOccurred(tr("Current input could not be applied")); return; }
-            {
-                for (const auto& value : response.value(QStringLiteral("catalog")).toArray()) {
-                    const auto input = value.toObject();
-                    if (input.value(QStringLiteral("id")).toString() != id) continue;
-                    auto manifest = input;
-                    manifest[QStringLiteral("path")] = input.value(QStringLiteral("content")).toObject().value(QStringLiteral("path"));
-                    manifest[QStringLiteral("restore_revision")] = input.value(QStringLiteral("accepted_revision"));
-                    if (auto current = _inputDrafts.value(id))
-                        current->reconcileReviewedContent({manifest, input.value(QStringLiteral("deleted")).toBool()},
-                            input.value(QStringLiteral("accepted_revision")).toInteger(),
-                            input.value(QStringLiteral("applied_revision")).toInteger(),
-                            input.value(QStringLiteral("persisted_revision")).toInteger(),
-                            action != QStringLiteral("apply_local_after_review")
-                                && current->snapshot().localRevision == captured.localRevision);
+    auto captured = draft->snapshot();
+    auto resolve = [this, id, conflict, action](const vc3d::spiral::InputDraftSnapshot& captured) {
+        postWithRetry(QStringLiteral("/session/resolve-input"),
+            {{QStringLiteral("command_id"), commandId()}, {QStringLiteral("id"), id},
+             {QStringLiteral("expected_revision"), conflict.value(QStringLiteral("expected_revision")).toInteger(captured.expectedAccepted)},
+             {QStringLiteral("review_token"), conflict.value(QStringLiteral("review_token"))},
+             {QStringLiteral("action"), action == QStringLiteral("save_as_new") ? QStringLiteral("use_current") : action}},
+            Timeout::LongCommand, 2,
+            [this, id, captured, action](const QJsonObject& response) {
+                if (!response.value(QStringLiteral("resolved")).toBool()) { emit errorOccurred(tr("Current input could not be applied")); return; }
+                {
+                    for (const auto& value : response.value(QStringLiteral("catalog")).toArray()) {
+                        const auto input = value.toObject();
+                        if (input.value(QStringLiteral("id")).toString() != id) continue;
+                        auto manifest = input;
+                        manifest[QStringLiteral("path")] = input.value(QStringLiteral("content")).toObject().value(QStringLiteral("path"));
+                        manifest[QStringLiteral("restore_revision")] = input.value(QStringLiteral("accepted_revision"));
+                        if (auto current = _inputDrafts.value(id))
+                            current->reconcileReviewedContent({manifest, input.value(QStringLiteral("deleted")).toBool()},
+                                input.value(QStringLiteral("accepted_revision")).toInteger(),
+                                input.value(QStringLiteral("applied_revision")).toInteger(),
+                                input.value(QStringLiteral("persisted_revision")).toInteger(),
+                                action != QStringLiteral("apply_local_after_review")
+                                    && current->snapshot().localRevision == captured.localRevision);
+                    }
                 }
-            }
-            if (action == QStringLiteral("save_as_new")) {
-                const auto newId = uuid();
-                auto content = captured.content;
-                content.manifest.remove(QStringLiteral("restore_revision"));
-                content.manifest[QStringLiteral("name")] = newId;
-                content.manifest[QStringLiteral("alias")] = newId;
-                _inputOrder.push_back(newId);
-                _inputDrafts[newId] = std::make_shared<vc3d::spiral::InputDraft>(newId, content);
-            }
-            _inputErrors.remove(id);
-            installInputCatalog(response.value(QStringLiteral("catalog")).toArray());
+                if (action == QStringLiteral("save_as_new")) {
+                    const auto newId = uuid();
+                    auto content = captured.content;
+                    content.manifest.remove(QStringLiteral("restore_revision"));
+                    content.manifest[QStringLiteral("name")] = newId;
+                    content.manifest[QStringLiteral("alias")] = newId;
+                    _inputOrder.push_back(newId);
+                    _inputDrafts[newId] = std::make_shared<vc3d::spiral::InputDraft>(newId, content);
+                }
+                _inputErrors.remove(id);
+                installInputCatalog(response.value(QStringLiteral("catalog")).toArray());
+            }, [this](const QString& error) { emit errorOccurred(error); });
+    };
+    if (action == QStringLiteral("save_as_new") && !captured.content.deleted
+        && captured.content.manifest.contains(QStringLiteral("restore_revision"))) {
+        fetchInputContent(id, captured.content.manifest.value(QStringLiteral("restore_revision")).toInteger(),
+            captured.content.manifest.value(QStringLiteral("kind")).toString(),
+            [this, captured, resolve](const QString& source) mutable {
+                copyInputAsync(source,
+                    [this, captured, resolve](const QString& path, const QString& error) mutable {
+                        if (!error.isEmpty()) { emit errorOccurred(error); return; }
+                        captured.content.manifest[QStringLiteral("path")] = path;
+                        resolve(captured);
+                    }, false);
+            });
+    } else {
+        resolve(captured);
+    }
+}
+
+void SpiralServiceManager::fetchInputContent(const QString& id, quint64 revision, const QString& kind,
+                                             std::function<void(const QString&)> done)
+{
+    get(QStringLiteral("/session/input-content/%1/%2").arg(id).arg(revision), Timeout::Command,
+        [this, kind, done](const QJsonObject& response) {
+            const auto workspace = response.value(QStringLiteral("workspace_id")).toString();
+            const auto artifact = response.value(QStringLiteral("artifact")).toObject().value(QStringLiteral("id")).toString();
+            _artifactCache->fetchArtifact(workspace, artifact,
+                [this, kind, done](const QString& path, const QString& error, bool) {
+                    if (!error.isEmpty()) { emit errorOccurred(error); return; }
+                    done(kind == QStringLiteral("patch") ? QFileInfo(path).absolutePath() : path);
+                });
         }, [this](const QString& error) { emit errorOccurred(error); });
 }
 
@@ -747,17 +794,7 @@ void SpiralServiceManager::editInputDraft(const QString& id)
     };
     const auto local = snapshot.content.manifest.value(QStringLiteral("path")).toString();
     if (draft->dirty() && QFileInfo::exists(local)) { open(local); return; }
-    get(QStringLiteral("/session/input-content/%1/%2").arg(id).arg(draft->accepted()), Timeout::Command,
-        [this, input, open](const QJsonObject& response) {
-            const auto workspace = response.value(QStringLiteral("workspace_id")).toString();
-            const auto artifact = response.value(QStringLiteral("artifact")).toObject().value(QStringLiteral("id")).toString();
-            _artifactCache->fetchArtifact(workspace, artifact,
-                [this, input, open](const QString& path, const QString& error, bool) {
-                    if (!error.isEmpty()) { emit errorOccurred(error); return; }
-                    open(input.value(QStringLiteral("kind")).toString() == QStringLiteral("patch")
-                         ? QFileInfo(path).absolutePath() : path);
-                });
-        });
+    fetchInputContent(id, draft->accepted(), input.value(QStringLiteral("kind")).toString(), open);
 }
 
 void SpiralServiceManager::discardInputWorkspace(std::function<void()> done)

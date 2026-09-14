@@ -206,6 +206,9 @@ signals:
     void errorOccurred(const QString& message);
 
 private:
+    void copyInputAsync(const QString& source, FetchPreviewFileCallback done, bool reuseWorkingCopy);
+    void fetchInputContent(const QString& id, quint64 revision, const QString& kind,
+                           std::function<void(const QString&)> done);
     // Per-operation-class request timeouts: a single global timeout is wrong.
     enum class Timeout : int {
         Quick = 5000,          // health checks and status polls
