@@ -14588,13 +14588,8 @@ void LineAnnotationController::syncBranchFiberFileRename(
     }
 
     scheduleBranchMetadataSaves(affectedFiberIds, fiberId);
-    // The owner ids above are current stored ids, while refreshBranchLineViews
-    // picks panes by the id their session was opened with; after a reload the
-    // two disagree and the very pane whose link was just removed would be
-    // skipped, leaving the branch overlay on screen. A delete is rare enough
-    // to refresh every open pane's branch overlay instead of guessing.
-    if (!affectedFiberIds.empty()) {
-        refreshBranchLineViews(0);
+    for (const uint64_t affectedFiberId : affectedFiberIds) {
+        refreshBranchLineViews(affectedFiberId);
     }
 }
 
@@ -14641,8 +14636,13 @@ void LineAnnotationController::removeBranchLinksToFiber(uint64_t fiberId,
     }
 
     scheduleBranchMetadataSaves(affectedFiberIds, fiberId);
-    for (const uint64_t affectedFiberId : affectedFiberIds) {
-        refreshBranchLineViews(affectedFiberId);
+    // The owner ids above are current stored ids, while refreshBranchLineViews
+    // picks panes by the id their session was opened with; after a reload the
+    // two disagree and the very pane whose link was just removed would be
+    // skipped, leaving the branch overlay on screen. A delete is rare enough
+    // to refresh every open pane's branch overlay instead of guessing.
+    if (!affectedFiberIds.empty()) {
+        refreshBranchLineViews(0);
     }
 }
 
