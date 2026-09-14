@@ -130,7 +130,7 @@ public:
     QString inputWorkspaceId() const { return _inputWorkspaceId; }
     void setInputSelection(const QStringList& ids) { _inputSelection = ids; _inputSelectionExplicit = true; }
 
-    void stagePatch(const QString& directory, const QString& inputId);
+    void stagePatch(const QString& directory, const QString& inputId, bool deleted = false);
     void stageJsonInput(const QString& kind, const QString& filePath,
                          const QString& inputId, const QString& role = {});
     // Stage a revision of an existing editable point collection.

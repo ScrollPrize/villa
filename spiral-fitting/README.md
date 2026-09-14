@@ -424,6 +424,34 @@ then persists those exact revisions. Editing can continue during either action;
 a response for an older revision leaves newer edits dirty. Failed transfers or
 publication can be retried with the retained command and bytes.
 
+In the flattened Spiral preview, tap `Ctrl` to toggle patch painting: left-drag
+paints, right-drag erases, and `Escape` exits. Ctrl+wheel changes brush size
+without toggling the mode; Shift+right-drag draws control-point lines. Starting
+a stroke on a session-drawn selection extends that patch in its original color.
+Drawn selections remain brush-editable after Apply and Commit, including across
+preview updates when their original surface can be projected onto the new one.
+Finalization keeps the largest edge-connected component of complete quads;
+selections with no complete quad remain editable and report an error.
+
+Drawn patches use the same editing workspace as other inputs. Add/Apply and
+Commit capture their current selections; an edit made while an older snapshot
+is being saved stays dirty. Erasing a previously staged patch completely stages
+a deletion on the next Add/Apply. The input list shows local brush errors and
+colors; Remove on a local brush edit discards that edit. Dataset patches use
+the existing managed patch editor.
+
+Brush regression checks use the existing build and Python environment:
+
+```bash
+AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target VC3D test_spiral_brush_patch test_spiral_input_workflow test_spiral_input_draft test_spiral_point_placement_mode test_spiral_point_collection_edit -j 4
+AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" ctest --test-dir volume-cartographer/build -R '^spiral_(brush_patch|input_workflow|input_draft|point_placement_mode|point_collection_edit)$' --output-on-failure
+```
+
+Set `SPIRAL_PATCH_REAL_INPUT` to a real tifxyz patch directory to include the
+read-only selection check and draft-copy validation. `SPIRAL_PATCH_EVIDENCE_DIR`
+optionally receives before/after selection-mask images. These checks cover CPU
+geometry and the editing workflow; they do not run GPU fitting.
+
 In the Spiral workspace, `Q` and `E` place same-winding and relative-winding
 points. Relative annotations count 0, 1, 2, ... in placement order; `F` reverses
 the chain and mirrors annotations. Existing collections remain editable after

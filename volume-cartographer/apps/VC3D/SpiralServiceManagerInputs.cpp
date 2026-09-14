@@ -224,9 +224,9 @@ void SpiralServiceManager::stageInput(const QString& kind, const QString& path, 
     emit inputDraftStaged(alias);
 }
 
-void SpiralServiceManager::stagePatch(const QString& directory, const QString& inputId)
+void SpiralServiceManager::stagePatch(const QString& directory, const QString& inputId, bool deleted)
 {
-    stageInput(QStringLiteral("patch"), directory, inputId, QStringLiteral("verified"));
+    stageInput(QStringLiteral("patch"), directory, inputId, QStringLiteral("verified"), {}, deleted);
 }
 
 void SpiralServiceManager::stageJsonInput(const QString& kind, const QString& path,

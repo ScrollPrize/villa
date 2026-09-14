@@ -2,6 +2,8 @@
 #include <QUuid>
 
 #include "SpiralBrushCursorWidget.hpp"
+#include "SpiralPatchCells.hpp"
+#include "SpiralPatchProjection.hpp"
 #include "SurfaceOverlayColors.hpp"
 #include "VCSettings.hpp"
 #include "overlays/PointsOverlayController.hpp"
@@ -11,6 +13,7 @@
 // OpenCvCompat pulls that header in on 5 and is a no-op on 4.
 #include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 
 #include <QDateTime>
 #include <QEvent>
@@ -26,6 +29,7 @@
 #include <QRandomGenerator>
 #include <QSettings>
 #include <QWheelEvent>
+#include <QUuid>
 
 #include <opencv2/imgproc.hpp>
 
@@ -236,6 +240,7 @@ std::uint64_t SpiralBrushController::sourceOrder(PclRole role, std::size_t index
 
 void SpiralBrushController::resetSession()
 {
+    _patchMode.deactivate();
     _gestures.clear();
     _polylines.clear();
     for (const PclRole role : vc3d::spiral::kEditablePclRoles) {
@@ -272,7 +277,7 @@ void SpiralBrushController::resetSession()
 bool SpiralBrushController::hasUnfinalizedPaint() const
 {
     return std::any_of(_gestures.begin(), _gestures.end(), [](const Gesture& gesture) {
-        return gesture.state == GestureState::Painted && !gesture.shape.isEmpty();
+        return gesture.state == GestureState::Painted && !gesture.emptyLocal();
     });
 }
 
@@ -298,7 +303,7 @@ bool SpiralBrushController::hasLocalChangesFor(const QString& id) const
 bool SpiralBrushController::hasReadyDrafts() const
 {
     return std::any_of(_gestures.begin(), _gestures.end(), [](const Gesture& gesture) {
-        return gesture.state == GestureState::Ready && !gesture.shape.isEmpty();
+        return gesture.state == GestureState::Ready;
     }) || std::any_of(_polylines.begin(), _polylines.end(), [this](const PolylineGesture& line) {
         return line.state == GestureState::Ready
             && (line.kind != PolylineGesture::Kind::PointCollection
@@ -312,7 +317,7 @@ void SpiralBrushController::markDraftsReady()
     deactivatePointPlacement();
     if (_dragMode != DragMode::None) return;
     for (auto& gesture : _gestures) {
-        if (gesture.state == GestureState::Painted && !gesture.shape.isEmpty())
+        if (gesture.state == GestureState::Painted)
             gesture.state = GestureState::Ready;
     }
     for (auto& line : _polylines) {
@@ -537,7 +542,24 @@ void SpiralBrushController::beginPaint(const QPointF& devicePos)
     const cv::Vec2d gridColumn = sourceRaw->gridToSurface({1.0, 0.0});
     const cv::Vec2d gridRow = sourceRaw->gridToSurface({0.0, 1.0});
     if (!std::isfinite(gridOrigin[0]) || !std::isfinite(gridOrigin[1])) return;
+    const auto position = devicePointToSurface(devicePos);
+    if (position) {
+        for (int index = static_cast<int>(_gestures.size()) - 1; index >= 0; --index) {
+            auto& existing = _gestures[static_cast<std::size_t>(index)];
+            if (!existing.visible()) continue;
+            const auto original = mapPatchPoint(*position, source, existing.source);
+            if (!original || !existing.shape.contains(*original)) continue;
+            _activeGesture = index;
+            _lastDevicePos = devicePos;
+            _dragMode = DragMode::Paint;
+            existing.changed();
+            extendDrag(devicePos);
+            emit paintStateChanged();
+            return;
+        }
+    }
     Gesture gesture;
+    gesture.id = QStringLiteral("brush_%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
     gesture.color = nextColor();
     gesture.source = std::move(source);
     gesture.gridOrigin = QPointF(gridOrigin[0], gridOrigin[1]);
@@ -1308,7 +1330,9 @@ void SpiralBrushController::extendDrag(const QPointF& devicePos)
         && _activeGesture < static_cast<int>(_gestures.size())) {
         const QPainterPath addition = deviceToSurface(deviceSweep(_lastDevicePos, devicePos));
         auto& gesture = _gestures[static_cast<std::size_t>(_activeGesture)];
-        gesture.shape = gesture.shape.united(addition);
+        const auto mapped = mapPatchShape(addition, _paintSurface, gesture.source);
+        if (mapped) gesture.shape = gesture.shape.united(*mapped);
+        else gesture.error = tr("Cannot map this stroke to the original patch; the selection was preserved");
     } else if (_dragMode == DragMode::Erase) {
         eraseWith(deviceSweep(_lastDevicePos, devicePos));
     } else if (_dragMode == DragMode::Polyline && !_polylineBlocked) {
@@ -1333,7 +1357,7 @@ void SpiralBrushController::finishDrag(const QPointF& devicePos)
     _activePolyline = -1;
     _polylineBlocked = false;
     _gestures.erase(std::remove_if(_gestures.begin(), _gestures.end(), [](const Gesture& gesture) {
-        return gesture.state == GestureState::Painted && gesture.shape.isEmpty();
+        return gesture.state == GestureState::Painted && gesture.emptyLocal();
     }), _gestures.end());
     emit paintStateChanged();
 }
@@ -1343,10 +1367,11 @@ void SpiralBrushController::eraseWith(const QPainterPath& deviceShape)
     Surface* current = _viewer ? _viewer->currentSurface() : nullptr;
     const QPainterPath surfaceShape = deviceToSurface(deviceShape);
     for (auto& gesture : _gestures) {
-        if ((gesture.state != GestureState::Painted
-             && gesture.state != GestureState::Ready)
-            || gesture.source.get() != current) continue;
-        gesture.shape = gesture.shape.subtracted(surfaceShape);
+        if (!gesture.visible()) continue;
+        const auto mapped = mapPatchShape(surfaceShape, _paintSurface, gesture.source);
+        if (!mapped || !gesture.shape.intersects(*mapped)) continue;
+        gesture.shape = gesture.shape.subtracted(*mapped);
+        gesture.changed();
     }
 
     auto* view = _viewer ? _viewer->graphicsView() : nullptr;
@@ -1547,7 +1572,7 @@ void SpiralBrushController::updateCursorWidget()
         // The brush-diameter ring only means something on the flattened
         // viewer, where paint and erase gestures live.
         const bool brushVisible = cursorHere && &bound == &_flattened
-            && !pointPlacementVisible && (_shiftHeld || _controlHeld);
+            && !pointPlacementVisible && (_patchMode.active() || _shiftHeld || _controlHeld);
         bound.cursorWidget->setCursorState(
             _cursorDevicePos, _diameterPx, brushVisible, pointPlacementVisible,
             accent);
@@ -1579,6 +1604,16 @@ bool SpiralBrushController::eventFilter(QObject* watched, QEvent* event)
     // preview; plane viewers take point placement and selection.
     const bool flattened = bound == &_flattened;
     const bool onViewport = watched == bound->viewport;
+    if (flattened && _patchMode.observe(*event)) {
+        _controlHeld = false;
+        if (_patchMode.active()) {
+            deactivatePointPlacement();
+            if (_vHeld) finishAnchoredPolyline();
+            _vHeld = false;
+        }
+        updateCursorWidget();
+        return true;
+    }
     const auto devicePosition = [&](const QPointF& position,
                                     const QPointF& globalPosition) {
         return onViewport
@@ -1611,6 +1646,7 @@ bool SpiralBrushController::eventFilter(QObject* watched, QEvent* event)
             default:
                 break;
             }
+            if (_pointPlacement.active()) _patchMode.deactivate();
             if (result.transition != SpiralPointPlacementMode::Transition::None) {
                 clearEditablePclHover();
                 updateCursorWidget();
@@ -1634,7 +1670,10 @@ bool SpiralBrushController::eventFilter(QObject* watched, QEvent* event)
         }
         if (key->key() == Qt::Key_V && !key->isAutoRepeat()) {
             if (event->type() == QEvent::KeyPress) {
-                if (!_pointPlacement.active()) _vHeld = true;
+                if (!_pointPlacement.active()) {
+                    _patchMode.deactivate();
+                    _vHeld = true;
+                }
             } else {
                 _vHeld = false;
                 finishAnchoredPolyline();
@@ -1742,6 +1781,18 @@ bool SpiralBrushController::eventFilter(QObject* watched, QEvent* event)
             _pclLeftClickConsumed = true;
             return true;
         }
+        if (flattened && _patchMode.active()
+            && mouse->modifiers() == Qt::NoModifier) {
+            updateCursor(devicePos);
+            if (mouse->button() == Qt::LeftButton) {
+                beginPaint(devicePos);
+                return true;
+            }
+            if (mouse->button() == Qt::RightButton) {
+                beginErase(devicePos);
+                return true;
+            }
+        }
         if (mouse->button() == Qt::LeftButton
             && mouse->modifiers() == Qt::NoModifier) {
             if (const auto hit = editablePclHitAt(viewer, devicePos)) {
@@ -1753,12 +1804,6 @@ bool SpiralBrushController::eventFilter(QObject* watched, QEvent* event)
             // the viewer's ordinary interaction path.
         }
         if (!flattened) return false;
-        if (mouse->button() == Qt::LeftButton && mouse->modifiers() == Qt::ShiftModifier) {
-            _shiftHeld = true;
-            updateCursor(devicePos);
-            beginPaint(devicePos);
-            return _dragMode == DragMode::Paint;
-        }
         if (mouse->button() == Qt::RightButton && mouse->modifiers() == Qt::ShiftModifier) {
             _shiftHeld = true;
             updateCursor(devicePos);
@@ -1808,7 +1853,7 @@ bool SpiralBrushController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
     Surface* current = viewer->currentSurface();
     const bool hasPaint = flattened && std::any_of(
         _gestures.begin(), _gestures.end(), [current](const Gesture& gesture) {
-            return gesture.source.get() == current && !gesture.shape.isEmpty();
+            return gesture.visible() && !gesture.shape.isEmpty();
         });
     return hasPaint || std::any_of(
         _polylines.begin(), _polylines.end(), [this, flattened](const PolylineGesture& line) {
@@ -1853,13 +1898,15 @@ void SpiralBrushController::collectPrimitives(VolumeViewerBase* viewer, OverlayB
     Surface* current = viewer->currentSurface();
     if (flattened) {
         for (const auto& gesture : _gestures) {
-            if (gesture.source.get() != current || gesture.shape.isEmpty()) continue;
+            if (!gesture.visible() || gesture.shape.isEmpty()) continue;
+            const auto displayed = mapPatchShape(gesture.shape, gesture.source, _paintSurface);
+            if (!displayed) continue;
             OverlayStyle style;
             style.penColor = Qt::transparent;
             style.brushColor = gesture.color;
             style.brushColor.setAlphaF(kPaintOpacity);
             style.z = 118.0;
-            builder.addPainterPath(surfaceToScene(gesture.shape), style);
+            builder.addPainterPath(surfaceToScene(*displayed), style);
         }
     }
     for (std::size_t lineIndex = 0; lineIndex < _polylines.size(); ++lineIndex) {
@@ -2046,15 +2093,7 @@ SpiralBrushController::PreparedPatch SpiralBrushController::makePatch(Gesture& g
             if (gesture.shape.contains(scene)) selected(row - row0, col - col0) = 1;
         }
     }
-    cv::Mat1b retained(selected.rows, selected.cols, uchar{0});
-    for (int row = 0; row + 1 < selected.rows; ++row) {
-        for (int col = 0; col + 1 < selected.cols; ++col) {
-            if (!selected(row, col) || !selected(row, col + 1)
-                || !selected(row + 1, col) || !selected(row + 1, col + 1)) continue;
-            retained(row, col) = retained(row, col + 1) = 1;
-            retained(row + 1, col) = retained(row + 1, col + 1) = 1;
-        }
-    }
+    const cv::Mat1b retained = vc3d::spiral::largestPatchQuadComponent(selected);
     std::vector<cv::Point> kept;
     cv::findNonZero(retained, kept);
     if (kept.empty()) return result;
@@ -2069,9 +2108,7 @@ SpiralBrushController::PreparedPatch SpiralBrushController::makePatch(Gesture& g
                 (*output)(row, col) = (*points)(row0 + localRow, col0 + localCol);
         }
     }
-    const QString stamp = QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz"));
-    const QString suffix = QString::number(QRandomGenerator::global()->generate(), 16).rightJustified(8, '0');
-    gesture.id = QStringLiteral("brush_%1_%2").arg(stamp, suffix);
+
     auto patch = std::make_shared<QuadSurface>(output.release(), gesture.source->scale());
     patch->id = gesture.id.toStdString();
     // Painted boundaries already encode the user's exact selection. Unlike
@@ -2093,13 +2130,26 @@ SpiralBrushController::preparePatches(QStringList& warnings)
         return patches;
     }
     for (auto& gesture : _gestures) {
-        if (gesture.state != GestureState::Ready || gesture.shape.isEmpty()) continue;
-        PreparedPatch patch = makePatch(gesture);
+        if (gesture.state != GestureState::Ready || gesture.uploadInFlight) continue;
+        ++gesture.attempt;
+        PreparedPatch patch;
+        if (gesture.shape.isEmpty() && gesture.staged) {
+            patch.id = gesture.id;
+            patch.color = gesture.color;
+            patch.surface = gesture.lastPatch;
+            patch.operation = QStringLiteral("delete");
+        } else {
+            patch = makePatch(gesture);
+            patch.operation = !gesture.staged
+                ? QStringLiteral("add") : QStringLiteral("replace");
+        }
         if (!patch.surface) {
-            warnings.push_back(tr("A painted area was too small to contain a complete quad"));
+            gesture.error = tr("Painted area is too small to contain a complete quad");
+            warnings.push_back(tr("%1: %2").arg(gesture.id, gesture.error));
             continue;
         }
-        gesture.state = GestureState::Finalizing;
+        gesture.submitted();
+        gesture.submittedPatch = patch.surface;
         patches.push_back(std::move(patch));
     }
     refreshAll();
@@ -2227,9 +2277,10 @@ SpiralBrushController::preparePointCollections(QStringList& warnings)
 
 void SpiralBrushController::finalizationSucceeded(const QString& id)
 {
-    _gestures.erase(std::remove_if(_gestures.begin(), _gestures.end(), [&](const Gesture& gesture) {
-        return gesture.id == id;
-    }), _gestures.end());
+    for (auto& gesture : _gestures) {
+        if (gesture.id != id) continue;
+        gesture.accepted();
+    }
     for (auto& line : _polylines) {
         if (line.id == id && line.state == GestureState::Finalizing)
             line.state = GestureState::Finalized;
@@ -2267,11 +2318,11 @@ void SpiralBrushController::commitSucceeded(const QStringList& ids)
     emit paintStateChanged();
 }
 
-void SpiralBrushController::finalizationFailed(const QString& id)
+void SpiralBrushController::finalizationFailed(const QString& id, const QString& error)
 {
     for (auto& gesture : _gestures) {
         if (gesture.id == id) {
-            gesture.state = GestureState::Ready;
+            gesture.failed(error.isEmpty() ? tr("Patch submission failed; edit or remove this draft") : error);
         }
     }
     for (auto& line : _polylines) {
@@ -2298,6 +2349,7 @@ void SpiralBrushController::discardDraft(const QString& id)
 
 void SpiralBrushController::discardUnfinalized()
 {
+    _patchMode.deactivate();
     _pointPlacement.deactivate();
     _pclLeftClickConsumed = false;
     _hoveredEditablePcl.reset();
@@ -2318,4 +2370,84 @@ void SpiralBrushController::discardUnfinalized()
         emit suppressedPclCollectionIdsChanged(role, {});
     refreshAll();
     emit paintStateChanged();
+}
+
+QJsonArray SpiralBrushController::patchDrafts() const
+{
+    QJsonArray rows;
+    for (const auto& gesture : _gestures) {
+        if (gesture.state == GestureState::Finalized) {
+            rows.append(QJsonObject{{"id", gesture.id}, {"kind", "patch"},
+                                    {"color", gesture.color.name()}, {"local", false}});
+            continue;
+        }
+        rows.append(QJsonObject{
+            {"local", true},
+            {"id", gesture.id}, {"kind", "patch"},
+            {"state", gesture.error.isEmpty() ?
+                (gesture.state == GestureState::Ready ? "ready" : "draft") : "error"},
+            {"error", gesture.error}, {"color", gesture.color.name()},
+            {"attempt", static_cast<qint64>(gesture.attempt)},
+            {"removable", gesture.removableLocally()},
+        });
+    }
+    return rows;
+}
+
+bool SpiralBrushController::removePatchDraft(const QString& id)
+{
+    for (auto it = _gestures.begin(); it != _gestures.end(); ++it) {
+        if (it->id != id) continue;
+        if (it->uploadInFlight) return false;
+        if (it->staged) {
+            it->shape = it->acceptedShape;
+            it->state = GestureState::Finalized;
+            it->error.clear();
+        } else {
+            _gestures.erase(it);
+        }
+        _activeGesture = -1;
+        refreshAll();
+        emit paintStateChanged();
+        return true;
+    }
+    return false;
+}
+
+bool SpiralBrushController::usesPaintSurface(const std::shared_ptr<QuadSurface>& surface) const
+{
+    return std::any_of(_gestures.begin(), _gestures.end(), [&](const Gesture& gesture) {
+        return gesture.source == surface;
+    });
+}
+
+std::optional<QPointF> SpiralBrushController::mapPatchPoint(
+    const QPointF& point, const std::shared_ptr<QuadSurface>& from,
+    const std::shared_ptr<QuadSurface>& to) const
+{
+    return vc3d::spiral::projectPatchPoint(point, from, to,
+        _patchIndexProvider ? _patchIndexProvider() : nullptr,
+        kPolylineProjectionToleranceVoxels);
+}
+
+std::optional<QPainterPath> SpiralBrushController::mapPatchShape(
+    const QPainterPath& path, const std::shared_ptr<QuadSurface>& from,
+    const std::shared_ptr<QuadSurface>& to) const
+{
+    return vc3d::spiral::projectPatchShape(path, from, to,
+        _patchIndexProvider ? _patchIndexProvider() : nullptr,
+        kPolylineProjectionToleranceVoxels);
+}
+
+std::shared_ptr<QuadSurface> SpiralBrushController::setPatchRemoved(const QString& id, bool removed)
+{
+    for (auto& gesture : _gestures) {
+        if (gesture.id != id) continue;
+        if (gesture.removed != removed) {
+            gesture.setRemoved(removed);
+            refreshAll();
+        }
+        return removed ? nullptr : gesture.lastPatch;
+    }
+    return nullptr;
 }
