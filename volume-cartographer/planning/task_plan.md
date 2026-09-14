@@ -1,56 +1,44 @@
-# Public S3 Lasagna anonymous-first access plan
+# Plan
 
-## Implementation
+1. Use the existing cache mutex for every derived-cache reset. Snapshot normal
+   and validity matrices under that mutex, including the validity fast-path
+   flag, before reading outside the lock. Do not serialize whole renders.
+   Use a private validity snapshot helper shared with validMask(); never nest
+   acquisitions of the non-recursive cache mutex. ensureLoaded() precedes cache
+   locking; any nested locks retain load-mutex then cache-mutex ordering.
+2. Keep point storage, geometry mutation, channel I/O, scheduling and numerical
+   algorithms unchanged. Concurrent point edits/unloading are not made safe by
+   this cache-only fix.
+3. Add a focused concurrent invalidation/render test with exact output checks,
+   including repository TIFFXYZ fixtures. Exercise cache rebuilds and retained
+   snapshots; test the unpatched implementation as a negative control.
+4. Build with 32 jobs and existing dependencies only. Run focused QuadSurface
+   tests and repeated offscreen RPC smoke runs, including four-CPU runs.
+5. Obtain independent plan and code review. Present the PR draft for approval;
+   do not create the PR before approval.
 
-1. Attempt recognized S3 sources anonymously before using any available
-   credentials. A successful anonymous response establishes sticky anonymous
-   access for the owning remote store.
-2. When anonymous access returns 401/403, retry with credentials and retain
-   authenticated mode after a successful or not-found authenticated response.
-   Permit a later anonymous denial to upgrade a mixed-access store.
-3. Coordinate the initial Lasagna store probe so concurrent readers observe one
-   selected mode, while retaining stable anonymous and authenticated clients.
-4. Reverse the ordinary remote Zarr whole-open order so it also selects
-   anonymous access before trying credentials.
-5. Keep AWS error-body recognition diagnostic-only for successful responses;
-   content containing strings such as `AccessDenied` must never change access
-   mode.
+## Specification Updates
 
-## Testing and validation
+Document derived-cache snapshot lifetime and invalidation requirements in
+specs/rendering.md. No render cancellation or geometry-edit contract change.
 
-- Add deterministic unit coverage for exact authenticated/anonymous request
-  counts, successful response bodies containing AWS error words, empty-body
-  HEAD success, concurrent probe coalescing, private fallback, mixed-access
-  upgrade, unrelated failures, and non-S3 control.
-- Cover URL classification for `s3://`, region-qualified S3, virtual-hosted S3
-  HTTPS, and non-S3 HTTPS inputs.
-- Run the relevant remote URL, HTTP fetch, remote file cache, Lasagna manifest,
-  Lasagna project-volume, and remote Zarr tests from the existing build using
-  all 32 build cores.
-- Validate the reported public PHerc0139 manifest with deliberately invalid
-  credentials as a real-data smoke test, without downloading Zarr chunks beyond
-  descriptor validation.
-- Run `git diff --check` on all changed files.
+## Documentation Updates
 
-## Specification updates
+Correct cache ownership and synchronization comments in QuadSurface.hpp.
+Record reproduction, validation and remaining limitations in task_log.md.
 
-Require recognized S3 endpoints to prefer anonymous access without changing
-source identity, while private data retains authenticated behavior.
+## Testing And Validation
 
-## Documentation updates
+Compare coordinates, normals and masks against a serial baseline; include
+concurrent renders and cache clears. Reuse the actual smoke test and record
+failures rather than increasing its timeout. A stress test is not a proof of
+all schedules; source-level locking review is also required.
+Preload fixtures, clone serial render baselines (gen returns TLS views), and
+compare exact finite values and NaN positions. Include all-valid components,
+invalid points, strict validity, normals omitted/requested and depth offsets.
+Only cache-only operations run concurrently. Geometry invalidation, lazy loading,
+channel access and point eviction remain excluded from the concurrent contract.
 
-Update `docs/remote_file_cache.md` and the remote Lasagna attachment section of
-`docs/vc3d_project_files.md` to describe anonymous-first selection and sticky
-access mode.
+## Changelog Update
 
-## Changelog update
-
-Add one dated line describing reliable public S3 Lasagna attachment in the
-planning changelog.
-
-## Independent review
-
-The 2026-08-27 follow-up review found that signed-first handling scanned
-successful payloads for error markers and could not classify an empty-body S3
-HEAD 400. Anonymous-first selection removes both ambiguities while preserving
-private and mixed-access behavior.
+Add one dated summary line after validation.
