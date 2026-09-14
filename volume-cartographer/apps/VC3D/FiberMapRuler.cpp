@@ -55,13 +55,14 @@ struct DistanceTicks {
     std::function<QString(double)> label;
 };
 
-DistanceTicks chooseDistanceTicks(double minStepVx, const std::optional<double>& voxelSizeUm)
+DistanceTicks chooseDistanceTicks(double minStepVx, const std::optional<double>& voxelSizeUm,
+                                  LengthUnit maxUnit = LengthUnit::Metre)
 {
     DistanceTicks ticks;
     if (voxelSizeUm && *voxelSizeUm > 0.0) {
         const double voxelUm = *voxelSizeUm;
         const double stepUm = niceStepAtLeast(minStepVx * voxelUm);
-        const LengthUnit unit = lengthUnitForStepUm(stepUm);
+        const LengthUnit unit = lengthUnitForStepUm(stepUm, maxUnit);
         ticks.stepVx = stepUm / voxelUm;
         ticks.caption = lengthUnitSuffix(unit);
         ticks.label = [voxelUm, unit](double valueVx) {
@@ -372,8 +373,10 @@ void FiberMapRuler::paintHeight(QPainter& painter, const QRect& band)
     if (!(zHigh > zLow)) {
         return;
     }
-    const DistanceTicks ticks =
-        chooseDistanceTicks(kMinDistanceTickSpacingPx / scale, _model.voxelSizeUm);
+    // A scroll is never metres tall: the height axis stays in centimetres
+    // however far out the view is.
+    const DistanceTicks ticks = chooseDistanceTicks(
+        kMinDistanceTickSpacingPx / scale, _model.voxelSizeUm, LengthUnit::Centimetre);
     if (!(ticks.stepVx > 0.0)) {
         return;
     }

@@ -56,6 +56,10 @@ private slots:
         QCOMPARE(lengthUnitForStepUm(50000.0), LengthUnit::Centimetre);
         QCOMPARE(lengthUnitForStepUm(100000.0), LengthUnit::Metre);
         QCOMPARE(lengthUnitForStepUm(2000000.0), LengthUnit::Metre);
+        // A cap holds the unit down however coarse the step gets.
+        QCOMPARE(lengthUnitForStepUm(100000.0, LengthUnit::Centimetre), LengthUnit::Centimetre);
+        QCOMPARE(lengthUnitForStepUm(5000000.0, LengthUnit::Centimetre), LengthUnit::Centimetre);
+        QCOMPARE(lengthUnitForStepUm(5000.0, LengthUnit::Centimetre), LengthUnit::Millimetre);
         QCOMPARE(lengthUnitUm(LengthUnit::Millimetre), 1000.0);
         QCOMPARE(lengthUnitUm(LengthUnit::Metre), 1000000.0);
         QCOMPARE(lengthUnitSuffix(LengthUnit::Centimetre), QStringLiteral("cm"));

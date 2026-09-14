@@ -71,19 +71,20 @@ inline QString lengthUnitSuffix(LengthUnit unit)
 
 // The unit every label of one ruler shares, chosen from the tick step so the
 // labels read as small whole numbers: metres from 10 cm steps up, centimetres
-// from 1 cm steps, millimetres from 0.1 mm steps, micrometres below.
-inline LengthUnit lengthUnitForStepUm(double stepUm)
+// from 1 cm steps, millimetres from 0.1 mm steps, micrometres below. maxUnit
+// caps the climb: a ruler for a quantity that is never metres long (a
+// scroll's height) stays in centimetres however coarse its ticks.
+inline LengthUnit lengthUnitForStepUm(double stepUm, LengthUnit maxUnit = LengthUnit::Metre)
 {
+    LengthUnit unit = LengthUnit::Micrometre;
     if (stepUm >= 100000.0) {
-        return LengthUnit::Metre;
+        unit = LengthUnit::Metre;
+    } else if (stepUm >= 10000.0) {
+        unit = LengthUnit::Centimetre;
+    } else if (stepUm >= 100.0) {
+        unit = LengthUnit::Millimetre;
     }
-    if (stepUm >= 10000.0) {
-        return LengthUnit::Centimetre;
-    }
-    if (stepUm >= 100.0) {
-        return LengthUnit::Millimetre;
-    }
-    return LengthUnit::Micrometre;
+    return lengthUnitUm(unit) > lengthUnitUm(maxUnit) ? maxUnit : unit;
 }
 
 // A length in the given unit, with only the decimals the value needs (up to
