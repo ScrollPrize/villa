@@ -148,23 +148,38 @@ QRect FiberMapRuler::bandRect(const QRect& viewport) const
         return QRect();
     }
     const int thickness = thicknessFor(_edge);
+    // The extent's four edges in viewport pixels; the band runs along the
+    // extent, cut to the viewport, and rests against its edge, clamped so
+    // the band never leaves the viewport.
+    const int ceiling = _view->mapFromScene(QPointF(0.0, _model.extentTopSceneY)).y();
+    const int floor = _view->mapFromScene(QPointF(0.0, _model.extentBottomSceneY)).y();
+    const int leftEdge = _view->mapFromScene(QPointF(_model.extentLeftSceneX, 0.0)).x();
+    const int rightEdge = _view->mapFromScene(QPointF(_model.extentRightSceneX, 0.0)).x();
+    const int runLeft = std::max(std::min(leftEdge, rightEdge), viewport.left());
+    const int runRight = std::min(std::max(leftEdge, rightEdge), viewport.right() + 1);
+    const int runTop = std::max(std::min(ceiling, floor), viewport.top());
+    const int runBottom = std::min(std::max(ceiling, floor), viewport.bottom() + 1);
     switch (_edge) {
     case Edge::Top: {
-        // The band's bottom rests on the ceiling; clamped so the band never
-        // leaves the viewport.
-        const int ceiling = _view->mapFromScene(QPointF(0.0, _model.extentTopSceneY)).y();
+        if (runRight <= runLeft) {
+            return QRect();
+        }
         const int bottom = std::clamp(ceiling, viewport.top() + thickness, viewport.bottom() + 1);
-        return QRect(viewport.left(), bottom - thickness, viewport.width(), thickness);
+        return QRect(runLeft, bottom - thickness, runRight - runLeft, thickness);
     }
     case Edge::Bottom: {
-        const int floor = _view->mapFromScene(QPointF(0.0, _model.extentBottomSceneY)).y();
+        if (runRight <= runLeft) {
+            return QRect();
+        }
         const int top = std::clamp(floor, viewport.top(), viewport.bottom() + 1 - thickness);
-        return QRect(viewport.left(), top, viewport.width(), thickness);
+        return QRect(runLeft, top, runRight - runLeft, thickness);
     }
     case Edge::Left: {
-        const int edge = _view->mapFromScene(QPointF(_model.extentLeftSceneX, 0.0)).x();
-        const int right = std::clamp(edge, viewport.left() + thickness, viewport.right() + 1);
-        return QRect(right - thickness, viewport.top(), thickness, viewport.height());
+        if (runBottom <= runTop) {
+            return QRect();
+        }
+        const int right = std::clamp(leftEdge, viewport.left() + thickness, viewport.right() + 1);
+        return QRect(right - thickness, runTop, thickness, runBottom - runTop);
     }
     }
     return QRect();

@@ -24,12 +24,15 @@ struct FiberMapRulerModel {
     // Unset when the package could not say, in which case the distance rulers
     // count voxels rather than guess a physical length.
     std::optional<double> voxelSizeUm;
-    // The edges of the scroll extent the axes attach to, in scene
+    // The scroll extent the axes attach to and run along, in scene
     // coordinates: the ceiling (scene y of the top), the floor (scene y of the
-    // bottom) and the map's left edge.
+    // bottom) and the map's left and right edges. A band never extends past
+    // the extent: the horizontal ones run from the left edge to the right,
+    // the vertical one from the ceiling to the floor.
     double extentTopSceneY = 0.0;
     double extentBottomSceneY = 0.0;
     double extentLeftSceneX = 0.0;
+    double extentRightSceneX = 0.0;
 };
 
 struct FiberMapRulerStyle {
@@ -67,7 +70,9 @@ public:
 
     // Where the band lies for the current transform, in viewport
     // coordinates: against the extent edge when that is inside the viewport,
-    // against the matching viewport edge otherwise. Empty without a layout.
+    // against the matching viewport edge otherwise, and along the edge only
+    // as far as the extent reaches. Empty without a layout or when the
+    // extent is entirely off screen along the band.
     [[nodiscard]] QRect bandRect(const QRect& viewport) const;
 
     // Paints the band into `painter`, which must be in viewport (device)

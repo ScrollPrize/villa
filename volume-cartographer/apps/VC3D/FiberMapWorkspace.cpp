@@ -467,6 +467,11 @@ FiberMapView::FiberMapView(QWidget* parent)
     setResizeAnchor(QGraphicsView::AnchorViewCenter);
     setRenderHints(QPainter::Antialiasing | QPainter::TextAntialiasing);
     setFrameShape(QFrame::NoFrame);
+    // The axes are painted in viewport coordinates over the scene. The
+    // default minimal update mode scrolls the viewport pixels on a pan and
+    // repaints only the exposed strips, which drags stale copies of the axes
+    // along with the map; a full repaint per pan keeps them in place.
+    setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
     setCursor(Qt::ArrowCursor);
     // The right button drives the pan, so the platform must not turn it into a
     // context-menu event that would reach the surrounding QMainWindow.
@@ -1708,6 +1713,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         rulerModel.extentTopSceneY = extentTopY;
         rulerModel.extentBottomSceneY = extentBottomY;
         rulerModel.extentLeftSceneX = _layout.x0Vx;
+        rulerModel.extentRightSceneX = _layout.x1Vx;
         _view->setRulerModel(rulerModel);
     }
 
