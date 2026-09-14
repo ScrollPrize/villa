@@ -371,7 +371,6 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     if (!cachedProjectPath.empty() && isNonEmptyFile(cachedProjectPath)) {
         try {
             vc::project::LoadOptions opts;
-            opts.remoteCacheRoot = remoteCacheRoot;
             opts.deferResolution = true;
             pkg = VolumePkg::load(
                 cachedProjectPath,
@@ -389,15 +388,10 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
 
     if (!pkg) {
         vc::project::LoadOptions opts;
-        opts.remoteCacheRoot = remoteCacheRoot;
         opts.deferResolution = true;
         pkg = VolumePkg::newEmpty(opts);
     }
     pkg->setName(sample.id.empty() ? "Open Data Sample" : sample.id);
-    if (!remoteCacheRoot.empty()) {
-        pkg->setRemoteCacheRoot(remoteCacheRoot);
-    }
-
     auto attachResult = attachOpenDataSampleVolumes(*pkg, sample, selection);
     result.supportedVolumes = attachResult.supportedVolumes;
     result.attachedVolumeEntries = attachResult.attachedVolumeEntries;

@@ -354,6 +354,14 @@ void CVolumeViewerView::wheelEvent(QWheelEvent *event)
         delta = angleDelta.x();
     }
 
+    // A partial notch gathered under one modifier set must not complete a
+    // step under another: the line annotation current cut binds Shift and
+    // Ctrl+Shift to different motions, so a remainder carried across the change
+    // would fire the wrong one.
+    if (event->modifiers() != _wheelAccumModifiers) {
+        _wheelAccum = 0;
+        _wheelAccumModifiers = event->modifiers();
+    }
     _wheelAccum += delta;
     constexpr int kStepThreshold = 120;  // one notch = one step
     int steps = _wheelAccum / kStepThreshold;

@@ -41,7 +41,7 @@ import BeforeAfter from '@site/src/components/BeforeAfter';
 import ChatCallout from '@site/src/components/ChatWidget/ChatCallout';
 
 
-*Last updated: August 14, 2026*
+*Last updated: September 6, 2026*
 
 <ChatCallout prefill="Walk me through the ink detection tutorial" />
 
@@ -482,7 +482,14 @@ The figure below shows this loop in action on PHerc. 1667: with each iteration t
 
 Everything above trains a model on one scroll and runs it on segments of that same scroll. But the goal — and the open [First Letters Prizes](/prizes#first-letters-prizes) — is finding ink in scrolls nobody has read yet, where there are no labels to train on. For that, we share pretrained **cross-scroll models**: ink detectors trained on aligned labels from four scrolls (PHerc. 0139, PHerc. 1667, PHerc. Paris 4, and PHerc. 0814) at a common working resolution of roughly 9&nbsp;µm isotropic.
 
-The models live at [`scrollprize/ink_9um`](https://huggingface.co/scrollprize/ink_9um) on Hugging Face: a small local 3D stem feeding a 2D U-Net, trained twice with only the seed changed (`hybrid_3d2d-seed42/` and `hybrid_3d2d-seed43/`), with seven checkpoints each along the training trajectory (`step-010000.pth` up to `step-075000.pth`). Different checkpoints behave a bit differently on different segments, so it's worth trying a few. Grab one to start:
+The models live at [`scrollprize/ink_9um`](https://huggingface.co/scrollprize/ink_9um) on Hugging Face: a small local 3D stem feeding a 2D U-Net, trained twice with only the seed changed (`hybrid_3d2d-seed42/` and `hybrid_3d2d-seed43/`), with seven checkpoints each along the training trajectory (`step-010000.pth` up to `step-075000.pth`).
+
+<figure>
+  <a href="/img/tutorials/ink-hybrid-3d2d.svg" target="_blank"><img src="/img/tutorials/ink-hybrid-3d2d.svg" width="900" height="356" style={{height: 'auto'}} alt="Diagram of the hybrid 3D-to-2D ink model: a 17-slice surface volume patch goes through two 3D convolutions, is collapsed along depth by attention pooling and max pooling, concatenated into a 32-channel 2D map, and passed through a six-stage 2D U-Net to produce an ink probability image in which two Greek letters are legible." /></a>
+  <figcaption className="mt-0">The hybrid 3D→2D model. A small 3D stem pools the 17-slice patch down to a 2D feature map, and a 2D U-Net predicts ink from that map.</figcaption>
+</figure>
+
+Different checkpoints behave a bit differently on different segments, so it's worth trying a few. Grab one to start:
 
 ```bash
 uvx --from huggingface_hub hf download scrollprize/ink_9um \
@@ -585,7 +592,7 @@ uvx --from huggingface_hub hf buckets sync hf://buckets/scrollprize/datasets/ink
 
 It contains labels only: 24 segments annotated on pooled 2.4&nbsp;µm renders (`labels/aligned-scrollprizeorg-21slices/`) and 5 on native 9.362&nbsp;µm renders (`labels/native9-scrollprizeorg-21slices/`), in exactly the segment-folder layout the trainer consumes. The surface volumes come from the open-data server; the dataset README's per-segment tables say which public volume each segment annotates.
 
-The full recipe lives in a single config file. Copy `src/vesuvius/ink_detection/configs/aligned21_hybrid_3d2d.json` from the repo into your `configs/` folder. It defines the hybrid 3D→2D model, a jittered 17-of-21 depth window, robust normalization, and batches drawn with fixed per-scroll quotas (29/22/11/2 of 64), and its `datasets` block already lists all 29 training representations: 24 aligned and 5 native, covering 25 physical segments. What it expects from you is each segment's surface volume, at `<segment>/surface-volume.zarr` next to its labels: the native 9.362&nbsp;µm renders are used as they come from the server, and the 2.4&nbsp;µm ones are first pooled to ~9.6&nbsp;µm with `python -m vesuvius.ink_detection.preprocessing.prepare_9um_isotropic_input <in.zarr> <out.zarr>`. Point the `/path/to/ink_9um` placeholder at your synced folder, set `out_dir`, and train:
+The full recipe lives in a single config file. Copy `src/vesuvius/ink_detection/configs/aligned21_hybrid_3d2d.json` from the repo into your `configs/` folder. It defines the hybrid 3D→2D model from the figure above, a jittered 17-of-21 depth window, robust normalization, and batches drawn with fixed per-scroll quotas (29/22/11/2 of 64), and its `datasets` block already lists all 29 training representations: 24 aligned and 5 native, covering 25 physical segments. What it expects from you is each segment's surface volume, at `<segment>/surface-volume.zarr` next to its labels: the native 9.362&nbsp;µm renders are used as they come from the server, and the 2.4&nbsp;µm ones are first pooled to ~9.6&nbsp;µm with `python -m vesuvius.ink_detection.preprocessing.prepare_9um_isotropic_input <in.zarr> <out.zarr>`. Point the `/path/to/ink_9um` placeholder at your synced folder, set `out_dir`, and train:
 
 ```bash
 uv run --extra models python -m vesuvius.ink_detection.training.train configs/aligned21_hybrid_3d2d.json

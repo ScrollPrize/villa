@@ -64,6 +64,7 @@ void AgentBridgeServer::registerLasagnaHandlers()
                 Params::optionalString(QStringLiteral("configPath")),
                 optionalVec3(QStringLiteral("seed")),
                 Params::optionalString(QStringLiteral("atlasPath")),
+                Params::optionalString(QStringLiteral("initShellDir")),
             },
             .errors = {-32602, -32000, -32004, -32005, -32007, -32009},
             .mcp = Mcp::snakeCase(

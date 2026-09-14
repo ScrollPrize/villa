@@ -307,6 +307,16 @@ TEST_CASE("httpGetString: bad URL surface as exception, not crash")
     }
 }
 
+TEST_CASE("httpGetBytes: transport failure is not mistaken for an HTTP miss")
+{
+    try {
+        (void)vc::httpGetBytes("not://a/real/scheme");
+        FAIL("expected a transport exception");
+    } catch (const std::exception& e) {
+        CHECK(std::string(e.what()).find("HTTP transport error") != std::string::npos);
+    }
+}
+
 TEST_CASE("httpGetString: empty URL handled gracefully")
 {
     try {

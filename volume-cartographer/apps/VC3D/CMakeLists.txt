@@ -107,7 +107,6 @@ set(srcs
     elements/DownloadQueueDebugOverlay.hpp
     elements/ViewerSplitGrid.cpp
     elements/ViewerSplitGrid.hpp
-    RemoteVolumeCachePaths.cpp
     SettingsDialog.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
@@ -177,6 +176,7 @@ set(srcs
     overlays/PlaneSlicingOverlayController.hpp
     overlays/SurfaceRotationOverlayController.cpp
     overlays/SurfaceRotationOverlayController.hpp
+    overlays/SurfaceRotationTransform.hpp
     overlays/AtlasOverlayController.cpp
     overlays/AtlasOverlayController.hpp
     overlays/AtlasControlPointsOverlayController.cpp

@@ -1304,3 +1304,162 @@ def test_reviewed_dropped_when_only_one_side_of_a_splice_was_reviewed():
 
     assert result['ok'], result['conflicts']
     assert fiber_merge.REVIEWED_TAG not in result['merged']['tags']
+
+
+# --- version 3 documents through refresh_pair_links ------------------------
+# v3 control points are {'position': ..., 'segment_to_next': ...} dicts;
+# every refresh test above drives the consistency pass with v1 bare-list
+# points, which is how a dict-vs-list crash shipped (any conflicting linked
+# v3 fiber demoted to a manual conflict). These pin the v3 paths.
+
+
+def make_v3_pair(a_name, b_name, a_cps, b_cps, a_index, b_index,
+                 pending=True):
+    """A consistent linked version-3 fiber pair, as VC3D would write it."""
+    a = make_v3_fiber(a_cps, filename=a_name)
+    b = make_v3_fiber(b_cps, filename=b_name)
+    pa, pb = a_cps[a_index], b_cps[b_index]
+    da = fiber_merge.endpoint_tangent(a['line_points'], pa)
+    db = fiber_merge.endpoint_tangent(b['line_points'], pb)
+    a['branches'] = [{
+        'control_point_index': a_index, 'branch_fiber_id': 2,
+        'branch_control_point_index': b_index, 'branch_file': b_name,
+        'control_point_direction': da, 'branch_control_point_direction': db,
+        'control_point_position': list(pa),
+        'branch_control_point_position': list(pb), 'pending': pending,
+    }]
+    b['branches'] = [{
+        'control_point_index': b_index, 'branch_fiber_id': 1,
+        'branch_control_point_index': a_index, 'branch_file': a_name,
+        'control_point_direction': db, 'branch_control_point_direction': da,
+        'control_point_position': list(pb),
+        'branch_control_point_position': list(pa), 'pending': pending,
+    }]
+    return a, b
+
+
+# Deliberately NOT parallel to BASE_CPS (which runs along x): a z-direction
+# peer gives the pair distinct endpoint tangents, so a swapped or miswired
+# direction field fails the loader checks instead of hiding behind
+# coincidentally equal tangents.
+B_CPS_V3 = [[100.0, 200.0, 350.0 + 10.0 * i] for i in range(4)]
+
+
+def test_refresh_v3_consistent_pair_is_noop():
+    a, b = make_v3_pair('a.json', 'b.json', BASE_CPS, B_CPS_V3, 2, 1)
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert out['ok']
+    assert not out['a_changed'] and not out['b_changed']
+    assert out['a_doc'] == a and out['b_doc'] == b
+    assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
+
+
+@pytest.mark.parametrize('with_base', [False, True])
+def test_refresh_v3_restores_missing_reciprocal(with_base):
+    a, b = make_v3_pair('a.json', 'b.json', BASE_CPS, B_CPS_V3, 2, 1)
+    base_a = copy.deepcopy(a) if with_base else None
+    b['branches'] = []
+    out = refresh_pair_links(a, b, 'a.json', 'b.json', base_doc=base_a)
+    assert out['ok'] and out['b_changed'] and not out['a_changed']
+    restored = out['b_doc']['branches'][0]
+    assert restored['branch_file'] == 'a.json'
+    assert restored['control_point_index'] == 1
+    assert restored['branch_control_point_index'] == 2
+    # Positions must be bare float triples (the loader's wire format), not
+    # v3 control-point dicts.
+    assert restored['control_point_position'] == B_CPS_V3[1]
+    assert restored['branch_control_point_position'] == BASE_CPS[2]
+    assert restored['pending'] is True
+    assert out['b_doc']['generation'] == 2
+    assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
+
+
+def test_v3_generation_only_conflict_merges_and_refreshes_cleanly():
+    """The field incident: two users merely OPEN the same linked v3 fiber
+    (VC3D re-saves with a generation bump on open), so both sides differ
+    from the base only in 'generation'. The merge takes the v3 span-merge
+    branch with every span owner 'none'; the consistency pass must then
+    rewrite nothing."""
+    base_a, b = make_v3_pair('a.json', 'b.json', BASE_CPS, B_CPS_V3, 2, 1)
+    local = copy.deepcopy(base_a)
+    local['generation'] = 2
+    remote = copy.deepcopy(base_a)
+    remote['generation'] = 3
+
+    result = merge_fibers(base_a, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['peer_files'] == ['b.json']
+
+    out = refresh_pair_links(result['merged'], b, 'a.json', 'b.json',
+                             base_doc=base_a)
+    assert out['ok']
+    assert not out['a_changed'] and not out['b_changed']
+    assert out['a_doc'] == result['merged'] and out['b_doc'] == b
+    assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
+
+
+@pytest.mark.parametrize('changed_side', ['local', 'remote'])
+def test_v3_short_circuit_merge_then_refresh(changed_side):
+    """One side untouched since the base: merge_fibers returns through its
+    short-circuit branches, which still report peer_files — the consistency
+    pass runs on those results in production too."""
+    base_a, b = make_v3_pair('a.json', 'b.json', BASE_CPS, B_CPS_V3, 2, 1)
+    changed = copy.deepcopy(base_a)
+    changed['generation'] = 2
+    local = changed if changed_side == 'local' else copy.deepcopy(base_a)
+    remote = changed if changed_side == 'remote' else copy.deepcopy(base_a)
+
+    result = merge_fibers(base_a, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['peer_files'] == ['b.json']
+    assert result['merged'] == changed
+
+    out = refresh_pair_links(result['merged'], b, 'a.json', 'b.json',
+                             base_doc=base_a)
+    assert out['ok']
+    assert not out['a_changed'] and not out['b_changed']
+    assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
+
+
+def test_v3_one_sided_span_edit_merges_and_refreshes():
+    """A real edit on one side of a linked v3 fiber (span re-run away from
+    the link anchor) while the other side just opened it: the span result
+    must be carried atomically and the pair must clear every loader check."""
+    base_a, b = make_v3_pair('a.json', 'b.json', BASE_CPS, B_CPS_V3, 2, 1)
+    local = copy.deepcopy(base_a)
+    set_v3_span(local, 5, goal='cspline', bend=1.5)
+    local['generation'] = 2
+    remote = copy.deepcopy(base_a)
+    remote['generation'] = 3
+
+    result = merge_fibers(base_a, local, remote)
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    assert merged['control_points'][5]['segment_to_next']['interp_goal'] == 'cspline'
+    assert merged['line_points'][21:24] == local['line_points'][21:24]
+    assert result['peer_files'] == ['b.json']
+
+    out = refresh_pair_links(merged, b, 'a.json', 'b.json', base_doc=base_a)
+    assert out['ok']
+    assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
+
+
+def test_refresh_v3_fiber_with_v1_peer_is_noop():
+    """Mid-migration reality: a v3 fiber linked to a not-yet-migrated v1
+    peer. The pass must handle both control-point shapes in one call."""
+    a, _ = make_v3_pair('a.json', 'b.json', BASE_CPS, B_CPS_V3, 2, 1)
+    _, b = make_pair('a.json', 'b.json', BASE_CPS, B_CPS_V3, 2, 1)
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert out['ok']
+    assert not out['a_changed'] and not out['b_changed']
+    assert out['a_doc'] == a and out['b_doc'] == b
+    assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
+
+
+def test_endpoint_tangent_accepts_v3_control_point():
+    doc = make_v3_fiber(BASE_CPS)
+    tangent = fiber_merge.endpoint_tangent(doc['line_points'],
+                                           doc['control_points'][2])
+    assert tangent == fiber_merge.endpoint_tangent(doc['line_points'],
+                                                   BASE_CPS[2])
+    assert tangent is not None

@@ -1,0 +1,166 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 356" role="img" aria-labelledby="t d">
+  <title id="t">Hybrid 3D-to-2D ink detection model</title>
+  <desc id="d">A patch of 17 surface-volume slices, 128 by 128 pixels, passes through two 3D convolution layers (3x3x3 kernels, 16 channels). The features are pooled over depth in two ways, an attention-weighted sum and a maximum, and concatenated into a 32-channel 2D map. A six-stage residual 2D U-Net with skip connections turns that map into an ink probability for every pixel. The output panel shows a crop of a real prediction, with two Greek letters legible as bright strokes.</desc>
+  <defs>
+    <style>
+      .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .kicker { font-size: 11.5px; letter-spacing: 1.4px; fill: rgba(255,255,255,0.55); }
+      .title { font-size: 13.5px; font-weight: 600; fill: #E6E8EA; }
+      .label { font-size: 12.5px; fill: #B7BCC2; }
+      .sub { font-size: 11px; fill: rgba(255,255,255,0.55); }
+      .shape { font-size: 11.5px; fill: rgba(255,255,255,0.45); }
+      .rule { stroke: rgba(255,255,255,0.12); stroke-width: 1; }
+      .box { fill: #1F2327; stroke: rgba(255,255,255,0.18); }
+      .flow { stroke: #E5502B; stroke-width: 1.6; fill: none; }
+      .wire { stroke: rgba(255,255,255,0.45); stroke-width: 1.2; fill: none; }
+      .skip { stroke: rgba(255,255,255,0.38); stroke-width: 1.1; fill: none; stroke-dasharray: 3 3; }
+      .enc { fill: #4C535B; }
+      .dec { fill: #5E666F; }
+    </style>
+    <marker id="arrowFlow" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0.5 L7,4 L0,7.5 Z" fill="#E5502B"/>
+    </marker>
+    <marker id="arrowWire" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0.5 L7,4 L0,7.5 Z" fill="rgba(255,255,255,0.55)"/>
+    </marker>
+    <marker id="arrowSkip" markerWidth="7" markerHeight="7" refX="5.5" refY="3.5" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0.5 L6,3.5 L0,6.5 Z" fill="rgba(255,255,255,0.45)"/>
+    </marker>
+    <clipPath id="outClip"><rect x="799" y="166" width="56" height="56" rx="3"/></clipPath>
+  </defs>
+
+  <!-- canvas -->
+  <rect width="900" height="356" fill="#16181B"/>
+
+  <!-- section headings -->
+  <g class="mono kicker">
+    <text x="72" y="44" text-anchor="middle">INPUT</text>
+    <text x="140" y="44">LOCAL 3D STEM</text>
+    <text x="565" y="44">2D U-NET</text>
+    <text x="827" y="44" text-anchor="middle">OUTPUT</text>
+  </g>
+  <g class="rule">
+    <line x1="38" y1="54" x2="106" y2="54"/>
+    <line x1="140" y1="54" x2="548" y2="54"/>
+    <line x1="565" y1="54" x2="761" y2="54"/>
+    <line x1="799" y1="54" x2="855" y2="54"/>
+  </g>
+
+  <g transform="translate(0,-36)">
+    <!-- ===== INPUT: a stack of 17 slices ===== -->
+    <g>
+      <rect x="54" y="160" width="52" height="52" rx="2" fill="#1E2226" stroke="rgba(255,255,255,0.18)"/>
+      <rect x="50" y="164" width="52" height="52" rx="2" fill="#20242A" stroke="rgba(255,255,255,0.22)"/>
+      <rect x="46" y="168" width="52" height="52" rx="2" fill="#23282D" stroke="rgba(255,255,255,0.26)"/>
+      <rect x="42" y="172" width="52" height="52" rx="2" fill="#272C32" stroke="rgba(255,255,255,0.32)"/>
+      <rect x="38" y="176" width="52" height="52" rx="2" fill="#2C3137" stroke="rgba(255,255,255,0.45)"/>
+    </g>
+    <g class="sans" text-anchor="middle">
+      <text class="label" x="72" y="252">surface volume patch</text>
+      <text class="sub" x="72" y="270">17 slices, 128×128 px</text>
+    </g>
+
+    <!-- input -> stem -->
+    <path class="flow" d="M112,194 H136" marker-end="url(#arrowFlow)"/>
+
+    <!-- ===== LOCAL 3D STEM ===== -->
+    <!-- two 3D conv layers -->
+    <rect class="box" x="140" y="140" width="150" height="108" rx="6"/>
+    <g class="sans" text-anchor="middle">
+      <text class="title" x="215" y="176">two 3D conv layers</text>
+      <text class="label" x="215" y="198">3×3×3 kernels</text>
+      <text class="label" x="215" y="214">16 channels</text>
+      <text class="sub" x="215" y="232">InstanceNorm, LeakyReLU</text>
+    </g>
+
+    <!-- split into the two depth poolings -->
+    <path class="wire" d="M290,194 H298 Q302,194 302,190 V162 Q302,158 306,158 H312" marker-end="url(#arrowWire)"/>
+    <path class="wire" d="M302,194 V226 Q302,230 306,230 H312" marker-end="url(#arrowWire)"/>
+
+    <!-- what the poolings do -->
+    <text class="sans label" x="394" y="116" text-anchor="middle">pool over depth: 3D features → 2D map</text>
+
+    <!-- attention pooling -->
+    <rect class="box" x="316" y="128" width="156" height="60" rx="6"/>
+    <g class="sans" text-anchor="middle">
+      <text class="label" x="394" y="148" fill="#E6E8EA">attention pooling</text>
+      <text class="sub" x="394" y="165">weighted sum over depth</text>
+      <text class="sub" x="394" y="181">learned softmax weights</text>
+    </g>
+
+    <!-- max pooling -->
+    <rect class="box" x="316" y="200" width="156" height="60" rx="6"/>
+    <g class="sans" text-anchor="middle">
+      <text class="label" x="394" y="220" fill="#E6E8EA">max pooling</text>
+      <text class="sub" x="394" y="237">maximum over depth</text>
+      <text class="sub" x="394" y="253">keeps the strongest response</text>
+    </g>
+
+    <!-- merge: concatenate the two 16-channel maps -->
+    <path class="wire" d="M472,158 H478 Q482,158 482,162 V190 Q482,194 486,194 H488"/>
+    <path class="wire" d="M472,230 H478 Q482,230 482,226 V194"/>
+    <circle cx="488" cy="194" r="2.4" fill="rgba(255,255,255,0.6)"/>
+    <path class="flow" d="M490,194 H561" marker-end="url(#arrowFlow)"/>
+    <g class="sans" text-anchor="middle">
+      <text class="label" x="525" y="181">concatenate</text>
+      <text class="sub" x="525" y="213">32 channels</text>
+    </g>
+
+    <!-- ===== 2D U-NET ===== -->
+    <!-- encoder: 128² 32 ch, 64² 64, 32² 128, 16² 256, 8² 320 -->
+    <rect class="enc" x="565" y="144" width="8" height="100" rx="2"/>
+    <rect class="enc" x="579" y="152" width="10" height="84" rx="2"/>
+    <rect class="enc" x="595" y="160" width="12" height="68" rx="2"/>
+    <rect class="enc" x="613" y="168" width="14" height="52" rx="2"/>
+    <rect class="enc" x="633" y="176" width="16" height="36" rx="2"/>
+    <!-- bottleneck: 4² 320 ch -->
+    <rect class="enc" x="655" y="183" width="16" height="22" rx="2"/>
+    <!-- decoder: 8² 320, 16² 256, 32² 128, 64² 64, 128² 32 -->
+    <rect class="dec" x="677" y="176" width="16" height="36" rx="2"/>
+    <rect class="dec" x="699" y="168" width="14" height="52" rx="2"/>
+    <rect class="dec" x="719" y="160" width="12" height="68" rx="2"/>
+    <rect class="dec" x="737" y="152" width="10" height="84" rx="2"/>
+    <rect class="dec" x="753" y="144" width="8" height="100" rx="2"/>
+
+    <!-- skip connections: each encoder stage feeds the decoder stage at the same resolution -->
+    <path class="skip" d="M641,176 V171 Q641,166 646,166 H680 Q685,166 685,171 V173" marker-end="url(#arrowSkip)"/>
+    <path class="skip" d="M620,168 V159 Q620,154 625,154 H701 Q706,154 706,159 V165" marker-end="url(#arrowSkip)"/>
+    <path class="skip" d="M601,160 V147 Q601,142 606,142 H720 Q725,142 725,147 V157" marker-end="url(#arrowSkip)"/>
+    <path class="skip" d="M584,152 V135 Q584,130 589,130 H737 Q742,130 742,135 V149" marker-end="url(#arrowSkip)"/>
+    <path class="skip" d="M569,144 V123 Q569,118 574,118 H752 Q757,118 757,123 V141" marker-end="url(#arrowSkip)"/>
+    <text class="sans sub" x="663" y="112" text-anchor="middle">skip connections</text>
+
+    <!-- U-Net annotations -->
+    <text class="sans sub" x="663" y="234" text-anchor="middle">4×4, 320 channels</text>
+    <g class="sans sub" text-anchor="middle">
+      <text x="663" y="284">6 stages, residual conv blocks</text>
+      <text x="663" y="300">encoder: strided conv halves the resolution</text>
+      <text x="663" y="316">decoder: transposed conv doubles it back</text>
+    </g>
+
+    <!-- U-Net -> output -->
+    <path class="flow" d="M763,194 H795" marker-end="url(#arrowFlow)"/>
+
+    <!-- ===== OUTPUT: ink probability map (crop of a real prediction) ===== -->
+    <rect x="799" y="166" width="56" height="56" rx="3" fill="#0E0F11"/>
+    <image clip-path="url(#outClip)" x="799" y="166" width="56" height="56"
+           preserveAspectRatio="xMidYMid slice"
+           href="data:image/webp;base64,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"/>
+    <rect x="799" y="166" width="56" height="56" rx="3" fill="none" stroke="rgba(255,255,255,0.40)"/>
+    <g class="sans" text-anchor="middle">
+      <text class="label" x="827" y="252">ink probability map</text>
+      <text class="sub" x="827" y="270">one value per pixel</text>
+      <text class="sub" x="827" y="288">1×1 conv, then sigmoid</text>
+    </g>
+  </g>
+
+  <!-- tensor shapes under each stage -->
+  <g class="mono shape" text-anchor="middle">
+    <text x="72" y="312">1 × 17 × 128 × 128</text>
+    <text x="215" y="312">16 × 17 × 128 × 128</text>
+    <text x="525" y="312">32 × 128 × 128</text>
+    <text x="827" y="312">1 × 128 × 128</text>
+  </g>
+  <text class="sans sub" x="450" y="338" text-anchor="middle">tensor shapes: channels × depth (slices) × height × width</text>
+</svg>

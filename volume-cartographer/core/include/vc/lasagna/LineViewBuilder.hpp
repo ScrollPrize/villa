@@ -11,7 +11,15 @@ class QuadSurface;
 
 namespace vc::lasagna {
 
-inline constexpr double kLineViewSamplingDistanceBaseVoxels = 32.0;
+// Along-strip resampling target and declared along-line grid density. Also the
+// control-point collapse radius in VC3D (LineAnnotationController), which keeps
+// every control span at least this long so no span is ever shorter than one
+// strip column (the #1484 strip model: a span shorter than the target is drawn
+// as one full column and would be stretched).
+inline constexpr double kLineViewAlongSamplingDistanceBaseVoxels = 8.0;
+// Cross-row spacing of the fixed seven-row ribbons (192 base voxels first to
+// last row). Independent of the along-strip target; along <= cross.
+inline constexpr double kLineViewCrossRowSpacingBaseVoxels = 32.0;
 inline constexpr int kLineViewCrossSampleCount = 7;
 
 struct LineViewConfig {
@@ -19,7 +27,7 @@ struct LineViewConfig {
     // optimized polyline between adjacent controls as closely as possible to
     // this spacing. The declared along-strip scale always uses this target, so
     // a shorter control-point span occupies one full display interval.
-    double targetSpacingBaseVoxels = kLineViewSamplingDistanceBaseVoxels;
+    double targetSpacingBaseVoxels = kLineViewAlongSamplingDistanceBaseVoxels;
     // Fractional indices into LineModel::points. Line endpoints are always
     // retained as additional supports. Empty retains every line point for
     // callers that do not have separate annotation-control metadata.

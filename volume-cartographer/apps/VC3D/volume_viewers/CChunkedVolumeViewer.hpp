@@ -34,6 +34,7 @@
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/Compositing.hpp"
+#include "vc/core/util/Rect3D.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class CState;
@@ -110,6 +111,11 @@ public:
     float normalOffset() const override { return _zOff; }
     CameraState cameraState() const;
     void applyCameraState(const CameraState& state, bool forceRender = true);
+    // Pins the camera's surface Y: pans move only along X, zooms are anchored
+    // on that row, and resets, centering and applied camera states land back
+    // on it. Enforced in syncCameraTransform(), i.e. before any render is
+    // submitted or repainted, so no frame is ever shown off the pinned row.
+    void setPinnedSurfaceY(std::optional<float> surfaceY);
     void applyCameraStateForReplayRepaint(const CameraState& state);
     // Render-bench helpers: true when no render is running/queued/pending; count of
     // remote chunk fetches still outstanding. Used by replay to settle each frame.
@@ -170,6 +176,11 @@ public:
     const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const override;
 
     void setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items) override;
+    // Moves every item registered under `key` by `delta` scene units; false
+    // when no group is registered under that key. Overlay scene coordinates
+    // are affine in the camera pointer at a fixed zoom, so a pan can shift a
+    // group in place instead of rebuilding it.
+    bool translateOverlayGroup(const std::string& key, const QPointF& delta);
     void clearOverlayGroup(const std::string& key) override;
     void clearAllOverlayGroups() override;
 
@@ -409,6 +420,9 @@ private:
         std::shared_ptr<vc::render::SurfaceCache> surfaceCache;
         std::shared_ptr<vc::render::SurfaceCache> overlaySurfaceCache;
         std::uint64_t surfaceCacheEpoch = 0;
+        // Effective launch-time bounds. Null for disabled bounds and for view
+        // types outside the supported plane/annotation scope.
+        std::optional<Rect3D> focusBoundsBase;
         std::shared_ptr<GeneratedSurfaceCache> genCache;
         bool genCacheDirty = false;
         std::string profileReason;
@@ -590,6 +604,7 @@ private:
 
     float _surfacePtrX = 0.0f;
     float _surfacePtrY = 0.0f;
+    std::optional<float> _pinnedSurfacePtrY;
     float _scale = 1.0f;
     float _dsScale = 1.0f;
     int _dsScaleIdx = 0;

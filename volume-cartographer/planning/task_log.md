@@ -1,73 +1,53 @@
-# Public S3 Lasagna authentication fallback task log
+# Task Log
 
-## 2026-08-27 findings
+2026-09-14: Created fix/quadsurface-cache-invalidation-race using git checkout
+-b from origin/main at 3b398f7cc. Previous read-only diagnosis on PR #1596
+reproduced a normal-cache reader SIGSEGV under GDB, and 2/20 full smoke runs
+failed during volume.open with four CPUs. The exact CI C3-only timeout has not
+been reproduced or attributed conclusively. No external dependency installs.
 
-- The public PHerc0139 manifest returns HTTP 200 to an unsigned request.
-- `resolveRemoteUrl()` intentionally classifies both `s3://` locators and
-  virtual-hosted `*.s3.amazonaws.com` HTTPS URLs as S3. Changing between those
-  forms therefore does not bypass signing.
-- Manual remote Lasagna attachment loads ambient AWS credentials before opening
-  the manifest. The observed credentials contain a rejected session token.
-- `RemoteFileCache` performs one credentialed request and reports
-  `InvalidToken`; it has no anonymous retry.
-- The ordinary remote Zarr opener already retries anonymously after a rejected
-  credentialed open.
-- Lasagna uses a separate exact-byte remote Zarr store. It also builds one
-  credentialed client and currently has no anonymous fallback for descriptor or
-  chunk reads.
-- Open-data catalogue Lasagna preparation avoids this failure by explicitly
-  disabling credential discovery, but manually attached manifests do not carry
-  that public-data knowledge.
-- A path-style `https://s3.amazonaws.com/<bucket>/<key>` locator works as an
-  immediate workaround because the current resolver does not classify that
-  hostname as S3, but it is not an acceptable permanent requirement.
+Scope: derived-cache invalidation versus rendering. Concurrent geometry writes,
+point eviction and arbitrary channel I/O remain externally synchronized duties.
 
-## 2026-08-28 review follow-up
+Independent plan review requested explicit lock ordering and matching mask/flag
+snapshots, cloned render baselines, and concurrent-operation exclusions; all
+incorporated. Independent code review found no implementation defect and caught
+a test hole outside the cropped view. The test now covers the full source grid,
+both components and interior invalid points, with explicit NaN assertions.
 
-- Signed-first fallback scanned successful response bodies for AWS error words,
-  so private content containing a marker could be discarded.
-- S3 HEAD responses carry no error body. A stale session token therefore
-  produced an unclassified empty HTTP 400 before a fresh remote Zarr could open.
-- Anonymous-first access avoids both ambiguities: public data never uses ambient
-  credentials, while anonymous 401/403 responses still fall back to private
-  authenticated access.
-- A not-found or unrelated failure does not select a sticky mode. Concurrent
-  initial requests share one probe, and a later anonymous denial can upgrade a
-  mixed-access store.
+Implemented cache resets under _cacheMutex and reference-counted normal/mask
+snapshots. Existing public signatures, numerical operations and rendering
+scheduling are unchanged. Snapshot acquisition does not copy full matrices or
+hold the mutex through pixel sampling.
 
-## Implementation result
+Validation (Linux GCC QuickBuild, existing system dependencies, -j32):
 
-- `S3AuthFallback` now performs one synchronized anonymous-first probe while
-  retaining stable anonymous and authenticated HTTP clients.
-- Anonymous 2xx responses make anonymous mode sticky. Anonymous 401/403
-  responses retry with credentials, and authenticated 2xx/404 responses retain
-  authenticated mode. Other failures leave the mode undecided.
-- `RemoteFileCache` applies the policy to remote manifest GETs and preserves
-  both anonymous and authenticated status in diagnostics when both fail.
-- Lasagna's exact-byte remote Zarr store applies the policy to HEAD and GET
-  requests, so descriptor validation and later chunk reads share the selected
-  mode without changing cached bytes or source identity.
-- Ordinary remote Zarr opening now attempts the complete anonymous open before
-  retrying with credentials. Optional metadata 403s remain ignorable for
-  least-privilege stores; if discovery then finds no required array metadata,
-  the remembered denial triggers authenticated retry.
-- Successful responses are never classified from their content.
+- Built VC3D and seven focused QuadSurface test targets.
+- ctest --test-dir volume-cartographer/build -R
+  '^test_quadsurface_(cache_concurrency|basics|components|more|fixtures|extras|final)$'
+  --output-on-failure -j32: 7/7 passed (OMP_NUM_THREADS=2).
+- ctest --test-dir volume-cartographer/build -R
+  '^test_quadsurface_cache_concurrency$' --repeat until-fail:100
+  --output-on-failure: 100/100 passed, 7.67 seconds total.
+- Negative control: linked the same regression test against the previously
+  compiled pre-fix QuadSurface object. It exited with SIGSEGV (139), including
+  after correcting the test viewport. This is schedule-dependent evidence,
+  not a guarantee that every unpatched run will fail.
+- Reused smoke_offscreen.main() through a temporary diagnostic wrapper that
+  captures process exit/log information. OMP_NUM_THREADS=4, taskset -c 0-3,
+  20 sequential runs: 20/20 passed after the fix versus 18/20 before.
+- New test includes the committed PHerc0172 fixture 20241113090990, generated
+  all-valid components, an interior hole with strict validity, optional normals
+  and depth offsets. Mat row bytes (including NaN payloads) match cloned serial
+  baselines during concurrent eviction. Existing tests cover sequential geometry
+  invalidation and point unloading.
+- No-PCH test compilation caught a missing opencv2/core.hpp include; added it.
+  Recompiled without PCH at -O2, linked against vc_core and ran both test cases:
+  passed. Final seven-target focused CTest run also passed after the include fix.
 
-## Validation
+No dependency installation, full-scroll replay, platform-wide testing, or
+performance claim. The observed CI C3-only timeout remains unattributed; this
+fix targets the separately reproduced cache-reader crash, not every RPC timeout.
 
-- Built `test_http_fetch_errors`, `test_remote_file_cache`,
-  `test_lasagna_manifest`, `test_lasagna_project_volumes`, `test_remote_url`,
-  `test_zarr_chunk_fetcher`, `test_volume_live_s3`, and `VC3D` with 32-way
-  build parallelism.
-- The six focused deterministic tests passed together. The policy test passed
-  20 consecutive executions, including its coordinated eight-thread initial
-  transition case.
-- With `VC_TEST_REQUIRE_NETWORK=1`, `test_lasagna_manifest` passed all 17 cases
-  with a malformed session token configured. The real-data case downloaded the
-  reported PHerc0139 manifest anonymously and opened public `presence` metadata
-  with shape `[9620, 3314, 3314]`.
-- With required network access, `test_volume_live_s3` passed all 10 cases,
-  including its invalid-session-credential anonymous-open case.
-- The initial sandboxed live attempt could not resolve the public hostname;
-  rerunning with network access succeeded. This was an execution-environment
-  restriction, not a code failure.
+Independent final review confirmed the test framing correction; no outstanding
+implementation findings. PR draft prepared for approval; publication is held.

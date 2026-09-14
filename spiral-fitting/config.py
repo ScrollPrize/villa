@@ -312,7 +312,7 @@ class Config:
         self.model_num_flow_integration_steps = 3
         self.model_flow_integration_solver = "rk4"
         self.model_num_flow_timesteps = 1
-        self.model_num_flow_stages = 1
+        self.model_num_flow_stages = 2
         self.model_flow_bounds_z_margin = 160
         self.model_flow_bounds_radius = 3200
         self.model_flow_voxel_resolution = 16

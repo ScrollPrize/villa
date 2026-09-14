@@ -956,11 +956,10 @@ NB_MODULE(volume, m)
             },
             "path"_a)
         .def_static("open_url",
-            [](const std::string& url, const std::filesystem::path& cacheRoot) {
-                return Volume::NewFromUrl(url, cacheRoot);
+            [](const std::string& url) {
+                return Volume::NewFromUrl(url);
             },
-            "url"_a,
-            "cache_root"_a = std::filesystem::path{})
+            "url"_a)
         .def_prop_ro("is_remote", &Volume::isRemote)
         .def_prop_ro("path", [](const Volume& self) { return self.path().string(); })
         .def_prop_ro("remote_url", [](const Volume& self) { return self.remoteUrl(); })

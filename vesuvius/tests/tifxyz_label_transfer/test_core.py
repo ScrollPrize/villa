@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from vesuvius.tifxyz_label_transfer.core import (
     GridVertexIndex,
     Surface,
     SurfaceMapper,
+    automatic_max_distance,
     choose_affine_direction,
     infer_output_shape,
     load_affine,
@@ -537,6 +539,46 @@ class SeamFillTests(unittest.TestCase):
         # mask must be exactly the stage-one interpolated mask.
         np.testing.assert_array_equal(inherited, stage_one_valid == 128)
 
+    def test_seam_fill_stops_at_the_distance_limit(self) -> None:
+        source = plane(24, 24)
+        target = plane(24, 24)
+        # Half the target lifted out of range: not a gap the measured field
+        # surrounds, but a region continuing away from every anchor. Only the
+        # part adjacent to measured data may be filled.
+        target.z[:, 12:] += 5.0
+        rng = np.random.default_rng(11)
+        label = rng.integers(1, 255, (24, 24), dtype=np.uint8)
+
+        _, unbounded_valid, _, unbounded_stats = transfer_array(
+            source, target, label, fill_seams=True, max_seam_distance=math.inf
+        )
+        _, valid, _, stats = transfer_array(
+            source, target, label, fill_seams=True, max_seam_distance=3.0
+        )
+
+        rejected = unbounded_valid == 0
+        self.assertEqual(int(rejected.sum()), 0)
+        self.assertEqual(unbounded_stats.seam_blocked_pixels, 0)
+        # The bound refuses part of what the unbounded fill accepted, and
+        # every pixel is still accounted for as filled or blocked.
+        self.assertGreater(stats.seam_blocked_pixels, 0)
+        self.assertLess(stats.seam_filled_pixels, unbounded_stats.seam_filled_pixels)
+        self.assertEqual(
+            stats.seam_filled_pixels + stats.seam_blocked_pixels,
+            unbounded_stats.seam_filled_pixels,
+        )
+        self.assertEqual(int((valid == 0).sum()), stats.seam_blocked_pixels)
+        self.assertIn("seam_blocked_pixels", stats.as_dict())
+        # Measured pixels are unaffected, and what survives the bound keeps
+        # the value the unbounded fill gave it.
+        measured = unbounded_valid == 255
+        np.testing.assert_array_equal(valid[measured], unbounded_valid[measured])
+        self.assertTrue(np.all(valid[:, :12] > 0))
+        # The refused pixels are the ones furthest from measured data.
+        blocked_columns = np.nonzero((valid == 0).any(axis=0))[0]
+        filled_columns = np.nonzero((valid == 128).any(axis=0))[0]
+        self.assertGreater(blocked_columns.min(), filled_columns.max())
+
     def test_fill_seams_off_leaves_holes(self) -> None:
         source = plane(24, 24)
         target = plane(24, 24)
@@ -547,6 +589,148 @@ class SeamFillTests(unittest.TestCase):
 
         self.assertGreater(int((valid == 0).sum()), 0)
         self.assertEqual(stats.seam_filled_pixels, 0)
+
+
+class SeamAnchorTests(unittest.TestCase):
+    def test_content_anchor_blocks_leak_the_matched_anchor_accepts(
+        self,
+    ) -> None:
+        # The wrong-wrap scenario: annotation lives on the left, and the
+        # target's right side leaves the source surface entirely. The
+        # disagreeing region begins right beside well-matched vertices, so
+        # a bound measured from matched geometry accepts its fill
+        # wholesale; a bound measured from measured annotation rejects it,
+        # while still closing a genuine gap inside the annotated area.
+        source = plane(24, 48)
+        target = plane(24, 48)
+        label = np.zeros((24, 48), dtype=np.uint8)
+        label[:, :4] = 7
+        target.z[10:12, 1:3] += 5.0  # gap surrounded by annotation
+        target.z[:, 30:] += 5.0  # region the source surface does not cover
+
+        _, matched_valid, _, matched_stats = transfer_array(
+            source, target, label, fill_seams=True
+        )
+        _, content_valid, _, content_stats = transfer_array(
+            source, target, label, fill_seams=True, seam_anchor="content"
+        )
+
+        self.assertTrue(np.all(matched_valid[:, 30:] == 128))
+        self.assertEqual(matched_stats.seam_blocked_pixels, 0)
+
+        self.assertTrue(np.all(content_valid[10:12, 1:3] == 128))
+        self.assertTrue(np.all(content_valid[:, 30:] == 0))
+        self.assertGreater(content_stats.seam_blocked_pixels, 0)
+        self.assertEqual(
+            content_stats.seam_filled_pixels
+            + content_stats.seam_blocked_pixels,
+            matched_stats.seam_filled_pixels,
+        )
+
+    def test_content_anchor_with_no_annotation_blocks_every_fill(self) -> None:
+        source = plane(24, 24)
+        target = plane(24, 24)
+        target.z[8:12, :] += 5.0
+        label = np.zeros((24, 24), dtype=np.uint8)
+
+        _, valid, _, stats = transfer_array(
+            source, target, label, fill_seams=True, seam_anchor="content"
+        )
+
+        # With nothing measured to extend, no fill is legitimate.
+        self.assertEqual(stats.seam_filled_pixels, 0)
+        self.assertGreater(stats.seam_blocked_pixels, 0)
+        self.assertTrue(np.all(valid[8:12, :] == 0))
+
+    def test_anchor_distance_output_receives_the_grid_field(self) -> None:
+        source = plane(24, 24)
+        target = plane(24, 24)
+        target.z[8:12, :] += 5.0
+        label = np.full((24, 24), 9, dtype=np.uint8)
+        anchors = np.full((24, 24), -1.0, dtype=np.float32)
+
+        transfer_array(
+            source,
+            target,
+            label,
+            fill_seams=True,
+            seam_anchor_distance_output=anchors,
+        )
+
+        # Zero at every measured vertex, positive inside the filled band,
+        # peaking at the band's middle rows.
+        self.assertTrue(np.all(anchors[:8, :] == 0.0))
+        self.assertTrue(np.all(anchors[12:, :] == 0.0))
+        self.assertTrue(np.all(anchors[8:12, :] > 0.0))
+        self.assertEqual(float(anchors.max()), 2.0)
+
+    def test_seam_anchor_arguments_are_validated(self) -> None:
+        source = plane(8, 8)
+        target = plane(8, 8)
+        label = np.full((8, 8), 9, dtype=np.uint8)
+
+        with self.assertRaisesRegex(ValueError, "seam_anchor"):
+            transfer_array(
+                source, target, label, fill_seams=True, seam_anchor="nearest"
+            )
+        with self.assertRaisesRegex(ValueError, "requires fill_seams"):
+            transfer_array(
+                source,
+                target,
+                label,
+                seam_anchor_distance_output=np.zeros((8, 8), np.float32),
+            )
+        with self.assertRaisesRegex(ValueError, "stored"):
+            transfer_array(
+                source,
+                target,
+                label,
+                fill_seams=True,
+                seam_anchor_distance_output=np.zeros((4, 4), np.float32),
+            )
+        with self.assertRaisesRegex(ValueError, "float32"):
+            transfer_array(
+                source,
+                target,
+                label,
+                fill_seams=True,
+                seam_anchor_distance_output=np.zeros((8, 8), np.uint8),
+            )
+        with self.assertRaisesRegex(ValueError, "max_seam_distance"):
+            transfer_array(
+                source,
+                target,
+                label,
+                fill_seams=True,
+                max_seam_distance=float("nan"),
+            )
+
+
+class AutomaticRadiusTests(unittest.TestCase):
+    def test_radius_is_keyed_to_the_target_pitch(self) -> None:
+        self.assertAlmostEqual(
+            automatic_max_distance(plane(10, 10)), 0.75, places=6
+        )
+
+    def test_default_radius_is_not_shrunk_by_a_denser_source(self) -> None:
+        # The same surface sampled twice as finely on the source side must
+        # not halve the default radius: an offset well inside the
+        # target-keyed radius stays matched everywhere.
+        rows, cols = np.meshgrid(
+            np.arange(47, dtype=np.float32) * 0.5,
+            np.arange(47, dtype=np.float32) * 0.5,
+            indexing="ij",
+        )
+        source = Surface(
+            x=cols, y=rows, z=np.full((47, 47), 10.0, dtype=np.float32)
+        )
+        target = plane(24, 24)
+        target.z[8:12, :] += 0.6
+        label = np.full((47, 47), 3, dtype=np.uint8)
+
+        _, valid, _, _ = transfer_array(source, target, label)
+
+        self.assertTrue(np.all(valid == 255))
 
 
 class ParallelAndCacheTests(unittest.TestCase):

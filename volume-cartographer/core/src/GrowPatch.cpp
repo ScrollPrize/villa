@@ -3721,14 +3721,12 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         }
 
         const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
-        const double voxel_size_d = static_cast<double>(voxelsize);
-        const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;
         surf->meta = utils::Json::parse(meta_params.dump());
         if (resume_surf && !resume_surf->id.empty()) {
             surf->meta["seed_surface_id"] = resume_surf->id;
         }
-        surf->meta["area_vx2"] = area_est_vx2;
-        surf->meta["area_cm2"] = area_est_cm2;
+        vc::surface::storeAreaMeta(surf->meta, area_est_vx2,
+                                   static_cast<double>(voxelsize));
         surf->meta["max_gen"] = stop_gen;
         surf->meta["elapsed_time_s"] = f_timer.seconds();
 
@@ -3832,12 +3830,10 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         }
 
         const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
-        const double voxel_size_d = static_cast<double>(voxelsize);
-        const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;
 
         surf->meta = utils::Json::parse(meta_params.dump());
-        surf->meta["area_vx2"] = area_est_vx2;
-        surf->meta["area_cm2"] = area_est_cm2;
+        vc::surface::storeAreaMeta(surf->meta, area_est_vx2,
+                                   static_cast<double>(voxelsize));
         surf->meta["max_gen"] = generation;
         {
             auto seed_arr = utils::Json::array();
@@ -5000,9 +4996,14 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     QuadSurface* surf = create_surface_from_state();
 
     const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
-    const double voxel_size_d = static_cast<double>(voxelsize);
-    const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;
-    printf("generated surface %f vx^2 (%f cm^2)\n", area_est_vx2, area_est_cm2);
+    const auto area_est_cm2 = vc::surface::areaCm2FromVox2(
+        area_est_vx2, static_cast<double>(voxelsize));
+    if (area_est_cm2) {
+        printf("generated surface %f vx^2 (%f cm^2)\n", area_est_vx2, *area_est_cm2);
+    } else {
+        printf("generated surface %f vx^2 (cm^2 unknown: volume has no voxel size)\n",
+               area_est_vx2);
+    }
 
     return surf;
 }

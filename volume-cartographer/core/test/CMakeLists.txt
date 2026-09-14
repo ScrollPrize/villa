@@ -66,6 +66,12 @@ endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
 
+vc_add_test(NAME test_omp_thread_point_collection)
+
+vc_add_test(NAME test_surface_area_units)
+
+vc_add_test(NAME test_voxel_size_metadata)
+
 vc_add_test(NAME test_tifxyz_identity)
 
 vc_add_test(NAME test_appendmask_render)
@@ -853,6 +859,8 @@ vc_add_test(NAME test_atlas LIBS doctest::doctest vc_atlas)
 # with the command-line tool so the tested code is the shipped code).
 vc_add_test(NAME test_tifxyz_selfcross LIBS doctest::doctest opencv_core)
 
+vc_add_test(NAME test_seg_add_overlap_metrics)
+
 # End-to-end CLI contract for the same tool: exit codes, report
 # serialization, collection envelope. Needs the binary, so it only exists
 # in configurations that build the apps -- the test shards configure with
@@ -863,6 +871,24 @@ if(TARGET vc_tifxyz_selfcross)
         LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
         DEFS VC_SELFCROSS_BIN="$<TARGET_FILE:vc_tifxyz_selfcross>")
     add_dependencies(test_tifxyz_selfcross_cli vc_tifxyz_selfcross)
+endif()
+
+if(TARGET vc_seg_add_overlap)
+    vc_add_test(NAME test_seg_add_overlap_cli
+        LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
+        DEFS VC_SEG_ADD_OVERLAP_BIN="$<TARGET_FILE:vc_seg_add_overlap>")
+    add_dependencies(test_seg_add_overlap_cli vc_seg_add_overlap)
+endif()
+
+if(TARGET vc_render_tifxyz)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    vc_register_test_target(vc_render_tifxyz)
+    add_test(NAME test_render_tifxyz_logging
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_tifxyz_logging.py"
+            $<TARGET_FILE:vc_render_tifxyz>)
+    set_tests_properties(test_render_tifxyz_logging PROPERTIES TIMEOUT 90)
+    vc_register_ctest(test_render_tifxyz_logging vc_render_tifxyz)
 endif()
 
 vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)
@@ -892,6 +918,8 @@ vc_add_test(NAME test_quadsurface_pointto)
 vc_add_test(NAME test_quadsurface_snapshot)
 
 vc_add_test(NAME test_quadsurface_save_concurrency)
+
+vc_add_test(NAME test_quadsurface_cache_concurrency)
 
 vc_add_test(NAME test_quadsurface_save_paths)
 
@@ -930,6 +958,10 @@ vc_add_test(NAME test_zarr_helpers)
 vc_add_test(NAME test_chunked_plane_sampler)
 
 vc_add_test(NAME test_slicing)
+# The vc_render_tifxyz prefetch planner and PrefetchedArrayView (header-only
+# under apps/src, shared with the command-line tool so the tested code is the
+# shipped code).
+vc_add_test(NAME test_render_prefetch)
 
 vc_add_test(NAME test_volume_pkg)
 
