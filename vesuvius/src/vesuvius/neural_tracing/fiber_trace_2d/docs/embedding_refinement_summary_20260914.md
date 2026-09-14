@@ -144,8 +144,25 @@ justify replacing the previously repeated64-restart policy.
 
 The subsequent cached-only verification reproduced support-softmin67 and
 LRU64 exactly; their failure-location comparison is recorded above. No causal
-benefit from combining them has been established. The seven remaining family
-refinements are now running cached-only; new GPU inference remains disabled.
+benefit from combining them has been established. The cached-only continuation
+completed three family searches, then stopped on missing chunk141/60/58 in the
+fourth family's seed. It correctly recorded that trial as incomplete.
+
+The four unfinished families continue in
+`embedding_ema99_remaining_adaptive_refine_20260914_v1/report.json`, with the
+same parameters and nonexclusive demand-managed inference for missing coverage.
+No grant is requested before a ready input; pause and30s idle release apply.
+The three completed searches are not rerun. Their final repeat stage was not
+reached; numerical determinism remains supported by the earlier exact checks,
+not newly claimed repetitions. Controls87/82 reproduced exactly on continuation.
+
+| Completed CPU search | Restarts | Configuration |
+|---|---:|---|
+| Plain mean LRU, own seed | 68 | K4, spacing512, weight0.30 |
+| Plain mean LRU, transferred seed | 69 | K2, spacing1024, weight0.10 |
+| Windowed anchors, own seed | 67 | K8, spacing256, window1024, EMA mix0.9, half-life128, weight0.25 |
+
+These results do not beat the earlier verified64-restart policy.
 
 ### Remaining search: plain mean LRU sensitivity (partial)
 
@@ -161,6 +178,8 @@ the coordinate minimum at68 restarts. Holding the other two parameters fixed:
 
 This is a coordinate search, not a full Cartesian optimum or independent
 validation. More anchors or denser insertion did not help around this seed.
-The separate transferred seed search is still running; do not combine its
-unfinished results into a final family conclusion. All these trials use the
+The transferred seed search has now finished at69 restarts with K2, spacing1024,
+weight0.10 (neighboring weights0.05/0.15 give83/82). Both family repeats were
+not reached before the cache miss stopped that sweep. These distinct local minima do not
+establish a global optimum. All these trials use the
 same frozen predictions, both directions and GT threshold as the controls.

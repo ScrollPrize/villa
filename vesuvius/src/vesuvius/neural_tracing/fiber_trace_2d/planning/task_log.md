@@ -1,5 +1,24 @@
 # Demand-scoped GPU ownership (2026-09-14)
 
+- Adaptive continuation live57397, report remaining_adaptive_refine_20260914_v1:
+  controls87/82 exact hashes. Review confirmed four remaining families unchanged.
+  Initial missing chunk starts4 CPU reads with no GPU registration; only after
+  reads complete does task f54924d2-d5fa-47ea-8f7c-277e1602805d request a grant.
+  It is waiting cooperatively with zero submitted GPU tiles, retaining readers
+  and tracing state; no busy GPU bypass or restarted completed family.
+
+- CPU run14738 terminated(exit1) on missing cached chunk141/60/58 at fourth
+  family seed. First3 searches completed68/69/67; repeats not reached, missing
+  variant correctly incomplete. Continue remaining4 families in new adaptive
+  report with the implemented nonexclusive20GiB demand-only lease. No changes
+  to numerical code, axes, frozen checkpoint or native build. Cached-only was
+  an interim restriction; adaptive allocation now handles real missing demand.
+
+- Remaining family2 finished: transferred plain mean LRU converges to69,
+  K2/spacing1024/w.10, versus own seed68. Weight neighbors.05/.15 give83/82.
+  Both repeat checks remain pending. Verified live14738 entering windowed-anchor
+  search next; no restart or GPU request. Existing verified64 remains best.
+
 - Recorded first remaining family's one-coordinate sensitivity: plain mean
   LRU K4/512/w.30 stays68; denser insertion and more anchors worsen it locally.
   This is not a Cartesian optimum. Corrected stale next-step paragraph now that

@@ -10,6 +10,12 @@ Update specs, demand GPU docs and task log with this startup contract.
 
 ## Goal follow-up: cached CPU validation
 
+The cached-only run has now terminated on missing chunk141/60/58 in family4,
+after three completed searches (68/69/67). Continue only the remaining four
+families in a fresh report using the user-requested adaptive demand lease:
+nonexclusive20GiB budget, no initial request, cooperative pause and30s idle
+release. Retain completed reports. Never silently skip missing coverage.
+
 After exact-repeat verification, finish the seven family refinements not
 completed in the interrupted report: plain mean LRU own/transfer seeds,
 windowed anchors own/transfer seeds, and normalized mean novelty/plain/hit
@@ -17,6 +23,9 @@ variants. Reuse the original saved axes/seeds unchanged. Run cached-only with
 inference disabled, original controls, per-family repeats and best repeat.
 Missing coverage is a real incomplete-test result, not permission to fill tiles
 or silently skip a candidate. Keep the GPU sweep stopped.
+
+The preceding cached-only restriction describes the completed interim phase;
+after its recorded miss, the adaptive continuation above is the active plan.
 
 Keep the GPU sweep stopped. Inspect saved unmatched failure regions, then
 repeat LRU64 and support-softmin67 with `fill_missing=false` through the approved

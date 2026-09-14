@@ -6,5 +6,7 @@
 - [x] Startup follow-up: defer bootstrap/registration until first ready input;
   unused cleanup never registers. Independent review and CPU tests passed.
 - [x] CPU-only exact verification of LRU64 and softmin67.
-- [ ] Finish seven remaining family refinements on cached predictions only.
+- [x] Three remaining family searches finished (68/69/67); CPU sweep stopped
+  correctly on missing coverage before final repeats.
+- [ ] Finish four remaining families with demand-managed missing-tile inference.
 - [ ] Record coverage limits or completed minima/repeats; consolidate final evidence.

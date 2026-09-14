@@ -6,6 +6,6 @@ again on demand. Reuse the locked manager protocol and shared inference.
 Start released: request no GPUs until the first input tile is ready.
 
 Goal continuation: improve embedding tracing by completing the previously
-requested method refinements. While keeping GPU work stopped, use existing
-predictions for CPU-only replay of remaining families and exact repeats.
-Do not convert missing cached coverage into new GPU inference.
+requested method refinements. Reuse cached predictions; for coverage missing
+from cache, use the requested adaptive manager path, starting without a grant,
+pausing cooperatively and releasing after30s idle. Preserve completed searches.
