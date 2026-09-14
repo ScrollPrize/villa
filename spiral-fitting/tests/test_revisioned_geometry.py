@@ -234,3 +234,92 @@ def test_baseline_fiber_adoption_preserves_startup_exclusions(context, monkeypat
         assert context._workspace_membership['excluded-fiber'] == {
             'kind': 'fiber', 'revision': 1, 'resident_id': 6, 'deleted': False}
     assert context.next_id == 7
+
+
+def test_input_revision_preserves_current_track_policy(context, monkeypatch):
+    import fit_spiral
+    from unittest.mock import Mock
+    ctx = context
+    ctx.using_tracks = True
+    ctx._refresh_trusted_geometry()
+    ctx.tracks = ['retained track']
+    ctx.track_sampling_config = fit_spiral.validate_track_sampling_config(ctx.config)
+    ctx.track_families = ctx.track_source_ids = None
+    ctx.track_crossing_cache = ctx.track_graph = None
+    prepare = Mock(return_value=None)
+    monkeypatch.setattr(fit_spiral, 'prepare_main_phase_tracks', prepare)
+    monkeypatch.setattr(fit_spiral, 'configure_prepared_track_sampling', Mock())
+    ctx.apply_config({'track_exclusion_radius': 10, 'track_max_tortuosity': 2,
+                      'track_crossing_mode': 'track_walk',
+                      'track_crossing_precompute_max': 12,
+                      'track_length_bin_weights': [1, 2, 3]}, current_iteration=0)
+    prepare.reset_mock()
+    ctx.install_input_changes(ctx.prepare_input_changes([
+        {'id': 'baseline', 'kind': 'patch', 'deleted': True, 'revision': 2}]))
+    policy = prepare.call_args.kwargs['sampling_config']
+    expected = fit_spiral.validate_track_sampling_config(ctx.config)
+    assert policy.keys() == expected.keys()
+    for key in expected:
+        np.testing.assert_equal(policy[key], expected[key])
+
+
+def test_exclusion_radius_preserves_unverified_revisions(context, monkeypatch):
+    import fit_spiral
+    ctx = context
+    ctx._source_unverified_patches = {
+        'deleted': relink._flat_patch(100, 510, 510),
+        'replaced': relink._flat_patch(100, 610, 610),
+    }
+    replacement = relink._flat_patch(100, 710, 710)
+    added = relink._flat_patch(100, 810, 810)
+    monkeypatch.setattr(fit_spiral, 'load_tifxyz',
+                        lambda path: {'replacement': replacement, 'added': added}[path])
+    records = [
+        {'id': 'deleted', 'kind': 'patch', 'role': 'unverified', 'deleted': True, 'revision': 2},
+        {'id': 'replaced', 'kind': 'patch', 'role': 'unverified', 'path': 'replacement', 'revision': 2},
+        {'id': 'added', 'kind': 'patch', 'role': 'unverified', 'path': 'added', 'revision': 1},
+    ]
+    ctx.install_input_changes(ctx.prepare_input_changes(records))
+    membership = copy.deepcopy(ctx._workspace_membership)
+    ctx.unverified_patches_path = '/mutable/dataset'
+    monkeypatch.setattr(ctx, '_load_patches_from_dir',
+                        lambda path: pytest.fail('revisioned patches reloaded from dataset'))
+    for radius in (1, 0):
+        ctx.apply_config({'patch_unverified_patch_exclusion_radius': radius}, current_iteration=0)
+        assert set(ctx.unverified_patches) == {'replaced', 'added'}
+        assert ctx._workspace_membership == membership
+        for pid, source in [('replaced', replacement), ('added', added)]:
+            assert ctx.unverified_patches[pid] is not source
+            torch.testing.assert_close(ctx.unverified_patches[pid].zyxs, source.zyxs)
+
+
+@pytest.mark.parametrize('dataset_change', ['edit', 'delete'])
+def test_adopted_fiber_reingests_snapshot(context, tmp_path, dataset_change):
+    import json
+    from fit_spiral import load_fiber_point_collection
+    dataset = tmp_path / 'dataset.json'
+    snapshot = tmp_path / 'snapshot.json'
+    document = json.dumps({'type': 'vc3d_fiber', 'line_points': [],
+                          'control_points': [[0, 0, 200], [400, 0, 200]]})
+    dataset.write_text(document)
+    snapshot.write_text(document)
+    pcl = load_fiber_point_collection(str(dataset), 6, min_point_spacing=0)
+    pcl.update(sampling_group='fibers', file_basename='dataset.json', source_file=str(dataset))
+    pcl.setdefault('metadata', {}).update(input_role='fiber', logical_input_kind='fiber',
+                                          logical_input_id='dataset', winding_is_absolute=False)
+    context._source_point_collections[6] = pcl
+    context.next_id = 7
+    candidate = context.prepare_input_changes([{
+        'id': 'fiber-uuid', 'kind': 'fiber', 'source_id': 'dataset',
+        'source_path': str(dataset), 'path': str(snapshot), 'revision': 1, 'adopt': True}])
+    assert pcl['source_file'] == str(dataset)
+    assert candidate._source_point_collections[6]['points'] == pcl['points']
+    context.install_input_changes(candidate)
+    if dataset_change == 'delete':
+        dataset.unlink()
+    else:
+        dataset.write_text('unaccepted invalid geometry')
+    context.apply_config({'pcl_fiber_min_point_spacing': 5.0}, current_iteration=0)
+    assert context.fiber_catalog['fiber-uuid']['source_file'] == str(snapshot)
+    assert context._workspace_membership['fiber-uuid']['revision'] == 1
+    assert context._workspace_membership['fiber-uuid']['resident_id'] == 6

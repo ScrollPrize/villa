@@ -3697,10 +3697,18 @@ class FitContext:
             self.lr_scheduler.load_state_dict(checkpoint['scheduler'])
 
     def _rebuild_unverified_patch_inputs(self, exclusion_radius):
-        """Reload only the unverified-patch pool for a Run-boundary mask edit."""
-        if not self.unverified_patches_path:
+        """Remask retained unverified sources for a Run-boundary mask edit."""
+        if not input_source_enabled(self.config, 'unverified_patches'):
             return {}, [], None, None
-        candidates = self._load_patches_from_dir(self.unverified_patches_path)
+        if hasattr(self, '_source_unverified_patches'):
+            candidates = {
+                pid: copy.copy(patch)
+                for pid, patch in self._source_unverified_patches.items()
+            }
+        elif self.unverified_patches_path:
+            candidates = self._load_patches_from_dir(self.unverified_patches_path)
+        else:
+            return {}, [], None, None
         candidates, n_masked, n_dropped = \
             _mask_unverified_patches_near_trusted_geometry(
                 candidates, self.trusted_geometry_tree, exclusion_radius)
@@ -3713,7 +3721,7 @@ class FitContext:
             self._prepare_patch_sampling_cache(candidate_list)
             if candidate_list else None)
         atlas = (
-            PatchAtlas(candidates, device='cuda')
+            PatchAtlas(candidates, device=self.device)
             if candidate_list else None)
         return candidates, candidate_list, probabilities, atlas
 
@@ -4101,6 +4109,8 @@ class FitContext:
                     else:
                         if adopt and resident_id in source:
                             pcl = source[resident_id]
+                            if kind == 'fiber':
+                                pcl['source_file'] = path
                         elif kind == 'fiber':
                             pcl = load_fiber_point_collection(
                                 path, resident_id,
@@ -4192,7 +4202,8 @@ class FitContext:
                     candidate.prepared_main_tracks = prepare_main_phase_tracks(
                         self.tracks, None, float(self.config['track_exclusion_radius']), self.device,
                         anchor_tree=candidate.trusted_geometry_tree,
-                        sampling_config=self.track_sampling_config, track_families=self.track_families,
+                        sampling_config=validate_track_sampling_config(self.config),
+                        track_families=self.track_families,
                         track_source_ids=self.track_source_ids, crossing_cache=self.track_crossing_cache,
                         track_graph=self.track_graph, progress=self.progress)
                 before_verified = set(candidate.verified_patches)
