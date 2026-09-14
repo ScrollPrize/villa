@@ -121,8 +121,20 @@ all anchor policies start from their own completed-round winner and, where
 different, K2/weight.10 transferred seed. Extend spacing through2048 for
 no-expiry methods (unused window4096), through1024 for windowed anchors with
 their actual window1024; include K1. Keep earlier records as exact references.
-This config is prepared, not yet executed. New-method refinements follow initial
-seed/delay/hit results and remain separate from these anchor-policy comparisons.
+This config is now running as `embedding_ema99_anchor_boundaries_20260914_v1`
+(handle72112), after completed seed/delay/hit and normalized-mean A/B rounds.
+These remain separate from the anchor-policy comparisons.
+
+## Completion audit
+
+Independent review after normalized A/B confirms implemented whole-path
+sum/support appearance summaries (no age expiry), LRU semantics, per-family
+refinement and algorithmic variants cover the requested methods. Finish the
+active finite round and its exact repeats, consolidate best parameters/bounds/
+hashes, verify released resources and keep training stopped. Treat this fiber as
+tuning data, not independent validation. Observed-exemplar and reliability
+weighting remain conditional hypotheses without supporting diagnostics; do not
+silently claim they were executed or manufacture endless additional grids.
 
 Prepared next mechanism grid in `embedding_methods_next.json`; after current
 sweep exits and native tests pass, use it as the existing experiment control's

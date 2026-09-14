@@ -8,6 +8,8 @@
 - User added next LRU anchor experiment; scheduled after refinement instead of stopping. Capacity4/8, admission128/512, nearest/average/EMA blend. Finer EMA results256/384/640/768/1024=74/72/87/84/73; no improvement yet. ShortK2 mixes.75/.9=91/76.
 # Latest continuation
 
+- Independent completion audit: user-requested no-expiry appearance summaries/LRU/algorithmic variants and independent refinements covered. Remaining active15-family finite round+repeats, consolidated parameters/bounds/hashes and final state/docs. No diagnostic currently justifies conditional exemplar/reliability variants; retain as untested future hypotheses. Fiber is tuning data, not independent validation. Live72112 confirmed, first spacing192/256/384 trials did not improve64.
+
 - Normalized A/B4047 exited0:10 replays, all old control hashes preserved, overall64 exactrepeat. Three normalized seeds75 each (different hashes) vs ordinary64/68/66. All6 coherence histograms sum to positivecounts; mean.9752–.9817, nonebelow.1. Started approved boundary/multi-start sweep72112 at `embedding_ema99_anchor_boundaries_20260914_v1`:12 prepared anchor families plus3 normalized families for fair per-method tuning. Training stays stopped; nonexclusive manager grant.
 
 - Normalized A/B live4047: rebuilt64 hash exact; normalized same settings75. Plain mean68 also remains68, normalized75. Optimized-path coherence control verified7,233,138 candidate-parent states equals histogram total, mean.9751943, fractionbelow.1=0. This is candidate-parent weighting, not GT/selected-only distribution; no near-cancellation evidence in this control.
