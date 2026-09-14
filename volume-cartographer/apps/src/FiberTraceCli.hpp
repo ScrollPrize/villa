@@ -109,10 +109,14 @@ inline bool parseTraceOption(
         config.embeddingAnchorAggregation = value("embedding-anchor-aggregation");
     else if (argument == "--embedding-anchor-novelty")
         config.embeddingAnchorNovelty = parseDouble(value("embedding-anchor-novelty"), "embedding-anchor-novelty");
+    else if (argument == "--embedding-anchor-touch")
+        config.embeddingAnchorTouch = value("embedding-anchor-touch");
     else if (argument == "--embedding-anchor-temperature")
         config.embeddingAnchorTemperature = parseDouble(value("embedding-anchor-temperature"), "embedding-anchor-temperature");
     else if (argument == "--embedding-ema-half-life-base-voxels")
         config.embeddingEmaHalfLifeBaseVoxels = parseDouble(value("embedding-ema-half-life-base-voxels"), "embedding-ema-half-life-base-voxels");
+    else if (argument == "--embedding-ema-delay-base-voxels")
+        config.embeddingEmaDelayBaseVoxels = parseDouble(value("embedding-ema-delay-base-voxels"), "embedding-ema-delay-base-voxels");
     else if (argument == "--smoothness-weight")
         config.smoothnessWeight = parseDouble(value("smoothness-weight"), "smoothness-weight");
     else if (argument == "--smoothness-normal-weight")
@@ -172,8 +176,10 @@ inline nlohmann::json traceConfigJson(const FiberTraceConfig& config)
         {"embedding_anchor_ema_mix", config.embeddingAnchorEmaMix},
         {"embedding_anchor_aggregation", config.embeddingAnchorAggregation},
         {"embedding_anchor_novelty", config.embeddingAnchorNovelty},
+        {"embedding_anchor_touch", config.embeddingAnchorTouch},
         {"embedding_anchor_temperature", config.embeddingAnchorTemperature},
         {"embedding_ema_half_life_base_voxels", config.embeddingEmaHalfLifeBaseVoxels},
+        {"embedding_ema_delay_base_voxels", config.embeddingEmaDelayBaseVoxels},
         {"step_voxels", config.stepVoxels},
         {"cone_angle_degrees", config.coneAngleDegrees},
         {"cone_angle_step_degrees", config.coneAngleStepDegrees},

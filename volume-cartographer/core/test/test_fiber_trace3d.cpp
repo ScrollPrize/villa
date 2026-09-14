@@ -79,6 +79,43 @@ TEST_CASE("embedding best history and normalized EMA references")
     CHECK_THROWS(fiberEmbeddingMemoryCost({1}, m, false));
 }
 
+TEST_CASE("delayed embedding EMA preserves observation arithmetic and beam isolation")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingMemory direct{{1,0},{1,0}}, delayed=direct, zero=direct;
+    FiberEmbeddingDelay pending, immediate;
+    const std::vector<float> a{0,1}, b{.6f,.8f};
+    advanceFiberEmbeddingDelayedMemory(delayed,pending,a,3,3,10,128);
+    advanceFiberEmbeddingDelayedMemory(delayed,pending,b,7,4,10,128);
+    CHECK(delayed.ema==delayed.seed);
+    auto fork=pending;
+    auto branch=delayed;
+    advanceFiberEmbeddingDelayedMemory(branch,fork,a,12,5,10,128);
+    CHECK(branch.ema==branch.seed);
+    advanceFiberEmbeddingDelayedMemory(branch,fork,b,13,1,10,128);
+    advanceFiberEmbeddingMemory(direct,a,3,128,1,false);
+    CHECK(branch.ema==direct.ema); // exact threshold; only first record matured
+    CHECK(pending.pending.size()==2); // original beam not changed
+    advanceFiberEmbeddingDelayedMemory(delayed,pending,a,20,13,10,128);
+    advanceFiberEmbeddingMemory(direct,b,4,128,1,false);
+    CHECK(delayed.ema==direct.ema); // two FIFO releases, original distances3 and4
+    CHECK(pending.pending.size()==1);
+    FiberEmbeddingMemory reference=zero;
+    for (int i=1;i<20;++i) {
+        const auto& value=i%2 ? a : b;
+        advanceFiberEmbeddingMemory(reference,value,3.125,128,1,false);
+        advanceFiberEmbeddingDelayedMemory(zero,immediate,value,i*3.125,3.125,0,128);
+        CHECK(zero.ema==reference.ema);
+        CHECK(immediate.pending.empty());
+    }
+    CHECK_THROWS(advanceFiberEmbeddingDelayedMemory(zero,immediate,a,1,1,-1,128));
+    CHECK_THROWS(advanceFiberEmbeddingDelayedMemory(zero,immediate,{1},1,1,10,128));
+    CHECK_THROWS(advanceFiberEmbeddingDelayedMemory(delayed,pending,a,19,1,10,128));
+    FiberEmbeddingDelay full;
+    full.pending.resize(FiberEmbeddingDelay::capacity,{1,1,a});
+    CHECK_THROWS(advanceFiberEmbeddingDelayedMemory(zero,full,a,2,1,10,128));
+}
+
 TEST_CASE("LRU anchors admit at bounded cadence and touch nearest before eviction")
 {
     using namespace vc::fiber_tracer;
@@ -163,6 +200,36 @@ TEST_CASE("novelty admission touches existing LRU without replacing familiar anc
     CHECK(state.entries[0].vector==std::vector<float>{0,1});
     CHECK(state.entries[1].vector==std::vector<float>{-1,0});
     CHECK_THROWS(advanceFiberEmbeddingLru(state,{1,0},40,10,2,-1));
+}
+
+TEST_CASE("hit-only LRU does not refresh unmatched anchors before eviction")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingLru nearest;
+    advanceFiberEmbeddingLru(nearest,{1,0},0,10,2,.1);
+    advanceFiberEmbeddingLru(nearest,{0,1},10,10,2,.1);
+    auto hit = nearest;
+    advanceFiberEmbeddingLru(nearest,{.8f,.6f},20,10,2,.1);
+    advanceFiberEmbeddingLru(hit,{.8f,.6f},20,10,2,.1,true);
+    CHECK(nearest.entries.front().vector == std::vector<float>{1,0});
+    CHECK(hit.entries.front().vector == std::vector<float>{0,1});
+    CHECK(hit.lastUsed.front() == 10);
+    auto familiar = nearest;
+    advanceFiberEmbeddingLru(familiar,{1,0},30,10,2,.1,true);
+    CHECK(familiar.entries.size() == 2);
+    CHECK(familiar.lastUsed.front() == 30);
+    CHECK(familiar.lastAdmission == 30);
+    auto legacy = nearest;
+    advanceFiberEmbeddingLru(nearest,{-1,0},30,10,2,.1);
+    advanceFiberEmbeddingLru(legacy,{-1,0},30,10,2,.1,false);
+    CHECK(nearest.lastUsed == legacy.lastUsed);
+    CHECK(nearest.entries.front().vector == legacy.entries.front().vector);
+    // Equality with the threshold is novel, consistently with insertion policy.
+    FiberEmbeddingLru equality;
+    advanceFiberEmbeddingLru(equality,{1,0},0,10,2,1,true);
+    advanceFiberEmbeddingLru(equality,{0,1},10,10,2,1,true);
+    CHECK(equality.entries.size() == 2);
+    CHECK(equality.lastUsed.front() == 0);
 }
 
 TEST_CASE("supported appearance softmin is normalized and split invariant")
@@ -605,16 +672,33 @@ TEST_CASE("embedding tracing preserves zero-weight path and rejects missing embe
     auto same = vc::fiber_tracer::traceFiberOneWay(predictions, request);
     CHECK(predictions.reads > 0);
     CHECK(old.points == same.points);
-    for (const auto* mode : {"best", "ema", "ema-seed", "ema-gated", "ema-seed-gated", "anchors", "anchors-lru", "appearance"}) {
+    for (const auto* mode : {"best", "seed", "ema", "ema-seed", "ema-gated", "ema-seed-gated", "ema-delayed", "anchors", "anchors-lru", "appearance"}) {
         request.config.embeddingReferenceMode = mode;
         CHECK(vc::fiber_tracer::traceFiberOneWay(predictions, request).points == old.points);
     }
+    request.config.embeddingReferenceMode = "anchors-lru";
+    request.config.embeddingAnchorTouch = "hit";
+    CHECK(vc::fiber_tracer::traceFiberOneWay(predictions, request).points == old.points);
+    request.config.embeddingReferenceMode = "appearance";
+    CHECK_THROWS_AS(vc::fiber_tracer::traceFiberOneWay(predictions, request), std::invalid_argument);
+    request.config.embeddingAnchorTouch = "unknown";
+    CHECK_THROWS_AS(vc::fiber_tracer::traceFiberOneWay(predictions, request), std::invalid_argument);
+    request.config.embeddingAnchorTouch = "nearest";
     request.config.embeddingReferenceMode = "unknown";
     CHECK_THROWS_AS(vc::fiber_tracer::traceFiberOneWay(predictions, request), std::invalid_argument);
     request.config.embeddingReferenceMode = "best";
     request.config.embeddingHistoryFalloff = "gaussian";
     CHECK_THROWS_AS(vc::fiber_tracer::traceFiberOneWay(predictions, request), std::invalid_argument);
     request.config.embeddingHistoryFalloff = "uniform";
+    request.config.embeddingReferenceMode = "ema-delayed";
+    request.config.embeddingEmaDelayBaseVoxels = 64;
+    CHECK(vc::fiber_tracer::traceFiberOneWay(predictions, request).points == old.points);
+    const auto originalStep = request.config.stepVoxels;
+    request.config.stepVoxels = .001;
+    request.config.embeddingEmaDelayBaseVoxels = 2048;
+    CHECK_THROWS_WITH_AS(vc::fiber_tracer::traceFiberOneWay(predictions, request), doctest::Contains("pending capacity"), std::invalid_argument);
+    request.config.stepVoxels = originalStep;
+    request.config.embeddingEmaDelayBaseVoxels = 0;
     request.config.embeddingReferenceMode = "ema";
     predictions.invalid = true;
     CHECK_THROWS_WITH_AS(vc::fiber_tracer::traceFiberOneWay(predictions, request), doctest::Contains("trace seed has no valid embedding"), std::runtime_error);

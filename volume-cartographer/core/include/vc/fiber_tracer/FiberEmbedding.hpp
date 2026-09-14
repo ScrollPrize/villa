@@ -56,6 +56,46 @@ inline double fiberEmbeddingMemoryCost(const std::vector<float>& vector,
     return withSeed ? .5 * (cost + 1 - fiberEmbeddingCosine(vector, state.seed)) : cost;
 }
 
+// Retain observation intervals, not release intervals: delayed application must
+// perform exactly the same EMA arithmetic on the same ordered observations.
+struct FiberEmbeddingPending {
+    double arcBase, distance;
+    std::vector<float> vector;
+};
+struct FiberEmbeddingDelay {
+    static constexpr size_t capacity = 4096;
+    // Empty vector avoids deque's allocation for every beam in unrelated modes.
+    std::vector<FiberEmbeddingPending> pending;
+};
+
+inline void advanceFiberEmbeddingDelayedMemory(FiberEmbeddingMemory& state,
+    FiberEmbeddingDelay& delayState, const std::vector<float>& vector,
+    double arcBase, double distance, double delay, double halfLife)
+{
+    if (!std::isfinite(delay) || delay < 0 || delay > 2048 ||
+        !std::isfinite(arcBase) || arcBase < 0 ||
+        !std::isfinite(distance) || distance < 0 ||
+        !std::isfinite(halfLife) || halfLife <= 0 || vector.empty() ||
+        vector.size() != state.ema.size() ||
+        std::any_of(vector.begin(), vector.end(), [](float v) { return !std::isfinite(v); }) ||
+        (!delayState.pending.empty() && arcBase <= delayState.pending.back().arcBase))
+        throw std::invalid_argument("invalid delayed embedding EMA update");
+    if (delay == 0) {
+        advanceFiberEmbeddingMemory(state, vector, distance, halfLife, 1, false);
+        return;
+    }
+    size_t released = 0;
+    while (released < delayState.pending.size() && delayState.pending[released].arcBase <= arcBase-delay) {
+        const auto& observation = delayState.pending[released];
+        advanceFiberEmbeddingMemory(state, observation.vector, observation.distance, halfLife, 1, false);
+        ++released;
+    }
+    if (released) delayState.pending.erase(delayState.pending.begin(), delayState.pending.begin()+released);
+    if (delayState.pending.size() >= FiberEmbeddingDelay::capacity)
+        throw std::runtime_error("delayed embedding EMA pending capacity exceeded");
+    delayState.pending.push_back({arcBase, distance, vector});
+}
+
 // Unit vectors enter here after interpolation, never normalize each corner.
 inline double fiberEmbeddingCost(const std::vector<float>& vector,
     const FiberEmbeddingHistory& history, double arcBase, double window,
@@ -144,7 +184,7 @@ struct FiberEmbeddingLru {
 };
 
 inline void advanceFiberEmbeddingLru(FiberEmbeddingLru& state, const std::vector<float>& vector,
-    double arc, double spacing, size_t capacity, double novelty = 0)
+    double arc, double spacing, size_t capacity, double novelty = 0, bool hitOnly = false)
 {
     if (capacity < 1 || capacity > 8 || vector.empty() || !std::isfinite(arc) ||
         !std::isfinite(spacing) || spacing <= 0 || !std::isfinite(novelty) || novelty < 0 || novelty > 2)
@@ -158,8 +198,9 @@ inline void advanceFiberEmbeddingLru(FiberEmbeddingLru& state, const std::vector
             const double cosine = fiberEmbeddingCosine(vector,state.entries[i].vector);
             if (cosine > closest) { closest = cosine; nearest = i; }
         }
-        state.lastUsed[nearest] = arc;
-        if (state.entries[nearest].vector == vector || 1-closest < novelty) return;
+        const bool familiar = state.entries[nearest].vector == vector || 1-closest < novelty;
+        if (!hitOnly || familiar) state.lastUsed[nearest] = arc;
+        if (familiar) return;
         if (state.entries.size() >= capacity) {
             const size_t oldest = std::min_element(state.lastUsed.begin(),state.lastUsed.end())-state.lastUsed.begin();
             state.entries.erase(state.entries.begin()+oldest);

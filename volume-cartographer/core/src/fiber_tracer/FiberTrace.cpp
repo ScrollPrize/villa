@@ -475,8 +475,12 @@ void requireNormalSamplerForNormalAwareSmoothness(const FiberTraceConfig& config
 void validateTraceConfig(const FiberTraceConfig& config)
 {
     const auto& mode = config.embeddingReferenceMode;
-    if (mode != "mean" && mode != "best" && mode != "ema" && mode != "ema-seed" &&
-        mode != "ema-gated" && mode != "ema-seed-gated" && mode != "anchors" && mode != "anchors-lru" && mode != "appearance")
+    if (config.embeddingAnchorTouch != "nearest" && config.embeddingAnchorTouch != "hit")
+        throw std::invalid_argument("unknown embedding anchor touch policy");
+    if (config.embeddingAnchorTouch == "hit" && mode != "anchors-lru")
+        throw std::invalid_argument("hit-only anchor touch requires anchors-lru");
+    if (mode != "mean" && mode != "best" && mode != "seed" && mode != "ema" && mode != "ema-seed" &&
+        mode != "ema-gated" && mode != "ema-seed-gated" && mode != "ema-delayed" && mode != "anchors" && mode != "anchors-lru" && mode != "appearance")
         throw std::invalid_argument("unknown embedding reference mode");
     if (mode == "best" && config.embeddingHistoryFalloff != "uniform")
         throw std::invalid_argument("best embedding history requires uniform falloff");
@@ -554,6 +558,11 @@ void validateTraceConfig(const FiberTraceConfig& config)
         throw std::invalid_argument("endpoint accept threshold in base voxels must be non-negative");
     if (!(config.traceToBaseScale > 0.0))
         throw std::invalid_argument("trace-to-base scale must be positive");
+    const double conservativeStep = .5 * std::max(1.0e-3f, static_cast<float>(config.stepVoxels)) * config.traceToBaseScale;
+    if (!std::isfinite(config.embeddingEmaDelayBaseVoxels) || config.embeddingEmaDelayBaseVoxels < 0 ||
+        config.embeddingEmaDelayBaseVoxels > 2048 ||
+        (mode == "ema-delayed" && std::ceil(config.embeddingEmaDelayBaseVoxels/conservativeStep)+2 > FiberEmbeddingDelay::capacity))
+        throw std::invalid_argument("embedding EMA delay exceeds bounded pending capacity for this step size");
     if (config.baseVoxelSizeUm.has_value() && !(*config.baseVoxelSizeUm > 0.0))
         throw std::invalid_argument("base voxel size must be positive when provided");
 }
@@ -616,6 +625,7 @@ void validateTraceConfig(const FiberTraceConfig& config)
 struct BeamState {
     FiberEmbeddingHistory embeddingHistory;
     FiberEmbeddingMemory embeddingMemory;
+    FiberEmbeddingDelay embeddingDelay;
     std::vector<size_t> embeddingAnchors;
     FiberEmbeddingLru embeddingLru;
     FiberEmbeddingAppearance embeddingAppearance;
@@ -685,7 +695,7 @@ void addEmbeddingScore(CandidateScore& score, const std::vector<float>& vector,
     if (vector.empty()) { score.valid = false; score.loss = std::numeric_limits<float>::infinity(); return; }
     const double arc = (parent.tracedLength + traceLength(point - beamEndpoint(parent))) * config.traceToBaseScale;
     // Same per-step units as the existing local alignment/smoothness costs.
-    const bool ema = config.embeddingReferenceMode.starts_with("ema");
+    const bool ema = config.embeddingReferenceMode.starts_with("ema") || config.embeddingReferenceMode == "seed";
     const bool lru = config.embeddingReferenceMode == "anchors-lru";
     const bool appearance = config.embeddingReferenceMode == "appearance";
     const double cost = (config.embeddingReferenceMode == "anchors" || lru || appearance) ?
@@ -1447,17 +1457,23 @@ void updateTargetPlaneCrossings(
                 config.embeddingHistorySpacingBaseVoxels,config.embeddingAnchorCount);
         else if (config.embeddingReferenceMode == "anchors-lru")
             advanceFiberEmbeddingLru(out.embeddingLru,score.embedding,out.tracedLength * config.traceToBaseScale,
-                config.embeddingHistorySpacingBaseVoxels,config.embeddingAnchorCount,config.embeddingAnchorNovelty);
+                config.embeddingHistorySpacingBaseVoxels,config.embeddingAnchorCount,config.embeddingAnchorNovelty,
+                config.embeddingAnchorTouch == "hit");
         else advanceFiberEmbeddingAnchors(out.embeddingHistory, out.embeddingAnchors, score.embedding,
             out.tracedLength * config.traceToBaseScale, config.embeddingHistorySpacingBaseVoxels,
             config.embeddingHistoryWindowBaseVoxels, config.embeddingHistoryCount, config.embeddingAnchorCount);
     }
+    else if (config.embeddingWeight > 0 && config.embeddingReferenceMode == "ema-delayed")
+        advanceFiberEmbeddingDelayedMemory(out.embeddingMemory, out.embeddingDelay, score.embedding,
+            out.tracedLength * config.traceToBaseScale,
+            traceLength(candidate.point - beamEndpoint(parent)) * config.traceToBaseScale,
+            config.embeddingEmaDelayBaseVoxels, config.embeddingEmaHalfLifeBaseVoxels);
     else if (config.embeddingWeight > 0 && config.embeddingReferenceMode.starts_with("ema"))
         advanceFiberEmbeddingMemory(out.embeddingMemory, score.embedding,
             traceLength(candidate.point - beamEndpoint(parent)) * config.traceToBaseScale,
             config.embeddingEmaHalfLifeBaseVoxels, score.selectedPresence,
             config.embeddingReferenceMode.ends_with("gated"));
-    else if (config.embeddingWeight > 0)
+    else if (config.embeddingWeight > 0 && config.embeddingReferenceMode != "seed")
         advanceFiberEmbeddingHistory(out.embeddingHistory, score.embedding,
             out.tracedLength * config.traceToBaseScale, config.embeddingHistorySpacingBaseVoxels,
             config.embeddingHistoryWindowBaseVoxels, static_cast<size_t>(config.embeddingHistoryCount));
