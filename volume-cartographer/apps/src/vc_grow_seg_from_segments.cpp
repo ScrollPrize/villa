@@ -21,6 +21,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
+#include "vc/core/util/VoxelSizeMetadata.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -559,6 +560,15 @@ static cv::Point find_center_seed_point(const cv::Mat_<cv::Vec3f>& points)
     return best;
 }
 
+// Physical area for the metrics, or NaN when the voxel size is unknown. NaN
+// serializes as null in the sweep report and fails every threshold and
+// isfinite() check, so an unknown scale can never make a surface "complete".
+static double area_cm2_or_nan(double area_vx2, double voxelsize)
+{
+    return vc::surface::areaCm2FromVox2(area_vx2, voxelsize)
+        .value_or(std::numeric_limits<double>::quiet_NaN());
+}
+
 static std::unique_ptr<QuadSurface> load_or_create_center_cutout(QuadSurface& target,
                                                                  const std::filesystem::path& target_path,
                                                                  double cutout_cm,
@@ -763,7 +773,7 @@ static SweepMetrics score_surface(QuadSurface& result,
     metrics.valid_points = result.countValidPoints();
     metrics.valid_quads = result.countValidQuads();
     metrics.area_vx2 = vc::surface::computeSurfaceAreaVox2(result);
-    metrics.area_cm2 = metrics.area_vx2 * voxelsize * voxelsize / 1e8;
+    metrics.area_cm2 = area_cm2_or_nan(metrics.area_vx2, voxelsize);
     if (target_area_vx2 > 0.0) {
         metrics.area_ratio = metrics.area_vx2 / target_area_vx2;
         metrics.area_abs_error_ratio = std::abs(metrics.area_vx2 - target_area_vx2) / target_area_vx2;
@@ -805,7 +815,7 @@ static SweepMetrics score_surface_without_target(QuadSurface& result, double vox
     metrics.valid_points = result.countValidPoints();
     metrics.valid_quads = result.countValidQuads();
     metrics.area_vx2 = vc::surface::computeSurfaceAreaVox2(result);
-    metrics.area_cm2 = metrics.area_vx2 * voxelsize * voxelsize / 1e8;
+    metrics.area_cm2 = area_cm2_or_nan(metrics.area_vx2, voxelsize);
     add_completeness_metrics(result, metrics);
     const double hole_penalty = 1.0 - std::clamp(metrics.enclosed_hole_fraction, 0.0, 1.0);
     metrics.mesh_completeness_score =
@@ -1148,7 +1158,14 @@ int main(int argc, char *argv[])
     std::cout << "chunk shape shape " << ds->defaultChunkShape() << std::endl;
     add_internal_volume_shape(params, ds->shape());
 
-    float voxelsize = Json::parse_file(vol_path/"meta.json")["voxelsize"].get_float();
+    // Resolved the same way Volume does, so a store that states its voxel size
+    // only through an acquisition record is not read as 0.
+    // 0 still means unknown, and every cm^2 below is then reported as null.
+    float voxelsize = 0.0f;
+    if (const auto resolved = vc::metadata::resolveLocalStoreVoxelSize(vol_path)) {
+        voxelsize = static_cast<float>(*resolved);
+    }
+    std::cout << "voxelsize: " << voxelsize << std::endl;
 
     std::filesystem::create_directories(tgt_dir);
 
@@ -1156,6 +1173,20 @@ int main(int argc, char *argv[])
         const bool seed_only_sweep = sweep_max_width > 0 || sweep_max_height > 0;
         const int seed_only_max_width = sweep_max_width;
         const int seed_only_max_height = sweep_max_height;
+        // --sweep-min-area is a physical threshold, so it cannot be evaluated
+        // without a voxel size. Refuse now: with voxelsize 0 no run could ever
+        // qualify, and the sweep would still finish "successfully" with
+        // nothing selected.
+        if (seed_only_sweep && sweep_min_area_cm2 > 0.0 &&
+            !(std::isfinite(voxelsize) && voxelsize > 0.0f)) {
+            std::cerr << "ERROR: volume reports no usable voxel size (" << voxelsize
+                      << " um/voxel), so --sweep-min-area " << sweep_min_area_cm2
+                      << " cannot be evaluated." << std::endl
+                      << "       Add \"voxelsize\" (um per voxel) to " << (vol_path / "meta.json").string()
+                      << ", or pass --sweep-min-area 0 to select without an area threshold."
+                      << std::endl;
+            return EXIT_FAILURE;
+        }
         auto target = load_quad_from_tifxyz(sweep_target_path.string());
         if (!target) {
             std::cerr << "Error: failed to load sweep target tifxyz " << sweep_target_path << std::endl;
@@ -1172,7 +1203,7 @@ int main(int argc, char *argv[])
         const int target_valid_quads = target->countValidQuads();
         const cv::Size target_grid_size = target->rawPointsPtr()->size();
         const double target_area_vx2 = vc::surface::computeSurfaceAreaVox2(*target);
-        const double target_area_cm2 = target_area_vx2 * voxelsize * voxelsize / 1e8;
+        const double target_area_cm2 = area_cm2_or_nan(target_area_vx2, voxelsize);
         PointIndex target_index;
         if (!seed_only_sweep) {
             target_index.buildFromMat(*target->rawPointsPtr());

@@ -1889,7 +1889,7 @@ void SegmentationLasagnaPanel::repeatLastLasagnaAction()
 bool SegmentationLasagnaPanel::repeatLastLasagnaActionHeadless(CState* state, QString* errorMessage)
 {
     return startOptimizationHeadless(state, _lastLasagnaMode, QString(), std::nullopt,
-                                      QString(), errorMessage);
+                                      QString(), QString(), errorMessage);
 }
 
 void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* statusBar)
@@ -1949,6 +1949,7 @@ bool SegmentationLasagnaPanel::startOptimizationHeadless(CState* state,
                                                          const QString& configPath,
                                                          std::optional<cv::Vec3i> seed,
                                                          const QString& atlasPath,
+                                                         const QString& initShellDir,
                                                          QString* errorMessage)
 {
     auto fail = [errorMessage](const QString& msg) {
@@ -2021,7 +2022,7 @@ bool SegmentationLasagnaPanel::startOptimizationHeadless(CState* state,
     } else {
         result = startOptimizationWithOverrides(
             state, nullptr, static_cast<int>(mode), resolvedConfig,
-            hasSeed, seedX, seedY, seedZ, Presentation::Silent);
+            hasSeed, seedX, seedY, seedZ, Presentation::Silent, initShellDir);
     }
 
     if (!result.submitted) {
@@ -2350,7 +2351,8 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
     int seedX,
     int seedY,
     int seedZ,
-    Presentation presentation)
+    Presentation presentation,
+    const QString& initShellDirOverride)
 {
     auto showStatus = [statusBar](const QString& msg, int timeout) {
         if (statusBar) {
@@ -2629,6 +2631,9 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
     args[QStringLiteral("model-w-unit")] = nmWUnit;
     args[QStringLiteral("model-h")] = nmH;
     args[QStringLiteral("depth")] = nmN;
+    if (!initShellDirOverride.trimmed().isEmpty()) {
+        args[QStringLiteral("init-shell-dir")] = initShellDirOverride.trimmed();
+    }
     config[QStringLiteral("args")] = args;
 
     std::cerr << "[lasagna] request settings:"

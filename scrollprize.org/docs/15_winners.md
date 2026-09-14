@@ -40,6 +40,73 @@ import AwardedTotal from '@site/src/components/AwardedTotal';
 
 Vesuvius Challenge has awarded **<AwardedTotal />** in prizes since the competition started in 2023! This page lists all the prizes awarded so far.
 
+### \$31,000 Progress Prizes (August 2026)
+
+**Goal:** Improve the tools and training methods needed to read the scrolls.
+
+<div className="flex flex-row flex-wrap">
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/WillStevens/scrollreading">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$20,000</div><span className="font-semibold">Patch-based unwrapping</span>: William Stevens</div>
+    <div className="text-sm text-dim">Detects when the 2D alignments of overlapping patches imply incompatible 3D locations, drops the offending patches, and joins the rest into flattened components — around 365 cm² of coverage on PHerc. 1667.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/Hob3rMallow/scrollfiesta_public">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$2,500</div><span className="font-semibold">9 µm surface model & ScrollFiesta fixes</span>: Ben Kyles / @hari_seldon and collaborators</div>
+    <div className="text-sm text-dim">A retrained 9 µm surface model distilled from 2.4 µm predictions, producing thinner and more continuous sheets with fewer blobs, plus bugfixes and improvements across the end-to-end ScrollFiesta unwrapping pipeline.</div>
+  </a>
+  <div className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Ink checkpoint benchmarking</span>: Domenico Russo</div>
+    <div className="text-sm text-dim">Benchmarks all 14 released 9 µm ink checkpoints, and retrains from dense teacher labels instead of the sparse hand-labelled strips.</div>
+  </div>
+  <div className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Seeded sheet growing</span>: Mihajlo Nestorović</div>
+    <div className="text-sm text-dim">A trained 3D model that grows a single papyrus sheet from a seed, along with a pipeline for generating harder sheet-level training data.</div>
+  </div>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/pscamillo/ink9-depth-window">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">How many depth slices?</span>: Paulo Sergio Camillo / @pscamillo</div>
+    <div className="text-sm text-dim">Real training experiments on how many depth slices the 9 µm ink model actually needs.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3Aspelufo+created%3A2026-08-01..2026-08-31">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Lasagna & VC3D improvements</span>: Santiago Pelufo</div>
+    <div className="text-sm text-dim">Seven merged villa changes, including Mac GPU flattening in Lasagna, a HiDPI scale bar, and assorted navigation and registration fixes.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/millerandmuller/first-light-pherc0826">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">First Letters on PHerc. 0826</span>: Lutfiya Miller and Chris Müller</div>
+    <div className="text-sm text-dim">Ran the First Letters workflow end to end on PHerc. 0826 and published the images, commands, failures and costs — with plenty of useful insight for others attempting it — plus two merged PRs.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/hammb/vesuvius-surface-detection-nninteractive-refinement">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">nnInteractive label refinement</span>: Benjamin Hamm</div>
+    <div className="text-sm text-dim">Applies nnInteractive to surface label refinement, producing labels much closer to the true surface (though with some remaining topological issues).</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/Nieuwlaar/ink9um-dense-native">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Dense pseudo-labels & checkpoint repair</span>: Erwin Nieuwlaar</div>
+    <div className="text-sm text-dim">Extends the ink training recipe with dense pseudo-labels from native 113 keV scans, and repairs a published Scroll 1 checkpoint whose untrained output layer was emitting blank predictions.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3Aaxiosdevs+created%3A2026-08-01..2026-08-31">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Assorted villa fixes</span>: Oleksandr Kozlenko</div>
+    <div className="text-sm text-dim">Several useful fixes across training, inference, coordinate scaling, validation metrics and CLI tools.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3ATAUIL-Abd-Elilah+created%3A2026-08-01..2026-08-31">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$500</div><span className="font-semibold">Sustained PR work</span>: TAUIL Abd Elilah</div>
+    <div className="text-sm text-dim">PR work throughout the month, including making <code>vesuvius.predict</code> preprocess CT the same way the model was trained.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/1543">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Shared disk cache</span>: Praneeth Reddy</div>
+    <div className="text-sm text-dim">Makes villa's neural-tracing disk cache available to the general model workflow, so reruns stop redownloading the same chunks.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/7jycwjmbfn-eng/spiral-fit-consumer-gpu">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Spiral fitting on Windows</span>: Shuhan Yang</div>
+    <div className="text-sm text-dim">Gets the spiral-fitting tools building and running on Windows with lower compute resources, plus patches that cut render traffic and time on remote volumes.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pulls?q=is%3Apr+is%3Amerged+author%3ADarthCeltic+created%3A2026-08-01..2026-08-31">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">VC3D agent bridge fixes</span>: Ryan Gurganious</div>
+    <div className="text-sm text-dim">Lets VC3D's agent bridge start Lasagna with the selected volume, and download large segments without reporting them missing.</div>
+  </a>
+  <div className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$250</div><span className="font-semibold">Checkpoint averaging</span>: Armando Gaona de Stefani</div>
+    <div className="text-sm text-dim">Careful checkpoint-averaging experiments on the ink models.</div>
+  </div>
+</div>
+
 ### \$33,500 Progress Prizes (July 2026)
 
 **Goal:** Improve the tools and training methods needed to read the scrolls.

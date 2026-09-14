@@ -82,7 +82,7 @@ std::vector<double> crossOffsets()
     const int center = kLineViewCrossSampleCount / 2;
     for (int i = 0; i < kLineViewCrossSampleCount; ++i) {
         offsets.push_back(
-            static_cast<double>(i - center) * kLineViewSamplingDistanceBaseVoxels);
+            static_cast<double>(i - center) * kLineViewCrossRowSpacingBaseVoxels);
     }
     return offsets;
 }
@@ -915,13 +915,13 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
                                        fixedCrossOffsets,
                                        ribbonFrames,
                                        positionMap.stripGridSpacingBaseVoxels,
-                                       kLineViewSamplingDistanceBaseVoxels,
+                                       kLineViewCrossRowSpacingBaseVoxels,
                                        true);
     surfaces.lineSideSlice = buildRibbon(ribbonSamples,
                                          fixedCrossOffsets,
                                          ribbonFrames,
                                          positionMap.stripGridSpacingBaseVoxels,
-                                         kLineViewSamplingDistanceBaseVoxels,
+                                         kLineViewCrossRowSpacingBaseVoxels,
                                          false);
     surfaces.stripPositionMap = positionMap;
 

@@ -945,6 +945,36 @@
          </property>
         </widget>
        </item>
+       <item row="1" column="0">
+        <widget class="QCheckBox" name="chkFocusBBox">
+         <property name="text">
+          <string>BBox</string>
+         </property>
+         <property name="toolTip">
+          <string>Limit new fiber work and dim views outside these base-volume coordinates</string>
+         </property>
+        </widget>
+       </item>
+       <item row="1" column="1" colspan="2">
+        <widget class="QLineEdit" name="focusBBoxMin">
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+         <property name="placeholderText">
+          <string>min x, y, z</string>
+         </property>
+        </widget>
+       </item>
+       <item row="1" column="3" colspan="2">
+        <widget class="QLineEdit" name="focusBBoxMax">
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+         <property name="placeholderText">
+          <string>max x, y, z</string>
+         </property>
+        </widget>
+       </item>
       </layout>
      </item>
      <item row="2" column="0">
@@ -1049,6 +1079,19 @@
       <widget class="QCheckBox" name="chkAxisOverlays">
        <property name="text">
         <string>Show axis overlays in XY view</string>
+       </property>
+      </widget>
+     </item>
+     <item row="11" column="0" colspan="4">
+      <widget class="QCheckBox" name="chkCoordinateFrames">
+       <property name="text">
+        <string>Show coordinate frames</string>
+       </property>
+       <property name="checked">
+        <bool>true</bool>
+       </property>
+       <property name="toolTip">
+        <string>Draw the X/Y/Z reference frame in the corner of the slice views</string>
        </property>
       </widget>
      </item>

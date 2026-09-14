@@ -359,6 +359,10 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
         connect(_state, &CState::poiChanged, chunkedViewer, &CChunkedVolumeViewer::onPOIChanged);
         connect(_state, &CState::volumeChanged, chunkedViewer, &CChunkedVolumeViewer::OnVolumeChanged);
         connect(_state, &CState::volumeClosing, chunkedViewer, &CChunkedVolumeViewer::onVolumeClosing);
+        connect(_state, &CState::focusBoundsChanged, chunkedViewer,
+                [chunkedViewer]() {
+                    chunkedViewer->requestRender("focus bounds changed");
+                });
     }
 
     // Restore persisted viewer preferences
@@ -370,6 +374,7 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
         bool showNormals = settings.value(viewer::SHOW_SURFACE_NORMALS, viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
         baseViewer->setShowSurfaceNormals(showNormals);
     }
+    chunkedViewer->setShowCoordinateFrame(_showCoordinateFrames);
 
     {
         using namespace vc3d::settings;
@@ -780,6 +785,16 @@ void ViewerManager::setShowSurfaceNormals(bool show)
     forEachBaseViewer([show](VolumeViewerBase* viewer) {
         if (viewer) {
             viewer->setShowSurfaceNormals(show);
+        }
+    });
+}
+
+void ViewerManager::setShowCoordinateFrames(bool show)
+{
+    _showCoordinateFrames = show;
+    forEachBaseViewer([show](VolumeViewerBase* viewer) {
+        if (auto* chunkedViewer = dynamic_cast<CChunkedVolumeViewer*>(viewer)) {
+            chunkedViewer->setShowCoordinateFrame(show);
         }
     });
 }

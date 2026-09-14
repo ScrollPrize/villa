@@ -13,7 +13,6 @@
 #include "segmentation/SegmentationModule.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "CommandLineToolRunner.hpp"
-#include "RemoteVolumeCachePaths.hpp"
 #include "SettingsDialog.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
@@ -1163,7 +1162,6 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
     if (!attachment->prepare(
             url,
             {},
-            VolumeAttachmentPresentation::Interactive,
             &request,
             &error)) {
         if (!error.isEmpty()) {
@@ -1953,7 +1951,6 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
     const bool fiberInference = role == QObject::tr("Fiber inference");
 
     vc::lasagna::LasagnaDatasetOpenOptions openOptions;
-    QString cacheRoot;
     bool needsRemoteCache = remote;
     bool needsRemoteAuth = remote;
     QString authLocation = location;
@@ -1998,21 +1995,13 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
         }
     }
     if (needsRemoteCache) {
-        auto* attachment = _window->_volumeAttachmentController.get();
-        cacheRoot = attachment->remoteCacheDirectory(VolumeAttachmentPresentation::Interactive);
-        if (cacheRoot.isEmpty())
-            return;
-        openOptions.remoteCacheRoot = cacheRoot.toStdString();
-    } else {
-        const auto persisted = _window->_state->vpkg()->remoteCacheRootOrEmpty();
-        if (!persisted.empty())
-            openOptions.remoteCacheRoot = persisted;
+        openOptions.remoteCacheRoot = vc3d::remoteCachePathFs();
     }
 
     const auto targetPackage = _window->_state->vpkg();
     const std::string persistedLocation = location.toStdString();
     auto* watcher = new QFutureWatcher<LasagnaAttachTaskResult>(this);
-    connect(watcher, &QFutureWatcher<LasagnaAttachTaskResult>::finished, this, [this, watcher, targetPackage, persistedLocation, fiberInference, cacheRoot]() {
+    connect(watcher, &QFutureWatcher<LasagnaAttachTaskResult>::finished, this, [this, watcher, targetPackage, persistedLocation, fiberInference]() {
         auto task = watcher->result();
         watcher->deleteLater();
         _lasagnaAttachmentInFlight = false;
@@ -2029,8 +2018,8 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
             return;
         }
         try {
-            const auto result =
-                targetPackage->attachPreparedLasagnaDataset(persistedLocation, {}, fiberInference, task.volumes, cacheRoot.toStdString());
+            const auto result = targetPackage->attachPreparedLasagnaDataset(
+                persistedLocation, {}, fiberInference, task.volumes);
             if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict) {
                 QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QObject::tr("A Lasagna volume conflicts with an existing volume id."));
                 return;

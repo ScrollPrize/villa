@@ -67,6 +67,8 @@ public:
         cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
         InitialDirectionMode initialDirectionMode = InitialDirectionMode::Sideways;
         vc::lasagna::LineOptimizationResult result;
+        std::optional<Rect3D> focusBoundsBase;
+        bool focusBoundsApplied = false;
         std::string error;
         std::string eventName;
     };
@@ -344,6 +346,9 @@ public:
     [[nodiscard]] uint64_t fiberIdForFileName(const std::string& fileName) const;
     // Display name as shown in the fiber panel (file stem, "unnamed" fallback).
     [[nodiscard]] QString fiberDisplayName(uint64_t fiberId) const;
+    // File stem of a fiber by id (live session first, then stored), or
+    // "unsaved fiber"; resolved at menu time so renames show immediately.
+    [[nodiscard]] QString fiberDisplayNameForId(uint64_t fiberId) const;
     [[nodiscard]] std::vector<std::string> knownFiberTags() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshots() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsFromStorage() const;
@@ -437,6 +442,11 @@ private:
         Unoptimized,
         Incremental,
         Optimized,
+    };
+
+    enum class SeedOrigin {
+        NewPlacement,
+        StoredFiber,
     };
 
     // Intentionally opaque outside LineAnnotationController.cpp. Keeping session
@@ -583,18 +593,44 @@ private:
                                    std::optional<std::pair<int, int>> spanControlIndices = std::nullopt);
     void handleLineSeed(const std::string& surfaceName,
                         cv::Vec3f volumePoint,
-                        InitialDirectionMode directionMode);
+                        InitialDirectionMode directionMode,
+                        SeedOrigin seedOrigin = SeedOrigin::NewPlacement);
+    // lineAnchor: linePosition's 3D point on the line the caller measured it
+    // on (see LineAnnotationDialog::generatedControlPointRequested). Absent,
+    // the position is used as given.
     void handleGeneratedControlPoint(const std::string& surfaceName,
                                      cv::Vec3f volumePoint,
-                                     double linePosition);
+                                     double linePosition,
+                                     std::optional<cv::Vec3f> lineAnchor = std::nullopt);
     void handleGeneratedControlPointDelete(const std::string& surfaceName,
                                            double linePosition,
                                            cv::Vec3f volumePoint);
-    void handleGeneratedControlPointBranch(const std::string& surfaceName,
-                                           size_t controlPointIndex,
-                                           cv::Vec3f linkedControlPoint,
-                                           bool openAfterCreate,
-                                           cv::Vec3f requestedLinkDirection);
+    // "New line annotation - linked to candidate": a new fiber seeded at
+    // volumePoint whose seed control point is pending-linked to the designated
+    // link candidate; the new fiber is then opened (deferred out of the menu
+    // callback frame).
+    void handleGeneratedNewLineAnnotationLinkedToCandidate(const std::string& surfaceName,
+                                                           cv::Vec3f volumePoint,
+                                                           cv::Vec3f requestedLinkDirection);
+    // The candidate ("parent") side of a new linked seed fiber: either the
+    // live session(s) of that fiber or its stored record. addRef/rollback
+    // mutate the parent's branch list(s); storedFiber snapshots it for the
+    // pair save after the ref was added.
+    struct LinkedSeedParent {
+        uint64_t fiberId = 0;
+        int controlPointIndex = -1;
+        cv::Vec3d point{0.0, 0.0, 0.0};
+        std::vector<cv::Vec3d> linePoints;
+        std::function<void(const FiberBranchRef&)> addRef;
+        std::function<void(const FiberBranchRef&)> rollback;
+        std::function<StoredFiber()> storedFiber;
+    };
+    // Creates and schedules the save of the one-control linked fiber; returns
+    // its id, or nullopt after showing the error (parent ref rolled back).
+    std::optional<uint64_t> createLinkedSeedFiber(const LinkedSeedParent& parent,
+                                                  const cv::Vec3d& seedPoint,
+                                                  const cv::Vec3d& requestedLinkDirection,
+                                                  const LineAnnotationSession& templateSession);
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
     // Debouncing entry point (signal-connected): one placement triggers
@@ -669,10 +705,25 @@ private:
         splitAndLinkCandidateMenuState(const LineAnnotationSession& session) const;
     [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
         mergeCandidateMenuState(const LineAnnotationSession& session) const;
+    [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
+        newLinkedToCandidateMenuState() const;
+    // "<name> / CP <stored index>" of the link candidate for menu labels
+    // (name only when the control point cannot be resolved).
+    [[nodiscard]] QString linkCandidateMenuName() const;
+    struct ResolvedLinkCandidate {
+        int storedControlIndex = -1;
+        size_t controlCount = 0;
+    };
+    // Live pane session first, then the stored fiber; nullopt when the
+    // candidate control point no longer exists.
+    [[nodiscard]] std::optional<ResolvedLinkCandidate> resolvedLinkCandidateControlIndex() const;
+    // Decorates published side-strip markers for one pane: link-candidate
+    // fiber, pending / same-H/V link state (the session may be null).
     [[nodiscard]] std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker>
         markLinkCandidateFiberIntersections(
             std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers,
-            const std::vector<FiberBranchRef>& branches) const;
+            const LineAnnotationSession* session) const;
+    [[nodiscard]] bool fibersShareHvDirection(uint64_t localFiberId, uint64_t linkedFiberId) const;
     bool ensureDatasetForSession(LineAnnotationSession& session);
     bool ensureFiberInferenceDatasetForSession(LineAnnotationSession& session);
     void refreshLineAnnotationDatasetMenus() const;
@@ -685,6 +736,8 @@ private:
     void setSessionOptimizationState(LineAnnotationSession& session,
                                      SessionOptimizationState state);
     void refreshSessionOptimizationStatus(const LineAnnotationSession& session);
+    bool placementAllowedByFocusBounds(const cv::Vec3d& point,
+                                       bool suppressErrorDialogs) const;
     bool applyOptimizationTaskResult(LineAnnotationSession& session,
                                      OptimizationTaskResult task,
                                      bool updateGeneratedViews,

@@ -56,9 +56,11 @@ static std::shared_ptr<Volume> New(std::filesystem::path path,
 // Open a remote HTTP or s3:// zarr volume. s3:// URLs are resolved to HTTPS.
 static std::shared_ptr<Volume> NewFromUrl(
     const std::string& url,
-    const std::filesystem::path& cacheRoot = {},
     const vc::HttpAuth& auth = {});
 ```
+
+Remote volumes always use the process-wide remote cache root configured by
+VC3D.
 
 `New(path, options)` creates a local zarr pyramid when `path` has no existing
 zarr array, or when `options.overwriteExisting` is true. Existing volumes are

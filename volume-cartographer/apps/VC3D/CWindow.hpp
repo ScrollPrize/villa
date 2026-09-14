@@ -291,7 +291,6 @@ private:
         const std::shared_ptr<Volume>& volume,
         const QString& location,
         std::vector<std::string> tags = {},
-        const QString& remoteCacheRoot = {},
         const QString& preferredVolumeId = {});
     void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
                                        bool reloadSurfaces = true);
@@ -319,6 +318,8 @@ private slots:
     void onEditMaskPressed(const QString& segmentId);
     void onAppendMaskPressed(const QString& segmentId);
     void onManualLocationChanged();
+    void onFocusBoundsEdited();
+    void onFocusBoundsToggled(bool enabled);
     void onZoomIn();
     void onZoomOut();
     void onCopyCoordinates();
@@ -331,6 +332,7 @@ private slots:
     void onSegmentationEditingModeChanged(bool enabled);
     void onSegmentationStopToolsRequested();
     void configureChunkedViewerConnections(CChunkedVolumeViewer* viewer);
+    void refreshFocusBoundsUi();
 
     CChunkedVolumeViewer* segmentationViewer() const;
     VolumeViewerBase* segmentationBaseViewer() const;

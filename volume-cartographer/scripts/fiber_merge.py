@@ -327,7 +327,9 @@ def line_tangent_at(line, index):
 
 def endpoint_tangent(line, point):
     """Port of endpointTangentFromLinePoints: tangent of the line segment
-    nearest to `point`, or None when the line has fewer than 2 points."""
+    nearest to `point`, or None when the line has fewer than 2 points.
+    Accepts a bare [x, y, z] point or a version-3 control point dict."""
+    point = _cp_position(point)
     if len(line) < 2 or not _finite_point(point):
         return None
     return line_tangent_at(line, nearest_line_point_index(line, point))
@@ -1243,8 +1245,11 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
                 f"link {a_name} -> {b_name}: anchor control point not found in "
                 f"{a_name if local_index is None else b_name}")
             continue
-        pa = a_cps[local_index]
-        pb = b_cps[far_index]
+        # Version-3 control points are {'position': ...} dicts; everything
+        # below (tangents, the reciprocal's float literals) needs the bare
+        # point.
+        pa = _cp_position(a_cps[local_index])
+        pb = _cp_position(b_cps[far_index])
         da = endpoint_tangent(a_line, pa)
         db = endpoint_tangent(b_line, pb)
 

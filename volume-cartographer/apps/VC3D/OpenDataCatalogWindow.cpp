@@ -836,7 +836,7 @@ void OpenDataCatalogWindow::populateSamples()
     }
 
     const QString needle = _searchEdit->text().trimmed();
-    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
+    const auto remoteRoot = vc3d::remoteCachePathFs();
     for (std::size_t i = 0; i < _manifest->samples.size(); ++i) {
         const auto& sample = _manifest->samples[i];
         if (!needle.isEmpty() &&
@@ -899,7 +899,7 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
         return;
     }
 
-    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
+    const auto remoteRoot = vc3d::remoteCachePathFs();
     const auto cacheSummary = sampleCacheSummary(remoteRoot, *sample);
     const auto representations = derivedRepresentations(*sample);
     _overviewLabel->setText(
@@ -1046,7 +1046,7 @@ void OpenDataCatalogWindow::refreshSelectedSampleCacheStatus()
 
     const int row = _sampleTable->currentRow();
     if (row >= 0) {
-        const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
+        const auto remoteRoot = vc3d::remoteCachePathFs();
         const auto cacheSummary = sampleCacheSummary(remoteRoot, *sample);
         QSignalBlocker blocker(_sampleTable);
         const bool sorting = _sampleTable->isSortingEnabled();
@@ -1276,7 +1276,7 @@ std::filesystem::path OpenDataCatalogWindow::selectedSegmentCacheDir() const
         return {};
     }
     return openDataCanonicalSegmentCacheDirectory(
-        std::filesystem::path(vc3d::remoteCachePath().toStdString()),
+        vc3d::remoteCachePathFs(),
         *sample,
         *segment);
 }
@@ -1290,7 +1290,7 @@ void OpenDataCatalogWindow::updateActionButtons()
     const auto* sample = selectedSample();
     const auto* segment = selectedSegment();
     const bool canCacheSegment = manifestReady && segment && segment->hasTifxyz();
-    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
+    const auto remoteRoot = vc3d::remoteCachePathFs();
     const auto sampleSummary = sample
         ? sampleCacheSummary(remoteRoot, *sample)
         : SampleCacheSummary{};
@@ -1420,7 +1420,7 @@ void OpenDataCatalogWindow::downloadSelectedVolumeNormalGrids()
     if (infos.empty()) {
         return;
     }
-    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
+    const auto remoteRoot = vc3d::remoteCachePathFs();
     const QString volumeLabel = qstr(volume->id);
     const int volumeRow = _volumesTable ? _volumesTable->currentRow() : -1;
 
@@ -1551,7 +1551,7 @@ void OpenDataCatalogWindow::cacheSelectedSegment()
         return;
     }
 
-    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
+    const auto remoteRoot = vc3d::remoteCachePathFs();
     const auto state = cacheStateForSegment(remoteRoot, *sample, *segment);
     const bool forceRefresh = state != OpenDataSegmentCacheState::Missing;
     setStatus(forceRefresh
@@ -1616,7 +1616,7 @@ void OpenDataCatalogWindow::syncSelectedSampleCache()
         return;
     }
 
-    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
+    const auto remoteRoot = vc3d::remoteCachePathFs();
     const auto summary = sampleCacheSummary(remoteRoot, *sample);
     const bool forceRefresh = summary.hasLocal();
     setStatus(forceRefresh
