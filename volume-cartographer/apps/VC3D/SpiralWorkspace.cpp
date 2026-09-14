@@ -445,8 +445,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 } else if (kind == QStringLiteral("fiber") && _lineAnnotationController) {
                     QString error;
                     const auto directory = QFileInfo(path).absolutePath();
-                    if (_lineAnnotationController->registerExternalFiberSource(directory.toStdString(), &error)) {
-                        const auto fiber = _lineAnnotationController->fiberIdForFileName(QFileInfo(path).fileName().toStdString());
+                    if (_lineAnnotationController->registerExternalFiberSource(directory.toStdString(), &error, true)) {
+                        const auto fiber = _lineAnnotationController->fiberIdForFilePath(path.toStdString());
                         _externalFiberSource = directory;
                         _managedFiberDirectories.insert(QDir(directory).absolutePath());
                         if (fiber) _lineAnnotationController->openFiber(fiber);

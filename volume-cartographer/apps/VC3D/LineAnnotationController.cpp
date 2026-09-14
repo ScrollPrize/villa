@@ -13185,6 +13185,18 @@ void LineAnnotationController::emitFiberSummaries()
     emit fibersChanged(fiberSummaries());
 }
 
+uint64_t LineAnnotationController::fiberIdForFilePath(const fs::path& path) const
+{
+    std::error_code ec;
+    auto canonical = fs::weakly_canonical(path, ec);
+    if (ec) canonical = fs::absolute(path).lexically_normal();
+    const auto key = vc3d::fiberSourceFileKey(canonical.parent_path(), canonical.filename().string());
+    const auto it = std::find_if(_fibers.begin(), _fibers.end(), [&key](const StoredFiber& fiber) {
+        return vc3d::fiberSourceFileKey(fiber.sourceRoot, fiber.fileName) == key;
+    });
+    return it != _fibers.end() ? it->id : 0;
+}
+
 uint64_t LineAnnotationController::fiberIdForFileName(const std::string& fileName) const
 {
     if (fileName.empty()) {
@@ -13398,11 +13410,11 @@ bool LineAnnotationController::redirectFiberSource(const fs::path& source,
             pane.session->fiberSourceRoot = destination;
     }
     std::erase(_externalFiberSources, original);
-    return registerExternalFiberSource(destination, errorMessage);
+    return registerExternalFiberSource(destination, errorMessage, true);
 }
 
 bool LineAnnotationController::registerExternalFiberSource(
-    const fs::path& source, QString* errorMessage)
+    const fs::path& source, QString* errorMessage, bool workingCopy)
 {
     try {
         if (source.empty()) throw std::runtime_error("Fiber source path is empty");
@@ -13419,9 +13431,12 @@ bool LineAnnotationController::registerExternalFiberSource(
             throw std::runtime_error("Fiber source is not a directory: " +
                                      canonical.string());
         }
+        const bool newlyIsolated = workingCopy && _workingCopyFiberSources.insert(canonical).second;
         if (std::find(_externalFiberSources.begin(), _externalFiberSources.end(),
                       canonical) == _externalFiberSources.end()) {
             _externalFiberSources.push_back(std::move(canonical));
+            loadFibersForCurrentPackage();
+        } else if (newlyIsolated) {
             loadFibersForCurrentPackage();
         }
         return true;
@@ -13439,6 +13454,7 @@ void LineAnnotationController::unregisterExternalFiberSource(const fs::path& sou
     if (ec) canonical = fs::absolute(source).lexically_normal();
     const auto oldSize = _externalFiberSources.size();
     std::erase(_externalFiberSources, canonical);
+    _workingCopyFiberSources.erase(canonical);
     if (_externalFiberSources.size() != oldSize) loadFibersForCurrentPackage();
 }
 
@@ -17183,7 +17199,7 @@ void LineAnnotationController::dedupeLoadedFiberSources(
                 fiber.username, fiber.startedAt, fiber.sequence);
         entries.push_back({fiber.sourceRoot, fiber.fileName,
                            fiberGeometryKey(fiber.controlPoints, fiber.linePoints),
-                           canonical});
+                           canonical, _workingCopyFiberSources.contains(fiber.sourceRoot)});
     }
     auto result = vc3d::dedupeFiberSources(entries, sourcePreference);
     if (result.kept.size() == fibers.size()) return;

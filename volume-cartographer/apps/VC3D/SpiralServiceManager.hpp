@@ -272,6 +272,9 @@ private:
         QString commitId;
         bool commit = false;
         bool applied = false;
+        bool preparing = true;
+        QString preparationError;
+        std::shared_ptr<QTemporaryDir> directory;
     };
     void stageInput(const QString& kind, const QString& path, const QString& alias,
                     const QString& role = {}, const QString& targetCollection = {}, bool deleted = false);

@@ -458,62 +458,93 @@ void SpiralServiceManager::applyInputDrafts(bool commit, const QStringList& sele
     command->revisions = revisions;
     command->localDeletions = localDeletions;
     _inputCommand = command;
-    QJsonArray changes;
-    for (const auto& snapshot : command->batch.entries) {
-        const auto& manifest = snapshot.content.manifest;
-        const auto kind = manifest.value(QStringLiteral("kind")).toString();
-        QJsonObject change{{QStringLiteral("id"), snapshot.id},
-            {QStringLiteral("kind"), kind}, {QStringLiteral("role"), manifest.value(QStringLiteral("role"))},
-            {QStringLiteral("name"), manifest.value(QStringLiteral("name"))},
-            {QStringLiteral("expected_revision"), qint64(snapshot.expectedAccepted)}};
-        if (snapshot.content.deleted) {
-            change[QStringLiteral("deleted")] = true;
-        } else if (manifest.contains(QStringLiteral("restore_revision"))) {
-            change[QStringLiteral("restore_revision")] = manifest.value(QStringLiteral("restore_revision"));
-        } else {
-            DraftTransfer transfer;
-            transfer.id = snapshot.id;
-            transfer.uploadId = QUuid::createUuid().toString(QUuid::Id128);
-            transfer.directory = QDir(_inputCopies.path()).filePath(QStringLiteral("submissions/%1").arg(transfer.uploadId));
-            const auto path = manifest.value(QStringLiteral("path")).toString();
-            QString error;
-            const bool directory = QFileInfo(path).isDir();
-            const auto target = directory ? transfer.directory : QDir(transfer.directory).filePath(QFileInfo(path).fileName());
-            if (!copyInput(path, target, error)) { failInputCommand(error, {{QStringLiteral("error"), error}}); return; }
-            QJsonArray files;
-            QDirIterator iterator(transfer.directory, QDir::Files | QDir::Hidden, QDirIterator::Subdirectories);
-            while (iterator.hasNext()) {
-                QFile file(iterator.next());
-                if (!file.open(QIODevice::ReadOnly)) { failInputCommand(tr("Cannot read captured input"), {{QStringLiteral("error"), "read"}}); return; }
-                QCryptographicHash hash(QCryptographicHash::Sha256);
-                hash.addData(&file);
-                files.append(QJsonObject{{QStringLiteral("name"), QDir(transfer.directory).relativeFilePath(file.fileName())},
-                    {QStringLiteral("size"), file.size()}, {QStringLiteral("sha256"), QString::fromLatin1(hash.result().toHex())}});
-            }
-            transfer.manifest = {{QStringLiteral("upload_id"), transfer.uploadId}, {QStringLiteral("id"), snapshot.id},
-                {QStringLiteral("kind"), kind}, {QStringLiteral("files"), files}};
-            if (kind == QStringLiteral("pcl")) transfer.manifest[QStringLiteral("role")] = manifest.value(QStringLiteral("role"));
-            change[QStringLiteral("upload_id")] = transfer.uploadId;
-            command->transfers.push_back(transfer);
+    // Capture the revision on the GUI thread; the worker sees only this value
+    // copy and immutable staged paths, never the live drafts or manager.
+    auto* watcher = new QFutureWatcher<std::shared_ptr<DraftCommand>>(this);
+    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, command]() {
+        watcher->deleteLater();
+        if (_inputCommand != command) return;
+        const auto prepared = watcher->result();
+        command->preparing = false;
+        if (!prepared->preparationError.isEmpty()) {
+            failInputCommand(prepared->preparationError, {{QStringLiteral("error"), "capture"}});
+            return;
         }
-        changes.append(change);
-    }
-    QJsonArray unchanged;
-    for (const auto& value : command->revisions) {
-        const auto id = value.toObject().value(QStringLiteral("id")).toString();
-        bool changed = false;
-        for (const auto& snapshot : command->batch.entries) changed |= snapshot.id == id;
-        if (!changed) unchanged.append(value);
-    }
-    command->request = {{QStringLiteral("command_id"), command->batch.commandId},
-        {QStringLiteral("changes"), changes}, {QStringLiteral("revisions"), unchanged}};
+        command->directory = prepared->directory;
+        command->transfers = prepared->transfers;
+        command->request = prepared->request;
+        resumeInputCommand();
+    });
     emit inputDraftsChanged();
-    resumeInputCommand();
+    watcher->setFuture(QtConcurrent::run([command = std::make_shared<DraftCommand>(*command)]() {
+        // Retain captured bytes for retries, and remove them off the GUI thread.
+        command->directory = std::shared_ptr<QTemporaryDir>(new QTemporaryDir,
+            [](QTemporaryDir* directory) {
+                (void)QtConcurrent::run([directory]() { delete directory; });
+            });
+        if (!command->directory->isValid()) {
+            command->preparationError = QObject::tr("Cannot create an input submission directory");
+            return command;
+        }
+        QJsonArray changes;
+        for (const auto& snapshot : command->batch.entries) {
+            const auto& manifest = snapshot.content.manifest;
+            const auto kind = manifest.value(QStringLiteral("kind")).toString();
+            QJsonObject change{{QStringLiteral("id"), snapshot.id},
+                {QStringLiteral("kind"), kind}, {QStringLiteral("role"), manifest.value(QStringLiteral("role"))},
+                {QStringLiteral("name"), manifest.value(QStringLiteral("name"))},
+                {QStringLiteral("expected_revision"), qint64(snapshot.expectedAccepted)}};
+            if (snapshot.content.deleted) {
+                change[QStringLiteral("deleted")] = true;
+            } else if (manifest.contains(QStringLiteral("restore_revision"))) {
+                change[QStringLiteral("restore_revision")] = manifest.value(QStringLiteral("restore_revision"));
+            } else {
+                DraftTransfer transfer;
+                transfer.id = snapshot.id;
+                transfer.uploadId = QUuid::createUuid().toString(QUuid::Id128);
+                transfer.directory = QDir(command->directory->path()).filePath(QStringLiteral("submissions/%1").arg(transfer.uploadId));
+                const auto path = manifest.value(QStringLiteral("path")).toString();
+                QString error;
+                const bool directory = QFileInfo(path).isDir();
+                const auto target = directory ? transfer.directory : QDir(transfer.directory).filePath(QFileInfo(path).fileName());
+                if (!copyInput(path, target, error)) { command->preparationError = error; return command; }
+                QJsonArray files;
+                QDirIterator iterator(transfer.directory, QDir::Files | QDir::Hidden, QDirIterator::Subdirectories);
+                while (iterator.hasNext()) {
+                    QFile file(iterator.next());
+                    if (!file.open(QIODevice::ReadOnly)) { command->preparationError = QObject::tr("Cannot read captured input"); return command; }
+                    QCryptographicHash hash(QCryptographicHash::Sha256);
+                    if (!hash.addData(&file)) {
+                        command->preparationError = QObject::tr("Cannot hash captured input");
+                        return command;
+                    }
+                    files.append(QJsonObject{{QStringLiteral("name"), QDir(transfer.directory).relativeFilePath(file.fileName())},
+                        {QStringLiteral("size"), file.size()}, {QStringLiteral("sha256"), QString::fromLatin1(hash.result().toHex())}});
+                }
+                transfer.manifest = {{QStringLiteral("upload_id"), transfer.uploadId}, {QStringLiteral("id"), snapshot.id},
+                    {QStringLiteral("kind"), kind}, {QStringLiteral("files"), files}};
+                if (kind == QStringLiteral("pcl")) transfer.manifest[QStringLiteral("role")] = manifest.value(QStringLiteral("role"));
+                change[QStringLiteral("upload_id")] = transfer.uploadId;
+                command->transfers.push_back(transfer);
+            }
+            changes.append(change);
+        }
+        QJsonArray unchanged;
+        for (const auto& value : command->revisions) {
+            const auto id = value.toObject().value(QStringLiteral("id")).toString();
+            bool changed = false;
+            for (const auto& snapshot : command->batch.entries) changed |= snapshot.id == id;
+            if (!changed) unchanged.append(value);
+        }
+        command->request = {{QStringLiteral("command_id"), command->batch.commandId},
+            {QStringLiteral("changes"), changes}, {QStringLiteral("revisions"), unchanged}};
+        return command;
+    }));
 }
 
 void SpiralServiceManager::resumeInputCommand()
 {
-    if (!_inputCommand || _inputCommandBusy || !_inputOwner || !isReady()) return;
+    if (!_inputCommand || _inputCommand->preparing || _inputCommandBusy || !_inputOwner || !isReady()) return;
     _inputCommandBusy = true;
     if (_inputCommand->applied) { persistInputCommand(); return; }
     transferInput(0);

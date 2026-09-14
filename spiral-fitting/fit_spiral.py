@@ -4094,6 +4094,10 @@ class FitContext:
                         old = source.pop(resident_id, None)
                         if old:
                             removed.append(_logical_identity(old.get('metadata', {})))
+                    elif adopt and kind == 'fiber' and resident_id not in source:
+                        # Preserve startup exclusions (including disabled or
+                        # malformed fibers) while retaining workspace identity.
+                        pass
                     else:
                         if adopt and resident_id in source:
                             pcl = source[resident_id]
@@ -4103,11 +4107,6 @@ class FitContext:
                                 min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
                                 base_shape_zyx=getattr(self, 'base_shape_zyx', None))
                             if pcl is None:
-                                if adopt:
-                                    candidate._workspace_membership[logical_id] = {
-                                        'kind': kind, 'revision': record.get('revision'),
-                                        'resident_id': resident_id, 'deleted': deleted}
-                                    continue
                                 raise ValueError(f'Fiber {logical_id} has no usable control points')
                             pcl['sampling_group'] = 'fibers'
                             pcl['file_basename'] = f'{source_id}.json'

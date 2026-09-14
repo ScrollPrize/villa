@@ -22,6 +22,8 @@ struct FiberDedupeEntry {
     // derived from the fiber's own metadata (as opposed to e.g. a service
     // copy named after a runtime id).
     bool canonicalName = false;
+    // Editable snapshots must retain their own source identity.
+    bool workingCopy = false;
 };
 
 struct FiberDedupeResult {
@@ -68,6 +70,7 @@ inline FiberDedupeResult dedupeFiberSources(
     std::unordered_map<std::string, std::size_t> firstByFileName;
     std::unordered_map<std::string, std::size_t> firstByContent;
     for (std::size_t i = 0; i < n; ++i) {
+        if (entries[i].workingCopy) continue;
         if (!entries[i].fileName.empty()) {
             auto [it, inserted] = firstByFileName.emplace(entries[i].fileName, i);
             if (!inserted) unite(it->second, i);

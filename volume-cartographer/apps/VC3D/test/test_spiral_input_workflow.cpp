@@ -6,6 +6,9 @@
 #include <QDirIterator>
 #include <QTemporaryDir>
 #include <QProcess>
+#include <QSemaphore>
+#include <QScopeGuard>
+#include <QtConcurrent/QtConcurrent>
 #include "SpiralServiceManager.hpp"
 #include "SpiralActivityWidget.hpp"
 
@@ -377,11 +380,29 @@ private slots:
                     if (error.contains(QStringLiteral("unreachable")) || error.contains(QStringLiteral("recovery")))
                         QTimer::singleShot(0, &client, [&client]() { client.applyInputDrafts(); });
                 });
+            // Hold the pool so preparation cannot start. Apply must return
+            // without sending anything, and another edit must remain separate.
+            auto* pool = QThreadPool::globalInstance();
+            const int previousThreads = pool->maxThreadCount();
+            pool->waitForDone();
+            pool->setMaxThreadCount(1);
+            QSemaphore started, release;
+            auto blocker = QtConcurrent::run([&]() { started.release(); release.acquire(); });
+            const auto restorePool = qScopeGuard([&]() {
+                release.release();
+                blocker.waitForFinished();
+                pool->setMaxThreadCount(previousThreads);
+            });
+            QVERIFY(started.tryAcquire(1, 10000));
             client.applyInputDrafts(true);
-            QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(root.filePath(QStringLiteral("applying"))), 10000);
-            // A save during the worker boundary creates a newer local revision.
+            QTest::qWait(100);
+            QVERIFY(!QFile::exists(root.filePath(QStringLiteral("applying"))));
             write(source, second);
             client.stageJsonInput(QStringLiteral("fiber"), source, QStringLiteral("fiber"));
+            // Repeated Apply while preparing must not start an early transfer.
+            client.applyInputDrafts();
+            release.release();
+            QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(root.filePath(QStringLiteral("applying"))), 10000);
             QFile::remove(root.filePath(QStringLiteral("hold-apply")));
             QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 1, 10000);
             QVERIFY2(completed.last()[0].toString().isEmpty(), qPrintable(completed.last()[0].toString()));

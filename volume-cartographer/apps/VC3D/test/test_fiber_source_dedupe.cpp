@@ -97,6 +97,23 @@ private slots:
         QCOMPARE(result.linkAliases.size(), std::size_t{2});
     }
 
+    void WorkingCopiesRetainIndependentSourceIdentities()
+    {
+        auto working = entry("/working", "fiber.json", "A", true);
+        working.workingCopy = true;
+        auto renamed = entry("/working2", "renamed.json", "A", false);
+        renamed.workingCopy = true;
+        const auto result = vc3d::dedupeFiberSources(
+            {entry("/vpkg/fibers", "fiber.json", "A", true), working, renamed,
+             entry("/spiral/fibers", "fiber.json", "A", true)},
+            {"/vpkg/fibers", "/spiral/fibers", "/working", "/working2"});
+        QCOMPARE(result.kept, (std::vector<std::size_t>{0, 1, 2}));
+        QCOMPARE(result.linkAliases.size(), std::size_t{1});
+        QVERIFY(!result.linkAliases.contains(vc3d::fiberSourceFileKey("/working", "fiber.json")));
+        vc3d::FiberRuntimeIds ids;
+        QVERIFY(ids.forFile("/vpkg/fibers", "fiber.json") != ids.forFile("/working", "fiber.json"));
+    }
+
     void EmptyContentKeyNeverMergesByContent()
     {
         const auto result = vc3d::dedupeFiberSources(

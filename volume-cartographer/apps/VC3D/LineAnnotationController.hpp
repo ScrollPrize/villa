@@ -1,5 +1,7 @@
 #pragma once
 
+#include <set>
+
 #include "FiberRuntimeIds.hpp"
 
 #include <QObject>
@@ -366,8 +368,9 @@ public:
     // a new project invalidates its data outright, while a new umbilicus only
     // moves where that data lands.
     [[nodiscard]] uint64_t packageGeneration() const { return _packageGeneration; }
-    // Runtime id of the loaded fiber with this file name, or 0 when the package
-    // no longer holds it. The stable way to act on a fiber recorded earlier.
+    // Resolve an exact source file, including an independently editable copy.
+    [[nodiscard]] uint64_t fiberIdForFilePath(const std::filesystem::path& path) const;
+    // First loaded filename match; use the full path when sources may overlap.
     [[nodiscard]] uint64_t fiberIdForFileName(const std::string& fileName) const;
     // Display name as shown in the fiber panel (file stem, "unnamed" fallback).
     [[nodiscard]] QString fiberDisplayName(uint64_t fiberId) const;
@@ -427,7 +430,7 @@ public:
     [[nodiscard]] std::filesystem::path fiberFilePath(uint64_t fiberId) const;
 
     bool registerExternalFiberSource(const std::filesystem::path& source,
-                                     QString* errorMessage = nullptr);
+                                     QString* errorMessage = nullptr, bool workingCopy = false);
     void unregisterExternalFiberSource(const std::filesystem::path& source);
     bool flushFiberSavesForDestinationChange(QString* errorMessage = nullptr);
     bool redirectFiberSource(const std::filesystem::path& source,
@@ -1131,6 +1134,7 @@ private:
     std::vector<StoredFiber> _fibers;
     mutable vc3d::FiberRuntimeIds _fiberRuntimeIds;
     std::vector<std::filesystem::path> _externalFiberSources;
+    std::set<std::filesystem::path> _workingCopyFiberSources;
     std::map<std::filesystem::path, std::filesystem::path> _fiberSourceRedirects;
     // dropped (sourceRoot/fileName) -> surviving key, rebuilt on every load.
     std::unordered_map<std::string, std::string> _loadedFiberLinkAliases;

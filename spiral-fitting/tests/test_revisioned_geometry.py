@@ -216,3 +216,21 @@ def test_fiber_spacing_reuses_revision_identity(context, tmp_path):
     assert context._workspace_membership['fiber-id']['resident_id'] == before
     assert context._workspace_membership['fiber-id']['revision'] == 2
     assert list(context.fiber_catalog) == ['fiber-id']
+
+
+@pytest.mark.parametrize('enabled', [True, False])
+def test_baseline_fiber_adoption_preserves_startup_exclusions(context, monkeypatch, enabled):
+    import fit_spiral
+    context.apply_config({'input_use_fibers': enabled}, current_iteration=0)
+    monkeypatch.setattr(fit_spiral, 'load_fiber_point_collection',
+                        lambda *args, **kwargs: pytest.fail('excluded fiber was reloaded'))
+    record = {'id': 'excluded-fiber', 'kind': 'fiber', 'source_id': 'malformed',
+              'path': '/immutable/malformed.json', 'revision': 1, 'adopt': True}
+    before = set(context._source_point_collections)
+    for _ in range(2):
+        context.install_input_changes(context.prepare_input_changes([record]))
+        assert set(context._source_point_collections) == before
+        assert not context.fiber_catalog
+        assert context._workspace_membership['excluded-fiber'] == {
+            'kind': 'fiber', 'revision': 1, 'resident_id': 6, 'deleted': False}
+    assert context.next_id == 7
