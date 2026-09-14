@@ -1829,16 +1829,28 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         if (!link.suspect) {
             // A winding-suspect link keeps its own red treatment below;
             // everything else takes the annotation's branch-link colours.
+            // A link joins two control points on two fibers, so it is drawn
+            // as a dot on each, joined by a dotted line: zoomed out the two
+            // dots overlap into one and the line is sub-pixel, zoomed in
+            // they part and each dot stays on its own fiber - a single dot
+            // at the midpoint sat on neither.
             const LinkPalette& palette =
                 linkPalette(hvTagOf(link.fiberA), hvTagOf(link.fiberB), link.pending);
-            auto* dot = new ScaledDot(QBrush(palette.brush),
-                                      cosmeticPen(palette.pen, 1.0),
-                                      crossingDotRadius,
-                                      kMinCrossingDotPx, kMaxCrossingDotPx,
-                                      crossingDotBounds);
-            _scene->addItem(dot);
-            dot->setPos(middle);
-            dot->setZValue(4.0);
+            QPen connectorPen = cosmeticPen(palette.pen, 1.0);
+            connectorPen.setStyle(Qt::DotLine);
+            auto* connector = _scene->addLine(QLineF(a, b));
+            connector->setPen(connectorPen);
+            connector->setZValue(3.9);
+            for (const QPointF& endpoint : {a, b}) {
+                auto* dot = new ScaledDot(QBrush(palette.brush),
+                                          cosmeticPen(palette.pen, 1.0),
+                                          crossingDotRadius,
+                                          kMinCrossingDotPx, kMaxCrossingDotPx,
+                                          crossingDotBounds);
+                _scene->addItem(dot);
+                dot->setPos(endpoint);
+                dot->setZValue(4.0);
+            }
             continue;
         }
         QPen suspectPen(kSuspect);
