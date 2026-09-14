@@ -2,6 +2,12 @@
 
 ## Opt-in embedding reference modes
 
+- LRU `normalized-mean` scores cosine to the equal-anchor sum normalized to
+  unit length; exact cancellation costs1. Cache only changes with bank contents.
+  Ordinary mean/best arithmetic stays unchanged. Existing profile reports
+  candidate-weighted coherence=sum-vector norm/K with decile bins plus1 bucket;
+  no mutation from parallel scoring and no GT information in reference updates.
+
 - LRU anchor touch policy defaults to `nearest` (refresh nearest even for novel
   observations). Opt-in `hit` refreshes only exact or within-novelty-threshold
   matches; novel observations evict actual LRU without touching old anchors.

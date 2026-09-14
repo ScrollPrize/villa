@@ -9,6 +9,15 @@ retains the existing prediction products and makes no embedding reads.
 
 ## Scoring and storage
 
+Experimental LRU aggregation `normalized-mean` uses cosine distance to the
+normalized sum of anchors, rather than mean distance to individual anchors.
+Ordinary mean equals `1-r*cos(query,mean_direction)`, where r is the length of
+the mean vector; normalization removes this disagreement-based shrinkage.
+Exact cancellation costs1. The cached sum is refreshed only on bank changes.
+Trace profiling records candidate-weighted r deciles (last bucket1, numerical
+overshoot clipped for binning). This may amplify near-cancelling directions;
+native validation and quality evaluation are pending, no default change.
+
 Experimental LRU `--embedding-anchor-touch hit` only refreshes an old anchor
 when an observation exactly matches or has cosine distance below the novelty
 threshold. Novel observations evict actual LRU without first touching their

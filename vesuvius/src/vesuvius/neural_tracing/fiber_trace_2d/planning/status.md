@@ -9,5 +9,8 @@
 - [ ] Cross-seed and admission-boundary refinements
 - [ ] Repeat winners, examine further supported method improvements
 - [x] Build/test seed-only, delayed EMA and hit-only LRU variants (2native suites,117Python tests)
-- [ ] Evaluate/refine new variants (seed/delay/hit comparison running)
+- [x] Evaluate/refine seed/delay/hit variants (91 replays, all exact repeats pass; best remains64)
+- [x] Build/test normalized-mean and coherence diagnostics (native2/Python118 pass)
+- [ ] Recheck optimized-path controls and coherence counts
+- [ ] Compare normalized mean against64/68/66 controls, refine if useful
 - [ ] Document full results

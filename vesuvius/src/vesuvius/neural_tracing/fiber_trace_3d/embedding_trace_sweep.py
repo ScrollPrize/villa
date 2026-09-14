@@ -147,8 +147,10 @@ def configured_variants(settings):
         mix = candidate.get('ema_mix', .5)
         if not isinstance(mix, (int, float)) or not math.isfinite(mix) or not 0 <= mix <= 1:
             raise ValueError('invalid anchor EMA mix')
-        if candidate.get('aggregation','best') not in ('best','mean','support-softmin'):
+        if candidate.get('aggregation','best') not in ('best','mean','normalized-mean','support-softmin'):
             raise ValueError('invalid anchor aggregation')
+        if candidate.get('aggregation') == 'normalized-mean' and mode != 'anchors-lru':
+            raise ValueError('normalized-mean requires anchors-lru')
         if mode == 'anchors' and candidate.get('aggregation','best') != 'best':
             raise ValueError('representative anchors require best aggregation')
         if (mode == 'appearance' and candidate.get('aggregation') == 'mean') or (mode != 'appearance' and candidate.get('aggregation') == 'support-softmin'):

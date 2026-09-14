@@ -7,6 +7,15 @@
 5. Sweep K2/4/8, short bank32 samples spacing128/window4096 and long bank64 spacing256/window16384; anchor-only and half EMA mixture. Same .25 weight, manager nonexclusive20GiB/16CPU and cached inference extension. Repeat best exactly. Compare against69, full tables/timings. Refine useful anchor mixture/weight if promising; otherwise inspect promising EMA half-life neighbors256/384/640/768/1024 as an additional approach. Continue sensible measured refinements until improvement stabilized or no supported next acceleration/quality idea remains.
 
 ## Spec update
+Reviewed aggregation hypothesis: opt-in normalized-mean LRU. Ordinary mean
+cost is `1-r*cos(query,mean_direction)`, r=norm(sum anchors)/K; disagreement
+shrinks influence toward1. Normalized mean removes that shrinkage, without
+changing admission/eviction. Cache derived unit sum only when bank changes,
+reuse shared norm/cosine math, exact-zero sum costs1. Preserve default arithmetic.
+Measure coherence r (including small-r frequency) before claiming this helps;
+near-cancellation can amplify unstable directions. Start at existing64/68
+settings, refine if useful. This differs from EMA and whole-path centroids.
+
 Reviewed next replacement-policy A/B: opt-in LRU `hit` touch policy. Existing
 `nearest` policy refreshes even an anchor outside the novelty threshold, then
 evicts another anchor. `hit` refreshes only exact/familiar observations; a novel
@@ -95,6 +104,14 @@ Opt-in anchors mode, deterministic greedy coverage selection, bounded bank, EMA 
 New multi-anchor report, embedding_tracing options, task log/status/changelog including failures and limits.
 
 ## Validation
+Prepared normalized aggregation A/B in `embedding_normalized_mean_next.json`:
+EMA69 control, ordinary vs normalized mean at confirmed64 and68 settings, plus
+hit-only66 settings. Require old hashes and nonzero candidate-parent coherence
+counts on optimized production path; sum histogram equals count. Summarize r
+and fraction below.1 (unstable-direction risk), with exact-repeat winner. Build
+only after active sweep ends. This short comparison precedes the prepared wider
+anchor boundary sweep; then refine normalized aggregation if useful.
+
 Prepared boundary/multi-start sweep in `embedding_anchor_boundaries_next.json`:
 all anchor policies start from their own completed-round winner and, where
 different, K2/weight.10 transferred seed. Extend spacing through2048 for

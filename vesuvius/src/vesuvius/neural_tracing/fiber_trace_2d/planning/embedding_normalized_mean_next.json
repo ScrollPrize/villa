@@ -1,0 +1,98 @@
+{
+  "pilot": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_reference_20260913_v1",
+  "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_normalized_mean_20260914_v1",
+  "fill_missing": true,
+  "gpu_manager": {
+    "exclusive": false,
+    "priority": 0,
+    "cpu_cores": 16,
+    "vram_bytes_per_gpu": 21474836480,
+    "label": "embedding-method-comparison"
+  },
+  "native_binary": "/home/hendrik/villa/volume-cartographer/build/dev-quickbuild-gcc/bin/vc_fiber_trace_metric",
+  "candidates": [
+    {
+      "mode": "ema",
+      "weight": 0.25,
+      "half_life": 512,
+      "spacing": 128,
+      "window": 1024,
+      "count": 8,
+      "falloff": "gaussian"
+    },
+    {
+      "mode": "anchors-lru",
+      "spacing": 512,
+      "window": 1024,
+      "count": 8,
+      "falloff": "uniform",
+      "ema_mix": 0,
+      "anchors": 2,
+      "weight": 0.1,
+      "novelty": 0.1,
+      "aggregation": "mean"
+    },
+    {
+      "mode": "anchors-lru",
+      "spacing": 512,
+      "window": 1024,
+      "count": 8,
+      "falloff": "uniform",
+      "ema_mix": 0,
+      "anchors": 2,
+      "weight": 0.1,
+      "novelty": 0.1,
+      "aggregation": "normalized-mean"
+    },
+    {
+      "mode": "anchors-lru",
+      "spacing": 512,
+      "window": 1024,
+      "count": 8,
+      "falloff": "uniform",
+      "ema_mix": 0,
+      "anchors": 4,
+      "weight": 0.3,
+      "novelty": 0,
+      "aggregation": "mean"
+    },
+    {
+      "mode": "anchors-lru",
+      "spacing": 512,
+      "window": 1024,
+      "count": 8,
+      "falloff": "uniform",
+      "ema_mix": 0,
+      "anchors": 4,
+      "weight": 0.3,
+      "novelty": 0,
+      "aggregation": "normalized-mean"
+    },
+    {
+      "mode": "anchors-lru",
+      "spacing": 512,
+      "window": 1024,
+      "count": 8,
+      "falloff": "uniform",
+      "ema_mix": 0,
+      "anchors": 2,
+      "weight": 0.1,
+      "novelty": 0.1,
+      "touch": "hit",
+      "aggregation": "mean"
+    },
+    {
+      "mode": "anchors-lru",
+      "spacing": 512,
+      "window": 1024,
+      "count": 8,
+      "falloff": "uniform",
+      "ema_mix": 0,
+      "anchors": 2,
+      "weight": 0.1,
+      "novelty": 0.1,
+      "touch": "hit",
+      "aggregation": "normalized-mean"
+    }
+  ]
+}

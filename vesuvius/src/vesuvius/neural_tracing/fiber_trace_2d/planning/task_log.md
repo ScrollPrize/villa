@@ -8,6 +8,22 @@
 - User added next LRU anchor experiment; scheduled after refinement instead of stopping. Capacity4/8, admission128/512, nearest/average/EMA blend. Finer EMA results256/384/640/768/1024=74/72/87/84/73; no improvement yet. ShortK2 mixes.75/.9=91/76.
 # Latest continuation
 
+- Normalized-mean native implementation committed c60fe9bcf after native2 pass1.66s/Python118 pass32.63s (`cooperative-tests/20260914_071900_187504`). Started approved manager-aware A/B handle4047 at `embedding_ema99_normalized_mean_20260914_v1`; checks old64/68/66 controls plus normalized variants and coherence profiles. No training restart.
+
+- New-method refinement66263 exited0:91 replays, five family winners72/66/68/69/71 and overall64 all exact-hash repeats. Restored full native-build/native-tests/Python suites and started approved regression launcher for normalized-mean; no rebuild overlapped the sweep.
+
+- Revalidated live handle66263 after snapshot-location reply: four families finished (seed72, hit-mean66, hit-best68, delayed start.25→ordinary EMA69). Lower-weight delayed family still running, best71 at delay512/half1024/.10; final repeats pending. No native rebuild or concurrent cache writer while this sweep is active.
+
+- Hit-only nearest local refinement completed68 (K2/.25/spacing768/novelty.10); three new-method families complete. Two delayedEMA starting seeds plus final repeats remain live66263; no earlier termination or manager bypass.
+
+- Hit-only nearest refinement improved74→68 at K2/weight.25/spacing768/novelty.10; still refining. Checked parallel sweep feasibility:DemandStore takes nonblocking exclusive writer.lock, so concurrent extensions of this same frozen cache are not safe/useful; retain sequential sweeps, no duplicate GPU reservation.
+
+- New-method refinement:seed-only settled72 at weight.30; hit-only meanLRU settled66 at originalK2/.10/spacing512/novelty.10 (unused window4096 equivalent). Remaining hit-nearest/delayed families still live66263. Normalized-mean A/B config prepared with old64/68/hit66 controls; not yet run.
+
+- Independent normalized-mean review found profile counters after fused scoring's early return; moved accounting before scoring branch, serial/common to both paths. Renamed JSON count to candidate-parent states (includes candidates later rejected). Added constant-input profile assertions; require nonzero counters on real optimized eval after rebuild. Python118pass30.93s before this native-only follow-up (`20260914_063307_062873`).
+
+- Implemented reviewed normalized-mean LRU aggregation (unbuilt while66263 runs):cached unit sum on bank changes, exact cancellation cost1; shared norm helper reused. Added candidate-weighted coherence histogram in existing trace profile (bins[0,.1),...,[.9,1),1) for both ordinary/normalized LRU, collected outside parallel scoring. Existing cost arithmetic unchanged; new math/cancellation tests and Python option coverage added. Must build/test and recheck existing64 hash after current sweep before evaluating it.
+
 - Mechanism grid finished exit0,15replays,64 winner exact. Seed weights.10/.25/.50=80/76/82; delays32/64/128/256=86/78/80/78 vs EMA69; hit mean66/nearest74 vs existing64. All rebuilt controls and delay0 exact. New-method refinement started session66263 via approved launcher:seed,hitmean,hitnearest,delayedEMA two weight seeds. Tests retain nonexclusive manager allocation after user-requested training stop. Prepared anchor boundary sweep remains next.
 
 - User requested stopping overfitting paired embedding training. Approved production-status identified the expected174110 launch; production-stop exited0 and verified root dead, manager task6f8a7826 finished with zero CPU/GPU allocation (generation67). Latest logged test update32000/4,096,000patches; do not infer final snapshot step from that log. Experiments continue under nonexclusive manager grants, frozen6500 EMA99 unchanged.

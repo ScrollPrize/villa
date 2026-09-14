@@ -32,6 +32,26 @@ check weight/delay interaction; then anchor boundary/multi-start tests follow.
 
 ## Completed independent refinements
 
+The subsequent five-family search in
+`embedding_ema99_new_method_refine_20260914_v1/report.json` has finished its
+coordinate searches and all exact repeats (91 replays, exit0). Every family
+winner and the overall64 winner reproduced its full replay hash. Results:
+
+| Family | Best settings | Restarts |
+|---|---|---:|
+| Seed-only | weight .30 |72|
+| Hit-only mean-LRU | K2, spacing512, weight.10, novelty.10 |66|
+| Hit-only nearest-LRU | K2, spacing768, weight.25, novelty.10 |68|
+| Delayed EMA, start weight.25 | delay0, half512, weight.25 |69|
+| Delayed EMA, start weight.10 | delay512, half1024, weight.10 |71|
+
+Both LRU winners use no EMA mixture. These finite searches do not improve the
+confirmed64-restart nearest-touch novelty mean-LRU. Delayed EMA's lower-weight
+start finds a different local result but not a better result than ordinary EMA.
+Across91 replays, wall seconds mean35.47, min/median/p95/max
+3.31/35.43/40.07/40.94 (nearest-rank p95). Includes the inexpensive embedding-off
+control, setup and variable trajectories; not isolated algorithm overhead.
+
 All13 families completed,270 replays total, process exit0. Every family winner
 and the overall winner reproduced its exact replay hash. Overall64 =29+35
 directional restarts. Finite coordinate searches, not proof of global optima.

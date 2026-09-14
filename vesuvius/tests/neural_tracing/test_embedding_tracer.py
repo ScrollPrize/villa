@@ -149,7 +149,7 @@ def test_sweep_fill_requires_managed_launch(tmp_path, monkeypatch):
     assert calls[0][1]["settings"] == manager
 
 
-@pytest.mark.parametrize('mode,aggregation',[('anchors-lru','mean'),('appearance','best'),('appearance','support-softmin')])
+@pytest.mark.parametrize('mode,aggregation',[('anchors-lru','mean'),('anchors-lru','normalized-mean'),('appearance','best'),('appearance','support-softmin')])
 def test_configurable_embedding_search(mode,aggregation):
     from vesuvius.neural_tracing.fiber_trace_3d.embedding_trace_sweep import configured_variants, search_weight
     history = dict(spacing=128, window=4096, count=64, falloff='linear', mode=mode, half_life=512, anchors=4, ema_mix=.5, aggregation=aggregation,novelty=.1,temperature=.2)
