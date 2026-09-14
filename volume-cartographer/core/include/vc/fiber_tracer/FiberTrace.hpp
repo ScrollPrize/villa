@@ -500,6 +500,8 @@ struct FiberReplayTraceRequest {
     std::optional<double> referenceBeginArcBase;
     double traceToBaseScale = 1.0;
     double errorThresholdBaseVoxels = 20.0;
+    double excursionGraceBaseVoxels = 0.0;
+    double tangentialThresholdFactor = 4.0;
     double matchRefineSteps = 1.0;
     std::optional<double> referenceEndArcBase;
     FiberTraceConfig config;
@@ -509,6 +511,8 @@ struct LasagnaReplayTraceRequest {
     std::vector<cv::Vec3d> referencePointsBase;
     double stepBaseVoxels = 16.0;
     double errorThresholdBaseVoxels = 20.0;
+    double excursionGraceBaseVoxels = 0.0;
+    double tangentialThresholdFactor = 4.0;
     double matchRefineSteps = 1.0;
     double maxStepFactor = 3.0;
 };
@@ -538,6 +542,7 @@ struct FiberReplayTraceSegment {
 };
 
 struct FiberReplayTraceResult {
+    double tangentialThresholdFactor = 4.0;
     double referenceBeginArcBase = 0.0;
     double referenceEndArcBase = 0.0;
     double completedReferenceArcBase = 0.0;

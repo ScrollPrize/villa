@@ -298,7 +298,8 @@ OmeZarrGroupTransform omeZarrGroupTransform(
 
 cv::Mat_<cv::Vec3f> nativeGroupTextureCoordinates(
     const cv::Mat_<cv::Vec3f>& basePoints,
-    const FiberReplayStripTextureSource& source)
+    const FiberReplayStripTextureSource& source, double baseSamplesPerPixel = 0,
+    int longitudinalColumns = 0)
 {
     cv::Mat_<cv::Vec3f> groupPoints = basePoints.clone();
     for (auto& point : groupPoints) {
@@ -314,19 +315,32 @@ cv::Mat_<cv::Vec3f> nativeGroupTextureCoordinates(
         const cv::Vec3f delta = right - left;
         return std::sqrt(static_cast<double>(delta.dot(delta)));
     };
+    const auto& metricPoints = baseSamplesPerPixel > 0 ? basePoints : groupPoints;
+    const double spacing = baseSamplesPerPixel > 0 ? baseSamplesPerPixel : 1;
     double maximumRowArc = 0.0;
     for (int column = 0; column < groupPoints.cols; ++column) {
         double arc = 0.0;
         for (int row = 1; row < groupPoints.rows; ++row)
-            arc += distance(groupPoints(row - 1, column), groupPoints(row, column));
+            arc += distance(metricPoints(row - 1, column), metricPoints(row, column)) / spacing;
         maximumRowArc = std::max(maximumRowArc, arc);
     }
     double maximumColumnArc = 0.0;
     for (int row = 0; row < groupPoints.rows; ++row) {
         double arc = 0.0;
         for (int column = 1; column < groupPoints.cols; ++column)
-            arc += distance(groupPoints(row, column - 1), groupPoints(row, column));
+            arc += distance(metricPoints(row, column - 1), metricPoints(row, column)) / spacing;
         maximumColumnArc = std::max(maximumColumnArc, arc);
+    }
+    if (baseSamplesPerPixel > 0) {
+        // Inspection's horizontal axis follows the fiber, not an offset ribbon
+        // edge (whose length changes with curvature and viewing plane).
+        const int lo = (basePoints.rows - 1) / 2;
+        const int hi = basePoints.rows / 2;
+        maximumColumnArc = 0;
+        for (int column = 1; column < basePoints.cols; ++column)
+            maximumColumnArc += distance(
+                (basePoints(lo, column - 1) + basePoints(hi, column - 1)) * 0.5F,
+                (basePoints(lo, column) + basePoints(hi, column)) * 0.5F) / spacing;
     }
     const auto sampleCount = [](double arc) {
         if (!std::isfinite(arc) || arc < 0.0 ||
@@ -337,7 +351,8 @@ cv::Mat_<cv::Vec3f> nativeGroupTextureCoordinates(
         return std::max(2, static_cast<int>(std::ceil(arc)) + 1);
     };
     const cv::Size nativeSize(
-        sampleCount(maximumColumnArc), sampleCount(maximumRowArc));
+        longitudinalColumns > 0 ? longitudinalColumns : sampleCount(maximumColumnArc),
+        sampleCount(maximumRowArc));
     if (nativeSize.width == groupPoints.cols &&
         nativeSize.height == groupPoints.rows) {
         return groupPoints;
@@ -727,7 +742,8 @@ std::vector<std::array<int, 2>> mappedFailureMarkerBands(
     const std::vector<Failure>& failures,
     const vc::lasagna::LineStripPositionMap& positionMap,
     const MatchedTraceSegment& fiberletFrame, int sourceColumns,
-    int renderedColumns, std::optional<size_t> requiredSegmentIndex)
+    int renderedColumns, std::optional<size_t> requiredSegmentIndex,
+    bool ownTraceEndpoint = false)
 {
     std::vector<std::array<int, 2>> bands;
     for (const auto& failure : failures) {
@@ -735,8 +751,9 @@ std::vector<std::array<int, 2>> mappedFailureMarkerBands(
             failure.segmentIndex != *requiredSegmentIndex) {
             continue;
         }
-        const auto sourceColumn = segmentSourceColumnForReferenceArc(
-            fiberletFrame, failure.referenceArcBase);
+        const auto sourceColumn = ownTraceEndpoint
+            ? std::optional<double>(double(fiberletFrame.size() - 1))
+            : segmentSourceColumnForReferenceArc(fiberletFrame, failure.referenceArcBase);
         if (!sourceColumn.has_value())
             continue;
         const int pixelColumn = static_cast<int>(std::lround(
@@ -1474,7 +1491,7 @@ nlohmann::json greedyReplayJson(
         {"reference_end_arc_base", replay.referenceEndArcBase},
         {"completed_reference_arc_base", replay.completedReferenceArcBase},
         {"threshold", fiberReplayThresholdDescriptorJson(
-             normalThresholdBaseVoxels)},
+             normalThresholdBaseVoxels, replay.tangentialThresholdFactor)},
         {"segments", nlohmann::json::array()},
         {"failures", nlohmann::json::array()},
     };
@@ -2190,8 +2207,10 @@ FiberReplayOverview renderReplayOverviewCommon(
     const std::vector<Failure>& fiberletFailures,
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale, int parallelThreads,
-    ::Volume& volume, const std::string& sourceLocator,
-    bool nativeTraceOnly = false)
+    const FiberReplayStripTextureSource& source,
+    const FiberReplayTextureRenderer& renderTexture,
+    bool nativeTraceOnly = false, int renderScale = kOverviewRenderScale,
+    bool labelRestarts = false, double baseSamplesPerPixel = 0)
 {
     const auto selectedReference = makePolylineArcGeometry(referenceGeometryBase);
     std::vector<LineViewComponentRequest> requests{
@@ -2210,21 +2229,24 @@ FiberReplayOverview renderReplayOverviewCommon(
         parallelThreads);
     if (views.empty())
         throw std::runtime_error("replay overview has no reference surfaces");
-    const auto source = validateFiberReplayStripCtVolume(volume, sourceLocator);
-    const auto renderSurface = [&](const QuadSurface& surface) {
+    validateTextureSource(source);
+    const auto renderSurface = [&](const QuadSurface& surface, int longitudinalColumns = 0) {
         const auto* basePoints = surface.rawPointsPtr();
         if (!basePoints || basePoints->empty()) {
             throw std::invalid_argument("replay overview strip surface has no coordinates");
         }
-        const auto groupPoints = nativeGroupTextureCoordinates(*basePoints, source);
-        cv::Mat_<uint8_t> grayscale =
-            vc::core::util::renderCoordsTextureFineToCoarse(groupPoints, volume, 0, kOverviewRenderScale, "Replay overview texture sampling");
+        const auto groupPoints = nativeGroupTextureCoordinates(*basePoints, source, baseSamplesPerPixel, longitudinalColumns);
+        cv::Mat_<uint8_t> grayscale = renderTexture(groupPoints, renderScale);
+        if (grayscale.rows != groupPoints.rows * renderScale ||
+            grayscale.cols != groupPoints.cols * renderScale)
+            throw std::runtime_error("overview texture callback returned wrong raster dimensions");
         cv::Mat_<cv::Vec3b> color;
         cv::cvtColor(grayscale, color, cv::COLOR_GRAY2BGR);
         return color;
     };
     auto referenceTop = renderSurface(*views.front().surfaces.lineSurface);
-    auto referenceSide = renderSurface(*views.front().surfaces.lineSideSlice);
+    auto referenceSide = renderSurface(*views.front().surfaces.lineSideSlice,
+        baseSamplesPerPixel > 0 ? referenceTop.cols / renderScale : 0);
     const auto draw = [&](cv::Mat_<cv::Vec3b>& image, const QuadSurface& surface) {
         const auto* points = surface.rawPointsPtr();
         const auto& positionMap = views.front().surfaces.stripPositionMap;
@@ -2242,6 +2264,13 @@ FiberReplayOverview renderReplayOverviewCommon(
             fiberletFailures, selectedReference,
             referenceBeginArcBase, positionMap, points->cols, image.cols);
         drawFailureMarkers(image, greedyBands, fiberletBands);
+        if (labelRestarts) {
+            for (size_t i = 0; i < fiberletBands.size(); ++i) {
+                const auto label = "R" + std::to_string(fiberletFailures[i].index);
+                cv::putText(image, label, {fiberletBands[i][0], 14 + static_cast<int>(i % 3) * 16},
+                    cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+            }
+        }
         drawCenterline(image, kReferenceColorBgr);
     };
     draw(referenceTop, *views.front().surfaces.lineSurface);
@@ -2265,7 +2294,8 @@ FiberReplayOverview renderReplayOverviewCommon(
         if (match == fiberlet.end() || match->points.size() < 2)
             throw std::logic_error("fiberlet overview view has no match metadata");
         auto top = renderSurface(*view.surfaces.lineSurface);
-        auto side = renderSurface(*view.surfaces.lineSideSlice);
+        auto side = renderSurface(*view.surfaces.lineSideSlice,
+            baseSamplesPerPixel > 0 ? top.cols / renderScale : 0);
         const auto drawFiberletFrame = [&](cv::Mat_<cv::Vec3b>& image,
                                            const QuadSurface& surface) {
             const auto* points = surface.rawPointsPtr();
@@ -2278,7 +2308,7 @@ FiberReplayOverview renderReplayOverviewCommon(
                 image.cols, std::nullopt);
             const auto fiberletBands = mappedFailureMarkerBands(
                 fiberletFailures, positionMap, match->points, points->cols,
-                image.cols, view.sourceSegmentIndex);
+                image.cols, view.sourceSegmentIndex, nativeTraceOnly);
             drawFailureMarkers(image, greedyBands, fiberletBands);
             drawCenterline(image, kFiberletColorBgr);
         };
@@ -2336,15 +2366,54 @@ FiberReplayOverview renderReplayOverviewCommon(
             {topRow, topRow + component.top.rows},
             {sideRow, sideRow + component.side.rows},
         });
+        auto& placement = placements.back();
+        const auto view = std::find_if(views.begin(), views.end(), [&](const auto& v) {
+            return v.sourceSegmentIndex == component.sourceSegmentIndex;
+        });
+        const auto match = std::find_if(fiberlet.begin(), fiberlet.end(), [&](const auto& v) {
+            return v.sourceSegmentIndex == component.sourceSegmentIndex;
+        });
+        placement.positionMap = view->surfaces.stripPositionMap;
+        placement.topSourceColumns = view->surfaces.lineSurface->rawPointsPtr()->cols;
+        for (const auto& point : match->points) {
+            placement.pointsBase.push_back(point.pointBase);
+            placement.referenceArcsBase.push_back(point.referenceArcBase);
+        }
         topColumn += component.top.cols +
             kOverviewFiberletComponentGapColumns;
         sideColumn += component.side.cols +
             kOverviewFiberletComponentGapColumns;
     }
 
+    // Label the assembled raster: individual components can be narrower than
+    // the text. Use segment identity, not reference-arc matching across breaks.
+    if (labelRestarts) {
+        for (const auto& failure : fiberletFailures) {
+            for (int next = 0; next < 2; ++next) {
+                const auto placement = std::find_if(placements.begin(), placements.end(),
+                    [&](const auto& p) { return p.sourceSegmentIndex == failure.segmentIndex + next; });
+                if (placement == placements.end()) continue; // No strip for a singleton.
+                const auto label = "R" + std::to_string(failure.index) + (next ? "+" : "-");
+                int baseline = 0;
+                const auto size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.4, 1, &baseline);
+                for (int side = 0; side < 2; ++side) {
+                    auto& image = side ? fiberletSide : fiberletTop;
+                    const auto columns = side ? placement->sideColumns : placement->topColumns;
+                    const int anchor = next ? columns[0] : columns[1] - 1;
+                    const int x = std::clamp(next ? anchor : anchor - size.width,
+                                             0, std::max(0, image.cols - size.width));
+                    const int y = std::min(image.rows - baseline - 1,
+                        14 + static_cast<int>((2 * failure.index + next) % 3) * 16);
+                    cv::putText(image, label, {x, y}, cv::FONT_HERSHEY_SIMPLEX,
+                        0.4, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+                }
+            }
+        }
+    }
     auto overview = composeOverview(
         referenceTop, referenceSide, fiberletTop, fiberletSide,
-        kJpegMaximumDimension, nativeTraceOnly);
+        renderScale == kOverviewRenderScale ? kJpegMaximumDimension : 12000, nativeTraceOnly);
+    overview.renderScale = renderScale;
     overview.textureSource = source;
     overview.fiberletComponents = std::move(placements);
     return overview;
@@ -2374,7 +2443,12 @@ FiberReplayOverview renderFiberReplayOverview(
     return renderReplayOverviewCommon(referenceGeometryBase, greedyReplay.referenceBeginArcBase,
         matchedGreedySegments(greedyReplay, reference), matchedFiberletSegments(fiberletReplay, reference),
         greedyReplay.failures, fiberletReplay.failures, normalSampler,
-        normalWorkingToBaseScale, parallelThreads, volume, sourceLocator);
+        normalWorkingToBaseScale, parallelThreads,
+        validateFiberReplayStripCtVolume(volume, sourceLocator),
+        [&](const auto& coords, int scale) -> cv::Mat_<uint8_t> {
+            return vc::core::util::renderCoordsTextureFineToCoarse(
+                coords, volume, 0, scale, "Replay overview CT sampling");
+        });
 }
 
 FiberReplayOverview renderFiberReplayTraceOverview(
@@ -2384,7 +2458,24 @@ FiberReplayOverview renderFiberReplayTraceOverview(
     double normalWorkingToBaseScale, int parallelThreads,
     ::Volume& volume, const std::string& sourceLocator)
 {
-    if (referenceGeometryBase.size() < 2 || !(normalWorkingToBaseScale > 0.0) ||
+    return renderFiberReplayTraceOverview(referenceGeometryBase, replay, normalSampler,
+        normalWorkingToBaseScale, parallelThreads,
+        validateFiberReplayStripCtVolume(volume, sourceLocator),
+        [&](const auto& coords, int scale) -> cv::Mat_<uint8_t> {
+            return vc::core::util::renderCoordsTextureFineToCoarse(
+                coords, volume, 0, scale, "Replay overview CT sampling");
+        });
+}
+
+FiberReplayOverview renderFiberReplayTraceOverview(
+    const std::vector<cv::Vec3d>& referenceGeometryBase,
+    const FiberReplayTraceResult& replay,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale, int parallelThreads,
+    const FiberReplayStripTextureSource& source,
+    const FiberReplayTextureRenderer& renderTexture, int renderScale, bool labelRestarts, double baseSamplesPerPixel)
+{
+    if (renderScale < 1 || referenceGeometryBase.size() < 2 || !(normalWorkingToBaseScale > 0.0) ||
         !std::isfinite(normalWorkingToBaseScale) || parallelThreads < 1)
         throw std::invalid_argument("replay overview geometry or normal-sampling configuration is invalid");
     const auto reference = makePolylineArcGeometry(referenceGeometryBase);
@@ -2401,9 +2492,364 @@ FiberReplayOverview renderFiberReplayTraceOverview(
     // graph result and no duplicate greedy overlay.
     return renderReplayOverviewCommon(referenceGeometryBase, replay.referenceBeginArcBase,
         {}, indexed, {}, replay.failures, normalSampler,
-        normalWorkingToBaseScale, parallelThreads, volume, sourceLocator, true);
+        normalWorkingToBaseScale, parallelThreads, source, renderTexture, true, renderScale, labelRestarts, baseSamplesPerPixel);
 }
 
+cv::Mat_<uint8_t> renderFiberReplayPresenceTexture(
+    const cv::Mat_<cv::Vec3f>& sourceCoordinates, int renderScale,
+    const FiberReplayStripTextureSource& source, double workingToBaseScale,
+    const FiberPredictionSource& predictions)
+{
+    validateTextureSource(source);
+    if (sourceCoordinates.empty() || renderScale < 1 ||
+        !std::isfinite(workingToBaseScale) || workingToBaseScale <= 0)
+        throw std::invalid_argument("invalid presence texture coordinates/scale");
+    cv::Mat_<cv::Vec3f> coords;
+    cv::resize(sourceCoordinates, coords,
+        cv::Size(sourceCoordinates.cols * renderScale, sourceCoordinates.rows * renderScale),
+        0, 0, cv::INTER_LINEAR);
+    cv::Mat_<uint8_t> image(coords.rows, coords.cols, uint8_t(0));
+    // Bounded requests avoid materializing a full strip's interpolation data.
+    constexpr size_t batchSize = 4096;
+    for (size_t begin = 0; begin < coords.total(); begin += batchSize) {
+        const size_t count = std::min(batchSize, coords.total() - begin);
+        std::vector<cv::Vec3d> points(count), directions(count, cv::Vec3d{1, 0, 0});
+        for (size_t i = 0; i < count; ++i)
+            for (int axis = 0; axis < 3; ++axis)
+                points[i][axis] = (coords.ptr<cv::Vec3f>()[begin + i][axis] -
+                    source.offsetFromBaseXYZ[axis]) / source.scaleFromBaseXYZ[axis] / workingToBaseScale;
+        std::vector<FiberPredictionSample> samples;
+        predictions.sampleBatch(points, directions, 1, samples);
+        if (samples.size() != count) throw std::runtime_error("invalid presence sample count");
+        for (size_t i = 0; i < count; ++i) {
+            float presence = 0;
+            for (const auto& option : samples[i].options)
+                presence = std::max(presence, option.presence);
+            image.ptr<uint8_t>()[begin + i] = cv::saturate_cast<uint8_t>(255 * presence);
+        }
+    }
+    return image;
+}
+
+FiberReplaySectionFrame fiberReplaySectionFrame(
+    const cv::Vec3d& center, const cv::Vec3d& inputTangent,
+    const vc::lasagna::NormalSampler& normals, double workingToBaseScale, double thresholdBase,
+    double tangentialFactor)
+{
+    (void)fiberReplayThresholdDescriptorJson(thresholdBase, tangentialFactor);
+    if (!(cv::norm(inputTangent) > 0) || !std::isfinite(cv::norm(inputTangent)) || !(thresholdBase > 0))
+        throw std::invalid_argument("invalid transverse frame tangent or threshold");
+    const cv::Vec3d tangent = inputTangent / cv::norm(inputTangent);
+    const auto normal = normals.sampleNormal(center / workingToBaseScale);
+    cv::Vec3d horizontal = normal.normal - tangent * normal.normal.dot(tangent);
+    if (!normal.valid || !std::isfinite(cv::norm(horizontal)) || cv::norm(horizontal) < 1e-10) {
+        const cv::Vec3d seed = std::abs(tangent[0]) < 0.9 ? cv::Vec3d{1, 0, 0} : cv::Vec3d{0, 1, 0};
+        horizontal = seed - tangent * seed.dot(tangent);
+    }
+    horizontal /= cv::norm(horizontal);
+    cv::Vec3d vertical = tangent.cross(horizontal); vertical /= cv::norm(vertical);
+    double rx = 1.0 / measureFiberReplayThreshold(center + horizontal, center,
+        normals, workingToBaseScale, thresholdBase, tangentialFactor).thresholdErrorRatio;
+    double ry = 1.0 / measureFiberReplayThreshold(center + vertical, center,
+        normals, workingToBaseScale, thresholdBase, tangentialFactor).thresholdErrorRatio;
+    if (rx > ry) { std::swap(horizontal, vertical); std::swap(rx, ry); }
+    return {horizontal, vertical, tangent, rx, ry};
+}
+
+static cv::Vec3d inspectionTraceTangent(const std::vector<cv::Vec3d>& points,
+    size_t index, const cv::Vec3d& fallback)
+{
+    for (size_t radius = 0; radius < points.size(); ++radius) {
+        const size_t left = index > radius ? index - radius : 0;
+        const size_t right = std::min(points.size() - 1, index + radius + 1);
+        const auto tangent = points[right] - points[left];
+        if (cv::norm(tangent) > 1e-12) return tangent;
+    }
+    return fallback;
+}
+
+FiberReplayStripPoint sampleFiberReplayStripColumn(
+    const FiberReplayOverviewFiberletComponent& component, double assembledColumn)
+{
+    if (component.pointsBase.size() < 2 ||
+        component.referenceArcsBase.size() != component.pointsBase.size() ||
+        component.topSourceColumns < 2 || !component.positionMap.valid() ||
+        !std::isfinite(assembledColumn) || assembledColumn < component.topColumns[0] ||
+        assembledColumn > component.topColumns[1] - 1)
+        throw std::invalid_argument("invalid traced-strip sample");
+    const double grid = (assembledColumn - component.topColumns[0]) *
+        (component.topSourceColumns - 1) / std::max(1, component.topColumns[1] - component.topColumns[0] - 1);
+    const double position = std::clamp(component.positionMap.stripGridColumnToOriginalPosition(grid),
+                                       0.0, double(component.pointsBase.size() - 1));
+    const size_t i = std::min(size_t(position), component.pointsBase.size() - 2);
+    const double t = position - i;
+    return {component.pointsBase[i] * (1 - t) + component.pointsBase[i + 1] * t,
+            inspectionTraceTangent(component.pointsBase, i, {1, 0, 0}),
+            component.referenceArcsBase[i] * (1 - t) + component.referenceArcsBase[i + 1] * t, position};
+}
+
+FiberReplayInspection renderFiberReplayInspection(
+    const std::vector<cv::Vec3d>& referenceGeometryBase, const FiberReplayTraceResult& replay,
+    const vc::lasagna::NormalSampler& normals, double workingToBaseScale,
+    const FiberReplayStripTextureSource& source, const FiberReplayTextureRenderer& ct,
+    const FiberReplayTextureRenderer& presence, double thresholdBase, bool reverse, double voxelSizeUm,
+    const std::string& ctSamplingDescription)
+{
+    if (!(thresholdBase > 0) || !std::isfinite(thresholdBase) || !(voxelSizeUm > 0))
+        throw std::invalid_argument("inspection needs positive threshold and voxel size");
+    const double factor = replay.tangentialThresholdFactor;
+    const auto descriptor = fiberReplayThresholdDescriptorJson(thresholdBase, factor);
+    constexpr int scale = 1;
+    constexpr double baseSpacing = 2;
+    auto scan = renderFiberReplayTraceOverview(referenceGeometryBase, replay, normals,
+        workingToBaseScale, 1, source, ct, scale, true, baseSpacing);
+    auto prediction = renderFiberReplayTraceOverview(referenceGeometryBase, replay, normals,
+        workingToBaseScale, 1, source, presence, scale, true, baseSpacing);
+    if (scan.pages.size() != prediction.pages.size())
+        throw std::runtime_error("unaligned inspection modalities");
+    FiberReplayInspection result;
+    result.metadata = {{"format", "vc_fiber_inspection"}, {"version", 3},
+        {"render_scale", scale}, {"base_samples_per_pixel", baseSpacing},
+        {"ct_sampling", ctSamplingDescription},
+        {"cross_section_center", "actual traced line; ellipse is trace-centered display tolerance, not GT rejection center"},
+        {"modalities", {"ct", "presence"}}, {"reverse", reverse},
+        {"threshold", descriptor},
+        {"rows", nlohmann::json::array()}, {"restarts", nlohmann::json::array()},
+        {"cross_sections", nlohmann::json::array()}, {"components", nlohmann::json::array()}};
+    for (const auto& component : scan.fiberletComponents)
+        result.metadata["components"].push_back({{"segment", component.sourceSegmentIndex},
+            {"reference_arc_begin_base", component.referenceArcBeginBase},
+            {"reference_arc_end_base", component.referenceArcEndBase},
+            {"top_columns", component.topColumns}, {"side_columns", component.sideColumns},
+            {"top_rows", component.topRows}, {"side_rows", component.sideRows}});
+    const auto geometry = makePolylineArcGeometry(referenceGeometryBase);
+    const auto arcMetadata = [&](double arc) {
+        const double local = arc - replay.referenceBeginArcBase;
+        const double original = reverse ? geometry.length() - local : local;
+        return nlohmann::json{{"reference_arc_base", arc}, {"directional_arc_base", local},
+            {"original_fiber_arc_base", original}, {"original_fiber_arc_mm", original * voxelSizeUm / 1000}};
+    };
+    for (const auto& failure : replay.failures) {
+        auto entry = failureJson(failure, thresholdBase);
+        entry.update(arcMetadata(failure.referenceArcBase));
+        entry["label"] = "R" + std::to_string(failure.index);
+        result.metadata["restarts"].push_back(entry);
+    }
+    const int margin = int(std::ceil(thresholdBase * std::max(1.0, factor) / baseSpacing)) + 4;
+    int width = 1600;
+    for (const auto& page : scan.pages) width = std::max(width, page.image.cols + 2 * margin);
+    std::vector<cv::Mat_<cv::Vec3b>> rows;
+    int height = 0;
+    const auto flush = [&] {
+        if (rows.empty()) return;
+        cv::Mat_<cv::Vec3b> page;
+        cv::vconcat(rows, page);
+        result.pages.push_back(std::move(page));
+        rows.clear(); height = 0;
+    };
+    const auto addRow = [&](const cv::Mat_<cv::Vec3b>& image, const std::string& label,
+                            nlohmann::json metadata, int xOffset = 0) {
+        const int h = image.rows + 22;
+        if (height + h > 16000) flush();
+        cv::Mat_<cv::Vec3b> row(h, width, cv::Vec3b{0, 0, 0});
+        image.copyTo(row(cv::Rect(xOffset, 22, image.cols, image.rows)));
+        cv::putText(row, label, {4, 16}, cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                    cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+        metadata.update({{"label", label}, {"page", result.pages.size()},
+                         {"rows", {height, height + h}}, {"image_row_begin", height + 22},
+                         {"image_column_begin", xOffset}});
+        result.metadata["rows"].push_back(metadata);
+        rows.push_back(std::move(row)); height += h;
+    };
+    struct Station {
+        FiberReplayStripPoint point;
+        size_t segment;
+        double column;
+        std::string role;
+        const FiberReplayFailure* failure = nullptr;
+        bool hasStrip = true;
+        size_t anchorSegment = 0;
+    };
+    std::vector<Station> forced;
+    for (const auto& failure : replay.failures) {
+        for (int next = 0; next < 2; ++next) {
+            const size_t segmentIndex = failure.segmentIndex + next;
+            if (segmentIndex >= replay.segments.size() || replay.segments[segmentIndex].tracePointsBase.empty()) {
+                result.metadata["restarts"][failure.index][next ? "restart_start_available" : "breakoff_available"] = false;
+                continue;
+            }
+            result.metadata["restarts"][failure.index][next ? "restart_start_available" : "breakoff_available"] = true;
+            const auto& segment = replay.segments[segmentIndex];
+            const auto& points = segment.tracePointsBase;
+            const size_t index = next ? 0 : points.size() - 1;
+            const double arc = next ? segment.startReferenceArcBase : segment.endReferenceArcBase;
+            auto tangent = samplePolylineArc(geometry, arc - replay.referenceBeginArcBase).tangent;
+            tangent = inspectionTraceTangent(points, index, tangent);
+            auto component = std::find_if(scan.fiberletComponents.begin(), scan.fiberletComponents.end(),
+                [&](const auto& c) { return c.sourceSegmentIndex == segmentIndex; });
+            double column = 0;
+            const bool hasStrip = component != scan.fiberletComponents.end();
+            size_t anchorSegment = segmentIndex;
+            if (hasStrip) column = next ? component->topColumns[0] : component->topColumns[1] - 1;
+            else {
+                // A one-point, zero-progress segment has no longitudinal strip.
+                // Anchor its exact section beside the nearest real strip endpoint.
+                double distance = std::numeric_limits<double>::infinity();
+                for (const auto& c : scan.fiberletComponents) {
+                    for (int end = 0; end < 2; ++end) {
+                        const double a = end ? c.referenceArcEndBase : c.referenceArcBeginBase;
+                        if (std::abs(a - arc) < distance) {
+                            distance = std::abs(a - arc);
+                            column = end ? c.topColumns[1] - 1 : c.topColumns[0];
+                            anchorSegment = c.sourceSegmentIndex;
+                        }
+                    }
+                }
+            }
+            forced.push_back({{points[index], tangent, arc, double(index)}, segmentIndex, column,
+                next ? "restart_start" : "breakoff", &failure, hasStrip, anchorSegment});
+        }
+    }
+    for (size_t p = 0; p < scan.pages.size(); ++p) {
+        const auto& page = scan.pages[p];
+        const auto& pred = prediction.pages[p];
+        if (page.image.size() != pred.image.size()) throw std::runtime_error("unaligned inspection rasters");
+        for (const auto& panel : page.panels) {
+            const std::array<std::array<int, 2>, 4> bands{panel.referenceTopRows,
+                panel.referenceSideRows, panel.fiberletTopRows, panel.fiberletSideRows};
+            const std::array<const char*, 4> names{"reference top", "reference side", "traced top", "traced side"};
+            size_t stripPage = 0;
+            int stripCtRow = 0, stripPresenceRow = 0;
+            for (size_t b = 0; b < bands.size(); ++b) {
+                if (height + 2 * (bands[b][1] - bands[b][0] + 22) > 16000) flush();
+                auto metadata = nlohmann::json{{"view", names[b]},
+                    {"progress", {panel.progressFractionBegin, panel.progressFractionEnd}},
+                    {"traced_top_columns", panel.fiberletTopColumns}};
+                metadata["modality"] = "ct";
+                if (b == 2) { stripPage = result.pages.size(); stripCtRow = height + 22; }
+                addRow(page.image.rowRange(bands[b][0], bands[b][1]),
+                    "CT / " + std::string(names[b]) + " / " + ctSamplingDescription + " / 2 base voxels per pixel", metadata, margin);
+                metadata["modality"] = "presence";
+                if (b == 2) stripPresenceRow = height + 22;
+                addRow(pred.image.rowRange(bands[b][0], bands[b][1]), "Presence / " + std::string(names[b]), metadata, margin);
+            }
+            struct Placed {
+                Station station;
+                FiberReplaySectionFrame frame;
+                int x, w, h;
+            };
+            std::vector<std::vector<Placed>> lanes(1);
+            const auto place = [&](Station station, bool mandatory) {
+                const auto frame = fiberReplaySectionFrame(station.point.pointBase, station.point.tangentBase,
+                    normals, workingToBaseScale, thresholdBase, factor);
+                // Odd dimensions place the exact trace point at the exact strip
+                // column, not half a pixel between two thumbnail samples.
+                const int w = std::max(3, 2 * int(std::ceil(frame.horizontalRadius / baseSpacing)) + 1);
+                const int h = std::max(3, 2 * int(std::ceil(frame.verticalRadius / baseSpacing)) + 1);
+                const int center = margin + int(std::lround(station.column)) - panel.fiberletTopColumns[0];
+                const int x = center - (w - 1) / 2;
+                for (size_t lane = 0; ; ++lane) {
+                    if (lane == lanes.size()) {
+                        if (!mandatory) return;
+                        lanes.emplace_back();
+                    }
+                    const bool overlaps = std::any_of(lanes[lane].begin(), lanes[lane].end(),
+                        [&](const auto& a) { return x < a.x + a.w + 2 && x + w + 2 > a.x; });
+                    if (!overlaps) {
+                        lanes[lane].push_back({std::move(station), frame, x, w, h});
+                        return;
+                    }
+                    if (!mandatory) return; // Dense regular sections fill the primary lane.
+                }
+            };
+            for (const auto& station : forced)
+                if (station.column >= panel.fiberletTopColumns[0] && station.column < panel.fiberletTopColumns[1])
+                    place(station, true);
+            // Layout first, inverse mapping second. Never sample a restart gap.
+            for (const auto& c : scan.fiberletComponents) {
+                const int begin = std::max(c.topColumns[0], panel.fiberletTopColumns[0]);
+                const int end = std::min(c.topColumns[1], panel.fiberletTopColumns[1]);
+                for (int column = begin; column < end; ++column)
+                {
+                    const int center = margin + column - panel.fiberletTopColumns[0];
+                    // Even the narrowest valid section contains its center pixel.
+                    if (std::any_of(lanes[0].begin(), lanes[0].end(), [&](const auto& a) {
+                        return center >= a.x - 2 && center < a.x + a.w + 2;
+                    })) continue;
+                    place({sampleFiberReplayStripColumn(c, column), c.sourceSegmentIndex, double(column), "dense", nullptr, true, c.sourceSegmentIndex}, false);
+                }
+            }
+            for (size_t lane = 0; lane < lanes.size(); ++lane) {
+                if (lanes[lane].empty()) continue;
+                int sectionHeight = 0;
+                for (const auto& s : lanes[lane]) sectionHeight = std::max(sectionHeight, s.h);
+                cv::Mat_<cv::Vec3b> ctRow(sectionHeight + 22, width, cv::Vec3b{0, 0, 0}), predRow = ctRow.clone();
+                if (height + 2 * (ctRow.rows + 22) > 16000) flush();
+                if (stripPage != result.pages.size()) {
+                    stripPage = result.pages.size(); stripCtRow = height + 22;
+                    addRow(page.image.rowRange(bands[2][0], bands[2][1]), "CT / traced top (section context) / " + ctSamplingDescription,
+                        {{"modality", "ct"}, {"view", "traced top"}}, margin);
+                    stripPresenceRow = height + 22;
+                    addRow(pred.image.rowRange(bands[2][0], bands[2][1]), "Presence / traced top (section context)",
+                        {{"modality", "presence"}, {"view", "traced top"}}, margin);
+                }
+                for (const auto& placed : lanes[lane]) {
+                    const auto& station = placed.station;
+                    const auto& frame = placed.frame;
+                    const auto& sample = station.point;
+                    const int w = placed.w, h = placed.h, x0 = placed.x;
+                    if (x0 < 0 || x0 + w > width) throw std::runtime_error("aligned section exceeds page");
+                    cv::Mat_<cv::Vec3f> coords(h, w);
+                    for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+                        const auto base = sample.pointBase + frame.horizontal * (frame.horizontalRadius * (2.0 * x / (w - 1) - 1))
+                            + frame.vertical * (frame.verticalRadius * (2.0 * y / (h - 1) - 1));
+                        for (int a = 0; a < 3; ++a)
+                            coords(y, x)[a] = float(base[a] * source.scaleFromBaseXYZ[a] + source.offsetFromBaseXYZ[a]);
+                    }
+                    const auto label = station.failure
+                        ? "R" + std::to_string(station.failure->index) + (station.role == "breakoff" ? "-" : "+")
+                        : "s" + std::to_string(result.metadata["cross_sections"].size());
+                    const auto decorate = [&](const FiberReplayTextureRenderer& render) {
+                        const auto gray = render(coords, 1);
+                        if (gray.size() != coords.size()) throw std::runtime_error("cross-section raster mismatch");
+                        cv::Mat_<cv::Vec3b> color; cv::cvtColor(gray, color, cv::COLOR_GRAY2BGR);
+                        auto overlay = color.clone();
+                        cv::ellipse(overlay, {(w - 1) / 2, (h - 1) / 2}, {(w - 1) / 2, (h - 1) / 2},
+                            0, 0, 360, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+                        cv::addWeighted(overlay, 0.25, color, 0.75, 0, color);
+                        return color;
+                    };
+                    decorate(ct).copyTo(ctRow(cv::Rect(x0, 22, w, h)));
+                    decorate(presence).copyTo(predRow(cv::Rect(x0, 22, w, h)));
+                    for (auto* row : {&ctRow, &predRow})
+                        cv::putText(*row, label, {x0, 15}, cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(220, 220, 220), 1);
+                    auto entry = arcMetadata(sample.referenceArcBase);
+                    entry.update({{"label", label}, {"role", station.role}, {"segment", station.segment},
+                        {"strip_column", station.column}, {"strip_center_column", margin + station.column - panel.fiberletTopColumns[0]},
+                        {"original_trace_position", sample.originalPosition}, {"has_longitudinal_strip", station.hasStrip},
+                        {"anchor_segment", station.anchorSegment}, {"strip_page", stripPage},
+                        {"strip_ct_row_begin", stripCtRow}, {"strip_presence_row_begin", stripPresenceRow},
+                        {"center_base_xyz", pointJson(sample.pointBase)}, {"horizontal_axis_xyz", pointJson(frame.horizontal)},
+                        {"vertical_axis_xyz", pointJson(frame.vertical)}, {"tangent_xyz", pointJson(frame.tangent)},
+                        {"radii_base", {frame.horizontalRadius, frame.verticalRadius}},
+                        {"extent_base", {2 * frame.horizontalRadius, 2 * frame.verticalRadius}},
+                        {"columns", {x0, x0 + w}}, {"shape_yx", {h, w}}, {"lane", lane},
+                        {"page", result.pages.size()}, {"ct_row_begin", height + 44},
+                        {"presence_row_begin", height + ctRow.rows + 66}});
+                    if (station.failure) entry["restart_index"] = station.failure->index;
+                    result.metadata["cross_sections"].push_back(std::move(entry));
+                }
+                addRow(ctRow, "CT / aligned transverse sections; R- old end, R+ new start / " + ctSamplingDescription,
+                    {{"modality", "ct"}, {"view", "cross_sections"}, {"traced_top_columns", panel.fiberletTopColumns}});
+                addRow(predRow, "Presence / aligned transverse sections (long axis vertical)",
+                    {{"modality", "presence"}, {"view", "cross_sections"}, {"traced_top_columns", panel.fiberletTopColumns}});
+            }
+        }
+    }
+    flush();
+    result.metadata["pages"] = result.pages.size();
+    return result;
+}
 nlohmann::json fiberReplayTraceJson(const FiberReplayTraceResult& replay, double normalThresholdBaseVoxels)
 {
     validateNativeReplayStructure(replay);
@@ -2420,7 +2866,8 @@ FiberReplayTraceResult fiberReplayTraceFromJson(const nlohmann::json& document)
     if (document.at("format") != "vc_native_fiber_replay" || document.at("version") != 1)
         throw std::invalid_argument("unsupported native replay format/version");
     const double threshold = document.at("threshold").at("normal_radius_base_voxels");
-    if (document.at("threshold") != fiberReplayThresholdDescriptorJson(threshold))
+    const double factor = document.at("threshold").value("tangential_factor", 4.0);
+    if (document.at("threshold") != fiberReplayThresholdDescriptorJson(threshold, factor))
         throw std::invalid_argument("unsupported native replay threshold descriptor");
     const auto point = [](const nlohmann::json& value) {
         if (!value.is_array() || value.size() != 3)
@@ -2447,10 +2894,14 @@ FiberReplayTraceResult fiberReplayTraceFromJson(const nlohmann::json& document)
         m.thresholdErrorBaseVoxels = value.at("threshold_error_base_voxels");
         m.thresholdErrorRatio = value.at("threshold_error_ratio");
         m.localNormalValid = value.at("local_normal_valid");
+        m.tangentialFactor = value.value("tangential_factor", factor);
+        if (m.tangentialFactor != factor)
+            throw std::invalid_argument("measurement tangential factor differs from descriptor");
         validateFiberReplayThresholdMeasurement(m, threshold);
         return m;
     };
     FiberReplayTraceResult replay;
+    replay.tangentialThresholdFactor = factor;
     replay.referenceBeginArcBase = document.at("reference_begin_arc_base");
     replay.referenceEndArcBase = document.at("reference_end_arc_base");
     replay.completedReferenceArcBase = document.at("completed_reference_arc_base");

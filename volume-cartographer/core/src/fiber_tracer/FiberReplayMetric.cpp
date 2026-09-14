@@ -50,14 +50,27 @@ double thresholdRatio(double thresholdError, double normalThreshold)
 
 }  // namespace
 
+bool FiberReplayExcursion::observe(bool outside, double stepBaseVoxels)
+{
+    if (!std::isfinite(graceBaseVoxels) || graceBaseVoxels < 0 ||
+        !std::isfinite(stepBaseVoxels) || stepBaseVoxels < 0)
+        throw std::invalid_argument("invalid replay excursion distance");
+    if (!outside) { outsideTravel.reset(); return false; }
+    if (outsideTravel) *outsideTravel += stepBaseVoxels;
+    else outsideTravel = 0;
+    return *outsideTravel >= graceBaseVoxels;
+}
+
 FiberReplayThresholdMeasurement measureFiberReplayThreshold(
     const cv::Vec3d& evaluatorPointBase,
     const cv::Vec3d& matchedReferencePointBase,
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale,
-    double normalThresholdBaseVoxels)
+    double normalThresholdBaseVoxels, double tangentialFactor)
 {
     (void)tangentialThreshold(normalThresholdBaseVoxels);
+    if (!std::isfinite(tangentialFactor) || tangentialFactor <= 0)
+        throw std::invalid_argument("invalid tangential factor");
     if (!(normalWorkingToBaseScale > 0.0) ||
         !std::isfinite(normalWorkingToBaseScale) ||
         !finiteVector(evaluatorPointBase) ||
@@ -69,6 +82,7 @@ FiberReplayThresholdMeasurement measureFiberReplayThreshold(
     const cv::Vec3d delta = evaluatorPointBase - matchedReferencePointBase;
     const double euclideanSquared = std::max(0.0, delta.dot(delta));
     FiberReplayThresholdMeasurement result;
+    result.tangentialFactor = tangentialFactor;
     result.euclideanErrorBaseVoxels = std::sqrt(euclideanSquared);
 
     const auto sampled = normalSampler.sampleNormal(
@@ -88,7 +102,7 @@ FiberReplayThresholdMeasurement measureFiberReplayThreshold(
         result.tangentialErrorBaseVoxels = tangentialError;
         result.thresholdErrorBaseVoxels = std::hypot(
             normalError,
-            tangentialError / kFiberReplayTangentialThresholdFactor);
+            tangentialError / tangentialFactor);
     } else {
         result.thresholdErrorBaseVoxels = result.euclideanErrorBaseVoxels;
     }
@@ -118,6 +132,8 @@ void validateFiberReplayThresholdMeasurement(
     double normalThresholdBaseVoxels)
 {
     (void)tangentialThreshold(normalThresholdBaseVoxels);
+    if (!std::isfinite(measurement.tangentialFactor) || measurement.tangentialFactor <= 0)
+        throw std::invalid_argument("invalid measurement tangential factor");
     const auto finiteNonNegative = [](double value) {
         return std::isfinite(value) && value >= 0.0;
     };
@@ -149,7 +165,7 @@ void validateFiberReplayThresholdMeasurement(
         expectedThresholdError = std::hypot(
             *measurement.normalErrorBaseVoxels,
             *measurement.tangentialErrorBaseVoxels /
-                kFiberReplayTangentialThresholdFactor);
+                measurement.tangentialFactor);
     } else if (measurement.normalErrorBaseVoxels.has_value() ||
                measurement.tangentialErrorBaseVoxels.has_value()) {
         throw std::invalid_argument(
@@ -168,14 +184,17 @@ void validateFiberReplayThresholdMeasurement(
 }
 
 nlohmann::json fiberReplayThresholdDescriptorJson(
-    double normalThresholdBaseVoxels)
+    double normalThresholdBaseVoxels, double tangentialFactor)
 {
+    if (!std::isfinite(tangentialFactor) || tangentialFactor <= 0 ||
+        !std::isfinite(normalThresholdBaseVoxels * tangentialFactor))
+        throw std::invalid_argument("invalid threshold descriptor factor/radius");
     return {
         {"shape", "lasagna_normal_ellipsoid"},
         {"normal_radius_base_voxels", normalThresholdBaseVoxels},
-        {"tangential_factor", kFiberReplayTangentialThresholdFactor},
+        {"tangential_factor", tangentialFactor},
         {"tangential_radius_base_voxels",
-         tangentialThreshold(normalThresholdBaseVoxels)},
+         tangentialThreshold(normalThresholdBaseVoxels) * tangentialFactor / kFiberReplayTangentialThresholdFactor},
         {"comparison", "threshold_error_strictly_greater"},
         {"invalid_normal_policy", "isotropic_euclidean"},
     };
@@ -199,6 +218,7 @@ nlohmann::json fiberReplayThresholdMeasurementJson(
          measurement.thresholdErrorBaseVoxels},
         {"threshold_error_ratio", measurement.thresholdErrorRatio},
         {"local_normal_valid", measurement.localNormalValid},
+        {"tangential_factor", measurement.tangentialFactor},
     };
 }
 

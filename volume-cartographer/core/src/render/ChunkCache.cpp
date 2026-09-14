@@ -13,6 +13,7 @@
 #include <bit>
 #include <cctype>
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <regex>
 #include <limits>

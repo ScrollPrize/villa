@@ -5,6 +5,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/fiber_tracer/FiberReplay.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -44,6 +45,345 @@ public:
 
     mutable std::vector<cv::Vec3d> points;
 };
+
+TEST_CASE("presence strip reverses the declared source transform before sampling")
+{
+    class Predictions final : public vc::fiber_tracer::FiberPredictionSource {
+    public:
+        mutable std::vector<cv::Vec3d> points;
+        vc::fiber_tracer::FiberPredictionSample sample(const cv::Vec3d& p, const cv::Vec3d&) const override {
+            points.push_back(p);
+            vc::fiber_tracer::FiberPredictionSample result;
+            result.options.push_back({{1, 0, 0}, 0.25f, true});
+            result.options.push_back({{0, 0, 0}, 0.75f, false});
+            return result;
+        }
+    } predictions;
+    vc::fiber_tracer::FiberReplayStripTextureSource source{
+        "synthetic-presence", {32, 32, 32}, {0.25, 0.5, 0.125}, {1, -2, 3}};
+    cv::Mat_<cv::Vec3f> coords(2, 2, cv::Vec3f{5, 6, 7});
+    const auto image = vc::fiber_tracer::renderFiberReplayPresenceTexture(coords, 2, source, 2, predictions);
+    CHECK(image.rows == 4);
+    CHECK(image.cols == 4);
+    REQUIRE(predictions.points.size() == 16);
+    for (const auto& p : predictions.points) CHECK(p == cv::Vec3d{8, 8, 16});
+    for (const auto value : image) CHECK(value == 191);
+}
+
+TEST_CASE("combined inspection aligns modalities and uses the true transverse acceptance ellipse")
+{
+    using namespace vc::fiber_tracer;
+    class Normals final : public vc::lasagna::NormalSampler {
+    public:
+        cv::Vec3d normal{0, 0, 1}; bool valid = true;
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override { return {normal, valid, {}}; }
+    } normals;
+    const std::vector<cv::Vec3d> reference{{4, 8, 8}, {12, 8, 8}};
+    FiberReplayTraceResult replay;
+    replay.referenceEndArcBase = replay.completedReferenceArcBase = 8;
+    FiberReplayTraceSegment segment;
+    segment.endReferenceArcBase = 8;
+    segment.tracePointsBase = reference;
+    segment.matches = {{1, 8, 8, reference.back()}};
+    replay.segments = {segment};
+    FiberReplayStripTextureSource source{"synthetic", {32, 32, 32}, {1, 1, 1}, {0, 0, 0}};
+    const auto renderer = [](const cv::Mat_<cv::Vec3f>& coords, int scale) {
+        return cv::Mat_<uint8_t>(coords.rows * scale, coords.cols * scale, uint8_t(70));
+    };
+    for (int variant = 0; variant < 4; ++variant) {
+        normals.normal = variant == 1 ? cv::Vec3d{1, 0, 1} : variant == 2 ? cv::Vec3d{1, 0, 0} : cv::Vec3d{0, 0, 1};
+        normals.valid = variant != 3;
+        const auto frame = fiberReplaySectionFrame(reference.front(), {1, 0, 0}, normals, 1, 2);
+        CHECK(frame.verticalRadius >= frame.horizontalRadius - 1e-9);
+        CHECK(frame.verticalRadius == doctest::Approx(variant == 3 ? 2 : 8));
+        if (variant == 2) CHECK(frame.horizontalRadius == doctest::Approx(8));
+        for (int axis = 0; axis < 2; ++axis) {
+            const auto offset = axis ? frame.vertical * frame.verticalRadius : frame.horizontal * frame.horizontalRadius;
+            CHECK(measureFiberReplayThreshold(reference.front() + offset, reference.front(), normals, 1, 2).thresholdErrorRatio == doctest::Approx(1));
+        }
+        // Legacy longitudinal strip frames reject invalid/parallel anchor normals;
+        // transverse geometry still has the metric's well-defined circular fallback.
+        if (variant >= 2) continue;
+        auto result = renderFiberReplayInspection(reference, replay, normals, 1, source,
+                                                  renderer, renderer, 2, true, 2);
+        REQUIRE_FALSE(result.pages.empty());
+        CHECK(result.metadata.at("render_scale") == 1);
+        CHECK(result.metadata.at("base_samples_per_pixel") == 2);
+        const auto& section = result.metadata.at("cross_sections").front();
+        const auto r = section.at("radii_base").get<std::array<double, 2>>();
+        CHECK(r[1] >= r[0] - 1e-9);
+        CHECK(r[1] == doctest::Approx(variant == 3 ? 2 : 8));
+        if (variant == 0) CHECK(r[0] == doctest::Approx(2));
+        if (variant == 2) CHECK(r[0] == doctest::Approx(8));
+        for (int axis = 0; axis < 2; ++axis) {
+            const auto a = section.at(axis ? "vertical_axis_xyz" : "horizontal_axis_xyz").get<std::array<double, 3>>();
+            const auto boundary = reference.front() + cv::Vec3d{a[0], a[1], a[2]} * r[axis];
+            CHECK(measureFiberReplayThreshold(boundary, reference.front(), normals, 1, 2).thresholdErrorRatio == doctest::Approx(1));
+        }
+        CHECK(section.at("original_fiber_arc_base").get<double>() == doctest::Approx(8));
+        const auto& rows = result.metadata.at("rows");
+        REQUIRE(rows.size() >= 2);
+        CHECK(rows[0].at("modality") == "ct");
+        CHECK(rows[1].at("modality") == "presence");
+        CHECK(rows[0].at("label").get<std::string>().find("trilinear") != std::string::npos);
+        for (const auto& s : result.metadata.at("cross_sections")) {
+            const auto columns = s.at("columns").get<std::array<int, 2>>();
+            CHECK((columns[0] + columns[1] - 1) / 2.0 == doctest::Approx(s.at("strip_center_column").get<double>()));
+            CHECK(s.at("role") == "dense");
+            CHECK(s.at("center_base_xyz")[1] == 8);
+        }
+    }
+}
+
+TEST_CASE("inspection uses replay ellipse factor for transverse frames and metadata")
+{
+    using namespace vc::fiber_tracer;
+    class Normals final : public vc::lasagna::NormalSampler {
+    public:
+        bool valid = true;
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override { return {{0,0,1}, valid, {}}; }
+    } normals;
+    for (const auto tangent : {cv::Vec3d{1,0,0}, cv::Vec3d{1,0,1}}) {
+        const auto frame = fiberReplaySectionFrame({0,0,0}, tangent, normals, 1, 40, 2);
+        CHECK(frame.verticalRadius == doctest::Approx(80));
+        CHECK(frame.horizontalRadius <= frame.verticalRadius);
+        for (const auto offset : {frame.horizontal * frame.horizontalRadius, frame.vertical * frame.verticalRadius})
+            CHECK(measureFiberReplayThreshold(offset, {0,0,0}, normals, 1, 40, 2).thresholdErrorRatio == doctest::Approx(1));
+    }
+    normals.valid = false;
+    CHECK(fiberReplaySectionFrame({0,0,0}, {1,0,0}, normals, 1, 40, 2).verticalRadius == doctest::Approx(40));
+    normals.valid = true;
+    CHECK_THROWS(fiberReplaySectionFrame({0,0,0}, {1,0,0}, normals, 1, 40, 0));
+    const std::vector<cv::Vec3d> points{{4,8,8},{204,8,8}};
+    FiberReplayTraceResult replay;
+    replay.tangentialThresholdFactor = 2;
+    replay.referenceEndArcBase = replay.completedReferenceArcBase = 200;
+    FiberReplayTraceSegment segment;
+    segment.endReferenceArcBase = 200;
+    segment.tracePointsBase = points;
+    segment.matches = {{1,200,200,points.back()}};
+    replay.segments = {segment};
+    FiberReplayStripTextureSource source{"synthetic", {512,512,512}, {1,1,1}, {0,0,0}};
+    const auto renderer = [](const cv::Mat_<cv::Vec3f>& coords, int scale) {
+        return cv::Mat_<uint8_t>(coords.rows * scale, coords.cols * scale, uint8_t(70));
+    };
+    const auto result = renderFiberReplayInspection(points, replay, normals, 1, source, renderer, renderer, 40, false, 2.4);
+    REQUIRE_FALSE(result.pages.empty());
+    CHECK(result.metadata.at("threshold") == fiberReplayThresholdDescriptorJson(40,2));
+    REQUIRE_FALSE(result.metadata.at("cross_sections").empty());
+    for (const auto& section : result.metadata.at("cross_sections")) {
+        CHECK(section.at("radii_base")[0].get<double>() == doctest::Approx(40));
+        CHECK(section.at("radii_base")[1].get<double>() == doctest::Approx(80));
+    }
+}
+
+TEST_CASE("thickness-only tolerance and excursion return window")
+{
+    using namespace vc::fiber_tracer;
+    class Normals final : public vc::lasagna::NormalSampler {
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override { return {{0,0,1}, true, {}}; }
+    } normals;
+    CHECK_FALSE(fiberReplayThresholdExceeded(measureFiberReplayThreshold({0,0,40}, {0,0,0}, normals, 1, 40, 2), 40));
+    CHECK(fiberReplayThresholdExceeded(measureFiberReplayThreshold({0,0,41}, {0,0,0}, normals, 1, 40, 2), 40));
+    CHECK_FALSE(fiberReplayThresholdExceeded(measureFiberReplayThreshold({80,0,0}, {0,0,0}, normals, 1, 40, 2), 40));
+    CHECK(fiberReplayThresholdExceeded(measureFiberReplayThreshold({81,0,0}, {0,0,0}, normals, 1, 40, 2), 40));
+    FiberReplayExcursion state{160, std::nullopt};
+    CHECK_FALSE(state.observe(true, 20));
+    CHECK_FALSE(state.observe(true, 159));
+    CHECK_FALSE(state.observe(false, 1)); // re-entry wins at the boundary
+    CHECK_FALSE(state.outsideTravel.has_value());
+    CHECK_FALSE(state.observe(true, 20));
+    CHECK(state.observe(true, 160));
+    FiberReplayExcursion immediate;
+    CHECK(immediate.observe(true, 0));
+}
+
+TEST_CASE("replay counts unresolved terminal excursions and roundtrips thickness-only geometry")
+{
+    using namespace vc::fiber_tracer;
+    class Prediction final : public FiberPredictionSource {
+        FiberPredictionSample sample(const cv::Vec3d&, const cv::Vec3d&) const override {
+            FiberPredictionSample result;
+            result.options.push_back({{0.9950372f, 0.09950372f, 0}, 1.0f, true});
+            return result;
+        }
+    } predictions;
+    class Normals final : public vc::lasagna::NormalSampler {
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override { return {{0,1,0}, true, {}}; }
+    } normals;
+    FiberReplayTraceRequest request;
+    request.fiber.linePointsXyzBase = {{0,0,0}, {27.8,0,0}};
+    request.fiber.controlPointsXyzBase = request.fiber.linePointsXyzBase;
+    request.fiber.controlPointLineIndices = {0,1};
+    request.errorThresholdBaseVoxels = 1;
+    request.tangentialThresholdFactor = 2;
+    request.config.stepVoxels = 4;
+    request.config.coneAngleDegrees = 0;
+    request.config.beamWidth = request.config.beamLookaheadSteps = 1;
+    request.config.smoothnessWeight = request.config.smoothnessNormalWeight = 0;
+    request.config.smoothnessTangentWeight = request.config.cumulativeSmoothnessTangentWeight = 0;
+    const auto immediate = traceFiberReplay(predictions, request, normals, 1);
+    REQUIRE_FALSE(immediate.failures.empty());
+    request.excursionGraceBaseVoxels = 160;
+    const auto delayed = traceFiberReplay(predictions, request, normals, 1);
+    REQUIRE_FALSE(delayed.failures.empty()); // outside at end, despite travel below grace
+    CHECK(delayed.failures.front().reason == "distance_above_threshold");
+    CHECK(delayed.failures.front().referenceArcBase > immediate.failures.front().referenceArcBase);
+    const auto document = fiberReplayTraceJson(delayed, 1);
+    const auto restored = fiberReplayTraceFromJson(document);
+    CHECK(restored.tangentialThresholdFactor == 2);
+    CHECK(fiberReplayTraceJson(restored, 1) == document);
+}
+
+TEST_CASE("restart labels appear on both assembled traced strip views")
+{
+    using namespace vc::fiber_tracer;
+    class Normals final : public vc::lasagna::NormalSampler {
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override { return {{0, 0, 1}, true, {}}; }
+    } normals;
+    const std::vector<cv::Vec3d> reference{{4, 8, 8}, {204, 8, 8}};
+    FiberReplayTraceResult replay;
+    replay.referenceEndArcBase = replay.completedReferenceArcBase = 200;
+    for (int i = 0; i < 2; ++i) {
+        FiberReplayTraceSegment s;
+        s.startReferenceArcBase = i * 100;
+        s.endReferenceArcBase = (i + 1) * 100;
+        s.tracePointsBase = {{4.0 + i * 100, 8, 8}, {104.0 + i * 100, 8, 8}};
+        s.matches = {{1, s.endReferenceArcBase, s.endReferenceArcBase, s.tracePointsBase.back()}};
+        replay.segments.push_back(s);
+    }
+    FiberReplayFailure failure;
+    failure.index = 0;
+    failure.segmentIndex = 0;
+    failure.referenceArcBase = 100;
+    failure.referenceArcFraction = 0.5;
+    replay.failures.push_back(failure);
+    FiberReplayStripTextureSource source{"synthetic", {256, 256, 256}, {1, 1, 1}, {0, 0, 0}};
+    const auto renderer = [](const cv::Mat_<cv::Vec3f>& c, int scale) {
+        return cv::Mat_<uint8_t>(c.rows * scale, c.cols * scale, uint8_t(70));
+    };
+    const auto plain = renderFiberReplayTraceOverview(reference, replay, normals, 1, 1, source, renderer, 1, false, 2);
+    const auto labeled = renderFiberReplayTraceOverview(reference, replay, normals, 1, 1, source, renderer, 1, true, 2);
+    REQUIRE(labeled.pages.size() == plain.pages.size());
+    for (size_t p = 0; p < plain.pages.size(); ++p) {
+        for (const auto& panel : plain.pages[p].panels) {
+            for (const auto band : {panel.fiberletTopRows, panel.fiberletSideRows}) {
+                CHECK(cv::norm(plain.pages[p].image.rowRange(band[0], band[1]),
+                    labeled.pages[p].image.rowRange(band[0], band[1]), cv::NORM_L1) > 0);
+            }
+        }
+    }
+}
+
+TEST_CASE("curved inspection aligns restart sections to both actual traced marker rasters")
+{
+    using namespace vc::fiber_tracer;
+    class Normals final : public vc::lasagna::NormalSampler {
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override { return {{0,0,1}, true, {}}; }
+    } normals;
+    const std::vector<cv::Vec3d> reference{{0,0,0}, {300,0,0}};
+    FiberReplayTraceResult replay;
+    replay.referenceEndArcBase = replay.completedReferenceArcBase = 300;
+    for (int i = 0; i < 3; ++i) {
+        FiberReplayTraceSegment s;
+        s.startReferenceArcBase = 100 * i;
+        s.endReferenceArcBase = 100 * (i + 1);
+        for (int j = 0; j <= 10; ++j) {
+            const double x = 100 * i + j * 10;
+            s.tracePointsBase.push_back({x, 20 * std::sin(j * 0.3), 0});
+            if (j) s.matches.push_back({size_t(j), x, x, {x,0,0}});
+        }
+        replay.segments.push_back(s);
+        if (i < 2) {
+            FiberReplayFailure f;
+            f.index = i; f.segmentIndex = i;
+            f.referenceArcBase = s.endReferenceArcBase;
+            f.referenceArcFraction = f.referenceArcBase / 300;
+            replay.failures.push_back(f);
+        }
+    }
+    SUBCASE("progressing reference matches") {}
+    SUBCASE("first segment moves without reference progress") {
+        replay.segments[0].endReferenceArcBase = 0;
+        replay.segments[1].startReferenceArcBase = 0;
+        for (auto& match : replay.segments[0].matches) {
+            match.matchedReferenceArcBase = 0;
+            match.matchedReferencePointBase = {0,0,0};
+        }
+        replay.failures[0].referenceArcBase = 0;
+        replay.failures[0].referenceArcFraction = 0;
+    }
+    FiberReplayStripTextureSource source{"synthetic", {512,512,512}, {1,1,1}, {0,0,0}};
+    const auto render = [](const cv::Mat_<cv::Vec3f>& c, int scale) {
+        return cv::Mat_<uint8_t>(c.rows * scale, c.cols * scale, uint8_t(70));
+    };
+    const auto overview = renderFiberReplayTraceOverview(reference, replay, normals, 1, 1, source, render, 1, true, 2);
+    for (const auto& c : overview.fiberletComponents) CHECK(c.topColumns == c.sideColumns);
+    const auto result = renderFiberReplayInspection(reference, replay, normals, 1, source, render, render, 2, false, 2);
+    int breakoffs = 0;
+    for (const auto& section : result.metadata.at("cross_sections")) {
+        if (section.at("role") != "breakoff") continue;
+        ++breakoffs;
+        const auto columns = section.at("columns").get<std::array<int,2>>();
+        const int center = (columns[0] + columns[1] - 1) / 2;
+        for (const auto& row : result.metadata.at("rows")) {
+            const auto view = row.at("view").get<std::string>();
+            if (view != "traced top" && view != "traced side") continue;
+            const auto& image = result.pages.at(row.at("page").get<size_t>());
+            const int y = row.at("image_row_begin").get<int>();
+            // Read real cyan failure-band pixels, above centerline and text.
+            CHECK(image(y, center) == cv::Vec3b(255,255,0));
+        }
+    }
+    CHECK(breakoffs == 2);
+}
+
+TEST_CASE("strip column inverse respects nonuniform line positions and refuses gaps")
+{
+    using namespace vc::fiber_tracer;
+    FiberReplayOverviewFiberletComponent c;
+    c.pointsBase = {{0, 0, 0}, {2, 0, 0}, {10, 0, 0}};
+    c.referenceArcsBase = {0, 2, 10};
+    c.positionMap.originalArclengths = {0, 2, 10};
+    c.positionMap.stripGridArclengths = {0, 5, 10};
+    c.positionMap.totalArclength = 10;
+    c.positionMap.stripGridSpacingBaseVoxels = 5;
+    c.positionMap.stripGridColumnCount = 3;
+    c.topSourceColumns = 3;
+    c.topColumns = {100, 106};
+    const auto sample = sampleFiberReplayStripColumn(c, 102.5);
+    CHECK(sample.pointBase[0] == doctest::Approx(5));
+    CHECK(sample.originalPosition == doctest::Approx(1.375));
+    CHECK(sample.referenceArcBase == doctest::Approx(5));
+    CHECK(sampleFiberReplayStripColumn(c, 105).pointBase[0] == doctest::Approx(10));
+    CHECK_THROWS(sampleFiberReplayStripColumn(c, 106));
+    CHECK_THROWS(sampleFiberReplayStripColumn(c, 99));
+    c.pointsBase.push_back(c.pointsBase.back());
+    c.referenceArcsBase.push_back(10);
+    c.positionMap.originalArclengths.push_back(10);
+    CHECK(cv::norm(sampleFiberReplayStripColumn(c, 105).tangentBase) > 0);
+}
+
+TEST_CASE("evaluation crops CP bounds and skips actual Lasagna spans without joining gaps")
+{
+    using namespace vc::fiber_tracer;
+    Vc3dFiberJson fiber;
+    fiber.version = 3;
+    for (int i = 0; i <= 10; ++i) fiber.linePoints.push_back({double(i), 0, 0});
+    fiber.controlPoints = {fiber.linePoints[1], fiber.linePoints[3], fiber.linePoints[5], fiber.linePoints[7], fiber.linePoints[9]};
+    fiber.segmentMetadata = {{{"interp_mode", "trace"}}, {{"interp_mode", "cspline"}},
+                            {{"interp_mode", "lasagna"}, {"interp_goal", "trace"}}, {{"interp_mode", "trace"}}};
+    const auto plan = vc3dEvaluationReferencePlan(fiber, "test");
+    CHECK(plan.at("eligible_length_base_voxels") == 6);
+    REQUIRE(plan.at("runs").size() == 2);
+    CHECK(plan.at("runs")[0].at("line_indices") == nlohmann::json::array({1, 5}));
+    CHECK(plan.at("runs")[1].at("original_arcs_base") == nlohmann::json::array({7, 9}));
+    CHECK(plan.at("excluded").size() == 3);
+    for (auto& m : fiber.segmentMetadata) m["interp_mode"] = "lasagna";
+    CHECK(vc3dEvaluationReferencePlan(fiber, "test").at("runs").empty());
+    fiber.controlPoints[0][0] = 0.5;
+    CHECK_THROWS(vc3dEvaluationReferencePlan(fiber, "test"));
+}
 
 vc::fiber_tracer::FiberReplayThresholdMeasurement tangentMeasurement(
     double errorBaseVoxels,

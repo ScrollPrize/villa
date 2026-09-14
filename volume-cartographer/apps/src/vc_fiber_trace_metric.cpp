@@ -257,7 +257,7 @@ int main(int argc, char** argv)
     try {
         if (argc > 1 && std::string_view(argv[1]) == "sample-embeddings")
             return queryCachedFiberEmbeddings(argc, argv);
-        if (argc > 1 && (std::string_view(argv[1]) == "replay-set" || std::string_view(argv[1]) == "render-replay"))
+        if (argc > 1 && (std::string_view(argv[1]) == "replay-set" || std::string_view(argv[1]) == "render-replay" || std::string_view(argv[1]) == "replay-references"))
             return runFiberTraceEvaluationCli(argc, argv);
         const CliOptions options = parseArgs(argc, argv);
         vc::render::processChunkCacheService()->configureDecodedByteCapacity(options.cacheBytes);

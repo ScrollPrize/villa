@@ -381,23 +381,6 @@ struct ConeOffset {
     return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
 }
 
-[[nodiscard]] bool pointsExactlyEqual(const cv::Vec3d& a, const cv::Vec3d& b)
-{
-    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
-}
-
-[[nodiscard]] size_t exactLineIndexForControlPoint(const std::vector<cv::Vec3d>& line, const cv::Vec3d& control, size_t controlIndex, const std::filesystem::path& path)
-{
-    for (size_t index = 0; index < line.size(); ++index) {
-        if (pointsExactlyEqual(line[index], control)) {
-            return index;
-        }
-    }
-    throw std::runtime_error(
-        "fiber JSON control point " + std::to_string(controlIndex) +
-        " is not an exact line point; refusing to guess line arc position: " + path.string());
-}
-
 [[nodiscard]] std::vector<cv::Vec3d> scaledPoints(const std::vector<cv::Vec3d>& points, double divisor)
 {
     std::vector<cv::Vec3d> out;
@@ -3964,18 +3947,7 @@ FiberInput loadFiberJson(const std::filesystem::path& path)
     if (fiber.controlPointsXyzBase.size() < 2) {
         throw std::runtime_error("fiber JSON needs at least two control_points: " + path.string());
     }
-    fiber.controlPointLineIndices.reserve(fiber.controlPointsXyzBase.size());
-    for (size_t index = 0; index < fiber.controlPointsXyzBase.size(); ++index) {
-        fiber.controlPointLineIndices.push_back(exactLineIndexForControlPoint(fiber.linePointsXyzBase, fiber.controlPointsXyzBase[index], index, path));
-    }
-    for (size_t index = 1; index < fiber.controlPointLineIndices.size(); ++index) {
-        if (fiber.controlPointLineIndices[index] <= fiber.controlPointLineIndices[index - 1]) {
-            throw std::runtime_error(
-                "fiber JSON control_points are not strictly increasing along "
-                "line_points: " +
-                path.string());
-        }
-    }
+    fiber.controlPointLineIndices = vc3dControlPointLineIndices(parsed, path.string());
     return fiber;
 }
 
@@ -4376,6 +4348,8 @@ FiberReplayTraceResult traceReferenceReplayCore(
     double nominalStepBase,
     double maxStepFactor,
     double errorThresholdBaseVoxels,
+    double excursionGraceBaseVoxels,
+    double tangentialThresholdFactor,
     double matchRefineSteps,
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale,
@@ -4383,8 +4357,11 @@ FiberReplayTraceResult traceReferenceReplayCore(
     const FiberTraceProgressCallback& progress,
     const FiberReplayFailureCallback& failureCallback)
 {
+    if (!std::isfinite(excursionGraceBaseVoxels) || excursionGraceBaseVoxels < 0)
+        throw std::invalid_argument("replay excursion grace must be finite and nonnegative");
     const double remainingArcBase = endArcBase - startArcBase;
     FiberReplayTraceResult result;
+    result.tangentialThresholdFactor = tangentialThresholdFactor;
     result.referenceBeginArcBase = startArcBase;
     result.referenceEndArcBase = endArcBase;
     result.completedReferenceArcBase = startArcBase;
@@ -4404,6 +4381,7 @@ FiberReplayTraceResult traceReferenceReplayCore(
         double previousArcBase = segmentStartArc;
         bool referenceExhausted = false;
         bool distanceFailed = false;
+        FiberReplayExcursion excursion{excursionGraceBaseVoxels, std::nullopt};
         const ReplayPointObserver observe =
             [&](const cv::Vec3d& pointBase, double cumulativeLoss, int) {
                 if (previousArcBase >= endArcBase - kEpsilon) {
@@ -4421,7 +4399,8 @@ FiberReplayTraceResult traceReferenceReplayCore(
                 const auto& match = forwardMatch.projection;
                 const auto thresholdMeasurement = measureFiberReplayThreshold(
                     pointBase, match.point, normalSampler,
-                    normalWorkingToBaseScale, errorThresholdBaseVoxels);
+                    normalWorkingToBaseScale, errorThresholdBaseVoxels, tangentialThresholdFactor);
+                const double stepTravel = cv::norm(pointBase - segment.tracePointsBase.back());
                 segment.tracePointsBase.push_back(pointBase);
                 segment.cumulativeLosses.push_back(cumulativeLoss);
                 segment.matches.push_back({
@@ -4435,10 +4414,11 @@ FiberReplayTraceResult traceReferenceReplayCore(
                 });
                 previousArcBase = match.arc;
                 segment.endReferenceArcBase = match.arc;
-                distanceFailed = fiberReplayThresholdExceeded(
-                    thresholdMeasurement, errorThresholdBaseVoxels);
+                distanceFailed = excursion.observe(fiberReplayThresholdExceeded(
+                    thresholdMeasurement, errorThresholdBaseVoxels), stepTravel);
                 if (previousArcBase >= endArcBase - kEpsilon)
                     referenceExhausted = true;
+                if (referenceExhausted && excursion.outsideTravel) distanceFailed = true;
                 return !distanceFailed && !referenceExhausted;
             };
 
@@ -4463,6 +4443,8 @@ FiberReplayTraceResult traceReferenceReplayCore(
         const std::string terminationReason = runSegment(
             start, endArcBase - segmentStartArc, maximumSteps, observe,
             segmentProgress);
+
+        if (excursion.outsideTravel) distanceFailed = true;
 
         if (referenceExhausted && !distanceFailed) {
             segment.endReferenceArcBase = endArcBase;
@@ -4617,7 +4599,7 @@ static FiberReplayTraceResult traceFiberReplayImpl(
     return traceReferenceReplayCore(
         reference, startArcBase, endArcBase, nominalStepBase,
         request.config.maxStepFactor, request.errorThresholdBaseVoxels,
-        request.matchRefineSteps, normalSampler, normalWorkingToBaseScale,
+        request.excursionGraceBaseVoxels, request.tangentialThresholdFactor, request.matchRefineSteps, normalSampler, normalWorkingToBaseScale,
         runSegment, progress, failureCallback);
 }
 
@@ -4723,7 +4705,7 @@ FiberReplayTraceResult traceLasagnaReplay(
     return traceReferenceReplayCore(
         reference, 0.0, reference.length(), request.stepBaseVoxels,
         request.maxStepFactor, request.errorThresholdBaseVoxels,
-        request.matchRefineSteps, normalSampler, 1.0, runSegment, progress,
+        request.excursionGraceBaseVoxels, request.tangentialThresholdFactor, request.matchRefineSteps, normalSampler, 1.0, runSegment, progress,
         failureCallback);
 }
 

@@ -9,6 +9,7 @@
 
 #include <array>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -113,7 +114,19 @@ struct FiberReplayOverviewFiberletComponent {
     std::array<int, 2> sideColumns{};
     std::array<int, 2> topRows{};
     std::array<int, 2> sideRows{};
+    // Original traced line + inverse display map; never bridge restart gaps.
+    std::vector<cv::Vec3d> pointsBase;
+    std::vector<double> referenceArcsBase;
+    vc::lasagna::LineStripPositionMap positionMap;
+    int topSourceColumns = 0;
 };
+
+struct FiberReplayStripPoint {
+    cv::Vec3d pointBase, tangentBase;
+    double referenceArcBase = 0, originalPosition = 0;
+};
+[[nodiscard]] FiberReplayStripPoint sampleFiberReplayStripColumn(
+    const FiberReplayOverviewFiberletComponent& component, double assembledColumn);
 
 struct FiberReplayOverview {
     FiberReplayStripTextureSource textureSource;
@@ -183,6 +196,51 @@ void writeFiberReplayTraceArtifacts(
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale, int parallelThreads,
     ::Volume& volume, const std::string& sourceLocator);
+
+// Coordinates supplied to the texture callback are in the declared source
+// lattice, resampled at native spacing. The callback applies renderScale.
+using FiberReplayTextureRenderer = std::function<cv::Mat_<uint8_t>(
+    const cv::Mat_<cv::Vec3f>&, int renderScale)>;
+[[nodiscard]] FiberReplayOverview renderFiberReplayTraceOverview(
+    const std::vector<cv::Vec3d>& referenceGeometryBase,
+    const FiberReplayTraceResult& replay,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale, int parallelThreads,
+    const FiberReplayStripTextureSource& source,
+    const FiberReplayTextureRenderer& renderTexture,
+    int renderScale = 8, bool labelRestarts = false, double baseSamplesPerPixel = 0);
+
+struct FiberReplayInspection {
+    std::vector<cv::Mat_<cv::Vec3b>> pages;
+    nlohmann::json metadata;
+};
+
+struct FiberReplaySectionFrame {
+    cv::Vec3d horizontal, vertical, tangent;
+    double horizontalRadius, verticalRadius;
+};
+[[nodiscard]] FiberReplaySectionFrame fiberReplaySectionFrame(
+    const cv::Vec3d& center, const cv::Vec3d& tangent,
+    const vc::lasagna::NormalSampler& normals, double workingToBaseScale, double thresholdBase,
+    double tangentialFactor = kFiberReplayTangentialThresholdFactor);
+
+// Aligned CT/presence strips and transverse acceptance cross-sections.
+[[nodiscard]] FiberReplayInspection renderFiberReplayInspection(
+    const std::vector<cv::Vec3d>& referenceGeometryBase,
+    const FiberReplayTraceResult& replay,
+    const vc::lasagna::NormalSampler& normals, double workingToBaseScale,
+    const FiberReplayStripTextureSource& source,
+    const FiberReplayTextureRenderer& ct, const FiberReplayTextureRenderer& presence,
+    double thresholdBase, bool reverse, double voxelSizeUm,
+    const std::string& ctSamplingDescription = "CT: trilinear interpolation");
+
+// Uses the existing prediction source (including its readiness gate). Multiple
+// prediction options are visualized as maximum presence, not direction validity.
+// This uses complete presence/nx/ny products, not standalone presence arrays.
+[[nodiscard]] cv::Mat_<uint8_t> renderFiberReplayPresenceTexture(
+    const cv::Mat_<cv::Vec3f>& sourceCoordinates, int renderScale,
+    const FiberReplayStripTextureSource& source, double workingToBaseScale,
+    const FiberPredictionSource& predictions);
 
 [[nodiscard]] FiberReplayStripTextureSource validateFiberReplayStripCtVolume(
     ::Volume& volume,
