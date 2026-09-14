@@ -143,7 +143,6 @@ LEGACY_RENAMES = {
     "interactive_influence_z": "influence_z",
     "interactive_influence_windings": "influence_windings",
     "interactive_influence_theta_frac": "influence_theta_frac",
-    "interactive_influence_disable_dt_frac": "influence_disable_dt_frac",
     "interactive_influence_sigma": "influence_sigma",
     "interactive_influence_anchor_ramp_power":
         "influence_anchor_ramp_power",

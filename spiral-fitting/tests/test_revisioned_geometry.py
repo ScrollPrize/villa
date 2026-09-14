@@ -42,7 +42,7 @@ def context(monkeypatch):
     ctx.slice_to_spiral_transform = lambda x: x
     ctx.optimiser = torch.optim.Adam([torch.nn.Parameter(torch.tensor([1.0]))])
     ctx.influence_state = None
-    ctx.interactive_dt_resume_iteration = None
+    ctx.run_dt_resume_iteration = None
     ctx.dist = SimpleNamespace(is_main_process=False)
     ctx.interactive_driver = None
     ctx.verified_patches_path = ''
@@ -76,6 +76,22 @@ def test_patch_deletion_rederives_attachments_without_mutating_active_state(cont
     assert not ctx.verified_patches
     assert ctx.optimiser is optimiser
     assert ctx.regular_pcl_catalog[5] is not original
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_input_revision_preserves_original_run_dt_schedule(context, enabled):
+    context.configure_dt_loss_schedule(
+        100, 100, {'enabled': enabled, 'last_fraction': 0.25})
+    expected = 175 if enabled else None
+    candidate = context.prepare_input_changes([
+        {'id': 'logical', 'kind': 'patch', 'source_id': 'baseline',
+         'deleted': True, 'revision': 2}],
+        current_iteration=150, target_iteration=200)
+    assert candidate.run_dt_resume_iteration == expected
+    context.install_input_changes(candidate)
+    assert context.run_dt_resume_iteration == expected
+    context.clear_interactive_run_state()
+    assert context.run_dt_resume_iteration is None
 
 
 def test_failed_mixed_batch_preserves_every_active_input(context):
