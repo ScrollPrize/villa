@@ -315,7 +315,15 @@ public:
         
         // Scale is currently in OBJ units. Convert to micrometers now.
         if (valid_count == 0) {
-            std::cerr << "Warning: no valid grid points were rasterized." << std::endl;
+            // An empty grid is not a conversion: refuse to write a tifxyz that
+            // holds only the -1 sentinel, so scripts see a failure, not success.
+            std::cerr << "Error: no valid grid points were rasterized on the "
+                      << grid_size[0] << " x " << grid_size[1] << " grid. "
+                      << "If the OBJ's UVs are normalised to [0,1] (published segments), "
+                      << "pass a stretch_factor (e.g. 800) or --uv-to-obj=<OBJ units per UV unit>."
+                      << std::endl;
+            delete points;
+            return nullptr;
         }
         const bool src_scale_mode = (src_scale[0] > 0.f && src_scale[1] > 0.f);
         if (src_scale_mode) {
@@ -539,7 +547,7 @@ int main(int argc, char *argv[])
         std::cout << std::endl;
         std::cout << "Note: Scale factors are automatically calculated from the mesh grid structure." << std::endl;
         std::cout << "Examples:" << std::endl;
-        std::cout << "  " << argv[0] << " mesh.obj outdir                       (legacy behavior)" << std::endl;
+        std::cout << "  " << argv[0] << " mesh.obj outdir                       (UV-metric mode, the default)" << std::endl;
         std::cout << "  " << argv[0] << " mesh.obj outdir 800 1.0 --uv-metric  (UV is metric, OBJ units == UV units)" << std::endl;
         std::cout << "  " << argv[0] << " mesh.obj outdir --uv-metric --uv-to-obj=0.001" << std::endl;
         return EXIT_SUCCESS;
