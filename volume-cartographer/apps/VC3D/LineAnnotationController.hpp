@@ -1219,6 +1219,9 @@ private:
         vc3d::line_annotation::FiberOptimizationMode)>
         _mergeModePicker;
     bool _errorDialogsSuppressed = false;
+    // deleteFibers is running (it yields to the event loop while draining
+    // saves); a second delete meanwhile is refused.
+    bool _deletingFibers = false;
     // Deduplicates the deferred re-optimization prompt across reentrant
     // fiber (re)loads.
     bool _reoptimizationPromptPending = false;

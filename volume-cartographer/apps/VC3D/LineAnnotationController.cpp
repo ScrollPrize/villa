@@ -67,6 +67,7 @@
 #include <QPointF>
 #include <QPushButton>
 #include <QRadioButton>
+#include <QScopeGuard>
 #include <QShortcut>
 #include <QDateTime>
 #include <QSettings>
@@ -3051,6 +3052,16 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
     if (fiberIds.empty()) {
         return;
     }
+    // One delete at a time. The save drain below runs a nested event loop
+    // that still delivers input, so a second delete could otherwise start
+    // inside the first; every UI entry point (Fibers docks, fiber map) shares
+    // this controller, so the guard has to live here.
+    if (_deletingFibers) {
+        showError(tr("A fiber delete is already in progress."), true);
+        return;
+    }
+    _deletingFibers = true;
+    const auto releaseDeleting = qScopeGuard([this]() { _deletingFibers = false; });
     // Drain queued save jobs first: a save still in flight for one of these
     // fibers would recreate the file right after the remove below.
     waitForFiberSaves();
@@ -3060,7 +3071,21 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
     std::vector<uint64_t> deletedIds;
     deletedIds.reserve(fiberIds.size());
     for (uint64_t fiberId : fiberIds) {
-        const auto path = fiberPath(fiberId);
+        // Only a fiber still loaded is deleted, by the file it is loaded
+        // from. The drain above yielded to the event loop, and an id that
+        // vanished meanwhile must not be turned into a path by the
+        // "<id>.json" fallback of fiberPath(uint64_t): that could name an
+        // unrelated file.
+        const auto fiberIt = std::find_if(_fibers.begin(),
+                                          _fibers.end(),
+                                          [fiberId](const StoredFiber& fiber) {
+                                              return fiber.id == fiberId;
+                                          });
+        if (fiberIt == _fibers.end()) {
+            Logger()->warn("deleteFibers: fiber {} is no longer loaded; skipping", fiberId);
+            continue;
+        }
+        const auto path = fiberPath(*fiberIt);
         std::error_code ec;
         fs::remove(path, ec);
         if (ec) {
@@ -3070,15 +3095,7 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
             continue;
         }
         deletedIds.push_back(fiberId);
-        auto fiberIt = std::find_if(_fibers.begin(),
-                                    _fibers.end(),
-                                    [fiberId](const StoredFiber& fiber) {
-                                        return fiber.id == fiberId;
-                                    });
-        deletedFibers.push_back({fiberId,
-                                 fiberIt == _fibers.end()
-                                     ? std::string{}
-                                     : fiberIt->fileName});
+        deletedFibers.push_back({fiberId, fiberIt->fileName});
     }
     if (deletedIds.empty()) {
         return;
