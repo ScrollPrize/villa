@@ -163,12 +163,16 @@ TEST_CASE("save / load round-trips data")
         gs.save(path, opts);
     }
 
-    GridStore loaded(path);
-    CHECK(loaded.size() == cv::Size(100, 100));
-    auto all = loaded.get_all();
-    CHECK(all.size() == 2);
-    auto in_lo = loaded.get(cv::Rect(0, 0, 10, 10));
-    CHECK(in_lo.size() == 1);
+    // Nested scope: the mmap-backed GridStore must be destroyed before the file
+    // can be deleted. Windows refuses to remove a file that is still mapped.
+    {
+        GridStore loaded(path);
+        CHECK(loaded.size() == cv::Size(100, 100));
+        auto all = loaded.get_all();
+        CHECK(all.size() == 2);
+        auto in_lo = loaded.get(cv::Rect(0, 0, 10, 10));
+        CHECK(in_lo.size() == 1);
+    }
 
     std::filesystem::remove(path);
 }
@@ -182,8 +186,10 @@ TEST_CASE("save with default options compiles & roundtrips")
         gs.add(diagonal(4, 1, 1, {1, 1}));
         gs.save(path);
     }
-    GridStore loaded(path);
-    CHECK(loaded.get_all().size() == 1);
+    {
+        GridStore loaded(path);
+        CHECK(loaded.get_all().size() == 1);
+    }
     std::filesystem::remove(path);
 }
 
@@ -196,8 +202,10 @@ TEST_CASE("save throws on a read-only (mmap-loaded) store")
         gs.add(diagonal(3));
         gs.save(path);
     }
-    GridStore loaded(path);
-    CHECK_THROWS_AS(loaded.save(tmpPath("save_readonly_2.bin")), std::runtime_error);
+    {
+        GridStore loaded(path);
+        CHECK_THROWS_AS(loaded.save(tmpPath("save_readonly_2.bin")), std::runtime_error);
+    }
     std::filesystem::remove(path);
 }
 
@@ -210,8 +218,10 @@ TEST_CASE("add throws on a read-only (mmap-loaded) store")
         gs.add(diagonal(3));
         gs.save(path);
     }
-    GridStore loaded(path);
-    CHECK_THROWS_AS(loaded.add(diagonal(3)), std::runtime_error);
+    {
+        GridStore loaded(path);
+        CHECK_THROWS_AS(loaded.add(diagonal(3)), std::runtime_error);
+    }
     std::filesystem::remove(path);
 }
 
