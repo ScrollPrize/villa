@@ -2318,11 +2318,34 @@ class UploadTests(unittest.TestCase):
             }})
         self.assertEqual(caught.exception.status, 400)
 
-        with self.assertRaisesRegex(ApiError, "Unknown influence"):
-            _planned_run(self.state, {
+    def test_run_ignores_and_reports_unknown_influence_keys(self):
+        session = self._session()
+        influence = {"influence_enabled": True, "influence_z": 1200,
+                     "influence_disable_dt_frac": 0.4,
+                     "future_unknown_setting": "obsolete"}
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            result = _planned_run(self.state, {
                 "iterations": 10,
-                "influence_config": {"influence_disable_dt_frac": 0.4},
+                "influence_config": influence,
             })
+        self.assertTrue(result["accepted"])
+        self.assertEqual(session.run_calls[-1][1], {
+            "influence_enabled": True, "influence_z": 1200})
+        self.assertEqual(self.state._active_run_influence, {
+            "influence_enabled": True, "influence_z": 1200})
+        warning = ("Ignoring unknown influence configuration keys: "
+                   "['future_unknown_setting', 'influence_disable_dt_frac']")
+        self.assertIn(warning, output.getvalue())
+        self.assertTrue(any(
+            event["text"] == warning and event["severity"] == "warning"
+            for event in self.state.events.read_after(0)["events"]))
+        self.assertIn("influence_disable_dt_frac", influence)
+
+        # Ignored keys cannot hide invalid values of known settings.
+        with self.assertRaisesRegex(ApiError, "influence_theta_frac must be between"):
+            _planned_run(self.state, {
+                "iterations": 10, "influence_config": {
+                    **influence, "influence_theta_frac": 1.5}})
 
     def test_run_requires_validates_and_propagates_dt_loss_schedule(self):
         session = self._session()
@@ -2365,17 +2388,35 @@ class UploadTests(unittest.TestCase):
                 self.state.run(request)
             self.assertEqual(caught.exception.status, 400)
 
-    def test_run_configuration_rejects_removed_influence_dt_field(self):
-        self._session()
+    def test_run_configuration_ignores_and_reports_unknown_fields(self):
+        session = self._session()
         configuration = dict(Config.catalog()["defaults"])
         configuration["influence_disable_dt_frac"] = 0.75
-        with self.assertRaisesRegex(ApiError, "complete configuration"):
-            self.state.run({
+        configuration["future_unknown_setting"] = 7
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            result = self.state.run({
                 "configuration": configuration,
                 "iterations": 10,
                 "influence": {},
                 "dt_loss_schedule": {
                     "enabled": False, "last_fraction": 0.25},
+                "expected_session_revision": self.state.session_revision,
+            })
+        self.assertTrue(result["accepted"])
+        self.assertNotIn("influence_disable_dt_frac", session.run_calls[-1][2])
+        self.assertNotIn("future_unknown_setting", session.run_calls[-1][2])
+        warning = ("Ignoring unknown run configuration keys: "
+                   "['future_unknown_setting', 'influence_disable_dt_frac']")
+        self.assertIn(warning, output.getvalue())
+        self.assertTrue(any(
+            event["text"] == warning and event["severity"] == "warning"
+            for event in self.state.events.read_after(0)["events"]))
+
+        # Extra obsolete fields must not conceal missing current fields.
+        del configuration["optimizer_learning_rate"]
+        with self.assertRaisesRegex(ApiError, "complete configuration"):
+            self.state.run({
+                "configuration": configuration,
                 "expected_session_revision": self.state.session_revision,
             })
 

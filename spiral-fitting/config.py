@@ -9,6 +9,14 @@ from pathlib import Path
 DEFAULT_GAP_EXPANDER_CAPACITY = 144
 
 
+def filter_known_config_keys(values, allowed, *, label, warn=print):
+    """Copy client settings, reporting keys absent from the current schema."""
+    unknown = sorted(set(values) - set(allowed))
+    if unknown:
+        warn(f"Ignoring unknown {label} keys: {unknown}")
+    return {key: value for key, value in values.items() if key in allowed}
+
+
 _ENUMS = {
     "model_flow_integration_solver": ["rk4"],
     "model_flow_field_type": ["cartesian", "cylindrical", "bspline", "bspline_cylindrical"],
