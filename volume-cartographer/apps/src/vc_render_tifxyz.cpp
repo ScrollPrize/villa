@@ -394,6 +394,46 @@ static std::string loadCachedRemoteUrl(const std::filesystem::path& volumePath)
     return {};
 }
 
+static void saveRemoteSourceMarker(const std::filesystem::path& volumePath,
+                                   const std::string& remoteUrl)
+{
+    if (volumePath.string().find("://") != std::string::npos)
+        return;
+    if (remoteUrl.find('?') != std::string::npos)
+        return;
+    if (loadCachedRemoteUrl(volumePath) == remoteUrl)
+        return;
+    std::error_code ec;
+    for (const char* name : {".zgroup", ".zarray", "zarr.json", "0"}) {
+        if (std::filesystem::exists(volumePath / name, ec)) {
+            logPrintf(stderr, "Warning: %s holds a local zarr; not recording the remote source\n",
+                      volumePath.string().c_str());
+            return;
+        }
+    }
+    std::filesystem::create_directories(volumePath, ec);
+    if (ec) {
+        logPrintf(stderr, "Warning: could not create %s to record the remote source: %s\n",
+                  volumePath.string().c_str(), ec.message().c_str());
+        return;
+    }
+    Json marker = Json::object();
+    marker["url"] = remoteUrl;
+    const auto markerPath = volumePath / ".remote_source.json";
+    std::ofstream out(markerPath);
+    if (!out) {
+        logPrintf(stderr, "Warning: could not write %s\n", markerPath.string().c_str());
+        return;
+    }
+    out << marker.dump(2) << "\n";
+    out.close();
+    if (!out) {
+        logPrintf(stderr, "Warning: could not write %s\n", markerPath.string().c_str());
+        return;
+    }
+    logPrintf(stdout, "Recorded remote source in %s\n", markerPath.string().c_str());
+}
+
 // Sparse pyramids (e.g. lasagna prediction zarrs holding only their scaledown
 // level) keep absent levels as {0,0,0} placeholders, so a pure range check on
 // numLevels() passes and every read at such a level comes back as fill value.
@@ -1011,7 +1051,7 @@ int main(int argc, char *argv[])
     // clang-format off
     po::options_description required("Required arguments");
     required.add_options()
-        ("volume,v", po::value<std::string>()->required(), "Path to the OME-Zarr volume")
+        ("volume,v", po::value<std::string>()->required(), "Path to the local OME-Zarr volume. With --remote-url the volume is streamed instead; this directory can still supply the voxel size (meta.json/metadata.json) and records the remote source in .remote_source.json so later runs can omit --remote-url")
         ("scale", po::value<float>()->required(), "Pixels per level-g voxel (Pg)")
         ("group-idx,g", po::value<int>()->required(), "OME-Zarr group index");
 
@@ -1021,7 +1061,7 @@ int main(int argc, char *argv[])
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
         ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
         ("prefetch-remote", po::bool_switch()->default_value(false), "Prefetch the chunks this render reads into the shared remote cache before rendering")
-        ("remote-url", po::value<std::string>(), "Remote OME-Zarr URL for remote cache streaming/prefetch; fetched chunks persist under the shared remote cache root (optional if --volume cache already records it)")
+        ("remote-url", po::value<std::string>(), "Remote OME-Zarr URL to stream from; fetched chunks persist under the shared remote cache root, not under --volume. Recorded in <volume>/.remote_source.json once the remote volume opens (not when --volume is a URL or a local zarr), after which it can be omitted")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
         ("timeout", po::value<int>()->default_value(0), "Kill process if not finished within N minutes")
         ("num-slices,n", po::value<int>()->default_value(1), "Number of slices to render")
@@ -1324,6 +1364,7 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
             logPrintf(stdout, "Remote zarr streaming: %s\n", remoteUrl.c_str());
+            saveRemoteSourceMarker(vol_path, remoteUrl);
         } catch (const std::exception& e) {
             logPrintf(stderr, "Error opening remote zarr: %s\n", e.what());
             return EXIT_FAILURE;
