@@ -330,6 +330,32 @@ class Volume:
                     f"Warning: Could not find config file at expected locations: {possible_paths}. Will try default: {self.configs}")
                 # Error will be raised in get_url_from_yaml if file truly doesn't exist
 
+            # --- Infer the scroll for a segment given without one ---
+            # Volume(type="segment", segment_id=...) is the documented form, but
+            # energy/resolution are keyed by scroll, so without this the lookup
+            # fails on scroll_id=None.
+            if self.type == "segment" and self.scroll_id is None:
+                if not self.configs or not os.path.exists(self.configs):
+                    # Distinguish "no config to look in" from "segment not listed",
+                    # and keep the error type the same as get_url_from_yaml's.
+                    raise FileNotFoundError(
+                        f"Configuration file not found at {self.configs}. It is needed to "
+                        f"determine which scroll segment {self.segment_id} belongs to, and "
+                        f"again to resolve the segment's URL. Restore scrolls.yaml, or open "
+                        f"the data directly with Volume(type='zarr', path=...).")
+                inferred = self._infer_scroll_from_segment()
+                if inferred is None:
+                    raise ValueError(
+                        f"Segment {self.segment_id} was not found in {self.configs}. "
+                        f"Pass scroll_id explicitly if it lives elsewhere.")
+                self.scroll_id, inferred_energy, inferred_resolution = inferred
+                if energy is None:
+                    energy = inferred_energy
+                if resolution is None:
+                    resolution = inferred_resolution
+                if self.verbose:
+                    print(f"Inferred scroll_id={self.scroll_id} for segment {self.segment_id}")
+
             # --- Energy & Resolution ---
             self.energy = energy if energy is not None else self.grab_canonical_energy()
             self.resolution = resolution if resolution is not None else self.grab_canonical_resolution()
@@ -540,6 +566,38 @@ class Volume:
                     stack.append((list(value.items()), path + [key]))
 
         return None, None, None, None
+
+    def _infer_scroll_from_segment(self) -> Optional[Tuple[str, int, float]]:
+        """Find which scroll a segment belongs to by scanning the config.
+
+        Returns (scroll_id, energy, resolution) for the first entry whose
+        ``segments`` map contains ``self.segment_id``. Returns None if the
+        config does not exist, or if it exists but does not list the segment.
+        A config that exists but cannot be read or parsed raises, rather than
+        being reported later as a missing segment.
+        """
+        if not self.configs or not os.path.exists(self.configs):
+            return None
+        with open(self.configs, 'r') as file:
+            config_data: Dict = yaml.safe_load(file)
+        if not config_data:
+            # Same complaint get_url_from_yaml already makes, raised here so an
+            # empty config is not reported as a missing segment.
+            raise ValueError(f"Config file {self.configs} is empty or invalid YAML.")
+
+        target = str(self.segment_id)
+        for scroll_id, energies in config_data.items():
+            if not isinstance(energies, dict):
+                continue
+            for energy, resolutions in energies.items():
+                if not isinstance(resolutions, dict):
+                    continue
+                for resolution, entry in resolutions.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    if target in (entry.get("segments") or {}):
+                        return str(scroll_id), int(energy), float(resolution)
+        return None
 
     def get_url_from_yaml(self) -> str:
         """Retrieves the data URL/path from the YAML config file."""
