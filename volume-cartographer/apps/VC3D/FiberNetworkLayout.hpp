@@ -242,12 +242,45 @@ struct GlobalResult {
     // may be underconstrained for a reason the fibers themselves can't show.
     int gatedSegmentCount = 0;
     int tangentialCount = 0;
+    // The sheet model, for distances along the sheet rather than along the
+    // map: the fibers' umbilicus radius fitted as a straight line in the
+    // winding coordinate, r(W) = sheetRadius0Vx + sheetPitchVx * W. That is
+    // an Archimedean spiral, which a scroll is to first order, and it costs
+    // one pass over samples the solve already holds. Fitted over the samples
+    // of anchored, drawable fibers; when they span too little winding to fix
+    // a slope, or the fit is not a sensible spiral (radius or pitch not
+    // positive), the model falls back to r0 = rRefVx, pitch = 0, and sheet
+    // distance degrades to the map's own arclength at rRef. See SheetModel.
+    double sheetRadius0Vx = 0.0;
+    double sheetPitchVx = 0.0;
     // Phase timings (milliseconds), for the rebuild's one-line profile.
     double prepMs = 0.0;
     double detectMs = 0.0;
     double solveMs = 0.0;
     double geometryMs = 0.0;
 };
+
+// Distance along the sheet as a function of map position. The map's x is
+// theta * rRef, arclength at one reference radius, which understates the
+// outer windings and overstates the inner ones; with the radius modelled as
+// r(W) = radius0 + pitch * W the distance from winding 0 to winding W is the
+// integral of r over the angle, 2*pi*(radius0*W + pitch*W^2/2). All voxels.
+struct SheetModel {
+    double rRefVx = 0.0;
+    double radius0Vx = 0.0;
+    double pitchVx = 0.0;
+};
+
+// Sheet distance (voxels, signed) from winding 0 to the sheet position drawn at
+// scene x. Monotonic wherever the modelled radius is positive.
+[[nodiscard]] double sheetDistanceVx(const SheetModel& model, double xVx);
+// Inverse of sheetDistanceVx: the scene x at which the sheet distance reads
+// distanceVx. NaN when no such position exists (the modelled radius would have
+// to be negative there) or the model is degenerate (rRef or radius0 not
+// positive).
+[[nodiscard]] double sheetXForDistanceVx(const SheetModel& model, double distanceVx);
+// The sheet model a result carries.
+[[nodiscard]] SheetModel sheetModelOf(const GlobalResult& result);
 
 // 128-bit content digest (two independent FNV-1a lanes over raw bytes).
 // Collisions are the design's one stated deviation from literal exactness:

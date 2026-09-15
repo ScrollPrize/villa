@@ -301,6 +301,33 @@ private slots:
         }
     }
 
+    // A mirrored scroll fits the same sheet model: the winding coordinate
+    // still grows outward, so the pitch keeps its sign and size.
+    void sheetModelSurvivesMirroring()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers =
+            makeWeave(100, QStringLiteral("a-"), 30000.0, 4000.0, 300.0,
+                      -0.4, kTwoPi + 0.4, {100, 100 + kStepsPerTurn});
+        const GlobalResult forward =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        for (InputFiber& fiber : fibers) {
+            for (cv::Vec3d& point : fiber.linePoints) {
+                point[1] = -point[1];
+            }
+            for (cv::Vec3d& point : fiber.controlPoints) {
+                point[1] = -point[1];
+            }
+        }
+        const GlobalResult mirrored =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QCOMPARE(mirrored.chirality, -forward.chirality);
+        QVERIFY(forward.sheetPitchVx > 0.0);
+        QVERIFY2(std::abs(mirrored.sheetPitchVx - forward.sheetPitchVx) < 1e-6 * forward.sheetPitchVx,
+                 qPrintable(QString::number(mirrored.sheetPitchVx)));
+        QVERIFY(std::abs(mirrored.sheetRadius0Vx - forward.sheetRadius0Vx) < 1e-6 * forward.sheetRadius0Vx);
+    }
+
     // A mirrored scroll (opposite chirality) produces the same map: the
     // winding coordinate still grows outward and crossings still coincide.
     void mirroredChiralityLaysOutTheSameMap()
@@ -685,6 +712,107 @@ private slots:
             tweaked.solveMs += 100.0;
             QVERIFY(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline);
         }
+    }
+
+    // The sheet model recovers an Archimedean weave's pitch and inner radius,
+    // and the distance functions invert each other and integrate the modelled
+    // radius over the angle.
+    void sheetModelRecoversArchimedeanPitch()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        constexpr double kRadius = 4000.0;
+        constexpr double kPitch = 300.0;
+        const std::vector<InputFiber> fibers =
+            makeWeave(100, QStringLiteral("a-"), 30000.0, kRadius, kPitch,
+                      -0.4, kTwoPi + 0.4, {100, 100 + kStepsPerTurn});
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QVERIFY(result.sheetPitchVx > 0.0);
+        QVERIFY2(std::abs(result.sheetPitchVx - kPitch) < 0.02 * kPitch,
+                 qPrintable(QString::number(result.sheetPitchVx)));
+        // The fixture's radius at theta = 0 is kRadius; winding 0 sits at the
+        // innermost anchored winding, within a turn of that angle, so the
+        // fitted radius at winding 0 lands within one pitch of it.
+        QVERIFY2(std::abs(result.sheetRadius0Vx - kRadius) < 1.5 * kPitch,
+                 qPrintable(QString::number(result.sheetRadius0Vx)));
+
+        const vc3d::fiber_map::SheetModel model = vc3d::fiber_map::sheetModelOf(result);
+        QCOMPARE(model.rRefVx, result.rRefVx);
+        QCOMPARE(vc3d::fiber_map::sheetDistanceVx(model, 0.0), 0.0);
+        // One winding out along the map is the integral of r over one turn.
+        const double circumference = kTwoPi * result.rRefVx;
+        const double oneTurn = vc3d::fiber_map::sheetDistanceVx(model, circumference);
+        QVERIFY(std::abs(oneTurn - kTwoPi * (result.sheetRadius0Vx +
+                                            0.5 * result.sheetPitchVx)) < 1e-6);
+        // Outer windings are longer than inner ones, and the map's own
+        // arclength lies between them.
+        const double secondTurn =
+            vc3d::fiber_map::sheetDistanceVx(model, 2.0 * circumference) - oneTurn;
+        QVERIFY(secondTurn > oneTurn);
+        // Round trip through the inverse, on both sides of winding 0.
+        for (double x : {-0.5 * circumference, 0.0, 0.3 * circumference,
+                         2.7 * circumference}) {
+            const double distance = vc3d::fiber_map::sheetDistanceVx(model, x);
+            const double back = vc3d::fiber_map::sheetXForDistanceVx(model, distance);
+            QVERIFY2(std::abs(back - x) < 1e-6,
+                     qPrintable(QStringLiteral("%1 -> %2 -> %3").arg(x).arg(distance).arg(back)));
+        }
+        // A distance no positive radius can reach has no position.
+        QVERIFY(std::isnan(vc3d::fiber_map::sheetXForDistanceVx(model, -1e12)));
+
+        // A vanishingly small positive pitch must not lose the answer to
+        // cancellation: the inverse tends smoothly to the linear case.
+        {
+            const vc3d::fiber_map::SheetModel tiny{4000.0, 4000.0, 1e-14};
+            const double x = kTwoPi * 4000.0;
+            const double distance = vc3d::fiber_map::sheetDistanceVx(tiny, x);
+            const double back = vc3d::fiber_map::sheetXForDistanceVx(tiny, distance);
+            QVERIFY2(std::abs(back - x) < 1e-6 * x, qPrintable(QString::number(back)));
+        }
+
+        // The model is part of the result's identity.
+        const ContentDigest baseline = vc3d::fiber_map::digestGlobalResult(result);
+        GlobalResult tweaked = result;
+        tweaked.sheetPitchVx += 1.0;
+        QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        tweaked = result;
+        tweaked.sheetRadius0Vx += 1.0;
+        QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+    }
+
+    // Too little winding span to fix a slope: the model falls back to the
+    // reference radius with no pitch, and sheet distance is then exactly the
+    // map's arclength.
+    void sheetModelFallsBackWithoutWindingSpan()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        const std::vector<InputFiber> fibers =
+            makeWeave(100, QStringLiteral("a-"), 30000.0, 4000.0, 300.0,
+                      -0.1, 0.8, {10, 120});
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QVERIFY(!result.fibers.empty());
+        // The fallback under test is the short winding span, not an absence
+        // of anchored fibers: the fit saw samples and had too little span.
+        double lo = std::numeric_limits<double>::infinity();
+        double hi = -std::numeric_limits<double>::infinity();
+        int anchored = 0;
+        for (const GlobalPlacedFiber& fiber : result.fibers) {
+            if (fiber.meta.anchor == GlobalAnchor::Unresolved) {
+                continue;
+            }
+            ++anchored;
+            lo = std::min(lo, fiber.meta.windingLo);
+            hi = std::max(hi, fiber.meta.windingHi);
+        }
+        QVERIFY(anchored > 0);
+        QVERIFY2(hi - lo < 0.5, qPrintable(QString::number(hi - lo)));
+        QCOMPARE(result.sheetPitchVx, 0.0);
+        QCOMPARE(result.sheetRadius0Vx, result.rRefVx);
+        const vc3d::fiber_map::SheetModel model = vc3d::fiber_map::sheetModelOf(result);
+        const double x = 0.37 * kTwoPi * result.rRefVx;
+        QVERIFY(std::abs(vc3d::fiber_map::sheetDistanceVx(model, x) - x) < 1e-9);
+        QVERIFY(std::abs(vc3d::fiber_map::sheetXForDistanceVx(model, x) - x) < 1e-9);
     }
 
     // Equal labels tie-break by fileName, never by the runtime id: swapping

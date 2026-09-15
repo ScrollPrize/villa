@@ -285,6 +285,24 @@ add_test(NAME fiber_save_batch_tracker COMMAND test_fiber_save_batch_tracker)
 vc_register_test_target(test_fiber_save_batch_tracker)
 vc_register_ctest(fiber_save_batch_tracker test_fiber_save_batch_tracker)
 
+add_executable(test_fiber_runtime_ids
+    test_fiber_runtime_ids.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberRuntimeIds.hpp)
+
+set_target_properties(test_fiber_runtime_ids PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_runtime_ids PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_fiber_runtime_ids PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_runtime_ids COMMAND test_fiber_runtime_ids)
+vc_register_test_target(test_fiber_runtime_ids)
+vc_register_ctest(fiber_runtime_ids test_fiber_runtime_ids)
+
 add_executable(test_fiber_network_layout
     test_fiber_network_layout.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.cpp
@@ -432,6 +450,42 @@ target_link_libraries(test_fiber_map_rebuild_queue PRIVATE
 add_test(NAME fiber_map_rebuild_queue COMMAND test_fiber_map_rebuild_queue)
 vc_register_test_target(test_fiber_map_rebuild_queue)
 vc_register_ctest(fiber_map_rebuild_queue test_fiber_map_rebuild_queue)
+
+add_executable(test_fiber_map_ruler_math
+    test_fiber_map_ruler_math.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapRulerMath.hpp)
+
+set_target_properties(test_fiber_map_ruler_math PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_map_ruler_math PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_fiber_map_ruler_math PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_map_ruler_math COMMAND test_fiber_map_ruler_math)
+vc_register_test_target(test_fiber_map_ruler_math)
+vc_register_ctest(fiber_map_ruler_math test_fiber_map_ruler_math)
+
+add_executable(test_line_annotation_fiber_deletion
+    test_line_annotation_fiber_deletion.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberDeletion.hpp)
+
+set_target_properties(test_line_annotation_fiber_deletion PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_line_annotation_fiber_deletion PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_line_annotation_fiber_deletion PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME line_annotation_fiber_deletion COMMAND test_line_annotation_fiber_deletion)
+vc_register_test_target(test_line_annotation_fiber_deletion)
+vc_register_ctest(line_annotation_fiber_deletion test_line_annotation_fiber_deletion)
 
 add_executable(test_line_annotation_optimization_queue
     test_line_annotation_optimization_queue.cpp

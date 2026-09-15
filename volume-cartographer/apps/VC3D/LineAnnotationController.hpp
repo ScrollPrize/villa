@@ -32,6 +32,7 @@
 #include "AnnotationFrame.hpp"
 #include "UmbilicusOrientationFreshness.hpp"
 #include "LineAnnotationFiberClassification.hpp"
+#include "LineAnnotationFiberDeletion.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
@@ -156,8 +157,8 @@ public:
     struct FiberMapFiber {
         // Runtime id, valid only for the generation this snapshot was taken in.
         uint64_t id = 0;
-        // Stable identity across loads; the runtime id is reassigned per load,
-        // so anything acted on later must be resolved from this.
+        // Stable identity across loads; anything acted on later is resolved
+        // from this.
         std::string fileName;
         // "<file prefix>-<sequence>", e.g. "kb-604".
         QString label;
@@ -302,7 +303,11 @@ public:
     void openFiberAtLinePointIndex(uint64_t fiberId, int linePointIndex);
     void openFiberSpan(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
     void deleteFiber(uint64_t fiberId);
-    void deleteFibers(std::vector<uint64_t> fiberIds);
+    // Deletes the requested fibers' files and drops them from the package.
+    // Returns what was done in terms of the file names captured before the
+    // save drain (see LineAnnotationFiberDeletion.hpp): a fiber can vanish,
+    // or the package can change, while the drain yields to the event loop.
+    vc3d::line_annotation::FiberDeleteOutcome deleteFibers(std::vector<uint64_t> fiberIds);
     void renameFiberFile(uint64_t fiberId);
     void importFibers();
     void exportFibers();
@@ -372,6 +377,9 @@ public:
     [[nodiscard]] uint64_t fiberIdForFilePath(const std::filesystem::path& path) const;
     // First loaded filename match; use the full path when sources may overlap.
     [[nodiscard]] uint64_t fiberIdForFileName(const std::string& fileName) const;
+    // Whether the fiber with this runtime id is loaded under this file name
+    // (a caller that captured both before a yield checks they still agree).
+    [[nodiscard]] bool hasLoadedFiber(uint64_t fiberId, const std::string& fileName) const;
     // Display name as shown in the fiber panel (file stem, "unnamed" fallback).
     [[nodiscard]] QString fiberDisplayName(uint64_t fiberId) const;
     // File stem of a fiber by id (live session first, then stored), or
@@ -916,13 +924,16 @@ private:
             const LineAnnotationSession& session,
             vc3d::line_annotation::FiberOptimizationMode clickedMode,
             vc3d::line_annotation::FiberOptimizationMode candidateMode);
-    // fileNames, not runtime ids: ids are densely reassigned on reloads,
-    // which can happen while the prompt's modal spins.
+    // fileNames, not runtime ids: a fiber can be deleted, and the package
+    // can change, while the prompt's modal spins.
     void reoptimizeMergedFibers(const std::vector<std::string>& fiberFileNames);
     void emitFiberSummaries();
     void addKnownFiberTags(const std::vector<std::string>& tags);
     [[nodiscard]] std::filesystem::path fibersRootDir() const;
     [[nodiscard]] std::filesystem::path fibersDir() const;
+    [[nodiscard]] std::filesystem::path primaryFiberSourceRoot() const;
+    [[nodiscard]] bool fiberNameOwnedByLiveFiber(const std::filesystem::path& sourceRoot,
+                                                 const std::string& fileName) const;
     // Base grid the fiber's stored geometry lives in: the shape stored in the
     // fiber itself, else the manifest its trace spans recorded, else the
     // package's selected fiber-inference dataset (see
@@ -943,6 +954,7 @@ private:
                               LineAnnotationSession& session,
                               const std::filesystem::path& atlasDir);
     [[nodiscard]] uint64_t nextFiberId() const;
+    void forgetFiberRuntimeBinding(uint64_t fiberId);
     [[nodiscard]] uint64_t nextFiberSequenceForUsername(const std::string& username) const;
     [[nodiscard]] std::string currentFiberUsername() const;
     [[nodiscard]] static std::string currentFiberDateTimeString();
@@ -1138,6 +1150,11 @@ private:
     std::map<std::filesystem::path, std::filesystem::path> _fiberSourceRedirects;
     // dropped (sourceRoot/fileName) -> surviving key, rebuilt on every load.
     std::unordered_map<std::string, std::string> _loadedFiberLinkAliases;
+    // Runtime id -> source-qualified file key as of the last non-empty fiber
+    // list, so a reload can follow an open session's link to a copy the
+    // dedupe dropped through _loadedFiberLinkAliases to its survivor. See
+    // loadFibersForCurrentPackage.
+    std::unordered_map<uint64_t, std::string> _formerFiberKeyById;
     std::vector<std::string> _knownFiberTags;
     std::unordered_map<uint64_t, CachedFiberAlignmentMetrics> _fiberAlignmentMetrics;
     std::unordered_set<uint64_t> _pendingFiberAlignmentMetrics;
@@ -1197,6 +1214,13 @@ private:
     uint64_t _fiberDataGeneration = 1;
     // See packageGeneration(); starts at 1 for the same reason.
     uint64_t _packageGeneration = 1;
+    // Counts loads of the fiber list. A load that yields to the event loop
+    // before publishing (the broken-link prompt, the repair-error dialog)
+    // compares its own number against this afterwards and stands down if a
+    // newer load ran meanwhile, instead of publishing an older list over it.
+    // This covers those pre-publication continuations only; the loader is
+    // not otherwise reentrant-safe.
+    uint64_t _fiberLoadSequence = 0;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;
@@ -1297,6 +1321,9 @@ private:
         vc3d::line_annotation::FiberOptimizationMode)>
         _mergeModePicker;
     bool _errorDialogsSuppressed = false;
+    // deleteFibers is running (it yields to the event loop while draining
+    // saves); a second delete meanwhile is refused.
+    bool _deletingFibers = false;
     // Deduplicates the deferred re-optimization prompt across reentrant
     // fiber (re)loads.
     bool _reoptimizationPromptPending = false;

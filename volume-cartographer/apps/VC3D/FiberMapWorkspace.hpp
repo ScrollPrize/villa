@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "vc/core/util/ScrollUmbilicus.hpp"
@@ -23,6 +24,9 @@
 #include "FiberMapStaleness.hpp"
 #include "FiberNetworkLayout.hpp"
 
+class FiberMapRuler;
+struct FiberMapRulerModel;
+struct FiberMapRulerStyle;
 class LineAnnotationController;
 class QDockWidget;
 class QEvent;
@@ -31,6 +35,7 @@ class QGraphicsPathItem;
 class QGraphicsScene;
 class QLabel;
 class QMouseEvent;
+class QPainter;
 class QHideEvent;
 class QPushButton;
 class QShowEvent;
@@ -41,12 +46,21 @@ class QWheelEvent;
 // Pan/zoom view of the fiber map, with the same gestures as the volume viewers:
 // right-drag pans, the wheel zooms. Left clicks are reported as selection
 // requests; ctrl+right-click without a drag asks for the control-point menu.
+// Three axes are painted over the viewport in the foreground pass - windings
+// above the scroll ceiling, sheet distance below the floor, height left of
+// the map - each floating at its extent edge while that is on screen and
+// clamped to the viewport edge once it is not, so whatever is in view is
+// labelled.
 class FiberMapView : public QGraphicsView
 {
     Q_OBJECT
 
 public:
     explicit FiberMapView(QWidget* parent = nullptr);
+    ~FiberMapView() override;
+
+    void setRulerModel(const FiberMapRulerModel& model);
+    void setRulerStyle(const FiberMapRulerStyle& style);
 
 signals:
     void clicked(QPointF scenePos);
@@ -60,8 +74,14 @@ protected:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    // The axes, drawn in viewport coordinates over everything in the scene.
+    void drawForeground(QPainter* painter, const QRectF& rect) override;
+    // Tooltips over an axis band explain the axis.
+    bool viewportEvent(QEvent* event) override;
 
 private:
+    // Owned; plain painter objects, not widgets.
+    std::vector<std::unique_ptr<FiberMapRuler>> _rulers;
     // Right-button press position, against which the pan is called a drag (and
     // the ctrl+right menu suppressed), plus the running pan reference.
     QPoint _pressPosition;
@@ -230,7 +250,27 @@ private:
     void paintFiberEmphasis(FiberEntry& entry, FiberEmphasis emphasis);
     void clearControlPointDots();
     void handleSceneClick(const QPointF& scenePos);
+    // Ctrl+right-click on the map: acts on the selected fiber, and only when
+    // the click lands on it. "Go to control point" when a dot was hit, and
+    // "Delete" always.
     void handleControlPointMenu(const QPointF& scenePos, const QPoint& globalPos);
+    // Right-click on a fiber row of the dock: selects the row, then offers
+    // the same Delete.
+    void handleTreeContextMenu(const QPoint& pos);
+    // The confirmed delete both menus end in. Runs outside the menus' nested
+    // event loops; the fiber must still be loaded under the same id and file
+    // name after the confirmation dialog, and nothing happens if the map's
+    // dependencies moved since the menu was built.
+    void confirmAndDeleteFiber(uint64_t fiberId,
+                               const std::string& fileName,
+                               const QString& displayName,
+                               const vc3d::fiber_map::FiberMapDependencies& menuDependencies);
+    // The delete itself, queued out of the confirmation dialog's signal:
+    // dependencies re-checked, the fiber re-checked by id and name, then the
+    // controller's deleteFibers behind a lifetime guard.
+    void deleteConfirmedFiber(uint64_t fiberId,
+                              const std::string& fileName,
+                              const vc3d::fiber_map::FiberMapDependencies& menuDependencies);
     void selectFiberRow(uint64_t fiberId);
     [[nodiscard]] uint64_t fiberAt(const QPointF& scenePos) const;
     [[nodiscard]] double sceneTolerance(double viewPixels) const;
@@ -297,6 +337,11 @@ private:
     QTimer* _stalePollTimer = nullptr;
     bool _fiberDockSized = false;
     bool _retheming = false;
+    // A delete is confirmed-or-pending: from the confirmation dialog opening
+    // until the queued delete has run (or the dialog was dismissed). One at a
+    // time, because the controller's delete yields to the event loop while it
+    // drains saves.
+    bool _deleteInFlight = false;
     // What the current layout was built from, and whether a change has been seen
     // since; a fresh workspace is stale until its first rebuild.
     uint64_t _layoutGeneration = 0;
