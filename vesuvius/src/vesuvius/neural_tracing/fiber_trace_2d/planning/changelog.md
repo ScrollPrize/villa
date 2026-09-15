@@ -1,3 +1,8 @@
+## 2026-09-14 — Evaluation-ablation merge and final EMA999
+
+- Merged evaluation-ablations into fiber-vischeck at afb14b400 preserving both feature sets, our four active task docs and combined changelog. Parameter-based cache extension replaces obsolete implementation-hash gates; native heartbeat stops after process exit. Validated102native cases and206Python tests (8skipped).
+- Final EMA999u11800 full50fiber eval+vis completed:113restarts/60.242mm mean versus119/57.230mm at u10200;0332/1299 regress, equal-scroll score61.052591 versus69.041084. All180renders and per-fiber index complete. Five-model comparison: docs/benchmarks/eligible_ema999_final_u11800_20260914.md.
+
 ## 2026-09-14 — Combined fiber inspection and resumable inference
 
 - Current EMA999 u10200 full matched evaluation:119restarts vs148 forEMA99u5200,
