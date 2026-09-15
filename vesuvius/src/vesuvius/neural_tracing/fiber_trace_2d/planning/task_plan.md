@@ -1,14 +1,17 @@
-# Plan
+# Refinement planning handoff
 
-1. Archive prior evaluation log; clone its config changing only output root,render=true,manager label. Keep exact frozen SHA and namespace/parameters. No new training snapshot.
-2. Independent review. Reuse tested workspace renderer and approved runner prepare/validate-full/full, all8GPUs manager-exclusive priority100 for missing visual-support inference; existing chunks reused.
-3. Continue until180directed galleries complete. Validate identical trace JSON/metrics versus nonvisual run, shared top/side component bounds and section centers; inspect representative image. Save full per-fiber index and output links.
+1. Preserve prior evaluation and contrastive restart notes in
+   fiber_vischeck_handoff/ and contrastive_restart/.
+2. Carry pending contrastive configuration, tests and launcher selection onto
+   fiber-vischeck; validate and commit without changing running jobs.
+3. Define training-time GT refinement behavior with the user before developing
+   the detailed implementation plan and independent review.
 
 ## Spec update
-None: retain aligned CT/presence top/side strips,2basevoxels/pixel,actual restart endpoint sections,40/80ellipse and current eligibility/restart metrics.
+None at branch handoff. Refinement semantics remain to be specified.
 
 ## Docs updates
-New visualization benchmark record, current log/status and changelog. Archive prior active log.
+Archive prior work and record branch/commit validation in task_log.md.
 
 ## Validation
-Config equality except output/render/job label; source bindings and frozen SHA validation;180galleries,alltrace/metric parity and actual image inspection. No code changes or rebuild needed.
+Approved CPU training-spans suite and git diff --check. No GPU jobs.

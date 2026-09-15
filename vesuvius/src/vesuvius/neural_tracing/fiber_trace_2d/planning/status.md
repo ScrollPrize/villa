@@ -1,5 +1,4 @@
-- [x] Read workflow and prepare plan
-- [x] Independent review/config validation
-- [ ] Full visualization stopped at user request; partial images retained
-- [x] All180 replay payloads identical; case60 inspected, completed component bounds aligned
-- [x] Worst-fiber report and partial-run log saved
+- [x] Branch from fiber-vischeck; carry contrastive restart changes.
+- [x] Archive both sets of prior planning notes.
+- [x] Validate and commit branch handoff.
+- [ ] Define training-time GT refinement requirements and detailed plan.

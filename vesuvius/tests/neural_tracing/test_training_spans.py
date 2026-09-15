@@ -136,3 +136,21 @@ def test_local_corpus_eligible_coverage():
                         np.testing.assert_array_equal(part.line_points_xyz[[0, -1]], part.control_points_xyz[[0, -1]])
         assert len(counts) == 5 and all(r[1] > 0 and r[2] > 0 for r in counts.values())
         print("eligible corpus", split, json.dumps(counts, sort_keys=True))
+
+
+def test_paired_contrastive_config_preserves_regular_settings():
+    path = CONFIG.with_name("train_5scroll_json_eligible_paired_contrastive_ema_16x8.json")
+    raw = json.loads(path.read_text())
+    base = json.loads(CONFIG.read_text())
+    old = json.loads(CONFIG.with_name("train_combined_5scroll_s1a_paired_contrastive_ema_16x8.json").read_text())
+    assert raw.pop("embedding") == old["embedding"]
+    base.pop("embedding")
+    assert module.load_config(path).embedding.paired_patches
+    for split in ("datasets", "test_datasets"):
+        for dataset in raw[split]:
+            normal = Path(dataset.pop("lasagna_manifest_path"))
+            if not normal.is_absolute():
+                assert (CONFIG.parent / normal).is_file()
+    raw["training"].pop("run_name")
+    base["training"].pop("run_name")
+    assert raw == base

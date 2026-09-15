@@ -31,6 +31,14 @@ run was launched as `5scroll_json_eligible_128_sd1_16x8_ema_20260914_105436` in
 `/ephemeral/hendrik/fiber3d_train2/runs`. It completed startup calibration and
 entered adaptive training; manager scheduling may pause/resume it.
 
+The subsequent contrastive variant is
+`train_5scroll_json_eligible_paired_contrastive_ema_16x8.json`: identical regular
+settings plus16 embedding channels, paired local contrastive loss (64pairs per
+128patch update), prior normal manifests, temperature0.1/margin0.2/weight1.
+Both patches belong to the same retained component. No NML is reintroduced.
+On user request the regular run was stopped and this variant launched fresh
+at20260914_164401, without resuming weights. Its config equivalence test passed.
+
 ## Verification
 
 Approved caller: `vesuvius/scripts/run_fiber3d_cooperative_tests`, selecting

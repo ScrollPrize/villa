@@ -1,3 +1,6 @@
-# EMA999 u10200 visualization
+# Fiber training-data refinement
 
-Render the full50fiber evaluation for the same frozen EMA999u10200 snapshot just evaluated. Reuse inference and corrected aligned combined CT/presence strips, restart sections and per-fiber index/statistics.
+Next user goal: refine fiber ground truth/training data while training.
+This branch starts from fiber-vischeck and includes the contrastive training
+restart configuration. Detailed refinement behavior is not specified yet;
+no refinement implementation or new training is authorized by this handoff.
