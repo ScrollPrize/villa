@@ -313,7 +313,7 @@ if(VC_RUN_E2E)
 endif()
 
 add_executable(test_obj2tifxyz_e2e test_obj2tifxyz_e2e.cpp)
-target_link_libraries(test_obj2tifxyz_e2e PRIVATE doctest::doctest nlohmann_json::nlohmann_json)
+target_link_libraries(test_obj2tifxyz_e2e PRIVATE doctest::doctest vc_core nlohmann_json::nlohmann_json)
 vc_register_test_target(test_obj2tifxyz_e2e)
 if(VC_RUN_E2E)
     add_test(NAME test_obj2tifxyz_e2e COMMAND test_obj2tifxyz_e2e)

@@ -1,21 +1,12 @@
-// End-to-end test for vc_obj2tifxyz on a synthetic planar mesh with UVs
-// normalised to [0,1], the parametrisation of the published segment OBJs.
-//
-// Covers two regressions:
-//   - #1320: with the default stretch factor the 2x2 grid covers only the UV
-//     bounding-box corners; a mesh that does not reach them (a diamond, like
-//     the published meshes whose corners are cut) rasterizes nothing and the
-//     tool must exit non-zero instead of writing an empty tifxyz.
-//   - #1319: meta.json "scale" must be grid cells per OBJ unit measured from
-//     the grid actually written (a 10-unit spacing stores 0.1), not the UV
-//     step, and decimation must be reflected in it.
-//
-// Opt-in: only runs when VC_RUN_E2E is set to "1".
-
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "vc/core/util/QuadSurface.hpp"
+
 #include <nlohmann/json.hpp>
+
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
 
 #include <cstdlib>
 #include <filesystem>
@@ -63,8 +54,7 @@ fs::path findVcObj2Tifxyz()
     return {};
 }
 
-// kGrid x kGrid planar mesh, vertices kSpacing apart at z=100, UVs in [0,1].
-void writeNormalisedPlaneObj(const fs::path& obj)
+void writePlaneObj(const fs::path& obj, double uvStep)
 {
     std::ofstream f(obj);
     f.precision(9);
@@ -75,8 +65,7 @@ void writeNormalisedPlaneObj(const fs::path& obj)
     }
     for (int r = 0; r < kGrid; ++r) {
         for (int c = 0; c < kGrid; ++c) {
-            f << "vt " << static_cast<double>(c) / (kGrid - 1) << ' '
-              << static_cast<double>(r) / (kGrid - 1) << '\n';
+            f << "vt " << c * uvStep << ' ' << r * uvStep << '\n';
         }
     }
     auto idx = [](int r, int c) { return r * kGrid + c + 1; };
@@ -89,14 +78,28 @@ void writeNormalisedPlaneObj(const fs::path& obj)
     }
 }
 
-// Four triangles forming a diamond whose UV bounding box is [0,1]^2 but whose
-// corners (0,0), (1,0), (0,1), (1,1) lie outside the mesh.
 void writeDiamondObj(const fs::path& obj)
 {
     std::ofstream f(obj);
     f << "v 50 0 100\nv 100 50 100\nv 50 100 100\nv 0 50 100\nv 50 50 100\n"
       << "vt 0.5 0\nvt 1 0.5\nvt 0.5 1\nvt 0 0.5\nvt 0.5 0.5\n"
       << "f 1/1 2/2 5/5\nf 2/2 3/3 5/5\nf 3/3 4/4 5/5\nf 4/4 1/1 5/5\n";
+}
+
+void writeSourceTifxyz(const fs::path& dir)
+{
+    cv::Mat_<cv::Vec3f> pts(kGrid, kGrid);
+    for (int r = 0; r < kGrid; ++r) {
+        for (int c = 0; c < kGrid; ++c) {
+            pts(r, c) = cv::Vec3f(static_cast<float>(c * kSpacing),
+                                  static_cast<float>(r * kSpacing), 100.f);
+        }
+    }
+    const float s = static_cast<float>(1.0 / kSpacing);
+    QuadSurface surf(pts, cv::Vec2f(s, s));
+    surf.path = dir;
+    surf.id = dir.filename().string();
+    surf.save(dir.string(), surf.id, false);
 }
 
 int run(const fs::path& bin, const std::string& args, const fs::path& log)
@@ -114,9 +117,17 @@ nlohmann::json readMeta(const fs::path& dir)
     return j;
 }
 
+void checkScale(const fs::path& dir, double expected)
+{
+    const auto meta = readMeta(dir);
+    REQUIRE(meta.contains("scale"));
+    CHECK(meta["scale"][0].get<double>() == doctest::Approx(expected).epsilon(0.02));
+    CHECK(meta["scale"][1].get<double>() == doctest::Approx(expected).epsilon(0.02));
 }
 
-TEST_CASE("vc_obj2tifxyz on a normalised-UV mesh")
+}
+
+TEST_CASE("vc_obj2tifxyz writes a scale that describes the emitted grid")
 {
     const char* runFlag = std::getenv("VC_RUN_E2E");
     if (!runFlag || std::string(runFlag) != "1") {
@@ -132,8 +143,13 @@ TEST_CASE("vc_obj2tifxyz on a normalised-UV mesh")
     std::mt19937_64 rng(rd());
     const fs::path root = fs::temp_directory_path() / ("vc_obj2tifxyz_e2e_" + std::to_string(rng()));
     fs::create_directories(root);
-    const fs::path obj = root / "plane.obj";
-    writeNormalisedPlaneObj(obj);
+    const fs::path normalised = root / "normalised.obj";
+    writePlaneObj(normalised, 1.0 / (kGrid - 1));
+    const fs::path metric = root / "metric.obj";
+    writePlaneObj(metric, kSpacing);
+    const fs::path source = root / "source";
+    writeSourceTifxyz(source);
+    const std::string stretch = std::to_string(kGrid - 1);
 
     SUBCASE("default stretch factor rasterizes nothing and must fail")
     {
@@ -147,31 +163,73 @@ TEST_CASE("vc_obj2tifxyz on a normalised-UV mesh")
         CHECK_FALSE(fs::exists(out / "meta.json"));
     }
 
-    SUBCASE("scale is grid cells per OBJ unit measured from the written grid")
+    SUBCASE("a 2 x 2 output grid is refused even when its corners rasterize")
+    {
+        const fs::path out = root / "degenerate";
+        const fs::path log = root / "degenerate.log";
+        INFO("log: ", log.string());
+        CHECK(run(bin, normalised.string() + " " + out.string(), log) != 0);
+        CHECK_FALSE(fs::exists(out / "meta.json"));
+    }
+
+    SUBCASE("normalised UVs: scale is the reciprocal of the measured spacing")
     {
         const fs::path out = root / "stretched";
         const fs::path log = root / "stretched.log";
-        const int rc = run(bin, obj.string() + " " + out.string() + " " + std::to_string(kGrid - 1), log);
         INFO("log: ", log.string());
-        REQUIRE(rc == 0);
-        const auto meta = readMeta(out);
-        REQUIRE(meta.contains("scale"));
-        CHECK(meta["scale"][0].get<double>() == doctest::Approx(1.0 / kSpacing).epsilon(0.02));
-        CHECK(meta["scale"][1].get<double>() == doctest::Approx(1.0 / kSpacing).epsilon(0.02));
+        REQUIRE(run(bin, normalised.string() + " " + out.string() + " " + stretch, log) == 0);
+        checkScale(out, 1.0 / kSpacing);
+    }
+
+    SUBCASE("grid size and scale follow stretch_factor")
+    {
+        for (int s : {20, 80}) {
+            const fs::path out = root / ("stretch-" + std::to_string(s));
+            const fs::path log = root / ("stretch-" + std::to_string(s) + ".log");
+            INFO("stretch ", s, ", log: ", log.string());
+            REQUIRE(run(bin, normalised.string() + " " + out.string() + " " + std::to_string(s), log) == 0);
+            const cv::Mat x = cv::imread((out / "x.tif").string(), cv::IMREAD_UNCHANGED);
+            REQUIRE_FALSE(x.empty());
+            CHECK(x.cols == s + 1);
+            CHECK(x.rows == s + 1);
+            checkScale(out, s / ((kGrid - 1) * kSpacing));
+        }
     }
 
     SUBCASE("decimation halves the scale")
     {
         const fs::path out = root / "decimated";
         const fs::path log = root / "decimated.log";
-        const int rc = run(bin, obj.string() + " " + out.string() + " " + std::to_string(kGrid - 1) +
-                                " --uv-downsample=2", log);
         INFO("log: ", log.string());
-        REQUIRE(rc == 0);
-        const auto meta = readMeta(out);
-        REQUIRE(meta.contains("scale"));
-        CHECK(meta["scale"][0].get<double>() == doctest::Approx(1.0 / (2 * kSpacing)).epsilon(0.02));
-        CHECK(meta["scale"][1].get<double>() == doctest::Approx(1.0 / (2 * kSpacing)).epsilon(0.02));
+        REQUIRE(run(bin, normalised.string() + " " + out.string() + " " + stretch + " --uv-downsample=2", log) == 0);
+        checkScale(out, 1.0 / (2 * kSpacing));
+    }
+
+    SUBCASE("mesh_units does not change the scale")
+    {
+        const fs::path out = root / "mesh-units";
+        const fs::path log = root / "mesh-units.log";
+        INFO("log: ", log.string());
+        REQUIRE(run(bin, normalised.string() + " " + out.string() + " " + stretch + " 7.91", log) == 0);
+        checkScale(out, 1.0 / kSpacing);
+    }
+
+    SUBCASE("source-scale mode keeps the source scale")
+    {
+        const fs::path out = root / "source-scale";
+        const fs::path log = root / "source-scale.log";
+        INFO("log: ", log.string());
+        REQUIRE(run(bin, metric.string() + " " + out.string() + " --tifxyz-source=" + source.string(), log) == 0);
+        checkScale(out, 1.0 / kSpacing);
+    }
+
+    SUBCASE("source-scale mode reduces the scale by the decimation applied")
+    {
+        const fs::path out = root / "source-scale-decimated";
+        const fs::path log = root / "source-scale-decimated.log";
+        INFO("log: ", log.string());
+        REQUIRE(run(bin, metric.string() + " " + out.string() + " --tifxyz-source=" + source.string() + " --uv-downsample=4", log) == 0);
+        checkScale(out, 1.0 / (4 * kSpacing));
     }
 
     fs::remove_all(root);
