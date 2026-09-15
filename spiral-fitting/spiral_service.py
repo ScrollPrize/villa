@@ -76,7 +76,7 @@ from fit_session import (API_VERSION, EDITABLE_PCL_ROLES, FIT_INPUT_CATALOG,
                          validate_session_request)
 from config import (BACKFILLABLE_CONFIG_DEFAULTS,
                     CHECKPOINT_MODEL_SHAPE_KEYS, Config, durable_config,
-                    rebuild_stage)
+                    filter_known_config_keys, rebuild_stage)
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
 from service_artifacts import ArtifactRegistry
@@ -194,7 +194,7 @@ def bind_service_paths(resolution, output_directory, cache_directory):
     return resolution
 
 
-def _validate_run_influence_config(value):
+def _validate_run_influence_config(value, *, warn=print):
     if value is None:
         return {}
     if not isinstance(value, dict):
@@ -213,10 +213,8 @@ def _validate_run_influence_config(value):
         "influence_anchor_ramp_power",
         "loss_weight_anchor",
     }
-    unknown = sorted(set(value) - allowed)
-    if unknown:
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       f"Unknown influence configuration keys: {unknown}")
+    value = filter_known_config_keys(
+        value, allowed, label="influence configuration", warn=warn)
     result = {}
     if "influence_enabled" in value:
         enabled = value["influence_enabled"]
@@ -1854,6 +1852,12 @@ class ServiceState:
             source="service", operation="publishing_preview",
             payload=snapshot, coalesce_key=("preview-publish",))
 
+    def _warn_ignored_config(self, warning):
+        print(warning)
+        self.events.append(
+            "log", warning, severity="warning", source="service",
+            operation="run")
+
     def run(self, request):
         autosave_on_pause = request.get("autosave_on_pause", True)
         if not isinstance(autosave_on_pause, bool):
@@ -1867,8 +1871,13 @@ class ServiceState:
         if expected != self.session_revision:
             raise ApiError(HTTPStatus.CONFLICT, "Session revision is stale")
         configuration = request.get("configuration")
-        if not isinstance(configuration, dict) or \
-                set(configuration) != set(self.config_catalog["defaults"]):
+        if not isinstance(configuration, dict):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "Running requires a complete configuration")
+        configuration = filter_known_config_keys(
+            configuration, self.config_catalog["defaults"],
+            label="run configuration", warn=self._warn_ignored_config)
+        if set(configuration) != set(self.config_catalog["defaults"]):
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "Running requires a complete configuration")
         try:
@@ -1935,7 +1944,7 @@ class ServiceState:
                 HTTPStatus.CONFLICT,
                 "Static dataset inputs cannot be changed by a run")
         influence_config = _validate_run_influence_config(
-            request.get("influence") or {})
+            request.get("influence") or {}, warn=self._warn_ignored_config)
         run_config = changes
         with self.lock:
             self._active_run_influence = dict(influence_config)

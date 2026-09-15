@@ -30,7 +30,7 @@ from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_INTERVAL_ITERATIONS,
                          write_autosave_metadata)
 from config import (BACKFILLABLE_CONFIG_DEFAULTS, RETIRED_CONFIG_KEYS,
                     Config, FitConfig,
-                    durable_config)
+                    durable_config, filter_known_config_keys)
 from spiral_progress import NullProgressReporter, ProgressReporter
 
 
@@ -991,18 +991,15 @@ class InteractiveFitSession:
         # profile.
         config["z_begin"] = int(self.run_config.z_begin)
         config["z_end"] = int(self.run_config.z_end)
-        advanced_config = dict(self.run_config.config)
         # Saved workspace overrides may outlive any setting in the schema.
         # Report and remove unknown keys before applying overrides or counts.
-        unknown = sorted(set(advanced_config) - set(config))
-        if unknown:
-            warning = f"Ignoring unknown advanced config keys: {unknown}"
+        def warn(warning):
             print(warning)
             with self._condition:
                 if warning not in self._warnings:
                     self._warnings.append(warning)
-            for key in unknown:
-                del advanced_config[key]
+        advanced_config = filter_known_config_keys(
+            self.run_config.config, config, label="advanced config", warn=warn)
         if checkpoint_profile_config is not None:
             default_advanced_config = checkpoint_profile_config
         else:
