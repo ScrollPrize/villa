@@ -701,11 +701,12 @@ bool isAvailableOpenDataSegmentsEntry(const VolumePkg& pkg,
         path.string()).empty();
 }
 
-bool isSelectedEditableOpenDataSegmentsEntry(
+bool isSelectedWritableOpenDataSegmentsEntry(
     const VolumePkg& pkg,
     const vc::project::Entry& entry)
 {
-    if (!vc::project::hasEntryTag(entry, "open-data-editable") ||
+    if ((!vc::project::hasEntryTag(entry, "open-data-editable") &&
+         !vc::project::hasEntryTag(entry, "open-data-patches")) ||
         vc::project::isLocationRemote(entry.location)) {
         return false;
     }
@@ -762,7 +763,7 @@ const vc::project::Entry* findOpenDataSegmentsEntryForVolume(const VolumePkg& pk
             continue;
         }
         if (std::find(entry.tags.begin(), entry.tags.end(), targetTag) != entry.tags.end()) {
-            if (isSelectedEditableOpenDataSegmentsEntry(pkg, entry)) {
+            if (isSelectedWritableOpenDataSegmentsEntry(pkg, entry)) {
                 return &entry;
             }
             if (!targetMatch) {
@@ -773,7 +774,7 @@ const vc::project::Entry* findOpenDataSegmentsEntryForVolume(const VolumePkg& pk
         if (std::find(entry.tags.begin(), entry.tags.end(), sourceTag) !=
             entry.tags.end()) {
             if (!sourceMatch ||
-                isSelectedEditableOpenDataSegmentsEntry(pkg, entry)) {
+                isSelectedWritableOpenDataSegmentsEntry(pkg, entry)) {
                 sourceMatch = &entry;
             }
         }
@@ -796,7 +797,7 @@ const vc::project::Entry* findOpenDataSegmentsEntryForLoadedVolume(const VolumeP
             if (isAvailableOpenDataSegmentsEntry(pkg, entry) &&
                 std::find(entry.tags.begin(), entry.tags.end(), coordinateTag) !=
                     entry.tags.end()) {
-                if (isSelectedEditableOpenDataSegmentsEntry(pkg, entry)) {
+                if (isSelectedWritableOpenDataSegmentsEntry(pkg, entry)) {
                     coordinateMatch = &entry;
                     break;
                 }
