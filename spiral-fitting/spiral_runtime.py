@@ -991,9 +991,18 @@ class InteractiveFitSession:
         # profile.
         config["z_begin"] = int(self.run_config.z_begin)
         config["z_end"] = int(self.run_config.z_end)
-        unknown = sorted(set(self.run_config.config) - set(config))
+        advanced_config = dict(self.run_config.config)
+        # Saved workspace overrides may outlive any setting in the schema.
+        # Report and remove unknown keys before applying overrides or counts.
+        unknown = sorted(set(advanced_config) - set(config))
         if unknown:
-            raise ValueError(f"Unknown advanced config keys: {unknown}")
+            warning = f"Ignoring unknown advanced config keys: {unknown}"
+            print(warning)
+            with self._condition:
+                if warning not in self._warnings:
+                    self._warnings.append(warning)
+            for key in unknown:
+                del advanced_config[key]
         if checkpoint_profile_config is not None:
             default_advanced_config = checkpoint_profile_config
         else:
@@ -1009,10 +1018,10 @@ class InteractiveFitSession:
             if key.startswith("sample_count_")
         }
         explicit_sampling_counts.update({
-            key: value for key, value in self.run_config.config.items()
+            key: value for key, value in advanced_config.items()
             if key.startswith("sample_count_")
         })
-        config.update(self.run_config.config)
+        config.update(advanced_config)
         config["z_begin"] = int(self.run_config.z_begin)
         config["z_end"] = int(self.run_config.z_end)
         fields = Config.catalog()["schema"]["fields"]
