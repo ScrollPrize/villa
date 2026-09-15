@@ -4,6 +4,7 @@
 #include <opencv2/core.hpp>
 #include <random>
 #include <memory>
+#include <unordered_map>
 
 namespace vc {
 namespace core {
@@ -66,6 +67,9 @@ private:
     cv::Rect rect;
     int grid_step;
     std::vector<std::shared_ptr<SegmentInfo>> all_segments;
+    // Position of each live segment in all_segments, so remove() does not have to
+    // search for it. Kept in step by add(), and by the swap in remove().
+    std::unordered_map<const SegmentInfo*, size_t> index_of;
     std::vector<std::vector<std::vector<std::weak_ptr<SegmentInfo>>>> grid;
     std::mt19937 gen;
 };
