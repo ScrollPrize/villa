@@ -141,6 +141,10 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
                    "track_exclusion_radius",
                })
     run_mutable_pcl = {
+        "pcl_vertical_fiber_radial_offset_enabled", "pcl_vertical_fiber_radial_offset_voxels",
+        "pcl_link_distance_tolerance", "pcl_link_window_points", "pcl_link_window_min_points",
+        "pcl_fiber_link_side_filter", "pcl_fiber_link_side_margin_voxels", "pcl_fiber_link_model_direction_step",
+
         "pcl_rel_winding_adjacent_patches_only",
         "pcl_stratified_pcl_sampling", "pcl_sampling_weights",
         "pcl_use_fiber_links", "pcl_use_pending_fiber_links",
@@ -162,6 +166,8 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
             assert field["runtime_impact"] == expected, key
     assert unaudited_prefixed_keys(fields) == []
 
+    # The vertical-fiber radial offset is refilled onto retained strips at a
+    # Run boundary; every other pcl_ setting shapes prepared inputs.
 
 def test_rebuild_stage_is_model_only_for_the_allowlist():
     assert rebuild_stage([]) == "model"

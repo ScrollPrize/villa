@@ -20,6 +20,7 @@ from fit_spiral import (
     FitContext,
     _UnattachedPclStripList,
     get_dt_loss_eligibility,
+    get_unattached_pcl_dt_start,
     get_progressive_dt_max_winding,
     get_run_dt_resume_iteration,
     materialize_fiber_fit_inputs,
@@ -46,6 +47,7 @@ class RunDtLossScheduleTests(unittest.TestCase):
             'loss_start_patch_dt': 10,
             'loss_start_track_dt': 20,
             'loss_start_unverified_patch_dt': 30,
+            'loss_start_unattached_pcl_dt': 25,
         }).as_dict()
         resume = 15
         self.assertEqual(get_dt_loss_eligibility(cfg, 14, resume), {
@@ -57,11 +59,25 @@ class RunDtLossScheduleTests(unittest.TestCase):
         # Existing loss starts remain strict `iteration > start` checks.
         at_starts = get_dt_loss_eligibility(cfg, 20, resume)
         self.assertTrue(at_starts['verified_patch'])
-        self.assertTrue(at_starts['unattached_pcl'])
+        self.assertFalse(at_starts['unattached_pcl'])
         self.assertFalse(at_starts['track'])
         self.assertFalse(at_starts['unverified_patch'])
+        self.assertFalse(get_dt_loss_eligibility(cfg, 25, resume)['unattached_pcl'])
+        self.assertTrue(get_dt_loss_eligibility(cfg, 26, resume)['unattached_pcl'])
         after_all = get_dt_loss_eligibility(cfg, 31, resume)
         self.assertTrue(all(after_all.values()))
+
+    def test_unattached_pcl_dt_start_follows_patch_start_when_unset(self):
+        cfg = Config({'loss_start_patch_dt': 10}).as_dict()
+        self.assertIsNone(cfg['loss_start_unattached_pcl_dt'])
+        self.assertEqual(get_unattached_pcl_dt_start(cfg), 10)
+        self.assertFalse(get_dt_loss_eligibility(cfg, 10)['unattached_pcl'])
+        self.assertTrue(get_dt_loss_eligibility(cfg, 11)['unattached_pcl'])
+        decoupled = Config({'loss_start_patch_dt': 10,
+                            'loss_start_unattached_pcl_dt': 0}).as_dict()
+        self.assertEqual(get_unattached_pcl_dt_start(decoupled), 0)
+        self.assertTrue(get_dt_loss_eligibility(decoupled, 1)['unattached_pcl'])
+        self.assertFalse(get_dt_loss_eligibility(decoupled, 1)['verified_patch'])
 
     def test_progressive_winding_cutoff_is_unchanged(self):
         cfg = Config({

@@ -79,8 +79,15 @@ from influence import make_influence_state, subsample_rows
 from spiral_sampling import load_spiral_sampling
 from tifxyz import load_tifxyz, patch_from_payload
 from geom_utils import bilinear_atlas_lookup, interp1d
-from point_collection import (link_points_to_patches, load_point_collection,
-                              normalise_pcl_winding_annotations)
+from point_collection import (
+    PatchLinkOptions,
+    SIDE_BEHIND,
+    SIDE_FRONT,
+    link_points_to_patches,
+    load_point_collection,
+    normalise_pcl_winding_annotations,
+    umbilicus_inward_direction,
+)
 from dt_targets import (
     DtTargetCacheManager,
     compute_patch_dt_target_cache,
@@ -101,6 +108,9 @@ from tracks import (
 from track_graph import TrackGraph
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 from sample_spiral import (
+    RADIAL_OFFSET_STRETCH_EPSILON,
+    get_radial_covector_in_scroll_space,
+    get_radial_normal_stretch,
     get_spiral_points,
     get_theta,
     get_winding_xy,
@@ -133,6 +143,8 @@ from spiral_helpers import (
     load_patches,
     load_fiber_point_collection,
     load_fiber_point_collections,
+    classify_fiber_hv,
+    fiber_collection_hv_tag,
     _decimate_ordered_points_min_spacing,
     resolve_fiber_links,
     build_link_components,
@@ -836,7 +848,9 @@ def regular_unattached_strip(pcl_id, pcl, min_point_spacing):
 
 def materialize_fiber_fit_inputs(
         fiber_catalog, verified_patches, *, z_begin, z_end, z_margin,
-        min_point_spacing, use_links=True, use_pending_links=False):
+        min_point_spacing, use_links=True, use_pending_links=False,
+        vertical_min_z_fraction=0.8, vertical_min_auto_certainty=0.5,
+        vertical_radial_offset=0.0):
     """Derive every CPU training view from the resident fiber catalog.
 
     ``fiber_catalog`` is ordered by logical input id and owns the canonical
@@ -844,6 +858,20 @@ def materialize_fiber_fit_inputs(
     geometry, but trimming and decimation never mutate the catalog's point
     membership. Re-running this function over the same catalog therefore
     produces the same graph and ordered training views.
+
+    Each strip carries ``hv_tag`` ('V', 'H', or None; see
+    spiral_helpers.classify_fiber_hv) and ``is_vertical`` for radial-offset updates.
+    ``radial_offsets`` holds the
+    per-point radial target offset in scroll voxels along the sheet normal,
+    positive in the increasing-winding direction of the fitted spiral (the
+    scan-space winding gradient, not the line to the umbilicus):
+    ``vertical_radial_offset`` on vertical strips (their back-face position
+    relative to the fitted sheet, away from the umbilicus), zero everywhere
+    else.
+    ``radial_offset_bake_scale`` carries each point's accumulated normal
+    stretch through the frozen constraint-bake stack (1 before any bake),
+    read from the catalog point dicts (see accumulate_radial_offset_bake_scale)
+    so the physical offset can be expressed in the resident frame.
     """
     point_collections = {}
     for logical_id, pcl in fiber_catalog.items():
@@ -954,23 +982,39 @@ def materialize_fiber_fit_inputs(
         windings = np.asarray(
             [point['winding_annotation'] for _, point in kept_items],
             dtype=np.float32)
+        bake_scale = np.asarray(
+            [point.get('radial_offset_bake_scale', 1.0)
+             for _, point in kept_items],
+            dtype=np.float32)
         zyxs, keep = _decimate_ordered_points_min_spacing(
             zyxs, min_point_spacing, return_indices=True,
             force_keep=force_keep | {len(zyxs) - 1})
         windings = windings[keep]
+        bake_scale = bake_scale[keep]
         link_points = {
             int(kept_items[original_position][0]): strip_position
             for strip_position, original_position in enumerate(keep)
             if original_position in force_keep
         }
         metadata = pcl.get('metadata', {})
+        hv_tag = classify_fiber_hv(
+            metadata.get('hv_classification'), zyxs,
+            min_z_fraction=vertical_min_z_fraction,
+            min_auto_certainty=vertical_min_auto_certainty)
         strips.append({
             'id': cid,
             'name': pcl.get('name'),
             'source_file': pcl.get('source_file'),
             'zyxs': zyxs,
             'windings': windings,
+            'radial_offsets': np.full(
+                len(zyxs),
+                float(vertical_radial_offset) if hv_tag == 'V' else 0.0,
+                dtype=np.float32),
+            'radial_offset_bake_scale': bake_scale,
             'link_points': link_points,
+            'hv_tag': hv_tag,
+            'is_vertical': hv_tag == 'V',
             'logical_input_kind': 'fiber',
             'logical_input_id': metadata.get('logical_input_id'),
             'logical_input_revision': metadata.get('logical_input_revision'),
@@ -982,34 +1026,110 @@ def materialize_fiber_fit_inputs(
 
 
 def _build_strip_flat_bundle(strip_arrays, device):
-    # Concatenate per-strip (zyxs, windings) arrays into one flat GPU tensor so the
-    # downstream computations can run a single transform call plus segmented reductions
-    # instead of per-strip Python loops. `strip_arrays` is a sequence of
-    # `(zyxs_np, windings_np)` pairs. Returns None when there are no points.
-    pairs = list(strip_arrays)
-    if len(pairs) == 0:
+    # Concatenate per-strip (zyxs, windings, radial_offsets[, bake_scale]) arrays
+    # into one flat GPU tensor so the downstream computations can run a single
+    # transform call plus segmented reductions instead of per-strip Python loops.
+    # `strip_arrays` is a sequence of `(zyxs_np, windings_np, radial_offsets_np)`
+    # triples or `(..., radial_offset_bake_scale_np)` quadruples; radial_offsets
+    # may be None for zeros and the bake scale None for ones. The bundle's
+    # `radial_offsets` is the physical offset (scroll voxels along the sheet
+    # normal) times the per-point bake scale, i.e. the offset in the resident
+    # frame's voxels; consumers convert it to spiral radius through the live
+    # transform's local normal stretch. `has_radial_offsets` lets them skip
+    # that work when every offset is zero. Returns None when there are no points.
+    triples = [tuple(t) for t in strip_arrays]
+    if len(triples) == 0:
         return None
-    lengths_np = np.fromiter((len(z) for z, _ in pairs), dtype=np.int64, count=len(pairs))
-    starts_np = np.empty(len(pairs) + 1, dtype=np.int64)
+    lengths_np = np.fromiter((len(t[0]) for t in triples), dtype=np.int64, count=len(triples))
+    starts_np = np.empty(len(triples) + 1, dtype=np.int64)
     starts_np[0] = 0
     np.cumsum(lengths_np, out=starts_np[1:])
     total = int(starts_np[-1])
     if total == 0:
         return None
-    zyxs_flat = np.concatenate([z for z, _ in pairs], axis=0).astype(np.float32, copy=False)
-    windings_flat = np.concatenate([w for _, w in pairs], axis=0).astype(np.float32, copy=False)
-    strip_id_np = np.repeat(np.arange(len(pairs), dtype=np.int64), lengths_np)
+    zyxs_flat = np.concatenate([t[0] for t in triples], axis=0).astype(np.float32, copy=False)
+    windings_flat = np.concatenate([t[1] for t in triples], axis=0).astype(np.float32, copy=False)
+    offsets_flat = np.concatenate([
+        t[2] if len(t) > 2 and t[2] is not None else np.zeros(len(t[0]), dtype=np.float32)
+        for t in triples], axis=0).astype(np.float32, copy=False)
+    if any(len(t) > 3 and t[3] is not None for t in triples):
+        scale_flat = np.concatenate([
+            t[3] if len(t) > 3 and t[3] is not None else np.ones(len(t[0]), dtype=np.float32)
+            for t in triples], axis=0).astype(np.float32, copy=False)
+        offsets_flat = offsets_flat * scale_flat
+    strip_id_np = np.repeat(np.arange(len(triples), dtype=np.int64), lengths_np)
     return {
         'zyxs': torch.from_numpy(zyxs_flat).to(device=device),
         'windings': torch.from_numpy(windings_flat).to(device=device),
+        'radial_offsets': torch.from_numpy(offsets_flat).to(device=device),
+        'has_radial_offsets': bool(np.any(offsets_flat != 0)),
         'strip_id': torch.from_numpy(strip_id_np).to(device=device),
         'starts': torch.from_numpy(starts_np).to(device=device),
         'starts_cpu': torch.from_numpy(starts_np),
         'lengths': torch.from_numpy(lengths_np).to(device=device),
         'lengths_cpu': torch.from_numpy(lengths_np),
-        'num_strips': len(pairs),
+        'num_strips': len(triples),
         'total': total,
     }
+
+
+def accumulate_radial_offset_bake_scale(slice_to_spiral_transform, zyxs,
+                                        previous=None, *, device=None):
+    """Fold one frozen epoch's normal stretch into a per-point bake scale.
+
+    The vertical-fiber radial offset is a physical distance along the sheet
+    normal in scroll voxels. A constraint bake rewrites the resident geometry
+    through a frozen transform that is not an isometry, so the same distance
+    measured in the baked frame is the scroll distance times that transform's
+    local stretch along the normal, ``|J^T n|`` at the pre-bake point
+    (sample_spiral.get_radial_normal_stretch). ``zyxs`` (N, 3) are the points
+    *before* this bake in the frame the transform reads; ``previous`` (N,) is
+    the scale accumulated over earlier epochs (None => ones). Returns the
+    updated (N,) float32 array. Successive epochs multiply, which is exact
+    when each epoch's stretch is evaluated for the normal direction that epoch
+    saw (the radial direction of its own output frame, as here) and treats
+    later epochs' rotation of that direction as second order.
+    """
+    stretch = get_radial_normal_stretch(
+        slice_to_spiral_transform,
+        torch.from_numpy(np.ascontiguousarray(zyxs, dtype=np.float32)),
+        device=device).numpy()
+    if previous is None:
+        return stretch
+    return np.asarray(previous, dtype=np.float32) * stretch
+
+
+def inward_winding_direction(slice_to_spiral_transform, zyxs, *, device=None,
+                             chunk_size=65536):
+    """Unit vectors along the fitted spiral's decreasing-winding direction.
+
+    At each input-frame point the scan-space gradient of the fitted winding
+    is ``J^T n`` (sample_spiral.get_radial_covector_in_scroll_space); its
+    negative points toward the neighbouring winding with the lower winding
+    number, the "front" side the fiber link side rules refer to. ``zyxs``
+    (N, 3) in the frame the transform reads; returns (N, 3) float64, zero
+    where the gradient vanishes. Evaluated under no_grad, chunked, with each
+    chunk staged to ``device`` when given.
+    """
+    points = torch.as_tensor(
+        np.ascontiguousarray(zyxs, dtype=np.float32)).reshape(-1, 3)
+    out = np.zeros((points.shape[0], 3), dtype=np.float64)
+    if points.shape[0] == 0:
+        return out
+    target = device if device is not None else points.device
+    with torch.no_grad():
+        for start in range(0, points.shape[0], chunk_size):
+            chunk = points[start:start + chunk_size].to(
+                device=target, dtype=torch.float32)
+            covector = get_radial_covector_in_scroll_space(
+                slice_to_spiral_transform, chunk,
+                epsilon=RADIAL_OFFSET_STRETCH_EPSILON)
+            norm = torch.linalg.norm(covector, dim=-1, keepdim=True)
+            direction = torch.where(
+                norm > 0, -covector / norm.clamp_min(1e-12),
+                torch.zeros_like(covector))
+            out[start:start + chunk_size] = direction.cpu().numpy()
+    return out
 
 
 def get_or_build_unattached_pcl_flat(pcl_strips, device):
@@ -1017,7 +1137,10 @@ def get_or_build_unattached_pcl_flat(pcl_strips, device):
     # top of fit_spiral_3d); otherwise build it now and try to cache for next call.
     flat = getattr(pcl_strips, 'flat', None)
     if flat is None and len(pcl_strips) > 0:
-        flat = _build_strip_flat_bundle(((s['zyxs'], s['windings']) for s in pcl_strips), device)
+        flat = _build_strip_flat_bundle(
+            ((s['zyxs'], s['windings'], s.get('radial_offsets'),
+              s.get('radial_offset_bake_scale')) for s in pcl_strips),
+            device)
         try:
             pcl_strips.flat = flat
         except AttributeError:
@@ -1076,13 +1199,19 @@ def get_dt_loss_eligibility(cfg, iteration, run_dt_resume_iteration=None):
     unverified_start = (
         patch_start if cfg['loss_start_unverified_patch_dt'] is None
         else cfg['loss_start_unverified_patch_dt'])
+    unattached_start = get_unattached_pcl_dt_start(cfg)
     return {
         'verified_patch': run_eligible and iteration > patch_start,
         'unverified_patch': run_eligible and iteration > unverified_start,
         'track': run_eligible and iteration > track_start,
-        # Unattached PCL DT intentionally keeps the verified-patch start.
-        'unattached_pcl': run_eligible and iteration > patch_start,
+        'unattached_pcl': run_eligible and iteration > unattached_start,
     }
+
+
+def get_unattached_pcl_dt_start(cfg):
+    """The unattached-PCL DT start: its own key, else the verified-patch start."""
+    start = cfg['loss_start_unattached_pcl_dt']
+    return cfg['loss_start_patch_dt'] if start is None else start
 
 
 def unresolved_fiber_link_warning(fiber_catalog, *, use_links, use_pending_links,
@@ -1726,7 +1855,7 @@ class FitContext:
                 self.unattached_component_edges.append([])
 
     def _derive_point_inputs(self, verified_patches, point_collections,
-                             fiber_point_collections):
+                             fiber_point_collections, *, direction_source='umbilicus'):
         """Shared initial/replacement linking, classification and sampling.
 
         Callers provide private point dictionaries; this method attaches and
@@ -1748,7 +1877,7 @@ class FitContext:
                     return True
             return False
 
-        link_distance_tolerance = 2.5
+        link_distance_tolerance = float(self.config['pcl_link_distance_tolerance'])
 
         # ==========================================================================
         # Point-to-patch linking
@@ -1766,6 +1895,14 @@ class FitContext:
             detail=(
                 f'{len(point_collections):,} collections, '
                 f'{len(verified_patches):,} patches'))
+        # Startup uses the umbilicus until a fitted transform is available.
+        # Live revisions select the direction for their current step, just
+        # like _maybe_relink_fibers_for_direction.
+        self._fiber_link_direction_source = direction_source
+        link_options = self._patch_link_options(
+            point_collections, 1.0, direction_source=direction_source)
+        if link_options.side_rules:
+            print(self._describe_fiber_link_side_rules(link_options))
         link_points_to_patches(
             verified_patches,
             point_collections,
@@ -1773,6 +1910,7 @@ class FitContext:
             surface_index_tolerance=link_distance_tolerance,
             distance_scale=1.0,
             general_hit_policy='largest_area',
+            options=link_options,
         )
 
         # Keep pristine linked regular collections. Derived training views may
@@ -1940,6 +2078,9 @@ class FitContext:
             min_point_spacing=min_point_spacing,
             use_links=self.config['pcl_use_fiber_links'],
             use_pending_links=self.config['pcl_use_pending_fiber_links'],
+            vertical_min_z_fraction=self.config['pcl_vertical_fiber_min_z_fraction'],
+            vertical_min_auto_certainty=self.config['pcl_vertical_fiber_min_auto_certainty'],
+            vertical_radial_offset=self._vertical_fiber_radial_offset(),
         )
         cross_patch_point_collections.update(
             {pcl['id']: pcl for pcl in fiber_cross_patch})
@@ -2502,6 +2643,293 @@ class FitContext:
                 prepare_patch_dt_target_samples(
                     self.unverified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
                 )
+
+    def _vertical_fiber_radial_offset(self):
+        """Radial target offset (voxels) applied to vertical fiber strips; 0 when off."""
+        if not self.config['pcl_vertical_fiber_radial_offset_enabled']:
+            return 0.0
+        return float(self.config['pcl_vertical_fiber_radial_offset_voxels'])
+
+    # ---- Point-to-patch linking options -----------------------------------
+
+    def _fiber_link_side_rules(self, collections):
+        """Side rule per collection id (point_collection.SIDE_*) under
+        pcl_fiber_link_side_filter: vertical fibers lie on the sheet's back
+        and attach only to patches in front of them, horizontal fibers on its
+        front and attach only to patches behind them. Untagged fibers and
+        regular collections carry no rule."""
+        if not self.config['pcl_fiber_link_side_filter']:
+            return {}
+        rules = {}
+        for cid, pcl in collections.items():
+            tag = fiber_collection_hv_tag(
+                pcl,
+                min_z_fraction=self.config['pcl_vertical_fiber_min_z_fraction'],
+                min_auto_certainty=self.config[
+                    'pcl_vertical_fiber_min_auto_certainty'])
+            if tag == 'V':
+                rules[cid] = SIDE_FRONT
+            elif tag == 'H':
+                rules[cid] = SIDE_BEHIND
+        return rules
+
+    def _fiber_link_inward_direction(self, source, *, umbilicus_z_to_yx=None):
+        """The side rules' inward-direction function for ``source``:
+        'umbilicus' (the line to the umbilicus in the current input frame,
+        the z-axis after a constraint bake) or 'model' (the fitted spiral's
+        decreasing-winding direction, see inward_winding_direction)."""
+        if source == 'model':
+            transform = self.spiral_and_transform.get_slice_to_spiral_transform()
+            device = self.device
+
+            def inward(zyxs):
+                return inward_winding_direction(transform, zyxs, device=device)
+            return inward
+        if source != 'umbilicus':
+            raise ValueError(f'unknown fiber link direction source {source!r}')
+        if umbilicus_z_to_yx is None:
+            umbilicus_z_to_yx = (
+                self._zero_umbilicus_z_to_yx if getattr(self, "frozen_epochs", ())
+                else self.umbilicus)
+        return umbilicus_inward_direction(umbilicus_z_to_yx)
+
+    def _fiber_views_from_catalog(self, fiber_catalog, cross_patch, strips,
+                                  strip_groups, voxel_scale):
+        """Replace the fiber-derived entries of the given training views with
+        views materialised from ``fiber_catalog`` under the current config.
+
+        Shared by live fiber incorporation/relinking and the Run-boundary
+        re-materialisation. Returns the new ``(cross_patch, strips,
+        strip_groups, resolved_links, link_components)``; the inputs are not
+        mutated, so callers commit (or discard) the result as one unit.
+        """
+        cross_patch = [
+            pcl for pcl in cross_patch
+            if pcl.get('metadata', {}).get('input_role')
+            not in {'fiber', 'fiber_link_component'}
+            and pcl.get('metadata', {}).get('logical_input_kind') != 'fiber'
+        ]
+        retained = [
+            (strip, group) for strip, group in zip(strips, strip_groups)
+            if strip.get('logical_input_kind') != 'fiber'
+        ]
+        strips = [strip for strip, _ in retained]
+        strip_groups = [group for _, group in retained]
+        (fiber_cross_patch, fiber_strips, fiber_sampling_groups,
+         resolved_links, link_components) = materialize_fiber_fit_inputs(
+            fiber_catalog,
+            self.verified_patches,
+            z_begin=self.z_begin,
+            z_end=self.z_end,
+            z_margin=self.config['patch_loss_z_margin'],
+            min_point_spacing=(
+                self.config['pcl_unattached_pcl_min_point_spacing']
+                * voxel_scale),
+            use_links=self.config['pcl_use_fiber_links'],
+            use_pending_links=self.config['pcl_use_pending_fiber_links'],
+            vertical_min_z_fraction=self.config[
+                'pcl_vertical_fiber_min_z_fraction'],
+            vertical_min_auto_certainty=self.config[
+                'pcl_vertical_fiber_min_auto_certainty'],
+            vertical_radial_offset=self._vertical_fiber_radial_offset(),
+        )
+        return (cross_patch + list(fiber_cross_patch),
+                strips + list(fiber_strips),
+                strip_groups + list(fiber_sampling_groups),
+                resolved_links, link_components)
+
+
+    def _refresh_trusted_geometry(self):
+        """Rebuild the trusted-geometry tree and the influence anchor seed
+        from the active patches and strips (both read the strips)."""
+        trusted = self._trusted_geometry_from_active_inputs()
+        trusted_np = np.ascontiguousarray(
+            trusted.cpu().numpy(), dtype=np.float32)
+        self.trusted_geometry_tree = (
+            cKDTree(trusted_np) if len(trusted_np) else None)
+        generator = torch.Generator().manual_seed(
+            int(self.config['optimizer_random_seed']))
+        self.influence_anchor_geometry = subsample_rows(
+            trusted,
+            int(self.config['sample_count_influence_anchor_geometry_points']),
+            generator).clone()
+
+
+    def _commit_rederived_pcl_views(self, cross_patch, strips, strip_groups,
+                                    resolved_links=None, link_components=None):
+        """Swap re-derived point-collection views into the resident session.
+
+        Run-boundary counterpart of the live-incorporation commit: the lists
+        are replaced in place (every holder observes them), the cached flat
+        strip bundle is dropped, and everything derived from the views is
+        refreshed -- sampling strata, whole-object DT caches, the trusted
+        geometry, and the patch/PCL theta topology.
+        """
+        self.cross_patch_pcls[:] = cross_patch
+        self.unattached_pcl_strips[:] = strips
+        self.unattached_strip_sampling_groups[:] = strip_groups
+        self.unattached_pcl_strips.flat = None
+        if resolved_links is not None:
+            self.resolved_links[:] = resolved_links
+            self.link_components[:] = link_components
+        self._rebuild_pcl_sampling_strata()
+        self.dt_target_cache_manager.reset()
+        self._refresh_trusted_geometry()
+        for warning in self._build_theta_crossing_map() or ():
+            print(f'WARNING: {warning}')
+
+
+    def _rematerialize_fiber_views(self):
+        """Re-derive every fiber training view from the retained fiber catalog.
+
+        Run-boundary path for the fiber-view settings (link usage, vertical
+        classification thresholds, unattached decimation spacing): the
+        catalog owns the canonical (already baked, if a reset happened)
+        fiber geometry, so no reload or re-bake is needed.
+        """
+        views = self._fiber_views_from_catalog(
+            self.fiber_catalog, list(self.cross_patch_pcls),
+            list(self.unattached_pcl_strips),
+            list(self.unattached_strip_sampling_groups),
+            self._baked_voxel_scale())
+        self._commit_rederived_pcl_views(*views)
+        link_warning = unresolved_fiber_link_warning(
+            self.fiber_catalog,
+            use_links=self.config['pcl_use_fiber_links'],
+            use_pending_links=self.config['pcl_use_pending_fiber_links'])
+        if link_warning is not None:
+            print(f'WARNING: {link_warning}')
+
+
+    def _baked_voxel_scale(self):
+        """Blunt scroll-voxel -> current-frame factor for metric thresholds.
+
+        Link tolerances, decimation spacings and exclusion radii are tuned in
+        scroll voxels; after a bake the resident geometry is expressed in
+        units stretched by the accumulated median stretch of the frozen
+        stack (see _baked_unit_scale). 1.0 before the first bake.
+        """
+        return (float(self._baked_unit_scale)
+                if getattr(self, 'frozen_epochs', ()) else 1.0)
+
+
+    def _patch_link_options(self, collections, voxel_scale, *,
+                            direction_source=None, umbilicus_z_to_yx=None):
+        """PatchLinkOptions for linking ``collections`` (resident id -> pcl)
+        in the current input frame. ``voxel_scale`` converts scroll-voxel
+        thresholds to that frame; ``direction_source`` defaults to the
+        session's current fiber link direction source."""
+        rules = self._fiber_link_side_rules(collections)
+        inward = None
+        if rules:
+            if direction_source is None:
+                direction_source = getattr(
+                    self, '_fiber_link_direction_source', 'umbilicus')
+            inward = self._fiber_link_inward_direction(
+                direction_source, umbilicus_z_to_yx=umbilicus_z_to_yx)
+        return PatchLinkOptions(
+            window_points=int(self.config['pcl_link_window_points']),
+            window_min_points=int(self.config['pcl_link_window_min_points']),
+            side_rules=rules,
+            inward_direction=inward,
+            side_margin=(float(self.config['pcl_fiber_link_side_margin_voxels'])
+                         * voxel_scale))
+
+    def _describe_fiber_link_side_rules(self, options):
+        rules = options.side_rules
+        front = sum(1 for rule in rules.values() if rule == SIDE_FRONT)
+        behind = len(rules) - front
+        return (
+            f'fiber link side rules: {front} vertical fiber(s) restricted to '
+            f'patches in front, {behind} horizontal fiber(s) to patches behind '
+            f'(margin {options.side_margin:g} voxels, inward direction from the '
+            f'{getattr(self, "_fiber_link_direction_source", "umbilicus")}, '
+            f'switching to the fitted winding at step '
+            f'{int(self.config["pcl_fiber_link_model_direction_step"])})')
+
+    def _desired_fiber_link_direction_source(self, iteration):
+        threshold = int(self.config['pcl_fiber_link_model_direction_step'])
+        return 'model' if iteration >= threshold else 'umbilicus'
+
+    def _maybe_relink_fibers_for_direction(self, iteration):
+        """Step hook for the fiber side rules' direction switch.
+
+        Once ``iteration`` (completed steps, whether run here or restored from
+        a checkpoint) reaches pcl_fiber_link_model_direction_step, every
+        fiber is relinked once under the fitted winding direction; a
+        checkpoint that lands before the step after such a switch relinks
+        back under the umbilicus direction. No-op while the side filter is
+        off or the session holds no fibers.
+        """
+        if not self.config['pcl_fiber_link_side_filter']:
+            return
+        if not getattr(self, 'fiber_catalog', None):
+            return
+        desired = self._desired_fiber_link_direction_source(iteration)
+        if desired == getattr(self, '_fiber_link_direction_source', 'umbilicus'):
+            return
+        self._relink_fibers_to_patches(desired, iteration=iteration)
+
+    def _relink_fibers_to_patches(self, direction_source, *, iteration=None):
+        """Drop every resident fiber point's patch attachment and link the
+        fiber catalog again against the verified patches, the side rules
+        taking their inward direction from ``direction_source``, then
+        re-materialise the fiber training views."""
+        collections = {pcl['id']: pcl for pcl in self.fiber_catalog.values()}
+
+        def attached_count():
+            return sum(
+                1 for pcl in collections.values()
+                for point in pcl['points'].values() if 'on_patch' in point)
+
+        before = attached_count()
+        for pcl in collections.values():
+            for point in pcl['points'].values():
+                point.pop('on_patch', None)
+        voxel_scale = self._baked_voxel_scale()
+        tolerance = self.link_distance_tolerance * voxel_scale
+        options = self._patch_link_options(
+            collections, voxel_scale, direction_source=direction_source)
+        link_points_to_patches(
+            self.verified_patches,
+            collections,
+            tolerance=tolerance,
+            surface_index_tolerance=tolerance,
+            distance_scale=1.0,
+            general_hit_policy='largest_area',
+            options=options,
+        )
+        self._fiber_link_direction_source = direction_source
+        dist = getattr(self, 'dist', None)
+        if dist is None or dist.is_main_process:
+            prefix = '' if iteration is None else f'step {iteration}: '
+            print(f'{prefix}relinked {len(collections)} fiber(s) with the '
+                  f'{direction_source} inward direction: {before} -> '
+                  f'{attached_count()} attached points')
+        self._rematerialize_fiber_views()
+
+    def _refill_vertical_fiber_radial_offsets(self):
+        """Re-derive every strip's per-point radial target offset from its
+        retained vertical/horizontal tag and the current config.
+
+        The offset (scroll voxels along the sheet normal) is written into each
+        strip's ``radial_offsets`` array when the strip is materialised and
+        then, times the strip's ``radial_offset_bake_scale``, concatenated
+        into the cached ``.flat`` GPU bundle that the strip losses, DT
+        targets, and satisfaction metric read. A Run-boundary change to the
+        offset therefore refills those arrays, drops the cached bundle, and
+        resets the DT target caches that were computed against the old
+        offsets; the bake scale is untouched. Strips without a tag (regular
+        point collections, horizontal fibers) stay at zero.
+        """
+        offset = self._vertical_fiber_radial_offset()
+        for strip in self.unattached_pcl_strips:
+            strip['radial_offsets'] = np.full(
+                len(strip['zyxs']),
+                offset if strip.get('is_vertical') else 0.0,
+                dtype=np.float32)
+        self.unattached_pcl_strips.flat = None
+        self.dt_target_cache_manager.reset()
 
     def _phase_mode_active(self):
         return self.phase_mode and self.sdt_volume is not None and self.lasagna_volume is not None
@@ -4277,7 +4705,9 @@ class FitContext:
                         points[cid] = catalog_copy_of_pcl(pcl)
                         if role == 'fiber':
                             fibers[cid] = points[cid]
-                candidate._derive_point_inputs(candidate.verified_patches, points, fibers)
+                candidate._derive_point_inputs(
+                    candidate.verified_patches, points, fibers,
+                    direction_source=candidate._desired_fiber_link_direction_source(current_iteration))
                 changed_points = {cid: points[cid] for cid in changed_points if cid in points}
                 changed_patches = {logical_id: patch for logical_id, patch in changed_patches.items()
                                    if candidate._workspace_membership[logical_id]['resident_id']
@@ -4401,71 +4831,141 @@ class FitContext:
         self._write_non_liftable_patch_report()
         return list(candidate._input_warnings)
 
-    def _fiber_views_from_catalog(self, fiber_catalog, cross_patch, strips,
-                                  strip_groups):
-        """Build all fiber-derived training views without mutating inputs."""
-        cross_patch = [
-            pcl for pcl in cross_patch
-            if pcl.get('metadata', {}).get('input_role')
-            not in {'fiber', 'fiber_link_component'}
-            and pcl.get('metadata', {}).get('logical_input_kind') != 'fiber'
-        ]
-        retained = [
-            (strip, group) for strip, group in zip(strips, strip_groups)
-            if strip.get('logical_input_kind') != 'fiber'
-        ]
-        strips = [strip for strip, _ in retained]
-        strip_groups = [group for _, group in retained]
-        (fiber_cross_patch, fiber_strips, fiber_sampling_groups,
-         resolved_links, link_components) = materialize_fiber_fit_inputs(
-            fiber_catalog,
+    def _regular_views_from_catalog_entries(self, entries, voxel_scale):
+        """Derive the training views of regular (non-fiber) collections.
+
+        ``entries`` maps resident id -> linked pcl container (a catalog copy,
+        or a freshly uploaded collection). Each is classified from how its
+        points attach: at least two attached points make a cross-patch pcl
+        (points grouped by patch), at least one unattached point makes an
+        unattached strip over the whole pcl (trimmed to the longest run in
+        the z window, then decimated), and absolute-winding pcls are always
+        cross-patch. A pcl in both sets gets an independent copy for the
+        strip. Returns ``(cross_patch_pcls, strips, strip_groups)``; the
+        containers in ``entries`` become the cross-patch views, so pass copies
+        when the originals must stay pristine.
+        """
+        new_cross_patch = {}
+        new_unattached = {}
+        for pid, pcl in entries.items():
+            num_attached = sum(1 for point in pcl['points'].values() if 'on_patch' in point)
+            num_unattached = len(pcl['points']) - num_attached
+            if pcl.get('metadata', {}).get('winding_is_absolute', False):
+                attached_points = [point for point in pcl['points'].values()
+                                   if 'on_patch' in point]
+                if any(not np.isfinite(point['winding_annotation'])
+                       or point['winding_annotation'] <= 0
+                       for point in attached_points):
+                    raise RuntimeError(
+                        f'Absolute-winding pcl {pcl.get("name")!r} must annotate every '
+                        f'attached point with a positive winding number')
+                new_cross_patch[pid] = pcl
+                continue
+            if num_attached >= 2:
+                new_cross_patch[pid] = pcl
+            if num_unattached >= 1:
+                new_unattached[pid] = copy.deepcopy(pcl) if num_attached >= 2 else pcl
+
+        z_margin = self.config['patch_loss_z_margin']
+        for pid in list(new_unattached.keys()):
+            pcl = new_unattached[pid]
+            kept_items = longest_run_in_z_window(
+                sorted(pcl['points'].items(), key=lambda kv: int(kv[0])),
+                self.z_begin, self.z_end, z_margin)
+            if len(kept_items) < 2:
+                del new_unattached[pid]
+            else:
+                pcl['points'] = dict(kept_items)
+
+        normalise_pcl_winding_annotations(new_cross_patch)
+        normalise_pcl_winding_annotations(new_unattached)
+
+        cross_patch = []
+        for pcl in new_cross_patch.values():
+            points_by_patch = {}
+            for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0])):
+                if 'on_patch' not in point:
+                    continue
+                pid = point['on_patch']['id']
+                if pid not in self.verified_patches:
+                    continue
+                points_by_patch.setdefault(pid, []).append(point)
+            pcl['points_by_patch'] = points_by_patch
+            cross_patch.append(pcl)
+
+        min_point_spacing = (
+            self.config['pcl_unattached_pcl_min_point_spacing']
+            * voxel_scale)
+        strips, strip_groups = [], []
+        for pcl_id, pcl in new_unattached.items():
+            strip = regular_unattached_strip(
+                pcl_id, pcl, min_point_spacing)
+            if strip is None:
+                continue
+            strips.append(strip)
+            strip_groups.append(pcl.get('sampling_group'))
+        return cross_patch, strips, strip_groups
+
+    def _relink_all_points_to_patches(self, *, iteration):
+        """Run-boundary path for the linking settings that govern every point
+        collection (pcl_link_distance_tolerance, pcl_link_window_points,
+        pcl_link_window_min_points).
+
+        Drops every resident point's patch attachment (regular catalog and
+        fiber catalog), links both again against the verified patches under
+        the current options -- the fiber side rules taking the inward
+        direction ``iteration`` implies -- and re-derives every
+        point-collection training view from the catalogs.
+        """
+        self.link_distance_tolerance = float(
+            self.config['pcl_link_distance_tolerance'])
+        regular = dict(getattr(self, 'regular_pcl_catalog', None) or {})
+        fibers = {pcl['id']: pcl
+                  for pcl in (getattr(self, 'fiber_catalog', None) or {}).values()}
+        collections = {**regular, **fibers}
+        if not collections:
+            return
+        before = sum(1 for pcl in collections.values()
+                     for point in pcl['points'].values() if 'on_patch' in point)
+        for pcl in collections.values():
+            for point in pcl['points'].values():
+                point.pop('on_patch', None)
+        voxel_scale = self._baked_voxel_scale()
+        tolerance = self.link_distance_tolerance * voxel_scale
+        direction_source = self._desired_fiber_link_direction_source(iteration)
+        options = self._patch_link_options(
+            collections, voxel_scale, direction_source=direction_source)
+        link_points_to_patches(
             self.verified_patches,
-            z_begin=self.z_begin,
-            z_end=self.z_end,
-            z_margin=self.config['patch_loss_z_margin'],
-            min_point_spacing=self.config[
-                'pcl_unattached_pcl_min_point_spacing'],
-            use_links=self.config['pcl_use_fiber_links'],
-            use_pending_links=self.config['pcl_use_pending_fiber_links'],
+            collections,
+            tolerance=tolerance,
+            surface_index_tolerance=tolerance,
+            distance_scale=1.0,
+            general_hit_policy='largest_area',
+            options=options,
         )
-        return (cross_patch + list(fiber_cross_patch),
-                strips + list(fiber_strips),
-                strip_groups + list(fiber_sampling_groups),
-                resolved_links, link_components)
+        self._fiber_link_direction_source = direction_source
+        after = sum(1 for pcl in collections.values()
+                    for point in pcl['points'].values() if 'on_patch' in point)
+        dist = getattr(self, 'dist', None)
+        if dist is None or dist.is_main_process:
+            print(f'step {iteration}: relinked {len(regular)} regular '
+                  f'collection(s) and {len(fibers)} fiber(s) to patches '
+                  f'(tolerance {self.link_distance_tolerance:g}, window '
+                  f'{options.window_points}/{options.window_min_points}): '
+                  f'{before} -> {after} attached points')
 
-    def _refresh_trusted_geometry(self):
-        trusted = self._trusted_geometry_from_active_inputs()
-        trusted_np = np.ascontiguousarray(
-            trusted.cpu().numpy(), dtype=np.float32)
-        self.trusted_geometry_tree = (
-            cKDTree(trusted_np) if len(trusted_np) else None)
-        generator = torch.Generator().manual_seed(
-            int(self.config['optimizer_random_seed']))
-        self.influence_anchor_geometry = subsample_rows(
-            trusted,
-            int(self.config['sample_count_influence_anchor_geometry_points']),
-            generator).clone()
-
-    def _commit_rederived_pcl_views(self, cross_patch, strips, strip_groups,
-                                    resolved_links=None, link_components=None):
-        self.cross_patch_pcls[:] = cross_patch
-        self.unattached_pcl_strips[:] = strips
-        self.unattached_strip_sampling_groups[:] = strip_groups
-        self.unattached_pcl_strips.flat = None
-        if resolved_links is not None:
-            self.resolved_links[:] = resolved_links
-            self.link_components[:] = link_components
-        self._rebuild_pcl_sampling_strata()
-        self.dt_target_cache_manager.reset()
-        self._refresh_trusted_geometry()
-        for warning in self._build_theta_crossing_map() or ():
-            print(f'WARNING: {warning}')
-
-    def _rematerialize_fiber_views(self):
+        # Every regular view is re-derived from a fresh catalog copy (the
+        # catalog stays pristine); the fiber views follow from the catalog.
+        working = {}
+        for cid, pcl in regular.items():
+            copy_ = catalog_copy_of_pcl(pcl)
+            copy_['chain'] = SequenceChain(copy_)
+            working[cid] = copy_
+        cross_patch, strips, strip_groups = (
+            self._regular_views_from_catalog_entries(working, voxel_scale))
         views = self._fiber_views_from_catalog(
-            self.fiber_catalog, list(self.cross_patch_pcls),
-            list(self.unattached_pcl_strips),
-            list(self.unattached_strip_sampling_groups))
+            self.fiber_catalog, cross_patch, strips, strip_groups, voxel_scale)
         self._commit_rederived_pcl_views(*views)
         link_warning = unresolved_fiber_link_warning(
             self.fiber_catalog,
@@ -4561,6 +5061,13 @@ class FitContext:
         old_values = {key: self.config[key] for key in tracked}
         self.config.update(config)
         try:
+            if changed & {'pcl_link_window_points', 'pcl_link_window_min_points'}:
+                window = int(self.config['pcl_link_window_points'])
+                minimum = int(self.config['pcl_link_window_min_points'])
+                if not 1 <= minimum <= window:
+                    raise ValueError(
+                        'pcl_link_window_min_points must be between 1 and '
+                        f'pcl_link_window_points ({window}), got {minimum}')
             fiber_catalog = getattr(self, 'fiber_catalog', None) or {}
             fiber_records = (
                 self._prepare_fiber_reingest()
@@ -4705,7 +5212,22 @@ class FitContext:
                 'pcl_use_pending_fiber_links',
                 'pcl_unattached_pcl_min_point_spacing',
             }
+            fiber_link_keys = {
+                'pcl_fiber_link_side_filter',
+                'pcl_fiber_link_side_margin_voxels',
+                'pcl_fiber_link_model_direction_step',
+            }
+            # The load-time linking settings govern every point collection:
+            # both catalogs are re-linked and every view re-derived.
+            all_link_keys = {
+                'pcl_link_distance_tolerance',
+                'pcl_link_window_points',
+                'pcl_link_window_min_points',
+            }
+            fiber_catalog = getattr(self, 'fiber_catalog', None) or {}
+            regular_catalog = getattr(self, 'regular_pcl_catalog', None) or {}
             rederived_views = False
+            relinked_everything = False
             if fiber_records is not None:
                 self._reingest_fiber_documents(fiber_records)
                 rebuilt_unverified = self.unverified_patches
@@ -4713,11 +5235,25 @@ class FitContext:
                 rebuilt_unverified_probabilities = self.unverified_patch_sampling_probabilities
                 rebuilt_unverified_atlas = self.unverified_patch_atlas
                 rederived_views = True
+            if changed & all_link_keys and (fiber_catalog or regular_catalog):
+                self._relink_all_points_to_patches(iteration=current_iteration)
+                rederived_views = True
+                relinked_everything = True
+            elif changed & fiber_link_keys and fiber_catalog:
+                # Re-links every resident fiber under the new side rules, with
+                # the inward direction the current step implies (umbilicus
+                # below pcl_fiber_link_model_direction_step, fitted winding
+                # from there), then re-materialises the fiber views.
+                self._relink_fibers_to_patches(
+                    self._desired_fiber_link_direction_source(
+                        current_iteration),
+                    iteration=current_iteration)
+                rederived_views = True
             elif changed & fiber_view_keys and fiber_catalog:
                 self._rematerialize_fiber_views()
                 rederived_views = True
             if ('pcl_unattached_pcl_min_point_spacing' in changed
-                    and getattr(self, 'regular_pcl_catalog', None)):
+                    and regular_catalog and not relinked_everything):
                 self._rederive_regular_unattached_strips()
                 rederived_views = True
             # Rebuild participation from retained source revisions after all
@@ -4784,6 +5320,11 @@ class FitContext:
         if self.unverified_patch_atlas is not None:
             self.unverified_patch_atlas.materialize(self.device)
         if changed & {
+                'pcl_vertical_fiber_radial_offset_enabled',
+                'pcl_vertical_fiber_radial_offset_voxels',
+        }:
+            self._refill_vertical_fiber_radial_offsets()
+        if changed & {
                 'patch_loss_z_margin',
                 'patch_unverified_patch_exclusion_radius',
         }:
@@ -4831,6 +5372,7 @@ class FitContext:
         theta_map_refreshed = self._refresh_theta_crossing_map_for_step(
             iteration,
             self.slice_to_spiral_transform)
+        self._maybe_relink_fibers_for_direction(iteration)
 
         losses = {}
         log_metrics = {
@@ -4867,6 +5409,7 @@ class FitContext:
         unverified_patch_dt_start = self.config['loss_start_patch_dt'] if self.config['loss_start_unverified_patch_dt'] is None else self.config['loss_start_unverified_patch_dt']
         compute_unverified_patch_dt = dt_eligibility['unverified_patch']
         compute_unattached_pcl_dt = dt_eligibility['unattached_pcl']
+        unattached_pcl_dt_start = get_unattached_pcl_dt_start(self.config)
 
         # Progressive-outward DT gating: winding cutoff that grows from the
         # respective DT start step. None means no gating.
@@ -4874,10 +5417,13 @@ class FitContext:
         patch_dt_max_winding = get_progressive_dt_max_winding(self.config, iteration, self.config['loss_start_patch_dt'], dt_progressive_outer)
         track_dt_max_winding = get_progressive_dt_max_winding(self.config, iteration, track_dt_start, dt_progressive_outer)
         unverified_patch_dt_max_winding = get_progressive_dt_max_winding(self.config, iteration, unverified_patch_dt_start, dt_progressive_outer)
+        unattached_pcl_dt_max_winding = get_progressive_dt_max_winding(self.config, iteration, unattached_pcl_dt_start, dt_progressive_outer)
         if patch_dt_max_winding is not None:
             log_metrics['patch_dt_max_winding'] = patch_dt_max_winding
         if track_dt_max_winding is not None:
             log_metrics['track_dt_max_winding'] = track_dt_max_winding
+        if unattached_pcl_dt_max_winding is not None:
+            log_metrics['unattached_pcl_dt_max_winding'] = unattached_pcl_dt_max_winding
 
         patch_dt_target_cache = None
         unverified_patch_dt_target_cache = None
@@ -4905,6 +5451,7 @@ class FitContext:
                         self.slice_to_spiral_transform, self.dr_per_winding,
                         pcl_flat['zyxs'], pcl_flat['starts'],
                         windings=pcl_flat['windings'],
+                        radial_offsets=pcl_flat.get('radial_offsets'),
                         floating_threshold=self.config['dt_target_floating_threshold'],
                         num_points_per_strip=self.config['sample_count_dt_target_points_per_strip'],
                         max_stride=self.config['dt_target_max_stride'],
@@ -5155,7 +5702,8 @@ class FitContext:
                 })
 
         if (
-            (self.config['loss_weight_unattached_pcl_radius'] > 0 or self.config['loss_weight_unattached_pcl_dt'] > 0)
+            (self.config['loss_weight_unattached_pcl_radius'] > 0
+             or self.config['loss_weight_unattached_pcl_dt'] > 0)
             and self.unattached_pcl_strips
         ):
             unattached_loss_values = get_unattached_pcl_strip_losses(
@@ -5169,7 +5717,7 @@ class FitContext:
                 self.config['sample_count_unattached_pcls_per_step'],
                 self.config['sample_count_unattached_pcl_points_per_step'],
                 compute_dt=compute_unattached_pcl_dt,
-                dt_max_winding=patch_dt_max_winding,
+                dt_max_winding=unattached_pcl_dt_max_winding,
                 dt_target_cache=unattached_pcl_dt_target_cache,
                 crossing_map=self.theta_crossing_map,
                 cfg=self.config,

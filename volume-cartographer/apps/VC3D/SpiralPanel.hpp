@@ -83,6 +83,7 @@ private:
     void syncTrackSamplingControlsFromAdvanced();
     void writeTrackSamplingControlsToAdvanced();
     void updateTrackSamplingUi();
+    void syncVerticalFiberOffsetControls(const QJsonObject& effectiveConfig);
     void applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration);
     void synchronizeSession(const QJsonObject& request,
                             const QJsonObject& status);
@@ -149,6 +150,8 @@ private:
     QToolButton* _browsePclButton = nullptr;
     QCheckBox* _savePngVisualizations = nullptr;
     QCheckBox* _trackLengthBinSampling = nullptr;
+    QCheckBox* _verticalFiberOffsetEnabled = nullptr;
+    QDoubleSpinBox* _verticalFiberOffsetVoxels = nullptr;
     QDoubleSpinBox* _trackShortWeight = nullptr;
     QDoubleSpinBox* _trackMediumWeight = nullptr;
     QDoubleSpinBox* _trackLongWeight = nullptr;

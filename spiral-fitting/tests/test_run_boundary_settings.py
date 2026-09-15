@@ -1,6 +1,6 @@
 """Run-boundary application of settings that used to demand a rebuild.
 
-Each test builds a FitContext piecemeal (the pattern test_vertical_fiber_theta
+Each test builds a FitContext piecemeal (the pattern test_fiber_supervision
 uses) and drives FitContext.apply_config the way the interactive runtime does.
 """
 import copy
@@ -355,3 +355,130 @@ def test_visualisation_slice_count_is_read_live():
         fit_spiral.FitContext._MODEL_STAGE_ATTRIBUTES)
     assert 'output_num_slices_for_visualization' in inspect.getsource(
         fit_spiral.FitContext._prepare_png_visualization_inputs)
+
+
+def test_fiber_link_side_rules_relink_every_fiber_at_a_run_boundary():
+    context = _context(pcl_fiber_link_model_direction_step=10)
+    context.fiber_catalog = {'f': _fiber(1, 'f', [[0.0, 0.0, 100.0], [50.0, 0.0, 100.0]])}
+    context._relink_fibers_to_patches = Mock()
+
+    # Below the direction-switch step the relink uses the umbilicus direction.
+    context.apply_config({'pcl_fiber_link_side_filter': True}, current_iteration=4)
+    context._relink_fibers_to_patches.assert_called_once_with(
+        'umbilicus', iteration=4)
+    assert context.config['pcl_fiber_link_side_filter'] is True
+
+    # From that step on it uses the fitted winding; the margin alone relinks too.
+    context._relink_fibers_to_patches.reset_mock()
+    context.apply_config(
+        {'pcl_fiber_link_side_margin_voxels': 1.5}, current_iteration=12)
+    context._relink_fibers_to_patches.assert_called_once_with(
+        'model', iteration=12)
+
+    # Turning the filter off relinks under no rules (plain attachments).
+    context._relink_fibers_to_patches.reset_mock()
+    context.apply_config({'pcl_fiber_link_side_filter': False}, current_iteration=12)
+    context._relink_fibers_to_patches.assert_called_once_with(
+        'model', iteration=12)
+
+
+def test_fiber_link_side_rules_are_a_no_op_without_a_fiber_catalog():
+    context = _context()
+    context._relink_fibers_to_patches = Mock()
+    context.apply_config({'pcl_fiber_link_side_filter': True}, current_iteration=0)
+    context._relink_fibers_to_patches.assert_not_called()
+    assert context.config['pcl_fiber_link_side_filter'] is True
+
+
+def _z_plane_patch(z, y0=-20.0, x0=-20.0, size=5, spacing=10.0):
+    from tifxyz import Patch
+    grid = torch.zeros((size, size, 3), dtype=torch.float32)
+    for i in range(size):
+        for j in range(size):
+            grid[i, j] = torch.tensor([z, y0 + i * spacing, x0 + j * spacing])
+    return Patch(grid, torch.ones(2), None, None)
+
+
+def _linkable_regular(cid, zyxs, absolute=False):
+    return {
+        'id': cid, 'name': f'regular{cid}', 'source_file': '/inputs/r.json',
+        'sampling_group': '/inputs/r.json',
+        'metadata': {'winding_is_absolute': absolute, 'input_role': 'legacy',
+                     'resident_collection_id': cid},
+        'points': {
+            i: {'id': i, 'collectionId': cid, 'p': [z[2], z[1], z[0]],
+                'zyx': np.asarray(z, dtype=np.float32),
+                'winding_annotation': float(i + 1) if absolute else float('nan')}
+            for i, z in enumerate(zyxs)
+        },
+    }
+
+
+def test_link_tolerance_relinks_every_collection_at_a_run_boundary():
+    if True:
+        # Patches at z = 50 and z = 60; points at z = 51.5 are 1.5 from the
+        # first, so a tolerance of 1.0 leaves them unattached and 2.0 links
+        # them. The fiber at z = 58.5 likewise sits 1.5 from the second.
+        context = _context(pcl_link_distance_tolerance=1.0)
+        context.verified_patches = {'a': _z_plane_patch(50.0), 'b': _z_plane_patch(60.0)}
+        regular = _linkable_regular(3, [[51.5, 0.0, -10.0], [51.5, 0.0, 0.0], [51.5, 0.0, 10.0]])
+        context.regular_pcl_catalog = {3: regular}
+        fiber = _fiber(9, 'f', [[58.5, 0.0, -10.0], [58.5, 0.0, 0.0], [58.5, 0.0, 10.0]])
+        context.fiber_catalog = {'f': fiber}
+        context.link_distance_tolerance = 1.0
+        # Stale views standing in for what load derived under tolerance 1.0.
+        context.unattached_pcl_strips.append({
+            'id': 3, 'logical_input_kind': None, 'zyxs': np.zeros((2, 3), np.float32),
+            'windings': np.zeros(2, np.float32), 'radial_offsets': np.zeros(2, np.float32)})
+        context.unattached_strip_sampling_groups.append('/inputs/r.json')
+
+        context.apply_config({'pcl_link_distance_tolerance': 2.0}, current_iteration=7)
+
+        assert context.link_distance_tolerance == 2.0
+        # The catalogs carry the new attachments...
+        assert [p['on_patch']['id'] for p in regular['points'].values()] == ['a'] * 3
+        assert [p['on_patch']['id'] for p in fiber['points'].values()] == ['b'] * 3
+        # ...and the views were re-derived from them: both collections are now
+        # cross-patch (all points attached), the stale strip is gone.
+        assert sorted(pcl['id'] for pcl in context.cross_patch_pcls) == [3, 9]
+        regular_view = next(pcl for pcl in context.cross_patch_pcls if pcl['id'] == 3)
+        assert regular_view is not regular  # the catalog stays pristine
+        assert list(regular_view['points_by_patch']) == ['a']
+        assert len(regular_view['points_by_patch']['a']) == 3
+        assert list(context.unattached_pcl_strips) == []
+        context._rebuild_pcl_sampling_strata.assert_called_once_with()
+        context._build_theta_crossing_map.assert_called_once_with()
+
+        # Tightening it again detaches everything and turns both into strips.
+        context._rebuild_pcl_sampling_strata.reset_mock()
+        context.apply_config({'pcl_link_distance_tolerance': 1.0}, current_iteration=8)
+        assert all('on_patch' not in p for p in regular['points'].values())
+        assert all('on_patch' not in p for p in fiber['points'].values())
+        assert context.cross_patch_pcls == []
+        assert sorted(strip['id'] for strip in context.unattached_pcl_strips) == [3, 9]
+
+
+def test_window_min_points_must_fit_the_window_at_a_run_boundary():
+    context = _context()
+    context.regular_pcl_catalog = {3: _linkable_regular(3, [[51.5, 0.0, 0.0]])}
+    context._relink_all_points_to_patches = Mock()
+    with pytest.raises(ValueError, match='pcl_link_window_min_points'):
+        context.apply_config(
+            {'pcl_link_window_points': 3, 'pcl_link_window_min_points': 4},
+            current_iteration=0)
+    context._relink_all_points_to_patches.assert_not_called()
+    # Nothing was applied.
+    assert context.config['pcl_link_window_points'] == 1
+    assert context.config['pcl_link_window_min_points'] == 1
+    context.apply_config(
+        {'pcl_link_window_points': 3, 'pcl_link_window_min_points': 2},
+        current_iteration=5)
+    context._relink_all_points_to_patches.assert_called_once_with(iteration=5)
+
+
+def test_link_settings_are_a_no_op_without_catalogs():
+    context = _context()
+    context._relink_all_points_to_patches = Mock()
+    context.apply_config({'pcl_link_distance_tolerance': 3.0}, current_iteration=0)
+    context._relink_all_points_to_patches.assert_not_called()
+    assert context.config['pcl_link_distance_tolerance'] == 3.0

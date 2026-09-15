@@ -16,6 +16,8 @@ from dt_targets import (
 from loss_maps import diagnostics_enabled, record_loss_samples
 from sample_spiral import (
     canonical_winding_samples,
+    get_radial_covector_in_scroll_space,
+    get_radial_normal_stretch,
     get_theta_and_radii,
     radius_from_unwrapped_shifted,
 )
@@ -1040,37 +1042,12 @@ def _decode_uint8_normal(nx_u8, ny_u8):
 
 
 def get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_zyx, spiral_zyx=None, epsilon=6.0):
-    # At each scroll-space point, pull the spiral-space cylinder normal (the outward radial
-    # direction normalize(spiral_yx)) back to scroll space as a covector, J^T n_spiral, where
-    # J = d(spiral) / d(scroll) is estimated by central differences. This is the geometrically
-    # correct transport of a surface normal (covector) -- unlike a tangent-vector pushforward J n.
-    # Returns the normalised scroll-space normal direction (num_points, 3) in zyx.
-    #
-    # Gradient flows through the transform parameters via the Jacobian only; the sample positions
-    # (scroll_zyx) and the radial direction are held fixed, matching the dense-normals loss. If the
-    # forward image spiral_zyx is supplied it is reused for the radial direction (and treated as a
-    # constant); otherwise it is computed here from scroll_zyx.
-    device = scroll_zyx.device
-    num_points = scroll_zyx.shape[0]
-    scroll_zyx = scroll_zyx.detach()
-
-    basis_zyx = torch.eye(3, device=device, dtype=scroll_zyx.dtype) * epsilon
-    scroll_plus = (scroll_zyx[None, :, :] + basis_zyx[:, None, :]).reshape(-1, 3)
-    scroll_minus = (scroll_zyx[None, :, :] - basis_zyx[:, None, :]).reshape(-1, 3)
-    if spiral_zyx is None:
-        combined_spiral = slice_to_spiral_transform(torch.cat([scroll_zyx, scroll_plus, scroll_minus], dim=0))
-        spiral_zyx = combined_spiral[:num_points]
-        spiral_plus, spiral_minus = combined_spiral[num_points:].chunk(2, dim=0)
-    else:
-        spiral_plus, spiral_minus = slice_to_spiral_transform(torch.cat([scroll_plus, scroll_minus], dim=0)).chunk(2, dim=0)
-
-    spiral_outward_yx = F.normalize(spiral_zyx[:, 1:].detach(), dim=-1)
-    spiral_outward_zyx = torch.cat([torch.zeros_like(spiral_outward_yx[:, :1]), spiral_outward_yx], dim=-1)
-
-    spiral_plus = spiral_plus.view(3, num_points, 3)
-    spiral_minus = spiral_minus.view(3, num_points, 3)
-    jacobian_columns = (spiral_plus - spiral_minus) / (2.0 * epsilon)  # scroll basis axis, point, spiral zyx
-    return F.normalize((jacobian_columns * spiral_outward_zyx[None, :, :]).sum(dim=-1).transpose(0, 1), dim=-1)
+    # The normalised scroll-space sheet normal at each point: the spiral-space radial
+    # covector pulled back through the transform (sample_spiral.
+    # get_radial_covector_in_scroll_space, which documents the J^T transport and
+    # the gradient path). Returns (num_points, 3) unit directions in zyx.
+    return F.normalize(get_radial_covector_in_scroll_space(
+        slice_to_spiral_transform, scroll_zyx, spiral_zyx=spiral_zyx, epsilon=epsilon), dim=-1)
 
 
 
@@ -1340,6 +1317,8 @@ def get_unattached_pcl_strip_losses(
     crossing_map,
     cfg,
 ):
+    # Returns (radius_loss, dt_loss).
+    #
     # Unattached pcls are treated as ordered strips, indexed by int(point_id), and
     # assumed to be locally dense enough that adjacent STRIP points have
     # |dtheta| < pi. The per-row samples themselves may be far sparser than that
@@ -1471,6 +1450,19 @@ def get_unattached_pcl_strip_losses(
     valid_windings = flat['windings'][sampled_flat_indices_t]
     zyxs_t = valid_zyxs[valid_gather_indices_t]
     winding_t = valid_windings[valid_gather_indices_t]
+    # Per-point radial target offset in input-frame voxels (vertical fibers
+    # sit on the sheet's back face: off the fitted winding along the sheet
+    # normal in the increasing-winding direction, i.e. along J^T n, the
+    # scan-space gradient of the fitted winding, away from the umbilicus;
+    # positive = that way); zero when absent. It is a physical distance along the sheet
+    # normal, so it is converted to spiral radius per point by the
+    # transform's local normal stretch once the sampled points' forward
+    # images are known (below).
+    flat_offsets = flat.get('radial_offsets')
+    has_offsets = flat_offsets is not None and flat.get('has_radial_offsets', True)
+    if has_offsets and 'has_radial_offsets' not in flat:
+        has_offsets = bool((flat_offsets != 0).any())
+    valid_offsets = flat_offsets[sampled_flat_indices_t] if has_offsets else None
 
     packed_walks = _pack_walks(walks, crossing_map)
 
@@ -1488,7 +1480,16 @@ def get_unattached_pcl_strip_losses(
         valid_spiral_zyxs = slice_to_spiral_transform(valid_zyxs)
         anchor_theta = None
     spiral_zyxs = valid_spiral_zyxs[valid_gather_indices_t]
-    theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
+    if valid_offsets is None:
+        offset_t = torch.zeros_like(winding_t)
+    else:
+        # Constant with respect to the fit: the offset is data, not a lever
+        # the transform could shrink by compressing the normal direction.
+        stretch = get_radial_normal_stretch(
+            slice_to_spiral_transform, valid_zyxs,
+            spiral_zyx=valid_spiral_zyxs.detach())
+        offset_t = (valid_offsets * stretch)[valid_gather_indices_t]
+    theta, radii, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
     if compute_dt:
         (shifted_radii, crossing_adjustments,
          anchor_sample_adjustment) = _unwrap_sampled_tracks(
@@ -1500,8 +1501,10 @@ def get_unattached_pcl_strip_losses(
             crossing_map, dr_per_winding, theta, shifted_radii, packed_walks,
         )
 
-    # Normalise so a pcl with mixed annotations still reads as a single 'strip'.
-    normalised_radii = shifted_radii - winding_t * dr_per_winding
+    # Normalise so a pcl with mixed annotations still reads as a single 'strip',
+    # and pull back-face (vertical) points in onto the fitted face by their
+    # offset (a positive offset sits the fiber outside its winding).
+    normalised_radii = shifted_radii - winding_t * dr_per_winding - offset_t
 
     radius_hinge_margin = dr_per_winding.detach() * cfg['patch_radius_loss_margin']
     dt_hinge_margin = dr_per_winding.detach() * cfg['patch_dt_loss_margin']
@@ -1514,7 +1517,7 @@ def get_unattached_pcl_strip_losses(
     radius_point_residuals = F.relu(radius_deviations - radius_hinge_margin)
     radius_loss = _masked_mean(radius_point_residuals, sample_mask)
     if diagnostics_enabled():
-        radius_target_shifted = mean_radii + winding_t * dr_per_winding
+        radius_target_shifted = mean_radii + winding_t * dr_per_winding + offset_t
         radius_target_radii = radius_from_unwrapped_shifted(
             theta, radius_target_shifted, crossing_adjustments,
             dr_per_winding,
@@ -1541,7 +1544,7 @@ def get_unattached_pcl_strip_losses(
         normalised_radii, dr_per_winding, dt_target_cache,
         anchor_strip_indices, anchor_theta, anchor_sample_adjustment,
         anchor_at_end, sample_mask=sample_mask)
-    target_shifted = target_normalised + winding_t * dr_per_winding
+    target_shifted = target_normalised + winding_t * dr_per_winding + offset_t
     target_radii = radius_from_unwrapped_shifted(
         theta, target_shifted, crossing_adjustments, dr_per_winding,
     )

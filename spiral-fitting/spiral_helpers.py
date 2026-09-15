@@ -293,6 +293,67 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
     return collection
 
 
+def classify_fiber_hv(hv_classification, zyxs, *, min_z_fraction,
+                      min_auto_certainty):
+    """Return 'V', 'H', or None for one fiber polyline.
+
+    Precedence: VC3D's manual H/V tag, then its automatic tag when the
+    recorded certainty (0..1) reaches ``min_auto_certainty``, then a geometric
+    fallback on the polyline itself: the strip is vertical when its z extent
+    covers at least ``min_z_fraction`` of its path length, horizontal when the
+    z extent covers at most ``1 - min_z_fraction`` of it, and untagged
+    otherwise. These tags drive radial offsets and patch-side linking.
+    """
+    hv = hv_classification if isinstance(hv_classification, dict) else {}
+    manual = str(hv.get('manual_tag') or '').strip().upper()
+    if manual in ('H', 'V'):
+        return manual
+    automatic = str(hv.get('automatic_tag') or '').strip().upper()
+    if automatic in ('H', 'V'):
+        try:
+            certainty = float(hv.get('automatic_certainty', 0.0))
+        except (TypeError, ValueError):
+            certainty = 0.0
+        if certainty >= min_auto_certainty:
+            return automatic
+    zyxs = np.asarray(zyxs, dtype=np.float64)
+    if zyxs.ndim != 2 or len(zyxs) < 2:
+        return None
+    path_length = float(np.linalg.norm(np.diff(zyxs, axis=0), axis=-1).sum())
+    if path_length <= 0.0:
+        return None
+    z_fraction = float(zyxs[:, 0].max() - zyxs[:, 0].min()) / path_length
+    if z_fraction >= min_z_fraction:
+        return 'V'
+    if z_fraction <= 1.0 - min_z_fraction:
+        return 'H'
+    return None
+
+
+def fiber_collection_hv_tag(pcl, *, min_z_fraction, min_auto_certainty):
+    """'V', 'H', or None for a resident fiber collection.
+
+    Applies classify_fiber_hv to the collection's VC3D ``hv_classification``
+    metadata and its id-ordered points (the geometric fallback runs on the
+    load-time decimated polyline rather than the fit strip, so the fallback
+    can differ marginally from the strip's tag). Collections that are not
+    fibers (``metadata.logical_input_kind != 'fiber'``) are untagged.
+    """
+    metadata = pcl.get('metadata') or {}
+    if metadata.get('logical_input_kind') != 'fiber':
+        return None
+    points = pcl.get('points') or {}
+    ordered = sorted(points.items(), key=lambda kv: int(kv[0]))
+    zyxs = np.asarray(
+        [np.asarray(point.get('zyx', point['p'][::-1]), dtype=np.float64)
+         for _, point in ordered],
+        dtype=np.float64).reshape(-1, 3)
+    return classify_fiber_hv(
+        metadata.get('hv_classification'), zyxs,
+        min_z_fraction=min_z_fraction,
+        min_auto_certainty=min_auto_certainty)
+
+
 def load_fiber_point_collections(path, next_id, min_point_spacing=20.0, *, base_shape_zyx=None):
     if not path:
         return {}, next_id
