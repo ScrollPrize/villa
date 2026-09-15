@@ -1,0 +1,8 @@
+numpy==2.5.3
+scipy==1.18.1
+tifffile==2026.8.23
+zarr==2.18.7
+numcodecs==0.15.1
+pillow==12.3.0
+requests==2.34.2
+pytest==9.1.1
