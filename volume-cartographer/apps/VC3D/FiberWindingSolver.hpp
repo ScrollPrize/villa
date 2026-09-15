@@ -126,11 +126,13 @@ struct SolverParams {
     // violates it by at least this many windings. Measured violations are
     // bimodal at 0 and 1, so anything between the modes works.
     double declarationViolationTurns = 0.5;
-    // A traversal group (see CrossingGroup) is only eligible when both ends of
-    // the H trace clear the V fiber's angular locus by this many turns on
-    // opposite sides: an H trace that begins or ends at the V fiber's angle
-    // may have been cut mid-traversal, and its crossing count is then
-    // incomplete. Intent: a few hundred voxels of arc at the scroll's radii.
+    // A traversal group (see CrossingGroup) is only eligible when the H
+    // trace's stretch at the V fiber's angle is entered and left with this
+    // much angular clearance on opposite sides, and a trace end inside that
+    // stretch clears the V fiber's angle at its height by the same amount:
+    // an H trace cut at the V fiber's angle may have been cut
+    // mid-traversal, and its crossing count is then incomplete. Intent: a
+    // few hundred voxels of arc at the scroll's radii.
     double endpointClearanceTurns = 0.01;
     // 0 = infer from the data; +1 / -1 force the winding direction.
     int chiralityOverride = 0;
@@ -262,9 +264,9 @@ struct CrossingGroup {
     bool coverageGap = false;
     bool unresolved = false;
     bool onCurtain = false;
-    // The H trace runs from one side of the branch's angular locus to the
-    // other with clearance, both ends and every sample within the branch's
-    // height range: the count is a complete traversal's.
+    // The H trace's stretch at the branch's angle runs from one side of the
+    // angular window to the other with clearance and stays within the
+    // branch's height range throughout: the count is a complete traversal's.
     bool traversalCovered = false;
     // Smallest |deltaR| over the events: the margin the verdict hangs on.
     double minAbsDeltaR = 0.0;

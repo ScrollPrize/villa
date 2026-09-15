@@ -890,19 +890,84 @@ PairCrossings detectPairCrossings(const CanonicalTrace& hTrace,
         group.mixedSigns = anyInside && anyOutside;
         group.coverageGap = gapTranslates.count(n) != 0;
         group.unresolved = unresolvedTranslates.count(n) != 0;
-        bool coveredA = false;
-        bool coveredB = false;
-        const int sideA = endpointSide(0, n, branch, coveredA);
-        const int sideB = endpointSide(hPsi.size() - 1, n, branch, coveredB);
-        // The whole H trace must stay within the branch's height range: an
-        // excursion above or below it could cross the V fiber's continuation
-        // unseen and come back with the count off by two.
-        bool pathCovered = true;
-        for (std::size_t i = 0; i < hZ.size() && pathCovered; ++i) {
-            pathCovered = hZ[i] >= branch.z.front() && hZ[i] <= branch.z.back();
+        // Completeness of the count is decided where the curtain is: the
+        // stretch of the H trace whose lifted angle lies within the branch's
+        // angular window (its psi range plus the clearance) at this
+        // translate. Every sample of that stretch must stay within the
+        // branch's height range - an excursion above or below it, at the V
+        // fiber's angle, could cross the fiber's untraced continuation unseen
+        // and come back with the count off by two - and the stretch must be
+        // entered from one side of the window and left to the other. A
+        // stretch that begins or ends at the trace's own end is judged there
+        // by the local side test against the V fiber's angle at that height.
+        // A multi-turn H fiber therefore passes on each turn that crosses the
+        // V fiber cleanly, whatever it does elsewhere.
+        // The stretch is taken segment by segment, each clipped to the window,
+        // so a single long segment jumping across the V fiber's angle is seen
+        // whether or not a sample lands inside; the clipped ends' heights
+        // bound the segment's heights inside the window (it is straight).
+        {
+            const double windowLo = branch.psiMin - clearance;
+            const double windowHi = branch.psiMax + clearance;
+            const double windowMid = 0.5 * (branch.psiMin + branch.psiMax);
+            const double lift = kTwoPi * static_cast<double>(n);
+            const double zLoBranch = branch.z.front();
+            const double zHiBranch = branch.z.back();
+            bool excursion = false;
+            bool any = false;
+            int sideA = 0;
+            int sideB = 0;
+            for (std::size_t i = 0; i + 1 < hPsi.size(); ++i) {
+                const double a = hPsi[i] + lift;
+                const double b = hPsi[i + 1] + lift;
+                const double segLo = std::min(a, b);
+                const double segHi = std::max(a, b);
+                if (segHi < windowLo || segLo > windowHi) {
+                    continue;
+                }
+                // Parameter range of the segment inside the window.
+                double t0 = 0.0;
+                double t1 = 1.0;
+                if (b != a) {
+                    const double tLo = (windowLo - a) / (b - a);
+                    const double tHi = (windowHi - a) / (b - a);
+                    t0 = std::clamp(std::min(tLo, tHi), 0.0, 1.0);
+                    t1 = std::clamp(std::max(tLo, tHi), 0.0, 1.0);
+                }
+                const double z0 = hZ[i] + t0 * (hZ[i + 1] - hZ[i]);
+                const double z1 = hZ[i] + t1 * (hZ[i + 1] - hZ[i]);
+                if (z0 < zLoBranch || z0 > zHiBranch || z1 < zLoBranch || z1 > zHiBranch) {
+                    excursion = true;
+                }
+                if (!any) {
+                    // Entering: from the side the segment's start lies on, or,
+                    // when the trace itself begins inside the window, by the
+                    // local test at its first sample.
+                    if (a < windowLo || a > windowHi) {
+                        sideA = a > windowMid ? 1 : -1;
+                    } else {
+                        bool covered = false;
+                        sideA = endpointSide(0, n, branch, covered);
+                        sideA = covered ? sideA : 0;
+                    }
+                }
+                any = true;
+                // Leaving (updated at every overlapping segment; the last one
+                // stands): to the side the segment's end lies on, or the local
+                // test at the trace's last sample when it ends inside.
+                if (b < windowLo || b > windowHi) {
+                    sideB = b > windowMid ? 1 : -1;
+                } else if (i + 2 == hPsi.size()) {
+                    bool covered = false;
+                    sideB = endpointSide(hPsi.size() - 1, n, branch, covered);
+                    sideB = covered ? sideB : 0;
+                } else {
+                    sideB = 0;
+                }
+            }
+            group.traversalCovered =
+                any && !excursion && sideA != 0 && sideB != 0 && sideA != sideB;
         }
-        group.traversalCovered = coveredA && coveredB && pathCovered && sideA != 0 &&
-                               sideB != 0 && sideA != sideB;
         group.hasVerdict = group.multiplicity >= 3 && group.mixedSigns &&
                            (group.orientationSum % 2 != 0) && !group.coverageGap &&
                            !group.unresolved && !group.onCurtain && group.traversalCovered;

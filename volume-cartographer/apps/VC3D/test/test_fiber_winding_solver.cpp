@@ -1062,33 +1062,103 @@ private slots:
         QCOMPARE(countDroppedCrossings(result), 1);
     }
 
-    // An H trace whose ends rise above and fall below the V fiber's height
-    // range: whether it crossed the V fiber's angle once or three times is
-    // not knowable from what was traced, so no verdict.
-    void uncoveredEndpointsGiveNoVerdict()
+    // An H trace that rises above the V fiber's height range WHILE at the V
+    // fiber's angle could cross the fiber's untraced continuation unseen:
+    // no verdict. The same trace whose ends leave the height range far from
+    // the V fiber's angle is a complete traversal and keeps its verdict.
+    void excursionAtTheVAngleGivesNoVerdict()
     {
-        World world;
         const double b = 100.0;
-        FiberTrace h;
-        h.hvTag = 'H';
-        for (double u = -3.0; u <= 3.0 + 1e-9; u += 0.01) {
-            h.theta.push_back(hairpinTheta(u, 0.03));
-            h.z.push_back(30000.0 + 200.0 * u);
-            h.radius.push_back(hairpinRadius(u, b) - kSheetStep);
+        for (const bool excursion : {true, false}) {
+            World world;
+            FiberTrace h;
+            h.hvTag = 'H';
+            for (double u = -3.0; u <= 3.0 + 1e-9; u += 0.01) {
+                h.theta.push_back(hairpinTheta(u, 0.03));
+                // Excursion: a 900 vx bulge above the V fiber's top between the
+                // middle and outer crossings, within its angular window.
+                // Otherwise a gentle slope whose ends fall outside the height
+                // range only where the trace is far from the V fiber's angle.
+                h.z.push_back(excursion
+                                  ? 30000.0 + 900.0 * std::exp(-std::pow((u - 0.8) / 0.3, 2.0))
+                                  : 30000.0 + 200.0 * u);
+                h.radius.push_back(hairpinRadius(u, b) - kSheetStep);
+            }
+            world.fibers.push_back(std::move(h));
+            world.trueM.push_back(0);
+            addRayV(world, hairpinRadius(kSqrt3, b) - 300.0, 29500.0, 30500.0, -1);
+            const SolveResult result =
+                solveWindings(world.fibers, world.links, SolverParams{});
+            QCOMPARE(result.crossings.size(), std::size_t{3});
+            const CrossingGroup& group = singleGroup(result);
+            QVERIFY(group.mixedSigns);
+            QVERIFY(group.orientationSum % 2 != 0);
+            QVERIFY(!group.coverageGap);
+            QVERIFY(!group.unresolved);
+            QVERIFY(!group.onCurtain);
+            QCOMPARE(group.traversalCovered, !excursion);
+            QCOMPARE(group.hasVerdict, !excursion);
+            if (!excursion) {
+                QCOMPARE(group.verdict, CrossingKind::Outside);
+            }
         }
-        world.fibers.push_back(std::move(h));
-        world.trueM.push_back(0);
-        // Spans the three crossings (z 29654, 30000, 30346) but not the H
-        // trace's ends (29400, 30600).
-        addRayV(world, hairpinRadius(kSqrt3, b) - 300.0, 29500.0, 30500.0, -1);
-        const SolveResult result =
-            solveWindings(world.fibers, world.links, SolverParams{});
-        QCOMPARE(result.crossings.size(), std::size_t{3});
-        const CrossingGroup& group = singleGroup(result);
-        QVERIFY(group.mixedSigns);
-        QVERIFY(group.orientationSum % 2 != 0);
-        QVERIFY(!group.traversalCovered);
-        QVERIFY(!group.hasVerdict);
+    }
+
+    // An excursion above the V fiber's top that crosses its angle on ONE long
+    // segment, with no sample inside the angular window, is still an
+    // excursion: the test clips segments to the window, so subdividing the
+    // segment changes nothing, and removing the excursion restores the
+    // verdict.
+    void excursionOnOneSegmentIsSeen()
+    {
+        const double b = 100.0;
+        for (const int variant : {0, 1, 2}) {  // 0 coarse, 1 subdivided, 2 no excursion
+            World world;
+            FiberTrace h;
+            h.hvTag = 'H';
+            for (double u = -3.0; u <= 3.0 + 1e-9; u += 0.01) {
+                h.theta.push_back(hairpinTheta(u, 0.03));
+                h.z.push_back(30000.0);
+                h.radius.push_back(hairpinRadius(u, b) - kSheetStep);
+            }
+            if (variant != 2) {
+                // Up above the V fiber's top, back across its angle and
+                // forward again, then down to end well past it on the far side.
+                const double far = hairpinTheta(3.0, 0.03);
+                const auto add = [&h, b](double theta, double z) {
+                    h.theta.push_back(theta);
+                    h.z.push_back(z);
+                    h.radius.push_back(hairpinRadius(3.0, b) - kSheetStep);
+                };
+                add(far + 0.02, 30800.0);
+                if (variant == 1) {
+                    add(kHairpinTheta0, 30800.0);
+                }
+                add(kHairpinTheta0 - 0.6, 30800.0);
+                if (variant == 1) {
+                    add(kHairpinTheta0, 30800.0);
+                }
+                add(far + 0.06, 30800.0);
+                add(far + 0.08, 30000.0);
+            }
+            world.fibers.push_back(std::move(h));
+            world.trueM.push_back(0);
+            addRayV(world, hairpinRadius(kSqrt3, b) - 300.0, 29500.0, 30500.0, -1);
+            const SolveResult result =
+                solveWindings(world.fibers, world.links, SolverParams{});
+            QCOMPARE(result.crossings.size(), std::size_t{3});
+            const CrossingGroup& group = singleGroup(result);
+            QVERIFY(group.mixedSigns);
+            QVERIFY(group.orientationSum % 2 != 0);
+            QVERIFY(!group.coverageGap);
+            QVERIFY(!group.unresolved);
+            QVERIFY(!group.onCurtain);
+            QCOMPARE(group.traversalCovered, variant == 2);
+            QCOMPARE(group.hasVerdict, variant == 2);
+            if (variant == 2) {
+                QCOMPARE(group.verdict, CrossingKind::Outside);
+            }
+        }
     }
 
     // A V fiber wobbling back and forth across an H fiber crosses it an even
