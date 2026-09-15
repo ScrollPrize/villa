@@ -3224,6 +3224,9 @@ vc3d::line_annotation::FiberDeleteOutcome LineAnnotationController::deleteFibers
             continue;
         }
         emit fiberFileRemoved(QString::fromStdString(path.string()));
+        // The name is free for a different fiber; the id is retired with the
+        // file (the registry never hands an id out twice).
+        _fiberRuntimeIds.forget(fiberIt->sourceRoot, fiberIt->fileName);
         deletedIds.push_back(fiberId);
         outcome.deleted.push_back({fiberId, fiberIt->fileName, fiberIt->sourceRoot});
     }
@@ -3430,8 +3433,9 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
     }
 
     *it = std::move(renamed);
-    // The fiber keeps its id under the new name.
-    _fiberRuntimeIds.remember(it->sourceRoot, it->fileName, it->id);
+    // The fiber keeps its id under the new name, and the old name is free: a
+    // fiber imported under it later is a different fiber with its own id.
+    _fiberRuntimeIds.rename(it->sourceRoot, oldFileName, it->fileName, it->id);
     for (const auto& pane : _panes) {
         if (pane.session && pane.session->fiberId == fiberId) {
             pane.session->fiberFileName = it->fileName;
@@ -8947,6 +8951,10 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
             bailOut(QString::fromStdString(retireResult.error));
             return;
         }
+        // The originals' names are free (their ids stay retired); the files
+        // are gone, so a fiber imported under either name is a different one.
+        forgetFiberRuntimeBinding(clickedId);
+        forgetFiberRuntimeBinding(farId);
         _fibers.erase(std::remove_if(_fibers.begin(),
                                      _fibers.end(),
                                      [clickedId, farId](const StoredFiber& fiber) {
@@ -9420,6 +9428,8 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
             bailOut(QString::fromStdString(retireResult.error));
             return;
         }
+        // The parent's name is free (its id stays retired).
+        forgetFiberRuntimeBinding(parentId);
         _fibers.erase(std::remove_if(_fibers.begin(),
                                      _fibers.end(),
                                      [parentId](const StoredFiber& fiber) {
@@ -12979,13 +12989,17 @@ LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOp
 void LineAnnotationController::loadFibersForCurrentPackage()
 {
     // Remember residents and unsaved/open sessions before changing sources.
-    // Keep removed identities reserved so surviving branch references stay safe.
+    // Keep removed identities reserved so surviving branch references stay
+    // safe. A session whose fiber was deleted keeps its id reserved but must
+    // not bind the deleted file's name again: a fiber imported under that
+    // name is a different fiber and takes a fresh id.
     for (const auto& fiber : _fibers)
         _fiberRuntimeIds.remember(fiber.sourceRoot, fiber.fileName, fiber.id);
     for (const auto& pane : _panes) {
         if (pane.session)
             _fiberRuntimeIds.remember(pane.session->fiberSourceRoot,
-                                      pane.session->fiberFileName,
+                                      pane.session->fiberDeleted ? std::string{}
+                                                                 : pane.session->fiberFileName,
                                       pane.session->fiberId);
     }
     // The load below can hand control to a nested event loop before it
@@ -14317,14 +14331,29 @@ void LineAnnotationController::attachAtlasPredSnaps(
     }
 }
 
+// Releases the (source, file name) binding of a loaded fiber that is being
+// retired, so the name is free for a different fiber; the id itself is never
+// reused. No-op for an id that is not loaded.
+void LineAnnotationController::forgetFiberRuntimeBinding(uint64_t fiberId)
+{
+    const auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& f) {
+        return f.id == fiberId;
+    });
+    if (it != _fibers.end()) {
+        _fiberRuntimeIds.forget(it->sourceRoot, it->fileName);
+    }
+}
+
 uint64_t LineAnnotationController::nextFiberId() const
 {
     for (const auto& fiber : _fibers)
         _fiberRuntimeIds.remember(fiber.sourceRoot, fiber.fileName, fiber.id);
     for (const auto& pane : _panes) {
+        // A deleted fiber's session reserves its id, not its former name.
         if (pane.session)
             _fiberRuntimeIds.remember(pane.session->fiberSourceRoot,
-                                      pane.session->fiberFileName,
+                                      pane.session->fiberDeleted ? std::string{}
+                                                                 : pane.session->fiberFileName,
                                       pane.session->fiberId);
     }
     return _fiberRuntimeIds.allocate();

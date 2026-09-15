@@ -954,6 +954,7 @@ private:
                               LineAnnotationSession& session,
                               const std::filesystem::path& atlasDir);
     [[nodiscard]] uint64_t nextFiberId() const;
+    void forgetFiberRuntimeBinding(uint64_t fiberId);
     [[nodiscard]] uint64_t nextFiberSequenceForUsername(const std::string& username) const;
     [[nodiscard]] std::string currentFiberUsername() const;
     [[nodiscard]] static std::string currentFiberDateTimeString();
