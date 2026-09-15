@@ -432,6 +432,7 @@ SegmentGrid::SegmentGrid(const cv::Rect& rect, int grid_step)
 }
 
 void SegmentGrid::add(const std::shared_ptr<SegmentInfo>& segment) {
+    index_of[segment.get()] = all_segments.size();
     all_segments.push_back(segment);
 
     int grid_x = (segment->middle_point.x - rect.x) / grid_step;
@@ -442,12 +443,19 @@ void SegmentGrid::add(const std::shared_ptr<SegmentInfo>& segment) {
 }
 
 void SegmentGrid::remove(const std::shared_ptr<SegmentInfo>& segment_to_remove) {
-    // Find the segment in the main vector
-    auto it = std::find(all_segments.begin(), all_segments.end(), segment_to_remove);
-    if (it == all_segments.end()) return;
+    // Look the segment up instead of scanning for it: align_and_filter_segments removes
+    // one segment per iteration and runs until the grid is empty, so a linear search here
+    // makes that loop quadratic in the number of segments.
+    auto found = index_of.find(segment_to_remove.get());
+    if (found == index_of.end()) return;
+    const size_t pos = found->second;
+    index_of.erase(found);
 
     // Swap with the last element and pop back for O(1) removal
-    std::swap(*it, all_segments.back());
+    std::swap(all_segments[pos], all_segments.back());
+    if (pos + 1 < all_segments.size()) {
+        index_of[all_segments[pos].get()] = pos;
+    }
     all_segments.pop_back();
 
     // Remove from the grid
