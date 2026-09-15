@@ -132,6 +132,22 @@ private slots:
         QCOMPARE(allocateRuntimeFiberId(space, {}), uint64_t{3});
     }
 
+    // Binding a name that another id holds moves the name: the new record
+    // owns it from now on (the caller has established that the file under
+    // that name is this fiber, e.g. an accepted save).
+    void bindingMovesANameToItsNewOwner()
+    {
+        RuntimeFiberIdSpace space;
+        std::vector<Fiber> fibers = loaded({"a.json"});
+        assignStableRuntimeIds(fibers, space, {});
+        bindRuntimeFiberIdentity(space, "a.json", 5);
+        QCOMPARE(space.idByFileName.at("a.json"), uint64_t{5});
+        QCOMPARE(allocateRuntimeFiberId(space, {}), uint64_t{6});
+        fibers = loaded({"a.json"});
+        assignStableRuntimeIds(fibers, space, {});
+        QCOMPARE(fibers[0].id, uint64_t{5});
+    }
+
     // A rename keeps the fiber's id under the new name and frees the old
     // name: a later import under the old name is a different fiber.
     void renameMovesTheBindingWithTheId()

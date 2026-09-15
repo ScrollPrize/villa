@@ -69,7 +69,7 @@ struct FiberDeleteResolution {
 // requested id can stop naming a loaded fiber during the wait, so the outcome
 // speaks in the file names captured before it. `requested` holds the
 // capture (requested id -> file name) and `deletedFileNames` the files that
-// were actually removed; `aborted` says the package identity moved and
+// were removed (or found already absent); `aborted` says the package identity moved and
 // nothing was removed.
 struct FiberDeleteOutcome {
     bool aborted = false;
@@ -192,12 +192,10 @@ FiberDeleteResolution resolveFiberDeletionAcrossWait(const std::vector<uint64_t>
 }
 
 // Whether an open annotation session belongs to one of the fibers just
-// deleted, for suppressing its save. A session keeps the runtime id it was
-// opened with, and a reload hands the stored fibers' ids out again without
-// touching sessions, so an id match alone can point at the wrong fiber
-// after a reload. A session that knows its file name is therefore matched
-// by that name only; an id match counts only for a session with no name,
-// which has no other identity.
+// deleted, for suppressing its save. A session that knows its file name is
+// matched by that name only (the file name is the identity; an id can be
+// stale); an id match counts only for a session with no name, which has no
+// other identity.
 inline bool sessionBelongsToDeletedFiber(uint64_t sessionFiberId,
                                          const std::string& sessionFileName,
                                          const std::vector<uint64_t>& deletedIdsSorted,

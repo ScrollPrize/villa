@@ -151,7 +151,7 @@ public:
     struct FiberMapFiber {
         // Runtime id, valid only for the generation this snapshot was taken in.
         uint64_t id = 0;
-        // Stable identity across loads and packages; the runtime id is
+        // Stable identity across loads within a package; the runtime id is
         // per package and can be retired, so anything acted on later must
         // be resolved from this.
         std::string fileName;
@@ -892,8 +892,9 @@ private:
     // file name onto them.
     void assignRuntimeFiberIds(std::vector<StoredFiber>& fibers);
     // Binds a persisted fiber's file name to its id in the package's id space
-    // (see LineAnnotationFiberIdentity.hpp); called from the save paths.
-    void registerFiberIdentity(const StoredFiber& fiber) const;
+    // (see LineAnnotationFiberIdentity.hpp). Called once a write is accepted
+    // or has succeeded, never before.
+    void registerFiberIdentity(const StoredFiber& fiber);
     [[nodiscard]] uint64_t nextFiberSequenceForUsername(const std::string& username) const;
     [[nodiscard]] std::string currentFiberUsername() const;
     [[nodiscard]] static std::string currentFiberDateTimeString();
@@ -1148,14 +1149,18 @@ private:
     // vpkg-ready reloads, and a retired id is never reused) and is reset when
     // the package changes. _runtimeIdsPackageGeneration says which package
     // it belongs to.
-    // mutable: a fiber's identity is bound when it is persisted, and the save
-    // paths are const (bookkeeping, not a change of state they report on).
-    mutable vc3d::line_annotation::RuntimeFiberIdSpace _runtimeIds;
+    // Bound at the explicit lifecycle points where a fiber's identity is
+    // established or changed: the loader, the save queue (after validation),
+    // the merge and split writes, a completed rename; retired by the delete,
+    // merge and split retirements.
+    vc3d::line_annotation::RuntimeFiberIdSpace _runtimeIds;
     uint64_t _runtimeIdsPackageGeneration = 0;
     // Counts loads of the fiber list. A load that yields to the event loop
-    // (the broken-link prompt, an error dialog) compares its own number
-    // against this afterwards and stands down if a newer load ran meanwhile,
-    // instead of publishing an older list over it.
+    // before publishing (the broken-link prompt, the repair-error dialog)
+    // compares its own number against this afterwards and stands down if a
+    // newer load ran meanwhile, instead of publishing an older list over it.
+    // This covers those pre-publication continuations only; the loader is
+    // not otherwise reentrant-safe.
     uint64_t _fiberLoadSequence = 0;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;

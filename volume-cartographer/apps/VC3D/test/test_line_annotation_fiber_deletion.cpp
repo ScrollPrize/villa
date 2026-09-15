@@ -35,8 +35,9 @@ struct Fiber {
     std::string fileName;
 };
 
-// A reload as loadFibersForCurrentPackage does it: the list is rebuilt from
-// disk in its own order and the ids are handed out again from 1.
+// A reload as the loader did it before runtime ids were made stable within
+// a package: the list rebuilt from disk in its own order and the ids handed
+// out again from 1. The delete has to stay correct even under that.
 std::vector<Fiber> reloaded(const std::vector<std::string>& fileNames)
 {
     std::vector<Fiber> fibers;

@@ -3227,6 +3227,27 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
 
     const QString currentName = QString::fromStdString(
         it->fileName.empty() ? fiberPath(*it).filename().string() : it->fileName);
+    // The dialog and the save drain below yield to the event loop: the list
+    // can be reloaded (invalidating `it`), the fiber deleted, a delete
+    // started, or the package switched. The fiber is therefore re-resolved
+    // by its file name after each yield, and the operation abandoned when
+    // the package or the pending-delete state moved.
+    const std::string sourceFileName = it->fileName;
+    const uint64_t renamePackageGeneration = _packageGeneration;
+    const auto reresolveSource = [this, &sourceFileName, renamePackageGeneration, fiberId]()
+        -> std::vector<StoredFiber>::iterator {
+        if (_packageGeneration != renamePackageGeneration || _deletingFibers) {
+            return _fibers.end();
+        }
+        if (sourceFileName.empty()) {
+            return std::find_if(_fibers.begin(), _fibers.end(),
+                                [fiberId](const StoredFiber& fiber) { return fiber.id == fiberId; });
+        }
+        return std::find_if(_fibers.begin(), _fibers.end(),
+                            [this, &sourceFileName](const StoredFiber& fiber) {
+                                return fiber.fileName == sourceFileName;
+                            });
+    };
     bool accepted = false;
     const QString input = QInputDialog::getText(_parentWidget.data(),
                                                 tr("Rename Line JSON"),
@@ -3235,6 +3256,11 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
                                                 currentName,
                                                 &accepted);
     if (!accepted) {
+        return;
+    }
+    it = reresolveSource();
+    if (it == _fibers.end()) {
+        showError(tr("The fiber is no longer available to rename."));
         return;
     }
 
@@ -3270,6 +3296,25 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
                       .arg(QString::fromStdString(newPath.filename().string())));
         return;
     }
+    // The name may be owned by a live fiber whose file is not on disk yet
+    // (a save still queued, or one that failed): renaming onto it would
+    // give two fibers one identity.
+    const auto nameOwnedByLiveFiber = [this, &newFileName]() {
+        const bool stored = std::any_of(_fibers.begin(), _fibers.end(),
+                                        [&newFileName](const StoredFiber& fiber) {
+                                            return fiber.fileName == *newFileName;
+                                        });
+        const bool open = std::any_of(_panes.begin(), _panes.end(), [&newFileName](const auto& pane) {
+            return pane.session && pane.session->fiberFileName == *newFileName;
+        });
+        return stored || open;
+    };
+    if (nameOwnedByLiveFiber()) {
+        showError(tr("Could not rename fiber %1: %2 is the name of another loaded fiber.")
+                      .arg(fiberId)
+                      .arg(QString::fromStdString(*newFileName)));
+        return;
+    }
 
     const std::string oldFileName = it->fileName;
     StoredFiber renamed = *it;
@@ -3290,6 +3335,19 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
         // would recreate the old path right after the remove below, leaving
         // duplicate files.
         waitForFiberSaves();
+        // The drain yielded: the fiber, the destination and the package are
+        // checked again before anything is written.
+        it = reresolveSource();
+        if (it == _fibers.end()) {
+            throw std::runtime_error("the fiber is no longer available to rename");
+        }
+        if (it->fileName != oldFileName) {
+            throw std::runtime_error("the fiber was renamed meanwhile");
+        }
+        ec.clear();
+        if (fs::exists(newPath, ec) || nameOwnedByLiveFiber()) {
+            throw std::runtime_error("the new name is taken");
+        }
         saveFiberNow(renamed);
         ec.clear();
         fs::remove(oldPath, ec);
@@ -8623,6 +8681,9 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
                       suppressErrors);
             return;
         }
+        // Persisted: the merged fiber's name now denotes its id across the
+        // package's reloads.
+        registerFiberIdentity(merged);
     }
 
     const uint64_t mergedId = merged.id;
@@ -8757,6 +8818,12 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
             bailOut(QString::fromStdString(retireResult.error));
             return;
         }
+        // The originals are deleted through the app: their names are retired
+        // (see LineAnnotationFiberIdentity.hpp).
+        vc3d::line_annotation::retireRuntimeFiberIdentity(_runtimeIds,
+                                                          clickedPath.filename().string());
+        vc3d::line_annotation::retireRuntimeFiberIdentity(_runtimeIds,
+                                                          farPath.filename().string());
         _fibers.erase(std::remove_if(_fibers.begin(),
                                      _fibers.end(),
                                      [clickedId, farId](const StoredFiber& fiber) {
@@ -9029,6 +9096,10 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
                       suppressErrors);
             return;
         }
+        // Persisted: both halves' names now denote their ids across the
+        // package's reloads.
+        registerFiberIdentity(prefix);
+        registerFiberIdentity(suffix);
     }
 
     const auto upsertFiber = [this](StoredFiber fiber) {
@@ -9170,6 +9241,10 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
             bailOut(QString::fromStdString(retireResult.error));
             return;
         }
+        // The parent is deleted through the app: its name is retired (see
+        // LineAnnotationFiberIdentity.hpp).
+        vc3d::line_annotation::retireRuntimeFiberIdentity(_runtimeIds,
+                                                          parentPath.filename().string());
         _fibers.erase(std::remove_if(_fibers.begin(),
                                      _fibers.end(),
                                      [parentId](const StoredFiber& fiber) {
@@ -12671,10 +12746,12 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         _runtimeIds = {};
         _runtimeIdsPackageGeneration = _packageGeneration;
     }
-    // The load below can hand control to a nested event loop (the broken-link
-    // prompt, an error dialog); a package switch or a newer load of this
-    // package inside it publishes its own list, and this load must then
-    // stand down rather than publish an older list over it.
+    // The load below can hand control to a nested event loop before it
+    // publishes (the broken-link prompt, the repair-error dialog); a package
+    // switch or a newer load of this package inside it publishes its own
+    // list, and this load must then stand down rather than publish an older
+    // list over it. The load-error dialog after publication is not covered:
+    // nothing is published after it.
     const uint64_t loadPackageGeneration = _packageGeneration;
     const uint64_t loadToken = ++_fiberLoadSequence;
     const auto superseded = [this, loadPackageGeneration, loadToken](const char* where) {
@@ -13376,7 +13453,7 @@ uint64_t LineAnnotationController::allocateFiberId(uint64_t minimumId)
     return vc3d::line_annotation::allocateRuntimeFiberId(_runtimeIds, live, minimumId);
 }
 
-void LineAnnotationController::registerFiberIdentity(const StoredFiber& fiber) const
+void LineAnnotationController::registerFiberIdentity(const StoredFiber& fiber)
 {
     vc3d::line_annotation::bindRuntimeFiberIdentity(_runtimeIds, fiber.fileName, fiber.id);
 }
@@ -14540,8 +14617,8 @@ void LineAnnotationController::scheduleBranchMetadataSaves(
     for (const uint64_t fiberId : uniqueFiberIds) {
         // A pane is the owner only when its session and the stored fiber of
         // this id are the same fiber by the shared identity rule - names when
-        // both are known, id otherwise - so an id that has gone stale (held
-        // across a package switch, say) cannot pick up an unrelated session.
+        // both are known, id otherwise - so a stale id is not taken as
+        // proof that an unrelated session is the owner.
         std::string storedFileName;
         if (const auto storedIt = std::find_if(_fibers.begin(), _fibers.end(),
                                                [fiberId](const StoredFiber& candidate) {
@@ -14654,9 +14731,9 @@ void LineAnnotationController::removeBranchLinksToFiber(uint64_t fiberId,
     }
     std::vector<uint64_t> affectedFiberIds;
     // Refs are matched by the shared identity rule (names decide when both
-    // are known; see LineAnnotationFiberIdentity.hpp), so an id that has
-    // gone stale can never make a ref to another fiber read as a ref to the
-    // deleted one.
+    // are known; see LineAnnotationFiberIdentity.hpp), so a ref that names
+    // another fiber is not read as a ref to the deleted one on the strength
+    // of a stale id.
     auto removeBranches = [&](std::vector<FiberBranchRef>& branches, uint64_t ownerFiberId) {
         const auto before = branches.size();
         branches.erase(
@@ -15491,6 +15568,12 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
 {
     // Any direct save supersedes a pending debounced autosave.
     session.autoSaveScheduled = false;
+    // A session whose fiber was deleted underneath it is not persisted by
+    // any path - a close with a final optimization included - or it would
+    // recreate the deleted file (or overwrite an import under that name).
+    if (session.suppressFiberSave) {
+        return;
+    }
     try {
         if (!finalizeSessionOptimizationSynchronously(session, false)) {
             return;
@@ -15814,9 +15897,6 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
 
 void LineAnnotationController::saveFiberNow(const StoredFiber& fiber) const
 {
-    // Persisting establishes the fiber's identity: its name keeps this id
-    // across the package's reloads.
-    registerFiberIdentity(fiber);
     const fs::path dir = fibersDir();
     if (dir.empty()) {
         throw std::runtime_error("No volume package is loaded");
@@ -15828,9 +15908,6 @@ void LineAnnotationController::saveFiberNow(const StoredFiber& fiber) const
 LineAnnotationController::FiberSaveSnapshot
 LineAnnotationController::makeFiberSaveSnapshot(const StoredFiber& fiber) const
 {
-    // Queued for persisting: the identity is bound now, before the save
-    // runs, so a reload in between already keeps this id for the name.
-    registerFiberIdentity(fiber);
     FiberSaveSnapshot snapshot;
     snapshot.fiberId = fiber.id;
     snapshot.generation = fiber.generation;
@@ -16098,6 +16175,11 @@ void LineAnnotationController::scheduleFiberSaveSnapshots(
     }
     canonicalizeFiberSaveSnapshots(snapshots);
     validateFiberSaveSnapshots(snapshots);
+    // Queued for persisting: each fiber's identity is bound now, before the
+    // save runs, so a reload in between already keeps its id for its name.
+    for (const auto& snapshot : snapshots) {
+        registerFiberIdentity(snapshot.fiber);
+    }
 
     auto jobKey = [](const FiberSaveJob& job) {
         std::vector<std::string> key;
