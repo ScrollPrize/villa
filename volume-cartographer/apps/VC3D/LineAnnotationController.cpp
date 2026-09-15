@@ -253,6 +253,12 @@ struct LineAnnotationController::LineAnnotationSession {
     fs::path atlasFiberPath;
     vc::atlas::AtlasPredSnapSet predSnapSet;
     bool suppressFiberSave = false;
+    // The fiber this session edits was deleted through the app while the
+    // session stayed open. Unlike suppressFiberSave - which is also set
+    // transiently (a headless save, the merge/split retirement window) -
+    // this never clears: the session's links are no longer editable and no
+    // persistence route may write it.
+    bool fiberDeleted = false;
     bool suppressGeneratedViews = false;
     bool suppressErrorDialogs = false;
     // True once the optimizer actually ran in this session (async or the
@@ -3197,6 +3203,7 @@ vc3d::line_annotation::FiberDeleteOutcome LineAnnotationController::deleteFibers
                                                    deletedIds,
                                                    deletedFileNames)) {
             pane.session->suppressFiberSave = true;
+            pane.session->fiberDeleted = true;
         }
     }
     for (const auto& [deletedId, deletedFileName] : deletedFibers) {
@@ -8135,10 +8142,10 @@ void LineAnnotationController::handleGeneratedControlPointLinkCandidate(
         return;
     }
     auto& session = *pane->session;
-    if (session.suppressFiberSave) {
-        // The fiber was deleted underneath this session; its links can no
-        // longer be edited, or the edit would be persisted as a new file.
-        showError(tr("This fiber was deleted; its links can no longer be edited."),
+    if (session.fiberDeleted) {
+        // The fiber was deleted underneath this session; a structural edit
+        // would be persisted as a new file under the deleted name.
+        showError(tr("This fiber was deleted; it can no longer be edited."),
                   session.suppressErrorDialogs);
         return;
     }
@@ -8215,10 +8222,10 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
         return;
     }
     auto& session = *pane->session;
-    if (session.suppressFiberSave) {
-        // The fiber was deleted underneath this session; its links can no
-        // longer be edited, or the edit would be persisted as a new file.
-        showError(tr("This fiber was deleted; its links can no longer be edited."),
+    if (session.fiberDeleted) {
+        // The fiber was deleted underneath this session; a structural edit
+        // would be persisted as a new file under the deleted name.
+        showError(tr("This fiber was deleted; it can no longer be edited."),
                   session.suppressErrorDialogs);
         return;
     }
@@ -8435,6 +8442,13 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
         return;
     }
     auto& session = *pane->session;
+    if (session.fiberDeleted) {
+        // The fiber was deleted underneath this session; a structural edit
+        // would be persisted as a new file under the deleted name.
+        showError(tr("This fiber was deleted; it can no longer be edited."),
+                  session.suppressErrorDialogs);
+        return;
+    }
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
         showError(tr("Line optimization is already running."));
         return;
@@ -8769,10 +8783,15 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
     // Retire both originals. Not deleteFibers: removeBranchLinksToFiber
     // would strip the peer links just redirected. suppressFiberSave covers
     // dialog-less inspection sessions too.
+    // Only the suppression this merge sets is its to release on failure: a
+    // session already suppressed (or deleted) stays as it was.
+    std::vector<std::weak_ptr<LineAnnotationSession>> suppressedByMerge;
     for (const auto& otherPane : _panes) {
         if (otherPane.session && (otherPane.session->fiberId == clickedId ||
-                                  otherPane.session->fiberId == farId)) {
+                                  otherPane.session->fiberId == farId) &&
+            !otherPane.session->suppressFiberSave) {
             otherPane.session->suppressFiberSave = true;
+            suppressedByMerge.push_back(otherPane.session);
         }
     }
     // This handler runs inside the dialog's own menu-callback stack, and
@@ -8783,6 +8802,7 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
     QTimer::singleShot(0, this, [this, clickedId, farId, clickedPath, farPath,
                                  mergedId, mergedFileName,
                                  joinControlIndex, suppressErrors,
+                                 suppressedByMerge,
                                  packageGeneration = _packageGeneration]() {
         // The originals, their paths and their ids belong to the package the
         // merge ran in; a package switch before or during this callback
@@ -8799,6 +8819,10 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
             return;
         }
         closeDialogPanesForFibers({clickedId, farId});
+        // Closing can yield through a pane's finalization or error dialog.
+        if (packageChanged()) {
+            return;
+        }
         closeIntersectionInspectionForRetiredFibers({clickedId, farId});
         // Fail loudly instead of reconciling: on any problem below, the
         // originals are kept, their surviving sessions are made saveable
@@ -8806,16 +8830,17 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
         // re-derive from branch_file; the merged fiber's
         // needs_reoptimization tag re-prompts the re-fit). The user
         // resolves the duplicate old/new fibers.
-        const auto bailOut = [this, clickedId, farId,
+        const auto bailOut = [this, suppressedByMerge,
                               suppressErrors](const QString& reason) {
-            for (const auto& otherPane : _panes) {
-                if (otherPane.session && (otherPane.session->fiberId == clickedId ||
-                                          otherPane.session->fiberId == farId)) {
-                    otherPane.session->suppressFiberSave = false;
+            // Release only what this merge suppressed, and never a session
+            // whose fiber was deleted meanwhile.
+            for (const auto& weak : suppressedByMerge) {
+                if (const auto session = weak.lock(); session && !session->fiberDeleted) {
+                    session->suppressFiberSave = false;
                 }
             }
             showError(tr("The merge could not be completed: %1\nThe original "
-                         "fibers were kept; reloading fibers from disk.")
+                         "fibers were left as they were; reloading fibers from disk.")
                           .arg(reason),
                       suppressErrors);
             loadFibersForCurrentPackage();
@@ -8851,7 +8876,8 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
             bailOut(tr("the original fibers changed meanwhile"));
             return;
         }
-        // All-or-nothing: a failure restores both originals in place.
+        // A failure rolls the removed originals back where the save job can
+        // (it reports recovery copies where it cannot).
         const auto retireResult = vc3d::line_annotation::runFiberSaveJob(
             ++_nextFiberSaveSequence, {}, {clickedPath, farPath});
         if (!retireResult.ok) {
@@ -8879,6 +8905,11 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
         // Re-fit the merged line (join span + extrapolation tails); consumes
         // the needs_reoptimization tag, which otherwise re-prompts on load.
         reoptimizeMergedFibers({mergedFileName});
+        // The re-fit yields (dataset picker, save drain); the merged fiber's
+        // id belongs to the package the merge ran in.
+        if (packageChanged()) {
+            return;
+        }
 
         invalidateFiberAlignmentMetrics(mergedId, true);
         emitFiberSummaries();
@@ -8898,6 +8929,13 @@ void LineAnnotationController::handleGeneratedControlPointSplitCandidate(
         return;
     }
     auto& session = *pane->session;
+    if (session.fiberDeleted) {
+        // The fiber was deleted underneath this session; a structural edit
+        // would be persisted as a new file under the deleted name.
+        showError(tr("This fiber was deleted; it can no longer be edited."),
+                  session.suppressErrorDialogs);
+        return;
+    }
     if (controlPointIndex >= session.controlPoints.size()) {
         return;
     }
@@ -8945,6 +8983,13 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
         return;
     }
     auto& session = *pane->session;
+    if (session.fiberDeleted) {
+        // The fiber was deleted underneath this session; a structural edit
+        // would be persisted as a new file under the deleted name.
+        showError(tr("This fiber was deleted; it can no longer be edited."),
+                  session.suppressErrorDialogs);
+        return;
+    }
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
         showError(tr("Line optimization is already running."));
         return;
@@ -9219,9 +9264,13 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
     // strip and re-save the peer links redirected above. cleanupSurfaceName
     // runs on the deferred dialog destruction and skips the closing save via
     // suppressFiberSave.
+    // Only the suppression this split sets is its to release on failure.
+    std::vector<std::weak_ptr<LineAnnotationSession>> suppressedBySplit;
     for (const auto& otherPane : _panes) {
-        if (otherPane.session && otherPane.session->fiberId == parentId) {
+        if (otherPane.session && otherPane.session->fiberId == parentId &&
+            !otherPane.session->suppressFiberSave) {
             otherPane.session->suppressFiberSave = true;
+            suppressedBySplit.push_back(otherPane.session);
         }
     }
     const auto reopenTarget =
@@ -9240,6 +9289,7 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
                                  prefixFiberId, suffixFiberId, prefixFileName,
                                  suffixFileName, reopenFiberId,
                                  reopenControlIndex, suppressErrors,
+                                 suppressedBySplit,
                                  packageGeneration = _packageGeneration]() {
         // As in the merge: the parent, its path and its id belong to the
         // package the split ran in, and a package switch before or during
@@ -9255,20 +9305,24 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
             return;
         }
         closeDialogPanesForFibers({parentId});
+        // Closing can yield through a pane's finalization or error dialog.
+        if (packageChanged()) {
+            return;
+        }
         closeIntersectionInspectionForRetiredFibers({parentId});
         // Fail loudly instead of reconciling: on any problem below, the
         // original is kept, its surviving sessions are made saveable again,
         // and a full reload rebuilds memory from disk (branch refs re-derive
         // from branch_file; the halves' needs_reoptimization tag re-prompts
         // the re-fit). The user resolves the duplicate old/new fibers.
-        const auto bailOut = [this, parentId, suppressErrors](const QString& reason) {
-            for (const auto& otherPane : _panes) {
-                if (otherPane.session && otherPane.session->fiberId == parentId) {
-                    otherPane.session->suppressFiberSave = false;
+        const auto bailOut = [this, suppressedBySplit, suppressErrors](const QString& reason) {
+            for (const auto& weak : suppressedBySplit) {
+                if (const auto session = weak.lock(); session && !session->fiberDeleted) {
+                    session->suppressFiberSave = false;
                 }
             }
             showError(tr("The split could not be completed: %1\nThe original "
-                         "fiber was kept; reloading fibers from disk.")
+                         "fiber was left as it was; reloading fibers from disk.")
                           .arg(reason),
                       suppressErrors);
             loadFibersForCurrentPackage();
@@ -9325,6 +9379,11 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
         // the split CPs. Consumes the needs_reoptimization tag set at
         // creation; an aborted batch keeps it for the next load's prompt.
         reoptimizeMergedFibers({prefixFileName, suffixFileName});
+        // The re-fit yields (dataset picker, save drain); the halves' ids
+        // belong to the package the split ran in.
+        if (packageChanged()) {
+            return;
+        }
 
         invalidateFiberAlignmentMetrics(prefixFiberId, true);
         invalidateFiberAlignmentMetrics(suffixFiberId, true);
@@ -9348,10 +9407,10 @@ void LineAnnotationController::handleGeneratedControlPointUnlink(
         return;
     }
     auto& session = *pane->session;
-    if (session.suppressFiberSave) {
-        // The fiber was deleted underneath this session; its links can no
-        // longer be edited, or the edit would be persisted as a new file.
-        showError(tr("This fiber was deleted; its links can no longer be edited."),
+    if (session.fiberDeleted) {
+        // The fiber was deleted underneath this session; a structural edit
+        // would be persisted as a new file under the deleted name.
+        showError(tr("This fiber was deleted; it can no longer be edited."),
                   session.suppressErrorDialogs);
         return;
     }
@@ -9435,10 +9494,10 @@ void LineAnnotationController::handleGeneratedControlPointSetLinkPending(
         return;
     }
     auto& session = *pane->session;
-    if (session.suppressFiberSave) {
-        // The fiber was deleted underneath this session; its links can no
-        // longer be edited, or the edit would be persisted as a new file.
-        showError(tr("This fiber was deleted; its links can no longer be edited."),
+    if (session.fiberDeleted) {
+        // The fiber was deleted underneath this session; a structural edit
+        // would be persisted as a new file under the deleted name.
+        showError(tr("This fiber was deleted; it can no longer be edited."),
                   session.suppressErrorDialogs);
         return;
     }
@@ -13176,9 +13235,17 @@ void LineAnnotationController::reoptimizeMergedFibers(
     double workingToBaseScale = 1.0;
 
     const QPointer<LineAnnotationController> alive(this);
+    // The file names belong to the package this was called for; the dataset
+    // picker and each fiber's save can yield, and after a package switch the
+    // same names would denote other files.
+    const uint64_t packageGeneration = _packageGeneration;
     int reoptimized = 0;
     bool scheduledTagOnlySave = false;
     for (const std::string& fiberFileName : fiberFileNames) {
+        if (_packageGeneration != packageGeneration) {
+            Logger()->warn("Re-optimization abandoned: the package changed");
+            return;
+        }
         const auto it = std::find_if(
             _fibers.begin(), _fibers.end(),
             [&fiberFileName](const StoredFiber& fiber) {
@@ -13232,6 +13299,11 @@ void LineAnnotationController::reoptimizeMergedFibers(
                                    "for the next load",
                                    kNeedsReoptimizationTag);
                 }
+                return;
+            }
+            if (_packageGeneration != packageGeneration) {
+                Logger()->warn("Re-optimization abandoned: the package changed "
+                               "while the dataset was being chosen");
                 return;
             }
             dataset = session->dataset;
@@ -15652,13 +15724,18 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
     // A session whose fiber was deleted underneath it is not saved through
     // here - the close with a final optimization included - or it would
     // recreate the deleted file (or overwrite an import under that name).
-    // The link handlers refuse such a session and the linked-peer snapshot
-    // loop below skips one, so the other persistence routes agree.
-    if (session.suppressFiberSave) {
+    // Checked again after the finalize below, which can yield (its dataset
+    // picker) and so let a delete land meanwhile. The transient
+    // suppressFiberSave (headless save, retirement window) is deliberately
+    // not consulted here: those sessions still save on close.
+    if (session.fiberDeleted) {
         return;
     }
     try {
         if (!finalizeSessionOptimizationSynchronously(session, false)) {
+            return;
+        }
+        if (session.fiberDeleted) {
             return;
         }
         if (session.lineWasOptimized) {
@@ -15782,7 +15859,7 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
             for (const auto& pane : _panes) {
                 if (!pane.session || pane.session.get() == &session ||
                     pane.session->fiberId != linkedFiberId ||
-                    pane.session->suppressFiberSave ||
+                    pane.session->fiberDeleted ||
                     pane.session->taskState != LineAnnotationSession::TaskState::Succeeded ||
                     pane.session->optimizedLine.points.empty() ||
                     pane.session->controlPoints.empty()) {
