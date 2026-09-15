@@ -67,6 +67,9 @@ public:
     // kind. Callers that draw both use two items.
     void setLineCommands(std::vector<OverlayLineCommand> commands);
     void setPointCommands(std::vector<OverlayPointCommand> commands);
+    // Fast path for opaque dots with one shared style. Pen width is the dot
+    // diameter; RoundCap gives circular dots without per-point style objects.
+    void setUniformPoints(std::vector<QPointF> points, const QPen& pen);
 
     void paint(QPainter* painter,
                const QStyleOptionGraphicsItem* option,
@@ -77,5 +80,7 @@ private:
 
     std::vector<OverlayLineCommand> _lines;
     std::vector<OverlayPointCommand> _points;
+    std::vector<QPointF> _uniformPoints;
+    QPen _uniformPen;
     QRectF _bounds;
 };

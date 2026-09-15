@@ -1,4 +1,5 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
+#include "ConstraintGraphWorkspace.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
 
 #include <QBuffer>
@@ -408,6 +409,8 @@ QJsonObject AgentBridgeServer::handleWorkspaceSwitch(const QJsonValue& params)
         _window->switchToMainWorkspace();
     } else if (name == QLatin1String("lasagna")) {
         _window->switchToLasagnaWorkspace();
+    } else if (name == QLatin1String("constraint-graph")) {
+        _window->_workspaceTabs->setCurrentWidget(_window->_constraintGraphWorkspace);
     } else {
         _window->switchToFiberSliceWorkspace();
     }

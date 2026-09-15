@@ -31,6 +31,8 @@ set(srcs
     LineAnnotationFiberSaveJob.hpp
     FiberNameDisplay.cpp
     FiberNameDisplay.hpp
+    ConstraintGraphWorkspace.cpp
+    ConstraintGraphWorkspace.hpp
     FiberMapWorkspace.cpp
     FiberMapWorkspace.hpp
     FiberNetworkLayout.cpp
@@ -363,6 +365,7 @@ target_link_libraries(VC3D
     $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
     vc_atlas
+    vc_constraints
     vc_lasagna
     vc_fiber_tracer
     vc_tracer

@@ -221,3 +221,11 @@ if(VC_USE_PCH)
         target_precompile_headers(${_lib} REUSE_FROM vc_common_pch)
     endforeach()
 endif()
+
+# Interactive constraint graph geometry is independent of the Qt workspace.
+add_library(vc_constraints
+    src/constraints/GraphCatalog.cpp
+    src/constraints/GraphCycleAudit.cpp
+    src/constraints/GraphFit.cpp
+    src/constraints/GraphSession.cpp)
+target_link_libraries(vc_constraints PUBLIC vc_core vc_lasagna PRIVATE Ceres::ceres)

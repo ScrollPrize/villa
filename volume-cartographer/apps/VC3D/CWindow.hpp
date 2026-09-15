@@ -130,6 +130,7 @@ class ViewerCompositePanel;
 class LineAnnotationDialog;
 class SpiralWorkspace;
 class FiberMapWorkspace;
+class ConstraintGraphWorkspace;
 
 class CWindow : public QMainWindow
 {
@@ -186,6 +187,7 @@ public:
                      RenderBenchOptions benchOptions = {});
     ~CWindow(void);
 
+    void openConstraintGraphSession(const QString& path);
     bool openVolumePackage(const QString& path,
                            bool interactive = true,
                            QString* errorMessage = nullptr,
@@ -431,6 +433,7 @@ private:
     QMainWindow* _spiralWorkspaceWindow{nullptr};
     SpiralWorkspace* _spiralWorkspace{nullptr};
     FiberMapWorkspace* _fiberMapWorkspace{nullptr};
+    ConstraintGraphWorkspace* _constraintGraphWorkspace{nullptr};
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
     QDockWidget* _inkDetectionDock{nullptr};

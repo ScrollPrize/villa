@@ -476,3 +476,22 @@ add_test(NAME spiral_brush_patch COMMAND test_spiral_brush_patch)
 vc_register_test_target(test_spiral_brush_patch)
 vc_register_ctest(spiral_brush_patch test_spiral_brush_patch)
 set_tests_properties(spiral_brush_patch PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_executable(test_constraint_graph test_constraint_graph.cpp)
+set_target_properties(test_constraint_graph PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_link_libraries(test_constraint_graph PRIVATE vc_constraints Qt6::Core Qt6::Test)
+add_test(NAME constraint_graph COMMAND test_constraint_graph)
+vc_register_test_target(test_constraint_graph)
+vc_register_ctest(constraint_graph test_constraint_graph)
+
+add_executable(test_constraint_graph_overlay test_constraint_graph_overlay.cpp ../overlays/OverlayBatchItem.cpp)
+set_target_properties(test_constraint_graph_overlay PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_link_libraries(test_constraint_graph_overlay PRIVATE vc_core Qt6::Widgets Qt6::Test)
+add_test(NAME constraint_graph_overlay COMMAND test_constraint_graph_overlay)
+set_tests_properties(constraint_graph_overlay PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+vc_register_test_target(test_constraint_graph_overlay)
+vc_register_ctest(constraint_graph_overlay test_constraint_graph_overlay)
+
+# Explicit real-data validation tool; never registered as a dataset-dependent CTest.
+add_executable(constraint_graph_probe constraint_graph_probe.cpp)
+target_link_libraries(constraint_graph_probe PRIVATE vc_constraints)
