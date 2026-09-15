@@ -171,9 +171,9 @@ public slots:
                                    int steps,
                                    bool inpaintOnly);
     void onFocusPOIChanged(std::string name, POI* poi);
-    void onPointDoubleClicked(uint64_t pointId);
+    void onPointDoubleClicked(vc::PointRef point);
     void onCopyWithNtRequested();
-    void onFocusViewsRequested(uint64_t collectionId, uint64_t pointId);
+    void onFocusViewsRequested(uint64_t collectionId, std::optional<vc::PointRef> point);
 
 public:
     enum class VolumeOpenError {
@@ -361,7 +361,7 @@ private slots:
     void onZScrollSensitivityChanged(double sensitivity);
     void onSharedCacheStatsChanged(const QStringList& items);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
-    void onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId);
+    void onConvertPointToAnchor(vc::PointRef point);
     void onNewFiberRequested();
     void onFiberCrosshairModeChanged(bool active);
     void onFiberViewersRequested();

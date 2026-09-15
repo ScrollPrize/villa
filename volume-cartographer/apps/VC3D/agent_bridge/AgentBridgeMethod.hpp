@@ -150,7 +150,7 @@ inline AgentBridgeParam optionalSafeId(const QString& name)
         .name = name,
         .type = AgentBridgeParamType::Integer,
         .finite = true,
-        .minimum = 1.0,
+        .minimum = 0.0,
         .maximum = 9007199254740991.0,
     };
     return param;

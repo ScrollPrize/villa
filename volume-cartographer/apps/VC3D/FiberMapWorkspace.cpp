@@ -2329,9 +2329,8 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
     // the menu is open. Two protections: the dependency set is captured now and
     // re-compared when an action fires, because bestIndex indexes the control
     // points as they were when the menu was built — an edit in between could
-    // have made it mean a different point, or none; and the runtime id is
-    // resolved from the file name at that same moment, because a reload
-    // reassigns ids.
+    // have made it mean a different point, or none; and the fiber must still
+    // be loaded under the captured id and file name at that same moment.
     const vc3d::fiber_map::FiberMapDependencies menuDependencies =
         currentDependencies();
     // Parentless: exec() runs a nested event loop, and a parented stack menu would
@@ -2343,7 +2342,7 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
                                             .arg(bestIndex)
                                             .arg(displayName));
     connect(action, &QAction::triggered, this,
-            [this, fileName, bestIndex, menuDependencies]() {
+            [this, fiberId, fileName, bestIndex, menuDependencies]() {
                 if (!_controller) {
                     return;
                 }
@@ -2376,33 +2375,32 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
                         fileName);
                     return;
                 }
-                // The defense the generation cannot give: a file name that no
-                // longer resolves under an unchanged generation means a bump
-                // was missed somewhere, and this map cannot be trusted until
-                // it is rebuilt — the one staleness that latches.
-                const uint64_t target = _controller->fiberIdForFileName(fileName);
-                if (target == 0) {
+                // The defense the generation cannot give: a fiber no longer
+                // loaded under its id and name under an unchanged generation
+                // means a bump was missed somewhere, and this map cannot be
+                // trusted until it is rebuilt — the one staleness that latches.
+                if (!_controller->hasLoadedFiber(fiberId, fileName)) {
                     markStale(tr("Fibers changed — press Update"));
                     Logger()->warn("Fiber map: {} is no longer loaded; not navigating",
                                    fileName);
                     return;
                 }
-                emit openFiberAtControlPointRequested(target, bestIndex);
+                emit openFiberAtControlPointRequested(fiberId, bestIndex);
             });
         menu.addSeparator();
     }
     QAction* deleteAction = menu.addAction(tr("Delete %1…").arg(displayName));
     deleteAction->setEnabled(!_deleteInFlight);
     connect(deleteAction, &QAction::triggered, this,
-            [this, fileName, displayName, menuDependencies]() {
+            [this, fiberId, fileName, displayName, menuDependencies]() {
                 // Deferred past menu.exec()'s nested loop: the confirmation
                 // is modal, and the delete itself ends in a scene rebuild
                 // that must not tear items down while the press that opened
                 // the menu is still unwinding.
                 QMetaObject::invokeMethod(
                     this,
-                    [this, fileName, displayName, menuDependencies]() {
-                        confirmAndDeleteFiber(fileName, displayName, menuDependencies);
+                    [this, fiberId, fileName, displayName, menuDependencies]() {
+                        confirmAndDeleteFiber(fiberId, fileName, displayName, menuDependencies);
                     },
                     Qt::QueuedConnection);
             });
@@ -2452,11 +2450,11 @@ void FiberMapWorkspace::handleTreeContextMenu(const QPoint& pos)
     QAction* deleteAction = menu.addAction(tr("Delete %1…").arg(displayName));
     deleteAction->setEnabled(!_deleteInFlight);
     connect(deleteAction, &QAction::triggered, this,
-            [this, fileName, displayName, menuDependencies]() {
+            [this, fiberId, fileName, displayName, menuDependencies]() {
                 QMetaObject::invokeMethod(
                     this,
-                    [this, fileName, displayName, menuDependencies]() {
-                        confirmAndDeleteFiber(fileName, displayName, menuDependencies);
+                    [this, fiberId, fileName, displayName, menuDependencies]() {
+                        confirmAndDeleteFiber(fiberId, fileName, displayName, menuDependencies);
                     },
                     Qt::QueuedConnection);
             });
@@ -2464,6 +2462,7 @@ void FiberMapWorkspace::handleTreeContextMenu(const QPoint& pos)
 }
 
 void FiberMapWorkspace::confirmAndDeleteFiber(
+    uint64_t fiberId,
     const std::string& fileName,
     const QString& displayName,
     const vc3d::fiber_map::FiberMapDependencies& menuDependencies)
@@ -2512,7 +2511,7 @@ void FiberMapWorkspace::confirmAndDeleteFiber(
     dialog->setDefaultButton(QMessageBox::Cancel);
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     connect(dialog, &QMessageBox::buttonClicked, this,
-            [this, dialog, fileName, menuDependencies](QAbstractButton* button) {
+            [this, dialog, fiberId, fileName, menuDependencies](QAbstractButton* button) {
                 // Only the answer is read here. The delete itself is queued
                 // out of the dialog's own signal delivery: it drains queued
                 // saves in a nested loop, and a workspace torn down during
@@ -2523,8 +2522,8 @@ void FiberMapWorkspace::confirmAndDeleteFiber(
                 }
                 QMetaObject::invokeMethod(
                     this,
-                    [this, fileName, menuDependencies]() {
-                        deleteConfirmedFiber(fileName, menuDependencies);
+                    [this, fiberId, fileName, menuDependencies]() {
+                        deleteConfirmedFiber(fiberId, fileName, menuDependencies);
                     },
                     Qt::QueuedConnection);
             });
@@ -2541,6 +2540,7 @@ void FiberMapWorkspace::confirmAndDeleteFiber(
 }
 
 void FiberMapWorkspace::deleteConfirmedFiber(
+    uint64_t fiberId,
     const std::string& fileName,
     const vc3d::fiber_map::FiberMapDependencies& menuDependencies)
 {
@@ -2557,10 +2557,12 @@ void FiberMapWorkspace::deleteConfirmedFiber(
         return;
     }
     // Anything could have happened while the dialog stood open (a reload, a
-    // package switch): the dependency set is checked again, and only then is
-    // the id resolved from the file name. A name that no longer resolves
-    // under unchanged dependencies means the map is not to be trusted until
-    // rebuilt - the one staleness that latches.
+    // package switch): the dependency set is checked again, and then the
+    // fiber must still be loaded under the id AND the name the menu named
+    // (runtime ids are stable and unique across sources; a bare name is
+    // not, so the id is what is deleted). A fiber gone under unchanged
+    // dependencies means the map is not to be trusted until rebuilt - the
+    // one staleness that latches.
     const StaleVerdict verdict = vc3d::fiber_map::staleVerdictFor(
         menuDependencies, currentDependencies(), /*layoutBuilt=*/true, QString());
     if (verdict.action != StaleVerdict::Action::Fresh) {
@@ -2570,8 +2572,7 @@ void FiberMapWorkspace::deleteConfirmedFiber(
                        fileName);
         return;
     }
-    const uint64_t target = _controller->fiberIdForFileName(fileName);
-    if (target == 0) {
+    if (!_controller->hasLoadedFiber(fiberId, fileName)) {
         markStale(tr("Fibers changed — press Update"));
         Logger()->warn("Fiber map: {} is no longer loaded; not deleting", fileName);
         return;
@@ -2580,7 +2581,7 @@ void FiberMapWorkspace::deleteConfirmedFiber(
     // deleteFibers drains queued saves in a nested loop, during which this
     // workspace could be destroyed; `self` keeps the epilogue off a dead
     // object.
-    _controller->deleteFibers({target});
+    _controller->deleteFibers({fiberId});
     if (!self) {
         return;
     }

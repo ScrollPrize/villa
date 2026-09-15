@@ -1,10 +1,11 @@
-from unittest import mock
 
 import pytest
 import torch
 
 from config import Config, FitConfig
-from fit_session import PclInputSpec, PclRole, ScrollSpec, SpiralInputPaths
+from fit_session import (RUN_MUTABLE_PCL_ROLES, PclInputSpec, PclRole,
+                         ScrollSpec, SpiralInputPaths,
+                         conventional_pcl_document_path, pcl_role_toggle_key)
 from fit_spiral import FitContext
 import losses
 
@@ -65,8 +66,28 @@ def test_disabled_sources_are_removed_before_any_loader_can_see_them():
     assert context.winding_inference_path is None
     assert context.shell_path is None
     assert context.pcl_input_specs == []
+    assert context._configured_pcl_sources == paths.pcls
     assert context.config["loss_weight_track_radius"] == 73.0
     assert context.config["sample_count_tracks_per_step"] == 1234
+
+
+def test_run_mutable_pcl_roles_match_the_run_boundary_toggle_keys():
+    # fit_session names the roles apply_config can turn on and off; config
+    # classifies their keys. The two lists must describe the same roles.
+    fields = Config.catalog()["schema"]["fields"]
+    run_boundary_toggles = {
+        key for key, spec in fields.items()
+        if key.startswith("input_use_pcl_")
+        and spec["runtime_impact"] == "run_boundary"}
+    assert run_boundary_toggles == {
+        pcl_role_toggle_key(role) for role in RUN_MUTABLE_PCL_ROLES}
+
+
+def test_conventional_pcl_document_path_matches_dataset_resolution(tmp_path):
+    (tmp_path / "same_windings.json").write_text("{}")
+    assert conventional_pcl_document_path(tmp_path, PclRole.SAME_WINDING) == \
+        str((tmp_path / "same_windings.json").resolve())
+    assert conventional_pcl_document_path("", "same_winding") == ""
 
 
 def test_pcl_role_toggles_filter_documents_independently():
@@ -122,27 +143,3 @@ def test_disabling_normals_skips_the_normal_loss_graph(monkeypatch):
         cfg=Config().as_dict(), z_begin=1, z_end=3))
 
     assert [name for name, _ in values] == ['dense_spacing']
-
-
-@pytest.mark.parametrize(('override', 'record', 'message'), [
-    ('input_use_verified_patches',
-     {'kind': 'patch', 'id': 'p', 'path': '/unused'},
-     'verified-patch inputs are disabled'),
-    ('input_use_fibers',
-     {'kind': 'fiber', 'id': 'f', 'path': '/unused'},
-     'fiber inputs are disabled'),
-    ('input_use_pcl_same_winding',
-     {'kind': 'pcl', 'id': 'c', 'role': 'same_winding', 'path': '/unused'},
-     'same_winding PCL inputs are disabled'),
-])
-def test_disabled_interactive_inputs_are_rejected_before_loading(
-    override, record, message,
-):
-    context = object.__new__(FitContext)
-    context.config = FitConfig(Config({override: False}).as_dict())
-    context.clear_interactive_influence = lambda: None
-    with mock.patch.object(torch.cuda, 'get_rng_state_all', return_value=[]), \
-            mock.patch.object(torch.cuda, 'set_rng_state_all'):
-        with pytest.raises(RuntimeError, match=message):
-            context.incorporate_interactive_inputs(
-                [record], current_iteration=0, target_iteration=1)

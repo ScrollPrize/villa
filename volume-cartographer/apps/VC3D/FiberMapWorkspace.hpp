@@ -258,16 +258,18 @@ private:
     // the same Delete.
     void handleTreeContextMenu(const QPoint& pos);
     // The confirmed delete both menus end in. Runs outside the menus' nested
-    // event loops; the fiber is re-resolved from its file name after the
-    // confirmation dialog, and nothing happens if the map's dependencies
-    // moved since the menu was built.
-    void confirmAndDeleteFiber(const std::string& fileName,
+    // event loops; the fiber must still be loaded under the same id and file
+    // name after the confirmation dialog, and nothing happens if the map's
+    // dependencies moved since the menu was built.
+    void confirmAndDeleteFiber(uint64_t fiberId,
+                               const std::string& fileName,
                                const QString& displayName,
                                const vc3d::fiber_map::FiberMapDependencies& menuDependencies);
     // The delete itself, queued out of the confirmation dialog's signal:
-    // dependencies re-checked, id re-resolved from the file name, then the
+    // dependencies re-checked, the fiber re-checked by id and name, then the
     // controller's deleteFibers behind a lifetime guard.
-    void deleteConfirmedFiber(const std::string& fileName,
+    void deleteConfirmedFiber(uint64_t fiberId,
+                              const std::string& fileName,
                               const vc3d::fiber_map::FiberMapDependencies& menuDependencies);
     void selectFiberRow(uint64_t fiberId);
     [[nodiscard]] uint64_t fiberAt(const QPointF& scenePos) const;

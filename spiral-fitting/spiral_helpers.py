@@ -147,16 +147,40 @@ def _decimate_ordered_points_min_spacing(points, min_spacing, return_indices=Fal
     return points[keep]
 
 
-def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0):
+def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0, *, base_shape_zyx=None):
     # Fiber JSONs are stored as one vc3d_fiber per file. Their control_points and
     # line_points are x/y/z coordinates at 4x the scale used by the regular PCL
-    # JSONs. line_points is the dense traced polyline; the control points lie
-    # exactly on it, and the tracer extends it ~150 points past the first and
+    # JSONs unless coordinate_base_shape_zyx declares their domain. line_points
+    # is the dense traced polyline; the control points lie exactly on it, and the tracer extends it ~150 points past the first and
     # last control point. We fit against the dense polyline, trimmed to the
     # first-to-last control point span so the dangling ends don't act as
     # constraints.
     with open(path, 'r') as f:
         data = json.load(f)
+
+    source_shape = data.get('coordinate_base_shape_zyx')
+    if source_shape is not None:
+        for name, shape in (('coordinate_base_shape_zyx', source_shape),
+                            ('base_shape_zyx', base_shape_zyx)):
+            if (not isinstance(shape, (list, tuple)) or len(shape) != 3
+                    or any(isinstance(v, bool) or not isinstance(v, (int, np.integer))
+                           or v <= 0 for v in shape)):
+                raise ValueError(f'{name} must contain three positive integers')
+        # Match VC3D's published domains: pyramids may round extents up or
+        # down, and same-level shapes may use inclusive maximum coordinates.
+        # Use the dyadic scale, not a ratio of rounded dimensions.
+        scales = []
+        for exponent in range(-5, 6):
+            factor = 2 ** abs(exponent)
+            large, small = ((source_shape, base_shape_zyx) if exponent <= 0
+                            else (base_shape_zyx, source_shape))
+            if all((abs(a - b) <= 1 if exponent == 0 else
+                    b in ((a + factor - 1) // factor, max(1, a // factor)))
+                   for a, b in zip(large, small)):
+                scales.append(2.0 ** exponent)
+        if len(scales) != 1:
+            raise ValueError('Fiber and dataset coordinate domains are incompatible or ambiguous')
+        coordinate_scale = scales[0]
 
     if data.get('version', 1) == 1 and not data.get('control_points'):
         print(f'WARNING: fiber {path} has no control_points; skipping')
@@ -269,7 +293,68 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
     return collection
 
 
-def load_fiber_point_collections(path, next_id, min_point_spacing=20.0):
+def classify_fiber_hv(hv_classification, zyxs, *, min_z_fraction,
+                      min_auto_certainty):
+    """Return 'V', 'H', or None for one fiber polyline.
+
+    Precedence: VC3D's manual H/V tag, then its automatic tag when the
+    recorded certainty (0..1) reaches ``min_auto_certainty``, then a geometric
+    fallback on the polyline itself: the strip is vertical when its z extent
+    covers at least ``min_z_fraction`` of its path length, horizontal when the
+    z extent covers at most ``1 - min_z_fraction`` of it, and untagged
+    otherwise. These tags drive radial offsets and patch-side linking.
+    """
+    hv = hv_classification if isinstance(hv_classification, dict) else {}
+    manual = str(hv.get('manual_tag') or '').strip().upper()
+    if manual in ('H', 'V'):
+        return manual
+    automatic = str(hv.get('automatic_tag') or '').strip().upper()
+    if automatic in ('H', 'V'):
+        try:
+            certainty = float(hv.get('automatic_certainty', 0.0))
+        except (TypeError, ValueError):
+            certainty = 0.0
+        if certainty >= min_auto_certainty:
+            return automatic
+    zyxs = np.asarray(zyxs, dtype=np.float64)
+    if zyxs.ndim != 2 or len(zyxs) < 2:
+        return None
+    path_length = float(np.linalg.norm(np.diff(zyxs, axis=0), axis=-1).sum())
+    if path_length <= 0.0:
+        return None
+    z_fraction = float(zyxs[:, 0].max() - zyxs[:, 0].min()) / path_length
+    if z_fraction >= min_z_fraction:
+        return 'V'
+    if z_fraction <= 1.0 - min_z_fraction:
+        return 'H'
+    return None
+
+
+def fiber_collection_hv_tag(pcl, *, min_z_fraction, min_auto_certainty):
+    """'V', 'H', or None for a resident fiber collection.
+
+    Applies classify_fiber_hv to the collection's VC3D ``hv_classification``
+    metadata and its id-ordered points (the geometric fallback runs on the
+    load-time decimated polyline rather than the fit strip, so the fallback
+    can differ marginally from the strip's tag). Collections that are not
+    fibers (``metadata.logical_input_kind != 'fiber'``) are untagged.
+    """
+    metadata = pcl.get('metadata') or {}
+    if metadata.get('logical_input_kind') != 'fiber':
+        return None
+    points = pcl.get('points') or {}
+    ordered = sorted(points.items(), key=lambda kv: int(kv[0]))
+    zyxs = np.asarray(
+        [np.asarray(point.get('zyx', point['p'][::-1]), dtype=np.float64)
+         for _, point in ordered],
+        dtype=np.float64).reshape(-1, 3)
+    return classify_fiber_hv(
+        metadata.get('hv_classification'), zyxs,
+        min_z_fraction=min_z_fraction,
+        min_auto_certainty=min_auto_certainty)
+
+
+def load_fiber_point_collections(path, next_id, min_point_spacing=20.0, *, base_shape_zyx=None):
     if not path:
         return {}, next_id
     fiber_paths = sorted(glob.glob(os.path.join(path, '*.json')))
@@ -282,7 +367,9 @@ def load_fiber_point_collections(path, next_id, min_point_spacing=20.0):
     skipped = 0
     for fiber_path in fiber_paths:
         try:
-            pcl = load_fiber_point_collection(fiber_path, next_id, min_point_spacing=min_point_spacing)
+            pcl = load_fiber_point_collection(
+                fiber_path, next_id, min_point_spacing=min_point_spacing,
+                base_shape_zyx=base_shape_zyx)
         except Exception as e:
             print(f'WARNING: failed to load fiber {fiber_path}: {e}')
             skipped += 1
@@ -325,7 +412,8 @@ def _point_id_for_orig_index(pcl, orig_index):
     return int(np.argmin(np.abs(np.asarray(kept) - orig_index)))
 
 
-def resolve_fiber_links(point_collections, include_pending=False):
+def resolve_fiber_links(point_collections, include_pending=False,
+                        assume_unannotated=False):
     """Resolve stored branch metadata into concrete point-to-point links.
 
     Fibers/PCLs carry raw 'branches' (see load_fiber_point_collection), each
@@ -336,6 +424,10 @@ def resolve_fiber_links(point_collections, include_pending=False):
 
     Returns a list of dicts:
         {'a_coll', 'a_point', 'b_coll', 'b_point', 'pending'}
+
+    ``assume_unannotated`` is for the canonical fiber catalog: its shared
+    point dictionaries are zero-normalized after their first materialization,
+    but source fiber documents are intrinsically unannotated.
     """
     by_basename = {}
     for cid, pcl in point_collections.items():
@@ -348,7 +440,7 @@ def resolve_fiber_links(point_collections, include_pending=False):
     # decomposition, so every consumer of the link graph (the cross-patch merge,
     # the unattached walk sampling) agrees on membership. Must run before
     # normalise_pcl_winding_annotations 0-fills unannotated pcls.
-    annotated_cids = {
+    annotated_cids = set() if assume_unannotated else {
         cid for cid, pcl in point_collections.items()
         if any(np.isfinite(p['winding_annotation']) for p in pcl['points'].values())
     }
@@ -714,6 +806,11 @@ def merge_linked_point_collections(point_collections, link_components,
             continue
         merged_id = f'fibercomp:{num_merged}'
         rep = members[0][1]
+        logical_members = [
+            pcl.get('metadata', {}).get('logical_input_id')
+            for _, pcl in members
+            if pcl.get('metadata', {}).get('logical_input_id') is not None
+        ]
         if extra_edges:
             print(f'fiber-link component {merged_id} '
                   f'({[cid for cid, _ in members]}): {len(extra_edges)} '
@@ -723,7 +820,8 @@ def merge_linked_point_collections(point_collections, link_components,
             'name': merged_id,
             'sampling_group': rep.get('sampling_group', 'fibers'),
             'metadata': {'winding_is_absolute': False,
-                         'input_role': 'fiber_link_component'},
+                         'input_role': 'fiber_link_component',
+                         'logical_input_ids': logical_members},
             'points': merged_points,
             'link_member_cids': [cid for cid, _ in members],
             'chain': ComponentChain(member_sorted, pos_of, tree_parent, extra_edges),
@@ -1265,16 +1363,30 @@ def _build_spliced_overlay(
     dr_per_winding,
     patch_atlas,
     patch_evaluation,
+    *,
+    first_winding=0,
 ):
+    """Overwrite ``scroll_zyxs`` with patch geometry wherever a patch that
+    passes the splicing profile covers the grid.
+
+    ``scroll_zyxs`` is ``[z, theta, 3]`` over the windings
+    ``first_winding .. first_winding + len(num_thetas_by_winding) - 1``
+    laid side by side along the theta axis; ``num_thetas_by_winding[k]``
+    is the theta count of winding ``first_winding + k``.
+    """
     started = time.perf_counter()
     device = scroll_zyxs.device
     dr = dr_per_winding.detach()
-    num_windings = len(num_thetas_by_winding)
+    first_winding = int(first_winding)
+    num_windings = first_winding + len(num_thetas_by_winding)
+    # Index the offset/count tables by absolute winding: windings below the
+    # grid's first one have no columns and are excluded from eligibility.
+    num_thetas_full = [0] * first_winding + [int(n) for n in num_thetas_by_winding]
     winding_offsets_t = torch.cat([
         torch.zeros([1], dtype=torch.long, device=device),
-        torch.cumsum(torch.tensor(num_thetas_by_winding, dtype=torch.long, device=device), dim=0),
+        torch.cumsum(torch.tensor(num_thetas_full, dtype=torch.long, device=device), dim=0),
     ])
-    num_thetas_t = torch.tensor(num_thetas_by_winding, dtype=torch.long, device=device)
+    num_thetas_t = torch.tensor(num_thetas_full, dtype=torch.long, device=device)
 
     profile = patch_evaluation.profiles['splicing']
     eligible_patches = (profile.satisfied_patches
@@ -1282,7 +1394,7 @@ def _build_spliced_overlay(
     packed_patch_indices = patch_evaluation.patch_indices
     target_winding_cpu = patch_evaluation.target_winding_indices.cpu()
     eligible = (eligible_patches[packed_patch_indices]
-                & (target_winding_cpu >= 0)
+                & (target_winding_cpu >= first_winding)
                 & (target_winding_cpu < num_windings))
     eligible_indices = torch.where(eligible)[0]
     if eligible_indices.numel() == 0:
@@ -1460,7 +1572,11 @@ def save_combined_preview(
     tracks=(),
     *,
     surface_id,
+    base_shape_zyx=None,
     progress=None,
+    input_extent_transform=None,
+    patch_atlas=None,
+    patch_satisfaction_evaluation=None,
 ):
     """Write the authoritative connected preview used by VC3D and Lasagna.
 
@@ -1471,13 +1587,31 @@ def save_combined_preview(
     flow ODE to derive a bound the configuration already states. Only a run
     that leaves the index unset derives the bound, and then from a bounded
     sample rather than from every point.
+
+    ``slice_to_spiral_transform`` maps true scroll space to spiral space and
+    its inverse places the surface. ``input_extent_transform`` (default: the
+    same transform) is the one the inputs are read through when the bound is
+    derived: after a constraint-bake reset the resident inputs live in baked
+    space and are read through the live chain, while the surface is pulled
+    back through the composed frozen+live chain.
+
+    When ``patch_satisfaction_evaluation`` (from
+    ``evaluate_patch_satisfaction_packed`` with the splicing profile) and its
+    ``patch_atlas`` are given, the transformed surface is spliced onto the
+    satisfied patches exactly as the final ``_spliced`` meshes are: wherever
+    such a patch covers the grid, its own geometry replaces the model's. The
+    caller passes ``None`` only when the resident patches are not in true
+    scroll space (after a constraint bake), where splicing would write
+    baked-space coordinates into a scroll-space surface.
     """
+    if input_extent_transform is None:
+        input_extent_transform = slice_to_spiral_transform
     configured_outer = cfg.get('shell_outer_winding_idx')
     if configured_outer is not None:
         exclusive_upper = int(configured_outer) + 1
     else:
         (_, exclusive_upper), _, _ = compute_winding_range_and_input_extents(
-            slice_to_spiral_transform,
+            input_extent_transform,
             dr_per_winding,
             patches,
             unattached_pcl_strips,
@@ -1513,14 +1647,14 @@ def save_combined_preview(
         dtype=torch.float32,
         device=dr_per_winding.device,
     )
-    winding_grids = {}
-    total_windings = last_winding - first_winding + 1
+    preview_windings = list(range(first_winding, last_winding + 1))
+    winding_scrolls = []
+    total_windings = len(preview_windings)
     if progress is not None:
         progress.begin(
             'exporting_preview', 'Transforming preview windings',
             step=0, total_steps=total_windings, unit='windings')
-    for winding_number, winding in enumerate(
-            range(first_winding, last_winding + 1), start=1):
+    for winding_number, winding in enumerate(preview_windings, start=1):
         yxs = spiral_yxs_by_winding[winding]
         if yxs.shape[0] < 2:
             raise RuntimeError(f'Preview winding {winding} has fewer than two theta samples')
@@ -1535,9 +1669,32 @@ def save_combined_preview(
         scroll = torch.cat(pieces, dim=0).reshape_as(spiral)
         outside = (scroll[..., 0] < z_begin) | (scroll[..., 0] >= z_end)
         scroll[outside] = -1.0
-        winding_grids[winding] = scroll.cpu().numpy().astype(np.float32)
+        winding_scrolls.append(scroll)
         if progress is not None:
             progress.update(winding_number, detail=f'winding {winding}')
+
+    if patch_satisfaction_evaluation is not None:
+        # Same splice as save_mesh's `_spliced` variant: the windings are
+        # laid side by side along theta, the satisfied patches are
+        # rasterized over them, then the grid is split back per winding.
+        if progress is not None:
+            progress.begin(
+                'exporting_preview', 'Splicing patches into preview surface')
+        num_thetas_by_winding = [
+            int(scroll.shape[1]) for scroll in winding_scrolls]
+        combined_scroll = torch.cat(winding_scrolls, dim=1)
+        _build_spliced_overlay(
+            combined_scroll, num_thetas_by_winding, z0, grid_spacing,
+            slice_to_spiral_transform, dr_per_winding,
+            patch_atlas, patch_satisfaction_evaluation,
+            first_winding=first_winding,
+        )
+        winding_scrolls = list(
+            torch.split(combined_scroll, num_thetas_by_winding, dim=1))
+    winding_grids = {
+        winding: scroll.cpu().numpy().astype(np.float32)
+        for winding, scroll in zip(preview_windings, winding_scrolls)
+    }
 
     if progress is not None:
         progress.begin(
@@ -1552,6 +1709,7 @@ def save_combined_preview(
         source='fit_spiral interactive preview',
         first_winding=first_winding,
         cleanup_erosion_cells=3,
+        base_shape_zyx=base_shape_zyx,
     )
     return manifest
 

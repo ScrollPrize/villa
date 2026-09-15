@@ -178,6 +178,23 @@ struct GeneratedSpanAlignmentMetric {
     std::string message;
 };
 
+// Positions cross from the stored fiber grid to the viewer grid together;
+// directions and line indices are independent of that uniform scale.
+inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::BranchLinkMarker& marker,
+                                          double scale)
+{
+    marker.localControlPoint *= static_cast<float>(scale);
+    marker.linkedControlPoint *= static_cast<float>(scale);
+    marker.planePoint *= static_cast<float>(scale);
+}
+
+inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::PredSnapMarker& marker,
+                                          double scale)
+{
+    marker.controlPoint *= static_cast<float>(scale);
+    marker.snapPoint *= static_cast<float>(scale);
+}
+
 struct GeneratedViews {
     std::string lineSurfaceName;
     QString lineSurfaceTitle;
@@ -483,9 +500,12 @@ inline constexpr double kGeneratedSideCutHalfWrapAngle = 3.14159265358979323846;
 // the point to the center at that point's z (non-finite when unknown). A point
 // without a usable direction gets NaN and does not break the chain: the next
 // finite angle continues from the last finite one. No towardCenter: all NaN.
+// pointToCenterFrameScale maps all three query coordinates into the center
+// provider's grid (including z for a center that varies along the scroll).
 inline std::vector<double> unwrappedGeneratedWindingAngles(
     const std::vector<cv::Vec3f>& linePoints,
-    const std::function<cv::Vec3f(const cv::Vec3f&)>& towardCenter)
+    const std::function<cv::Vec3f(const cv::Vec3f&)>& towardCenter,
+    float pointToCenterFrameScale = 1.0f)
 {
     constexpr double kTwoPi = 2.0 * kGeneratedSideCutHalfWrapAngle;
     std::vector<double> angles(linePoints.size(), std::numeric_limits<double>::quiet_NaN());
@@ -498,7 +518,7 @@ inline std::vector<double> unwrappedGeneratedWindingAngles(
         if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
             continue;
         }
-        const cv::Vec3f toCenter = towardCenter(point);
+        const cv::Vec3f toCenter = towardCenter(point * pointToCenterFrameScale);
         if (!std::isfinite(toCenter[0]) || !std::isfinite(toCenter[1])) {
             continue;
         }

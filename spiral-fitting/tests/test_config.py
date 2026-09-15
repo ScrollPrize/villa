@@ -1,9 +1,13 @@
 import inspect
 import json
+from pathlib import Path
 
 import pytest
 
-from config import Config, FitConfig, MODEL_STAGE_KEYS, rebuild_stage
+from config import (
+    Config, FitConfig, MODEL_STAGE_KEYS, NEW_FIT_KEYS, SHELL_ATLAS_KEYS,
+    rebuild_stage,
+    unaudited_prefixed_keys)
 from fit_session import run_mutable_config
 
 
@@ -64,11 +68,19 @@ def test_input_participation_toggles_are_rebuild_scoped_booleans():
         "input_use_surf_sdt", "input_use_fiber_directions",
         "input_use_tracks",
     }
+    # The editable point-collection roles (same-winding, relative) have a
+    # live add/replace/delete path, so their toggles apply at a Run boundary;
+    # every other participation toggle is a rebuild.
+    run_boundary = {"input_use_pcl_relative", "input_use_pcl_same_winding"}
     for key in expected:
         assert catalog["defaults"][key] is (key not in default_off)
         assert catalog["schema"]["fields"][key]["type"] == "boolean"
-        assert catalog["schema"]["fields"][key]["runtime_impact"] == "new_fit"
+        assert catalog["schema"]["fields"][key]["runtime_impact"] == (
+            "run_boundary" if key in run_boundary else "new_fit"), key
         assert catalog["schema"]["fields"][key]["description"]
+    assert rebuild_stage(["model_num_flow_stages",
+                          "input_use_pcl_same_winding"]) == "model"
+    assert rebuild_stage(["input_use_pcl_absolute"]) == "all"
 
 
 def test_z_range_is_advertised_as_owned_by_the_run_controls():
@@ -100,16 +112,14 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
         if key.startswith("dt_"):
             assert field["runtime_impact"] == "run_boundary"
         if key.startswith("shell_"):
-            expected = (
-                "new_fit"
-                if key in {"shell_num_theta_bins",
-                           "shell_table_smooth_sigma_z",
-                           "shell_table_smooth_sigma_theta",
-                           "shell_min_confidence"}
-                else "run_boundary")
-            assert field["runtime_impact"] == expected
-    # Input identities and shell-atlas construction are fixed for a resident
-    # session; ordinary shell loss settings remain run-mutable.
+            # The atlas settings rebuild the resident lookup at a Run
+            # boundary (apply_config refuses them only when the session's
+            # tracks were filtered against the shell at load).
+            assert field["runtime_impact"] == "run_boundary"
+        if key.startswith("output_"):
+            # Read at export/preview time only.
+            assert field["runtime_impact"] == "run_boundary"
+    # Input identities are fixed for a resident session.
     assert schema["paths"] == {}
 
     mutable_tracks = {
@@ -125,15 +135,43 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
     }
     assert all(fields[key]["runtime_impact"] == "run_boundary"
                for key in mutable_tracks)
-    assert all(fields[key]["runtime_impact"] == "new_fit"
+    assert all(fields[key]["runtime_impact"] == "run_boundary"
                for key in {
                    "track_crossing_precompute_max", "track_crossing_mode",
                    "track_exclusion_radius",
                })
+    run_mutable_pcl = {
+        "pcl_vertical_fiber_radial_offset_enabled", "pcl_vertical_fiber_radial_offset_voxels",
+        "pcl_link_distance_tolerance", "pcl_link_window_points", "pcl_link_window_min_points",
+        "pcl_fiber_link_side_filter", "pcl_fiber_link_side_margin_voxels", "pcl_fiber_link_model_direction_step",
 
+        "pcl_rel_winding_adjacent_patches_only",
+        "pcl_stratified_pcl_sampling", "pcl_sampling_weights",
+        "pcl_use_fiber_links", "pcl_use_pending_fiber_links",
+        "pcl_unattached_pcl_min_point_spacing",
+        "pcl_fiber_min_point_spacing",
+    }
+    for key, field in fields.items():
+        if key.startswith("pcl_"):
+            expected = "run_boundary" if key in run_mutable_pcl else "new_fit"
+            assert field["runtime_impact"] == expected, key
+        # input_ keys are participation gates and a rebuild, except the
+        # editable point-collection roles, whose live add/replace/delete
+        # path lets apply_config load or drop the whole role.
+        if key.startswith("input_"):
+            expected = (
+                "run_boundary"
+                if key in {"input_use_pcl_same_winding",
+                           "input_use_pcl_relative"} else "new_fit")
+            assert field["runtime_impact"] == expected, key
+    assert unaudited_prefixed_keys(fields) == []
+
+    # The vertical-fiber radial offset is refilled onto retained strips at a
+    # Run boundary; every other pcl_ setting shapes prepared inputs.
 
 def test_rebuild_stage_is_model_only_for_the_allowlist():
     assert rebuild_stage([]) == "model"
+    assert rebuild_stage(["model_num_flow_stages"]) == "model"
     assert rebuild_stage(["model_num_flow_integration_steps"]) == "model"
     assert rebuild_stage(["model_num_flow_integration_steps",
                           "model_linear_z_resolution"]) == "model"
@@ -144,6 +182,14 @@ def test_rebuild_stage_is_model_only_for_the_allowlist():
     assert rebuild_stage(["model_flow_bounds_z_margin"]) == "all"
     # Unaudited/unknown keys fail safe rather than raising.
     assert rebuild_stage(["not_a_setting"]) == "all"
+    # The shell atlas settings are run-boundary knobs until the resident
+    # session has filtered its tracks against the shell; then apply_config
+    # refuses them and only a full rebuild can apply them.
+    for key in SHELL_ATLAS_KEYS:
+        assert rebuild_stage([key]) == "model"
+        assert rebuild_stage([key], shell_filtered_tracks=True) == "all"
+    assert rebuild_stage(["loss_weight_shell_outer"],
+                         shell_filtered_tracks=True) == "model"
 
 
 def test_the_allowlist_is_a_subset_of_the_new_fit_settings():
@@ -221,3 +267,18 @@ def test_obsolete_patch_sampling_fields_are_not_in_the_schema():
         assert key not in catalog["schema"]["fields"]
         with pytest.raises(ValueError, match="Unknown"):
             Config({key: "straight" if key.endswith("sampling") else 1.0})
+
+
+def test_dt_loss_schedule_is_not_advanced_or_durable_configuration():
+    catalog = Config.catalog()
+    assert "influence_disable_dt_frac" not in catalog["defaults"]
+    assert "influence_disable_dt_frac" not in catalog["schema"]["fields"]
+    with pytest.raises(ValueError, match="Unknown"):
+        Config({"influence_disable_dt_frac": 0.75})
+
+
+def test_golden_metadata_uses_new_metric_and_excludes_removed_field():
+    golden = (Path(__file__).parent / "golden" / "golden_bands.json").read_text()
+    assert "run_dt_suppressed" in golden
+    assert "interactive_dt_suppressed" not in golden
+    assert "influence_disable_dt_frac" not in golden

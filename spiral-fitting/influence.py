@@ -29,6 +29,7 @@ import time
 import numpy as np
 import torch
 
+from flow_fields import CartesianFlowField
 from sample_spiral import get_theta_and_radii
 
 
@@ -137,6 +138,10 @@ class InteractiveInfluenceState:
         self.device = device
         self.masks = {}  # 'flow_lr'/'flow_hr' [Z,Y,X] fp16, 'gap' [num_z,total] fp16
         self.footprints = []  # per input: {'input_id', 'kind', 'zst' cpu fp32} (diagnostics)
+        # Authoritative contribution by logical input. Revisions replace this
+        # entry; masks are rebuilt from the map so old geometry is not unioned
+        # forever.
+        self.contributions = {}
         self.anchor_scroll = None  # [A,3] fp32
         self.anchor_target = None  # [A,3] fp32, spiral-space
         self.anchor_w = None  # [A] fp32, accumulated influence weight
@@ -167,7 +172,7 @@ class InteractiveInfluenceState:
         for input_id, pcl in new_collections.items():
             zyx = torch.from_numpy(np.stack(
                 [point['zyx'] for point in pcl['points'].values()], axis=0)).to(torch.float32)
-            per_input.append((str(input_id), 'pcl', zyx))
+            per_input.append((input_id, 'pcl', zyx))
         footprint_parts = []
         for input_id, kind, zyx in per_input:
             # copy=True: the subsample may alias the input's own tensor, and the
@@ -176,8 +181,21 @@ class InteractiveInfluenceState:
             zyx[:, 0] = zyx[:, 0].clamp(float(z_begin), float(z_end - 1))
             zst = spiral_zst(_apply_transform_chunked(slice_to_spiral_transform, zyx),
                              dr_per_winding).to(torch.float32)
-            self.footprints.append({'input_id': input_id, 'kind': kind, 'zst': zst.cpu()})
+            logical_kind = kind
+            logical_id = input_id
+            revision = None
+            if kind == 'pcl' and input_id in new_collections:
+                metadata = new_collections[input_id].get('metadata', {})
+                logical_kind = metadata.get('logical_input_kind') or kind
+                logical_id = metadata.get('logical_input_id') or str(input_id)
+                revision = metadata.get('logical_input_revision')
+            contribution = {
+                'input_id': str(logical_id), 'kind': logical_kind,
+                'revision': revision, 'zst': zst.cpu(),
+            }
+            self.contributions[(logical_kind, str(logical_id))] = contribution
             footprint_parts.append(zst)
+        self.footprints = list(self.contributions.values())
         return torch.cat(footprint_parts, dim=0) if footprint_parts else \
             torch.empty([0, 3], dtype=torch.float32, device=self.device)
 
@@ -189,20 +207,17 @@ class InteractiveInfluenceState:
 
     @torch.no_grad()
     def _allocate_masks(self, spiral_and_transform):
-        flow_fields = spiral_and_transform.flow_fields
-        for flow_field in flow_fields:
-            if not hasattr(flow_field, 'flows') or len(flow_field.flows) != 2:
-                raise RuntimeError(
-                    'interactive influence regions require cartesian flow fields '
-                    '(low-res + high-res lattices)')
-        lr_flow, hr_flow = flow_fields[0].flows
-        if any(
-            tuple(field.flows[level].shape[2:]) != tuple((lr_flow, hr_flow)[level].shape[2:])
-            for field in flow_fields
-            for level in range(2)
-        ):
+        flow_field = spiral_and_transform.flow_field
+        # The masks assume the trilinear lattice's one-cell support; wider
+        # bases (b-spline) and non-cartesian lattices would need their own
+        # mask geometry.
+        if not isinstance(flow_field, CartesianFlowField):
             raise RuntimeError(
-                'interactive influence regions require all flow stages to share lattice shapes')
+                'interactive influence regions require cartesian flow fields '
+                '(low-res + high-res lattices)')
+        # Masks are spatial ([Z, Y, X]) and broadcast over every flow stage
+        # (the lattices' leading slab axis) and vector component.
+        lr_flow, hr_flow = flow_field.flows
         gap_logits = spiral_and_transform.gap_expander_params.logits
         self.masks = {
             'flow_lr': torch.zeros(lr_flow.shape[2:], dtype=torch.float16, device=self.device),
@@ -241,13 +256,13 @@ class InteractiveInfluenceState:
 
     @torch.no_grad()
     def _flow_z_displacement_bound(self, spiral_and_transform):
-        v_max = 0.
-        for flow_field in spiral_and_transform.flow_fields:
-            lr_flow, hr_flow = flow_field.flows
-            v_max = v_max + (
-                lr_flow[:, 0].abs().max()
-                + hr_flow[:, 0].abs().max()
-            )
+        # Every stage (slab) can displace by its own peak z velocity, and the
+        # stages compose, so the bound sums the per-slab maxima.
+        lr_flow, hr_flow = spiral_and_transform.flow_field.flows
+        v_max = (
+            lr_flow[:, 0].abs().flatten(1).amax(dim=1).sum()
+            + hr_flow[:, 0].abs().flatten(1).amax(dim=1).sum()
+        )
         z_range = float(spiral_and_transform.flow_max_corner_zyx[0]
                         - spiral_and_transform.flow_min_corner_zyx[0])
         return float(v_max) * z_range
@@ -346,17 +361,26 @@ class InteractiveInfluenceState:
         if footprint_zst.shape[0] == 0:
             raise RuntimeError('influence footprint is empty for the incorporated inputs')
 
-        self._update_gap_mask(spiral_and_transform, footprint_zst)
-        self._update_flow_mask(spiral_and_transform, 'flow_lr', footprint_zst, dr_per_winding)
-        self._update_flow_mask(spiral_and_transform, 'flow_hr', footprint_zst, dr_per_winding)
+        # Recompute the union from authoritative per-input contributions. This
+        # is the key difference between adding another input and revising one.
+        for mask in self.masks.values():
+            mask.zero_()
+        authoritative = torch.cat(
+            [entry['zst'].to(self.device) for entry in self.contributions.values()],
+            dim=0)
+        self._update_gap_mask(spiral_and_transform, authoritative)
+        self._update_flow_mask(
+            spiral_and_transform, 'flow_lr', authoritative, dr_per_winding)
+        self._update_flow_mask(
+            spiral_and_transform, 'flow_hr', authoritative, dr_per_winding)
 
         # Refresh anchor targets to the current state and union the new
         # region's weight at each anchor.
         anchor_spiral = _apply_transform_chunked(slice_to_spiral_transform, self.anchor_scroll)
         self.anchor_target = anchor_spiral.to(torch.float32)
         anchor_zst = spiral_zst(anchor_spiral, dr_per_winding).to(torch.float32)
-        w_new = influence_weight(anchor_zst, footprint_zst, self.limits, self.sigma)
-        self.anchor_w = torch.maximum(self.anchor_w, w_new)
+        self.anchor_w = influence_weight(
+            anchor_zst, authoritative, self.limits, self.sigma)
         self.anchor_loss_weight = (1. - self.anchor_w).clamp(0., 1.) ** self.ramp_power
 
         self._apply_optimizer_surgery(spiral_and_transform, optimiser)
@@ -368,17 +392,61 @@ class InteractiveInfluenceState:
               f'anchors held: {int((self.anchor_loss_weight > 0.5).sum())}/{self.anchor_w.shape[0]}')
 
     @torch.no_grad()
+    def remove_logical_contributions_(self, identities, *,
+                                      spiral_and_transform, optimiser):
+        """Remove deleted logical inputs and rebuild every derived mask."""
+        removed = False
+        for kind, input_id in identities:
+            removed = self.contributions.pop((kind, str(input_id)), None) \
+                is not None or removed
+        if not removed:
+            return
+        self.footprints = list(self.contributions.values())
+        for mask in self.masks.values():
+            mask.zero_()
+        if not self.contributions:
+            if self.anchor_w is not None:
+                self.anchor_w.zero_()
+                self.anchor_loss_weight = torch.ones_like(self.anchor_w)
+            self.deactivate_(spiral_and_transform, optimiser)
+            self.num_incorporations = 0
+            return
+
+        authoritative = torch.cat(
+            [entry['zst'].to(self.device)
+             for entry in self.contributions.values()], dim=0)
+        slice_to_spiral_transform = \
+            spiral_and_transform.get_slice_to_spiral_transform()
+        dr_per_winding = spiral_and_transform.get_dr_per_winding()
+        self._update_gap_mask(spiral_and_transform, authoritative)
+        self._update_flow_mask(
+            spiral_and_transform, 'flow_lr', authoritative, dr_per_winding)
+        self._update_flow_mask(
+            spiral_and_transform, 'flow_hr', authoritative, dr_per_winding)
+        if self.anchor_scroll is not None:
+            anchor_spiral = _apply_transform_chunked(
+                slice_to_spiral_transform, self.anchor_scroll)
+            self.anchor_target = anchor_spiral.to(torch.float32)
+            anchor_zst = spiral_zst(
+                anchor_spiral, dr_per_winding).to(torch.float32)
+            self.anchor_w = influence_weight(
+                anchor_zst, authoritative, self.limits, self.sigma)
+            self.anchor_loss_weight = \
+                (1. - self.anchor_w).clamp(0., 1.) ** self.ramp_power
+        self._apply_optimizer_surgery(spiral_and_transform, optimiser)
+        self.num_incorporations += 1
+
+    @torch.no_grad()
     def _apply_optimizer_surgery(self, spiral_and_transform, optimiser):
         # Adam momentum would keep moving masked-out elements after their
         # gradients are zeroed; scale it by the mask (zero where fully masked).
         gap_logits = spiral_and_transform.gap_expander_params.logits
-        masked_params = [(gap_logits, self.masks['gap'])]
-        for flow_field in spiral_and_transform.flow_fields:
-            lr_flow, hr_flow = flow_field.flows
-            masked_params.extend((
-                (lr_flow, self.masks['flow_lr']),
-                (hr_flow, self.masks['flow_hr']),
-            ))
+        lr_flow, hr_flow = spiral_and_transform.flow_field.flows
+        masked_params = [
+            (gap_logits, self.masks['gap']),
+            (lr_flow, self.masks['flow_lr']),
+            (hr_flow, self.masks['flow_hr']),
+        ]
         for param, mask in masked_params:
             state = optimiser.state.get(param)
             if state and 'exp_avg' in state:
@@ -417,13 +485,12 @@ class InteractiveInfluenceState:
     @torch.no_grad()
     def apply_grad_masks_(self, spiral_and_transform):
         gap_logits = spiral_and_transform.gap_expander_params.logits
-        masked_params = [(gap_logits, self.masks['gap'])]
-        for flow_field in spiral_and_transform.flow_fields:
-            lr_flow, hr_flow = flow_field.flows
-            masked_params.extend((
-                (lr_flow, self.masks['flow_lr']),
-                (hr_flow, self.masks['flow_hr']),
-            ))
+        lr_flow, hr_flow = spiral_and_transform.flow_field.flows
+        masked_params = [
+            (gap_logits, self.masks['gap']),
+            (lr_flow, self.masks['flow_lr']),
+            (hr_flow, self.masks['flow_hr']),
+        ]
         for param, mask in masked_params:
             if param.grad is not None:
                 param.grad.mul_(mask)

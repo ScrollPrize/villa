@@ -1,5 +1,9 @@
 #pragma once
 
+#include <set>
+
+#include "FiberRuntimeIds.hpp"
+
 #include <QObject>
 #include <QPointF>
 #include <QPointer>
@@ -49,6 +53,8 @@ class SurfacePanelController;
 class ViewerManager;
 class VolumePkg;
 class QWidget;
+namespace vc::lasagna { class LasagnaDataset; class LasagnaNormalSampler; }
+namespace vc::fiber_tracer { class FiberPredictionField; }
 
 class LineAnnotationController : public QObject
 {
@@ -151,9 +157,8 @@ public:
     struct FiberMapFiber {
         // Runtime id, valid only for the generation this snapshot was taken in.
         uint64_t id = 0;
-        // Stable identity across loads within a package; the runtime id is
-        // per package and can be retired, so anything acted on later must
-        // be resolved from this.
+        // Stable identity across loads; anything acted on later is resolved
+        // from this.
         std::string fileName;
         // "<file prefix>-<sequence>", e.g. "kb-604".
         QString label;
@@ -262,6 +267,27 @@ public:
                                              int,
                                              int)>;
 
+    struct ResolvedFiberOptimizationInputs {
+        std::shared_ptr<vc::lasagna::LasagnaDataset> normalDataset;
+        std::shared_ptr<vc::lasagna::LasagnaNormalSampler> baseNormalSampler;
+        std::shared_ptr<vc::lasagna::LasagnaDataset> traceNormalDataset;
+        std::shared_ptr<vc::lasagna::LasagnaNormalSampler> traceNormalSampler;
+        std::shared_ptr<vc::lasagna::LasagnaDataset> fiberDataset;
+        std::shared_ptr<vc::fiber_tracer::FiberPredictionField> predictions;
+        std::string normalManifestLocation;
+        std::string fiberManifestLocation;
+        double traceToBaseScale = 1.0;
+    };
+
+    struct HeadlessFiberOptimizationRequest {
+        std::vector<cv::Vec3d> controlPointsL0;
+        ResolvedFiberOptimizationInputs inputs;
+        std::filesystem::path destinationFiberSource;
+        std::function<bool()> shouldSave;
+    };
+    using HeadlessFiberCompletion =
+        std::function<void(bool, const QString&, uint64_t)>;
+
     LineAnnotationController(CState* state,
                              ViewerManager* viewerManager,
                              QWidget* parentWidget,
@@ -347,9 +373,13 @@ public:
     // a new project invalidates its data outright, while a new umbilicus only
     // moves where that data lands.
     [[nodiscard]] uint64_t packageGeneration() const { return _packageGeneration; }
-    // Runtime id of the loaded fiber with this file name, or 0 when the package
-    // no longer holds it. The stable way to act on a fiber recorded earlier.
+    // Resolve an exact source file, including an independently editable copy.
+    [[nodiscard]] uint64_t fiberIdForFilePath(const std::filesystem::path& path) const;
+    // First loaded filename match; use the full path when sources may overlap.
     [[nodiscard]] uint64_t fiberIdForFileName(const std::string& fileName) const;
+    // Whether the fiber with this runtime id is loaded under this file name
+    // (a caller that captured both before a yield checks they still agree).
+    [[nodiscard]] bool hasLoadedFiber(uint64_t fiberId, const std::string& fileName) const;
     // Display name as shown in the fiber panel (file stem, "unnamed" fallback).
     [[nodiscard]] QString fiberDisplayName(uint64_t fiberId) const;
     // File stem of a fiber by id (live session first, then stored), or
@@ -407,6 +437,21 @@ public:
     // running Spiral fit.
     [[nodiscard]] std::filesystem::path fiberFilePath(uint64_t fiberId) const;
 
+    bool registerExternalFiberSource(const std::filesystem::path& source,
+                                     QString* errorMessage = nullptr, bool workingCopy = false);
+    void unregisterExternalFiberSource(const std::filesystem::path& source);
+    bool flushFiberSavesForDestinationChange(QString* errorMessage = nullptr);
+    bool redirectFiberSource(const std::filesystem::path& source,
+                             const std::filesystem::path& workingCopy,
+                             QString* errorMessage = nullptr);
+    [[nodiscard]] std::optional<ResolvedFiberOptimizationInputs>
+        resolveFiberOptimizationInputs(
+            const std::string& fallbackNormalLocation,
+            const std::string& fallbackFiberLocation,
+            QString* errorMessage = nullptr) const;
+    void optimizeAndSaveFiberHeadless(HeadlessFiberOptimizationRequest request,
+                                      HeadlessFiberCompletion completion);
+
     // Bumped whenever the project's umbilicus attachment changes. Cheap to
     // read, so holders of geometry placed relative to the umbilicus can compare
     // it lazily instead of being signalled.
@@ -431,6 +476,7 @@ signals:
         LineAnnotationController::FiberSummary::AlignmentMetrics alignment,
         std::vector<LineAnnotationController::FiberSummary::AlignmentMetrics> spanAlignments);
     void fiberSaved(uint64_t fiberId, uint64_t generation);
+    void fiberFileRemoved(const QString& path);
     void fibersDeleted(std::vector<uint64_t> fiberIds);
     void atlasCreated(std::filesystem::path atlasDir);
 
@@ -480,6 +526,7 @@ private:
         std::string startedAt;
         uint64_t sequence = 0;
         std::string fileName;
+        std::filesystem::path sourceRoot;
         uint64_t generation = 1;
         std::vector<vc3d::line_annotation::StoredControlPoint> controlPoints;
         std::vector<cv::Vec3d> linePoints;
@@ -492,6 +539,10 @@ private:
         std::vector<std::string> tags;
         vc3d::line_annotation::FiberOptimizationMode optimizationMode =
             vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+        // Coordinate domain in which control_points and line_points are
+        // stored. New Spiral-created fibers record the fiber manifest's L0
+        // shape so a downsampled active volume can display them correctly.
+        std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX;
         bool needsSave = false;
     };
 
@@ -826,6 +877,9 @@ private:
     [[nodiscard]] std::vector<std::filesystem::path> saveGeneratedQuadMeshes(LineAnnotationSession& session);
     [[nodiscard]] PaneRecord* paneForSurface(const std::string& surfaceName);
     [[nodiscard]] const PaneRecord* paneForSurface(const std::string& surfaceName) const;
+    [[nodiscard]] cv::Vec3f fiberBasePointFromViewer(
+        const std::string& surfaceName,
+        cv::Vec3f volumePoint) const;
     // "H"/"V" from the manual tag, falling back to the automatic classification;
     // empty when unknown or the fiber isn't loaded.
     [[nodiscard]] QString fiberHvDirectionTag(uint64_t fiberId) const;
@@ -843,6 +897,13 @@ private:
                                                              int activeStart = -1,
                                                              int activeEnd = -1) const;
     void loadFibersForCurrentPackage();
+    // Drop fibers that are the same fiber seen through several sources (or
+    // identical geometry under another name); records link aliases so branch
+    // links written against a dropped copy still resolve to the survivor.
+    void dedupeLoadedFiberSources(std::vector<StoredFiber>& fibers,
+                                  const std::vector<std::filesystem::path>& sourcePreference);
+    [[nodiscard]] std::string loadedFiberLinkKey(const StoredFiber& from,
+                                                 const std::string& branchFileName) const;
     [[nodiscard]] bool validateLoadedFiberLinks(std::vector<StoredFiber>& fibers,
                                                 std::vector<std::string>& errors) const;
     // Fibers merged by the sync tool (scripts/fiber_merge.py) carry a
@@ -870,6 +931,17 @@ private:
     void addKnownFiberTags(const std::vector<std::string>& tags);
     [[nodiscard]] std::filesystem::path fibersRootDir() const;
     [[nodiscard]] std::filesystem::path fibersDir() const;
+    [[nodiscard]] std::filesystem::path primaryFiberSourceRoot() const;
+    [[nodiscard]] bool fiberNameOwnedByLiveFiber(const std::filesystem::path& sourceRoot,
+                                                 const std::string& fileName) const;
+    // Base grid the fiber's stored geometry lives in: the shape stored in the
+    // fiber itself, else the manifest its trace spans recorded, else the
+    // package's selected fiber-inference dataset (see
+    // fiberBaseShapeManifestCandidates). nullopt when none can be resolved.
+    [[nodiscard]] std::optional<std::array<std::size_t, 3>>
+        resolveStoredFiberCoordinateBaseShape(const StoredFiber& fiber) const;
+    [[nodiscard]] std::optional<std::array<std::size_t, 3>>
+        fiberManifestBaseShape(const std::string& location) const;
     [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path fiberPath(uint64_t fiberId) const;
     [[nodiscard]] std::filesystem::path fiberPath(const StoredFiber& fiber) const;
@@ -881,20 +953,7 @@ private:
     void attachAtlasPredSnaps(const StoredFiber& fiber,
                               LineAnnotationSession& session,
                               const std::filesystem::path& atlasDir);
-    // A fresh runtime fiber id: above every id this package has handed out
-    // and every live one (stored or in an open session), and at least
-    // minimumId. Ids are never recycled within a package; see
-    // LineAnnotationFiberIdentity.hpp.
-    [[nodiscard]] uint64_t allocateFiberId(uint64_t minimumId = 0);
-    [[nodiscard]] std::vector<uint64_t> liveSessionFiberIds() const;
-    // Assigns runtime ids to a freshly loaded list (known file names keep
-    // their ids, new ones get fresh ids) and remaps the stored branch refs by
-    // file name onto them.
-    void assignRuntimeFiberIds(std::vector<StoredFiber>& fibers);
-    // Binds a persisted fiber's file name to its id in the package's id space
-    // (see LineAnnotationFiberIdentity.hpp). Called once a write is accepted
-    // or has succeeded, never before.
-    void registerFiberIdentity(const StoredFiber& fiber);
+    [[nodiscard]] uint64_t nextFiberId() const;
     [[nodiscard]] uint64_t nextFiberSequenceForUsername(const std::string& username) const;
     [[nodiscard]] std::string currentFiberUsername() const;
     [[nodiscard]] static std::string currentFiberDateTimeString();
@@ -1084,6 +1143,17 @@ private:
     int _nextPaneId = 1;
     std::vector<PaneRecord> _panes;
     std::vector<StoredFiber> _fibers;
+    mutable vc3d::FiberRuntimeIds _fiberRuntimeIds;
+    std::vector<std::filesystem::path> _externalFiberSources;
+    std::set<std::filesystem::path> _workingCopyFiberSources;
+    std::map<std::filesystem::path, std::filesystem::path> _fiberSourceRedirects;
+    // dropped (sourceRoot/fileName) -> surviving key, rebuilt on every load.
+    std::unordered_map<std::string, std::string> _loadedFiberLinkAliases;
+    // Runtime id -> source-qualified file key as of the last non-empty fiber
+    // list, so a reload can follow an open session's link to a copy the
+    // dedupe dropped through _loadedFiberLinkAliases to its survivor. See
+    // loadFibersForCurrentPackage.
+    std::unordered_map<uint64_t, std::string> _formerFiberKeyById;
     std::vector<std::string> _knownFiberTags;
     std::unordered_map<uint64_t, CachedFiberAlignmentMetrics> _fiberAlignmentMetrics;
     std::unordered_set<uint64_t> _pendingFiberAlignmentMetrics;
@@ -1143,18 +1213,6 @@ private:
     uint64_t _fiberDataGeneration = 1;
     // See packageGeneration(); starts at 1 for the same reason.
     uint64_t _packageGeneration = 1;
-    // The package's runtime id space: which file name holds which id, and the
-    // next id never handed out. It outlives every reload of the fiber list
-    // within the package (so a fiber keeps its id across import, repair and
-    // vpkg-ready reloads, and a retired id is never reused) and is reset when
-    // the package changes. _runtimeIdsPackageGeneration says which package
-    // it belongs to.
-    // Bound at the explicit lifecycle points where a fiber's identity is
-    // established or changed: the loader, the save queue (after validation),
-    // the merge and split writes, a completed rename; retired by the delete,
-    // merge and split retirements.
-    vc3d::line_annotation::RuntimeFiberIdSpace _runtimeIds;
-    uint64_t _runtimeIdsPackageGeneration = 0;
     // Counts loads of the fiber list. A load that yields to the event loop
     // before publishing (the broken-link prompt, the repair-error dialog)
     // compares its own number against this afterwards and stands down if a
@@ -1229,6 +1287,11 @@ private:
     };
     mutable std::map<std::filesystem::path, StorageSnapshotCacheEntry>
         _storageSnapshotCache;
+    // Resolved manifest location -> base_shape_zyx. Opening a fiber session
+    // re-reads the manifest otherwise; successes only, so a failed (moved or
+    // remote) location is retried next time.
+    mutable std::unordered_map<std::string, std::array<std::size_t, 3>>
+        _fiberManifestBaseShapeCache;
     // See cachedControlSpansForFiber: keyed by fiber id, valid while the
     // fiber's save generation and the package generation match.
     struct ControlSpanCacheEntry {

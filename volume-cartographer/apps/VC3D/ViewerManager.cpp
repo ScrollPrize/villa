@@ -295,6 +295,18 @@ void ViewerManager::setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t ov
     });
 }
 
+void ViewerManager::setPreferSurfaceTileFills(bool enabled)
+{
+    if (_preferSurfaceTileFills == enabled) {
+        return;
+    }
+    _preferSurfaceTileFills = enabled;
+    forEachBaseViewer([enabled](VolumeViewerBase* viewer) {
+        if (viewer)
+            viewer->setPreferSurfaceTileFills(enabled);
+    });
+}
+
 void ViewerManager::onGlobalTick()
 {
     for (auto* v : _baseViewers) {
@@ -433,6 +445,7 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     baseViewer->setOverlayComposite(_overlayComposite);
     baseViewer->setSurfaceCacheBudgets(_surfaceCacheBudgetBytes,
                                        _overlaySurfaceCacheBudgetBytes);
+    baseViewer->setPreferSurfaceTileFills(_preferSurfaceTileFills);
 
     if (_segmentationModule && role != ViewerRole::Annotation) {
         _segmentationModule->attachViewer(baseViewer);

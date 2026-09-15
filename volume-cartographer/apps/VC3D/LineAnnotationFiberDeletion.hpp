@@ -5,30 +5,53 @@
 // LineAnnotationController::deleteFibers has to drain queued saves before it
 // removes files, and the drain runs a nested event loop that still delivers
 // input: the package can change, a fiber can be deleted, renamed or replaced
-// meanwhile (and, before runtime ids were made stable across reloads, a reload
-// renumbered every fiber - the regression the tests below still replay). The
-// identity that survives the wait is the file name, and the identity of the
-// package is its generation counter plus its fibers directory. These helpers
-// hold that reasoning in one place, free of Qt and of the controller, so the
-// capture / wait / resolve sequence can be exercised in a unit test with a
-// wait that changes the list.
+// meanwhile, and the list can be reloaded. The identity that survives the
+// wait is the file: its source root plus its file name (a file name alone is
+// not unique across registered sources), and the identity of the package is
+// its generation counter plus its fibers directory. These helpers hold that
+// reasoning in one place, free of Qt and of the controller, so the capture /
+// wait / resolve sequence can be exercised in a unit test with a wait that
+// changes the list.
 //
-// Fiber is any type with `uint64_t id` and `std::string fileName` members.
+// Fiber is any type with `uint64_t id`, `std::string fileName` and
+// `std::filesystem::path sourceRoot` members.
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "LineAnnotationFiberIdentity.hpp"
-
 namespace vc3d::line_annotation
 {
+
+// Whether two (runtime id, file name) pairs name the same stored fiber: the
+// rule shared by branchReferencesFiber, the branch synchronizers and the
+// deletion helpers. Runtime ids are unique across every registered source
+// and stable across reloads (FiberRuntimeIds), so once both sides carry one
+// the ids decide, and an equal file name in another source is not a match.
+// The file name is the fallback when either side has no id (legacy or
+// not-yet-loaded references).
+inline bool sameFiberIdentity(uint64_t idA, const std::string& fileNameA,
+                              uint64_t idB, const std::string& fileNameB)
+{
+    if (idA != 0 && idB != 0) {
+        return idA == idB;
+    }
+    return !fileNameA.empty() && fileNameA == fileNameB;
+}
 
 struct FiberDeleteTarget {
     uint64_t requestedId = 0;
     std::string fileName;
+    std::filesystem::path sourceRoot;
+
+    [[nodiscard]] bool namesFile(const std::string& otherFileName,
+                                 const std::filesystem::path& otherSourceRoot) const
+    {
+        return fileName == otherFileName && sourceRoot == otherSourceRoot;
+    }
 };
 
 struct FiberDeletePackageIdentity {
@@ -51,13 +74,13 @@ struct FiberDeleteResolution {
     // The package identity moved during the wait: nothing may be deleted.
     bool aborted = false;
     std::string abortReason;
-    // Current runtime ids of the targets still loaded, matched by file name.
-    // Sorted and unique, for the caller's binary searches.
+    // Current runtime ids of the targets still loaded, matched by source root
+    // and file name. Sorted and unique, for the caller's binary searches.
     std::vector<uint64_t> resolvedIds;
-    // Targets whose file name no longer names a loaded fiber.
+    // Targets whose file no longer names a loaded fiber.
     std::vector<FiberDeleteTarget> missing;
-    // Targets whose file name names more than one loaded fiber; deleting
-    // either would be a guess, so neither is.
+    // Targets whose file names more than one loaded fiber; deleting either
+    // would be a guess, so neither is.
     std::vector<FiberDeleteTarget> ambiguous;
     // From the capture, carried through for the caller's reporting.
     std::vector<FiberDeleteTarget> targets;
@@ -65,33 +88,41 @@ struct FiberDeleteResolution {
     std::vector<uint64_t> unnamed;
 };
 
+// A fiber the delete removed (or found already absent).
+struct FiberDeleted {
+    uint64_t id = 0;
+    std::string fileName;
+    std::filesystem::path sourceRoot;
+};
+
 // What a delete did, for callers that must report per requested fiber: a
 // requested id can stop naming a loaded fiber during the wait, so the outcome
-// speaks in the file names captured before it. `requested` holds the
-// capture (requested id -> file name) and `deletedFileNames` the files that
-// were removed (or found already absent); `aborted` says the package identity moved and
-// nothing was removed.
+// speaks in the files captured before it. `requested` holds the capture
+// (requested id -> file) and `deleted` the files that were removed; `aborted`
+// says the package identity moved and nothing was removed.
 struct FiberDeleteOutcome {
     bool aborted = false;
     std::string error;
     std::vector<FiberDeleteTarget> requested;
-    std::vector<std::string> deletedFileNames;
+    std::vector<FiberDeleted> deleted;
     // Current runtime ids of the deleted fibers, as emitted to observers.
     std::vector<uint64_t> deletedIds;
 
     [[nodiscard]] bool deletedRequested(uint64_t requestedId) const
     {
         for (const FiberDeleteTarget& target : requested) {
-            if (target.requestedId == requestedId) {
-                return std::find(deletedFileNames.begin(), deletedFileNames.end(),
-                                 target.fileName) != deletedFileNames.end();
+            if (target.requestedId != requestedId) {
+                continue;
             }
+            return std::any_of(deleted.begin(), deleted.end(), [&target](const FiberDeleted& entry) {
+                return target.namesFile(entry.fileName, entry.sourceRoot);
+            });
         }
         return false;
     }
 };
 
-// Before the wait: the file name each requested id would be deleted at.
+// Before the wait: the file each requested id would be deleted at.
 template <class Fiber>
 FiberDeleteCapture captureFiberDeleteTargets(const std::vector<uint64_t>& requestedIds,
                                              const std::vector<Fiber>& fibers)
@@ -109,14 +140,14 @@ FiberDeleteCapture captureFiberDeleteTargets(const std::vector<uint64_t>& reques
             capture.unnamed.push_back(requestedId);
             continue;
         }
-        capture.targets.push_back(FiberDeleteTarget{requestedId, it->fileName});
+        capture.targets.push_back(FiberDeleteTarget{requestedId, it->fileName, it->sourceRoot});
     }
     return capture;
 }
 
 // After the wait: refuse if the package identity moved, otherwise match each
-// captured file name against the current list. The requested ids are never
-// consulted here; the names are the identity.
+// captured file against the current list. The requested ids are never
+// consulted here; the files are the identity.
 template <class Fiber>
 FiberDeleteResolution resolveFiberDeleteTargets(const FiberDeleteCapture& capture,
                                                 const std::vector<Fiber>& fibersNow,
@@ -127,11 +158,9 @@ FiberDeleteResolution resolveFiberDeleteTargets(const FiberDeleteCapture& captur
     resolution.targets = capture.targets;
     resolution.notLoaded = capture.notLoaded;
     resolution.unnamed = capture.unnamed;
-    if (before.fibersDir.empty() || after.fibersDir.empty()) {
-        resolution.aborted = true;
-        resolution.abortReason = "the package has no fibers directory";
-        return resolution;
-    }
+    // An empty fibers directory is a valid configuration (fibers loaded from
+    // registered external sources only; each target carries its own source
+    // root), so only a CHANGE of directory or package aborts.
     if (before.packageGeneration != after.packageGeneration) {
         resolution.aborted = true;
         resolution.abortReason = "the project changed";
@@ -146,7 +175,7 @@ FiberDeleteResolution resolveFiberDeleteTargets(const FiberDeleteCapture& captur
         uint64_t matchedId = 0;
         int matches = 0;
         for (const Fiber& fiber : fibersNow) {
-            if (fiber.fileName == target.fileName) {
+            if (target.namesFile(fiber.fileName, fiber.sourceRoot)) {
                 ++matches;
                 matchedId = fiber.id;
             }
@@ -192,27 +221,19 @@ FiberDeleteResolution resolveFiberDeletionAcrossWait(const std::vector<uint64_t>
 }
 
 // Whether an open annotation session belongs to one of the fibers just
-// deleted, for suppressing its save. A session that knows its file name is
-// matched by that name only (the file name is the identity; an id can be
-// stale); an id match counts only for a session with no name, which has no
-// other identity.
+// deleted, for suppressing its save: sameFiberIdentity against each deleted
+// fiber.
 inline bool sessionBelongsToDeletedFiber(uint64_t sessionFiberId,
                                          const std::string& sessionFileName,
-                                         const std::vector<uint64_t>& deletedIdsSorted,
-                                         const std::vector<std::string>& deletedFileNames)
+                                         const std::vector<FiberDeleted>& deleted)
 {
-    if (!sessionFileName.empty()) {
-        return std::find(deletedFileNames.begin(), deletedFileNames.end(), sessionFileName) !=
-               deletedFileNames.end();
-    }
-    return std::binary_search(deletedIdsSorted.begin(), deletedIdsSorted.end(), sessionFiberId);
+    return std::any_of(deleted.begin(), deleted.end(), [&](const FiberDeleted& entry) {
+        return sameFiberIdentity(sessionFiberId, sessionFileName, entry.id, entry.fileName);
+    });
 }
 
 // Whether a branch (cross-fiber link) reference points at a fiber just
-// deleted. Branch refs carry both the runtime id and the file name of the
-// fiber they point to; the id can be stale after a reload for the same
-// reason as a session's, so when both sides have a file name the names
-// decide, and the id counts only when a name is missing on either side.
+// deleted; the same rule.
 inline bool branchRefersToDeletedFiber(uint64_t branchFiberId,
                                        const std::string& branchFileName,
                                        uint64_t deletedFiberId,

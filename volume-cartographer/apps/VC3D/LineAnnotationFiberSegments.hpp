@@ -264,6 +264,9 @@ struct FiberModeOptimizationRequest {
     std::optional<std::vector<size_t>> dirtySegments;
     bool globalGoalsOnly = false;
     bool retraceAll = false;
+    // Ordinary line annotation retains open geometry outside the controls.
+    // Spiral 2D annotation uses the controls as inclusive bounds.
+    bool retainOpenTails = true;
     std::function<void(const FiberExtrapolationFallbackDiagnostic&)>
         extrapolationFallbackCallback;
     // Cooperative cancellation (see LineOptimizationConfig::cancelFlag):
