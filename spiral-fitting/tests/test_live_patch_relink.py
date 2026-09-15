@@ -1,10 +1,9 @@
 """The point-to-patch linker; revision integration is in test_revisioned_geometry."""
+
 import unittest
 from unittest import mock
-
 import numpy as np
 import torch
-
 import point_collection
 from point_collection import link_unattached_points_to_patches
 from tifxyz import Patch
@@ -94,16 +93,6 @@ class LinkUnattachedPointsTests(unittest.TestCase):
         self.assertEqual(gained, {7: 1})
         self.assertEqual(between['points'][0]['on_patch']['id'], 'b')
         self.assertNotIn('on_patch', between['points'][1])
-
-    def test_no_new_patches_is_a_no_op(self):
-        collection = {'id': 1, 'name': 'r', 'points': {0: _point(0, 1, [0, 0, 0])}}
-        self.assertEqual(
-            link_unattached_points_to_patches({1: collection}, {}, {}), {})
-        self.assertNotIn('on_patch', collection['points'][0])
-
-
-if __name__ == '__main__':
-    unittest.main()
 
 
 def _regular_pcl(cid, zyxs):

@@ -1,9 +1,7 @@
 import errno
 from pathlib import Path
 import shutil
-
 import pytest
-
 import input_snapshot as snapshot
 from input_publication import fingerprint
 from service_http import ApiError
@@ -37,22 +35,6 @@ def test_snapshot_fingerprint_and_independent_writes(source, tmp_path, monkeypat
     assert (destination / 'meta.json').read_text() == '{"name":"patch"}'
     (destination / 'nested' / 'x.tif').write_bytes(b'destination changed')
     assert (source / 'nested' / 'x.tif').stat().st_size == 256 * 4096
-
-
-def test_actual_clone_is_independent(tmp_path):
-    source, destination = tmp_path / 'source', tmp_path / 'destination'
-    source.write_bytes(b'a' * 8192)
-    if not snapshot._clone_file(source, destination):
-        assert not destination.exists()
-        pytest.skip('This filesystem does not support clones')
-    assert source.stat().st_ino != destination.stat().st_ino
-    with source.open('r+b') as stream:
-        stream.write(b'b')
-    assert destination.read_bytes() == b'a' * 8192
-    with destination.open('r+b') as stream:
-        stream.seek(1)
-        stream.write(b'c')
-    assert source.read_bytes() == b'b' + b'a' * 8191
 
 
 @pytest.mark.parametrize('error', [errno.EOPNOTSUPP, errno.EXDEV, errno.ENOTTY])

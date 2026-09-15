@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from spiral_service import ServiceState, SpiralServer, SpiralHandler, resolve_dataset_root
-from test_spiral_service_v2 import _attach_fake_session
+from service_fixtures import _attach_fake_session
 
 root = Path(sys.argv[1])
 dataset = root / 'dataset'

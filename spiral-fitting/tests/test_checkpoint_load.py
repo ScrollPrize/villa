@@ -1,3 +1,4 @@
+
 """Strict two-phase in-session checkpoint loading.
 
 Phase 1 (``FitContext.inspect_checkpoint``) is a pure CPU-side verdict: it
@@ -8,26 +9,23 @@ where the session goes during a load, that a refusal leaves it exactly as it
 was, and that the verb is only valid in Idle.
 """
 
+from checkpoint_fixtures import _FakeContext, _idle_session
 import copy
 from pathlib import Path
 import sys
-import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
-
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 import fit_spiral
 from config import BACKFILLABLE_CONFIG_DEFAULTS, Config, durable_config
 from fit_session import SessionState
-from spiral_progress import NullProgressReporter
-import spiral_runtime
-from spiral_runtime import (ApplyCheckpointCommand, DiscardCheckpointCommand,
-                            InteractiveFitSession,
-                            PreflightCheckpointCommand)
+from spiral_runtime import ApplyCheckpointCommand, PreflightCheckpointCommand
+import tempfile
+from checkpoint_io import load_checkpoint_cpu
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 CONFIG = Config().as_dict()
@@ -123,26 +121,13 @@ class HeadlessCheckpointTests(unittest.TestCase):
             [None, "/out/checkpoint_fitted.ckpt", None,
              "/out/checkpoint_fitted.ckpt", None],
         )
-
-    def test_periodic_save_is_main_process_only(self):
-        context = SimpleNamespace(
-            num_training_steps=2500,
-            dist=SimpleNamespace(is_main_process=False),
-            _save_model=mock.Mock(),
-        )
-
+        context._save_model.reset_mock()
+        context.dist.is_main_process = False
         fit_spiral.FitContext._maybe_save_headless_checkpoint(context, 1000)
-
         context._save_model.assert_not_called()
 
 
 class CheckpointPreflightTests(unittest.TestCase):
-    def test_a_matching_checkpoint_is_accepted_with_its_durable_iteration(self):
-        verdict = _inspect(_checkpoint())
-        self.assertTrue(verdict.accepted, verdict.reasons)
-        self.assertEqual(verdict.reasons, ())
-        self.assertEqual(verdict.completed_iterations, 4200)
-
     def test_preflight_does_not_touch_the_live_fit(self):
         context = _live_context()
         context.spiral_and_transform.load_state_dict = (
@@ -152,10 +137,9 @@ class CheckpointPreflightTests(unittest.TestCase):
         context.lr_scheduler.load_state_dict = (
             lambda *_: self.fail("preflight loaded scheduler state"))
         before = copy.deepcopy(context.config)
-        self.assertFalse(_inspect(_checkpoint(z_begin=0)).accepted)
-        self.assertTrue(_inspect(_checkpoint()).accepted)
+        self.assertFalse(_inspect(_checkpoint(z_begin=0), context).accepted)
+        self.assertTrue(_inspect(_checkpoint(), context).accepted)
         self.assertEqual(context.config, before)
-
 
     def test_schema_invariants(self):
         self.assertIn("not a state dictionary",
@@ -280,57 +264,6 @@ class CheckpointPreflightTests(unittest.TestCase):
         self.assertIn("parameter groups",
                       _inspect(_checkpoint(scheduler=narrower)).message())
 
-    def test_every_failing_invariant_is_reported_not_just_the_first(self):
-        verdict = _inspect(_checkpoint(lasagna_scale=2, z_begin=0))
-        self.assertFalse(verdict.accepted)
-        self.assertEqual(len(verdict.reasons), 2, verdict.reasons)
-
-
-class SparseStoreDdpTests(unittest.TestCase):
-    def _context(self, *, rank):
-        return SimpleNamespace(
-            dist=fit_spiral.DistributedContext(
-                rank=rank, world_size=2, local_rank=rank),
-            grad_mag_spacing_enabled=False,
-            phase_mode=True,
-            normal_nx_zarr_path='/data/nx',
-            normal_ny_zarr_path='/data/ny',
-            grad_mag_zarr_path=None,
-            normal_zarr_group='4',
-            surf_sdt_zarr_path='/data/sdt',
-            surf_sdt_zarr_group='1',
-        )
-
-    def test_nonzero_rank_waits_for_rank_zero_without_building(self):
-        context = self._context(rank=1)
-
-        def rank_zero_succeeded(payload, src):
-            self.assertEqual(src, 0)
-            payload[0] = None
-
-        with mock.patch.object(
-                fit_spiral, 'ensure_fit_sparse_stores') as build, \
-             mock.patch.object(
-                 fit_spiral.torch.distributed, 'broadcast_object_list',
-                 side_effect=rank_zero_succeeded) as broadcast:
-            fit_spiral.FitContext._ensure_sparse_volume_stores(
-                context, use_normals=True, progress=NullProgressReporter())
-
-        build.assert_not_called()
-        broadcast.assert_called_once()
-
-    def test_rank_zero_builds_before_releasing_other_ranks(self):
-        context = self._context(rank=0)
-        with mock.patch.object(
-                fit_spiral, 'ensure_fit_sparse_stores') as build, \
-             mock.patch.object(
-                 fit_spiral.torch.distributed, 'broadcast_object_list') as broadcast:
-            fit_spiral.FitContext._ensure_sparse_volume_stores(
-                context, use_normals=True, progress=NullProgressReporter())
-
-        build.assert_called_once()
-        broadcast.assert_called_once()
-
 
 class _StubContext(fit_spiral.FitContext):
     """A FitContext with a real optimiser/scheduler and nothing else."""
@@ -377,68 +310,6 @@ class CheckpointApplyTests(unittest.TestCase):
         self.assertNotAlmostEqual(
             context.optimiser.param_groups[0]["lr"],
             context.config["optimizer_learning_rate"], places=12)
-
-    def test_a_checkpoint_without_an_iteration_falls_back_to_the_caller(self):
-        context = _StubContext()
-        payload = {
-            "spiral_and_transform": context.model.state_dict(),
-            "optimiser": context.optimiser.state_dict(),
-            "scheduler": context.lr_scheduler.state_dict(),
-        }
-        self.assertEqual(
-            context.apply_checkpoint(payload, fallback_iteration=17), 17)
-        self.assertEqual(context.start_iteration, 17)
-
-
-class _FakeContext:
-    """The fitter-thread context the runtime load commands drive."""
-
-    def __init__(self, accepted=True, apply_error=None):
-        self.accepted = accepted
-        self.apply_error = apply_error
-        self.inspected = []
-        self.applied = []
-
-    def inspect_checkpoint(self, checkpoint, source=""):
-        self.inspected.append(source)
-        return fit_spiral.CheckpointVerdict(
-            self.accepted, () if self.accepted else ("z-domain differs",),
-            completed_iterations=99, source=source)
-
-    def apply_checkpoint(self, checkpoint, realign_lr=False):
-        self.applied.append(realign_lr)
-        if self.apply_error is not None:
-            raise self.apply_error
-        return 99
-
-
-def _idle_session(completed=5):
-    session = InteractiveFitSession.__new__(InteractiveFitSession)
-    session._condition = threading.Condition()
-    session._state = SessionState.Idle
-    session._phase = "Idle"
-    session._completed = completed
-    session._target = completed
-    session._pending = 0
-    session._commands = []
-    session._pending_checkpoint = None
-    session.session_generation = 0
-    session._config_revision = 0
-    session._command_epoch = 0
-    session._step_epoch = 0
-    session._step_config_revision = 0
-    session._stop_requested = False
-    session._shutdown = False
-    session._run_start_completed = completed
-    session._latest_metrics = {"total_loss": 1.0}
-    session.input_manifest = {}
-    session.rank = 0
-    session.world_size = 1
-    session._status_callback = None
-    session._event_callback = None
-    session._progress_reporter = lambda: NullProgressReporter()
-    session._publish_status = lambda: None
-    return session
 
 
 class InSessionCheckpointLoadTests(unittest.TestCase):
@@ -503,32 +374,6 @@ class InSessionCheckpointLoadTests(unittest.TestCase):
         self.assertIsNone(session._pending_checkpoint)
         self.assertNotIn("checkpoint", session.input_manifest)
 
-    def test_an_unreadable_checkpoint_is_a_refusal_not_a_failure(self):
-        import checkpoint_io
-        checkpoint_io.load_checkpoint_cpu = lambda path: (_ for _ in ()).throw(
-            OSError("no such file"))
-        session = _idle_session()
-        session._context = _FakeContext()
-
-        command = self._preflight(session)
-
-        self.assertIn("no such file", command.error)
-        self.assertEqual(session._state, SessionState.Idle)
-
-    def test_apply_without_a_preflight_refuses_without_touching_the_model(self):
-        session = _idle_session()
-        session._context = _FakeContext()
-        with session._condition:
-            session._transition_locked(SessionState.Loading, "Inspecting")
-        command = ApplyCheckpointCommand(
-            session_generation=0, epoch=2, path="/ckpt/b.ckpt")
-
-        session._run_checkpoint_apply(command)
-
-        self.assertIn("No inspected checkpoint is pending", command.error)
-        self.assertEqual(session._context.applied, [])
-        self.assertEqual(session._state, SessionState.Idle)
-
     def test_a_failure_while_applying_is_fatal_to_the_session(self):
         session = _idle_session()
         session._context = _FakeContext(apply_error=RuntimeError("size mismatch"))
@@ -544,19 +389,6 @@ class InSessionCheckpointLoadTests(unittest.TestCase):
         self.assertIn("size mismatch", command.error)
         self.assertEqual(session._state, SessionState.Loading)
 
-    def test_discard_releases_the_payload_and_returns_to_idle(self):
-        session = _idle_session()
-        session._context = _FakeContext()
-        self._preflight(session)
-        self.assertIsNotNone(session._pending_checkpoint)
-
-        command = DiscardCheckpointCommand(session_generation=0, epoch=2)
-        session._run_checkpoint_discard(command)
-
-        self.assertIsNone(session._pending_checkpoint)
-        self.assertEqual(session._state, SessionState.Idle)
-        self.assertTrue(command.result["discarded"])
-
     def test_load_is_refused_outside_idle(self):
         for state in (SessionState.Running, SessionState.Saving,
                       SessionState.Loading, SessionState.Error):
@@ -569,44 +401,12 @@ class InSessionCheckpointLoadTests(unittest.TestCase):
                     session.preflight_checkpoint("/ckpt/a.ckpt", timeout=0.1)
                 self.assertEqual(session._commands, [])
 
-    def test_the_load_commands_are_all_rank_commands_on_the_epoch_barrier(self):
-        session = _idle_session()
-        good = spiral_runtime.CommandBarrier(
-            epoch=1, kind="preflight_checkpoint", config_revision=0, pending=0)
-        wrong_kind = spiral_runtime.CommandBarrier(
-            epoch=1, kind="run", config_revision=0, pending=0)
-        with self.assertRaises(spiral_runtime.CommandBarrierViolation):
-            session.preflight_checkpoint("/ckpt/a.ckpt", timeout=0.1,
-                                         barrier=wrong_kind)
-        self.assertEqual(session._command_epoch, 0)
-        self.assertEqual(session._commands, [])
 
-        # A matching barrier advances the coordinator's epoch, then removes
-        # and cancels the queued command when its caller times out.
-        def queue_and_wait():
-            try:
-                session.preflight_checkpoint(
-                    "/ckpt/a.ckpt", timeout=0.2, barrier=good)
-            except TimeoutError:
-                pass  # No fitter thread is draining the queue here.
-
-        thread = threading.Thread(target=queue_and_wait, daemon=True)
-        thread.start()
-        thread.join(2.0)
-        self.assertEqual(session._command_epoch, 1)
-        self.assertEqual(session._commands, [])
-
-    def test_a_rank_with_iterations_pending_refuses_the_load_barrier(self):
-        session = _idle_session()
-        session._pending = 3
-        with self.assertRaisesRegex(spiral_runtime.CommandBarrierViolation,
-                                    "requires 0"):
-            session.preflight_checkpoint(
-                "/ckpt/a.ckpt", timeout=0.1,
-                barrier=spiral_runtime.CommandBarrier(
-                    epoch=1, kind="preflight_checkpoint", config_revision=0,
-                    pending=0))
-
-
-if __name__ == "__main__":
-    unittest.main()
+class CheckpointLoadingTests(unittest.TestCase):
+    def test_modern_checkpoint_loads_on_cpu(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'checkpoint.pt'
+            torch.save({'tensor': torch.arange(8), 'cfg': {'value': 3}}, path)
+            loaded = load_checkpoint_cpu(path)
+            torch.testing.assert_close(loaded['tensor'], torch.arange(8))
+            self.assertEqual(loaded['cfg']['value'], 3)

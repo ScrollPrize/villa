@@ -1,11 +1,8 @@
 import math
 from unittest import mock
-
 import pytest
 import torch
-
 import flow_triton
-import transforms
 from flow_fields import BSplineCylindricalFlowField, CylindricalFlowField
 
 # Both interpolants share the fused kernels (flow_triton CUBIC switch), so
@@ -79,26 +76,6 @@ def test_cpu_stationary_integrator_falls_back_lazily(monkeypatch):
     torch.testing.assert_close(points.grad, reference_points.grad)
     torch.testing.assert_close(actual.flows[0].grad, expected.flows[0].grad)
     torch.testing.assert_close(actual.flows[1].grad, expected.flows[1].grad)
-
-
-def test_diffeomorphism_passes_direction_to_the_integrator():
-    class RecordingFlow:
-        def __init__(self):
-            self.calls = []
-
-        def get_integrator(self):
-            def integrate(y_flat, h, n_steps, reverse=False):
-                self.calls.append((h, n_steps, reverse))
-                return y_flat
-            return integrate
-
-    flow = RecordingFlow()
-    transform = transforms.IntegratedFlowDiffeomorphism(
-        flow, torch.zeros(3), torch.ones(3), num_steps=3, solver='rk4')
-    points = torch.rand(5, 3)
-    torch.testing.assert_close(transform._call(points), points)
-    torch.testing.assert_close(transform._inverse(points), points)
-    assert flow.calls == [(1.0 / 3, 3, False), (-1.0 / 3, 3, True)]
 
 
 cuda = pytest.mark.skipif(

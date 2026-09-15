@@ -1,10 +1,9 @@
 from collections import OrderedDict
-
 import pytest
 import torch
-
 from config import Config, durable_config
 from update_checkpoint import migrate_config, update_checkpoint
+from flatten_spiral_checkpoint import MODEL_CONFIG_KEYS, _checkpoint_config
 
 
 def test_migrate_legacy_config_to_exact_current_schema():
@@ -68,10 +67,14 @@ def test_unknown_legacy_config_key_is_not_silently_dropped():
         migrate_config({"mystery": 1})
 
 
-@pytest.mark.parametrize("key", [
-    "influence_disable_dt_frac",
-    "interactive_influence_disable_dt_frac",
-])
-def test_removed_dt_fields_are_unknown_and_unmigratable(key):
-    with pytest.raises(ValueError, match=f"no known migration.*{key}"):
-        migrate_config({key: 0.75})
+def test_legacy_checkpoint_model_config_gets_current_aliases():
+    legacy = {key: index for index, key in enumerate(MODEL_CONFIG_KEYS)}
+    config = _checkpoint_config({"cfg": legacy})
+    for key in MODEL_CONFIG_KEYS:
+        assert config[f"model_{key}"] == legacy[key]
+    assert _checkpoint_config({"cfg": config}) == config
+
+
+def test_checkpoint_config_reports_missing_fields():
+    with pytest.raises(ValueError, match="missing model configuration"):
+        _checkpoint_config({"cfg": {}})

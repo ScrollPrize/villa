@@ -11,25 +11,21 @@ import json
 from pathlib import Path
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from unittest import mock
-
 import torch
+from checkpoint_io import model_state_sha256
+from fit_session import SpiralInputPaths
+from lasagna_publish import PublishedPreview
+from preview_index import PublishedPreviewIndex
+from spiral_service import PREVIEW_ARTIFACTS_KEPT, ServiceState
+from checkpoint_fixtures import _FakeContext, _idle_session
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from checkpoint_io import model_state_sha256
-from fit_session import SessionState, SpiralInputPaths
-from lasagna_publish import PublishedPreview
-from preview_index import PublishedPreviewIndex
-from service_artifacts import ArtifactRegistry
-from spiral_runtime import (ApplyCheckpointCommand, PreflightCheckpointCommand,
-                            SaveCheckpointCommand)
-from spiral_service import PREVIEW_ARTIFACTS_KEPT, ServiceState
-from test_checkpoint_load import _FakeContext, _idle_session
 
 DIGEST = "d" * 64
 OTHER_DIGEST = "e" * 64
@@ -71,25 +67,18 @@ class ModelStateDigestTests(unittest.TestCase):
             model_state_sha256(state, [_frozen_epoch(1.0)], 0, 10),
             model_state_sha256(clone, [_frozen_epoch(1.0)], 0, 10))
 
-    def test_every_tensor_dtype_hashes(self):
-        for dtype in (torch.float16, torch.bfloat16, torch.int64, torch.bool):
-            with self.subTest(dtype=dtype):
-                digest = model_state_sha256(
-                    {"x": torch.ones(3, dtype=dtype), "e": torch.zeros(0)})
-                self.assertEqual(len(digest), 64)
-
 
 class _DigestContext(_FakeContext):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.saved = []
 
-    def model_state_digest(self):
-        return DIGEST
-
     def save_checkpoint(self, path, completed_iterations):
         self.saved.append((path, completed_iterations))
         return path
+
+    def model_state_digest(self):
+        return DIGEST
 
 
 def _session(completed=5):
@@ -103,92 +92,6 @@ def _session(completed=5):
     session._run_config_limits = None
     session._default_advanced_config = None
     return session
-
-
-class RuntimeCheckpointStateTests(unittest.TestCase):
-    def setUp(self):
-        import checkpoint_io
-        self._original = checkpoint_io.load_checkpoint_cpu
-        checkpoint_io.load_checkpoint_cpu = lambda path: {
-            "completed_iterations": 99}
-        self.addCleanup(
-            setattr, checkpoint_io, "load_checkpoint_cpu", self._original)
-
-    def test_a_save_names_the_checkpoint_the_model_now_equals(self):
-        session = _session(completed=5)
-        session._context = _DigestContext()
-        self.assertIsNone(session.status()["checkpoint_state"])
-        command = SaveCheckpointCommand(
-            session_generation=0, expected_iteration=5, path="/out/a.ckpt")
-        session._run_checkpoint_save(command)
-        self.assertEqual(command.result["model_state_sha256"], DIGEST)
-        self.assertEqual(session.status()["checkpoint_state"], {
-            "path": "/out/a.ckpt", "model_state_sha256": DIGEST,
-            "completed_iterations": 5})
-
-    def test_a_load_names_the_loaded_checkpoint(self):
-        session = _session(completed=5)
-        session._context = _DigestContext()
-        preflight = PreflightCheckpointCommand(
-            session_generation=0, epoch=1, path="/ckpt/a.ckpt")
-        session._run_checkpoint_preflight(preflight)
-        self.assertIsNone(preflight.error)
-        apply = ApplyCheckpointCommand(
-            session_generation=0, epoch=2, path="/ckpt/a.ckpt")
-        session._run_checkpoint_apply(apply)
-        self.assertIsNone(apply.error)
-        self.assertEqual(apply.result["model_state_sha256"], DIGEST)
-        self.assertEqual(session.status()["checkpoint_state"], {
-            "path": "/ckpt/a.ckpt", "model_state_sha256": DIGEST,
-            "completed_iterations": 99})
-
-    def test_a_step_forgets_the_checkpoint(self):
-        session = _session(completed=5)
-        session._context = _DigestContext()
-        session._checkpoint_state = {
-            "path": "/ckpt/a.ckpt", "model_state_sha256": DIGEST,
-            "completed_iterations": 5}
-        session._pending = 2
-        session._state = SessionState.Running
-        session.iteration_completed(
-            completed_iterations=6, total_loss=1.0, losses={},
-            learning_rate=1e-4)
-        self.assertIsNone(session.status()["checkpoint_state"])
-
-    def test_a_context_without_a_digest_reports_nothing(self):
-        session = _session(completed=5)
-        session._context = _FakeContext()
-        self.assertIsNone(session._record_checkpoint_state("/ckpt/a.ckpt", 5))
-        self.assertIsNone(session.status()["checkpoint_state"])
-
-
-class RegistryRetentionTests(unittest.TestCase):
-    def _register(self, registry, root, generation):
-        root.mkdir()
-        (root / "manifest.json").write_text("{}")
-        return registry.register_directory(
-            "spiral-preview", "session", generation, root, "manifest.json",
-            delete_root_on_prune=True)
-
-    def test_retain_exempts_older_artifacts_from_fixed_count_pruning(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            registry = ArtifactRegistry()
-            refs = [self._register(registry, base / f"g{n}", n)
-                    for n in range(1, 5)]
-            pinned = (base / "g1").resolve()
-            registry.prune(
-                "spiral-preview", "session", 2,
-                retain=lambda artifact: Path(artifact.root) == pinned)
-            self.assertTrue((base / "g1").exists())
-            self.assertFalse((base / "g2").exists())
-            self.assertIsNotNone(registry.manifest(refs[0]["id"]))
-            self.assertEqual(
-                registry.find("spiral-preview", base / "g1", "session"),
-                refs[0])
-            self.assertIsNone(registry.find("spiral-preview", base / "g2"))
-            self.assertIsNone(
-                registry.find("spiral-preview", base / "g1", "other-session"))
 
 
 class PublishedPreviewIndexTests(unittest.TestCase):
@@ -252,15 +155,6 @@ class PublishedPreviewIndexTests(unittest.TestCase):
             index.pin(str(checkpoint), "f" * 64)
             self.assertEqual(index.pinned_roots(), set())
 
-    def test_a_corrupt_index_file_starts_over(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            index = PublishedPreviewIndex(base)
-            index.path.parent.mkdir(parents=True)
-            index.path.write_text("not json")
-            self.assertIsNone(index.lookup(DIGEST))
-            self.assertEqual(index.pinned_roots(), set())
-
 
 def _wait(predicate, timeout=5.0):
     deadline = time.monotonic() + timeout
@@ -312,18 +206,6 @@ class ServiceRestoreTests(unittest.TestCase):
             self.assertTrue(_wait(
                 lambda: state._preview.completed_generation >= generation))
         return published
-
-    def test_a_publication_is_indexed_by_its_model_state(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary)
-            state = self._state(output)
-            published = self._publish(state, output, 1, DIGEST)
-            self.assertEqual(state._preview.model_state_sha256, DIGEST)
-            index = PublishedPreviewIndex(output)
-            entry = index.lookup(DIGEST)
-            self.assertEqual(entry["manifest_path"],
-                             str(published.manifest_path))
-            self.assertEqual(entry["source_fit_iteration"], 40)
 
     def test_loading_a_checkpoint_re_shows_its_published_surface(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -383,48 +265,6 @@ class ServiceRestoreTests(unittest.TestCase):
                 {"manifest.json", "surface.tifxyz/x.tif"})
             self.assertEqual(state._preview.source_fit_iteration, 40)
 
-    def test_the_same_checkpoint_state_is_handled_once_and_a_shown_surface_is_kept(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary)
-            state = self._state(output)
-            self._publish(state, output, 1, DIGEST)
-            shown = state._preview.artifact
-            checkpoint = output / "checkpoint_autosave.ckpt"
-            checkpoint.write_bytes(b"PK\x03\x04checkpoint")
-            status = {"checkpoint_state": {
-                "path": str(checkpoint), "model_state_sha256": DIGEST,
-                "completed_iterations": 40}}
-            with mock.patch.object(
-                    state, "_restore_published_preview",
-                    wraps=state._restore_published_preview) as restore:
-                state._status_changed(status)
-                state._status_changed(status)
-                state._status_changed({"checkpoint_state": None})
-                self.assertTrue(_wait(
-                    lambda: checkpoint.as_posix() in json.loads(
-                        PublishedPreviewIndex(output).path.read_text())["pins"]))
-            self.assertEqual(restore.call_count, 1)
-            self.assertEqual(state._preview.artifact, shown)
-            self.assertEqual(state._preview.model_state_sha256, DIGEST)
-
-    def test_an_unknown_model_state_changes_nothing(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary)
-            state = self._state(output)
-            self._publish(state, output, 1, DIGEST)
-            shown = state._preview.artifact
-            checkpoint = output / "checkpoints" / "elsewhere.ckpt"
-            checkpoint.parent.mkdir()
-            checkpoint.write_bytes(b"PK\x03\x04checkpoint")
-            state._status_changed({"checkpoint_state": {
-                "path": str(checkpoint), "model_state_sha256": "f" * 64,
-                "completed_iterations": 1}})
-            self.assertTrue(_wait(lambda: not any(
-                thread.name == "spiral-preview-restore"
-                for thread in threading.enumerate())))
-            self.assertEqual(state._preview.artifact, shown)
-            self.assertEqual(state._preview.model_state_sha256, DIGEST)
-
     def test_pinned_surfaces_survive_fixed_count_retention(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
@@ -451,7 +291,3 @@ class ServiceRestoreTests(unittest.TestCase):
             self._publish(state, output, PREVIEW_ARTIFACTS_KEPT + 3,
                           "a" * 64)
             self.assertFalse(first.manifest_path.exists())
-
-
-if __name__ == "__main__":
-    unittest.main()

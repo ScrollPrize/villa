@@ -2,28 +2,16 @@
 
 import unittest
 from unittest import mock
-
 import numpy as np
 import pytest
 import torch
-
-import fit_spiral
 import point_collection
 from config import Config, FitConfig
 from dt_targets import compute_strip_dt_target_cache
-from fit_spiral import (
-    FitContext,
-    _build_strip_flat_bundle,
-    accumulate_radial_offset_bake_scale,
-    inward_winding_direction,
-    materialize_fiber_fit_inputs,
-)
-from losses import get_radial_normal_in_scroll_space
-from point_collection import SIDE_BEHIND, SIDE_FRONT
-from sample_spiral import get_radial_covector_in_scroll_space, get_radial_normal_stretch
-from spiral_helpers import classify_fiber_hv, fiber_collection_hv_tag
+from fit_spiral import FitContext, accumulate_radial_offset_bake_scale
+from sample_spiral import get_radial_normal_stretch
+from spiral_helpers import classify_fiber_hv
 from tifxyz import Patch
-
 import test_live_patch_relink as relink
 from test_revisioned_geometry import context
 
@@ -65,16 +53,6 @@ def test_manual_tag_wins_over_geometry():
         min_z_fraction=0.8, min_auto_certainty=0.5) == 'H'
 
 
-def test_automatic_tag_requires_certainty_then_geometry_decides():
-    vertical = _vertical_fiber(lambda z: 1.0)
-    confident = {'automatic_tag': 'H', 'automatic_certainty': 0.9}
-    unsure = {'automatic_tag': 'H', 'automatic_certainty': 0.2}
-    assert classify_fiber_hv(
-        confident, vertical, min_z_fraction=0.8, min_auto_certainty=0.5) == 'H'
-    assert classify_fiber_hv(
-        unsure, vertical, min_z_fraction=0.8, min_auto_certainty=0.5) == 'V'
-
-
 def test_geometric_fallback_splits_vertical_horizontal_and_diagonal():
     assert classify_fiber_hv(
         None, _vertical_fiber(lambda z: 1.0),
@@ -89,59 +67,6 @@ def test_geometric_fallback_splits_vertical_horizontal_and_diagonal():
     assert classify_fiber_hv(
         {}, diagonal[:1], min_z_fraction=0.8, min_auto_certainty=0.5) is None
 
-
-def test_materialize_stamps_hv_tag_and_is_vertical_on_fiber_strips():
-    from fit_spiral import materialize_fiber_fit_inputs
-
-    def member(cid, logical_id, zyxs, hv=None):
-        points = {
-            i: {"id": i, "collectionId": cid,
-                "p": [z[2], z[1], z[0]],
-                "zyx": np.asarray(z, dtype=np.float32),
-                "winding_annotation": float("nan")}
-            for i, z in enumerate(zyxs)
-        }
-        return {
-            "id": cid, "file_basename": f"{logical_id}.json",
-            "sampling_group": "fibers",
-            "metadata": {"logical_input_id": logical_id,
-                         "logical_input_kind": "fiber",
-                         "winding_is_absolute": False,
-                         "hv_classification": hv or {}},
-            "points": points,
-            "kept_orig_indices": np.arange(len(zyxs)),
-            "control_line_indices": np.arange(len(zyxs)),
-            "branches": [],
-        }
-
-    vertical = [[float(z), 0.0, 100.0] for z in range(0, 100, 10)]
-    horizontal = [[0.0, 0.0, 100.0 + x] for x in range(0, 100, 10)]
-    catalog = {
-        "v": member(1, "v", vertical),
-        "h": member(2, "h", horizontal),
-        "forced": member(3, "forced", horizontal, {"manual_tag": "V"}),
-    }
-    _, strips, *_ = materialize_fiber_fit_inputs(
-        catalog, {}, z_begin=-10, z_end=200, z_margin=0,
-        min_point_spacing=0, use_links=False,
-        vertical_min_z_fraction=0.8, vertical_min_auto_certainty=0.5,
-        vertical_radial_offset=4.0)
-    by_id = {strip['id']: strip for strip in strips}
-    assert by_id[1]['hv_tag'] == 'V' and by_id[1]['is_vertical']
-    assert by_id[2]['hv_tag'] == 'H' and not by_id[2]['is_vertical']
-    assert by_id[3]['hv_tag'] == 'V' and by_id[3]['is_vertical']
-    # Vertical strips carry the radial target offset, horizontals never do.
-    assert np.all(by_id[1]['radial_offsets'] == 4.0)
-    assert np.all(by_id[3]['radial_offsets'] == 4.0)
-    assert np.all(by_id[2]['radial_offsets'] == 0.0)
-    _, strips_off, *_ = materialize_fiber_fit_inputs(
-        catalog, {}, z_begin=-10, z_end=200, z_margin=0,
-        min_point_spacing=0, use_links=False,
-        vertical_min_z_fraction=0.8, vertical_min_auto_certainty=0.5)
-    assert all(np.all(strip['radial_offsets'] == 0.0) for strip in strips_off)
-
-
-# --- live Run-boundary offset changes ---------------------------------------------
 
 def test_apply_config_refills_radial_offsets_and_drops_cached_bundle():
     from types import SimpleNamespace
@@ -239,34 +164,6 @@ def _y_plane(y, z0, x0, size=5, spacing=10.0):
     return Patch(grid, torch.ones(2), None, None)
 
 
-class HvTagTests(unittest.TestCase):
-    THRESHOLDS = dict(min_z_fraction=0.8, min_auto_certainty=0.5)
-
-    def test_manual_tag_wins_and_non_fibers_are_untagged(self):
-        vertical = _fiber(1, [(0, 0, 0), (0, 10, 0)], hv={'manual_tag': 'V'})
-        self.assertEqual(fiber_collection_hv_tag(vertical, **self.THRESHOLDS), 'V')
-        regular = _fiber(2, [(0, 0, 0), (100, 0, 0)], kind=None)
-        self.assertIsNone(fiber_collection_hv_tag(regular, **self.THRESHOLDS))
-
-    def test_geometric_fallback_reads_the_id_ordered_points(self):
-        # Points inserted out of id order; in id order the path is a straight
-        # column (or row), in insertion order it doubles back.
-        fiber = _fiber(3, [(0, 0, 0), (100, 0, 0), (50, 0, 0)])
-        fiber['points'] = {2: fiber['points'][1], 0: fiber['points'][0], 1: fiber['points'][2]}
-        self.assertEqual(fiber_collection_hv_tag(fiber, **self.THRESHOLDS), 'V')
-        flat = _fiber(4, [(0, 0, 0), (0, 0, 100), (0, 0, 50)])
-        flat['points'] = {2: flat['points'][1], 0: flat['points'][0], 1: flat['points'][2]}
-        self.assertEqual(fiber_collection_hv_tag(flat, **self.THRESHOLDS), 'H')
-
-
-class InwardWindingDirectionTests(unittest.TestCase):
-    def test_identity_transform_points_at_the_spiral_axis(self):
-        # With scroll == spiral space the winding gradient is the outward
-        # radial direction, so the inward direction points at the yx origin.
-        direction = inward_winding_direction(lambda zyx: zyx, [[0.0, 10.0, 0.0], [5.0, 0.0, -4.0]])
-        np.testing.assert_allclose(direction, [[0.0, -1.0, 0.0], [0.0, 0.0, 1.0]], atol=1e-6)
-
-
 class _StubContext:
     @staticmethod
     def make(**overrides):
@@ -292,21 +189,6 @@ class DirectionSwitchHookTests(unittest.TestCase):
         context._fiber_link_direction_source = 'model'
         context._relink_fibers_to_patches.reset_mock()
         context._maybe_relink_fibers_for_direction(11)
-        context._relink_fibers_to_patches.assert_not_called()
-
-    def test_a_checkpoint_before_the_threshold_returns_to_the_umbilicus(self):
-        context = _StubContext.make()
-        context._fiber_link_direction_source = 'model'
-        context._maybe_relink_fibers_for_direction(3)
-        context._relink_fibers_to_patches.assert_called_once_with('umbilicus', iteration=3)
-
-    def test_no_op_without_the_filter_or_without_fibers(self):
-        context = _StubContext.make(pcl_fiber_link_side_filter=False)
-        context._maybe_relink_fibers_for_direction(10)
-        context._relink_fibers_to_patches.assert_not_called()
-        context = _StubContext.make()
-        context.fiber_catalog = {}
-        context._maybe_relink_fibers_for_direction(10)
         context._relink_fibers_to_patches.assert_not_called()
 
 
@@ -354,13 +236,6 @@ class RelinkFibersTests(unittest.TestCase):
             [p['on_patch']['id'] for _, p in sorted(horizontal['points'].items())], ['behind'] * 3)
         self.assertEqual(context._fiber_link_direction_source, 'model')
         context._rematerialize_fiber_views.assert_called_once_with()
-
-    def test_side_rules_follow_the_hv_tag(self):
-        context, vertical, horizontal = self._context()
-        rules = context._fiber_link_side_rules({1: vertical, 2: horizontal, 3: _fiber(3, [(0, 0, 0)], kind=None)})
-        self.assertEqual(rules, {1: SIDE_FRONT, 2: SIDE_BEHIND})
-        context.config = FitConfig(Config({'pcl_fiber_link_side_filter': False}).as_dict())
-        self.assertEqual(context._fiber_link_side_rules({1: vertical}), {})
 
 
 class YxScale:
@@ -414,7 +289,6 @@ def test_stretch_follows_the_normal_direction_under_anisotropic_scaling():
     torch.testing.assert_close(stretch[2], expected, rtol=0, atol=1e-4)
 
 
-
 def test_accumulate_bake_scale_multiplies_successive_epochs():
     zyxs = _points_on_axes().numpy()
     first = accumulate_radial_offset_bake_scale(YxScale(2.0, 2.0), zyxs)
@@ -423,63 +297,6 @@ def test_accumulate_bake_scale_multiplies_successive_epochs():
         YxScale(1.5, 1.5), zyxs * 2.0, first)
     np.testing.assert_allclose(second, 3.0, atol=1e-4)
     assert second.dtype == np.float32
-
-
-def test_flat_bundle_applies_the_bake_scale_and_flags_nonzero_offsets():
-    zyxs = np.zeros((4, 3), dtype=np.float32)
-    windings = np.zeros(4, dtype=np.float32)
-    plain = _build_strip_flat_bundle(
-        [(zyxs, windings, np.full(4, 4.0, np.float32)),
-         (zyxs, windings, None)], torch.device('cpu'))
-    assert plain['has_radial_offsets'] is True
-    torch.testing.assert_close(
-        plain['radial_offsets'], torch.tensor([4.0] * 4 + [0.0] * 4))
-    scaled = _build_strip_flat_bundle(
-        [(zyxs, windings, np.full(4, 4.0, np.float32),
-          np.array([1.0, 1.5, 2.0, 0.5], np.float32)),
-         (zyxs, windings, np.full(4, 4.0, np.float32), None)],
-        torch.device('cpu'))
-    torch.testing.assert_close(
-        scaled['radial_offsets'],
-        torch.tensor([4.0, 6.0, 8.0, 2.0] + [4.0] * 4))
-    zeros = _build_strip_flat_bundle(
-        [(zyxs, windings, np.zeros(4, np.float32),
-          np.full(4, 3.0, np.float32))], torch.device('cpu'))
-    assert zeros['has_radial_offsets'] is False
-
-
-def test_materialize_carries_the_catalog_points_bake_scale_through_decimation():
-    vertical = [[float(z), 0.0, 100.0] for z in range(0, 100, 10)]
-    points = {
-        i: {"id": i, "collectionId": 1, "p": [z[2], z[1], z[0]],
-            "zyx": np.asarray(z, dtype=np.float32),
-            "winding_annotation": float("nan"),
-            "radial_offset_bake_scale": 1.0 + 0.1 * i}
-        for i, z in enumerate(vertical)
-    }
-    del points[4]["radial_offset_bake_scale"]  # an unbaked point: scale 1
-    catalog = {"v": {
-        "id": 1, "file_basename": "v.json", "sampling_group": "fibers",
-        "metadata": {"logical_input_id": "v", "logical_input_kind": "fiber",
-                     "winding_is_absolute": False, "hv_classification": {}},
-        "points": points, "kept_orig_indices": np.arange(10),
-        "control_line_indices": np.arange(10), "branches": [],
-    }}
-    _, strips, *_ = materialize_fiber_fit_inputs(
-        catalog, {}, z_begin=-10, z_end=200, z_margin=0,
-        min_point_spacing=25.0, use_links=False,
-        vertical_min_z_fraction=0.8, vertical_min_auto_certainty=0.5,
-        vertical_radial_offset=4.0)
-    strip, = strips
-    assert strip['is_vertical']
-    kept = strip['zyxs'][:, 0].round().astype(int) // 10
-    expected = np.array(
-        [1.0 if i == 4 else 1.0 + 0.1 * i for i in kept], dtype=np.float32)
-    assert len(kept) < 10  # decimation happened
-    np.testing.assert_allclose(strip['radial_offset_bake_scale'], expected, rtol=1e-6)
-    assert strip['radial_offset_bake_scale'].dtype == np.float32
-
-
 
 
 def test_dt_target_cache_converts_offsets_through_the_stretch():

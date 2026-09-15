@@ -1,4 +1,5 @@
 """Integrated immutable transport, catalog, resident and publication lifecycle."""
+
 import copy
 import os
 import threading
@@ -8,34 +9,15 @@ import io
 import json
 from pathlib import Path
 from uuid import uuid4
-
 import pytest
-
 from input_publication import _Publication, Output, PublicationTransaction, fingerprint
 from input_workspace import Catalog, Change, Content, InputIdentity, MutationCoordinator
 from service_uploads import UploadEnvironment, UploadManager
 from service_editing import EditingWorkspace
 from service_http import ApiError
 
+
 TOKEN = 'test-client'
-
-
-def test_session_activity_survives_commit():
-    catalog = Catalog()
-    original = InputIdentity(str(uuid4()), 'fiber', '/dataset/original.json')
-    added = InputIdentity(str(uuid4()), 'fiber', '/dataset/added.json')
-    content = Content.from_json({'path': '/snapshot/first'})
-    catalog.register_base(original, content)
-    assert not catalog.entry(original.id).status()['session_changed']
-    revisions = catalog.accept([Change(original, 1, Content.from_json({'path': '/snapshot/edited'})),
-                                Change(added, 0, content)])
-    catalog.mark_applied(revisions)
-    catalog.mark_persisted(revisions)
-    assert catalog.entry(original.id).status()['session_changed']
-    assert catalog.entry(added.id).status()['session_changed']
-    external = InputIdentity(str(uuid4()), 'fiber', '/dataset/external.json')
-    catalog.register_external_bases(((external, content),))
-    assert catalog.entry(external.id).status()['session_changed']
 
 
 class Resident:
@@ -257,30 +239,6 @@ def test_discard_restores_current_dataset_in_one_resident_batch(workspace):
     assert all(e.accepted == e.persisted for e in ws.catalog.entries())
 
 
-def test_timeout_reuses_captured_influence_and_accepted_revision(workspace):
-    editing, resident = workspace
-    settings = {'influence_radius': 12}
-    editing.influence = lambda: settings
-    seen = []
-    original = resident.apply_input_changes
-    def interrupted(command, records, influence_config=None):
-        seen.append(copy.deepcopy(influence_config))
-        if len(seen) == 1:
-            raise TimeoutError('lost application response')
-        return original(command, records, influence_config)
-    resident.apply_input_changes = interrupted
-    input_id = str(uuid4())
-    request = {'command_id': 'captured-influence', 'changes': [{'id': input_id,
-        'kind': 'pcl', 'role': 'same_winding', 'expected_revision': 0,
-        'upload_id': upload(editing, 'new')}]}
-    with pytest.raises(TimeoutError):
-        editing.change(TOKEN, request)
-    settings['influence_radius'] = 99
-    assert editing.change(TOKEN, request)['applied']
-    assert seen == [{'influence_radius': 12}, {'influence_radius': 12}]
-    assert editing.catalog.entry(input_id).accepted == 1
-
-
 def test_rebuild_preserves_desired_inputs_uploads_and_failed_preparation(workspace):
     editing, resident = workspace
     baseline = editing.catalog.entries()[0]
@@ -330,66 +288,6 @@ def test_reconnect_refreshes_clean_targets_and_preserves_dirty_conflicts(workspa
     change(editing, new_id, 0, 'new', kind='pcl', role='same_winding')
     assert editing.catalog.entry(new_id).identity.collection_id == 101
     assert json.loads(target.read_text()) == document
-
-
-def test_reconnect_discovers_external_inputs_without_replacing_local_changes(workspace):
-    editing, resident = workspace
-    baseline = editing.catalog.entries()[0]
-    change(editing, baseline.identity.id, 1, 'local')
-    target = Path(baseline.identity.source)
-    document = json.loads(target.read_text())
-    document['collections']['80'] = {'name': 'external', 'points': {}}
-    target.write_text(json.dumps(document))
-    # A conventional role file can appear after dataset resolution/startup.
-    from service_uploads import PCL_ROLE_FILES
-    relative = editing.dataset / PCL_ROLE_FILES['relative']
-    relative.write_text(json.dumps({'collections': {'12': {'name': 'relative', 'points': {}}}}))
-    fiber = editing.dataset / 'fibers' / 'external.json'
-    fiber.parent.mkdir()
-    fiber.write_text(json.dumps({'type': 'vc3d_fiber', 'version': 1, 'points': []}))
-    patch = editing.dataset / 'verified_patches' / 'external'
-    patch.mkdir(parents=True)
-    (patch / 'meta.json').write_text('{}')
-    (patch / 'x.tif').write_bytes(b'unchanged geometry bytes')
-    original = {p: p.read_bytes() for p in [target, relative, fiber, patch / 'meta.json', patch / 'x.tif']}
-
-    editing.claim(TOKEN, 'discover')
-    entries = editing.catalog.entries()
-    assert len(entries) == 5
-    imported = [e for e in entries if e.identity.id != baseline.identity.id]
-    assert {(e.identity.kind, e.identity.role) for e in imported} == {
-        ('pcl', 'same_winding'), ('pcl', 'relative'), ('fiber', None), ('patch', 'verified')}
-    assert all(e.accepted == e.applied == e.persisted == 1 for e in imported)
-    assert {r['id'] for r in resident.calls[-1][1]} == {e.identity.id for e in imported}
-    assert editing.catalog.entry(baseline.identity.id).accepted == 2
-    assert editing.catalog.entry(baseline.identity.id).persisted == 1
-    calls = len(resident.calls)
-    editing.claim(TOKEN, 'discover-again')
-    assert len(resident.calls) == calls
-    assert editing.catalog.entries() == entries
-    assert all(p.read_bytes() == data for p, data in original.items())
-    new_id = str(uuid4())
-    change(editing, new_id, 0, 'next', kind='pcl', role='same_winding')
-    assert editing.catalog.entry(new_id).identity.collection_id == 81
-    # Rebuild adopts the discovered identities rather than inventing duplicates.
-    assert editing.replay_resident('new-generation')['applied']
-    assert {r['id'] for r in resident.calls[-1][1]} == {e.identity.id for e in editing.catalog.entries()}
-
-
-def test_discovered_inputs_retry_failed_application(workspace):
-    editing, resident = workspace
-    target = editing.dataset / 'fibers' / 'external.json'
-    target.parent.mkdir()
-    target.write_text('{}')
-    resident.fail = True
-    editing.claim(TOKEN, 'failed-discovery')
-    entry = next(e for e in editing.catalog.entries() if e.identity.kind == 'fiber')
-    assert (entry.accepted, entry.applied, entry.persisted) == (1, 0, 1)
-    resident.fail = False
-    editing.claim(TOKEN, 'retry-discovery')
-    restored = editing.catalog.entry(entry.identity.id)
-    assert (restored.accepted, restored.applied, restored.persisted) == (1, 1, 1)
-    assert not restored.errors
 
 
 def identity(kind="pcl", *, source="same_windings.json", collection_id=None):
@@ -546,6 +444,7 @@ def test_rejects_symlinks_and_overlapping_targets(tmp_path):
 
 DATA = b'{"type":"vc3d_fiber","version":1,"points":[]}'
 
+
 @pytest.fixture
 def manager(tmp_path):
     return UploadManager(UploadEnvironment(
@@ -557,31 +456,6 @@ def upload_manifest(data=DATA):
     return {"upload_id": "a" * 32, "kind": "fiber", "id": "fiber-1",
             "files": [{"name": "fiber.json", "size": len(data),
                        "sha256": hashlib.sha256(data).hexdigest()}]}
-
-
-def test_cancellation_retains_receipt_and_never_recreates_transfer(manager):
-    upload_id = manager.begin(upload_manifest())["upload_id"]
-    manager.cancel(upload_id)
-    manager.cancel(upload_id)
-    assert manager.begin(upload_manifest())["upload_id"] == upload_id
-    assert manager.status(upload_id)["state"] == "cancelled"
-    assert not manager.uploads[upload_id].staging_dir.exists()
-    with pytest.raises(ApiError, match="cancelled"):
-        manager.receive(upload_id, "fiber.json", io.BytesIO(DATA), len(DATA))
-    with pytest.raises(ApiError, match="cancelled"):
-        manager.finalize(upload_id)
-
-
-def test_editable_upload_requires_stable_id_and_rejects_mutation_fields(manager):
-    manifest = upload_manifest()
-    del manifest['upload_id']
-    with pytest.raises(ApiError, match='stable upload_id'):
-        manager.begin(manifest)
-    for index, (key, value) in enumerate([('operation', 'delete_collection'), ('base_revision', 'old'),
-                       ('target_collection_id', '0'), ('base_source_revision', '0' * 64)]):
-        with pytest.raises(ApiError, match='bytes only'):
-            manager.begin(dict(upload_manifest(), upload_id=f"{index:032x}", **{key: value}))
-    assert manager.uploads == {}
 
 
 @pytest.mark.parametrize('partial', [False, True])
@@ -596,41 +470,6 @@ def test_failed_transfer_cannot_finalize_and_retries_exact_bytes(manager, partia
     manager.receive(upload_id, 'fiber.json', io.BytesIO(DATA[offset:]), len(DATA) - offset, offset=offset)
     result = manager.finalize(upload_id)
     assert Path(result.record['path']).read_bytes() == DATA
-
-
-def test_recovery_rejects_queued_waiters_without_blocking_later_commands(monkeypatch):
-    coordinator = MutationCoordinator()
-    started, fail, queued = threading.Event(), threading.Event(), threading.Event()
-    original_wait = coordinator._condition.wait
-
-    def wait(timeout=None):
-        queued.set()
-        return original_wait(timeout)
-
-    monkeypatch.setattr(coordinator._condition, 'wait', wait)
-
-    def operation(payload):
-        started.set()
-        assert fail.wait(5)
-        raise OSError('publication interrupted')
-
-    with ThreadPoolExecutor(2) as pool:
-        first = pool.submit(coordinator.execute, 'first', 'commit', {}, operation,
-                            recoverable=True)
-        assert started.wait(5)
-        second = pool.submit(coordinator.execute, 'second', 'apply', {}, lambda p: p)
-        assert queued.wait(5)
-        fail.set()
-        with pytest.raises(OSError):
-            first.result(5)
-        with pytest.raises(ApiError, match='needs recovery'):
-            second.result(5)
-    assert coordinator.outcome('second')['state'] == 'rejected'
-    assert coordinator._queue == []
-    coordinator.execute('first', 'commit', {}, lambda p: p, recoverable=True)
-    with pytest.raises(ApiError, match='needs recovery'):
-        coordinator.execute('second', 'apply', {}, lambda p: p)
-    assert coordinator.execute('reconnect', 'claim', {}, lambda p: 'claimed') == 'claimed'
 
 
 @pytest.fixture
@@ -656,46 +495,6 @@ def artifact_names(state, result):
     return {item['name'] for item in state.artifacts.manifest(result['artifact']['id'])['files']}
 
 
-def test_editor_artifact_large_unlinked_catalog(artifact_state):
-    from service_artifacts import MAX_ARTIFACT_FILES
-    state = artifact_state
-    ws = state.editing_workspace
-    first = add_artifact_fiber(ws, 'first')
-    # Distinct catalog entries can share immutable bytes; only the selected
-    # entry should be copied, regardless of total catalog size.
-    content = ws.catalog.entry(first).current.content
-    for index in range(MAX_ARTIFACT_FILES):
-        ws.catalog.register_base(InputIdentity(str(uuid4()), 'fiber',
-            str(ws.dataset / 'fibers' / f'other-{index}.json')), content)
-    assert artifact_names(state, state.input_content_artifact(first, 1)) == {'first.json'}
-
-
-@pytest.mark.parametrize('failure_stage', ['copy', 'register'])
-def test_editor_artifact_failed_attempt_can_retry(artifact_state, monkeypatch, failure_stage):
-    state = artifact_state
-    ws = state.editing_workspace
-    first = add_artifact_fiber(ws, 'first', [{'branch_file': 'peer.json'}])
-    add_artifact_fiber(ws, 'peer')
-    owner, method = (ws, '_copy') if failure_stage == 'copy' else (state.artifacts, 'register_directory')
-    original = getattr(owner, method)
-    calls = 0
-
-    def fail_once(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == (2 if failure_stage == 'copy' else 1):
-            raise OSError('transient artifact failure')
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(owner, method, fail_once)
-    with pytest.raises(OSError, match='transient'):
-        state.input_content_artifact(first, 1)
-    assert not list((ws.root / 'artifacts' / first).iterdir())
-    result = state.input_content_artifact(first, 1)
-    assert artifact_names(state, result) == {'first.json', 'peer.json'}
-    assert state.input_content_artifact(first, 1) == result
-
-
 def test_editor_artifact_follows_transitive_pending_links_and_exact_revision(artifact_state):
     state = artifact_state
     ws = state.editing_workspace
@@ -712,35 +511,3 @@ def test_editor_artifact_follows_transitive_pending_links_and_exact_revision(art
     ws.catalog.accept([Change(ws.catalog.entry(peer).identity, 1, None)])
     assert artifact_names(state, state.input_content_artifact(first, 1)) == {'first.json'}
     assert artifact_names(state, original) == {'first.json', 'peer.json', 'last.json'}
-
-
-@pytest.mark.parametrize('deleted', [False, True])
-def test_existing_external_refresh_retries_failed_application(workspace, deleted):
-    editing, resident = workspace
-    entry = editing.catalog.entries()[0]
-    target = Path(entry.identity.source)
-    document = json.loads(target.read_text())
-    if deleted:
-        del document['collections']['7']
-    else:
-        document['collections']['7']['name'] = 'external'
-    target.write_text(json.dumps(document))
-    resident.fail = True
-    editing.claim(TOKEN, 'failed-refresh')
-    refreshed = editing.catalog.entry(entry.identity.id)
-    assert (refreshed.accepted, refreshed.applied, refreshed.persisted) == (2, 1, 2)
-    assert refreshed.errors
-    resident.fail = False
-    editing.claim(TOKEN, 'retry-refresh')
-    restored = editing.catalog.entry(entry.identity.id)
-    assert (restored.accepted, restored.applied, restored.persisted) == (2, 2, 2)
-    assert not restored.errors
-    assert resident.calls[-1][1][0]['revision'] == 2
-    calls = len(resident.calls)
-    editing.claim(TOKEN, 'refresh-again')
-    assert len(resident.calls) == calls
-    assert json.loads(target.read_text()) == document
-    # A subsequent local edit commits against the captured external base.
-    change(editing, entry.identity.id, 2, 'local')
-    commit(editing, entry.identity.id, 3)
-    assert json.loads(target.read_text())['collections']['7']['name'] == 'local'

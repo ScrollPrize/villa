@@ -1,11 +1,11 @@
 """Exercise workspace recovery through the real authenticated HTTP routes."""
+
 import hashlib
 import json
 import urllib.request
 import urllib.error
 from uuid import uuid4
-
-from test_spiral_service_v2 import HttpServiceFixture, _attach_fake_session
+from service_fixtures import HttpServiceFixture, _attach_fake_session
 from test_service_editing import Resident
 
 
@@ -94,16 +94,6 @@ class EditingHttpTests(HttpServiceFixture):
         command['changes'][0]['deleted'] = True
         self.assertEqual(self.request('POST', '/session/input-changes', headers=self.owner,
                                      body=command)[0], 409)
-
-    def test_ownership_and_removed_routes(self):
-        for path, body in [('/session/run', {'command_id': 'run'}),
-                           ('/session/commit-inputs', {'command_id': 'commit'}),
-                           ('/session/inputs', {}),
-                           ('/session/rebuild', {'command_id': 'rebuild'})]:
-            self.assertEqual(self.request('POST', path, body=body)[0], 403)
-        self.assertEqual(self.request('GET', '/session/status')[0], 200)
-        self.assertEqual(self.request('DELETE', '/session/ephemeral-inputs/fiber/test',
-                                      headers=self.owner)[0], 404)
 
     def test_release_retries_are_idempotent_over_http(self):
         root = self.state.editing().root

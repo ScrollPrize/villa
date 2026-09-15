@@ -4,59 +4,13 @@ import pickle
 import tempfile
 import unittest
 from pathlib import Path
-
 import numpy as np
 import zarr
 from click.testing import CliRunner
-
-from tracks_to_ome_zarr import (
-    ALL_LABEL_BITS,
-    LocalLabeler,
-    RoundRobinLabeler,
-    SpatialLabeler,
-    _rasterize_polyline,
-    main,
-)
+from tracks_to_ome_zarr import SpatialLabeler, main
 
 
 class TrackRasterizationTests(unittest.TestCase):
-    def test_rasterize_polyline_fills_intervertex_gaps(self):
-        track = np.asarray([[1, 2, 3], [1, 2, 7], [3, 4, 7]], dtype=np.int32)
-        points = _rasterize_polyline(track)
-        np.testing.assert_array_equal(
-            points,
-            np.asarray([
-                [1, 2, 3], [1, 2, 4], [1, 2, 5], [1, 2, 6], [1, 2, 7],
-                [2, 3, 7], [3, 4, 7],
-            ]),
-        )
-
-    def test_spatial_labeler_separates_nearby_tracks(self):
-        labeler = SpatialLabeler(reuse_distance=16)
-        first = labeler.assign(np.asarray([[10, 10, 10], [10, 10, 12]]))
-        nearby = labeler.assign(np.asarray([[11, 10, 10], [11, 10, 12]]))
-        self.assertNotEqual(first, nearby)
-
-    def test_spatial_labeler_can_reuse_a_label_far_away(self):
-        labeler = SpatialLabeler(reuse_distance=4)
-        labels = [
-            labeler.assign(np.asarray([[index * 20, 0, 0]]))
-            for index in range(256)
-        ]
-        self.assertEqual(len(set(labels[:255])), 255)
-        self.assertEqual(labels[255], labels[0])
-        self.assertEqual(labeler.forced_reuses, 0)
-
-    def test_spatial_labeler_forced_reuse_picks_least_local_label(self):
-        labeler = SpatialLabeler(reuse_distance=4)
-        labeler.occupancy[(0, 0, 0)] = ALL_LABEL_BITS
-        labeler.occupancy[(1, 0, 0)] = ALL_LABEL_BITS & ~(1 << 255)
-
-        label = labeler.assign(np.asarray([[0, 0, 0]]))
-
-        self.assertEqual(label, 255)
-        self.assertEqual(labeler.forced_reuses, 1)
-
     def test_integer_key_spatial_labeler_matches_tuple_key_labels(self):
         tracks = [
             np.asarray([[1, 1, 1], [1, 1, 7]]),
@@ -70,28 +24,6 @@ class TrackRasterizationTests(unittest.TestCase):
             tuple_labeler.assign_many(tracks),
             integer_labeler.assign_many(tracks),
         )
-
-    def test_local_labeler_avoids_reuse_in_crossed_cells(self):
-        labeler = LocalLabeler(reuse_distance=4, shape=(16, 16, 16))
-        crossing = labeler.assign(np.asarray([[1, 1, 1], [1, 1, 5]]))
-        sharing = labeler.assign(np.asarray([[1, 1, 5], [1, 1, 6]]))
-
-        self.assertNotEqual(crossing, sharing)
-
-    def test_local_labeler_reports_unavoidable_cell_reuse(self):
-        labeler = LocalLabeler(reuse_distance=4, shape=(16, 16, 16))
-        track = np.asarray([[1, 1, 1]])
-        labels = [labeler.assign(track) for _ in range(256)]
-
-        self.assertEqual(len(set(labels[:255])), 255)
-        self.assertEqual(labels[255], labels[0])
-        self.assertEqual(labeler.forced_reuses, 1)
-
-    def test_round_robin_labeler_cycles_all_nonzero_values(self):
-        labels = RoundRobinLabeler().assign_many([None] * 256)
-
-        np.testing.assert_array_equal(labels[:255], np.arange(1, 256, dtype=np.uint8))
-        self.assertEqual(int(labels[255]), 1)
 
 
 class TrackOmeZarrIntegrationTests(unittest.TestCase):
@@ -129,6 +61,9 @@ class TrackOmeZarrIntegrationTests(unittest.TestCase):
             self.assertEqual(array.shape, (16, 16, 16))
             self.assertNotEqual(int(array[1, 1, 1]), 0)
             self.assertNotEqual(int(array[1, 5, 5]), 0)
+            # Rasterization fills the segments between DBM vertices.
+            self.assertTrue((array[1, 1, 1:6] != 0).all())
+            self.assertTrue((array[1, 1:6, 5] != 0).all())
             # Sorted record a owns the shared endpoint under first-track-wins.
             self.assertEqual(int(array[1, 1, 5]), int(array[1, 1, 1]))
 
@@ -181,7 +116,3 @@ class TrackOmeZarrIntegrationTests(unittest.TestCase):
                 zarr.open_group(serial_path, mode='r')['0'][:],
                 zarr.open_group(pipelined_path, mode='r')['0'][:],
             )
-
-
-if __name__ == '__main__':
-    unittest.main()

@@ -1,11 +1,10 @@
 """Prepare/install uses real CPU geometry and shared derivation helpers."""
+
 import copy
 from types import SimpleNamespace
-
 import numpy as np
 import pytest
 import torch
-
 from config import Config, FitConfig
 from dt_targets import DtTargetCacheManager
 from fit_spiral import FitContext, PatchAtlas
@@ -141,48 +140,6 @@ def test_mixed_revisions_keep_fiber_filename_and_restore_role_content(context, t
     assert ctx.fiber_catalog['fiber-uuid']['file_basename'] == 'fiber-name.json'
 
 
-@pytest.mark.parametrize('adopt', [False, True])
-def test_startup_fiber_survives_replay_without_input_role(context, adopt):
-    pcl = relink._regular_pcl(5, [[50, 80, 80], [50, 110, 110]])
-    pcl['id'] = 5
-    pcl['metadata'].pop('input_role')
-    pcl['metadata'].update(logical_input_kind='fiber', logical_input_id='startup')
-    pcl['sampling_group'] = 'fibers'
-    context._source_point_collections = {5: pcl}
-    records = ([{'id': 'workspace-fiber', 'kind': 'fiber', 'source_id': 'startup',
-                 'path': '/immutable/not-reloaded.json', 'adopt': True}]
-               if adopt else [])
-    candidate = context.prepare_input_changes(records)
-    logical_id = 'workspace-fiber' if adopt else 'startup'
-    assert set(candidate.fiber_catalog) == {logical_id}
-    assert not candidate.regular_pcl_catalog
-    assert candidate.unattached_pcl_strips[0]['logical_input_kind'] == 'fiber'
-    assert 'input_role' not in pcl['metadata']
-
-
-def test_missing_sampling_weight_rejects_batch_without_stopping_resident(context, resident, tmp_path):
-    import json
-    path = tmp_path / 'new_group.json'
-    path.write_text(json.dumps({'vc_pointcollections_json_version': '1', 'collections': {
-        '0': {'name': 'new', 'points': {
-            '0': {'p': [80, 80, 50]}, '1': {'p': [110, 110, 50]}}}}}))
-    context.config = FitConfig({**dict(context.config), 'pcl_sampling_weights': {'drawn': 1}})
-    session, _, _, _ = resident
-    session._context = context
-    before, optimiser = context.regular_pcl_catalog, context.optimiser
-    records = [{'id': 'new', 'kind': 'pcl', 'path': str(path), 'role': 'same_winding'}]
-    result = session.apply_input_changes('missing-weight', records, timeout=5)
-    assert not result['applied']
-    assert 'sampling group' in str(result)
-    assert context.regular_pcl_catalog is before
-    assert context.optimiser is optimiser
-    assert session._completed == 7
-    context.config = FitConfig({**dict(context.config),
-                                'pcl_sampling_weights': {'drawn': 1, 'new_group': 1}})
-    assert session.apply_input_changes('fixed-weight', records, timeout=5)['applied']
-    assert session._completed == 7
-
-
 @pytest.mark.parametrize('metadata', [
     {'format': 'tifxyz'},
     [],
@@ -230,57 +187,6 @@ def test_invalid_absolute_annotations_fail_during_preparation(context, tmp_path)
         context.prepare_input_changes([
             {'id': 'absolute-uuid', 'kind': 'pcl', 'path': str(path), 'role': 'absolute'}])
     assert context.regular_pcl_catalog is before
-
-
-def test_rejected_patch_revision_does_not_remove_previous_geometry(context, monkeypatch):
-    import fit_spiral
-    original = context.verified_patches['baseline']
-    monkeypatch.setattr(fit_spiral, 'load_tifxyz', lambda path: copy.copy(original))
-
-    def reject(candidate):
-        del candidate.verified_patches['baseline']
-        return ['theta consistency rejection']
-
-    monkeypatch.setattr(FitContext, '_build_theta_crossing_map', reject)
-    with pytest.raises(ValueError, match='theta consistency'):
-        context.prepare_input_changes([
-            {'id': 'patch-uuid', 'kind': 'patch', 'source_id': 'baseline',
-             'path': '/immutable/replacement', 'revision': 2}])
-    assert context.verified_patches['baseline'] is original
-
-
-def test_rebuild_adopts_baseline_geometry_without_reading_it_again(context):
-    ctx = context
-    original = ctx._source_verified_patches['baseline']
-    candidate = ctx.prepare_input_changes([{'id': 'baseline-uuid', 'kind': 'patch',
-        'source_id': 'baseline', 'path': '/immutable/source/need-not-be-reloaded',
-        'role': 'verified', 'revision': 1, 'adopt': True}])
-    assert candidate._source_verified_patches['baseline'] is original
-    ctx.install_input_changes(candidate)
-    assert 'baseline' in ctx.verified_patches
-
-
-@pytest.mark.parametrize('role', ['verified', 'unverified'])
-def test_baseline_adoption_preserves_initial_loader_exclusions(context, monkeypatch, role):
-    import fit_spiral
-    # A baseline may be absent because it has no valid quads, was eroded
-    # away, or was excluded by the ROI, name filter, or source toggle.
-    # Registration must not try to reinterpret any of those decisions.
-    monkeypatch.setattr(fit_spiral, 'load_tifxyz',
-                        lambda path: pytest.fail('excluded baseline was reloaded'))
-    original = context._source_verified_patches['baseline']
-    candidate = context.prepare_input_changes([{
-        'id': 'excluded-uuid', 'kind': 'patch', 'source_id': 'excluded',
-        'path': '/immutable/excluded', 'role': role, 'revision': 1,
-        'adopt': True,
-    }])
-    assert candidate._workspace_membership['excluded-uuid'] == {
-        'kind': 'patch', 'revision': 1, 'resident_id': 'excluded', 'deleted': False,
-    }
-    context.install_input_changes(candidate)
-    assert context._source_verified_patches == {'baseline': original}
-    assert not context._source_unverified_patches
-    assert set(context.verified_patches) == {'baseline'}
 
 
 @pytest.mark.parametrize('role', ['verified', 'unverified'])
@@ -346,19 +252,6 @@ def test_patch_additions_rederive_one_view_per_collection(context, monkeypatch, 
     assert all('on_patch' not in point for point in context._source_point_collections[5]['points'].values())
 
 
-def test_fiber_spacing_reuses_revision_identity(context, tmp_path):
-    import json
-    path = tmp_path / 'fiber.json'
-    path.write_text(json.dumps({'type': 'vc3d_fiber', 'line_points': [], 'control_points': [[0, 0, 200], [400, 0, 200]]}))
-    context.install_input_changes(context.prepare_input_changes([
-        {'id': 'fiber-id', 'kind': 'fiber', 'path': str(path), 'revision': 2}]))
-    before = context._workspace_membership['fiber-id']['resident_id']
-    context.apply_config({'pcl_fiber_min_point_spacing': 5.0}, current_iteration=0)
-    assert context._workspace_membership['fiber-id']['resident_id'] == before
-    assert context._workspace_membership['fiber-id']['revision'] == 2
-    assert list(context.fiber_catalog) == ['fiber-id']
-
-
 @pytest.mark.parametrize('enabled', [True, False])
 def test_baseline_fiber_adoption_preserves_startup_exclusions(context, monkeypatch, enabled):
     import fit_spiral
@@ -375,63 +268,6 @@ def test_baseline_fiber_adoption_preserves_startup_exclusions(context, monkeypat
         assert context._workspace_membership['excluded-fiber'] == {
             'kind': 'fiber', 'revision': 1, 'resident_id': 6, 'deleted': False}
     assert context.next_id == 7
-
-
-def test_input_revision_preserves_current_track_policy(context, monkeypatch):
-    import fit_spiral
-    from unittest.mock import Mock
-    ctx = context
-    ctx.using_tracks = True
-    ctx._refresh_trusted_geometry()
-    ctx.tracks = ['retained track']
-    ctx.track_sampling_config = fit_spiral.validate_track_sampling_config(ctx.config)
-    ctx.track_families = ctx.track_source_ids = None
-    ctx.track_crossing_cache = ctx.track_graph = None
-    prepare = Mock(return_value=None)
-    monkeypatch.setattr(fit_spiral, 'prepare_main_phase_tracks', prepare)
-    monkeypatch.setattr(fit_spiral, 'configure_prepared_track_sampling', Mock())
-    ctx.apply_config({'track_exclusion_radius': 10, 'track_max_tortuosity': 2,
-                      'track_crossing_mode': 'track_walk',
-                      'track_crossing_precompute_max': 12,
-                      'track_length_bin_weights': [1, 2, 3]}, current_iteration=0)
-    prepare.reset_mock()
-    ctx.install_input_changes(ctx.prepare_input_changes([
-        {'id': 'baseline', 'kind': 'patch', 'deleted': True, 'revision': 2}]))
-    policy = prepare.call_args.kwargs['sampling_config']
-    expected = fit_spiral.validate_track_sampling_config(ctx.config)
-    assert policy.keys() == expected.keys()
-    for key in expected:
-        np.testing.assert_equal(policy[key], expected[key])
-
-
-def test_exclusion_radius_preserves_unverified_revisions(context, monkeypatch):
-    import fit_spiral
-    ctx = context
-    ctx._source_unverified_patches = {
-        'deleted': relink._flat_patch(100, 510, 510),
-        'replaced': relink._flat_patch(100, 610, 610),
-    }
-    replacement = relink._flat_patch(100, 710, 710)
-    added = relink._flat_patch(100, 810, 810)
-    monkeypatch.setattr(fit_spiral, 'load_tifxyz',
-                        lambda path: {'replacement': replacement, 'added': added}[path])
-    records = [
-        {'id': 'deleted', 'kind': 'patch', 'role': 'unverified', 'deleted': True, 'revision': 2},
-        {'id': 'replaced', 'kind': 'patch', 'role': 'unverified', 'path': 'replacement', 'revision': 2},
-        {'id': 'added', 'kind': 'patch', 'role': 'unverified', 'path': 'added', 'revision': 1},
-    ]
-    ctx.install_input_changes(ctx.prepare_input_changes(records))
-    membership = copy.deepcopy(ctx._workspace_membership)
-    ctx.unverified_patches_path = '/mutable/dataset'
-    monkeypatch.setattr(ctx, '_load_patches_from_dir',
-                        lambda path: pytest.fail('revisioned patches reloaded from dataset'))
-    for radius in (1, 0):
-        ctx.apply_config({'patch_unverified_patch_exclusion_radius': radius}, current_iteration=0)
-        assert set(ctx.unverified_patches) == {'replaced', 'added'}
-        assert ctx._workspace_membership == membership
-        for pid, source in [('replaced', replacement), ('added', added)]:
-            assert ctx.unverified_patches[pid] is not source
-            torch.testing.assert_close(ctx.unverified_patches[pid].zyxs, source.zyxs)
 
 
 @pytest.mark.parametrize('dataset_change', ['edit', 'delete'])

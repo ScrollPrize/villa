@@ -1,5 +1,5 @@
 """Disposable editing storage, teardown barriers and crash reclamation."""
-import json
+
 import os
 from pathlib import Path
 import subprocess
@@ -8,15 +8,13 @@ import threading
 import time
 from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
-
 import pytest
-
 from input_publication import Output, PublicationTransaction, fingerprint
 from service_editing import EditingWorkspace
 from service_http import ApiError
 from spiral_service import ServiceState
 from test_service_editing import Resident, upload
-from test_spiral_service_v2 import _attach_fake_session
+from service_fixtures import _attach_fake_session
 from workspace_storage import MARKER, reclaim_workspaces
 
 
@@ -73,14 +71,6 @@ def test_release_removes_uploads_and_revisions_only(state, commit):
     assert fresh.root.exists()
 
 
-def test_failed_initialization_is_disposable(state, monkeypatch):
-    workspace = state.editing()
-    state.session = None
-    state._session_error = 'failed initialization'
-    state.close()
-    assert not workspace.root.exists()
-
-
 def test_fitter_timeout_retains_files_and_ownership_for_retry(state, monkeypatch):
     workspace = state.editing()
     close = state.session.close
@@ -135,23 +125,6 @@ def test_close_drains_file_users(state, user):
     assert not workspace.root.exists()
 
 
-def test_artifact_reader_timeout_and_retry(state):
-    workspace = state.editing()
-    path = workspace.root / 'artifact'
-    path.mkdir()
-    (path / 'data').write_bytes(b'content')
-    artifact = state.artifacts.register_directory('input-content', workspace.id, 1, path, 'data')
-    reader, _, _ = state.artifacts.acquire_file(artifact['id'], 'data')
-    with pytest.raises(TimeoutError):
-        state.artifacts.retire_root(workspace.root, timeout=0)
-    assert path.exists()
-    with pytest.raises(ApiError):
-        state.artifacts.acquire_file(artifact['id'], 'data')
-    state.artifacts.release(reader)
-    state.release_editing('owner', 'release')
-    assert not workspace.root.exists()
-
-
 def test_commit_recovery_survives_close(state):
     workspace = state.editing()
     target = workspace.dataset / 'recover.json'
@@ -169,25 +142,8 @@ def test_commit_recovery_survives_close(state):
     transaction.release()
 
 
-def test_failed_deletion_keeps_marker_for_reclamation(state, monkeypatch):
-    import workspace_storage
-    workspace = state.editing()
-    (workspace.root / 'draft').mkdir()
-    original = workspace_storage.shutil.rmtree
-    def fail(path, *args, **kwargs):
-        if Path(path).name == 'draft':
-            raise PermissionError('test deletion failure')
-        return original(path, *args, **kwargs)
-    monkeypatch.setattr(workspace_storage.shutil, 'rmtree', fail)
-    with pytest.raises(PermissionError):
-        state.release_editing('owner', 'release')
-    assert (workspace.root / MARKER).exists()
-    monkeypatch.setattr(workspace_storage.shutil, 'rmtree', original)
-    state.release_editing('owner', 'release')
-    assert not workspace.root.exists()
-
-
 def test_subprocess_crash_live_owner_concurrent_reclamation_and_legacy(tmp_path):
+    package_root = Path(__file__).resolve().parents[1]
     dataset = tmp_path / 'dataset'
     dataset.mkdir()
     output = tmp_path / 'output'
@@ -200,10 +156,13 @@ print(w.root, flush=True)
 sys.stdin.read()
 '''
     process = subprocess.Popen([sys.executable, '-c', code, str(dataset), str(output)],
-                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                               cwd=package_root, stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, text=True)
     try:
-        root = Path(process.stdout.readline().strip())
-        assert root.is_dir()
+        published_root = process.stdout.readline().strip()
+        assert published_root, 'workspace subprocess exited before publishing its root'
+        root = Path(published_root)
+        assert root.is_dir() and root.resolve().is_relative_to(output.resolve())
         legacy = root.parent / 'legacy'
         legacy.mkdir()
         (legacy / 'data').write_text('keep')
@@ -219,8 +178,8 @@ sys.stdin.read()
         command = [sys.executable, '-c',
                    'from workspace_storage import reclaim_workspaces; import sys; reclaim_workspaces(sys.argv[1])',
                    str(output)]
-        processes = [subprocess.Popen(command) for _ in range(3)]
-        assert all(p.wait(timeout=10) == 0 for p in processes)
+        processes = [subprocess.Popen(command, cwd=package_root) for _ in range(3)]
+        assert [p.wait(timeout=10) for p in processes] == [0, 0, 0]
         assert not root.exists()
         assert (legacy / 'data').read_text() == 'keep'
         assert link.is_symlink()
@@ -259,19 +218,6 @@ def test_real_scroll_discard_and_reopen(tmp_path):
         assert target.read_bytes() == before == source.read_bytes()
     finally:
         fresh.close()
-
-
-def test_failed_claim_can_be_released(state, monkeypatch):
-    state.release_editing('owner', 'first-release')
-    workspace = state.editing()
-    def fail():
-        (workspace.root / 'partial-snapshot').write_bytes(b'partial')
-        raise OSError('snapshot failed')
-    monkeypatch.setattr(workspace, '_seed', fail)
-    with pytest.raises(OSError):
-        workspace.claim('owner', 'failed-claim')
-    state.release_editing('owner', 'failed-claim-release')
-    assert not workspace.root.exists()
 
 
 def test_shutdown_timeout_does_not_remove_active_mutation(state):

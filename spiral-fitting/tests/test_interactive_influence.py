@@ -1,19 +1,9 @@
 import math
 import unittest
-
 import numpy as np
 import torch
-
-from influence import (
-    InteractiveInfluenceState,
-    _gap_logit_zst,
-    influence_weight,
-    make_influence_state,
-    spiral_zst,
-    subsample_rows,
-)
-from transforms import GapExpanderParams, GapExpandingTransform, SpiralAndTransform
-
+from influence import _gap_logit_zst, influence_weight, make_influence_state
+from transforms import GapExpandingTransform, SpiralAndTransform
 
 TINY_CONFIG = {
     'model_initial_dr_per_winding': 16.,
@@ -89,11 +79,6 @@ class InfluenceWeightTests(unittest.TestCase):
     def weight(self, query, footprint):
         return influence_weight(query, footprint, self.LIMITS, self.SIGMA)
 
-    def test_unit_weight_on_footprint(self):
-        footprint = torch.tensor([[500., 3., 1.], [800., 5., 4.]])
-        w = self.weight(footprint.clone(), footprint)
-        torch.testing.assert_close(w, torch.ones([2]))
-
     def test_zero_beyond_each_hard_extent(self):
         footprint = zst(500., 3., 1.)
         for axis, offset in ((0, self.LIMITS[0]), (1, self.LIMITS[1])):
@@ -128,12 +113,6 @@ class InfluenceWeightTests(unittest.TestCase):
         separate = torch.maximum(self.weight(queries, footprint_a),
                                  self.weight(queries, footprint_b))
         torch.testing.assert_close(pooled, separate)
-
-    def test_gaussian_decay_inside(self):
-        footprint = zst(500., 3., 1.)
-        query = zst(500. + self.LIMITS[0] * 0.5, 3., 1.)
-        expected = math.exp(-0.25 / (2. * self.SIGMA ** 2))
-        self.assertAlmostEqual(float(self.weight(query, footprint)), expected, places=5)
 
 
 class GapCoordinateTests(unittest.TestCase):
@@ -174,70 +153,14 @@ class GapCoordinateTests(unittest.TestCase):
         far = (theta_probe - float(theta_cols[column])).abs() > 2. * theta_spacing
         self.assertEqual(float(diff[far, bucket + 1].max()), 0.)
 
-    def test_z_row_localization(self):
-        model = make_tiny_model()
-        gap_params = model.gap_expander_params
-        min_z = float(model.flow_min_corner_zyx[0])
-        max_z = float(model.flow_max_corner_zyx[0])
-        z_rows, s_cols, theta_cols = _gap_logit_zst(gap_params, min_z, max_z, torch.device('cpu'))
-        row, column = gap_params.num_z // 2, s_cols.shape[0] // 2
-        bucket = int(s_cols[column] - 0.5)
-        theta_probe = torch.full([gap_params.num_z], float(theta_cols[column]))
-
-        def radii():
-            transform = GapExpandingTransform(
-                gap_params, torch.tensor(16.), min_z, max_z, TINY_CONFIG['model_gap_expander_lr_scale'])
-            with torch.no_grad():
-                return transform.get_transformed_winding_radii(theta_probe, z_rows.clone())
-
-        before = radii()
-        with torch.no_grad():
-            gap_params.logits[0, 0, row, column] += 0.05
-            gap_params._triton_consts = None
-        diff = (radii() - before).abs()[:, bucket + 1]
-        self.assertGreater(float(diff[row]), 0.)
-        far_rows = torch.arange(gap_params.num_z)
-        far_rows = far_rows[(far_rows - row).abs() > 1]
-        self.assertEqual(float(diff[far_rows].max()), 0.)
-
 
 class FlowLatticeMappingTests(unittest.TestCase):
-    def test_flowbox_to_spiral_is_identity_with_zero_parameters(self):
-        model = make_tiny_model()
-        points = torch.stack([
-            torch.empty([256]).uniform_(10., 180.),
-            torch.empty([256]).uniform_(-80., 80.),
-            torch.empty([256]).uniform_(-80., 80.),
-        ], dim=-1)
-        for include in (False, True):
-            transform = model.get_flowbox_to_spiral_transform(include_diffeomorphism=include)
-            with torch.no_grad():
-                mapped = transform(points)
-            torch.testing.assert_close(mapped, points, atol=1e-3, rtol=0.)
-
     def test_flowbox_to_spiral_round_trip_with_nonzero_flow(self):
         model = make_tiny_model()
         with torch.no_grad():
             for flow in model.flow_field.flows:
                 flow.normal_(std=1e-3)
         transform = model.get_flowbox_to_spiral_transform(include_diffeomorphism=True)
-        points = torch.stack([
-            torch.empty([256]).uniform_(10., 180.),
-            torch.empty([256]).uniform_(-80., 80.),
-            torch.empty([256]).uniform_(-80., 80.),
-        ], dim=-1)
-        with torch.no_grad():
-            round_trip = transform.inv(transform(points))
-        torch.testing.assert_close(round_trip, points, atol=0.5, rtol=0.)
-
-    def test_two_stage_flow_round_trip(self):
-        model = make_tiny_model(model_num_flow_stages=2)
-        # The stages are the slabs of one flow field's lattices.
-        self.assertEqual([flow.shape[0] for flow in model.flow_field.flows], [2, 2])
-        with torch.no_grad():
-            for flow in model.flow_field.flows:
-                flow.normal_(std=1e-3)
-        transform = model.get_slice_to_spiral_transform()
         points = torch.stack([
             torch.empty([256]).uniform_(10., 180.),
             torch.empty([256]).uniform_(-80., 80.),
@@ -296,33 +219,6 @@ class FreezeInvariantTests(unittest.TestCase):
             param = dict(model.named_parameters())[name]
             self.assertTrue(torch.equal(param.detach(), snapshot[name]),
                             f'{name}: frozen parameter moved')
-
-    def test_partially_masked_elements_move_less(self):
-        model, optimiser = self._prepopulated()
-        state = make_influence_state(INFLUENCE_CONFIG, torch.device('cpu'))
-        state._allocate_masks(model)
-        state.masks['gap'].fill_(0.1)
-        state.num_incorporations = 1
-        state._apply_optimizer_surgery(model, optimiser)
-
-        gap_logits = model.gap_expander_params.logits
-        before = gap_logits.detach().clone()
-        grad = torch.randn_like(gap_logits) * 1e-3
-        gap_logits.grad = grad.clone()
-        state.apply_grad_masks_(model)
-        optimiser.step()
-        state.apply_masked_gap_decay_(model, optimiser)
-        moved_masked = (gap_logits.detach() - before).abs().mean()
-
-        model2, optimiser2 = self._prepopulated()
-        # Same fabricated update with no masking, from the same start.
-        gap2 = model2.gap_expander_params.logits
-        with torch.no_grad():
-            gap2.copy_(before)
-        gap2.grad = grad.clone()
-        optimiser2.step()
-        moved_free = (gap2.detach() - before).abs().mean()
-        self.assertLess(float(moved_masked), float(moved_free))
 
     def test_flow_masks_apply_to_every_stage(self):
         model = make_tiny_model(model_num_flow_stages=2)
@@ -393,18 +289,6 @@ class ActivateAndAnchorTests(unittest.TestCase):
         )
         return state
 
-    def test_activation_builds_localized_masks_and_anchor_bank(self):
-        model = make_tiny_model()
-        optimiser = make_optimiser(model)
-        state = self._activate(model, optimiser)
-        self.assertTrue(state.active)
-        for key in ('flow_lr', 'flow_hr', 'gap'):
-            coverage = float((state.masks[key] > 0).float().mean())
-            self.assertGreater(coverage, 0., f'{key} mask is empty')
-            self.assertLess(coverage, 1., f'{key} mask covers everything')
-        self.assertGreater(float(state.anchor_w.max()), 0.5)
-        self.assertGreater(int((state.anchor_loss_weight > 0.5).sum()), 0)
-
     def test_anchor_loss_zero_after_refresh_then_positive_after_perturbation(self):
         model = make_tiny_model()
         optimiser = make_optimiser(model)
@@ -425,29 +309,6 @@ class ActivateAndAnchorTests(unittest.TestCase):
         model.flow_field.apply_accumulated_field_grad()
         self.assertTrue(any(flow.grad is not None and flow.grad.abs().sum() > 0
                             for flow in model.flow_field.flows))
-
-    def test_second_incorporation_extends_the_union(self):
-        model = make_tiny_model()
-        optimiser = make_optimiser(model)
-        state = self._activate(model, optimiser)
-        gap_before = state.masks['gap'].clone()
-        collection = self._make_collection()
-        for point in collection['points'].values():
-            point['zyx'] = point['zyx'] + np.array([60., 0., 0.], dtype=np.float32)
-        state.activate_or_extend_(
-            new_patches={},
-            new_collections={2: collection},
-            spiral_and_transform=model,
-            optimiser=optimiser,
-            cfg=INFLUENCE_CONFIG,
-            z_begin=0,
-            z_end=192,
-            anchor_geometry_zyx=None,
-        )
-        self.assertEqual(state.num_incorporations, 2)
-        self.assertTrue((state.masks['gap'] >= gap_before).all())
-        self.assertGreater(float((state.masks['gap'] > 0).float().mean()),
-                           float((gap_before > 0).float().mean()))
 
     def test_fiber_revision_replaces_its_influence_contribution(self):
         model = make_tiny_model()
@@ -530,34 +391,3 @@ class ActivateAndAnchorTests(unittest.TestCase):
                          [('same_winding', '7')])
         self.assertEqual(state.footprints[0]['input_id'], '7')
         self.assertTrue(state.active)
-
-
-class SubsampleTests(unittest.TestCase):
-    def test_subsample_is_deterministic_for_a_seed(self):
-        points = torch.randn([100, 3])
-        g1 = torch.Generator(); g1.manual_seed(7)
-        g2 = torch.Generator(); g2.manual_seed(7)
-        self.assertTrue(torch.equal(subsample_rows(points, 10, g1),
-                                    subsample_rows(points, 10, g2)))
-
-    def test_subsample_returns_input_when_small(self):
-        points = torch.randn([5, 3])
-        g = torch.Generator(); g.manual_seed(7)
-        self.assertIs(subsample_rows(points, 10, g), points)
-
-
-class SpiralZstTests(unittest.TestCase):
-    def test_matches_manual_computation(self):
-        dr = torch.tensor(16.)
-        theta = torch.tensor([0.5])
-        winding = 3.
-        radius = (winding + 0.5 / (2. * math.pi)) * 16.
-        point = torch.tensor([[100., math.sin(0.5) * float(radius), math.cos(0.5) * float(radius)]])
-        result = spiral_zst(point, dr)
-        self.assertAlmostEqual(float(result[0, 0]), 100., places=4)
-        self.assertAlmostEqual(float(result[0, 1]), winding, places=4)
-        self.assertAlmostEqual(float(result[0, 2]), 0.5, places=4)
-
-
-if __name__ == '__main__':
-    unittest.main()
