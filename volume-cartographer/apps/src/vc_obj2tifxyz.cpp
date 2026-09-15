@@ -50,6 +50,7 @@ private:
     cv::Vec2f uv_min, uv_max;
     cv::Vec2i grid_size;
     cv::Vec2f scale;
+    cv::Vec2d est_spacing = cv::Vec2d(0.0, 0.0);
     // UV handling
     bool uv_is_metric = true;   // if true, scale comes from UV spacing
     float uv_to_obj   = 1.0f;   // OBJ units per 1 UV unit (used when uv_is_metric)
@@ -214,7 +215,7 @@ public:
         const double eff_decim_y = (gh_dec > 1) ? (double)(gh_raw - 1) / (double)(gh_dec - 1) : 1.0;
 
         // When the source tifxyz scale is known, size the output grid to the
-        // source sampling density and adopt its scale verbatim. vc_tifxyz2obj
+        // source sampling density. vc_tifxyz2obj
         // wrote UVs as grid_idx*(1/src_scale), so the source cell count per axis
         // is ~uv_range*src_scale + 1. This keeps the flattened tifxyz at the
         // input's resolution/scale instead of metric mode's 1 cell / UV unit
@@ -224,29 +225,28 @@ public:
             int gw_src = std::max(2, static_cast<int>(std::lround(uv_range[0] * src_scale[0])) + 1);
             int gh_src = std::max(2, static_cast<int>(std::lround(uv_range[1] * src_scale[1])) + 1);
             // Honor any further user decimation / pixel cap on top of source density.
-            gw_src = apply_decimation(gw_src, decim);
-            gh_src = apply_decimation(gh_src, decim);
-            grid_size[0] = gw_src;
-            grid_size[1] = gh_src;
-            scale[0] = src_scale[0];
-            scale[1] = src_scale[1];
+            const int gw_src_dec = apply_decimation(gw_src, decim);
+            const int gh_src_dec = apply_decimation(gh_src, decim);
+            grid_size[0] = gw_src_dec;
+            grid_size[1] = gh_src_dec;
+            scale[0] = static_cast<float>(src_scale[0] * (gw_src_dec - 1) / double(gw_src - 1));
+            scale[1] = static_cast<float>(src_scale[1] * (gh_src_dec - 1) / double(gh_src - 1));
             std::cout << "Source-scale mode: grid " << grid_size[0] << " x " << grid_size[1]
                       << "  scale: " << scale[0] << ", " << scale[1]
-                      << "  (matched to input tifxyz)" << std::endl;
+                      << "  (input tifxyz scale, reduced by any decimation)" << std::endl;
         } else if (uv_is_metric) {
             // --- Preserve physical pixel size (scale) from the RAW grid ---
             // du_raw/dv_raw are UV units per pixel *before* decimation.
             const float du_raw = (gw_raw > 1) ? uv_range[0] / float(gw_raw - 1) : 0.f;
             const float dv_raw = (gh_raw > 1) ? uv_range[1] / float(gh_raw - 1) : 0.f;
-            scale[0] = du_raw * uv_to_obj; // OBJ units per pixel (unchanged by decimation)
-            scale[1] = dv_raw * uv_to_obj;
+            est_spacing[0] = du_raw * uv_to_obj * eff_decim_x;
+            est_spacing[1] = dv_raw * uv_to_obj * eff_decim_y;
 
             std::cout << "UV-metric mode: grid " << grid_size[0] << " x " << grid_size[1]
-                      << "  scale(OBJ units): " << scale[0] << ", " << scale[1] << std::endl;
+                      << "  UV-derived cell spacing (OBJ units): " << est_spacing[0] << ", " << est_spacing[1] << std::endl;
             if (decim > 1.0) {
                 std::cout << "  (applied UV decimation ~" << decim << "x per axis; "
-                          << "effective decim [" << eff_decim_x << ", " << eff_decim_y << "]; "
-                          << "preserved per-pixel physical scale)\n";
+                          << "effective decim [" << eff_decim_x << ", " << eff_decim_y << "])\n";
             }
         } else {
             // --- Legacy non-metric: measure from 3D on decimated grid, then compensate ---
@@ -257,20 +257,17 @@ public:
             for (const auto& face : faces) {
                 rasterizeTriangle(preliminary_points, face);
             }
-            // This fills 'scale' with the distance between adjacent samples on the DECIMATED grid
-            calculateScaleFromGrid(preliminary_points);
+            cv::Vec2d measured = measureGridSpacing(preliminary_points);
+            if (measured[0] > 0) measured[0] /= eff_decim_x;
+            if (measured[1] > 0) measured[1] /= eff_decim_y;
 
-            // Compensate by the effective decimation so that scale matches the raw-grid pixel size
-            if (scale[0] > 0) scale[0] = static_cast<float>(scale[0] / eff_decim_x);
-            if (scale[1] > 0) scale[1] = static_cast<float>(scale[1] / eff_decim_y);
-
-            // Keep original behavior for the final log (do not fight it further)
-            const cv::Vec2f measured = scale;
+            // Keep original behavior for the final grid size (do not fight it further)
             grid_size[0] = std::max(2, static_cast<int>(std::round(measured[0] * stretch_factor)) + 1);
             grid_size[1] = std::max(2, static_cast<int>(std::round(measured[1] * stretch_factor)) + 1);
+            est_spacing = measured;
 
             std::cout << "Final grid: " << grid_size[0] << " x " << grid_size[1] << std::endl;
-            std::cout << "Scale(OBJ units; compensated to raw-pixel spacing): "
+            std::cout << "Measured cell spacing (OBJ units; compensated to raw-pixel spacing): "
                       << measured[0] << ", " << measured[1] << std::endl;
         }
 
@@ -286,7 +283,7 @@ public:
         }
     }
     
-    QuadSurface* createQuadSurface(float mesh_units = 1.0f) {
+    QuadSurface* createQuadSurface() {
         // Create points matrix initialized with invalid values
         cv::Mat_<cv::Vec3f>* points = new cv::Mat_<cv::Vec3f>(grid_size[1], grid_size[0], cv::Vec3f(-1, -1, -1));
 
@@ -313,28 +310,47 @@ public:
         std::cout << "Valid grid points: " << valid_count << " / " << (grid_size[0] * grid_size[1]) 
                   << " (" << (100.0f * valid_count / (grid_size[0] * grid_size[1])) << "%)" << std::endl;
         
-        // Scale is currently in OBJ units. Convert to micrometers now.
         if (valid_count == 0) {
-            std::cerr << "Warning: no valid grid points were rasterized." << std::endl;
+            std::cerr << "Error: no valid grid points were rasterized (grid "
+                      << grid_size[0] << " x " << grid_size[1] << "); refusing to write an empty tifxyz."
+                      << std::endl;
+            delete points;
+            return nullptr;
+        }
+        if (grid_size[0] <= 2 && grid_size[1] <= 2) {
+            std::cerr << "Error: degenerate 2 x 2 output grid (" << valid_count
+                      << " of 4 points rasterized); refusing to write a tifxyz." << std::endl;
+            delete points;
+            return nullptr;
         }
         const bool src_scale_mode = (src_scale[0] > 0.f && src_scale[1] > 0.f);
         if (src_scale_mode) {
-            // Scale was adopted verbatim from the source tifxyz; do not rescale.
             std::cout << "Scale (from source tifxyz): " << scale[0] << ", " << scale[1] << std::endl;
-        } else if (uv_is_metric) {
-            scale[0] *= mesh_units;
-            scale[1] *= mesh_units;
-            std::cout << "Scale from UV (micrometers): " << scale[0] << ", " << scale[1] << std::endl;
         } else {
-            // Measure from 3D to preserve anisotropy and noise-robustness (already compensated in determineGridDimensions)
-            calculateScaleFromGrid(*points, mesh_units);
+            cv::Vec2d spacing = measureGridSpacing(*points);
+            if (spacing[0] <= 0.0 || spacing[1] <= 0.0) {
+                std::cerr << "Warning: could not measure cell spacing from the grid; using the UV-derived estimate"
+                          << std::endl;
+                spacing = est_spacing;
+            }
+            if (spacing[0] <= 0.0 || spacing[1] <= 0.0) {
+                std::cerr << "Error: cell spacing is not positive (" << spacing[0] << ", " << spacing[1]
+                          << "); cannot derive a tifxyz scale." << std::endl;
+                delete points;
+                return nullptr;
+            }
+            scale[0] = static_cast<float>(1.0 / spacing[0]);
+            scale[1] = static_cast<float>(1.0 / spacing[1]);
+            std::cout << "Measured cell spacing: " << spacing[0] << ", " << spacing[1]
+                      << " OBJ units -> scale: " << scale[0] << ", " << scale[1]
+                      << " cells per unit" << std::endl;
         }
         
         return new QuadSurface(points, scale);
     }
     
-    void calculateScaleFromGrid(const cv::Mat_<cv::Vec3f>& points, float mesh_units = 1.0f) {
-        // Based on vc_segmentation_scales from Slicing.cpp
+    // Based on vc_segmentation_scales from Slicing.cpp
+    static cv::Vec2d measureGridSpacing(const cv::Mat_<cv::Vec3f>& points) {
         double sum_x = 0;
         double sum_y = 0;
         int count = 0;
@@ -355,21 +371,17 @@ public:
             step = 1;
         }
         
-        // Calculate average distance between adjacent points
         for (int j = jmin; j < jmax; j += step) {
             for (int i = imin; i < imax; i += step) {
-                // Skip invalid points
                 if (points(j, i)[0] == -1 || points(j, i-1)[0] == -1 || points(j-1, i)[0] == -1)
                     continue;
                 
-                // Distance to neighbor in X direction
                 cv::Vec3f v = points(j, i) - points(j, i-1);
                 const double dist_x_sq = v.dot(v);
                 if (dist_x_sq > 0) {
                     sum_x += std::sqrt(dist_x_sq);
                 }
                 
-                // Distance to neighbor in Y direction
                 v = points(j, i) - points(j-1, i);
                 const double dist_y_sq = v.dot(v);
                 if (dist_y_sq > 0) {
@@ -380,16 +392,9 @@ public:
         }
         
         if (count > 0 && sum_x > 0 && sum_y > 0) {
-            // Scale is the average distance between points, adjusted by mesh units
-            scale[0] = static_cast<float>((sum_x / count) * mesh_units);
-            scale[1] = static_cast<float>((sum_y / count) * mesh_units);
-        } else {
-            // Fallback to UV-based scale if we couldn't calculate from grid
-            std::cerr << "Warning: Could not calculate scale from grid, using UV-based fallback" << std::endl;
-            // scale already set in determineGridDimensions
+            return cv::Vec2d(sum_x / count, sum_y / count);
         }
-        
-        std::cout << "Calculated scale factors from grid: " << scale[0] << ", " << scale[1] << " micrometers" << std::endl;
+        return cv::Vec2d(0.0, 0.0);
     }
     
 private:
@@ -523,8 +528,10 @@ int main(int argc, char *argv[])
         std::cout << "Converts an OBJ file to tifxyz format" << std::endl;
         std::cout << std::endl;
         std::cout << "Parameters:" << std::endl;
-        std::cout << "  stretch_factor: UV scaling factor (default: 1.0)" << std::endl;
-        std::cout << "  mesh_units    : micrometers per OBJ unit (default: 1.0)" << std::endl;
+        std::cout << "  stretch_factor: grid cells per UV unit (default: 1.0). OBJs with UVs normalised" << std::endl;
+        std::cout << "                  to [0,1] (e.g. the published segment meshes) need a value such as 800," << std::endl;
+        std::cout << "                  otherwise the grid is 2 x 2 and the tool refuses it." << std::endl;
+        std::cout << "  mesh_units    : micrometers per OBJ unit (default: 1.0; accepted for compatibility, not used for the tifxyz scale)" << std::endl;
         std::cout << "Flags:" << std::endl;
         std::cout << "  --uv-metric         : UVs are metric (default; UV units == OBJ units unless --uv-to-obj is set)" << std::endl;
         std::cout << "  --uv-non-metric     : Revert to legacy behavior (measure scale from 3D mesh)" << std::endl;
@@ -533,13 +540,15 @@ int main(int argc, char *argv[])
         std::cout << "  --grid-cap=<pixels> : Upper bound on total grid pixels. Implies extra decimation if needed." << std::endl;
         std::cout << "  --uuid=<id>         : Metadata UUID. Defaults to the output-directory basename." << std::endl;
         std::cout << "  --tifxyz-source=<dir>: Original tifxyz being flattened. Its meta.json scale sizes the" << std::endl;
-        std::cout << "                        output grid to the input sampling density (output scale == input" << std::endl;
-        std::cout << "                        scale). If <dir>/approval.tif exists, it is resampled onto the new" << std::endl;
+        std::cout << "                        output grid to the input sampling density." << std::endl;
+        std::cout << "                        If <dir>/approval.tif exists, it is resampled onto the new" << std::endl;
         std::cout << "                        grid via the <input.obj>.griduv sidecar. Absent: legacy metric sizing." << std::endl;
         std::cout << std::endl;
-        std::cout << "Note: Scale factors are automatically calculated from the mesh grid structure." << std::endl;
+        std::cout << "Note: the tifxyz scale (grid cells per voxel) is measured from the grid actually" << std::endl;
+        std::cout << "      produced; with --tifxyz-source it is the source scale reduced by any decimation." << std::endl;
+        std::cout << "      The tool exits non-zero when no grid point is rasterized or the output grid is only 2 x 2." << std::endl;
         std::cout << "Examples:" << std::endl;
-        std::cout << "  " << argv[0] << " mesh.obj outdir                       (legacy behavior)" << std::endl;
+        std::cout << "  " << argv[0] << " mesh.obj outdir                       (UV-metric mode, 1 cell per UV unit)" << std::endl;
         std::cout << "  " << argv[0] << " mesh.obj outdir 800 1.0 --uv-metric  (UV is metric, OBJ units == UV units)" << std::endl;
         std::cout << "  " << argv[0] << " mesh.obj outdir --uv-metric --uv-to-obj=0.001" << std::endl;
         return EXIT_SUCCESS;
@@ -703,7 +712,7 @@ int main(int argc, char *argv[])
     converter.determineGridDimensions(stretch_factor);
     
     // Create quad surface
-    QuadSurface* surf = converter.createQuadSurface(mesh_units);
+    QuadSurface* surf = converter.createQuadSurface();
     if (!surf) {
         std::cerr << "Failed to create quad surface" << std::endl;
         return EXIT_FAILURE;
