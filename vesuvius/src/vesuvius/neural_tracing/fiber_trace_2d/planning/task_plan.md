@@ -1,37 +1,28 @@
-# Training-feedback fiber refinement
+# Fixed test crops
 
-## Approved continuation launch
-Resume raw current.pt from 5scroll_json_eligible_128_sd1_16x8_ema_20260914_105436
-(update 11800), preserve optimizer/LR 0.01, data, EMA and batch settings; enable
-refinement and add existing per-scroll normal manifests. Use a new run name and
-the approved production-start launcher with automatic manager admission. Check
-startup for errors and record the launch/log. No protocol or semantic changes.
+## Current correction
+Stop active run. Mark test observations explicitly independent and use uniform
+ellipse cap without border taper or endpoint pinning in the shared solver.
+Preserve training constraints. Test scalar/batched parity, border/end movement,
+test observation transport and existing managed CUDA path. Independently review.
+Restart from original non-refinement update11800, not either refinement run.
+Spec/docs update: remove stated test taper/end locks; retain step cap/tether.
 
-1. Inspect queue transport, coordinate transforms, native normal sampler and
-   snapshot/cooperative lifetime. Disabled behavior stays unchanged.
-2. Validated opt-in settings and shared versioned per-component geometry store;
-   immutable reference, mutable curves, preserved eligibility/source identity.
-3. Fixed-budget semi-implicit solve: uniform segment quadrature, baseline tether,
-   small displacement smoothness, current tangent-plane projection, tapered
-   ellipse step cap, equal-distance resampling after each step. Existing native
-   normal interpolation and geometric transforms must be reused.
-4. Carry lightweight geometry in the existing queued sample payload; update after
-   actual model forwards (raw train/test only, never EMA observations). Existing
-   prefetched batches remain immutable; reject stale conflicting proposals.
-5. Save all train/test geometry beside checkpoints, restore matching geometry on
-   resume and keep it across GPU cohort changes. Never overwrite input annotations.
-6. CPU geometry/integration/restore regression tests and small runtime measurements
-   through approved runner; manager allocation for any CUDA checks. No long run.
+1. Commit old state (5ba084bfd); keep training behavior unchanged.
+2. Test transforms use original GT; lazily register per-sample/transform local
+   curves in existing store/archive. Old whole-test updates do not seed them.
+3. Share raw/EMA scalar logging. Preserve names and checkpoint selection semantics.
+4. Test crop stability, target changes, overlap isolation, resume and metric parity;
+   approved CPU runner and manager-owned CUDA smoke. Independent review.
+5. Stop incorrectly resumed refinement run; resume original non-refinement run
+   5scroll_json_eligible_128_sd1_16x8_ema_20260914_105436/current raw at11800.
+   Verify no refinement archive/config in source checkpoint; keep optimizer/EMA,
+   initialize fresh refinement geometry. Check manager launch and resume log.
 
 ## Spec update
-Add the opt-in contract to specs.md including moving test targets and bounded
-lookahead. No manager protocol changes.
+Test geometry is independent per fixed GT crop; same raw/EMA targets per visit.
+Existing nearest connected section solver scope and training cap/taper
+behavior remain unchanged. Archive local test state, not merged test fibers.
 
 ## Docs updates
-Add training_refinement.md with settings, solver and snapshot inspection/restore.
-Brief task log and changelog; independent plan/integration review.
-
-## Validation
-Approved cooperative test caller; numerical shape, quadrature, clamp/taper,
-resampling, augmented coordinate roundtrip, persistence/stale proposal tests.
-Report measured overhead and limitations rather than promise a percentage.
+Update refinement docs, specs, changelog and task log with transition and launch.

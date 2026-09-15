@@ -2734,6 +2734,16 @@ def _log_embedding_scalars(writer, prefix, losses, model, step):
                 writer.add_scalar(f"{prefix}/{key}", value, step)
 
 
+def _log_test_scalars(writer, prefix, losses, model, step):
+    """Raw, EMA and historical observations use the same component tags."""
+    for key in ("total", "direction", "presence", "angle_mean_deg",
+                "branch0_fraction", "branch1_fraction", "selected_score_mean"):
+        if key in losses:
+            tag = f"loss_{key}" if key in {"total", "direction", "presence"} else key
+            writer.add_scalar(f"{prefix}/{tag}", losses[key], step)
+    _log_embedding_scalars(writer, prefix, losses, model, step)
+
+
 def _losses_to_float_dict(losses: dict[str, torch.Tensor]) -> dict[str, float]:
     return {key: float(value.detach().cpu()) for key, value in losses.items()}
 
@@ -3510,9 +3520,7 @@ def training_units(
               f"loss_total={values['total']:.6f} angle_mean_deg={values['angle_mean_deg']:.2f} "
               f"{_embedding_log(values, raw_model) if 'embedding' in values else ''}", flush=True)
         if writer is not None:
-            writer.add_scalar(f"{prefix}/loss_total", values["total"], step)
-            writer.add_scalar(f"{prefix}/angle_mean_deg", values["angle_mean_deg"], step)
-            _log_embedding_scalars(writer, prefix, values, raw_model, step)
+            _log_test_scalars(writer, prefix, values, raw_model, step)
 
     def run_configured_tests(step: int, *, initial=False):
         nonlocal pending_test, ema_test_metrics
@@ -3617,14 +3625,7 @@ def training_units(
                         )
                     if writer is not None and (pending_test is None or not pending_test["dense_logged"]):
                         diagnostics.marker("test-tensorboard-scalars-begin", step=step)
-                        writer.add_scalar("test/loss_total", test_losses["total"], step)
-                        writer.add_scalar("test/loss_direction", test_losses["direction"], step)
-                        writer.add_scalar("test/loss_presence", test_losses["presence"], step)
-                        _log_embedding_scalars(writer, "test", test_losses, raw_model, step)
-                        writer.add_scalar("test/angle_mean_deg", test_losses["angle_mean_deg"], step)
-                        writer.add_scalar("test/branch0_fraction", test_losses["branch0_fraction"], step)
-                        writer.add_scalar("test/branch1_fraction", test_losses["branch1_fraction"], step)
-                        writer.add_scalar("test/selected_score_mean", test_losses["selected_score_mean"], step)
+                        _log_test_scalars(writer, "test", test_losses, raw_model, step)
                         diagnostics.marker("test-tensorboard-scalars-end", step=step)
                 if (
                     distributed.is_main

@@ -13,7 +13,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.refinement import (
     RefinementConfig, GeometryStore, RefinementObserver, RefinementObservation,
     arclength, resample, ellipse_metric, clamp_update, taper, semi_implicit_step,
     presence_force, refine_curve, refinement_session,
-    refine_observations, BatchedPatchTransform,
+    refine_observations, BatchedPatchTransform, step_limits,
 )
 
 
@@ -113,6 +113,101 @@ def test_loader_reuses_updated_geometry_and_transports_observation(monkeypatch, 
     np.testing.assert_array_equal(test._refinement_store.read(test._refinement_keys[0]), before)
 
 
+def test_fixed_test_crop_local_targets_and_resume(monkeypatch, tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.loader import FiberTrace3DLoader
+    train = make_refining_loader(monkeypatch, tmp_path)
+    cfg = replace(train.config, refinement_split="test")
+    object.__setattr__(cfg, "_array_records", train.config._array_records)
+    loader = FiberTrace3DLoader(cfg)
+    first = loader.load_sample(0)
+    other = loader.load_sample(1)
+    obs = first.refinement_geometry
+    assert obs is not None and other.refinement_geometry is not None
+    assert obs.independent_piece and other.refinement_geometry.independent_piece
+    assert obs.key != other.refinement_geometry.key
+    store = loader._refinement_store
+    source = store.read(loader._refinement_keys[0])
+    moved = obs.current.copy()
+    moved[1:-1, 1] += 2
+    assert store.commit(obs.key, 0, obs.current, moved)
+    again = loader.load_sample(0)
+    np.testing.assert_array_equal(again.refinement_geometry.current, moved)
+    np.testing.assert_array_equal(again.refinement_geometry.params.cp_volume_zyx, obs.params.cp_volume_zyx)
+    np.testing.assert_array_equal(again.refinement_geometry.params.source_to_output_zyx, obs.params.source_to_output_zyx)
+    torch.testing.assert_close(first.volume, again.volume, rtol=0, atol=0)
+    torch.testing.assert_close(first.crop_origin_zyx, again.crop_origin_zyx, rtol=0, atol=0)
+    assert not torch.equal(first.target_segment_starts_zyx, again.target_segment_starts_zyx)
+    np.testing.assert_array_equal(loader.load_sample(1).refinement_geometry.current, other.refinement_geometry.current)
+    np.testing.assert_array_equal(store.read(loader._refinement_keys[0]), source)
+    # Legacy whole-test updates never move the crop or seed its local curve.
+    legacy = source.copy()
+    legacy[:, 1] += 10
+    assert store.commit(loader._refinement_keys[0], 0, source, legacy)
+    np.testing.assert_array_equal(loader.load_sample(0).refinement_geometry.current, moved)
+    archive = tmp_path / "geometry.zip"
+    saved = store.save(archive)
+    with zipfile.ZipFile(archive) as z:
+        source_json = json.loads(z.read(loader._refinement_keys[0] + "/fiber.json"))
+        assert source_json["refinement"]["evaluation_role"] == "immutable_source_only"
+    restored = GeometryStore(tmp_path / "restored")
+    restored.restore(archive, saved["sha256"])
+    monkeypatch.setenv("VILLA_FIBER_REFINEMENT_STATE", str(restored.root))
+    resumed = FiberTrace3DLoader(cfg)
+    np.testing.assert_array_equal(resumed.load_sample(0).refinement_geometry.current, moved)
+    assert resumed.load_sample(2).refinement_geometry is not None  # lazy new crop after restore
+
+
+def test_independent_piece_uniform_cap_and_free_endpoints():
+    from vesuvius.neural_tracing.fiber_trace_3d.loader import _Augment3DParams
+    cfg = RefinementConfig(iterations=1, gt_weight=0., shape_weight=0., learning_rate=10.)
+    points = np.c_[np.linspace(0, 63, 9), np.ones(9), np.full(9, 32.)]
+    current = np.c_[points, arclength(points)]
+    normals = np.tile([0.,1.,0.], (len(points),1))
+    presence = np.broadcast_to(np.arange(64)[None,:,None]/63., (64,)*3).copy()
+    params = _Augment3DParams(0, np.zeros(3), np.zeros(3), np.eye(3), np.eye(3),
+                            0,1,1,0,0,None,0,0,None)
+    train = RefinementObservation("a",0,current,current,normals,params,1.,(64,)*3,cfg)
+    test = replace(train, independent_piece=True)
+    a,b = refine_observations([train,test], [presence,presence])
+    expected = refine_curve(current,points,current[:,3],normals,presence,lambda x:x,
+                            (64,)*3,cfg,independent_piece=True)
+    np.testing.assert_allclose(b,expected,atol=1e-10)
+    np.testing.assert_allclose(b[:,1]-points[:,1], cfg.max_step_fraction*cfg.normal_radius_base)
+    np.testing.assert_array_equal(a[[0,-1]], current[[0,-1]])
+    limits = step_limits(points,(64,)*3,cfg,True,np.array([0,8]))
+    np.testing.assert_array_equal(limits,np.full(9,.125))
+
+
+def test_independent_piece_omits_stitching_segments(monkeypatch, tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.arc_sampling import FiberLocation
+    loader = make_refining_loader(monkeypatch, tmp_path)
+    record, _, cp = loader.descriptor_for_sample_index(0)
+    params = loader._sample_augment_params(record, cp, 0)
+    points = np.c_[np.linspace(4,28,5), np.full(5,16.), np.full(5,16.)]
+    source = loader._output_points_to_source_volume_np(points, params) * record.volume_spacing_base
+    record = replace(record, fiber=replace(record.fiber,line_points_xyz=source[:,::-1]))
+    loc = FiberLocation(2,.5,tuple(source[2,::-1]))
+    all_segments = loader._line_segment_spec(record,loc,params,patch_shape=(32,)*3,radius=1.)
+    separate = loader._line_segment_spec(replace(record,label_breaks=(1,3)),loc,params,
+                                         patch_shape=(32,)*3,radius=1.)
+    for all_values, actual in zip(all_segments,separate):
+        np.testing.assert_array_equal(actual,all_values[[0,2]])
+
+
+def test_raw_and_ema_metric_tags_match():
+    from vesuvius.neural_tracing.fiber_trace_3d.train import _log_test_scalars
+    values = dict(total=1., direction=.1, presence=.9, angle_mean_deg=3.,
+                  branch0_fraction=1., branch1_fraction=0., selected_score_mean=.8)
+    calls = []
+    writer = SimpleNamespace(add_scalar=lambda *args: calls.append(args))
+    for prefix in ("test", "test_ema_0p99", "test_ema_0p999"):
+        _log_test_scalars(writer, prefix, values, SimpleNamespace(embedding_channels=0), 100)
+    tags = [{tag.split("/", 1)[1] for tag, _, _ in calls if tag.startswith(p + "/")}
+            for p in ("test", "test_ema_0p99", "test_ema_0p999")]
+    assert tags[0] == tags[1] == tags[2]
+    assert {"loss_presence", "loss_direction", "loss_total"} <= tags[0]
+
+
 def test_refine_peak_and_material_reference():
     p = line()
     normals = np.tile([0., 1., 0.], (len(p), 1))
@@ -140,7 +235,7 @@ def test_store_snapshot_restore_and_stale(tmp_path):
     store = GeometryStore(tmp_path / "live")
     key = "a"*64
     p = line()[:, :3]
-    store.register(key, p, {"split": "test", "source": "fiber.json"}, cfg)
+    store.register(key, p, {"split": "train", "source": "fiber.json"}, cfg)
     before = store.read(key)
     after = before.copy()
     after[2, 1] += 1
@@ -274,6 +369,27 @@ def test_augmented_mapping_quadrature_and_cost():
     print(f"refinement batched CPU one-core solver: 16 patches,24 nodes each,4 iterations,affine+smooth; "
           f"ms/batch min/median/max={np.array([min(durations),np.median(durations),max(durations)])*1000}; "
           f"patches/s={16/np.median(durations):.1f}")
+
+
+@pytest.mark.skipif(os.environ.get("FIBER_COOPERATIVE_CUDA_TEST") != "1", reason="manager-gated CUDA only")
+def test_cuda_fixed_test_crop_feedback(tmp_path, monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d.loader import FiberTrace3DLoader, collate_fiber_trace_3d_samples
+    train = make_refining_loader(monkeypatch, tmp_path)
+    cfg = replace(train.config, refinement_split="test")
+    object.__setattr__(cfg, "_array_records", train.config._array_records)
+    loader = FiberTrace3DLoader(cfg)
+    sample = loader.load_sample(0)
+    batch = collate_fiber_trace_3d_samples([sample]).to("cuda")
+    stride = sample.refinement_geometry.output_stride
+    output = torch.rand(1, 7, *[32 // stride]*3, device="cuda")
+    observer = RefinementObserver(cfg.refinement)
+    observer(batch, output)
+    observer.flush(SimpleNamespace(enabled=False, is_main=True))
+    assert observer.accepted == 1
+    again = loader.load_sample(0)
+    torch.testing.assert_close(sample.volume, again.volume, rtol=0, atol=0)
+    np.testing.assert_array_equal(again.refinement_geometry.current,
+                                 loader._refinement_store.read(sample.refinement_geometry.key))
 
 
 @pytest.mark.skipif(os.environ.get("FIBER_COOPERATIVE_CUDA_TEST") != "1", reason="manager-gated CUDA only")

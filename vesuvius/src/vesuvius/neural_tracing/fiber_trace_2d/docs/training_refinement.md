@@ -32,8 +32,8 @@ default. Segment midpoint quadrature supplies presence gradients through the
 loader's affine and smooth coordinate mapping. A native banded solve combines
 the immutable-original GT ellipse tether and a small displacement-smoothness
 penalty. Updates are projected into each current tangent's perpendicular plane,
-then capped to 1/8 ellipse. The cap ramps from zero at the patch boundary to full
-at 1/8 patch width. Local section endpoints remain fixed. Every iteration
+then capped to 1/8 ellipse. For training only, the cap ramps from zero at the patch
+boundary to full at 1/8 patch width, and local section endpoints remain fixed. Every iteration
 resamples by arclength while retaining original-reference material coordinates.
 The cap applies per iteration; total drift is controlled by the original-GT
 tether, not a hard cumulative distance cap.
@@ -49,6 +49,20 @@ commits proposals in sample-index order after each macro-update and each test
 wave, rejecting stale overlapping proposals. Later loads see the new geometry;
 already-prefetched batches retain their old targets. Train/test stores are
 separate. Raw and EMA evaluations within a wave use the same prepared targets.
+Test crop selection and all image transforms are computed from immutable original
+GT. Each deterministic crop stores its own local refined curve (`test_patch` in
+archive metadata); overlapping crops do not update one another or a whole test
+fiber. Other visits of the selected fiber stay present in targets as original GT;
+the solver still updates only the nearest connected visit. Refined targets move,
+but the image crop does not follow them. Test pieces use a uniform 1/8-ellipse cap:
+no border taper and no endpoint pinning. Artificial joins to the original outside
+curve are omitted from dense labels. Quadrature outside prediction support supplies
+no presence force (no fabricated border extension); the original-GT tether remains.
+New crop entries initialize lazily from original GT, including after resume.
+Legacy whole-test refinements are unused; their `fiber.json` exports are marked
+`immutable_source_only` and show baseline geometry. Training geometry is unchanged.
+Raw and EMA TensorBoard tracks expose the same direction/presence/total, angle,
+branch and selection metrics (plus embedding diagnostics where enabled).
 Test targets intentionally evolve, so these metrics are not fixed-GT validation.
 Sampling weights remain based on original lengths; selected material locations
 map onto the current curves. Multiworker lookahead timing can affect which
@@ -85,4 +99,7 @@ warps, four iterations, ten repeats: 16-patch solve min/median/max
 7.33 ms, native scalar mapping 2.98 ms; batching is 2.16 ms/patch. This excludes
 normal loading, D2H, distributed commit and archive writes, and is not an
 end-to-end training speed claim. TensorBoard exposes cumulative refinement time,
-accepted and stale proposals. A production run has not been launched.
+accepted and stale proposals. Managed production continuation was launched from
+update11800. The first fixed-test-crop continuation incorrectly resumed refinement
+update13300; it was replaced, at user request, with the original non-refinement
+update11800 checkpoint and fresh train/test refinement state.

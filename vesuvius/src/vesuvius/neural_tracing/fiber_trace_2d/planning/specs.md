@@ -2,6 +2,16 @@
 
 ## Opt-in training-feedback refinement (2026-09-15)
 
+- Test crops are fixed by original GT selection and transforms. Refined local
+  test curves are independent per deterministic crop, never merged into the full
+  test fiber; checkpoint archives preserve them. Old whole-test updates are
+  ignored by the fixed-crop protocol. Training still uses shared whole curves.
+- Raw and EMA tests log the same component metrics, including presence/direction.
+- Independent test pieces have uniform 1/8-ellipse step caps without border taper
+  or endpoint pinning. Training still tapers/pins for stitching. Test labels omit
+  artificial joins to the outside original curve; outside model support contributes
+  no presence force. Baseline tether, fixed crops and per-piece persistence remain.
+
 - `refinement.enabled` defaults false. Current raw model presence, detached from
   autograd, refines persistent train and test curves; no frozen teacher or extra
   forward. Subsequent queued loads reuse refined geometry, never mutate input files.

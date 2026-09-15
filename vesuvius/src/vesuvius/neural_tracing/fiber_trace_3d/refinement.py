@@ -102,6 +102,17 @@ def clamp_update(delta, points, metric, limits, tangent=None):
     return delta * np.minimum(1., limits / np.maximum(norm, 1e-12))[:, None]
 
 
+def step_limits(points_patch, shape, cfg, independent, endpoints):
+    """Test pieces have no stitching seam: uniform cap, including endpoints."""
+    independent = np.broadcast_to(independent, (len(points_patch),))
+    limits = np.full(len(points_patch), cfg.max_step_fraction)
+    stitched = ~independent
+    limits[stitched] *= taper(points_patch[stitched], shape, cfg.border_fraction)
+    pinned = np.asarray(endpoints)[~independent[endpoints]]
+    limits[pinned] = 0.
+    return limits
+
+
 def semi_implicit_step(points, baseline, metric, force, cfg, links=None, spacing=None):
     """Cartesian 3x3 block-tridiagonal solve followed by plane projection.
 
@@ -135,7 +146,7 @@ def semi_implicit_step(points, baseline, metric, force, cfg, links=None, spacing
     return solve_banded((3, 3), band, rhs.reshape(-1), check_finite=False).reshape(n, 3)
 
 
-def presence_force(points, to_patch, presence, patch_shape, cfg, output_stride=1, segment_weights=None):
+def presence_force(points, to_patch, presence, patch_shape, cfg, output_stride=1, segment_weights=None, independent_piece=False):
     """Uniform segment quadrature; each observation pushes both endpoints.
 
     Derivatives of the existing nonlinear base->patch mapping are evaluated
@@ -154,6 +165,10 @@ def presence_force(points, to_patch, presence, patch_shape, cfg, output_stride=1
     offsets = np.concatenate((np.eye(3), -np.eye(3))) * epsilon
     sampled = sample((q[None] + offsets[:, None]).reshape(-1, 3)).reshape(6, -1)
     gradients = ((sampled[:3] - sampled[3:]) / (2 * epsilon)).T.reshape(-1, len(t), 3)
+    if independent_piece:
+        centers = to_patch(q) / output_stride
+        supported = np.all((centers >= 0) & (centers <= np.array(presence.shape)-1), axis=1)
+        gradients *= supported.reshape(-1, len(t), 1)
     lengths = np.linalg.norm(np.diff(points, axis=0), axis=1) if segment_weights is None else segment_weights
     gradients *= lengths[:, None, None] / len(t)
     force = np.zeros_like(points)
@@ -163,7 +178,7 @@ def presence_force(points, to_patch, presence, patch_shape, cfg, output_stride=1
     return force / np.maximum(mass[:, None], 1e-12)
 
 
-def refine_curve(current, baseline_points, baseline_arc, normals, presence, to_patch, patch_shape, cfg, output_stride=1):
+def refine_curve(current, baseline_points, baseline_arc, normals, presence, to_patch, patch_shape, cfg, output_stride=1, *, independent_piece=False):
     curve = np.asarray(current, dtype=np.float64).copy()
     normal_arc = curve[:, 3].copy()
     # Sheet axes are unoriented: interpolate nn^T metrics, never signed normals.
@@ -173,11 +188,9 @@ def refine_curve(current, baseline_points, baseline_arc, normals, presence, to_p
         baseline = interpolate(baseline_points, baseline_arc, curve[:, 3])
         metric = interpolate(metrics, normal_arc, curve[:, 3]).reshape(-1, 3, 3)
         force = presence_force(points, to_patch, presence, patch_shape, cfg, output_stride,
-                               segment_weights=np.diff(curve[:, 3]))
+                               segment_weights=np.diff(curve[:, 3]), independent_piece=independent_piece)
         update = semi_implicit_step(points, baseline, metric, force, cfg)
-        limits = cfg.max_step_fraction * taper(to_patch(points), patch_shape, cfg.border_fraction)
-        # Lock the local section endpoints; resampling cannot move their seam.
-        limits[[0, -1]] = 0.
+        limits = step_limits(to_patch(points), patch_shape, cfg, independent_piece, np.array([0, len(points)-1]))
         update = clamp_update(update, points, metric, limits)
         curve = resample(points + update, curve[:, 3])
     return curve
@@ -223,6 +236,31 @@ class GeometryStore:
             if expected != set(keys):
                 raise ValueError(f"refinement resume {split} dataset membership changed")
 
+    def test_patch(self, parent, sample_index, params, shape, spacing, start, current, baseline):
+        """Lazy independent local state; parent identity was validated by register.
+
+        New deterministic crops may be first encountered after a checkpoint.
+        They always start from immutable GT, including after legacy resumes.
+        """
+        from dataclasses import asdict
+        identity = dict(protocol="fixed-test-crop-v1", parent=parent,
+                        sample_index=int(sample_index), params=asdict(params),
+                        shape=shape, spacing=float(spacing), start=int(start))
+        serialized = json.dumps(identity, sort_keys=True,
+            default=lambda value: value.tolist() if isinstance(value, np.ndarray) else value.item())
+        key = hashlib.sha256(serialized.encode()).hexdigest()
+        path = self.root / key
+        with file_lock(self.root / "catalog.lock"):
+            if not path.exists():
+                parent_metadata = json.loads((self.root / parent / "metadata.json").read_text())
+                metadata = {**parent_metadata, "split": "test_patch", "crop": json.loads(serialized)}
+                metadata.pop("export", None)  # cropped endpoints, not whole-fiber CP metadata
+                path.mkdir()
+                np.save(path / "baseline.npy", baseline)
+                np.save(path / "current.npy", current)
+                (path / "metadata.json").write_text(json.dumps(metadata))
+        return key, self.read(key)
+
     def read(self, key):
         path = self.root / key
         with file_lock(path / "lock", shared=True):
@@ -257,6 +295,11 @@ class GeometryStore:
                         archive.write(path / name, f"{path.name}/{name}")
                     curve = np.load(path / "current.npy")
                     metadata = json.loads((path / "metadata.json").read_text())
+                    if metadata.get("split") == "test":
+                        # Whole-test entries are identity/baseline records only;
+                        # legacy current.npy is retained for archive compatibility.
+                        curve = np.load(path / "baseline.npy")
+                        metadata = {**metadata, "evaluation_role": "immutable_source_only"}
                     # An eligible component is exported independently: never
                     # reconnect gaps or fabricate extrapolation.
                     export = metadata.get("export", {})
@@ -352,6 +395,7 @@ class RefinementObservation:
     shape: tuple
     config: RefinementConfig
     output_stride: int = 1
+    independent_piece: bool = False
 
 
 class BatchedPatchTransform:
@@ -430,6 +474,11 @@ def refine_observations(observations, maps):
         sampled = map_coordinates(maps, np.concatenate((query_ids[None], mapped.T)),
                                   order=1, mode="nearest", prefilter=False).reshape(6,-1)
         gradient = (sampled[:3]-sampled[3:]).T.reshape(-1,len(t),3)
+        independent_queries = np.array([o.independent_piece for o in observations], dtype=bool)[qids]
+        if np.any(independent_queries):
+            centers = transform(q, qids) / observations[0].output_stride
+            supported = np.all((centers >= 0) & (centers <= np.array(maps.shape[1:])-1), axis=1)
+            gradient *= (supported | ~independent_queries).reshape(-1,len(t),1)
         weights = curve[edges+1,3]-curve[edges,3]
         gradient *= weights[:,None,None]/len(t)
         force = np.zeros_like(points)
@@ -441,8 +490,8 @@ def refine_observations(observations, maps):
         force /= np.maximum(mass[:,None], 1e-12)
         spacing = np.concatenate([np.full(len(b), max(arclength(b)[-1]/(len(b)-1),1e-6)) for b in baseline_parts])
         delta = semi_implicit_step(points, baseline, metric, force, cfg, links=links, spacing=spacing)
-        limits = cfg.max_step_fraction*taper(transform(points, ids), observations[0].shape, cfg.border_fraction)
-        limits[endpoint] = 0
+        independent = np.array([o.independent_piece for o in observations], dtype=bool)[ids]
+        limits = step_limits(transform(points, ids), observations[0].shape, cfg, independent, endpoint)
         delta = clamp_update(delta, points, metric, limits, tangent=points[following]-points[previous])
         updated = points+delta
         curves = [resample(updated[a:b], curve[a:b,3]) for a,b in zip(offsets[:-1], offsets[1:])]

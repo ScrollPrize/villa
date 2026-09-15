@@ -14,7 +14,7 @@ from .embedding import (EmbeddingConfig, EmbeddingGeometry, build_eligibility,
                         InvalidNormalSampleError)
 from .arc_sampling import FiberLocation, ScrollArcSampler
 from .training_spans import training_fiber_spans
-from .refinement import RefinementConfig, RefinementObservation, active_store, arclength, interpolate, export_metadata
+from .refinement import RefinementConfig, RefinementObservation, active_store, arclength, interpolate, export_metadata, resample
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +128,7 @@ class _Record:
     base_shape_zyx: tuple[int, int, int]
     fiber_identity: str
     dataset_config: dict[str, Any]
+    label_breaks: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3009,6 +3010,8 @@ class FiberTrace3DLoader:
         segment_start = points_out[:-1].astype(np.float32)
         segment_end = points_out[1:].astype(np.float32)
         valid_segments = np.isfinite(segment_start).all(axis=1) & np.isfinite(segment_end).all(axis=1)
+        if record.label_breaks:
+            valid_segments[list(record.label_breaks)] = False
         if record.dataset_config.get("dense_supervision", False) or isinstance(cp_index, FiberLocation):
             # Whole fibers can be long: reject disjoint segment boxes in NumPy
             # before exact clipping. Keep source order and boundary-touching
@@ -3201,6 +3204,13 @@ class FiberTrace3DLoader:
         cp = flat - (int(counts[local-1]) if local else 0)
         return self.records[ids[local]], ids[local], cp
 
+    @staticmethod
+    def _refined_location(curve, location):
+        segment = min(len(curve) - 2, max(0, int(np.searchsorted(curve[:, 3], location) - 1)))
+        fraction = (location - curve[segment, 3]) / (curve[segment+1, 3] - curve[segment, 3])
+        point = (1-fraction)*curve[segment, :3] + fraction*curve[segment+1, :3]
+        return FiberLocation(segment, fraction, tuple(point[::-1]))
+
     def _load_raw_sample_once(
         self,
         sample_index: int,
@@ -3220,26 +3230,33 @@ class FiberTrace3DLoader:
         start = time.perf_counter()
         data_index = _bounded_data_sample_index(stream_index, sample_index_limit)
         record, record_index, cp_index = descriptor
+        fixed_test = self._refinement_store is not None and self.config.refinement_split == "test"
+        # Freeze all crop/augmentation decisions on the original GT descriptor.
+        fixed_params = (self._sample_augment_params(record, cp_index, augmentation_index,
+            value_index=stream_index // 2 if self.config.embedding.paired_patches else None)
+            if fixed_test else None)
         refinement_current = None
         if self._refinement_store is not None:
             key = self._refinement_keys[record_index]
-            refinement_current = self._refinement_store.read(key)
+            if fixed_test:
+                baseline = self._refinement_store.baseline(key)
+                refinement_current = resample(baseline[:, :3], baseline[:, 3],
+                    max(2, int(np.ceil(baseline[-1, 3] / self.config.refinement.spacing_base)) + 1))
+            else:
+                refinement_current = self._refinement_store.read(key)
             reference_arc = arclength(record.fiber.line_points_zyx.astype(np.float64))
             if isinstance(cp_index, FiberLocation):
                 location = reference_arc[cp_index.segment_index] + cp_index.fraction * (
                     reference_arc[cp_index.segment_index + 1] - reference_arc[cp_index.segment_index])
             else:
                 location = reference_arc[control_point_line_index(record.fiber, cp_index)]
-            segment = min(len(refinement_current) - 2, max(0, int(np.searchsorted(refinement_current[:, 3], location) - 1)))
-            fraction = (location - refinement_current[segment, 3]) / (refinement_current[segment+1, 3] - refinement_current[segment, 3])
-            point = (1-fraction)*refinement_current[segment, :3] + fraction*refinement_current[segment+1, :3]
-            cp_index = FiberLocation(segment, fraction, tuple(point[::-1]))
+            cp_index = self._refined_location(refinement_current, location)
             record = replace(record, fiber=replace(record.fiber,
                 line_points_xyz=refinement_current[:, :3][:, ::-1].astype(np.float32)))
         if timings is not None:
             timings["descriptor_ms"] = (time.perf_counter() - start) * 1000.0
         start = time.perf_counter()
-        params = self._sample_augment_params(record, cp_index, augmentation_index,
+        params = fixed_params if fixed_test else self._sample_augment_params(record, cp_index, augmentation_index,
             value_index=stream_index // 2 if self.config.embedding.paired_patches else None)
         refinement_geometry = None
         if refinement_current is not None:
@@ -3255,6 +3272,23 @@ class FiberTrace3DLoader:
                 current = refinement_current[section_start:section_stop].copy()
                 if len(current) >= 3:
                     baseline = self._refinement_store.baseline(key)
+                    lo = max(0, int(np.searchsorted(baseline[:, 3], current[0, 3])-1))
+                    hi = min(len(baseline), int(np.searchsorted(baseline[:, 3], current[-1, 3]))+2)
+                    local_baseline = baseline[lo:hi].copy()
+                    observation_start = section_start
+                    if fixed_test:
+                        key, current = self._refinement_store.test_patch(key, data_index, params,
+                            self.config.patch_shape_zyx, record.volume_spacing_base,
+                            section_start, current, local_baseline)
+                        observation_start = 0
+                        # Keep other visits of the same fiber as original GT;
+                        # never replace the whole target with a clipped polyline.
+                        refinement_current[section_start:section_stop] = current
+                        cp_index = self._refined_location(refinement_current, location)
+                        record = replace(record, fiber=replace(record.fiber,
+                            line_points_xyz=refinement_current[:, :3][:, ::-1].astype(np.float32)),
+                            label_breaks=tuple(i for i in (section_start-1, section_stop-1)
+                                              if 0 <= i < len(refinement_current)-1))
                     ref = interpolate(baseline[:, :3], baseline[:, 3], current[:, 3])
                     try:
                         normals = self._sample_native_normals(record, ref, timings)
@@ -3263,11 +3297,10 @@ class FiberTrace3DLoader:
                         # valid CT/GT training samples, without a fake normal.
                         normals = None
                     if normals is not None:
-                        lo = max(0, int(np.searchsorted(baseline[:, 3], current[0, 3])-1))
-                        hi = min(len(baseline), int(np.searchsorted(baseline[:, 3], current[-1, 3]))+2)
-                        refinement_geometry = RefinementObservation(key, section_start, current,
-                            baseline[lo:hi].copy(), normals, params, record.volume_spacing_base,
-                            self.config.patch_shape_zyx, self.config.refinement, self.config.embedding.output_stride)
+                        refinement_geometry = RefinementObservation(key, observation_start, current,
+                            local_baseline, normals, params, record.volume_spacing_base,
+                            self.config.patch_shape_zyx, self.config.refinement, self.config.embedding.output_stride,
+                            independent_piece=fixed_test)
         if timings is not None:
             timings["augment_params_ms"] = (time.perf_counter() - start) * 1000.0
         embedding_start = time.perf_counter()

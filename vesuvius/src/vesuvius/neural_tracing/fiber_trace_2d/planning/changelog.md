@@ -1,3 +1,14 @@
+## 2026-09-15 — Fixed-crop test refinement
+
+- Test pieces keep uniform1/8-ellipse step caps without border taper or pinned
+  endpoints; omit artificial outside joins. Training taper/stitching unchanged.
+
+- Independent persistent test-crop curves use original GT image transforms;
+  overlapping test crops no longer modify each other or whole test fibers.
+- Raw/EMA test scalar logging shares component tags including presence/direction.
+- Resume preserves train geometry and optimizer/EMA; legacy whole-test updates
+  intentionally do not initialize the new crop-local targets.
+
 ## 2026-09-15 — Opt-in training-feedback GT refinement
 
 - Current detached raw presence refines train/test geometry through a batched
@@ -5,7 +16,7 @@
   queues are shared. Original-GT ellipse tether, tapered step caps, resampling,
   and checkpoint-linked geometry archives preserve inspectability and resume.
 - Disabled by default; configuration and measured solver cost documented in
-  docs/training_refinement.md. No production training started.
+  docs/training_refinement.md. Managed continuation launched from update11800.
 
 ## 2026-09-14 — Evaluation-ablation merge and final EMA999
 

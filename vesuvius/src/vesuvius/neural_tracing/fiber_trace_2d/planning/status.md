@@ -1,11 +1,11 @@
-- [x] Branch from fiber-vischeck; carry contrastive restart changes.
-- [x] Archive both sets of prior planning notes.
-- [x] Validate and commit branch handoff.
-- [x] Define training-time GT refinement requirements and independently review plan.
-- [x] Implement opt-in solver, native-normal queue integration and persistent geometry.
-- [x] Implement train/test feedback and snapshot/restore lifecycle.
-- [x] CPU and manager-gated CUDA regression tests and bounded solver timing.
-- [x] Document settings, changed test-target semantics and limitations.
-- [x] Final independent implementation review; conditioned legacy-config guard fixed.
-- [x] User-approved continuation config and launch reviewed; managed startup launched
-  from raw update 11800 with LR0.01 and existing EMA/optimizer state.
+- [x] Commit previous implementation.
+- [x] Update and independently review plan.
+- [x] Implement fixed-crop local test state and EMA metric parity.
+- [x] Independent code review and selected-tangent correction.
+- [x] Final CPU/manager CUDA regression checks (15 refinement,57 managed,2 CUDA).
+- [x] Resume managed training at update13300; first test completed and both EMA
+  presence/direction tags verified directly in TensorBoard events.
+- [x] Correct user-specified restart origin: stop that continuation and launch
+  original non-refinement update11800 with fresh geometry (root3545749).
+- [x] Remove missed test taper and endpoint locks; preserve uniform ellipse cap,
+  omit outside joins, validate17CPU+57managed+2CUDA, restart original11800 root3826686.
