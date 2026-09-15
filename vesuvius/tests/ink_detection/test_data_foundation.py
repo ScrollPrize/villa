@@ -19,6 +19,7 @@ from vesuvius.ink_detection.data.geometry import (
     select_flat_pixels_via_stored_resolution,
 )
 from vesuvius.ink_detection.data.patch_cache import (
+    label_asset_fingerprint,
     load_patch_cache,
     patch_finding_cache_token,
     save_patch_cache,
@@ -380,6 +381,67 @@ def test_v6_patch_cache_round_trip_and_stale_rejection(tmp_path):
 
     changed = _config(tmp_path, patch_overlap=0.25)
     assert load_patch_cache(path, config=changed, segments=[segment]) is None
+
+
+def _write_mask(path: Path, chunks: dict[str, bytes]) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for name, payload in chunks.items():
+        (path / name).write_bytes(payload)
+
+
+def test_patch_cache_is_rejected_when_a_label_changes_under_the_same_path(tmp_path):
+    """Paths alone cannot see a mask regenerated in place, which is how a split goes stale."""
+
+    config = _config(tmp_path)
+    mask = tmp_path / "supervision.zarr"
+    _write_mask(mask, {".zarray": b"{}", "0.0.0": b"chunk-one", "0.0.1": b"chunk-two"})
+    segment = replace(_segment(config, tmp_path), supervision_mask=mask)
+    path = tmp_path / "patches.json"
+    save_patch_cache(path, [Patch(segment=segment, bbox=(1, 2, 3, 4, 5, 6))])
+
+    assert load_patch_cache(path, config=config, segments=[segment]) is not None
+
+    # regenerated in place: same path, one chunk fewer
+    (mask / "0.0.1").unlink()
+    assert load_patch_cache(path, config=config, segments=[segment]) is None
+
+    # restored, then rewritten to a different size under the same name
+    _write_mask(mask, {"0.0.1": b"chunk-two"})
+    assert load_patch_cache(path, config=config, segments=[segment]) is not None
+    (mask / "0.0.1").write_bytes(b"chunk-two-but-longer")
+    assert load_patch_cache(path, config=config, segments=[segment]) is None
+
+
+def test_patch_cache_still_hits_when_nothing_changed(tmp_path):
+    """The fingerprint must not cost the fast path: an untouched tree keeps hitting."""
+
+    config = _config(tmp_path)
+    mask = tmp_path / "supervision.zarr"
+    _write_mask(mask, {".zarray": b"{}", "0.0.0": b"chunk"})
+    segment = replace(_segment(config, tmp_path), supervision_mask=mask)
+    path = tmp_path / "patches.json"
+    save_patch_cache(path, [Patch(segment=segment, bbox=(1, 2, 3, 4, 5, 6))])
+
+    for _ in range(3):
+        loaded = load_patch_cache(path, config=config, segments=[segment])
+        assert loaded is not None and len(loaded) == 1
+
+
+def test_label_fingerprint_is_stable_and_notices_each_asset(tmp_path):
+    ink = tmp_path / "ink.zarr"
+    supervision = tmp_path / "supervision.zarr"
+    _write_mask(ink, {"0.0.0": b"a"})
+    _write_mask(supervision, {"0.0.0": b"b"})
+
+    baseline = label_asset_fingerprint([ink, supervision])
+    assert baseline == label_asset_fingerprint([supervision, ink]), "order must not matter"
+    assert baseline == label_asset_fingerprint([ink, supervision, None])
+
+    (ink / "0.0.0").write_bytes(b"aa")
+    assert label_asset_fingerprint([ink, supervision]) != baseline
+
+    missing = label_asset_fingerprint([tmp_path / "absent.zarr"])
+    assert missing and missing != label_asset_fingerprint([ink])
 
 
 def test_unlabeled_coverage_key_is_rejected_and_cache_token_stays_compatible(tmp_path):
