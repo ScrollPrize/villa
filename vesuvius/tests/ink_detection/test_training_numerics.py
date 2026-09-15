@@ -257,9 +257,7 @@ def test_dilation_union_excludes_new_ink_from_background(monkeypatch):
     supervision = torch.zeros_like(labels)
     supervision[..., 0] = 1
 
-    monkeypatch.setattr(
-        dilation_module, "dilate_label_batch_with_cucim", _fake_dilator
-    )
+    monkeypatch.setattr(dilation_module, "dilate_label_batch", _fake_dilator)
     output = apply_label_dilation(
         {"inklabels": labels, "supervision_mask": supervision},
         1.0,
