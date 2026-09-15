@@ -236,6 +236,39 @@ TEST_CASE("openLocalZarrPyramid: missing dir throws")
     CHECK_THROWS(openLocalZarrPyramid("/__no__/__where__"));
 }
 
+TEST_CASE("openLocalZarrPyramid: skips declared levels that have no array metadata")
+{
+    auto d = tmpDir("declared_missing");
+    makeLocalVolume(d, /*numLevels=*/4);
+    {
+        std::ofstream f(d / ".zattrs");
+        f << R"({"multiscales":[{"datasets":[{"path":"0"},{"path":"1"},{"path":"2"},{"path":"3"}]}]})";
+    }
+    fs::remove_all(d / "1");
+    fs::remove_all(d / "3");
+    auto opened = openLocalZarrPyramid(d);
+    REQUIRE(opened.fetchers.size() == 3);
+    CHECK(opened.fetchers[0]);
+    CHECK_FALSE(opened.fetchers[1]);
+    CHECK(opened.fetchers[2]);
+    CHECK(opened.shapes[0] == std::array<int, 3>{64, 64, 64});
+    CHECK(opened.shapes[2] == std::array<int, 3>{16, 16, 16});
+    fs::remove_all(d);
+}
+
+TEST_CASE("openLocalZarrPyramid: a declared base level with no array metadata still throws")
+{
+    auto d = tmpDir("declared_missing_base");
+    makeLocalVolume(d, /*numLevels=*/2);
+    {
+        std::ofstream f(d / ".zattrs");
+        f << R"({"multiscales":[{"datasets":[{"path":"0"},{"path":"1"}]}]})";
+    }
+    fs::remove_all(d / "0");
+    CHECK_THROWS(openLocalZarrPyramid(d));
+    fs::remove_all(d);
+}
+
 TEST_CASE("optional remote metadata probes accept least-privilege S3 403s")
 {
     CHECK(vc::render::isOptionalRemoteMetadataMiss(
