@@ -26,6 +26,12 @@ The native `vc_spiral` extension is required. HTTP tests need localhost sockets.
 Shared fixtures live in `*_fixtures.py`; reusable helpers should live there
 instead of importing another module's test cases.
 
+`editing_fixtures.py` provides service state without HTTP sockets for direct
+service checks. Geometry, SDT and live-revision setup live in
+`geometry_fixtures.py`, `sdt_fixtures.py` and `live_revision_fixtures.py`.
+Pytest supplies the project import path; only standalone drivers need their
+own path setup.
+
 Real-scroll fits remain opt-in: `RUN_GOLDEN=1` enables the golden and structural
 rebuild checks (use `GOLDEN_RUN_SPEC` for a local dataset specification),
 `SPIRAL_INTERACTIVE_E2E=1` enables the interactive smoke, and

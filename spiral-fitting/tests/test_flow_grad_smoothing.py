@@ -12,8 +12,6 @@ classification of the new keys.
 """
 
 import math
-import sys
-from pathlib import Path
 import pytest
 import torch
 import torch.nn.functional as F
@@ -29,9 +27,6 @@ from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
 from transforms import SpiralAndTransform
 import types
 import unittest
-
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def _dense_reference(grad, sigma):

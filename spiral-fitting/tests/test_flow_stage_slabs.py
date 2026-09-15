@@ -10,8 +10,6 @@ checkpoints written in the per-stage module layout (model state, optimiser
 moments) plus the retired time-axis config key.
 """
 
-import sys
-from pathlib import Path
 import pytest
 import torch
 import flow_triton
@@ -24,9 +22,6 @@ from flow_fields import (
     CylindricalFlowField,
 )
 from transforms import SpiralAndTransform
-
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 N_STEPS = 3

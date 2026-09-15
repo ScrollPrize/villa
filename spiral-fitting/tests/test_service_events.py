@@ -5,15 +5,9 @@ output reaching clients without duplicating structured records.
 """
 
 import json
-import sys
 import unittest
-from pathlib import Path
 from spiral_service import ServiceEventBuffer, ServiceState
 from service_fixtures import HttpServiceFixture
-
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 class FakeClock:

@@ -472,10 +472,6 @@ def test_started_child_is_unbuffered_and_final_output_is_drained(tmp_path):
     ]
 
 
-SPIRAL_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SPIRAL_DIR))
-
-
 class RenderInkPathTests(unittest.TestCase):
     def test_failed_full_scroll_flatten_fails_when_no_strips_are_rendered(self):
         with CliRunner().isolated_filesystem():

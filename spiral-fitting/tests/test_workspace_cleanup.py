@@ -12,25 +12,8 @@ import pytest
 from input_publication import Output, PublicationTransaction, fingerprint
 from service_editing import EditingWorkspace
 from service_http import ApiError
-from spiral_service import ServiceState
-from test_service_editing import Resident, upload
-from service_fixtures import _attach_fake_session
+from editing_fixtures import Resident, upload, editing_state as state
 from workspace_storage import MARKER, reclaim_workspaces
-
-
-@pytest.fixture
-def state(tmp_path):
-    dataset = tmp_path / 'dataset'
-    dataset.mkdir()
-    output = tmp_path / 'output'
-    output.mkdir()
-    state = ServiceState(dataset_root=dataset)
-    session = _attach_fake_session(state, output, dataset)
-    resident = Resident()
-    session.apply_input_changes = resident.apply_input_changes
-    state.editing().claim('owner', 'claim')
-    yield state
-    state.close()
 
 
 @pytest.mark.parametrize('commit', [False, True])

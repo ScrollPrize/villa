@@ -1,6 +1,5 @@
 """Integrated immutable transport, catalog, resident and publication lifecycle."""
 
-import copy
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -15,23 +14,10 @@ from input_workspace import Catalog, Change, Content, InputIdentity, MutationCoo
 from service_uploads import UploadEnvironment, UploadManager
 from service_editing import EditingWorkspace
 from service_http import ApiError
+from editing_fixtures import Resident, upload, editing_state
 
 
 TOKEN = 'test-client'
-
-
-class Resident:
-    def __init__(self):
-        self.calls = []
-        self.members = {}
-        self.fail = False
-
-    def apply_input_changes(self, command, records, influence_config=None):
-        self.calls.append((command, copy.deepcopy(records)))
-        if self.fail:
-            return {'applied': False, 'errors': {'rank0': 'invalid input'}}
-        self.members.update({r['id']: r for r in records})
-        return {'applied': True}
 
 
 @pytest.fixture
@@ -46,23 +32,6 @@ def workspace(tmp_path):
     workspace.claim(TOKEN, 'claim')
     yield workspace, resident
     workspace.close()
-
-
-def upload(workspace, name, kind='pcl', input_id=None, branches=None):
-    doc = ({'vc_pointcollections_json_version': '1', 'collections': {'0': {'name': name, 'points': {str(i): {'p': [i, 2, 3], 'creation_time': i} for i in range(2)}}}} if kind == 'pcl' else
-           {'type': 'vc3d_fiber', 'version': 1, 'points': []})
-    if branches is not None:
-        doc['branches'] = branches
-    data = json.dumps(doc).encode()
-    request = {'upload_id': uuid4().hex, 'id': input_id or str(uuid4()), 'kind': kind,
-               'files': [{'name': 'input.json', 'size': len(data),
-                          'sha256': hashlib.sha256(data).hexdigest()}]}
-    if kind == 'pcl':
-        request['role'] = 'same_winding'
-    transfer = workspace.uploads.begin(request)['upload_id']
-    workspace.uploads.receive(transfer, 'input.json', io.BytesIO(data), len(data))
-    workspace.uploads.finalize(transfer)
-    return transfer
 
 
 def change(workspace, input_id, expected, name=None, **kwargs):
@@ -511,3 +480,44 @@ def test_editor_artifact_follows_transitive_pending_links_and_exact_revision(art
     ws.catalog.accept([Change(ws.catalog.entry(peer).identity, 1, None)])
     assert artifact_names(state, state.input_content_artifact(first, 1)) == {'first.json'}
     assert artifact_names(state, original) == {'first.json', 'peer.json', 'last.json'}
+
+
+def test_fiber_editor_artifact_contains_immutable_desired_peers(editing_state):
+    workspace = editing_state.editing()
+    ids = [str(uuid4()), str(uuid4())]
+    changes = [{'id': input_id, 'kind': 'fiber', 'name': name,
+                'expected_revision': 0, 'upload_id': upload(workspace, name, 'fiber',
+                    branches=[{'branch_file': 'peer.json'}] if name == 'first' else [])}
+               for input_id, name in zip(ids, ['first', 'peer'])]
+    workspace.change('owner', {'command_id': 'fibers', 'changes': changes})
+    first = editing_state.input_content_artifact(ids[0], 1)
+    manifest = editing_state.artifacts.manifest(first['artifact']['id'])
+    assert {f['name'] for f in manifest['files']} == {'first.json', 'peer.json'}
+    workspace.change('owner', {'command_id': 'remove-peer', 'changes': [
+        {'id': ids[1], 'expected_revision': 1, 'deleted': True}]})
+    second = editing_state.input_content_artifact(ids[0], 1)
+    assert first['artifact']['id'] != second['artifact']['id']
+    assert len(editing_state.artifacts.manifest(first['artifact']['id'])['files']) == 2
+    assert len(editing_state.artifacts.manifest(second['artifact']['id'])['files']) == 1
+
+
+def test_rebuild_retry_does_not_restart_resident_construction(editing_state):
+    workspace = editing_state.editing()
+    original = workspace.replay_resident
+    builds, replays = [], []
+    def build(request):
+        builds.append(request)
+        return {'accepted': True}
+    def replay(generation):
+        replays.append(generation)
+        if len(replays) == 1:
+            raise TimeoutError('lost resident replay outcome')
+        return original(generation)
+    workspace.replay_resident = replay
+    request = {'command_id': 'rebuild-retained'}
+    with pytest.raises(TimeoutError):
+        editing_state.editing_lifecycle('owner', 'session_rebuild', request, build)
+    result = editing_state.editing_lifecycle('owner', 'session_rebuild', request, build)
+    assert result['accepted']
+    assert len(builds) == 1
+    assert len(replays) == 2

@@ -65,9 +65,6 @@ from fit_session import (
 from config import Config, durable_config
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-
 def _planned_run(state, request):
     request = dict(request)
     configuration = dict(Config.catalog()["defaults"])

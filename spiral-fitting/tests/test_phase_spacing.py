@@ -21,7 +21,7 @@ from sdt_losses import (
 )
 from transforms import GapExpanderParams, GapExpandingTransform
 from fit_session import SpiralInputPaths, SpiralRunConfig, validate_session_request
-from test_sdt_losses import (
+from sdt_fixtures import (
     DR_PER_WINDING,
     PerfectSpiralToX,
     make_volume,

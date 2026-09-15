@@ -1,97 +1,114 @@
 from flow_fixtures import _make_small_spiral_model, _sample_scroll_points
 import unittest
+import pytest
 import torch
 import torch.nn.functional as F
-from flow_fields import CartesianFlowField, CylindricalFlowField, sample_field
+import flow_triton
+from flow_fields import (
+    CartesianFlowField, CylindricalFlowField, BSplineFlowField,
+    BSplineCylindricalFlowField, sample_field, sample_field_bspline,
+)
 
 
-class CartesianFlowGradientTests(unittest.TestCase):
-    def test_streamed_backwards_match_dense_autograd(self):
-        torch.manual_seed(4)
-        resolution = torch.tensor([12, 12, 12])
-        flow = CartesianFlowField(resolution, spatial_scale_factor=6)
-        with torch.no_grad():
-            flow.flows[0].normal_(std=0.1)
-            flow.flows[1].normal_(std=0.1)
+def _reference_sampler(flow, low, high):
+    # Build the reference from raw parameter clones, bypassing get_sampler's
+    # detached leaves and pending-gradient accumulation.
+    if isinstance(flow, CartesianFlowField):
+        field = F.interpolate(
+            low, size=tuple(high.shape[2:]), mode='trilinear')[0] + high[0]
+        return lambda points: sample_field(points, field)
+    if isinstance(flow, BSplineFlowField):
+        return lambda points: (
+            sample_field_bspline(low[0], points)
+            + sample_field_bspline(high[0], points))
 
-        points = torch.rand(37, 3, requires_grad=True)
-        reference_points = points.detach().clone().requires_grad_(True)
-        reference_lr = flow.flows[0].detach().clone().requires_grad_(True)
-        reference_hr = flow.flows[1].detach().clone().requires_grad_(True)
+    def sample(points):
+        values = []
+        for parameter, num_phi, offsets in (
+                (low, flow._lr_num_phi, flow._lr_offsets),
+                (high, flow._hr_num_phi, flow._hr_offsets)):
+            field = parameter[0]
+            n0 = int(num_phi[0])
+            pinned = torch.cat(
+                [torch.zeros_like(field[:, :, :n0]), field[:, :, n0:]], dim=2)
+            values.append(type(flow)._sample_lattice(pinned, num_phi, offsets, points))
+        return values[0] + values[1]
+    return sample
 
-        reference_lr_up = F.interpolate(
-            reference_lr,
-            size=tuple(reference_hr.shape[2:]),
-            mode='trilinear',
-        )[0]
-        reference_field = reference_lr_up + reference_hr[0]
-        reference_output = sample_field(reference_points, reference_field)
-        reference_loss = reference_output.square().sum()
-        reference_loss.backward()
 
-        sampler = flow.get_sampler(0)
-        outputs = [sampler(chunk) for chunk in points.split(17)]
-        for output in outputs:
+@pytest.mark.parametrize('field_class', [
+    CartesianFlowField, CylindricalFlowField,
+    BSplineFlowField, BSplineCylindricalFlowField,
+], ids=['cartesian', 'cylindrical', 'bspline', 'bspline_cylindrical'])
+def test_streamed_backwards_match_dense_autograd(field_class):
+    cartesian = field_class is CartesianFlowField
+    torch.manual_seed(4 if cartesian else 11)
+    flow = field_class(torch.tensor([12, 12, 12]), spatial_scale_factor=6)
+    with torch.no_grad():
+        for parameter in flow.flows:
+            parameter.normal_(std=0.1)
+    batch_sizes = [37] if cartesian else [29, 41]
+    points = [torch.rand(n, 3, requires_grad=True) for n in batch_sizes]
+    reference_points = [p.detach().clone().requires_grad_(True) for p in points]
+    reference_fields = [p.detach().clone().requires_grad_(True) for p in flow.flows]
+    reference_sample = _reference_sampler(flow, *reference_fields)
+    reference_outputs = [reference_sample(p) for p in reference_points]
+    if cartesian:
+        reference_outputs[0].square().sum().backward()
+    else:
+        (reference_outputs[0].square().mean() + reference_outputs[1].abs().mean()).backward()
+
+    sampler = flow.get_sampler(0)
+    # Independent backwards WITHOUT retain_graph through one cached sampler.
+    if cartesian:
+        chunks = [sampler(chunk) for chunk in points[0].split(17)]
+        for output in chunks:
             output.square().sum().backward()
-        flow.apply_accumulated_field_grad()
+        outputs = [torch.cat(chunks)]
+    else:
+        outputs = [sampler(p) for p in points]
+        outputs[0].square().mean().backward()
+        outputs[1].abs().mean().backward()
+    flow.apply_accumulated_field_grad()
 
-        torch.testing.assert_close(torch.cat(outputs), reference_output, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(points.grad, reference_points.grad, rtol=2e-4, atol=2e-5)
-        torch.testing.assert_close(flow.flows[0].grad, reference_lr.grad, rtol=2e-4, atol=2e-5)
-        torch.testing.assert_close(flow.flows[1].grad, reference_hr.grad, rtol=2e-4, atol=2e-5)
+    output_tolerance = dict(rtol=1e-5, atol=1e-6) if cartesian else {}
+    grad_tolerance = dict(rtol=2e-4, atol=2e-5) if cartesian else {}
+    for actual, expected in zip(outputs, reference_outputs):
+        torch.testing.assert_close(actual, expected, **output_tolerance)
+    for actual, expected in zip(
+            points + list(flow.flows), reference_points + reference_fields):
+        torch.testing.assert_close(actual.grad, expected.grad, **grad_tolerance)
+    if not cartesian:
+        assert flow._pending_field_graphs is None
 
 
-class CylindricalFlowGradientTests(unittest.TestCase):
-    def test_streamed_backwards_and_pending_field_grad_match_dense_autograd(self):
-        torch.manual_seed(11)
-        flow = CylindricalFlowField(torch.tensor([12, 12, 12]), spatial_scale_factor=6)
-        with torch.no_grad():
-            flow.flows[0].normal_(std=0.1)
-            flow.flows[1].normal_(std=0.1)
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not flow_triton._HAS_TRITON,
+    reason='needs CUDA and triton')
+@pytest.mark.parametrize('kind', ['bspline', 'bspline_cylindrical'])
+def test_full_model_grads_match_eager_path(monkeypatch, kind):
+    def run(disable_triton):
+        model = _make_small_spiral_model(23, kind, device='cuda')
+        points = _sample_scroll_points(41, 5).cuda()
+        with monkeypatch.context() as environment:
+            environment.setenv('FIT_SPIRAL_TRITON', '0' if disable_triton else '1')
+            transform = model.get_slice_to_spiral_transform()
+            loss = (transform(points)[..., 1:].norm(dim=-1)
+                    / model.get_dr_per_winding()).mean()
+            loss.backward()
+        model.flow_field.apply_accumulated_field_grad()
+        return loss.detach(), {name: p.grad for name, p in model.named_parameters()}
 
-        points_a = torch.rand(29, 3, requires_grad=True)
-        points_b = torch.rand(41, 3, requires_grad=True)
-        reference_a = points_a.detach().clone().requires_grad_(True)
-        reference_b = points_b.detach().clone().requires_grad_(True)
-        reference_lr = flow.flows[0].detach().clone().requires_grad_(True)
-        reference_hr = flow.flows[1].detach().clone().requires_grad_(True)
-
-        n0_lr = int(flow._lr_num_phi[0])
-        n0_hr = int(flow._hr_num_phi[0])
-        reference_lr_field = torch.cat(
-            [torch.zeros_like(reference_lr[0][:, :, :n0_lr]), reference_lr[0][:, :, n0_lr:]],
-            dim=2)
-        reference_hr_field = torch.cat(
-            [torch.zeros_like(reference_hr[0][:, :, :n0_hr]), reference_hr[0][:, :, n0_hr:]],
-            dim=2)
-
-        def reference_sample(pts):
-            return (
-                CylindricalFlowField._sample_lattice(reference_lr_field, flow._lr_num_phi, flow._lr_offsets, pts)
-                + CylindricalFlowField._sample_lattice(reference_hr_field, flow._hr_num_phi, flow._hr_offsets, pts)
-            )
-
-        reference_out_a = reference_sample(reference_a)
-        reference_out_b = reference_sample(reference_b)
-        (reference_out_a.square().mean() + reference_out_b.abs().mean()).backward()
-
-        sampler = flow.get_sampler(0)
-        out_a = sampler(points_a)
-        out_b = sampler(points_b)
-        # Two independent backwards through the one cached sampler, WITHOUT
-        # retain_graph: the shared pinned+scaled field graphs are cut at
-        # detached leaves, so neither backward touches the other's graph.
-        out_a.square().mean().backward()
-        out_b.abs().mean().backward()
-        flow.apply_accumulated_field_grad()
-
-        torch.testing.assert_close(out_a, reference_out_a)
-        torch.testing.assert_close(out_b, reference_out_b)
-        torch.testing.assert_close(points_a.grad, reference_a.grad)
-        torch.testing.assert_close(points_b.grad, reference_b.grad)
-        torch.testing.assert_close(flow.flows[0].grad, reference_lr.grad)
-        torch.testing.assert_close(flow.flows[1].grad, reference_hr.grad)
-        self.assertIsNone(flow._pending_field_graphs)
+    eager_loss, eager_grads = run(disable_triton=True)
+    triton_loss, triton_grads = run(disable_triton=False)
+    torch.testing.assert_close(triton_loss, eager_loss, rtol=1e-4, atol=1e-7)
+    for name, eager_grad in eager_grads.items():
+        triton_grad = triton_grads[name]
+        if eager_grad is None and triton_grad is None:
+            continue
+        torch.testing.assert_close(
+            triton_grad, eager_grad, rtol=2e-3, atol=1e-5,
+            msg=lambda base, name=name: f'{name}: {base}')
 
 
 class SharedTransformLeafTests(unittest.TestCase):

@@ -12,7 +12,6 @@ was, and that the verb is only valid in Idle.
 from checkpoint_fixtures import _FakeContext, _idle_session
 import copy
 from pathlib import Path
-import sys
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -23,9 +22,6 @@ from fit_session import SessionState
 from spiral_runtime import ApplyCheckpointCommand, PreflightCheckpointCommand
 import tempfile
 from checkpoint_io import load_checkpoint_cpu
-
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 CONFIG = Config().as_dict()

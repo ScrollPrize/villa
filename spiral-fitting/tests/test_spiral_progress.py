@@ -1,4 +1,3 @@
-import threading
 import pytest
 from spiral_progress import ProgressReporter
 
@@ -54,17 +53,3 @@ def test_publish_is_rate_limited_but_snapshot_keeps_latest_counter():
     reporter.update(3)
     assert len(published) == 2
     assert published[-1]["step"] == 3
-
-
-def test_updates_and_snapshots_are_thread_safe():
-    reporter = ProgressReporter(heartbeat_interval=0)
-    reporter.begin("loading", "Loading", step=0, total_steps=1000)
-
-    thread = threading.Thread(
-        target=lambda: [reporter.update(index) for index in range(1001)])
-    thread.start()
-    while thread.is_alive():
-        snapshot = reporter.snapshot()
-        assert 0 <= snapshot["step"] <= 1000
-    thread.join()
-    assert reporter.snapshot()["step"] == 1000

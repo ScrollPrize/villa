@@ -1,62 +1,12 @@
 """Exercise revision commands through the actual fitter boundary queue."""
 
-import copy
+from runtime_fixtures import resident
+
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 import pytest
-from spiral_runtime import _SessionShutdown, _apply_input_changes_at_boundary
-
-
-@pytest.fixture
-def resident():
-    from runtime_fixtures import RuntimeFixture
-    session = RuntimeFixture()._idle_session(completed=7)
-    session._live_reservation_iteration = None
-    session._live_reservation_epoch = 0
-    session._iteration_in_progress = None
-    session._input_batches = {}
-    session.status = lambda: {"current_iteration": session._completed, "state": session._state}
-    entered, release = threading.Event(), threading.Event()
-    release.set()
-    active = {"revision": 1}
-
-    def prepare(records, config, **kwargs):
-        entered.set()
-        assert release.wait(5)
-        if records[0].get("invalid"):
-            raise ValueError("invalid selected draft")
-        return SimpleNamespace(
-            _workspace_membership=copy.deepcopy(records[0]),
-            verified_patches={}, unverified_patches={})
-
-    def install(candidate):
-        active.update(candidate._workspace_membership)
-        return []
-
-    session._context = SimpleNamespace(
-        prepare_input_changes=Mock(side_effect=prepare),
-        install_input_changes=Mock(side_effect=install))
-    errors = []
-
-    def worker():
-        try:
-            session.wait_for_iteration(7)
-        except _SessionShutdown:
-            pass
-        except BaseException as exc:
-            errors.append(exc)
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-    yield session, active, entered, release
-    release.set()
-    with session._condition:
-        session._shutdown = True
-        session._condition.notify_all()
-    thread.join(5)
-    assert not thread.is_alive()
-    assert not errors
+from spiral_runtime import _apply_input_changes_at_boundary
 
 
 def test_idle_batch_applies_without_run_and_replays_once(resident):

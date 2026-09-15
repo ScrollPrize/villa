@@ -4,50 +4,13 @@ Each test builds a FitContext piecemeal (the pattern test_fiber_supervision
 uses) and drives FitContext.apply_config the way the interactive runtime does.
 """
 
+from geometry_fixtures import _context
+
 import copy
-from types import SimpleNamespace
 from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
-from config import Config
-from fit_spiral import FitContext, _UnattachedPclStripList
-
-
-def _context(**overrides):
-    context = FitContext.__new__(FitContext)
-    context.config = Config().as_dict()
-    context.config.update({'z_begin': 0, 'z_end': 200})
-    context.config.update(overrides)
-    context.shell_map = None
-    context.shell_envelope = None
-    context.shell_outer_winding_idx = None
-    context.shell_valid_zyxs_gpu = None
-    context.shell_patch = None
-    context.tracks = []
-    context.prepared_main_tracks = None
-    context.verified_patches = {}
-    context.verified_patches_list = []
-    context.unverified_patches = None
-    context.unverified_patches_list = []
-    context.unverified_patch_sampling_probabilities = None
-    context.unverified_patch_atlas = None
-    context.cross_patch_pcls = []
-    context.unattached_pcl_strips = _UnattachedPclStripList()
-    context.unattached_strip_sampling_groups = []
-    context.resolved_links = []
-    context.link_components = []
-    context.fiber_catalog = {}
-    context.regular_pcl_catalog = {}
-    context.fiber_direction_samples = None
-    context.dt_target_cache_manager = SimpleNamespace(
-        update_interval=100, reset=Mock())
-    context.theta_crossing_map = SimpleNamespace(invalidate=Mock())
-    context._rebuild_pcl_sampling_strata = Mock()
-    context._refresh_trusted_geometry = Mock()
-    context._build_theta_crossing_map = Mock(return_value=[])
-    context._make_shell_polar_map = Mock(return_value='rebuilt shell map')
-    return context
 
 
 def _fiber(cid, logical_id, zyxs, hv=None):

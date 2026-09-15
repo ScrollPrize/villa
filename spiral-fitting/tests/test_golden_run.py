@@ -30,8 +30,6 @@ SPEC_PATH = os.environ.get(
 GOLDEN_PATH = os.environ.get(
     'GOLDEN_RUN_BANDS', os.path.join(SPIRAL_DIR, 'tests', 'golden', 'golden_bands.json'))
 
-sys.path.insert(0, os.path.join(SPIRAL_DIR, 'tests'))
-
 
 def _skip_reason():
     if os.environ.get('RUN_GOLDEN') != '1':

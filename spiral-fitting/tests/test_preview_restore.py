@@ -9,7 +9,6 @@ save, a load or a resume - re-shows the surface it already flattened for it.
 
 import json
 from pathlib import Path
-import sys
 import tempfile
 import time
 import unittest
@@ -21,10 +20,6 @@ from lasagna_publish import PublishedPreview
 from preview_index import PublishedPreviewIndex
 from spiral_service import PREVIEW_ARTIFACTS_KEPT, ServiceState
 from checkpoint_fixtures import _FakeContext, _idle_session
-
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 DIGEST = "d" * 64

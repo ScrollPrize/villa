@@ -8,8 +8,6 @@ from tracks import (
     iter_track_losses,
     prepare_main_phase_tracks,
 )
-import pathlib
-import sys
 from tracks import _crossing_row_alignments
 
 
@@ -260,11 +258,6 @@ class CpuTrackStorageTests(unittest.TestCase):
             torch.stack([value.detach() for _, value in combined_parts]),
         )
         torch.testing.assert_close(staged_parameter.grad, combined_parameter.grad)
-
-
-SPIRAL_DIR = pathlib.Path(__file__).resolve().parents[1]
-if str(SPIRAL_DIR) not in sys.path:
-    sys.path.insert(0, str(SPIRAL_DIR))
 
 
 class TrackWalkConfigurationTests(unittest.TestCase):

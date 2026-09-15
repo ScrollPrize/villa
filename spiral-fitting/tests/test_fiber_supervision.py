@@ -12,8 +12,8 @@ from fit_spiral import FitContext, accumulate_radial_offset_bake_scale
 from sample_spiral import get_radial_normal_stretch
 from spiral_helpers import classify_fiber_hv
 from tifxyz import Patch
-import test_live_patch_relink as relink
-from test_revisioned_geometry import context
+import geometry_fixtures as relink
+from geometry_fixtures import context
 
 
 DR = 12.0

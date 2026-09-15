@@ -1,10 +1,9 @@
-import os
 import unittest
 import numpy as np
 import scipy.ndimage
 import torch
 import flow_triton
-from flow_fields import BSplineFlowField, sample_field_bspline
+from flow_fields import sample_field_bspline
 
 
 def _random_points(num_points, seed, lo=-0.3, hi=1.3):
@@ -42,49 +41,6 @@ class BSplineSamplerTests(unittest.TestCase):
         # clamp itself is a kink that finite differences would straddle.
         points = (_random_points(11, 6, lo=0.05, hi=0.95)).requires_grad_(True)
         torch.autograd.gradcheck(sample_field_bspline, (field, points))
-
-
-class BSplineFlowGradientTests(unittest.TestCase):
-    def test_streamed_backwards_and_pending_field_grad_match_dense_autograd(self):
-        torch.manual_seed(11)
-        flow = BSplineFlowField(torch.tensor([12, 12, 12]), spatial_scale_factor=6)
-        with torch.no_grad():
-            flow.flows[0].normal_(std=0.1)
-            flow.flows[1].normal_(std=0.1)
-
-        points_a = torch.rand(29, 3, requires_grad=True)
-        points_b = torch.rand(41, 3, requires_grad=True)
-        reference_a = points_a.detach().clone().requires_grad_(True)
-        reference_b = points_b.detach().clone().requires_grad_(True)
-        reference_lr = flow.flows[0].detach().clone().requires_grad_(True)
-        reference_hr = flow.flows[1].detach().clone().requires_grad_(True)
-
-        def reference_sample(pts):
-            return (
-                sample_field_bspline(reference_lr[0], pts)
-                + sample_field_bspline(reference_hr[0], pts)
-            )
-
-        reference_out_a = reference_sample(reference_a)
-        reference_out_b = reference_sample(reference_b)
-        (reference_out_a.square().mean() + reference_out_b.abs().mean()).backward()
-
-        sampler = flow.get_sampler()
-        out_a = sampler(points_a)
-        out_b = sampler(points_b)
-        # Two independent backwards through the one cached sampler, WITHOUT
-        # retain_graph: the shared field graphs are cut at detached leaves.
-        out_a.square().mean().backward()
-        out_b.abs().mean().backward()
-        flow.apply_accumulated_field_grad()
-
-        torch.testing.assert_close(out_a, reference_out_a)
-        torch.testing.assert_close(out_b, reference_out_b)
-        torch.testing.assert_close(points_a.grad, reference_a.grad)
-        torch.testing.assert_close(points_b.grad, reference_b.grad)
-        torch.testing.assert_close(flow.flows[0].grad, reference_lr.grad)
-        torch.testing.assert_close(flow.flows[1].grad, reference_hr.grad)
-        self.assertIsNone(flow._pending_field_graphs)
 
 
 def _eager_rk4(low, high, pts, h, n_steps):
@@ -179,38 +135,3 @@ class BSplineTritonEquivalenceTests(unittest.TestCase):
             acc_lo[0], reference_low.grad, rtol=1e-3, atol=1e-5)
         torch.testing.assert_close(
             acc_hi[0], reference_high.grad, rtol=1e-3, atol=1e-5)
-
-    def test_full_model_grads_match_eager_path(self):
-        from flow_fixtures import (
-            _make_small_spiral_model, _sample_scroll_points)
-
-        def run(disable_triton):
-            model = _make_small_spiral_model(23, 'bspline', device='cuda')
-            points = _sample_scroll_points(41, 5).cuda()
-            previous = os.environ.get('FIT_SPIRAL_TRITON')
-            os.environ['FIT_SPIRAL_TRITON'] = '0' if disable_triton else '1'
-            try:
-                transform = model.get_slice_to_spiral_transform()
-                loss = (transform(points)[..., 1:].norm(dim=-1)
-                        / model.get_dr_per_winding()).mean()
-                loss.backward()
-            finally:
-                if previous is None:
-                    os.environ.pop('FIT_SPIRAL_TRITON', None)
-                else:
-                    os.environ['FIT_SPIRAL_TRITON'] = previous
-            model.flow_field.apply_accumulated_field_grad()
-            return loss.detach(), {
-                name: p.grad for name, p in model.named_parameters()}
-
-        eager_loss, eager_grads = run(disable_triton=True)
-        triton_loss, triton_grads = run(disable_triton=False)
-
-        torch.testing.assert_close(triton_loss, eager_loss, rtol=1e-4, atol=1e-7)
-        for name, eager_grad in eager_grads.items():
-            triton_grad = triton_grads[name]
-            if eager_grad is None and triton_grad is None:
-                continue
-            torch.testing.assert_close(
-                triton_grad, eager_grad, rtol=2e-3, atol=1e-5,
-                msg=lambda base, name=name: f'{name}: {base}')

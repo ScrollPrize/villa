@@ -19,7 +19,7 @@ native = bool(os.environ.get('SPIRAL_REVISION_CLIENT_LIVE'))
 protocol_stdout = sys.stdout
 if native:
     sys.stdout = sys.stderr
-    from test_revisioned_live_fit import make_real_revision_session
+    from live_revision_fixtures import make_real_revision_session
     import torch
     source_patch, source_digest, dataset, baseline, replacement, patch, config, actual = make_real_revision_session(root)
     deadline = time.monotonic() + 180

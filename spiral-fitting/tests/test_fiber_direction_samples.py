@@ -1,6 +1,4 @@
 import json
-import sys
-from pathlib import Path
 import numpy as np
 import torch
 from fiber_direction_samples import (
@@ -9,10 +7,6 @@ from fiber_direction_samples import (
     load_fiber_direction_samples,
 )
 from losses import get_fiber_direction_loss
-
-SPIRAL_DIR = Path(__file__).resolve().parents[1]
-if str(SPIRAL_DIR) not in sys.path:
-    sys.path.insert(0, str(SPIRAL_DIR))
 
 
 def test_cell_argmax_keeps_one_highest_presence_voxel_per_cell():
