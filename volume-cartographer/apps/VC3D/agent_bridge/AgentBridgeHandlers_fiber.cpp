@@ -395,8 +395,8 @@ QJsonObject AgentBridgeServer::handleFiberDelete(const QJsonValue& params)
     vc3d::line_annotation::FiberDeleteOutcome outcome;
     const QString err = captureFiberError(ctrl, [&] { outcome = ctrl->deleteFibers(ids); });
 
-    // What actually got removed, in terms of the file names captured before
-    // the controller's save drain: the package can change during that drain,
+    // What was removed (or found already absent), in terms of the file names
+    // captured before the controller's save drain: the package can change during that drain,
     // so "is the requested id still listed" is not the question. deleteFibers
     // continues past per-file failures.
     QJsonArray deleted;

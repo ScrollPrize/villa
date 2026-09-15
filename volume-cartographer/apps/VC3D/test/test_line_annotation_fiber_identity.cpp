@@ -288,6 +288,47 @@ private slots:
         QCOMPARE(fibers[0].id, uint64_t{5});
     }
 
+    // The split as the controller performs it: both halves bound when their
+    // write succeeds, the parent's name retired when its file is removed;
+    // the next reload keeps the halves' ids, and a later import under the
+    // parent's name is a new fiber.
+    void splitBindsHalvesAndRetiresTheParent()
+    {
+        RuntimeFiberIdSpace space;
+        std::vector<Fiber> fibers = loaded({"parent.json"});
+        assignStableRuntimeIds(fibers, space, {});
+        const uint64_t prefix = allocateRuntimeFiberId(space, {1}, 2);
+        const uint64_t suffix = allocateRuntimeFiberId(space, {1, prefix}, prefix + 1);
+        bindRuntimeFiberIdentity(space, "prefix.json", prefix);
+        bindRuntimeFiberIdentity(space, "suffix.json", suffix);
+        retireRuntimeFiberIdentity(space, "parent.json");
+        fibers = loaded({"prefix.json", "suffix.json"});
+        assignStableRuntimeIds(fibers, space, {});
+        QCOMPARE(idsOf(fibers), (std::vector<uint64_t>{2, 3}));
+        fibers = loaded({"parent.json", "prefix.json", "suffix.json"});
+        assignStableRuntimeIds(fibers, space, {});
+        QCOMPARE(idsOf(fibers), (std::vector<uint64_t>{4, 2, 3}));
+    }
+
+    // An accepted save's binding is kept even if the write later fails and
+    // is retried: the identity was established when the save was accepted,
+    // and a retry must not change it.
+    void acceptedBindingSurvivesAFailedWrite()
+    {
+        RuntimeFiberIdSpace space;
+        const uint64_t id = allocateRuntimeFiberId(space, {});
+        bindRuntimeFiberIdentity(space, "new.json", id);
+        // The failed write leaves no file; the next load does not see the
+        // name, and the binding stays.
+        std::vector<Fiber> fibers = loaded({});
+        assignStableRuntimeIds(fibers, space, {});
+        QCOMPARE(space.idByFileName.at("new.json"), id);
+        // The retry writes the file; the load gives it the same id.
+        fibers = loaded({"new.json"});
+        assignStableRuntimeIds(fibers, space, {});
+        QCOMPARE(fibers[0].id, id);
+    }
+
     // The names-first rule the synchronisers use. The comment's example: an
     // open session A still holds id 1 while, after a renumbering reload, a
     // link in fiber D recorded as (1, new.json) points at another fiber; the

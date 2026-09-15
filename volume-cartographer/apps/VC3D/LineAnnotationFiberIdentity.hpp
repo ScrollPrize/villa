@@ -92,8 +92,9 @@ void assignStableRuntimeIds(std::vector<Fiber>& fibers,
 }
 
 // A fiber created by the app (a saved session, a merge, a split, a linked
-// seed) establishes its identity when it is first persisted: its file name is
-// bound to the id it was allocated, so the next reload keeps that id. Binding
+// seed) establishes its identity when its first save is accepted or has
+// succeeded: its file name is bound to the id it was allocated, so the next
+// reload keeps that id. Binding
 // a name already bound to another id moves it (the name now denotes this
 // fiber); the mark never drops below a bound id.
 inline void bindRuntimeFiberIdentity(RuntimeFiberIdSpace& space,

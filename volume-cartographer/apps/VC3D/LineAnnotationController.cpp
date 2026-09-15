@@ -3228,10 +3228,11 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
     const QString currentName = QString::fromStdString(
         it->fileName.empty() ? fiberPath(*it).filename().string() : it->fileName);
     // The dialog and the save drain below yield to the event loop: the list
-    // can be reloaded (invalidating `it`), the fiber deleted, a delete
-    // started, or the package switched. The fiber is therefore re-resolved
-    // by its file name after each yield, and the operation abandoned when
-    // the package or the pending-delete state moved.
+    // can be reloaded (invalidating `it`), the fiber deleted (and another
+    // imported under its name, with a fresh id), a delete started, or the
+    // package switched. The fiber is therefore re-resolved after each yield
+    // by its file name AND its runtime id - both must still agree - and the
+    // operation abandoned when the package changed or a delete is running.
     const std::string sourceFileName = it->fileName;
     const uint64_t renamePackageGeneration = _packageGeneration;
     const auto reresolveSource = [this, &sourceFileName, renamePackageGeneration, fiberId]()
@@ -3239,13 +3240,9 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
         if (_packageGeneration != renamePackageGeneration || _deletingFibers) {
             return _fibers.end();
         }
-        if (sourceFileName.empty()) {
-            return std::find_if(_fibers.begin(), _fibers.end(),
-                                [fiberId](const StoredFiber& fiber) { return fiber.id == fiberId; });
-        }
         return std::find_if(_fibers.begin(), _fibers.end(),
-                            [this, &sourceFileName](const StoredFiber& fiber) {
-                                return fiber.fileName == sourceFileName;
+                            [&sourceFileName, fiberId](const StoredFiber& fiber) {
+                                return fiber.id == fiberId && fiber.fileName == sourceFileName;
                             });
     };
     bool accepted = false;
@@ -3317,36 +3314,36 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
     }
 
     const std::string oldFileName = it->fileName;
-    StoredFiber renamed = *it;
-    renamed.fileName = *newFileName;
-    // The canonical name encodes the fiber's identity; keep the stored
-    // username/started_at/sequence consistent with it so attribution and
-    // per-user sequence allocation follow the rename. Non-canonical names
-    // carry no identity, so the stored fields stay as they are.
-    const auto parsedIdentity =
-        vc3d::line_annotation::parsedFiberFileNameIdentity(*newFileName);
-    if (parsedIdentity) {
-        renamed.username = parsedIdentity->username;
-        renamed.startedAt = parsedIdentity->startedAt;
-        renamed.sequence = parsedIdentity->sequence;
-    }
+    StoredFiber renamed;
     try {
         // Drain queued save jobs first: one still in flight for this fiber
         // would recreate the old path right after the remove below, leaving
         // duplicate files.
         waitForFiberSaves();
         // The drain yielded: the fiber, the destination and the package are
-        // checked again before anything is written.
+        // checked again before anything is written, and the copy that is
+        // written is taken from the record as it stands NOW - a save that
+        // landed during the drain must not be overwritten with older data.
         it = reresolveSource();
         if (it == _fibers.end()) {
             throw std::runtime_error("the fiber is no longer available to rename");
         }
-        if (it->fileName != oldFileName) {
-            throw std::runtime_error("the fiber was renamed meanwhile");
-        }
         ec.clear();
         if (fs::exists(newPath, ec) || nameOwnedByLiveFiber()) {
             throw std::runtime_error("the new name is taken");
+        }
+        renamed = *it;
+        renamed.fileName = *newFileName;
+        // The canonical name encodes the fiber's identity; keep the stored
+        // username/started_at/sequence consistent with it so attribution and
+        // per-user sequence allocation follow the rename. Non-canonical names
+        // carry no identity, so the stored fields stay as they are.
+        const auto parsedIdentity =
+            vc3d::line_annotation::parsedFiberFileNameIdentity(*newFileName);
+        if (parsedIdentity) {
+            renamed.username = parsedIdentity->username;
+            renamed.startedAt = parsedIdentity->startedAt;
+            renamed.sequence = parsedIdentity->sequence;
         }
         saveFiberNow(renamed);
         ec.clear();
@@ -8138,6 +8135,13 @@ void LineAnnotationController::handleGeneratedControlPointLinkCandidate(
         return;
     }
     auto& session = *pane->session;
+    if (session.suppressFiberSave) {
+        // The fiber was deleted underneath this session; its links can no
+        // longer be edited, or the edit would be persisted as a new file.
+        showError(tr("This fiber was deleted; its links can no longer be edited."),
+                  session.suppressErrorDialogs);
+        return;
+    }
     if (controlPointIndex >= session.controlPoints.size()) {
         return;
     }
@@ -8211,6 +8215,13 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
         return;
     }
     auto& session = *pane->session;
+    if (session.suppressFiberSave) {
+        // The fiber was deleted underneath this session; its links can no
+        // longer be edited, or the edit would be persisted as a new file.
+        showError(tr("This fiber was deleted; its links can no longer be edited."),
+                  session.suppressErrorDialogs);
+        return;
+    }
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
         showError(tr("Line optimization is already running."));
         return;
@@ -8771,7 +8782,22 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
     // merged line on a clean stack.
     QTimer::singleShot(0, this, [this, clickedId, farId, clickedPath, farPath,
                                  mergedId, mergedFileName,
-                                 joinControlIndex, suppressErrors]() {
+                                 joinControlIndex, suppressErrors,
+                                 packageGeneration = _packageGeneration]() {
+        // The originals, their paths and their ids belong to the package the
+        // merge ran in; a package switch before or during this callback
+        // (its drain yields) tore that package's sessions down, and the new
+        // package's list and id space must not be touched with them.
+        const auto packageChanged = [this, packageGeneration]() {
+            if (_packageGeneration == packageGeneration) {
+                return false;
+            }
+            Logger()->warn("Merge retirement abandoned: the package changed");
+            return true;
+        };
+        if (packageChanged()) {
+            return;
+        }
         closeDialogPanesForFibers({clickedId, farId});
         closeIntersectionInspectionForRetiredFibers({clickedId, farId});
         // Fail loudly instead of reconciling: on any problem below, the
@@ -8799,6 +8825,9 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
         // (failed finalization) is caught while the originals still exist.
         const uint64_t saveFailuresBefore = _fiberSaveFailureCount;
         waitForFiberSaves();
+        if (packageChanged()) {
+            return;
+        }
         if (_fiberSaveFailureCount != saveFailuresBefore) {
             bailOut(tr("a pending fiber save failed"));
             return;
@@ -8810,6 +8839,17 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
                 bailOut(tr("the annotation workspace did not close"));
                 return;
             }
+        }
+        // The originals must still be the fibers the merge consumed (same
+        // id, same file) before their files are removed.
+        const auto stillOriginal = [this](uint64_t id, const fs::path& path) {
+            return std::any_of(_fibers.begin(), _fibers.end(), [id, &path](const StoredFiber& f) {
+                return f.id == id && f.fileName == path.filename().string();
+            });
+        };
+        if (!stillOriginal(clickedId, clickedPath) || !stillOriginal(farId, farPath)) {
+            bailOut(tr("the original fibers changed meanwhile"));
+            return;
         }
         // All-or-nothing: a failure restores both originals in place.
         const auto retireResult = vc3d::line_annotation::runFiberSaveJob(
@@ -9199,7 +9239,21 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
     QTimer::singleShot(0, this, [this, parentId, parentPath,
                                  prefixFiberId, suffixFiberId, prefixFileName,
                                  suffixFileName, reopenFiberId,
-                                 reopenControlIndex, suppressErrors]() {
+                                 reopenControlIndex, suppressErrors,
+                                 packageGeneration = _packageGeneration]() {
+        // As in the merge: the parent, its path and its id belong to the
+        // package the split ran in, and a package switch before or during
+        // this callback means none of them may be acted on.
+        const auto packageChanged = [this, packageGeneration]() {
+            if (_packageGeneration == packageGeneration) {
+                return false;
+            }
+            Logger()->warn("Split retirement abandoned: the package changed");
+            return true;
+        };
+        if (packageChanged()) {
+            return;
+        }
         closeDialogPanesForFibers({parentId});
         closeIntersectionInspectionForRetiredFibers({parentId});
         // Fail loudly instead of reconciling: on any problem below, the
@@ -9224,6 +9278,9 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
         // (failed finalization) is caught while the original still exists.
         const uint64_t saveFailuresBefore = _fiberSaveFailureCount;
         waitForFiberSaves();
+        if (packageChanged()) {
+            return;
+        }
         if (_fiberSaveFailureCount != saveFailuresBefore) {
             bailOut(tr("a pending fiber save failed"));
             return;
@@ -9234,6 +9291,16 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
                 bailOut(tr("the annotation workspace did not close"));
                 return;
             }
+        }
+        // The parent must still be the fiber the split consumed (same id,
+        // same file) before its file is removed.
+        const bool stillParent = std::any_of(
+            _fibers.begin(), _fibers.end(), [parentId, &parentPath](const StoredFiber& f) {
+                return f.id == parentId && f.fileName == parentPath.filename().string();
+            });
+        if (!stillParent) {
+            bailOut(tr("the original fiber changed meanwhile"));
+            return;
         }
         const auto retireResult = vc3d::line_annotation::runFiberSaveJob(
             ++_nextFiberSaveSequence, {}, {parentPath});
@@ -9281,6 +9348,13 @@ void LineAnnotationController::handleGeneratedControlPointUnlink(
         return;
     }
     auto& session = *pane->session;
+    if (session.suppressFiberSave) {
+        // The fiber was deleted underneath this session; its links can no
+        // longer be edited, or the edit would be persisted as a new file.
+        showError(tr("This fiber was deleted; its links can no longer be edited."),
+                  session.suppressErrorDialogs);
+        return;
+    }
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
         showError(tr("Line optimization is already running."));
         return;
@@ -9361,6 +9435,13 @@ void LineAnnotationController::handleGeneratedControlPointSetLinkPending(
         return;
     }
     auto& session = *pane->session;
+    if (session.suppressFiberSave) {
+        // The fiber was deleted underneath this session; its links can no
+        // longer be edited, or the edit would be persisted as a new file.
+        showError(tr("This fiber was deleted; its links can no longer be edited."),
+                  session.suppressErrorDialogs);
+        return;
+    }
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
         showError(tr("Line optimization is already running."));
         return;
@@ -12751,7 +12832,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
     // switch or a newer load of this package inside it publishes its own
     // list, and this load must then stand down rather than publish an older
     // list over it. The load-error dialog after publication is not covered:
-    // nothing is published after it.
+    // the candidate list is not installed after it.
     const uint64_t loadPackageGeneration = _packageGeneration;
     const uint64_t loadToken = ++_fiberLoadSequence;
     const auto superseded = [this, loadPackageGeneration, loadToken](const char* where) {
@@ -15568,9 +15649,11 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
 {
     // Any direct save supersedes a pending debounced autosave.
     session.autoSaveScheduled = false;
-    // A session whose fiber was deleted underneath it is not persisted by
-    // any path - a close with a final optimization included - or it would
+    // A session whose fiber was deleted underneath it is not saved through
+    // here - the close with a final optimization included - or it would
     // recreate the deleted file (or overwrite an import under that name).
+    // The link handlers refuse such a session and the linked-peer snapshot
+    // loop below skips one, so the other persistence routes agree.
     if (session.suppressFiberSave) {
         return;
     }
@@ -15699,6 +15782,7 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
             for (const auto& pane : _panes) {
                 if (!pane.session || pane.session.get() == &session ||
                     pane.session->fiberId != linkedFiberId ||
+                    pane.session->suppressFiberSave ||
                     pane.session->taskState != LineAnnotationSession::TaskState::Succeeded ||
                     pane.session->optimizedLine.points.empty() ||
                     pane.session->controlPoints.empty()) {
@@ -16850,8 +16934,21 @@ std::string LineAnnotationController::uniqueImportedFiberFileName(
         ? ".json"
         : fs::path(requested).extension().string();
 
+    // A name is taken when a file exists under it, when this import already
+    // chose it, or when a loaded fiber or an open session owns it: such a
+    // fiber may have no file yet (a save still queued, or one that failed),
+    // and an import writing there would take over its identity.
     auto available = [&](const std::string& candidate) {
         if (candidate.empty() || reserved.count(candidate) != 0) {
+            return false;
+        }
+        const bool owned =
+            std::any_of(_fibers.begin(), _fibers.end(),
+                        [&candidate](const StoredFiber& f) { return f.fileName == candidate; }) ||
+            std::any_of(_panes.begin(), _panes.end(), [&candidate](const auto& pane) {
+                return pane.session && pane.session->fiberFileName == candidate;
+            });
+        if (owned) {
             return false;
         }
         std::error_code ec;
