@@ -256,8 +256,8 @@ struct LineAnnotationController::LineAnnotationSession {
     // The fiber this session edits was deleted through the app while the
     // session stayed open. Unlike suppressFiberSave - which is also set
     // transiently (a headless save, the merge/split retirement window) -
-    // this never clears: the session's links are no longer editable and no
-    // persistence route may write it.
+    // this never clears: the structural-edit handlers refuse the session,
+    // and the session save and the linked-peer snapshot loop skip it.
     bool fiberDeleted = false;
     bool suppressGeneratedViews = false;
     bool suppressErrorDialogs = false;
@@ -8839,8 +8839,7 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
                     session->suppressFiberSave = false;
                 }
             }
-            showError(tr("The merge could not be completed: %1\nThe original "
-                         "fibers were left as they were; reloading fibers from disk.")
+            showError(tr("The merge could not be completed: %1\nReloading fibers from disk.")
                           .arg(reason),
                       suppressErrors);
             loadFibersForCurrentPackage();
@@ -9321,8 +9320,7 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
                     session->suppressFiberSave = false;
                 }
             }
-            showError(tr("The split could not be completed: %1\nThe original "
-                         "fiber was left as it was; reloading fibers from disk.")
+            showError(tr("The split could not be completed: %1\nReloading fibers from disk.")
                           .arg(reason),
                       suppressErrors);
             loadFibersForCurrentPackage();
@@ -15727,7 +15725,8 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
     // Checked again after the finalize below, which can yield (its dataset
     // picker) and so let a delete land meanwhile. The transient
     // suppressFiberSave (headless save, retirement window) is deliberately
-    // not consulted here: those sessions still save on close.
+    // not consulted here: such a session remains eligible for this save
+    // path (its close-save in particular).
     if (session.fiberDeleted) {
         return;
     }
