@@ -23,7 +23,6 @@ using vc3d::line_annotation::branchRefersToDeletedFiber;
 using vc3d::line_annotation::sameFiberIdentity;
 using vc3d::line_annotation::FiberDeleteOutcome;
 using vc3d::line_annotation::FiberDeleteTarget;
-using vc3d::line_annotation::currentOwnerIdForSession;
 
 namespace
 {
@@ -283,26 +282,6 @@ private slots:
         QCOMPARE(resolution.targets.size(), std::size_t{1});
         QCOMPARE(resolution.targets[0].requestedId, uint64_t{2});
         QCOMPARE(resolution.targets[0].fileName, std::string("b.json"));
-    }
-
-    // Scheduling a metadata save for an open session whose link was
-    // removed: the owner id handed to the scheduler is the CURRENT id of the
-    // stored fiber with the session's name, so after a reload A's session
-    // (opened as 1, "a.json") schedules under a's new id 2, not under 1,
-    // which now belongs to new.json.
-    void ownerIdForSessionFollowsTheFileNameAfterAReload()
-    {
-        const std::vector<Fiber> fibers = reloaded({"new.json", "a.json", "b.json"});
-        QCOMPARE(currentOwnerIdForSession(1, "a.json", fibers), uint64_t{2});
-        QCOMPARE(currentOwnerIdForSession(2, "b.json", fibers), uint64_t{3});
-        // Unnamed session: only its id.
-        QCOMPARE(currentOwnerIdForSession(7, "", fibers), uint64_t{7});
-        // Named but no longer stored under that name: its own id.
-        QCOMPARE(currentOwnerIdForSession(4, "gone.json", fibers), uint64_t{4});
-        // And the scheduler-side identity check accepts that pane for that
-        // owner id: session (1, a.json) vs stored (2, a.json).
-        QVERIFY(sameFiberIdentity(1, "a.json", 2, "a.json"));
-        QVERIFY(!sameFiberIdentity(1, "a.json", 1, "new.json"));
     }
 
     // Nothing to delete: the wait is skipped, and the report still names

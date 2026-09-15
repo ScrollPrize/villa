@@ -21,6 +21,8 @@
 #include <utility>
 #include <vector>
 
+#include "LineAnnotationFiberIdentity.hpp"
+
 namespace vc3d::line_annotation
 {
 
@@ -218,45 +220,7 @@ inline bool branchRefersToDeletedFiber(uint64_t branchFiberId,
                                        uint64_t deletedFiberId,
                                        const std::string& deletedFileName)
 {
-    if (!branchFileName.empty() && !deletedFileName.empty()) {
-        return branchFileName == deletedFileName;
-    }
-    return deletedFiberId != 0 && branchFiberId == deletedFiberId;
-}
-
-// Whether two (id, file name) pairs name the same stored fiber. The one rule
-// behind the session and branch matches above: when both sides carry a file
-// name the names decide, because runtime ids are reassigned by a reload;
-// the ids count only when a name is missing on either side.
-inline bool sameFiberIdentity(uint64_t idA, const std::string& fileNameA,
-                              uint64_t idB, const std::string& fileNameB)
-{
-    if (!fileNameA.empty() && !fileNameB.empty()) {
-        return fileNameA == fileNameB;
-    }
-    return idA != 0 && idA == idB;
-}
-
-// The id to schedule a metadata save under for an open session that owns a
-// changed link. Owner ids are looked up against the stored list, whose ids
-// are current, while the session keeps the id it was opened with; a named
-// session therefore maps to the current id of the stored fiber with its
-// name, and falls back to its own id only when it has no name or no stored
-// fiber carries the name.
-template <class Fiber>
-uint64_t currentOwnerIdForSession(uint64_t sessionFiberId,
-                                  const std::string& sessionFileName,
-                                  const std::vector<Fiber>& fibersNow)
-{
-    if (sessionFileName.empty()) {
-        return sessionFiberId;
-    }
-    for (const Fiber& fiber : fibersNow) {
-        if (fiber.fileName == sessionFileName) {
-            return fiber.id;
-        }
-    }
-    return sessionFiberId;
+    return sameFiberIdentity(branchFiberId, branchFileName, deletedFiberId, deletedFileName);
 }
 
 } // namespace vc3d::line_annotation

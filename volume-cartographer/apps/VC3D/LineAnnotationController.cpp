@@ -966,14 +966,16 @@ void addUniqueFiberId(std::vector<uint64_t>& ids, uint64_t fiberId)
     ids.push_back(fiberId);
 }
 
+// Names decide when both sides carry one; the id counts only when a name is
+// missing on either side (see LineAnnotationFiberIdentity.hpp). An id match
+// with a disagreeing name is not a match: ids are per package and an id held
+// across a reload or a package switch can name another fiber.
 bool branchReferencesFiber(const LineAnnotationController::FiberBranchRef& branch,
                            uint64_t fiberId,
                            const std::string& fileName)
 {
-    if (fiberId != 0 && branch.branchFiberId == fiberId) {
-        return true;
-    }
-    return !fileName.empty() && branch.branchFileName == fileName;
+    return vc3d::line_annotation::sameFiberIdentity(
+        branch.branchFiberId, branch.branchFileName, fiberId, fileName);
 }
 
 bool controlPointHasBranchLink(
@@ -992,14 +994,8 @@ bool branchLinkedEndpointMatches(
     const LineAnnotationController::FiberBranchRef& lhs,
     const LineAnnotationController::FiberBranchRef& rhs)
 {
-    const bool sameTargetId =
-        lhs.branchFiberId != 0 &&
-        rhs.branchFiberId != 0 &&
-        lhs.branchFiberId == rhs.branchFiberId;
-    const bool sameTargetFile =
-        !lhs.branchFileName.empty() &&
-        lhs.branchFileName == rhs.branchFileName;
-    return (sameTargetId || sameTargetFile) &&
+    return vc3d::line_annotation::sameFiberIdentity(lhs.branchFiberId, lhs.branchFileName,
+                                                    rhs.branchFiberId, rhs.branchFileName) &&
            lhs.branchControlPointIndex == rhs.branchControlPointIndex;
 }
 
@@ -7343,6 +7339,10 @@ void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg>
     // sit in one directory with identical grids, so both halves of the cache key
     // can match while the umbilicus file behind them differs.
     ++_packageGeneration;
+    // A new package numbers its fibers from 1; file names do not carry
+    // identity across packages.
+    _runtimeIds = {};
+    _runtimeIdsPackageGeneration = _packageGeneration;
     invalidateScrollUmbilicus();
     loadFibersForCurrentPackage();
 }
@@ -7757,7 +7757,7 @@ std::optional<uint64_t> LineAnnotationController::createLinkedSeedFiber(
     // initialization with the link direction as the slice normal.
     auto linkedSeedRecord = std::make_shared<LineAnnotationSession>();
     linkedSeedRecord->suppressErrorDialogs = templateSession.suppressErrorDialogs;
-    linkedSeedRecord->fiberId = std::max(nextFiberId(), parent.fiberId + 1);
+    linkedSeedRecord->fiberId = allocateFiberId(parent.fiberId + 1);
     linkedSeedRecord->sourceSliceNormal = linkDirection;
     linkedSeedRecord->initialDirectionMode = InitialDirectionMode::ZInOut;
     linkedSeedRecord->selectedDatasetLocation = templateSession.selectedDatasetLocation;
@@ -8087,7 +8087,7 @@ void LineAnnotationController::handleGeneratedControlPointLinkCandidate(
     }
     ensureSessionFiberIdentity(session);
     if (session.fiberId == 0) {
-        session.fiberId = nextFiberId();
+        session.fiberId = allocateFiberId();
     }
 
     LinkCandidate candidate;
@@ -8167,7 +8167,7 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
 
     ensureSessionFiberIdentity(session);
     if (session.fiberId == 0) {
-        session.fiberId = nextFiberId();
+        session.fiberId = allocateFiberId();
     }
     if (session.fiberId == _linkCandidate->fiberId) {
         showError(tr("The link candidate is on this fiber; designate a candidate on a "
@@ -8375,7 +8375,7 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
     }
     ensureSessionFiberIdentity(session);
     if (session.fiberId == 0) {
-        session.fiberId = nextFiberId();
+        session.fiberId = allocateFiberId();
     }
     if (session.fiberId == _linkCandidate->fiberId) {
         showError(tr("The merge candidate is on this fiber; designate a candidate on a "
@@ -8560,7 +8560,7 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
     merged.sequence = nextFiberSequenceForUsername(merged.username);
     merged.fileName = vc3d::line_annotation::fiberFileName(
         merged.username, merged.startedAt, merged.sequence);
-    merged.id = std::max(nextFiberId(), std::max(clickedId, farId) + 1);
+    merged.id = allocateFiberId(std::max(clickedId, farId) + 1);
     merged.generation = 1;
     merged.controlPoints = std::move(geometry->controlPoints);
     merged.linePoints = std::move(geometry->linePoints);
@@ -8796,7 +8796,7 @@ void LineAnnotationController::handleGeneratedControlPointSplitCandidate(
     }
     ensureSessionFiberIdentity(session);
     if (session.fiberId == 0) {
-        session.fiberId = nextFiberId();
+        session.fiberId = allocateFiberId();
     }
 
     LinkCandidate candidate;
@@ -8847,7 +8847,7 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
     }
     ensureSessionFiberIdentity(session);
     if (session.fiberId == 0) {
-        session.fiberId = nextFiberId();
+        session.fiberId = allocateFiberId();
     }
     if (session.fiberId != _splitCandidate->fiberId) {
         showError(tr("The split candidate is on a different fiber; designate one on "
@@ -8910,7 +8910,8 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
     const std::string username = currentFiberUsername();
     const std::string startedAt = currentFiberDateTimeString();
     const uint64_t prefixSequence = nextFiberSequenceForUsername(username);
-    const uint64_t prefixId = std::max(nextFiberId(), parentId + 1);
+    const uint64_t prefixId = allocateFiberId(parentId + 1);
+    const uint64_t suffixId = allocateFiberId(prefixId + 1);
 
     const auto makeHalf = [&](uint64_t id, uint64_t sequence) {
         StoredFiber half;
@@ -8931,7 +8932,7 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
         return half;
     };
     StoredFiber prefix = makeHalf(prefixId, prefixSequence);
-    StoredFiber suffix = makeHalf(prefixId + 1, prefixSequence + 1);
+    StoredFiber suffix = makeHalf(suffixId, prefixSequence + 1);
 
     prefix.controlPoints.assign(parent.controlPoints.begin(),
                                 parent.controlPoints.begin() + plan->prefixControlCount);
@@ -12655,11 +12656,28 @@ LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOp
 
 void LineAnnotationController::loadFibersForCurrentPackage()
 {
-    // Runtime fiber ids are reassigned per package load; a surviving candidate
-    // could silently point at an unrelated fiber with the same id.
+    // Runtime ids belong to a package: a fiber keeps its id across every
+    // reload of this package's list, and only a package change starts the
+    // numbering over (onVolumePackageChanged resets the space too; this gate
+    // covers a first load and any path that bumped the generation without it).
+    if (_runtimeIdsPackageGeneration != _packageGeneration) {
+        _runtimeIds = {};
+        _runtimeIdsPackageGeneration = _packageGeneration;
+    }
+    // The load below can hand control to a nested event loop (the broken-link
+    // prompt); a package switch inside it publishes its own list, and this
+    // load must then not publish an older package's fibers over it.
+    const uint64_t loadPackageGeneration = _packageGeneration;
+    // Candidates hold ids of fibers that may not survive the reload.
     _linkCandidate.reset();
     _splitCandidate.reset();
     _fibers.clear();
+    // Geometry caches keyed by fiber id and validated by the fiber's save
+    // generation: a reload can bring changed geometry under the same id and
+    // generation (a file edited or replaced on disk), so they start over.
+    _controlSpanCache.clear();
+    _sideStripStoredSnapshotCache.clear();
+    _sideStripSessionSnapshotCache.clear();
     // The set no longer matches what the previous generation described, and
     // the broken-link prompt below can hand control to a nested event loop
     // mid-load. Bumping now makes a map built before this load stale
@@ -12722,6 +12740,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
             }
         }
         sortLoadedFibers(strictFibers);
+        assignRuntimeFiberIds(strictFibers);
         (void)validateLoadedFiberLinks(strictFibers, strictErrors);
         return std::pair<std::vector<StoredFiber>, std::vector<std::string>>{
             std::move(strictFibers),
@@ -12755,25 +12774,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         }
     }
     sortLoadedFibers(loadedFibers);
-    {
-        std::unordered_map<std::string, uint64_t> fiberIdByFileName;
-        fiberIdByFileName.reserve(loadedFibers.size());
-        uint64_t runtimeId = 1;
-        for (auto& fiber : loadedFibers) {
-            fiber.id = runtimeId++;
-            if (!fiber.fileName.empty()) {
-                fiberIdByFileName[fiber.fileName] = fiber.id;
-            }
-        }
-        for (auto& fiber : loadedFibers) {
-            for (auto& branch : fiber.branches) {
-                if (auto it = fiberIdByFileName.find(branch.branchFileName);
-                    it != fiberIdByFileName.end()) {
-                    branch.branchFiberId = it->second;
-                }
-            }
-        }
-    }
+    assignRuntimeFiberIds(loadedFibers);
 
     const auto branchLinkIssues = collectLoadedFiberBranchIssues(loadedFibers);
     std::vector<std::string> branchErrors = branchLoadErrors;
@@ -12820,6 +12821,11 @@ void LineAnnotationController::loadFibersForCurrentPackage()
             prompt.setDefaultButton(qobject_cast<QPushButton*>(repairButton));
             prompt.exec();
             repairRequested = (prompt.clickedButton() == repairButton);
+        }
+        if (_packageGeneration != loadPackageGeneration) {
+            Logger()->warn("Fiber load superseded by a package change while the "
+                           "broken-link prompt was open; discarding it");
+            return;
         }
 
         if (repairRequested) {
@@ -13329,18 +13335,45 @@ void LineAnnotationController::attachAtlasPredSnaps(
     }
 }
 
-uint64_t LineAnnotationController::nextFiberId() const
+std::vector<uint64_t> LineAnnotationController::liveSessionFiberIds() const
 {
-    uint64_t id = 1;
-    for (const auto& fiber : _fibers) {
-        id = std::max(id, fiber.id + 1);
-    }
+    std::vector<uint64_t> ids;
     for (const auto& pane : _panes) {
         if (pane.session && pane.session->fiberId != 0) {
-            id = std::max(id, pane.session->fiberId + 1);
+            ids.push_back(pane.session->fiberId);
         }
     }
-    return id;
+    return ids;
+}
+
+uint64_t LineAnnotationController::allocateFiberId(uint64_t minimumId)
+{
+    std::vector<uint64_t> live = liveSessionFiberIds();
+    live.reserve(live.size() + _fibers.size());
+    for (const auto& fiber : _fibers) {
+        live.push_back(fiber.id);
+    }
+    return vc3d::line_annotation::allocateRuntimeFiberId(_runtimeIds, live, minimumId);
+}
+
+void LineAnnotationController::assignRuntimeFiberIds(std::vector<StoredFiber>& fibers)
+{
+    vc3d::line_annotation::assignStableRuntimeIds(fibers, _runtimeIds, liveSessionFiberIds());
+    std::unordered_map<std::string, uint64_t> fiberIdByFileName;
+    fiberIdByFileName.reserve(fibers.size());
+    for (const auto& fiber : fibers) {
+        if (!fiber.fileName.empty()) {
+            fiberIdByFileName.emplace(fiber.fileName, fiber.id);
+        }
+    }
+    for (auto& fiber : fibers) {
+        for (auto& branch : fiber.branches) {
+            if (auto it = fiberIdByFileName.find(branch.branchFileName);
+                it != fiberIdByFileName.end()) {
+                branch.branchFiberId = it->second;
+            }
+        }
+    }
 }
 
 uint64_t LineAnnotationController::nextFiberSequenceForUsername(const std::string& username) const
@@ -14384,9 +14417,9 @@ LineAnnotationController::syncLinkedBranchMetadataAfterFiberModification(
                                targetBranches.end(),
                                [&session, &removedBranch](const FiberBranchRef& candidate) {
                                    const bool pointsToSession =
-                                       candidate.branchFiberId == session.fiberId ||
-                                       (!session.fiberFileName.empty() &&
-                                        candidate.branchFileName == session.fiberFileName);
+                                       vc3d::line_annotation::sameFiberIdentity(
+                                           candidate.branchFiberId, candidate.branchFileName,
+                                           session.fiberId, session.fiberFileName);
                                    const bool sameLocalEndpoint =
                                        candidate.branchControlPointIndex ==
                                            removedBranch.controlPointIndex ||
@@ -14480,13 +14513,10 @@ void LineAnnotationController::scheduleBranchMetadataSaves(
     std::vector<FiberSaveSnapshot> snapshots;
     snapshots.reserve(uniqueFiberIds.size());
     for (const uint64_t fiberId : uniqueFiberIds) {
-        // The owner ids come from both open sessions (which keep the id they
-        // were opened with) and stored fibers (current ids); after a reload
-        // the two numberings disagree. A pane is the owner only when its
-        // session and the stored fiber of this id are the same fiber by the
-        // shared identity rule - names when both are known, id otherwise -
-        // so a stored owner cannot pick up an unrelated session that happens
-        // to hold its number.
+        // A pane is the owner only when its session and the stored fiber of
+        // this id are the same fiber by the shared identity rule - names when
+        // both are known, id otherwise - so an id that has gone stale (held
+        // across a package switch, say) cannot pick up an unrelated session.
         std::string storedFileName;
         if (const auto storedIt = std::find_if(_fibers.begin(), _fibers.end(),
                                                [fiberId](const StoredFiber& candidate) {
@@ -14508,11 +14538,9 @@ void LineAnnotationController::scheduleBranchMetadataSaves(
                 continue;
             }
             StoredFiber linkedFiber = storedFiberFromSession(*pane.session);
-            // A session keeps the id it was opened with while a reload
-            // reassigns the stored fibers' ids, so a named snapshot is
-            // upserted onto the stored fiber with its file name, never
-            // onto whichever fiber now holds the session's id (see
-            // LineAnnotationFiberDeletion.hpp).
+            // A named snapshot is upserted onto the stored fiber with its
+            // file name, never onto whichever fiber holds the session's id
+            // (see LineAnnotationFiberIdentity.hpp).
             auto linkedIt = std::find_if(
                 _fibers.begin(),
                 _fibers.end(),
@@ -14620,15 +14648,9 @@ void LineAnnotationController::removeBranchLinksToFiber(uint64_t fiberId,
         }
     };
 
-    // Owner ids are scheduled against the stored list, whose ids are
-    // current; a session keeps the id it was opened with, so a named
-    // session's owner id is the current id of the stored fiber with its
-    // name (see LineAnnotationFiberDeletion.hpp).
     for (const auto& pane : _panes) {
         if (pane.session) {
-            removeBranches(pane.session->branches,
-                           vc3d::line_annotation::currentOwnerIdForSession(
-                               pane.session->fiberId, pane.session->fiberFileName, _fibers));
+            removeBranches(pane.session->branches, pane.session->fiberId);
         }
     }
     for (auto& fiber : _fibers) {
@@ -14636,13 +14658,8 @@ void LineAnnotationController::removeBranchLinksToFiber(uint64_t fiberId,
     }
 
     scheduleBranchMetadataSaves(affectedFiberIds, fiberId);
-    // The owner ids above are current stored ids, while refreshBranchLineViews
-    // picks panes by the id their session was opened with; after a reload the
-    // two disagree and the very pane whose link was just removed would be
-    // skipped, leaving the branch overlay on screen. A delete is rare enough
-    // to refresh every open pane's branch overlay instead of guessing.
-    if (!affectedFiberIds.empty()) {
-        refreshBranchLineViews(0);
+    for (const uint64_t affectedFiberId : affectedFiberIds) {
+        refreshBranchLineViews(affectedFiberId);
     }
 }
 
@@ -14653,15 +14670,24 @@ void LineAnnotationController::syncReciprocalBranchControlPointReferences(
         return;
     }
 
-    auto updateBranches = [&session](std::vector<FiberBranchRef>& targetBranches) {
+    // A target's branch is updated only when it points at this session AND
+    // the session's branch it is mirrored from points back at the target's
+    // owner: a stale reciprocal on some other fiber must not be rewritten
+    // from a branch that links elsewhere.
+    auto updateBranches = [&session](std::vector<FiberBranchRef>& targetBranches,
+                                     uint64_t ownerFiberId,
+                                     const std::string& ownerFileName) {
         for (auto& targetBranch : targetBranches) {
-            if (targetBranch.branchFiberId != session.fiberId &&
-                (session.fiberFileName.empty() ||
-                 targetBranch.branchFileName != session.fiberFileName)) {
+            if (!vc3d::line_annotation::sameFiberIdentity(
+                    targetBranch.branchFiberId, targetBranch.branchFileName,
+                    session.fiberId, session.fiberFileName)) {
                 continue;
             }
             for (const auto& sourceBranch : session.branches) {
                 if (sourceBranch.branchFiberId != 0 &&
+                    vc3d::line_annotation::sameFiberIdentity(
+                        sourceBranch.branchFiberId, sourceBranch.branchFileName,
+                        ownerFiberId, ownerFileName) &&
                     targetBranch.controlPointIndex == sourceBranch.branchControlPointIndex) {
                     targetBranch.branchFiberId = session.fiberId;
                     targetBranch.branchFileName = session.fiberFileName;
@@ -14676,11 +14702,12 @@ void LineAnnotationController::syncReciprocalBranchControlPointReferences(
 
     for (const auto& pane : _panes) {
         if (pane.session && pane.session.get() != &session) {
-            updateBranches(pane.session->branches);
+            updateBranches(pane.session->branches, pane.session->fiberId,
+                           pane.session->fiberFileName);
         }
     }
     for (auto& fiber : _fibers) {
-        updateBranches(fiber.branches);
+        updateBranches(fiber.branches, fiber.id, fiber.fileName);
     }
 }
 
@@ -14782,10 +14809,9 @@ std::vector<uint64_t> LineAnnotationController::syncBranchEndpointPositions(
                                 const cv::Vec3d& targetPoint,
                                 const cv::Vec3d& sourcePoint) {
         for (auto& reciprocal : targetBranches) {
-            const bool pointsToSession =
-                reciprocal.branchFiberId == session.fiberId ||
-                (!session.fiberFileName.empty() &&
-                 reciprocal.branchFileName == session.fiberFileName);
+            const bool pointsToSession = vc3d::line_annotation::sameFiberIdentity(
+                reciprocal.branchFiberId, reciprocal.branchFileName,
+                session.fiberId, session.fiberFileName);
             const bool sameLocalEndpoint =
                 reciprocal.controlPointIndex == targetControlPointIndex ||
                 pointsApproximatelyEqual(reciprocal.controlPointPosition, targetPoint);
@@ -14830,9 +14856,9 @@ std::vector<uint64_t> LineAnnotationController::syncBranchEndpointPositions(
             if (!pane.session || pane.session.get() == &session) {
                 continue;
             }
-            if (pane.session->fiberId != branch.branchFiberId &&
-                (branch.branchFileName.empty() ||
-                pane.session->fiberFileName != branch.branchFileName)) {
+            if (!vc3d::line_annotation::sameFiberIdentity(
+                    pane.session->fiberId, pane.session->fiberFileName,
+                    branch.branchFiberId, branch.branchFileName)) {
                 continue;
             }
             if (auto targetIndex = matchingSessionControlPointIndex(
@@ -14864,8 +14890,8 @@ std::vector<uint64_t> LineAnnotationController::syncBranchEndpointPositions(
             continue;
         }
         for (auto& fiber : _fibers) {
-            if (fiber.id != branch.branchFiberId &&
-                (branch.branchFileName.empty() || fiber.fileName != branch.branchFileName)) {
+            if (!vc3d::line_annotation::sameFiberIdentity(
+                    fiber.id, fiber.fileName, branch.branchFiberId, branch.branchFileName)) {
                 continue;
             }
             if (auto targetIndex = matchingStoredControlPointIndex(
@@ -15307,7 +15333,7 @@ LineAnnotationController::makeStoredFiberSessionSnapshot(LineAnnotationSession& 
                                   });
     }
     fiber.id = existingIt == _fibers.end()
-        ? (session.fiberId == 0 ? nextFiberId() : session.fiberId)
+        ? (session.fiberId == 0 ? allocateFiberId() : session.fiberId)
         : existingIt->id;
     fiber.generation = existingIt == _fibers.end()
         ? uint64_t{1}
@@ -16665,13 +16691,14 @@ bool LineAnnotationController::validateLoadedFiberLinks(std::vector<StoredFiber>
                      fibers.end());
     }
 
+    // The ids were assigned before validation (assignRuntimeFiberIds) and
+    // removing invalid fibers must not renumber the survivors; only the
+    // branch refs are remapped onto the ids the survivors carry.
     std::unordered_map<std::string, uint64_t> fiberIdByFileName;
     fiberIdByFileName.reserve(fibers.size());
-    uint64_t runtimeId = 1;
-    for (auto& fiber : fibers) {
-        fiber.id = runtimeId++;
+    for (const auto& fiber : fibers) {
         if (!fiber.fileName.empty()) {
-            fiberIdByFileName[fiber.fileName] = fiber.id;
+            fiberIdByFileName.emplace(fiber.fileName, fiber.id);
         }
     }
     for (auto& fiber : fibers) {

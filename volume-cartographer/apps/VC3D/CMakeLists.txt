@@ -28,6 +28,7 @@ set(srcs
     AxisAlignedSliceController.hpp
     LineAnnotationFiberClassification.hpp
     LineAnnotationFiberDeletion.hpp
+    LineAnnotationFiberIdentity.hpp
     LineAnnotationFiberSaveJob.cpp
     LineAnnotationFiberSaveJob.hpp
     FiberNameDisplay.cpp

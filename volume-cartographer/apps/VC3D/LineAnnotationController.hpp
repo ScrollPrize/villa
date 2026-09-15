@@ -880,7 +880,16 @@ private:
     void attachAtlasPredSnaps(const StoredFiber& fiber,
                               LineAnnotationSession& session,
                               const std::filesystem::path& atlasDir);
-    [[nodiscard]] uint64_t nextFiberId() const;
+    // A fresh runtime fiber id: above every id this package has handed out
+    // and every live one (stored or in an open session), and at least
+    // minimumId. Ids are never recycled within a package; see
+    // LineAnnotationFiberIdentity.hpp.
+    [[nodiscard]] uint64_t allocateFiberId(uint64_t minimumId = 0);
+    [[nodiscard]] std::vector<uint64_t> liveSessionFiberIds() const;
+    // Assigns runtime ids to a freshly loaded list (known file names keep
+    // their ids, new ones get fresh ids) and remaps the stored branch refs by
+    // file name onto them.
+    void assignRuntimeFiberIds(std::vector<StoredFiber>& fibers);
     [[nodiscard]] uint64_t nextFiberSequenceForUsername(const std::string& username) const;
     [[nodiscard]] std::string currentFiberUsername() const;
     [[nodiscard]] static std::string currentFiberDateTimeString();
@@ -1129,6 +1138,14 @@ private:
     uint64_t _fiberDataGeneration = 1;
     // See packageGeneration(); starts at 1 for the same reason.
     uint64_t _packageGeneration = 1;
+    // The package's runtime id space: which file name holds which id, and the
+    // next id never handed out. It outlives every reload of the fiber list
+    // within the package (so a fiber keeps its id across import, repair and
+    // vpkg-ready reloads, and a retired id is never reused) and is reset when
+    // the package changes. _runtimeIdsPackageGeneration says which package
+    // it belongs to.
+    vc3d::line_annotation::RuntimeFiberIdSpace _runtimeIds;
+    uint64_t _runtimeIdsPackageGeneration = 0;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;
