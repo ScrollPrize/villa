@@ -232,6 +232,10 @@ public:
         return bounds_.size();
     }
 
+    size_t mapped_bytes() const {
+        return mmapped_data_ ? mmapped_data_->size : 0;
+    }
+
     size_t get_memory_usage() const {
         size_t grid_memory = grid_.capacity() * sizeof(std::vector<int>);
         for (const auto& cell : grid_) {
@@ -930,6 +934,10 @@ cv::Size GridStore::size() const {
 
 size_t GridStore::get_memory_usage() const {
     return pimpl_->get_memory_usage();
+}
+
+size_t GridStore::residentBytes() const {
+    return pimpl_->mapped_bytes() + pimpl_->get_memory_usage();
 }
 
 size_t GridStore::numSegments() const {

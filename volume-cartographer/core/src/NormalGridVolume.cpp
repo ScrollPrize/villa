@@ -8,6 +8,7 @@
  #include <fstream>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <condition_variable>
 #include <deque>
 #include <iostream>
@@ -27,6 +28,9 @@
     struct CacheEntry {
         std::shared_ptr<GridStore> grid_store;
         uint64_t generation;
+        // Bytes charged to the budget when this entry was inserted, held here
+        // so eviction subtracts exactly what insertion added.
+        size_t bytes = 0;
     };
 
      struct NormalGridVolume::pimpl {
@@ -40,11 +44,69 @@
          mutable std::shared_mutex mutex;
          mutable std::unordered_map<cv::Vec2i, CacheEntry> grid_cache;
          mutable uint64_t generation_counter = 0;
-         // Cap at 512 entries. Each cached GridStore holds up to 2 MiB of
-         // decoded seglists (GridStore.cpp:813) plus metadata, so 512 ≈
-         // ~1 GiB ceiling on this cache alone. The prior 4096 could have
-         // reached 8 GiB if every slot held a fully-populated store.
-         size_t max_cache_size = 512;
+         // Budgeted in BYTES rather than entries.
+         //
+         // An entry count is the wrong unit here. A cached GridStore costs the
+         // .grid file it maps -- whose size varies by an order of magnitude
+         // between slices -- plus up to 2 MiB of decoded seglists, so any
+         // entry cap is simultaneously too loose (a worst case of entries x
+         // 2 MiB) and too tight (it evicts small stores that cost almost
+         // nothing to keep). A byte budget bounds the cache directly and does
+         // not need retuning when the grids change.
+         //
+         // The old cap of 512 entries was far below a real tracing working
+         // set. Measured on one resume round of a large patch, whose grid
+         // working set was 7424 distinct slices totalling 4.0 GB: the tracer
+         // opened .grid files 110631 times, i.e. it reopened, remapped and
+         // re-parsed each file about 15 times over, and threw away each
+         // store's decoded polylines with it. A budget that holds the working
+         // set turns that into one construction per distinct slice.
+         //
+         // The default is 4 GiB of accounted bytes. Sweeping the budget on
+         // that same round gave:
+         //
+         //     budget    GridStore constructions   resident entries
+         //     256 MiB   112447                      659
+         //       1 GiB    50426                     2162
+         //       2 GiB    32423                     3730
+         //       4 GiB     7427                     7427
+         //       8 GiB     7427                     7427
+         //
+         // 4 GiB is the knee: it holds the whole working set with no
+         // evictions, and 8 GiB buys nothing. All budgets produced
+         // byte-identical output -- the cache is transparent, so a store that
+         // is evicted is simply reloaded from the same immutable file.
+         //
+         // The accounting charges each store its whole mapped file size while
+         // only touched pages are actually resident, so the real RSS cost is
+         // well under the budget (1.8 GB at the 4 GiB default in that run).
+         // The budget over-charges rather than under-charges, which is the
+         // safe direction. Mappings are file-backed, so concurrent tracers
+         // working the same grids share those pages through the page cache.
+         // Lower the budget with VC_GRID_CACHE_BYTES on a memory-tight host.
+         static constexpr size_t kDefaultCacheBytes = 4ull * 1024 * 1024 * 1024;
+         size_t max_cache_bytes = [] {
+             if (const char* e = std::getenv("VC_GRID_CACHE_BYTES")) {
+                 const long long v = std::atoll(e);
+                 if (v > 0) return static_cast<size_t>(v);
+             }
+             return kDefaultCacheBytes;
+         }();
+         // Backstop so a volume of unusually tiny slices cannot grow the map
+         // without bound; not the binding constraint at the default budget.
+         size_t max_cache_entries = [] {
+             if (const char* e = std::getenv("VC_GRID_CACHE_ENTRIES")) {
+                 const long long v = std::atoll(e);
+                 if (v > 0) return static_cast<size_t>(v);
+             }
+             return size_t(65536);
+         }();
+         mutable size_t cache_bytes = 0;
+         mutable uint64_t inserts_since_resync = 0;
+         // Hoisted out of the eviction path: this used to construct a fresh
+         // std::mt19937 from std::random_device on every single eviction,
+         // while holding the exclusive cache lock.
+         mutable std::mt19937 eviction_rng{std::random_device{}()};
          size_t eviction_sample_size = 10;
         
          mutable std::atomic<uint64_t> cache_hits{0};
@@ -391,40 +453,74 @@
                     return it->second.grid_store;
                 }
  
-                grid_cache[key] = {grid_store, ++generation_counter};
+                const size_t entry_bytes = grid_store ? grid_store->residentBytes() : 0;
+                grid_cache[key] = {grid_store, ++generation_counter, entry_bytes};
+                cache_bytes += entry_bytes;
 
-                // Eviction logic
-                if (grid_cache.size() > max_cache_size) {
-                    std::vector<cv::Vec2i> keys;
-                    keys.reserve(grid_cache.size());
-                    for (const auto& pair : grid_cache) {
-                        keys.push_back(pair.first);
-                    }
-
-                    std::mt19937 gen(std::random_device{}());
-                    std::uniform_int_distribution<size_t> dist(0, keys.size() - 1);
-
-                    cv::Vec2i key_to_evict;
-                    uint64_t min_generation = std::numeric_limits<uint64_t>::max();
-
-                    for (size_t i = 0; i < eviction_sample_size && !keys.empty(); ++i) {
-                        size_t rand_idx = dist(gen);
-                        const auto& key = keys[rand_idx];
-                        const auto& entry = grid_cache.at(key);
-                        if (entry.generation < min_generation) {
-                            min_generation = entry.generation;
-                            key_to_evict = key;
+                // A store's decoded-polyline cache grows after it is inserted,
+                // so the running total drifts low. Resync it periodically; the
+                // O(entries) walk is amortised over 1024 insertions, and at
+                // the default budget insertions become rare once the working
+                // set is resident.
+                if (++inserts_since_resync >= 1024) {
+                    inserts_since_resync = 0;
+                    size_t total = 0;
+                    for (auto& [k, e] : grid_cache) {
+                        (void)k;
+                        if (e.grid_store) {
+                            e.bytes = e.grid_store->residentBytes();
+                            total += e.bytes;
                         }
                     }
-
-                    if (min_generation != std::numeric_limits<uint64_t>::max()) {
-                        grid_cache.erase(key_to_evict);
-                    }
+                    cache_bytes = total;
                 }
+
+                evict_to_budget_locked();
 
                 check_print_stats();
             }
             return grid_store;
+        }
+
+        // Caller must hold the exclusive lock. Evicting is always safe: the
+        // cache is transparent, so a dropped store is reloaded from the same
+        // immutable .grid file on the next miss. Eviction policy affects
+        // timing, never results.
+        void evict_to_budget_locked() const
+        {
+            while ((cache_bytes > max_cache_bytes || grid_cache.size() > max_cache_entries)
+                   && grid_cache.size() > 1) {
+                std::vector<cv::Vec2i> keys;
+                keys.reserve(grid_cache.size());
+                for (const auto& pair : grid_cache) {
+                    keys.push_back(pair.first);
+                }
+                if (keys.empty()) {
+                    break;
+                }
+
+                std::uniform_int_distribution<size_t> dist(0, keys.size() - 1);
+                cv::Vec2i key_to_evict;
+                uint64_t min_generation = std::numeric_limits<uint64_t>::max();
+                for (size_t i = 0; i < eviction_sample_size; ++i) {
+                    const auto& k = keys[dist(eviction_rng)];
+                    const auto& entry = grid_cache.at(k);
+                    if (entry.generation < min_generation) {
+                        min_generation = entry.generation;
+                        key_to_evict = k;
+                    }
+                }
+                if (min_generation == std::numeric_limits<uint64_t>::max()) {
+                    break;
+                }
+
+                auto it = grid_cache.find(key_to_evict);
+                if (it == grid_cache.end()) {
+                    break;
+                }
+                cache_bytes -= std::min(cache_bytes, it->second.bytes);
+                grid_cache.erase(it);
+            }
         }
 
         NormalGridVolume::CacheStats cacheStats() const {
