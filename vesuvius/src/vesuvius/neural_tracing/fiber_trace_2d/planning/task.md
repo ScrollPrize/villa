@@ -1,3 +1,3 @@
-# Shareable embedding experiment summary
+# Merge refinement into the committed embedding/evaluation branch
 
-Summarize all recorded 3D fiber embedding experiments, training runs and eval results in a Markdown file suitable for others. Explain mechanisms, matched baselines, protocol changes, limits and practical conclusion. No new training/evaluation or runtime code changes.
+Commit the current state, then merge fiber-training-refinement into fiber-vischeck. Preserve both feature sets and historical planning/results. Validate without launching training/evaluations.

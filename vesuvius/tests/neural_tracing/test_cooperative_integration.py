@@ -246,7 +246,7 @@ def test_queue_publication_failure_is_not_silently_counted_as_delivery():
         cohort._check_publication()
 
 
-def test_cohort_constructor_failure_reaps_children(monkeypatch):
+def test_cohort_constructor_failure_reaps_children(monkeypatch, tmp_path):
     from villa_gpu_manager import cohort as process_cohort, processes
     from vesuvius.neural_tracing.fiber_trace_3d.cooperative_cohort import FiberCohort
     events = []
@@ -268,7 +268,9 @@ def test_cohort_constructor_failure_reaps_children(monkeypatch):
     broker = SimpleNamespace(frontier=0, effective_batch_size=128)
     calibration = MemoryCalibration(10, 10, 0, 0, 0, 1, ((1, 20),))
     with pytest.raises(RuntimeError, match="monitor setup failed"):
-        FiberCohort(config_path="unused", grant={"cpu_cores": 1, "gpus": {"GPU-fake": 30}},
+        config_path = tmp_path / "config.json"
+        config_path.write_text("{}")
+        FiberCohort(config_path=str(config_path), grant={"cpu_cores": 1, "gpus": {"GPU-fake": 30}},
                     state=None, broker=broker, calibration=calibration,
                     calibration_observations=[{"gpu_name": "fake", "torch_version": "test", "cuda_version": "test"}])
     assert events == ["spawned", "joined"]

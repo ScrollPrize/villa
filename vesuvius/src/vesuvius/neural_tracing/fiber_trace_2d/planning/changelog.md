@@ -1,3 +1,13 @@
+## 2026-09-15 — Merge refinement and embedding/evaluation work
+
+- Committed embedding/evaluation state as de6fc71e8, then merged
+  fiber-training-refinement at c3e0d21a8 into fiber-vischeck.
+- No source conflicts; preserved both planning histories under
+  planning/merge_refinement_20260915 and fused both changelog histories.
+- Independent semantic review approved. Native/evaluation suite passed with
+  232 Python tests (8 skipped); refinement/format suite passed 17 (2 skipped).
+  No training or full evaluations rerun.
+
 ## 2026-09-15 — Shareable embedding research summary
 
 - Added docs/embedding_experiments_summary_20260915.md covering recorded3D
@@ -72,6 +82,25 @@
   alternate embeddings, original-cache composite manifests, per-array demand
   routing and model-specific pools within one manager grant. Publication and
   native scoring unchanged. Usage/limits in docs/mixed_inference.md.
+## 2026-09-15 — Fixed-crop test refinement
+
+- Test pieces keep uniform1/8-ellipse step caps without border taper or pinned
+  endpoints; omit artificial outside joins. Training taper/stitching unchanged.
+
+- Independent persistent test-crop curves use original GT image transforms;
+  overlapping test crops no longer modify each other or whole test fibers.
+- Raw/EMA test scalar logging shares component tags including presence/direction.
+- Resume preserves train geometry and optimizer/EMA; legacy whole-test updates
+  intentionally do not initialize the new crop-local targets.
+
+## 2026-09-15 — Opt-in training-feedback GT refinement
+
+- Current detached raw presence refines train/test geometry through a batched
+  semi-implicit, normal-plane constrained solver; native normal loading and fast
+  queues are shared. Original-GT ellipse tether, tapered step caps, resampling,
+  and checkpoint-linked geometry archives preserve inspectability and resume.
+- Disabled by default; configuration and measured solver cost documented in
+  docs/training_refinement.md. Managed continuation launched from update11800.
 
 ## 2026-09-14 — Evaluation-ablation merge and final EMA999
 

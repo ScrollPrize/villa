@@ -1,5 +1,31 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Opt-in training-feedback refinement (2026-09-15)
+
+- Test crops are fixed by original GT selection and transforms. Refined local
+  test curves are independent per deterministic crop, never merged into the full
+  test fiber; checkpoint archives preserve them. Old whole-test updates are
+  ignored by the fixed-crop protocol. Training still uses shared whole curves.
+- Raw and EMA tests log the same component metrics, including presence/direction.
+- Independent test pieces have uniform 1/8-ellipse step caps without border taper
+  or endpoint pinning. Training still tapers/pins for stitching. Test labels omit
+  artificial joins to the outside original curve; outside model support contributes
+  no presence force. Baseline tether, fixed crops and per-piece persistence remain.
+
+- `refinement.enabled` defaults false. Current raw model presence, detached from
+  autograd, refines persistent train and test curves; no frozen teacher or extra
+  forward. Subsequent queued loads reuse refined geometry, never mutate input files.
+- Immutable-original GT tether uses 40/80 base-voxel normal/tangent radii;
+  small displacement shape penalty, current tangent-plane updates, per-iteration
+  1/8-ellipse cap tapered over 1/8 patch width, and arclength resampling.
+- Shared native normal sampling/validity and existing fast data queues are reused.
+  Invalid normals skip refinement. Already prepared targets stay immutable.
+  Test raw/EMA targets agree within a wave; only raw predictions update geometry.
+- All component geometries and provenance are archived alongside snapshots and
+  restored by checkpoint reference/checksum; supervisor lifetime spans GPU resize.
+- See `docs/training_refinement.md` for configuration, explicit unsupported
+  modes, stale-lookahead semantics, measurements and snapshot inspection.
+
 ## Reported combined-distance mean (user override 2026-09-14)
 
 - At each aggregation scope (scroll, collection, paired fiber, pooled total),
