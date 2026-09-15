@@ -57,6 +57,7 @@ from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, EDITABLE_PCL_ROLE_VALUES,
                          fit_input, input_source_enabled, pcl_input_enabled,
                          pcl_role_toggle_key, phase_bundle_enabled,
                          shell_losses_enabled, winding_inference_enabled)
+from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
 
 
 def _startup_resource_suffix(started_at=None):
@@ -1276,6 +1277,15 @@ def get_flow_field_high_res_lr_scale(cfg, iteration):
     fraction = min(
         1., max(0., (int(iteration) - int(start_step)) / ramp_steps))
     return min(1., float(initial) + fraction * (float(final) - float(initial)))
+
+
+def get_flow_field_low_res_lr_scale(cfg):
+    """Relative optimizer LR for the low-resolution flow lattice."""
+    value = cfg.get('model_flow_field_low_res_lr_scale')
+    # Only a missing or null setting takes the default: 0 is a valid scale
+    # that freezes the coarse lattice (a zero AdamW LR also disables its
+    # decoupled weight decay).
+    return 1.0 if value is None else float(value)
 
 
 def set_optimizer_group_lr_scale(
@@ -3001,23 +3011,168 @@ class FitContext:
                       'to enable it (some of these losses also need the '
                       'phase/SDT assets, see any warnings above).')
 
-    def _apply_high_res_lr_scale(self, iteration):
-        scale = get_flow_field_high_res_lr_scale(self.config, iteration)
+    def _apply_flow_group_settings(self, iteration):
+        """Per-step optimizer settings of the two flow-lattice groups: their
+        LR scales relative to the base group and the moment flags are read
+        every step. The catalog exposes optimizer flags at run boundaries,
+        but classifies model_ LR controls as requiring a model rebuild.
+        Returns (low-res scale, high-res scale)."""
+        high_res_scale = get_flow_field_high_res_lr_scale(self.config, iteration)
+        low_res_scale = get_flow_field_low_res_lr_scale(self.config)
+        # The base group (pitch and shell parameters) carries the scheduled
+        # optimizer_learning_rate unscaled; both flow groups hang off it.
+        base_group = self.optimiser.param_groups[0]
         low_res_group = next(
             group for group in self.optimiser.param_groups
             if any(param is self.low_res_flow_params[0] for param in group['params']))
         high_res_group = next(
             group for group in self.optimiser.param_groups
             if any(param is self.high_res_flow_params[0] for param in group['params']))
-        set_optimizer_group_lr_scale(
-            self.optimiser,
-            self.lr_scheduler,
-            group=high_res_group,
-            reference_group=low_res_group,
-            scale=scale,
-            initial_lr=self.config['optimizer_learning_rate'],
-        )
-        return scale
+        # A loaded checkpoint's groups replace the live hyperparameters, so
+        # the flags are re-applied here rather than kept in the group.
+        lazy_moments = bool(self.config.get('optimizer_flow_lazy_moments', False))
+        shared_second_moment = bool(
+            self.config.get('optimizer_flow_shared_second_moment', False))
+        clip_quantile = self.config.get(
+            'optimizer_flow_shared_second_moment_clip_quantile', 0.99)
+        for group in (low_res_group, high_res_group):
+            group['lazy_moments'] = lazy_moments
+            group['shared_second_moment'] = shared_second_moment
+            group['shared_second_moment_clip_quantile'] = clip_quantile
+        for group, scale in ((low_res_group, low_res_scale), (high_res_group, high_res_scale)):
+            set_optimizer_group_lr_scale(
+                self.optimiser,
+                self.lr_scheduler,
+                group=group,
+                reference_group=base_group,
+                scale=scale,
+                initial_lr=self.config['optimizer_learning_rate'],
+            )
+        return low_res_scale, high_res_scale
+
+    def _report_flow_grad_conditioning(self):
+        """Log the flow gradient smoothing widths in lattice cells.
+
+        Widths use scroll-voxel units of the flow frame. Very small cell-unit
+        widths collapse to identity kernels. Print the conversion at build
+        time; subsequent live changes do not refresh this startup report.
+        """
+        if not self.dist.is_main_process:
+            return
+        if not self.config.get('optimizer_flow_grad_smoothing', False):
+            return
+        along, across, low_res = self._flow_grad_smoothing_widths()
+        print(self.spiral_and_transform.describe_flow_grad_smoothing(along, across, low_res))
+        if not (self.config.get('optimizer_flow_lazy_moments', False)
+                or self.config.get('optimizer_flow_shared_second_moment', False)):
+            print('NOTE: flow gradient smoothing with per-cell Adam moments and '
+                  'without optimizer_flow_lazy_moments: the smoothed tails reach '
+                  'cells whose Adam second moment has decayed, so their first '
+                  'step is far larger than the tail warrants')
+
+    def _flow_grad_smoothing_widths(self):
+        """(along-sheet, across-ring, low-res along-sheet) widths in voxels."""
+        along = float(self.config['optimizer_flow_grad_smoothing_sigma_voxels'])
+        across = float(self.config.get(
+            'optimizer_flow_grad_smoothing_across_sigma_voxels', 0.0) or 0.0)
+        low_res = float(self.config.get(
+            'optimizer_flow_grad_smoothing_low_res_sigma_voxels', 0.0) or 0.0)
+        return along, across, low_res
+
+    def _sanitize_nonfinite_grads_(self):
+        """Count and zero nonfinite entries in every distributed gradient.
+
+        Bumps nonfinite_grad_steps once per step with any nonfinite gradient
+        and nonfinite_grad_by_param per affected parameter, then replaces
+        NaN and +/-inf with zero in place.
+        """
+        step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=self.nonfinite_grad_steps.device)
+        for name, p in self.dist_grad_named:
+            if p.grad is not None:
+                # aminmax propagates NaN and surfaces +/-inf through two scalar
+                # reductions, avoiding the gradient-sized boolean temporaries
+                # that (~torch.isfinite(grad)).any() allocates per parameter.
+                grad_min, grad_max = torch.aminmax(p.grad)
+                param_nonfinite = ~(torch.isfinite(grad_min) & torch.isfinite(grad_max))
+                step_had_nonfinite |= param_nonfinite
+                self.nonfinite_grad_by_param[name] += param_nonfinite.to(self.nonfinite_grad_steps.dtype)
+                torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+        self.nonfinite_grad_steps += step_had_nonfinite.to(self.nonfinite_grad_steps.dtype)
+
+    def _clip_flow_grads(self):
+        """Robustly clip both flow lattices' gradients per stage (see
+        lazy_moment_adamw.robust_clip_) and keep the thresholds and clipped
+        fractions for the step log. A non-positive multiple leaves the
+        gradients alone and clears the stats."""
+        multiple = float(self.config.get('optimizer_flow_grad_clip_median_multiple', 0.0) or 0.0)
+        self.flow_grad_clip_stats = {}
+        if multiple <= 0.0:
+            return
+        for name, param in (('LR', self.low_res_flow_params[0]),
+                            ('HR', self.high_res_flow_params[0])):
+            if param.grad is None:
+                continue
+            stats = robust_clip_(param.grad, multiple)
+            if stats is not None:
+                self.flow_grad_clip_stats[name] = stats
+
+    def _flow_conditioning_report(self):
+        """Per-lattice, per-stage gradient-conditioning lines and metrics.
+
+        Update root-mean-squares are converted from the lattices' normalised
+        flow-box units to scroll voxels per component (a cylindrical
+        lattice's components are z, radial, tangential; a Cartesian one's
+        z, y, x), so runs with different smoothing widths or denominators
+        are compared on how far they actually move the field per step. Reads
+        device statistics, so call it only when logging.
+        """
+        stats = getattr(self.optimiser, 'conditioning_stats', {})
+        clip_stats = getattr(self, 'flow_grad_clip_stats', {})
+        lines, payload = [], {}
+        if not stats and not clip_stats:
+            return lines, payload
+        ranges = (self.spiral_and_transform.flow_max_corner_zyx
+                  - self.spiral_and_transform.flow_min_corner_zyx).to(torch.float64).cpu()
+        cylindrical = self.config['model_flow_field_type'] in ('cylindrical', 'bspline_cylindrical')
+        component_names = ('z', 'r', 't') if cylindrical else ('z', 'y', 'x')
+        # Component 0 is z; the in-plane components (radial and tangential,
+        # or y and x) both live in the square yx box.
+        component_voxels = [float(ranges[0]), float(ranges[1]), float(ranges[2])]
+        for name, param in (('LR', self.low_res_flow_params[0]),
+                            ('HR', self.high_res_flow_params[0])):
+            entry = stats.get(param)
+            clip = clip_stats.get(name)
+            if entry is None and clip is None:
+                continue
+            stages = int(param.shape[0]) if param.dim() >= 3 else 1
+            cells_per_stage = param.numel() / stages
+            for stage in range(stages):
+                parts = []
+                prefix = f'flow_cond/{name}/stage{stage}/'
+                if entry is not None:
+                    rms = entry['update_rms'][stage].cpu()
+                    count = entry['update_count'][stage].cpu()
+                    voxels = [float(rms[c]) * component_voxels[c] for c in range(rms.numel())]
+                    parts.append('update rms vox ' + ' '.join(
+                        f'{component_names[c]}={v:.4f}' for c, v in enumerate(voxels)))
+                    updated = float(count.sum()) / cells_per_stage
+                    parts.append(f'updated {100.0 * updated:.1f}%')
+                    payload[prefix + 'updated_fraction'] = updated
+                    for c, v in enumerate(voxels):
+                        payload[prefix + f'update_rms_vox_{component_names[c]}'] = v
+                    if entry['scale'] is not None:
+                        scale = float(entry['scale'][stage])
+                        parts.append(f'shared scale {scale:.3e}')
+                        payload[prefix + 'shared_scale'] = scale
+                if clip is not None:
+                    threshold, fraction = clip
+                    threshold = float(threshold[stage])
+                    fraction = float(fraction[stage])
+                    parts.append(f'clip thr {threshold:.3e} clipped {100.0 * fraction:.3f}%')
+                    payload[prefix + 'clip_threshold'] = threshold
+                    payload[prefix + 'clipped_fraction'] = fraction
+                lines.append(f'  flow cond {name} stage{stage}: ' + ', '.join(parts))
+        return lines, payload
 
     def _realign_lr_schedule(self, completed_steps):
         """Align optimizer/scheduler state to the current absolute horizon."""
@@ -3533,6 +3688,7 @@ class FitContext:
         grouped_ids = {id(p) for p in flow_field_params + self.gap_expander_params + linear_params}
         other_params = [p for p in self.spiral_and_transform.parameters() if id(p) not in grouped_ids]
         initial_high_res_lr_scale = get_flow_field_high_res_lr_scale(self.config, 0)
+        initial_low_res_lr_scale = get_flow_field_low_res_lr_scale(self.config)
         param_groups = [
             {'params': other_params, 'weight_decay': 0.0},
             {'params': linear_params, 'weight_decay': 0.0},
@@ -3540,7 +3696,8 @@ class FitContext:
             {
                 'params': self.low_res_flow_params,
                 'weight_decay': self.config['optimizer_weight_decay_flow_field'],
-                'lr_scale': 1.,
+                'lr': self.config['optimizer_learning_rate'] * initial_low_res_lr_scale,
+                'lr_scale': initial_low_res_lr_scale,
             },
             {
                 'params': self.high_res_flow_params,
@@ -3550,7 +3707,11 @@ class FitContext:
             },
         ]
         progress.begin('loading', 'Creating optimizer')
-        self.optimiser = torch.optim.AdamW(param_groups, lr=self.config['optimizer_learning_rate'], betas=(0.9, 0.999), eps=1.e-8, fused=True)
+        # AdamW for every group; the flow groups may additionally be stepped
+        # with lazy moments (optimizer_flow_lazy_moments, applied per step by
+        # _apply_flow_group_settings), which keeps AdamW's state format.
+        self.optimiser = LazyMomentAdamW(param_groups, lr=self.config['optimizer_learning_rate'], betas=(0.9, 0.999), eps=1.e-8, fused=True)
+        self._report_flow_grad_conditioning()
         # Influence masks are scoped to one interactive Run request. They are
         # created from that run's pending inputs and discarded before its autosave.
         self.influence_state = None
@@ -3700,6 +3861,10 @@ class FitContext:
         )
         self.nonfinite_grad_steps = torch.zeros((), device=self.dist_grad_params[0].device)
         self.nonfinite_grad_by_param = {name: torch.zeros((), device=p.device) for name, p in self.dist_grad_named}
+        # Per-lattice, per-stage (threshold, clipped fraction) of the last
+        # step's robust flow-gradient clip, for the step log (see
+        # _clip_flow_grads).
+        self.flow_grad_clip_stats = {}
         self.run_dt_resume_iteration = None
 
     # What _build_model_state() constructs, and therefore what
@@ -5349,7 +5514,8 @@ class FitContext:
 
     def step(self, iteration):
         self.step_timer.start('fwd')
-        flow_field_high_res_lr_scale = self._apply_high_res_lr_scale(iteration)
+        flow_field_low_res_lr_scale, flow_field_high_res_lr_scale = (
+            self._apply_flow_group_settings(iteration))
 
         # The tiny graph paths shared by every transform evaluation this
         # iteration (dr softplus, scaled linear logits, pinned gap logits) are
@@ -5372,6 +5538,7 @@ class FitContext:
 
         losses = {}
         log_metrics = {
+            'flow_field_low_res_lr_scale': flow_field_low_res_lr_scale,
             'flow_field_high_res_lr_scale': flow_field_high_res_lr_scale,
         }
 
@@ -5795,18 +5962,28 @@ class FitContext:
         allreduce_grads_(self.dist_grad_params, self.dist.world_size)
         self.step_timer.stop('comm')
 
-        step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=self.nonfinite_grad_steps.device)
-        for name, p in self.dist_grad_named:
-            if p.grad is not None:
-                # aminmax propagates NaN and surfaces +/-inf through two scalar
-                # reductions, avoiding the gradient-sized boolean temporaries
-                # that (~torch.isfinite(grad)).any() allocates per parameter.
-                grad_min, grad_max = torch.aminmax(p.grad)
-                param_nonfinite = ~(torch.isfinite(grad_min) & torch.isfinite(grad_max))
-                step_had_nonfinite |= param_nonfinite
-                self.nonfinite_grad_by_param[name] += param_nonfinite.to(self.nonfinite_grad_steps.dtype)
-                torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
-        self.nonfinite_grad_steps += step_had_nonfinite.to(self.nonfinite_grad_steps.dtype)
+        # Detect and zero nonfinite gradients straight after the all-reduce
+        # (identical on every rank) and before the clipping and smoothing:
+        # clamping would turn an infinity into a finite bound and hide it
+        # from these counters, and smoothing would spread a single NaN over
+        # every cell within its kernel. This does not check for overflow in
+        # subsequent arithmetic or repair invalid parameter/moment state.
+        self._sanitize_nonfinite_grads_()
+
+        # Clip after the all-reduce (identical gradients and statistics on
+        # every rank) and before smoothing, so a cell with an unsatisfiable
+        # loss is bounded before its spike is spread over its neighbours.
+        self.step_timer.start('clip')
+        self._clip_flow_grads()
+        self.step_timer.stop('clip')
+
+        if self.config.get('optimizer_flow_grad_smoothing', False):
+            # After the all-reduce (smoothing is linear, and every rank then
+            # smooths identical gradients) and before the influence masks, so
+            # smoothing cannot leak gradient outside a masked region.
+            self.step_timer.start('smooth')
+            self.spiral_and_transform.smooth_flow_grad_(*self._flow_grad_smoothing_widths())
+            self.step_timer.stop('smooth')
 
         if self.influence_state is not None and self.influence_state.active:
             # After the all-reduce and the accumulated-field-grad handoff, so
@@ -5886,8 +6063,12 @@ class FitContext:
                     )
                     by_param = ', '.join(f'{name}: {count}' for name, count in per_param)
                     print(f'  ({n_sanitised} non-finite-gradient steps sanitised so far; by param: {by_param})')
+                conditioning_lines, conditioning_payload = self._flow_conditioning_report()
+                for line in conditioning_lines:
+                    print(line)
                 payload = {
                     'total_loss': loss.item(),
+                    **conditioning_payload,
                     'nonfinite_grad_steps': self.nonfinite_grad_steps.item(),
                     **{f'nonfinite_grad_steps/{name}': count.item() for name, count in self.nonfinite_grad_by_param.items()},
                     **{name + '_loss': value for name, value in losses.items()},
