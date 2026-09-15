@@ -495,3 +495,78 @@ def test_flat_inference_ignores_embedded_io_paths_and_keeps_reference_defaults(
     assert "stride=8 requested_overlap=0.500 blend_mode=hann" in caplog.text
     assert np.all(tifffile.imread(output) == 127)
     assert not any(path.name.startswith("ink_flat_infer_") for path in tmp_path.iterdir())
+
+
+def test_flat_robust_normalization_excludes_reader_padding(tmp_path):
+    """Training normalizes only the voxels read from the source and leaves the
+    reader's padding at zero (`data/dataset.py::_tensor_sample`).  Robust
+    normalization takes full-array percentiles, median and MAD, so normalizing
+    the padded patch lets artificial zeros move the statistics for every real
+    CT voxel."""
+    from vesuvius.image_proc.intensity.normalization import normalize_robust
+    from vesuvius.ink_detection.inference.infer import Block, FlatBlockDataset
+
+    source_ZYX = np.arange(100, 100 + 3 * 4 * 4, dtype=np.uint8).reshape(3, 4, 4)
+    path = tmp_path / "short-depth.zarr"
+    array = zarr.open(path, mode="w", shape=source_ZYX.shape,
+                      chunks=source_ZYX.shape, dtype="u1", zarr_format=2)
+    array[:] = source_ZYX
+
+    layers = select_layer_indices(
+        3, layer_start=None, layer_end=None, output_depth=5, direction="forward"
+    )
+    reader = FlatPatchReader(
+        input_path=path,
+        resolution="0",
+        depth_axis_first=True,
+        height=4,
+        width=4,
+        layer_indices=layers,
+        output_depth=5,
+        preprocessing="tifxyz_robust",
+    )
+    dataset = FlatBlockDataset(
+        reader=reader,
+        blocks=[Block(y0=0, x0=0, valid_h=4, valid_w=4)],
+        patch_size=4,
+        preprocessing="tifxyz_robust",
+    )
+    image_CZYX, _ = dataset[0]
+    got = image_CZYX.numpy()[0]
+
+    expected = np.zeros((5, 4, 4), dtype=np.float32)
+    expected[1:4] = normalize_robust(source_ZYX.astype(np.float32))
+
+    # the two planes the reader padded must still be exactly zero
+    np.testing.assert_array_equal(got[0], np.zeros((4, 4), dtype=np.float32))
+    np.testing.assert_array_equal(got[4], np.zeros((4, 4), dtype=np.float32))
+    # and every real voxel must match what training would have produced
+    np.testing.assert_allclose(got, expected, rtol=0, atol=1e-6)
+
+
+def test_flat_divide_255_is_unchanged_by_the_padding_rule(tmp_path):
+    """divide_255 needs no special case: zero divided by 255 is still zero."""
+    from vesuvius.ink_detection.inference.infer import Block, FlatBlockDataset
+
+    source_ZYX = np.arange(100, 100 + 3 * 4 * 4, dtype=np.uint8).reshape(3, 4, 4)
+    path = tmp_path / "divide.zarr"
+    array = zarr.open(path, mode="w", shape=source_ZYX.shape,
+                      chunks=source_ZYX.shape, dtype="u1", zarr_format=2)
+    array[:] = source_ZYX
+
+    layers = select_layer_indices(
+        3, layer_start=None, layer_end=None, output_depth=5, direction="forward"
+    )
+    reader = FlatPatchReader(
+        input_path=path, resolution="0", depth_axis_first=True,
+        height=4, width=4, layer_indices=layers, output_depth=5,
+        preprocessing="divide_255",
+    )
+    dataset = FlatBlockDataset(
+        reader=reader, blocks=[Block(y0=0, x0=0, valid_h=4, valid_w=4)],
+        patch_size=4, preprocessing="divide_255",
+    )
+    got = dataset[0][0].numpy()[0]
+    expected = np.zeros((5, 4, 4), dtype=np.float32)
+    expected[1:4] = source_ZYX.astype(np.float32) / 255.0
+    np.testing.assert_allclose(got, expected, rtol=0, atol=1e-7)
