@@ -980,7 +980,14 @@ def _load_native_model(payload, config, args) -> NativeModelBundle:
     )
     base_model = make_model(config)
     load_model_state(base_model, state)
-    model = TargetModel(base_model.eval()).eval()
+    # Training center-pads the model input to model_config.input_pad_depth_to
+    # before every forward pass, and flat inference passes the same value into
+    # this wrapper.  Native inference has to honour the same contract, or a
+    # checkpoint trained at a padded depth is fed an unpadded one here.
+    model = TargetModel(
+        base_model.eval(),
+        input_pad_depth_to=config.model.input_pad_depth_to,
+    ).eval()
     model, device = prepare_model_for_inference(
         model,
         gpu_ids=args.gpu_ids,
