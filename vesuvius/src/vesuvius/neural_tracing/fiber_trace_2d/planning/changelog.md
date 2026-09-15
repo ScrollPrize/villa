@@ -1,3 +1,12 @@
+## 2026-09-15 — Opt-in training-feedback GT refinement
+
+- Current detached raw presence refines train/test geometry through a batched
+  semi-implicit, normal-plane constrained solver; native normal loading and fast
+  queues are shared. Original-GT ellipse tether, tapered step caps, resampling,
+  and checkpoint-linked geometry archives preserve inspectability and resume.
+- Disabled by default; configuration and measured solver cost documented in
+  docs/training_refinement.md. No production training started.
+
 ## 2026-09-14 — Evaluation-ablation merge and final EMA999
 
 - Merged evaluation-ablations into fiber-vischeck at afb14b400 preserving both feature sets, our four active task docs and combined changelog. Parameter-based cache extension replaces obsolete implementation-hash gates; native heartbeat stops after process exit. Validated102native cases and206Python tests (8skipped).

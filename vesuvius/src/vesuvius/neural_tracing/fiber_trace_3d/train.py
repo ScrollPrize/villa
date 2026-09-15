@@ -73,6 +73,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.direction import (
     decode_lasagna_direction_3x2_analytic,
     encode_lasagna_direction_3x2,
 )
+from .refinement import RefinementConfig, RefinementObserver, refinement_session, active_store
 from vesuvius.neural_tracing.fiber_trace_3d.model import (
     build_fiber_trace_3d_model,
     direction_output,
@@ -837,6 +838,7 @@ def _bounded_training_sample_count(training: dict[str, Any], sample_count: int) 
 
 def _make_test_loader_raw_config(raw_config: dict[str, Any], training: dict[str, Any]) -> dict[str, Any]:
     test_raw = dict(raw_config)
+    test_raw["_refinement_split"] = "test"
     test_raw["datasets"] = raw_config["test_datasets"]
     test_raw.pop("test_datasets", None)
     if "test_batch_size" in training:
@@ -1798,6 +1800,7 @@ def _save_snapshot(
     sample_progress: _SampleProgress | None = None,
     ema: ModelEMA | None = None,
     ema_name: str | None = None,
+    refinement_state: dict | None = None,
 ) -> None:
     snapshot_model = _unwrap_model(model)
     payload = {
@@ -1807,6 +1810,8 @@ def _save_snapshot(
         "metric": metric,
         "metric_name": metric_name,
     }
+    if refinement_state is not None:
+        payload["refinement_state"] = refinement_state
     if sample_progress is not None:
         payload["samples_seen"] = sample_progress.at(step)
         payload["optimizer_global_batch_size"] = sample_progress.global_batch_size
@@ -2578,6 +2583,7 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
             sparse_tangent = sparse_tangent[sparse_mask]
     return FiberTrace3DBatch(
         embedding_geometry=None if batch.embedding_geometry is None else batch.embedding_geometry[start:stop],
+        refinement_geometry=None if batch.refinement_geometry is None else batch.refinement_geometry[start:stop],
         volume=batch.volume[start:stop],
         valid_mask=None if batch.valid_mask is None else batch.valid_mask[start:stop],
         cp_local_zyx=batch.cp_local_zyx[start:stop],
@@ -2612,6 +2618,16 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
         presence_mask=None if batch.presence_mask is None else batch.presence_mask[start:stop],
         profile_timings_ms=batch.profile_timings_ms,
     )
+
+
+def _combine_prediction_observers(*observers):
+    active = tuple(observer for observer in observers if observer is not None)
+    if not active:
+        return None
+    def observe(batch, output):
+        for observer in active:
+            observer(batch, output)
+    return observe
 
 
 def _forward_loss_tensors(
@@ -2793,6 +2809,7 @@ def _forward_loss(
     return _losses_to_float_dict(losses)
 
 
+@refinement_session
 def run_training(
     config_path: str | Path,
     *,
@@ -2845,6 +2862,11 @@ def training_units(
         raw_config = {**raw_config, "training": {**raw_config.get("training", {}), **training_overrides}}
     loader_config = load_config(config_path)
     training = dict(raw_config.get("training", {}))
+    refinement = RefinementObserver(RefinementConfig.parse(raw_config))
+    if refinement.config.enabled and raw_config.get("historical_test_datasets"):
+        raise ValueError("disable historical_test_datasets when refining train/test ground truth")
+    if refinement.config.enabled and training.get("test_output_upsample"):
+        raise ValueError("refinement requires native output-lattice testing (no test_output_upsample)")
     evaluation_microbatch_size = training.get("evaluation_microbatch_size")
     if evaluation_microbatch_size is not None and (
         type(evaluation_microbatch_size) is not int or evaluation_microbatch_size < 1
@@ -3394,6 +3416,20 @@ def training_units(
     def save_test_snapshots(test_step, metric, metric_name, *, initial=False):
         nonlocal best_metric
         if metric is None:
+            if refinement.config.enabled and not initial and test_step % checkpoint_interval == 0:
+                _distributed_barrier(distributed)
+                if distributed.is_main:
+                    saved = active_store().save(snapshot_dir / f"fibers_step_{test_step:08d}.zip")
+                    for name in [None, *ema.tracks]:
+                        suffix = "" if name is None else f"_{name}"
+                        filenames = [f"current{suffix}.pt"]
+                        if kept_snapshot_interval > 0 and test_step % kept_snapshot_interval == 0:
+                            filenames.append(f"step_{test_step:08d}{suffix}.pt")
+                        for filename in filenames:
+                            _save_snapshot(snapshot_dir / filename, model=raw_model, optimizer=optimizer,
+                                step=test_step, config=raw_config, metric=None, grad_scaler=grad_scaler,
+                                sample_progress=sample_progress, ema=ema, ema_name=name, refinement_state=saved)
+                _distributed_barrier(distributed)
             return
         planned = []
         tracks = [(None, metric, metric_name, best_metric)]
@@ -3415,11 +3451,17 @@ def training_units(
                 filenames.append(f"best{suffix}.pt")
             planned.extend((filename, name, value, value_name) for filename in filenames)
         # Update every track's best before serializing the resumable raw state.
+        saved_refinement = None
+        if planned and refinement.config.enabled:
+            _distributed_barrier(distributed)
+            if distributed.is_main:
+                saved_refinement = active_store().save(snapshot_dir / f"fibers_step_{test_step:08d}.zip")
         for filename, name, value, value_name in planned:
             if distributed.is_main:
                 _save_snapshot(snapshot_dir / filename, model=raw_model, optimizer=optimizer,
                     step=test_step, config=raw_config, metric=value, metric_name=value_name,
-                    grad_scaler=grad_scaler, sample_progress=sample_progress, ema=ema, ema_name=name)
+                    grad_scaler=grad_scaler, sample_progress=sample_progress, ema=ema, ema_name=name,
+                    refinement_state=saved_refinement)
             _distributed_barrier(distributed)
 
     if distributed.is_main:
@@ -3507,6 +3549,10 @@ def training_units(
                             if pending_test is not None else evaluation_microbatch_size))
                 finally:
                     iterator.close()
+                if source == "test":
+                    # Raw and all EMA tracks have now consumed identical batch
+                    # targets. Commit before a possible managed yield/restart.
+                    refinement.flush(distributed)
                 rows = _distributed_gather_dense_test_rows(local, distributed)
                 if pending_test is None:
                     all_rows.extend(rows)
@@ -3546,7 +3592,9 @@ def training_units(
                     conditioned_loss_options=conditioned_loss_options, mixed_precision=mixed_precision,
                     diagnostics=diagnostics, diagnostic_step=step,
                     output_upsample=training.get("test_output_upsample"),
-                    prediction_observer=test_visualization if distributed.is_main and writer is not None and test_vis_due else None,
+                    prediction_observer=_combine_prediction_observers(
+                        refinement if refinement.config.enabled else None,
+                        test_visualization if distributed.is_main and writer is not None and test_vis_due else None),
                 )
                 gathered_rows = yield from collect_evaluation(
                     test_loader, options, source="test", rows_key="rows",
@@ -3952,7 +4000,8 @@ def training_units(
                             train_model,
                             next_batch,
                             conditioned_loss_options=conditioned_loss_options,
-                            prediction_observer=train_visualization,
+                            prediction_observer=_combine_prediction_observers(
+                                refinement if refinement.config.enabled else None, train_visualization),
                         )
                     if component_accumulator is not None:
                         if scaler_enabled:
@@ -4118,6 +4167,11 @@ def training_units(
             if train_vis_due:
                 _distributed_barrier(distributed)
 
+            refinement.flush(distributed)
+            if writer is not None and refinement.config.enabled and scalar_metrics_due:
+                writer.add_scalar("refinement/seconds_cumulative", refinement.seconds, step)
+                writer.add_scalar("refinement/accepted", refinement.accepted, step)
+                writer.add_scalar("refinement/stale", refinement.stale, step)
             test_metric = None
             test_metric_name = None
             test_due = test_interval > 0 and step % test_interval == 0

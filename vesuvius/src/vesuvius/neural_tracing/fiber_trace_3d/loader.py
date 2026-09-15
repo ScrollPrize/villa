@@ -14,6 +14,7 @@ from .embedding import (EmbeddingConfig, EmbeddingGeometry, build_eligibility,
                         InvalidNormalSampleError)
 from .arc_sampling import FiberLocation, ScrollArcSampler
 from .training_spans import training_fiber_spans
+from .refinement import RefinementConfig, RefinementObservation, active_store, arclength, interpolate, export_metadata
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,8 @@ _FULL_VALID_MASK_CACHE: dict[tuple[int, ...], np.ndarray] = {}
 @dataclass(frozen=True)
 class FiberTrace3DConfig:
     datasets: tuple[dict[str, Any], ...]
+    refinement: RefinementConfig = field(default_factory=RefinementConfig)
+    refinement_split: str = "train"
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     batch_size: int = 1
     patch_shape_zyx: tuple[int, int, int] = (192, 192, 192)
@@ -213,6 +216,7 @@ class FiberTrace3DSample:
     target_tangent_zyx: torch.Tensor
     profile_timings_ms: dict[str, float] | None = None
     embedding_geometry: EmbeddingGeometry | None = None
+    refinement_geometry: RefinementObservation | None = None
 
 
 @dataclass(frozen=True)
@@ -427,6 +431,7 @@ class FiberTrace3DBatch:
     deferred_blur_kernels: tuple[_BlurKernels3D | None, ...] | None = None
     profile_timings_ms: dict[str, float] | None = None
     embedding_geometry: tuple[EmbeddingGeometry | None, ...] | None = None
+    refinement_geometry: tuple[RefinementObservation | None, ...] | None = None
 
     # Local effective-batch target counts, prepared before model forward.
     normalization_counts: torch.Tensor | None = None
@@ -438,6 +443,7 @@ class FiberTrace3DBatch:
         non_blocking: bool = False,
     ) -> "FiberTrace3DBatch":
         return FiberTrace3DBatch(
+            refinement_geometry=self.refinement_geometry,
             normalization_counts=None if self.normalization_counts is None else self.normalization_counts.to(device, non_blocking=non_blocking),
             embedding_geometry=None if self.embedding_geometry is None else tuple(
                 None if item is None else replace(item, eligible=item.eligible.to(device, non_blocking=non_blocking))
@@ -605,6 +611,7 @@ def collate_fiber_trace_3d_samples(
     if deferred_augmentation_params is not None and len(deferred_augmentation_params) != len(samples):
         raise ValueError("deferred augmentation-parameter count does not match sample count")
     return FiberTrace3DBatch(
+        refinement_geometry=tuple(sample.refinement_geometry for sample in samples),
         embedding_geometry=tuple(sample.embedding_geometry for sample in samples),
         volume=volume_batch,
         valid_mask=None,
@@ -773,6 +780,8 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
        datasets=tuple(dict(entry) for entry in datasets),
         sampling_strategy=str(raw.get("sampling_strategy", "control_points")),
         embedding=EmbeddingConfig.from_mapping(raw),
+        refinement=RefinementConfig.parse(raw),
+        refinement_split=raw.get("_refinement_split", "train"),
         batch_size=int(raw.get("batch_size", 1)),
         patch_shape_zyx=_as_zyx3(
             raw.get("patch_shape_zyx", raw.get("crop_size", [192, 192, 192])),
@@ -1065,7 +1074,13 @@ def _sample_control_1d(
     *,
     origin: float,
     spacing: float,
+    batch_index=None,
 ) -> torch.Tensor:
+    if isinstance(control, np.ndarray):
+        if batch_index is not None:
+            from scipy.ndimage import map_coordinates
+            return map_coordinates(control, np.stack((batch_index, (coord-origin)/spacing)), order=1, mode="nearest", prefilter=False)
+        return np.interp((coord - origin) / spacing, np.arange(len(control)), control)
     if control.ndim != 1:
         raise ValueError("1D smooth displacement control must be one-dimensional")
     if control.numel() == 1:
@@ -1087,7 +1102,14 @@ def _sample_control_2d(
     origin_b: float,
     spacing_a: float,
     spacing_b: float,
+    batch_index=None,
 ) -> torch.Tensor:
+    if isinstance(control, np.ndarray):
+        from scipy.ndimage import map_coordinates
+        coords = np.stack(((coord_a-origin_a)/spacing_a, (coord_b-origin_b)/spacing_b))
+        if batch_index is not None:
+            coords = np.concatenate((np.asarray(batch_index)[None], coords))
+        return map_coordinates(control.astype(np.float64, copy=False), coords, order=1, mode="nearest", prefilter=False)
     if control.ndim != 2:
         raise ValueError("2D smooth displacement control must be two-dimensional")
     height, width = int(control.shape[0]), int(control.shape[1])
@@ -1124,11 +1146,13 @@ def _smooth_forward_rel_zyx(
     rel_zyx: torch.Tensor,
     smooth: _SmoothDisplacement3DParams | None,
     controls: tuple[torch.Tensor, ...] | None = None,
+    batch_index=None,
 ) -> torch.Tensor:
     if smooth is None or smooth.mode == "none":
         return rel_zyx
-    tensors = _smooth_control_tensors(smooth, device=rel_zyx.device) if controls is None else controls
-    out = rel_zyx.clone()
+    array_backend = isinstance(rel_zyx, np.ndarray)
+    tensors = (smooth.controls if array_backend else _smooth_control_tensors(smooth, device=rel_zyx.device)) if controls is None else controls
+    out = rel_zyx.copy() if array_backend else rel_zyx.clone()
     origin = np.asarray(smooth.control_min_zyx, dtype=np.float64)
     spacing = np.asarray(smooth.control_spacing_zyx, dtype=np.float64)
     if smooth.mode == "1d":
@@ -1137,6 +1161,7 @@ def _smooth_forward_rel_zyx(
             out[..., 2],
             origin=float(origin[2]),
             spacing=float(spacing[2]),
+            batch_index=batch_index,
         )
     elif smooth.mode == "2d":
         out[..., 0] = out[..., 0] + _sample_control_2d(
@@ -1147,6 +1172,7 @@ def _smooth_forward_rel_zyx(
             origin_b=float(origin[2]),
             spacing_a=float(spacing[1]),
             spacing_b=float(spacing[2]),
+            batch_index=batch_index,
         )
     elif smooth.mode == "3d":
         out[..., 0] = out[..., 0] + _sample_control_2d(
@@ -1157,6 +1183,7 @@ def _smooth_forward_rel_zyx(
             origin_b=float(origin[2]),
             spacing_a=float(spacing[1]),
             spacing_b=float(spacing[2]),
+            batch_index=batch_index,
         )
         out[..., 1] = out[..., 1] + _sample_control_2d(
             tensors[1],
@@ -1166,6 +1193,7 @@ def _smooth_forward_rel_zyx(
             origin_b=float(origin[2]),
             spacing_a=float(spacing[0]),
             spacing_b=float(spacing[2]),
+            batch_index=batch_index,
         )
         out[..., 2] = out[..., 2] + _sample_control_2d(
             tensors[2],
@@ -1175,6 +1203,7 @@ def _smooth_forward_rel_zyx(
             origin_b=float(origin[1]),
             spacing_a=float(spacing[0]),
             spacing_b=float(spacing[1]),
+            batch_index=batch_index,
         )
     else:
         raise ValueError(f"unsupported smooth displacement mode {smooth.mode!r}")
@@ -2035,6 +2064,26 @@ class FiberTrace3DLoader:
         self._missing_normal_samples = 0
         self._replacement_pools = {}
         self.records = self._load_records()
+        self._refinement_store = None
+        if config.refinement.enabled:
+            if any(not d.get("lasagna_manifest_path") for d in config.datasets):
+                raise ValueError("refinement requires lasagna_manifest_path for every dataset")
+            if config.sampling_strategy != "scroll_balanced_arclength":
+                raise ValueError("refinement requires scroll_balanced_arclength and dense supervision")
+            self._refinement_store = active_store()
+            self._refinement_keys = []
+            for record in self.records:
+                key = hashlib.sha256(f"{config.refinement_split}:{record.volume_path}:{record.fiber_identity}".encode()).hexdigest()
+                self._refinement_keys.append(key)
+                self._refinement_store.register(key, record.fiber.line_points_zyx.astype(np.float64),
+                    {"source": str(record.fiber.path), "split": config.refinement_split,
+                     "scroll_id": record.dataset_config.get("scroll_id"),
+                     "base_volume_path": record.volume_path, "base_shape_zyx": record.base_shape_zyx,
+                     "source_identity": record.fiber_identity,
+                     "normal_manifest": str(_resolve_path(record.dataset_config["lasagna_manifest_path"], config.config_dir)),
+                     "control_span": record.fiber.metadata.get("training_control_span"),
+                     "export": export_metadata(record.fiber)}, config.refinement)
+            self._refinement_store.validate_split(self._refinement_keys, config.refinement_split)
         if config.sampling_strategy not in {"control_points", "scroll_balanced_arclength"}:
             raise ValueError("sampling_strategy must be control_points or scroll_balanced_arclength")
         for record in self.records:
@@ -2748,9 +2797,17 @@ class FiberTrace3DLoader:
         self,
         points_volume_zyx: np.ndarray,
         params: _Augment3DParams | _GeometryMaps3D,
+        *, array_backend: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         if isinstance(params, _GeometryMaps3D):
             params = params.params
+        if array_backend:
+            # Sparse refinement queries share the same ordered shear mapping;
+            # native SciPy interpolation avoids dozens of tiny Torch dispatches.
+            relative = np.asarray(points_volume_zyx, dtype=np.float64) - params.cp_volume_zyx
+            mapped = params.cp_local_zyx + _smooth_forward_rel_zyx(relative, params.smooth) @ params.source_to_output_zyx.T
+            valid = np.isfinite(mapped).all(axis=1) & (mapped >= 0).all(axis=1) & (mapped <= np.asarray(self.config.patch_shape_zyx)-1).all(axis=1)
+            return mapped, valid
         points_np = np.asarray(points_volume_zyx, dtype=np.float32)
         points = torch.as_tensor(
             points_np,
@@ -3053,10 +3110,8 @@ class FiberTrace3DLoader:
             self._target_tangent_output_zyx(record, cp_index, params),
         )
 
-    def _build_embedding_geometry(self, record, record_index, params, timings=None):
-        cfg = self.config.embedding
-        if not cfg.enabled:
-            return None
+    def _sample_native_normals(self, record, points, timings=None):
+        """Shared native validity/encoding-aware path for embedding and refinement."""
         from vc.volume import NormalSampler
         manifest = _resolve_path(record.dataset_config["lasagna_manifest_path"], self.config.config_dir)
         if manifest not in self._embedding_normal_records:
@@ -3067,23 +3122,26 @@ class FiberTrace3DLoader:
                 timings["embedding_normal_open_ms"] = (time.perf_counter()-opened)*1000
         sampler = self._embedding_normal_records[manifest]
 
-        def sample_normals(points):
-            # Native interface is base XYZ; loader geometry is base ZYX.
-            xyz = np.ascontiguousarray(points[:, ::-1], dtype=np.float32)
-            started = time.perf_counter()
-            normals, valid = sampler.sample(xyz, threads=1)
-            if timings is not None:
-                timings["embedding_normals_ms"] = timings.get("embedding_normals_ms", 0.) + (time.perf_counter()-started)*1000
-            if not valid.all():
-                raise InvalidNormalSampleError(
-                    f"embedding exclusion: invalid normal (including zero grad_mag) "
-                    f"manifest={manifest} invalid={np.count_nonzero(~valid)}/{len(valid)}")
-            return normals[:, ::-1]
+        xyz = np.ascontiguousarray(points[:, ::-1], dtype=np.float32)
+        started = time.perf_counter()
+        normals, valid = sampler.sample(xyz, threads=1)
+        if timings is not None:
+            timings["embedding_normals_ms"] = timings.get("embedding_normals_ms", 0.) + (time.perf_counter()-started)*1000
+        if not valid.all():
+            raise InvalidNormalSampleError(
+                f"invalid normal (including zero grad_mag) "
+                f"manifest={manifest} invalid={np.count_nonzero(~valid)}/{len(valid)}")
+        return normals[:, ::-1]
+
+    def _build_embedding_geometry(self, record, record_index, params, timings=None):
+        cfg = self.config.embedding
+        if not cfg.enabled:
+            return None
 
         eligible = build_eligibility(
             self.config.patch_shape_zyx, cfg.output_stride,
             lambda points: self._output_points_to_source_volume_np(points, params) * record.volume_spacing_base,
-            record.fiber.line_points_zyx, sample_normals, record.base_shape_zyx)
+            record.fiber.line_points_zyx, lambda points: self._sample_native_normals(record, points, timings), record.base_shape_zyx)
         return EmbeddingGeometry(eligible, _stable_seed(self.config.seed, params.stream_index, "embedding"),
                                  cfg.pairs(self.config.patch_shape_zyx), cfg.output_stride, cfg.weight,
                                  cfg.objective, cfg.negatives_per_anchor, cfg.temperature, cfg.margin)
@@ -3162,11 +3220,54 @@ class FiberTrace3DLoader:
         start = time.perf_counter()
         data_index = _bounded_data_sample_index(stream_index, sample_index_limit)
         record, record_index, cp_index = descriptor
+        refinement_current = None
+        if self._refinement_store is not None:
+            key = self._refinement_keys[record_index]
+            refinement_current = self._refinement_store.read(key)
+            reference_arc = arclength(record.fiber.line_points_zyx.astype(np.float64))
+            if isinstance(cp_index, FiberLocation):
+                location = reference_arc[cp_index.segment_index] + cp_index.fraction * (
+                    reference_arc[cp_index.segment_index + 1] - reference_arc[cp_index.segment_index])
+            else:
+                location = reference_arc[control_point_line_index(record.fiber, cp_index)]
+            segment = min(len(refinement_current) - 2, max(0, int(np.searchsorted(refinement_current[:, 3], location) - 1)))
+            fraction = (location - refinement_current[segment, 3]) / (refinement_current[segment+1, 3] - refinement_current[segment, 3])
+            point = (1-fraction)*refinement_current[segment, :3] + fraction*refinement_current[segment+1, :3]
+            cp_index = FiberLocation(segment, fraction, tuple(point[::-1]))
+            record = replace(record, fiber=replace(record.fiber,
+                line_points_xyz=refinement_current[:, :3][:, ::-1].astype(np.float32)))
         if timings is not None:
             timings["descriptor_ms"] = (time.perf_counter() - start) * 1000.0
         start = time.perf_counter()
         params = self._sample_augment_params(record, cp_index, augmentation_index,
             value_index=stream_index // 2 if self.config.embedding.paired_patches else None)
+        refinement_geometry = None
+        if refinement_current is not None:
+            patch_points, valid = self._source_points_to_output_np(
+                refinement_current[:, :3] / record.volume_spacing_base, params)
+            # Include one outside/context node on either side. Separate visits
+            # to a curved fiber may be disjoint; never span an outside gap.
+            near = np.flatnonzero(valid)
+            if len(near):
+                groups = np.split(near, np.flatnonzero(np.diff(near) > 1) + 1)
+                group = min(groups, key=lambda g: np.min(np.abs(g - cp_index.segment_index)))
+                section_start, section_stop = max(0, int(group[0])-1), min(len(refinement_current), int(group[-1])+2)
+                current = refinement_current[section_start:section_stop].copy()
+                if len(current) >= 3:
+                    baseline = self._refinement_store.baseline(key)
+                    ref = interpolate(baseline[:, :3], baseline[:, 3], current[:, 3])
+                    try:
+                        normals = self._sample_native_normals(record, ref, timings)
+                    except InvalidNormalSampleError:
+                        # Invalid support means no geometric evidence. Preserve
+                        # valid CT/GT training samples, without a fake normal.
+                        normals = None
+                    if normals is not None:
+                        lo = max(0, int(np.searchsorted(baseline[:, 3], current[0, 3])-1))
+                        hi = min(len(baseline), int(np.searchsorted(baseline[:, 3], current[-1, 3]))+2)
+                        refinement_geometry = RefinementObservation(key, section_start, current,
+                            baseline[lo:hi].copy(), normals, params, record.volume_spacing_base,
+                            self.config.patch_shape_zyx, self.config.refinement, self.config.embedding.output_stride)
         if timings is not None:
             timings["augment_params_ms"] = (time.perf_counter() - start) * 1000.0
         embedding_start = time.perf_counter()
@@ -3218,6 +3319,7 @@ class FiberTrace3DLoader:
             timings["raw_sample_cpu_ms"] = load_cpu_ms
         sample = FiberTrace3DSample(
             embedding_geometry=embedding_geometry,
+            refinement_geometry=refinement_geometry,
             stream_index=stream_index,
             data_index=int(data_index),
             record_index=int(record_index),
@@ -3717,6 +3819,8 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
        datasets=tuple(dict(entry) for entry in datasets),
         sampling_strategy=str(raw.get("sampling_strategy", "control_points")),
         embedding=EmbeddingConfig.from_mapping(raw),
+        refinement=RefinementConfig.parse(raw),
+        refinement_split=raw.get("_refinement_split", "train"),
         batch_size=int(raw.get("batch_size", 1)),
         patch_shape_zyx=_as_zyx3(raw.get("patch_shape_zyx", [192, 192, 192]), key="patch_shape_zyx"),
         seed=int(raw.get("seed", 1)),

@@ -1,4 +1,11 @@
 - [x] Branch from fiber-vischeck; carry contrastive restart changes.
 - [x] Archive both sets of prior planning notes.
 - [x] Validate and commit branch handoff.
-- [ ] Define training-time GT refinement requirements and detailed plan.
+- [x] Define training-time GT refinement requirements and independently review plan.
+- [x] Implement opt-in solver, native-normal queue integration and persistent geometry.
+- [x] Implement train/test feedback and snapshot/restore lifecycle.
+- [x] CPU and manager-gated CUDA regression tests and bounded solver timing.
+- [x] Document settings, changed test-target semantics and limitations.
+- [x] Final independent implementation review; conditioned legacy-config guard fixed.
+- [x] User-approved continuation config and launch reviewed; managed startup launched
+  from raw update 11800 with LR0.01 and existing EMA/optimizer state.

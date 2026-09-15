@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +96,15 @@ def _points(raw: Any, *, label: str) -> tuple[tuple[float, float, float], ...]:
             _number(value, label=f"{label}[{index}]") for value in point
         ))
     return tuple(result)
+
+
+def serialize_segment_metadata(segment: FiberTraceSegmentMetadata) -> dict[str, Any]:
+    """Inverse of the canonical V3 parser; derived outcome is not serialized."""
+    result = asdict(segment)
+    result.pop("outcome")
+    result.update(optimizer="native_fiber_trace3d", metadata_version=3, tracer_version=2)
+    parse_segment_metadata(result)
+    return result
 
 
 def parse_segment_metadata(raw: Any) -> FiberTraceSegmentMetadata:

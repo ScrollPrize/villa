@@ -122,7 +122,7 @@ def test_parse_vc3d_fiber_validates_and_preserves_xyz_order():
         )
 
 
-def test_parse_vc3d_fiber_v3_segment_metadata():
+def test_parse_vc3d_fiber_v3_segment_metadata(tmp_path):
     segment = {
         "optimizer": "native_fiber_trace3d",
         "metadata_version": 3,
@@ -180,6 +180,18 @@ def test_parse_vc3d_fiber_v3_segment_metadata():
     assert fiber.control_point_segments[0].meeting_error_base_voxels == 2.5
     assert fiber.control_point_segments[0].meeting_error_ratio == 1.25
     assert fiber.control_point_segments[1] is None
+    from vc3d_fiber_format import serialize_segment_metadata
+    assert serialize_segment_metadata(fiber.control_point_segments[0]) == segment
+    from vesuvius.neural_tracing.fiber_trace_3d.refinement import GeometryStore, RefinementConfig, export_metadata
+    import zipfile
+    store = GeometryStore(tmp_path / "geometry")
+    key = "a" * 64
+    store.register(key, fiber.line_points_zyx, {"export": export_metadata(fiber)}, RefinementConfig())
+    store.save(tmp_path / "fibers.zip")
+    with zipfile.ZipFile(tmp_path / "fibers.zip") as archive:
+        roundtrip = parse_vc3d_fiber(json.loads(archive.read(key + "/fiber.json")))
+    assert roundtrip.control_point_segments == fiber.control_point_segments
+    np.testing.assert_allclose(roundtrip.control_points_xyz, fiber.control_points_xyz)
 
     invalid = {
         "type": "vc3d_fiber",

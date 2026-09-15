@@ -36,6 +36,8 @@ CPU_TESTS = [
     "tests/neural_tracing/test_cooperative_reference.py",
 ]
 SUITES = {
+    "refinement": ["tests/neural_tracing/test_refinement.py", "tests/neural_tracing/test_fiber_trace.py::test_parse_vc3d_fiber_v3_segment_metadata", "-s"],
+    "cuda-refinement": ["tests/neural_tracing/test_refinement.py", "-k", "cuda", "-s"],
     "demand-gpu-cpu": ["tests/neural_tracing/test_demand_gpu.py", "../lasagna/tests/test_demand_predict3d.py", "../gpu_manager/tests/test_supervisor.py"],
     "demand-gpu-live": ["tests/neural_tracing/test_demand_gpu.py", "-k", "live_manager", "-s"],
     "paired": ["tests/neural_tracing/test_paired_embeddings.py", "tests/neural_tracing/test_local_competition.py", "tests/neural_tracing/test_fiber_embeddings.py", "tests/neural_tracing/test_cooperative_resources.py", "tests/neural_tracing/test_startup_calibration.py", "tests/neural_tracing/test_cooperative_setup.py", "tests/neural_tracing/test_sample_broker.py"],
@@ -125,7 +127,7 @@ def main():
         if control.get("native_build", False):
             env["FIBER_COOPERATIVE_NATIVE_BUILD"] = str(ROOT / 'volume-cartographer/build/dev-quickbuild-gcc/python')
             env["PYTHONPATH"] = f"{ROOT / 'vesuvius/scripts/cooperative_test_support'}:" + env["PYTHONPATH"]
-        if suite in ("cuda-amp", "cuda-arc", "cuda-ema"):
+        if suite in ("cuda-amp", "cuda-arc", "cuda-ema", "cuda-refinement"):
             env.update(CUDA_VISIBLE_DEVICES=devices[0], FIBER_COOPERATIVE_CUDA_TEST="1")
         elif suite in ("cuda-cohort", "cuda-reference"):
             env["FIBER_COOPERATIVE_TEST_GPUS"] = ",".join(devices)
@@ -173,7 +175,7 @@ def main():
         monitor = None
         peaks = {}
         if suite.startswith("cuda-"):
-            selected = devices[:1] if suite in ("cuda-amp", "cuda-arc", "cuda-ema") else devices
+            selected = devices[:1] if suite in ("cuda-amp", "cuda-arc", "cuda-ema", "cuda-refinement") else devices
             uuids = subprocess.check_output(["nvidia-smi", f"--id={','.join(selected)}",
                 "--query-gpu=uuid", "--format=csv,noheader"], text=True, timeout=10).splitlines()
             peaks = {uuid.strip(): 0 for uuid in uuids}
@@ -193,7 +195,7 @@ def main():
                 invocation_started += time.monotonic() - wait_started
                 started = time.monotonic()
                 env["FIBER_COOPERATIVE_TEST_GPUS"] = ",".join(peaks)
-                if suite in ("cuda-amp", "cuda-arc", "cuda-ema"):
+                if suite in ("cuda-amp", "cuda-arc", "cuda-ema", "cuda-refinement"):
                     env["CUDA_VISIBLE_DEVICES"] = next(iter(peaks))
                 elif suite == "cuda-embedding":
                     env["CUDA_VISIBLE_DEVICES"] = ",".join(peaks)
