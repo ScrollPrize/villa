@@ -23,7 +23,8 @@ import flow_triton
 from checkpoint_migrations import (merge_flow_stage_lattices,
                                    merge_flow_stage_state)
 from config import RETIRED_CONFIG_KEYS, Config, durable_config
-from flow_fields import CartesianFlowField, CylindricalFlowField
+from flow_fields import (BSplineCylindricalFlowField, BSplineFlowField,
+                         CartesianFlowField, CylindricalFlowField)
 from transforms import SpiralAndTransform
 import update_checkpoint
 
@@ -39,8 +40,12 @@ def _make_field(kind, num_stages, device='cpu', seed=7, **kwargs):
             torch.tensor([12, 16, 16]), spatial_scale_factor=4,
             num_stages=num_stages, **kwargs)
     else:
-        field = CylindricalFlowField(
-            (12, 16, 16), spatial_scale_factor=4, num_stages=num_stages)
+        cls = {
+            'cylindrical': CylindricalFlowField,
+            'bspline': BSplineFlowField,
+            'bspline_cylindrical': BSplineCylindricalFlowField,
+        }[kind]
+        field = cls((12, 16, 16), spatial_scale_factor=4, num_stages=num_stages)
     field = field.to(device)
     with torch.no_grad():
         field.flows[0].uniform_(-0.03, 0.03)
@@ -65,7 +70,8 @@ def _points(n, device='cpu', seed=41):
     return torch.rand(n, 3, generator=generator, device=device) * 1.2 - 0.1
 
 
-@pytest.mark.parametrize('kind', ['cartesian', 'cylindrical'])
+@pytest.mark.parametrize(
+    'kind', ['cartesian', 'cylindrical', 'bspline', 'bspline_cylindrical'])
 @pytest.mark.parametrize('reverse', [False, True])
 def test_slab_walk_equals_composition_of_single_stage_fields(kind, reverse):
     merged = _make_field(kind, 3)
@@ -179,7 +185,8 @@ def _eager_reference(field, points, h, n_steps, reverse, monkeypatch):
 
 
 @cuda
-@pytest.mark.parametrize('kind', ['cartesian', 'cylindrical'])
+@pytest.mark.parametrize(
+    'kind', ['cartesian', 'cylindrical', 'bspline', 'bspline_cylindrical'])
 @pytest.mark.parametrize('reverse', [False, True])
 @pytest.mark.parametrize('coalesce', ['0', '1'])
 def test_fused_multi_slab_matches_eager(monkeypatch, kind, reverse, coalesce):

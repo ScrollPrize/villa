@@ -11,7 +11,12 @@ from einops import rearrange
 import flow_grad_smoothing
 import gap_triton
 import sample_spiral
-from flow_fields import CartesianFlowField, CylindricalFlowField
+from flow_fields import (
+    BSplineCylindricalFlowField,
+    BSplineFlowField,
+    CartesianFlowField,
+    CylindricalFlowField,
+)
 from gap_parameterization import (
     calibrated_gap_softplus_scale,
     initial_dr_logit,
@@ -487,7 +492,12 @@ class SpiralAndTransform(nn.Module):
             float(config['model_initial_dr_per_winding']), self.gap_min_gap))
 
         flow_resolution = (flow_max_corner_zyx - flow_min_corner_zyx) // config['model_flow_voxel_resolution']
-        flow_field_cls = CylindricalFlowField if config['model_flow_field_type'] == 'cylindrical' else CartesianFlowField
+        flow_field_cls = {
+            'cartesian': CartesianFlowField,
+            'cylindrical': CylindricalFlowField,
+            'bspline': BSplineFlowField,
+            'bspline_cylindrical': BSplineCylindricalFlowField,
+        }[config['model_flow_field_type']]
 
         # num_flow_stages: number of stationary velocity fields whose integrated diffeomorphisms
         # are composed sequentially (phi = exp(v_N) o ... o exp(v_1) in the spiral->slice
