@@ -186,7 +186,7 @@ def prepare(workload, *, pilot_only=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["freeze-snapshot", "prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "cached-full", "report-metrics", "profile", "observe", "report-progress", "reference-plan"])
+    parser.add_argument("mode", choices=["integration-report", "integration-fit", "integration-audit", "fixed-path-report", "fixed-path-extract", "fixed-path-fit", "freeze-snapshot", "prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "cached-full", "report-metrics", "profile", "observe", "report-progress", "reference-plan"])
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--devices", help="runtime device selection (default from workload)")
     parser.add_argument("--manager-socket")
@@ -196,6 +196,18 @@ def main():
     parser.add_argument("--seconds", type=float, default=20, help="read-only observe duration,1–60s")
     args = parser.parse_args()
     workload = load_workload(args.config)
+    if args.mode == "integration-report":
+        from vesuvius.neural_tracing.fiber_trace_3d.embedding_integration_report import report
+        report(workload['fixed_path'])
+        return 0
+    if args.mode == "fixed-path-report":
+        from vesuvius.neural_tracing.fiber_trace_3d.embedding_fixed_path import report
+        report(workload['fixed_path'])
+        return 0
+    if args.mode == "fixed-path-extract":
+        from vesuvius.neural_tracing.fiber_trace_3d.embedding_fixed_path import extract
+        extract(workload['fixed_path'])
+        return 0
     if args.mode == "freeze-snapshot":
         from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import freeze_checkpoint
         from lasagna.inference_provenance import atomic_write
@@ -240,13 +252,21 @@ def main():
         return 0
     devices = args.devices or (workload["pilot_devices"] if args.mode == "pilot" else workload["devices"])
     manager = workload["evaluation"].get("gpu_manager", {})
-    if args.mode in ("pilot", "full", "profile") and not args.unmanaged and (
+    if args.mode in ("pilot", "full", "profile", "fixed-path-fit", "integration-fit", "integration-audit") and not args.unmanaged and (
             manager.get("enabled", False) or args.manager_socket is not None):
         from vesuvius.neural_tracing.fiber_trace_3d.managed_evaluation import launch_managed
         return launch_managed([sys.executable, str(Path(__file__).resolve()), args.mode,
                                "--config", str(args.config.resolve())],
                               devices=devices, settings=manager, socket=args.manager_socket,
                               priority=args.manager_priority)
+    if args.mode in ('integration-fit','integration-audit'):
+        from vesuvius.neural_tracing.fiber_trace_3d.embedding_integration import calibrate, audit
+        (calibrate if args.mode=='integration-fit' else audit)(workload['fixed_path'])
+        return 0
+    if args.mode == "fixed-path-fit":
+        from vesuvius.neural_tracing.fiber_trace_3d.embedding_fixed_path import fit
+        fit(workload['fixed_path'])
+        return 0
     if args.mode == "profile":
         if workload.get("profile", {}).get("kind") == "cached-trace":
             for source in workload["sources"]:

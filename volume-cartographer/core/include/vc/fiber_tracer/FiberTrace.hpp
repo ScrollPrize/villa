@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc/fiber_tracer/FiberReplayMetric.hpp"
+#include "vc/fiber_tracer/FiberEmbedding.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
@@ -91,6 +92,9 @@ struct FiberTraceProfile {
 
 struct FiberTraceConfig {
     double embeddingWeight = 0.0;
+    // Opt-in calibrated mapping. Zero temperature preserves the linear cost.
+    double embeddingDistanceThreshold = 0.0;
+    double embeddingDistanceTemperature = 0.0;
     double embeddingHistorySpacingBaseVoxels = 32.0;
     double embeddingHistoryWindowBaseVoxels = 256.0;
     int embeddingHistoryCount = 8;
@@ -98,6 +102,7 @@ struct FiberTraceConfig {
     std::string embeddingReferenceMode = "mean";
     double embeddingEmaHalfLifeBaseVoxels = 512;
     double embeddingEmaDelayBaseVoxels = 0;
+    FiberEmbeddingIntegrationConfig embeddingIntegration;
     int embeddingAnchorCount = 4;
     double embeddingAnchorEmaMix = 0.5;
     std::string embeddingAnchorAggregation = "best";
@@ -321,6 +326,16 @@ public:
     }
     [[nodiscard]] virtual FiberPredictionSample sample(const cv::Vec3d& volumePoint, const cv::Vec3d& referenceDirection) const = 0;
 };
+
+struct FiberFixedPathSample {
+    std::vector<float> embedding;
+    double distanceBase, baseCost, totalCost, predictionAngleDegrees;
+    double presence = 0;
+};
+// Read-only fixed-route surrogate; no beam search or ground-truth selection.
+std::vector<FiberFixedPathSample> scoreFiberFixedPath(
+    const FiberPredictionSource&, const std::vector<cv::Vec3d>& points,
+    const FiberTraceConfig&, const vc::lasagna::NormalSampler*);
 
 struct FiberPredictionChunkDependency {
     std::filesystem::path arrayPath;

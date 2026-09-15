@@ -1,3 +1,78 @@
+## 2026-09-15 — Shareable embedding research summary
+
+- Added docs/embedding_experiments_summary_20260915.md covering recorded3D
+  training objectives, diagnostics, policy sweeps, legacy/current full evaluations,
+  mixed-model inference and differentiable calibration/integration. Includes
+  run/artifact/checkpoint references, protocol boundaries and practical conclusion.
+- Validated links/artifact locations and matched saved metrics; independent review
+  passed. Documentation only; no new model/evaluation runs or default changes.
+
+## 2026-09-15 — Causal embedding integration matrix
+
+- Added opt-in physical update cadence, finite observation windows, learned
+  presence/disagreement gate, angular update cap and continuous dual EMA.
+  Native default unchanged; no anchors. Shared EMA/history and fitting helpers.
+- GPU fit45candidates,150steps each; same148windows and30/9/11fiber grouping,
+  shared warm-up extended4096without changing scored branch data. Native/Torch
+  parity270real paths max2.129504e-7;107native/231Python tests passed,8skips.
+- Five full50fiber/180direction finalist evaluations completed:cadencedEMA117,
+  window111,gate110,angular115,dual113restarts versus previous fittedEMA110,
+  originalEMA111,embeddingsoff113,Classic292. No new overall improvement.
+  Gate trades fewer Paris4 errors for more0139/1299 errors; no default promoted.
+- Full matrix, per-scroll/global/split metrics, settings, commands and provenance:
+  docs/benchmarks/embedding_integration_20260915.{md,json}.
+  Usage/math:docs/embedding_integration.md. Approved build/evaluation runners reused.
+
+## 2026-09-15 — Fixed-path differentiable EMA calibration
+
+- Added opt-in native fixed-path scoring/export using shared tracer helpers,
+  cached-only extraction and GPU PyTorch parameter fitting with whole-fiber
+  fit/selection/heldout grouping. Optional zero-anchored smooth distance mapping;
+  linear production defaults unchanged. Approved evaluation runner reused.
+- u11800 presence/direction + u42000 embeddings: fitted linear weight0.0454013,
+  half-life510.432 gives110full-cohort restarts versus111old EMA/113embedding-off.
+  Smooth fit gives117; no default promoted. Heldout20linear/24smooth versus
+  21old EMA/18embedding-off. Small/mixed gain, not a significance claim.
+-103native and219Python tests passed,8optional skips; both50fiber/180direction
+  real evaluations and separate512voxel-window parameter check completed.
+  Full data/limitations/commands: docs/benchmarks/fixed_path_ema_calibration_20260915.{md,json}.
+  Usage: docs/fixed_path_embedding_calibration.md.
+
+## 2026-09-15 — u11800 failure-density inspection ranking
+
+- Saved all 50 original fibers ranked by counted restarts per combined directed
+  eligible reference mm in docs/benchmarks/eligible_ema999_final_u11800_fibers_by_failure_density_20260915.md.
+  Includes per-case counts, forward/reverse IDs, annotation/trace/image links,
+  one-way and directed lengths, and the existing mean convention. Verified
+  per-case counts and lengths against per-fiber totals (113 restarts, 180 cases).
+  Uses saved results only; no evaluation or rendering rerun. This delivers the
+  requested inspection file before the newly authorized fixed-path differentiable
+  EMA scoring experiment; that experiment has not started yet.
+
+## 2026-09-15 — Corrected EMA-only matrix
+
+- Corrected the earlier anchor-policy interpretation: plain EMA-only winner
+  (weight0.25, half-life512basevoxels, no anchors) evaluated on all50fibers
+  for paired best/current and u11800 predictions with each embedding model.
+  Restarts respectively133/211/123/111. All180directions complete per run,
+  original caches reused and model-role identities verified.
+- u11800 + current paired embeddings gives111restarts/61.318mm versus
+  u11800 alone113/60.242mm;0139/Paris4 improve slightly,1299 worsens.
+  Full13-model comparison including all earlier baselines and explicit
+  Anchor-LRU labels: docs/benchmarks/ema_only_matrix_20260915.{md,json}.
+
+## 2026-09-15 — Paired EMA999 matrix and mixed inference
+
+- Completed four paired EMA999 anchor comparisons: current u42000 off/Anchor-LRU
+  205/208 restarts (33.338/32.859mm); best u10800 off/Anchor-LRU 135/139
+  (50.497/49.054mm). Prior non-embedding u11800 remains best combined
+  at113/60.242mm. Full nine-model per-scroll table and provenance:
+  docs/benchmarks/paired_ema999_complete_20260915.{md,json}.
+- Added optional mixed-model live inference: primary presence/nx/ny with
+  alternate embeddings, original-cache composite manifests, per-array demand
+  routing and model-specific pools within one manager grant. Publication and
+  native scoring unchanged. Usage/limits in docs/mixed_inference.md.
+
 ## 2026-09-14 — Evaluation-ablation merge and final EMA999
 
 - Merged evaluation-ablations into fiber-vischeck at afb14b400 preserving both feature sets, our four active task docs and combined changelog. Parameter-based cache extension replaces obsolete implementation-hash gates; native heartbeat stops after process exit. Validated102native cases and206Python tests (8skipped).

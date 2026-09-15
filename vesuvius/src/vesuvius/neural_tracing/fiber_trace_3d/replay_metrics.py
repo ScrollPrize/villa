@@ -103,6 +103,18 @@ def complete_report(summary: dict, *, episode_distance: float = RESTART_EPISODE_
                 collections={k: aggregate(v) for k, v in collections.items()})
 
 
+def split_report(summary: dict, fiber_splits: dict) -> dict:
+    """Apply the same complete episode metrics to predefined whole-fiber groups."""
+    groups = defaultdict(list)
+    for source in summary['sources']:
+        for case in source['cases']:
+            fiber = source['backend_config']['fibers'][case['source_index']]
+            split = fiber_splits[fiber]['split']
+            groups[split].append(reference_segments(case, source['summary']['base_voxel_size_um']/1000))
+    return {key: segment_statistics([value for row in rows for value in row], len(rows))
+            for key, rows in groups.items()}
+
+
 def correct_summary(summary: dict) -> dict:
     """Return corrected metadata; input cases and raw failure data stay intact."""
     report = complete_report(summary)

@@ -3,16 +3,27 @@
 #include <cmath>
 #include <stdexcept>
 #include <string_view>
+#include <string>
 #include <vector>
 #include <utility>
 #include <limits>
 
 namespace vc::fiber_tracer {
+inline double fiberEmbeddingDistancePenalty(double distance, double threshold, double temperature)
+{
+    if (temperature == 0) return distance;
+    const auto softplus = [](double x) { return std::max(x, 0.0) + std::log1p(std::exp(-std::abs(x))); };
+    // Anchored at zero: no per-step constant can bias paths of different lengths.
+    return temperature * (softplus((distance-threshold)/temperature) - softplus(-threshold/temperature));
+}
+
 struct FiberEmbeddingReference {
     double arcBase;
     std::vector<float> vector;
 };
 using FiberEmbeddingHistory = std::vector<FiberEmbeddingReference>;
+inline double fiberEmbeddingCost(const std::vector<float>&, const FiberEmbeddingHistory&, double, double, std::string_view, bool);
+inline void advanceFiberEmbeddingHistory(FiberEmbeddingHistory&, const std::vector<float>&, double, double, double, size_t);
 
 inline double fiberEmbeddingCosine(const std::vector<float>& a, const std::vector<float>& b)
 {
@@ -24,7 +35,35 @@ inline double fiberEmbeddingCosine(const std::vector<float>& a, const std::vecto
 
 struct FiberEmbeddingMemory {
     std::vector<float> ema, seed;
+    // Allocated only by opt-in integration experiments.
+    std::vector<float> secondary;
+    FiberEmbeddingHistory integrationHistory;
+    double integrationArc = 0, integrationElapsed = 0;
 };
+
+struct FiberEmbeddingIntegrationConfig {
+    std::string kind = "ema";
+    double spacing = 0;
+    double gateBias = 3, gatePresence = 2, gateDistance = 2;
+    double capDegrees = 10;
+    double longHalfLife = 1024, mixBias = 0, mixSlope = 2;
+    double window = 512;
+    bool active() const { return kind != "ema" || spacing != 0; }
+};
+
+inline void blendFiberEmbeddingVector(std::vector<float>& reference,
+    const std::vector<float>& vector, double decay)
+{
+    double norm2 = 0;
+    std::vector<float> mixed(vector.size());
+    for (size_t i = 0; i < vector.size(); ++i) {
+        mixed[i] = static_cast<float>(decay * reference[i] + (1-decay) * vector[i]);
+        norm2 += double(mixed[i]) * mixed[i];
+    }
+    if (norm2 == 0) return;
+    for (auto& v : mixed) v = static_cast<float>(v / std::sqrt(norm2));
+    reference = std::move(mixed);
+}
 
 inline void advanceFiberEmbeddingMemory(FiberEmbeddingMemory& state, const std::vector<float>& vector,
     double distance, double halfLife, double presence, bool gated)
@@ -37,16 +76,76 @@ inline void advanceFiberEmbeddingMemory(FiberEmbeddingMemory& state, const std::
     const double cosine = fiberEmbeddingCosine(vector, state.ema);
     if (gated && (presence < .5 || cosine < .5)) return;
     const double decay = std::exp2(-distance / halfLife);
-    double norm2 = 0;
-    std::vector<float> mixed(vector.size());
-    for (size_t i = 0; i < vector.size(); ++i) {
-        mixed[i] = static_cast<float>(decay * state.ema[i] + (1-decay) * vector[i]);
-        norm2 += double(mixed[i]) * mixed[i];
-    }
     // Exact cancellation retains the previous valid reference, never a zero vector.
-    if (norm2 == 0) return;
-    for (auto& v : mixed) v = static_cast<float>(v / std::sqrt(norm2));
-    state.ema = std::move(mixed);
+    blendFiberEmbeddingVector(state.ema, vector, decay);
+}
+
+inline double fiberEmbeddingSigmoid(double x)
+{
+    return x >= 0 ? 1/(1+std::exp(-x)) : std::exp(x)/(1+std::exp(x));
+}
+
+inline double integratedFiberEmbeddingCost(const std::vector<float>& vector,
+    const FiberEmbeddingMemory& state, double candidateDistance,
+    const FiberEmbeddingIntegrationConfig& config)
+{
+    const double fast = 1-fiberEmbeddingCosine(vector,state.ema);
+    if (config.kind == "dual") {
+        const double slow = state.secondary.empty() ? fast : 1-fiberEmbeddingCosine(vector,state.secondary);
+        const double mix = fiberEmbeddingSigmoid(config.mixBias+config.mixSlope*(slow-fast));
+        return mix*fast+(1-mix)*slow;
+    }
+    if (config.kind == "window") {
+        const double arc = state.integrationArc+candidateDistance;
+        if (state.integrationHistory.empty()) return arc <= config.window ? 1-fiberEmbeddingCosine(vector,state.seed) : 0;
+        return fiberEmbeddingCost(vector,state.integrationHistory,arc,config.window,"uniform",false);
+    }
+    return fast;
+}
+
+inline void advanceIntegratedFiberEmbedding(FiberEmbeddingMemory& state,
+    const std::vector<float>& vector, double distance, double halfLife, double presence,
+    const FiberEmbeddingIntegrationConfig& config)
+{
+    if (config.kind == "window" && state.integrationHistory.empty() && state.integrationArc == 0)
+        state.integrationHistory.push_back({0,state.seed});
+    state.integrationArc += distance;
+    state.integrationElapsed += distance;
+    // Admission uses accumulated actual distance. No tolerance or step-count
+    // approximation; exporter records these same distances for fitting parity.
+    if (state.integrationElapsed < config.spacing) return;
+    const double elapsed = std::exchange(state.integrationElapsed,0.0);
+    const double decay = std::exp2(-elapsed/halfLife);
+    if (config.kind == "window") {
+        advanceFiberEmbeddingHistory(state.integrationHistory,vector,state.integrationArc,0,config.window,4096);
+        return;
+    }
+    if (config.kind == "dual") {
+        if (state.secondary.empty()) state.secondary = state.ema;
+        blendFiberEmbeddingVector(state.secondary,vector,std::exp2(-elapsed/config.longHalfLife));
+    }
+    if (config.kind == "gate") {
+        const double disagreement = 1-fiberEmbeddingCosine(vector,state.ema);
+        const double gate = fiberEmbeddingSigmoid(config.gateBias+config.gatePresence*(presence-.5)-config.gateDistance*disagreement);
+        blendFiberEmbeddingVector(state.ema,vector,1-(1-decay)*gate);
+    } else if (config.kind == "angular") {
+        auto proposed = state.ema;
+        blendFiberEmbeddingVector(proposed,vector,decay);
+        const double cosine = fiberEmbeddingCosine(proposed,state.ema);
+        // An exactly antipodal update has no unique rotation plane, even if
+        // the configured cap exceeds pi. Match the differentiable replay.
+        if (cosine <= -1) return;
+        const double angle = std::acos(cosine);
+        const double limit = config.capDegrees * (3.14159265358979323846/180) * elapsed/8;
+        if (angle <= limit) { state.ema = std::move(proposed); return; }
+        // Undefined antipodal plane retains the previous reference.
+        if (std::sin(angle) <= 1e-8) return;
+        const double a = std::sin(angle-limit)/std::sin(angle), b = std::sin(limit)/std::sin(angle);
+        std::vector<float> capped(vector.size());
+        double norm2 = 0;
+        for (size_t i=0;i<capped.size();++i) { capped[i]=a*state.ema[i]+b*proposed[i]; norm2+=double(capped[i])*capped[i]; }
+        if (norm2 > 0) { for(auto& x:capped)x=static_cast<float>(x/std::sqrt(norm2)); state.ema=std::move(capped); }
+    } else blendFiberEmbeddingVector(state.ema,vector,decay);
 }
 
 inline double fiberEmbeddingMemoryCost(const std::vector<float>& vector,

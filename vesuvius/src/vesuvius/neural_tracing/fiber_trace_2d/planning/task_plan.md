@@ -1,14 +1,13 @@
 # Plan
 
-1. Archive prior evaluation log; clone its config changing only output root,render=true,manager label. Keep exact frozen SHA and namespace/parameters. No new training snapshot.
-2. Independent review. Reuse tested workspace renderer and approved runner prepare/validate-full/full, all8GPUs manager-exclusive priority100 for missing visual-support inference; existing chunks reused.
-3. Continue until180directed galleries complete. Validate identical trace JSON/metrics versus nonvisual run, shared top/side component bounds and section centers; inspect representative image. Save full per-fiber index and output links.
+1. Read original embedding training, diagnostic, policy-sweep and full-evaluation reports; identify model snapshots and protocol boundaries. Archive previous task log.
+2. Independent plan review against task/specs/plan. Write a self-contained narrative summary with training/evaluation run index, experimental-family coverage, matched result tables and interpretation. Separate single-fiber tuning, legacy full-cohort protocol and current eligible full-cohort protocol. Clarify model EMA vs tracer EMA and Anchor-LRU vs plain EMA.
+3. Validate numbers against saved reports/JSON, check referenced file paths, independent final review. No expensive reruns. Update status/log/changelog.
 
 ## Spec update
-None: retain aligned CT/presence top/side strips,2basevoxels/pixel,actual restart endpoint sections,40/80ellipse and current eligibility/restart metrics.
+
+None: documentation-only; no model, metric or tracer behavior changes.
 
 ## Docs updates
-New visualization benchmark record, current log/status and changelog. Archive prior active log.
 
-## Validation
-Config equality except output/render/job label; source bindings and frozen SHA validation;180galleries,alltrace/metric parity and actual image inspection. No code changes or rebuild needed.
+Add docs/embedding_experiments_summary_20260915.md with linked detailed evidence, frozen runs and limitations. Preserve old detailed reports. Record missing/unverified evidence explicitly rather than infer outcomes.

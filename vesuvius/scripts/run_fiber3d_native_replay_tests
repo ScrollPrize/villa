@@ -48,10 +48,12 @@ if [[ "$suite" == inspection ]]; then
         lasagna/tests/test_demand_predict3d.py \
         vesuvius/tests/neural_tracing/test_inference_cache_identity.py \
         vesuvius/tests/neural_tracing/test_live_inference_cache_namespace.py \
+        vesuvius/tests/neural_tracing/test_mixed_inference.py \
         vesuvius/tests/scripts/test_classic_fiber_evaluation.py \
         vesuvius/tests/neural_tracing/test_demand_gpu.py \
         vesuvius/tests/neural_tracing/test_training_spans.py \
         vesuvius/tests/neural_tracing/test_embedding_tracer.py \
+        vesuvius/tests/neural_tracing/test_embedding_fixed_path.py \
         vesuvius/tests/neural_tracing/test_fiber_embeddings.py
 fi
 if [[ "$suite" != full ]]; then

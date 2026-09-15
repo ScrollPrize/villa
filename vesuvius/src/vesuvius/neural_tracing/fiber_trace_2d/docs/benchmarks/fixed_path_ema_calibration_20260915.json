@@ -1,0 +1,2013 @@
+{
+  "branch_distance_base": {
+    "bad": {
+      "max": 256.0020456314087,
+      "median": 255.99989891052246,
+      "min": 255.99629640579224
+    },
+    "good": {
+      "max": 255.99918127059937,
+      "median": 255.97105479240417,
+      "min": 255.63870334625244
+    }
+  },
+  "exclusions": {
+    "connector_curvature": 28,
+    "no_shared_near_reference_start": 22,
+    "outside_prediction_cone": 34,
+    "reference_end": 4,
+    "short_segment": 55
+  },
+  "fit": {
+    "baseline": {
+      "fit": {
+        "failure_windows": 12,
+        "gt_preferred_percent": 16.666667938232422,
+        "mean_gap": 0.17306900024414062,
+        "ranking_loss": 3.911473035812378,
+        "short_two_step_gt_preferred_percent": 25,
+        "windows": 76
+      },
+      "selection": {
+        "failure_windows": 6,
+        "gt_preferred_percent": 0,
+        "mean_gap": 0.2365894913673401,
+        "ranking_loss": 4.3002238273620605,
+        "short_two_step_gt_preferred_percent": 16.666667938232422,
+        "windows": 38
+      },
+      "test": {
+        "failure_windows": 11,
+        "gt_preferred_percent": 0,
+        "mean_gap": 0.2467210590839386,
+        "ranking_loss": 5.8709869384765625,
+        "short_two_step_gt_preferred_percent": 18.18181800842285,
+        "windows": 34
+      }
+    },
+    "dataset_sha256": "f3431ab82b30122afdecd4eb643fbcf87b290c6e94a61f5e7d44e202a2dba254",
+    "fits": [
+      {
+        "best": {
+          "iteration": 242,
+          "parameters": [
+            0.045401282608509064,
+            510.43218994140625,
+            0.05000000074505806,
+            0.09999999403953552
+          ],
+          "selection_loss": 4.241023063659668
+        },
+        "history": [
+          {
+            "fit_loss": 3.911473035812378,
+            "iteration": 0,
+            "parameters": [
+              0.2499999850988388,
+              512,
+              0.05000000074505806,
+              0.09999999403953552
+            ],
+            "selection_loss": 4.3002238273620605
+          },
+          {
+            "fit_loss": 3.865875482559204,
+            "iteration": 25,
+            "parameters": [
+              0.13204461336135864,
+              508.75799560546875,
+              0.05000000074505806,
+              0.09999999403953552
+            ],
+            "selection_loss": 4.2658257484436035
+          },
+          {
+            "fit_loss": 3.846665620803833,
+            "iteration": 50,
+            "parameters": [
+              0.08153911679983139,
+              509.62200927734375,
+              0.05000000074505806,
+              0.09999999403953552
+            ],
+            "selection_loss": 4.251319408416748
+          },
+          {
+            "fit_loss": 3.8389034271240234,
+            "iteration": 75,
+            "parameters": [
+              0.060987964272499084,
+              509.8182678222656,
+              0.05000000074505806,
+              0.09999999403953552
+            ],
+            "selection_loss": 4.245455741882324
+          },
+          {
+            "fit_loss": 3.8355512619018555,
+            "iteration": 100,
+            "parameters": [
+              0.05208732187747955,
+              510.232421875,
+              0.05000000074505806,
+              0.09999999403953552
+            ],
+            "selection_loss": 4.242922782897949
+          },
+          {
+            "fit_loss": 3.834055185317993,
+            "iteration": 125,
+            "parameters": [
+              0.04810827225446701,
+              510.3507385253906,
+              0.05000000074505806,
+              0.09999999403953552
+            ],
+            "selection_loss": 4.24179220199585
+          },
+          {
+            "fit_loss": 3.833407163619995,
+            "iteration": 150,
+            "parameters": [
+              0.04638489708304405,
+              510.39886474609375,
+              0.05000000074505806,
+              0.09999999403953552
+            ],
+            "selection_loss": 4.241302490234375
+          },
+          {
+            "fit_loss": 3.833151340484619,
+            "iteration": 175,
+            "parameters": [
+              0.04570382088422775,
+              510.4224548339844,
+              0.05000000074505806,
+              0.09999999403953552
+            ],
+            "selection_loss": 4.241109371185303
+          },
+          {
+            "fit_loss": 3.833064556121826,
+            "iteration": 200,
+            "parameters": [
+              0.045472532510757446,
+              510.4297180175781,
+              0.05000000074505806,
+              0.09999999403953552
+            ],
+            "selection_loss": 4.241043567657471
+          },
+          {
+            "fit_loss": 3.8330414295196533,
+            "iteration": 225,
+            "parameters": [
+              0.045410577207803726,
+              510.4319763183594,
+              0.05000000074505806,
+              0.09999999403953552
+            ],
+            "selection_loss": 4.241025447845459
+          },
+          {
+            "fit_loss": 3.8330371379852295,
+            "iteration": 250,
+            "parameters": [
+              0.04540016129612923,
+              510.4321594238281,
+              0.05000000074505806,
+              0.09999999403953552
+            ],
+            "selection_loss": 4.241023063659668
+          },
+          {
+            "fit_loss": 3.8330373764038086,
+            "iteration": 275,
+            "parameters": [
+              0.04540058597922325,
+              510.43218994140625,
+              0.05000000074505806,
+              0.09999999403953552
+            ],
+            "selection_loss": 4.241023063659668
+          },
+          {
+            "fit_loss": 3.833038091659546,
+            "iteration": 300,
+            "parameters": [
+              0.04540155082941055,
+              510.4320983886719,
+              0.05000000074505806,
+              0.09999999403953552
+            ],
+            "selection_loss": 4.241023540496826
+          }
+        ],
+        "metrics": {
+          "fit": {
+            "failure_windows": 12,
+            "gt_preferred_percent": 16.666667938232422,
+            "mean_gap": 0.16945163905620575,
+            "ranking_loss": 3.8330373764038086,
+            "short_two_step_gt_preferred_percent": 25,
+            "windows": 76
+          },
+          "selection": {
+            "failure_windows": 6,
+            "gt_preferred_percent": 0,
+            "mean_gap": 0.22922378778457642,
+            "ranking_loss": 4.241023063659668,
+            "short_two_step_gt_preferred_percent": 16.666667938232422,
+            "windows": 38
+          },
+          "test": {
+            "failure_windows": 11,
+            "gt_preferred_percent": 0,
+            "mean_gap": 0.23788957297801971,
+            "ranking_loss": 5.711045742034912,
+            "short_two_step_gt_preferred_percent": 18.18181800842285,
+            "windows": 34
+          }
+        },
+        "smooth": false
+      },
+      {
+        "best": {
+          "iteration": 300,
+          "parameters": [
+            0.227174773812294,
+            513.7789306640625,
+            0.8921006321907043,
+            0.04869288206100464
+          ],
+          "selection_loss": 4.228208065032959
+        },
+        "history": [
+          {
+            "fit_loss": 3.893860101699829,
+            "iteration": 0,
+            "parameters": [
+              0.2499999850988388,
+              512,
+              0.05000000074505806,
+              0.09999999403953552
+            ],
+            "selection_loss": 4.276658058166504
+          },
+          {
+            "fit_loss": 3.8508925437927246,
+            "iteration": 25,
+            "parameters": [
+              0.13361454010009766,
+              508.0509033203125,
+              0.09986118227243423,
+              0.16286015510559082
+            ],
+            "selection_loss": 4.250245094299316
+          },
+          {
+            "fit_loss": 3.835022449493408,
+            "iteration": 50,
+            "parameters": [
+              0.08809008449316025,
+              509.0663757324219,
+              0.18643169105052948,
+              0.2128131091594696
+            ],
+            "selection_loss": 4.240268230438232
+          },
+          {
+            "fit_loss": 3.8280868530273438,
+            "iteration": 75,
+            "parameters": [
+              0.07421088218688965,
+              509.9461669921875,
+              0.3270419239997864,
+              0.22805051505565643
+            ],
+            "selection_loss": 4.235687255859375
+          },
+          {
+            "fit_loss": 3.8229117393493652,
+            "iteration": 100,
+            "parameters": [
+              0.07508597522974014,
+              510.871337890625,
+              0.5204993486404419,
+              0.20253543555736542
+            ],
+            "selection_loss": 4.232271194458008
+          },
+          {
+            "fit_loss": 3.8188636302948,
+            "iteration": 125,
+            "parameters": [
+              0.08747643977403641,
+              512.2138671875,
+              0.6864428520202637,
+              0.1450035125017166
+            ],
+            "selection_loss": 4.229790687561035
+          },
+          {
+            "fit_loss": 3.8172128200531006,
+            "iteration": 150,
+            "parameters": [
+              0.10998975485563278,
+              512.828369140625,
+              0.771527886390686,
+              0.10083779692649841
+            ],
+            "selection_loss": 4.22877836227417
+          },
+          {
+            "fit_loss": 3.816763162612915,
+            "iteration": 175,
+            "parameters": [
+              0.13722501695156097,
+              513.28955078125,
+              0.8114749789237976,
+              0.07962093502283096
+            ],
+            "selection_loss": 4.228466510772705
+          },
+          {
+            "fit_loss": 3.8165907859802246,
+            "iteration": 200,
+            "parameters": [
+              0.16356489062309265,
+              513.6400146484375,
+              0.8359102010726929,
+              0.06857749074697495
+            ],
+            "selection_loss": 4.228342533111572
+          },
+          {
+            "fit_loss": 3.8164820671081543,
+            "iteration": 225,
+            "parameters": [
+              0.18604888021945953,
+              513.8485107421875,
+              0.8543650507926941,
+              0.06155947595834732
+            ],
+            "selection_loss": 4.2282795906066895
+          },
+          {
+            "fit_loss": 3.816394329071045,
+            "iteration": 250,
+            "parameters": [
+              0.20386238396167755,
+              513.9194946289062,
+              0.8694216012954712,
+              0.056399717926979065
+            ],
+            "selection_loss": 4.228242874145508
+          },
+          {
+            "fit_loss": 3.8163199424743652,
+            "iteration": 275,
+            "parameters": [
+              0.2173217087984085,
+              513.883544921875,
+              0.8818697929382324,
+              0.052235037088394165
+            ],
+            "selection_loss": 4.2282209396362305
+          },
+          {
+            "fit_loss": 3.816256523132324,
+            "iteration": 300,
+            "parameters": [
+              0.227174773812294,
+              513.7789306640625,
+              0.8921006321907043,
+              0.04869288206100464
+            ],
+            "selection_loss": 4.228208065032959
+          }
+        ],
+        "metrics": {
+          "fit": {
+            "failure_windows": 12,
+            "gt_preferred_percent": 16.666667938232422,
+            "mean_gap": 0.16865818202495575,
+            "ranking_loss": 3.816256523132324,
+            "short_two_step_gt_preferred_percent": 25,
+            "windows": 76
+          },
+          "selection": {
+            "failure_windows": 6,
+            "gt_preferred_percent": 0,
+            "mean_gap": 0.22759073972702026,
+            "ranking_loss": 4.228208065032959,
+            "short_two_step_gt_preferred_percent": 16.666667938232422,
+            "windows": 38
+          },
+          "test": {
+            "failure_windows": 11,
+            "gt_preferred_percent": 0,
+            "mean_gap": 0.2359357327222824,
+            "ranking_loss": 5.6762261390686035,
+            "short_two_step_gt_preferred_percent": 18.18181800842285,
+            "windows": 34
+          }
+        },
+        "smooth": true
+      }
+    ],
+    "native_parity_max_abs": 2.682209014892578e-7,
+    "notes": "Calibration-heldout, not pristine test; historical cohort already used for tuning. Detached finite warm-up; fixed routes are not beam candidates."
+  },
+  "implementation_sha256": {
+    "/home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/embedding_fixed_path.py": "6efa9a867f0ddd22bfb9be3940f1ba37e6905ed2534bbff0656f0ff730e2f119",
+    "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_metric": "c8f95ad1c7811aeb099045059c65cb7a5e05eaefae6743f04280695e1f0a061d",
+    "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/core/libvc_fiber_tracer.so": "591b548abbe89e38b6140dc5b910a0ddfc293ebf185196e8b0e53820bdf01593"
+  },
+  "long_window": {
+    "baseline": {
+      "fit": {
+        "failure_windows": 16,
+        "gt_preferred_percent": 25,
+        "mean_gap": 0.1928415447473526,
+        "ranking_loss": 4.615975856781006,
+        "short_two_step_gt_preferred_percent": 18.75,
+        "windows": 76
+      },
+      "selection": {
+        "failure_windows": 9,
+        "gt_preferred_percent": 22.22222328186035,
+        "mean_gap": 0.1291675567626953,
+        "ranking_loss": 3.1465065479278564,
+        "short_two_step_gt_preferred_percent": 11.111111640930176,
+        "windows": 41
+      },
+      "test": {
+        "failure_windows": 9,
+        "gt_preferred_percent": 0,
+        "mean_gap": 0.18741841614246368,
+        "ranking_loss": 3.7454655170440674,
+        "short_two_step_gt_preferred_percent": 22.22222328186035,
+        "windows": 32
+      }
+    },
+    "dataset_sha256": "1241b522076fec4561304904d2901f142198f14b4d2e24e12e3cc2d746a58c7e",
+    "fits": [
+      {
+        "best": {
+          "iteration": 242,
+          "parameters": [
+            0.045401282608509064,
+            510.43218994140625,
+            0.05000000074505806,
+            0.09999999403953552
+          ],
+          "selection_loss": 4.241023063659668
+        },
+        "fitted_on": "/ephemeral/hendrik/fiber3d_train2/evaluations/fixed_path_ema_fit_20260915_v1/fit_report.json",
+        "metrics": {
+          "fit": {
+            "failure_windows": 16,
+            "gt_preferred_percent": 31.25,
+            "mean_gap": 0.18456798791885376,
+            "ranking_loss": 4.465324401855469,
+            "short_two_step_gt_preferred_percent": 18.75,
+            "windows": 76
+          },
+          "selection": {
+            "failure_windows": 9,
+            "gt_preferred_percent": 22.22222328186035,
+            "mean_gap": 0.1277397722005844,
+            "ranking_loss": 3.1204020977020264,
+            "short_two_step_gt_preferred_percent": 11.111111640930176,
+            "windows": 41
+          },
+          "test": {
+            "failure_windows": 9,
+            "gt_preferred_percent": 0,
+            "mean_gap": 0.18084096908569336,
+            "ranking_loss": 3.6436991691589355,
+            "short_two_step_gt_preferred_percent": 22.22222328186035,
+            "windows": 32
+          }
+        },
+        "smooth": false
+      },
+      {
+        "best": {
+          "iteration": 300,
+          "parameters": [
+            0.227174773812294,
+            513.7789306640625,
+            0.8921006321907043,
+            0.04869288206100464
+          ],
+          "selection_loss": 4.228208065032959
+        },
+        "fitted_on": "/ephemeral/hendrik/fiber3d_train2/evaluations/fixed_path_ema_fit_20260915_v1/fit_report.json",
+        "metrics": {
+          "fit": {
+            "failure_windows": 16,
+            "gt_preferred_percent": 31.25,
+            "mean_gap": 0.1827431321144104,
+            "ranking_loss": 4.432648658752441,
+            "short_two_step_gt_preferred_percent": 18.75,
+            "windows": 76
+          },
+          "selection": {
+            "failure_windows": 9,
+            "gt_preferred_percent": 22.22222328186035,
+            "mean_gap": 0.1274123638868332,
+            "ranking_loss": 3.1148080825805664,
+            "short_two_step_gt_preferred_percent": 11.111111640930176,
+            "windows": 41
+          },
+          "test": {
+            "failure_windows": 9,
+            "gt_preferred_percent": 0,
+            "mean_gap": 0.1793830692768097,
+            "ranking_loss": 3.62136173248291,
+            "short_two_step_gt_preferred_percent": 22.22222328186035,
+            "windows": 32
+          }
+        },
+        "smooth": true
+      }
+    ],
+    "native_parity_max_abs": 2.682209014892578e-7,
+    "notes": "Calibration-heldout, not pristine test; historical cohort already used for tuning. Detached finite warm-up; fixed routes are not beam candidates."
+  },
+  "pending": [],
+  "rows": [
+    {
+      "metrics": {
+        "collections": {
+          "PHerc0139": {
+            "directed_reference_mm": 1174.5539969044462,
+            "directions": 62,
+            "failures": 108,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 109,
+            "mean_segment_length_mm": 10.775724742242625,
+            "median_segment_length_mm": 2.2353737454645346,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.07936848493761992,
+            "p95_segment_length_mm": 25.656990650779477,
+            "reliability_segments": 170,
+            "zero_length_segments": 1
+          },
+          "PHerc0332": {
+            "directed_reference_mm": 425.1609036763345,
+            "directions": 6,
+            "failures": 9,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 10,
+            "mean_segment_length_mm": 42.51609036763345,
+            "median_segment_length_mm": 16.777452764888626,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.9231183095256714,
+            "p95_segment_length_mm": 84.67550621015432,
+            "reliability_segments": 15,
+            "zero_length_segments": 0
+          },
+          "PHerc1229": {
+            "directed_reference_mm": 407.1055269538943,
+            "directions": 10,
+            "failures": 26,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 27,
+            "mean_segment_length_mm": 15.077982479773864,
+            "median_segment_length_mm": 6.361195644014893,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.3177413847719428,
+            "p95_segment_length_mm": 35.55838458801477,
+            "reliability_segments": 36,
+            "zero_length_segments": 0
+          },
+          "PHerc1451": {
+            "directed_reference_mm": 48.369329337350806,
+            "directions": 4,
+            "failures": 2,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 3,
+            "mean_segment_length_mm": 16.123109779116934,
+            "median_segment_length_mm": 11.053251522727496,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 1.7460456179382813,
+            "p95_segment_length_mm": 11.347566533766855,
+            "reliability_segments": 6,
+            "zero_length_segments": 0
+          },
+          "PHercParis4_eval_fibers": {
+            "directed_reference_mm": 3655.0856746100235,
+            "directions": 82,
+            "failures": 101,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 102,
+            "mean_segment_length_mm": 35.834173280490425,
+            "median_segment_length_mm": 10.84211029859377,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.28506353290498415,
+            "p95_segment_length_mm": 71.55888983996923,
+            "reliability_segments": 183,
+            "zero_length_segments": 2
+          },
+          "PHercParis4_fibers": {
+            "directed_reference_mm": 1157.3518213511936,
+            "directions": 16,
+            "failures": 46,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 47,
+            "mean_segment_length_mm": 24.62450683725944,
+            "median_segment_length_mm": 5.5778573184875615,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.024232664148898637,
+            "p95_segment_length_mm": 87.48073236960792,
+            "reliability_segments": 62,
+            "zero_length_segments": 1
+          }
+        },
+        "global_result": {
+          "directed_reference_mm": 6867.627252833243,
+          "directed_runs": 180,
+          "directions": 180,
+          "failures": 292,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 293,
+          "mean_segment_length_mm": 23.439000862912092,
+          "median_segment_length_mm": 5.82266567467534,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.17602069563017358,
+          "p95_segment_length_mm": 62.40836031074263,
+          "reliability_segments": 472,
+          "zero_length_segments": 4
+        },
+        "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+        "metric_definition": "restart-episodes-80-base-voxels-v1",
+        "reference_selection_policy": "cp-bounded-no-lasagna-v1",
+        "restart_episode_distance_base_voxels": 80,
+        "scrolls": {
+          "PHerc0139": {
+            "directed_reference_mm": 1174.5539969044462,
+            "directions": 62,
+            "failures": 108,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 109,
+            "mean_segment_length_mm": 10.775724742242625,
+            "median_segment_length_mm": 2.2353737454645346,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.07936848493761992,
+            "p95_segment_length_mm": 25.656990650779477,
+            "reliability_segments": 170,
+            "zero_length_segments": 1
+          },
+          "PHerc0332": {
+            "directed_reference_mm": 425.1609036763345,
+            "directions": 6,
+            "failures": 9,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 10,
+            "mean_segment_length_mm": 42.51609036763345,
+            "median_segment_length_mm": 16.777452764888626,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.9231183095256714,
+            "p95_segment_length_mm": 84.67550621015432,
+            "reliability_segments": 15,
+            "zero_length_segments": 0
+          },
+          "PHerc1299": {
+            "directed_reference_mm": 407.1055269538943,
+            "directions": 10,
+            "failures": 26,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 27,
+            "mean_segment_length_mm": 15.077982479773864,
+            "median_segment_length_mm": 6.361195644014893,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.3177413847719428,
+            "p95_segment_length_mm": 35.55838458801477,
+            "reliability_segments": 36,
+            "zero_length_segments": 0
+          },
+          "PHerc1451": {
+            "directed_reference_mm": 48.369329337350806,
+            "directions": 4,
+            "failures": 2,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 3,
+            "mean_segment_length_mm": 16.123109779116934,
+            "median_segment_length_mm": 11.053251522727496,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 1.7460456179382813,
+            "p95_segment_length_mm": 11.347566533766855,
+            "reliability_segments": 6,
+            "zero_length_segments": 0
+          },
+          "PHercParis4": {
+            "directed_reference_mm": 4812.437495961217,
+            "directions": 98,
+            "failures": 147,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 148,
+            "mean_segment_length_mm": 32.51646956730552,
+            "median_segment_length_mm": 8.893961733985995,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.19572438435019313,
+            "p95_segment_length_mm": 85.48657066119873,
+            "reliability_segments": 245,
+            "zero_length_segments": 3
+          }
+        }
+      },
+      "name": "Classic",
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_thickness40_grace160_20260914_v2/full/summary.json",
+      "splits": {
+        "fit": {
+          "directed_reference_mm": 3401.7307881966144,
+          "directions": 90,
+          "failures": 149,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 150,
+          "mean_segment_length_mm": 22.678205254644094,
+          "median_segment_length_mm": 8.22796453586568,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.19748750094431888,
+          "p95_segment_length_mm": 48.303985505005215,
+          "reliability_segments": 239,
+          "zero_length_segments": 1
+        },
+        "selection": {
+          "directed_reference_mm": 1736.772429325578,
+          "directions": 50,
+          "failures": 85,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 86,
+          "mean_segment_length_mm": 20.195028247971837,
+          "median_segment_length_mm": 5.006120304123258,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.08839075544902716,
+          "p95_segment_length_mm": 66.9851075946892,
+          "reliability_segments": 135,
+          "zero_length_segments": 0
+        },
+        "test": {
+          "directed_reference_mm": 1729.1240353110504,
+          "directions": 40,
+          "failures": 58,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 59,
+          "mean_segment_length_mm": 29.307187039170348,
+          "median_segment_length_mm": 4.67403013974735,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.02689734276568303,
+          "p95_segment_length_mm": 75.10305686932173,
+          "reliability_segments": 98,
+          "zero_length_segments": 3
+        }
+      },
+      "summary_sha256": "8c08ea0c40d13c0df4daaee993c9579e9395b68a81bbb0b9b89c1afd5d4df70c"
+    },
+    {
+      "metrics": {
+        "collections": {
+          "PHerc0139": {
+            "directed_reference_mm": 1174.5539969044462,
+            "directions": 62,
+            "failures": 50,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 51,
+            "mean_segment_length_mm": 23.03047052753816,
+            "median_segment_length_mm": 3.7222728796877425,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.22099082590944386,
+            "p95_segment_length_mm": 45.707492952084614,
+            "reliability_segments": 112,
+            "zero_length_segments": 0
+          },
+          "PHerc0332": {
+            "directed_reference_mm": 425.16090367633456,
+            "directions": 6,
+            "failures": 4,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 5,
+            "mean_segment_length_mm": 85.0321807352669,
+            "median_segment_length_mm": 22.429184508515892,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 7.075307507089176,
+            "p95_segment_length_mm": 129.83510989539107,
+            "reliability_segments": 10,
+            "zero_length_segments": 0
+          },
+          "PHerc1229": {
+            "directed_reference_mm": 407.1055269538943,
+            "directions": 10,
+            "failures": 7,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 8,
+            "mean_segment_length_mm": 50.88819086923679,
+            "median_segment_length_mm": 29.134420135240227,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 1.4110375659489922,
+            "p95_segment_length_mm": 40.665757075353156,
+            "reliability_segments": 17,
+            "zero_length_segments": 0
+          },
+          "PHerc1451": {
+            "directed_reference_mm": 48.369329337350806,
+            "directions": 4,
+            "failures": 0,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 1,
+            "mean_segment_length_mm": 48.369329337350806,
+            "median_segment_length_mm": 12.092332334337701,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 11.128853511213034,
+            "p95_segment_length_mm": 13.055811157462367,
+            "reliability_segments": 4,
+            "zero_length_segments": 0
+          },
+          "PHercParis4_eval_fibers": {
+            "directed_reference_mm": 3655.0856746100235,
+            "directions": 82,
+            "failures": 27,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 28,
+            "mean_segment_length_mm": 130.53877409321512,
+            "median_segment_length_mm": 21.082754990515237,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.356754296867571,
+            "p95_segment_length_mm": 111.32705162439791,
+            "reliability_segments": 109,
+            "zero_length_segments": 0
+          },
+          "PHercParis4_fibers": {
+            "directed_reference_mm": 1157.3518213511936,
+            "directions": 16,
+            "failures": 25,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 26,
+            "mean_segment_length_mm": 44.513531590430524,
+            "median_segment_length_mm": 5.214221660133744,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.009572963808341273,
+            "p95_segment_length_mm": 117.6865611678392,
+            "reliability_segments": 41,
+            "zero_length_segments": 0
+          }
+        },
+        "global_result": {
+          "directed_reference_mm": 6867.627252833243,
+          "directed_runs": 180,
+          "directions": 180,
+          "failures": 113,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 114,
+          "mean_segment_length_mm": 60.24234432309862,
+          "median_segment_length_mm": 9.337231504552525,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.23256258556280987,
+          "p95_segment_length_mm": 94.96003518162932,
+          "reliability_segments": 293,
+          "zero_length_segments": 0
+        },
+        "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+        "metric_definition": "restart-episodes-80-base-voxels-v1",
+        "reference_selection_policy": "cp-bounded-no-lasagna-v1",
+        "restart_episode_distance_base_voxels": 80,
+        "scrolls": {
+          "PHerc0139": {
+            "directed_reference_mm": 1174.5539969044462,
+            "directions": 62,
+            "failures": 50,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 51,
+            "mean_segment_length_mm": 23.03047052753816,
+            "median_segment_length_mm": 3.7222728796877425,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.22099082590944386,
+            "p95_segment_length_mm": 45.707492952084614,
+            "reliability_segments": 112,
+            "zero_length_segments": 0
+          },
+          "PHerc0332": {
+            "directed_reference_mm": 425.16090367633456,
+            "directions": 6,
+            "failures": 4,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 5,
+            "mean_segment_length_mm": 85.0321807352669,
+            "median_segment_length_mm": 22.429184508515892,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 7.075307507089176,
+            "p95_segment_length_mm": 129.83510989539107,
+            "reliability_segments": 10,
+            "zero_length_segments": 0
+          },
+          "PHerc1299": {
+            "directed_reference_mm": 407.1055269538943,
+            "directions": 10,
+            "failures": 7,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 8,
+            "mean_segment_length_mm": 50.88819086923679,
+            "median_segment_length_mm": 29.134420135240227,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 1.4110375659489922,
+            "p95_segment_length_mm": 40.665757075353156,
+            "reliability_segments": 17,
+            "zero_length_segments": 0
+          },
+          "PHerc1451": {
+            "directed_reference_mm": 48.369329337350806,
+            "directions": 4,
+            "failures": 0,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 1,
+            "mean_segment_length_mm": 48.369329337350806,
+            "median_segment_length_mm": 12.092332334337701,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 11.128853511213034,
+            "p95_segment_length_mm": 13.055811157462367,
+            "reliability_segments": 4,
+            "zero_length_segments": 0
+          },
+          "PHercParis4": {
+            "directed_reference_mm": 4812.437495961217,
+            "directions": 98,
+            "failures": 52,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 53,
+            "mean_segment_length_mm": 90.80070747096636,
+            "median_segment_length_mm": 17.374942549743434,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.2714428780617592,
+            "p95_segment_length_mm": 112.57011768161503,
+            "reliability_segments": 150,
+            "zero_length_segments": 0
+          }
+        }
+      },
+      "name": "u11800 embedding off",
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/eligible_ema999_final_vis_20260914_v1/full/summary.json",
+      "splits": {
+        "fit": {
+          "directed_reference_mm": 3401.7307881966144,
+          "directions": 90,
+          "failures": 59,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 60,
+          "mean_segment_length_mm": 56.69551313661024,
+          "median_segment_length_mm": 13.211150809757253,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.20471804489177656,
+          "p95_segment_length_mm": 87.48073236960792,
+          "reliability_segments": 149,
+          "zero_length_segments": 0
+        },
+        "selection": {
+          "directed_reference_mm": 1736.772429325578,
+          "directions": 50,
+          "failures": 36,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 37,
+          "mean_segment_length_mm": 46.93979538717779,
+          "median_segment_length_mm": 7.094520767363827,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.23467005682924336,
+          "p95_segment_length_mm": 112.36997655155247,
+          "reliability_segments": 86,
+          "zero_length_segments": 0
+        },
+        "test": {
+          "directed_reference_mm": 1729.1240353110504,
+          "directions": 40,
+          "failures": 18,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 19,
+          "mean_segment_length_mm": 91.00652817426581,
+          "median_segment_length_mm": 10.992650255923387,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.293316828980286,
+          "p95_segment_length_mm": 113.07137349246901,
+          "reliability_segments": 58,
+          "zero_length_segments": 0
+        }
+      },
+      "summary_sha256": "a94a6915f2ae9f1c74c6d8e1b409616378a1c1d53321fee43756d035fe84f340"
+    },
+    {
+      "metrics": {
+        "collections": {
+          "PHerc0139": {
+            "directed_reference_mm": 1174.5539969044462,
+            "directions": 62,
+            "failures": 49,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 50,
+            "mean_segment_length_mm": 23.491079938088923,
+            "median_segment_length_mm": 3.897842196154158,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.21700743552066754,
+            "p95_segment_length_mm": 47.17438992917201,
+            "reliability_segments": 111,
+            "zero_length_segments": 1
+          },
+          "PHerc0332": {
+            "directed_reference_mm": 425.1609036763345,
+            "directions": 6,
+            "failures": 4,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 5,
+            "mean_segment_length_mm": 85.0321807352669,
+            "median_segment_length_mm": 22.419468014582066,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 7.2159507875342275,
+            "p95_segment_length_mm": 129.78906623996335,
+            "reliability_segments": 10,
+            "zero_length_segments": 0
+          },
+          "PHerc1229": {
+            "directed_reference_mm": 407.1055269538943,
+            "directions": 10,
+            "failures": 9,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 10,
+            "mean_segment_length_mm": 40.71055269538943,
+            "median_segment_length_mm": 21.474080985458315,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 1.5874782839739012,
+            "p95_segment_length_mm": 40.5305588045479,
+            "reliability_segments": 19,
+            "zero_length_segments": 0
+          },
+          "PHerc1451": {
+            "directed_reference_mm": 48.369329337350806,
+            "directions": 4,
+            "failures": 0,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 1,
+            "mean_segment_length_mm": 48.369329337350806,
+            "median_segment_length_mm": 12.092332334337701,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 11.128853511213034,
+            "p95_segment_length_mm": 13.055811157462367,
+            "reliability_segments": 4,
+            "zero_length_segments": 0
+          },
+          "PHercParis4_eval_fibers": {
+            "directed_reference_mm": 3655.0856746100235,
+            "directions": 82,
+            "failures": 26,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 27,
+            "mean_segment_length_mm": 135.37354350407495,
+            "median_segment_length_mm": 22.369522937687734,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.3549387802742145,
+            "p95_segment_length_mm": 111.45741724029222,
+            "reliability_segments": 108,
+            "zero_length_segments": 0
+          },
+          "PHercParis4_fibers": {
+            "directed_reference_mm": 1157.3518213511936,
+            "directions": 16,
+            "failures": 23,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 24,
+            "mean_segment_length_mm": 48.22299255629974,
+            "median_segment_length_mm": 8.912235032797874,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.09645242316517413,
+            "p95_segment_length_mm": 120.45411110122679,
+            "reliability_segments": 39,
+            "zero_length_segments": 0
+          }
+        },
+        "global_result": {
+          "directed_reference_mm": 6867.627252833243,
+          "directed_runs": 180,
+          "directions": 180,
+          "failures": 111,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 112,
+          "mean_segment_length_mm": 61.31810047172538,
+          "median_segment_length_mm": 10.512139254723536,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.23565969520127483,
+          "p95_segment_length_mm": 96.23300710394705,
+          "reliability_segments": 291,
+          "zero_length_segments": 1
+        },
+        "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+        "metric_definition": "restart-episodes-80-base-voxels-v1",
+        "reference_selection_policy": "cp-bounded-no-lasagna-v1",
+        "restart_episode_distance_base_voxels": 80,
+        "scrolls": {
+          "PHerc0139": {
+            "directed_reference_mm": 1174.5539969044462,
+            "directions": 62,
+            "failures": 49,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 50,
+            "mean_segment_length_mm": 23.491079938088923,
+            "median_segment_length_mm": 3.897842196154158,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.21700743552066754,
+            "p95_segment_length_mm": 47.17438992917201,
+            "reliability_segments": 111,
+            "zero_length_segments": 1
+          },
+          "PHerc0332": {
+            "directed_reference_mm": 425.1609036763345,
+            "directions": 6,
+            "failures": 4,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 5,
+            "mean_segment_length_mm": 85.0321807352669,
+            "median_segment_length_mm": 22.419468014582066,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 7.2159507875342275,
+            "p95_segment_length_mm": 129.78906623996335,
+            "reliability_segments": 10,
+            "zero_length_segments": 0
+          },
+          "PHerc1299": {
+            "directed_reference_mm": 407.1055269538943,
+            "directions": 10,
+            "failures": 9,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 10,
+            "mean_segment_length_mm": 40.71055269538943,
+            "median_segment_length_mm": 21.474080985458315,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 1.5874782839739012,
+            "p95_segment_length_mm": 40.5305588045479,
+            "reliability_segments": 19,
+            "zero_length_segments": 0
+          },
+          "PHerc1451": {
+            "directed_reference_mm": 48.369329337350806,
+            "directions": 4,
+            "failures": 0,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 1,
+            "mean_segment_length_mm": 48.369329337350806,
+            "median_segment_length_mm": 12.092332334337701,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 11.128853511213034,
+            "p95_segment_length_mm": 13.055811157462367,
+            "reliability_segments": 4,
+            "zero_length_segments": 0
+          },
+          "PHercParis4": {
+            "directed_reference_mm": 4812.437495961217,
+            "directions": 98,
+            "failures": 49,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 50,
+            "mean_segment_length_mm": 96.24874991922434,
+            "median_segment_length_mm": 17.30089725733823,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.28235595271073577,
+            "p95_segment_length_mm": 113.83800111149961,
+            "reliability_segments": 147,
+            "zero_length_segments": 0
+          }
+        }
+      },
+      "name": "u11800 + u42000 EMA baseline",
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/mixed_current_ema_only_20260915_v1/full/summary.json",
+      "splits": {
+        "fit": {
+          "directed_reference_mm": 3401.7307881966144,
+          "directions": 90,
+          "failures": 55,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 56,
+          "mean_segment_length_mm": 60.74519264636812,
+          "median_segment_length_mm": 14.489610147780526,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.2277797711389222,
+          "p95_segment_length_mm": 87.48073236960792,
+          "reliability_segments": 145,
+          "zero_length_segments": 0
+        },
+        "selection": {
+          "directed_reference_mm": 1736.772429325578,
+          "directions": 50,
+          "failures": 35,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 36,
+          "mean_segment_length_mm": 48.243678592377165,
+          "median_segment_length_mm": 7.212975080781132,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.23485511999569023,
+          "p95_segment_length_mm": 112.36997655155247,
+          "reliability_segments": 85,
+          "zero_length_segments": 1
+        },
+        "test": {
+          "directed_reference_mm": 1729.1240353110504,
+          "directions": 40,
+          "failures": 21,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 22,
+          "mean_segment_length_mm": 78.5965470595932,
+          "median_segment_length_mm": 10.000674114880905,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.2714428780617592,
+          "p95_segment_length_mm": 114.46715449433412,
+          "reliability_segments": 61,
+          "zero_length_segments": 0
+        }
+      },
+      "summary_sha256": "9eb945e6f7676de7e980c32b373a5568c1ae77d67b33fe9a1ff34000a603c41d"
+    },
+    {
+      "metrics": {
+        "collections": {
+          "PHerc0139": {
+            "directed_reference_mm": 1174.5539969044462,
+            "directions": 62,
+            "failures": 46,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 47,
+            "mean_segment_length_mm": 24.990510572435024,
+            "median_segment_length_mm": 3.4757639272694583,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.21613804254450159,
+            "p95_segment_length_mm": 48.30837672842972,
+            "reliability_segments": 108,
+            "zero_length_segments": 0
+          },
+          "PHerc0332": {
+            "directed_reference_mm": 425.1609036763345,
+            "directions": 6,
+            "failures": 4,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 5,
+            "mean_segment_length_mm": 85.0321807352669,
+            "median_segment_length_mm": 22.4258804466111,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 7.140023659442106,
+            "p95_segment_length_mm": 129.7853092551557,
+            "reliability_segments": 10,
+            "zero_length_segments": 0
+          },
+          "PHerc1229": {
+            "directed_reference_mm": 407.1055269538943,
+            "directions": 10,
+            "failures": 7,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 8,
+            "mean_segment_length_mm": 50.88819086923679,
+            "median_segment_length_mm": 29.347301967724547,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 1.4112196053472172,
+            "p95_segment_length_mm": 40.67428676053661,
+            "reliability_segments": 17,
+            "zero_length_segments": 0
+          },
+          "PHerc1451": {
+            "directed_reference_mm": 48.369329337350806,
+            "directions": 4,
+            "failures": 0,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 1,
+            "mean_segment_length_mm": 48.369329337350806,
+            "median_segment_length_mm": 12.092332334337701,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 11.128853511213034,
+            "p95_segment_length_mm": 13.055811157462367,
+            "reliability_segments": 4,
+            "zero_length_segments": 0
+          },
+          "PHercParis4_eval_fibers": {
+            "directed_reference_mm": 3655.0856746100235,
+            "directions": 82,
+            "failures": 26,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 27,
+            "mean_segment_length_mm": 135.37354350407495,
+            "median_segment_length_mm": 24.04757387451336,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.3545759020191375,
+            "p95_segment_length_mm": 102.92326520993217,
+            "reliability_segments": 108,
+            "zero_length_segments": 0
+          },
+          "PHercParis4_fibers": {
+            "directed_reference_mm": 1157.3518213511936,
+            "directions": 16,
+            "failures": 27,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 28,
+            "mean_segment_length_mm": 41.33399361968549,
+            "median_segment_length_mm": 5.444621428897885,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.13946754955027663,
+            "p95_segment_length_mm": 117.19859891586889,
+            "reliability_segments": 43,
+            "zero_length_segments": 0
+          }
+        },
+        "global_result": {
+          "directed_reference_mm": 6867.627252833243,
+          "directed_runs": 180,
+          "directions": 180,
+          "failures": 110,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 111,
+          "mean_segment_length_mm": 61.87051579129048,
+          "median_segment_length_mm": 10.50641158978292,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.2324302383445457,
+          "p95_segment_length_mm": 89.63372864546425,
+          "reliability_segments": 290,
+          "zero_length_segments": 0
+        },
+        "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+        "metric_definition": "restart-episodes-80-base-voxels-v1",
+        "reference_selection_policy": "cp-bounded-no-lasagna-v1",
+        "restart_episode_distance_base_voxels": 80,
+        "scrolls": {
+          "PHerc0139": {
+            "directed_reference_mm": 1174.5539969044462,
+            "directions": 62,
+            "failures": 46,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 47,
+            "mean_segment_length_mm": 24.990510572435024,
+            "median_segment_length_mm": 3.4757639272694583,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.21613804254450159,
+            "p95_segment_length_mm": 48.30837672842972,
+            "reliability_segments": 108,
+            "zero_length_segments": 0
+          },
+          "PHerc0332": {
+            "directed_reference_mm": 425.1609036763345,
+            "directions": 6,
+            "failures": 4,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 5,
+            "mean_segment_length_mm": 85.0321807352669,
+            "median_segment_length_mm": 22.4258804466111,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 7.140023659442106,
+            "p95_segment_length_mm": 129.7853092551557,
+            "reliability_segments": 10,
+            "zero_length_segments": 0
+          },
+          "PHerc1299": {
+            "directed_reference_mm": 407.1055269538943,
+            "directions": 10,
+            "failures": 7,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 8,
+            "mean_segment_length_mm": 50.88819086923679,
+            "median_segment_length_mm": 29.347301967724547,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 1.4112196053472172,
+            "p95_segment_length_mm": 40.67428676053661,
+            "reliability_segments": 17,
+            "zero_length_segments": 0
+          },
+          "PHerc1451": {
+            "directed_reference_mm": 48.369329337350806,
+            "directions": 4,
+            "failures": 0,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 1,
+            "mean_segment_length_mm": 48.369329337350806,
+            "median_segment_length_mm": 12.092332334337701,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 11.128853511213034,
+            "p95_segment_length_mm": 13.055811157462367,
+            "reliability_segments": 4,
+            "zero_length_segments": 0
+          },
+          "PHercParis4": {
+            "directed_reference_mm": 4812.437495961217,
+            "directions": 98,
+            "failures": 53,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 54,
+            "mean_segment_length_mm": 89.11921288817068,
+            "median_segment_length_mm": 17.468511407876733,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.2698246636504753,
+            "p95_segment_length_mm": 112.36997655155247,
+            "reliability_segments": 151,
+            "zero_length_segments": 0
+          }
+        }
+      },
+      "name": "Fitted linear EMA",
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/fixed_path_ema_linear_20260915_v1/full/summary.json",
+      "splits": {
+        "fit": {
+          "directed_reference_mm": 3401.7307881966144,
+          "directions": 90,
+          "failures": 56,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 57,
+          "mean_segment_length_mm": 59.67948751222131,
+          "median_segment_length_mm": 14.977562366413583,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.19769207362592095,
+          "p95_segment_length_mm": 87.48073236960792,
+          "reliability_segments": 146,
+          "zero_length_segments": 0
+        },
+        "selection": {
+          "directed_reference_mm": 1736.772429325578,
+          "directions": 50,
+          "failures": 34,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 35,
+          "mean_segment_length_mm": 49.62206940930223,
+          "median_segment_length_mm": 6.485364335655895,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.24078701530736174,
+          "p95_segment_length_mm": 112.36997655155247,
+          "reliability_segments": 84,
+          "zero_length_segments": 0
+        },
+        "test": {
+          "directed_reference_mm": 1729.1240353110504,
+          "directions": 40,
+          "failures": 20,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 21,
+          "mean_segment_length_mm": 82.33923977671668,
+          "median_segment_length_mm": 11.128853511213034,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.2837747454996603,
+          "p95_segment_length_mm": 109.9148779543896,
+          "reliability_segments": 60,
+          "zero_length_segments": 0
+        }
+      },
+      "summary_sha256": "e1ecb26694adb5e3e3b74b92f11cc9693c8ec11ffc8bada7c05d9a9592936b67"
+    },
+    {
+      "metrics": {
+        "collections": {
+          "PHerc0139": {
+            "directed_reference_mm": 1174.5539969044462,
+            "directions": 62,
+            "failures": 52,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 53,
+            "mean_segment_length_mm": 22.16139616800842,
+            "median_segment_length_mm": 3.1966741855537135,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.2233946550686035,
+            "p95_segment_length_mm": 45.679501770592594,
+            "reliability_segments": 114,
+            "zero_length_segments": 0
+          },
+          "PHerc0332": {
+            "directed_reference_mm": 425.16090367633456,
+            "directions": 6,
+            "failures": 4,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 5,
+            "mean_segment_length_mm": 85.0321807352669,
+            "median_segment_length_mm": 22.426909185067146,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 7.097364957672555,
+            "p95_segment_length_mm": 129.77987505367045,
+            "reliability_segments": 10,
+            "zero_length_segments": 0
+          },
+          "PHerc1229": {
+            "directed_reference_mm": 407.1055269538943,
+            "directions": 10,
+            "failures": 9,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 10,
+            "mean_segment_length_mm": 40.71055269538943,
+            "median_segment_length_mm": 17.75640877540068,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 1.663522686436417,
+            "p95_segment_length_mm": 40.53922627210998,
+            "reliability_segments": 19,
+            "zero_length_segments": 0
+          },
+          "PHerc1451": {
+            "directed_reference_mm": 48.369329337350806,
+            "directions": 4,
+            "failures": 0,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 1,
+            "mean_segment_length_mm": 48.369329337350806,
+            "median_segment_length_mm": 12.092332334337701,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 11.128853511213034,
+            "p95_segment_length_mm": 13.055811157462367,
+            "reliability_segments": 4,
+            "zero_length_segments": 0
+          },
+          "PHercParis4_eval_fibers": {
+            "directed_reference_mm": 3655.0856746100235,
+            "directions": 82,
+            "failures": 29,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 30,
+            "mean_segment_length_mm": 121.83618915366745,
+            "median_segment_length_mm": 21.082754990515237,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.37186960997695057,
+            "p95_segment_length_mm": 109.7626642336661,
+            "reliability_segments": 111,
+            "zero_length_segments": 0
+          },
+          "PHercParis4_fibers": {
+            "directed_reference_mm": 1157.3518213511936,
+            "directions": 16,
+            "failures": 23,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 24,
+            "mean_segment_length_mm": 48.22299255629974,
+            "median_segment_length_mm": 8.912235032797874,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.009572963808337885,
+            "p95_segment_length_mm": 120.45411110122679,
+            "reliability_segments": 39,
+            "zero_length_segments": 0
+          }
+        },
+        "global_result": {
+          "directed_reference_mm": 6867.627252833243,
+          "directed_runs": 180,
+          "directions": 180,
+          "failures": 117,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 118,
+          "mean_segment_length_mm": 58.20023095621392,
+          "median_segment_length_mm": 9.688954511163608,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.26350877756749885,
+          "p95_segment_length_mm": 92.59189198499054,
+          "reliability_segments": 297,
+          "zero_length_segments": 0
+        },
+        "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+        "metric_definition": "restart-episodes-80-base-voxels-v1",
+        "reference_selection_policy": "cp-bounded-no-lasagna-v1",
+        "restart_episode_distance_base_voxels": 80,
+        "scrolls": {
+          "PHerc0139": {
+            "directed_reference_mm": 1174.5539969044462,
+            "directions": 62,
+            "failures": 52,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 53,
+            "mean_segment_length_mm": 22.16139616800842,
+            "median_segment_length_mm": 3.1966741855537135,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.2233946550686035,
+            "p95_segment_length_mm": 45.679501770592594,
+            "reliability_segments": 114,
+            "zero_length_segments": 0
+          },
+          "PHerc0332": {
+            "directed_reference_mm": 425.16090367633456,
+            "directions": 6,
+            "failures": 4,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 5,
+            "mean_segment_length_mm": 85.0321807352669,
+            "median_segment_length_mm": 22.426909185067146,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 7.097364957672555,
+            "p95_segment_length_mm": 129.77987505367045,
+            "reliability_segments": 10,
+            "zero_length_segments": 0
+          },
+          "PHerc1299": {
+            "directed_reference_mm": 407.1055269538943,
+            "directions": 10,
+            "failures": 9,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 10,
+            "mean_segment_length_mm": 40.71055269538943,
+            "median_segment_length_mm": 17.75640877540068,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 1.663522686436417,
+            "p95_segment_length_mm": 40.53922627210998,
+            "reliability_segments": 19,
+            "zero_length_segments": 0
+          },
+          "PHerc1451": {
+            "directed_reference_mm": 48.369329337350806,
+            "directions": 4,
+            "failures": 0,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 1,
+            "mean_segment_length_mm": 48.369329337350806,
+            "median_segment_length_mm": 12.092332334337701,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 11.128853511213034,
+            "p95_segment_length_mm": 13.055811157462367,
+            "reliability_segments": 4,
+            "zero_length_segments": 0
+          },
+          "PHercParis4": {
+            "directed_reference_mm": 4812.437495961217,
+            "directions": 98,
+            "failures": 52,
+            "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+            "mean_denominator": 53,
+            "mean_segment_length_mm": 90.80070747096636,
+            "median_segment_length_mm": 17.56308274199082,
+            "metric_definition": "restart-episodes-80-base-voxels-v1",
+            "p05_segment_length_mm": 0.2848757704629951,
+            "p95_segment_length_mm": 112.36997655155247,
+            "reliability_segments": 150,
+            "zero_length_segments": 0
+          }
+        }
+      },
+      "name": "Fitted smooth EMA",
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/fixed_path_ema_smooth_20260915_v1/full/summary.json",
+      "splits": {
+        "fit": {
+          "directed_reference_mm": 3401.7307881966144,
+          "directions": 90,
+          "failures": 55,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 56,
+          "mean_segment_length_mm": 60.74519264636812,
+          "median_segment_length_mm": 13.381105290656905,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.19954395386226825,
+          "p95_segment_length_mm": 88.0240589516691,
+          "reliability_segments": 145,
+          "zero_length_segments": 0
+        },
+        "selection": {
+          "directed_reference_mm": 1736.772429325578,
+          "directions": 50,
+          "failures": 38,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 39,
+          "mean_segment_length_mm": 44.53262639296354,
+          "median_segment_length_mm": 5.313758365093856,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.24638449272879165,
+          "p95_segment_length_mm": 112.36997655155247,
+          "reliability_segments": 88,
+          "zero_length_segments": 0
+        },
+        "test": {
+          "directed_reference_mm": 1729.1240353110504,
+          "directions": 40,
+          "failures": 24,
+          "mean_definition": "combined-directed-distance-per-restarts-plus-one-v1",
+          "mean_denominator": 25,
+          "mean_segment_length_mm": 69.16496141244201,
+          "median_segment_length_mm": 10.4848935106184,
+          "metric_definition": "restart-episodes-80-base-voxels-v1",
+          "p05_segment_length_mm": 0.2848842240652562,
+          "p95_segment_length_mm": 109.7626642336661,
+          "reliability_segments": 64,
+          "zero_length_segments": 0
+        }
+      },
+      "summary_sha256": "f4ae50682821126804c5f603981aaf2ee552530fcc00b2ed193f86acc4778941"
+    }
+  ],
+  "split": {
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0139/kb_20260827T204421830_000022.json": {
+      "identity": "d56d2f5227dafd8e10b3eb33cbebf4662f5fa50441beccad0d07d14ce63866d0",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0139/kb_20260828T155910844_000043.json": {
+      "identity": "2cb4f53ff7a751e6a6cbb57d0ed178cb56adb473698e493f1a491659d536965b",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0139/kb_20260901T224443942_000068.json": {
+      "identity": "1b878e8d4780f4d690fdad79b627639310ee1ef89f7ab43721cd41d47e2c283b",
+      "split": "selection"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0139/kb_20260905T035141671_000093.json": {
+      "identity": "f02dd80d863732555432b984cae7c6860e5e0c131200f5eef64b770c7fbb07de",
+      "split": "selection"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0139/kb_20260908T172232906_000117.json": {
+      "identity": "7f7233a10107033e6209fa7d3e1e0318f4e22868d5cd992ed880cb74e4119f41",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0139/lt_20260831T061702750_000026.json": {
+      "identity": "bfe6d4503ef062b2098ed7af9e7a3d750e7e2d5bb0d60e3cace512d654bf3499",
+      "split": "test"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0139/lt_20260904T062829219_000052.json": {
+      "identity": "e975023d515c57a74a5eef01c1e265be6d68b174a5951e51ab624904250dfcfd",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0139/lt_20260909T071741261_000094.json": {
+      "identity": "e0e4b35a6463fa6db0adb6a79c4389b368d44a5f04803844a9b51ce184f8b621",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0139/lt_20260909T082646148_000107.json": {
+      "identity": "212765dcbec18691d9bcfbf6c32bc0af140eb3b66655a45fb6935c1db0615c2c",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0139/lt_20260909T084022344_000109.json": {
+      "identity": "08dc8c65097a51765abf6e8026169f34b3d4d956c558efe987e07c3c23881166",
+      "split": "test"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0332/dj_20260810T113807458_000001.json": {
+      "identity": "a4d150f21d0c0443c6f48fbb2958f92a295a39aecdcc3ed25a9ee2338eb84918",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0332/kb_20260822T033517433_000058.json": {
+      "identity": "7416fa0f6f68128abfcf5ee50967432a8c87cd86a99ce7761a53bb0e2b6a657e",
+      "split": "test"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0332/kb_20260822T164832186_000062.json": {
+      "identity": "d12e8009f2500b67593efd8631533bd394da46b514a12e7654464a6d996de9d1",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc1229/lt_20260819T050805459_000002.json": {
+      "identity": "2ba8241c7609d1542ca76952c0df0b720f94fc14b7a1dedaa533ae1753aae15f",
+      "split": "selection"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc1229/lt_20260819T081412107_000011.json": {
+      "identity": "61c43065474b43a3ab7bf60e6570caaa001ce6b97889786f0d7d9848ef8702d4",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc1229/lt_20260824T083243313_000053.json": {
+      "identity": "1ec0eb6b9ee454a932237e25aa8b1238f776b7a6a2eb7d1ac2ebd63975fb9279",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc1229/lt_20260824T091041867_000056.json": {
+      "identity": "feb00e24f7d94c8d5cba4eceec8adbc0e2743659a5f660e9d58795e5238d4b08",
+      "split": "test"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc1229/lt_20260825T075316065_000069.json": {
+      "identity": "c11c93d911b8f922d921ebc98c8c6ba057e730ac61b0280dec5c27c8e410e53b",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc1451/dj_20260903T195009387_000005.json": {
+      "identity": "71ec785b6e1aad6ffcc12e36e59107b275bcee1621868eb310d7277b40d5b38b",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc1451/dj_20260903T200017539_000006.json": {
+      "identity": "5d4302ec835c9783f5bab9fb0cfd5f8da22c680066b4774134812b7a5f6ad30c",
+      "split": "test"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260815T020414697_000008.json": {
+      "identity": "5fdcfa6f1d8b14883f72df5fb782d75a502f9fe0d010f58bb3ba946fbb895d50",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260815T025206849_000041.json": {
+      "identity": "4b953d57e8d83e3df960cd1a0d38c73988d48c0b2ff5fd3379df5e99272c41c7",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260815T135300158_000075.json": {
+      "identity": "4d2e03e3fc8193e397875875b6757552b3664658207fcc698250c6c04031c231",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260816T224409952_000122.json": {
+      "identity": "3eb3a5f40321efff8d82ed7d6904a24e16d0e8894deec31d75216b0ad21d182d",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260821T221016194_000135.json": {
+      "identity": "7a2d2f7a315b7834da04078f0937daf9f8ef3073740fb334105f7ec70f181c62",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260822T103908823_000165.json": {
+      "identity": "6ed794028dfff54f211f45d5ea847aa9ac61b25f559832de102248795eb04e12",
+      "split": "selection"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260822T121633375_000173.json": {
+      "identity": "18ddb42b0f596a656149a9a6dc798647ca7db5f08f194397465f97bde3bdbdd5",
+      "split": "test"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260824T032219305_000197.json": {
+      "identity": "741c63776fe7635d60c48c209450aa0fbedf15ca1eacbac563465afcd883f097",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260826T172849645_000255.json": {
+      "identity": "4a09f41ca4b3215b75bc8ec141c6714e3ebf76746682494b727a4afc40d85d1e",
+      "split": "test"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260827T134102921_000271.json": {
+      "identity": "a759291c28f7294a38f2f24eabedc1c2a2c9ef17d72d7104de5b5d636f78798f",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260901T165827570_000316.json": {
+      "identity": "32ea3d3ff779a9623ad10d7952186578a02c9110d6c210b65cde4a31ff2c4a15",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260901T170547855_000317.json": {
+      "identity": "130a8a070889af7f9f29c7b4387ea02a6fab9ded038ac27c58a63c20a8428a6c",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260901T201915394_000335.json": {
+      "identity": "c5755590846a400fd5e8045a325baa2f7c38e356caaf8881e76929486dcbdecf",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260902T103444019_000352.json": {
+      "identity": "495d2dac08abf0f63424c8182db358082eb1bbc2c6f1fb1cfb7e2d0a715c2744",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260902T125309620_000368.json": {
+      "identity": "b4b36176e66e49a26b8def1a0969fd6ba502c27efd2f12f85353dedb75906c97",
+      "split": "selection"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260902T131435457_000370.json": {
+      "identity": "bf3f02a5ff85c33fe98c20f32b9bbd2cf7e893241964d30926c1c5e5390a4818",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260902T181618881_000388.json": {
+      "identity": "34e0d6d45325dca859b4d9ae7242e2c5e6973bdc62bc95bc298786ed9a3cd6a3",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260902T214326941_000399.json": {
+      "identity": "433d3bc0e035f5e00c1f5dc8402e81806454bed982ea459717b1843da7b20683",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260902T215234337_000400.json": {
+      "identity": "b49c5d9a1408f05c0754ced324a6d3a009f944256534b8bebacfd043d7322c91",
+      "split": "selection"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260903T214715058_000404.json": {
+      "identity": "889933c87578c5895db59fb2fe5bec41a3c06c4021be27d347e88b00b1745166",
+      "split": "test"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260904T145959056_000421.json": {
+      "identity": "db2b24c4c7523200d5ad6bbab3aa7ded3111cf167861fa46e06c6f9ccaf1c603",
+      "split": "test"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260904T210541536_000446.json": {
+      "identity": "cd20a437a05f628ee18cb3f55a5dde6e7d2e0f118935c3dfee8b4b8df45ebf1e",
+      "split": "selection"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260905T163237868_000469.json": {
+      "identity": "816d29a580522f25734838f5f2e0f0734a9da8156bdc760e815f5cccc6eb6487",
+      "split": "selection"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260907T141106877_000497.json": {
+      "identity": "39de86ce15e54c29ebdefe1a2b313f90c68bf95fee23cbfa4c0a86593680a7ae",
+      "split": "test"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_fibers/kb_20260711T043119415_000150.json": {
+      "identity": "ac8d20762a21d0eca629e191196e9a54302986ecc1a2f22e306ae41172da9e81",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_fibers/kb_20260729T173847941_000210.json": {
+      "identity": "31c157c42ff43be9aac440c7b8ab8ba615b8aee73d118cf460e212baf4365ff7",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_fibers/kb_20260729T182039882_000211.json": {
+      "identity": "55ea7afaba29c78de6bb51befc276269da69de231bc882ff94a6092e971a7d0b",
+      "split": "fit"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_fibers/kb_20260803T040828806_000224.json": {
+      "identity": "0621515906692d6e848751299853f84b71cdf58251231e8b434bb0dc45a20dba",
+      "split": "test"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_fibers/sm_20260706T204346695_000119.json": {
+      "identity": "4dc53c3dc6e43b10baaefb8b2e5f7beae0ba51f67f2023d18e679ea37498af89",
+      "split": "selection"
+    },
+    "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_fibers/sm_20260707T184533000_000122.json": {
+      "identity": "b1ac3f01d5c0a86aba67f91ccc96605d87d54d1c8fa31b668e045e85dccb104f",
+      "split": "fit"
+    }
+  },
+  "window_counts": [
+    {
+      "count": 13,
+      "kind": "control",
+      "scroll": "PHerc0139",
+      "split": "fit"
+    },
+    {
+      "count": 5,
+      "kind": "failure",
+      "scroll": "PHerc0139",
+      "split": "fit"
+    },
+    {
+      "count": 16,
+      "kind": "control",
+      "scroll": "PHerc0139",
+      "split": "selection"
+    },
+    {
+      "count": 4,
+      "kind": "failure",
+      "scroll": "PHerc0139",
+      "split": "selection"
+    },
+    {
+      "count": 1,
+      "kind": "control",
+      "scroll": "PHerc0139",
+      "split": "test"
+    },
+    {
+      "count": 3,
+      "kind": "failure",
+      "scroll": "PHerc0139",
+      "split": "test"
+    },
+    {
+      "count": 4,
+      "kind": "control",
+      "scroll": "PHerc0332",
+      "split": "fit"
+    },
+    {
+      "count": 1,
+      "kind": "failure",
+      "scroll": "PHerc0332",
+      "split": "fit"
+    },
+    {
+      "count": 2,
+      "kind": "control",
+      "scroll": "PHerc0332",
+      "split": "test"
+    },
+    {
+      "count": 5,
+      "kind": "control",
+      "scroll": "PHerc1299",
+      "split": "fit"
+    },
+    {
+      "count": 2,
+      "kind": "control",
+      "scroll": "PHerc1299",
+      "split": "selection"
+    },
+    {
+      "count": 1,
+      "kind": "failure",
+      "scroll": "PHerc1299",
+      "split": "selection"
+    },
+    {
+      "count": 5,
+      "kind": "failure",
+      "scroll": "PHerc1299",
+      "split": "test"
+    },
+    {
+      "count": 1,
+      "kind": "control",
+      "scroll": "PHerc1451",
+      "split": "fit"
+    },
+    {
+      "count": 2,
+      "kind": "control",
+      "scroll": "PHerc1451",
+      "split": "test"
+    },
+    {
+      "count": 41,
+      "kind": "control",
+      "scroll": "PHercParis4",
+      "split": "fit"
+    },
+    {
+      "count": 6,
+      "kind": "failure",
+      "scroll": "PHercParis4",
+      "split": "fit"
+    },
+    {
+      "count": 14,
+      "kind": "control",
+      "scroll": "PHercParis4",
+      "split": "selection"
+    },
+    {
+      "count": 1,
+      "kind": "failure",
+      "scroll": "PHercParis4",
+      "split": "selection"
+    },
+    {
+      "count": 18,
+      "kind": "control",
+      "scroll": "PHercParis4",
+      "split": "test"
+    },
+    {
+      "count": 3,
+      "kind": "failure",
+      "scroll": "PHercParis4",
+      "split": "test"
+    }
+  ]
+}

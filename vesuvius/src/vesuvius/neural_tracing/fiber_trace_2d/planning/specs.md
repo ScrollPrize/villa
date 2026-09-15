@@ -187,6 +187,18 @@
 
 ## Native live reference evaluation (standalone first)
 
+- Optional evaluation.embedding_inference selects a second frozen checkpoint,
+  inference settings and namespace for embedding_NNN only; primary owns
+  presence/nx/ny. Sheet normals are unchanged. Composite manifests point to
+  original arrays and record both cache identities; no copied payloads or
+  code-hash cache invalidation. Equal physical source and output lattice are
+  mandatory. Per-array routing gates readiness across all participating stores.
+- Mixed live inference reuses model-specific ordinary worker pools under one
+  manager grant, partitioning GPUs and shared CPU/buffer budgets. Shared-GPU
+  workers divide the inherited VRAM allowance. Existing single-model behavior
+  is unchanged. Single-model cached profiling/extension rejects composites
+  explicitly; mixed cache reuse goes through live_evaluate. See docs/mixed_inference.md.
+
 - Live cases keep thread-confined publication proofs for acknowledged chunks
   (readiness_cache_entries default4096;0 disables memoization for diagnostics).
   Local hits avoid shared bridge locks and CPU-permit suspension, but still
@@ -7264,6 +7276,18 @@
 - No wire fields change; EOF/timeout never frees server-side reservations.
 # Experimental LRU embedding anchors
 
+Opt-in fixed-route EMA calibration exports native candidate/base scores and
+normalized embedding observations using the existing scoring/state transitions.
+Offline fitting uses frozen paths and checkpoints, shared finite causal history,
+GPU backpropagation and whole-fiber grouping. It is a surrogate for beam search;
+actual tracing is required to judge quality, and calibration-heldout data is
+reported separately. Missing cached samples reject routes, never become zeros.
+
+Optional embedding distance threshold/temperature maps cosine distance using a
+zero-anchored softplus. Temperature0/threshold0 retains the exact linear default.
+Parameters are finite/nonnegative, threshold at most2. The scoring mapping is
+recorded in effective native provenance and leaves EMA admission/updates unchanged.
+
 Whole-path `appearance` mode uses bounded spherical summaries (FP64 sums and
 support) rather than window expiry. Merge minimum incremental spherical error
 when over capacity; deterministic ties and cancellation fallback. Nearest
@@ -7325,6 +7349,23 @@ recomputed using report-metrics without mutating their trace artifacts.
   segments. No change to CP-bounded/non-Lasagna eligibility or model inputs.
 - Evaluator development uses the no-argument workspace build runner documented
   in vesuvius/scripts/native-build-deps/README.md; historical configs preserved.
+
+# Opt-in embedding integration experiments (2026-09-15)
+
+- Existing plain EMA defaults retain exact arithmetic; new families opt in via
+  embedding-integration and physical update-spacing flags.
+- Always score each candidate before updating independent child state. Admission
+  clocks follow actual traced base-voxel distance, not GT/reference progression.
+- Support cadenced normalized EMA, finite uniform observation window, learned
+  presence/disagreement gate, angular-limited update and adaptive dual EMA.
+  All state resets at restart. No anchors and no extra inference inputs.
+- Gates consume the admission clock even if update weight vanishes. Finite-window
+  expiry is evaluated at candidate position. Validate capacity instead of silently
+  truncating the desired window. Angular exact antipodes retain old reference.
+- GPU fixed-path fitting uses shared native exports, split/loss helpers and a
+  grouped whole-fiber fit/selection/test partition. Selection chooses finalists;
+  heldout never drives optimization. Require native/Torch parity and full native
+  tracing before promoting any experimental setting.
 
 # Demand-scoped sweep GPU lifecycle (2026-09-14)
 

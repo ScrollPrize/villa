@@ -978,6 +978,38 @@ TEST_CASE("native fiber tracer requires normals for normal-aware smoothness")
     CHECK_NOTHROW(vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr));
 }
 
+TEST_CASE("fixed route export shares native EMA and base scoring")
+{
+    using namespace vc::fiber_tracer;
+    class Source final : public FiberPredictionSource {
+    public:
+        FiberPredictionSample sample(const cv::Vec3d&, const cv::Vec3d&) const override {
+            FiberPredictionSample s; s.options.push_back({{1,0,0},.75,true}); return s;
+        }
+        void sampleEmbeddings(const std::vector<cv::Vec3f>& p,std::vector<std::vector<float>>& out) const override {
+            out.clear(); for (const auto& q:p) out.push_back(q[0]==0 ? std::vector<float>{1,0} : std::vector<float>{0,1});
+        }
+    } source;
+    FiberTraceConfig config;
+    config.embeddingReferenceMode="ema"; config.embeddingWeight=.25; config.embeddingEmaHalfLifeBaseVoxels=4;
+    config.smoothnessNormalWeight=config.smoothnessTangentWeight=config.cumulativeSmoothnessTangentWeight=0;
+    config.parallelThreads=1;
+    const auto rows=scoreFiberFixedPath(source,{{0,0,0},{4,0,0},{8,0,0}},config,nullptr);
+    REQUIRE(rows.size()==3);
+    CHECK(rows[1].baseCost==doctest::Approx(.25));
+    CHECK(rows[1].totalCost==doctest::Approx(.5));
+    CHECK(rows[2].totalCost==doctest::Approx(.25+.25*(1-std::sqrt(.5))));
+    CHECK(rows[1].distanceBase==4);
+    CHECK_THROWS(scoreFiberFixedPath(source,{{0,0,0},{0,0,0}},config,nullptr));
+    config.embeddingDistanceThreshold=.3; config.embeddingDistanceTemperature=.05;
+    const auto mapped=scoreFiberFixedPath(source,{{0,0,0},{4,0,0}},config,nullptr);
+    CHECK(mapped[1].totalCost==doctest::Approx(.25+.25*fiberEmbeddingDistancePenalty(1,.3,.05)));
+    CHECK(fiberEmbeddingDistancePenalty(0,.3,.05)==0);
+    CHECK(fiberEmbeddingDistancePenalty(.75,0,0)==.75);
+    config.embeddingDistanceTemperature=-1;
+    CHECK_THROWS(scoreFiberFixedPath(source,{{0,0,0},{4,0,0}},config,nullptr));
+}
+
 TEST_CASE("native fiber tracer parallel workers require concurrent samplers")
 {
     CHECK(vc::fiber_tracer::testing::debugTraceWorkerCount(true, true, true, 4, 64) == 4);
@@ -2393,6 +2425,81 @@ TEST_CASE("polyline box clipping preserves ordered exit and re-entry runs")
               .empty());
 }
 
+
+TEST_CASE("Embedding integration preserves defaults and isolates branch clocks")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingMemory old{{1,0},{1,0}}, integrated = old;
+    FiberEmbeddingIntegrationConfig config;
+    for (double d : {7.99,8.01,16.0}) {
+        advanceFiberEmbeddingMemory(old,{0,1},d,64,1,false);
+        advanceIntegratedFiberEmbedding(integrated,{0,1},d,64,1,config);
+        CHECK(old.ema == integrated.ema);
+    }
+    FiberEmbeddingMemory parent{{1,0},{1,0}}, child = parent;
+    config.spacing = 16;
+    advanceIntegratedFiberEmbedding(child,{0,1},8,64,1,config);
+    CHECK(child.ema == parent.ema);
+    CHECK(child.integrationElapsed == 8);
+    CHECK(parent.integrationElapsed == 0);
+    advanceIntegratedFiberEmbedding(child,{0,1},8,64,1,config);
+    CHECK(child.ema != parent.ema);
+    CHECK(child.integrationElapsed == 0);
+    CHECK(parent.integrationArc == 0);
+}
+
+TEST_CASE("Embedding gated admissions reset the clock even with zero update")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingMemory state{{1,0},{1,0}};
+    FiberEmbeddingIntegrationConfig config;
+    config.kind = "gate"; config.spacing = 16; config.gateBias = -1000;
+    advanceIntegratedFiberEmbedding(state,{0,1},16,64,0,config);
+    CHECK(state.ema == std::vector<float>{1,0});
+    CHECK(state.integrationElapsed == 0);
+    config.gateBias = 1000;
+    advanceIntegratedFiberEmbedding(state,{0,1},8,64,1,config);
+    CHECK(state.ema == std::vector<float>{1,0});
+    CHECK(state.integrationElapsed == 8);
+}
+
+TEST_CASE("Embedding angular cap and finite window use actual physical distance")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingMemory state{{1,0},{1,0}};
+    FiberEmbeddingIntegrationConfig config;
+    config.kind = "angular"; config.capDegrees = 2;
+    advanceIntegratedFiberEmbedding(state,{0,1},16,8,1,config);
+    CHECK(std::acos(fiberEmbeddingCosine(state.ema,{1,0})) <= 4*3.141592653589793/180+1e-6);
+    state = FiberEmbeddingMemory{{1,0},{1,0}};
+    advanceIntegratedFiberEmbedding(state,{-1,0},8,8,1,config);
+    CHECK(state.ema == std::vector<float>{1,0}); // exact cancellation
+    config.capDegrees = 90;
+    advanceIntegratedFiberEmbedding(state,{-1,0},64,32,1,config);
+    CHECK(state.ema == std::vector<float>{1,0}); // undefined antipodal plane
+    state = FiberEmbeddingMemory{{1,0},{1,0}};
+    config.kind = "window"; config.spacing = 8; config.window = 8;
+    CHECK(integratedFiberEmbeddingCost({0,1},state,8,config) == 1);
+    advanceIntegratedFiberEmbedding(state,{0,1},8,64,1,config);
+    CHECK(integratedFiberEmbeddingCost({0,1},state,8,config) == 0);
+    CHECK(integratedFiberEmbeddingCost({1,0},state,8,config) == 1);
+    CHECK(integratedFiberEmbeddingCost({1,0},state,9,config) == 0);
+}
+
+TEST_CASE("Dual embedding histories are continuous independent EMAs")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingMemory state{{1,0},{1,0}};
+    FiberEmbeddingIntegrationConfig config;
+    config.kind = "dual"; config.longHalfLife = 128;
+    CHECK(integratedFiberEmbeddingCost({0,1},state,8,config) == 1);
+    advanceIntegratedFiberEmbedding(state,{0,1},8,32,1,config);
+    CHECK(state.ema[1] > state.secondary[1]);
+    auto branch = state;
+    advanceIntegratedFiberEmbedding(branch,{0,1},8,32,1,config);
+    CHECK(branch.secondary != state.secondary);
+    CHECK(branch.ema != state.ema);
+}
 
 TEST_CASE("Case-local readiness bypasses the shared gate and permit on acknowledged hits")
 {

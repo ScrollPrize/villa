@@ -4,6 +4,7 @@
 #include "FiberTraceCli.hpp"
 #include "FiberTraceEvaluationCli.hpp"
 #include "FiberEmbeddingQuery.hpp"
+#include "FiberFixedPathQuery.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -255,6 +256,10 @@ void clearProgressLine()
 int main(int argc, char** argv)
 {
     try {
+        if (argc > 1 && std::string_view(argv[1]) == "score-fixed-paths")
+            return queryFixedFiberPaths(argc, argv);
+        if (argc > 1 && std::string_view(argv[1]) == "integrate-embeddings")
+            return queryFiberIntegration(argc, argv);
         if (argc > 1 && std::string_view(argv[1]) == "sample-embeddings")
             return queryCachedFiberEmbeddings(argc, argv);
         if (argc > 1 && (std::string_view(argv[1]) == "replay-set" || std::string_view(argv[1]) == "render-replay" || std::string_view(argv[1]) == "replay-references"))

@@ -13,6 +13,12 @@ from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_fiber_file
 from .live_evaluate import coordinate_native
 
 
+def require_single_model_profile(evaluation):
+    if evaluation.get("embedding_inference") or any(s.get("inference_roles") for s in evaluation["sources"]):
+        raise ValueError("mixed-model caches must use live_evaluate with the original embedding_inference configuration; "
+                         "single-model cached profiling/extension is not supported")
+
+
 def extend_cached_replay(evaluation, binary, checkpoint, *, gpu_manager=None):
     """Continue an existing inference cache through shared demand publication.
 
@@ -20,6 +26,7 @@ def extend_cached_replay(evaluation, binary, checkpoint, *, gpu_manager=None):
     the existing cache. The numerical adapter/store/control loop are unchanged.
     Caller must own its GPU grant, or supply a demand-scoped manager request.
     """
+    require_single_model_profile(evaluation)
     from contextlib import ExitStack
     import subprocess
     import torch
@@ -88,7 +95,10 @@ class PublishedStore:
     def __init__(self, manifest):
         manifest = Path(manifest).resolve()
         self.root = manifest.parent
-        groups = json.loads(manifest.read_text())["groups"]
+        document = json.loads(manifest.read_text())
+        if "mixed_inference" in document:
+            raise ValueError("open each underlying ordinary cache separately, not the mixed manifest")
+        groups = document["groups"]
         self.channels, self.paths = {}, []
         self.level = self.chunk = self.shape = None
         for group in groups.values():
@@ -136,6 +146,7 @@ def run_full(workload):
     import subprocess
     previous = Path(workload["cached_evaluation"])
     summary = json.loads((previous / "summary.json").read_text())
+    require_single_model_profile(summary["config"])
     inventory = json.loads((previous / "inference_summary.json").read_text())
     if not summary.get("completed") or any((previous / p).exists() for p in ("incomplete.json", "inference_incomplete.json")):
         raise ValueError("cached evaluation requires completed input")
@@ -215,6 +226,7 @@ def run(workload):
     settings = workload["profile"]
     previous = Path(settings["completed_evaluation"])
     summary = json.loads((previous / "summary.json").read_text())
+    require_single_model_profile(summary["config"])
     inference = json.loads((previous / "inference_summary.json").read_text())
     if not summary.get("completed") or any((previous / p).exists() for p in ("incomplete.json", "inference_incomplete.json")):
         raise ValueError("cached profiling requires a completed evaluation")

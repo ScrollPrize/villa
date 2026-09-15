@@ -1,3 +1,3 @@
-# EMA999 u10200 visualization
+# Shareable embedding experiment summary
 
-Render the full50fiber evaluation for the same frozen EMA999u10200 snapshot just evaluated. Reuse inference and corrected aligned combined CT/presence strips, restart sections and per-fiber index/statistics.
+Summarize all recorded 3D fiber embedding experiments, training runs and eval results in a Markdown file suitable for others. Explain mechanisms, matched baselines, protocol changes, limits and practical conclusion. No new training/evaluation or runtime code changes.

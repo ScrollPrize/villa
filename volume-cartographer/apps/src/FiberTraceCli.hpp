@@ -113,6 +113,30 @@ inline bool parseTraceOption(
         config.embeddingAnchorTouch = value("embedding-anchor-touch");
     else if (argument == "--embedding-anchor-temperature")
         config.embeddingAnchorTemperature = parseDouble(value("embedding-anchor-temperature"), "embedding-anchor-temperature");
+    else if (argument == "--embedding-integration")
+        config.embeddingIntegration.kind = value("embedding-integration");
+    else if (argument == "--embedding-update-spacing-base-voxels")
+        config.embeddingIntegration.spacing = parseDouble(value("embedding-update-spacing-base-voxels"), "embedding-update-spacing-base-voxels");
+    else if (argument == "--embedding-update-gate-bias")
+        config.embeddingIntegration.gateBias = parseDouble(value("embedding-update-gate-bias"), "embedding-update-gate-bias");
+    else if (argument == "--embedding-update-gate-presence")
+        config.embeddingIntegration.gatePresence = parseDouble(value("embedding-update-gate-presence"), "embedding-update-gate-presence");
+    else if (argument == "--embedding-update-gate-distance")
+        config.embeddingIntegration.gateDistance = parseDouble(value("embedding-update-gate-distance"), "embedding-update-gate-distance");
+    else if (argument == "--embedding-update-cap-degrees-per-8-base-voxels")
+        config.embeddingIntegration.capDegrees = parseDouble(value("embedding-update-cap-degrees-per-8-base-voxels"), "embedding-update-cap-degrees-per-8-base-voxels");
+    else if (argument == "--embedding-update-long-half-life-base-voxels")
+        config.embeddingIntegration.longHalfLife = parseDouble(value("embedding-update-long-half-life-base-voxels"), "embedding-update-long-half-life-base-voxels");
+    else if (argument == "--embedding-update-mix-bias")
+        config.embeddingIntegration.mixBias = parseDouble(value("embedding-update-mix-bias"), "embedding-update-mix-bias");
+    else if (argument == "--embedding-update-mix-slope")
+        config.embeddingIntegration.mixSlope = parseDouble(value("embedding-update-mix-slope"), "embedding-update-mix-slope");
+    else if (argument == "--embedding-integration-window-base-voxels")
+        config.embeddingIntegration.window = parseDouble(value("embedding-integration-window-base-voxels"), "embedding-integration-window-base-voxels");
+    else if (argument == "--embedding-distance-threshold")
+        config.embeddingDistanceThreshold = parseDouble(value("embedding-distance-threshold"), "embedding-distance-threshold");
+    else if (argument == "--embedding-distance-temperature")
+        config.embeddingDistanceTemperature = parseDouble(value("embedding-distance-temperature"), "embedding-distance-temperature");
     else if (argument == "--embedding-ema-half-life-base-voxels")
         config.embeddingEmaHalfLifeBaseVoxels = parseDouble(value("embedding-ema-half-life-base-voxels"), "embedding-ema-half-life-base-voxels");
     else if (argument == "--embedding-ema-delay-base-voxels")
@@ -167,6 +191,12 @@ inline nlohmann::json traceConfigJson(const FiberTraceConfig& config)
 {
     return {
         {"embedding_weight", config.embeddingWeight},
+        {"embedding_integration", {{"kind",config.embeddingIntegration.kind},{"spacing",config.embeddingIntegration.spacing},
+            {"gate_bias",config.embeddingIntegration.gateBias},{"gate_presence",config.embeddingIntegration.gatePresence},{"gate_distance",config.embeddingIntegration.gateDistance},
+            {"cap_degrees",config.embeddingIntegration.capDegrees},{"long_half_life",config.embeddingIntegration.longHalfLife},
+            {"mix_bias",config.embeddingIntegration.mixBias},{"mix_slope",config.embeddingIntegration.mixSlope},{"window",config.embeddingIntegration.window}}},
+        {"embedding_distance_threshold", config.embeddingDistanceThreshold},
+        {"embedding_distance_temperature", config.embeddingDistanceTemperature},
         {"embedding_history_spacing_base_voxels", config.embeddingHistorySpacingBaseVoxels},
         {"embedding_history_window_base_voxels", config.embeddingHistoryWindowBaseVoxels},
         {"embedding_history_count", config.embeddingHistoryCount},

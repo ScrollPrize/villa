@@ -258,6 +258,35 @@ def create_demand_store(cache, source_identity, model_identity, geometry, effect
         prepare_output=prepare_output)
 
 
+def resolve_inference_model(cache_root, checkpoint, model_config, settings, device_list):
+    """Resolve numerical identity once for either channel role."""
+    snapshot, checkpoint_digest = freeze_checkpoint(Path(checkpoint), cache_root)
+    effective, _ = _checkpoint_config_for_inference(snapshot, model_config)
+    settings = dict(settings)
+    precision, _ = _resolve_inference_precision(settings.get("precision", "auto"), checkpoint=snapshot, devices=device_list)
+    effective = dict(effective)
+    effective["training"] = {**effective.get("training", {}), "mixed_precision": precision}
+    tile, overlap, border = (int(settings.get(k, default)) for k, default in
+                             (("tile_size", 192), ("overlap", 64), ("border", 16)))
+    power = int(settings.get("scaledown_power", 2))
+    if not 0 <= power <= 8:
+        raise ValueError("invalid inference scaledown power")
+    scale, chunk = 1 << power, int(settings.get("chunk_size", 32))
+    dtype = settings.get("accumulator_dtype", "float16")
+    max_batch_size = settings.get("max_batch_size", 1)
+    if type(max_batch_size) is not int or max_batch_size < 1:
+        raise ValueError("inference.max_batch_size must be a positive integer")
+    model_identity = {"schema": 1, "checkpoint_sha256": checkpoint_digest, "config": effective,
+                      "precision": precision, "tile": tile, "overlap": overlap, "border": border,
+                      "scale": scale, "chunk": chunk, "accumulator_dtype": dtype,
+                      "compressor": settings.get("compressor", "blosc-zstd"),
+                      "max_batch_size": max_batch_size,
+                      "embedding_channels": "signed-float32-v2" if settings.get("emit_embeddings", False) else None}
+    return dict(snapshot=snapshot, effective=effective, settings=settings,
+                identity=model_identity, tile=tile, overlap=overlap, border=border,
+                scale=scale, chunk=chunk, power=power)
+
+
 def run(config_path, checkpoint, devices, native_binary, model_config=None, *, render=False,
         manager_socket=None, manager_priority=None, unmanaged=False):
     config_path = Path(config_path).resolve()
@@ -288,38 +317,37 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
     resolver = binary.with_name("vc_cache_root")
     cache_root = Path(subprocess.check_output([str(resolver)], text=True).strip())
     prediction_cache_root = inference_cache_root(cache_root, config.get("inference_cache_namespace"))
-    snapshot, checkpoint_digest = freeze_checkpoint(Path(checkpoint), cache_root)
-    effective, _ = _checkpoint_config_for_inference(snapshot, model_config)
     settings = dict(config.get("inference", {}))
     trace_args = config.get("trace_args", [])
+    mixed = config.get("embedding_inference")
+    if mixed is not None and (not isinstance(mixed, dict) or not mixed.get("checkpoint")):
+        raise ValueError("embedding_inference requires a checkpoint")
     if "--embedding-weight" in trace_args:
         weight = float(trace_args[trace_args.index("--embedding-weight") + 1])
         if not math.isfinite(weight) or weight < 0:
             raise ValueError("embedding weight must be finite and nonnegative")
-        if weight > 0:
+        if weight > 0 and mixed is None:
             settings["emit_embeddings"] = True
     device_list = tuple(torch.device(f"cuda:{int(v)}") for v in devices.split(","))
     if not device_list or len(set(device_list)) != len(device_list):
         raise ValueError("select a nonempty distinct comma-separated CUDA device list")
-    precision, _ = _resolve_inference_precision(settings.get("precision", "auto"), checkpoint=snapshot, devices=device_list)
-    effective = dict(effective)
-    effective["training"] = {**effective.get("training", {}), "mixed_precision": precision}
-    tile, overlap, border = (int(settings.get(k, default)) for k, default in
-                             (("tile_size", 192), ("overlap", 64), ("border", 16)))
-    power = int(settings.get("scaledown_power", 2))
-    if not 0 <= power <= 8:
-        raise ValueError("invalid inference scaledown power")
-    scale, chunk = 1 << power, int(settings.get("chunk_size", 32))
-    dtype = settings.get("accumulator_dtype", "float16")
-    max_batch_size = settings.get("max_batch_size", 1)
-    if type(max_batch_size) is not int or max_batch_size < 1:
-        raise ValueError("inference.max_batch_size must be a positive integer")
-    model_identity = {"schema": 1, "checkpoint_sha256": checkpoint_digest, "config": effective,
-                      "precision": precision, "tile": tile, "overlap": overlap, "border": border,
-                      "scale": scale, "chunk": chunk, "accumulator_dtype": dtype,
-                      "compressor": settings.get("compressor", "blosc-zstd"),
-                      "max_batch_size": max_batch_size,
-                      "embedding_channels": "signed-float32-v2" if settings.get("emit_embeddings", False) else None}
+    primary = resolve_inference_model(cache_root, checkpoint, model_config, settings, device_list)
+    models = [(primary, prediction_cache_root)]
+    if mixed is not None:
+        unknown = set(mixed) - {"checkpoint", "checkpoint_sha256", "model_config", "inference", "inference_cache_namespace"}
+        if unknown:
+            raise ValueError(f"unknown embedding_inference options: {sorted(unknown)}")
+        embedding_settings = {**settings, **mixed.get("inference", {}), "emit_embeddings": True}
+        alternate = resolve_inference_model(cache_root, location(base, mixed["checkpoint"]),
+            location(base, mixed["model_config"]) if mixed.get("model_config") else None,
+            embedding_settings, device_list)
+        if mixed.get("checkpoint_sha256") and mixed["checkpoint_sha256"] != alternate["identity"]["checkpoint_sha256"]:
+            raise ValueError("embedding checkpoint SHA256 mismatch")
+        if alternate["scale"] != primary["scale"]:
+            raise ValueError("mixed embeddings must use the same output lattice/scaledown")
+        models.append((alternate, inference_cache_root(cache_root,
+            mixed.get("inference_cache_namespace", config.get("inference_cache_namespace")))))
+    power = primary["power"]
     evaluation = dict(config)
     evaluation["reference_plan"] = references
     evaluation["annotation_sha256"] = annotation_hashes
@@ -331,6 +359,7 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
         raise ValueError("evaluation output already exists")
     evaluation["sources"] = []
     source_to_store, stores, readers, channel_indices, backgrounds = {}, {}, {}, {}, {}
+    pool_groups = {}
     started = time.monotonic()
     native = None
     connection = None
@@ -352,27 +381,45 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
             validate_input_lattice(root_attrs, level)
             if volume_shape != tuple((n + (1 << level) - 1) // (1 << level) for n in base_shape):
                 raise ValueError("selected input level is not the expected isotropic power-of-two lattice")
-            geometry = demand.DemandGeometry(volume_shape, tile, overlap, border, scale, chunk)
             source_identity = {"locator": input_path, "level": level, "shape": volume_shape,
                 "base_shape": base_shape, "metadata": root_attrs,
                 "revision": source.get("source_revision"), "base_voxel_size_um": source["base_voxel_size_um"],
                 "coordinate_space": source.get("coordinate_space")}
             source_key = json_digest(source_identity)
-            source_to_store[source_id] = source_key
-            cache, stored_model_identity = resolve_prediction_cache(
-                prediction_cache_root / source_key, source_identity, model_identity, geometry, settings)
-            print(f"live-eval cache source={source_id} existing={(cache / 'cache_identity.json').is_file()} path={cache}", flush=True)
-            if source_key not in stores:
-                store = cleanup.enter_context(create_demand_store(cache, source_identity, stored_model_identity,
-                    geometry, effective, snapshot, level, settings))
-                products = store.products
-                stores[source_key] = store
-                readers[source_key] = NativeTileReader(sampler, geometry, sampler.volume.dtype)
-                channel_indices[source_key] = {str((Path(c.relative_path) / str(p.level)).resolve()): geometry
-                    for p in products for c in p.channels}
-                backgrounds[source_key] = set()
+            role_keys, manifests = [], []
+            for model, model_cache_root in models:
+                geometry = demand.DemandGeometry(volume_shape, model["tile"], model["overlap"],
+                    model["border"], model["scale"], model["chunk"])
+                cache, stored_model_identity = resolve_prediction_cache(
+                    model_cache_root / source_key, source_identity, model["identity"], geometry, model["settings"])
+                key = source_key if mixed is None else str(cache.resolve())
+                role_keys.append(key)
+                manifests.append(cache / "inference.lasagna.json")
+                print(f"live-eval cache source={source_id} existing={(cache / 'cache_identity.json').is_file()} path={cache}", flush=True)
+                if key not in stores:
+                    store = cleanup.enter_context(create_demand_store(cache, source_identity, stored_model_identity,
+                        geometry, model["effective"], model["snapshot"], level, model["settings"]))
+                    stores[key] = store
+                    readers[key] = NativeTileReader(sampler, geometry, sampler.volume.dtype)
+                    channel_indices[key] = {str((Path(c.relative_path) / str(p.level)).resolve()): geometry
+                        for p in store.products for c in p.channels}
+                    backgrounds[key] = set()
+                    group_key = json_digest(model["identity"])
+                    group = pool_groups.setdefault(group_key, {"keys": [], "settings": model["settings"]})
+                    group["keys"].append(key)
+                for fiber in references["sources"][source_index]["fibers"]:
+                    for run in fiber["runs"]:
+                        backgrounds[key].update(reference_chunks(run["points_base_xyz"],
+                            (1 << level) * model["scale"], geometry.output_shape, model["chunk"]))
+            source_to_store[source_id] = role_keys if mixed is not None else role_keys[0]
             entry = dict(source)
-            entry["fiber_manifest"] = str(cache / "inference.lasagna.json")
+            entry["fiber_manifest"] = str(manifests[0])
+            if mixed is not None:
+                from .mixed_inference import write_mixed_manifest
+                entry["fiber_manifest"] = str(write_mixed_manifest(
+                    cache_root / "live_inference" / "_composites", *manifests))
+                entry["inference_roles"] = {"presence_nx_ny": str(manifests[0]),
+                                            "embedding": str(manifests[1])}
             entry["normal_manifest"] = location(base, source["normal_manifest"])
             entry["inference_scaledown_power"] = power
             entry["input_volume"] = input_path
@@ -385,18 +432,16 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
                 entry["ct_base_volume"] = True
             entry["fibers"] = [location(base, f) for f in source["fibers"]]
             evaluation["sources"].append(entry)
-            for fiber in references["sources"][source_index]["fibers"]:
-                for run in fiber["runs"]:
-                    backgrounds[source_key].update(reference_chunks(run["points_base_xyz"],
-                        (1 << level) * scale, geometry.output_shape, chunk))
         if any(sha256_file(Path(path)) != digest for path, digest in annotation_hashes.items()):
             raise ValueError("annotation changed before native evaluation launch")
         return coordinate_native(evaluation, binary, stores, source_to_store, channel_indices,
-            backgrounds, readers, device_list, settings, started=started)
+            backgrounds, readers, device_list, settings, started=started,
+            pool_groups=pool_groups if mixed is not None else None)
 
 
 def coordinate_native(evaluation, binary, stores, source_to_store, channel_indices,
-                      backgrounds, readers, device_list, settings, *, started=None, allow_inference=True):
+                      backgrounds, readers, device_list, settings, *, started=None, allow_inference=True,
+                      pool_groups=None):
     """Shared authenticated control loop for live inference and cached-only replay."""
     started = time.monotonic() if started is None else started
     max_batch_size = settings.get("max_batch_size", 1)
@@ -482,12 +527,11 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                             continue
                         if message.get("type") != "demand" or message["request_id"] in waiters:
                             raise ValueError("invalid/duplicate native request")
-                        key = source_to_store[message["source"]]
                         targets = set()
+                        from .mixed_inference import request_store_key
                         for item in message["chunks"]:
                             array = str(Path(item["array"]).resolve())
-                            if array not in channel_indices[key]:
-                                raise ValueError("native request escapes its inference cache")
+                            key = request_store_key(source_to_store[message["source"]], array, channel_indices)
                             origin = stores[key].request(item["index_zyx"], remaining=float(message["remaining_base_voxels"]))
                             targets.add((key, origin))
                         waiters[message["request_id"]] = targets
@@ -495,7 +539,10 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                 if pool is None and queued:
                     if not allow_inference:
                         raise RuntimeError("cached-only replay cannot schedule inference")
-                    pool = demand.DemandWorkerPool(stores, readers, device_list,
+                    from .mixed_inference import ModelWorkerPools
+                    factory = demand.DemandWorkerPool if pool_groups is None else (
+                        lambda *args, **kwargs: ModelWorkerPools(*args, groups=pool_groups, **kwargs))
+                    pool = factory(stores, readers, device_list,
                         slots_per_gpu=int(settings.get("slots_per_gpu", 2)), input_workers=int(settings.get("input_workers", 8)),
                         input_slots=settings.get("input_slots"),
                         result_slots=settings.get("result_slots"),

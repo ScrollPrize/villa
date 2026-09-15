@@ -1526,7 +1526,7 @@ std::vector<LasagnaChannelBinding> bindLasagnaEmbeddingChannels(
         const auto digits = std::to_string(i);
         auto binding = bindLasagnaChannel(manifest, "embedding_" + std::string(3-digits.size(), '0') + digits, true);
         if (binding.array->metadata().dtype != utils::ZarrDtype::float32 ||
-            binding.spacing != lattice.spacing || !sameLasagnaSamplingGrid(binding, lattice))
+            binding.spacing != lattice.spacing || binding.shapeZYX != lattice.shapeZYX)
             throw std::runtime_error("embedding channels must be float32 on the prediction lattice");
         bindings.push_back(std::move(binding));
     }

@@ -7,6 +7,7 @@ import pytest
 
 from vesuvius.neural_tracing.fiber_trace_3d.replay_metrics import (
     reference_segments, segment_statistics, correct_summary, complete_report,
+    split_report,
 )
 
 
@@ -33,6 +34,21 @@ def test_one_restart_and_terminal():
     assert stats["median_segment_length_mm"] == 5
     assert stats["p05_segment_length_mm"] == pytest.approx(4.1)
     assert stats["p95_segment_length_mm"] == pytest.approx(5.9)
+
+
+def test_split_report_uses_same_complete_partition():
+    s=summary()
+    for source in s['sources']:
+        source['backend_config']['fibers']=[source['source_id']]
+        source['cases'][0]['source_index']=0
+    grouped=split_report(s,{'a':{'split':'fit'},'b':{'split':'test'}})
+    assert grouped['fit']==segment_statistics([4,6],1)
+    assert grouped['test']==segment_statistics([10],1)
+    from vesuvius.neural_tracing.fiber_trace_3d.embedding_integration_report import validate_coverage
+    rows=[dict(name='a',metrics=complete_report(s)),dict(name='b',metrics=complete_report(s))]
+    validate_coverage(rows)
+    rows[1]['metrics']['global_result']['directions']+=1
+    with pytest.raises(ValueError,match='coverage'):validate_coverage(rows)
 
 
 def test_zero_failures_repeats_endpoints_and_reverse():

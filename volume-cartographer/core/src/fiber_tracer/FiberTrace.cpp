@@ -458,6 +458,18 @@ void requireNormalSamplerForNormalAwareSmoothness(const FiberTraceConfig& config
 void validateTraceConfig(const FiberTraceConfig& config)
 {
     const auto& mode = config.embeddingReferenceMode;
+    const auto& integration = config.embeddingIntegration;
+    if (integration.active() && mode != "ema") throw std::invalid_argument("integration variants require plain EMA reference mode");
+    if (integration.kind != "ema" && integration.kind != "gate" && integration.kind != "angular" && integration.kind != "dual" && integration.kind != "window")
+        throw std::invalid_argument("unknown embedding integration");
+    for (double x : {integration.spacing,integration.gateBias,integration.gatePresence,integration.gateDistance,integration.capDegrees,
+                     integration.longHalfLife,integration.mixBias,integration.mixSlope,integration.window})
+        if (!std::isfinite(x)) throw std::invalid_argument("nonfinite embedding integration parameter");
+    if (integration.spacing < 0 || integration.spacing > 2048 || integration.capDegrees <= 0 || integration.capDegrees > 180 ||
+        integration.window <= 0 || integration.window > 2048 || integration.longHalfLife <= 0 ||
+        (integration.kind == "dual" && integration.longHalfLife <= config.embeddingEmaHalfLifeBaseVoxels) ||
+        (integration.kind == "window" && integration.window/std::max(integration.spacing,config.stepVoxels*config.traceToBaseScale)+2 > 4096))
+        throw std::invalid_argument("invalid embedding integration bounds");
     if (config.embeddingAnchorTouch != "nearest" && config.embeddingAnchorTouch != "hit")
         throw std::invalid_argument("unknown embedding anchor touch policy");
     if (config.embeddingAnchorTouch == "hit" && mode != "anchors-lru")
@@ -484,6 +496,10 @@ void validateTraceConfig(const FiberTraceConfig& config)
         throw std::invalid_argument("invalid anchor novelty/temperature");
     if (!std::isfinite(config.embeddingEmaHalfLifeBaseVoxels) || config.embeddingEmaHalfLifeBaseVoxels <= 0)
         throw std::invalid_argument("embedding EMA half life must be positive");
+    if (!std::isfinite(config.embeddingDistanceThreshold) || config.embeddingDistanceThreshold < 0 || config.embeddingDistanceThreshold > 2 ||
+        !std::isfinite(config.embeddingDistanceTemperature) || config.embeddingDistanceTemperature < 0 ||
+        (config.embeddingDistanceTemperature == 0 && config.embeddingDistanceThreshold != 0))
+        throw std::invalid_argument("invalid embedding distance mapping");
     if (config.embeddingHistoryFalloff != "uniform" && config.embeddingHistoryFalloff != "linear" &&
         config.embeddingHistoryFalloff != "gaussian")
         throw std::invalid_argument("unknown embedding history falloff");
@@ -683,7 +699,9 @@ void addEmbeddingScore(CandidateScore& score, const std::vector<float>& vector,
     const bool ema = config.embeddingReferenceMode.starts_with("ema") || config.embeddingReferenceMode == "seed";
     const bool lru = config.embeddingReferenceMode == "anchors-lru";
     const bool appearance = config.embeddingReferenceMode == "appearance";
-    const double cost = (config.embeddingReferenceMode == "anchors" || lru || appearance) ?
+    const double cost = config.embeddingIntegration.active() ? integratedFiberEmbeddingCost(vector,parent.embeddingMemory,
+        traceLength(point-beamEndpoint(parent))*config.traceToBaseScale,config.embeddingIntegration) :
+        (config.embeddingReferenceMode == "anchors" || lru || appearance) ?
         (1-config.embeddingAnchorEmaMix) * (appearance ? fiberEmbeddingAppearanceCost(vector,parent.embeddingAppearance,
             config.embeddingAnchorAggregation == "support-softmin" ? config.embeddingAnchorTemperature : 0) : lru ? fiberEmbeddingLruCost(vector,parent.embeddingLru,
             config.embeddingAnchorAggregation == "mean", config.embeddingAnchorAggregation == "normalized-mean") : fiberEmbeddingAnchorCost(vector, parent.embeddingHistory, parent.embeddingAnchors)) +
@@ -692,7 +710,8 @@ void addEmbeddingScore(CandidateScore& score, const std::vector<float>& vector,
         config.embeddingReferenceMode.starts_with("ema-seed")) : fiberEmbeddingCost(
         vector, parent.embeddingHistory, arc, config.embeddingHistoryWindowBaseVoxels,
         config.embeddingHistoryFalloff, config.embeddingReferenceMode == "best");
-    score.loss += static_cast<float>(config.embeddingWeight * cost);
+    score.loss += static_cast<float>(config.embeddingWeight * fiberEmbeddingDistancePenalty(
+        cost, config.embeddingDistanceThreshold, config.embeddingDistanceTemperature));
     score.embedding = vector;
 }
 
@@ -1442,7 +1461,11 @@ void updateTargetPlaneCrossings(
     out.historyDirection = updateHistoryDirection(parent.historyDirection, task.direction, parent.depth, config.cumulativeSmoothnessSteps);
     out.loss = candidate.loss;
     out.tracedLength = parent.tracedLength + traceLength(candidate.point - beamEndpoint(parent));
-    if (config.embeddingWeight > 0 && (config.embeddingReferenceMode == "anchors" || config.embeddingReferenceMode == "anchors-lru" || config.embeddingReferenceMode == "appearance")) {
+    if (config.embeddingWeight > 0 && config.embeddingIntegration.active())
+        advanceIntegratedFiberEmbedding(out.embeddingMemory,score.embedding,
+            traceLength(candidate.point-beamEndpoint(parent))*config.traceToBaseScale,
+            config.embeddingEmaHalfLifeBaseVoxels,score.selectedPresence,config.embeddingIntegration);
+    else if (config.embeddingWeight > 0 && (config.embeddingReferenceMode == "anchors" || config.embeddingReferenceMode == "anchors-lru" || config.embeddingReferenceMode == "appearance")) {
         advanceFiberEmbeddingMemory(out.embeddingMemory, score.embedding,
             traceLength(candidate.point - beamEndpoint(parent)) * config.traceToBaseScale,
             config.embeddingEmaHalfLifeBaseVoxels, score.selectedPresence, false);
@@ -2854,20 +2877,27 @@ public:
     {
         readinessGroups_.clear();
         if (gate) {
+            std::vector<const vc::lasagna::LasagnaChannelBinding*> bindings;
             for (const auto& option : options_) {
-                for (const auto* binding : {&option.presence, &option.nx, &option.ny}) {
-                    auto group = std::find_if(readinessGroups_.begin(), readinessGroups_.end(), [&](const auto& candidate) {
-                        // Exact equality: readiness must not merge near-but-different grids.
-                        return candidate.binding.spacing == binding->spacing &&
-                            candidate.binding.shapeZYX == binding->shapeZYX && candidate.binding.chunksZYX == binding->chunksZYX;
-                    });
-                    if (group == readinessGroups_.end()) {
-                        ReadinessGroup entry{*binding, *binding, {binding->path}};
-                        entry.levelBinding.spacing = 1.0;
-                        readinessGroups_.push_back(std::move(entry));
-                    } else {
-                        group->paths.push_back(binding->path);
-                    }
+                for (const auto* binding : {&option.presence, &option.nx, &option.ny})
+                    bindings.push_back(binding);
+            }
+            // Embeddings can belong to a different inference publication group.
+            // Waiting for the prediction channels alone does not prove readiness.
+            for (const auto& binding : embeddings_)
+                bindings.push_back(&binding);
+            for (const auto* binding : bindings) {
+                auto group = std::find_if(readinessGroups_.begin(), readinessGroups_.end(), [&](const auto& candidate) {
+                    // Exact equality: readiness must not merge near-but-different grids.
+                    return candidate.binding.spacing == binding->spacing &&
+                        candidate.binding.shapeZYX == binding->shapeZYX && candidate.binding.chunksZYX == binding->chunksZYX;
+                });
+                if (group == readinessGroups_.end()) {
+                    ReadinessGroup entry{*binding, *binding, {binding->path}};
+                    entry.levelBinding.spacing = 1.0;
+                    readinessGroups_.push_back(std::move(entry));
+                } else {
+                    group->paths.push_back(binding->path);
                 }
             }
         }
@@ -2877,8 +2907,7 @@ public:
     void sampleEmbeddings(const std::vector<cv::Vec3f>& points, std::vector<std::vector<float>>& values) const
     {
         if (embeddings_.empty()) throw std::runtime_error("embedding sampling was not enabled for prediction field");
-        // All siblings are published together by the existing demand store.
-        // Await the identical prediction lattice before reading any signed data.
+        // Await every dependency, including independently published embeddings.
         awaitPoints(points);
         vc::lasagna::sampleLasagnaVectorBatch(embeddings_, points, values);
     }
@@ -4027,6 +4056,55 @@ cv::Vec3d referenceTangentToward(const std::vector<cv::Vec3d>& line, size_t star
         toVec3d(traceNormalizedOrZero(inferred.direction)),
     });
     return planes;
+}
+
+std::vector<FiberFixedPathSample> scoreFiberFixedPath(
+    const FiberPredictionSource& predictions, const std::vector<cv::Vec3d>& points,
+    const FiberTraceConfig& config, const vc::lasagna::NormalSampler* normalSampler)
+{
+    validateTraceConfig(config);
+    requireNormalSamplerForNormalAwareSmoothness(config, normalSampler);
+    if (points.size() < 2) throw std::invalid_argument("fixed path needs at least two points");
+    std::vector<TraceVec> coordinates;
+    for (const auto& p : points) {
+        if (!finitePoint(p)) throw std::invalid_argument("nonfinite fixed path");
+        coordinates.push_back(toTraceVec(p));
+    }
+    std::vector<std::vector<float>> embeddings;
+    predictions.sampleEmbeddings(coordinates, embeddings);
+    if (embeddings.size() != points.size() || std::any_of(embeddings.begin(), embeddings.end(), [](const auto& e){return e.empty();}))
+        throw std::runtime_error("fixed path missing embeddings");
+    const auto seed = bestAlignedPrediction(predictions, points.front(),
+        traceNormalizedOrZero(coordinates[1]-coordinates[0]), false);
+    if (!seed.valid) throw std::runtime_error("fixed path invalid seed prediction");
+    std::vector<BeamState> beams(1);
+    auto& initial = beams[0];
+    initial.path = appendBeamPathPoint(nullptr, coordinates[0]);
+    initial.previousStepDirection = initial.currentSampleDirection = initial.historyDirection = seed.direction;
+    initial.embeddingMemory.ema = initial.embeddingMemory.seed = embeddings[0];
+    std::vector<FiberFixedPathSample> result{{embeddings[0], 0, 0, 0, 0, seed.presence}};
+    auto baseConfig = config;
+    baseConfig.embeddingWeight = 0;
+    CandidateScoringScratch scratch;
+    for (size_t i = 1; i < coordinates.size(); ++i) {
+        const auto delta = coordinates[i]-coordinates[i-1];
+        const auto distance = traceLength(delta);
+        if (!(distance > 0)) throw std::invalid_argument("fixed path repeated point");
+        const auto direction = delta/distance;
+        const double angle = std::acos(std::clamp(double(direction.dot(beams[0].currentSampleDirection)), -1.0, 1.0))*180.0/kTracePi;
+        const std::vector<CandidateTask> tasks{{0, direction}};
+        auto scores = scoreCandidateTasks(predictions, normalSampler, beams, tasks, {coordinates[i]}, baseConfig, 1, {}, nullptr, scratch, nullptr);
+        if (!scores[0].valid) throw std::runtime_error("fixed path invalid base prediction");
+        const double base = scores[0].loss;
+        addEmbeddingScore(scores[0], embeddings[i], beams[0], coordinates[i], config);
+        result.push_back({embeddings[i], distance*config.traceToBaseScale, base, scores[0].loss, angle, scores[0].selectedPresence});
+        FrontierCandidate candidate;
+        candidate.point = coordinates[i];
+        candidate.depth = beams[0].depth+1;
+        candidate.loss = beams[0].loss+scores[0].loss;
+        beams[0] = beamStateFromFrontierCandidate(beams,tasks,scores,0,candidate,config);
+    }
+    return result;
 }
 
 FiberTraceOneWayResult traceFiberOneWay(
