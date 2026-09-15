@@ -13,7 +13,9 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -42,7 +44,63 @@ fs::path makeEmptyNgvDir(const std::string& tag, int sparseVolume = 4)
     return d;
 }
 
+fs::path makeMultiscaleNgvDir(const std::string& tag, int minLevel, int maxLevel)
+{
+    auto d = tmpDir(tag);
+    std::ofstream f(d / "metadata.json");
+    f << "{\"format\":\"normal-grid-multiscale\",\"min-level\":" << minLevel
+      << ",\"max-level\":" << maxLevel
+      << ",\"source-metadata\":{\"sparse-volume\":4,\"spiral-step\":20.0}}";
+    return d;
+}
+
+struct CerrCapture {
+    std::ostringstream buffer;
+    std::streambuf* previous;
+    CerrCapture() : previous(std::cerr.rdbuf(buffer.rdbuf())) {}
+    ~CerrCapture() { std::cerr.rdbuf(previous); }
+};
+
+int constructAtLevel(const fs::path& d, int level, std::string& warning)
+{
+    CerrCapture capture;
+    NormalGridVolume v(d.string(), level);
+    warning = capture.buffer.str();
+    return v.level();
+}
+
 } // namespace
+
+TEST_CASE("Single-scale store: a nonzero level warns and falls back to level 0")
+{
+    auto d = makeEmptyNgvDir("single_scale_level");
+    std::string warning;
+    CHECK(constructAtLevel(d, 2, warning) == 0);
+    CHECK(warning.find("normal_grid_level=2 ignored") != std::string::npos);
+    CHECK(warning.find(d.string()) != std::string::npos);
+    CHECK(warning.find("single-scale") != std::string::npos);
+    CHECK(warning.find("vc_gen_normalgrids pyramid") != std::string::npos);
+    CHECK(constructAtLevel(d, 0, warning) == 0);
+    CHECK(warning.empty());
+    fs::remove_all(d);
+}
+
+TEST_CASE("Multiscale store: an out-of-range level warns and is clamped")
+{
+    auto d = makeMultiscaleNgvDir("multiscale_level", 0, 1);
+    std::string warning;
+    CHECK(constructAtLevel(d, 3, warning) == 1);
+    CHECK(warning.find("normal_grid_level=3 is outside the levels 0..1") != std::string::npos);
+    CHECK(warning.find("using level 1") != std::string::npos);
+    CHECK(constructAtLevel(d, 1, warning) == 1);
+    CHECK(warning.empty());
+    fs::remove_all(d);
+    auto lo = makeMultiscaleNgvDir("multiscale_level_lo", 1, 2);
+    CHECK(constructAtLevel(lo, 0, warning) == 1);
+    CHECK(warning.find("normal_grid_level=0 is outside the levels 1..2") != std::string::npos);
+    CHECK(warning.find("using level 1") != std::string::npos);
+    fs::remove_all(lo);
+}
 
 TEST_CASE("Constructor: missing metadata.json throws")
 {
