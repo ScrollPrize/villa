@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cmath>
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -24,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace vc::render {
@@ -97,6 +99,29 @@ bool isMissingZarrMetadataError(const std::exception& error)
 {
     return std::string_view(error.what()).find("zarr: no metadata found") !=
            std::string_view::npos;
+}
+
+void reportSkippedDeclaredLevels(std::string_view source,
+                                 const std::vector<std::string>& keys)
+{
+    if (keys.empty())
+        return;
+    std::string list;
+    for (const auto& key : keys) {
+        if (!list.empty())
+            list += ", ";
+        list += key;
+    }
+    static std::mutex reportedMutex;
+    static std::unordered_set<std::string> reported;
+    {
+        std::lock_guard lock(reportedMutex);
+        if (!reported.insert(std::string(source) + ": " + list).second)
+            return;
+    }
+    std::cerr << "warning: .zattrs at " << source
+              << " declares multiscale levels with no array metadata (" << list
+              << "); skipping them and opening the levels that exist\n";
 }
 
 class ClassifyingHttpStore final : public utils::Store {
@@ -979,7 +1004,14 @@ OpenedChunkedZarr openLocalZarrPyramid(const std::filesystem::path& root)
     auto store = std::make_shared<utils::FileSystemStore>(root);
     const auto advertised = remoteLevelKeysFromZattrs(store, 0);
     if (!advertised.empty()) {
+        std::vector<std::string> skipped;
         for (const auto& [physicalLevel, key] : advertised) {
+            if (!opened.fetchers.empty() &&
+                !std::filesystem::exists(root / key / ".zarray") &&
+                !std::filesystem::exists(root / key / "zarr.json")) {
+                skipped.push_back(key);
+                continue;
+            }
             auto array = utils::ZarrArray::open(
                 root / key, vc::buildZarrCodecRegistry(1));
             if (array.metadata().dtype == utils::ZarrDtype::uint16) {
@@ -988,6 +1020,7 @@ OpenedChunkedZarr openLocalZarrPyramid(const std::filesystem::path& root)
             }
             addPhysicalLevel(opened, physicalLevel, std::move(array));
         }
+        reportSkippedDeclaredLevels(root.string(), skipped);
         return opened;
     }
     for (int level : localLevelNumbers(root)) {
@@ -1073,9 +1106,17 @@ OpenedChunkedZarr openHttpZarrPyramid(
 
     const auto zattrsLevelKeys = remoteLevelKeysFromZattrs(store, firstPhysicalLevel);
     if (!zattrsLevelKeys.empty()) {
+        std::vector<std::string> skipped;
         for (const auto& [physicalLevel, key] : zattrsLevelKeys) {
-            addRemoteLevelFromKey(opened, store, key, physicalLevel);
+            try {
+                addRemoteLevelFromKey(opened, store, key, physicalLevel);
+            } catch (const std::exception& error) {
+                if (opened.fetchers.empty() || !isMissingZarrMetadataError(error))
+                    throw;
+                skipped.push_back(key);
+            }
         }
+        reportSkippedDeclaredLevels(spec.sourceUrl, skipped);
         return finishOpen(std::move(opened));
     }
 
