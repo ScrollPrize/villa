@@ -14,6 +14,9 @@ using vc3d::line_annotation::RuntimeFiberIdSpace;
 using vc3d::line_annotation::allocateRuntimeFiberId;
 using vc3d::line_annotation::assignStableRuntimeIds;
 using vc3d::line_annotation::sameFiberIdentity;
+using vc3d::line_annotation::bindRuntimeFiberIdentity;
+using vc3d::line_annotation::rebindRuntimeFiberIdentity;
+using vc3d::line_annotation::retireRuntimeFiberIdentity;
 
 namespace
 {
@@ -89,25 +92,60 @@ private slots:
         QCOMPARE(idsOf(fibers), (std::vector<uint64_t>{2, 1}));
     }
 
-    // A deleted fiber's id stays retired: a later new file never takes it,
-    // so anything still holding the old id can only miss, never hit another
-    // fiber.
-    void retiredIdsAreNotRecycled()
+    // A fiber deleted through the app has its name retired: a later file
+    // under that name is a new fiber with a fresh id, and the old id is never
+    // handed out again, so anything still holding it can only miss.
+    void deletedNamesAreRetiredAndIdsNeverRecycled()
     {
         RuntimeFiberIdSpace space;
         std::vector<Fiber> fibers = loaded({"a.json", "b.json", "c.json"});
         assignStableRuntimeIds(fibers, space, {});
-        // c.json is deleted; the space still remembers it (the controller
-        // keeps the name -> id map for the package), and the next reload has
-        // a new file.
+        retireRuntimeFiberIdentity(space, "c.json");
         fibers = loaded({"a.json", "b.json", "d.json"});
         assignStableRuntimeIds(fibers, space, {});
         QCOMPARE(idsOf(fibers), (std::vector<uint64_t>{1, 2, 4}));
-        // Re-creating c.json under the same name gets its old id back: the
-        // name is the identity.
+        // An import under the retired name is a different fiber.
         fibers = loaded({"a.json", "b.json", "c.json", "d.json"});
         assignStableRuntimeIds(fibers, space, {});
-        QCOMPARE(idsOf(fibers), (std::vector<uint64_t>{1, 2, 3, 4}));
+        QCOMPARE(idsOf(fibers), (std::vector<uint64_t>{1, 2, 5, 4}));
+    }
+
+    // A fiber the app creates (a saved session, a merge, a split half) is
+    // bound when it is persisted, so the first reload keeps the id it was
+    // allocated instead of treating the new file as unknown.
+    void createdFibersKeepTheirAllocatedIdAcrossTheFirstReload()
+    {
+        RuntimeFiberIdSpace space;
+        std::vector<Fiber> fibers = loaded({"a.json"});
+        assignStableRuntimeIds(fibers, space, {});
+        const uint64_t created = allocateRuntimeFiberId(space, {});
+        QCOMPARE(created, uint64_t{2});
+        bindRuntimeFiberIdentity(space, "created.json", created);
+        fibers = loaded({"a.json", "created.json"});
+        assignStableRuntimeIds(fibers, space, {});
+        QCOMPARE(idsOf(fibers), (std::vector<uint64_t>{1, 2}));
+        // Binding never lowers the mark, and binding an unnamed or id-less
+        // record is a no-op.
+        bindRuntimeFiberIdentity(space, "", 9);
+        bindRuntimeFiberIdentity(space, "x.json", 0);
+        QCOMPARE(space.idByFileName.size(), std::size_t{2});
+        QCOMPARE(allocateRuntimeFiberId(space, {}), uint64_t{3});
+    }
+
+    // A rename keeps the fiber's id under the new name and frees the old
+    // name: a later import under the old name is a different fiber.
+    void renameMovesTheBindingWithTheId()
+    {
+        RuntimeFiberIdSpace space;
+        std::vector<Fiber> fibers = loaded({"a.json", "b.json"});
+        assignStableRuntimeIds(fibers, space, {});
+        rebindRuntimeFiberIdentity(space, "a.json", "renamed.json", 1);
+        fibers = loaded({"b.json", "renamed.json"});
+        assignStableRuntimeIds(fibers, space, {});
+        QCOMPARE(idsOf(fibers), (std::vector<uint64_t>{2, 1}));
+        fibers = loaded({"a.json", "b.json", "renamed.json"});
+        assignStableRuntimeIds(fibers, space, {});
+        QCOMPARE(idsOf(fibers), (std::vector<uint64_t>{3, 2, 1}));
     }
 
     // Open sessions hold ids outside the stored list (a fiber created but not

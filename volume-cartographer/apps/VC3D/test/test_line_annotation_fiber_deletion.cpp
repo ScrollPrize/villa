@@ -1,8 +1,11 @@
 // Coverage for LineAnnotationFiberDeletion.hpp: deleting stored fibers across
 // the save drain in LineAnnotationController::deleteFibers. The drain runs a
-// nested event loop, and a reload during it reassigns runtime ids from 1, so
-// the file name captured before the wait - not the id - decides what is
-// deleted afterwards, and a package change during the wait deletes nothing.
+// nested event loop in which the list can change under the delete, so the file
+// name captured before the wait - not the id - decides what is deleted
+// afterwards, and a package change during the wait deletes nothing. The
+// fixture's reload deliberately renumbers every fiber from 1: that is the
+// regression the first review comment found (runtime ids are stable across
+// in-package reloads since), and the delete must stay correct even under it.
 
 #include <QtTest/QtTest>
 

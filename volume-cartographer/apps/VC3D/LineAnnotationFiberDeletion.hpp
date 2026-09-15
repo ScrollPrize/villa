@@ -4,14 +4,14 @@
 //
 // LineAnnotationController::deleteFibers has to drain queued saves before it
 // removes files, and the drain runs a nested event loop that still delivers
-// input. Anything that reloads the fiber list meanwhile (an import, a repair
-// reload, a project switch) reassigns the runtime ids from 1, so an id that
-// was captured before the wait can name a different fiber after it. The
-// identity that survives a reload is the file name, and the identity of the
+// input: the package can change, a fiber can be deleted, renamed or replaced
+// meanwhile (and, before runtime ids were made stable across reloads, a reload
+// renumbered every fiber - the regression the tests below still replay). The
+// identity that survives the wait is the file name, and the identity of the
 // package is its generation counter plus its fibers directory. These helpers
 // hold that reasoning in one place, free of Qt and of the controller, so the
 // capture / wait / resolve sequence can be exercised in a unit test with a
-// wait that reloads the list.
+// wait that changes the list.
 //
 // Fiber is any type with `uint64_t id` and `std::string fileName` members.
 
@@ -65,9 +65,9 @@ struct FiberDeleteResolution {
     std::vector<uint64_t> unnamed;
 };
 
-// What a delete did, for callers that must report per requested fiber: the
-// requested ids may have been reassigned by a reload during the wait, so the
-// outcome speaks in the file names captured before it. `requested` holds the
+// What a delete did, for callers that must report per requested fiber: a
+// requested id can stop naming a loaded fiber during the wait, so the outcome
+// speaks in the file names captured before it. `requested` holds the
 // capture (requested id -> file name) and `deletedFileNames` the files that
 // were actually removed; `aborted` says the package identity moved and
 // nothing was removed.
@@ -116,7 +116,7 @@ FiberDeleteCapture captureFiberDeleteTargets(const std::vector<uint64_t>& reques
 
 // After the wait: refuse if the package identity moved, otherwise match each
 // captured file name against the current list. The requested ids are never
-// consulted here; they may have been reassigned.
+// consulted here; the names are the identity.
 template <class Fiber>
 FiberDeleteResolution resolveFiberDeleteTargets(const FiberDeleteCapture& capture,
                                                 const std::vector<Fiber>& fibersNow,

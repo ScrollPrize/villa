@@ -151,8 +151,9 @@ public:
     struct FiberMapFiber {
         // Runtime id, valid only for the generation this snapshot was taken in.
         uint64_t id = 0;
-        // Stable identity across loads; the runtime id is reassigned per load,
-        // so anything acted on later must be resolved from this.
+        // Stable identity across loads and packages; the runtime id is
+        // per package and can be retired, so anything acted on later must
+        // be resolved from this.
         std::string fileName;
         // "<file prefix>-<sequence>", e.g. "kb-604".
         QString label;
@@ -278,8 +279,8 @@ public:
     void deleteFiber(uint64_t fiberId);
     // Deletes the requested fibers' files and drops them from the package.
     // Returns what was done in terms of the file names captured before the
-    // save drain (see LineAnnotationFiberDeletion.hpp): the requested ids
-    // may have been reassigned by a reload during the drain.
+    // save drain (see LineAnnotationFiberDeletion.hpp): a fiber can vanish,
+    // or the package can change, while the drain yields to the event loop.
     vc3d::line_annotation::FiberDeleteOutcome deleteFibers(std::vector<uint64_t> fiberIds);
     void renameFiberFile(uint64_t fiberId);
     void importFibers();
@@ -862,8 +863,8 @@ private:
             const LineAnnotationSession& session,
             vc3d::line_annotation::FiberOptimizationMode clickedMode,
             vc3d::line_annotation::FiberOptimizationMode candidateMode);
-    // fileNames, not runtime ids: ids are densely reassigned on reloads,
-    // which can happen while the prompt's modal spins.
+    // fileNames, not runtime ids: a fiber can be deleted, and the package
+    // can change, while the prompt's modal spins.
     void reoptimizeMergedFibers(const std::vector<std::string>& fiberFileNames);
     void emitFiberSummaries();
     void addKnownFiberTags(const std::vector<std::string>& tags);
@@ -890,6 +891,9 @@ private:
     // their ids, new ones get fresh ids) and remaps the stored branch refs by
     // file name onto them.
     void assignRuntimeFiberIds(std::vector<StoredFiber>& fibers);
+    // Binds a persisted fiber's file name to its id in the package's id space
+    // (see LineAnnotationFiberIdentity.hpp); called from the save paths.
+    void registerFiberIdentity(const StoredFiber& fiber) const;
     [[nodiscard]] uint64_t nextFiberSequenceForUsername(const std::string& username) const;
     [[nodiscard]] std::string currentFiberUsername() const;
     [[nodiscard]] static std::string currentFiberDateTimeString();
@@ -1144,8 +1148,15 @@ private:
     // vpkg-ready reloads, and a retired id is never reused) and is reset when
     // the package changes. _runtimeIdsPackageGeneration says which package
     // it belongs to.
-    vc3d::line_annotation::RuntimeFiberIdSpace _runtimeIds;
+    // mutable: a fiber's identity is bound when it is persisted, and the save
+    // paths are const (bookkeeping, not a change of state they report on).
+    mutable vc3d::line_annotation::RuntimeFiberIdSpace _runtimeIds;
     uint64_t _runtimeIdsPackageGeneration = 0;
+    // Counts loads of the fiber list. A load that yields to the event loop
+    // (the broken-link prompt, an error dialog) compares its own number
+    // against this afterwards and stands down if a newer load ran meanwhile,
+    // instead of publishing an older list over it.
+    uint64_t _fiberLoadSequence = 0;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;

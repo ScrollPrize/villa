@@ -396,9 +396,9 @@ QJsonObject AgentBridgeServer::handleFiberDelete(const QJsonValue& params)
     const QString err = captureFiberError(ctrl, [&] { outcome = ctrl->deleteFibers(ids); });
 
     // What actually got removed, in terms of the file names captured before
-    // the controller's save drain: a reload during that drain reassigns the
-    // runtime ids, so "is the requested id still listed" would answer for a
-    // different fiber. deleteFibers continues past per-file failures.
+    // the controller's save drain: the package can change during that drain,
+    // so "is the requested id still listed" is not the question. deleteFibers
+    // continues past per-file failures.
     QJsonArray deleted;
     bool allDeleted = !outcome.aborted;
     for (uint64_t id : ids) {

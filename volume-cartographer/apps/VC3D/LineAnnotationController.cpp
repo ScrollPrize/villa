@@ -3066,11 +3066,10 @@ vc3d::line_annotation::FiberDeleteOutcome LineAnnotationController::deleteFibers
 
     // Queued save jobs are drained first: a save still in flight for one of
     // these fibers would recreate the file right after the remove below. The
-    // drain yields to the event loop, and anything that reloads the fiber
-    // list meanwhile (an import, a repair reload, a project switch) hands
-    // the runtime ids out again from 1 - so the fibers are captured by file
-    // name and package identity before the wait and re-resolved after it;
-    // see LineAnnotationFiberDeletion.hpp.
+    // drain yields to the event loop, in which the package can change or a
+    // fiber can vanish - so the fibers are captured by file name and package
+    // identity before the wait and re-resolved after it; see
+    // LineAnnotationFiberDeletion.hpp.
     const auto identityNow = [this]() {
         return deletion::FiberDeletePackageIdentity{packageGeneration(),
                                                     fibersDir().string()};
@@ -3177,11 +3176,15 @@ vc3d::line_annotation::FiberDeleteOutcome LineAnnotationController::deleteFibers
     for (uint64_t deletedId : deletedIds) {
         invalidateFiberAlignmentMetrics(deletedId, false);
     }
-    // Open sessions keep the id they were opened with, and a reload during
-    // the drain may have reassigned the stored ids; the shared rule matches
-    // a named session by file name only (see LineAnnotationFiberDeletion.hpp),
-    // so a survivor holding a deleted fiber's new id keeps saving and the
-    // deleted fiber's own session does not re-create the file.
+    // The names are retired from the package's id space: a later file under
+    // one of them is a new fiber with a fresh id, not this one resurrected
+    // for whoever still holds the old id.
+    for (const auto& [deletedId, deletedFileName] : deletedFibers) {
+        vc3d::line_annotation::retireRuntimeFiberIdentity(_runtimeIds, deletedFileName);
+    }
+    // Save suppression for open sessions goes by the shared identity rule
+    // (see LineAnnotationFiberDeletion.hpp): a named session by file name,
+    // an unnamed one by id.
     std::vector<std::string> deletedFileNames;
     deletedFileNames.reserve(deletedFibers.size());
     for (const auto& [deletedId, deletedFileName] : deletedFibers) {
@@ -3303,6 +3306,10 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
     }
 
     *it = std::move(renamed);
+    // The fiber keeps its id under the new name; the old name no longer
+    // denotes it (see LineAnnotationFiberIdentity.hpp).
+    vc3d::line_annotation::rebindRuntimeFiberIdentity(_runtimeIds, oldFileName, it->fileName,
+                                                      it->id);
     for (const auto& pane : _panes) {
         if (pane.session && pane.session->fiberId == fiberId) {
             pane.session->fiberFileName = it->fileName;
@@ -8051,8 +8058,8 @@ void LineAnnotationController::handleGeneratedNewLineAnnotationLinkedToCandidate
     // Deferred: this runs inside the context-menu callback of the current
     // dialog, and opening finalizes, saves and closes that dialog. Value
     // capture only; the controller is the context object. Fiber ids are
-    // reassigned per package load, so a switch that lands in between must
-    // not open an unrelated fiber of the new package.
+    // per package, so a switch that lands in between must not open an
+    // unrelated fiber of the new package.
     QTimer::singleShot(0, this,
                        [this, fiberId = *newFiberId, packageGeneration = _packageGeneration]() {
                            if (_packageGeneration != packageGeneration) {
@@ -12665,9 +12672,18 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         _runtimeIdsPackageGeneration = _packageGeneration;
     }
     // The load below can hand control to a nested event loop (the broken-link
-    // prompt); a package switch inside it publishes its own list, and this
-    // load must then not publish an older package's fibers over it.
+    // prompt, an error dialog); a package switch or a newer load of this
+    // package inside it publishes its own list, and this load must then
+    // stand down rather than publish an older list over it.
     const uint64_t loadPackageGeneration = _packageGeneration;
+    const uint64_t loadToken = ++_fiberLoadSequence;
+    const auto superseded = [this, loadPackageGeneration, loadToken](const char* where) {
+        if (_packageGeneration == loadPackageGeneration && _fiberLoadSequence == loadToken) {
+            return false;
+        }
+        Logger()->warn("Fiber load superseded while {} was open; discarding it", where);
+        return true;
+    };
     // Candidates hold ids of fibers that may not survive the reload.
     _linkCandidate.reset();
     _splitCandidate.reset();
@@ -12822,9 +12838,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
             prompt.exec();
             repairRequested = (prompt.clickedButton() == repairButton);
         }
-        if (_packageGeneration != loadPackageGeneration) {
-            Logger()->warn("Fiber load superseded by a package change while the "
-                           "broken-link prompt was open; discarding it");
+        if (superseded("the broken-link prompt")) {
             return;
         }
 
@@ -12844,6 +12858,9 @@ void LineAnnotationController::loadFibersForCurrentPackage()
                           .arg(QString::fromStdString(
                               repairErrors.empty() ? std::string{"unknown error"}
                                                    : repairErrors.front())));
+            if (superseded("the repair error dialog")) {
+                return;
+            }
         }
 
         auto strict = loadStrictFibers();
@@ -12871,6 +12888,9 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         }
     }
 
+    if (superseded("a dialog")) {
+        return;
+    }
     _fibers = std::move(loadedFibers);
     if (!loadErrors.empty()) {
         for (const auto& error : loadErrors) {
@@ -12931,8 +12951,8 @@ void LineAnnotationController::loadFibersForCurrentPackage()
 
 void LineAnnotationController::promptReoptimizationForMergedFibers()
 {
-    // Collected by fileName, not runtime id: ids are densely reassigned on
-    // every reload, and a reload can happen while the modal below spins.
+    // Collected by fileName, not runtime id: a fiber can be deleted, and the
+    // package can change, while the modal below spins.
     std::vector<std::string> tagged;
     for (const auto& fiber : _fibers) {
         if (!fiber.fileName.empty() &&
@@ -13356,6 +13376,11 @@ uint64_t LineAnnotationController::allocateFiberId(uint64_t minimumId)
     return vc3d::line_annotation::allocateRuntimeFiberId(_runtimeIds, live, minimumId);
 }
 
+void LineAnnotationController::registerFiberIdentity(const StoredFiber& fiber) const
+{
+    vc3d::line_annotation::bindRuntimeFiberIdentity(_runtimeIds, fiber.fileName, fiber.id);
+}
+
 void LineAnnotationController::assignRuntimeFiberIds(std::vector<StoredFiber>& fibers)
 {
     vc3d::line_annotation::assignStableRuntimeIds(fibers, _runtimeIds, liveSessionFiberIds());
@@ -13512,7 +13537,7 @@ LineAnnotationController::fiberSnapshotsForSideStripQuery() const
     // Per-fiber memoization: a snapshot (and its geometry hash) is rebuilt
     // only when the fiber's geometry actually changed - the stored copy by
     // its save generation (plus the package generation, since runtime ids
-    // are reassigned per load), an open session by its line revision and
+    // are per package), an open session by its line revision and
     // edit epoch. Unchanged fibers cost two integer compares per query
     // instead of a full polyline deep copy plus per-point hashing. The
     // caches are GUI-thread-only (like all controller state); workers only
@@ -14628,10 +14653,10 @@ void LineAnnotationController::removeBranchLinksToFiber(uint64_t fiberId,
         return;
     }
     std::vector<uint64_t> affectedFiberIds;
-    // Named refs are matched by file name only (see
-    // LineAnnotationFiberDeletion.hpp): a reload during the delete's save
-    // drain reassigns stored ids, so a ref's recorded id can point at the
-    // deleted fiber's new id while its name says another fiber.
+    // Refs are matched by the shared identity rule (names decide when both
+    // are known; see LineAnnotationFiberIdentity.hpp), so an id that has
+    // gone stale can never make a ref to another fiber read as a ref to the
+    // deleted one.
     auto removeBranches = [&](std::vector<FiberBranchRef>& branches, uint64_t ownerFiberId) {
         const auto before = branches.size();
         branches.erase(
@@ -15789,6 +15814,9 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
 
 void LineAnnotationController::saveFiberNow(const StoredFiber& fiber) const
 {
+    // Persisting establishes the fiber's identity: its name keeps this id
+    // across the package's reloads.
+    registerFiberIdentity(fiber);
     const fs::path dir = fibersDir();
     if (dir.empty()) {
         throw std::runtime_error("No volume package is loaded");
@@ -15800,6 +15828,9 @@ void LineAnnotationController::saveFiberNow(const StoredFiber& fiber) const
 LineAnnotationController::FiberSaveSnapshot
 LineAnnotationController::makeFiberSaveSnapshot(const StoredFiber& fiber) const
 {
+    // Queued for persisting: the identity is bound now, before the save
+    // runs, so a reload in between already keeps this id for the name.
+    registerFiberIdentity(fiber);
     FiberSaveSnapshot snapshot;
     snapshot.fiberId = fiber.id;
     snapshot.generation = fiber.generation;

@@ -10,8 +10,14 @@
 //  1. Within one package, a fiber keeps its runtime id across reloads of the
 //     fiber list (import, repair reloads, the vpkg-ready load), and ids are
 //     never recycled: a new file gets a fresh id above every id ever handed out
-//     in the package, a deleted fiber's id stays retired. Only a package switch
-//     restarts the numbering. See assignStableRuntimeIds.
+//     in the package. A file name that is merely absent from one load (a parse
+//     failure, a strict pass) keeps its binding and returns with its id; a file
+//     name whose fiber was deleted through the app has its binding retired, so
+//     a later file under that name is a new fiber with a new id. Only a package
+//     switch restarts the numbering. Identity here is the package-local file
+//     name, not the physical file: a file replaced on disk under an unchanged
+//     name outside the app is, by this rule, the same fiber. See
+//     assignStableRuntimeIds and the bind / retire / rebind helpers.
 //  2. Where a record carries both an id and a file name, the names decide when
 //     both are known and the id counts only when a name is missing on either
 //     side. See sameFiberIdentity. This covers the window inside a reload and
@@ -83,6 +89,42 @@ void assignStableRuntimeIds(std::vector<Fiber>& fibers,
             space.idByFileName[fiber.fileName] = fiber.id;
         }
     }
+}
+
+// A fiber created by the app (a saved session, a merge, a split, a linked
+// seed) establishes its identity when it is first persisted: its file name is
+// bound to the id it was allocated, so the next reload keeps that id. Binding
+// a name already bound to another id moves it (the name now denotes this
+// fiber); the mark never drops below a bound id.
+inline void bindRuntimeFiberIdentity(RuntimeFiberIdSpace& space,
+                                     const std::string& fileName,
+                                     uint64_t id)
+{
+    if (fileName.empty() || id == 0) {
+        return;
+    }
+    space.idByFileName[fileName] = id;
+    space.nextId = std::max(space.nextId, id + 1);
+}
+
+// A fiber deleted through the app: the name's binding is dropped (the id
+// itself stays retired, since the mark never falls), so a later file under
+// the same name is a new fiber with a fresh id rather than the old one
+// resurrected for holders that still remember it.
+inline void retireRuntimeFiberIdentity(RuntimeFiberIdSpace& space, const std::string& fileName)
+{
+    space.idByFileName.erase(fileName);
+}
+
+// A fiber renamed through the app keeps its id under the new name; the old
+// name is unbound, so a later file under it is a different fiber.
+inline void rebindRuntimeFiberIdentity(RuntimeFiberIdSpace& space,
+                                       const std::string& oldFileName,
+                                       const std::string& newFileName,
+                                       uint64_t id)
+{
+    space.idByFileName.erase(oldFileName);
+    bindRuntimeFiberIdentity(space, newFileName, id);
 }
 
 // A fresh id for a fiber created outside a reload (a new session, a merge, a
