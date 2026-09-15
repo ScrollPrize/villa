@@ -197,6 +197,11 @@ void attachEditableOpenDataSegmentRoot(
     const std::filesystem::path& editableSegmentsRoot,
     bool select = true);
 
+void attachOpenDataPatchesRoot(
+    VolumePkg& pkg,
+    const std::vector<std::string>& volumeTags,
+    const std::string& patchesRootLocation);
+
 OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
     VolumePkg& pkg,
     const OpenDataSample& sample,
