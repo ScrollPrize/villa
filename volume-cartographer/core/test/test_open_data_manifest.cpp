@@ -1701,6 +1701,143 @@ TEST_CASE("OpenDataSegmentCache editable copy inherits routing from an aggregate
     std::filesystem::remove_all(testRoot);
 }
 
+TEST_CASE("OpenDataSegmentCache patches root follows the routing of the grow volume")
+{
+    const auto testRoot = std::filesystem::temp_directory_path() /
+                          ("vc_open_data_patches_routing_test_" +
+                           std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(testRoot);
+    const auto patchesRoot = testRoot / "segments" / "patches";
+    std::filesystem::create_directories(testRoot / "segments" / "vol1");
+    std::filesystem::create_directories(testRoot / "segments" / "vol2");
+    std::filesystem::create_directories(patchesRoot);
+
+    const auto previousAutosaveRoot = VolumePkg::autosaveRoot();
+    VolumePkg::setAutosaveRoot(testRoot / "autosave");
+    const auto projectPath = testRoot / "sample.volpkg.json";
+    auto pkg = VolumePkg::newEmpty();
+    pkg->save(projectPath);
+    for (const std::string id : {"vol1", "vol2"}) {
+        REQUIRE(pkg->addSegmentsEntry(
+            (testRoot / "segments" / id).string(),
+            {"open-data", "immutable", "vc-open-data-segment-aggregate",
+             "vc-open-data-target-volume-id:" + id,
+             "vc-open-data-source-coordinate-level:0",
+             "vc-open-data-coordinate-space:sample/" + id + "@L0"}));
+    }
+    REQUIRE(pkg->addSegmentsEntry(patchesRoot.string(), {"growpatch"}));
+
+    auto patchesEntryTags = [&](const VolumePkg& project) {
+        std::vector<std::vector<std::string>> found;
+        for (const auto& entry : project.segmentEntries()) {
+            if (entry.location == patchesRoot.string()) {
+                found.push_back(entry.tags);
+            }
+        }
+        REQUIRE(found.size() == 1);
+        return found.front();
+    };
+
+    attachOpenDataPatchesRoot(
+        *pkg,
+        {"vc-open-data-volume-id:vol1",
+         "vc-open-data-coordinate-space:sample/vol1@L0"},
+        patchesRoot.string());
+    pkg->setOutputSegments(patchesRoot.string());
+    const std::vector<std::string> vol1Tags{
+        "growpatch",
+        "open-data-patches",
+        "vc-open-data-target-volume-id:vol1",
+        "vc-open-data-source-coordinate-level:0",
+        "vc-open-data-coordinate-space:sample/vol1@L0",
+    };
+    CHECK(patchesEntryTags(*pkg) == vol1Tags);
+
+    vc::project::LoadOptions opts;
+    opts.deferResolution = true;
+    auto reopened = VolumePkg::load(projectPath, opts);
+    CHECK(patchesEntryTags(*reopened) == vol1Tags);
+    CHECK(reopened->outputSegmentsPath() == patchesRoot);
+    reopened.reset();
+
+    attachOpenDataPatchesRoot(
+        *pkg,
+        {"vc-open-data-coordinate-space:sample/vol2@L0"},
+        patchesRoot.string());
+    CHECK(patchesEntryTags(*pkg) == std::vector<std::string>{
+        "growpatch",
+        "open-data-patches",
+        "vc-open-data-target-volume-id:vol2",
+        "vc-open-data-source-coordinate-level:0",
+        "vc-open-data-coordinate-space:sample/vol2@L0",
+    });
+
+    attachOpenDataPatchesRoot(*pkg, {}, patchesRoot.string());
+    CHECK(patchesEntryTags(*pkg) ==
+          std::vector<std::string>{"growpatch", "open-data-patches"});
+
+    pkg.reset();
+    VolumePkg::setAutosaveRoot(previousAutosaveRoot);
+    std::filesystem::remove_all(testRoot);
+}
+
+TEST_CASE("OpenDataSampleProject reopens on the volume of a selected patches root")
+{
+    OpenDataSample sample;
+    sample.id = "PHerc0139";
+    for (const std::string id : {"vol-a", "vol-b"}) {
+        OpenDataVolume volume;
+        volume.id = id;
+        volume.dataFormat = "zarr";
+        OpenDataArtifact artifact;
+        artifact.type = "zarr";
+        artifact.resolvedUrl = "http://127.0.0.1:9/" + id + ".zarr";
+        volume.artifacts.push_back(std::move(artifact));
+        sample.volumes.push_back(std::move(volume));
+    }
+    for (int i = 0; i < 2; ++i) {
+        OpenDataSegment segment;
+        segment.originalVolumeId = "vol-b";
+        sample.segments.push_back(std::move(segment));
+    }
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+                           ("vc_open_data_patches_reopen_test_" +
+                            std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(cacheRoot);
+    const auto patchesRoot = openDataPatchesRoot(cacheRoot, sample.id);
+    std::filesystem::create_directories(patchesRoot);
+
+    OpenDataSampleProjectResult firstResult;
+    auto first = createOpenDataSampleProject(sample, cacheRoot, &firstResult);
+    REQUIRE(first);
+    CHECK(firstResult.preferredVolumeId == "vol-b");
+    REQUIRE(first->addSegmentsEntry(
+        patchesRoot.string(),
+        {"growpatch", "open-data-patches", "vc-open-data-target-volume-id:vol-a"}));
+    first->setOutputSegments(patchesRoot.string());
+    first.reset();
+
+    OpenDataSampleProjectResult secondResult;
+    auto second = createOpenDataSampleProject(sample, cacheRoot, &secondResult);
+    REQUIRE(second);
+    CHECK(secondResult.preferredVolumeId == "vol-a");
+    CHECK(second->outputSegmentsPath() == patchesRoot);
+    REQUIRE(second->reconcileSegmentsEntryTags(
+        patchesRoot.string(),
+        {"vc-open-data-target-volume-id:vol-z"},
+        {"vc-open-data-target-volume-id:"}));
+    second.reset();
+
+    OpenDataSampleProjectResult thirdResult;
+    auto third = createOpenDataSampleProject(sample, cacheRoot, &thirdResult);
+    REQUIRE(third);
+    CHECK(thirdResult.preferredVolumeId == "vol-b");
+    third.reset();
+
+    std::filesystem::remove_all(cacheRoot);
+}
+
 TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
 {
     OpenDataSample sample;

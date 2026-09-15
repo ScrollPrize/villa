@@ -15,6 +15,7 @@
 #include <exception>
 #include <filesystem>
 #include <map>
+#include <string_view>
 #include <system_error>
 
 namespace vc3d::opendata {
@@ -345,6 +346,51 @@ std::filesystem::path sampleProjectCachePath(
            (safePathComponent(sample.id.empty() ? "sample" : sample.id) + ".volpkg.json");
 }
 
+std::string selectedWritableRootVolumeId(
+    const VolumePkg& pkg,
+    const OpenDataSample& sample)
+{
+    const auto selectedPath = pkg.outputSegmentsPath();
+    if (selectedPath.empty()) {
+        return {};
+    }
+    constexpr std::string_view targetPrefix = "vc-open-data-target-volume-id:";
+    for (const auto& entry : pkg.segmentEntries()) {
+        if ((!vc::project::hasEntryTag(entry, "open-data-editable") &&
+             !vc::project::hasEntryTag(entry, "open-data-patches")) ||
+            vc::project::isLocationRemote(entry.location)) {
+            continue;
+        }
+        std::error_code error;
+        const bool selected = std::filesystem::equivalent(
+            selectedPath,
+            vc::project::resolveLocalPath(entry.location, pkg.path().parent_path()),
+            error);
+        if (!selected || error) {
+            continue;
+        }
+        for (const auto& tag : entry.tags) {
+            if (tag.rfind(targetPrefix, 0) != 0) {
+                continue;
+            }
+            const auto volumeId = tag.substr(targetPrefix.size());
+            const bool inSample = std::any_of(
+                sample.volumes.begin(), sample.volumes.end(),
+                [&](const OpenDataVolume& volume) { return volume.id == volumeId; });
+            const bool attached = std::any_of(
+                pkg.volumeEntries().begin(), pkg.volumeEntries().end(),
+                [&](const vc::project::Entry& volumeEntry) {
+                    return vc::project::hasEntryTag(
+                        volumeEntry, "vc-open-data-volume-id:" + volumeId);
+                });
+            if (inSample && attached) {
+                return volumeId;
+            }
+        }
+    }
+    return {};
+}
+
 bool isNonEmptyFile(const std::filesystem::path& path)
 {
     std::error_code ec;
@@ -422,6 +468,10 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     // cached projects.
     attachOpenDataSampleSegments(*pkg, sample, remoteCacheRoot, result,
                                  progressCallback);
+    if (auto workingVolumeId = selectedWritableRootVolumeId(*pkg, sample);
+        !workingVolumeId.empty()) {
+        result.preferredVolumeId = std::move(workingVolumeId);
+    }
     // Catalog loads remain unresolved until volume tags, normal-grid paths,
     // and every segment representation/cache entry have been reconciled.
     if (pkg->entryResolutionDeferred()) {
