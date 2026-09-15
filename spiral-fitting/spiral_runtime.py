@@ -28,7 +28,8 @@ from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_INTERVAL_ITERATIONS,
                          SpiralInputPaths, SpiralPreviewConfig,
                          SpiralRunConfig, run_mutable_config,
                          write_autosave_metadata)
-from config import (BACKFILLABLE_CONFIG_DEFAULTS, Config, FitConfig,
+from config import (BACKFILLABLE_CONFIG_DEFAULTS, RETIRED_CONFIG_KEYS,
+                    Config, FitConfig,
                     durable_config)
 from spiral_progress import NullProgressReporter, ProgressReporter
 
@@ -937,6 +938,8 @@ class InteractiveFitSession:
                         checkpoint_config.get('cfg'), Mapping):
                     raise ValueError("Checkpoint has no current Spiral configuration")
                 durable = dict(checkpoint_config['cfg'])
+                for key in RETIRED_CONFIG_KEYS:
+                    durable.pop(key, None)
                 # Checkpoints store the durable subset of the schema
                 # (see config.durable_config), so key sets compare
                 # against that subset. A small explicit allowlist records

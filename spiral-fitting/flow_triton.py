@@ -1,11 +1,19 @@
-"""Fused Triton kernels for the time-invariant RK4 flow integration.
+"""Fused Triton kernels for the piecewise-stationary RK4 flow integration.
 
 The eager path (flow_fields._RK4SparseFlowIntegrate) launches ~10 kernels per
 stage sample in forward (two grid_samples plus stage arithmetic) and ~25 in
 backward (_sparse_backward_impl: corner gathers, weight products, reductions,
 index_add_). Per point the whole integration is independent, so the entire
-forward (n_steps x 4 stage samples) runs as ONE kernel here, and the entire
-adjoint sweep as ONE kernel, with all intermediates kept in registers.
+forward (num_slabs x n_steps x 4 stage samples) runs as ONE kernel here, and
+the entire adjoint sweep as ONE kernel, with all intermediates kept in
+registers.
+
+Every lattice carries a leading slab axis: slab t is a stationary velocity
+field integrated for unit time (n_steps RK4 steps of size h), and the slabs
+compose in order. The kernels walk the flattened (slab, step) sequence, so
+composing N stationary flows costs one launch per direction, not N. With
+REVERSE the slab order is reversed (and the caller negates h), which is the
+inverse of the composition.
 
 Numerical contract: same arithmetic and evaluation order as the eager path,
 but the compiler is free to contract mul+add chains into FMAs (like nvcc does
@@ -137,18 +145,28 @@ if _HAS_TRITON:
 
     @triton.jit
     def _rk4_fwd_kernel(y_ptr, out_ptr, stages_ptr,
-                        low_ptr, high_ptr, scale,
+                        low_base, high_base, scale,
                         N, Z, Y, X, zm1f, ym1f, xm1f,
-                        h, h_half, h_sixth, n_steps,
+                        h, h_half, h_sixth, n_steps, num_slabs,
+                        REVERSE: tl.constexpr,
                         STORE_STAGES: tl.constexpr, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
         i = pid * BLOCK + tl.arange(0, BLOCK)
         m = i < N
         ch = tl.full((), Z, tl.int64) * Y * X
+        slab_stride = ch * 3
         yz = tl.load(y_ptr + i * 3 + 0, mask=m, other=0.0)
         yy = tl.load(y_ptr + i * 3 + 1, mask=m, other=0.0)
         yx = tl.load(y_ptr + i * 3 + 2, mask=m, other=0.0)
-        for step in range(n_steps):
+        # Flattened (slab, step) walk: step // n_steps is the slab being
+        # applied, so the stage-point index `step * 4 + k` stays contiguous.
+        for step in range(n_steps * num_slabs):
+            slab = step // n_steps
+            if REVERSE:
+                slab = num_slabs - 1 - slab
+            slab_off = slab.to(tl.int64) * slab_stride
+            low_ptr = low_base + slab_off
+            high_ptr = high_base + slab_off
             if STORE_STAGES:
                 s = (step * 4 + 0) * N.to(tl.int64)
                 tl.store(stages_ptr + (s + i) * 3 + 0, yz, mask=m)
@@ -318,18 +336,27 @@ if _HAS_TRITON:
 
     @triton.jit
     def _rk4_bwd_kernel(grad_y_ptr, grad_pts_ptr, stages_ptr,
-                        low_ptr, high_ptr, acc_ptr, scale,
+                        low_base, high_base, acc_base, scale,
                         N, Z, Y, X, zm1f, ym1f, xm1f, zm2f, ym2f, xm2f,
-                        h, h_half, h_sixth, n_steps,
+                        h, h_half, h_sixth, n_steps, num_slabs,
+                        REVERSE: tl.constexpr,
                         HAS_ACC: tl.constexpr, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
         i = pid * BLOCK + tl.arange(0, BLOCK)
         m = i < N
         ch = tl.full((), Z, tl.int64) * Y * X
+        slab_stride = ch * 3
         gz = tl.load(grad_y_ptr + i * 3 + 0, mask=m, other=0.0)
         gy = tl.load(grad_y_ptr + i * 3 + 1, mask=m, other=0.0)
         gx = tl.load(grad_y_ptr + i * 3 + 2, mask=m, other=0.0)
-        for step in range(n_steps - 1, -1, -1):
+        for step in range(n_steps * num_slabs - 1, -1, -1):
+            slab = step // n_steps
+            if REVERSE:
+                slab = num_slabs - 1 - slab
+            slab_off = slab.to(tl.int64) * slab_stride
+            low_ptr = low_base + slab_off
+            high_ptr = high_base + slab_off
+            acc_ptr = acc_base + slab_off
             s1 = (step * 4 + 0) * N.to(tl.int64)
             s2 = (step * 4 + 1) * N.to(tl.int64)
             s3 = (step * 4 + 2) * N.to(tl.int64)
@@ -439,19 +466,27 @@ if _HAS_TRITON:
 
     @triton.jit
     def _rk4d_fwd_kernel(y_ptr, out_ptr, stages_ptr,
-                         lo_ptr, lo_az, lo_bz, lo_ay, lo_by, lo_ax, lo_bx,
+                         lo_base, lo_az, lo_bz, lo_ay, lo_by, lo_ax, lo_bx,
                          loZ, loY, loX, lo_scale,
-                         hi_ptr, hi_az, hi_bz, hi_ay, hi_by, hi_ax, hi_bx,
+                         hi_base, hi_az, hi_bz, hi_ay, hi_by, hi_ax, hi_bx,
                          hiZ, hiY, hiX, hi_scale,
-                         N, h, h_half, h_sixth, n_steps,
+                         N, h, h_half, h_sixth, n_steps, num_slabs,
+                         REVERSE: tl.constexpr,
                          STORE_STAGES: tl.constexpr, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
         i = pid * BLOCK + tl.arange(0, BLOCK)
         m = i < N
+        lo_stride = loZ.to(tl.int64) * loY * loX * 3
+        hi_stride = hiZ.to(tl.int64) * hiY * hiX * 3
         yz = tl.load(y_ptr + i * 3 + 0, mask=m, other=0.0)
         yy = tl.load(y_ptr + i * 3 + 1, mask=m, other=0.0)
         yx = tl.load(y_ptr + i * 3 + 2, mask=m, other=0.0)
-        for step in range(n_steps):
+        for step in range(n_steps * num_slabs):
+            slab = step // n_steps
+            if REVERSE:
+                slab = num_slabs - 1 - slab
+            lo_ptr = lo_base + slab.to(tl.int64) * lo_stride
+            hi_ptr = hi_base + slab.to(tl.int64) * hi_stride
             if STORE_STAGES:
                 s = (step * 4 + 0) * N.to(tl.int64)
                 tl.store(stages_ptr + (s + i) * 3 + 0, yz, mask=m)
@@ -587,19 +622,31 @@ if _HAS_TRITON:
 
     @triton.jit
     def _rk4d_bwd_kernel(grad_y_ptr, grad_pts_ptr, stages_ptr,
-                         lo_ptr, acc_lo_ptr, lo_az, lo_bz, lo_ay, lo_by, lo_ax, lo_bx,
+                         lo_base, acc_lo_base, lo_az, lo_bz, lo_ay, lo_by, lo_ax, lo_bx,
                          loZ, loY, loX, lo_scale,
-                         hi_ptr, acc_hi_ptr, hi_az, hi_bz, hi_ay, hi_by, hi_ax, hi_bx,
+                         hi_base, acc_hi_base, hi_az, hi_bz, hi_ay, hi_by, hi_ax, hi_bx,
                          hiZ, hiY, hiX, hi_scale,
-                         N, h, h_half, h_sixth, n_steps,
+                         N, h, h_half, h_sixth, n_steps, num_slabs,
+                         REVERSE: tl.constexpr,
                          HAS_ACC: tl.constexpr, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
         i = pid * BLOCK + tl.arange(0, BLOCK)
         m = i < N
+        lo_stride = loZ.to(tl.int64) * loY * loX * 3
+        hi_stride = hiZ.to(tl.int64) * hiY * hiX * 3
         gz = tl.load(grad_y_ptr + i * 3 + 0, mask=m, other=0.0)
         gy = tl.load(grad_y_ptr + i * 3 + 1, mask=m, other=0.0)
         gx = tl.load(grad_y_ptr + i * 3 + 2, mask=m, other=0.0)
-        for step in range(n_steps - 1, -1, -1):
+        for step in range(n_steps * num_slabs - 1, -1, -1):
+            slab = step // n_steps
+            if REVERSE:
+                slab = num_slabs - 1 - slab
+            lo_off = slab.to(tl.int64) * lo_stride
+            hi_off = slab.to(tl.int64) * hi_stride
+            lo_ptr = lo_base + lo_off
+            hi_ptr = hi_base + hi_off
+            acc_lo_ptr = acc_lo_base + lo_off
+            acc_hi_ptr = acc_hi_base + hi_off
             s1 = (step * 4 + 0) * N.to(tl.int64)
             s2 = (step * 4 + 1) * N.to(tl.int64)
             s3 = (step * 4 + 2) * N.to(tl.int64)
@@ -777,10 +824,11 @@ if _HAS_TRITON:
 
     @triton.jit
     def _rk4_bwd_coalesced_kernel(grad_y_ptr, grad_pts_ptr, stages_ptr,
-                                  low_ptr, high_ptr, acc_ptr, scale,
+                                  low_base, high_base, acc_base, scale,
                                   N, Z, Y, X, zm1f, ym1f, xm1f,
                                   zm2f, ym2f, xm2f,
-                                  h, h_half, h_sixth, n_steps,
+                                  h, h_half, h_sixth, n_steps, num_slabs,
+                                  REVERSE: tl.constexpr,
                                   BLOCK: tl.constexpr):
         # _rk4_bwd_kernel with the field-gradient atomics deferred through
         # register accumulators: RK4 stage points move slowly relative to the
@@ -794,6 +842,7 @@ if _HAS_TRITON:
         i = pid * BLOCK + tl.arange(0, BLOCK)
         m = i < N
         ch = tl.full((), Z, tl.int64) * Y * X
+        slab_stride = ch * 3
         gz = tl.load(grad_y_ptr + i * 3 + 0, mask=m, other=0.0)
         gy = tl.load(grad_y_ptr + i * 3 + 1, mask=m, other=0.0)
         gx = tl.load(grad_y_ptr + i * 3 + 2, mask=m, other=0.0)
@@ -825,7 +874,14 @@ if _HAS_TRITON:
         rx5 = tl.zeros(i.shape, dtype=tl.float32)
         rx6 = tl.zeros(i.shape, dtype=tl.float32)
         rx7 = tl.zeros(i.shape, dtype=tl.float32)
-        for step in range(n_steps - 1, -1, -1):
+        for step in range(n_steps * num_slabs - 1, -1, -1):
+            slab = step // n_steps
+            if REVERSE:
+                slab = num_slabs - 1 - slab
+            slab_off = slab.to(tl.int64) * slab_stride
+            low_ptr = low_base + slab_off
+            high_ptr = high_base + slab_off
+            acc_ptr = acc_base + slab_off
             s1 = (step * 4 + 0) * N.to(tl.int64)
             s2 = (step * 4 + 1) * N.to(tl.int64)
             s3 = (step * 4 + 2) * N.to(tl.int64)
@@ -909,10 +965,16 @@ if _HAS_TRITON:
             gz = ((gz + b4z) + b3z + b2z) + b1z
             gy = ((gy + b4y) + b3y + b2y) + b1y
             gx = ((gx + b4x) + b3x + b2x) + b1x
-        _flush_cell(acc_ptr, ch, Y, X, acz, acy, acx, m & have,
-                    rz0, rz1, rz2, rz3, rz4, rz5, rz6, rz7,
-                    ry0, ry1, ry2, ry3, ry4, ry5, ry6, ry7,
-                    rx0, rx1, rx2, rx3, rx4, rx5, rx6, rx7)
+            # The held sums belong to this slab's lattice. The reverse walk
+            # finishes a slab at its first step, so flush there (this also
+            # covers the very last step of the walk); the next slab's stage
+            # then starts a fresh cell.
+            slab_done = (step % n_steps) == 0
+            _flush_cell(acc_ptr, ch, Y, X, acz, acy, acx, m & have & slab_done,
+                        rz0, rz1, rz2, rz3, rz4, rz5, rz6, rz7,
+                        ry0, ry1, ry2, ry3, ry4, ry5, ry6, ry7,
+                        rx0, rx1, rx2, rx3, rx4, rx5, rx6, rx7)
+            have = have & ((step % n_steps) != 0)
         tl.store(grad_pts_ptr + i * 3 + 0, gz, mask=m)
         tl.store(grad_pts_ptr + i * 3 + 1, gy, mask=m)
         tl.store(grad_pts_ptr + i * 3 + 2, gx, mask=m)
@@ -1011,19 +1073,27 @@ if _HAS_TRITON:
 
     @triton.jit
     def _rk4c_fwd_kernel(y_ptr, out_ptr, stages_ptr,
-                         lo_ptr, lo_num_phi_ptr, lo_offsets_ptr,
+                         lo_base, lo_num_phi_ptr, lo_offsets_ptr,
                          loNZ, loNR, loTOTAL,
-                         hi_ptr, hi_num_phi_ptr, hi_offsets_ptr,
+                         hi_base, hi_num_phi_ptr, hi_offsets_ptr,
                          hiNZ, hiNR, hiTOTAL,
-                         N, h, h_half, h_sixth, n_steps,
+                         N, h, h_half, h_sixth, n_steps, num_slabs,
+                         REVERSE: tl.constexpr,
                          STORE_STAGES: tl.constexpr, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
         i = pid * BLOCK + tl.arange(0, BLOCK)
         m = i < N
+        lo_stride = loNZ.to(tl.int64) * loTOTAL * 3
+        hi_stride = hiNZ.to(tl.int64) * hiTOTAL * 3
         yz = tl.load(y_ptr + i * 3, mask=m, other=0.0)
         yy = tl.load(y_ptr + i * 3 + 1, mask=m, other=0.0)
         yx = tl.load(y_ptr + i * 3 + 2, mask=m, other=0.0)
-        for step in range(n_steps):
+        for step in range(n_steps * num_slabs):
+            slab = step // n_steps
+            if REVERSE:
+                slab = num_slabs - 1 - slab
+            lo_ptr = lo_base + slab.to(tl.int64) * lo_stride
+            hi_ptr = hi_base + slab.to(tl.int64) * hi_stride
             if STORE_STAGES:
                 s = (step * 4) * N.to(tl.int64)
                 tl.store(stages_ptr + (s + i) * 3, yz, mask=m)
@@ -1170,19 +1240,31 @@ if _HAS_TRITON:
 
     @triton.jit
     def _rk4c_bwd_kernel(grad_y_ptr, grad_pts_ptr, stages_ptr,
-                         lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, lo_acc_ptr,
+                         lo_base, lo_num_phi_ptr, lo_offsets_ptr, lo_acc_base,
                          loNZ, loNR, loTOTAL,
-                         hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hi_acc_ptr,
+                         hi_base, hi_num_phi_ptr, hi_offsets_ptr, hi_acc_base,
                          hiNZ, hiNR, hiTOTAL,
-                         N, h, h_half, h_sixth, n_steps,
+                         N, h, h_half, h_sixth, n_steps, num_slabs,
+                         REVERSE: tl.constexpr,
                          HAS_ACC: tl.constexpr, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
         i = pid * BLOCK + tl.arange(0, BLOCK)
         m = i < N
+        lo_stride = loNZ.to(tl.int64) * loTOTAL * 3
+        hi_stride = hiNZ.to(tl.int64) * hiTOTAL * 3
         gz = tl.load(grad_y_ptr + i * 3, mask=m, other=0.0)
         gy = tl.load(grad_y_ptr + i * 3 + 1, mask=m, other=0.0)
         gx = tl.load(grad_y_ptr + i * 3 + 2, mask=m, other=0.0)
-        for step in range(n_steps - 1, -1, -1):
+        for step in range(n_steps * num_slabs - 1, -1, -1):
+            slab = step // n_steps
+            if REVERSE:
+                slab = num_slabs - 1 - slab
+            lo_off = slab.to(tl.int64) * lo_stride
+            hi_off = slab.to(tl.int64) * hi_stride
+            lo_ptr = lo_base + lo_off
+            hi_ptr = hi_base + hi_off
+            lo_acc_ptr = lo_acc_base + lo_off
+            hi_acc_ptr = hi_acc_base + hi_off
             s1 = (step * 4) * N.to(tl.int64)
             s2 = (step * 4 + 1) * N.to(tl.int64)
             s3 = (step * 4 + 2) * N.to(tl.int64)
@@ -1249,14 +1331,24 @@ def coalesce_enabled():
 
 
 def _launch_args(field):
-    Z, Y, X = field.shape[1], field.shape[2], field.shape[3]
+    # field :: slabs, 3, Z, Y, X
+    Z, Y, X = field.shape[2], field.shape[3], field.shape[4]
     return (
         Z, Y, X,
         float(Z - 1), float(Y - 1), float(X - 1),
     )
 
 
-def _run_fwd_kernel(y0, low_field, high_field, high_scale, h, n_steps, stages):
+def _stage_buffer(y0, num_slabs, n_steps):
+    # One (slab, step, RK4 stage) position record per point, in the order the
+    # forward kernel visits them, for the adjoint sweep.
+    return torch.empty(
+        int(num_slabs) * int(n_steps) * 4, y0.shape[0], 3,
+        device=y0.device, dtype=y0.dtype)
+
+
+def _run_fwd_kernel(y0, low_field, high_field, high_scale, h, n_steps, reverse,
+                    stages):
     n = y0.shape[0]
     out = torch.empty_like(y0)
     Z, Y, X, zm1f, ym1f, xm1f = _launch_args(low_field)
@@ -1266,40 +1358,45 @@ def _run_fwd_kernel(y0, low_field, high_field, high_scale, h, n_steps, stages):
             low_field, high_field, float(high_scale),
             n, Z, Y, X, zm1f, ym1f, xm1f,
             float(h), float(h / 2), float(h / 6), int(n_steps),
+            int(low_field.shape[0]),
+            REVERSE=bool(reverse),
             STORE_STAGES=stages is not None, BLOCK=_BLOCK,
         )
     return out
 
 
-def rk4_integrate(y0, low_field, high_field, high_scale, acc, h, n_steps):
-    # Entry point mirroring flow_fields._RK4SparseFlowIntegrate.apply. The
-    # grad-vs-inference split lives here because Function.forward always runs
-    # with grad disabled, so it cannot decide itself whether stage points for
-    # the adjoint sweep must be kept.
+def rk4_integrate(y0, low_field, high_field, high_scale, acc, h, n_steps,
+                  reverse=False):
+    # Entry point mirroring flow_fields._RK4SparseFlowIntegrate.apply, over
+    # every slab of [slabs, 3, Z, Y, X] fields (slabs applied in reverse order
+    # with `reverse`). The grad-vs-inference split lives here because
+    # Function.forward always runs with grad disabled, so it cannot decide
+    # itself whether stage points for the adjoint sweep must be kept.
     if torch.is_grad_enabled() and y0.requires_grad:
         return TritonRK4Integrate.apply(
-            y0, low_field, high_field, high_scale, acc, h, n_steps)
+            y0, low_field, high_field, high_scale, acc, h, n_steps, reverse)
     return _run_fwd_kernel(
-        y0.contiguous(), low_field, high_field, high_scale, h, n_steps, None)
+        y0.contiguous(), low_field, high_field, high_scale, h, n_steps,
+        reverse, None)
 
 
 class TritonRK4Integrate(torch.autograd.Function):
-    # Drop-in replacement for flow_fields._RK4SparseFlowIntegrate; same
-    # arguments, same saved-state footprint (the 4*n_steps stage points), same
+    # Fused counterpart of flow_fields._RK4SparseFlowIntegrate over all slabs;
+    # same saved-state footprint (the 4*n_steps stage points per slab), same
     # accumulator contract for the field gradient.
 
     @staticmethod
-    def forward(ctx, y0, low_field, high_field, high_scale, acc, h, n_steps):
+    def forward(ctx, y0, low_field, high_field, high_scale, acc, h, n_steps,
+                reverse):
         ctx.set_materialize_grads(False)
         y0 = y0.contiguous()
         perm = None
         if acc is not None and permute_enabled() and y0.shape[0] > _PERM_STRIDE:
             perm = _interleave_perm(y0.shape[0], y0.device)
             y0 = y0[perm].contiguous()
-        stages = torch.empty(
-            int(n_steps) * 4, y0.shape[0], 3, device=y0.device, dtype=y0.dtype)
+        stages = _stage_buffer(y0, low_field.shape[0], n_steps)
         out = _run_fwd_kernel(
-            y0, low_field, high_field, high_scale, h, n_steps, stages)
+            y0, low_field, high_field, high_scale, h, n_steps, reverse, stages)
         if perm is not None:
             unperm = torch.empty_like(out)
             unperm[perm] = out
@@ -1310,12 +1407,13 @@ class TritonRK4Integrate(torch.autograd.Function):
         ctx.acc = acc
         ctx.h = float(h)
         ctx.n_steps = int(n_steps)
+        ctx.reverse = bool(reverse)
         return out
 
     @staticmethod
     def backward(ctx, grad_y):
         if grad_y is None:
-            return None, None, None, None, None, None, None
+            return (None,) * 8
         low_field, high_field, stages = ctx.saved_tensors
         perm = ctx.perm
         if perm is not None:
@@ -1326,14 +1424,15 @@ class TritonRK4Integrate(torch.autograd.Function):
         acc = ctx.acc
         h = ctx.h
         Z, Y, X, zm1f, ym1f, xm1f = _launch_args(low_field)
+        num_slabs = int(low_field.shape[0])
         if n > 0 and acc is not None and coalesce_enabled():
             _rk4_bwd_coalesced_kernel[(triton.cdiv(n, _BLOCK),)](
                 grad_y, grad_pts, stages,
                 low_field, high_field, acc, ctx.high_scale,
                 n, Z, Y, X, zm1f, ym1f, xm1f,
                 float(Z - 2), float(Y - 2), float(X - 2),
-                h, float(h / 2), float(h / 6), ctx.n_steps,
-                BLOCK=_BLOCK,
+                h, float(h / 2), float(h / 6), ctx.n_steps, num_slabs,
+                REVERSE=ctx.reverse, BLOCK=_BLOCK,
             )
         elif n > 0:
             _rk4_bwd_kernel[(triton.cdiv(n, _BLOCK),)](
@@ -1342,20 +1441,22 @@ class TritonRK4Integrate(torch.autograd.Function):
                 acc if acc is not None else low_field, ctx.high_scale,
                 n, Z, Y, X, zm1f, ym1f, xm1f,
                 float(Z - 2), float(Y - 2), float(X - 2),
-                h, float(h / 2), float(h / 6), ctx.n_steps,
+                h, float(h / 2), float(h / 6), ctx.n_steps, num_slabs,
+                REVERSE=ctx.reverse,
                 HAS_ACC=acc is not None, BLOCK=_BLOCK,
             )
         if perm is not None:
             unperm = torch.empty_like(grad_pts)
             unperm[perm] = grad_pts
             grad_pts = unperm
-        return grad_pts, None, None, None, None, None, None
+        return grad_pts, None, None, None, None, None, None, None
 
 
 def _field_geoms(low_field, high_field):
     # (a, b) per dim per field s.t. lattice coord = normalised_point * a + b.
+    # Fields are [slabs, 3, Z, Y, X]; every slab shares the geometry.
     geom = []
-    for l, hh in zip(low_field.shape[1:], high_field.shape[1:]):
+    for l, hh in zip(low_field.shape[2:], high_field.shape[2:]):
         if l == hh:
             geom += [float(hh - 1), 0.0]
         else:
@@ -1363,33 +1464,40 @@ def _field_geoms(low_field, high_field):
             # with F.interpolate(align_corners=False)'s source-index map.
             s = l / hh
             geom += [float((hh - 1) * s), float(0.5 * s - 0.5)]
-    for hh in high_field.shape[1:]:
+    for hh in high_field.shape[2:]:
         geom += [float(hh - 1), 0.0]
     return geom  # lo az,bz,ay,by,ax,bx then hi az,bz,ay,by,ax,bx
 
 
-def _run_direct_fwd(y0, low, high, lo_scale, hi_scale, h, n_steps, stages):
+def _run_direct_fwd(y0, low, high, lo_scale, hi_scale, h, n_steps, reverse,
+                    stages):
     n = y0.shape[0]
     out = torch.empty_like(y0)
     if n > 0:
         g = _field_geoms(low, high)
         _rk4d_fwd_kernel[(triton.cdiv(n, _BLOCK),)](
             y0, out, stages if stages is not None else out,
-            low, *g[:6], low.shape[1], low.shape[2], low.shape[3], float(lo_scale),
-            high, *g[6:], high.shape[1], high.shape[2], high.shape[3], float(hi_scale),
+            low, *g[:6], low.shape[2], low.shape[3], low.shape[4], float(lo_scale),
+            high, *g[6:], high.shape[2], high.shape[3], high.shape[4], float(hi_scale),
             n, float(h), float(h / 2), float(h / 6), int(n_steps),
+            int(low.shape[0]),
+            REVERSE=bool(reverse),
             STORE_STAGES=stages is not None, BLOCK=_BLOCK,
         )
     return out
 
 
 def rk4_direct_integrate(y0, low, high, lo_scale, hi_scale, acc_lo, acc_hi,
-                         h, n_steps):
+                         h, n_steps, reverse=False):
+    # low :: slabs, 3, Zl, Yl, Xl and high :: slabs, 3, Z, Y, X; the slabs
+    # are applied in order (reverse order with `reverse`).
     if torch.is_grad_enabled() and y0.requires_grad:
         return TritonRK4DirectIntegrate.apply(
-            y0, low, high, lo_scale, hi_scale, acc_lo, acc_hi, h, n_steps)
+            y0, low, high, lo_scale, hi_scale, acc_lo, acc_hi, h, n_steps,
+            reverse)
     return _run_direct_fwd(
-        y0.contiguous(), low, high, lo_scale, hi_scale, h, n_steps, None)
+        y0.contiguous(), low, high, lo_scale, hi_scale, h, n_steps, reverse,
+        None)
 
 
 class TritonRK4DirectIntegrate(torch.autograd.Function):
@@ -1399,23 +1507,25 @@ class TritonRK4DirectIntegrate(torch.autograd.Function):
     # (see CartesianFlowField.apply_accumulated_field_grad).
 
     @staticmethod
-    def forward(ctx, y0, low, high, lo_scale, hi_scale, acc_lo, acc_hi, h, n_steps):
+    def forward(ctx, y0, low, high, lo_scale, hi_scale, acc_lo, acc_hi, h,
+                n_steps, reverse):
         ctx.set_materialize_grads(False)
         y0 = y0.contiguous()
-        stages = torch.empty(
-            int(n_steps) * 4, y0.shape[0], 3, device=y0.device, dtype=y0.dtype)
-        out = _run_direct_fwd(y0, low, high, lo_scale, hi_scale, h, n_steps, stages)
+        stages = _stage_buffer(y0, low.shape[0], n_steps)
+        out = _run_direct_fwd(
+            y0, low, high, lo_scale, hi_scale, h, n_steps, reverse, stages)
         ctx.save_for_backward(low, high, stages)
         ctx.scales = (float(lo_scale), float(hi_scale))
         ctx.accs = (acc_lo, acc_hi)
         ctx.h = float(h)
         ctx.n_steps = int(n_steps)
+        ctx.reverse = bool(reverse)
         return out
 
     @staticmethod
     def backward(ctx, grad_y):
         if grad_y is None:
-            return None, None, None, None, None, None, None, None, None
+            return (None,) * 10
         low, high, stages = ctx.saved_tensors
         grad_y = grad_y.contiguous()
         n = grad_y.shape[0]
@@ -1428,28 +1538,32 @@ class TritonRK4DirectIntegrate(torch.autograd.Function):
             _rk4d_bwd_kernel[(triton.cdiv(n, _BLOCK),)](
                 grad_y, grad_pts, stages,
                 low, acc_lo if acc_lo is not None else low, *g[:6],
-                low.shape[1], low.shape[2], low.shape[3], lo_scale,
+                low.shape[2], low.shape[3], low.shape[4], lo_scale,
                 high, acc_hi if acc_hi is not None else high, *g[6:],
-                high.shape[1], high.shape[2], high.shape[3], hi_scale,
+                high.shape[2], high.shape[3], high.shape[4], hi_scale,
                 n, h, float(h / 2), float(h / 6), ctx.n_steps,
+                int(low.shape[0]),
+                REVERSE=ctx.reverse,
                 HAS_ACC=acc_lo is not None, BLOCK=_BLOCK,
             )
-        return grad_pts, None, None, None, None, None, None, None, None
+        return grad_pts, None, None, None, None, None, None, None, None, None
 
 
 def _run_cylindrical_fwd(y0, low, low_num_phi, low_offsets,
                          high, high_num_phi, high_offsets,
-                         h, n_steps, stages):
+                         h, n_steps, reverse, stages):
     n = y0.shape[0]
     out = torch.empty_like(y0)
     if n > 0:
         _rk4c_fwd_kernel[(triton.cdiv(n, _CYL_BLOCK),)](
             y0, out, stages if stages is not None else out,
             low, low_num_phi, low_offsets,
-            low.shape[1], low_num_phi.numel(), low.shape[2],
+            low.shape[2], low_num_phi.numel(), low.shape[3],
             high, high_num_phi, high_offsets,
-            high.shape[1], high_num_phi.numel(), high.shape[2],
+            high.shape[2], high_num_phi.numel(), high.shape[3],
             n, float(h), float(h / 2), float(h / 6), int(n_steps),
+            int(low.shape[0]),
+            REVERSE=bool(reverse),
             STORE_STAGES=stages is not None, BLOCK=_CYL_BLOCK,
         )
     return out
@@ -1457,17 +1571,21 @@ def _run_cylindrical_fwd(y0, low, low_num_phi, low_offsets,
 
 def rk4_cylindrical_integrate(y0, low, low_num_phi, low_offsets,
                               high, high_num_phi, high_offsets,
-                              acc_low, acc_high, h, n_steps):
-    """Integrate a stationary pair of packed cylindrical flow lattices."""
+                              acc_low, acc_high, h, n_steps, reverse=False):
+    """Integrate a pair of packed cylindrical flow lattices, slab by slab.
+
+    ``low`` / ``high`` are [slabs, 3, nz, total_phi]; the slabs are applied in
+    order (reverse order with ``reverse``).
+    """
     if torch.is_grad_enabled() and (
             y0.requires_grad or low.requires_grad or high.requires_grad):
         return TritonRK4CylindricalIntegrate.apply(
             y0, low, low_num_phi, low_offsets,
             high, high_num_phi, high_offsets,
-            acc_low, acc_high, h, n_steps)
+            acc_low, acc_high, h, n_steps, reverse)
     return _run_cylindrical_fwd(
         y0.contiguous(), low, low_num_phi, low_offsets,
-        high, high_num_phi, high_offsets, h, n_steps, None)
+        high, high_num_phi, high_offsets, h, n_steps, reverse, None)
 
 
 class TritonRK4CylindricalIntegrate(torch.autograd.Function):
@@ -1476,27 +1594,26 @@ class TritonRK4CylindricalIntegrate(torch.autograd.Function):
     @staticmethod
     def forward(ctx, y0, low, low_num_phi, low_offsets,
                 high, high_num_phi, high_offsets,
-                acc_low, acc_high, h, n_steps):
+                acc_low, acc_high, h, n_steps, reverse):
         ctx.set_materialize_grads(False)
         y0 = y0.contiguous()
-        stages = torch.empty(
-            int(n_steps) * 4, y0.shape[0], 3,
-            device=y0.device, dtype=y0.dtype)
+        stages = _stage_buffer(y0, low.shape[0], n_steps)
         out = _run_cylindrical_fwd(
             y0, low, low_num_phi, low_offsets,
-            high, high_num_phi, high_offsets, h, n_steps, stages)
+            high, high_num_phi, high_offsets, h, n_steps, reverse, stages)
         ctx.save_for_backward(
             low, low_num_phi, low_offsets,
             high, high_num_phi, high_offsets, stages)
         ctx.accs = (acc_low, acc_high)
         ctx.h = float(h)
         ctx.n_steps = int(n_steps)
+        ctx.reverse = bool(reverse)
         return out
 
     @staticmethod
     def backward(ctx, grad_y):
         if grad_y is None:
-            return (None,) * 11
+            return (None,) * 12
         (low, low_num_phi, low_offsets,
          high, high_num_phi, high_offsets, stages) = ctx.saved_tensors
         grad_y = grad_y.contiguous()
@@ -1509,11 +1626,13 @@ class TritonRK4CylindricalIntegrate(torch.autograd.Function):
                 grad_y, grad_pts, stages,
                 low, low_num_phi, low_offsets,
                 acc_low if has_acc else low,
-                low.shape[1], low_num_phi.numel(), low.shape[2],
+                low.shape[2], low_num_phi.numel(), low.shape[3],
                 high, high_num_phi, high_offsets,
                 acc_high if has_acc else high,
-                high.shape[1], high_num_phi.numel(), high.shape[2],
+                high.shape[2], high_num_phi.numel(), high.shape[3],
                 n, ctx.h, float(ctx.h / 2), float(ctx.h / 6), ctx.n_steps,
+                int(low.shape[0]),
+                REVERSE=ctx.reverse,
                 HAS_ACC=has_acc, BLOCK=_CYL_BLOCK,
             )
-        return grad_pts, None, None, None, None, None, None, None, None, None, None
+        return (grad_pts,) + (None,) * 11

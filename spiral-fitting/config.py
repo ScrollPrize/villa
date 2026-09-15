@@ -240,7 +240,7 @@ _GAP_EXPANDER_DESCRIPTIONS = {
 # checkpoint written under another count loads with a printed notice.
 CHECKPOINT_MODEL_SHAPE_KEYS = (
     "model_flow_integration_solver",
-    "model_num_flow_timesteps", "model_flow_bounds_z_margin",
+    "model_num_flow_stages", "model_flow_bounds_z_margin",
     "model_flow_bounds_radius", "model_flow_voxel_resolution",
     "model_flow_field_type", "model_gap_expander_logit_resolution",
     "model_gap_expander_capacity_windings",
@@ -248,6 +248,15 @@ CHECKPOINT_MODEL_SHAPE_KEYS = (
     "model_gap_expander_min_gap", "model_gap_expander_softplus_bias",
     "model_initial_dr_per_winding", "model_linear_z_resolution",
 )
+
+
+# Configuration keys retired from the schema. Checkpoint loaders accept these
+# stored keys after validating their values in checkpoint_migrations.
+RETIRED_CONFIG_KEYS = frozenset({
+    # The leading axis now holds stationary flow stages. Old checkpoints with
+    # more than one interpolated time sample are refused during migration.
+    "model_num_flow_timesteps",
+})
 
 
 # Configuration keys whose every consumer is built by
@@ -266,7 +275,6 @@ CHECKPOINT_MODEL_SHAPE_KEYS = (
 # construction — the safe answer.
 MODEL_STAGE_KEYS = frozenset({
     "model_flow_integration_solver",
-    "model_num_flow_timesteps",
     "model_num_flow_stages",
     "model_flow_bounds_radius",
     "model_flow_voxel_resolution",
@@ -283,7 +291,6 @@ MODEL_STAGE_KEYS = frozenset({
 
 _MODEL_STRUCTURE_KEYS = frozenset({
     "model_flow_integration_solver",
-    "model_num_flow_timesteps",
     "model_num_flow_stages",
     "model_flow_bounds_z_margin",
     "model_flow_bounds_radius",
@@ -498,7 +505,8 @@ class Config:
         self.optimizer_num_training_steps = 30000
         self.model_num_flow_integration_steps = 3
         self.model_flow_integration_solver = "rk4"
-        self.model_num_flow_timesteps = 1
+        # Stationary velocity fields composed in sequence, held as the slabs
+        # of the flow lattices' leading axis (see transforms.SpiralAndTransform).
         self.model_num_flow_stages = 2
         self.model_flow_bounds_z_margin = 160
         self.model_flow_bounds_radius = 3200

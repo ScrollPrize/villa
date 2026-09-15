@@ -48,7 +48,7 @@ class CartesianFlowGradientTests(unittest.TestCase):
         reference_loss = reference_output.square().sum()
         reference_loss.backward()
 
-        output = flow.get_sampler(0.0)(points)
+        output = flow.get_sampler(0)(points)
         loss = output.square().sum()
         loss.backward()
         flow.apply_accumulated_field_grad()
@@ -76,12 +76,12 @@ class CartesianFlowGradientTests(unittest.TestCase):
         points_a = torch.rand(29, 3, requires_grad=True)
         points_b = torch.rand(41, 3, requires_grad=True)
 
-        combined_sampler = combined.get_sampler(0.0)
+        combined_sampler = combined.get_sampler(0)
         (combined_sampler(points_a).square().mean()
          + combined_sampler(points_b).abs().mean()).backward()
         combined.apply_accumulated_field_grad()
 
-        streamed_sampler = streamed.get_sampler(0.0)
+        streamed_sampler = streamed.get_sampler(0)
         streamed_sampler(points_a).square().mean().backward(retain_graph=True)
         streamed_sampler(points_b).abs().mean().backward(retain_graph=True)
         streamed.apply_accumulated_field_grad()
@@ -124,7 +124,7 @@ class CylindricalFlowGradientTests(unittest.TestCase):
         reference_out_b = reference_sample(reference_b)
         (reference_out_a.square().mean() + reference_out_b.abs().mean()).backward()
 
-        sampler = flow.get_sampler(0.0)
+        sampler = flow.get_sampler(0)
         out_a = sampler(points_a)
         out_b = sampler(points_b)
         # Two independent backwards through the one cached sampler, WITHOUT
@@ -200,8 +200,7 @@ class SharedTransformLeafTests(unittest.TestCase):
         family_a, family_b = self._loss_families(
             transform, reference.get_dr_per_winding(), points_a, points_b)
         (family_a + family_b).backward()
-        for flow_field in reference.flow_fields:
-            flow_field.apply_accumulated_field_grad()
+        reference.flow_field.apply_accumulated_field_grad()
 
         shared_outputs = streamed.get_shared_transform_tensors()
         shared_leaves = tuple(
@@ -215,8 +214,7 @@ class SharedTransformLeafTests(unittest.TestCase):
         # between families ends at a detached leaf.
         leaf_a.backward()
         leaf_b.backward()
-        for flow_field in streamed.flow_fields:
-            flow_field.apply_accumulated_field_grad()
+        streamed.flow_field.apply_accumulated_field_grad()
         pending = [
             (output, leaf.grad) for output, leaf in zip(shared_outputs, shared_leaves)
             if output.requires_grad and leaf.grad is not None

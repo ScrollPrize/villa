@@ -62,10 +62,10 @@ def test_cpu_stationary_integrator_falls_back_lazily(monkeypatch):
     points = torch.rand(31, 3, requires_grad=True)
     reference_points = points.detach().clone().requires_grad_(True)
 
-    integrator = actual.get_time_invariant_integrator()
+    integrator = actual.get_integrator()
     assert actual._pending_field_graphs is None
     output = integrator(points, -0.1, 3)
-    reference = _manual_rk4(expected.get_sampler(0.0), reference_points, -0.1, 3)
+    reference = _manual_rk4(expected.get_sampler(0), reference_points, -0.1, 3)
     output.square().sum().backward()
     reference.square().sum().backward()
     actual.apply_accumulated_field_grad()
@@ -77,29 +77,24 @@ def test_cpu_stationary_integrator_falls_back_lazily(monkeypatch):
     torch.testing.assert_close(actual.flows[1].grad, expected.flows[1].grad)
 
 
-def test_temporally_varying_flow_bypasses_stationary_integrator(monkeypatch):
-    class FakeFlow:
-        num_flow_timesteps = 2
+def test_diffeomorphism_passes_direction_to_the_integrator():
+    class RecordingFlow:
+        def __init__(self):
+            self.calls = []
 
-        def get_time_invariant_integrator(self):
-            raise AssertionError('stationary integrator must not be requested')
+        def get_integrator(self):
+            def integrate(y_flat, h, n_steps, reverse=False):
+                self.calls.append((h, n_steps, reverse))
+                return y_flat
+            return integrate
 
-        def get_sampler(self, _t):
-            return torch.zeros_like
-
-    calls = []
-
-    def fake_odeint(func, y, ts, method):
-        calls.append((func, ts, method))
-        return torch.stack([y, y])
-
-    monkeypatch.setattr(transforms, 'odeint', fake_odeint)
+    flow = RecordingFlow()
     transform = transforms.IntegratedFlowDiffeomorphism(
-        FakeFlow(), torch.zeros(3), torch.ones(3), num_steps=3, solver='rk4')
-    result = transform._call(torch.rand(5, 3))
-    assert len(calls) == 1
-    assert calls[0][2] == 'rk4'
-    assert result.shape == (5, 3)
+        flow, torch.zeros(3), torch.ones(3), num_steps=3, solver='rk4')
+    points = torch.rand(5, 3)
+    torch.testing.assert_close(transform._call(points), points)
+    torch.testing.assert_close(transform._inverse(points), points)
+    assert flow.calls == [(1.0 / 3, 3, False), (-1.0 / 3, 3, True)]
 
 
 cuda = pytest.mark.skipif(
@@ -121,8 +116,8 @@ def test_fused_matches_eager_forward_and_adjoint(monkeypatch, n_steps, h):
     reference_points = points.detach().clone().requires_grad_(True)
     upstream = torch.randn(points.shape, generator=generator, device='cuda')
 
-    output = fused.get_time_invariant_integrator()(points, h, n_steps)
-    reference = _manual_rk4(eager.get_sampler(0.0), reference_points, h, n_steps)
+    output = fused.get_integrator()(points, h, n_steps)
+    reference = _manual_rk4(eager.get_sampler(0), reference_points, h, n_steps)
     output.backward(upstream)
     reference.backward(upstream)
     fused.apply_accumulated_field_grad()
@@ -152,8 +147,8 @@ def test_two_fused_backwards_share_accumulators(monkeypatch):
     b = torch.rand(37, 3, device='cuda', requires_grad=True)
     ar = a.detach().clone().requires_grad_(True)
     br = b.detach().clone().requires_grad_(True)
-    fi = fused.get_time_invariant_integrator()
-    es = eager.get_sampler(0.0)
+    fi = fused.get_integrator()
+    es = eager.get_sampler(0)
     fi(a, 0.1, 3).square().mean().backward()
     fi(b, 0.1, 3).abs().mean().backward()
     _manual_rk4(es, ar, 0.1, 3).square().mean().backward()
@@ -173,8 +168,8 @@ def test_fused_field_gradients_do_not_require_point_gradients(monkeypatch):
     eager = _make_flow('cuda', seed=31)
     eager.load_state_dict(fused.state_dict())
     points = torch.rand(53, 3, device='cuda')
-    output = fused.get_time_invariant_integrator()(points, 0.1, 1)
-    reference = _manual_rk4(eager.get_sampler(0.0), points, 0.1, 1)
+    output = fused.get_integrator()(points, 0.1, 1)
+    reference = _manual_rk4(eager.get_sampler(0), points, 0.1, 1)
     output.square().mean().backward()
     reference.square().mean().backward()
     fused.apply_accumulated_field_grad()
@@ -189,7 +184,7 @@ def test_fused_field_gradients_do_not_require_point_gradients(monkeypatch):
 def test_empty_batch_and_no_grad_avoid_stage_storage(monkeypatch):
     monkeypatch.setenv('FIT_SPIRAL_TRITON', '1')
     flow = _make_flow('cuda')
-    integrator = flow.get_time_invariant_integrator()
+    integrator = flow.get_integrator()
     empty = torch.empty(0, 3, device='cuda', requires_grad=True)
     assert integrator(empty, 0.1, 3).shape == (0, 3)
 
@@ -203,6 +198,6 @@ def test_empty_batch_and_no_grad_avoid_stage_storage(monkeypatch):
 
     with mock.patch.object(flow_triton, '_run_cylindrical_fwd', recording_run):
         with torch.no_grad():
-            result = flow.get_time_invariant_integrator()(points, 0.1, 3)
+            result = flow.get_integrator()(points, 0.1, 3)
     assert result.grad_fn is None
     assert seen == [None]

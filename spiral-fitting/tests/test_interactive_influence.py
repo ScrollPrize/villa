@@ -19,7 +19,6 @@ TINY_CONFIG = {
     'model_initial_dr_per_winding': 16.,
     'model_flow_voxel_resolution': 8,  # 24^3 high-res lattice, 4^3 low-res: both have interior points
     'model_flow_field_type': 'cartesian',
-    'model_num_flow_timesteps': 1,
     'model_linear_z_resolution': 48,
     'model_gap_expander_logit_resolution': 24,
     'model_gap_expander_num_windings': 6,
@@ -66,9 +65,7 @@ def make_tiny_model(**config_overrides):
 
 
 def make_optimiser(model, gap_weight_decay=1.e-2):
-    flow_field_params = [
-        param for flow_field in model.flow_fields for param in flow_field.parameters()
-    ]
+    flow_field_params = list(model.flow_field.parameters())
     gap_expander_params = list(model.gap_expander_params.parameters())
     linear_params = [model.linear_logits]
     grouped = {id(p) for p in flow_field_params + gap_expander_params + linear_params}
@@ -235,11 +232,11 @@ class FlowLatticeMappingTests(unittest.TestCase):
 
     def test_two_stage_flow_round_trip(self):
         model = make_tiny_model(model_num_flow_stages=2)
-        self.assertEqual(len(model.flow_fields), 2)
+        # The stages are the slabs of one flow field's lattices.
+        self.assertEqual([flow.shape[0] for flow in model.flow_field.flows], [2, 2])
         with torch.no_grad():
-            for flow_field in model.flow_fields:
-                for flow in flow_field.flows:
-                    flow.normal_(std=1e-3)
+            for flow in model.flow_field.flows:
+                flow.normal_(std=1e-3)
         transform = model.get_slice_to_spiral_transform()
         points = torch.stack([
             torch.empty([256]).uniform_(10., 180.),
@@ -333,13 +330,12 @@ class FreezeInvariantTests(unittest.TestCase):
         state._allocate_masks(model)
         state.masks['flow_lr'].zero_()
         state.masks['flow_hr'].zero_()
-        for flow_field in model.flow_fields:
-            for flow in flow_field.flows:
-                flow.grad = torch.ones_like(flow)
+        for flow in model.flow_field.flows:
+            flow.grad = torch.ones_like(flow)
         state.apply_grad_masks_(model)
-        for flow_field in model.flow_fields:
-            for flow in flow_field.flows:
-                self.assertEqual(float(flow.grad.abs().sum()), 0.)
+        for flow in model.flow_field.flows:
+            self.assertEqual(flow.shape[0], 2)
+            self.assertEqual(float(flow.grad.abs().sum()), 0.)
 
     def test_gap_weight_decay_disabled_and_reemulated_in_region(self):
         model, optimiser = self._prepopulated()
