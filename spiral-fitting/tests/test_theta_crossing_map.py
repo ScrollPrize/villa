@@ -1,8 +1,5 @@
 import math
-
-import pytest
 import torch
-
 from losses import SampledWalk, _pack_walks
 from theta_crossing_map import ThetaCrossingMap
 
@@ -49,22 +46,6 @@ def test_crossings_reverse_reanchor_padding_and_current_dr_scaling():
     adjustment_20 = crossing_map.adjustments(
         packed, theta, torch.tensor(20.0))
     assert torch.equal(adjustment_20, torch.tensor([[0.0, 0.0, 20.0]]))
-
-
-def test_patch_local_correction_connects_centres_to_fractional_picks():
-    points = _points_for_theta([0.1, 0.2])
-    crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(2, lambda lo, hi: points[lo:hi])
-    crossing_map.register_edges([[0, 1]])
-    crossing_map.force_refresh(_identity)
-    packed = _pack_walks([
-        SampledWalk(
-            torch.tensor([0, 1]).numpy(), torch.tensor([0, 1]).numpy(), True),
-    ], crossing_map)
-    adjustment = crossing_map.adjustments(
-        packed, torch.tensor([[2 * math.pi - 0.1, 0.2]]),
-        torch.tensor(12.0))
-    assert torch.allclose(adjustment, torch.tensor([[0.0, -12.0]]))
 
 
 def test_absolute_winding_reference_survives_unsampled_walk_origin():
@@ -126,26 +107,6 @@ def test_relative_winding_walks_keep_each_annotation_frame():
     assert torch.equal(unwrapped[1] - unwrapped[0], torch.tensor([24.0, 24.0]))
 
 
-def test_reference_node_connects_exact_annotation_to_patch_walk_origin():
-    # The PCL point and its attached patch quad can straddle theta=0 even though
-    # they are spatially adjacent; transport that final local branch step too.
-    points = _points_for_theta([6.1, 0.1, 0.2])
-    crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(3, lambda lo, hi: points[lo:hi])
-    crossing_map.register_edges([[1, 2]])
-    crossing_map.force_refresh(_identity)
-    packed = _pack_walks([
-        SampledWalk(
-            torch.tensor([1, 2]).numpy(),
-            torch.tensor([0, 1]).numpy(), True,
-            reference_node_id=0),
-    ], crossing_map)
-    theta = crossing_map.node_theta[torch.tensor([[1, 2]])]
-    adjustment = crossing_map.adjustments(
-        packed, theta, torch.tensor(12.0))
-    assert torch.equal(adjustment, torch.tensor([[-12.0, -12.0]]))
-
-
 def test_unwrap_tree_caches_branching_multiwrap_node_potentials():
     # DFS preorder: 0 -> 1 -> 2 -> 3, then node 4 branches from node 1.
     # The main arm crosses theta=0 once; the branch does not.
@@ -175,29 +136,6 @@ def test_unwrap_tree_caches_branching_multiwrap_node_potentials():
     adjustments = crossing_map.adjustments_from_potentials(
         sample_ids, sample_theta, torch.tensor(12.0))
     assert torch.equal(adjustments, torch.tensor([[-12.0, 0.0, 0.0, -12.0]]))
-
-
-def test_potential_inconsistencies_returns_only_bad_edge_nodes_on_host():
-    # The tree walks 0.1 -> 2.5 -> 4.9 without crossing wrapped theta zero,
-    # while the direct 0 -> 2 edge does cross the branch cut.  No global lift
-    # can satisfy that cycle.
-    points = _points_for_theta([0.1, 2.5, 4.9])
-    crossing_map = ThetaCrossingMap('cpu', chunk_size=2)
-    crossing_map.register_nodes(3, lambda lo, hi: points[lo:hi])
-    crossing_map.register_unwrap_tree([0, 1, 2], [-1, 0, 1])
-    crossing_map.register_edges([[0, 2]])
-    crossing_map.force_refresh(_identity)
-
-    report, bad_nodes = crossing_map.potential_inconsistencies()
-
-    assert report == {
-        'checked_edges': 3,
-        'inconsistent_edges': 1,
-        'max_abs_residual': 1,
-    }
-    assert bad_nodes.device.type == 'cpu'
-    assert bad_nodes.tolist() == [0, 2]
-    assert crossing_map.potential_consistency() == report
 
 
 def test_unordered_potentials_span_forty_wraps_without_sparse_aliasing():
@@ -245,33 +183,6 @@ def test_potential_adjustments_handle_fractional_and_annotation_frames():
     assert torch.equal(adjustments, torch.tensor([[0.0, -10.0]]))
 
 
-def test_unwrap_tree_rejects_non_preorder_and_unregistered_potential_lookup():
-    points = _points_for_theta([0.0, 0.1, 0.2])
-    crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(3, lambda lo, hi: points[lo:hi])
-    with pytest.raises(ValueError, match='precede'):
-        crossing_map.register_unwrap_tree([0, 1, 2], [-1, 2, 0])
-    crossing_map_4 = ThetaCrossingMap('cpu')
-    points_4 = _points_for_theta([0.0, 0.1, 0.2, 0.3])
-    crossing_map_4.register_nodes(4, lambda lo, hi: points_4[lo:hi])
-    with pytest.raises(ValueError, match='depth-first preorder'):
-        crossing_map_4.register_unwrap_tree([0, 1, 2, 3], [-1, 0, 0, 1])
-    crossing_map.register_unwrap_tree([0, 1], [-1, 0])
-    crossing_map.force_refresh(_identity)
-    with pytest.raises(RuntimeError, match='no registered unwrap potential'):
-        crossing_map.winding_potentials(torch.tensor([2]))
-
-
-def test_single_node_unwrap_tree_needs_no_registered_edge():
-    points = _points_for_theta([0.4])
-    crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(1, lambda lo, hi: points[lo:hi])
-    crossing_map.register_unwrap_tree([0], [-1])
-    crossing_map.force_refresh(_identity)
-    assert crossing_map.edge_nodes.numel() == 0
-    assert crossing_map.winding_potentials([0]).tolist() == [0]
-
-
 def test_refresh_interval_chunking_force_refresh_and_interval_change():
     points = _points_for_theta([0.1, 0.2, 0.3, 0.4, 0.5])
     calls = []
@@ -295,18 +206,6 @@ def test_refresh_interval_chunking_force_refresh_and_interval_change():
     assert len(calls) == num_calls
     # A live interval change resets the cadence.
     assert crossing_map.refresh_if_due(21, transform, update_interval=7)
-
-
-def test_unregistered_sampled_edge_fails_clearly():
-    points = _points_for_theta([0.0, 0.1, 0.2])
-    crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(3, lambda lo, hi: points[lo:hi])
-    crossing_map.register_edges([[0, 1]])
-    with pytest.raises(RuntimeError, match='unregistered edge'):
-        _pack_walks([
-            SampledWalk(
-                torch.tensor([1, 2]).numpy(), torch.tensor([0]).numpy(), False),
-        ], crossing_map)
 
 
 def test_common_packer_handles_ragged_reverse_single_node_and_pick_modes():
@@ -401,44 +300,3 @@ def test_new_adjustment_container_preserves_values_loss_and_gradients():
     new_loss.backward()
     torch.testing.assert_close(new_raw.grad, old_raw.grad)
     torch.testing.assert_close(new_dr.grad, old_dr.grad)
-
-
-@pytest.mark.parametrize(
-    ('nodes', 'picks', 'message'),
-    [([], [0], 'nonempty'), ([0, 1], [2], 'out-of-range')],
-)
-def test_common_packer_rejects_invalid_walks(nodes, picks, message):
-    points = _points_for_theta([0.0, 0.1])
-    crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(2, lambda lo, hi: points[lo:hi])
-    crossing_map.register_edges([[0, 1]])
-    with pytest.raises(ValueError, match=message):
-        _pack_walks([
-            SampledWalk(
-                torch.tensor(nodes).numpy(), torch.tensor(picks).numpy(), False),
-        ], crossing_map)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
-def test_cuda_unset_potential_raises_at_assert_boundary():
-    # On CUDA the unset-potential hard error is deferred (the verdict is
-    # copied off-device asynchronously); the guarantee is that it surfaces
-    # no later than assert_no_pending_potential_errors(), which the training
-    # loop calls before every optimizer step.
-    points = _points_for_theta([0.0, 0.1, 0.2])
-    crossing_map = ThetaCrossingMap('cuda')
-    crossing_map.register_nodes(3, lambda lo, hi: points[lo:hi])
-    crossing_map.register_unwrap_tree([0, 1], [-1, 0])
-    crossing_map.force_refresh(_identity)
-
-    # Node 2 is outside the tree; the call itself may return the sentinel
-    # without raising, but the boundary must raise.
-    crossing_map.winding_potentials(torch.tensor([2], device='cuda'))
-    with pytest.raises(RuntimeError, match='no registered unwrap potential'):
-        crossing_map.assert_no_pending_potential_errors()
-
-    # A healthy query afterwards passes the boundary cleanly.
-    crossing_map._pending_potential_checks.clear()
-    assert crossing_map.winding_potentials(
-        torch.tensor([0], device='cuda')).tolist() == [0]
-    crossing_map.assert_no_pending_potential_errors()

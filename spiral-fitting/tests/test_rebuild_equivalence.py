@@ -1,11 +1,8 @@
 """A model-stage rebuild produces the session a full build would have.
 
-The defence behind config.MODEL_STAGE_KEYS is that retaining the host inputs
-and the brick pools across an allowlisted change is unobservable. The
-source-scan test in tests/test_config.py checks that no allowlisted key is
-even named during host preparation; this checks the other half end to end —
-that the rebuilt session's checkpoint is structurally identical to one built
-from scratch with the same value.
+Changing the flow-stage count through a model rebuild must produce the same
+checkpoint structure as a fresh build. This checks keys, shapes, dtypes and
+configuration, not numerical equality of randomly initialized parameters.
 
 Like the golden run it needs the dataset and a GPU, so it only runs when
 opted in:
@@ -18,8 +15,8 @@ import os
 import subprocess
 import sys
 import tempfile
-
 import pytest
+
 
 SPIRAL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SPEC_PATH = os.environ.get(

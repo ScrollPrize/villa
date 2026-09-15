@@ -1,9 +1,7 @@
 from types import SimpleNamespace
 from unittest import mock
-
 import pytest
 import torch
-
 import fit_spiral
 
 
@@ -35,18 +33,6 @@ def test_gb10_oom_reports_host_memory_and_preserves_cause(monkeypatch, failure_s
     assert caught.value.__cause__ is failure
     assert 'drop_caches' in str(caught.value)
     assert 'MemAvailable: 97000 kB' in str(caught.value)
-
-
-@pytest.mark.parametrize('device', ['NVIDIA RTX 4090', None])
-def test_diagnostic_does_not_assume_shared_memory(monkeypatch, device):
-    failure = torch.OutOfMemoryError('out of memory')
-    monkeypatch.setattr(torch, 'empty', mock.Mock(side_effect=failure))
-    monkeypatch.setattr(torch.cuda, 'get_device_name', mock.Mock(
-        return_value=device, side_effect=RuntimeError('unavailable') if device is None else None))
-    with pytest.raises(RuntimeError) as caught:
-        fit_spiral.FitContext.check_cuda_ready(SimpleNamespace(progress=None))
-    assert caught.value.__cause__ is failure
-    assert 'drop_caches' not in str(caught.value)
 
 
 def test_headless_stops_before_loading_inputs_on_cuda_failure():

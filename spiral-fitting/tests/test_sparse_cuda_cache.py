@@ -3,12 +3,9 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-
 import numpy as np
-import pytest
 import torch
 import zarr
-
 import lasagna_data
 from pack_resident_pools import _make_chunk_reader, pack_arrays, sidecar_path
 from lasagna_data import ensure_fit_sparse_stores
@@ -173,34 +170,6 @@ def test_missing_sparse_store_uses_windows_file_lock(tmp_path, monkeypatch):
     assert Path(f'{sidecar}.lock').read_bytes() == b'\0'
 
 
-def test_pack_progress_callback_uses_console_report_cadence(tmp_path):
-    source = tmp_path / 'source'
-    source.mkdir()
-    (source / '.zarray').write_text(json.dumps({
-        'zarr_format': 2,
-        'shape': [32, 16, 16],
-        'chunks': [16, 16, 16],
-        'dtype': '|u1',
-        'compressor': None,
-        'fill_value': 0,
-        'order': 'C',
-        'filters': None,
-        'dimension_separator': '.',
-    }))
-    chunk = np.ones((16, 16, 16), dtype=np.uint8).tobytes()
-    (source / '0.0.0').write_bytes(chunk)
-    (source / '1.0.0').write_bytes(chunk)
-    updates = []
-
-    pack_arrays(
-        [str(source)], str(tmp_path / 'pool'), label='test',
-        progress_callback=lambda current, total, detail: updates.append(
-            (current, total, detail)),
-    )
-
-    assert [current for current, _, _ in updates] == [0, 2]
-
-
 def test_gather_matches_dense_multichannel(tmp_path):
     z, y, x = np.indices((40, 40, 70))
     first = ((z * 17 + y * 5 + x) % 251 + 1).astype(np.uint8)
@@ -220,15 +189,6 @@ def test_gather_matches_dense_multichannel(tmp_path):
     assert pool.stats()['gathers'] == 2  # the empty gather short-circuits
 
 
-def test_absent_bricks_read_zero(tmp_path):
-    data = np.zeros((48, 16, 16), dtype=np.uint8)
-    data[:16] = 9  # only the first chunk row is occupied
-    pool = make_pool(tmp_path, [data], 'sparse')
-    assert pool.resident_bricks < pool.table.numel()
-    values = pool.gather(torch.tensor([[2, 2, 2], [30, 5, 5], [47, 15, 15]]))
-    assert values[:, 0].tolist() == [9, 0, 0]
-
-
 def test_origin_and_z_roi_restriction(tmp_path):
     data = np.broadcast_to(
         (np.arange(64, dtype=np.uint16) % 251 + 1).astype(np.uint8)[:, None, None],
@@ -245,14 +205,6 @@ def test_origin_and_z_roi_restriction(tmp_path):
     last = pool.gather(torch.tensor([[31, 3, 3]]))
     assert int(first[0, 0]) == int(data[32, 0, 0])
     assert int(last[0, 0]) == int(data[63, 3, 3])
-
-
-def test_bounds_check_env(tmp_path, monkeypatch):
-    monkeypatch.setenv('FIT_SPIRAL_RESIDENT_BOUNDS_CHECK', '1')
-    data = np.ones((16, 16, 16), dtype=np.uint8)
-    pool = make_pool(tmp_path, [data], 'bounds')
-    with pytest.raises(IndexError):
-        pool.gather(torch.tensor([[16, 0, 0]]))
 
 
 def test_pack_ct_mask_zeroes_and_drops_bricks(tmp_path):

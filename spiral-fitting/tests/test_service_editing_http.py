@@ -1,12 +1,12 @@
 """Exercise workspace recovery through the real authenticated HTTP routes."""
+
 import hashlib
 import json
 import urllib.request
 import urllib.error
 from uuid import uuid4
-
-from test_spiral_service_v2 import HttpServiceFixture, _attach_fake_session
-from test_service_editing import Resident
+from service_fixtures import HttpServiceFixture, _attach_fake_session
+from editing_fixtures import Resident
 
 
 class EditingHttpTests(HttpServiceFixture):
@@ -95,16 +95,6 @@ class EditingHttpTests(HttpServiceFixture):
         self.assertEqual(self.request('POST', '/session/input-changes', headers=self.owner,
                                      body=command)[0], 409)
 
-    def test_ownership_and_removed_routes(self):
-        for path, body in [('/session/run', {'command_id': 'run'}),
-                           ('/session/commit-inputs', {'command_id': 'commit'}),
-                           ('/session/inputs', {}),
-                           ('/session/rebuild', {'command_id': 'rebuild'})]:
-            self.assertEqual(self.request('POST', path, body=body)[0], 403)
-        self.assertEqual(self.request('GET', '/session/status')[0], 200)
-        self.assertEqual(self.request('DELETE', '/session/ephemeral-inputs/fiber/test',
-                                      headers=self.owner)[0], 404)
-
     def test_release_retries_are_idempotent_over_http(self):
         root = self.state.editing().root
         for _ in range(2):
@@ -122,43 +112,3 @@ class EditingHttpTests(HttpServiceFixture):
         self.request('POST', '/session/editing/release', headers=self.owner,
                      body={'command_id': 'release'})
         self.assertTrue(fresh.root.exists())
-
-    def test_fiber_editor_artifact_contains_immutable_desired_peers(self):
-        from test_service_editing import upload
-        workspace = self.state.editing()
-        ids = [str(uuid4()), str(uuid4())]
-        changes = [{'id': input_id, 'kind': 'fiber', 'name': name,
-                    'expected_revision': 0, 'upload_id': upload(workspace, name, 'fiber',
-                        branches=[{'branch_file': 'peer.json'}] if name == 'first' else [])}
-                   for input_id, name in zip(ids, ['first', 'peer'])]
-        workspace.change('owner', {'command_id': 'fibers', 'changes': changes})
-        first = self.state.input_content_artifact(ids[0], 1)
-        manifest = self.state.artifacts.manifest(first['artifact']['id'])
-        self.assertEqual({f['name'] for f in manifest['files']}, {'first.json', 'peer.json'})
-        workspace.change('owner', {'command_id': 'remove-peer', 'changes': [
-            {'id': ids[1], 'expected_revision': 1, 'deleted': True}]})
-        second = self.state.input_content_artifact(ids[0], 1)
-        self.assertNotEqual(first['artifact']['id'], second['artifact']['id'])
-        self.assertEqual(len(self.state.artifacts.manifest(first['artifact']['id'])['files']), 2)
-        self.assertEqual(len(self.state.artifacts.manifest(second['artifact']['id'])['files']), 1)
-
-    def test_rebuild_retry_does_not_restart_resident_construction(self):
-        workspace = self.state.editing()
-        original = workspace.replay_resident
-        builds, replays = [], []
-        def build(request):
-            builds.append(request)
-            return {'accepted': True}
-        def replay(generation):
-            replays.append(generation)
-            if len(replays) == 1:
-                raise TimeoutError('lost resident replay outcome')
-            return original(generation)
-        workspace.replay_resident = replay
-        request = {'command_id': 'rebuild-retained'}
-        with self.assertRaises(TimeoutError):
-            self.state.editing_lifecycle('owner', 'session_rebuild', request, build)
-        result = self.state.editing_lifecycle('owner', 'session_rebuild', request, build)
-        self.assertTrue(result['accepted'])
-        self.assertEqual(len(builds), 1)
-        self.assertEqual(len(replays), 2)

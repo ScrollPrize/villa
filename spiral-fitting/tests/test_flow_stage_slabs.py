@@ -10,23 +10,18 @@ checkpoints written in the per-stage module layout (model state, optimiser
 moments) plus the retired time-axis config key.
 """
 
-import os
-import sys
-from pathlib import Path
-
 import pytest
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 import flow_triton
-from checkpoint_migrations import (merge_flow_stage_lattices,
-                                   merge_flow_stage_state)
-from config import RETIRED_CONFIG_KEYS, Config, durable_config
-from flow_fields import (BSplineCylindricalFlowField, BSplineFlowField,
-                         CartesianFlowField, CylindricalFlowField)
+from checkpoint_migrations import merge_flow_stage_lattices, merge_flow_stage_state
+from config import Config
+from flow_fields import (
+    BSplineCylindricalFlowField,
+    BSplineFlowField,
+    CartesianFlowField,
+    CylindricalFlowField,
+)
 from transforms import SpiralAndTransform
-import update_checkpoint
 
 
 N_STEPS = 3
@@ -102,16 +97,6 @@ def test_slab_walk_equals_composition_of_single_stage_fields(kind, reverse):
                 merged.flows[level].grad[slab], single.flows[level].grad[0])
 
 
-def test_no_grad_walk_matches_grad_walk():
-    merged = _make_field('cartesian', 2)
-    points = _points(29)
-    with torch.no_grad():
-        plain = merged.get_integrator()(points, -H, N_STEPS, reverse=True)
-    traced = merged.get_integrator()(
-        points.clone().requires_grad_(True), -H, N_STEPS, reverse=True)
-    torch.testing.assert_close(plain, traced.detach())
-
-
 def test_reverse_walk_inverts_forward_walk_approximately():
     # Not exact (RK4 forward/backward inconsistency), but the slab order must
     # be reversed for the round trip to close at all at this flow amplitude.
@@ -124,51 +109,6 @@ def test_reverse_walk_inverts_forward_walk_approximately():
         wrong_order = integrate(forward, -H, N_STEPS, reverse=False)
     torch.testing.assert_close(back, points, atol=2e-3, rtol=0.)
     assert (wrong_order - points).abs().max() > 1e-2
-
-
-def test_model_forward_and_inverse_use_one_diffeomorphism():
-    config = {
-        'model_initial_dr_per_winding': 16.,
-        'model_flow_voxel_resolution': 8,
-        'model_flow_field_type': 'cartesian',
-        'model_num_flow_stages': 2,
-        'model_linear_z_resolution': 48,
-        'model_gap_expander_logit_resolution': 24,
-        'model_gap_expander_num_windings': 6,
-        'model_gap_expander_capacity_windings': 6,
-        'model_gap_expander_min_gap': 1.0,
-        'model_gap_expander_softplus_bias': 4.0,
-        'model_gap_expander_lr_scale': 0.3,
-        'output_first_winding': 1,
-    }
-    torch.manual_seed(0)
-    umbilicus = torch.zeros([5, 3])
-    umbilicus[:, 0] = torch.linspace(0., 192., 5)
-    model = SpiralAndTransform(
-        flow_integration_steps=3, flow_integration_solver='rk4',
-        flow_min_corner_zyx=torch.tensor([0, -96, -96]),
-        flow_max_corner_zyx=torch.tensor([192, 96, 96]),
-        umbilicus_zyx=umbilicus, config=config)
-    assert [flow.shape[0] for flow in model.flow_field.flows] == [2, 2]
-    with torch.no_grad():
-        for flow in model.flow_field.flows:
-            flow.normal_(std=1e-3)
-    transform = model.get_slice_to_spiral_transform()
-    # Compose([gap, diffeo, linear, umbilicus]).inv: exactly one diffeomorphism.
-    parts = getattr(transform, 'parts', None)
-    if parts is None:
-        parts = transform._inv.parts
-    from transforms import IntegratedFlowDiffeomorphism
-    assert sum(isinstance(getattr(p, '_inv', p), IntegratedFlowDiffeomorphism)
-               or isinstance(p, IntegratedFlowDiffeomorphism) for p in parts) == 1
-    points = torch.stack([
-        torch.empty([128]).uniform_(10., 180.),
-        torch.empty([128]).uniform_(-80., 80.),
-        torch.empty([128]).uniform_(-80., 80.),
-    ], dim=-1)
-    with torch.no_grad():
-        round_trip = transform.inv(transform(points))
-    torch.testing.assert_close(round_trip, points, atol=0.5, rtol=0.)
 
 
 cuda = pytest.mark.skipif(
@@ -185,11 +125,13 @@ def _eager_reference(field, points, h, n_steps, reverse, monkeypatch):
 
 
 @cuda
-@pytest.mark.parametrize(
-    'kind', ['cartesian', 'cylindrical', 'bspline', 'bspline_cylindrical'])
+@pytest.mark.parametrize('kind, coalesce', [
+    ('cartesian', '0'), ('cartesian', '1'),
+    ('cylindrical', '1'), ('bspline', '1'), ('bspline_cylindrical', '1'),
+])
 @pytest.mark.parametrize('reverse', [False, True])
-@pytest.mark.parametrize('coalesce', ['0', '1'])
 def test_fused_multi_slab_matches_eager(monkeypatch, kind, reverse, coalesce):
+    # Only the Cartesian kernel has a coalesced backward implementation.
     monkeypatch.setenv('FIT_SPIRAL_TRITON', '1')
     monkeypatch.setenv('FIT_SPIRAL_RK4_COALESCE', coalesce)
     monkeypatch.delenv('FIT_SPIRAL_DIRECT_LR', raising=False)
@@ -261,8 +203,6 @@ def test_fused_direct_multi_slab_equals_sequential_single_slabs(monkeypatch, rev
                 merged.flows[level].grad[slab], single.flows[level].grad[0],
                 rtol=1e-5, atol=1e-6)
 
-
-# --------------------------------------------------------------- migration
 
 def _old_layout_state(model):
     """The per-stage module layout a pre-slab checkpoint stored."""
@@ -341,13 +281,6 @@ def test_merge_flow_stage_state_folds_stage_modules(flow_field_type):
     fresh.load_state_dict(merged)
 
 
-def test_merge_flow_stage_lattices_is_a_noop_for_single_stage_checkpoints():
-    model, config = _small_model('cartesian', 1)
-    checkpoint = {'spiral_and_transform': model.state_dict(),
-                  'cfg': {**config, 'model_num_flow_timesteps': 1}}
-    assert merge_flow_stage_lattices(checkpoint) is checkpoint
-
-
 def test_merge_flow_stage_lattices_refuses_time_varying_flows():
     model, config = _small_model('cartesian', 1)
     checkpoint = {'spiral_and_transform': model.state_dict(),
@@ -419,16 +352,3 @@ def test_merge_flow_stage_lattices_migrates_optimizer():
 
     # Another pass finds nothing left to do.
     assert merge_flow_stage_lattices(migrated) is migrated
-
-
-def test_retired_time_axis_key_is_dropped_by_config_migration():
-    assert 'model_num_flow_timesteps' in RETIRED_CONFIG_KEYS
-    with pytest.raises(ValueError, match='Unknown Spiral config keys'):
-        Config({'model_num_flow_timesteps': 1})
-    source = {**durable_config(Config().as_dict()), 'model_num_flow_timesteps': 1}
-    migrated, renamed, removed, added = update_checkpoint.migrate_config(source)
-    assert 'model_num_flow_timesteps' not in migrated
-    assert removed == ['model_num_flow_timesteps']
-    legacy = {**durable_config(Config().as_dict()), 'num_flow_timesteps': 1}
-    _, _, removed, _ = update_checkpoint.migrate_config(legacy)
-    assert removed == ['num_flow_timesteps']

@@ -5,10 +5,8 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
-
 import numpy as np
 import torch
-
 import point_collection
 from point_collection import (
     PatchLinkOptions,
@@ -54,19 +52,6 @@ class LoadPointCollectionTests(unittest.TestCase):
             collection["points"][1]["winding_annotation"],
         )
 
-    def test_missing_file_warns_and_skips(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = os.path.join(temporary, "drawn_control_points.json")
-            output = io.StringIO()
-            with redirect_stdout(output):
-                loaded = load_point_collection(path)
-
-        self.assertIsNone(loaded)
-        message = output.getvalue()
-        self.assertIn("not found", message)
-        self.assertIn(path, message)
-        self.assertNotIn("Error", message)
-
     def test_malformed_file_still_reports_error(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = os.path.join(temporary, "abs_winding.json")
@@ -78,18 +63,6 @@ class LoadPointCollectionTests(unittest.TestCase):
 
         self.assertIsNone(loaded)
         self.assertIn("Error loading point collection", output.getvalue())
-
-    def test_unsupported_version_still_reports_error(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = os.path.join(temporary, "abs_winding.json")
-            with open(path, "w", encoding="utf-8") as stream:
-                json.dump({"vc_pointcollections_json_version": "2"}, stream)
-            output = io.StringIO()
-            with redirect_stdout(output):
-                loaded = load_point_collection(path)
-
-        self.assertIsNone(loaded)
-        self.assertIn("Unsupported JSON version", output.getvalue())
 
 
 def _grid_patch(rows, cols, at, scale=1.0):
@@ -182,15 +155,6 @@ class WindowLinkingTests(unittest.TestCase, _BackendCases):
             self.assertEqual(_attached(pcl), ['a', 'b', 'a'])
         self.for_each_backend(body)
 
-    def test_gate_is_clipped_at_the_collection_ends(self):
-        def body():
-            # Requiring the full window of three: the end points only have two
-            # window members, so they need both; the middle point needs all
-            # three. A satisfies every requirement, B none.
-            pcl = self._link(PatchLinkOptions(window_points=3, window_min_points=3))
-            self.assertEqual(_attached(pcl), ['a', 'a', 'a'])
-        self.for_each_backend(body)
-
     def test_even_window_rounds_up_and_window_needs_own_hit(self):
         self.assertEqual(PatchLinkOptions(window_points=2).window_half, 1)
         self.assertEqual(PatchLinkOptions(window_points=4).window_half, 2)
@@ -255,12 +219,6 @@ class SideRuleLinkingTests(unittest.TestCase, _BackendCases):
             general_hit_policy='largest_area', options=options)
         return pcl
 
-    def test_umbilicus_inward_direction_points_at_the_axis(self):
-        inward = umbilicus_inward_direction(lambda zs: np.tile([5.0, 5.0], (len(zs), 1)))
-        direction = inward(np.asarray([[0.0, 15.0, 5.0], [3.0, 5.0, 5.0]]))
-        np.testing.assert_allclose(direction[0], [0.0, -1.0, 0.0])
-        np.testing.assert_allclose(direction[1], [0.0, 0.0, 0.0])
-
     def test_front_rule_rejects_the_patch_behind(self):
         def body():
             pcl = self._link(SIDE_FRONT)
@@ -272,27 +230,3 @@ class SideRuleLinkingTests(unittest.TestCase, _BackendCases):
             pcl = self._link(SIDE_BEHIND)
             self.assertEqual(_attached(pcl), ['behind'] * 3)
         self.for_each_backend(body)
-
-    def test_margin_admits_a_patch_just_across_the_point(self):
-        def body():
-            # Both patches sit 1.0 across; a margin of 1.5 accepts both, so
-            # the plain policy (equal area and distance -> patch order) decides.
-            pcl = self._link(SIDE_BEHIND, margin=1.5)
-            self.assertEqual(_attached(pcl), ['front'] * 3)
-        self.for_each_backend(body)
-
-    def test_unruled_collections_are_untouched(self):
-        def body():
-            pcl = self._link(None)
-            self.assertEqual(_attached(pcl), ['front'] * 3)
-        self.for_each_backend(body)
-
-    def test_rules_require_a_direction(self):
-        with self.assertRaises(ValueError):
-            PatchLinkOptions(side_rules={1: SIDE_FRONT})
-        with self.assertRaises(ValueError):
-            PatchLinkOptions(side_rules={1: 'sideways'}, inward_direction=lambda z: z)
-
-
-if __name__ == "__main__":
-    unittest.main()

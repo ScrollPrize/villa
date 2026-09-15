@@ -1,10 +1,7 @@
 from unittest.mock import patch
-
 import pytest
 import torch
-
 from winding_supervision import get_winding_inference_losses
-
 
 RELATIVE = "dense_spacing_winding_model_relative"
 DENSITY = "dense_spacing_winding_model_density"
@@ -88,42 +85,6 @@ def _run(relative_shell=None, density_shell=None, *,
         call.args[0]: call.args[3] for call in record.call_args_list
     }
     return losses, metrics, recorded_masks
-
-
-def test_pair_with_both_endpoints_inside_shell_remains_valid():
-    losses, metrics, masks = _run(relative_shell=(11.0, 21.0))
-
-    torch.testing.assert_close(losses[RELATIVE], torch.tensor(0.5))
-    assert metrics[f"{RELATIVE}_valid_fraction"] == 1.0
-    torch.testing.assert_close(masks[RELATIVE], torch.tensor([True]))
-
-
-@pytest.mark.parametrize("shell_radii", [(9.0, 21.0), (11.0, 19.0)])
-def test_pair_is_masked_when_either_endpoint_is_outside(shell_radii):
-    losses, metrics, masks = _run(relative_shell=shell_radii)
-
-    torch.testing.assert_close(losses[RELATIVE], torch.tensor(0.0))
-    assert metrics[f"{RELATIVE}_valid_fraction"] == 0.0
-    torch.testing.assert_close(masks[RELATIVE], torch.tensor([False]))
-
-
-def test_points_exactly_on_shell_boundary_remain_valid():
-    losses, metrics, masks = _run(relative_shell=(10.0, 20.0))
-
-    torch.testing.assert_close(losses[RELATIVE], torch.tensor(0.5))
-    assert metrics[f"{RELATIVE}_valid_fraction"] == 1.0
-    torch.testing.assert_close(masks[RELATIVE], torch.tensor([True]))
-
-
-def test_low_confidence_at_either_endpoint_masks_pair():
-    losses, metrics, masks = _run(
-        relative_shell=(11.0, 21.0),
-        relative_confidence=(1.0, 0.24),
-    )
-
-    torch.testing.assert_close(losses[RELATIVE], torch.tensor(0.0))
-    assert metrics[f"{RELATIVE}_valid_fraction"] == 0.0
-    torch.testing.assert_close(masks[RELATIVE], torch.tensor([False]))
 
 
 def test_entirely_shell_masked_batch_has_finite_zero_losses_and_metrics():

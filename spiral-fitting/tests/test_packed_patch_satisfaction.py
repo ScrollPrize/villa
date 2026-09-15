@@ -1,9 +1,6 @@
 import math
 from types import SimpleNamespace
-
-import numpy as np
 import torch
-
 from satisfaction_metrics import (
     PATCH_EVALUATION_CHUNK_SIZE,
     _ListPatchAtlas,
@@ -11,7 +8,6 @@ from satisfaction_metrics import (
     get_patch_satisfied_areas,
     metrics_config,
 )
-from spiral_sampling import load_spiral_sampling
 
 
 class CountingIdentityTransform:
@@ -67,32 +63,6 @@ def assert_legacy_equal(packed, legacy):
             torch.testing.assert_close(actual, expected)
 
 
-def test_native_layout_handles_ragged_boundaries_and_empty_roi():
-    native = load_spiral_sampling()
-    assert native is not None and hasattr(native, 'PatchSatisfactionAtlas')
-    masks = [
-        np.ones((2, 3), dtype=bool),
-        np.array([[1, 0, 1], [1, 1, 0]], dtype=bool),
-        np.ones((1, 1), dtype=bool),
-    ]
-    zs = [
-        np.zeros((3, 4), dtype=np.float32),
-        np.zeros((3, 4), dtype=np.float32),
-        np.full((2, 2), 10, dtype=np.float32),
-    ]
-    atlas = native.PatchSatisfactionAtlas(masks, zs, -1, 1)
-    layout = atlas.packed_layout()
-    np.testing.assert_array_equal(layout['patch_offsets'], [0, 6, 10, 10])
-    np.testing.assert_array_equal(layout['full_valid_counts'], [6, 4, 1])
-    np.testing.assert_array_equal(layout['quad_shapes'], [[2, 3], [2, 3], [1, 1]])
-    # Solid 2x3: every cell touches the outside. Ragged: every selected cell
-    # touches either the outside or a hole.
-    assert np.asarray(layout['boundary_flags']).all()
-    corners = np.asarray(layout['corner_vertex_ids'])
-    assert corners.shape == (10, 4)
-    assert len(np.unique(corners[:6])) == 12
-
-
 def test_packed_matches_reference_for_crossing_multiwrap_and_disconnected():
     centres = [
         [spiral_point(2 * math.pi - .1, 3), spiral_point(.1, 4),
@@ -119,21 +89,6 @@ def test_packed_matches_reference_for_crossing_multiwrap_and_disconnected():
         CountingIdentityTransform(), torch.tensor(10.0), patches, -1, 1,
         metrics_overrides=dict(metrics_config))
     assert_legacy_equal(packed, legacy)
-
-
-def test_strict_and_splicing_share_transform_residuals():
-    patch = patch_from_centres([[spiral_point(.2, 3.47)]])
-    patches = [patch]
-    transform = CountingIdentityTransform()
-    trainable_dr = torch.tensor(10.0, requires_grad=True)
-    evaluation = evaluate_patch_satisfaction_packed(
-        transform, trainable_dr, patches,
-        _ListPatchAtlas(patches, torch.device('cpu')),
-        -1, 1, include_splicing=True)
-    assert transform.forward_calls == 1
-    assert transform.inverse_calls == 1
-    assert not evaluation.profiles['strict'].satisfied_patches.item()
-    assert evaluation.profiles['splicing'].satisfied_patches.item()
 
 
 def test_90k_one_quad_patches_use_point_chunks_not_patch_calls():

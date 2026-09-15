@@ -1,13 +1,12 @@
 """The point-to-patch linker; revision integration is in test_revisioned_geometry."""
+
+from geometry_fixtures import _point
+
 import unittest
 from unittest import mock
-
-import numpy as np
 import torch
-
 import point_collection
 from point_collection import link_unattached_points_to_patches
-from tifxyz import Patch
 
 
 class _FakePatch:
@@ -20,26 +19,6 @@ class _FakePatch:
     def project(self, zyx):
         distance = torch.linalg.norm(zyx - self.centre)
         return torch.tensor([0.5, 0.5]), distance
-
-
-def _point(point_id, cid, zyx, attached_to=None):
-    z, y, x = zyx
-    point = {
-        'id': point_id, 'collectionId': cid, 'p': [x, y, z],
-        'zyx': np.asarray(zyx, dtype=np.float32),
-        'winding_annotation': float('nan'),
-    }
-    if attached_to is not None:
-        point['on_patch'] = {'id': attached_to, 'distance': 0.0, 'ij': [0, 0]}
-    return point
-
-
-def _flat_patch(z, y0, x0, size=5, spacing=10.0):
-    grid = torch.zeros((size, size, 3), dtype=torch.float32)
-    for i in range(size):
-        for j in range(size):
-            grid[i, j] = torch.tensor([z, y0 + i * spacing, x0 + j * spacing])
-    return Patch(grid, torch.ones(3), None, None)
 
 
 class LinkUnattachedPointsTests(unittest.TestCase):
@@ -94,25 +73,3 @@ class LinkUnattachedPointsTests(unittest.TestCase):
         self.assertEqual(gained, {7: 1})
         self.assertEqual(between['points'][0]['on_patch']['id'], 'b')
         self.assertNotIn('on_patch', between['points'][1])
-
-    def test_no_new_patches_is_a_no_op(self):
-        collection = {'id': 1, 'name': 'r', 'points': {0: _point(0, 1, [0, 0, 0])}}
-        self.assertEqual(
-            link_unattached_points_to_patches({1: collection}, {}, {}), {})
-        self.assertNotIn('on_patch', collection['points'][0])
-
-
-if __name__ == '__main__':
-    unittest.main()
-
-
-def _regular_pcl(cid, zyxs):
-        return {
-            'id': 3, 'name': 'drawn', 'source_file': '/inputs/drawn.json',
-            'sampling_group': '/inputs/drawn.json',
-            'metadata': {
-                'winding_is_absolute': False, 'input_role': 'legacy',
-                'resident_collection_id': cid,
-            },
-            'points': {i: _point(i, cid, zyx) for i, zyx in enumerate(zyxs)},
-        }

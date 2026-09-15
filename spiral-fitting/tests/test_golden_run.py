@@ -1,5 +1,4 @@
-"""Golden-run characterization test for the headless fit path
-(REFACTOR_PLAN.md, PR 1 commit 0).
+"""Real-scroll characterization of the headless fit path.
 
 Runs one short headless fit (tests/golden_run_driver.py, subprocess) on the
 local PHercParis4 dataset and asserts it against tests/golden/golden_bands.json:
@@ -21,17 +20,15 @@ import os
 import subprocess
 import sys
 import tempfile
-
 import pytest
+from golden_run_compare import compare
+
 
 SPIRAL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SPEC_PATH = os.environ.get(
     'GOLDEN_RUN_SPEC', os.path.join(SPIRAL_DIR, 'tests', 'golden', 'run_spec.json'))
 GOLDEN_PATH = os.environ.get(
     'GOLDEN_RUN_BANDS', os.path.join(SPIRAL_DIR, 'tests', 'golden', 'golden_bands.json'))
-
-sys.path.insert(0, os.path.join(SPIRAL_DIR, 'tests'))
-from golden_run_compare import compare  # noqa: E402
 
 
 def _skip_reason():

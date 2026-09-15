@@ -3,7 +3,7 @@ fit_spiral CLI drives it, with dataset locations supplied by a JSON spec
 instead of edits to fit_spiral module globals.
 
 This is the measurement half of the golden-run characterization harness
-(REFACTOR_PLAN.md, PR 1 commit 0). It is meant to run as a subprocess so
+It runs as a subprocess so
 each run gets a fresh interpreter, CUDA context, and RNG state:
 
     python tests/golden_run_driver.py <spec.json> <result.json> <out_dir>
