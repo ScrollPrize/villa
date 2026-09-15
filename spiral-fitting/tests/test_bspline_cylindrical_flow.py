@@ -87,3 +87,60 @@ class BSplineCylindricalSamplerTests(unittest.TestCase):
             lambda f, p: BSplineCylindricalFlowField._sample_lattice(
                 f, ring_num_phi, ring_offsets, p),
             (field, points))
+
+    def test_constant_local_field_reproduced_away_from_axis(self):
+        # Per-axis weights sum to 1 (periodic wrap and border replication
+        # included), so a lattice constant in the LOCAL basis is reproduced
+        # exactly at queries whose radial stencil misses the pinned r=0 ring
+        # (r_cont >= 2). The z/radial constants also exercise the rotation.
+        flow = BSplineCylindricalFlowField(torch.tensor([8, 24, 24])).double()
+        nr = flow._hr_num_phi.shape[0]
+        with torch.no_grad():
+            flow.flows[1][:, 0] = 0.7   # local z
+            flow.flows[1][:, 1] = -1.3  # local radial
+
+        generator = torch.Generator().manual_seed(2)
+        n = 400
+        z_cont = torch.rand(n, generator=generator, dtype=torch.float64) * 7
+        r_cont = 2.0 + torch.rand(n, generator=generator, dtype=torch.float64) * (nr - 3.05)
+        phi = (torch.rand(n, generator=generator, dtype=torch.float64) * 2. - 1.) * np.pi * 0.999
+        points = _points_from_cylindrical(z_cont, r_cont, phi, 8, nr)
+
+        with torch.no_grad():
+            output = flow.get_sampler()(points)
+
+        expected = torch.stack([
+            torch.full_like(phi, 0.7),
+            -1.3 * torch.sin(phi),
+            -1.3 * torch.cos(phi),
+        ], dim=-1)
+        torch.testing.assert_close(output, expected, rtol=1e-12, atol=1e-12)
+
+
+class BSplineCylindricalGradientTests(unittest.TestCase):
+    def test_eager_integrator_matches_manual_sampler_loop(self):
+        # On CPU the inherited integrator runs the eager slab loop over the
+        # CUBIC sampler (not the trilinear one); two slabs, walked forward
+        # and in reverse order.
+        torch.manual_seed(13)
+        flow = BSplineCylindricalFlowField(torch.tensor([12, 12, 12]), num_stages=2)
+        with torch.no_grad():
+            flow.flows[0].normal_(std=0.1)
+            flow.flows[1].normal_(std=0.1)
+        points = torch.rand(37, 3)
+        n_steps = 3
+
+        for reverse in (False, True):
+            h = (-1.0 if reverse else 1.0) / n_steps
+            with torch.no_grad():
+                integrated = flow.get_integrator()(points, h, n_steps, reverse=reverse)
+                y = points
+                for slab in ((1, 0) if reverse else (0, 1)):
+                    sampler = flow.get_sampler(slab)
+                    for _ in range(n_steps):
+                        k1 = sampler(y)
+                        k2 = sampler(y + (h / 2) * k1)
+                        k3 = sampler(y + (h / 2) * k2)
+                        k4 = sampler(y + h * k3)
+                        y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+            torch.testing.assert_close(integrated, y)

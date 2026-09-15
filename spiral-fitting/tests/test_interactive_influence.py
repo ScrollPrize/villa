@@ -153,6 +153,32 @@ class GapCoordinateTests(unittest.TestCase):
         far = (theta_probe - float(theta_cols[column])).abs() > 2. * theta_spacing
         self.assertEqual(float(diff[far, bucket + 1].max()), 0.)
 
+    def test_z_row_localization(self):
+        model = make_tiny_model()
+        gap_params = model.gap_expander_params
+        min_z = float(model.flow_min_corner_zyx[0])
+        max_z = float(model.flow_max_corner_zyx[0])
+        z_rows, s_cols, theta_cols = _gap_logit_zst(gap_params, min_z, max_z, torch.device('cpu'))
+        row, column = gap_params.num_z // 2, s_cols.shape[0] // 2
+        bucket = int(s_cols[column] - 0.5)
+        theta_probe = torch.full([gap_params.num_z], float(theta_cols[column]))
+
+        def radii():
+            transform = GapExpandingTransform(
+                gap_params, torch.tensor(16.), min_z, max_z, TINY_CONFIG['model_gap_expander_lr_scale'])
+            with torch.no_grad():
+                return transform.get_transformed_winding_radii(theta_probe, z_rows.clone())
+
+        before = radii()
+        with torch.no_grad():
+            gap_params.logits[0, 0, row, column] += 0.05
+            gap_params._triton_consts = None
+        diff = (radii() - before).abs()[:, bucket + 1]
+        self.assertGreater(float(diff[row]), 0.)
+        far_rows = torch.arange(gap_params.num_z)
+        far_rows = far_rows[(far_rows - row).abs() > 1]
+        self.assertEqual(float(diff[far_rows].max()), 0.)
+
 
 class FlowLatticeMappingTests(unittest.TestCase):
     def test_flowbox_to_spiral_round_trip_with_nonzero_flow(self):
@@ -169,6 +195,19 @@ class FlowLatticeMappingTests(unittest.TestCase):
         with torch.no_grad():
             round_trip = transform.inv(transform(points))
         torch.testing.assert_close(round_trip, points, atol=0.5, rtol=0.)
+
+    def test_flowbox_to_spiral_is_identity_with_zero_parameters(self):
+        model = make_tiny_model()
+        points = torch.stack([
+            torch.empty([256]).uniform_(10., 180.),
+            torch.empty([256]).uniform_(-80., 80.),
+            torch.empty([256]).uniform_(-80., 80.),
+        ], dim=-1)
+        for include in (False, True):
+            transform = model.get_flowbox_to_spiral_transform(include_diffeomorphism=include)
+            with torch.no_grad():
+                mapped = transform(points)
+            torch.testing.assert_close(mapped, points, atol=1e-3, rtol=0.)
 
 
 class FreezeInvariantTests(unittest.TestCase):

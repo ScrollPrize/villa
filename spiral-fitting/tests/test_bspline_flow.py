@@ -3,7 +3,7 @@ import numpy as np
 import scipy.ndimage
 import torch
 import flow_triton
-from flow_fields import sample_field_bspline
+from flow_fields import BSplineFlowField, sample_field_bspline
 
 
 def _random_points(num_points, seed, lo=-0.3, hi=1.3):
@@ -41,6 +41,17 @@ class BSplineSamplerTests(unittest.TestCase):
         # clamp itself is a kink that finite differences would straddle.
         points = (_random_points(11, 6, lo=0.05, hi=0.95)).requires_grad_(True)
         torch.autograd.gradcheck(sample_field_bspline, (field, points))
+
+    def test_partition_of_unity_on_constant_field(self):
+        # The cubic B-spline basis sums to one everywhere (including in the
+        # replicated border region), so a constant lattice must reproduce the
+        # constant exactly at every query point.
+        field = torch.zeros(3, 4, 5, 6, dtype=torch.float64)
+        constant = torch.tensor([0.7, -1.3, 2.1], dtype=torch.float64)
+        field += constant[:, None, None, None]
+        output = sample_field_bspline(field, _random_points(500, 4))
+        torch.testing.assert_close(
+            output, constant.expand_as(output), rtol=1e-12, atol=1e-12)
 
 
 def _eager_rk4(low, high, pts, h, n_steps):
@@ -135,3 +146,27 @@ class BSplineTritonEquivalenceTests(unittest.TestCase):
             acc_lo[0], reference_low.grad, rtol=1e-3, atol=1e-5)
         torch.testing.assert_close(
             acc_hi[0], reference_high.grad, rtol=1e-3, atol=1e-5)
+
+
+class BSplineFlowGradientTests(unittest.TestCase):
+    def test_eager_integrator_matches_sampler_loop_per_slab(self):
+        # Two slabs, applied in order (reverse order, backwards, for the
+        # inverse), each a plain RK4 over that slab's sampler.
+        torch.manual_seed(13)
+        flow = BSplineFlowField(torch.tensor([12, 12, 12]), num_stages=2)
+        with torch.no_grad():
+            flow.flows[0].normal_(std=0.1)
+            flow.flows[1].normal_(std=0.1)
+        points = torch.rand(37, 3)
+        h, n_steps = 1.0 / 3.0, 3
+
+        for reverse in (False, True):
+            with torch.no_grad():
+                integrated = flow.get_integrator()(
+                    points, -h if reverse else h, n_steps, reverse=reverse)
+                y = points
+                for slab in ((1, 0) if reverse else (0, 1)):
+                    y = _eager_rk4(
+                        flow.flows[0][slab], flow.flows[1][slab], y,
+                        -h if reverse else h, n_steps)
+            torch.testing.assert_close(integrated, y)
