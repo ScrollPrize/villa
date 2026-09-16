@@ -2954,6 +2954,12 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
 
     if (seedOnlyPoint) {
         const cv::Vec3d seedPoint = *seedOnlyPoint;
+        // Copied now, like seedPoint: ensureDatasetForSession and launchSession
+        // below can process events that finalize other editors and reload or
+        // reallocate _fibers, after which `it` must not be read.
+        std::vector<std::string> seedTags = it->controlPoints.empty()
+            ? std::vector<std::string>{}
+            : it->controlPoints.front().tags;
         session->seedPoint = seedPoint;
         session->focusedLinePosition = 0.0;
         session->focusedControlPoint = seedPoint;
@@ -2984,8 +2990,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
                        toVec3f(seedPoint),
                        InitialDirectionMode::ZInOut,
                        SeedOrigin::StoredFiber,
-                       it->controlPoints.empty() ? std::vector<std::string>{}
-                                                 : it->controlPoints.front().tags);
+                       std::move(seedTags));
         return;
     }
 
