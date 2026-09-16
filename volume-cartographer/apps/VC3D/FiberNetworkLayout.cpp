@@ -586,6 +586,14 @@ PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
     placedFiber.label = fiber.label;
     placedFiber.hvTag = fiber.hvTag;
     placedFiber.controlPoints = geo.controlPoints;
+    placedFiber.kollesisTerminations.assign(placedFiber.controlPoints.size(), false);
+    if (fiber.kollesisTerminations.size() == fiber.controlPoints.size()) {
+        for (std::size_t i = 0;
+             i < fiber.kollesisTerminations.size() && i < placedFiber.kollesisTerminations.size();
+             ++i) {
+            placedFiber.kollesisTerminations[i] = fiber.kollesisTerminations[i];
+        }
+    }
 
     const std::size_t spanCount =
         fiber.controlPoints.empty() ? 0 : fiber.controlPoints.size() - 1;
@@ -1593,6 +1601,12 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
         hashU64(digest, fiber.label.size());
         hashBytes(digest, fiber.label.constData(),
                   static_cast<std::size_t>(fiber.label.size()) * sizeof(QChar));
+        // Display-only like the label, and like it part of "did anything the
+        // layout consumes change" so the memoization check stays exact.
+        hashU64(digest, fiber.kollesisTerminations.size());
+        for (const bool tagged : fiber.kollesisTerminations) {
+            hashU64(digest, tagged ? 1 : 0);
+        }
         hashU64(digest, fiber.links.size());
         for (const InputLink& link : fiber.links) {
             hashU64(digest, static_cast<uint64_t>(
@@ -1685,6 +1699,10 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         for (const QPointF& point : fiber.fiber.controlPoints) {
             hashDouble(digest, point.x());
             hashDouble(digest, point.y());
+        }
+        hashU64(digest, fiber.fiber.kollesisTerminations.size());
+        for (const bool tagged : fiber.fiber.kollesisTerminations) {
+            hashU64(digest, tagged ? 1 : 0);
         }
     }
     hashU64(digest, result.links.size());

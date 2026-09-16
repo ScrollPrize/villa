@@ -167,6 +167,9 @@ public:
         std::vector<cv::Vec3d> linePoints;
         // Per control-point span; size max(0, controlPoints.size() - 1).
         std::vector<bool> tracedSegments;
+        // Per control point: carries the kollesis_termination tag. Same size
+        // as controlPoints.
+        std::vector<bool> kollesisTerminations;
         // Branch links resolving to a loaded fiber, pending included.
         std::vector<FiberMapLink> links;
     };
@@ -648,10 +651,13 @@ private:
                                    std::optional<int> controlPointIndex,
                                    std::optional<int> linePointIndex = std::nullopt,
                                    std::optional<std::pair<int, int>> spanControlIndices = std::nullopt);
+    // seedTags: per-control-point tags the seed keeps (a reopened
+    // single-point fiber's stored tags); empty for a new placement.
     void handleLineSeed(const std::string& surfaceName,
                         cv::Vec3f volumePoint,
                         InitialDirectionMode directionMode,
-                        SeedOrigin seedOrigin = SeedOrigin::NewPlacement);
+                        SeedOrigin seedOrigin = SeedOrigin::NewPlacement,
+                        std::vector<std::string> seedTags = {});
     // lineAnchor: linePosition's 3D point on the line the caller measured it
     // on (see LineAnnotationDialog::generatedControlPointRequested). Absent,
     // the position is used as given.
@@ -715,6 +721,9 @@ private:
                                                  size_t firstControlPointIndex,
                                                  size_t secondControlPointIndex,
                                                  const std::string& goal);
+    void handleGeneratedControlPointSetKollesisTermination(const std::string& surfaceName,
+                                                           size_t controlPointIndex,
+                                                           bool enabled);
     void handleGeneratedControlPointLinkCandidate(const std::string& surfaceName,
                                                   size_t controlPointIndex,
                                                   cv::Vec3f volumePoint);

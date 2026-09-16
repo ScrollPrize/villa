@@ -54,6 +54,9 @@ struct GeneratedOverlay {
 
         size_t controlIndex = std::numeric_limits<size_t>::max();
         bool isSeed = false;
+        // Tagged kollesis_termination: hollow yellow ring. A linked tagged
+        // point keeps the link-state fill inside the yellow ring.
+        bool isKollesisTermination = false;
         bool hasBranches = false;
         bool hasPendingLinks = false;
         // Same-orientation links (H-H / V-V) render in the orange warning
@@ -1449,6 +1452,133 @@ struct GeneratedLinkCandidateMenuState {
 // Defined in the .cpp: this header is also compiled into QtCore-only tests.
 [[nodiscard]] QColor generatedLinkStateColor(bool pending, bool sameHv, int alpha);
 
+// The kollesis-termination ring colour: the ordinary control-point yellow.
+// The tag is told apart by form, not hue: a tagged point draws as a hollow
+// yellow ring (a linked one keeps its link-state fill inside the ring).
+// Shared with the overview bar and the Fiber Map so the tag looks the same
+// everywhere.
+[[nodiscard]] QColor generatedKollesisTerminationColor(int alpha);
+
+namespace detail
+{
+
+struct GeneratedControlPointExtent {
+    const GeneratedOverlay::ControlPointMarker* first = nullptr;
+    const GeneratedOverlay::ControlPointMarker* last = nullptr;
+};
+
+inline GeneratedControlPointExtent generatedControlPointExtent(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints)
+{
+    GeneratedControlPointExtent extent;
+    for (const auto& control : controlPoints) {
+        if (!std::isfinite(control.linePosition)) {
+            continue;
+        }
+        if (!extent.first || control.linePosition < extent.first->linePosition) {
+            extent.first = &control;
+        }
+        if (!extent.last || control.linePosition > extent.last->linePosition) {
+            extent.last = &control;
+        }
+    }
+    return extent;
+}
+
+} // namespace detail
+
+// A kollesis termination may only sit on a fiber end: the control point with
+// the smallest or the largest line position (a single point is both). Markers
+// without a finite line position do not take part. Defined inline: this
+// header is compiled into QtCore-only tests without the .cpp.
+inline bool generatedControlPointIsEndpoint(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+    size_t controlIndex)
+{
+    const auto extent = detail::generatedControlPointExtent(controlPoints);
+    if (!extent.first || !extent.last) {
+        return false;
+    }
+    const auto atIndex = [controlIndex](const GeneratedOverlay::ControlPointMarker* marker) {
+        return marker && marker->controlIndex == controlIndex;
+    };
+    if (atIndex(extent.first) || atIndex(extent.last)) {
+        return true;
+    }
+    // Ties on the extreme line position (collapsed points not yet re-fit)
+    // count too: any of them is the fiber's end.
+    for (const auto& control : controlPoints) {
+        if (control.controlIndex != controlIndex || !std::isfinite(control.linePosition)) {
+            continue;
+        }
+        return control.linePosition == extent.first->linePosition ||
+               control.linePosition == extent.last->linePosition;
+    }
+    return false;
+}
+
+// The placement rule itself, on parallel per-control-point vectors so the
+// dialog (overlay markers) and the controller (session controls) enforce the
+// same thing: true when linePosition lies strictly before a tagged first
+// control point or strictly after a tagged last one. The fiber is declared to
+// end there, so no control point may be placed beyond it; placing at the
+// endpoint's own position (which replaces it) stays allowed. Entries without
+// a finite position do not take part; a size mismatch means no tags.
+inline bool generatedLinePositionBeyondTaggedEnd(const std::vector<double>& controlLinePositions,
+                                                 const std::vector<bool>& tagged,
+                                                 double linePosition)
+{
+    if (!std::isfinite(linePosition) || tagged.size() != controlLinePositions.size()) {
+        return false;
+    }
+    bool haveExtent = false;
+    double first = 0.0;
+    double last = 0.0;
+    for (const double position : controlLinePositions) {
+        if (!std::isfinite(position)) {
+            continue;
+        }
+        if (!haveExtent) {
+            first = last = position;
+            haveExtent = true;
+            continue;
+        }
+        first = std::min(first, position);
+        last = std::max(last, position);
+    }
+    if (!haveExtent) {
+        return false;
+    }
+    const auto taggedAt = [&](double extremePosition) {
+        for (size_t i = 0; i < tagged.size(); ++i) {
+            if (tagged[i] && controlLinePositions[i] == extremePosition) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (linePosition < first && taggedAt(first)) {
+        return true;
+    }
+    return linePosition > last && taggedAt(last);
+}
+
+// generatedLinePositionBeyondTaggedEnd over overlay markers.
+inline bool generatedLinePositionBeyondKollesisTermination(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+    double linePosition)
+{
+    std::vector<double> positions;
+    std::vector<bool> tagged;
+    positions.reserve(controlPoints.size());
+    tagged.reserve(controlPoints.size());
+    for (const auto& control : controlPoints) {
+        positions.push_back(control.linePosition);
+        tagged.push_back(control.isKollesisTermination);
+    }
+    return generatedLinePositionBeyondTaggedEnd(positions, tagged, linePosition);
+}
+
 struct GeneratedControlPointContextMenuOptions {
     QWidget* parent = nullptr;
     std::string surfaceName;
@@ -1491,6 +1621,9 @@ struct GeneratedControlPointContextMenuOptions {
     std::function<void(size_t, cv::Vec3f)> splitFromCandidateAndLink;
     std::function<void(uint64_t, cv::Vec3f)> openNearbyAnnotation;
     std::function<void(size_t, size_t, std::string)> setSegmentInterpolationGoal;
+    // (controlIndex, enabled): toggle the kollesis_termination tag on the
+    // point. The menu item is checkable and reflects the marker's state.
+    std::function<void(size_t, bool)> setKollesisTermination;
 };
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,

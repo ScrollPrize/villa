@@ -90,6 +90,11 @@ QColor generatedCurrentLineMarkerColor(GeneratedCurrentLineMarkerState state,
 
 } // namespace
 
+QColor generatedKollesisTerminationColor(int alpha)
+{
+    return QColor(255, 230, 0, alpha);
+}
+
 QColor generatedLinkStateColor(bool pending, bool sameHv, int alpha)
 {
     if (sameHv) {
@@ -313,23 +318,42 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     splitCandidateControlPointStyle.brushColor = QColor(235, 60, 60, 175);
     splitCandidateControlPointStyle.z = 163.5;
 
+    // The transient candidate designations outrank the tag: a candidate keeps
+    // its own colour and size (the fast current-cut overlay does the same).
+    const auto drawsKollesisRing = [](const GeneratedOverlay::ControlPointMarker& control) {
+        return control.isKollesisTermination && !control.isSplitCandidate &&
+               !control.isLinkCandidate;
+    };
     auto controlStyleForMarker = [&](const GeneratedOverlay::ControlPointMarker& control)
-        -> const ViewerOverlayControllerBase::OverlayStyle& {
+        -> ViewerOverlayControllerBase::OverlayStyle {
         if (control.isSplitCandidate) {
             return splitCandidateControlPointStyle;
         }
         if (control.isLinkCandidate) {
             return linkCandidateControlPointStyle;
         }
+        const bool linked = control.hasPendingLinks || control.hasBranches;
+        ViewerOverlayControllerBase::OverlayStyle style;
         if (control.hasPendingLinks) {
-            return control.hasSameHvPendingLinks ? sameHvPendingBranchControlPointStyle
-                                                 : pendingBranchControlPointStyle;
+            style = control.hasSameHvPendingLinks ? sameHvPendingBranchControlPointStyle
+                                                  : pendingBranchControlPointStyle;
+        } else if (control.hasBranches) {
+            style = control.hasSameHvBranches ? sameHvBranchControlPointStyle
+                                              : branchControlPointStyle;
+        } else {
+            style = control.isSeed ? seedStyle : controlPointStyle;
         }
-        if (control.hasBranches) {
-            return control.hasSameHvBranches ? sameHvBranchControlPointStyle
-                                             : branchControlPointStyle;
+        if (drawsKollesisRing(control)) {
+            // Hollow ring: "yellow means control point, hollow means the
+            // fiber ends here". A linked termination keeps the link-state
+            // fill inside the ring so the link still reads.
+            style.penColor = generatedKollesisTerminationColor(245);
+            style.penWidth = 2.5;
+            if (!linked) {
+                style.brushColor = Qt::transparent;
+            }
         }
-        return control.isSeed ? seedStyle : controlPointStyle;
+        return style;
     };
 
     ViewerOverlayControllerBase::OverlayStyle markerStyle;
@@ -476,7 +500,8 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                 if (finiteScenePoint(controlScene)) {
                     primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
                         controlScene,
-                        control.hasBranches ? 6.25 : (control.isSeed ? 5.5 : 5.0),
+                        (control.hasBranches ? 6.25 : (control.isSeed ? 5.5 : 5.0)) +
+                            (drawsKollesisRing(control) ? 1.0 : 0.0),
                         true,
                         controlStyleForMarker(control)});
                 }
@@ -571,7 +596,8 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         }
         for (const auto& control : overlay.controlPoints) {
             addVolumePointMarker(control.point,
-                                 control.hasBranches ? 12.0 : (control.isSeed ? 11.0 : 10.0),
+                                 (control.hasBranches ? 12.0 : (control.isSeed ? 11.0 : 10.0)) +
+                                     (drawsKollesisRing(control) ? 2.0 : 0.0),
                                  controlStyleForMarker(control));
         }
     }
@@ -918,6 +944,21 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     }
     QAction* deleteAction = menu.addAction(QWidget::tr("Delete control point"));
     deleteAction->setEnabled(options.controlPoints.size() > 1);
+    QAction* kollesisTerminationAction = nullptr;
+    if (options.setKollesisTermination) {
+        // Only a fiber end can be a termination. An interior point that
+        // somehow carries the tag (an edited file) can still shed it.
+        const bool haveIndex = selectedControlIndex != std::numeric_limits<size_t>::max();
+        const bool endpoint = haveIndex &&
+            generatedControlPointIsEndpoint(options.controlPoints, selectedControlIndex);
+        const bool enabled = haveIndex && (endpoint || selectedControl.isKollesisTermination);
+        kollesisTerminationAction = menu.addAction(
+            enabled ? QWidget::tr("Kollesis termination")
+                    : QWidget::tr("Kollesis termination (fiber ends only)"));
+        kollesisTerminationAction->setCheckable(true);
+        kollesisTerminationAction->setChecked(selectedControl.isKollesisTermination);
+        kollesisTerminationAction->setEnabled(enabled);
+    }
     QAction* designateLinkCandidateAction = nullptr;
     if (options.designateLinkCandidate) {
         designateLinkCandidateAction =
@@ -1065,6 +1106,12 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         if (options.deleteControlPoint) {
             options.deleteControlPoint(selectedControl.linePosition, selectedControl.point);
         }
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (kollesisTerminationAction && selected == kollesisTerminationAction &&
+        kollesisTerminationAction->isEnabled()) {
+        options.setKollesisTermination(selectedControlIndex,
+                                       !selectedControl.isKollesisTermination);
         return GeneratedControlPointContextResult::Handled;
     }
     for (const auto& [action, goal] : interpolationGoalActions) {
