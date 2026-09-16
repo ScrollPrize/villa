@@ -121,6 +121,14 @@ re-running rclone resumes interrupted downloads. The dataset contains verified a
 Configuration is straightforward: the input paths and fitting region are plain variables at the top of `fit_spiral.py`. Edit them to point at your download:
 
 - `dataset_path` — the root of the dataset; the per-input paths below it (`verified_patches_path`, `unverified_patches_path`, `pcl_json_paths`, `fibers_path`, `shell_path`, `tracks_dbm_path`, the normals/grad-mag zarr paths, …) default to locations inside it. Set any of them to `None` to fit without that input.
+- **`input_use_*` — whether an input that is present is actually used.** Each optional input has a toggle in `default_config`, independent of whether its file is there. `input_use_tracks` defaults to `false`, so a dataset that ships a tracks DBM will not use it unless you turn it on:
+
+  ```
+  FIT_SPIRAL_CONFIG_OVERRIDES='{"input_use_tracks": true, ...}'
+  ```
+
+  Worth checking before a long run: with tracks off and no verified patches, no remaining input places a point on a winding, and the fit still converges and writes a checkpoint.
+
 - `z_begin, z_end` — the slice range (in full-resolution voxels) to fit. **Consider starting with a small range**: the whole written region of Scroll 1 is roughly z 4,000–17,000, and fitting all of it needs a lot of GPU memory (around 60 GB). A ~1,000-slice range is a good first run on a smaller GPU. Per-step sample counts are scaled automatically to the size of the z-range, so hyperparameters don't need retuning when you change it.
 
 Everything else — loss weights, resolutions, step counts — lives in the `default_config` dict just below, with one entry per knob. You can override any of them without editing the file via a JSON environment variable, and a few other environment variables control the run:
