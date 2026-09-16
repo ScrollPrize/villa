@@ -73,7 +73,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.direction import (
     decode_lasagna_direction_3x2_analytic,
     encode_lasagna_direction_3x2,
 )
-from .refinement import RefinementConfig, RefinementObserver, refinement_session, active_store
+from .refinement import RefinementConfig, RefinementObserver, refinement_session, active_store, log_refinement_scalars, empty_refinement_statistics
 from vesuvius.neural_tracing.fiber_trace_3d.model import (
     build_fiber_trace_3d_model,
     direction_output,
@@ -3531,6 +3531,8 @@ def training_units(
                             "dense_logged": False, "elapsed": 0.0}
         diagnostics.arm_test_watchdog(step)
         diagnostics.marker("test-routine-begin", step=step)
+        test_refinement_totals = (pending_test.setdefault("refinement_loss_totals", empty_refinement_statistics())
+                                  if pending_test is not None else empty_refinement_statistics())
         def collect_evaluation(evaluation_loader, options, *, source, rows_key, visualization=None):
             nonlocal test_started
             count, offset = options["sample_count"], options["start_sample_index"]
@@ -3557,15 +3559,23 @@ def training_units(
                             if pending_test is not None else evaluation_microbatch_size))
                 finally:
                     iterator.close()
-                if source == "test":
+                refinement_stats = empty_refinement_statistics()
+                if source == "test" and refinement.config.enabled:
                     # Raw and all EMA tracks have now consumed identical batch
                     # targets. Commit before a possible managed yield/restart.
-                    refinement.flush(distributed)
+                    refinement_stats = refinement.flush(distributed, phase="test", step=step,
+                        batch=f"{remaining[start]}:{remaining[min(start+wave_size,len(remaining))-1]}")
                 rows = _distributed_gather_dense_test_rows(local, distributed)
                 if pending_test is None:
+                    test_refinement_totals[:] = [a+b for a,b in zip(test_refinement_totals,refinement_stats)]
                     all_rows.extend(rows)
                     continue
-                rows = _distributed_broadcast_object(rows if distributed.is_main else None, distributed)
+                if source == "test" and refinement.config.enabled:
+                    rows, refinement_stats = _distributed_broadcast_object(
+                        (rows,refinement_stats) if distributed.is_main else None, distributed)
+                    test_refinement_totals[:] = [a+b for a,b in zip(test_refinement_totals,refinement_stats)]
+                else:
+                    rows = _distributed_broadcast_object(rows if distributed.is_main else None, distributed)
                 pending_test[rows_key].extend(rows)
                 if visualization is not None:
                     sheets = _distributed_broadcast_object(
@@ -3626,6 +3636,7 @@ def training_units(
                     if writer is not None and (pending_test is None or not pending_test["dense_logged"]):
                         diagnostics.marker("test-tensorboard-scalars-begin", step=step)
                         _log_test_scalars(writer, "test", test_losses, raw_model, step)
+                        log_refinement_scalars(writer,"test",test_refinement_totals,step)
                         diagnostics.marker("test-tensorboard-scalars-end", step=step)
                 if (
                     distributed.is_main
@@ -4168,11 +4179,7 @@ def training_units(
             if train_vis_due:
                 _distributed_barrier(distributed)
 
-            refinement.flush(distributed)
-            if writer is not None and refinement.config.enabled and scalar_metrics_due:
-                writer.add_scalar("refinement/seconds_cumulative", refinement.seconds, step)
-                writer.add_scalar("refinement/accepted", refinement.accepted, step)
-                writer.add_scalar("refinement/stale", refinement.stale, step)
+            refinement.flush(distributed, phase="train", step=step, writer=writer)
             test_metric = None
             test_metric_name = None
             test_due = test_interval > 0 and step % test_interval == 0

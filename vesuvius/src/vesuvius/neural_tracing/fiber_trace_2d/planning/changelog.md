@@ -1,3 +1,17 @@
+## 2026-09-15 — Anisotropic and direction-guided refinement
+
+- Separate surface-normal/tangential bending (production0.1/1.0) and add weak
+  predicted direction guidance0.1, full smooth-warp pullback, split objective logs.
+- Preserve original-GT tether, shared raw/EMA targets and independent test pieces.
+
+## 2026-09-15 — Weak result-line bending and refinement loss reporting
+
+- Replace displacement smoothing with weak arclength bending of the resulting
+  line; retain original-GT tether, training stitching and free test endpoints.
+- Replace cumulative refinement TB counters with weighted presence, bending and
+  localization losses. Print batch means; test TB aggregates over each pass.
+- Regression verifies identical refined test targets for raw, EMA99 and EMA999.
+
 ## 2026-09-15 — Merge refinement and embedding/evaluation work
 
 - Committed embedding/evaluation state as de6fc71e8, then merged

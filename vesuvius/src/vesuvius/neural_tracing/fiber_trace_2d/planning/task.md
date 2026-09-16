@@ -1,3 +1,6 @@
-# Merge refinement into the committed embedding/evaluation branch
+# Anisotropic and direction-guided training refinement
 
-Commit the current state, then merge fiber-training-refinement into fiber-vischeck. Preserve both feature sets and historical planning/results. Validate without launching training/evaluations.
+Use normal bending weight0.1, tangential weight10.0 and direction weight1.0
+(user follow-up: increase tangent and direction by10x, leave normal unchanged).
+Keep split loss logs/shared raw-EMA targets, fixed crops, free test ends and caps.
+Stop previous run and launch fresh geometry from original non-refinement11800.
