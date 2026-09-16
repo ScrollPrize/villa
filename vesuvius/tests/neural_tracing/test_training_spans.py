@@ -103,6 +103,7 @@ def test_file_backed_train_and_test_use_identical_filtered_geometry(monkeypatch)
 
 
 CONFIG = Path(__file__).resolve().parents[2] / "src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_5scroll_json_eligible_ema_16x8.json"
+FULLRES_CONFIG = CONFIG.with_name("train_5scroll_json_eligible_fullres_ema_16x8.json")
 
 
 def test_clean_json_only_training_config():
@@ -116,6 +117,22 @@ def test_clean_json_only_training_config():
     for split in ("datasets", "test_datasets"):
         assert len({d["scroll_id"] for d in raw[split]}) == 5
         assert all(d["fiber_glob"].endswith("*.json") for d in raw[split])
+
+
+def test_fullres_config_changes_only_output_stride_and_run_name():
+    raw = json.loads(FULLRES_CONFIG.read_text())
+    base = json.loads(CONFIG.read_text())
+    loaded = module.load_config(FULLRES_CONFIG)
+    assert raw["model_3d"]["output_stride"] == 1
+    assert not loaded.embedding.enabled
+    assert not loaded.refinement.enabled
+    assert "refinement" not in raw
+    assert not any("resume" in key for key in raw["training"])
+    assert raw["model_3d"].pop("output_stride") == 1
+    assert base["model_3d"].pop("output_stride") == 4
+    assert raw["training"].pop("run_name") == "5scroll_json_eligible_fullres_128_sd1_16x8_ema"
+    assert base["training"].pop("run_name") == "5scroll_json_eligible_128_sd1_16x8_ema"
+    assert raw == base
 
 
 def test_local_corpus_eligible_coverage():

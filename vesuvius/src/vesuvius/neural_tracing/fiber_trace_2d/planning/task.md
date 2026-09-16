@@ -1,5 +1,6 @@
-# Refinement direction-weight ablation
+# Fresh full-resolution five-scroll training
 
-Lower refinement direction weight from 1.0 to 0.1; retain normal/tangent
-smoothing 0.1/10 and all other settings. Restart from the same original
-non-refinement checkpoint (update11800), not the stopped trial.
+Stop the current refinement training. Start a new training from scratch without
+refinement or embeddings, using the same eligible five-scroll JSON-only data and
+training settings as the current regular baseline, except that the U-Net emits
+full-resolution output (`model_3d.output_stride: 1`) instead of stride 4.

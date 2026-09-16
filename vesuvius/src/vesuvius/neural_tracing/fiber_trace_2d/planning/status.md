@@ -1,4 +1,7 @@
-- [x] Plan and independent review.
-- [x] Change refinement direction1->0.1 only; retain normal0.1/tangent10.
-- [x] CPU regression:23 passed,2 GPU-gated skips (config-only change).
-- [x] Approved managed launch20260916_062132 root1231471; original11800 source.
+- [x] Stop current refinement training and release allocation.
+- [x] Inspect output-stride specification and baseline config.
+- [x] Independent plan review.
+- [x] Add full-resolution config and equivalence regression.
+- [x] Run focused CPU validation: 40 passed, 2 skipped.
+- [x] Update docs and approved launcher configuration.
+- [ ] Launch fresh managed training and verify startup.
