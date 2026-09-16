@@ -413,7 +413,10 @@ struct FiberletOnDemandPreprocessor::State {
     mutable std::map<std::array<int, 4>, EvaluationAnchorChunkEntry> evaluationAnchorChunks;
     mutable std::size_t evaluationAnchorBytes = 0;
     mutable std::uint64_t evaluationAnchorTouch = 0;
-    std::array<std::mutex, 64> fiberletGenerationStripes;
+    using Pair = std::pair<FiberletChunkDataset::MaterializedChunk, FiberletChunkDataset::MaterializedChunk>;
+    std::mutex generationMutex;
+    std::map<std::array<int, 3>, std::shared_future<Pair>> generating;
+    std::set<std::array<int, 3>> emptyOwners;
     std::mutex shutdownMutex;
     bool shutdownComplete = false;
 };
@@ -644,6 +647,7 @@ FiberletChunkDataset::MaterializedChunk FiberletOnDemandPreprocessor::generateAn
     const auto start = std::chrono::steady_clock::now();
     const auto& config = state_->config;
     std::vector<std::array<std::size_t, 3>> selectedCells;
+    const auto work = config.acquireWork ? config.acquireWork() : nullptr;
     if (config.anchorCellPredicate) {
         selectedCells = selectedOwnedCells(codec, config.anchorMetadata, config.grid, config.anchorConfig.cellSizePredictionVoxels, config.anchorCellPredicate);
     } else {
@@ -822,6 +826,13 @@ std::vector<FiberletScheduledChunk> FiberletOnDemandPreprocessor::referenceChunk
     return result;
 }
 
+std::vector<FiberletScheduledChunk> FiberletOnDemandPreprocessor::anchorChunkScheduleNearReference(
+    const PolylineArcGeometry& reference, double begin, double end, double radius) const
+{
+    const double padding = std::sqrt(3.0) * anchorConfig().cellSizePredictionVoxels * grid().predictionToBaseScale;
+    return referenceChunkSchedule(reference, begin, end, radius + padding);
+}
+
 void FiberletOnDemandPreprocessor::prefetchScheduled(std::span<const FiberletScheduledChunk> schedule, std::size_t begin, std::size_t count, bool wait) const
 {
     if (begin > schedule.size())
@@ -873,22 +884,58 @@ void FiberletOnDemandPreprocessor::shutdown()
 FiberletChunkDataset::MaterializedChunk FiberletOnDemandPreprocessor::generateFiberletChunk(
     FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, const FiberletStorageCodecConfig& codec)
 {
+    const std::array<int, 3> owner{key.iz, key.iy, key.ix};
+    std::shared_future<State::Pair> future;
+    std::shared_ptr<std::promise<State::Pair>> producer;
+    {
+        std::lock_guard lock(state_->generationMutex);
+        if (state_->emptyOwners.contains(owner)) {
+            if (kind == FiberletStorageChunkKind::FiberletPrefix)
+                return {serializeFiberletPrefixes(codec, {}),
+                    std::make_shared<const FiberletPrefixChunkPayload>(FiberletDecodedPrefixes{codec, {}}), true};
+            return {serializeFiberletRoutes(codec, {}),
+                std::make_shared<const FiberletRouteChunkPayload>(FiberletDecodedRoutes{codec, {}}), true};
+        }
+        if (const auto found = state_->generating.find(owner); found != state_->generating.end())
+            future = found->second;
+        else {
+            producer = std::make_shared<std::promise<State::Pair>>();
+            future = producer->get_future().share();
+            state_->generating.emplace(owner, future);
+        }
+    }
+    if (producer) {
+        try {
+            auto prefixKey = key; prefixKey.level = 0;
+            auto routeKey = key; routeKey.level = 1;
+            auto prefix = state_->fiberletDataset->readMaterializedChunk(FiberletStorageChunkKind::FiberletPrefix, prefixKey);
+            auto route = state_->fiberletDataset->readMaterializedChunk(FiberletStorageChunkKind::FiberletRoutes, routeKey);
+            auto pair = prefix && route ? State::Pair{std::move(*prefix), std::move(*route)}
+                : generateFiberletPair(prefixKey, state_->fiberletDataset->codecConfig(FiberletStorageChunkKind::FiberletPrefix, prefixKey));
+            const bool empty = std::dynamic_pointer_cast<const FiberletPrefixChunkPayload>(pair.first.payload)->prefixes.empty();
+            std::lock_guard lock(state_->generationMutex);
+            if (empty) state_->emptyOwners.insert(owner);
+            producer->set_value(std::move(pair));
+            state_->generating.erase(owner);
+        } catch (...) {
+            std::lock_guard lock(state_->generationMutex);
+            producer->set_exception(std::current_exception());
+            state_->generating.erase(owner);
+        }
+    }
+    const auto& pair = future.get();
+    return kind == FiberletStorageChunkKind::FiberletPrefix ? pair.first : pair.second;
+}
+
+std::pair<FiberletChunkDataset::MaterializedChunk, FiberletChunkDataset::MaterializedChunk>
+FiberletOnDemandPreprocessor::generateFiberletPair(
+    const vc::render::ChunkKey& key, const FiberletStorageCodecConfig& codec)
+{
     const auto start = std::chrono::steady_clock::now();
     auto prefixKey = key;
     prefixKey.level = 0;
     auto routeKey = key;
     routeKey.level = 1;
-    const std::array<int, 3> keyZYX{key.iz, key.iy, key.ix};
-    std::size_t stripe = 1469598103934665603ULL;
-    for (const auto coordinate : keyZYX) {
-        stripe ^= static_cast<std::uint32_t>(coordinate);
-        stripe *= 1099511628211ULL;
-    }
-    std::lock_guard keyLock(state_->fiberletGenerationStripes[stripe % state_->fiberletGenerationStripes.size()]);
-    const auto& requestedKey = kind == FiberletStorageChunkKind::FiberletPrefix ? prefixKey : routeKey;
-    if (auto cached = state_->fiberletDataset->readMaterializedChunk(kind, requestedKey))
-        return std::move(*cached);
-
     const auto& config = state_->config;
     std::vector<FiberletStoredAnchor> storedAnchors;
     const auto dependencies = anchorDependencies(prefixKey);
@@ -907,6 +954,7 @@ FiberletChunkDataset::MaterializedChunk FiberletOnDemandPreprocessor::generateFi
         const auto evaluated = evaluationAnchorChunk(dependency, anchors);
         storedAnchors.insert(storedAnchors.end(), evaluated->begin(), evaluated->end());
     }
+    const auto work = config.acquireWork ? config.acquireWork() : nullptr;
     std::sort(storedAnchors.begin(), storedAnchors.end(), [](const auto& left, const auto& right) { return left.key < right.key; });
     const auto duplicate = std::adjacent_find(storedAnchors.begin(), storedAnchors.end(), [](const auto& left, const auto& right) {
         return left.key == right.key;
@@ -1035,7 +1083,7 @@ FiberletChunkDataset::MaterializedChunk FiberletOnDemandPreprocessor::generateFi
             .candidateGenerationSeconds = report.candidateGenerationSeconds,
                 .candidateGenerationCpuSeconds = report.candidateGenerationCpuSeconds});
     }
-    return kind == FiberletStorageChunkKind::FiberletPrefix ? std::move(prefixChunk) : std::move(routeChunk);
+    return {std::move(prefixChunk), std::move(routeChunk)};
 }
 
 }  // namespace vc::fiber_tracer

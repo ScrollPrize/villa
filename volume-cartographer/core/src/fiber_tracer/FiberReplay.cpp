@@ -1274,8 +1274,9 @@ void validateNativeReplayStructure(const FiberReplayTraceResult& replay)
         if (!inInterval(segment.startReferenceArcBase, previousEnd, end) ||
             !inInterval(segment.endReferenceArcBase, segment.startReferenceArcBase, end) ||
             segment.endReferenceArcBase > replay.completedReferenceArcBase + kEpsilon ||
-            segment.tracePointsBase.size() != segment.matches.size() + 1 ||
-            segment.cumulativeLosses.size() != segment.tracePointsBase.size())
+            (replay.graphGeometry && segment.tracePointsBase.empty() ? !segment.matches.empty() :
+                segment.tracePointsBase.size() != segment.matches.size() + 1) ||
+            (!(replay.graphGeometry && segment.cumulativeLosses.empty()) && segment.cumulativeLosses.size() != segment.tracePointsBase.size()))
             throw std::invalid_argument("invalid native replay segment interval/geometry");
         for (const auto& p : segment.tracePointsBase)
             for (double value : p.val)
@@ -2858,6 +2859,7 @@ nlohmann::json fiberReplayTraceJson(const FiberReplayTraceResult& replay, double
     auto result = greedyReplayJson(replay, normalThresholdBaseVoxels);
     result["format"] = "vc_native_fiber_replay";
     result["version"] = 1;
+    if (replay.graphGeometry) result["geometry_backend"] = "fiberlet";
     return result;
 }
 
@@ -2901,6 +2903,7 @@ FiberReplayTraceResult fiberReplayTraceFromJson(const nlohmann::json& document)
         return m;
     };
     FiberReplayTraceResult replay;
+    replay.graphGeometry = document.value("geometry_backend", std::string{}) == "fiberlet";
     replay.tangentialThresholdFactor = factor;
     replay.referenceBeginArcBase = document.at("reference_begin_arc_base");
     replay.referenceEndArcBase = document.at("reference_end_arc_base");
@@ -2921,8 +2924,9 @@ FiberReplayTraceResult fiberReplayTraceFromJson(const nlohmann::json& document)
                 m.at("search_begin_arc_base").get<double>(),
                 m.at("search_end_arc_base").get<double>(), measurement(m)});
         }
-        if (segment.tracePointsBase.size() != segment.matches.size() + 1 ||
-            segment.cumulativeLosses.size() != segment.tracePointsBase.size())
+        if ((replay.graphGeometry && segment.tracePointsBase.empty() ? !segment.matches.empty() :
+                segment.tracePointsBase.size() != segment.matches.size() + 1) ||
+            (!(replay.graphGeometry && segment.cumulativeLosses.empty()) && segment.cumulativeLosses.size() != segment.tracePointsBase.size()))
             throw std::invalid_argument("replay segment geometry/loss/match lengths disagree");
         for (size_t i = 0; i < segment.matches.size(); ++i)
             if (segment.matches[i].tracePointIndex != i + 1)

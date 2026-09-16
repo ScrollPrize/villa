@@ -78,6 +78,8 @@ struct FiberletGraphReplayConfig {
     double pruneDistanceBaseVoxels = 48.0;
     size_t maximumGeneratedStatesPerIteration = 1'000'000;
     double errorThresholdBaseVoxels = 20.0;
+    double tangentialThresholdFactor = 4.0;
+    double excursionGraceBaseVoxels = 0.0;
     double matchRefineSteps = 1.0;
     double minimumResetAdvanceBaseVoxels = 1.0;
     double referenceBeginArcBase = 0.0;

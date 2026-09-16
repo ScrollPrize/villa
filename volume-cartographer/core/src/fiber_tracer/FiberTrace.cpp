@@ -3793,6 +3793,12 @@ public:
     {
         (void)storedGridInfo();
         const auto& option = options_[*canonicalOptionIndex_];
+        if (readinessGate_) {
+            std::vector<cv::Vec3d> points;
+            points.reserve(indicesZYX.size());
+            for (const auto& index : indicesZYX) points.push_back(storedGridPoint(option, index));
+            awaitPoints(points);
+        }
         samples.assign(indicesZYX.size(), {});
         const auto sampleOne = [&](size_t index, auto& resolvers) {
             const auto& zyx = indicesZYX[index];
@@ -3954,7 +3960,6 @@ FiberPresenceChunkScanReport FiberPredictionField::scanStoredPresenceChunks(int 
 void FiberPredictionField::sampleStoredGridBatch(
     const std::vector<std::array<size_t, 3>>& indicesZYX, int parallelThreads, std::vector<FiberStoredPredictionSample>& samples) const
 {
-    impl_->requireOfflineStoredGrid();
     impl_->sampleStoredGridBatch(indicesZYX, parallelThreads, samples);
 }
 

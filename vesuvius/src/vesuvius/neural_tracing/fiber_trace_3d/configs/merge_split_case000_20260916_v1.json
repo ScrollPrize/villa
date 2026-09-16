@@ -1,0 +1,31 @@
+{
+  "case_count": 1,
+  "cases": [
+    {
+      "candidate": {
+        "fiber": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0139/kb_20260901T224443942_000068.json",
+        "id": "08e44ead4019b9400317",
+        "source_id": "PHerc0139"
+      },
+      "correction": {
+        "corrected_path": "/ephemeral/hendrik/fiber3d_train2/corrected_fibers/evalextract_20260916T154925562_000000.json",
+        "corrected_sha256": "b7cd71fb6b444afc3228efbe40f700f1a45f7bb2bbab6175620e9bf07ee2261a",
+        "original_path": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3/fibers/000_08e44ead4019b9400317.json",
+        "original_sha256": "5bf083e301364e28a0e2029eeba20a6861b66b1fc6af36835b957f0e791a038c"
+      },
+      "length_base_voxels": 1485.5263696157492,
+      "length_mm": 3.5637777607081826,
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/mini5_corrected_weighted_i4_vis_20260916_v3_inputs/000_08e44ead4019b9400317.json",
+      "sha256": "d9397b43a5b912f037d0d61b16be6493f15d3c56ea2b3e5e291c76bfee85394b"
+    }
+  ],
+  "completed": true,
+  "selection": {
+    "parent_manifest": "/ephemeral/hendrik/fiber3d_train2/evaluations/mini5_corrected_weighted_i4_vis_20260916_v3_inputs/manifest.json",
+    "rule": "User-selected merge/split case000"
+  },
+  "supersedes": "/home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/mini5_fiberlet_failures_20260916_v1.json",
+  "total_base_voxels": 1485.5263696157492,
+  "total_mm": 3.5637777607081826,
+  "version": 1
+}

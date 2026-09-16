@@ -1,5 +1,78 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Short-benchmark review exports
+
+- Optional single-case pair diagnostics freeze a separately hashed auxiliary
+  neighboring-fiber hypothesis outside GT scoring. Native CP-bounded eligibility
+  and existing accelerated polyline projection provide sampled base-XYZ distance
+  profiles without connecting gaps/restarts. Geometry does not establish physical
+  identity or constitute independent ground truth.
+
+- Explicit benchmark corrections create a separately hashed frozen annotation and
+  versioned manifest; preserve historical originals/results. Restore benchmark
+  coordinate/direction metadata without replacing edited CP/line geometry.
+  Native replay-references determines CP-bounded/non-Lasagna eligible length.
+
+- Optional regular inline rendering and per-directed-piece review index; no
+  assumption of paired directions. Sort by reported restart episodes/mm.
+- vc3d-readable derived reference/trace files use author_TIMESTAMP_SEQUENCE.json
+  names (evalextract vs evaltrace-beam/fiberlet), stable persisted export timestamp,
+  original piece IDs, separate files at every restart. Include source annotation,
+  benchmark piece, case/segment and evaluated run provenance. Preserve coordinates.
+- Full original annotation copy retains original basename and bytes. Never overwrite
+  edited exports or silently remove dataset members during manual review.
+
+## Experimental single-anchor weighted fit (2026-09-16)
+
+- Opt-in fiberlet.anchor_fit.method=weighted; legacy extraction remains default.
+  Owned-cell observations only, same validity/presence floor and support threshold,
+  at most one retained direction/location per cell; no cross-cell NMS.
+- Fixed cell-centered sigma2 and moving sigma1.5 prediction-voxel Gaussians.
+  Initialize cell center and principal unoriented tensor weighted by Gcell*p^gamma.
+  Iterate weights Gcell*Glocal*p^gamma*abs(dot(direction,axis))^q; principal tensor
+  direction and damped centroid position (damping0.5). Sigmas remain fixed.
+- Support denominator is sum Gcell over all owned voxels, numerator sum
+  Gcell*p*cos² over usable samples. It is not a local-presence gate at the result.
+  Empty cells remain empty. Degenerate initial tensor uses strongest observed
+  direction with stable-order ties; subsequent degeneracy/zero mass retains state.
+- Experimental settings/schema enter anchor and fiberlet construction identities
+  only when enabled; legacy fingerprints and inference identities unchanged.
+- Coverage direction statistics compare stored fitted axis against GT tangent
+  modulo sign. This comparison also changes multiplicity/NMS, not just refinement.
+
+## Anchor-only placement coverage (2026-09-16)
+
+- Native backend=anchors reuses canonical chunk extraction and caches, but requests
+  only anchor chunks in the GT tube with conservative owner-cell padding. No
+  fiberlet construction/search. Placement is counted once per eligible piece.
+- Canonical positions project to nearest Euclidean GT point; shared acceptance
+  ellipse tests that projection. Flat endpoint caps reject beyond eligible spans.
+  This is not a union-of-ellipses metric at bends. Invalid-normal fallback is
+  the existing isotropic policy and its incidence is reported.
+- Interior gaps are GT arclength differences between unique accepted projections,
+  normalized by actual anchor-cell side. Endpoint gaps and no-anchor pieces are
+  separate. Aggregate quantiles pool gaps, not per-piece quantiles.
+- Arc0-phased bins of one cell side (including final partial bin) describe occupancy
+  and consecutive empty bins; these are not literal crossed 3D grid cells. Never
+  bridge excluded CP/Lasagna spans. Save per-anchor stable IDs, original GT arcs,
+  per-piece distributions and checkpoint/cache provenance.
+
+## Cached fiberlet evaluation (2026-09-16)
+
+- Optional `backend=fiberlet` reuses canonical full-chunk anchor/path generation
+  and on-demand inference; ordinary beam replay remains default.
+- Construction identity includes source/model/normal, grid, algorithms and
+  storage parameters, not replay settings. Split anchor/fiberlet caches under
+  live inference are distinct from whole-volume Combined exports.
+- Graph cases release CPU permits while awaiting construction/readiness;
+  construction has separate bounded anchor/path services and a shared byte budget.
+- Preserve eligible GT, bidirectional evaluation, ellipse/grace and restart
+  episodes. Carry excursion state across edges. Report credited coverage because
+  graph seed absence must not appear as successful tracing.
+- Retain authoritative graph artifacts and explicit graph-geometry adapters for
+  existing inline inspection. See `docs/fiberlet_evaluation.md` for configuration,
+  supported defaults, cache layout and current limitations.
+
 ## Opt-in training-feedback refinement (2026-09-15)
 
 - Test crops are fixed by original GT selection and transforms. Refined local
@@ -7347,6 +7420,25 @@ Inspection labels both reference and traced top/side strips. Traced `Rn-` and
 cross-section IDs, in both modalities. No fabricated strip for singleton traces;
 no changes to sampling, trace geometry or evaluation metrics.
 # Reported restart episodes
+
+Targeted short-failure benchmark opt-in annotations may set evaluation_direction
+to forward or reverse; omitted/both preserves ordinary bidirectional replay.
+Exported directed GT pieces preserve original CP/non-Lasagna boundaries and link
+original fiber, eligible span, arcs, model and trial artifacts. Search first-failure
+reproduction within±100basevoxels on a100-voxel start grid, confirm100farther
+upstream, retain at most100beyond target. Audit actual outside travel to reject
+failures manufactured by truncating the160-voxel grace. Trials reuse published
+inference; misses use the shared demand pipeline/original snapshot with managed
+GPU grants, not exclusion or fill zeros. This targeted set is not an unbiased
+replacement for full evaluation. Default evaluation metrics remain unchanged.
+Extraction owns one GPU grant across its work queue. Spawned lane coordinators
+retain bounded producer sessions/readers/mmap accumulators and GPU worker pools
+between replay batches. Canonical shared-cache owners are co-located; conflicting
+retained sessions are evicted before opening another writer. One CUDAmodel perlane
+uses its GPU budget; extra CPU/mmap sessions may stay retained. Per-batch control
+state remains fresh, and queued work favors the resident model until drained.
+Drain before reuse, close pools before stores on eviction/error/final shutdown,
+and keep deterministic original-order candidate selection independent of execution.
 
 Default metric restart-episodes-80-base-voxels-v1 partitions reference distance
 at the first event of each episode. First event always counts; a later event

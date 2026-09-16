@@ -18,6 +18,26 @@
 #include <utility>
 #include <vector>
 #include <future>
+
+TEST_CASE("Construction and tracing share CPU admission without holding it during waits") {
+    std::counting_semaphore<> budget(1);
+    CHECK(FiberConstructionCpuPermit::current == nullptr);
+    {
+        FiberConstructionCpuPermit construction(budget);
+        CHECK(FiberConstructionCpuPermit::current == &construction);
+        CHECK_FALSE(budget.try_acquire());
+        construction.suspend([&] {
+            FiberCaseCpuPermit tracing(budget);
+            CHECK_FALSE(budget.try_acquire());
+        });
+        CHECK_FALSE(budget.try_acquire());
+        CHECK_THROWS_AS(construction.suspend([] { throw std::runtime_error("cancelled"); }), std::runtime_error);
+        CHECK_FALSE(budget.try_acquire());
+    }
+    CHECK(FiberConstructionCpuPermit::current == nullptr);
+    REQUIRE(budget.try_acquire());
+    budget.release();
+}
 #if defined(__unix__) || defined(__APPLE__)
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -446,6 +466,10 @@ TEST_CASE("live field gates float visitor boundary chunks before any cache read"
     CHECK_THROWS_WITH_AS(field.sampleBatch(std::vector<cv::Vec3f>{{0.63f, 0.1f, 0.1f}},
         std::vector<cv::Vec3f>{{1, 0, 0}}, 1, samples, nullptr), doctest::Contains("synthetic not-ready"), std::runtime_error);
     CHECK(calls == 1);
+    std::vector<vc::fiber_tracer::FiberStoredPredictionSample> storedSamples;
+    CHECK_THROWS_WITH_AS(field.sampleStoredGridBatch({{10, 10, 63}}, 1, storedSamples),
+        doctest::Contains("synthetic not-ready"), std::runtime_error);
+    CHECK(calls == 2);
     field.setReadinessGate([&](const auto& dependencies) {
         // A large duplicate batch strictly within chunk1 must not invent
         // chunk0 from the uninitialized tail of a single-chunk cube request.

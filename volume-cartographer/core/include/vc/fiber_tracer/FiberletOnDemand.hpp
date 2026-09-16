@@ -54,6 +54,9 @@ struct FiberletOnDemandConfig {
     FiberletChunkCacheOptions fiberletCacheOptions;
     FiberletOnDemandProgressCallback progress;
     FiberletChunkResolvedCallback chunkResolved;
+    // Optional shared CPU admission. Acquired only for generation computation,
+    // never while waiting for anchor dependencies. Lifetime releases admission.
+    std::function<std::shared_ptr<void>()> acquireWork;
 };
 
 struct FiberletScheduledChunk {
@@ -128,6 +131,9 @@ public:
     [[nodiscard]] std::vector<vc::render::ChunkKey> anchorDependencies(const vc::render::ChunkKey& fiberletChunk) const;
     [[nodiscard]] std::vector<FiberletScheduledChunk> referenceChunkSchedule(
         const PolylineArcGeometry& reference, double beginArcBase, double endArcBase, double radiusBaseVoxels) const;
+    // Includes owner-cell displacement padding, but no path-connection halo.
+    [[nodiscard]] std::vector<FiberletScheduledChunk> anchorChunkScheduleNearReference(
+        const PolylineArcGeometry& reference, double beginArcBase, double endArcBase, double radiusBaseVoxels) const;
     void prefetchScheduled(std::span<const FiberletScheduledChunk> schedule, std::size_t begin, std::size_t count, bool wait = false) const;
     // Stop speculative generation in dependency order and drain writes. Call
     // this before releasing a batch-owned preprocessor.
@@ -138,6 +144,8 @@ private:
     void initialize();
     FiberletChunkDataset::MaterializedChunk generateAnchorChunk(const vc::render::ChunkKey& key, const FiberletStorageCodecConfig& codec);
     FiberletChunkDataset::MaterializedChunk generateFiberletChunk(FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, const FiberletStorageCodecConfig& codec);
+    std::pair<FiberletChunkDataset::MaterializedChunk, FiberletChunkDataset::MaterializedChunk>
+        generateFiberletPair(const vc::render::ChunkKey& key, const FiberletStorageCodecConfig& codec);
 
     struct State;
     std::shared_ptr<State> state_;

@@ -1,16 +1,12 @@
 # Plan
 
-1. Freeze both best/current EMA999 before running either; record update/hash/loss.
-2. Independent review, prepare and validate unchanged50originalGT/180direction protocol,40/80ellipse,160grace,80restartfilter; noembedding/norender. Shared namespace still keys by checkpoint hash; different models remain isolated.
-3. Run best then current through approved runner, each with all8GPUs exclusive manager allocation. Continue until both complete or genuine blocker.
-4. Validate metrics and compare combined/per-scroll to prior results; persist command/provenance/timing and report.
+1. Preserve completed correction planning in archive. Freeze one-case manifest/config from mini5v3 with identical snapshot/cache/settings. Keep user companion annotation as a separately hashed auxiliary hypothesis, not ground truth.
+2. Use native replay-references for both CP-bounded eligible lines; no extrapolated tails. Reuse benchmark-full for baseline render. Add optional pair diagnostic that freezes companion and records native plan, exact point-to-segment distances and arclength profiles against GT and first failed trace. Dense profiles only on this small case; no volume-wide scan or new solver.
+3. Inspect existing render and compare sampled geometry near merge and divergent end. Distinguish geometric corroboration from physical fiber identity; no assertion that CT establishes identity without evidence. Save inputs and report under dedicated benchmark output.
+4. Regression-test distance helper, run approved tests/benchmark, validate unchanged one-case replay vs mini5v3. Log result, command and limitations.
 
 ## Spec update
-
-Visualization follow-up: identical frozen bestu22000 and inference namespace/protocol; only render=true, output directory and manager label change. Use approved prepare/full runner. Permit on-demand additional strip coverage, preserving existing inference. Verify180renders/index and99restart result at completion.
-
-None.
+Single merge/split benchmark stores primary GT, auxiliary candidate (not an independent GT label), frozen hashes and native eligibility, baseline model/cache provenance.
 
 ## Docs updates
-
-Archive previous task under refinement_best_ema99_u17800. New benchmark tables/JSON,task_log,changelog.
+New benchmark report with paths, geometric evidence, reproduction command and future many-to-many assignment motivation. Changelog entry; update active log/status.

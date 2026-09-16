@@ -3,7 +3,19 @@ import json
 import pytest
 
 
-def test_cached_extension_reuses_shared_store_and_validates_source(tmp_path, monkeypatch):
+def test_cancelled_replay_never_launches_native(monkeypatch):
+    from concurrent.futures import CancelledError
+    from threading import Event
+    from vesuvius.neural_tracing.fiber_trace_3d import live_evaluate as live
+    event = Event(); event.set()
+    monkeypatch.setattr(live, 'implementation_identity', lambda: {})
+    monkeypatch.setattr(live.subprocess, 'Popen', lambda *a, **k: pytest.fail('launched cancelled work'))
+    with pytest.raises(CancelledError):
+        live.coordinate_native({},None,{},{},{},{},{},(),{},cancel_event=event)
+
+
+@pytest.mark.parametrize('duplicate_source', [False, True])
+def test_cached_extension_reuses_shared_store_and_validates_source(tmp_path, monkeypatch, duplicate_source):
     from contextlib import contextmanager
     from types import SimpleNamespace
     from vesuvius.neural_tracing.fiber_trace_3d import cached_trace_profile as cached, live_evaluate as live
@@ -27,13 +39,81 @@ def test_cached_extension_reuses_shared_store_and_validates_source(tmp_path, mon
         yield SimpleNamespace(products=[])
         calls.append("closed")
     monkeypatch.setattr(live, "create_demand_store", store)
-    monkeypatch.setattr(cached, "coordinate_native", lambda *a, **k: calls.append("replay"))
-    evaluation = {"inference": {}, "sources": [{"id": "source", "fiber_manifest": str(tmp_path / "manifest.json")}]}
-    cached.extend_cached_replay(evaluation, tmp_path / "binary", tmp_path / "checkpoint")
+    def coordinate(*args, **kwargs):
+        assert [str(device) for device in args[-2]] == [f'cuda:{i}' for i in range(8)]
+        assert 'demand_gpu_manager' not in args[-1]
+        calls.append('replay')
+    monkeypatch.setattr(cached, "coordinate_native", coordinate)
+    evaluation = {"inference": {'demand_gpu_manager': {'enabled': True}}, "sources": [{"id": "source", "fiber_manifest": str(tmp_path / "manifest.json")}]}
+    if duplicate_source:
+        evaluation['sources'].append(dict(evaluation['sources'][0], id='second_collection'))
+    cached.extend_cached_replay(evaluation, tmp_path / "binary", tmp_path / "checkpoint", devices='0,1,2,3,4,5,6,7')
     assert calls == ["open", "replay", "closed"]
     volume.shape_at = lambda level: [32]*3
     with pytest.raises(ValueError, match="source metadata changed"):
         cached.extend_cached_replay(evaluation, tmp_path / "binary", tmp_path / "checkpoint")
+
+
+def test_retained_session_reuses_pool_and_closes_before_stores(monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from vesuvius.neural_tracing.fiber_trace_3d import cached_trace_profile as cached
+    events = []
+    @contextmanager
+    def resources(*args, **kwargs):
+        events.append('open stores')
+        yield ({},{},{},{},(),{})
+        events.append('close stores')
+    monkeypatch.setattr(cached,'_cached_replay_resources',resources)
+    def coordinate(*args, **kwargs):
+        session=kwargs['inference_session']
+        if session.pool is None:
+            events.append('open pool')
+            session.pool=SimpleNamespace(close=lambda:events.append('close pool'))
+        events.append('run')
+    monkeypatch.setattr(cached,'coordinate_native',coordinate)
+    with cached.CachedReplaySession({'sources':[]},'binary','checkpoint') as session:
+        session.run({'sources':[]})
+        session.run({'sources':[]})
+        assert events==['open stores','open pool','run','run']
+        session.pool.busy=False
+        session.pool.stop_gpu=lambda:events.append('stop gpu')
+        session.pool.start_gpu=lambda devices:events.append('start gpu')
+        session.pool.authorize_gpu=lambda:events.append('authorize gpu')
+        session.pause_gpu()
+        session.pause_gpu()
+        session.run({'sources':[]})
+    session.close()
+    assert events==['open stores','open pool','run','run','stop gpu','start gpu',
+                   'authorize gpu','run','close pool','close stores']
+
+
+def test_worker_evicts_overlapping_idle_session_and_reuses_matching(monkeypatch,tmp_path):
+    from threading import Event
+    from collections import OrderedDict
+    from vesuvius.neural_tracing.fiber_trace_3d import cached_trace_profile as cached
+    monkeypatch.setattr(cached,'_trial_cancel_event',Event())
+    monkeypatch.setattr(cached,'_trial_sessions',OrderedDict())
+    monkeypatch.setattr(cached,'_trial_session_limit',2)
+    events=[]
+    class Session:
+        def __init__(self,e,b,c,**kwargs):
+            self.closed=False
+            self.tag=e['inference']['tag']
+            events.append(('open',self.tag))
+        def run(self,e): events.append(('run',self.tag))
+        def close(self):
+            if not self.closed: events.append(('close',self.tag))
+            self.closed=True
+    monkeypatch.setattr(cached,'CachedReplaySession',Session)
+    evaluation=dict(sources=[{'id':'s','fiber_manifest':str(tmp_path/'cache'/'manifest.json')}],inference={'tag':'a'})
+    cached.execute_trial_replay(evaluation,'binary','snapshot')
+    cached.execute_trial_replay(evaluation,'binary')
+    changed=dict(evaluation,inference={'tag':'b'})
+    cached.execute_trial_replay(changed,'binary','snapshot')
+    assert events==[('open','a'),('run','a'),('run','a'),('close','a'),('open','b'),('run','b')]
+    cached.close_trial_worker()
+    assert events[-1]==('close','b')
 
 from vesuvius.neural_tracing.fiber_trace_3d.cached_trace_profile import PublishedStore, prefix_points
 

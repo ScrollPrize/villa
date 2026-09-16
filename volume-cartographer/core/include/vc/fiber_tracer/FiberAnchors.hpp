@@ -27,6 +27,13 @@ struct FiberAnchorObservation {
 };
 
 struct FiberAnchorConfig {
+    // Experimental owned-cell fit. Legacy remains bit-for-bit/default unchanged.
+    std::string fitMethod = "legacy";
+    int weightedFitIterations = 4;
+    float weightedFitPresenceExponent = 1.0F;
+    float weightedFitDirectionExponent = 2.0F;
+    float weightedFitLocalSigma = 1.5F;
+    float weightedFitDamping = 0.5F;
     int cellSizePredictionVoxels = 4;
     float gaussianSigmaPredictionVoxels = 2.0F;
     float peakSigmaPredictionVoxels = 1.5F;

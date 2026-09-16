@@ -2358,6 +2358,32 @@ TEST_CASE("fiberlet graph replay clips a failure edge then records an uncovered 
     CHECK(obj.find("\nl 1 2 3\n") != std::string::npos);
 }
 
+TEST_CASE("fiberlet replay grace survives edge boundaries and requires reentry")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0.6, 0}, {2, 0.6, 0}}, 0.0);
+    addGraphPath(report, 1, 2, {{2, 0.6, 0}, {3, 0.6, 0}, {4, 0, 0}, {5, 0, 0}}, 0.0);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.errorThresholdBaseVoxels = 0.5;
+    config.tangentialThresholdFactor = 2;
+    config.excursionGraceBaseVoxels = 4;
+    auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {5, 0, 0}}, replayYNormals(), 1, config);
+    CHECK(replay.failures.empty());
+    config.excursionGraceBaseVoxels = 1.5;
+    replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {5, 0, 0}}, replayYNormals(), 1, config);
+    REQUIRE_FALSE(replay.failures.empty());
+    CHECK(replay.failures.front().reason == "distance_above_threshold");
+    config.excursionGraceBaseVoxels = 100;
+    config.referenceEndArcBase = 2;
+    replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {5, 0, 0}}, replayYNormals(), 1, config);
+    REQUIRE_FALSE(replay.failures.empty());
+    CHECK(replay.failures.front().reason == "distance_above_threshold");
+}
+
 TEST_CASE("fiberlet graph replay can force the original focused seed")
 {
     auto report = graphPathReport();

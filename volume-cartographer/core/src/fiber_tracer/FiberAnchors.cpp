@@ -2434,6 +2434,14 @@ const char* fiberAnchorDiagnosticStageName(FiberAnchorDiagnosticStage stage)
 
 void validateFiberAnchorConfig(const FiberAnchorConfig& config)
 {
+    if (config.fitMethod != "legacy" && config.fitMethod != "weighted")
+        throw std::invalid_argument("unknown anchor fit method");
+    if (config.weightedFitIterations < 0 || config.weightedFitIterations > 100 ||
+        !(config.weightedFitPresenceExponent > 0) || !(config.weightedFitDirectionExponent >= 0) ||
+        !(config.weightedFitLocalSigma > 0) || !(config.weightedFitDamping > 0 && config.weightedFitDamping <= 1) ||
+        !std::isfinite(config.weightedFitPresenceExponent + config.weightedFitDirectionExponent +
+                       config.weightedFitLocalSigma + config.weightedFitDamping))
+        throw std::invalid_argument("invalid weighted anchor fit configuration");
     if (config.cellSizePredictionVoxels < 2 || config.cellSizePredictionVoxels > 8)
         throw std::invalid_argument("fiber anchor cell size must be in [2, 8]");
     if (!(config.gaussianSigmaPredictionVoxels > 0.0F) ||
@@ -2710,6 +2718,64 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
         profile->seedGenerationObservationVisits += observations.size();
     }
 
+    if (config.fitMethod == "weighted") {
+        std::vector<WeightedObservation> weighted = observations;
+        std::vector<float> fixed;
+        fixed.reserve(weighted.size());
+        size_t strongest = 0;
+        for (size_t i=0; i<weighted.size(); ++i) {
+            const float p = observations[i].weight / observations[i].gaussian;
+            weighted[i].weight = observations[i].gaussian * std::pow(p, config.weightedFitPresenceExponent);
+            fixed.push_back(weighted[i].weight);
+            if (fixed[i] > fixed[strongest]) strongest = i;
+        }
+        const auto initial = principalFiberAxisF(weightedTensor(weighted, nullptr, 0));
+        cv::Vec3f axis = initial.unique ? initial.axis : canonicalFiberAxisF(weighted[strongest].direction);
+        cv::Vec3f position = center;
+        auto& component = result.components[0];
+        component.diagnosticId = 0;
+        component.diagnosticParentIds = {0};
+        component.assignedObservationCount = observations.size();
+        component.anchor.positionPredictionXYZ = position;
+        component.anchor.axisXYZ = axis;
+        result.initializedDiagnostics[0].anchor = component.anchor;
+        result.initializedDiagnostics[0].transition.outcome = "continue";
+        result.initializedDiagnostics[0].transition.reason.reset();
+        for (int iteration=0;iteration<config.weightedFitIterations;++iteration) {
+            float mass=0;
+            cv::Vec3f centroid{0,0,0};
+            for (size_t i=0;i<weighted.size();++i) {
+                const auto delta=weighted[i].position-position;
+                const float agreement=std::clamp(std::abs(weighted[i].direction.dot(axis)),0.0F,1.0F);
+                const float local=std::exp(-delta.dot(delta)/(2*config.weightedFitLocalSigma*config.weightedFitLocalSigma));
+                const float w=fixed[i]*local*std::pow(agreement,config.weightedFitDirectionExponent);
+                weighted[i].weight=w; mass+=w; centroid+=weighted[i].position*w;
+            }
+            if (!(mass>0)) break; // keep the last data-supported state
+            position += (centroid*(1.0F/mass)-position)*config.weightedFitDamping;
+            const auto principal=principalFiberAxisF(weightedTensor(weighted,nullptr,0));
+            if (principal.unique) axis=principal.axis; // stable previous axis on ties
+            ++component.anchor.refinementIterations;
+        }
+        float support=0, presenceMass=0;
+        for(const auto& observation:observations) {
+            const float cosine=observation.direction.dot(axis);
+            support+=observation.weight*cosine*cosine;
+            presenceMass+=observation.weight;
+        }
+        component.anchor.positionPredictionXYZ=position;
+        component.anchor.axisXYZ=canonicalFiberAxisF(axis);
+        component.anchor.alignedSupport=support/denominator.sum;
+        component.anchor.directionalCoherence=presenceMass>0 ? support/presenceMass : 0;
+        component.anchor.refinementScore=component.anchor.alignedSupport;
+        component.retained=support>0 && component.anchor.alignedSupport>=config.minimumAlignedSupport;
+        component.retainedAfterSupport=component.retained;
+        component.rejectionReason=component.retained ? "" : "below_support";
+        result.components[1].rejectionReason="single_anchor_mode";
+        result.retainedAnchorCount=component.retained ? 1 : 0;
+        result.objective=component.anchor.alignedSupport;
+        return result;
+    }
     const FiberPrincipalAxisF global = principalFiberAxisF(weightedTensor(observations, nullptr, 0));
     std::vector<cv::Vec3f> seeds;
     seeds.reserve(config.maximumSeedCount);
@@ -3109,7 +3175,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
         peakTransverseSupport,
         config.gaussianCutoffSigmas *
             config.peakAxialSigmaPredictionVoxels);
-    const float maximumSupportRadius =
+    const float maximumSupportRadius = config.fitMethod == "weighted" ? 0.0F :
         std::max(broadSupportRadius, peakSupportRadius);
     const size_t sampleHalo =
         static_cast<size_t>(std::ceil(maximumSupportRadius)) +
@@ -3168,7 +3234,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
         }
     }
     std::set<CellIndex> workCellSet(selectedCells.begin(), selectedCells.end());
-    if (!refinedOnly) {
+    if (!refinedOnly && config.fitMethod != "weighted") {
         const float nmsDistance = std::hypot(
             config.nmsTransverseRadiusPredictionVoxels,
             config.nmsLongitudinalRadiusPredictionVoxels);
@@ -5052,7 +5118,8 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
     }
 
     const auto duplicateSuppressionStart = std::chrono::steady_clock::now();
-    suppressFiberAnchorDuplicates(contextResults, config);
+    if (config.fitMethod != "weighted")
+        suppressFiberAnchorDuplicates(contextResults, config);
     report.profile.duplicateSuppressionSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - duplicateSuppressionStart).count();
     const auto finalizationStart = std::chrono::steady_clock::now();

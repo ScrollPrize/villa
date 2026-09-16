@@ -1,5 +1,3 @@
-# Best and latest EMA999 run212757
+# Task
 
-Evaluate best and current EMA999 from5scroll_json_eligible_refinement_128_sd1_16x8_ema_20260915_212757 on full50fiber cohort without embeddings.
-
-Follow-up: run full visualization for the frozen bestu22000 snapshot, reusing inference cache.
+Create a single-case merge/split benchmark from corrected mini5 v3 case000 for future global assignment experiments. Compare user-provided edited evaltrace-fiberlet file with reference and failing trace to assess whether it represents the touching neighboring fiber. Do not implement global assignment yet.

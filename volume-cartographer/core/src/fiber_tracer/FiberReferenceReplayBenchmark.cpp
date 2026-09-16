@@ -83,7 +83,7 @@ FiberReferenceReplayOutcome measureFiberReferenceReplayOutcome(const FiberRefere
         if (!segment.seedKey.has_value() || segment.matches.empty())
             continue;
         const double begin =
-            std::clamp(segment.matches.front().searchBeginArcBase - replay.referenceBeginArcBase, 0.0, replayCase.referenceLengthBaseVoxels);
+            std::clamp(segment.startReferenceArcBase - replay.referenceBeginArcBase, 0.0, replayCase.referenceLengthBaseVoxels);
         const double end = std::clamp(segment.endReferenceArcBase - replay.referenceBeginArcBase, 0.0, replayCase.referenceLengthBaseVoxels);
         if (end > begin + kEpsilon)
             tracedIntervals.emplace_back(begin, end);
@@ -107,7 +107,7 @@ FiberReferenceReplayOutcome measureFiberReferenceReplayOutcome(const FiberRefere
         if (failure.index != outcome.failures.size() || failure.segmentIndex >= replay.segments.size())
             throw std::invalid_argument("reference replay failures are not in stable segment order");
         const auto& segment = replay.segments[failure.segmentIndex];
-        const double begin = !segment.matches.empty() ? segment.matches.front().searchBeginArcBase : failure.referenceArcBase;
+        const double begin = segment.seedKey.has_value() ? segment.startReferenceArcBase : failure.referenceArcBase;
         const double directionalArc = std::clamp(failure.referenceArcBase - replay.referenceBeginArcBase, 0.0, replayCase.referenceLengthBaseVoxels);
         if (directionalArc + kEpsilon < previousDirectionalArc)
             throw std::invalid_argument("reference replay failures are not in directional arc order");

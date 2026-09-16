@@ -2,6 +2,9 @@
 #include <doctest/doctest.h>
 
 #include "vc/fiber_tracer/FiberReferenceReplayBenchmark.hpp"
+#include "vc/fiber_tracer/FiberAnchorCoverage.hpp"
+#include "vc/fiber_tracer/FiberAnchors.hpp"
+#include "vc/fiber_tracer/FiberletPipeline.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 
 #include <cmath>
@@ -29,6 +32,116 @@ private:
 };
 
 }  // namespace
+
+TEST_CASE("anchor coverage uses ellipse flat caps and arclength gaps")
+{
+    const ConstantNormalSampler normals({0,0,1});
+    std::vector<cv::Vec3d> line{{0,0,0},{128,0,0}};
+    const std::vector<cv::Vec3d> anchors{
+        {16,0,40}, {48,80,0}, {80,0,40.01}, {112,80.01,0},
+        {-1,0,0}, {129,0,0}, {48,0,0}, {128,0,0}};
+    auto result = vc::fiber_tracer::measureFiberAnchorCoverage(line,anchors,normals,1,40,2,32);
+    CHECK(result["accepted_anchors"].size()==4);
+    CHECK(result["end_cap_rejections"]==2);
+    CHECK(result["unique_arcs_base"]==nlohmann::json({16,48,128}));
+    CHECK(result["interior_gaps_base"]==nlohmann::json({32,80}));
+    CHECK(result["leading_gap_base"]==16);
+    CHECK(result["trailing_gap_base"]==0);
+    CHECK(result["empty_arc_bins"]==1);
+    std::reverse(line.begin(),line.end());
+    const auto reverse=vc::fiber_tracer::measureFiberAnchorCoverage(line,anchors,normals,1,40,2,32);
+    CHECK(reverse["interior_gaps_base"]==nlohmann::json({80,32}));
+    CHECK(reverse["leading_gap_base"]==0);
+    CHECK(reverse["trailing_gap_base"]==16);
+}
+
+TEST_CASE("weighted anchor fit is single sign invariant and moves toward presence")
+{
+    using namespace vc::fiber_tracer;
+    FiberAnchorConfig config;
+    config.fitMethod="weighted";
+    config.peakGradientWeight=0;
+    config.weightedFitIterations=0;
+    std::vector<FiberAnchorObservation> samples;
+    for(int z=0;z<4;++z) for(int y=0;y<4;++y) for(int x=0;x<4;++x)
+        samples.push_back({{float(x),float(y),float(z)},{1,0,0},x==3?1.0F:0.1F,true});
+    const auto initial=fitFiberCellAnchors({0,0,0},{0,0,0},{4,4,4},samples,config);
+    REQUIRE(initial.retainedAnchorCount==1);
+    CHECK(initial.components[0].anchor.positionPredictionXYZ[0]==doctest::Approx(1.5));
+    config.weightedFitIterations=8;
+    const auto refined=fitFiberCellAnchors({0,0,0},{0,0,0},{4,4,4},samples,config);
+    REQUIRE(refined.retainedAnchorCount==1);
+    const auto position=refined.components[0].anchor.positionPredictionXYZ;
+    CHECK(position[0]>2.0F);
+    for(int d=0;d<3;++d) {CHECK(position[d]>=0);CHECK(position[d]<=3);}
+    for(auto& sample:samples) sample.direction=-sample.direction;
+    const auto flipped=fitFiberCellAnchors({0,0,0},{0,0,0},{4,4,4},samples,config);
+    CHECK(flipped.components[0].anchor.positionPredictionXYZ==position);
+    CHECK(flipped.components[0].anchor.axisXYZ==refined.components[0].anchor.axisXYZ);
+    for(auto& sample:samples) sample.valid=false;
+    CHECK(fitFiberCellAnchors({0,0,0},{0,0,0},{4,4,4},samples,config).retainedAnchorCount==0);
+}
+
+TEST_CASE("weighted fit cache identities separate while legacy identity ignores disabled settings")
+{
+    using namespace vc::fiber_tracer;
+    FiberAnchorConfig a;
+    FiberletPathConfig p;
+    FiberPredictionGridInfo grid{{32,32,32},8};
+    auto identity=[&] {return makeFiberletDatasetMetadata(FiberletDatasetKind::Anchors,grid,a,p,128,nlohmann::json::object()).datasetFingerprint;};
+    auto legacy=identity();
+    a.weightedFitIterations=8;
+    CHECK(identity()==legacy);
+    a.fitMethod="weighted";
+    auto weighted=identity();
+    CHECK(weighted!=legacy);
+    a.weightedFitIterations=4;
+    CHECK(identity()!=weighted);
+}
+
+TEST_CASE("anchor direction error ignores sign")
+{
+    const ConstantNormalSampler normals({0,0,1});
+    const std::vector<cv::Vec3d> points{{0,0,0},{96,0,0}},anchors{{32,0,0},{64,0,0}},
+        axes{{-1,0,0},{0,1,0}};
+    const auto r=vc::fiber_tracer::measureFiberAnchorCoverage(points,anchors,normals,1,40,2,32,axes);
+    CHECK(r["accepted_anchors"][0]["direction_error_degrees"].get<double>()==doctest::Approx(0));
+    CHECK(r["accepted_anchors"][1]["direction_error_degrees"].get<double>()==doctest::Approx(90));
+}
+
+TEST_CASE("anchor coverage preserves empty singleton and invalid normal cases")
+{
+    const ConstantNormalSampler missing({0,0,1},false);
+    const std::vector<cv::Vec3d> line{{0,0,0},{65,0,0}};
+    auto empty=vc::fiber_tracer::measureFiberAnchorCoverage(line,{},missing,1,40,2,32);
+    CHECK(empty["no_anchor_length_base"]==65);
+    CHECK(empty["interior_gaps_base"].empty());
+    CHECK(empty["leading_gap_base"].is_null());
+    CHECK(empty["empty_arc_bin_runs"]==nlohmann::json({3}));
+    CHECK(empty["empty_arc_bin_length_base"]==65);
+    const std::vector<cv::Vec3d> anchors{{32,60,0},{65,0,0}};
+    auto single=vc::fiber_tracer::measureFiberAnchorCoverage(line,anchors,missing,1,40,2,32);
+    CHECK(single["invalid_normal_tests"]==2);
+    CHECK(single["accepted_anchors"].size()==1);
+    CHECK(single["interior_gaps_base"].empty());
+    CHECK(single["empty_arc_bin_runs"]==nlohmann::json({2}));
+    CHECK(single["empty_arc_bin_length_base"]==64);
+}
+
+TEST_CASE("anchor indexed projection agrees with shared projection on bends")
+{
+    const ConstantNormalSampler normals({0,0,1});
+    const std::vector<cv::Vec3d> line{{0,0,0},{100,0,0},{100,100,0},{200,100,0}};
+    const auto geometry=vc::fiber_tracer::makePolylineArcGeometry(line);
+    std::vector<cv::Vec3d> anchors;
+    for(int x=10;x<200;x+=13) for(int y=0;y<100;y+=17) anchors.emplace_back(x,y,0);
+    auto result=vc::fiber_tracer::measureFiberAnchorCoverage(line,anchors,normals,1,40,2,32);
+    for(const auto& a:result["accepted_anchors"]) {
+        auto expected=vc::fiber_tracer::projectPointToPolylineArc(geometry,
+            anchors[a["anchor_index"].get<size_t>()],0,geometry.length());
+        CHECK(a["reference_arc_base"].get<double>()==doctest::Approx(expected.arc));
+    }
+}
 
 TEST_CASE("reference replay preparation retains crop re-entry runs in both directions")
 {
@@ -63,8 +176,11 @@ TEST_CASE("reference replay outcome retains every failure and credits only seede
     replay.segments[1].endReferenceArcBase = 6.0;
     replay.segments[1].terminationReason = "missing_seed_gap";
     replay.segments[2].seedKey = vc::fiber_tracer::FiberletStorageKey{};
+    replay.segments[2].startReferenceArcBase = 6.0;
     replay.segments[2].endReferenceArcBase = 10.0;
-    replay.segments[2].matches.push_back({0, 6.0, 6.0, {}, 6.0, 7.0, {}});
+    // The seed search begins at resetArc, before the explicit missing-seed gap.
+    // Only [seedArc,endArc] is traced, not [resetArc,endArc].
+    replay.segments[2].matches.push_back({0, 6.0, 6.0, {}, 4.25, 6.0, {}});
     replay.failures.push_back({0, 0, "distance_above_threshold", 4.25, 0.425, {4.25, 0, 0}});
     replay.failures.push_back({1, 1, "missing_seed_gap", 4.25, 0.425, {4.25, 0, 0}});
 

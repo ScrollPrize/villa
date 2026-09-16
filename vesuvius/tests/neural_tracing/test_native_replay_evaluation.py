@@ -141,6 +141,97 @@ def replay_fixture(tmp_path):
     return tmp_path, config, run
 
 
+@pytest.mark.parametrize("fit", [None, {"method":"weighted","iterations":4,"presence_exponent":2,"direction_exponent":2}])
+def test_anchor_only_coverage_does_not_construct_fiberlets(replay_fixture, fit):
+    root, config, run = replay_fixture
+    config.update(backend="anchors", fiberlet={"storage_chunk_side_base": 16, "construction_workers": 8})
+    if fit is not None:
+        config["fiberlet"]["anchor_fit"] = fit
+    config["decoded_cache_bytes"] = 256 * 1024 * 1024
+    presence = zarr.open_array(str(root / "fiber_presence.zarr"), mode="r+")
+    presence[:] = 0
+    presence[15:18, 15:18, :] = 255
+    config["sources"][0]["fiberlet_cache_root"] = str(root / "anchors-cache")
+    (root / "evaluation.json").write_text(json.dumps(config))
+    first = run("replay-set", "--config", root / "evaluation.json")
+    assert "stage=anchors" in first.stdout
+    assert "stage=fiberlets" not in first.stdout
+    result = json.loads((root / "evaluation/summary.json").read_text())
+    assert result["completed"] and result["cases"] == 1  # placement is not directional
+    case = result["anchor_cases"][0]
+    assert case["accepted_anchors"]
+    assert case["cell_side_base"] == 4
+    assert all(a["direction_error_degrees"] is not None for a in case["accepted_anchors"])
+    if fit is not None:
+        cells = [tuple(a["id"]["cell_zyx"]) for a in case["accepted_anchors"]]
+        assert len(cells) == len(set(cells))
+    assert not (root / "evaluation/cases/0/graph.json").exists()
+    config["output"] = "anchors-warm"
+    (root / "evaluation.json").write_text(json.dumps(config))
+    second = run("replay-set", "--config", root / "evaluation.json")
+    assert "stage=fiberlets" not in second.stdout
+    warm = json.loads((root / "anchors-warm/summary.json").read_text())
+    assert result["anchor_cases"] == warm["anchor_cases"]
+
+
+def test_fiberlet_backend_canonical_cache_resume(replay_fixture):
+    import hashlib
+    root, config, run = replay_fixture
+    config.update(backend="fiberlet", fiberlet={"storage_chunk_side_base": 16,
+        "construction_workers": 8, "lookahead_base_voxels": 16})
+    config["decoded_cache_bytes"] = 256 * 1024 * 1024
+    presence = zarr.open_array(str(root / "fiber_presence.zarr"), mode="r+")
+    presence[:] = 0
+    presence[15:18, 15:18, :] = 255
+    config["sources"][0]["fiberlet_cache_root"] = str(root / "fiberlet-cache")
+    (root / "evaluation.json").write_text(json.dumps(config))
+    cold = run("replay-set", "--config", root / "evaluation.json")
+    # Prefix and route misses for one owner must share generation, including
+    # empty owners encountered in the surrounding graph halo.
+    completed = [line.split(' seconds=')[0] for line in cold.stdout.splitlines()
+                 if line.startswith('fiberlet-preprocess ') and ' stage=fiberlets ' in line]
+    assert completed and len(completed) == len(set(completed))
+    first = json.loads((root / "evaluation/summary.json").read_text())
+    assert first["completed"] and first["cases"] == 2
+    assert first["sources"][0]["tracer"] == "fiberlet"
+    cache = root / "fiberlet-cache"
+    def payloads():
+        return {str(p.relative_to(cache)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in cache.rglob("*") if p.is_file() and p.name != ".lock"}
+    before = payloads()
+    assert before
+    config["output"] = "warm"
+    config["render"] = True
+    config["excursion_grace_base_voxels"] = 160
+    config["tangential_threshold_factor"] = 2
+    (root / "evaluation.json").write_text(json.dumps(config))
+    run("replay-set", "--config", root / "evaluation.json")
+    second = json.loads((root / "warm/summary.json").read_text())
+    assert second["completed"] and second["cases"] == 2
+    assert payloads() == before  # replay-only settings do not alter construction
+    assert (root / "warm/cases/0/graph.json").is_file()
+    assert (root / "warm/cases/0/rendered/render.json").is_file()
+
+
+def test_fiberlet_backend_empty_seed_reports_untraced_coverage(replay_fixture):
+    root, config, run = replay_fixture
+    zarr.open_array(str(root / "fiber_presence.zarr"), mode="r+")[:] = 0
+    config.update(backend="fiberlet", render=True, fiberlet={
+        "storage_chunk_side_base": 16, "workers_per_source": 2})
+    config["sources"][0]["fiberlet_cache_root"] = str(root / "empty-cache")
+    (root / "evaluation.json").write_text(json.dumps(config))
+    run("replay-set", "--config", root / "evaluation.json")
+    result = json.loads((root / "evaluation/summary.json").read_text())
+    assert result["completed"]
+    assert result["sources"][0]["summary"]["traced_length_base_voxels"] == 0
+    assert result["sources"][0]["summary"]["length_weighted_success_percent"] == 0
+    for case in (0, 1):
+        artifact = json.loads((root / f"evaluation/cases/{case}/trace.json").read_text())
+        assert artifact["replay"]["geometry_backend"] == "fiberlet"
+        assert artifact["replay"]["failures"]
+        assert (root / f"evaluation/cases/{case}/rendered/render.json").is_file()
+
+
 def test_eligible_spans_trim_extrapolation_and_skip_lasagna(replay_fixture):
     root, config, run = replay_fixture
     def metadata(mode):
@@ -256,6 +347,54 @@ def test_bidirectional_export_and_posthoc_strips(replay_fixture):
         with Image.open(path) as image:
             assert image.width > 0 and image.height > 0
     assert run("replay-set", "--config", root / "evaluation.json", check=False).returncode != 0
+
+
+@pytest.mark.parametrize("direction", ["forward", "reverse"])
+def test_single_direction_annotation(replay_fixture, direction):
+    root, config, run = replay_fixture
+    path = root / "annotation.json"
+    annotation = json.loads(path.read_text())
+    annotation["evaluation_direction"] = direction
+    path.write_text(json.dumps(annotation))
+    run("replay-set", "--config", root / "evaluation.json")
+    summary = json.loads((root / "evaluation/summary.json").read_text())
+    assert summary["cases"] == 1 and summary["eligible_runs"] == 1
+    artifact = json.loads((root / "evaluation/cases/0/trace.json").read_text())
+    assert artifact["provenance"]["reverse"] == (direction == "reverse")
+
+
+def test_exported_short_piece_remains_eligible(replay_fixture):
+    root, config, run = replay_fixture
+    path = root / "annotation.json"
+    original = json.loads(path.read_text())
+    points = original["line_points"]
+    path.write_text(json.dumps(dict(type="vc3d_fiber", version=1,
+        line_points=points, control_points=[points[0],points[-1]],
+        optimization_mode="native_fiber_trace3d", evaluation_direction="forward")))
+    plan = json.loads(run("replay-references", "--config", root / "evaluation.json").stdout)
+    selected = plan["sources"][0]["fibers"][0]
+    assert len(selected["runs"]) == 1
+    assert selected["eligible_length_base_voxels"] == pytest.approx(selected["original_length_base_voxels"])
+
+
+@pytest.mark.parametrize("folded", [False, True])
+def test_indexed_self_proximity(replay_fixture, folded):
+    root, config, run = replay_fixture
+    config['self_proximity'] = dict(minimum_arc_separation_base=20, sample_spacing_base=1)
+    config['error_threshold_base_voxels'] = 1
+    config['tangential_threshold_factor'] = 2
+    (root/'evaluation.json').write_text(json.dumps(config))
+    points = [[4,16,16],[28,16,16]]
+    if folded: points += [[28,20,16],[4,20,16],[4,16,16],[6,16,16]]
+    annotation=dict(type='vc3d_fiber',version=1,optimization_mode='native_fiber_trace3d',
+                    line_points=points,control_points=[points[0],points[-1]])
+    (root/'annotation.json').write_text(json.dumps(annotation))
+    plan=json.loads(run('replay-references','--config',root/'evaluation.json').stdout)
+    proximity=plan['sources'][0]['fibers'][0]['self_proximity']
+    assert proximity['excluded'] == folded
+    if folded:
+        assert abs(proximity['original_arcs_base'][1]-proximity['original_arcs_base'][0]) >=20-1e-7
+        assert proximity['threshold_ratio'] <=1
 
 
 def test_annotation_binding_mismatch_fails_before_output(replay_fixture):

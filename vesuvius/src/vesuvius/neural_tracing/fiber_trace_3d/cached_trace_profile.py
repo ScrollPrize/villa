@@ -1,5 +1,7 @@
 """Short, manager-isolated readiness comparison using immutable published chunks."""
 from copy import deepcopy
+from collections import OrderedDict
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -13,13 +15,87 @@ from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_fiber_file
 from .live_evaluate import coordinate_native
 
 
+_trial_cancel_event = None
+_trial_sessions = OrderedDict()
+_trial_session_limit = 1
+
+
+def initialize_trial_worker(cancel_event, session_limit=1, vram_budget=None):
+    """Spawned CPU coordinator; GPU inference still uses the shared worker pool."""
+    global _trial_cancel_event, _trial_session_limit
+    _trial_cancel_event = cancel_event
+    _trial_session_limit = session_limit
+    if vram_budget is not None:
+        os.environ['FIBER_INFERENCE_VRAM_BUDGET_BYTES'] = str(vram_budget)
+    from multiprocessing.util import Finalize
+    Finalize(None, close_trial_worker, exitpriority=10)
+
+
+def close_trial_worker():
+    while _trial_sessions:
+        _, session = _trial_sessions.popitem(last=False)
+        session.close()
+
+
+def execute_trial_replay(evaluation, binary, checkpoint=None, devices='0', source_catalog=None):
+    """Process-pool entrypoint, keeping Python setup outside the main GIL.
+
+    Each call retains existing cache identity and shared native/inference logic.
+    Results stay in the evaluation directory, not duplicated over IPC.
+    """
+    if _trial_cancel_event is None:
+        raise RuntimeError('trial worker must be initialized with cancellation state')
+    sources = source_catalog or evaluation['sources']
+    caches = {str(Path(s['fiber_manifest']).resolve().parent) for s in sources}
+    bindings = {s['id']:str(Path(s['fiber_manifest']).resolve()) for s in sources}
+    key = json_digest(dict(bindings=bindings,settings=evaluation['inference'],devices=devices))
+    session = _trial_sessions.get(key)
+    if session is not None and session.closed:
+        del _trial_sessions[key]
+        session = None
+    if session is None and checkpoint is None:
+        run_cached_config(evaluation, binary, cancel_event=_trial_cancel_event)
+        return
+    if session is None:
+        # Idle retained sessions still own cache writer locks. Co-location alone
+        # is not sufficient: evict all overlapping owners before opening another.
+        for old_key, old in list(_trial_sessions.items()):
+            if caches.intersection(old.caches):
+                old.close()
+                del _trial_sessions[old_key]
+        while len(_trial_sessions)>=_trial_session_limit:
+            _, old = _trial_sessions.popitem(last=False)
+            old.close()
+        catalog_evaluation = dict(evaluation,sources=sources)
+        session = CachedReplaySession(catalog_evaluation,binary,checkpoint,
+            devices=devices,cancel_event=_trial_cancel_event)
+        session.caches = caches
+        _trial_sessions[key] = session
+        print(f'short-benchmark inference-session opened caches={len(caches)} retained={len(_trial_sessions)}',flush=True)
+    else:
+        _trial_sessions.move_to_end(key)
+        print(f'short-benchmark inference-session reused caches={len(caches)}',flush=True)
+    # Historical measured batches reserve ~50GiB/GPU. Keep CPU/mmap sessions
+    # resident, but only one model's CUDA workers per lane at a time.
+    for other in _trial_sessions.values():
+        if other is not session:
+            other.pause_gpu()
+    try:
+        session.run(evaluation)
+    except BaseException:
+        session.close()
+        _trial_sessions.pop(key,None)
+        raise
+
+
 def require_single_model_profile(evaluation):
     if evaluation.get("embedding_inference") or any(s.get("inference_roles") for s in evaluation["sources"]):
         raise ValueError("mixed-model caches must use live_evaluate with the original embedding_inference configuration; "
                          "single-model cached profiling/extension is not supported")
 
 
-def extend_cached_replay(evaluation, binary, checkpoint, *, gpu_manager=None):
+@contextmanager
+def _cached_replay_resources(evaluation, binary, checkpoint, *, gpu_manager=None, devices='0', cancel_event=None):
     """Continue an existing inference cache through shared demand publication.
 
     Unlike a fresh experiment namespace, this explicitly validates and locks
@@ -38,16 +114,25 @@ def extend_cached_replay(evaluation, binary, checkpoint, *, gpu_manager=None):
     binary = Path(binary)
     cache_root = subprocess.check_output([str(binary.with_name("vc_cache_root"))], text=True).strip()
     settings = dict(evaluation["inference"])
+    settings.pop("demand_gpu_manager", None)
     if gpu_manager is not None:
         settings["demand_gpu_manager"] = gpu_manager
     stores, readers, mapping, channels = {}, {}, {}, {}
+    checkpoint_digest = sha256_file(checkpoint)
     with ExitStack() as cleanup:
         for source in evaluation["sources"]:
+            if cancel_event is not None and cancel_event.is_set():
+                from concurrent.futures import CancelledError
+                raise CancelledError('trace extraction cancelled')
             cache = Path(source["fiber_manifest"]).parent
+            key = str(cache)
+            if key in stores:
+                mapping[source["id"]] = key
+                continue
             persisted = json.loads((cache / "cache_identity.json").read_text())
             identity = persisted["identity"]
             model, original = identity["model"], identity["source"]
-            settings = validate_cached_model(model, sha256_file(checkpoint), settings)
+            settings = validate_cached_model(model, checkpoint_digest, settings)
             geometry = DemandGeometry(**persisted["geometry"])
             sampler = Vc3dCoordinateSampler(original["locator"], level=original["level"],
                 cache_root=cache_root, **native_reader_options(settings))
@@ -56,15 +141,78 @@ def extend_cached_replay(evaluation, binary, checkpoint, *, gpu_manager=None):
             if (list(sampler.volume.shape_at(original["level"])) != original["shape"] or
                 list(sampler.volume.shape_at(0)) != original["base_shape"] or attrs != original["metadata"]):
                 raise ValueError("source metadata changed since cached inference")
-            key = str(cache)
             stores[key] = cleanup.enter_context(create_demand_store(cache, original, model, geometry,
                 model["config"], checkpoint, original["level"], settings))
             readers[key] = NativeTileReader(sampler, geometry, sampler.volume.dtype)
             mapping[source["id"]] = key
             channels[key] = {str((Path(c.relative_path)/str(p.level)).resolve()): geometry
                             for p in stores[key].products for c in p.channels}
-        return coordinate_native(evaluation, binary, stores, mapping, channels,
-            {k:set() for k in stores}, readers, (torch.device("cuda:0"),), settings)
+        yield (stores,mapping,channels,readers,
+               tuple(torch.device(f"cuda:{int(d)}") for d in str(devices).split(',')),settings)
+
+
+class CachedReplaySession:
+    """One validated producer's readers, mmap stores and GPU workers, reused."""
+    def __init__(self,evaluation,binary,checkpoint,**kwargs):
+        self.binary = Path(binary)
+        self.cancel_event = kwargs.get('cancel_event')
+        self.pool = self.gpu_lease = None
+        self.gpu_paused = False
+        self.closed = False
+        self.owner = _cached_replay_resources(evaluation,binary,checkpoint,**kwargs)
+        self.resources = self.owner.__enter__()
+        self.source_bindings = {s['id']:str(Path(s['fiber_manifest']).resolve()) for s in evaluation['sources']}
+
+    def run(self,evaluation):
+        if self.closed:
+            raise RuntimeError('inference session already closed')
+        for source in evaluation['sources']:
+            if self.source_bindings.get(source['id']) != str(Path(source['fiber_manifest']).resolve()):
+                raise ValueError('trial sources differ from retained inference session')
+        stores,mapping,channels,readers,devices,settings = self.resources
+        if self.gpu_paused and self.pool is not None:
+            self.pool.start_gpu(devices)
+            self.pool.authorize_gpu()
+            self.gpu_paused = False
+        return coordinate_native(evaluation,self.binary,stores,mapping,channels,
+            {k:set() for k in stores},readers,devices,settings,
+            cancel_event=self.cancel_event,inference_session=self)
+
+    def pause_gpu(self):
+        if self.pool is not None and not self.gpu_paused:
+            if self.pool.busy:
+                raise RuntimeError('cannot switch model before inference drained')
+            if self.gpu_lease is not None:
+                raise RuntimeError('retained model switching requires outer GPU ownership')
+            self.pool.stop_gpu()
+            self.gpu_paused = True
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            if self.gpu_lease is not None:
+                self.gpu_lease.close()
+        finally:
+            try:
+                if self.pool is not None:
+                    self.pool.close()
+            finally:
+                self.pool = self.gpu_lease = None
+                self.owner.__exit__(None,None,None)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self,*_):
+        self.close()
+
+
+def extend_cached_replay(evaluation,binary,checkpoint,**kwargs):
+    """One-shot convenience wrapper around the same reusable session."""
+    with CachedReplaySession(evaluation,binary,checkpoint,**kwargs) as session:
+        return session.run(evaluation)
 
 
 def prefix_points(points, length):
@@ -141,6 +289,28 @@ class PublishedStore:
         return None
 
 
+def published_bindings(sources):
+    """Shared immutable, all-channel readiness bindings for cached replay."""
+    stores, mapping, channels = {}, {}, {}
+    for source in sources:
+        key = str(Path(source["fiber_manifest"]).resolve().parent)
+        if key not in stores:
+            stores[key] = PublishedStore(source["fiber_manifest"])
+            channels[key] = stores[key].channels
+        mapping[source["id"]] = key
+    return stores, mapping, channels
+
+
+def run_cached_config(evaluation, binary, *, timeout=3600, cancel_event=None):
+    """Replay explicit references without inference; missing chunks fail loudly."""
+    stores, mapping, channels = published_bindings(evaluation["sources"])
+    coordinate_native(evaluation, Path(binary), stores, mapping, channels,
+        {key: set() for key in stores}, {}, (),
+        {"cached_trace_timeout_seconds": timeout}, allow_inference=False,
+        **({'cancel_event': cancel_event} if cancel_event is not None else {}))
+    return json.loads((Path(evaluation["output"]) / "summary.json").read_text())
+
+
 def run_full(workload):
     """Full original-fiber replay, immutable published cache, no GPU or rendering."""
     import subprocess
@@ -180,11 +350,6 @@ def run_full(workload):
             raise ValueError("cached checkpoint mismatch")
         for path in [*source["fibers"], source["normal_manifest"]]:
             hashes[path] = sha256_file(path)
-        key = str(root)
-        if key not in stores:
-            stores[key] = PublishedStore(source["fiber_manifest"])
-            channels[key] = stores[key].channels
-        mapping[source["id"]] = key
     # Export using the very same native selection implementation as replay.
     config_path = output / "evaluation.json"
     atomic_write(config_path, evaluation)
@@ -196,10 +361,7 @@ def run_full(workload):
     atomic_write(output / "provenance.json", {"previous_evaluation": str(previous),
         "checkpoint_sha256": workload["checkpoint_sha256"], "input_sha256": hashes,
         "allow_inference": False, "render": False})
-    coordinate_native(evaluation, binary, stores, mapping, channels,
-        {key: set() for key in stores}, {}, (),
-        {"cached_trace_timeout_seconds": 3600}, allow_inference=False)
-    result = json.loads((output / "full/summary.json").read_text())
+    result = run_cached_config(evaluation, binary)
     expected_cases = 2 * sum(len(fiber["runs"]) for source in evaluation["reference_plan"]["sources"] for fiber in source["fibers"])
     if result["cases"] != expected_cases:
         raise ValueError("cached replay coverage differs from selected reference plan")

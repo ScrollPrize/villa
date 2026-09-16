@@ -4,6 +4,9 @@
 #include "vc/fiber_tracer/FiberReplay.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberReferenceReplayBenchmark.hpp"
+#include "vc/fiber_tracer/FiberletPipeline.hpp"
+#include "vc/fiber_tracer/FiberletChunkGraph.hpp"
+#include "vc/fiber_tracer/FiberAnchorCoverage.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/util/GlobalCacheRoot.hpp"
@@ -27,6 +30,7 @@
 #include <set>
 #include <syncstream>
 #include <thread>
+#include <unordered_map>
 #include <opencv2/imgcodecs.hpp>
 
 namespace {
@@ -140,7 +144,37 @@ struct Source {
     std::unique_ptr<std::mutex> renderMutex;
     std::string renderCt;
     FiberReplayStripTextureSource renderSource;
+    std::shared_ptr<FiberletOnDemandPreprocessor> fiberlets;
+    std::shared_ptr<FiberPredictionField> constructionPredictions;
+    std::shared_ptr<vc::core::util::ExclusiveDirectoryLock> fiberletLock;
 };
+
+FiberReplayTraceResult fiberletInspectionReplay(const FiberletGraphReplayResult& graph, double factor)
+{
+    FiberReplayTraceResult result;
+    result.graphGeometry = true;
+    result.tangentialThresholdFactor = factor;
+    result.referenceBeginArcBase = graph.referenceBeginArcBase;
+    result.referenceEndArcBase = graph.referenceEndArcBase;
+    result.completedReferenceArcBase = graph.completedReferenceArcBase;
+    result.failures = graph.failures;
+    for (const auto& value : graph.segments) {
+        FiberReplayTraceSegment segment;
+        segment.startReferenceArcBase = value.startReferenceArcBase;
+        segment.endReferenceArcBase = value.endReferenceArcBase;
+        segment.terminationReason = value.terminationReason;
+        segment.tracePointsBase = value.routePointsBaseXYZ;
+        // Graph costs remain authoritative in graph.json; inspection only uses geometry.
+        for (const auto& match : value.matches) {
+            if (match.routePointIndex == 0) continue; // graph includes its seed match
+            segment.matches.push_back({match.routePointIndex, match.predictedReferenceArcBase,
+                match.matchedReferenceArcBase, match.matchedReferencePointBaseXYZ,
+                match.searchBeginArcBase, match.searchEndArcBase, match.thresholdMeasurement});
+        }
+        result.segments.push_back(std::move(segment));
+    }
+    return result;
+}
 
 struct Case {
     size_t source = 0;
@@ -153,16 +187,125 @@ struct Case {
     Json selection;
 };
 
+Json selfProximity(const Json& plan, const vc::lasagna::NormalSampler& normals,
+                   double threshold, double factor, double separation, double spacing)
+{
+    struct Segment { cv::Vec3d a, b; double arc, length; };
+    struct Hash {
+        size_t operator()(const std::array<int64_t,3>& k) const {
+            size_t h=0;
+            for (auto x:k) h ^= std::hash<int64_t>{}(x)+0x9e3779b9+(h<<6)+(h>>2);
+            return h;
+        }
+    };
+    if (!(threshold>0 && factor>0 && separation>0 && spacing>0) ||
+        !std::isfinite(threshold+factor+separation+spacing))
+        throw std::invalid_argument("invalid self-proximity parameters");
+    const auto started=std::chrono::steady_clock::now();
+    const double radius=threshold*std::max(1.0,factor);
+    auto cell=[&](const cv::Vec3d& p) {
+        return std::array<int64_t,3>{int64_t(std::floor(p[0]/radius)),int64_t(std::floor(p[1]/radius)),int64_t(std::floor(p[2]/radius))};
+    };
+    std::vector<Segment> segments;
+    std::unordered_map<std::array<int64_t,3>,std::vector<size_t>,Hash> grid;
+    for (const auto& run:plan.at("runs")) {
+        double arc=run.at("original_arcs_base")[0];
+        const auto& points=run.at("points_base_xyz");
+        for (size_t i=1;i<points.size();++i) {
+            cv::Vec3d a(points[i-1][0],points[i-1][1],points[i-1][2]);
+            cv::Vec3d b(points[i][0],points[i][1],points[i][2]);
+            const double length=cv::norm(b-a);
+            const size_t pieces=std::max(size_t{1},size_t(std::ceil(length/spacing)));
+            for (size_t j=0;j<pieces;++j) {
+                Segment s{a+(b-a)*(double(j)/pieces), a+(b-a)*(double(j+1)/pieces),arc+length*j/pieces,length/pieces};
+                if (!(s.length>0)) continue;
+                const auto lo=cell({std::min(s.a[0],s.b[0]),std::min(s.a[1],s.b[1]),std::min(s.a[2],s.b[2])});
+                const auto hi=cell({std::max(s.a[0],s.b[0]),std::max(s.a[1],s.b[1]),std::max(s.a[2],s.b[2])});
+                for(auto x=lo[0];x<=hi[0];++x) for(auto y=lo[1];y<=hi[1];++y) for(auto z=lo[2];z<=hi[2];++z)
+                    grid[{x,y,z}].push_back(segments.size());
+                segments.push_back(s);
+            }
+            arc+=length;
+        }
+    }
+    size_t checks=0;
+    Json result{{"excluded",false},{"minimum_arc_separation_base",separation},{"sample_spacing_base",spacing},
+                {"normal_radius_base",threshold},{"tangential_radius_base",threshold*factor},{"indexed_segments",segments.size()}};
+    for (const auto& query:segments) {
+        // Include both endpoints; shared vertices may repeat but never all-pairs.
+        for (int endpoint=0;endpoint<2;++endpoint) {
+            const auto p=endpoint?query.b:query.a;
+            const double arc=query.arc+(endpoint?query.length:0);
+            const auto key=cell(p);
+            for(int dx=-1;dx<=1;++dx) for(int dy=-1;dy<=1;++dy) for(int dz=-1;dz<=1;++dz) {
+                const auto found=grid.find({key[0]+dx,key[1]+dy,key[2]+dz});
+                if(found==grid.end()) continue;
+                for(auto index:found->second) {
+                    const auto& s=segments[index];
+                    if (std::max(std::abs(arc-s.arc),std::abs(arc-s.arc-s.length))<separation) continue;
+                    const auto v=s.b-s.a;
+                    const double euclideanT=std::clamp((p-s.a).dot(v)/v.dot(v),0.0,1.0);
+                    if(cv::norm(s.a+v*euclideanT-p)>radius) continue;
+                    ++checks;
+                    auto measure=[&](double t) {return measureFiberReplayThreshold(s.a+v*t,p,normals,1.0,threshold,factor);};
+                    auto square=[&](double t) {auto q=measure(t).thresholdErrorBaseVoxels;return q*q;};
+                    // Shared metric is quadratic along a segment with the normal
+                    // sampled at fixed p. Minimize it without duplicating its math.
+                    const double q0=square(0),q1=square(1),qm=square(.5);
+                    const double aa=2*(q0+q1-2*qm),bb=q1-q0-aa;
+                    const double optimum=aa>0?-bb/(2*aa):(q0<=q1?0:1);
+                    double t=0, minimum=std::numeric_limits<double>::infinity();
+                    const std::array<std::pair<double,double>,2> intervals{{
+                        {0,std::min(1.0,(arc-separation-s.arc)/s.length)},
+                        {std::max(0.0,(arc+separation-s.arc)/s.length),1}}};
+                    for(const auto& [lo,hi]:intervals) if(lo<=hi) {
+                        const double candidate=std::clamp(optimum,lo,hi);
+                        const double q=square(candidate);
+                        if(q<minimum) {minimum=q;t=candidate;}
+                    }
+                    if(!std::isfinite(minimum)) continue;
+                    const auto m=measure(t);
+                    if(!fiberReplayThresholdExceeded(m,threshold)) {
+                        const auto target=s.a+v*t;
+                        result.update({{"excluded",true},{"original_arcs_base",{arc,s.arc+s.length*t}},
+                            {"points_base_xyz",{{p[0],p[1],p[2]},{target[0],target[1],target[2]}}},
+                            {"threshold_ratio",m.thresholdErrorRatio},{"normal_valid",m.localNormalValid}});
+                        goto done;
+                    }
+                }
+            }
+        }
+    }
+done:
+    result["narrow_phase_checks"]=checks;
+    result["seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+    return result;
+}
+
 Json referencePlan(const Json& config, const std::filesystem::path& base)
 {
     Json result{{"policy", "cp-bounded-no-lasagna-v1"}, {"sources", Json::array()}};
     for (const auto& source : config.at("sources")) {
+        std::unique_ptr<vc::lasagna::LasagnaNormalSampler> proximityNormals;
+        if(config.contains("self_proximity")) {
+            vc::lasagna::LasagnaDatasetOpenOptions options;
+            options.remoteCacheRoot=vc::core::util::globalCacheRoot();
+            options.workingToBaseScale=1.0;
+            proximityNormals=std::make_unique<vc::lasagna::LasagnaNormalSampler>(
+                vc::lasagna::LasagnaDataset::openLocation(sourceLocation(base,source.at("normal_manifest").get<std::string>()),options));
+        }
         Json fibers = Json::array();
         for (const auto& value : source.at("fibers")) {
             // The Python coordinator resolves symlinks when binding sources.
             // Use the same existing-file identity for export and replay checks.
             const auto path = std::filesystem::canonical(localPath(base, value.get<std::string>()));
             auto plan = vc3dEvaluationReferencePlan(parseVc3dFiberJson(readJson(path), path.string()), path.string());
+            if(proximityNormals) {
+                const auto& settings=config.at("self_proximity");
+                plan["self_proximity"]=selfProximity(plan,*proximityNormals,
+                    config.value("error_threshold_base_voxels",40.0),config.value("tangential_threshold_factor",2.0),
+                    settings.value("minimum_arc_separation_base",500.0),settings.value("sample_spacing_base",4.0));
+            }
             plan["fiber_path"] = path.string(); fibers.push_back(std::move(plan));
         }
         result["sources"].push_back({{"source_id", source.at("id")}, {"fibers", std::move(fibers)}});
@@ -277,6 +420,40 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     if (config.contains("reference_plan") && config.at("reference_plan") != references)
         throw std::invalid_argument("reference selection changed since inference prefetch planning");
     const auto trace = traceOptions(config.value("trace_args", Json::array()));
+    const auto backend = config.value("backend", std::string("beam"));
+    if (backend != "beam" && backend != "fiberlet" && backend != "anchors")
+        throw std::invalid_argument("backend must be beam, fiberlet or anchors");
+    const bool anchorBackend = backend == "anchors";
+    const bool fiberletBackend = backend == "fiberlet" || anchorBackend;
+    if (anchorBackend && (config.value("render", false) || renderFlag))
+        throw std::invalid_argument("anchor coverage does not render traces");
+    const auto fiberletSettings = config.value("fiberlet", Json::object());
+    const int constructionWorkers = fiberletSettings.value("construction_workers",
+        fiberletSettings.value("workers_per_source", 4));
+    const int storageSide = fiberletSettings.value("storage_chunk_side_base", 512);
+    if (constructionWorkers <= 0 || storageSide <= 0)
+        throw std::invalid_argument("invalid fiberlet worker/chunk configuration");
+    FiberletPathConfig fiberletPaths;
+    FiberAnchorConfig fiberletAnchors;
+    if (fiberletSettings.contains("anchor_fit")) {
+        const auto& fit=fiberletSettings.at("anchor_fit");
+        const std::set<std::string> allowed{"method","iterations","presence_exponent","direction_exponent","local_sigma","damping"};
+        for (const auto& [name,value]:fit.items())
+            if (!allowed.contains(name)) throw std::invalid_argument("unknown anchor_fit parameter: "+name);
+        fiberletAnchors.fitMethod=fit.value("method",std::string("weighted"));
+        fiberletAnchors.weightedFitIterations=fit.value("iterations",4);
+        fiberletAnchors.weightedFitPresenceExponent=fit.value("presence_exponent",1.0F);
+        fiberletAnchors.weightedFitDirectionExponent=fit.value("direction_exponent",2.0F);
+        fiberletAnchors.weightedFitLocalSigma=fit.value("local_sigma",1.5F);
+        fiberletAnchors.weightedFitDamping=fit.value("damping",0.5F);
+        if (fiberletAnchors.fitMethod=="weighted") fiberletAnchors.peakGradientWeight=0;
+        validateFiberAnchorConfig(fiberletAnchors);
+    }
+    FiberletGraphReplayConfig graphConfig;
+    graphConfig.beamWidth = fiberletSettings.value("beam_width", 16);
+    graphConfig.lookaheadDistanceBaseVoxels = fiberletSettings.value("lookahead_base_voxels", 384.0);
+    graphConfig.beamStepDistanceBaseVoxels = fiberletSettings.value("beam_step_base_voxels", 48.0);
+    graphConfig.requireInitialSeedInFirstWindow = true;
     const bool live = config.contains("live_endpoint");
     const bool profileTracing = config.value("profile_tracing", false);
     const auto readinessEntries = config.value("readiness_cache_entries", int64_t{4096});
@@ -293,6 +470,10 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     const double refine = config.value("match_refine_steps", 1.0);
     const double excursionGrace = config.value("excursion_grace_base_voxels", 0.0);
     const double tangentialFactor = config.value("tangential_threshold_factor", 4.0);
+    graphConfig.errorThresholdBaseVoxels = threshold;
+    graphConfig.tangentialThresholdFactor = tangentialFactor;
+    graphConfig.excursionGraceBaseVoxels = excursionGrace;
+    graphConfig.matchRefineSteps = refine;
     if (!std::isfinite(tangentialFactor) || tangentialFactor <= 0)
         throw std::invalid_argument("invalid tangential_threshold_factor");
     if (!std::isfinite(excursionGrace) || excursionGrace < 0)
@@ -390,8 +571,13 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     throw std::invalid_argument("annotation base voxel size mismatch: " + fiberPath.string());
             }
             const auto& selected = references.at("sources").at(sources.size()).at("fibers").at(fiberIndex);
+            const auto evaluationDirection = annotation.value("evaluation_direction", std::string("both"));
+            if (evaluationDirection != "both" && evaluationDirection != "forward" && evaluationDirection != "reverse")
+                throw std::invalid_argument("invalid annotation evaluation_direction");
             for (const auto& run : selected.at("runs")) {
                 for (bool reverse : {false, true}) {
+                    if (anchorBackend && evaluationDirection == "both" && reverse) continue;
+                    if ((evaluationDirection == "forward" && reverse) || (evaluationDirection == "reverse" && !reverse)) continue;
                     std::vector<cv::Vec3d> points;
                     for (const auto& p : run.at("points_base_xyz")) points.emplace_back(p[0].get<double>(), p[1].get<double>(), p[2].get<double>());
                     if (reverse) std::reverse(points.begin(), points.end());
@@ -413,11 +599,130 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         throw std::invalid_argument("live case count exceeds explicit stack-preserving thread budget");
     std::unique_ptr<FiberLiveBridge> bridge;
     if (live) bridge = std::make_unique<FiberLiveBridge>(config.at("live_endpoint"));
-    std::counting_semaphore<> cpuPermits(static_cast<std::ptrdiff_t>(workers));
+    std::vector<std::atomic<double>> caseRemaining(cases.size());
+    for (size_t i = 0; i < cases.size(); ++i) caseRemaining[i].store(cases[i].length);
+    const auto cpuBudget = fiberletBackend ? std::max(workers, static_cast<size_t>(constructionWorkers)) : workers;
+    std::counting_semaphore<> cpuPermits(static_cast<std::ptrdiff_t>(cpuBudget));
+    struct GenerationShutdown {
+        std::vector<Source>& sources;
+        std::unique_ptr<FiberLiveBridge>& bridge;
+        ~GenerationShutdown() {
+            if (std::uncaught_exceptions() && bridge) bridge->cancel("fiberlet evaluation unwinding");
+            for (auto& source : sources) if (source.fiberlets) {
+                try { source.fiberlets->shutdown(); }
+                catch (const std::exception& e) { std::cerr << "fiberlet shutdown: " << e.what() << '\n'; }
+            }
+        }
+    } generationShutdown{sources, bridge};
+    if (fiberletBackend) {
+        // The generator owns bounded, distinct anchor and path services. Graph
+        // threads never occupy those services while waiting for dependencies.
+        std::map<std::filesystem::path, size_t> shared;
+        for (size_t s = 0; s < sources.size(); ++s) {
+            auto& source = sources[s];
+            const auto grid = source.predictions->storedGridInfo();
+            auto identity = source.provenance.value("fiberlet_source_identity", Json::object());
+            if (identity.empty())
+                identity = {{"source_volume", {{"identity", "manifest_hashes_only"}}},
+                    {"fiber_prediction", {{"manifest_content_hash",
+                        fiberletContentHash(source.predictionManifest.manifestPath)}}}};
+            identity["normal_prediction"] = {{"manifest_content_hash",
+                fiberletContentHash(source.provenance.at("normal_manifest").get<std::string>())}};
+            identity["fiber_prediction"]["manifest_content_hash"] =
+                fiberletContentHash(source.predictionManifest.manifestPath);
+            auto anchors = makeFiberletDatasetMetadata(FiberletDatasetKind::Anchors, grid,
+                fiberletAnchors, fiberletPaths, storageSide, identity);
+            const FiberletGeometryCacheProfile geometry{
+                .geometry = {.positionQuantumBaseVoxels = 0.0, .compactDirections = true},
+                .compatibilityCostTagBits = 16, .storageChunkSideBaseVoxels = storageSide};
+            auto paths = makeFiberletDatasetMetadata(FiberletDatasetKind::Fiberlets, grid,
+                fiberletAnchors, fiberletPaths, storageSide, identity, {}, 0, geometry,
+                FiberletStorageProfile::CompactDirectionsFixedCost);
+            std::string fingerprint;
+            constexpr char hex[] = "0123456789abcdef";
+            for (auto byte : paths.datasetFingerprint) {
+                fingerprint += hex[byte >> 4]; fingerprint += hex[byte & 15];
+            }
+            const auto root = std::filesystem::path(source.provenance.value("fiberlet_cache_root",
+                (cacheRoot / "live_inference" / "fiberlets").string())) / fingerprint;
+            source.provenance["fiberlet_cache"] = root.string();
+            source.provenance["fiberlet_processing"] = paths.processing;
+            if (auto it = shared.find(root); it != shared.end()) {
+                source.fiberlets = sources[it->second].fiberlets;
+                source.constructionPredictions = sources[it->second].constructionPredictions;
+                source.fiberletLock = sources[it->second].fiberletLock;
+                continue;
+            }
+            source.fiberletLock = std::make_shared<vc::core::util::ExclusiveDirectoryLock>(root);
+            source.constructionPredictions = std::make_shared<FiberPredictionField>(
+                vc::lasagna::LasagnaDataset(source.predictionManifest),
+                FiberPredictionFieldBindingMode::TraceOptions, false);
+            if (bridge) {
+                source.constructionPredictions->setReadinessGate(
+                    [&, id = source.id, s](const auto& dependencies) {
+                        // Generation services invoke this on several workers;
+                        // reuse the existing thread-confined publication proofs.
+                        thread_local std::map<std::string, FiberCaseReadiness> proofs;
+                        auto [proof, inserted] = proofs.try_emplace(id, static_cast<size_t>(readinessEntries));
+                        (void)inserted;
+                        double priority = 0;
+                        size_t owner = 0;
+                        for (size_t i = 0; i < cases.size(); ++i)
+                            if (sources[cases[i].source].predictionManifest.manifestPath ==
+                                sources[s].predictionManifest.manifestPath && caseRemaining[i].load() > priority) {
+                                priority = caseRemaining[i].load(); owner = i;
+                            }
+                        proof->second.await(dependencies, [&](const auto& missing) {
+                            const auto wait = [&] { bridge->await(id, owner, priority, missing); };
+                            if (auto* permit = FiberConstructionCpuPermit::current) permit->suspend(wait);
+                            else wait();
+                        }, [&] { bridge->checkActive(); });
+                    });
+            }
+            FiberletOnDemandConfig generation;
+            generation.anchorRoot = root / "anchors.zarr";
+            generation.fiberletRoot = root / "fiberlets.zarr";
+            generation.anchorMetadata = anchors;
+            generation.fiberletMetadata = paths;
+            generation.grid = grid;
+            generation.anchorConfig = fiberletAnchors;
+            generation.pathConfig = fiberletPaths;
+            configureCanonicalFiberletGeneration(generation);
+            generation.acquireWork = [&cpuPermits]() -> std::shared_ptr<void> {
+                return std::make_shared<FiberConstructionCpuPermit>(cpuPermits);
+            };
+            generation.predictionSampler = [field = source.constructionPredictions](
+                const auto& indices, int threads, auto& samples) {
+                field->sampleStoredGridBatch(indices, threads, samples);
+            };
+            vc::lasagna::LasagnaDatasetOpenOptions normalOptions;
+            normalOptions.remoteCacheRoot = cacheRoot;
+            normalOptions.workingToBaseScale = grid.predictionToBaseScale;
+            generation.normalSampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(
+                vc::lasagna::LasagnaDataset::openLocation(
+                    source.provenance.at("normal_manifest").get<std::string>(), normalOptions));
+            auto& options = generation.anchorCacheOptions;
+            options.service.decodedByteCapacity = persistedConfig.at("decoded_cache_bytes").get<size_t>();
+            options.service.decodedByteBudget = vc::render::processChunkCacheService()->decodedByteBudget();
+            options.service.fetchConcurrency.workerCapacity = constructionWorkers;
+            options.service.fetchConcurrency.maxConcurrentReads = constructionWorkers;
+            generation.fiberletCacheOptions = options;
+            generation.progress = [id = source.id, logChunks=config.value("log_construction_chunks", true)](const FiberletOnDemandProgress& p) {
+                if (p.status == "completed" && logChunks)
+                    std::osyncstream(std::cout) << "fiberlet-preprocess source=" << id <<
+                        " stage=" << p.stage << " z=" << p.key.iz << " y=" << p.key.iy <<
+                        " x=" << p.key.ix << " seconds=" << p.elapsedSeconds <<
+                        " inputs=" << p.inputCount << " outputs=" << p.outputCount << std::endl;
+            };
+            source.fiberlets = FiberletOnDemandPreprocessor::create(std::move(generation));
+            shared.emplace(root, s);
+        }
+    }
     std::filesystem::create_directories(output.parent_path());
     if (!std::filesystem::create_directory(output)) throw std::invalid_argument("evaluation output already exists");
     std::filesystem::create_directory(output / "cases");
     std::vector<FiberReferenceReplayOutcome> outcomes(cases.size());
+    std::vector<Json> anchorOutcomes(cases.size());
     std::vector<size_t> order(cases.size());
     std::iota(order.begin(), order.end(), size_t{0});
     std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return cases[a].length > cases[b].length; });
@@ -437,6 +742,62 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 const auto& source = sources[item.source];
                 FiberCaseCpuPermit permit(cpuPermits);
                 if (failed.load()) break;
+                if (anchorBackend) {
+                    const auto geometry = makePolylineArcGeometry(item.points);
+                    const auto schedule = source.fiberlets->anchorChunkScheduleNearReference(
+                        geometry, 0, geometry.length(), threshold * std::max(1.0, tangentialFactor));
+                    std::vector<vc::render::ChunkKey> keys;
+                    for (const auto& entry : schedule) keys.push_back(entry.key);
+                    source.fiberlets->anchorCache()->prefetchChunks(keys, false);
+                    std::map<FiberletStorageKey, cv::Vec3d> unique;
+                    std::map<FiberletStorageKey, cv::Vec3d> fittedAxes;
+                    const auto scale = source.fiberlets->grid().predictionToBaseScale;
+                    for (const auto& key : keys) {
+                        vc::render::ChunkResult chunk;
+                        permit.suspend([&] {
+                            chunk = source.fiberlets->anchorCache()->getChunkBlocking(key.level, key.iz, key.iy, key.ix);
+                        });
+                        const auto payload = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(chunk.payload);
+                        if (chunk.status != vc::render::ChunkStatus::Data || !payload)
+                            throw std::runtime_error("anchor coverage chunk unavailable: " + chunk.error);
+                        for (const auto& a : payload->anchors) {
+                            const cv::Vec3d p = cv::Vec3d(a.positionPredictionXYZ) * scale;
+                            const auto [it, inserted] = unique.emplace(a.key, p);
+                            fittedAxes.emplace(a.key, cv::Vec3d(a.fittedAxisXYZ));
+                            if (!inserted && cv::norm(it->second - p) > 1e-8)
+                                throw std::runtime_error("inconsistent duplicate anchor");
+                        }
+                    }
+                    std::vector<cv::Vec3d> positions;
+                    std::vector<cv::Vec3d> directions;
+                    Json ids = Json::array();
+                    for (const auto& [key, position] : unique) {
+                        positions.push_back(position);
+                        directions.push_back(fittedAxes.at(key));
+                        ids.push_back({{"cell_zyx",key.coordinateZYX},{"variant",key.variant}});
+                    }
+                    auto result = measureFiberAnchorCoverage(item.points, positions, *source.normals,
+                        source.traceScale, threshold, tangentialFactor,
+                        source.fiberlets->anchorConfig().cellSizePredictionVoxels * scale, directions);
+                    result.update({{"case_index",index},{"source_id",source.id},{"fiber_path",item.fiberPath.string()},
+                        {"reverse",item.reverse},{"reference_run",item.selection},{"requested_anchor_chunks",keys.size()},
+                        {"base_voxel_size_um",source.voxelSizeUm}});
+                    const double originalBegin = item.selection.at("original_arcs_base")[0];
+                    const double originalEnd = item.selection.at("original_arcs_base")[1];
+                    for (auto& a : result["accepted_anchors"]) {
+                        a["id"] = ids.at(a.at("anchor_index").get<size_t>());
+                        const double arc = a.at("reference_arc_base");
+                        a["original_fiber_arc_base"] = item.reverse ? originalEnd - arc : originalBegin + arc;
+                    }
+                    const auto directory = output / "cases" / std::to_string(index);
+                    std::filesystem::create_directories(directory);
+                    vc::core::util::atomicWriteString(directory / "anchors.json", result.dump(2) + "\n");
+                    anchorOutcomes[index] = std::move(result);
+                    caseRemaining[index].store(0);
+                    std::osyncstream(std::cout) << "anchor coverage progress=" << ++completed << '/' << cases.size()
+                        << " source=" << source.id << " case=" << index << std::endl;
+                    continue;
+                }
                 std::atomic<double> remaining{item.length};
                 FiberReadinessProfile readinessProfile;
                 FiberTraceProfile traceProfile;
@@ -468,7 +829,20 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 request.config.profile = profileTracing ? &traceProfile : nullptr;
                 request.config.traceToBaseScale = source.traceScale;
                 request.config.baseVoxelSizeUm = source.voxelSizeUm;
-                const auto replay = traceFiberReplay(livePredictions ? *livePredictions : *source.predictions,
+                std::optional<FiberletGraphReplayResult> graphReplay;
+                const auto replay = [&]() {
+                    if (fiberletBackend) {
+                        FiberletCachedReplayGraphSource graph(source.fiberlets, fiberletPaths,
+                            defaultFiberletReplayQuantization(storageSide));
+                        graph.setWaitExecutor([&](const auto& wait) { permit.suspend(wait); });
+                        graphReplay = traceFiberletGraphReplay(graph, item.points, *source.normals,
+                            source.traceScale, graphConfig, {}, [&](const FiberletGraphReplayProgress& progress) {
+                                remaining.store(item.length * (1 - std::clamp(progress.referenceArcFraction, 0.0, 1.0)));
+                                caseRemaining[index].store(remaining.load());
+                            });
+                        return fiberletInspectionReplay(*graphReplay, tangentialFactor);
+                    }
+                    return traceFiberReplay(livePredictions ? *livePredictions : *source.predictions,
                     request, *source.normals, source.traceScale,
                     [&](const FiberTraceProgress& progress) {
                         if (progress.referenceArcFraction)
@@ -481,6 +855,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                             std::osyncstream(std::cout) << "trace-profile " << profile.dump() << std::endl;
                         }
                     });
+                }();
                 auto provenance = source.provenance;
                 provenance["source_id"] = source.id;
                 provenance["fiber_path"] = item.fiberPath.string();
@@ -488,6 +863,9 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 provenance["case_index"] = index;
                 provenance["reference_run"] = item.selection;
                 writeFiberReplayTraceArtifacts(output / "cases" / std::to_string(index), item.points, replay, threshold, provenance);
+                if (graphReplay)
+                    vc::core::util::atomicWriteString(output / "cases" / std::to_string(index) / "graph.json",
+                        fiberletGraphReplayJson(*graphReplay, graphConfig).dump(2) + "\n");
                 if (profileTracing)
                     vc::core::util::atomicWriteString(output / "cases" / std::to_string(index) / "profile.json",
                         caseProfileJson(index, std::chrono::duration<double>(std::chrono::steady_clock::now() - caseStart).count(),
@@ -536,7 +914,9 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     vc::core::util::atomicWriteString(directory / "render.json", inspection.metadata.dump(2) + "\n");
                 }
                 FiberReferenceReplayCase replayCase{item.fiber, item.run, item.reverse, item.points, item.length};
-                outcomes[index] = measureFiberReferenceReplayOutcome(replayCase, replay);
+                outcomes[index] = graphReplay ? measureFiberReferenceReplayOutcome(replayCase, *graphReplay)
+                    : measureFiberReferenceReplayOutcome(replayCase, replay);
+                caseRemaining[index].store(0);
                 std::osyncstream(std::cout) << "replay progress=" << ++completed << '/' << cases.size()
                     << " case=" << index << " source=" << source.id << " reverse=" << item.reverse
                     << '\n'; // Counts are reported by the shared episode metrics.
@@ -549,11 +929,24 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         }
     });
     pool.clear(); // join before consuming results or propagating errors
+    for (auto& source : sources) if (source.fiberlets) source.fiberlets->shutdown();
     if (error) {
         vc::core::util::atomicWriteString(output / "incomplete.json", Json{{"completed_cases", completed.load()}, {"requested_cases", cases.size()}, {"config", persistedConfig}}.dump(2) + "\n");
         std::rethrow_exception(error);
     }
     Json summaries = Json::array();
+    if (anchorBackend) {
+        double lengthMm = 0;
+        for (const auto& row : anchorOutcomes)
+            lengthMm += row.at("reference_length_base").get<double>() * row.at("base_voxel_size_um").get<double>() / 1000;
+        vc::core::util::atomicWriteString(output / "summary.json", Json{
+            {"completed",true},{"backend","anchors"},{"cases",cases.size()},
+            {"directed_reference_length_mm",lengthMm},{"reference_selection_policy",references.at("policy")},
+            {"config",persistedConfig},{"anchor_cases",anchorOutcomes},
+            {"wall_seconds",std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()}
+        }.dump(2) + "\n");
+        return 0;
+    }
     double directedLengthMm = 0.0;
     size_t totalFailures = 0, selectedFibers = 0;
     auto commonConfig = persistedConfig;
@@ -565,7 +958,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         for (size_t i = 0; i < cases.size(); ++i) if (cases[i].source == s) selected.push_back(outcomes[i]);
         const auto summary = summarizeFiberReferenceReplay(sources[s].provenance.at("fibers").size(), selected, sources[s].voxelSizeUm);
         auto value = fiberReferenceReplayBenchmarkJson(summary, selected,
-            trace.beamWidth == 1 ? "native_greedy" : "native_beam", commonConfig, sources[s].provenance,
+            fiberletBackend ? "fiberlet" : trace.beamWidth == 1 ? "native_greedy" : "native_beam", commonConfig, sources[s].provenance,
             {0, 0, 0}, {0, 0, 0});
         value["coordinates"]["crop_half_open"] = false;
         value["coordinates"].erase("minimum_base_xyz");
@@ -590,7 +983,12 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     vc::core::util::atomicWriteString(output / "summary.json", Json{
         {"version", 2}, {"metric_definition", "complete-reference-partition-v1"},
         {"completed", true}, {"cases", cases.size()}, {"workers", workers},
-        {"selected_fibers", selectedFibers}, {"eligible_runs", cases.size() / 2},
+        {"selected_fibers", selectedFibers}, {"eligible_runs", [&] {
+            size_t count = 0;
+            for (const auto& source : references.at("sources"))
+                for (const auto& fiber : source.at("fibers")) count += fiber.at("runs").size();
+            return count;
+        }()},
         {"directed_reference_length_mm", directedLengthMm}, {"failures", totalFailures},
         {"reference_selection_policy", references.at("policy")},
         {"failures_per_directed_mm", directedLengthMm > 0 ? Json(totalFailures / directedLengthMm) : Json(nullptr)},

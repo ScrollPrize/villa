@@ -1,3 +1,81 @@
+## 2026-09-16 — Best short200 failure review
+
+- Rendered all59best-u22000 failing pieces (62restarts) in46.958s; exact original
+  replay geometry preserved. Review index sorted reported restarts/mm; no exclusions.
+- Added original copies and vc3d reference/trace exports beside images for59+mini5:
+  canonical evalextract/evaltrace author filenames, explicit source/case provenance,
+  separate restart segments; protect edited exports. Approved benchmark-review
+  runner can regenerate index/exports without tracing. See
+  docs/benchmarks/best_u22000_failed59_vis_20260916.md.
+
+## 2026-09-16 — Weighted anchor downstream mini-pilot
+
+- Regular inline visualization completed for all five weighted cases in25.689s;
+  unchanged traces. Short benchmark runner supports opt-in render and CT binding.
+  Saved beam comparison:Classic fails3/5,best-u22000 fails5/5. Images and comparison
+  documented in the same mini5 report; cost oracle paused for visual inspection.
+
+- Five locked historical fiberlet failures, four-iteration weighted fit, full native
+  construction/tracing:43.9985s with cached inference. Restarts5→5,100%coverage,
+  mean2.359517mm unchanged; no failures solved. Default unchanged.
+- Config/subset and per-piece failure arc comparison saved; see
+  docs/benchmarks/mini5_fiberlet_weighted_i4_20260916.md.
+
+## 2026-09-16 — Single-anchor weighted-fit experiment
+
+- Opt-in native iterative weighted centroid/direction-tensor fitter in shared
+  extraction path; owned-cell observations, fixed and moving Gaussians, one anchor,
+  no NMS. Legacy defaults/cache identity unchanged; experimental identity isolated.
+- Completed 20 experimental settings plus legacy on all 200 short pieces.
+  Approximately 32% fewer accepted matches; comparable positional coverage, but
+  no win on direction-qualified coverage. More iterations did not help coverage.
+- Added fitted-axis angular/qualified-coverage metrics; saved full matrix and
+  per-scroll results in docs/benchmarks/short200_anchor_weighted_fit_20260916.md.
+  125 native +263 Python tests passed, 8 skipped. Placement-only; not promoted.
+
+## 2026-09-16 — Anchor-only GT placement benchmark
+
+- Added native anchors backend using canonical cached extraction in a narrow GT
+  tube, shared owner-cell padding, indexed projection and existing acceptance metric.
+  No fiberlet paths/search. Flat endpoint caps and explicit cell-side gap units.
+- Completed200pieces with best-u22000 in52.461s (warmcache plus40inference tiles).
+  99.8467% interior gaps below1cell;max3.7364cells;59/8721empty arc bins;noempty
+  pieces. Cellside32basevoxels. Full per-scroll histograms/endpointstats/inspection
+  ranking and exact commands in docs/benchmarks/short200_anchor_coverage_u22000_20260916.md.
+-122native tests and261Python tests passed;8optional skips. Existing extraction
+  and replay metrics unchanged; placement alone does not measure graph connectivity.
+
+## 2026-09-16 — Short200 beam/fiberlet comparison completed
+
+- Classic153restarts/4.299mm, best-u22000 beam62/10.509mm, same-model
+  fiberlets67/9.737mm on the same200pieces/662.089848mm.
+- Scroll-local224CPU construction and on-demand GPU lease; release30idle seconds.
+  Fiberlet run24m46s includes partial construction-cache reuse and extra inference,
+  not a controlled search-speed measurement. Credited reference coverage99.846%.
+- Results and provenance: docs/benchmarks/short200_classic_fiberlet_20260916.md.
+
+## 2026-09-16 — Short failure benchmark extraction
+
+- Directed100voxel-grid reproduction search with confirmation/padding, original
+  annotation/model/arc provenance, deduplication and native self-proximity exclusion.
+- Resumable trials reuse historical inference and fill missing chunks under one
+  whole-extraction GPU grant. Replaced sequential snapshot/group barriers with
+  bounded concurrent jobs, deterministic selection and coordinated cancellation.
+- Completed accepted200-case v3:41best/50other/109Classic,662.089848mm.
+  Final resumed scheduler21m34s (not total development/extraction attempts).
+  All200annotation hashes/directions/lengths validated. Best-u22000 evaluation
+  on the common benchmark now running. See docs/short_failure_benchmark.md.
+
+## 2026-09-16 — Optional cached fiberlet evaluation
+
+- Added anchor extraction/path generation/graph replay to the live evaluator,
+  reusing production kernels, canonical metadata, inference readiness and caches.
+  Ordinary beam replay remains default; shared inspection supports graph paths.
+- Graph acceptance carries the existing ellipse/excursion policy across edges;
+  seeded-coverage accounting now excludes skipped seed gaps.
+- Real cold/warm pilot gives identical paths with zero warm inference; full-set
+  validation is ongoing. Details: docs/benchmarks/fiberlet_u22000_20260916.md.
+
 ## 2026-09-16 — Refinement run212757 best/latest EMA999
 
 - Both full50-fiber evaluations completed without embedding/rendering.
@@ -2815,3 +2893,15 @@ are in docs/embedding_refinement_summary_20260914.md. Boundary sweep stopped on
 user request after eight families and partial ninth; preserved report under
 `/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_anchor_boundaries_20260914_v1/`.
 Partial support-softmin 67 has not received the final exact-repeat stage.
+# 2026-09-16 Corrected mini5 reference
+
+Versioned user-corrected piece000 and reran weighted4 fiberlet mini5 with vis.
+One restart per case remains; other four replay results exactly unchanged.
+Corrected CP-bounded extent1485.5vs900base voxels. See benchmark report
+`../docs/benchmarks/mini5_corrected_weighted_i4_20260916.md`.
+# 2026-09-16 Merge/split single-case benchmark
+
+Frozen corrected mini5case000 with separate neighboring-fiber hypothesis and
+native CP-bounded geometric profiles. One-case weighted4 baseline reproduces
+exactly. Evidence supports approach/separation and trace switching; physical
+identity remains unconfirmed. Global-assignment experiments not yet implemented.

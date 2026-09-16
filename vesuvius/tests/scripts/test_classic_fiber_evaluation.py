@@ -6,6 +6,30 @@ from pathlib import Path
 import pytest
 
 
+def test_short_extraction_owns_one_outer_grant(tmp_path, monkeypatch):
+    import sys
+    from vesuvius.neural_tracing.fiber_trace_3d import managed_evaluation, short_failure_benchmark
+    script = Path(__file__).resolve().parents[2] / 'scripts/run_classic_fiber_evaluation.py'
+    spec = importlib.util.spec_from_file_location('classic_eval_grant', script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config = tmp_path / 'config.json'
+    config.write_text(json.dumps({'devices': '0,1,2,3,4,5,6,7', 'short_failures': {}}))
+    launches, runs = [], []
+    monkeypatch.setattr(managed_evaluation, 'launch_managed', lambda *a, **k: launches.append((a,k)) or 0)
+    monkeypatch.setattr(short_failure_benchmark, 'run', lambda *a, **k: runs.append((a,k)))
+    argv = [str(script), 'short-failures', '--config', str(config)]
+    monkeypatch.setattr(sys, 'argv', argv)
+    assert module.main() == 0
+    assert len(launches) == 1 and not runs
+    assert launches[0][1]['settings']['exclusive'] is True
+    assert launches[0][1]['priority'] == 100
+    monkeypatch.setattr(sys, 'argv', argv + ['--unmanaged', '--devices', '0,1,2,3,4,5,6,7'])
+    assert module.main() == 0
+    assert len(launches) == len(runs) == 1
+    assert runs[0][1]['devices'] == '0,1,2,3,4,5,6,7'
+
+
 def test_default_classic_workload_uses_full_set_validated_batching():
     configs = Path(__file__).resolve().parents[2] / "src/vesuvius/neural_tracing/fiber_trace_3d/configs"
     default = json.loads((configs / "eval_classic_collection.json").read_text())

@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 import re
 import secrets
-import select
+import selectors
 import shutil
 import socket
 import subprocess
@@ -36,6 +36,23 @@ from vesuvius.neural_tracing.fiber_trace_2d.sampling import Vc3dCoordinateSample
 from vesuvius.neural_tracing.fiber_trace_3d import inference_adapter
 from vesuvius.neural_tracing.fiber_trace_3d.inference_cache import resolve_prediction_cache
 from vesuvius.neural_tracing.fiber_trace_3d.infer import _checkpoint_config_for_inference, _resolve_inference_precision
+
+
+def finalize_native_summary(summary):
+    """Placement diagnostics have no trace/restart partitions to correct."""
+    if summary.get('backend') == 'anchors':
+        if not summary.get('completed') or len(summary['anchor_cases']) != summary['cases']:
+            raise ValueError('incomplete anchor summary')
+        return summary
+    from .replay_metrics import correct_summary
+    return correct_summary(summary)
+
+
+def bind_fiberlet_identity(entry, source_identity, model_identity, manifest):
+    """Canonical graph-cache binding shared by fresh and historical replay."""
+    entry['fiberlet_source_identity'] = {
+        'source_volume': source_identity, 'fiber_prediction': model_identity}
+    entry['fiberlet_cache_root'] = str(Path(manifest).parent / 'fiberlets')
 
 
 def location(base, value):
@@ -413,6 +430,8 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
                             (1 << level) * model["scale"], geometry.output_shape, model["chunk"]))
             source_to_store[source_id] = role_keys if mixed is not None else role_keys[0]
             entry = dict(source)
+            # Scientific producer identity, independent of manifests' runtime locations.
+            bind_fiberlet_identity(entry, source_identity, models[0][0]["identity"], manifests[0])
             entry["fiber_manifest"] = str(manifests[0])
             if mixed is not None:
                 from .mixed_inference import write_mixed_manifest
@@ -441,15 +460,27 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
 
 def coordinate_native(evaluation, binary, stores, source_to_store, channel_indices,
                       backgrounds, readers, device_list, settings, *, started=None, allow_inference=True,
-                      pool_groups=None):
+                      pool_groups=None, cancel_event=None, inference_session=None):
     """Shared authenticated control loop for live inference and cached-only replay."""
     started = time.monotonic() if started is None else started
     max_batch_size = settings.get("max_batch_size", 1)
     if type(max_batch_size) is not int or max_batch_size < 1:
         raise ValueError("inference.max_batch_size must be a positive integer")
     producer_implementation = implementation_identity()  # Run provenance only, never a cache key.
-    native = connection = pool = gpu_lease = None
+    native = connection = None
+    pool = inference_session.pool if inference_session is not None else None
+    gpu_lease = inference_session.gpu_lease if inference_session is not None else None
+    reused_pool = pool is not None
+    succeeded = False
+    initial_stats = {key: dict(store.stats) for key, store in stores.items()}
+    if pool is not None and pool.busy:
+        raise RuntimeError('borrowed inference session must be drained before replay')
     adaptive = settings.get("demand_gpu_manager")
+    def check_cancelled():
+        if cancel_event is not None and cancel_event.is_set():
+            from concurrent.futures import CancelledError
+            raise CancelledError('trace extraction cancelled')
+    check_cancelled()
     with ExitStack() as cleanup, tempfile.TemporaryDirectory(prefix="fiber-live-control-") as control:
         listener = cleanup.enter_context(socket.socket())
         listener.bind(("127.0.0.1", 0))
@@ -469,6 +500,7 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
             listener.settimeout(0.1)
             deadline = time.monotonic() + 120
             while connection is None:
+                check_cancelled()
                 if native.poll() not in (None, 0):
                     raise RuntimeError("native evaluator failed during source validation (see native.log)")
                 if time.monotonic() > deadline:
@@ -478,11 +510,22 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                 except socket.timeout:
                     pass
             connection.settimeout(1)
+            # Parallel model jobs can exceed select()'s FD_SETSIZE even with a
+            # single watched socket. epoll/kqueue have no such descriptor limit.
+            selector = cleanup.enter_context(selectors.DefaultSelector())
+            selector.register(connection, selectors.EVENT_READ)
             pending = b""
             authenticated = False
             waiters = {}
             last_report = time.monotonic()
             queue_log = None
+            def open_queue_log():
+                nonlocal queue_log
+                queue_log = cleanup.enter_context((Path(evaluation["output"]) / "inference_queues.jsonl").open("x"))
+                print(f"live-eval buffers={pool.stats['shared_slot_bytes'] / (1 << 30):.2f}GiB "
+                      f"input_slots={pool.stats['input_slots']} readers={pool.stats['input_workers']} "
+                      f"result_slots={pool.stats['result_slots']} max_batch_size={max_batch_size} "
+                      f"reused_pool={reused_pool}", flush=True)
             last_queue_report = 0.0
             last_metrics_report, metrics_cases = 0.0, -1
             last_heartbeat = 0.0
@@ -496,9 +539,10 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                         write_trace_progress_report(root, root.parent)
                         metrics_cases = (count, image_count)
                     last_metrics_report = time.monotonic()
+                check_cancelled()
                 if not allow_inference and time.monotonic() - started > settings.get("cached_trace_timeout_seconds", 300):
                     raise TimeoutError("cached trace profiling exceeded its bounded duration")
-                if select.select([connection], [], [], 0.005)[0]:
+                if selector.select(0.005):
                     received = connection.recv(65536)
                     if not received:
                         if not authenticated:
@@ -553,15 +597,20 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                     if adaptive is not None:
                         from .demand_gpu import DemandGpuLease
                         gpu_lease = DemandGpuLease(pool, adaptive)
-                    queue_log = cleanup.enter_context((Path(evaluation["output"]) / "inference_queues.jsonl").open("x"))
-                    print(f"live-eval buffers={pool.stats['shared_slot_bytes'] / (1 << 30):.2f}GiB "
-                          f"input_slots={pool.stats['input_slots']} readers={pool.stats['input_workers']} "
-                          f"result_slots={pool.stats['result_slots']} max_batch_size={max_batch_size}", flush=True)
+                    if inference_session is not None:
+                        inference_session.pool = pool
+                        inference_session.gpu_lease = gpu_lease
+                    open_queue_log()
                 if pool is not None:
+                    # Native connects before exclusively creating its output
+                    # directory. A first demand confirms that setup completed;
+                    # an idle retained pool must not create outputs ahead of it.
+                    if queue_log is None and waiters:
+                        open_queue_log()
                     if gpu_lease is not None:
                         gpu_lease.tick()
                     pool.pump()
-                    if time.monotonic() - last_queue_report >= 1:
+                    if queue_log is not None and time.monotonic() - last_queue_report >= 1:
                         row = {"elapsed_seconds": time.monotonic() - started, "phase": "tracing",
                                "trace_requests_waiting": len(waiters), **pool.queue_snapshot()}
                         queue_log.write(json.dumps(row) + "\n")
@@ -584,7 +633,10 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
             # Reference-intersection work is explicitly drained even if traces
             # finished before lower-priority prefetch did.
             if pool is not None:
+                if queue_log is None:
+                    open_queue_log()
                 while pool.busy:
+                    check_cancelled()
                     if gpu_lease is not None:
                         gpu_lease.tick()
                     pool.pump()
@@ -595,15 +647,18 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                     time.sleep(0.005)
                 queue_log.write(json.dumps({"elapsed_seconds": time.monotonic() - started,
                     "phase": "complete", "trace_requests_waiting": 0, **pool.queue_snapshot()}) + "\n")
-            from .replay_metrics import correct_summary
             summary_path = Path(evaluation["output"]) / "summary.json"
-            atomic_write(summary_path, correct_summary(json.loads(summary_path.read_text())))
+            atomic_write(summary_path, finalize_native_summary(json.loads(summary_path.read_text())))
             atomic_write(Path(evaluation["output"]) / "inference_summary.json", {
                 "producer_implementation": producer_implementation,
                 "wall_seconds": time.monotonic() - started, "worker_pool": pool.stats if pool else None,
-                "sources": {key: store.stats for key, store in stores.items()},
+                "worker_pool_scope": "session cumulative" if inference_session is not None else "batch",
+                "reused_worker_pool": reused_pool,
+                "sources": {key: {k: v-initial_stats[key].get(k,0) for k,v in store.stats.items()}
+                            for key, store in stores.items()},
                 "cache_roots": {key: str(store.root) for key, store in stores.items()},
                 "reference_prefetch_chunks": {key: len(v) for key, v in backgrounds.items()}})
+            succeeded = True
         except BaseException as error:
             destination = Path(evaluation["output"])
             destination.mkdir(parents=True, exist_ok=True)
@@ -628,11 +683,13 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
             raise
         finally:
             try:
-                if gpu_lease is not None:
+                if inference_session is not None and not succeeded:
+                    inference_session.close()
+                elif inference_session is None and gpu_lease is not None:
                     gpu_lease.close()
             finally:
                 try:
-                    if pool is not None:
+                    if inference_session is None and pool is not None:
                         pool.close()
                 finally:
                     if connection is not None:

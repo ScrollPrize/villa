@@ -104,3 +104,14 @@ public:
 private:
     std::counting_semaphore<>& pool_;
 };
+
+// Construction and replay share admission, but not dependency-waiting threads.
+class FiberConstructionCpuPermit : public FiberCaseCpuPermit {
+public:
+    explicit FiberConstructionCpuPermit(std::counting_semaphore<>& pool)
+        : FiberCaseCpuPermit(pool), previous_(current) { current = this; }
+    ~FiberConstructionCpuPermit() { current = previous_; }
+    static inline thread_local FiberConstructionCpuPermit* current = nullptr;
+private:
+    FiberConstructionCpuPermit* previous_;
+};

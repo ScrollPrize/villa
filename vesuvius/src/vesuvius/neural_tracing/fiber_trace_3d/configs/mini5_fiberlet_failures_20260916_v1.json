@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "completed": true,
+  "case_count": 5,
+  "cases": [
+    {
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3/fibers/000_08e44ead4019b9400317.json",
+      "sha256": "5bf083e301364e28a0e2029eeba20a6861b66b1fc6af36835b957f0e791a038c",
+      "length_mm": 2.1591,
+      "length_base_voxels": 900,
+      "candidate": {
+        "source_id": "PHerc0139",
+        "id": "08e44ead4019b9400317",
+        "fiber": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0139/kb_20260901T224443942_000068.json"
+      }
+    },
+    {
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3/fibers/001_6b300e78b502d4fbf62f.json",
+      "sha256": "1240e514a87a1ad1f6ce687e6b37c47cb65d4d1a455f8f948cb74aef970168bb",
+      "length_mm": 2.1591,
+      "length_base_voxels": 900,
+      "candidate": {
+        "source_id": "PHerc0139",
+        "id": "6b300e78b502d4fbf62f",
+        "fiber": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc0139/kb_20260901T224443942_000068.json"
+      }
+    },
+    {
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3/fibers/019_3ebd5fc902a023ef2728.json",
+      "sha256": "f114cb30f096887a0dbb061f675c7a47831fdb116c5feabba17cf67f015cc132",
+      "length_mm": 2.6389,
+      "length_base_voxels": 1100,
+      "candidate": {
+        "source_id": "PHerc1229",
+        "id": "3ebd5fc902a023ef2728",
+        "fiber": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHerc1229/lt_20260824T091041867_000056.json"
+      }
+    },
+    {
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3/fibers/025_86888783a75b0603b424.json",
+      "sha256": "944f102798c3ff0aab54da3738239d71ce1a7484ea602f577267e82d8d1adfa0",
+      "length_mm": 4.32,
+      "length_base_voxels": 1800,
+      "candidate": {
+        "source_id": "PHercParis4_eval_fibers",
+        "id": "86888783a75b0603b424",
+        "fiber": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260815T025206849_000041.json"
+      }
+    },
+    {
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3/fibers/026_e1432d57017f235a79c9.json",
+      "sha256": "937de25edc3be277fab543bdb76b2d961e7e47e54916053a29c0e9eedcff1792",
+      "length_mm": 2.88,
+      "length_base_voxels": 1200,
+      "candidate": {
+        "source_id": "PHercParis4_eval_fibers",
+        "id": "e1432d57017f235a79c9",
+        "fiber": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/all/PHercParis4_eval_fibers/anon_20260815T025206849_000041.json"
+      }
+    }
+  ],
+  "total_mm": 14.1571,
+  "total_base_voxels": 5900,
+  "selection": {
+    "parent_manifest": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3/manifest.json",
+    "rule": "First failing manifest paths: two PHerc0139, one PHerc1299, two Paris4",
+    "historical_cases": [
+      {
+        "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3/fibers/000_08e44ead4019b9400317.json",
+        "trace": "/ephemeral/hendrik/fiber3d_train2/evaluations/short200_fiberlet_u22000_128_scroll_20260916_v2/scrolls/00/cases/0/trace.json",
+        "scroll": "PHerc0139/20260102150214@L0",
+        "case": 0,
+        "events": 1
+      },
+      {
+        "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3/fibers/001_6b300e78b502d4fbf62f.json",
+        "trace": "/ephemeral/hendrik/fiber3d_train2/evaluations/short200_fiberlet_u22000_128_scroll_20260916_v2/scrolls/00/cases/1/trace.json",
+        "scroll": "PHerc0139/20260102150214@L0",
+        "case": 1,
+        "events": 1
+      },
+      {
+        "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3/fibers/019_3ebd5fc902a023ef2728.json",
+        "trace": "/ephemeral/hendrik/fiber3d_train2/evaluations/short200_fiberlet_u22000_128_scroll_20260916_v2/scrolls/02/cases/0/trace.json",
+        "scroll": "PHerc1299/20260309130042@L0",
+        "case": 0,
+        "events": 1
+      },
+      {
+        "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3/fibers/025_86888783a75b0603b424.json",
+        "trace": "/ephemeral/hendrik/fiber3d_train2/evaluations/short200_fiberlet_u22000_128_scroll_20260916_v2/scrolls/04/cases/0/trace.json",
+        "scroll": "PHercParis4/20260411134726@L0",
+        "case": 0,
+        "events": 1
+      },
+      {
+        "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3/fibers/026_e1432d57017f235a79c9.json",
+        "trace": "/ephemeral/hendrik/fiber3d_train2/evaluations/short200_fiberlet_u22000_128_scroll_20260916_v2/scrolls/04/cases/1/trace.json",
+        "scroll": "PHercParis4/20260411134726@L0",
+        "case": 1,
+        "events": 1
+      }
+    ]
+  }
+}

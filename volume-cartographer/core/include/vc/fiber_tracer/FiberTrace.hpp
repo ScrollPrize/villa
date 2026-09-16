@@ -560,6 +560,8 @@ struct FiberReplayTraceSegment {
 };
 
 struct FiberReplayTraceResult {
+    // Geometry adapter for graph replay; costs remain in its graph artifact.
+    bool graphGeometry = false;
     double tangentialThresholdFactor = 4.0;
     double referenceBeginArcBase = 0.0;
     double referenceEndArcBase = 0.0;

@@ -96,6 +96,8 @@ using FiberletAnchorView =
 class FiberletChunkGraphSource
 {
 public:
+    using WaitExecutor = std::function<void(const std::function<void()>&)>;
+    void setWaitExecutor(WaitExecutor wait) { wait_ = std::move(wait); }
     FiberletChunkGraphSource(
         std::shared_ptr<FiberletChunkDataset> anchorDataset,
         std::shared_ptr<vc::render::ChunkCache> anchorCache,
@@ -143,6 +145,10 @@ public:
     [[nodiscard]] const FiberletPathConfig& pathConfig() const noexcept;
 
 private:
+    [[nodiscard]] vc::render::ChunkResult fetchChunk(
+        const std::shared_ptr<vc::render::ChunkCache>& cache,
+        const vc::render::ChunkKey& key, bool blocking) const;
+    WaitExecutor wait_;
     [[nodiscard]] vc::render::ChunkKey ownerChunk(const FiberletStorageKey& anchor, int level) const;
     [[nodiscard]] std::vector<vc::render::ChunkKey> incidentOwnerChunks(const FiberletStorageKey& anchor) const;
 
@@ -585,6 +591,7 @@ writeFiberletReductionOverlayBox(
 class FiberletCachedReplayGraphSource final : public FiberletReplayGraphSource
 {
 public:
+    void setWaitExecutor(FiberletChunkGraphSource::WaitExecutor wait) { chunks_.setWaitExecutor(std::move(wait)); }
     FiberletCachedReplayGraphSource(
         std::shared_ptr<FiberletOnDemandPreprocessor> preprocessor,
         FiberletPathConfig pathConfig,

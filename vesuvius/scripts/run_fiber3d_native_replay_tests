@@ -36,6 +36,8 @@ if [[ "$suite" == inspection ]]; then
     "$native_test"
     trace_test=$(find_binary test_fiber_trace3d)
     "$trace_test"
+    reference_test=$(find_binary test_fiber_reference_replay_benchmark)
+    "$reference_test"
     cd "$repo_dir"
     export VC_REPLAY_TEST_BINARY="$replay_binary"
     export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
@@ -45,6 +47,8 @@ if [[ "$suite" == inspection ]]; then
         vesuvius/tests/neural_tracing/test_visualization_report.py \
         vesuvius/tests/neural_tracing/test_replay_metrics.py \
         vesuvius/tests/neural_tracing/test_cached_trace_profile.py \
+        vesuvius/tests/neural_tracing/test_short_failure_benchmark.py \
+        vesuvius/tests/neural_tracing/test_short_benchmark_evaluate.py \
         lasagna/tests/test_demand_predict3d.py \
         vesuvius/tests/neural_tracing/test_inference_cache_identity.py \
         vesuvius/tests/neural_tracing/test_live_inference_cache_namespace.py \
@@ -77,4 +81,5 @@ PYTHONPATH="$repo_dir/vesuvius/src:$repo_dir" \
     "$python_bin" -m pytest --noconftest -q vesuvius/tests/neural_tracing/test_native_replay_evaluation.py \
         lasagna/tests/test_demand_predict3d.py lasagna/tests/test_live_tiled_predict3d.py \
         vesuvius/tests/neural_tracing/test_cached_trace_profile.py \
+        vesuvius/tests/neural_tracing/test_short_failure_benchmark.py \
         vesuvius/tests/neural_tracing/test_live_process_probe.py

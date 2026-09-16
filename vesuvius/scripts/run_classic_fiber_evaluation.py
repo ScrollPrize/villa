@@ -186,7 +186,7 @@ def prepare(workload, *, pilot_only=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["integration-report", "integration-fit", "integration-audit", "fixed-path-report", "fixed-path-extract", "fixed-path-fit", "freeze-snapshot", "prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "cached-full", "report-metrics", "profile", "observe", "report-progress", "reference-plan"])
+    parser.add_argument("mode", choices=["benchmark-review", "benchmark-full", "pair-connectivity", "short-failures", "integration-report", "integration-fit", "integration-audit", "fixed-path-report", "fixed-path-extract", "fixed-path-fit", "freeze-snapshot", "prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "cached-full", "report-metrics", "profile", "observe", "report-progress", "reference-plan"])
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--devices", help="runtime device selection (default from workload)")
     parser.add_argument("--manager-socket")
@@ -194,8 +194,55 @@ def main():
     parser.add_argument("--unmanaged", action="store_true", help="explicit bypass of configured manager")
     parser.add_argument("--pid", type=int, help="existing coordinator PID for read-only observe")
     parser.add_argument("--seconds", type=float, default=20, help="read-only observe duration,1–60s")
+    parser.add_argument("--extraction-time-limit-seconds", type=float,
+                        help="checkpoint and stop short-failures scheduling after this duration (cleanup follows)")
     args = parser.parse_args()
-    workload = load_workload(args.config)
+    workload = (json.loads(args.config.read_text()) if args.mode in ('short-failures', 'benchmark-full', 'benchmark-review', 'pair-connectivity') else load_workload(args.config))
+    if args.mode == 'pair-connectivity':
+        from vesuvius.neural_tracing.fiber_trace_3d.fiber_pair_connectivity import run_pair_connectivity
+        run_pair_connectivity(workload)
+        return 0
+    if args.mode == 'benchmark-review':
+        from vesuvius.neural_tracing.fiber_trace_3d.short_benchmark_evaluate import write_render_review_index
+        root = Path(workload['output_root'])
+        result = json.loads((root / 'full/summary.json').read_text())
+        if not result['completed']:
+            raise ValueError('cannot index incomplete benchmark')
+        rows = write_render_review_index(root, result, json.loads(Path(workload['benchmark_manifest']).read_text()))
+        print(f'Indexed {len(rows)} rendered pieces: {root / "README.md"}')
+        return 0
+    if args.mode == 'benchmark-full':
+        devices = args.devices or workload['devices']
+        manager = None if args.unmanaged else dict(workload['gpu_manager'], devices=devices)
+        if manager is not None:
+            if args.manager_socket is not None:
+                manager['socket'] = args.manager_socket
+            if args.manager_priority is not None:
+                manager['priority'] = args.manager_priority
+        from vesuvius.neural_tracing.fiber_trace_3d.short_benchmark_evaluate import run
+        run(workload, devices, gpu_manager=manager)
+        return 0
+    if args.mode == "short-failures":
+        import os
+        fill_missing = workload['short_failures'].get('fill_missing', True)
+        devices = args.devices or workload.get('devices', '0')
+        if fill_missing and not args.unmanaged:
+            from vesuvius.neural_tracing.fiber_trace_3d.managed_evaluation import launch_managed
+            manager = dict(workload.get('evaluation', {}).get('gpu_manager', {}))
+            manager.update(workload['short_failures'].get('gpu_manager', {}))
+            manager.update(exclusive=True, label='short-failure-extraction')
+            command = [sys.executable, str(Path(__file__).resolve()), args.mode,
+                       '--config', str(args.config.resolve())]
+            if args.extraction_time_limit_seconds is not None:
+                command.extend(['--extraction-time-limit-seconds',str(args.extraction_time_limit_seconds)])
+            return launch_managed(command,
+                                  devices=devices, settings=manager, socket=args.manager_socket,
+                                  priority=100 if args.manager_priority is None else args.manager_priority)
+        if not fill_missing:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        from vesuvius.neural_tracing.fiber_trace_3d.short_failure_benchmark import run
+        run(workload, devices=devices, time_limit_seconds=args.extraction_time_limit_seconds)
+        return 0
     if args.mode == "integration-report":
         from vesuvius.neural_tracing.fiber_trace_3d.embedding_integration_report import report
         report(workload['fixed_path'])

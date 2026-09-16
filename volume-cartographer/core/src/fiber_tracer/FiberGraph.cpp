@@ -510,6 +510,7 @@ struct PersistentRouteHistory {
 };
 
 struct PersistentRouteEvaluation {
+    FiberReplayExcursion excursion;
     std::shared_ptr<const PersistentRouteEvaluation> parent;
     std::shared_ptr<const PersistentRouteHistory> history;
     std::vector<cv::Vec3d> appendedPointsBaseXYZ;
@@ -3032,7 +3033,10 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
     const size_t maximumSegments = static_cast<size_t>(std::ceil(intervalLength / config.minimumResetAdvanceBaseVoxels)) + 2;
     const double seedWindowBase =
         std::max(config.minimumResetAdvanceBaseVoxels, static_cast<double>(graph.anchorCellSizePredictionVoxels()) * graph.predictionToBaseScale());
-    const double seedBroadPhaseBase = fiberReplayTangentialThresholdBaseVoxels(config.errorThresholdBaseVoxels);
+    if (!std::isfinite(config.tangentialThresholdFactor) || config.tangentialThresholdFactor <= 0 ||
+        !std::isfinite(config.excursionGraceBaseVoxels) || config.excursionGraceBaseVoxels < 0)
+        throw std::invalid_argument("invalid fiberlet replay ellipse/grace");
+    const double seedBroadPhaseBase = config.tangentialThresholdFactor * config.errorThresholdBaseVoxels;
     std::set<FiberletStorageKey> consumedNodes;
     std::map<FiberletStorageKey, size_t> nodeIndices;
     std::map<FiberletStorageId, size_t> candidateIndices;
@@ -3062,7 +3066,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                 if (projection.arc + kReplayEpsilon < scanBegin || projection.arc > scanEnd + kReplayEpsilon || projection.distance > seedBroadPhaseBase)
                     continue;
                 const auto thresholdMeasurement =
-                    measureFiberReplayThreshold(node.positionBaseXYZ, projection.point, normalSampler, normalWorkingToBaseScale, config.errorThresholdBaseVoxels);
+                    measureFiberReplayThreshold(node.positionBaseXYZ, projection.point, normalSampler, normalWorkingToBaseScale, config.errorThresholdBaseVoxels, config.tangentialThresholdFactor);
                 if (fiberReplayThresholdExceeded(thresholdMeasurement, config.errorThresholdBaseVoxels))
                     continue;
                 const cv::Vec3d tangent = samplePolylineArc(reference, projection.arc).tangent;
@@ -3204,6 +3208,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
         initialBeam.visitedNodes = persistentVisitedAdd(nullptr, seed->node.id);
         initialBeam.logicalRoute = logicalRoutes.root();
         auto rootEvaluation = std::make_shared<PersistentRouteEvaluation>();
+        rootEvaluation->excursion.graceBaseVoxels = config.excursionGraceBaseVoxels;
         rootEvaluation->appendedPointsBaseXYZ.emplace_back(seed->node.positionBaseXYZ);
         rootEvaluation->appendedMatches.push_back(
             {0, seed->projection.arc, seed->projection.arc, seed->projection.point, resetArc, seed->projection.arc, seed->thresholdMeasurement});
@@ -3264,6 +3269,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                     throw std::logic_error("persistent beam route has zero geometry length");
 
                 auto next = std::make_shared<PersistentRouteEvaluation>();
+                next->excursion = evaluated->excursion;
                 next->parent = evaluated;
                 next->history = historyNode;
                 next->cumulativeEdgeCost = evaluated->cumulativeEdgeCost;
@@ -3287,7 +3293,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                     const auto forwardMatch =
                         matchForwardPolylinePoint(reference, points[pointIndex], next->matchedReferenceArcBase, stepBase, config.matchRefineSteps, referenceEndArcBase);
                     const auto thresholdMeasurement = measureFiberReplayThreshold(
-                        points[pointIndex], forwardMatch.projection.point, normalSampler, normalWorkingToBaseScale, config.errorThresholdBaseVoxels);
+                        points[pointIndex], forwardMatch.projection.point, normalSampler, normalWorkingToBaseScale, config.errorThresholdBaseVoxels, config.tangentialThresholdFactor);
                     next->appendedPointsBaseXYZ.push_back(points[pointIndex]);
                     next->appendedMatches.push_back({
                         next->routePointCount,
@@ -3301,7 +3307,11 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                     ++next->routePointCount;
                     next->lastPointBaseXYZ = points[pointIndex];
                     next->matchedReferenceArcBase = forwardMatch.projection.arc;
-                    if (!next->failure.has_value() && fiberReplayThresholdExceeded(thresholdMeasurement, config.errorThresholdBaseVoxels)) {
+                    const bool excursionFailed = next->excursion.observe(
+                        fiberReplayThresholdExceeded(thresholdMeasurement, config.errorThresholdBaseVoxels), stepBase);
+                    const bool outsideAtEnd = next->matchedReferenceArcBase >= referenceEndArcBase - kReplayEpsilon &&
+                        next->excursion.outsideTravel.has_value();
+                    if (!next->failure.has_value() && (excursionFailed || outsideAtEnd)) {
                         FiberReplayFailure event;
                         event.segmentIndex = result.segments.size();
                         event.reason = "distance_above_threshold";
@@ -3311,6 +3321,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                         event.thresholdMeasurement = thresholdMeasurement;
                         next->failure = std::move(event);
                         next->failureCandidatePathPointIndex = pointIndex;
+                        break;
                     }
                     if (next->matchedReferenceArcBase >= referenceEndArcBase - kReplayEpsilon) {
                         next->reachedReferenceEnd = true;
@@ -3563,6 +3574,21 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
         segment.decisions = std::move(decisions);
         consumedNodes.insert(selectedTraversedNodes.begin(), selectedTraversedNodes.end());
 
+        // Ending outside during the grace window is still a failure, just as
+        // in the ordinary replay evaluator. Never credit an unresolved excursion.
+        const auto terminalEvaluation = evaluateRoute(selectedRoute);
+        if (!distanceFailure && terminalEvaluation->excursion.outsideTravel &&
+            !segment.matches.empty()) {
+            FiberReplayFailure event;
+            event.segmentIndex = result.segments.size();
+            event.reason = "distance_above_threshold";
+            event.referenceArcBase = segment.matches.back().matchedReferenceArcBase;
+            event.evaluatorPointBase = segment.routePointsBaseXYZ.back();
+            event.segmentPointIndex = segment.routePointsBaseXYZ.size() - 1;
+            event.thresholdMeasurement = segment.matches.back().thresholdMeasurement;
+            distanceFailure = std::move(event);
+        }
+
         if (referenceExhausted && !distanceFailure.has_value()) {
             segment.endReferenceArcBase = referenceEndArcBase;
             segment.terminationReason = "reference_end";
@@ -3717,7 +3743,8 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
         {"lookahead_distance_prediction_voxels", config.lookaheadDistanceBaseVoxels / replay.predictionToBaseScale},
         {"cost_mode", replayCostModeName(config.costMode)},
         {"maximum_generated_states_per_iteration", config.maximumGeneratedStatesPerIteration},
-        {"threshold", fiberReplayThresholdDescriptorJson(config.errorThresholdBaseVoxels)},
+        {"threshold", fiberReplayThresholdDescriptorJson(config.errorThresholdBaseVoxels, config.tangentialThresholdFactor)},
+        {"excursion_grace_base_voxels", config.excursionGraceBaseVoxels},
         {"match_refine_steps", config.matchRefineSteps},
         {"minimum_reset_advance_base_voxels", config.minimumResetAdvanceBaseVoxels},
         {"reference_begin_arc_base", config.referenceBeginArcBase},

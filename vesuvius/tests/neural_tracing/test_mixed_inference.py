@@ -99,7 +99,8 @@ def test_model_pools_partition_budget_lifecycle(monkeypatch):
 
 
 @pytest.mark.parametrize("embedding_chunk", [4, 8])
-def test_native_mixed_replay_and_readiness(tmp_path, embedding_chunk):
+@pytest.mark.parametrize("high_descriptors", [False, True])
+def test_native_mixed_replay_and_readiness(tmp_path, embedding_chunk, high_descriptors):
     """Real native sampler/control loop reads base bytes and alternate float embeddings."""
     binary = os.environ.get("VC_REPLAY_TEST_BINARY")
     if not binary:
@@ -149,13 +150,57 @@ def test_native_mixed_replay_and_readiness(tmp_path, embedding_chunk):
         "trace_args": ["--cone-angle-degrees", "0", "--step-voxels", "2", "--embedding-weight", "0.1"],
         "sources": [{"id": "test", "fiber_manifest": str(mixed), "normal_manifest": str(normal),
             "inference_scaledown_power": 0, "base_voxel_size_um": 1, "fibers": [str(annotation)]}]}
-    coordinate_native(evaluation, Path(binary), stores, {"test": ["a", "b"]},
-        {k: s.channels for k, s in stores.items()}, {"a": set(), "b": set()}, {}, (), {},
-        allow_inference=False)
+    from contextlib import ExitStack
+    with ExitStack() as handles:
+        if high_descriptors:
+            import resource
+            if resource.getrlimit(resource.RLIMIT_NOFILE)[0] < 1200:
+                pytest.skip('high-descriptor regression requires fd limit>=1200')
+            while handles.enter_context(open(os.devnull, 'rb')).fileno() < 1100:
+                pass
+        coordinate_native(evaluation, Path(binary), stores, {"test": ["a", "b"]},
+            {k: s.channels for k, s in stores.items()}, {"a": set(), "b": set()}, {}, (), {},
+            allow_inference=False)
     assert all(s.stats["warm_chunks"] > 0 for s in stores.values())
     assert stores["b"].polls > 5
     summary = json.loads((tmp_path / "output/summary.json").read_text())
     assert summary["completed"] and summary["cases"] == 2
+    if not high_descriptors:
+        # Borrowed inference workers survive multiple native replay connections;
+        # only per-batch control/outputs are recreated. No GPU is needed here.
+        from types import SimpleNamespace
+        class IdlePool:
+            busy = False
+            stats = dict(shared_slot_bytes=0,input_slots=1,input_workers=1,result_slots=1)
+            closed = 0
+            def pump(self): pass
+            def close(self): self.closed+=1
+            def queue_snapshot(self):
+                return {k:0 for k in ('requested_chunks_pending','tiles_queued','read_queued',
+                    'read_running','read_done','gpu_submitted_uncollected','input_slots_free',
+                    'input_slots_capacity','tiles_accumulating','publications_queued','publications_submitted')}
+        pool=IdlePool()
+        session=SimpleNamespace(pool=pool,gpu_lease=None,close=pool.close)
+        for i in range(2):
+            repeat=dict(evaluation,output=str(tmp_path/f'repeat-{i}'))
+            coordinate_native(repeat,Path(binary),stores,{'test':['a','b']},
+                {k:s.channels for k,s in stores.items()},{'a':set(),'b':set()},{},(),{},
+                allow_inference=False,inference_session=session)
+            assert pool.closed==0
+            result=json.loads((Path(repeat['output'])/'inference_summary.json').read_text())
+            assert result['reused_worker_pool'] is True
+            assert all(v['warm_chunks']==0 for v in result['sources'].values())
+            assert json.loads((Path(repeat['output'])/'summary.json').read_text())['failures']==summary['failures']
+        # A poisoned replay invalidates/closes borrowed resources exactly once.
+        original_request=stores['a'].request
+        def fail(*args,**kwargs): raise RuntimeError('synthetic demand failure')
+        stores['a'].request=fail
+        with pytest.raises(RuntimeError,match='synthetic demand failure'):
+            coordinate_native(dict(evaluation,output=str(tmp_path/'failed')),Path(binary),stores,
+                {'test':['a','b']},{k:s.channels for k,s in stores.items()},
+                {'a':set(),'b':set()},{},(),{},allow_inference=False,inference_session=session)
+        stores['a'].request=original_request
+        assert pool.closed==1
 
 
 def test_cached_helpers_reject_composite_explicitly(tmp_path):
