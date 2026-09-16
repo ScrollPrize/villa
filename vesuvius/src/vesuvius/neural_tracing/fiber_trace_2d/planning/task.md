@@ -1,3 +1,5 @@
-# Merge refinement into the committed embedding/evaluation branch
+# Best and latest EMA999 run212757
 
-Commit the current state, then merge fiber-training-refinement into fiber-vischeck. Preserve both feature sets and historical planning/results. Validate without launching training/evaluations.
+Evaluate best and current EMA999 from5scroll_json_eligible_refinement_128_sd1_16x8_ema_20260915_212757 on full50fiber cohort without embeddings.
+
+Follow-up: run full visualization for the frozen bestu22000 snapshot, reusing inference cache.

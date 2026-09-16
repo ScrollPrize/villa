@@ -1,3 +1,53 @@
+## 2026-09-16 — Refinement run212757 best/latest EMA999
+
+- Both full50-fiber evaluations completed without embedding/rendering.
+  Bestu22000:99restarts/68.676mm mean/11.129median, new overall leader.
+  Latestu37100:105/64.789/9.837. Latest−4restarts on0139,+10onParis4.
+- Sequential8GPUexclusive evaluations; frozen before either run. Full historical
+  and per-scroll report: docs/benchmarks/refinement_212757_ema999_best_current_20260916.md.
+
+## 2026-09-15 — Refinement run185710 best EMA99 u17800
+
+- Full50-fiber noembedding evaluation:106restarts,64.183mm mean,
+  10.856mm median. Better than rawu13300 (126),close to EMA999u16500(103).
+- Highest combined median in recorded comparison; best restarts/mean remains
+  EMA999u16500. No rendering. Report/provenance:
+  docs/benchmarks/refinement_185710_best_ema99_u17800_20260915.md.
+
+## 2026-09-15 — Refinement run185710 best raw u13300
+
+- Best raw (test/loss_total selected) full50fiber evaluation:126restarts,
+  54.076mm mean,9.653mm median. Payload model weights used, EMA bank ignored.
+- Best measured EMA999u16500 remains103/66.035. Full table/provenance in
+  docs/benchmarks/refinement_185710_best_raw_u13300_20260915.md.
+- No embedding/rendering. All8GPUs; inference/coordinator345.703s.
+
+## 2026-09-15 — Refinement EMA999 u24200 repeat
+
+- Latest same-run EMA999 regressed:114restarts/59.718mm mean versus
+  u16500 103/66.035; u16500 remains best measured no-embedding checkpoint.
+- Full50-fiber fixedGT protocol unchanged. Dense loss also increased.
+  Report: docs/benchmarks/refinement_131854_ema999_u24200_20260915.md.
+- u16500 visualization verified complete180renders/index and103restarts.
+
+## 2026-09-15 — Refinement run131854 EMA999 u16500 evaluation
+
+- Full50-fiber original-GT no-embedding evaluation completed:103restarts,
+  66.035mm mean,10.504mm median; versusu14400 111/61.318/10.512.
+- All8GPUs, inference/coordinator344.292s. Full comparison/provenance in
+  docs/benchmarks/refinement_131854_ema999_u16500_20260915.md.
+- Previousu14400 visualization also verified completed:180renders,per-fiber
+  index,111restarts unchanged. No rendering requested for this new snapshot.
+
+## 2026-09-15 — Refinement EMA999 u14400 full evaluation
+
+- Frozen latest EMA999 from refinement run20260915_120327; full original-GT
+  50-fiber/180-direction evaluation without embedding or rendering completed.
+- 111 filtered restarts,61.318mm mean,10.512mm median, versus previous
+  non-embedding EMA999u11800 at113/60.242/9.337. Mixed per-scroll changes.
+- All8GPUs via exclusive manager; inference wall343.647s. Full historical and
+  per-scroll comparison/provenance: docs/benchmarks/refinement_ema999_u14400_20260915.md.
+
 ## 2026-09-15 — Merge refinement and embedding/evaluation work
 
 - Committed embedding/evaluation state as de6fc71e8, then merged
