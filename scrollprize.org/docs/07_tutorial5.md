@@ -113,13 +113,15 @@ Now let's train a model. The rest of this tutorial is hands-on: you will set up 
 
 ### The dataset
 
-The tutorial uses the [`ink-labels` dataset](/data_datasets#ink-labels-2026-07), which lives in the [`scrollprize/datasets` storage bucket](https://huggingface.co/buckets/scrollprize/datasets/tree/ink) on Hugging Face, organized by scroll. The full dataset is hundreds of GB, so the whole tutorial runs end-to-end on **one segment** of PHerc. Paris 4 (Scroll 1) — about 25 GB:
+The tutorial uses the [`ink-labels` dataset](/data_datasets#ink-labels-2026-07), which lives in the [`scrollprize/datasets` storage bucket](https://huggingface.co/buckets/scrollprize/datasets/tree/ink) on Hugging Face, organized by scroll. The full dataset is hundreds of GB, so the whole tutorial runs end-to-end on **one segment** of PHerc. Paris 4 (Scroll 1) — about 92 GB, because the segment ships its surface volume at all six pyramid levels (level 0 alone is 67 GB):
 
 ```bash
 uvx --from huggingface_hub hf buckets sync \
   hf://buckets/scrollprize/datasets/ink/phercparis4/w00_20231016151002 \
   ./ink-dataset/phercparis4/w00_20231016151002
 ```
+
+Training at full resolution only reads the level-0 chunks under the labeled regions, about 3 GB of those 92 GB. If disk or bandwidth is tight, [download just that part](#small-gpu-or-small-disk) instead.
 
 `hf buckets sync` works like `rsync`: re-running it resumes interrupted downloads and only transfers what changed. If you hit rate limits, create a free account, generate a read token under **Settings → Access Tokens**, and either run `uvx --from huggingface_hub hf auth login` once or set `HF_TOKEN=hf_...` in your environment.
 
@@ -172,6 +174,8 @@ git clone https://github.com/ScrollPrize/villa.git
 cd villa/vesuvius
 uv sync --extra models
 ```
+
+If `uv sync --extra models` stops with `Could not find a package configuration file provided by "Ceres"`, it is building the C++ `volume-cartographer` bindings, which ink detection does not use (see [villa#1706](https://github.com/ScrollPrize/villa/pull/1706)). Skip them with `uv sync --extra models --no-install-package volume-cartographer`.
 
 `uv sync --extra models` creates a virtual environment and installs the exact locked dependencies (PyTorch, zarr, and friends). The `models` extra is the machine-learning stack; every command below passes it too. Verify that PyTorch sees your GPU:
 
@@ -245,7 +249,7 @@ The trainer discovers your segments, finds all training patches inside the super
 If your dataset includes segments with validation masks, the model is also evaluated on those held-out regions at each validation step, reporting balanced accuracy — how well it detects ink in areas it was never trained on. If training loss keeps dropping while validation accuracy stalls, the model is starting to overfit your labels. (The tutorial segment has no validation mask, so this first run reports training loss only.) You can stop training at any time with `ctrl+c` and use the most recently saved checkpoint.
 
 :::tip
-If you run out of GPU memory, reduce `batch_size` to 1, or reduce the `patch_size` to `[64, 128, 128]`. For multi-GPU training, launch through Accelerate instead: `uv run --extra models accelerate launch --num_processes 2 --module vesuvius.ink_detection.training.train configs/ink_tutorial.json`.
+If you run out of GPU memory, reduce `batch_size` to 1, or reduce the `patch_size` to `[64, 128, 128]`. On Windows and WSL2 you may never see an out-of-memory error: the NVIDIA driver moves the overflow into system RAM and training just gets 20–100× slower. If `nvidia-smi` shows the card full and each iteration takes seconds, treat that as running out of memory. [Measured settings for a 6 GB card](#small-gpu-or-small-disk) are below. For multi-GPU training, launch through Accelerate instead: `uv run --extra models accelerate launch --num_processes 2 --module vesuvius.ink_detection.training.train configs/ink_tutorial.json`.
 :::
 
 :::tip
@@ -284,6 +288,47 @@ Here is the result on the tutorial segment — the model's prediction in white, 
   <a href="/img/tutorials/ink-prediction-w00.webp" target="_blank"><img src="/img/tutorials/ink-prediction-w00.webp" /></a>
   <figcaption className="mt-0">The trained model's ink prediction for the tutorial segment. Red: the handful of letters it was trained on. Everything else it found on its own.</figcaption>
 </figure>
+
+### Small GPU or small disk
+
+The commands above assume a data-center GPU and room for the whole segment. Both can be scaled down.
+
+**Download only what training reads.** `select_flat_training_chunks` runs the trainer's own patch discovery on the labels and cuts a sync plan down to the level-0 chunks your config actually reads. Run all three steps from the same directory:
+
+```bash
+# 1. labels, Zarr metadata and x.tif (segment discovery requires it): ~70 MB
+uvx --from huggingface_hub hf buckets sync \
+  hf://buckets/scrollprize/datasets/ink/phercparis4/w00_20231016151002 \
+  ./ink-dataset/phercparis4/w00_20231016151002 \
+  --include "*_inklabels.zarr/*" --include "*_supervision_mask.zarr/*" --include "*_validation_mask.zarr/*" \
+  --include "*.zarr/.z*" --include "*.zarr/0/.z*" --include "x.tif" --include "meta.json"
+
+# 2. the full plan, without downloading anything
+uvx --from huggingface_hub hf buckets sync \
+  hf://buckets/scrollprize/datasets/ink/phercparis4/w00_20231016151002 \
+  ./ink-dataset/phercparis4/w00_20231016151002 --plan full.jsonl
+
+# 3. keep what the config reads, then download it
+uv run --extra models python -m vesuvius.ink_detection.preprocessing.select_flat_training_chunks \
+  configs/ink_tutorial.json full.jsonl subset.jsonl
+uvx --from huggingface_hub hf buckets sync --apply subset.jsonl
+```
+
+For the tutorial segment this keeps 3,534 of 101,304 level-0 chunks (2.95 GB) with `patch_size [64, 256, 256]`, and 2,862 chunks (2.42 GB) with `[64, 128, 128]`. Step 1 is many small files (12,625 files, 70 MB) and took 13 minutes here; step 3 runs patch discovery and took about 3.5 minutes. Selecting the chunks is config-specific: if you change `patch_size`, `patch_overlap`, `patch_min_labeled_coverage` or the labels, rerun step 3.
+
+**Settings that fit a 6 GB GPU.** Measured on an RTX 3060 Laptop GPU (6 GB), driver 616.92, WSL2, `torch 2.12.1+cu130`, on the tutorial segment with `mixed_precision: fp16` and `dataloader_workers: 4`. Steady-state time per iteration after 20 iterations; "spills" means the card was full and the driver moved memory into system RAM (see the tip above):
+
+| `patch_size` | `batch_size` | s / iteration | GPU memory | |
+|---|---|---|---|---|
+| `[64, 128, 128]` | 2 | **0.50** | 4.4 GB | fits; 200 iterations in 5.5 min, 20,000 in about 3 h |
+| `[64, 128, 128]` | 4 | 10.3 | full | spills |
+| `[64, 128, 128]` | 8 | 53.8 | full | spills |
+| `[64, 128, 128]` | 16, 32 | — | full | out of memory at ~17 GB allocated |
+| `[64, 256, 256]` | 1 | 10.5 | full | spills |
+| `[64, 256, 256]` | 2 (tutorial) | ~44 | full | spills |
+| `[64, 256, 256]` | 8 | — | full | out of memory at ~17 GB allocated |
+
+Inference needs far less: with the 9 µm checkpoint `hybrid_3d2d-seed42/step-075000.pth` on the w035 render (6,458 patches), `--batch-size 8` peaked at 0.6 GB, `32` at 1.5 GB and `128` at 4.9 GB, all finishing in about 1 min 40 s; most of that is startup, `torch.compile` and data loading, not the GPU.
 
 ### Native 3D: training and inference
 
@@ -560,7 +605,7 @@ uv run --extra models python -m vesuvius.ink_detection.inference.infer \
   --batch-size 32
 ```
 
-The `--batch-size 32` assumes a large GPU; drop it to 4 or 1 if you run out of memory.
+`--batch-size 32` needs about 1.5 GB of GPU memory with these checkpoints ([measurements](#small-gpu-or-small-disk)); drop it to 4 or 1 if you run out of memory.
 
 Checkpoints embed their training config, so inference rebuilds the model and its normalization automatically. Two things to know when reading the output:
 
