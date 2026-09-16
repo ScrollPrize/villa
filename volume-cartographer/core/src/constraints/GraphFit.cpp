@@ -1,31 +1,103 @@
 #include "GraphInternal.hpp"
 #include "GraphFiberJunctions.hpp"
+#include "GraphPrepared.hpp"
+#include "GraphFitCosts.hpp"
 #include "vc/core/util/SymmetricDirichlet.hpp"
 #include <ceres/ceres.h>
 #include <set>
 #include <tuple>
+#include <cstdlib>
+#include <iostream>
+#include <sstream>
+#include <numeric>
+#include <ranges>
+#include <chrono>
 
 namespace vc::constraints {
 namespace {
-struct Region {
-    cv::Vec2d low{INFINITY,INFINITY},high{-INFINITY,-INFINITY};
-    void include(cv::Vec2d p) {for(int d=0;d<2;++d){low[d]=std::min(low[d],p[d]);high[d]=std::max(high[d],p[d]);}}
-    Region padded(double margin)const {return {low-cv::Vec2d::all(margin),high+cv::Vec2d::all(margin)};}
-    bool contains(cv::Vec2d p)const {return p[0]>=low[0]&&p[1]>=low[1]&&p[0]<=high[0]&&p[1]<=high[1];}
-};
+using Region=detail::ChartRegion;
 struct LocalFit {
     const FitResult& committed;
     Region region;
     std::map<std::string,std::vector<unsigned char>> movable;
     size_t count=0,total=0;
     bool expand=false;
-    bool moves(const std::string& id,int i)const {return movable.at(id)[i]!=0;}
+    const PreparedGraph* prepared=nullptr;
+    std::shared_ptr<const detail::FiberJunctions> geometry;
+    std::map<std::string,std::vector<size_t>> chartTriangles;
+    std::vector<Link> contacts;
+    std::vector<detail::PreparedContact> weights;
+    std::vector<size_t> contactIds;
+    std::set<std::string> parameterNodes;
+    const GraphEdit* edit=nullptr;
+    bool fixedReference=false;
+    bool moves(const std::string& id,int i)const {auto it=movable.find(id);return it!=movable.end()&&it->second[i]!=0;}
     bool added(const std::string& id)const {return !committed.graph.nodes.contains(id);}
 };
+double attachmentRms(const Graph& graph,const LocalFit* local){
+    if(!local||!local->prepared){
+        double squared=0;for(const auto& link:graph.links.read()){const auto e=detail::linkError(graph,link);squared+=e.dot(e);}
+        return graph.links.empty()?0:std::sqrt(squared/graph.links.size());
+    }
+    const auto& base=*local->prepared;
+    auto errors=base.squaredErrors;
+    for(size_t i=0;i<local->contacts.size();++i){
+        if(local->contactIds[i]>=errors.size())continue;
+        const auto& l=local->contacts[i];const auto& w=local->weights[i];
+        const auto e=detail::interpolate(graph.nodes.at(l.a.node).uv,w.a)-detail::interpolate(graph.nodes.at(l.b.node).uv,w.b);
+        errors[local->contactIds[i]]=e.dot(e);
+    }
+    const std::set<size_t> removed(local->edit->removedLinks.begin(),local->edit->removedLinks.end());
+    double squared=0;size_t count=0;
+    for(size_t i=0;i<errors.size();++i)if(!removed.contains(i)){squared+=errors[i];++count;}
+    for(const auto& l:local->edit->addedLinks){const auto e=detail::linkError(graph,l);squared+=e.dot(e);++count;}
+    return count?std::sqrt(squared/count):0;
+}
+void selectActiveCharts(const Graph& graph,LocalFit& local){
+    for(const auto& [id,p]:graph.nodes){
+        local.total+=p.uv.size();
+        if(local.fixedReference&&!local.added(id))continue;
+        if(local.prepared&&!local.added(id)&&!local.prepared->charts.at(id).bounds.intersects(local.region))continue;
+        auto& mask=local.movable[id];mask.resize(p.uv.size());
+        for(size_t i=0;i<p.uv.size();++i){mask[i]=detail::valid(p.source->xyz[i])&&(local.added(id)||local.region.contains(p.uv[i]));local.count+=mask[i];}
+        if(local.prepared){
+            auto& triangles=local.chartTriangles[id];
+            if(local.added(id)){triangles.resize(p.source->triangles.size());std::iota(triangles.begin(),triangles.end(),0);}
+            else triangles=local.prepared->charts.at(id).query(local.region,*p.source);
+            local.parameterNodes.insert(id);
+        }
+    }
+    if(!local.prepared)return;
+    const auto& base=*local.prepared;
+    std::set<size_t> incident,removed(local.edit->removedLinks.begin(),local.edit->removedLinks.end());
+    for(const auto& [id,mask]:local.movable)if(auto it=base.incident.find(id);it!=base.incident.end())incident.insert(it->second.begin(),it->second.end());
+    auto append=[&](const Link& link,const detail::PreparedContact& weights,size_t id){
+        bool moves=false;for(int i=0;i<3;++i)moves|=local.moves(link.a.node,weights.a.indices[i])||local.moves(link.b.node,weights.b.indices[i]);
+        if(!moves)return;
+        local.contacts.push_back(link);local.weights.push_back(weights);local.contactIds.push_back(id);
+        local.parameterNodes.insert(link.a.node);local.parameterNodes.insert(link.b.node);
+    };
+    for(size_t i:incident)if(!removed.contains(i))append(base.accepted.graph.links[i],base.contacts[i],i);
+    for(const auto& link:local.edit->addedLinks){auto [a,b]=detail::linkWeights(graph,link);append(link,{a,b},base.contacts.size());}
+}
+const std::vector<Link>& fitContacts(const Graph& graph,const LocalFit* local){
+    return local&&local->prepared?local->contacts:graph.links.read();
+}
+auto fitTriangles(const Node& node,const LocalFit* local){
+    const std::vector<size_t>* indices=nullptr;
+    if(local&&local->prepared){
+        auto it=local->chartTriangles.find(node.id);
+        if(it!=local->chartTriangles.end())indices=&it->second;
+    }
+    return std::views::iota(size_t(0),indices?indices->size():node.triangles.size())|
+        std::views::transform([&node,indices](size_t i)->const cv::Vec3i&{return node.triangles[indices?(*indices)[i]:i];});
+}
 // The chart's bounding rectangle is often mostly empty between ribbons.
 // Keep only an integer lookup there; XYZ scratch data belongs to covered sites.
 struct RasterSample {
-    cv::Vec3d sum{0,0,0},normal{0,0,0},point{-1,-1,-1};
+    // target: the rasterized position the fidelity term pulls toward.
+    // point: the optimized position, which may start elsewhere.
+    cv::Vec3d sum{0,0,0},normal{0,0,0},point{-1,-1,-1},target{-1,-1,-1};
     double mass=0;
     int owner=-1,visited=-1;
     bool active=false;
@@ -50,32 +122,6 @@ public:
             ordered.push_back(samples_[index]);index=int(ordered.size()-1);
         }
         samples_=std::move(ordered);
-    }
-};
-struct ChartMetric {
-    double inv00,inv01,inv11,weight,orientation;
-    template<class T> bool operator()(const T* a,const T* b,const T* c,T* r) const {
-        const T j00=(b[0]-a[0])*T(inv00), j10=(b[1]-a[1])*T(inv00);
-        const T j01=(b[0]-a[0])*T(inv01)+(c[0]-a[0])*T(inv11);
-        const T j11=(b[1]-a[1])*T(inv01)+(c[1]-a[1])*T(inv11);
-        const T determinant=j00*j11-j01*j10;
-        // Refuse flipped/degenerate trial steps, rather than regularizing an
-        // inverse through zero and silently accepting a reflected element.
-        if(dirichletValue(determinant)*orientation<=1e-8) return false;
-        const T w=T(weight);
-        r[0]=w*j00;r[1]=w*j01;r[2]=w*j10;r[3]=w*j11;
-        r[4]=w*j11/determinant;r[5]=-w*j01/determinant;
-        r[6]=-w*j10/determinant;r[7]=w*j00/determinant;
-        return true;
-    }
-};
-struct Match {
-    std::vector<double> coefficients;
-    double weight;
-    template<class T> bool operator()(T const* const* p,T* r) const {
-        r[0]=T(0);r[1]=T(0);
-        for(size_t i=0;i<coefficients.size();++i) for(int d=0;d<2;++d) r[d]+=p[i][d]*T(coefficients[i]*weight);
-        return true;
     }
 };
 struct Direction {
@@ -118,6 +164,16 @@ double axisRotation(const Placement& p) {
     const double target=n.direction=='H'?0:std::acos(-1.0)/2;
     return std::remainder(target-std::atan2(delta[1],delta[0]),std::acos(-1.0));
 }
+struct RigidDirection {
+    cv::Vec2d delta;
+    int axis;
+    double weight;
+    template<class T> bool operator()(const T* pose,T* r) const {
+        const T c=cos(pose[0]),s=sin(pose[0]);
+        r[0]=T(weight)*(axis==0?c*T(delta[0])-s*T(delta[1]):s*T(delta[0])+c*T(delta[1]));
+        return true;
+    }
+};
 struct RigidMatch {
     cv::Vec2d a,b;
     double weight;
@@ -146,16 +202,53 @@ struct HorizontalAnchor {
 };
 struct Cancellation : ceres::IterationCallback {
     const std::atomic_bool* cancel;
-    explicit Cancellation(const std::atomic_bool* c):cancel(c){}
-    ceres::CallbackReturnType operator()(const ceres::IterationSummary&) override {
-        return cancel&&cancel->load()?ceres::SOLVER_ABORT:ceres::SOLVER_CONTINUE;
+    Progress progress;
+    std::string phase;
+    int limit;
+    std::chrono::steady_clock::time_point last{};
+    explicit Cancellation(const std::atomic_bool* c,Progress p={},std::string name={},int iterations=0)
+        :cancel(c),progress(std::move(p)),phase(std::move(name)),limit(iterations){}
+    ceres::CallbackReturnType operator()(const ceres::IterationSummary& iteration) override {
+        if(cancel&&cancel->load())return ceres::SOLVER_ABORT;
+        const auto now=std::chrono::steady_clock::now();
+        if(progress&&(iteration.iteration==0||iteration.iteration==limit||now-last>=std::chrono::milliseconds(500))) {
+            progress(phase+": iteration "+std::to_string(iteration.iteration)+" (limit "+std::to_string(limit)+", may finish earlier)");
+            last=now;
+        }
+        return ceres::SOLVER_CONTINUE;
     }
 };
+// Local edits fit onto the accepted fibers instead of bending them. A patch
+// has far more chart area near a contact than a seven-row ribbon, so with
+// equal weights it wins and the fiber curves inside its dead band; later
+// edits then inherit that curvature. In a local fit, all fibers resist
+// chart deformation ten times harder (a hundredfold in cost) and an added
+// patch half as hard. Source XYZ is never rewritten; only the flattened
+// placement changes. The full solver keeps its uniform weights: with stiff
+// fibers it would have to translate them to satisfy contacts, which a local
+// fit's frozen surroundings forbid, and its refit layouts rejected proposals
+// that the local weighting accepts.
+double tunable(const char* name,double fallback) {
+    // Experiment overrides only; the defaults are the documented behavior.
+    if(const auto* value=std::getenv(name))return std::atof(value);
+    return fallback;
+}
+const double referenceFiberWeight=tunable("VC3D_CONSTRAINT_FIT_FIBER_WEIGHT",10);
+const double addedPatchWeight=tunable("VC3D_CONSTRAINT_FIT_PATCH_WEIGHT",.5);
+int solverThreads() {
+    // Opt-in for experiments: parallel residual/Jacobian evaluation only.
+    if(const auto* value=std::getenv("VC3D_CONSTRAINT_FIT_THREADS"))return std::max(1,std::atoi(value));
+    return 1;
+}
 ceres::Solver::Options solverOptions(Cancellation& callback,int iterations) {
     ceres::Solver::Options options;options.linear_solver_type=ceres::SPARSE_NORMAL_CHOLESKY;
-    options.num_threads=1;options.max_num_iterations=iterations;options.callbacks.push_back(&callback);
+    options.num_threads=solverThreads();options.max_num_iterations=iterations;options.callbacks.push_back(&callback);
     options.function_tolerance=1e-7;options.gradient_tolerance=1e-8;
     return options;
+}
+void profileSolve(const char* stage,const ceres::Solver::Summary& summary) {
+    if(std::getenv("VC3D_PROFILE_CONSTRAINT_FIT"))
+        std::clog<<"Constraint fit: "<<stage<<'\n'<<summary.FullReport()<<std::endl;
 }
 double triangleOrientation(const Placement& p,const cv::Vec3i& t) {
     return detail::cross(p.uv[t[1]]-p.uv[t[0]],p.uv[t[2]]-p.uv[t[0]]);
@@ -185,7 +278,14 @@ FitResult renderProposalSources(const Graph& draft,const Graph& committed,const 
     for(const auto& [id,p]:draft.nodes)if(!committed.nodes.contains(id)||id==selected)graph.nodes.emplace(id,p);
     for(const auto& l:draft.links)if(graph.nodes.contains(l.a.node)&&graph.nodes.contains(l.b.node))graph.links.push_back(l);
     if(graph.nodes.empty())return {};
-    graph.seed=graph.nodes.begin()->first;return render(std::move(graph),cancel);
+    graph.seed=graph.nodes.begin()->first;return renderPlacement(std::move(graph),cancel);
+}
+FitResult renderProposalSources(const GraphEdit& edit,const std::string& selected,const std::atomic_bool* cancel){
+    Graph graph;graph.settings=edit.base->accepted.graph.settings;graph.nodes=edit.addedNodes;
+    if(auto it=edit.base->accepted.graph.nodes.find(selected);it!=edit.base->accepted.graph.nodes.end())graph.nodes.emplace(*it);
+    for(const auto& link:edit.addedLinks)if(graph.nodes.contains(link.a.node)&&graph.nodes.contains(link.b.node))graph.links.push_back(link);
+    if(graph.nodes.empty())return {};
+    graph.seed=graph.nodes.begin()->first;return renderPlacement(std::move(graph),cancel);
 }
 FitResult renderSourceLayer(const Graph& fitted,bool fibers,const std::atomic_bool* cancel) {
     Graph graph;graph.settings=fitted.settings;
@@ -197,16 +297,32 @@ FitResult renderSourceLayer(const Graph& fitted,bool fibers,const std::atomic_bo
 }
 namespace {
 FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,LocalFit* local=nullptr,
-                        const cv::Mat_<cv::Vec3f>* saved=nullptr,const cv::Vec2d* savedOrigin=nullptr) {
+                        const cv::Mat_<cv::Vec3f>* saved=nullptr,const cv::Vec2d* savedOrigin=nullptr,const Progress& progress={}) {
     FitResult result;result.graph=std::move(graph);auto& g=result.graph;
     if(g.nodes.empty()) {result.message="Graph is empty";return result;}
-    const detail::FiberJunctions junctions(g,!saved);
+    const auto ownedGeometry=local&&local->geometry?nullptr:std::make_shared<detail::FiberJunctions>(g,!saved);
+    const auto& junctions=local&&local->geometry?*local->geometry:*ownedGeometry;
     double spacing=g.settings.spacing;
     cv::Vec2d low{INFINITY,INFINITY},high{-INFINITY,-INFINITY};
     std::vector<double> stretches;
+    std::map<std::string,detail::ChartIndex> changedIndexes;
+    auto chartIndex=[&](const std::string& id,const Placement& p)->const detail::ChartIndex&{
+        const auto before=local->committed.graph.nodes.find(id);
+        if(before!=local->committed.graph.nodes.end()&&p.uv.sharesStorage(before->second.uv))return local->prepared->charts.at(id);
+        return changedIndexes.try_emplace(id,p).first->second;
+    };
     for(const auto& [id,p]:g.nodes) {
         if(p.uv.size()!=p.source->xyz.size()) throw std::runtime_error("Source/placement size mismatch");
         const auto& xyz=junctions.points(*p.source);
+        if(local&&local->prepared&&!local->added(id)){
+            const auto& before=local->committed.graph.nodes.at(id);
+            if(p.uv.sharesStorage(before.uv)&&&xyz==&local->prepared->junctions->points(*p.source)){
+                const auto& bounds=local->prepared->charts.at(id).bounds;
+                for(int d=0;d<2;++d){low[d]=std::min(low[d],bounds.low[d]);high[d]=std::max(high[d],bounds.high[d]);}
+                const auto& cached=local->prepared->chartStretches.at(id);stretches.insert(stretches.end(),cached.begin(),cached.end());
+                continue;
+            }
+        }
         double sign=0;
         for(const auto& t:p.source->triangles) {
             auto det=triangleOrientation(p,t);
@@ -246,18 +362,29 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
         const int x=int(std::lround(at[0])),y=int(std::lround(at[1]));
         return x>=0&&y>=0&&x<grid.cols&&y<grid.rows?cv::Vec3d(grid(y,x)):cv::Vec3d{-1,-1,-1};
     };
+    if(progress)progress("Building output surface samples");
+    auto rasterProgress=std::chrono::steady_clock::now();
     RasterSamples samples(count);
     std::vector<unsigned char> coverage(count,0);
     std::vector<std::string> ids;
     std::set<std::pair<std::string,std::string>> linked;
-    for(const auto& l:g.links) linked.insert(std::minmax(l.a.node,l.b.node));
+    if(local&&local->edit)linked=detail::editedPairs(*local->edit);
+    else for(const auto& l:g.links.read()) linked.insert(std::minmax(l.a.node,l.b.node));
     size_t conflicts=0;int ordinal=0;
     // Synthetic ribbons are support only; real patches replace that support.
     for(bool fiber:{true,false}) for(const auto& [id,p]:g.nodes) {
         if(p.source->fiber!=fiber) continue;
         detail::cancelled(cancel);const auto& n=*p.source;int current=ordinal++;ids.push_back(id);
         const auto& geometry=junctions.points(n);
-        for(const auto& t:n.triangles) {
+        const auto now=std::chrono::steady_clock::now();
+        if(progress&&(ordinal==1||now-rasterProgress>=std::chrono::milliseconds(500))) {
+            progress("Building output surface: source "+std::to_string(ordinal)+" / "+std::to_string(g.nodes.size()));rasterProgress=now;
+        }
+        std::vector<size_t> selectedTriangles;
+        const bool indexed=local&&local->prepared;
+        if(indexed)selectedTriangles=chartIndex(id,p).query({low,low+cv::Vec2d(cols-1,rows-1)*spacing},n);
+        for(size_t ti=0;ti<(indexed?selectedTriangles.size():n.triangles.size());++ti) {
+            const auto& t=n.triangles[indexed?selectedTriangles[ti]:ti];
             cv::Vec2d a=(p.uv[t[0]]-low)/spacing,b=(p.uv[t[1]]-low)/spacing,c=(p.uv[t[2]]-low)/spacing;
             auto normal=detail::unit((geometry[t[1]]-geometry[t[0]]).cross(geometry[t[2]]-geometry[t[0]]));
             if(detail::cross(b-a,c-a)<0) normal*=-1;
@@ -321,6 +448,17 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
     for(size_t i=0;i<count;++i)if(samples[i].mass) {
         auto& s=samples.at(i);
         s.point=saved?cv::Vec3d((*saved)(int(i)/cols,int(i)%cols)):(local&&!movable(int(i))?previous(int(i)):s.sum/s.mass);
+        s.target=s.point;
+        // The accepted surface around a local edit was relaxed by an earlier
+        // solve and sits up to tens of voxels from raw raster positions. Fresh
+        // raster samples next to that frozen ring start the relaxation from a
+        // torn grid, which it repairs with large moves that can fold a patch.
+        // Start free samples where the accepted surface already is; fidelity
+        // still pulls them toward the new raster positions.
+        if(refine&&local&&movable(int(i))) {
+            const auto old=previous(int(i));
+            if(detail::valid(old))s.point=old;
+        }
     }
     // Preserve the dense grid's parameter address order as well as residual
     // order, so Ceres uses the same ordering in its sparse factorization.
@@ -343,12 +481,18 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
     for(size_t i=0;i<count;++i)if(samples[i].active)active.push_back(int(i));
     if(active.empty()){result.message="No complete quads after rasterization";return result;}
     if(refine) {
-        for(int i:active)if(movable(i))problem.AddResidualBlock(new ceres::AutoDiffCostFunction<Fidelity,3,3>(new Fidelity{point(i),5.0/spacing}),nullptr,point(i).val);
+        for(int i:active)if(movable(i))problem.AddResidualBlock(new ceres::AutoDiffCostFunction<Fidelity,3,3>(new Fidelity{samples[i].target,5.0/spacing}),nullptr,point(i).val);
         for(const auto& t:triangles) problem.AddResidualBlock(vc::SymmetricDirichletLoss::Create(spacing,g.settings.stiffness,1e-8,0),nullptr,point(t[0]).val,point(t[1]).val,point(t[2]).val);
         // Rasterization and metric regularization must not pull an explicit
         // H/V junction back between the front and back of the sheet. Anchor
         // the rendered bilinear sample itself to the horizontal position.
-        for(const auto& link:g.links) {
+        std::vector<Link> junctionLinks;
+        if(local&&local->edit){
+            const std::set<size_t> removed(local->edit->removedLinks.begin(),local->edit->removedLinks.end());
+            for(size_t i:local->prepared->junctionLinks)if(!removed.contains(i))junctionLinks.push_back(local->committed.graph.links[i]);
+            junctionLinks.insert(junctionLinks.end(),local->edit->addedLinks.begin(),local->edit->addedLinks.end());
+        }
+        for(const auto& link:local&&local->edit?junctionLinks:g.links.read()) {
             const auto [h,v]=detail::horizontalVerticalLink(g,link);if(!h)continue;
             const auto& horizontal=*g.nodes.at(h->node).source;
             const auto at=(placedLocation(g,*h)-low)/spacing;
@@ -366,7 +510,7 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
                 nullptr,point(a).val,point(b).val,point(c).val,point(d).val);
         }
         if(local)for(int i:active)if(!movable(i))problem.SetParameterBlockConstant(point(i).val);
-        Cancellation cb(cancel);auto options=solverOptions(cb,12);ceres::Solver::Summary summary;ceres::Solve(options,&problem,&summary);detail::cancelled(cancel);
+        Cancellation cb(cancel,progress,"Refining output surface",12);auto options=solverOptions(cb,12);ceres::Solver::Summary summary;ceres::Solve(options,&problem,&summary);profileSolve("surface",summary);detail::cancelled(cancel);
         if(!summary.IsSolutionUsable()){result.message="Shared surface fit failed: "+summary.BriefReport();return result;}
     }
     if(local) {
@@ -383,16 +527,36 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
         }
         if(local->expand){result.message="Surface adjustment reaches the local boundary";return result;}
         result.localSurfaceSamples=std::count_if(active.begin(),active.end(),movable);
+        result.changedSurfaceBounds=std::array<cv::Vec2d,2>{local->region.low,local->region.high};
     }
     cv::Mat_<cv::Vec3f> grid=saved?saved->clone():cv::Mat_<cv::Vec3f>(rows,cols,cv::Vec3f{-1,-1,-1});
     for(int i:active) grid(i/cols,i%cols)=cv::Vec3f(point(i));
-    for(const auto& t:triangles) {
+    // A checksum-verified saved grid has already passed fit validation. Its
+    // fused/corrected normals can differ from the immutable source ribbons;
+    // reopening must not prune it again against those original normals.
+    if(!saved)for(const auto& t:triangles) {
         auto cross=(point(t[1])-point(t[0])).cross(point(t[2])-point(t[0]));
         auto reference=samples[t[0]].normal+samples[t[1]].normal+samples[t[2]].normal;
         if(cv::norm(cross)<1e-6||cross.dot(reference)<=0) {
             bool support=false;for(int i:t.val) support|=g.nodes.at(ids[samples[i].owner]).source->fiber;
             support|=samples[t[0]].owner!=samples[t[1]].owner||samples[t[0]].owner!=samples[t[2]].owner;
-            if(!support){result.message="Patch geometry contains an inverted quad";return result;}
+            // A patch whose rasterized samples already fold is rejected: its
+            // chart or source is wrong. A fold that only the relaxation
+            // introduced is a solver artifact; prune that cell like an
+            // unsupported one instead of rejecting the whole fit.
+            const auto rasterCross=(samples[t[1]].target-samples[t[0]].target).cross(samples[t[2]].target-samples[t[0]].target);
+            const bool rasterFolded=cv::norm(rasterCross)<1e-6||rasterCross.dot(reference)<=0;
+            if(!support&&rasterFolded) {
+                if(std::getenv("VC3D_PROFILE_CONSTRAINT_FIT")) {
+                    std::clog<<"Inverted patch quad: "<<ids[samples[t[0]].owner]<<" grid=("<<t[0]%cols<<","<<t[0]/cols<<")"
+                        <<" cos="<<cross.dot(reference)/(cv::norm(cross)*std::max(1e-12,cv::norm(reference)))
+                        <<" |normal|/mass="<<cv::norm(reference)/(samples[t[0]].mass+samples[t[1]].mass+samples[t[2]].mass)
+                        <<" edges="<<cv::norm(point(t[1])-point(t[0]))<<","<<cv::norm(point(t[2])-point(t[0]))
+                        <<" raster="<<cv::norm(samples[t[1]].sum/samples[t[1]].mass-samples[t[0]].sum/samples[t[0]].mass)<<","<<cv::norm(samples[t[2]].sum/samples[t[2]].mass-samples[t[0]].sum/samples[t[0]].mass)
+                        <<" moved="<<cv::norm(point(t[0])-samples[t[0]].sum/samples[t[0]].mass)<<std::endl;
+                }
+                result.message="Patch geometry contains an inverted quad";return result;
+            }
             int victim=t[0];for(int i:t.val)if(samples[i].mass<samples[victim].mass)victim=i;
             if(local&&!movable(victim)){local->expand=true;result.message="Quad validation reaches the local boundary";return result;}
             grid(victim/cols,victim%cols)={-1,-1,-1};unsupported.insert(victim);
@@ -421,7 +585,18 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
         grid=std::move(merged);low=mergedLow;cols=mergedCols;rows=mergedRows;
     }
     size_t completeQuads=0;
-    for(int y=0;y+1<rows;++y)for(int x=0;x+1<cols;++x) {
+    if(local&&local->prepared){
+        const auto first=detail::tileAt(low,spacing),last=detail::tileAt(low+cv::Vec2d(cols-2,rows-2)*spacing,spacing);
+        const auto dirty=local->region.padded(spacing);
+        for(int y=first.second;y<=last.second;++y)for(int x=first.first;x<=last.first;++x){
+            const detail::TileKey key{x,y};const Region tile{{x*64*spacing,y*64*spacing},{(x+1)*64*spacing,(y+1)*64*spacing}};
+            const auto cached=local->prepared->surfaceTiles.find(key);
+            detail::SurfaceTileStats computed;
+            const auto* stats=cached==local->prepared->surfaceTiles.end()?nullptr:&cached->second;
+            if(!stats||tile.intersects(dirty)){computed=detail::surfaceTileStats(grid,low,spacing,key);stats=&computed;}
+            completeQuads+=stats->quads;stretches.insert(stretches.end(),stats->stretches.begin(),stats->stretches.end());
+        }
+    }else for(int y=0;y+1<rows;++y)for(int x=0;x+1<cols;++x) {
         if(grid(y,x)[0]==-1||grid(y,x+1)[0]==-1||grid(y+1,x)[0]==-1||grid(y+1,x+1)[0]==-1)continue;
         ++completeQuads;
         for(const auto edge:std::array<std::pair<cv::Vec3f,cv::Vec3f>,2>{{{grid(y,x),grid(y,x+1)},{grid(y,x),grid(y+1,x)}}}) {
@@ -436,8 +611,7 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
     auto defaultOrigin=result.surface->gridToSurface({0,0});
     result.surface->shiftSurfaceOrigin(defaultOrigin-low);result.origin=low;
     if(!stretches.empty()) {auto index=stretches.begin()+static_cast<size_t>(0.95*(stretches.size()-1));std::nth_element(stretches.begin(),index,stretches.end());result.stretchP95=*index;}
-    double squared=0;for(const auto& l:g.links){auto d=detail::linkError(g,l);squared+=d.dot(d);}
-    result.correspondenceRms=g.links.empty()?0:std::sqrt(squared/g.links.size());
+    result.correspondenceRms=attachmentRms(g,local);
     result.valid=true;result.message=unsupported.empty()?"Ready":"Ready; "+std::to_string(unsupported.size())+" unsupported boundary samples omitted";return result;
 }
 } // namespace
@@ -448,29 +622,7 @@ FitResult render(Graph graph,const std::atomic_bool* cancel) {return renderSurfa
 FitResult renderPlacement(Graph graph,const std::atomic_bool* cancel) {return renderSurface(std::move(graph),cancel,false);}
 
 namespace {
-FitResult fitCharts(Graph graph,const std::atomic_bool* cancel,Progress progress,bool alignAxes,LocalFit* local=nullptr) {
-    graph.settings.validate();detail::cancelled(cancel);
-    if(graph.nodes.empty())return render(std::move(graph),cancel);
-    std::set<std::string> connected{graph.seed};
-    for(size_t pass=0;pass<graph.nodes.size();++pass) {
-        const auto before=connected.size();
-        for(const auto& l:graph.links) {
-            if(!graph.nodes.contains(l.a.node)||!graph.nodes.contains(l.b.node))throw std::runtime_error("Link refers to a missing node");
-            if(connected.contains(l.a.node))connected.insert(l.b.node);
-            if(connected.contains(l.b.node))connected.insert(l.a.node);
-        }
-        if(connected.size()==before)break;
-    }
-    if(!graph.nodes.contains(graph.seed)||connected.size()!=graph.nodes.size()) {
-        FitResult failed;failed.graph=std::move(graph);failed.message="Every node must remain linked to the seed";return failed;
-    }
-    // The positional gauge must not freeze a previously tilted seed. Rotate
-    // the whole existing graph together before fixing that seed's rigid pose.
-    const auto rotation=alignAxes&&!local?axisRotation(graph.nodes.at(graph.seed)):0;
-    if(rotation!=0) {
-        const double c=std::cos(rotation),s=std::sin(rotation);
-        for(auto& [id,p]:graph.nodes)for(auto& uv:p.uv)uv={c*uv[0]-s*uv[1],s*uv[0]+c*uv[1]};
-    }
+void alignRigid(Graph& graph,const std::atomic_bool* cancel,const Progress& progress,bool alignAxes,LocalFit* local) {
     const double bandHalfWidth=2*graph.settings.spacing;
     const double bandWeight=2/graph.settings.spacing;
     // Close component loops with rigid node motions before allowing vertex
@@ -488,6 +640,9 @@ FitResult fitCharts(Graph graph,const std::atomic_bool* cancel,Progress progress
             const auto& n=*p.source;
             if(!alignAxes||!n.fiber||(n.direction!='H'&&n.direction!='V'))continue;
             const int axis=n.direction=='V'?0:1;
+            const int first=(n.rows/2)*n.cols,last=first+n.cols-1;
+            rigid.AddResidualBlock(new ceres::AutoDiffCostFunction<RigidDirection,1,3>(
+                new RigidDirection{p.uv[last]-p.uv[first],axis,30/graph.settings.spacing}),nullptr,poses[id].val);
             double center=0;
             for(int x=0;x<n.cols;++x) {
                 auto uv=p.uv[(n.rows/2)*n.cols+x];
@@ -499,7 +654,7 @@ FitResult fitCharts(Graph graph,const std::atomic_bool* cancel,Progress progress
                 rigid.AddResidualBlock(new ceres::AutoDiffCostFunction<RigidFiberBand,1,3,1>(
                     new RigidFiberBand{p.uv[(n.rows/2)*n.cols+x],axis,bandHalfWidth,bandWeight}),nullptr,poses[id].val,&centers[id]);
         }
-        for(const auto& l:graph.links) {
+        for(const auto& l:fitContacts(graph,local)) {
             if(l.a.node==l.b.node||(local&&!local->added(l.a.node)&&!local->added(l.b.node)))continue;
             auto [wa,wb]=detail::linkWeights(graph,l);
             auto a=detail::interpolate(graph.nodes.at(l.a.node).uv,wa);
@@ -508,8 +663,8 @@ FitResult fitCharts(Graph graph,const std::atomic_bool* cancel,Progress progress
                 new RigidMatch{a,b,(l.keypoint?1000.0:30.0)/graph.settings.spacing}),nullptr,poses[l.a.node].val,poses[l.b.node].val);
         }
         rigid.SetParameterBlockConstant(poses.at(graph.seed).val);
-        Cancellation cb(cancel);auto options=solverOptions(cb,100);ceres::Solver::Summary summary;
-        ceres::Solve(options,&rigid,&summary);detail::cancelled(cancel);
+        Cancellation cb(cancel,progress,"Aligning patches and fibers",100);auto options=solverOptions(cb,100);ceres::Solver::Summary summary;
+        ceres::Solve(options,&rigid,&summary);profileSolve("rigid",summary);detail::cancelled(cancel);
         if(!summary.IsSolutionUsable())throw std::runtime_error("Rigid graph alignment failed: "+summary.BriefReport());
         for(auto& [id,p]:graph.nodes) {
             if(local&&!local->added(id))continue;
@@ -517,16 +672,47 @@ FitResult fitCharts(Graph graph,const std::atomic_bool* cancel,Progress progress
             for(auto& uv:p.uv)uv={c*uv[0]-s*uv[1]+pose[1],s*uv[0]+c*uv[1]+pose[2]};
         }
     }
+}
+FitResult fitCharts(Graph graph,const std::atomic_bool* cancel,Progress progress,bool alignAxes,LocalFit* local=nullptr) {
+    graph.settings.validate();detail::cancelled(cancel);
+    if(graph.nodes.empty())return render(std::move(graph),cancel);
+    if(!local||!local->prepared) {
+    std::set<std::string> connected{graph.seed};
+    for(size_t pass=0;pass<graph.nodes.size();++pass) {
+        const auto before=connected.size();
+        for(const auto& l:fitContacts(graph,local)) {
+            if(!graph.nodes.contains(l.a.node)||!graph.nodes.contains(l.b.node))throw std::runtime_error("Link refers to a missing node");
+            if(connected.contains(l.a.node))connected.insert(l.b.node);
+            if(connected.contains(l.b.node))connected.insert(l.a.node);
+        }
+        if(connected.size()==before)break;
+    }
+    if(!graph.nodes.contains(graph.seed)||connected.size()!=graph.nodes.size()) {
+        FitResult failed;failed.graph=std::move(graph);failed.message="Every node must remain linked to the seed";return failed;
+    }
+    }
+    // The positional gauge must not freeze a previously tilted seed. Rotate
+    // the whole existing graph together before fixing that seed's rigid pose.
+    const auto rotation=alignAxes&&!local?axisRotation(graph.nodes.at(graph.seed)):0;
+    if(rotation!=0) {
+        const double c=std::cos(rotation),s=std::sin(rotation);
+        for(auto& [id,p]:graph.nodes)for(auto& uv:p.uv)uv={c*uv[0]-s*uv[1],s*uv[0]+c*uv[1]};
+    }
+    const double bandHalfWidth=2*graph.settings.spacing;
+    const double bandWeight=2/graph.settings.spacing;
+    alignRigid(graph,cancel,progress,alignAxes,local);
     if(progress)progress("Fitting connected graph");
-    const detail::FiberJunctions junctions(graph);
+    const auto ownedGeometry=local&&local->geometry?nullptr:std::make_shared<detail::FiberJunctions>(graph);
+    const auto& junctions=local&&local->geometry?*local->geometry:*ownedGeometry;
     ceres::Problem problem;
     std::map<std::string,double> centers;
     for(auto& [id,p]:graph.nodes) {
+        if(local&&local->prepared&&!local->movable.contains(id))continue;
         const auto& n=*p.source;
         const auto& geometry=junctions.points(n);
         const auto* movable=local?&local->movable.at(id):nullptr;
         const auto moves=[&](int i){return !movable||(*movable)[i]!=0;};
-        for(const auto& t:n.triangles) {
+        for(const auto& t:fitTriangles(n,local)) {
             if(!moves(t[0])&&!moves(t[1])&&!moves(t[2]))continue;
             auto x=geometry[t[1]]-geometry[t[0]],y=geometry[t[2]]-geometry[t[0]];
             double length=cv::norm(x),projection=x.dot(y)/length;
@@ -535,11 +721,18 @@ FitResult fitCharts(Graph graph,const std::atomic_bool* cancel,Progress progress
             double det=triangleOrientation(p,t);
             if(!std::isfinite(det)||std::abs(det)<1e-8) {FitResult failed;failed.graph=std::move(graph);failed.message="Degenerate initial chart: "+id;return failed;}
             double w=std::sqrt(graph.settings.stiffness*length*height/(2*graph.settings.spacing*graph.settings.spacing));
-            auto* cost=new ceres::AutoDiffCostFunction<ChartMetric,8,2,2,2>(new ChartMetric{1/length,-projection/(length*height),1/height,w,det>0?1.0:-1.0});
+            if(local)w*=n.fiber?referenceFiberWeight:(local->added(id)?addedPatchWeight:1);
+            auto* cost=new detail::ChartMetricCost({1/length,-projection/(length*height),1/height,w,det>0?1.0:-1.0});
             problem.AddResidualBlock(cost,nullptr,p.uv[t[0]].val,p.uv[t[1]].val,p.uv[t[2]].val);
         }
         if(alignAxes&&n.fiber&&(n.direction=='H'||n.direction=='V')) {
             const int axis=n.direction=='V'?0:1;
+            const int first=(n.rows/2)*n.cols,last=first+n.cols-1;
+            // The band permits local bends; it must not also permit an entire
+            // fiber to tilt when a patch attaches. Tie its endpoint row/column.
+            if((moves(first)||moves(last))&&problem.HasParameterBlock(p.uv[first].val)&&problem.HasParameterBlock(p.uv[last].val))
+                problem.AddResidualBlock(new ceres::AutoDiffCostFunction<Direction,1,2,2>(
+                    new Direction{axis,30/graph.settings.spacing}),nullptr,p.uv[first].val,p.uv[last].val);
             double center=0;
             for(int x=0;x<n.cols;++x)center+=p.uv[(n.rows/2)*n.cols+x][axis];
             centers[id]=center/n.cols;
@@ -557,9 +750,11 @@ FitResult fitCharts(Graph graph,const std::atomic_bool* cancel,Progress progress
                 problem.AddResidualBlock(new ceres::AutoDiffCostFunction<Direction,1,2,2>(new Direction{n.direction=='V'?0:1,0.2/graph.settings.spacing}),nullptr,p.uv[a].val,p.uv[b].val);
         }
     }
-    for(const auto& l:graph.links) {
+    size_t contactIndex=0;
+    for(const auto& l:fitContacts(graph,local)) {
         std::vector<double*> blocks;std::vector<double> coefficients;
-        auto [wa,wb]=detail::linkWeights(graph,l);
+        const auto weights=local&&local->prepared?local->weights[contactIndex++]:[&]{auto [a,b]=detail::linkWeights(graph,l);return detail::PreparedContact{a,b};}();
+        const auto& wa=weights.a;const auto& wb=weights.b;
         if(local) {
             bool touches=false;
             for(int i=0;i<3;++i)touches|=local->moves(l.a.node,wa.indices[i])||local->moves(l.b.node,wb.indices[i]);
@@ -570,14 +765,14 @@ FitResult fitCharts(Graph graph,const std::atomic_bool* cancel,Progress progress
                 if(it==blocks.end()){blocks.push_back(ptr);coefficients.push_back(sign*w.values[i]);}
                 else coefficients[it-blocks.begin()]+=sign*w.values[i];}};
         add(l.a,wa,1);add(l.b,wb,-1);
-        auto* cost=new ceres::DynamicAutoDiffCostFunction<Match,4>(new Match{coefficients,(l.keypoint?1000.0:30.0)/graph.settings.spacing});
-        for(size_t i=0;i<blocks.size();++i)cost->AddParameterBlock(2);cost->SetNumResiduals(2);
+        auto* cost=new detail::MatchCost(std::move(coefficients),(l.keypoint?1000.0:30.0)/graph.settings.spacing);
         problem.AddResidualBlock(cost,nullptr,blocks);
     }
     if(graph.nodes.empty()) return render(std::move(graph),cancel);
     if(local) {
         for(auto& [id,p]:graph.nodes) {
-            for(size_t i=0;i<p.uv.size();++i)if(!local->moves(id,i)&&problem.HasParameterBlock(p.uv[i].val))problem.SetParameterBlockConstant(p.uv[i].val);
+            if(local->prepared&&!local->parameterNodes.contains(id))continue;
+            for(size_t i=0;i<p.uv.size();++i)if(!local->moves(id,i)&&problem.HasParameterBlock(std::as_const(p.uv)[i].val))problem.SetParameterBlockConstant(p.uv[i].val);
             if(!local->added(id)&&centers.contains(id)&&problem.HasParameterBlock(&centers[id]))problem.SetParameterBlockConstant(&centers[id]);
         }
     } else {
@@ -592,15 +787,15 @@ FitResult fitCharts(Graph graph,const std::atomic_bool* cancel,Progress progress
         auto edge=seed.uv[anchor[1]]-seed.uv[anchor[0]];
         problem.SetManifold(seed.uv[anchor[1]].val,new ceres::SubsetManifold(2,{std::abs(edge[0])>=std::abs(edge[1])?1:0}));
     }
-    Cancellation cb(cancel);auto options=solverOptions(cb,60);ceres::Solver::Summary summary;
+    Cancellation cb(cancel,progress,"Fitting flattened layout",60);auto options=solverOptions(cb,60);ceres::Solver::Summary summary;
     // ChartMetric deliberately rejects trial steps that flip a triangle.
     // Ceres retries them with a smaller trust region; logging every rejection
     // as a warning floods stderr on constrained fits. Keep this solve quiet;
     // unusable solutions and final geometry errors are still reported below.
     options.logging_type=ceres::SILENT;
-    ceres::Solve(options,&problem,&summary);detail::cancelled(cancel);
+    ceres::Solve(options,&problem,&summary);profileSolve("chart",summary);detail::cancelled(cancel);
     if(!summary.IsSolutionUsable()) {FitResult failed;failed.graph=std::move(graph);failed.message=summary.BriefReport();return failed;}
-    for(const auto& l:graph.links)if(l.keypoint&&cv::norm(placedLocation(graph,l.a)-placedLocation(graph,l.b))>0.02) {
+    for(const auto& l:fitContacts(graph,local))if(l.keypoint&&cv::norm(placedLocation(graph,l.a)-placedLocation(graph,l.b))>0.02) {
         FitResult failed;failed.graph=std::move(graph);failed.message="Keypoint constraints conflict; edit or remove a pair";return failed;
     }
     if(!alignAxes||local) {
@@ -608,7 +803,7 @@ FitResult fitCharts(Graph graph,const std::atomic_bool* cancel,Progress progress
         return aligned;
     }
     if(progress)progress("Building shared tifxyz surface");
-    auto result=render(std::move(graph),cancel);
+    auto result=renderSurface(std::move(graph),cancel,true,nullptr,nullptr,nullptr,progress);
     if(result.valid && result.correspondenceRms>result.graph.settings.radius) {
         result.valid=false;
         result.message="Attachment error exceeds proximity tolerance; add matching keypoint pairs";
@@ -618,54 +813,83 @@ FitResult fitCharts(Graph graph,const std::atomic_bool* cancel,Progress progress
 } // namespace
 
 FitResult fit(Graph graph,const std::atomic_bool* cancel,Progress progress) {
+    if(!graph.nodes.contains(graph.seed))return fitCharts(std::move(graph),cancel,progress,true);
     // New linked components can start with very large loop-closure errors.
     // First let their source charts relax into a connected configuration;
     // imposing rows/columns on those errors directly can trap the no-flip
     // solve. Existing fitted graphs normally skip this initialization pass.
     double squared=0;
-    for(const auto& link:graph.links) {
+    for(const auto& link:graph.links.read()) {
         detail::cancelled(cancel);
         const auto error=detail::linkError(graph,link);squared+=error.dot(error);
     }
     if(!graph.links.empty()&&squared>graph.links.size()*graph.settings.radius*graph.settings.radius) {
-        if(progress)progress("Initializing linked source geometry");
-        auto initialized=fitCharts(std::move(graph),cancel,progress,false);
-        if(!initialized.valid)return initialized;
-        graph=std::move(initialized.graph);
+        graph.settings.validate();
+        // Large placement errors often need only rigid registration. Test that
+        // inexpensive result before paying for a second full vertex solve.
+        alignRigid(graph,cancel,progress,false,nullptr);
+        squared=0;
+        for(const auto& link:graph.links.read()) {
+            detail::cancelled(cancel);
+            const auto error=detail::linkError(graph,link);squared+=error.dot(error);
+        }
+        if(squared>graph.links.size()*graph.settings.radius*graph.settings.radius) {
+            if(progress)progress("Initializing linked source geometry");
+            auto initialized=fitCharts(std::move(graph),cancel,progress,false);
+            if(!initialized.valid)return initialized;
+            graph=std::move(initialized.graph);
+        }
     }
     return fitCharts(std::move(graph),cancel,progress,true);
 }
 namespace {
 auto linkKey(const Link& l) {
-    return std::tuple{l.a.node,l.a.lineIndex,l.a.grid[0],l.a.grid[1],l.b.node,l.b.lineIndex,l.b.grid[0],l.b.grid[1],l.keypoint,l.pending};
+    return detail::contactKey(l);
 }
-bool chartBoundarySettled(const Graph& graph,LocalFit& local) {
-    const double movementLimit=graph.settings.radius*.25;
+struct BoundaryStrain {
+    double movement=0,stretch=1;
+    bool outside=false;
+    std::string describe()const {
+        if(outside)return "added chart leaves the local region";
+        std::ostringstream out;out.precision(3);
+        out<<"boundary moved "<<movement<<" vx, edge stretch "<<stretch;return out.str();
+    }
+};
+BoundaryStrain chartBoundaryStrain(const Graph& graph,LocalFit& local) {
+    BoundaryStrain strain;
     for(const auto& [id,p]:graph.nodes) {
+        if(local.prepared&&!local.movable.contains(id))continue;
         if(local.added(id)) {
-            for(const auto& t:p.source->triangles)for(int i:t.val)if(!local.region.contains(p.uv[i]))return false;
+            for(const auto& t:p.source->triangles)for(int i:t.val)if(!local.region.contains(p.uv[i]))strain.outside=true;
             continue;
         }
         const auto& before=local.committed.graph.nodes.at(id);
-        for(const auto& t:p.source->triangles)for(int j=0;j<3;++j) {
+        for(const auto& t:fitTriangles(*p.source,&local))for(int j=0;j<3;++j) {
             int a=t[j],b=t[(j+1)%3];
             if(local.moves(id,a)==local.moves(id,b))continue;
             if(!local.moves(id,a))std::swap(a,b);
-            if(cv::norm(p.uv[a]-before.uv[a])>movementLimit)return false;
+            strain.movement=std::max(strain.movement,cv::norm(p.uv[a]-before.uv[a]));
             const double oldLength=cv::norm(before.uv[a]-before.uv[b]);
             const double newLength=cv::norm(p.uv[a]-p.uv[b]);
-            if(oldLength>1e-8&&(newLength>oldLength*1.02||newLength<oldLength/1.02))return false;
+            if(oldLength>1e-8)strain.stretch=std::max({strain.stretch,newLength/oldLength,oldLength/newLength});
         }
     }
-    return true;
+    return strain;
 }
-Region changedSurfaceBounds(const Graph& graph,const Graph& committed) {
+bool chartBoundarySettled(const Graph& graph,const BoundaryStrain& strain) {
+    return !strain.outside&&strain.movement<=graph.settings.radius*.25&&strain.stretch<=1.02;
+}
+Region changedSurfaceBounds(const Graph& graph,const Graph& committed,LocalFit* local=nullptr) {
     Region region;
-    const detail::FiberJunctions afterGeometry(graph),beforeGeometry(committed);
+    const auto ownedAfter=local&&local->geometry?nullptr:std::make_shared<detail::FiberJunctions>(graph);
+    const auto ownedBefore=local&&local->prepared?nullptr:std::make_shared<detail::FiberJunctions>(committed);
+    const auto& afterGeometry=local&&local->geometry?*local->geometry:*ownedAfter;
+    const auto& beforeGeometry=local&&local->prepared?*local->prepared->junctions:*ownedBefore;
     for(const auto& [id,p]:graph.nodes) {
         auto before=committed.nodes.find(id);
         const auto& afterPoints=afterGeometry.points(*p.source);
         const auto* beforePoints=before==committed.nodes.end()?nullptr:&beforeGeometry.points(*before->second.source);
+        if(before!=committed.nodes.end()&&p.uv.sharesStorage(before->second.uv)&&&afterPoints==beforePoints)continue;
         for(const auto& t:p.source->triangles) {
             bool changed=before==committed.nodes.end();
             if(!changed)for(int i:t.val)changed|=p.uv[i]!=before->second.uv[i]||
@@ -677,92 +901,226 @@ Region changedSurfaceBounds(const Graph& graph,const Graph& committed) {
     return region;
 }
 }
-FitResult fitIncremental(Graph graph,const FitResult& committed,const std::atomic_bool* cancel,Progress progress) {
+namespace {
+FitResult fitIncrementalImpl(Graph graph,const FitResult& committed,const std::atomic_bool* cancel,Progress progress,const GraphEdit* edit=nullptr,bool fixedReference=false) {
     graph.settings.validate();detail::cancelled(cancel);
     const auto& a=graph.settings;const auto& b=committed.graph.settings;
-    auto global=[&] {
+    std::set<std::string> deformablePatches;
+    if(edit)for(const auto& link:edit->addedLinks) {
+        for(const auto& [patch,fiber]:{std::pair{link.a.node,link.b.node},std::pair{link.b.node,link.a.node}})
+            if(committed.graph.nodes.contains(patch)&&!graph.nodes.at(patch).source->fiber&&
+               edit->addedNodes.contains(fiber)&&graph.nodes.at(fiber).source->fiber)
+                deformablePatches.insert(patch);
+    }
+    // The full solver re-lays out every chart, so it is reserved for edits
+    // that reach most of the graph or whose boundary never settles. Callers
+    // that still want its verdict on a locally rejected edit run it themselves.
+    auto global=[&](Graph whole,const std::string& reason=std::string{}) {
+        if(edit){
+            // A stale accepted neighborhood can drift even without the new
+            // object. Before asking for global rearrangement, try attaching
+            // only the new charts to that stable reference. This uses the same
+            // residuals and all geometry/attachment checks, with old UV fixed.
+            // Adding fibers to accepted patches requires those patches to
+            // deform. Freezing them would silently undo that joint fit.
+            if(!fixedReference&&!edit->addedNodes.empty()&&deformablePatches.empty()){
+                if(progress)progress("Fitting addition against fixed accepted charts");
+                return fitIncrementalImpl(std::move(whole),committed,cancel,progress,edit,true);
+            }
+            FitResult pending;pending.graph=std::move(whole);pending.needsRefit=true;
+            pending.message=(reason.empty()?"Attachment reaches beyond the local fit":reason)+
+                "; use Refit graph to fit this proposal with the accepted graph";return pending;
+        }
         if(progress)progress("Fitting full graph");
-        return fit(std::move(graph),cancel,progress);
+        return fit(std::move(whole),cancel,progress);
     };
     if(!committed.valid||!committed.surface||graph.seed!=committed.graph.seed||a.spacing!=b.spacing||a.stiffness!=b.stiffness||
-       a.radius!=b.radius||a.fiberScale!=b.fiberScale||a.patchScale!=b.patchScale||a.normalScale!=b.normalScale||a.normalManifest!=b.normalManifest)return global();
+       a.radius!=b.radius||a.fiberScale!=b.fiberScale||a.patchScale!=b.patchScale||a.normalScale!=b.normalScale||a.normalManifest!=b.normalManifest)return global(std::move(graph));
     for(const auto& [id,p]:committed.graph.nodes) {
         auto current=graph.nodes.find(id);
-        if(current==graph.nodes.end()||current->second.source!=p.source)return global();
+        if(current==graph.nodes.end()||current->second.source!=p.source)return global(std::move(graph));
     }
-    Region affected;
+    bool added=false;
     for(auto& [id,p]:graph.nodes) {
         if(auto previous=committed.graph.nodes.find(id);previous!=committed.graph.nodes.end()) {
             // A manual edit can start from a previous proposal fit. Always
             // anchor its unchanged surroundings to the accepted snapshot.
             p.uv=previous->second.uv;
-        } else for(const auto& t:p.source->triangles)for(int i:t.val)affected.include(p.uv[i]);
+        } else added=true;
     }
+    // The full solver starts from the edit as proposed, as it always has.
+    const Graph draft=graph;
+    // An added chart still in its unplaced source coordinates says nothing
+    // about where the edit lands; a region around it would only grow toward
+    // the real location attempt by attempt. Place it first. Proposals already
+    // placed near their contacts keep their placement and region unchanged.
+    double misplaced=0;
+    for(const auto& link:graph.links.read())
+        if(!committed.graph.nodes.contains(link.a.node)||!committed.graph.nodes.contains(link.b.node))
+            misplaced=std::max(misplaced,cv::norm(detail::linkError(graph,link)));
+    if(added&&misplaced>4*a.spacing){LocalFit placing{committed,{}};alignRigid(graph,cancel,{},true,&placing);}
+    Region affected;
+    for(const auto& [id,p]:graph.nodes)
+        if(!committed.graph.nodes.contains(id))for(const auto& t:p.source->triangles)for(int i:t.val)affected.include(p.uv[i]);
     auto compare=[](const Link& x,const Link& y){return linkKey(x)<linkKey(y);};
-    std::multiset<Link,decltype(compare)> old(committed.graph.links.begin(),committed.graph.links.end(),compare);
-    std::multiset<Link,decltype(compare)> edited(graph.links.begin(),graph.links.end(),compare);
+    std::multiset<Link,decltype(compare)> edited(compare);
     std::vector<Link> changed;
-    std::set_symmetric_difference(old.begin(),old.end(),edited.begin(),edited.end(),std::back_inserter(changed),compare);
+    std::shared_ptr<const detail::FiberJunctions> geometry;
+    if(edit){
+        changed=edit->addedLinks;
+        for(size_t i:edit->removedLinks)changed.push_back(committed.graph.links.at(i));
+        bool changedJunction=false;
+        for(const auto& link:changed)changedJunction|=detail::horizontalVerticalLink(graph,link).first!=nullptr;
+        geometry=edit->base->junctions;
+        if(changedJunction){
+            Graph junctionGraph; junctionGraph.settings=graph.settings;junctionGraph.nodes=graph.nodes;
+            const std::set<size_t> removed(edit->removedLinks.begin(),edit->removedLinks.end());
+            for(size_t i:edit->base->junctionLinks)if(!removed.contains(i))junctionGraph.links.push_back(committed.graph.links[i]);
+            for(const auto& link:edit->addedLinks)if(detail::horizontalVerticalLink(graph,link).first)junctionGraph.links.push_back(link);
+            geometry=std::make_shared<detail::FiberJunctions>(junctionGraph);
+        }
+    }else{
+        std::multiset<Link,decltype(compare)> old(committed.graph.links.begin(),committed.graph.links.end(),compare);
+        edited.insert(graph.links.cbegin(),graph.links.cend());
+        std::set_symmetric_difference(old.begin(),old.end(),edited.begin(),edited.end(),std::back_inserter(changed),compare);
+    }
     for(const auto& link:changed)for(const auto& location:{link.a,link.b})affected.include(placedLocation(graph,location));
-    if(!std::isfinite(affected.low[0]))return global(); // Explicit refit with no local edit.
-    double margin=4*a.spacing;
-    for(size_t attempt=0;attempt<4;++attempt,margin*=2) {
+    // A long new fiber can require a warp across an entire accepted patch.
+    // Cutting that patch at a narrow chart-space halo locks in its old UV
+    // distortion. Free the contacted patches and budget for their vertices;
+    // distant charts and the existing boundary checks remain unchanged.
+    size_t chartBudget=32768;
+    for(const auto& id:deformablePatches) {
+        const auto& p=graph.nodes.at(id);
+        for(const auto& t:p.source->triangles)for(int i:t.val)affected.include(p.uv[i]);
+        chartBudget=std::min(size_t(131072),chartBudget+p.uv.size());
+    }
+    if(!std::isfinite(affected.low[0]))return global(draft); // Explicit refit with no local edit.
+    // Doubling continues until the free region reaches most of the graph.
+    // Twelve doublings of the initial margin exceed any 16-million-sample grid.
+    constexpr size_t maxAttempts=12;
+    std::string lastFailure;
+    double lastWorst=INFINITY,margin=4*a.spacing;
+    for(size_t attempt=0;attempt<maxAttempts;++attempt,margin*=2) {
         detail::cancelled(cancel);
         LocalFit local{committed,affected.padded(margin)};
-        for(const auto& [id,p]:graph.nodes) {
-            auto& mask=local.movable[id];mask.resize(p.uv.size());
-            for(size_t i=0;i<p.uv.size();++i) {
-                mask[i]=detail::valid(p.source->xyz[i])&&(local.added(id)||local.region.contains(p.uv[i]));
-                local.count+=mask[i];++local.total;
-            }
-        }
-        // A broad addition should go directly to the established full solver.
-        if(local.count*3>local.total*2)return global();
+        if(edit){local.prepared=edit->base.get();local.edit=edit;local.geometry=geometry;local.fixedReference=fixedReference;}
+        selectActiveCharts(graph,local);
+        // Interactive edits have a deterministic work budget. They never
+        // silently switch to a different full-graph objective.
+        if(edit?(local.count>chartBudget||attempt>=4):(local.count*3>local.total*2))return global(draft);
         if(progress)progress("Fitting local charts: "+std::to_string(local.count)+" / "+std::to_string(local.total)+" vertices, attempt "+std::to_string(attempt+1));
         auto charts=fitCharts(graph,cancel,progress,true,&local);
-        if(!charts.valid||!chartBoundarySettled(charts.graph,local)) {
-            if(progress)progress("Expanding local charts: "+(charts.valid?std::string("boundary remains strained"):charts.message));
+        const auto strain=charts.valid?chartBoundaryStrain(charts.graph,local):BoundaryStrain{};
+        if(!charts.valid||!chartBoundarySettled(charts.graph,strain)) {
+            if(progress)progress("Expanding local charts: "+(charts.valid?"boundary remains strained ("+strain.describe()+")":charts.message));
+            if(fixedReference)return global(draft,charts.valid?strain.describe():charts.message);
             continue;
         }
-        bool matches=true;
-        for(const auto& link:changed) {
+        double worst=0;const Link* worstLink=nullptr;
+        for(const auto& link:edit?edit->addedLinks:changed) {
             // Removed links no longer constrain the solution.
-            if(!edited.contains(link))continue;
-            if(cv::norm(detail::linkError(charts.graph,link))>a.radius){matches=false;break;}
+            if(!edit&&!edited.contains(link))continue;
+            const double error=cv::norm(detail::linkError(charts.graph,link));
+            if(error>worst){worst=error;worstLink=&link;}
         }
-        if(!matches)continue;
-        auto dirty=changedSurfaceBounds(charts.graph,committed.graph);
+        if(worstLink&&std::getenv("VC3D_PROFILE_CONSTRAINT_FIT"))
+            std::clog<<"Worst attachment: "<<worstLink->a.node<<" grid=("<<worstLink->a.grid[0]<<","<<worstLink->a.grid[1]<<") line="<<worstLink->a.lineIndex
+                <<" <-> "<<worstLink->b.node<<" grid=("<<worstLink->b.grid[0]<<","<<worstLink->b.grid[1]<<") line="<<worstLink->b.lineIndex
+                <<" keypoint="<<worstLink->keypoint<<" pending="<<worstLink->pending<<" error="<<worst<<" vx"<<std::endl;
+        if(worst>a.radius) {
+            // Contacts that a widened region does not bring closer are
+            // inconsistent with the graph; more region will not change that.
+            if(worst>lastWorst*.75) {
+                if(edit)return global(draft,"Attachment error exceeds proximity tolerance");
+                FitResult rejected;rejected.graph=std::move(charts.graph);
+                rejected.message="Attachment error exceeds proximity tolerance; add matching keypoint pairs";
+                rejected.localChartVertices=local.count;rejected.localExpansions=attempt;
+                return rejected;
+            }
+            lastWorst=worst;
+            if(progress){std::ostringstream out;out.precision(3);out<<"Expanding local charts: attachment error "<<worst<<" vx exceeds proximity tolerance";progress(out.str());}
+            if(fixedReference)return global(draft,"Attachment error exceeds proximity tolerance with accepted charts fixed");
+            continue;
+        }
+        lastWorst=INFINITY;
+        auto dirty=changedSurfaceBounds(charts.graph,committed.graph,&local);
         if(!std::isfinite(dirty.low[0])) {
             auto unchanged=committed;unchanged.graph=std::move(charts.graph);
-            double squared=0;for(const auto& link:unchanged.graph.links){const auto e=detail::linkError(unchanged.graph,link);squared+=e.dot(e);}
-            unchanged.correspondenceRms=unchanged.graph.links.empty()?0:std::sqrt(squared/unchanged.graph.links.size());
+            unchanged.correspondenceRms=attachmentRms(unchanged.graph,&local);
             unchanged.localChartVertices=local.count;unchanged.localSurfaceSamples=0;unchanged.localExpansions=attempt;
             return unchanged;
         }
         // Chart and XYZ relaxation have different footprints. Once the chart
         // boundary settles, a strained XYZ boundary needs a larger surface
-        // region, not another chart solve (or an immediate global fallback on
-        // the last chart attempt). Keep the settled chart while growing XYZ.
+        // region, not another chart solve. Keep the settled chart while growing
+        // XYZ; the region stops growing once it covers the whole surface.
         double surfaceMargin=margin;
-        for(size_t surfaceAttempt=0;surfaceAttempt<4;++surfaceAttempt,surfaceMargin*=2) {
+        std::string failure;
+        for(size_t surfaceAttempt=0;surfaceAttempt<maxAttempts;++surfaceAttempt,surfaceMargin*=2) {
             detail::cancelled(cancel);
             local.region=dirty.padded(surfaceMargin);local.expand=false;
+            if(edit&&(surfaceAttempt>=4||(local.region.high[0]-local.region.low[0])*(local.region.high[1]-local.region.low[1])/(a.spacing*a.spacing)>262144))return global(draft);
             if(progress)progress("Updating local tifxyz region: attempt "+std::to_string(surfaceAttempt+1));
-            auto result=renderSurface(charts.graph,cancel,true,&local);
+            auto result=renderSurface(charts.graph,cancel,true,&local,nullptr,nullptr,progress);
             if(local.expand) {
                 if(progress)progress("Expanding local surface: "+result.message);
                 continue;
             }
             if(!result.valid||result.correspondenceRms>a.radius) {
-                if(progress)progress("Expanding local charts after surface validation: "+
-                    (result.valid?std::string("attachment error exceeds proximity tolerance"):result.message));
+                failure=result.valid?std::string("Attachment error exceeds proximity tolerance"):result.message;
+                if(progress)progress("Expanding local charts after surface validation: "+failure);
                 break;
             }
             result.localChartVertices=local.count;result.localExpansions=attempt;
             if(progress)progress("Local fit complete: "+std::to_string(local.count)+" chart vertices, "+std::to_string(result.localSurfaceSamples)+" surface samples");
             return result;
         }
+        // Stop repeating the same geometry rejection after enlarging the
+        // neighborhood. A full re-layout may still resolve the boundary;
+        // that more expensive operation is the caller's decision.
+        if(fixedReference)return global(draft,failure);
+        if(!failure.empty()&&failure==lastFailure) {
+            if(edit)return global(draft,failure);
+            FitResult rejected;rejected.graph=std::move(charts.graph);rejected.message=failure;
+            rejected.localChartVertices=local.count;rejected.localExpansions=attempt;
+            return rejected;
+        }
+        lastFailure=failure;
     }
-    return global();
+    return global(draft);
+}
+} // namespace
+FitResult fitIncremental(Graph graph,const FitResult& committed,const std::atomic_bool* cancel,Progress progress){
+    return fitIncrementalImpl(std::move(graph),committed,cancel,std::move(progress));
+}
+FitResult fitEdit(const GraphEdit& edit,const std::atomic_bool* cancel,Progress progress){
+    detail::cancelled(cancel);
+    if(!edit.base)throw std::runtime_error("Graph edit has no committed revision");
+    const auto& committed=edit.base->accepted;
+    Graph graph;graph.settings=committed.graph.settings;graph.seed=committed.graph.seed;graph.nodes=committed.graph.nodes;
+    for(const auto& [id,p]:edit.addedNodes){
+        if(!p.source||id!=p.source->id||!graph.nodes.emplace(id,p).second)throw std::runtime_error("Graph edit replaces an accepted source");
+    }
+    graph.links=edit.addedLinks;
+    for(const auto& link:edit.addedLinks){(void)placedLocation(graph,link.a);(void)placedLocation(graph,link.b);}
+    for(size_t i:edit.removedLinks)if(i>=committed.graph.links.size())throw std::runtime_error("Removed contact is outside the committed revision");
+    // Topology validation works on object pairs, not hundreds of thousands of
+    // sampled correspondence records. Retain multiplicity when removing links.
+    std::set<std::string> reached{graph.seed};
+    const auto pairs=detail::editedPairs(edit);
+    for(size_t n=0;n<graph.nodes.size();++n){
+        const auto before=reached.size();for(const auto& [a,b]:pairs){if(reached.contains(a))reached.insert(b);if(reached.contains(b))reached.insert(a);}
+        if(before==reached.size())break;
+    }
+    FitResult result;
+    if(reached.size()!=graph.nodes.size()){result.graph=std::move(graph);result.message="Every node must remain linked to the seed";}
+    else if(edit.addedNodes.empty()&&edit.addedLinks.empty()&&edit.removedLinks.empty())return committed;
+    else result=fitIncrementalImpl(std::move(graph),committed,cancel,std::move(progress),&edit);
+    // Materialize contact storage once, after fitting; all intermediate stages
+    // use the delta and prepared incident-contact lists.
+    result.graph.links=materialize(edit).links;
+    if(!result.valid&&result.localChartVertices){result.needsRefit=true;result.message+="; use Refit graph for a full fit of this proposal";}
+    return result;
 }
 } // namespace vc::constraints

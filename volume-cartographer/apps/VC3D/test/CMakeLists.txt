@@ -479,7 +479,7 @@ set_tests_properties(spiral_brush_patch PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=
 
 add_executable(test_constraint_graph test_constraint_graph.cpp)
 set_target_properties(test_constraint_graph PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-target_link_libraries(test_constraint_graph PRIVATE vc_constraints Qt6::Core Qt6::Test)
+target_link_libraries(test_constraint_graph PRIVATE vc_constraints Ceres::ceres Qt6::Core Qt6::Test)
 add_test(NAME constraint_graph COMMAND test_constraint_graph)
 vc_register_test_target(test_constraint_graph)
 vc_register_ctest(constraint_graph test_constraint_graph)
@@ -495,3 +495,11 @@ vc_register_ctest(constraint_graph_overlay test_constraint_graph_overlay)
 # Explicit real-data validation tool; never registered as a dataset-dependent CTest.
 add_executable(constraint_graph_probe constraint_graph_probe.cpp)
 target_link_libraries(constraint_graph_probe PRIVATE vc_constraints)
+
+add_executable(test_constraint_graph_activity test_constraint_graph_activity.cpp)
+set_target_properties(test_constraint_graph_activity PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_link_libraries(test_constraint_graph_activity PRIVATE Qt6::Widgets Qt6::Test)
+add_test(NAME constraint_graph_activity COMMAND test_constraint_graph_activity)
+set_tests_properties(constraint_graph_activity PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+vc_register_test_target(test_constraint_graph_activity)
+vc_register_ctest(constraint_graph_activity test_constraint_graph_activity)

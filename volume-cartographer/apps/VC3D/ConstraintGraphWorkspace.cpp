@@ -1,4 +1,5 @@
 #include "ConstraintGraphWorkspace.hpp"
+#include "ConstraintGraphActivity.hpp"
 #include "ConstraintGraphView.hpp"
 #include "ConstraintGraphSelectionBar.hpp"
 #include "CState.hpp"
@@ -13,6 +14,9 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include <QtConcurrent/QtConcurrent>
+#include <iostream>
+#include <cstdlib>
+#include <chrono>
 #include <QFutureWatcher>
 #include <QCheckBox>
 #include <QComboBox>
@@ -59,7 +63,7 @@ std::shared_ptr<QuadSurface> displaySurface(const cg::FitResult& result) {
 
 }
 ConstraintGraphWorkspace::ConstraintGraphWorkspace(CState* main,QWidget* parent):QMainWindow(parent),_main(main) {
-    setObjectName("constraintGraphWorkspace");_pool.setMaxThreadCount(1);_discoveryPool.setMaxThreadCount(1);
+    setObjectName("constraintGraphWorkspace");_pool.setMaxThreadCount(1);_discoveryPool.setMaxThreadCount(1);_comparisonPool.setMaxThreadCount(1);
     _state=new CState(this,main&&main->debugDownloadQueueEnabled());
     _manager=std::make_unique<ViewerManager>(_state,_state->pointCollection(),this);
     _manager->setPreferSurfaceTileFills(true);
@@ -70,17 +74,23 @@ ConstraintGraphWorkspace::ConstraintGraphWorkspace(CState* main,QWidget* parent)
     action(tr("Save"),[this]{save();});action(tr("Save as…"),[this]{save(true);});
     action(tr("Export tifxyz…"),[this]{if(!_committed.valid)return;auto parent=QFileDialog::getExistingDirectory(this,tr("Export destination"));if(parent.isEmpty())return;
         auto path=std::filesystem::path(parent.toStdString())/"constraint-graph.tifxyz";auto snapshot=_committed;
-        run([snapshot,path](auto*,auto){cg::exportSurface(snapshot,path);return Job{};},[this,path](Job){report(tr("Exported %1").arg(QString::fromStdString(path.string())));});});
+        run(tr("Exporting tifxyz"),[snapshot,path](auto*,auto){cg::exportSurface(snapshot,path);return Job{};},[this,path](Job){report(tr("Exported %1").arg(QString::fromStdString(path.string())));},false);});
     action(tr("Undo"),[this]{navigateHistory(false);})->setShortcut(QKeySequence::Undo);
     action(tr("Redo"),[this]{navigateHistory(true);})->setShortcut(QKeySequence::Redo);
     action(tr("Fit view"),[this]{_view[0]->resetViewForCurrentContent(true);});
     action(tr("Refit graph"),[this]{
-        if(_saving||!_committed.valid)return;
-        cancelPreview();_selected.clear();_candidates.clear();
+        if(_saving||_busy||!_committed.valid)return;
+        auto draft=_draft.value_or(_committed.graph);auto selected=_selected;
+        cancelPreview();_selected=selected;_candidates.clear();
         _bar->move(12,12);
-        _draft=_committed.graph;rebuildPreview(true);
+        fitPreview(std::move(draft),std::move(selected),true,true);
     });
     _showCommitted=new QCheckBox(tr("Show committed"),toolbar);toolbar->addWidget(_showCommitted);connect(_showCommitted,&QCheckBox::toggled,this,[this]{display();});
+    _showAllBoundaries=new QCheckBox(tr("Show all boundaries"),toolbar);
+    _showAllBoundaries->setObjectName("constraintGraphShowAllBoundaries");
+    _showAllBoundaries->setToolTip(tr("Show colored boundaries for committed fibers and patches too. When unchecked, only proposals have boundaries."));
+    toolbar->addWidget(_showAllBoundaries);
+    connect(_showAllBoundaries,&QCheckBox::toggled,this,[this]{overlays();});
     auto* dock=new QDockWidget(tr("Graph inputs"),this);dock->setObjectName("constraintGraphInputs");addDockWidget(Qt::LeftDockWidgetArea,dock);
     auto* panel=new QWidget(dock);auto* form=new QFormLayout(panel);dock->setWidget(panel);
     dock->setMaximumWidth(460);
@@ -118,7 +128,11 @@ ConstraintGraphWorkspace::ConstraintGraphWorkspace(CState* main,QWidget* parent)
     _pairs=new QListWidget(panel);_pairs->setObjectName("constraintGraphKeypoints");form->addRow(tr("Keypoint pairs"),_pairs);
     auto* remove=new QPushButton(tr("Remove selected pair"),panel);form->addRow(remove);connect(remove,&QPushButton::clicked,this,&ConstraintGraphWorkspace::removePair);
     auto* edit=new QPushButton(tr("Replace selected pair"),panel);form->addRow(edit);connect(edit,&QPushButton::clicked,this,[this]{removePair();beginPair();});
-    _status=new QLabel(panel);_status->setWordWrap(true);_status->setTextInteractionFlags(Qt::TextSelectableByMouse);form->addRow(_status);
+    auto* activityDock=new QDockWidget(tr("Activity"),this);activityDock->setObjectName("constraintGraphActivityDock");
+    activityDock->setFeatures(QDockWidget::DockWidgetMovable|QDockWidget::DockWidgetFloatable);
+    _activity=new ConstraintGraphActivity(activityDock);activityDock->setWidget(_activity);
+    addDockWidget(Qt::BottomDockWidgetArea,activityDock);
+    connect(_activity->stopButton(),&QPushButton::clicked,this,&ConstraintGraphWorkspace::cancelPreview);
     _splitter=new QSplitter(Qt::Horizontal,this);setCentralWidget(_splitter);
     for(int i=0;i<2;++i) {
         _view[i]=_manager->createViewerInWidget(i==0?"constraint-graph":"constraint-proposal",_splitter);
@@ -174,12 +188,13 @@ ConstraintGraphWorkspace::ConstraintGraphWorkspace(CState* main,QWidget* parent)
     updateControls();
 }
 ConstraintGraphWorkspace::~ConstraintGraphWorkspace(){
+    cancelComparison();_comparisonPool.waitForDone();
     stopDiscovery();_discoveryPool.waitForDone();
     ++_generation;if(_cancel)_cancel->store(true);_pool.waitForDone();
     for(int pane=0;pane<2;++pane){if(_overlayRoot[pane])for(auto* item:_items[pane])delete item;_items[pane].clear();_markers[pane].clear();delete _overlayRoot[pane].data();}
     delete _highlights.data();_manager.reset();
 }
-void ConstraintGraphWorkspace::report(const QString& message){_status->setText(message);statusBar()->showMessage(message);}
+void ConstraintGraphWorkspace::report(const QString& message){_activity->note(message);}
 void ConstraintGraphWorkspace::refreshAudit(){
     if(!_catalog){_audit->setText(tr("Fiber cycle check unavailable: source catalog not loaded."));return;}
     const auto& audit=_catalog->cycleAudit;
@@ -189,20 +204,37 @@ void ConstraintGraphWorkspace::refreshAudit(){
     _audit->setText((warning?tr("Warning — "):QString{})+text);
     _audit->setToolTip(tr("Checks current source annotations across all components, independently of the fitted grid. See details for scope and affected links."));
 }
-void ConstraintGraphWorkspace::run(Worker worker,std::function<void(Job)> finish) {
+void ConstraintGraphWorkspace::run(const QString& title,Worker worker,std::function<void(Job)> finish,bool stoppable) {
     if(_saving)return;
     if(_cancel)_cancel->store(true);auto cancel=std::make_shared<std::atomic_bool>(false);_cancel=cancel;auto generation=++_generation;
+    _activity->finish(ConstraintGraphActivity::Operation,tr("Superseded"));
+    _activity->begin(ConstraintGraphActivity::Operation,title,stoppable);
+    if(_busy)_activity->update(ConstraintGraphActivity::Operation,tr("Waiting for the previous operation to stop…"));
     _busy=true;updateControls();QPointer<ConstraintGraphWorkspace> guard(this);
-    auto progress=[guard,generation](const std::string& message){if(guard)QMetaObject::invokeMethod(guard,[guard,generation,message]{if(guard&&guard->_generation==generation)guard->report(QString::fromStdString(message));},Qt::QueuedConnection);};
+    // VC3D_CONSTRAINT_FIT_LOG=1 echoes every progress line with its elapsed
+    // time to stderr as well as the Activity panel.
+    static const bool logProgress=std::getenv("VC3D_CONSTRAINT_FIT_LOG")!=nullptr;
+    const auto started=std::chrono::steady_clock::now();
+    auto progress=[guard,generation,started](const std::string& message){
+        if(logProgress)std::clog<<"constraint graph +"<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count()<<" ms: "<<message<<std::endl;
+        if(guard)QMetaObject::invokeMethod(guard,[guard,generation,message]{if(guard&&guard->_generation==generation)guard->_activity->update(ConstraintGraphActivity::Operation,QString::fromStdString(message));},Qt::QueuedConnection);};
     auto* watcher=new QFutureWatcher<Job>(this);
-    connect(watcher,&QFutureWatcher<Job>::finished,this,[this,watcher,generation,finish=std::move(finish)]()mutable{
-        auto job=watcher->result();watcher->deleteLater();if(generation!=_generation)return;_busy=false;
+    connect(watcher,&QFutureWatcher<Job>::finished,this,[this,watcher,generation,cancel,finish=std::move(finish)]()mutable{
+        auto job=watcher->result();watcher->deleteLater();
+        if(generation!=_generation){
+            if(_cancel==cancel&&!_busy)_activity->finish(ConstraintGraphActivity::Operation,tr("Cancelled"));
+            return;
+        }
+        _busy=false;
         _saving=false;
+        const auto outcome=!job.error.empty()?tr("Failed"):
+            !job.fit.graph.nodes.empty()&&!job.fit.valid?tr("Needs attention"):tr("Completed");
+        _activity->finish(ConstraintGraphActivity::Operation,outcome);
         if(!job.error.empty()){report(QString::fromStdString(job.error));_closing=false;updateControls();emit operationFinished(false);return;}
         try{finish(std::move(job));}catch(const std::exception& e){report(QString::fromUtf8(e.what()));emit operationFinished(false);updateControls();return;}
         updateControls();emit operationFinished(true);
     });
-    watcher->setFuture(QtConcurrent::run(&_pool,[worker=std::move(worker),cancel,progress]{try{return worker(cancel.get(),progress);}catch(const std::exception& e){Job job;job.error=e.what();return job;}catch(...){Job job;job.error="Unknown graph operation failure";return job;}}));
+    watcher->setFuture(QtConcurrent::run(&_pool,[worker=std::move(worker),cancel,progress]{try{progress("Starting operation");return worker(cancel.get(),progress);}catch(const std::exception& e){Job job;job.error=e.what();return job;}catch(...){Job job;job.error="Unknown graph operation failure";return job;}}));
 }
 cg::Settings ConstraintGraphWorkspace::settings()const {
     cg::Settings s;s.fiberFolder=_fibers->text().toStdString();s.patchFolder=_patches->text().toStdString();
@@ -235,7 +267,7 @@ void ConstraintGraphWorkspace::start(const cg::Settings& s){
     if(_saving)return;
     if(_dirty&&QMessageBox::question(this,tr("New graph"),tr("Discard unsaved graph changes?"))!=QMessageBox::Yes)return;
     stopDiscovery();setSettings(s);report(tr("Loading fibers and patch bounds…"));
-    run([s](auto* cancel,auto progress){Job j;vc::lasagna::LasagnaDatasetOpenOptions options;options.workingToBaseScale=s.normalScale;
+    run(tr("Loading inputs and building graph"),[s](auto* cancel,auto progress){Job j;progress("Opening normals dataset");vc::lasagna::LasagnaDatasetOpenOptions options;options.workingToBaseScale=s.normalScale;
         j.dataset=std::make_shared<vc::lasagna::LasagnaDataset>(vc::lasagna::LasagnaDataset::openLocation(s.normalManifest,options));j.normals=std::make_shared<vc::lasagna::LasagnaNormalSampler>(*j.dataset);
         j.catalog=std::make_shared<cg::Catalog>(cg::loadCatalog(s,cancel,progress));if(j.catalog->components.empty())throw std::runtime_error("No eligible fiber components; check source scales and fiber validation");
         try{j.fit=cg::fit(cg::seedGraph(*j.catalog,0,s,*j.normals,cancel),cancel,progress);}
@@ -257,10 +289,11 @@ void ConstraintGraphWorkspace::seed(int component){
     if(!_catalog||!_normals||component<0)return;
     if(_dirty&&QMessageBox::question(this,tr("Change seed"),tr("Start a new graph from this component and discard unsaved changes?"))!=QMessageBox::Yes)return;
     stopDiscovery();auto c=_catalog;auto n=_normals;auto s=_committed.valid?_committed.graph.settings:settings();
-    run([c,n,s,component](auto* cancel,auto progress){Job j;j.fit=cg::fit(cg::seedGraph(*c,component,s,*n,cancel),cancel,progress);return j;},[this](Job j){
+    run(tr("Building selected component"),[c,n,s,component](auto* cancel,auto progress){Job j;j.fit=cg::fit(cg::seedGraph(*c,component,s,*n,cancel),cancel,progress);return j;},[this](Job j){
         if(!j.fit.valid){report(QString::fromStdString(j.fit.message));return;}_committed=std::move(j.fit);_draft.reset();_preview={};_proposalView={};_undo.clear();_redo.clear();_dirty=true;_path.clear();_selected.clear();display();initialView();search();});
 }
 void ConstraintGraphWorkspace::stopDiscovery(){
+    if(_activity)_activity->finish(ConstraintGraphActivity::Discovery,tr("Stopped"));
     ++_discoveryGeneration;if(_discoveryCancel)_discoveryCancel->store(true);
     _discovering=false;_available.clear();_previewCache.clear();
 }
@@ -293,20 +326,27 @@ void ConstraintGraphWorkspace::receiveDiscovery(std::vector<cg::Candidate> batch
 }
 void ConstraintGraphWorkspace::search(){
     stopDiscovery();_candidates.clear();_candidate=-1;
-    if(!_catalog||!_committed.valid)return;
+    if(!_committed.valid)return;
+    if(!_prepared||cg::preparedResult(*_prepared).surface!=_committed.surface||
+       cg::preparedResult(*_prepared).graph.settings.radius!=_committed.graph.settings.radius){
+        auto snapshot=_committed;auto edit=std::move(_prepareEdit);_prepareEdit.reset();_prepared.reset();
+        run(tr("Preparing attachments"),[snapshot,edit](auto* cancel,auto progress){progress("Preparing committed graph for attachment");Job job;job.prepared=edit?cg::prepareGraph(snapshot,*edit,cancel):cg::prepareGraph(snapshot,cancel);return job;},
+            [this](Job job){_prepared=std::move(job.prepared);search();});
+        return;
+    }
+    if(!_catalog)return;
+    _activity->begin(ConstraintGraphActivity::Discovery,tr("Attachment search"));
     _discovering=true;_awaitingProposals=!_selected.empty();auto cancel=std::make_shared<std::atomic_bool>(false);_discoveryCancel=cancel;
     const auto generation=_discoveryGeneration;auto catalog=_catalog;auto graph=_committed.graph;const int stride=_discoveryStride->currentData().toInt();
     QPointer<ConstraintGraphWorkspace> guard(this);
-    overlays();report(tr("Finding proposals… Orange marks show verified attachments."));updateControls();
+    overlays();updateControls();
     auto* watcher=new QFutureWatcher<QString>(this);
     connect(watcher,&QFutureWatcher<QString>::finished,this,[this,watcher,generation]{
         auto error=watcher->result();watcher->deleteLater();if(generation!=_discoveryGeneration)return;
         _discovering=false;
-        if(!_busy&&_candidate<0){
-            if(!error.isEmpty())report(error);
-            else if(_selected.empty())report(tr("%1 proposals · orange marks indicate available attachments").arg(_available.size()));
-            else if(_awaitingProposals)selectAvailable(true);
-        }
+        _activity->finish(ConstraintGraphActivity::Discovery,error.isEmpty()?tr("%1 proposals found").arg(_available.size()):error);
+        // Discovery owns its row; completing it must not erase a fit error.
+        if(error.isEmpty()&&!_busy&&_candidate<0&&!_selected.empty()&&_awaitingProposals)selectAvailable(true);
         updateControls();
     });
     watcher->setFuture(QtConcurrent::run(&_discoveryPool,[guard,catalog,graph=std::move(graph),cancel,generation,stride]{
@@ -319,7 +359,12 @@ void ConstraintGraphWorkspace::search(){
             pending.clear();timer.restart();
         };
         try {
-            cg::discover(*catalog,graph,{},cancel.get(),{},[&](std::vector<cg::Candidate> batch){
+            cg::discover(*catalog,graph,{},cancel.get(),[guard,generation](const std::string& message){
+                if(guard)QMetaObject::invokeMethod(guard,[guard,generation,message]{
+                    if(guard&&guard->_discoveryGeneration==generation)
+                        guard->_activity->update(ConstraintGraphActivity::Discovery,QString::fromStdString(message));
+                },Qt::QueuedConnection);
+            },[&](std::vector<cg::Candidate> batch){
                 pending.insert(pending.end(),std::make_move_iterator(batch.begin()),std::make_move_iterator(batch.end()));
                 if(timer.elapsed()>=500)publish();
             },stride);publish();return QString{};
@@ -328,11 +373,11 @@ void ConstraintGraphWorkspace::search(){
 }
 void ConstraintGraphWorkspace::selectCandidate(int delta){
     if(_saving)return;
-    if(_candidates.empty()||!_catalog||!_normals)return;
+    if(_candidates.empty()||!_catalog||!_normals||!_prepared)return;
     _candidate=(_candidate+delta+int(_candidates.size()))%int(_candidates.size());if(_candidate<0)_candidate=0;
     auto candidate=_candidates[_candidate];
     if(_selected.empty()&&!candidate.contacts.empty()) {_selected=candidate.contacts.front().a.node;_selectionUv=cg::placedLocation(_committed.graph,candidate.contacts.front().a);}
-    auto c=_catalog;auto n=_normals;auto g=_committed.graph;bool whole=_whole->isChecked();
+    auto c=_catalog;auto n=_normals;auto prepared=_prepared;bool whole=_whole->isChecked();
     auto same=[&](const CachedPreview& cached){
         if(cached.whole!=whole||cached.candidate.id!=candidate.id||cached.candidate.contacts.size()!=candidate.contacts.size())return false;
         auto location=[](const auto& a,const auto& b){return a.node==b.node&&a.lineIndex==b.lineIndex&&a.grid==b.grid;};
@@ -343,49 +388,65 @@ void ConstraintGraphWorkspace::selectCandidate(int delta){
         return true;
     };
     if(auto cached=std::find_if(_previewCache.begin(),_previewCache.end(),same);cached!=_previewCache.end()) {
-        if(_cancel)_cancel->store(true);++_generation;_busy=false;
+        if(_cancel)_cancel->store(true);++_generation;_busy=false;_activity->finish(ConstraintGraphActivity::Operation,tr("Cancelled"));
         _firstPair.reset();_matching=false;_showCommitted->setChecked(false);
         installPreview(cached->job);return;
     }
+    cancelComparison();_fiberView={};_patchView={};_placementOnly=true;
     _activeCandidate=candidate;
     _draft.reset();_preview={};_proposalView={};_firstPair.reset();_matching=false;_showCommitted->setChecked(false);display();
-    // Construct the source attachment first; do not hide it behind a global solve.
-    run([c,n,g,candidate,whole](auto* cancel,auto){Job j;j.fit.graph=cg::propose(*c,g,candidate,whole,*n,cancel);return j;},
-        [this,id=candidate.id](Job j){fitPreview(std::move(j.fit.graph),_committed.graph,id);});
-}
-void ConstraintGraphWorkspace::rebuildPreview(bool fitView){
-    if(!_draft)return;_activeCandidate.reset();auto draft=*_draft;auto committed=_committed.graph;auto selected=_candidate>=0?_candidates[_candidate].id:_selected;
-    _preview={};fitPreview(std::move(draft),std::move(committed),selected,fitView);
-}
-void ConstraintGraphWorkspace::fitPreview(cg::Graph draft,cg::Graph committed,std::string selected,bool fitView){
-    _placementOnly=true;
-    _fiberView={};_patchView={};updateComparison();
     QPointer<ConstraintGraphWorkspace> guard(this);
     const auto generation=_generation+1;
-    auto baseline=_committed;baseline.graph=std::move(committed);
-    run([guard,generation,draft=std::move(draft),baseline=std::move(baseline),selected](auto* cancel,auto progress)mutable{
-        Job job;job.proposalView=cg::renderProposalSources(draft,baseline.graph,selected,cancel);
-        auto placement=cg::renderPlacement(draft,cancel);
-        if(guard&&!cancel->load())QMetaObject::invokeMethod(guard,[guard,generation,placement=std::move(placement),source=job.proposalView]()mutable{
+    run(tr("Fitting %1").arg(QString::fromStdString(candidate.id)),[guard,generation,c,n,prepared,candidate,whole](auto* cancel,auto progress){
+        progress("Finding contacts for the selected attachment");
+        auto edit=cg::proposeEdit(*c,prepared,candidate,whole,*n,cancel);
+        progress("Building source preview");
+        Job job;job.edit=edit;
+        job.proposalView=cg::renderProposalSources(edit,candidate.id,cancel);
+        if(guard&&!cancel->load())QMetaObject::invokeMethod(guard,[guard,generation,source=job.proposalView]{
             if(!guard||guard->_generation!=generation)return;
-            guard->_preview=std::move(placement);guard->_proposalView=std::move(source);
-            guard->report(guard->tr("Initial placement · fitting joint graph…"));
-            guard->display();guard->_view[1]->resetViewForCurrentContent(true);guard->updateControls();
+            guard->_proposalView=source;guard->display();guard->_view[1]->resetViewForCurrentContent(true);
+            guard->_activity->update(ConstraintGraphActivity::Operation,guard->tr("Fitting attachment…"));
         },Qt::QueuedConnection);
-        job.fit=cg::fitIncremental(std::move(draft),baseline,cancel,progress);
-        if(job.fit.valid){
-            job.fiberView=cg::renderSourceLayer(job.fit.graph,true,cancel);
-            job.patchView=cg::renderSourceLayer(job.fit.graph,false,cancel);
+        job.fit=cg::fitEdit(edit,cancel,progress);
+        return job;
+    },[this](Job job){finishPreview(std::move(job));});
+}
+void ConstraintGraphWorkspace::rebuildPreview(bool fitView){
+    if(!_draft)return;
+    _activeCandidate.reset();auto draft=*_draft;auto selected=_candidate>=0?_candidates[_candidate].id:_selected;
+    const bool settingsChanged=draft.settings.stiffness!=_committed.graph.settings.stiffness;
+    fitPreview(std::move(draft),selected,fitView,settingsChanged||_fullPreview);
+}
+void ConstraintGraphWorkspace::fitPreview(cg::Graph draft,std::string selected,bool fitView,bool full){
+    if(!_prepared&&!full)return;
+    cancelComparison();_placementOnly=true;_fiberView={};_patchView={};_preview={};updateComparison();
+    auto prepared=_prepared;auto committed=_committed.graph;auto existingEdit=_previewEdit;
+    run(full?tr("Refitting entire graph"):tr("Updating attachment"),[draft=std::move(draft),prepared,committed,selected,full,existingEdit](auto* cancel,auto progress)mutable{
+        Job job;progress("Building source preview");
+        if(full){
+            job.fullFit=true;
+            job.proposalView=cg::renderProposalSources(draft,committed,selected,cancel);
+            job.fit=cg::fit(std::move(draft),cancel,progress);
+        }else{
+            auto edit=existingEdit?*existingEdit:cg::graphEdit(prepared,draft);job.edit=edit;
+            job.proposalView=cg::renderProposalSources(edit,selected,cancel);
+            job.fit=cg::fitEdit(edit,cancel,progress);
         }
         return job;
-    },[this,fitView](Job job){
-        if(_activeCandidate){
-            if(_previewCache.size()>=3)_previewCache.erase(_previewCache.begin());
-            _previewCache.push_back({*_activeCandidate,_whole->isChecked(),job});
-        }
-        installPreview(std::move(job));if(fitView)_view[0]->resetViewForCurrentContent(true);});
+    },[this,fitView](Job job){finishPreview(std::move(job),fitView);});
+}
+void ConstraintGraphWorkspace::finishPreview(Job job,bool fitView){
+    if(_activeCandidate){
+        if(_previewCache.size()>=3)_previewCache.erase(_previewCache.begin());
+        _previewCache.push_back({*_activeCandidate,_whole->isChecked(),job});
+    }
+    installPreview(std::move(job));if(fitView)_view[0]->resetViewForCurrentContent(true);
 }
 void ConstraintGraphWorkspace::installPreview(Job j){
+    cancelComparison();
+    _previewEdit=std::move(j.edit);
+    _fullPreview=j.fullFit;
     _placementOnly=false;_activeCandidate.reset();
     j.fit.graph.settings.volumeScale=_committed.graph.settings.volumeScale;
     j.proposalView.graph.settings.volumeScale=_committed.graph.settings.volumeScale;
@@ -396,11 +457,17 @@ void ConstraintGraphWorkspace::installPreview(Job j){
 }
 void ConstraintGraphWorkspace::commit(){
     if(_busy||_placementOnly||!_draft||!_preview.valid)return;
+    cancelComparison();
+    _prepareEdit=std::move(_previewEdit);_previewEdit.reset();
     _undo.push_back(_committed);if(_undo.size()>20)_undo.erase(_undo.begin());_redo.clear();_committed=_preview;_dirty=true;
     _draft.reset();_preview={};_proposalView={};_matching=false;_firstPair.reset();_candidate=-1;display();refreshPairs();search();
 }
 void ConstraintGraphWorkspace::cancelPreview(){
     if(_saving)return;
+    cancelComparison();
+    _previewEdit.reset();
+    _fullPreview=false;
+    if(_busy){_activity->update(ConstraintGraphActivity::Operation,tr("Stopping… waiting for the current step to return"));_activity->stopButton()->setEnabled(false);}
     if(_cancel)_cancel->store(true);++_generation;_busy=false;_awaitingProposals=false;_placementOnly=false;_activeCandidate.reset();_draft.reset();_preview={};_proposalView={};_matching=false;_firstPair.reset();_candidate=-1;_showCommitted->setChecked(false);display();refreshPairs();updateControls();
 }
 void ConstraintGraphWorkspace::navigateHistory(bool redo){
@@ -410,7 +477,7 @@ void ConstraintGraphWorkspace::navigateHistory(bool redo){
 void ConstraintGraphWorkspace::beginPair(){
     if(_saving)return;
     if(!_committed.valid)return;
-    if(!_draft){if(_selected.empty())return;_draft=_committed.graph;rebuildPreview();}
+    if(!_draft){if(_selected.empty()||!_prepared)return;_draft=_committed.graph;_previewEdit=cg::GraphEdit{_prepared};rebuildPreview();}
     _matching=true;_firstPair.reset();_splitter->widget(1)->show();overlays();report(tr("Click the feature in the proposal pane, then its match in the graph."));
 }
 void ConstraintGraphWorkspace::clicked(int pane,const QPointF& scene){
@@ -422,9 +489,15 @@ void ConstraintGraphWorkspace::clicked(int pane,const QPointF& scene){
         const auto& graph=(!_showCommitted->isChecked()&&_preview.valid)?_preview.graph:_committed.graph;
         auto match=cg::pick(graph,uv,_selected);if(!match)match=cg::pick(graph,uv);if(!match||match->node==_firstPair->node)return;
         // User registration supersedes the proximity guesses for this pair.
-        auto nodes=std::minmax(match->node,_firstPair->node);
-        _draft->links.erase(std::remove_if(_draft->links.begin(),_draft->links.end(),[&](const auto& l){return !l.keypoint&&std::minmax(l.a.node,l.b.node)==nodes;}),_draft->links.end());
-        _draft->links.push_back({*match,*_firstPair,true});_firstPair.reset();_matching=false;rebuildPreview();return;
+        if(_fullPreview){
+            const auto pair=std::minmax(match->node,_firstPair->node);
+            _draft->links.eraseIf([&](const cg::Link& l){return !l.keypoint&&std::minmax(l.a.node,l.b.node)==pair;});
+            _draft->links.push_back({*match,*_firstPair,true});
+        }else{
+            if(!_previewEdit)_previewEdit=cg::graphEdit(_prepared,*_draft);
+            cg::addKeypoint(*_previewEdit,{*match,*_firstPair,true});_draft=cg::materialize(*_previewEdit);
+        }
+        _firstPair.reset();_matching=false;rebuildPreview();return;
     }
     if(pane!=0||!_committed.valid)return;
     const auto& showing=(!_showCommitted->isChecked()&&_preview.valid)?_preview.graph:_committed.graph;
@@ -439,7 +512,14 @@ void ConstraintGraphWorkspace::refreshPairs(){
 void ConstraintGraphWorkspace::removePair(){
     if(_saving)return;
     auto* item=_pairs->currentItem();if(!item)return;auto index=item->data(Qt::UserRole).toULongLong();if(!_draft)_draft=_committed.graph;
-    if(index<_draft->links.size())_draft->links.erase(_draft->links.begin()+index);rebuildPreview();
+    if(index<_draft->links.size()){
+        if(_fullPreview)_draft->links.erase(_draft->links.cbegin()+index);
+        else{
+            if(!_previewEdit)_previewEdit=cg::graphEdit(_prepared,*_draft);
+            cg::removeKeypoint(*_previewEdit,std::as_const(_draft->links)[index]);_draft=cg::materialize(*_previewEdit);
+        }
+    }
+    rebuildPreview();
 }
 void ConstraintGraphWorkspace::display(){
     const auto& showing=(!_showCommitted->isChecked()&&_preview.valid)?_preview:_committed;
@@ -447,14 +527,49 @@ void ConstraintGraphWorkspace::display(){
     _splitter->widget(1)->setVisible(_proposalView.valid);updateComparison();overlays();
 }
 void ConstraintGraphWorkspace::updateComparison(){
-    const bool available=_preview.valid&&!_placementOnly&&!_showCommitted->isChecked()&&_fiberView.valid&&_patchView.valid;
+    bool fibers=false,patches=false;
+    for(const auto& [id,p]:_preview.graph.nodes){fibers|=p.source->fiber;patches|=!p.source->fiber;}
+    const bool available=_preview.valid&&!_placementOnly&&!_showCommitted->isChecked()&&fibers&&patches;
     _compareSources->setEnabled(available);_patchOpacity->setEnabled(available&&_compareSources->isChecked());
-    if(available&&_compareSources->isChecked()){
+    if(available&&_compareSources->isChecked()&&_fiberView.valid&&_patchView.valid){
         _fiberView.graph.settings.volumeScale=_committed.graph.settings.volumeScale;
         _patchView.graph.settings.volumeScale=_committed.graph.settings.volumeScale;
         _view[0]->setSurfaceComparisonOpacity(_patchOpacity->value()/100.0f);
         _view[0]->setSurfaceComparison(displaySurface(_fiberView),displaySurface(_patchView));
-    }else _view[0]->setSurfaceComparison({},{});
+    }else {
+        _view[0]->setSurfaceComparison({},{});
+        if(available&&_compareSources->isChecked()&&!_comparisonBusy)requestComparison();
+    }
+}
+void ConstraintGraphWorkspace::cancelComparison(){
+    if(_comparisonCancel)_comparisonCancel->store(true);
+    ++_comparisonGeneration;_comparisonBusy=false;
+    if(_activity)_activity->finish(ConstraintGraphActivity::Comparison,tr("Stopped"));
+}
+void ConstraintGraphWorkspace::requestComparison(){
+    if(!_preview.valid||_comparisonBusy)return;
+    _comparisonBusy=true;
+    _activity->begin(ConstraintGraphActivity::Comparison,tr("Building fiber / patch comparison"));
+    auto cancel=std::make_shared<std::atomic_bool>(false);_comparisonCancel=cancel;
+    const auto generation=++_comparisonGeneration;auto graph=_preview.graph;
+    auto* watcher=new QFutureWatcher<Job>(this);
+    connect(watcher,&QFutureWatcher<Job>::finished,this,[this,watcher,generation]{
+        auto job=watcher->result();watcher->deleteLater();
+        if(generation!=_comparisonGeneration)return;
+        _comparisonBusy=false;
+        _activity->finish(ConstraintGraphActivity::Comparison,job.error.empty()&&job.fiberView.valid&&job.patchView.valid?tr("Ready"):tr("Unavailable"));
+        if(!job.error.empty()||!job.fiberView.valid||!job.patchView.valid){
+            QSignalBlocker blocker(_compareSources);_compareSources->setChecked(false);
+            report(tr("Source comparison unavailable: %1").arg(QString::fromStdString(job.error.empty()?job.fiberView.message+" "+job.patchView.message:job.error)));
+        }else{_fiberView=std::move(job.fiberView);_patchView=std::move(job.patchView);}
+        updateComparison();
+    });
+    watcher->setFuture(QtConcurrent::run(&_comparisonPool,[graph=std::move(graph),cancel]{
+        Job job;
+        try{job.fiberView=cg::renderSourceLayer(graph,true,cancel.get());job.patchView=cg::renderSourceLayer(graph,false,cancel.get());}
+        catch(const std::exception& error){job.error=error.what();}
+        return job;
+    }));
 }
 void ConstraintGraphWorkspace::initialView(){
     if(!_committed.valid)return;
@@ -483,6 +598,7 @@ void ConstraintGraphWorkspace::overlays(){
             if(!label.isEmpty()){auto* text=scene->addSimpleText(label);text->setBrush(color);text->setFlag(QGraphicsItem::ItemIgnoresTransformations);text->setZValue(31);_items[pane].push_back(text);_markers[pane].push_back({text,uv,{5,5}});}};
         const auto pathStart=profile?timer.nsecsElapsed():0;
         for(const auto& [id,p]:result.graph.nodes){
+            if(!vc3d::constraint_graph::showBoundary(id,_committed.graph,_showAllBoundaries->isChecked()))continue;
             QPainterPath path;const auto& n=*p.source;
             if(n.fiber){for(int i=0;i<n.cols;++i){auto q=point(p.uv[(n.rows/2)*n.cols+i]);if(i==0)path.moveTo(q);else path.lineTo(q);}}
             else{std::map<std::pair<int,int>,int> edges;for(const auto& t:n.triangles)for(int i=0;i<3;++i)++edges[std::minmax(t[i],t[(i+1)%3])];
@@ -561,14 +677,14 @@ void ConstraintGraphWorkspace::save(bool choose){
     if(!_committed.valid||_busy)return;
     QString path=_path;if(choose||path.isEmpty())path=QFileDialog::getSaveFileName(this,tr("Save constraint graph"),path,tr("Graph session (*.json)"));
     if(path.isEmpty()){_closing=false;return;}auto snapshot=_committed;
-    run([snapshot,path](auto*,auto){cg::saveSession(snapshot,path.toStdString());return Job{};},[this,path](Job){_path=path;_dirty=false;report(tr("Saved graph and tifxyz"));if(_closing){_closing=false;_draft.reset();_preview={};_proposalView={};emit closeReady();}});
+    run(tr("Saving graph and tifxyz"),[snapshot,path](auto*,auto){cg::saveSession(snapshot,path.toStdString());return Job{};},[this,path](Job){_path=path;_dirty=false;report(tr("Saved graph and tifxyz"));if(_closing){_closing=false;_draft.reset();_preview={};_proposalView={};emit closeReady();}},false);
     _saving=true;updateControls();
 }
 void ConstraintGraphWorkspace::openSession(const QString& path){
     if(_saving)return;
     if(_dirty&&QMessageBox::question(this,tr("Open graph"),tr("Discard unsaved graph changes?"))!=QMessageBox::Yes)return;
     stopDiscovery();report(tr("Opening saved graph…"));
-    run([path](auto* cancel,auto progress){Job j;j.fit=cg::loadSession(path.toStdString());auto s=j.fit.graph.settings;
+    run(tr("Opening saved graph"),[path](auto* cancel,auto progress){progress("Reading session and checking saved surface");Job j;j.fit=cg::loadSession(path.toStdString());auto s=j.fit.graph.settings;
         try {
             vc::lasagna::LasagnaDatasetOpenOptions options;options.workingToBaseScale=s.normalScale;
             j.dataset=std::make_shared<vc::lasagna::LasagnaDataset>(vc::lasagna::LasagnaDataset::openLocation(s.normalManifest,options));j.normals=std::make_shared<vc::lasagna::LasagnaNormalSampler>(*j.dataset);j.catalog=std::make_shared<cg::Catalog>(cg::loadCatalog(s,cancel,progress));

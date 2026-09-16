@@ -1,4 +1,5 @@
 #include "GraphInternal.hpp"
+#include "GraphPrepared.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberGeometry.hpp"
 #include "vc/atlas/FiberHvClassification.hpp"
@@ -9,6 +10,8 @@
 #include <boost/geometry/index/rtree.hpp>
 #include <fstream>
 #include <numeric>
+#include <optional>
+#include <thread>
 #include <set>
 #include "utils/thread_pool.hpp"
 
@@ -82,12 +85,46 @@ std::optional<PatchContact> patchContact(const Node& node,const QuadSurface& sur
     try { (void)detail::weights(node,location); } catch(const std::exception&) { return {}; }
     return PatchContact{location,hit->distance};
 }
+void addFiberPatchContacts(Graph& g,const Node& n,const QuadSurface& surface,
+                           const SurfacePatchIndex& index,const std::set<std::string>& included,
+                           const std::atomic_bool* cancel) {
+    std::set<std::pair<std::string,int64_t>> attached;
+    std::set<std::string> manual;
+    for(const auto& link:g.links.read()) {
+        const auto* other=link.a.node==n.id?&link.b:link.b.node==n.id?&link.a:nullptr;
+        if(!other)continue;
+        if(link.keypoint)manual.insert(other->node);
+        if(other->lineIndex>=0)attached.emplace(other->node,other->lineIndex);
+    }
+    // Discovery marks are local clusters. Verify all included fibers,
+    // including off-stride points, in either direction of graph growth.
+    // Bounds only prune impossible hits; the shared exact query decides.
+    cv::Vec3d low=cv::Vec3d::all(INFINITY),high=cv::Vec3d::all(-INFINITY);
+    for(const auto& xyz:n.xyz)if(detail::valid(xyz))for(int d=0;d<3;++d) {
+        low[d]=std::min(low[d],xyz[d]-g.settings.radius);
+        high[d]=std::max(high[d],xyz[d]+g.settings.radius);
+    }
+    for(const auto& [id,p]:g.nodes)if(included.contains(id)&&p.source->fiber&&!manual.contains(id)) {
+        const auto& fiber=*p.source;
+        for(size_t i=0;i<fiber.line.size();++i) {
+            detail::cancelled(cancel);const auto& xyz=fiber.line[i];
+            if(attached.contains({id,int64_t(i)}))continue;
+            if(xyz[0]<low[0]||xyz[0]>high[0]||xyz[1]<low[1]||xyz[1]>high[1]||xyz[2]<low[2]||xyz[2]>high[2])continue;
+            auto hit=patchContact(n,surface,index,xyz,g.settings.radius);if(!hit)continue;
+            // A winding fiber can revisit this XYZ on a distant chart
+            // traversal. Only extend the clicked placement locally, using
+            // the same four-spacing neighborhood as incremental fitting.
+            if(cv::norm(placedLocation(g,atLine(id,i))-placedLocation(g,hit->location))>4*g.settings.spacing)continue;
+            g.links.push_back({atLine(id,i),hit->location});
+        }
+    }
+}
 void alignNewNodes(Graph& g,const std::set<std::string>& existing) {
     auto placed=existing;
     if(placed.empty()&&!g.nodes.empty()) placed.insert(g.seed);
     while(placed.size()<g.nodes.size()) {
         bool progress=false;
-        for(const auto& link:g.links) {
+        for(const auto& link:g.links.read()) {
             auto a=link.a,b=link.b;
             if(!placed.contains(a.node)) std::swap(a,b);
             if(!placed.contains(a.node)||placed.contains(b.node)) continue;
@@ -126,13 +163,14 @@ void alignNewNodes(Graph& g,const std::set<std::string>& existing) {
         if(!progress) throw std::runtime_error("Addition is disconnected from the seed");
     }
 }
-void addFiberLinks(Graph& g,const Catalog& c) {
+void addFiberLinks(Graph& g,const Catalog& c,const std::set<std::string>* existing=nullptr) {
     for(const auto& link:c.links) {
+        if(existing&&existing->contains(link.a)&&existing->contains(link.b))continue;
         if(!g.nodes.contains(link.a)||!g.nodes.contains(link.b)) continue;
         auto a=atLine(link.a,c.fibers.at(link.a).controls.at(link.controlA));
         auto b=atLine(link.b,c.fibers.at(link.b).controls.at(link.controlB));
         bool found=false;
-        for(const auto& old:g.links) if(!old.keypoint&&old.a.node==a.node&&old.b.node==b.node&&old.a.lineIndex==a.lineIndex&&old.b.lineIndex==b.lineIndex) {found=true;break;}
+        for(const auto& old:g.links.read()) if(!old.keypoint&&old.a.node==a.node&&old.b.node==b.node&&old.a.lineIndex==a.lineIndex&&old.b.lineIndex==b.lineIndex) {found=true;break;}
         if(!found) g.links.push_back({a,b,false,link.pending});
     }
 }
@@ -171,7 +209,13 @@ Catalog loadCatalog(const Settings& settings,const std::atomic_bool* cancel,Prog
             }catch(const std::exception& e){centers.clear();centerError=e.what();}
         }
     }
-    for(const auto& path:entries(settings.fiberFolder)) {
+    const auto fiberPaths=entries(settings.fiberFolder);
+    size_t fiberFilesRead=0;
+    if(progress)progress("Reading fiber annotations");
+    for(const auto& path:fiberPaths) {
+        ++fiberFilesRead;
+        if(progress&&(fiberFilesRead%100==0||fiberFilesRead==fiberPaths.size()))
+            progress("Reading fiber annotations: "+std::to_string(fiberFilesRead)+" / "+std::to_string(fiberPaths.size())+" files");
         detail::cancelled(cancel); if(path.extension()!=".json") continue;
         try {
             auto json=readJson(path);auto parsed=fiber_tracer::parseVc3dFiberJson(json,path.string());
@@ -257,18 +301,38 @@ Catalog loadCatalog(const Settings& settings,const std::atomic_bool* cancel,Prog
     catch(const std::exception& e){detail::cancelled(cancel);out.cycleAudit.summary="Fiber cycle check unavailable: "+std::string(e.what());}
     if(!centerError.empty())out.cycleAudit.details.push_back("Cannot read umbilicus: "+centerError);
     auto bounds=std::make_shared<Catalog::BoundsIndex>();std::vector<Bound> values;
-    size_t count=0;
-    for(const auto& path:settings.patchFolder.empty()?std::vector<std::filesystem::path>{}:entries(settings.patchFolder)) {
-        detail::cancelled(cancel);if(!std::filesystem::is_directory(path)) continue;
-        try {
-            auto json=readJson(path/"meta.json");
-            auto bbox=json.at("bbox");
-            PatchEntry entry{"patch:"+path.filename().string(),path,vector3(bbox.at(0))*settings.patchScale,vector3(bbox.at(1))*settings.patchScale};
-            for(int d=0;d<3;++d) if(entry.low[d]>entry.high[d]) throw std::runtime_error("Inverted patch bounds");
-            values.push_back({Box(point(entry.low),point(entry.high)),out.patches.size()});
-            out.patches.push_back(std::move(entry));
-        }catch(const std::exception& e){out.warnings.push_back(path.filename().string()+": "+e.what());}
-        if(progress&&++count%1000==0) progress("Indexed "+std::to_string(count)+" patch bounds");
+    // Tens of thousands of patch folders, often on a network share: reading one
+    // meta.json at a time is bound by per-file latency. Read them on a pool in
+    // large batches and assemble entries and warnings in sorted folder order,
+    // so the catalog, its indices and its messages are unchanged.
+    const auto paths=settings.patchFolder.empty()?std::vector<std::filesystem::path>{}:entries(settings.patchFolder);
+    struct Indexed { std::optional<PatchEntry> entry; std::string warning; };
+    std::vector<Indexed> indexed(paths.size());
+    const size_t width=std::min<size_t>({32,std::max<size_t>(1,paths.size()),4*std::max(1u,std::thread::hardware_concurrency())});
+    utils::ThreadPool workers(width);
+    for(size_t start=0;start<paths.size();start+=4096) {
+        detail::cancelled(cancel);
+        const size_t stop=std::min(paths.size(),start+4096);
+        workers.run_indexed_batch(stop-start,[&](size_t i){
+            const auto& path=paths[start+i];auto& slot=indexed[start+i];
+            if(cancel&&cancel->load())return;
+            try {
+                if(!std::filesystem::is_directory(path)) return;
+                auto json=readJson(path/"meta.json");
+                auto bbox=json.at("bbox");
+                PatchEntry entry{"patch:"+path.filename().string(),path,vector3(bbox.at(0))*settings.patchScale,vector3(bbox.at(1))*settings.patchScale};
+                for(int d=0;d<3;++d) if(entry.low[d]>entry.high[d]) throw std::runtime_error("Inverted patch bounds");
+                slot.entry=std::move(entry);
+            }catch(const std::exception& e){slot.warning=path.filename().string()+": "+e.what();}
+        });
+        if(progress)progress("Indexed "+std::to_string(stop)+" / "+std::to_string(paths.size())+" patch folders");
+    }
+    detail::cancelled(cancel);
+    for(auto& slot:indexed) {
+        if(!slot.warning.empty())out.warnings.push_back(std::move(slot.warning));
+        if(!slot.entry)continue;
+        values.push_back({Box(point(slot.entry->low),point(slot.entry->high)),out.patches.size()});
+        out.patches.push_back(std::move(*slot.entry));
     }
     bounds->tree=decltype(bounds->tree)(values.begin(),values.end());out.boundsIndex=bounds;
     return out;
@@ -549,12 +613,18 @@ std::vector<Candidate> discover(const Catalog& c,const Graph& g,const std::strin
     }
     // Publish patch attachments first, before the separate patch-to-fiber scan.
     if(progress)progress("Searching nearby fiber contacts");
+    size_t fiberChecks=0;
+    const size_t patchChecks=std::count_if(g.nodes.begin(),g.nodes.end(),[&](const auto& entry){return !entry.second.source->fiber&&(selected.empty()||entry.first==selected);});
+    const size_t unplacedFibers=std::count_if(c.fibers.begin(),c.fibers.end(),[&](const auto& entry){return !g.nodes.contains(entry.first);});
     for(const auto& [id,placement]:g.nodes) {
         if(!selected.empty()&&id!=selected)continue;
         const auto& n=*placement.source;if(n.fiber)continue;
         auto surf=detail::sourceSurface(n);SurfacePatchIndex index;index.setSamplingStride(1);index.rebuild({surf});
         for(const auto& [fid,f]:c.fibers) {
             if(g.nodes.contains(fid)) continue;
+            ++fiberChecks;
+            if(progress&&(fiberChecks%50==0||fiberChecks==patchChecks*unplacedFibers))
+                progress("Checking fiber / patch pairs: "+std::to_string(fiberChecks)+" / "+std::to_string(patchChecks*unplacedFibers));
             detail::cancelled(cancel);
             for(size_t i:sampledLinePoints(f.line.size(),lineStride)) {
                 auto hit=patchContact(n,*surf,index,f.line[i],radius);if(!hit)continue;
@@ -567,8 +637,9 @@ std::vector<Candidate> discover(const Catalog& c,const Graph& g,const std::strin
     for(auto& [id,candidate]:results)append(std::move(candidate));
     std::stable_sort(out.begin(),out.end(),[](const auto& a,const auto& b){return a.distance!=b.distance?a.distance<b.distance:a.id<b.id;});return out;
 }
-Graph propose(const Catalog& c,const Graph& committed,const Candidate& candidate,bool whole,const lasagna::NormalSampler& sampler,const std::atomic_bool* cancel) {
-    Graph g=committed;std::set<std::string> existing;for(const auto& [id,p]:g.nodes) existing.insert(id);
+namespace {
+void appendProposal(Graph& g,const Catalog& c,const Graph& committed,const Candidate& candidate,bool whole,const lasagna::NormalSampler& sampler,const std::atomic_bool* cancel) {
+    std::set<std::string> existing;for(const auto& [id,p]:g.nodes) existing.insert(id);
     // Keep the clicked attachment first for initial placement; other contacts
     // participate in the same joint fit rather than defining separate patches.
     g.links.insert(g.links.end(),candidate.contacts.begin(),candidate.contacts.end());
@@ -584,36 +655,7 @@ Graph propose(const Catalog& c,const Graph& committed,const Candidate& candidate
         auto n=loadPatchNode(*it,g.settings);g.nodes.emplace(n->id,Placement{n,n->initialUv});
         alignNewNodes(g,existing);
         auto surface=detail::sourceSurface(*n);SurfacePatchIndex index;index.setSamplingStride(1);index.rebuild({surface});
-        std::set<std::pair<std::string,int64_t>> attached;
-        std::set<std::string> manual;
-        for(const auto& link:g.links) {
-            const auto* other=link.a.node==n->id?&link.b:link.b.node==n->id?&link.a:nullptr;
-            if(!other)continue;
-            if(link.keypoint)manual.insert(other->node);
-            if(other->lineIndex>=0)attached.emplace(other->node,other->lineIndex);
-        }
-        // Discovery marks are local clusters. Once a patch is chosen, verify
-        // its contacts against every placed fiber, including off-stride points.
-        // Bounds only prune impossible hits; the shared exact query decides.
-        cv::Vec3d low=cv::Vec3d::all(INFINITY),high=cv::Vec3d::all(-INFINITY);
-        for(const auto& xyz:n->xyz)if(detail::valid(xyz))for(int d=0;d<3;++d) {
-            low[d]=std::min(low[d],xyz[d]-g.settings.radius);
-            high[d]=std::max(high[d],xyz[d]+g.settings.radius);
-        }
-        for(const auto& [id,p]:committed.nodes)if(p.source->fiber&&!manual.contains(id)) {
-            const auto& fiber=*p.source;
-            for(size_t i=0;i<fiber.line.size();++i) {
-                detail::cancelled(cancel);const auto& xyz=fiber.line[i];
-                if(attached.contains({id,int64_t(i)}))continue;
-                if(xyz[0]<low[0]||xyz[0]>high[0]||xyz[1]<low[1]||xyz[1]>high[1]||xyz[2]<low[2]||xyz[2]>high[2])continue;
-                auto hit=patchContact(*n,*surface,index,xyz,g.settings.radius);if(!hit)continue;
-                // A winding fiber can revisit this XYZ on a distant chart
-                // traversal. Only extend the clicked placement locally, using
-                // the same four-spacing neighborhood as incremental fitting.
-                if(cv::norm(placedLocation(g,atLine(id,i))-placedLocation(g,hit->location))>4*g.settings.spacing)continue;
-                g.links.push_back({atLine(id,i),hit->location});
-            }
-        }
+        addFiberPatchContacts(g,*n,*surface,index,existing,cancel);
         // Actual 3-D overlap couples every already accepted patch into the same fit.
         for(const auto& [id,p]:committed.nodes) if(!p.source->fiber) {
             detail::cancelled(cancel);
@@ -626,6 +668,34 @@ Graph propose(const Catalog& c,const Graph& committed,const Candidate& candidate
             }
         }
     }
-    addFiberLinks(g,c);alignNewNodes(g,existing);return g;
+    addFiberLinks(g,c,&existing);alignNewNodes(g,existing);
+    if(candidate.fiber) {
+        std::set<std::string> added;
+        for(const auto& [id,p]:g.nodes)if(!existing.contains(id))added.insert(id);
+        for(const auto& [id,p]:committed.nodes)if(!p.source->fiber) {
+            detail::cancelled(cancel);
+            auto surface=detail::sourceSurface(*p.source);
+            SurfacePatchIndex index;index.setSamplingStride(1);index.rebuild({surface});
+            addFiberPatchContacts(g,*p.source,*surface,index,added,cancel);
+        }
+    }
+}
+}
+Graph propose(const Catalog& c,const Graph& committed,const Candidate& candidate,bool whole,const lasagna::NormalSampler& sampler,const std::atomic_bool* cancel) {
+    Graph g=committed;appendProposal(g,c,committed,candidate,whole,sampler,cancel);return g;
+}
+GraphEdit proposeEdit(const Catalog& c,std::shared_ptr<const PreparedGraph> base,const Candidate& candidate,bool whole,
+                      const lasagna::NormalSampler& sampler,const std::atomic_bool* cancel){
+    if(!base)throw std::runtime_error("Proposal has no committed revision");
+    const auto& committed=base->accepted.graph;
+    if(committed.nodes.contains(candidate.id))throw std::runtime_error("Proposal is already committed");
+    // The placement map shares UV storage; only the new nodes and links are
+    // writable. Accepted contacts never enter proposal construction.
+    Graph context;context.settings=committed.settings;context.seed=committed.seed;context.nodes=committed.nodes;
+    appendProposal(context,c,committed,candidate,whole,sampler,cancel);
+    GraphEdit edit;edit.base=std::move(base);
+    for(auto& [id,p]:context.nodes)if(!committed.nodes.contains(id))edit.addedNodes.emplace(id,std::move(p));
+    edit.addedLinks=context.links.read();
+    return edit;
 }
 } // namespace vc::constraints

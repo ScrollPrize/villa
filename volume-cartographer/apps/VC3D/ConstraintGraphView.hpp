@@ -3,6 +3,15 @@
 #include <limits>
 
 namespace vc3d::constraint_graph {
+// Membership in the accepted graph distinguishes proposals in either pane,
+// including all new fibers in a proposed linked component.
+inline bool showBoundary(const std::string& id,
+                         const vc::constraints::Graph& committed,
+                         bool showAllBoundaries)
+{
+    return showAllBoundaries || !committed.nodes.contains(id);
+}
+
 struct InitialView {
     cv::Vec2d center{0,0};
     double scale = .5;

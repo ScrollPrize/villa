@@ -10,6 +10,7 @@
 #include <tuple>
 
 class ConstraintGraphSelectionBar;
+class ConstraintGraphActivity;
 class CState;
 class ViewerManager;
 class VolumeViewerBase;
@@ -52,12 +53,15 @@ private:
         std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
         std::shared_ptr<vc::lasagna::LasagnaNormalSampler> normals;
         vc::constraints::FitResult fit,proposalView,fiberView,patchView;
+        std::shared_ptr<const vc::constraints::PreparedGraph> prepared;
+        std::optional<vc::constraints::GraphEdit> edit;
+        bool fullFit=false;
         std::vector<vc::constraints::Candidate> candidates;
         std::string error;
         std::string notice;
     };
     using Worker=std::function<Job(const std::atomic_bool*,vc::constraints::Progress)>;
-    void run(Worker,std::function<void(Job)>);
+    void run(const QString& title,Worker,std::function<void(Job)>,bool stoppable=true);
     vc::constraints::Settings settings() const;
     void setSettings(const vc::constraints::Settings&);
     void seed(int component);
@@ -69,7 +73,10 @@ private:
     void selectCandidate(int delta);
     void rebuildPreview(bool fitView=false);
     void installPreview(Job);
-    void fitPreview(vc::constraints::Graph, vc::constraints::Graph, std::string, bool fitView=false);
+    void fitPreview(vc::constraints::Graph, std::string, bool fitView=false, bool full=false);
+    void finishPreview(Job, bool fitView=false);
+    void cancelComparison();
+    void requestComparison();
     void commit();
     void cancelPreview();
     void navigateHistory(bool redo);
@@ -96,14 +103,15 @@ private:
     VolumeViewerBase* _view[2]{};
     QSplitter* _splitter{};
     ConstraintGraphSelectionBar* _bar{};
+    ConstraintGraphActivity* _activity{};
     QComboBox* _volume{}, *_normal{}, *_component{}, *_discoveryStride{};
     QLineEdit* _fibers{}, *_patches{};
     QDoubleSpinBox* _radius{}, *_fiberScale{}, *_patchScale{}, *_normalScale{}, *_volumeScale{}, *_stiffness{};
-    QCheckBox* _whole{}, *_showCommitted{};
+    QCheckBox* _whole{}, *_showCommitted{}, *_showAllBoundaries{};
     QCheckBox* _compareSources{};
     QSlider* _patchOpacity{};
     QPushButton* _commit{}, *_pair{}, *_previous{}, *_next{}, *_cancelButton{};
-    QLabel* _candidateLabel{}, *_status{}, *_audit{};
+    QLabel* _candidateLabel{}, *_audit{};
     QListWidget* _pairs{};
     std::vector<QGraphicsItem*> _items[2];
     QPointer<OverlayBatchItem> _overlayRoot[2];
@@ -118,6 +126,8 @@ private:
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> _normals;
     vc::constraints::FitResult _committed, _preview, _proposalView;
     vc::constraints::FitResult _fiberView, _patchView;
+    std::shared_ptr<const vc::constraints::PreparedGraph> _prepared;
+    std::optional<vc::constraints::GraphEdit> _previewEdit, _prepareEdit;
     std::optional<vc::constraints::Graph> _draft;
     std::vector<vc::constraints::FitResult> _undo,_redo;
     std::vector<vc::constraints::Candidate> _candidates, _available;
@@ -132,11 +142,16 @@ private:
     std::optional<vc::constraints::Location> _firstPair;
     bool _matching=false,_busy=false,_dirty=false,_closing=false;
     bool _saving=false, _placementOnly=false;
+    bool _fullPreview=false;
     struct CachedPreview { vc::constraints::Candidate candidate; bool whole; Job job; };
     std::vector<CachedPreview> _previewCache;
     std::optional<vc::constraints::Candidate> _activeCandidate;
     QString _path;
     QThreadPool _pool;
+    QThreadPool _comparisonPool;
+    std::shared_ptr<std::atomic_bool> _comparisonCancel;
+    uint64_t _comparisonGeneration=0;
+    bool _comparisonBusy=false;
     uint64_t _generation=0;
     std::shared_ptr<std::atomic_bool> _cancel;
 };

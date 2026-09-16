@@ -28,22 +28,27 @@ Missing support remains invalid rather than connecting unrelated boundaries.
 - Drag the **Drag to move** handle on the selection bar to place it anywhere in
   the workspace. It stays there through selection and camera changes.
 - Patches have distinct outline colors, shared between the graph and source
-  panes. Selecting a patch thickens its outline without changing its color.
+  panes. Only proposals show colored fiber lines and patch boundaries by default;
+  their boundaries disappear on **Commit**. Enable **Show all boundaries** in
+  the toolbar to show committed objects' boundaries too. Selecting a patch
+  thickens its visible outline without changing its color.
 - After a proposal finishes fitting, enable **Compare fiber / patch CT** in
   the selection bar. **Patch opacity** blends the independently sampled patch
   CT over the fiber CT at their fitted chart positions: 0% shows fibers, 50%
   exposes texture misalignment, and 100% shows patches where they have coverage.
   Patch holes leave the fiber image visible. Disable comparison to return to
   the joint surface. This changes display only; it does not refit or affect
-  Commit, saved geometry, or export. The control is unavailable during the
-  initial fit, with **Show committed**, or without both source layers.
+  Commit, saved geometry, or export. Comparison layers are generated on demand
+  in a separate cancellable worker; Commit remains available while they load.
+  The control is unavailable during the initial fit, with **Show committed**,
+  or without both source types.
 - Use **Tab / Shift+Tab** or the arrows in the selection bar to cycle proposals.
-- The main pane renders the proposed joint placement from the selected volume.
-  An initial attachment appears while the full joint fit runs; **Commit** stays
-  disabled until fitting and geometry validation succeed. The initial attachment
-  can move during fitting. The last three completed previews are cached until
+- The main pane keeps the accepted surface visible while the attachment fits.
+  The second pane shows the proposed source as soon as it is loaded. A validated
+  local fit replaces the main pane's surface and enables **Commit**.
+  The last three completed previews are cached until
   the committed graph or its settings change.
-  The second pane renders the proposed source separately. **Show committed**
+  **Show committed**
   temporarily restores the accepted graph in the main pane.
 - To adjust alignment, choose **Add keypoint pair**, click a recognizable feature
   in the proposal pane, then its match in the main pane. Add another pair to
@@ -53,11 +58,21 @@ Missing support remains invalid rather than connecting unrelated boundaries.
   Undo and redo operate on committed edits.
 - Selecting a committed patch finds nearby unplaced fibers. **Include linked
   component** adds all fibers linked to the proposed fiber.
+- If an attachment cannot pass validation within the local work budget, its
+  proposal stays available and the status asks for **Refit graph**. That action
+  fits the accepted graph together with the pending addition; review the result
+  and **Commit** or **Cancel**. Ordinary selection never starts a full refit.
 
 Ordinary additions refit the patch, overlapping neighbors, and nearby sections
 of fibers. Distant accepted chart vertices and surface samples remain fixed.
+When adding fibers, the local region includes the entire accepted patches they
+contact, so their existing UV distortion can relax across patch boundaries.
+If this joint fit exceeds its work budget, the proposal requests **Refit graph**;
+it does not accept a fallback that freezes those patches and bends only the fiber.
 Selecting a patch verifies every dense point on every placed fiber against
-that patch, independently of the discovery stride. These contacts constrain
+that patch, independently of the discovery stride. Adding a fiber or linked
+component performs the same verification against every accepted patch; other
+fibers in the new component also receive their own patch contacts. These contacts constrain
 the joint fit in addition to the clicked cluster. Contacts must pass the same
 3D proximity check and lie within four grid intervals (80 vx by default) of
 the patch's initial placement in the accepted chart. This prevents a fiber
@@ -65,7 +80,12 @@ that revisits the same 3D region on a distant traversal from pulling separate
 parts of the layout together. Manual keypoint pairs still replace automatic
 matches between their node pair.
 Real 3D patch overlaps add correspondence constraints; symmetric Dirichlet terms
-penalize stretching and compression in both the chart and output grid. Invalid fits cannot be committed. Spacing ratio
+penalize stretching and compression in both the chart and output grid. In
+incremental fits both accepted and added fibers are the reference frame: their charts
+resist deformation ten times harder than before and an added patch's chart
+half as hard, so a patch deforms onto the fibers it touches instead of bending
+them (see *Fibers as the reference frame* below). Source fiber and patch XYZ
+are never rewritten by any of this. Invalid fits cannot be committed. Spacing ratio
 and attachment RMS in the status area describe fit quality; they are not a
 guarantee that the selected patches follow the correct sheet. Inspect fiber
 continuity in the rendered volume before committing.
@@ -73,8 +93,10 @@ continuity in the rendered volume before committing.
 Horizontal fibers share a fitted row and vertical fibers share a fitted column.
 Each fiber can bend within two grid spacings (40 voxels) on either side of its
 row/column without an alignment penalty; larger departures are penalized softly.
-This applies during rigid alignment and joint deformation, so a small local
-tilt cannot accumulate into large drift across the graph. Use **Refit graph**
+An additional endpoint constraint keeps each horizontal level end to end and
+each vertical upright, while retaining local bends inside that band. Both
+constraints apply during rigid alignment and joint deformation, including when
+a patch attaches to several fibers. Use **Refit graph**
 to preview this alignment on an existing session, then **Commit** or **Cancel**.
 
 At explicit horizontal–vertical links, the horizontal supplies the 3D position
@@ -116,6 +138,22 @@ The output grid is limited to 16 million samples. Input folders should remain
 unchanged during a session.
 
 ## Navigation and interaction
+
+The **Activity** panel stays visible below the viewers. It shows the current
+operation, its latest stage, elapsed time, and an animated busy indicator.
+**Refit graph** reports alignment, flattened-layout fitting, and output-surface
+refinement iterations. Iteration limits are per solve, not an overall percentage
+or an estimated completion time; local fits can expand and repeat a solve.
+File loading and attachment discovery report counts where available.
+
+Attachment search and source comparison have independent activity rows, so
+background work cannot replace a refit's progress. **Show activity log** retains
+the last 200 messages, including failures and completed stages. Errors remain
+selectable in the panel instead of being duplicated in the sidebar and status
+bar. **Stop operation** requests cancellation and shows **Stopping…** until the
+worker actually returns. It is disabled during save/export, which do not support
+interrupting file writes. A long individual solver step or file read can delay
+cancellation; the elapsed clock continues while waiting.
 
 Opening a graph or selecting a new seed component centers a seed-fiber junction
 at ten screen pixels per grid interval (0.5 pixels per graph voxel with the
@@ -214,8 +252,8 @@ do not trigger a warning. Any uncertain span makes its entire fiber uncertain.
 From the repository root, with the existing CMake configuration and dependencies:
 
 ```sh
-AGENTS_AGENT_MODE=1 ninja -C volume-cartographer/build VC3D test_constraint_graph test_constraint_graph_overlay constraint_graph_probe -j 4
-QT_QPA_PLATFORM=offscreen ctest --test-dir volume-cartographer/build --output-on-failure -R '^constraint_graph(_overlay)?$'
+AGENTS_AGENT_MODE=1 ninja -C volume-cartographer/build VC3D test_constraint_graph test_constraint_graph_overlay test_constraint_graph_activity constraint_graph_probe -j 4
+QT_QPA_PLATFORM=offscreen ctest --test-dir volume-cartographer/build --output-on-failure -R '^constraint_graph(_overlay|_activity)?$'
 volume-cartographer/build/bin/VC3D
 ```
 
@@ -306,6 +344,206 @@ trimming, arclength mapping, chart handedness, isotropy, real surface proximity,
 patch overlaps, component growth, paired registration, cancellation, malformed
 sessions, and save/reopen.
 
+Activity tests cover independent foreground/background rows, retained history,
+late updates after completion, and stop-button availability. Solver tests verify
+iteration reporting, cancellation from a progress callback, and identical chart
+and surface results with and without reporting. An isolated offscreen VC3D was
+also exercised with `/home/sean/Desktop/new_graph_2.json`: opening/preparing,
+concurrent discovery, full-refit iteration reporting, and acknowledged Stop were
+observed without modifying the session. Captures are
+`/tmp/cg-progress-validation/refit.png` and `cancelled.png`.
+Repeating the 440-contact fiber addition below produced iteration updates
+throughout its 26-second fit, followed by surface-refinement updates. Its graph
+JSON and saved-surface checksum were identical to the fit before progress was
+added; the resulting session also reopened exactly.
+
+## Prepared graph and bounded attachments
+
+The workspace prepares each accepted graph revision once. This caches chart
+bounds and triangle blocks, contact interpolation weights and incident-contact
+lists, horizontal/vertical junction geometry, and distortion statistics. A
+proposal contains added sources and added/removed contacts relative to that
+revision. It does not copy and compare the full contact list to rediscover the
+edit. Chart UV and contact storage use copy-on-write snapshots for previews and
+history; immutable source XYZ remains shared.
+
+The chart solve gathers only affected triangles and contacts, retaining fixed
+boundary constraints and their original order. The surface update rasterizes
+the affected region and reuses distant accepted samples. Cached statistics for
+unchanged charts and 64×64 surface tiles avoid remeasuring their geometry.
+After Commit, preparation reuses unchanged chart, junction, contact-weight,
+and tile data. Cancellation and revision checks prevent old fit or comparison
+results from replacing a newer preview.
+
+Ordinary edits have a deterministic work budget: four chart attempts, at most
+32,768 movable chart vertices plus the sizes of accepted patches contacted by
+new fibers (capped at 131,072 total), and four surface expansions covering at most
+262,144 grid sites. If neighborhood fitting fails, additions other than fibers
+contacting accepted patches get one attempt against fixed accepted charts.
+The same residuals, precision, attachment
+tolerance, and geometry checks apply. A remaining failure requests an explicit
+**Refit graph**; it cannot be committed. These are work limits, not relaxed
+acceptance thresholds or a hard wall-clock deadline. Full seed construction
+and explicit refitting can still be expensive.
+
+The existing dense QuadSurface still requires a final grid copy, and exact
+global quality reporting aggregates cached values. Completed edits materialize
+the contact list once. Thus the entire preview path is not constant-time in
+graph size; the expensive geometry and solver setup now follow the local edit.
+The older `fitIncremental` API remains available for comparison tests; the
+workspace uses `proposeEdit` / `fitEdit`.
+
+### Reproducing attachment measurements
+
+Use the build commands above. The following commands read the supplied input
+and write only explicitly requested output sessions. Catalog loading and
+preparing the accepted revision happen before each repeated-selection timer;
+`prepare_ms` reports preparation separately. Timed work includes proposal
+construction, source preview, and validated fitting, but not CT tile painting,
+comparison layers, saving, or discovery.
+
+```sh
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 VC3D_PROFILE_CONSTRAINT_FIT=1 \
+  volume-cartographer/build/bin/constraint_graph_probe \
+  --edit-proposal-benchmark /home/sean/Desktop/new_graph_2.json 3
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 \
+  volume-cartographer/build/bin/constraint_graph_probe \
+  --edit-proposal-scan /home/sean/Desktop/new_graph_2.json 15
+mkdir -p /tmp/constraint-graph-fresh
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 \
+  volume-cartographer/build/bin/constraint_graph_probe \
+  --fresh-edit-growth /home/sean/Desktop/new_graph_2.json /tmp/constraint-graph-fresh/growth 4
+```
+
+The fresh-growth command takes only locations and coordinate settings from the
+session, constructs a fresh largest fiber component, and commits successive
+valid local additions with incremental cache preparation. Each saved result
+must reopen with exactly the same surface. It reports rejected candidates too,
+without silently refitting them globally. The proposal benchmark accepts an
+optional output prefix, candidate index or source ID, and selected node ID (`patch` selects
+the first accepted patch).
+An additional final proximity argument overrides the radius in memory for a
+diagnostic run; the input session is not modified. `discovered_contacts` counts
+all discovery clusters for the selected source, whereas `contacts` counts the
+clicked cluster. Attachment comparison includes both link orientations.
+
+### Adding fibers to warped committed patches
+
+The old local region could cut through a committed patch before its deformation
+had settled. Exceeding the 32,768-vertex budget then retried with every accepted
+chart frozen, producing a valid preview in which only the new fiber deformed.
+Fiber additions now include the full bounds of every accepted patch contacted
+by the addition, allow room for those patches in the bounded solve, and use the
+same fiber stiffness for new and accepted fibers. If that joint fit still fails,
+it requests **Refit graph** instead of freezing the patches. Patch additions and
+the full-refit objective retain their previous behavior.
+
+Real-data validation used `new_graph_2.json`, patch `band-seed3889268…117`, and
+horizontal fiber `anon_20260822T114841824_000171.json`. The saved radius is 2 vx
+and finds no proposal for that pair. This diagnostic uses 20 vx to exercise its
+440-contact crossing; it does not change the application's proximity default.
+From the repository root, after the build above:
+
+```sh
+mkdir -p /tmp/cg-warp-validation/empty-patches
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 \
+  VC3D_BENCHMARK_PATCH_FOLDER=/tmp/cg-warp-validation/empty-patches \
+  volume-cartographer/build/bin/constraint_graph_probe \
+  --edit-proposal-benchmark /home/sean/Desktop/new_graph_2.json 1 \
+  /tmp/cg-warp-validation/result \
+  fiber:anon_20260822T114841824_000171.json \
+  patch:band-seed3889268-20260729-161032-117.tifxyz 20
+```
+
+The empty patch catalog avoids indexing unrelated patches during fiber discovery;
+the committed patches are embedded in the session. On Linux arm64,
+RelWithDebInfo, one run per version, the old path froze all 119 accepted charts.
+The corrected path deformed the six contacted patches and the nearby portion of
+one accepted fiber; the other 112 charts remained exactly unchanged. On the
+last patch, attachment RMS fell from 2.507 to 1.153 vx and maximum error from
+15.192 to 7.148 vx; its largest UV correction was 39.107 vx. Source geometry was
+identical, 7,307,352 distant output samples were unchanged, and the saved result
+reopened exactly. Fitting took 23.2 s before and 26.1 s after on this shared host;
+large patch corrections can still take tens of seconds.
+
+`addedFiberDeformsCommittedPatch` fails on the previous frozen-patch fallback
+and passes with the correction. It checks actual patch movement, preservation
+of the new fiber's length, immutable sources, and distant reference vertices.
+All 34 constraint-graph cases and the overlay, spiral-brush, and agent-bridge
+contract suites pass.
+
+### Prepared attachment measurements
+
+On Linux arm64, the existing RelWithDebInfo build (`-O2 -g -DNDEBUG`), three
+warm-cache repetitions of candidate 0 (`band-seed3879901…821`, 9 clicked
+contacts) on `new_graph_2.json` gave:
+
+| Path | Mean | Minimum | Median | Maximum |
+| --- | ---: | ---: | ---: | ---: |
+| Previous workspace proposal/source/initial-placement/local-fit path | 1,576.06 ms | 1,559.33 ms | 1,579.69 ms | 1,589.16 ms |
+| Prepared edit proposal/source/local-fit path | 97.35 ms | 95.26 ms | 96.18 ms | 100.60 ms |
+
+Preparation took 111.89 ms once. Both fits report attachment RMS 0.135639 vx,
+95% spacing ratio 1.03235, and 334 movable chart vertices / 352 surface
+samples. The baseline command was `--local-proposal-benchmark` with the same
+input and three repetitions, recorded before the restructuring. These are
+RelWithDebInfo measurements, not Release or cross-platform claims.
+They are diagnostic runs on a shared host, not isolated performance-lab results.
+
+Ceres reports accounted for only about 8.6 ms of the old path. A 120-sample
+GDB profile found 62 samples in full contact-multiset comparison/tree work;
+the old path also rendered the entire initial placement before local fitting.
+The prepared path eliminates those passes. Its phase trace spends roughly
+15 ms proposing, 1 ms gathering the local problem, 4 ms fitting charts,
+48–53 ms updating the surface, and 27 ms materializing final contacts.
+
+Regression coverage compares prepared and legacy local fits, preserves distant
+samples and immutable sources, checks incremental preparation against a full
+cache rebuild, exercises manual contact overrides/removal and invalid edits,
+checks snapshot isolation, and verifies exact surface save/reopen. The
+constraint graph, overlay, surface-index, spiral-brush, and agent-bridge
+contract test suites pass.
+
+Fresh source construction produced a 91-fiber seed. Four successive valid
+patch commits took 52.36, 272.97, 67.05, and 183.44 ms (mean 143.96, median
+125.25 ms); incremental preparation after each commit took 0.94–1.53 ms.
+Two intervening attempts at `band-seed11286360…611` requested an explicit refit
+in 2.38 and 2.42 seconds. Those are rejections, not completed-fit speedups.
+Every accepted surface round-tripped exactly.
+
+A separate branch of that fresh graph adds `band-seed1121911…930`, then
+`fiber:anon_20260816T200950449_000106.json` with 88 clicked contacts:
+
+```sh
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 volume-cartographer/build/bin/constraint_graph_probe \
+  --edit-proposal-benchmark /tmp/constraint-graph-fresh/growth.0.json 3 \
+  /tmp/constraint-graph-fresh/bridge patch:band-seed1121911-20260729-203225-930.tifxyz
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 VC3D_PROFILE_CONSTRAINT_FIT=1 \
+  volume-cartographer/build/bin/constraint_graph_probe \
+  --edit-proposal-benchmark /tmp/constraint-graph-fresh/bridge.session.json 3 \
+  /tmp/constraint-graph-fresh/fiber 0 patch:band-seed1121911-20260729-203225-930.tifxyz
+```
+
+The bridge patch took mean 187.10 ms (min/median/max 182.64/189.13/189.52).
+The fiber took mean 487.12 ms (min/median/max 466.24/484.15/510.98), with all
+three fits valid: RMS 0.092951 vx, spacing ratio 1.01898, 4,970 chart vertices,
+and 4,979 surface samples. It added one fiber, and the saved surface reopened
+exactly. This fresh-layout measurement is not directly comparable to the older
+saved-layout fiber timings below.
+
+An offscreen Qt app smoke test with `s1_ds2.zarr` and the fresh seed clicked a
+visible proposal (`band-seed11523519…`): its source appeared at 53 ms and Commit
+became enabled at 212 ms. Comparison loading left Commit enabled; 0/50/100%
+comparison, restoration, commit, undo, and redo completed. CT tile loading is
+asynchronous; these are control-availability timings, not complete CT-paint
+timings. macOS and amd64 have not been run in this environment.
+
+## Earlier implementation measurements
+
+The following benchmark history records earlier implementations and objectives.
+In particular, references to automatic background global fitting and eager
+comparison-layer rendering do not describe the current workspace.
+
 ## Proposal preview benchmark
 
 Build and test from the repository root (no dependency installation needed):
@@ -368,11 +606,11 @@ The neighborhood doubles when the last free ring moves more than one quarter
 of the proximity tolerance (1 vx at the default), or a boundary edge changes
 length by more than a factor of 1.02. These checks apply to both chart and
 surface boundaries. New attachment errors must also meet the proximity limit.
-There are at most four chart attempts. Each settled chart can expand its XYZ
-surface region independently up to four times, retaining the same boundary and
-geometry checks. Broad edits (over two thirds of source
-vertices), unresolved boundary strain/validation failures, changed global
-settings, and explicit **Refit graph** use the global solver.
+The chart region keeps doubling while its boundary remains strained, and each
+settled chart can expand its XYZ surface region independently, retaining the
+same boundary and geometry checks (see *Local expansion instead of the global
+fallback* below). Broad edits (over two thirds of source vertices), changed
+global settings, and explicit **Refit graph** use the global solver.
 
 The shared surface is rasterized and optimized only around changed triangles,
 including their old footprint and a margin. A fixed outer ring supplies the
@@ -384,7 +622,8 @@ building or solving an optimization problem for distant geometry.
 Local results can differ slightly from a global relaxation because their
 surroundings are fixed. Solver precision, iteration limits, symmetric Dirichlet
 terms, proximity settings, no-flip checks, and commit gating are unchanged.
-An invalid proposal can still require a slow global fallback before rejection.
+An invalid proposal is rejected by the local path; the workspace then asks the
+full solver for its verdict in the background (see below).
 
 ### Measurements
 
@@ -640,3 +879,371 @@ radius, stride and scale, sampling across batch boundaries, streamed cancellatio
 and independent surface expansion with fixed distant samples. An isolated
 offscreen VC3D run opened the real 91-fiber session with `s1_ds2.zarr` and displayed
 CT and proposal markers (`/tmp/cg-speed-ui.png`). macOS and amd64 were not exercised.
+
+
+## Fit alignment and solver benchmark
+
+A large attachment error first receives rigid registration. If that brings the
+RMS within the existing proximity tolerance, fitting proceeds directly to the
+axis-aligned deformation solve. Graphs with unresolved loop errors still receive
+the initialization deformation pass. Triangle and correspondence Jacobians are
+computed analytically; residuals, double precision, solver tolerances, single-thread
+execution, distortion penalties and inverted-triangle rejection are unchanged.
+The added endpoint constraints and completed fiber-to-patch contacts intentionally
+change the fitted layout. Source coordinates and annotations remain immutable.
+
+Build, test, and reproduce from the repository root:
+
+```sh
+AGENTS_AGENT_MODE=1 ninja -C volume-cartographer/build VC3D constraint_graph_probe test_constraint_graph test_constraint_graph_overlay -j 4
+AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen ctest --test-dir volume-cartographer/build --output-on-failure -R '^constraint_graph(_overlay)?$'
+AGENTS_AGENT_MODE=1 volume-cartographer/build/bin/constraint_graph_probe --fit-benchmark /home/sean/Desktop/patch_test.json 3 /tmp/patch-refitted.json
+AGENTS_AGENT_MODE=1 volume-cartographer/build/bin/constraint_graph_probe --fit-benchmark /tmp/constraint-graph-real/axis-aligned-grown.json 3 /tmp/multi-refitted.json
+volume-cartographer/build/bin/VC3D
+```
+
+Set `VC3D_PROFILE_CONSTRAINT_FIT=1` on the probe or VC3D to print Ceres timing,
+iteration and convergence reports separately for rigid, chart and shared-surface
+solves. This is opt-in and does not change solver settings.
+
+Linux arm64, GCC 13.3, RelWithDebInfo, three full refits of each unchanged input
+per version. Session loading and output serialization are outside the timer.
+These measurements cover the core fit, not CT loading or UI painting.
+
+| Input | Version | Mean ms | Min / median / max ms |
+| --- | --- | ---: | ---: |
+| `patch_test.json`: 91 fibers, one patch, 339,419 vertices | Before | 34,513.9 | 34,218.5 / 34,335.7 / 34,987.6 |
+| Same | After | 13,536.1 | 13,284.3 / 13,439.1 / 13,884.8 |
+| `axis-aligned-grown.json`: 92 fibers, eight patches, 370,742 vertices | Before | 26,509.8 | 26,062.6 / 26,635.3 / 26,831.4 |
+| Same | After | 24,797.2 | 24,017.8 / 25,100.4 / 25,273.3 |
+
+On `patch_test.json`, attachment RMS changed from 0.004657 to 0.005530 voxels
+and spacing-ratio p95 from 1.01689 to 1.01960. Maximum horizontal endpoint tilt
+fell from 1.10244 degrees to 0.000021 degrees; the real fibers retain their local
+bends. On the eight-patch input, attachment RMS was 0.094687 before and 0.094692
+after, with spacing-ratio p95 1.01503 and 1.01486. All six final fits passed the
+existing geometry checks. The larger graph still takes about 25 seconds.
+
+A 150-sample GDB profile of the baseline initialization found 39 samples in
+sparse factorization stacks, nine in chart-metric autodiff, and 102 in other
+Ceres/evaluation/allocation work. Hardware perf events were unavailable. Ceres
+reports on the one-patch fit show the unnecessary initialization chart pass
+costing about 12 seconds; the final chart solve now takes 4–5 seconds and the
+shared XYZ solve about 8 seconds. The latter remains a substantial cost.
+Analytic Jacobians were checked against automatic differentiation, including
+reflected charts, partial Jacobian requests and rejected degenerate triangles.
+An isolated analytic-only refit differed by at most 7.4e-8 voxels in UV from the
+baseline due to floating-point derivative arithmetic; this is not a claim of
+bit-identical solver output.
+
+Regression coverage includes level fibers under dense two-fiber patch contacts,
+local bend preservation, both directions of multi-source contact discovery,
+manual-pair precedence, proximity/traversal rejection, cancellation, omitted
+redundant deformation passes, exact saved-surface restoration and fixed distant
+geometry on local edits. The new attachment and redundant-pass regressions fail
+against the original library. Ubuntu arm64 was exercised; macOS and amd64 were
+not tested in this run. Use **Refit graph**, inspect the preview, then **Commit**
+to apply the new alignment to an existing saved graph.
+
+A growth replay used `working.json.proposal.json.fiber-grown.json` from
+`/tmp/constraint-graph-real`, removing only
+`fiber:anon_20260816T200950449_000106.json` and its incident links to re-add it
+against the two accepted patches. No source samples were synthesized. The
+selected patch was `band-seed1121911-20260729-203225-930.tifxyz`, with 106 contacts.
+One run per version took 36,567 ms before and 25,786 ms after through the fitted
+surface, including local attempts and global fallback. Attachment RMS was
+0.172782 / 0.172795 vx; spacing-ratio p95 was 1.01746 / 1.01628. This particular
+fiber had contacts on only one of the two patches, so it validates growth but
+is not evidence of improved multi-patch attachment accuracy; that missing-contact
+case is covered by the regression fixture.
+
+The replay also exposed saved-grid pruning against original ribbon normals
+rather than the corrected normals used during fitting. Loading now preserves
+the authenticated grid after its finite-value and source-support checks. The
+round-trip probe checks exact grid equality, and the unit fixture covers strong
+junction corrections whose normals differ from the source. Fit benchmarks with
+an output path now also verify exact save/reopen outside the timed interval.
+
+An isolated offscreen VC3D opened the before/after one-patch fits on the real
+`s1_ds2.zarr` volume. Captures are `/tmp/cg-fit-speed/ui-before.png` and
+`/tmp/cg-fit-speed/ui-after.png`. Display copies disable catalog discovery to
+make the comparison repeatable; original sessions and input files are unchanged.
+
+
+## Local expansion instead of the global fallback
+
+Adding a large patch, or one attached to several fibers, used to take 25–70
+seconds whenever the four local attempts failed and the incremental fit fell
+back to the full solver. Profiling the full solver on the eight-patch session
+(`axis-aligned-grown.json`, 370,742 vertices, RelWithDebInfo, one thread)
+gave 24.6 s: the chart solve took 14.7 s over 27 iterations and the shared
+surface solve 8.5 s over its 12 iterations. Of the 20.5 s spent in the sparse
+normal Cholesky solver across those solves, 12.8 s was CHOLMOD factorization
+(measured with an `LD_PRELOAD` timing shim). Ceres threads only parallelize
+evaluation: eight threads brought the same refit from 24.6 s to 19.6 s, so no
+thread count reaches the interactive budget. Threads remain opt-in through
+`VC3D_CONSTRAINT_FIT_THREADS` for experiments; the default is unchanged.
+
+The fallback was also not a refinement. Compared with the committed layout, a
+full solve moved every existing chart vertex by a median of 22 vx (p99 71 vx)
+on a session fitted by earlier solver code, and by a median of 0.7 vx
+(p99 3.5 vx) when refitting a graph the current code had just fitted. The
+chart objective has flat directions inside the fiber dead band, so the global
+solver re-lays out the whole graph on every call. Benchmark sessions on disk
+must therefore be refit once before incremental fits are measured against
+them; on a stale committed layout the local boundary strain grows with the
+free region instead of shrinking.
+
+`fitIncremental()` now behaves as follows. Residuals, solver options, iteration
+limits, tolerances, the proximity rule, the 1 vx / 2% boundary-settling checks
+and the two-thirds broad-edit rule are unchanged, and a proposal that was
+already placed near its contacts runs exactly the same first four attempts as
+before.
+
+- The chart margin keeps doubling from 80 vx (up to twelve doublings) until the
+  boundary settles or the free region exceeds two thirds of the vertices, which
+  still goes to the full solver. Surface regions expand the same way.
+- An added chart whose contacts are more than 80 vx from their partners is
+  rigidly placed before the free region is chosen. Re-adding a node from its
+  unplaced source coordinates previously spent six attempts (about 12 s) growing
+  a region toward the real location.
+- A geometry rejection (for example *Patch geometry contains an inverted quad*)
+  that repeats after the region has doubled is returned at once with
+  `localChartVertices > 0`. A worst attachment error above the proximity radius
+  that a doubled region does not improve by at least 25% is likewise returned
+  as *Attachment error exceeds proximity tolerance*.
+- Progress messages report the boundary movement and edge stretch of a
+  strained attempt, and the worst attachment error of a rejected one.
+- The workspace reports a local rejection immediately, then asks the full
+  solver for its verdict on the same draft while the proposal stays selected.
+  Selecting another proposal or cancelling stops that solve as before. The
+  full solver's result replaces the local rejection when it arrives.
+
+With `VC3D_PROFILE_CONSTRAINT_FIT=1`, an inverted-quad rejection also logs the
+offending grid cell, the cosine between the fitted and source normals, the
+fitted and rasterized edge lengths, and how far the surface solve moved the
+sample. On the rejected real proposals that distance was 18–52 vx at a fidelity
+weight of 0.25/vx: the rejections came from the shared-surface relaxation
+inside a frozen ring, not from the chart. See *Inverted quads* below.
+
+### Measurements
+
+Linux arm64, GCC 13.3, RelWithDebInfo, `OMP_NUM_THREADS=1`, one run per case.
+"Before" is the session-start solver built into a copy of the probe. Both
+sessions were refit once with the current solver before measuring:
+
+```sh
+AGENTS_AGENT_MODE=1 volume-cartographer/build/bin/constraint_graph_probe --fit-benchmark /tmp/cg-horizontal-junctions/final.json 1 /tmp/cg/refit1.json
+AGENTS_AGENT_MODE=1 volume-cartographer/build/bin/constraint_graph_probe --fit-benchmark /home/sean/Desktop/axis-aligned-grown.json 1 /tmp/cg/grown-refit.json
+```
+
+Proposal survey: the 92-node session, twelve real proposals from the local
+`graph_patches` copy, timed from the draft to the incremental fit's verdict
+(catalog discovery, initial placement, source layers and I/O excluded):
+
+```sh
+AGENTS_AGENT_MODE=1 VC3D_BENCHMARK_PATCH_FOLDER=/home/sean/Desktop/spiral_dataset/graph_patches \
+  volume-cartographer/build/bin/constraint_graph_probe --local-proposal-benchmark /tmp/cg/refit1.json 1 /tmp/cg/candN N
+```
+
+| Candidate | Contacts | Before | Before outcome | After | After outcome |
+| --- | ---: | ---: | --- | ---: | --- |
+| 0 `band-seed3879901…821` | 58 | 528 ms | valid, local | 602 ms | valid, local |
+| 1 same patch | 16 | 533 ms | valid, local | 808 ms | valid, local |
+| 2 `band-seed11488028…912` | 35 | 27,456 ms | rejected after global: inverted quad | 2,679 ms | rejected locally: inverted quad |
+| 3 same patch | 30 | 27,722 ms | rejected after global: inverted quad | 2,619 ms | rejected locally: inverted quad |
+| 4 same patch | 34 | 27,440 ms | rejected after global: inverted quad | 2,462 ms | rejected locally: inverted quad |
+| 5 same patch | 49 | 27,310 ms | rejected after global: inverted quad | 1,810 ms | valid, local (RMS 0.146 vx) |
+| 6 same patch | 62 | 946 ms | valid, local | 1,088 ms | valid, local |
+| 7 `band-seed11299011…179` | 30 | 468 ms | valid, local | 608 ms | valid, local |
+| 8 same patch | 24 | 498 ms | valid, local | 582 ms | valid, local |
+| 9 `band-seed1121911…930` | 112 | 518 ms | valid, local | 531 ms | valid, local |
+| 10 same patch | 2 | 547 ms | valid, local | 538 ms | valid, local |
+| 11 `band-seed11473808…488` | 207 | 644 ms | valid, local | 773 ms | valid, local |
+
+Re-adding committed nodes: the 100-node eight-patch session. Each node is
+removed with its links, the accepted surface is rebuilt without it, and the
+node is re-added incrementally from its unplaced source chart. This covers the
+large patches with 1,700–2,600 contacts on three partners:
+
+```sh
+AGENTS_AGENT_MODE=1 volume-cartographer/build/bin/constraint_graph_probe --readd-benchmark /tmp/cg/grown-refit.json 'patch:band-seed10980845-20260729-182209-499.tifxyz' 1 /tmp/cg/readded.json
+```
+
+| Node | Contacts | Before | Before outcome | After | After outcome |
+| --- | ---: | ---: | --- | ---: | --- |
+| `fiber:anon_…000106` | 106 | 26,064 ms | valid after global | 3,365 ms | rejected locally: inverted quad; the workspace's background full solve reproduces the earlier result |
+| `band-seed10980845…499` | 1731 | 69,219 ms | rejected after global: inverted quad | 2,222 ms | rejected locally: attachment error |
+| `band-seed11074660…159` | 2568 | 71,661 ms | rejected after global: inverted quad | 2,240 ms | rejected locally: attachment error |
+| `band-seed1121911…930` | 243 | 823 ms | valid, local | 408 ms | valid, local |
+| `band-seed11304273…287` | 2628 | 72,833 ms | rejected after global: inverted quad | 2,245 ms | rejected locally: attachment error |
+| `band-seed1310793…956` | 42 | 1,582 ms | valid, local | 277 ms | valid, local |
+| `band-seed3219408…892` | 38 | 22,519 ms | valid after global | 496 ms | valid, local |
+| `band-seed3355050…635` | 513 | 17,890 ms | valid after global | 1,394 ms | valid, local |
+| `band-seed3879901…821` | 58 | 299 ms | valid, local | 202 ms | valid, local |
+
+Every accepted fit had attachment RMS 0.0947 vx and spacing-ratio p95 near
+1.016 in both versions, and all nine accepted surfaces round-tripped exactly
+through save/reopen. Valid results are local relaxations with fixed
+surroundings; the full solver's re-layout of the same additions differs. The
+one case that the full solver accepted and the local path rejects (the 106
+contact fiber) still receives that acceptance from the workspace's background
+solve, about 26 s later, instead of blocking the verdict on it. Rejected
+proposals now report within about 2.7 s instead of 27–73 s; the full solver
+rejected the same proposals.
+
+Regression tests: `farReachingLocalEditKeepsExpandingInsteadOfRefittingEverything`
+(a strip with 6% shorter contact spacing needs five doublings and must stay
+local), `repeatedGeometryRejectionIsReportedWithoutTheGlobalSolver` (a folded
+patch is rejected after two identical surface rejections without a full solve)
+and `addedChartIsPlacedBeforeChoosingTheLocalRegion` (an unplaced chart is
+enclosed by the first region). All 31 `constraint_graph` cases and the seven
+related ctest suites pass. The workspace's background full solve after a local
+rejection was compiled and follows the existing progress-callback path; it was
+not exercised interactively in this session. macOS and amd64 were not tested.
+
+### Fibers as the reference frame
+
+Layouts drifted into a state where even small additions kept expanding their
+local region. The mechanism: a fiber may bend anywhere within 40 vx of its row
+or column at no cost, so inside that band only the chart metric resists a
+patch's pull, and a patch has far more chart area near a contact than a
+seven-row ribbon. The patch won, the fiber curved, and every later edit near
+that fiber inherited the curvature; local commits also lock in up to 1 vx and
+2% of residual strain at each frozen ring. In the twelve-proposal survey the
+uniform weights moved committed fibers by 5–14.5 vx per accepted proposal.
+
+In a local fit the chart-metric weights are now type dependent: committed
+fiber triangles carry ten times the weight (a hundredfold in cost) and an
+added patch's triangles half of it. Added fibers, committed patches, all link
+weights, the dead band, the endpoint ties, rigid alignment, the surface solve,
+proximity checks, no-flip barrier and commit gating are unchanged, and no
+source XYZ changes: only where a patch lands in the flattened chart. The
+defaults can be overridden for experiments with
+`VC3D_CONSTRAINT_FIT_FIBER_WEIGHT` and `VC3D_CONSTRAINT_FIT_PATCH_WEIGHT`.
+
+The full solver keeps its uniform weights. A variant that applied the fiber
+weight everywhere (with fiber-to-fiber links scaled to match) was measured and
+rejected: after a refit under it, five of the twelve surveyed proposals were
+rejected with inverted patch quads that the local weighting accepts, and
+re-adding the 106-contact fiber stopped at a constant 41.7 vx contact error
+because a stiff fiber can only satisfy disagreeing contacts by translating,
+which a local fit's frozen surroundings forbid. Consequently **Refit graph**
+still relaxes fibers toward patches; the layouts it produces are the ones the
+local weighting was measured against.
+
+`VC3D_CONSTRAINT_FIT_LOG=1` echoes every workspace progress line with its
+elapsed time to stderr, so the boundary-strain and attachment numbers can be
+read after the fact; the status bar only shows the latest line.
+
+#### Measurements with the fiber-reference weights
+
+Same hardware, sessions and commands as above; "before" is the session-start
+solver. Time is from the draft to the incremental fit's verdict. The last
+column is how far any committed fiber vertex moved in the accepted fit.
+
+| Proposal | Contacts | Before | After | Committed fiber moved (before → after) |
+| --- | ---: | ---: | ---: | --- |
+| 0 `band-seed3879901…821` | 58 | 528 ms valid | 406 ms valid | 8.9 → 0.6 vx |
+| 1 same patch | 16 | 533 ms valid | 420 ms valid | 8.9 → 0.6 vx |
+| 2 `band-seed11488028…912` | 35 | 27,456 ms rejected | 521 ms valid | 14.5 → 1.8 vx |
+| 3 same patch | 30 | 27,722 ms rejected | 474 ms valid | 14.5 → 1.8 vx |
+| 4 same patch | 34 | 27,440 ms rejected | 477 ms valid | 14.5 → 1.8 vx |
+| 5 same patch | 49 | 27,310 ms rejected | 534 ms valid | 14.4 → 1.8 vx |
+| 6 same patch | 62 | 946 ms valid | 495 ms valid | 11.4 → 1.8 vx |
+| 7 `band-seed11299011…179` | 30 | 468 ms valid | 394 ms valid | 8.5 → 0.1 vx |
+| 8 same patch | 24 | 498 ms valid | 402 ms valid | 8.5 → 0.1 vx |
+| 9 `band-seed1121911…930` | 112 | 518 ms valid | 554 ms valid | 5.2 → 0.8 vx |
+| 10 same patch | 2 | 547 ms valid | 531 ms valid | 5.2 → 0.8 vx |
+| 11 `band-seed11473808…488` | 207 | 644 ms valid | 450 ms valid | 10.4 → 0.4 vx |
+
+The "before" movement column is the earlier local-only version without the
+weights (same sessions); the uniform-weight solver moved committed fibers by
+5–14.5 vx per accepted proposal, the weighted one by at most 1.8 vx. All twelve
+surfaces round-tripped exactly.
+
+| Re-added node | Contacts | Before | After |
+| --- | ---: | ---: | --- |
+| `fiber:anon_…000106` | 106 | 26,064 ms valid after global | 3,235 ms rejected locally (inverted quad); the background full solve then reproduces the earlier result |
+| `band-seed10980845…499` | 1731 | 69,219 ms rejected | 2,173 ms rejected (attachment error) |
+| `band-seed11074660…159` | 2568 | 71,661 ms rejected | 2,299 ms rejected (attachment error) |
+| `band-seed1121911…930` | 243 | 823 ms valid | 500 ms valid |
+| `band-seed11304273…287` | 2628 | 72,833 ms rejected | 2,201 ms rejected (attachment error) |
+| `band-seed1310793…956` | 42 | 1,582 ms valid | 1,420 ms valid |
+| `band-seed3219408…892` | 38 | 22,519 ms valid after global | 362 ms valid |
+| `band-seed3355050…635` | 513 | 17,890 ms valid after global | 886 ms valid |
+| `band-seed3879901…821` | 58 | 299 ms valid | 194 ms valid |
+
+On this session, whose fibers were bent by patches under the uniform solver,
+re-adding a patch lets the stiff fibers inside the free region straighten by up
+to 12 vx relative to the committed layout, which costs a few more doublings
+(1.4 s instead of 0.3 s for the 42-contact patch). Layouts committed with the
+weighted local fits do not carry that curvature.
+
+Regression coverage: `localAdditionPreservesDistantGeometry` now checks that
+contacts disagreeing with the fiber spacing stretch the added patch while the
+fiber moves under 0.5 vx, and
+`farReachingLocalEditKeepsExpandingInsteadOfRefittingEverything` drives its
+far-reaching strain through a committed patch strip pinned to the fiber at
+both ends. All 32 `constraint_graph` cases pass three times in a row; the
+seven related ctest suites pass.
+
+### Inverted quads
+
+"Patch geometry contains an inverted quad" was the slowest and most frequent
+rejection. It fires after the shared-surface relaxation when a grid triangle's
+normal opposes the source normals at its three samples and all three belong to
+one patch with no fiber underneath. In every rejected real case the rasterized
+triangle was fine (20 by 20 vx edges) and the relaxation had moved a sample by
+18–52 vx, once by 237 vx. Two causes: a local fit re-rasterizes its interior
+from raw source positions while the frozen ring keeps committed samples that an
+earlier relaxation had already moved by up to 20 vx, so the grid starts torn
+along that seam; and a patch chart sheared by its contacts maps a grid step onto
+a stretched piece of source, leaving the rasterized triangle nearly edge-on.
+
+Two changes:
+
+- In a local fit, free samples now start where the accepted surface already is
+  when it has a sample there, and only newly covered samples start at raw
+  raster positions. The fidelity term still pulls every free sample toward its
+  new rasterized position, so the target is unchanged; only the starting point
+  of the non-converging 12-iteration relaxation is. Full solves and saved
+  surfaces are unaffected.
+- A fold that appears only after relaxation is pruned like a fiber-supported or
+  mixed-owner cell, counted in "unsupported boundary samples omitted", instead
+  of rejecting the fit. A patch whose *rasterized* triangle already folds is
+  still rejected with the same message, since that fold comes from the source
+  or its chart. This applies to local and full solves alike.
+
+Same sessions and commands as above, one run per case:
+
+| Case | Contacts | Before | After |
+| --- | ---: | ---: | --- |
+| 12 surveyed proposals | 2–207 | 8 valid in 0.5–0.9 s, 4 rejected after 27 s | 12 valid in 0.39–0.55 s |
+| `fiber:anon_…000106` re-add | 106 | 26.1 s valid after global | 1.57 s valid, local |
+| `band-seed3219408…892` re-add | 38 | 22.5 s valid after global | 0.37 s valid, local |
+| `band-seed3355050…635` re-add | 513 | 17.9 s valid after global | 0.91 s valid, local |
+| Three 1,700–2,600-contact patches | | 69–73 s rejected | 2.2–2.3 s rejected (attachment error) |
+| Other four re-adds | 42–243 | 0.3–1.6 s valid | 0.18–1.44 s valid |
+
+No inverted-quad rejection occurred in any of the 21 cases. Accepted fits have
+attachment RMS 0.09–0.23 vx and spacing-ratio p95 1.015–1.016; all twelve saved
+surfaces round-tripped exactly. The three remaining rejections are patches whose
+contacts disagree with the accepted fibers by 41–509 vx on their worst link, and
+the full solver rejected them too. `foldedPatchCellsArePrunedInsteadOfRejectingTheFit`
+covers the pruning on a synthetic folded patch; all 32 `constraint_graph` cases
+and the seven related ctest suites pass.
+
+## Catalog startup with large patch folders
+
+Indexing a patch folder read one `meta.json` after another on the calling
+thread: with 86,000 patch folders on a network share that is 86,000 serial
+round trips, about ten minutes before the workspace appeared. The scan now runs
+on a thread pool (up to 32 workers, in batches of 4,096 folders) and assembles
+entries and warnings in the same sorted folder order, so the catalog, the
+bounds index, candidate ordering and warning messages are unchanged. Progress
+reports batches instead of every thousand folders. On the local 84,312-folder
+copy with a warm cache the probe's session-plus-catalog load went from 10.1 s to
+8.0 s; the remaining time is session and fiber loading. The 23,946-folder
+network share (`/mnt/bigpc/…/verified_patches`) loaded in 20.4 s including the
+session, measured once with the new code only.

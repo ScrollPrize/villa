@@ -3,6 +3,7 @@
 #include <opencv2/core.hpp>
 #include <nlohmann/json.hpp>
 #include <atomic>
+#include <array>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -10,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include "vc/constraints/SharedVector.hpp"
 
 class QuadSurface;
 namespace vc::lasagna { class NormalSampler; }
@@ -101,13 +103,13 @@ struct Node {
 };
 struct Placement {
     std::shared_ptr<const Node> source;
-    std::vector<cv::Vec2d> uv;
+    SharedVector<cv::Vec2d> uv;
 };
 struct Graph {
     Settings settings;
     std::string seed;
     std::map<std::string, Placement> nodes;
-    std::vector<Link> links;
+    SharedVector<Link> links;
 };
 struct Candidate {
     std::string id;
@@ -123,10 +125,38 @@ struct FitResult {
     double correspondenceRms = 0;
     double stretchP95 = 1;
     bool valid = false;
+    // A bounded attachment needs an explicit full-graph refit. It is not a
+    // verdict that the source geometry is invalid, and cannot be committed.
+    bool needsRefit = false;
+    // Bounds of the surface samples replaced by an incremental result.
+    std::optional<std::array<cv::Vec2d,2>> changedSurfaceBounds;
     // Diagnostics for an incremental fit; zero for the global path.
     size_t localChartVertices = 0, localSurfaceSamples = 0, localExpansions = 0;
     std::string message;
 };
+
+struct PreparedGraph;
+// Contact indices are stable within this immutable committed revision.
+struct GraphEdit {
+    std::shared_ptr<const PreparedGraph> base;
+    std::map<std::string,Placement> addedNodes;
+    std::vector<Link> addedLinks;
+    std::vector<size_t> removedLinks;
+};
+std::shared_ptr<const PreparedGraph> prepareGraph(const FitResult&, const std::atomic_bool* cancel = nullptr);
+std::shared_ptr<const PreparedGraph> prepareGraph(const FitResult&, const GraphEdit&, const std::atomic_bool* cancel = nullptr);
+const FitResult& preparedResult(const PreparedGraph&);
+Graph materialize(const GraphEdit&);
+// Adapter for callers editing an existing snapshot. The interactive proposal
+// path constructs its delta directly, without diffing the committed graph.
+GraphEdit graphEdit(std::shared_ptr<const PreparedGraph>, const Graph&);
+void addKeypoint(GraphEdit&, Link);
+void removeKeypoint(GraphEdit&, const Link&);
+GraphEdit proposeEdit(const Catalog&, std::shared_ptr<const PreparedGraph>, const Candidate&, bool wholeComponent,
+                      const lasagna::NormalSampler&, const std::atomic_bool* cancel = nullptr);
+FitResult fitEdit(const GraphEdit&, const std::atomic_bool* cancel = nullptr, Progress = {});
+FitResult renderProposalSources(const GraphEdit&, const std::string& selected,
+                                const std::atomic_bool* cancel = nullptr);
 
 Catalog loadCatalog(const Settings&, const std::atomic_bool* cancel = nullptr, Progress = {});
 // Audit original dense fibers and annotated links, independent of fitted UV.
@@ -145,8 +175,11 @@ Graph propose(const Catalog&, const Graph&, const Candidate&, bool wholeComponen
               const lasagna::NormalSampler&, const std::atomic_bool* cancel = nullptr);
 FitResult fit(Graph, const std::atomic_bool* cancel = nullptr, Progress = {});
 // Fit an edit against a committed surface, preserving distant geometry. Expand
-// the free region when its boundary remains strained; fall back to fit() for
+// the free region while its boundary remains strained; fall back to fit() for
 // broad edits or changed global settings. Residuals and tolerances are shared.
+// A rejection that persists across a doubled region is returned at once with
+// localChartVertices > 0; callers wanting the full re-layout's verdict on it
+// run fit() on the same draft.
 FitResult fitIncremental(Graph, const FitResult& committed,
                          const std::atomic_bool* cancel = nullptr, Progress = {});
 FitResult renderProposalSources(const Graph& draft, const Graph& committed, const std::string& selected,

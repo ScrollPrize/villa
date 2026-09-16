@@ -9,6 +9,13 @@
 #include <fstream>
 #include <cstdlib>
 namespace {
+void verifySavedSurface(const vc::constraints::FitResult& expected,const std::filesystem::path& path) {
+    const auto restored=vc::constraints::loadSession(path);
+    if(!restored.valid||restored.origin!=expected.origin||
+       restored.surface->rawPointsPtr()->size()!=expected.surface->rawPointsPtr()->size()||
+       cv::norm(*restored.surface->rawPointsPtr(),*expected.surface->rawPointsPtr(),cv::NORM_INF)!=0)
+        throw std::runtime_error("Saved fit did not round trip exactly: "+restored.message);
+}
 vc::constraints::Catalog benchmarkCatalog(vc::constraints::Settings settings) {
     // Use a local copy of a real catalog without changing the saved graph or
     // invalidating its derived-surface checksum.
@@ -17,6 +24,55 @@ vc::constraints::Catalog benchmarkCatalog(vc::constraints::Settings settings) {
 }
 }
 int main(int argc,char** argv){
+    if(argc>=4&&std::string(argv[1])=="--fresh-edit-growth") {
+        try {
+            using namespace vc::constraints;
+            // The session supplies only input locations and coordinate settings.
+            // Start from source fibers, without its saved placements or surface.
+            const auto settings=loadSession(argv[2]).graph.settings;
+            const auto catalog=benchmarkCatalog(settings);
+            vc::lasagna::LasagnaDatasetOpenOptions options;options.workingToBaseScale=settings.normalScale;
+            const auto dataset=vc::lasagna::LasagnaDataset::openLocation(settings.normalManifest,options);
+            vc::lasagna::LasagnaNormalSampler normals(dataset);
+            auto result=fit(seedGraph(catalog,0,settings,normals));
+            if(!result.valid)throw std::runtime_error("Fresh seed: "+result.message);
+            saveSession(result,std::string(argv[3])+".seed.json");
+            auto prepared=prepareGraph(result);
+            auto selected=result.graph.seed;
+            const int steps=argc>4?std::stoi(argv[4]):4;
+            for(int step=0;step<steps;++step) {
+                auto candidates=discover(catalog,result.graph,selected);
+                if(candidates.empty())candidates=discover(catalog,result.graph,{});
+                bool accepted=false;
+                std::set<std::string> attempted;
+                for(const auto& candidate:candidates) {
+                    if(!attempted.insert(candidate.id).second)continue;
+                    const auto start=std::chrono::steady_clock::now();
+                    auto edit=proposeEdit(catalog,prepared,candidate,true,normals);
+                    auto source=renderProposalSources(edit,candidate.id);
+                    auto fitted=fitEdit(edit);
+                    const double elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+                    std::cout<<"step="<<step<<" candidate="<<candidate.id<<" fiber="<<candidate.fiber
+                             <<" added="<<edit.addedNodes.size()<<" total_ms="<<elapsed<<" valid="<<fitted.valid
+                             <<" needs_refit="<<fitted.needsRefit<<" rms="<<fitted.correspondenceRms
+                             <<" stretch="<<fitted.stretchP95<<" message="<<fitted.message<<std::endl;
+                    if(fitted.valid) {
+                        const auto preparationStart=std::chrono::steady_clock::now();
+                        prepared=prepareGraph(fitted,edit);
+                        std::cout<<"commit_prepare_ms="<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-preparationStart).count()<<std::endl;
+                        result=std::move(fitted);selected=candidate.id;accepted=true;
+                        const auto path=std::string(argv[3])+"."+std::to_string(step)+".json";
+                        saveSession(result,path);verifySavedSurface(result,path);
+                        break;
+                    }
+                    if(attempted.size()>=30)break;
+                }
+                if(!accepted)throw std::runtime_error("No valid addition among tested candidates");
+            }
+            std::cout<<"fresh_growth_roundtrip=exact nodes="<<result.graph.nodes.size()<<std::endl;
+            return 0;
+        }catch(const std::exception& e){std::cerr<<e.what()<<std::endl;return 1;}
+    }
     if(argc>=3&&(std::string(argv[1])=="--render-benchmark"||std::string(argv[1])=="--fit-benchmark")) {
         try {
             using namespace vc::constraints;
@@ -29,7 +85,56 @@ int main(int argc,char** argv){
                 if(!result.valid)throw std::runtime_error(result.message);
                 std::cout<<"iteration="<<i<<" elapsed_ms="<<std::chrono::duration<double,std::milli>(end-start).count()
                     <<" rms="<<result.correspondenceRms<<" stretch="<<result.stretchP95<<std::endl;
-                if(i==0&&argc>4)saveSession(result,argv[4]);
+                if(i==0&&argc>4){saveSession(result,argv[4]);verifySavedSurface(result,argv[4]);}
+            }
+            return 0;
+        }catch(const std::exception& e){std::cerr<<e.what()<<std::endl;return 1;}
+    }
+    if(argc>=4&&(std::string(argv[1])=="--readd-benchmark"||std::string(argv[1])=="--edit-readd-benchmark")) {
+        // Remove one committed node, rebuild the accepted surface without it,
+        // then time re-adding it incrementally from its unplaced source chart.
+        // usage: --readd-benchmark SESSION NODE_ID [ITERATIONS] [OUTPUT_SESSION]
+        try {
+            using namespace vc::constraints;
+            const auto session=loadSession(argv[2]);
+            if(!session.valid)throw std::runtime_error(session.message);
+            const std::string node=argv[3];
+            if(!session.graph.nodes.contains(node))throw std::runtime_error("Unknown node: "+node);
+            if(node==session.graph.seed)throw std::runtime_error("The seed cannot be re-added");
+            Graph reduced=session.graph;reduced.nodes.erase(node);
+            reduced.links.eraseIf([&](const Link& l){return l.a.node==node||l.b.node==node;});
+            const auto committed=render(reduced);
+            if(!committed.valid)throw std::runtime_error("Committed surface without the node: "+committed.message);
+            const bool useEdit=std::string(argv[1])=="--edit-readd-benchmark";
+            const auto prepared=useEdit?prepareGraph(committed):nullptr;
+            size_t contacts=0;std::set<std::string> partners;
+            for(const auto& l:session.graph.links)if(l.a.node==node||l.b.node==node){++contacts;partners.insert(l.a.node==node?l.b.node:l.a.node);}
+            std::cout<<"node="<<node<<" contacts="<<contacts<<" partners="<<partners.size()<<" nodes="<<session.graph.nodes.size()<<std::endl;
+            for(int i=0;i<(argc>4?std::stoi(argv[4]):3);++i) {
+                auto draft=session.graph;
+                auto& placement=draft.nodes.at(node);placement.uv=placement.source->initialUv;
+                for(auto& [id,p]:draft.nodes)if(id!=node)p.uv=committed.graph.nodes.at(id).uv;
+                auto start=std::chrono::steady_clock::now(),phase=start;
+                auto stamp=[&](const std::string& name){auto now=std::chrono::steady_clock::now();std::cout<<name<<" phase_ms="<<std::chrono::duration<double,std::milli>(now-phase).count()<<" total_ms="<<std::chrono::duration<double,std::milli>(now-start).count()<<std::endl;phase=now;};
+                const auto edit=useEdit?graphEdit(prepared,draft):GraphEdit{};
+                auto result=useEdit?fitEdit(edit,nullptr,stamp):fitIncremental(std::move(draft),committed,nullptr,stamp);
+                const auto end=std::chrono::steady_clock::now();
+                std::cout<<"iteration="<<i<<" elapsed_ms="<<std::chrono::duration<double,std::milli>(end-start).count()
+                    <<" valid="<<result.valid<<" needs_refit="<<result.needsRefit<<" rms="<<result.correspondenceRms<<" stretch="<<result.stretchP95
+                    <<" local_chart_vertices="<<result.localChartVertices<<" local_surface_samples="<<result.localSurfaceSamples
+                    <<" expansions="<<result.localExpansions<<" message="<<result.message<<std::endl;
+                if(i==0&&argc>5){
+                    if(useEdit&&result.needsRefit){
+                        // Explicit verification requested with an output path:
+                        // the same draft is still accepted by the full action.
+                        const auto refitStart=std::chrono::steady_clock::now();
+                        result=fit(result.graph);
+                        std::cout<<"explicit_refit_ms="<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-refitStart).count()
+                            <<" valid="<<result.valid<<" message="<<result.message<<std::endl;
+                        if(!result.valid)throw std::runtime_error("Explicit refit failed: "+result.message);
+                    }
+                    if(result.valid){saveSession(result,argv[5]);verifySavedSurface(result,argv[5]);std::cout<<"surface_roundtrip=exact"<<std::endl;}
+                }
             }
             return 0;
         }catch(const std::exception& e){std::cerr<<e.what()<<std::endl;return 1;}
@@ -124,8 +229,9 @@ int main(int argc,char** argv){
             struct Errors {size_t count=0;double beforeSquared=0,afterSquared=0,beforeMax=0,afterMax=0;};
             std::map<std::pair<std::string,std::string>,Errors> errors;
             for(const auto& link:after.links){
-                if(link.keypoint||!after.nodes.at(link.a.node).source->fiber||after.nodes.at(link.b.node).source->fiber)continue;
-                auto& e=errors[{link.a.node,link.b.node}];++e.count;
+                const bool aFiber=after.nodes.at(link.a.node).source->fiber,bFiber=after.nodes.at(link.b.node).source->fiber;
+                if(link.keypoint||aFiber==bFiber)continue;
+                auto& e=errors[aFiber?std::pair{link.a.node,link.b.node}:std::pair{link.b.node,link.a.node}];++e.count;
                 const auto a=placedLocation(before,link.a)-placedLocation(before,link.b);
                 const auto b=placedLocation(after,link.a)-placedLocation(after,link.b);
                 e.beforeSquared+=a.dot(a);e.afterSquared+=b.dot(b);
@@ -137,10 +243,11 @@ int main(int argc,char** argv){
             return 0;
         }catch(const std::exception& e){std::cerr<<e.what()<<std::endl;return 1;}
     }
-    if(argc>=3&&(std::string(argv[1])=="--proposal-benchmark"||std::string(argv[1])=="--local-proposal-benchmark"||std::string(argv[1])=="--local-proposal-scan"||std::string(argv[1])=="--clicked-proposal-benchmark"||std::string(argv[1])=="--proposal-contacts")) {
+    if(argc>=3&&(std::string(argv[1])=="--proposal-benchmark"||std::string(argv[1])=="--local-proposal-benchmark"||std::string(argv[1])=="--local-proposal-scan"||std::string(argv[1])=="--clicked-proposal-benchmark"||std::string(argv[1])=="--proposal-contacts"||std::string(argv[1])=="--edit-proposal-benchmark"||std::string(argv[1])=="--edit-proposal-scan")) {
         try {
             using namespace vc::constraints;
-            const auto result=loadSession(argv[2]);
+            auto result=loadSession(argv[2]);
+            if(argc>7){result.graph.settings.radius=std::stod(argv[7]);result.graph.settings.validate();}
             const auto catalog=benchmarkCatalog(result.graph.settings);
             vc::lasagna::LasagnaDatasetOpenOptions options;options.workingToBaseScale=result.graph.settings.normalScale;
             const auto dataset=vc::lasagna::LasagnaDataset::openLocation(result.graph.settings.normalManifest,options);
@@ -166,20 +273,37 @@ int main(int argc,char** argv){
                 }
                 return 0;
             }
-            const bool scan=std::string(argv[1])=="--local-proposal-scan";
+            const bool useEdit=std::string(argv[1])=="--edit-proposal-benchmark"||std::string(argv[1])=="--edit-proposal-scan";
+            const auto preparationStart=std::chrono::steady_clock::now();
+            const auto prepared=useEdit?prepareGraph(result):nullptr;
+            if(useEdit)std::cout<<"prepare_ms="<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-preparationStart).count()<<std::endl;
+            const bool scan=std::string(argv[1])=="--local-proposal-scan"||std::string(argv[1])=="--edit-proposal-scan";
+            size_t firstCandidate=0;
+            if(argc>5){
+                const std::string requested=argv[5];
+                if(requested.starts_with("patch:")||requested.starts_with("fiber:")){
+                    const auto it=std::find_if(candidates.begin(),candidates.end(),[&](const auto& candidate){return candidate.id==requested;});
+                    if(it==candidates.end())throw std::runtime_error("Requested source has no proposal at this selection");
+                    firstCandidate=size_t(it-candidates.begin());
+                }else firstCandidate=std::stoul(requested);
+            }
             for(int i=0;i<(argc>3?std::stoi(argv[3]):3);++i) {
-                const auto candidateIndex=(argc>5?std::stoul(argv[5]):0)+(scan?i:0);
+                const auto candidateIndex=firstCandidate+(scan?i:0);
                 if(candidateIndex>=candidates.size())break;
                 const auto& candidate=candidates[candidateIndex];
                 std::cout<<"candidate="<<candidate.id<<" candidate_index="<<candidateIndex<<" nodes="<<result.graph.nodes.size()<<" contacts="<<candidate.contacts.size()<<std::endl;
+                size_t discoveredContacts=0;
+                for(const auto& c:candidates)if(c.id==candidate.id)discoveredContacts+=c.contacts.size();
+                std::cout<<"discovered_contacts="<<discoveredContacts<<std::endl;
                 std::atomic_bool stop{false};
                 auto start=std::chrono::steady_clock::now(),phase=start;
                 auto stamp=[&](const std::string& name){auto now=std::chrono::steady_clock::now();std::cout<<name<<" phase_ms="<<std::chrono::duration<double,std::milli>(now-phase).count()<<" total_ms="<<std::chrono::duration<double,std::milli>(now-start).count()<<std::endl;phase=now;if(scan&&name=="Fitting full graph")stop=true;};
-                auto draft=propose(catalog,result.graph,candidate,true,normals);
+                const auto edit=useEdit?proposeEdit(catalog,prepared,candidate,true,normals):GraphEdit{};
+                auto draft=useEdit?Graph{}:propose(catalog,result.graph,candidate,true,normals);
                 // Reproduce the old clicked-cluster-only fit for paired
                 // real-data comparisons, without changing production code.
                 if(std::string(argv[1])=="--clicked-proposal-benchmark"){
-                    std::erase_if(draft.links,[&](const auto& link){
+                    draft.links.eraseIf([&](const auto& link){
                         if(link.b.node!=candidate.id||!draft.nodes.at(link.a.node).source->fiber)return false;
                         return std::none_of(candidate.contacts.begin(),candidate.contacts.end(),[&](const auto& selected){
                             return link.a.node==selected.a.node&&link.a.lineIndex==selected.a.lineIndex&&link.b.grid==selected.b.grid;
@@ -187,25 +311,23 @@ int main(int argc,char** argv){
                     });
                 }
                 stamp("propose");
-                auto source=renderProposalSources(draft,result.graph,candidate.id);stamp("source_render");
-                auto placement=renderPlacement(draft);stamp("initial_placement");
-                std::cout<<"placement_valid="<<placement.valid<<" message="<<placement.message<<std::endl;
+                auto source=useEdit?renderProposalSources(edit,candidate.id):renderProposalSources(draft,result.graph,candidate.id);stamp("source_render");
+                if(!useEdit){auto placement=renderPlacement(draft);stamp("initial_placement");
+                    std::cout<<"placement_valid="<<placement.valid<<" message="<<placement.message<<std::endl;}
                 FitResult fitResult;
                 try {
-                    fitResult=std::string(argv[1])!="--proposal-benchmark"?fitIncremental(std::move(draft),result,&stop,stamp):fit(std::move(draft),nullptr,stamp);
+                    fitResult=useEdit?fitEdit(edit,&stop,stamp):std::string(argv[1])!="--proposal-benchmark"?fitIncremental(std::move(draft),result,&stop,stamp):fit(std::move(draft),nullptr,stamp);
                 }catch(const std::exception&){if(!stop)throw;std::cout<<"candidate_index="<<candidateIndex<<" requires_global=1"<<std::endl;continue;}
                 stamp("fit_complete");
-                std::cout<<"iteration="<<i<<" valid="<<fitResult.valid<<" rms="<<fitResult.correspondenceRms<<" stretch="<<fitResult.stretchP95<<" message="<<fitResult.message<<std::endl;
-                if(fitResult.valid){
+                std::cout<<"iteration="<<i<<" valid="<<fitResult.valid<<" needs_refit="<<fitResult.needsRefit<<" rms="<<fitResult.correspondenceRms<<" stretch="<<fitResult.stretchP95<<" message="<<fitResult.message<<std::endl;
+                if(fitResult.valid&&!useEdit){
                     auto fibers=renderSourceLayer(fitResult.graph,true),patches=renderSourceLayer(fitResult.graph,false);
                     std::cout<<"source_layers_valid="<<fibers.valid<<","<<patches.valid<<std::endl;
                     if(!fibers.valid||!patches.valid)throw std::runtime_error("Cannot render independent source layers");
                 }
-                if(argc>4) {std::ofstream out(std::string(argv[4])+"."+std::to_string(i)+".json");out<<graphToJson(fitResult.graph);}
-                if(argc>4&&i==0&&fitResult.valid&&std::string(argv[1])=="--local-proposal-benchmark") {
-                    const auto path=std::string(argv[4])+".session.json";saveSession(fitResult,path);auto restored=loadSession(path);
-                    if(!restored.valid||restored.origin!=fitResult.origin||restored.surface->rawPointsPtr()->size()!=fitResult.surface->rawPointsPtr()->size()||
-                       cv::norm(*restored.surface->rawPointsPtr(),*fitResult.surface->rawPointsPtr(),cv::NORM_INF)!=0)throw std::runtime_error("Incremental surface did not round trip exactly");
+                if(argc>4&&!scan) {std::ofstream out(std::string(argv[4])+"."+std::to_string(i)+".json");out<<graphToJson(fitResult.graph);}
+                if(argc>4&&i==0&&fitResult.valid&&(std::string(argv[1])=="--local-proposal-benchmark"||useEdit)) {
+                    const auto path=std::string(argv[4])+".session.json";saveSession(fitResult,path);verifySavedSurface(fitResult,path);
                     std::cout<<"surface_roundtrip=exact"<<std::endl;
                 }
             }
