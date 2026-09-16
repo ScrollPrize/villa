@@ -241,10 +241,17 @@ def parse_vc3d_fiber_format(
         positions: list[Any] = []
         parsed_segments: list[FiberTraceSegmentMetadata | None] = []
         for index, control in enumerate(raw_controls):
-            if not isinstance(control, dict) or not set(control) <= {"position", "segment_to_next"}:
-                raise ValueError("version-3 control points must contain only position and segment_to_next")
+            if not isinstance(control, dict) or not set(control) <= {"position", "segment_to_next", "tags"}:
+                raise ValueError("version-3 control points must contain only position, segment_to_next and tags")
             if "position" not in control:
                 raise ValueError("version-3 control point is missing position")
+            # Optional per-control-point tags (VC3D writes e.g. "kollesis_termination",
+            # only when non-empty). Validated for shape, not consumed here.
+            if "tags" in control and not (
+                isinstance(control["tags"], list)
+                and all(isinstance(tag, str) for tag in control["tags"])
+            ):
+                raise ValueError("version-3 control point tags must be a list of strings")
             positions.append(control["position"])
             if index + 1 == len(raw_controls):
                 if "segment_to_next" in control:
