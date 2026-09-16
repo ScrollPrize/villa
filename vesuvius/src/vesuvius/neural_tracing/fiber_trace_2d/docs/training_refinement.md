@@ -14,7 +14,7 @@ Disabled by default. Add a top-level object to a training JSON:
   "shape_weight": 0.01,
   "shape_normal_weight": 0.1,
   "shape_tangent_weight": 10.0,
-  "direction_weight": 1.0,
+  "direction_weight": 0.1,
   "learning_rate": 0.01,
   "max_step_fraction": 0.125,
   "border_fraction": 0.125
@@ -50,11 +50,11 @@ resamples by arclength while retaining original-reference material coordinates.
 The cap applies per iteration; total drift is controlled by the original-GT
 tether, not a hard cumulative distance cap.
 
-The current follow-up config keeps normal0.1 and increases tangent1->10 and
-direction0.1->1. Model-training loss weights and LR remain unchanged. Restart
+The current follow-up config keeps normal0.1/tangent10 and lowers direction1->0.1.
+Model-training loss weights and LR remain unchanged. Restart
 from the original pre-refinement checkpoint for this comparison.
 
-Optional direction guidance (default weight0, current trial1.0) penalizes
+Optional direction guidance (default weight0, current trial0.1) penalizes
 `1-(unit_segment_tangent dot predicted_base_axis)^2` at the same segment quadrature.
 Six encoded channels are interpolated before shared analytic decoding. The full
 finite-difference base-to-patch Jacobian, including smooth deformation, pulls the

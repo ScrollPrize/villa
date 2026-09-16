@@ -1,6 +1,5 @@
-# Anisotropic and direction-guided training refinement
+# Refinement direction-weight ablation
 
-Use normal bending weight0.1, tangential weight10.0 and direction weight1.0
-(user follow-up: increase tangent and direction by10x, leave normal unchanged).
-Keep split loss logs/shared raw-EMA targets, fixed crops, free test ends and caps.
-Stop previous run and launch fresh geometry from original non-refinement11800.
+Lower refinement direction weight from 1.0 to 0.1; retain normal/tangent
+smoothing 0.1/10 and all other settings. Restart from the same original
+non-refinement checkpoint (update11800), not the stopped trial.

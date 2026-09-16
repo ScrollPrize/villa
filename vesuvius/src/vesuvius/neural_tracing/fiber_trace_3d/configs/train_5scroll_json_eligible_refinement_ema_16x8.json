@@ -227,6 +227,6 @@
     "enabled": true,
     "shape_normal_weight": 0.1,
     "shape_tangent_weight": 10.0,
-    "direction_weight": 1.0
+    "direction_weight": 0.1
   }
 }
