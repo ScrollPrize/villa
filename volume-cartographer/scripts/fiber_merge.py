@@ -212,8 +212,13 @@ def is_fiber_doc(doc):
     else:
         for index, cp in enumerate(control_points):
             if (not isinstance(cp, dict) or
-                    not set(cp) <= {'position', 'segment_to_next'} or
+                    not set(cp) <= {'position', 'segment_to_next', 'tags'} or
                     not _finite_point(cp.get('position'))):
+                return False
+            # Optional per-CP tags (e.g. 'kollesis_termination'): the loader
+            # takes an array of strings and nothing else.
+            if 'tags' in cp and not (isinstance(cp['tags'], list) and
+                                     all(isinstance(t, str) for t in cp['tags'])):
                 return False
             segment = cp.get('segment_to_next')
             if index + 1 == len(control_points):
@@ -510,14 +515,23 @@ def _v3_chunks(doc, anchor_indices):
             'start_controls': copy.deepcopy(controls[first_control:final_control]),
             'end_control': copy.deepcopy(controls[final_control]),
             'end_position': copy.deepcopy(_cp_position(controls[final_control])),
+            # The terminal CP's own tags: its descriptor belongs to the next
+            # chunk, but its tags belong to the point, and for the fiber's
+            # final CP no later chunk would otherwise see them change.
+            'end_tags': copy.deepcopy(_cp_tags(controls[final_control])),
             'line_points': copy.deepcopy(doc['line_points'][line_start:line_end + 1]),
         })
     return chunks, None
 
 
+def _cp_tags(value):
+    return value.get('tags', []) if isinstance(value, dict) else []
+
+
 def _v3_chunk_equal(a, b):
     return (a['start_controls'] == b['start_controls'] and
             a['end_position'] == b['end_position'] and
+            a['end_tags'] == b['end_tags'] and
             a['line_points'] == b['line_points'])
 
 

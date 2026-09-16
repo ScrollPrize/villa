@@ -903,6 +903,61 @@ private slots:
         QCOMPARE(result.unplaced.front().id, uint64_t{903});
         QVERIFY(findFiber(result, 903) == nullptr);
     }
+
+    // --- Kollesis terminations: a display-only per-control-point flag that
+    // must reach the placed fiber aligned to its control points, must not
+    // touch the geometry cache keys, and must move both session digests.
+    void kollesisTerminationsReachThePlacedFiberWithoutRecomputingGeometry()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        const GlobalLayoutParams params = defaultParams();
+        std::vector<InputFiber> fibers = cacheFixture();
+        const uint64_t taggedId = fibers.front().id;
+        const std::size_t controlCount = fibers.front().controlPoints.size();
+        QVERIFY(controlCount >= 2);
+
+        vc3d::fiber_map::GlobalLayoutCache cache;
+        const GlobalResult untagged =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        const GlobalPlacedFiber* plain = findFiber(untagged, taggedId);
+        QVERIFY(plain != nullptr);
+        QCOMPARE(plain->fiber.kollesisTerminations.size(), plain->fiber.controlPoints.size());
+        QVERIFY(std::none_of(plain->fiber.kollesisTerminations.begin(),
+                             plain->fiber.kollesisTerminations.end(),
+                             [](bool tagged) { return tagged; }));
+
+        fibers.front().kollesisTerminations.assign(controlCount, false);
+        fibers.front().kollesisTerminations.back() = true;
+        const GlobalResult tagged =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        const GlobalPlacedFiber* placed = findFiber(tagged, taggedId);
+        QVERIFY(placed != nullptr);
+        QCOMPARE(placed->fiber.kollesisTerminations.size(), placed->fiber.controlPoints.size());
+        QVERIFY(placed->fiber.kollesisTerminations.back());
+        QVERIFY(!placed->fiber.kollesisTerminations.front());
+        // Same geometry: every cached slot was reused.
+        QCOMPARE(cache.lastStats().fibersRecomputed, 0);
+        QCOMPARE(cache.lastStats().pairsRecomputed, 0);
+        // Still an input change the memoization check must see, on both sides.
+        QVERIFY(!(vc3d::fiber_map::digestGlobalInputs(fibers, umbilicus, params) ==
+                  vc3d::fiber_map::digestGlobalInputs(cacheFixture(), umbilicus, params)));
+        QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tagged) ==
+                  vc3d::fiber_map::digestGlobalResult(untagged)));
+
+        // A flag vector that does not match the control points is ignored
+        // rather than read misaligned: it still carries a true flag, so a
+        // prefix copy would be caught.
+        fibers.front().kollesisTerminations.front() = true;
+        fibers.front().kollesisTerminations.pop_back();
+        const GlobalResult mismatched =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        const GlobalPlacedFiber* ignored = findFiber(mismatched, taggedId);
+        QVERIFY(ignored != nullptr);
+        QCOMPARE(ignored->fiber.kollesisTerminations.size(), ignored->fiber.controlPoints.size());
+        QVERIFY(std::none_of(ignored->fiber.kollesisTerminations.begin(),
+                             ignored->fiber.kollesisTerminations.end(),
+                             [](bool flagged) { return flagged; }));
+    }
 };
 
 QTEST_APPLESS_MAIN(TestFiberGlobalLayout)

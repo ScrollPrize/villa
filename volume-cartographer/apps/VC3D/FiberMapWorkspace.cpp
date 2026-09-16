@@ -2,6 +2,7 @@
 
 #include "FiberMapRuler.hpp"
 #include "LineAnnotationController.hpp"
+#include "LineAnnotationGeneratedViews.hpp"
 
 #include "vc/core/util/Logging.hpp"
 
@@ -46,10 +47,13 @@
 #include <QWindow>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
-#include <memory>
 #include <limits>
+#include <memory>
+#include <optional>
+#include <set>
 #include <utility>
 
 namespace
@@ -133,6 +137,16 @@ const LinkPalette kLinkSameTypePending{QColor(255, 190, 120, 245),
 // overlap when zoomed out; the fill is thinned so the two stacked compound
 // to roughly the palette's 175 rather than to near-opaque.
 constexpr int kLinkEndpointFillAlpha = 120;
+
+// A control point tagged kollesis_termination is marked on every fiber,
+// selected or not, as the line annotation's hollow yellow ring: an unlinked
+// one as an unfilled ring, a linked one as its link endpoint dot with the
+// yellow ring around the link fill.
+QColor kollesisColor(int alpha)
+{
+    return vc3d::line_annotation::generatedKollesisTerminationColor(alpha);
+}
+constexpr qreal kKollesisRimWidthPx = 2.0;
 
 // A link is same-type only when both fibers carry the same known H/V tag; an
 // unknown tag on either end falls back to the cross-type colours.
@@ -1145,6 +1159,7 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
             input.controlPoints = std::move(fiber.controlPoints);
             input.linePoints = std::move(fiber.linePoints);
             input.tracedSegments = std::move(fiber.tracedSegments);
+            input.kollesisTerminations = std::move(fiber.kollesisTerminations);
             input.links.reserve(fiber.links.size());
             for (const auto& link : fiber.links) {
                 input.links.push_back(
@@ -1715,6 +1730,15 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         const auto entry = _entries.constFind(fiberId);
         return entry == _entries.constEnd() ? '?' : entry->fiber.hvTag;
     };
+    const auto isKollesisTermination = [this](uint64_t fiberId, int controlIndex) {
+        const auto entry = _entries.constFind(fiberId);
+        if (entry == _entries.constEnd() || controlIndex < 0) {
+            return false;
+        }
+        const auto& flags = entry->fiber.kollesisTerminations;
+        const auto index = static_cast<std::size_t>(controlIndex);
+        return index < flags.size() && flags[index];
+    };
 
     {
         FiberMapRulerModel rulerModel;
@@ -1857,15 +1881,24 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
             // where the dots overlap, to about the palette's own.
             QColor fill = palette.brush;
             fill.setAlpha(kLinkEndpointFillAlpha);
+            const std::array<bool, 2> tagged{
+                isKollesisTermination(link.fiberA, link.cpA),
+                isKollesisTermination(link.fiberB, link.cpB)};
+            std::size_t endpointIndex = 0;
             for (const QPointF& endpoint : {a, b}) {
+                const bool kollesis = tagged[endpointIndex++];
                 auto* dot = new ScaledDot(QBrush(fill),
-                                          cosmeticPen(palette.pen, 1.0),
+                                          kollesis
+                                              ? cosmeticPen(kollesisColor(245), kKollesisRimWidthPx)
+                                              : cosmeticPen(palette.pen, 1.0),
                                           crossingDotRadius,
                                           kMinCrossingDotPx, kMaxCrossingDotPx,
                                           crossingDotBounds);
                 _scene->addItem(dot);
                 dot->setPos(endpoint);
-                dot->setZValue(4.0);
+                // A tagged endpoint sits above its untagged twin where the two
+                // overlap zoomed out, so the rim stays visible.
+                dot->setZValue(kollesis ? 4.1 : 4.0);
             }
             continue;
         }
@@ -1889,6 +1922,40 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         label->setBrush(kSuspect);
         pinText(label, middle, 0.0, -14.0, true);
         label->setZValue(5.0);
+    }
+
+    // Kollesis terminations on unlinked control points: a linked one was
+    // already drawn above as its link endpoint dot with the pale yellow rim.
+    {
+        // Suspect links draw rings, not endpoint dots, so their tagged
+        // endpoints still need the marker.
+        std::set<std::pair<uint64_t, int>> linkedEndpoints;
+        for (const vc3d::fiber_map::PlacedLink& link : _layout.links) {
+            if (link.suspect) {
+                continue;
+            }
+            linkedEndpoints.emplace(link.fiberA, link.cpA);
+            linkedEndpoints.emplace(link.fiberB, link.cpB);
+        }
+        const QPen rim = cosmeticPen(kollesisColor(245), kKollesisRimWidthPx);
+        const QBrush fill(Qt::NoBrush);
+        for (auto entry = _entries.constBegin(); entry != _entries.constEnd(); ++entry) {
+            const vc3d::fiber_map::PlacedFiber& fiber = entry->fiber;
+            for (std::size_t i = 0;
+                 i < fiber.kollesisTerminations.size() && i < fiber.controlPoints.size();
+                 ++i) {
+                if (!fiber.kollesisTerminations[i] ||
+                    linkedEndpoints.count({fiber.id, static_cast<int>(i)}) != 0) {
+                    continue;
+                }
+                auto* dot = new ScaledDot(fill, rim, crossingDotRadius,
+                                          kMinCrossingDotPx, kMaxCrossingDotPx,
+                                          crossingDotBounds);
+                _scene->addItem(dot);
+                dot->setPos(fiber.controlPoints[i]);
+                dot->setZValue(4.1);
+            }
+        }
     }
 
     // Crossings the winding repair had to drop: contradicted evidence, marked
@@ -2270,8 +2337,36 @@ void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)
     const FiberMapPalette& theme = activePalette();
     const QColor color = fiberColor(entry->fiber.hvTag, theme);
     const double vxPerCm = sceneVxPerCm();
+    // The selected fiber's dots cover the scene's kollesis markers, so a
+    // tagged point keeps its look here: a hollow yellow ring when unlinked,
+    // the link fill inside the yellow ring when linked.
+    const char selfTag = entry->fiber.hvTag;
+    const auto linkFillFor = [this, selfTag](uint64_t fiberId,
+                                             int controlIndex) -> std::optional<QColor> {
+        for (const vc3d::fiber_map::PlacedLink& link : _layout.links) {
+            const bool atA = link.fiberA == fiberId && link.cpA == controlIndex;
+            const bool atB = link.fiberB == fiberId && link.cpB == controlIndex;
+            if ((!atA && !atB) || link.suspect) {
+                continue;
+            }
+            const auto other = _entries.constFind(atA ? link.fiberB : link.fiberA);
+            const char otherTag = other == _entries.constEnd() ? '?' : other->fiber.hvTag;
+            return linkPalette(selfTag, otherTag, link.pending).brush;
+        }
+        return std::nullopt;
+    };
     for (std::size_t i = 0; i < entry->fiber.controlPoints.size(); ++i) {
-        auto* dot = new ScaledDot(QBrush(color), cosmeticPen(theme.chipInk, 1.0),
+        QBrush fill(color);
+        QPen rim = cosmeticPen(theme.chipInk, 1.0);
+        if (i < entry->fiber.kollesisTerminations.size() && entry->fiber.kollesisTerminations[i]) {
+            if (const auto linkFill = linkFillFor(fiberId, static_cast<int>(i))) {
+                fill = QBrush(*linkFill);
+            } else {
+                fill = QBrush(Qt::NoBrush);
+            }
+            rim = cosmeticPen(kollesisColor(255), kKollesisRimWidthPx);
+        }
+        auto* dot = new ScaledDot(fill, rim,
                                   kControlDotRadiusCm * vxPerCm, kMinControlDotPx,
                                   kMaxControlDotPx, kControlDotBoundsCm * vxPerCm);
         _scene->addItem(dot);

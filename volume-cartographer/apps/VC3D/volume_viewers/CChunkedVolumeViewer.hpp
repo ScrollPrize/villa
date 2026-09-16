@@ -281,6 +281,9 @@ public:
         QObject* receiver, const std::function<void()>& callback) override {
         return connect(this, &CChunkedVolumeViewer::overlaysUpdated, receiver, callback);
     }
+    // Re-runs every connectOverlaysUpdated callback: for a data change the
+    // viewer itself cannot see (an overlay's source edited elsewhere).
+    void refreshOverlays() { if (_closing) return; emit overlaysUpdated(); }
     void reloadPerfSettings() override;
     void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes) override;
     void setPreferSurfaceTileFills(bool enabled) override;

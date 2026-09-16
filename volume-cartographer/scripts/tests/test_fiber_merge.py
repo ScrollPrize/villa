@@ -1463,3 +1463,72 @@ def test_endpoint_tangent_accepts_v3_control_point():
     assert tangent == fiber_merge.endpoint_tangent(doc['line_points'],
                                                    BASE_CPS[2])
     assert tangent is not None
+
+
+def test_is_fiber_doc_accepts_control_point_tags_and_rejects_bad_shapes():
+    doc = make_v3_fiber(BASE_CPS)
+    doc['control_points'][-1]['tags'] = ['kollesis_termination']
+    assert fiber_merge.is_fiber_doc(doc)
+    bad = copy.deepcopy(doc)
+    bad['control_points'][-1]['tags'] = 'kollesis_termination'   # not an array
+    assert not fiber_merge.is_fiber_doc(bad)
+    bad = copy.deepcopy(doc)
+    bad['control_points'][-1]['tags'] = [1]                       # not strings
+    assert not fiber_merge.is_fiber_doc(bad)
+    bad = copy.deepcopy(doc)
+    bad['control_points'][-1]['kollesis_termination'] = True      # unknown field
+    assert not fiber_merge.is_fiber_doc(bad)
+
+
+def test_v3_final_control_point_tag_survives_a_separated_remote_span_change():
+    """The fiber's final CP is the likeliest kollesis termination; its tag
+    is the one per-CP change no later chunk would witness, so the chunk
+    comparison must read it itself or the merge would silently drop it."""
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['generation'] = 2
+    remote['generation'] = 3
+    local['control_points'][-1]['tags'] = ['kollesis_termination']
+    set_v3_span(remote, 1, goal='cspline', bend=1.5)
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    assert merged['control_points'][-1]['tags'] == ['kollesis_termination']
+    assert merged['control_points'][1]['segment_to_next']['interp_goal'] == 'cspline'
+    assert loader_issues({'dj_x_000001.json': merged}) == []
+
+
+def test_v3_interior_control_point_tag_survives_a_separated_remote_span_change():
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['generation'] = 2
+    remote['generation'] = 3
+    remote['control_points'][2]['tags'] = ['kollesis_termination']
+    set_v3_span(local, 5, goal='lasagna', bend=-2.0)
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    assert merged['control_points'][2]['tags'] == ['kollesis_termination']
+    assert merged['control_points'][5]['segment_to_next']['interp_goal'] == 'lasagna'
+    assert loader_issues({'dj_x_000001.json': merged}) == []
+
+
+def test_v3_tagging_and_refitting_the_same_final_span_is_a_manual_conflict():
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['generation'] = 2
+    remote['generation'] = 3
+    local['control_points'][-1]['tags'] = ['kollesis_termination']
+    set_v3_span(remote, len(BASE_CPS) - 2, goal='cspline', bend=1.5)
+
+    result = merge_fibers(base, local, remote)
+
+    assert not result['ok']
+    assert any('changed differently on both sides' in c for c in result['conflicts'])

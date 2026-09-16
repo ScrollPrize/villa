@@ -56,6 +56,10 @@ struct InputFiber {
     // Per control-point-span "was fiber-model traced"; anything else is only
     // an interpolation. Empty or mismatched renders as a single traced run.
     std::vector<bool> tracedSegments;
+    // Per control point: tagged kollesis_termination. Display-only (no
+    // geometry reads it), so it is not part of the cache keys; empty or
+    // mismatched means no tags.
+    std::vector<bool> kollesisTerminations;
     // Raw directed refs; the layout dedupes reciprocal pairs.
     std::vector<InputLink> links;
 };
@@ -102,6 +106,9 @@ struct PlacedFiber {
     // Control-point positions read off the smoothed geometry, so they land
     // exactly on the drawn curve.
     std::vector<QPointF> controlPoints;
+    // Parallel to controlPoints: the point carries the kollesis_termination
+    // tag (copied from the input; always sized to controlPoints).
+    std::vector<bool> kollesisTerminations;
 };
 
 struct PlacedLink {

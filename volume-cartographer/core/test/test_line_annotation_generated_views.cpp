@@ -4047,3 +4047,152 @@ TEST_CASE("Winding queries use the center frame at every volume level")
           generatedLineIndexRangeWithinWinding(expected, expected.size(), 20.0,
                                                kGeneratedSideCutHalfWrapAngle));
 }
+
+TEST_CASE("control point tags round trip and travel with the point")
+{
+    using namespace vc3d::line_annotation;
+
+    // Untagged points serialize exactly as before: no "tags" key at all.
+    StoredControlPoint untagged{{1.0, 2.0, 3.0}};
+    CHECK(!storedControlPointToJson(untagged).contains("tags"));
+
+    StoredControlPoint tagged{{1.0, 2.0, 3.0}};
+    CHECK(setControlPointTag(tagged.tags, kKollesisTerminationTag, true));
+    CHECK(!setControlPointTag(tagged.tags, kKollesisTerminationTag, true));
+    CHECK(hasControlPointTag(tagged.tags, kKollesisTerminationTag));
+    const auto json = storedControlPointToJson(tagged);
+    REQUIRE(json.contains("tags"));
+    CHECK(json["tags"] == nlohmann::json::array({"kollesis_termination"}));
+    const auto parsed = storedControlPointFromJson(json, 3);
+    CHECK(parsed.tags == tagged.tags);
+    CHECK(setControlPointTag(tagged.tags, kKollesisTerminationTag, false));
+    CHECK(tagged.tags.empty());
+    CHECK(!setControlPointTag(tagged.tags, kKollesisTerminationTag, false));
+
+    // Normalised on read: trimmed, blanks dropped, unique, sorted.
+    const nlohmann::json messy{{"position", {1.0, 2.0, 3.0}},
+                               {"tags", {" b ", "a", "", "a"}}};
+    CHECK(storedControlPointFromJson(messy, 3).tags ==
+          std::vector<std::string>{"a", "b"});
+    const nlohmann::json notArray{{"position", {1.0, 2.0, 3.0}},
+                                  {"tags", "kollesis_termination"}};
+    CHECK_THROWS_AS(storedControlPointFromJson(notArray, 3), std::runtime_error);
+    const nlohmann::json notStrings{{"position", {1.0, 2.0, 3.0}}, {"tags", {1}}};
+    CHECK_THROWS_AS(storedControlPointFromJson(notStrings, 3), std::runtime_error);
+    // Any other per-point field is still rejected.
+    const nlohmann::json unknown{{"position", {1.0, 2.0, 3.0}},
+                                 {"kollesis_termination", true}};
+    CHECK_THROWS_AS(storedControlPointFromJson(unknown, 3), std::runtime_error);
+
+    // The shared core reader (atlas, tracer CLI, inspect tools) accepts the
+    // field and rejects the same malformed shapes.
+    const nlohmann::json root = {{"control_points", nlohmann::json::array({json})}};
+    CHECK_NOTHROW(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+        root, "control_points", 3, "test fiber"));
+    const nlohmann::json badTags = {{"control_points", nlohmann::json::array({notStrings})}};
+    CHECK_THROWS_AS(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+                        badTags, "control_points", 3, "test fiber"),
+                    std::runtime_error);
+    const nlohmann::json badField = {{"control_points", nlohmann::json::array({unknown})}};
+    CHECK_THROWS_AS(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+                        badField, "control_points", 3, "test fiber"),
+                    std::runtime_error);
+
+    // Edits: the click that collapses tagged points keeps the union of their
+    // tags, the optimizer round trip and a reverse carry them unchanged.
+    std::vector<LineControlPoint> controls{
+        LineControlPoint{0.0, cv::Vec3d(0.0, 0.0, 0.0), true, 0},
+        LineControlPoint{5.0, cv::Vec3d(5.0, 0.0, 0.0), false, 5},
+        LineControlPoint{10.0, cv::Vec3d(10.0, 0.0, 0.0), false, 10}};
+    controls[1].tags = {"kollesis_termination"};
+    controls[2].tags = {"other"};
+    const auto collapse =
+        collapseControlPointsAtClick(controls, {1, 2}, 7.0, cv::Vec3d(7.0, 0.0, 0.0));
+    REQUIRE(collapse.replacementIndex < collapse.controlPoints.size());
+    CHECK(collapse.controlPoints[collapse.replacementIndex].tags ==
+          std::vector<std::string>{"kollesis_termination", "other"});
+    CHECK(collapse.controlPoints[0].tags.empty());
+    const auto fresh =
+        collapseControlPointsAtClick(controls, {}, 7.0, cv::Vec3d(7.0, 0.0, 0.0));
+    REQUIRE(fresh.replacementIndex < fresh.controlPoints.size());
+    CHECK(fresh.controlPoints[fresh.replacementIndex].tags.empty());
+
+    const auto merged = mergeOptimizerControlPoints(optimizerControlPoints(controls), controls);
+    REQUIRE(merged.size() == controls.size());
+    CHECK(merged[1].tags == controls[1].tags);
+    CHECK(merged[2].tags == controls[2].tags);
+
+    std::vector<StoredControlPoint> stored{StoredControlPoint{cv::Vec3d(0.0, 0.0, 0.0)},
+                                           StoredControlPoint{cv::Vec3d(5.0, 0.0, 0.0)},
+                                           StoredControlPoint{cv::Vec3d(10.0, 0.0, 0.0)}};
+    stored[2].tags = {"kollesis_termination"};
+    const auto reversed = reversedStoredControlPoints(stored);
+    REQUIRE(reversed.size() == 3);
+    CHECK(reversed[0].tags == stored[2].tags);
+    CHECK(reversed[2].tags.empty());
+}
+
+TEST_CASE("kollesis terminations sit on fiber ends and block placement beyond them")
+{
+    using namespace vc3d::line_annotation;
+    using Marker = GeneratedOverlay::ControlPointMarker;
+    const auto marker = [](size_t index, double linePosition, bool tagged) {
+        Marker m;
+        m.controlIndex = index;
+        m.linePosition = linePosition;
+        m.isKollesisTermination = tagged;
+        return m;
+    };
+
+    // Session order need not be line order: index 2 is the first point.
+    std::vector<Marker> markers{marker(0, 10.0, false), marker(1, 25.0, false),
+                                marker(2, 3.0, false), marker(3, 40.0, false)};
+    CHECK(generatedControlPointIsEndpoint(markers, 2));
+    CHECK(generatedControlPointIsEndpoint(markers, 3));
+    CHECK(!generatedControlPointIsEndpoint(markers, 0));
+    CHECK(!generatedControlPointIsEndpoint(markers, 1));
+    CHECK(!generatedControlPointIsEndpoint(markers, 9));
+    CHECK(generatedControlPointIsEndpoint({marker(0, 5.0, false)}, 0));
+    CHECK(!generatedControlPointIsEndpoint({}, 0));
+    // A marker without a line position neither is an end nor hides one.
+    markers.push_back(marker(4, std::numeric_limits<double>::quiet_NaN(), true));
+    CHECK(!generatedControlPointIsEndpoint(markers, 4));
+    CHECK(generatedControlPointIsEndpoint(markers, 3));
+
+    // Nothing tagged: nothing blocked.
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, -5.0));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, 100.0));
+
+    // Tagged last point: only positions strictly past it are blocked.
+    markers[3].isKollesisTermination = true;
+    CHECK(generatedLinePositionBeyondKollesisTermination(markers, 40.5));
+    CHECK(generatedLinePositionBeyondKollesisTermination(markers, 100.0));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, 40.0));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, 30.0));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, -5.0));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(
+        markers, std::numeric_limits<double>::quiet_NaN()));
+
+    // Tagged first point: the other side.
+    markers[3].isKollesisTermination = false;
+    markers[2].isKollesisTermination = true;
+    CHECK(generatedLinePositionBeyondKollesisTermination(markers, 2.9));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, 3.0));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, 100.0));
+
+    // An interior tag (from an edited file) blocks nothing.
+    markers[2].isKollesisTermination = false;
+    markers[1].isKollesisTermination = true;
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, -5.0));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, 100.0));
+
+    // The rule the controller applies to session controls directly.
+    const std::vector<double> positions{10.0, 25.0, 3.0, 40.0};
+    CHECK(generatedLinePositionBeyondTaggedEnd(positions, {false, false, false, true}, 41.0));
+    CHECK(!generatedLinePositionBeyondTaggedEnd(positions, {false, false, false, true}, 40.0));
+    CHECK(generatedLinePositionBeyondTaggedEnd(positions, {false, false, true, false}, 2.0));
+    CHECK(!generatedLinePositionBeyondTaggedEnd(positions, {false, true, false, false}, 100.0));
+    // Mismatched vectors mean no tags rather than a misaligned read.
+    CHECK(!generatedLinePositionBeyondTaggedEnd(positions, {true}, 100.0));
+    CHECK(!generatedLinePositionBeyondTaggedEnd({}, {}, 5.0));
+}
