@@ -436,6 +436,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _DistributedConfig,
     _LossStatistics,
     _Trace2Cp3DConfig,
+    _checkpoint_sources,
     _load_snapshot,
     _optimizer_hparams_from_training,
     _branch_choice_grid_offsets,
@@ -3113,6 +3114,19 @@ def test_3d_resume_reapplies_current_optimizer_hparams_preserving_state(tmp_path
     )
     assert resumed_state_norms == pytest.approx(original_state_norms)
     assert resumed_state_steps == pytest.approx(original_state_steps)
+
+
+def test_3d_checkpoint_sources_separate_resume_and_weights_initialization() -> None:
+    assert _checkpoint_sources(
+        {"training": {"initialize_from": "best-ema.pt"}}
+    ) == (None, "best-ema.pt")
+    assert _checkpoint_sources(
+        {"training": {"initialize_from": "best-ema.pt"}}, "current.pt"
+    ) == ("current.pt", None)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _checkpoint_sources({"training": {
+            "resume": "current.pt", "initialize_from": "best-ema.pt",
+        }})
 
 
 def test_3d_save_snapshot_unwraps_parallel_model_state(tmp_path: Path) -> None:

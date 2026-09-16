@@ -36,7 +36,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.gradient_accumulation import (
 from vesuvius.neural_tracing.fiber_trace_3d.training_state import (
     TrainingBoundary, capture_handoff, restore_handoff,
     model_optimizer_payload, restore_model_optimizer,
-    config_fingerprint,
+    checkpoint_sources as _checkpoint_sources, config_fingerprint,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.cooperative_resources import EffectiveBatchSampleIndex
 from torch.nn.parallel import DistributedDataParallel
@@ -2999,11 +2999,7 @@ def training_units(
         raw_model.parameters(),
         **optimizer_hparams,
     )
-    resume = (
-        str(resume_checkpoint)
-        if resume_checkpoint is not None
-        else training.get("resume") or raw_config.get("resume")
-    )
+    resume, initialize_from = _checkpoint_sources(raw_config, resume_checkpoint)
     start_step = 0
     progress_metadata: dict[str, Any] = {}
     handoff_progress = None
@@ -3028,6 +3024,19 @@ def training_units(
             map_location=device,
             progress_metadata=progress_metadata,
         )
+    elif initialize_from:
+        _load_snapshot(
+            initialize_from,
+            model=raw_model,
+            optimizer=None,
+            map_location=device,
+        )
+        if distributed.is_main:
+            print(
+                "fiber_trace_3d initialization: "
+                f"checkpoint={initialize_from} weights_only=true start_step=0",
+                flush=True,
+            )
     optimizer_lr_group_scales = _optimizer_learning_rate_scales(optimizer)
 
     ddp_broadcast_buffers = training.get("ddp_broadcast_buffers", True)

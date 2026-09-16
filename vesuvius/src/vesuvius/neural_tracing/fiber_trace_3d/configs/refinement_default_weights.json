@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "status": "current-tracing-selected-best",
+  "selected_at": "2026-09-16",
+  "selection_metric": "full-50-fiber-filtered-restarts",
+  "run": "5scroll_json_eligible_refinement_128_sd1_16x8_ema_20260915_212757",
+  "snapshot_kind": "ema",
+  "ema_decay": 0.999,
+  "update": 22000,
+  "samples_seen": 2816000,
+  "training_initialization_semantics": "model weights and refined-fiber geometry; fresh optimizer, EMA tracks, and update/sample counters",
+  "training_checkpoint": "/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_refinement_128_sd1_16x8_ema_20260915_212757/snapshots/best_ema_0p999.pt",
+  "inference_checkpoint": "/ephemeral/hendrik/fiber3d_train2/evaluations/refinement_212757_best_ema999_off_20260916_v1/frozen/live_inference/_models/67edd3a1bde162c7105ee37d849a0f0b60a9b840dd37fc7ff6e17e0c3a2e9742/snapshot.pt",
+  "checkpoint_sha256": "67edd3a1bde162c7105ee37d849a0f0b60a9b840dd37fc7ff6e17e0c3a2e9742",
+  "refinement_state": {
+    "file": "fibers_step_00022000.zip",
+    "sha256": "71421ef7b18b46ece142c87975993346d890628939ff2254c87d0137e62e9989"
+  },
+  "dense_validation": {
+    "metric": "test_ema_0p999/loss_total",
+    "value": 0.20778093604016895
+  },
+  "full_evaluation": {
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/refinement_212757_best_ema999_off_20260916_v1",
+    "selected_fibers": 50,
+    "eligible_runs": 90,
+    "directed_traces": 180,
+    "directed_reference_length_mm": 6867.627252833244,
+    "restart_episodes": 99,
+    "failures_per_directed_mm": 0.014415459132432895,
+    "mean_segment_length_mm": 68.67627252833243,
+    "median_segment_length_mm": 11.128853511213034,
+    "p05_segment_length_mm": 0.22730862638168176,
+    "p95_segment_length_mm": 100.80221724867276
+  }
+}

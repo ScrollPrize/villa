@@ -617,8 +617,9 @@ def main():
     config = json.loads(args.reference.read_text())["config"]
     if config.get("batch_size") != 8:
         parser.error("this reference experiment requires batch_size=8 per rank")
-    if config.get("resume") or config.get("training", {}).get("resume"):
-        parser.error("reference experiment must start fresh, not resume")
+    if (config.get("resume") or config.get("training", {}).get("resume") or
+            config.get("training", {}).get("initialize_from")):
+        parser.error("reference experiment must start from fresh model weights")
     if args.tuning_suite:
         run_tuning_suite(args)
         return

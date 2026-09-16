@@ -15,7 +15,7 @@ import signal
 import time
 
 from .cooperative_resources import MemoryCalibration
-from .training_state import config_fingerprint
+from .training_state import checkpoint_sources, config_fingerprint
 
 
 @dataclass(frozen=True)
@@ -109,7 +109,7 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
     settings = launch_settings(raw, socket=socket)
     fingerprint = config_fingerprint(raw)
     training = raw.get("training", {})
-    resume = resume_checkpoint or training.get("resume") or raw.get("resume")
+    resume, _initialize_from = checkpoint_sources(raw, resume_checkpoint)
     start_step = 0
     if resume is not None:
         # Same trusted checkpoint assumption as the ordinary trainer. Do not

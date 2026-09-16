@@ -474,7 +474,8 @@ def start():
     devices = control['devices']
     if raw['batch_size'] * len(devices) != raw['training']['optimizer_global_batch_size']:
         raise ValueError('Reproduction requires a physical effective batch, no accumulation')
-    if raw['training'].get('resume') or raw.get('resume'):
+    if (raw['training'].get('resume') or raw.get('resume') or
+            raw['training'].get('initialize_from')):
         raise ValueError('Reproduction trials start from scratch')
     OUTPUT.mkdir(parents=True, exist_ok=True)
     folder = OUTPUT / (control['stage'] + '-' + datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S'))

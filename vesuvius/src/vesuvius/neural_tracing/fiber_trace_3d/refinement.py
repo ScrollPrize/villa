@@ -15,6 +15,8 @@ import time
 
 import numpy as np
 
+from vesuvius.neural_tracing.fiber_trace_3d.training_state import checkpoint_sources
+
 
 @dataclass(frozen=True)
 class RefinementConfig:
@@ -347,14 +349,16 @@ def refinement_session(function):
             raise RuntimeError("refinement state must be owned by one training supervisor")
         if int(os.environ.get("WORLD_SIZE", "1")) > 1:
             raise ValueError("refinement multi-GPU launch must use the cooperative manager, not torchrun")
-        resume = kwargs.get("resume_checkpoint") or raw.get("training", {}).get("resume") or raw.get("resume")
+        resume, initialize_from = checkpoint_sources(raw, kwargs.get("resume_checkpoint"))
+        state_checkpoint = resume or initialize_from
         with tempfile.TemporaryDirectory(prefix="fiber-refinement-") as root:
-            if resume:
+            if state_checkpoint:
                 import torch
-                state = torch.load(resume, map_location="cpu", weights_only=False)
+                state = torch.load(state_checkpoint, map_location="cpu", weights_only=False)
                 saved = state.get("refinement_state")
                 if saved:
-                    GeometryStore(root).restore(Path(resume).parent / saved["file"], saved["sha256"])
+                    GeometryStore(root).restore(
+                        Path(state_checkpoint).parent / saved["file"], saved["sha256"])
                 elif state.get("config", {}).get("refinement", {}).get("enabled"):
                     raise ValueError("refinement checkpoint is missing its fiber state")
             os.environ[_ENV] = root

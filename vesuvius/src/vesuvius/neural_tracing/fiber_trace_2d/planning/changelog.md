@@ -1,3 +1,13 @@
+## 2026-09-16 — Refinement default and run062136 evaluations
+
+- Promoted tracing-selected refinement EMA999u22000 (99restarts/68.676mm) as
+  the canonical refinement training default, with explicit model/state
+  initialization (fresh optimizer/progress/EMA), immutable model/geometry hashes,
+  and frozen inference path in `refinement_default_weights.json`.
+- Full50-fiber run062136 best/current evaluations scored114/59.718mm and
+  109/62.433mm. Neither displaced u22000. Full provenance and per-scroll table:
+  docs/benchmarks/refinement_062136_ema999_best_current_20260916.md.
+
 ## 2026-09-16 — Best short200 failure review
 
 - Rendered all59best-u22000 failing pieces (62restarts) in46.958s; exact original

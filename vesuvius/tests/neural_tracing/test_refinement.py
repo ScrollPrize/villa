@@ -266,6 +266,34 @@ def test_session_restores_and_cleans_environment(tmp_path, monkeypatch):
     assert "VILLA_FIBER_REFINEMENT_STATE" not in os.environ
 
 
+def test_session_restores_geometry_for_weights_initialization(tmp_path, monkeypatch):
+    monkeypatch.delenv("VILLA_FIBER_REFINEMENT_STATE", raising=False)
+    checkpoint_dir = tmp_path / "snapshots"
+    checkpoint_dir.mkdir()
+    key = "a" * 64
+    source = GeometryStore(tmp_path / "source")
+    source.register(key, line()[:, :3], {"split": "train"}, RefinementConfig())
+    expected = source.read(key)
+    expected[:, 1] += 2
+    assert source.commit(key, 0, source.read(key), expected)
+    state = source.save(checkpoint_dir / "fibers.zip")
+    checkpoint = checkpoint_dir / "best_ema.pt"
+    torch.save({"snapshot_kind": "ema", "refinement_state": state}, checkpoint)
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "refinement": {"enabled": True},
+        "training": {"initialize_from": str(checkpoint)},
+    }))
+
+    @refinement_session
+    def run(path):
+        restored = GeometryStore(os.environ["VILLA_FIBER_REFINEMENT_STATE"])
+        np.testing.assert_array_equal(restored.read(key), expected)
+
+    run(cfg)
+    assert "VILLA_FIBER_REFINEMENT_STATE" not in os.environ
+
+
 def _distributed_refinement_worker(rank, world, rendezvous, root):
     import torch.distributed as dist
     from datetime import timedelta

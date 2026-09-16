@@ -36,6 +36,17 @@ def config_fingerprint(config):
                                     allow_nan=False).encode()).hexdigest()
 
 
+def checkpoint_sources(raw_config, resume_checkpoint=None):
+    """Resolve exact continuation versus a weights-only initialization."""
+    training = raw_config.get("training", {})
+    configured_resume = training.get("resume") or raw_config.get("resume")
+    initialize_from = training.get("initialize_from")
+    if resume_checkpoint is None and configured_resume and initialize_from:
+        raise ValueError("training.resume and training.initialize_from are mutually exclusive")
+    resume = str(resume_checkpoint) if resume_checkpoint is not None else configured_resume
+    return resume, None if resume else initialize_from
+
+
 def model_optimizer_payload(model, optimizer, grad_scaler=None, ema=None):
     """Common payload; callers choose disk serialization or CPU RAM ownership."""
     result = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}

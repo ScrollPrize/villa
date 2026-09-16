@@ -1,3 +1,6 @@
 # Task
 
-Create a single-case merge/split benchmark from corrected mini5 v3 case000 for future global assignment experiments. Compare user-provided edited evaltrace-fiberlet file with reference and failing trace to assess whether it represents the touching neighboring fiber. Do not implement global assignment yet.
+Commit the completed merge/split work, evaluate the best and current EMA999
+snapshots from refinement run `20260916_062136` on the established full 50-fiber
+benchmark, then promote the tracing-selected best refinement checkpoint to the
+canonical refinement training default and document it as the current best.

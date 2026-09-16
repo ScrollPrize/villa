@@ -1,12 +1,34 @@
 # Plan
 
-1. Preserve completed correction planning in archive. Freeze one-case manifest/config from mini5v3 with identical snapshot/cache/settings. Keep user companion annotation as a separately hashed auxiliary hypothesis, not ground truth.
-2. Use native replay-references for both CP-bounded eligible lines; no extrapolated tails. Reuse benchmark-full for baseline render. Add optional pair diagnostic that freezes companion and records native plan, exact point-to-segment distances and arclength profiles against GT and first failed trace. Dense profiles only on this small case; no volume-wide scan or new solver.
-3. Inspect existing render and compare sampled geometry near merge and divergent end. Distinguish geometric corroboration from physical fiber identity; no assertion that CT establishes identity without evidence. Save inputs and report under dedicated benchmark output.
-4. Regression-test distance helper, run approved tests/benchmark, validate unchanged one-case replay vs mini5v3. Log result, command and limitations.
+1. Commit the completed merge/split/fiberlet diagnostics before the new runs.
+2. Freeze and identify the `062136` best/current EMA999 snapshots.
+3. Run both with the identical original-GT 50-fiber/180-direction protocol,
+   embeddings and rendering disabled, all eight GPUs, and fresh model caches.
+4. Validate global and per-scroll metrics and compare against the previous
+   refinement leader.
+5. Select the actual tracing winner as the refinement default. Point the
+   canonical training config at the source checkpoint using explicit
+   weights-only initialization semantics so its sibling geometry archive remains
+   available without pretending an EMA artifact is an optimizer resume; record
+   an immutable machine-readable manifest with both training and frozen-inference
+   paths and hashes.
+6. Validate configs, snapshot/archive hashes and initialization metadata; test
+   weights/state initialization and the resume/initialize exclusion, document,
+   and commit the evaluation plus default selection.
 
 ## Spec update
-Single merge/split benchmark stores primary GT, auxiliary candidate (not an independent GT label), frozen hashes and native eligibility, baseline model/cache provenance.
+
+None. The evaluator and refinement algorithm do not change. The canonical
+refinement starting weights change to the current tracing-selected winner.
 
 ## Docs updates
-New benchmark report with paths, geometric evidence, reproduction command and future many-to-many assignment motivation. Changelog entry; update active log/status.
+
+Add the `062136` benchmark report, current-default model documentation, and a
+changelog entry. Replace the active status/log with this task's provenance.
+
+## Testing
+
+Parse all JSON, verify checkpoint and refinement archive hashes, load checkpoint
+metadata, validate the configured initialization/state relationship, run the
+focused refinement and checkpoint-source tests, and rely on both completed
+180-direction runner summaries for evaluation validation.
