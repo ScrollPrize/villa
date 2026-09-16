@@ -39,6 +39,13 @@ initialization with no refinement, embedding, or resume source. Its config
 fingerprint is distinct, so cooperative startup measures stride-1 memory rather
 than accepting the stride-4 calibration.
 
+The managed run launched at 2026-09-16 19:23 UTC as
+`5scroll_json_eligible_fullres_128_sd1_16x8_ema_20260916_192344`. Startup
+measured microbatch 8, saved calibration fingerprint
+`7fa1c121dd3ca12a56efeda8046f3725d81bdd565c281961e115ca977d6305e5`,
+then re-registered for adaptive training. It reached update 200 and completed
+the update-100 and update-200 raw/EMA tests during launch verification.
+
 The subsequent contrastive variant is
 `train_5scroll_json_eligible_paired_contrastive_ema_16x8.json`: identical regular
 settings plus16 embedding channels, paired local contrastive loss (64pairs per

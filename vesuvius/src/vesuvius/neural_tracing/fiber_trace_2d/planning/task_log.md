@@ -14,3 +14,12 @@
   `/ephemeral/hendrik/fiber3d_train2/cooperative-tests/20260916_191912_825700`.
 - Independent final review approved the exact config delta, regression, fresh
   semantics, calibration separation and managed launcher selection.
+- Committed config/test/docs/launcher as `a456f1dc5`.
+- Approved production launch root1436973, launch dir
+  `5scroll_json_eligible_fullres_128_sd1_16x8_ema-20260916_192340`.
+- Initially queued behind exclusive `refinement062136-best`; it then acquired
+  8GPU/128CPU. Fresh real-update calibration measured microbatch8 at step12 and
+  saved fingerprint `7fa1c121dd3ca12a56efeda8046f3725d81bdd565c281961e115ca977d6305e5`
+  (adaptive minimum20,373,831,680 bytes/GPU).
+- Active run is `5scroll_json_eligible_fullres_128_sd1_16x8_ema_20260916_192344`.
+  Verified fresh progress through update200 and raw/EMA tests at100 and200.

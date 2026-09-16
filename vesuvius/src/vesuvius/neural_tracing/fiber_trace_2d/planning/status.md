@@ -4,4 +4,4 @@
 - [x] Add full-resolution config and equivalence regression.
 - [x] Run focused CPU validation: 40 passed, 2 skipped.
 - [x] Update docs and approved launcher configuration.
-- [ ] Launch fresh managed training and verify startup.
+- [x] Launch fresh managed training; distinct stride-1 calibration and update 200 verified.
