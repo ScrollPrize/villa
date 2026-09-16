@@ -204,6 +204,23 @@ std::size_t addRayV(World& world, double radius, double z0, double z1, long long
     return world.fibers.size() - 1;
 }
 
+// --- Kollesis fixtures. The inner sheet's H fiber ends just past the seam
+// angle with its end tagged; the outer sheet's V fiber runs at the seam one
+// thickness in FRONT of the H fiber's end (the outer sheet is glued toward
+// the core), so the crossing reads Outside by a thickness although the two
+// are one winding. The H fiber runs a little past the V fiber, as annotated
+// ends do: the encounter is interior to the trace, not a vertex coincidence.
+constexpr double kSeamWinding = 0.55;
+constexpr double kSeamOvershoot = 0.02;
+constexpr double kSeamHeight = 30000.0;
+
+// An H fiber whose earlier turn sits well outside the seam V fiber: the
+// seam-encounter reading must not spill over to that crossing.
+double outerOnEarlierTurn(double w, double z)
+{
+    return w < kSeamWinding - 0.5 ? sheetR(w + 1.0, z) + 300.0 : sheetR(w, z) - kSheetStep;
+}
+
 // The one group of a solve, or fails the test.
 const CrossingGroup& singleGroup(const SolveResult& result)
 {
@@ -1370,7 +1387,7 @@ private slots:
                 shards.push_back(vc3d::fiber_map::winding::classifyPairCrossings(
                     vc3d::fiber_map::winding::detectPairCrossings(canonical[hIndex],
                                                                   canonical[vIndex], params),
-                    canonical[hIndex], canonical[vIndex], params));
+                    canonical[hIndex], canonical[vIndex], {}, params));
                 ordered.push_back({hIndex, vIndex, nullptr});
             }
         }
@@ -1425,6 +1442,669 @@ private slots:
         }
         QCOMPARE(a.droppedCrossingCount, b.droppedCrossingCount);
         QCOMPARE(a.droppedGroupCount, b.droppedGroupCount);
+    }
+
+    // --- Kollesis seam encounters.
+
+    // Without the flags the seam crossing reads Outside and fights the link;
+    // with the H end tagged, the V on the kollesis and the pair linked it
+    // reads Inside, is flagged, and nothing is dropped.
+    void kollesisSeamEncounterReadsInside()
+    {
+        for (const bool flagged : {false, true}) {
+            World world;
+            const std::size_t h = addH(world, 0.05, kSeamWinding + kSeamOvershoot, kSeamHeight);
+            // In front of the H fiber's end by a thickness: r_v = sheet - 200,
+            // r_h = sheet - 100 -> deltaR = +100.
+            const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+            world.links.push_back(LinkInput{
+                h, world.fibers[h].theta.size() - 1, v, 40});
+            if (flagged) {
+                world.fibers[h].kollesisEndSample = world.fibers[h].theta.size() - 1;
+                world.fibers[v].onKollesis = true;
+            }
+            const SolveResult result =
+                solveWindings(world.fibers, world.links, SolverParams{});
+            QCOMPARE(result.crossings.size(), std::size_t{1});
+            QCOMPARE(result.events.size(), std::size_t{1});
+            const Crossing& event = result.events.front();
+            QVERIFY(event.deltaR > 0.0);
+            QCOMPARE(event.kollesis, flagged);
+            QCOMPARE(event.kind, flagged ? CrossingKind::Inside : CrossingKind::Outside);
+            QCOMPARE(result.crossings.front().kind, event.kind);
+            QCOMPARE(result.kollesisCrossingCount, flagged ? 1 : 0);
+            // The link holds either way; without the flags the crossing is
+            // the casualty.
+            QVERIFY(result.droppedLinks.empty());
+            QCOMPARE(countDroppedCrossings(result), flagged ? 0 : 1);
+            checkRelativeTurns(result, world, {h, v});
+            QVERIFY(result.groups.empty());
+        }
+    }
+
+    // Only the encounter at the tagged end is read as the seam: a crossing of
+    // the same pair a turn earlier keeps its radial reading.
+    void kollesisReadingStaysAtTheTaggedEnd()
+    {
+        World world;
+        const std::size_t h = addH(world, kSeamWinding - 1.2, kSeamWinding + kSeamOvershoot,
+                                   kSeamHeight, outerOnEarlierTurn);
+        const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+        world.fibers[h].kollesisEndSample = world.fibers[h].theta.size() - 1;
+        world.fibers[v].onKollesis = true;
+        world.links.push_back(LinkInput{h, world.fibers[h].theta.size() - 1, v, 40});
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.events.size(), std::size_t{2});
+        int seam = 0;
+        int outside = 0;
+        for (const Crossing& event : result.events) {
+            if (event.kollesis) {
+                ++seam;
+                QCOMPARE(event.kind, CrossingKind::Inside);
+            } else {
+                QCOMPARE(event.kind, CrossingKind::Outside);
+                ++outside;
+            }
+        }
+        QCOMPARE(seam, 1);
+        QCOMPARE(outside, 1);
+        QCOMPARE(result.kollesisCrossingCount, 1);
+    }
+
+    // A tag on the H fiber's first control point (the outer sheet's H fiber
+    // starting at the seam) mirrors the end tag.
+    void kollesisStartTagMirrorsTheEndTag()
+    {
+        World world;
+        const std::size_t h = addH(world, kSeamWinding - kSeamOvershoot, kSeamWinding + 0.5,
+                                   kSeamHeight);
+        const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+        world.fibers[h].kollesisStartSample = 0;
+        world.fibers[v].onKollesis = true;
+        world.links.push_back(LinkInput{h, 0, v, 40});
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.events.size(), std::size_t{1});
+        QVERIFY(result.events.front().kollesis);
+        QCOMPARE(result.events.front().kind, CrossingKind::Inside);
+        QCOMPARE(countDroppedCrossings(result), 0);
+    }
+
+    // Tag, kollesis V and link are all needed: a tagged H end against a V
+    // that is not on the kollesis, a kollesis V against an untagged H, or a
+    // tagged H and kollesis V that are not linked, read as before.
+    void kollesisNeedsBothFlags()
+    {
+        for (const int which : {0, 1, 2}) {
+            World world;
+            const std::size_t h = addH(world, 0.05, kSeamWinding + kSeamOvershoot, kSeamHeight);
+            const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+            if (which != 1) {
+                world.fibers[h].kollesisEndSample = world.fibers[h].theta.size() - 1;
+            }
+            if (which != 0) {
+                world.fibers[v].onKollesis = true;
+            }
+            if (which != 2) {
+                world.links.push_back(LinkInput{h, world.fibers[h].theta.size() - 1, v, 40});
+            }
+            const SolveResult result =
+                solveWindings(world.fibers, world.links, SolverParams{});
+            QCOMPARE(result.events.size(), std::size_t{1});
+            QVERIFY(!result.events.front().kollesis);
+            QCOMPARE(result.events.front().kind, CrossingKind::Outside);
+            QCOMPARE(result.kollesisCrossingCount, 0);
+        }
+    }
+
+    // The seam encounter is read as a whole: when the H fiber's end wobbles
+    // across the V fiber's angle so two detections share the encounter's
+    // cluster, both are reclassified and the representative is Inside even
+    // though the more confident detection read Outside.
+    void kollesisReadsTheWholeEncounter()
+    {
+        World world;
+        FiberTrace h;
+        h.hvTag = 'H';
+        for (double w = 0.05; w <= kSeamWinding + kSeamOvershoot + 1e-9; w += 1.0 / 256.0) {
+            h.theta.push_back(kTwoPi * w);
+            h.z.push_back(kSeamHeight);
+            h.radius.push_back(sheetR(w, kSeamHeight) - kSheetStep);
+        }
+        // Back across the seam angle: a second pass of the V fiber's angle
+        // at nearly the same height and radius.
+        h.theta.push_back(kTwoPi * (kSeamWinding - 0.5 * kSeamOvershoot));
+        h.z.push_back(kSeamHeight + 10.0);
+        h.radius.push_back(sheetR(kSeamWinding, kSeamHeight) - kSheetStep);
+        h.kollesisEndSample = h.theta.size() - 1;
+        world.fibers.push_back(std::move(h));
+        world.trueM.push_back(0);
+        const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+        world.fibers[v].onKollesis = true;
+        world.links.push_back(LinkInput{0, world.fibers[0].theta.size() - 1, v, 40});
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QVERIFY(result.events.size() >= 2);
+        for (const Crossing& event : result.events) {
+            QVERIFY(event.kollesis);
+            QCOMPARE(event.kind, CrossingKind::Inside);
+        }
+        QCOMPARE(result.crossings.size(), std::size_t{1});
+        QCOMPARE(result.crossings.front().kind, CrossingKind::Inside);
+        QVERIFY(result.crossings.front().kollesis);
+        QVERIFY(result.crossings.front().mergedCount >= 2);
+        QVERIFY(result.groups.empty());
+    }
+
+    // The tagged control need not be the trace's end: the layout runs a
+    // sample beyond the outer controls, and here that padding sample climbs
+    // above the V fiber's top. The link names the encounter either way.
+    void kollesisTaggedSampleNeedNotBeTheTraceEnd()
+    {
+        for (const bool tagPadding : {false, true}) {
+            World world;
+            const std::size_t h = addH(world, 0.05, kSeamWinding + kSeamOvershoot, kSeamHeight);
+            const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+            world.fibers[v].onKollesis = true;
+            FiberTrace& hFiber = world.fibers[h];
+            hFiber.theta.push_back(hFiber.theta.back() + kTwoPi / 256.0);
+            hFiber.z.push_back(31500.0);
+            hFiber.radius.push_back(hFiber.radius.back());
+            hFiber.kollesisEndSample = tagPadding ? hFiber.theta.size() - 1
+                                                  : hFiber.theta.size() - 2;
+            world.links.push_back(LinkInput{h, hFiber.theta.size() - 2, v, 40});
+            const SolveResult result =
+                solveWindings(world.fibers, world.links, SolverParams{});
+            QCOMPARE(result.events.size(), std::size_t{1});
+            QVERIFY(result.events.front().kollesis);
+            QCOMPARE(result.events.front().kind, CrossingKind::Inside);
+        }
+    }
+
+    // A V fiber folded in height meets the H fiber's end on both limbs at
+    // the same angle and height: one thickness in front (the seam, +100)
+    // and well behind (-400). The link names the limb: linked to the front
+    // limb the +100 crossing is the seam; linked to the back limb, that one
+    // is, and the front limb's crossing keeps its radial reading. Unlinked,
+    // nothing is read; links to both limbs from one control disagree and
+    // read nothing either.
+    void kollesisLinkNamesTheLimbOfAFoldedV()
+    {
+        enum Mode { Unlinked, LinkFront, LinkBack, LinkBoth };
+        for (const Mode mode : {Unlinked, LinkFront, LinkBack, LinkBoth}) {
+            World world;
+            const std::size_t h = addH(world, 0.05, kSeamWinding + kSeamOvershoot, kSeamHeight);
+            FiberTrace vFiber;
+            vFiber.hvTag = 'V';
+            vFiber.onKollesis = true;
+            for (double z = 29000.0; z <= 31000.0 + 1e-9; z += 25.0) {
+                vFiber.theta.push_back(kTwoPi * kSeamWinding);
+                vFiber.z.push_back(z);
+                vFiber.radius.push_back(sheetR(kSeamWinding, z) - 200.0);
+            }
+            const std::size_t frontAtSeamHeight = 40;
+            QCOMPARE(vFiber.z[frontAtSeamHeight], kSeamHeight);
+            for (double z = 30975.0; z >= 29000.0 - 1e-9; z -= 25.0) {
+                vFiber.theta.push_back(kTwoPi * kSeamWinding);
+                vFiber.z.push_back(z);
+                vFiber.radius.push_back(sheetR(kSeamWinding, z) + 300.0);
+            }
+            const std::size_t backAtSeamHeight = 120;
+            QCOMPARE(vFiber.z[backAtSeamHeight], kSeamHeight);
+            world.fibers.push_back(std::move(vFiber));
+            world.trueM.push_back(0);
+            const std::size_t v = world.fibers.size() - 1;
+            const std::size_t hEnd = world.fibers[h].theta.size() - 1;
+            world.fibers[h].kollesisEndSample = hEnd;
+            if (mode == LinkFront || mode == LinkBoth) {
+                world.links.push_back(LinkInput{h, hEnd, v, frontAtSeamHeight});
+            }
+            if (mode == LinkBack || mode == LinkBoth) {
+                world.links.push_back(LinkInput{h, hEnd, v, backAtSeamHeight});
+            }
+            const SolveResult result =
+                solveWindings(world.fibers, world.links, SolverParams{});
+            QCOMPARE(result.events.size(), std::size_t{2});
+            for (const Crossing& event : result.events) {
+                if (event.deltaR > 0.0) {
+                    QCOMPARE(event.kollesis, mode == LinkFront);
+                    QCOMPARE(event.kind,
+                             mode == LinkFront ? CrossingKind::Inside : CrossingKind::Outside);
+                } else {
+                    QCOMPARE(event.kollesis, mode == LinkBack);
+                    QCOMPARE(event.kind, CrossingKind::Inside);
+                }
+            }
+            QCOMPARE(result.kollesisCrossingCount,
+                     mode == LinkFront || mode == LinkBack ? 1 : 0);
+        }
+    }
+
+    // An H fiber folded back on itself crosses the V fiber twice at one
+    // height, first far outside it (+1000) and then, nearest its tagged end,
+    // one thickness behind (+100). Only the encounter at the tag is the
+    // seam; the radially distinct crossing at the same height keeps its
+    // Outside reading.
+    void kollesisReadsOnlyTheEncountersOwnRadius()
+    {
+        World world;
+        FiberTrace hFiber;
+        hFiber.hvTag = 'H';
+        const double zH = kSeamHeight;
+        for (double w = 0.05; w < kSeamWinding - 0.011; w += 1.0 / 256.0) {
+            hFiber.theta.push_back(kTwoPi * w);
+            hFiber.z.push_back(zH);
+            hFiber.radius.push_back(sheetR(w, zH) - kSheetStep);
+        }
+        const double seamSheet = sheetR(kSeamWinding, zH);
+        // Out to +800 over the sheet, across the V fiber (+1000), then back
+        // across it a thickness behind (+100) to the tagged end.
+        const double outward[][2] = {{kSeamWinding - 0.01, seamSheet + 800.0},
+                                     {kSeamWinding + 0.02, seamSheet + 800.0},
+                                     {kSeamWinding + 0.02, seamSheet - kSheetStep},
+                                     {kSeamWinding - 0.005, seamSheet - kSheetStep}};
+        for (const auto& [w, r] : outward) {
+            hFiber.theta.push_back(kTwoPi * w);
+            hFiber.z.push_back(zH);
+            hFiber.radius.push_back(r);
+        }
+        hFiber.kollesisEndSample = hFiber.theta.size() - 1;
+        world.fibers.push_back(std::move(hFiber));
+        world.trueM.push_back(0);
+        const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+        world.fibers[v].onKollesis = true;
+        world.links.push_back(LinkInput{0, world.fibers[0].theta.size() - 1, v, 40});
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.events.size(), std::size_t{2});
+        int seam = 0;
+        for (const Crossing& event : result.events) {
+            if (event.deltaR > 500.0) {
+                QVERIFY(!event.kollesis);
+                QCOMPARE(event.kind, CrossingKind::Outside);
+            } else {
+                QVERIFY(std::abs(event.deltaR - 100.0) < 30.0);
+                QVERIFY(event.kollesis);
+                QCOMPARE(event.kind, CrossingKind::Inside);
+                ++seam;
+            }
+        }
+        QCOMPARE(seam, 1);
+        QCOMPARE(result.kollesisCrossingCount, 1);
+    }
+
+    // A link to the apex of a height-folded V fiber names a vertex both
+    // limbs share. The H fiber crosses the near limb one thickness behind
+    // it (+100) and the far limb, at its tagged end, three thicknesses
+    // behind (+300): the seam is the encounter at the tag, not the thinner
+    // one further back along the H fiber.
+    void kollesisApexLinkPicksTheEncounterAtTheTag()
+    {
+        World world;
+        const std::size_t h = addH(world, 0.05, kSeamWinding + 0.09, kSeamHeight);
+        FiberTrace vFiber;
+        vFiber.hvTag = 'V';
+        vFiber.onKollesis = true;
+        // Near limb slanting from w = 0.55 at the bottom to the apex at
+        // w = 0.60, 2000 vx up; far limb back down to w = 0.65.
+        const auto limbW = [](double z, double wBottom, double wTop) {
+            return wBottom + (wTop - wBottom) * (z - 29000.0) / 2000.0;
+        };
+        for (double z = 29000.0; z <= 31000.0 + 1e-9; z += 25.0) {
+            const double w = limbW(z, kSeamWinding, kSeamWinding + 0.05);
+            vFiber.theta.push_back(kTwoPi * w);
+            vFiber.z.push_back(z);
+            vFiber.radius.push_back(sheetR(w, z) - 200.0);
+        }
+        const std::size_t apex = vFiber.z.size() - 1;
+        for (double z = 30975.0; z >= 29000.0 - 1e-9; z -= 25.0) {
+            const double w = limbW(z, kSeamWinding + 0.1, kSeamWinding + 0.05);
+            vFiber.theta.push_back(kTwoPi * w);
+            vFiber.z.push_back(z);
+            vFiber.radius.push_back(sheetR(w, z) - 400.0);
+        }
+        world.fibers.push_back(std::move(vFiber));
+        world.trueM.push_back(0);
+        const std::size_t v = world.fibers.size() - 1;
+        const std::size_t hEnd = world.fibers[h].theta.size() - 1;
+        world.fibers[h].kollesisEndSample = hEnd;
+        world.links.push_back(LinkInput{h, hEnd, v, apex});
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.events.size(), std::size_t{2});
+        for (const Crossing& event : result.events) {
+            const bool far = event.deltaR > 200.0;
+            QVERIFY(far || std::abs(event.deltaR - 100.0) < 30.0);
+            QCOMPARE(event.kollesis, far);
+            QCOMPARE(event.kind, far ? CrossingKind::Inside : CrossingKind::Outside);
+        }
+        QCOMPARE(result.kollesisCrossingCount, 1);
+    }
+
+    // Three limbs of a zigzag V fiber cross the H fiber's coarse last
+    // segment about 0.09, 0.43 and 0.77 samples before its tagged end, at
+    // +300, +155 and +10; a fourth limb beyond the end, which the link
+    // names, is never crossed, so the limb is chosen geometrically. The two
+    // within half a sample of the nearest are one place and the thinner of
+    // them (+155) is the seam - whichever order the limbs come in; a chained
+    // pairwise tie reached +10 in one order and +300 in the other.
+    void kollesisRanksLimbsAgainstTheNearestNotPairwise()
+    {
+        for (const bool reversedLimbs : {false, true}) {
+            World world;
+            const std::size_t h = addH(world, 0.05, kSeamWinding - 0.01, kSeamHeight);
+            world.fibers[h].theta.push_back(kTwoPi * kSeamWinding);
+            world.fibers[h].z.push_back(kSeamHeight);
+            world.fibers[h].radius.push_back(sheetR(kSeamWinding, kSeamHeight) - kSheetStep);
+            const std::size_t hEnd = world.fibers[h].theta.size() - 1;
+            world.fibers[h].kollesisEndSample = hEnd;
+            // Limbs (w, radius offset) along the last segment, which runs
+            // from the last 1/256 step below kSeamWinding - 0.01 to the end;
+            // dR = -offset - 100.
+            std::vector<std::pair<double, double>> limbs{
+                {kSeamWinding - 0.001, -400.0},
+                {kSeamWinding - 0.005, -255.0},
+                {kSeamWinding - 0.009, -110.0}};
+            if (reversedLimbs) {
+                std::reverse(limbs.begin(), limbs.end());
+            }
+            limbs.push_back({kSeamWinding + 0.03, -200.0});
+            FiberTrace vFiber;
+            vFiber.hvTag = 'V';
+            vFiber.onKollesis = true;
+            bool up = true;
+            for (const auto& [w, offset] : limbs) {
+                const double z0 = up ? 29000.0 : 31000.0;
+                const double step = up ? 25.0 : -25.0;
+                for (int k = 0; k <= 80; ++k) {
+                    if (k == 0 && !vFiber.z.empty()) {
+                        continue; // the apex sample is shared
+                    }
+                    const double z = z0 + step * k;
+                    vFiber.theta.push_back(kTwoPi * w);
+                    vFiber.z.push_back(z);
+                    vFiber.radius.push_back(sheetR(w, z) + offset);
+                }
+                up = !up;
+            }
+            // The fourth limb descends from the shared apex: its sample at
+            // the seam height.
+            const std::size_t uncrossedAtSeamHeight = vFiber.z.size() - 41;
+            QCOMPARE(vFiber.z[uncrossedAtSeamHeight], kSeamHeight);
+            QCOMPARE(vFiber.theta[uncrossedAtSeamHeight], kTwoPi * (kSeamWinding + 0.03));
+            world.fibers.push_back(std::move(vFiber));
+            world.trueM.push_back(0);
+            world.links.push_back(
+                LinkInput{h, hEnd, world.fibers.size() - 1, uncrossedAtSeamHeight});
+            const SolveResult result =
+                solveWindings(world.fibers, world.links, SolverParams{});
+            QCOMPARE(result.events.size(), std::size_t{3});
+            int seam = 0;
+            for (const Crossing& event : result.events) {
+                const bool middle = std::abs(event.deltaR - 155.0) < 20.0;
+                QCOMPARE(event.kollesis, middle);
+                seam += middle ? 1 : 0;
+            }
+            QCOMPARE(seam, 1);
+            QCOMPARE(result.kollesisCrossingCount, 1);
+        }
+    }
+
+    // The annotator links the tagged end to the V fiber's nearest control,
+    // which on a V folded in height may sit on a limb the H fiber never
+    // reaches at the tag: here the far limb, 0.05 turn past the H fiber's
+    // end at the same heights, which the H fiber crossed a turn earlier but
+    // not on the tagged end's translate. The link still identifies the V;
+    // the encounter falls back to the limb the end sits against, and the
+    // earlier-turn crossings keep their readings.
+    void kollesisLinkOnAnUncrossedLimbFallsBackToGeometry()
+    {
+        World world;
+        const std::size_t h = addH(world, kSeamWinding - 1.2, kSeamWinding + kSeamOvershoot,
+                                   kSeamHeight);
+        FiberTrace vFiber;
+        vFiber.hvTag = 'V';
+        vFiber.onKollesis = true;
+        for (double z = 29000.0; z <= 31000.0 + 1e-9; z += 25.0) {
+            vFiber.theta.push_back(kTwoPi * kSeamWinding);
+            vFiber.z.push_back(z);
+            vFiber.radius.push_back(sheetR(kSeamWinding, z) - 200.0);
+        }
+        // Across to the far limb at the top, then back down beyond the H
+        // fiber's end.
+        const double farW = kSeamWinding + 0.05;
+        for (double z = 31000.0; z >= 29000.0 - 1e-9; z -= 25.0) {
+            vFiber.theta.push_back(kTwoPi * farW);
+            vFiber.z.push_back(z);
+            vFiber.radius.push_back(sheetR(farW, z) - 200.0);
+        }
+        const std::size_t farAtSeamHeight = vFiber.z.size() - 41;
+        QCOMPARE(vFiber.z[farAtSeamHeight], kSeamHeight);
+        QCOMPARE(vFiber.theta[farAtSeamHeight], kTwoPi * farW);
+        world.fibers.push_back(std::move(vFiber));
+        world.trueM.push_back(0);
+        const std::size_t v = world.fibers.size() - 1;
+        const std::size_t hEnd = world.fibers[h].theta.size() - 1;
+        world.fibers[h].kollesisEndSample = hEnd;
+        world.links.push_back(LinkInput{h, hEnd, v, farAtSeamHeight});
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        // Both limbs a turn earlier (Inside by a wrap) and the near limb at
+        // the tag.
+        QCOMPARE(result.events.size(), std::size_t{3});
+        int seam = 0;
+        for (const Crossing& event : result.events) {
+            if (event.kollesis) {
+                ++seam;
+                QVERIFY(std::abs(event.deltaR - 100.0) < 30.0);
+                QCOMPARE(event.kind, CrossingKind::Inside);
+            } else {
+                QVERIFY(event.deltaR < -1000.0);
+            }
+        }
+        QCOMPARE(seam, 1);
+        QCOMPARE(result.kollesisCrossingCount, 1);
+    }
+
+    // Links are drawn at the crossing, not at the tagged end: an H fiber
+    // whose tagged end lies 0.2 turn past the V fiber, linked to the V at
+    // the crossing control, is read there. The tag qualifies the fiber; the
+    // link names the encounter.
+    void kollesisLinkAtTheCrossingFarFromTheTag()
+    {
+        World world;
+        const std::size_t h = addH(world, 0.05, kSeamWinding + 0.2, kSeamHeight);
+        const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+        world.fibers[v].onKollesis = true;
+        world.fibers[h].kollesisEndSample = world.fibers[h].theta.size() - 1;
+        // The H sample at the V fiber's angle.
+        const std::size_t atCrossing = static_cast<std::size_t>(
+            std::llround((kSeamWinding - 0.05) * 256.0));
+        QVERIFY(std::abs(world.fibers[h].theta[atCrossing] - kTwoPi * kSeamWinding) < 0.02);
+        world.links.push_back(LinkInput{h, atCrossing, v, 40});
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.events.size(), std::size_t{1});
+        QVERIFY(result.events.front().kollesis);
+        QCOMPARE(result.events.front().kind, CrossingKind::Inside);
+        QVERIFY(result.droppedLinks.empty());
+        QCOMPARE(countDroppedCrossings(result), 0);
+    }
+
+    // The link localizes the encounter, not the tag: an H fiber running a
+    // full turn past the V after the crossing it is linked at, tagged at its
+    // end, meets the V again a turn later, nearer the tag. The linked
+    // crossing is the seam; the later one, a genuine winding out, is not.
+    void kollesisLinkNotTagLocalizesTheEncounter()
+    {
+        World world;
+        const std::size_t h = addH(world, 0.05, kSeamWinding + 1.02, kSeamHeight);
+        const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+        world.fibers[v].onKollesis = true;
+        world.fibers[h].kollesisEndSample = world.fibers[h].theta.size() - 1;
+        const std::size_t atCrossing = static_cast<std::size_t>(
+            std::llround((kSeamWinding - 0.05) * 256.0));
+        world.links.push_back(LinkInput{h, atCrossing, v, 40});
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.events.size(), std::size_t{2});
+        for (const Crossing& event : result.events) {
+            const bool linked = std::abs(event.deltaR - 100.0) < 30.0;
+            QVERIFY(linked || event.deltaR > 1000.0);
+            QCOMPARE(event.kollesis, linked);
+            QCOMPARE(event.kind, linked ? CrossingKind::Inside : CrossingKind::Outside);
+        }
+        QCOMPARE(result.kollesisCrossingCount, 1);
+    }
+
+    // The link is drawn on a control that has climbed 700 vx above the V
+    // fiber's top, 0.15 turn past the crossing, and names a far limb the H
+    // never reaches (joined to the near limb below the H fiber). The
+    // fallback must still find the near limb's encounter: the linked
+    // control's height does not veto the limb.
+    void kollesisFallbackIgnoresTheLinkedControlsHeight()
+    {
+        World world;
+        FiberTrace hFiber;
+        hFiber.hvTag = 'H';
+        const double linkW = kSeamWinding + 0.15;
+        for (double w = 0.05; w <= linkW + 1e-9; w += 1.0 / 256.0) {
+            hFiber.theta.push_back(kTwoPi * w);
+            hFiber.z.push_back(kSeamHeight);
+            hFiber.radius.push_back(sheetR(w, kSeamHeight) - kSheetStep);
+        }
+        hFiber.theta.push_back(kTwoPi * (linkW + 0.001));
+        hFiber.z.push_back(kSeamHeight + 700.0);
+        hFiber.radius.push_back(sheetR(linkW, kSeamHeight) - kSheetStep);
+        const std::size_t climbed = hFiber.theta.size() - 1;
+        hFiber.theta.push_back(kTwoPi * (kSeamWinding + 0.4));
+        hFiber.z.push_back(kSeamHeight);
+        hFiber.radius.push_back(sheetR(kSeamWinding + 0.4, kSeamHeight) - kSheetStep);
+        hFiber.kollesisEndSample = hFiber.theta.size() - 1;
+        world.fibers.push_back(std::move(hFiber));
+        world.trueM.push_back(0);
+        // Far limb at 0.2 turn past the crossing, wholly above the H fiber's
+        // descent there and below it where it starts; joined at the bottom
+        // to the near limb, which tops out 400 vx below the linked control.
+        FiberTrace vFiber;
+        vFiber.hvTag = 'V';
+        vFiber.onKollesis = true;
+        const double farW = kSeamWinding + 0.2;
+        for (double z = 30050.0; z >= 28900.0 - 1e-9; z -= 25.0) {
+            vFiber.theta.push_back(kTwoPi * farW);
+            vFiber.z.push_back(z);
+            vFiber.radius.push_back(sheetR(farW, z) - 200.0);
+        }
+        const std::size_t farAtSeamHeight = 2;
+        QCOMPARE(vFiber.z[farAtSeamHeight], kSeamHeight);
+        for (double z = 28900.0; z <= 30300.0 + 1e-9; z += 25.0) {
+            vFiber.theta.push_back(kTwoPi * kSeamWinding);
+            vFiber.z.push_back(z);
+            vFiber.radius.push_back(sheetR(kSeamWinding, z) - 200.0);
+        }
+        world.fibers.push_back(std::move(vFiber));
+        world.trueM.push_back(0);
+        world.links.push_back(LinkInput{0, climbed, 1, farAtSeamHeight});
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.events.size(), std::size_t{1});
+        QVERIFY(result.events.front().kollesis);
+        QCOMPARE(result.events.front().kind, CrossingKind::Inside);
+        QVERIFY(result.events.front().deltaR > 0.0);
+    }
+
+    // A link whose limb saw nothing on the link's translate does not reach
+    // for another turn: the H fiber is linked to the V at a control where
+    // it does not cross it (0.05 turn past the V's angle), and first meets
+    // the V a whole turn later. That crossing, a genuine winding out, keeps
+    // its reading.
+    void kollesisFallbackStaysOnTheLinksTranslate()
+    {
+        World world;
+        const std::size_t h = addH(world, kSeamWinding + 0.05, kSeamWinding + 1.05, kSeamHeight);
+        const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+        world.fibers[v].onKollesis = true;
+        world.fibers[h].kollesisEndSample = world.fibers[h].theta.size() - 1;
+        world.links.push_back(LinkInput{h, 0, v, 40});
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.events.size(), std::size_t{1});
+        QVERIFY(!result.events.front().kollesis);
+        QVERIFY(result.events.front().deltaR > 1000.0);
+        QCOMPARE(result.events.front().kind, CrossingKind::Outside);
+        QCOMPARE(result.kollesisCrossingCount, 0);
+    }
+
+    // A tagged H fiber linked to one V fiber is read against that V only: a
+    // second V on the kollesis that its end also overruns, a thickness
+    // behind it, keeps its radial reading. Unlinked, nothing is read.
+    void kollesisLinkedEndReadsOnlyItsLinkedV()
+    {
+        for (const bool linked : {false, true}) {
+            World world;
+            const std::size_t h = addH(world, 0.05, kSeamWinding + kSeamOvershoot, kSeamHeight);
+            const std::size_t vLinked = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+            const std::size_t vOther =
+                addV(world, kSeamWinding + 0.5 * kSeamOvershoot, 29000.0, 31000.0, -200.0);
+            world.fibers[vLinked].onKollesis = true;
+            world.fibers[vOther].onKollesis = true;
+            const std::size_t hEnd = world.fibers[h].theta.size() - 1;
+            world.fibers[h].kollesisEndSample = hEnd;
+            if (linked) {
+                world.links.push_back(LinkInput{h, hEnd, vLinked, 40});
+            }
+            const SolveResult result =
+                solveWindings(world.fibers, world.links, SolverParams{});
+            QCOMPARE(result.events.size(), std::size_t{2});
+            for (const Crossing& event : result.events) {
+                const bool other = event.vFiber == vOther;
+                QCOMPARE(event.kollesis, linked && !other);
+            }
+            QCOMPARE(result.kollesisCrossingCount, linked ? 1 : 0);
+        }
+    }
+
+    // An H fiber whose end climbs steeply through the V fiber meets it at a
+    // shallow angle: the encounter is a tangential detection only. It is
+    // still the seam encounter, read and flagged like a transversal one.
+    void kollesisShallowEncounterIsRead()
+    {
+        for (const bool flagged : {false, true}) {
+            World world;
+            FiberTrace hFiber;
+            hFiber.hvTag = 'H';
+            for (double w = 0.05; w < kSeamWinding - 0.001; w += 1.0 / 256.0) {
+                hFiber.theta.push_back(kTwoPi * w);
+                hFiber.z.push_back(kSeamHeight);
+                hFiber.radius.push_back(sheetR(w, kSeamHeight) - kSheetStep);
+            }
+            // 0.0002 turn across the V fiber's angle while climbing 600 vx:
+            // a few percent transversality.
+            const double climbTop = kSeamHeight + 600.0;
+            for (const double dw : {-0.0001, 0.0001}) {
+                hFiber.theta.push_back(kTwoPi * (kSeamWinding + dw));
+                hFiber.z.push_back(dw < 0.0 ? kSeamHeight : climbTop);
+                hFiber.radius.push_back(sheetR(kSeamWinding, kSeamHeight + 300.0) - kSheetStep);
+            }
+            hFiber.kollesisEndSample = hFiber.theta.size() - 1;
+            world.fibers.push_back(std::move(hFiber));
+            world.trueM.push_back(0);
+            const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+            world.fibers[v].onKollesis = flagged;
+            world.links.push_back(LinkInput{0, world.fibers[0].theta.size() - 1, v, 40});
+            const SolveResult result =
+                solveWindings(world.fibers, world.links, SolverParams{});
+            QCOMPARE(result.events.size(), std::size_t{1});
+            const Crossing& event = result.events.front();
+            QVERIFY(event.tangential);
+            QVERIFY(event.deltaR > 0.0);
+            QCOMPARE(event.kollesis, flagged);
+            QCOMPARE(event.kind, flagged ? CrossingKind::Inside : CrossingKind::Outside);
+            QCOMPARE(result.kollesisCrossingCount, flagged ? 1 : 0);
+            QCOMPARE(result.crossings.size(), std::size_t{1});
+            QCOMPARE(result.crossings.front().kollesis, flagged);
+        }
     }
 
     // Exactly parallel owner segments leave an intersection the detector

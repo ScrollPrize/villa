@@ -188,6 +188,9 @@ struct GlobalFiberMeta {
     GlobalAnchor anchor = GlobalAnchor::Unresolved;
     bool linked = false;
     bool sheetDriftSuspect = false;
+    // A V fiber the annotator has linked to kollesis-tagged H ends on both
+    // sides: its seam encounters read as same winding or inward.
+    bool onKollesis = false;
     // W range over the fiber; a multi-turn H fiber has no single winding.
     double windingLo = 0.0;
     double windingHi = 0.0;
@@ -220,6 +223,8 @@ struct CrossingEvent {
     double transversality = 0.0;
     bool tangential = false;
     bool touch = false;
+    // Read as a kollesis seam encounter (same winding or inward).
+    bool kollesis = false;
     int orientation = 0;
     int mergedCount = 1;
     double confidence = 0.0;
@@ -270,6 +275,7 @@ struct CrossingMark {
     std::size_t eventIndex = 0;
     // Index into GlobalResult::crossingGroups when the error is a group's, else -1.
     long long groupId = -1;
+    bool kollesis = false;
 };
 
 // A fiber that could not be placed: no geometry, no umbilicus to unroll
@@ -315,6 +321,8 @@ struct GlobalResult {
     // Owner-segment pairs the detector could not intersect (exactly
     // parallel); their translates take no group verdict.
     int unresolvedIntersectionCount = 0;
+    // Events read as kollesis seam encounters.
+    int kollesisCrossingCount = 0;
     // Geometry the solver refused to learn from: angularly ill-conditioned
     // or wild segments, and tangential contacts. Nonzero values say the map
     // may be underconstrained for a reason the fibers themselves can't show.

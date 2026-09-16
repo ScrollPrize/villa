@@ -1598,6 +1598,9 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     if (_layout.traversalGroupCount > 0) {
         status += tr(" · %1 grouped").arg(_layout.traversalGroupCount);
     }
+    if (_layout.kollesisCrossingCount > 0) {
+        status += tr(" · %1 kollesis").arg(_layout.kollesisCrossingCount);
+    }
     const qint64 totalMs =
         job.snapshotMs + job.convertMs + job.layoutMs + publishMs;
     if (job.stats.used && !job.fullRebuild) {
@@ -2075,6 +2078,9 @@ void FiberMapWorkspace::rebuildTree()
         }
         if (meta.sheetDriftSuspect) {
             text += tr(" · drift?");
+        }
+        if (meta.onKollesis) {
+            text += tr(" · kollesis");
         }
         return text;
     };

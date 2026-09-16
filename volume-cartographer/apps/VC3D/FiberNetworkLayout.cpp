@@ -1254,6 +1254,109 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     const auto detectBegin = std::chrono::steady_clock::now();
     const int chirality =
         winding::inferChirality(traces, solverParams.chiralityOverride);
+
+    // Kollesis fields (see winding::FiberTrace). An H fiber's tagged first or
+    // last control point marks a seam end, named by that control's sample on
+    // the trace (which runs a sample beyond it). A V fiber is on a kollesis when
+    // the annotator has linked it - at the crossings, wherever along the H
+    // fibers those are - to two DISTINCT tagged H fibers whose tagged ends
+    // lie to opposite sides of it: the side being which way the tagged end
+    // lies from the linked control along the H fiber's own line, in the
+    // winding sense (chirality). Nothing is inferred from crossings.
+    {
+        const auto tagsUsable = [](const InputFiber& fiber) {
+            return fiber.controlPoints.size() >= 2 &&
+                   fiber.kollesisTerminations.size() == fiber.controlPoints.size();
+        };
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            const InputFiber& fiber = *ordered[i];
+            if (traces[i].hvTag != 'H' || !tagsUsable(fiber)) {
+                continue;
+            }
+            const auto sampleOf = [&](std::size_t control) {
+                const std::size_t lineIndex = prepared[i].controlLineIndex[control];
+                return lineIndex >= domainBegin[i] &&
+                               lineIndex - domainBegin[i] < traces[i].theta.size()
+                           ? lineIndex - domainBegin[i]
+                           : winding::kNoSample;
+            };
+            if (fiber.kollesisTerminations.front()) {
+                traces[i].kollesisStartSample = sampleOf(0);
+            }
+            if (fiber.kollesisTerminations.back()) {
+                traces[i].kollesisEndSample = sampleOf(fiber.controlPoints.size() - 1);
+            }
+        }
+        // Per V fiber: the (side, H fiber) evidence its links supply.
+        std::map<std::size_t, std::set<std::pair<int, std::size_t>>> seamEvidence;
+        for (const LinkRecord& link : allLinks) {
+            std::size_t h = link.a;
+            int ih = link.ia;
+            std::size_t v = link.b;
+            if (traces[link.a].hvTag == 'V' && traces[link.b].hvTag == 'H') {
+                h = link.b;
+                ih = link.ib;
+                v = link.a;
+            } else if (traces[link.a].hvTag != 'H' || traces[link.b].hvTag != 'V') {
+                continue;
+            }
+            const InputFiber& hFiber = *ordered[h];
+            if (!tagsUsable(hFiber) || ih < 0 ||
+                static_cast<std::size_t>(ih) >= hFiber.controlPoints.size()) {
+                continue;
+            }
+            const std::vector<double>& thetaLine = prepared[h].thetaLine;
+            const std::vector<std::size_t>& lineOf = prepared[h].controlLineIndex;
+            const std::size_t linkLine = lineOf[static_cast<std::size_t>(ih)];
+            if (linkLine >= thetaLine.size()) {
+                continue;
+            }
+            const std::size_t last = hFiber.controlPoints.size() - 1;
+            for (const std::size_t tagged : {std::size_t{0}, last}) {
+                if (!hFiber.kollesisTerminations[tagged]) {
+                    continue;
+                }
+                const std::size_t tagLine = lineOf[tagged];
+                if (tagLine >= thetaLine.size()) {
+                    continue;
+                }
+                // Which way the tagged end lies from the link along the line.
+                double toward = thetaLine[tagLine] - thetaLine[linkLine];
+                if (tagLine == linkLine) {
+                    // Linked at the tagged control itself: the end lies away
+                    // from the fiber's body, one line step toward the
+                    // neighbouring control's sample. (Controls follow the
+                    // line, but a control snapped to a nearest line point
+                    // out of order must not flip the side.)
+                    const std::size_t neighbour = lineOf[tagged == 0 ? 1 : tagged - 1];
+                    if (neighbour == tagLine || neighbour >= thetaLine.size()) {
+                        continue;
+                    }
+                    const std::size_t inward = neighbour > tagLine ? tagLine + 1 : tagLine - 1;
+                    toward = -(thetaLine[inward] - thetaLine[tagLine]);
+                }
+                const double side = static_cast<double>(chirality) * toward;
+                if (!(side > 0.0) && !(side < 0.0)) {
+                    continue;
+                }
+                seamEvidence[v].emplace(side > 0.0 ? 1 : -1, h);
+            }
+        }
+        for (const auto& [v, evidence] : seamEvidence) {
+            // Two distinct H fibers on opposite sides; a doubly tagged single
+            // H fiber does not qualify a V on its own.
+            bool distinct = false;
+            for (const auto& [sideA, hA] : evidence) {
+                for (const auto& [sideB, hB] : evidence) {
+                    if (sideA > 0 && sideB < 0 && hA != hB) {
+                        distinct = true;
+                    }
+                }
+            }
+            traces[v].onKollesis = distinct;
+        }
+    }
+
     std::vector<winding::CanonicalTrace> canonical(fiberCount);
     for (std::size_t i = 0; i < fiberCount; ++i) {
         canonical[i] = winding::canonicalizeTrace(traces[i], chirality);
@@ -1300,7 +1403,9 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
                 geometry = &slot.detection;
             }
             classified.push_back(winding::classifyPairCrossings(
-                *geometry, canonical[h], canonical[v], solverParams));
+                *geometry, canonical[h], canonical[v],
+                winding::seamAnchors(canonical, h, v, linkInputs),
+                solverParams));
             detections.push_back(winding::PairDetection{h, v, &classified.back()});
         }
     }
@@ -1319,6 +1424,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     result.gatedSegmentCount = solve.gatedSegmentCount;
     result.tangentialCount = solve.tangentialCount;
     result.unresolvedIntersectionCount = solve.unresolvedIntersectionCount;
+    result.kollesisCrossingCount = solve.kollesisCrossingCount;
     result.detectMs = solve.detectMs;
     result.solveMs = solve.solveMs;
 
@@ -1387,6 +1493,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         placed.meta.networkId = networkIdOf[i];
         placed.meta.networkSize = networkSizeOf[i];
         placed.meta.sheetDriftSuspect = placement.sheetDriftSuspect;
+        placed.meta.onKollesis = traces[i].onKollesis;
         placed.meta.windingLo = placement.windingLo;
         placed.meta.windingHi = placement.windingHi;
         switch (placement.anchor) {
@@ -1477,6 +1584,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         event.transversality = crossing.transversality;
         event.tangential = crossing.tangential;
         event.touch = crossing.touch;
+        event.kollesis = crossing.kollesis;
         event.orientation = crossing.orientation;
         event.mergedCount = crossing.mergedCount;
         event.confidence = crossing.confidence;
@@ -1532,6 +1640,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         mark.violationTurns = violationTurns;
         mark.eventIndex = eventIndex;
         mark.groupId = groupId;
+        mark.kollesis = event.kollesis;
         return mark;
     };
     for (std::size_t c = 0; c < solve.crossings.size(); ++c) {
@@ -1784,6 +1893,8 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
     hashU64(digest, static_cast<uint64_t>(
                         static_cast<int64_t>(result.unresolvedIntersectionCount)));
     hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.kollesisCrossingCount)));
+    hashU64(digest, static_cast<uint64_t>(
                         static_cast<int64_t>(result.gatedSegmentCount)));
     hashU64(digest,
             static_cast<uint64_t>(static_cast<int64_t>(result.tangentialCount)));
@@ -1801,6 +1912,7 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         hashU64(digest, static_cast<uint64_t>(fiber.meta.anchor));
         hashU64(digest, fiber.meta.linked ? 1 : 0);
         hashU64(digest, fiber.meta.sheetDriftSuspect ? 1 : 0);
+        hashU64(digest, fiber.meta.onKollesis ? 1 : 0);
         hashU64(digest, static_cast<uint64_t>(
                             static_cast<int64_t>(fiber.meta.networkId)));
         hashU64(digest, static_cast<uint64_t>(
@@ -1860,6 +1972,7 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         hashDouble(digest, mark.violationTurns);
         hashU64(digest, mark.eventIndex);
         hashI64(mark.groupId);
+        hashU64(digest, mark.kollesis ? 1 : 0);
     }
     hashU64(digest, result.crossingEvents.size());
     for (const CrossingEvent& event : result.crossingEvents) {
@@ -1872,7 +1985,8 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         hashU64(digest, static_cast<uint64_t>(event.status));
         hashDouble(digest, event.deltaR);
         hashDouble(digest, event.transversality);
-        hashU64(digest, (event.tangential ? 1 : 0) | (event.touch ? 2 : 0));
+        hashU64(digest, (event.tangential ? 1 : 0) | (event.touch ? 2 : 0) |
+                            (event.kollesis ? 4 : 0));
         hashI64(event.orientation);
         hashI64(event.mergedCount);
         hashDouble(digest, event.confidence);

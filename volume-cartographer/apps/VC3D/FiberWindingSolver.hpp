@@ -56,6 +56,9 @@
 namespace vc3d::fiber_map::winding
 {
 
+// "No sample": for the optional sample indices below.
+inline constexpr std::size_t kNoSample = static_cast<std::size_t>(-1);
+
 struct FiberTrace {
     char hvTag = '?';
     // At least one span of this fiber was traced by the fiber model. A fiber
@@ -67,6 +70,22 @@ struct FiberTrace {
     // gated on trust: the annotation is taken as accurate, and a winding
     // error over an interpolated span points at the span to trace.
     bool trusted = true;
+    // Kollesis: where two sheets are glued the outer sheet lies in front of
+    // (toward the core from) the inner sheet over the overlap, so the inner
+    // sheet's H fibers sit one thickness BEHIND the outer sheet's V fibers
+    // there, which the radial rule would read as a whole winding out. An H
+    // fiber's end tagged kollesis_termination marks such a seam; a V fiber is
+    // on a kollesis when the annotator has linked it to tagged H ends on
+    // both sides (derived by the layout, never guessed from geometry). At
+    // the seam encounter of a tagged H end with such a V, the crossing is
+    // read as "same winding or inward" whatever its radial sign - when the
+    // annotator has linked the H fiber to that V (at the crossing, as links
+    // are drawn). The tagged ends are the samples of the tagged first / last
+    // control point (the trace may run a sample beyond them); kNoSample when
+    // untagged.
+    std::size_t kollesisStartSample = kNoSample;
+    std::size_t kollesisEndSample = kNoSample;
+    bool onKollesis = false;
     // Parallel arrays over the fiber's visible (control-point-bounded) domain.
     std::vector<double> theta;
     std::vector<double> radius;
@@ -189,6 +208,10 @@ struct Crossing {
     std::size_t hSegment = 0;
     double hT = 0.0;
     std::size_t vSample = kNoSample;
+    // The seam encounter of a kollesis-tagged H end with a V fiber on that
+    // kollesis: annotation-classified as Inside (see FiberTrace), kept out
+    // of the traversal-group counts like a touch.
+    bool kollesis = false;
     // A pass and return at a vertex of either polyline (both incident
     // segments on one side of the other segment), or the two opposing
     // records of a V apex: crosses nothing, counted by no group.
@@ -322,6 +345,8 @@ struct SolveResult {
     int droppedGroupCount = 0;
     // Owner-segment pairs that were exactly parallel, summed over pairs.
     int unresolvedIntersectionCount = 0;
+    // Events read as kollesis seam encounters.
+    int kollesisCrossingCount = 0;
     // Indices into the input link list whose constraints were dropped by
     // cycle repair.
     std::vector<std::size_t> droppedLinks;
@@ -365,6 +390,9 @@ struct SolveResult {
 struct CanonicalTrace {
     char hvTag = '?';
     bool trusted = true;
+    std::size_t kollesisStartSample = kNoSample;
+    std::size_t kollesisEndSample = kNoSample;
+    bool onKollesis = false;
     long long gauge = 0;
     std::vector<double> psi;
     std::vector<double> radius;
@@ -389,9 +417,6 @@ struct CanonicalTrace {
 [[nodiscard]] CanonicalTrace canonicalizeTrace(const FiberTrace& fiber,
                                                int chirality);
 
-// One (H, V) pair's merged crossings (hFiber/vFiber left unset - the pair is
-// implicit) plus the pair's gate tallies. Deterministic pure function of the
-// two canonical traces and the detection parameters.
 // The geometry half of a pair's detection, and what the layout's per-pair
 // cache stores: every raw detection with its provenance, plus the gate
 // tallies and the translates on which an event may have gone unseen. A pure
@@ -436,14 +461,41 @@ struct PairCrossings {
     // touched (recorded on the groups).
     int unresolvedCount = 0;
 };
+// One tagged end of an H fiber, to be read against a V fiber on a kollesis,
+// through the link the annotator drew between the two: the tagged control's
+// sample on the H trace, and the link's samples on the H and V traces (the
+// link nearest the tagged end when the pair is linked more than once). The
+// link names the encounter: the V limbs holding the linked V sample's
+// vertex (two at a fold apex), on the translate that lifts the linked H
+// sample onto it. Where none of those limbs has a detection on that
+// translate (the annotator linked the V's nearest control, which sat on a
+// fold the H never reaches), the encounter is the pair's detection that
+// lifts the linked H sample best and sits nearest it along the H fiber,
+// whatever height the linked control is at. A detection on the linked limb on that translate, however far
+// along the H fiber, keeps the link in charge; a crossing of that limb on
+// another translate does not (it is another turn's encounter).
+struct SeamAnchor {
+    std::size_t hSample = kNoSample;
+    std::size_t hLinkSample = kNoSample;
+    std::size_t vSample = kNoSample;
+};
+// The seam anchors of the pair (h, v): one per tagged end of the H trace
+// that is linked to this V - empty unless the V is on a kollesis and the
+// pair is linked. A tagged H fiber is never read against a V it is not
+// linked to. `traces` and `links` index fibers the way hIndex / vIndex do.
+[[nodiscard]] std::vector<SeamAnchor> seamAnchors(const std::vector<CanonicalTrace>& traces,
+                                                  std::size_t hIndex, std::size_t vIndex,
+                                                  const std::vector<LinkInput>& links);
 // The classification half, run at solve time (never cached): the proximity
 // merge into representatives, the resolved events, the traversal groups -
-// and the readings that depend on annotation, which the traces carry as
-// flags (a V fiber on a kollesis, an H fiber ending at one). Deterministic in
-// its inputs, so fresh and cached builds classify identically.
+// and the readings that depend on annotation: the pair's seam anchors (see
+// SeamAnchor), which the caller derives from the traces' kollesis fields and
+// the links. Deterministic in its inputs, so fresh and cached builds
+// classify identically.
 [[nodiscard]] PairCrossings classifyPairCrossings(const PairDetections& detections,
                                                   const CanonicalTrace& h,
                                                   const CanonicalTrace& v,
+                                                  const std::vector<SeamAnchor>& seams,
                                                   const SolverParams& params);
 
 // Field-by-field, bit-exact equality of two classified shards.
