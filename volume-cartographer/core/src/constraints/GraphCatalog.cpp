@@ -10,6 +10,7 @@
 #include <fstream>
 #include <numeric>
 #include <set>
+#include "utils/thread_pool.hpp"
 
 namespace vc::constraints {
 namespace bg=boost::geometry;
@@ -17,8 +18,44 @@ namespace bgi=boost::geometry::index;
 using Point=bg::model::point<double,3,bg::cs::cartesian>;
 using Box=bg::model::box<Point>;
 using Bound=std::pair<Box,size_t>;
-struct Catalog::BoundsIndex { bgi::rtree<Bound,bgi::quadratic<16>> tree; };
+struct Catalog::BoundsIndex {
+    bgi::rtree<Bound,bgi::quadratic<16>> tree;
+    struct Contacts {
+        double radius=0,scale=0;
+        int stride=0;
+        struct Source {std::string id;std::weak_ptr<const Node> node;};
+        std::vector<Source> sources;
+        Candidate candidate;
+        size_t bytes=0;
+        uint64_t used=0;
+    };
+    // Discovery is restarted after each edit, but immutable source geometry
+    // usually has the same contacts. Bound the cache and never retain sources.
+    mutable std::mutex mutex;
+    mutable std::map<size_t,Contacts> contacts;
+    mutable size_t contactBytes=0;
+    mutable uint64_t clock=0;
+    struct FiberBounds {
+        std::weak_ptr<const Node> source;
+        double radius=0;
+        int stride=0;
+        struct Run {size_t first,last;};
+        std::map<size_t,std::vector<Run>> patches;
+        size_t bytes=0;
+        uint64_t used=0;
+    };
+    mutable std::map<std::string,std::shared_ptr<FiberBounds>> fiberBounds;
+    mutable size_t boundsBytes=0;
+};
 namespace {
+std::vector<size_t> sampledLinePoints(size_t count,int stride) {
+    std::vector<size_t> indices;
+    if(!count)return indices;
+    indices.reserve((count-1)/size_t(stride)+2);
+    for(size_t i=0;i<count;i+=size_t(stride))indices.push_back(i);
+    if(indices.back()!=count-1)indices.push_back(count-1);
+    return indices;
+}
 Point point(const cv::Vec3d& p) { return {p[0],p[1],p[2]}; }
 nlohmann::json readJson(const std::filesystem::path& p) {
     std::ifstream f(p); if(!f) throw std::runtime_error("Cannot read "+p.string());
@@ -36,6 +73,15 @@ cv::Vec3d vector3(const nlohmann::json& j) {
     return p;
 }
 Location atLine(const std::string& id,size_t index) { Location p{id};p.lineIndex=static_cast<int64_t>(index);return p; }
+struct PatchContact { Location location; double distance; };
+std::optional<PatchContact> patchContact(const Node& node,const QuadSurface& surface,
+                                       const SurfacePatchIndex& index,const cv::Vec3d& xyz,double radius) {
+    SurfacePatchIndex::PointQuery query;query.worldPoint=cv::Vec3f(xyz);query.tolerance=radius;
+    auto hit=index.locate(query);if(!hit)return {};
+    Location location{node.id,cv::Vec2d(surface.ptrToGrid(hit->ptr))};
+    try { (void)detail::weights(node,location); } catch(const std::exception&) { return {}; }
+    return PatchContact{location,hit->distance};
+}
 void alignNewNodes(Graph& g,const std::set<std::string>& existing) {
     auto placed=existing;
     if(placed.empty()&&!g.nodes.empty()) placed.insert(g.seed);
@@ -316,7 +362,9 @@ Graph seedGraph(const Catalog& c,size_t component,const Settings& s,const lasagn
     g.seed=g.nodes.begin()->first;addFiberLinks(g,c);alignNewNodes(g,{});return g;
 }
 
-std::vector<Candidate> discover(const Catalog& c,const Graph& g,const std::string& selected,const std::atomic_bool* cancel,Progress progress,DiscoveryBatch found) {
+std::vector<Candidate> discover(const Catalog& c,const Graph& g,const std::string& selected,const std::atomic_bool* cancel,Progress progress,DiscoveryBatch found,int lineStride) {
+    if(lineStride<1)throw std::invalid_argument("Discovery stride must be positive");
+    detail::cancelled(cancel);
     std::map<std::string,Candidate> results;
     std::vector<Candidate> out;
     // Split separated fiber contacts before publishing a usable proposal.
@@ -346,39 +394,161 @@ std::vector<Candidate> discover(const Catalog& c,const Graph& g,const std::strin
         if(!cluster.contacts.empty())out.push_back(std::move(cluster));
         if(found&&out.size()>first)found(std::vector<Candidate>(out.begin()+first,out.end()));
     };
-    struct Query { Location at;cv::Vec3d xyz; };
+    struct Query {
+        std::string id;
+        std::shared_ptr<const Node> source;
+        std::vector<Catalog::BoundsIndex::FiberBounds::Run> runs;
+    };
     std::map<size_t,std::vector<Query>> queries;
     const auto radius=g.settings.radius;
+    if(progress)progress("Searching nearby patch bounds");
     for(const auto& [id,placement]:g.nodes) {
+        detail::cancelled(cancel);
         if(!selected.empty()&&id!=selected) continue;
         const auto& n=*placement.source;
         if(n.fiber) {
-            for(size_t i=0;i<n.line.size();++i) {
-                detail::cancelled(cancel);std::vector<Bound> hits;auto p=n.line[i];
-                c.boundsIndex->tree.query(bgi::intersects(Box(point(p-cv::Vec3d::all(radius)),point(p+cv::Vec3d::all(radius)))),std::back_inserter(hits));
-                for(const auto& hit:hits) if(!g.nodes.contains(c.patches[hit.second].id)) queries[hit.second].push_back({atLine(id,i),p});
+            const auto& cache=*c.boundsIndex;
+            std::shared_ptr<Catalog::BoundsIndex::FiberBounds> bounds;
+            {
+                std::lock_guard lock(cache.mutex);
+                auto old=cache.fiberBounds.find(id);
+                if(old!=cache.fiberBounds.end()&&old->second->source.lock()==placement.source&&
+                   old->second->radius==radius&&old->second->stride==lineStride) {
+                    bounds=old->second;bounds->used=++cache.clock;
+                }
+            }
+            if(!bounds) {
+                bounds=std::make_shared<Catalog::BoundsIndex::FiberBounds>();
+                bounds->source=placement.source;bounds->radius=radius;bounds->stride=lineStride;
+                const auto sampled=sampledLinePoints(n.line.size(),lineStride);
+                // Nearby dense points mostly traverse the same R-tree branches.
+                // Query a small batch's union once, then retain precisely the same
+                // point/patch box intersections in the original per-patch order.
+                for(size_t first=0;first<sampled.size();first+=32) {
+                    detail::cancelled(cancel);
+                    const auto end=std::min(first+32,sampled.size());
+                    cv::Vec3d low=cv::Vec3d::all(INFINITY),high=cv::Vec3d::all(-INFINITY);
+                    for(size_t j=first;j<end;++j)for(int d=0;d<3;++d) {
+                        low[d]=std::min(low[d],n.line[sampled[j]][d]-radius);
+                        high[d]=std::max(high[d],n.line[sampled[j]][d]+radius);
+                    }
+                    std::vector<Bound> hits;
+                    c.boundsIndex->tree.query(bgi::intersects(Box(point(low),point(high))),std::back_inserter(hits));
+                    for(const auto& hit:hits) {
+                        const auto& patch=c.patches[hit.second];
+                        for(size_t j=first;j<end;++j) {
+                            const auto i=sampled[j];const auto p=n.line[i];
+                            bool intersects=true;
+                            for(int d=0;d<3;++d)intersects&=p[d]+radius>=patch.low[d]&&p[d]-radius<=patch.high[d];
+                            if(intersects) {
+                                auto& runs=bounds->patches[hit.second];
+                                if(!runs.empty()&&runs.back().last+size_t(lineStride)==i)runs.back().last=i;
+                                else runs.push_back({i,i});
+                            }
+                        }
+                    }
+                }
+                bounds->bytes=sizeof(*bounds)+id.capacity();
+                for(const auto& [patch,runs]:bounds->patches)bounds->bytes+=128+runs.capacity()*sizeof(Catalog::BoundsIndex::FiberBounds::Run);
+                constexpr size_t limit=64*1024*1024;
+                if(bounds->bytes<=limit) {
+                    std::lock_guard lock(cache.mutex);
+                    if(auto old=cache.fiberBounds.find(id);old!=cache.fiberBounds.end()) {
+                        cache.boundsBytes-=old->second->bytes;cache.fiberBounds.erase(old);
+                    }
+                    while(cache.boundsBytes+bounds->bytes>limit&&!cache.fiberBounds.empty()) {
+                        auto oldest=std::min_element(cache.fiberBounds.begin(),cache.fiberBounds.end(),[](const auto& a,const auto& b){return a.second->used<b.second->used;});
+                        cache.boundsBytes-=oldest->second->bytes;cache.fiberBounds.erase(oldest);
+                    }
+                    bounds->used=++cache.clock;cache.boundsBytes+=bounds->bytes;
+                    cache.fiberBounds.emplace(id,bounds);
+                }
+            }
+            for(const auto& [patch,runs]:bounds->patches)if(!g.nodes.contains(c.patches[patch].id)) {
+                queries[patch].push_back({id,placement.source,runs});
             }
         }
     }
+    if(progress)progress("Verifying nearby patch contacts");
     size_t done=0;
-    for(const auto& [i,points]:queries) {
+    auto verify=[&](const auto& queryEntry) {
+        const auto& [i,points]=queryEntry;
         detail::cancelled(cancel);const auto& entry=c.patches[i];
+        const auto& cache=*c.boundsIndex;
+        // For this catalog, immutable source identity + radius + stride fixes
+        // every queried index. Store one identity per source, not millions of
+        // repeated point indices (which would evict useful contact results).
+        {
+            std::lock_guard lock(cache.mutex);
+            auto hit=cache.contacts.find(i);
+            if(hit!=cache.contacts.end()) {
+                auto& old=hit->second;
+                if(old.radius==radius&&old.scale==g.settings.patchScale&&old.stride==lineStride&&old.sources.size()==points.size()&&
+                   std::equal(points.begin(),points.end(),old.sources.begin(),[](const auto& q,const auto& source){
+                       return q.source==source.node.lock()&&q.id==source.id;
+                   })) {
+                    old.used=++cache.clock;return old.candidate;
+                }
+            }
+        }
         auto node=loadPatchNode(entry,g.settings);auto surface=detail::sourceSurface(*node);
         SurfacePatchIndex index;index.setSamplingStride(1);index.rebuild({surface});
-        for(const auto& query:points) {
-            SurfacePatchIndex::PointQuery q;q.worldPoint=cv::Vec3f(query.xyz);q.tolerance=radius;
-            auto hit=index.locate(q);if(!hit) continue;
-            try { (void)detail::weights(*node,cv::Vec2d(surface->ptrToGrid(hit->ptr))); } catch(const std::exception&) { continue; }
-            auto& candidate=results[entry.id];candidate.id=entry.id;
+        Candidate candidate;candidate.id=entry.id;
+        for(const auto& query:points)for(const auto& run:query.runs)for(size_t line=run.first;line<=run.last;line+=size_t(lineStride)) {
+            detail::cancelled(cancel);
+            auto hit=patchContact(*node,*surface,index,query.source->line[line],radius);if(!hit)continue;
             if(candidate.contacts.empty()||hit->distance<candidate.distance) candidate.distance=hit->distance;
-            candidate.contacts.push_back({query.at,{entry.id,cv::Vec2d(surface->ptrToGrid(hit->ptr))}});
+            candidate.contacts.push_back({atLine(query.id,line),hit->location});
         }
-        if(auto hit=results.find(entry.id);hit!=results.end()) {
-            append(std::move(hit->second));results.erase(hit);
+        Catalog::BoundsIndex::Contacts remembered;
+        remembered.radius=radius;remembered.scale=g.settings.patchScale;remembered.stride=lineStride;
+        for(const auto& query:points)remembered.sources.push_back({query.id,query.source});
+        remembered.candidate=candidate;
+        remembered.bytes=sizeof(remembered)+remembered.sources.capacity()*sizeof(remembered.sources[0])+candidate.id.capacity()+
+            remembered.candidate.contacts.capacity()*sizeof(Link);
+        for(const auto& source:remembered.sources)remembered.bytes+=source.id.capacity();
+        for(const auto& link:remembered.candidate.contacts)remembered.bytes+=link.a.node.capacity()+link.b.node.capacity();
+        constexpr size_t limit=128*1024*1024;
+        if(remembered.bytes<=limit) {
+            std::lock_guard lock(cache.mutex);
+            if(auto old=cache.contacts.find(i);old!=cache.contacts.end()) {
+                cache.contactBytes-=old->second.bytes;cache.contacts.erase(old);
+            }
+            while(cache.contactBytes+remembered.bytes>limit&&!cache.contacts.empty()) {
+                auto oldest=std::min_element(cache.contacts.begin(),cache.contacts.end(),[](const auto& a,const auto& b){return a.second.used<b.second.used;});
+                cache.contactBytes-=oldest->second.bytes;cache.contacts.erase(oldest);
+            }
+            remembered.used=++cache.clock;cache.contactBytes+=remembered.bytes;
+            cache.contacts.emplace(i,std::move(remembered));
         }
-        if(progress&&++done%50==0) progress("Searched "+std::to_string(done)+" / "+std::to_string(queries.size())+" nearby patches");
+        return candidate;
+    };
+    if(!queries.empty()) {
+        // Bounded batches overlap independent TIFF reads/exact queries. Publish
+        // in catalog order, retaining contact order and deterministic ties.
+        const size_t width=std::min<size_t>({4,queries.size(),std::max(1u,std::thread::hardware_concurrency())});
+        utils::ThreadPool workers(width);
+        auto next=queries.begin();
+        while(next!=queries.end()) {
+            detail::cancelled(cancel);
+            std::vector<decltype(next)> batch;
+            for(size_t i=0;i<width&&next!=queries.end();++i,++next)batch.push_back(next);
+            std::vector<Candidate> verified(batch.size());
+            std::vector<std::exception_ptr> errors(batch.size());
+            workers.run_indexed_batch(batch.size(),[&](size_t i){
+                try{verified[i]=verify(*batch[i]);}catch(...){errors[i]=std::current_exception();}
+            });
+            for(size_t i=0;i<verified.size();++i) {
+                if(errors[i])std::rethrow_exception(errors[i]);
+                auto& candidate=verified[i];
+                if(!candidate.contacts.empty())append(std::move(candidate));
+                detail::cancelled(cancel);
+                if(progress&&++done%50==0) progress("Searched "+std::to_string(done)+" / "+std::to_string(queries.size())+" nearby patches");
+            }
+        }
     }
     // Publish patch attachments first, before the separate patch-to-fiber scan.
+    if(progress)progress("Searching nearby fiber contacts");
     for(const auto& [id,placement]:g.nodes) {
         if(!selected.empty()&&id!=selected)continue;
         const auto& n=*placement.source;if(n.fiber)continue;
@@ -386,14 +556,11 @@ std::vector<Candidate> discover(const Catalog& c,const Graph& g,const std::strin
         for(const auto& [fid,f]:c.fibers) {
             if(g.nodes.contains(fid)) continue;
             detail::cancelled(cancel);
-            for(size_t i=0;i<f.line.size();++i) {
-                SurfacePatchIndex::PointQuery q;q.worldPoint=cv::Vec3f(f.line[i]);q.tolerance=radius;
-                auto hit=index.locate(q);if(!hit) continue;
-                auto ptr=surf->ptrToGrid(hit->ptr);
-                try { (void)detail::weights(n,cv::Vec2d(ptr)); } catch(const std::exception&) { continue; }
+            for(size_t i:sampledLinePoints(f.line.size(),lineStride)) {
+                auto hit=patchContact(n,*surf,index,f.line[i],radius);if(!hit)continue;
                 auto& candidate=results[fid];candidate.id=fid;candidate.fiber=true;
                 if(candidate.contacts.empty()||hit->distance<candidate.distance) candidate.distance=hit->distance;
-                candidate.contacts.push_back({{id,cv::Vec2d(ptr)},atLine(fid,i)});
+                candidate.contacts.push_back({hit->location,atLine(fid,i)});
             }
         }
     }
@@ -402,6 +569,9 @@ std::vector<Candidate> discover(const Catalog& c,const Graph& g,const std::strin
 }
 Graph propose(const Catalog& c,const Graph& committed,const Candidate& candidate,bool whole,const lasagna::NormalSampler& sampler,const std::atomic_bool* cancel) {
     Graph g=committed;std::set<std::string> existing;for(const auto& [id,p]:g.nodes) existing.insert(id);
+    // Keep the clicked attachment first for initial placement; other contacts
+    // participate in the same joint fit rather than defining separate patches.
+    g.links.insert(g.links.end(),candidate.contacts.begin(),candidate.contacts.end());
     if(candidate.fiber) {
         std::vector<std::string> additions{candidate.id};
         if(whole) for(const auto& component:c.components) if(std::find(component.begin(),component.end(),candidate.id)!=component.end()) {additions=component;break;}
@@ -412,21 +582,50 @@ Graph propose(const Catalog& c,const Graph& committed,const Candidate& candidate
         auto it=std::find_if(c.patches.begin(),c.patches.end(),[&](const auto& p){return p.id==candidate.id;});
         if(it==c.patches.end()) throw std::runtime_error("Candidate patch disappeared");
         auto n=loadPatchNode(*it,g.settings);g.nodes.emplace(n->id,Placement{n,n->initialUv});
+        alignNewNodes(g,existing);
         auto surface=detail::sourceSurface(*n);SurfacePatchIndex index;index.setSamplingStride(1);index.rebuild({surface});
+        std::set<std::pair<std::string,int64_t>> attached;
+        std::set<std::string> manual;
+        for(const auto& link:g.links) {
+            const auto* other=link.a.node==n->id?&link.b:link.b.node==n->id?&link.a:nullptr;
+            if(!other)continue;
+            if(link.keypoint)manual.insert(other->node);
+            if(other->lineIndex>=0)attached.emplace(other->node,other->lineIndex);
+        }
+        // Discovery marks are local clusters. Once a patch is chosen, verify
+        // its contacts against every placed fiber, including off-stride points.
+        // Bounds only prune impossible hits; the shared exact query decides.
+        cv::Vec3d low=cv::Vec3d::all(INFINITY),high=cv::Vec3d::all(-INFINITY);
+        for(const auto& xyz:n->xyz)if(detail::valid(xyz))for(int d=0;d<3;++d) {
+            low[d]=std::min(low[d],xyz[d]-g.settings.radius);
+            high[d]=std::max(high[d],xyz[d]+g.settings.radius);
+        }
+        for(const auto& [id,p]:committed.nodes)if(p.source->fiber&&!manual.contains(id)) {
+            const auto& fiber=*p.source;
+            for(size_t i=0;i<fiber.line.size();++i) {
+                detail::cancelled(cancel);const auto& xyz=fiber.line[i];
+                if(attached.contains({id,int64_t(i)}))continue;
+                if(xyz[0]<low[0]||xyz[0]>high[0]||xyz[1]<low[1]||xyz[1]>high[1]||xyz[2]<low[2]||xyz[2]>high[2])continue;
+                auto hit=patchContact(*n,*surface,index,xyz,g.settings.radius);if(!hit)continue;
+                // A winding fiber can revisit this XYZ on a distant chart
+                // traversal. Only extend the clicked placement locally, using
+                // the same four-spacing neighborhood as incremental fitting.
+                if(cv::norm(placedLocation(g,atLine(id,i))-placedLocation(g,hit->location))>4*g.settings.spacing)continue;
+                g.links.push_back({atLine(id,i),hit->location});
+            }
+        }
         // Actual 3-D overlap couples every already accepted patch into the same fit.
         for(const auto& [id,p]:committed.nodes) if(!p.source->fiber) {
             detail::cancelled(cancel);
             for(size_t i=0;i<p.source->xyz.size();++i) {
                 if(!detail::valid(p.source->xyz[i])) continue;
-                SurfacePatchIndex::PointQuery q;q.worldPoint=cv::Vec3f(p.source->xyz[i]);q.tolerance=g.settings.radius;
-                auto hit=index.locate(q);if(!hit) continue;
+                auto hit=patchContact(*n,*surface,index,p.source->xyz[i],g.settings.radius);if(!hit)continue;
                 Location a{id,{static_cast<double>(i%p.source->cols),static_cast<double>(i/p.source->cols)}};
                 try {detail::weights(*p.source,a);}catch(...){continue;}
-                try { (void)detail::weights(*n,cv::Vec2d(surface->ptrToGrid(hit->ptr))); } catch(const std::exception&) { continue; }
-                g.links.push_back({a,{n->id,cv::Vec2d(surface->ptrToGrid(hit->ptr))}});
+                g.links.push_back({a,hit->location});
             }
         }
     }
-    g.links.insert(g.links.end(),candidate.contacts.begin(),candidate.contacts.end());addFiberLinks(g,c);alignNewNodes(g,existing);return g;
+    addFiberLinks(g,c);alignNewNodes(g,existing);return g;
 }
 } // namespace vc::constraints

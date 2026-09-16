@@ -2141,12 +2141,13 @@ SurfacePatchIndex::locate(const PointQuery& pointQuery) const
         cv::Vec2f scale;
     };
     std::unordered_map<QuadSurface*, SurfaceInfo> surfaceInfoCache;
-    surfaceInfoCache.reserve(4);
     auto ensureSurfaceInfo = [&](QuadSurface* surface) -> const SurfaceInfo& {
         auto it = surfaceInfoCache.find(surface);
         if (it != surfaceInfoCache.end()) {
             return it->second;
         }
+        // Most proximity queries miss. Allocate only after an accepted hit.
+        if (surfaceInfoCache.empty()) surfaceInfoCache.reserve(4);
         SurfaceInfo info{surface->center(), surface->scale()};
         auto [insertIt, _] = surfaceInfoCache.emplace(surface, info);
         return insertIt->second;

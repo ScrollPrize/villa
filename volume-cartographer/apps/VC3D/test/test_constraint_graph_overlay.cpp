@@ -6,6 +6,7 @@
 #include "../overlays/OverlayBatchItem.hpp"
 #include "../ConstraintGraphSelectionBar.hpp"
 #include "../ConstraintGraphPatchColors.hpp"
+#include "../volume_viewers/SurfaceComparison.hpp"
 #include <QVBoxLayout>
 #include <set>
 
@@ -20,6 +21,21 @@ QPen dotPen() {QPen pen(QColor("#ffba45"));pen.setWidthF(4);pen.setCapStyle(Qt::
 class ConstraintGraphOverlayTest:public QObject {
     Q_OBJECT
 private slots:
+    void comparisonOpacityPreservesHolesAndBlackPixels(){
+        QImage base(3,1,QImage::Format_RGB32);base.fill(Qt::white);
+        QImage patch(3,1,QImage::Format_RGB32);patch.fill(Qt::black);
+        patch.setPixelColor(2,0,Qt::red);
+        cv::Mat_<uint8_t> coverage(1,3,uint8_t(1));coverage(0,1)=0;
+        QCOMPARE(vc3d::blendSurfaceImages(base,patch,coverage,0),base);
+        auto mixed=vc3d::blendSurfaceImages(base,patch,coverage,.5f);
+        QCOMPARE(mixed.pixelColor(0,0),QColor(128,128,128));
+        QCOMPARE(mixed.pixelColor(1,0),QColor(Qt::white));
+        auto opaque=vc3d::blendSurfaceImages(base,patch,coverage,1);
+        QCOMPARE(opaque.pixelColor(0,0),QColor(Qt::black));
+        QCOMPARE(opaque.pixelColor(1,0),QColor(Qt::white));
+        QCOMPARE(opaque.pixelColor(2,0),QColor(Qt::red));
+        QCOMPARE(vc3d::blendSurfaceImages(base,patch,{},.5f),base);
+    }
     void patchColorsRemainDistinctAndStable(){
         ConstraintGraphPatchColors colors;auto first=colors.color("patch:a");
         std::set<QRgb> seen;

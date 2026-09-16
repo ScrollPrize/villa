@@ -138,8 +138,9 @@ std::shared_ptr<const Node> makeFiberNode(const Fiber&, const Settings&, const l
 std::shared_ptr<const Node> loadPatchNode(const PatchEntry&, const Settings&);
 Graph seedGraph(const Catalog&, size_t component, const Settings&, const lasagna::NormalSampler&,
                 const std::atomic_bool* cancel = nullptr);
+// Search every lineStride-th dense point, plus both endpoints. Use 1 for a full scan.
 std::vector<Candidate> discover(const Catalog&, const Graph&, const std::string& selectedNode,
-                                const std::atomic_bool* cancel = nullptr, Progress = {}, DiscoveryBatch = {});
+                                const std::atomic_bool* cancel = nullptr, Progress = {}, DiscoveryBatch = {}, int lineStride = 4);
 Graph propose(const Catalog&, const Graph&, const Candidate&, bool wholeComponent,
               const lasagna::NormalSampler&, const std::atomic_bool* cancel = nullptr);
 FitResult fit(Graph, const std::atomic_bool* cancel = nullptr, Progress = {});
@@ -153,6 +154,9 @@ FitResult renderProposalSources(const Graph& draft, const Graph& committed, cons
 // Temporary display of the initial attachment, without shared XYZ optimization.
 // Never commit this result: fit() must still validate the joint solution.
 FitResult renderPlacement(Graph, const std::atomic_bool* cancel = nullptr);
+// Inspect immutable fiber/patch XYZ independently at the fitted chart positions.
+// Display only: no shared-surface refinement and no change to the accepted fit.
+FitResult renderSourceLayer(const Graph&, bool fibers, const std::atomic_bool* cancel = nullptr);
 FitResult render(Graph, const std::atomic_bool* cancel = nullptr);
 cv::Vec2d placedLocation(const Graph&, const Location&);
 cv::Vec3d sourceLocation(const Node&, const cv::Vec2d&);

@@ -23,6 +23,7 @@ class QListWidget;
 class QGraphicsItem;
 class OverlayBatchItem;
 class QSplitter;
+class QSlider;
 class Volume;
 namespace vc::lasagna { class LasagnaDataset;class LasagnaNormalSampler; }
 
@@ -50,7 +51,7 @@ private:
         std::shared_ptr<vc::constraints::Catalog> catalog;
         std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
         std::shared_ptr<vc::lasagna::LasagnaNormalSampler> normals;
-        vc::constraints::FitResult fit,proposalView;
+        vc::constraints::FitResult fit,proposalView,fiberView,patchView;
         std::vector<vc::constraints::Candidate> candidates;
         std::string error;
         std::string notice;
@@ -78,6 +79,7 @@ private:
     void removePair();
     void refreshPairs();
     void display();
+    void updateComparison();
     void overlays();
     void updateOverlayTransform(int pane, bool force=false);
     void positionControlBar();
@@ -94,10 +96,12 @@ private:
     VolumeViewerBase* _view[2]{};
     QSplitter* _splitter{};
     ConstraintGraphSelectionBar* _bar{};
-    QComboBox* _volume{}, *_normal{}, *_component{};
+    QComboBox* _volume{}, *_normal{}, *_component{}, *_discoveryStride{};
     QLineEdit* _fibers{}, *_patches{};
     QDoubleSpinBox* _radius{}, *_fiberScale{}, *_patchScale{}, *_normalScale{}, *_volumeScale{}, *_stiffness{};
     QCheckBox* _whole{}, *_showCommitted{};
+    QCheckBox* _compareSources{};
+    QSlider* _patchOpacity{};
     QPushButton* _commit{}, *_pair{}, *_previous{}, *_next{}, *_cancelButton{};
     QLabel* _candidateLabel{}, *_status{}, *_audit{};
     QListWidget* _pairs{};
@@ -113,6 +117,7 @@ private:
     std::shared_ptr<vc::lasagna::LasagnaDataset> _dataset;
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> _normals;
     vc::constraints::FitResult _committed, _preview, _proposalView;
+    vc::constraints::FitResult _fiberView, _patchView;
     std::optional<vc::constraints::Graph> _draft;
     std::vector<vc::constraints::FitResult> _undo,_redo;
     std::vector<vc::constraints::Candidate> _candidates, _available;

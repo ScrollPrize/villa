@@ -1,10 +1,12 @@
 #include <QtTest/QtTest>
 #include <QTemporaryDir>
+#include <QProcess>
 #include "vc/constraints/ConstraintGraph.hpp"
 #include "vc/fiber_tracer/FiberGeometry.hpp"
 #include "vc/lasagna/LineModel.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "../ConstraintGraphView.hpp"
+#include "../../../core/src/constraints/GraphFiberJunctions.hpp"
 #include <fstream>
 using namespace vc::constraints;
 namespace {
@@ -22,6 +24,148 @@ Graph base(){Graph g;auto n=plane("a");g.seed="a";g.nodes.emplace("a",Placement{
 class ConstraintGraphTest:public QObject {
     Q_OBJECT
 private slots:
+    void horizontalAnchorsLinkedVerticalGeometry(){
+        Catalog catalog;catalog.components={{"h","v"}};
+        Fiber h;h.id="h";h.direction='H';h.controls={0,10,20};
+        Fiber v;v.id="v";v.direction='V';v.controls={0,10,20};
+        for(int i=0;i<=20;++i){
+            h.line.push_back({100.0+i*20,300,100});
+            v.line.push_back({304,100.0+i*20,112});
+        }
+        Normals normals;Settings settings;
+        catalog.fibers={{"h",h},{"v",v}};catalog.links={{"h","v",1,1}};
+        Graph graph=seedGraph(catalog,0,settings,normals);
+        auto unlinked=std::make_shared<Node>(*graph.nodes.at("v").source);unlinked->id="unlinked";
+        graph.nodes.emplace("unlinked",Placement{unlinked,unlinked->initialUv});
+        Link link{fiberLineLocation(*graph.nodes.at("h").source,10),fiberLineLocation(*graph.nodes.at("v").source,10)};
+        graph.links={link};
+        const auto original=graphToJson(graph);
+        const detail::FiberJunctions junctions(graph);
+        const auto& vertical=*graph.nodes.at("v").source;
+        const auto& horizontal=*graph.nodes.at("h").source;
+        const auto target=sourceLocation(horizontal,link.a.grid);
+        QVERIFY(cv::norm(sourceLocation(vertical,link.b.grid)+junctions.offset(vertical,link.b.grid[0])-target)<1e-8);
+        QCOMPARE(junctions.offset(vertical,link.b.grid[0]-4),cv::Vec3d(0,0,0));
+        QCOMPARE(junctions.offset(vertical,link.b.grid[0]+4),cv::Vec3d(0,0,0));
+        QVERIFY(cv::norm(junctions.offset(vertical,link.b.grid[0]+2)-cv::Vec3d(-2,0,-6))<1e-8);
+        QVERIFY(junctions.points(horizontal)==horizontal.xyz);
+        QVERIFY(junctions.points(*unlinked)==unlinked->xyz);
+        QCOMPARE(graphToJson(graph).dump(),original.dump());
+        std::swap(graph.links[0].a,graph.links[0].b);
+        QVERIFY(detail::FiberJunctions(graph).points(vertical)==junctions.points(vertical));
+        // A fractional control gets the full horizontal position, independent
+        // of the coarse ribbon columns used by the chart metric.
+        graph.links[0].a.grid[0]+=.3;
+        const detail::FiberJunctions fractional(graph);
+        const auto& vl=graph.links[0].a;const auto& hl=graph.links[0].b;
+        QVERIFY(cv::norm(sourceLocation(vertical,vl.grid)+fractional.offset(vertical,vl.grid[0])-sourceLocation(horizontal,hl.grid))<1e-8);
+        graph.nodes.erase("unlinked");
+        const auto fitted=fit(graph);QVERIFY2(fitted.valid,fitted.message.c_str());
+        QVERIFY(fitted.correspondenceRms<.01);
+        QVERIFY(fitted.graph.nodes.at("v").source==graph.nodes.at("v").source);
+        const auto sample=fitted.surface->sampleAtSurface(placedLocation(fitted.graph,hl));
+        QVERIFY(sample.valid());
+        QVERIFY(cv::norm(cv::Vec3d(sample.volume)-sourceLocation(horizontal,hl.grid))<.02);
+        QTemporaryDir dir;const auto path=std::filesystem::path(dir.path().toStdString())/"graph.json";
+        saveSession(fitted,path);const auto restored=loadSession(path);
+        QVERIFY2(restored.valid,restored.message.c_str());
+        QCOMPARE(cv::norm(*restored.surface->rawPointsPtr(),*fitted.surface->rawPointsPtr(),cv::NORM_INF),0.0);
+    }
+    void verticalJunctionsBlendNearbyLinks(){
+        auto h=plane("h"),v=plane("v");h->fiber=v->fiber=true;h->direction='H';v->direction='V';
+        for(auto& xyz:v->xyz)xyz[2]+=10;
+        Graph graph;graph.seed="h";graph.nodes={{"h",{h,h->initialUv}},{"v",{v,v->initialUv}}};
+        graph.links={{{"h",{1,2}},{"v",{1,2}}},{{"h",{3,2}},{"v",{3,2}}}};
+        const detail::FiberJunctions junctions(graph);
+        // Equal neighboring corrections stay constant between links; they
+        // must not add together or fade to the back between close anchors.
+        QCOMPARE(junctions.offset(*v,2),cv::Vec3d(0,0,-10));
+        const auto before=graphToJson(graph);
+        auto fitted=fit(graph);QVERIFY2(fitted.valid,fitted.message.c_str());
+        QVERIFY(fitted.correspondenceRms<.01);
+        const auto& grid=*fitted.surface->rawPointsPtr();
+        const auto uv=placedLocation(fitted.graph,{"h",{2,2}});
+        const auto at=(uv-fitted.origin)/graph.settings.spacing;
+        const auto xyz=grid(int(std::lround(at[1])),int(std::lround(at[0])));
+        QVERIFY(std::abs(xyz[2]-100)<.2);
+        QCOMPARE(graphToJson(graph).dump(),before.dump());
+        graph.links.push_back({{"h",{0,2}},{"v",{1,2}}});
+        QVERIFY_EXCEPTION_THROWN((void)detail::FiberJunctions(graph),std::runtime_error);
+    }
+    void incrementalVerticalJunctionKeepsDistantSurface(){
+        Catalog catalog;catalog.components={{"h","v"}};
+        Fiber h;h.id="h";h.direction='H';h.controls={0,10,20};
+        Fiber v;v.id="v";v.direction='V';v.controls={0,100,200};
+        for(int i=0;i<=20;++i)h.line.push_back({100.0+i*20,2100,100});
+        for(int i=0;i<=200;++i)v.line.push_back({300,100.0+i*20,112});
+        catalog.fibers={{"h",h},{"v",v}};catalog.links={{"h","v",1,1}};
+        Normals normals;const auto committed=fit(seedGraph(catalog,0,Settings{},normals));
+        QVERIFY2(committed.valid,committed.message.c_str());
+        auto draft=committed.graph;
+        draft.links[0].a=fiberLineLocation(*draft.nodes.at("h").source,10);
+        draft.links[0].a.grid[0]+=.1;
+        const auto fitted=fitIncremental(draft,committed);
+        QVERIFY2(fitted.valid,fitted.message.c_str());QVERIFY(fitted.localChartVertices>0);
+        const auto center=placedLocation(committed.graph,committed.graph.links[0].b);
+        const auto& old=*committed.surface->rawPointsPtr();const auto& grid=*fitted.surface->rawPointsPtr();
+        const auto shift=(committed.origin-fitted.origin)/draft.settings.spacing;
+        size_t retained=0;
+        for(int y=0;y<old.rows;++y)for(int x=0;x<old.cols;++x) {
+            if(old(y,x)[0]==-1)continue;
+            const auto uv=committed.origin+cv::Vec2d(x,y)*draft.settings.spacing;
+            if(cv::norm(uv-center)<400)continue;
+            QCOMPARE(grid(y+int(std::lround(shift[1])),x+int(std::lround(shift[0]))),old(y,x));++retained;
+        }
+        QVERIFY(retained>100);
+    }
+    void patchFitsAllLocalFibers(){
+        QTemporaryDir dir;auto path=std::filesystem::path(dir.path().toStdString())/"patch";
+        cv::Mat_<cv::Vec3f> grid(5,5);
+        for(int y=0;y<5;++y)for(int x=0;x<5;++x)grid(y,x)={100+x*20.0f,100+y*20.0f,100};
+        QuadSurface(grid,{.05f,.05f}).save(path,"patch");
+        Catalog catalog;catalog.patches.push_back({"patch",path,{100,100,100},{180,180,100}});
+        Graph graph;graph.seed="first";Normals normals;
+        auto add=[&](std::string id,double y,double z,double chartOffset){
+            Fiber f;f.id=id;f.direction='H';f.controls={0,80};
+            for(int i=0;i<=80;++i)f.line.push_back({100.0+i,y,z});
+            auto n=makeFiberNode(f,graph.settings,normals);auto uv=n->initialUv;
+            for(auto& p:uv)p[1]+=chartOffset;
+            graph.nodes.emplace(id,Placement{n,uv});
+        };
+        add("first",120,100,0);add("second",160,100,52);
+        add("outside",160,105,40);add("other_traversal",160,100,4000);
+        Candidate candidate;candidate.id="patch";
+        Location anchor{"first"};anchor.lineIndex=40;
+        candidate.contacts.push_back({anchor,{"patch",{2,1}}});
+        auto proposal=propose(catalog,graph,candidate,false,normals);
+        std::map<std::string,size_t> counts;std::set<std::pair<std::string,int64_t>> unique;
+        for(const auto& link:proposal.links)if(link.b.node=="patch"){
+            ++counts[link.a.node];QVERIFY(unique.emplace(link.a.node,link.a.lineIndex).second);
+        }
+        QCOMPARE(counts["first"],size_t(81));QCOMPARE(counts["second"],size_t(81));
+        QCOMPARE(counts["outside"],size_t(0));QCOMPARE(counts["other_traversal"],size_t(0));
+        auto manualCandidate=candidate;
+        manualCandidate.contacts.push_back({{"second",{2,3}},{"patch",{2,3}},true});
+        auto manual=propose(catalog,graph,manualCandidate,false,normals);
+        QCOMPARE(std::count_if(manual.links.begin(),manual.links.end(),[](const auto& link){
+            return link.a.node=="second"&&link.b.node=="patch";
+        }),1);
+        // Fit just the local connected geometry; unrelated nodes are tested
+        // above for exclusion, not made part of this connected fit fixture.
+        proposal.nodes.erase("outside");proposal.nodes.erase("other_traversal");
+        const auto fitted=fit(proposal);QVERIFY2(fitted.valid,fitted.message.c_str());
+        for(const auto& link:fitted.graph.links)
+            QVERIFY(cv::norm(placedLocation(fitted.graph,link.a)-placedLocation(fitted.graph,link.b))<.2);
+        const auto original=graphToJson(fitted.graph).dump();
+        auto fibers=renderSourceLayer(fitted.graph,true),patches=renderSourceLayer(fitted.graph,false);
+        QVERIFY2(fibers.valid,fibers.message.c_str());QVERIFY2(patches.valid,patches.message.c_str());
+        QCOMPARE(fibers.graph.nodes.size(),size_t(2));QCOMPARE(patches.graph.nodes.size(),size_t(1));
+        QCOMPARE(graphToJson(fitted.graph).dump(),original);
+        for(const auto& [id,p]:fibers.graph.nodes)QVERIFY(p.uv==fitted.graph.nodes.at(id).uv);
+        QVERIFY(patches.graph.nodes.at("patch").uv==fitted.graph.nodes.at("patch").uv);
+        std::atomic_bool cancel{true};
+        QVERIFY_EXCEPTION_THROWN(propose(catalog,graph,candidate,false,normals,&cancel),std::runtime_error);
+    }
     void localAdditionPreservesDistantGeometry(){
         Fiber fiber;fiber.id="long";fiber.direction='H';fiber.controls={0,200};
         for(int i=0;i<=200;++i)fiber.line.push_back({100+i*20.0,100,100});
@@ -95,6 +239,39 @@ private slots:
         auto source=renderProposalSources(graph,base(),"b");QVERIFY(source.valid);
         QCOMPARE(source.graph.nodes.size(),size_t(1));QVERIFY(source.graph.nodes.contains("b"));
         std::atomic_bool cancel{true};QVERIFY_EXCEPTION_THROWN(renderPlacement(graph,&cancel),std::runtime_error);
+    }
+    void surfaceExpansionKeepsSettledChart(){
+        Fiber fiber;fiber.id="long";fiber.direction='H';fiber.controls={0,200};
+        for(int i=0;i<=200;++i)fiber.line.push_back({100+i*20.0,100,100});
+        Normals normals;Graph graph;auto source=makeFiberNode(fiber,graph.settings,normals);
+        graph.seed=source->id;graph.nodes.emplace(source->id,Placement{source,source->initialUv});
+        auto committed=fit(graph);QVERIFY2(committed.valid,committed.message.c_str());
+        // An accepted XYZ grid can carry earlier surface relaxation beyond
+        // the next edit's chart footprint. Its boundary must settle too.
+        auto& grid=*committed.surface->rawPointsPtr();
+        for(int y=0;y<grid.rows;++y)for(int x=0;x<grid.cols;++x) {
+            const double u=committed.origin[0]+x*graph.settings.spacing;
+            if(grid(y,x)[0]!=-1&&u>=1740&&u<=2340)grid(y,x)[2]+=2;
+        }
+        auto draft=committed.graph;auto patch=plane("patch",2000);
+        for(auto& xyz:patch->xyz)xyz+=cv::Vec3d{2000,-40,0};
+        for(auto& uv:patch->initialUv)uv[1]-=40;
+        draft.nodes.emplace(patch->id,Placement{patch,patch->initialUv});
+        draft.links.push_back({fiberLineLocation(*source,102),{"patch",{2,2}}});
+        size_t charts=0,surfaces=0;
+        const auto result=fitIncremental(draft,committed,nullptr,[&](const std::string& message){
+            charts+=message.starts_with("Fitting local charts:");
+            surfaces+=message.starts_with("Updating local tifxyz region:");
+        });
+        QVERIFY2(result.valid,result.message.c_str());QVERIFY(result.localChartVertices>0);
+        QCOMPARE(charts,size_t(1));QVERIFY(surfaces>1);
+        QVERIFY(result.correspondenceRms<.01);QVERIFY(result.stretchP95<1.01);
+        const auto shift=(committed.origin-result.origin)/graph.settings.spacing;
+        const auto& after=*result.surface->rawPointsPtr();
+        for(int y=0;y<grid.rows;++y)for(int x=0;x<grid.cols;++x) {
+            const double u=committed.origin[0]+x*graph.settings.spacing;
+            if(u<1400||u>2700)QCOMPARE(after(y+int(std::lround(shift[1])),x+int(std::lround(shift[0]))),grid(y,x));
+        }
     }
     void initialViewUsesSeedAtInspectionScale(){
         auto g=base();
@@ -188,6 +365,30 @@ private slots:
         g=base();auto other=plane("disconnected");g.nodes.emplace(other->id,Placement{other,other->initialUv});
         QVERIFY(!fit(g).valid);
     }
+    void incompatibleKeypointsStayRejected(){
+        auto graph=base();auto patch=plane("b",100);
+        graph.nodes.emplace(patch->id,Placement{patch,patch->initialUv});
+        // These pairs demand a reflection, which a rigid rotation cannot
+        // satisfy. The no-flip barrier must still prevent committing the fit.
+        graph.links={{{"a",{0,0}},{"b",{0,0}},true},
+                     {{"a",{4,0}},{"b",{0,4}},true},
+                     {{"a",{0,4}},{"b",{4,0}},true}};
+        const auto result=fit(graph);
+        QVERIFY(!result.valid);
+        QVERIFY2(result.message.find("Keypoint constraints conflict")!=std::string::npos ||
+                 result.message.find("inverted quad")!=std::string::npos,result.message.c_str());
+    }
+    void rejectedChartStepsStayQuiet(){
+        // Capture the real solver's stderr in a child rather than changing
+        // process-wide glog settings or installing a global log filter.
+        QProcess child;
+        child.start(QCoreApplication::applicationFilePath(),{"incompatibleKeypointsStayRejected"});
+        QVERIFY(child.waitForFinished(30000));
+        QCOMPARE(child.exitStatus(),QProcess::NormalExit);
+        const auto output=child.readAllStandardOutput()+child.readAllStandardError();
+        QVERIFY2(child.exitCode()==0,output.constData());
+        QVERIFY2(!output.contains("Step failed to evaluate"),output.constData());
+    }
     void linkedRibbonHandedness(){
         Catalog catalog;catalog.components={{"a","b","c"}};
         for(int j=0;j<3;++j){
@@ -248,6 +449,65 @@ private slots:
         for(int x=0;x<n->cols;++x){low=std::min(low,uv[n->cols+x][1]);high=std::max(high,uv[n->cols+x][1]);}
         QVERIFY(high-low>25);QVERIFY(high-low<35);
         QVERIFY(result.stretchP95<1.01);
+    }
+    void discoveryStride(){
+        QTemporaryDir dir;const auto root=std::filesystem::path(dir.path().toStdString());
+        std::filesystem::create_directory(root/"fibers");std::filesystem::create_directory(root/"patches");
+        nlohmann::json points=nlohmann::json::array();
+        for(int x=100;x<=230;++x)points.push_back({x,110,100});
+        const nlohmann::json fiber={{"type","vc3d_fiber"},{"version",1},{"line_points",points},
+            {"control_points",{{100,110,100},{230,110,100}}},{"branches",nlohmann::json::array()}};
+        for(const char* name:{"a.json","b.json"})std::ofstream(root/"fibers"/name)<<fiber;
+        cv::Mat_<cv::Vec3f> grid(3,8);
+        for(int y=0;y<grid.rows;++y)for(int x=0;x<grid.cols;++x)grid(y,x)={100+x*20.0f,100+y*20.0f,104};
+        QuadSurface patch(grid,{.05f,.05f});patch.save(root/"patches"/"one","one");
+        Settings settings;settings.fiberFolder=root/"fibers";settings.patchFolder=root/"patches";settings.fiberScale=1;
+        const auto catalog=loadCatalog(settings);Normals normals;const auto graph=seedGraph(catalog,0,settings,normals);
+        const auto before=graphToJson(graph).dump();
+        for(int stride:{1,4,8}) {
+            const auto forward=discover(catalog,graph,graph.seed,nullptr,{},{},stride);
+            QCOMPARE(forward.size(),size_t(1));
+            auto moved=graph;for(auto& uv:moved.nodes.at(graph.seed).uv)uv+=cv::Vec2d{500,700};
+            const auto cached=discover(catalog,moved,graph.seed,nullptr,{},{},stride);
+            QCOMPARE(cached.size(),forward.size());QCOMPARE(cached[0].distance,forward[0].distance);
+            QCOMPARE(cached[0].contacts.size(),forward[0].contacts.size());
+            for(size_t i=0;i<forward[0].contacts.size();++i) {
+                QCOMPARE(cached[0].contacts[i].a.lineIndex,forward[0].contacts[i].a.lineIndex);
+                QCOMPARE(cached[0].contacts[i].b.grid,forward[0].contacts[i].b.grid);
+            }
+            // Replacing an immutable source must invalidate an otherwise
+            // identical request list; chart movement alone must not.
+            auto replacement=std::make_shared<Node>(*graph.nodes.at(graph.seed).source);
+            replacement->line[0][2]+=.5;moved.nodes.at(graph.seed).source=replacement;
+            const auto changed=discover(catalog,moved,graph.seed,nullptr,{},{},stride);
+            QCOMPARE(changed.size(),size_t(1));QVERIFY(changed[0].distance<forward[0].distance);
+            moved=graph;moved.settings.patchScale=1.001;
+            QVERIFY(discover(catalog,moved,graph.seed,nullptr,{},{},stride).empty());
+            std::vector<int> expected;
+            for(int i=0;i<=130;i+=stride)expected.push_back(i);
+            if(expected.back()!=130)expected.push_back(130);
+            QCOMPARE(forward[0].contacts.size(),expected.size());
+            const auto proposal=propose(catalog,graph,forward[0],true,normals);
+            const auto reverse=discover(catalog,proposal,"patch:one",nullptr,{},{},stride);
+            QCOMPARE(reverse.size(),size_t(1));QVERIFY(reverse[0].fiber);
+            QCOMPARE(reverse[0].contacts.size(),expected.size());
+            for(size_t i=0;i<expected.size();++i) {
+                const auto& a=forward[0].contacts[i];const auto& b=reverse[0].contacts[i];
+                QCOMPARE(a.a.lineIndex,expected[i]);QCOMPARE(b.b.lineIndex,expected[i]);
+                QVERIFY(a.b.grid==b.a.grid);
+                // Every published contact retains the original 4-vx proximity check.
+                const auto xyz=cv::Vec3d{100+20*a.b.grid[0],100+20*a.b.grid[1],104};
+                QVERIFY(cv::norm(xyz-catalog.fibers.at(graph.seed).line.at(expected[i]))<=4.00001);
+            }
+            auto outside=graph;outside.settings.radius=3.99;
+            QVERIFY(discover(catalog,outside,graph.seed,nullptr,{},{},stride).empty());
+            auto outsideReverse=proposal;outsideReverse.settings.radius=3.99;
+            QVERIFY(discover(catalog,outsideReverse,"patch:one",nullptr,{},{},stride).empty());
+        }
+        QCOMPARE(discover(catalog,graph,graph.seed)[0].contacts.size(),size_t(34));
+        QCOMPARE(graphToJson(graph).dump(),before);
+        QVERIFY_EXCEPTION_THROWN(discover(catalog,graph,graph.seed,nullptr,{},{},0),std::invalid_argument);
+        QVERIFY_EXCEPTION_THROWN(discover(catalog,graph,graph.seed,nullptr,{},{},-1),std::invalid_argument);
     }
     void discoveryAndComponents(){
         QTemporaryDir dir;auto root=std::filesystem::path(dir.path().toStdString());std::filesystem::create_directory(root/"fibers");std::filesystem::create_directory(root/"patches");

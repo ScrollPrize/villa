@@ -70,6 +70,14 @@ inline cv::Vec2d interpolate(const std::vector<cv::Vec2d>& uv, const Weights& w)
 inline cv::Vec3d interpolate(const std::vector<cv::Vec3d>& xyz, const Weights& w) {
     return xyz[w.indices[0]]*w.values[0]+xyz[w.indices[1]]*w.values[1]+xyz[w.indices[2]]*w.values[2];
 }
+inline std::pair<const Location*,const Location*> horizontalVerticalLink(const Graph& g,const Link& link) {
+    const auto* h=&link.a;const auto* v=&link.b;
+    if(g.nodes.at(h->node).source->direction=='V')std::swap(h,v);
+    const auto& horizontal=*g.nodes.at(h->node).source;
+    const auto& vertical=*g.nodes.at(v->node).source;
+    if(!horizontal.fiber||!vertical.fiber||horizontal.direction!='H'||vertical.direction!='V')return {nullptr,nullptr};
+    return {h,v};
+}
 inline std::pair<Weights,Weights> linkWeights(const Graph& g,const Link& link) {
     const auto& a=*g.nodes.at(link.a.node).source;
     const auto& b=*g.nodes.at(link.b.node).source;
@@ -77,7 +85,10 @@ inline std::pair<Weights,Weights> linkWeights(const Graph& g,const Link& link) {
     // A branch records two control locations, which can move apart after
     // tracing. Preserve their measured tangential separation instead of
     // collapsing different XYZ positions into one output grid point.
-    if(!link.keypoint&&a.fiber&&b.fiber) {
+    // H/V controls coincide in the chart: the horizontal supplies the XYZ
+    // position and FiberJunctions blends that correction into the vertical.
+    const bool horizontalVertical=horizontalVerticalLink(g,link).first!=nullptr;
+    if(!link.keypoint&&a.fiber&&b.fiber&&!horizontalVertical) {
         const auto delta=interpolate(b.xyz,wb)-interpolate(a.xyz,wa);
         const auto x=a.xyz[wa.indices[1]]-a.xyz[wa.indices[0]];
         const auto y=a.xyz[wa.indices[2]]-a.xyz[wa.indices[0]];

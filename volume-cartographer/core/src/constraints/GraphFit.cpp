@@ -1,4 +1,5 @@
 #include "GraphInternal.hpp"
+#include "GraphFiberJunctions.hpp"
 #include "vc/core/util/SymmetricDirichlet.hpp"
 #include <ceres/ceres.h>
 #include <set>
@@ -20,6 +21,36 @@ struct LocalFit {
     bool expand=false;
     bool moves(const std::string& id,int i)const {return movable.at(id)[i]!=0;}
     bool added(const std::string& id)const {return !committed.graph.nodes.contains(id);}
+};
+// The chart's bounding rectangle is often mostly empty between ribbons.
+// Keep only an integer lookup there; XYZ scratch data belongs to covered sites.
+struct RasterSample {
+    cv::Vec3d sum{0,0,0},normal{0,0,0},point{-1,-1,-1};
+    double mass=0;
+    int owner=-1,visited=-1;
+    bool active=false;
+};
+class RasterSamples {
+    std::vector<int> indices_;
+    std::vector<RasterSample> samples_;
+public:
+    explicit RasterSamples(size_t count):indices_(count,-1) {}
+    const RasterSample& operator[](size_t i)const {
+        static const RasterSample empty;
+        return indices_[i]<0?empty:samples_[indices_[i]];
+    }
+    RasterSample& at(size_t i) {return samples_[indices_[i]];}
+    RasterSample& insert(size_t i) {
+        if(indices_[i]<0){indices_[i]=int(samples_.size());samples_.emplace_back();}
+        return at(i);
+    }
+    void orderByGrid() {
+        std::vector<RasterSample> ordered;ordered.reserve(samples_.size());
+        for(auto& index:indices_)if(index>=0) {
+            ordered.push_back(samples_[index]);index=int(ordered.size()-1);
+        }
+        samples_=std::move(ordered);
+    }
 };
 struct ChartMetric {
     double inv00,inv01,inv11,weight,orientation;
@@ -103,6 +134,16 @@ struct Fidelity {
         for(int i=0;i<3;++i) r[i]=T(weight)*(p[i]-T(target[i]));return true;
     }
 };
+struct HorizontalAnchor {
+    cv::Vec4d weights;
+    cv::Vec3d target;
+    double weight;
+    template<class T> bool operator()(const T* a,const T* b,const T* c,const T* d,T* r) const {
+        for(int i=0;i<3;++i)
+            r[i]=T(weight)*(T(weights[0])*a[i]+T(weights[1])*b[i]+T(weights[2])*c[i]+T(weights[3])*d[i]-T(target[i]));
+        return true;
+    }
+};
 struct Cancellation : ceres::IterationCallback {
     const std::atomic_bool* cancel;
     explicit Cancellation(const std::atomic_bool* c):cancel(c){}
@@ -146,16 +187,26 @@ FitResult renderProposalSources(const Graph& draft,const Graph& committed,const 
     if(graph.nodes.empty())return {};
     graph.seed=graph.nodes.begin()->first;return render(std::move(graph),cancel);
 }
+FitResult renderSourceLayer(const Graph& fitted,bool fibers,const std::atomic_bool* cancel) {
+    Graph graph;graph.settings=fitted.settings;
+    for(const auto& [id,p]:fitted.nodes)if(p.source->fiber==fibers)graph.nodes.emplace(id,p);
+    for(const auto& link:fitted.links)if(graph.nodes.contains(link.a.node)&&graph.nodes.contains(link.b.node))graph.links.push_back(link);
+    if(graph.nodes.empty())return {};
+    graph.seed=graph.nodes.begin()->first;
+    return renderPlacement(std::move(graph),cancel);
+}
 namespace {
 FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,LocalFit* local=nullptr,
                         const cv::Mat_<cv::Vec3f>* saved=nullptr,const cv::Vec2d* savedOrigin=nullptr) {
     FitResult result;result.graph=std::move(graph);auto& g=result.graph;
     if(g.nodes.empty()) {result.message="Graph is empty";return result;}
+    const detail::FiberJunctions junctions(g,!saved);
     double spacing=g.settings.spacing;
     cv::Vec2d low{INFINITY,INFINITY},high{-INFINITY,-INFINITY};
     std::vector<double> stretches;
     for(const auto& [id,p]:g.nodes) {
         if(p.uv.size()!=p.source->xyz.size()) throw std::runtime_error("Source/placement size mismatch");
+        const auto& xyz=junctions.points(*p.source);
         double sign=0;
         for(const auto& t:p.source->triangles) {
             auto det=triangleOrientation(p,t);
@@ -167,7 +218,7 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
                 auto uv=p.uv[t[i]];
                 if(!std::isfinite(uv[0])||!std::isfinite(uv[1])) {result.message="Nonfinite placement";return result;}
                 for(int d=0;d<2;++d){low[d]=std::min(low[d],uv[d]);high[d]=std::max(high[d],uv[d]);}
-                double dist=cv::norm(p.source->xyz[t[(i+1)%3]]-p.source->xyz[t[i]]);
+                double dist=cv::norm(xyz[t[(i+1)%3]]-xyz[t[i]]);
                 double flat=cv::norm(p.uv[t[(i+1)%3]]-uv);
                 if(dist>1e-8&&flat>1e-8) stretches.push_back(std::max(flat/dist,dist/flat));
             }
@@ -195,10 +246,9 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
         const int x=int(std::lround(at[0])),y=int(std::lround(at[1]));
         return x>=0&&y>=0&&x<grid.cols&&y<grid.rows?cv::Vec3d(grid(y,x)):cv::Vec3d{-1,-1,-1};
     };
-    std::vector<cv::Vec3d> sum(count,{0,0,0}),normals(count,{0,0,0});
-    std::vector<double> mass(count,0);
+    RasterSamples samples(count);
     std::vector<unsigned char> coverage(count,0);
-    std::vector<int> owner(count,-1);std::vector<std::string> ids;
+    std::vector<std::string> ids;
     std::set<std::pair<std::string,std::string>> linked;
     for(const auto& l:g.links) linked.insert(std::minmax(l.a.node,l.b.node));
     size_t conflicts=0;int ordinal=0;
@@ -206,10 +256,10 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
     for(bool fiber:{true,false}) for(const auto& [id,p]:g.nodes) {
         if(p.source->fiber!=fiber) continue;
         detail::cancelled(cancel);const auto& n=*p.source;int current=ordinal++;ids.push_back(id);
-        std::set<size_t> visited;
+        const auto& geometry=junctions.points(n);
         for(const auto& t:n.triangles) {
             cv::Vec2d a=(p.uv[t[0]]-low)/spacing,b=(p.uv[t[1]]-low)/spacing,c=(p.uv[t[2]]-low)/spacing;
-            auto normal=detail::unit((n.xyz[t[1]]-n.xyz[t[0]]).cross(n.xyz[t[2]]-n.xyz[t[0]]));
+            auto normal=detail::unit((geometry[t[1]]-geometry[t[0]]).cross(geometry[t[2]]-geometry[t[0]]));
             if(detail::cross(b-a,c-a)<0) normal*=-1;
             int x0=std::max(0,int(std::ceil(std::min({a[0],b[0],c[0]}))));
             int x1=std::min(cols-1,int(std::floor(std::max({a[0],b[0],c[0]}))));
@@ -220,17 +270,21 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
             }
             for(int y=y0;y<=y1;++y) for(int x=x0;x<=x1;++x) {
                 auto w=barycentric({double(x),double(y)},a,b,c);if(!w)continue;
-                size_t index=size_t(y)*cols+x;if(!visited.insert(index).second)continue;
+                size_t index=size_t(y)*cols+x;
+                auto& sample=samples.insert(index);if(sample.visited==current)continue;
+                sample.visited=current;
                 auto xyz=n.xyz[t[0]]*(*w)[0]+n.xyz[t[1]]*(*w)[1]+n.xyz[t[2]]*(*w)[2];
+                double sourceColumn=0;for(int j=0;j<3;++j)sourceColumn+=(t[j]%n.cols)*(*w)[j];
+                xyz+=junctions.offset(n,sourceColumn);
                 double weight=1;
                 if(fiber) {
                     double sourceRow=0;for(int j=0;j<3;++j) sourceRow+=(t[j]/n.cols)*(*w)[j];
                     weight=1/(1+std::abs(sourceRow-n.rows/2));
                 }
-                if(owner[index]>=0&&!fiber&&g.nodes.at(ids[owner[index]]).source->fiber) {mass[index]=0;sum[index]={0,0,0};normals[index]={0,0,0};}
-                if(mass[index]>0&&!fiber&&cv::norm(sum[index]/mass[index]-xyz)>g.settings.radius &&
-                   !linked.contains(std::minmax(id,ids[owner[index]]))) ++conflicts;
-                sum[index]+=xyz*weight;normals[index]+=normal*weight;mass[index]+=weight;owner[index]=current;
+                if(sample.owner>=0&&!fiber&&g.nodes.at(ids[sample.owner]).source->fiber) {sample.mass=0;sample.sum={0,0,0};sample.normal={0,0,0};}
+                if(sample.mass>0&&!fiber&&cv::norm(sample.sum/sample.mass-xyz)>g.settings.radius &&
+                   !linked.contains(std::minmax(id,ids[sample.owner]))) ++conflicts;
+                sample.sum+=xyz*weight;sample.normal+=normal*weight;sample.mass+=weight;sample.owner=current;
             }
         }
     }
@@ -241,47 +295,77 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
     std::set<int> unsupported;
     for(int y=0;y+1<rows;++y)for(int x=0;x+1<cols;++x) {
         int a=y*cols+x,b=a+1,c=a+cols,d=c+1;
-        if(coverage[a]==15||!mass[a]||!mass[b]||!mass[c]||!mass[d])continue;
-        int victim=a;for(int i:{b,c,d})if(mass[i]<mass[victim])victim=i;unsupported.insert(victim);
+        if(coverage[a]==15||!samples[a].mass||!samples[b].mass||!samples[c].mass||!samples[d].mass)continue;
+        int victim=a;for(int i:{b,c,d})if(samples[i].mass<samples[victim].mass)victim=i;unsupported.insert(victim);
     }
     for(int i:unsupported) {
         if(local&&!movable(i)&&detail::valid(previous(i))){local->expand=true;result.message="Surface support reaches the local boundary";return result;}
-        mass[i]=0;
+        samples.at(i).mass=0;
     }
     if(local)for(size_t i=0;i<count;++i)if(!movable(int(i))) {
         const auto old=previous(int(i));
-        if(detail::valid(old)&&owner[i]<0){local->expand=true;result.message="Surface moved across the local boundary";return result;}
-        mass[i]=detail::valid(old)?1:0;
+        if(detail::valid(old)&&samples[i].owner<0){local->expand=true;result.message="Surface moved across the local boundary";return result;}
+        if(samples[i].owner>=0)samples.at(i).mass=detail::valid(old)?1:0;
     }
     if(saved) {
         for(size_t i=0;i<count;++i) {
             const auto p=(*saved)(int(i)/cols,int(i)%cols);
-            if(p[0]!=-1&&(!detail::valid(cv::Vec3d(p))||owner[i]<0)){result.message="Saved surface has unsupported samples";return result;}
-            mass[i]=p[0]!=-1?1:0;
+            if(p[0]!=-1&&(!detail::valid(cv::Vec3d(p))||samples[i].owner<0)){result.message="Saved surface has unsupported samples";return result;}
+            if(samples[i].owner>=0)samples.at(i).mass=p[0]!=-1?1:0;
         }
         for(int y=0;y+1<rows;++y)for(int x=0;x+1<cols;++x) {
             int a=y*cols+x;
-            if(coverage[a]!=15&&mass[a]&&mass[a+1]&&mass[a+cols]&&mass[a+cols+1]){result.message="Saved surface bridges a source gap";return result;}
+            if(coverage[a]!=15&&samples[a].mass&&samples[a+1].mass&&samples[a+cols].mass&&samples[a+cols+1].mass){result.message="Saved surface bridges a source gap";return result;}
         }
     }
-    std::vector<cv::Vec3d> points(count,{-1,-1,-1});
-    for(size_t i=0;i<count;++i)if(mass[i])points[i]=saved?cv::Vec3d((*saved)(int(i)/cols,int(i)%cols)):(local&&!movable(int(i))?previous(int(i)):sum[i]/mass[i]);
+    for(size_t i=0;i<count;++i)if(samples[i].mass) {
+        auto& s=samples.at(i);
+        s.point=saved?cv::Vec3d((*saved)(int(i)/cols,int(i)%cols)):(local&&!movable(int(i))?previous(int(i)):s.sum/s.mass);
+    }
+    // Preserve the dense grid's parameter address order as well as residual
+    // order, so Ceres uses the same ordering in its sparse factorization.
+    if(refine)samples.orderByGrid();
+    // No insertions after this point: Ceres retains pointers into the samples.
+    auto point=[&](int i)->cv::Vec3d& {return samples.at(i).point;};
     // Joint XYZ fit: every overlapping source contributes to the same sample.
     // Preserve its measured position while regularizing the shared grid metric.
     ceres::Problem problem;
     std::vector<cv::Vec3i> triangles;
     for(int y=0;y+1<rows;++y)for(int x=0;x+1<cols;++x) {
         int a=y*cols+x,b=a+1,c=a+cols,d=c+1;
-        if(!mass[a]||!mass[b]||!mass[c]||!mass[d]) continue;
+        if(!samples[a].mass||!samples[b].mass||!samples[c].mass||!samples[d].mass) continue;
         triangles.push_back({a,b,c});triangles.push_back({d,c,b});
     }
-    std::set<int> active;
-    for(const auto& t:triangles)for(int i:t.val)active.insert(i);
+    // Scan in index order, as in the former set (including residual order).
+    for(const auto& t:triangles)for(int i:t.val)samples.at(i).active=true;
+    std::vector<int> active;
+    active.reserve(std::min(count,triangles.size()*3));
+    for(size_t i=0;i<count;++i)if(samples[i].active)active.push_back(int(i));
     if(active.empty()){result.message="No complete quads after rasterization";return result;}
     if(refine) {
-        for(int i:active)if(movable(i))problem.AddResidualBlock(new ceres::AutoDiffCostFunction<Fidelity,3,3>(new Fidelity{points[i],5.0/spacing}),nullptr,points[i].val);
-        for(const auto& t:triangles) problem.AddResidualBlock(vc::SymmetricDirichletLoss::Create(spacing,g.settings.stiffness,1e-8,0),nullptr,points[t[0]].val,points[t[1]].val,points[t[2]].val);
-        if(local)for(int i:active)if(!movable(i))problem.SetParameterBlockConstant(points[i].val);
+        for(int i:active)if(movable(i))problem.AddResidualBlock(new ceres::AutoDiffCostFunction<Fidelity,3,3>(new Fidelity{point(i),5.0/spacing}),nullptr,point(i).val);
+        for(const auto& t:triangles) problem.AddResidualBlock(vc::SymmetricDirichletLoss::Create(spacing,g.settings.stiffness,1e-8,0),nullptr,point(t[0]).val,point(t[1]).val,point(t[2]).val);
+        // Rasterization and metric regularization must not pull an explicit
+        // H/V junction back between the front and back of the sheet. Anchor
+        // the rendered bilinear sample itself to the horizontal position.
+        for(const auto& link:g.links) {
+            const auto [h,v]=detail::horizontalVerticalLink(g,link);if(!h)continue;
+            const auto& horizontal=*g.nodes.at(h->node).source;
+            const auto at=(placedLocation(g,*h)-low)/spacing;
+            const int x=int(std::floor(at[0])),y=int(std::floor(at[1]));
+            if(x<0||y<0||x+1>=cols||y+1>=rows)continue;
+            const int a=y*cols+x,b=a+1,c=a+cols,d=c+1;
+            if(!samples[a].mass||!samples[b].mass||!samples[c].mass||!samples[d].mass)continue;
+            // Measured patches retain their existing precedence over ribbons.
+            bool patch=false;for(int i:{a,b,c,d})patch|=!g.nodes.at(ids[samples[i].owner]).source->fiber;
+            if(patch||(!movable(a)&&!movable(b)&&!movable(c)&&!movable(d)))continue;
+            const double u=at[0]-x,w=at[1]-y;
+            const auto target=detail::interpolate(horizontal.xyz,detail::weights(horizontal,*h));
+            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<HorizontalAnchor,3,3,3,3,3>(
+                new HorizontalAnchor{{(1-u)*(1-w),u*(1-w),(1-u)*w,u*w},target,1000.0/spacing}),
+                nullptr,point(a).val,point(b).val,point(c).val,point(d).val);
+        }
+        if(local)for(int i:active)if(!movable(i))problem.SetParameterBlockConstant(point(i).val);
         Cancellation cb(cancel);auto options=solverOptions(cb,12);ceres::Solver::Summary summary;ceres::Solve(options,&problem,&summary);detail::cancelled(cancel);
         if(!summary.IsSolutionUsable()){result.message="Shared surface fit failed: "+summary.BriefReport();return result;}
     }
@@ -292,24 +376,24 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
             for(int offset:{-1,1,-cols,cols})if(i+offset>=0&&i+offset<int(count)&&!movable(i+offset)) {
                 boundary=true;const auto oldA=previous(i),oldB=previous(i+offset);
                 if(!detail::valid(oldA)||!detail::valid(oldB))continue;
-                const double before=cv::norm(oldA-oldB),after=cv::norm(points[i]-points[i+offset]);
+                const double before=cv::norm(oldA-oldB),after=cv::norm(point(i)-point(i+offset));
                 if(before>1e-8&&(after>before*1.02||after<before/1.02))local->expand=true;
             }
-            if(boundary&&detail::valid(previous(i))&&cv::norm(points[i]-previous(i))>g.settings.radius*.25)local->expand=true;
+            if(boundary&&detail::valid(previous(i))&&cv::norm(point(i)-previous(i))>g.settings.radius*.25)local->expand=true;
         }
         if(local->expand){result.message="Surface adjustment reaches the local boundary";return result;}
         result.localSurfaceSamples=std::count_if(active.begin(),active.end(),movable);
     }
     cv::Mat_<cv::Vec3f> grid=saved?saved->clone():cv::Mat_<cv::Vec3f>(rows,cols,cv::Vec3f{-1,-1,-1});
-    for(int i:active) grid(i/cols,i%cols)=cv::Vec3f(points[i]);
+    for(int i:active) grid(i/cols,i%cols)=cv::Vec3f(point(i));
     for(const auto& t:triangles) {
-        auto cross=(points[t[1]]-points[t[0]]).cross(points[t[2]]-points[t[0]]);
-        auto reference=normals[t[0]]+normals[t[1]]+normals[t[2]];
+        auto cross=(point(t[1])-point(t[0])).cross(point(t[2])-point(t[0]));
+        auto reference=samples[t[0]].normal+samples[t[1]].normal+samples[t[2]].normal;
         if(cv::norm(cross)<1e-6||cross.dot(reference)<=0) {
-            bool support=false;for(int i:t.val) support|=g.nodes.at(ids[owner[i]]).source->fiber;
-            support|=owner[t[0]]!=owner[t[1]]||owner[t[0]]!=owner[t[2]];
+            bool support=false;for(int i:t.val) support|=g.nodes.at(ids[samples[i].owner]).source->fiber;
+            support|=samples[t[0]].owner!=samples[t[1]].owner||samples[t[0]].owner!=samples[t[2]].owner;
             if(!support){result.message="Patch geometry contains an inverted quad";return result;}
-            int victim=t[0];for(int i:t.val)if(mass[i]<mass[victim])victim=i;
+            int victim=t[0];for(int i:t.val)if(samples[i].mass<samples[victim].mass)victim=i;
             if(local&&!movable(victim)){local->expand=true;result.message="Quad validation reaches the local boundary";return result;}
             grid(victim/cols,victim%cols)={-1,-1,-1};unsupported.insert(victim);
         }
@@ -434,13 +518,17 @@ FitResult fitCharts(Graph graph,const std::atomic_bool* cancel,Progress progress
         }
     }
     if(progress)progress("Fitting connected graph");
+    const detail::FiberJunctions junctions(graph);
     ceres::Problem problem;
     std::map<std::string,double> centers;
     for(auto& [id,p]:graph.nodes) {
         const auto& n=*p.source;
+        const auto& geometry=junctions.points(n);
+        const auto* movable=local?&local->movable.at(id):nullptr;
+        const auto moves=[&](int i){return !movable||(*movable)[i]!=0;};
         for(const auto& t:n.triangles) {
-            if(local&&!local->moves(id,t[0])&&!local->moves(id,t[1])&&!local->moves(id,t[2]))continue;
-            auto x=n.xyz[t[1]]-n.xyz[t[0]],y=n.xyz[t[2]]-n.xyz[t[0]];
+            if(!moves(t[0])&&!moves(t[1])&&!moves(t[2]))continue;
+            auto x=geometry[t[1]]-geometry[t[0]],y=geometry[t[2]]-geometry[t[0]];
             double length=cv::norm(x),projection=x.dot(y)/length;
             double height=std::sqrt(std::max(0.0,y.dot(y)-projection*projection));
             if(length<1e-6||height<1e-6)continue;
@@ -457,14 +545,14 @@ FitResult fitCharts(Graph graph,const std::atomic_bool* cancel,Progress progress
             centers[id]=center/n.cols;
             for(int x=0;x<n.cols;++x) {
                 auto& uv=p.uv[(n.rows/2)*n.cols+x];
-                if(problem.HasParameterBlock(uv.val)&&(!local||local->moves(id,(n.rows/2)*n.cols+x)))
+                if(problem.HasParameterBlock(uv.val)&&moves((n.rows/2)*n.cols+x))
                     problem.AddResidualBlock(new ceres::AutoDiffCostFunction<FiberBand,1,2,1>(
                         new FiberBand{axis,bandHalfWidth,bandWeight}),nullptr,uv.val,&centers[id]);
             }
         }
         if(n.fiber&&(n.direction=='H'||n.direction=='V'))for(int x=0;x+1<n.cols;++x) {
             int a=(n.rows/2)*n.cols+x,b=a+1;
-            if((!local||local->moves(id,a)||local->moves(id,b))&&
+            if((moves(a)||moves(b))&&
                problem.HasParameterBlock(p.uv[a].val)&&problem.HasParameterBlock(p.uv[b].val))
                 problem.AddResidualBlock(new ceres::AutoDiffCostFunction<Direction,1,2,2>(new Direction{n.direction=='V'?0:1,0.2/graph.settings.spacing}),nullptr,p.uv[a].val,p.uv[b].val);
         }
@@ -505,6 +593,11 @@ FitResult fitCharts(Graph graph,const std::atomic_bool* cancel,Progress progress
         problem.SetManifold(seed.uv[anchor[1]].val,new ceres::SubsetManifold(2,{std::abs(edge[0])>=std::abs(edge[1])?1:0}));
     }
     Cancellation cb(cancel);auto options=solverOptions(cb,60);ceres::Solver::Summary summary;
+    // ChartMetric deliberately rejects trial steps that flip a triangle.
+    // Ceres retries them with a smaller trust region; logging every rejection
+    // as a warning floods stderr on constrained fits. Keep this solve quiet;
+    // unusable solutions and final geometry errors are still reported below.
+    options.logging_type=ceres::SILENT;
     ceres::Solve(options,&problem,&summary);detail::cancelled(cancel);
     if(!summary.IsSolutionUsable()) {FitResult failed;failed.graph=std::move(graph);failed.message=summary.BriefReport();return failed;}
     for(const auto& l:graph.links)if(l.keypoint&&cv::norm(placedLocation(graph,l.a)-placedLocation(graph,l.b))>0.02) {
@@ -568,11 +661,15 @@ bool chartBoundarySettled(const Graph& graph,LocalFit& local) {
 }
 Region changedSurfaceBounds(const Graph& graph,const Graph& committed) {
     Region region;
+    const detail::FiberJunctions afterGeometry(graph),beforeGeometry(committed);
     for(const auto& [id,p]:graph.nodes) {
         auto before=committed.nodes.find(id);
+        const auto& afterPoints=afterGeometry.points(*p.source);
+        const auto* beforePoints=before==committed.nodes.end()?nullptr:&beforeGeometry.points(*before->second.source);
         for(const auto& t:p.source->triangles) {
             bool changed=before==committed.nodes.end();
-            if(!changed)for(int i:t.val)changed|=p.uv[i]!=before->second.uv[i];
+            if(!changed)for(int i:t.val)changed|=p.uv[i]!=before->second.uv[i]||
+                afterPoints[i]!=(*beforePoints)[i];
             if(!changed)continue;
             for(int i:t.val){region.include(p.uv[i]);if(before!=committed.nodes.end())region.include(before->second.uv[i]);}
         }
@@ -642,17 +739,29 @@ FitResult fitIncremental(Graph graph,const FitResult& committed,const std::atomi
             unchanged.localChartVertices=local.count;unchanged.localSurfaceSamples=0;unchanged.localExpansions=attempt;
             return unchanged;
         }
-        local.region=dirty.padded(margin);
-        if(progress)progress("Updating local tifxyz region");
-        auto result=renderSurface(std::move(charts.graph),cancel,true,&local);
-        if(!result.valid||local.expand) {
-            if(progress)progress("Expanding local surface: "+result.message);
-            continue;
+        // Chart and XYZ relaxation have different footprints. Once the chart
+        // boundary settles, a strained XYZ boundary needs a larger surface
+        // region, not another chart solve (or an immediate global fallback on
+        // the last chart attempt). Keep the settled chart while growing XYZ.
+        double surfaceMargin=margin;
+        for(size_t surfaceAttempt=0;surfaceAttempt<4;++surfaceAttempt,surfaceMargin*=2) {
+            detail::cancelled(cancel);
+            local.region=dirty.padded(surfaceMargin);local.expand=false;
+            if(progress)progress("Updating local tifxyz region: attempt "+std::to_string(surfaceAttempt+1));
+            auto result=renderSurface(charts.graph,cancel,true,&local);
+            if(local.expand) {
+                if(progress)progress("Expanding local surface: "+result.message);
+                continue;
+            }
+            if(!result.valid||result.correspondenceRms>a.radius) {
+                if(progress)progress("Expanding local charts after surface validation: "+
+                    (result.valid?std::string("attachment error exceeds proximity tolerance"):result.message));
+                break;
+            }
+            result.localChartVertices=local.count;result.localExpansions=attempt;
+            if(progress)progress("Local fit complete: "+std::to_string(local.count)+" chart vertices, "+std::to_string(result.localSurfaceSamples)+" surface samples");
+            return result;
         }
-        if(result.correspondenceRms>a.radius)continue;
-        result.localChartVertices=local.count;result.localExpansions=attempt;
-        if(progress)progress("Local fit complete: "+std::to_string(local.count)+" chart vertices, "+std::to_string(result.localSurfaceSamples)+" surface samples");
-        return result;
     }
     return global();
 }

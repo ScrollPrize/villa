@@ -34,6 +34,7 @@
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSplitter>
+#include <QSlider>
 #include <QStatusBar>
 #include <QToolBar>
 #include <QKeyEvent>
@@ -94,6 +95,12 @@ ConstraintGraphWorkspace::ConstraintGraphWorkspace(CState* main,QWidget* parent)
     form->addRow(tr("Fiber → graph scale"),_fiberScale);form->addRow(tr("Patch → graph scale"),_patchScale);
     form->addRow(tr("Graph → normal base"),_normalScale);form->addRow(tr("Graph → volume scale"),_volumeScale);
     form->addRow(tr("Grid spacing"),new QLabel(tr("20 vx × 20 vx"),panel));form->addRow(tr("Proximity (vx)"),_radius);form->addRow(tr("Spacing stiffness"),_stiffness);
+    _discoveryStride=new QComboBox(panel);_discoveryStride->setObjectName("constraintGraphDiscoveryStride");
+    for(int stride:{1,4,8})_discoveryStride->addItem(stride==1?tr("1 — every point"):tr("%1 — every %1th point").arg(stride),stride);
+    const int savedStride=QSettings{}.value("constraintGraph/discoveryStride",4).toInt();
+    _discoveryStride->setCurrentIndex(std::max(0,_discoveryStride->findData(savedStride==1||savedStride==8?savedStride:4)));
+    _discoveryStride->setToolTip(tr("Sample dense fiber points for proposals in both directions. Endpoints are always checked. Larger strides can miss short contacts; 1 checks every point."));
+    form->addRow(tr("Discovery stride"),_discoveryStride);
     auto* load=new QPushButton(tr("Load folders / New graph"),panel);load->setObjectName("constraintGraphLoad");form->addRow(load);connect(load,&QPushButton::clicked,this,[this]{try{start(settings());}catch(const std::exception& e){report(QString::fromUtf8(e.what()));}});
     _component=new QComboBox(panel);_component->setObjectName("constraintGraphComponent");form->addRow(tr("Seed component"),_component);connect(_component,qOverload<int>(&QComboBox::activated),this,&ConstraintGraphWorkspace::seed);
     _audit=new QLabel(tr("Fiber cycle check: load source folders to check."),panel);_audit->setObjectName("constraintGraphCycleAudit");_audit->setWordWrap(true);_audit->setTextInteractionFlags(Qt::TextSelectableByMouse);form->addRow(_audit);
@@ -133,11 +140,28 @@ ConstraintGraphWorkspace::ConstraintGraphWorkspace(CState* main,QWidget* parent)
     for(auto* w:std::vector<QWidget*>{_previous,_candidateLabel,_next})candidateRow->addWidget(w);
     for(auto* w:std::vector<QWidget*>{_pair,_commit,_cancelButton})actionRow->addWidget(w);
     barLayout->addWidget(_whole);
+    _compareSources=new QCheckBox(tr("Compare fiber / patch CT"),_bar);
+    _compareSources->setObjectName("constraintGraphCompareSources");barLayout->addWidget(_compareSources);
+    auto* opacityRow=new QHBoxLayout;barLayout->addLayout(opacityRow);
+    opacityRow->addWidget(new QLabel(tr("Patch opacity"),_bar));
+    _patchOpacity=new QSlider(Qt::Horizontal,_bar);_patchOpacity->setObjectName("constraintGraphPatchOpacity");
+    _patchOpacity->setRange(0,100);_patchOpacity->setValue(50);opacityRow->addWidget(_patchOpacity);
+    auto* opacityValue=new QLabel(tr("50%"),_bar);opacityRow->addWidget(opacityValue);
+    _patchOpacity->setToolTip(tr("Blend independent patch CT over fiber CT at the fitted positions. 0% shows fibers; 100% shows patches wherever they have coverage."));
+    connect(_compareSources,&QCheckBox::toggled,this,[this]{updateComparison();});
+    connect(_patchOpacity,&QSlider::valueChanged,this,[this,opacityValue](int value){
+        opacityValue->setText(tr("%1%").arg(value));_view[0]->setSurfaceComparisonOpacity(value/100.0f);
+    });
     _bar->hide();
     connect(_previous,&QPushButton::clicked,this,[this]{selectCandidate(-1);});connect(_next,&QPushButton::clicked,this,[this]{selectCandidate(1);});
     connect(_pair,&QPushButton::clicked,this,&ConstraintGraphWorkspace::beginPair);connect(_commit,&QPushButton::clicked,this,&ConstraintGraphWorkspace::commit);
     connect(_cancelButton,&QPushButton::clicked,this,&ConstraintGraphWorkspace::cancelPreview);
     connect(_whole,&QCheckBox::toggled,this,[this]{if(_candidate>=0)selectCandidate(0);});
+    connect(_discoveryStride,qOverload<int>(&QComboBox::currentIndexChanged),this,[this]{
+        QSettings{}.setValue("constraintGraph/discoveryStride",_discoveryStride->currentData().toInt());
+        if(!_committed.valid)return;
+        cancelPreview();search();
+    });
     connect(_radius,qOverload<double>(&QDoubleSpinBox::valueChanged),this,[this](double v){if(!_committed.valid)return;cancelPreview();_committed.graph.settings.radius=v;_dirty=true;search();});
     connect(_volumeScale,qOverload<double>(&QDoubleSpinBox::valueChanged),this,[this](double v){
         if(!_committed.valid)return;
@@ -271,7 +295,7 @@ void ConstraintGraphWorkspace::search(){
     stopDiscovery();_candidates.clear();_candidate=-1;
     if(!_catalog||!_committed.valid)return;
     _discovering=true;_awaitingProposals=!_selected.empty();auto cancel=std::make_shared<std::atomic_bool>(false);_discoveryCancel=cancel;
-    const auto generation=_discoveryGeneration;auto catalog=_catalog;auto graph=_committed.graph;
+    const auto generation=_discoveryGeneration;auto catalog=_catalog;auto graph=_committed.graph;const int stride=_discoveryStride->currentData().toInt();
     QPointer<ConstraintGraphWorkspace> guard(this);
     overlays();report(tr("Finding proposals… Orange marks show verified attachments."));updateControls();
     auto* watcher=new QFutureWatcher<QString>(this);
@@ -285,7 +309,7 @@ void ConstraintGraphWorkspace::search(){
         }
         updateControls();
     });
-    watcher->setFuture(QtConcurrent::run(&_discoveryPool,[guard,catalog,graph=std::move(graph),cancel,generation]{
+    watcher->setFuture(QtConcurrent::run(&_discoveryPool,[guard,catalog,graph=std::move(graph),cancel,generation,stride]{
         std::vector<cg::Candidate> pending;QElapsedTimer timer;timer.start();
         auto publish=[&]{
             if(pending.empty()||cancel->load())return;
@@ -298,7 +322,7 @@ void ConstraintGraphWorkspace::search(){
             cg::discover(*catalog,graph,{},cancel.get(),{},[&](std::vector<cg::Candidate> batch){
                 pending.insert(pending.end(),std::make_move_iterator(batch.begin()),std::make_move_iterator(batch.end()));
                 if(timer.elapsed()>=500)publish();
-            });publish();return QString{};
+            },stride);publish();return QString{};
         }catch(const std::exception& e){publish();return QString::fromUtf8(e.what());}
     }));
 }
@@ -335,6 +359,7 @@ void ConstraintGraphWorkspace::rebuildPreview(bool fitView){
 }
 void ConstraintGraphWorkspace::fitPreview(cg::Graph draft,cg::Graph committed,std::string selected,bool fitView){
     _placementOnly=true;
+    _fiberView={};_patchView={};updateComparison();
     QPointer<ConstraintGraphWorkspace> guard(this);
     const auto generation=_generation+1;
     auto baseline=_committed;baseline.graph=std::move(committed);
@@ -347,7 +372,12 @@ void ConstraintGraphWorkspace::fitPreview(cg::Graph draft,cg::Graph committed,st
             guard->report(guard->tr("Initial placement · fitting joint graph…"));
             guard->display();guard->_view[1]->resetViewForCurrentContent(true);guard->updateControls();
         },Qt::QueuedConnection);
-        job.fit=cg::fitIncremental(std::move(draft),baseline,cancel,progress);return job;
+        job.fit=cg::fitIncremental(std::move(draft),baseline,cancel,progress);
+        if(job.fit.valid){
+            job.fiberView=cg::renderSourceLayer(job.fit.graph,true,cancel);
+            job.patchView=cg::renderSourceLayer(job.fit.graph,false,cancel);
+        }
+        return job;
     },[this,fitView](Job job){
         if(_activeCandidate){
             if(_previewCache.size()>=3)_previewCache.erase(_previewCache.begin());
@@ -359,6 +389,7 @@ void ConstraintGraphWorkspace::installPreview(Job j){
     _placementOnly=false;_activeCandidate.reset();
     j.fit.graph.settings.volumeScale=_committed.graph.settings.volumeScale;
     j.proposalView.graph.settings.volumeScale=_committed.graph.settings.volumeScale;
+    _fiberView=std::move(j.fiberView);_patchView=std::move(j.patchView);
     _draft=j.fit.graph;_preview=std::move(j.fit);_proposalView=std::move(j.proposalView);
     report(_preview.valid?tr("Preview · correspondence RMS %1 vx · 95% spacing ratio %2").arg(_preview.correspondenceRms,0,'f',3).arg(_preview.stretchP95,0,'f',3):QString::fromStdString(_preview.message));
     display();refreshPairs();updateControls();
@@ -413,7 +444,17 @@ void ConstraintGraphWorkspace::removePair(){
 void ConstraintGraphWorkspace::display(){
     const auto& showing=(!_showCommitted->isChecked()&&_preview.valid)?_preview:_committed;
     _state->setSurface("constraint-graph",displaySurface(showing));_state->setSurface("constraint-proposal",displaySurface(_proposalView));
-    _splitter->widget(1)->setVisible(_proposalView.valid);overlays();
+    _splitter->widget(1)->setVisible(_proposalView.valid);updateComparison();overlays();
+}
+void ConstraintGraphWorkspace::updateComparison(){
+    const bool available=_preview.valid&&!_placementOnly&&!_showCommitted->isChecked()&&_fiberView.valid&&_patchView.valid;
+    _compareSources->setEnabled(available);_patchOpacity->setEnabled(available&&_compareSources->isChecked());
+    if(available&&_compareSources->isChecked()){
+        _fiberView.graph.settings.volumeScale=_committed.graph.settings.volumeScale;
+        _patchView.graph.settings.volumeScale=_committed.graph.settings.volumeScale;
+        _view[0]->setSurfaceComparisonOpacity(_patchOpacity->value()/100.0f);
+        _view[0]->setSurfaceComparison(displaySurface(_fiberView),displaySurface(_patchView));
+    }else _view[0]->setSurfaceComparison({},{});
 }
 void ConstraintGraphWorkspace::initialView(){
     if(!_committed.valid)return;
@@ -500,7 +541,7 @@ void ConstraintGraphWorkspace::positionControlBar(){
     }
 }
 void ConstraintGraphWorkspace::updateControls(){
-    for(auto* control:std::vector<QWidget*>{_radius,_stiffness,_volumeScale,_component})control->setEnabled(!_saving);
+    for(auto* control:std::vector<QWidget*>{_radius,_stiffness,_volumeScale,_component,_discoveryStride})control->setEnabled(!_saving);
     _commit->setEnabled(!_busy&&!_placementOnly&&_draft&&_preview.valid);_pair->setEnabled(!_busy&&(_proposalView.valid||!_selected.empty()));
     _previous->setEnabled(!_candidates.empty());_next->setEnabled(!_candidates.empty());_cancelButton->setEnabled(_draft.has_value()||_busy);
     _whole->setVisible(_candidate>=0&&_candidate<int(_candidates.size())&&_candidates[_candidate].fiber);
