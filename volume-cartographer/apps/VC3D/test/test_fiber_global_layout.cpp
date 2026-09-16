@@ -1086,12 +1086,12 @@ private slots:
         const auto shardsB = second.cachedDetections();
         QCOMPARE(shardsA.size(), shardsB.size());
         QVERIFY(!shardsA.empty());
-        bool sawGroups = false;
+        bool sawDetections = false;
         for (std::size_t i = 0; i < shardsA.size(); ++i) {
-            QVERIFY(vc3d::fiber_map::winding::identicalPairCrossings(*shardsA[i], *shardsB[i]));
-            sawGroups = sawGroups || !shardsA[i]->groups.empty();
+            QVERIFY(vc3d::fiber_map::winding::identicalPairDetections(*shardsA[i], *shardsB[i]));
+            sawDetections = sawDetections || !shardsA[i]->raw.empty();
         }
-        QVERIFY(sawGroups);
+        QVERIFY(sawDetections);
         // Nudge the folded V fiber and rebuild INTO the first cache: exactly
         // the shards it takes part in (one per H fiber) recompute, and every
         // shard the warmed cache then holds - recomputed or reused - is the
@@ -1113,13 +1113,13 @@ private slots:
         const auto shardsC = third.cachedDetections();
         QCOMPARE(shardsWarm.size(), shardsC.size());
         for (std::size_t i = 0; i < shardsC.size(); ++i) {
-            QVERIFY(vc3d::fiber_map::winding::identicalPairCrossings(*shardsWarm[i], *shardsC[i]));
+            QVERIFY(vc3d::fiber_map::winding::identicalPairDetections(*shardsWarm[i], *shardsC[i]));
         }
         // And the move did change some shard against the original build
         // (recomputation need not change every affected shard's output).
         int differing = 0;
         for (std::size_t i = 0; i < shardsB.size(); ++i) {
-            if (!vc3d::fiber_map::winding::identicalPairCrossings(*shardsB[i], *shardsC[i])) {
+            if (!vc3d::fiber_map::winding::identicalPairDetections(*shardsB[i], *shardsC[i])) {
                 ++differing;
             }
         }

@@ -416,7 +416,7 @@ public:
     [[nodiscard]] const Stats& lastStats() const { return _stats; }
     // The cached detection shards in (H file, V file) order, for tests of the
     // contract that a cached shard is the fresh one bit for bit.
-    [[nodiscard]] std::vector<const winding::PairCrossings*> cachedDetections() const;
+    [[nodiscard]] std::vector<const winding::PairDetections*> cachedDetections() const;
 
 private:
     friend GlobalResult buildGlobalLayout(const std::vector<InputFiber>&,
@@ -431,7 +431,7 @@ private:
     };
     struct PairSlot {
         ContentDigest key;
-        winding::PairCrossings detection;
+        winding::PairDetections detection;
     };
     std::map<std::string, PrepSlot> _prep;
     std::map<std::pair<std::string, std::string>, PairSlot> _pairs;

@@ -392,6 +392,31 @@ struct CanonicalTrace {
 // One (H, V) pair's merged crossings (hFiber/vFiber left unset - the pair is
 // implicit) plus the pair's gate tallies. Deterministic pure function of the
 // two canonical traces and the detection parameters.
+// The geometry half of a pair's detection, and what the layout's per-pair
+// cache stores: every raw detection with its provenance, plus the gate
+// tallies and the translates on which an event may have gone unseen. A pure
+// function of the two canonical traces and the detection parameters - no
+// annotation (link, tag) enters, so an annotation edit never invalidates a
+// shard. classifyPairCrossings turns it into the constraints, events and
+// groups the solve consumes.
+struct PairDetections {
+    std::vector<Crossing> raw;
+    std::vector<Crossing> shallow;
+    std::size_t detectionCount = 0;
+    // Sorted, unique.
+    std::vector<long long> gapTranslates;
+    std::vector<long long> unresolvedTranslates;
+    int gatedSegmentCount = 0;
+    int tangentialCount = 0;
+    int unresolvedCount = 0;
+};
+[[nodiscard]] PairDetections detectPairCrossings(const CanonicalTrace& h,
+                                                 const CanonicalTrace& v,
+                                                 const SolverParams& params);
+// Field-by-field, bit-exact equality of two detection shards: the test of
+// the cache's contract that a cached shard IS the fresh one.
+[[nodiscard]] bool identicalPairDetections(const PairDetections& a, const PairDetections& b);
+
 struct PairCrossings {
     // Representatives: the proximity-merged crossings the legacy constraint
     // path is built from, exactly as before.
@@ -411,12 +436,17 @@ struct PairCrossings {
     // touched (recorded on the groups).
     int unresolvedCount = 0;
 };
-[[nodiscard]] PairCrossings detectPairCrossings(const CanonicalTrace& h,
-                                                const CanonicalTrace& v,
-                                                const SolverParams& params);
+// The classification half, run at solve time (never cached): the proximity
+// merge into representatives, the resolved events, the traversal groups -
+// and the readings that depend on annotation, which the traces carry as
+// flags (a V fiber on a kollesis, an H fiber ending at one). Deterministic in
+// its inputs, so fresh and cached builds classify identically.
+[[nodiscard]] PairCrossings classifyPairCrossings(const PairDetections& detections,
+                                                  const CanonicalTrace& h,
+                                                  const CanonicalTrace& v,
+                                                  const SolverParams& params);
 
-// Field-by-field, bit-exact equality of two detection shards: the test of
-// the cache's contract that a cached shard IS the fresh one.
+// Field-by-field, bit-exact equality of two classified shards.
 [[nodiscard]] bool identicalPairCrossings(const PairCrossings& a, const PairCrossings& b);
 
 // A detection shard bound to the current build's fiber indices.

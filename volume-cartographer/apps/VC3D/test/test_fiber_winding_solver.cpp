@@ -1367,7 +1367,9 @@ private slots:
                 if (canonical[vIndex].hvTag != 'V') {
                     continue;
                 }
-                shards.push_back(vc3d::fiber_map::winding::detectPairCrossings(
+                shards.push_back(vc3d::fiber_map::winding::classifyPairCrossings(
+                    vc3d::fiber_map::winding::detectPairCrossings(canonical[hIndex],
+                                                                  canonical[vIndex], params),
                     canonical[hIndex], canonical[vIndex], params));
                 ordered.push_back({hIndex, vIndex, nullptr});
             }

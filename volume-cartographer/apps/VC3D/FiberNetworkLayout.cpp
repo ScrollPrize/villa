@@ -740,9 +740,9 @@ ContentDigest combineDigests(uint64_t seed,
 
 } // namespace
 
-std::vector<const winding::PairCrossings*> GlobalLayoutCache::cachedDetections() const
+std::vector<const winding::PairDetections*> GlobalLayoutCache::cachedDetections() const
 {
-    std::vector<const winding::PairCrossings*> shards;
+    std::vector<const winding::PairDetections*> shards;
     shards.reserve(_pairs.size());
     for (const auto& entry : _pairs) {
         shards.push_back(&entry.second.detection);
@@ -1264,7 +1264,12 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(chirality)));
         return digest;
     }();
-    std::deque<winding::PairCrossings> freshShards;
+    // Geometry per pair (cached or fresh), then its classification: the
+    // merge, the events, the groups and every reading that depends on
+    // annotation, computed for every build from the canonical traces' flags,
+    // so a link or tag edit never invalidates a shard.
+    std::deque<winding::PairDetections> freshShards;
+    std::deque<winding::PairCrossings> classified;
     std::vector<winding::PairDetection> detections;
     for (std::size_t h = 0; h < fiberCount; ++h) {
         if (canonical[h].hvTag != 'H' || canonical[h].psi.empty()) {
@@ -1274,26 +1279,29 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
             if (canonical[v].hvTag != 'V' || canonical[v].psi.empty()) {
                 continue;
             }
+            const winding::PairDetections* geometry = nullptr;
             if (cache == nullptr) {
                 freshShards.push_back(winding::detectPairCrossings(
                     canonical[h], canonical[v], solverParams));
-                detections.push_back(
-                    winding::PairDetection{h, v, &freshShards.back()});
-                continue;
-            }
-            const ContentDigest pairKey = combineDigests(
-                0x9A18, {prepKeys[h], prepKeys[v], chiralityDigest, detectParams});
-            GlobalLayoutCache::PairSlot& slot = cache->_pairs[std::make_pair(
-                ordered[h]->fileName, ordered[v]->fileName)];
-            if (slot.key == pairKey) {
-                ++cache->_stats.pairsReused;
+                geometry = &freshShards.back();
             } else {
-                slot.detection = winding::detectPairCrossings(
-                    canonical[h], canonical[v], solverParams);
-                slot.key = pairKey;
-                ++cache->_stats.pairsRecomputed;
+                const ContentDigest pairKey = combineDigests(
+                    0x9A18, {prepKeys[h], prepKeys[v], chiralityDigest, detectParams});
+                GlobalLayoutCache::PairSlot& slot = cache->_pairs[std::make_pair(
+                    ordered[h]->fileName, ordered[v]->fileName)];
+                if (slot.key == pairKey) {
+                    ++cache->_stats.pairsReused;
+                } else {
+                    slot.detection = winding::detectPairCrossings(
+                        canonical[h], canonical[v], solverParams);
+                    slot.key = pairKey;
+                    ++cache->_stats.pairsRecomputed;
+                }
+                geometry = &slot.detection;
             }
-            detections.push_back(winding::PairDetection{h, v, &slot.detection});
+            classified.push_back(winding::classifyPairCrossings(
+                *geometry, canonical[h], canonical[v], solverParams));
+            detections.push_back(winding::PairDetection{h, v, &classified.back()});
         }
     }
     const double detectLoopMs = std::chrono::duration<double, std::milli>(

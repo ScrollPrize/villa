@@ -316,19 +316,20 @@ CanonicalTrace canonicalizeTrace(const FiberTrace& fiber, int chirality)
 // The detection loop for one (H, V) pair, over the V trace's precomputed
 // z-monotone branches. Everything here is pair-local: the produced crossings
 // carry no indices, no global ids, and no dependence on any other pair.
-PairCrossings detectPairCrossings(const CanonicalTrace& hTrace,
-                                  const CanonicalTrace& vTrace,
-                                  const SolverParams& params)
+PairDetections detectPairCrossings(const CanonicalTrace& hTrace,
+                                   const CanonicalTrace& vTrace,
+                                   const SolverParams& params)
 {
-    PairCrossings result;
+    PairDetections result;
     if (hTrace.psi.empty() || vTrace.psi.empty()) {
         return result;
     }
     const bool trusted = hTrace.trusted && vTrace.trusted;
-    // Transversal events, merged below into representatives as before, and
-    // shallow (tangential) events, which are recorded and counted but never
-    // merged into a representative or constraining on their own - exactly
-    // the passes the transversality gate used to discard unrecorded.
+    // Transversal events, merged by the classification into representatives
+    // as before, and shallow (tangential) events, which are recorded and
+    // counted but never merged into a representative or constraining on
+    // their own - exactly the passes the transversality gate used to discard
+    // unrecorded.
     std::vector<Crossing> raw;
     std::vector<Crossing> shallow;
     std::size_t detectionCount = 0;
@@ -649,6 +650,73 @@ PairCrossings detectPairCrossings(const CanonicalTrace& hTrace,
             }
         }
     }
+
+    result.raw = std::move(raw);
+    result.shallow = std::move(shallow);
+    result.detectionCount = detectionCount;
+    result.gapTranslates.assign(gapTranslates.begin(), gapTranslates.end());
+    result.unresolvedTranslates.assign(unresolvedTranslates.begin(),
+                                       unresolvedTranslates.end());
+    return result;
+}
+
+bool identicalPairDetections(const PairDetections& a, const PairDetections& b)
+{
+    const auto sameDouble = [](double x, double y) {
+        return std::memcmp(&x, &y, sizeof(double)) == 0;
+    };
+    const auto sameCrossing = [&](const Crossing& x, const Crossing& y) {
+        return sameDouble(x.zVx, y.zVx) && sameDouble(x.psiH, y.psiH) && x.n == y.n &&
+               sameDouble(x.deltaR, y.deltaR) && sameDouble(x.confidence, y.confidence) &&
+               x.mergedCount == y.mergedCount && x.kind == y.kind &&
+               sameDouble(x.transversality, y.transversality) && x.tangential == y.tangential &&
+               x.orientation == y.orientation && x.hSegment == y.hSegment &&
+               sameDouble(x.hT, y.hT) && x.vSample == y.vSample && x.touch == y.touch &&
+               x.vBranch == y.vBranch && x.detection == y.detection;
+    };
+    if (a.raw.size() != b.raw.size() || a.shallow.size() != b.shallow.size() ||
+        a.detectionCount != b.detectionCount || a.gapTranslates != b.gapTranslates ||
+        a.unresolvedTranslates != b.unresolvedTranslates ||
+        a.gatedSegmentCount != b.gatedSegmentCount || a.tangentialCount != b.tangentialCount ||
+        a.unresolvedCount != b.unresolvedCount) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.raw.size(); ++i) {
+        if (!sameCrossing(a.raw[i], b.raw[i])) {
+            return false;
+        }
+    }
+    for (std::size_t i = 0; i < a.shallow.size(); ++i) {
+        if (!sameCrossing(a.shallow[i], b.shallow[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+PairCrossings classifyPairCrossings(const PairDetections& detections,
+                                    const CanonicalTrace& hTrace,
+                                    const CanonicalTrace& vTrace,
+                                    const SolverParams& params)
+{
+    PairCrossings result;
+    result.gatedSegmentCount = detections.gatedSegmentCount;
+    result.tangentialCount = detections.tangentialCount;
+    result.unresolvedCount = detections.unresolvedCount;
+    if (hTrace.psi.empty() || vTrace.psi.empty()) {
+        return result;
+    }
+    const bool trusted = hTrace.trusted && vTrace.trusted;
+    const std::vector<double>& hPsi = hTrace.psi;
+    const std::vector<double>& hZ = hTrace.z;
+    std::vector<Crossing> raw = detections.raw;
+    std::vector<Crossing> shallow = detections.shallow;
+    const std::size_t detectionCount = detections.detectionCount;
+    const std::set<long long> gapTranslates(detections.gapTranslates.begin(),
+                                            detections.gapTranslates.end());
+    const std::set<long long> unresolvedTranslates(detections.unresolvedTranslates.begin(),
+                                                   detections.unresolvedTranslates.end());
+    (void)trusted;
 
     // Pair-local sort and merge of the transversal detections into the
     // representatives the legacy constraint path is built from, unchanged:
@@ -1106,8 +1174,9 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             if (canonical[v].hvTag != 'V' || canonical[v].psi.empty()) {
                 continue;
             }
-            shards.push_back(
-                detectPairCrossings(canonical[h], canonical[v], params));
+            shards.push_back(classifyPairCrossings(
+                detectPairCrossings(canonical[h], canonical[v], params), canonical[h],
+                canonical[v], params));
             detections.push_back(PairDetection{h, v, &shards.back()});
         }
     }
