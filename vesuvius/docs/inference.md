@@ -34,6 +34,7 @@ vesuvius.predict \
 | `--tta_type` / `--disable_tta` | Choose `rotation` (default) or `mirroring`, or disable test-time augmentation.
 | `--num_parts` / `--part_id` | Partition inference so multiple machines can process different chunks.
 | `--bbox` | Restrict inference to a region of interest: `"z0:z1,y0:y1,x0:x1"` in global voxel coordinates, half-open. Omit a bound to reach the volume edge (`"1000:1400,:,2000:"`). See [Region-of-interest inference](#region-of-interest-inference).
+| `--chunk_cache_mb` | Keep up to this many MB of fetched input chunks in an in-memory LRU cache (zarr 3), so overlapping patches do not download the same chunks again. Each DataLoader worker keeps its own cache. Default `0` (off).
 | `--overlap` | Fractional patch overlap (0–1, default `0.5`).
 | `--batch_size` | Inference batch size (default `1`).
 | `--patch_size` | Override the model patch size using a comma-separated list (e.g. `192,192,192`).
