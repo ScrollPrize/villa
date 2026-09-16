@@ -341,6 +341,7 @@ PairDetections detectPairCrossings(const CanonicalTrace& hTrace,
     // parallel owner segments the intersection cannot be placed on.
     std::set<long long> gapTranslates;
     std::set<long long> unresolvedTranslates;
+    std::set<std::size_t> uncoveredSegments;
     // Which side of the directed segment a->b the point p lies on, in
     // (psi, z): +1, -1, or 0 on the line.
     const auto sideOf = [](double ax, double az, double bx, double bz, double px, double pz) {
@@ -408,6 +409,7 @@ PairDetections detectPairCrossings(const CanonicalTrace& hTrace,
             if (std::min(hR[i], hR[i + 1]) < params.minUmbilicusRadiusVx ||
                 std::abs(hPsi[i + 1] - hPsi[i]) > maxStep) {
                 ++result.gatedSegmentCount;
+                uncoveredSegments.insert(i);
                 for (long long m = mLo; m <= mHi; ++m) {
                     const double lo = segPsiLo + kTwoPi * static_cast<double>(m);
                     const double hi = segPsiHi + kTwoPi * static_cast<double>(m);
@@ -455,6 +457,7 @@ PairDetections detectPairCrossings(const CanonicalTrace& hTrace,
                         ++result.gatedSegmentCount;
                         if (psiOverlap) {
                             gapTranslates.insert(m);
+                            uncoveredSegments.insert(i);
                         }
                         continue;
                     }
@@ -478,6 +481,7 @@ PairDetections detectPairCrossings(const CanonicalTrace& hTrace,
                         const bool collinear = rx * qpz - rz * qpx == 0.0;
                         if (collinear && overlapProper) {
                             unresolvedTranslates.insert(m);
+                            uncoveredSegments.insert(i);
                             ++result.unresolvedCount;
                         }
                         continue;
@@ -658,6 +662,7 @@ PairDetections detectPairCrossings(const CanonicalTrace& hTrace,
     result.shallow = std::move(shallow);
     result.detectionCount = detectionCount;
     result.gapTranslates.assign(gapTranslates.begin(), gapTranslates.end());
+    result.uncoveredSegments.assign(uncoveredSegments.begin(), uncoveredSegments.end());
     result.unresolvedTranslates.assign(unresolvedTranslates.begin(),
                                        unresolvedTranslates.end());
     return result;
@@ -680,6 +685,7 @@ bool identicalPairDetections(const PairDetections& a, const PairDetections& b)
     if (a.raw.size() != b.raw.size() || a.shallow.size() != b.shallow.size() ||
         a.detectionCount != b.detectionCount || a.gapTranslates != b.gapTranslates ||
         a.unresolvedTranslates != b.unresolvedTranslates ||
+        a.uncoveredSegments != b.uncoveredSegments ||
         a.gatedSegmentCount != b.gatedSegmentCount || a.tangentialCount != b.tangentialCount ||
         a.unresolvedCount != b.unresolvedCount) {
         return false;
@@ -755,6 +761,7 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
                                     const CanonicalTrace& hTrace,
                                     const CanonicalTrace& vTrace,
                                     const std::vector<SeamAnchor>& seams,
+                                    const std::vector<std::size_t>& inferredSeams,
                                     const SolverParams& params)
 {
     PairCrossings result;
@@ -859,6 +866,49 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
     // keeps that crossing's radial reading).
     constexpr double kSeamResidualTieTurns = 0.05;
     constexpr double kSeamAlongTieSamples = 0.5;
+    // Read one encounter as the seam, from its seed detection: the seed's own
+    // cluster when the seed is transversal (a cluster is one encounter by
+    // construction), and every detection, transversal or shallow, within
+    // the merge's own nearness of the seed - the same encounter.
+    const auto readEncounter = [&](const Crossing& seed, bool inferred) {
+        const auto partOfEncounter = [&](const Crossing& detection) {
+            return detection.n == seed.n && detection.vBranch == seed.vBranch &&
+                   std::abs(detection.zVx - seed.zVx) <= params.zMergeVx &&
+                   std::abs(detection.deltaR - seed.deltaR) <= params.tieBandVx;
+        };
+        const auto readAsSeam = [&](Crossing& detection) {
+            detection.kollesis = true;
+            detection.kollesisInferred = detection.kollesisInferred || inferred;
+            detection.kind = CrossingKind::Inside;
+            if (!detection.tangential) {
+                detection.confidence = 0.9 * detection.transversality;
+                if (!trusted) {
+                    detection.confidence *= params.untrustedConfidenceFactor;
+                }
+            }
+        };
+        for (const std::vector<std::size_t>& cluster : clusterRawIndices) {
+            const bool seeded = std::any_of(
+                cluster.begin(), cluster.end(),
+                [&](std::size_t rawIndex) { return &raw[rawIndex] == &seed; });
+            if (!seeded) {
+                continue;
+            }
+            for (const std::size_t rawIndex : cluster) {
+                readAsSeam(raw[rawIndex]);
+            }
+        }
+        for (Crossing& detection : raw) {
+            if (partOfEncounter(detection)) {
+                readAsSeam(detection);
+            }
+        }
+        for (Crossing& detection : shallow) {
+            if (partOfEncounter(detection)) {
+                readAsSeam(detection);
+            }
+        }
+    };
     const auto readSeam = [&](const SeamAnchor& anchor) {
         if (anchor.hSample >= hPsi.size() || anchor.hLinkSample >= hPsi.size() ||
             anchor.vSample >= vTrace.psi.size()) {
@@ -1014,52 +1064,20 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
         if (chosen == nullptr) {
             return;
         }
-        const long long seamTranslate = chosen->n;
-        const std::size_t seamBranch = chosen->branch;
-        const Crossing& seed = *chosen->nearest;
-        // Within the merge's own nearness of the seed: the same encounter.
-        const auto partOfEncounter = [&](const Crossing& detection) {
-            return detection.n == seamTranslate && detection.vBranch == seamBranch &&
-                   std::abs(detection.zVx - seed.zVx) <= params.zMergeVx &&
-                   std::abs(detection.deltaR - seed.deltaR) <= params.tieBandVx;
-        };
-        const auto readAsSeam = [&](Crossing& detection) {
-            detection.kollesis = true;
-            detection.kind = CrossingKind::Inside;
-            if (!detection.tangential) {
-                detection.confidence = 0.9 * detection.transversality;
-                if (!trusted) {
-                    detection.confidence *= params.untrustedConfidenceFactor;
-                }
-            }
-        };
-        // The encounter: the seed's own cluster when the seed is transversal
-        // (a cluster is one encounter by construction), and every detection,
-        // transversal or shallow, within the merge's nearness of the seed.
-        for (const std::vector<std::size_t>& cluster : clusterRawIndices) {
-            const bool seeded = std::any_of(
-                cluster.begin(), cluster.end(),
-                [&](std::size_t rawIndex) { return &raw[rawIndex] == &seed; });
-            if (!seeded) {
-                continue;
-            }
-            for (const std::size_t rawIndex : cluster) {
-                readAsSeam(raw[rawIndex]);
-            }
-        }
-        for (Crossing& detection : raw) {
-            if (partOfEncounter(detection)) {
-                readAsSeam(detection);
-            }
-        }
-        for (Crossing& detection : shallow) {
-            if (partOfEncounter(detection)) {
-                readAsSeam(detection);
-            }
-        }
+        readEncounter(*chosen->nearest, false);
     };
     for (const SeamAnchor& anchor : seams) {
         readSeam(anchor);
+    }
+    // Seam encounters the solve itself found (see classifyPairCrossings).
+    for (const std::size_t id : inferredSeams) {
+        for (const std::vector<Crossing>* list : {&raw, &shallow}) {
+            for (const Crossing& detection : *list) {
+                if (detection.detection == id) {
+                    readEncounter(detection, true);
+                }
+            }
+        }
     }
 
     for (const std::vector<std::size_t>& cluster : clusterRawIndices) {
@@ -1180,6 +1198,66 @@ PairCrossings classifyPairCrossings(const PairDetections& detections,
         }
         for (std::size_t i = 0; i < all.size(); ++i) {
             eventOfDetection[all[i].detection] = eventOfRecord[keptRecord[i]];
+        }
+    }
+
+    // Terminal events (see Crossing::terminal): toward one of the H fiber's
+    // ends, no further detection of this pair along the H fiber, less than
+    // a turn of angle to that end, every sample on the way within the
+    // event's V branch's height range, and no segment on the way on which a
+    // detection may have gone unseen (gated, or an unresolved overlap).
+    {
+        const std::vector<std::size_t>& uncovered = detections.uncoveredSegments;
+        // Any uncovered segment with index in [from, to]?
+        const auto uncoveredWithin = [&](std::size_t from, std::size_t to) {
+            if (from > to) {
+                return false;
+            }
+            const auto it = std::lower_bound(uncovered.begin(), uncovered.end(), from);
+            return it != uncovered.end() && *it <= to;
+        };
+        std::vector<double> alongAll;
+        alongAll.reserve(raw.size() + shallow.size());
+        for (const std::vector<Crossing>* list : {&raw, &shallow}) {
+            for (const Crossing& detection : *list) {
+                alongAll.push_back(static_cast<double>(detection.hSegment) + detection.hT);
+            }
+        }
+        std::sort(alongAll.begin(), alongAll.end());
+        const std::size_t last = hPsi.size() - 1;
+        for (Crossing& event : events) {
+            const double along = static_cast<double>(event.hSegment) + event.hT;
+            const Branch& branch = vTrace.branches[event.vBranch];
+            const double zLo = branch.z.front();
+            const double zHi = branch.z.back();
+            const auto within = [&](std::size_t from, std::size_t to) {
+                for (std::size_t k = from; k <= to; ++k) {
+                    if (hZ[k] < zLo || hZ[k] > zHi) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            const bool laterExists =
+                std::upper_bound(alongAll.begin(), alongAll.end(), along + 1e-9) != alongAll.end();
+            const bool earlierExists =
+                std::lower_bound(alongAll.begin(), alongAll.end(), along - 1e-9) != alongAll.begin();
+            // The crossing's own segment counts both ways: the part of it
+            // beyond the crossing may hold a gated encounter too.
+            const bool forward = !laterExists &&
+                                 std::abs(hPsi[last] - event.psiH) < kTwoPi &&
+                                 (event.hSegment + 1 > last || within(event.hSegment + 1, last)) &&
+                                 (last == 0 || !uncoveredWithin(event.hSegment, last - 1));
+            const bool backward = !earlierExists &&
+                                  std::abs(event.psiH - hPsi[0]) < kTwoPi &&
+                                  within(0, event.hSegment) &&
+                                  !uncoveredWithin(0, event.hSegment);
+            event.terminal = forward || backward;
+            const auto sideBit = [&](double psiEnd) {
+                return psiEnd > event.psiH ? 1 : (psiEnd < event.psiH ? 2 : 0);
+            };
+            event.terminalSides = (forward ? sideBit(hPsi[last]) : 0) |
+                                  (backward ? sideBit(hPsi[0]) : 0);
         }
     }
 
@@ -1415,6 +1493,8 @@ bool identicalPairCrossings(const PairCrossings& a, const PairCrossings& b)
                sameDouble(x.hT, y.hT) && x.vSample == y.vSample && x.touch == y.touch &&
                x.vBranch == y.vBranch && x.detection == y.detection &&
                x.representative == y.representative && x.kollesis == y.kollesis &&
+               x.kollesisInferred == y.kollesisInferred && x.terminal == y.terminal &&
+               x.terminalSides == y.terminalSides &&
                x.coveredByGroups == y.coveredByGroups && x.groupIndex == y.groupIndex;
     };
     const auto sameGroup = [&](const CrossingGroup& x, const CrossingGroup& y) {
@@ -1477,7 +1557,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             }
             shards.push_back(classifyPairCrossings(
                 detectPairCrossings(canonical[h], canonical[v], params), canonical[h],
-                canonical[v], seamAnchors(canonical, h, v, links), params));
+                canonical[v], seamAnchors(canonical, h, v, links), {}, params));
             detections.push_back(PairDetection{h, v, &shards.back()});
         }
     }
@@ -1590,6 +1670,9 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             }
             if (event.kollesis) {
                 ++result.kollesisCrossingCount;
+            }
+            if (event.kollesisInferred) {
+                ++result.kollesisInferredCount;
             }
             events.push_back(event);
         }

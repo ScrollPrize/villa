@@ -32,6 +32,13 @@ using vc3d::fiber_map::winding::LinkInput;
 using vc3d::fiber_map::winding::SolveResult;
 using vc3d::fiber_map::winding::SolverParams;
 using vc3d::fiber_map::winding::solveWindings;
+using vc3d::fiber_map::winding::CanonicalTrace;
+using vc3d::fiber_map::winding::PairCrossings;
+using vc3d::fiber_map::winding::PairDetections;
+using vc3d::fiber_map::winding::canonicalizeTrace;
+using vc3d::fiber_map::winding::classifyPairCrossings;
+using vc3d::fiber_map::winding::detectPairCrossings;
+using vc3d::fiber_map::winding::inferChirality;
 
 namespace
 {
@@ -1387,7 +1394,7 @@ private slots:
                 shards.push_back(vc3d::fiber_map::winding::classifyPairCrossings(
                     vc3d::fiber_map::winding::detectPairCrossings(canonical[hIndex],
                                                                   canonical[vIndex], params),
-                    canonical[hIndex], canonical[vIndex], {}, params));
+                    canonical[hIndex], canonical[vIndex], {}, {}, params));
                 ordered.push_back({hIndex, vIndex, nullptr});
             }
         }
@@ -2034,6 +2041,156 @@ private slots:
         QVERIFY(result.events.front().deltaR > 1000.0);
         QCOMPARE(result.events.front().kind, CrossingKind::Outside);
         QCOMPARE(result.kollesisCrossingCount, 0);
+    }
+
+    // Terminal events and the inferred seam reading, at the classification
+    // level. An H ending 0.02 turn past the V: its one crossing is terminal,
+    // reads Outside, and read as an inferred seam becomes Inside, flagged
+    // kollesis and kollesisInferred. An H running on for 2.2 turns: its
+    // middle crossing is not terminal (the V is met again a turn later, and
+    // was met a turn earlier), its first is toward the H's start and its
+    // last toward its end (0.2 turn past, within the V's height).
+    void inferredSeamReadsTheTerminalEncounter()
+    {
+        const SolverParams params;
+        {
+            World world;
+            const std::size_t h = addH(world, 0.05, kSeamWinding + kSeamOvershoot, kSeamHeight);
+            const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+            const int chirality = inferChirality(world.fibers, params.chiralityOverride);
+            const CanonicalTrace ch = canonicalizeTrace(world.fibers[h], chirality);
+            const CanonicalTrace cv = canonicalizeTrace(world.fibers[v], chirality);
+            const PairDetections geometry = detectPairCrossings(ch, cv, params);
+            QCOMPARE(geometry.raw.size(), std::size_t{1});
+            const PairCrossings plain = classifyPairCrossings(geometry, ch, cv, {}, {}, params);
+            QCOMPARE(plain.events.size(), std::size_t{1});
+            QVERIFY(plain.events.front().terminal);
+            // Ends both ways within a turn: 0.5 turn to the start, 0.02 to
+            // the end.
+            QCOMPARE(plain.events.front().terminalSides, 3);
+            QCOMPARE(plain.events.front().kind, CrossingKind::Outside);
+            QVERIFY(!plain.events.front().kollesis);
+            const PairCrossings inferred = classifyPairCrossings(
+                geometry, ch, cv, {}, {geometry.raw.front().detection}, params);
+            QCOMPARE(inferred.events.size(), std::size_t{1});
+            QCOMPARE(inferred.events.front().kind, CrossingKind::Inside);
+            QVERIFY(inferred.events.front().kollesis);
+            QVERIFY(inferred.events.front().kollesisInferred);
+            QCOMPARE(inferred.crossings.front().kind, CrossingKind::Inside);
+            QVERIFY(inferred.crossings.front().kollesisInferred);
+            QVERIFY(inferred.groups.empty());
+        }
+        {
+            World world;
+            const std::size_t h = addH(world, 0.05, kSeamWinding + 2.2, kSeamHeight);
+            const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+            const int chirality = inferChirality(world.fibers, params.chiralityOverride);
+            const CanonicalTrace ch = canonicalizeTrace(world.fibers[h], chirality);
+            const CanonicalTrace cv = canonicalizeTrace(world.fibers[v], chirality);
+            const PairCrossings plain = classifyPairCrossings(
+                detectPairCrossings(ch, cv, params), ch, cv, {}, {}, params);
+            QCOMPARE(plain.events.size(), std::size_t{3});
+            std::vector<const Crossing*> byAlong;
+            for (const Crossing& event : plain.events) {
+                byAlong.push_back(&event);
+            }
+            std::sort(byAlong.begin(), byAlong.end(), [](const Crossing* a, const Crossing* b) {
+                return a->hSegment < b->hSegment;
+            });
+            QVERIFY(byAlong[0]->terminal);
+            QVERIFY(!byAlong[1]->terminal);
+            QCOMPARE(byAlong[1]->terminalSides, 0);
+            QVERIFY(byAlong[2]->terminal);
+            // The first ends toward the start, the last toward the end: on
+            // opposite sides of their crossings.
+            QVERIFY(byAlong[0]->terminalSides != 0 && byAlong[2]->terminalSides != 0);
+            QCOMPARE(byAlong[0]->terminalSides & byAlong[2]->terminalSides, 0);
+        }
+        // An H that leaves the V's height range on its way to its end is
+        // not terminal toward that end (a further crossing could have gone
+        // unseen), only toward its start.
+        {
+            World world;
+            const std::size_t h = addH(world, 0.05, kSeamWinding + kSeamOvershoot, kSeamHeight);
+            const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+            FiberTrace& hFiber = world.fibers[h];
+            hFiber.theta.push_back(hFiber.theta.back() + kTwoPi * 0.1);
+            hFiber.z.push_back(31500.0);
+            hFiber.radius.push_back(hFiber.radius.back());
+            const int chirality = inferChirality(world.fibers, params.chiralityOverride);
+            const CanonicalTrace ch = canonicalizeTrace(world.fibers[h], chirality);
+            const CanonicalTrace cv = canonicalizeTrace(world.fibers[v], chirality);
+            const PairCrossings plain = classifyPairCrossings(
+                detectPairCrossings(ch, cv, params), ch, cv, {}, {}, params);
+            QCOMPARE(plain.events.size(), std::size_t{1});
+            const Crossing& event = plain.events.front();
+            const int endBit = ch.psi.back() > event.psiH ? 1 : 2;
+            QVERIFY(event.terminal);
+            QCOMPARE(event.terminalSides & endBit, 0);
+            QVERIFY(event.terminalSides != 0);
+        }
+        // A gated segment on the way to the end (a 0.4-turn jump between
+        // samples, over the step gate) could hide a further crossing: not
+        // terminal toward that end either, though the end is within a turn
+        // and at the V's height.
+        {
+            World world;
+            const std::size_t h = addH(world, 0.05, kSeamWinding + kSeamOvershoot, kSeamHeight);
+            const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+            FiberTrace& hFiber = world.fibers[h];
+            hFiber.theta.push_back(hFiber.theta.back() + kTwoPi * 0.4);
+            hFiber.z.push_back(kSeamHeight);
+            hFiber.radius.push_back(hFiber.radius.back());
+            const int chirality = inferChirality(world.fibers, params.chiralityOverride);
+            const CanonicalTrace ch = canonicalizeTrace(world.fibers[h], chirality);
+            const CanonicalTrace cv = canonicalizeTrace(world.fibers[v], chirality);
+            const PairDetections geometry = detectPairCrossings(ch, cv, params);
+            QCOMPARE(geometry.uncoveredSegments.size(), std::size_t{1});
+            QCOMPARE(geometry.uncoveredSegments.front(), ch.psi.size() - 2);
+            const PairCrossings plain = classifyPairCrossings(geometry, ch, cv, {}, {}, params);
+            QCOMPARE(plain.events.size(), std::size_t{1});
+            const Crossing& event = plain.events.front();
+            const int endBit = ch.psi.back() > event.psiH ? 1 : 2;
+            QCOMPARE(event.terminalSides & endBit, 0);
+            QVERIFY(event.terminalSides != 0);
+        }
+        // A gated encounter on the crossing's OWN segment, just past the
+        // crossing: a V folded in height whose returning limb sits under
+        // the radius gate, 0.002 turn past the limb the H crosses. Both
+        // limbs fall within the crossing's own H segment (the H runs on a
+        // few more); the event is terminal neither way.
+        {
+            World world;
+            const std::size_t h = addH(world, 0.05, kSeamWinding + kSeamOvershoot, kSeamHeight);
+            FiberTrace vFiber;
+            vFiber.hvTag = 'V';
+            const double gatedW = kSeamWinding + 0.002;
+            for (double z = 29000.0; z <= 31000.0 + 1e-9; z += 25.0) {
+                vFiber.theta.push_back(kTwoPi * kSeamWinding);
+                vFiber.z.push_back(z);
+                vFiber.radius.push_back(sheetR(kSeamWinding, z) - 200.0);
+            }
+            for (double z = 31000.0; z >= 29000.0 - 1e-9; z -= 25.0) {
+                vFiber.theta.push_back(kTwoPi * gatedW);
+                vFiber.z.push_back(z);
+                vFiber.radius.push_back(0.5 * params.minUmbilicusRadiusVx);
+            }
+            world.fibers.push_back(std::move(vFiber));
+            world.trueM.push_back(0);
+            const std::size_t v = world.fibers.size() - 1;
+            const int chirality = inferChirality(world.fibers, params.chiralityOverride);
+            const CanonicalTrace ch = canonicalizeTrace(world.fibers[h], chirality);
+            const CanonicalTrace cv = canonicalizeTrace(world.fibers[v], chirality);
+            const PairDetections geometry = detectPairCrossings(ch, cv, params);
+            QCOMPARE(geometry.raw.size(), std::size_t{1});
+            QVERIFY(!geometry.uncoveredSegments.empty());
+            const PairCrossings plain = classifyPairCrossings(geometry, ch, cv, {}, {}, params);
+            QCOMPARE(plain.events.size(), std::size_t{1});
+            QVERIFY(std::find(geometry.uncoveredSegments.begin(), geometry.uncoveredSegments.end(),
+                              plain.events.front().hSegment) != geometry.uncoveredSegments.end());
+            QVERIFY(!plain.events.front().terminal);
+            QCOMPARE(plain.events.front().terminalSides, 0);
+        }
     }
 
     // A tagged H fiber linked to one V fiber is read against that V only: a

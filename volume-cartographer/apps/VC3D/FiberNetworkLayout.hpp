@@ -225,6 +225,9 @@ struct CrossingEvent {
     bool touch = false;
     // Read as a kollesis seam encounter (same winding or inward).
     bool kollesis = false;
+    // ... from the solve contradiction on a certified kollesis V rather than
+    // from a tag on this H fiber (see winding::Crossing::kollesisInferred).
+    bool kollesisInferred = false;
     int orientation = 0;
     int mergedCount = 1;
     double confidence = 0.0;
@@ -323,6 +326,7 @@ struct GlobalResult {
     int unresolvedIntersectionCount = 0;
     // Events read as kollesis seam encounters.
     int kollesisCrossingCount = 0;
+    int kollesisInferredCount = 0;
     // Geometry the solver refused to learn from: angularly ill-conditioned
     // or wild segments, and tangential contacts. Nonzero values say the map
     // may be underconstrained for a reason the fibers themselves can't show.

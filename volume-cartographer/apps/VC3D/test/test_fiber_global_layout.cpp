@@ -231,8 +231,14 @@ constexpr double kSeamInnerRadius = 4000.0;
 constexpr double kSeamOuterRadius = kSeamInnerRadius - 150.0;
 constexpr double kSeamVRadius = kSeamOuterRadius + 60.0;
 
+// `extraInner`: 0 none; 1 an untagged inner H fiber (803) alongside the tagged
+// one, ending just past the V and linked to the tagged inner H fiber at a
+// control at the same angle (same winding, no tag); 2 the same but unlinked;
+// 3 linked and running a full turn on past the V, so its only end within a
+// turn of the crossing is its start, on the inner sheet's body side.
 std::vector<InputFiber> kollesisSeam(bool sameSide, int linkMask, int tagMask,
-                                     bool shortControl = false, bool linkAtCrossing = false)
+                                     bool shortControl = false, bool linkAtCrossing = false,
+                                     int extraInner = 0)
 {
     std::vector<InputFiber> fibers;
     std::vector<cv::Vec3d> inner =
@@ -273,6 +279,20 @@ std::vector<InputFiber> kollesisSeam(bool sameSide, int linkMask, int tagMask,
     }
     if (linkMask & 2) {
         addLink(fibers[1], outerLinked, fibers[2], 1);
+    }
+    if (extraInner != 0) {
+        const double end = extraInner == 3 ? kSeamAngle + 0.2 + kTwoPi : kSeamAngle + kSeamOverrun;
+        std::vector<cv::Vec3d> extra =
+            arcPoints(30000.0, kSeamInnerRadius, 0.0, kSeamAngle - 0.6, end);
+        const int extraLast = static_cast<int>(extra.size()) - 1;
+        // Its middle control at the tagged inner H fiber's middle control's
+        // angle (same start, same step), so the link joins equal angles.
+        fibers.push_back(makeFiber(803, QStringLiteral("k-inner2"), 'H', std::move(extra),
+                                   {0, linkAtCrossing ? innerCrossing : innerLast / 2, extraLast}));
+        fibers.back().kollesisTerminations.assign(3, false);
+        if (extraInner != 2) {
+            addLink(fibers.back(), 1, fibers[0], 1);
+        }
     }
     return fibers;
 }
@@ -1284,6 +1304,57 @@ private slots:
         }
     }
 
+    // The solve finds the seam encounters no tag names: on the certified
+    // kollesis V, a third inner H fiber, untagged, linked to the tagged
+    // inner H fiber (so the rest of its evidence puts it on the V's winding)
+    // and ending just past the V, has its Outside crossing read as an
+    // inferred seam: no ring, flagged. Unlinked, nothing contradicts the
+    // crossing and nothing is inferred; running a full turn on past the V,
+    // the crossing is not terminal and its ring stays.
+    void inferredSeamsClearTheUntaggedInnerFibers()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        for (const int extraInner : {1, 2, 3}) {
+            const GlobalResult result = vc3d::fiber_map::buildGlobalLayout(
+                kollesisSeam(false, 3, 3, false, false, extraInner), umbilicus, defaultParams());
+            const GlobalPlacedFiber* v = findFiber(result, 802);
+            QVERIFY(v != nullptr && v->meta.onKollesis);
+            int extraEvents = 0;
+            int extraInferred = 0;
+            int extraDropped = 0;
+            for (const auto& event : result.crossingEvents) {
+                if (event.hFiberId != 803 || event.vFiberId != 802) {
+                    continue;
+                }
+                ++extraEvents;
+                extraInferred += event.kollesisInferred ? 1 : 0;
+                extraDropped += event.status == vc3d::fiber_map::winding::CrossingStatus::Dropped ? 1 : 0;
+                if (event.kollesisInferred) {
+                    QVERIFY(event.kollesis);
+                    QCOMPARE(event.kind, vc3d::fiber_map::winding::CrossingKind::Inside);
+                    QVERIFY(event.deltaR > 0.0);
+                }
+            }
+            QVERIFY(extraEvents >= 1);
+            QCOMPARE(result.kollesisInferredCount, extraInferred);
+            if (extraInner == 1) {
+                QCOMPARE(extraInferred, extraEvents);
+                QCOMPARE(extraDropped, 0);
+                QCOMPARE(result.droppedCrossingCount, 0);
+                const GlobalPlacedFiber* extra = findFiber(result, 803);
+                QVERIFY(extra != nullptr);
+                QVERIFY(std::abs(extra->meta.windingLo - v->meta.windingLo) < 0.6);
+            } else if (extraInner == 2) {
+                QCOMPARE(extraInferred, 0);
+                QCOMPARE(extraDropped, 0);
+            } else {
+                QCOMPARE(extraInferred, 0);
+                QVERIFY(extraDropped >= 1);
+                QVERIFY(result.droppedCrossingCount >= 1);
+            }
+        }
+    }
+
     // Tags and links are annotation: adding them recomputes no detection
     // shard, yet changes the classified result, and the memoized build
     // equals the fresh one throughout. Every new field is in the digest.
@@ -1331,6 +1402,17 @@ private slots:
                 }
             }
             QVERIFY(flipped);
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = fresh;
+            tweaked.crossingEvents.front().kollesisInferred =
+                !tweaked.crossingEvents.front().kollesisInferred;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = fresh;
+            tweaked.kollesisInferredCount += 1;
             QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
         }
     }

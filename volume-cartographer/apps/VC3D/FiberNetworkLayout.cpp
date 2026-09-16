@@ -1263,6 +1263,10 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     // lie to opposite sides of it: the side being which way the tagged end
     // lies from the linked control along the H fiber's own line, in the
     // winding sense (chirality). Nothing is inferred from crossings.
+    // Per V fiber: the (side, H fiber) evidence its links supply; kept for
+    // the solve's own seam readings below, which need the side the inner
+    // sheet's ends lie on.
+    std::map<std::size_t, std::set<std::pair<int, std::size_t>>> seamEvidence;
     {
         const auto tagsUsable = [](const InputFiber& fiber) {
             return fiber.controlPoints.size() >= 2 &&
@@ -1287,8 +1291,6 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
                 traces[i].kollesisEndSample = sampleOf(fiber.controlPoints.size() - 1);
             }
         }
-        // Per V fiber: the (side, H fiber) evidence its links supply.
-        std::map<std::size_t, std::set<std::pair<int, std::size_t>>> seamEvidence;
         for (const LinkRecord& link : allLinks) {
             std::size_t h = link.a;
             int ih = link.ia;
@@ -1374,6 +1376,9 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     std::deque<winding::PairDetections> freshShards;
     std::deque<winding::PairCrossings> classified;
     std::vector<winding::PairDetection> detections;
+    // Per classified pair: its geometry and fibers, for the second pass.
+    std::vector<const winding::PairDetections*> geometryOf;
+    std::map<std::pair<std::size_t, std::size_t>, std::size_t> pairIndexOf;
     for (std::size_t h = 0; h < fiberCount; ++h) {
         if (canonical[h].hvTag != 'H' || canonical[h].psi.empty()) {
             continue;
@@ -1404,9 +1409,11 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
             }
             classified.push_back(winding::classifyPairCrossings(
                 *geometry, canonical[h], canonical[v],
-                winding::seamAnchors(canonical, h, v, linkInputs),
+                winding::seamAnchors(canonical, h, v, linkInputs), {},
                 solverParams));
             detections.push_back(winding::PairDetection{h, v, &classified.back()});
+            geometryOf.push_back(geometry);
+            pairIndexOf[{h, v}] = classified.size() - 1;
         }
     }
     const double detectLoopMs = std::chrono::duration<double, std::milli>(
@@ -1415,7 +1422,100 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     winding::SolveResult solve =
         winding::solveWindings(traces, linkInputs, solverParams, chirality,
                                detections);
-    solve.detectMs += detectLoopMs;
+    // Seam encounters the solve finds (see winding::Crossing::kollesisInferred):
+    // on a V the annotator certified as on a kollesis, an Outside crossing
+    // that lost to the rest of its H fiber's evidence by exactly one turn,
+    // where that H fiber ends within a turn past the V. The glued inner sheet
+    // sits one thickness behind the outer sheet's V and reads exactly so.
+    // The H fiber must end on the side of the V where the inner sheet's
+    // tagged ends lie - the side of the tagged encounters that read Outside
+    // (behind the V), known from the identification itself; a V whose tagged
+    // encounters do not settle that side gets no inferred readings. Those
+    // pairs are classified again with the encounter read Inside, and the
+    // solve repeated, until a pass finds nothing new (each pass adds at
+    // least one of finitely many events, so it ends). Detection shards are
+    // untouched: this is classification.
+    double reclassifyMs = 0.0;
+    double assemblyMs = solve.detectMs;
+    double solveMs = solve.solveMs;
+    {
+        // Per kollesis V: the side (+1 / -1 in canonical angle) its inner
+        // sheet's ends lie on, or 0 when unsettled.
+        std::map<std::size_t, int> innerEndSide;
+        {
+            std::map<std::size_t, std::set<int>> behind;
+            std::map<std::size_t, std::set<int>> inFront;
+            for (const winding::Crossing& event : solve.events) {
+                if (!event.kollesis || event.kollesisInferred) {
+                    continue;
+                }
+                const auto evidence = seamEvidence.find(event.vFiber);
+                if (evidence == seamEvidence.end()) {
+                    continue;
+                }
+                for (const auto& [side, h] : evidence->second) {
+                    if (h == event.hFiber) {
+                        (event.deltaR > 0.0 ? behind : inFront)[event.vFiber].insert(side);
+                    }
+                }
+            }
+            for (const auto& [v, sides] : behind) {
+                if (sides.size() == 1) {
+                    const int side = *sides.begin();
+                    const auto front = inFront.find(v);
+                    if (front == inFront.end() || front->second.count(side) == 0) {
+                        innerEndSide[v] = side;
+                    }
+                }
+            }
+        }
+        std::map<std::size_t, std::set<std::size_t>> inferred;
+        for (;;) {
+            bool added = false;
+            for (const winding::Crossing& event : solve.events) {
+                if (event.status != winding::CrossingStatus::Dropped ||
+                    event.kind != winding::CrossingKind::Outside || event.kollesis ||
+                    event.touch || event.tangential || !event.terminal ||
+                    std::abs(event.violationTurns - 1.0) > 0.5 ||
+                    !traces[event.vFiber].onKollesis) {
+                    continue;
+                }
+                const auto side = innerEndSide.find(event.vFiber);
+                if (side == innerEndSide.end() ||
+                    (event.terminalSides & (side->second > 0 ? 1 : 2)) == 0) {
+                    continue;
+                }
+                const auto pair = pairIndexOf.find({event.hFiber, event.vFiber});
+                if (pair == pairIndexOf.end()) {
+                    continue;
+                }
+                added = inferred[pair->second].insert(event.detection).second || added;
+            }
+            if (!added) {
+                break;
+            }
+            const auto reclassifyBegin = std::chrono::steady_clock::now();
+            for (const auto& [index, ids] : inferred) {
+                const std::size_t h = detections[index].hFiber;
+                const std::size_t v = detections[index].vFiber;
+                classified[index] = winding::classifyPairCrossings(
+                    *geometryOf[index], canonical[h], canonical[v],
+                    winding::seamAnchors(canonical, h, v, linkInputs),
+                    std::vector<std::size_t>(ids.begin(), ids.end()), solverParams);
+            }
+            reclassifyMs += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - reclassifyBegin)
+                                .count();
+            solve = winding::solveWindings(traces, linkInputs, solverParams, chirality,
+                                           detections);
+            assemblyMs += solve.detectMs;
+            solveMs += solve.solveMs;
+        }
+    }
+    // Every pass's shard assembly, detection loop and reclassification is
+    // detection time; every pass's solve is solve time.
+    solve.detectMs = assemblyMs + detectLoopMs + reclassifyMs;
+    solve.solveMs = solveMs;
 
     result.chirality = solve.chirality;
     result.islandCount = solve.islandCount;
@@ -1425,6 +1525,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     result.tangentialCount = solve.tangentialCount;
     result.unresolvedIntersectionCount = solve.unresolvedIntersectionCount;
     result.kollesisCrossingCount = solve.kollesisCrossingCount;
+    result.kollesisInferredCount = solve.kollesisInferredCount;
     result.detectMs = solve.detectMs;
     result.solveMs = solve.solveMs;
 
@@ -1585,6 +1686,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         event.tangential = crossing.tangential;
         event.touch = crossing.touch;
         event.kollesis = crossing.kollesis;
+        event.kollesisInferred = crossing.kollesisInferred;
         event.orientation = crossing.orientation;
         event.mergedCount = crossing.mergedCount;
         event.confidence = crossing.confidence;
@@ -1895,6 +1997,8 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
     hashU64(digest, static_cast<uint64_t>(
                         static_cast<int64_t>(result.kollesisCrossingCount)));
     hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.kollesisInferredCount)));
+    hashU64(digest, static_cast<uint64_t>(
                         static_cast<int64_t>(result.gatedSegmentCount)));
     hashU64(digest,
             static_cast<uint64_t>(static_cast<int64_t>(result.tangentialCount)));
@@ -1986,7 +2090,7 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         hashDouble(digest, event.deltaR);
         hashDouble(digest, event.transversality);
         hashU64(digest, (event.tangential ? 1 : 0) | (event.touch ? 2 : 0) |
-                            (event.kollesis ? 4 : 0));
+                            (event.kollesis ? 4 : 0) | (event.kollesisInferred ? 8 : 0));
         hashI64(event.orientation);
         hashI64(event.mergedCount);
         hashDouble(digest, event.confidence);

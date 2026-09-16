@@ -1600,6 +1600,9 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     }
     if (_layout.kollesisCrossingCount > 0) {
         status += tr(" · %1 kollesis").arg(_layout.kollesisCrossingCount);
+        if (_layout.kollesisInferredCount > 0) {
+            status += tr(" (%1 inferred)").arg(_layout.kollesisInferredCount);
+        }
     }
     const qint64 totalMs =
         job.snapshotMs + job.convertMs + job.layoutMs + publishMs;

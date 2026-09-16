@@ -212,6 +212,23 @@ struct Crossing {
     // kollesis: annotation-classified as Inside (see FiberTrace), kept out
     // of the traversal-group counts like a touch.
     bool kollesis = false;
+    // A seam encounter read without a tag on this H fiber: on a V fiber the
+    // annotator certified as on a kollesis, an Outside crossing the rest of
+    // the evidence contradicted by exactly one turn, of an H fiber that ends
+    // within a turn past it (see `terminal`) - the glued inner sheet, one
+    // thickness behind the outer sheet's V. Implies `kollesis`.
+    bool kollesisInferred = false;
+    // The H fiber ends within one turn past this crossing, toward one of its
+    // ends, without meeting the V fiber again and without leaving the V
+    // branch's height range (so a further crossing could not have gone
+    // unseen, and no gated or unresolved segment on the way either): how an
+    // inner sheet's H fiber ends in a kollesis overlap. A
+    // property of the pair's geometry, no length in it. `terminalSides`
+    // says which way those ends lie from the crossing in canonical angle:
+    // bit 1 the +psi side, bit 2 the -psi side (a short H fiber may end
+    // within a turn both ways).
+    bool terminal = false;
+    int terminalSides = 0;
     // A pass and return at a vertex of either polyline (both incident
     // segments on one side of the other segment), or the two opposing
     // records of a V apex: crosses nothing, counted by no group.
@@ -347,6 +364,8 @@ struct SolveResult {
     int unresolvedIntersectionCount = 0;
     // Events read as kollesis seam encounters.
     int kollesisCrossingCount = 0;
+    // Of those, read from the solve contradiction rather than a tag.
+    int kollesisInferredCount = 0;
     // Indices into the input link list whose constraints were dropped by
     // cycle repair.
     std::vector<std::size_t> droppedLinks;
@@ -431,6 +450,10 @@ struct PairDetections {
     // Sorted, unique.
     std::vector<long long> gapTranslates;
     std::vector<long long> unresolvedTranslates;
+    // H segments (by index) on which an encounter with this V may have gone
+    // unseen: the segment was gated, met a gated V segment in angle, or
+    // shared an unresolved collinear stretch. Sorted, unique.
+    std::vector<std::size_t> uncoveredSegments;
     int gatedSegmentCount = 0;
     int tangentialCount = 0;
     int unresolvedCount = 0;
@@ -492,10 +515,17 @@ struct SeamAnchor {
 // SeamAnchor), which the caller derives from the traces' kollesis fields and
 // the links. Deterministic in its inputs, so fresh and cached builds
 // classify identically.
+// `inferredSeams`: detection ids (Crossing::detection) the caller has found
+// to be seam encounters by the solve itself - on a V on a kollesis, an
+// Outside crossing contradicted by one turn whose H fiber is `terminal`
+// there - read Inside like a tagged encounter and flagged kollesisInferred.
+// The layout supplies them from a first solve and solves again; the plain
+// solveWindings overload never infers.
 [[nodiscard]] PairCrossings classifyPairCrossings(const PairDetections& detections,
                                                   const CanonicalTrace& h,
                                                   const CanonicalTrace& v,
                                                   const std::vector<SeamAnchor>& seams,
+                                                  const std::vector<std::size_t>& inferredSeams,
                                                   const SolverParams& params);
 
 // Field-by-field, bit-exact equality of two classified shards.
