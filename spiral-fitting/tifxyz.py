@@ -11,6 +11,13 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 
 
+def interpolate_quad_triangles(tl, tr, bl, br, di, dj):
+    """Interpolate the two triangles used by Patch.project (di/dj end in 1)."""
+    return torch.where(di + dj <= 1,
+                       tl + di * (bl - tl) + dj * (tr - tl),
+                       br + (1 - di) * (tr - br) + (1 - dj) * (bl - br))
+
+
 @dataclass
 class Patch:
     zyxs: torch.Tensor
@@ -72,13 +79,15 @@ class Patch:
         return int(default if self.erosion_cells_override is None
                    else self.erosion_cells_override)
 
-    def ij_to_zyx(self, ij: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def ij_to_zyx(self, ij: torch.Tensor, *, triangulated=False) -> tuple[torch.Tensor, torch.Tensor]:
         """Bilinearly interpolate zyx coordinates at fractional (i, j) pixel locations.
 
         Args:
             ij: Tensor of shape (..., 2) containing (i, j) pixel coordinates in the
                 patch grid (row, col). Coordinates outside the patch or on invalid
                 quads are marked invalid in the returned mask.
+            triangulated: Match the piecewise planar surface used by project,
+                instead of the default bilinear interpolation.
 
         Returns:
             (zyx, valid_mask) where zyx has shape (..., 3) and invalid samples are
@@ -93,6 +102,10 @@ class Patch:
 
         i0 = torch.floor(flat[:, 0]).long()
         j0 = torch.floor(flat[:, 1]).long()
+        if triangulated:
+            # Projection may land exactly on the outer edge of the last quad.
+            i0 = torch.where(flat[:, 0] == h - 1, h - 2, i0)
+            j0 = torch.where(flat[:, 1] == w - 1, w - 2, j0)
 
         in_bounds = (i0 >= 0) & (j0 >= 0) & (i0 < h - 1) & (j0 < w - 1)
         valid = torch.zeros_like(in_bounds, dtype=torch.bool)
@@ -118,9 +131,12 @@ class Patch:
             bl = zyxs[i0[valid_idx] + 1, j0[valid_idx]]
             br = zyxs[i0[valid_idx] + 1, j0[valid_idx] + 1]
 
-            top = tl + (tr - tl) * dj
-            bottom = bl + (br - bl) * dj
-            interp = top + (bottom - top) * di
+            if triangulated:
+                interp = interpolate_quad_triangles(tl, tr, bl, br, di, dj)
+            else:
+                top = tl + (tr - tl) * dj
+                bottom = bl + (br - bl) * dj
+                interp = top + (bottom - top) * di
             result[valid_idx] = interp
 
         zyx = result.reshape(*ij.shape[:-1], 3)

@@ -87,6 +87,63 @@ Run from the spiral/ directory, e.g.
         --pcl /path/to/abs_windings.json \
         --pcl /path/to/rel_windings.json \
         --z-range 10000,13000
+
+Alternatively, pass --config params.json with any or all options in a JSON object:
+
+    {
+        "checkpoint": "out/checkpoint_fitted.ckpt",
+        "patches_dir": "/path/to/dataset/patches",
+        "patch_id": "seed-patch",
+        "pcl": ["/path/to/abs_windings.json", "/path/to/rel_windings.json"],
+        "z_range": "10000,13000",
+        "detect_loops": true,
+        "plot": false
+    }
+
+Keys use option names without leading dashes; hyphens and underscores are both
+accepted. Use JSON booleans for toggles, an array for pcl, and an empty string
+for fibers to infer the dataset's fibers directory. Relative paths are resolved
+from the working directory, as on the CLI. Explicit CLI options override JSON
+values; omitted options retain their usual defaults.
+
+An optional JSON-only "linking" object controls analysis attachments (omitting
+it preserves checkpoint/legacy linking). For example:
+
+    "linking": {
+        "distance": 2.5,
+        "window_points": 5,
+        "min_points": 3,
+        "vertical_max_behind_fraction": 0.2,
+        "horizontal_max_front_fraction": 0.2,
+        "side_margin_voxels": 0.5,
+        "selection": "support_then_distance",
+        "fiber_stride": 1,
+        "patch_stride": 1
+    }
+
+Distance (positive float, full-resolution scan voxels) defaults to the saved
+checkpoint tolerance and affects every collection. Patch stride also affects
+every collection, but only its link-query geometry; winding analysis uses the
+original patches. Coarse cells spanning invalid fine quads are excluded.
+Absolute winding annotations attach independently within the distance tolerance;
+checkpoint window-support requirements and fiber side rules do not apply to them.
+
+The remaining settings affect fibers only. Stride samples the original trimmed
+fiber, replacing checkpoint spacing-based thinning, and always keeps endpoints
+and branch junctions. Windows count sampled points within each individual fiber
+(before merging fibers), including the center point. window_points defaults to
+5 and must be odd; min_points defaults to 1 and is strict even at fiber ends.
+The center point must itself be within distance of the candidate patch.
+
+Front points inward along the checkpoint's negative winding gradient in scan
+space. Each orientation's wrong-side fraction defaults to null (disabled).
+Enabled fractions are in [0,1] and count nearby hits in the local window, with
+offsets within side_margin_voxels (default 0.5) treated as on-surface. Undefined
+directions do not support a side-filtered link. A fraction equal to the limit
+passes. Eligible patches rank by support count, RMS distance, center distance,
+then patch ID. selection may instead be "nearest" or "largest_area". Both
+strides default to 1. Resolved settings and counts are saved under "linking" in
+the report; candidate rejection counts refer to (sampled point, patch) pairs.
 """
 
 import os
@@ -114,6 +171,7 @@ from sample_spiral import (
 # (never slicing through invalid regions, where theta would jump and the unwrap
 # would miscount whole windings).
 import connect_overlapping_patches as cop
+from winding_linking import AnalysisLinkingConfig, AnalysisPointLinker, model_inward_direction
 
 
 def resolve_umbilicus_path(patches_dir, explicit_path=None):
@@ -172,6 +230,28 @@ def _to_py(x):
     return x
 
 
+def resolve_base_shape_zyx(checkpoint, patches_dir):
+    """The dataset's volume coordinate domain (ZYX shape), or None.
+
+    Fibers exported with coordinate_base_shape_zyx can only be scaled into the
+    dataset's domain when that domain is known, so the analysis ScrollSpec must
+    carry it like a real fit's does. Prefer the shape the checkpoint was fit
+    against; legacy checkpoints predate that field, so fall back to the
+    dataset's spiral-scroll.json next to --patches-dir when one exists."""
+    shape = checkpoint.get('base_shape_zyx')
+    if shape is not None:
+        return tuple(int(v) for v in shape)
+    from fit_session import SCROLL_SPEC_FILENAME, ScrollSpecError, load_scroll_spec
+    dataset_root = os.path.dirname(os.path.abspath(os.path.expanduser(patches_dir)))
+    if not os.path.isfile(os.path.join(dataset_root, SCROLL_SPEC_FILENAME)):
+        return None
+    try:
+        return load_scroll_spec(dataset_root).base_shape_zyx
+    except ScrollSpecError as e:
+        print(f'WARNING: ignoring {SCROLL_SPEC_FILENAME}: {e}')
+        return None
+
+
 def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_z_end, umbilicus_path,
                      fibers_path=None):
     """Build the explicit FitConfig / ScrollSpec / SpiralInputPaths pointing
@@ -181,19 +261,24 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
     z-range shapes the transform's flow field independently of the filtering
     z-range."""
     from fit_session import PclInputSpec, ScrollSpec, SpiralInputPaths
+    from config import filter_known_config_keys
 
     cfg = fs.Config().as_dict()
-    cfg.update(checkpoint['cfg'])
+    # Analysis needs the saved model/input settings, not an exact match to
+    # the training config schema. Backfill new defaults and report old keys.
+    cfg.update(filter_known_config_keys(
+        checkpoint['cfg'], cfg, label='checkpoint config'))
     # This tool IS the patch graph — a checkpoint trained supervision-free
     # (disable_patches, e.g. the 2026-07-17 normals-only baseline) must not
     # stop the loaders from reading the patches it wants to analyse.
     cfg['input_disable_patches'] = False
-    # We compute no shell losses; zero their weights so the context's
-    # shell_losses_enabled() gate stops load_host_inputs() from loading the
-    # shell (replacing the old fs.shell_losses_enabled = lambda: False
-    # override). Nothing else in the host-loading path reads these weights.
+    # Analysis needs neither shell supervision nor fiber-direction loss inputs.
+    # Disable the shell source too: winding-model checkpoints require it even
+    # with both shell loss weights zero.
+    cfg['input_use_outer_shell'] = False
     cfg['loss_weight_shell_outer'] = 0.0
     cfg['loss_weight_shell_patch_radius'] = 0.0
+    cfg['loss_weight_fiber_directions'] = 0.0
     # The filtering z-range is the optimisation window this analysis uses.
     cfg['z_begin'] = int(filter_z_begin)
     cfg['z_end'] = int(filter_z_end)
@@ -202,6 +287,7 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
         name='analysis',
         voxel_size_um=9.6,
         spiral_outward_sense=checkpoint.get('spiral_outward_sense') or 'CW',
+        base_shape_zyx=resolve_base_shape_zyx(checkpoint, patches_dir),
     )
     # This analysis needs no scroll volume, track store, or outer shell:
     # leaving those paths empty keeps load_host_inputs() from touching the
@@ -222,11 +308,11 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
     return fit_config, scroll, paths, int(checkpoint['z_begin']), int(checkpoint['z_end'])
 
 
-def build_transform(checkpoint, cfg, context, model_z_begin, model_z_end):
+def build_transform(checkpoint, cfg, context, model_z_begin, model_z_end, *, device='cuda'):
     """Reconstruct the slice->spiral transform and dr_per_winding from the
     checkpoint, using fit_spiral's own model class. The flow field is shaped by
     the checkpoint's (model) z-range, not the filtering z-range."""
-    device = torch.device('cuda')
+    device = torch.device(device)
 
     all_zs = np.arange(model_z_begin, model_z_end)
     umbilicus_fn = context.umbilicus_z_to_yx()
@@ -248,8 +334,13 @@ def build_transform(checkpoint, cfg, context, model_z_begin, model_z_end):
         spiral_outward_sense=context.spiral_outward_sense,
     )
     model.to(device)
-    model.load_state_dict(fs.merge_flow_stage_lattices(
+    model_state = dict(fs.merge_flow_stage_lattices(
         checkpoint)['spiral_and_transform'])
+    # Older fits learned a shell-loss winding index. It is not part of the
+    # slice->spiral transform and is no longer a model parameter. Keep strict
+    # loading for every other key so missing/incompatible geometry still fails.
+    model_state.pop('shell_outer_winding_param', None)
+    model.load_state_dict(model_state)
     model.eval()
 
     transform = model.get_slice_to_spiral_transform()
@@ -892,7 +983,48 @@ def parse_z_range(z_range):
     return lo, hi
 
 
+def load_cli_config(ctx, param, value):
+    """Supply JSON values as Click defaults, preserving CLI validation/precedence."""
+    if value is None or ctx.resilient_parsing:
+        return
+    try:
+        with open(value, encoding='utf-8') as config_file:
+            config = json.load(config_file)
+    except (OSError, ValueError) as exc:
+        raise click.BadParameter(f'cannot read JSON configuration: {exc}', ctx=ctx, param=param) from exc
+    if not isinstance(config, dict):
+        raise click.BadParameter('must contain a JSON object', ctx=ctx, param=param)
+
+    names = {}
+    for option in ctx.command.params:
+        if option.name == param.name:
+            continue
+        names[option.name] = option.name
+        for flag in option.opts:
+            names[flag.lstrip('-').replace('-', '_')] = option.name
+
+    defaults = {}
+    for key, setting in config.items():
+        if key == 'linking':
+            try:
+                ctx.meta['analysis_linking'] = AnalysisLinkingConfig.from_json(setting)
+            except ValueError as exc:
+                raise click.BadParameter(str(exc), ctx=ctx, param=param) from exc
+            continue
+        name = names.get(key.replace('-', '_'))
+        if name is None:
+            raise click.BadParameter(f'unknown option {key!r}', ctx=ctx, param=param)
+        if name in defaults:
+            raise click.BadParameter(f'duplicate option {key!r}', ctx=ctx, param=param)
+        defaults[name] = setting
+    ctx.default_map = {**(ctx.default_map or {}), **defaults}
+
+
 @click.command()
+@click.option('--config', type=click.Path(exists=True, dir_okay=False),
+              is_eager=True, expose_value=False, callback=load_cli_config,
+              help='JSON object with option values (hyphen or underscore keys). '
+                   'CLI options override JSON; use arrays for pcl and booleans for toggles.')
 @click.option('--checkpoint', required=True, type=click.Path(exists=True, dir_okay=False),
               help='Path to a checkpoint_*.ckpt saved by fit_spiral.')
 @click.option('--patches-dir', required=True, type=click.Path(exists=True, file_okay=False),
@@ -991,9 +1123,32 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
             f'z-range [{model_z_begin}, {model_z_end}); the transform is undefined outside its domain.'
         )
 
-    print('loading + z-filtering patches and point-collections')
     context = fs.FitContext(fit_config, scroll=scroll, paths=input_paths)
-    context.load_host_inputs()
+    linking_config = click.get_current_context().meta.get('analysis_linking')
+    point_linker = None
+    transform = dr = None
+    if linking_config is not None:
+        try:
+            linking_config = linking_config.resolve_distance(fit_config['pcl_link_distance_tolerance'])
+        except ValueError as exc:
+            raise click.BadParameter(str(exc), param_hint='linking.distance') from exc
+        print('rebuilding spiral transform before linking')
+        transform, dr = build_transform(ckpt, fit_config, context, model_z_begin, model_z_end)
+        from point_collection import PatchLinkOptions
+        point_linker = AnalysisPointLinker(
+            linking_config,
+            model_inward_direction(transform, dr, device, model_z_begin, model_z_end),
+            min_z_fraction=fit_config['pcl_vertical_fiber_min_z_fraction'],
+            min_auto_certainty=fit_config['pcl_vertical_fiber_min_auto_certainty'],
+            annotation_options=PatchLinkOptions(
+                window_points=fit_config['pcl_link_window_points'],
+                window_min_points=fit_config['pcl_link_window_min_points']))
+    print('loading + z-filtering patches and point-collections')
+    if point_linker is None:
+        context.load_host_inputs()
+    else:
+        context.load_host_inputs(point_linker=point_linker, fiber_min_point_spacing=0.0)
+        print(f'analysis linking: {json.dumps(point_linker.report)}')
     patches = context.verified_patches
     # fit_spiral holds the cross-patch pcls as a list; this tool's
     # vote/edge builders key their reports by pcl id. Per-file collection
@@ -1010,8 +1165,9 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
         )
     patch = patches[patch_id]
 
-    print('rebuilding spiral transform from checkpoint')
-    transform, dr = build_transform(ckpt, fit_config, context, model_z_begin, model_z_end)
+    if transform is None:
+        print('rebuilding spiral transform from checkpoint')
+        transform, dr = build_transform(ckpt, fit_config, context, model_z_begin, model_z_end)
     dr_value = float(dr.item())
     print(f'dr_per_winding = {dr_value:.4f}')
 
@@ -1381,6 +1537,9 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
         'min_edge_fix': min_edge_fix,
         'disconnected_subgraphs': disconnected_subgraphs,
     }
+
+    if point_linker is not None:
+        out['linking'] = point_linker.report
 
     if output is None:
         output = os.path.join(os.path.dirname(os.path.abspath(checkpoint)), f'winding_votes_{patch_id}.json')

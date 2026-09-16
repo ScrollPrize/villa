@@ -124,7 +124,8 @@ def radius_from_unwrapped_shifted(
     return raw_shifted_radii + theta / (2 * np.pi) * dr_per_winding
 
 
-def get_radial_covector_in_scroll_space(slice_to_spiral_transform, scroll_zyx, spiral_zyx=None, epsilon=6.0):
+def get_radial_covector_in_scroll_space(slice_to_spiral_transform, scroll_zyx, spiral_zyx=None, epsilon=6.0,
+                                       *, dr_per_winding=None):
     """Pull the spiral-space radial unit normal back to scroll space, unnormalised.
 
     At each scroll-space point the outward radial direction of spiral space,
@@ -139,7 +140,10 @@ def get_radial_covector_in_scroll_space(slice_to_spiral_transform, scroll_zyx, s
     parameters via the Jacobian only; the sample positions and the radial
     direction are held fixed. If the forward image ``spiral_zyx`` is supplied
     it is reused for the radial direction (as a constant); otherwise it is
-    computed here.
+    computed here. With ``dr_per_winding`` supplied, pull back the exact local
+    covector of r/dr - theta/(2*pi), rather than the radial normal. Computing
+    the angular derivative analytically avoids the theta seam and the clamp
+    at winding zero. The winding direction is undefined on the spiral axis.
     """
     device = scroll_zyx.device
     num_points = scroll_zyx.shape[0]
@@ -156,6 +160,12 @@ def get_radial_covector_in_scroll_space(slice_to_spiral_transform, scroll_zyx, s
         spiral_plus, spiral_minus = slice_to_spiral_transform(torch.cat([scroll_plus, scroll_minus], dim=0)).chunk(2, dim=0)
 
     spiral_outward_yx = torch.nn.functional.normalize(spiral_zyx[:, 1:].detach(), dim=-1)
+    if dr_per_winding is not None:
+        yx = spiral_zyx[:, 1:].detach()
+        r2 = yx.square().sum(dim=-1, keepdim=True)
+        theta_gradient = torch.stack([yx[:, 1], -yx[:, 0]], dim=-1) / r2.clamp_min(1e-24)
+        spiral_outward_yx = spiral_outward_yx / dr_per_winding - theta_gradient / (2 * torch.pi)
+        spiral_outward_yx = torch.where(r2 > 1e-24, spiral_outward_yx, torch.zeros_like(yx))
     spiral_outward_zyx = torch.cat([torch.zeros_like(spiral_outward_yx[:, :1]), spiral_outward_yx], dim=-1)
 
     spiral_plus = spiral_plus.view(3, num_points, 3)

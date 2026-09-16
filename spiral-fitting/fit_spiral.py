@@ -1102,7 +1102,7 @@ def accumulate_radial_offset_bake_scale(slice_to_spiral_transform, zyxs,
 
 
 def inward_winding_direction(slice_to_spiral_transform, zyxs, *, device=None,
-                             chunk_size=65536):
+                             chunk_size=65536, dr_per_winding=None):
     """Unit vectors along the fitted spiral's decreasing-winding direction.
 
     At each input-frame point the scan-space gradient of the fitted winding
@@ -1111,7 +1111,9 @@ def inward_winding_direction(slice_to_spiral_transform, zyxs, *, device=None,
     number, the "front" side the fiber link side rules refer to. ``zyxs``
     (N, 3) in the frame the transform reads; returns (N, 3) float64, zero
     where the gradient vanishes. Evaluated under no_grad, chunked, with each
-    chunk staged to ``device`` when given.
+    chunk staged to ``device`` when given. Supply ``dr_per_winding`` for the
+    exact winding gradient including the angular term; omission retains the
+    historical radial-normal approximation.
     """
     points = torch.as_tensor(
         np.ascontiguousarray(zyxs, dtype=np.float32)).reshape(-1, 3)
@@ -1125,7 +1127,8 @@ def inward_winding_direction(slice_to_spiral_transform, zyxs, *, device=None,
                 device=target, dtype=torch.float32)
             covector = get_radial_covector_in_scroll_space(
                 slice_to_spiral_transform, chunk,
-                epsilon=RADIAL_OFFSET_STRETCH_EPSILON)
+                epsilon=RADIAL_OFFSET_STRETCH_EPSILON,
+                dr_per_winding=dr_per_winding)
             norm = torch.linalg.norm(covector, dim=-1, keepdim=True)
             direction = torch.where(
                 norm > 0, -covector / norm.clamp_min(1e-12),
@@ -1866,7 +1869,8 @@ class FitContext:
                 self.unattached_component_edges.append([])
 
     def _derive_point_inputs(self, verified_patches, point_collections,
-                             fiber_point_collections, *, direction_source='umbilicus'):
+                             fiber_point_collections, *, direction_source='umbilicus',
+                             point_linker=None):
         """Shared initial/replacement linking, classification and sampling.
 
         Callers provide private point dictionaries; this method attaches and
@@ -1910,19 +1914,22 @@ class FitContext:
         # Live revisions select the direction for their current step, just
         # like _maybe_relink_fibers_for_direction.
         self._fiber_link_direction_source = direction_source
-        link_options = self._patch_link_options(
-            point_collections, 1.0, direction_source=direction_source)
-        if link_options.side_rules:
-            print(self._describe_fiber_link_side_rules(link_options))
-        link_points_to_patches(
-            verified_patches,
-            point_collections,
-            tolerance=link_distance_tolerance,
-            surface_index_tolerance=link_distance_tolerance,
-            distance_scale=1.0,
-            general_hit_policy='largest_area',
-            options=link_options,
-        )
+        if point_linker is not None:
+            point_linker(verified_patches, point_collections, fiber_point_collections)
+        else:
+            link_options = self._patch_link_options(
+                point_collections, 1.0, direction_source=direction_source)
+            if link_options.side_rules:
+                print(self._describe_fiber_link_side_rules(link_options))
+            link_points_to_patches(
+                verified_patches,
+                point_collections,
+                tolerance=link_distance_tolerance,
+                surface_index_tolerance=link_distance_tolerance,
+                distance_scale=1.0,
+                general_hit_policy='largest_area',
+                options=link_options,
+            )
 
         # Keep pristine linked regular collections. Derived training views may
         # trim or decimate points, but live patches must still be offered every
@@ -2198,8 +2205,12 @@ class FitContext:
                         pass
             raise RuntimeError(message) from exc
 
-    def load_host_inputs(self):
+    def load_host_inputs(self, *, point_linker=None, fiber_min_point_spacing=None):
         """Load and prepare every host-side input for a fit.
+
+        Analysis callers may supply ``point_linker(patches, collections,
+        fibers)`` to attach points before classification, and override fiber
+        loading's spacing without changing the training configuration.
 
         Seeds the host RNG streams, then loads patches, point collections,
         fibers, tracks, and the outer shell; links and classifies PCLs;
@@ -2337,7 +2348,8 @@ class FitContext:
         fiber_point_collections, next_id = load_fiber_point_collections(
             self.fibers_path,
             next_id,
-            min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
+            min_point_spacing=(self.config['pcl_fiber_min_point_spacing']
+                               if fiber_min_point_spacing is None else fiber_min_point_spacing),
             base_shape_zyx=getattr(self, 'base_shape_zyx', None),
         )
         # All fibers (horizontal, vertical, and merged link components) form one
@@ -2374,7 +2386,8 @@ class FitContext:
                 pid: copy.copy(patch) for pid, patch in unverified_patches.items()
             }
         self._derive_point_inputs(
-            verified_patches, point_collections, fiber_point_collections)
+            verified_patches, point_collections, fiber_point_collections,
+            **({'point_linker': point_linker} if point_linker is not None else {}))
         unattached_pcl_strips = self.unattached_pcl_strips
         link_distance_tolerance = self.link_distance_tolerance
 

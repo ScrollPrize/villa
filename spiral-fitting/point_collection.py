@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from tifxyz import Patch
+from tifxyz import Patch, interpolate_quad_triangles
 
 
 _LINK_THREADS_DEFAULT_CAP = 16
@@ -60,12 +60,25 @@ class PatchLinkOptions:
     ``s >= -side_margin`` and a SIDE_BEHIND one hits with ``s <= side_margin``
     (margin in point units). Rejected hits are dropped before selection, so
     in a window they count as misses.
+
+    Analysis callers can set ``strict_min_points`` (no end-of-chain relaxation),
+    ``rank_by_support`` (support count, RMS, center distance, stable patch ID),
+    and ``max_wrong_side_fractions`` per collection. A fraction rule replaces
+    per-hit side rejection with a local-window gate, retaining tolerated
+    wrong-side hits and excluding undefined directions from support. Fraction
+    equality passes. ``report_counts`` receives per-collection candidate and
+    attachment counts; callers using workers must make it thread-safe.
     """
     window_points: int = 1
     window_min_points: int = 1
     side_rules: Mapping[int, str] = None
     inward_direction: Optional[Callable[[np.ndarray], np.ndarray]] = None
     side_margin: float = 0.0
+    # Opt-in analysis policies; defaults preserve the training linker.
+    strict_min_points: bool = False
+    rank_by_support: bool = False
+    max_wrong_side_fractions: Mapping[int, float] = None
+    report_counts: Optional[Callable[[dict], None]] = None
 
     def __post_init__(self):
         if int(self.window_points) < 1:
@@ -87,6 +100,11 @@ class PatchLinkOptions:
         object.__setattr__(self, 'side_rules', rules)
         if rules and self.inward_direction is None:
             raise ValueError('side rules need an inward_direction function')
+        fractions = dict(self.max_wrong_side_fractions or {})
+        for cid, fraction in fractions.items():
+            if cid not in rules or not np.isfinite(fraction) or not 0 <= fraction <= 1:
+                raise ValueError('wrong-side fractions need a side rule and a value in [0, 1]')
+        object.__setattr__(self, 'max_wrong_side_fractions', fractions)
 
     @property
     def window_half(self) -> int:
@@ -95,7 +113,7 @@ class PatchLinkOptions:
 
     @property
     def gates_on_window(self) -> bool:
-        return self.window_half > 0 and self.window_min_points > 1
+        return self.window_min_points > 1 and (self.window_half > 0 or self.strict_min_points)
 
     def side_rule(self, collection_id) -> Optional[str]:
         return self.side_rules.get(collection_id)
@@ -120,6 +138,86 @@ def umbilicus_inward_direction(z_to_umbilicus_yx):
 
 
 DEFAULT_LINK_OPTIONS = PatchLinkOptions()
+
+
+class NoValidLinkQuads(ValueError):
+    """Sampling left a patch without any usable coarse cells."""
+
+
+class SampledLinkPatch(Patch):
+    """Link-only coarse quads, separated by invalid rows/columns.
+
+    Separators let both the native vertex-based index and Patch.project use
+    exactly the same valid coarse cells, without bridging holes. Returned ij
+    coordinates are in this packed grid until ``original_ij`` maps them back.
+    """
+
+    def __init__(self, source, stride):
+        vertices = source.zyxs.detach().cpu()
+        h, w = vertices.shape[:2]
+        self.sample_rows = np.unique(np.r_[np.arange(0, h, stride), h - 1])
+        self.sample_cols = np.unique(np.r_[np.arange(0, w, stride), w - 1])
+        rows, cols = self.sample_rows, self.sample_cols
+        # A coarse cell is usable only if every underlying fine quad is valid.
+        invalid = (~source.valid_quad_mask.cpu().numpy()).astype(np.int64)
+        prefix = np.pad(invalid.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+        bad = (prefix[rows[1:, None], cols[None, 1:]]
+               - prefix[rows[:-1, None], cols[None, 1:]]
+               - prefix[rows[1:, None], cols[None, :-1]]
+               + prefix[rows[:-1, None], cols[None, :-1]])
+        valid = torch.from_numpy(bad == 0)
+        if not bool(valid.any()):
+            raise NoValidLinkQuads('no valid sampled quads')
+        grid = torch.full((3 * len(valid) - 1, 3 * valid.shape[1] - 1, 3), -1., dtype=torch.float32)
+        for i in range(2):
+            for j in range(2):
+                corners = vertices[rows[i:len(rows) - 1 + i, None], cols[None, j:len(cols) - 1 + j]]
+                grid[i::3, j::3] = torch.where(valid[..., None], corners, -1.)
+        super().__init__(grid, source.scale, source.overlapping_ids, None, uuid=source.uuid)
+        self.area = source.area  # largest-area selection still uses original area
+
+    def _cell_coordinates(self, ij):
+        ij = torch.as_tensor(ij, dtype=torch.float32)
+        cell = torch.floor(ij / 3).long()
+        cell[..., 0].clamp_(0, len(self.sample_rows) - 2)
+        cell[..., 1].clamp_(0, len(self.sample_cols) - 2)
+        uv = ij - 3 * cell
+        return cell, uv
+
+    def original_ij(self, ij):
+        cell, uv = self._cell_coordinates(ij)
+        rows = torch.as_tensor(self.sample_rows, device=uv.device)
+        cols = torch.as_tensor(self.sample_cols, device=uv.device)
+        r, c = cell.unbind(-1)
+        return torch.stack([rows[r] + uv[..., 0] * (rows[r + 1] - rows[r]),
+                            cols[c] + uv[..., 1] * (cols[c + 1] - cols[c])], dim=-1)
+
+    def ij_to_zyx(self, ij, *, triangulated=True):
+        # Match the two triangles used by both projection backends, including
+        # exact edge vertices; bilinear interpolation would move a curved foot.
+        cell, uv = self._cell_coordinates(ij)
+        r, c = (3 * cell).unbind(-1)
+        grid = self.zyxs.to(uv.device)
+        a, b, d, e = grid[r, c], grid[r + 1, c], grid[r, c + 1], grid[r + 1, c + 1]
+        u, v = uv[..., :1], uv[..., 1:]
+        zyx = interpolate_quad_triangles(a, d, b, e, u, v)
+        valid = ((uv >= 0) & (uv <= 1)).all(-1) & self.valid_quad_mask.to(uv.device)[r, c]
+        return zyx, valid
+
+
+def sample_patches_for_linking(patches, stride):
+    """Return link-only geometry; stride 1 reuses the original patches."""
+    if isinstance(stride, bool) or not isinstance(stride, int) or stride < 1:
+        raise ValueError('patch stride must be a positive integer')
+    if stride == 1:
+        return patches
+    sampled = {}
+    for pid, patch in patches.items():
+        try:
+            sampled[pid] = SampledLinkPatch(patch, stride)
+        except NoValidLinkQuads:
+            continue
+    return sampled
 
 
 def load_point_collection(filename: str) -> Optional[Dict[int, Dict[str, Any]]]:
@@ -269,7 +367,7 @@ def _point_zyxs(point_items) -> np.ndarray:
     ], axis=0), dtype=np.float32)
 
 
-def _projection_feet(point_idx, surf_idx, ijs, patch_for_surface):
+def _projection_feet(point_idx, surf_idx, ijs, patch_for_surface, *, triangulated=False):
     """Projection foot (zyx) of every hit, NaN where it cannot be evaluated."""
     feet = np.full((len(point_idx), 3), np.nan, dtype=np.float32)
     for surface in np.unique(surf_idx):
@@ -278,7 +376,8 @@ def _projection_feet(point_idx, surf_idx, ijs, patch_for_surface):
             continue
         rows = np.flatnonzero(surf_idx == surface)
         ij = torch.as_tensor(np.asarray(ijs[rows], dtype=np.float32))
-        zyx, valid = patch.ij_to_zyx(ij)
+        kwargs = {'triangulated': True} if triangulated and isinstance(patch, Patch) else {}
+        zyx, valid = patch.ij_to_zyx(ij, **kwargs)
         if not bool(valid.all()):
             # A foot exactly on the last grid row/column is out of range for
             # the bilinear lookup; nudge it into the adjacent quad.
@@ -286,7 +385,7 @@ def _projection_feet(point_idx, surf_idx, ijs, patch_for_surface):
             nudged = ij.clone()
             nudged[:, 0] = nudged[:, 0].clamp(0.0, h - 1 - 1e-3)
             nudged[:, 1] = nudged[:, 1].clamp(0.0, w - 1 - 1e-3)
-            zyx_nudged, valid_nudged = patch.ij_to_zyx(nudged)
+            zyx_nudged, valid_nudged = patch.ij_to_zyx(nudged, **kwargs)
             fill = (~valid) & valid_nudged
             zyx[fill] = zyx_nudged[fill]
             valid = valid | valid_nudged
@@ -295,20 +394,22 @@ def _projection_feet(point_idx, surf_idx, ijs, patch_for_surface):
     return feet
 
 
-def _side_reject_mask(point_zyxs, point_idx, surf_idx, ijs, patch_for_surface, rule, options):
-    """True for hits on the wrong side of their point under ``rule`` (see
-    PatchLinkOptions.side_rules). A foot that cannot be evaluated, or a point
-    with an undefined inward direction, is never rejected."""
+def _side_measurements(point_zyxs, point_idx, surf_idx, ijs, patch_for_surface, rule, options):
+    """Return wrong-side and defined masks for candidate projection feet."""
     reject = np.zeros(len(point_idx), dtype=bool)
+    defined_hits = np.zeros(len(point_idx), dtype=bool)
     if len(point_idx) == 0:
-        return reject
-    feet = _projection_feet(point_idx, surf_idx, ijs, patch_for_surface)
+        return reject, defined_hits
+    feet = _projection_feet(point_idx, surf_idx, ijs, patch_for_surface,
+                            triangulated=bool(options.max_wrong_side_fractions))
     known = np.isfinite(feet).all(axis=1)
     if not known.any():
-        return reject
+        return reject, defined_hits
     points = point_zyxs[point_idx[known]].astype(np.float64)
-    inward = np.asarray(options.inward_direction(points), dtype=np.float64).reshape(-1, 3)
-    defined = np.linalg.norm(inward, axis=1) > 0
+    unique_points, inverse = np.unique(point_idx[known], return_inverse=True)
+    directions = options.inward_direction(point_zyxs[unique_points].astype(np.float64))
+    inward = np.asarray(directions, dtype=np.float64).reshape(-1, 3)[inverse]
+    defined = np.isfinite(inward).all(axis=1) & (np.linalg.norm(inward, axis=1) > 0)
     offset = ((feet[known].astype(np.float64) - points) * inward).sum(axis=1)
     margin = float(options.side_margin)
     if rule == SIDE_FRONT:
@@ -316,7 +417,36 @@ def _side_reject_mask(point_zyxs, point_idx, surf_idx, ijs, patch_for_surface, r
     else:
         wrong = offset > margin
     reject[known] = defined & wrong
-    return reject
+    defined_hits[known] = defined
+    return reject, defined_hits
+
+
+def _side_reject_mask(point_zyxs, point_idx, surf_idx, ijs, patch_for_surface, rule, options):
+    """Legacy per-hit rule: undefined directions never reject a hit."""
+    return _side_measurements(
+        point_zyxs, point_idx, surf_idx, ijs, patch_for_surface, rule, options)[0]
+
+
+def _window_hit_statistics(point_idx, surf_idx, distances, num_points, half, wrong):
+    """Support, RMS distance, and wrong-side count before candidate gating."""
+    counts = np.zeros(len(point_idx), dtype=np.int64)
+    rms = np.zeros(len(point_idx), dtype=np.float64)
+    wrong_counts = np.zeros(len(point_idx), dtype=np.int64)
+    for surface in np.unique(surf_idx):
+        rows = np.flatnonzero(surf_idx == surface)
+        positions = point_idx[rows]
+        values = np.zeros((num_points, 3), dtype=np.float64)
+        values[positions, 0] = 1
+        values[positions, 1] = np.asarray(distances[rows], dtype=np.float64) ** 2
+        values[positions, 2] = wrong[rows]
+        cumulative = np.vstack([np.zeros(3), values.cumsum(axis=0)])
+        lo = np.maximum(positions - half, 0)
+        hi = np.minimum(positions + half + 1, num_points)
+        totals = cumulative[hi] - cumulative[lo]
+        counts[rows] = totals[:, 0].astype(np.int64)
+        rms[rows] = np.sqrt(np.maximum(totals[:, 1], 0) / totals[:, 0])
+        wrong_counts[rows] = totals[:, 2].astype(np.int64)
+    return counts, rms, wrong_counts
 
 
 def _window_hit_gate(point_idx, surf_idx, num_points, half, min_points):
@@ -339,7 +469,8 @@ def _window_hit_gate(point_idx, surf_idx, num_points, half, min_points):
     return keep
 
 
-def _best_hit_per_point(point_idx, surf_idx, distances, ijs, *, patch_areas=None):
+def _best_hit_per_point(point_idx, surf_idx, distances, ijs, *, patch_areas=None,
+                        support=None, rms=None, surface_ids=None):
     if len(surf_idx) == 0:
         return None
     # Primary sort: point. Then, for general PCLs, the largest patch area (the
@@ -348,6 +479,8 @@ def _best_hit_per_point(point_idx, surf_idx, distances, ijs, *, patch_areas=None
     keys = [surf_idx, distances]
     if patch_areas is not None:
         keys.append(-patch_areas[surf_idx])
+    if support is not None:
+        keys = [np.asarray(surface_ids)[surf_idx], distances, rms, -support]
     keys.append(point_idx)
     order = np.lexsort(keys)
     sorted_points = point_idx[order]
@@ -380,6 +513,11 @@ def _link_from_hits(
     ``point_items`` (id order). Points already carrying ``on_patch`` still
     serve as window members but are never re-linked.
     """
+    if collection.get('metadata', {}).get('winding_is_absolute', False):
+        # Absolute anchors are independent measurements, often on successive
+        # windings. Neighbour support and fiber side rules do not apply.
+        # Retain reporting and the caller's distance/patch-selection policy.
+        options = PatchLinkOptions(report_counts=options.report_counts)
     local: Dict[str, List[PointPatchLink]] = {}
     if len(surf_idx) == 0:
         return local
@@ -390,23 +528,57 @@ def _link_from_hits(
         point_idx, surf_idx, distances, ijs = (
             point_idx[keep], surf_idx[keep], distances[keep], ijs[keep])
     rule = options.side_rule(collection_id)
+    fraction = options.max_wrong_side_fractions.get(collection_id)
+    counts_report = dict(candidate_hits=len(point_idx), undefined_side_hits=0,
+                         side_rejected_candidates=0, support_rejected_candidates=0,
+                         attached_points=0)
+    wrong = np.zeros(len(point_idx), dtype=bool)
     if rule is not None and len(point_idx):
-        reject = _side_reject_mask(
+        wrong, defined = _side_measurements(
             point_zyxs, point_idx, surf_idx, ijs, patch_for_surface, rule, options)
+        reject = ~defined if fraction is not None else wrong
+        counts_report['undefined_side_hits'] = int((~defined).sum())
+        if fraction is None:
+            counts_report['side_rejected_candidates'] = int(reject.sum())
         if reject.any():
             accept = ~reject
             point_idx, surf_idx, distances, ijs = (
                 point_idx[accept], surf_idx[accept], distances[accept], ijs[accept])
-    if options.gates_on_window and len(point_idx):
-        eligible = _window_hit_gate(
-            point_idx, surf_idx, len(point_items), options.window_half,
-            options.window_min_points)
+            wrong = wrong[accept]
+    support = rms = None
+    if options.rank_by_support or options.strict_min_points or fraction is not None:
+        support, rms, wrong_counts = _window_hit_statistics(
+            point_idx, surf_idx, distances, len(point_items), options.window_half, wrong)
+        required = options.window_min_points
+        if not options.strict_min_points:
+            required = np.minimum(required, np.minimum(point_idx + options.window_half + 1, len(point_items))
+                                  - np.maximum(point_idx - options.window_half, 0))
+        supported = support >= required
+        side_ok = np.ones(len(point_idx), dtype=bool)
+        if fraction is not None:
+            side_ok = wrong_counts <= fraction * support
+        counts_report['support_rejected_candidates'] = int((~supported).sum())
+        counts_report['side_rejected_candidates'] += int((supported & ~side_ok).sum())
+        eligible = supported & side_ok
+        point_idx, surf_idx, distances, ijs, support, rms = (
+            point_idx[eligible], surf_idx[eligible], distances[eligible],
+            ijs[eligible], support[eligible], rms[eligible])
+    elif options.gates_on_window and len(point_idx):
+        eligible = _window_hit_gate(point_idx, surf_idx, len(point_items),
+                                    options.window_half, options.window_min_points)
+        counts_report['support_rejected_candidates'] = int((~eligible).sum())
         if not eligible.all():
             point_idx, surf_idx, distances, ijs = (
                 point_idx[eligible], surf_idx[eligible], distances[eligible],
                 ijs[eligible])
     best = _best_hit_per_point(
-        point_idx, surf_idx, distances, ijs, patch_areas=patch_areas)
+        point_idx, surf_idx, distances, ijs, patch_areas=patch_areas,
+        support=support if options.rank_by_support else None,
+        rms=rms, surface_ids=surface_ids)
+    counts_report['attached_points'] = 0 if best is None else sum(
+        'on_patch' not in point_items[int(i)][1] for i in best[0])
+    if options.report_counts is not None:
+        options.report_counts(counts_report)
     if best is None:
         return local
     win_points, win_surfaces, win_distances, win_ijs = best
@@ -474,7 +646,7 @@ def _link_points_to_patches_with_surface_index(
     print(f'linking points to patches with vc_spiral.surface_index ({len(surface_ids)} patches)')
 
     if not hasattr(index, 'locate_all_xyz_batch'):
-        if options.gates_on_window or options.side_rules:
+        if options.gates_on_window or options.side_rules or options.rank_by_support or options.report_counts:
             # The single-hit legacy query cannot count window hits or test
             # the side rules; let the brute-force path handle it.
             return None
@@ -708,7 +880,8 @@ def link_points_to_patches(
 
     ``options`` (PatchLinkOptions) adds the window hit gate and the side
     rules on top of either policy; points already carrying ``on_patch`` are
-    never re-linked.
+    never re-linked. Collections marked ``metadata.winding_is_absolute``
+    attach each point independently, without window or side rules.
     """
     options = options or DEFAULT_LINK_OPTIONS
     links: Dict[str, List[PointPatchLink]] = {}

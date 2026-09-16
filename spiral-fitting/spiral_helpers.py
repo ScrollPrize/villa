@@ -160,6 +160,10 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
 
     source_shape = data.get('coordinate_base_shape_zyx')
     if source_shape is not None:
+        if base_shape_zyx is None:
+            raise ValueError(
+                'fiber declares coordinate_base_shape_zyx but the dataset base_shape_zyx '
+                'is unknown (set base_shape_zyx in spiral-scroll.json)')
         for name, shape in (('coordinate_base_shape_zyx', source_shape),
                             ('base_shape_zyx', base_shape_zyx)):
             if (not isinstance(shape, (list, tuple)) or len(shape) != 3
