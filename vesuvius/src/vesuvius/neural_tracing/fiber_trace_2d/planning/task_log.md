@@ -19,3 +19,12 @@
 - Approved CPU validation passed: training/config spans 41 passed, 2 skipped;
   refinement 23 passed, 2 skipped. Logs are under
   `/ephemeral/hendrik/fiber3d_train2/cooperative-tests/20260916_213539_062927`.
+- Committed the reproducible continuation state as `39b7277cd`.
+- Launched managed continuation root1628019 at
+  `/ephemeral/hendrik/fiber3d_train2/runs/.launches/5scroll_json_eligible_fullres_refinement_128_sd1_16x8_ema-20260916_213749`.
+  Active run directory is
+  `/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_128_sd1_16x8_ema_20260916_213753`.
+- Verified exact raw resume at checkpoint step4100/524,800 samples and fresh
+  refinement progress through updates4101-4103. Full-resolution refinement
+  calibration measured microbatch1 and is advancing to microbatch2 before the
+  adaptive continuation.

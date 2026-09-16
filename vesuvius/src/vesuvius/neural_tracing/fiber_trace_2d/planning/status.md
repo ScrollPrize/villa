@@ -4,5 +4,6 @@
 - [x] Add full-resolution refinement continuation config and regression.
 - [x] Run focused CPU validation.
 - [x] Update docs and launcher.
-- [ ] Commit reproducible continuation state.
-- [ ] Launch managed continuation and verify resumed progress.
+- [x] Commit reproducible continuation state (`39b7277cd`).
+- [x] Launch managed continuation and verify resume at update 4100 plus fresh
+  refinement progress through update 4103.
