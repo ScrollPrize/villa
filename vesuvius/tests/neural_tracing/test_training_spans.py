@@ -104,6 +104,10 @@ def test_file_backed_train_and_test_use_identical_filtered_geometry(monkeypatch)
 
 CONFIG = Path(__file__).resolve().parents[2] / "src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_5scroll_json_eligible_ema_16x8.json"
 FULLRES_CONFIG = CONFIG.with_name("train_5scroll_json_eligible_fullres_ema_16x8.json")
+REFINEMENT_CONFIG = CONFIG.with_name("train_5scroll_json_eligible_refinement_ema_16x8.json")
+FULLRES_REFINEMENT_CONFIG = CONFIG.with_name(
+    "train_5scroll_json_eligible_fullres_refinement_ema_16x8.json"
+)
 
 
 def test_clean_json_only_training_config():
@@ -132,6 +136,40 @@ def test_fullres_config_changes_only_output_stride_and_run_name():
     assert base["model_3d"].pop("output_stride") == 4
     assert raw["training"].pop("run_name") == "5scroll_json_eligible_fullres_128_sd1_16x8_ema"
     assert base["training"].pop("run_name") == "5scroll_json_eligible_128_sd1_16x8_ema"
+    assert raw == base
+
+
+def test_fullres_refinement_config_changes_only_stride_resume_and_run_name():
+    raw = json.loads(FULLRES_REFINEMENT_CONFIG.read_text())
+    base = json.loads(REFINEMENT_CONFIG.read_text())
+    fullres = json.loads(FULLRES_CONFIG.read_text())
+    loaded = module.load_config(FULLRES_REFINEMENT_CONFIG)
+
+    assert loaded.refinement.enabled
+    assert not loaded.embedding.enabled
+    assert raw["refinement"] == {
+        "enabled": True,
+        "shape_normal_weight": 0.1,
+        "shape_tangent_weight": 10.0,
+        "direction_weight": 0.1,
+    }
+    assert raw["model_3d"] == fullres["model_3d"]
+    assert raw["training"]["resume"] == (
+        "/ephemeral/hendrik/fiber3d_train2/runs/"
+        "5scroll_json_eligible_fullres_128_sd1_16x8_ema_20260916_192344/"
+        "snapshots/current.pt"
+    )
+
+    assert raw["model_3d"].pop("output_stride") == 1
+    assert base["model_3d"].pop("output_stride") == 4
+    raw["training"].pop("resume")
+    base["training"].pop("resume")
+    assert raw["training"].pop("run_name") == (
+        "5scroll_json_eligible_fullres_refinement_128_sd1_16x8_ema"
+    )
+    assert base["training"].pop("run_name") == (
+        "5scroll_json_eligible_refinement_128_sd1_16x8_ema"
+    )
     assert raw == base
 
 

@@ -1,25 +1,21 @@
-# Fresh full-resolution five-scroll training — 2026-09-16
+# Resume full-resolution training with refinement — 2026-09-16
 
-- Committed preceding direction-weight trial as `597af5c93`.
-- Stopped refinement launch `5scroll_json_eligible_refinement_128_sd1_16x8_ema-20260916_062132`; launcher reports dead and manager task finished/interrupted with zero resources.
-- Baseline is `train_5scroll_json_eligible_ema_16x8.json`: eligible five-scroll JSON-only, no embeddings/refinement/resume, LR0.01, global batch128, 16/GPU cap, BF16/GroupNorm, EMA0.99/0.999.
-- Planned experimental delta: output stride4->1 plus distinct run name only.
-- Independent review approved; specifically require a new stride-1 calibration.
-  Calibration fingerprint hashes the full numerical/data config (excluding only
-  cooperative controls), so output stride1 cannot reuse the stride4 report.
-- Added `train_5scroll_json_eligible_fullres_ema_16x8.json`; exact-diff test
-  permits only stride4->1 and the distinct fullres run name. Fresh/no
-  refinement/no embedding/no resume assertions included.
-- Approved `training-spans` suite passed: 40 passed,2 skipped in33.02s;
-  `/ephemeral/hendrik/fiber3d_train2/cooperative-tests/20260916_191912_825700`.
-- Independent final review approved the exact config delta, regression, fresh
-  semantics, calibration separation and managed launcher selection.
-- Committed config/test/docs/launcher as `a456f1dc5`.
-- Approved production launch root1436973, launch dir
-  `5scroll_json_eligible_fullres_128_sd1_16x8_ema-20260916_192340`.
-- Initially queued behind exclusive `refinement062136-best`; it then acquired
-  8GPU/128CPU. Fresh real-update calibration measured microbatch8 at step12 and
-  saved fingerprint `7fa1c121dd3ca12a56efeda8046f3725d81bdd565c281961e115ca977d6305e5`
-  (adaptive minimum20,373,831,680 bytes/GPU).
-- Active run is `5scroll_json_eligible_fullres_128_sd1_16x8_ema_20260916_192344`.
-  Verified fresh progress through update200 and raw/EMA tests at100 and200.
+- Stopped managed full-resolution run
+  `5scroll_json_eligible_fullres_128_sd1_16x8_ema_20260916_192344` after its
+  completed update4100/test. Manager allocation released cleanly.
+- Durable source checkpoint exists at that run's `snapshots/current.pt` (750MiB).
+- Existing reviewed refinement delta adds per-scroll normal manifests,
+  `bounded_gradient_accumulation:true`, `_config_dir`, refinement weights
+  normal0.1/tangent10/direction0.1, a resume source and distinct run name.
+- Planned new config is the existing refinement config with only output
+  stride4->1, resume source->the stopped fullres current checkpoint, and a
+  distinct fullres-refinement run name.
+- Independent review approved that three-field derivation and requested direct
+  checkpoint-state verification.
+- Verified the checkpoint itself: update4100, 524,800 samples, raw snapshot,
+  optimizer and EMA present, and no `refinement_state`.
+- Added the full-resolution refinement continuation config and an exact-delta
+  regression.
+- Approved CPU validation passed: training/config spans 41 passed, 2 skipped;
+  refinement 23 passed, 2 skipped. Logs are under
+  `/ephemeral/hendrik/fiber3d_train2/cooperative-tests/20260916_213539_062927`.

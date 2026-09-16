@@ -1,19 +1,19 @@
 # Plan
 
-1. Stop the active refinement run and verify its cooperative allocation is released.
-2. Add a distinct full-resolution config derived from the regular eligible five-scroll JSON-only config. Change only `model_3d.output_stride` from 4 to 1 and `training.run_name`; retain LR 0.01, global batch 128, GroupNorm/BF16, EMA, data, augmentation, tests, and fresh initialization.
-3. Add a regression asserting that the full-resolution config differs from the stride-4 baseline only in output stride and run name, and explicitly has neither refinement nor enabled embeddings nor a resume source.
-4. Run the focused CPU configuration tests. Use the existing stride-1 model/target coverage as the numerical implementation validation; no unmanaged GPU test.
-5. Point the approved production launcher at the new config, launch through the cooperative manager, and verify the emitted config/run identity and initial health.
+1. Stop the active full-resolution run and identify its latest durable `current.pt` checkpoint.
+2. Add a distinct full-resolution refinement config derived from the existing reviewed stride-4 refinement config. Change only output stride 4->1, resume source to the stopped full-resolution checkpoint, and run name. This preserves normal manifests, bounded accumulation, refinement normal/tangent/direction weights 0.1/10/0.1, LR0.01, global batch128, EMA and all data/augmentation settings.
+3. Add a regression asserting that the new config differs from the existing refinement config only in those three fields, that its architecture matches the stopped stride-1 checkpoint config, and that refinement is enabled while embeddings remain disabled.
+4. Run the approved CPU training-span and refinement suites; no unmanaged GPU test.
+5. Point the approved production launcher at the continuation config, commit the reproducible state, launch through the cooperative manager, and verify checkpoint step, fresh refinement geometry, calibration/allocation and resumed progress.
 
 ## Spec update
 
-None. `model_3d.output_stride: 1` and fresh training are already specified.
+None. Resume and full-resolution refinement are already specified behaviors.
 
 ## Docs updates
 
-Add the full-resolution comparison config and launch identity to the training-span documentation and current task log/status.
+Record the full-resolution refinement continuation and launch identity in refinement documentation and current task log/status.
 
 ## Changelog
 
-No feature changelog entry: this is a configuration experiment using existing behavior.
+No feature changelog entry: this is a configuration continuation using existing behavior.

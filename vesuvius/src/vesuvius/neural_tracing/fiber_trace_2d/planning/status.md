@@ -1,7 +1,8 @@
-- [x] Stop current refinement training and release allocation.
-- [x] Inspect output-stride specification and baseline config.
+- [x] Stop full-resolution run and identify current checkpoint at update 4100.
+- [x] Inspect exact existing refinement-config delta.
 - [x] Independent plan review.
-- [x] Add full-resolution config and equivalence regression.
-- [x] Run focused CPU validation: 40 passed, 2 skipped.
-- [x] Update docs and approved launcher configuration.
-- [x] Launch fresh managed training; distinct stride-1 calibration and update 200 verified.
+- [x] Add full-resolution refinement continuation config and regression.
+- [x] Run focused CPU validation.
+- [x] Update docs and launcher.
+- [ ] Commit reproducible continuation state.
+- [ ] Launch managed continuation and verify resumed progress.

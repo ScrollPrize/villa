@@ -37,7 +37,7 @@ the immutable-original GT ellipse tether and weak bending of the resulting line,
 not of its displacement. The penalty is `shape_weight * integral |d²x/ds²|² ds`,
 when the optional normal/tangent weights are omitted. With those weights the
 curvature penalty is `normal_weight*|nnT*kappa|² + tangent_weight*|(I-nnT)*kappa|²`:
-normal0.1/tangent1.0 gives 10x/100x the previous isotropic0.01. Unoriented normal
+normal0.1/tangent10 gives 10x/1000x the previous isotropic0.01. Unoriented normal
 projectors, not signed normals, are interpolated. The full 3x3 block-pentadiagonal
 system has scalar half-bandwidth8. It uses nonuniform current arclength coefficients
 frozen within each solve. Material
@@ -53,6 +53,13 @@ tether, not a hard cumulative distance cap.
 The current follow-up config keeps normal0.1/tangent10 and lowers direction1->0.1.
 Model-training loss weights and LR remain unchanged. Restart
 from the original pre-refinement checkpoint for this comparison.
+
+The full-resolution continuation uses
+`train_5scroll_json_eligible_fullres_refinement_ema_16x8.json`. It resumes the
+raw stride-1 run at update4100 (524,800 samples), retaining its model,
+optimizer, and EMA tracks while initializing refinement geometry from the
+original annotations. It keeps normal0.1/tangent10/direction0.1, LR0.01,
+global batch128, and embeddings disabled.
 
 Optional direction guidance (default weight0, current trial0.1) penalizes
 `1-(unit_segment_tangent dot predicted_base_axis)^2` at the same segment quadrature.

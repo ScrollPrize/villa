@@ -298,7 +298,7 @@
     "continuation_config": "/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/continuation_config.json"
   },
   "production": {
-    "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_5scroll_json_eligible_fullres_ema_16x8.json"
+    "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_5scroll_json_eligible_fullres_refinement_ema_16x8.json"
   },
   "trace_series": {
     "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/finetune_5scroll_s1a_128_sd1_16x8_ema_lr0001-20260912_223739",
