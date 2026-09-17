@@ -71,6 +71,15 @@ namespace
 // is the review script's own dark theme (fiber_network_unroll.py THEME["dark"]);
 // the light row takes the script's light surface/ink/winding and pairs them with
 // H/V hues of the same families darkened enough to read on white.
+// One stop of the gap heat map's colour ramp: position along the ramp
+// (0 = on a fiber, 1 = the saturation distance), colour, and opacity over
+// the map ground.
+struct GapRampStop {
+    float t;
+    QColor colour;
+    float alpha;
+};
+
 struct FiberMapPalette {
     QColor surface;
     QColor ink;
@@ -81,6 +90,14 @@ struct FiberMapPalette {
     QColor chipHorizontal;
     QColor chipVertical;
     QColor chipInk;
+    // The gap heat map's ramp: steel that is barely there under the fibers,
+    // through periwinkle, to violet where nothing is drawn. The far end is
+    // chosen per theme - lifted on the dark ground so it stands off the
+    // surface, deepened on the light one - so the layer never fights the
+    // cyan/green fibers, the violet link dots (a neighbour of the far end,
+    // which only meets it where links border empty sheet), the red suspect
+    // rings or the yellow kollesis rims that all sit at the faint end.
+    std::array<GapRampStop, 3> gapRamp;
 };
 
 const FiberMapPalette kDarkPalette{
@@ -93,6 +110,9 @@ const FiberMapPalette kDarkPalette{
     .chipHorizontal = QColor(QStringLiteral("#aee7f0")),
     .chipVertical = QColor(QStringLiteral("#b8ecc4")),
     .chipInk = QColor(QStringLiteral("#0b0b0b")),
+    .gapRamp = {{{0.0f, QColor(QStringLiteral("#a9b6c9")), 0.10f},
+                {0.5f, QColor(QStringLiteral("#6f7ff2")), 0.42f},
+                {1.0f, QColor(QStringLiteral("#a06cff")), 0.75f}}},
 };
 
 const FiberMapPalette kLightPalette{
@@ -107,6 +127,9 @@ const FiberMapPalette kLightPalette{
     .chipHorizontal = QColor(QStringLiteral("#bfe9f1")),
     .chipVertical = QColor(QStringLiteral("#c8edd2")),
     .chipInk = QColor(QStringLiteral("#0b0b0b")),
+    .gapRamp = {{{0.0f, QColor(QStringLiteral("#cfd6e4")), 0.14f},
+                {0.5f, QColor(QStringLiteral("#6f7ff2")), 0.45f},
+                {1.0f, QColor(QStringLiteral("#5b2bd6")), 0.75f}}},
 };
 
 // The theme in force right now. Every build reads this afresh rather than
@@ -290,36 +313,29 @@ QPen interpolatedPen(const QColor& color, qreal width)
     return pen;
 }
 
-// The heat map's colour for a normalised distance t = D / saturation: faint
-// pale yellow on the fibers, saturating through orange to magenta at the
-// farthest gaps. Translucent so the ground and grid stay legible under it,
-// and theme-independent (it reads on both surfaces). NaN (no sheet position)
-// is fully transparent. Premultiplied, for Format_ARGB32_Premultiplied.
-QRgb gapColour(float t)
+// The heat map's colour for a normalised distance t = D / saturation, from
+// the theme's ramp: faint under the fibers, saturating where nothing is
+// drawn, translucent throughout so the ground and grid stay legible. NaN (no
+// sheet position) is fully transparent. Premultiplied, for
+// Format_ARGB32_Premultiplied.
+QRgb gapColour(float t, const FiberMapPalette& theme)
 {
     if (std::isnan(t)) {
         return qPremultiply(qRgba(0, 0, 0, 0));
     }
     const float clamped = std::clamp(t, 0.0f, 1.0f);
-    struct Stop {
-        float t;
-        int r;
-        int g;
-        int b;
-        float a;
-    };
-    constexpr std::array<Stop, 3> kStops{{{0.0f, 246, 226, 122, 0.12f},
-                                          {0.5f, 240, 128, 60, 0.40f},
-                                          {1.0f, 181, 23, 158, 0.65f}}};
-    const Stop& lo = clamped < kStops[1].t ? kStops[0] : kStops[1];
-    const Stop& hi = clamped < kStops[1].t ? kStops[1] : kStops[2];
+    const auto& stops = theme.gapRamp;
+    const GapRampStop& lo = clamped < stops[1].t ? stops[0] : stops[1];
+    const GapRampStop& hi = clamped < stops[1].t ? stops[1] : stops[2];
     const float f = (clamped - lo.t) / (hi.t - lo.t);
     const auto mix = [f](float a, float b) { return a + f * (b - a); };
-    return qPremultiply(qRgba(
-        static_cast<int>(std::lround(mix(static_cast<float>(lo.r), static_cast<float>(hi.r)))),
-        static_cast<int>(std::lround(mix(static_cast<float>(lo.g), static_cast<float>(hi.g)))),
-        static_cast<int>(std::lround(mix(static_cast<float>(lo.b), static_cast<float>(hi.b)))),
-        static_cast<int>(std::lround(255.0f * mix(lo.a, hi.a)))));
+    const auto channel = [&mix](int a, int b) {
+        return static_cast<int>(std::lround(mix(static_cast<float>(a), static_cast<float>(b))));
+    };
+    return qPremultiply(qRgba(channel(lo.colour.red(), hi.colour.red()),
+                              channel(lo.colour.green(), hi.colour.green()),
+                              channel(lo.colour.blue(), hi.colour.blue()),
+                              static_cast<int>(std::lround(255.0f * mix(lo.alpha, hi.alpha)))));
 }
 
 QPainterPath pathForRuns(const vc3d::fiber_map::PlacedFiber& fiber, bool traced)
@@ -2365,6 +2381,8 @@ void FiberMapWorkspace::changeEvent(QEvent* event)
     const QString emptyMessage = _emptyMessage;
     rebuildScene(emptyMessage);
     rebuildTree();
+    // The legend's ramp is the theme's too.
+    updateGapLegend();
     if (highlighted != 0 && _entries.contains(highlighted)) {
         setHighlightedFiber(highlighted);
         selectFiberRow(highlighted);
@@ -2549,6 +2567,7 @@ void FiberMapWorkspace::addGapTiles()
     }
     const vc3d::fiber_map::gaps::GapField& field = *_gapField;
     const float inverseSaturation = 1.0f / static_cast<float>(field.saturationVx);
+    const FiberMapPalette& theme = activePalette();
     for (const vc3d::fiber_map::gaps::GapFieldTile& tile :
          vc3d::fiber_map::gaps::gapFieldTiles(field, kGapTileCols)) {
         const int width = tile.colEnd - tile.colBegin;
@@ -2558,7 +2577,8 @@ void FiberMapWorkspace::addGapTiles()
             const int fieldRow = field.rows - 1 - row;
             QRgb* line = reinterpret_cast<QRgb*>(image.scanLine(row));
             for (int col = 0; col < width; ++col) {
-                line[col] = gapColour(field.at(fieldRow, tile.colBegin + col) * inverseSaturation);
+                line[col] =
+                    gapColour(field.at(fieldRow, tile.colBegin + col) * inverseSaturation, theme);
             }
         }
         QGraphicsPixmapItem* item = _scene->addPixmap(QPixmap::fromImage(image));
@@ -2669,13 +2689,15 @@ void FiberMapWorkspace::updateGapLegend()
     // The ramp between the scale's two ends.
     constexpr int kWidth = 72;
     constexpr int kHeight = 10;
+    // Painted over the map's own ground colour, as the layer is in the scene.
+    const FiberMapPalette& theme = activePalette();
     QPixmap ramp(kWidth, kHeight);
-    ramp.fill(Qt::transparent);
+    ramp.fill(tint(theme.surface, theme.ink, 0.045));
     {
         QPainter painter(&ramp);
         for (int x = 0; x < kWidth; ++x) {
             const float t = static_cast<float>(x) / static_cast<float>(kWidth - 1);
-            painter.fillRect(x, 0, 1, kHeight, QColor::fromRgba(qUnpremultiply(gapColour(t))));
+            painter.fillRect(x, 0, 1, kHeight, QColor::fromRgba(qUnpremultiply(gapColour(t, theme))));
         }
     }
     _gapLegend->setPixmap(ramp);
