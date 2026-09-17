@@ -8,8 +8,10 @@
 
 #include <QAbstractButton>
 #include <QAction>
+#include <QCheckBox>
 #include <QColor>
 #include <QDockWidget>
+#include <QDoubleSpinBox>
 #include <QElapsedTimer>
 #include <QEvent>
 #include <QFont>
@@ -17,6 +19,7 @@
 #include <QGraphicsItem>
 #include <QGraphicsLineItem>
 #include <QGraphicsPathItem>
+#include <QGraphicsPixmapItem>
 #include <QGraphicsRectItem>
 #include <QGraphicsScene>
 #include <QGraphicsSimpleTextItem>
@@ -28,9 +31,12 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QHelpEvent>
+#include <QImage>
+#include <QLinearGradient>
 #include <QPainterPath>
 #include <QPalette>
 #include <QPen>
+#include <QPixmap>
 #include <QPushButton>
 #include <QScopeGuard>
 #include <QScrollBar>
@@ -169,6 +175,17 @@ constexpr qreal kInterpolatedHighlightWidth = 2.4;
 constexpr qreal kNetworkGlowWidthPx = 20.0;
 constexpr int kNetworkGlowAlpha = 70;
 constexpr qreal kPanelZ = -3.0;
+// The gap heat map: over the ground, under the winding grid and every fiber.
+constexpr qreal kGapZ = -2.5;
+// Columns per heat-map pixmap tile: well under any platform pixmap limit.
+constexpr int kGapTileCols = 4096;
+// Gap heat map defaults and ranges, in centimetres (the spinboxes' unit).
+constexpr double kGapCellCm = 0.05;
+constexpr double kGapSaturationDefaultCm = 1.0;
+constexpr double kGapSaturationMinCm = 0.1;
+constexpr double kGapSaturationMaxCm = 10.0;
+constexpr double kGapAcrossDefault = 1.0;
+constexpr double kGapAcrossMax = 10.0;
 constexpr qreal kNetworkGlowZ = 1.5;
 constexpr qreal kFiberZ = 2.0;
 constexpr qreal kHighlightZ = 7.0;
@@ -263,6 +280,38 @@ QPen interpolatedPen(const QColor& color, qreal width)
     pen.setStyle(Qt::CustomDashLine);
     pen.setDashPattern({5.0, 2.2});
     return pen;
+}
+
+// The heat map's colour for a normalised distance t = D / saturation: faint
+// pale yellow on the fibers, saturating through orange to magenta at the
+// farthest gaps. Translucent so the ground and grid stay legible under it,
+// and theme-independent (it reads on both surfaces). NaN (no sheet position)
+// is fully transparent. Premultiplied, for Format_ARGB32_Premultiplied.
+QRgb gapColour(float t)
+{
+    if (std::isnan(t)) {
+        return qPremultiply(qRgba(0, 0, 0, 0));
+    }
+    const float clamped = std::clamp(t, 0.0f, 1.0f);
+    struct Stop {
+        float t;
+        int r;
+        int g;
+        int b;
+        float a;
+    };
+    constexpr std::array<Stop, 3> kStops{{{0.0f, 246, 226, 122, 0.12f},
+                                          {0.5f, 240, 128, 60, 0.40f},
+                                          {1.0f, 181, 23, 158, 0.65f}}};
+    const Stop& lo = clamped < kStops[1].t ? kStops[0] : kStops[1];
+    const Stop& hi = clamped < kStops[1].t ? kStops[1] : kStops[2];
+    const float f = (clamped - lo.t) / (hi.t - lo.t);
+    const auto mix = [f](float a, float b) { return a + f * (b - a); };
+    return qPremultiply(qRgba(
+        static_cast<int>(std::lround(mix(static_cast<float>(lo.r), static_cast<float>(hi.r)))),
+        static_cast<int>(std::lround(mix(static_cast<float>(lo.g), static_cast<float>(hi.g)))),
+        static_cast<int>(std::lround(mix(static_cast<float>(lo.b), static_cast<float>(hi.b)))),
+        static_cast<int>(std::lround(255.0f * mix(lo.a, hi.a)))));
 }
 
 QPainterPath pathForRuns(const vc3d::fiber_map::PlacedFiber& fiber, bool traced)
@@ -671,6 +720,47 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
            "Use if the map ever looks wrong."));
     toolBar->addWidget(_fullRebuildButton);
     toolBar->addSeparator();
+
+    // The gap heat map controls. Distances are entered in centimetres as
+    // intents, converted with the package's voxel size like every other
+    // physical tuning length (and with the documented assumption when the
+    // package cannot say - the legend then reads in voxels, never in a
+    // guessed centimetre).
+    _gapsCheck = new QCheckBox(tr("Gaps"), toolBar);
+    _gapsCheck->setChecked(false);
+    _gapsCheck->setToolTip(
+        tr("Heat map of the estimated distance from each spot on the sheet to\n"
+           "the nearest annotated fiber, counting fibers on neighbouring\n"
+           "windings at the sheet model's pitch. Covers the annotated extent.\n"
+           "Faint on fibers; strongest at gaps the saturation distance or\n"
+           "farther from everything. Changing a setting rebuilds the map."));
+    toolBar->addWidget(_gapsCheck);
+    _gapSaturationSpin = new QDoubleSpinBox(toolBar);
+    _gapSaturationSpin->setRange(kGapSaturationMinCm, kGapSaturationMaxCm);
+    _gapSaturationSpin->setDecimals(1);
+    _gapSaturationSpin->setSingleStep(0.1);
+    _gapSaturationSpin->setValue(kGapSaturationDefaultCm);
+    _gapSaturationSpin->setSuffix(tr(" cm"));
+    _gapSaturationSpin->setToolTip(
+        tr("Saturation distance: gaps this far or farther from every fiber\n"
+           "take the strongest colour."));
+    toolBar->addWidget(_gapSaturationSpin);
+    _gapAcrossSpin = new QDoubleSpinBox(toolBar);
+    _gapAcrossSpin->setRange(0.0, kGapAcrossMax);
+    _gapAcrossSpin->setDecimals(2);
+    _gapAcrossSpin->setSingleStep(0.25);
+    _gapAcrossSpin->setValue(kGapAcrossDefault);
+    _gapAcrossSpin->setPrefix(QStringLiteral("\u00d7"));
+    _gapAcrossSpin->setToolTip(
+        tr("Across-sheet weight: a fiber k windings away counts as\n"
+           "k \u00d7 this \u00d7 the modelled sheet pitch away. 1 is the model's own\n"
+           "spacing; larger values count only fibers on the same winding as\n"
+           "close; 0 ignores other windings entirely."));
+    toolBar->addWidget(_gapAcrossSpin);
+    _gapLegend = new QLabel(toolBar);
+    _gapLegend->setTextFormat(Qt::PlainText);
+    toolBar->addWidget(_gapLegend);
+    toolBar->addSeparator();
     _statusLabel =
         new QLabel(tr("press Update"), toolBar);
     toolBar->addWidget(_statusLabel);
@@ -714,6 +804,12 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
             [this]() { requestRebuild(false); });
     connect(_fullRebuildButton, &QPushButton::clicked, this,
             [this]() { requestRebuild(true); });
+    connect(_gapsCheck, &QCheckBox::toggled, this, &FiberMapWorkspace::handleGapsToggled);
+    connect(_gapSaturationSpin, &QDoubleSpinBox::valueChanged, this,
+            [this](double) { handleGapParamsChanged(); });
+    connect(_gapAcrossSpin, &QDoubleSpinBox::valueChanged, this,
+            [this](double) { handleGapParamsChanged(); });
+    updateGapLegend();
     connect(_view, &FiberMapView::clicked, this, &FiberMapWorkspace::handleSceneClick);
     connect(_view, &FiberMapView::zoomed, this,
             &FiberMapWorkspace::updateLabelChipVisibility);
@@ -893,6 +989,9 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     // instead of geometry; it also owns tearing down the items, the entries and
     // the highlight, so none of that is repeated here.
     _layout = {};
+    _gapField.reset();
+    _gapPublishedWanted = false;
+    _gapTiles.clear();
     _layoutGeneration = 0;
     _layoutFrame = {};
     _layoutUmbilicusFingerprint.clear();
@@ -905,6 +1004,7 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     // epoch bump refuses its publication.
     _rebuildQueue.invalidate();
     _voxelSizeUm.reset();
+    updateGapLegend();
     _scrollZMaxVx = 0.0;
     // A fresh fit belongs to the next layout, which is not this one's frame.
     _viewFitted = false;
@@ -1135,6 +1235,14 @@ struct FiberMapWorkspace::RebuildJobResult {
     bool hadUmbilicus = false;
     // The workspace's memoization cache, exclusive to the job in flight.
     vc3d::fiber_map::GlobalLayoutCache cache;
+    // The gap heat map: wanted at job start (checkbox on), built with these
+    // settings after the layout. Failure is reported, never fatal to the
+    // layout.
+    bool wantGapField = false;
+    vc3d::fiber_map::gaps::GapFieldParams gapParams;
+    std::shared_ptr<const vc3d::fiber_map::gaps::GapField> gapField;
+    QString gapError;
+    qint64 gapMs = 0;
     // Products.
     vc3d::fiber_map::GlobalResult layout;
     vc3d::fiber_map::ContentDigest inputsDigest;
@@ -1191,6 +1299,21 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
                             .count();
         job->outputDigest = vc3d::fiber_map::digestGlobalResult(job->layout);
         job->stats = job->cache.lastStats();
+        if (job->wantGapField) {
+            // Its own guard: the layout above is good whatever happens here.
+            const auto gapBegin = std::chrono::steady_clock::now();
+            try {
+                job->gapField = std::make_shared<const vc3d::fiber_map::gaps::GapField>(
+                    vc3d::fiber_map::gaps::buildGapField(job->layout, job->gapParams));
+            } catch (const std::exception& ex) {
+                job->gapError = QString::fromUtf8(ex.what());
+            } catch (...) {
+                job->gapError = QStringLiteral("unknown gap field error");
+            }
+            job->gapMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - gapBegin)
+                             .count();
+        }
     } catch (const std::exception& ex) {
         job->error = QString::fromUtf8(ex.what());
     } catch (...) {
@@ -1318,6 +1441,8 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild)
         job->builtUmbilicusGeneration = _controller->umbilicusGeneration();
         job->hadFibers = !job->snapshot.fibers.empty();
         job->hadUmbilicus = !job->snapshot.umbilicusCenters.empty();
+        job->wantGapField = _gapsCheck && _gapsCheck->isChecked();
+        job->gapParams = gapFieldParams(job->snapshot.voxelSizeUm);
 
         // No smoothing of the drawn fibers: with the markers pixel-capped,
         // a de-bumped curve read as a distortion of where the fibers really
@@ -1405,6 +1530,7 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
             job->snapshot = {};
             job->layout = {};
             job->cache = {};
+            job->gapField.reset();
         }
     });
 
@@ -1494,6 +1620,11 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     // dependency watermark commits together.
     _layoutCache = std::move(job.cache);
     _layout = std::move(job.layout);
+    // Null when the checkbox was off at job start or the build failed; the
+    // scene rebuild below draws whatever this is.
+    _gapField = job.gapField;
+    _gapPublishedWanted = job.wantGapField;
+    _gapFieldParams = job.gapParams;
     _layoutUmbilicusFingerprint = job.preReadUmbilicusFingerprint;
     _layoutGeneration = job.snapshot.generation;
     _layoutFrame = job.snapshot.frame;
@@ -1504,6 +1635,8 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     _latchedReason.clear();
     _restingReason.clear();
     _voxelSizeUm = job.snapshot.voxelSizeUm;
+    // The legend's unit follows the voxel size, which this may have changed.
+    updateGapLegend();
 
     // Full rebuild doubles as the memoization check: when nothing the layout
     // consumes changed since the last memoized Update, the from-scratch
@@ -1566,9 +1699,10 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     Logger()->info(
         "fiber map rebuild: GUI stalls snapshot {} ms + publish {} ms · "
         "worker convert {} ms · layout {} ms (prep {:.0f}, detect {:.0f}, "
-        "solve {:.0f}, geometry {:.0f})",
+        "solve {:.0f}, geometry {:.0f}) · gaps {} ms",
         job.snapshotMs, publishMs, job.convertMs, job.layoutMs,
-        _layout.prepMs, _layout.detectMs, _layout.solveMs, _layout.geometryMs);
+        _layout.prepMs, _layout.detectMs, _layout.solveMs, _layout.geometryMs,
+        job.gapMs);
 
     // Default the dock to a width that shows every column of the first real
     // tree; afterwards the width is the user's to manage.
@@ -1621,7 +1755,7 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
         }
     }
     const qint64 totalMs =
-        job.snapshotMs + job.convertMs + job.layoutMs + publishMs;
+        job.snapshotMs + job.convertMs + job.layoutMs + job.gapMs + publishMs;
     if (job.stats.used && !job.fullRebuild) {
         status += tr(" · %1 ms, %2/%3 pairs reused")
                       .arg(totalMs)
@@ -1643,6 +1777,28 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
         // No physical figure on the map means anything, so say why once
         // rather than leave the voxel counts looking like an odd unit.
         status += tr(" · voxel size unknown — lengths in vx");
+    }
+    if (job.wantGapField) {
+        if (_gapField && !_gapField->empty()) {
+            status += tr(" · gaps to %1").arg(formatMapLength(_gapField->saturationVx));
+            if (_gapField->seedFiberCount == 0) {
+                status += tr(" (no fibers to seed)");
+            } else if (!_gapField->folded) {
+                status += _gapFieldParams.acrossWeight > 0.0
+                    ? tr(" (in-sheet only: no sheet pitch)")
+                    : tr(" (in-sheet only)");
+            } else {
+                status += tr(" (\u00d7%1 across)").arg(_gapFieldParams.acrossWeight);
+            }
+            if (_gapField->foldTruncated) {
+                status += tr(", fold cap reached");
+            }
+            if (_gapField->cellCoarsened) {
+                status += tr(", coarse cells");
+            }
+        } else if (!job.gapError.isEmpty()) {
+            status += tr(" · gaps failed: %1").arg(job.gapError);
+        }
     }
     if (job.hadUmbilicus && !job.snapshot.umbilicusLabel.isEmpty()) {
         // The controller composes this: which grid the umbilicus indexes,
@@ -1684,6 +1840,11 @@ void FiberMapWorkspace::finishRebuild()
         _fullRebuildButton->setEnabled(true);
     }
     const auto pending = _rebuildQueue.finishApply();
+    // Whatever this build did (published, discarded, failed), the tiles must
+    // follow the checkbox against the layout that is published NOW: a toggle
+    // during the build only hid or queued, and a discarded build leaves the
+    // old layout standing with settings that may already match.
+    reconcileGapTiles();
     if (pending == vc3d::fiber_map::FiberMapRebuildQueue::Pending::None) {
         return;
     }
@@ -1694,10 +1855,15 @@ void FiberMapWorkspace::finishRebuild()
     // already covers the change, the verdict here is Fresh and the update
     // would recompute a digest-identical map. A latched failure or genuine
     // staleness still dispatches, and a pending Full always does - it is
-    // the user's explicit escape hatch.
+    // the user's explicit escape hatch. The heat map's settings are not a
+    // layout dependency, so they are asked separately: a build that
+    // captured them at its start and published while they moved leaves a
+    // field the toolbar no longer describes, and that pending Update is
+    // the one that fixes it.
     if (!full && _layoutBuilt &&
         evaluateDependencies().action ==
-            vc3d::fiber_map::StaleVerdict::Action::Fresh) {
+            vc3d::fiber_map::StaleVerdict::Action::Fresh &&
+        gapSettingsMatchPublished()) {
         return;
     }
     requestRebuild(full);
@@ -1711,6 +1877,8 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     _networkEmphasized.clear();
     _labelChips.clear();
     _chipHideScale = 0.0;
+    // Scene-owned: clear() deletes them.
+    _gapTiles.clear();
     _scene->clear();
 
     // Kept so a theme change can rebuild the scene as it stands, without asking
@@ -1793,6 +1961,9 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         QRectF(QPointF(_layout.x0Vx, extentTopY), QPointF(_layout.x1Vx, extentBottomY)),
         QPen(Qt::NoPen), QBrush(tint(theme.surface, theme.ink, 0.045)));
     ground->setZValue(kPanelZ);
+
+    // The gap heat map, when there is one and it is switched on.
+    addGapTiles();
 
     // The winding grid, one line per integer winding. The numbers are the
     // top ruler's, which labels whatever is in view; the scene carries only
@@ -2335,6 +2506,167 @@ void FiberMapWorkspace::paintFiberEmphasis(FiberEntry& entry,
         delete entry.glowItem;
         entry.glowItem = nullptr;
     }
+}
+
+vc3d::fiber_map::gaps::GapFieldParams FiberMapWorkspace::gapFieldParams(
+    std::optional<double> voxelSizeUm) const
+{
+    // The same conversion as the layout's intents: the package's voxel size
+    // when known, the documented assumption otherwise.
+    const double vxPerCm = kUmPerCm / voxelSizeUm.value_or(kAssumedVoxelSizeUm);
+    vc3d::fiber_map::gaps::GapFieldParams params;
+    params.cellVx = kGapCellCm * vxPerCm;
+    params.saturationVx =
+        (_gapSaturationSpin ? _gapSaturationSpin->value() : kGapSaturationDefaultCm) * vxPerCm;
+    params.acrossWeight = _gapAcrossSpin ? _gapAcrossSpin->value() : kGapAcrossDefault;
+    params.seedInterpolated = true;
+    return params;
+}
+
+void FiberMapWorkspace::addGapTiles()
+{
+    _gapTiles.clear();
+    // Only a field the toolbar currently describes is ever drawn: a scene
+    // rebuild for any reason (publish, theme change) must not resurrect a
+    // field whose replacement failed or is still pending.
+    if (!_scene || !_gapField || _gapField->empty() || !_gapsCheck || !_gapsCheck->isChecked() ||
+        !gapSettingsMatchPublished()) {
+        return;
+    }
+    const vc3d::fiber_map::gaps::GapField& field = *_gapField;
+    const float inverseSaturation = 1.0f / static_cast<float>(field.saturationVx);
+    for (const vc3d::fiber_map::gaps::GapFieldTile& tile :
+         vc3d::fiber_map::gaps::gapFieldTiles(field, kGapTileCols)) {
+        const int width = tile.colEnd - tile.colBegin;
+        QImage image(width, field.rows, QImage::Format_ARGB32_Premultiplied);
+        // Image row 0 is the top of the tile: the field's last row (largest z).
+        for (int row = 0; row < field.rows; ++row) {
+            const int fieldRow = field.rows - 1 - row;
+            QRgb* line = reinterpret_cast<QRgb*>(image.scanLine(row));
+            for (int col = 0; col < width; ++col) {
+                line[col] = gapColour(field.at(fieldRow, tile.colBegin + col) * inverseSaturation);
+            }
+        }
+        QGraphicsPixmapItem* item = _scene->addPixmap(QPixmap::fromImage(image));
+        item->setTransformationMode(Qt::SmoothTransformation);
+        item->setPos(tile.sceneRect.topLeft());
+        item->setTransform(QTransform::fromScale(field.cellVx, field.cellVx));
+        item->setZValue(kGapZ);
+        _gapTiles.push_back(item);
+    }
+}
+
+void FiberMapWorkspace::setGapTilesVisible(bool visible)
+{
+    for (QGraphicsItem* tile : _gapTiles) {
+        tile->setVisible(visible);
+    }
+}
+
+bool FiberMapWorkspace::gapSettingsMatchPublished() const
+{
+    if (!_layoutBuilt) {
+        return false;
+    }
+    const bool want = _gapsCheck && _gapsCheck->isChecked();
+    // The same conversion the job used: at publish _voxelSizeUm became the
+    // snapshot's, so equal settings compare equal exactly.
+    return vc3d::fiber_map::gaps::sameGapSettings(
+        _gapPublishedWanted, _gapFieldParams, want, gapFieldParams(_voxelSizeUm));
+}
+
+bool FiberMapWorkspace::rebuildInFlight() const
+{
+    return _rebuildQueue.state() != vc3d::fiber_map::FiberMapRebuildQueue::State::Idle;
+}
+
+void FiberMapWorkspace::reconcileGapTiles()
+{
+    const bool show = _gapsCheck && _gapsCheck->isChecked() && gapSettingsMatchPublished();
+    if (show && _gapTiles.empty()) {
+        addGapTiles();
+    }
+    setGapTilesVisible(show);
+}
+
+void FiberMapWorkspace::requestGapRebuild()
+{
+    if (!rebuildInFlight() && !_layoutBuilt) {
+        // Nothing to update yet: the first build reads the toolbar itself.
+        return;
+    }
+    // With a build in flight this coalesces into the pending slot, and
+    // finishRebuild() dispatches it if the settings do not match what that
+    // build captured - or drops it if they do (moved and moved back).
+    requestRebuild(false);
+}
+
+void FiberMapWorkspace::handleGapsToggled(bool checked)
+{
+    updateGapLegend();
+    if (!checked) {
+        setGapTilesVisible(false);
+        return;
+    }
+    // While a build is in flight the published settings say nothing about
+    // what it captured; the reconciliation belongs to its epilogue.
+    if (rebuildInFlight()) {
+        requestGapRebuild();
+        return;
+    }
+    // The published build already asked for exactly this: show its field
+    // again (nothing to show when that build's field failed; the status
+    // line said so). Anything else needs the worker.
+    if (gapSettingsMatchPublished()) {
+        reconcileGapTiles();
+        return;
+    }
+    requestGapRebuild();
+}
+
+void FiberMapWorkspace::handleGapParamsChanged()
+{
+    updateGapLegend();
+    if (!_gapsCheck || !_gapsCheck->isChecked()) {
+        return;
+    }
+    if (!rebuildInFlight() && gapSettingsMatchPublished()) {
+        // Moved and moved back, with nothing in flight to disagree: the
+        // published field is the right one again, so it shows again (a
+        // failed or discarded build in between had hidden it).
+        reconcileGapTiles();
+        return;
+    }
+    requestGapRebuild();
+}
+
+void FiberMapWorkspace::updateGapLegend()
+{
+    if (!_gapLegend || !_gapSaturationSpin || !_gapAcrossSpin || !_gapsCheck) {
+        return;
+    }
+    const bool on = _gapsCheck->isChecked();
+    _gapSaturationSpin->setEnabled(on);
+    _gapAcrossSpin->setEnabled(on);
+    _gapLegend->setEnabled(on);
+    // The ramp, then its range: centimetres only when the voxel size is
+    // known, voxels (as the field measures them) otherwise.
+    constexpr int kWidth = 72;
+    constexpr int kHeight = 10;
+    QPixmap ramp(kWidth, kHeight);
+    ramp.fill(Qt::transparent);
+    {
+        QPainter painter(&ramp);
+        for (int x = 0; x < kWidth; ++x) {
+            const float t = static_cast<float>(x) / static_cast<float>(kWidth - 1);
+            painter.fillRect(x, 0, 1, kHeight, QColor::fromRgba(qUnpremultiply(gapColour(t))));
+        }
+    }
+    _gapLegend->setPixmap(ramp);
+    const QString range = _voxelSizeUm
+        ? tr("0–%1 cm").arg(_gapSaturationSpin->value(), 0, 'f', 1)
+        : tr("0–%1 vx").arg(std::lround(gapFieldParams(std::nullopt).saturationVx));
+    _gapLegend->setToolTip(tr("Gap distance colour scale: %1").arg(range));
 }
 
 void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)

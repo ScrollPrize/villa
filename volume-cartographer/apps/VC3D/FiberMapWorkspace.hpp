@@ -20,6 +20,7 @@
 #include "vc/core/util/ScrollUmbilicus.hpp"
 
 #include "AnnotationFrame.hpp"
+#include "FiberMapGapField.hpp"
 #include "FiberMapRebuildQueue.hpp"
 #include "FiberMapStaleness.hpp"
 #include "FiberNetworkLayout.hpp"
@@ -28,7 +29,9 @@ class FiberMapRuler;
 struct FiberMapRulerModel;
 struct FiberMapRulerStyle;
 class LineAnnotationController;
+class QCheckBox;
 class QDockWidget;
+class QDoubleSpinBox;
 class QEvent;
 class QGraphicsItem;
 class QGraphicsPathItem;
@@ -239,6 +242,37 @@ private:
     // true when the package cannot say how big a voxel is.
     [[nodiscard]] QString formatMapLength(double valueVx) const;
     void setHighlightedFiber(uint64_t fiberId);
+    // The gap heat map (FiberMapGapField.hpp). The field is a pure function of
+    // the published layout and the toolbar's settings: it is built on the
+    // rebuild worker alongside the layout, with the settings captured at job
+    // start, published with it, and dropped with it. It takes part in no
+    // digest. Its tiles are ordinary scene items, recreated from the retained
+    // field by rebuildScene() and forgotten before every scene clear.
+    [[nodiscard]] vc3d::fiber_map::gaps::GapFieldParams gapFieldParams(
+        std::optional<double> voxelSizeUm) const;
+    void addGapTiles();
+    void setGapTilesVisible(bool visible);
+    void handleGapsToggled(bool checked);
+    void handleGapParamsChanged();
+    void updateGapLegend();
+    // Whether the published build's heat-map settings (on/off and
+    // parameters, captured at its job start) are what the toolbar asks for
+    // now. False before any build has published.
+    [[nodiscard]] bool gapSettingsMatchPublished() const;
+    // A build is running or being applied: whatever it captured of the
+    // toolbar is not yet published, so no reuse decision can be made from
+    // the published settings until its epilogue.
+    [[nodiscard]] bool rebuildInFlight() const;
+    // Tiles follow the checkbox against the published field: shown (created
+    // if need be) when on and the published settings match, hidden
+    // otherwise. The rebuild epilogue's last word on the heat map.
+    void reconcileGapTiles();
+    // A settings change that the published build does not cover: queues an
+    // Update when a layout exists or a build is running (the epilogue keeps
+    // a pending Update alive while the settings mismatch, see
+    // finishRebuild()); before a first build with nothing running, that
+    // build captures the settings itself.
+    void requestGapRebuild();
     // Label chips are fixed pixel size, so zoomed far enough out they bury
     // the geometry; below the scale where one winding spans fewer screen
     // pixels than a couple of chips, they all hide.
@@ -285,6 +319,20 @@ private:
     QPushButton* _updateButton = nullptr;
     QPushButton* _fullRebuildButton = nullptr;
     QLabel* _statusLabel = nullptr;
+    QCheckBox* _gapsCheck = nullptr;
+    QDoubleSpinBox* _gapSaturationSpin = nullptr;
+    QDoubleSpinBox* _gapAcrossSpin = nullptr;
+    QLabel* _gapLegend = nullptr;
+    // The published layout's gap field (null before a build that carried
+    // one) and the settings it was built with, so a toggle can tell a field
+    // it may show from one that needs a rebuild.
+    std::shared_ptr<const vc3d::fiber_map::gaps::GapField> _gapField;
+    // What the published build was asked for (the field is null when this
+    // is false, and also when the build failed with it true).
+    bool _gapPublishedWanted = false;
+    vc3d::fiber_map::gaps::GapFieldParams _gapFieldParams;
+    // Scene-owned; cleared (not deleted) whenever the scene is.
+    std::vector<QGraphicsItem*> _gapTiles;
     vc3d::fiber_map::GlobalResult _layout;
     // Memoized rebuild state: the cache, whether a verification failure
     // benched it, and the last build's input/output digests for Full
