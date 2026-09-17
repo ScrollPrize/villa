@@ -32,6 +32,7 @@
 #include <utility>
 
 #include "CWindow.hpp"
+#include "ConstraintGraphWorkspace.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
 #include "LasagnaServiceManager.hpp"
@@ -507,6 +508,9 @@ void AgentBridgeServer::seedViewerRegistry()
         return;
     for (VolumeViewerBase* v : _window->_viewerManager->baseViewers())
         registerViewer(v);
+    if (_window->_constraintGraphWorkspace)
+        for (VolumeViewerBase* v : _window->_constraintGraphWorkspace->viewerManager()->baseViewers())
+            registerViewer(v);
 }
 
 

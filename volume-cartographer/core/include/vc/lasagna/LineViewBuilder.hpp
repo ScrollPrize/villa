@@ -23,6 +23,8 @@ inline constexpr double kLineViewCrossRowSpacingBaseVoxels = 32.0;
 inline constexpr int kLineViewCrossSampleCount = 7;
 
 struct LineViewConfig {
+    double crossSpacingBaseVoxels = kLineViewCrossRowSpacingBaseVoxels;
+    int crossSampleCount = kLineViewCrossSampleCount;
     // Derived ribbons retain every annotation control point and subdivide the
     // optimized polyline between adjacent controls as closely as possible to
     // this spacing. The declared along-strip scale always uses this target, so

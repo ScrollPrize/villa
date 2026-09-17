@@ -2252,6 +2252,8 @@ class FitContext:
         torch.random.manual_seed(self.config['optimizer_random_seed'])
         progress.begin('loading', 'Loading umbilicus')
         umbilicus = self.umbilicus_z_to_yx()
+        # Startup fiber side linking reads this while deriving point inputs.
+        self.umbilicus = umbilicus
         if self.scroll_zarr_path:
             progress.begin('loading', 'Opening scroll volume')
             print('loading volume zarr')
@@ -2589,7 +2591,6 @@ class FitContext:
         # class (b): host-prepared inputs and caches). cross_patch_pcls,
         # unattached_pcl_strips, unattached_strip_sampling_groups, and
         # pcl_sampling_strata were assigned above, before the strata build.
-        self.umbilicus = umbilicus
         self.scroll_zarr = scroll_zarr
         self.fiber_direction_samples = fiber_direction_samples
         self.filter_tracks_by_shell = filter_tracks_by_shell

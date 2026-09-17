@@ -155,6 +155,8 @@ public:
 
     void setOverlayVolume(std::shared_ptr<Volume> volume) override;
     void setOverlayOpacity(float opacity) override;
+    void setSurfaceComparison(std::shared_ptr<Surface> base,std::shared_ptr<Surface> overlay) override;
+    void setSurfaceComparisonOpacity(float opacity) override;
     void setOverlayColormap(const std::string& colormapId) override;
     void setOverlaySamplingMethod(vc::Sampling method) override;
     void setOverlayThreshold(float threshold) override;
@@ -417,6 +419,7 @@ private:
         float windowHigh = 255.0f;
         std::string baseColormapId;
         std::shared_ptr<Surface> surf;
+        std::shared_ptr<Surface> comparisonBase, comparisonOverlay;
         std::string surfaceName;
         std::shared_ptr<vc::render::ChunkCache> chunkArray;
         std::shared_ptr<Volume> overlayVolume;
@@ -576,6 +579,8 @@ private:
     std::uint64_t _chunkRemoteFetchCbId = 0;
 
     QImage _framebuffer;
+    std::shared_ptr<Surface> _comparisonBase, _comparisonOverlay;
+    float _comparisonOpacity = 0.5f;
     std::atomic<bool> _renderWorkerBusy{false};
     std::optional<PendingRenderJob> _activeRenderJob;
     std::optional<PendingRenderJob> _pendingRenderJob;

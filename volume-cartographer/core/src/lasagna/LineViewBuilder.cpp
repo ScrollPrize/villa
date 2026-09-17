@@ -75,14 +75,17 @@ cv::Vec3f toVec3f(const cv::Vec3d& v)
             static_cast<float>(v[2])};
 }
 
-std::vector<double> crossOffsets()
+std::vector<double> crossOffsets(const LineViewConfig& config)
 {
+    if (config.crossSampleCount < 3 || config.crossSampleCount % 2 == 0 ||
+        !std::isfinite(config.crossSpacingBaseVoxels) || config.crossSpacingBaseVoxels <= 0)
+        throw std::invalid_argument("Ribbon cross grid requires an odd sample count >= 3 and positive spacing");
     std::vector<double> offsets;
-    offsets.reserve(kLineViewCrossSampleCount);
-    const int center = kLineViewCrossSampleCount / 2;
-    for (int i = 0; i < kLineViewCrossSampleCount; ++i) {
+    offsets.reserve(config.crossSampleCount);
+    const int center = config.crossSampleCount / 2;
+    for (int i = 0; i < config.crossSampleCount; ++i) {
         offsets.push_back(
-            static_cast<double>(i - center) * kLineViewCrossRowSpacingBaseVoxels);
+            static_cast<double>(i - center) * config.crossSpacingBaseVoxels);
     }
     return offsets;
 }
@@ -908,20 +911,20 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
         }
     }
 
-    const auto fixedCrossOffsets = crossOffsets();
+    const auto fixedCrossOffsets = crossOffsets(config);
 
     LineViewSurfaces surfaces;
     surfaces.lineSurface = buildRibbon(ribbonSamples,
                                        fixedCrossOffsets,
                                        ribbonFrames,
                                        positionMap.stripGridSpacingBaseVoxels,
-                                       kLineViewCrossRowSpacingBaseVoxels,
+                                       config.crossSpacingBaseVoxels,
                                        true);
     surfaces.lineSideSlice = buildRibbon(ribbonSamples,
                                          fixedCrossOffsets,
                                          ribbonFrames,
                                          positionMap.stripGridSpacingBaseVoxels,
-                                         kLineViewCrossRowSpacingBaseVoxels,
+                                         config.crossSpacingBaseVoxels,
                                          false);
     surfaces.stripPositionMap = positionMap;
 

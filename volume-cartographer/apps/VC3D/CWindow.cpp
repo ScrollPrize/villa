@@ -156,6 +156,7 @@
 #include "SegmentationCommandHandler.hpp"
 #include "LasagnaServiceManager.hpp"
 #include "FiberMapWorkspace.hpp"
+#include "ConstraintGraphWorkspace.hpp"
 #include "SpiralWorkspace.hpp"
 #include "SurfaceOverlayColors.hpp"
 #include "segmentation/panels/SegmentationLasagnaPanel.hpp"
@@ -2706,6 +2707,14 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 }
                 scheduleAtlasSearchDockRefresh();
             });
+    _constraintGraphWorkspace = new ConstraintGraphWorkspace(_state, this);
+    _constraintGraphWorkspace->setProperty("workspaceId", QStringLiteral("constraint-graph"));
+    const int constraintGraphIndex = _workspaceTabs->addTab(_constraintGraphWorkspace, tr("Constraint Graph"));
+    if (auto* tabBar = _workspaceTabs->tabBar())
+        tabBar->setTabButton(constraintGraphIndex, QTabBar::RightSide, nullptr);
+    connectVolumeSelector(_constraintGraphWorkspace->volumeSelectionControl());
+    connect(_constraintGraphWorkspace, &ConstraintGraphWorkspace::closeReady, this, [this] { close(); });
+
     _fiberMapWorkspace = new FiberMapWorkspace(_lineAnnotationController.get(), this);
     _fiberMapWorkspace->setProperty("workspaceId", QStringLiteral("fiber-map"));
     const int fiberMapIndex = _workspaceTabs->addTab(_fiberMapWorkspace, tr("Fiber Map"));
@@ -4098,6 +4107,9 @@ VolumeViewerBase* CWindow::activeBaseViewer() const
 
 ViewerManager* CWindow::activeWorkspaceViewerManager() const
 {
+    if (_workspaceTabs && _constraintGraphWorkspace &&
+        _workspaceTabs->currentWidget() == _constraintGraphWorkspace)
+        return _constraintGraphWorkspace->viewerManager();
     if (_workspaceTabs && _spiralWorkspace &&
         _workspaceTabs->currentWidget() == _spiralWorkspace) {
         return _spiralWorkspace->viewerManager();
@@ -4299,6 +4311,8 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     } else {
         _state->setCurrentVolume(newvol);
     }
+    if (_constraintGraphWorkspace)
+        _constraintGraphWorkspace->synchronizeVolume(newvol);
     if (_spiralWorkspace) {
         _spiralWorkspace->synchronizeVolume(newvol, navigationTransform);
     }
@@ -8644,6 +8658,10 @@ void CWindow::saveWindowState()
 
 void CWindow::closeEvent(QCloseEvent* event)
 {
+    if (_constraintGraphWorkspace && !_constraintGraphWorkspace->prepareToClose()) {
+        event->ignore();
+        return;
+    }
     if (_spiralWorkspace && !_spiralCloseGuardBypass
         && _spiralWorkspace->hasPendingBrushWork()) {
         event->ignore();
@@ -9004,6 +9022,8 @@ std::vector<QComboBox*> CWindow::volumeSelectionControls() const
     if (_spiralWorkspace && _spiralWorkspace->volumeSelectionControl()) {
         selectors.push_back(_spiralWorkspace->volumeSelectionControl());
     }
+    if (_constraintGraphWorkspace)
+        selectors.push_back(_constraintGraphWorkspace->volumeSelectionControl());
     return selectors;
 }
 
@@ -9541,6 +9561,8 @@ void CWindow::CloseVolume(void)
 
     // CState::closeAll emits volumeClosing, clears surfaces, vpkg, volume, points
     _state->closeAll();
+    if (_constraintGraphWorkspace)
+        _constraintGraphWorkspace->synchronizeVolume(nullptr);
     if (_spiralWorkspace) {
         _spiralWorkspace->synchronizeVolume(nullptr);
     }
@@ -11312,4 +11334,10 @@ void CWindow::onFiberAnnotationFinished(uint64_t fiberId)
     if (_fiberSliceWidget) {
         _fiberSliceWidget->selectFiber(fiberId);
     }
+}
+
+void CWindow::openConstraintGraphSession(const QString& path)
+{
+    _workspaceTabs->setCurrentWidget(_constraintGraphWorkspace);
+    _constraintGraphWorkspace->openSession(path);
 }

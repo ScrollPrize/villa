@@ -1,5 +1,6 @@
 """Fiber supervision: classification, patch-side linking and radial offsets."""
 
+import json
 import unittest
 from unittest import mock
 
@@ -11,6 +12,7 @@ import fit_spiral
 import point_collection
 from config import Config, FitConfig
 from dt_targets import compute_strip_dt_target_cache
+from fit_session import ScrollSpec, SpiralInputPaths
 from fit_spiral import (
     FitContext,
     _build_strip_flat_bundle,
@@ -30,6 +32,49 @@ from test_revisioned_geometry import context
 
 DR = 12.0
 WINDING = 40
+
+
+@pytest.mark.parametrize('tag, side', [('V', SIDE_FRONT), ('H', SIDE_BEHIND)])
+def test_host_startup_initializes_umbilicus_before_fiber_side_linking(
+        tmp_path, tag, side):
+    umbilicus = tmp_path / 'umbilicus.json'
+    umbilicus.write_text(json.dumps({'control_points': [
+        {'z': 0, 'y': 20, 'x': 30}, {'z': 200, 'y': 20, 'x': 30}]}))
+    fibers = tmp_path / 'fibers'
+    fibers.mkdir()
+    (fibers / 'fiber.json').write_text(json.dumps({
+        'type': 'vc3d_fiber', 'line_points': [],
+        'control_points': [[40, 20, 50], [40, 20, 100]],
+        'hv_classification': {'manual_tag': tag},
+    }))
+    ctx = FitContext(
+        FitConfig(Config({
+            'z_begin': 0, 'z_end': 200,
+            'input_disable_patches': True,
+            'input_use_outer_shell': False,
+            'input_use_fibers': True,
+            'pcl_fiber_link_side_filter': True,
+            'pcl_use_fiber_links': True,
+            'pcl_fiber_min_point_spacing': 0,
+            'pcl_unattached_pcl_min_point_spacing': 0,
+        }).as_dict()),
+        scroll=ScrollSpec(name='test', voxel_size_um=1.0,
+                          spiral_outward_sense='CW'),
+        paths=SpiralInputPaths(umbilicus=str(umbilicus), fibers=str(fibers)),
+    )
+    with mock.patch.object(
+            fit_spiral, 'link_points_to_patches',
+            wraps=fit_spiral.link_points_to_patches) as link:
+        ctx.load_host_inputs()
+
+    options = link.call_args.kwargs['options']
+    assert list(options.side_rules.values()) == [side]
+    np.testing.assert_allclose(
+        options.inward_direction(np.array([[50., 20., 40.]])),
+        [[0., 0., -1.]])
+    np.testing.assert_allclose(ctx.umbilicus(np.array([50.])), [[20., 30.]])
+    assert ctx.fiber_catalog
+    assert ctx.unattached_pcl_strips
 
 
 def _vertical_fiber(theta_of_z, z_len=400.0, spacing=20.0, winding=WINDING):

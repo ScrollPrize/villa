@@ -440,6 +440,10 @@ auto main(int argc, char* argv[]) -> int
         "200");
     parser.addOption(replayTimedProfilePeriodOption);
 
+    QCommandLineOption constraintGraphSessionOption("constraint-graph-session",
+        "Open a saved Constraint Graph workspace session.", "path");
+    parser.addOption(constraintGraphSessionOption);
+
     QCommandLineOption agentBridgeOption(
         "agent-bridge",
         "Enable the agent bridge (JSON-RPC over a local socket) on the default "
@@ -581,6 +585,9 @@ auto main(int argc, char* argv[]) -> int
                 std::_Exit(2);
             }
         }
+
+        if (parser.isSet(constraintGraphSessionOption))
+            aWin.openConstraintGraphSession(parser.value(constraintGraphSessionOption));
 
         // Agent bridge (opt-in, off by default). Constructed only when a bridge
         // flag is present, so normal runs pay zero cost and open no socket.
