@@ -121,7 +121,18 @@ uvx --from huggingface_hub hf buckets sync \
   ./ink-dataset/phercparis4/w00_20231016151002
 ```
 
-Training at full resolution only reads the level-0 chunks under the labeled regions, about 3 GB of those 92 GB. If disk or bandwidth is tight, [download just that part](#small-gpu-or-small-disk) instead.
+Where those 92 GB go:
+
+| Part of the segment | Files | Size |
+|---|---|---|
+| surface volume, level 0 (full resolution) | 101,306 | 67.37 GB |
+| surface volume, level 1 | 25,328 | 17.96 GB |
+| surface volume, levels 2–5 | 8,523 | 6.06 GB |
+| `preds/` (a precomputed prediction) | 1 | 0.40 GB |
+| surface geometry `x/y/z.tif` + `meta.json` | 4 | 0.20 GB |
+| ink labels, supervision mask (all levels) | 12,621 | 0.03 GB |
+
+Training with `volume_scale: "0"` reads only the level-0 chunks under the labeled patches: **with the flat-path selector, ~2.4 GB** instead of 92 GB. If disk or bandwidth is tight, [download just that part](#small-gpu-or-small-disk) instead.
 
 `hf buckets sync` works like `rsync`: re-running it resumes interrupted downloads and only transfers what changed. If you hit rate limits, create a free account, generate a read token under **Settings → Access Tokens**, and either run `uvx --from huggingface_hub hf auth login` once or set `HF_TOKEN=hf_...` in your environment.
 
