@@ -40,17 +40,66 @@
    tested settings/results, update changelog/status/log, validate with the
    pre-approved native replay test runner, and commit.
 
+## Continuation: construction-DP tuning
+
+The completed graph-replay matrix was a negative control, not completion of the
+requested DP retuning. The sharper prediction principally changes the discrete
+DP that constructs each fiberlet between anchors. Continue as follows:
+
+1. Expose a strict nested `fiberlet.path` configuration in the native evaluation
+   CLI for the twelve persisted semantic `FiberletPathConfig` fields: cell
+   radius, neighborhood margin, longitudinal/transverse step, endpoint/prediction
+   angles, corridor radius, invalid-prediction cost, and the four smoothness
+   fields. Never expose the execution-only sampling-batch or thread fields. Feed
+   that same object into metadata/fingerprint generation, on-demand construction,
+   and cached replay; do not introduce a second implementation or bypass
+   canonical construction.
+2. Extend the resumable approved-runner sweep machinery with a path-parameter
+   mode while preserving the already-published graph-sweep identity. Resolve
+   partial candidate overrides against native defaults, hash the complete
+   resolved setting, retain immutable attempts, and reject duplicate settings.
+3. Add native/CLI regression coverage proving that path settings reach persisted
+   construction metadata, alter construction cache identity, and remain separate
+   from replay-only settings. Add Python coverage for validation, duplicate
+   detection, resumption, and dispatch.
+4. Run a corrected-mini5 lattice stage using production anchors and unchanged
+   graph replay: longitudinal step `{1,1.5,2,3,4}` prediction voxels crossed with
+   transverse step `{0.5,1}`. Then test transverse step `0.25` at the best two
+   distinct longitudinal steps, chosen deterministically by failures, coverage,
+   summed first-failure progress, and finally declared candidate order. Include
+   explicit same-run baseline/prewarm and candidate caps. Rank failures first,
+   then coverage and per-case first-failure progress.
+5. If a lattice candidate is credible, refine corridor radius and the local
+   direction/smoothness balance around it. If no lattice point removes a failure,
+   still test a bounded, documented second stage over corridor and prediction
+   deviation because those directly control whether the sharper ridge remains
+   reachable. Record its exact candidates and selection count in the task log and
+   matrix provenance before starting it. Preserve raw corridor radius `0` as the
+   backward-compatible baseline (it resolves to the 4-prediction-voxel anchor
+   cell size), and exclude explicit radius `4` as a behaviorally duplicate but
+   differently hashed identity. Avoid an uncontrolled Cartesian product.
+6. Only then consider stepped cost-profile graph replay and bounded-search
+   approximations. These are secondary because they select among constructed
+   fiberlets; they cannot recover geometry excluded by construction DP.
+7. Promote to short200 only for fewer failures, or the existing deterministic
+   first-failure gate without coverage loss. On short200 compare against both the
+   same-matrix production fiberlet baseline and the regular u22000 tracer. Retain
+   production defaults if no setting passes.
+
 ## Spec update
 
-No tracing/evaluation protocol change. If a fiberlet parameter set wins on the
-200-break benchmark, document it as the current downstream fiberlet default;
-otherwise retain the existing default and archive the sweep.
+Add an optional, strict `fiberlet.path` evaluation configuration that maps
+one-to-one onto the existing native construction DP. No metric/protocol change.
+If a fiberlet parameter set wins on the 200-break benchmark, document it as the
+current downstream fiberlet default; otherwise retain the existing default and
+archive the sweep.
 
 ## Docs updates
 
-Add a benchmark report containing the complete mini5 matrix, promoted 200-case
-results, exact manifests/checkpoint/commands, and interpretation. Update
-`docs/fiberlet_evaluation.md` only if a new default is promoted.
+Extend the benchmark report with the complete construction-DP matrix, promoted
+200-case results, exact manifests/checkpoint/commands, and interpretation.
+Document the new `fiberlet.path` keys. Update `docs/fiberlet_evaluation.md` only
+if a new default is promoted.
 
 ## Testing
 
@@ -67,3 +116,15 @@ ordered variants, legacy/no-anchor-fit binding, interrupted-attempt recovery,
 completed-row validation/provenance rejection, deterministic ranking, and
 per-case metric extraction. Prewarm production graph chunks once, then repeat the
 legacy row after warmup; report end-to-end times as cache-contaminated otherwise.
+
+For construction-DP candidates, cache prewarming is per resolved path identity:
+the first run includes construction and is the relevant end-to-end cost. Do not
+claim replay-only timing parity. Use the approved native build and replay-test
+runners after native parsing changes, and the approved benchmark runner for all
+measurements.
+
+The existing dataset fingerprint names a common anchor-and-fiberlet root, so each
+distinct path identity currently duplicates the unchanged anchor cache as well as
+constructing distinct fiberlets. This is accepted for the bounded sweep and must
+be included in storage/runtime interpretation; do not claim cross-candidate anchor
+reuse.

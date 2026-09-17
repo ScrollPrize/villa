@@ -212,6 +212,28 @@ def test_fiberlet_backend_canonical_cache_resume(replay_fixture):
     assert (root / "warm/cases/0/graph.json").is_file()
     assert (root / "warm/cases/0/rendered/render.json").is_file()
 
+    config["output"] = "path-fine"
+    config["render"] = False
+    config["fiberlet"]["path"] = {
+        "longitudinal_step_prediction": 1.0,
+        "transverse_step_prediction": 1.0,
+    }
+    (root / "evaluation.json").write_text(json.dumps(config))
+    run("replay-set", "--config", root / "evaluation.json")
+    after = payloads()
+    assert before.items() <= after.items()
+    assert len(after) > len(before)  # construction settings create a new fingerprint root
+    metadata = [json.loads(path.read_text()) for path in cache.rglob(".zattrs")]
+    assert any(value.get("processing", {}).get("paths", {}).get(
+        "longitudinal_step_prediction") == 1.0 for value in metadata)
+
+    config["output"] = "invalid-path"
+    config["fiberlet"]["path"]["parallel_threads"] = 8
+    (root / "evaluation.json").write_text(json.dumps(config))
+    rejected = run("replay-set", "--config", root / "evaluation.json", check=False)
+    assert rejected.returncode != 0
+    assert "unknown fiberlet.path parameter: parallel_threads" in rejected.stderr
+
 
 def test_fiberlet_backend_empty_seed_reports_untraced_coverage(replay_fixture):
     root, config, run = replay_fixture

@@ -2925,3 +2925,13 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
   One fine-step/long-lookahead candidate timed out and was retained for audit.
 - Kept beam16/step48/lookahead384 and skipped short200 promotion. Full matrix and
   reproduction details: `../docs/benchmarks/fiberlet_graph_retuning_u22000_20260917.md`.
+
+## 2026-09-17 — Fiberlet construction-DP retuning retained production defaults
+
+- Added strict semantic `fiberlet.path` configuration and a hash-bound,
+  attempt-preserving path-construction sweep behind the approved runner.
+- Tested 25 lattice/reach/objective settings on corrected mini5. Longitudinal4 /
+  transverse0.25 improved summed first-failure progress by +157.169 base voxels
+  but retained all5 failures and missed the locked +160 promotion threshold.
+- Kept the existing construction defaults and skipped short200. Complete results:
+  `../docs/benchmarks/fiberlet_construction_dp_retuning_u22000_20260917.md`.

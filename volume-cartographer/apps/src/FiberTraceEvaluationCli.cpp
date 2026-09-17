@@ -435,6 +435,45 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         throw std::invalid_argument("invalid fiberlet worker/chunk configuration");
     FiberletPathConfig fiberletPaths;
     FiberAnchorConfig fiberletAnchors;
+    if (fiberletSettings.contains("path")) {
+        const auto& path = fiberletSettings.at("path");
+        if (!path.is_object())
+            throw std::invalid_argument("fiberlet.path must be an object");
+        const std::set<std::string> allowed{
+            "cell_radius", "neighborhood_margin_cells",
+            "longitudinal_step_prediction", "transverse_step_prediction",
+            "maximum_endpoint_angle_degrees", "maximum_prediction_deviation_degrees",
+            "corridor_radius_prediction", "invalid_prediction_cost_per_voxel",
+            "smoothness_weight", "smoothness_normal_weight",
+            "smoothness_tangent_weight", "smoothness_free_angle_degrees"};
+        for (const auto& [name, value] : path.items())
+            if (!allowed.contains(name))
+                throw std::invalid_argument("unknown fiberlet.path parameter: " + name);
+        fiberletPaths.cellRadius = path.value("cell_radius", fiberletPaths.cellRadius);
+        fiberletPaths.neighborhoodMarginCells = path.value(
+            "neighborhood_margin_cells", fiberletPaths.neighborhoodMarginCells);
+        fiberletPaths.longitudinalStepPredictionVoxels = path.value(
+            "longitudinal_step_prediction", fiberletPaths.longitudinalStepPredictionVoxels);
+        fiberletPaths.transverseStepPredictionVoxels = path.value(
+            "transverse_step_prediction", fiberletPaths.transverseStepPredictionVoxels);
+        fiberletPaths.maximumEndpointAngleDegrees = path.value(
+            "maximum_endpoint_angle_degrees", fiberletPaths.maximumEndpointAngleDegrees);
+        fiberletPaths.maximumPredictionDeviationDegrees = path.value(
+            "maximum_prediction_deviation_degrees", fiberletPaths.maximumPredictionDeviationDegrees);
+        fiberletPaths.corridorRadiusPredictionVoxels = path.value(
+            "corridor_radius_prediction", fiberletPaths.corridorRadiusPredictionVoxels);
+        fiberletPaths.invalidPredictionCostPerVoxel = path.value(
+            "invalid_prediction_cost_per_voxel", fiberletPaths.invalidPredictionCostPerVoxel);
+        fiberletPaths.smoothnessWeight = path.value(
+            "smoothness_weight", fiberletPaths.smoothnessWeight);
+        fiberletPaths.smoothnessNormalWeight = path.value(
+            "smoothness_normal_weight", fiberletPaths.smoothnessNormalWeight);
+        fiberletPaths.smoothnessTangentWeight = path.value(
+            "smoothness_tangent_weight", fiberletPaths.smoothnessTangentWeight);
+        fiberletPaths.smoothnessFreeAngleDegrees = path.value(
+            "smoothness_free_angle_degrees", fiberletPaths.smoothnessFreeAngleDegrees);
+        validateFiberletPathConfig(fiberletPaths);
+    }
     if (fiberletSettings.contains("anchor_fit")) {
         const auto& fit=fiberletSettings.at("anchor_fit");
         const std::set<std::string> allowed{"method","iterations","presence_exponent","direction_exponent","local_sigma","damping"};

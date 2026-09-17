@@ -260,6 +260,9 @@ def run(workload, devices, *, gpu_manager=None, cancel_event=None):
     if workload.get('fiberlet_sweep'):
         from .fiberlet_parameter_sweep import run_sweep
         return run_sweep(workload, devices, gpu_manager)
+    if workload.get('fiberlet_path_sweep'):
+        from .fiberlet_parameter_sweep import run_path_sweep
+        return run_path_sweep(workload, devices, gpu_manager)
     from .cached_trace_profile import extend_cached_replay, CachedReplaySession
     from .replay_metrics import complete_report, correct_summary
     previous = Path(workload['cached_evaluation'])

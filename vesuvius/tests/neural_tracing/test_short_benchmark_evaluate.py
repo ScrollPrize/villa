@@ -77,6 +77,36 @@ def test_fiberlet_parameter_sweep_variants_require_legacy_lattice_and_order():
         ordered_variants({'fiberlet': {}, 'fiberlet_sweep': {'variants': bad}})
 
 
+def test_fiberlet_path_sweep_resolves_semantic_defaults_and_rejects_aliases():
+    from vesuvius.neural_tracing.fiber_trace_3d.fiberlet_parameter_sweep import ordered_path_variants
+    entries = [
+        dict(name='prewarm', warmup=True, parameters={}),
+        dict(name='baseline', parameters={}),
+        dict(name='fine', parameters=dict(
+            longitudinal_step_prediction=1.5, transverse_step_prediction=.25)),
+    ]
+    rows = ordered_path_variants({'fiberlet': {}, 'fiberlet_path_sweep': {'variants': entries}})
+    assert rows[0]['resolved_path']['longitudinal_step_prediction'] == 2
+    assert rows[2]['resolved_path']['longitudinal_step_prediction'] == 1.5
+    assert rows[2]['resolved_path']['transverse_step_prediction'] == .25
+    assert set(rows[2]['resolved_path']) == {
+        'cell_radius', 'neighborhood_margin_cells', 'longitudinal_step_prediction',
+        'transverse_step_prediction', 'maximum_endpoint_angle_degrees',
+        'maximum_prediction_deviation_degrees', 'corridor_radius_prediction',
+        'invalid_prediction_cost_per_voxel', 'smoothness_weight',
+        'smoothness_normal_weight', 'smoothness_tangent_weight',
+        'smoothness_free_angle_degrees'}
+    with pytest.raises(ValueError, match='measured fiberlet path settings must be unique'):
+        ordered_path_variants({'fiberlet': {}, 'fiberlet_path_sweep': {'variants': entries + [
+            dict(name='baseline-again', parameters={})]}})
+    with pytest.raises(ValueError, match='duplicates'):
+        ordered_path_variants({'fiberlet': {}, 'fiberlet_path_sweep': {'variants': [
+            dict(name='bad-radius', parameters={'corridor_radius_prediction': 4})]}})
+    with pytest.raises(ValueError, match='semantic'):
+        ordered_path_variants({'fiberlet': {}, 'fiberlet_path_sweep': {'variants': [
+            dict(name='threads', parameters={'parallel_threads': 8})]}})
+
+
 def test_fiberlet_parameter_sweep_attempt_recovery_and_completed_validation(tmp_path):
     from vesuvius.neural_tracing.fiber_trace_3d.fiberlet_parameter_sweep import (
         _validate_completed, next_attempt_root,

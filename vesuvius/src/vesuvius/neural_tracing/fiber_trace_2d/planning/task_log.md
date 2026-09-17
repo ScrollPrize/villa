@@ -56,3 +56,71 @@ short200 values remain 67 failures/9.736615mm for fiberlets versus 62
 failures/10.509363mm for the regular u22000 beam tracer. Full matrix, artifacts,
 commands and interpretation are recorded in
 `docs/benchmarks/fiberlet_graph_retuning_u22000_20260917.md`.
+
+Completion audit found that the first matrix tuned graph replay beam controls,
+but the user specifically called out the fiberlet DP step size in the context of
+sharper predictions. Native `FiberletPathConfig` separately controls the actual
+construction lattice: longitudinal step 2 prediction voxels, transverse step
+0.5, default corridor radius one 4-voxel anchor cell, direction deviation 25
+degrees, and local presence/direction/smoothness costs. None of these were
+varied. The prior “complete” conclusion was therefore too narrow. Reopened the
+same task to expose and tune construction DP before deciding whether fiberlets
+can improve on current-best data.
+
+Independent continuation review approved the scope after four constraints were
+made explicit: only the twelve persisted semantic path fields are configurable;
+fine-lattice follow-ups use deterministic top-two selection; raw corridor radius
+zero remains the backward-compatible effective-four baseline while explicit four
+is excluded as a duplicate identity; and each distinct path identity currently
+duplicates the common anchor cache as well as constructing new fiberlets. These
+constraints are now part of the task plan.
+
+Implemented strict native `fiberlet.path` parsing into the canonical
+`FiberletPathConfig`, excluding operational batching/thread controls. Added a
+separate resumable `fiberlet_path_sweep` mode without changing the archived graph
+sweep identity. Partial candidates resolve to the complete native semantic
+default, duplicate identities and the radius-four alias are rejected, and each
+row persists the fully resolved construction setting.
+
+Construction-DP lattice stage1 completed 10 measured settings plus prewarm on
+corrected mini5. Every setting retained 5 failures; production 2/0.5 remained
+best at 100% coverage and 6747.054 summed first-failure base voxels. The
+deterministic top two distinct longitudinal values are 2 (2/0.5=6747.054;
+2/1=6745.975) and 4 (4/1=6746.110; 4/0.5=6704.727). Stage2 is therefore fixed,
+before execution, to transverse 0.25 at longitudinal 2 and 4, plus a same-matrix
+production prewarm/baseline. No other fine-lattice settings will be added.
+
+Stage2 found one positive upper-bound signal: longitudinal4/transverse0.25 kept
+5 failures and 100% coverage, and improved every individual case for a summed
+first-failure gain of +157.169 base voxels (6904.223 versus 6747.054). It misses
+the predeclared +160 promotion gate by 2.831 base voxels and is not promoted yet.
+The next matrix is fixed before execution to 7 measured settings around 4/0.25:
+its raw-radius0/deviation25 baseline; corridor radii 2,3,6; and prediction
+deviations 15,20,35 degrees. Explicit radius4 remains excluded as the native
+radius0 alias. A separate scoring stage, if warranted, is fixed to six one-axis
+changes around the best reach setting: invalid cost 2/8, total smoothness 1/4,
+and tangent smoothness 5/20. Candidate selection for that stage is failures,
+coverage, summed first-failure progress, then declared order; one reach setting
+will be selected.
+
+Stage3 reach results selected the unchanged 4/0.25 setting: corridor2,
+corridor3, corridor6, deviation15, and deviation20 were metric-identical to the
+6904.223 baseline; deviation35 scored 6903.932 and was slower. Stage4 therefore
+uses the already-declared six one-axis local-cost candidates around unchanged
+4/0.25, plus same-matrix prewarm/baseline. No adaptive additions will be made.
+
+Stage4 completed. Invalid-prediction cost 2/8, total smoothness 1/4, and tangent
+smoothness 5 were identical to the 4/0.25 baseline; tangent20 scored 6903.932,
+0.291 base voxel worse. Across all four construction matrices, no setting removed
+a failure. The best was unchanged 4/0.25 with +157.169 summed first-failure base
+voxels and no per-case regression, but it missed the locked +160 gate by 2.831
+and took 364.975s cold versus 14.645s for cached production replay. It was not
+promoted to short200. Production path defaults and the historical short200
+comparison (fiberlet67 failures/9.736615mm versus regular u22000 62/10.509363mm)
+remain authoritative. Full results are in
+`docs/benchmarks/fiberlet_construction_dp_retuning_u22000_20260917.md`.
+
+Final validation: approved native build succeeded; native suites passed
+23/85/17 and the Python/replay suite passed 270 with 8 optional skips. A second
+approved invocation of stage4 validated provenance and skipped all eight
+completed rows without recomputation. No unapproved executable command was used.
