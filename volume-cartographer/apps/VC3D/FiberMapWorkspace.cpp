@@ -42,6 +42,8 @@
 #include <QScrollBar>
 #include <QSpinBox>
 #include <QtConcurrent/QtConcurrent>
+
+#include <opencv2/core.hpp>
 #include <QStyleOptionGraphicsItem>
 #include <QTimer>
 #include <QToolBar>
@@ -321,6 +323,16 @@ QPen interpolatedPen(const QColor& color, qreal width)
     return pen;
 }
 
+bool isDarkPalette(const FiberMapPalette& theme)
+{
+    return &theme == &kDarkPalette;
+}
+
+const FiberMapPalette& paletteForDark(bool dark)
+{
+    return dark ? kDarkPalette : kLightPalette;
+}
+
 // The heat map's colour for a normalised distance t = D / saturation, from
 // the theme's ramp: faint under the fibers, saturating where nothing is
 // drawn, translucent throughout so the ground and grid stay legible. NaN (no
@@ -344,6 +356,64 @@ QRgb gapColour(float t, const FiberMapPalette& theme)
                               channel(lo.colour.green(), hi.colour.green()),
                               channel(lo.colour.blue(), hi.colour.blue()),
                               static_cast<int>(std::lround(255.0f * mix(lo.alpha, hi.alpha)))));
+}
+
+// The ramp sampled at 256 steps: colouring a cell is then one table read
+// instead of an interpolation, which is what makes a 24-million-cell field
+// cheap enough to colour anywhere.
+using GapColourTable = std::array<QRgb, 256>;
+
+GapColourTable gapColourTable(const FiberMapPalette& theme)
+{
+    GapColourTable table{};
+    for (std::size_t i = 0; i < table.size(); ++i) {
+        table[i] = gapColour(static_cast<float>(i) / 255.0f, theme);
+    }
+    return table;
+}
+
+// Colours the field into one premultiplied ARGB image per tile (see
+// gapFieldTiles), rows in parallel. Pure: no Qt widget or scene is touched,
+// so it runs on the rebuild worker as well as on the GUI thread. Image row
+// 0 is the top of the tile, i.e. the field's last row (largest z); a cell
+// with no sheet position (NaN) is transparent.
+std::vector<QImage> colourGapTiles(const vc3d::fiber_map::gaps::GapField& field,
+                                   const GapColourTable& table)
+{
+    std::vector<QImage> images;
+    if (field.empty()) {
+        return images;
+    }
+    const float scale = 255.0f / static_cast<float>(field.saturationVx);
+    for (const vc3d::fiber_map::gaps::GapFieldTile& tile :
+         vc3d::fiber_map::gaps::gapFieldTiles(field, kGapTileCols)) {
+        const int width = tile.colEnd - tile.colBegin;
+        QImage image(width, field.rows, QImage::Format_ARGB32_Premultiplied);
+        // One detach up front: scanLine() on a mutable image bumps QImage's
+        // (non-atomic) detach counter on every call, so rows must address
+        // the buffer directly to be written in parallel.
+        uchar* const bits = image.bits();
+        const qsizetype stride = image.bytesPerLine();
+        cv::parallel_for_(cv::Range(0, field.rows), [&](const cv::Range& range) {
+            for (int row = range.start; row < range.end; ++row) {
+                const int fieldRow = field.rows - 1 - row;
+                QRgb* line = reinterpret_cast<QRgb*>(bits + static_cast<qsizetype>(row) * stride);
+                for (int col = 0; col < width; ++col) {
+                    const float v = field.at(fieldRow, tile.colBegin + col) * scale;
+                    if (std::isnan(v)) {
+                        line[col] = 0;  // premultiplied fully transparent
+                        continue;
+                    }
+                    // Clamped before the cast, so an out-of-range value
+                    // cannot become an out-of-range index.
+                    const int index = static_cast<int>(std::clamp(v, 0.0f, 255.0f) + 0.5f);
+                    line[col] = table[static_cast<std::size_t>(std::min(index, 255))];
+                }
+            }
+        });
+        images.push_back(std::move(image));
+    }
+    return images;
 }
 
 QPainterPath pathForRuns(const vc3d::fiber_map::PlacedFiber& fiber, bool traced)
@@ -1059,6 +1129,7 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     // the highlight, so none of that is repeated here.
     _layout = {};
     _gapField.reset();
+    _pendingGapTiles.clear();
     _gapPublishedWanted = false;
     _gapPublishedError.clear();
     _gapTiles.clear();
@@ -1310,7 +1381,11 @@ struct FiberMapWorkspace::RebuildJobResult {
     // layout.
     bool wantGapField = false;
     vc3d::fiber_map::gaps::GapFieldParams gapParams;
+    // Which theme's ramp to colour with, read on the GUI thread at job
+    // start; the tiles come back coloured so publication only wraps them.
+    bool gapDarkTheme = false;
     std::shared_ptr<const vc3d::fiber_map::gaps::GapField> gapField;
+    std::vector<QImage> gapTiles;
     QString gapError;
     qint64 gapMs = 0;
     // Products.
@@ -1375,6 +1450,8 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
             try {
                 job->gapField = std::make_shared<const vc3d::fiber_map::gaps::GapField>(
                     vc3d::fiber_map::gaps::buildGapField(job->layout, job->gapParams));
+                job->gapTiles = colourGapTiles(
+                    *job->gapField, gapColourTable(paletteForDark(job->gapDarkTheme)));
             } catch (const std::exception& ex) {
                 job->gapError = QString::fromUtf8(ex.what());
             } catch (...) {
@@ -1513,6 +1590,7 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild)
         job->hadUmbilicus = !job->snapshot.umbilicusCenters.empty();
         job->wantGapField = _gapsCheck && _gapsCheck->isChecked();
         job->gapParams = gapFieldParams(job->snapshot.voxelSizeUm);
+        job->gapDarkTheme = isDarkPalette(activePalette());
 
         // No smoothing of the drawn fibers: with the markers pixel-capped,
         // a de-bumped curve read as a distortion of where the fibers really
@@ -1600,6 +1678,7 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
             job->layout = {};
             job->cache = {};
             job->gapField.reset();
+            job->gapTiles.clear();
         }
     });
 
@@ -1692,6 +1771,8 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     // Null when the checkbox was off at job start or the build failed; the
     // scene rebuild below draws whatever this is.
     _gapField = job.gapField;
+    _pendingGapTiles = std::move(job.gapTiles);
+    _pendingGapTilesDark = job.gapDarkTheme;
     _gapPublishedWanted = job.wantGapField;
     _gapPublishedError = job.gapError;
     _gapFieldParams = job.gapParams;
@@ -2725,25 +2806,32 @@ void FiberMapWorkspace::addGapTiles()
     // field whose replacement failed or is still pending.
     if (!_scene || !_gapField || _gapField->empty() || !_gapsCheck || !_gapsCheck->isChecked() ||
         !gapSettingsMatchPublished()) {
+        if (!gapSettingsMatchPublished()) {
+            // Coloured for a field the toolbar has moved past: never shown.
+            _pendingGapTiles.clear();
+        }
         return;
     }
     const vc3d::fiber_map::gaps::GapField& field = *_gapField;
-    const float inverseSaturation = 1.0f / static_cast<float>(field.saturationVx);
     const FiberMapPalette& theme = activePalette();
-    for (const vc3d::fiber_map::gaps::GapFieldTile& tile :
-         vc3d::fiber_map::gaps::gapFieldTiles(field, kGapTileCols)) {
-        const int width = tile.colEnd - tile.colBegin;
-        QImage image(width, field.rows, QImage::Format_ARGB32_Premultiplied);
-        // Image row 0 is the top of the tile: the field's last row (largest z).
-        for (int row = 0; row < field.rows; ++row) {
-            const int fieldRow = field.rows - 1 - row;
-            QRgb* line = reinterpret_cast<QRgb*>(image.scanLine(row));
-            for (int col = 0; col < width; ++col) {
-                line[col] =
-                    gapColour(field.at(fieldRow, tile.colBegin + col) * inverseSaturation, theme);
-            }
-        }
-        QGraphicsPixmapItem* item = _scene->addPixmap(QPixmap::fromImage(image));
+    const std::vector<vc3d::fiber_map::gaps::GapFieldTile> tiles =
+        vc3d::fiber_map::gaps::gapFieldTiles(field, kGapTileCols);
+    // The worker coloured the tiles for the theme in force at job start;
+    // they are used once, here, and the GUI thread only wraps them. Any
+    // other time (a theme change, a toggle after the scene was rebuilt
+    // without them) they are coloured again from the field here - a table
+    // read per cell, rows in parallel: milliseconds even at the cell cap.
+    std::vector<QImage> images;
+    if (!_pendingGapTiles.empty() && _pendingGapTilesDark == isDarkPalette(theme) &&
+        _pendingGapTiles.size() == tiles.size()) {
+        images = std::move(_pendingGapTiles);
+    } else {
+        images = colourGapTiles(field, gapColourTable(theme));
+    }
+    _pendingGapTiles.clear();
+    for (std::size_t i = 0; i < tiles.size() && i < images.size(); ++i) {
+        const vc3d::fiber_map::gaps::GapFieldTile& tile = tiles[i];
+        QGraphicsPixmapItem* item = _scene->addPixmap(QPixmap::fromImage(std::move(images[i])));
         item->setTransformationMode(Qt::SmoothTransformation);
         item->setPos(tile.sceneRect.topLeft());
         item->setTransform(QTransform::fromScale(field.cellVx, field.cellVx));

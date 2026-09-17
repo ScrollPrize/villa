@@ -3,6 +3,7 @@
 #include <QFutureWatcher>
 #include <QGraphicsView>
 #include <QHash>
+#include <QImage>
 #include <QMainWindow>
 #include <QThreadPool>
 #include <QPointer>
@@ -356,6 +357,12 @@ private:
     vc3d::fiber_map::gaps::GapFieldParams _gapFieldParams;
     // Scene-owned; cleared (not deleted) whenever the scene is.
     std::vector<QGraphicsItem*> _gapTiles;
+    // Tile images the worker coloured for the published field, in the theme
+    // it was told (dark or light), waiting for the next addGapTiles() to
+    // wrap them in pixmaps; empty once used, or when the theme has moved on
+    // and they are coloured again from the field.
+    std::vector<QImage> _pendingGapTiles;
+    bool _pendingGapTilesDark = false;
     vc3d::fiber_map::GlobalResult _layout;
     // Memoized rebuild state: the cache, whether a verification failure
     // benched it, and the last build's input/output digests for Full
