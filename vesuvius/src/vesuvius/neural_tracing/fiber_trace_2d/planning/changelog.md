@@ -2779,3 +2779,10 @@ are in docs/embedding_refinement_summary_20260914.md. Boundary sweep stopped on
 user request after eight families and partial ninth; preserved report under
 `/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_anchor_boundaries_20260914_v1/`.
 Partial support-softmin 67 has not received the final exact-repeat stage.
+
+# 2026-09-17 — frozen refined fibers and split-range embeddings
+
+- Added read-only, SHA-verified refined training geometry imports that are
+  independent of model resume, plus separately normalized short-/long-range
+  embedding banks with explicit downstream bank selection. Legacy behavior is
+  unchanged when the new settings are absent.

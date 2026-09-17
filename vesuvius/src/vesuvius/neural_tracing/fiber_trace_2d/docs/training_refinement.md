@@ -114,6 +114,15 @@ identity; changed source membership fails explicitly. Original annotations are
 never overwritten. Shared geometry remains owned by the training supervisor
 during GPU pause/reallocation, and is removed when that supervisor exits.
 
+To train a fresh model on an already refined training corpus, set
+`update_enabled: false`, `state_checkpoint` to the refinement checkpoint, and
+`state_sha256` to its recorded archive digest. This is not model resume: the new
+training has fresh weights, optimizer, EMA and update0. The source archive is
+restored read-only, validated against every training fiber, and never copied into
+new snapshots. No proposals, solves, commits, or refinement metrics run. Tests use
+their immutable original GT rather than incompatible saved crop identities. A
+later model resume still restores the same explicit geometry source.
+
 Currently unsupported with refinement: unmanaged multi-GPU launches, conditioned
 decoders, historical-test datasets, and test-output upsampling. These fail
 explicitly. Standard managed training and native output strides are supported.

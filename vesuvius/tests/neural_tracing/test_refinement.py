@@ -15,6 +15,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.refinement import (
     presence_force, refine_curve, refinement_session,
     refine_observations, BatchedPatchTransform, step_limits, bending_terms, refinement_losses,
     normal_projectors, shape_metric, direction_feedback, REFINEMENT_LOSS_NAMES,
+    active_store,
 )
 
 
@@ -32,6 +33,26 @@ def test_config_rejects_invalid():
     for key in ("model", "model_3d"):
         with pytest.raises(ValueError, match="unconditioned"):
             RefinementConfig.parse({"refinement": {"enabled": True}, key: {"conditioned_decoder_enabled": True}})
+    frozen = {"enabled": True, "update_enabled": False,
+              "state_checkpoint": "/tmp/state.pt", "state_sha256": "a" * 64}
+    assert not RefinementConfig.parse({"refinement": frozen}).update_enabled
+    for invalid in ({**frozen, "state_sha256": None}, {**frozen, "state_sha256": "BAD"},
+                    {**frozen, "enabled": False}):
+        with pytest.raises(ValueError):
+            RefinementConfig.parse({"refinement": invalid})
+
+
+def test_frozen_geometry_store_is_read_only(tmp_path):
+    writable = GeometryStore(tmp_path / "state")
+    cfg = RefinementConfig(enabled=True)
+    key = "f" * 64
+    writable.register(key, line()[:, :3], {"split": "train"}, cfg)
+    frozen = GeometryStore(writable.root, read_only=True)
+    frozen.register(key, line()[:, :3], {"split": "train"}, cfg)
+    with pytest.raises(RuntimeError, match="read-only"):
+        frozen.commit(key, 0, frozen.read(key), frozen.read(key))
+    with pytest.raises(ValueError, match="missing"):
+        frozen.register("e" * 64, line()[:, :3], {"split": "train"}, cfg)
 
 
 def test_ellipse_plane_step_and_border():
@@ -439,6 +460,40 @@ def test_session_restores_and_cleans_environment(tmp_path, monkeypatch):
     root = run(cfg)
     assert not os.path.exists(root)
     assert "VILLA_FIBER_REFINEMENT_STATE" not in os.environ
+
+
+def test_frozen_session_uses_explicit_geometry_checkpoint_without_model_resume(tmp_path, monkeypatch):
+    monkeypatch.delenv("VILLA_FIBER_REFINEMENT_STATE", raising=False)
+    source = tmp_path / "source"
+    source.mkdir()
+    key = "d" * 64
+    store = GeometryStore(source / "state")
+    store.register(key, line()[:, :3], {"split": "train"}, RefinementConfig(enabled=True))
+    saved = store.save(source / "fibers.zip")
+    checkpoint = source / "current.pt"
+    torch.save({"refinement_state": saved}, checkpoint)
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"refinement": {
+        "enabled": True,
+        "update_enabled": False,
+        "state_checkpoint": str(checkpoint),
+        "state_sha256": saved["sha256"],
+    }}))
+
+    @refinement_session
+    def run(path, **kwargs):
+        assert "resume_checkpoint" not in kwargs
+        frozen = active_store()
+        assert frozen.read_only
+        np.testing.assert_array_equal(frozen.read(key), store.read(key))
+        with pytest.raises(RuntimeError, match="read-only"):
+            frozen.commit(key, 0, frozen.read(key), frozen.read(key))
+        return os.environ["VILLA_FIBER_REFINEMENT_STATE"]
+
+    root = run(cfg)
+    assert not os.path.exists(root)
+    assert "VILLA_FIBER_REFINEMENT_STATE" not in os.environ
+    assert "VILLA_FIBER_REFINEMENT_FROZEN" not in os.environ
 
 
 def _distributed_refinement_worker(rank, world, rendezvous, root):

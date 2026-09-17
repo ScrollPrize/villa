@@ -25,6 +25,9 @@ def empty_refinement_statistics():
 @dataclass(frozen=True)
 class RefinementConfig:
     enabled: bool = False
+    update_enabled: bool = True
+    state_checkpoint: str | None = None
+    state_sha256: str | None = None
     iterations: int = 4
     spacing_base: float = 8.0
     samples_per_segment: int = 4
@@ -48,8 +51,17 @@ class RefinementConfig:
         if unknown:
             raise ValueError(f"unknown refinement settings: {sorted(unknown)}")
         result = cls(**values)
-        if type(result.enabled) is not bool:
-            raise ValueError("refinement.enabled must be boolean")
+        if type(result.enabled) is not bool or type(result.update_enabled) is not bool:
+            raise ValueError("refinement enabled/update_enabled must be boolean")
+        if result.state_checkpoint is not None and (not isinstance(result.state_checkpoint, str) or not result.state_checkpoint):
+            raise ValueError("refinement.state_checkpoint must be a nonempty path string")
+        if result.state_sha256 is not None and (not isinstance(result.state_sha256, str) or len(result.state_sha256) != 64 or
+                any(c not in "0123456789abcdef" for c in result.state_sha256)):
+            raise ValueError("refinement.state_sha256 must be a lowercase SHA256")
+        if not result.update_enabled and (not result.enabled or not result.state_checkpoint or not result.state_sha256):
+            raise ValueError("frozen refinement requires enabled=true plus state_checkpoint/state_sha256")
+        if (result.state_checkpoint is None) != (result.state_sha256 is None):
+            raise ValueError("refinement state_checkpoint and state_sha256 must be specified together")
         for name in ("iterations", "samples_per_segment"):
             if type(getattr(result, name)) is not int or not 1 <= getattr(result, name) <= 64:
                 raise ValueError(f"refinement.{name} must be an integer in [1,64]")
@@ -284,6 +296,7 @@ def refine_curve(current, baseline_points, baseline_arc, normals, presence, to_p
 
 
 _ENV = "VILLA_FIBER_REFINEMENT_STATE"
+_FROZEN_ENV = "VILLA_FIBER_REFINEMENT_FROZEN"
 
 
 @contextmanager
@@ -296,9 +309,10 @@ def file_lock(path, shared=False):
 
 
 class GeometryStore:
-    def __init__(self, root):
+    def __init__(self, root, *, read_only=False):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self.read_only = bool(read_only)
 
     def register(self, key, points, metadata, cfg):
         path = self.root / key
@@ -307,6 +321,8 @@ class GeometryStore:
                 if json.loads((path / "metadata.json").read_text()) != json.loads(json.dumps(metadata)):
                     raise ValueError("refinement geometry metadata changed for an existing source")
                 return
+            if self.read_only:
+                raise ValueError("frozen refinement archive is missing a configured training fiber")
             if (self.root / "restored.json").exists():
                 raise ValueError("refinement resume sources differ from the saved geometry; refusing to reset GT")
             arc = arclength(points)
@@ -329,6 +345,8 @@ class GeometryStore:
         New deterministic crops may be first encountered after a checkpoint.
         They always start from immutable GT, including after legacy resumes.
         """
+        if self.read_only:
+            raise RuntimeError("frozen refinement cannot create test-patch state")
         from dataclasses import asdict
         identity = dict(protocol="fixed-test-crop-v1", parent=parent,
                         sample_index=int(sample_index), params=asdict(params),
@@ -357,6 +375,8 @@ class GeometryStore:
         return np.load(self.root / key / "baseline.npy", mmap_mode="r")
 
     def commit(self, key, start, before, after):
+        if self.read_only:
+            raise RuntimeError("frozen refinement geometry is read-only")
         path = self.root / key
         with file_lock(path / "lock"):
             target = np.load(path / "current.npy", mmap_mode="r+")
@@ -370,6 +390,8 @@ class GeometryStore:
 
     def save(self, target):
         """One portable archive shared by raw/EMA snapshots at this step."""
+        if self.read_only:
+            raise RuntimeError("frozen refinement reuses its immutable source archive")
         import zipfile
         target = Path(target)
         temporary = target.with_suffix(".tmp")
@@ -435,19 +457,36 @@ def refinement_session(function):
         if int(os.environ.get("WORLD_SIZE", "1")) > 1:
             raise ValueError("refinement multi-GPU launch must use the cooperative manager, not torchrun")
         resume = kwargs.get("resume_checkpoint") or raw.get("training", {}).get("resume") or raw.get("resume")
+        state_source = None
+        if cfg.state_checkpoint:
+            state_source = Path(cfg.state_checkpoint).expanduser()
+            if not state_source.is_absolute():
+                state_source = Path(config_path).resolve().parent / state_source
+        elif resume:
+            state_source = Path(resume)
         with tempfile.TemporaryDirectory(prefix="fiber-refinement-") as root:
-            if resume:
+            if state_source:
                 import torch
-                state = torch.load(resume, map_location="cpu", weights_only=False)
+                state = torch.load(state_source, map_location="cpu", weights_only=False)
                 saved = state.get("refinement_state")
                 if saved:
-                    GeometryStore(root).restore(Path(resume).parent / saved["file"], saved["sha256"])
+                    if cfg.state_sha256 and saved["sha256"] != cfg.state_sha256:
+                        raise ValueError("configured frozen refinement SHA does not match source checkpoint")
+                    GeometryStore(root).restore(state_source.parent / saved["file"], saved["sha256"])
+                    if not cfg.update_enabled:
+                        print(f"fiber refinement: frozen geometry restored source={state_source} "
+                              f"archive={saved['file']} sha256={saved['sha256']}", flush=True)
                 elif state.get("config", {}).get("refinement", {}).get("enabled"):
                     raise ValueError("refinement checkpoint is missing its fiber state")
+                elif cfg.state_checkpoint:
+                    raise ValueError("configured refinement state checkpoint has no fiber state")
             os.environ[_ENV] = root
+            if not cfg.update_enabled:
+                os.environ[_FROZEN_ENV] = "1"
             try:
                 return function(config_path, **kwargs)
             finally:
+                os.environ.pop(_FROZEN_ENV, None)
                 os.environ.pop(_ENV, None)
     return wrapped
 
@@ -455,7 +494,7 @@ def refinement_session(function):
 def active_store():
     if _ENV not in os.environ:
         raise RuntimeError("enabled refinement requires the training launcher (missing shared state)")
-    return GeometryStore(os.environ[_ENV])
+    return GeometryStore(os.environ[_ENV], read_only=os.environ.get(_FROZEN_ENV) == "1")
 
 
 def export_metadata(fiber):
@@ -708,7 +747,7 @@ class RefinementObserver:
         self.accepted = self.stale = 0
 
     def __call__(self, batch, output):
-        if not self.config.enabled:
+        if not self.config.enabled or not self.config.update_enabled:
             return
         from .model import presence_outputs, direction_outputs
         directions = None
@@ -722,7 +761,7 @@ class RefinementObserver:
                              presence_outputs(output.detach()).amax(dim=1).squeeze(1).float(),directions))
 
     def flush(self, distributed, *, phase=None, step=None, writer=None, batch=None):
-        if not self.config.enabled:
+        if not self.config.enabled or not self.config.update_enabled:
             return
         import torch.distributed as dist
         started = time.perf_counter()

@@ -22,6 +22,47 @@ def paired_batch(pair_id=0):
         eligible=torch.ones_like(g.eligible)) for i,g in enumerate(b.embedding_geometry)))
 
 
+def split_batch(pair_id=0, channels=2):
+    batch = paired_batch(pair_id)
+    return replace(batch, embedding_geometry=tuple(
+        replace(g, short_range_channels=channels) for g in batch.embedding_geometry))
+
+
+def test_split_range_banks_have_independent_counts_gradients_and_diagnostics():
+    batch = split_batch()
+    embeddings = torch.randn(2, 4, 8, 8, 8, requires_grad=True)
+    presence = torch.rand(2, 1, 8, 8, 8, requires_grad=True)
+    diagnostics = []
+    result = embedding_statistics(embeddings, presence, batch, diagnostics)
+    assert len(result) == 10
+    assert result[5] == 0
+    assert result[7] == result[9] == 16
+    loss = .5 * (result[6] / result[7] + result[8] / result[9])
+    loss.backward()
+    assert presence.grad is None
+    assert embeddings.grad[:, :2].abs().sum() > 0
+    assert embeddings.grad[:, 2:].abs().sum() > 0
+    assert all("short_positive_mean" in row and "long_positive_mean" in row
+               for row in diagnostics)
+
+
+def test_split_range_config_is_strict_and_budget_preserving():
+    config = EmbeddingConfig.from_mapping({"embedding": {
+        "enabled": True, "channels": 16, "objective": "local_contrastive",
+        "paired_patches": True, "short_range_channels": 8,
+        "pairs_at_128": 65536, "negatives_per_anchor": 32,
+    }})
+    assert config.pairs((128,) * 3) == 65536
+    for values in (
+        {"enabled": True, "channels": 16, "objective": "pairwise", "short_range_channels": 8},
+        {"enabled": True, "channels": 16, "objective": "local_contrastive", "short_range_channels": 8},
+        {"enabled": True, "channels": 8, "objective": "local_contrastive", "paired_patches": True,
+         "short_range_channels": 8},
+    ):
+        with pytest.raises(ValueError, match="short_range_channels"):
+            EmbeddingConfig.from_mapping({"embedding": values})
+
+
 def test_pair_joint_gradients_and_detached_presence():
     b = paired_batch()
     torch.manual_seed(4)
@@ -137,29 +178,107 @@ def test_full_model_single_backward_pair_accumulation(monkeypatch):
         torch.testing.assert_close(a.grad,b.grad,atol=3e-5,rtol=3e-4)
 
 
+def test_split_range_single_backward_accumulation_matches_full_batch():
+    import copy
+    from vesuvius.neural_tracing.fiber_trace_3d.gradient_accumulation import NormalizedGradientAccumulator
+    from vesuvius.neural_tracing.fiber_trace_3d.train import _finalize_loss_statistics
+    cfg = tiny_config()
+    cfg['embedding'].update(objective='local_contrastive', paired_patches=True,
+                            channels=4, short_range_channels=2)
+    torch.manual_seed(81)
+    model = build_fiber_trace_3d_model(cfg)
+    oracle = copy.deepcopy(model)
+    batches = [split_batch(0), split_batch(1)]
+    total = _forward_loss_statistics(oracle, batches[0]) + _forward_loss_statistics(oracle, batches[1])
+    _finalize_loss_statistics(total, direction_weight=1., presence_weight=1.)['total'].backward()
+    counts = sum(pair_prepass_counts(b) for b in batches)
+    accumulator = NormalizedGradientAccumulator(model, counts, direction_weight=1., presence_weight=1.)
+    for batch in batches:
+        accumulator.add(_forward_loss_statistics(model, batch))
+    accumulator.reduce_and_assign()
+    for actual, expected in zip(model.parameters(), oracle.parameters()):
+        torch.testing.assert_close(actual.grad, expected.grad, atol=3e-5, rtol=3e-4)
+
+
+@pytest.mark.parametrize("split", [False, True])
 @pytest.mark.skipif(os.environ.get('FIBER_COOPERATIVE_CUDA_TEST')!='1',reason='manager-only GPU test')
-def test_cuda_embedding_paired_forward_backward():
+def test_cuda_embedding_paired_forward_backward(split):
     import time
     torch.set_num_threads(1)
     device=torch.device('cuda:0')
     torch.cuda.set_per_process_memory_fraction(8*1024**3/torch.cuda.get_device_properties(0).total_memory)
     cfg=tiny_config(); cfg['embedding'].update(objective='local_contrastive',paired_patches=True)
+    if split:
+        cfg['embedding'].update(channels=4, short_range_channels=2)
     model=build_fiber_trace_3d_model(cfg).to(device)
-    batch=paired_batch().to(device)
+    batch=(split_batch() if split else paired_batch()).to(device)
     start=time.perf_counter()
     for _ in range(3):
         model.zero_grad(set_to_none=True)
         with torch.autocast('cuda',dtype=torch.bfloat16):
             stats=_forward_loss_statistics(model,batch)
-            loss=stats.contrastive_embedding_sum/stats.contrastive_embedding_count
+            loss=(.5 * (stats.short_embedding_sum / stats.short_embedding_count +
+                        stats.long_embedding_sum / stats.long_embedding_count)
+                  if split else stats.contrastive_embedding_sum / stats.contrastive_embedding_count)
         loss.backward()
         assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
     torch.cuda.synchronize()
-    print('PAIRED_GPU_SMOKE',dict(gpus=1,patches_per_step=2,steps=3,seconds=time.perf_counter()-start,
+    print('PAIRED_GPU_SMOKE',dict(gpus=1,split=split,patches_per_step=2,steps=3,seconds=time.perf_counter()-start,
         peak_allocated_bytes=torch.cuda.max_memory_allocated()))
 
 
-def _paired_distributed_worker(rank, directory):
+@pytest.mark.skipif(os.environ.get('FIBER_COOPERATIVE_CUDA_TEST')!='1',reason='manager-only GPU test')
+def test_cuda_embedding_split_matched_budget_cost():
+    import json
+    import statistics
+    import time
+    torch.set_num_threads(1)
+    device = torch.device('cuda:0')
+    torch.cuda.set_per_process_memory_fraction(
+        8 * 1024**3 / torch.cuda.get_device_properties(0).total_memory)
+    base = paired_batch()
+    base = replace(base, embedding_geometry=tuple(
+        replace(g, pairs=65536, negatives_per_anchor=32,
+                eligible=torch.ones(32, 32, 32, dtype=torch.bool))
+        for g in base.embedding_geometry))
+    batches = {
+        "legacy": base.to(device),
+        "split8x8": replace(base, embedding_geometry=tuple(
+            replace(g, short_range_channels=8) for g in base.embedding_geometry)).to(device),
+    }
+    rows = {}
+    for name, batch in batches.items():
+        embeddings = torch.randn(2, 16, 32, 32, 32, device=device, requires_grad=True)
+        presence = torch.rand(2, 1, 32, 32, 32, device=device)
+        samples = []
+        for iteration in range(13):
+            embeddings.grad = None
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            values = embedding_statistics(embeddings, presence, batch)
+            loss = (values[4] / values[5] if name == "legacy" else
+                    .5 * (values[6] / values[7] + values[8] / values[9]))
+            loss.backward()
+            torch.cuda.synchronize()
+            if iteration >= 3:
+                samples.append(time.perf_counter() - started)
+        ordered = sorted(samples)
+        rows[name] = {
+            "mean_s": statistics.mean(samples),
+            "p50_s": statistics.median(samples),
+            "p95_s": ordered[min(len(ordered) - 1, round(.95 * (len(ordered) - 1)))],
+            "min_s": ordered[0],
+            "max_s": ordered[-1],
+        }
+    print("SPLIT_EMBEDDING_MATCHED_BUDGET " + json.dumps({
+        "processing_units": "one GPU; two 16-channel 32-cube patches; 65536 negatives per patch",
+        "warmups": 3,
+        "measured_iterations": 10,
+        "results": rows,
+    }, sort_keys=True))
+
+
+def _paired_distributed_worker(rank, directory, split):
     import torch.distributed as dist
     from datetime import timedelta
     torch.set_num_threads(1)
@@ -172,14 +291,18 @@ def _paired_distributed_worker(rank, directory):
     try:
         torch.manual_seed(71)
         cfg=tiny_config(); cfg['embedding'].update(objective='local_contrastive',paired_patches=True)
+        if split:
+            cfg['embedding'].update(channels=4, short_range_channels=2)
         model=build_fiber_trace_3d_model(cfg).to(device)
         import copy
         oracle=copy.deepcopy(model)
         def run(m,which):
-            batch=paired_batch(which)
+            batch=split_batch(which) if split else paired_batch(which)
             batch=replace(batch,embedding_geometry=tuple(replace(g,seed=g.seed+which*100) for g in batch.embedding_geometry)).to(device)
             stats=_forward_loss_statistics(m,batch)
-            return stats.contrastive_embedding_sum/stats.contrastive_embedding_count
+            return (.5 * (stats.short_embedding_sum / stats.short_embedding_count +
+                           stats.long_embedding_sum / stats.long_embedding_count)
+                    if split else stats.contrastive_embedding_sum/stats.contrastive_embedding_count)
         run(model,rank).backward()
         for param in model.parameters():
             if param.grad is not None:
@@ -191,9 +314,10 @@ def _paired_distributed_worker(rank, directory):
         dist.destroy_process_group()
 
 
+@pytest.mark.parametrize("split", [False, True])
 @pytest.mark.skipif(os.environ.get('FIBER_COOPERATIVE_CUDA_TEST')!='1',reason='manager-only GPU test')
-def test_cuda_embedding_paired_two_gpu(tmp_path):
-    torch.multiprocessing.spawn(_paired_distributed_worker,args=(str(tmp_path),),nprocs=2)
+def test_cuda_embedding_paired_two_gpu(tmp_path, split):
+    torch.multiprocessing.spawn(_paired_distributed_worker,args=(str(tmp_path), split),nprocs=2)
 
 
 @pytest.mark.skipif(os.environ.get('FIBER_EMBEDDING_DATA_TEST')!='1',reason='approved host-data test only')
@@ -212,3 +336,39 @@ def test_paired_real_data_preflight():
             a,b=[s.sample.embedding_geometry for s in samples]
             assert a.fiber_id==b.fiber_id and (a.pair_member,b.pair_member)==(0,1)
             print('PAIRED_DATA_OK',kind,entry['scroll_id'],a.fiber_id,flush=True)
+
+
+@pytest.mark.skipif(os.environ.get('FIBER_EMBEDDING_DATA_TEST')!='1',reason='approved host-data test only')
+def test_frozen_split_real_data_preflight():
+    import json
+    from pathlib import Path
+    from vesuvius.neural_tracing.fiber_trace_3d.loader import FiberTrace3DLoader, config_from_mapping
+    from vesuvius.neural_tracing.fiber_trace_3d.refinement import refinement_session
+    path = Path(__file__).parents[2] / (
+        'src/vesuvius/neural_tracing/fiber_trace_3d/configs/'
+        'train_5scroll_json_eligible_fullres_frozen_refined_split_embedding_ema_16x8.json')
+
+    @refinement_session
+    def verify(config_path):
+        raw = json.loads(config_path.read_text())
+        train_cfg = config_from_mapping({**raw, 'batch_size': 2, 'volume_io_threads': 1},
+                                        config_dir=config_path.parent)
+        train = FiberTrace3DLoader(train_cfg)
+        assert train._refinement_store.read_only
+        assert len(train._refinement_keys) == len(train.records) > 0
+        assert any(not np.array_equal(train._refinement_store.read(key),
+                                      train._refinement_store.baseline(key)[:, :3])
+                   for key in train._refinement_keys)
+        samples = [train.load_raw_sample(i) for i in range(2)]
+        assert samples[0].sample.embedding_geometry.pair_id == samples[1].sample.embedding_geometry.pair_id
+
+        test_raw = {**raw, 'datasets': raw['test_datasets'], '_refinement_split': 'test',
+                    'augment_enabled': False, 'batch_size': 2, 'volume_io_threads': 1}
+        test = FiberTrace3DLoader(config_from_mapping(test_raw, config_dir=config_path.parent))
+        assert test._refinement_store is None
+        test_samples = [test.load_raw_sample(i, sample_mode='flat') for i in range(2)]
+        assert test_samples[0].sample.embedding_geometry.pair_id == test_samples[1].sample.embedding_geometry.pair_id
+        print('FROZEN_SPLIT_DATA_OK', {'train_fibers': len(train.records),
+              'test_fibers': len(test.records)}, flush=True)
+
+    verify(path)

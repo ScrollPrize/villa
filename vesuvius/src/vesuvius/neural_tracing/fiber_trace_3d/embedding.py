@@ -19,11 +19,12 @@ class EmbeddingConfig:
     temperature: float = 0.1
     margin: float = 0.2
     paired_patches: bool = False
+    short_range_channels: int = 0
 
     @classmethod
     def from_mapping(cls, raw):
         values = dict(raw.get("embedding", {}))
-        unknown = set(values) - {"enabled", "channels", "pairs_at_128", "weight", "objective", "negatives_per_anchor", "temperature", "margin", "paired_patches"}
+        unknown = set(values) - {"enabled", "channels", "pairs_at_128", "weight", "objective", "negatives_per_anchor", "temperature", "margin", "paired_patches", "short_range_channels"}
         if unknown:
             raise ValueError(f"unknown embedding settings: {sorted(unknown)}")
         model = raw.get("model_3d", raw.get("model", {}))
@@ -43,6 +44,12 @@ class EmbeddingConfig:
         if type(result.paired_patches) is not bool or (result.paired_patches and
                 (not result.enabled or result.objective != "local_contrastive")):
             raise ValueError("paired_patches requires enabled local_contrastive embeddings")
+        if type(result.short_range_channels) is not int or result.short_range_channels < 0:
+            raise ValueError("embedding.short_range_channels must be a nonnegative integer")
+        if result.short_range_channels and (
+                not result.enabled or result.objective != "local_contrastive" or
+                not result.paired_patches or result.short_range_channels >= result.channels):
+            raise ValueError("short_range_channels requires paired local_contrastive embeddings and a nonempty long-range bank")
         if type(result.negatives_per_anchor) is not int or result.negatives_per_anchor < 1:
             raise ValueError("negatives_per_anchor must be positive integer")
         if not math.isfinite(result.temperature) or result.temperature <= 0 or not math.isfinite(result.margin):
@@ -51,7 +58,7 @@ class EmbeddingConfig:
 
     def pairs(self, shape):
         if self.objective == "local_contrastive":
-            k = self.negatives_per_anchor
+            k = self.negatives_per_anchor * (2 if self.short_range_channels else 1)
             return k * max(1, round(self.pairs_at_128 * max(shape) / 128 / k))
         return 2 * max(1, round(self.pairs_at_128 * max(shape) / 128 / 2))
 
@@ -70,6 +77,7 @@ class EmbeddingGeometry:
     pair_id: int | None = None
     pair_member: int = 0
     fiber_id: str = ""
+    short_range_channels: int = 0
 
 
 class InvalidNormalSampleError(ValueError):
@@ -243,6 +251,13 @@ def embedding_pair_counts(batch):
     if len(modes) != 1:
         raise ValueError("mixed embedding objectives in batch")
     if modes == {"local_contrastive"}:
+        split = {g.short_range_channels for g in batch.embedding_geometry}
+        if len(split) != 1:
+            raise ValueError("mixed embedding channel splits in batch")
+        if next(iter(split)):
+            return (0, 0, 0,
+                    sum(g.pairs // (2 * g.negatives_per_anchor) for g in batch.embedding_geometry),
+                    sum(g.pairs // (2 * g.negatives_per_anchor) for g in batch.embedding_geometry))
         return (0, 0, sum(g.pairs // g.negatives_per_anchor for g in batch.embedding_geometry))
     half = sum(g.pairs // 2 for g in batch.embedding_geometry)
     return half, half
@@ -259,9 +274,27 @@ def validate_patch_pairs(geometries):
                 not a.fiber_id or a.fiber_id != b.fiber_id):
             raise ValueError("embedding pair identity/fiber mismatch")
         if (a.pairs, a.stride, a.weight, a.objective, a.negatives_per_anchor,
-                a.temperature, a.margin) != (b.pairs, b.stride, b.weight, b.objective,
-                b.negatives_per_anchor, b.temperature, b.margin):
+                a.temperature, a.margin, a.short_range_channels) != (
+                b.pairs, b.stride, b.weight, b.objective,
+                b.negatives_per_anchor, b.temperature, b.margin, b.short_range_channels):
             raise ValueError("embedding pair settings mismatch")
+
+
+def _presence_weighted_negatives(embeddings, presence, geometries, banks, channels,
+                                 count, anchors, rng):
+    weights = torch.cat([presence[j].detach().float().reshape(-1) for j in banks])
+    if not bool(torch.isfinite(weights).all()) or bool(((weights < 0) | (weights > 1)).any()):
+        raise ValueError("embedding presence must be finite probabilities")
+    weights = weights * torch.cat([geometries[j].eligible.to(weights.device).reshape(-1) for j in banks])
+    if not bool(weights.sum() > 0):
+        return embeddings.new_empty((anchors, 0), dtype=torch.float32)
+    chosen = torch.multinomial(weights, count, replacement=True, generator=rng)
+    vectors = torch.cat([
+        embeddings[j, channels].reshape(embeddings[:, channels].shape[1], -1)
+        for j in banks
+    ], dim=1)
+    sampled = F.normalize(vectors[:, chosen].T.float(), dim=1, eps=1e-8)
+    return sampled.reshape(anchors, count // anchors, -1)
 
 
 def embedding_statistics(embeddings, presence, batch, diagnostics=None):
@@ -271,9 +304,10 @@ def embedding_statistics(embeddings, presence, batch, diagnostics=None):
     if batch.embedding_geometry is None or len(batch.embedding_geometry) != len(embeddings):
         raise ValueError("embedding-enabled model requires loader embedding geometry/normals")
     counts = zero.detach().new_tensor(embedding_pair_counts(batch)).unbind()
-    contrastive = len(counts) == 3
+    contrastive = len(counts) in (3, 5)
     pos_count, neg_count = counts[:2]
     competition = zero
+    short_competition, long_competition = zero, zero
     for i, geometry in enumerate(batch.embedding_geometry):
         if geometry is None or tuple(geometry.eligible.shape) != tuple(embeddings.shape[-3:]):
             raise ValueError("missing or mismatched embedding output-grid geometry")
@@ -281,6 +315,57 @@ def embedding_statistics(embeddings, presence, batch, diagnostics=None):
         # Match the existing value-augmentation seed conversion.
         rng = torch.Generator(device=embeddings.device).manual_seed(geometry.seed % (2**63 - 1))
         if contrastive:
+            if geometry.short_range_channels:
+                split = geometry.short_range_channels
+                if split >= embeddings.shape[1]:
+                    raise ValueError("embedding channel split exceeds model output")
+                if geometry.pair_id is None:
+                    raise ValueError("split-range embeddings require paired patches")
+                anchors = geometry.pairs // (2 * geometry.negatives_per_anchor)
+                if anchors < 1 or geometry.pairs % (2 * geometry.negatives_per_anchor):
+                    raise ValueError("split-range pair budget must divide equally between banks")
+                offset, count = int(batch.target_segment_offsets[i]), int(batch.target_segment_counts[i])
+                starts = batch.target_segment_starts_zyx[offset:offset + count].float() / geometry.stride
+                ends = batch.target_segment_ends_zyx[offset:offset + count].float() / geometry.stride
+                points = sample_trace_points(starts, ends, anchors * 2, rng, embeddings.shape[-3:])
+                short_vectors = sample_embeddings(embeddings[i, :split], points)
+                short_anchor, short_positive_vector = short_vectors[:anchors], short_vectors[anchors:]
+                short_positive = (short_anchor * short_positive_vector).sum(1).clamp(-1, 1)
+                short_negative_vectors = _presence_weighted_negatives(
+                    embeddings, presence, batch.embedding_geometry, [i], slice(0, split),
+                    geometry.pairs // 2, anchors, rng)
+                short_negative = ((short_anchor[:, None] * short_negative_vectors).sum(-1).clamp(-1, 1)
+                                  if short_negative_vectors.numel() else short_positive.new_empty((anchors, 0)))
+                if short_negative.numel():
+                    short_competition = short_competition + local_competition(
+                        short_positive, short_negative, geometry.temperature, geometry.margin).sum() * geometry.weight
+
+                partner = i ^ 1
+                other = batch.embedding_geometry[partner]
+                off, nseg = int(batch.target_segment_offsets[partner]), int(batch.target_segment_counts[partner])
+                other_points = sample_trace_points(
+                    batch.target_segment_starts_zyx[off:off+nseg].float() / other.stride,
+                    batch.target_segment_ends_zyx[off:off+nseg].float() / other.stride,
+                    anchors, rng, embeddings.shape[-3:])
+                long_anchor = sample_embeddings(embeddings[i, split:], points[:anchors])
+                long_positive_vector = sample_embeddings(embeddings[partner, split:], other_points)
+                long_positive = (long_anchor * long_positive_vector).sum(1).clamp(-1, 1)
+                long_negative_vectors = _presence_weighted_negatives(
+                    embeddings, presence, batch.embedding_geometry, [i, partner], slice(split, None),
+                    geometry.pairs // 2, anchors, rng)
+                long_negative = ((long_anchor[:, None] * long_negative_vectors).sum(-1).clamp(-1, 1)
+                                 if long_negative_vectors.numel() else long_positive.new_empty((anchors, 0)))
+                if long_negative.numel():
+                    long_competition = long_competition + local_competition(
+                        long_positive, long_negative, geometry.temperature, geometry.margin).sum() * geometry.weight
+                if diagnostics is not None:
+                    values = {}
+                    for prefix, positive, negative in (("short", short_positive, short_negative),
+                                                       ("long", long_positive, long_negative)):
+                        values.update({f"{prefix}_{key}": value for key, value in
+                                      similarity_diagnostics(positive.detach(), negative.detach()).items()})
+                    diagnostics.append(values)
+                continue
             anchors = geometry.pairs // geometry.negatives_per_anchor
             offset, count = int(batch.target_segment_offsets[i]), int(batch.target_segment_counts[i])
             starts = batch.target_segment_starts_zyx[offset:offset + count].float() / geometry.stride
@@ -337,6 +422,9 @@ def embedding_statistics(embeddings, presence, batch, diagnostics=None):
         negative = (on_trace[2 * half:] * negatives).sum(dim=1).clamp_min(0)
         neg_sum = neg_sum + negative.sum() * geometry.weight
     if contrastive:
+        if len(counts) == 5:
+            return pos_sum, pos_count, neg_sum, neg_count, competition, counts[2], \
+                short_competition, counts[3], long_competition, counts[4]
         return pos_sum, pos_count, neg_sum, neg_count, competition, counts[2]
     return pos_sum, pos_count, neg_sum, neg_count
 

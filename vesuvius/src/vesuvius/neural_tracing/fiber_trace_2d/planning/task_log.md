@@ -1,30 +1,34 @@
-# Resume full-resolution training with refinement — 2026-09-16
+# Task log
 
-- Stopped managed full-resolution run
-  `5scroll_json_eligible_fullres_128_sd1_16x8_ema_20260916_192344` after its
-  completed update4100/test. Manager allocation released cleanly.
-- Durable source checkpoint exists at that run's `snapshots/current.pt` (750MiB).
-- Existing reviewed refinement delta adds per-scroll normal manifests,
-  `bounded_gradient_accumulation:true`, `_config_dir`, refinement weights
-  normal0.1/tangent10/direction0.1, a resume source and distinct run name.
-- Planned new config is the existing refinement config with only output
-  stride4->1, resume source->the stopped fullres current checkpoint, and a
-  distinct fullres-refinement run name.
-- Independent review approved that three-field derivation and requested direct
-  checkpoint-state verification.
-- Verified the checkpoint itself: update4100, 524,800 samples, raw snapshot,
-  optimizer and EMA present, and no `refinement_state`.
-- Added the full-resolution refinement continuation config and an exact-delta
-  regression.
-- Approved CPU validation passed: training/config spans 41 passed, 2 skipped;
-  refinement 23 passed, 2 skipped. Logs are under
-  `/ephemeral/hendrik/fiber3d_train2/cooperative-tests/20260916_213539_062927`.
-- Committed the reproducible continuation state as `39b7277cd`.
-- Launched managed continuation root1628019 at
-  `/ephemeral/hendrik/fiber3d_train2/runs/.launches/5scroll_json_eligible_fullres_refinement_128_sd1_16x8_ema-20260916_213749`.
-  Active run directory is
-  `/ephemeral/hendrik/fiber3d_train2/runs/5scroll_json_eligible_fullres_refinement_128_sd1_16x8_ema_20260916_213753`.
-- Verified exact raw resume at checkpoint step4100/524,800 samples and fresh
-  refinement progress through updates4101-4103. Full-resolution refinement
-  calibration measured microbatch1 and is advancing to microbatch2 before the
-  adaptive continuation.
+- 2026-09-17: Repository was clean at `1079e727d`; no pre-task changes remained to
+  commit. Stopped full-resolution refinement run has durable `current.pt` at update
+  17800 (2,278,400 samples) referencing `fibers_step_00017800.zip`, SHA256
+  `a9120cd0c21c968f94c3ec802339e5bc678712c72dd7f183b0f7f32dd345ed53`.
+- 2026-09-17: Interpreted “from scratch” as resetting model/optimizer/EMA/progress
+  while importing only the saved refined fiber geometry. Total embedding width
+  remains16: short channels0:8, long channels8:16.
+- 2026-09-17: Independent review found archived test-patch identities are from the
+  unpaired run and cannot be reused by paired evaluation. Scope frozen geometry to
+  training fibers; use immutable original test GT and forbid frozen mode from
+  creating new state. Review also requires separate bank statistics/normalization,
+  read-only archive provenance, downstream bank selection and matched-budget timing.
+- 2026-09-17: Implemented explicit frozen geometry restore, separate from model
+  resume. The training split reads and validates update17800 geometry without
+  proposals/commits/archive copies; paired tests retain original GT.
+- 2026-09-17: Implemented independently normalized8-channel short and long banks.
+  Short positives/negatives stay within a patch; long positives cross paired
+  patches and negatives cover the pair. The existing65536 negative budget is
+  split evenly and the bank means have equal loss weight. Inference requires an
+  explicit bank for split checkpoints.
+- 2026-09-17: Focused CPU functionality tests passed; the broad refinement subset
+  had45passes/5skips plus one sandbox-only Gloo loopback failure, to be rerun with
+  an explicit loopback interface. Managed CUDA validation and timing remain.
+- 2026-09-17: Approved validation results: split contract16passed/6expected skips;
+  broader paired suite78passed/12expected skips; managed CUDA10passed/47deselected;
+  real frozen archive/data preflight1passed in92.91s, validating1524train and90test
+  fibers plus actual train/test pairs. The earlier broad sandbox Gloo failure was
+  environmental; managed two-GPU NCCL coverage passed.
+- 2026-09-17: Matched-budget one-GPU timing (two16-channel32-cube patches,
+  65536 negatives/patch,3warmups+10samples): legacy mean/p50/p95
+  6.867/6.882/6.907ms; split8x8 9.899/9.895/9.968ms. The split objective adds
+  about3.03ms in this isolated loss benchmark; no model/data path is included.

@@ -1,19 +1,56 @@
 # Plan
 
-1. Stop the active full-resolution run and identify its latest durable `current.pt` checkpoint.
-2. Add a distinct full-resolution refinement config derived from the existing reviewed stride-4 refinement config. Change only output stride 4->1, resume source to the stopped full-resolution checkpoint, and run name. This preserves normal manifests, bounded accumulation, refinement normal/tangent/direction weights 0.1/10/0.1, LR0.01, global batch128, EMA and all data/augmentation settings.
-3. Add a regression asserting that the new config differs from the existing refinement config only in those three fields, that its architecture matches the stopped stride-1 checkpoint config, and that refinement is enabled while embeddings remain disabled.
-4. Run the approved CPU training-span and refinement suites; no unmanaged GPU test.
-5. Point the approved production launcher at the continuation config, commit the reproducible state, launch through the cooperative manager, and verify checkpoint step, fresh refinement geometry, calibration/allocation and resumed progress.
+1. Extend refinement state configuration with a frozen-update mode and an explicit
+   state-source checkpoint. Restore and validate the existing fiber archive without
+   loading model/optimizer/EMA progress. Use its current training fibers; evaluate
+   against immutable original test GT because paired sample identities do not map
+   to the archive's unpaired test patches. Make the imported store read-only and do
+   not construct observations, create entries, solve, commit, or emit refinement
+   metrics. Checkpoints retain immutable source path/SHA provenance rather than
+   rewriting the 520MiB archive; later model resumes restore the same source.
+2. Extend the existing paired local-contrastive embedding objective with an optional
+   channel split. Preserve legacy behavior when omitted. For an 8/8 split, compute
+   short-range positives and presence-weighted negatives only within each patch on
+   independently normalized channels0:8; compute strictly cross-patch long-range
+   positives and symmetric paired-region negatives on independently normalized
+   channels8:16. Carry separate numerator/count statistics through accumulation,
+   distributed reduction and logging, and use `0.5*(short_mean+long_mean)`.
+   Split the existing configured negative budget evenly between banks so total
+   sampled pairs and dot-product work remain comparable to the legacy objective.
+3. Add CPU regression coverage for config validation, channel isolation, positive
+   routing, negative routing/count normalization, gradients to both banks, unequal
+   rank/microbatch accumulation equivalence, frozen train-only restore, original-GT
+   tests, no proposal generation, fresh model state, and unchanged legacy behavior.
+4. Add a fresh full-resolution five-scroll JSON paired-embedding config using the
+   update17800 refinement archive, LR0.01, global batch128,16 total embedding
+   channels split8/8, and no model resume.
+5. Store bank semantics in config/checkpoints. Make current inference/tracing reject
+   split banks unless a bank is selected explicitly; do not concatenate them into
+   one cosine space. Update refinement/embedding documentation and planning records.
+6. Run the
+   focused embedding, paired, refinement, gradient-accumulation and config suites
+   via the approved cooperative test launcher; run managed CUDA coverage if the
+   suite selects it. Measure legacy versus split embedding-statistics runtime with
+   fixed input/budget and report the distribution before launch.
+7. Commit the implementation/config, launch with the approved managed production
+   runner, and verify from logs that update0 uses fresh weights, frozen fibers are
+   restored from update17800, no refinement updates occur, and both embedding banks
+   report finite losses/gradients.
 
 ## Spec update
 
-None. Resume and full-resolution refinement are already specified behaviors.
+No `planning/spec.md` exists in this checkout. Document the new opt-in contracts in
+the maintained embedding/refinement docs: frozen geometry imports only fiber state,
+and split-range channels retain the legacy behavior when not configured. Document
+that downstream consumers must explicitly select short or long channels.
 
 ## Docs updates
 
-Record the full-resolution refinement continuation and launch identity in refinement documentation and current task log/status.
+Update `docs/training_refinement.md` and `docs/paired_embedding_training.md` with
+the frozen-state and split-range semantics, config fields, snapshot provenance and
+new production config/run command, bank metadata and downstream compatibility.
 
 ## Changelog
 
-No feature changelog entry: this is a configuration continuation using existing behavior.
+Add a concise entry for frozen refined-fiber training and independently supervised
+short-/long-range embedding banks.

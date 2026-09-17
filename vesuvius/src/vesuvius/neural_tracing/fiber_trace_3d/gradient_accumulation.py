@@ -15,11 +15,14 @@ from .loss_statistics import LossStatistics
 
 COMPONENTS = ("direction", "positive_presence", "negative_presence")
 EMBEDDING_COMPONENTS = ("positive_embedding", "negative_embedding")
+SPLIT_EMBEDDING_COMPONENTS = ("short_embedding", "long_embedding")
 
 
 def loss_components(model):
     if not getattr(model, "embedding_channels", 0):
         return COMPONENTS
+    if getattr(model, "embedding_short_range_channels", 0):
+        return COMPONENTS + EMBEDDING_COMPONENTS + ("contrastive_embedding",) + SPLIT_EMBEDDING_COMPONENTS
     return COMPONENTS + EMBEDDING_COMPONENTS + (("contrastive_embedding",)
         if getattr(model, "embedding_objective", "pairwise") == "local_contrastive" else ())
 
@@ -55,9 +58,17 @@ class NormalizedGradientAccumulator:
             raise ValueError(f"expected {len(self.components)} target-derived normalization counts")
         if distributed:
             dist.all_reduce(self.counts, group=process_group)
-        self.weights = self.counts.new_tensor((direction_weight,
-            presence_weight * positive_query_weight, presence_weight * negative_query_weight)
-            + ((0.5, 0.5) if len(self.components) >= 5 else ()) + ((1.0,) if len(self.components) == 6 else ()))
+        component_weights = {
+            "direction": direction_weight,
+            "positive_presence": presence_weight * positive_query_weight,
+            "negative_presence": presence_weight * negative_query_weight,
+            "positive_embedding": 0.5,
+            "negative_embedding": 0.5,
+            "contrastive_embedding": 1.0,
+            "short_embedding": 0.5,
+            "long_embedding": 0.5,
+        }
+        self.weights = self.counts.new_tensor(tuple(component_weights[name] for name in self.components))
         self.loss_scale = float(loss_scale)
         if not math.isfinite(self.loss_scale) or self.loss_scale <= 0:
             raise ValueError("invalid loss scale")
@@ -198,8 +209,16 @@ class ComponentGradientAccumulator:
             for bank in self.flat_banks:
                 dist.all_reduce(bank, group=process_group)
         statistics = LossStatistics.unpack(self.statistics)
-        weights = (direction_weight, presence_weight * positive_query_weight,
-                   presence_weight * negative_query_weight, 0.5, 0.5, 1.0)
+        component_weights = {
+            "direction": direction_weight,
+            "positive_presence": presence_weight * positive_query_weight,
+            "negative_presence": presence_weight * negative_query_weight,
+            "positive_embedding": 0.5,
+            "negative_embedding": 0.5,
+            "contrastive_embedding": 1.0,
+            "short_embedding": 0.5,
+            "long_embedding": 0.5,
+        }
         with torch.no_grad():
             # Keep GradScaler's scale applied. The existing optimizer boundary
             # unscales/checks/clips exactly once, after globally combining banks.
@@ -211,6 +230,6 @@ class ComponentGradientAccumulator:
                 grad = torch.zeros_like(parameter)
                 for ci, component in enumerate(self.components):
                     count = getattr(statistics, f"{component}_count").clamp_min(1)
-                    grad.add_(self.banks[ci][pi] * (weights[ci] / count))
+                    grad.add_(self.banks[ci][pi] * (component_weights[component] / count))
                 parameter.grad = grad
         return statistics

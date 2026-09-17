@@ -28,11 +28,17 @@ class LossStatistics:
     negative_embedding_count: torch.Tensor | None = None
     contrastive_embedding_sum: torch.Tensor | None = None
     contrastive_embedding_count: torch.Tensor | None = None
+    short_embedding_sum: torch.Tensor | None = None
+    short_embedding_count: torch.Tensor | None = None
+    long_embedding_sum: torch.Tensor | None = None
+    long_embedding_count: torch.Tensor | None = None
 
     def __post_init__(self):
         for name in ("positive_embedding_sum", "positive_embedding_count",
                      "negative_embedding_sum", "negative_embedding_count",
-                     "contrastive_embedding_sum", "contrastive_embedding_count"):
+                     "contrastive_embedding_sum", "contrastive_embedding_count",
+                     "short_embedding_sum", "short_embedding_count",
+                     "long_embedding_sum", "long_embedding_count"):
             if getattr(self, name) is None:
                 object.__setattr__(self, name, torch.zeros_like(self.direction_count))
 

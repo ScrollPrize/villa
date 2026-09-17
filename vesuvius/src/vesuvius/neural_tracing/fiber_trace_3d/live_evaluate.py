@@ -235,7 +235,8 @@ def create_demand_store(cache, source_identity, model_identity, geometry, effect
     adapter = inference_adapter.FiberTrace3DPredictAdapter(effective, checkpoint=snapshot,
         level=level + power, scaledown=(1 << level) * geometry.scale, inference_scaledown=geometry.scale,
         chunk_size=geometry.chunk, product_prefix="fiber", zarr_path_prefix=cache / "fiber",
-        emit_embeddings=bool(settings.get("emit_embeddings", False)))
+        emit_embeddings=bool(settings.get("emit_embeddings", False)),
+        embedding_bank=settings.get("embedding_bank"))
     # Construction restores checkpoint config; reapply the resolved precision.
     adapter.config["training"] = {**adapter.config.get("training", {}),
         "mixed_precision": effective["training"]["mixed_precision"]}

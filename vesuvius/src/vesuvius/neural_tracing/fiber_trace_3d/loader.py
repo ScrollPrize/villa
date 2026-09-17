@@ -2066,7 +2066,7 @@ class FiberTrace3DLoader:
         self._replacement_pools = {}
         self.records = self._load_records()
         self._refinement_store = None
-        if config.refinement.enabled:
+        if config.refinement.enabled and (config.refinement.update_enabled or config.refinement_split == "train"):
             if any(not d.get("lasagna_manifest_path") for d in config.datasets):
                 raise ValueError("refinement requires lasagna_manifest_path for every dataset")
             if config.sampling_strategy != "scroll_balanced_arclength":
@@ -3147,7 +3147,8 @@ class FiberTrace3DLoader:
             record.fiber.line_points_zyx, lambda points: self._sample_native_normals(record, points, timings), record.base_shape_zyx)
         return EmbeddingGeometry(eligible, _stable_seed(self.config.seed, params.stream_index, "embedding"),
                                  cfg.pairs(self.config.patch_shape_zyx), cfg.output_stride, cfg.weight,
-                                 cfg.objective, cfg.negatives_per_anchor, cfg.temperature, cfg.margin)
+                                 cfg.objective, cfg.negatives_per_anchor, cfg.temperature, cfg.margin,
+                                 short_range_channels=cfg.short_range_channels)
 
     def load_raw_sample(
         self, sample_index: int, *, sample_index_limit: int | None = None,
@@ -3259,7 +3260,7 @@ class FiberTrace3DLoader:
         params = fixed_params if fixed_test else self._sample_augment_params(record, cp_index, augmentation_index,
             value_index=stream_index // 2 if self.config.embedding.paired_patches else None)
         refinement_geometry = None
-        if refinement_current is not None:
+        if refinement_current is not None and self.config.refinement.update_enabled:
             patch_points, valid = self._source_points_to_output_np(
                 refinement_current[:, :3] / record.volume_spacing_base, params)
             # Include one outside/context node on either side. Separate visits

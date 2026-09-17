@@ -1,9 +1,10 @@
-- [x] Stop full-resolution run and identify current checkpoint at update 4100.
-- [x] Inspect exact existing refinement-config delta.
-- [x] Independent plan review.
-- [x] Add full-resolution refinement continuation config and regression.
-- [x] Run focused CPU validation.
-- [x] Update docs and launcher.
-- [x] Commit reproducible continuation state (`39b7277cd`).
-- [x] Launch managed continuation and verify resume at update 4100 plus fresh
-  refinement progress through update 4103.
+# Status
+
+- [x] Capture the task and detailed plan.
+- [x] Independent plan review against current code/docs.
+- [x] Implement frozen refinement-state loading.
+- [x] Implement 8/8 short-/long-range embedding supervision.
+- [x] Add fresh production config and regression tests.
+- [x] Update docs, task log and changelog.
+- [x] Run focused CPU and managed CUDA validation.
+- [ ] Commit and launch managed training; verify fresh model plus frozen fibers.
