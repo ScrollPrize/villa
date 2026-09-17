@@ -17,6 +17,8 @@
 #include <QtTest/QtTest>
 
 #include <cmath>
+#include <set>
+#include <string>
 #include <limits>
 #include <vector>
 
@@ -1451,6 +1453,512 @@ private slots:
         QCOMPARE(a.droppedGroupCount, b.droppedGroupCount);
     }
 
+    // A hit at a fold apex is classified by the V fiber's own two limbs, not
+    // by either branch's extension: the H fiber comes in from above and
+    // leaves straight down between the limbs - a crossing - whichever way
+    // the V fiber's samples run. (Dyadic angles: the hit must land exactly
+    // on the vertex for the case to arise at all.)
+    void apexHitIsClassifiedByTheVFibersOwnRays()
+    {
+        const SolverParams params;
+        for (const bool reversed : {false, true}) {
+            FiberTrace h;
+            h.hvTag = 'H';
+            h.theta = {-0.25, 0.0, 0.0};
+            h.z = {30100.0, 30000.0, 29900.0};
+            h.radius = {19900.0, 19900.0, 19900.0};
+            FiberTrace v;
+            v.hvTag = 'V';
+            v.theta = {-0.125, 0.0, 0.125};
+            v.z = {29900.0, 30000.0, 29900.0};
+            v.radius = {20000.0, 20000.0, 20000.0};
+            if (reversed) {
+                std::reverse(v.theta.begin(), v.theta.end());
+                std::reverse(v.z.begin(), v.z.end());
+            }
+            const CanonicalTrace ch = canonicalizeTrace(h, 1);
+            const CanonicalTrace cv = canonicalizeTrace(v, 1);
+            QCOMPARE(cv.branches.size(), std::size_t{2});
+            const PairDetections geometry = detectPairCrossings(ch, cv, params);
+            QCOMPARE(geometry.raw.size(), std::size_t{2});
+            for (const Crossing& record : geometry.raw) {
+                QVERIFY(!record.touch);
+            }
+            const PairCrossings classified =
+                classifyPairCrossings(geometry, ch, cv, {}, {}, params);
+            QCOMPARE(classified.events.size(), std::size_t{1});
+            QVERIFY(!classified.events.front().touch);
+            QCOMPARE(classified.events.front().mergedCount, 2);
+        }
+    }
+
+    // At a fold apex the two records' orientations differ by the limbs'
+    // opposite directions whatever the H fiber does; the ray test decides.
+    // The apex crossing lies on the edge of both limbs' curtains: it counts
+    // for neither, and both limbs' groups there take no verdict. An H fiber
+    // that enters the apex from above, leaves straight down and then crosses
+    // the limbs again below reads the same - one apex crossing, no touches,
+    // the same groups, none with a verdict - whichever way its own samples
+    // run.
+    void apexRecordsCollapseByTheRayTestNotOrientation()
+    {
+        const SolverParams params;
+        std::vector<std::vector<int>> summaries;
+        for (const bool reversedH : {false, true}) {
+            FiberTrace h;
+            h.hvTag = 'H';
+            h.theta = {-0.25, 0.0, 0.0, -0.25, 0.25};
+            h.z = {25000.0, 30000.0, 25000.0, 25000.0, 25000.0};
+            h.radius = {19800.0, 19800.0, 19800.0, 20400.0, 20400.0};
+            if (reversedH) {
+                std::reverse(h.theta.begin(), h.theta.end());
+                std::reverse(h.z.begin(), h.z.end());
+                std::reverse(h.radius.begin(), h.radius.end());
+            }
+            FiberTrace v;
+            v.hvTag = 'V';
+            v.theta = {-0.125, 0.0, 0.125};
+            v.z = {20000.0, 30000.0, 20000.0};
+            v.radius = {20000.0, 20000.0, 20000.0};
+            const CanonicalTrace ch = canonicalizeTrace(h, 1);
+            const CanonicalTrace cv = canonicalizeTrace(v, 1);
+            const PairCrossings classified = classifyPairCrossings(
+                detectPairCrossings(ch, cv, params), ch, cv, {}, {}, params);
+            int apexEvents = 0;
+            for (const Crossing& event : classified.events) {
+                QVERIFY(!event.touch);
+                if (event.vSample != Crossing::kNoSample) {
+                    ++apexEvents;
+                    QCOMPARE(event.mergedCount, 2);
+                }
+            }
+            QCOMPARE(apexEvents, 1);
+            std::vector<int> summary;
+            for (const CrossingGroup& group : classified.groups) {
+                QVERIFY(group.onCurtain);
+                QVERIFY(!group.hasVerdict);
+                summary.push_back(static_cast<int>(group.vBranch));
+                summary.push_back(group.multiplicity);
+                summary.push_back(group.insideCount);
+                summary.push_back(group.hasVerdict ? 1 : 0);
+                summary.push_back(group.hasVerdict ? static_cast<int>(group.verdict) : -1);
+            }
+            QVERIFY(!summary.empty());
+            summaries.push_back(summary);
+        }
+        QCOMPARE(summaries.front(), summaries.back());
+    }
+
+    // A repeated apex sample at another radius: the apex's radial interval
+    // is [20000, 21000]. With the H fiber outside it (19500) the hit reads at
+    // the interval's nearest point, -500, whichever sample owns it, so the
+    // two records are one representative and one event; with the H fiber
+    // inside it (20500) the fibers meet in 3D there: one curtain contact,
+    // deltaR 0, no verdict. Both are apex crossings and count for no group,
+    // whichever way either fiber's samples run.
+    void apexRecordsAtTwoRadiiStayTwoEvents()
+    {
+        const SolverParams params;
+        for (const double hRadius : {19500.0, 20500.0}) {
+            for (const bool reversedH : {false, true}) {
+                for (const bool reversedV : {false, true}) {
+                    FiberTrace h;
+                    h.hvTag = 'H';
+                    h.theta = {-0.25, 0.0, 0.0};
+                    h.z = {30100.0, 30000.0, 29900.0};
+                    h.radius = {hRadius, hRadius, hRadius};
+                    FiberTrace v;
+                    v.hvTag = 'V';
+                    v.theta = {-0.125, 0.0, 0.0, 0.125};
+                    v.z = {20000.0, 30000.0, 30000.0, 20000.0};
+                    v.radius = {20000.0, 20000.0, 21000.0, 21000.0};
+                    if (reversedH) {
+                        std::reverse(h.theta.begin(), h.theta.end());
+                        std::reverse(h.z.begin(), h.z.end());
+                        std::reverse(h.radius.begin(), h.radius.end());
+                    }
+                    if (reversedV) {
+                        std::reverse(v.theta.begin(), v.theta.end());
+                        std::reverse(v.z.begin(), v.z.end());
+                        std::reverse(v.radius.begin(), v.radius.end());
+                    }
+                    const CanonicalTrace ch = canonicalizeTrace(h, 1);
+                    const CanonicalTrace cv = canonicalizeTrace(v, 1);
+                    const PairCrossings classified = classifyPairCrossings(
+                        detectPairCrossings(ch, cv, params), ch, cv, {}, {}, params);
+                    for (const Crossing& event : classified.events) {
+                        QVERIFY(!event.touch);
+                        QVERIFY(event.apex);
+                    }
+                    for (const CrossingGroup& group : classified.groups) {
+                        QVERIFY(!group.hasVerdict);
+                    }
+                    if (hRadius < 20000.0) {
+                        QCOMPARE(classified.events.size(), std::size_t{1});
+                        QCOMPARE(classified.events.front().deltaR, -500.0);
+                        QCOMPARE(classified.events.front().kind, CrossingKind::Inside);
+                        QCOMPARE(classified.events.front().mergedCount, 2);
+                    } else {
+                        QCOMPARE(classified.events.size(), std::size_t{1});
+                        QCOMPARE(classified.events.front().deltaR, 0.0);
+                        QCOMPARE(classified.events.front().mergedCount, 2);
+                    }
+                }
+            }
+        }
+    }
+
+    // Representation invariants under every sample order, with a crossing
+    // before the apex whose radius decides how the proximity merge clusters
+    // the apex records: every event's representative index is valid, and a
+    // dropped representative always has a dropped, violated event to mark.
+    // The apex here steps in radius across the H fiber's, so it reads as a
+    // curtain contact; with the earlier crossing far outside (+350) it
+    // contradicts that contact's weak Inside and one representative drops.
+    void apexRecordsUnderTwoRepresentativesStayTwoEvents()
+    {
+        SolverParams params;
+        params.chiralityOverride = 1;
+        for (const double r0 : {19900.0, 20400.0}) {
+            std::vector<std::vector<int>> summaries;
+            for (const bool reversedH : {false, true}) {
+                for (const bool reversedV : {false, true}) {
+                    FiberTrace h;
+                    h.hvTag = 'H';
+                    h.theta = {0.0, -0.25, 0.0, 0.0};
+                    h.z = {29900.0, 30100.0, 30000.0, 29950.0};
+                    h.radius = {r0, 19900.0, 20000.0, 20000.0};
+                    FiberTrace v;
+                    v.hvTag = 'V';
+                    v.theta = {-0.125, 0.0, 0.0, 0.125};
+                    v.z = {20000.0, 30000.0, 30000.0, 20000.0};
+                    v.radius = {20050.0, 20050.0, 19950.0, 19950.0};
+                    if (reversedH) {
+                        std::reverse(h.theta.begin(), h.theta.end());
+                        std::reverse(h.z.begin(), h.z.end());
+                        std::reverse(h.radius.begin(), h.radius.end());
+                    }
+                    if (reversedV) {
+                        std::reverse(v.theta.begin(), v.theta.end());
+                        std::reverse(v.z.begin(), v.z.end());
+                        std::reverse(v.radius.begin(), v.radius.end());
+                    }
+                    const SolveResult result = solveWindings({h, v}, {}, params);
+                    QCOMPARE(result.events.size(), std::size_t{2});
+                    std::vector<int> summary;
+                    int apex = 0;
+                    for (const Crossing& event : result.events) {
+                        QVERIFY(!event.touch);
+                        apex += event.apex ? 1 : 0;
+                        QVERIFY(event.representative < result.crossings.size());
+                        summary.push_back(static_cast<int>(event.kind));
+                        summary.push_back(static_cast<int>(event.status));
+                    }
+                    std::sort(summary.begin(), summary.end());
+                    summary.push_back(countDroppedCrossings(result));
+                    summaries.push_back(summary);
+                    QCOMPARE(apex, 1);
+                    QCOMPARE(countDroppedCrossings(result), r0 > 20000.0 ? 1 : 0);
+                    for (std::size_t c = 0; c < result.crossings.size(); ++c) {
+                        if (result.crossings[c].status != CrossingStatus::Dropped) {
+                            continue;
+                        }
+                        bool marked = false;
+                        for (const Crossing& event : result.events) {
+                            marked = marked || (event.representative == c &&
+                                                event.status == CrossingStatus::Dropped &&
+                                                event.violationTurns >= 0.5);
+                        }
+                        QVERIFY(marked);
+                    }
+                }
+            }
+            for (std::size_t k = 1; k < summaries.size(); ++k) {
+                QCOMPARE(summaries[k], summaries[0]);
+            }
+        }
+    }
+
+    // Degenerate hits read the same whichever way either fiber's samples run,
+    // and where no intersection can be placed the translate is unresolved
+    // (no verdict) rather than counted one way in one order and another in
+    // the other. Coordinates (theta, z, r), chirality +1.
+    void degenerateHitsReadTheSameInEitherOrder()
+    {
+        const SolverParams params;
+        struct Fixture {
+            const char* name;
+            std::vector<double> ht, hz, hr, vt, vz, vr;
+        };
+        // 1: a radial step of the H fiber (zero projected length, radius
+        //    19000 -> 21000) through the V fiber at (0, 0, 20000).
+        // 2: an H vertex touching the V fiber exactly at its radius.
+        // 3: collinear owner segments sharing only the vertex (0, 0): one
+        //    crossing, read by the rays at the vertex.
+        // 4: repeated start samples of an H fiber that a V fold touches from
+        //    below and leaves.
+        // 5: an apex hit whose two parameters differ in the last place.
+        // 6: a hit at t == 0 of a segment on whose far side a gated limb sits.
+        // 8 ("vertex on segment"): a V vertex exactly on an H segment whose radii run 5000 -> 35000
+        //    through the V's 20000: a contact, deltaR 0, whichever way (the V
+        //    is monotone here, so the vertex is interior, not an apex).
+        // 9: radial runs of both fibers at one point, overlapping in radius.
+        // 10: an H run [1000, 19000] at a V apex of radius 20000: the read
+        //    radius is the run's nearest, 19000, not the owner's.
+        // 7: a fold with a level top the H fiber crosses at its corner. The
+        //    corner is one record or two collapsed ones depending on which
+        //    limb the level run joins, so the apex flag is left out of the
+        //    comparison; the translate is unresolved either way.
+        const std::vector<Fixture> fixtures{
+            {"radial step", {-0.25, 0.0, 0.0, 0.25, -0.25, 0.25}, {0, 0, 0, 100, 200, 300},
+             {19000, 19000, 21000, 21000, 21000, 17000}, {0.0, 0.0}, {-1000, 1000}, {20000, 20000}},
+            {"curtain touch", {-0.25, 0.0, -0.25, 0.25, -0.25, 0.25}, {0, 100, 200, 300, 400, 500},
+             {19000, 20000, 21000, 21000, 21000, 17000}, {0.0, 0.0}, {-1000, 1000}, {20000, 20000}},
+            {"collinear contact", {0.5, 0.0, 0.0}, {-500, 0, -1000}, {19000, 19000, 19000},
+             {0.5, 0.0, 0.0}, {-1000, 0, 1000}, {20000, 20000, 20000}},
+            {"repeated start", {0.0, 0.0, 0.25}, {0, 0, 0}, {19000, 19000, 19000},
+             {0.125, 0.0, -0.125}, {-1000, 0, -1000}, {20000, 20000, 20000}},
+            {"apex ulp", {-0.001, 0.001}, {-100, 100}, {19000, 19000},
+             {-0.3, 0.0, 0.2}, {-1000, 0, -1234}, {20000, 20000, 20000}},
+            {"terminal own segment", {-0.25, 0.0, 0.25}, {0, 0, 0}, {21000, 21000, 21000},
+             {0.0, 0.0, 0.125, 0.125}, {-1000, 1000, 1000, -1000}, {20000, 20000, 100, 100}},
+            {"flat top", {0.0, 0.0}, {1100, 900}, {19000, 19000},
+             {-0.25, 0.0, 0.25, 0.5}, {0, 1000, 1000, 0}, {20000, 20000, 20000, 20000}},
+            {"vertex on segment", {0.5, -0.001, 0.001, 0.5, -0.5}, {-200, -100, 100, 200, 300},
+             {5000, 5000, 35000, 35000, 1000}, {-0.3, 0.0, 0.2}, {-1000, 0, 1234},
+             {20000, 20000, 20000}},
+            {"overlapping runs", {-0.25, 0.0, 0.0, 0.0}, {100, 0, 0, -100},
+             {19000, 19000, 21000, 21000}, {-0.125, 0.0, 0.0, 0.125}, {-1000, 0, 0, -1000},
+             {20000, 20000, 22000, 22000}},
+            {"run nearest radius", {-0.001, 0.0, 0.0, 0.0}, {1000, 0, 0, -1000},
+             {1000, 1000, 19000, 19000}, {-0.002, 0.0, 0.002}, {-1000, 0, -1000},
+             {20000, 20000, 20000}},
+            // 11: a V vertex on an H segment at parameter 1/3, the H radius
+            //     there (15000) equal to the V's only in the reals.
+            {"rounded contact", {0.5, -0.25, 0.125, 0.5, -0.5}, {-300, -200, 100, 200, 300},
+             {35000, 35000, 5000, 5000, 15000}, {-0.25, 0.0, 0.25}, {-1000, 0, 1000},
+             {15000, 15000, 15000}},
+            // 12: a radial V step at a point of an H segment (parameter 1/3)
+            //     whose radius there is the step's end.
+            {"radial step at rounded radius", {-0.25, 0.125}, {-200, 100}, {35000, 5000},
+             {0.0, 0.0}, {0, 0}, {14000, 15000}},
+            // 13: a contact whose interpolated radius cancels from 33670 and
+            //     491 down to 956.375: the envelope scales with the inputs.
+            {"cancelling contact",
+             {0.5, -32713.625 / 65536.0, 465.375 / 65536.0, 0.5, -0.5},
+             {-1500, -32713.625 / 32.0, 465.375 / 32.0, 200, 300},
+             {33670, 33670, 491, 491, 1000}, {0.0, 0.0, 0.0}, {-2000, 0, 2000},
+             {956.375, 956.375, 956.375}},
+            // 14: the same H segment against a radial V step ending at that
+            //     radius: unresolved either way.
+            {"cancelling radial step", {-32713.625 / 65536.0, 465.375 / 65536.0},
+             {-32713.625 / 32.0, 465.375 / 32.0}, {33670, 491}, {0.0, 0.0}, {0, 0},
+             {955.375, 956.375}},
+            // 15: nearly parallel, disjoint: the lines meet far off both
+            //     segments; nothing is detected and nothing is unresolved.
+            {"near parallel disjoint", {0.0, 0.5}, {0, 1024}, {19000, 19000},
+             {0.125, 0.375}, {256 + std::ldexp(1.0, -42), 768 + 3 * std::ldexp(1.0, -43)},
+             {20000, 20000}},
+        };
+        for (const Fixture& f : fixtures) {
+            std::vector<std::vector<int>> summaries;
+            std::vector<PairCrossings> results;
+            for (int order = 0; order < 4; ++order) {
+                FiberTrace h;
+                h.hvTag = 'H';
+                h.theta = f.ht;
+                h.z = f.hz;
+                h.radius = f.hr;
+                FiberTrace v;
+                v.hvTag = 'V';
+                v.theta = f.vt;
+                v.z = f.vz;
+                v.radius = f.vr;
+                if (order & 1) {
+                    std::reverse(h.theta.begin(), h.theta.end());
+                    std::reverse(h.z.begin(), h.z.end());
+                    std::reverse(h.radius.begin(), h.radius.end());
+                }
+                if (order & 2) {
+                    std::reverse(v.theta.begin(), v.theta.end());
+                    std::reverse(v.z.begin(), v.z.end());
+                    std::reverse(v.radius.begin(), v.radius.end());
+                }
+                const CanonicalTrace ch = canonicalizeTrace(h, 1);
+                const CanonicalTrace cv = canonicalizeTrace(v, 1);
+                const PairDetections geometry = detectPairCrossings(ch, cv, params);
+                const PairCrossings classified =
+                    classifyPairCrossings(geometry, ch, cv, {}, {}, params);
+                // Order-free summary: the multiset of (kind, touch, apex,
+                // tangential) over events, and per group whether it has a
+                // verdict and which.
+                std::vector<int> summary;
+                std::vector<std::vector<int>> eventRows;
+                const bool flatTop = std::string(f.name) == "flat top";
+                for (const Crossing& event : classified.events) {
+                    eventRows.push_back({static_cast<int>(event.kind), event.touch ? 1 : 0,
+                                         flatTop ? 0 : (event.apex ? 1 : 0),
+                                         event.tangential ? 1 : 0});
+                }
+                std::sort(eventRows.begin(), eventRows.end());
+                for (const auto& row : eventRows) {
+                    summary.insert(summary.end(), row.begin(), row.end());
+                }
+                summary.push_back(-1);
+                int verdicts = 0;
+                for (const CrossingGroup& group : classified.groups) {
+                    verdicts += group.hasVerdict ? 1 : 0;
+                    summary.push_back(group.hasVerdict ? static_cast<int>(group.verdict) : -2);
+                }
+                summary.push_back(geometry.unresolvedCount > 0 ? 1 : 0);
+                summaries.push_back(summary);
+                results.push_back(classified);
+                // No fixture here supports a verdict.
+                QVERIFY2(verdicts == 0, f.name);
+            }
+            for (std::size_t k = 1; k < summaries.size(); ++k) {
+                QVERIFY2(summaries[k] == summaries[0], f.name);
+            }
+            const PairCrossings& first = results.front();
+            const std::string name = f.name;
+            if (name == "radial step" || name == "flat top") {
+                QVERIFY2(first.unresolvedCount > 0, f.name);
+            } else if (name == "collinear contact") {
+                QCOMPARE(first.events.size(), std::size_t{1});
+                QVERIFY2(!first.events.front().touch, f.name);
+                QVERIFY2(!first.events.front().tangential, f.name);
+            } else if (name == "curtain touch") {
+                QVERIFY2(!first.groups.empty() && first.groups.front().onCurtain, f.name);
+            } else if (name == "repeated start") {
+                for (const Crossing& event : first.events) {
+                    QVERIFY2(event.touch, f.name);
+                }
+            } else if (name == "apex ulp") {
+                QCOMPARE(first.events.size(), std::size_t{1});
+                QVERIFY2(first.events.front().apex, f.name);
+                QCOMPARE(first.events.front().mergedCount, 2);
+            } else if (name == "vertex on segment") {
+                bool contact = false;
+                for (const Crossing& event : first.events) {
+                    contact = contact || event.deltaR == 0.0;
+                }
+                QVERIFY2(contact, f.name);
+                QVERIFY2(!first.groups.empty() && first.groups.front().onCurtain, f.name);
+            } else if (name == "rounded contact") {
+                bool contact = false;
+                for (const Crossing& event : first.events) {
+                    contact = contact || event.deltaR == 0.0;
+                }
+                QVERIFY2(contact, f.name);
+                QVERIFY2(!first.groups.empty() && first.groups.front().onCurtain, f.name);
+            } else if (name == "radial step at rounded radius" ||
+                       name == "cancelling radial step") {
+                QVERIFY2(first.unresolvedCount > 0, f.name);
+            } else if (name == "cancelling contact") {
+                bool contact = false;
+                for (const Crossing& event : first.events) {
+                    contact = contact || event.deltaR == 0.0;
+                }
+                QVERIFY2(contact, f.name);
+                QVERIFY2(!first.groups.empty() && first.groups.front().onCurtain, f.name);
+            } else if (name == "near parallel disjoint") {
+                QCOMPARE(first.events.size(), std::size_t{0});
+                QCOMPARE(first.unresolvedCount, 0);
+            } else if (name == "overlapping runs") {
+                for (const Crossing& event : first.events) {
+                    QCOMPARE(event.deltaR, 0.0);
+                }
+            } else if (name == "run nearest radius") {
+                for (const Crossing& event : first.events) {
+                    QVERIFY2(std::abs(event.deltaR + 1000.0) < 1e-9, f.name);
+                }
+            } else if (name == "terminal own segment") {
+                QCOMPARE(first.events.size(), std::size_t{1});
+                QVERIFY2(first.events.front().terminal, f.name);
+                QVERIFY2(first.events.front().terminalSides != 0, f.name);
+                for (const PairCrossings& other : results) {
+                    QCOMPARE(other.events.front().terminalSides,
+                             first.events.front().terminalSides);
+                }
+            }
+        }
+    }
+
+    // Independent annotations can meet exactly in the reals while every
+    // difference in doubles rounds: integer voxel samples on a straight
+    // umbilicus give an H fiber at angles a and 4a and a V apex at 2a, one
+    // third along the H segment in height. The incidence is decided inside
+    // the rounding envelope: one transversal apex event in either H order.
+    void roundedIncidenceIsOneApexEvent()
+    {
+        const SolverParams params;
+        const double a = std::atan2(2048.0, 10240.0);
+        for (const bool reversedH : {false, true}) {
+            FiberTrace h;
+            h.hvTag = 'H';
+            h.theta = {a, 4.0 * a};
+            h.z = {19900.0, 20200.0};
+            h.radius = {std::hypot(10240.0, 2048.0), std::hypot(15232.0, 15360.0)};
+            if (reversedH) {
+                std::reverse(h.theta.begin(), h.theta.end());
+                std::reverse(h.z.begin(), h.z.end());
+                std::reverse(h.radius.begin(), h.radius.end());
+            }
+            FiberTrace v;
+            v.hvTag = 'V';
+            v.theta = {2.0 * a, 2.0 * a, a};
+            v.z = {19990.0, 20000.0, 19990.0};
+            v.radius = {std::hypot(15360.0, 6400.0), std::hypot(15360.0, 6400.0),
+                        std::hypot(10240.0, 2048.0)};
+            const CanonicalTrace ch = canonicalizeTrace(h, 1);
+            const CanonicalTrace cv = canonicalizeTrace(v, 1);
+            QCOMPARE(cv.branches.size(), std::size_t{2});
+            const PairCrossings classified = classifyPairCrossings(
+                detectPairCrossings(ch, cv, params), ch, cv, {}, {}, params);
+            QCOMPARE(classified.events.size(), std::size_t{1});
+            const Crossing& event = classified.events.front();
+            QVERIFY(!event.touch);
+            QVERIFY(!event.tangential);
+            QVERIFY(event.apex);
+            QCOMPARE(event.mergedCount, 2);
+        }
+    }
+
+    // A vertex hit's orientation follows the directed cyclic order of the
+    // incident rays and flips with the H fiber's direction, also where the
+    // chords are parallel (an H fiber turning back on itself at the vertex).
+    void vertexOrientationFlipsWithTheHFiber()
+    {
+        const SolverParams params;
+        int forward = 0;
+        int reversed = 0;
+        for (const bool reversedH : {false, true}) {
+            FiberTrace h;
+            h.hvTag = 'H';
+            h.theta = {0.25, 0.0, 0.25};
+            h.z = {-2000.0, 0.0, 0.0};
+            h.radius = {19000.0, 19000.0, 19000.0};
+            FiberTrace v;
+            v.hvTag = 'V';
+            v.theta = {0.25, 0.0, 0.25};
+            v.z = {-1000.0, 0.0, 1000.0};
+            v.radius = {20000.0, 20000.0, 20000.0};
+            if (reversedH) {
+                std::reverse(h.theta.begin(), h.theta.end());
+                std::reverse(h.z.begin(), h.z.end());
+            }
+            const CanonicalTrace ch = canonicalizeTrace(h, 1);
+            const CanonicalTrace cv = canonicalizeTrace(v, 1);
+            const PairCrossings classified = classifyPairCrossings(
+                detectPairCrossings(ch, cv, params), ch, cv, {}, {}, params);
+            QCOMPARE(classified.events.size(), std::size_t{1});
+            QVERIFY(!classified.events.front().touch);
+            (reversedH ? reversed : forward) = classified.events.front().orientation;
+        }
+        QVERIFY(forward != 0);
+        QCOMPARE(reversed, -forward);
+    }
+
     // --- Kollesis seam encounters.
 
     // Without the flags the seam crossing reads Outside and fights the link;
@@ -2158,7 +2666,9 @@ private slots:
         // crossing: a V folded in height whose returning limb sits under
         // the radius gate, 0.002 turn past the limb the H crosses. Both
         // limbs fall within the crossing's own H segment (the H runs on a
-        // few more); the event is terminal neither way.
+        // few more), and the hit is at that segment's start, so the whole
+        // segment lies ahead: not terminal toward the end, terminal toward
+        // the start.
         {
             World world;
             const std::size_t h = addH(world, 0.05, kSeamWinding + kSeamOvershoot, kSeamHeight);
@@ -2188,8 +2698,11 @@ private slots:
             QCOMPARE(plain.events.size(), std::size_t{1});
             QVERIFY(std::find(geometry.uncoveredSegments.begin(), geometry.uncoveredSegments.end(),
                               plain.events.front().hSegment) != geometry.uncoveredSegments.end());
-            QVERIFY(!plain.events.front().terminal);
-            QCOMPARE(plain.events.front().terminalSides, 0);
+            const Crossing& event = plain.events.front();
+            QCOMPARE(event.hT, 0.0);
+            const int startBit = ch.psi.front() > event.psiH ? 1 : 2;
+            QVERIFY(event.terminal);
+            QCOMPARE(event.terminalSides, startBit);
         }
     }
 
@@ -2261,6 +2774,61 @@ private slots:
             QCOMPARE(result.kollesisCrossingCount, flagged ? 1 : 0);
             QCOMPARE(result.crossings.size(), std::size_t{1});
             QCOMPARE(result.crossings.front().kollesis, flagged);
+        }
+    }
+
+    // A seam encounter on a traversal's translate takes its events out of
+    // the count, and the rest is an incomplete traversal: five crossings
+    // (inside, outside, inside, inside, outside; orientations alternating)
+    // read together say Inside (three inside passes). With the last two read
+    // as the linked seam encounter, the remaining three would say Outside -
+    // so a seamed group takes no verdict at all.
+    void seamedTraversalGroupTakesNoVerdict()
+    {
+        for (const bool seam : {false, true}) {
+            World world;
+            FiberTrace hFiber;
+            hFiber.hvTag = 'H';
+            const double amplitude = 0.1 * kTwoPi;
+            const double dRAt[5] = {-200.0, 300.0, -200.0, -25.0, 25.0};
+            for (int k = 0; k <= 500; ++k) {
+                const double s = -0.5 * M_PI + 5.0 * M_PI * k / 500.0;
+                const double z = 29600.0 + 200.0 * s / M_PI;
+                // Radial offset from the V fiber, linear between the
+                // crossings' values at s = 0, pi, ..., 4 pi.
+                const double q = std::clamp(s / M_PI, 0.0, 4.0);
+                const int lo = static_cast<int>(std::floor(q));
+                const int hi = std::min(lo + 1, 4);
+                const double dR = dRAt[lo] + (q - lo) * (dRAt[hi] - dRAt[lo]);
+                hFiber.theta.push_back(kTwoPi * kSeamWinding + amplitude * std::sin(s));
+                hFiber.z.push_back(z);
+                hFiber.radius.push_back(sheetR(kSeamWinding, z) - 200.0 + dR);
+            }
+            world.fibers.push_back(std::move(hFiber));
+            world.trueM.push_back(0);
+            const std::size_t v = addV(world, kSeamWinding, 29000.0, 31000.0, -200.0);
+            if (seam) {
+                world.fibers[v].onKollesis = true;
+                world.fibers[0].kollesisEndSample = world.fibers[0].theta.size() - 1;
+                world.links.push_back(LinkInput{0, world.fibers[0].theta.size() - 1, v, 56});
+            }
+            const SolveResult result =
+                solveWindings(world.fibers, world.links, SolverParams{});
+            QCOMPARE(result.events.size(), std::size_t{5});
+            QCOMPARE(result.groups.size(), std::size_t{1});
+            const CrossingGroup& group = result.groups.front();
+            if (!seam) {
+                QCOMPARE(group.multiplicity, 5);
+                QCOMPARE(group.insideCount, 3);
+                QVERIFY(!group.seamed);
+                QVERIFY(group.hasVerdict);
+                QCOMPARE(group.verdict, CrossingKind::Inside);
+            } else {
+                QCOMPARE(result.kollesisCrossingCount, 2);
+                QCOMPARE(group.multiplicity, 3);
+                QVERIFY(group.seamed);
+                QVERIFY(!group.hasVerdict);
+            }
         }
     }
 

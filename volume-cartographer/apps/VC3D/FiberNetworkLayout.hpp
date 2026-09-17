@@ -56,8 +56,9 @@ struct InputFiber {
     // Per control-point-span "was fiber-model traced"; anything else is only
     // an interpolation. Empty or mismatched renders as a single traced run.
     std::vector<bool> tracedSegments;
-    // Per control point: tagged kollesis_termination. Display-only (no
-    // geometry reads it), so it is not part of the cache keys; empty or
+    // Per control point: tagged kollesis_termination. Read at solve time
+    // (a V fiber linked to two tagged H fibers is on a kollesis), never by
+    // the cached detection, so it is not part of the cache keys; empty or
     // mismatched means no tags.
     std::vector<bool> kollesisTerminations;
     // Raw directed refs; the layout dedupes reciprocal pairs.
@@ -253,6 +254,8 @@ struct CrossingGroupRecord {
     bool unresolved = false;
     bool onCurtain = false;
     bool traversalCovered = false;
+    // A seam encounter lies on the translate: no verdict (incomplete count).
+    bool seamed = false;
     double minAbsDeltaR = 0.0;
     double meanTransversality = 0.0;
     bool hasVerdict = false;

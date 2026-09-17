@@ -922,6 +922,7 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     rebuildScene(reason);
     _restingReason = reason;
     _freshStatus = withCachedUmbilicusStatus(reason);
+    _freshStatusStyle.clear();
     if (_statusLabel) {
         _statusLabel->setStyleSheet(_freshStatusStyle);
         _statusLabel->setText(_freshStatus);

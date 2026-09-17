@@ -517,10 +517,6 @@ private slots:
         QVERIFY(minW < 1.0);
     }
 
-    // A fiber with no model-traced span never declares winding errors: the
-    // same wrong-winding link that is suspect between two traced fibers is
-    // silent when one end is pure control-point interpolation, and any
-    // dropped crossings it causes draw no red rings.
     // Declarations are not gated on trust: an interpolated fiber's wrong
     // link and the crossings it contradicts are reported exactly as a traced
     // fiber's would be. Its evidence is attenuated uniformly, so the same

@@ -1158,9 +1158,10 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         winding::FiberTrace& trace = traces[i];
         trace.hvTag = ordered[i]->hvTag;
         // One model-traced span trusts the whole fiber; a fiber with none is
-        // control-point interpolation and must never be declared a winding
-        // error. Empty flags get the benefit of the doubt, exactly as the
-        // drawing renders them (a single traced run).
+        // control-point interpolation, whose evidence is attenuated in repair
+        // conflicts (declarations are not gated on it). Empty flags get the
+        // benefit of the doubt, exactly as the drawing renders them (a single
+        // traced run).
         const std::vector<bool>& tracedFlags = ordered[i]->tracedSegments;
         trace.trusted = tracedFlags.empty() ||
                         std::any_of(tracedFlags.begin(), tracedFlags.end(),
@@ -1711,6 +1712,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         record.unresolved = group.unresolved;
         record.onCurtain = group.onCurtain;
         record.traversalCovered = group.traversalCovered;
+        record.seamed = group.seamed;
         record.minAbsDeltaR = group.minAbsDeltaR;
         record.meanTransversality = group.meanTransversality;
         record.hasVerdict = group.hasVerdict;
@@ -1745,6 +1747,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         mark.kollesis = event.kollesis;
         return mark;
     };
+    std::vector<char> declaredRepresentative(solve.crossings.size(), 0);
     for (std::size_t c = 0; c < solve.crossings.size(); ++c) {
         const winding::Crossing& crossing = solve.crossings[c];
         if (crossing.status != winding::CrossingStatus::Dropped ||
@@ -1752,20 +1755,19 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
             continue;
         }
         ++result.droppedCrossingCount;
-        if (!drawable[crossing.hFiber]) {
-            continue;
-        }
-        // Every event the representative stood for that the map itself
-        // violates: a merged event of the other sign that the map satisfies
-        // is not an error at its place, and an event whose group constrained
-        // for it is the group's to declare.
-        for (std::size_t e = 0; e < solve.events.size(); ++e) {
-            const winding::Crossing& event = solve.events[e];
-            if (event.representative == c &&
-                event.status == winding::CrossingStatus::Dropped &&
-                event.violationTurns >= solverParams.declarationViolationTurns) {
-                result.suspectCrossings.push_back(markFor(e, event.violationTurns, -1));
-            }
+        declaredRepresentative[c] = drawable[crossing.hFiber];
+    }
+    // Every event a declared representative stood for that the map itself
+    // violates: a merged event of the other sign that the map satisfies is
+    // not an error at its place, and an event whose group constrained for it
+    // is the group's to declare. One pass over the events.
+    for (std::size_t e = 0; e < solve.events.size(); ++e) {
+        const winding::Crossing& event = solve.events[e];
+        if (event.representative < declaredRepresentative.size() &&
+            declaredRepresentative[event.representative] &&
+            event.status == winding::CrossingStatus::Dropped &&
+            event.violationTurns >= solverParams.declarationViolationTurns) {
+            result.suspectCrossings.push_back(markFor(e, event.violationTurns, -1));
         }
     }
     // A dropped, violated traversal group is one conflict, marked at every
@@ -1926,8 +1928,9 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
         hashU64(digest, fiber.label.size());
         hashBytes(digest, fiber.label.constData(),
                   static_cast<std::size_t>(fiber.label.size()) * sizeof(QChar));
-        // Display-only like the label, and like it part of "did anything the
-        // layout consumes change" so the memoization check stays exact.
+        // Solve-time input (kollesis identification), never detection input:
+        // part of "did anything the layout consumes change" so the
+        // memoization check stays exact, not of the detection shard keys.
         hashU64(digest, fiber.kollesisTerminations.size());
         for (const bool tagged : fiber.kollesisTerminations) {
             hashU64(digest, tagged ? 1 : 0);
@@ -2113,7 +2116,8 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         hashI64(group.insideOrientationSum);
         hashU64(digest, (group.mixedSigns ? 1 : 0) | (group.coverageGap ? 2 : 0) |
                             (group.unresolved ? 4 : 0) | (group.onCurtain ? 8 : 0) |
-                            (group.traversalCovered ? 16 : 0) | (group.hasVerdict ? 32 : 0));
+                            (group.traversalCovered ? 16 : 0) | (group.hasVerdict ? 32 : 0) |
+                            (group.seamed ? 64 : 0));
         hashDouble(digest, group.minAbsDeltaR);
         hashDouble(digest, group.meanTransversality);
         hashU64(digest, static_cast<uint64_t>(group.verdict));

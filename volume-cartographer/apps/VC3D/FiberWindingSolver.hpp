@@ -200,10 +200,14 @@ struct Crossing {
     // Provenance: the H segment and its parameter, and the V vertex identity
     // (Branch::vertexId) when the hit is at a V vertex (kNoSample otherwise).
     // A V vertex shared by two branches is detected once per branch; the two
-    // are one event when their orientations agree (a straight pass through
-    // the vertex) and a `touch` when they oppose: the V fiber comes up to the
-    // H fiber at its apex and retraces, which crosses nothing. Touches are
-    // recorded and never counted.
+    // records are one event when the ray test read the hit as a crossing (the
+    // H fiber passes through the apex between the limbs) and the proximity
+    // merge put both under one representative, and both stay `touch` when
+    // it read a touch: the V fiber comes up to the H fiber at its apex and
+    // retraces, which crosses nothing. Records of one apex under two
+    // representatives (a repeated apex sample at another radius, say) stay
+    // two events, each with its own. Touches are recorded and never
+    // counted; apex crossings are `apex` (see below).
     static constexpr std::size_t kNoSample = static_cast<std::size_t>(-1);
     std::size_t hSegment = 0;
     double hT = 0.0;
@@ -230,9 +234,15 @@ struct Crossing {
     bool terminal = false;
     int terminalSides = 0;
     // A pass and return at a vertex of either polyline (both incident
-    // segments on one side of the other segment), or the two opposing
-    // records of a V apex: crosses nothing, counted by no group.
+    // segments on one side of the other segment), or the two records of a V
+    // apex the ray test read as a touch: crosses nothing, counted by no
+    // group.
     bool touch = false;
+    // A crossing exactly at a V fold apex, the shared end of two limbs: it
+    // lies on the edge of both limbs' radial curtains, so it belongs to
+    // neither limb's count. Counted by no group; both limbs' groups on its
+    // translate are `onCurtain` and take no verdict.
+    bool apex = false;
     // The z-monotone V branch the event was found on.
     std::size_t vBranch = 0;
     // The raw detection this record came from (its position in the pair's
@@ -300,7 +310,10 @@ struct CrossingGroup {
     int orientationSum = 0;
     int insideOrientationSum = 0;
     bool mixedSigns = false;
-    // Eligibility diagnostics (see above).
+    // Eligibility diagnostics (see above). onCurtain: an event on the edge
+    // of the radial curtain - exactly at the V fiber's radius, or a crossing
+    // at a fold apex shared with another limb - where the count is not of
+    // one traversal of this limb.
     bool coverageGap = false;
     bool unresolved = false;
     bool onCurtain = false;
@@ -308,6 +321,11 @@ struct CrossingGroup {
     // angular window to the other with clearance and stays within the
     // branch's height range throughout: the count is a complete traversal's.
     bool traversalCovered = false;
+    // A kollesis seam encounter of this pair lies on this translate and
+    // branch. Seam events are read by annotation and left out of the count,
+    // so the count is of an incomplete traversal and proves nothing: no
+    // verdict.
+    bool seamed = false;
     // Smallest |deltaR| over the events: the margin the verdict hangs on.
     double minAbsDeltaR = 0.0;
     double meanTransversality = 0.0;
@@ -425,6 +443,10 @@ struct CanonicalTrace {
         // repeated in the projection - at a fold apex, say - is one vertex
         // to both branches.
         std::vector<std::size_t> vertexId;
+        // The original trace sample each branch sample came from, so a hit
+        // at a branch end (a fold apex) can be classified by the fiber's own
+        // incident rays rather than the branch's extension.
+        std::vector<std::size_t> sample;
         // Walking the branch in its stored (ascending z) order follows the
         // fiber's own polyline order.
         bool forwardAscending = true;
@@ -479,9 +501,11 @@ struct PairCrossings {
     std::vector<CrossingGroup> groups;
     int gatedSegmentCount = 0;
     int tangentialCount = 0;
-    // Owner segments that were exactly parallel: an intersection the
-    // detector cannot place. Disables the verdict on the translates it
-    // touched (recorded on the groups).
+    // Places where no intersection can be placed or trusted: collinear
+    // owner segments overlapping or sharing an endpoint, a radial step (zero
+    // projected length) through the other fiber's curtain, a hit on a level
+    // V segment (a fold's flat top). Disables the verdict on the translates
+    // it touched (recorded on the groups).
     int unresolvedCount = 0;
 };
 // One tagged end of an H fiber, to be read against a V fiber on a kollesis,
@@ -527,9 +551,6 @@ struct SeamAnchor {
                                                   const std::vector<SeamAnchor>& seams,
                                                   const std::vector<std::size_t>& inferredSeams,
                                                   const SolverParams& params);
-
-// Field-by-field, bit-exact equality of two classified shards.
-[[nodiscard]] bool identicalPairCrossings(const PairCrossings& a, const PairCrossings& b);
 
 // A detection shard bound to the current build's fiber indices.
 struct PairDetection {
