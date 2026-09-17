@@ -179,6 +179,23 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "pcl_fiber_link_side_margin_voxels": 0.5,
     "pcl_fiber_link_model_direction_step": 10000,
 })
+# Pinned winding radii postdate durable checkpoints; missing means off.
+BACKFILLABLE_CONFIG_DEFAULTS.update({
+    "model_pins_enabled": False,
+    "model_pins_warmup_steps": 500,
+    "model_pin_patch_grid_stride": 1,
+    "model_pin_kernel_spacing_factor": 1.5,
+    "model_pin_kernel_min_arc_voxels": 3.0,
+    "model_pin_kernel_max_theta_radians": 0.25,
+    "model_pin_kernel_min_z_voxels": 3.0,
+    "model_pin_kernel_max_z_voxels": 200.0,
+    "model_pin_coincidence_frac": 0.05,
+    "model_pin_conflict_tolerance": 0.1,
+    "model_pin_rebin_interval": 1,
+    "model_pin_overlap_tolerance_voxels": 0.0,
+    "optimizer_lr_pin_targets": 0.01,
+    "sample_count_pins": 100000,
+})
 # The flow-gradient conditioning settings postdate durable checkpoints;
 # missing means off, which is exactly the earlier behaviour.
 BACKFILLABLE_CONFIG_DEFAULTS.update({
@@ -248,6 +265,38 @@ _GAP_EXPANDER_DESCRIPTIONS = {
         "minimum-spacing loss remains the separate geological preference."),
     "model_gap_expander_softplus_bias": (
         "Bias of the stable lower-bounded softplus gap parameterisation."),
+}
+
+_PIN_DESCRIPTIONS = {
+    "model_pins_enabled": (
+        "Pin the gap expander's winding radii so every verified-patch, "
+        "cross-patch PCL and unattached-strip point lands exactly on its "
+        "target winding (pinned_spiral_plan.md). Adds the per-component "
+        "pin_targets parameter to the model."),
+    "model_pins_warmup_steps": (
+        "Steps of the ordinary unpinned soft fit before the pins are switched "
+        "on (the flow must already have the winding ordering right)."),
+    "model_pin_patch_grid_stride": (
+        "Keep every n-th quad centre of each verified patch as a pin (1 = all)."),
+    "model_pin_kernel_spacing_factor": (
+        "Pin footprint width as a multiple of the pin's own-object spacing."),
+    "model_pin_kernel_min_arc_voxels": (
+        "Footprint floor along theta, in voxels of arc at the pin's radius."),
+    "model_pin_kernel_max_theta_radians": "Footprint cap along theta.",
+    "model_pin_kernel_min_z_voxels": "Footprint floor along z.",
+    "model_pin_kernel_max_z_voxels": "Footprint cap along z.",
+    "model_pin_coincidence_frac": (
+        "Pins in one winding slot closer than this fraction of their "
+        "footprints are treated as one pin."),
+    "model_pin_conflict_tolerance": (
+        "Coincident pins whose radii differ by more than this fraction of "
+        "the local winding gap are reported as conflicts."),
+    "model_pin_overlap_tolerance_voxels": (
+        "Verified patches with quad centres within this distance are linked "
+        "into one pin component (the same sheet observed twice); 0 disables."),
+    "model_pin_rebin_interval": (
+        "Steps between rebuilds of the pin coincidence groups; slot or "
+        "pin-set changes always rebuild."),
 }
 
 _OPTIMIZER_DESCRIPTIONS = {
@@ -322,6 +371,9 @@ _OPTIMIZER_DESCRIPTIONS = {
 # changes the map a fixed parameter set produces (by the discretisation
 # difference) but reshapes nothing, so it is a run-boundary setting and a
 # checkpoint written under another count loads with a printed notice.
+# model_pins_enabled is deliberately absent: enabling pins on a checkpoint
+# written without them is the intended workflow (the pin_targets parameter is
+# initialised from the loaded model; see FitContext._adapt_checkpoint_for_pins).
 CHECKPOINT_MODEL_SHAPE_KEYS = (
     "model_flow_integration_solver",
     "model_num_flow_stages", "model_flow_bounds_z_margin",
@@ -358,6 +410,14 @@ RETIRED_CONFIG_KEYS = frozenset({
 # Both are therefore absent, and a key nobody has audited is absent by
 # construction — the safe answer.
 MODEL_STAGE_KEYS = frozenset({
+    "model_pins_enabled",
+    "model_pin_overlap_tolerance_voxels",
+    "model_pin_patch_grid_stride",
+    "model_pin_kernel_spacing_factor",
+    "model_pin_kernel_min_arc_voxels",
+    "model_pin_kernel_max_theta_radians",
+    "model_pin_kernel_min_z_voxels",
+    "model_pin_kernel_max_z_voxels",
     "model_flow_integration_solver",
     "model_num_flow_stages",
     "model_flow_bounds_radius",
@@ -374,6 +434,14 @@ MODEL_STAGE_KEYS = frozenset({
 })
 
 _MODEL_STRUCTURE_KEYS = frozenset({
+    "model_pins_enabled",
+    "model_pin_overlap_tolerance_voxels",
+    "model_pin_patch_grid_stride",
+    "model_pin_kernel_spacing_factor",
+    "model_pin_kernel_min_arc_voxels",
+    "model_pin_kernel_max_theta_radians",
+    "model_pin_kernel_min_z_voxels",
+    "model_pin_kernel_max_z_voxels",
     "model_flow_integration_solver",
     "model_num_flow_stages",
     "model_flow_bounds_z_margin",
@@ -391,6 +459,10 @@ _MODEL_STRUCTURE_KEYS = frozenset({
 })
 
 _RUN_MUTABLE_MODEL_KEYS = frozenset({
+    "model_pins_warmup_steps",
+    "model_pin_rebin_interval",
+    "model_pin_coincidence_frac",
+    "model_pin_conflict_tolerance",
     "model_flow_field_low_res_lr_scale",
     "model_num_flow_integration_steps",
     "model_flow_field_high_res_lr_scale_initial",
@@ -570,6 +642,8 @@ def _field_spec(key, default):
         spec["description"] = _INPUT_TOGGLE_DESCRIPTIONS[key]
     elif key in _GAP_EXPANDER_DESCRIPTIONS:
         spec["description"] = _GAP_EXPANDER_DESCRIPTIONS[key]
+    elif key in _PIN_DESCRIPTIONS:
+        spec["description"] = _PIN_DESCRIPTIONS[key]
     elif key in _PCL_LINK_DESCRIPTIONS:
         spec["description"] = _PCL_LINK_DESCRIPTIONS[key]
 
@@ -632,6 +706,37 @@ class Config:
         self.model_gap_expander_softplus_bias = 4.0
         self.model_linear_z_resolution = 48
         self.model_initial_dr_per_winding = 16.0
+        # Pinned winding radii (pinned_spiral_plan.md stage 2a): every
+        # hard-constraint point is sent exactly onto its target winding by a
+        # pinned, monotone radial map, with one fractional winding coordinate
+        # per constraint component (the model's pin_targets parameter).
+        self.model_pins_enabled = False
+        self.model_pins_warmup_steps = 500
+        self.model_pin_patch_grid_stride = 1
+        self.model_pin_kernel_spacing_factor = 1.5
+        self.model_pin_kernel_min_arc_voxels = 3.0
+        self.model_pin_kernel_max_theta_radians = 0.25
+        self.model_pin_kernel_min_z_voxels = 3.0
+        self.model_pin_kernel_max_z_voxels = 200.0
+        self.model_pin_coincidence_frac = 0.05
+        self.model_pin_conflict_tolerance = 0.1
+        # Steps between rebuilds of the pins' coincidence groups (pins move
+        # every step; 1 = rebuild every step, the exact 2a behaviour).
+        self.model_pin_rebin_interval = 1
+        # Patches whose quad centres come within this many scroll voxels of
+        # each other are treated as the same sheet observed twice and join
+        # one pin component with an integer offset from the theta topology.
+        # Off by default: compressed adjacent sheets can pass a proximity
+        # test, and a false link is a hard wrong constraint. ~1.5 is a
+        # reasonable opt-in value for overlapping surface annotations.
+        self.model_pin_overlap_tolerance_voxels = 0.0
+        self.optimizer_lr_pin_targets = 0.01
+        # Registry pins pushed through the flow per training step (stratified
+        # by component; 0 = all). Export and diagnostics always use them all.
+        # Memory of the eager pinned lookup grows with the (sample, pin) pairs
+        # every loss family keeps for backward; 100k fits a 24 GB GPU with the
+        # default sample counts.
+        self.sample_count_pins = 100000
         # Patch/PCL theta=0 topology is transformed only on this cadence. Patch
         # samples use cached node potentials; generic PCL/track walks gather
         # cached signed crossings.

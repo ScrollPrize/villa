@@ -10,6 +10,7 @@ from einops import rearrange
 
 import flow_grad_smoothing
 import gap_triton
+import pins as pins_module
 import sample_spiral
 from flow_fields import (
     BSplineCylindricalFlowField,
@@ -279,6 +280,112 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         return transformed_zyx
 
 
+class PinnedGapExpandingTransform(GapExpandingTransform):
+    """Gap expander whose winding radii are pinned (pinned_spiral_plan.md 2a.4).
+
+    The free map ``s_free`` is the parent class's table; ``pin_table``
+    (:class:`pins.PinTable`) supplies per-ray anchors that the pinned monotone
+    map passes through exactly (unless the ordering guard fires). The fused
+    Triton path is bypassed: every call runs the eager pinned arithmetic,
+    chunked over points to bound the ``[chunk, windings]`` intermediates.
+    """
+
+    def __init__(self, *args, pin_table, chunk_size=16384, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pin_table = pin_table
+        self.chunk_size = int(chunk_size)
+
+    def _use_triton(self, input_zyx, dr):
+        return False
+
+    def ray_map(self, theta, z):
+        """The free table and the resolved pinned anchor sequence per ray."""
+        table = self.get_transformed_winding_radii(theta, z)
+        R, S, w, valid = self.pin_table.anchors(theta, z)
+        ray_map = pins_module.build_pinned_ray_map(
+            table, self.dr_per_winding, theta / (2 * torch.pi), R, S, w, valid,
+            self.min_gap)
+        return table, ray_map
+
+    def _radial(self, input_zyx, inverse):
+        flat = input_zyx.reshape(-1, 3)
+        pieces = []
+        for start in range(0, flat.shape[0], self.chunk_size):
+            chunk = flat[start:start + self.chunk_size]
+            theta, radius, _ = get_theta_and_radii(chunk[..., 1:], self.dr_per_winding)
+            z = chunk[..., 0]
+            table, ray_map = self.ray_map(theta, z)
+            theta_norm = theta / (2 * torch.pi)
+            if inverse:
+                # intermediate -> canonical
+                mapped = pins_module.pinned_map_forward(
+                    radius, table, self.dr_per_winding, theta_norm, ray_map)
+            else:
+                # canonical -> intermediate
+                mapped = pins_module.pinned_map_inverse(
+                    radius, table, self.dr_per_winding, theta_norm, ray_map)
+            delta_radius = mapped - radius
+            outward_direction = torch.cat([
+                torch.zeros_like(chunk[..., :1]),
+                F.normalize(chunk[..., 1:], dim=-1)], dim=-1)
+            pieces.append(chunk + outward_direction * delta_radius[..., None])
+        if not pieces:
+            return input_zyx
+        return torch.cat(pieces, dim=0).reshape(input_zyx.shape)
+
+    def _call(self, input_zyx):
+        return self._radial(input_zyx, inverse=False)
+
+    def _inverse(self, input_zyx):
+        return self._radial(input_zyx, inverse=True)
+
+    @torch.no_grad()
+    def pin_diagnostics(self, pins, chunk_size=None):
+        """Evaluate the pinned map at every pin's own ray (plan 2a.4 logging).
+
+        ``pins`` is the ``[P, 4]`` ``(z, theta, r, dr (T + n))`` tensor the
+        table was built from. Returns exactness residuals, guard-violation
+        counts split by cause, and the minimum effective winding gap.
+        """
+        chunk_size = chunk_size or self.chunk_size
+        residuals = []
+        order_violations = 0
+        min_rise_violations = 0
+        rays_with_violation = 0
+        anchors_total = 0
+        min_effective_gap = float('inf')
+        for start in range(0, pins.shape[0], chunk_size):
+            chunk = pins[start:start + chunk_size]
+            z, theta, r, r_target_shifted = chunk.unbind(-1)
+            table, ray_map = self.ray_map(theta, z)
+            theta_norm = theta / (2 * torch.pi)
+            s = pins_module.pinned_map_forward(r, table, self.dr_per_winding, theta_norm, ray_map)
+            residuals.append((s - (r_target_shifted + self.dr_per_winding * theta_norm)).abs())
+            order_violations += int(ray_map.order_violations().sum())
+            min_rise_violations += int(ray_map.min_rise_violations().sum())
+            rays_with_violation += int(ray_map.guard_active.any(dim=-1).sum())
+            anchors_total += int(ray_map.valid[:, 1:].sum())
+            free_gap_min = table.diff(dim=-1).min(dim=-1).values
+            scale_max = ray_map.scale.max(dim=-1).values
+            min_effective_gap = min(min_effective_gap, float((free_gap_min / scale_max).min()))
+        residual = torch.cat(residuals) if residuals else pins.new_zeros([0])
+        num_pins = int(pins.shape[0])
+        dr = float(self.dr_per_winding.detach())
+        return {
+            'pin_residual_max': float(residual.max()) if residual.numel() else 0.0,
+            'pin_residual_mean': float(residual.mean()) if residual.numel() else 0.0,
+            # Pins missed by more than a tenth of a winding: the exactness failures.
+            'pin_inexact_fraction': float((residual > 0.1 * dr).float().mean()) if residual.numel() else 0.0,
+            # Anchor-level sums (one ray can carry many) and their denominators.
+            'pin_order_violations': order_violations,
+            'pin_min_rise_violations': min_rise_violations,
+            'pin_anchors_evaluated': anchors_total,
+            'pin_rays_evaluated': num_pins,
+            'pin_rays_with_violation_fraction': rays_with_violation / max(num_pins, 1),
+            'pin_min_effective_gap': min_effective_gap,
+        }
+
+
 class VaryingLinearTransform(pyro.distributions.transforms.Transform):
 
     # This applies a z-dependent 2x2 linear transform M(z) on yx, parametrised
@@ -372,6 +479,22 @@ class UmbilicusTransform(pyro.distributions.transforms.Transform):
         return self._call(input_zyx, inverse=True)
 
 
+def pinned_gap_stage(slice_to_spiral_transform):
+    """The PinnedGapExpandingTransform of a production chain, or None."""
+    inv_parts = getattr(slice_to_spiral_transform, 'parts', None)
+    if inv_parts is not None:
+        try:
+            parts = [p.inv for p in reversed(inv_parts)]
+        except AttributeError:
+            return None
+    else:
+        base = getattr(slice_to_spiral_transform, '_inv', None)
+        parts = list(getattr(base, 'parts', None) or [])
+    if parts and isinstance(parts[0], PinnedGapExpandingTransform):
+        return parts[0]
+    return None
+
+
 def ray_gap_enabled():
     # Per-ray specialization of the gap-expander stage for radial-ray sample
     # batches (phase-bundle polylines / registration targets). The generic
@@ -416,6 +539,10 @@ def ray_specialized_spiral_to_scroll(
         base = getattr(slice_to_spiral_transform, '_inv', None)
         parts = list(getattr(base, 'parts', None) or []) or None
     if not parts or not isinstance(parts[0], GapExpandingTransform):
+        return None
+    if getattr(parts[0], 'pin_table', None) is not None:
+        # The pinned gap stage is not a per-ray table gather; use the generic
+        # (pinned) transform instead.
         return None
     gap, rest = parts[0], parts[1:]
     flip = None
@@ -525,14 +652,274 @@ class SpiralAndTransform(nn.Module):
             dr_per_winding=config['model_initial_dr_per_winding'],  # this is a nominal (fixed) winding spacing which we only use to calculate the number of logits
         )
 
+        # Pinned winding radii (pinned_spiral_plan.md stage 2a). pin_targets is
+        # the per-component fractional winding coordinate T; it is created by
+        # init_pin_targets() once the constraint graph's component count is
+        # known, so a model without pins has no such parameter. The registry
+        # (pins.PinRegistry) and the active flag are runtime state set by the
+        # fitter; while inactive every transform is the unpinned one.
+        self.pin_targets = None
+        self.pin_registry = None
+        self.pins_active = False
+        self._pin_slots = None
+        self._pin_groups = None
+        self._pin_rebuilds = 0
+        self.last_pins = None
+
     @property
     def device(self):
         return self.linear_logits.device
 
-    def _get_transform_parts(self, truncate_at_step=None, shared=None):
+    # -- pins ----------------------------------------------------------------
+
+    def init_pin_targets(self, num_components):
+        """Create ``T`` (``pin_targets``) for ``num_components`` components."""
+        self.pin_targets = nn.Parameter(
+            torch.zeros([int(num_components)], dtype=torch.float32, device=self.device))
+        return self.pin_targets
+
+    def set_pin_registry(self, registry, *, reset_targets=True):
+        """Attach a finalised registry; optionally load its ``T`` estimate."""
+        self.pin_registry = registry.to(self.device) if registry is not None else None
+        self._pin_slots = None
+        self._pin_groups = None
+        if registry is not None:
+            if self.pin_targets is None or self.pin_targets.numel() != registry.num_components:
+                self.init_pin_targets(registry.num_components)
+            if reset_targets:
+                with torch.no_grad():
+                    self.pin_targets.copy_(registry.initial_T.to(self.device))
+
+    def effective_pin_targets(self):
+        registry = self.pin_registry
+        return torch.where(registry.fixed_T, registry.fixed_T_value, self.pin_targets)
+
+    def get_unpinned_slice_to_spiral_transform(self):
+        """The full scroll -> spiral transform with the free gap expander."""
+        active = self.pins_active
+        self.pins_active = False
+        try:
+            return self.get_slice_to_spiral_transform()
+        finally:
+            self.pins_active = active
+
+    @torch.no_grad()
+    def estimate_pin_targets(self, chunk_size=262144):
+        """``T_g`` = median over the component's pins of the canonical
+        shifted winding ``s_free(r_i)/dr - n_i`` under the current unpinned
+        model (plan 2a.1); fixed components keep their value."""
+        registry = self.pin_registry
+        dr = self.get_dr_per_winding()
+        transform = self.get_unpinned_slice_to_spiral_transform()
+        zyx = registry.zyx
+        spiral = torch.cat([
+            transform(zyx[start:start + chunk_size])
+            for start in range(0, zyx.shape[0], chunk_size)], dim=0) \
+            if zyx.shape[0] else zyx.new_zeros([0, 3])
+        theta, _, shifted = get_theta_and_radii(spiral[..., 1:], dr)
+        estimate = shifted / dr - registry.adjusted_n(theta).to(shifted.dtype)
+        T = torch.zeros([registry.num_components], dtype=torch.float32, device=self.device)
+        for component in range(registry.num_components):
+            mask = registry.component == component
+            if mask.any():
+                T[component] = estimate[mask].median()
+        return torch.where(registry.fixed_T, registry.fixed_T_value, T)
+
+    def get_slice_to_intermediate_transform(self, shared=None, truncate_at_step=None):
+        """Scroll -> intermediate space: the chain without the gap expander."""
+        _, maybe_flip, diffeomorphism, truncate_frac = self._get_transform_parts(
+            truncate_at_step, shared, with_pins=False)
+        scaled_linear_logits = (
+            shared[1] if shared is not None
+            else self.linear_logits * self.linear_logits_scale)
+        return pyro.distributions.transforms.ComposeTransform([
+            *maybe_flip,
+            diffeomorphism,
+            VaryingLinearTransform(scaled_linear_logits, self.flow_min_corner_zyx[0], self.flow_max_corner_zyx[0], truncate_frac),
+            self.umbilicus_transform,
+        ]).inv
+
+    def sample_pin_subset(self, sample_count):
+        """Stratified random subset of the registry for one training step.
+
+        Every component keeps at least one pin and otherwise a share
+        proportional to its size. Returns ``(indices, eps_theta, eps_z)``
+        where the footprints are widened for the thinning (plan 2a.3's
+        own-object spacing under uniform random sampling: by ``1/sqrt(f)``
+        for 2-D patch grids, ``1/f`` for chains), capped like the registry.
+        """
+        registry = self.pin_registry
+        num_pins = registry.num_pins
+        sample_count = int(sample_count or 0)
+        if sample_count <= 0 or num_pins <= sample_count:
+            return None
+        device = registry.zyx.device
+        counts = torch.bincount(registry.component, minlength=registry.num_components).to(torch.float32)
+        fraction = sample_count / num_pins
+        quota = torch.clamp(torch.floor(counts * fraction), min=1.0)
+        quota = torch.where(counts > 0, torch.minimum(quota, counts), torch.zeros_like(quota))
+        # Rank each pin within its component by a random key.
+        key = torch.rand([num_pins], device=device)
+        order = torch.argsort(registry.component.to(torch.float64) * 2.0 + key.to(torch.float64))
+        component_sorted = registry.component[order]
+        starts = torch.cumsum(counts, dim=0) - counts
+        rank = torch.arange(num_pins, device=device, dtype=torch.float32) - starts[component_sorted]
+        keep_sorted = rank < quota[component_sorted]
+        indices = order[keep_sorted]
+        scale_component = counts / quota.clamp(min=1.0)
+        scale = scale_component[registry.component[indices]]
+        kind = registry.kind[indices]
+        widen = torch.where(kind == pins_module.PIN_KIND_PATCH, torch.sqrt(scale),
+                            torch.where(kind == pins_module.PIN_KIND_CHAIN, scale, torch.ones_like(scale)))
+        rule = self._pin_footprint_caps()
+        eps_theta = (registry.eps_theta[indices] * widen).clamp(max=rule[0])
+        eps_z = (registry.eps_z[indices] * widen).clamp(max=rule[1])
+        return indices, eps_theta, eps_z
+
+    def _pin_footprint_caps(self):
+        return (float(self.cfg.get('model_pin_kernel_max_theta_radians', 0.25)),
+                float(self.cfg.get('model_pin_kernel_max_z_voxels', 200.0)))
+
+    def compute_pins(self, shared=None, registry=None, chunk_size=None, subsample=False):
+        """Push the registry through the flow chain (plan 2a.2).
+
+        Returns ``pins`` ``[P, 4]`` = ``(z, theta, r, dr (T + n))`` in
+        intermediate space with the graph attached (flow, linear, ``dr``,
+        ``T``), and stores the pins' winding slots for the table build.
+        ``chunk_size`` bounds the flow-integration batch under ``no_grad``
+        (with the graph attached the whole registry goes through at once).
+        With ``subsample`` (the training step) only the stratified subset of
+        ``sample_count_pins`` registry pins is pushed; export and
+        diagnostics use the full registry.
+        """
+        registry = self.pin_registry if registry is None else registry
+        dr = shared[0] if shared is not None else self.get_dr_per_winding()
+        transform = self.get_slice_to_intermediate_transform(shared)
+        subset = self.sample_pin_subset(self.cfg.get('sample_count_pins', 0)) if subsample else None
+        if subset is None:
+            self._pin_view = {
+                'indices': None, 'component': registry.component,
+                'eps_theta': registry.eps_theta, 'eps_z': registry.eps_z,
+                'kind': registry.kind, 'n0': registry.n0, 'theta0': registry.theta0,
+                'local_gap': registry.local_gap, 'num_pins': registry.num_pins}
+            zyx = registry.zyx
+        else:
+            indices, eps_theta, eps_z = subset
+            self._pin_view = {
+                'indices': indices, 'component': registry.component[indices],
+                'eps_theta': eps_theta, 'eps_z': eps_z, 'kind': registry.kind[indices],
+                'n0': registry.n0[indices], 'theta0': registry.theta0[indices],
+                'local_gap': registry.local_gap[indices], 'num_pins': int(indices.numel())}
+            zyx = registry.zyx[indices]
+        view = self._pin_view
+        if chunk_size is None and not torch.is_grad_enabled():
+            chunk_size = 1 << 20
+        if chunk_size is not None and not torch.is_grad_enabled():
+            intermediate = torch.cat([
+                transform(zyx[start:start + chunk_size])
+                for start in range(0, zyx.shape[0], chunk_size)], dim=0) \
+                if zyx.shape[0] else zyx.new_zeros([0, 3])
+        else:
+            intermediate = transform(zyx)
+        theta, radius, _ = get_theta_and_radii(intermediate[..., 1:], dr)
+        z = intermediate[..., 0]
+        n = (view['n0'] + torch.round((view['theta0'] - theta.detach()) / (2 * torch.pi)).to(torch.int32)).to(torch.float32)
+        T_eff = self.effective_pin_targets()
+        # Shifted target dr (T + n); the lookup adds the query ray's angular
+        # term so anchors are continuous across the theta = 0 seam.
+        target = dr * (T_eff[view['component']] + n)
+        pins = torch.stack([z, theta, radius, target], dim=-1)
+        self._pin_slots_next = torch.round(T_eff.detach()[view['component']] + n).to(torch.int64)
+        self._pin_n_next = n.to(torch.int32)
+        self.last_pins = pins
+        return pins
+
+    def pin_groups_stale(self, settings_key, rebin_interval):
+        """True when the coincidence groups must be recomputed: the pin set,
+        any pin's slot or the coincidence settings changed, or the groups are
+        ``rebin_interval`` steps old (pins move every step, so previously
+        coincident pins can separate while staying merged)."""
+        if getattr(self, '_pin_groups_key', None) != settings_key:
+            return True
+        if getattr(self, '_pin_groups_age', 0) >= max(int(rebin_interval), 1):
+            return True
+        return self.pin_slots_changed()
+
+    def pin_slots_changed(self):
+        """True when the pin set or any pin's slot differs from the cached table."""
+        if self._pin_slots is None or self._pin_slots.shape != self._pin_slots_next.shape:
+            return True
+        indices = self._pin_view.get('indices')
+        cached = getattr(self, '_pin_slots_indices', None)
+        if (indices is None) != (cached is None):
+            return True
+        if indices is not None and (indices.shape != cached.shape or bool((indices != cached).any())):
+            return True
+        return bool((self._pin_slots != self._pin_slots_next).any())
+
+    def build_pin_table(self, pins, coincidence_frac, conflict_tolerance, dr=None,
+                        rebin_interval=1):
+        """Rasterise ``pins`` into a :class:`pins.PinTable`.
+
+        The slot assignment and coincidence groups are rebuilt whenever any
+        pin's slot changed (plan 2a.3); otherwise the cached groups are reused
+        and only the differentiable values and the cells are refreshed.
+        """
+        registry = self.pin_registry
+        view = self._pin_view
+        dr = self.get_dr_per_winding() if dr is None else dr
+        num_slots = len(self.gap_expander_params.num_by_winding)
+        min_z = float(self.flow_min_corner_zyx[0])
+        max_z = float(self.flow_max_corner_zyx[0])
+        settings_key = (float(coincidence_frac), float(conflict_tolerance))
+        if self.pin_groups_stale(settings_key, rebin_interval):
+            self._pin_slots = self._pin_slots_next
+            self._pin_slots_indices = view.get('indices')
+            self._pin_groups_key = settings_key
+            self._pin_groups_age = 0
+            with torch.no_grad():
+                self._pin_groups = pins_module.compute_coincidence_groups(
+                    pins[:, 1].detach(), pins[:, 0].detach(), self._pin_slots, view['component'],
+                    self._pin_n_next, pins[:, 2].detach(),
+                    view['eps_theta'], view['eps_z'], min_z, max_z,
+                    view['local_gap'],
+                    coincidence_frac=coincidence_frac,
+                    conflict_tolerance=conflict_tolerance,
+                    kinds=view['kind'])
+            self._pin_rebuilds += 1
+        self._pin_groups_age = getattr(self, '_pin_groups_age', 0) + 1
+        return pins_module.PinTable(
+            pins[:, 0], pins[:, 1], pins[:, 2], pins[:, 3], self._pin_slots,
+            view['eps_theta'], view['eps_z'], num_slots, min_z, max_z, dr,
+            groups=self._pin_groups, num_registry_pins=view['num_pins'])
+
+    @property
+    def pin_conflicts(self):
+        return self._pin_groups.conflicts if self._pin_groups is not None else []
+
+    def merged_pin_mask(self):
+        """Registry pins that the coincidence pass merged with another pin
+        (their rasterised pin is the group mean, so they are not individually
+        exact)."""
+        registry = self.pin_registry
+        if self._pin_groups is None:
+            return torch.zeros([registry.num_pins], dtype=torch.bool, device=registry.zyx.device)
+        counts = torch.bincount(self._pin_groups.group, minlength=self._pin_groups.num_groups)
+        merged = counts[self._pin_groups.group] > 1
+        indices = self._pin_view.get('indices') if getattr(self, '_pin_view', None) else None
+        if indices is None:
+            return merged
+        full = torch.zeros([registry.num_pins], dtype=torch.bool, device=registry.zyx.device)
+        full[indices] = merged
+        return full
+
+    def _pins_enabled(self):
+        return self.pins_active and self.pin_registry is not None and self.pin_targets is not None
+
+    def _get_transform_parts(self, truncate_at_step=None, shared=None, with_pins=True):
         truncate_frac = None if truncate_at_step is None else truncate_at_step / (self.flow_integration_steps - 1)
         diffeomorphism = IntegratedFlowDiffeomorphism(self.flow_field, self.flow_min_corner_zyx, self.flow_max_corner_zyx, num_steps=self.flow_integration_steps, solver=self.flow_integration_solver, truncate_at_step=truncate_at_step)
-        gap_expander = GapExpandingTransform(
+        gap_args = (
             self.gap_expander_params,
             shared[0] if shared is not None else self.get_dr_per_winding(),
             self.flow_min_corner_zyx[0],
@@ -543,6 +930,20 @@ class SpiralAndTransform(nn.Module):
             self.gap_softplus_scale,
             truncate_frac,
         )
+        if with_pins and self._pins_enabled():
+            # Pins are the fourth shared leaf when the step supplies them;
+            # otherwise compute them now from the live parameters.
+            if shared is not None and len(shared) > 3 and shared[3] is not None:
+                pins = shared[3]
+            else:
+                pins = self.compute_pins(shared)
+            pin_table = self.build_pin_table(
+                pins, float(self.cfg.get('model_pin_coincidence_frac', 0.05)),
+                float(self.cfg.get('model_pin_conflict_tolerance', 0.1)), dr=gap_args[1],
+                rebin_interval=int(self.cfg.get('model_pin_rebin_interval', 1) or 1))
+            gap_expander = PinnedGapExpandingTransform(*gap_args, pin_table=pin_table)
+        else:
+            gap_expander = GapExpandingTransform(*gap_args)
         if shared is not None:
             gap_expander._pinned_scaled_logits = shared[2]
         if self.spiral_outward_sense == 'CW':
@@ -633,15 +1034,24 @@ class SpiralAndTransform(nn.Module):
         pinned_scaled_gap_logits = torch.cat(
             [torch.zeros_like(gap_logits[..., :1]), gap_logits[..., 1:]], dim=-1,
         ) * self.cfg['model_gap_expander_lr_scale']
-        return (
+        outputs = (
             self.get_dr_per_winding(),
             self.linear_logits * self.linear_logits_scale,
             pinned_scaled_gap_logits,
         )
+        if self._pins_enabled():
+            # The pins tensor is a fourth shared leaf: each loss family's
+            # backward accumulates into it and the step propagates once through
+            # compute_pins (flow, linear, dr and T). It must be propagated
+            # before the flow field's accumulated gradient is flushed. The
+            # training step pushes the sampled subset (sample_count_pins).
+            outputs = outputs + (self.compute_pins(subsample=True),)
+        return outputs
 
     def get_native_log_gaps(self, winding_idx, theta, z):
         """Exact log gap for the native lower-bounded gap expander."""
-        gap_expander, _, _, truncate_frac = self._get_transform_parts()
+        # The free gap table only; the pinned stage is irrelevant here.
+        gap_expander, _, _, truncate_frac = self._get_transform_parts(with_pins=False)
         assert truncate_frac is None
         return gap_expander.get_native_log_gaps(winding_idx, theta, z)
 

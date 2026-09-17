@@ -47,6 +47,7 @@ from ddp_helpers import (
     maybe_init_distributed,
     process_context,
 )
+import pins as pins_module
 from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
                     RETIRED_CONFIG_KEYS, Config, FitConfig, SHELL_ATLAS_KEYS, durable_config)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
@@ -167,7 +168,7 @@ from satisfaction_metrics import (
     save_overlay_and_print_satisfaction,
 )
 from visualization import overlay_patches_on_slices
-from transforms import SpiralAndTransform
+from transforms import SpiralAndTransform, pinned_gap_stage
 from theta_crossing_map import ThetaCrossingMap
 from winding_supervision import (
     get_winding_inference_losses,
@@ -1265,6 +1266,15 @@ def get_exponential_lr_at_step(
     completed = max(0, int(completed_steps))
     gamma = float(final_factor) ** (1.0 / horizon)
     return float(initial_lr) * gamma ** completed
+
+
+def _checkpoint_lacks_pin_group(context, optimiser_state):
+    """True when this fit has a pin_targets optimiser group but the saved
+    optimiser state predates pins (exactly one group fewer)."""
+    if not getattr(context, 'pin_target_params', None) or not isinstance(optimiser_state, Mapping):
+        return False
+    saved_groups = list(optimiser_state.get('param_groups') or [])
+    return len(saved_groups) == len(context.optimiser.param_groups) - 1
 
 
 def get_flow_field_high_res_lr_scale(cfg, iteration):
@@ -3331,6 +3341,214 @@ class FitContext:
 
         self._sdt_inactive_warned = set()
 
+    # ==========================================================================
+    # Pinned winding radii (pinned_spiral_plan.md stage 2a)
+    # ==========================================================================
+
+    def _pin_footprint_rule(self):
+        cfg = self.config
+        return pins_module.FootprintRule(
+            spacing_factor=float(cfg.get('model_pin_kernel_spacing_factor', 1.5)),
+            min_arc_voxels=float(cfg.get('model_pin_kernel_min_arc_voxels', 3.0)),
+            max_theta_radians=float(cfg.get('model_pin_kernel_max_theta_radians', 0.25)),
+            min_z_voxels=float(cfg.get('model_pin_kernel_min_z_voxels', 3.0)),
+            max_z_voxels=float(cfg.get('model_pin_kernel_max_z_voxels', 200.0)))
+
+    def _finalize_pin_registry(self):
+        """Resolve the pin graph against the current (unpinned) model.
+
+        The theta topology has just been refreshed under
+        self.slice_to_spiral_transform for a newly constructed registry.
+        A matching checkpoint restores its registry together with T: rebuilding
+        integer offsets in the current theta frame would change the meaning of
+        the saved targets after a seam crossing. Otherwise the new registry
+        supplies the initial target estimates.
+        """
+        model = self.spiral_and_transform
+        started_at = time.perf_counter()
+        if self.pin_targets_loaded:
+            registry = model.pin_registry
+        else:
+            with torch.no_grad():
+                intermediate = model.get_slice_to_intermediate_transform()
+                dr = model.get_dr_per_winding()
+                gap_expander, _, _, _ = model._get_transform_parts(with_pins=False)
+
+                def free_gap(theta, z, slot):
+                    table = gap_expander.get_transformed_winding_radii(theta, z)
+                    gaps = table.diff(dim=-1)
+                    idx = slot.clamp(0, gaps.shape[-1] - 1)
+                    return torch.gather(gaps, -1, idx[:, None]).squeeze(-1)
+
+                registry = pins_module.finalize_registry(
+                    self.pin_graph,
+                    intermediate_transform=intermediate, dr=dr,
+                    canonical_transform=model.get_unpinned_slice_to_spiral_transform(),
+                    crossing_map=self.theta_crossing_map, patch_atlas=self.patch_atlas,
+                    footprint_rule=self._pin_footprint_rule(), free_gap_fn=free_gap,
+                    min_z=float(self.flow_min_corner_spiral_zyx[0]),
+                    max_z=float(self.flow_max_corner_spiral_zyx[0]),
+                    device=self.device)
+        model.set_pin_registry(registry, reset_targets=not self.pin_targets_loaded)
+        if self.dist.is_main_process:
+            print(registry.summary())
+            report = registry.consistency_report
+            if report.get('inconsistent_edges'):
+                print(f'WARNING: pin registry has {report["inconsistent_edges"]} '
+                      f'inconsistent constraint cycles '
+                      f'(by edge kind: {report.get("inconsistent_edges_by_kind")}):')
+                for comp, entries in list(report['components'].items())[:20]:
+                    print(f'  component {comp}: ' + '; '.join(
+                        f'{e["edge"]} ({e["kind"]}, mismatch {e["mismatch"]})'
+                        for e in entries[:5]))
+            for conflict in report.get('absolute_conflicts', []):
+                print(f'WARNING: absolute winding conflict in component '
+                      f'{conflict["component"]}: {conflict}')
+            print(f'pin registry ready ({_startup_resource_suffix(started_at)})')
+        warmup = int(self.config.get('model_pins_warmup_steps', 0) or 0)
+        self.pins_activation_iteration = warmup
+        if self.pin_targets_loaded and self.start_iteration >= warmup:
+            model.pins_active = True
+            self.slice_to_spiral_transform = model.get_slice_to_spiral_transform()
+
+    def _maybe_activate_pins(self, iteration):
+        model = self.spiral_and_transform
+        if (model.pin_registry is None or model.pins_active
+                or self.pins_activation_iteration is None
+                or iteration < self.pins_activation_iteration):
+            return
+        if not self.pin_targets_loaded:
+            # T from the state the soft fit has reached (plan 2a.1).
+            with torch.no_grad():
+                model.pin_targets.copy_(model.estimate_pin_targets())
+        model.pins_active = True
+        if self.dist.is_main_process:
+            T = model.effective_pin_targets().detach()
+            frac = (T - torch.round(T)).abs()
+            print(f'pins activated at iteration {iteration}: {model.pin_registry.num_pins} pins, '
+                  f'{model.pin_registry.num_components} components, '
+                  f'|T - round(T)| mean {float(frac.mean()) if frac.numel() else 0.0:.3f}')
+        # Whole-object DT targets now come from T; drop the cached medians.
+        self.dt_target_cache_manager.reset()
+
+    def _pinned_patch_dt_values(self):
+        """Per verified patch, ``T_g + O_P`` (nan for unpinned patches)."""
+        model = self.spiral_and_transform
+        if not model._pins_enabled():
+            return None
+        registry = model.pin_registry
+        T = model.effective_pin_targets().detach()
+        values = torch.full([len(self.verified_patches_list)], float('nan'), device=self.device)
+        has = registry.patch_component >= 0
+        values[has] = T[registry.patch_component[has]] + registry.patch_offset[has].to(T.dtype)
+        return values
+
+    def _record_pin_target_grad(self, family, pins_leaf, seen_before):
+        grad = pins_leaf.grad
+        if grad is None:
+            return
+        registry = self.spiral_and_transform.pin_registry
+        # The pins leaf holds the step's sampled subset; its component ids
+        # live in the model's current pin view.
+        component = self.spiral_and_transform._pin_view['component']
+        increment = grad[:, 3] if seen_before is None else grad[:, 3] - seen_before[:, 3]
+        dr = float(self.dr_per_winding.detach())
+        per_component = torch.zeros(
+            [registry.num_components], device=grad.device).index_add(
+            0, component, increment) * dr
+        self.pin_grad_by_family[family] = per_component
+
+    def _pin_step_metrics(self, pins):
+        """Guard/conflict/exactness diagnostics at the pins' own rays."""
+        model = self.spiral_and_transform
+        metrics = {}
+        gap = pinned_gap_stage(self.slice_to_spiral_transform)
+        if gap is not None:
+            metrics.update(gap.pin_diagnostics(pins))
+        metrics['pin_conflicts'] = float(len(model.pin_conflicts))
+        metrics['pin_rebuilds'] = float(model._pin_rebuilds)
+        T = model.effective_pin_targets().detach()
+        if T.numel():
+            frac = (T - torch.round(T)).abs()
+            metrics['pin_T_frac_mean'] = float(frac.mean())
+            metrics['pin_T_frac_max'] = float(frac.max())
+        for family, grad in self.pin_grad_by_family.items():
+            metrics[f'pin_T_grad_norm/{family}'] = float(grad.norm())
+        self.pin_grad_by_family = {}
+        return metrics
+
+    def _export_transform(self):
+        """The live transform for export; pinned with the full registry."""
+        transform = self.spiral_and_transform.get_slice_to_spiral_transform()
+        model = self.spiral_and_transform
+        if model._pins_enabled():
+            gap = pinned_gap_stage(transform)
+            assert gap is not None, 'pins are active but the export transform is unpinned'
+            assert gap.pin_table.num_registry_pins == model.pin_registry.num_pins, (
+                'export transform must carry the full pin registry')
+        return transform
+
+    def _adapt_checkpoint_for_pins(self, checkpoint, model_state, optimiser_state):
+        """Fit a checkpoint written with a different (or no) pin registry.
+
+        ``pin_targets`` is kept only when the checkpoint's registry
+        fingerprint matches this fit's constraint graph; otherwise it is
+        dropped and re-estimated from the loaded model. A checkpoint from
+        before pins existed gets an appended optimiser/scheduler group for T.
+        """
+        scheduler_state = checkpoint.get('scheduler')
+        self.pin_targets_loaded = False
+        if getattr(self.spiral_and_transform, 'pin_targets', None) is None:
+            model_state = {k: v for k, v in model_state.items() if k != 'pin_targets'}
+            return model_state, optimiser_state, scheduler_state
+        model_state = dict(model_state)
+        saved_T = model_state.get('pin_targets')
+        saved_registry = checkpoint.get('pin_registry')
+        fingerprint = saved_registry.get('fingerprint') if isinstance(saved_registry, Mapping) else None
+        live = self.spiral_and_transform.pin_targets
+        if (saved_T is not None and tuple(saved_T.shape) == tuple(live.shape)
+                and fingerprint == self.pin_graph.fingerprint()):
+            self.spiral_and_transform.set_pin_registry(
+                pins_module.PinRegistry.from_state_dict(saved_registry, live.device),
+                reset_targets=False)
+            self.pin_targets_loaded = True
+        else:
+            if saved_T is not None:
+                print('checkpoint pin_targets do not match this fit\'s constraint '
+                      'graph; re-estimating T from the loaded model')
+            model_state['pin_targets'] = live.detach().clone().cpu()
+            # Adam's moments belong to the old component identities, even
+            # when the new target tensor happens to have the same shape.
+            # Preserve every other parameter's state and the source archive.
+            if (isinstance(optimiser_state, Mapping)
+                    and not _checkpoint_lacks_pin_group(self, optimiser_state)):
+                groups = optimiser_state.get('param_groups') or []
+                if len(groups) == len(self.optimiser.param_groups):
+                    pin_ids = set(groups[-1].get('params', []))
+                    optimiser_state = dict(optimiser_state)
+                    optimiser_state['state'] = {
+                        key: value for key, value in optimiser_state.get('state', {}).items()
+                        if key not in pin_ids}
+        if _checkpoint_lacks_pin_group(self, optimiser_state):
+            optimiser_state = dict(optimiser_state)
+            groups = [dict(g) for g in optimiser_state.get('param_groups') or []]
+            next_index = 1 + max(
+                (idx for g in groups for idx in g.get('params', [])), default=-1)
+            live_group = dict(self.optimiser.param_groups[-1])
+            live_group.pop('params', None)
+            groups.append({**live_group, 'params': [next_index]})
+            optimiser_state['param_groups'] = groups
+            if isinstance(scheduler_state, Mapping):
+                scheduler_state = dict(scheduler_state)
+                base = list(scheduler_state.get('base_lrs') or [])
+                base.append(self.lr_scheduler.base_lrs[-1])
+                scheduler_state['base_lrs'] = base
+                last = list(scheduler_state.get('_last_lr') or [])
+                if last:
+                    last.append(live_group['lr'])
+                    scheduler_state['_last_lr'] = last
+        return model_state, optimiser_state, scheduler_state
+
     def _make_theta_crossing_map(self):
         """Construct the shared patch/PCL source topology."""
         crossing_map = ThetaCrossingMap(
@@ -3641,6 +3859,42 @@ class FitContext:
         )
         self.spiral_and_transform.to(self.device)
 
+        # Pinned winding radii (pinned_spiral_plan.md 2a.1). The constraint
+        # graph is model-independent, so its component count -- the size of
+        # the pin_targets parameter T -- is known before the optimiser exists;
+        # the registry itself (integer offsets, footprints) is finalised
+        # against the theta topology below, and the pins are switched on at
+        # model_pins_warmup_steps (see _maybe_activate_pins).
+        self.pin_graph = None
+        self.pin_targets_loaded = False
+        self.pins_activation_iteration = None
+        self.pin_grad_by_family = {}
+        if self.config.get('model_pins_enabled', False):
+            progress.begin('loading', 'Building pin constraint graph')
+            overlap_tolerance = float(self.config.get('model_pin_overlap_tolerance_voxels', 0.0) or 0.0)
+            overlap_pairs = None
+            if overlap_tolerance > 0:
+                started_at = time.perf_counter()
+                overlap_pairs = pins_module.patch_overlap_pairs(
+                    self.patch_atlas, overlap_tolerance,
+                    stride=int(self.config.get('model_pin_patch_grid_stride', 1)))
+                if self.dist.is_main_process:
+                    linked = len({(a, b) for a, _, b, _, _ in overlap_pairs})
+                    print(f'pin overlaps: {linked} patch pairs within {overlap_tolerance:g} voxels '
+                          f'({_startup_resource_suffix(started_at)})')
+            self.pin_graph = pins_module.build_pin_graph(
+                verified_patches=self.verified_patches,
+                patch_atlas=self.patch_atlas,
+                cross_patch_pcls=self.cross_patch_pcls,
+                unattached_pcl_strips=self.unattached_pcl_strips,
+                unattached_components=self.unattached_components,
+                unattached_component_edges=self.unattached_component_edges,
+                patch_grid_stride=self.config.get('model_pin_patch_grid_stride', 1),
+                overlap_pairs=overlap_pairs,
+            )
+            print(self.pin_graph.summary())
+            self.spiral_and_transform.init_pin_targets(self.pin_graph.num_components)
+
         # ==========================================================================
         # Outer-shell setup
         # ==========================================================================
@@ -3685,7 +3939,10 @@ class FitContext:
         flow_field_params = self.low_res_flow_params + self.high_res_flow_params
         self.gap_expander_params = list(self.spiral_and_transform.gap_expander_params.parameters())
         linear_params = [self.spiral_and_transform.linear_logits]
-        grouped_ids = {id(p) for p in flow_field_params + self.gap_expander_params + linear_params}
+        pin_target_params = (
+            [self.spiral_and_transform.pin_targets]
+            if self.spiral_and_transform.pin_targets is not None else [])
+        grouped_ids = {id(p) for p in flow_field_params + self.gap_expander_params + linear_params + pin_target_params}
         other_params = [p for p in self.spiral_and_transform.parameters() if id(p) not in grouped_ids]
         initial_high_res_lr_scale = get_flow_field_high_res_lr_scale(self.config, 0)
         initial_low_res_lr_scale = get_flow_field_low_res_lr_scale(self.config)
@@ -3706,6 +3963,19 @@ class FitContext:
                 'lr_scale': initial_high_res_lr_scale,
             },
         ]
+        if pin_target_params:
+            # T has its own group: one Adam step moves a component by at most
+            # about optimizer_lr_pin_targets windings (plan 2a.5). Expressed as
+            # a scale of the base LR so schedule realignment preserves it.
+            pin_lr = float(self.config.get('optimizer_lr_pin_targets', 0.01))
+            pin_lr_scale = pin_lr / float(self.config['optimizer_learning_rate'])
+            param_groups.append({
+                'params': pin_target_params,
+                'weight_decay': 0.0,
+                'lr': pin_lr,
+                'lr_scale': pin_lr_scale,
+            })
+        self.pin_target_params = pin_target_params
         progress.begin('loading', 'Creating optimizer')
         # AdamW for every group; the flow groups may additionally be stepped
         # with lazy moments (optimizer_flow_lazy_moments, applied per step by
@@ -3825,6 +4095,9 @@ class FitContext:
         self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform()
         self.dr_per_winding = self.spiral_and_transform.get_dr_per_winding()
         self._build_theta_crossing_map()
+        if self.pin_graph is not None:
+            progress.begin('loading', 'Finalising pin registry')
+            self._finalize_pin_registry()
 
         # Caches are recomputed lazily once the corresponding DT loss is active.
         # Updates are deterministic given the transform, so DDP ranks stay consistent.
@@ -3887,7 +4160,7 @@ class FitContext:
         'slice_to_spiral_transform', 'dr_per_winding',
         'dt_target_cache_manager', 'dist_grad_params', 'dist_grad_named',
         'step_timer', 'nonfinite_grad_steps', 'nonfinite_grad_by_param',
-        'run_dt_resume_iteration',
+        'run_dt_resume_iteration', 'pin_graph', 'pin_target_params',
     )
 
     def rebuild_model_state(self):
@@ -3967,6 +4240,12 @@ class FitContext:
             'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
             'input_manifest': dict(getattr(self.interactive_driver, 'input_manifest', {})),
             'preview_first_winding': 10,
+            # Pinned winding radii: the registry lets an offline exporter
+            # rebuild the exact pinned transform without the fit inputs.
+            'pin_registry': (
+                self.spiral_and_transform.pin_registry.state_dict()
+                if self.spiral_and_transform.pin_registry is not None else None),
+            'pins_active': bool(self.spiral_and_transform.pins_active),
         }
 
     def save_checkpoint(self, path, completed_iterations):
@@ -4193,6 +4472,11 @@ class FitContext:
         model_state = checkpoint.get('spiral_and_transform')
         if isinstance(model_state, Mapping):
             live_state = self.spiral_and_transform.state_dict()
+            # The pin_targets parameter is sized by the constraint registry,
+            # which is rebuilt from the inputs: a mismatch is re-initialised
+            # from the loaded model, not refused (see load_checkpoint).
+            model_state = {k: v for k, v in model_state.items() if k != 'pin_targets'}
+            live_state = {k: v for k, v in live_state.items() if k != 'pin_targets'}
             unexpected = sorted(set(model_state) - set(live_state))
             absent = sorted(set(live_state) - set(model_state))
             if unexpected or absent:
@@ -4221,6 +4505,10 @@ class FitContext:
             live_optimiser = self.optimiser.state_dict()
             saved_groups = list(optimiser_state.get('param_groups') or [])
             live_groups = list(live_optimiser.get('param_groups') or [])
+            if _checkpoint_lacks_pin_group(self, optimiser_state):
+                # A checkpoint written before pins existed: the pin group is
+                # appended at load (fresh Adam state for T).
+                live_groups = live_groups[:-1]
             if len(saved_groups) != len(live_groups):
                 reasons.append(
                     f'checkpoint optimiser has {len(saved_groups)} parameter '
@@ -4252,6 +4540,8 @@ class FitContext:
                 else:
                     saved_base = list(scheduler_state.get('base_lrs') or [])
                     live_base = list(live_scheduler.get('base_lrs') or [])
+                    if _checkpoint_lacks_pin_group(self, checkpoint.get('optimiser')):
+                        live_base = live_base[:-1]
                     if len(saved_base) != len(live_base):
                         reasons.append(
                             f'checkpoint scheduler tracks {len(saved_base)} '
@@ -4311,6 +4601,8 @@ class FitContext:
             migrate_legacy_gap_parameterization(merge_flow_stage_lattices(checkpoint)),
             self.config['model_gap_expander_capacity_windings'])
         transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
+        transformed_spiral_state, optimiser_state, scheduler_state = \
+            self._adapt_checkpoint_for_pins(checkpoint, transformed_spiral_state, optimiser_state)
         self.spiral_and_transform.load_state_dict(transformed_spiral_state)
         self.optimiser.load_state_dict(optimiser_state)
         # Older checkpoints could have been saved while influence masking had
@@ -4320,8 +4612,8 @@ class FitContext:
         gap_group = next(group for group in self.optimiser.param_groups
                          if any(param is gap_param for param in group['params']))
         gap_group['weight_decay'] = self.config['optimizer_weight_decay_gap_expander']
-        if checkpoint.get('scheduler') is not None:
-            self.lr_scheduler.load_state_dict(checkpoint['scheduler'])
+        if scheduler_state is not None:
+            self.lr_scheduler.load_state_dict(scheduler_state)
 
     def _rebuild_unverified_patch_inputs(self, exclusion_radius):
         """Remask retained unverified sources for a Run-boundary mask edit."""
@@ -4480,8 +4772,7 @@ class FitContext:
             # any constraint bake it is pulled back through the composed
             # frozen+live chain; the resident inputs that bound its winding
             # range are in baked space and are read through the live chain.
-            live_transform = \
-                self.spiral_and_transform.get_slice_to_spiral_transform()
+            live_transform = self._export_transform()
             dr_per_winding = self.spiral_and_transform.get_dr_per_winding()
             splice_evaluation = self._preview_splice_evaluation(
                 live_transform, dr_per_winding, progress)
@@ -5525,12 +5816,16 @@ class FitContext:
         # (retain_graph) until the family is released. The leaf gradients
         # accumulated across families flow through the real shared paths once,
         # next to the flow-field gradient flush below.
+        self._maybe_activate_pins(iteration)
         shared_transform_outputs = self.spiral_and_transform.get_shared_transform_tensors()
         shared_transform_leaves = tuple(
             output.detach().requires_grad_(True) for output in shared_transform_outputs)
         self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform(
             shared=shared_transform_leaves)
         self.dr_per_winding = shared_transform_leaves[0]
+        pins_leaf = shared_transform_leaves[3] if len(shared_transform_leaves) > 3 else None
+        log_pins_this_step = pins_leaf is not None and iteration % 200 == 0
+        pin_grad_seen = None
         theta_map_refreshed = self._refresh_theta_crossing_map_for_step(
             iteration,
             self.slice_to_spiral_transform)
@@ -5544,6 +5839,7 @@ class FitContext:
 
         def backward_family(weighted_losses):
             """Accumulate one loss family's gradients, then release its graph."""
+            nonlocal pin_grad_seen
             family_loss = sum(weighted_losses.values())
             if family_loss.requires_grad:
                 self.step_timer.stop('fwd')
@@ -5557,6 +5853,14 @@ class FitContext:
                 self.step_timer.start('fwd')
             for name, value in weighted_losses.items():
                 losses[name] = value.detach()
+            if log_pins_this_step:
+                # Per-family gradient on T (plan 2a.5): dL/dT_g = dr * sum_i
+                # dL/dr_target_i over the component's pins, read off the pins
+                # leaf as the increment this family added.
+                self._record_pin_target_grad(
+                    '+'.join(weighted_losses), pins_leaf, pin_grad_seen)
+                pin_grad_seen = (
+                    pins_leaf.grad.clone() if pins_leaf.grad is not None else None)
 
         run_dt_suppressed = (
             self.run_dt_resume_iteration is not None
@@ -5599,6 +5903,7 @@ class FitContext:
                     self.verified_patches_list, self.patch_atlas,
                     self.theta_crossing_map,
                     self.config['dt_target_floating_threshold'],
+                    pinned_values=self._pinned_patch_dt_values(),
                 ))
             if compute_unverified_patch_dt and self.config['loss_weight_unverified_patch_dt'] > 0 and self.unverified_patch_atlas is not None:
                 unverified_patch_dt_target_cache = self.dt_target_cache_manager.get('unverified_patch', iteration, lambda: compute_patch_dt_target_cache(
@@ -5943,13 +6248,17 @@ class FitContext:
 
         self.step_timer.stop('fwd')
         self.step_timer.start('bwd')
+        if pins_leaf is not None and pins_leaf.grad is not None:
+            # The pins' graph runs through the flow chain, so it must be
+            # propagated before the field's accumulated gradient is flushed.
+            torch.autograd.backward([shared_transform_outputs[3]], [pins_leaf.grad])
         # Flush the sparse-accumulated field gradient into the flow parameters.
         self.spiral_and_transform.flow_field.apply_accumulated_field_grad()
         # Propagate the leaf gradients the family backwards accumulated on the
         # shared transform paths through the real parameters, exactly once.
         shared_transform_pending = [
             (output, leaf.grad)
-            for output, leaf in zip(shared_transform_outputs, shared_transform_leaves)
+            for output, leaf in zip(shared_transform_outputs[:3], shared_transform_leaves[:3])
             if output.requires_grad and leaf.grad is not None
         ]
         if shared_transform_pending:
@@ -6006,6 +6315,12 @@ class FitContext:
         self.step_timer.maybe_report(iteration)
         if self.profiler is not None:
             self.profiler.step()
+        if pins_leaf is not None:
+            log_metrics['pins_active'] = 1.0
+            if log_pins_this_step:
+                log_metrics.update(self._pin_step_metrics(pins_leaf.detach()))
+        elif self.pin_graph is not None:
+            log_metrics['pins_active'] = 0.0
 
         return loss, losses, log_metrics, shell_metrics
 
@@ -6153,7 +6468,7 @@ class FitContext:
             save_overlay_and_print_satisfaction(
                 suffix,
                 spiral_and_transform=self.spiral_and_transform,
-                slice_to_spiral_transform=self.slice_to_spiral_transform,
+                slice_to_spiral_transform=self._export_transform(),
                 dr_per_winding=self.dr_per_winding,
                 patches_list=self.verified_patches_list,
                 patches_dict=self.verified_patches,

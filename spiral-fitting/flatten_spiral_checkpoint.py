@@ -172,7 +172,21 @@ def _build_model(
         spiral_outward_sense=str(
             checkpoint.get("spiral_outward_sense") or "CW"),
     ).to(device)
+    state = dict(state)
+    saved_targets = state.pop("pin_targets", None)
     model.load_state_dict(state)
+    registry_state = checkpoint.get("pin_registry")
+    if saved_targets is not None and registry_state is not None:
+        # Pinned winding radii: rebuild the exact pinned transform from the
+        # checkpoint's registry (pinned_spiral_plan.md 2a.4 export path).
+        import pins as pins_module
+        model.init_pin_targets(saved_targets.numel())
+        with torch.no_grad():
+            model.pin_targets.copy_(saved_targets.to(device))
+        model.set_pin_registry(
+            pins_module.PinRegistry.from_state_dict(registry_state, device),
+            reset_targets=False)
+        model.pins_active = bool(checkpoint.get("pins_active", True))
     model.eval()
     return model
 
