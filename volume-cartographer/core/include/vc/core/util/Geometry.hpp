@@ -29,6 +29,19 @@ bool loc_valid_xy(const cv::Mat_<cv::Vec3f> &m, const cv::Vec2d &l);
 bool loc_valid_xy(const cv::Mat_<cv::Vec3d> &m, const cv::Vec2d &l);
 bool loc_valid_xy(const cv::Mat_<float> &m, const cv::Vec2d &l);
 
+// Check whether location is backed by a complete 4x4 Catmull-Rom support, the
+// bicubic analogue of loc_valid. The stencil spans rows/cols [i-1, i+2] around
+// the floor cell, so its origin must satisfy 1 <= row <= rows-3 and
+// 1 <= col <= cols-3, and all sixteen points must be present.
+//
+// Unlike loc_valid, this rejects NaN as well as the -1 sentinel: callers such
+// as vc_render_tifxyz rewrite sentinels to NaN before rendering, so both
+// spellings of "missing" occur in practice.
+// l is [y, x]!
+bool loc_valid_cubic(const cv::Mat_<cv::Vec3f> &m, const cv::Vec2d &l);
+// Same, with the coordinate order swapped. l is [x, y]!
+bool loc_valid_cubic_xy(const cv::Mat_<cv::Vec3f> &m, const cv::Vec2d &l);
+
 
 float tdist(const cv::Vec3f &a, const cv::Vec3f &b, float t_dist);
 float tdist_sum(const cv::Vec3f &v, const std::vector<cv::Vec3f> &tgts, const std::vector<float> &tds);
