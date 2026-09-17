@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -43,6 +44,36 @@ struct Bounds {
     int xMin = 0;
     int xMax = 0;
 };
+
+std::vector<int> parseLevels(const std::string& value)
+{
+    std::vector<int> levels;
+    std::size_t begin = 0;
+    while (begin <= value.size()) {
+        const auto end = value.find(',', begin);
+        const auto token = value.substr(begin, end - begin);
+        const auto first = token.find_first_not_of(" \t");
+        const auto last = token.find_last_not_of(" \t");
+        if (first == std::string::npos) {
+            throw std::invalid_argument(
+                "--level requires a comma-separated list of non-negative integers");
+        }
+        const auto* start = token.data() + first;
+        const auto* finish = token.data() + last + 1;
+        int level = 0;
+        const auto result = std::from_chars(start, finish, level);
+        if (result.ec != std::errc{} || result.ptr != finish || level < 0) {
+            throw std::invalid_argument(
+                "--level requires a comma-separated list of non-negative integers");
+        }
+        if (std::find(levels.begin(), levels.end(), level) == levels.end())
+            levels.push_back(level);
+        if (end == std::string::npos)
+            break;
+        begin = end + 1;
+    }
+    return levels;
+}
 
 void validateBounds(const Bounds& bounds)
 {
@@ -118,9 +149,9 @@ Bounds scaleBounds(
         return static_cast<int>(
             (static_cast<std::int64_t>(value) * destDim) / sourceDim);
     };
-    auto mapExclusive = [](int exclusive, int sourceDim, int destDim) {
+    auto mapExclusive = [](std::int64_t exclusive, int sourceDim, int destDim) {
         return static_cast<int>(
-            (static_cast<std::int64_t>(exclusive) * destDim + sourceDim - 1) /
+            (exclusive * destDim + sourceDim - 1) /
             sourceDim);
     };
 
@@ -128,9 +159,12 @@ Bounds scaleBounds(
     dest.zMin = mapMin(source.zMin, sourceShape[0], destShape[0]);
     dest.yMin = mapMin(source.yMin, sourceShape[1], destShape[1]);
     dest.xMin = mapMin(source.xMin, sourceShape[2], destShape[2]);
-    dest.zMax = mapExclusive(source.zMax + 1, sourceShape[0], destShape[0]) - 1;
-    dest.yMax = mapExclusive(source.yMax + 1, sourceShape[1], destShape[1]) - 1;
-    dest.xMax = mapExclusive(source.xMax + 1, sourceShape[2], destShape[2]) - 1;
+    dest.zMax = mapExclusive(
+        static_cast<std::int64_t>(source.zMax) + 1, sourceShape[0], destShape[0]) - 1;
+    dest.yMax = mapExclusive(
+        static_cast<std::int64_t>(source.yMax) + 1, sourceShape[1], destShape[1]) - 1;
+    dest.xMax = mapExclusive(
+        static_cast<std::int64_t>(source.xMax) + 1, sourceShape[2], destShape[2]) - 1;
     return dest;
 }
 
@@ -248,9 +282,9 @@ int main(int argc, char** argv)
          "VC3D project file (*.volpkg.json); used to resolve volume cache layout and auth")
         ("url", po::value<std::string>(&url)->required(), "HTTP/S3 OME-Zarr root or concrete array URL")
         ("dry-run,n", po::bool_switch(&dryRun), "Print the cache destination and uncompressed region size without downloading")
-        ("level,l", po::value<int>(),
-         "Logical pyramid level; omit to download every present level. "
-         "Coordinates are at this level, or at the finest present level when omitted")
+        ("level,l", po::value<std::string>(),
+         "Comma-separated pyramid levels (e.g. 3,4,5); omit to download every present level. "
+         "Coordinates are always at level 0")
         ("zmin", po::value<int>(&requested.zMin)->required(), "Inclusive minimum Z voxel")
         ("zmax", po::value<int>(&requested.zMax)->required(), "Inclusive maximum Z voxel")
         ("ymin", po::value<int>(&requested.yMin),
@@ -268,22 +302,18 @@ int main(int argc, char** argv)
         if (parsed.contains("help")) {
             std::cout
                 << "Usage: vc_zarr_download_region --project PROJECT --url URL "
-                   "[--level LEVEL] --zmin Z --zmax Z [--ymin Y] [--ymax Y] "
+                   "[--level LEVEL[,LEVEL...]] --zmin Z --zmax Z [--ymin Y] [--ymax Y] "
                    "[--xmin X] [--xmax X] [--dry-run]\n\n"
-                << "Bounds are inclusive voxel coordinates at --level, or at the "
-                   "finest present level when --level is omitted. Omitted Y/X "
+                << "Bounds are inclusive voxel coordinates at level 0. Omitted Y/X "
                    "bounds default to the full extent of those axes.\n\n"
                 << options << '\n';
             return 0;
         }
         po::notify(parsed);
 
-        std::optional<int> requestedLevel;
-        if (parsed.contains("level")) {
-            requestedLevel = parsed["level"].as<int>();
-            if (*requestedLevel < 0)
-                throw std::invalid_argument("--level must be non-negative");
-        }
+        std::optional<std::vector<int>> requestedLevels;
+        if (parsed.contains("level"))
+            requestedLevels = parseLevels(parsed["level"].as<std::string>());
         if (requested.zMin < 0 ||
             (parsed.contains("ymin") && requested.yMin < 0) ||
             (parsed.contains("xmin") && requested.xMin < 0)) {
@@ -322,20 +352,21 @@ int main(int argc, char** argv)
                   << vc::core::util::redactedRemoteLocation(spec.portableLocator)
                   << '\n';
         auto volume = Volume::NewFromUrl(url, volumeCacheRoot, {}, metadata, !anonymous);
-        const auto levels = requestedLevel
-            ? std::vector<int>{*requestedLevel}
+        const auto levels = requestedLevels
+            ? *requestedLevels
             : volume->presentScaleLevels();
-        if (requestedLevel && !volume->hasScaleLevel(*requestedLevel)) {
-            throw std::out_of_range(
-                "requested --level is not present in the Zarr pyramid");
+        for (const int level : levels) {
+            if (!volume->hasScaleLevel(level)) {
+                throw std::out_of_range(
+                    "requested --level " + std::to_string(level) +
+                    " is not present in the Zarr pyramid");
+            }
         }
         if (levels.empty())
             throw std::runtime_error("volume has no present zarr scale levels");
-
-        const int coordinateLevel = requestedLevel
-            ? *requestedLevel
-            : volume->firstPresentScaleLevel();
-        const auto coordinateShape = volume->shape(coordinateLevel);
+        if (!volume->hasScaleLevel(0))
+            throw std::runtime_error("level 0 is required to interpret region coordinates");
+        const auto coordinateShape = volume->shape(0);
         if (coordinateShape[1] <= 0 || coordinateShape[2] <= 0) {
             throw std::runtime_error("volume has an empty Y or X extent");
         }
