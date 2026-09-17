@@ -480,8 +480,7 @@ def compute_patch_dt_target_cache(
     this cache whenever the theta map refreshes.
 
     ``pinned_values`` (optional, one per patch, nan where absent) is the
-    pinned model's root-frame winding coordinate ``T_g + O_P`` of each patch
-    (pinned_spiral_plan.md 2a.5): for those patches it replaces the sampled
+    pinned model's root-frame winding coordinate ``T_g + O_P`` of each patch. For those patches it replaces the sampled
     unwrapped median as the input to the whole-object selection, so the
     snapped DT target follows ``T`` rather than a cached median.
     """

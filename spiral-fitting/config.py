@@ -271,7 +271,7 @@ _PIN_DESCRIPTIONS = {
     "model_pins_enabled": (
         "Pin the gap expander's winding radii so every verified-patch, "
         "cross-patch PCL and unattached-strip point lands exactly on its "
-        "target winding (pinned_spiral_plan.md). Adds the per-component "
+        "target winding. Adds the per-component "
         "pin_targets parameter to the model."),
     "model_pins_warmup_steps": (
         "Steps of the ordinary unpinned soft fit before the pins are switched "
@@ -706,7 +706,7 @@ class Config:
         self.model_gap_expander_softplus_bias = 4.0
         self.model_linear_z_resolution = 48
         self.model_initial_dr_per_winding = 16.0
-        # Pinned winding radii (pinned_spiral_plan.md stage 2a): every
+        # Pinned winding radii: every
         # hard-constraint point is sent exactly onto its target winding by a
         # pinned, monotone radial map, with one fractional winding coordinate
         # per constraint component (the model's pin_targets parameter).
@@ -721,7 +721,7 @@ class Config:
         self.model_pin_coincidence_frac = 0.05
         self.model_pin_conflict_tolerance = 0.1
         # Steps between rebuilds of the pins' coincidence groups (pins move
-        # every step; 1 = rebuild every step, the exact 2a behaviour).
+        # every step; 1 = rebuild every step).
         self.model_pin_rebin_interval = 1
         # Patches whose quad centres come within this many scroll voxels of
         # each other are treated as the same sheet observed twice and join

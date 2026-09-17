@@ -1,11 +1,10 @@
-"""Pinned winding radii, transform level (pinned_spiral_plan.md stage 2a).
+"""Pinned winding radii, transform level.
 
 A synthetic Archimedean scroll (umbilicus on the z axis, spacing DR) with
 patches, cross-patch PCLs (one crossing the theta = 0 seam, one absolute) and
 an unattached strip; the real PatchAtlas / ThetaCrossingMap / SpiralAndTransform
-machinery on the CPU. Covers the plan's test 6 (registry offsets and the
-consistency report), the transform-level exactness of test 8 (positive and
-negative case), checkpoint round trips of the registry, and the pinned DT
+machinery on the CPU. Covers registry offsets and the consistency report,
+transform-level exactness (positive and negative cases), checkpoint round trips of the registry, and the pinned DT
 target values.
 """
 
@@ -172,7 +171,7 @@ def build_registry(model, patches, atlas, pcls, strips, stride=1):
 
 
 # ---------------------------------------------------------------------------
-# 6. registry offsets
+# registry offsets
 # ---------------------------------------------------------------------------
 
 
@@ -226,7 +225,7 @@ def test_registry_offsets():
 
 
 # ---------------------------------------------------------------------------
-# 8 (transform level): exactness through the full chain, positive and negative
+# Transform level: exactness through the full chain, positive and negative
 # ---------------------------------------------------------------------------
 
 

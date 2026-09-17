@@ -3342,7 +3342,7 @@ class FitContext:
         self._sdt_inactive_warned = set()
 
     # ==========================================================================
-    # Pinned winding radii (pinned_spiral_plan.md stage 2a)
+    # Pinned winding radii
     # ==========================================================================
 
     def _pin_footprint_rule(self):
@@ -3418,7 +3418,7 @@ class FitContext:
                 or iteration < self.pins_activation_iteration):
             return
         if not self.pin_targets_loaded:
-            # T from the state the soft fit has reached (plan 2a.1).
+            # T from the state the soft fit has reached.
             with torch.no_grad():
                 model.pin_targets.copy_(model.estimate_pin_targets())
         model.pins_active = True
@@ -3859,7 +3859,7 @@ class FitContext:
         )
         self.spiral_and_transform.to(self.device)
 
-        # Pinned winding radii (pinned_spiral_plan.md 2a.1). The constraint
+        # Pinned winding radii. The constraint
         # graph is model-independent, so its component count -- the size of
         # the pin_targets parameter T -- is known before the optimiser exists;
         # the registry itself (integer offsets, footprints) is finalised
@@ -3965,7 +3965,7 @@ class FitContext:
         ]
         if pin_target_params:
             # T has its own group: one Adam step moves a component by at most
-            # about optimizer_lr_pin_targets windings (plan 2a.5). Expressed as
+            # about optimizer_lr_pin_targets windings. Expressed as
             # a scale of the base LR so schedule realignment preserves it.
             pin_lr = float(self.config.get('optimizer_lr_pin_targets', 0.01))
             pin_lr_scale = pin_lr / float(self.config['optimizer_learning_rate'])
@@ -5854,7 +5854,7 @@ class FitContext:
             for name, value in weighted_losses.items():
                 losses[name] = value.detach()
             if log_pins_this_step:
-                # Per-family gradient on T (plan 2a.5): dL/dT_g = dr * sum_i
+                # Per-family gradient on T: dL/dT_g = dr * sum_i
                 # dL/dr_target_i over the component's pins, read off the pins
                 # leaf as the increment this family added.
                 self._record_pin_target_grad(

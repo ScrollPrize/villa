@@ -178,7 +178,7 @@ def _build_model(
     registry_state = checkpoint.get("pin_registry")
     if saved_targets is not None and registry_state is not None:
         # Pinned winding radii: rebuild the exact pinned transform from the
-        # checkpoint's registry (pinned_spiral_plan.md 2a.4 export path).
+        # checkpoint's registry.
         import pins as pins_module
         model.init_pin_targets(saved_targets.numel())
         with torch.no_grad():

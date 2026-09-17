@@ -281,7 +281,7 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
 
 
 class PinnedGapExpandingTransform(GapExpandingTransform):
-    """Gap expander whose winding radii are pinned (pinned_spiral_plan.md 2a.4).
+    """Gap expander whose winding radii are pinned.
 
     The free map ``s_free`` is the parent class's table; ``pin_table``
     (:class:`pins.PinTable`) supplies per-ray anchors that the pinned monotone
@@ -299,13 +299,13 @@ class PinnedGapExpandingTransform(GapExpandingTransform):
         return False
 
     def ray_map(self, theta, z):
-        """The free table and the resolved pinned anchor sequence per ray."""
-        table = self.get_transformed_winding_radii(theta, z)
+        """The pre-pin winding radii and resolved pinned anchors per query ray."""
+        pre_pin_winding_radii = self.get_transformed_winding_radii(theta, z)
         R, S, w, valid = self.pin_table.anchors(theta, z)
         ray_map = pins_module.build_pinned_ray_map(
-            table, self.dr_per_winding, theta / (2 * torch.pi), R, S, w, valid,
+            pre_pin_winding_radii, self.dr_per_winding, theta / (2 * torch.pi), R, S, w, valid,
             self.min_gap)
-        return table, ray_map
+        return pre_pin_winding_radii, ray_map
 
     def _radial(self, input_zyx, inverse):
         flat = input_zyx.reshape(-1, 3)
@@ -314,16 +314,16 @@ class PinnedGapExpandingTransform(GapExpandingTransform):
             chunk = flat[start:start + self.chunk_size]
             theta, radius, _ = get_theta_and_radii(chunk[..., 1:], self.dr_per_winding)
             z = chunk[..., 0]
-            table, ray_map = self.ray_map(theta, z)
+            pre_pin_winding_radii, ray_map = self.ray_map(theta, z)
             theta_norm = theta / (2 * torch.pi)
             if inverse:
                 # intermediate -> canonical
                 mapped = pins_module.pinned_map_forward(
-                    radius, table, self.dr_per_winding, theta_norm, ray_map)
+                    radius, pre_pin_winding_radii, self.dr_per_winding, theta_norm, ray_map)
             else:
                 # canonical -> intermediate
                 mapped = pins_module.pinned_map_inverse(
-                    radius, table, self.dr_per_winding, theta_norm, ray_map)
+                    radius, pre_pin_winding_radii, self.dr_per_winding, theta_norm, ray_map)
             delta_radius = mapped - radius
             outward_direction = torch.cat([
                 torch.zeros_like(chunk[..., :1]),
@@ -341,7 +341,7 @@ class PinnedGapExpandingTransform(GapExpandingTransform):
 
     @torch.no_grad()
     def pin_diagnostics(self, pins, chunk_size=None):
-        """Evaluate the pinned map at every pin's own ray (plan 2a.4 logging).
+        """Evaluate the pinned map at every pin's own ray.
 
         ``pins`` is the ``[P, 4]`` ``(z, theta, r, dr (T + n))`` tensor the
         table was built from. Returns exactness residuals, guard-violation
@@ -357,15 +357,15 @@ class PinnedGapExpandingTransform(GapExpandingTransform):
         for start in range(0, pins.shape[0], chunk_size):
             chunk = pins[start:start + chunk_size]
             z, theta, r, r_target_shifted = chunk.unbind(-1)
-            table, ray_map = self.ray_map(theta, z)
+            pre_pin_winding_radii, ray_map = self.ray_map(theta, z)
             theta_norm = theta / (2 * torch.pi)
-            s = pins_module.pinned_map_forward(r, table, self.dr_per_winding, theta_norm, ray_map)
+            s = pins_module.pinned_map_forward(r, pre_pin_winding_radii, self.dr_per_winding, theta_norm, ray_map)
             residuals.append((s - (r_target_shifted + self.dr_per_winding * theta_norm)).abs())
             order_violations += int(ray_map.order_violations().sum())
             min_rise_violations += int(ray_map.min_rise_violations().sum())
             rays_with_violation += int(ray_map.guard_active.any(dim=-1).sum())
             anchors_total += int(ray_map.valid[:, 1:].sum())
-            free_gap_min = table.diff(dim=-1).min(dim=-1).values
+            free_gap_min = pre_pin_winding_radii.diff(dim=-1).min(dim=-1).values
             scale_max = ray_map.scale.max(dim=-1).values
             min_effective_gap = min(min_effective_gap, float((free_gap_min / scale_max).min()))
         residual = torch.cat(residuals) if residuals else pins.new_zeros([0])
@@ -559,8 +559,8 @@ def ray_specialized_spiral_to_scroll(
     theta_norm = theta / (2 * torch.pi)
     # Per-ray transformed winding radii (differentiable through logits + dr;
     # includes the truncate_frac warm-up lerp exactly like the eager path).
-    table = gap.get_transformed_winding_radii(theta, z)
-    num_windings = table.shape[-1]
+    pre_pin_winding_radii = gap.get_transformed_winding_radii(theta, z)
+    num_windings = pre_pin_winding_radii.shape[-1]
 
     # Eager _call per-sample pipeline, with per-ray quantities gathered.
     tn_s = theta_norm[pair_id]
@@ -571,7 +571,7 @@ def ray_specialized_spiral_to_scroll(
     # [samples, windings] expansion. F.embedding rather than plain indexing:
     # index backward is a pathological _index_put_impl_ accumulate here,
     # embedding_dense_backward is the fused gather-accumulate kernel.
-    flat_table = table.reshape(-1, 1)
+    flat_table = pre_pin_winding_radii.reshape(-1, 1)
     flat_idx = pair_id * num_windings + inner
     r_in = F.embedding(flat_idx, flat_table).squeeze(-1)
     r_out = F.embedding(flat_idx + 1, flat_table).squeeze(-1)
@@ -652,7 +652,7 @@ class SpiralAndTransform(nn.Module):
             dr_per_winding=config['model_initial_dr_per_winding'],  # this is a nominal (fixed) winding spacing which we only use to calculate the number of logits
         )
 
-        # Pinned winding radii (pinned_spiral_plan.md stage 2a). pin_targets is
+        # Pinned winding radii. pin_targets is
         # the per-component fractional winding coordinate T; it is created by
         # init_pin_targets() once the constraint graph's component count is
         # known, so a model without pins has no such parameter. The registry
@@ -707,7 +707,7 @@ class SpiralAndTransform(nn.Module):
     def estimate_pin_targets(self, chunk_size=262144):
         """``T_g`` = median over the component's pins of the canonical
         shifted winding ``s_free(r_i)/dr - n_i`` under the current unpinned
-        model (plan 2a.1); fixed components keep their value."""
+        model; fixed components keep their value."""
         registry = self.pin_registry
         dr = self.get_dr_per_winding()
         transform = self.get_unpinned_slice_to_spiral_transform()
@@ -744,8 +744,8 @@ class SpiralAndTransform(nn.Module):
 
         Every component keeps at least one pin and otherwise a share
         proportional to its size. Returns ``(indices, eps_theta, eps_z)``
-        where the footprints are widened for the thinning (plan 2a.3's
-        own-object spacing under uniform random sampling: by ``1/sqrt(f)``
+        where the footprints are widened for the thinning (own-object
+        spacing under uniform random sampling: by ``1/sqrt(f)``
         for 2-D patch grids, ``1/f`` for chains), capped like the registry.
         """
         registry = self.pin_registry
@@ -781,7 +781,7 @@ class SpiralAndTransform(nn.Module):
                 float(self.cfg.get('model_pin_kernel_max_z_voxels', 200.0)))
 
     def compute_pins(self, shared=None, registry=None, chunk_size=None, subsample=False):
-        """Push the registry through the flow chain (plan 2a.2).
+        """Push the registry through the flow chain.
 
         Returns ``pins`` ``[P, 4]`` = ``(z, theta, r, dr (T + n))`` in
         intermediate space with the graph attached (flow, linear, ``dr``,
@@ -862,7 +862,7 @@ class SpiralAndTransform(nn.Module):
         """Rasterise ``pins`` into a :class:`pins.PinTable`.
 
         The slot assignment and coincidence groups are rebuilt whenever any
-        pin's slot changed (plan 2a.3); otherwise the cached groups are reused
+        pin's slot changed; otherwise the cached groups are reused
         and only the differentiable values and the cells are refreshed.
         """
         registry = self.pin_registry

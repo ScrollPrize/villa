@@ -1,4 +1,4 @@
-"""Pinned winding radii for the gap expander (pinned_spiral_plan.md, stage 2a).
+"""Pinned winding radii for the gap expander.
 
 The gap expander maps the *intermediate* radius ``r`` on a ray ``(theta, z)``
 (umbilicus-centred, post-flow) to the *canonical* spiral radius ``s(r)``.
@@ -9,18 +9,18 @@ kernel mass -- built from *pins*: hard-constraint points pushed through the
 flow chain, whose target canonical radius is decided by one fractional
 winding coordinate ``T_g`` per constraint component.
 
-Layout of this module, in the order the plan builds it:
+Layout of this module:
 
-* ``free_map_forward`` / ``free_map_inverse``: ``s_free`` and its inverse over
+* ``unpinned_map_forward`` / ``unpinned_map_inverse``: ``s_free`` and its inverse over
   a ``[N, K]`` table (the eager ``GapExpandingTransform`` arithmetic).
 * ``pinned_map_forward`` / ``pinned_map_inverse``: the pinned monotone map
-  (plan 2a.4) over padded per-ray anchor lists, with the ordering guard and
+  over padded per-ray anchor lists, with the ordering guard and
   its diagnostics. Pure tensor functions; the one-ray reference is ``N=1``.
-* ``ray_anchors``: rasterised pin lookup (plan 2a.3): compressed-sparse-row
+* ``ray_anchors``: rasterised pin lookup: compressed-sparse-row
   cells, per-pin footprints, singular compact kernel, IDW per winding slot.
 * ``PinTable``: the per-step rasterised pin set consumed by
   ``transforms.PinnedGapExpandingTransform``.
-* ``PinGraph`` / ``PinRegistry``: the constraint registry (plan 2a.1): the
+* ``PinGraph`` / ``PinRegistry``: the constraint registry: the
   model-independent constraint graph (components, pin geometry) and its
   model-dependent finalisation (integer offsets ``n_i``, footprints, ``T``
   initialisation, consistency report).
@@ -61,23 +61,23 @@ def wrap_angle(delta):
 # ---------------------------------------------------------------------------
 
 
-def free_map_forward(r, table, dr, theta_norm):
+def unpinned_map_forward(r, pre_pin_winding_radii, dr, theta_norm):
     """``s_free(r)``: intermediate radius -> canonical radius.
 
-    ``table`` is ``[N, K]`` (winding k's intermediate radius on each ray),
+    ``pre_pin_winding_radii`` is ``[N, K]`` (winding k's intermediate radius on each ray),
     ``r`` and ``theta_norm`` (theta / 2pi) are ``[N]`` or ``[N, M]`` broadcast
-    over the ray. Piecewise linear through ``(table[k], (k + theta_norm) dr)``
+    over the ray. Piecewise linear through ``(pre_pin_winding_radii[k], (k + theta_norm) dr)``
     with the end segments extrapolated, exactly the eager
     ``GapExpandingTransform._inverse`` arithmetic.
     """
-    num_windings = table.shape[-1]
-    squeeze = r.dim() == table.dim() - 1
+    num_windings = pre_pin_winding_radii.shape[-1]
+    squeeze = r.dim() == pre_pin_winding_radii.dim() - 1
     if squeeze:
         r = r[..., None]
-    inner = torch.searchsorted(table.detach().contiguous(), r.detach().contiguous()) - 1
+    inner = torch.searchsorted(pre_pin_winding_radii.detach().contiguous(), r.detach().contiguous()) - 1
     inner = inner.clip(min=0, max=num_windings - 2)
-    r_inner = torch.gather(table, -1, inner)
-    r_outer = torch.gather(table, -1, inner + 1)
+    r_inner = torch.gather(pre_pin_winding_radii, -1, inner)
+    r_outer = torch.gather(pre_pin_winding_radii, -1, inner + 1)
     tn = theta_norm[..., None]
     canonical_inner = (inner.to(r.dtype) + tn) * dr
     frac = (r - r_inner) / (r_outer - r_inner)
@@ -85,23 +85,23 @@ def free_map_forward(r, table, dr, theta_norm):
     return out.squeeze(-1) if squeeze else out
 
 
-def free_map_inverse(c, table, dr, theta_norm):
+def unpinned_map_inverse(c, pre_pin_winding_radii, dr, theta_norm):
     """``s_free^{-1}(c)``: canonical radius -> intermediate radius.
 
     The eager ``GapExpandingTransform._call`` arithmetic: bracket by the
     canonical winding ``floor((c - theta_norm dr) / dr)`` (clipped to the
     table) and lerp the table.
     """
-    num_windings = table.shape[-1]
-    squeeze = c.dim() == table.dim() - 1
+    num_windings = pre_pin_winding_radii.shape[-1]
+    squeeze = c.dim() == pre_pin_winding_radii.dim() - 1
     if squeeze:
         c = c[..., None]
     tn = theta_norm[..., None]
     shifted = (c - tn * dr).clamp(min=0.)
     inner = torch.floor(shifted.detach() / dr.detach()).to(torch.int64)
     inner = inner.clip(min=0, max=num_windings - 2)
-    r_inner = torch.gather(table, -1, inner)
-    r_outer = torch.gather(table, -1, inner + 1)
+    r_inner = torch.gather(pre_pin_winding_radii, -1, inner)
+    r_outer = torch.gather(pre_pin_winding_radii, -1, inner + 1)
     canonical_inner = (inner.to(c.dtype) + tn) * dr
     frac = (c - canonical_inner) / dr
     out = torch.lerp(r_inner, r_outer, frac)
@@ -109,7 +109,7 @@ def free_map_inverse(c, table, dr, theta_norm):
 
 
 # ---------------------------------------------------------------------------
-# The pinned monotone map (plan 2a.4)
+# The pinned monotone map
 # ---------------------------------------------------------------------------
 
 
@@ -143,11 +143,11 @@ class PinnedRayMap:
         return (self.guard_active & ~self.guard_order).sum(dim=-1)
 
 
-def build_pinned_ray_map(table, dr, theta_norm, anchor_R, anchor_S,
+def build_pinned_ray_map(pre_pin_winding_radii, dr, theta_norm, anchor_R, anchor_S,
                          anchor_w, anchor_valid, min_gap):
-    """Resolve the anchors of plan 2a.4 for ``N`` rays.
+    """Resolve the pinned anchors for ``N`` rays.
 
-    ``table`` ``[N, K]`` free winding radii; ``anchor_*`` ``[N, J]`` padded
+    ``pre_pin_winding_radii`` ``[N, K]`` pre-pin winding radii; ``anchor_*`` ``[N, J]`` padded
     per-ray anchors (any order; sorted here by ``R``); ``min_gap`` the gap
     expander's floor. Returns a :class:`PinnedRayMap`.
 
@@ -162,19 +162,19 @@ def build_pinned_ray_map(table, dr, theta_norm, anchor_R, anchor_S,
     constant past it). This is a tridiagonal system per ray, solved by the
     Thomas algorithm. A ``w = 1`` anchor is its target exactly; a ``w = 0``
     anchor lies on the line between its neighbours and so has no effect on
-    the map for any ``R_j`` (transparent) -- which the plan's forward
+    the map for any ``R_j`` (transparent) -- which a forward
     recursion ``a_j = w_j S_j + (1 - w_j)(s_{j-1} + free_rise_j)`` does not
     give, since a zero-mass anchor still splits the interval rescale there.
-    The ordering guard is then the plan's hard max as a forward pass::
+    The ordering guard applies a hard max in a forward pass::
 
         s_j = max(u_j + delta_j, s_{j-1} + min_gap * (u_j - u_{j-1}) / dr)
 
     which is the identity whenever inactive. A coincident pair
     (``u_j == u_{j-1}``) is an empty interval with ``scale = 1``.
     """
-    dtype = table.dtype
-    num_rays = table.shape[0]
-    device = table.device
+    dtype = pre_pin_winding_radii.dtype
+    num_rays = pre_pin_winding_radii.shape[0]
+    device = pre_pin_winding_radii.device
     if anchor_R.shape[-1] == 0:
         anchor_R = anchor_R.new_zeros([num_rays, 0])
     # Sort by R with padded anchors last.
@@ -190,7 +190,7 @@ def build_pinned_ray_map(table, dr, theta_norm, anchor_R, anchor_S,
     R, S, w, valid = R[:, :count], S[:, :count], w[:, :count], valid[:, :count]
 
     zero = torch.zeros([num_rays], dtype=dtype, device=device)
-    u0 = free_map_forward(zero, table, dr, theta_norm)
+    u0 = unpinned_map_forward(zero, pre_pin_winding_radii, dr, theta_norm)
     if count == 0:
         ones = torch.ones([num_rays, 1], dtype=dtype, device=device)
         return PinnedRayMap(
@@ -204,7 +204,7 @@ def build_pinned_ray_map(table, dr, theta_norm, anchor_R, anchor_S,
     # decouple below), made non-decreasing with the base so padded / fp-noise
     # rows never produce a negative interval.
     R_eval = torch.where(valid, R, torch.zeros_like(R))
-    u = free_map_forward(R_eval, table, dr, theta_norm)
+    u = unpinned_map_forward(R_eval, pre_pin_winding_radii, dr, theta_norm)
     u = torch.where(valid, u, u0[:, None])
     u = torch.maximum(u, torch.cummax(torch.cat([u0[:, None], u], dim=-1), dim=-1).values[:, :-1])
     w = torch.where(valid, w, torch.ones_like(w))
@@ -284,7 +284,7 @@ def build_pinned_ray_map(table, dr, theta_norm, anchor_R, anchor_S,
     )
 
 
-def pinned_map_forward(r, table, dr, theta_norm, ray_map):
+def pinned_map_forward(r, pre_pin_winding_radii, dr, theta_norm, ray_map):
     """``s(r)`` for intermediate radii ``r`` (``[N]`` or ``[N, M]``)."""
     squeeze = r.dim() == 1
     if squeeze:
@@ -297,12 +297,12 @@ def pinned_map_forward(r, table, dr, theta_norm, ray_map):
     scale = torch.where(idx + 1 <= last, scale, torch.ones_like(scale))
     s_prev = torch.gather(ray_map.s_at, -1, idx)
     sf_prev = torch.gather(ray_map.s_free_at, -1, idx)
-    s_free_r = free_map_forward(r, table, dr, theta_norm)
+    s_free_r = unpinned_map_forward(r, pre_pin_winding_radii, dr, theta_norm)
     out = s_prev + scale * (s_free_r - sf_prev)
     return out.squeeze(-1) if squeeze else out
 
 
-def pinned_map_inverse(c, table, dr, theta_norm, ray_map):
+def pinned_map_inverse(c, pre_pin_winding_radii, dr, theta_norm, ray_map):
     """``s^{-1}(c)`` for canonical radii ``c`` (``[N]`` or ``[N, M]``).
 
     Locates the interval by ``searchsorted`` over the anchor values
@@ -326,12 +326,12 @@ def pinned_map_inverse(c, table, dr, theta_norm, ray_map):
     s_prev = torch.gather(ray_map.s_at, -1, idx)
     sf_prev = torch.gather(ray_map.s_free_at, -1, idx)
     s_free_c = sf_prev + (c - s_prev) / safe_scale
-    out = free_map_inverse(s_free_c, table, dr, theta_norm)
+    out = unpinned_map_inverse(s_free_c, pre_pin_winding_radii, dr, theta_norm)
     return out.squeeze(-1) if squeeze else out
 
 
 # ---------------------------------------------------------------------------
-# Pin lookup per ray (plan 2a.3)
+# Pin lookup per ray
 # ---------------------------------------------------------------------------
 
 
@@ -501,7 +501,7 @@ class PinFootprints:
 
 @dataclasses.dataclass
 class CoincidenceGroups:
-    """Result of the coincident-pin compatibility pass (plan 2a.3).
+    """Result of the coincident-pin compatibility pass.
 
     ``group`` maps each registry pin to its rasterised pin; ``num_groups`` is
     the rasterised count. ``conflict_groups`` lists conflicting groups with a
@@ -746,7 +746,7 @@ class PinTable:
 
 
 # ---------------------------------------------------------------------------
-# Footprints (plan 2a.3, per-pin kernel widths)
+# Footprints (per-pin kernel widths)
 # ---------------------------------------------------------------------------
 
 
@@ -819,7 +819,7 @@ def chain_neighbour_spacing(theta, z):
 
 
 # ---------------------------------------------------------------------------
-# The constraint registry (plan 2a.1)
+# The constraint registry
 # ---------------------------------------------------------------------------
 
 
@@ -994,7 +994,7 @@ class PinGraph:
 
 @dataclasses.dataclass
 class PinRegistry:
-    """Flat per-pin tensors (plan 2a.1), finalised against one model state.
+    """Flat per-pin tensors, finalised against one model state.
 
     ``zyx`` scroll-space positions; ``component`` ``g(i)``; ``n0`` the
     integer offset at construction; ``theta0`` the intermediate-space angle
@@ -1058,7 +1058,7 @@ class PinRegistry:
             patch_offset=state['patch_offset'].to(device))
 
     def adjusted_n(self, theta):
-        """``n_i(t) = n_i(0) + round((theta0_i - theta_i(t)) / 2pi)`` (plan 2a.1)."""
+        """``n_i(t) = n_i(0) + round((theta0_i - theta_i(t)) / 2pi)``."""
         return self.n0 + torch.round((self.theta0 - theta) / TWO_PI).to(torch.int32)
 
     def summary(self):

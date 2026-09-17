@@ -1,9 +1,6 @@
-"""Pinned winding radii (pinned_spiral_plan.md stage 2a): unit tests over the
+"""Pinned winding radii: unit tests over the
 pure one-ray / per-ray functions in pins.py, plus the transform-level
 integration (PinnedGapExpandingTransform, compute_pins, the registry graph).
-
-Numbered tests follow the plan's list (1, 2, 2a, 2b, 2c, 3, 4, 5, 5b, 5c, 6,
-7, 7b) and the synthetic end-to-end check (8, reduced to the transform level).
 """
 
 import math
@@ -21,7 +18,7 @@ import pins
 from pins import (
     FootprintRule, PinCells, TWO_PI, build_pinned_ray_map,
     chain_neighbour_spacing, compact_kernel, compute_coincidence_groups,
-    free_map_forward, free_map_inverse, grid_neighbour_spacing,
+    unpinned_map_forward, unpinned_map_inverse, grid_neighbour_spacing,
     pinned_map_forward, pinned_map_inverse, ray_anchors,
 )
 
@@ -92,11 +89,11 @@ def _inverse(c, table, theta, ray_map, dr=DR):
 
 
 def _free(r, table, theta, dr=DR):
-    return free_map_forward(r, table, torch.as_tensor(dr), theta / TWO_PI)
+    return unpinned_map_forward(r, table, torch.as_tensor(dr), theta / TWO_PI)
 
 
 # ---------------------------------------------------------------------------
-# 1. exactness
+# exactness
 # ---------------------------------------------------------------------------
 
 
@@ -119,14 +116,13 @@ def test_pinned_map_exact_on_pins():
 
 
 # ---------------------------------------------------------------------------
-# 2. monotone under adversarial anchors, guard counting
+# monotone under adversarial anchors, guard counting
 # ---------------------------------------------------------------------------
 
 
 def _hand_count_guard(table_row, theta_row, R, S, w, dr=DR, min_gap=MIN_GAP):
-    """Reference one-ray solution in plain numpy: the tridiagonal blend of
-    plan 2a.4 (as implemented; see pins.build_pinned_ray_map) followed by
-    the hard-max ordering guard."""
+    """Reference one-ray solution in plain numpy: the tridiagonal blend
+    (see pins.build_pinned_ray_map) followed by the hard-max ordering guard."""
     order = np.argsort(R, kind='stable')
     R, S, w = R[order], S[order], w[order]
     sfree = lambda r: float(_free(torch.tensor([r]), table_row[None], theta_row[None])[0])
@@ -211,7 +207,7 @@ def test_hard_max_leaves_non_violating_anchors_bit_identical():
 
 
 # ---------------------------------------------------------------------------
-# 2a. anchor crossing matrix
+# anchor crossing matrix
 # ---------------------------------------------------------------------------
 
 
@@ -296,7 +292,7 @@ def test_anchor_crossing_matrix():
 
 
 # ---------------------------------------------------------------------------
-# 2b. multi-turn patch and dense cells in the CSR table
+# multi-turn patch and dense cells in the CSR table
 # ---------------------------------------------------------------------------
 
 
@@ -351,7 +347,7 @@ def test_pin_table_multi_turn_patch():
 
 
 # ---------------------------------------------------------------------------
-# 2c. coincidence pass
+# coincidence pass
 # ---------------------------------------------------------------------------
 
 
@@ -397,7 +393,7 @@ def test_pin_coincidence_pass():
 
 
 # ---------------------------------------------------------------------------
-# 3. no pins is the free map
+# no pins is the free map
 # ---------------------------------------------------------------------------
 
 
@@ -439,7 +435,7 @@ def test_zero_mass_anchor_is_transparent():
 
 
 # ---------------------------------------------------------------------------
-# 4. inverse round trip
+# inverse round trip
 # ---------------------------------------------------------------------------
 
 
@@ -466,7 +462,7 @@ def test_pinned_map_inverse_roundtrip():
 
 
 # ---------------------------------------------------------------------------
-# 5. continuity of the lookup
+# continuity of the lookup
 # ---------------------------------------------------------------------------
 
 
@@ -578,7 +574,7 @@ def test_pin_grid_between_pins_stays_near_targets():
 
 
 # ---------------------------------------------------------------------------
-# 5b. footprints
+# footprints
 # ---------------------------------------------------------------------------
 
 
@@ -623,7 +619,7 @@ def test_pin_footprints():
 
 
 # ---------------------------------------------------------------------------
-# 5c. seam crossing keeps the target
+# seam crossing keeps the target
 # ---------------------------------------------------------------------------
 
 
@@ -651,7 +647,7 @@ def test_pin_seam_crossing():
 
 
 # ---------------------------------------------------------------------------
-# 7. gradient check
+# gradient check
 # ---------------------------------------------------------------------------
 
 
@@ -678,7 +674,7 @@ def test_pinned_map_gradcheck():
 
 
 # ---------------------------------------------------------------------------
-# 7b. DT gradient on T through one pin
+# DT gradient on T through one pin
 # ---------------------------------------------------------------------------
 
 
