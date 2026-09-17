@@ -33,7 +33,6 @@
 #include <QPainter>
 #include <QHelpEvent>
 #include <QImage>
-#include <QLinearGradient>
 #include <QPainterPath>
 #include <QPalette>
 #include <QPen>
@@ -1059,6 +1058,7 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     _layout = {};
     _gapField.reset();
     _gapPublishedWanted = false;
+    _gapPublishedError.clear();
     _gapTiles.clear();
     _layoutGeneration = 0;
     _layoutFrame = {};
@@ -1691,6 +1691,7 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     // scene rebuild below draws whatever this is.
     _gapField = job.gapField;
     _gapPublishedWanted = job.wantGapField;
+    _gapPublishedError = job.gapError;
     _gapFieldParams = job.gapParams;
     _layoutUmbilicusFingerprint = job.preReadUmbilicusFingerprint;
     _layoutGeneration = job.snapshot.generation;
@@ -1846,33 +1847,15 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
         // rather than leave the voxel counts looking like an odd unit.
         status += tr(" · voxel size unknown — lengths in vx");
     }
-    if (job.wantGapField) {
-        if (_gapField && !_gapField->empty()) {
-            status += tr(" · gaps to %1").arg(formatMapLength(_gapField->saturationVx));
-            if (_gapField->seedFiberCount == 0) {
-                status += tr(" (no fibers to seed)");
-            } else if (!_gapField->folded) {
-                status += tr(" (this winding only: no sheet pitch)");
-            } else if (_gapField->faded) {
-                status += tr(" (fades by %1 windings)").arg(_gapFieldParams.fadeWindings);
-            }
-            if (_gapField->foldTruncated) {
-                status += tr(", fold cap reached");
-            }
-            if (_gapField->cellCoarsened) {
-                status += tr(", coarse cells");
-            }
-        } else if (!job.gapError.isEmpty()) {
-            status += tr(" · gaps failed: %1").arg(job.gapError);
-        }
-    }
     if (job.hadUmbilicus && !job.snapshot.umbilicusLabel.isEmpty()) {
         // The controller composes this: which grid the umbilicus indexes,
         // whether that came from the file's own metadata or from the z-span
         // guess, and any frame inconsistency it noticed on the way.
         status += QStringLiteral(" · ") + job.snapshot.umbilicusLabel;
     }
-    _freshStatus = status;
+    _freshStatusBase = status;
+    _freshStatus = _freshStatusBase + gapStatusSuffix();
+    status = _freshStatus;
     // Red and bold while anything is ringed; plain once the map is clean.
     _freshStatusStyle = errorCount > 0
         ? QStringLiteral("QLabel { color: %1; font-weight: bold; }").arg(kSuspect.name())
@@ -2519,12 +2502,26 @@ void FiberMapWorkspace::changeEvent(QEvent* event)
     // rebuildScene clears the highlight, so it is restored afterwards: a theme
     // switch should not cost the user their selection.
     const uint64_t highlighted = _highlightedFiber;
+    // A selected error entry survives too: the rebuilt tree lists the same
+    // errors in the same order for the same layout, so its row index is its
+    // identity.
+    int selectedErrorRow = -1;
+    if (QTreeWidgetItem* current = _tree->currentItem();
+        current && current->data(0, kErrorExtentRole).isValid()) {
+        selectedErrorRow = _tree->indexOfTopLevelItem(current);
+    }
     const QString emptyMessage = _emptyMessage;
     rebuildScene(emptyMessage);
     rebuildTree();
     // The legend's ramp is the theme's too.
     updateGapLegend();
-    if (highlighted != 0 && _entries.contains(highlighted)) {
+    if (selectedErrorRow >= 0 && selectedErrorRow < _tree->topLevelItemCount() &&
+        _tree->topLevelItem(selectedErrorRow)->data(0, kErrorExtentRole).isValid()) {
+        const bool guard = _syncingSelection;
+        _syncingSelection = true;
+        _tree->setCurrentItem(_tree->topLevelItem(selectedErrorRow));
+        _syncingSelection = guard;
+    } else if (highlighted != 0 && _entries.contains(highlighted)) {
         setHighlightedFiber(highlighted);
         selectFiberRow(highlighted);
     }
@@ -2596,11 +2593,11 @@ void FiberMapWorkspace::handleSceneClick(const QPointF& scenePos)
     const uint64_t fiberId = fiberAt(scenePos);
     setHighlightedFiber(fiberId);
     if (fiberId != 0) {
-        selectFiberRow(fiberId);
+        selectFiberRow(fiberId, /*revealHidden=*/true);
     }
 }
 
-void FiberMapWorkspace::selectFiberRow(uint64_t fiberId)
+void FiberMapWorkspace::selectFiberRow(uint64_t fiberId, bool revealHidden)
 {
     const bool guard = _syncingSelection;
     _syncingSelection = true;
@@ -2632,6 +2629,12 @@ void FiberMapWorkspace::selectFiberRow(uint64_t fiberId)
         hit = find(true);
     }
     if (hit != nullptr) {
+        // A search that hides the row would make the selection invisible;
+        // the user's click on the map outranks the filter, so it clears.
+        const bool hidden = hit->isHidden() || (hit->parent() && hit->parent()->isHidden());
+        if (revealHidden && hidden && _searchEdit && !_searchEdit->text().isEmpty()) {
+            _searchEdit->clear();  // textChanged re-applies the (empty) filter
+        }
         _tree->setCurrentItem(hit);
         _tree->scrollToItem(hit);
     }
@@ -2793,6 +2796,7 @@ void FiberMapWorkspace::requestGapRebuild()
 void FiberMapWorkspace::handleGapsToggled(bool checked)
 {
     updateGapLegend();
+    refreshGapStatus();
     if (!checked) {
         setGapTilesVisible(false);
         return;
@@ -2816,17 +2820,61 @@ void FiberMapWorkspace::handleGapsToggled(bool checked)
 void FiberMapWorkspace::handleGapParamsChanged()
 {
     updateGapLegend();
+    refreshGapStatus();
     if (!_gapsCheck || !_gapsCheck->isChecked()) {
         return;
     }
+    // Shown iff the published field is what the toolbar now asks for: a
+    // moved setting hides the old field at once rather than leaving colours
+    // on the map that the legend no longer describes; moved back (with
+    // nothing in flight to disagree) it shows again.
+    reconcileGapTiles();
     if (!rebuildInFlight() && gapSettingsMatchPublished()) {
-        // Moved and moved back, with nothing in flight to disagree: the
-        // published field is the right one again, so it shows again (a
-        // failed or discarded build in between had hidden it).
-        reconcileGapTiles();
         return;
     }
     requestGapRebuild();
+}
+
+QString FiberMapWorkspace::gapStatusSuffix() const
+{
+    if (!_layoutBuilt || !_gapsCheck || !_gapsCheck->isChecked() || !_gapPublishedWanted) {
+        return QString();
+    }
+    QString suffix;
+    if (_gapField && !_gapField->empty()) {
+        suffix += tr(" · gaps to %1").arg(formatMapLength(_gapField->saturationVx));
+        if (_gapField->seedFiberCount == 0) {
+            suffix += tr(" (no fibers to seed)");
+        } else if (!_gapField->folded) {
+            suffix += tr(" (this winding only: no sheet pitch)");
+        } else if (_gapField->faded) {
+            suffix += tr(" (fades by %1 windings)").arg(_gapFieldParams.fadeWindings);
+        }
+        if (_gapField->foldTruncated) {
+            suffix += tr(", fold cap reached");
+        }
+        if (_gapField->cellCoarsened) {
+            suffix += tr(", coarse cells");
+        }
+        if (!gapSettingsMatchPublished()) {
+            suffix += tr(" — settings changed, press Update");
+        }
+    } else if (!_gapPublishedError.isEmpty()) {
+        suffix += tr(" · gaps failed: %1").arg(_gapPublishedError);
+    }
+    return suffix;
+}
+
+void FiberMapWorkspace::refreshGapStatus()
+{
+    if (!_layoutBuilt || !_statusLabel) {
+        return;
+    }
+    _freshStatus = _freshStatusBase + gapStatusSuffix();
+    // Only the resting text is recomposed; a stale banner keeps the floor.
+    if (_staleReason.isEmpty() && _latchedReason.isEmpty()) {
+        _statusLabel->setText(_freshStatus);
+    }
 }
 
 void FiberMapWorkspace::updateGapLegend()

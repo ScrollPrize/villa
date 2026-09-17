@@ -260,6 +260,11 @@ private:
     void handleGapsToggled(bool checked);
     void handleGapParamsChanged();
     void updateGapLegend();
+    // The status line's heat-map suffix for the published build as the
+    // toolbar stands now (empty with Gaps off), and the status text it
+    // composes with the layout's own summary.
+    [[nodiscard]] QString gapStatusSuffix() const;
+    void refreshGapStatus();
     // Whether the published build's heat-map settings (on/off and
     // parameters, captured at its job start) are what the toolbar asks for
     // now. False before any build has published.
@@ -310,7 +315,11 @@ private:
     void deleteConfirmedFiber(uint64_t fiberId,
                               const std::string& fileName,
                               const vc3d::fiber_map::FiberMapDependencies& menuDependencies);
-    void selectFiberRow(uint64_t fiberId);
+    // Lands the tree on the fiber's row. revealHidden: a search that hides
+    // the row is cleared first - for the user's own click on the map, which
+    // outranks the filter; a programmatic restore (theme change) leaves the
+    // search as typed.
+    void selectFiberRow(uint64_t fiberId, bool revealHidden = false);
     [[nodiscard]] uint64_t fiberAt(const QPointF& scenePos) const;
     [[nodiscard]] double sceneTolerance(double viewPixels) const;
 
@@ -340,8 +349,10 @@ private:
     // it may show from one that needs a rebuild.
     std::shared_ptr<const vc3d::fiber_map::gaps::GapField> _gapField;
     // What the published build was asked for (the field is null when this
-    // is false, and also when the build failed with it true).
+    // is false, and also when the build failed with it true), and why it
+    // has no field if it failed.
     bool _gapPublishedWanted = false;
+    QString _gapPublishedError;
     vc3d::fiber_map::gaps::GapFieldParams _gapFieldParams;
     // Scene-owned; cleared (not deleted) whenever the scene is.
     std::vector<QGraphicsItem*> _gapTiles;
@@ -432,6 +443,9 @@ private:
     // What the status line says when nothing is stale: the last build summary,
     // or the clear reason. Restored when a derived stale reason reverts.
     QString _freshStatus;
+    // _freshStatus without the heat-map suffix, so the suffix can follow the
+    // Gaps checkbox after publication.
+    QString _freshStatusBase;
     // The stylesheet that goes with _freshStatus (red while errors are ringed).
     QString _freshStatusStyle;
     // The clear reason alone, without the umbilicus suffix _freshStatus
