@@ -1,6 +1,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/types/Sampling.hpp"
+#include "vc/core/util/CubicInterpolation.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 
 #include <opencv2/core.hpp>
@@ -234,13 +235,6 @@ struct ChunkSampler {
         return std::fma(fz, c1 - c0, c0);
     }
 
-    static VC_FORCE_INLINE float catmullRom(float t) {
-        float at = std::abs(t);
-        if (at < 1.0f) return 1.5f*at*at*at - 2.5f*at*at + 1.0f;
-        if (at < 2.0f) return -0.5f*at*at*at + 2.5f*at*at - 4.0f*at + 2.0f;
-        return 0.0f;
-    }
-
     float sampleTricubic(float vz, float vy, float vx) {
         int iz = int(std::floor(vz));
         int iy = int(std::floor(vy));
@@ -249,12 +243,12 @@ struct ChunkSampler {
 
         float result = 0.0f;
         for (int dz = -1; dz <= 2; dz++) {
-            float wz = catmullRom(fz - float(dz));
+            float wz = vc::interp::catmullRomWeight(fz - float(dz));
             for (int dy = -1; dy <= 2; dy++) {
-                float wy = catmullRom(fy - float(dy));
+                float wy = vc::interp::catmullRomWeight(fy - float(dy));
                 float wzy = wz * wy;
                 for (int dx = -1; dx <= 2; dx++) {
-                    float wx = catmullRom(fx - float(dx));
+                    float wx = vc::interp::catmullRomWeight(fx - float(dx));
                     result += wzy * wx * float(sampleInt(iz + dz, iy + dy, ix + dx));
                 }
             }
