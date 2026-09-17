@@ -40,21 +40,33 @@ def canonical_runtime(source_dir):
 
 
 class CanonicalLogitProjection(nn.Module):
-    """Input: normalized B1x64x256x256; native decoder XY stride: four.
+    """Hecate: shared voxel logits and a learned, differentiable depth projection.
 
     Full-grid outputs are interpolated for supervision/display, not additional
-    resolved XY detail. Only central input planes 1:63 are used. Both losses
+    resolved XY detail. The 2.4um model uses central planes 1:63 and XY stride four; the
+    9.6um model uses all 16 planes and XY stride one. Both losses
     share projection_3d_logits as their differentiable ancestor.
     """
-    def __init__(self, source_dir, with_norm=True, freeze_batchnorm_stats=True):
+    def __init__(self, source_dir=None, with_norm=True, freeze_batchnorm_stats=True,
+                 input_depth=64, depth_margin=1, native_xy_stride=4,
+                 native_refinement=False, activation_checkpointing=False):
         super().__init__()
-        self.canonical = canonical_runtime(source_dir).RegressionModel(with_norm=with_norm)
+        geometry = (input_depth, depth_margin, native_xy_stride)
+        if geometry not in ((64, 1, 4), (16, 0, 1)) or native_refinement or activation_checkpointing:
+            raise ValueError("Only the released Hecate 2.4um and 9.6um architectures are supported")
+        self.input_depth, self.depth_margin, self.native_xy_stride = geometry
+        self.feature_depth = input_depth - 2 * depth_margin
+        self.canonical = canonical_runtime(source_dir or canonical_source_dir()).RegressionModel(with_norm=with_norm)
         if hasattr(self.canonical.backbone, "maxpool"):
             pool = self.canonical.backbone.maxpool
             if (pool.kernel_size != (1, 3, 3) or pool.stride != (1, 2, 2)
                     or pool.padding != (0, 1, 1) or pool.ceil_mode):
                 raise ValueError("Canonical encoder spatial max-pool contract changed")
             self.canonical.backbone.maxpool = SpatialMaxPool3d()
+        if native_xy_stride == 1:
+            self.canonical.backbone.conv1 = nn.Conv3d(1, 64, 3, padding=1, bias=False)
+            nn.init.kaiming_normal_(self.canonical.backbone.conv1.weight, mode="fan_out", nonlinearity="relu")
+            self.canonical.backbone.maxpool = nn.Identity()
         self.depth_coordinate_scale = nn.Parameter(torch.zeros(()))
         self.freeze_batchnorm_stats = bool(freeze_batchnorm_stats)
         self.canonical.decoder.deep_supervision = False
@@ -78,9 +90,9 @@ class CanonicalLogitProjection(nn.Module):
         return self
 
     def _features_logits(self, image):
-        if image.ndim != 5 or image.shape[1:3] != (1, 64):
-            raise ValueError("Canonical joint input must be B1x64xHxW")
-        features, _ = self.canonical.forward_features(image[:, :, 1:63])
+        if image.ndim != 5 or image.shape[1:3] != (1, self.input_depth):
+            raise ValueError(f"Expected B1x{self.input_depth}xHxW")
+        features, _ = self.canonical.forward_features(image[:, :, self.depth_margin:self.input_depth-self.depth_margin])
         head = self.canonical.decoder.logit
         # The existing Conv2d classifier is exactly a pointwise Conv3d when
         # its kernel gains a singleton depth dimension. No new ink head.
@@ -88,11 +100,10 @@ class CanonicalLogitProjection(nn.Module):
                           None if head.bias is None else head.bias.float())
         return features, logits.float()
 
-    @staticmethod
-    def _full_grid(logits, image):
-        full = F.interpolate(logits, size=(62, *image.shape[-2:]),
+    def _full_grid(self, logits, image):
+        full = F.interpolate(logits, size=(self.feature_depth, *image.shape[-2:]),
                              mode="trilinear", align_corners=False)
-        return F.pad(full, (0, 0, 0, 0, 1, 1), value=-20.)
+        return F.pad(full, (0, 0, 0, 0, self.depth_margin, self.depth_margin), value=-20.)
 
     def forward_3d(self, image):
         """Return full-grid logits without executing attention or projection."""
@@ -102,12 +113,14 @@ class CanonicalLogitProjection(nn.Module):
     def forward(self, image, valid=None):
         features, logits = self._features_logits(image)
         scores = self.canonical.decoder.depth_collapse.attn_conv(features).float()
-        z = (torch.arange(62, device=scores.device, dtype=torch.float32) - 31) / 31
+        half = self.feature_depth // 2
+        z = (torch.arange(self.feature_depth, device=scores.device, dtype=torch.float32) - half) / half
         scores = scores + self.depth_coordinate_scale * z.view(1, 1, -1, 1, 1)
         if valid is None:
             native_valid = torch.ones_like(logits, dtype=torch.bool)
         else:
-            native_valid = F.max_pool3d(valid[:, :, 1:63].float(), (1, 4, 4)).bool()
+            native_valid = F.max_pool3d(valid[:, :, self.depth_margin:self.input_depth-self.depth_margin].float(),
+                                        (1, self.native_xy_stride, self.native_xy_stride)).bool()
         weights = scores.masked_fill(~native_valid, -1e4).softmax(2) * native_valid
         weights = weights / weights.sum(2, keepdim=True).clamp_min(1e-8)
         native_2d = (weights * logits).sum(2)
@@ -116,9 +129,9 @@ class CanonicalLogitProjection(nn.Module):
                                     mode="bilinear", align_corners=False)
         ink = torch.logit(probability.clamp(torch.finfo(torch.float32).eps,
                                            1 - torch.finfo(torch.float32).eps))
-        attention = F.interpolate(weights, size=(62, *image.shape[-2:]),
+        attention = F.interpolate(weights, size=(self.feature_depth, *image.shape[-2:]),
                                   mode="trilinear", align_corners=False)
-        attention = F.pad(attention, (0, 0, 0, 0, 1, 1))
+        attention = F.pad(attention, (0, 0, 0, 0, self.depth_margin, self.depth_margin))
         return {"ink": ink, "ink_3d_logits": self._full_grid(logits, image),
                 "depth_weights": attention, "projection_3d_logits": logits,
                 "native_2d_logits": native_2d}
