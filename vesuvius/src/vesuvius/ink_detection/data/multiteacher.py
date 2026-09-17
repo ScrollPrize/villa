@@ -30,6 +30,11 @@ SPACING = dict(zip(SCROLLS, (2.401, 2.399, 2.215, 2.399, 2.399, 2.403, 2.399, 2.
 MASK_FACTOR = 16
 
 
+def scroll_vocabulary(records):
+    """Keep existing IDs stable and append additional manifest scrolls."""
+    return SCROLLS + tuple(sorted({r["scroll"] for r in records} - set(SCROLLS)))
+
+
 def stable_seed(*parts) -> int:
     return int.from_bytes(hashlib.sha256(":".join(map(str, parts)).encode()).digest()[:8], "big")
 
@@ -254,6 +259,7 @@ class FlatDistillationDataset(Dataset):
         self.path = Path(manifest_path)
         self.manifest = json.loads(self.path.read_text())
         self.records = self.manifest["segments"]
+        self.scroll_vocabulary = scroll_vocabulary(self.records)
         self.path_roots = path_roots or {}
         self.excluded_segments = set(excluded_segments or [])
         if self.excluded_segments:
@@ -411,13 +417,15 @@ class FlatDistillationDataset(Dataset):
                 arrays = [np.flip(a, axis=-1) for a in arrays]
         raw, teacher_image, image, labels, support, valid = arrays
         if self.augment:
-            image = np.clip(image * rng.uniform(0.9, 1.1) + rng.uniform(-0.05, 0.05), 0, 1)
+            image = image * rng.uniform(0.9, 1.1) + rng.uniform(-0.05, 0.05)
+            # Divide-normalized CT can legitimately exceed one (255/200).
+            image = np.maximum(image, 0) if self.student_normalization.mode == "divide" else np.clip(image, 0, 1)
         def tensor(a):
             return torch.from_numpy(np.array(a, dtype=np.float32, copy=True)).unsqueeze(0)
         return {"image": tensor(image), "teacher_image": tensor(teacher_image),
                 "raw": tensor(raw), "labels_2d": tensor(labels), "mask_2d": tensor(support),
                 "valid_3d": tensor(valid), "teacher_id": torch.tensor(record["teacher_id"]),
-                "scroll_id": torch.tensor(SCROLLS.index(record["scroll"])),
+                "scroll_id": torch.tensor(self.scroll_vocabulary.index(record["scroll"])),
                 "record_id": torch.tensor(index), "draw_id": torch.tensor(draw),
                 "reverse_depth": torch.tensor(reverse_depth),
                 "yx": torch.tensor([y, x])}
