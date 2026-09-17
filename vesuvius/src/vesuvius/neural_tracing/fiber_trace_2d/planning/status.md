@@ -1,11 +1,12 @@
 # Status
 
-- [x] Commit preceding merge/split and fiberlet work.
-- [x] Freeze and prepare best/current `062136` EMA999 snapshots.
-- [x] Complete both full 50-fiber evaluations.
-- [x] Validate global and per-scroll results.
-- [x] Promote the tracing-selected u22000 checkpoint in config and manifest.
-- [x] Document the new evaluations and current default.
-- [x] Independent plan/result review.
-- [x] Validate hashes/config/initialization behavior.
-- [x] Commit the completed default selection.
+- [x] Read task and local workflow instructions.
+- [x] Audit prior mini5/short200 fiberlet baselines and parameter surface.
+- [x] Write task plan.
+- [x] Independent plan review; corrected mini5 identity/resume/ranking details.
+- [x] Implement resumable graph-parameter sweep through approved runner.
+- [x] Run approved regression tests.
+- [x] Run mini5 staged search.
+- [x] Apply promotion gate; no credible candidate, so do not spend short200 run.
+- [x] Analyze, document, and retain existing production defaults.
+- [x] Commit final code, configuration, and results.

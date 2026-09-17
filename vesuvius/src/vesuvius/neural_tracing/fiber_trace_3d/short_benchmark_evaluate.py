@@ -251,11 +251,14 @@ def prepare_corrections(workload):
     return dict(workload, benchmark_manifest=str(target), benchmark_corrections=[])
 
 
-def run(workload, devices, *, gpu_manager=None):
+def run(workload, devices, *, gpu_manager=None, cancel_event=None):
     if workload.get('benchmark_corrections'):
         workload = prepare_corrections(workload)
     if workload.get('anchor_sweep'):
         from .anchor_fit_sweep import run_sweep
+        return run_sweep(workload, devices, gpu_manager)
+    if workload.get('fiberlet_sweep'):
+        from .fiberlet_parameter_sweep import run_sweep
         return run_sweep(workload, devices, gpu_manager)
     from .cached_trace_profile import extend_cached_replay, CachedReplaySession
     from .replay_metrics import complete_report, correct_summary
@@ -298,7 +301,8 @@ def run(workload, devices, *, gpu_manager=None):
     if workload.get('scroll_sequential', False):
         parts, artifacts = [], []
         with CachedReplaySession(evaluation, workload['native_binary'], checkpoint,
-                                devices=devices, gpu_manager=gpu_manager) as session:
+                                devices=devices, gpu_manager=gpu_manager,
+                                cancel_event=cancel_event) as session:
             for index, sources in enumerate(scroll_groups(evaluation)):
                 destination = root / 'scrolls' / f'{index:02d}'
                 current = dict(evaluation, sources=sources, output=str(destination))
@@ -326,7 +330,8 @@ def run(workload, devices, *, gpu_manager=None):
         atomic_write(root / 'full/summary.json', result)
     else:
         extend_cached_replay(evaluation, workload['native_binary'], checkpoint,
-                             devices=devices, gpu_manager=gpu_manager)
+                             devices=devices, gpu_manager=gpu_manager,
+                             cancel_event=cancel_event)
     elapsed = time.monotonic() - start
     result = json.loads((root / 'full/summary.json').read_text())
     if result['cases'] != manifest['case_count'] or sha256_file(manifest_path) != manifest_hash:
@@ -373,5 +378,6 @@ def run(workload, devices, *, gpu_manager=None):
         write_pair_benchmark(root, evaluation, manifest,
             dict(workload['pair_reference'], checkpoint_sha256=workload['checkpoint_sha256']),
             workload['native_binary'])
-    print(json.dumps(report, indent=2), flush=True)
+    if not workload.get('quiet_report'):
+        print(json.dumps(report, indent=2), flush=True)
     return report

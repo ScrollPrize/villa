@@ -53,6 +53,78 @@ def test_weighted_fit_sweep_has_twenty_distinct_candidates_and_legacy():
     assert sum(fit is not None and fit['iterations']==0 for _,fit in rows)==2
 
 
+def test_fiberlet_parameter_sweep_variants_require_legacy_lattice_and_order():
+    from vesuvius.neural_tracing.fiber_trace_3d.fiberlet_parameter_sweep import ordered_variants
+    entries = [
+        dict(name='prewarm', warmup=True, parameters=dict(
+            beam_width=16, beam_step_base_voxels=48, lookahead_base_voxels=384)),
+        dict(name='baseline', parameters=dict(
+            beam_width=16, beam_step_base_voxels=48, lookahead_base_voxels=384)),
+        dict(name='fine', parameters=dict(
+            beam_width=32, beam_step_base_voxels=24, lookahead_base_voxels=192)),
+    ]
+    rows = ordered_variants({'fiberlet': {}, 'fiberlet_sweep': {'variants': entries}})
+    assert [row['name'] for row in rows] == ['prewarm', 'baseline', 'fine']
+    assert rows[0]['warmup'] and not rows[1]['warmup']
+    with pytest.raises(ValueError, match='measured fiberlet settings must be unique'):
+        ordered_variants({'fiberlet': {}, 'fiberlet_sweep': {'variants': entries + [
+            dict(name='baseline-again', parameters=entries[1]['parameters'])]}})
+    with pytest.raises(ValueError, match='production anchors'):
+        ordered_variants({'fiberlet': {'anchor_fit': {}}, 'fiberlet_sweep': {'variants': entries}})
+    bad = json.loads(json.dumps(entries))
+    bad[-1]['parameters']['beam_step_base_voxels'] = 25
+    with pytest.raises(ValueError, match='8-base lattice'):
+        ordered_variants({'fiberlet': {}, 'fiberlet_sweep': {'variants': bad}})
+
+
+def test_fiberlet_parameter_sweep_attempt_recovery_and_completed_validation(tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.fiberlet_parameter_sweep import (
+        _validate_completed, next_attempt_root,
+    )
+    candidate = tmp_path / 'candidate'
+    (candidate / 'attempt_001').mkdir(parents=True)
+    (candidate / 'attempt_003').mkdir()
+    assert next_attempt_root(candidate).name == 'attempt_004'
+    metrics = candidate / 'attempt_003/metrics.json'
+    metrics.write_text('{}')
+    variant = dict(name='baseline', warmup=False,
+                   parameters=dict(beam_width=16, beam_step_base_voxels=48,
+                                   lookahead_base_voxels=384), identity=(16,48.,384.))
+    identity = {'sha256': 'matrix'}
+    pointer = candidate / 'result.json'
+    saved_variant = {key:value for key,value in variant.items() if key != 'identity'}
+    pointer.write_text(json.dumps(dict(variant=saved_variant, matrix_identity=identity,
+        attempt_root=str(metrics.parent), metrics_sha256=sha256_file(metrics),
+        row={'name':'baseline','status':'completed'})))
+    assert _validate_completed(pointer, variant, identity)['status'] == 'completed'
+    with pytest.raises(ValueError, match='provenance changed'):
+        _validate_completed(pointer, variant, {'sha256': 'different-matrix'})
+    metrics.write_text('{"changed":true}')
+    with pytest.raises(ValueError, match='metrics changed'):
+        _validate_completed(pointer, variant, identity)
+
+
+def test_fiberlet_parameter_sweep_extracts_and_ranks_case_metrics(tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.fiberlet_parameter_sweep import (
+        case_diagnostics, ranking_key,
+    )
+    for index, failure in enumerate((None, 64.0)):
+        path = tmp_path / f'scrolls/00/cases/{index}/trace.json'
+        path.parent.mkdir(parents=True)
+        failures = [] if failure is None else [{'reference_arc_base': failure, 'reason': 'distance_above_threshold'}]
+        path.write_text(json.dumps(dict(
+            provenance=dict(fiber_path=f'fiber-{index}', coordinate_space='scroll/scan'),
+            replay=dict(reference_end_arc_base=128.0, failures=failures))))
+    rows = case_diagnostics(tmp_path)
+    assert [row['first_failure_or_end_base'] for row in rows] == [128.,64.]
+    assert [row['first_failure_reason'] for row in rows] == [None,'distance_above_threshold']
+    better = dict(name='better',status='completed',warmup=False,coverage_percent=100,
+                  first_failure_total_base=200,global_result={'failures':1})
+    worse = dict(name='worse',status='completed',warmup=False,coverage_percent=100,
+                 first_failure_total_base=100,global_result={'failures':2})
+    assert sorted([worse,better], key=ranking_key) == [better,worse]
+
+
 def test_directed_binding_preserves_model_and_collections(tmp_path):
     path = tmp_path / 'piece.json'
     path.write_text(json.dumps({'evaluation_direction': 'forward'}))

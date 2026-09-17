@@ -2915,3 +2915,13 @@ Frozen corrected mini5case000 with separate neighboring-fiber hypothesis and
 native CP-bounded geometric profiles. One-case weighted4 baseline reproduces
 exactly. Evidence supports approach/separation and trace switching; physical
 identity remains unconfirmed. Global-assignment experiments not yet implemented.
+
+## 2026-09-17 — Fiberlet graph retuning retained production defaults
+
+- Added a hash-bound, attempt-preserving graph replay sweep behind the approved
+  evaluation runner and tested beam width, step and lookahead on corrected mini5.
+- All 42 completed unique settings retained 5 failures/100% coverage; the best
+  first-failure shift was only +22.762 base voxels, below the +160 promotion gate.
+  One fine-step/long-lookahead candidate timed out and was retained for audit.
+- Kept beam16/step48/lookahead384 and skipped short200 promotion. Full matrix and
+  reproduction details: `../docs/benchmarks/fiberlet_graph_retuning_u22000_20260917.md`.

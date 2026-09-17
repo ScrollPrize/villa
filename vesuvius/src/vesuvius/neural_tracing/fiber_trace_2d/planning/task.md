@@ -1,6 +1,7 @@
 # Task
 
-Commit the completed merge/split work, evaluate the best and current EMA999
-snapshots from refinement run `20260916_062136` on the established full 50-fiber
-benchmark, then promote the tracing-selected best refinement checkpoint to the
-canonical refinement training default and document it as the current best.
+Retune the native downstream fiberlet graph tracer for the current tracing-best
+EMA999 u22000 prediction snapshot. Search first on the fixed five-error benchmark,
+then evaluate promising parameter sets on the fixed 200-break benchmark. Focus on
+the graph/DP controls such as beam decision step, lookahead, and beam width. Use
+only existing pre-approved command entry points for builds, tests, and runs.
