@@ -208,17 +208,19 @@ constexpr qreal kGapZ = -2.5;
 constexpr int kGapTileCols = 4096;
 // Gap heat map defaults and ranges, in centimetres (the spinboxes' unit).
 constexpr double kGapCellCm = 0.05;
-constexpr double kGapSaturationDefaultCm = 1.0;
+constexpr double kGapSaturationDefaultCm = 3.0;
 constexpr double kGapSaturationMinCm = 0.1;
 constexpr double kGapSaturationMaxCm = 10.0;
 // Across-sheet term at the model's own sheet spacing (not exposed: the fade
 // below is the one knob for how far other windings reach).
 constexpr double kGapAcrossWeight = 1.0;
-// Fade of neighbouring windings' influence, on by default, gone at this
-// many windings away.
+// Fade of neighbouring windings' influence, on by default. The spinbox
+// counts the neighbouring windings that still count on each side (0: only
+// the fiber's own winding); the field's own parameter is the winding at
+// which the influence is gone, one more (see gapFieldParams()).
 constexpr bool kGapFadeDefault = true;
-constexpr int kGapFadeWindingsDefault = 5;
-constexpr int kGapFadeWindingsMax = 64;
+constexpr int kGapFadeWindingsDefault = 4;
+constexpr int kGapFadeWindingsMax = 7;
 // Tree item roles beyond the fiber id in Qt::UserRole: an error entry's
 // scene extent - the ring, or both rings of a suspect link, to bring into
 // view (a QRectF, possibly of zero size; unset on every other item).
@@ -777,16 +779,16 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     _gapFadeCheck->setChecked(kGapFadeDefault);
     _gapFadeCheck->setToolTip(
         tr("Fibers on other windings count less the farther away their\n"
-           "winding is, and not at all from this many windings away.\n"
+           "winding is; beyond this many windings away they do not count.\n"
            "Off: every winding within reach counts at its sheet distance."));
     toolBar->addWidget(_gapFadeCheck);
     _gapFadeWindingsSpin = new QSpinBox(toolBar);
-    _gapFadeWindingsSpin->setRange(1, kGapFadeWindingsMax);
+    _gapFadeWindingsSpin->setRange(0, kGapFadeWindingsMax);
     _gapFadeWindingsSpin->setValue(kGapFadeWindingsDefault);
     _gapFadeWindingsSpin->setSuffix(tr(" windings"));
     _gapFadeWindingsSpin->setToolTip(
-        tr("Windings away at which a fiber stops counting\n"
-           "(1: only fibers on the same winding count)."));
+        tr("How many windings away a fiber still counts, on either side\n"
+           "(0: only fibers on the same winding count)."));
     toolBar->addWidget(_gapFadeWindingsSpin);
     toolBar->addSeparator();
     _statusLabel =
@@ -2707,8 +2709,10 @@ vc3d::fiber_map::gaps::GapFieldParams FiberMapWorkspace::gapFieldParams(
         (_gapSaturationSpin ? _gapSaturationSpin->value() : kGapSaturationDefaultCm) * vxPerCm;
     params.acrossWeight = kGapAcrossWeight;
     params.fade = _gapFadeCheck ? _gapFadeCheck->isChecked() : kGapFadeDefault;
+    // The spinbox counts neighbouring windings that still count; the field
+    // wants the first winding that no longer does.
     params.fadeWindings =
-        _gapFadeWindingsSpin ? _gapFadeWindingsSpin->value() : kGapFadeWindingsDefault;
+        (_gapFadeWindingsSpin ? _gapFadeWindingsSpin->value() : kGapFadeWindingsDefault) + 1;
     params.seedInterpolated = true;
     return params;
 }
@@ -2848,7 +2852,7 @@ QString FiberMapWorkspace::gapStatusSuffix() const
         } else if (!_gapField->folded) {
             suffix += tr(" (this winding only: no sheet pitch)");
         } else if (_gapField->faded) {
-            suffix += tr(" (fades by %1 windings)").arg(_gapFieldParams.fadeWindings);
+            suffix += tr(" (fades out beyond %1 windings)").arg(_gapFieldParams.fadeWindings - 1);
         }
         if (_gapField->foldTruncated) {
             suffix += tr(", fold cap reached");
