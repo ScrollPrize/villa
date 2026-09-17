@@ -13,9 +13,10 @@ Layout of this module:
 
 * ``unpinned_map_forward`` / ``unpinned_map_inverse``: ``s_free`` and its inverse over
   a ``[N, K]`` table (the eager ``GapExpandingTransform`` arithmetic).
-* ``pinned_map_forward`` / ``pinned_map_inverse``: the pinned monotone map
-  over padded per-ray anchor lists, with the ordering guard and
-  its diagnostics. Pure tensor functions; the one-ray reference is ``N=1``.
+* ``build_pinned_ray_map``: transparent radius-space blending, a radial
+  slope guard, and a combined table of winding and fractional pin knots.
+* ``pinned_map_forward`` / ``pinned_map_inverse``: one piecewise-linear
+  lookup in that table, in either direction. No nested unpinned evaluation.
 * ``ray_anchors``: rasterised pin lookup: compressed-sparse-row
   cells, per-pin footprints, singular compact kernel, IDW per winding slot.
 * ``PinTable``: the per-step rasterised pin set consumed by
@@ -115,219 +116,238 @@ def unpinned_map_inverse(c, pre_pin_winding_radii, dr, theta_norm):
 
 @dataclasses.dataclass
 class PinnedRayMap:
-    """Per-ray anchor sequence of the pinned map, sorted by ``R``.
+    """One monotone knot table per ray, plus pin-constraint diagnostics.
 
-    All tensors are ``[N, J + 1]``: position 0 is the base anchor
-    ``(R=0, s=s_free(0))``, positions ``1..J`` the sorted anchors (padded
-    entries have ``valid=False``, ``R=+inf`` for the interval search and
-    ``scale=1``).
+    ``canonical_knots`` and ``intermediate_knots`` contain the combined
+    original winding knots and fractional pin knots. Only the first
+    ``knot_counts`` entries of each row are valid. Evaluation in either
+    direction is a single piecewise-linear lookup in this table.
     """
 
-    R: torch.Tensor          # anchor intermediate radius (inf where padded)
-    s_free_at: torch.Tensor  # s_free(R_j) (finite everywhere)
-    s_at: torch.Tensor       # pinned s(R_j)
-    scale: torch.Tensor      # rise_j / free_rise_j on (R_{j-1}, R_j]; 1 past J
-    valid: torch.Tensor      # bool
-    guard_active: torch.Tensor   # bool [N, J+1]; the hard max was binding
-    guard_order: torch.Tensor    # bool; and the target was below the previous anchor
-    weight: torch.Tensor         # anchor kernel mass w_j (0 where padded)
-
-    @property
-    def num_anchors(self):
-        return self.R.shape[-1] - 1
+    canonical_knots: torch.Tensor
+    intermediate_knots: torch.Tensor
+    knot_counts: torch.Tensor
+    anchor_canonical: torch.Tensor
+    anchor_radii: torch.Tensor
+    anchor_valid: torch.Tensor
+    guard_active: torch.Tensor
+    guard_order: torch.Tensor
+    duplicate_conflicts: torch.Tensor
+    base_conflicts: torch.Tensor
 
     def order_violations(self):
-        return (self.guard_active & self.guard_order).sum(dim=-1)
+        return ((self.guard_active & self.guard_order).sum(dim=-1)
+                + self.duplicate_conflicts + self.base_conflicts)
 
     def min_rise_violations(self):
         return (self.guard_active & ~self.guard_order).sum(dim=-1)
 
+    def minimum_winding_gap(self, dr):
+        """Minimum local dR/dc * dr over the final piecewise-linear map."""
+        dc = self.canonical_knots.diff(dim=-1)
+        dR = self.intermediate_knots.diff(dim=-1)
+        valid = torch.arange(dc.shape[-1], device=dc.device)[None] < self.knot_counts[:, None] - 1
+        gap = dr * dR / torch.where(valid, dc, torch.ones_like(dc))
+        return torch.where(valid, gap, torch.full_like(gap, float('inf'))).min(dim=-1).values
 
-def build_pinned_ray_map(pre_pin_winding_radii, dr, theta_norm, anchor_R, anchor_S,
-                         anchor_w, anchor_valid, min_gap):
-    """Resolve the pinned anchors for ``N`` rays.
 
-    ``pre_pin_winding_radii`` ``[N, K]`` pre-pin winding radii; ``anchor_*`` ``[N, J]`` padded
-    per-ray anchors (any order; sorted here by ``R``); ``min_gap`` the gap
-    expander's floor. Returns a :class:`PinnedRayMap`.
+def piecewise_linear_map(query, knot_x, knot_y, knot_counts=None):
+    """Interpolate monotone knot pairs, extrapolating the end segments.
 
-    Write ``u = s_free(r)`` and the correction ``delta(u) = s - u``, piecewise
-    linear in ``u`` between the anchors ``u_j = s_free(R_j)`` and zero at the
-    base ``u_0 = s_free(0)``. Each anchor's correction is a blend of its own
-    target and what its neighbours alone would interpolate at ``u_j``::
-
-        delta_j = w_j (S_j - u_j) + (1 - w_j) lerp(delta_{j-1}, delta_{j+1}; u_j)
-
-    (the last anchor's outer neighbour is itself, so the correction is
-    constant past it). This is a tridiagonal system per ray, solved by the
-    Thomas algorithm. A ``w = 1`` anchor is its target exactly; a ``w = 0``
-    anchor lies on the line between its neighbours and so has no effect on
-    the map for any ``R_j`` (transparent) -- which a forward
-    recursion ``a_j = w_j S_j + (1 - w_j)(s_{j-1} + free_rise_j)`` does not
-    give, since a zero-mass anchor still splits the interval rescale there.
-    The ordering guard applies a hard max in a forward pass::
-
-        s_j = max(u_j + delta_j, s_{j-1} + min_gap * (u_j - u_{j-1}) / dr)
-
-    which is the identity whenever inactive. A coincident pair
-    (``u_j == u_{j-1}``) is an empty interval with ``scale = 1``.
+    Knots are [N, K], queries [N] or [N, M]. Padded rows may supply their
+    valid lengths; each row must have at least two strictly increasing x
+    knots. Interval selection is discrete; all interpolation is differentiable.
     """
-    dtype = pre_pin_winding_radii.dtype
-    num_rays = pre_pin_winding_radii.shape[0]
-    device = pre_pin_winding_radii.device
-    if anchor_R.shape[-1] == 0:
-        anchor_R = anchor_R.new_zeros([num_rays, 0])
-    # Sort by R with padded anchors last.
-    inf = torch.full_like(anchor_R, float('inf'))
-    sort_key = torch.where(anchor_valid, anchor_R.detach(), inf)
-    order = torch.argsort(sort_key, dim=-1, stable=True)
-    R = torch.gather(anchor_R, -1, order)
-    S = torch.gather(anchor_S, -1, order)
-    w = torch.gather(anchor_w, -1, order)
-    valid = torch.gather(anchor_valid, -1, order)
-    # Trim the padding to the longest valid run (one host sync).
-    count = int(valid.sum(dim=-1).max().item()) if valid.numel() else 0
-    R, S, w, valid = R[:, :count], S[:, :count], w[:, :count], valid[:, :count]
+    squeeze = query.dim() == 1
+    if squeeze:
+        query = query[:, None]
+    if knot_counts is None:
+        knot_counts = torch.full(
+            [knot_x.shape[0]], knot_x.shape[1], dtype=torch.long, device=knot_x.device)
+    valid = torch.arange(knot_x.shape[1], device=knot_x.device)[None] < knot_counts[:, None]
+    search_x = torch.where(valid, knot_x.detach(), torch.full_like(knot_x, float('inf')))
+    left = torch.searchsorted(search_x.contiguous(), query.detach().contiguous()) - 1
+    left = torch.minimum(left.clamp(min=0), knot_counts[:, None] - 2)
+    x0, x1 = (torch.gather(knot_x, -1, left + offset) for offset in (0, 1))
+    y0, y1 = (torch.gather(knot_y, -1, left + offset) for offset in (0, 1))
+    result = torch.lerp(y0, y1, (query - x0) / (x1 - x0))
+    return result.squeeze(-1) if squeeze else result
 
-    zero = torch.zeros([num_rays], dtype=dtype, device=device)
-    u0 = unpinned_map_forward(zero, pre_pin_winding_radii, dr, theta_norm)
-    if count == 0:
-        ones = torch.ones([num_rays, 1], dtype=dtype, device=device)
-        return PinnedRayMap(
-            R=zero[:, None], s_free_at=u0[:, None], s_at=u0[:, None], scale=ones,
-            valid=torch.ones([num_rays, 1], dtype=torch.bool, device=device),
-            guard_active=torch.zeros([num_rays, 1], dtype=torch.bool, device=device),
-            guard_order=torch.zeros([num_rays, 1], dtype=torch.bool, device=device),
-            weight=zero[:, None])
 
-    # u_j = s_free(R_j) at finite stand-ins for padded anchors (their rows
-    # decouple below), made non-decreasing with the base so padded / fp-noise
-    # rows never produce a negative interval.
-    R_eval = torch.where(valid, R, torch.zeros_like(R))
-    u = unpinned_map_forward(R_eval, pre_pin_winding_radii, dr, theta_norm)
-    u = torch.where(valid, u, u0[:, None])
-    u = torch.maximum(u, torch.cummax(torch.cat([u0[:, None], u], dim=-1), dim=-1).values[:, :-1])
-    w = torch.where(valid, w, torch.ones_like(w))
-    target_delta = torch.where(valid, S - u, torch.zeros_like(S))
+def _pack_knots(canonical, radii, valid):
+    """Sort and compact knot pairs; at equal coordinates keep the last pair.
 
-    # Neighbour interpolation weights lambda_j (on delta_{j-1}) and
-    # 1 - lambda_j (on delta_{j+1}) at u_j. The last valid anchor's outer
-    # neighbour is itself: lambda = 1.
-    u_prev = torch.cat([u0[:, None], u[:, :-1]], dim=-1)
+    Pin knots are appended after original knots so exact pin coordinates
+    (and their gradients) win when they coincide with an original knot.
+    Padding stays finite; only the lookup's detached search keys use infinity.
+    """
+    order = torch.argsort(torch.where(valid, canonical.detach(), float('inf')), dim=-1, stable=True)
+    canonical, radii, valid = (torch.gather(a, -1, order) for a in (canonical, radii, valid))
+    next_valid = torch.cat([valid[:, 1:], torch.zeros_like(valid[:, :1])], dim=-1)
+    next_c = torch.cat([canonical[:, 1:], canonical[:, -1:]], dim=-1)
+    keep = valid & (~next_valid | (canonical < next_c))
+    order = torch.argsort((~keep).to(torch.int32), dim=-1, stable=True)
+    counts = keep.sum(dim=-1)
+    return torch.gather(canonical, -1, order), torch.gather(radii, -1, order), counts
+
+
+def _merge_equal_targets(R, S, w, valid):
+    """Combine equal canonical targets by support-weighted radius.
+
+    Different radii at exactly the same target cannot both be satisfied by
+    an invertible map. Their disagreement is reported, and zero support
+    contributes neither to the representative radius nor its strength.
+    """
+    order = torch.argsort(torch.where(valid, S.detach(), float('inf')), dim=-1, stable=True)
+    R, S, w, valid = (torch.gather(a, -1, order) for a in (R, S, w, valid))
+    width = S.shape[-1]
+    first = torch.cat([torch.ones_like(valid[:, :1]), S[:, 1:] != S[:, :-1]], dim=-1)
+    group = (first.to(torch.long).cumsum(dim=-1) - 1).clamp(min=0)
+    support = torch.where(valid, w, torch.zeros_like(w))
+    mass = torch.zeros_like(w).scatter_add(1, group, support)
+    total = torch.zeros_like(R).scatter_add(1, group, support * R)
+    members = torch.zeros_like(group).scatter_add(1, group, valid.to(torch.long))
+    indices = torch.arange(width, device=S.device)[None].expand_as(group)
+    ref = torch.zeros_like(group).scatter_reduce(
+        1, group, torch.where(valid, indices, torch.zeros_like(indices)),
+        reduce='amax', include_self=True)
+    target = torch.gather(S, 1, ref)
+    radius = torch.where(members == 1, torch.gather(R, 1, ref), total / mass.clamp(min=torch.finfo(R.dtype).tiny))
+    lo = torch.full_like(R, float('inf')).scatter_reduce(
+        1, group, torch.where(valid, R, float('inf')), reduce='amin', include_self=True)
+    hi = torch.full_like(R, -float('inf')).scatter_reduce(
+        1, group, torch.where(valid, R, -float('inf')), reduce='amax', include_self=True)
+    conflicts = ((members > 1) & (hi > lo)).sum(dim=-1)
+    valid = mass > 0
+    order = torch.argsort((~valid).to(torch.int32), dim=-1, stable=True)
+    count = int(valid.sum(dim=-1).max()) if valid.numel() else 0
+    radius, target, mass, valid = (torch.gather(a, 1, order)[:, :count]
+                                  for a in (radius, target, mass, valid))
+    return radius, target, mass.clamp(max=1.), valid, conflicts
+
+
+def _transparent_radius_corrections(u, desired_radius, weight, valid):
+    """Solve radius corrections in unpinned-radius coordinates, based at 0.
+
+    delta_j = w_j (R_pin_j - u_j) + (1-w_j) lerp(delta_left, delta_right).
+    The outer correction is constant. At zero support a knot is exactly on
+    its neighbours' line, so it neither constrains nor changes the map.
+    """
+    u_prev = torch.cat([torch.zeros_like(u[:, :1]), u[:, :-1]], dim=-1)
     u_next = torch.cat([u[:, 1:], u[:, -1:]], dim=-1)
     next_valid = torch.cat([valid[:, 1:], torch.zeros_like(valid[:, :1])], dim=-1)
     span = u_next - u_prev
-    lam = torch.where(span > 0, (u_next - u) / torch.where(span > 0, span, torch.ones_like(span)),
-                      torch.full_like(span, 0.5))
+    lam = (u_next - u) / torch.where(span > 0, span, torch.ones_like(span))
     lam = torch.where(next_valid, lam, torch.ones_like(lam))
-    coupling = 1. - w
-    sub = -coupling * lam                # multiplies delta_{j-1}
-    sup = -coupling * (1. - lam)         # multiplies delta_{j+1}
-    diag = torch.ones_like(w)
-    rhs = w * target_delta
-
-    # Thomas algorithm, delta_0 = 0 (so the first sub-diagonal term vanishes).
-    diag_p = [diag[:, 0]]
-    rhs_p = [rhs[:, 0]]
-    for j in range(1, count):
-        m = sub[:, j] / diag_p[-1]
-        diag_p.append(diag[:, j] - m * sup[:, j - 1])
-        rhs_p.append(rhs[:, j] - m * rhs_p[-1])
-    deltas = [None] * count
-    deltas[-1] = rhs_p[-1] / diag_p[-1]
-    for j in range(count - 2, -1, -1):
-        deltas[j] = (rhs_p[j] - sup[:, j] * deltas[j + 1]) / diag_p[j]
-    delta = torch.stack(deltas, dim=-1)
-    # A full-weight anchor is its target bit-for-bit, not u + (S - u).
-    s_solved = torch.where(w >= 1., S, u + delta)
-
-    # Ordering guard: hard max, forward pass.
-    min_rise_ratio = float(min_gap) / dr
-    s_cols = [u0]
-    scale_cols = [torch.ones_like(u0)]
-    guard_cols = [torch.zeros_like(valid[:, 0])]
-    order_cols = [torch.zeros_like(valid[:, 0])]
-    s_prev = u0
-    u_prev_col = u0
-    for j in range(count):
-        valid_j = valid[:, j]
-        u_j = u[:, j]
-        free_rise = u_j - u_prev_col
-        min_rise = min_rise_ratio * free_rise
-        candidate = s_solved[:, j]
-        guard = valid_j & (candidate - s_prev < min_rise)
-        s_j = torch.where(guard, s_prev + min_rise, candidate)
-        s_j = torch.where(valid_j, s_j, s_prev)
-        rise = s_j - s_prev
-        positive = free_rise > 0
-        scale = torch.where(positive, rise / torch.where(positive, free_rise, torch.ones_like(free_rise)),
-                            torch.ones_like(rise))
-        s_cols.append(s_j)
-        scale_cols.append(scale)
-        guard_cols.append(guard)
-        order_cols.append(guard & (S[:, j] < s_prev))
-        s_prev = s_j
-        u_prev_col = torch.where(valid_j, u_j, u_prev_col)
-
-    R_full = torch.cat([zero[:, None], torch.where(valid, R, inf[:, :count])], dim=-1)
-    valid_full = torch.cat([torch.ones_like(valid[:, :1]), valid], dim=-1)
-    weight_full = torch.cat([zero[:, None], torch.where(valid, w, torch.zeros_like(w))], dim=-1)
-    return PinnedRayMap(
-        R=R_full,
-        s_free_at=torch.cat([u0[:, None], u], dim=-1),
-        s_at=torch.stack(s_cols, dim=-1),
-        scale=torch.stack(scale_cols, dim=-1),
-        valid=valid_full,
-        guard_active=torch.stack(guard_cols, dim=-1),
-        guard_order=torch.stack(order_cols, dim=-1),
-        weight=weight_full,
-    )
+    w = torch.where(valid, weight, torch.ones_like(weight))
+    sub = -(1. - w) * lam
+    sup = -(1. - w) * (1. - lam)
+    rhs = w * torch.where(valid, desired_radius - u, torch.zeros_like(u))
+    diag = [torch.ones_like(u[:, 0])]
+    values = [rhs[:, 0]]
+    for j in range(1, u.shape[-1]):
+        factor = sub[:, j] / diag[-1]
+        diag.append(1. - factor * sup[:, j - 1])
+        values.append(rhs[:, j] - factor * values[-1])
+    delta = [values[-1] / diag[-1]]
+    for j in range(u.shape[-1] - 2, -1, -1):
+        delta.append((values[j] - sup[:, j] * delta[-1]) / diag[j])
+    delta = torch.stack(delta[::-1], dim=-1)
+    return torch.where(w >= 1., desired_radius, u + delta)
 
 
-def pinned_map_forward(r, pre_pin_winding_radii, dr, theta_norm, ray_map):
-    """``s(r)`` for intermediate radii ``r`` (``[N]`` or ``[N, M]``)."""
-    squeeze = r.dim() == 1
-    if squeeze:
-        r = r[:, None]
-    # idx = number of anchors j >= 1 with R_j < r  ->  interval (R_idx, R_idx+1]
-    idx = torch.searchsorted(ray_map.R[:, 1:].detach().contiguous(), r.detach().contiguous())
-    last = ray_map.R.shape[-1] - 1
-    scale_idx = (idx + 1).clamp(max=last)
-    scale = torch.gather(ray_map.scale, -1, scale_idx)
-    scale = torch.where(idx + 1 <= last, scale, torch.ones_like(scale))
-    s_prev = torch.gather(ray_map.s_at, -1, idx)
-    sf_prev = torch.gather(ray_map.s_free_at, -1, idx)
-    s_free_r = unpinned_map_forward(r, pre_pin_winding_radii, dr, theta_norm)
-    out = s_prev + scale * (s_free_r - sf_prev)
-    return out.squeeze(-1) if squeeze else out
+def build_pinned_ray_map(pre_pin_winding_radii, dr, theta_norm, anchor_R, anchor_S,
+                         anchor_w, anchor_valid, min_gap):
+    """Blend pin radii with the unpinned field and build one radial knot table.
 
+    Pins are ordered by their canonical targets S (which may be fractional
+    windings). At each S, u = R_unpinned(S). A tridiagonal solve blends the
+    desired radius correction R_pin-u with the neighbouring corrections.
+    Original winding knots are then deformed by interpolation in u and
+    combined with the pin knots. Both evaluation directions use this one table.
 
-def pinned_map_inverse(c, pre_pin_winding_radii, dr, theta_norm, ray_map):
-    """``s^{-1}(c)`` for canonical radii ``c`` (``[N]`` or ``[N, M]``).
-
-    Locates the interval by ``searchsorted`` over the anchor values
-    ``s(R_j)``, inverts the affine rescale, then inverts ``s_free``.
+    The guard clips each solved interval's radial slope, then accumulates
+    the extra rise outwards. Splitting an interval with a zero-weight knot
+    therefore does not change the guard or map. The slope floor relative to
+    u is min_gap / dr; diagnostics measure the resulting physical gaps.
+    Conflicts shift subsequent radii outwards; compatible pins remain exact.
     """
-    squeeze = c.dim() == 1
-    if squeeze:
-        c = c[:, None]
-    # s_at is non-decreasing along the anchors; padded anchors repeat s_J, so
-    # push them to +inf for the search.
-    s_search = torch.where(ray_map.valid[:, 1:], ray_map.s_at[:, 1:].detach(),
-                           torch.full_like(ray_map.s_at[:, 1:], float('inf')))
-    idx = torch.searchsorted(s_search.contiguous(), c.detach().contiguous())
-    last = ray_map.R.shape[-1] - 1
-    scale_idx = (idx + 1).clamp(max=last)
-    scale = torch.gather(ray_map.scale, -1, scale_idx)
-    scale = torch.where(idx + 1 <= last, scale, torch.ones_like(scale))
-    # scale == 0 only for a coincident pair whose targets jump; such a c has
-    # no preimage interval, so land on the anchor.
-    safe_scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    s_prev = torch.gather(ray_map.s_at, -1, idx)
-    sf_prev = torch.gather(ray_map.s_free_at, -1, idx)
-    s_free_c = sf_prev + (c - s_prev) / safe_scale
-    out = unpinned_map_inverse(s_free_c, pre_pin_winding_radii, dr, theta_norm)
-    return out.squeeze(-1) if squeeze else out
+    num_rays, num_windings = pre_pin_winding_radii.shape
+    device = pre_pin_winding_radii.device
+    canonical = (torch.arange(num_windings, device=device, dtype=pre_pin_winding_radii.dtype)[None]
+                 + theta_norm[:, None]) * dr
+    zero = torch.zeros_like(theta_norm)
+    base_c = unpinned_map_forward(zero, pre_pin_winding_radii, dr, theta_norm)
+    supported = anchor_valid & (anchor_w > 0)
+    base_conflicts = (supported & ((anchor_S < base_c[:, None])
+                                   | ((anchor_S == base_c[:, None]) & (anchor_R != 0)))).sum(dim=-1)
+    valid = supported & (anchor_S > base_c[:, None])
+    if anchor_S.shape[-1]:
+        R, S, w, valid, duplicate_conflicts = _merge_equal_targets(
+            anchor_R, anchor_S, anchor_w, valid)
+    else:
+        R, S, w = anchor_R, anchor_S, anchor_w
+        duplicate_conflicts = torch.zeros_like(base_conflicts)
+    if S.shape[-1] == 0:
+        empty = torch.zeros([num_rays, 0], dtype=torch.bool, device=device)
+        return PinnedRayMap(
+            canonical, pre_pin_winding_radii,
+            torch.full([num_rays], num_windings, dtype=torch.long, device=device),
+            S, R, empty, empty, empty, duplicate_conflicts, base_conflicts)
+
+    S = torch.where(valid, S, base_c[:, None])
+    u = unpinned_map_inverse(S, pre_pin_winding_radii, dr, theta_norm)
+    u = torch.where(valid, u, torch.zeros_like(u))
+    solved = _transparent_radius_corrections(u, R, w, valid)
+    prev_u = torch.cat([zero[:, None], u[:, :-1]], dim=-1)
+    prev_radius = torch.cat([zero[:, None], solved[:, :-1]], dim=-1)
+    rise = solved - prev_radius
+    min_ratio = float(min_gap) / dr
+    min_rise = min_ratio * (u - prev_u)
+    guard = valid & (rise < min_rise)
+    extra = torch.where(guard, min_rise - rise, torch.zeros_like(rise)).cumsum(dim=-1)
+    resolved = solved + extra
+    corrections = resolved - u
+
+    # One outer knot beyond all winding and pin knots makes extrapolation
+    # retain the unpinned outer slope. Below the fixed origin, retain the
+    # original inner slope as well.
+    num_anchors = valid.sum(dim=-1)
+    last_idx = (num_anchors - 1).clamp(min=0)[:, None]
+    last_S = torch.where(num_anchors > 0, torch.gather(S, 1, last_idx).squeeze(1), base_c)
+    last_delta = torch.where(num_anchors > 0, torch.gather(corrections, 1, last_idx).squeeze(1), zero)
+    outer_c = torch.maximum(canonical[:, -1], last_S) + dr
+    outer_u = unpinned_map_inverse(outer_c, pre_pin_winding_radii, dr, theta_norm)
+    correction_x, correction_y, correction_counts = _pack_knots(
+        torch.cat([zero[:, None], u, outer_u[:, None]], dim=-1),
+        torch.cat([zero[:, None], corrections, last_delta[:, None]], dim=-1),
+        torch.cat([torch.ones_like(valid[:, :1]), valid, torch.ones_like(valid[:, :1])], dim=-1))
+    inner_c = base_c - dr
+    all_c = torch.cat([canonical, inner_c[:, None], base_c[:, None], outer_c[:, None], S], dim=-1)
+    unpinned_radii = unpinned_map_inverse(all_c, pre_pin_winding_radii, dr, theta_norm)
+    delta = piecewise_linear_map(unpinned_radii, correction_x, correction_y, correction_counts)
+    delta = torch.where(unpinned_radii < 0, torch.zeros_like(delta), delta)
+    radii = unpinned_radii + delta
+    # Retain exact resolved pin values and the fixed origin, including their
+    # gradients, instead of reconstructing them with subtract/add arithmetic.
+    radii = torch.cat([radii[:, :num_windings + 1], zero[:, None],
+                       radii[:, num_windings + 2:num_windings + 3], resolved], dim=-1)
+    all_valid = torch.cat([torch.ones_like(all_c[:, :num_windings + 3], dtype=torch.bool), valid], dim=-1)
+    canonical_knots, intermediate_knots, counts = _pack_knots(all_c, radii, all_valid)
+    return PinnedRayMap(canonical_knots, intermediate_knots, counts, S, resolved, valid,
+                        guard, valid & (rise <= 0), duplicate_conflicts, base_conflicts)
+
+
+def pinned_map_forward(r, ray_map):
+    """Intermediate -> canonical radius through one combined knot table."""
+    return piecewise_linear_map(r, ray_map.intermediate_knots, ray_map.canonical_knots,
+                                ray_map.knot_counts)
+
+
+def pinned_map_inverse(c, ray_map):
+    """Canonical -> intermediate radius through the same knot table."""
+    return piecewise_linear_map(c, ray_map.canonical_knots, ray_map.intermediate_knots,
+                                ray_map.knot_counts)
 
 
 # ---------------------------------------------------------------------------

@@ -283,10 +283,11 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
 class PinnedGapExpandingTransform(GapExpandingTransform):
     """Gap expander whose winding radii are pinned.
 
-    The free map ``s_free`` is the parent class's table; ``pin_table``
-    (:class:`pins.PinTable`) supplies per-ray anchors that the pinned monotone
-    map passes through exactly (unless the ordering guard fires). The fused
-    Triton path is bypassed: every call runs the eager pinned arithmetic,
+    The parent's winding radii are blended with constraints from ``pin_table``
+    (:class:`pins.PinTable`) in intermediate-radius space. The resulting
+    combined knot table serves both directions, with exact full-strength
+    pins unless constraints conflict. The fused Triton path is bypassed:
+    every call runs the eager pinned arithmetic,
     chunked over points to bound the ``[chunk, windings]`` intermediates.
     """
 
@@ -299,13 +300,12 @@ class PinnedGapExpandingTransform(GapExpandingTransform):
         return False
 
     def ray_map(self, theta, z):
-        """The pre-pin winding radii and resolved pinned anchors per query ray."""
+        """Build the combined canonical/intermediate knot table per query ray."""
         pre_pin_winding_radii = self.get_transformed_winding_radii(theta, z)
         R, S, w, valid = self.pin_table.anchors(theta, z)
-        ray_map = pins_module.build_pinned_ray_map(
-            pre_pin_winding_radii, self.dr_per_winding, theta / (2 * torch.pi), R, S, w, valid,
-            self.min_gap)
-        return pre_pin_winding_radii, ray_map
+        return pins_module.build_pinned_ray_map(
+            pre_pin_winding_radii, self.dr_per_winding, theta / (2 * torch.pi),
+            R, S, w, valid, self.min_gap)
 
     def _radial(self, input_zyx, inverse):
         flat = input_zyx.reshape(-1, 3)
@@ -314,16 +314,13 @@ class PinnedGapExpandingTransform(GapExpandingTransform):
             chunk = flat[start:start + self.chunk_size]
             theta, radius, _ = get_theta_and_radii(chunk[..., 1:], self.dr_per_winding)
             z = chunk[..., 0]
-            pre_pin_winding_radii, ray_map = self.ray_map(theta, z)
-            theta_norm = theta / (2 * torch.pi)
+            ray_map = self.ray_map(theta, z)
             if inverse:
                 # intermediate -> canonical
-                mapped = pins_module.pinned_map_forward(
-                    radius, pre_pin_winding_radii, self.dr_per_winding, theta_norm, ray_map)
+                mapped = pins_module.pinned_map_forward(radius, ray_map)
             else:
                 # canonical -> intermediate
-                mapped = pins_module.pinned_map_inverse(
-                    radius, pre_pin_winding_radii, self.dr_per_winding, theta_norm, ray_map)
+                mapped = pins_module.pinned_map_inverse(radius, ray_map)
             delta_radius = mapped - radius
             outward_direction = torch.cat([
                 torch.zeros_like(chunk[..., :1]),
@@ -357,17 +354,16 @@ class PinnedGapExpandingTransform(GapExpandingTransform):
         for start in range(0, pins.shape[0], chunk_size):
             chunk = pins[start:start + chunk_size]
             z, theta, r, r_target_shifted = chunk.unbind(-1)
-            pre_pin_winding_radii, ray_map = self.ray_map(theta, z)
+            ray_map = self.ray_map(theta, z)
             theta_norm = theta / (2 * torch.pi)
-            s = pins_module.pinned_map_forward(r, pre_pin_winding_radii, self.dr_per_winding, theta_norm, ray_map)
+            s = pins_module.pinned_map_forward(r, ray_map)
             residuals.append((s - (r_target_shifted + self.dr_per_winding * theta_norm)).abs())
             order_violations += int(ray_map.order_violations().sum())
             min_rise_violations += int(ray_map.min_rise_violations().sum())
-            rays_with_violation += int(ray_map.guard_active.any(dim=-1).sum())
-            anchors_total += int(ray_map.valid[:, 1:].sum())
-            free_gap_min = pre_pin_winding_radii.diff(dim=-1).min(dim=-1).values
-            scale_max = ray_map.scale.max(dim=-1).values
-            min_effective_gap = min(min_effective_gap, float((free_gap_min / scale_max).min()))
+            rays_with_violation += int(((ray_map.order_violations() + ray_map.min_rise_violations()) > 0).sum())
+            anchors_total += int(ray_map.anchor_valid.sum())
+            min_effective_gap = min(
+                min_effective_gap, float(ray_map.minimum_winding_gap(self.dr_per_winding).min()))
         residual = torch.cat(residuals) if residuals else pins.new_zeros([0])
         num_pins = int(pins.shape[0])
         dr = float(self.dr_per_winding.detach())

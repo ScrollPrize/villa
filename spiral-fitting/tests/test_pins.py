@@ -81,11 +81,11 @@ def _ray_map(table, theta, R, S, w, valid=None, dr=DR, min_gap=MIN_GAP):
 
 
 def _forward(r, table, theta, ray_map, dr=DR):
-    return pinned_map_forward(r, table, torch.as_tensor(dr), theta / TWO_PI, ray_map)
+    return pinned_map_forward(r, ray_map)
 
 
 def _inverse(c, table, theta, ray_map, dr=DR):
-    return pinned_map_inverse(c, table, torch.as_tensor(dr), theta / TWO_PI, ray_map)
+    return pinned_map_inverse(c, ray_map)
 
 
 def _free(r, table, theta, dr=DR):
@@ -104,9 +104,9 @@ def test_pinned_map_exact_on_pins():
     table = _free_table(num_rays, theta, gen)
     # Consistent pins: increasing R and increasing S, w = 1.
     J = 5
-    R = torch.sort(20 + torch.rand(num_rays, J, generator=gen) * 140, dim=-1).values
+    R = torch.sort(20 + torch.rand(num_rays, J, generator=gen) * 140, dim=-1).values + torch.arange(J)[None] * 5.
     S = torch.sort(10 + torch.rand(num_rays, J, generator=gen) * 160, dim=-1).values
-    # Keep targets spaced by more than the min rise can demand.
+    # Both radius and target sequences have separated knots.
     S = S + torch.arange(J)[None, :] * 4.0
     w = torch.ones(num_rays, J)
     ray_map = _ray_map(table, theta, R, S, w)
@@ -123,39 +123,40 @@ def test_pinned_map_exact_on_pins():
 def _hand_count_guard(table_row, theta_row, R, S, w, dr=DR, min_gap=MIN_GAP):
     """Reference one-ray solution in plain numpy: the tridiagonal blend
     (see pins.build_pinned_ray_map) followed by the hard-max ordering guard."""
-    order = np.argsort(R, kind='stable')
+    order = np.argsort(S, kind='stable')
     R, S, w = R[order], S[order], w[order]
-    sfree = lambda r: float(_free(torch.tensor([r]), table_row[None], theta_row[None])[0])
+    canonical = dr * (np.arange(len(table_row)) + float(theta_row) / TWO_PI)
+    left = np.searchsorted(canonical, S) - 1
+    left = np.clip(left, 0, len(canonical) - 2)
+    radii = table_row.numpy()
+    u = radii[left] + (S - canonical[left]) / dr * (radii[left + 1] - radii[left])
     J = len(R)
-    u0 = sfree(0.0)
-    u = np.asarray([sfree(r) for r in R])
+    u0 = 0.0
     u_prev = np.concatenate([[u0], u[:-1]])
     u_next = np.concatenate([u[1:], u[-1:]])
     lam = np.where(u_next > u_prev, (u_next - u) / np.where(u_next > u_prev, u_next - u_prev, 1.0), 0.5)
     lam[-1] = 1.0
     A = np.eye(J)
-    b = w * (S - u)
+    b = w * (R - u)
     for j in range(J):
         if j > 0:
             A[j, j - 1] = -(1 - w[j]) * lam[j]
         if j + 1 < J:
             A[j, j + 1] = -(1 - w[j]) * (1 - lam[j])
     delta = np.linalg.solve(A, b)
-    s_prev, u_prev_v = u0, u0
-    s_at, violations, causes = [], 0, []
+    solved = np.where(w == 1, R, u + delta)
+    prev_radius, prev_u, extra = 0.0, 0.0, 0.0
+    result, violations, causes = [], 0, []
     for j in range(J):
-        free_rise = u[j] - u_prev_v
-        min_rise = min_gap * free_rise / dr
-        candidate = u[j] + delta[j]
-        if candidate - s_prev < min_rise:
+        rise = solved[j] - prev_radius
+        min_rise = min_gap * (u[j] - prev_u) / dr
+        if rise < min_rise:
             violations += 1
-            causes.append('order' if S[j] < s_prev else 'min_rise')
-            s_new = s_prev + min_rise
-        else:
-            s_new = candidate
-        s_at.append(s_new)
-        s_prev, u_prev_v = s_new, u[j]
-    return np.asarray(s_at), violations, causes, order
+            causes.append('order' if rise <= 0 else 'min_rise')
+            extra += min_rise - rise
+        result.append(solved[j] + extra)
+        prev_radius, prev_u = solved[j], u[j]
+    return np.asarray(result), violations, causes, order
 
 
 def test_pinned_map_monotone():
@@ -181,29 +182,27 @@ def test_pinned_map_monotone():
         assert int(ray_map.guard_active[i].sum()) == violations
         assert int(ray_map.order_violations()[i]) == causes.count('order')
         assert int(ray_map.min_rise_violations()[i]) == causes.count('min_rise')
-        # Anchors not touched by the guard with w == 1 are exact; every anchor
-        # value matches the hand recursion bit-for-bit up to fp association.
-        got = ray_map.s_at[i, 1:].numpy()
+        # Full-strength pins before any guarded interval remain exact;
+        # every radius agrees with the independent dense-system reference.
+        got = ray_map.anchor_radii[i].numpy()
         assert np.allclose(got, s_at, atol=1e-9)
         for j in range(J):
-            if not ray_map.guard_active[i, j + 1] and w[i, order[j]] == 1.0:
-                assert abs(got[j] - S[i, order[j]].item()) < 1e-9
+            if not ray_map.guard_active[i, :j + 1].any() and w[i, order[j]] == 1.0:
+                assert abs(got[j] - R[i, order[j]].item()) < 1e-9
 
 
-def test_hard_max_leaves_non_violating_anchors_bit_identical():
+def test_radius_guard_leaves_compatible_rays_bit_identical():
     gen = torch.Generator().manual_seed(3)
     theta = torch.rand(8, generator=gen) * TWO_PI
     table = _free_table(8, theta, gen)
-    R = torch.sort(20 + torch.rand(8, 4, generator=gen) * 140, dim=-1).values
-    S = torch.sort(10 + torch.rand(8, 4, generator=gen) * 160, dim=-1).values + torch.arange(4)[None] * 5.
-    w = torch.ones(8, 4)
-    # Force one violation on ray 0 by swapping its last two targets far apart.
-    S[0, 3] = S[0, 2] - 30.0
-    ray_map = _ray_map(table, theta, R, S, w)
+    S = torch.tensor([[30., 70., 100., 130.]]).expand(8, -1).clone()
+    R = unpinned_map_inverse(S, table, torch.tensor(DR), theta / TWO_PI) + 10.
+    # One reversed radial interval; the other rays are all compatible.
+    R[0, 3] = R[0, 2] - 20.
+    ray_map = _ray_map(table, theta, R, S, torch.ones_like(R))
     assert int(ray_map.guard_active[0].sum()) == 1
     assert int(ray_map.guard_active[1:].sum()) == 0
-    # Non-violating anchors are exactly their targets (no smoothing leak).
-    assert torch.equal(ray_map.s_at[1:, 1:], S[1:])
+    assert torch.equal(ray_map.anchor_radii[1:], R[1:])
 
 
 # ---------------------------------------------------------------------------
@@ -243,52 +242,37 @@ def test_anchor_crossing_matrix():
     assert (s[1:] - s[:-1]).abs().max() < 0.6 * float(sweep[1] - sweep[0]) + 1e-9
     assert (_forward(R, table, theta, ray_map) - S).abs().max() < 1e-9
 
-    # (ii) targets out of order: S_a = 90 fixed, S_b = 70 fixed; when b passes
-    # beyond a in R the sorted targets decrease -> guard fires ('order'),
-    # and s jumps by about S_a - S_b at the crossing.
+    # (ii) Fixed canonical targets: moving the observed radii through one
+    # another no longer reorders the knots. The radius guard activates
+    # continuously as their separation shrinks, without a winding jump.
     s, ray_map = _two_anchor_sweep(90.0, 70.0, 1.0, 1.0, sweep)
-    before = sweep < 80.0
-    after = sweep > 80.0
-    assert int(ray_map.order_violations()[before].sum()) == 0
-    assert torch.all(ray_map.order_violations()[after] == 1)
-    assert int(ray_map.min_rise_violations().sum()) == 0
-    # Just after the crossing, s(R_b) is forced up from S_b to ~S_a (plus the
-    # min rise): the map jumps by about S_a - S_b at the crossing.
-    idx_after = int(torch.nonzero(after)[0])
-    idx_before = idx_after - 2   # sweep hits R_a exactly in between; skip the coincident position
-    theta = torch.zeros(len(sweep))
-    table = _identity_table(len(sweep), theta)
-    s_at_b = _forward(sweep[:, None], table, theta, ray_map)[:, 0]
-    assert abs(float(s_at_b[idx_before]) - 70.0) < 1e-9
-    jump = float(s_at_b[idx_after] - s_at_b[idx_before])
-    assert abs(jump - (90.0 - 70.0)) < 3.0
+    assert int(ray_map.order_violations()[sweep < 80.0].sum()) == 0
+    assert torch.all(ray_map.order_violations()[sweep >= 80.0] == 1)
+    radii = ray_map.anchor_radii
+    assert (radii[1:] - radii[:-1]).abs().max() <= float(sweep[1] - sweep[0]) + 1e-9
+    assert torch.all(radii.diff(dim=-1) > 0)
+    assert torch.isfinite(s).all()
 
-    # (iii) equal targets, unequal weights: the jump across the crossing is
-    # bounded by |w_a - w_b| * |S - a_free|; a guard firing is counted.
-    w_a, w_b = 1.0, 0.95
-    s, ray_map = _two_anchor_sweep(80.0, 80.0, w_a, w_b, sweep)
-    idx_after = int(torch.nonzero(sweep > 80.0)[0])
-    s_before, s_after = s[idx_after - 2], s[idx_after]
-    a_free_gap = float(sweep[idx_after] - 80.0)  # identity free map
-    bound = abs(w_a - w_b) * (abs(80.0 - 80.0) + a_free_gap) + 2 * float(sweep[1] - sweep[0]) + MIN_GAP
-    assert float((s_after - s_before).abs().max()) <= bound
-    for i in range(len(sweep)):
-        S_sorted = ray_map.s_at[i]
-        assert torch.isfinite(S_sorted).all()
+    # (iii) Equal canonical targets are merged: a weighted radius and one
+    # knot, with incompatible observations reported rather than a jump.
+    s, ray_map = _two_anchor_sweep(80.0, 80.0, 1.0, 0.95, sweep)
+    expected = (80.0 + 0.95 * sweep) / 1.95
+    assert torch.allclose(ray_map.anchor_radii[:, 0], expected)
+    assert torch.equal(ray_map.duplicate_conflicts > 0, sweep != 80.0)
+    assert torch.isfinite(s).all()
 
-    # (iv) exactly coincident R (free_rise = 0): finite, monotone, no NaN.
+    # (iv) Equal observed radii at distinct targets require a minimum radial
+    # separation, leaving a finite, strictly invertible map.
     theta = torch.zeros(1)
     table = _identity_table(1, theta)
     R = torch.tensor([[80.0, 80.0]])
     S = torch.tensor([[80.0, 84.0]])
-    w = torch.ones(1, 2)
-    ray_map = _ray_map(table, theta, R, S, w)
+    ray_map = _ray_map(table, theta, R, S, torch.ones(1, 2))
     grid = torch.linspace(1.0, 180.0, 400)[None]
     s = _forward(grid, table, theta, ray_map)
     assert torch.isfinite(s).all()
-    assert torch.all(s.diff(dim=-1) >= 0)
-    inv = _inverse(s, table, theta, ray_map)
-    assert torch.isfinite(inv).all()
+    assert torch.all(s.diff(dim=-1) > 0)
+    assert torch.allclose(_inverse(s, table, theta, ray_map), grid)
 
 
 # ---------------------------------------------------------------------------
@@ -519,7 +503,7 @@ def test_pin_lookup_continuity():
     s, ray_map, _ = _map_at(seam, thetas, 50.0, grid)
     assert (s[0] - s[1]).abs().max() < 1e-2
     # The pin is reached from the wrapped side too.
-    assert bool(ray_map.valid[0, 1])
+    assert bool(ray_map.anchor_valid[0, 0])
 
     # Zero-mass slots are never divided (no NaN/inf under anomaly detection).
     with torch.autograd.detect_anomaly():
@@ -535,7 +519,7 @@ def test_pin_lookup_continuity():
 
     # Outside every footprint: equals the free map.
     s, ray_map, free_table = _map_at(table_obj, torch.tensor([3.0]), 50.0, grid)
-    assert torch.equal(s, _free(grid[None], free_table, torch.tensor([3.0])))
+    torch.testing.assert_close(s, _free(grid[None], free_table, torch.tensor([3.0])), rtol=0, atol=1e-12)
 
 
 def test_pin_grid_between_pins_stays_near_targets():
@@ -729,3 +713,121 @@ def test_robust_integer_offsets_isolates_the_wrong_edge():
     assert n.tolist() == [0, 1, 2, 3, 4, 5]
     assert [k for k, _ in inconsistent] == [3]
     assert inconsistent[0][1] == -1
+
+
+@pytest.mark.parametrize('guarded', [False, True])
+@pytest.mark.parametrize('target', [20., 60., 120., 240.])
+def test_fading_pin_is_transparent_even_with_ordering_guard(guarded, target):
+    theta = torch.tensor([0.4])
+    table = _free_table(1, theta, torch.Generator().manual_seed(91))
+    S = torch.tensor([[40., 90.]])
+    R = torch.tensor([[55., 30. if guarded else 110.]])
+    base = _ray_map(table, theta, R, S, torch.ones_like(R))
+    queries = torch.linspace(-30., 350., 901)[None]
+    baseline = _inverse(queries, table, theta, base)
+    errors = []
+    for weight in (1e-3, 1e-6, 1e-9, 0.):
+        extended = _ray_map(
+            table, theta, torch.cat([R, torch.tensor([[180.]])], dim=-1),
+            torch.cat([S, torch.tensor([[target]])], dim=-1),
+            torch.tensor([[1., 1., weight]]))
+        actual = _inverse(queries, table, theta, extended)
+        errors.append(float((actual - baseline).abs().max()))
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(_forward(actual, table, theta, extended), queries,
+                                   atol=1e-9, rtol=0)
+    assert errors[1] < max(errors[0] * 0.01, 1e-10)
+    assert errors[2] < 1e-5
+    assert errors[3] < 1e-10
+
+
+def test_single_pin_blends_radii_not_canonical_corrections():
+    theta = torch.zeros(1)
+    table = _identity_table(1, theta)
+    # Halfway between the unpinned radius 64 and observed radius 96 is 80.
+    ray_map = _ray_map(table, theta, torch.tensor([[96.]]),
+                       torch.tensor([[64.]]), torch.tensor([[0.5]]))
+    assert float(pinned_map_inverse(torch.tensor([64.]), ray_map)) == 80.
+    assert float(pinned_map_forward(torch.tensor([80.]), ray_map)) == 64.
+
+
+def test_combined_knots_preserve_gap_shape_and_outer_extrapolation():
+    theta = torch.zeros(1)
+    table = torch.tensor([[0., 10., 30., 40.]])
+    ray_map = _ray_map(table, theta, torch.tensor([[80., 120.]]),
+                       torch.tensor([[48., 80.]]), torch.ones(1, 2))
+    # Pin 48->80 doubles the original gaps (10,20,10), retaining their ratio.
+    expected = torch.tensor([[0., 20., 60., 80., 120., 140.]])
+    query = torch.tensor([[0., 16., 32., 48., 80., 112.]])
+    torch.testing.assert_close(pinned_map_inverse(query, ray_map), expected, rtol=0, atol=1e-12)
+    # The outer pin lies beyond the original table. Beyond it, the original
+    # outer slope 10/16 must return, not the preceding pin interval's slope.
+    assert float(pinned_map_inverse(torch.tensor([-16.]), ray_map)) == -10.
+    torch.testing.assert_close(pinned_map_forward(expected, ray_map), query, rtol=0, atol=1e-12)
+
+
+def test_padded_and_duplicate_knots_have_finite_gradients():
+    theta = torch.tensor([0., 0.3, 0.8])
+    table = _free_table(3, theta, torch.Generator().manual_seed(5)).requires_grad_()
+    R = torch.tensor([[70., 70., 90.], [40., 90., 150.], [20., 40., 60.]], requires_grad=True)
+    # First row has duplicate targets and a target on an original winding.
+    # Second has fewer pins, third has no supported pins in the same batch.
+    S = torch.tensor([[64., 64., 100.], [32., 80., 150.], [16., 32., 48.]], requires_grad=True)
+    w = torch.tensor([[1., 1., 0.8], [0.7, 0., 0.], [0., 0., 0.]], requires_grad=True)
+    m = _ray_map(table, theta, R, S, w)
+    q = torch.tensor([[12., 65., 220.]]).expand(3, -1)
+    actual = pinned_map_inverse(q, m)
+    torch.testing.assert_close(pinned_map_forward(actual, m), q, atol=1e-9, rtol=0)
+    torch.testing.assert_close(actual[2], unpinned_map_inverse(q, table, torch.tensor(DR), theta / TWO_PI)[2])
+    actual.sum().backward()
+    for tensor in (table, R, S, w):
+        assert tensor.grad is not None and torch.isfinite(tensor.grad).all()
+
+
+def test_pinned_evaluation_only_searches_combined_knots():
+    from unittest.mock import patch
+    theta = torch.zeros(1)
+    m = _ray_map(_identity_table(1, theta), theta,
+                 torch.tensor([[75.]]), torch.tensor([[64.]]), torch.ones(1, 1))
+    with patch.object(torch, 'searchsorted', wraps=torch.searchsorted) as search:
+        c = pinned_map_forward(torch.tensor([80.]), m)
+        assert search.call_count == 1
+        pinned_map_inverse(c, m)
+        assert search.call_count == 2
+
+
+def test_float32_target_crossing_original_knot_is_continuous():
+    theta = torch.zeros(3, dtype=torch.float32)
+    table = _identity_table(3, theta).float()
+    S = torch.tensor([[64. - 1e-4], [64.], [64. + 1e-4]], dtype=torch.float32, requires_grad=True)
+    R = torch.full_like(S, 70., requires_grad=True)
+    m = _ray_map(table, theta, R, S, torch.ones_like(S))
+    q = torch.tensor([[40., 70., 90.]], dtype=torch.float32).expand(3, -1)
+    c = pinned_map_forward(q, m)
+    assert torch.isfinite(c).all()
+    assert (c[1:] - c[:-1]).abs().max() < 2e-4
+    torch.testing.assert_close(pinned_map_inverse(c, m), q, atol=2e-5, rtol=0)
+    c.sum().backward()
+    assert torch.isfinite(S.grad).all() and torch.isfinite(R.grad).all()
+
+
+@pytest.mark.parametrize('weight', [0., 1e-9, 0.5, 1.])
+def test_duplicate_target_with_fading_support(weight):
+    theta = torch.zeros(1)
+    table = _identity_table(1, theta)
+    R = torch.tensor([[70., 120.]])
+    S = torch.tensor([[64., 64.]])
+    m = _ray_map(table, theta, R, S, torch.tensor([[1., weight]]))
+    expected = (70. + weight * 120.) / (1. + weight)
+    torch.testing.assert_close(pinned_map_inverse(torch.tensor([64.]), m),
+                               torch.tensor([expected]), rtol=0, atol=1e-12)
+
+
+def test_origin_constraints_report_only_incompatible_pins():
+    theta = torch.zeros(1)
+    table = _identity_table(1, theta)
+    m = _ray_map(table, theta, torch.tensor([[0., 10., 20., 80.]]),
+                 torch.tensor([[0., 0., -10., 64.]]), torch.ones(1, 4))
+    assert int(m.base_conflicts[0]) == 2
+    assert float(pinned_map_inverse(torch.tensor([0.]), m)) == 0.
+    assert float(pinned_map_inverse(torch.tensor([64.]), m)) == 80.

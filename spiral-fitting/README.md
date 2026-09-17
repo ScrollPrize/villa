@@ -998,3 +998,57 @@ gradient of the fitted winding, `fit_spiral.inward_winding_direction`), and the
 fiber training views are re-materialised. A checkpoint from before that step
 loaded after the switch relinks back under the umbilicus direction at its first
 step.
+
+## Pinned radial maps
+
+`model_pins_enabled` enables annotation-derived constraints on the gap
+expander. `model_pins_warmup_steps` sets the absolute activation iteration;
+`sample_count_pins` limits the training subset (0 uses every pin), while export
+uses the full registry.
+
+For each query ray `(theta, z)`, spatial kernel weights produce pin radii and
+canonical targets, including fractional winding targets. The construction
+orders these constraints by canonical target and solves for **intermediate
+radius corrections** relative to the unpinned radius field. A full-strength
+constraint requests the observed pin radius; a fading constraint follows the
+correction interpolated from its neighbours. Consequently, a constraint with
+vanishing support disappears continuously instead of pulling the map back to
+the unpinned field at its location.
+
+A radial slope guard clips each solved interval's rise, accumulating any
+required extra rise outwards. Its minimum slope relative to the unpinned
+radius is `model_gap_expander_min_gap / dr`; this is not an absolute physical
+winding-gap guarantee. `pin_min_effective_gap` measures the minimum local
+`dR/dc * dr` of the final map. Guarding interval slopes makes the result
+independent of splitting an interval with a zero-strength constraint. Equal
+canonical targets are merged by support-weighted radius; conflicting radii
+and supported targets at or below the fixed origin are reported as ordering
+violations. Such conflicting constraints cannot all be exact.
+
+The original winding knots are deformed between the resolved pin knots,
+preserving the relative unpinned gap pattern. They are combined with the
+fractional pin knots into a single canonical/intermediate-radius table. Each
+forward or inverse evaluation then uses one search and linear interpolation;
+it does not evaluate an unpinned map followed by a correction map. Outside the
+outermost pin the unpinned outer slope is retained; below the fixed origin the
+unpinned inner map is retained.
+
+This radius-space parameterization changes pinned interpolation between
+annotations and the response to conflicts compared with the earlier
+canonical-coordinate correction map. Existing checkpoint parameters and pin
+registries still load, but an already pinned checkpoint is evaluated with the
+new mapping. Unpinned transforms are unchanged. No speedup is assumed from
+this representation change.
+
+Validate the synthetic radial maps and full CPU transform chain with:
+
+```bash
+AGENTS_AGENT_MODE=1 .venv/bin/python -m pytest -q \
+  tests/test_pins.py tests/test_pins_transform.py \
+  tests/test_checkpoint_load.py tests/test_flatten_spiral_checkpoint.py
+```
+
+The tests cover radius blending, pin exactness, vanishing support with and
+without active guards, duplicate and fractional knots, extrapolation,
+monotonicity, round trips, finite gradients, numerical gradient checks,
+angular seams, and checkpoint resume.
