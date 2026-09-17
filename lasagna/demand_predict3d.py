@@ -11,21 +11,43 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import itertools
 import heapq
+import faulthandler
 import json
 import math
+import mmap
 import os
 from pathlib import Path
 import shutil
 import tempfile
 import multiprocessing as mp
 import queue
+import re
+import threading
 import time
 
 import numpy as np
+import torch
 
 from lasagna import tiled_predict3d as tiled
 from lasagna.inference_provenance import atomic_write
 from lasagna.inference_profiling import stage_timing
+
+
+# Ext4 with 4 KiB blocks rejects individual files at 16 TiB, and many
+# concurrent publication threads cannot safely map multi-terabyte extents even
+# when those files are sparse. Keep each temporary accumulator shard at most
+# 128 GiB where whole-plane boundaries permit while retaining one logical
+# full-volume array in the shared descriptor. An indivisible plane may exceed
+# that target, but remains bounded well below ext4's 16-TiB limit.
+MMAP_SHARD_TARGET_BYTES = 128 << 30
+MAX_MMAP_FILE_BYTES = 8 << 40
+
+
+@dataclass(frozen=True)
+class _MmapHandle:
+    paths: tuple[str, ...]
+    shard_axis0_sizes: tuple[int, ...]
+    dtype: str
 
 
 def cache_identity(identity, geometry, accumulator_dtype, accumulator_layout, accumulator_prefault):
@@ -132,7 +154,9 @@ class DemandStore:
         if self.dtype not in (np.dtype("float16"), np.dtype("float32")):
             self.lock.close()
             raise ValueError("accumulator dtype must match sequential float16/float32")
-        self.scratch_dirs, self.arrays, self.accumulators = [], [], {}
+        self.scratch_dirs, self.accumulators = [], {}
+        self.arena_key = "sync"
+        self._sync_arena = self._sync_publication = self._sync_record_spec = None
         self.tiles, self.chunks, self.priorities = {}, {}, {}
         self._pending_priorities = []
         self.publications = deque()
@@ -146,7 +170,6 @@ class DemandStore:
                 raise ValueError("legacy database-only inference cache; use a fresh cache root (old files untouched)")
             if identity_path.exists() and json.loads(identity_path.read_text()) != encoded:
                 raise ValueError("cache inference identity mismatch")
-            allowed = set()
             for product in self.products:
                 for channel in product.channels:
                     Path(channel.relative_path).resolve().relative_to(self.root.resolve())
@@ -160,29 +183,9 @@ class DemandStore:
                             with os.scandir(level) as entries:
                                 if any(e.name not in {".zarray", ".zattrs"} for e in entries):
                                     raise ValueError("unidentified cache payloads; use a fresh cache root")
-                parent = Path(product.channels[0].relative_path) / ".live_tmp"
-                if parent.is_symlink():
-                    raise ValueError("unsafe scratch parent symlink")
-                allowed.add(parent)
-            stale_dirs = []
-            # Validate every candidate before deleting any. Only reserved,
-            # immediately contained session directories are scratch, not outputs.
-            for parent in allowed:
-                if not parent.exists():
-                    continue
-                for stale in parent.iterdir():
-                    if not stale.name.startswith("session-"):
-                        continue
-                    if stale.is_symlink() or not stale.is_dir():
-                        raise ValueError("unsafe stale scratch directory")
-                    for member in stale.iterdir():
-                        raw = member.name.removeprefix("raw-").removesuffix(".mmap")
-                        known = member.name == "weight.mmap" or (member.name == f"raw-{raw}.mmap" and raw.isdigit())
-                        if member.is_symlink() or not member.is_file() or not known:
-                            raise ValueError("unsafe stale scratch contents")
-                    stale_dirs.append(stale)
-            for stale in stale_dirs:
-                shutil.rmtree(stale)
+            # Legacy full-volume `.live_tmp/session-*` scratch is deliberately
+            # ignored. It is disposable and explicit offline GC must handle it;
+            # resume must never synchronously walk/free multi-terabyte extents.
             if not identity_path.exists():
                 # Static provenance only: no tile/chunk/scratch state is saved.
                 atomic_write(identity_path, encoded)
@@ -194,14 +197,7 @@ class DemandStore:
                 tiled._omezarr_dim_sep(str(channel.relative_path), product.level))
                 for product in self.products for channel in product.channels)
             self._read_arrays = {}
-            for product in self.products:
-                parent = Path(product.channels[0].relative_path) / ".live_tmp"
-                parent.mkdir(parents=True, exist_ok=True)
-                directory = Path(tempfile.mkdtemp(prefix="session-", dir=parent))
-                self.scratch_dirs.append(directory)
-                self.accumulators[product.name] = tuple(self._mmap(directory / f"raw-{c}.mmap", self.dtype)
-                                                        for c in range(product.raw_channel_count))
-            self.weight = self._mmap(self.scratch_dirs[0] / "weight.mmap", np.dtype("float32"))
+            self.weight = None
         except BaseException:
             self.close()
             raise
@@ -209,13 +205,22 @@ class DemandStore:
     def _mmap(self, path, dtype):
         descriptor = tiled._MmapBandDescriptor((str(path),), self.geometry.output_shape, str(dtype),
             self.geometry.chunk if self.layout == "chunk-major" else 0, self.prefault)
-        size = math.prod(descriptor.storage_shape) * dtype.itemsize
-        # Fresh ftruncate allocates zero-filled holes, not a whole-volume clear.
-        with path.open("xb") as file:
-            file.truncate(size)
-        array = np.memmap(path, mode="r+", dtype=dtype, shape=descriptor.storage_shape)
-        self.arrays.append(array)
-        return array
+        storage_shape = descriptor.storage_shape
+        axis0_slab_bytes = math.prod(storage_shape[1:]) * dtype.itemsize
+        if axis0_slab_bytes > MAX_MMAP_FILE_BYTES:
+            raise ValueError("one accumulator storage-axis-0 slab exceeds the mmap shard ceiling")
+        axis0_per_shard = max(1, MMAP_SHARD_TARGET_BYTES // axis0_slab_bytes)
+        sizes = tuple(min(axis0_per_shard, storage_shape[0] - start)
+                      for start in range(0, storage_shape[0], axis0_per_shard))
+        paths = tuple(path if len(sizes) == 1 else
+                      path.with_name(f"{path.stem}.part-{index:04d}{path.suffix}")
+                      for index in range(len(sizes)))
+        # Fresh ftruncate creates zero-filled holes; opening/mapping is deferred
+        # until a worker actually touches the corresponding Z shard.
+        for shard_path, axis0_size in zip(paths, sizes):
+            with shard_path.open("xb") as file:
+                file.truncate(axis0_size * axis0_slab_bytes)
+        return _MmapHandle(tuple(str(member) for member in paths), tuple(int(v) for v in sizes), str(dtype))
 
     def _chunk_files(self, origin):
         for channel, product, sep in self._channel_metadata:
@@ -251,16 +256,16 @@ class DemandStore:
         return True
 
     def _sync_published(self, origin):
+        """Confirm atomic chunk publication; cache files are regenerable.
+
+        Closing each temp file before os.replace makes process-level readers
+        safe.  Deliberate fsync durability is omitted: forcing every channel
+        file and parent directory to stable storage serialized this transient
+        inference cache and provided no useful recovery guarantee.
+        """
         for member in self._chunk_files(origin):
             if not member.is_file():
                 return False
-            with member.open("rb") as file:
-                os.fsync(file.fileno())
-            descriptor = os.open(member.parent, os.O_RDONLY)
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
         return True
 
     def ready(self, origin):
@@ -318,11 +323,16 @@ class DemandStore:
         return tile
 
     def _descriptor(self, arrays):
-        return tiled._MmapBandDescriptor(tuple(str(a.filename) for a in arrays),
-                                         self.geometry.output_shape, str(arrays[0].dtype),
-                                         self.geometry.chunk if self.layout == "chunk-major" else 0, self.prefault)
+        if not arrays or any(array.dtype != arrays[0].dtype or
+                array.shard_axis0_sizes != arrays[0].shard_axis0_sizes for array in arrays):
+            raise ValueError("incompatible mmap channel handles")
+        return tiled._MmapBandDescriptor(
+            tuple(path for array in arrays for path in array.paths),
+            self.geometry.output_shape, arrays[0].dtype,
+            self.geometry.chunk if self.layout == "chunk-major" else 0,
+            self.prefault, arrays[0].shard_axis0_sizes)
 
-    def begin_complete(self, tile, result_spec, slot, sequence):
+    def begin_complete(self, tile, result_spec, slot, sequence, *, weight_spec=None):
         """Plan chunk-owner tasks without copying or persisting result tensors."""
         if self.tiles.get(tile, {}).get("state") != "inflight":
             raise ValueError("duplicate/unrequested inference completion")
@@ -335,13 +345,14 @@ class DemandStore:
             if tile not in entry["dependencies"] or tile in entry["pending"] or tile in entry["applied"]:
                 raise ValueError("invalid/duplicate contribution")
             destination, source = self.geometry.intersection(origin, tile)
+            destination = tuple(slice(a - o, b - o) for (a, b), o in
+                                zip(((s.start, s.stop) for s in destination), origin))
             tasks.append(tiled._AccumulateProcessTask(
                 -1, sequence, slot, result_spec, self.geometry.scale, origin,
                 tuple(v for s in destination for v in (s.start, s.stop)),
                 tuple(v for s in source for v in (s.start, s.stop)),
                 tuple(p.name for p in self.products),
-                tuple((p.name, self._descriptor(self.accumulators[p.name])) for p in self.products),
-                self._descriptor((self.weight,))))
+                (), None, weight_spec, (self.arena_key, origin)))
             entry["pending"].add(tile)
         self.tiles[tile] = {"state": "accumulating", "remaining": len(tasks)}
         self.stats["inferred_tiles"] += 1
@@ -394,20 +405,37 @@ class DemandStore:
         entries += [(f"product:{p.name}", arrays[p.name]) for p in self.products]
         layouts, size = tiled._packed_layouts((name, a.shape, a.dtype) for name, a in entries)
         shm, = tiled._create_shared_slots(1, size)
-        mmaps = {}
+        from lasagna.chunk_accumulator_arena import ChunkAccumulatorArena
+        if self._sync_arena is None:
+            record_entries = [("weight", (self.geometry.chunk,) * 3, np.float32)]
+            record_entries += [(f"product:{p.name}:{channel}", (self.geometry.chunk,) * 3, self.dtype)
+                               for p in self.products for channel in range(p.raw_channel_count)]
+            record_layouts, record_bytes = tiled._packed_layouts(record_entries)
+            self._sync_record_spec = tiled._AccumulatorRecordSpec(record_bytes, record_layouts)
+            self._sync_publication = tiled._create_shared_slots(1, record_bytes)[0]
+            self._sync_arena = ChunkAccumulatorArena(
+                self.root / ".accumulator_arena", record_bytes=record_bytes,
+                hot_slots=max(8, len(tuple(self.geometry.touched(tile)))))
+        record_spec, publication = self._sync_record_spec, self._sync_publication
+        record_bytes = record_spec.nbytes
+        publication_spec = tiled._SharedSlotSpec(publication.name, record_bytes,
+            (tiled._SharedArrayLayout("record", 0, (record_bytes,), np.dtype(np.uint8).str),))
+        mmaps = tiled._BoundedMmapCache()
+        arena = self._sync_arena
         try:
             for layout, (_, a) in zip(layouts, entries):
                 tiled._slot_array(shm, layout)[:] = a
             spec = tiled._SharedSlotSpec(shm.name, size, layouts)
             for task in self.begin_complete(tile, spec, 0, 0):
-                tiled._execute_accumulate_process_task(task, {shm.name: shm}, mmaps)
+                tiled._execute_accumulate_process_task(task, {shm.name: shm}, mmaps, arena, record_spec)
                 self.contribution_done(tile, task.origin)
             while self.publications:
                 origin = self.publications.popleft()
-                self.publication_done(origin, self._publish(origin))
+                destination = np.ndarray((record_bytes,), np.uint8, buffer=publication.buf)
+                arena.snapshot_and_release((self.arena_key, origin), destination)
+                self.publication_done(origin, self._publish_record(origin, publication_spec, record_spec))
         finally:
-            for a in mmaps.values():
-                a._mmap.close()
+            mmaps.close()
             shm.close()
             shm.unlink()
 
@@ -430,18 +458,67 @@ class DemandStore:
             (0, 0, 0, *self.geometry.output_shape), self.products,
             tuple((p.name, self._descriptor(self.accumulators[p.name])) for p in self.products), self._descriptor((self.weight,)))
         # These are threads in the store's process, not flush subprocesses.
-        # Borrow its existing maps: remapping whole sparse volumes per worker
-        # can exhaust virtual address space even when physical RAM is free.
+        # Give each publication a small private shard-map cache: sharing mutable
+        # mmap/LRU state between publication threads is unsafe, while bounding
+        # it avoids mapping a whole sparse logical volume at once.
         # Publication is admitted only after this chunk's writers have finished;
         # the shared flush helper copies the requested region before finalizing.
-        cache = {str(array.filename): array for array in self.arrays}
-        tiled._execute_flush_process_task(task, self.model_adapter, self.output_adapter, cache)
-        return self._sync_published(origin)
+        # Finalization consumes weight/raw regions sequentially, so one mapping
+        # is sufficient and bounds aggregate virtual address use across the
+        # publication thread pool.
+        cache = tiled._BoundedMmapCache(max_open=1)
+        try:
+            tiled._execute_flush_process_task(task, self.model_adapter, self.output_adapter, cache)
+            return self._sync_published(origin)
+        finally:
+            cache.close()
+
+    def _publish_record(self, origin, publication_spec, record_spec):
+        """Finalize one immutable chunk-local arena snapshot."""
+        members = tuple(self._chunk_files(origin))
+        for member in members:
+            if member.is_symlink():
+                raise ValueError("unsafe published chunk symlink")
+            member.resolve().relative_to(self.root.resolve())
+        for member in members:
+            member.unlink(missing_ok=True)
+        shm = tiled._attach_shared_memory(publication_spec.shm_name)
+        try:
+            record = np.ndarray((record_spec.nbytes,), np.uint8, buffer=shm.buf)
+            layouts = {layout.name: layout for layout in record_spec.layouts}
+            shape = tuple(min(self.geometry.chunk, n - o)
+                          for n, o in zip(self.geometry.output_shape, origin))
+            region = tuple(slice(0, n) for n in shape)
+            denom = np.asarray(tiled._record_array(record, layouts["weight"])[region],
+                               dtype=np.float32).copy()
+            if np.any(denom > 0.0):
+                np.maximum(denom, 1.0e-7, out=denom)
+                for product in self.products:
+                    raw = np.stack([np.asarray(tiled._record_array(
+                        record, layouts[f"product:{product.name}:{channel}"])[region],
+                        dtype=np.float32) for channel in range(product.raw_channel_count)])
+                    raw /= denom[None]
+                    finalizer = getattr(self.model_adapter, "finalize_product_slab", None)
+                    if finalizer is None:
+                        persisted = {channel.name: np.clip(raw[i] * 255.0, 0.0, 255.0).astype(product.dtype)
+                                     for i, channel in enumerate(product.channels)}
+                    else:
+                        persisted = finalizer(product, raw)
+                    self.output_adapter.write_product_chunk(
+                        product, chunk_origin_zyx=origin,
+                        data={channel.name: persisted[channel.name] for channel in product.channels})
+            return self._sync_published(origin)
+        finally:
+            shm.close()
 
     def close(self):
-        for array in getattr(self, "arrays", ()):
-            array._mmap.close()
-        self.arrays = []
+        if getattr(self, "_sync_arena", None) is not None:
+            self._sync_arena.close()
+            self._sync_arena = None
+        if getattr(self, "_sync_publication", None) is not None:
+            self._sync_publication.close()
+            self._sync_publication.unlink()
+            self._sync_publication = None
         for directory in getattr(self, "scratch_dirs", ()):
             # Only this instance's mkdtemp-created scratch directory is removed.
             shutil.rmtree(directory)
@@ -461,11 +538,24 @@ def format_queue_snapshot(row):
             f"gpu_submitted={row['gpu_submitted_uncollected']} "
             f"input_free={row['input_slots_free']}/{row['input_slots_capacity']} "
             f"accumulating={row['tiles_accumulating']} "
-            f"publish(q/submitted)={row['publications_queued']}/{row['publications_submitted']}")
+            f"publish(q/submitted)={row['publications_queued']}/{row['publications_submitted']} "
+            f"arena(hot/spill)={row.get('arena_hot_occupancy', 0)}/"
+            f"{row.get('arena_spill_occupancy', 0)} "
+            f"spill(slots/segments)={row.get('arena_broker_slot_high_water', 0)}/"
+            f"{row.get('arena_broker_segments', 0)}")
+
+
+def _pump_refill_budget(worker_count, max_batch_size):
+    """Bound coordinator latency while refilling two batches per GPU."""
+    return min(64, max(16, max(1, int(worker_count)) * int(max_batch_size) * 2))
 
 
 def _gated_demand_worker(gate, arguments, vram_budget):
     # No CUDA context/model before the manager records this child's identity.
+    # Native CUDA/shared-memory faults otherwise surface only as an opaque
+    # negative process exit code in the coordinator.  Preserve the Python
+    # stack for fatal signals such as SIGBUS without changing worker behavior.
+    faulthandler.enable(all_threads=True)
     gate.wait()
     if arguments[1].startswith("GPU-"):
         os.environ["CUDA_VISIBLE_DEVICES"] = arguments[1]
@@ -473,6 +563,103 @@ def _gated_demand_worker(gate, arguments, vram_budget):
     if vram_budget is not None:
         os.environ["FIBER_INFERENCE_VRAM_BUDGET_BYTES"] = str(vram_budget)
     tiled._multi_gpu_worker_main(*arguments)
+
+
+class _SpillArenaBroker:
+    """Own one anonymous, grow-only spill file and recycle record slots globally.
+
+    File growth and physical extent allocation happen serially on this broker
+    thread. Accumulator workers only mmap already prepared large segments, so a
+    simultaneous eviction wave cannot make every worker enter filesystem
+    allocation independently.
+    """
+
+    def __init__(self, context, scratch_dir, *, record_bytes, segment_slots, workers):
+        self.record_bytes = int(record_bytes)
+        self.segment_slots = int(segment_slots)
+        granularity = int(mmap.ALLOCATIONGRANULARITY)
+        raw_stride = self.record_bytes * self.segment_slots
+        self.segment_stride = ((raw_stride + granularity - 1) // granularity) * granularity
+        directory = Path(scratch_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        fd = None
+        if hasattr(os, "O_TMPFILE"):
+            try:
+                fd = os.open(directory, os.O_RDWR | os.O_TMPFILE, 0o600)
+                open_path = f"/proc/{os.getpid()}/fd/{fd}"
+            except OSError:
+                fd = None
+        if fd is None:
+            fd, name = tempfile.mkstemp(prefix="spill-arena-", suffix=".mmap", dir=directory)
+            open_path = name
+        self.fd = fd
+        self.open_path = open_path
+        self._named_path = None if open_path.startswith("/proc/") else Path(open_path)
+        self.requests = context.Queue(maxsize=max(64, int(workers) * 4))
+        self.responses = [context.Queue(maxsize=2) for _ in range(int(workers))]
+        self._free = []
+        self._next = 0
+        self._segments = 0
+        self._closed = False
+        self.stats = {"slot_high_water": 0, "logical_bytes": 0, "segments": 0,
+                      "reuses": 0, "requests": 0, "releases": 0}
+        self._thread = threading.Thread(target=self._serve, name="spill-arena-broker", daemon=True)
+        self._thread.start()
+
+    def seal(self):
+        """Remove the fallback pathname after every worker has opened the inode."""
+        if self._named_path is not None:
+            self._named_path.unlink(missing_ok=True)
+            self._named_path = None
+
+    def _prepare_new_slot(self, slot):
+        segment = slot // self.segment_slots
+        if segment >= self._segments:
+            os.ftruncate(self.fd, (segment + 1) * self.segment_stride)
+            self._segments = segment + 1
+            self.stats["segments"] = self._segments
+            self.stats["logical_bytes"] = self._segments * self.segment_stride
+
+    def _serve(self):
+        while True:
+            item = self.requests.get()
+            if item[0] == "stop":
+                return
+            kind, worker, value = item
+            if kind == "release":
+                heapq.heappush(self._free, int(value))
+                self.stats["releases"] += 1
+                continue
+            if kind != "acquire":
+                self.responses[worker].put(("error", f"invalid spill broker request {kind!r}"))
+                continue
+            self.stats["requests"] += 1
+            try:
+                if self._free:
+                    slot = heapq.heappop(self._free)
+                    self.stats["reuses"] += 1
+                else:
+                    slot = self._next
+                    self._prepare_new_slot(slot)
+                    self._next += 1
+                    self.stats["slot_high_water"] = self._next
+                self.responses[worker].put(("slot", slot))
+            except BaseException as exc:
+                self.responses[worker].put(("error", f"{type(exc).__name__}: {exc}"))
+
+    def close(self):
+        if self._closed:
+            return
+        self.requests.put(("stop", -1, -1))
+        self._thread.join()
+        for channel in (self.requests, *self.responses):
+            channel.cancel_join_thread()
+            channel.close()
+        os.close(self.fd)
+        if self._named_path is not None:
+            self._named_path.unlink(missing_ok=True)
+            self._named_path = None
+        self._closed = True
 
 
 class DemandWorkerPool:
@@ -484,7 +671,8 @@ class DemandWorkerPool:
     """
     def __init__(self, stores, readers, devices, *, slots_per_gpu=2, input_workers=8, input_slots=None,
                  result_slots=None, accumulator_workers=None, flush_workers=4, profile_pipeline=False,
-                 max_batch_size=1, deferred_gpu=False):
+                 max_batch_size=1, deferred_gpu=False, accumulator_hot_slots=None,
+                 accumulator_spill_segment_slots=256):
         if type(max_batch_size) is not int or max_batch_size < 1:
             raise ValueError("max_batch_size must be a positive integer")
         if not stores or not devices or slots_per_gpu < 1 or input_workers < 1:
@@ -515,21 +703,44 @@ class DemandWorkerPool:
         accumulator_workers = len(devices) if accumulator_workers is None else int(accumulator_workers)
         if accumulator_workers < 1 or flush_workers < 1:
             raise ValueError("positive accumulation/publication worker budgets required")
+        hot_total = accumulator_workers * 8 if accumulator_hot_slots is None else int(accumulator_hot_slots)
+        if hot_total < accumulator_workers or int(accumulator_spill_segment_slots) < 1:
+            raise ValueError("hot slots must cover every accumulator worker and spill segments must be positive")
+        for key, store in stores.items():
+            store.arena_key = str(key)
         tile_shape = (self.geometry.tile,) * 3
         output_shape = (self.geometry.tile // self.geometry.scale,) * 3
         self.input_layouts, input_bytes = tiled._packed_layouts((("input", tile_shape, np.uint16),))
-        entries = [(f"weight:{self.geometry.scale}", output_shape, np.float32)]
-        entries += [(f"product:{p.name}", (p.raw_channel_count, *output_shape), np.float32) for p in first.products]
+        # Result slots carry only model outputs.  Blend weights are immutable
+        # for a geometry, so keep one shared template instead of copying a
+        # 64 MiB full-resolution weight volume through every result slot.
+        entries = [(f"product:{p.name}", (p.raw_channel_count, *output_shape), np.float32)
+                   for p in first.products]
         self.result_layouts, result_bytes = tiled._packed_layouts(entries)
-        self.inputs, self.results, self.processes = [], [], []
+        self.weight_layouts, weight_bytes = tiled._packed_layouts(
+            ((f"weight:{self.geometry.scale}", output_shape, np.float32),))
+        record_entries = [("weight", (self.geometry.chunk,) * 3, np.float32)]
+        record_entries += [(f"product:{p.name}:{channel}", (self.geometry.chunk,) * 3, first.dtype)
+                           for p in first.products for channel in range(p.raw_channel_count)]
+        record_layouts, record_bytes = tiled._packed_layouts(record_entries)
+        self.record_spec = tiled._AccumulatorRecordSpec(record_bytes, record_layouts)
+        hot_counts = tuple(hot_total // accumulator_workers + (i < hot_total % accumulator_workers)
+                           for i in range(accumulator_workers))
+        self.inputs, self.results, self.weight_templates = [], [], []
+        self.result_slot_pool = None
+        self.publication_slots, self.processes = [], []
         self.active, self.loading, self.free = {}, {}, deque(range(result_count))
         self.free_inputs = deque(range(count))
         self.input_owners = {}
         self.accumulating, self.accumulation_tasks, self.publishing = {}, {}, {}
+        self.publication_pending = {}
+        self.free_publication_slots = deque(range(int(flush_workers)))
+        self.publication_generations = [0] * int(flush_workers)
         self.pending_accumulation = [deque() for _ in range(accumulator_workers)]
         self.accumulator_processes = []
         self.accumulator_counts = [0] * accumulator_workers
         self.accumulator_queues = []
+        self.spill_broker = None
         self.task_sequence = 0
         self.flush_workers = int(flush_workers)
         self.sequence = 0
@@ -546,6 +757,7 @@ class DemandWorkerPool:
         self.accumulator_queue_samples = []
         self.accumulator_submitted = {}
         self.accumulator_backends = {}
+        self.arena_worker_stats = {}
         self.worker_ids = set()
         self.stats = {"tiles": 0, "worker_seconds": 0.0, "load_seconds": 0.0,
                       "max_batch_size": max_batch_size, "batches": 0,
@@ -555,7 +767,12 @@ class DemandWorkerPool:
                       "pump_background_seconds": 0.0,
                       "input_slots": count, "input_workers": input_workers, "result_slots": result_count,
                       "input_slot_bytes": input_bytes, "result_slot_bytes": result_bytes,
-                      "shared_slot_bytes": count * input_bytes + result_count * result_bytes}
+                      "result_slot_backing": "file-mmap",
+                      "weight_template_bytes": weight_bytes,
+                      "accumulator_record_bytes": record_bytes, "accumulator_hot_slots": hot_total,
+                      "accumulator_hot_capacity_bytes": hot_total * record_bytes,
+                      "shared_slot_bytes": count * input_bytes + result_count * result_bytes + weight_bytes
+                          + int(flush_workers) * record_bytes}
         self.executor = ThreadPoolExecutor(max_workers=input_workers, thread_name_prefix="inference-input")
         self.publisher = ThreadPoolExecutor(max_workers=self.flush_workers, thread_name_prefix="inference-publish")
         context = mp.get_context("spawn")
@@ -564,21 +781,73 @@ class DemandWorkerPool:
         self.accumulator_events = context.Queue(maxsize=128 * accumulator_workers)
         try:
             self.inputs = tiled._create_shared_slots(count, input_bytes)
-            self.results = tiled._create_shared_slots(result_count, result_bytes)
+            # Result tiles dominate POSIX-shm usage at full resolution. A
+            # paused training process can retain most of the host's shmem and
+            # make otherwise valid result writes fail with SIGBUS. Keep this
+            # bounded ring in one sparse regular-file mmap under the cache;
+            # pages remain cacheable and are overwritten without explicit sync.
+            self.result_slot_pool = tiled._FileMappedSlotPool(
+                first.root / ".accumulator_arena", count=result_count,
+                size=result_bytes, prefix="result-slots-")
+            self.results = self.result_slot_pool.handles()
+            self.weight_templates = tiled._create_shared_slots(1, weight_bytes)
+            self.publication_slots = tiled._create_shared_slots(int(flush_workers), record_bytes)
+            self.spill_broker = _SpillArenaBroker(
+                context, first.root / ".accumulator_arena", record_bytes=record_bytes,
+                segment_slots=int(accumulator_spill_segment_slots), workers=accumulator_workers)
             input_specs = tuple(tiled._SharedSlotSpec(s.name, input_bytes, self.input_layouts) for s in self.inputs)
-            result_specs = tuple(tiled._SharedSlotSpec(s.name, result_bytes, self.result_layouts) for s in self.results)
+            result_specs = self.result_slot_pool.specs(self.result_layouts)
             self.result_specs = result_specs
+            self.weight_spec = tiled._SharedSlotSpec(
+                self.weight_templates[0].name, weight_bytes, self.weight_layouts)
+            self.publication_specs = tuple(tiled._SharedSlotSpec(
+                slot.name, record_bytes, (tiled._SharedArrayLayout(
+                    "record", 0, (record_bytes,), np.dtype(np.uint8).str),))
+                for slot in self.publication_slots)
+            blend_ramp = tiled.blend_ramp(self.geometry.tile, self.geometry.border, self.geometry.overlap)
+            weights = tiled._blend_weights_by_scale(
+                blend_ramp, native_stride, (self.geometry.scale,), device=torch.device("cpu"),
+            )[self.geometry.scale]
+            tiled._copy_tensor_to_shared_array(
+                tiled._slot_array(self.weight_templates[0], self.weight_layouts[0]), weights,
+            )
             for i in range(accumulator_workers):
                 work = context.Queue(maxsize=32)
                 self.accumulator_queues.append(work)
                 process = context.Process(target=tiled._accumulate_process_main,
-                    args=(i, work, self.accumulator_events), name=f"demand-accumulate-{i}")
+                    args=(i, work, self.accumulator_events, self.record_spec, hot_counts[i],
+                          int(accumulator_spill_segment_slots), str(first.root / ".accumulator_arena"),
+                          self.spill_broker.open_path, self.spill_broker.requests,
+                          self.spill_broker.responses[i], self.spill_broker.segment_stride),
+                    name=f"demand-accumulate-{i}")
                 process.start()
                 self.accumulator_processes.append(process)
+            attached = set()
+            deadline = time.monotonic() + 60
+            while len(attached) < accumulator_workers:
+                for process in self.accumulator_processes:
+                    if process.exitcode is not None:
+                        raise RuntimeError(
+                            f"spill arena worker {process.name} failed to attach: {process.exitcode}")
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    raise TimeoutError("timed out attaching accumulator workers to spill arena")
+                try:
+                    event = self.accumulator_events.get(timeout=min(1, timeout))
+                except queue.Empty:
+                    # Spawn and module import can legitimately take longer than
+                    # one polling interval on a busy host.  The one-second get
+                    # is only for checking child exit status; the attachment
+                    # deadline above is the actual startup timeout.
+                    continue
+                if event[0] != "arena_attached" or event[1] in attached:
+                    raise RuntimeError(f"invalid spill arena attachment event: {event}")
+                attached.add(event[1])
+            self.spill_broker.seal()
             scales = {p.name: self.geometry.scale for p in first.products}
             self.gpu_arguments = (
                     self.adapter, None, self.geometry.tile,
-                    tiled.blend_ramp(self.geometry.tile, self.geometry.border, self.geometry.overlap), scales,
+                    blend_ramp, scales,
                     int(getattr(self.adapter, "native_output_stride", 1)), input_specs, result_specs,
                     self.work, self.events, profile_pipeline, max_batch_size, True)
             if not deferred_gpu:
@@ -598,7 +867,8 @@ class DemandWorkerPool:
         try:
             for i, device in enumerate(devices):
                 process = context.Process(target=_gated_demand_worker, args=(self.gpu_gate, (
-                    i, str(device), *self.gpu_arguments), vram_budget))
+                    i, str(device), *self.gpu_arguments), vram_budget),
+                    name=f"demand-gpu-{i}")
                 process.start()
                 self.processes.append(process)
         except BaseException:
@@ -653,7 +923,8 @@ class DemandWorkerPool:
 
     @property
     def busy(self):
-        return bool(self.active or self.loading or self.accumulating or self.publishing or any(
+        return bool(self.active or self.loading or self.accumulating or self.publishing
+                    or self.publication_pending or any(
             s.publications or s.pending_tile_key() is not None for s in self.stores.values()))
 
     def queue_snapshot(self):
@@ -672,6 +943,13 @@ class DemandWorkerPool:
         chunks = [entry for store in self.stores.values() for entry in store.chunks.values()
                   if not entry["ready"]]
         requested = sum(bool(entry.get("requested")) for entry in chunks)
+        arena_totals = {key: sum(int(row.get(key, 0)) for row in getattr(self, "arena_worker_stats", {}).values())
+                        for key in ("hot_occupancy", "hot_high_water", "spill_occupancy",
+                                    "spill_high_water", "spill_capacity", "evictions",
+                                    "promotions", "spill_bytes_written", "spill_bytes_read")}
+        broker = getattr(self, "spill_broker", None)
+        broker_stats = {} if broker is None else {
+            f"arena_broker_{key}": int(value) for key, value in broker.stats.items()}
         return {**reads, "reads_submitted": len(self.loading),
                 "tiles_queued": len(queued), "tiles_queued_foreground": sum(queued),
                 "tiles_queued_background": len(queued)-sum(queued),
@@ -683,7 +961,9 @@ class DemandWorkerPool:
                 "accumulation_tasks_outstanding": len(self.accumulation_tasks),
                 "accumulation_tasks_not_submitted": sum(map(len, self.pending_accumulation)),
                 "publications_submitted": len(self.publishing),
-                "publications_queued": sum(len(s.publications) for s in self.stores.values())}
+                "publications_queued": sum(len(s.publications) for s in self.stores.values()),
+                "publication_snapshots_pending": len(getattr(self, "publication_pending", {})),
+                **{f"arena_{key}": value for key, value in arena_totals.items()}, **broker_stats}
 
     def _release_result(self, sequence):
         _, _, slot, _ = self.accumulating.pop(sequence)
@@ -696,40 +976,71 @@ class DemandWorkerPool:
                 event = self.accumulator_events.get_nowait()
             except queue.Empty:
                 break
-            if event[0] != "result":
+            if event[0] == "publish_snapshot":
+                name, origin, slot, generation = self.publication_pending.pop(event[1])
+                if slot != event[2] or generation != event[3] or self.publication_generations[slot] != generation:
+                    raise RuntimeError("publication snapshot slot mismatch")
+                future = self.publisher.submit(
+                    self.stores[name]._publish_record, origin,
+                    self.publication_specs[slot], self.record_spec)
+                self.publishing[name, origin] = (future, slot)
+                self.arena_worker_stats[event[4]] = event[7]
+                continue
+            if event[0] == "batch_error":
+                raise RuntimeError(f"shared accumulator batch error: {event}")
+            if event[0] != "batch_result":
                 raise RuntimeError(f"shared accumulator error: {event}")
-            name, tile, origin, sequence = self.accumulation_tasks.pop(event[1])
+            name, tile, origins, sequence = self.accumulation_tasks.pop(event[1])
             if event[2] != sequence:
                 raise RuntimeError("accumulator result sequence mismatch")
-            self.stores[name].contribution_done(tile, origin)
-            self.accumulator_counts[event[3]] += 1
-            self.accumulating[sequence][3] -= 1
+            if event[6] != len(origins):
+                raise RuntimeError("accumulator batch contribution count mismatch")
+            for origin in origins:
+                self.stores[name].contribution_done(tile, origin)
+            self.accumulator_counts[event[3]] += len(origins)
+            if len(event) > 7:
+                self.arena_worker_stats[event[3]] = event[7]
+            self.accumulating[sequence][3] -= len(origins)
             if not self.accumulating[sequence][3]:
                 self._release_result(sequence)
             if self.profile_pipeline:
                 self.accumulator_samples.append(event[5])
                 self.accumulator_queue_samples.append(max(0, time.perf_counter() - self.accumulator_submitted.pop(event[1]) - event[5]))
-                self.accumulator_backends[event[4]] = self.accumulator_backends.get(event[4], 0) + 1
+                self.accumulator_backends[event[4]] = self.accumulator_backends.get(event[4], 0) + len(origins)
         for pending, work in zip(self.pending_accumulation, self.accumulator_queues):
             while pending:
                 try:
                     work.put_nowait(pending[0])
                 except queue.Full:
                     break
-                if self.profile_pipeline:
-                    self.accumulator_submitted[pending[0].task_id] = time.perf_counter()
+                if self.profile_pipeline and hasattr(pending[0], "batch_id"):
+                    self.accumulator_submitted[pending[0].batch_id] = time.perf_counter()
                 pending.popleft()
 
     def _pump_publications(self):
-        for key, future in list(self.publishing.items()):
+        for key, (future, slot) in list(self.publishing.items()):
             if future.done():
                 name, origin = key
                 self.stores[name].publication_done(origin, future.result())
                 del self.publishing[key]
+                self.free_publication_slots.append(slot)
         for name, store in self.stores.items():
-            while store.publications and len(self.publishing) < self.flush_workers:
+            while store.publications and self.free_publication_slots:
                 origin = store.publications.popleft()
-                self.publishing[name, origin] = self.publisher.submit(store._publish, origin)
+                slot = self.free_publication_slots.popleft()
+                self.publication_generations[slot] += 1
+                generation = self.publication_generations[slot]
+                request_id = self.task_sequence
+                self.task_sequence += 1
+                chunk = store.geometry.chunk
+                grid = tuple(o // chunk for o in origin)
+                owner = tiled._stable_accumulator_owner(store.geometry.scale, grid,
+                                                         len(self.accumulator_queues))
+                task = tiled._ArenaPublishTask(
+                    request_id, (store.arena_key, origin), slot, generation,
+                    self.publication_specs[slot])
+                self.publication_pending[request_id] = (name, origin, slot, generation)
+                self.pending_accumulation[owner].append(task)
 
     def _read_into_slot(self, name, tile, slot):
         # The input slot was reserved by the coordinator and remains owned
@@ -764,11 +1075,15 @@ class DemandWorkerPool:
         phase_started = time.perf_counter()
         # Bound coordinator work: a deep input window must not prevent RPC
         # priority updates or completed GPU/accumulation events being drained.
+        # Refill at least two dynamic batches per GPU in one coordinator pass.
+        # The old fixed 16/8 limits were adequate for batch-1 but visibly
+        # starved eight batch-4 workers after a completion wave.
+        pump_budget = _pump_refill_budget(len(self.processes), self.stats["max_batch_size"])
         admitted = 0
         # Keep the executor's admitted window at most reader-sized. The deeper
         # priority queue stays in stores, where new foreground demands can
         # overtake background work not yet submitted to a non-preemptible read.
-        while self.free_inputs and admitted < 16 and len(self.loading) < self.input_workers:
+        while self.free_inputs and admitted < pump_budget and len(self.loading) < self.input_workers:
             with stage_timing(self.stage_samples, "admit.global_priority_selection"):
                 choice = self._next_admission()
                 if choice is None:
@@ -798,7 +1113,7 @@ class DemandWorkerPool:
                 if error is not None:
                     raise error
         for sequence, (name, tile, slot, future, started) in list(self.loading.items()):
-            if not self.gpu_authorized or dispatched >= 8:
+            if not self.gpu_authorized or dispatched >= pump_budget:
                 break
             if not future.done() or not self.free:
                 continue
@@ -846,18 +1161,28 @@ class DemandWorkerPool:
                     "coordinator_receive_delay_s": time.perf_counter() - event[8]})
             name, tile, slot = self.active.pop(event[1])
             self.last_gpu_activity = time.monotonic()
-            tasks = self.stores[name].begin_complete(tile, self.result_specs[slot], slot, event[1])
+            tasks = self.stores[name].begin_complete(
+                tile, self.result_specs[slot], slot, event[1], weight_spec=self.weight_spec,
+            )
             self.accumulating[event[1]] = [name, tile, slot, len(tasks)]
+            owner_tasks = [[] for _ in self.accumulator_queues]
             for task in tasks:
-                task = replace(task, task_id=self.task_sequence)
-                self.task_sequence += 1
-                self.accumulation_tasks[task.task_id] = (name, tile, task.origin, event[1])
                 # Hash chunk indices, not voxel origins: origins divisible by
                 # chunk32 would otherwise all hash to the SAME worker modulo8.
                 chunk = self.stores[name].geometry.chunk
                 grid = tuple(o // chunk for o in task.origin)
                 owner = tiled._stable_accumulator_owner(task.sd, grid, len(self.accumulator_queues))
-                self.pending_accumulation[owner].append(task)
+                owner_tasks[owner].append(task)
+            for owner, owned in enumerate(owner_tasks):
+                if not owned:
+                    continue
+                batch_id = self.task_sequence
+                self.task_sequence += 1
+                owned = tuple(replace(task, task_id=batch_id) for task in owned)
+                batch = tiled._AccumulateProcessBatch(batch_id, event[1], owned)
+                self.accumulation_tasks[batch_id] = (
+                    name, tile, tuple(task.origin for task in owned), event[1])
+                self.pending_accumulation[owner].append(batch)
             if not tasks:
                 self._release_result(event[1])
             self.stats["worker_seconds"] += event[6]
@@ -882,13 +1207,23 @@ class DemandWorkerPool:
                 process.join()
         self.processes = []
         self.accumulator_processes = []
+        if self.spill_broker is not None:
+            self.stats["spill_broker"] = dict(self.spill_broker.stats)
+            self.spill_broker.close()
+            self.spill_broker = None
         # No publisher may retain a view of scratch after the store is closed.
         self.publisher.shutdown(wait=True, cancel_futures=True)
         self.executor.shutdown(wait=True, cancel_futures=True)
-        for array in self.inputs + self.results:
+        for array in (self.inputs + self.results + self.weight_templates
+                      + self.publication_slots):
             array.close()
-            array.unlink()
-        self.inputs, self.results = [], []
+            unlink = getattr(array, "unlink", None)
+            if unlink is not None:
+                unlink()
+        if self.result_slot_pool is not None:
+            self.result_slot_pool.close()
+            self.result_slot_pool = None
+        self.inputs, self.results, self.weight_templates = [], [], []
         for channel in (self.work, self.events, self.accumulator_events, *self.accumulator_queues):
             channel.cancel_join_thread()
             channel.close()

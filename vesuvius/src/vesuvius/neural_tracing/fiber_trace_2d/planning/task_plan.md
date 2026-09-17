@@ -1,130 +1,190 @@
 # Plan
 
-1. Lock the comparison to EMA999 u22000 (`67edd3a1...`), corrected mini5 v3
-   manifest SHA `ed031e2f...` (5 cases/16.887346mm), and short200 manifest SHA
-   `7c6911dc...` (200 cases/662.089848mm). Keep the established 40/80
-   ellipse, 160-base grace, and 80-base restart grouping unchanged.
-2. Re-establish the native fiberlet baseline with legacy production anchors and
-   graph settings beam16/lookahead384/step48. Do not mix the unsuccessful weighted
-   anchor experiment into the graph-parameter comparison.
-3. Add a resumable matrix mode behind the existing approved evaluation runner.
-   Bind matrix provenance to manifest/model/native hashes and the full ordered
-   candidate list. Every candidate gets immutable attempt directories plus an
-   atomic completed-result pointer; an interrupted attempt is retained and a new
-   numbered attempt is started. Validate completed candidates before skipping.
-   Every candidate reports total
-   restarts, coverage, mean/median/P05/P95 segment length, per-case first failure,
-   and wall time.
-4. On mini5, search in stages rather than an uncontrolled Cartesian explosion.
-   Stage1 is beam16 with step `{16,24,32,48,64,96}` and lookahead
-   `{96,192,384,768}` base voxels (multiples of the8-base prediction lattice,
-   lookahead >= step):24 candidates. Stage2 takes the best3 distinct step/lookahead
-   pairs and adds beam widths `{8,32,64}` (beam16 is already measured). Stage3
-   takes the best2 and tests valid step neighbors `s±8` and lookahead neighbors
-   `l±64`, deduplicating every earlier candidate. Cap each candidate at the
-   approved runner timeout and retain failed/capped attempts. “Retain choices”
-   means a cumulative result set, not monotone output from wider searches.
-5. Promote only candidates that materially improve mini5 (fewer failures, or a
-   deterministic later-first-failure shift without coverage loss) to the 200-break
-   set. A no-failure case maps to its reference end. At equal failures, require
-   coverage within0.01percentage point of baseline, total first-failure gain at
-   least160base voxels, and no individual case regression over64base voxels.
-   Always rerun the old fiberlet settings in the same matrix for a fair baseline.
-6. Compare the selected fiberlet result with both the prior 67-failure fiberlet
-   baseline and the 62-failure regular u22000 beam result. The same-matrix legacy
-   rerun is authoritative: rank fewer failures first, reject coverage loss over
-   0.01percentage point, then compare failures/mm, mean/quantiles/per-scroll and
-   runtime. Historical results are references only. Record failures,
-   failures/mm, mean distance, quantiles, coverage, and per-scroll behavior.
-7. Archive or promote the tuning based on the 200-break result, document all
-   tested settings/results, update changelog/status/log, validate with the
-   pre-approved native replay test runner, and commit.
+1. Lock `best_ema_0p999.pt` by SHA-256 and verify the model output scale from
+   its training configuration.
+2. Derive a new immutable evaluation config from the last comparable full
+   50-fiber no-embedding refinement evaluation. Preserve the six source
+   collections, 50 fibers/90 eligible pieces/180 directions, 40/80 ellipse,
+   160-base excursion grace, 80-base reference-distance restart grouping, and
+   tracer parameters. Require `metric_definition=restart-episodes-80-base-voxels-v1`
+   and exactly 6867.627253 directed reference mm.
+3. Set inference scale to the model's native full-resolution output
+   (`scaledown_power=0`), use a fresh cache namespace/output root, all eight
+   managed GPUs, and rendering/embeddings disabled. Use batch cap 1 as an
+   explicitly recorded VRAM/throughput-only deviation for the much larger
+   full-resolution 256-cubed decoder output. Runtime tuning established batch
+   cap 4 within the measured 62-GiB-per-GPU grant.
+4. Freeze the exact checkpoint, patch the config to that immutable copy, then
+   prepare/audit and run only through the existing pre-approved `freeze-snapshot`,
+   `prepare`, and `full` runner modes. Validate checkpoint hash, completion,
+   case count, directed reference length, combined metrics, and per-scroll metrics.
+5. Persist the exact command, checkpoint/config identity, results, and any
+   deviation in the task log and a benchmark report.
 
-## Continuation: construction-DP tuning
+Outcome: completed in v22 after replacing the large POSIX shared-memory GPU
+result ring with one fixed-offset regular-file mmap ring. All 180 directions
+completed; see
+`../docs/benchmarks/fullres_refinement_213753_best_ema999_20260917.md`.
 
-The completed graph-replay matrix was a negative control, not completion of the
-requested DP retuning. The sharper prediction principally changes the discrete
-DP that constructs each fiberlet between anchors. Continue as follows:
+## Full-resolution accumulator correction
 
-1. Expose a strict nested `fiberlet.path` configuration in the native evaluation
-   CLI for the twelve persisted semantic `FiberletPathConfig` fields: cell
-   radius, neighborhood margin, longitudinal/transverse step, endpoint/prediction
-   angles, corridor radius, invalid-prediction cost, and the four smoothness
-   fields. Never expose the execution-only sampling-batch or thread fields. Feed
-   that same object into metadata/fingerprint generation, on-demand construction,
-   and cached replay; do not introduce a second implementation or bypass
-   canonical construction.
-2. Extend the resumable approved-runner sweep machinery with a path-parameter
-   mode while preserving the already-published graph-sweep identity. Resolve
-   partial candidate overrides against native defaults, hash the complete
-   resolved setting, retain immutable attempts, and reject duplicate settings.
-3. Add native/CLI regression coverage proving that path settings reach persisted
-   construction metadata, alter construction cache identity, and remain separate
-   from replay-only settings. Add Python coverage for validation, duplicate
-   detection, resumption, and dispatch.
-4. Run a corrected-mini5 lattice stage using production anchors and unchanged
-   graph replay: longitudinal step `{1,1.5,2,3,4}` prediction voxels crossed with
-   transverse step `{0.5,1}`. Then test transverse step `0.25` at the best two
-   distinct longitudinal steps, chosen deterministically by failures, coverage,
-   summed first-failure progress, and finally declared candidate order. Include
-   explicit same-run baseline/prewarm and candidate caps. Rank failures first,
-   then coverage and per-case first-failure progress.
-5. If a lattice candidate is credible, refine corridor radius and the local
-   direction/smoothness balance around it. If no lattice point removes a failure,
-   still test a bounded, documented second stage over corridor and prediction
-   deviation because those directly control whether the sharper ridge remains
-   reachable. Record its exact candidates and selection count in the task log and
-   matrix provenance before starting it. Preserve raw corridor radius `0` as the
-   backward-compatible baseline (it resolves to the 4-prediction-voxel anchor
-   cell size), and exclude explicit radius `4` as a behaviorally duplicate but
-   differently hashed identity. Avoid an uncontrolled Cartesian product.
-6. Only then consider stepped cost-profile graph replay and bounded-search
-   approximations. These are secondary because they select among constructed
-   fiberlets; they cannot recover geometry excluded by construction DP.
-7. Promote to short200 only for fewer failures, or the existing deterministic
-   first-failure gate without coverage loss. On short200 compare against both the
-   same-matrix production fiberlet baseline and the regular u22000 tracer. Retain
-   production defaults if no setting passes.
+The first managed launch exposed a real scale-1 blocker before any tile was
+inferred: PHerc0139's float32 weight accumulator is about 27 TB, beyond ext4's
+16 TB single-file limit. Preserve the existing demand accumulator rather than
+introducing another implementation:
+
+1. Extend the shared mmap descriptor with backward-compatible per-channel
+   Z-shard metadata. Split only at storage-axis-0 boundaries, which are whole
+   Z-brick planes for chunk-major layout.
+2. Have `DemandStore` create sparse shard files below a conservative,
+   test-injectable per-file ceiling and map shards lazily. Bound each worker's
+   mmap cache with LRU eviction, and use a per-publication local cache so the
+   full logical volume is never simultaneously mapped. Accumulation/finalization
+   must route regions across shards while preserving the same per-voxel
+   operations, rounding, and ordering.
+3. Keep unsharded descriptors and the full-volume inference identity unchanged;
+   shard files are temporary implementation details under `.live_tmp`.
+4. Add exact flat/chunk-major cross-shard read/add tests, padded-edge coverage,
+   overlapping f16/f32 accumulation, lazy/bounded mapping and cleanup coverage,
+   descriptor validation, and end-to-end DemandStore publication equivalence.
+   Run the existing approved replay-test runner before relaunching the exact
+   prepared benchmark.
+
+## Full-resolution host-output correction
+
+1. Store only product tensors in per-result shared slots. Build one immutable
+   shared blend-weight template per worker pool and have accumulator tasks read
+   it without repeating a GPU-to-host transfer for every tile.
+2. Copy weighted CUDA tensors directly into their shared CPU destinations,
+   preserving float32 weighting and eliminating the temporary CPU tensor plus
+   second host memcpy.
+3. For aligned single-chunk writes, encode the padded C-order Zarr-v2 payload
+   directly with the compressor recorded in `.zarray`, write a same-directory
+   temporary file, and atomically replace the final chunk. Retain the general
+   Zarr fallback for unsupported/multi-chunk writes. Do not fsync regenerable
+   inference-cache chunks.
+4. Use 64-cubed output chunks, 128 accumulator workers under a 192-logical-CPU
+   exclusive grant, and 512 product-only result slots. These are throughput-only
+   settings and must not enter numerical cache identity.
+
+## Reusable hot/spill accumulator arena
+
+The interrupted full-resolution run demonstrated that deleting globally
+addressed, multi-terabyte sparse mmap shards can serialize ext4 reserved-extent
+conversion for minutes with one kernel worker saturated and no useful device
+I/O. Replace that temporary representation without changing inference,
+accumulation arithmetic, finalization, or persistent Zarr cache identity.
+
+1. Move physical demand accumulators from `DemandStore` to one pool-level arena
+   shared by all compatible stores. `DemandStore` retains only scheduling and
+   publication metadata. Key every live record by `(store/source, chunk_origin)`
+   so equal coordinates from different sources cannot alias. Give the
+   synchronous `DemandStore.complete()` adapter an explicit tiny arena using the
+   same record/accessor implementation.
+2. Represent every incomplete output chunk by one padded `chunk^3` local record:
+   float32 weight plus every product's raw channels in the configured float16 or
+   float32 accumulator dtype. Page/cache-line align records, report exact
+   `record_bytes`, validate positive hot/segment slot counts, and address data by
+   `(slot, local ZYX)` rather than global volume coordinates. A newly assigned
+   record is completely zeroed before its first add; eviction and promotion copy
+   the complete record including padded edge bytes.
+3. Allocate a configurable fixed process-local anonymous-RAM hot-slot pool
+   partitioned into owner-exclusive ranges among stable accumulator processes
+   and shared logically across all stores. Only the owning process operates on
+   its range; no other process ever needs to map hot data. Anonymous virtual
+   capacity is reserved up front and physical pages are committed lazily. There
+   is no application-level file-backed hot fallback. Each owner processes
+   its FIFO queue serially, so record allocation, accumulation, eviction,
+   promotion and completion cannot race. Spill contains only records first
+   admitted to and later evicted from hot storage; at least one hot slot per
+   owner guarantees progress because an idle incomplete victim can always be
+   evicted before the next queued contribution. Require total hot slots at least
+   equal owner count and partition quotient/remainder deterministically.
+4. Use a separate fixed shared-memory publication-snapshot pool. Once all
+   contributions acknowledge, enqueue completion on the same stable owner FIFO;
+   the owner copies the complete hot or cold record into a generation-leased
+   publication slot and immediately releases its accumulator slot. The publisher
+   reads only that immutable snapshot and returns the lease after its atomic Zarr
+   write. This removes movable-location publication pinning and cross-process
+   spill-fd sharing; validate publication-slot generation on every ready/done
+   event to reject ABA reuse. Never copy complete records on the coordinator pump
+   thread. Accumulation/completion messages carry only `(store key, chunk origin)`
+   plus local source/destination bounds, never a physical arena slot descriptor;
+   the owner resolves locations at FIFO execution time.
+5. Add an on-demand spill arena made of fixed-size views into one pool-wide
+   regular-file mmap under the existing `/ephemeral` cache. It is never one
+   file per output chunk and never globally volume-addressed. Eviction copies a
+   full hot record into a spill slot; promotion copies it back and releases the
+   cold slot. Publish a completed cold record directly without needless
+   promotion. A central broker reuses the lowest free spill slot and extends the
+   arena only when none is free. Thus capacity tracks the high-water number of concurrently
+   cold incomplete records; because incidental partial chunks may remain live,
+   that high-water can legitimately grow with explored work.
+   Select victims by deterministic least-recently-used order among incomplete
+   hot records, tie-broken by store key and chunk origin.
+6. The pool creates one backing file directly on `/ephemeral` via `O_TMPFILE`
+   where supported, or `mkstemp` followed by immediate unlink. Spawn-safe fd
+   duplication gives owners access without reopening a pathname. A broker thread
+   serializes cheap logical `ftruncate` growth once per segment; physical block
+   allocation and writeback remain kernel-managed through the mmap and are never
+   synchronously preallocated per record. Owners mmap fixed-size segment views.
+   This prevents an eviction wave from making every owner create/grow an inode
+   concurrently without serializing its data writes. Never
+   use memfd/tmpfs for spill. Last-close reclamation is bounded by compact spill
+   high-water rather than the volume lattice. Stop scanning/removing legacy
+   `.live_tmp/session-*` during startup; legacy cleanup is an explicit offline
+   maintenance action, not part of evaluation resume.
+7. Extract shared local-record add/read/finalize accessors used by both demand
+   arena accumulation and existing whole-volume helpers; do not fork numerical
+   arithmetic or output finalization. Preserve stable owner FIFO arrival order,
+   float16/float32 per-add rounding, atomic Zarr publication, late-request reuse,
+   and one application of each contribution per session. Keep the persistent
+   cache identity JSON byte-for-byte compatible: legacy layout/prefault identity
+   fields remain accepted for existing prepared caches while no longer defining
+   the internal demand scratch representation. Hot capacity, spill segment size
+   and eviction policy are throughput-only settings outside cache identity.
+8. Add telemetry for hot/spill occupancy and high-water, pinned/queued counts,
+   promotions, evictions, segment/capacity growth, bytes copied, direct cold
+   publication snapshots, publication-slot occupancy/waits, allocation/free
+   balance and generation failures.
+9. Validate exact f16/f32 scripted-arrival equivalence over multiple eviction/
+   promotion cycles and padded edges. Cover global multi-store sharing/key
+   isolation, zero-before-reuse, ABA rejection, queued-task movement exclusion,
+   one-hot-slot eviction forward progress, direct cold publication snapshots,
+   publication-slot ABA rejection, publisher failure/close ordering, spill
+   free-list/high-water reuse across repeated publications, multiprocessing
+   `spawn`, worker failure, no named scratch/startup traversal,
+   exact cache-identity compatibility, telemetry invariants and synchronous
+   completion. Then run the approved native/Python replay suites and resume the
+   same prepared 50-fiber evaluation through the existing approved runner.
 
 ## Spec update
 
-Add an optional, strict `fiberlet.path` evaluation configuration that maps
-one-to-one onto the existing native construction DP. No metric/protocol change.
-If a fiberlet parameter set wins on the 200-break benchmark, document it as the
-current downstream fiberlet default; otherwise retain the existing default and
-archive the sweep.
+Replace the `specs.md` demand clauses that require full-logical-shape
+`.live_tmp/session-*` mmap, chunk-major/flat scratch translation, prefaulting,
+synchronous restart cleanup, and uncapped sparse-volume storage. Specify the
+pool-wide chunk-local hot/spill arena, owner-FIFO state machine, publication
+snapshot leases, eviction forward
+progress, anonymous regular-file `/ephemeral` segments, explicit legacy cleanup,
+slot reuse/high-water semantics and telemetry. Retain FIFO owner arrival order,
+late-request partial reuse, exact precision/rounding, bounded GPU-result RAM,
+RAM-only coordinator metadata, atomic persistent cache publication, cache
+identity compatibility and all tracer/evaluation invariants.
 
 ## Docs updates
 
-Extend the benchmark report with the complete construction-DP matrix, promoted
-200-case results, exact manifests/checkpoint/commands, and interpretation.
-Document the new `fiberlet.path` keys. Update `docs/fiberlet_evaluation.md` only
-if a new default is promoted.
+Document arena ownership, eviction/promotion/publication pinning, spill growth
+and reuse, crash behavior, telemetry, and relevant tuning knobs. Add a benchmark
+report for the full-resolution best EMA999 result and update the task log/status
+and changelog after successful completion.
 
 ## Testing
 
-Use only the existing approved entry points:
+The benchmark itself is the requested integration test. Use the existing
+pre-approved command:
 
-- `run_fiber3d_native_build` if native changes become necessary;
-- `run_fiber3d_native_replay_tests` for regression tests;
-- `run_classic_fiber_evaluation.py benchmark-full --config ...` for all mini5
-  and short200 runs.
+`run_classic_fiber_evaluation.py {freeze-snapshot,prepare,full} --config <config>`
 
-Validate immutable identities, matrix resumption, metric recomputation, equal
-case counts/reference lengths, and no coverage regression. Unit coverage includes
-ordered variants, legacy/no-anchor-fit binding, interrupted-attempt recovery,
-completed-row validation/provenance rejection, deterministic ranking, and
-per-case metric extraction. Prewarm production graph chunks once, then repeat the
-legacy row after warmup; report end-to-end times as cache-contaminated otherwise.
-
-For construction-DP candidates, cache prewarming is per resolved path identity:
-the first run includes construction and is the relevant end-to-end cost. Do not
-claim replay-only timing parity. Use the approved native build and replay-test
-runners after native parsing changes, and the approved benchmark runner for all
-measurements.
-
-The existing dataset fingerprint names a common anchor-and-fiberlet root, so each
-distinct path identity currently duplicates the unchanged anchor cache as well as
-constructing distinct fiberlets. This is accepted for the bounded sweep and must
-be included in storage/runtime interpretation; do not claim cross-candidate anchor
-reuse.
+Use the approved native replay-test runner for the accumulator correction.
+Validate the produced report and all 180 case artifacts before reporting
+success.

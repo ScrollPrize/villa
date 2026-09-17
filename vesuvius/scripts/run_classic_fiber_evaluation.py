@@ -179,7 +179,10 @@ def prepare(workload, *, pilot_only=False):
         if target.exists() and json.loads(target.read_text()) != value:
             raise ValueError(f"refusing to overwrite changed prepared evidence: {target}")
         if not target.exists():
-            atomic_write(target, value)
+            # These files are reproducible from the locked inputs. Atomic
+            # replacement matters; waiting for unrelated multi-terabyte mmap
+            # writeback on the evaluation filesystem does not.
+            atomic_write(target, value, durable=False)
     count = sum(len(s["fibers"]) for s in sources)
     print(f"Prepared {'one whole-fiber pilot/two directions' if pilot_only else f'{count} fibers/{2*count} directions'}. Pilot: {selected}/{Path(path).name}", flush=True)
 

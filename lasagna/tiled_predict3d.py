@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import atexit
-from collections import deque
+from collections import deque, OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from functools import wraps
@@ -285,12 +285,24 @@ class _MmapBandDescriptor:
 	dtype: str = "float32"
 	chunk_side: int = 0  # zero: existing circular-Z layout; positive: full-volume bricks
 	prefault: bool = False
+	# Storage-axis-0 sizes for each sparse file shard. Paths are channel-major:
+	# all shards for channel zero, then all shards for channel one, and so on.
+	# Empty retains the historical one-file-per-channel representation.
+	shard_axis0_sizes: tuple[int, ...] = ()
 
 	def __post_init__(self):
 		if self.chunk_side < 0:
 			raise ValueError("negative mmap chunk side")
 		if self.prefault and not self.chunk_side:
 			raise ValueError("writable prefault requires chunk-major layout")
+		if not self.paths:
+			raise ValueError("mmap descriptor requires at least one path")
+		if self.shard_axis0_sizes:
+			if (any(type(size) is not int or size <= 0 for size in self.shard_axis0_sizes)
+					or sum(int(size) for size in self.shard_axis0_sizes) != self.storage_shape[0]
+					or len(self.paths) % len(self.shard_axis0_sizes)
+					or len(set(self.paths)) != len(self.paths)):
+				raise ValueError("invalid mmap axis-0 shards")
 
 	@property
 	def storage_shape(self) -> tuple[int, ...]:
@@ -302,6 +314,62 @@ class _MmapBandDescriptor:
 	@property
 	def ring_depth(self) -> int:
 		return int(self.shape_zyx[0])
+
+	@property
+	def shard_sizes(self) -> tuple[int, ...]:
+		return self.shard_axis0_sizes or (int(self.storage_shape[0]),)
+
+	@property
+	def shard_count(self) -> int:
+		return len(self.shard_sizes)
+
+	@property
+	def channel_count(self) -> int:
+		return len(self.paths) // self.shard_count
+
+	def shard_path(self, channel: int, shard: int) -> str:
+		if not 0 <= int(channel) < self.channel_count or not 0 <= int(shard) < self.shard_count:
+			raise ValueError("invalid mmap channel/shard")
+		return self.paths[int(channel) * self.shard_count + int(shard)]
+
+	def shard_storage_shape(self, shard: int) -> tuple[int, ...]:
+		return (int(self.shard_sizes[int(shard)]), *self.storage_shape[1:])
+
+
+class _BoundedMmapCache:
+	"""Per-worker LRU of mmap shards; eviction happens only between helper calls."""
+
+	def __init__(self, max_open: int = 8):
+		if int(max_open) < 1:
+			raise ValueError("mmap cache capacity must be positive")
+		self.max_open = int(max_open)
+		self._arrays = OrderedDict()
+
+	def get(self, path):
+		array = self._arrays.pop(path, None)
+		if array is not None:
+			self._arrays[path] = array
+		return array
+
+	def __setitem__(self, path, array):
+		previous = self._arrays.pop(path, None)
+		if previous is not None and previous is not array:
+			previous._mmap.close()
+		while len(self._arrays) >= self.max_open:
+			_, evicted = self._arrays.popitem(last=False)
+			evicted._mmap.close()
+		self._arrays[path] = array
+
+	def __len__(self):
+		return len(self._arrays)
+
+	def values(self):
+		return self._arrays.values()
+
+	def close(self):
+		while self._arrays:
+			_, array = self._arrays.popitem(last=False)
+			array._mmap.close()
 
 
 @dataclass(frozen=True)
@@ -333,6 +401,39 @@ class _AccumulateProcessTask:
 	dirty_products: tuple[str, ...]
 	accumulators: tuple[tuple[str, _MmapBandDescriptor], ...]
 	weight: _MmapBandDescriptor
+	# Demand inference keeps one immutable blend-weight template shared by all
+	# result slots.  Whole-volume inference retains the legacy in-slot weight.
+	weight_spec: "_SharedSlotSpec | None" = None
+	arena_key: tuple[str, ChunkOriginZYX] | None = None
+
+
+@dataclass(frozen=True)
+class _AccumulatorRecordSpec:
+	nbytes: int
+	layouts: tuple["_SharedArrayLayout", ...]
+
+
+@dataclass(frozen=True)
+class _ArenaPublishTask:
+	request_id: int
+	arena_key: tuple[str, ChunkOriginZYX]
+	publication_slot: int
+	generation: int
+	publication_spec: "_SharedSlotSpec"
+
+
+@dataclass(frozen=True)
+class _AccumulateProcessBatch:
+	"""One IPC unit containing same-tile contributions owned by one worker."""
+
+	batch_id: int
+	event_seq: int
+	tasks: tuple[_AccumulateProcessTask, ...]
+
+	def __post_init__(self):
+		if (not self.tasks or any(task.event_seq != self.event_seq for task in self.tasks)
+				or any(task.result_slot != self.tasks[0].result_slot for task in self.tasks)):
+			raise ValueError("invalid accumulator task batch")
 
 
 @dataclass(frozen=True)
@@ -1029,6 +1130,55 @@ def _atomic_zarr_write(omezarr_path: str, level: int,
 	If n_levels > 0, also invalidates coarser pyramid chunks that depend on the written data."""
 	sep = _omezarr_dim_sep(omezarr_path, level)
 	level_path = os.path.join(omezarr_path, str(level))
+	# Fast path for the inference publisher: it always hands us one complete,
+	# aligned logical Zarr chunk.  Encoding that chunk directly preserves the
+	# Zarr-v2 bytes while avoiding a temporary array, metadata copy/open, slice
+	# machinery and recursive cleanup for every channel.
+	zarray_path = os.path.join(level_path, ".zarray")
+	try:
+		with open(zarray_path, encoding="utf-8") as handle:
+			metadata = json.load(handle)
+		chunks = tuple(int(value) for value in metadata["chunks"])
+		dtype = np.dtype(metadata["dtype"])
+		shape = tuple(int(value) for value in metadata["shape"])
+		region_shape = (int(z1-z0), int(y1-y0), int(x1-x0))
+		direct = (
+			metadata.get("zarr_format") == 2
+			and metadata.get("order", "C") == "C"
+			and metadata.get("filters") in (None, [])
+			and len(chunks) == 3
+			and (z0 % chunks[0], y0 % chunks[1], x0 % chunks[2]) == (0, 0, 0)
+			and all(0 < extent <= chunk for extent, chunk in zip(region_shape, chunks))
+			and (z1, y1, x1) == tuple(min(start + chunk, size)
+				for start, chunk, size in zip((z0, y0, x0), chunks, shape))
+			and tuple(np.asarray(data).shape) == region_shape
+		)
+	except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+		direct = False
+	if direct:
+		fill_value = metadata.get("fill_value", 0)
+		if fill_value is None:
+			fill_value = 0
+		chunk = np.full(chunks, fill_value, dtype=dtype)
+		chunk[tuple(slice(0, extent) for extent in region_shape)] = np.asarray(data, dtype=dtype)
+		compressor = metadata.get("compressor")
+		payload = chunk.tobytes(order="C") if compressor is None else numcodecs.get_codec(compressor).encode(chunk)
+		iz, iy, ix = z0 // chunks[0], y0 // chunks[1], x0 // chunks[2]
+		destination = Path(_zarr_chunk_path(level_path, sep, iz, iy, ix))
+		destination.parent.mkdir(parents=True, exist_ok=True)
+		temporary = destination.with_name(
+			f".tmp.{destination.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+		)
+		try:
+			with temporary.open("xb") as handle:
+				handle.write(payload)
+			if n_levels > 0:
+				_invalidate_pyramid_chunks(omezarr_path, level, n_levels, iz, iy, ix)
+			os.replace(temporary, destination)
+		finally:
+			temporary.unlink(missing_ok=True)
+		return
+
 	out_dir = os.path.dirname(omezarr_path)
 	zarr_name = os.path.basename(omezarr_path)
 	tmp_path = os.path.join(
@@ -2164,6 +2314,59 @@ class _SharedSlotSpec:
 	shm_name: str
 	nbytes: int
 	layouts: tuple[_SharedArrayLayout, ...]
+	mmap_path: str | None = None
+	mmap_offset: int = 0
+
+
+class _FileMappedSlot:
+	"""One fixed slot in a reusable regular-file-backed mmap pool."""
+
+	def __init__(self, path: str, offset: int, nbytes: int):
+		self.name = ""
+		self.path = str(path)
+		self.offset = int(offset)
+		self.nbytes = int(nbytes)
+		self._fd = os.open(self.path, os.O_RDWR)
+		self._mapping = mmap.mmap(
+			self._fd, self.nbytes, access=mmap.ACCESS_WRITE, offset=self.offset)
+		self.buf = self._mapping
+
+	def close(self) -> None:
+		if self._mapping is not None:
+			self._mapping.close()
+			self._mapping = None
+		if self._fd is not None:
+			os.close(self._fd)
+			self._fd = None
+
+
+class _FileMappedSlotPool:
+	"""Sparse fixed slot file whose pages can be shared by spawned workers."""
+
+	def __init__(self, directory, *, count: int, size: int, prefix: str):
+		directory = Path(directory)
+		directory.mkdir(parents=True, exist_ok=True)
+		granularity = int(mmap.ALLOCATIONGRANULARITY)
+		self.slot_bytes = int(size)
+		self.stride = ((self.slot_bytes + granularity - 1) // granularity) * granularity
+		fd, path = tempfile.mkstemp(prefix=prefix, suffix=".mmap", dir=directory)
+		self.path = Path(path)
+		self.count = int(count)
+		try:
+			os.ftruncate(fd, self.count * self.stride)
+		finally:
+			os.close(fd)
+
+	def handles(self) -> list[_FileMappedSlot]:
+		return [_FileMappedSlot(str(self.path), index * self.stride, self.slot_bytes)
+			for index in range(self.count)]
+
+	def specs(self, layouts) -> tuple[_SharedSlotSpec, ...]:
+		return tuple(_SharedSlotSpec("", self.slot_bytes, tuple(layouts),
+			str(self.path), index * self.stride) for index in range(self.count))
+
+	def close(self) -> None:
+		self.path.unlink(missing_ok=True)
 
 
 def _packed_layouts(entries: Iterable[tuple[str, tuple[int, ...], Any]]) -> tuple[tuple[_SharedArrayLayout, ...], int]:
@@ -2177,7 +2380,7 @@ def _packed_layouts(entries: Iterable[tuple[str, tuple[int, ...], Any]]) -> tupl
 	return tuple(layouts), max(1, ((offset + 63) // 64) * 64)
 
 
-def _slot_array(shm: shared_memory.SharedMemory, layout: _SharedArrayLayout) -> np.ndarray:
+def _slot_array(shm, layout: _SharedArrayLayout) -> np.ndarray:
 	return np.ndarray(layout.shape, dtype=np.dtype(layout.dtype), buffer=shm.buf, offset=layout.offset)
 
 
@@ -2186,6 +2389,12 @@ def _attach_shared_memory(name: str) -> shared_memory.SharedMemory:
 		return shared_memory.SharedMemory(name=name, create=False, track=False)
 	except TypeError:  # Python < 3.13
 		return shared_memory.SharedMemory(name=name, create=False)
+
+
+def _attach_slot(spec: _SharedSlotSpec):
+	if spec.mmap_path is not None:
+		return _FileMappedSlot(spec.mmap_path, spec.mmap_offset, spec.nbytes)
+	return _attach_shared_memory(spec.shm_name)
 
 
 def _create_shared_slots(count: int, size: int) -> list[shared_memory.SharedMemory]:
@@ -2249,10 +2458,11 @@ def _prefault_mmap_brick(array, view, descriptor):
 	seen.add(offset)  # Failed/partial advice must not suppress a retry.
 
 
-def _chunk_major_views(array, descriptor, bounds):
+def _chunk_major_views(array, descriptor, bounds, *, axis0_index_offset=0, relative_origin=None):
 	"""Yield 3D brick views and matching region-relative slices, shared by read/add."""
 	b = descriptor.chunk_side
 	starts, stops = bounds[::2], bounds[1::2]
+	relative_origin = starts if relative_origin is None else tuple(relative_origin)
 	if b <= 0 or any(not 0 <= lo <= hi <= n for lo, hi, n in zip(starts, stops, descriptor.shape_zyx)):
 		raise ValueError("invalid chunk-major region")
 	if any(lo == hi for lo, hi in zip(starts, stops)):
@@ -2262,8 +2472,26 @@ def _chunk_major_views(array, descriptor, bounds):
 		lo = tuple(max(a, o) for a, o in zip(starts, origin))
 		hi = tuple(min(a, o + b) for a, o in zip(stops, origin))
 		local = tuple(slice(a - o, z - o) for a, z, o in zip(lo, hi, origin))
-		relative = tuple(slice(a - o, z - o) for a, z, o in zip(lo, hi, starts))
-		yield array[index + local], relative
+		relative = tuple(slice(a - o, z - o) for a, z, o in zip(lo, hi, relative_origin))
+		storage_index = (index[0] - int(axis0_index_offset), *index[1:])
+		yield array[storage_index + local], relative
+
+
+def _mmap_shard(descriptor, channel, shard, mode, cache):
+	path = descriptor.shard_path(channel, shard)
+	array = cache.get(path)
+	if array is None:
+		array = np.memmap(path, dtype=np.dtype(descriptor.dtype), mode=mode,
+			shape=descriptor.shard_storage_shape(shard))
+		cache[path] = array
+	return array
+
+
+def _axis0_shards(descriptor):
+	start = 0
+	for shard, size in enumerate(descriptor.shard_sizes):
+		yield shard, start, int(size)
+		start += int(size)
 
 
 def _read_mmap_band_chunk(
@@ -2272,27 +2500,43 @@ def _read_mmap_band_chunk(
 	z0: int, z1: int, y0: int, y1: int, x0: int, x1: int,
 	cache: dict[str, np.memmap],
 ) -> np.ndarray:
-	path = descriptor.paths[int(channel)]
-	arr = cache.get(path)
-	if arr is None:
-		arr = np.memmap(
-			path, dtype=np.dtype(descriptor.dtype), mode="r",
-			shape=descriptor.storage_shape,
-		)
-		cache[path] = arr
+	if not 0 <= int(channel) < descriptor.channel_count:
+		raise ValueError("invalid mmap channel")
 	out = np.zeros((z1-z0, y1-y0, x1-x0), dtype=np.float32)
 	if descriptor.chunk_side:
-		for view, relative in _chunk_major_views(arr, descriptor, (z0, z1, y0, y1, x0, x1)):
-			out[relative] = view
+		b = descriptor.chunk_side
+		for shard, storage_start, storage_size in _axis0_shards(descriptor):
+			logical_start = storage_start * b
+			logical_stop = min((storage_start + storage_size) * b, descriptor.shape_zyx[0])
+			lo, hi = max(int(z0), logical_start), min(int(z1), logical_stop)
+			if lo >= hi:
+				continue
+			arr = _mmap_shard(descriptor, channel, shard, "r", cache)
+			for view, relative in _chunk_major_views(
+					arr, descriptor, (lo, hi, y0, y1, x0, x1),
+					axis0_index_offset=storage_start, relative_origin=(z0, y0, x0)):
+				out[relative] = view
 		return out
 	offset = 0
 	logical = int(z0)
 	while logical < int(z1):
 		physical = logical % descriptor.ring_depth
-		length = min(int(z1) - logical, descriptor.ring_depth - physical)
-		out[offset:offset+length] = arr[physical:physical+length, y0:y1, x0:x1]
-		offset += length
-		logical += length
+		wrap_length = min(int(z1) - logical, descriptor.ring_depth - physical)
+		remaining = wrap_length
+		while remaining:
+			for shard, storage_start, storage_size in _axis0_shards(descriptor):
+				if storage_start <= physical < storage_start + storage_size:
+					break
+			else:
+				raise ValueError("physical mmap index outside shards")
+			length = min(remaining, storage_start + storage_size - physical)
+			arr = _mmap_shard(descriptor, channel, shard, "r", cache)
+			out[offset:offset+length] = arr[
+				physical-storage_start:physical-storage_start+length, y0:y1, x0:x1]
+			offset += length
+			logical += length
+			physical += length
+			remaining -= length
 	return out
 
 
@@ -2334,30 +2578,48 @@ def _add_mmap_band_chunk(
 	source: np.ndarray,
 	cache: dict[str, np.memmap],
 ) -> str:
-	path = descriptor.paths[int(channel)]
-	arr = cache.get(path)
-	if arr is None:
-		arr = np.memmap(path, dtype=np.dtype(descriptor.dtype), mode="r+", shape=descriptor.storage_shape)
-		cache[path] = arr
+	if not 0 <= int(channel) < descriptor.channel_count:
+		raise ValueError("invalid mmap channel")
 	if descriptor.chunk_side:
 		backend = "numpy"
-		for view, relative in _chunk_major_views(arr, descriptor, (z0, z1, y0, y1, x0, x1)):
-			if descriptor.prefault:
-				_prefault_mmap_brick(arr, view, descriptor)
-			backend = _add_accumulator_view(view, source[relative])
+		b = descriptor.chunk_side
+		for shard, storage_start, storage_size in _axis0_shards(descriptor):
+			logical_start = storage_start * b
+			logical_stop = min((storage_start + storage_size) * b, descriptor.shape_zyx[0])
+			lo, hi = max(int(z0), logical_start), min(int(z1), logical_stop)
+			if lo >= hi:
+				continue
+			arr = _mmap_shard(descriptor, channel, shard, "r+", cache)
+			for view, relative in _chunk_major_views(
+					arr, descriptor, (lo, hi, y0, y1, x0, x1),
+					axis0_index_offset=storage_start, relative_origin=(z0, y0, x0)):
+				if descriptor.prefault:
+					_prefault_mmap_brick(arr, view, descriptor)
+				backend = _add_accumulator_view(view, source[relative])
 		return backend
 	offset = 0
 	logical = int(z0)
 	backend = "numpy"
 	while logical < int(z1):
 		physical = logical % descriptor.ring_depth
-		length = min(int(z1) - logical, descriptor.ring_depth - physical)
-		backend = _add_accumulator_view(
-			arr[physical:physical + length, y0:y1, x0:x1],
-			source[offset:offset + length],
-		)
-		offset += length
-		logical += length
+		wrap_length = min(int(z1) - logical, descriptor.ring_depth - physical)
+		remaining = wrap_length
+		while remaining:
+			for shard, storage_start, storage_size in _axis0_shards(descriptor):
+				if storage_start <= physical < storage_start + storage_size:
+					break
+			else:
+				raise ValueError("physical mmap index outside shards")
+			length = min(remaining, storage_start + storage_size - physical)
+			arr = _mmap_shard(descriptor, channel, shard, "r+", cache)
+			backend = _add_accumulator_view(
+				arr[physical-storage_start:physical-storage_start+length, y0:y1, x0:x1],
+				source[offset:offset + length],
+			)
+			offset += length
+			logical += length
+			physical += length
+			remaining -= length
 	return backend
 
 
@@ -2368,16 +2630,44 @@ def _stable_accumulator_owner(sd: int, origin: ChunkOriginZYX, worker_count: int
 	return int(value % int(worker_count))
 
 
-def _execute_accumulate_process_task(task, shms, mmaps) -> str:
+def _record_array(record: np.ndarray, layout: _SharedArrayLayout) -> np.ndarray:
+	return np.ndarray(layout.shape, dtype=np.dtype(layout.dtype), buffer=record,
+		offset=layout.offset)
+
+
+def _execute_accumulate_process_task(task, shms, mmaps, arena=None, record_spec=None) -> str:
 	"""Shared task executor for whole-volume and demand accumulation workers."""
-	shm = shms.get(task.result_spec.shm_name)
+	result_key = (task.result_spec.shm_name, task.result_spec.mmap_path,
+		task.result_spec.mmap_offset)
+	shm = shms.get(result_key)
 	if shm is None:
-		shm = _attach_shared_memory(task.result_spec.shm_name)
-		shms[task.result_spec.shm_name] = shm
+		shm = _attach_slot(task.result_spec)
+		shms[result_key] = shm
 	layouts = {layout.name: layout for layout in task.result_spec.layouts}
+	weight_spec = task.result_spec if task.weight_spec is None else task.weight_spec
+	weight_shm = shms.get(weight_spec.shm_name)
+	if weight_shm is None:
+		weight_shm = _attach_shared_memory(weight_spec.shm_name)
+		shms[weight_spec.shm_name] = weight_shm
+	weight_layouts = {layout.name: layout for layout in weight_spec.layouts}
 	lz0, lz1, ly0, ly1, lx0, lx1 = task.destination
 	pz0, pz1, py0, py1, px0, px1 = task.source
-	weight = _slot_array(shm, layouts[f"weight:{task.sd}"])[pz0:pz1, py0:py1, px0:px1]
+	weight = _slot_array(weight_shm, weight_layouts[f"weight:{task.sd}"])[pz0:pz1, py0:py1, px0:px1]
+	if task.arena_key is not None:
+		if arena is None or record_spec is None:
+			raise RuntimeError("arena accumulation task without an owner arena")
+		record = arena.mutable_record(task.arena_key, create=True)
+		record_layouts = {layout.name: layout for layout in record_spec.layouts}
+		destination = (slice(lz0, lz1), slice(ly0, ly1), slice(lx0, lx1))
+		backend = _add_accumulator_view(
+			_record_array(record, record_layouts["weight"])[destination], weight)
+		for name in task.dirty_products:
+			product = _slot_array(shm, layouts[f"product:{name}"])
+			for channel in range(int(product.shape[0])):
+				backend = _add_accumulator_view(
+					_record_array(record, record_layouts[f"product:{name}:{channel}"])[destination],
+					product[channel, pz0:pz1, py0:py1, px0:px1])
+		return backend
 	backend = _add_mmap_band_chunk(
 		task.weight, 0, lz0, lz1, ly0, ly1, lx0, lx1, weight, mmaps,
 	)
@@ -2393,30 +2683,90 @@ def _execute_accumulate_process_task(task, shms, mmaps) -> str:
 	return backend
 
 
-def _accumulate_process_main(worker_index: int, task_queue, result_queue) -> None:
+def _accumulate_process_main(worker_index: int, task_queue, result_queue,
+		record_spec=None, hot_slots=None, spill_segment_slots=256, scratch_dir=None,
+		spill_open_path=None, spill_request_queue=None, spill_response_queue=None,
+		spill_segment_stride=None) -> None:
+	# Emit the active Python frame for fatal native/mmap faults instead of
+	# leaving the coordinator with only a negative child exit code.
+	import faulthandler
+	faulthandler.enable(all_threads=True)
 	_native_limits = _limit_native_worker_threads()
 	shms: dict[str, shared_memory.SharedMemory] = {}
-	mmaps: dict[str, np.memmap] = {}
+	mmaps = _BoundedMmapCache()
+	arena = None
+	spill_fd = None
 	try:
+		if record_spec is not None:
+			from lasagna.chunk_accumulator_arena import ChunkAccumulatorArena
+			arena_arguments = {}
+			if spill_open_path is not None:
+				spill_fd = os.open(spill_open_path, os.O_RDWR)
+				def acquire_spill_slot():
+					spill_request_queue.put(("acquire", worker_index, -1))
+					kind, value = spill_response_queue.get()
+					if kind != "slot":
+						raise RuntimeError(f"spill arena allocation failed: {value}")
+					return value
+				def release_spill_slot(slot):
+					spill_request_queue.put(("release", worker_index, int(slot)))
+				arena_arguments = {
+					"spill_fd": spill_fd,
+					"spill_slot_acquire": acquire_spill_slot,
+					"spill_slot_release": release_spill_slot,
+					"spill_segment_stride": spill_segment_stride,
+				}
+			arena = ChunkAccumulatorArena(scratch_dir, record_bytes=record_spec.nbytes,
+				hot_slots=int(hot_slots), spill_segment_slots=spill_segment_slots,
+				**arena_arguments)
+			if spill_open_path is not None:
+				result_queue.put(("arena_attached", worker_index))
 		while True:
-			task = task_queue.get()
-			if task is None:
+			item = task_queue.get()
+			if item is None:
 				break
 			started = time.perf_counter()
 			try:
-				backend = _execute_accumulate_process_task(task, shms, mmaps)
-				result_queue.put((
-					"result", task.task_id, task.event_seq, worker_index, backend,
-					time.perf_counter() - started,
-				))
+				if isinstance(item, _ArenaPublishTask):
+					publication_shm = shms.get(item.publication_spec.shm_name)
+					if publication_shm is None:
+						publication_shm = _attach_shared_memory(item.publication_spec.shm_name)
+						shms[item.publication_spec.shm_name] = publication_shm
+					destination = np.ndarray((record_spec.nbytes,), np.uint8,
+						buffer=publication_shm.buf)
+					location = arena.snapshot_and_release(item.arena_key, destination)
+					result_queue.put(("publish_snapshot", item.request_id, item.publication_slot,
+						item.generation, worker_index, location, time.perf_counter() - started,
+						arena.telemetry()))
+				elif isinstance(item, _AccumulateProcessBatch):
+					backends = {
+						_execute_accumulate_process_task(task, shms, mmaps, arena, record_spec)
+						for task in item.tasks
+					}
+					result_queue.put((
+						"batch_result", item.batch_id, item.event_seq, worker_index,
+						",".join(sorted(backends)), time.perf_counter() - started,
+						len(item.tasks), arena.telemetry() if arena is not None else {},
+					))
+				else:
+					backend = _execute_accumulate_process_task(item, shms, mmaps, arena, record_spec)
+					result_queue.put((
+						"result", item.task_id, item.event_seq, worker_index, backend,
+						time.perf_counter() - started,
+					))
 			except BaseException as exc:
-				result_queue.put(("error", task.task_id, task.event_seq, worker_index, type(exc).__name__, str(exc)))
+				kind = "batch_error" if isinstance(item, _AccumulateProcessBatch) else "error"
+				identifier = item.batch_id if isinstance(item, _AccumulateProcessBatch) else getattr(item, "task_id", getattr(item, "request_id", -1))
+				event_seq = item.event_seq if hasattr(item, "event_seq") else -1
+				result_queue.put((kind, identifier, event_seq, worker_index,
+					type(exc).__name__, str(exc)))
 				break
 	finally:
-		for arr in mmaps.values():
-			mmap_obj = getattr(arr, "_mmap", None)
-			if mmap_obj is not None:
-				mmap_obj.close()
+		if arena is not None:
+			arena.close()
+		if spill_fd is not None:
+			os.close(spill_fd)
+		mmaps.close()
 		for shm in shms.values():
 			shm.close()
 
@@ -2476,7 +2826,7 @@ def _flush_process_main(
 	result_queue,
 ) -> None:
 	_native_limits = _limit_native_worker_threads()
-	cache: dict[str, np.memmap] = {}
+	cache = _BoundedMmapCache()
 	try:
 		while True:
 			task = task_queue.get()
@@ -2494,10 +2844,7 @@ def _flush_process_main(
 				))
 				break
 	finally:
-		for arr in cache.values():
-			mmap_obj = getattr(arr, "_mmap", None)
-			if mmap_obj is not None:
-				mmap_obj.close()
+		cache.close()
 
 
 def _ready_inference_batch(work_queue, first, max_batch_size):
@@ -2514,6 +2861,37 @@ def _ready_inference_batch(work_queue, first, max_batch_size):
 			break
 		batch.append(item)
 	return batch, stop
+
+
+def _blend_weights_by_scale(
+	blend_ramp: np.ndarray,
+	native_output_stride: int,
+	scales: Iterable[int],
+	*,
+	device: torch.device,
+) -> dict[int, torch.Tensor]:
+	"""Build the canonical deterministic blend weights used by all schedulers."""
+	ramp_t = torch.as_tensor(blend_ramp, dtype=torch.float32, device=device)
+	w_full = ramp_t[:, None, None] * ramp_t[None, :, None] * ramp_t[None, None, :]
+	w_native = (
+		_pyrdown3d(w_full.unsqueeze(0), factor=native_output_stride).squeeze(0)
+		if native_output_stride > 1 else w_full
+	)
+	return {
+		sd: (
+			_pyrdown3d(w_native.unsqueeze(0), factor=sd // native_output_stride).squeeze(0)
+			if sd > native_output_stride else w_native
+		)
+		for sd in sorted(set(int(value) for value in scales))
+	}
+
+
+def _copy_tensor_to_shared_array(destination: np.ndarray, source: torch.Tensor) -> None:
+	"""Copy directly into a shared NumPy allocation without a temporary CPU tensor."""
+	target = torch.from_numpy(destination)
+	if tuple(target.shape) != tuple(source.shape) or target.dtype != source.dtype:
+		raise ValueError("shared result layout does not match inference tensor")
+	target.copy_(source)
 
 
 def _multi_gpu_worker_main(
@@ -2540,8 +2918,8 @@ def _multi_gpu_worker_main(
 	device = torch.device(device_text)
 	if device.type == "cuda":
 		torch.cuda.set_device(device)
-	inputs = [_attach_shared_memory(spec.shm_name) for spec in input_specs]
-	results = [_attach_shared_memory(spec.shm_name) for spec in result_specs]
+	inputs = [_attach_slot(spec) for spec in input_specs]
+	results = [_attach_slot(spec) for spec in result_specs]
 	try:
 		model = model_adapter.load_model(device=device)
 		if model_state is not None:
@@ -2550,20 +2928,12 @@ def _multi_gpu_worker_main(
 				prepare_state_load(model, model_state, device=device)
 			model.load_state_dict(model_state, strict=True)
 		model.eval()
-		ramp_t = torch.as_tensor(blend_ramp, dtype=torch.float32, device=device)
-		w_full = ramp_t[:, None, None] * ramp_t[None, :, None] * ramp_t[None, None, :]
-		w_native = (
-			_pyrdown3d(w_full.unsqueeze(0), factor=native_output_stride).squeeze(0)
-			if native_output_stride > 1 else w_full
+		weights_by_scale = _blend_weights_by_scale(
+			blend_ramp, native_output_stride,
+			(*product_scales.values(), native_output_stride), device=device,
 		)
+		w_native = weights_by_scale[native_output_stride]
 		expected_native_shape = tuple(int(value) for value in w_native.shape)
-		weights_by_scale = {
-			sd: (
-				_pyrdown3d(w_native.unsqueeze(0), factor=sd // native_output_stride).squeeze(0)
-				if sd > native_output_stride else w_native
-			)
-			for sd in sorted(set(int(value) for value in product_scales.values()))
-		}
 		while True:
 			task = work_queue.get()
 			if task is None:
@@ -2670,14 +3040,21 @@ def _multi_gpu_worker_main(
 					result_slot, needed_names = item[3:5]
 					layouts = {layout.name: layout for layout in result_specs[result_slot].layouts}
 					for sd in sorted({int(product_scales[name]) for name in needed_names}):
-						_slot_array(results[result_slot], layouts[f"weight:{sd}"])[:] = weights_by_scale[sd].detach().cpu().numpy()
+						weight_name = f"weight:{sd}"
+						if weight_name in layouts:
+							_copy_tensor_to_shared_array(
+								_slot_array(results[result_slot], layouts[weight_name]),
+								weights_by_scale[sd],
+							)
 					for name in needed_names:
 						sd = int(product_scales[name])
 						weighted = tensors[name][index] * w_native
 						remaining_scaledown = sd // native_output_stride
 						if remaining_scaledown > 1:
 							weighted = _pyrdown3d(weighted, factor=remaining_scaledown)
-						_slot_array(results[result_slot], layouts[f"product:{name}"])[:] = weighted.detach().cpu().numpy()
+						_copy_tensor_to_shared_array(
+							_slot_array(results[result_slot], layouts[f"product:{name}"]), weighted,
+						)
 						del weighted
 				if profile is not None:
 					profile["output_and_d2h_wall_s"] = time.perf_counter() - stage_started

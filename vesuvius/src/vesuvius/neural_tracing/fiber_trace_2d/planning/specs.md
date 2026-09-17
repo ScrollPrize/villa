@@ -376,26 +376,44 @@
   the SAME tiled geometry/model worker/normalization/blend/filter/accumulation/
   finalization helpers used by sequential inference. Circular-Z/TensorStore/
   monotone Z-band admission rules below apply to the sequential mode. Demand
-  mode uses native fast-loader sampling and full-logical-shape sparse file-backed
-  mmap inside output Zarr `.live_tmp/session-*`; no dense zero initialization.
-- Optional `inference.accumulator_layout` is `flat` (default) or `chunk-major`.
-  Chunk-major scratch stores output-chunk grid ZYX followed by local brick ZYX,
-  in the same per-channel files. Edge bricks are padded; descriptors retain the
-  logical volume shape. Scratch has no application-imposed byte cap.
-  Shared accumulator/finalizer helpers translate regions, preserving per-add
-  arithmetic. Output Zarr geometry and chunk ownership/tasks do not change.
-  No prefaulting, eager allocation, advice or extra sync accompanies layout alone.
-  Layout participates in cache identity. `profile.accumulator_layout` overrides
-  it only for isolated benchmarks; sequential circular-Z storage stays unchanged.
-- Optional `inference.accumulator_prefault` defaults false and requires
-  chunk-major plus Linux MADV_POPULATE_WRITE support. Each owner advises each
-  channel's full touched brick once, before its first addition; writable advice
-  cost is included in task timings. Root-relative ranges are page-aligned and
-  clipped to mapping size. Failed advice raises and is not marked successful;
-  no read-prefault fallback or advice during finalizer reads. The kernel can
-  allocate sparse backing/page-cache memory, but no explicit zero writes or
-  scratch sync are added. This flag is cache-identified and has a profile-only
-  override. Unsupported platforms/kernels fail explicitly when enabled.
+  mode uses native fast-loader sampling and one pool-level chunk-local
+  accumulator arena shared logically across compatible sources. Each incomplete
+  chunk is keyed by `(source/store, chunk origin)` and contains one padded
+  `chunk^3` f32 weight plus all configured f16/f32 raw-product channels.
+- The arena has a fixed process-local anonymous-RAM hot tier partitioned into
+  owner-exclusive ranges (at least one slot per stable accumulator owner).
+  Hot storage is not POSIX shared memory because exactly one owner process ever
+  accesses each range; virtual capacity is reserved up front and physical pages
+  are committed only as records become live. Transport and immutable
+  publication slots remain shared memory.
+  Owner FIFO work messages carry only logical keys and local bounds; the owner
+  resolves its private location map at execution time. New/reused records are
+  completely zeroed before first add. Deterministic LRU eviction copies full
+  records into fixed-size views of one pool-wide regular-file mmap created and
+  immediately unlinked under the configured cache filesystem. A central broker
+  owns the lowest-free-slot heap, serializes logical file growth, and gives
+  owners only prepared slots. Spill contains only previously hot
+  records and has no hard slot cap. Promotion and completed publication return
+  slots globally, so allocation follows concurrent cold-state high-water,
+  which may grow with explored incidental partial chunks.
+- Completed records copy once into generation-leased shared publication slots;
+  owner storage is released only after the snapshot copy completes. Publishers
+  finalize immutable snapshots and atomically replace Zarr chunks. No publisher
+  maps owner spill or hot storage. Normal/crash close releases anonymous spill
+  extents; no named arena files or per-chunk backing files remain. Legacy
+  `.live_tmp/session-*` full-volume scratch is ignored during startup and may be
+  removed only by explicit offline maintenance, never synchronous resume.
+- Legacy `inference.accumulator_layout` and `accumulator_prefault` remain parsed
+  and cache-identified exactly for prepared-cache compatibility, but are
+  superseded by the chunk-local demand arena and no longer control demand scratch.
+  Sequential circular-Z storage and its mmap/prefault behavior remain unchanged.
+  Hot-slot count, spill segment slots and eviction policy are throughput-only and
+  do not enter persistent inference identity.
+- The spill broker extends the anonymous backing file logically once per mmap
+  segment with `ftruncate`. It must not synchronously `posix_fallocate` individual
+  records or segments; mmap page faults and kernel writeback allocate physical
+  storage lazily. Slot assignment/reuse remains centrally serialized, while
+  independent owner writes are not serialized behind filesystem allocation.
 - Native stride, tile/stride/border alignment and numerical precision remain
   unchanged. Demand accumulation follows GPU result arrival order, explicitly
   allowing order-dependent f16/f32 rounding; sequential inference retains its
@@ -439,21 +457,31 @@
   Bounded background publication uses the shared finalizer after all contributors
   acknowledge; only the coordinator marks RAM readiness. Explicit zero chunks
   are stored. Restart lazily checks all sibling files and decodes requested chunks
-  against expected shape/dtype/chunk geometry, cleans validated owned scratch and
-  rebuilds incomplete work. No whole-volume scan or persistent checksum table.
+  against expected shape/dtype/chunk geometry and rebuilds incomplete work. It
+  does not traverse or delete legacy/new scratch on resume. No whole-volume scan
+  or persistent checksum table.
   Active ready files are immutable. Before replacing an incomplete sibling group,
   validate all paths and remove its old siblings so process interruption cannot
   leave a mixed-generation complete group. This is not a power-loss transactional
   guarantee; same-size, decodable corruption is not cryptographically detected.
-- Active shared RAM slots remain bounded; file-backed scratch has no configured
-  size cap, touched-byte accounting or per-tile filesystem-space polling.
-  Fresh sparse mmap holes read as zeros, without preallocation. Actual filesystem
-  errors propagate rather than being masked. Disk exhaustion
+- Active result, hot-accumulator and publication shared-RAM slots remain bounded;
+  anonymous file-backed spill has no configured total size cap or per-tile
+  filesystem-space polling. Telemetry reports hot/spill occupancy/high-water,
+  capacity, promotion/eviction and bytes copied. Actual filesystem errors
+  propagate rather than being masked. Disk exhaustion
   can still cause a worker SIGBUS; worker death aborts instead of marking ready.
   No silent partial-output eviction. Stuck underlying
   input-read cancellation is explicitly deferred by the user (not an observed
   stuck condition or current blocker). Global queued-descriptor bounds and
   stress/performance validation remain future hardening, not guarantees.
+- Large reusable GPU result slots may use one regular-file-backed mmap ring
+  under the hidden cache scratch directory instead of POSIX shared memory.
+  Every slot has a fixed aligned offset and is mapped directly by GPU and
+  accumulator workers; this is shared byte storage, not staged serialization.
+  The ring is created once per pool, performs no explicit fsync, creates no
+  per-tile files, and is unlinked when the pool closes after children have
+  detached. Input slots may remain POSIX shared memory. Transport backing and
+  slot counts are throughput settings outside persistent inference identity.
 - The short inference profiler may opt into isolated native-reader responsiveness
   controls: idle, no-intersection allocation-only reads, prewarmed native reads
   and full reader-wrapper calls. A separate Python heartbeat and calling-thread

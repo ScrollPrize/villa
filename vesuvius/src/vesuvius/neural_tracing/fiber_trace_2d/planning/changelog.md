@@ -2935,3 +2935,19 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
   but retained all5 failures and missed the locked +160 promotion threshold.
 - Kept the existing construction defaults and skipped short200. Complete results:
   `../docs/benchmarks/fiberlet_construction_dp_retuning_u22000_20260917.md`.
+
+## 2026-09-17 — Full-resolution demand evaluation completed
+
+- Replaced large POSIX shared-memory GPU result slots with one reusable direct
+  regular-file mmap ring after host-wide shared-memory pressure caused all eight
+  GPU workers to SIGBUS during output copies. Inputs retain their smaller POSIX
+  shared-memory ring; no staged arrays, per-tile files or explicit fsyncs were
+  introduced.
+- Sized the lazily committed hot accumulator arena to the measured live set
+  (163,840 records / 720-GiB virtual capacity), retaining the reusable unbounded
+  spill arena only as a correctness fallback.
+- Completed the native-resolution best-EMA999 five-scroll evaluation: 180/180
+  directions, 127 restart episodes, 53.653-mm combined mean and 8.922-mm median.
+  Native 23/85/17 and Python 283 tests pass (8 skipped). Full provenance and
+  per-scroll metrics:
+  `../docs/benchmarks/fullres_refinement_213753_best_ema999_20260917.md`.

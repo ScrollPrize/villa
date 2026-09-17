@@ -83,7 +83,8 @@ class ModelWorkerPools:
             for group, selected in zip(groups, assignments):
                 settings = group["settings"]
                 kwargs = dict(options)
-                for name in ("input_workers", "input_slots", "result_slots", "accumulator_workers", "flush_workers"):
+                for name in ("input_workers", "input_slots", "result_slots", "accumulator_workers",
+                             "accumulator_hot_slots", "accumulator_spill_segment_slots", "flush_workers"):
                     if kwargs.get(name) is not None:
                         kwargs[name] = max(1, kwargs[name] // len(groups))
                 # These two affect numerics/cache identity and belong to each model.
@@ -101,7 +102,8 @@ class ModelWorkerPools:
     @property
     def stats(self):
         result = {"models": [p.stats for p in self.pools]}
-        for name in ("shared_slot_bytes", "input_slots", "input_workers", "result_slots", "tiles"):
+        for name in ("shared_slot_bytes", "accumulator_hot_capacity_bytes",
+                     "input_slots", "input_workers", "result_slots", "tiles"):
             result[name] = sum(p.stats.get(name, 0) for p in self.pools)
         result["max_batch_size"] = max(p.stats["max_batch_size"] for p in self.pools)
         return result

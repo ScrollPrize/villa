@@ -321,7 +321,7 @@ def profile_workload(workload, *, devices_override=None):
                         with lock:
                             phase_values.setdefault(name, []).append(time.perf_counter() - begin)
                 return call
-            for name in ("begin_complete", "contribution_done", "publication_done", "_publish", "_cached_chunk_complete", "_sync_published"):
+            for name in ("begin_complete", "contribution_done", "publication_done", "_publish_record", "_cached_chunk_complete", "_sync_published"):
                 setattr(store, name, instrument(name, getattr(store, name)))
             pool = cleanup.enter_context(demand.DemandWorkerPool({"source": store}, {"source": instrument("native_read", reader)},
                 devices, slots_per_gpu=settings["slots_per_gpu"], input_workers=settings["input_workers"],
@@ -329,6 +329,8 @@ def profile_workload(workload, *, devices_override=None):
                 result_slots=params.get("result_slots", settings.get("result_slots")),
                 max_batch_size=settings.get("max_batch_size", 1),
                 accumulator_workers=settings.get("accumulator_workers"),
+                accumulator_hot_slots=settings.get("accumulator_hot_slots"),
+                accumulator_spill_segment_slots=int(settings.get("accumulator_spill_segment_slots", 256)),
                 flush_workers=int(settings.get("flush_workers", 4)), profile_pipeline=True))
             warm_start = time.perf_counter()
             while len(pool.worker_ids) < len(devices) and pool.busy and time.perf_counter() - warm_start < params["warmup_max_seconds"]:

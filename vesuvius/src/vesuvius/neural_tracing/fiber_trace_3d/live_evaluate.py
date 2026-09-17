@@ -522,7 +522,8 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
             def open_queue_log():
                 nonlocal queue_log
                 queue_log = cleanup.enter_context((Path(evaluation["output"]) / "inference_queues.jsonl").open("x"))
-                print(f"live-eval buffers={pool.stats['shared_slot_bytes'] / (1 << 30):.2f}GiB "
+                print(f"live-eval shared_buffers={pool.stats['shared_slot_bytes'] / (1 << 30):.2f}GiB "
+                      f"hot_capacity={pool.stats.get('accumulator_hot_capacity_bytes', 0) / (1 << 30):.2f}GiB "
                       f"input_slots={pool.stats['input_slots']} readers={pool.stats['input_workers']} "
                       f"result_slots={pool.stats['result_slots']} max_batch_size={max_batch_size} "
                       f"reused_pool={reused_pool}", flush=True)
@@ -592,6 +593,8 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                         result_slots=settings.get("result_slots"),
                         max_batch_size=max_batch_size,
                         accumulator_workers=settings.get("accumulator_workers"),
+                        accumulator_hot_slots=settings.get("accumulator_hot_slots"),
+                        accumulator_spill_segment_slots=int(settings.get("accumulator_spill_segment_slots", 256)),
                         flush_workers=int(settings.get("flush_workers", 4)),
                         deferred_gpu=adaptive is not None)
                     if adaptive is not None:
