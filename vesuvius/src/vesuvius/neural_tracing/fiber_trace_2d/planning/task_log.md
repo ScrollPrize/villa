@@ -32,3 +32,15 @@
   65536 negatives/patch,3warmups+10samples): legacy mean/p50/p95
   6.867/6.882/6.907ms; split8x8 9.899/9.895/9.968ms. The split objective adds
   about3.03ms in this isolated loss benchmark; no model/data path is included.
+- 2026-09-17: Committed implementation/config as `6068cd822` and launched managed
+  run `5scroll_json_eligible_fullres_frozen_refined_split_embedding_128_sd1_16x8_ema_20260917_121854`.
+  Update0 evaluation restored the exact frozen archive and reported finite short
+  (`5.165938`) and long (`5.276968`) embedding losses from fresh model/EMA state.
+- 2026-09-17: Startup exposed an existing native remote-open bug: 128 loader
+  workers eagerly ran `aws configure export-credentials` even though the public
+  S3 objects accepted anonymous access. Added an anonymous-first, deferred-auth
+  fix for future runs; the active run remains uninterrupted.
+- 2026-09-17: Rebuilt the editable VC extension with GCC13. Focused native auth
+  coverage passes 18/18, all changed production translation units compile, and
+  the approved `run_fiber3d_experiment remote-auth-probe` opened the public
+  Paris4 pyramid (levels0-5) with a sentinel AWS helper that was never invoked.

@@ -1,4 +1,8 @@
 {
+  "remote_auth_probe": {
+    "url": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+    "timeout_seconds": 60
+  },
   "embedding_milestone": {
     "step": 5400,
     "checkpoint": "/ephemeral/hendrik/fiber3d_train2/runs/combined_5scroll_s1a_paired_contrastive_128_sd1_16x8_ema_20260913_174112/snapshots/current.pt",

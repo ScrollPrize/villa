@@ -36,6 +36,11 @@
    runner, and verify from logs that update0 uses fresh weights, frozen fibers are
    restored from update17800, no refinement updates occur, and both embedding banks
    report finite losses/gradients.
+8. Remove the observed 128-worker AWS credential-helper stampede without restarting
+   the active run: make native S3 volume, manifest, and Lasagna object access try
+   anonymous HTTP first and resolve ambient AWS credentials lazily only after an
+   authentication denial. Preserve private-bucket fallback and add deterministic
+   native regression coverage.
 
 ## Spec update
 

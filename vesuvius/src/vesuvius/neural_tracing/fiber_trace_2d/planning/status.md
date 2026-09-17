@@ -7,4 +7,5 @@
 - [x] Add fresh production config and regression tests.
 - [x] Update docs, task log and changelog.
 - [x] Run focused CPU and managed CUDA validation.
-- [ ] Commit and launch managed training; verify fresh model plus frozen fibers.
+- [x] Commit and launch managed training; verify fresh model plus frozen fibers.
+- [x] Validate and commit anonymous-first remote access fix.
