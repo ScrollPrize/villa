@@ -19,8 +19,13 @@
 
 #include <omp.h>
 
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <optional>
@@ -32,6 +37,38 @@ using shape = std::vector<size_t>;
 
 
 using Json = utils::Json;
+
+// The tracer's Ceres solves go through CHOLMOD, whose BLAS calls land in the
+// process-wide OpenBLAS pool. The pthreads build of OpenBLAS sizes that pool
+// from the core count when the library is loaded and the idle workers
+// spin-wait (sched_yield) between jobs; the tracer issues many small
+// factorizations, so on an N-core machine the pool burns N-1 cores for
+// nothing, and neither thread_limit nor omp_set_num_threads() reaches it.
+// Measured on a 14C/28T Xeon, same 1.78 cm2 patch: thread_limit=1 took
+// 189 CPU-s for 16.6 s of wall with the pool and 13 CPU-s / 12.7 s with it
+// capped; 28 threads took 122 CPU-s / 6.6 s versus 33 CPU-s / 3.7 s.
+// Same runtime cap as VC3D's VCAppMain.cpp: runs launched from VC3D get
+// OMP_NUM_THREADS from CommandLineToolRunner (OpenBLAS honours it too),
+// direct CLI runs had nothing. An explicit OPENBLAS_NUM_THREADS /
+// GOTO_NUM_THREADS in the environment wins: OpenBLAS already honoured it.
+static void cap_blas_thread_pool()
+{
+#ifndef _WIN32
+    if (std::getenv("OPENBLAS_NUM_THREADS") || std::getenv("GOTO_NUM_THREADS"))
+        return;
+    const int omp_threads = omp_get_max_threads();
+    if (auto fn = reinterpret_cast<void (*)(int)>(dlsym(RTLD_DEFAULT, "openblas_set_num_threads")))
+        fn(1);
+    // Retire the workers created at load; OpenBLAS re-creates a pool on
+    // demand, now sized to one thread.
+    if (auto fn = reinterpret_cast<void (*)()>(dlsym(RTLD_DEFAULT, "blas_shutdown")))
+        fn();
+    // OpenMP builds of OpenBLAS up to 0.3.0 forwarded the call above to
+    // omp_set_num_threads(); the tracer's own thread count stays as it was.
+    if (omp_get_max_threads() != omp_threads)
+        omp_set_num_threads(omp_threads);
+#endif
+}
 
 static bool is_remote_volume_path(const std::string& path)
 {
@@ -203,6 +240,11 @@ static auto load_direction_fields(Json const&params, std::filesystem::path const
 
 int main(int argc, char *argv[])
 {
+    // First: the workers spin for about 0.1 s after the OpenBLAS constructor
+    // creates them (3 CPU-s for 27 workers), so retire them before the
+    // volume is opened rather than when the thread settings are applied.
+    cap_blas_thread_pool();
+
     std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path;
     cv::Vec3d origin;
     Json params;
