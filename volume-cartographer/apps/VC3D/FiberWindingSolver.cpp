@@ -5,6 +5,7 @@
 #include <limits>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <set>
@@ -44,6 +45,14 @@ double wrappedDelta(double a, double b)
     return d - M_PI;
 }
 
+// What a constraint was built from: a merged crossing, an input link, or a
+// traversal group standing in for its member crossings.
+enum class SourceKind { Crossing, Link, Group };
+struct SourceRef {
+    SourceKind kind = SourceKind::Crossing;
+    std::size_t index = 0;
+};
+
 // k[to] - k[from] >= weight. Equalities are a pair of mirrored constraints
 // dropped together.
 struct Constraint {
@@ -51,8 +60,7 @@ struct Constraint {
     std::size_t to = 0;
     long long weight = 0;
     double confidence = 0.0;
-    // >= 0: index into the merged crossing list; < 0: -(linkIndex + 1).
-    long long source = 0;
+    SourceRef source;
     long long pair = -1;
     bool active = true;
 };
@@ -110,6 +118,12 @@ std::vector<Branch> splitBranches(const std::vector<double>& psi,
     if (z.size() < 2) {
         return branches;
     }
+    // Vertex identity: consecutive samples at one (psi, z) are one vertex.
+    std::vector<std::size_t> vertexOf(z.size(), 0);
+    for (std::size_t i = 1; i < z.size(); ++i) {
+        vertexOf[i] = (psi[i] == psi[i - 1] && z[i] == z[i - 1]) ? vertexOf[i - 1]
+                                                                  : vertexOf[i - 1] + 1;
+    }
     std::size_t start = 0;
     int direction = 0;
     // Named to survive Qt's `emit` macro: with the project PCH, Qt headers
@@ -123,12 +137,17 @@ std::vector<Branch> splitBranches(const std::vector<double>& psi,
         branch.psi.resize(count);
         branch.z.resize(count);
         branch.r.resize(count);
+        branch.vertexId.resize(count);
+        branch.sample.resize(count);
         const bool ascending = z[end] >= z[begin];
+        branch.forwardAscending = ascending;
         for (std::size_t i = 0; i < count; ++i) {
             const std::size_t src = ascending ? begin + i : end - i;
             branch.psi[i] = psi[src];
             branch.z[i] = z[src];
             branch.r[i] = r[src];
+            branch.vertexId[i] = vertexOf[src];
+            branch.sample[i] = src;
         }
         branch.psiMin = *std::min_element(branch.psi.begin(), branch.psi.end());
         branch.psiMax = *std::max_element(branch.psi.begin(), branch.psi.end());
@@ -273,6 +292,9 @@ CanonicalTrace canonicalizeTrace(const FiberTrace& fiber, int chirality)
     CanonicalTrace trace;
     trace.hvTag = fiber.hvTag;
     trace.trusted = fiber.trusted;
+    trace.kollesisStartSample = fiber.kollesisStartSample;
+    trace.kollesisEndSample = fiber.kollesisEndSample;
+    trace.onKollesis = fiber.onKollesis;
     const bool usable = fiber.theta.size() >= 2 &&
                         fiber.radius.size() == fiber.theta.size() &&
                         fiber.z.size() == fiber.theta.size() &&
@@ -299,42 +321,131 @@ CanonicalTrace canonicalizeTrace(const FiberTrace& fiber, int chirality)
 // The detection loop for one (H, V) pair, over the V trace's precomputed
 // z-monotone branches. Everything here is pair-local: the produced crossings
 // carry no indices, no global ids, and no dependence on any other pair.
-PairCrossings detectPairCrossings(const CanonicalTrace& hTrace,
-                                  const CanonicalTrace& vTrace,
-                                  const SolverParams& params)
+PairDetections detectPairCrossings(const CanonicalTrace& hTrace,
+                                   const CanonicalTrace& vTrace,
+                                   const SolverParams& params)
 {
-    PairCrossings result;
+    PairDetections result;
     if (hTrace.psi.empty() || vTrace.psi.empty()) {
         return result;
     }
-    const bool declarable = hTrace.trusted && vTrace.trusted;
+    const bool trusted = hTrace.trusted && vTrace.trusted;
+    // Transversal events, merged by the classification into representatives
+    // as before, and shallow (tangential) events, which are recorded and
+    // counted but never merged into a representative or constraining on
+    // their own - exactly the passes the transversality gate used to discard
+    // unrecorded.
     std::vector<Crossing> raw;
+    std::vector<Crossing> shallow;
+    std::size_t detectionCount = 0;
+    // Translates on which an event may have gone unseen: a gated segment
+    // whose translate could have met the other fiber, or a pair of exactly
+    // parallel owner segments the intersection cannot be placed on.
+    std::set<long long> gapTranslates;
+    std::set<long long> unresolvedTranslates;
+    std::set<std::size_t> uncoveredSegments;
     const double maxStep = params.maxStepTurns * kTwoPi;
+    // Zero-area test for three points in (psi, z), robust to rounding: the
+    // orientation determinant is compared with the bound on its own rounding
+    // error (Shewchuk's orient2d filter bound, which covers the differences
+    // and the products); a determinant inside that envelope has no certain
+    // sign, and the point is taken to lie on the segment. An incidence exact
+    // in the reals therefore reads the same in either fiber's sample order.
+    // The envelope itself depends on which point anchors the determinant,
+    // so a point within about 1e-16 (relative) of the segment, without
+    // being on it, may read as incident in one order and not the other;
+    // deciding that adaptively (Shewchuk's full predicates) is left for
+    // when data ever asks for it - the consequences here are conservative
+    // (a vertex hit counts for no group, its limbs take no verdict). The
+    // two products are compared as separately rounded values, never as one
+    // fused expression (floating-point contraction would round a*b - c*d
+    // differently from the two products).
+    constexpr double kEps = std::numeric_limits<double>::epsilon() / 2.0;
+    constexpr double kOrientErrorBound = (3.0 + 16.0 * kEps) * kEps;
+    const auto sameArea = [](double ax, double az, double bx, double bz, double px, double pz) {
+        const double lhs = (bx - ax) * (pz - az);
+        const double rhs = (bz - az) * (px - ax);
+        return std::abs(lhs - rhs) <= kOrientErrorBound * (std::abs(lhs) + std::abs(rhs));
+    };
+    // Two radii equal within rounding: a contact. An interpolated radius
+    // carries the rounding of its parameter times the endpoint radii it
+    // interpolates between, so the envelope is relative to the magnitudes
+    // that went in (`scale`), not to the result, which cancellation can
+    // leave small.
+    constexpr double kRadialErrorBound = 8.0 * kEps;
+    const auto sameRadius = [](double a, double b, double scale) {
+        return std::abs(a - b) <= kRadialErrorBound * scale;
+    };
     const std::vector<double>& hPsi = hTrace.psi;
     const std::vector<double>& hZ = hTrace.z;
     const std::vector<double>& hR = hTrace.radius;
-    for (const Branch& branch : vTrace.branches) {
+    // The last segment of positive length on each polyline: the one whose end
+    // closes the trace, whatever repeated samples trail it.
+    const auto lastRealSegment = [](const std::vector<double>& psi, const std::vector<double>& z) {
+        std::size_t last = 0;
+        for (std::size_t i = 0; i + 1 < psi.size(); ++i) {
+            if (psi[i + 1] != psi[i] || z[i + 1] != z[i]) {
+                last = i;
+            }
+        }
+        return last;
+    };
+    // The nearest sample before/after `index` that differs from it, or npos.
+    const auto distinctBefore = [](const std::vector<double>& psi, const std::vector<double>& z,
+                                   std::size_t index) {
+        for (std::size_t k = index; k > 0; --k) {
+            if (psi[k - 1] != psi[index] || z[k - 1] != z[index]) {
+                return k - 1;
+            }
+        }
+        return static_cast<std::size_t>(-1);
+    };
+    const auto distinctAfter = [](const std::vector<double>& psi, const std::vector<double>& z,
+                                  std::size_t index) {
+        for (std::size_t k = index + 1; k < psi.size(); ++k) {
+            if (psi[k] != psi[index] || z[k] != z[index]) {
+                return k;
+            }
+        }
+        return static_cast<std::size_t>(-1);
+    };
+    const std::size_t hLastSegment = lastRealSegment(hPsi, hZ);
+    for (std::size_t branchIndex = 0; branchIndex < vTrace.branches.size(); ++branchIndex) {
+        const Branch& branch = vTrace.branches[branchIndex];
         const double branchZLo = branch.z.front();
         const double branchZHi = branch.z.back();
+        const std::size_t branchLastSegment = lastRealSegment(branch.psi, branch.z);
+        // The branch is stored ascending in z; its segments are walked back
+        // in the fiber's own polyline order for the orientation sign.
+        const int branchDirection = branch.forwardAscending ? 1 : -1;
         for (std::size_t i = 0; i + 1 < hPsi.size(); ++i) {
             const double zLo = std::min(hZ[i], hZ[i + 1]);
             const double zHi = std::max(hZ[i], hZ[i + 1]);
             if (zHi < branchZLo || zLo > branchZHi) {
                 continue;
             }
-            if (std::min(hR[i], hR[i + 1]) < params.minUmbilicusRadiusVx ||
-                std::abs(hPsi[i + 1] - hPsi[i]) > maxStep) {
-                ++result.gatedSegmentCount;
-                continue;
-            }
             // Candidate 2*pi translates of this H segment into the branch's
-            // lift window.
+            // lift window - computed before the gate, because a gated segment
+            // still says which translates it could have met.
             const double segPsiLo = std::min(hPsi[i], hPsi[i + 1]);
             const double segPsiHi = std::max(hPsi[i], hPsi[i + 1]);
             const long long mLo = static_cast<long long>(
                 std::floor((branch.psiMin - segPsiHi) / kTwoPi));
             const long long mHi = static_cast<long long>(
                 std::ceil((branch.psiMax - segPsiLo) / kTwoPi));
+            if (std::min(hR[i], hR[i + 1]) < params.minUmbilicusRadiusVx ||
+                std::abs(hPsi[i + 1] - hPsi[i]) > maxStep) {
+                ++result.gatedSegmentCount;
+                uncoveredSegments.insert(i);
+                for (long long m = mLo; m <= mHi; ++m) {
+                    const double lo = segPsiLo + kTwoPi * static_cast<double>(m);
+                    const double hi = segPsiHi + kTwoPi * static_cast<double>(m);
+                    if (hi >= branch.psiMin && lo <= branch.psiMax) {
+                        gapTranslates.insert(m);
+                    }
+                }
+                continue;
+            }
             // V segments overlapping the H segment's z range, found by
             // binary search on the branch's ascending z.
             const auto zBegin = std::lower_bound(branch.z.begin(),
@@ -353,24 +464,203 @@ PairCrossings detectPairCrossings(const CanonicalTrace& hTrace,
                     if (branch.z[j + 1] < zLo) {
                         continue;
                     }
+                    const bool psiOverlap =
+                        std::max(x0, x1) >= std::min(branch.psi[j], branch.psi[j + 1]) &&
+                        std::min(x0, x1) <= std::max(branch.psi[j], branch.psi[j + 1]);
+                    // Overlap of positive length along the coordinate the
+                    // segments extend in (height for near-vertical ones).
+                    // Collinear segments sharing only an endpoint are left to
+                    // the neighbouring segments' own intersections; the
+                    // contact itself is not recorded.
+                    const bool alongZ = std::abs(x1 - x0) < std::abs(hZ[i + 1] - hZ[i]);
+                    const bool overlapProper = alongZ
+                        ? (zHi > std::min(branch.z[j], branch.z[j + 1]) &&
+                           zLo < std::max(branch.z[j], branch.z[j + 1]))
+                        : (std::max(x0, x1) > std::min(branch.psi[j], branch.psi[j + 1]) &&
+                           std::min(x0, x1) < std::max(branch.psi[j], branch.psi[j + 1]));
                     if (std::min(branch.r[j], branch.r[j + 1]) <
                             params.minUmbilicusRadiusVx ||
                         std::abs(branch.psi[j + 1] - branch.psi[j]) > maxStep) {
                         ++result.gatedSegmentCount;
+                        if (psiOverlap) {
+                            gapTranslates.insert(m);
+                            uncoveredSegments.insert(i);
+                        }
                         continue;
                     }
                     const double rx = x1 - x0;
                     const double rz = hZ[i + 1] - hZ[i];
                     const double sx = branch.psi[j + 1] - branch.psi[j];
                     const double sz = branch.z[j + 1] - branch.z[j];
+                    // A zero-length segment in the projection is a repeated
+                    // sample, which meets nothing its neighbours do not - or
+                    // a step along the umbilicus ray (radius changes, angle
+                    // and height do not), which can pass straight through the
+                    // other fiber's curtain where no intersection can be
+                    // placed: its point on the other segment with its radii
+                    // straddling the other's radius there makes the translate
+                    // unresolved.
+                    if ((rx == 0.0 && rz == 0.0) || (sx == 0.0 && sz == 0.0)) {
+                        const bool hRadial = rx == 0.0 && rz == 0.0 && hR[i] != hR[i + 1];
+                        const bool vRadial =
+                            sx == 0.0 && sz == 0.0 && branch.r[j] != branch.r[j + 1];
+                        if (hRadial && vRadial) {
+                            // Two radial steps at one point: unresolved when
+                            // their radial intervals meet.
+                            if (x0 == branch.psi[j] && hZ[i] == branch.z[j] &&
+                                std::max(std::min(hR[i], hR[i + 1]),
+                                         std::min(branch.r[j], branch.r[j + 1])) <=
+                                    std::min(std::max(hR[i], hR[i + 1]),
+                                             std::max(branch.r[j], branch.r[j + 1]))) {
+                                unresolvedTranslates.insert(m);
+                                uncoveredSegments.insert(i);
+                                ++result.unresolvedCount;
+                            }
+                        } else if (hRadial || vRadial) {
+                            // The radial step's point P against the other
+                            // segment A->B.
+                            const double px = hRadial ? x0 : branch.psi[j];
+                            const double pz = hRadial ? hZ[i] : branch.z[j];
+                            const double ax = hRadial ? branch.psi[j] : x0;
+                            const double az = hRadial ? branch.z[j] : hZ[i];
+                            const double bx = hRadial ? branch.psi[j + 1] : x1;
+                            const double bz = hRadial ? branch.z[j + 1] : hZ[i + 1];
+                            const bool onSegment = sameArea(ax, az, bx, bz, px, pz) &&
+                                                   px >= std::min(ax, bx) && px <= std::max(ax, bx) &&
+                                                   pz >= std::min(az, bz) && pz <= std::max(az, bz);
+                            if (onSegment) {
+                                // The other segment's radius at P, by the
+                                // parameter along its dominant axis.
+                                const double w = std::abs(bz - az) >= std::abs(bx - ax)
+                                    ? (bz != az ? (pz - az) / (bz - az) : 0.0)
+                                    : (bx != ax ? (px - ax) / (bx - ax) : 0.0);
+                                const double rOtherA = hRadial ? branch.r[j] : hR[i];
+                                const double rOtherB = hRadial ? branch.r[j + 1] : hR[i + 1];
+                                const double rOther = rOtherA + w * (rOtherB - rOtherA);
+                                const double rStepLo =
+                                    hRadial ? std::min(hR[i], hR[i + 1])
+                                            : std::min(branch.r[j], branch.r[j + 1]);
+                                const double rStepHi =
+                                    hRadial ? std::max(hR[i], hR[i + 1])
+                                            : std::max(branch.r[j], branch.r[j + 1]);
+                                const double scale = std::abs(rOtherA) + std::abs(rOtherB) +
+                                                     std::abs(rStepLo) + std::abs(rStepHi);
+                                if ((rOther >= rStepLo || sameRadius(rOther, rStepLo, scale)) &&
+                                    (rOther <= rStepHi || sameRadius(rOther, rStepHi, scale))) {
+                                    unresolvedTranslates.insert(m);
+                                    uncoveredSegments.insert(i);
+                                    ++result.unresolvedCount;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     const double denom = rx * sz - rz * sx;
                     const double qpx = branch.psi[j] - x0;
                     const double qpz = branch.z[j] - hZ[i];
-                    if (denom == 0.0) {
-                        continue;
+                    double t = 0.0;
+                    double u = 0.0;
+                    // Parallel iff the two products agree exactly (compared as
+                    // separately rounded values; contraction-safe). Exactly,
+                    // not within an envelope: a nearly parallel pair whose
+                    // lines meet far off both segments must not be taken for
+                    // an overlap, and exact equality survives either segment's
+                    // reversal (both products negate).
+                    const bool parallel = rx * sz == rz * sx;
+                    if (parallel) {
+                        // Parallel owner segments. Disjoint parallels meet
+                        // nowhere; collinear ones overlapping in angle share a
+                        // stretch on which no intersection can be placed, so
+                        // the translate's count is not to be trusted.
+                        const bool collinear = rx * qpz == rz * qpx;
+                        if (!collinear) {
+                            continue;
+                        }
+                        if (overlapProper) {
+                            unresolvedTranslates.insert(m);
+                            uncoveredSegments.insert(i);
+                            ++result.unresolvedCount;
+                            continue;
+                        }
+                        // Collinear segments sharing exactly one endpoint meet
+                        // at a vertex of both polylines. The half-open
+                        // ownership may hand that vertex to this very pair (the
+                        // segments leaving it), so the hit is placed at the
+                        // shared endpoint and read like any vertex hit below -
+                        // its rays, not these segments, say what it is.
+                        if (x0 == branch.psi[j] && hZ[i] == branch.z[j]) {
+                            t = 0.0;
+                            u = 0.0;
+                        } else if (x0 == branch.psi[j + 1] && hZ[i] == branch.z[j + 1]) {
+                            t = 0.0;
+                            u = 1.0;
+                        } else if (x1 == branch.psi[j] && hZ[i + 1] == branch.z[j]) {
+                            t = 1.0;
+                            u = 0.0;
+                        } else if (x1 == branch.psi[j + 1] && hZ[i + 1] == branch.z[j + 1]) {
+                            t = 1.0;
+                            u = 1.0;
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        t = (qpx * sz - qpz * sx) / denom;
+                        u = (qpx * rz - qpz * rx) / denom;
+                        // A vertex of one segment lying exactly on the other
+                        // is decided on the coordinates themselves (an exact
+                        // orientation predicate within the segment's box),
+                        // not on the divided parameter, which can miss 0 or 1
+                        // by an ulp and differ between the two branches
+                        // sharing a vertex; the parameter is snapped to the
+                        // vertex so ownership and identity see it.
+                        const auto onSegment = [&](double ax, double az, double bx, double bz,
+                                                   double px, double pz) {
+                            return sameArea(ax, az, bx, bz, px, pz) &&
+                                   px >= std::min(ax, bx) && px <= std::max(ax, bx) &&
+                                   pz >= std::min(az, bz) && pz <= std::max(az, bz);
+                        };
+                        // The other parameter is then taken from the vertex's
+                        // coordinates along the segment's dominant axis (one
+                        // division of exact inputs), not from the determinant
+                        // quotient, whose last-place error would put the hit
+                        // a hair off the vertex and its radius a hair off the
+                        // other fiber's.
+                        const auto paramAt = [](double ax, double az, double bx, double bz,
+                                                double px, double pz) {
+                            return std::abs(bz - az) >= std::abs(bx - ax) ? (pz - az) / (bz - az)
+                                                                          : (px - ax) / (bx - ax);
+                        };
+                        // The envelope alone would also accept a vertex a hair
+                        // off the other segment's LINE while the segments
+                        // themselves miss (nearly parallel ones meet far away);
+                        // the snap therefore also asks the computed parameter
+                        // to already sit next to the vertex.
+                        constexpr double kSnapReach = 1e-9;
+                        if (std::abs(u) <= kSnapReach &&
+                            onSegment(x0, hZ[i], x1, hZ[i + 1], branch.psi[j], branch.z[j])) {
+                            u = 0.0;
+                            t = paramAt(x0, hZ[i], x1, hZ[i + 1], branch.psi[j], branch.z[j]);
+                        } else if (std::abs(u - 1.0) <= kSnapReach &&
+                                   onSegment(x0, hZ[i], x1, hZ[i + 1], branch.psi[j + 1],
+                                             branch.z[j + 1])) {
+                            u = 1.0;
+                            t = paramAt(x0, hZ[i], x1, hZ[i + 1], branch.psi[j + 1],
+                                        branch.z[j + 1]);
+                        }
+                        if (std::abs(t) <= kSnapReach &&
+                            onSegment(branch.psi[j], branch.z[j], branch.psi[j + 1],
+                                      branch.z[j + 1], x0, hZ[i])) {
+                            t = 0.0;
+                            u = paramAt(branch.psi[j], branch.z[j], branch.psi[j + 1],
+                                        branch.z[j + 1], x0, hZ[i]);
+                        } else if (std::abs(t - 1.0) <= kSnapReach &&
+                                   onSegment(branch.psi[j], branch.z[j], branch.psi[j + 1],
+                                             branch.z[j + 1], x1, hZ[i + 1])) {
+                            t = 1.0;
+                            u = paramAt(branch.psi[j], branch.z[j], branch.psi[j + 1],
+                                        branch.z[j + 1], x1, hZ[i + 1]);
+                        }
                     }
-                    const double t = (qpx * sz - qpz * sx) / denom;
-                    const double u = (qpx * rz - qpz * rx) / denom;
                     // Half-open on both segments so a crossing at a shared
                     // interior vertex is counted once - except that each
                     // polyline's FINAL segment closes at its end, so a
@@ -378,16 +668,79 @@ PairCrossings detectPairCrossings(const CanonicalTrace& hTrace,
                     // which is the reversed end of both branches) is owned
                     // rather than lost. The apex's double detection is
                     // exactly what the dedup clustering exists to merge.
-                    const bool tEnd = i + 2 == hPsi.size();
-                    const bool uEnd = j + 2 == branch.z.size();
+                    const bool tEnd = i == hLastSegment;
+                    const bool uEnd = j == branchLastSegment;
                     if (t < 0.0 || u < 0.0 ||
                         (tEnd ? t > 1.0 : t >= 1.0) ||
                         (uEnd ? u > 1.0 : u >= 1.0)) {
                         continue;
                     }
-                    const double rH = hR[i] + t * (hR[i + 1] - hR[i]);
-                    const double rV =
+                    if (sz == 0.0) {
+                        // A hit on a level V segment - the flat top of a fold,
+                        // which the branch split hands to whichever limb comes
+                        // first in the samples. The crossing lies on the
+                        // curtain's edge; the translate's count is not to be
+                        // trusted.
+                        unresolvedTranslates.insert(m);
+                        ++result.unresolvedCount;
+                    }
+                    double rH = hR[i] + t * (hR[i + 1] - hR[i]);
+                    double rV =
                         branch.r[j] + u * (branch.r[j + 1] - branch.r[j]);
+                    // A hit at a vertex whose run of repeated samples steps in
+                    // radius (a step along the umbilicus ray) has no one
+                    // radius; when the step spans the other fiber's radius
+                    // the fibers meet in 3D there, a curtain contact: read the
+                    // hit at the other fiber's radius (deltaR 0), the same
+                    // whichever sample of the run owns it.
+                    const auto runRadius = [](const std::vector<double>& psi,
+                                              const std::vector<double>& z,
+                                              const std::vector<double>& r, std::size_t index,
+                                              double& lo, double& hi) {
+                        lo = hi = r[index];
+                        for (std::size_t k = index; k > 0 && psi[k - 1] == psi[index] &&
+                                                    z[k - 1] == z[index]; --k) {
+                            lo = std::min(lo, r[k - 1]);
+                            hi = std::max(hi, r[k - 1]);
+                        }
+                        for (std::size_t k = index + 1; k < psi.size() && psi[k] == psi[index] &&
+                                                        z[k] == z[index]; ++k) {
+                            lo = std::min(lo, r[k]);
+                            hi = std::max(hi, r[k]);
+                        }
+                    };
+                    {
+                        // Each fiber's radial interval at the hit: the run's
+                        // span at a vertex, the interpolated radius otherwise.
+                        // Intervals that meet are a contact (both radii the
+                        // same canonical value); disjoint ones read at their
+                        // nearest points - the same whichever sample owns
+                        // the hit.
+                        double hLo = rH;
+                        double hHi = rH;
+                        if (t == 0.0 || t == 1.0) {
+                            runRadius(hPsi, hZ, hR, t == 0.0 ? i : i + 1, hLo, hHi);
+                        }
+                        double vLo = rV;
+                        double vHi = rV;
+                        if (u == 0.0 || u == 1.0) {
+                            runRadius(vTrace.psi, vTrace.z, vTrace.radius,
+                                      u == 0.0 ? branch.sample[j] : branch.sample[j + 1], vLo, vHi);
+                        }
+                        const double radialScale = std::abs(hR[i]) + std::abs(hR[i + 1]) +
+                                                   std::abs(branch.r[j]) + std::abs(branch.r[j + 1]) +
+                                                   hLo + hHi + vLo + vHi;
+                        if (std::max(hLo, vLo) <= std::min(hHi, vHi) ||
+                            sameRadius(hHi, vLo, radialScale) || sameRadius(hLo, vHi, radialScale)) {
+                            rH = rV = std::max(hLo, vLo);
+                        } else if (hHi < vLo) {
+                            rH = hHi;
+                            rV = vLo;
+                        } else {
+                            rH = hLo;
+                            rV = vHi;
+                        }
+                    }
                     // Transversality in arc-length-scaled coordinates: psi is
                     // radians, z voxels, so psi is scaled by the crossing's
                     // own radius - a branch-wide scale would let geometry far
@@ -401,14 +754,9 @@ PairCrossings detectPairCrossings(const CanonicalTrace& hTrace,
                     if (hNorm == 0.0 || vNorm == 0.0) {
                         continue;
                     }
-                    const double transversality =
+                    double transversality =
                         std::abs(hx * sz - rz * vx) / (hNorm * vNorm);
-                    if (transversality < params.minTransversality) {
-                        ++result.tangentialCount;
-                        continue;
-                    }
                     Crossing crossing;
-                    crossing.declarable = declarable;
                     crossing.zVx = hZ[i] + t * rz;
                     crossing.psiH = hPsi[i] + t * (hPsi[i + 1] - hPsi[i]);
                     // The translate integer IS the turn gap, exactly;
@@ -416,6 +764,150 @@ PairCrossings detectPairCrossings(const CanonicalTrace& hTrace,
                     // only reintroduce floating point.
                     crossing.n = m;
                     crossing.deltaR = rH - rV;
+                    crossing.transversality = transversality;
+                    crossing.orientation = (denom > 0.0 ? 1 : -1) * branchDirection;
+                    crossing.hSegment = i;
+                    crossing.hT = t;
+                    crossing.vBranch = branchIndex;
+                    crossing.detection = detectionCount++;
+                    if (u == 0.0) {
+                        crossing.vSample = branch.vertexId[j];
+                    } else if (u == 1.0) {
+                        crossing.vSample = branch.vertexId[j + 1];
+                    }
+                    // A hit exactly at a vertex interior to a polyline is a
+                    // crossing only if the vertex's two incident segments
+                    // leave on opposite sides of the other segment; on one
+                    // side it is a touch: the polyline came up to the other
+                    // and turned back.
+                    // A hit at a vertex of either polyline is a crossing only
+                    // if, going round the hit point, the two H rays alternate
+                    // with the two V rays (H, V, H, V): the polylines
+                    // separate each other there. H, H, V, V is a touch: one
+                    // polyline came up to the other and turned back. The
+                    // incident rays are taken past any repeated samples and,
+                    // for the V fiber, from its own trace - so at a fold apex,
+                    // the end of both branches, the rays are the two limbs and
+                    // not one limb's extension. A polyline not at a vertex,
+                    // or the V fiber at its own trace's end, contributes its
+                    // segment's two half-rays. Cyclic order of directions
+                    // survives the anisotropic (psi, z) axes.
+                    const bool hVertex = t == 0.0 && i > 0;
+                    const bool vVertex = u == 0.0 || u == 1.0;
+                    if (hVertex || vVertex) {
+                        const double px = x0 + t * rx;
+                        const double pz = hZ[i] + t * rz;
+                        double rays[4][2];
+                        // A vertex at a polyline's own end (past any repeated
+                        // samples) contributes its segment's two half-rays,
+                        // like a hit that is not at a vertex.
+                        bool hRays = false;
+                        if (hVertex) {
+                            const std::size_t prev = distinctBefore(hPsi, hZ, i);
+                            const std::size_t next = distinctAfter(hPsi, hZ, i);
+                            hRays = prev != static_cast<std::size_t>(-1) &&
+                                    next != static_cast<std::size_t>(-1);
+                            if (hRays) {
+                                rays[0][0] = hPsi[prev] + kTwoPi * static_cast<double>(m) - px;
+                                rays[0][1] = hZ[prev] - pz;
+                                rays[1][0] = hPsi[next] + kTwoPi * static_cast<double>(m) - px;
+                                rays[1][1] = hZ[next] - pz;
+                            }
+                        }
+                        if (!hRays) {
+                            rays[0][0] = -rx;
+                            rays[0][1] = -rz;
+                            rays[1][0] = rx;
+                            rays[1][1] = rz;
+                        }
+                        bool vRays = false;
+                        if (vVertex) {
+                            const std::size_t vIndex =
+                                u == 0.0 ? branch.sample[j] : branch.sample[j + 1];
+                            const std::size_t prev = distinctBefore(vTrace.psi, vTrace.z, vIndex);
+                            const std::size_t next = distinctAfter(vTrace.psi, vTrace.z, vIndex);
+                            vRays = prev != static_cast<std::size_t>(-1) &&
+                                    next != static_cast<std::size_t>(-1);
+                            if (vRays) {
+                                rays[2][0] = vTrace.psi[prev] - px;
+                                rays[2][1] = vTrace.z[prev] - pz;
+                                rays[3][0] = vTrace.psi[next] - px;
+                                rays[3][1] = vTrace.z[next] - pz;
+                            }
+                        }
+                        if (!vRays) {
+                            rays[2][0] = -sx;
+                            rays[2][1] = -sz;
+                            rays[3][0] = sx;
+                            rays[3][1] = sz;
+                        }
+                        {
+                            double angle[4];
+                            for (int r = 0; r < 4; ++r) {
+                                angle[r] = std::atan2(rays[r][1], rays[r][0]);
+                            }
+                            int order[4] = {0, 1, 2, 3};
+                            std::sort(order, order + 4,
+                                      [&angle](int a, int b) { return angle[a] < angle[b]; });
+                            // Alternating iff no two H rays (0, 1) are cyclic
+                            // neighbours.
+                            bool alternating = true;
+                            for (int r = 0; r < 4; ++r) {
+                                const bool aIsH = order[r] < 2;
+                                const bool bIsH = order[(r + 1) % 4] < 2;
+                                if (aIsH == bIsH) {
+                                    alternating = false;
+                                }
+                            }
+                            if (!alternating) {
+                                crossing.touch = true;
+                            } else {
+                                // Orientation from the directed cyclic order:
+                                // going round from the H fiber's outgoing ray,
+                                // the V ray met first is the V fiber's outgoing
+                                // ray when H crosses V left to right (the sign
+                                // of the segments' cross product for straight
+                                // segments). The V rays are in fiber order
+                                // when they came from the trace, in branch
+                                // order otherwise.
+                                int afterHNext = -1;
+                                for (int r = 0; r < 4; ++r) {
+                                    if (order[r] == 1) {
+                                        afterHNext = order[(r + 1) % 4];
+                                    }
+                                }
+                                const int vOrder = vRays ? 1 : branchDirection;
+                                crossing.orientation = (afterHNext == 3 ? 1 : -1) * vOrder;
+                            }
+                        }
+                        // At a vertex the hit's angle comes from the incident
+                        // rays, not from whichever segment happened to own
+                        // it: the same reading in either sample order.
+                        // Transversality is that of the most transversal pair
+                        // of incident rays (at a fold apex the H fiber
+                        // crosses a limb, not the apex's chord); the
+                        // orientation was read above from the rays' cyclic
+                        // order.
+                        {
+                            double best = 0.0;
+                            for (int hr = 0; hr < 2; ++hr) {
+                                for (int vr = 2; vr < 4; ++vr) {
+                                    const double ax = rays[hr][0] * rScale;
+                                    const double az = rays[hr][1];
+                                    const double bx = rays[vr][0] * rScale;
+                                    const double bz = rays[vr][1];
+                                    const double na = std::hypot(ax, az);
+                                    const double nb = std::hypot(bx, bz);
+                                    if (na > 0.0 && nb > 0.0) {
+                                        best = std::max(best,
+                                                        std::abs(ax * bz - az * bx) / (na * nb));
+                                    }
+                                }
+                            }
+                            transversality = best;
+                            crossing.transversality = transversality;
+                        }
+                    }
                     // No tie band: the sign of deltaR is the whole
                     // classification. A same-winding contact reads inside
                     // (H on the sheet front), which the weak constraint
@@ -433,6 +925,13 @@ PairCrossings detectPairCrossings(const CanonicalTrace& hTrace,
                     crossing.kind = crossing.deltaR <= 0.0
                         ? CrossingKind::Inside
                         : CrossingKind::Outside;
+                    if (transversality < params.minTransversality) {
+                        ++result.tangentialCount;
+                        crossing.tangential = true;
+                        crossing.confidence = 0.0;
+                        shallow.push_back(crossing);
+                        continue;
+                    }
                     crossing.confidence =
                         crossing.kind == CrossingKind::Inside
                             ? 0.9 * transversality
@@ -441,7 +940,7 @@ PairCrossings detectPairCrossings(const CanonicalTrace& hTrace,
                                            crossing.deltaR /
                                                (3.0 * std::max(params.tieBandVx,
                                                                1e-9)));
-                    if (!crossing.declarable) {
+                    if (!trusted) {
                         crossing.confidence *= params.untrustedConfidenceFactor;
                     }
                     raw.push_back(crossing);
@@ -450,10 +949,136 @@ PairCrossings detectPairCrossings(const CanonicalTrace& hTrace,
         }
     }
 
-    // Pair-local sort and merge: one physical traversal seen by several
-    // segment pairs (or twice across a branch split) is one piece of
-    // evidence. Stable, so equal-key crossings keep deterministic encounter
-    // order - the constraint index downstream breaks repair ties.
+    result.raw = std::move(raw);
+    result.shallow = std::move(shallow);
+    result.detectionCount = detectionCount;
+    result.gapTranslates.assign(gapTranslates.begin(), gapTranslates.end());
+    result.uncoveredSegments.assign(uncoveredSegments.begin(), uncoveredSegments.end());
+    result.unresolvedTranslates.assign(unresolvedTranslates.begin(),
+                                       unresolvedTranslates.end());
+    return result;
+}
+
+bool identicalPairDetections(const PairDetections& a, const PairDetections& b)
+{
+    const auto sameDouble = [](double x, double y) {
+        return std::memcmp(&x, &y, sizeof(double)) == 0;
+    };
+    const auto sameCrossing = [&](const Crossing& x, const Crossing& y) {
+        return sameDouble(x.zVx, y.zVx) && sameDouble(x.psiH, y.psiH) && x.n == y.n &&
+               sameDouble(x.deltaR, y.deltaR) && sameDouble(x.confidence, y.confidence) &&
+               x.mergedCount == y.mergedCount && x.kind == y.kind &&
+               sameDouble(x.transversality, y.transversality) && x.tangential == y.tangential &&
+               x.orientation == y.orientation && x.hSegment == y.hSegment &&
+               sameDouble(x.hT, y.hT) && x.vSample == y.vSample && x.touch == y.touch &&
+               x.vBranch == y.vBranch && x.detection == y.detection;
+    };
+    if (a.raw.size() != b.raw.size() || a.shallow.size() != b.shallow.size() ||
+        a.detectionCount != b.detectionCount || a.gapTranslates != b.gapTranslates ||
+        a.unresolvedTranslates != b.unresolvedTranslates ||
+        a.uncoveredSegments != b.uncoveredSegments ||
+        a.gatedSegmentCount != b.gatedSegmentCount || a.tangentialCount != b.tangentialCount ||
+        a.unresolvedCount != b.unresolvedCount) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.raw.size(); ++i) {
+        if (!sameCrossing(a.raw[i], b.raw[i])) {
+            return false;
+        }
+    }
+    for (std::size_t i = 0; i < a.shallow.size(); ++i) {
+        if (!sameCrossing(a.shallow[i], b.shallow[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<SeamAnchor> seamAnchors(const std::vector<CanonicalTrace>& traces,
+                                    std::size_t hIndex, std::size_t vIndex,
+                                    const std::vector<LinkInput>& links)
+{
+    std::vector<SeamAnchor> anchors;
+    if (hIndex >= traces.size() || vIndex >= traces.size() || !traces[vIndex].onKollesis) {
+        return anchors;
+    }
+    const CanonicalTrace& h = traces[hIndex];
+    const CanonicalTrace& v = traces[vIndex];
+    for (const std::size_t hSample : {h.kollesisStartSample, h.kollesisEndSample}) {
+        if (hSample == kNoSample || hSample >= h.psi.size()) {
+            continue;
+        }
+        // The pair's link nearest the tagged end along the H fiber. Two
+        // links at one H sample naming different V samples say nothing
+        // (the annotation tool links a control once; an import may not).
+        SeamAnchor anchor;
+        anchor.hSample = hSample;
+        std::size_t bestDistance = static_cast<std::size_t>(-1);
+        bool disagree = false;
+        for (const LinkInput& link : links) {
+            std::size_t hLink = kNoSample;
+            std::size_t vLink = kNoSample;
+            if (link.fiberA == hIndex && link.fiberB == vIndex) {
+                hLink = link.pointA;
+                vLink = link.pointB;
+            } else if (link.fiberB == hIndex && link.fiberA == vIndex) {
+                hLink = link.pointB;
+                vLink = link.pointA;
+            } else {
+                continue;
+            }
+            if (hLink >= h.psi.size() || vLink >= v.psi.size()) {
+                continue;
+            }
+            const std::size_t distance = hLink > hSample ? hLink - hSample : hSample - hLink;
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                anchor.hLinkSample = hLink;
+                anchor.vSample = vLink;
+                disagree = false;
+            } else if (distance == bestDistance && anchor.vSample != vLink) {
+                disagree = true;
+            }
+        }
+        if (anchor.hLinkSample == kNoSample || disagree) {
+            continue;
+        }
+        anchors.push_back(anchor);
+    }
+    return anchors;
+}
+
+PairCrossings classifyPairCrossings(const PairDetections& detections,
+                                    const CanonicalTrace& hTrace,
+                                    const CanonicalTrace& vTrace,
+                                    const std::vector<SeamAnchor>& seams,
+                                    const std::vector<std::size_t>& inferredSeams,
+                                    const SolverParams& params)
+{
+    PairCrossings result;
+    result.gatedSegmentCount = detections.gatedSegmentCount;
+    result.tangentialCount = detections.tangentialCount;
+    result.unresolvedCount = detections.unresolvedCount;
+    if (hTrace.psi.empty() || vTrace.psi.empty()) {
+        return result;
+    }
+    const bool trusted = hTrace.trusted && vTrace.trusted;
+    const std::vector<double>& hPsi = hTrace.psi;
+    const std::vector<double>& hZ = hTrace.z;
+    std::vector<Crossing> raw = detections.raw;
+    std::vector<Crossing> shallow = detections.shallow;
+    const std::size_t detectionCount = detections.detectionCount;
+    const std::set<long long> gapTranslates(detections.gapTranslates.begin(),
+                                            detections.gapTranslates.end());
+    const std::set<long long> unresolvedTranslates(detections.unresolvedTranslates.begin(),
+                                                   detections.unresolvedTranslates.end());
+
+    // Pair-local sort and merge of the transversal detections into the
+    // representatives the legacy constraint path is built from, unchanged:
+    // one physical traversal seen by several segment pairs (or twice across
+    // a branch split) is one piece of evidence. Stable, so equal-key
+    // crossings keep deterministic encounter order - the constraint index
+    // downstream breaks repair ties.
     std::vector<std::size_t> order(raw.size());
     for (std::size_t i = 0; i < order.size(); ++i) {
         order[i] = i;
@@ -474,37 +1099,719 @@ PairCrossings detectPairCrossings(const CanonicalTrace& hTrace,
     // radially distinct traversal interleaved in z must not split a cluster,
     // so mismatches within the z window are skipped over, not treated as the
     // cluster's end.
-    std::vector<char> consumed(order.size(), 0);
-    for (std::size_t index = 0; index < order.size(); ++index) {
-        if (consumed[index]) {
-            continue;
-        }
-        const Crossing& first = raw[order[index]];
-        std::size_t best = index;
-        int count = 1;
-        consumed[index] = 1;
-        for (std::size_t scan = index + 1; scan < order.size(); ++scan) {
-            const Crossing& next = raw[order[scan]];
-            if (next.n != first.n || next.zVx - first.zVx > params.zMergeVx) {
-                break;
-            }
-            if (consumed[scan] ||
-                std::abs(next.deltaR - first.deltaR) > params.tieBandVx) {
+    // Per detection id: its representative, for the events below.
+    std::vector<std::size_t> representativeOf(detectionCount, 0);
+    std::vector<std::vector<std::size_t>> clusterDetections;
+    // Clusters first (over raw indices, in sorted order), then the seam
+    // reading, then the representatives, so a reclassified encounter is
+    // represented by its new reading whatever the confidences were.
+    std::vector<std::vector<std::size_t>> clusterRawIndices;
+    {
+        std::vector<char> consumed(order.size(), 0);
+        for (std::size_t index = 0; index < order.size(); ++index) {
+            if (consumed[index]) {
                 continue;
             }
-            consumed[scan] = 1;
-            ++count;
-            if (next.confidence > raw[order[best]].confidence) {
-                best = scan;
+            const Crossing& first = raw[order[index]];
+            consumed[index] = 1;
+            std::vector<std::size_t> cluster{order[index]};
+            for (std::size_t scan = index + 1; scan < order.size(); ++scan) {
+                const Crossing& next = raw[order[scan]];
+                if (next.n != first.n || next.zVx - first.zVx > params.zMergeVx) {
+                    break;
+                }
+                if (consumed[scan] ||
+                    std::abs(next.deltaR - first.deltaR) > params.tieBandVx) {
+                    continue;
+                }
+                consumed[scan] = 1;
+                cluster.push_back(order[scan]);
+            }
+            clusterRawIndices.push_back(std::move(cluster));
+        }
+    }
+
+    // The kollesis seam encounter of a tagged H end (see SeamAnchor). The
+    // encounter is named by a V branch and a 2*pi translate: the branches
+    // holding the linked V sample's vertex (two at a fold apex) and the
+    // translate that lifts the linked H sample onto it; when none of those
+    // saw an encounter - the annotator having linked to the V's nearest
+    // control on another of its height folds - every limb with a detection
+    // on the translate the linked H sample lifts to at that limb (at the
+    // linked control's height clamped to the limb, so a control that
+    // climbed past the V still marks the encounter). On each candidate branch
+    // the detection nearest the linked H sample along the H fiber,
+    // transversal or shallow, is that branch's encounter; the seam is the
+    // encounter nearest the link, and where two limbs meet the H fiber at one place (a V folded
+    // in height at one angle) the limb the end actually sits against: the
+    // radially thinnest, and at an exact tie in thickness the one read
+    // Outside, the reading a seam falsifies. (The residual tolerance ranks
+    // limbs against the best, it is no overrun limit: a lone limb reads
+    // however far the end overran.) The encounter is read as a whole - the detection's
+    // proximity cluster and the detections within the merge height AND the
+    // radial tie band of it, the same nearness the merge itself uses, so a
+    // radially distinct crossing at the same height stays what it is - as
+    // Inside: the glued sheets are one winding, and "same or inward" is true
+    // whichever sheet the V is on. Nothing is read where no detection sits
+    // on the link's own translate (an H that first meets the V a turn later
+    // keeps that crossing's radial reading).
+    constexpr double kSeamResidualTieTurns = 0.05;
+    constexpr double kSeamAlongTieSamples = 0.5;
+    // Read one encounter as the seam, from its seed detection: the seed's own
+    // cluster when the seed is transversal (a cluster is one encounter by
+    // construction), and every detection, transversal or shallow, within
+    // the merge's own nearness of the seed - the same encounter.
+    const auto readEncounter = [&](const Crossing& seed, bool inferred) {
+        const auto partOfEncounter = [&](const Crossing& detection) {
+            return detection.n == seed.n && detection.vBranch == seed.vBranch &&
+                   std::abs(detection.zVx - seed.zVx) <= params.zMergeVx &&
+                   std::abs(detection.deltaR - seed.deltaR) <= params.tieBandVx;
+        };
+        const auto readAsSeam = [&](Crossing& detection) {
+            detection.kollesis = true;
+            detection.kollesisInferred = detection.kollesisInferred || inferred;
+            detection.kind = CrossingKind::Inside;
+            if (!detection.tangential) {
+                detection.confidence = 0.9 * detection.transversality;
+                if (!trusted) {
+                    detection.confidence *= params.untrustedConfidenceFactor;
+                }
+            }
+        };
+        for (const std::vector<std::size_t>& cluster : clusterRawIndices) {
+            const bool seeded = std::any_of(
+                cluster.begin(), cluster.end(),
+                [&](std::size_t rawIndex) { return &raw[rawIndex] == &seed; });
+            if (!seeded) {
+                continue;
+            }
+            for (const std::size_t rawIndex : cluster) {
+                readAsSeam(raw[rawIndex]);
             }
         }
-        Crossing representative = raw[order[best]];
-        representative.mergedCount = count;
+        for (Crossing& detection : raw) {
+            if (partOfEncounter(detection)) {
+                readAsSeam(detection);
+            }
+        }
+        for (Crossing& detection : shallow) {
+            if (partOfEncounter(detection)) {
+                readAsSeam(detection);
+            }
+        }
+    };
+    const auto readSeam = [&](const SeamAnchor& anchor) {
+        if (anchor.hSample >= hPsi.size() || anchor.hLinkSample >= hPsi.size() ||
+            anchor.vSample >= vTrace.psi.size()) {
+            return;
+        }
+        const double zLink = hZ[anchor.hLinkSample];
+        const double psiLink = hPsi[anchor.hLinkSample];
+        const double hPosition = static_cast<double>(anchor.hLinkSample);
+        // Position along the H polyline, in samples.
+        const auto along = [](const Crossing& detection) {
+            return static_cast<double>(detection.hSegment) + detection.hT;
+        };
+        // The detection of (translate, branch) nearest the linked H sample,
+        // or null; ties go to the transversal record, then the earlier one.
+        const auto nearestOn = [&](long long n, std::size_t branch) -> const Crossing* {
+            const Crossing* nearest = nullptr;
+            double bestDistance = std::numeric_limits<double>::infinity();
+            for (const std::vector<Crossing>* list : {&raw, &shallow}) {
+                for (const Crossing& detection : *list) {
+                    if (detection.n != n || detection.vBranch != branch) {
+                        continue;
+                    }
+                    const double distance = std::abs(along(detection) - hPosition);
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        nearest = &detection;
+                    }
+                }
+            }
+            return nearest;
+        };
+        struct Candidate {
+            std::size_t branch = 0;
+            long long n = 0;
+            double residual = 0.0;
+            const Crossing* nearest = nullptr;
+            double distance = 0.0;
+        };
+        const auto candidateOn = [&](std::size_t branch, long long n, double residual) {
+            Candidate candidate{branch, n, residual, nearestOn(n, branch), 0.0};
+            if (candidate.nearest != nullptr) {
+                candidate.distance = std::abs(along(*candidate.nearest) - hPosition);
+            }
+            return candidate;
+        };
+        std::vector<Candidate> candidates;
+        const auto anyEncounter = [&]() {
+            return std::any_of(candidates.begin(), candidates.end(),
+                               [](const Candidate& c) { return c.nearest != nullptr; });
+        };
+        {
+            // The linked V sample's vertex (the run of identical projected
+            // samples it belongs to), and every branch holding that vertex.
+            std::size_t vertex = 0;
+            for (std::size_t i = 1; i <= anchor.vSample; ++i) {
+                if (vTrace.psi[i] != vTrace.psi[i - 1] || vTrace.z[i] != vTrace.z[i - 1]) {
+                    ++vertex;
+                }
+            }
+            const double turns = (vTrace.psi[anchor.vSample] - psiLink) / kTwoPi;
+            const long long n = static_cast<long long>(std::llround(turns));
+            for (std::size_t b = 0; b < vTrace.branches.size(); ++b) {
+                const Branch& branch = vTrace.branches[b];
+                if (std::find(branch.vertexId.begin(), branch.vertexId.end(), vertex) ==
+                    branch.vertexId.end()) {
+                    continue;
+                }
+                candidates.push_back(candidateOn(b, n, 0.0));
+            }
+        }
+        if (!anyEncounter()) {
+            // Every (translate, limb) that saw a detection, with the residual
+            // of lifting the linked H sample onto that limb at its height
+            // (clamped to the limb's range: the linked control may sit above
+            // or below the V - a control that climbed past it, say - and
+            // still mark this encounter).
+            candidates.clear();
+            std::set<std::pair<long long, std::size_t>> seen;
+            for (const std::vector<Crossing>* list : {&raw, &shallow}) {
+                for (const Crossing& detection : *list) {
+                    if (!seen.insert({detection.n, detection.vBranch}).second) {
+                        continue;
+                    }
+                    const Branch& branch = vTrace.branches[detection.vBranch];
+                    if (branch.z.size() < 2) {
+                        continue;
+                    }
+                    const double zAt = std::clamp(zLink, branch.z.front(), branch.z.back());
+                    const auto upper = std::lower_bound(branch.z.begin(), branch.z.end(), zAt);
+                    std::size_t j = static_cast<std::size_t>(upper - branch.z.begin());
+                    j = j > 0 ? j - 1 : 0;
+                    if (j + 1 >= branch.z.size()) {
+                        j = branch.z.size() - 2;
+                    }
+                    const double span = branch.z[j + 1] - branch.z[j];
+                    const double u =
+                        span > 0.0 ? std::clamp((zAt - branch.z[j]) / span, 0.0, 1.0) : 0.0;
+                    const double psiV = branch.psi[j] + u * (branch.psi[j + 1] - branch.psi[j]);
+                    const double turns = (psiV - psiLink) / kTwoPi;
+                    // Only the translate the link lifts to on this limb: a
+                    // detection of another turn is another encounter.
+                    if (std::llround(turns) != detection.n) {
+                        continue;
+                    }
+                    candidates.push_back(candidateOn(
+                        detection.vBranch, detection.n,
+                        std::abs(turns - static_cast<double>(detection.n))));
+                }
+            }
+        }
+        // Only branches that saw the encounter; among those with the
+        // smallest lift residual (within kSeamResidualTieTurns of the best),
+        // the encounters nearest the linked H sample along the H fiber (within
+        // kSeamAlongTieSamples of the nearest - one place), and of those the
+        // radially thinnest, Outside before Inside at an exact tie. Each cut
+        // is against the best of the previous, never chained pairwise; only
+        // two encounters at one place with one and the same deltaR are left
+        // to limb order.
+        const Candidate* chosen = nullptr;
+        double bestResidual = std::numeric_limits<double>::infinity();
+        for (const Candidate& candidate : candidates) {
+            if (candidate.nearest != nullptr) {
+                bestResidual = std::min(bestResidual, candidate.residual);
+            }
+        }
+        const auto residualEligible = [&](const Candidate& candidate) {
+            return candidate.nearest != nullptr &&
+                   candidate.residual <= bestResidual + kSeamResidualTieTurns;
+        };
+        double bestDistance = std::numeric_limits<double>::infinity();
+        for (const Candidate& candidate : candidates) {
+            if (residualEligible(candidate)) {
+                bestDistance = std::min(bestDistance, candidate.distance);
+            }
+        }
+        for (const Candidate& candidate : candidates) {
+            if (!residualEligible(candidate) ||
+                candidate.distance > bestDistance + kSeamAlongTieSamples) {
+                continue;
+            }
+            if (chosen == nullptr) {
+                chosen = &candidate;
+                continue;
+            }
+            const double thickness = std::abs(candidate.nearest->deltaR);
+            const double chosenThickness = std::abs(chosen->nearest->deltaR);
+            if (thickness < chosenThickness ||
+                (thickness == chosenThickness &&
+                 candidate.nearest->deltaR > chosen->nearest->deltaR)) {
+                chosen = &candidate;
+            }
+        }
+        if (chosen == nullptr) {
+            return;
+        }
+        readEncounter(*chosen->nearest, false);
+    };
+    for (const SeamAnchor& anchor : seams) {
+        readSeam(anchor);
+    }
+    // Seam encounters the solve itself found (see classifyPairCrossings).
+    for (const std::size_t id : inferredSeams) {
+        for (const std::vector<Crossing>* list : {&raw, &shallow}) {
+            for (const Crossing& detection : *list) {
+                if (detection.detection == id) {
+                    readEncounter(detection, true);
+                }
+            }
+        }
+    }
+
+    for (const std::vector<std::size_t>& cluster : clusterRawIndices) {
+        std::size_t best = cluster.front();
+        for (const std::size_t rawIndex : cluster) {
+            if (raw[rawIndex].confidence > raw[best].confidence) {
+                best = rawIndex;
+            }
+        }
+        Crossing representative = raw[best];
+        representative.mergedCount = static_cast<int>(cluster.size());
         representative.confidence = std::min(
             2.0, representative.confidence *
                      (1.0 + 0.25 * static_cast<double>(representative.mergedCount - 1)));
+        std::vector<std::size_t> detectionIds;
+        detectionIds.reserve(cluster.size());
+        for (const std::size_t rawIndex : cluster) {
+            detectionIds.push_back(raw[rawIndex].detection);
+            representativeOf[raw[rawIndex].detection] = result.crossings.size();
+        }
+        clusterDetections.push_back(std::move(detectionIds));
         result.crossings.push_back(representative);
     }
+    // Shallow detections follow the representatives, in the same
+    // deterministic order, each standing for itself.
+    std::stable_sort(shallow.begin(), shallow.end(),
+                     [](const Crossing& a, const Crossing& b) {
+                         return std::tie(a.n, a.zVx, a.deltaR) <
+                                std::tie(b.n, b.zVx, b.deltaR);
+                     });
+    for (const Crossing& event : shallow) {
+        representativeOf[event.detection] = result.crossings.size();
+        clusterDetections.push_back({event.detection});
+        result.crossings.push_back(event);
+    }
+    // The raw record per detection id, for representatives that end up
+    // standing for covered and uncovered detections alike.
+    std::vector<const Crossing*> recordOf(detectionCount, nullptr);
+    for (const Crossing& detection : raw) {
+        recordOf[detection.detection] = &detection;
+    }
+    for (const Crossing& detection : shallow) {
+        recordOf[detection.detection] = &detection;
+    }
+
+    // Resolved events: every detection, with the two records of a V vertex
+    // shared by two branches (a fold apex, or any vertex the ownership rule
+    // hands to both) collapsed into one event when the ray test read the
+    // hit as a crossing - the H fiber passes through the vertex between the
+    // limbs - and the two are one encounter radially, and both left as
+    // touches when it read a touch: the V fiber came up to the H fiber at
+    // its apex and retraced, crossing nothing. The two records' orientations
+    // differ by the limbs' opposite directions and say nothing about which
+    // it is. Records the proximity merge put under two representatives (a
+    // repeated apex sample at another radius, say) stay two events, so a
+    // dropped representative keeps its mark and no event claims a
+    // representative that does not stand for it.
+    // The same V vertex on the same H segment is the same point; the two
+    // branches' parameters for it may differ in the last place.
+    const auto sameVertexHit = [](const Crossing& a, const Crossing& b) {
+        return a.vSample != Crossing::kNoSample && a.vSample == b.vSample &&
+               a.n == b.n && a.hSegment == b.hSegment;
+    };
+    std::vector<Crossing> events;
+    // Per detection id: the event it is part of.
+    std::vector<std::size_t> eventOfDetection(detectionCount, 0);
+    // (translate, branch) keys of both limbs at every apex crossing.
+    std::set<std::pair<long long, std::size_t>> apexKeys;
+    {
+        std::vector<Crossing> all;
+        all.reserve(raw.size() + shallow.size());
+        all.insert(all.end(), raw.begin(), raw.end());
+        all.insert(all.end(), shallow.begin(), shallow.end());
+        std::vector<std::size_t> byHit(all.size());
+        for (std::size_t i = 0; i < byHit.size(); ++i) {
+            byHit[i] = i;
+        }
+        std::stable_sort(byHit.begin(), byHit.end(),
+                         [&all](std::size_t a, std::size_t b) {
+                             const Crossing& ca = all[a];
+                             const Crossing& cb = all[b];
+                             return std::tie(ca.n, ca.hSegment, ca.hT, ca.vSample, ca.vBranch) <
+                                    std::tie(cb.n, cb.hSegment, cb.hT, cb.vSample, cb.vBranch);
+                         });
+        // Per record: the record it was collapsed into (itself when kept).
+        std::vector<std::size_t> keptRecord(all.size());
+        for (std::size_t i = 0; i < keptRecord.size(); ++i) {
+            keptRecord[i] = i;
+        }
+        for (std::size_t k = 1; k < byHit.size(); ++k) {
+            Crossing& a = all[byHit[k - 1]];
+            Crossing& b = all[byHit[k]];
+            if (!sameVertexHit(a, b) || keptRecord[byHit[k - 1]] != byHit[k - 1]) {
+                continue;
+            }
+            if (!a.touch && !b.touch) {
+                // A crossing at the apex, on the edge of both limbs' curtains
+                // (see Crossing::apex).
+                if (a.vBranch != b.vBranch) {
+                    a.apex = true;
+                    b.apex = true;
+                    apexKeys.insert({a.n, a.vBranch});
+                    apexKeys.insert({b.n, b.vBranch});
+                }
+                if (representativeOf[a.detection] != representativeOf[b.detection]) {
+                    // Two representatives: two events.
+                    continue;
+                }
+                // One event: keep the more confident record (then the lower
+                // branch), standing for both detections.
+                const bool keepA = a.confidence > b.confidence ||
+                                   (a.confidence == b.confidence && a.vBranch <= b.vBranch);
+                Crossing& kept = keepA ? a : b;
+                kept.mergedCount = a.mergedCount + b.mergedCount;
+                keptRecord[keepA ? byHit[k] : byHit[k - 1]] = keepA ? byHit[k - 1] : byHit[k];
+            } else {
+                a.touch = true;
+                b.touch = true;
+            }
+        }
+        std::vector<std::size_t> eventOfRecord(all.size(), 0);
+        std::vector<std::size_t> keptOrder;
+        for (std::size_t i = 0; i < all.size(); ++i) {
+            if (keptRecord[i] == i) {
+                keptOrder.push_back(i);
+            }
+        }
+        std::stable_sort(keptOrder.begin(), keptOrder.end(),
+                         [&all](std::size_t a, std::size_t b) {
+                             const Crossing& ca = all[a];
+                             const Crossing& cb = all[b];
+                             return std::tie(ca.n, ca.vBranch, ca.zVx, ca.hSegment, ca.hT, ca.vSample) <
+                                    std::tie(cb.n, cb.vBranch, cb.zVx, cb.hSegment, cb.hT, cb.vSample);
+                         });
+        for (const std::size_t record : keptOrder) {
+            eventOfRecord[record] = events.size();
+            Crossing event = all[record];
+            event.representative = representativeOf[event.detection];
+            events.push_back(std::move(event));
+        }
+        for (std::size_t i = 0; i < all.size(); ++i) {
+            eventOfDetection[all[i].detection] = eventOfRecord[keptRecord[i]];
+        }
+    }
+
+    // Terminal events (see Crossing::terminal): toward one of the H fiber's
+    // ends, no further detection of this pair along the H fiber, less than
+    // a turn of angle to that end, every sample on the way within the
+    // event's V branch's height range, and no segment on the way on which a
+    // detection may have gone unseen (gated, or an unresolved overlap).
+    {
+        const std::vector<std::size_t>& uncovered = detections.uncoveredSegments;
+        // Any uncovered segment with index in [from, to]?
+        const auto uncoveredWithin = [&](std::size_t from, std::size_t to) {
+            if (from > to) {
+                return false;
+            }
+            const auto it = std::lower_bound(uncovered.begin(), uncovered.end(), from);
+            return it != uncovered.end() && *it <= to;
+        };
+        std::vector<double> alongAll;
+        alongAll.reserve(raw.size() + shallow.size());
+        for (const std::vector<Crossing>* list : {&raw, &shallow}) {
+            for (const Crossing& detection : *list) {
+                alongAll.push_back(static_cast<double>(detection.hSegment) + detection.hT);
+            }
+        }
+        std::sort(alongAll.begin(), alongAll.end());
+        const std::size_t last = hPsi.size() - 1;
+        for (Crossing& event : events) {
+            const double along = static_cast<double>(event.hSegment) + event.hT;
+            const Branch& branch = vTrace.branches[event.vBranch];
+            const double zLo = branch.z.front();
+            const double zHi = branch.z.back();
+            const auto within = [&](std::size_t from, std::size_t to) {
+                for (std::size_t k = from; k <= to; ++k) {
+                    if (hZ[k] < zLo || hZ[k] > zHi) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            const bool laterExists =
+                std::upper_bound(alongAll.begin(), alongAll.end(), along + 1e-9) != alongAll.end();
+            const bool earlierExists =
+                std::lower_bound(alongAll.begin(), alongAll.end(), along - 1e-9) != alongAll.begin();
+            // The crossing's own segment counts both ways: the part of it
+            // beyond the crossing may hold a gated encounter too.
+            // The crossing's own segment counts on a side only where a part
+            // of it lies on that side of the hit.
+            const std::size_t firstAhead = event.hT < 1.0 ? event.hSegment : event.hSegment + 1;
+            const bool forward = !laterExists &&
+                                 std::abs(hPsi[last] - event.psiH) < kTwoPi &&
+                                 (event.hSegment + 1 > last || within(event.hSegment + 1, last)) &&
+                                 (last == 0 || !uncoveredWithin(firstAhead, last - 1));
+            const bool ownBehind = event.hT > 0.0;
+            const bool backward = !earlierExists &&
+                                  std::abs(event.psiH - hPsi[0]) < kTwoPi &&
+                                  within(0, event.hSegment) &&
+                                  !(ownBehind ? uncoveredWithin(0, event.hSegment)
+                                              : (event.hSegment > 0 &&
+                                                 uncoveredWithin(0, event.hSegment - 1)));
+            event.terminal = forward || backward;
+            const auto sideBit = [&](double psiEnd) {
+                return psiEnd > event.psiH ? 1 : (psiEnd < event.psiH ? 2 : 0);
+            };
+            event.terminalSides = (forward ? sideBit(hPsi[last]) : 0) |
+                                  (backward ? sideBit(hPsi[0]) : 0);
+        }
+    }
+
+    // Traversal groups: every (translate, V branch) with at least two
+    // counted events, counted over the events themselves.
+    std::map<std::pair<long long, std::size_t>, std::vector<std::size_t>> eventsByKey;
+    // Translates and branches with a seam encounter: their counts are of an
+    // incomplete traversal (see CrossingGroup::seamed).
+    std::set<std::pair<long long, std::size_t>> seamedKeys;
+    // Keys with an event exactly at the V fiber's radius - on the curtain
+    // itself - counted or not (a touch there is a contact all the same).
+    std::set<std::pair<long long, std::size_t>> curtainKeys;
+    for (std::size_t e = 0; e < events.size(); ++e) {
+        if (events[e].deltaR == 0.0) {
+            curtainKeys.insert({events[e].n, events[e].vBranch});
+        }
+        // Touches cross nothing; seam encounters are annotation-classified,
+        // not radial evidence. Neither counts.
+        if (events[e].kollesis) {
+            seamedKeys.insert({events[e].n, events[e].vBranch});
+            continue;
+        }
+        if (events[e].touch || events[e].apex) {
+            continue;
+        }
+        eventsByKey[{events[e].n, events[e].vBranch}].push_back(e);
+    }
+    // Which side of the branch's angular locus an H endpoint lies on, for
+    // translate n: +1 / -1 when the endpoint clears the locus by the
+    // clearance, 0 when it is too close; `covered` false when the branch does
+    // not span that height, in which case the traversal's completeness is
+    // unknown and the group takes no verdict.
+    const double clearance = params.endpointClearanceTurns * kTwoPi;
+    const auto endpointSide = [&](std::size_t sample, long long n, const Branch& branch,
+                                  bool& covered) {
+        const double z = hZ[sample];
+        const double psi = hPsi[sample] + kTwoPi * static_cast<double>(n);
+        covered = false;
+        if (branch.z.size() < 2 || z < branch.z.front() || z > branch.z.back()) {
+            return 0;
+        }
+        covered = true;
+        const auto upper = std::lower_bound(branch.z.begin(), branch.z.end(), z);
+        std::size_t j = static_cast<std::size_t>(upper - branch.z.begin());
+        j = j > 0 ? j - 1 : 0;
+        if (j + 1 >= branch.z.size()) {
+            j = branch.z.size() - 2;
+        }
+        const double span = branch.z[j + 1] - branch.z[j];
+        const double u = span > 0.0 ? std::clamp((z - branch.z[j]) / span, 0.0, 1.0) : 0.0;
+        const double psiV = branch.psi[j] + u * (branch.psi[j + 1] - branch.psi[j]);
+        const double d = psi - psiV;
+        if (std::abs(d) < clearance) {
+            return 0;
+        }
+        return d > 0.0 ? 1 : -1;
+    };
+    for (const auto& [key, members] : eventsByKey) {
+        if (members.size() < 2) {
+            continue;
+        }
+        const long long n = key.first;
+        const Branch& branch = vTrace.branches[key.second];
+        CrossingGroup group;
+        group.n = n;
+        group.vBranch = key.second;
+        group.members = members;
+        group.multiplicity = static_cast<int>(members.size());
+        group.minAbsDeltaR = std::numeric_limits<double>::infinity();
+        bool anyInside = false;
+        bool anyOutside = false;
+        double transversalitySum = 0.0;
+        for (const std::size_t e : members) {
+            const Crossing& event = events[e];
+            const bool inside = event.kind == CrossingKind::Inside;
+            anyInside = anyInside || inside;
+            anyOutside = anyOutside || !inside;
+            group.orientationSum += event.orientation;
+            if (inside) {
+                ++group.insideCount;
+                group.insideOrientationSum += event.orientation;
+            }
+            if (event.deltaR == 0.0) {
+                group.onCurtain = true;
+            }
+            group.minAbsDeltaR = std::min(group.minAbsDeltaR, std::abs(event.deltaR));
+            transversalitySum += event.transversality;
+        }
+        group.meanTransversality = transversalitySum / static_cast<double>(members.size());
+        group.mixedSigns = anyInside && anyOutside;
+        group.coverageGap = gapTranslates.count(n) != 0;
+        group.unresolved = unresolvedTranslates.count(n) != 0;
+        // Completeness of the count is decided where the curtain is: the
+        // stretch of the H trace whose lifted angle lies within the branch's
+        // angular window (its psi range plus the clearance) at this
+        // translate. Every sample of that stretch must stay within the
+        // branch's height range - an excursion above or below it, at the V
+        // fiber's angle, could cross the fiber's untraced continuation unseen
+        // and come back with the count off by two - and the stretch must be
+        // entered from one side of the window and left to the other. A
+        // stretch that begins or ends at the trace's own end is judged there
+        // by the local side test against the V fiber's angle at that height.
+        // A multi-turn H fiber therefore passes on each turn that crosses the
+        // V fiber cleanly, whatever it does elsewhere.
+        // The stretch is taken segment by segment, each clipped to the window,
+        // so a single long segment jumping across the V fiber's angle is seen
+        // whether or not a sample lands inside; the clipped ends' heights
+        // bound the segment's heights inside the window (it is straight).
+        {
+            const double windowLo = branch.psiMin - clearance;
+            const double windowHi = branch.psiMax + clearance;
+            const double windowMid = 0.5 * (branch.psiMin + branch.psiMax);
+            const double lift = kTwoPi * static_cast<double>(n);
+            const double zLoBranch = branch.z.front();
+            const double zHiBranch = branch.z.back();
+            bool excursion = false;
+            bool any = false;
+            int sideA = 0;
+            int sideB = 0;
+            for (std::size_t i = 0; i + 1 < hPsi.size(); ++i) {
+                const double a = hPsi[i] + lift;
+                const double b = hPsi[i + 1] + lift;
+                const double segLo = std::min(a, b);
+                const double segHi = std::max(a, b);
+                if (segHi < windowLo || segLo > windowHi) {
+                    continue;
+                }
+                // Parameter range of the segment inside the window.
+                double t0 = 0.0;
+                double t1 = 1.0;
+                if (b != a) {
+                    const double tLo = (windowLo - a) / (b - a);
+                    const double tHi = (windowHi - a) / (b - a);
+                    t0 = std::clamp(std::min(tLo, tHi), 0.0, 1.0);
+                    t1 = std::clamp(std::max(tLo, tHi), 0.0, 1.0);
+                }
+                const double z0 = hZ[i] + t0 * (hZ[i + 1] - hZ[i]);
+                const double z1 = hZ[i] + t1 * (hZ[i + 1] - hZ[i]);
+                if (z0 < zLoBranch || z0 > zHiBranch || z1 < zLoBranch || z1 > zHiBranch) {
+                    excursion = true;
+                }
+                if (!any) {
+                    // Entering: from the side the segment's start lies on, or,
+                    // when the trace itself begins inside the window, by the
+                    // local test at its first sample.
+                    if (a < windowLo || a > windowHi) {
+                        sideA = a > windowMid ? 1 : -1;
+                    } else {
+                        bool covered = false;
+                        sideA = endpointSide(0, n, branch, covered);
+                        sideA = covered ? sideA : 0;
+                    }
+                }
+                any = true;
+                // Leaving (updated at every overlapping segment; the last one
+                // stands): to the side the segment's end lies on, or the local
+                // test at the trace's last sample when it ends inside.
+                if (b < windowLo || b > windowHi) {
+                    sideB = b > windowMid ? 1 : -1;
+                } else if (i + 2 == hPsi.size()) {
+                    bool covered = false;
+                    sideB = endpointSide(hPsi.size() - 1, n, branch, covered);
+                    sideB = covered ? sideB : 0;
+                } else {
+                    sideB = 0;
+                }
+            }
+            group.traversalCovered =
+                any && !excursion && sideA != 0 && sideB != 0 && sideA != sideB;
+        }
+        group.seamed = seamedKeys.count({group.n, group.vBranch}) > 0;
+        if (apexKeys.count({group.n, group.vBranch}) > 0 ||
+            curtainKeys.count({group.n, group.vBranch}) > 0) {
+            group.onCurtain = true;
+        }
+        group.hasVerdict = group.multiplicity >= 3 && group.mixedSigns &&
+                           (group.orientationSum % 2 != 0) && !group.coverageGap &&
+                           !group.unresolved && !group.onCurtain && !group.seamed &&
+                           group.traversalCovered;
+        if (group.hasVerdict) {
+            group.verdict = (group.insideCount % 2 == 1) ? CrossingKind::Inside
+                                                         : CrossingKind::Outside;
+            group.confidence =
+                std::clamp(group.minAbsDeltaR / (3.0 * std::max(params.tieBandVx, 1e-9)),
+                           0.0, 1.0) *
+                group.meanTransversality;
+            if (!trusted) {
+                group.confidence *= params.untrustedConfidenceFactor;
+            }
+        }
+        const long long groupIndex = static_cast<long long>(result.groups.size());
+        for (const std::size_t e : members) {
+            events[e].groupIndex = groupIndex;
+        }
+        result.groups.push_back(std::move(group));
+    }
+
+    // Representatives against the groups: one standing only for detections
+    // whose events sit in verdict groups is covered (the groups constrain in
+    // its place); one standing for covered and uncovered detections alike
+    // constrains for the uncovered ones only - it becomes the merge's
+    // representative of just those: the most confident uncovered record (the
+    // earliest in cluster order on a tie, as the merge picks), boosted by
+    // their count. Its display group is its own detection's.
+    const auto verdictOf = [&](std::size_t detection) {
+        const long long g = events[eventOfDetection[detection]].groupIndex;
+        return g >= 0 && result.groups[static_cast<std::size_t>(g)].hasVerdict;
+    };
+    for (std::size_t r = 0; r < result.crossings.size(); ++r) {
+        Crossing& representative = result.crossings[r];
+        representative.groupIndex = events[eventOfDetection[representative.detection]].groupIndex;
+        int uncovered = 0;
+        const Crossing* best = nullptr;
+        for (const std::size_t detection : clusterDetections[r]) {
+            if (verdictOf(detection)) {
+                continue;
+            }
+            ++uncovered;
+            if (best == nullptr || recordOf[detection]->confidence > best->confidence) {
+                best = recordOf[detection];
+            }
+        }
+        if (uncovered == 0) {
+            representative.coveredByGroups = true;
+        } else if (uncovered < static_cast<int>(clusterDetections[r].size()) &&
+                   !representative.tangential && best != nullptr) {
+            const long long displayGroup = representative.groupIndex;
+            representative = *best;
+            representative.mergedCount = uncovered;
+            representative.confidence = std::min(
+                2.0, best->confidence * (1.0 + 0.25 * static_cast<double>(uncovered - 1)));
+            representative.groupIndex = displayGroup;
+        }
+    }
+    result.events = std::move(events);
     return result;
 }
 
@@ -528,8 +1835,9 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             if (canonical[v].hvTag != 'V' || canonical[v].psi.empty()) {
                 continue;
             }
-            shards.push_back(
-                detectPairCrossings(canonical[h], canonical[v], params));
+            shards.push_back(classifyPairCrossings(
+                detectPairCrossings(canonical[h], canonical[v], params), canonical[h],
+                canonical[v], seamAnchors(canonical, h, v, links), {}, params));
             detections.push_back(PairDetection{h, v, &shards.back()});
         }
     }
@@ -616,13 +1924,45 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
                                 std::tie(b->hFiber, b->vFiber);
                      });
     std::vector<Crossing> merged;
+    std::vector<Crossing>& events = result.events;
+    std::vector<CrossingGroup>& groups = result.groups;
     for (const PairDetection* detection : ordered_detections) {
         result.gatedSegmentCount += detection->detection->gatedSegmentCount;
         result.tangentialCount += detection->detection->tangentialCount;
+        result.unresolvedIntersectionCount += detection->detection->unresolvedCount;
+        const std::size_t crossingBase = merged.size();
+        const std::size_t eventBase = events.size();
+        const std::size_t groupBase = groups.size();
         for (Crossing crossing : detection->detection->crossings) {
             crossing.hFiber = detection->hFiber;
             crossing.vFiber = detection->vFiber;
+            if (crossing.groupIndex >= 0) {
+                crossing.groupIndex += static_cast<long long>(groupBase);
+            }
             merged.push_back(crossing);
+        }
+        for (Crossing event : detection->detection->events) {
+            event.hFiber = detection->hFiber;
+            event.vFiber = detection->vFiber;
+            event.representative += crossingBase;
+            if (event.groupIndex >= 0) {
+                event.groupIndex += static_cast<long long>(groupBase);
+            }
+            if (event.kollesis) {
+                ++result.kollesisCrossingCount;
+            }
+            if (event.kollesisInferred) {
+                ++result.kollesisInferredCount;
+            }
+            events.push_back(event);
+        }
+        for (CrossingGroup group : detection->detection->groups) {
+            group.hFiber = detection->hFiber;
+            group.vFiber = detection->vFiber;
+            for (std::size_t& member : group.members) {
+                member += eventBase;
+            }
+            groups.push_back(std::move(group));
         }
     }
     const auto detectEnd = std::chrono::steady_clock::now();
@@ -633,7 +1973,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     std::vector<Constraint> constraints;
     const auto addPair = [&constraints](std::size_t from, std::size_t to,
                                         long long weight, double confidence,
-                                        long long source) {
+                                        SourceRef source) {
         // Equality: to - from == weight, as a mirrored pair sharing one fate.
         Constraint forward{from, to, weight, confidence, source, -1, true};
         Constraint backward{to, from, -weight, confidence, source, -1, true};
@@ -644,8 +1984,20 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     };
 
     for (std::size_t c = 0; c < merged.size(); ++c) {
-        const Crossing& crossing = merged[c];
-        const long long source = static_cast<long long>(c);
+        Crossing& crossing = merged[c];
+        const SourceRef source{SourceKind::Crossing, c};
+        // A representative standing only for detections whose traversal
+        // groups took a verdict does not constrain on its own; the groups do,
+        // below.
+        if (crossing.coveredByGroups) {
+            crossing.status = CrossingStatus::InGroup;
+            continue;
+        }
+        // A shallow pass is an event for the count and the record, never a
+        // constraint on its own.
+        if (crossing.tangential) {
+            continue;
+        }
         switch (crossing.kind) {
         case CrossingKind::Inside:
             // W_h <= W_v: same winding or further inward, never a forced gap
@@ -666,6 +2018,26 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
                     crossing.confidence, source);
             ++result.tieCount;
             break;
+        }
+    }
+
+    // Traversal groups with a verdict, one constraint each, after the
+    // crossings and before the links - in shard order, so fresh and cached
+    // builds emit identically.
+    for (std::size_t g = 0; g < groups.size(); ++g) {
+        const CrossingGroup& group = groups[g];
+        if (!group.hasVerdict) {
+            continue;
+        }
+        const SourceRef groupSource{SourceKind::Group, g};
+        if (group.verdict == CrossingKind::Inside) {
+            // W_h <= W_v: k_v - k_h >= -n.
+            constraints.push_back(Constraint{group.hFiber, group.vFiber, -group.n,
+                                             group.confidence, groupSource, -1, true});
+        } else {
+            // W_h >= W_v + 1: k_h - k_v >= n + 1.
+            constraints.push_back(Constraint{group.vFiber, group.hFiber, 1 + group.n,
+                                             group.confidence, groupSource, -1, true});
         }
     }
 
@@ -696,7 +2068,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
         }
         // W_A(pA) == W_B(pB) is k_A - k_B == a; addPair encodes to - from.
         addPair(link.fiberA, link.fiberB, -a, confidence,
-                -(static_cast<long long>(l) + 1));
+                SourceRef{SourceKind::Link, l});
         result.placements[link.fiberA].linked = true;
         result.placements[link.fiberB].linked = true;
     }
@@ -712,12 +2084,19 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
         if (constraints[ci].pair >= 0) {
             constraints[static_cast<std::size_t>(constraints[ci].pair)].active = false;
         }
-        const long long source = constraints[ci].source;
-        if (source >= 0) {
-            merged[static_cast<std::size_t>(source)].status = CrossingStatus::Dropped;
+        const SourceRef source = constraints[ci].source;
+        switch (source.kind) {
+        case SourceKind::Crossing:
+            merged[source.index].status = CrossingStatus::Dropped;
             ++result.droppedCrossingCount;
-        } else {
-            result.droppedLinks.push_back(static_cast<std::size_t>(-source - 1));
+            break;
+        case SourceKind::Link:
+            result.droppedLinks.push_back(source.index);
+            break;
+        case SourceKind::Group:
+            groups[source.index].status = CrossingStatus::Dropped;
+            ++result.droppedGroupCount;
+            break;
         }
     };
     for (;;) {
@@ -833,7 +2212,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     // the island path against an empty anchored set - honestly unresolved.
     std::set<std::size_t> rootsWithCrossings;
     for (const Constraint& constraint : constraints) {
-        if (constraint.active && constraint.source >= 0) {
+        if (constraint.active && constraint.source.kind != SourceKind::Link) {
             rootsWithCrossings.insert(findRoot(constraint.from));
         }
     }
@@ -1302,6 +2681,27 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             break;
         }
     }
+    // Events: their own violation, and the status of what constrained for
+    // them - their group when it took a verdict, else their representative.
+    for (Crossing& event : events) {
+        const long long gap = event.n + k[event.vFiber] - k[event.hFiber];
+        event.violationTurns = event.kind == CrossingKind::Inside
+            ? static_cast<double>(std::max<long long>(0, -gap))
+            : static_cast<double>(std::max<long long>(0, gap + 1));
+        const bool grouped = event.groupIndex >= 0 &&
+                             groups[static_cast<std::size_t>(event.groupIndex)].hasVerdict;
+        event.status = grouped ? CrossingStatus::InGroup : merged[event.representative].status;
+    }
+    // A group's violation is against its verdict, the constraint it stood for.
+    for (CrossingGroup& group : groups) {
+        if (!group.hasVerdict) {
+            continue;
+        }
+        const long long gap = group.n + k[group.vFiber] - k[group.hFiber];
+        group.violationTurns = group.verdict == CrossingKind::Inside
+            ? static_cast<double>(std::max<long long>(0, -gap))
+            : static_cast<double>(std::max<long long>(0, gap + 1));
+    }
     // Sheet drift: rule 1 constrains "that section" of an H fiber; one k per
     // fiber assumes the annotation stays on one sheet. Repeated drops against
     // DISTINCT evidence on one H fiber - different V fibers or different
@@ -1309,13 +2709,17 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     // than solved; two drops of one contested traversal are not.
     std::map<std::size_t, std::set<std::pair<std::size_t, long long>>> dropsPerFiber;
     for (const Crossing& crossing : merged) {
-        // Only declarable, actually-violated drops are drift evidence: a
-        // contradiction against (or from) interpolated geometry says nothing
-        // about the H fiber, and a drop the final map satisfies anyway is
-        // repair debris, not evidence of anything.
-        if (crossing.status == CrossingStatus::Dropped && crossing.declarable &&
+        // Only actually-violated drops are drift evidence: a drop the final
+        // map satisfies anyway is repair debris, not evidence of anything.
+        if (crossing.status == CrossingStatus::Dropped &&
             crossing.violationTurns >= params.declarationViolationTurns) {
             dropsPerFiber[crossing.hFiber].emplace(crossing.vFiber, crossing.n);
+        }
+    }
+    for (const CrossingGroup& group : groups) {
+        if (group.hasVerdict && group.status == CrossingStatus::Dropped &&
+            group.violationTurns >= params.declarationViolationTurns) {
+            dropsPerFiber[group.hFiber].emplace(group.vFiber, group.n);
         }
     }
     for (const auto& [f, evidence] : dropsPerFiber) {
@@ -1327,6 +2731,9 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     for (Crossing& crossing : merged) {
         crossing.psiH +=
             kTwoPi * static_cast<double>(gauge[crossing.hFiber]);
+    }
+    for (Crossing& event : events) {
+        event.psiH += kTwoPi * static_cast<double>(gauge[event.hFiber]);
     }
     result.crossings = std::move(merged);
     result.solveMs = std::chrono::duration<double, std::milli>(

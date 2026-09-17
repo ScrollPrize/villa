@@ -721,6 +721,9 @@ ContentDigest detectionParamsDigest(const winding::SolverParams& params)
     hashDouble(digest, params.minTransversality);
     hashDouble(digest, params.zMergeVx);
     hashDouble(digest, params.untrustedConfidenceFactor);
+    hashDouble(digest, params.endpointClearanceTurns);
+    // Detection format version: events, orientation and traversal groups.
+    hashU64(digest, 2);
     return digest;
 }
 
@@ -736,6 +739,16 @@ ContentDigest combineDigests(uint64_t seed,
 }
 
 } // namespace
+
+std::vector<const winding::PairDetections*> GlobalLayoutCache::cachedDetections() const
+{
+    std::vector<const winding::PairDetections*> shards;
+    shards.reserve(_pairs.size());
+    for (const auto& entry : _pairs) {
+        shards.push_back(&entry.second.detection);
+    }
+    return shards;
+}
 
 void GlobalLayoutCache::clear()
 {
@@ -1145,9 +1158,10 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         winding::FiberTrace& trace = traces[i];
         trace.hvTag = ordered[i]->hvTag;
         // One model-traced span trusts the whole fiber; a fiber with none is
-        // control-point interpolation and must never be declared a winding
-        // error. Empty flags get the benefit of the doubt, exactly as the
-        // drawing renders them (a single traced run).
+        // control-point interpolation, whose evidence is attenuated in repair
+        // conflicts (declarations are not gated on it). Empty flags get the
+        // benefit of the doubt, exactly as the drawing renders them (a single
+        // traced run).
         const std::vector<bool>& tracedFlags = ordered[i]->tracedSegments;
         trace.trusted = tracedFlags.empty() ||
                         std::any_of(tracedFlags.begin(), tracedFlags.end(),
@@ -1241,6 +1255,111 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     const auto detectBegin = std::chrono::steady_clock::now();
     const int chirality =
         winding::inferChirality(traces, solverParams.chiralityOverride);
+
+    // Kollesis fields (see winding::FiberTrace). An H fiber's tagged first or
+    // last control point marks a seam end, named by that control's sample on
+    // the trace (which runs a sample beyond it). A V fiber is on a kollesis when
+    // the annotator has linked it - at the crossings, wherever along the H
+    // fibers those are - to two DISTINCT tagged H fibers whose tagged ends
+    // lie to opposite sides of it: the side being which way the tagged end
+    // lies from the linked control along the H fiber's own line, in the
+    // winding sense (chirality). Nothing is inferred from crossings.
+    // Per V fiber: the (side, H fiber) evidence its links supply; kept for
+    // the solve's own seam readings below, which need the side the inner
+    // sheet's ends lie on.
+    std::map<std::size_t, std::set<std::pair<int, std::size_t>>> seamEvidence;
+    {
+        const auto tagsUsable = [](const InputFiber& fiber) {
+            return fiber.controlPoints.size() >= 2 &&
+                   fiber.kollesisTerminations.size() == fiber.controlPoints.size();
+        };
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            const InputFiber& fiber = *ordered[i];
+            if (traces[i].hvTag != 'H' || !tagsUsable(fiber)) {
+                continue;
+            }
+            const auto sampleOf = [&](std::size_t control) {
+                const std::size_t lineIndex = prepared[i].controlLineIndex[control];
+                return lineIndex >= domainBegin[i] &&
+                               lineIndex - domainBegin[i] < traces[i].theta.size()
+                           ? lineIndex - domainBegin[i]
+                           : winding::kNoSample;
+            };
+            if (fiber.kollesisTerminations.front()) {
+                traces[i].kollesisStartSample = sampleOf(0);
+            }
+            if (fiber.kollesisTerminations.back()) {
+                traces[i].kollesisEndSample = sampleOf(fiber.controlPoints.size() - 1);
+            }
+        }
+        for (const LinkRecord& link : allLinks) {
+            std::size_t h = link.a;
+            int ih = link.ia;
+            std::size_t v = link.b;
+            if (traces[link.a].hvTag == 'V' && traces[link.b].hvTag == 'H') {
+                h = link.b;
+                ih = link.ib;
+                v = link.a;
+            } else if (traces[link.a].hvTag != 'H' || traces[link.b].hvTag != 'V') {
+                continue;
+            }
+            const InputFiber& hFiber = *ordered[h];
+            if (!tagsUsable(hFiber) || ih < 0 ||
+                static_cast<std::size_t>(ih) >= hFiber.controlPoints.size()) {
+                continue;
+            }
+            const std::vector<double>& thetaLine = prepared[h].thetaLine;
+            const std::vector<std::size_t>& lineOf = prepared[h].controlLineIndex;
+            const std::size_t linkLine = lineOf[static_cast<std::size_t>(ih)];
+            if (linkLine >= thetaLine.size()) {
+                continue;
+            }
+            const std::size_t last = hFiber.controlPoints.size() - 1;
+            for (const std::size_t tagged : {std::size_t{0}, last}) {
+                if (!hFiber.kollesisTerminations[tagged]) {
+                    continue;
+                }
+                const std::size_t tagLine = lineOf[tagged];
+                if (tagLine >= thetaLine.size()) {
+                    continue;
+                }
+                // Which way the tagged end lies from the link along the line.
+                double toward = thetaLine[tagLine] - thetaLine[linkLine];
+                if (tagLine == linkLine) {
+                    // Linked at the tagged control itself: the end lies away
+                    // from the fiber's body, one line step toward the
+                    // neighbouring control's sample. (Controls follow the
+                    // line, but a control snapped to a nearest line point
+                    // out of order must not flip the side.)
+                    const std::size_t neighbour = lineOf[tagged == 0 ? 1 : tagged - 1];
+                    if (neighbour == tagLine || neighbour >= thetaLine.size()) {
+                        continue;
+                    }
+                    const std::size_t inward = neighbour > tagLine ? tagLine + 1 : tagLine - 1;
+                    toward = -(thetaLine[inward] - thetaLine[tagLine]);
+                }
+                const double side = static_cast<double>(chirality) * toward;
+                if (!(side > 0.0) && !(side < 0.0)) {
+                    continue;
+                }
+                seamEvidence[v].emplace(side > 0.0 ? 1 : -1, h);
+            }
+        }
+        for (const auto& [v, evidence] : seamEvidence) {
+            // Two distinct H fibers on opposite sides; a doubly tagged single
+            // H fiber does not qualify a V on its own.
+            bool distinct = false;
+            for (const auto& [sideA, hA] : evidence) {
+                for (const auto& [sideB, hB] : evidence) {
+                    if (sideA > 0 && sideB < 0 && hA != hB) {
+                        distinct = true;
+                    }
+                }
+            }
+            traces[v].onKollesis = distinct;
+        }
+    }
+
     std::vector<winding::CanonicalTrace> canonical(fiberCount);
     for (std::size_t i = 0; i < fiberCount; ++i) {
         canonical[i] = winding::canonicalizeTrace(traces[i], chirality);
@@ -1251,8 +1370,16 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(chirality)));
         return digest;
     }();
-    std::deque<winding::PairCrossings> freshShards;
+    // Geometry per pair (cached or fresh), then its classification: the
+    // merge, the events, the groups and every reading that depends on
+    // annotation, computed for every build from the canonical traces' flags,
+    // so a link or tag edit never invalidates a shard.
+    std::deque<winding::PairDetections> freshShards;
+    std::deque<winding::PairCrossings> classified;
     std::vector<winding::PairDetection> detections;
+    // Per classified pair: its geometry and fibers, for the second pass.
+    std::vector<const winding::PairDetections*> geometryOf;
+    std::map<std::pair<std::size_t, std::size_t>, std::size_t> pairIndexOf;
     for (std::size_t h = 0; h < fiberCount; ++h) {
         if (canonical[h].hvTag != 'H' || canonical[h].psi.empty()) {
             continue;
@@ -1261,26 +1388,33 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
             if (canonical[v].hvTag != 'V' || canonical[v].psi.empty()) {
                 continue;
             }
+            const winding::PairDetections* geometry = nullptr;
             if (cache == nullptr) {
                 freshShards.push_back(winding::detectPairCrossings(
                     canonical[h], canonical[v], solverParams));
-                detections.push_back(
-                    winding::PairDetection{h, v, &freshShards.back()});
-                continue;
-            }
-            const ContentDigest pairKey = combineDigests(
-                0x9A18, {prepKeys[h], prepKeys[v], chiralityDigest, detectParams});
-            GlobalLayoutCache::PairSlot& slot = cache->_pairs[std::make_pair(
-                ordered[h]->fileName, ordered[v]->fileName)];
-            if (slot.key == pairKey) {
-                ++cache->_stats.pairsReused;
+                geometry = &freshShards.back();
             } else {
-                slot.detection = winding::detectPairCrossings(
-                    canonical[h], canonical[v], solverParams);
-                slot.key = pairKey;
-                ++cache->_stats.pairsRecomputed;
+                const ContentDigest pairKey = combineDigests(
+                    0x9A18, {prepKeys[h], prepKeys[v], chiralityDigest, detectParams});
+                GlobalLayoutCache::PairSlot& slot = cache->_pairs[std::make_pair(
+                    ordered[h]->fileName, ordered[v]->fileName)];
+                if (slot.key == pairKey) {
+                    ++cache->_stats.pairsReused;
+                } else {
+                    slot.detection = winding::detectPairCrossings(
+                        canonical[h], canonical[v], solverParams);
+                    slot.key = pairKey;
+                    ++cache->_stats.pairsRecomputed;
+                }
+                geometry = &slot.detection;
             }
-            detections.push_back(winding::PairDetection{h, v, &slot.detection});
+            classified.push_back(winding::classifyPairCrossings(
+                *geometry, canonical[h], canonical[v],
+                winding::seamAnchors(canonical, h, v, linkInputs), {},
+                solverParams));
+            detections.push_back(winding::PairDetection{h, v, &classified.back()});
+            geometryOf.push_back(geometry);
+            pairIndexOf[{h, v}] = classified.size() - 1;
         }
     }
     const double detectLoopMs = std::chrono::duration<double, std::milli>(
@@ -1289,7 +1423,100 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     winding::SolveResult solve =
         winding::solveWindings(traces, linkInputs, solverParams, chirality,
                                detections);
-    solve.detectMs += detectLoopMs;
+    // Seam encounters the solve finds (see winding::Crossing::kollesisInferred):
+    // on a V the annotator certified as on a kollesis, an Outside crossing
+    // that lost to the rest of its H fiber's evidence by exactly one turn,
+    // where that H fiber ends within a turn past the V. The glued inner sheet
+    // sits one thickness behind the outer sheet's V and reads exactly so.
+    // The H fiber must end on the side of the V where the inner sheet's
+    // tagged ends lie - the side of the tagged encounters that read Outside
+    // (behind the V), known from the identification itself; a V whose tagged
+    // encounters do not settle that side gets no inferred readings. Those
+    // pairs are classified again with the encounter read Inside, and the
+    // solve repeated, until a pass finds nothing new (each pass adds at
+    // least one of finitely many events, so it ends). Detection shards are
+    // untouched: this is classification.
+    double reclassifyMs = 0.0;
+    double assemblyMs = solve.detectMs;
+    double solveMs = solve.solveMs;
+    {
+        // Per kollesis V: the side (+1 / -1 in canonical angle) its inner
+        // sheet's ends lie on, or 0 when unsettled.
+        std::map<std::size_t, int> innerEndSide;
+        {
+            std::map<std::size_t, std::set<int>> behind;
+            std::map<std::size_t, std::set<int>> inFront;
+            for (const winding::Crossing& event : solve.events) {
+                if (!event.kollesis || event.kollesisInferred) {
+                    continue;
+                }
+                const auto evidence = seamEvidence.find(event.vFiber);
+                if (evidence == seamEvidence.end()) {
+                    continue;
+                }
+                for (const auto& [side, h] : evidence->second) {
+                    if (h == event.hFiber) {
+                        (event.deltaR > 0.0 ? behind : inFront)[event.vFiber].insert(side);
+                    }
+                }
+            }
+            for (const auto& [v, sides] : behind) {
+                if (sides.size() == 1) {
+                    const int side = *sides.begin();
+                    const auto front = inFront.find(v);
+                    if (front == inFront.end() || front->second.count(side) == 0) {
+                        innerEndSide[v] = side;
+                    }
+                }
+            }
+        }
+        std::map<std::size_t, std::set<std::size_t>> inferred;
+        for (;;) {
+            bool added = false;
+            for (const winding::Crossing& event : solve.events) {
+                if (event.status != winding::CrossingStatus::Dropped ||
+                    event.kind != winding::CrossingKind::Outside || event.kollesis ||
+                    event.touch || event.tangential || !event.terminal ||
+                    std::abs(event.violationTurns - 1.0) > 0.5 ||
+                    !traces[event.vFiber].onKollesis) {
+                    continue;
+                }
+                const auto side = innerEndSide.find(event.vFiber);
+                if (side == innerEndSide.end() ||
+                    (event.terminalSides & (side->second > 0 ? 1 : 2)) == 0) {
+                    continue;
+                }
+                const auto pair = pairIndexOf.find({event.hFiber, event.vFiber});
+                if (pair == pairIndexOf.end()) {
+                    continue;
+                }
+                added = inferred[pair->second].insert(event.detection).second || added;
+            }
+            if (!added) {
+                break;
+            }
+            const auto reclassifyBegin = std::chrono::steady_clock::now();
+            for (const auto& [index, ids] : inferred) {
+                const std::size_t h = detections[index].hFiber;
+                const std::size_t v = detections[index].vFiber;
+                classified[index] = winding::classifyPairCrossings(
+                    *geometryOf[index], canonical[h], canonical[v],
+                    winding::seamAnchors(canonical, h, v, linkInputs),
+                    std::vector<std::size_t>(ids.begin(), ids.end()), solverParams);
+            }
+            reclassifyMs += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - reclassifyBegin)
+                                .count();
+            solve = winding::solveWindings(traces, linkInputs, solverParams, chirality,
+                                           detections);
+            assemblyMs += solve.detectMs;
+            solveMs += solve.solveMs;
+        }
+    }
+    // Every pass's shard assembly, detection loop and reclassification is
+    // detection time; every pass's solve is solve time.
+    solve.detectMs = assemblyMs + detectLoopMs + reclassifyMs;
+    solve.solveMs = solveMs;
 
     result.chirality = solve.chirality;
     result.islandCount = solve.islandCount;
@@ -1297,6 +1524,9 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     result.tieCount = solve.tieCount;
     result.gatedSegmentCount = solve.gatedSegmentCount;
     result.tangentialCount = solve.tangentialCount;
+    result.unresolvedIntersectionCount = solve.unresolvedIntersectionCount;
+    result.kollesisCrossingCount = solve.kollesisCrossingCount;
+    result.kollesisInferredCount = solve.kollesisInferredCount;
     result.detectMs = solve.detectMs;
     result.solveMs = solve.solveMs;
 
@@ -1365,6 +1595,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         placed.meta.networkId = networkIdOf[i];
         placed.meta.networkSize = networkSizeOf[i];
         placed.meta.sheetDriftSuspect = placement.sheetDriftSuspect;
+        placed.meta.onKollesis = traces[i].onKollesis;
         placed.meta.windingLo = placement.windingLo;
         placed.meta.windingHi = placement.windingHi;
         switch (placement.anchor) {
@@ -1423,42 +1654,138 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         // A link the repair had to drop is winding-suspect whatever its
         // residual now reads: the map placed its endpoints against it. The
         // boundary is inclusive because a residual AT the threshold already
-        // solves with zero confidence. Suspicion requires model-traced
-        // geometry on both ends - the residual of a link into an
-        // interpolated fiber is as suspect as the unwrap it rode on.
-        placedLink.suspect = (traces[link.a].trusted && traces[link.b].trusted) &&
-                             (placedLink.turnErr >= params.suspectTurns ||
-                              droppedLinks.count(l) != 0);
+        // solves with zero confidence.
+        placedLink.suspect = placedLink.turnErr >= params.suspectTurns ||
+                             droppedLinks.count(l) != 0;
         if (placedLink.suspect) {
             ++result.suspectLinkCount;
         }
         result.links.push_back(std::move(placedLink));
     }
 
-    for (const winding::Crossing& crossing : solve.crossings) {
-        // Declared errors only: a drop involving an untrusted fiber is the
-        // interpolation's fault, and a drop the final map SATISFIES anyway is
-        // greedy-repair debris (the real culprit fell in a later cycle) -
-        // neither is an annotation mistake to ring in red.
+    // Every crossing event goes out as an inspection record, positioned where
+    // the user will look for it: the solver's position is on the raw unrolled
+    // trace; the map draws a resampled (and possibly smoothed) curve, so the
+    // point is projected onto the drawn polyline of the H fiber it belongs to.
+    result.crossingEvents.reserve(solve.events.size());
+    for (const winding::Crossing& crossing : solve.events) {
+        CrossingEvent event;
+        const double x =
+            (crossing.psiH + kTwoPi * solve.placements[crossing.hFiber].turns) *
+            rRefVx;
+        event.posVx = drawable[crossing.hFiber]
+            ? nearestPointOnPolyline(geometry[crossing.hFiber].samples,
+                                     QPointF(x, crossing.zVx))
+            : QPointF(x, crossing.zVx);
+        event.hFiberId = ordered[crossing.hFiber]->id;
+        event.vFiberId = ordered[crossing.vFiber]->id;
+        event.n = crossing.n;
+        event.kind = crossing.kind;
+        event.status = crossing.status;
+        event.deltaR = crossing.deltaR;
+        event.transversality = crossing.transversality;
+        event.tangential = crossing.tangential;
+        event.touch = crossing.touch;
+        event.kollesis = crossing.kollesis;
+        event.kollesisInferred = crossing.kollesisInferred;
+        event.orientation = crossing.orientation;
+        event.mergedCount = crossing.mergedCount;
+        event.confidence = crossing.confidence;
+        event.violationTurns = crossing.violationTurns;
+        event.groupId = crossing.groupIndex;
+        result.crossingEvents.push_back(std::move(event));
+    }
+    result.crossingGroups.reserve(solve.groups.size());
+    for (const winding::CrossingGroup& group : solve.groups) {
+        CrossingGroupRecord record;
+        record.hFiberId = ordered[group.hFiber]->id;
+        record.vFiberId = ordered[group.vFiber]->id;
+        record.n = group.n;
+        record.vBranch = group.vBranch;
+        record.members = group.members;
+        record.multiplicity = group.multiplicity;
+        record.insideCount = group.insideCount;
+        record.orientationSum = group.orientationSum;
+        record.insideOrientationSum = group.insideOrientationSum;
+        record.mixedSigns = group.mixedSigns;
+        record.coverageGap = group.coverageGap;
+        record.unresolved = group.unresolved;
+        record.onCurtain = group.onCurtain;
+        record.traversalCovered = group.traversalCovered;
+        record.seamed = group.seamed;
+        record.minAbsDeltaR = group.minAbsDeltaR;
+        record.meanTransversality = group.meanTransversality;
+        record.hasVerdict = group.hasVerdict;
+        record.verdict = group.verdict;
+        record.confidence = group.confidence;
+        record.status = group.status;
+        record.violationTurns = group.violationTurns;
+        if (group.hasVerdict) {
+            ++result.traversalGroupCount;
+        }
+        result.crossingGroups.push_back(std::move(record));
+    }
+
+    // Declared errors only: a drop the final map SATISFIES anyway is
+    // greedy-repair debris (the real culprit fell in a later cycle), not an
+    // annotation mistake to ring in red. A crossing that constrained through
+    // its group (InGroup) is never declared on its own. An individual
+    // declaration is marked at every event its representative stood for.
+    const auto markFor = [&](std::size_t eventIndex, double violationTurns,
+                             long long groupId) {
+        const CrossingEvent& event = result.crossingEvents[eventIndex];
+        CrossingMark mark;
+        mark.posVx = event.posVx;
+        mark.hFiberId = event.hFiberId;
+        mark.vFiberId = event.vFiberId;
+        mark.n = event.n;
+        mark.kind = event.kind;
+        mark.deltaR = event.deltaR;
+        mark.violationTurns = violationTurns;
+        mark.eventIndex = eventIndex;
+        mark.groupId = groupId;
+        mark.kollesis = event.kollesis;
+        return mark;
+    };
+    std::vector<char> declaredRepresentative(solve.crossings.size(), 0);
+    for (std::size_t c = 0; c < solve.crossings.size(); ++c) {
+        const winding::Crossing& crossing = solve.crossings[c];
         if (crossing.status != winding::CrossingStatus::Dropped ||
-            !crossing.declarable ||
             crossing.violationTurns < solverParams.declarationViolationTurns) {
             continue;
         }
         ++result.droppedCrossingCount;
-        if (!drawable[crossing.hFiber]) {
+        declaredRepresentative[c] = drawable[crossing.hFiber];
+    }
+    // Every event a declared representative stood for that the map itself
+    // violates: a merged event of the other sign that the map satisfies is
+    // not an error at its place, and an event whose group constrained for it
+    // is the group's to declare. One pass over the events.
+    for (std::size_t e = 0; e < solve.events.size(); ++e) {
+        const winding::Crossing& event = solve.events[e];
+        if (event.representative < declaredRepresentative.size() &&
+            declaredRepresentative[event.representative] &&
+            event.status == winding::CrossingStatus::Dropped &&
+            event.violationTurns >= solverParams.declarationViolationTurns) {
+            result.suspectCrossings.push_back(markFor(e, event.violationTurns, -1));
+        }
+    }
+    // A dropped, violated traversal group is one conflict, marked at every
+    // place the pair met.
+    for (std::size_t g = 0; g < solve.groups.size(); ++g) {
+        const winding::CrossingGroup& group = solve.groups[g];
+        if (!group.hasVerdict || group.status != winding::CrossingStatus::Dropped ||
+            group.violationTurns < solverParams.declarationViolationTurns) {
             continue;
         }
-        // The solver's position is on the raw unrolled trace; the map draws
-        // a resampled (and possibly smoothed) curve, so the mark is projected
-        // onto the drawn polyline of the H fiber it belongs to, where the
-        // user will look for it.
-        const double x =
-            (crossing.psiH + kTwoPi * solve.placements[crossing.hFiber].turns) *
-            rRefVx;
-        result.suspectCrossings.push_back(CrossingMark{
-            nearestPointOnPolyline(geometry[crossing.hFiber].samples,
-                                   QPointF(x, crossing.zVx))});
+        ++result.declaredGroupCount;
+        if (!drawable[group.hFiber]) {
+            continue;
+        }
+        for (const std::size_t member : group.members) {
+            result.suspectCrossings.push_back(
+                markFor(member, group.violationTurns, static_cast<long long>(g)));
+        }
     }
 
     const double padX = std::max(kPadFraction * (hiX - loX), params.minPadXVx);
@@ -1601,8 +1928,9 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
         hashU64(digest, fiber.label.size());
         hashBytes(digest, fiber.label.constData(),
                   static_cast<std::size_t>(fiber.label.size()) * sizeof(QChar));
-        // Display-only like the label, and like it part of "did anything the
-        // layout consumes change" so the memoization check stays exact.
+        // Solve-time input (kollesis identification), never detection input:
+        // part of "did anything the layout consumes change" so the
+        // memoization check stays exact, not of the detection shard keys.
         hashU64(digest, fiber.kollesisTerminations.size());
         for (const bool tagged : fiber.kollesisTerminations) {
             hashU64(digest, tagged ? 1 : 0);
@@ -1636,6 +1964,7 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
     hashDouble(digest, solver.linkSuspectTurns);
     hashDouble(digest, solver.untrustedConfidenceFactor);
     hashDouble(digest, solver.declarationViolationTurns);
+    hashDouble(digest, solver.endpointClearanceTurns);
     hashU64(digest, static_cast<uint64_t>(
                         static_cast<int64_t>(solver.chiralityOverride)));
     return digest;
@@ -1663,6 +1992,16 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
     hashU64(digest, static_cast<uint64_t>(
                         static_cast<int64_t>(result.droppedCrossingCount)));
     hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.declaredGroupCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.traversalGroupCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.unresolvedIntersectionCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.kollesisCrossingCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.kollesisInferredCount)));
+    hashU64(digest, static_cast<uint64_t>(
                         static_cast<int64_t>(result.gatedSegmentCount)));
     hashU64(digest,
             static_cast<uint64_t>(static_cast<int64_t>(result.tangentialCount)));
@@ -1680,6 +2019,7 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         hashU64(digest, static_cast<uint64_t>(fiber.meta.anchor));
         hashU64(digest, fiber.meta.linked ? 1 : 0);
         hashU64(digest, fiber.meta.sheetDriftSuspect ? 1 : 0);
+        hashU64(digest, fiber.meta.onKollesis ? 1 : 0);
         hashU64(digest, static_cast<uint64_t>(
                             static_cast<int64_t>(fiber.meta.networkId)));
         hashU64(digest, static_cast<uint64_t>(
@@ -1724,10 +2064,66 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         hashDouble(digest, mark.xVx);
         hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(mark.number)));
     }
+    const auto hashI64 = [&digest](long long value) {
+        hashU64(digest, static_cast<uint64_t>(value));
+    };
     hashU64(digest, result.suspectCrossings.size());
     for (const CrossingMark& mark : result.suspectCrossings) {
         hashDouble(digest, mark.posVx.x());
         hashDouble(digest, mark.posVx.y());
+        hashU64(digest, mark.hFiberId);
+        hashU64(digest, mark.vFiberId);
+        hashI64(mark.n);
+        hashU64(digest, static_cast<uint64_t>(mark.kind));
+        hashDouble(digest, mark.deltaR);
+        hashDouble(digest, mark.violationTurns);
+        hashU64(digest, mark.eventIndex);
+        hashI64(mark.groupId);
+        hashU64(digest, mark.kollesis ? 1 : 0);
+    }
+    hashU64(digest, result.crossingEvents.size());
+    for (const CrossingEvent& event : result.crossingEvents) {
+        hashDouble(digest, event.posVx.x());
+        hashDouble(digest, event.posVx.y());
+        hashU64(digest, event.hFiberId);
+        hashU64(digest, event.vFiberId);
+        hashI64(event.n);
+        hashU64(digest, static_cast<uint64_t>(event.kind));
+        hashU64(digest, static_cast<uint64_t>(event.status));
+        hashDouble(digest, event.deltaR);
+        hashDouble(digest, event.transversality);
+        hashU64(digest, (event.tangential ? 1 : 0) | (event.touch ? 2 : 0) |
+                            (event.kollesis ? 4 : 0) | (event.kollesisInferred ? 8 : 0));
+        hashI64(event.orientation);
+        hashI64(event.mergedCount);
+        hashDouble(digest, event.confidence);
+        hashDouble(digest, event.violationTurns);
+        hashI64(event.groupId);
+    }
+    hashU64(digest, result.crossingGroups.size());
+    for (const CrossingGroupRecord& group : result.crossingGroups) {
+        hashU64(digest, group.hFiberId);
+        hashU64(digest, group.vFiberId);
+        hashI64(group.n);
+        hashU64(digest, group.vBranch);
+        hashU64(digest, group.members.size());
+        for (const std::size_t member : group.members) {
+            hashU64(digest, member);
+        }
+        hashI64(group.multiplicity);
+        hashI64(group.insideCount);
+        hashI64(group.orientationSum);
+        hashI64(group.insideOrientationSum);
+        hashU64(digest, (group.mixedSigns ? 1 : 0) | (group.coverageGap ? 2 : 0) |
+                            (group.unresolved ? 4 : 0) | (group.onCurtain ? 8 : 0) |
+                            (group.traversalCovered ? 16 : 0) | (group.hasVerdict ? 32 : 0) |
+                            (group.seamed ? 64 : 0));
+        hashDouble(digest, group.minAbsDeltaR);
+        hashDouble(digest, group.meanTransversality);
+        hashU64(digest, static_cast<uint64_t>(group.verdict));
+        hashDouble(digest, group.confidence);
+        hashU64(digest, static_cast<uint64_t>(group.status));
+        hashDouble(digest, group.violationTurns);
     }
     hashU64(digest, result.unplaced.size());
     for (const UnplacedFiber& fiber : result.unplaced) {

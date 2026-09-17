@@ -56,8 +56,9 @@ struct InputFiber {
     // Per control-point-span "was fiber-model traced"; anything else is only
     // an interpolation. Empty or mismatched renders as a single traced run.
     std::vector<bool> tracedSegments;
-    // Per control point: tagged kollesis_termination. Display-only (no
-    // geometry reads it), so it is not part of the cache keys; empty or
+    // Per control point: tagged kollesis_termination. Read at solve time
+    // (a V fiber linked to two tagged H fibers is on a kollesis), never by
+    // the cached detection, so it is not part of the cache keys; empty or
     // mismatched means no tags.
     std::vector<bool> kollesisTerminations;
     // Raw directed refs; the layout dedupes reciprocal pairs.
@@ -188,6 +189,9 @@ struct GlobalFiberMeta {
     GlobalAnchor anchor = GlobalAnchor::Unresolved;
     bool linked = false;
     bool sheetDriftSuspect = false;
+    // A V fiber the annotator has linked to kollesis-tagged H ends on both
+    // sides: its seam encounters read as same winding or inward.
+    bool onKollesis = false;
     // W range over the fiber; a multi-turn H fiber has no single winding.
     double windingLo = 0.0;
     double windingHi = 0.0;
@@ -204,10 +208,80 @@ struct GlobalPlacedFiber {
     GlobalFiberMeta meta;
 };
 
-// A crossing constraint the repair had to drop, marked on the map (y = +z,
-// like every placed coordinate here).
+// Every H-vs-V crossing event the solver resolved (one per crossing of the
+// two polylines, apex touches included and flagged), positioned on the drawn
+// H polyline (y = +z, like every placed coordinate here), with what it read
+// and what became of the representative that stood for it: the inspection
+// record behind the map's markers. Ids are the runtime fiber ids of the build.
+struct CrossingEvent {
+    QPointF posVx;
+    uint64_t hFiberId = 0;
+    uint64_t vFiberId = 0;
+    long long n = 0;
+    winding::CrossingKind kind = winding::CrossingKind::Inside;
+    winding::CrossingStatus status = winding::CrossingStatus::Used;
+    double deltaR = 0.0;
+    double transversality = 0.0;
+    bool tangential = false;
+    bool touch = false;
+    // Read as a kollesis seam encounter (same winding or inward).
+    bool kollesis = false;
+    // ... from the solve contradiction on a certified kollesis V rather than
+    // from a tag on this H fiber (see winding::Crossing::kollesisInferred).
+    bool kollesisInferred = false;
+    int orientation = 0;
+    int mergedCount = 1;
+    double confidence = 0.0;
+    double violationTurns = 0.0;
+    // Index into GlobalResult::crossingGroups, or -1.
+    long long groupId = -1;
+};
+
+// A pair's crossings on one translate and V branch read together (see
+// winding::CrossingGroup); members index GlobalResult::crossingEvents.
+struct CrossingGroupRecord {
+    uint64_t hFiberId = 0;
+    uint64_t vFiberId = 0;
+    long long n = 0;
+    std::size_t vBranch = 0;
+    std::vector<std::size_t> members;
+    int multiplicity = 0;
+    int insideCount = 0;
+    int orientationSum = 0;
+    int insideOrientationSum = 0;
+    bool mixedSigns = false;
+    bool coverageGap = false;
+    bool unresolved = false;
+    bool onCurtain = false;
+    bool traversalCovered = false;
+    // A seam encounter lies on the translate: no verdict (incomplete count).
+    bool seamed = false;
+    double minAbsDeltaR = 0.0;
+    double meanTransversality = 0.0;
+    bool hasVerdict = false;
+    winding::CrossingKind verdict = winding::CrossingKind::Inside;
+    double confidence = 0.0;
+    winding::CrossingStatus status = winding::CrossingStatus::Used;
+    double violationTurns = 0.0;
+};
+
+// A declared winding error, marked on the map: a dropped crossing the final
+// map still violates, or every member of such a traversal group. Group
+// members share a groupId; they are one conflict drawn at each place the
+// pair met, not independent errors.
 struct CrossingMark {
     QPointF posVx;
+    uint64_t hFiberId = 0;
+    uint64_t vFiberId = 0;
+    long long n = 0;
+    winding::CrossingKind kind = winding::CrossingKind::Inside;
+    double deltaR = 0.0;
+    double violationTurns = 0.0;
+    // Index into GlobalResult::crossingEvents.
+    std::size_t eventIndex = 0;
+    // Index into GlobalResult::crossingGroups when the error is a group's, else -1.
+    long long groupId = -1;
+    bool kollesis = false;
 };
 
 // A fiber that could not be placed: no geometry, no umbilicus to unroll
@@ -229,6 +303,9 @@ struct GlobalResult {
     // One mark per integer winding across the padded extent.
     std::vector<WindingMark> windings;
     std::vector<CrossingMark> suspectCrossings;
+    // Every crossing and every traversal group of the solve, for inspection.
+    std::vector<CrossingEvent> crossingEvents;
+    std::vector<CrossingGroupRecord> crossingGroups;
     std::vector<UnplacedFiber> unplaced;
     double rRefVx = 0.0;
     double x0Vx = 0.0;
@@ -240,10 +317,19 @@ struct GlobalResult {
     int unresolvedCount = 0;
     int tieCount = 0;
     int suspectLinkCount = 0;
-    // Declared winding errors only: drops involving a fiber with no
-    // model-traced span are expected interpolation noise and are neither
-    // counted here nor marked on the map.
+    // Declared winding errors: dropped constraints the final map still
+    // violates. droppedCrossingCount counts individual crossings,
+    // declaredGroupCount traversal groups (each one conflict);
+    // traversalGroupCount is the groups that took a verdict.
     int droppedCrossingCount = 0;
+    int declaredGroupCount = 0;
+    int traversalGroupCount = 0;
+    // Owner-segment pairs the detector could not intersect (exactly
+    // parallel); their translates take no group verdict.
+    int unresolvedIntersectionCount = 0;
+    // Events read as kollesis seam encounters.
+    int kollesisCrossingCount = 0;
+    int kollesisInferredCount = 0;
     // Geometry the solver refused to learn from: angularly ill-conditioned
     // or wild segments, and tangential contacts. Nonzero values say the map
     // may be underconstrained for a reason the fibers themselves can't show.
@@ -343,6 +429,9 @@ public:
         int pairsRecomputed = 0;
     };
     [[nodiscard]] const Stats& lastStats() const { return _stats; }
+    // The cached detection shards in (H file, V file) order, for tests of the
+    // contract that a cached shard is the fresh one bit for bit.
+    [[nodiscard]] std::vector<const winding::PairDetections*> cachedDetections() const;
 
 private:
     friend GlobalResult buildGlobalLayout(const std::vector<InputFiber>&,
@@ -357,7 +446,7 @@ private:
     };
     struct PairSlot {
         ContentDigest key;
-        winding::PairCrossings detection;
+        winding::PairDetections detection;
     };
     std::map<std::string, PrepSlot> _prep;
     std::map<std::pair<std::string, std::string>, PairSlot> _pairs;

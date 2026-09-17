@@ -172,6 +172,10 @@ constexpr qreal kPanelZ = -3.0;
 constexpr qreal kNetworkGlowZ = 1.5;
 constexpr qreal kFiberZ = 2.0;
 constexpr qreal kHighlightZ = 7.0;
+// Error rings (dropped crossings, suspect-link endpoints) draw above
+// everything, the selected fiber and its control dots included: a ring in a
+// dense tangle is the one thing the map must not bury.
+constexpr qreal kSuspectRingZ = kHighlightZ + 2.0;
 // Dots (control points, link crossings, suspect-link rings) are drawn in scene
 // units, so they grow with the zoom, but their on-screen radius is clamped
 // from both sides: never smaller than kMin*Px, so they stay visible when a
@@ -863,6 +867,7 @@ void FiberMapWorkspace::showStale(const QString& reason)
 {
     _staleReason = reason;
     if (_statusLabel) {
+        _statusLabel->setStyleSheet({});
         _statusLabel->setText(withCachedUmbilicusStatus(reason));
     }
 }
@@ -917,7 +922,9 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     rebuildScene(reason);
     _restingReason = reason;
     _freshStatus = withCachedUmbilicusStatus(reason);
+    _freshStatusStyle.clear();
     if (_statusLabel) {
+        _statusLabel->setStyleSheet(_freshStatusStyle);
         _statusLabel->setText(_freshStatus);
     }
 }
@@ -993,6 +1000,7 @@ bool FiberMapWorkspace::applyStaleVerdict(const StaleVerdict& verdict)
         if (!_staleReason.isEmpty() && _layoutBuilt) {
             _staleReason.clear();
             if (_statusLabel) {
+                _statusLabel->setStyleSheet(_freshStatusStyle);
                 _statusLabel->setText(_freshStatus);
             }
         }
@@ -1236,6 +1244,7 @@ void FiberMapWorkspace::showEvent(QShowEvent* event)
         // suffix when the layout was cleared, and the package may have
         // changed since (nothing is built, so no dependency comparison will
         // ever say so). The cache re-resolves when the fingerprint moved.
+        _statusLabel->setStyleSheet({});
         _statusLabel->setText(withCachedUmbilicusStatus(
             _restingReason.isEmpty() ? tr("press Update")
                                      : _restingReason));
@@ -1576,11 +1585,18 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
         _fiberDockSized = true;
     }
 
-    QString status = tr("%1 fibers · %2 windings · %3 islands · %4 suspect links")
-                         .arg(_layout.fibers.size())
-                         .arg(_layout.windings.size())
-                         .arg(_layout.islandCount)
-                         .arg(_layout.suspectLinkCount);
+    // The errors lead: what the red marks add up to - every ring (dropped
+    // crossings, each group conflict's rings) and every suspect link - so
+    // one glance says whether the map is clean, before any tally of how it
+    // was built.
+    const int errorCount = static_cast<int>(_layout.suspectCrossings.size()) +
+                           _layout.suspectLinkCount;
+    QString status = errorCount > 0 ? tr("%1 errors").arg(errorCount) : tr("no errors");
+    status += tr(" · %1 fibers · %2 windings · %3 islands · %4 suspect links")
+                  .arg(_layout.fibers.size())
+                  .arg(_layout.windings.size())
+                  .arg(_layout.islandCount)
+                  .arg(_layout.suspectLinkCount);
     if (!_layout.unplaced.empty()) {
         status += tr(" · %1 unplaceable").arg(_layout.unplaced.size());
     }
@@ -1589,6 +1605,20 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     }
     if (_layout.droppedCrossingCount > 0) {
         status += tr(" · %1 dropped crossings").arg(_layout.droppedCrossingCount);
+    }
+    if (_layout.declaredGroupCount > 0) {
+        // A traversal group read together and still contradicted by the map:
+        // one conflict, ringed at each place the pair met.
+        status += tr(" · %1 group conflicts").arg(_layout.declaredGroupCount);
+    }
+    if (_layout.traversalGroupCount > 0) {
+        status += tr(" · %1 grouped").arg(_layout.traversalGroupCount);
+    }
+    if (_layout.kollesisCrossingCount > 0) {
+        status += tr(" · %1 kollesis").arg(_layout.kollesisCrossingCount);
+        if (_layout.kollesisInferredCount > 0) {
+            status += tr(" (%1 inferred)").arg(_layout.kollesisInferredCount);
+        }
     }
     const qint64 totalMs =
         job.snapshotMs + job.convertMs + job.layoutMs + publishMs;
@@ -1621,6 +1651,11 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
         status += QStringLiteral(" · ") + job.snapshot.umbilicusLabel;
     }
     _freshStatus = status;
+    // Red and bold while anything is ringed; plain once the map is clean.
+    _freshStatusStyle = errorCount > 0
+        ? QStringLiteral("QLabel { color: %1; font-weight: bold; }").arg(kSuspect.name())
+        : QString();
+    _statusLabel->setStyleSheet(_freshStatusStyle);
     _statusLabel->setText(status);
 
     if (!_viewFitted && !_layout.fibers.empty()) {
@@ -1915,7 +1950,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
                                        kMaxSuspectRingPx, suspectRingBounds);
             _scene->addItem(ring);
             ring->setPos(endpoint);
-            ring->setZValue(5.0);
+            ring->setZValue(kSuspectRingZ);
         }
         auto* label = _scene->addSimpleText(
             tr("+%1 turn").arg(link.turnErr, 0, 'f', 1), labelFont);
@@ -1966,7 +2001,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
                                    kMaxSuspectRingPx, suspectRingBounds);
         _scene->addItem(ring);
         ring->setPos(QPointF(mark.posVx.x(), -mark.posVx.y()));
-        ring->setZValue(5.0);
+        ring->setZValue(kSuspectRingZ);
     }
 
     // The scroll extent, when known, is part of what the first-build fit
@@ -2067,6 +2102,9 @@ void FiberMapWorkspace::rebuildTree()
         }
         if (meta.sheetDriftSuspect) {
             text += tr(" · drift?");
+        }
+        if (meta.onKollesis) {
+            text += tr(" · kollesis");
         }
         return text;
     };
