@@ -38,6 +38,7 @@ class QGraphicsItem;
 class QGraphicsPathItem;
 class QGraphicsScene;
 class QLabel;
+class QLineEdit;
 class QMouseEvent;
 class QPainter;
 class QHideEvent;
@@ -164,6 +165,9 @@ private:
     void requestRebuild(bool fullRebuild = false);
     void rebuildScene(const QString& emptyMessage);
     void rebuildTree();
+    // Hides every fiber row the search box does not match, and every group
+    // (error, network) left without a visible row; an empty box shows all.
+    void applyTreeFilter();
     // Puts a stale reason on the status line and records it, without latching:
     // this is how applyStaleVerdict() surfaces staleness *derived* from the
     // dependency comparison, which clears itself when its cause reverts.
@@ -318,7 +322,10 @@ private:
     QTreeWidget* _tree = nullptr;
     QDockWidget* _fiberDock = nullptr;
     QPushButton* _updateButton = nullptr;
-    QPushButton* _fullRebuildButton = nullptr;
+    // The dock's search box: a case-insensitive substring filter over each
+    // fiber row's label and annotation name, re-applied after every tree
+    // rebuild.
+    QLineEdit* _searchEdit = nullptr;
     QLabel* _statusLabel = nullptr;
     QCheckBox* _gapsCheck = nullptr;
     // The colour scale reads "0 [ramp] [saturation]": the spinbox IS the

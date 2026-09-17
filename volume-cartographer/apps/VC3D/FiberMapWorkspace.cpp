@@ -26,6 +26,7 @@
 #include <QGuiApplication>
 #include <QHeaderView>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMouseEvent>
@@ -49,6 +50,7 @@
 #include <QTransform>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
+#include <QVBoxLayout>
 #include <QVariant>
 #include <QWheelEvent>
 #include <QWindow>
@@ -62,6 +64,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <unordered_map>
 #include <utility>
 
 namespace
@@ -217,6 +220,10 @@ constexpr double kGapAcrossWeight = 1.0;
 constexpr bool kGapFadeDefault = true;
 constexpr int kGapFadeWindingsDefault = 5;
 constexpr int kGapFadeWindingsMax = 64;
+// Tree item roles beyond the fiber id in Qt::UserRole: an error entry's
+// scene extent - the ring, or both rings of a suspect link, to bring into
+// view (a QRectF, possibly of zero size; unset on every other item).
+constexpr int kErrorExtentRole = Qt::UserRole + 1;
 constexpr qreal kNetworkGlowZ = 1.5;
 constexpr qreal kFiberZ = 2.0;
 constexpr qreal kHighlightZ = 7.0;
@@ -735,14 +742,10 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     _updateButton = new QPushButton(tr("Update"), toolBar);
     _updateButton->setToolTip(
         tr("Rebuild the map, reusing cached work for unchanged fibers.\n"
-           "Identical result to Full rebuild, much faster."));
+           "Shift+click: recompute everything from scratch and, when nothing\n"
+           "changed since the last Update, verify the cached result against it.\n"
+           "Use that if the map ever looks wrong."));
     toolBar->addWidget(_updateButton);
-    _fullRebuildButton = new QPushButton(tr("Full rebuild"), toolBar);
-    _fullRebuildButton->setToolTip(
-        tr("Recompute everything from scratch. When an Update preceded it\n"
-           "on unchanged inputs, also verify the memoized result.\n"
-           "Use if the map ever looks wrong."));
-    toolBar->addWidget(_fullRebuildButton);
     toolBar->addSeparator();
 
     // The gap heat map controls. The scale's top is entered in centimetres
@@ -803,10 +806,23 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
         _tree->header()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
     }
     _tree->header()->setStretchLastSection(true);
+    _searchEdit = new QLineEdit(this);
+    _searchEdit->setObjectName(QStringLiteral("fiberMapSearch"));
+    _searchEdit->setPlaceholderText(tr("Search fibers by label or name"));
+    _searchEdit->setClearButtonEnabled(true);
+    _searchEdit->setToolTip(
+        tr("Show only fibers whose label (dj-000412) or annotation name\n"
+           "(dj_20260812T101010_000412) contains this text."));
+    auto* dockBody = new QWidget(this);
+    auto* dockLayout = new QVBoxLayout(dockBody);
+    dockLayout->setContentsMargins(0, 0, 0, 0);
+    dockLayout->setSpacing(2);
+    dockLayout->addWidget(_searchEdit);
+    dockLayout->addWidget(_tree, 1);
     _fiberDock = new QDockWidget(tr("Fibers"), this);
     _fiberDock->setObjectName(QStringLiteral("fiberMapFiberDock"));
     _fiberDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
-    _fiberDock->setWidget(_tree);
+    _fiberDock->setWidget(dockBody);
     addDockWidget(Qt::LeftDockWidgetArea, _fiberDock);
     resizeDocks({_fiberDock}, {360}, Qt::Horizontal);
 
@@ -826,10 +842,6 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
         connect(_fiberDock, &QDockWidget::dockLocationChanged, this, releaseStaleMouseGrab);
     }
 
-    connect(_updateButton, &QPushButton::clicked, this,
-            [this]() { requestRebuild(false); });
-    connect(_fullRebuildButton, &QPushButton::clicked, this,
-            [this]() { requestRebuild(true); });
     connect(_gapsCheck, &QCheckBox::toggled, this, &FiberMapWorkspace::handleGapsToggled);
     connect(_gapSaturationSpin, &QDoubleSpinBox::valueChanged, this,
             [this](double) { handleGapParamsChanged(); });
@@ -838,11 +850,18 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     connect(_gapFadeWindingsSpin, &QSpinBox::valueChanged, this,
             [this](int) { handleGapParamsChanged(); });
     updateGapLegend();
+    // Shift held at the click asks for the from-scratch rebuild (the
+    // memoization check's other half); the plain click is the memoized Update.
+    connect(_updateButton, &QPushButton::clicked, this, [this]() {
+        requestRebuild(QGuiApplication::keyboardModifiers().testFlag(Qt::ShiftModifier));
+    });
     connect(_view, &FiberMapView::clicked, this, &FiberMapWorkspace::handleSceneClick);
     connect(_view, &FiberMapView::zoomed, this,
             &FiberMapWorkspace::updateLabelChipVisibility);
     connect(_view, &FiberMapView::controlPointMenuRequested,
             this, &FiberMapWorkspace::handleControlPointMenu);
+    connect(_searchEdit, &QLineEdit::textChanged, this,
+            [this](const QString&) { applyTreeFilter(); });
     _tree->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(_tree, &QTreeWidget::customContextMenuRequested,
             this, &FiberMapWorkspace::handleTreeContextMenu);
@@ -856,7 +875,8 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
                 // and so deletes `current` while this emission is still being
                 // delivered.
                 const uint64_t fiberId = current->data(0, Qt::UserRole).toULongLong();
-                if (fiberId == 0) {
+                const QVariant errorExtent = current->data(0, kErrorExtentRole);
+                if (fiberId == 0 && !errorExtent.isValid()) {
                     return;
                 }
                 // The same gate the scene click and the control-point menu use;
@@ -872,6 +892,26 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
                     QMetaObject::invokeMethod(
                         this, [this]() { refreshStaleState(); },
                         Qt::QueuedConnection);
+                    return;
+                }
+                if (errorExtent.isValid()) {
+                    // An error entry: bring its mark into view - both rings
+                    // of a suspect link, which can sit far apart - zooming
+                    // out only when the current zoom cannot hold them. The
+                    // fibers are its children, one click away.
+                    const QRectF extent = errorExtent.toRectF();
+                    const QRectF visible =
+                        _view->mapToScene(_view->viewport()->rect()).boundingRect();
+                    if (extent.width() > visible.width() * 0.8 ||
+                        extent.height() > visible.height() * 0.8) {
+                        const double margin =
+                            0.15 * std::max(extent.width(), extent.height());
+                        _view->fitInView(extent.adjusted(-margin, -margin, margin, margin),
+                                         Qt::KeepAspectRatio);
+                        updateLabelChipVisibility();
+                    } else {
+                        _view->centerOn(extent.center());
+                    }
                     return;
                 }
                 setHighlightedFiber(fiberId);
@@ -1195,7 +1235,7 @@ void FiberMapWorkspace::clearRebuildProgress()
         _progressMarquee->stop();
     }
     _progressButton = nullptr;
-    for (QPushButton* button : {_updateButton, _fullRebuildButton}) {
+    for (QPushButton* button : {_updateButton}) {
         if (button == nullptr) {
             continue;
         }
@@ -1506,8 +1546,7 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild)
         cacheMoved = true;
 
         _updateButton->setEnabled(false);
-        _fullRebuildButton->setEnabled(false);
-        startRebuildProgress(fullRebuild ? _fullRebuildButton : _updateButton);
+        startRebuildProgress(_updateButton);
 
         future = QtConcurrent::run(&_rebuildPool, [job]() {
             runRebuildJob(job);
@@ -1862,9 +1901,6 @@ void FiberMapWorkspace::finishRebuild()
     clearRebuildProgress();
     if (_updateButton) {
         _updateButton->setEnabled(true);
-    }
-    if (_fullRebuildButton) {
-        _fullRebuildButton->setEnabled(true);
     }
     const auto pending = _rebuildQueue.finishApply();
     // Whatever this build did (published, discarded, failed), the tiles must
@@ -2243,32 +2279,36 @@ void FiberMapWorkspace::rebuildTree()
     // everything else about the tree is the widget palette's business.
     const FiberMapPalette& theme = activePalette();
 
-    // Grouped by linked network, largest first (the layout numbers network
-    // ids by size), then every unlinked fiber flat; inner -> outer within
-    // each group.
+    // The errors first, one entry per red mark; then grouped by linked
+    // network, largest first (the layout numbers network ids by size); then
+    // every unlinked fiber flat; then the unplaceable. Alphabetical by label
+    // within every group.
     std::map<int, std::vector<const vc3d::fiber_map::GlobalPlacedFiber*>> networks;
     std::vector<const vc3d::fiber_map::GlobalPlacedFiber*> individual;
+    std::unordered_map<uint64_t, const vc3d::fiber_map::GlobalPlacedFiber*> byId;
     for (const vc3d::fiber_map::GlobalPlacedFiber& fiber : _layout.fibers) {
+        byId.emplace(fiber.fiber.id, &fiber);
         if (fiber.meta.networkId >= 0) {
             networks[fiber.meta.networkId].push_back(&fiber);
         } else {
             individual.push_back(&fiber);
         }
     }
-    const auto innerToOuter = [](const vc3d::fiber_map::GlobalPlacedFiber* a,
-                                 const vc3d::fiber_map::GlobalPlacedFiber* b) {
-        if (a->meta.windingLo != b->meta.windingLo) {
-            return a->meta.windingLo < b->meta.windingLo;
+    const auto labelLess = [](const QString& a, const QString& b, uint64_t idA, uint64_t idB) {
+        const int order = QString::compare(a, b, Qt::CaseInsensitive);
+        if (order != 0) {
+            return order < 0;
         }
-        if (a->fiber.label != b->fiber.label) {
-            return a->fiber.label < b->fiber.label;
-        }
-        return a->fiber.id < b->fiber.id;
+        return idA < idB;
+    };
+    const auto alphabetical = [&labelLess](const vc3d::fiber_map::GlobalPlacedFiber* a,
+                                           const vc3d::fiber_map::GlobalPlacedFiber* b) {
+        return labelLess(a->fiber.label, b->fiber.label, a->fiber.id, b->fiber.id);
     };
     for (auto& [id, members] : networks) {
-        std::sort(members.begin(), members.end(), innerToOuter);
+        std::sort(members.begin(), members.end(), alphabetical);
     }
-    std::sort(individual.begin(), individual.end(), innerToOuter);
+    std::sort(individual.begin(), individual.end(), alphabetical);
 
     // A multi-turn H fiber has no single winding, so the column shows the
     // range it spans.
@@ -2327,6 +2367,64 @@ void FiberMapWorkspace::rebuildTree()
         item->setForeground(3, theme.inkSoft);
     };
 
+    // Every red mark on the map, as the status line counts them: each suspect
+    // crossing is one, and each suspect link (two rings and a dashed line) is
+    // one. Numbered left to right, then bottom to top, by the mark's centre,
+    // ties by the fibers involved, so the numbers stay put across rebuilds of
+    // an unchanged map. The entry itself brings the mark into view; its
+    // children are the two fibers involved.
+    struct ErrorEntry {
+        // Scene coordinates (y = -z), like the rings rebuildScene() draws.
+        QRectF extent;
+        uint64_t fiberA = 0;
+        uint64_t fiberB = 0;
+        QString kind;
+    };
+    std::vector<ErrorEntry> errors;
+    for (const vc3d::fiber_map::CrossingMark& mark : _layout.suspectCrossings) {
+        const QPointF ring(mark.posVx.x(), -mark.posVx.y());
+        errors.push_back(ErrorEntry{QRectF(ring, ring), mark.hFiberId, mark.vFiberId,
+                                    tr("crossing")});
+    }
+    for (const vc3d::fiber_map::PlacedLink& link : _layout.links) {
+        if (!link.suspect) {
+            continue;
+        }
+        // The rings sit on the two linked control points.
+        const QPointF ringA(link.a.x(), -link.a.y());
+        const QPointF ringB(link.b.x(), -link.b.y());
+        errors.push_back(ErrorEntry{QRectF(ringA, ringB).normalized(), link.fiberA, link.fiberB,
+                                    tr("link, +%1 turn").arg(link.turnErr, 0, 'f', 1)});
+    }
+    std::sort(errors.begin(), errors.end(), [](const ErrorEntry& a, const ErrorEntry& b) {
+        const QPointF ca = a.extent.center();
+        const QPointF cb = b.extent.center();
+        if (ca.x() != cb.x()) {
+            return ca.x() < cb.x();
+        }
+        if (ca.y() != cb.y()) {
+            return ca.y() > cb.y();
+        }
+        if (a.fiberA != b.fiberA) {
+            return a.fiberA < b.fiberA;
+        }
+        return a.fiberB < b.fiberB;
+    });
+    for (std::size_t i = 0; i < errors.size(); ++i) {
+        const ErrorEntry& error = errors[i];
+        auto* errorItem = new QTreeWidgetItem(
+            _tree, {tr("Error %1 — %2").arg(i + 1).arg(error.kind)});
+        errorItem->setForeground(0, kSuspect);
+        errorItem->setFirstColumnSpanned(true);
+        errorItem->setData(0, kErrorExtentRole, error.extent);
+        for (const uint64_t fiberId : {error.fiberA, error.fiberB}) {
+            if (const auto placed = byId.find(fiberId); placed != byId.end()) {
+                addFiberRow(errorItem, placed->second);
+            }
+        }
+        errorItem->setExpanded(true);
+    }
+
     for (const auto& [id, members] : networks) {
         auto* networkItem = new QTreeWidgetItem(
             _tree, {tr("Network %1 — %2 fibers")
@@ -2343,18 +2441,61 @@ void FiberMapWorkspace::rebuildTree()
     for (const vc3d::fiber_map::GlobalPlacedFiber* row : individual) {
         addFiberRow(nullptr, row);
     }
+    std::vector<const vc3d::fiber_map::UnplacedFiber*> unplaceable;
+    unplaceable.reserve(_layout.unplaced.size());
     for (const vc3d::fiber_map::UnplacedFiber& unplaced : _layout.unplaced) {
+        unplaceable.push_back(&unplaced);
+    }
+    std::sort(unplaceable.begin(), unplaceable.end(),
+              [&labelLess](const vc3d::fiber_map::UnplacedFiber* a,
+                           const vc3d::fiber_map::UnplacedFiber* b) {
+                  return labelLess(a->label, b->label, a->id, b->id);
+              });
+    for (const vc3d::fiber_map::UnplacedFiber* unplaced : unplaceable) {
         const QString annotationName =
-            _controller ? _controller->fiberDisplayName(unplaced.id) : QString();
+            _controller ? _controller->fiberDisplayName(unplaced->id) : QString();
         auto* item = new QTreeWidgetItem(
-            _tree, {unplaced.label, QString(QLatin1Char(unplaced.hvTag)),
+            _tree, {unplaced->label, QString(QLatin1Char(unplaced->hvTag)),
                     QStringLiteral("—"), tr("unplaceable"), annotationName});
-        item->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(unplaced.id));
+        item->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(unplaced->id));
         for (int column = 0; column < _tree->columnCount(); ++column) {
             item->setForeground(column, theme.inkSoft);
         }
     }
+    applyTreeFilter();
     _syncingSelection = guard;
+}
+
+void FiberMapWorkspace::applyTreeFilter()
+{
+    if (!_tree || !_searchEdit) {
+        return;
+    }
+    const QString needle = _searchEdit->text().trimmed();
+    const auto rowMatches = [&needle](const QTreeWidgetItem* item) {
+        if (needle.isEmpty()) {
+            return true;
+        }
+        // Column 0 is the label (dj-000412), the last column the annotation
+        // name (dj_20260812T101010_000412).
+        return item->text(0).contains(needle, Qt::CaseInsensitive) ||
+               item->text(item->columnCount() - 1).contains(needle, Qt::CaseInsensitive);
+    };
+    for (int row = 0; row < _tree->topLevelItemCount(); ++row) {
+        QTreeWidgetItem* item = _tree->topLevelItem(row);
+        const bool isGroup = item->data(0, Qt::UserRole).toULongLong() == 0;
+        if (!isGroup) {
+            item->setHidden(!rowMatches(item));
+            continue;
+        }
+        bool anyVisible = false;
+        for (int child = 0; child < item->childCount(); ++child) {
+            const bool visible = rowMatches(item->child(child));
+            item->child(child)->setHidden(!visible);
+            anyVisible = anyVisible || visible;
+        }
+        item->setHidden(!anyVisible);
+    }
 }
 
 // A theme switch changes every colour of the map, and both the scene and the
@@ -2466,19 +2607,33 @@ void FiberMapWorkspace::selectFiberRow(uint64_t fiberId)
     const auto matches = [fiberId](QTreeWidgetItem* item) {
         return item->data(0, Qt::UserRole).toULongLong() == fiberId;
     };
-    for (int row = 0; row < _tree->topLevelItemCount(); ++row) {
-        QTreeWidgetItem* item = _tree->topLevelItem(row);
-        QTreeWidgetItem* hit = matches(item) ? item : nullptr;
-        for (int child = 0; hit == nullptr && child < item->childCount(); ++child) {
-            if (matches(item->child(child))) {
-                hit = item->child(child);
+    // A fiber in an error also has its row in its network (or the flat
+    // list); that row is the one to land on, the error entry's copy only
+    // when nothing else lists it.
+    const auto find = [this, &matches](bool includeErrors) -> QTreeWidgetItem* {
+        for (int row = 0; row < _tree->topLevelItemCount(); ++row) {
+            QTreeWidgetItem* item = _tree->topLevelItem(row);
+            if (!includeErrors && item->data(0, kErrorExtentRole).isValid()) {
+                continue;
+            }
+            if (matches(item)) {
+                return item;
+            }
+            for (int child = 0; child < item->childCount(); ++child) {
+                if (matches(item->child(child))) {
+                    return item->child(child);
+                }
             }
         }
-        if (hit != nullptr) {
-            _tree->setCurrentItem(hit);
-            _tree->scrollToItem(hit);
-            break;
-        }
+        return nullptr;
+    };
+    QTreeWidgetItem* hit = find(false);
+    if (hit == nullptr) {
+        hit = find(true);
+    }
+    if (hit != nullptr) {
+        _tree->setCurrentItem(hit);
+        _tree->scrollToItem(hit);
     }
     _syncingSelection = guard;
 }
