@@ -353,7 +353,7 @@ def test_default_labeled_and_unlabeled_patch_origins(tmp_path):
     assert held_out == []
 
 
-def test_v6_patch_cache_round_trip_and_stale_rejection(tmp_path):
+def test_v7_patch_cache_round_trip_and_stale_rejection(tmp_path):
     config = _config(tmp_path)
     segment = replace(
         _segment(config, tmp_path),
@@ -376,7 +376,7 @@ def test_v6_patch_cache_round_trip_and_stale_rejection(tmp_path):
     assert loaded[0].is_validation
     assert loaded[0].supervision_mask == str(segment.validation_mask)
     assert replace(patch, supervision_mask_override="").supervision_mask == ""
-    assert "v6" in patch_finding_cache_token(config)
+    assert "v7" in patch_finding_cache_token(config)
 
     changed = _config(tmp_path, patch_overlap=0.25)
     assert load_patch_cache(path, config=changed, segments=[segment]) is None
@@ -391,7 +391,7 @@ def test_unlabeled_coverage_key_is_rejected_and_cache_token_stays_compatible(tmp
         ],
     )
     assert patch_finding_cache_token(unlabeled) == (
-        "unlabeled-default-v6-po-0.5-mdc-0.15-pfs-"
+        "unlabeled-default-v7-po-0.5-mdc-0.15-pfs-"
     )
 
     with pytest.raises(

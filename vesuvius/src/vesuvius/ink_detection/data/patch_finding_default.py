@@ -7,6 +7,7 @@ from collections.abc import Callable
 import numpy as np
 
 from vesuvius.ink_detection.types import Patch, Segment
+from vesuvius.ink_detection.data.normalization import exclude_validation_voxels
 
 
 def surface_patch_bbox(
@@ -113,6 +114,7 @@ def find_segment_patches(
         ]
         has_training = bool(supervision_patch.size and np.any(supervision_patch))
         has_validation = False
+        validation_patch = None
         if validation is not None:
             validation_patch = validation[
                 validation_surface,
@@ -122,7 +124,7 @@ def find_segment_patches(
             has_validation = bool(validation_patch.size and np.any(validation_patch))
             if has_training and has_validation:
                 has_training = bool(
-                    np.any(np.asarray(supervision_patch) & ~np.asarray(validation_patch))
+                    np.any((np.asarray(supervision_patch) > 0) & ~(np.asarray(validation_patch) > 0))
                 )
         y0 = int(round(y_scan * scale_y))
         x0 = int(round(x_scan * scale_x))
@@ -139,6 +141,7 @@ def find_segment_patches(
         label_patch = inklabels[
             mask_surface, y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
         ]
+        label_patch = exclude_validation_voxels(label_patch, validation_patch)
         if has_training and labeled_patch_coverage(label_patch) >= (
             segment.data_config.patch_finding.min_labeled_coverage
         ):
