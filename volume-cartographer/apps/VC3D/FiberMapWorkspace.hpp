@@ -321,11 +321,13 @@ private:
     QPushButton* _fullRebuildButton = nullptr;
     QLabel* _statusLabel = nullptr;
     QCheckBox* _gapsCheck = nullptr;
+    // The colour scale reads "0 [ramp] [saturation]": the spinbox IS the
+    // scale's top end.
+    QLabel* _gapLegendZero = nullptr;
+    QLabel* _gapLegend = nullptr;
     QDoubleSpinBox* _gapSaturationSpin = nullptr;
-    QDoubleSpinBox* _gapAcrossSpin = nullptr;
     QCheckBox* _gapFadeCheck = nullptr;
     QSpinBox* _gapFadeWindingsSpin = nullptr;
-    QLabel* _gapLegend = nullptr;
     // The published layout's gap field (null before a build that carried
     // one) and the settings it was built with, so a toggle can tell a field
     // it may show from one that needs a rebuild.
@@ -352,8 +354,9 @@ private:
     std::vector<QGraphicsItem*> _labelChips;
     double _chipHideScale = 0.0;
     // Annotation voxel size of the snapshot the current layout came from, in µm;
-    // unset when the package could not say, in which case nothing physical is
-    // displayed.
+    // unset when the package could not say, in which case no measured length
+    // is displayed as physical (the gap scale's top stays a cm intent and its
+    // tooltip names the assumption it is converted with).
     std::optional<double> _voxelSizeUm;
     // Scroll top in scene z, i.e. voxels; 0 when the volume's extent is unknown.
     double _scrollZMaxVx = 0.0;

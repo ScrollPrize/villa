@@ -57,6 +57,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -185,8 +186,9 @@ constexpr double kGapCellCm = 0.05;
 constexpr double kGapSaturationDefaultCm = 1.0;
 constexpr double kGapSaturationMinCm = 0.1;
 constexpr double kGapSaturationMaxCm = 10.0;
-constexpr double kGapAcrossDefault = 1.0;
-constexpr double kGapAcrossMax = 10.0;
+// Across-sheet term at the model's own sheet spacing (not exposed: the fade
+// below is the one knob for how far other windings reach).
+constexpr double kGapAcrossWeight = 1.0;
 // Fade of neighbouring windings' influence, on by default, gone at this
 // many windings away.
 constexpr bool kGapFadeDefault = true;
@@ -727,61 +729,47 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     toolBar->addWidget(_fullRebuildButton);
     toolBar->addSeparator();
 
-    // The gap heat map controls. Distances are entered in centimetres as
-    // intents, converted with the package's voxel size like every other
-    // physical tuning length (and with the documented assumption when the
-    // package cannot say - the legend then reads in voxels, never in a
-    // guessed centimetre).
+    // The gap heat map controls. The scale's top is entered in centimetres
+    // as an intent, converted with the package's voxel size like every other
+    // physical tuning length, and with the documented assumption when the
+    // package cannot say - the scale's tooltip then says so, and the status
+    // line reports the field's lengths in voxels.
     _gapsCheck = new QCheckBox(tr("Gaps"), toolBar);
     _gapsCheck->setChecked(false);
     _gapsCheck->setToolTip(
         tr("Heat map of the estimated distance from each spot on the sheet to\n"
            "the nearest annotated fiber, counting fibers on neighbouring\n"
-           "windings at the sheet model's pitch. Covers the annotated extent.\n"
-           "Faint on fibers; strongest at gaps the saturation distance or\n"
-           "farther from everything. Changing a setting rebuilds the map."));
+           "windings. Covers the annotated extent. Faint on fibers, strongest\n"
+           "at the far end of the scale. Changing a setting rebuilds the map."));
     toolBar->addWidget(_gapsCheck);
+    // The colour scale: 0, the ramp, and the distance the ramp tops out at.
+    _gapLegendZero = new QLabel(QStringLiteral("0"), toolBar);
+    toolBar->addWidget(_gapLegendZero);
+    _gapLegend = new QLabel(toolBar);
+    _gapLegend->setTextFormat(Qt::PlainText);
+    toolBar->addWidget(_gapLegend);
     _gapSaturationSpin = new QDoubleSpinBox(toolBar);
     _gapSaturationSpin->setRange(kGapSaturationMinCm, kGapSaturationMaxCm);
     _gapSaturationSpin->setDecimals(1);
     _gapSaturationSpin->setSingleStep(0.1);
     _gapSaturationSpin->setValue(kGapSaturationDefaultCm);
     _gapSaturationSpin->setSuffix(tr(" cm"));
-    _gapSaturationSpin->setToolTip(
-        tr("Saturation distance: gaps this far or farther from every fiber\n"
-           "take the strongest colour."));
     toolBar->addWidget(_gapSaturationSpin);
-    _gapAcrossSpin = new QDoubleSpinBox(toolBar);
-    _gapAcrossSpin->setRange(0.0, kGapAcrossMax);
-    _gapAcrossSpin->setDecimals(2);
-    _gapAcrossSpin->setSingleStep(0.25);
-    _gapAcrossSpin->setValue(kGapAcrossDefault);
-    _gapAcrossSpin->setPrefix(QStringLiteral("\u00d7"));
-    _gapAcrossSpin->setToolTip(
-        tr("Across-sheet weight: a fiber k windings away counts as\n"
-           "k \u00d7 this \u00d7 the modelled sheet pitch away. 1 is the model's own\n"
-           "spacing; larger values count only fibers on the same winding as\n"
-           "close; 0 ignores other windings entirely."));
-    toolBar->addWidget(_gapAcrossSpin);
     _gapFadeCheck = new QCheckBox(tr("Fade by"), toolBar);
     _gapFadeCheck->setChecked(kGapFadeDefault);
     _gapFadeCheck->setToolTip(
-        tr("Taper the influence of fibers on other windings with the winding\n"
-           "gap: a fiber one winding away counts almost fully, one this many\n"
-           "windings away not at all. Off: only the across-sheet weight limits\n"
-           "how far other windings reach."));
+        tr("Fibers on other windings count less the farther away their\n"
+           "winding is, and not at all from this many windings away.\n"
+           "Off: every winding within reach counts at its sheet distance."));
     toolBar->addWidget(_gapFadeCheck);
     _gapFadeWindingsSpin = new QSpinBox(toolBar);
     _gapFadeWindingsSpin->setRange(1, kGapFadeWindingsMax);
     _gapFadeWindingsSpin->setValue(kGapFadeWindingsDefault);
     _gapFadeWindingsSpin->setSuffix(tr(" windings"));
     _gapFadeWindingsSpin->setToolTip(
-        tr("Windings away at which another winding's fiber no longer counts\n"
-           "(1: only the cell's own winding counts)."));
+        tr("Windings away at which a fiber stops counting\n"
+           "(1: only fibers on the same winding count)."));
     toolBar->addWidget(_gapFadeWindingsSpin);
-    _gapLegend = new QLabel(toolBar);
-    _gapLegend->setTextFormat(Qt::PlainText);
-    toolBar->addWidget(_gapLegend);
     toolBar->addSeparator();
     _statusLabel =
         new QLabel(tr("press Update"), toolBar);
@@ -828,8 +816,6 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
             [this]() { requestRebuild(true); });
     connect(_gapsCheck, &QCheckBox::toggled, this, &FiberMapWorkspace::handleGapsToggled);
     connect(_gapSaturationSpin, &QDoubleSpinBox::valueChanged, this,
-            [this](double) { handleGapParamsChanged(); });
-    connect(_gapAcrossSpin, &QDoubleSpinBox::valueChanged, this,
             [this](double) { handleGapParamsChanged(); });
     connect(_gapFadeCheck, &QCheckBox::toggled, this,
             [this](bool) { handleGapParamsChanged(); });
@@ -1661,7 +1647,8 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     _latchedReason.clear();
     _restingReason.clear();
     _voxelSizeUm = job.snapshot.voxelSizeUm;
-    // The legend's unit follows the voxel size, which this may have changed.
+    // The scale's tooltip notes an assumed voxel size, which this may have
+    // just replaced with the package's own.
     updateGapLegend();
 
     // Full rebuild doubles as the memoization check: when nothing the layout
@@ -1810,15 +1797,9 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
             if (_gapField->seedFiberCount == 0) {
                 status += tr(" (no fibers to seed)");
             } else if (!_gapField->folded) {
-                status += _gapFieldParams.acrossWeight > 0.0
-                    ? tr(" (in-sheet only: no sheet pitch)")
-                    : tr(" (in-sheet only)");
+                status += tr(" (this winding only: no sheet pitch)");
             } else if (_gapField->faded) {
-                status += tr(" (\u00d7%1 across, fades by %2 windings)")
-                              .arg(_gapFieldParams.acrossWeight)
-                              .arg(_gapFieldParams.fadeWindings);
-            } else {
-                status += tr(" (\u00d7%1 across)").arg(_gapFieldParams.acrossWeight);
+                status += tr(" (fades by %1 windings)").arg(_gapFieldParams.fadeWindings);
             }
             if (_gapField->foldTruncated) {
                 status += tr(", fold cap reached");
@@ -2548,7 +2529,7 @@ vc3d::fiber_map::gaps::GapFieldParams FiberMapWorkspace::gapFieldParams(
     params.cellVx = kGapCellCm * vxPerCm;
     params.saturationVx =
         (_gapSaturationSpin ? _gapSaturationSpin->value() : kGapSaturationDefaultCm) * vxPerCm;
-    params.acrossWeight = _gapAcrossSpin ? _gapAcrossSpin->value() : kGapAcrossDefault;
+    params.acrossWeight = kGapAcrossWeight;
     params.fade = _gapFadeCheck ? _gapFadeCheck->isChecked() : kGapFadeDefault;
     params.fadeWindings =
         _gapFadeWindingsSpin ? _gapFadeWindingsSpin->value() : kGapFadeWindingsDefault;
@@ -2675,21 +2656,17 @@ void FiberMapWorkspace::handleGapParamsChanged()
 
 void FiberMapWorkspace::updateGapLegend()
 {
-    if (!_gapLegend || !_gapSaturationSpin || !_gapAcrossSpin || !_gapsCheck) {
+    if (!_gapLegend || !_gapLegendZero || !_gapSaturationSpin || !_gapFadeCheck ||
+        !_gapFadeWindingsSpin || !_gapsCheck) {
         return;
     }
     const bool on = _gapsCheck->isChecked();
-    _gapSaturationSpin->setEnabled(on);
-    _gapAcrossSpin->setEnabled(on);
-    if (_gapFadeCheck) {
-        _gapFadeCheck->setEnabled(on);
+    for (QWidget* widget : std::initializer_list<QWidget*>{_gapLegendZero, _gapLegend,
+                                                            _gapSaturationSpin, _gapFadeCheck}) {
+        widget->setEnabled(on);
     }
-    if (_gapFadeWindingsSpin) {
-        _gapFadeWindingsSpin->setEnabled(on && _gapFadeCheck && _gapFadeCheck->isChecked());
-    }
-    _gapLegend->setEnabled(on);
-    // The ramp, then its range: centimetres only when the voxel size is
-    // known, voxels (as the field measures them) otherwise.
+    _gapFadeWindingsSpin->setEnabled(on && _gapFadeCheck->isChecked());
+    // The ramp between the scale's two ends.
     constexpr int kWidth = 72;
     constexpr int kHeight = 10;
     QPixmap ramp(kWidth, kHeight);
@@ -2702,10 +2679,20 @@ void FiberMapWorkspace::updateGapLegend()
         }
     }
     _gapLegend->setPixmap(ramp);
-    const QString range = _voxelSizeUm
-        ? tr("0–%1 cm").arg(_gapSaturationSpin->value(), 0, 'f', 1)
-        : tr("0–%1 vx").arg(std::lround(gapFieldParams(std::nullopt).saturationVx));
-    _gapLegend->setToolTip(tr("Gap distance colour scale: %1").arg(range));
+    // One tooltip for the whole scale. The distance is a physical intent; when
+    // the package cannot say how big a voxel is, the map converts it with the
+    // documented assumption and the status line says lengths are in voxels.
+    QString scale = tr("Gap colour scale: gaps this far or farther from every fiber\n"
+                       "get the strongest colour; on a fiber the map is faintest.");
+    if (!_voxelSizeUm) {
+        scale += tr("\nVoxel size unknown: %1 cm is taken at %2 \u00b5m per voxel.")
+                     .arg(_gapSaturationSpin->value(), 0, 'f', 1)
+                     .arg(kAssumedVoxelSizeUm);
+    }
+    for (QWidget* widget : std::initializer_list<QWidget*>{_gapLegendZero, _gapLegend,
+                                                            _gapSaturationSpin}) {
+        widget->setToolTip(scale);
+    }
 }
 
 void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)
