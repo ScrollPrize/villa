@@ -751,7 +751,7 @@ def test_single_pin_blends_radii_not_canonical_corrections():
     assert float(pinned_map_forward(torch.tensor([80.]), ray_map)) == 64.
 
 
-def test_combined_knots_preserve_gap_shape_and_outer_extrapolation():
+def test_radius_deformation_preserves_gap_shape_and_outer_extrapolation():
     theta = torch.zeros(1)
     table = torch.tensor([[0., 10., 30., 40.]])
     ray_map = _ray_map(table, theta, torch.tensor([[80., 120.]]),
@@ -784,16 +784,46 @@ def test_padded_and_duplicate_knots_have_finite_gradients():
         assert tensor.grad is not None and torch.isfinite(tensor.grad).all()
 
 
-def test_pinned_evaluation_only_searches_combined_knots():
-    from unittest.mock import patch
-    theta = torch.zeros(1)
-    m = _ray_map(_identity_table(1, theta), theta,
-                 torch.tensor([[75.]]), torch.tensor([[64.]]), torch.ones(1, 1))
-    with patch.object(torch, 'searchsorted', wraps=torch.searchsorted) as search:
-        c = pinned_map_forward(torch.tensor([80.]), m)
-        assert search.call_count == 1
-        pinned_map_inverse(c, m)
-        assert search.call_count == 2
+def test_float32_pin_one_ulp_from_nonuniform_winding():
+    # These rays produced 177 collapsed and 17 reversed intervals when
+    # winding and fractional pin knots were materialised in one float32 table.
+    gen = torch.Generator().manual_seed(17)
+    n = 1000
+    gaps = 1 + torch.rand(n, 11, generator=gen, dtype=torch.float32) * 30
+    table = torch.cat([torch.zeros(n, 1, dtype=torch.float32), gaps.cumsum(1)], 1)
+    table.requires_grad_()
+    target = torch.tensor(64., dtype=torch.float32).nextafter(torch.tensor(100., dtype=torch.float32))
+    S = target.expand(n, 1).clone().requires_grad_()
+    R = (10 + torch.rand(n, 1, generator=gen, dtype=torch.float32) * 200).requires_grad_()
+    theta = torch.zeros(n, dtype=torch.float32)
+    m = _ray_map(table, theta, R, S, torch.ones_like(S))
+    assert (m.minimum_winding_gap(DR) > 0).all()
+    torch.testing.assert_close(pinned_map_inverse(S, m), R, rtol=0, atol=2e-5)
+    torch.testing.assert_close(pinned_map_forward(R, m), S, rtol=0, atol=2e-5)
+    q = torch.tensor([[63., 64., 65., 90.]], dtype=torch.float32).expand(n, -1).clone().requires_grad_()
+    r = pinned_map_inverse(q, m)
+    assert (r.diff(dim=-1) > 0).all()
+    # Inverting free gaps close to one voxel amplifies float32 radius
+    # rounding; allow 16 machine epsilons relative to canonical radius.
+    torch.testing.assert_close(pinned_map_forward(r, m), q,
+                               rtol=16 * torch.finfo(torch.float32).eps, atol=2e-5)
+    r.sum().backward()
+    assert (q.grad > 0).all()
+    for tensor in (table, R, S, q):
+        assert torch.isfinite(tensor.grad).all()
+
+
+def test_minimum_winding_gap_matches_composed_slopes():
+    # Free gaps 10, 20, 10. The pin deformation has slopes 2, 1/2, 1.
+    # Its changes fall inside free segments, not on winding knots.
+    table = torch.tensor([[0., 10., 30., 40.]])
+    m = _ray_map(table, torch.zeros(1), torch.tensor([[10., 25.]]),
+                 torch.tensor([[8., 40.]]), torch.ones(1, 2))
+    q = torch.tensor([[-16., 4., 12., 24., 36., 44., 64.]], requires_grad=True)
+    r = pinned_map_inverse(q, m)
+    slope, = torch.autograd.grad(r.sum(), q)
+    torch.testing.assert_close(m.minimum_winding_gap(DR), (slope * DR).min(dim=-1).values)
+    assert float(m.minimum_winding_gap(DR)) == 5.
 
 
 def test_float32_target_crossing_original_knot_is_continuous():

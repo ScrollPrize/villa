@@ -285,7 +285,7 @@ class PinnedGapExpandingTransform(GapExpandingTransform):
 
     The parent's winding radii are blended with constraints from ``pin_table``
     (:class:`pins.PinTable`) in intermediate-radius space. The resulting
-    combined knot table serves both directions, with exact full-strength
+    radius deformation is composed with the free map, with exact full-strength
     pins unless constraints conflict. The fused Triton path is bypassed:
     every call runs the eager pinned arithmetic,
     chunked over points to bound the ``[chunk, windings]`` intermediates.
@@ -300,7 +300,7 @@ class PinnedGapExpandingTransform(GapExpandingTransform):
         return False
 
     def ray_map(self, theta, z):
-        """Build the combined canonical/intermediate knot table per query ray."""
+        """Build the free map and pin-only radius deformation per query ray."""
         pre_pin_winding_radii = self.get_transformed_winding_radii(theta, z)
         R, S, w, valid = self.pin_table.anchors(theta, z)
         return pins_module.build_pinned_ray_map(

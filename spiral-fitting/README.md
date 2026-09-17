@@ -1025,13 +1025,15 @@ canonical targets are merged by support-weighted radius; conflicting radii
 and supported targets at or below the fixed origin are reported as ordering
 violations. Such conflicting constraints cannot all be exact.
 
-The original winding knots are deformed between the resolved pin knots,
-preserving the relative unpinned gap pattern. They are combined with the
-fractional pin knots into a single canonical/intermediate-radius table. Each
-forward or inverse evaluation then uses one search and linear interpolation;
-it does not evaluate an unpinned map followed by a correction map. Outside the
-outermost pin the unpinned outer slope is retained; below the fixed origin the
-unpinned inner map is retained.
+The free winding map and the pin-only radius deformation are evaluated as
+two explicit stages: canonical coordinate -> unpinned radius -> corrected
+radius, with the stages reversed for the inverse. This preserves the relative
+unpinned gap pattern without merging fractional pins and winding knots into
+one table. A pin arbitrarily close to an original winding therefore does not
+create a near-zero interval in a combined float32 search table. Outside the
+outermost pin the radius deformation is a constant offset; below the fixed
+origin it is the identity. Nearly coincident pin anchors themselves remain
+subject to floating-point resolution limits.
 
 This radius-space parameterization changes pinned interpolation between
 annotations and the response to conflicts compared with the earlier

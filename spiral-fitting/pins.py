@@ -14,9 +14,9 @@ Layout of this module:
 * ``unpinned_map_forward`` / ``unpinned_map_inverse``: ``s_free`` and its inverse over
   a ``[N, K]`` table (the eager ``GapExpandingTransform`` arithmetic).
 * ``build_pinned_ray_map``: transparent radius-space blending, a radial
-  slope guard, and a combined table of winding and fractional pin knots.
-* ``pinned_map_forward`` / ``pinned_map_inverse``: one piecewise-linear
-  lookup in that table, in either direction. No nested unpinned evaluation.
+  slope guard, and a pin-only radius deformation.
+* ``pinned_map_forward`` / ``pinned_map_inverse``: the unpinned map composed
+  with the radius deformation, evaluated explicitly in either direction.
 * ``ray_anchors``: rasterised pin lookup: compressed-sparse-row
   cells, per-pin footprints, singular compact kernel, IDW per winding slot.
 * ``PinTable``: the per-step rasterised pin set consumed by
@@ -116,17 +116,18 @@ def unpinned_map_inverse(c, pre_pin_winding_radii, dr, theta_norm):
 
 @dataclasses.dataclass
 class PinnedRayMap:
-    """One monotone knot table per ray, plus pin-constraint diagnostics.
+    """The free winding map and a separate pin-only radius deformation.
 
-    ``canonical_knots`` and ``intermediate_knots`` contain the combined
-    original winding knots and fractional pin knots. Only the first
-    ``knot_counts`` entries of each row are valid. Evaluation in either
-    direction is a single piecewise-linear lookup in this table.
+    ``unpinned_anchors`` and ``radius_anchors`` include the fixed origin;
+    ``anchor_counts`` excludes padding and includes that origin.
     """
 
-    canonical_knots: torch.Tensor
-    intermediate_knots: torch.Tensor
-    knot_counts: torch.Tensor
+    pre_pin_winding_radii: torch.Tensor
+    dr: torch.Tensor
+    theta_norm: torch.Tensor
+    unpinned_anchors: torch.Tensor
+    radius_anchors: torch.Tensor
+    anchor_counts: torch.Tensor
     anchor_canonical: torch.Tensor
     anchor_radii: torch.Tensor
     anchor_valid: torch.Tensor
@@ -143,52 +144,51 @@ class PinnedRayMap:
         return (self.guard_active & ~self.guard_order).sum(dim=-1)
 
     def minimum_winding_gap(self, dr):
-        """Minimum local dR/dc * dr over the final piecewise-linear map."""
-        dc = self.canonical_knots.diff(dim=-1)
-        dR = self.intermediate_knots.diff(dim=-1)
-        valid = torch.arange(dc.shape[-1], device=dc.device)[None] < self.knot_counts[:, None] - 1
-        gap = dr * dR / torch.where(valid, dc, torch.ones_like(dc))
-        return torch.where(valid, gap, torch.full_like(gap, float('inf'))).min(dim=-1).values
+        """Minimum dR/dc * dr, from overlapping free and deformation intervals."""
+        free = self.pre_pin_winding_radii
+        gaps = free.diff(dim=-1) * (dr / self.dr)
+        # The first and last free segments also cover extrapolation.
+        lo = torch.cat([torch.full_like(free[:, :1], -float('inf')), free[:, 1:-1]], dim=-1)
+        hi = torch.cat([free[:, 1:-1], torch.full_like(free[:, :1], float('inf'))], dim=-1)
+
+        def minimum_between(left, right):
+            overlap = (hi > left[:, None]) & (lo < right[:, None])
+            return torch.where(overlap, gaps, float('inf')).min(dim=-1).values
+
+        zero = torch.zeros_like(free[:, 0])
+        result = minimum_between(torch.full_like(zero, -float('inf')), zero)
+        for j in range(1, self.unpinned_anchors.shape[-1]):
+            left, right = self.unpinned_anchors[:, j - 1], self.unpinned_anchors[:, j]
+            valid = j < self.anchor_counts
+            span = torch.where(valid, right - left, torch.ones_like(right))
+            slope = (self.radius_anchors[:, j] - self.radius_anchors[:, j - 1]) / span
+            gap = slope * minimum_between(left, right)
+            result = torch.minimum(result, torch.where(valid, gap, float('inf')))
+        last = torch.gather(self.unpinned_anchors, 1, self.anchor_counts[:, None] - 1)[:, 0]
+        return torch.minimum(result, minimum_between(last, torch.full_like(last, float('inf'))))
 
 
-def piecewise_linear_map(query, knot_x, knot_y, knot_counts=None):
-    """Interpolate monotone knot pairs, extrapolating the end segments.
+def piecewise_linear_map(query, knot_x, knot_y, knot_counts):
+    """Map pin-only knots with unit-slope extrapolation at both ends.
 
-    Knots are [N, K], queries [N] or [N, M]. Padded rows may supply their
-    valid lengths; each row must have at least two strictly increasing x
-    knots. Interval selection is discrete; all interpolation is differentiable.
+    Each row includes the origin and may contain no other valid knots.
+    Padding is excluded from searches and interpolation arithmetic.
     """
     squeeze = query.dim() == 1
     if squeeze:
         query = query[:, None]
-    if knot_counts is None:
-        knot_counts = torch.full(
-            [knot_x.shape[0]], knot_x.shape[1], dtype=torch.long, device=knot_x.device)
     valid = torch.arange(knot_x.shape[1], device=knot_x.device)[None] < knot_counts[:, None]
     search_x = torch.where(valid, knot_x.detach(), torch.full_like(knot_x, float('inf')))
-    left = torch.searchsorted(search_x.contiguous(), query.detach().contiguous()) - 1
-    left = torch.minimum(left.clamp(min=0), knot_counts[:, None] - 2)
-    x0, x1 = (torch.gather(knot_x, -1, left + offset) for offset in (0, 1))
-    y0, y1 = (torch.gather(knot_y, -1, left + offset) for offset in (0, 1))
-    result = torch.lerp(y0, y1, (query - x0) / (x1 - x0))
+    right = torch.searchsorted(search_x.contiguous(), query.detach().contiguous())
+    interior = (right > 0) & (right < knot_counts[:, None])
+    left = torch.minimum((right - 1).clamp(min=0), knot_counts[:, None] - 1)
+    right = torch.minimum(right, knot_counts[:, None] - 1)
+    x0, x1 = (torch.gather(knot_x, -1, idx) for idx in (left, right))
+    y0, y1 = (torch.gather(knot_y, -1, idx) for idx in (left, right))
+    span = torch.where(interior, x1 - x0, torch.ones_like(x0))
+    mapped = torch.lerp(y0, y1, (query - x0) / span)
+    result = torch.where(interior, mapped, query + (y0 - x0))
     return result.squeeze(-1) if squeeze else result
-
-
-def _pack_knots(canonical, radii, valid):
-    """Sort and compact knot pairs; at equal coordinates keep the last pair.
-
-    Pin knots are appended after original knots so exact pin coordinates
-    (and their gradients) win when they coincide with an original knot.
-    Padding stays finite; only the lookup's detached search keys use infinity.
-    """
-    order = torch.argsort(torch.where(valid, canonical.detach(), float('inf')), dim=-1, stable=True)
-    canonical, radii, valid = (torch.gather(a, -1, order) for a in (canonical, radii, valid))
-    next_valid = torch.cat([valid[:, 1:], torch.zeros_like(valid[:, :1])], dim=-1)
-    next_c = torch.cat([canonical[:, 1:], canonical[:, -1:]], dim=-1)
-    keep = valid & (~next_valid | (canonical < next_c))
-    order = torch.argsort((~keep).to(torch.int32), dim=-1, stable=True)
-    counts = keep.sum(dim=-1)
-    return torch.gather(canonical, -1, order), torch.gather(radii, -1, order), counts
 
 
 def _merge_equal_targets(R, S, w, valid):
@@ -258,13 +258,13 @@ def _transparent_radius_corrections(u, desired_radius, weight, valid):
 
 def build_pinned_ray_map(pre_pin_winding_radii, dr, theta_norm, anchor_R, anchor_S,
                          anchor_w, anchor_valid, min_gap):
-    """Blend pin radii with the unpinned field and build one radial knot table.
+    """Blend pin radii and build a deformation of the unpinned radius field.
 
     Pins are ordered by their canonical targets S (which may be fractional
     windings). At each S, u = R_unpinned(S). A tridiagonal solve blends the
     desired radius correction R_pin-u with the neighbouring corrections.
-    Original winding knots are then deformed by interpolation in u and
-    combined with the pin knots. Both evaluation directions use this one table.
+    Evaluation composes the original winding map with this pin-only
+    deformation; original winding knots are never merged with pin knots.
 
     The guard clips each solved interval's radial slope, then accumulates
     the extra rise outwards. Splitting an interval with a zero-weight knot
@@ -272,10 +272,8 @@ def build_pinned_ray_map(pre_pin_winding_radii, dr, theta_norm, anchor_R, anchor
     u is min_gap / dr; diagnostics measure the resulting physical gaps.
     Conflicts shift subsequent radii outwards; compatible pins remain exact.
     """
-    num_rays, num_windings = pre_pin_winding_radii.shape
+    num_rays = pre_pin_winding_radii.shape[0]
     device = pre_pin_winding_radii.device
-    canonical = (torch.arange(num_windings, device=device, dtype=pre_pin_winding_radii.dtype)[None]
-                 + theta_norm[:, None]) * dr
     zero = torch.zeros_like(theta_norm)
     base_c = unpinned_map_forward(zero, pre_pin_winding_radii, dr, theta_norm)
     supported = anchor_valid & (anchor_w > 0)
@@ -291,8 +289,8 @@ def build_pinned_ray_map(pre_pin_winding_radii, dr, theta_norm, anchor_R, anchor
     if S.shape[-1] == 0:
         empty = torch.zeros([num_rays, 0], dtype=torch.bool, device=device)
         return PinnedRayMap(
-            canonical, pre_pin_winding_radii,
-            torch.full([num_rays], num_windings, dtype=torch.long, device=device),
+            pre_pin_winding_radii, dr, theta_norm, zero[:, None], zero[:, None],
+            torch.ones([num_rays], dtype=torch.long, device=device),
             S, R, empty, empty, empty, duplicate_conflicts, base_conflicts)
 
     S = torch.where(valid, S, base_c[:, None])
@@ -307,47 +305,27 @@ def build_pinned_ray_map(pre_pin_winding_radii, dr, theta_norm, anchor_R, anchor
     guard = valid & (rise < min_rise)
     extra = torch.where(guard, min_rise - rise, torch.zeros_like(rise)).cumsum(dim=-1)
     resolved = solved + extra
-    corrections = resolved - u
-
-    # One outer knot beyond all winding and pin knots makes extrapolation
-    # retain the unpinned outer slope. Below the fixed origin, retain the
-    # original inner slope as well.
-    num_anchors = valid.sum(dim=-1)
-    last_idx = (num_anchors - 1).clamp(min=0)[:, None]
-    last_S = torch.where(num_anchors > 0, torch.gather(S, 1, last_idx).squeeze(1), base_c)
-    last_delta = torch.where(num_anchors > 0, torch.gather(corrections, 1, last_idx).squeeze(1), zero)
-    outer_c = torch.maximum(canonical[:, -1], last_S) + dr
-    outer_u = unpinned_map_inverse(outer_c, pre_pin_winding_radii, dr, theta_norm)
-    correction_x, correction_y, correction_counts = _pack_knots(
-        torch.cat([zero[:, None], u, outer_u[:, None]], dim=-1),
-        torch.cat([zero[:, None], corrections, last_delta[:, None]], dim=-1),
-        torch.cat([torch.ones_like(valid[:, :1]), valid, torch.ones_like(valid[:, :1])], dim=-1))
-    inner_c = base_c - dr
-    all_c = torch.cat([canonical, inner_c[:, None], base_c[:, None], outer_c[:, None], S], dim=-1)
-    unpinned_radii = unpinned_map_inverse(all_c, pre_pin_winding_radii, dr, theta_norm)
-    delta = piecewise_linear_map(unpinned_radii, correction_x, correction_y, correction_counts)
-    delta = torch.where(unpinned_radii < 0, torch.zeros_like(delta), delta)
-    radii = unpinned_radii + delta
-    # Retain exact resolved pin values and the fixed origin, including their
-    # gradients, instead of reconstructing them with subtract/add arithmetic.
-    radii = torch.cat([radii[:, :num_windings + 1], zero[:, None],
-                       radii[:, num_windings + 2:num_windings + 3], resolved], dim=-1)
-    all_valid = torch.cat([torch.ones_like(all_c[:, :num_windings + 3], dtype=torch.bool), valid], dim=-1)
-    canonical_knots, intermediate_knots, counts = _pack_knots(all_c, radii, all_valid)
-    return PinnedRayMap(canonical_knots, intermediate_knots, counts, S, resolved, valid,
-                        guard, valid & (rise <= 0), duplicate_conflicts, base_conflicts)
+    return PinnedRayMap(
+        pre_pin_winding_radii, dr, theta_norm,
+        torch.cat([zero[:, None], u], dim=-1),
+        torch.cat([zero[:, None], resolved], dim=-1), valid.sum(dim=-1) + 1,
+        S, resolved, valid, guard, valid & (rise <= 0), duplicate_conflicts, base_conflicts)
 
 
 def pinned_map_forward(r, ray_map):
-    """Intermediate -> canonical radius through one combined knot table."""
-    return piecewise_linear_map(r, ray_map.intermediate_knots, ray_map.canonical_knots,
-                                ray_map.knot_counts)
+    """Intermediate -> unpinned radius -> canonical coordinate."""
+    u = piecewise_linear_map(r, ray_map.radius_anchors, ray_map.unpinned_anchors,
+                             ray_map.anchor_counts)
+    return unpinned_map_forward(u, ray_map.pre_pin_winding_radii,
+                                ray_map.dr, ray_map.theta_norm)
 
 
 def pinned_map_inverse(c, ray_map):
-    """Canonical -> intermediate radius through the same knot table."""
-    return piecewise_linear_map(c, ray_map.canonical_knots, ray_map.intermediate_knots,
-                                ray_map.knot_counts)
+    """Canonical coordinate -> unpinned radius -> intermediate radius."""
+    u = unpinned_map_inverse(c, ray_map.pre_pin_winding_radii,
+                             ray_map.dr, ray_map.theta_norm)
+    return piecewise_linear_map(u, ray_map.unpinned_anchors, ray_map.radius_anchors,
+                                ray_map.anchor_counts)
 
 
 # ---------------------------------------------------------------------------
