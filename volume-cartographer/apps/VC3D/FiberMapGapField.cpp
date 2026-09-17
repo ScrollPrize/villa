@@ -167,6 +167,9 @@ GapField buildGapField(const GlobalResult& layout, const GapFieldParams& params)
     if (params.maxFoldWindings < 0) {
         throw std::invalid_argument("gap field: maxFoldWindings must be >= 0");
     }
+    if (params.fadeWindings < 1) {
+        throw std::invalid_argument("gap field: fadeWindings must be >= 1");
+    }
     if (params.maxCells == 0) {
         throw std::invalid_argument("gap field: maxCells must be > 0");
     }
@@ -287,6 +290,7 @@ GapField buildGapField(const GlobalResult& layout, const GapFieldParams& params)
     field.cols = cols;
     field.rows = rows;
     field.folded = fold && haveSeeds;
+    field.faded = field.folded && params.fade;
     const double saturation = params.saturationVx;
     field.distanceVx.assign(
         static_cast<std::size_t>(cols) * static_cast<std::size_t>(rows),
@@ -321,15 +325,39 @@ GapField buildGapField(const GlobalResult& layout, const GapFieldParams& params)
     }
     const std::vector<float> distance = exactDistanceTransform(seeds);
 
-    // The fold search: k with |k| * across >= saturation can never beat the
-    // clamp, and the cap guards a tiny fitted pitch.
+    // The fade: a candidate from |k| windings away is blended toward the
+    // saturation by |k| / fadeWindings, so the lower bound of what winding m
+    // can offer (its across term alone, faded) grows with m, and windings
+    // from fadeWindings on offer exactly the saturation.
+    const double fadeN = field.faded ? static_cast<double>(params.fadeWindings)
+                                     : std::numeric_limits<double>::infinity();
+    // Everything about the across term stays in double, and a candidate is
+    // computed by the very same arithmetic as its winding's lower bound on
+    // a value no smaller, so candidate >= bound holds bit for bit and the
+    // early break below can never skip an improving candidate.
+    const auto faded = [fadeN, saturation](double windings, double value) {
+        const double f = std::min(1.0, windings / fadeN);
+        return (1.0 - f) * value + f * saturation;
+    };
+    const auto acrossTerm = [across](double windings) { return windings * across; };
+    const auto lowerBound = [&faded, &acrossTerm](double windings) {
+        return faded(windings, acrossTerm(windings));
+    };
+
+    // The fold search: k whose lower bound reaches the saturation can never
+    // beat the clamp (the across term alone at ceil(sat/across), or the fade
+    // at fadeWindings), and the cap guards a tiny fitted pitch.
     int foldWindings = 0;
+    double searchBound = 0.0;
     bool capBinds = false;
     if (field.folded) {
         const double bySaturation = std::ceil(saturation / across) - 1.0;
-        const double capped = std::min(bySaturation, static_cast<double>(params.maxFoldWindings));
-        foldWindings = static_cast<int>(std::max(0.0, capped));
-        capBinds = bySaturation > static_cast<double>(params.maxFoldWindings);
+        const double byFade = field.faded ? static_cast<double>(params.fadeWindings) - 1.0
+                                          : std::numeric_limits<double>::infinity();
+        searchBound = std::max(0.0, std::min(bySaturation, byFade));
+        const double capped = std::min(searchBound, static_cast<double>(params.maxFoldWindings));
+        foldWindings = static_cast<int>(capped);
+        capBinds = searchBound > static_cast<double>(params.maxFoldWindings);
     }
 
     // Column shift maps: where output column j lands in the raster when read
@@ -348,13 +376,14 @@ GapField buildGapField(const GlobalResult& layout, const GapFieldParams& params)
         }
     }
 
-    // When the cap binds: per column, the across term of the nearest omitted
-    // winding (|k| > foldWindings) whose shifted query would still land in
-    // the raster. Only such a winding can hold a seed the search never saw;
-    // one landing outside is beyond the saturation by the halo argument.
-    // +inf when no omitted winding lands in the raster.
-    std::vector<float> omittedAcross(static_cast<std::size_t>(cols),
-                                     std::numeric_limits<float>::infinity());
+    // When the cap binds: per column, the lower bound of the nearest omitted
+    // winding (foldWindings < |k| <= searchBound) whose shifted query would
+    // still land in the raster. Only such a winding can hold a seed the
+    // search never saw; one landing outside is beyond the saturation by the
+    // halo argument, and one beyond searchBound offers the saturation
+    // anyway. +inf when no such winding exists.
+    std::vector<double> omittedAcross(static_cast<std::size_t>(cols),
+                                      std::numeric_limits<double>::infinity());
     if (capBinds) {
         const double uRaster1 = uRaster0 + static_cast<double>(rasterCols) * cell;
         double xRasterLo = sheetXForDistanceVx(model, uRaster0);
@@ -365,8 +394,8 @@ GapField buildGapField(const GlobalResult& layout, const GapFieldParams& params)
         if (std::isfinite(xRasterHi)) {
             for (int j = 0; j < cols; ++j) {
                 const double x = layout.x0Vx + (static_cast<double>(j) + 0.5) * cell;
-                const double kLo = std::ceil((xRasterLo - x) / period);
-                const double kHi = std::floor((xRasterHi - x) / period);
+                const double kLo = std::max(std::ceil((xRasterLo - x) / period), -searchBound);
+                const double kHi = std::min(std::floor((xRasterHi - x) / period), searchBound);
                 const double beyond = static_cast<double>(foldWindings) + 1.0;
                 double nearest = std::numeric_limits<double>::infinity();
                 const double outwardLo = std::max(kLo, beyond);
@@ -378,8 +407,7 @@ GapField buildGapField(const GlobalResult& layout, const GapFieldParams& params)
                     nearest = std::min(nearest, -inwardHi);
                 }
                 if (std::isfinite(nearest)) {
-                    omittedAcross[static_cast<std::size_t>(j)] =
-                        static_cast<float>(nearest * across);
+                    omittedAcross[static_cast<std::size_t>(j)] = lowerBound(nearest);
                 }
             }
         }
@@ -387,7 +415,6 @@ GapField buildGapField(const GlobalResult& layout, const GapFieldParams& params)
 
     std::vector<unsigned char> rowTruncated(static_cast<std::size_t>(rows), 0);
     const float cellF = static_cast<float>(cell);
-    const float saturationF = static_cast<float>(saturation);
     cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
         for (int i = range.start; i < range.end; ++i) {
             const float* row = distance.data() + static_cast<std::size_t>(i) * rasterCols;
@@ -398,25 +425,32 @@ GapField buildGapField(const GlobalResult& layout, const GapFieldParams& params)
                     out[j] = kOutside;
                     continue;
                 }
-                float best = saturationF;
+                double best = saturation;
                 const float g0 = columnMap[static_cast<std::size_t>(foldWindings) * cols + j];
                 if (!std::isnan(g0)) {
-                    best = std::min(best, sampleRow(row, rasterCols, g0) * cellF);
+                    best = std::min(best, static_cast<double>(sampleRow(row, rasterCols, g0) * cellF));
                 }
                 int m = 1;
                 for (; m <= foldWindings; ++m) {
-                    const float acrossM = static_cast<float>(m) * static_cast<float>(across);
-                    if (acrossM >= best) {
+                    // Nothing winding m offers can be below its faded across
+                    // term, and that bound only grows with m.
+                    const double windings = static_cast<double>(m);
+                    if (lowerBound(windings) >= best) {
                         break;
                     }
+                    const double acrossM = acrossTerm(windings);
                     for (const int k : {m, -m}) {
                         const float g =
                             columnMap[static_cast<std::size_t>(k + foldWindings) * cols + j];
                         if (std::isnan(g)) {
                             continue;
                         }
-                        const float s = sampleRow(row, rasterCols, g) * cellF;
-                        best = std::min(best, std::hypot(s, acrossM));
+                        const double s = static_cast<double>(sampleRow(row, rasterCols, g) * cellF);
+                        // max() only guards a hypot that is not correctly
+                        // rounded; the value fed to the fade is never below
+                        // the across term the bound was computed from.
+                        const double inSheetAndAcross = std::max(acrossM, std::hypot(s, acrossM));
+                        best = std::min(best, faded(windings, inSheetAndAcross));
                     }
                 }
                 // The cap bit if the search ran off its end while an omitted
@@ -424,7 +458,7 @@ GapField buildGapField(const GlobalResult& layout, const GapFieldParams& params)
                 if (capBinds && m > foldWindings && omittedAcross[static_cast<std::size_t>(j)] < best) {
                     truncated = true;
                 }
-                out[j] = best;
+                out[j] = static_cast<float>(best);
             }
             if (truncated) {
                 rowTruncated[static_cast<std::size_t>(i)] = 1;

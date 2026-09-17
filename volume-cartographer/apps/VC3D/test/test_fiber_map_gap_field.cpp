@@ -114,6 +114,8 @@ private slots:
     void transformIsExactDistanceToNearestSeedPixel();
     void degenerateGridsStillMeasure();
     void matchesBruteForceOracleAndIsDeterministic();
+    void fadeTapersNeighbouringWindingsToNothing();
+    void matchesBruteForceOracleWithFade();
     void tilesCoverTheFieldEdgeToEdge();
 };
 
@@ -148,6 +150,9 @@ void TestFiberMapGapField::invalidParametersThrow()
     QVERIFY_THROWS_EXCEPTION(std::invalid_argument, buildGapField(layout, params));
     params = GapFieldParams{};
     params.maxCells = 0;
+    QVERIFY_THROWS_EXCEPTION(std::invalid_argument, buildGapField(layout, params));
+    params = GapFieldParams{};
+    params.fadeWindings = 0;
     QVERIFY_THROWS_EXCEPTION(std::invalid_argument, buildGapField(layout, params));
 }
 
@@ -222,6 +227,17 @@ void TestFiberMapGapField::sameGapSettingsComparesWhatBuildsTheField()
     QVERIFY(!sameGapSettings(true, a, true, b));
     b = a;
     b.seedInterpolated = !a.seedInterpolated;
+    QVERIFY(!sameGapSettings(true, a, true, b));
+    b = a;
+    b.fade = !a.fade;
+    QVERIFY(!sameGapSettings(true, a, true, b));
+    // The fade count only matters while fading.
+    a.fade = false;
+    b = a;
+    b.fadeWindings = a.fadeWindings + 1;
+    QVERIFY(sameGapSettings(true, a, true, b));
+    a.fade = true;
+    b.fade = true;
     QVERIFY(!sameGapSettings(true, a, true, b));
 }
 
@@ -483,7 +499,12 @@ void TestFiberMapGapField::cellCoarsensUnderBudget()
     QVERIFY(std::abs(sampleAt(field, 7100.0, 5100.0) - 2100.0) <= field.cellVx);
 }
 
-void TestFiberMapGapField::matchesBruteForceOracleAndIsDeterministic()
+namespace
+{
+
+// Random dot seeds against an independent brute force over the seed pixels,
+// with or without the fade; see the calling tests.
+void checkAgainstBruteForce(bool fade, int fadeWindings)
 {
     // Dot seeds each occupy exactly one raster pixel, so an independent
     // oracle knows the seed pixels: for each cell and each k, the distance
@@ -506,6 +527,8 @@ void TestFiberMapGapField::matchesBruteForceOracleAndIsDeterministic()
     GapFieldParams params;
     params.cellVx = 100.0;
     params.saturationVx = 1500.0;
+    params.fade = fade;
+    params.fadeWindings = fadeWindings;
     const GapField field = buildGapField(layout, params);
     QVERIFY(field.folded);
     // Bitwise identical across thread counts: every cell is a function of
@@ -540,7 +563,17 @@ void TestFiberMapGapField::matchesBruteForceOracleAndIsDeterministic()
         return layout.yMinVx + (std::floor((y - layout.yMinVx) / params.cellVx) + 0.5) * params.cellVx;
     };
     const double across = pitch;
-    const int kMax = static_cast<int>(std::ceil(params.saturationVx / across)) - 1;
+    int kMax = static_cast<int>(std::ceil(params.saturationVx / across)) - 1;
+    if (fade) {
+        kMax = std::min(kMax, fadeWindings - 1);
+    }
+    const auto fadeIt = [&](int k, double value) {
+        if (!fade) {
+            return value;
+        }
+        const double f = std::min(1.0, static_cast<double>(std::abs(k)) / fadeWindings);
+        return (1.0 - f) * value + f * params.saturationVx;
+    };
     int checked = 0;
     for (int row = 0; row < field.rows; row += 3) {
         const double y = layout.yMinVx + (row + 0.5) * params.cellVx;
@@ -553,7 +586,7 @@ void TestFiberMapGapField::matchesBruteForceOracleAndIsDeterministic()
                     const double du = u - pixelCentreU(seed.u);
                     const double dy = y - pixelCentreY(seed.y);
                     const double s = std::hypot(du, dy);
-                    best = std::min(best, std::hypot(s, std::abs(k) * across));
+                    best = std::min(best, fadeIt(k, std::hypot(s, std::abs(k) * across)));
                 }
             }
             const float got = field.at(row, col);
@@ -564,6 +597,72 @@ void TestFiberMapGapField::matchesBruteForceOracleAndIsDeterministic()
         }
     }
     QVERIFY(checked > 500);
+}
+
+}  // namespace
+
+void TestFiberMapGapField::matchesBruteForceOracleAndIsDeterministic()
+{
+    checkAgainstBruteForce(false, 5);
+}
+
+void TestFiberMapGapField::matchesBruteForceOracleWithFade()
+{
+    checkAgainstBruteForce(true, 3);
+}
+
+void TestFiberMapGapField::fadeTapersNeighbouringWindingsToNothing()
+{
+    // r(W) = 4000 + 200 W. Fibers on windings 1, 2 and 5 only, at three
+    // different angles so each is the sole candidate at its own angle. With
+    // the fade at 5 windings, the cell at each angle on winding 0 reads the
+    // candidate blended toward the saturation by k/5.
+    const double rRef = 4000.0;
+    const double period = kTwoPi * rRef;
+    const double pitch = 200.0;
+    const double saturation = 5000.0;
+    GlobalResult layout = makeLayout(rRef, 4000.0, pitch, 0.0, 6.5 * period, 0.0, 10000.0);
+    const double angle1 = 3000.0;
+    const double angle2 = 3000.0 + 0.3 * period;
+    const double angle5 = 3000.0 + 0.6 * period;
+    addVertical(layout, 1.0 * period + angle1, 0.0, 10000.0);
+    addVertical(layout, 2.0 * period + angle2, 0.0, 10000.0);
+    addVertical(layout, 5.0 * period + angle5, 0.0, 10000.0);
+    GapFieldParams params;
+    params.cellVx = 100.0;
+    params.saturationVx = saturation;
+    params.fade = true;
+    params.fadeWindings = 5;
+    const GapField field = buildGapField(layout, params);
+    QVERIFY(field.folded);
+    QVERIFY(field.faded);
+    QVERIFY(!field.foldTruncated);
+    const auto expect = [&](double x, double expected) {
+        const float d = sampleAt(field, x, 5050.0);
+        QVERIFY2(std::abs(d - expected) <= params.cellVx,
+                 qPrintable(QStringLiteral("x %1: %2 vs %3").arg(x).arg(d).arg(expected)));
+    };
+    // k = 1: 0.8 * 200 + 0.2 * 5000.
+    expect(angle1 + 50.0, 0.8 * pitch + 0.2 * saturation);
+    // k = 2: 0.6 * 400 + 0.4 * 5000.
+    expect(angle2 + 50.0, 0.6 * 2.0 * pitch + 0.4 * saturation);
+    // k = 5: no influence at all.
+    QCOMPARE(sampleAt(field, angle5 + 50.0, 5050.0), static_cast<float>(saturation));
+    // The fiber's own winding is unaffected by the fade.
+    QVERIFY(sampleAt(field, 1.0 * period + angle1 + 50.0, 5050.0) <= params.cellVx);
+    // Without the fade the same cells read the plain fold.
+    params.fade = false;
+    const GapField plain = buildGapField(layout, params);
+    QVERIFY(!plain.faded);
+    QVERIFY(std::abs(sampleAt(plain, angle1 + 50.0, 5050.0) - pitch) <= params.cellVx);
+    QVERIFY(std::abs(sampleAt(plain, angle5 + 50.0, 5050.0) - 5.0 * pitch) <= params.cellVx);
+    // fadeWindings 1: only the cell's own winding; the fold still reports
+    // as enabled.
+    params.fade = true;
+    params.fadeWindings = 1;
+    const GapField own = buildGapField(layout, params);
+    QVERIFY(own.folded);
+    QCOMPARE(sampleAt(own, angle1 + 50.0, 5050.0), static_cast<float>(saturation));
 }
 
 void TestFiberMapGapField::tilesCoverTheFieldEdgeToEdge()

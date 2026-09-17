@@ -32,6 +32,7 @@ class LineAnnotationController;
 class QCheckBox;
 class QDockWidget;
 class QDoubleSpinBox;
+class QSpinBox;
 class QEvent;
 class QGraphicsItem;
 class QGraphicsPathItem;
@@ -322,6 +323,8 @@ private:
     QCheckBox* _gapsCheck = nullptr;
     QDoubleSpinBox* _gapSaturationSpin = nullptr;
     QDoubleSpinBox* _gapAcrossSpin = nullptr;
+    QCheckBox* _gapFadeCheck = nullptr;
+    QSpinBox* _gapFadeWindingsSpin = nullptr;
     QLabel* _gapLegend = nullptr;
     // The published layout's gap field (null before a build that carried
     // one) and the settings it was built with, so a toggle can tell a field

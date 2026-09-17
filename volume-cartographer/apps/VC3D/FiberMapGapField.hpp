@@ -27,6 +27,17 @@
 // fiber on the cell's own winding counts). acrossWeight == 0, or a degenerate
 // sheet model (pitch 0), disables the fold: D = S_0, and `folded` is false.
 //
+// With `fade` on, a fiber's influence also tapers with the winding gap and is
+// gone at `fadeWindings`: the candidate from winding k is blended toward the
+// saturation by |k| / fadeWindings,
+//
+//     D_k' = (1 - |k|/N) * D_k + (|k|/N) * saturationVx,     N = fadeWindings,
+//
+// so the cell's own winding counts in full, winding N-1 barely, and winding N
+// and beyond not at all (they are never searched). This is a display choice
+// on top of the metric, for maps where a fiber several sheets away should not
+// read as covering a gap.
+//
 // What this is and is not. It is one number per cell, in voxels, exact up to
 // the rasterisation (fibers are drawn one cell wide, distances are read from
 // an exact per-cell Euclidean distance transform and interpolated between
@@ -56,6 +67,10 @@ struct GapFieldParams {
     double saturationVx = 4167.0;
     // Multiplier on the model pitch for the across-sheet term (0 disables).
     double acrossWeight = 1.0;
+    // Taper the fold's candidates toward the saturation with the winding gap,
+    // reaching it at fadeWindings (>= 1; 1 means only the cell's own winding).
+    bool fade = false;
+    int fadeWindings = 5;
     bool seedInterpolated = true;
     // Hard cap on |k|. The saturation already bounds k at ceil(sat/across)-1;
     // this guards a tiny fitted pitch. foldTruncated reports when it may
@@ -81,6 +96,8 @@ struct GapField {
     double saturationVx = 0.0;
     // False when the fold was disabled (acrossWeight or pitch is 0).
     bool folded = false;
+    // The fold's candidates were faded (params.fade with the fold enabled).
+    bool faded = false;
     // Conservative: some cell's search stopped at maxFoldWindings while an
     // omitted winding both lands in the seed raster and has an across term
     // below that cell's result, so a closer seed there is possible (not
@@ -101,8 +118,8 @@ struct GapField {
 };
 
 // Throws std::invalid_argument for non-finite or non-positive cell/saturation,
-// negative or non-finite acrossWeight, negative maxFoldWindings, or a cell
-// budget no cell size can meet (the seed raster is never narrower than a few
+// negative or non-finite acrossWeight, negative maxFoldWindings, fadeWindings
+// below 1, or a cell budget no cell size can meet (the seed raster is never narrower than a few
 // cells). An empty layout (no fibers, or a degenerate extent or reference
 // radius) yields an empty field.
 [[nodiscard]] GapField buildGapField(const GlobalResult& layout, const GapFieldParams& params);
@@ -120,6 +137,9 @@ struct GapField {
     }
     if (!wantA) {
         return true;
+    }
+    if (a.fade != b.fade || (a.fade && a.fadeWindings != b.fadeWindings)) {
+        return false;
     }
     return a.cellVx == b.cellVx && a.saturationVx == b.saturationVx &&
            a.acrossWeight == b.acrossWeight && a.seedInterpolated == b.seedInterpolated &&

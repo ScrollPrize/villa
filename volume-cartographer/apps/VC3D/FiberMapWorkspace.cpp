@@ -40,6 +40,7 @@
 #include <QPushButton>
 #include <QScopeGuard>
 #include <QScrollBar>
+#include <QSpinBox>
 #include <QtConcurrent/QtConcurrent>
 #include <QStyleOptionGraphicsItem>
 #include <QTimer>
@@ -186,6 +187,11 @@ constexpr double kGapSaturationMinCm = 0.1;
 constexpr double kGapSaturationMaxCm = 10.0;
 constexpr double kGapAcrossDefault = 1.0;
 constexpr double kGapAcrossMax = 10.0;
+// Fade of neighbouring windings' influence, on by default, gone at this
+// many windings away.
+constexpr bool kGapFadeDefault = true;
+constexpr int kGapFadeWindingsDefault = 5;
+constexpr int kGapFadeWindingsMax = 64;
 constexpr qreal kNetworkGlowZ = 1.5;
 constexpr qreal kFiberZ = 2.0;
 constexpr qreal kHighlightZ = 7.0;
@@ -757,6 +763,22 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
            "spacing; larger values count only fibers on the same winding as\n"
            "close; 0 ignores other windings entirely."));
     toolBar->addWidget(_gapAcrossSpin);
+    _gapFadeCheck = new QCheckBox(tr("Fade by"), toolBar);
+    _gapFadeCheck->setChecked(kGapFadeDefault);
+    _gapFadeCheck->setToolTip(
+        tr("Taper the influence of fibers on other windings with the winding\n"
+           "gap: a fiber one winding away counts almost fully, one this many\n"
+           "windings away not at all. Off: only the across-sheet weight limits\n"
+           "how far other windings reach."));
+    toolBar->addWidget(_gapFadeCheck);
+    _gapFadeWindingsSpin = new QSpinBox(toolBar);
+    _gapFadeWindingsSpin->setRange(1, kGapFadeWindingsMax);
+    _gapFadeWindingsSpin->setValue(kGapFadeWindingsDefault);
+    _gapFadeWindingsSpin->setSuffix(tr(" windings"));
+    _gapFadeWindingsSpin->setToolTip(
+        tr("Windings away at which another winding's fiber no longer counts\n"
+           "(1: only the cell's own winding counts)."));
+    toolBar->addWidget(_gapFadeWindingsSpin);
     _gapLegend = new QLabel(toolBar);
     _gapLegend->setTextFormat(Qt::PlainText);
     toolBar->addWidget(_gapLegend);
@@ -809,6 +831,10 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
             [this](double) { handleGapParamsChanged(); });
     connect(_gapAcrossSpin, &QDoubleSpinBox::valueChanged, this,
             [this](double) { handleGapParamsChanged(); });
+    connect(_gapFadeCheck, &QCheckBox::toggled, this,
+            [this](bool) { handleGapParamsChanged(); });
+    connect(_gapFadeWindingsSpin, &QSpinBox::valueChanged, this,
+            [this](int) { handleGapParamsChanged(); });
     updateGapLegend();
     connect(_view, &FiberMapView::clicked, this, &FiberMapWorkspace::handleSceneClick);
     connect(_view, &FiberMapView::zoomed, this,
@@ -1787,6 +1813,10 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
                 status += _gapFieldParams.acrossWeight > 0.0
                     ? tr(" (in-sheet only: no sheet pitch)")
                     : tr(" (in-sheet only)");
+            } else if (_gapField->faded) {
+                status += tr(" (\u00d7%1 across, fades by %2 windings)")
+                              .arg(_gapFieldParams.acrossWeight)
+                              .arg(_gapFieldParams.fadeWindings);
             } else {
                 status += tr(" (\u00d7%1 across)").arg(_gapFieldParams.acrossWeight);
             }
@@ -2519,6 +2549,9 @@ vc3d::fiber_map::gaps::GapFieldParams FiberMapWorkspace::gapFieldParams(
     params.saturationVx =
         (_gapSaturationSpin ? _gapSaturationSpin->value() : kGapSaturationDefaultCm) * vxPerCm;
     params.acrossWeight = _gapAcrossSpin ? _gapAcrossSpin->value() : kGapAcrossDefault;
+    params.fade = _gapFadeCheck ? _gapFadeCheck->isChecked() : kGapFadeDefault;
+    params.fadeWindings =
+        _gapFadeWindingsSpin ? _gapFadeWindingsSpin->value() : kGapFadeWindingsDefault;
     params.seedInterpolated = true;
     return params;
 }
@@ -2648,6 +2681,12 @@ void FiberMapWorkspace::updateGapLegend()
     const bool on = _gapsCheck->isChecked();
     _gapSaturationSpin->setEnabled(on);
     _gapAcrossSpin->setEnabled(on);
+    if (_gapFadeCheck) {
+        _gapFadeCheck->setEnabled(on);
+    }
+    if (_gapFadeWindingsSpin) {
+        _gapFadeWindingsSpin->setEnabled(on && _gapFadeCheck && _gapFadeCheck->isChecked());
+    }
     _gapLegend->setEnabled(on);
     // The ramp, then its range: centimetres only when the voxel size is
     // known, voxels (as the field measures them) otherwise.
