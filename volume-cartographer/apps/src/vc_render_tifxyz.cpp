@@ -33,6 +33,9 @@
 #include <unordered_set>
 #include <tiffio.h>
 #include <omp.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 namespace po = boost::program_options;
 using Json = utils::Json;
@@ -377,6 +380,24 @@ static std::vector<float> buildCompositeOffsetList(
     for (int zi = compositeStart; zi <= compositeEnd; zi++)
         out.push_back(float(zi) * float(sliceStep));
     return out;
+}
+
+// Memory this process can actually use: the cgroup limit when one is set
+// (Docker), otherwise the machine's RAM. 0 when unknown (Windows).
+static size_t usableMemoryBytes()
+{
+    size_t bytes = 0;
+#ifndef _WIN32
+    const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page > 0) bytes = size_t(pages) * size_t(page);
+#endif
+#ifdef __linux__
+    for (const char* f : {"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"}) {
+        std::ifstream in(f); unsigned long long lim = 0;
+        if (in >> lim && lim > 0 && (bytes == 0 || lim < bytes)) bytes = size_t(lim);
+    }
+#endif
+    return bytes;
 }
 
 static std::string loadCachedRemoteUrl(const std::filesystem::path& volumePath)
@@ -1299,6 +1320,9 @@ int main(int argc, char *argv[])
     const int cacheLevel = group_idx;
 
     const size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
+    if (const size_t mem = usableMemoryBytes(); mem > 0 && cache_bytes >= mem)
+        logPrintf(stderr, "Warning: --cache-gb %llu is not below the memory available to this process (%.1f GB): the render can stall without any output. Lower --cache-gb.\n",
+                  (unsigned long long)parsed["cache-gb"].as<size_t>(), double(mem) / (1024.0 * 1024.0 * 1024.0));
     std::unique_ptr<vc::render::ChunkCache> ownedChunkCache;
     std::shared_ptr<Volume> remoteVolume;
     std::shared_ptr<vc::render::ChunkCache> remoteCache;
