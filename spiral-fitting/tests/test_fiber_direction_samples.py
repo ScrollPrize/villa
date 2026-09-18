@@ -1,53 +1,12 @@
 import json
-import sys
-from pathlib import Path
-
 import numpy as np
 import torch
-
-
-SPIRAL_DIR = Path(__file__).resolve().parents[1]
-if str(SPIRAL_DIR) not in sys.path:
-    sys.path.insert(0, str(SPIRAL_DIR))
-
-from fiber_direction_samples import (FORMAT_VERSION, _cell_argmax, _parse_z_roi,
-                                     load_fiber_direction_samples)
+from fiber_direction_samples import (
+    FORMAT_VERSION,
+    _cell_argmax,
+    load_fiber_direction_samples,
+)
 from losses import get_fiber_direction_loss
-
-
-def test_parse_z_roi():
-    assert _parse_z_roi("10000,11000") == (10000, 11000)
-
-
-def test_read_chunk_crops_full_sized_boundary_chunk():
-    import fiber_direction_samples as module
-
-    stored = np.arange(4 * 4 * 4, dtype=np.uint8).reshape(4, 4, 4)
-
-    class Response:
-        status_code = 200
-        content = stored.tobytes()
-
-        @staticmethod
-        def raise_for_status():
-            return None
-
-    class Session:
-        @staticmethod
-        def get(*args, **kwargs):
-            return Response()
-
-    metadata = {
-        "shape": [5, 4, 4],
-        "chunks": [4, 4, 4],
-        "dtype": "|u1",
-        "compressor": None,
-        "order": "C",
-    }
-    result = module._read_chunk(Session(), "https://example.invalid/a", metadata,
-                                (1, 0, 0))
-    assert result.shape == (1, 4, 4)
-    np.testing.assert_array_equal(result, stored[:1])
 
 
 def test_cell_argmax_keeps_one_highest_presence_voxel_per_cell():

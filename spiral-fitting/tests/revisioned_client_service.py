@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from spiral_service import ServiceState, SpiralServer, SpiralHandler, resolve_dataset_root
-from test_spiral_service_v2 import _attach_fake_session
+from service_fixtures import _attach_fake_session
 
 root = Path(sys.argv[1])
 dataset = root / 'dataset'
@@ -19,7 +19,7 @@ native = bool(os.environ.get('SPIRAL_REVISION_CLIENT_LIVE'))
 protocol_stdout = sys.stdout
 if native:
     sys.stdout = sys.stderr
-    from test_revisioned_live_fit import make_real_revision_session
+    from live_revision_fixtures import make_real_revision_session
     import torch
     source_patch, source_digest, dataset, baseline, replacement, patch, config, actual = make_real_revision_session(root)
     deadline = time.monotonic() + 180

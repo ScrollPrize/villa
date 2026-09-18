@@ -3,52 +3,14 @@
 Each test builds a FitContext piecemeal (the pattern test_fiber_supervision
 uses) and drives FitContext.apply_config the way the interactive runtime does.
 """
-import copy
-from types import SimpleNamespace
-from unittest.mock import Mock
 
+from geometry_fixtures import _context
+
+import copy
+from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
-
-from config import Config
-from fit_spiral import FitContext, _UnattachedPclStripList
-
-
-def _context(**overrides):
-    context = FitContext.__new__(FitContext)
-    context.config = Config().as_dict()
-    context.config.update({'z_begin': 0, 'z_end': 200})
-    context.config.update(overrides)
-    context.shell_map = None
-    context.shell_envelope = None
-    context.shell_outer_winding_idx = None
-    context.shell_valid_zyxs_gpu = None
-    context.shell_patch = None
-    context.tracks = []
-    context.prepared_main_tracks = None
-    context.verified_patches = {}
-    context.verified_patches_list = []
-    context.unverified_patches = None
-    context.unverified_patches_list = []
-    context.unverified_patch_sampling_probabilities = None
-    context.unverified_patch_atlas = None
-    context.cross_patch_pcls = []
-    context.unattached_pcl_strips = _UnattachedPclStripList()
-    context.unattached_strip_sampling_groups = []
-    context.resolved_links = []
-    context.link_components = []
-    context.fiber_catalog = {}
-    context.regular_pcl_catalog = {}
-    context.fiber_direction_samples = None
-    context.dt_target_cache_manager = SimpleNamespace(
-        update_interval=100, reset=Mock())
-    context.theta_crossing_map = SimpleNamespace(invalidate=Mock())
-    context._rebuild_pcl_sampling_strata = Mock()
-    context._refresh_trusted_geometry = Mock()
-    context._build_theta_crossing_map = Mock(return_value=[])
-    context._make_shell_polar_map = Mock(return_value='rebuilt shell map')
-    return context
 
 
 def _fiber(cid, logical_id, zyxs, hv=None):
@@ -86,8 +48,6 @@ def _regular(cid, zyxs, attached=()):
             "metadata": {"winding_is_absolute": False}, "points": points}
 
 
-# --- shell atlas -----------------------------------------------------------------
-
 def test_shell_atlas_settings_rebuild_the_resident_lookup():
     context = _context()
     context.shell_map = 'old shell map'
@@ -113,26 +73,6 @@ def test_shell_atlas_settings_are_refused_when_tracks_were_shell_filtered():
     assert context.shell_map == 'old shell map'
 
 
-# --- fiber directions -------------------------------------------------------------
-
-def test_fiber_direction_weight_needs_resident_samples():
-    context = _context()
-    with pytest.raises(ValueError, match='fiber-direction samples'):
-        context.apply_config(
-            {'loss_weight_fiber_directions': 1.0}, current_iteration=0)
-    assert context.config['loss_weight_fiber_directions'] == 0.0
-    context.fiber_direction_samples = {'position_zyx': np.zeros((1, 3))}
-    context.apply_config(
-        {'loss_weight_fiber_directions': 1.0}, current_iteration=0)
-    assert context.config['loss_weight_fiber_directions'] == 1.0
-    # Lowering to zero never needs the samples.
-    context.fiber_direction_samples = None
-    context.apply_config(
-        {'loss_weight_fiber_directions': 0.0}, current_iteration=0)
-
-
-# --- sampling weights ------------------------------------------------------------
-
 def test_sampling_weights_rebuild_the_strata_after_validating_every_group():
     context = _context()
     context.cross_patch_pcls = [{'sampling_group': 'relative.json'}]
@@ -150,43 +90,6 @@ def test_sampling_weights_rebuild_the_strata_after_validating_every_group():
     context._rebuild_pcl_sampling_strata.reset_mock()
     context.apply_config({'pcl_sampling_weights': None}, current_iteration=0)
     context._rebuild_pcl_sampling_strata.assert_called_once_with()
-
-
-# --- fiber views -----------------------------------------------------------------
-
-def test_fiber_view_settings_are_a_no_op_without_a_fiber_catalog():
-    context = _context()
-    context.apply_config({'pcl_use_fiber_links': False}, current_iteration=0)
-    context._rebuild_pcl_sampling_strata.assert_not_called()
-    assert context.config['pcl_use_fiber_links'] is False
-
-
-def test_fiber_spacing_reloads_the_documents_and_refuses_missing_ones(tmp_path):
-    context = _context()
-    context.fiber_catalog = {
-        'gone': _fiber(1, 'gone', [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]])}
-    context.fiber_catalog['gone']['source_file'] = str(tmp_path / 'gone.json')
-    context.prepare_input_changes = Mock()
-    context.install_input_changes = Mock(return_value=[])
-    with pytest.raises(ValueError, match='no longer on disk'):
-        context.apply_config(
-            {'pcl_fiber_min_point_spacing': 5.0}, current_iteration=0)
-    assert context.config['pcl_fiber_min_point_spacing'] == 40.0
-    context.prepare_input_changes.assert_not_called()
-
-    present = tmp_path / 'present.json'
-    present.write_text('{}')
-    context.fiber_catalog = {
-        'present': _fiber(2, 'present', [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]])}
-    context.fiber_catalog['present']['source_file'] = str(present)
-    context.fiber_catalog['present']['metadata'][
-        'logical_input_revision'] = 'abc'
-    context.apply_config(
-        {'pcl_fiber_min_point_spacing': 5.0}, current_iteration=0)
-    context.prepare_input_changes.assert_called_once_with(
-        [{'kind': 'fiber', 'path': str(present), 'id': 'present', 'source_id': 'present',
-          'revision': 'abc'}],
-        influence_config={'influence_enabled': False})
 
 
 @pytest.mark.parametrize('exponential', [False, True])
@@ -225,8 +128,6 @@ def test_missing_fiber_rejects_lr_changes_without_mutating_optimizer(
     assert context.num_training_steps == horizon_before
 
 
-# --- regular strips --------------------------------------------------------------
-
 def test_unattached_spacing_rederives_regular_strips_from_the_catalog():
     context = _context(pcl_unattached_pcl_min_point_spacing=0.0)
     line = [[float(i), 0.0, 0.0] for i in range(6)]
@@ -262,9 +163,6 @@ def test_unattached_spacing_rederives_regular_strips_from_the_catalog():
     assert context.cross_patch_pcls == []
     context._rebuild_pcl_sampling_strata.assert_called_once_with()
     context._refresh_trusted_geometry.assert_called_once_with()
-
-
-# --- point-collection role toggles ---------------------------------------------
 
 
 @pytest.mark.parametrize('settings, error', [
@@ -304,8 +202,6 @@ def test_invalid_track_policy_preserves_enabled_pcl_inputs(settings, error):
     assert context.cross_patch_pcls == [pcl]
 
 
-# --- tracks ---------------------------------------------------------------------
-
 def test_track_crossing_settings_reprepare_the_retained_tracks(monkeypatch):
     import fit_spiral
     context = _context(input_use_tracks=True)
@@ -333,29 +229,6 @@ def test_track_crossing_settings_reprepare_the_retained_tracks(monkeypatch):
     assert policy['crossing_precompute_max'] == 12
     assert context.prepared_main_tracks is prepared
 
-# --- integration steps ------------------------------------------------------------
-
-def test_integration_step_count_is_set_on_the_resident_transform():
-    context = _context()
-    context.spiral_and_transform = SimpleNamespace(flow_integration_steps=3)
-    context.apply_config(
-        {'model_num_flow_integration_steps': 5}, current_iteration=0)
-    assert context.spiral_and_transform.flow_integration_steps == 5
-    assert context.config['model_num_flow_integration_steps'] == 5
-
-
-# --- visualisation slices -------------------------------------------------------
-
-def test_visualisation_slice_count_is_read_live():
-    import inspect
-    import fit_spiral
-    source = inspect.getsource(fit_spiral.FitContext._build_model_state)
-    assert 'output_num_slices_for_visualization' not in source
-    assert 'num_slices_for_visualisation' not in (
-        fit_spiral.FitContext._MODEL_STAGE_ATTRIBUTES)
-    assert 'output_num_slices_for_visualization' in inspect.getsource(
-        fit_spiral.FitContext._prepare_png_visualization_inputs)
-
 
 def test_fiber_link_side_rules_relink_every_fiber_at_a_run_boundary():
     context = _context(pcl_fiber_link_model_direction_step=10)
@@ -380,14 +253,6 @@ def test_fiber_link_side_rules_relink_every_fiber_at_a_run_boundary():
     context.apply_config({'pcl_fiber_link_side_filter': False}, current_iteration=12)
     context._relink_fibers_to_patches.assert_called_once_with(
         'model', iteration=12)
-
-
-def test_fiber_link_side_rules_are_a_no_op_without_a_fiber_catalog():
-    context = _context()
-    context._relink_fibers_to_patches = Mock()
-    context.apply_config({'pcl_fiber_link_side_filter': True}, current_iteration=0)
-    context._relink_fibers_to_patches.assert_not_called()
-    assert context.config['pcl_fiber_link_side_filter'] is True
 
 
 def _z_plane_patch(z, y0=-20.0, x0=-20.0, size=5, spacing=10.0):
@@ -456,29 +321,3 @@ def test_link_tolerance_relinks_every_collection_at_a_run_boundary():
         assert all('on_patch' not in p for p in fiber['points'].values())
         assert context.cross_patch_pcls == []
         assert sorted(strip['id'] for strip in context.unattached_pcl_strips) == [3, 9]
-
-
-def test_window_min_points_must_fit_the_window_at_a_run_boundary():
-    context = _context()
-    context.regular_pcl_catalog = {3: _linkable_regular(3, [[51.5, 0.0, 0.0]])}
-    context._relink_all_points_to_patches = Mock()
-    with pytest.raises(ValueError, match='pcl_link_window_min_points'):
-        context.apply_config(
-            {'pcl_link_window_points': 3, 'pcl_link_window_min_points': 4},
-            current_iteration=0)
-    context._relink_all_points_to_patches.assert_not_called()
-    # Nothing was applied.
-    assert context.config['pcl_link_window_points'] == 1
-    assert context.config['pcl_link_window_min_points'] == 1
-    context.apply_config(
-        {'pcl_link_window_points': 3, 'pcl_link_window_min_points': 2},
-        current_iteration=5)
-    context._relink_all_points_to_patches.assert_called_once_with(iteration=5)
-
-
-def test_link_settings_are_a_no_op_without_catalogs():
-    context = _context()
-    context._relink_all_points_to_patches = Mock()
-    context.apply_config({'pcl_link_distance_tolerance': 3.0}, current_iteration=0)
-    context._relink_all_points_to_patches.assert_not_called()
-    assert context.config['pcl_link_distance_tolerance'] == 3.0

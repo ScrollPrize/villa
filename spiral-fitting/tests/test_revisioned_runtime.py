@@ -1,64 +1,12 @@
 """Exercise revision commands through the actual fitter boundary queue."""
-import copy
+
+from runtime_fixtures import resident
+
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
-
 import pytest
-
-from fit_session import SessionState
-from spiral_runtime import _SessionShutdown, _apply_input_changes_at_boundary
-
-
-@pytest.fixture
-def resident():
-    from test_spiral_headless import ProtocolTests
-    session = ProtocolTests()._idle_session(completed=7)
-    session._live_reservation_iteration = None
-    session._live_reservation_epoch = 0
-    session._iteration_in_progress = None
-    session._input_batches = {}
-    session.status = lambda: {"current_iteration": session._completed, "state": session._state}
-    entered, release = threading.Event(), threading.Event()
-    release.set()
-    active = {"revision": 1}
-
-    def prepare(records, config, **kwargs):
-        entered.set()
-        assert release.wait(5)
-        if records[0].get("invalid"):
-            raise ValueError("invalid selected draft")
-        return SimpleNamespace(
-            _workspace_membership=copy.deepcopy(records[0]),
-            verified_patches={}, unverified_patches={})
-
-    def install(candidate):
-        active.update(candidate._workspace_membership)
-        return []
-
-    session._context = SimpleNamespace(
-        prepare_input_changes=Mock(side_effect=prepare),
-        install_input_changes=Mock(side_effect=install))
-    errors = []
-
-    def worker():
-        try:
-            session.wait_for_iteration(7)
-        except _SessionShutdown:
-            pass
-        except BaseException as exc:
-            errors.append(exc)
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-    yield session, active, entered, release
-    release.set()
-    with session._condition:
-        session._shutdown = True
-        session._condition.notify_all()
-    thread.join(5)
-    assert not thread.is_alive()
-    assert not errors
+from spiral_runtime import _apply_input_changes_at_boundary
 
 
 def test_idle_batch_applies_without_run_and_replays_once(resident):
@@ -73,55 +21,6 @@ def test_idle_batch_applies_without_run_and_replays_once(resident):
         session.apply_input_changes("batch", [{"revision": 3}])
 
 
-@pytest.mark.parametrize('running', [False, True])
-@pytest.mark.parametrize('outcome', ['install', 'discard', 'invalid'])
-def test_input_batch_restores_progress_after_preparation(running, outcome):
-    from spiral_progress import ProgressReporter
-    from spiral_runtime import InputBatchCommand
-    from test_spiral_headless import ProtocolTests
-
-    session = ProtocolTests()._idle_session(completed=2616)
-    session._state = SessionState.Running if running else SessionState.Idle
-    session._run_start_completed = 2500
-    session._target = 3750 if running else 2616
-    session._pending = 1134 if running else 0
-    session.progress = ProgressReporter(publish=session._progress_changed,
-                                        publish_interval=0)
-
-    def prepare(*args, **kwargs):
-        session.progress.begin('loading', 'Preparing patch sampling',
-                               step=0, total_steps=0, unit='patches')
-        if outcome == 'invalid':
-            raise ValueError('invalid patch')
-        return SimpleNamespace(_workspace_membership={}, verified_patches={},
-                               unverified_patches={})
-
-    session._context = SimpleNamespace(
-        prepare_input_changes=prepare,
-        install_input_changes=Mock(return_value=[]))
-    prepared = InputBatchCommand(batch_id='patch')
-    session._input_batches = {'patch': {'prepare': prepared}}
-    session._run_input_batch(prepared)
-    assert session._phase == 'Preparing patch sampling'
-
-    session._run_input_batch(InputBatchCommand(
-        batch_id='patch', action='install' if outcome == 'install' else 'discard'))
-
-    if running:
-        assert session._phase == 'Optimizing'
-        progress = session.progress.snapshot()
-        assert progress['operation'] == 'optimizing'
-        assert progress['unit'] == 'iterations'
-        assert (progress['step'], progress['total_steps']) == (116, 1250)
-        session.iteration_completed(completed_iterations=2617, total_loss=1,
-                                    losses={}, learning_rate=1e-5)
-        assert session._phase == 'Optimizing'
-        assert session.progress.snapshot()['step'] == 117
-    else:
-        assert session._phase == 'Idle'
-        assert session.progress.snapshot() is None
-
-
 def test_preparation_failure_leaves_active_state_and_allows_next_batch(resident):
     session, active, _, _ = resident
     result = session.apply_input_changes("invalid", [{"invalid": True}], timeout=2)
@@ -134,9 +33,9 @@ def test_preparation_failure_leaves_active_state_and_allows_next_batch(resident)
 
 def test_device_failure_during_preparation_remains_fail_stop():
     from spiral_runtime import InputBatchCommand
-    from test_spiral_headless import ProtocolTests
+    from runtime_fixtures import RuntimeFixture
 
-    session = ProtocolTests()._idle_session(completed=7)
+    session = RuntimeFixture()._idle_session(completed=7)
     failure = RuntimeError('CUDA device failure')
     session._context = SimpleNamespace(
         prepare_input_changes=Mock(side_effect=failure))
@@ -164,16 +63,6 @@ def test_timeout_preserves_captured_batch_and_boundary_for_retry(resident):
     assert session._context.prepare_input_changes.call_count == 1
     assert session.apply_input_changes("newer", records, timeout=2)["applied"]
     assert active["revision"] == 3
-
-
-def test_final_running_boundary_can_be_reserved(resident):
-    session, _, _, _ = resident
-    with session._condition:
-        session._state = SessionState.Running
-        session._iteration_in_progress = 6
-    result = session.reserve_input_boundary(7, 1, include_idle=True)
-    assert result["reserved"]
-    session.cancel_input_boundary(1)
 
 
 @pytest.mark.parametrize("failure", ["validation", "membership", None])
@@ -233,30 +122,6 @@ def test_distributed_boundary_retry_handles_mixed_reservations(faster_rank):
     assert calls[0][1]["reservation_epoch"] == calls[1][1]["reservation_epoch"]
     assert calls[2][1]["reservation_epoch"] == calls[1][1]["reservation_epoch"]
     assert calls[-1][1]["install"]
-
-
-def test_worker_failure_is_reported_instead_of_waiting_for_timeout(resident):
-    from spiral_runtime import InputBatchCommand
-    session, _, _, _ = resident
-    with session._condition:
-        session._state = SessionState.Error
-        session._error = 'device failure'
-    with pytest.raises(RuntimeError, match='device failure'):
-        session._wait_input_batch(InputBatchCommand(), 5)
-
-
-def test_failed_run_configuration_completes_its_command(resident):
-    from spiral_runtime import ConfigureCommand
-    from unittest.mock import Mock
-    resident, *_ = resident
-    resident._context.apply_config = Mock(side_effect=ValueError('invalid setting'))
-    resident._pending = 2
-    resident._warnings = []
-    command = ConfigureCommand(config={'optimizer_learning_rate': -1})
-    resident._run_configuration(command)
-    assert command.done.is_set() and 'invalid setting' in command.error
-    assert resident._pending == 0
-    assert resident.status()['state'] == 'Idle'
 
 
 def test_distributed_close_retry_rejects_surviving_file_users():

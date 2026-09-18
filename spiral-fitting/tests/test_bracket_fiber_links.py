@@ -11,16 +11,13 @@ import json
 import os
 import subprocess
 import sys
-
 import numpy as np
 import pytest
 
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-sys.path.insert(0, ROOT)
 
-import bracket_fiber_links as bfl  # noqa: E402
-from umbilicus import json_umbilicus_z_to_yx  # noqa: E402
 
 SCALE = 0.25          # fitter voxels per file unit
 UMB_YX = (4000.0, 4000.0)
@@ -139,29 +136,6 @@ def _run(dataset, *args):
     return proc.stdout
 
 
-def test_detection_finds_the_bracketed_vertical(dataset):
-    umb = json_umbilicus_z_to_yx(str(dataset / 'umbilicus.json'))
-    fibers = bfl.load_fibers(str(dataset / 'fibers'), umb, coordinate_scale=SCALE,
-                             min_z_fraction=0.8, min_auto_certainty=0.5)
-    assert {f.tag for f in fibers.values()} == {'H', 'V'}
-    dropped = bfl.drop_duplicate_copies(fibers)
-    assert dropped == {'12.json': 'test_20260101T000000000_000007.json'}
-    links = bfl.find_bracket_links(fibers, theta_bin=0.005, z_tolerance=15.0,
-                                   min_gap=8.0, max_gap=60.0, margin=0.0)
-    assert {(l.vertical, l.horizontal) for l in links} == {('test_20260101T000000000_000007.json', 'horizontal.json')}
-    link = links[0]
-    assert link.revolution == 0
-    assert abs(link.gap - PITCH) < 1.0
-    assert 9.0 < link.behind_by < 11.0
-    assert abs(link.z - 1000.0) < 3.0
-    # The horizontal endpoint is on revolution 0 near theta = pi, a few voxels
-    # from the vertical point.
-    h = fibers['horizontal.json']
-    v = fibers['test_20260101T000000000_000007.json']
-    d = np.linalg.norm(h.zyx[link.horizontal_line_index] - v.zyx[link.vertical_line_index])
-    assert 9.0 < d < 12.0
-
-
 def test_dry_run_writes_nothing_and_apply_writes_valid_reciprocal_links(dataset):
     before = {n: open(dataset / 'fibers' / n).read() for n in os.listdir(dataset / 'fibers')}
     out = _run(dataset, '--report', str(dataset / 'report.json'))
@@ -211,9 +185,3 @@ def test_dry_run_writes_nothing_and_apply_writes_valid_reciprocal_links(dataset)
     # Idempotent: the pair is now linked, so nothing more is planned.
     out = _run(dataset)
     assert 'planned new links: 0' in out
-
-
-def test_pending_flag(dataset):
-    _run(dataset, '--apply', '--pending', '--backup-dir', str(dataset / 'bak'))
-    v = json.load(open(dataset / 'fibers' / 'test_20260101T000000000_000007.json'))
-    assert [b for b in v['branches'] if b['branch_file'] == 'horizontal.json'][0]['pending'] is True

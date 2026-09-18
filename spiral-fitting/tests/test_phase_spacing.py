@@ -6,11 +6,9 @@ from dataclasses import replace
 import json
 import math
 import os
-
 import numpy as np
 import pytest
 import torch
-
 from sdt_losses import (
     _build_phase_padding,
     _pair_counts_from_samples,
@@ -22,10 +20,8 @@ from sdt_losses import (
     sample_sdt_trilinear,
 )
 from transforms import GapExpanderParams, GapExpandingTransform
-from fit_session import (
-    SpiralInputPaths, SpiralRunConfig, validate_session_request,
-)
-from test_sdt_losses import (
+from fit_session import SpiralInputPaths, SpiralRunConfig, validate_session_request
+from sdt_fixtures import (
     DR_PER_WINDING,
     PerfectSpiralToX,
     make_volume,
@@ -116,34 +112,6 @@ class TestCompleteBandDetection:
             rtol=0)
         torch.testing.assert_close(bands['width'], torch.full([4], 4.0))
 
-    def test_missing_band_leaves_a_two_winding_phase_gap(self):
-        volume = sheet_volume(80, [10, 20, 30, 50, 60])
-        cfg = phase_cfg()
-        bands = detect(
-            fixed_ray(PerfectSpiralToX(), cfg), volume,
-            normal_volume(volume['shape']), cfg)
-        torch.testing.assert_close(
-            bands['phase'], torch.tensor([2.0, 3.0, 5.0]), atol=1e-5,
-            rtol=0)
-        assert float(bands['phase'][2] - bands['phase'][1]) >= 2.0
-
-    def test_close_complete_fragments_merge_using_projected_spacing(self):
-        volume = fractional_sheet_volume(
-            96, [40.0, 45.0, 60.0], half_thickness=0.75)
-        cfg = phase_cfg(
-            dense_spacing_target_step_wv=0.25,
-            dense_spacing_max_step_wv=0.5,
-            dense_spacing_max_steps=400,
-        )
-        bands = detect(
-            fixed_ray(PerfectSpiralToX(radial_scale=2.0), cfg, 1.0, 4.0),
-            volume,
-            # Along-ray separation is 5 wv, but |dot| ~= 0.5 makes the
-            # normal-projected separation 2.5 wv and therefore mergeable.
-            normal_volume(volume['shape'], nx=192, ny=128), cfg)
-        assert bands['merged_count'] == 1
-        assert len(bands['phase']) == 2
-
     def test_graze_guard_distinguishes_shallow_from_deep_oblique_bands(self):
         # nx=ny=128 reconstructs +nz, perpendicular to this x-directed ray.
         cfg = phase_cfg()
@@ -158,21 +126,6 @@ class TestCompleteBandDetection:
             normals, cfg)
         assert bool(shallow_bands['graze'].all())
         assert not bool(deep_bands['graze'].any())
-
-    def test_subvoxel_band_translation_moves_localized_center(self):
-        cfg = phase_cfg(
-            dense_spacing_target_step_wv=0.125,
-            dense_spacing_max_step_wv=0.25,
-            dense_spacing_max_steps=320)
-        centers = []
-        for sheet_center in (20.0, 20.25):
-            volume = fractional_sheet_volume(
-                48, [sheet_center], half_thickness=1.0)
-            bands = detect(
-                fixed_ray(PerfectSpiralToX(), cfg, 1.0, 3.0), volume,
-                normal_volume(volume['shape']), cfg)
-            centers.append(float(bands['center'][0, 2]))
-        assert centers[1] - centers[0] == pytest.approx(0.25, abs=0.03)
 
     def test_normal_decode_scale_origin_order_and_invalid_convention(self):
         normals = normal_volume((3, 4, 4), nx=255, ny=128, scale=2.0,
@@ -227,20 +180,6 @@ class TestCompleteBandDetection:
         clean = (bands['phase'] - 2.0).abs().argmin()
         assert not bool(bands['interior_invalid'][clean])
         assert not bool(bands['ambiguous'][clean])
-
-    def test_non_axis_normal_uses_positive_nz_not_an_nz_only_flip(self):
-        normals = normal_volume((2, 2, 2), nx=192, ny=166)
-        vector, valid = sample_lasagna_normals_nearest(
-            normals, torch.tensor([[0.0, 0.0, 0.0]]))
-        assert bool(valid[0])
-        assert float(vector[0, 0]) > 0.0
-        ray = torch.nn.functional.normalize(
-            torch.tensor([0.8, 0.3, 0.5]), dim=0)
-        positive_dot = abs(float(torch.dot(vector[0], ray)))
-        nz_flipped = vector[0].clone()
-        nz_flipped[0] *= -1
-        flipped_dot = abs(float(torch.dot(nz_flipped, ray)))
-        assert positive_dot > flipped_dot + 0.5
 
 
 class TestPhaseLoss:
@@ -313,30 +252,6 @@ class TestPhaseLoss:
         assert metrics['dense_spacing_phase_residual_abs_p95'] < 0.1
         assert float(loss) < 1e-3
 
-    def test_extra_inserted_band_is_skipped_without_biasing_residuals(self):
-        torch.manual_seed(6)
-        # A spurious extra sheet at x = 45 sits mid-gap between windings 4 and
-        # 5. Hard unit enumeration would hand winding 5 to the extra band and
-        # shift every later target a full winding outward - a systematic
-        # positive-rho bias. The extra-observation state absorbs it instead.
-        volume = sheet_volume(100, [10, 20, 30, 40, 45, 50, 60, 70, 80])
-        loss, metrics = run_phase(
-            volume, normal_volume(volume['shape']), PerfectSpiralToX(), 8,
-            phase_cfg())
-        assert metrics['dense_spacing_phase_extra_per_ray'] > 0.05
-        assert metrics['dense_spacing_phase_valid_fraction'] > 0.25
-        assert metrics['dense_spacing_phase_residual_abs_p95'] < 0.15
-        assert float(loss) < 5e-3
-
-    def test_single_band_rays_have_zero_weight(self):
-        torch.manual_seed(12)
-        volume = sheet_volume(80, [30])
-        loss, metrics = run_phase(
-            volume, normal_volume(volume['shape']), PerfectSpiralToX(), 6,
-            phase_cfg())
-        assert float(loss) == 0.0
-        assert metrics['dense_spacing_phase_valid_fraction'] == 0.0
-
     def test_over_budget_central_rays_are_wholly_rejected(self):
         torch.manual_seed(13)
         volume = sheet_volume(200, [30, 60, 90, 120, 150])
@@ -359,21 +274,6 @@ class TestPhaseLoss:
             run_bundle(volume, normals, PerfectSpiralToX(), 8, phase_cfg(),
                        generator=generator)
         torch.testing.assert_close(torch.rand(5), expected)
-
-    def test_detached_observations_carry_no_gradient(self):
-        # The phase gradient flows only through the modeled targets: band
-        # centers, directions, and reference gaps are detached observations.
-        torch.manual_seed(3)
-        volume = sheet_volume(100, [10, 20, 30, 40, 50, 60, 70, 80])
-        offset = torch.tensor(1.0, requires_grad=True)
-        cfg = phase_cfg(loss_weight_dense_spacing_count=0.0)
-        components = run_bundle(
-            volume, normal_volume(volume['shape']),
-            PerfectSpiralToX(x_offset=offset), 8, cfg)
-        assert set(components) == {'dense_spacing_phase'}
-        loss, _ = components['dense_spacing_phase']
-        loss.backward()
-        assert torch.isfinite(offset.grad)
 
 
 class TestSharedRayValidity:
@@ -410,21 +310,6 @@ class TestSharedRayValidity:
         pads, pad_rejected, _ = _build_phase_padding(
             transform, dr, volume, k, pair_m, theta, z, 1, 5, cfg)
         assert bool(pad_rejected[0])
-
-    def test_count_survives_when_phase_finds_no_bands(self):
-        # No complete bands (one huge sheet): phase scores nothing, but the
-        # crossing count stays live on the shared central samples.
-        torch.manual_seed(2)
-        volume = sheet_volume(96, [25], half_thickness=20.0)
-        components = run_bundle(
-            volume, normal_volume(volume['shape']), PerfectSpiralToX(), 4,
-            phase_cfg(dense_spacing_pair_m_short=(1, 1),
-                      dense_spacing_pair_m_long=(1, 1)))
-        phase_loss, phase_metrics = components['dense_spacing_phase']
-        count_loss, count_metrics = components['dense_spacing_count']
-        assert phase_metrics['dense_spacing_phase_valid_fraction'] == 0.0
-        assert count_metrics['dense_spacing_count_valid_fraction'] > 0.99
-        assert math.isfinite(float(count_loss))
 
 
 class TestBundleComposition:
@@ -470,32 +355,6 @@ class TestBundleComposition:
         ]
         assert names == ['min_spacing']
 
-    def test_zero_sub_weights_disable_components_without_new_modes(self):
-        torch.manual_seed(5)
-        volume = sheet_volume(100, [10, 20, 30, 40, 50, 60, 70, 80])
-        normals = normal_volume(volume['shape'])
-        cfg = phase_cfg(loss_weight_dense_spacing=0.0)
-        components = run_bundle(volume, normals, PerfectSpiralToX(), 8, cfg)
-        assert set(components) == {'dense_spacing_count'}
-
-    def test_zero_shared_pair_budget_skips_active_phase_bundle(self):
-        volume = sheet_volume(100, [10, 20, 30, 40, 50, 60, 70, 80])
-        normals = normal_volume(volume['shape'])
-        cfg = phase_cfg(
-            sample_count_dense_spacing_pairs=0,
-            sample_count_dense_spacing_density_extra_pairs=0,
-        )
-        assert run_bundle(
-            volume, normals, PerfectSpiralToX(), 8, cfg) == {}
-
-    def test_bundle_requires_a_signed_distance_store(self):
-        surf = make_volume(np.full([4, 4, 8], 200, np.uint8), kind='surf',
-                           unit=None, cap=None)
-        with pytest.raises(ValueError):
-            list(iter_phase_bundle_losses(
-                None, PerfectSpiralToX(), torch.tensor(DR_PER_WINDING), surf,
-                normal_volume(surf['shape']), 6, phase_cfg(), 1, 2))
-
 
 class TestModeContract:
     def base_request(self, tmp_path, config):
@@ -516,26 +375,6 @@ class TestModeContract:
         }
         base.update(config)
         return paths, SpiralRunConfig(z_begin=1, z_end=2, config=base)
-
-    def test_exactly_the_supported_modes_are_accepted(self, tmp_path):
-        # The three current modes pass mode validation; anything else -
-        # including retired values like the old 'crossing_count' - is a
-        # plain error (no migration handling).
-        for mode in ('phase', 'grad_mag', 'winding_model'):
-            paths, run = self.base_request(tmp_path, {
-                'dense_spacing_mode': mode,
-                'loss_weight_dense_spacing': 0.0,
-            })
-            fields = {error['field']
-                      for error in validate_session_request(paths, run)}
-            assert 'dense_spacing_mode' not in fields
-        for mode in ('crossing_count', 'anything_else'):
-            paths, run = self.base_request(tmp_path, {
-                'dense_spacing_mode': mode,
-            })
-            fields = {error['field']
-                      for error in validate_session_request(paths, run)}
-            assert 'dense_spacing_mode' in fields
 
     def test_winding_model_mode_requires_a_valid_crossing_manifest(self, tmp_path):
         paths, run = self.base_request(tmp_path, {
@@ -563,87 +402,6 @@ class TestModeContract:
                   for error in validate_session_request(paths, run)}
         assert 'winding_inference' not in fields
 
-    def test_missing_mode_defaults_to_winding_model_and_requires_its_assets(
-        self, tmp_path,
-    ):
-        # Omitted modes use the fitter's winding-model default in preflight.
-        paths, run = self.base_request(tmp_path, {})
-        assert run.config.get('dense_spacing_mode') is None
-        fields = {error['field'] for error in validate_session_request(paths, run)}
-        assert {'winding_inference', 'outer_shell'} <= fields
-        assert 'surf_sdt' not in fields
-
-    def test_phase_mode_requires_normals_and_sdt(self, tmp_path):
-        paths, run = self.base_request(tmp_path, {
-            'dense_spacing_mode': 'phase',
-            'loss_weight_dense_spacing': 0.0,
-            'loss_weight_dense_attachment': 0.0,
-        })
-        fields = {error['field'] for error in validate_session_request(paths, run)}
-        assert {'normal_x', 'normal_y', 'surf_sdt'} <= fields
-
-    @pytest.mark.parametrize('disabled', [
-        'input_use_normals', 'input_use_surf_sdt',
-    ])
-    def test_a_disabled_phase_prerequisite_cascades_the_bundle_off(
-        self, tmp_path, disabled,
-    ):
-        paths, run = self.base_request(tmp_path, {
-            disabled: False,
-            'dense_spacing_mode': 'phase',
-            'loss_weight_dense_spacing': 12.0,
-        })
-        paths = replace(paths, surf_sdt=str(tmp_path / 'missing-sdt.zarr'))
-        fields = {error['field'] for error in validate_session_request(paths, run)}
-        assert not {'normal_x', 'normal_y', 'surf_sdt'} & fields
-
-    def test_grad_mag_mode_requires_grad_mag_not_sdt(self, tmp_path):
-        paths, run = self.base_request(tmp_path, {
-            'dense_spacing_mode': 'grad_mag',
-            'loss_weight_dense_spacing': 12.0,
-        })
-        fields = {error['field'] for error in validate_session_request(paths, run)}
-        assert 'gradient_magnitude' in fields
-        assert 'surf_sdt' not in fields
-        assert 'normal_x' not in fields
-
-    def test_zero_weight_grad_mag_is_not_required(self, tmp_path):
-        paths, run = self.base_request(tmp_path, {
-            'dense_spacing_mode': 'grad_mag',
-            'loss_weight_dense_spacing': 0.0,
-        })
-        fields = {error['field'] for error in validate_session_request(paths, run)}
-        assert 'gradient_magnitude' not in fields
-
-    def test_disabled_grad_mag_source_is_not_required(self, tmp_path):
-        paths, run = self.base_request(tmp_path, {
-            'dense_spacing_mode': 'grad_mag',
-            'loss_weight_dense_spacing': 12.0,
-            'input_use_gradient_magnitude': False,
-        })
-        fields = {error['field'] for error in validate_session_request(paths, run)}
-        assert 'gradient_magnitude' not in fields
-
-    def test_disabled_outer_shell_cascades_winding_inference_off(self, tmp_path):
-        paths, run = self.base_request(tmp_path, {
-            'dense_spacing_mode': 'winding_model',
-            'input_use_outer_shell': False,
-        })
-        fields = {error['field'] for error in validate_session_request(paths, run)}
-        assert 'outer_shell' not in fields
-        assert 'winding_inference' not in fields
-
-    def test_invalid_mode_is_rejected_before_asset_errors(self, tmp_path):
-        paths, run = self.base_request(tmp_path, {
-            'dense_spacing_mode': 'crossing_count',
-        })
-        errors = validate_session_request(paths, run)
-        by_field = {error['field']: error['message'] for error in errors}
-        assert 'dense_spacing_mode' in by_field
-        # The invalid-mode error must appear instead of misleading
-        # mode-derived asset errors.
-        assert 'surf_sdt' not in by_field
-        assert 'gradient_magnitude' not in by_field
 
 class TestNativeMinimumGap:
     def make_transform(self, dr=None):

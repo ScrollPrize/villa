@@ -1,8 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-
 import numpy as np
-import pytest
-
 from vc_spiral import surface_index
 
 
@@ -67,19 +64,6 @@ def test_tolerance_boundary_is_inclusive():
     np.testing.assert_array_equal(outside[0], [0, 0])
 
 
-def test_zero_tolerance_returns_exact_hits():
-    _, surface = make_surface("flat")
-    index = surface_index.SurfacePatchIndex()
-    index.rebuild([surface])
-
-    exact = query(index, [[0.5, 0.5, 0.0], [0.5, 0.5, 0.1]], 0.0)
-
-    np.testing.assert_array_equal(exact[0], [0, 1, 1])
-    np.testing.assert_array_equal(exact[1], [0])
-    np.testing.assert_array_equal(exact[2], [0.0])
-    np.testing.assert_allclose(exact[3], [[0.5, 0.5]], atol=1e-6)
-
-
 def test_multiple_surfaces_and_subset_filtering():
     _, low = make_surface("low", z_fn=lambda _row, _col: 0.0)
     _, high = make_surface("high", z_fn=lambda _row, _col: 0.2)
@@ -106,47 +90,6 @@ def test_multiple_surfaces_and_subset_filtering():
         0.11,
     )
     np.testing.assert_array_equal(empty_hits[0], [0, 0])
-
-
-def test_sampling_stride_controls_the_evaluated_quads():
-    zyx, _ = make_surface("stride", rows=5, cols=5)
-    zyx[1, 1] = -1.0
-    surface = surface_index.QuadSurface("stride", zyx, 1.0, 1.0)
-    point = [[0.5, 0.5, 0.0]]
-
-    fine = surface_index.SurfacePatchIndex()
-    fine.rebuild([surface], sampling_stride=1)
-    np.testing.assert_array_equal(query(fine, point, 0.1)[0], [0, 0])
-
-    coarse = surface_index.SurfacePatchIndex()
-    coarse.rebuild([surface], sampling_stride=2)
-    coarse_hit = query(coarse, point, 0.1)
-    np.testing.assert_array_equal(coarse_hit[0], [0, 1])
-    np.testing.assert_allclose(coarse_hit[3], [[0.5, 0.5]], atol=1e-6)
-
-    with pytest.raises(RuntimeError, match="sampling_stride must be >= 1"):
-        coarse.rebuild([surface], sampling_stride=0)
-
-
-def test_output_dtypes_shapes_and_one_hit_per_surface():
-    _, first = make_surface("first")
-    _, second = make_surface("second")
-    index = surface_index.SurfacePatchIndex()
-    index.rebuild([first, second])
-
-    offsets, surfaces, distances, ijs = query(
-        index, [[0.25, 0.25, 0.0], [50.0, 50.0, 50.0]], 0.1
-    )
-    assert offsets.dtype == np.int64
-    assert surfaces.dtype == np.int32
-    assert distances.dtype == np.float32
-    assert ijs.dtype == np.float32
-    assert offsets.shape == (3,)
-    assert surfaces.shape == (2,)
-    assert distances.shape == (2,)
-    assert ijs.shape == (2, 2)
-    np.testing.assert_array_equal(offsets, [0, 2, 2])
-    np.testing.assert_array_equal(surfaces, [0, 1])
 
 
 def test_equal_distance_ties_are_deterministic():

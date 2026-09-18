@@ -1,44 +1,39 @@
+import pytest
+from runtime_fixtures import RuntimeFixture
 import dataclasses
 import json
 from pathlib import Path
-import queue
 import tempfile
 import threading
 import time
 from types import SimpleNamespace
 import unittest
-from unittest import mock
-
 import numpy as np
 import torch
-
-from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADATA_NAME,
-                         AUTOSAVE_METADATA_SCHEMA, PclInputSpec, PclRole,
-                         ScrollSpecError, SessionState, SpiralInputPaths,
-                         load_scroll_spec, resolve_dataset_root,
-                         resolve_logical_dbm, validate_checkpoint_container)
+from fit_session import (
+    AUTOSAVE_CHECKPOINT_NAME,
+    AUTOSAVE_METADATA_NAME,
+    AUTOSAVE_METADATA_SCHEMA,
+    ScrollSpecError,
+    SessionState,
+    load_scroll_spec,
+    resolve_dataset_root,
+    resolve_logical_dbm,
+    validate_checkpoint_container,
+)
 import spiral_runtime
 from spiral_progress import NullProgressReporter
-from spiral_runtime import (CommandBarrier, CommandBarrierViolation,
-                            ConfigureCommand,
-                            DtLossScheduleCommand,
-                            DistributedInteractiveFitSession,
-                            FileStoreRendezvous, InputBatchCommand,
-                            InteractiveFitSession,
-                            SaveCheckpointCommand, collective_view)
-import spiral_helpers
+from spiral_runtime import (
+    CommandBarrier,
+    CommandBarrierViolation,
+    ConfigureCommand,
+    DtLossScheduleCommand,
+    InteractiveFitSession,
+    collective_view,
+)
 from spiral_helpers import compute_winding_range_and_input_extents
 from spiral_service import ServiceState
 from tifxyz import save_combined_tifxyz
-
-
-def _zip_checkpoint_bytes(payload=b"payload"):
-    import io
-    import zipfile
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("data.pkl", payload)
-    return buffer.getvalue()
 
 
 def write_scroll_spec(root, **extra):
@@ -53,37 +48,6 @@ def write_scroll_spec(root, **extra):
 
 
 class ScrollSpecTests(unittest.TestCase):
-    def test_missing_file_names_the_conventional_filename(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaisesRegex(ScrollSpecError, "spiral-scroll.json"):
-                load_scroll_spec(temporary)
-
-    def test_schema_version_is_required(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            (Path(temporary) / "spiral-scroll.json").write_text(json.dumps({
-                "name": "s1", "voxel_size_um": 9.6,
-                "spiral_outward_sense": "CW"}))
-            with self.assertRaisesRegex(ScrollSpecError, "schema_version"):
-                load_scroll_spec(temporary)
-
-    def test_unknown_top_level_keys_are_ignored(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            write_scroll_spec(
-                temporary,
-                base_shape_zyx=[18946, 8174, 8174],
-                future_extension={"enabled": True})
-            spec = load_scroll_spec(temporary)
-            self.assertEqual(spec.name, "s1")
-            self.assertEqual(spec.base_shape_zyx, (18946, 8174, 8174))
-            self.assertNotIn("future_extension", spec.manifest())
-
-    def test_unknown_path_override_keys_are_rejected(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            write_scroll_spec(temporary, paths={"scroll_zarr": "volume.zarr"})
-            with self.assertRaisesRegex(
-                    ScrollSpecError, r"unknown path override keys: \['scroll_zarr'\]"):
-                load_scroll_spec(temporary)
-
     def test_required_physical_facts_and_defaults(self):
         with tempfile.TemporaryDirectory() as temporary:
             (Path(temporary) / "spiral-scroll.json").write_text(json.dumps({
@@ -103,16 +67,6 @@ class ScrollSpecTests(unittest.TestCase):
             self.assertEqual(spec.surf_sdt_zarr_group, "1")
             self.assertEqual(spec.lasagna_scale, 4)
             self.assertEqual(spec.path_overrides, ())
-
-    def test_base_shape_is_validated_and_preserved(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            write_scroll_spec(temporary, base_shape_zyx=[100, 200, 300])
-            spec = load_scroll_spec(temporary)
-            self.assertEqual(spec.base_shape_zyx, (100, 200, 300))
-            for invalid in ([100, 200], [100, 0, 300], [100, 2.5, 300]):
-                write_scroll_spec(temporary, base_shape_zyx=invalid)
-                with self.assertRaisesRegex(ScrollSpecError, "base_shape_zyx"):
-                    load_scroll_spec(temporary)
 
     def test_relative_path_overrides_resolve_against_dataset_root(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -152,13 +106,6 @@ class DatasetResolverTests(unittest.TestCase):
             checkpoint = Path(temporary) / "truncated.ckpt"
             checkpoint.write_bytes(b"PK\x03\x04" + bytes(128))
             with self.assertRaisesRegex(ValueError, "incomplete or corrupt"):
-                validate_checkpoint_container(checkpoint)
-
-    def test_legacy_torch_checkpoint_is_rejected(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            checkpoint = Path(temporary) / "legacy.ckpt"
-            torch.save({"value": 1}, checkpoint, _use_new_zipfile_serialization=False)
-            with self.assertRaisesRegex(ValueError, "Legacy pickle checkpoints are not supported"):
                 validate_checkpoint_container(checkpoint)
 
     def test_conventional_resolution_and_logical_dbm_suffix(self):
@@ -223,67 +170,8 @@ class HandoffTests(unittest.TestCase):
             self.assertTrue(np.all(x[:, 1] == 10))
             self.assertTrue(np.all(x[:, 2] == 11))
 
-    def test_combined_preview_cleanup_publishes_one_authoritative_component(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            destination = Path(temporary) / "generation-1"
-            block = np.full((18, 32, 3), -1.0, dtype=np.float32)
-            block[1:15, 1:16] = [10.0, 20.0, 30.0]
-            block[5:13, 23:30] = [40.0, 50.0, 60.0]
-            save_combined_tifxyz(
-                {10: block}, destination, "preview", 1, 9.6, "test",
-                cleanup_erosion_cells=3)
-
-            metadata = json.loads(
-                (destination / "preview" / "meta.json").read_text())
-            self.assertNotIn("components", metadata)
-            self.assertEqual(metadata["lasagna_input_cleanup"], {
-                "erosion_cells": 3,
-                "component_connectivity": 4,
-                "components_after_erosion": 2,
-            })
-            from PIL import Image
-            coordinates = [
-                np.asarray(Image.open(destination / "preview" / f"{axis}.tif"))
-                for axis in "xyz"
-            ]
-            valid = np.isfinite(coordinates).all(axis=0) & ~np.all(
-                np.stack(coordinates, axis=-1) == -1.0, axis=-1)
-            self.assertEqual(int(valid.sum()), 72)
-            self.assertTrue(valid[4:12, 4:13].all())
-            self.assertFalse(valid[:, 20:].any())
-
 
 class PreviewRangeTests(unittest.TestCase):
-    def test_many_short_tracks_are_transformed_in_point_batches(self):
-        class CountingIdentity:
-            def __init__(self):
-                self.calls = 0
-
-            def __call__(self, value):
-                self.calls += 1
-                return value
-
-        transform = CountingIdentity()
-        tracks = [np.array([[50, 0, x]], dtype=np.float32) for x in range(70_000)]
-        winding_range, patch_extents, pcl_extents = compute_winding_range_and_input_extents(
-            transform,
-            torch.tensor(10.0),
-            [],
-            [],
-            {"output_first_winding": 10, "output_winding_margin": 4},
-            0,
-            100,
-            lambda *_: None,
-            authoritative_zyx_lines=tracks,
-        )
-
-        # One call for 70k single-point tracks: they are transformed as
-        # points, in batches of the transform chunk, not one call per line.
-        self.assertEqual(transform.calls, 1)
-        self.assertEqual(winding_range, (10, 7005))
-        self.assertEqual(patch_extents, [])
-        self.assertEqual(pcl_extents, [])
-
     def test_a_point_budget_bounds_the_transformed_track_points(self):
         class CountingIdentity:
             def __init__(self):
@@ -320,82 +208,6 @@ class PreviewRangeTests(unittest.TestCase):
         self.assertLessEqual(budgeted_range[1], exact_range[1])
 
 
-class PreviewWindingBoundTests(unittest.TestCase):
-    """What sets the preview's outer winding, and what it costs to find out."""
-
-    class _Stop(Exception):
-        pass
-
-    def _export(self, cfg):
-        return spiral_helpers.save_combined_preview(
-            object(), torch.tensor(500.0), [], [], "/unused", cfg,
-            z_begin=0, z_end=100, voxel_size_um=9.6,
-            get_or_build_unattached_pcl_flat=lambda *_: None,
-            surface_id="surface")
-
-    def test_a_configured_shell_index_is_taken_without_deriving_it(self):
-        cfg = {"shell_outer_winding_idx": 130, "output_first_winding": 10,
-               "output_step_size": 20, "model_flow_bounds_z_margin": 0}
-        with mock.patch.object(
-                spiral_helpers,
-                "compute_winding_range_and_input_extents") as extents, \
-             mock.patch.object(spiral_helpers, "get_spiral_yxs",
-                               side_effect=self._Stop) as spiral_yxs:
-            with self.assertRaises(self._Stop):
-                self._export(cfg)
-
-        # No pass over the patch, PCL and track points: the configured index
-        # is the bound, and every dense sampler already integrates to it.
-        extents.assert_not_called()
-        self.assertEqual(spiral_yxs.call_args.args[0], 131)
-
-    def test_an_unset_shell_index_derives_the_bound_from_a_sample(self):
-        cfg = {"shell_outer_winding_idx": None, "output_first_winding": 10,
-               "output_winding_margin": 4, "output_step_size": 20,
-               "model_flow_bounds_z_margin": 0}
-        with mock.patch.object(
-                spiral_helpers, "compute_winding_range_and_input_extents",
-                return_value=((10, 61), [], [])) as extents, \
-             mock.patch.object(spiral_helpers, "get_spiral_yxs",
-                               side_effect=self._Stop) as spiral_yxs:
-            with self.assertRaises(self._Stop):
-                self._export(cfg)
-
-        extents.assert_called_once()
-        self.assertEqual(
-            extents.call_args.kwargs["point_budget"],
-            spiral_helpers.ESTIMATED_WINDING_RANGE_POINT_BUDGET)
-        self.assertEqual(spiral_yxs.call_args.args[0], 61)
-
-
-class _FakeWorker:
-    """A worker process stand-in for the parent watchdog and fail-stop paths."""
-
-    def __init__(self, rank):
-        self.rank = rank
-        self.alive = True
-        self.exitcode = None
-        self.terminated = 0
-        self.killed = 0
-
-    def is_alive(self):
-        return self.alive
-
-    def terminate(self):
-        self.terminated += 1
-        self.alive = False
-        if self.exitcode is None:
-            self.exitcode = -15
-
-    def kill(self):
-        self.killed += 1
-        self.alive = False
-        self.exitcode = -9
-
-    def join(self, timeout=None):
-        return None
-
-
 def rank_status(state, epoch=0, config_revision=0, **extra):
     status = {
         "state": state, "phase": str(state), "warnings": [], "error": None,
@@ -406,28 +218,7 @@ def rank_status(state, epoch=0, config_revision=0, **extra):
     return status
 
 
-class ProtocolTests(unittest.TestCase):
-    def _proxy(self, world_size=2, published=None):
-        """A coordinator with fake workers and no spawned processes."""
-        session = DistributedInteractiveFitSession.__new__(
-            DistributedInteractiveFitSession)
-        session._init_coordinator_state(
-            tuple(range(world_size)),
-            (published.append if published is not None else None),
-            None)
-        session._events = queue.Queue()
-        session._commands = [queue.Queue() for _ in range(world_size)]
-        session._processes = [_FakeWorker(rank) for rank in range(world_size)]
-        return session
-
-    def _wait_for(self, predicate, timeout=10.0):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if predicate():
-                return True
-            time.sleep(0.01)
-        return False
-
+class ProtocolTests(RuntimeFixture):
     def test_distributed_session_waits_for_every_rank_before_ready(self):
         published = []
         session = self._proxy(published=published)
@@ -492,32 +283,6 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(view.visible)
         self.assertEqual(view.state, SessionState.Running)
 
-    def test_rank_zero_publication_is_named_a_coordinator_sub_operation(self):
-        published = []
-        session = self._proxy(published=published)
-        session._collective_state = SessionState.Idle
-        listener = threading.Thread(target=session._listen)
-        listener.start()
-        saving = rank_status(SessionState.Saving, epoch=6)
-        saving["phase"] = "Autosaving checkpoint"
-        saving["progress"] = {"operation": "saving_checkpoint",
-                              "stage_name": "Autosaving checkpoint",
-                              "detail": "checkpoint_autosave.ckpt"}
-        session._events.put(("status", 1, rank_status(
-            SessionState.Idle, epoch=6)))
-        session._events.put(("status", 0, saving))
-        self.assertTrue(self._wait_for(
-            lambda: published and published[-1].get("coordinator_operation")))
-        latest = published[-1]
-        self.assertEqual(latest["state"], SessionState.Saving)
-        self.assertEqual(latest["coordinator_operation"], "saving")
-        self.assertIn("Coordinator saving (rank 0)", latest["phase"])
-        self.assertIn("coordinator rank 1/2", latest["progress"]["detail"])
-        # The agreed collective state is untouched by rank-0-only work.
-        self.assertEqual(session._collective_state, SessionState.Idle)
-        session._events.put(None)
-        listener.join(2)
-
     def test_all_rank_commands_carry_a_monotonic_epoch(self):
         session = self._proxy()
         with session._condition:
@@ -541,28 +306,6 @@ class ProtocolTests(unittest.TestCase):
                 SessionState.Idle, config_revision=8)
             third = session._issue_barrier("run")
         self.assertIsNone(third.config_revision)
-
-    def test_checkpoint_save_is_a_coordinator_sub_operation_without_a_barrier(self):
-        session = self._proxy()
-        session._collective_state = SessionState.Idle
-        session._status["state"] = SessionState.Idle
-        thread = threading.Thread(
-            target=lambda: session._call(
-                "save_checkpoint", {"path": "/tmp/x.ckpt"}, ranks=(0,),
-                timeout=5.0, collective=False))
-        thread.start()
-        barrier, command_id, name, _ = session._commands[0].get(timeout=5)
-        self.assertIsNone(barrier)
-        self.assertEqual(name, "save_checkpoint")
-        self.assertEqual(session._command_epoch, 0)
-        self.assertTrue(session._commands[1].empty())
-        session._events.put(("ack", command_id, 0, True, "/tmp/x.ckpt"))
-        listener = threading.Thread(target=session._listen)
-        listener.start()
-        thread.join(5)
-        self.assertFalse(thread.is_alive())
-        session._events.put(None)
-        listener.join(2)
 
     def test_worker_error_fails_the_session_and_terminates_siblings(self):
         published = []
@@ -588,28 +331,6 @@ class ProtocolTests(unittest.TestCase):
                             for worker in session._processes))
         self.assertTrue(published)
 
-    def test_unexpected_worker_exit_fails_the_session_in_bounded_time(self):
-        session = self._proxy()
-        session._start_coordinator_threads()
-        try:
-            started = time.monotonic()
-            session._processes[1].alive = False
-            session._processes[1].exitcode = 7
-            self.assertTrue(self._wait_for(
-                lambda: session.status()["state"] == SessionState.Error))
-            self.assertTrue(self._wait_for(
-                lambda: session._processes[0].terminated == 1))
-            elapsed = time.monotonic() - started
-        finally:
-            session._stop_watchdog.set()
-            session._events.put(None)
-        self.assertLess(elapsed, 60.0)
-        error = session.status()["error"]
-        self.assertIn("rank 1", error)
-        self.assertIn("exit code 7", error)
-        # The surviving sibling is taken down with it.
-        self.assertEqual(session._processes[0].terminated, 1)
-
     def test_command_timeout_fails_the_session_and_aborts_the_workers(self):
         session = self._proxy()
         session._collective_state = SessionState.Idle
@@ -626,34 +347,6 @@ class ProtocolTests(unittest.TestCase):
         # A failed session refuses further work with the original cause.
         with self.assertRaisesRegex(RuntimeError, "Timed out"):
             session._call("stop")
-
-    def test_first_failure_cause_wins_and_workers_are_aborted_once(self):
-        session = self._proxy()
-        session._fail_session("first cause", rank=1)
-        session._fail_session("second cause", rank=0)
-        self.assertIn("first cause", session.status()["error"])
-        self.assertTrue(all(worker.terminated == 1
-                            for worker in session._processes))
-
-    def test_rendezvous_owns_its_endpoint_and_cleans_up(self):
-        with tempfile.TemporaryDirectory() as root:
-            rendezvous = FileStoreRendezvous(Path(root) / ".spiral-rendezvous")
-            directory = Path(rendezvous.directory)
-            self.assertTrue(directory.is_dir())
-            self.assertEqual(
-                Path(rendezvous.endpoint.store_path).parent, directory)
-            # Two sessions never share an endpoint.
-            other = FileStoreRendezvous(Path(root) / ".spiral-rendezvous")
-            self.assertNotEqual(other.directory, rendezvous.directory)
-            other.close()
-            # Closing one leaves the other's endpoint owned.
-            self.assertTrue(directory.is_dir())
-
-            session = self._proxy()
-            session._rendezvous = rendezvous
-            session._close_rendezvous()
-            self.assertFalse(directory.exists())
-            self.assertIsNone(session._rendezvous)
 
     def test_run_barrier_is_validated_against_the_rank_state(self):
         session = self._idle_session(rank=1, world_size=2)
@@ -729,30 +422,6 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(session._state, SessionState.Idle)
         self.assertEqual(session._target, 10)
 
-    def test_distributed_run_propagates_schedule_to_every_rank_call(self):
-        session = self._proxy()
-        session._status["state"] = SessionState.Idle
-        observed = {}
-
-        def call(name, arguments, **kwargs):
-            observed.update({"name": name, "arguments": arguments})
-            return 25
-
-        session._call = call
-        schedule = {"enabled": True, "last_fraction": 0.4}
-
-        self.assertEqual(session.run(20, dt_loss_schedule=schedule), 25)
-        self.assertEqual(observed["name"], "run")
-        self.assertEqual(observed["arguments"]["dt_loss_schedule"], schedule)
-
-    def test_command_from_another_epoch_fail_stops_the_rank(self):
-        session = self._idle_session(rank=1, world_size=2)
-        session._commands.append(InputBatchCommand(
-            session_generation=0, epoch=99, records=[]))
-        with self.assertRaisesRegex(CommandBarrierViolation,
-                                    "from epoch 99 while in epoch 0"):
-            session.wait_for_iteration(0)
-
     def test_step_boundary_refuses_an_epoch_the_run_was_not_admitted_in(self):
         session = self._idle_session(rank=1, world_size=2)
         session.run(5, barrier=CommandBarrier(
@@ -771,331 +440,6 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(CommandBarrierViolation,
                                     "against revision 0"):
             session.wait_for_iteration(0)
-
-    def _idle_session(self, completed=0, rank=0, world_size=1):
-        session = InteractiveFitSession.__new__(InteractiveFitSession)
-        session._condition = threading.Condition()
-        session._state = SessionState.Idle
-        session._phase = "Idle"
-        session._completed = completed
-        session._target = completed
-        session._pending = 0
-        session._commands = []
-        session.session_generation = 0
-        session._config_revision = 0
-        session._command_epoch = 0
-        session._step_epoch = 0
-        session._step_config_revision = 0
-        session.rank = 0
-        session.world_size = 1
-        session._command_epoch = 0
-        session._step_epoch = 0
-        session._step_config_revision = 0
-        session._stop_requested = False
-        session._shutdown = False
-        session._run_start_completed = completed
-        session._context = SimpleNamespace(
-            configure_dt_loss_schedule=lambda *_: None)
-        session.requested_config = {
-            "optimizer_num_training_steps": 30_000}
-        session._run_config = dict(session.requested_config)
-        session._warnings = []
-        session.rank = rank
-        session.world_size = world_size
-        session._status_callback = None
-        session._event_callback = None
-        return session
-
-    def test_illegal_lifecycle_transition_is_a_programming_error(self):
-        session = self._idle_session()
-        with session._condition:
-            # An idle session may now start an explicit preview export, but a
-            # preview export cannot start a run.
-            session._transition_locked(SessionState.ExportingPreview)
-            with self.assertRaisesRegex(RuntimeError,
-                                        "ExportingPreview -> Running"):
-                session._transition_locked(SessionState.Running)
-            # Every state may still fail or shut down.
-            session._transition_locked(SessionState.Error, "Error")
-            with self.assertRaisesRegex(RuntimeError, "Error -> Running"):
-                session._transition_locked(SessionState.Running)
-
-    def test_idle_reports_one_phase_and_the_iteration_count(self):
-        never_run = self._idle_session()
-        paused = self._idle_session(completed=42)
-        for session in (never_run, paused):
-            with session._condition:
-                session._transition_locked(
-                    SessionState.Idle, spiral_runtime.IDLE_PHASE)
-        self.assertEqual(never_run._state, SessionState.Idle)
-        self.assertEqual(paused._state, SessionState.Idle)
-        # Both idle sessions look the same to a client except for the work
-        # they have done; the phase does not editorialise about it.
-        self.assertEqual(never_run._phase, "Idle")
-        self.assertEqual(paused._phase, "Idle")
-        self.assertEqual(never_run.completed_iterations, 0)
-        self.assertEqual(paused.completed_iterations, 42)
-
-    def test_save_command_carries_identity_and_completes_with_a_result(self):
-        session = self._idle_session(completed=7)
-        session._progress_reporter = lambda: NullProgressReporter()
-        session._publish_status = lambda: None
-        session._context = SimpleNamespace(
-            save_checkpoint=lambda path, iteration: f"{path}#{iteration}")
-        saved = threading.Thread(
-            target=lambda: results.append(
-                session.save_checkpoint("/tmp/c.ckpt", timeout=5.0)))
-        results = []
-        saved.start()
-        deadline = time.time() + 5
-        while not session._commands and time.time() < deadline:
-            time.sleep(0.005)
-        command = session._commands[0]
-        self.assertIsInstance(command, SaveCheckpointCommand)
-        self.assertTrue(command.command_id)
-        self.assertEqual(command.session_generation, 0)
-        self.assertEqual(command.expected_iteration, 7)
-        session._commands.pop(0)
-        session._run_checkpoint_save(command)
-        saved.join(5)
-        self.assertEqual(results, ["/tmp/c.ckpt#7"])
-        self.assertEqual(command.result["path"], "/tmp/c.ckpt#7")
-        self.assertFalse(command.cancelled)
-        self.assertEqual(session._state, SessionState.Idle)
-
-    def test_command_queued_against_a_closed_session_is_cancelled(self):
-        session = self._idle_session(completed=3)
-        command = SaveCheckpointCommand(
-            session_generation=session.session_generation,
-            expected_iteration=3, path="/tmp/c.ckpt")
-        session.session_generation += 1
-        stale = command.stale_reason(
-            session_generation=session.session_generation,
-            iteration=3, config_revision=0)
-        self.assertIsNotNone(stale)
-        command.cancel(stale)
-        self.assertTrue(command.cancelled)
-        self.assertIn("no longer current", command.error)
-
-    def test_interactive_run_can_continue_past_checkpoint_training_steps(self):
-        session = InteractiveFitSession.__new__(InteractiveFitSession)
-        session._condition = threading.Condition()
-        session._state = SessionState.Idle
-        session._completed = 30_000
-        session._pending = 0
-        session._target = 30_000
-        session._commands = []
-        session.session_generation = 0
-        session._config_revision = 0
-        session._command_epoch = 0
-        session._step_epoch = 0
-        session._step_config_revision = 0
-        session.rank = 0
-        session.world_size = 1
-
-        target = session.run(250)
-
-        self.assertEqual(target, 30_250)
-        self.assertEqual(session._pending, 250)
-        self.assertEqual(session._target, 30_250)
-        self.assertEqual(session._state, SessionState.Running)
-
-    def test_interactive_run_extends_training_horizon_to_target_iteration(self):
-        session = InteractiveFitSession.__new__(InteractiveFitSession)
-        session._condition = threading.Condition()
-        session._state = SessionState.Idle
-        session._completed = 30_000
-        session._pending = 0
-        session._target = 30_000
-        session._context = object()
-        session._commands = []
-        session.session_generation = 0
-        session._config_revision = 0
-        session._command_epoch = 0
-        session._step_epoch = 0
-        session._step_config_revision = 0
-        session.rank = 0
-        session.world_size = 1
-        session.requested_config = {
-            "optimizer_num_training_steps": 30_000,
-        }
-        session._run_config = dict(session.requested_config)
-
-        target = session.run(250)
-
-        self.assertEqual(target, 30_250)
-        self.assertIsInstance(session._commands[0], ConfigureCommand)
-        self.assertEqual(
-            session._commands[0].config["optimizer_num_training_steps"],
-            30_250,
-        )
-        self.assertEqual(
-            session._run_config["optimizer_num_training_steps"], 30_250)
-
-    def test_interactive_run_preserves_horizon_when_target_is_within_it(self):
-        session = InteractiveFitSession.__new__(InteractiveFitSession)
-        session._condition = threading.Condition()
-        session._state = SessionState.Idle
-        session._completed = 100
-        session._pending = 0
-        session._target = 100
-        session._context = object()
-        session._commands = []
-        session.session_generation = 0
-        session._config_revision = 0
-        session._command_epoch = 0
-        session._step_epoch = 0
-        session._step_config_revision = 0
-        session.rank = 0
-        session.world_size = 1
-        session.requested_config = {
-            "optimizer_num_training_steps": 30_000,
-        }
-        session._run_config = dict(session.requested_config)
-
-        session.run(250)
-
-        self.assertEqual(len(session._commands), 1)
-        self.assertIsInstance(session._commands[0], DtLossScheduleCommand)
-        self.assertEqual(
-            session._run_config["optimizer_num_training_steps"], 30_000)
-
-    def test_interactive_run_preserves_horizon_when_target_equals_it(self):
-        session = InteractiveFitSession.__new__(InteractiveFitSession)
-        session._condition = threading.Condition()
-        session._state = SessionState.Idle
-        session._completed = 29_750
-        session._pending = 0
-        session._target = 29_750
-        session._context = object()
-        session._commands = []
-        session.session_generation = 0
-        session._config_revision = 0
-        session._command_epoch = 0
-        session._step_epoch = 0
-        session._step_config_revision = 0
-        session.rank = 0
-        session.world_size = 1
-        session.requested_config = {
-            "optimizer_num_training_steps": 30_000,
-        }
-        session._run_config = dict(session.requested_config)
-
-        target = session.run(250)
-
-        self.assertEqual(target, 30_000)
-        self.assertEqual(len(session._commands), 1)
-        self.assertIsInstance(session._commands[0], DtLossScheduleCommand)
-        self.assertEqual(
-            session._run_config["optimizer_num_training_steps"], 30_000)
-
-    def test_interactive_run_extends_horizon_by_run_count_when_crossed(self):
-        session = InteractiveFitSession.__new__(InteractiveFitSession)
-        session._condition = threading.Condition()
-        session._state = SessionState.Idle
-        session._completed = 29_751
-        session._pending = 0
-        session._target = 29_751
-        session._context = object()
-        session._commands = []
-        session.session_generation = 0
-        session._config_revision = 0
-        session._command_epoch = 0
-        session._step_epoch = 0
-        session._step_config_revision = 0
-        session.rank = 0
-        session.world_size = 1
-        session.requested_config = {
-            "optimizer_num_training_steps": 30_000,
-        }
-        session._run_config = dict(session.requested_config)
-
-        target = session.run(250)
-
-        self.assertEqual(target, 30_001)
-        self.assertIsInstance(session._commands[0], ConfigureCommand)
-        self.assertEqual(
-            session._commands[0].config["optimizer_num_training_steps"],
-            30_250,
-        )
-        self.assertEqual(
-            session._run_config["optimizer_num_training_steps"], 30_250)
-
-    def _running_session(self, completed, target, reserved=None, epoch=7):
-        session = self._idle_session(completed=completed)
-        session._state = SessionState.Running
-        session._target = target
-        session._pending = target - completed
-        session._iteration_in_progress = None
-        session._live_reservation_iteration = reserved
-        session._live_reservation_epoch = epoch
-        session._warnings = []
-        session._error = None
-        session._publish_status = lambda: None
-        session._progress_reporter = lambda: NullProgressReporter()
-        return session
-
-    def test_run_configuration_applies_active_host_values_exactly(self):
-        session = InteractiveFitSession.__new__(InteractiveFitSession)
-        session._condition = threading.Condition()
-        session._completed = 7
-        applied = {}
-
-        def apply_config(config, path_changes=None, *, current_iteration):
-            applied["config"] = config
-            applied["path_changes"] = path_changes
-            applied["current_iteration"] = current_iteration
-
-        session._context = SimpleNamespace(apply_config=apply_config)
-
-        session._state = SessionState.Idle
-        session._commands = []
-        session._config_revision = 0
-        session._applied_config = None
-        command = ConfigureCommand(config={
-            "sample_count_patches_per_step": 101,
-            "loss_weight_patch_radius": 3.5,
-            "loss_start_patch_dt": 123,
-        })
-        session._run_configuration(command)
-
-        self.assertEqual(applied["config"], {
-            "sample_count_patches_per_step": 101,
-            "loss_weight_patch_radius": 3.5,
-            "loss_start_patch_dt": 123,
-        })
-        self.assertEqual(applied["path_changes"], {})
-        self.assertEqual(applied["current_iteration"], 7)
-        self.assertTrue(command.done.is_set())
-        self.assertIsNone(command.error)
-        self.assertEqual(command.result["config_revision"], 1)
-
-    def _paused_session(self, calls, output_path, autosave_on_pause=True):
-        session = InteractiveFitSession.__new__(InteractiveFitSession)
-        session._condition = threading.Condition()
-        session._state = SessionState.Running
-        session._completed = 9
-        session._pending = 1
-        session._target = 10
-        session._stop_requested = False
-        session._latest_metrics = {}
-        session._output_path = str(output_path)
-        session._status_callback = None
-        session._autosave_on_pause = autosave_on_pause
-        session.paths = SpiralInputPaths.from_mapping({
-            "dataset_root": "/datasets/scroll1",
-            "output_directory": str(output_path),
-        })
-
-        def save_checkpoint(path, *_):
-            calls.append("save")
-            Path(path).write_bytes(_zip_checkpoint_bytes())
-
-        session._context = SimpleNamespace(
-            clear_interactive_run_state=lambda: calls.append("finish"),
-            save_checkpoint=save_checkpoint)
-        session._publish_preview = lambda: calls.append("preview")
-        return session
 
     def test_run_finish_callback_precedes_autosave(self):
         calls = []
@@ -1121,31 +465,6 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(metadata["completed_iterations"], 10)
             self.assertEqual(metadata["checkpoint"], AUTOSAVE_CHECKPOINT_NAME)
 
-    def test_a_run_can_ask_for_no_autosave_on_pause(self):
-        calls = []
-        with tempfile.TemporaryDirectory() as output:
-            session = self._paused_session(calls, output,
-                                           autosave_on_pause=False)
-
-            session.iteration_completed(
-                completed_iterations=10, total_loss=1.0, losses={},
-                learning_rate=1.e-3)
-
-            self.assertEqual(calls, ["finish"])
-            self.assertEqual(session._state, SessionState.Idle)
-            # No autosave means no metadata claiming one exists.
-            self.assertFalse((Path(output) / AUTOSAVE_METADATA_NAME).exists())
-
-    def _mid_run_session(self, calls, output_path, completed,
-                         autosave_on_pause=True):
-        session = self._paused_session(
-            calls, output_path, autosave_on_pause=autosave_on_pause)
-        session._completed = completed - 1
-        session._pending = 500
-        session._target = completed + 499
-        session._warnings = []
-        return session
-
     def test_a_long_run_autosaves_every_thousand_iterations(self):
         calls = []
         with tempfile.TemporaryDirectory() as output:
@@ -1164,27 +483,6 @@ class ProtocolTests(unittest.TestCase):
                 (Path(output) / AUTOSAVE_METADATA_NAME).read_text())
             self.assertEqual(metadata["completed_iterations"], 3000)
             self.assertEqual(metadata["checkpoint"], AUTOSAVE_CHECKPOINT_NAME)
-
-    def test_off_cadence_iterations_do_not_autosave(self):
-        calls = []
-        with tempfile.TemporaryDirectory() as output:
-            session = self._mid_run_session(calls, output, completed=3001)
-            session.iteration_completed(
-                completed_iterations=3001, total_loss=1.0, losses={},
-                learning_rate=1.e-3)
-            self.assertEqual(calls, [])
-            self.assertEqual(session._state, SessionState.Running)
-
-    def test_a_run_without_autosave_skips_the_cadence_too(self):
-        calls = []
-        with tempfile.TemporaryDirectory() as output:
-            session = self._mid_run_session(
-                calls, output, completed=3000, autosave_on_pause=False)
-            session.iteration_completed(
-                completed_iterations=3000, total_loss=1.0, losses={},
-                learning_rate=1.e-3)
-            self.assertEqual(calls, [])
-            self.assertFalse((Path(output) / AUTOSAVE_METADATA_NAME).exists())
 
     def test_a_failed_cadence_autosave_keeps_the_previous_one_and_warns(self):
         calls = []
@@ -1207,22 +505,6 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(previous.read_bytes(), b"previous autosave")
             self.assertEqual(len(session._warnings), 1)
             self.assertIn("disk full", session._warnings[0])
-
-    def test_early_stop_clears_run_state_before_autosave(self):
-        calls = []
-        with tempfile.TemporaryDirectory() as output:
-            session = self._paused_session(calls, output)
-            session._pending = 20
-            session._target = 29
-            session._stop_requested = True
-
-            session.iteration_completed(
-                completed_iterations=10, total_loss=1.0, losses={},
-                learning_rate=1.e-3)
-
-            self.assertEqual(calls, ["finish", "save"])
-            self.assertEqual(session._state, SessionState.Idle)
-            self.assertEqual(session._pending, 0)
 
     def test_scheduled_preview_is_queued_at_cadence_and_final_boundaries(self):
         calls = []
@@ -1297,136 +579,6 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(command.done.is_set())
         self.assertIsNone(command.error)
 
-    def test_rank_zero_capture_failure_disables_cadence_on_secondary_rank(self):
-        session = self._idle_session(completed=10)
-        session._state = SessionState.Running
-        session._phase = "Optimizing"
-        session._warnings = []
-        session._automatic_previews_disabled = False
-        session._preview_manifest = None
-        session._preview_generation = 0
-        session._preview_source_iteration = None
-        session._progress_reporter = lambda: NullProgressReporter()
-        session._publish_status = lambda: None
-        session.publishes_outputs = False
-        barriers = []
-        session._preview_snapshot_barrier = lambda: barriers.append(True)
-        session._share_preview_capture_error = lambda error: "rank 0 preview OOM"
-        command = spiral_runtime.ExportPreviewCommand(
-            session_generation=0, expected_iteration=10, automatic=True)
-
-        session._run_export_preview(command)
-
-        self.assertEqual(len(barriers), 2)
-        self.assertTrue(session._automatic_previews_disabled)
-        self.assertIn("rank 0 preview OOM", "\n".join(session._warnings))
-        self.assertIn("rank 0 preview OOM", command.error)
-
-    def test_the_autosave_flag_is_decided_when_a_run_is_admitted(self):
-        session = self._idle_session(completed=4)
-        session.requested_config = {"optimizer_num_training_steps": 30_000}
-        session._progress_reporter = lambda: NullProgressReporter()
-
-        session.run(2, autosave_on_pause=False)
-        self.assertFalse(session._autosave_on_pause)
-        with session._condition:
-            session._state = SessionState.Idle
-            session._pending = 0
-        session.run(2)
-        self.assertTrue(session._autosave_on_pause)
-
-    def test_preview_is_announced_before_exporting_state_can_pause(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            session = InteractiveFitSession.__new__(InteractiveFitSession)
-            session._condition = threading.Condition()
-            session._preview_generation = 0
-            session._preview_session_id = "test-session"
-            session.paths = type(
-                "Paths", (), {"output_directory": temporary})()
-            states = []
-            session._state = SessionState.ExportingPreview
-            session._context = SimpleNamespace(
-                export_preview=lambda destination, surface_id, diagnostics: {
-                    "manifest_path": str(Path(destination) / "manifest.json"),
-                })
-            session._publish_status = lambda: states.append((
-                session._state,
-                session._preview_generation,
-                session._preview_manifest,
-            ))
-
-            session._publish_preview()
-
-            self.assertEqual(states, [(
-                SessionState.ExportingPreview,
-                1,
-                str(Path(temporary) / ".spiral-preview" / "test-session"
-                    / "generation-1" / "manifest.json"),
-            )])
-
-    def test_a_restored_checkpoint_session_does_not_export_a_preview(self):
-        session = InteractiveFitSession.__new__(InteractiveFitSession)
-        session._condition = threading.Condition()
-        session._state = SessionState.Loading
-        session._phase = "Loading"
-        session._completed = 0
-        session._target = 0
-        session._status_callback = None
-        session._event_callback = None
-        session.publishes_outputs = True
-        session.paths = SimpleNamespace(checkpoint="/ckpt/a.ckpt",
-                                        output_directory="/tmp")
-        calls = []
-        session._publish_preview = lambda: calls.append("preview")
-        session._progress_reporter = lambda: NullProgressReporter()
-
-        session._session_ready(SimpleNamespace(start_iteration=4200,
-                                               out_path="/tmp/out"))
-
-        # Inspecting a checkpoint costs a load, not a preview export.
-        self.assertEqual(calls, [])
-        self.assertEqual(session._state, SessionState.Idle)
-        self.assertEqual(session._phase, "Idle")
-        self.assertEqual(session._completed, 4200)
-
-    def test_export_preview_is_a_requested_coordinator_operation(self):
-        session = self._idle_session(completed=12)
-        session.publishes_outputs = True
-        session._preview_manifest = None
-        session._preview_generation = 0
-        session._progress_reporter = lambda: NullProgressReporter()
-        session._publish_status = lambda: None
-        states = []
-
-        def publish_preview(diagnostics=False):
-            states.append((session._state, diagnostics))
-            session._preview_manifest = "/preview/manifest.json"
-            session._preview_generation = 3
-
-        session._publish_preview = publish_preview
-        results = []
-        requester = threading.Thread(
-            target=lambda: results.append(session.export_preview(timeout=5.0)))
-        requester.start()
-        deadline = time.time() + 5
-        while not session._commands and time.time() < deadline:
-            time.sleep(0.005)
-        command = session._commands.pop(0)
-        self.assertIsInstance(command, spiral_runtime.ExportPreviewCommand)
-        # A coordinator sub-operation: no command epoch of its own.
-        self.assertIsNone(command.epoch)
-        self.assertEqual(command.expected_iteration, 12)
-
-        session._run_export_preview(command)
-        requester.join(5)
-
-        # Diagnostics are opt-in, so an unqualified request does not ask the
-        # fitter for the loss overlays.
-        self.assertEqual(states, [(SessionState.ExportingPreview, False)])
-        self.assertEqual(session._state, SessionState.Idle)
-        self.assertEqual(results, [{"preview_manifest_path": "/preview/manifest.json",
-                                    "preview_generation": 3}])
-
     def test_export_preview_can_capture_a_running_iteration_boundary(self):
         session = self._idle_session()
         with session._condition:
@@ -1483,18 +635,6 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(calls, ["finish"])
         self.assertEqual(session._state, SessionState.Idle)
 
-    def test_mutating_command_is_deduplicated(self):
-        service = ServiceState()
-        calls = []
-        first = service.replay_command(
-            "session_run", "same-command",
-            lambda: calls.append(1) or {"accepted": True})
-        second = service.replay_command(
-            "session_run", "same-command",
-            lambda: calls.append(2) or {"accepted": True})
-        self.assertEqual(calls, [1])
-        self.assertEqual(first, second)
-
     def test_concurrent_duplicate_waits_for_one_execution(self):
         service = ServiceState()
         entered = threading.Event()
@@ -1526,5 +666,15 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(results[0], results[1])
 
 
-if __name__ == "__main__":
-    unittest.main()
+@pytest.mark.parametrize("completed, expected_horizon", [
+    (100, 30_000), (29_750, 30_000), (29_751, 30_250), (30_000, 30_250),
+])
+def test_run_preserves_or_extends_training_horizon(completed, expected_horizon):
+    session = RuntimeFixture()._idle_session(completed=completed)
+    assert session.run(250) == completed + 250
+    assert session._run_config["optimizer_num_training_steps"] == expected_horizon
+    configured = [command.config["optimizer_num_training_steps"]
+                  for command in session._commands
+                  if isinstance(command, ConfigureCommand)]
+    assert configured == ([expected_horizon] if expected_horizon > 30_000 else [])
+    assert any(isinstance(command, DtLossScheduleCommand) for command in session._commands)

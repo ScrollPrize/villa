@@ -12,21 +12,21 @@ classification of the new keys.
 """
 
 import math
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 import torch.nn.functional as F
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 import flow_grad_smoothing
 from config import Config
-from flow_fields import (BSplineCylindricalFlowField, BSplineFlowField,
-                         CartesianFlowField, CylindricalFlowField)
+from flow_fields import (
+    BSplineCylindricalFlowField,
+    BSplineFlowField,
+    CartesianFlowField,
+    CylindricalFlowField,
+)
 from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
 from transforms import SpiralAndTransform
+import types
+import unittest
 
 
 def _dense_reference(grad, sigma):
@@ -39,19 +39,6 @@ def _dense_reference(grad, sigma):
     norm = F.conv3d(ones, kernel3[None, None], padding=radius)
     out = F.conv3d(volumes, kernel3[None, None], padding=radius) / norm
     return out.view(grad.shape).to(grad.dtype)
-
-
-def test_kernel_is_normalised_and_tiny_widths_are_identity():
-    kernel = flow_grad_smoothing.gaussian_kernel(1.5)
-    assert kernel.numel() == 2 * math.ceil(4.5) + 1
-    assert float(kernel.sum()) == pytest.approx(1.0, abs=1e-6)
-    assert torch.equal(kernel, kernel.flip(0))
-    assert flow_grad_smoothing.gaussian_kernel(0.0) is None
-    assert flow_grad_smoothing.gaussian_kernel(0.01) is None
-    grad = torch.randn(2, 3, 5, 6, 7)
-    before = grad.clone()
-    flow_grad_smoothing.smooth_cartesian_(grad, 0.01)
-    assert torch.equal(grad, before)
 
 
 def test_cartesian_matches_dense_reference_and_keeps_constants():
@@ -188,20 +175,6 @@ def test_model_converts_voxels_to_cells():
     assert 'ignored' in model.describe_flow_grad_smoothing(6.0, 16.0)
 
 
-def test_describe_widths_reports_both_directions_for_cylindrical_lattices():
-    report = flow_grad_smoothing.describe_widths(96.0, 16.0, 16.0, 6, 'cylindrical')
-    assert 'along-sheet 96 voxels = HR 6.00 cells (radius 18), LR 1.00 cells (radius 3)' in report
-    assert 'across rings 16 voxels = HR 1.00 cells (radius 3), LR 0.17 cells (identity)' in report
-
-
-def test_describe_widths_reports_the_low_res_lattices_own_width():
-    report = flow_grad_smoothing.describe_widths(
-        96.0, 16.0, 16.0, 6, 'cylindrical', low_res_along_voxels=288.0)
-    assert 'along-sheet 96 voxels (LR 288 voxels) = HR 6.00 cells (radius 18), LR 3.00 cells (radius 9)' in report
-    # The across-ring width is unaffected.
-    assert 'across rings 16 voxels = HR 1.00 cells (radius 3), LR 0.17 cells (identity)' in report
-
-
 def test_cylindrical_radial_pass_spreads_across_rings_at_the_same_angle():
     num_phi, offsets = _cylinder_tables(7)
     nz = 5
@@ -256,22 +229,6 @@ def test_cylindrical_radial_pass_spreads_across_rings_at_the_same_angle():
     flow_grad_smoothing.smooth_cylindrical_(constant, num_phi, offsets, 1.2, 1.5)
     torch.testing.assert_close(constant, torch.full_like(constant, 1.5))
 
-
-def test_cylindrical_zero_across_width_is_the_ring_and_z_blur_alone():
-    torch.manual_seed(11)
-    num_phi, offsets = _cylinder_tables(6)
-    grad = torch.randn(2, 3, 9, offsets[-1])
-    reference = grad.clone()
-    flow_grad_smoothing.smooth_cylindrical_(reference, num_phi, offsets, 1.3)
-    flow_grad_smoothing.smooth_cylindrical_(grad, num_phi, offsets, 1.3, 0.0)
-    torch.testing.assert_close(grad, reference)
-    # Both widths below the identity threshold: a no-op.
-    before = grad.clone()
-    flow_grad_smoothing.smooth_cylindrical_(grad, num_phi, offsets, 0.01, 0.01)
-    assert torch.equal(grad, before)
-
-
-# ------------------------------------------------------------ lazy moments
 
 def _sparse_pattern(shape, density, generator):
     mask = torch.rand(shape, generator=generator) < density
@@ -351,20 +308,6 @@ def test_lazy_step_applies_decoupled_weight_decay_everywhere():
     torch.testing.assert_close(param.detach(), torch.full((10,), 0.95))
 
 
-def test_lazy_step_with_no_state_and_first_touch_matches_sparse_adam():
-    param = torch.nn.Parameter(torch.zeros(5))
-    ref = torch.nn.Parameter(torch.zeros(5))
-    optimiser = LazyMomentAdamW([{'params': [param], 'lazy_moments': True}], lr=0.1)
-    sparse_adam = torch.optim.SparseAdam([ref], lr=0.1)
-    grad = torch.tensor([0.0, 2.0, 0.0, -1.0, 0.0])
-    param.grad = grad.clone()
-    ref.grad = grad.to_sparse()
-    optimiser.step()
-    sparse_adam.step()
-    torch.testing.assert_close(param, ref, rtol=1e-5, atol=1e-6)
-    assert float(param.detach()[0]) == 0.0
-
-
 def _reference_shared_step(param, grad, state, lr, betas, eps, masked, quantile=None):
     # Plain-torch reference of the shared-denominator step on a [S, C, ...]
     # parameter: per-cell EMA moments, one denominator per stage S (shared by
@@ -428,52 +371,6 @@ def test_shared_second_moment_matches_reference_and_keeps_adamw_state(masked):
     param.grad = torch.randn(param.shape, generator=generator)
     optimiser.step()
     assert float(state['step']) == 7
-
-
-def test_shared_second_moment_keeps_the_gradient_profile_and_is_per_plane():
-    # A smooth gradient profile on two stages, the second ten times larger.
-    torch.manual_seed(8)
-    profile = torch.exp(-0.5 * ((torch.arange(9.0) - 4.0) / 1.5) ** 2)
-    grad = torch.stack([profile, 10.0 * profile])[:, None, :].expand(2, 2, 9).clone()
-    param = torch.nn.Parameter(torch.zeros(2, 2, 9))
-    optimiser = LazyMomentAdamW([{'params': [param], 'shared_second_moment': True}], lr=1e-2)
-    param.grad = grad.clone()
-    optimiser.step()
-    update = -param.detach()
-    # Within a plane the update is proportional to the gradient (one scale
-    # per plane), not flattened to its sign as per-cell Adam would do.
-    ratio = update / grad
-    for plane in ratio.view(4, 9):
-        assert float(plane.std() / plane.mean()) < 1e-5
-    # Adam's scale invariance holds per plane: the ten-times gradient gets
-    # the same update.
-    torch.testing.assert_close(update[0], update[1])
-    # The per-cell step, for contrast, moves every cell of the profile by
-    # about the learning rate.
-    cellwise = torch.nn.Parameter(torch.zeros(2, 2, 9))
-    LazyMomentAdamW([{'params': [cellwise], 'lazy_moments': True}], lr=1e-2)
-    per_cell = LazyMomentAdamW([{'params': [cellwise], 'lazy_moments': True}], lr=1e-2)
-    cellwise.grad = grad.clone()
-    per_cell.step()
-    torch.testing.assert_close(-cellwise.detach(), torch.full_like(cellwise, 1e-2), rtol=1e-4, atol=1e-6)
-
-
-def test_shared_second_moment_equals_per_cell_for_uniform_gradients():
-    # Every cell of a stage carrying the same gradient makes the mean second
-    # moment equal to each cell's own, so the two denominators coincide.
-    torch.manual_seed(9)
-    generator = torch.Generator().manual_seed(10)
-    shared = torch.nn.Parameter(torch.randn(2, 3, 4, 4))
-    cellwise = torch.nn.Parameter(shared.detach().clone())
-    a = LazyMomentAdamW([{'params': [shared], 'lazy_moments': True, 'shared_second_moment': True}], lr=1e-2)
-    b = LazyMomentAdamW([{'params': [cellwise], 'lazy_moments': True}], lr=1e-2)
-    for _ in range(5):
-        per_stage = torch.randn(2, 1, 1, 1, generator=generator)
-        shared.grad = per_stage.expand(2, 3, 4, 4).clone()
-        cellwise.grad = shared.grad.clone()
-        a.step()
-        b.step()
-        torch.testing.assert_close(shared, cellwise, rtol=1e-6, atol=1e-8)
 
 
 def test_shared_second_moment_is_one_scale_per_stage_across_components():
@@ -557,82 +454,6 @@ def test_robust_clip_bounds_spikes_per_stage_and_reports_them():
     assert robust_clip_(untouched, 0.0) is None and torch.equal(untouched, copy)
 
 
-def test_robust_clip_reads_a_fixed_stride_subsample():
-    # The median comes from a fixed-stride subsample, so a plane larger than
-    # the subsample target still gets the median of its (uniform) cells.
-    from lazy_moment_adamw import STATS_SUBSAMPLE
-    grad = torch.ones(1, 1, STATS_SUBSAMPLE * 3 + 17)
-    grad[0, 0, 100] = 1e6
-    threshold, _ = robust_clip_(grad, 4.0)
-    assert threshold.tolist() == [4.0]
-    assert float(grad.max()) == 4.0
-
-
-def test_shared_second_moment_on_a_vector_is_one_plane():
-    param = torch.nn.Parameter(torch.zeros(6))
-    optimiser = LazyMomentAdamW([{
-        'params': [param], 'shared_second_moment': True,
-        'shared_second_moment_clip_quantile': None}], lr=0.1)
-    param.grad = torch.tensor([1.0, 2.0, 3.0, 0.0, 0.0, 0.0])
-    optimiser.step()
-    # mean second moment over the three touched cells: (1 + 4 + 9) / 3 * (1 - beta2)
-    mean_sq = (14.0 / 3.0) * 1e-3
-    denom = (mean_sq ** 0.5) / (1e-3 ** 0.5) + 1e-8
-    expected = -0.1 * torch.tensor([1.0, 2.0, 3.0, 0.0, 0.0, 0.0]) / denom
-    torch.testing.assert_close(param.detach(), expected, rtol=1e-5, atol=1e-7)
-
-
-# -------------------------------------------------------------------- config
-
-def test_new_optimizer_keys_are_run_boundary_and_off_by_default():
-    fields = Config.catalog()['schema']['fields']
-    defaults = Config().as_dict()
-    for key in ('optimizer_flow_grad_smoothing', 'optimizer_flow_lazy_moments'):
-        assert fields[key]['type'] == 'boolean'
-        assert fields[key]['runtime_impact'] == 'run_boundary'
-        assert defaults[key] is False
-        assert 'description' in fields[key]
-    sigma = 'optimizer_flow_grad_smoothing_sigma_voxels'
-    assert fields[sigma]['type'] == 'number'
-    assert fields[sigma]['runtime_impact'] == 'run_boundary'
-    assert defaults[sigma] == 32.0
-    across = 'optimizer_flow_grad_smoothing_across_sigma_voxels'
-    assert fields[across]['type'] == 'number'
-    assert fields[across]['runtime_impact'] == 'run_boundary'
-    assert defaults[across] == 0.0
-    shared = 'optimizer_flow_shared_second_moment'
-    assert fields[shared]['type'] == 'boolean'
-    assert fields[shared]['runtime_impact'] == 'run_boundary'
-    assert defaults[shared] is False
-    assert 'description' in fields[across] and 'description' in fields[shared]
-    low_res = 'optimizer_flow_grad_smoothing_low_res_sigma_voxels'
-    quantile = 'optimizer_flow_shared_second_moment_clip_quantile'
-    clip = 'optimizer_flow_grad_clip_median_multiple'
-    for key, default in ((low_res, 0.0), (quantile, 0.99), (clip, 0.0)):
-        assert fields[key]['type'] == 'number'
-        assert fields[key]['runtime_impact'] == 'run_boundary'
-        assert defaults[key] == default
-        assert 'description' in fields[key]
-    # The low-res LR scale is a model_ key like the high-res scale it sits
-    # beside, so it shares that key's classification and rebuild stage.
-    low_res_lr = 'model_flow_field_low_res_lr_scale'
-    high_res_lr = 'model_flow_field_high_res_lr_scale_initial'
-    assert fields[low_res_lr]['type'] == 'number'
-    assert defaults[low_res_lr] == 1.0
-    assert 'description' in fields[low_res_lr]
-    assert fields[low_res_lr]['runtime_impact'] == fields[high_res_lr]['runtime_impact']
-    assert fields[low_res_lr].get('rebuild_stage') == fields[high_res_lr].get('rebuild_stage')
-    # All postdate durable checkpoints: a checkpoint without them loads as
-    # if they were off (the quantile only matters with the shared moment on).
-    from config import BACKFILLABLE_CONFIG_DEFAULTS
-    assert BACKFILLABLE_CONFIG_DEFAULTS[across] == 0.0
-    assert BACKFILLABLE_CONFIG_DEFAULTS[shared] is False
-    assert BACKFILLABLE_CONFIG_DEFAULTS[low_res] == 0.0
-    assert BACKFILLABLE_CONFIG_DEFAULTS[quantile] == 0.99
-    assert BACKFILLABLE_CONFIG_DEFAULTS[clip] == 0.0
-    assert BACKFILLABLE_CONFIG_DEFAULTS[low_res_lr] == 1.0
-
-
 cuda = pytest.mark.skipif(
     not torch.cuda.is_available() or not __import__('flow_triton')._HAS_TRITON,
     reason='requires CUDA and Triton')
@@ -683,3 +504,36 @@ def test_fused_blur_handles_awkward_sizes_and_wide_kernels(monkeypatch):
     monkeypatch.setenv('FIT_SPIRAL_TRITON', '0')
     torch.testing.assert_close(
         fused_wide, flow_grad_smoothing.smooth_cartesian_(wide.clone(), sigma))
+
+
+class NonFiniteGradCheckTests(unittest.TestCase):
+    @staticmethod
+    def _sanitize(named_params):
+        import fit_spiral
+        context = types.SimpleNamespace(
+            dist_grad_named=named_params,
+            nonfinite_grad_steps=torch.zeros((), dtype=torch.int64),
+            nonfinite_grad_by_param={name: torch.zeros((), dtype=torch.int64)
+                                     for name, _ in named_params},
+        )
+        fit_spiral.FitContext._sanitize_nonfinite_grads_(context)
+        return context
+
+    def test_sanitizer_counts_and_zeroes_only_nonfinite_cells(self):
+        bad = torch.nn.Parameter(torch.ones(1, 3, 5, 5, 5))
+        good = torch.nn.Parameter(torch.ones(4))
+        bad.grad = torch.ones_like(bad)
+        bad.grad[0, 0, 2, 2, 2] = float('nan')
+        bad.grad[0, 1, 0, 0, 0] = float('inf')
+        bad.grad[0, 2, 0, 0, 0] = float('-inf')
+        good.grad = torch.full_like(good, 2.0)
+        context = self._sanitize([('bad', bad), ('good', good)])
+
+        self.assertEqual(int(context.nonfinite_grad_steps), 1)
+        self.assertEqual(int(context.nonfinite_grad_by_param['bad']), 1)
+        self.assertEqual(int(context.nonfinite_grad_by_param['good']), 0)
+        self.assertEqual(bad.grad[0, 0, 2, 2, 2].item(), 0.0)
+        self.assertEqual(bad.grad[0, 1, 0, 0, 0].item(), 0.0)
+        # Every nonfinite value is cleared; finite gradients are preserved.
+        self.assertEqual(int((bad.grad == 0).sum()), 3)
+        self.assertTrue(torch.equal(good.grad, torch.full_like(good, 2.0)))

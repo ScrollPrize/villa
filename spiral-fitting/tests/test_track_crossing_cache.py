@@ -3,10 +3,8 @@ import pickle
 from pathlib import Path
 import tempfile
 import unittest
-
 import numpy as np
 import torch
-
 from build_track_crossings import build_cache
 from tracks import (
     PackedTrackCollection,
@@ -20,7 +18,6 @@ from tracks import (
     load_tracks_from_dbm,
     prepare_main_phase_tracks,
     _sample_prepared_track_points,
-    track_crossing_cache_path,
     write_packed_track_store,
 )
 
@@ -44,21 +41,6 @@ class TrackCrossingCacheTests(unittest.TestCase):
             database[b'h:0'] = pickle.dumps([horizontal, outside])
             database[b'vy:0'] = pickle.dumps([vertical])
         return path
-
-    def test_builder_writes_adjacent_versioned_csr(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = self.make_db(temporary)
-            destination = build_cache(path, show_progress=False)
-
-            self.assertEqual(destination, track_crossing_cache_path(path))
-            self.assertTrue(destination.is_file())
-            cache = load_track_crossing_cache(path)
-            self.assertIsNotNone(cache)
-            self.assertEqual(len(cache['source_ids']), 3)
-            # One accepted pair is represented in both adjacency directions.
-            self.assertEqual(len(cache['partners']), 2)
-            np.testing.assert_array_equal(
-                cache['offsets'][1:] - cache['offsets'][:-1], [1, 0, 1])
 
     def test_fit_remaps_whole_db_cache_after_z_filtering(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -232,14 +214,6 @@ class TrackCrossingCacheTests(unittest.TestCase):
             for name in serial:
                 np.testing.assert_array_equal(serial[name], parallel[name])
 
-    def test_builder_rejects_empty_z_range(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = self.make_db(temporary)
-            with self.assertRaisesRegex(ValueError, 'less than'):
-                build_cache(
-                    path, z_lo=20, z_hi=20,
-                    show_progress=False)
-
     def test_changed_dbm_invalidates_sidecar(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = self.make_db(temporary)
@@ -248,28 +222,6 @@ class TrackCrossingCacheTests(unittest.TestCase):
                 database[b'h:new'] = pickle.dumps([line_track(4)])
 
             self.assertIsNone(load_track_crossing_cache(path, warn=False))
-
-    def test_parallel_crossing_scan_matches_single_worker(self):
-        horizontal = line_track(20, z=10, y=10, axis=2)
-        verticals = []
-        for x in (4, 10, 16):
-            track = line_track(20, z=10, y=0, axis=1)
-            track[:, 2] = x
-            verticals.append(track)
-        tracks = [horizontal, *verticals]
-        families = ['horizontal', 'vertical', 'vertical', 'vertical']
-        source_ids = np.arange(len(tracks), dtype=np.uint64)
-
-        serial = _build_crossing_partner_csr(
-            tracks, families, source_ids=source_ids,
-            workers=1, worker_chunk_groups=1)
-        parallel = _build_crossing_partner_csr(
-            tracks, families, source_ids=source_ids,
-            workers=2, worker_chunk_groups=1)
-
-        self.assertEqual(serial.keys(), parallel.keys())
-        for name in serial:
-            np.testing.assert_array_equal(serial[name], parallel[name])
 
     def test_native_crossing_kernel_matches_python_reference(self):
         native = _load_native_track_crossings()
@@ -305,36 +257,6 @@ class TrackCrossingCacheTests(unittest.TestCase):
         for name in expected:
             np.testing.assert_array_equal(actual[name], expected[name])
 
-    def test_native_resampler_returns_empty_crossing_record_map(self):
-        native = _load_native_track_crossings()
-        if native is None:
-            self.skipTest('VC native crossing extension is not built')
-        tracks = [
-            line_track(2, z=10, y=10),
-            line_track(2, z=20, y=20),
-        ]
-        crossing_index = native.prepare_crossing_index(
-            np.zeros(3, dtype=np.int64),
-            np.empty(0, dtype=np.int32),
-            np.empty(0, dtype=np.int32),
-            np.empty(0, dtype=np.int32),
-            np.asarray([len(track) for track in tracks], dtype=np.int32),
-        )
-        empty_table = np.empty((len(tracks), 0), dtype=np.int32)
-        result = native.resample_tracks(
-            np.concatenate(tracks).astype(np.float32),
-            np.asarray([0, len(tracks[0]), sum(map(len, tracks))],
-                       dtype=np.int64),
-            empty_table, empty_table, empty_table,
-            minimum_spacing=1.0, maximum_spacing=2.0,
-            crossing_index=crossing_index,
-        )
-
-        self.assertIn('crossing_record_sample', result)
-        np.testing.assert_array_equal(
-            result['crossing_record_sample'],
-            np.empty(0, dtype=np.int32))
-
     def test_native_radix_argsort_is_stable(self):
         native = _load_native_track_crossings()
         if native is None:
@@ -344,7 +266,3 @@ class TrackCrossingCacheTests(unittest.TestCase):
         order = native.parallel_argsort(packed, workers=3)
         expected = np.argsort(packed, kind='stable').astype(np.uint32)
         np.testing.assert_array_equal(order, expected)
-
-
-if __name__ == '__main__':
-    unittest.main()

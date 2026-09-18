@@ -57,3 +57,7 @@ build-backend = "scikit_build_core.build"
 cmake.source-dir = "cpp"
 cmake.version = ">=3.22"
 wheel.packages = ["vc_spiral"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

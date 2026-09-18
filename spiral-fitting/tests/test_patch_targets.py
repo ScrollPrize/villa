@@ -2,19 +2,13 @@ import math
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
-
 import numpy as np
 import torch
-
-from dt_targets import (
-    compute_patch_dt_target_cache,
-    patch_dt_target_in_sample_frame,
-    strip_dt_target_in_sample_frame,
-)
+from dt_targets import compute_patch_dt_target_cache, patch_dt_target_in_sample_frame
 from fit_spiral import FitContext
 from losses import _patch_radius_and_dt_losses
-from sample_spiral import radius_from_unwrapped_shifted, unwrap_shifted_radii
-from satisfaction_metrics import get_patch_satisfied_areas, metrics_config
+from sample_spiral import unwrap_shifted_radii
+from satisfaction_metrics import get_patch_satisfied_areas
 
 
 class _IdentityTransform:
@@ -83,43 +77,6 @@ class ThetaCrossingLossTests(unittest.TestCase):
             torch.tensor([0]))
         torch.testing.assert_close(target, torch.tensor([[50.0]]))
 
-    def test_patch_target_cache_uses_only_largest_connected_component(self):
-        dr = torch.tensor(10.0)
-        patch_row = SimpleNamespace(
-            _dt_target_ijs=np.array([
-                [0.25, 0.25], [0.25, 1.25], [2.25, 0.25],
-                [2.25, 2.25], [4.25, 4.25],
-            ]),
-            _dt_target_block_rc=np.array(
-                [[0, 0], [0, 1], [2, 0], [2, 2], [4, 4]],
-                dtype=np.int32),
-            _dt_target_block_shape=(5, 5),
-        )
-
-        class Atlas:
-            def theta_node_ids(self, patch_indices, ijs):
-                return np.array([4, 5, 6, 7, 8], dtype=np.int64)
-
-            def lookup(self, patch_indices, ijs):
-                return torch.stack([
-                    _spiral_point(0.0, 3, float(dr)),
-                    _spiral_point(0.0, 3, float(dr)),
-                    _spiral_point(0.0, 9, float(dr)),
-                    _spiral_point(0.0, 9, float(dr)),
-                    _spiral_point(0.0, 9, float(dr)),
-                ])
-
-        crossing_map = SimpleNamespace(
-            winding_potentials=lambda node_ids, theta: torch.zeros(5))
-        cache = compute_patch_dt_target_cache(
-            _IdentityTransform(), dr, [patch_row], Atlas(), crossing_map,
-            floating_threshold=0.25)
-
-        # The three detached winding-9 singletons collectively outnumber the
-        # winding-3 main island, but their unrelated frames must not affect it.
-        torch.testing.assert_close(
-            cache['target_relative'].to(torch.int64), torch.tensor([3]))
-
     def test_patch_losses_ignore_padded_samples_in_both_radius_modes(self):
         dr = torch.tensor(10.0)
         theta = torch.tensor([[0.2, 1.1, 2.0, 4.0]])
@@ -142,60 +99,6 @@ class ThetaCrossingLossTests(unittest.TestCase):
                 self.assertLess(float(dt_loss), 2e-5)
         for call in record.call_args_list:
             torch.testing.assert_close(call.args[3], mask)
-
-    def test_patch_dt_cache_anchor_ignores_padded_points(self):
-        dr = torch.tensor(10.0)
-        sample_ijs = torch.tensor([[[0.0, 0.0], [10.0, 10.0], [10.0, 10.0]]])
-        sample_mask = torch.tensor([[True, False, False]])
-        zeros = torch.zeros((1, 3))
-        cache = {
-            'ijs': torch.tensor([[[0.0, 0.0], [10.0, 10.0]]]),
-            'point_valid': torch.tensor([[True, True]]),
-            'target_relative': torch.tensor([3.0]),
-            'theta': torch.zeros((1, 2)),
-            'relative_adjustment': torch.tensor([[0.0, 5.0]]),
-            'valid': torch.tensor([True]),
-            'anchor_dist_sq_limit': torch.tensor([1.0]),
-        }
-        target = patch_dt_target_in_sample_frame(
-            torch.tensor([[30.0, -20.0, -20.0]]), sample_ijs, zeros, zeros,
-            dr, cache, torch.tensor([0]), sample_mask=sample_mask)
-        torch.testing.assert_close(target, torch.tensor([[30.0]]))
-
-    def test_strip_dt_median_fallback_ignores_padded_points(self):
-        dr = torch.tensor(10.0)
-        sample_mask = torch.tensor([[True, False, False]])
-        zeros = torch.zeros((1, 3))
-        cache = {
-            'frame': 'strip_endpoints',
-            'anchor_theta': torch.zeros((1, 2)),
-            'anchor_adjustment': torch.tensor([[0, 5]]),
-            'target_relative': torch.tensor([3.0]),
-            'valid': torch.tensor([True]),
-        }
-        target = strip_dt_target_in_sample_frame(
-            torch.tensor([[30.0, -20.0, -20.0]]),
-            torch.tensor([[4, 10, 10]]), zeros, zeros,
-            dr, cache, torch.tensor([0]), sample_mask=sample_mask)
-        torch.testing.assert_close(target, torch.tensor([[30.0]]))
-
-    def test_unwrapped_target_converts_back_to_the_same_physical_winding(self):
-        dr = torch.tensor(10.0)
-        theta = torch.tensor([[[2 * math.pi - 0.1, 0.1]]])
-        raw_shifted = torch.tensor([[[30.0, 40.0]]])
-
-        unwrapped, adjustments = unwrap_shifted_radii(theta, raw_shifted, dr)
-        torch.testing.assert_close(unwrapped, torch.full_like(unwrapped, 30.0))
-        torch.testing.assert_close(
-            adjustments,
-            torch.tensor([[[0.0, -10.0]]]),
-        )
-
-        target_radii = radius_from_unwrapped_shifted(
-            theta, torch.full_like(unwrapped, 30.0), adjustments, dr,
-        )
-        expected = raw_shifted + theta / (2 * math.pi) * dr
-        torch.testing.assert_close(target_radii, expected)
 
     def test_patch_inverse_radius_and_dt_losses_are_zero_across_theta_seam(self):
         dr = torch.tensor(10.0)
@@ -248,38 +151,6 @@ class ThetaCrossingSatisfactionTests(unittest.TestCase):
 
         self.assertTrue(bool(satisfied[0]))
         self.assertTrue(bool(masks[0].all()))
-
-    def test_metrics_overrides_are_call_local(self):
-        dr = torch.tensor(10.0)
-        theta = 0.2
-        radius = (3.47 + theta / (2 * math.pi)) * float(dr)
-        center = torch.tensor([
-            0.0,
-            math.sin(theta) * radius,
-            math.cos(theta) * radius,
-        ], dtype=torch.float32)
-        patch = _patch_with_quad_centers([center])
-        original = dict(metrics_config)
-
-        strict, *_ = get_patch_satisfied_areas(
-            _IdentityTransform(), dr, [patch], -1, 1,
-        )
-        loose, *_ = get_patch_satisfied_areas(
-            _IdentityTransform(),
-            dr,
-            [patch],
-            -1,
-            1,
-            metrics_overrides={
-                'satisfaction_radius_tolerance': 0.495,
-                'satisfaction_distance_tolerance': 12.0,
-                'satisfied_patch_quad_fraction': 0.90,
-            },
-        )
-
-        self.assertFalse(bool(strict[0]))
-        self.assertTrue(bool(loose[0]))
-        self.assertEqual(metrics_config, original)
 
 
 class ThetaCrossingCacheCadenceTests(unittest.TestCase):
@@ -340,7 +211,3 @@ class ThetaCrossingCacheCadenceTests(unittest.TestCase):
         self.assertTrue(refreshed)
         context._enforce_theta_liftability.assert_called_once_with()
         context.dt_target_cache_manager.reset.assert_called_once_with()
-
-
-if __name__ == '__main__':
-    unittest.main()

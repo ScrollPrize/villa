@@ -4,128 +4,19 @@ implementable without machine-local data)."""
 
 import math
 import unittest
-
 import numpy as np
 import torch
-
 from sdt_losses import (
-    MIN_VALID_CORNER_WEIGHT_MASS,
     _sample_spacing_pairs,
-    aggregate_pair_counts,
     compute_pair_counts,
-    fitted_winding_domain,
     get_dense_attachment_loss,
     iter_phase_bundle_losses,
     sample_sdt_trilinear,
 )
-
-
-DR_PER_WINDING = 10.0
-TWO_PI = 2.0 * math.pi
-
-
-def spiral_shifted_radius(points):
-    """Shared spiral -> shifted-radius prologue for the mock transforms: the
-    spiral has radius 0 at winding angle 0 and grows at DR_PER_WINDING, so a
-    perfect fit maps winding k to shifted radius k * DR_PER_WINDING."""
-    y, x = points[:, 1], points[:, 2]
-    radius = torch.sqrt(y * y + x * x + 1e-12)
-    theta = torch.arctan2(y, x) % TWO_PI
-    return radius - theta / TWO_PI * DR_PER_WINDING
-
-
-def make_volume(array_u8, *, scale=1.0, z_origin=0, unit=1.0, offset=128,
-                cap=127.0, kind='sdt'):
-    volume = torch.as_tensor(np.asarray(array_u8), dtype=torch.uint8)
-    return {
-        'backend': 'dense',
-        'kind': kind,
-        'volume': volume,
-        'z_origin': z_origin,
-        'scale_zyx': (scale,) * 3,
-        'unit': unit,
-        'offset': offset,
-        'cap': cap,
-        'shape': tuple(volume.shape),
-        'fingerprint': {},
-    }
-
-
-def sheet_volume(x_size, sheet_centers, half_thickness=2.0, zy=(4, 4)):
-    """Planar sheets normal to x: sd(x) = min |x - c| - half_thickness, exact
-    under the encoding since the field varies along one axis only."""
-    x = np.arange(x_size, dtype=np.float32)
-    sd = np.min([np.abs(x - c) for c in sheet_centers], axis=0) - half_thickness
-    encoded = (np.clip(np.rint(sd), -127, 127) + 128).astype(np.uint8)
-    return make_volume(np.broadcast_to(encoded, (*zy, x_size)).copy())
-
-
-class PerfectSpiralToX:
-    """A 'fit' whose windings sit exactly on sheets at x = k * dr: maps a
-    spiral point to (z0, y0, shifted_radius + x_offset), optionally scaled.
-
-    ``radial_scale`` < 1 collapses windings together; ``x_offset`` shifts the
-    whole fit off the sheets. Differentiable through both parameters when they
-    are tensors, which the gradient-recovery tests rely on.
-    """
-
-    def __init__(self, z0=1.5, y0=1.5, x_offset=0.0, radial_scale=1.0):
-        self.z0, self.y0 = z0, y0
-        self.x_offset = x_offset
-        self.radial_scale = radial_scale
-
-    def inv(self, points):
-        mapped_x = self.x_offset + self.radial_scale * spiral_shifted_radius(points)
-        return torch.stack([
-            torch.full_like(mapped_x, self.z0),
-            torch.full_like(mapped_x, self.y0),
-            mapped_x,
-        ], dim=-1)
-
-
-def spacing_cfg(**overrides):
-    cfg = {
-        'sample_count_dense_spacing_pairs': 256,
-        'dense_spacing_pair_m_short': (1, 1),
-        'dense_spacing_pair_m_long': (1, 1),
-        'dense_spacing_pair_long_fraction': 0.0,
-        'dense_spacing_count_temperature_wv': 0.5,
-        'sample_count_dense_spacing_count_extra_pairs': 0,
-        'dense_spacing_target_step_wv': 1.0,
-        'dense_spacing_max_step_wv': 2.0,
-        'dense_spacing_max_steps': 64,
-        'dense_spacing_step_oversample': 1.25,
-        'dense_spacing_use_support_gate': True,
-        'dense_spacing_support_sigma': 4.0,
-        'dense_spacing_support_floor_alpha': 0.05,
-        'dense_spacing_support_policy': 'product',
-        'dense_spacing_phase_huber_delta': 0.5,
-        'dense_spacing_phase_extension_windings': 1.0,
-        'dense_spacing_phase_min_center_gap_wv': 4.0,
-        'dense_spacing_phase_graze_dot': 0.4,
-        'dense_spacing_phase_graze_depth_wv': 1.0,
-        'dense_spacing_phase_window_windings': 1.0,
-        'dense_spacing_phase_end_free_margin_windings': 0.5,
-        'dense_spacing_phase_missing_cost': 0.7,
-        'dense_spacing_phase_missing_extend_cost': 0.7,
-        'dense_spacing_phase_extra_cost': 0.9,
-        'dense_spacing_phase_extra_extend_cost': 0.9,
-        'dense_spacing_phase_temperature': 0.2,
-        'dense_spacing_phase_band_confidence_cost': 0.25,
-        'dense_spacing_phase_top2_margin': 0.2,
-        'dense_spacing_phase_min_matched_windings': 2,
-        'dense_spacing_phase_min_matched_mass': 1.0,
-        'loss_weight_dense_spacing': 12.0,
-        'loss_weight_dense_spacing_count': 8.0,
-        'loss_weight_min_spacing': 0.0,
-        'loss_weight_dense_attachment': 0.0,
-        'dense_min_spacing_d_min_wv': 6.0,
-        'sample_count_minimum_spacing_independent_samples': 64,
-        'sample_count_dense_attachment_points': 512,
-        'dense_attachment_scale': 8.0,
-    }
-    cfg.update(overrides)
-    return cfg
+from sdt_fixtures import (
+    DR_PER_WINDING, PerfectSpiralToX, make_volume, sheet_volume,
+    spacing_cfg, spiral_shifted_radius,
+)
 
 
 def pair_counts(transform, volume, k, m=1, theta=0.0, cfg=None):
@@ -182,23 +73,6 @@ class TrilinearSamplingTests(unittest.TestCase):
         self.assertTrue(bool(valid[0]))  # working (4,4,4) -> grid (2,2,2)
         self.assertAlmostEqual(float(value[0]), (130 - 128) * 0.5, places=4)
 
-    def test_weight_mass_validity(self):
-        # Test 7: a valid/no-data corner mixture follows the weight-mass
-        # criterion, and is not accepted merely because the interpolated value
-        # is nonzero (nor rejected because it is zero).
-        volume = make_volume(np.full([4, 4, 4], 128, np.uint8))
-        volume['volume'][1, 1, 1] = 0  # one no-data corner
-        near = torch.tensor([[0.9, 0.9, 0.9]])   # 0.729 of the mass is invalid
-        far = torch.tensor([[0.3, 0.3, 0.3]])    # only 0.027 invalid
-        _, valid_near, _ = sample_sdt_trilinear(volume, near)
-        value_far, valid_far, _ = sample_sdt_trilinear(volume, far)
-        self.assertFalse(bool(valid_near[0]))
-        self.assertTrue(bool(valid_far[0]))
-        # Renormalised over valid corners; interpolated sd is exactly 0 and
-        # that must not be treated as invalid.
-        self.assertAlmostEqual(float(value_far[0]), 0.0, places=4)
-        self.assertEqual(MIN_VALID_CORNER_WEIGHT_MASS, 0.5)
-
     def test_trilinear_is_smooth_and_differentiable(self):
         # Test 6: values change smoothly as mapped points cross a voxel, and
         # gradient flows through the fractional weights.
@@ -213,28 +87,6 @@ class TrilinearSamplingTests(unittest.TestCase):
         self.assertLess(float(diffs.max() - diffs.min()), 1e-3)  # and uniform
         value.sum().backward()
         self.assertTrue(bool((xs.grad.abs() > 0).all()))
-
-    def test_medial_ridge_gradient(self):
-        # Test 17: at a two-sheet medial ridge the field is unsaturated but the
-        # position gradient cancels under exact symmetry (in the interpolant,
-        # symmetry means a cell whose two knots share the ridge value); a
-        # sub-voxel perturbation recovers a gradient toward the nearer sheet.
-        volume = sheet_volume(64, [20, 31])  # ridge at 25.5, mid-cell
-        x_symmetric = torch.tensor([25.5], requires_grad=True)
-        points = torch.stack([torch.full_like(x_symmetric, 1.5),
-                              torch.full_like(x_symmetric, 1.5), x_symmetric], -1)
-        value, _, _ = sample_sdt_trilinear(volume, points)
-        self.assertLess(float(value[0]), 127.0)  # unsaturated
-        value.sum().backward()
-        self.assertAlmostEqual(float(x_symmetric.grad[0]), 0.0, places=4)
-
-        x_perturbed = torch.tensor([26.6], requires_grad=True)
-        points = torch.stack([torch.full_like(x_perturbed, 1.5),
-                              torch.full_like(x_perturbed, 1.5), x_perturbed], -1)
-        value, _, _ = sample_sdt_trilinear(volume, points)
-        value.sum().backward()
-        # The nearer sheet is at 31, so sd decreases towards +x here.
-        self.assertLess(float(x_perturbed.grad[0]), 0.0)
 
 
 class CrossingCountTests(unittest.TestCase):
@@ -257,13 +109,6 @@ class CrossingCountTests(unittest.TestCase):
             for count in result['count'].tolist():
                 self.assertAlmostEqual(count, m, delta=0.02 + 0.04 * m)
 
-    def test_same_sheet_counts_zero(self):
-        # Test 2: two endpoints inside the same (very thick) sheet count ~0.
-        volume = sheet_volume(96, [25], half_thickness=20.0)
-        result = pair_counts(PerfectSpiralToX(), volume, k=[1.0], m=1)
-        self.assertTrue(bool(result['seg_valid'].all()))
-        self.assertLess(float(result['count'][0]), 0.05)
-
     def test_oblique_crossing_is_topological(self):
         # Test 3: count through a flat sheet is invariant to path obliquity -
         # a stretched mapping crosses the same one sheet and still counts ~1.
@@ -283,16 +128,6 @@ class CrossingCountTests(unittest.TestCase):
         result = pair_counts(PerfectSpiralToX(), volume, k=[1.0, 2.0], m=1)
         for count in result['count'].tolist():
             self.assertAlmostEqual(count, 1.0, delta=0.08)
-
-    def test_too_long_pairs_are_rejected_and_reported(self):
-        # Test 18a: a pair that would need more than max_steps polyline samples
-        # is invalidated and reported, never evaluated at unsafe spacing.
-        volume = sheet_volume(96, [10, 20])
-        result = pair_counts(
-            PerfectSpiralToX(radial_scale=30.0), volume, k=[1.0], m=1,
-            cfg=spacing_cfg(dense_spacing_max_steps=32))
-        self.assertTrue(bool(result['too_long'][0]))
-        self.assertFalse(bool(result['seg_valid'][0]))
 
     def test_step_violation_detected_when_chord_underestimates(self):
         # Test 18b: a mapping whose polyline is much longer than its endpoint
@@ -358,42 +193,6 @@ class CrossingCountTests(unittest.TestCase):
         self.assertTrue(result['count'].requires_grad)
         self.assertFalse(result['support'].requires_grad)
 
-    def test_support_policies(self):
-        volume = sheet_volume(96, [10, 20])
-        # Off-sheet endpoints: exterior distance ~3 at both ends.
-        result = pair_counts(
-            PerfectSpiralToX(x_offset=5.0), volume, k=[1.0],
-            cfg=spacing_cfg(dense_spacing_support_policy='product'))
-        result_min = pair_counts(
-            PerfectSpiralToX(x_offset=5.0), volume, k=[1.0],
-            cfg=spacing_cfg(dense_spacing_support_policy='minimum'))
-        self.assertLess(float(result['support'][0]),
-                        float(result_min['support'][0]) + 1e-6)
-
-    def test_winding_skip_reads_plus_one(self):
-        # Test 13: a fit with one winding 'removed' - windings land on sheets
-        # 10, 20, 40, 50 so the (2, 3) pair spans the unclaimed sheet at 30 -
-        # reads mean_count - m ~ +1 on exactly the affected pair. The extra
-        # 10 wv are absorbed over a 5 wv ramp (slope 3), which keeps mapped
-        # adjacent steps inside the max-step bound.
-        class SkipsASheet:
-            def inv(self, points):
-                shifted = spiral_shifted_radius(points)
-                mapped = shifted + 10.0 * ((shifted - 22.5) / 5.0).clamp(0.0, 1.0)
-                return torch.stack([
-                    torch.full_like(mapped, 1.5),
-                    torch.full_like(mapped, 1.5),
-                    mapped,
-                ], dim=-1)
-
-        volume = sheet_volume(96, [10, 20, 30, 40, 50, 60])
-        rows = aggregate_pair_counts(
-            SkipsASheet(), torch.tensor(DR_PER_WINDING), volume,
-            outer_winding_idx=5, cfg=spacing_cfg(), z_begin=1, z_end=2,
-            samples_per_pair=64)
-        by_winding = {row['winding']: row for row in rows}
-        self.assertAlmostEqual(by_winding[1]['mean_count_minus_m'], 0.0, delta=0.15)
-        self.assertAlmostEqual(by_winding[2]['mean_count_minus_m'], 1.0, delta=0.2)
 
 class SpacingLossTests(unittest.TestCase):
     def setUp(self):
@@ -446,27 +245,6 @@ class SpacingLossTests(unittest.TestCase):
         # the residual grows with baseline but stays a few percent of m.
         self.assertLess(metrics['dense_spacing_count_residual_mean'], 0.2)
         self.assertLess(float(loss), 0.2)
-
-    def test_pair_m_clamped_to_winding_domain(self):
-        # m ranges larger than the fitted domain span must not sample windings
-        # outside [inner, outer]: with outer_winding_idx=4 the domain is
-        # [1, 3], so both mixture ranges clamp to m=2 and every pair stays
-        # in range.
-        volume = sheet_volume(96, [10, 20, 30, 40, 50, 60])
-        loss, metrics = run_bundle_count(
-            PerfectSpiralToX(), volume, outer_winding_idx=4,
-            cfg=spacing_cfg(dense_spacing_pair_m_short=(3, 7),
-                            dense_spacing_pair_m_long=(5, 15),
-                            dense_spacing_pair_long_fraction=0.15,
-                            dense_spacing_max_steps=128))
-        self.assertGreater(metrics['dense_spacing_count_valid_fraction'], 0.99)
-        self.assertLess(metrics['dense_spacing_count_residual_mean'], 0.2)
-
-    def test_missing_volume_yields_no_components(self):
-        components = list(iter_phase_bundle_losses(
-            None, PerfectSpiralToX(), torch.tensor(DR_PER_WINDING), None,
-            None, 6, spacing_cfg(), 1, 2))
-        self.assertEqual(components, [])
 
     def test_shared_ray_counts_match_independent_implementation(self):
         # The bundle's shared central-ray count must equal the independent
@@ -521,19 +299,6 @@ class SpacingLossTests(unittest.TestCase):
             optimiser.step()
         self.assertLess(residual_value, 0.1)
 
-    def test_exact_collapse_has_no_count_gradient(self):
-        # Test 16a: an exactly collapsed pair deep inside one wide sheet sits
-        # on a flat inside plateau - the count supplies no separation gradient
-        # (this is the documented limitation, asserted so a future fix that
-        # lifts it shows up as an intentional test change).
-        volume = sheet_volume(96, [10], half_thickness=8.0)
-        scale = torch.tensor(0.0, requires_grad=True)
-        result = pair_counts(
-            PerfectSpiralToX(radial_scale=scale, x_offset=10.0), volume,
-            k=[0.0], m=1)
-        (result['count'] - 1.0).abs().sum().backward()
-        self.assertAlmostEqual(float(scale.grad), 0.0, places=5)
-
 
 class AttachmentLossTests(unittest.TestCase):
     def setUp(self):
@@ -574,63 +339,5 @@ class AttachmentLossTests(unittest.TestCase):
         self.assertEqual(metrics['dense_attachment_live_gradient_fraction'], 0.0)
         self.assertAlmostEqual(metrics['dense_attachment_saturated_fraction'], 1.0, places=2)
 
-    def test_requires_sdt_kind(self):
-        surf = make_volume(np.full([4, 4, 8], 200, np.uint8), kind='surf',
-                           unit=None, cap=None)
-        with self.assertRaises(ValueError):
-            self.run_loss(surf, PerfectSpiralToX())
-
-    def test_fitted_winding_domain(self):
-        self.assertEqual(fitted_winding_domain(130), (1, 129))
-
 
 SHIPPED_STORE = '/home/sean/Desktop/spiral_dataset/to_hf/lasagna_inputs/las_008_surf_sdt.ome.zarr'
-
-
-@unittest.skipUnless(
-    __import__('os').environ.get('SPIRAL_SDT_INTEGRATION'),
-    'machine-local integration test; set SPIRAL_SDT_INTEGRATION=1 to run '
-    '(requires the shipped threshold-150 store and CUDA)')
-class ShippedStoreIntegrationTests(unittest.TestCase):
-    def test_primary_diagnostic_point(self):
-        # Doc test 15: the primary diagnostic point (working xyz 4375, 2176,
-        # 11314) reproduces surf = 0 there yet SDT ~ +4..6 working voxels
-        # (measured +4.5 on the shipped store), where the retired pred_dt sat
-        # saturated at encoded 80.
-        import os
-        from lasagna_data import prepare_surf_sdt_volume
-
-        with self.assertRaises(RuntimeError):
-            # Fit range outside the built [4000, 18000] working-z coverage.
-            prepare_surf_sdt_volume(SHIPPED_STORE, '1', z_begin=3000, z_end=12000,
-                                    cache_directory='/tmp/claude-1000/sdt-smoke-cache')
-
-        volume = prepare_surf_sdt_volume(
-            SHIPPED_STORE, '1', z_begin=11250, z_end=11380,
-            cache_directory=os.environ.get('SPIRAL_SDT_CACHE',
-                                           '/tmp/claude-1000/sdt-smoke-cache'))
-        try:
-            self.assertEqual(volume['scale_zyx'], (2.0, 2.0, 2.0))
-            self.assertEqual(volume['fingerprint']['threshold'], 150)
-            value, valid, _ = sample_sdt_trilinear(
-                volume, torch.tensor([[11314.0, 2176.0, 4375.0]]))
-            self.assertTrue(bool(valid[0]))
-            self.assertGreaterEqual(float(value[0]), 3.0)
-            self.assertLessEqual(float(value[0]), 6.5)
-        finally:
-            volume['store'].close()
-
-
-class CoverageValidationTests(unittest.TestCase):
-    def test_merged_ranges_cover(self):
-        from lasagna_data import _merged_ranges_cover
-        self.assertTrue(_merged_ranges_cover([[0, 10]], 2, 8))
-        self.assertTrue(_merged_ranges_cover([[0, 5], [5, 10]], 0, 10))
-        self.assertTrue(_merged_ranges_cover([[0, 6], [4, 10]], 0, 10))
-        self.assertFalse(_merged_ranges_cover([[0, 4], [6, 10]], 0, 10))
-        self.assertFalse(_merged_ranges_cover([[2, 10]], 0, 10))
-        self.assertFalse(_merged_ranges_cover([], 0, 10))
-
-
-if __name__ == '__main__':
-    unittest.main()

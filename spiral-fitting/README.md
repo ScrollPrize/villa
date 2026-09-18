@@ -4,6 +4,11 @@ Code and helpers to fit a canonical Archimedean spiral to deformed scrolls.
 `spiral_service.py` hosts one persistent interactive fit session over HTTP for
 the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
+## Tests
+
+See [tests/README.md](tests/README.md) for the focused suite, CPU/CUDA commands
+and real-scroll integration checks.
+
 ## CUDA startup check
 
 VC3D fit sessions and command-line fits allocate one CUDA element and synchronize
@@ -609,7 +614,7 @@ AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m
   spiral-fitting/tests/test_workspace_cleanup.py \
   spiral-fitting/tests/test_service_editing.py \
   spiral-fitting/tests/test_service_editing_http.py \
-  spiral-fitting/tests/test_spiral_service_v2.py
+  spiral-fitting/tests/test_service.py
 ```
 
 Set `SPIRAL_REAL_PCL=/path/to/real/abs_winding.json` for the real-scroll

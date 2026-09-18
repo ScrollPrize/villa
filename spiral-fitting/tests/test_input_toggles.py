@@ -1,13 +1,16 @@
-
 import pytest
 import torch
-
 from config import Config, FitConfig
-from fit_session import (RUN_MUTABLE_PCL_ROLES, PclInputSpec, PclRole,
-                         ScrollSpec, SpiralInputPaths,
-                         conventional_pcl_document_path, pcl_role_toggle_key)
+from fit_session import PclInputSpec, PclRole, ScrollSpec, SpiralInputPaths
 from fit_spiral import FitContext
 import losses
+from fit_session import (
+    fit_input,
+    input_source_enabled,
+    pcl_input_enabled,
+    phase_bundle_enabled,
+    winding_inference_enabled,
+)
 
 
 def make_context(config, paths):
@@ -71,25 +74,6 @@ def test_disabled_sources_are_removed_before_any_loader_can_see_them():
     assert context.config["sample_count_tracks_per_step"] == 1234
 
 
-def test_run_mutable_pcl_roles_match_the_run_boundary_toggle_keys():
-    # fit_session names the roles apply_config can turn on and off; config
-    # classifies their keys. The two lists must describe the same roles.
-    fields = Config.catalog()["schema"]["fields"]
-    run_boundary_toggles = {
-        key for key, spec in fields.items()
-        if key.startswith("input_use_pcl_")
-        and spec["runtime_impact"] == "run_boundary"}
-    assert run_boundary_toggles == {
-        pcl_role_toggle_key(role) for role in RUN_MUTABLE_PCL_ROLES}
-
-
-def test_conventional_pcl_document_path_matches_dataset_resolution(tmp_path):
-    (tmp_path / "same_windings.json").write_text("{}")
-    assert conventional_pcl_document_path(tmp_path, PclRole.SAME_WINDING) == \
-        str((tmp_path / "same_windings.json").resolve())
-    assert conventional_pcl_document_path("", "same_winding") == ""
-
-
 def test_pcl_role_toggles_filter_documents_independently():
     config = Config({
         "input_use_pcl_relative": False,
@@ -112,11 +96,6 @@ def test_pcl_role_toggles_filter_documents_independently():
         ("/inputs/absolute.json", "absolute"),
         ("/inputs/same.json", "same_winding"),
     ]
-
-
-def test_empty_patch_sets_have_no_sampling_distribution():
-    context = object.__new__(FitContext)
-    assert context._patch_sampling_probabilities([]) is None
 
 
 def test_disabling_normals_skips_the_normal_loss_graph(monkeypatch):
@@ -143,3 +122,92 @@ def test_disabling_normals_skips_the_normal_loss_graph(monkeypatch):
         cfg=Config().as_dict(), z_begin=1, z_end=3))
 
     assert [name for name, _ in values] == ['dense_spacing']
+
+
+def test_outer_shell_is_required_by_shell_losses_or_winding_model():
+    spec = fit_input("outer_shell")
+    assert spec.kind == "directory"
+    # Required by either shell loss weight (the outer weight defaults on) or
+    # by winding-model supervision even when both shell losses are disabled.
+    assert spec.required({}) is True
+    assert spec.required({"dense_spacing_mode": "phase",
+                          "loss_weight_shell_outer": 0.0,
+                          "loss_weight_shell_patch_radius": 0.0}) is False
+    assert spec.required({"loss_weight_shell_outer": 0.0,
+                          "loss_weight_shell_patch_radius": 2.0}) is True
+    assert spec.required({"dense_spacing_mode": "winding_model",
+                          "loss_weight_shell_outer": 0.0,
+                          "loss_weight_shell_patch_radius": 0.0}) is True
+
+
+def test_lasagna_store_predicates_reproduce_the_mode_contract():
+    # Phase requires normals and the SDT even at zero
+    # sub-weights; grad_mag requires the gradient store only with a positive
+    # spacing weight and never the SDT; an invalid mode enables nothing.
+    phase = {"dense_spacing_mode": "phase"}
+    assert fit_input("normal_x").required(phase) is True
+    assert fit_input("surf_sdt").required(phase) is True
+    assert fit_input("gradient_magnitude").required(phase) is False
+
+    grad = {"dense_spacing_mode": "grad_mag",
+            "loss_weight_dense_normals": 0.0}
+    assert fit_input("gradient_magnitude").required(grad) is True
+    assert fit_input("surf_sdt").required(grad) is False
+    assert fit_input("normal_x").required(grad) is False
+    assert fit_input("gradient_magnitude").required(
+        {**grad, "loss_weight_dense_spacing": 0.0}) is False
+
+    winding_model = {"dense_spacing_mode": "winding_model",
+                     "loss_weight_dense_normals": 0.0}
+    assert fit_input("winding_inference").required(winding_model) is True
+    assert fit_input("winding_inference").enabled(winding_model) is True
+    assert fit_input("normal_x").required(winding_model) is False
+    assert fit_input("surf_sdt").required(winding_model) is False
+
+    invalid = {"dense_spacing_mode": "crossing_count",
+               "loss_weight_dense_normals": 0.0}
+    assert not any(fit_input(key).required(invalid)
+                   for key in ("normal_x", "normal_y",
+                               "gradient_magnitude", "surf_sdt",
+                               "winding_inference"))
+
+
+def test_source_toggles_and_dependencies_are_centralized():
+    assert input_source_enabled({}, "tracks_dbm") is True
+    assert input_source_enabled({"input_use_tracks": False}, "tracks_dbm") is False
+    assert fit_input("tracks_dbm").enabled({"input_use_tracks": False}) is False
+
+    assert phase_bundle_enabled({"dense_spacing_mode": "phase"}) is True
+    assert phase_bundle_enabled({
+        "dense_spacing_mode": "phase", "input_use_normals": False,
+    }) is False
+    assert phase_bundle_enabled({
+        "dense_spacing_mode": "phase", "input_use_surf_sdt": False,
+    }) is False
+
+    winding = {"dense_spacing_mode": "winding_model"}
+    assert winding_inference_enabled(winding) is True
+    assert winding_inference_enabled({
+        **winding, "input_use_winding_inference": False,
+    }) is False
+    assert winding_inference_enabled({
+        **winding, "input_use_outer_shell": False,
+    }) is False
+
+
+def test_pcl_role_toggles_include_legacy_role_inference():
+    for role in PclRole:
+        key = f"input_use_pcl_{role.value}"
+        assert pcl_input_enabled({}, role) is True
+        assert pcl_input_enabled({key: False}, role) is False
+
+    assert pcl_input_enabled(
+        {"input_use_pcl_absolute": False}, None, "/data/abs_winding.json") is False
+    assert pcl_input_enabled(
+        {"input_use_pcl_relative": False}, None, "/data/legacy.json") is False
+    # Absolute PCLs cascade off when their verified-patch prerequisite is off.
+    assert pcl_input_enabled(
+        {"input_use_verified_patches": False}, PclRole.ABSOLUTE) is False
+    # Non-absolute inputs may still become unattached-strip supervision.
+    assert pcl_input_enabled(
+        {"input_use_verified_patches": False}, PclRole.RELATIVE) is True

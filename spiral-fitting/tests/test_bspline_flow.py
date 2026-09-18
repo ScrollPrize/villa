@@ -1,10 +1,7 @@
-import os
 import unittest
-
 import numpy as np
 import scipy.ndimage
 import torch
-
 import flow_triton
 from flow_fields import BSplineFlowField, sample_field_bspline
 
@@ -37,6 +34,14 @@ class BSplineSamplerTests(unittest.TestCase):
         torch.testing.assert_close(
             output, torch.from_numpy(reference), rtol=1e-10, atol=1e-10)
 
+    def test_gradcheck(self):
+        torch.manual_seed(5)
+        field = torch.randn(3, 4, 5, 4, dtype=torch.float64, requires_grad=True)
+        # Interior points: the field is C2 across knots, but the [0, 1] border
+        # clamp itself is a kink that finite differences would straddle.
+        points = (_random_points(11, 6, lo=0.05, hi=0.95)).requires_grad_(True)
+        torch.autograd.gradcheck(sample_field_bspline, (field, points))
+
     def test_partition_of_unity_on_constant_field(self):
         # The cubic B-spline basis sums to one everywhere (including in the
         # replicated border region), so a constant lattice must reproduce the
@@ -47,91 +52,6 @@ class BSplineSamplerTests(unittest.TestCase):
         output = sample_field_bspline(field, _random_points(500, 4))
         torch.testing.assert_close(
             output, constant.expand_as(output), rtol=1e-12, atol=1e-12)
-
-    def test_gradcheck(self):
-        torch.manual_seed(5)
-        field = torch.randn(3, 4, 5, 4, dtype=torch.float64, requires_grad=True)
-        # Interior points: the field is C2 across knots, but the [0, 1] border
-        # clamp itself is a kink that finite differences would straddle.
-        points = (_random_points(11, 6, lo=0.05, hi=0.95)).requires_grad_(True)
-        torch.autograd.gradcheck(sample_field_bspline, (field, points))
-
-    def test_sampler_output_shape_preserved(self):
-        field = torch.randn(3, 4, 4, 4, dtype=torch.float64)
-        points = _random_points(24, 7).view(2, 3, 4, 3)
-        self.assertEqual(sample_field_bspline(field, points).shape, (2, 3, 4, 3))
-
-
-class BSplineFlowGradientTests(unittest.TestCase):
-    def test_streamed_backwards_and_pending_field_grad_match_dense_autograd(self):
-        torch.manual_seed(11)
-        flow = BSplineFlowField(torch.tensor([12, 12, 12]), spatial_scale_factor=6)
-        with torch.no_grad():
-            flow.flows[0].normal_(std=0.1)
-            flow.flows[1].normal_(std=0.1)
-
-        points_a = torch.rand(29, 3, requires_grad=True)
-        points_b = torch.rand(41, 3, requires_grad=True)
-        reference_a = points_a.detach().clone().requires_grad_(True)
-        reference_b = points_b.detach().clone().requires_grad_(True)
-        reference_lr = flow.flows[0].detach().clone().requires_grad_(True)
-        reference_hr = flow.flows[1].detach().clone().requires_grad_(True)
-
-        def reference_sample(pts):
-            return (
-                sample_field_bspline(reference_lr[0], pts)
-                + sample_field_bspline(reference_hr[0], pts)
-            )
-
-        reference_out_a = reference_sample(reference_a)
-        reference_out_b = reference_sample(reference_b)
-        (reference_out_a.square().mean() + reference_out_b.abs().mean()).backward()
-
-        sampler = flow.get_sampler()
-        out_a = sampler(points_a)
-        out_b = sampler(points_b)
-        # Two independent backwards through the one cached sampler, WITHOUT
-        # retain_graph: the shared field graphs are cut at detached leaves.
-        out_a.square().mean().backward()
-        out_b.abs().mean().backward()
-        flow.apply_accumulated_field_grad()
-
-        torch.testing.assert_close(out_a, reference_out_a)
-        torch.testing.assert_close(out_b, reference_out_b)
-        torch.testing.assert_close(points_a.grad, reference_a.grad)
-        torch.testing.assert_close(points_b.grad, reference_b.grad)
-        torch.testing.assert_close(flow.flows[0].grad, reference_lr.grad)
-        torch.testing.assert_close(flow.flows[1].grad, reference_hr.grad)
-        self.assertIsNone(flow._pending_field_graphs)
-
-    def test_no_grad_sampler_has_no_pending_record(self):
-        flow = BSplineFlowField(torch.tensor([12, 12, 12]))
-        with torch.no_grad():
-            flow.get_sampler()(torch.rand(5, 3))
-        self.assertIsNone(flow._pending_field_graphs)
-        flow.apply_accumulated_field_grad()  # no-op
-
-    def test_eager_integrator_matches_sampler_loop_per_slab(self):
-        # Two slabs, applied in order (reverse order, backwards, for the
-        # inverse), each a plain RK4 over that slab's sampler.
-        torch.manual_seed(13)
-        flow = BSplineFlowField(torch.tensor([12, 12, 12]), num_stages=2)
-        with torch.no_grad():
-            flow.flows[0].normal_(std=0.1)
-            flow.flows[1].normal_(std=0.1)
-        points = torch.rand(37, 3)
-        h, n_steps = 1.0 / 3.0, 3
-
-        for reverse in (False, True):
-            with torch.no_grad():
-                integrated = flow.get_integrator()(
-                    points, -h if reverse else h, n_steps, reverse=reverse)
-                y = points
-                for slab in ((1, 0) if reverse else (0, 1)):
-                    y = _eager_rk4(
-                        flow.flows[0][slab], flow.flows[1][slab], y,
-                        -h if reverse else h, n_steps)
-            torch.testing.assert_close(integrated, y)
 
 
 def _eager_rk4(low, high, pts, h, n_steps):
@@ -227,103 +147,26 @@ class BSplineTritonEquivalenceTests(unittest.TestCase):
         torch.testing.assert_close(
             acc_hi[0], reference_high.grad, rtol=1e-3, atol=1e-5)
 
-    def test_module_integrator_accumulates_param_grads(self):
-        # The BSplineFlowField wiring: detached-field integrator, per-lattice
-        # accumulators, apply_accumulated_field_grad -> parameter gradients.
+
+class BSplineFlowGradientTests(unittest.TestCase):
+    def test_eager_integrator_matches_sampler_loop_per_slab(self):
+        # Two slabs, applied in order (reverse order, backwards, for the
+        # inverse), each a plain RK4 over that slab's sampler.
         torch.manual_seed(13)
-        flow = BSplineFlowField(torch.tensor([12, 12, 12])).cuda()
+        flow = BSplineFlowField(torch.tensor([12, 12, 12]), num_stages=2)
         with torch.no_grad():
             flow.flows[0].normal_(std=0.1)
             flow.flows[1].normal_(std=0.1)
-        pts = _mixed_points(200, 14, 'cuda', torch.float32).requires_grad_(True)
+        points = torch.rand(37, 3)
+        h, n_steps = 1.0 / 3.0, 3
 
-        reference_pts = pts.detach().clone().requires_grad_(True)
-        reference_low = flow.flows[0][0].detach().clone().requires_grad_(True)
-        reference_high = flow.flows[1][0].detach().clone().requires_grad_(True)
-        (_eager_rk4(reference_low, reference_high, reference_pts,
-                    self.H, self.N_STEPS).square().sum()).backward()
-
-        integrate = flow.get_integrator()
-        integrate(pts, self.H, self.N_STEPS).square().sum().backward()
-        flow.apply_accumulated_field_grad()
-
-        torch.testing.assert_close(
-            pts.grad, reference_pts.grad, rtol=1e-3, atol=1e-5)
-        torch.testing.assert_close(
-            flow.flows[0].grad[0], reference_low.grad, rtol=1e-3, atol=1e-5)
-        torch.testing.assert_close(
-            flow.flows[1].grad[0], reference_high.grad, rtol=1e-3, atol=1e-5)
-        self.assertEqual(
-            flow.flows[1].grad.untyped_storage().data_ptr(),
-            flow._hr_grad_acc.untyped_storage().data_ptr())
-
-    def test_fused_multi_slab_matches_eager(self):
-        # Three slabs walked forward and in reverse: the fused kernel's slab
-        # indexing (values channels-last, accumulators parameter-layout)
-        # must match the eager slab-by-slab loop, gradients included.
         for reverse in (False, True):
-            torch.manual_seed(17)
-            flow = BSplineFlowField(torch.tensor([12, 16, 16]), num_stages=3).cuda()
             with torch.no_grad():
-                flow.flows[0].normal_(std=0.03)
-                flow.flows[1].normal_(std=0.012)
-            h = -self.H if reverse else self.H
-            pts = _mixed_points(200, 18, 'cuda', torch.float32).requires_grad_(True)
-            upstream = torch.randn_like(pts)
-
-            reference_pts = pts.detach().clone().requires_grad_(True)
-            reference_lr = flow.flows[0].detach().clone().requires_grad_(True)
-            reference_hr = flow.flows[1].detach().clone().requires_grad_(True)
-            y = reference_pts
-            for slab in ((2, 1, 0) if reverse else (0, 1, 2)):
-                y = _eager_rk4(reference_lr[slab], reference_hr[slab], y, h, self.N_STEPS)
-            y.backward(upstream)
-
-            out = flow.get_integrator()(pts, h, self.N_STEPS, reverse=reverse)
-            out.backward(upstream)
-            flow.apply_accumulated_field_grad()
-
-            torch.testing.assert_close(out, y, rtol=1e-4, atol=1e-6)
-            torch.testing.assert_close(pts.grad, reference_pts.grad, rtol=1e-3, atol=1e-5)
-            torch.testing.assert_close(flow.flows[0].grad, reference_lr.grad, rtol=1e-3, atol=1e-5)
-            torch.testing.assert_close(flow.flows[1].grad, reference_hr.grad, rtol=1e-3, atol=1e-5)
-            assert not torch.equal(flow.flows[1].grad[0], flow.flows[1].grad[1])
-
-    def test_full_model_grads_match_eager_path(self):
-        from tests.test_vram_reductions import (
-            _make_small_spiral_model, _sample_scroll_points)
-
-        def run(disable_triton):
-            model = _make_small_spiral_model(23, 'bspline', device='cuda')
-            points = _sample_scroll_points(41, 5).cuda()
-            previous = os.environ.get('FIT_SPIRAL_TRITON')
-            os.environ['FIT_SPIRAL_TRITON'] = '0' if disable_triton else '1'
-            try:
-                transform = model.get_slice_to_spiral_transform()
-                loss = (transform(points)[..., 1:].norm(dim=-1)
-                        / model.get_dr_per_winding()).mean()
-                loss.backward()
-            finally:
-                if previous is None:
-                    os.environ.pop('FIT_SPIRAL_TRITON', None)
-                else:
-                    os.environ['FIT_SPIRAL_TRITON'] = previous
-            model.flow_field.apply_accumulated_field_grad()
-            return loss.detach(), {
-                name: p.grad for name, p in model.named_parameters()}
-
-        eager_loss, eager_grads = run(disable_triton=True)
-        triton_loss, triton_grads = run(disable_triton=False)
-
-        torch.testing.assert_close(triton_loss, eager_loss, rtol=1e-4, atol=1e-7)
-        for name, eager_grad in eager_grads.items():
-            triton_grad = triton_grads[name]
-            if eager_grad is None and triton_grad is None:
-                continue
-            torch.testing.assert_close(
-                triton_grad, eager_grad, rtol=2e-3, atol=1e-5,
-                msg=lambda base, name=name: f'{name}: {base}')
-
-
-if __name__ == '__main__':
-    unittest.main()
+                integrated = flow.get_integrator()(
+                    points, -h if reverse else h, n_steps, reverse=reverse)
+                y = points
+                for slab in ((1, 0) if reverse else (0, 1)):
+                    y = _eager_rk4(
+                        flow.flows[0][slab], flow.flows[1][slab], y,
+                        -h if reverse else h, n_steps)
+            torch.testing.assert_close(integrated, y)

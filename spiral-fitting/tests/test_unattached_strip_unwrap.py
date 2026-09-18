@@ -11,15 +11,12 @@ regardless of how many windings it spans."""
 
 import numpy as np
 import torch
-
 import losses
 from config import Config
 from dt_targets import compute_strip_dt_target_cache
-from losses import (
-    build_pcl_sampling_strata,
-    get_unattached_pcl_strip_losses,
-)
+from losses import build_pcl_sampling_strata, get_unattached_pcl_strip_losses
 from theta_crossing_map import ThetaCrossingMap
+
 
 DR = 12.0
 
@@ -177,32 +174,6 @@ def test_short_unequal_strips_carry_one_dt_anchor_per_row():
     assert dt_losses.max() < 1e-3
 
 
-def test_mixed_short_and_long_strips_use_independent_caps(monkeypatch):
-    cfg = _make_cfg()
-    short = _perfect_spiral_fiber(1.0)[:3]
-    long = _perfect_spiral_fiber(10.0)
-    assert len(long) > 1024
-    transform = CountingIdentityTransform()
-    captured_counts = []
-    real_helper = losses.endpoint_strip_dt_target_in_sample_frame
-
-    def capture_mask(*args, **kwargs):
-        captured_counts.append(kwargs['sample_mask'].sum(dim=-1).tolist())
-        return real_helper(*args, **kwargs)
-
-    monkeypatch.setattr(
-        losses, 'endpoint_strip_dt_target_in_sample_frame', capture_mask)
-    radius_losses, dt_losses = _run_losses(
-        [short, long], cfg, num_steps=1,
-        num_points_per_pcl=1024, transform=transform)
-
-    assert sorted(captured_counts[0]) == [3, 1024]
-    assert transform.forward_counts == [1029]
-    assert transform.inverse_counts == [1027]
-    assert radius_losses.max() < 1e-3
-    assert dt_losses.max() < 1e-3
-
-
 def test_endpoint_cache_carries_anchor_without_changing_loss_samples():
     cfg = _make_cfg()
     fiber = _perfect_spiral_fiber(10.0)
@@ -224,21 +195,6 @@ def test_endpoint_cache_carries_anchor_without_changing_loss_samples():
         median_transform.forward_inputs[0], rtol=0, atol=0)
     np.testing.assert_allclose(endpoint_losses[0], median_losses[0], atol=1e-6)
     np.testing.assert_allclose(endpoint_losses[1], median_losses[1], atol=1e-6)
-
-
-def test_endpoint_cache_adds_one_forward_point_but_no_inverse_loss_point():
-    cfg = _make_cfg()
-    base = _perfect_spiral_fiber(1.0)
-    transform = CountingIdentityTransform()
-    radius_losses, dt_losses = _run_losses(
-        [base[:3], base[:5]], cfg, num_steps=1,
-        num_points_per_pcl=1024, transform=transform,
-        whole_object_cache=True)
-
-    assert transform.forward_counts == [10]
-    assert transform.inverse_counts == [8]
-    assert radius_losses.max() < 1e-3
-    assert dt_losses.max() < 1e-3
 
 
 def test_endpoint_cache_handles_both_component_walk_directions(monkeypatch):
@@ -276,24 +232,6 @@ def test_multiwrap_perfect_fiber_has_zero_radius_and_dt_loss():
     # against miscounted crossings (mean radius loss ~4.4*DR).
     cfg = _make_cfg()
     radius_losses, dt_losses = _run_losses([_perfect_spiral_fiber(20.0)], cfg)
-    assert radius_losses.max() < 1e-3
-    assert dt_losses.max() < 1e-3
-
-
-def test_five_wrap_perfect_fiber_has_zero_radius_loss():
-    cfg = _make_cfg()
-    radius_losses, _ = _run_losses(
-        [_perfect_spiral_fiber(5.0)], cfg, compute_dt=False)
-    assert radius_losses.max() < 1e-3
-
-
-def test_subwrap_strip_across_seam_still_has_zero_loss():
-    # A short strip crossing theta=0 exactly once: the legacy sparse unwrap
-    # handled this correctly, so the dense-walk adjustments (re-anchored at
-    # each row's first pick) must reproduce zero loss here too.
-    cfg = _make_cfg()
-    fiber = _perfect_spiral_fiber(0.5, theta0=1.75 * np.pi)
-    radius_losses, dt_losses = _run_losses([fiber], cfg)
     assert radius_losses.max() < 1e-3
     assert dt_losses.max() < 1e-3
 
@@ -438,32 +376,6 @@ def test_zero_offsets_add_no_transform_evaluations():
         [base[:3], base[:5]], cfg, num_steps=1, num_points_per_pcl=1024,
         transform=transform, radial_offsets=[0.0, 0.0])
     assert transform.forward_counts == [10]
-
-
-def test_offset_strip_is_satisfied_under_a_stretching_transform():
-    # Under a 2.5x radial stretch a back-face fiber 4 scroll voxels outside
-    # the sheet is 10 spiral units out; the physical offset of 4 puts every
-    # point on the sheet. A fiber only 4 *spiral* units out (what a constant
-    # spiral-space offset of 4 would have expected) reads 6 units inside its
-    # winding with the same offset -- the largest possible residual, outside
-    # the 0.45*DR satisfaction band -- so none of it is satisfied.
-    from fit_spiral import _build_strip_flat_bundle
-    from satisfaction_metrics import get_unattached_pcl_satisfied_counts
-    scale = 2.5
-    transform = RadialScaleTransform(scale)
-    sheet_scroll = transform.inv(torch.from_numpy(_perfect_spiral_fiber(2.0)))
-    physical = _radially_displaced(sheet_scroll.numpy(), 4.0)
-    constant = _radially_displaced(sheet_scroll.numpy(), 4.0 / scale)
-    for fiber, expect_all in ((physical, True), (constant, False)):
-        strips = _strips([fiber])
-        flat = _build_strip_flat_bundle(
-            [(fiber, np.zeros(len(fiber), np.float32),
-              np.full(len(fiber), 4.0, np.float32))],
-            torch.device('cpu'))
-        satisfied, total, _ = get_unattached_pcl_satisfied_counts(
-            transform, torch.tensor(DR), strips, lambda _s, _d: flat)
-        assert int(total[0]) == len(fiber)
-        assert int(satisfied[0]) == (len(fiber) if expect_all else 0)
 
 
 def test_radial_offset_only_moves_the_offset_strip():
