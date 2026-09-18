@@ -155,9 +155,9 @@ public:
         // Mirrors FiberBranchRef::adjacent: the endpoints are one winding
         // apart (V inside H), which the map's winding solve honours.
         bool adjacent = false;
-        // Mirrors FiberBranchRef::adjacentKeyPresent: an explicit kind, so
-        // two refs of one pair saying true and false is a real disagreement
-        // the map reports (an absent key would have been healed at load).
+        // The containing JSON array states the kind explicitly, so
+        // two refs of one pair with different kinds are a real disagreement.
+        // Missing adjacent arrays are healed before load-time validation.
         bool adjacentExplicit = true;
     };
 
@@ -237,14 +237,10 @@ public:
     // saved-fiber control-point ordering. Any live mutation of control points or
     // branches must go through the private session paths that call
     // syncLinkedBranchMetadataAfterFiberModification().
-    // JSON key of FiberBranchRef::adjacent in a fiber file's "branches"
-    // entries. Written EXPLICITLY, true or false, on every entry this build
-    // saves: an absent key then means the entry was last written by
-    // something that does not know the kind (an older VC3D strips unknown
-    // keys on save), which lets a stripped flag be told apart from a
-    // deliberate re-link as an ordinary link and healed or reported instead
-    // of silently winning.
-    static constexpr const char* kAdjacentLinkJsonKey = "adjacent";
+    // Adjacent links have the same entry schema as ordinary branches, in a
+    // separate top-level array. Always written, even empty: absence means a
+    // legacy writer, while an empty array is a deliberate absence of links.
+    static constexpr const char* kAdjacentBranchesJsonKey = "adjacent_branches";
 
     struct FiberBranchRef {
         int controlPointIndex = -1;
@@ -268,13 +264,6 @@ public:
         // for a link (delete and re-link to change), mirrored on both
         // reciprocal refs.
         bool adjacent = false;
-        // The file carried the key (true or false) when this ref was read;
-        // false for an entry written by a build that does not know it, and
-        // for refs created in memory before their first save. The load-time
-        // heal (healOneSidedAdjacentLinks) restores a stripped flag from the
-        // reciprocal only when the key is absent, never over an explicit
-        // false.
-        bool adjacentKeyPresent = true;
     };
 
     // Per-fiber data for the fiber overlay's "Show linked" mode. Only fibers
@@ -587,6 +576,9 @@ private:
         // leave it alone (the next load heals again). Unset for fibers not
         // read from disk.
         std::optional<std::filesystem::file_time_type> loadedWriteTime;
+        // Presence at read time, including an explicitly empty array. Only
+        // a missing array permits restoring adjacent refs from peers.
+        bool adjacentBranchesPresent = true;
         // healOneSidedAdjacentLinks marked this record for saving.
         bool adjacentHealed = false;
     };
@@ -960,11 +952,9 @@ private:
                                   const std::vector<std::filesystem::path>& sourcePreference);
     [[nodiscard]] std::string loadedFiberLinkKey(const StoredFiber& from,
                                                  const std::string& branchFileName) const;
-    // A link whose one ref says adjacent while the reciprocal carries no
-    // adjacent key at all was saved on the reciprocal's side by a build that
-    // does not know the kind; the flag is put back and that fiber marked for
-    // saving. An explicit false on the reciprocal is a real disagreement
-    // (a deliberate re-link mid-sync) and is left for the sync merge.
+    // Restore adjacent reciprocals only into files whose array was absent.
+    // Run before cross-file validation so an old save cannot remove the
+    // whole network as missing its reciprocals. A present array is untouched.
     void healOneSidedAdjacentLinks(std::vector<StoredFiber>& fibers) const;
     // The heal's save must not overwrite a file that changed on disk since it
     // was READ (a concurrent sync download): stale when the write time moved,

@@ -278,18 +278,17 @@ class TestAnalyzeChanges:
 
 class TestLegacyRegressionUpload:
     def test_stripped_fiber_is_a_conflict_not_an_upload(self, manager):
-        """The last-synced copy (shadow) knew every link's kind; the local
-        file - saved by an older VC3D - has an entry without the key. A plain
+        """The shadow had adjacent links; an older VC3D dropped their array. A plain
         "local modified" upload would spread the loss: conflict instead."""
         import test_fiber_merge as fm
         knowing = fm.make_fiber(fm.BASE_CPS,
                                 branches=[fm.link('kb_a.json', fm.BASE_CPS[2], fm.OTHER, 2)])
-        knowing['branches'][0]['adjacent'] = True
+        knowing['adjacent_branches'], knowing['branches'] = knowing['branches'], []
         write_local(manager, 'fibers/f.json', json.dumps(knowing))
         manager._update_shadow('fibers/f.json')
         base_info = local_info(manager, 'fibers/f.json')
         stripped = copy.deepcopy(knowing)
-        stripped['branches'][0].pop('adjacent')
+        stripped.pop('adjacent_branches')
         stripped['generation'] = 2
         write_local(manager, 'fibers/f.json', json.dumps(stripped))
         info = local_info(manager, 'fibers/f.json')
@@ -301,18 +300,17 @@ class TestLegacyRegressionUpload:
         assert 'older VC3D' in actions['fibers/f.json'][1]
 
     def test_mixed_base_stripped_adjacent_link_is_a_conflict(self, manager):
-        """The shadow has the adjacent link beside a legacy entry; the local
-        file lost the adjacent key: still a conflict."""
+        """The shadow has both kinds of link; the local file lost the
+        adjacent array: still a conflict."""
         import test_fiber_merge as fm
         adjacent = fm.link('kb_a.json', fm.BASE_CPS[2], fm.OTHER, 2)
-        adjacent['adjacent'] = True
         legacy = fm.link('kb_c.json', fm.BASE_CPS[4], [7.0, 7.0, 7.0], 4)
-        base = fm.make_fiber(fm.BASE_CPS, branches=[adjacent, legacy])
+        base = fm.make_fiber(fm.BASE_CPS, branches=[legacy], adjacent_branches=[adjacent])
         write_local(manager, 'fibers/f.json', json.dumps(base))
         manager._update_shadow('fibers/f.json')
         base_info = local_info(manager, 'fibers/f.json')
         stripped = copy.deepcopy(base)
-        stripped['branches'][0].pop('adjacent')
+        stripped.pop('adjacent_branches')
         stripped['generation'] = 2
         write_local(manager, 'fibers/f.json', json.dumps(stripped))
         info = local_info(manager, 'fibers/f.json')
@@ -323,11 +321,11 @@ class TestLegacyRegressionUpload:
         assert actions['fibers/f.json'][0] == SyncAction.CONFLICT
 
     def test_ordinary_edit_still_uploads(self, manager):
-        """The same setup with the kind kept is a normal upload."""
+        """The same setup with the array kept is a normal upload."""
         import test_fiber_merge as fm
         knowing = fm.make_fiber(fm.BASE_CPS,
                                 branches=[fm.link('kb_a.json', fm.BASE_CPS[2], fm.OTHER, 2)])
-        knowing['branches'][0]['adjacent'] = True
+        knowing['adjacent_branches'], knowing['branches'] = knowing['branches'], []
         write_local(manager, 'fibers/f.json', json.dumps(knowing))
         manager._update_shadow('fibers/f.json')
         base_info = local_info(manager, 'fibers/f.json')

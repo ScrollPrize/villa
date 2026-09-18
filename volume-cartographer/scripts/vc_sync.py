@@ -678,7 +678,7 @@ class S3SyncManager:
 
     def _fiber_legacy_regression(self, path, tracked):
         """For a fiber file about to be uploaded as a plain local change: the
-        message when it lost link-kind keys its last-synced copy carried
+        message when it lost an adjacent_branches array that held links
         (fiber_merge.legacy_regression), else None. Anything unreadable is
         not a regression - the ordinary paths deal with it."""
         if not path.lower().endswith('.json') or not tracked:

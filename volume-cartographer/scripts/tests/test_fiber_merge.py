@@ -37,7 +37,7 @@ def line_for(cps, samples_per_span=4):
 
 
 def make_fiber(cps, branches=None, tags=None, generation=1,
-               filename='dj_x_000001.json'):
+               filename='dj_x_000001.json', adjacent_branches=None):
     return {
         'type': 'vc3d_fiber',
         'version': 1,
@@ -47,6 +47,7 @@ def make_fiber(cps, branches=None, tags=None, generation=1,
         'control_points': [list(p) for p in cps],
         'line_points': line_for(cps),
         'branches': copy.deepcopy(branches or []),
+        'adjacent_branches': copy.deepcopy(adjacent_branches or []),
         'tags': list(tags or []),
     }
 
@@ -226,74 +227,75 @@ def loader_issues(docs_by_name):
                 issues.append(f"{name}: control point {k} not on line (fatal)")
                 break
             li += 1
-        for entry in doc.get('branches', []):
-            # Parse-time stripping: the loader deletes (and rewrites the
-            # file without) entries it cannot parse — surfaced as issues so
-            # merge output never relies on that destruction.
-            if (not isinstance(entry, dict) or
-                    'link_direction' in entry or
-                    any(key not in entry for key in _REQUIRED_BRANCH_KEYS) or
-                    not _l_basename(entry['branch_file'])):
-                issues.append(f"{name}: branch entry stripped at parse time "
-                              "(file rewritten)")
-                continue
-            if (not _l_finite_direction(entry['control_point_direction']) or
-                    not _l_finite_direction(
-                        entry['branch_control_point_direction'])):
-                issues.append(f"{name}: non-finite branch direction")
-                continue
-            i = entry['control_point_index']
-            if not (isinstance(i, int) and 0 <= i < len(cps)):
-                issues.append(f"{name}: local CP index out of range")
-                continue
-            if not _l_pos_eq(cps[i], entry['control_point_position']):
-                issues.append(f"{name}: local CP position mismatch")
-                continue
-            if len(line) >= 2:
-                tangent = _l_tangent(line, entry['control_point_position'])
-                if not _l_dirs_compatible(entry['control_point_direction'],
-                                          tangent):
-                    issues.append(f"{name}: branch endpoint direction mismatch")
+        for kind in ('branches', 'adjacent_branches'):
+            for entry in doc.get(kind, []):
+                # Parse-time stripping: the loader deletes (and rewrites the
+                # file without) entries it cannot parse — surfaced as issues so
+                # merge output never relies on that destruction.
+                if (not isinstance(entry, dict) or
+                        'link_direction' in entry or
+                        any(key not in entry for key in _REQUIRED_BRANCH_KEYS) or
+                        not _l_basename(entry['branch_file'])):
+                    issues.append(f"{name}: branch entry stripped at parse time "
+                                  "(file rewritten)")
                     continue
-            target = docs_by_name.get(_l_basename(entry['branch_file']))
-            if target is None:
-                issues.append(f"{name}: missing linked fiber "
-                              f"{entry['branch_file']}")
-                continue
-            tcps = [_l_cp_position(cp) for cp in target['control_points']]
-            tline = target['line_points']
-            j = entry['branch_control_point_index']
-            if not (isinstance(j, int) and 0 <= j < len(tcps)):
-                issues.append(f"{name}: linked CP index out of range")
-                continue
-            if not _l_pos_eq(tcps[j], entry['branch_control_point_position']):
-                issues.append(f"{name}: linked CP position mismatch")
-                continue
-            if len(tline) >= 2:
-                tangent = _l_tangent(tline,
-                                     entry['branch_control_point_position'])
-                if not _l_dirs_compatible(
-                        entry['branch_control_point_direction'], tangent):
-                    issues.append(f"{name}: linked endpoint direction mismatch")
+                if (not _l_finite_direction(entry['control_point_direction']) or
+                        not _l_finite_direction(
+                            entry['branch_control_point_direction'])):
+                    issues.append(f"{name}: non-finite branch direction")
                     continue
-            # C2: index-exact reciprocity, plus positions and directions
-            # compared STORED against STORED.
-            reciprocal = any(
-                _l_basename(c.get('branch_file')) == name and
-                c.get('control_point_index') == j and
-                c.get('branch_control_point_index') == i and
-                _l_pos_eq(c.get('control_point_position'),
-                          entry['branch_control_point_position']) and
-                _l_pos_eq(c.get('branch_control_point_position'),
-                          entry['control_point_position']) and
-                _l_dirs_compatible(c.get('control_point_direction'),
-                                   entry['branch_control_point_direction']) and
-                _l_dirs_compatible(c.get('branch_control_point_direction'),
-                                   entry['control_point_direction'])
-                for c in target.get('branches', []) if isinstance(c, dict))
-            if not reciprocal:
-                issues.append(f"{name}: missing reciprocal branch in "
-                              f"{entry['branch_file']}")
+                i = entry['control_point_index']
+                if not (isinstance(i, int) and 0 <= i < len(cps)):
+                    issues.append(f"{name}: local CP index out of range")
+                    continue
+                if not _l_pos_eq(cps[i], entry['control_point_position']):
+                    issues.append(f"{name}: local CP position mismatch")
+                    continue
+                if len(line) >= 2:
+                    tangent = _l_tangent(line, entry['control_point_position'])
+                    if not _l_dirs_compatible(entry['control_point_direction'],
+                                              tangent):
+                        issues.append(f"{name}: branch endpoint direction mismatch")
+                        continue
+                target = docs_by_name.get(_l_basename(entry['branch_file']))
+                if target is None:
+                    issues.append(f"{name}: missing linked fiber "
+                                  f"{entry['branch_file']}")
+                    continue
+                tcps = [_l_cp_position(cp) for cp in target['control_points']]
+                tline = target['line_points']
+                j = entry['branch_control_point_index']
+                if not (isinstance(j, int) and 0 <= j < len(tcps)):
+                    issues.append(f"{name}: linked CP index out of range")
+                    continue
+                if not _l_pos_eq(tcps[j], entry['branch_control_point_position']):
+                    issues.append(f"{name}: linked CP position mismatch")
+                    continue
+                if len(tline) >= 2:
+                    tangent = _l_tangent(tline,
+                                         entry['branch_control_point_position'])
+                    if not _l_dirs_compatible(
+                            entry['branch_control_point_direction'], tangent):
+                        issues.append(f"{name}: linked endpoint direction mismatch")
+                        continue
+                # C2: index-exact reciprocity, plus positions and directions
+                # compared STORED against STORED.
+                reciprocal = any(
+                    _l_basename(c.get('branch_file')) == name and
+                    c.get('control_point_index') == j and
+                    c.get('branch_control_point_index') == i and
+                    _l_pos_eq(c.get('control_point_position'),
+                              entry['branch_control_point_position']) and
+                    _l_pos_eq(c.get('branch_control_point_position'),
+                              entry['control_point_position']) and
+                    _l_dirs_compatible(c.get('control_point_direction'),
+                                       entry['branch_control_point_direction']) and
+                    _l_dirs_compatible(c.get('branch_control_point_direction'),
+                                       entry['control_point_direction'])
+                    for c in target.get(kind, []) if isinstance(c, dict))
+                if not reciprocal:
+                    issues.append(f"{name}: missing reciprocal branch in "
+                                  f"{entry['branch_file']}")
     return issues
 
 
@@ -810,312 +812,203 @@ def test_refresh_syncs_pending_on_existing_reciprocal():
     assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
 
 
-def test_refresh_restores_missing_reciprocal_with_adjacent_kind():
-    """A restored reciprocal carries the link's kind: an adjacent-winding
-    link on A must not come back as an ordinary link on B."""
+def adjacent_pair():
     b_cps = [cp(i, dz=50.0) for i in range(4)]
     a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1)
-    a['branches'][0]['adjacent'] = True
-    b['branches'] = []
+    for doc in (a, b):
+        doc['adjacent_branches'] = doc.pop('branches')
+        doc['branches'] = []
+    return a, b
+
+
+@pytest.mark.parametrize('array_present', [False, True])
+def test_refresh_restores_adjacent_reciprocal_in_its_own_array(array_present):
+    a, b = adjacent_pair()
+    b['adjacent_branches'] = []
+    if not array_present:
+        del b['adjacent_branches']
     out = refresh_pair_links(a, b, 'a.json', 'b.json')
     assert out['ok'] and out['b_changed']
-    assert out['b_doc']['branches'][0]['adjacent'] is True
+    assert out['b_doc']['branches'] == []
+    assert len(out['b_doc']['adjacent_branches']) == 1
+    assert 'adjacent' not in out['b_doc']['adjacent_branches'][0]
+    assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
+    again = refresh_pair_links(out['a_doc'], out['b_doc'], 'a.json', 'b.json')
+    assert again['ok'] and not again['a_changed'] and not again['b_changed']
+
+
+@pytest.mark.parametrize('kind', ['branches', 'adjacent_branches'])
+def test_refresh_relink_moves_reciprocal_between_arrays(kind):
+    a, b = adjacent_pair()
+    old_kind = 'adjacent_branches' if kind == 'branches' else 'branches'
+    if old_kind == 'branches':
+        for doc in (a, b):
+            doc['branches'], doc['adjacent_branches'] = doc['adjacent_branches'], []
+    base = copy.deepcopy(a)
+    a[kind], a[old_kind] = a[old_kind], []
+    a[kind][0]['pending'] = True
+    out = refresh_pair_links(a, b, 'a.json', 'b.json', base_doc=base)
+    assert out['ok'] and out['b_changed']
+    assert out['b_doc'][old_kind] == []
+    assert len(out['b_doc'][kind]) == 1
+    assert out['b_doc'][kind][0]['pending'] is True
+    assert out['b_doc']['generation'] == b['generation'] + 1
     assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
 
 
-def test_refresh_writes_an_explicit_kind_onto_the_reciprocal():
-    """An explicit kind on A (true or false) is written onto B; a B that
-    carries no key gets it, and a consistent pair changes nothing."""
-    b_cps = [cp(i, dz=50.0) for i in range(4)]
-    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1)
-    a['branches'][0]['adjacent'] = True
-    out = refresh_pair_links(a, b, 'a.json', 'b.json')
-    assert out['ok'] and out['b_changed']
-    assert out['b_doc']['branches'][0]['adjacent'] is True
-    again = refresh_pair_links(out['a_doc'], out['b_doc'], 'a.json', 'b.json')
-    assert again['ok'] and not again['b_changed']
-    # A deliberate re-link as ordinary is an explicit false, and follows too.
-    a2 = copy.deepcopy(out['a_doc'])
-    a2['branches'][0]['adjacent'] = False
-    corrected = refresh_pair_links(a2, out['b_doc'], 'a.json', 'b.json')
-    assert corrected['ok'] and corrected['b_changed']
-    assert corrected['b_doc']['branches'][0]['adjacent'] is False
-
-
-@pytest.mark.parametrize('b_state', ['absent', 'true'])
-def test_refresh_writes_explicit_false_onto_the_reciprocal(b_state):
-    """An explicit ordinary kind on A (false) reaches B whether B carries no
-    key or says adjacent: the key exists on B afterwards with value False."""
-    b_cps = [cp(i, dz=50.0) for i in range(4)]
-    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1)
-    a['branches'][0]['adjacent'] = False
-    if b_state == 'true':
-        b['branches'][0]['adjacent'] = True
-    out = refresh_pair_links(a, b, 'a.json', 'b.json')
-    assert out['ok'] and out['b_changed']
-    assert 'adjacent' in out['b_doc']['branches'][0]
-    assert out['b_doc']['branches'][0]['adjacent'] is False
-
-
-def test_refresh_restores_missing_reciprocal_with_explicit_false():
-    """A rebuilt reciprocal copies A's explicit kind even when it is false,
-    so the restored entry is not mistaken for a legacy writer's."""
-    b_cps = [cp(i, dz=50.0) for i in range(4)]
-    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1)
-    a['branches'][0]['adjacent'] = False
-    b['branches'] = []
-    out = refresh_pair_links(a, b, 'a.json', 'b.json')
-    assert out['ok'] and out['b_changed']
-    assert out['b_doc']['branches'][0]['adjacent'] is False
-
-
-def test_relink_that_beats_an_approval_is_not_counted_as_one():
-    """The correction case again, checking the bookkeeping: an ordinary
-    pending re-link winning over an untouched adjacent approval reports no
-    approval."""
-    adjacent = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=False)
-    adjacent['adjacent'] = True
-    relinked = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
-    relinked['adjacent'] = False
-    base = make_fiber(BASE_CPS, branches=[adjacent])
-    local = make_fiber(BASE_CPS, branches=[relinked], generation=2)
-    remote = make_fiber(BASE_CPS, branches=[adjacent], tags=['x'], generation=2)
-    result = merge_fibers(base, local, remote)
-    assert result['ok']
-    assert result['stats']['links_approved'] == 0
-    assert any('re-flagged as pending' in note for note in result['notes'])
-
-
-def test_refresh_does_not_strip_the_kind_for_an_older_writer():
-    """A carries no key (an older VC3D saved it) while B says adjacent: that
-    is a conflict, and B keeps its flag."""
-    b_cps = [cp(i, dz=50.0) for i in range(4)]
-    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1)
-    b['branches'][0]['adjacent'] = True
+def test_refresh_never_pairs_different_kinds_without_a_base():
+    a, b = adjacent_pair()
+    b['branches'], b['adjacent_branches'] = b['adjacent_branches'], []
+    assert loader_issues({'a.json': a, 'b.json': b})
     out = refresh_pair_links(a, b, 'a.json', 'b.json')
     assert not out['ok']
-    assert any('adjacent' in message for message in out['conflicts'])
-    assert out['b_doc']['branches'][0]['adjacent'] is True
+    assert out['a_doc'] == a and out['b_doc'] == b
+    assert not out['a_changed'] and not out['b_changed']
 
 
-def test_merge_keeps_adjacent_kind():
-    """A three-way merge copies the chosen entry whole, kind included."""
-    adjacent = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
-    adjacent['adjacent'] = True
-    base = make_fiber(BASE_CPS, branches=[adjacent])
-    local = make_fiber(BASE_CPS, branches=[adjacent], tags=['x'], generation=2)
-    remote = make_fiber(BASE_CPS, branches=[adjacent], tags=['y'], generation=2)
-    result = merge_fibers(base, local, remote)
-    assert result['ok']
-    assert result['merged']['branches'][0]['adjacent'] is True
-
-
-def test_deliberate_relink_as_ordinary_wins_over_untouched_peer():
-    """The correction case: the annotator unlinked an adjacent link and
-    re-linked the same points as an ordinary link (explicit false, pending
-    again); the other machine still has the untouched adjacent copy. The
-    side that changed the kind wins, review state included."""
-    adjacent = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=False)
-    adjacent['adjacent'] = True
-    relinked = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
-    relinked['adjacent'] = False
-    base = make_fiber(BASE_CPS, branches=[adjacent])
-    local = make_fiber(BASE_CPS, branches=[relinked], generation=2)
-    remote = make_fiber(BASE_CPS, branches=[adjacent], tags=['x'], generation=2)
-    result = merge_fibers(base, local, remote)
-    assert result['ok']
-    merged = result['merged']['branches'][0]
-    assert merged['adjacent'] is False
-    assert merged['pending'] is True
-    # And the mirror image: re-linked as adjacent on remote, local untouched.
-    ordinary = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=False)
-    ordinary['adjacent'] = False
-    as_adjacent = copy.deepcopy(relinked)
-    as_adjacent['adjacent'] = True
-    result = merge_fibers(make_fiber(BASE_CPS, branches=[ordinary]),
-                          make_fiber(BASE_CPS, branches=[ordinary], tags=['x'], generation=2),
-                          make_fiber(BASE_CPS, branches=[as_adjacent], generation=2))
-    assert result['ok']
-    assert result['merged']['branches'][0]['adjacent'] is True
-
-
-def test_stripped_kind_is_a_conflict():
-    """The strip case: the base had adjacent, one side (an older VC3D's
-    save) carries no key at all. Indistinguishable from nothing on disk but
-    the absence itself, so it is a conflict, not a silent win - on either
-    side, and when both sides lost it."""
-    adjacent = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
-    adjacent['adjacent'] = True
-    stripped = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
-    assert 'adjacent' not in stripped
-    base = make_fiber(BASE_CPS, branches=[adjacent])
-    for local_links, remote_links in (([stripped], [adjacent]),
-                                      ([adjacent], [stripped]),
-                                      ([stripped], [stripped])):
-        result = merge_fibers(base,
-                              make_fiber(BASE_CPS, branches=local_links, generation=2),
-                              make_fiber(BASE_CPS, branches=remote_links, tags=['x'],
-                                         generation=2))
-        assert not result['ok']
-        assert any('older VC3D' in message for message in result['conflicts'])
-
-
-def test_stripped_kind_is_a_conflict_through_the_shortcuts():
-    """The whole-document shortcuts (remote == base, local == remote) must
-    not let a stripped copy through as "the only change" or "agreed"."""
-    adjacent = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
-    adjacent['adjacent'] = True
-    stripped = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
-    base = make_fiber(BASE_CPS, branches=[adjacent])
-    # local stripped, remote untouched (== base)
-    result = merge_fibers(base, make_fiber(BASE_CPS, branches=[stripped], generation=2),
-                          copy.deepcopy(base))
-    assert not result['ok'] and any('older VC3D' in m for m in result['conflicts'])
-    # both stripped and identical
-    result = merge_fibers(base, make_fiber(BASE_CPS, branches=[stripped], generation=2),
-                          make_fiber(BASE_CPS, branches=[stripped], generation=2))
-    assert not result['ok'] and any('older VC3D' in m for m in result['conflicts'])
-
-
-def test_stripped_kind_versus_deletion_is_a_conflict():
-    """One side lost the key (older writer), the other deleted the link:
-    neither a deletion nor a decision, in either orientation."""
-    adjacent = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
-    adjacent['adjacent'] = True
-    stripped = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
-    base = make_fiber(BASE_CPS, branches=[adjacent])
-    for local_links, remote_links in (([stripped], []), ([], [stripped])):
-        result = merge_fibers(base,
-                              make_fiber(BASE_CPS, branches=local_links, generation=2),
-                              make_fiber(BASE_CPS, branches=remote_links, tags=['x'],
-                                         generation=2))
-        assert not result['ok']
-        assert any('older VC3D' in m for m in result['conflicts'])
-
-
-def test_refresh_leaves_b_untouched_on_a_kind_conflict():
-    """A carries no kind while B says adjacent: conflict, and B comes back
-    byte-identical even when its review state or anchors would otherwise
-    have been corrected."""
-    b_cps = [cp(i, dz=50.0) for i in range(4)]
-    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1, pending=True)
-    b['branches'][0]['adjacent'] = True
-    a['branches'][0].pop('pending')          # A approved; B still pending
-    before = copy.deepcopy(b)
+def test_refresh_missing_array_cannot_erase_peer_adjacent_links():
+    a, b = adjacent_pair()
+    del a['adjacent_branches']
     out = refresh_pair_links(a, b, 'a.json', 'b.json')
     assert not out['ok']
-    assert out['b_doc'] == before and not out['b_changed']
+    assert any('older VC3D' in message for message in out['conflicts'])
+    assert out['b_doc'] == b and not out['b_changed']
 
 
-def test_refresh_with_base_detects_both_sides_stripped():
-    """A's base knew the link as adjacent; A (merged) and B both lack the
-    key: nothing says adjacent any more, but the base does - conflict."""
-    b_cps = [cp(i, dz=50.0) for i in range(4)]
-    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1)
+def test_refresh_with_base_detects_both_arrays_stripped():
+    a, b = adjacent_pair()
     base = copy.deepcopy(a)
-    base['branches'][0]['adjacent'] = True
+    del a['adjacent_branches']
+    del b['adjacent_branches']
     out = refresh_pair_links(a, b, 'a.json', 'b.json', base_doc=base)
     assert not out['ok']
-    assert any('older VC3D' in m for m in out['conflicts'])
+    assert out['a_doc'] == a and out['b_doc'] == b
 
 
-def test_moved_anchor_on_an_older_build_is_a_conflict():
-    """An older build moved the linked control point AND stripped the key:
-    the entry no longer pairs with the base's (it reads as an addition), so
-    the per-link strip check cannot see it. The file-level regression check
-    does: the base knew every kind, the side has an entry with none."""
-    adjacent = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
-    adjacent['adjacent'] = True
-    base = make_fiber(BASE_CPS, branches=[adjacent])
-    moved_cps = list(BASE_CPS)
-    moved_cps[2] = [BASE_CPS[2][0] + 40.0, BASE_CPS[2][1], BASE_CPS[2][2]]
-    moved = link('kb_a.json', moved_cps[2], OTHER, 2, pending=True)   # no key
-    local = make_fiber(moved_cps, branches=[moved], generation=2)
+@pytest.mark.parametrize('kind', ['branches', 'adjacent_branches'])
+def test_refresh_deletion_only_removes_same_kind_reciprocal(kind):
+    a, b = adjacent_pair()
+    other = 'branches' if kind == 'adjacent_branches' else 'adjacent_branches'
+    for doc in (a, b):
+        doc['branches'] = copy.deepcopy(doc['adjacent_branches'])
+    base = copy.deepcopy(a)
+    a[kind] = []
+    out = refresh_pair_links(a, b, 'a.json', 'b.json', base_doc=base)
+    assert out['ok']
+    assert out['b_doc'][kind] == []
+    assert len(out['b_doc'][other]) == 1
+    assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
+
+
+@pytest.mark.parametrize('kind', ['branches', 'adjacent_branches'])
+@pytest.mark.parametrize('remote_action', ['untouched', 'deleted', 'approved'])
+def test_relink_moves_entry_and_keeps_fresh_review_state(kind, remote_action):
+    old_kind = 'adjacent_branches' if kind == 'branches' else 'branches'
+    entry = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
+    base = make_fiber(BASE_CPS, **{old_kind: [entry]})
+    local = make_fiber(BASE_CPS, generation=2, **{kind: [entry]})
     remote = copy.deepcopy(base)
-    result = merge_fibers(base, local, remote)
-    assert not result['ok']
-    assert any('older VC3D' in m for m in result['conflicts'])
-    # The mirror: remote regressed, local untouched.
-    result = merge_fibers(base, copy.deepcopy(base),
-                          make_fiber(moved_cps, branches=[moved], generation=2))
-    assert not result['ok']
-
-
-def test_mixed_base_still_detects_a_stripped_adjacent_link():
-    """The base has an adjacent link beside a legacy entry (an older build's
-    addition, copied in): the file-level "knowing writer" sign is gone, but
-    the adjacent link itself losing its key, or vanishing while a legacy
-    entry is present, is still a regression."""
-    adjacent = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
-    adjacent['adjacent'] = True
-    legacy = link('kb_c.json', BASE_CPS[4], [7.0, 7.0, 7.0], 4, pending=True)  # no key
-    base = make_fiber(BASE_CPS, branches=[adjacent, legacy])
-    stripped = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)          # no key
-    assert fiber_merge.legacy_regression(make_fiber(BASE_CPS, branches=[stripped, legacy]), base)
-    # moved anchor: the adjacent link is gone, a legacy entry remains
-    moved_cps = list(BASE_CPS)
-    moved_cps[2] = [BASE_CPS[2][0] + 40.0, BASE_CPS[2][1], BASE_CPS[2][2]]
-    moved = link('kb_a.json', moved_cps[2], OTHER, 2, pending=True)
-    assert fiber_merge.legacy_regression(make_fiber(moved_cps, branches=[moved, legacy]), base)
-    # the adjacent link kept its key: the legacy entry alone is no regression
-    assert fiber_merge.legacy_regression(make_fiber(BASE_CPS, branches=[adjacent, legacy]),
-                                         base) is None
-    # deleted outright by a knowing writer (no legacy entry left): no regression
-    assert fiber_merge.legacy_regression(make_fiber(BASE_CPS, branches=[]), base) is None
-
-
-def test_legacy_regression_needs_a_knowing_base():
-    """A base written before the key existed proves nothing: absent keys on
-    a side are then simply legacy entries, not a regression."""
-    legacy = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
-    base = make_fiber(BASE_CPS, branches=[legacy])
-    assert fiber_merge.legacy_regression(copy.deepcopy(base), base) is None
-    knowing = copy.deepcopy(base)
-    knowing['branches'][0]['adjacent'] = False
-    assert fiber_merge.legacy_regression(copy.deepcopy(base), knowing)
-    assert fiber_merge.legacy_regression(knowing, knowing) is None
-
-
-def test_refresh_rejects_a_regressed_a_against_its_base():
-    """A lost its kind keys since its base: the refresh decides nothing."""
-    b_cps = [cp(i, dz=50.0) for i in range(4)]
-    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1)
-    base = copy.deepcopy(a)
-    base['branches'][0]['adjacent'] = False
-    out = refresh_pair_links(a, b, 'a.json', 'b.json', base_doc=base)
-    assert not out['ok'] and any('older VC3D' in m for m in out['conflicts'])
-
-
-def test_relinked_as_adjacent_survives_deletion_on_the_other_side():
-    """Local unlinked the pair and re-linked it as adjacent (same anchors),
-    remote deleted the original: the re-link is a modification, so it
-    survives like an approval would, instead of vanishing."""
-    ordinary = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
-    ordinary['adjacent'] = False
-    adjacent = copy.deepcopy(ordinary)
-    adjacent['adjacent'] = True
-    base = make_fiber(BASE_CPS, branches=[ordinary])
-    local = make_fiber(BASE_CPS, branches=[adjacent], generation=2)
-    remote = make_fiber(BASE_CPS, branches=[], tags=['x'], generation=2)
+    remote['tags'] = ['x']
+    if remote_action == 'deleted':
+        remote[old_kind] = []
+    elif remote_action == 'approved':
+        remote[old_kind][0]['pending'] = False
     result = merge_fibers(base, local, remote)
     assert result['ok']
-    assert len(result['merged']['branches']) == 1
-    assert result['merged']['branches'][0]['adjacent'] is True
+    assert result['merged'][old_kind] == []
+    assert result['merged'][kind] == [entry]
+    assert result['stats']['links_approved'] == 0
+
+
+@pytest.mark.parametrize('sides', ['local', 'remote', 'both'])
+@pytest.mark.parametrize('other_action', ['untouched', 'metadata', 'deleted'])
+def test_stripped_array_is_a_conflict_before_all_shortcuts(sides, other_action):
+    entry = link('kb_a.json', BASE_CPS[2], OTHER, 2)
+    base = make_fiber(BASE_CPS, adjacent_branches=[entry])
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    for name, doc in (('local', local), ('remote', remote)):
+        if sides in (name, 'both'):
+            del doc['adjacent_branches']
+            doc['generation'] = 2
+        elif other_action == 'metadata':
+            doc['tags'] = ['x']
+        elif other_action == 'deleted':
+            doc['adjacent_branches'] = []
+    result = merge_fibers(base, local, remote)
+    assert not result['ok']
+    assert any('older VC3D' in message for message in result['conflicts'])
+
+
+def test_strip_detection_does_not_depend_on_remaining_links_or_geometry():
+    entry = link('kb_a.json', BASE_CPS[2], OTHER, 2)
+    base = make_fiber(BASE_CPS, branches=[entry], adjacent_branches=[entry])
+    stripped = make_fiber([cp(i, dz=50) for i in range(4)])
+    del stripped['adjacent_branches']
+    assert fiber_merge.legacy_regression(stripped, base)
+    stripped['adjacent_branches'] = []
+    assert fiber_merge.legacy_regression(stripped, base) is None
+
+
+@pytest.mark.parametrize('has_array', [False, True])
+def test_legacy_regression_requires_base_adjacent_entries(has_array):
+    base = make_fiber(BASE_CPS)
+    if not has_array:
+        del base['adjacent_branches']
+    legacy = make_fiber(BASE_CPS)
+    del legacy['adjacent_branches']
+    assert fiber_merge.legacy_regression(legacy, base) is None
+    result = merge_fibers(base, legacy, legacy)
+    assert result['ok'] and result['merged']['adjacent_branches'] == []
 
 
 def test_merge_kind_mismatch_without_a_base_is_a_conflict():
-    """Both sides added a link at the same anchors, one adjacent and one
-    ordinary, with no base to say who changed what: a conflict."""
-    ordinary = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
-    ordinary['adjacent'] = False
-    adjacent = copy.deepcopy(ordinary)
-    adjacent['adjacent'] = True
-    base = make_fiber(BASE_CPS, branches=[])
-    local = make_fiber(BASE_CPS, branches=[adjacent], generation=2)
-    remote = make_fiber(BASE_CPS, branches=[ordinary], tags=['x'], generation=2)
-    result = merge_fibers(base, local, remote)
+    entry = link('kb_a.json', BASE_CPS[2], OTHER, 2)
+    result = merge_fibers(make_fiber(BASE_CPS),
+                          make_fiber(BASE_CPS, adjacent_branches=[entry]),
+                          make_fiber(BASE_CPS, branches=[entry]))
     assert not result['ok']
     assert any('adjacent' in message for message in result['conflicts'])
+
+
+def test_merge_combines_both_arrays_and_reports_adjacent_peers():
+    ordinary = link('ordinary.json', BASE_CPS[2], OTHER, 2)
+    adjacent = link('adjacent.json', BASE_CPS[4], OTHER, 4)
+    result = merge_fibers(make_fiber(BASE_CPS),
+                          make_fiber(BASE_CPS, branches=[ordinary]),
+                          make_fiber(BASE_CPS, adjacent_branches=[adjacent]))
+    assert result['ok']
+    assert result['merged']['branches'] == [ordinary]
+    assert result['merged']['adjacent_branches'] == [adjacent]
+    assert result['peer_files'] == ['adjacent.json', 'ordinary.json']
+
+
+@pytest.mark.parametrize('kind', ['branches', 'adjacent_branches'])
+def test_each_kind_reanchors_links_after_geometry_merge(kind):
+    a, b = adjacent_pair()
+    if kind == 'branches':
+        for doc in (a, b):
+            doc['branches'], doc['adjacent_branches'] = doc['adjacent_branches'], []
+    local, remote = copy.deepcopy(a), copy.deepcopy(a)
+    local['control_points'].insert(1, cp(0.5))
+    local['line_points'] = line_for(local['control_points'])
+    local[kind][0]['control_point_index'] += 1
+    remote[kind][0]['pending'] = False
+    merged = merge_fibers(a, local, remote)
+    assert merged['ok']
+    assert merged['merged'][kind][0]['control_point_index'] == 3
+    assert not merged['merged'][kind][0]['pending']
+    refreshed = refresh_pair_links(merged['merged'], b, 'a.json', 'b.json', base_doc=a)
+    assert refreshed['ok']
+    assert loader_issues({'a.json': refreshed['a_doc'], 'b.json': refreshed['b_doc']}) == []
+
+
+@pytest.mark.parametrize('kind', ['branches', 'adjacent_branches'])
+def test_each_kind_preserves_opaque_entries(kind):
+    base = make_fiber(BASE_CPS, **{kind: [{'unrecognized': 'entry'}]})
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['tags'], remote['tags'] = ['local'], ['remote']
+    result = merge_fibers(base, local, remote)
+    assert result['ok'] and result['merged'][kind] == base[kind]
 
 
 def test_branch_file_compared_as_basename():

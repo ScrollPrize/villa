@@ -7,6 +7,7 @@
 #include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
 #include "FiberSliceGeometry.hpp"
+#include "LineAnnotationAdjacentLinks.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSaveJob.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
@@ -6999,7 +7000,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
                                                branch.branchControlPointIndex,
                                                branch.pending,
                                                branch.adjacent,
-                                               branch.adjacentKeyPresent});
+                                               true});
         }
         snapshot.fibers.push_back(std::move(entry));
     }
@@ -8553,7 +8554,8 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
             farIt->branches.begin(),
             farIt->branches.end(),
             [&reciprocal](const FiberBranchRef& branch) {
-                return branch.branchFiberId == reciprocal.branchFiberId &&
+                return branch.adjacent == reciprocal.adjacent &&
+                       branch.branchFiberId == reciprocal.branchFiberId &&
                        branch.controlPointIndex == reciprocal.controlPointIndex &&
                        branch.branchControlPointIndex == reciprocal.branchControlPointIndex;
             });
@@ -13441,8 +13443,8 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         }
         sortLoadedFibers(strictFibers);
         dedupeLoadedFiberSources(strictFibers, sources);
-        (void)validateLoadedFiberLinks(strictFibers, strictErrors);
         healOneSidedAdjacentLinks(strictFibers);
+        (void)validateLoadedFiberLinks(strictFibers, strictErrors);
         return std::pair<std::vector<StoredFiber>, std::vector<std::string>>{
             std::move(strictFibers),
             std::move(strictErrors)};
@@ -13496,6 +13498,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         }
     }
 
+    healOneSidedAdjacentLinks(loadedFibers);
     const auto branchLinkIssues = collectLoadedFiberBranchIssues(loadedFibers);
     std::vector<std::string> branchErrors = branchLoadErrors;
     branchErrors.reserve(branchErrors.size() + branchLinkIssues.size());
@@ -13575,7 +13578,6 @@ void LineAnnotationController::loadFibersForCurrentPackage()
     std::vector<std::string> loadErrors = std::move(fatalLoadErrors);
     if (branchErrors.empty()) {
         (void)validateLoadedFiberLinks(loadedFibers, loadErrors);
-        healOneSidedAdjacentLinks(loadedFibers);
     }
 
     for (auto& fiber : loadedFibers) {
@@ -16130,7 +16132,8 @@ std::vector<uint64_t> LineAnnotationController::syncBranchEndpointPositions(
             const bool sameLinkedEndpoint =
                 reciprocal.branchControlPointIndex == sourceBranch.controlPointIndex ||
                 pointsApproximatelyEqual(reciprocal.branchControlPointPosition, sourcePoint);
-            if (!pointsToSession || !sameLocalEndpoint || !sameLinkedEndpoint) {
+            if (reciprocal.adjacent != sourceBranch.adjacent ||
+                !pointsToSession || !sameLocalEndpoint || !sameLinkedEndpoint) {
                 continue;
             }
             reciprocal.controlPointIndex = targetControlPointIndex;
@@ -17073,6 +17076,7 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
         {"manual_tag", serialized.manualHvTag},
     };
     root["branches"] = nlohmann::json::array();
+    root[kAdjacentBranchesJsonKey] = nlohmann::json::array();
     for (const auto& branch : serialized.branches) {
         if (branch.controlPointIndex < 0 || branch.branchFiberId == 0) {
             continue;
@@ -17108,10 +17112,8 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
         if (branch.pending) {
             branchJson["pending"] = true;
         }
-        // Always explicit: absence is reserved for entries written by builds
-        // that do not know the kind (see kAdjacentLinkJsonKey).
-        branchJson[kAdjacentLinkJsonKey] = branch.adjacent;
-        root["branches"].push_back(std::move(branchJson));
+        root[branch.adjacent ? kAdjacentBranchesJsonKey : "branches"]
+            .push_back(std::move(branchJson));
     }
     for (size_t index = 0; index + 1 < serialized.controlPoints.size(); ++index) {
         if (!serialized.controlPoints[index].segmentToNext) {
@@ -17255,7 +17257,8 @@ void LineAnnotationController::canonicalizeFiberSaveSnapshots(
                 target->fiber.branches.begin(),
                 target->fiber.branches.end(),
                 [&snapshot, &branch](const FiberBranchRef& candidate) {
-                    return branchReferencesFiber(candidate,
+                    return candidate.adjacent == branch.adjacent &&
+                           branchReferencesFiber(candidate,
                                                  snapshot.fiber.id,
                                                  snapshot.fiber.fileName) &&
                            (candidate.controlPointIndex ==
@@ -17370,7 +17373,8 @@ void LineAnnotationController::validateFiberSaveSnapshots(
                 target->fiber.branches.begin(),
                 target->fiber.branches.end(),
                 [&snapshot, &branch](const FiberBranchRef& candidate) {
-                    return branchReferencesFiber(candidate,
+                    return candidate.adjacent == branch.adjacent &&
+                           branchReferencesFiber(candidate,
                                                  snapshot.fiber.id,
                                                  snapshot.fiber.fileName) &&
                            candidate.controlPointIndex == branch.branchControlPointIndex &&
@@ -17698,7 +17702,11 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
         fiber.tags = normalizedFiberTagsFromJson(root.at("tags"));
     }
 
-    if (root.contains("branches")) {
+    fiber.adjacentBranchesPresent = root.contains(kAdjacentBranchesJsonKey);
+    for (const auto* kind : {"branches", kAdjacentBranchesJsonKey}) {
+        if (!root.contains(kind)) {
+            continue;
+        }
         auto recordBranchError = [&](const std::string& reason) {
             if (branchErrors) {
                 branchErrors->push_back(fiberErrorName(fiber.fileName) + ": " + reason);
@@ -17706,9 +17714,9 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
             }
             throw std::runtime_error(reason);
         };
-        const auto& branches = root.at("branches");
+        const auto& branches = root.at(kind);
         if (!branches.is_array()) {
-            if (recordBranchError("branches must be an array")) {
+            if (recordBranchError(std::string(kind) + " must be an array")) {
                 fiber.needsSave = true;
             }
         } else {
@@ -17763,8 +17771,7 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
                     branch.branchControlPointPosition =
                         pointFromJson(branchJson.at("branch_control_point_position"));
                     branch.pending = branchJson.value("pending", false);
-                    branch.adjacentKeyPresent = branchJson.contains(kAdjacentLinkJsonKey);
-                    branch.adjacent = branchJson.value(kAdjacentLinkJsonKey, false);
+                    branch.adjacent = std::string_view(kind) == kAdjacentBranchesJsonKey;
                     if (branch.controlPointIndex < 0 ||
                         static_cast<size_t>(branch.controlPointIndex) >=
                             fiber.controlPoints.size()) {
@@ -17881,17 +17888,14 @@ bool LineAnnotationController::isReciprocalBranchRef(const StoredFiber& fiber,
                                                      const FiberBranchRef& branch,
                                                      const FiberBranchRef& candidate)
 {
-    return candidate.branchFileName == fiber.fileName &&
-           candidate.controlPointIndex == branch.branchControlPointIndex &&
-           candidate.branchControlPointIndex == branch.controlPointIndex &&
-           pointsApproximatelyEqual(candidate.controlPointPosition,
-                                    branch.branchControlPointPosition) &&
-           pointsApproximatelyEqual(candidate.branchControlPointPosition,
-                                    branch.controlPointPosition) &&
-           branchDirectionsCompatible(candidate.controlPointDirection,
-                                      branch.branchControlPointDirection) &&
-           branchDirectionsCompatible(candidate.branchControlPointDirection,
-                                      branch.controlPointDirection);
+    return vc3d::line_annotation::reciprocalBranchRefMatches(
+        fiber, branch, candidate,
+        [](const cv::Vec3d& a, const cv::Vec3d& b) {
+            return pointsApproximatelyEqual(a, b);
+        },
+        [](const cv::Vec3d& a, const cv::Vec3d& b) {
+            return branchDirectionsCompatible(a, b);
+        });
 }
 
 std::vector<LineAnnotationController::BranchLinkValidationIssue>
@@ -17995,41 +17999,12 @@ LineAnnotationController::collectLoadedFiberBranchIssues(
 
 void LineAnnotationController::healOneSidedAdjacentLinks(std::vector<StoredFiber>& fibers) const
 {
-    // The same keys the validation pairs files with: source-qualified, so two
-    // working copies sharing a basename never heal each other.
-    std::unordered_map<std::string, std::size_t> indexByFileName;
-    indexByFileName.reserve(fibers.size());
-    for (std::size_t i = 0; i < fibers.size(); ++i) {
-        if (!fibers[i].fileName.empty()) {
-            indexByFileName[(fibers[i].sourceRoot / fibers[i].fileName).lexically_normal().string()] = i;
-        }
-    }
-    for (const StoredFiber& fiber : fibers) {
-        for (const FiberBranchRef& branch : fiber.branches) {
-            if (!branch.adjacent || branch.branchFileName.empty()) {
-                continue;
-            }
-            const auto target =
-                indexByFileName.find(loadedFiberLinkKey(fiber, branch.branchFileName));
-            if (target == indexByFileName.end()) {
-                continue;
-            }
-            StoredFiber& other = fibers[target->second];
-            for (FiberBranchRef& reciprocal : other.branches) {
-                if (!isReciprocalBranchRef(fiber, branch, reciprocal) || reciprocal.adjacent ||
-                    reciprocal.adjacentKeyPresent) {
-                    continue;
-                }
-                reciprocal.adjacent = true;
-                reciprocal.adjacentKeyPresent = true;
-                other.needsSave = true;
-                other.adjacentHealed = true;
-                Logger()->info("Restored the adjacent link kind on {} (its file carried no "
-                               "adjacent key; {} says adjacent)",
-                               other.fileName, fiber.fileName);
-            }
-        }
-    }
+    vc3d::line_annotation::restoreMissingAdjacentBranchRefs(
+        fibers,
+        [this](const StoredFiber& fiber, const std::string& name) {
+            return loadedFiberLinkKey(fiber, name);
+        },
+        isReciprocalBranchRef);
 }
 
 bool LineAnnotationController::adjacentHealSaveIsStale(const StoredFiber& fiber) const
@@ -18100,14 +18075,6 @@ bool LineAnnotationController::repairLoadedFiberBranchLinks(
             break;
         }
     }
-
-    // Survivors only, and before anything is written back: a fiber saved
-
-    // here would otherwise write an explicit false over a flag the heal
-
-    // is about to restore.
-
-    healOneSidedAdjacentLinks(fibers);
 
     for (auto& fiber : fibers) {
         const std::string sourceFile =
