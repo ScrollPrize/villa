@@ -21,6 +21,7 @@ def open_zarr_group(path, mode: str = 'r', storage_options: Optional[Dict[str, A
     back to v2 when nothing is there yet. zarr 2 has no ``zarr_format``
     argument.
     """
+    preserved_attrs = None
     if _ZARR_V3 and 'zarr_format' not in kwargs:
         if mode in ('w', 'w-'):
             kwargs['zarr_format'] = 2
@@ -29,8 +30,8 @@ def open_zarr_group(path, mode: str = 'r', storage_options: Optional[Dict[str, A
             # Forcing v2 would write a second .zgroup next to an existing
             # zarr.json and leave a store that reads as v3 and empty. An
             # *empty* v3 group, though, is what a failed run on zarr 3 leaves
-            # behind (zarr.json only); there is nothing to keep, so recreate
-            # it as v2 rather than write a v3 store no consumer reads.
+            # behind (zarr.json only); no data is at stake, so recreate it as
+            # v2 rather than write a v3 store no consumer reads.
             try:
                 existing = zarr.open_group(
                     path, mode='r', storage_options=storage_options
@@ -40,12 +41,21 @@ def open_zarr_group(path, mode: str = 'r', storage_options: Optional[Dict[str, A
             else:
                 fmt = int(existing.metadata.zarr_format)
                 if fmt != 2 and len(existing) == 0:
+                    # `len() == 0` means no child arrays or groups, not no
+                    # metadata: a group can carry attributes (OME
+                    # `multiscales`, this package's own patch_size/sigma)
+                    # before anything is written into it, and mode='w'
+                    # would drop them. Carry them across the conversion.
+                    preserved_attrs = dict(existing.attrs)
                     mode, kwargs['zarr_format'] = 'w', 2
                 else:
                     kwargs['zarr_format'] = fmt
     if storage_options is not None:
         kwargs['storage_options'] = storage_options
-    return zarr.open_group(path, mode=mode, **kwargs)
+    group = zarr.open_group(path, mode=mode, **kwargs)
+    if preserved_attrs:
+        group.attrs.update(preserved_attrs)
+    return group
 
 
 def _v3_compressor(group, compressor):

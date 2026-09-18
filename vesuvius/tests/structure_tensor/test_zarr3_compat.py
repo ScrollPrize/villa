@@ -241,3 +241,20 @@ def test_ome_u8_vector_writer_creates_scale_arrays(tmp_path):
         downsample=2,
         make_confidence=True,
     )
+
+
+@pytest.mark.skipif(not _ZARR_V3, reason="zarr 3 stores only exist under zarr 3")
+def test_open_zarr_group_append_keeps_attrs_of_empty_v3_group(tmp_path):
+    """An empty group is not necessarily a bare one: recreating a v3 leftover
+    as v2 must not throw away metadata written before the first array."""
+    path = str(tmp_path / "meta_only.zarr")
+    seed = zarr.open_group(path, mode="w", zarr_format=3)
+    seed.attrs["multiscales"] = [{"version": "0.4", "datasets": [{"path": "0"}]}]
+    seed.attrs["patch_size"] = [128, 128, 128]
+
+    root = open_zarr_group(path, mode="a")
+
+    assert root.metadata.zarr_format == 2
+    assert root.attrs["multiscales"] == [{"version": "0.4", "datasets": [{"path": "0"}]}]
+    assert root.attrs["patch_size"] == [128, 128, 128]
+    assert dict(zarr.open_group(path, mode="r").attrs) == dict(root.attrs)
