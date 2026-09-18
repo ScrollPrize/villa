@@ -35,8 +35,28 @@ except ImportError:  # pragma: no cover - triton is present on CUDA installs
 _TWO_PI = 2 * math.pi
 
 
+_warned_missing_triton = False
+
+
+def _warn_missing_triton():
+    # PyTorch publishes no triton wheel for Windows, so this fallback is the
+    # default there rather than the exception the import guard reads like. Say
+    # so once, the way tracks.py does when the native crossing consolidator is
+    # missing; silently running a much slower path with slightly different
+    # results is worse than a line of output.
+    global _warned_missing_triton
+    if not _warned_missing_triton:
+        _warned_missing_triton = True
+        print(
+            'WARNING: triton is unavailable; the fused gap-expander kernels fall back '
+            'to the much slower eager path, whose results differ slightly')
+
+
 def gap_triton_available(*tensors):
-    if not _HAS_TRITON or os.environ.get('FIT_SPIRAL_TRITON', '1') == '0':
+    if not _HAS_TRITON:
+        _warn_missing_triton()
+        return False
+    if os.environ.get('FIT_SPIRAL_TRITON', '1') == '0':
         return False
     return all(
         t.is_cuda and t.dtype == torch.float32 for t in tensors if t is not None

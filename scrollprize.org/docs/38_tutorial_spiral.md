@@ -102,6 +102,11 @@ uv sync
 
 Everything the fit needs is declared in the project's own [`pyproject.toml`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/pyproject.toml), `torch` included — on Linux it comes from the CUDA 12.8 wheel index, so there is no separate torch install to get right. `uv sync` also builds `vc_spiral`, a small C++ extension the fit uses to link point annotations to patch surfaces, so the machine needs cmake and a C++ toolchain; you no longer need a volume-cartographer Python install.
 
+Two notes for Windows, where the fit runs natively:
+
+- PyPI marks PyTorch's CUDA runtime packages `platform_system == "Linux"`, so the line above installs a CPU-only build there. Take it from the CUDA index instead, e.g. `uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128`.
+- PyTorch also publishes no `triton` wheel for Windows, and the fit's fused RK4 and gap kernels quietly fall back to the eager path without it. Installing the community `triton-windows` build that matches the `triton` version your torch pins puts the fused path back; on one machine that was 3.8 vs 1.7 it/s, with the first run paying a one-off kernel compile.
+
 #### Get the dataset
 
 Ready-made inputs are published in the [`spiral-input` dataset](data_datasets#spiral-input-2026-07), which lives on the dl.ash2txt.org data server : [Spiral Datasets](https://dl.ash2txt.org/datasets/spiral_datasets/PHercParis4/) (~90 GB):
