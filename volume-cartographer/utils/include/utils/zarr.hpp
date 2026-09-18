@@ -225,6 +225,19 @@ struct ShardConfig {
     std::vector<std::size_t> sub_chunks;   // inner chunk shape
     std::vector<ZarrCodecConfig> index_codecs;  // codecs for the shard index
     std::vector<ZarrCodecConfig> sub_codecs;    // codecs for inner chunks
+    // Where the index lives in the shard file: "start" (VC's own writer) or
+    // "end" (the zarr v3 default, used by zarr-python and volcomp exports).
+    std::string index_location = "start";
+
+    [[nodiscard]] bool index_at_end() const noexcept { return index_location == "end"; }
+    /// Bytes the index occupies in the shard: 16 per inner chunk, plus the
+    /// 4-byte checksum when the index codec pipeline ends with crc32c.
+    [[nodiscard]] std::size_t index_bytes(std::size_t n_inner) const noexcept {
+        std::size_t n = n_inner * 16;
+        for (const auto& c : index_codecs)
+            if (c.name == "crc32c") n += 4;
+        return n;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -244,6 +257,10 @@ struct ZarrMetadata {
     char byte_order = '<';
     std::string compressor_id;           // "blosc", "zlib", "zstd", or "" for raw
     int compression_level = 5;
+    // Quantiser step for lossy codecs configured by a float ("volcomp": q).
+    // v2: compressor {"id":"volcomp","q":Q}; v3 carries it in the codec
+    // configuration instead. 0 = unset.
+    float codec_q = 0.0f;
     std::string dimension_separator = ".";
     std::vector<ZarrFilter> filters;     // v2 filters applied before compression
 
@@ -303,6 +320,10 @@ struct ZarrMetadata {
 /// magic-check before decode.
 [[nodiscard]] bool is_canonical_c3d(const ZarrMetadata& m) noexcept;
 
+/// Structural check: uint8, 128^3 chunks (the volcomp codec atom) carrying
+/// the "volcomp" codec — v3 sharded (any shard multiple of 128^3) or plain.
+[[nodiscard]] bool is_canonical_volcomp(const ZarrMetadata& m) noexcept;
+
 // ---------------------------------------------------------------------------
 // Store abstraction
 // ---------------------------------------------------------------------------
@@ -331,6 +352,14 @@ public:
     /// Get a byte range from a key [offset, offset+length).
     [[nodiscard]] virtual std::optional<std::vector<std::byte>>
     get_partial(const std::string& key, std::size_t offset, std::size_t length) const;
+
+    /// Size in bytes of the object at key, when the store can answer cheaply
+    /// (stat / HEAD). nullopt when unknown or absent; readers that need the
+    /// size (shard indexes stored at the end) then fall back to a full read.
+    [[nodiscard]] virtual std::optional<std::size_t> size_of(const std::string& key) const {
+        (void)key;
+        return std::nullopt;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -349,6 +378,7 @@ public:
     get_if_exists(const std::string& key) const override;
     [[nodiscard]] std::optional<std::vector<std::byte>>
     get_partial(const std::string& key, std::size_t offset, std::size_t length) const override;
+    [[nodiscard]] std::optional<std::size_t> size_of(const std::string& key) const override;
     void set(const std::string& key, std::span<const std::byte> value) override;
     void erase(const std::string& key) override;
 
@@ -381,6 +411,7 @@ public:
     void erase(const std::string& key) override;
     [[nodiscard]] std::optional<std::vector<std::byte>>
     get_partial(const std::string& key, std::size_t offset, std::size_t length) const override;
+    [[nodiscard]] std::optional<std::size_t> size_of(const std::string& key) const override;
 
 private:
     [[nodiscard]] std::string make_url(const std::string& key) const;
@@ -750,6 +781,11 @@ public:
     [[nodiscard]] std::optional<std::vector<std::byte>>
     extract_inner_chunk(std::span<const std::byte> shard_data,
                         std::span<const std::size_t> inner_indices) const;
+    /// Same, but returns the stored (still encoded) bytes, honouring
+    /// index_location; nullopt for a missing/empty chunk.
+    [[nodiscard]] std::optional<std::vector<std::byte>>
+    extract_inner_chunk_raw(std::span<const std::byte> shard_data,
+                            std::span<const std::size_t> inner_indices) const;
 
     // -- Members -------------------------------------------------------------
 private:
