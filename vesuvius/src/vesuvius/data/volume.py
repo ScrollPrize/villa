@@ -15,47 +15,13 @@ from pathlib import Path
 from vesuvius.install.accept_terms import get_installation_path
 import zarr
 
-# Substrings that mark a read as worth retrying. Matching on the message keeps
-# this independent of which stack (aiohttp, botocore, urllib3, ssl) raised:
-# zarr and fsspec wrap those differently across versions and backends.
-_TRANSIENT_READ_MARKERS = (
-    'payload is not completed',
-    'not enough data to satisfy content length',
-    'contentlengtherror',
-    'connection reset',
-    'connection aborted',
-    'connection closed',
-    'server disconnected',
-    'record layer failure',
-    'ssl',
-    'timed out',
-    'timeout',
-    'temporarily unavailable',
-    'slowdown',
-    'throttl',
-    'too many requests',
-    'internal error',
-    'service unavailable',
-    'bad gateway',
-    'gateway timeout',
-    ' 429',
-    ' 500',
-    ' 502',
-    ' 503',
-    ' 504',
+# Transient-remote-read classification and retry live in a shared leaf module
+# so both the prediction path here and ink_detection.volume_io use the same
+# marker list without drifting.  Re-exported here for backward compatibility.
+from ._transient_reads import (
+    _TRANSIENT_READ_MARKERS,
+    _is_transient_read_error,
 )
-
-
-def _is_transient_read_error(exc: BaseException) -> bool:
-    """True when a read failure looks like a network hiccup rather than a bug."""
-    seen = set()
-    while exc is not None and id(exc) not in seen:
-        seen.add(id(exc))
-        text = f"{type(exc).__name__}: {exc}".lower()
-        if any(marker in text for marker in _TRANSIENT_READ_MARKERS):
-            return True
-        exc = exc.__cause__ or exc.__context__
-    return False
 
 
 # Define the functions needed here to avoid circular imports
