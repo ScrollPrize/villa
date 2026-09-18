@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import math
 from pathlib import Path
+import time
 from typing import Sequence
 
 import numpy as np
@@ -23,6 +24,8 @@ INPUT_Z = OUTPUT_Z * POOL_Z
 TILE = 512
 CHUNK_XY = 128
 FORMAT_TAG = "level2-zmean4-21slice-v1"
+READ_RETRIES = 5
+RETRY_BACKOFF_S = 1.0
 
 
 def centered_slice(length: int, requested: int) -> tuple[int, int]:
@@ -111,11 +114,25 @@ def prepare_isotropic_input(
         for x0 in range(0, shape[2], TILE)
     ]
 
+    def read_block(y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+        """Read one tile, retrying transient remote failures."""
+        last_error: Exception | None = None
+        for attempt in range(READ_RETRIES):
+            try:
+                return np.asarray(
+                    source[z0:z1, y0:y1, x0:x1], dtype=np.float32
+                )
+            except Exception as exc:  # noqa: BLE001 - reader-specific
+                last_error = exc
+                if attempt + 1 < READ_RETRIES:
+                    time.sleep(RETRY_BACKOFF_S * (2 ** attempt))
+        raise RuntimeError(
+            f"tile y={y0}:{y1} x={x0}:{x1} failed after {READ_RETRIES} read attempts"
+        ) from last_error
+
     def process(tile: tuple[int, int, int, int]) -> None:
         y0, y1, x0, x1 = tile
-        block_ZYX = np.asarray(
-            source[z0:z1, y0:y1, x0:x1], dtype=np.float32
-        )
+        block_ZYX = read_block(y0, y1, x0, x1)
         pooled_ZYX = np.rint(
             block_ZYX.reshape(
                 OUTPUT_Z, POOL_Z, y1 - y0, x1 - x0
