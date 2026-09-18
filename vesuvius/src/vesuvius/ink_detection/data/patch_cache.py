@@ -24,13 +24,16 @@ def label_asset_fingerprint(paths: Iterable[Path | str | None]) -> str:
     patch count and the bounding boxes are the old ones, so training continues over
     supervision that has been deleted.
 
-    Hashing each asset's relative file names and sizes catches that, because rewriting a
-    zarr changes chunk sizes and dropping annotation deletes chunks outright when the
-    store does not write empty ones. It reads no chunk contents, so it costs one
-    directory walk -- ``os.scandir`` carries the size on Windows and Linux alike -- and it
-    cannot tell apart two different labels that compress to identical sizes under
-    identical names. A byte-identical copy of a tree fingerprints the same as its source,
-    which is the wanted behaviour.
+    Hashing each asset's relative file names, sizes and modification times catches that:
+    rewriting a zarr changes chunk sizes and stamps every chunk it writes, and dropping
+    annotation deletes chunks outright when the store does not write empty ones. It reads
+    no chunk contents, so it costs one directory walk -- ``os.scandir`` carries the stat
+    result on Windows and Linux alike, and the mtime rides along with the size for free.
+
+    The trade is that a copy of a tree fingerprints the same as its source only when the
+    copy preserved modification times; otherwise it misses once and the split is rebuilt.
+    A label rewritten to the same bytes at a new time misses the same way. Both err
+    towards rebuilding, which is the cheap side.
     """
 
     digest = hashlib.sha256()
@@ -40,7 +43,7 @@ def label_asset_fingerprint(paths: Iterable[Path | str | None]) -> str:
         if not root.exists():
             digest.update(b"\0missing")
             continue
-        entries: list[tuple[str, int]] = []
+        entries: list[tuple[str, int, int]] = []
         stack = [("", str(root))]
         while stack:
             relative, current = stack.pop()
@@ -54,13 +57,15 @@ def label_asset_fingerprint(paths: Iterable[Path | str | None]) -> str:
                     stack.append((name, child.path))
                     continue
                 try:
-                    size = child.stat().st_size
+                    stat = child.stat()
+                    size, mtime_ns = stat.st_size, stat.st_mtime_ns
                 except OSError:
-                    size = -1
-                entries.append((name, size))
-        for name, size in sorted(entries):
+                    size, mtime_ns = -1, -1
+                entries.append((name, size, mtime_ns))
+        for name, size, mtime_ns in sorted(entries):
             digest.update(name.encode())
             digest.update(str(size).encode())
+            digest.update(str(mtime_ns).encode())
     return digest.hexdigest()[:16]
 
 

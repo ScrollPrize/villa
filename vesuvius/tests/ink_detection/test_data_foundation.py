@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import os
 import pickle
 import random
+import shutil
 import warnings
 
 import numpy as np
@@ -405,10 +407,19 @@ def test_patch_cache_is_rejected_when_a_label_changes_under_the_same_path(tmp_pa
     (mask / "0.0.1").unlink()
     assert load_patch_cache(path, config=config, segments=[segment]) is None
 
-    # restored, then rewritten to a different size under the same name
+    # rewritten to a different size under the same name
     _write_mask(mask, {"0.0.1": b"chunk-two"})
+    save_patch_cache(path, [Patch(segment=segment, bbox=(1, 2, 3, 4, 5, 6))])
     assert load_patch_cache(path, config=config, segments=[segment]) is not None
     (mask / "0.0.1").write_bytes(b"chunk-two-but-longer")
+    assert load_patch_cache(path, config=config, segments=[segment]) is None
+
+    # rewritten to the same size under the same name: only the modification time moves
+    save_patch_cache(path, [Patch(segment=segment, bbox=(1, 2, 3, 4, 5, 6))])
+    assert load_patch_cache(path, config=config, segments=[segment]) is not None
+    chunk = mask / "0.0.1"
+    chunk.write_bytes(b"chunk-two-but-edited")
+    os.utime(chunk, ns=(0, os.stat(chunk).st_mtime_ns + 1_000_000_000))
     assert load_patch_cache(path, config=config, segments=[segment]) is None
 
 
@@ -439,6 +450,14 @@ def test_label_fingerprint_is_stable_and_notices_each_asset(tmp_path):
 
     (ink / "0.0.0").write_bytes(b"aa")
     assert label_asset_fingerprint([ink, supervision]) != baseline
+
+    # a copy that kept modification times fingerprints as its source; a touch does not
+    copied = tmp_path / "elsewhere" / "ink.zarr"
+    shutil.copytree(ink, copied)
+    assert label_asset_fingerprint([copied]) == label_asset_fingerprint([ink])
+    stamp = os.stat(copied / "0.0.0").st_mtime_ns + 1_000_000_000
+    os.utime(copied / "0.0.0", ns=(stamp, stamp))
+    assert label_asset_fingerprint([copied]) != label_asset_fingerprint([ink])
 
     missing = label_asset_fingerprint([tmp_path / "absent.zarr"])
     assert missing and missing != label_asset_fingerprint([ink])
