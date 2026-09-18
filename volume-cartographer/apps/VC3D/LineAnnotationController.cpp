@@ -8349,6 +8349,14 @@ void LineAnnotationController::handleGeneratedControlPointLinkCandidate(
     if (controlPointIndex < storedIndexMap.size()) {
         candidate.storedControlPointIndexHint = storedIndexMap[controlPointIndex];
     }
+    // The newest designation of a point wins: a split candidate on this
+    // same point would otherwise keep drawing (its red marker takes
+    // precedence) and the point would look stuck. Candidates on different
+    // points coexist - "split from candidate and link" needs both.
+    if (_splitCandidate && _splitCandidate->fiberId == candidate.fiberId &&
+        pointsApproximatelyEqual(_splitCandidate->position, candidate.position)) {
+        _splitCandidate.reset();
+    }
     _linkCandidate = candidate;
 
     if (pane->dialog) {
@@ -9148,6 +9156,11 @@ void LineAnnotationController::handleGeneratedControlPointSplitCandidate(
     const auto storedIndexMap = storedIndexMapForSessionControls(session.controlPoints);
     if (controlPointIndex < storedIndexMap.size()) {
         candidate.storedControlPointIndexHint = storedIndexMap[controlPointIndex];
+    }
+    // The newest designation of a point wins (see the link candidate).
+    if (_linkCandidate && _linkCandidate->fiberId == candidate.fiberId &&
+        pointsApproximatelyEqual(_linkCandidate->position, candidate.position)) {
+        _linkCandidate.reset();
     }
     _splitCandidate = candidate;
 
