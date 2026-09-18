@@ -2262,9 +2262,16 @@ TEST_CASE("persistent fiberlet beam enforces configuration and state bounds")
     config.maximumGeneratedStatesPerIteration = 1;
 
     config.expansionThreads = 1;
-    CHECK_THROWS_AS(vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config), std::runtime_error);
+    try {
+        (void)vc::fiber_tracer::traceFiberletGraphReplay(
+            graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
+        FAIL("route-state limit was not enforced");
+    } catch (const vc::fiber_tracer::FiberletRouteStateLimitError& error) {
+        CHECK(error.attemptedStates() == 2);
+        CHECK(error.maximumStates() == 1);
+    }
     config.expansionThreads = 4;
-    CHECK_THROWS_AS(vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config), std::runtime_error);
+    CHECK_THROWS_AS(vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config), vc::fiber_tracer::FiberletRouteStateLimitError);
     config.maximumGeneratedStatesPerIteration = 100;
     config.beamWidth = 17;
     CHECK_NOTHROW(vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config));

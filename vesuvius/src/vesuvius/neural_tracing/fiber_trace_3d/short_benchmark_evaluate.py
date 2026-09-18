@@ -20,6 +20,7 @@ def bind_benchmark(config, manifest, *, backend=None, fiberlet=None, render=Fals
     for source in sources.values():
         source['fibers'] = []
     seen = set()
+    contrast_bindings = {}
     for case in manifest['cases']:
         path = str(Path(case['path']).resolve())
         if path in seen or sha256_file(path) != case['sha256']:
@@ -28,6 +29,26 @@ def bind_benchmark(config, manifest, *, backend=None, fiberlet=None, render=Fals
         if json.loads(Path(path).read_text()).get('evaluation_direction') != 'forward':
             raise ValueError('benchmark must contain directed forward annotations')
         sources[case['candidate']['source_id']]['fibers'].append(path)
+        choices = case.get('contrast_choices', [])
+        if choices and backend != 'fiberlet':
+            raise ValueError('contrast choices require the fiberlet backend')
+        bound = []
+        reference = json.loads(Path(path).read_text())
+        for choice in choices:
+            choice_path = str(Path(choice['path']).resolve())
+            if choice_path in seen or sha256_file(choice_path) != choice['sha256']:
+                raise ValueError('duplicate or changed contrast choice')
+            seen.add(choice_path)
+            document = json.loads(Path(choice_path).read_text())
+            for key in ('vc_open_data_coordinate_space',
+                        'vc_open_data_source_original_resolution'):
+                if document.get(key) != reference.get(key):
+                    raise ValueError('contrast choice coordinate binding mismatch')
+            if len(document.get('line_points', [])) < 2:
+                raise ValueError('contrast choice has no usable line')
+            bound.append(choice_path)
+        if bound:
+            contrast_bindings[path] = bound
     evaluation['sources'] = [s for s in sources.values() if s['fibers']]
     for key in ('live_endpoint', 'reference_plan', 'annotation_sha256'):
         evaluation.pop(key, None)
@@ -49,6 +70,12 @@ def bind_benchmark(config, manifest, *, backend=None, fiberlet=None, render=Fals
                     raise ValueError('fiberlet replay requires canonical source identity/cache root')
             evaluation['backend'] = backend
             evaluation['fiberlet'] = deepcopy(fiberlet or {})
+    if contrast_bindings:
+        radius = evaluation.get('fiberlet', {}).get(
+            'contrast_corridor_radius_base_voxels', 0)
+        if not isinstance(radius, (int, float)) or radius <= 0:
+            raise ValueError('contrast choices require a positive corridor radius')
+        evaluation['fiberlet_contrast_choices'] = contrast_bindings
     return evaluation
 
 
@@ -251,6 +278,62 @@ def prepare_corrections(workload):
     return dict(workload, benchmark_manifest=str(target), benchmark_corrections=[])
 
 
+def render_existing(workload, devices, *, gpu_manager=None, cancel_event=None):
+    """Render a completed split benchmark directly from its saved traces."""
+    from .cached_trace_profile import CachedReplaySession
+    from .live_evaluate import resume_visualization_selection
+
+    root = Path(workload['output_root'])
+    result = json.loads((root / 'full/summary.json').read_text())
+    if not result.get('completed') or not result.get('scroll_artifacts'):
+        raise ValueError('completed split benchmark required for saved-trace rendering')
+    checkpoint = Path(workload['checkpoint'])
+    if sha256_file(checkpoint) != workload['checkpoint_sha256']:
+        raise ValueError('checkpoint changed')
+    evaluation = json.loads((root / 'evaluation.json').read_text())
+    groups = scroll_groups(evaluation)
+    artifacts = [Path(path) for path in result['scroll_artifacts']]
+    if len(groups) != len(artifacts):
+        raise ValueError('saved scroll artifacts do not match physical source groups')
+    limit = int(workload.get('benchmark_render_limit', 24))
+    if limit < 1:
+        raise ValueError('benchmark_render_limit must be positive')
+    with CachedReplaySession(evaluation, workload['native_binary'], checkpoint,
+                             devices=devices, gpu_manager=gpu_manager,
+                             cancel_event=cancel_event) as session:
+        for index, (sources, destination) in enumerate(zip(groups, artifacts)):
+            current = dict(evaluation, sources=deepcopy(sources),
+                           output=str(destination), render=True,
+                           resume_visualization=True,
+                           resume_render_limit=limit)
+            for source in current['sources']:
+                source.setdefault('ct_volume', source['input_volume'])
+                source.setdefault('ct_base_volume', True)
+            source_ids = {source['id'] for source in current['sources']}
+            current['reference_plan'] = dict(
+                evaluation['reference_plan'],
+                sources=[source for source in evaluation['reference_plan']['sources']
+                         if source['source_id'] in source_ids])
+            while True:
+                selected = resume_visualization_selection(
+                    destination, [source['id'] for source in current['sources']], limit)
+                if not selected:
+                    break
+                print(f'benchmark render scroll={index+1}/{len(groups)} '
+                      f'batch={len(selected)}', flush=True)
+                session.run(current)
+                status = json.loads((destination / 'visualization_resume.json').read_text())
+                print(f'benchmark render progress scroll={index+1}/{len(groups)} '
+                      f'rendered={status["rendered_cases"]}/{status["cases"]}', flush=True)
+            for marker in (destination / 'incomplete.json',
+                           destination / 'inference_incomplete.json'):
+                marker.unlink(missing_ok=True)
+    rows = write_render_review_index(
+        root, result, json.loads(Path(workload['benchmark_manifest']).read_text()))
+    print(f'Indexed {len(rows)} rendered pieces: {root / "README.md"}', flush=True)
+    return rows
+
+
 def run(workload, devices, *, gpu_manager=None, cancel_event=None):
     if workload.get('benchmark_corrections'):
         workload = prepare_corrections(workload)
@@ -289,6 +372,17 @@ def run(workload, devices, *, gpu_manager=None, cancel_event=None):
     evaluation = bind_benchmark(summary['config'], manifest,
         backend=workload.get('backend'), fiberlet=workload.get('fiberlet'),
         render=workload.get('render', False))
+    inference_overrides = workload.get('inference_overrides', {})
+    allowed_inference_overrides = {
+        'accumulator_hot_slots', 'accumulator_spill_segment_slots',
+    }
+    if (not isinstance(inference_overrides, dict)
+            or set(inference_overrides) - allowed_inference_overrides):
+        raise ValueError('unsupported benchmark inference override')
+    if inference_overrides:
+        if not isinstance(evaluation.get('inference'), dict):
+            raise ValueError('benchmark inference overrides require inference settings')
+        evaluation['inference'].update(inference_overrides)
     for source in evaluation['sources']:
         recorded = next(s for s in bindings['sources'] if s['collection'] == source['id'])
         if sha256_file(source['normal_manifest']) != recorded['normal_manifest_sha256']:
@@ -297,6 +391,10 @@ def run(workload, devices, *, gpu_manager=None, cancel_event=None):
     root.mkdir(parents=True, exist_ok=False)
     evaluation.update(output=str(root / 'full'), workers=workload.get('benchmark_workers', 128))
     evaluation['log_construction_chunks'] = workload.get('log_construction_chunks', True)
+    atomic_write(root / 'evaluation.json', evaluation)
+    import subprocess
+    evaluation['reference_plan'] = json.loads(subprocess.check_output(
+        [workload['native_binary'], 'replay-references', '--config', str(root / 'evaluation.json')], text=True))
     atomic_write(root / 'evaluation.json', evaluation)
     atomic_write(root / 'provenance.json', dict(workload=workload,
         benchmark_sha256=manifest_hash, native_sha256=sha256_file(workload['native_binary'])))
@@ -309,6 +407,9 @@ def run(workload, devices, *, gpu_manager=None, cancel_event=None):
             for index, sources in enumerate(scroll_groups(evaluation)):
                 destination = root / 'scrolls' / f'{index:02d}'
                 current = dict(evaluation, sources=sources, output=str(destination))
+                source_ids = {source['id'] for source in sources}
+                current['reference_plan'] = dict(evaluation['reference_plan'], sources=[source for source in
+                    evaluation['reference_plan']['sources'] if source['source_id'] in source_ids])
                 print(f'benchmark scroll-start {index+1}: {[s["id"] for s in sources]}', flush=True)
                 session.run(current)
                 part = json.loads((destination / 'summary.json').read_text())
@@ -322,7 +423,13 @@ def run(workload, devices, *, gpu_manager=None, cancel_event=None):
             metric_definition=parts[0].get('metric_definition', 'anchor-nearest-projection-flat-caps-v1'),
             reference_selection_policy=parts[0]['reference_selection_policy'],
             cases=sum(p['cases'] for p in parts), failures=sum(p.get('failures', 0) for p in parts),
+            evaluated_cases=sum(p.get('evaluated_cases', p['cases']) for p in parts),
+            route_state_limit_cases=sum(p.get('route_state_limit_cases', 0) for p in parts),
+            infrastructure_failures=[f for p in parts for f in p.get('infrastructure_failures', [])],
             directed_reference_length_mm=sum(p['directed_reference_length_mm'] for p in parts),
+            requested_directed_reference_length_mm=sum(
+                p.get('requested_directed_reference_length_mm', p['directed_reference_length_mm'])
+                for p in parts),
             sources=[s for p in parts for s in p.get('sources', [])], scroll_artifacts=artifacts)
         if anchor_only:
             result['backend'] = 'anchors'
@@ -365,10 +472,17 @@ def run(workload, devices, *, gpu_manager=None, cancel_event=None):
             print(json.dumps(report, indent=2), flush=True)
         return report
     report = complete_report(result)
+    report['route_state_limit_cases'] = result.get('route_state_limit_cases', 0)
+    report['infrastructure_failures'] = result.get('infrastructure_failures', [])
+    report['requested_directed_runs'] = result['cases']
+    report['evaluated_directed_runs'] = result.get('evaluated_cases', result['cases'])
+    report['requested_directed_reference_mm'] = result.get(
+        'requested_directed_reference_length_mm', result['directed_reference_length_mm'])
     report['coverage'] = {s['source_id']: {k: v for k, v in s['summary'].items()
         if k in ('traced_length_mm', 'length_weighted_success_percent', 'failure_free_cases',
-                 'directed_cases', 'failure_reasons')} for s in result['sources']}
-    if not math.isclose(report['global_result']['directed_reference_mm'], manifest['total_mm'], abs_tol=0.01):
+                 'directed_cases', 'requested_directed_cases', 'route_state_limit_cases',
+                 'failure_reasons')} for s in result['sources']}
+    if not math.isclose(report['requested_directed_reference_mm'], manifest['total_mm'], abs_tol=0.01):
         raise ValueError('benchmark evaluated length differs from exported length')
     report['wall_seconds'] = elapsed
     report['benchmark_manifest'] = str(manifest_path)

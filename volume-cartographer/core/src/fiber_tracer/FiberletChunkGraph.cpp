@@ -3817,6 +3817,56 @@ FiberletCachedReplayGraphSource::FiberletCachedReplayGraphSource(
 
 FiberletCachedReplayGraphSource::FiberletCachedReplayGraphSource(
     std::shared_ptr<FiberletOnDemandPreprocessor> preprocessor,
+    FiberletAnchorCellPredicate traversalCellPredicate,
+    FiberletPathConfig pathConfig,
+    FiberletEvaluationQuantization evaluationQuantization,
+    float maximumJoinAngleDegrees)
+    : preprocessor_(std::move(preprocessor))
+    , chunks_(
+          preprocessor_ ? preprocessor_->anchorDataset() : nullptr,
+          preprocessor_ ? preprocessor_->anchorCache() : nullptr,
+          preprocessor_ ? preprocessor_->fiberletDataset() : nullptr,
+          preprocessor_ ? preprocessor_->fiberletCache() : nullptr,
+          pathConfig,
+          [preprocessor = preprocessor_](const vc::render::ChunkKey& key,
+                                        std::shared_ptr<const FiberletAnchorChunkPayload> anchors) {
+              return preprocessor->evaluationAnchorChunk(key, std::move(anchors));
+          })
+    , pathConfig_(std::move(pathConfig))
+    , traversalCellPredicate_(std::move(traversalCellPredicate))
+    , evaluationQuantization_(std::move(evaluationQuantization))
+    , maximumJoinAngleDegrees_(maximumJoinAngleDegrees)
+    , quantizationState_(std::make_shared<QuantizationState>())
+{
+    if (!preprocessor_ || !traversalCellPredicate_ ||
+        !(maximumJoinAngleDegrees_ >= 0.0F) ||
+        !(maximumJoinAngleDegrees_ <= 180.0F) ||
+        !std::isfinite(maximumJoinAngleDegrees_)) {
+        throw std::invalid_argument(
+            "filtered cached fiberlet replay graph configuration is invalid");
+    }
+    if ((evaluationQuantization_.costBits != 0 &&
+         evaluationQuantization_.costBits != 8 &&
+         evaluationQuantization_.costBits != 16) ||
+        (evaluationQuantization_.costDomain !=
+             FiberletCostQuantizationDomain::RawTotal &&
+         evaluationQuantization_.costDomain !=
+             FiberletCostQuantizationDomain::SqrtPerPredictionVoxel) ||
+        (evaluationQuantization_.costDomain ==
+             FiberletCostQuantizationDomain::SqrtPerPredictionVoxel &&
+         (!(evaluationQuantization_.costDensityMaximum > 0.0F) ||
+          !std::isfinite(evaluationQuantization_.costDensityMaximum))) ||
+        evaluationQuantization_.storageChunkSideBaseVoxels <= 0) {
+        throw std::invalid_argument(
+            "filtered cached fiberlet logical quantization is invalid");
+    }
+    (void)fiberletPositionBinCountForEvaluation(
+        evaluationQuantization_.storageChunkSideBaseVoxels,
+        evaluationQuantization_.positionQuantumBaseVoxels);
+}
+
+FiberletCachedReplayGraphSource::FiberletCachedReplayGraphSource(
+    std::shared_ptr<FiberletOnDemandPreprocessor> preprocessor,
     std::shared_ptr<FiberletChunkDataset> evaluatedAnchorDataset,
     std::shared_ptr<vc::render::ChunkCache> evaluatedAnchorCache,
     std::shared_ptr<FiberletChunkDataset> fiberletDataset,

@@ -65,6 +65,27 @@ def test_saved_trace_metrics_available_without_rendering_or_summary(tmp_path):
     assert report["fibers"][0]["mean_mm"] == pytest.approx(20 / 3)
     assert report["fibers"][0]["restarts"] == 2
     assert (tmp_path / "trace_progress.csv").exists()
+    assert {row["case_index"] for row in report["cases"]} == {0, 1}
+    assert all(row["failures_per_mm"] == pytest.approx(0.1) for row in report["cases"])
+    assert (tmp_path / "per_case_failure_density.md").exists()
+    assert (tmp_path / "per_case_failure_density.csv").exists()
+    assert (tmp_path / "per_case_failure_density.json").exists()
+
+
+def test_case_report_puts_zero_failure_cases_last_and_displays_infinity(tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.visualization_report import write_trace_progress_report
+    for index, arcs in enumerate(([], [5])):
+        case = tmp_path / "full/cases" / str(index)
+        case.mkdir(parents=True)
+        (case / "trace.json").write_text(json.dumps({"provenance": {"source_id": "source",
+            "fiber_path": f"fiber-{index}.json", "reverse": False, "case_index": index,
+            "base_voxel_size_um": 1000}, "replay": {"reference_begin_arc_base": 0,
+            "reference_end_arc_base": 10, "completed_reference_arc_base": 10,
+            "failures": [{"reference_arc_base": a} for a in arcs]}}))
+    report = write_trace_progress_report(tmp_path / "full", tmp_path)
+    assert [row["case_index"] for row in report["cases"]] == [1, 0]
+    assert report["cases"][1]["mean_mm"] is None
+    assert "| ∞ |" in (tmp_path / "per_case_failure_density.md").read_text()
 
 
 @pytest.mark.parametrize("combined", [False, True])

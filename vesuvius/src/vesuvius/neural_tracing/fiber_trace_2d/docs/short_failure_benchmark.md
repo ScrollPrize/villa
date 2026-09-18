@@ -1,5 +1,9 @@
 # Short directed failure benchmark
 
+See the [fiber-tracing benchmark runbook](benchmark_runbook.md) for the current
+beam/fiberlet configs, exact commands and the distinction between frozen v3
+evidence and later ground-truth review drafts.
+
 ## Accepted dataset (2026-09-16)
 
 Saved at `/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_20260916_v3`:

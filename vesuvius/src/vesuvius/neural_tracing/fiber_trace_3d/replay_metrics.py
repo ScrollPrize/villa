@@ -83,7 +83,8 @@ def complete_report(summary: dict, *, episode_distance: float = RESTART_EPISODE_
         return value
 
     total = aggregate([row for rows in collections.values() for row in rows])
-    if total["directions"] != summary["cases"]:
+    evaluated_cases = summary.get("evaluated_cases", summary["cases"])
+    if total["directions"] != evaluated_cases:
         raise ValueError("case/failure totals disagree with saved summary")
     cases = [case for source in summary["sources"] for case in source["cases"]]
     expected_failures = (sum(len(reference_segments(case))-1 for case in cases)

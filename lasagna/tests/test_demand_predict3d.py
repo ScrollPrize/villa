@@ -19,30 +19,28 @@ LAYOUT_CASES = [("flat", False), ("chunk-major", False),
         not tiled.sys.platform.startswith("linux"), reason="Linux writable-prefault experiment"))]
 
 
-def _spawn_spill_roundtrip(open_path, requests, response, segment_stride, scratch_dir, result):
-    import os
+def _spawn_spill_roundtrip(requests, response, segment_stride, scratch_dir, result):
     from lasagna.chunk_accumulator_arena import ChunkAccumulatorArena
-    fd = os.open(open_path, os.O_RDWR)
     def acquire():
         requests.put(("acquire", 0, -1))
-        kind, value = response.get(timeout=5)
+        reply = response.get(timeout=5)
+        kind, value = reply[:2]
         if kind != "slot":
             raise RuntimeError(value)
-        return value
+        return value, reply[2]
     def release(slot):
         requests.put(("release", 0, slot))
-    try:
-        with ChunkAccumulatorArena(
-                scratch_dir, record_bytes=128, hot_slots=1, spill_segment_slots=2,
-                spill_fd=fd, spill_slot_acquire=acquire, spill_slot_release=release,
-                spill_segment_stride=segment_stride) as arena:
-            arena.mutable_record("a", create=True).fill(73)
-            arena.mutable_record("b", create=True).fill(19)
-            out = np.empty(128, np.uint8)
-            arena.snapshot_and_release("a", out)
-            result.put((int(out.min()), int(out.max())))
-    finally:
-        os.close(fd)
+    with ChunkAccumulatorArena(
+            scratch_dir, record_bytes=128, hot_slots=1, spill_segment_slots=2,
+            spill_slot_acquire=acquire, spill_slot_release=release,
+            spill_segment_stride=segment_stride) as arena:
+        arena.mutable_record("a", create=True).fill(73)
+        arena.record_mutated("a")
+        arena.mutable_record("b", create=True).fill(19)
+        arena.record_mutated("b")
+        out = np.empty(128, np.uint8)
+        arena.snapshot_and_release("a", out)
+        result.put((int(out.min()), int(out.max())))
 
 
 def _spawn_file_mapped_slot_read(spec, result):
@@ -547,67 +545,88 @@ def test_chunk_arena_evicts_reuses_low_slots_and_leaves_no_named_files(tmp_path)
     with ChunkAccumulatorArena(tmp_path, record_bytes=128, hot_slots=1,
                                spill_segment_slots=2) as arena:
         arena.mutable_record("a", create=True).fill(11)
+        arena.record_mutated("a")
         b = arena.mutable_record("b", create=True)  # evicts a
         np.testing.assert_array_equal(b, np.zeros(128, np.uint8))
         b.fill(22)
+        arena.record_mutated("b")
         assert arena.stats["spill_capacity"] == 2
-        np.testing.assert_array_equal(arena.mutable_record("a"), np.full(128, 11, np.uint8))
+        cold = arena.mutable_record("a")
+        np.testing.assert_array_equal(cold, np.full(128, 11, np.uint8))
+        cold.fill(12)
+        arena.record_mutated("a")
+        del cold
         assert arena.stats["promotions"] == 1
         out = np.empty(128, np.uint8)
         arena.snapshot_and_release("a", out)
-        np.testing.assert_array_equal(out, np.full(128, 11, np.uint8))
+        np.testing.assert_array_equal(out, np.full(128, 12, np.uint8))
         c = arena.mutable_record("c", create=True)
         np.testing.assert_array_equal(c, np.zeros(128, np.uint8))
         c.fill(33)
+        arena.record_mutated("c")
         # Free-list reuse prevents another segment at the same cold high-water.
         assert arena.stats["spill_capacity"] == 2
         assert arena.stats["allocations"] == 3
     assert not list(tmp_path.iterdir())
 
 
-def test_shared_spill_broker_serializes_growth_and_reuses_global_slots(tmp_path, monkeypatch):
+def test_shared_spill_broker_preallocates_segments_and_reuses_global_slots(tmp_path):
     import multiprocessing as mp
     import os
     from lasagna.chunk_accumulator_arena import ChunkAccumulatorArena
     from lasagna.demand_predict3d import _SpillArenaBroker
 
-    if hasattr(os, "posix_fallocate"):
-        def reject_physical_preallocation(*_):
-            raise AssertionError("spill arena must rely on mmap-backed lazy allocation")
-        monkeypatch.setattr(os, "posix_fallocate", reject_physical_preallocation)
     context = mp.get_context("spawn")
     broker = _SpillArenaBroker(context, tmp_path, record_bytes=128,
                                segment_slots=2, workers=1)
-    fd = os.dup(broker.fd)
     def acquire():
         broker.requests.put(("acquire", 0, -1))
-        kind, value = broker.responses[0].get(timeout=5)
+        reply = broker.responses[0].get(timeout=5)
+        kind, value = reply[:2]
         assert kind == "slot"
-        return value
+        return value, reply[2]
     def release(slot):
         broker.requests.put(("release", 0, slot))
     try:
         with ChunkAccumulatorArena(
                 tmp_path, record_bytes=128, hot_slots=1, spill_segment_slots=2,
-                spill_fd=fd, spill_slot_acquire=acquire, spill_slot_release=release,
+                spill_slot_acquire=acquire, spill_slot_release=release,
                 spill_segment_stride=broker.segment_stride) as arena:
             arena.mutable_record("a", create=True).fill(11)
+            arena.record_mutated("a")
             arena.mutable_record("b", create=True).fill(22)
+            arena.record_mutated("b")
             out = np.empty(128, np.uint8)
             arena.snapshot_and_release("a", out)
             np.testing.assert_array_equal(out, np.full(128, 11, np.uint8))
             arena.mutable_record("c", create=True).fill(33)
-        # The broker grows the single file logically, relies on mmap-backed
-        # lazy physical allocation, and reuses the lowest slot before growth.
+            arena.record_mutated("c")
+        # A fixed segment is physically preallocated when supported, and its
+        # lowest released slot is reused before another segment is created.
         deadline = time.monotonic() + 5
-        while broker.stats["reuses"] < 1 and time.monotonic() < deadline:
+        while broker.stats["releases"] < 1 and time.monotonic() < deadline:
             time.sleep(.01)
-        assert broker.stats["reuses"] >= 1
-        assert broker.stats["slot_high_water"] == 1
+        before = broker.stats["slot_high_water"]
+        slot, _ = acquire()
+        releases_before = broker.stats["releases"]
+        release(slot)
+        deadline = time.monotonic() + 5
+        while broker.stats["releases"] < releases_before + 1 and time.monotonic() < deadline:
+            time.sleep(.01)
+        reused, _ = acquire()
+        releases_before = broker.stats["releases"]
+        release(reused)
+        deadline = time.monotonic() + 5
+        while broker.stats["releases"] < releases_before + 1 and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert broker.stats["reuses"] >= 2
+        assert broker.stats["slot_high_water"] == before
+        assert broker.stats["slot_high_water"] <= 2
         assert broker.stats["segments"] == 1
         assert broker.stats["logical_bytes"] == broker.segment_stride
+        if hasattr(os, "posix_fallocate") and not broker.stats["preallocation_fallbacks"]:
+            assert broker.stats["allocated_bytes"] == broker.segment_stride
     finally:
-        os.close(fd)
         broker.close()
     assert not list(tmp_path.iterdir())
 
@@ -620,15 +639,15 @@ def test_shared_spill_broker_fd_survives_spawn(tmp_path):
                                segment_slots=2, workers=1)
     result = context.Queue()
     process = context.Process(target=_spawn_spill_roundtrip, args=(
-        broker.open_path, broker.requests, broker.responses[0],
-        broker.segment_stride, str(tmp_path), result))
+        broker.requests, broker.responses[0], broker.segment_stride,
+        str(tmp_path), result))
     try:
         process.start()
         process.join(15)
         broker.seal()
         assert process.exitcode == 0
         assert result.get(timeout=1) == (73, 73)
-        assert broker.stats["slot_high_water"] == 1
+        assert broker.stats["slot_high_water"] <= 2
     finally:
         if process.is_alive():
             process.kill()
@@ -637,6 +656,41 @@ def test_shared_spill_broker_fd_survives_spawn(tmp_path):
         result.close()
         broker.close()
     assert not list(tmp_path.iterdir())
+
+
+def test_chunk_arena_evicts_in_parallel_and_promotes_exact_records(tmp_path):
+    import threading
+    from lasagna.chunk_accumulator_arena import ChunkAccumulatorArena
+
+    with ChunkAccumulatorArena(
+            tmp_path, record_bytes=4096, hot_slots=10, spill_segment_slots=8,
+            background_eviction_workers=2, pressure_fraction=.9) as arena:
+        original_write = arena._write_spill
+        simultaneous = threading.Barrier(2)
+
+        def synchronized_write(spill, source):
+            simultaneous.wait(timeout=5)
+            original_write(spill, source)
+
+        arena._write_spill = synchronized_write
+        for value in range(10):
+            arena.mutable_record(value, create=True).fill(value + 1)
+            arena.record_mutated(value)
+        deadline = time.monotonic() + 5
+        while arena.stats["evictions"] < 2 and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert arena.stats["evictions_in_flight_high_water"] == 2
+        assert arena.stats["evictions"] >= 2
+        assert arena.telemetry()["hot_free"] >= 1
+        assert arena.stats["direct_segments"] + arena.stats["buffered_segments"] >= 1
+
+        for value in range(10):
+            record = arena.mutable_record(value)
+            try:
+                np.testing.assert_array_equal(
+                    record, np.full(4096, value + 1, np.uint8))
+            finally:
+                arena.record_mutated(value)
 
 
 @pytest.mark.parametrize("b,dtype", [(2, "float16"), (16, "float32"), (32, "float16")])
@@ -1056,9 +1110,15 @@ def test_arrival_applied_immediately_without_npz_reservation_or_sync(tmp_path, m
             store.complete(tile, values)
         assert tile in store.chunks[origin]["applied"]
         layouts = {layout.name: layout for layout in store._sync_record_spec.layouts}
-        assert any(np.any(tiled._record_array(store._sync_arena.mutable_record(key),
-                                              layouts["weight"]) > 0)
-                   for key in tuple(store._sync_arena._locations))
+        has_weight = False
+        for key in tuple(store._sync_arena._locations):
+            record = store._sync_arena.mutable_record(key)
+            try:
+                has_weight |= bool(np.any(
+                    tiled._record_array(record, layouts["weight"]) > 0))
+            finally:
+                store._sync_arena.record_mutated(key)
+        assert has_weight
         assert not store.ready(origin)
         assert store.tiles[tile]["state"] == "consumed"
         with pytest.raises(ValueError, match="duplicate"):

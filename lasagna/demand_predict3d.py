@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from dataclasses import replace
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import itertools
 import heapq
 import faulthandler
@@ -566,12 +567,12 @@ def _gated_demand_worker(gate, arguments, vram_budget):
 
 
 class _SpillArenaBroker:
-    """Own one anonymous, grow-only spill file and recycle record slots globally.
+    """Own fixed preallocated spill segments and recycle slots globally.
 
-    File growth and physical extent allocation happen serially on this broker
-    thread. Accumulator workers only mmap already prepared large segments, so a
-    simultaneous eviction wave cannot make every worker enter filesystem
-    allocation independently.
+    Workers receive a slot and the path of its immutable backing segment.  The
+    parent keeps every O_TMPFILE descriptor alive, while workers use O_DIRECT
+    where supported.  This avoids dirty page-cache growth and reuses both file
+    extents and record slots across accumulator lifetimes.
     """
 
     def __init__(self, context, scratch_dir, *, record_bytes, segment_slots, workers):
@@ -580,45 +581,72 @@ class _SpillArenaBroker:
         granularity = int(mmap.ALLOCATIONGRANULARITY)
         raw_stride = self.record_bytes * self.segment_slots
         self.segment_stride = ((raw_stride + granularity - 1) // granularity) * granularity
-        directory = Path(scratch_dir)
-        directory.mkdir(parents=True, exist_ok=True)
-        fd = None
-        if hasattr(os, "O_TMPFILE"):
-            try:
-                fd = os.open(directory, os.O_RDWR | os.O_TMPFILE, 0o600)
-                open_path = f"/proc/{os.getpid()}/fd/{fd}"
-            except OSError:
-                fd = None
-        if fd is None:
-            fd, name = tempfile.mkstemp(prefix="spill-arena-", suffix=".mmap", dir=directory)
-            open_path = name
-        self.fd = fd
-        self.open_path = open_path
-        self._named_path = None if open_path.startswith("/proc/") else Path(open_path)
+        self.directory = Path(scratch_dir)
+        self.directory.mkdir(parents=True, exist_ok=True)
         self.requests = context.Queue(maxsize=max(64, int(workers) * 4))
-        self.responses = [context.Queue(maxsize=2) for _ in range(int(workers))]
+        self.responses = [context.Queue(maxsize=4) for _ in range(int(workers))]
         self._free = []
         self._next = 0
-        self._segments = 0
+        self._segment_fds = []
+        self._segment_paths = []
+        self._named_paths = []
         self._closed = False
-        self.stats = {"slot_high_water": 0, "logical_bytes": 0, "segments": 0,
-                      "reuses": 0, "requests": 0, "releases": 0}
+        self.stats = {"slot_high_water": 0, "logical_bytes": 0,
+                      "allocated_bytes": 0, "segments": 0,
+                      "reuses": 0, "requests": 0, "releases": 0,
+                      "preallocation_fallbacks": 0}
         self._thread = threading.Thread(target=self._serve, name="spill-arena-broker", daemon=True)
         self._thread.start()
 
     def seal(self):
-        """Remove the fallback pathname after every worker has opened the inode."""
-        if self._named_path is not None:
-            self._named_path.unlink(missing_ok=True)
-            self._named_path = None
+        """Compatibility no-op: segment paths must remain openable until close."""
+
+    def _prepare_segment(self, segment):
+        if segment != len(self._segment_fds):
+            raise RuntimeError("spill segments must be prepared sequentially")
+        fd = None
+        named_path = None
+        if hasattr(os, "O_TMPFILE"):
+            try:
+                fd = os.open(self.directory, os.O_RDWR | os.O_TMPFILE, 0o600)
+                path = f"/proc/{os.getpid()}/fd/{fd}"
+            except OSError:
+                fd = None
+        if fd is None:
+            fd, name = tempfile.mkstemp(
+                prefix=f"spill-segment-{segment:06d}-", suffix=".bin",
+                dir=self.directory)
+            path = name
+            named_path = Path(name)
+        try:
+            os.ftruncate(fd, self.segment_stride)
+            if hasattr(os, "posix_fallocate"):
+                try:
+                    os.posix_fallocate(fd, 0, self.segment_stride)
+                    self.stats["allocated_bytes"] += self.segment_stride
+                except OSError as exc:
+                    if exc.errno not in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
+                        raise
+                    self.stats["preallocation_fallbacks"] += 1
+            else:  # pragma: no cover - macOS lacks posix_fallocate in Python
+                self.stats["preallocation_fallbacks"] += 1
+        except BaseException:
+            os.close(fd)
+            if named_path is not None:
+                named_path.unlink(missing_ok=True)
+            raise
+        self._segment_fds.append(fd)
+        self._segment_paths.append(path)
+        if named_path is not None:
+            self._named_paths.append(named_path)
+        self.stats["segments"] = len(self._segment_fds)
+        self.stats["logical_bytes"] = len(self._segment_fds) * self.segment_stride
 
     def _prepare_new_slot(self, slot):
         segment = slot // self.segment_slots
-        if segment >= self._segments:
-            os.ftruncate(self.fd, (segment + 1) * self.segment_stride)
-            self._segments = segment + 1
-            self.stats["segments"] = self._segments
-            self.stats["logical_bytes"] = self._segments * self.segment_stride
+        while segment >= len(self._segment_fds):
+            self._prepare_segment(len(self._segment_fds))
+        return self._segment_paths[segment]
 
     def _serve(self):
         while True:
@@ -638,12 +666,13 @@ class _SpillArenaBroker:
                 if self._free:
                     slot = heapq.heappop(self._free)
                     self.stats["reuses"] += 1
+                    path = self._segment_paths[slot // self.segment_slots]
                 else:
                     slot = self._next
-                    self._prepare_new_slot(slot)
+                    path = self._prepare_new_slot(slot)
                     self._next += 1
                     self.stats["slot_high_water"] = self._next
-                self.responses[worker].put(("slot", slot))
+                self.responses[worker].put(("slot", slot, path))
             except BaseException as exc:
                 self.responses[worker].put(("error", f"{type(exc).__name__}: {exc}"))
 
@@ -655,10 +684,13 @@ class _SpillArenaBroker:
         for channel in (self.requests, *self.responses):
             channel.cancel_join_thread()
             channel.close()
-        os.close(self.fd)
-        if self._named_path is not None:
-            self._named_path.unlink(missing_ok=True)
-            self._named_path = None
+        for fd in self._segment_fds:
+            os.close(fd)
+        self._segment_fds.clear()
+        self._segment_paths.clear()
+        for path in self._named_paths:
+            path.unlink(missing_ok=True)
+        self._named_paths.clear()
         self._closed = True
 
 
@@ -817,8 +849,8 @@ class DemandWorkerPool:
                 process = context.Process(target=tiled._accumulate_process_main,
                     args=(i, work, self.accumulator_events, self.record_spec, hot_counts[i],
                           int(accumulator_spill_segment_slots), str(first.root / ".accumulator_arena"),
-                          self.spill_broker.open_path, self.spill_broker.requests,
-                          self.spill_broker.responses[i], self.spill_broker.segment_stride),
+                          self.spill_broker.requests, self.spill_broker.responses[i],
+                          self.spill_broker.segment_stride),
                     name=f"demand-accumulate-{i}")
                 process.start()
                 self.accumulator_processes.append(process)
@@ -843,7 +875,6 @@ class DemandWorkerPool:
                 if event[0] != "arena_attached" or event[1] in attached:
                     raise RuntimeError(f"invalid spill arena attachment event: {event}")
                 attached.add(event[1])
-            self.spill_broker.seal()
             scales = {p.name: self.geometry.scale for p in first.products}
             self.gpu_arguments = (
                     self.adapter, None, self.geometry.tile,

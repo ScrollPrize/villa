@@ -65,6 +65,18 @@ struct FiberletScheduledChunk {
     double nearestReferenceDistanceBase = 0.0;
 };
 
+struct FiberletReferencePrefetchCandidate {
+    FiberletScheduledChunk scheduled;
+    double remainingReferenceBase = 0.0;
+    std::size_t stableOrder = 0;
+};
+
+// Deduplicate one physical preprocessor's reference schedules and order the
+// retained chunks from greatest remaining reference distance to least.
+[[nodiscard]] std::vector<FiberletScheduledChunk>
+orderFiberletReferencePrefetch(
+    std::span<const FiberletReferencePrefetchCandidate> candidates);
+
 [[nodiscard]] std::string fiberletScheduledResolutionError(
     const vc::render::ChunkKey& key,
     const vc::render::ChunkResult& resolved);
@@ -134,7 +146,12 @@ public:
     // Includes owner-cell displacement padding, but no path-connection halo.
     [[nodiscard]] std::vector<FiberletScheduledChunk> anchorChunkScheduleNearReference(
         const PolylineArcGeometry& reference, double beginArcBase, double endArcBase, double radiusBaseVoxels) const;
-    void prefetchScheduled(std::span<const FiberletScheduledChunk> schedule, std::size_t begin, std::size_t count, bool wait = false) const;
+    void prefetchScheduled(
+        std::span<const FiberletScheduledChunk> schedule,
+        std::size_t begin,
+        std::size_t count,
+        bool wait = false,
+        int priorityOffset = 0) const;
     // Stop speculative generation in dependency order and drain writes. Call
     // this before releasing a batch-owned preprocessor.
     void shutdown();

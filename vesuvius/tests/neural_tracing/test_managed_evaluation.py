@@ -47,12 +47,64 @@ def test_external_gpu_processes_block_benchmark(monkeypatch):
     managed.assert_gpus_idle(["GPU-aa"])
 
 
-def test_live_run_routes_before_checkpoint_cuda_or_native(monkeypatch, tmp_path):
+def test_live_run_uses_demand_scoped_manager_settings_without_mutation():
     from vesuvius.neural_tracing.fiber_trace_3d import live_evaluate
-    path = tmp_path / "config.json"
-    path.write_text(json.dumps({"gpu_manager": {"enabled": True}}))
-    seen = []
-    monkeypatch.setattr(managed, "launch_managed", lambda command, **kw: seen.append((command, kw)) or 0)
-    monkeypatch.setattr(live_evaluate, "freeze_checkpoint", lambda *a: pytest.fail("checkpoint touched before grant"))
-    assert live_evaluate.run(path, "missing.pt", "0,1", "missing-binary", render=True) == 0
-    assert "--render" in seen[0][0] and seen[0][1]["devices"] == "0,1"
+    config = {"gpu_manager": {"enabled": True, "priority": 50,
+                              "vram_bytes_per_gpu": 4 << 30}}
+    settings = live_evaluate.demand_gpu_manager_settings(
+        config, "0,1", manager_socket="custom.sock", manager_priority=123)
+    assert settings == {"enabled": True, "priority": 123,
+                        "vram_bytes_per_gpu": 4 << 30,
+                        "devices": "0,1", "socket": "custom.sock"}
+    assert config["gpu_manager"] == {"enabled": True, "priority": 50,
+                                      "vram_bytes_per_gpu": 4 << 30}
+    assert live_evaluate.demand_gpu_manager_settings(
+        config, "0,1", unmanaged=True) is None
+    assert live_evaluate.demand_gpu_manager_settings({}, "0,1") is None
+    assert live_evaluate.runtime_inference_settings(
+        {"tile_size": 64, "demand_gpu_manager": {"stale": True}}, None
+    ) == {"tile_size": 64}
+    assert live_evaluate.runtime_inference_settings(
+        {"tile_size": 64, "demand_gpu_manager": {"stale": True}}, settings
+    ) == {"tile_size": 64, "demand_gpu_manager": settings}
+    with pytest.raises(ValueError, match="vram_bytes_per_gpu"):
+        live_evaluate.demand_gpu_manager_settings(
+            {"gpu_manager": {"enabled": True}}, "0")
+
+
+def test_live_precision_identity_resolution_does_not_touch_cuda(monkeypatch, tmp_path):
+    import torch
+    from vesuvius.neural_tracing.fiber_trace_3d.infer import _resolve_inference_precision
+    checkpoint = tmp_path / "snapshot.pt"
+    torch.save({"config": {"training": {"mixed_precision": "bf16"}}}, checkpoint)
+    monkeypatch.setattr(torch.cuda, "device",
+                        lambda *a, **k: pytest.fail("CUDA touched before demand grant"))
+    assert _resolve_inference_precision(
+        "auto", checkpoint=checkpoint, devices=(torch.device("cuda:0"),),
+        validate_devices=False) == ("bf16", "checkpoint")
+
+
+def test_visualization_resume_selection_round_robins_missing_cases(tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import resume_visualization_selection
+
+    cases = [
+        (0, "a", [[0, 0, 0], [1, 0, 0]]),
+        (1, "a", [[1, 0, 0], [2, 0, 0]]),
+        (2, "b", [[0, 1, 0], [1, 1, 0]]),
+        (3, "a", [[2, 0, 0], [3, 0, 0]]),
+        (4, "b", [[1, 1, 0], [2, 1, 0]]),
+    ]
+    for index, source, points in cases:
+        case = tmp_path / "cases" / str(index)
+        case.mkdir(parents=True)
+        (case / "trace.json").write_text(json.dumps({
+            "provenance": {"case_index": index, "source_id": source},
+            "reference_points_base_xyz": points,
+        }))
+    rendered = tmp_path / "cases/0/rendered"
+    rendered.mkdir()
+    (rendered / "render.json").write_text(json.dumps({"format": "vc_fiber_inspection", "pages": 1}))
+    (rendered / "strips_0.jpg").write_bytes(b"complete")
+
+    assert [case for case, _ in resume_visualization_selection(tmp_path, ["a", "b"], 3)] == [1, 2, 3]
+    assert [case for case, _ in resume_visualization_selection(tmp_path, ["a", "b"], 10)] == [1, 2, 3, 4]

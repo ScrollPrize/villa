@@ -315,6 +315,14 @@ class FiberTrace3DPredictAdapter:
         if budget is not None and device.type == "cuda":
             from .cooperative_resources import configure_cuda_memory_budget
             configure_cuda_memory_budget(int(budget), 2 * 1024**3, device=device)
+        # Demand workers reach this point only after the GPU manager has
+        # authorized their gate. Validate the already resolved cache-identity
+        # precision here rather than touching CUDA in the parent coordinator.
+        from vesuvius.neural_tracing.fiber_trace_3d.train import (
+            _mixed_precision_config_from_training,
+        )
+        _mixed_precision_config_from_training(
+            dict(self.config.get("training", {})), device)
         model = build_fiber_trace_3d_model(self.config).to(device)
         if self.checkpoint is not None:
             from vesuvius.neural_tracing.fiber_trace_3d.train import _load_snapshot

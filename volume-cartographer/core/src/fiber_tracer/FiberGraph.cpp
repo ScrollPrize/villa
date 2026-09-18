@@ -607,7 +607,7 @@ struct ExactPersistentStateBudget {
     {
         const size_t previous = generated.fetch_add(1, std::memory_order_relaxed);
         if (previous >= maximum) {
-            throw std::runtime_error("persistent fiberlet beam exceeded the route-state limit");
+            throw FiberletRouteStateLimitError(previous + 1, maximum);
         }
     }
 };

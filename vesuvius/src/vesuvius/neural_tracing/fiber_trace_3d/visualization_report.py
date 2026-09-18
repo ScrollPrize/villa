@@ -17,6 +17,7 @@ def write_trace_progress_report(evaluation_root, report_root):
     from lasagna.inference_provenance import atomic_write
     evaluation_root, report_root = Path(evaluation_root), Path(report_root)
     grouped = {}
+    cases = []
     for artifact in sorted((evaluation_root / "cases").glob("*/trace.json")):
         document = json.loads(artifact.read_text())
         p, replay = document["provenance"], document["replay"]
@@ -38,12 +39,30 @@ def write_trace_progress_report(evaluation_root, report_root):
         if run in value["runs"]:
             raise ValueError("duplicate directional trace")
         stats = segment_statistics(segments, 1)
+        length = math.fsum(segments)
+        rendered = [str(path.relative_to(report_root))
+                    for path in sorted(artifact.parent.glob("rendered*/strips_*.jpg"))]
+        cases.append({
+            "collection": p["source_id"],
+            "fiber": p["fiber_path"],
+            "direction": direction,
+            "run_index": run,
+            "case_index": p["case_index"],
+            "length_mm": length,
+            "restarts": stats["failures"],
+            # A no-failure case has no observed finite failure distance. Keep
+            # JSON/CSV standards-compliant and render it as infinity below.
+            "mean_mm": stats["mean_segment_length_mm"] if stats["failures"] else None,
+            "failures_per_mm": stats["failures"] / length if length else None,
+            "trace_json": str(artifact.relative_to(report_root)),
+            "images": rendered,
+        })
         row["segments"].extend(segments)
         value["runs"][run] = {"case_index": p["case_index"],
             "restarts": stats["failures"], "mean_mm": stats["mean_segment_length_mm"],
-            "length_mm": math.fsum(segments),
+            "length_mm": length,
             "trace_json": str(artifact.relative_to(report_root)),
-            "images": [str(path.relative_to(report_root)) for path in sorted(artifact.parent.glob("rendered*/strips_*.jpg"))]}
+            "images": rendered}
         selected = next((f for f in p.get("reference_selection", []) if Path(f["fiber_path"]).resolve() == Path(p["fiber_path"]).resolve()), None)
         row["expected_runs"] = len(selected["runs"]) if selected is not None else 1
     rows = list(grouped.values())
@@ -63,7 +82,10 @@ def write_trace_progress_report(evaluation_root, report_root):
     paired = [r for r in rows if r["paired_complete"]]
     average = math.fsum(r["mean_mm"] for r in paired) / len(paired) if paired else 0
     rows.sort(key=lambda r: (r["reference_length_mm"], r["mean_mm"]))
+    cases.sort(key=lambda r: (-(r["failures_per_mm"] or 0), -r["restarts"],
+                              r["collection"], r["fiber"], r["direction"], r["run_index"]))
     report = {"status": "saved traces; rendering may be incomplete", "fibers": rows,
+        "cases": cases,
         "paired_fibers": len(paired), "arithmetic_mean_per_fiber_mm": average,
         "short_below_average": [r for r in rows if r["paired_complete"] and r["mean_mm"] < average]}
     atomic_write(report_root / "trace_progress.json", report)
@@ -89,6 +111,36 @@ def write_trace_progress_report(evaluation_root, report_root):
             ",".join(str(v["case_index"]) for v in row["directions"].get("forward", {}).get("runs", {}).values()),
             ",".join(str(v["case_index"]) for v in row["directions"].get("reverse", {}).get("runs", {}).values())])
     (report_root / "trace_progress.csv").write_text(stream.getvalue())
+
+    case_lines = ["# Saved trace cases by failure density", "",
+        "One row per directed eligible reference piece. Sorted by filtered restarts/mm, highest first. "
+        "A zero-restart case has no observed finite failure distance, so its mean is shown as ∞ and it sorts last.", "",
+        "| Rank | Collection / fiber | Direction | Run | Case | Length mm | Restarts | Restarts/mm | Mean mm | Trace / images |",
+        "|---:|---|---|---:|---:|---:|---:|---:|---:|---|"]
+    for rank, row in enumerate(cases, 1):
+        links = [f"[trace]({quote(row['trace_json'])})"]
+        links += [f"[image {i + 1}]({quote(path)})" for i, path in enumerate(row["images"])]
+        mean = "∞" if row["mean_mm"] is None else f"{row['mean_mm']:.4f}"
+        density = "—" if row["failures_per_mm"] is None else f"{row['failures_per_mm']:.4f}"
+        case_lines.append(
+            f"| {rank} | {row['collection']} / {Path(row['fiber']).stem} | {row['direction']} | "
+            f"{row['run_index']} | {row['case_index']} | {row['length_mm']:.4f} | {row['restarts']} | "
+            f"{density} | {mean} | {' · '.join(links)} |")
+    (report_root / "per_case_failure_density.md").write_text("\n".join(case_lines) + "\n")
+    atomic_write(report_root / "per_case_failure_density.json", {
+        "metric": "filtered_restarts_per_directed_eligible_mm",
+        "zero_restart_mean": None,
+        "cases": cases,
+    })
+    case_stream = io.StringIO()
+    case_writer = csv.writer(case_stream)
+    case_writer.writerow(["rank", "collection", "fiber", "direction", "run_index", "case_index",
+                          "length_mm", "restarts", "restarts_per_mm", "mean_mm", "trace_json"])
+    for rank, row in enumerate(cases, 1):
+        case_writer.writerow([rank, row["collection"], row["fiber"], row["direction"], row["run_index"],
+                              row["case_index"], row["length_mm"], row["restarts"],
+                              row["failures_per_mm"], row["mean_mm"], row["trace_json"]])
+    (report_root / "per_case_failure_density.csv").write_text(case_stream.getvalue())
     return report
 
 
@@ -142,10 +194,11 @@ def fiber_rows(summary):
                                        -r["restarts"], r["collection"], r["fiber"]))
 
 
-def write_visualization_report(evaluation_root, report_root, *, provenance=None):
+def write_visualization_report(evaluation_root, report_root, *, provenance=None, allow_incomplete=False):
     from lasagna.inference_provenance import atomic_write
     evaluation_root, report_root = Path(evaluation_root), Path(report_root)
-    if any((evaluation_root / n).exists() for n in ("incomplete.json", "inference_incomplete.json")):
+    if not allow_incomplete and any((evaluation_root / n).exists()
+                                    for n in ("incomplete.json", "inference_incomplete.json")):
         raise ValueError("cannot publish a completed visualization index for incomplete evaluation")
     summary = json.loads((evaluation_root / "summary.json").read_text())
     rows = fiber_rows(summary)

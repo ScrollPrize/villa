@@ -99,6 +99,41 @@ def test_drain_waits_for_submitted_tiles_but_not_cpu_results():
     assert pool.accumulating  # CPU accumulation survives GPU join
 
 
+def test_exclusive_cohort_checks_external_occupancy_before_authorize(monkeypatch):
+    import vesuvius.neural_tracing.fiber_trace_3d.managed_evaluation as managed
+    calls = []
+    pool = SimpleNamespace(
+        processes=[],
+        start_gpu=lambda devices, **kw: calls.append(("start", tuple(devices))),
+        stop_gpu=lambda: calls.append(("stop",)),
+    )
+    monkeypatch.setattr(managed, "assert_gpus_idle",
+                        lambda devices: calls.append(("idle", tuple(devices))))
+    cohort = DemandCohort(pool, {"gpus": {"GPU-b": 20, "GPU-a": 10}},
+                          exclusive=True)
+    assert cohort.gpu_uuids == ("GPU-a", "GPU-b")
+    assert calls == [("start", ("GPU-a", "GPU-b")),
+                     ("idle", ("GPU-a", "GPU-b"))]
+    calls.clear()
+    DemandCohort(pool, {"gpus": {"GPU-a": 10}}, exclusive=False)
+    assert calls == [("start", ("GPU-a",))]
+
+
+def test_exclusive_occupancy_failure_stops_gated_workers(monkeypatch):
+    import vesuvius.neural_tracing.fiber_trace_3d.managed_evaluation as managed
+    calls = []
+    pool = SimpleNamespace(
+        processes=[],
+        start_gpu=lambda *a, **k: calls.append("start"),
+        stop_gpu=lambda: calls.append("stop"),
+    )
+    monkeypatch.setattr(managed, "assert_gpus_idle",
+                        lambda devices: (_ for _ in ()).throw(RuntimeError("occupied")))
+    with pytest.raises(RuntimeError, match="occupied"):
+        DemandCohort(pool, {"gpus": {"GPU-a": 10}}, exclusive=True)
+    assert calls == ["start", "stop"]
+
+
 @pytest.mark.skipif(os.environ.get('FIBER_DEMAND_GPU_SMOKE') != '1', reason='explicit manager GPU smoke only')
 def test_live_manager_idle_reacquire(tmp_path):
     import numpy as np

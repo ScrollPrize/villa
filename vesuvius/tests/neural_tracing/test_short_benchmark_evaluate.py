@@ -193,6 +193,35 @@ def test_directed_binding_preserves_model_and_collections(tmp_path):
         bind_benchmark(config, manifest)
 
 
+def test_directed_binding_carries_verified_contrast_choices(tmp_path):
+    reference = tmp_path / 'reference.json'
+    choice = tmp_path / 'choice.json'
+    common = dict(type='vc3d_fiber', version=1,
+                  vc_open_data_coordinate_space='scroll/scan@L0',
+                  vc_open_data_source_original_resolution=2.4)
+    reference.write_text(json.dumps(dict(common, evaluation_direction='forward',
+                                         line_points=[[0, 0, 0], [8, 0, 0]])))
+    choice.write_text(json.dumps(dict(common, line_points=[[0, 1, 0], [8, 1, 0]])))
+    manifest = dict(completed=True, case_count=1, cases=[dict(
+        path=str(reference), sha256=sha256_file(reference),
+        candidate=dict(source_id='A'),
+        contrast_choices=[dict(path=str(choice), sha256=sha256_file(choice),
+                               role='competing-trace')])])
+    config = dict(sources=[dict(id='A', fibers=[], fiberlet_source_identity={'x': 1},
+                                fiberlet_cache_root='cache')])
+    fiberlet = dict(contrast_corridor_radius_base_voxels=64)
+    result = bind_benchmark(config, manifest, backend='fiberlet', fiberlet=fiberlet)
+    assert result['fiberlet_contrast_choices'] == {
+        str(reference.resolve()): [str(choice.resolve())]}
+    with pytest.raises(ValueError, match='fiberlet backend'):
+        bind_benchmark(config, manifest)
+    with pytest.raises(ValueError, match='positive corridor'):
+        bind_benchmark(config, manifest, backend='fiberlet', fiberlet={})
+    choice.write_text('{}')
+    with pytest.raises(ValueError, match='changed contrast'):
+        bind_benchmark(config, manifest, backend='fiberlet', fiberlet=fiberlet)
+
+
 def test_rejects_changed_annotations(tmp_path):
     path = tmp_path / 'piece.json'
     path.write_text('{}')

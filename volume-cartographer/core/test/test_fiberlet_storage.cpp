@@ -153,6 +153,33 @@ TEST_CASE("Fiberlet scheduled resolution errors preserve key status and cause")
         "scheduled fiberlet chunk 0/427/139/187 resolved as missing");
 }
 
+TEST_CASE("Reference prefetch deduplicates physical chunks and orders remaining work")
+{
+    const auto scheduled = [](int z, int y, int x, double arc, double distance) {
+        return FiberletScheduledChunk{{0, z, y, x}, arc, distance};
+    };
+    const std::vector<FiberletReferencePrefetchCandidate> candidates{
+        {scheduled(1, 2, 3, 2.0, 2.0), 10.0, 1},
+        {scheduled(1, 2, 3, 3.0, 5.0), 12.0, 2},
+        {scheduled(4, 5, 6, 1.0, 1.0), 12.0, 5},
+        {scheduled(4, 5, 6, 4.0, 1.0), 12.0, 3},
+        {scheduled(7, 8, 9, 0.0, 0.0), 5.0, 0},
+    };
+    const auto ordered = orderFiberletReferencePrefetch(candidates);
+    REQUIRE(ordered.size() == 3);
+    CHECK(ordered[0].key == (vc::render::ChunkKey{0, 4, 5, 6}));
+    CHECK(ordered[0].nearestReferenceArcBase == 4.0);
+    CHECK(ordered[1].key == (vc::render::ChunkKey{0, 1, 2, 3}));
+    CHECK(ordered[1].nearestReferenceArcBase == 3.0);
+    CHECK(ordered[2].key == (vc::render::ChunkKey{0, 7, 8, 9}));
+
+    auto invalid = candidates;
+    invalid.front().remainingReferenceBase = -1.0;
+    CHECK_THROWS_AS(
+        orderFiberletReferencePrefetch(invalid),
+        std::invalid_argument);
+}
+
 TEST_CASE("Fiberlet evaluation quantization uses base positions and shared codecs")
 {
     FiberPredictionGridInfo grid;

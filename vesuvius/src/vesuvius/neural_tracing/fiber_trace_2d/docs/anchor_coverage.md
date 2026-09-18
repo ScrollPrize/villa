@@ -1,5 +1,8 @@
 # Anchor placement coverage benchmark
 
+See the [fiber-tracing benchmark runbook](benchmark_runbook.md) for its status
+relative to the scientific and short-regression benchmarks.
+
 Use the existing approved runner:
 
 ```bash

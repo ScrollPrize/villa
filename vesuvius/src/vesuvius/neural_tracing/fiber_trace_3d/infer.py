@@ -269,6 +269,7 @@ def _resolve_inference_precision(
     *,
     checkpoint: str | Path | None,
     devices: tuple[torch.device, ...],
+    validate_devices: bool = True,
 ) -> tuple[str, str]:
     from vesuvius.neural_tracing.fiber_trace_3d.train import (
         _mixed_precision_config_from_training,
@@ -300,6 +301,11 @@ def _resolve_inference_precision(
 
     if mode == "auto":
         mode = "off"
+    if not validate_devices:
+        # Live demand inference establishes numerical/cache identity before it
+        # has (or needs) a GPU grant. The gated worker validates this resolved
+        # policy against its authorized device before constructing the model.
+        return mode, source
     try:
         for selected in devices:
             if selected.type == "cuda":

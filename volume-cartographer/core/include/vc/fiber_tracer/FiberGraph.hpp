@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,6 +21,23 @@
 
 namespace vc::fiber_tracer
 {
+
+class FiberletRouteStateLimitError final : public std::runtime_error {
+public:
+    FiberletRouteStateLimitError(size_t attemptedStates, size_t maximumStates)
+        : std::runtime_error("persistent fiberlet beam exceeded the route-state limit")
+        , attemptedStates_(attemptedStates)
+        , maximumStates_(maximumStates)
+    {
+    }
+
+    [[nodiscard]] size_t attemptedStates() const noexcept { return attemptedStates_; }
+    [[nodiscard]] size_t maximumStates() const noexcept { return maximumStates_; }
+
+private:
+    size_t attemptedStates_ = 0;
+    size_t maximumStates_ = 0;
+};
 
 struct FiberletGraphNode {
     FiberletAnchorId anchor;

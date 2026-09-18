@@ -1,5 +1,8 @@
 # Cached fiberlet evaluation
 
+See the [fiber-tracing benchmark runbook](benchmark_runbook.md) for the current
+bounded-fiberlet benchmark, fast diagnostics and exact commands.
+
 The existing live evaluation runner supports `evaluation.backend: "fiberlet"`.
 Omitting it retains the ordinary beam tracer. Both consume the same frozen model,
 source bindings, locked GT split, inference cache and eligible-reference plan.

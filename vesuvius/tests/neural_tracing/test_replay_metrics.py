@@ -155,3 +155,22 @@ def test_filtered_summary_is_idempotent_and_validates_original_counts():
     s["failures"] = 2
     with pytest.raises(ValueError, match="failure total"):
         complete_report(s)
+
+
+def test_infrastructure_limited_cases_are_not_regular_restart_directions():
+    s = summary()
+    # The native benchmark preserves the requested case count while omitting a
+    # route-state-limited case from ordinary geometric replay outcomes.
+    s['sources'][1]['cases'] = []
+    s['sources'][1]['summary']['directed_reference_length_base_voxels'] = 0
+    s.update(evaluated_cases=1, route_state_limit_cases=1,
+             failures=1, directed_reference_length_mm=10,
+             requested_directed_reference_length_mm=20)
+    report = complete_report(s)
+    assert report['global_result']['directions'] == 1
+    assert report['global_result']['failures'] == 1
+    fixed = correct_summary(s)
+    assert fixed['cases'] == 2
+    assert fixed['evaluated_cases'] == 1
+    assert fixed['route_state_limit_cases'] == 1
+    assert fixed['failures'] == 1

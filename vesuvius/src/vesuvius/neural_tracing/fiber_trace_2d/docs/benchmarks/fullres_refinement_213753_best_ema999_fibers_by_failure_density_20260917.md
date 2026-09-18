@@ -1,6 +1,6 @@
 # Full-resolution best EMA999 fibers ranked by restart density
 
-Generated from the completed non-render evaluation; no tracing, inference, rendering, or recounting was performed for this ranking. Case links target the matching visualization run and become available as rendering completes.
+Generated from the completed non-render evaluation; no tracing, inference, rendering, or recounting was performed for this ranking. Case links target the matching visualization run. That run was terminated by the 15-minute foreground-command ceiling after 91 of 180 strip images, so links for later cases currently identify intended locations rather than completed galleries.
 
 Ranking uses counted/filtered restart episodes divided by combined forward-and-reverse eligible reference distance. Extrapolated and Lasagna-interpolated spans contribute neither distance nor failures. Zero-restart fibers are sorted last and shown with infinite observed mean distance.
 

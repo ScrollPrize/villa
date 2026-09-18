@@ -600,6 +600,13 @@ public:
         float maximumJoinAngleDegrees = 45.0F);
     FiberletCachedReplayGraphSource(
         std::shared_ptr<FiberletOnDemandPreprocessor> preprocessor,
+        FiberletAnchorCellPredicate traversalCellPredicate,
+        FiberletPathConfig pathConfig,
+        FiberletEvaluationQuantization evaluationQuantization =
+            defaultFiberletReplayQuantization(),
+        float maximumJoinAngleDegrees = 45.0F);
+    FiberletCachedReplayGraphSource(
+        std::shared_ptr<FiberletOnDemandPreprocessor> preprocessor,
         std::shared_ptr<FiberletChunkDataset> evaluatedAnchorDataset,
         std::shared_ptr<vc::render::ChunkCache> evaluatedAnchorCache,
         std::shared_ptr<FiberletChunkDataset> fiberletDataset,

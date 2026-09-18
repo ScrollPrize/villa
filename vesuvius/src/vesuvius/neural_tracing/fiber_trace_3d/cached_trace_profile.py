@@ -20,6 +20,30 @@ _trial_sessions = OrderedDict()
 _trial_session_limit = 1
 
 
+def reference_backgrounds(evaluation, stores, mapping):
+    """Build low-priority centerline chunk sets for a bound reference plan."""
+    from lasagna.demand_predict3d import DemandGeometry
+    from .live_evaluate import reference_chunks
+    backgrounds = {key: set() for key in stores}
+    plan = evaluation.get("reference_plan")
+    if not plan:
+        return backgrounds
+    cache_geometry = {}
+    for source in plan["sources"]:
+        key = mapping[source["source_id"]]
+        if key not in cache_geometry:
+            persisted = json.loads((Path(stores[key].root) / "cache_identity.json").read_text())
+            geometry = DemandGeometry(**persisted["geometry"])
+            factor = (1 << int(persisted["identity"]["source"]["level"])) * geometry.scale
+            cache_geometry[key] = geometry, factor
+        geometry, factor = cache_geometry[key]
+        for fiber in source["fibers"]:
+            for run in fiber["runs"]:
+                backgrounds[key].update(reference_chunks(
+                    run["points_base_xyz"], factor, geometry.output_shape, geometry.chunk))
+    return backgrounds
+
+
 def initialize_trial_worker(cancel_event, session_limit=1, vram_budget=None):
     """Spawned CPU coordinator; GPU inference still uses the shared worker pool."""
     global _trial_cancel_event, _trial_session_limit
@@ -175,7 +199,7 @@ class CachedReplaySession:
             self.pool.authorize_gpu()
             self.gpu_paused = False
         return coordinate_native(evaluation,self.binary,stores,mapping,channels,
-            {k:set() for k in stores},readers,devices,settings,
+            reference_backgrounds(evaluation, stores, mapping),readers,devices,settings,
             cancel_event=self.cancel_event,inference_session=self)
 
     def pause_gpu(self):

@@ -1,3 +1,12 @@
+## 2026-09-18 — Fiber-tracing benchmark runbook
+
+- Added one central inventory of current scientific, targeted-regression,
+  fiberlet, anchor, mini5, contrast and performance benchmarks with exact runner
+  modes, configs, output/completion contracts and detailed-result links.
+- Distinguished immutable short200 v3 evidence from the later GT-review draft,
+  and separated current canonical results from focused diagnostics, helper modes
+  and historical model/embedding sweeps.
+
 ## 2026-09-16 — Refinement default and run062136 evaluations
 
 - Promoted tracing-selected refinement EMA999u22000 (99restarts/68.676mm) as
@@ -2951,3 +2960,45 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
   Native 23/85/17 and Python 283 tests pass (8 skipped). Full provenance and
   per-scroll metrics:
   `../docs/benchmarks/fullres_refinement_213753_best_ema999_20260917.md`.
+
+## 2026-09-17 — Live evaluation GPU ownership is demand-scoped
+
+- Removed eager outer GPU grants from ordinary `pilot`/`full` evaluation while
+  retaining fixed grants for bounded profile/fit/audit and short-failure modes.
+- Managed setup now resolves numerical identity without CUDA; gated workers
+  validate precision only after authorization. Warm cached tracing/rendering
+  acquires no GPU, while missing tiles retain the existing 30-second idle
+  release and reacquisition behavior. Exclusive grants still reject unmanaged
+  external CUDA processes before worker authorization.
+- Native 23/85/17 and Python 286 tests pass (8 skipped); no evaluation rerun or
+  cache/numerical identity change.
+## 2026-09-18 — Parallel visualization resume and full-resolution short200 review
+
+- Restored concurrent same-source rich gallery rendering and selected saved-path
+  background prefetch for interrupted visualization resume; retained 135/180
+  existing full-evaluation galleries unchanged.
+- Evaluated/rendered all 200 locked short-failure pieces with best full-resolution
+  EMA999 using the existing named inference cache: 56 restarts, 11.615611 mm
+  mean, 237.084 s end-to-end. Review index and all 200 galleries are complete.
+
+## 2026-09-18 — Ground-truth review copy of short200
+
+- Published an independent 200-annotation review draft of the locked v3 short
+  benchmark, with rewritten local bindings and immutable per-case source
+  provenance. Large extraction scratch remains only in the unchanged source.
+- Removed visually rejected rendered case 147 (piece
+  `148_c34b34ef89821e48c871`) from the active draft and retained its annotation,
+  original manifest, and hashed evidence in recoverable review archives.
+
+## 2026-09-18 — Full-resolution short200 fiberlet evaluation and review
+
+- Completed all 200 immutable short-failure pieces with bounded-width-64
+  fiberlet replay and the full-resolution best EMA999 cache: 60 restart
+  episodes over 662.089848 mm, with zero route-state-limit cases.
+- Compared against the matched beam result (56 episodes): fiberlets improved 20
+  pieces, worsened 23, and newly failed on 17 formerly failure-free pieces.
+- Added resumable rendering directly from saved beam or fiberlet artifacts,
+  without inference or retracing, and indexed complete galleries for all 200
+  fiberlet pieces. Render-only resume now preserves trace and summary artifacts.
+- Full case mapping and review paths:
+  `../docs/benchmarks/short200_fullres_fiberlet_vs_beam_20260918.md`.

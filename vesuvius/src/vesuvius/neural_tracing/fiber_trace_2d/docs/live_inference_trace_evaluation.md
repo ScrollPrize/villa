@@ -1,5 +1,8 @@
 # Parallel native reference evaluation with live inference
 
+For the current benchmark inventory, canonical configs and exact runner modes,
+start with the [fiber-tracing benchmark runbook](benchmark_runbook.md).
+
 First standalone implementation, 2026-09-10. **Offline evaluation and on-demand inference are connected; synthetic cold/warm tests and a real classic-checkpoint PHerc0139 pilot pass.** Source bindings are configured; short eight-GPU inference profiles are recorded in the [chunk-major report](live_inference_chunk_major_20260910.md) and linked prior reports. The full evaluation has not been restarted during these performance experiments. See [classic evaluation report](classic_fiber_evaluation_20260910.md). Training and VC3D live-view integration remain later work. Current task records/status are in ../planning/.
 
 ## Current live implementation and command
@@ -63,6 +66,18 @@ process crash may leave owned temporary scratch for existing restart cleanup.
 - Version1 localhost TCP exchanges authenticated `hello`, batched `demand` descriptors (source/case/chunk/remaining length), `ready`, and cancellation `error`. No image tensors cross it. Tokens are redacted in saved config; native ready knowledge is bounded to100000 entries.
 - **Reviewed deviation:** one stack-preserving OS thread per directed case, default maximum256, with bounded active CPU permits. Waiting releases its permit without holding sampler locks. This preserves beam state but is not a stackless session engine, persistent trace recovery, or a solution for thousands of case threads.
 - `live_evaluate.py` freezes a checkpoint by SHA256/copy, validates bindings, creates the source/model cache, starts native replay and persistent spawned GPU workers lazily, prioritizes demand by longest remaining length, then drains reference-intersection prefetch. Reference prefetch starts after authenticated source validation even if tracing produces no demand. No whole-array scan.
+- Managed `pilot`/`full` runs keep checkpoint-policy and cache-identity setup on
+  CPU. They do not acquire an outer GPU grant. Once a missing tile has finished
+  its input read, the demand lease registers and starts gated workers on the
+  authorized devices; precision capability is validated there before model
+  construction. Thirty seconds without GPU tile activity releases the grant,
+  and later ready input reacquires it. A fully warm trace or render creates no
+  manager task and no model worker. Before authorizing an exclusive grant, the
+  gated children remain CUDA-free while the coordinator rejects unmanaged
+  external CUDA processes on those GPUs. `--unmanaged` removes any adaptive
+  manager setting and retains direct device validation. Fixed-duration
+  profiling/fitting/audit modes and the short-failure extractor continue to use
+  their intentional outer grants.
 - `lasagna/demand_predict3d.py` reuses shared tile geometry, GPU worker, raw input conversion, blending/filtering, per-add accumulation and output flush/finalizer from `tiled_predict3d.py`. Native input sampling is the same selected-level primitive as fast training. All model options/products publish coherent ordinary Zarr channels.
 - Full logical output-shape sparse mmap holds raw products and weights inside hidden output-Zarr directories. Fresh holes already read as zero: no zero reservation, scratch fsync or NPZ staging. Shared-RAM results go directly to the existing accumulator processes. Demand uses arrival-order additions (same f16/f32 precision, not guaranteed bitwise equality across schedules). There is no application scratch cap or per-tile storage polling; actual disk exhaustion can still kill an accumulator and abort the run.
 - Optional `inference.accumulator_layout: "chunk-major"` stores a flat grid of contiguous output-chunk bricks within each existing per-channel mmap. Boundary bricks are padded, without scratch byte accounting; logical output shape and Zarr encoding do not change. Both additions and finalizer reads use shared addressing helpers. Default remains `flat`; sequential circular-Z storage is unaffected. See the [layout benchmark](live_inference_chunk_major_20260910.md).

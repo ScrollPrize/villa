@@ -20,7 +20,6 @@ import selectors
 import shutil
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 from urllib.parse import urlsplit
@@ -143,6 +142,53 @@ def reference_chunks(points_base, factor, shape, chunk):
                 index = np.minimum(floor + corner, np.asarray(shape) - 1) // chunk
                 result.add(tuple(int(v) for v in index))
     return result
+
+
+def _complete_inspection_gallery(directory):
+    """Match the native resume validator without trusting partial galleries."""
+    directory = Path(directory)
+    try:
+        metadata = json.loads((directory / "render.json").read_text())
+        pages = metadata.get("pages")
+        return (metadata.get("format") == "vc_fiber_inspection" and
+                type(pages) is int and pages > 0 and
+                all((directory / f"strips_{page}.jpg").is_file()
+                    for page in range(pages)))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def resume_visualization_selection(output, source_ids, limit):
+    """Return the native round-robin selection and its saved center paths."""
+    if type(limit) is not int or limit < 1:
+        raise ValueError("resume_render_limit must be a positive integer")
+    groups = {source_id: [] for source_id in source_ids}
+    cases_root = Path(output) / "cases"
+    case_dirs = [path for path in cases_root.iterdir()
+                 if path.is_dir() and path.name.isdigit()]
+    for case_dir in sorted(case_dirs, key=lambda p: int(p.name)):
+        artifact_path = case_dir / "trace.json"
+        if not artifact_path.is_file() or _complete_inspection_gallery(case_dir / "rendered"):
+            continue
+        artifact = json.loads(artifact_path.read_text())
+        provenance = artifact.get("provenance", {})
+        case_index = provenance.get("case_index")
+        source_id = provenance.get("source_id")
+        points = artifact.get("reference_points_base_xyz")
+        if case_index != int(case_dir.name) or source_id not in groups or not isinstance(points, list):
+            raise ValueError(f"invalid visualization-resume trace artifact: {artifact_path}")
+        groups[source_id].append((case_index, points))
+    selected = []
+    for rank in itertools.count():
+        added = False
+        for source_id in source_ids:
+            if rank < len(groups[source_id]):
+                selected.append(groups[source_id][rank])
+                added = True
+                if len(selected) == limit:
+                    return selected
+        if not added:
+            return selected
 
 
 def input_root_attributes(volume):
@@ -275,12 +321,15 @@ def create_demand_store(cache, source_identity, model_identity, geometry, effect
         prepare_output=prepare_output)
 
 
-def resolve_inference_model(cache_root, checkpoint, model_config, settings, device_list):
+def resolve_inference_model(cache_root, checkpoint, model_config, settings, device_list,
+                            *, validate_devices=True):
     """Resolve numerical identity once for either channel role."""
     snapshot, checkpoint_digest = freeze_checkpoint(Path(checkpoint), cache_root)
     effective, _ = _checkpoint_config_for_inference(snapshot, model_config)
     settings = dict(settings)
-    precision, _ = _resolve_inference_precision(settings.get("precision", "auto"), checkpoint=snapshot, devices=device_list)
+    precision, _ = _resolve_inference_precision(
+        settings.get("precision", "auto"), checkpoint=snapshot,
+        devices=device_list, validate_devices=validate_devices)
     effective = dict(effective)
     effective["training"] = {**effective.get("training", {}), "mixed_precision": precision}
     tile, overlap, border = (int(settings.get(k, default)) for k, default in
@@ -304,23 +353,52 @@ def resolve_inference_model(cache_root, checkpoint, model_config, settings, devi
                 scale=scale, chunk=chunk, power=power)
 
 
+def demand_gpu_manager_settings(config, devices, *, manager_socket=None,
+                                manager_priority=None, unmanaged=False):
+    """Return runtime-only adaptive GPU settings, or ``None`` when unmanaged.
+
+    These settings deliberately stay outside inference/model identity.  The
+    demand coordinator consumes them only after a missing tile has finished
+    loading, so cached tracing never registers with or acquires from the GPU
+    manager.
+    """
+    manager = dict(config.get("gpu_manager", {}))
+    if unmanaged or not (manager.get("enabled", False) or manager_socket is not None):
+        return None
+    manager["devices"] = devices
+    if manager_socket is not None:
+        manager["socket"] = manager_socket
+    if manager_priority is not None:
+        manager["priority"] = manager_priority
+    budget = manager.get("vram_bytes_per_gpu")
+    if type(budget) is not int or budget <= (2 << 30):
+        raise ValueError(
+            "demand-managed live inference requires gpu_manager."
+            "vram_bytes_per_gpu > 2GiB")
+    return manager
+
+
+def runtime_inference_settings(settings, adaptive_manager):
+    """Keep manager lifecycle controls runtime-only and honor unmanaged mode."""
+    runtime = dict(settings)
+    runtime.pop("demand_gpu_manager", None)
+    if adaptive_manager is not None:
+        runtime["demand_gpu_manager"] = dict(adaptive_manager)
+    return runtime
+
+
 def run(config_path, checkpoint, devices, native_binary, model_config=None, *, render=False,
-        manager_socket=None, manager_priority=None, unmanaged=False):
+        manager_socket=None, manager_priority=None, unmanaged=False, runtime_overrides=None):
     config_path = Path(config_path).resolve()
     config = json.loads(config_path.read_text())
-    manager = config.get("gpu_manager", {})
-    if not unmanaged and (manager.get("enabled", False) or manager_socket is not None):
-        from .managed_evaluation import launch_managed
-        command = [sys.executable, "-m", __name__, "--config", str(config_path),
-                   "--checkpoint", str(checkpoint), "--native-binary", str(native_binary)]
-        # __name__ is __main__ under python -m; use the importable module name.
-        command[2] = "vesuvius.neural_tracing.fiber_trace_3d.live_evaluate"
-        if model_config is not None:
-            command.extend(["--model-config", str(model_config)])
-        if render:
-            command.append("--render")
-        return launch_managed(command, devices=devices, settings=manager,
-                              socket=manager_socket, priority=manager_priority)
+    runtime_overrides = dict(runtime_overrides or {})
+    unknown_runtime = set(runtime_overrides) - {"resume_visualization", "resume_render_limit"}
+    if unknown_runtime:
+        raise ValueError(f"unknown evaluation runtime overrides: {sorted(unknown_runtime)}")
+    config.update(runtime_overrides)
+    adaptive_manager = demand_gpu_manager_settings(config, devices,
+        manager_socket=manager_socket, manager_priority=manager_priority,
+        unmanaged=unmanaged)
     base = config_path.parent
     if config.get("version") != 1 or not config.get("sources"):
         raise ValueError("evaluation config requires version1 and explicit sources")
@@ -348,7 +426,8 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
     device_list = tuple(torch.device(f"cuda:{int(v)}") for v in devices.split(","))
     if not device_list or len(set(device_list)) != len(device_list):
         raise ValueError("select a nonempty distinct comma-separated CUDA device list")
-    primary = resolve_inference_model(cache_root, checkpoint, model_config, settings, device_list)
+    primary = resolve_inference_model(cache_root, checkpoint, model_config, settings, device_list,
+        validate_devices=adaptive_manager is None)
     models = [(primary, prediction_cache_root)]
     if mixed is not None:
         unknown = set(mixed) - {"checkpoint", "checkpoint_sha256", "model_config", "inference", "inference_cache_namespace"}
@@ -357,7 +436,7 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
         embedding_settings = {**settings, **mixed.get("inference", {}), "emit_embeddings": True}
         alternate = resolve_inference_model(cache_root, location(base, mixed["checkpoint"]),
             location(base, mixed["model_config"]) if mixed.get("model_config") else None,
-            embedding_settings, device_list)
+            embedding_settings, device_list, validate_devices=adaptive_manager is None)
         if mixed.get("checkpoint_sha256") and mixed["checkpoint_sha256"] != alternate["identity"]["checkpoint_sha256"]:
             raise ValueError("embedding checkpoint SHA256 mismatch")
         if alternate["scale"] != primary["scale"]:
@@ -372,10 +451,22 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
         raise ValueError("render must be a boolean")
     evaluation["render"] = render or config.get("render", False)
     evaluation["output"] = location(base, config["output"])
-    if Path(evaluation["output"]).exists():
+    if Path(evaluation["output"]).exists() and not config.get("resume_visualization", False):
         raise ValueError("evaluation output already exists")
+    if config.get("resume_visualization", False) and not Path(evaluation["output"]).is_dir():
+        raise ValueError("visualization resume requires an existing evaluation output")
     evaluation["sources"] = []
     source_to_store, stores, readers, channel_indices, backgrounds = {}, {}, {}, {}, {}
+    resume_points = {}
+    if config.get("resume_visualization", False):
+        selected = resume_visualization_selection(evaluation["output"],
+            [source["id"] for source in config["sources"]],
+            int(config.get("resume_render_limit", 24)))
+        for case_index, points in selected:
+            artifact = json.loads((Path(evaluation["output"]) / "cases" /
+                str(case_index) / "trace.json").read_text())
+            resume_points.setdefault(artifact["provenance"]["source_id"], []).append(points)
+        evaluation["resume_render_cases"] = [case_index for case_index, _ in selected]
     pool_groups = {}
     started = time.monotonic()
     native = None
@@ -424,10 +515,15 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
                     group_key = json_digest(model["identity"])
                     group = pool_groups.setdefault(group_key, {"keys": [], "settings": model["settings"]})
                     group["keys"].append(key)
-                for fiber in references["sources"][source_index]["fibers"]:
-                    for run in fiber["runs"]:
-                        backgrounds[key].update(reference_chunks(run["points_base_xyz"],
+                if config.get("resume_visualization", False):
+                    for points in resume_points.get(source_id, ()):
+                        backgrounds[key].update(reference_chunks(points,
                             (1 << level) * model["scale"], geometry.output_shape, model["chunk"]))
+                else:
+                    for fiber in references["sources"][source_index]["fibers"]:
+                        for run in fiber["runs"]:
+                            backgrounds[key].update(reference_chunks(run["points_base_xyz"],
+                                (1 << level) * model["scale"], geometry.output_shape, model["chunk"]))
             source_to_store[source_id] = role_keys if mixed is not None else role_keys[0]
             entry = dict(source)
             # Scientific producer identity, independent of manifests' runtime locations.
@@ -453,8 +549,9 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
             evaluation["sources"].append(entry)
         if any(sha256_file(Path(path)) != digest for path, digest in annotation_hashes.items()):
             raise ValueError("annotation changed before native evaluation launch")
+        runtime_settings = runtime_inference_settings(settings, adaptive_manager)
         return coordinate_native(evaluation, binary, stores, source_to_store, channel_indices,
-            backgrounds, readers, device_list, settings, started=started,
+            backgrounds, readers, device_list, runtime_settings, started=started,
             pool_groups=pool_groups if mixed is not None else None)
 
 
@@ -521,7 +618,9 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
             queue_log = None
             def open_queue_log():
                 nonlocal queue_log
-                queue_log = cleanup.enter_context((Path(evaluation["output"]) / "inference_queues.jsonl").open("x"))
+                name = (f"inference_queues.resume.{os.getpid()}.{time.time_ns()}.jsonl"
+                        if evaluation.get("resume_visualization") else "inference_queues.jsonl")
+                queue_log = cleanup.enter_context((Path(evaluation["output"]) / name).open("x"))
                 print(f"live-eval shared_buffers={pool.stats['shared_slot_bytes'] / (1 << 30):.2f}GiB "
                       f"hot_capacity={pool.stats.get('accumulator_hot_capacity_bytes', 0) / (1 << 30):.2f}GiB "
                       f"input_slots={pool.stats['input_slots']} readers={pool.stats['input_workers']} "
@@ -702,7 +801,9 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
             text = log.read()
             destination = Path(evaluation["output"])
             destination.mkdir(parents=True, exist_ok=True)
-            (destination / "native.log").write_text(text)
+            name = (f"native.resume.{os.getpid()}.{time.time_ns()}.log"
+                    if evaluation.get("resume_visualization") else "native.log")
+            (destination / name).write_text(text)
             print(text, end="", flush=True)
 
 
@@ -714,8 +815,8 @@ def main():
     parser.add_argument("--devices", required=True, help="explicit CUDA indices, e.g. 0,1; no CPU production inference")
     parser.add_argument("--native-binary", default="vc_fiber_trace_metric")
     parser.add_argument("--render", action="store_true", help="render reference/traced strips directly after each completed case")
-    parser.add_argument("--manager-socket", help="request fixed exclusive GPUs from this manager")
-    parser.add_argument("--manager-priority", type=int, help="explicit exclusive-job priority (default100)")
+    parser.add_argument("--manager-socket", help="request GPUs on demand from this manager")
+    parser.add_argument("--manager-priority", type=int, help="explicit demand-inference priority (default100)")
     parser.add_argument("--unmanaged", action="store_true", help="explicitly bypass configured GPU management")
     args = parser.parse_args()
     return run(args.config, args.checkpoint, args.devices, args.native_binary, args.model_config,

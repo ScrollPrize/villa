@@ -19,11 +19,25 @@ class DemandCohort:
     done = False
     state = None
 
-    def __init__(self, pool, grant):
+    def __init__(self, pool, grant, *, exclusive=False):
         self.pool = pool
         self.authorized = self.closed = self.draining = False
-        pool.start_gpu(sorted(grant["gpus"]),
-                       vram_budget=min(grant["gpus"].values()))
+        self.gpu_uuids = tuple(sorted(grant["gpus"]))
+        self.exclusive = bool(exclusive)
+        started = False
+        try:
+            pool.start_gpu(self.gpu_uuids,
+                           vram_budget=min(grant["gpus"].values()))
+            started = True
+            if self.exclusive:
+                # Workers are alive but still blocked on their gate, so they
+                # have not touched CUDA and cannot contaminate this check.
+                from .managed_evaluation import assert_gpus_idle
+                assert_gpus_idle(self.gpu_uuids)
+        except BaseException:
+            if started:
+                pool.stop_gpu()
+            raise
 
     @property
     def processes(self):
@@ -74,7 +88,8 @@ class DemandGpuLease:
         self.last_status = None
         self.supervisor = Supervisor(Client(self.manager_socket or ""), request=request,
             label=settings.get("label", "demand-inference"),
-            cohort_factory=lambda grant, state: DemandCohort(pool, grant),
+            cohort_factory=lambda grant, state: DemandCohort(
+                pool, grant, exclusive=exclusive),
             clock=clock, poll_interval=.2)
 
     def tick(self):

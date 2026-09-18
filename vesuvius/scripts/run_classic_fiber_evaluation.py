@@ -19,6 +19,15 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(REPO / "vesuvius/src"), str(REPO), str(REPO / "gpu_manager/src")]
 
 DEFAULT_CONFIG = REPO / "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_classic_collection.json"
+FIXED_GPU_GRANT_MODES = frozenset((
+    "profile", "fixed-path-fit", "integration-fit", "integration-audit"))
+
+
+def live_run_manager_options(args):
+    """Forward CLI manager intent exactly to demand-scoped live evaluation."""
+    return {"manager_socket": args.manager_socket,
+            "manager_priority": args.manager_priority,
+            "unmanaged": args.unmanaged}
 
 
 def load_workload(path):
@@ -189,7 +198,7 @@ def prepare(workload, *, pilot_only=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["benchmark-review", "benchmark-full", "pair-connectivity", "short-failures", "integration-report", "integration-fit", "integration-audit", "fixed-path-report", "fixed-path-extract", "fixed-path-fit", "freeze-snapshot", "prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "cached-full", "report-metrics", "profile", "observe", "report-progress", "reference-plan"])
+    parser.add_argument("mode", choices=["contrast-prepare", "benchmark-remove-case", "benchmark-review", "benchmark-render", "benchmark-full", "pair-connectivity", "short-failures", "integration-report", "integration-fit", "integration-audit", "fixed-path-report", "fixed-path-extract", "fixed-path-fit", "freeze-snapshot", "prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "resume-visualization", "cached-full", "report-metrics", "profile", "observe", "report-progress", "reference-plan"])
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--devices", help="runtime device selection (default from workload)")
     parser.add_argument("--manager-socket")
@@ -200,7 +209,15 @@ def main():
     parser.add_argument("--extraction-time-limit-seconds", type=float,
                         help="checkpoint and stop short-failures scheduling after this duration (cleanup follows)")
     args = parser.parse_args()
-    workload = (json.loads(args.config.read_text()) if args.mode in ('short-failures', 'benchmark-full', 'benchmark-review', 'pair-connectivity') else load_workload(args.config))
+    workload = (json.loads(args.config.read_text()) if args.mode in ('contrast-prepare', 'benchmark-remove-case', 'short-failures', 'benchmark-full', 'benchmark-render', 'benchmark-review', 'pair-connectivity') else load_workload(args.config))
+    if args.mode == 'contrast-prepare':
+        from vesuvius.neural_tracing.fiber_trace_3d.contrast_choice_benchmark import package_contrast_choice
+        print(package_contrast_choice(workload))
+        return 0
+    if args.mode == 'benchmark-remove-case':
+        from vesuvius.neural_tracing.fiber_trace_3d.contrast_choice_benchmark import remove_review_case
+        print(remove_review_case(workload))
+        return 0
     if args.mode == 'pair-connectivity':
         from vesuvius.neural_tracing.fiber_trace_3d.fiber_pair_connectivity import run_pair_connectivity
         run_pair_connectivity(workload)
@@ -213,6 +230,17 @@ def main():
             raise ValueError('cannot index incomplete benchmark')
         rows = write_render_review_index(root, result, json.loads(Path(workload['benchmark_manifest']).read_text()))
         print(f'Indexed {len(rows)} rendered pieces: {root / "README.md"}')
+        return 0
+    if args.mode == 'benchmark-render':
+        devices = args.devices or workload['devices']
+        manager = None if args.unmanaged else dict(workload['gpu_manager'], devices=devices)
+        if manager is not None:
+            if args.manager_socket is not None:
+                manager['socket'] = args.manager_socket
+            if args.manager_priority is not None:
+                manager['priority'] = args.manager_priority
+        from vesuvius.neural_tracing.fiber_trace_3d.short_benchmark_evaluate import render_existing
+        render_existing(workload, devices, gpu_manager=manager)
         return 0
     if args.mode == 'benchmark-full':
         devices = args.devices or workload['devices']
@@ -302,7 +330,7 @@ def main():
         return 0
     devices = args.devices or (workload["pilot_devices"] if args.mode == "pilot" else workload["devices"])
     manager = workload["evaluation"].get("gpu_manager", {})
-    if args.mode in ("pilot", "full", "profile", "fixed-path-fit", "integration-fit", "integration-audit") and not args.unmanaged and (
+    if args.mode in FIXED_GPU_GRANT_MODES and not args.unmanaged and (
             manager.get("enabled", False) or args.manager_socket is not None):
         from vesuvius.neural_tracing.fiber_trace_3d.managed_evaluation import launch_managed
         return launch_managed([sys.executable, str(Path(__file__).resolve()), args.mode,
@@ -339,10 +367,11 @@ def main():
         return
     from lasagna.inference_provenance import json_digest, sha256_file
     from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import run
-    audit = json.loads((ROOT / f"{args.mode}_bindings.json").read_text())
+    prepared_mode = "full" if args.mode == "resume-visualization" else args.mode
+    audit = json.loads((ROOT / f"{prepared_mode}_bindings.json").read_text())
     if audit["workload_sha256"] != json_digest(workload):
         raise ValueError("workload mapping/settings changed after preparation")
-    config = json.loads((ROOT / f"{args.mode}.json").read_text())
+    config = json.loads((ROOT / f"{prepared_mode}.json").read_text())
     if json_digest(config) != audit["config_sha256"]:
         raise ValueError("prepared config changed after audit")
     if sha256_file(CHECKPOINT) != audit["checkpoint_sha256"] or sha256_file(SPLIT / "manifest.json") != audit["split_sha256"]:
@@ -378,12 +407,26 @@ def main():
     if validate_only:
         print("Checkpoint, locked split membership/content, config and normal manifests verified.", flush=True)
         return
-    result = run(ROOT / f"{args.mode}.json", CHECKPOINT, devices, BINARY, unmanaged=True)
+    runtime_overrides = ({"resume_visualization": True, "resume_render_limit": 96}
+                         if args.mode == "resume-visualization" else None)
+    result = run(ROOT / f"{prepared_mode}.json", CHECKPOINT, devices, BINARY,
+                 runtime_overrides=runtime_overrides, **live_run_manager_options(args))
     if config.get("render") and result in (None, 0):
         from vesuvius.neural_tracing.fiber_trace_3d.visualization_report import write_visualization_report
-        write_visualization_report(ROOT / args.mode, ROOT,
+        if args.mode == "resume-visualization":
+            status = json.loads((ROOT / "full/visualization_resume.json").read_text())
+            if status["remaining_cases"]:
+                print(json.dumps({"rendered_cases": status["rendered_cases"],
+                    "remaining_cases": len(status["remaining_cases"]),
+                    "next_cases": status["remaining_cases"][:96]}, indent=2), flush=True)
+                return result
+        write_visualization_report(ROOT / prepared_mode, ROOT,
             provenance={"checkpoint": str(CHECKPOINT), "checkpoint_sha256": audit["checkpoint_sha256"],
-                        "workload": str(args.config.resolve()), "native_binary": str(BINARY)})
+                        "workload": str(args.config.resolve()), "native_binary": str(BINARY)},
+            allow_incomplete=args.mode == "resume-visualization")
+        if args.mode == "resume-visualization":
+            for marker in (ROOT / "full/incomplete.json", ROOT / "full/inference_incomplete.json"):
+                marker.unlink(missing_ok=True)
     return result
 
 

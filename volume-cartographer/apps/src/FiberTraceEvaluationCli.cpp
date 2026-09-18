@@ -27,6 +27,7 @@
 #include <iostream>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <syncstream>
 #include <thread>
@@ -73,6 +74,37 @@ Json readJson(const std::filesystem::path& path)
     std::ifstream input(path);
     if (!input) throw std::runtime_error("cannot open " + path.string());
     return Json::parse(input);
+}
+
+bool completeInspectionGallery(const std::filesystem::path& directory)
+{
+    const auto metadataPath = directory / "render.json";
+    if (!std::filesystem::is_regular_file(metadataPath)) return false;
+    try {
+        const auto metadata = readJson(metadataPath);
+        if (metadata.value("format", std::string{}) != "vc_fiber_inspection" ||
+            !metadata.contains("pages") || !metadata.at("pages").is_number_unsigned())
+            return false;
+        const auto pages = metadata.at("pages").get<size_t>();
+        if (!pages) return false;
+        for (size_t page = 0; page < pages; ++page)
+            if (!std::filesystem::is_regular_file(directory / ("strips_" + std::to_string(page) + ".jpg")))
+                return false;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+Json expectedReplayArtifact(const std::vector<cv::Vec3d>& points,
+                            const FiberReplayTraceResult& replay,
+                            double threshold, const Json& provenance)
+{
+    Json reference = Json::array();
+    for (const auto& point : points) reference.push_back({point[0], point[1], point[2]});
+    return {{"format", "vc_native_replay_artifact"}, {"version", 1},
+        {"reference_points_base_xyz", std::move(reference)},
+        {"provenance", provenance}, {"replay", fiberReplayTraceJson(replay, threshold)}};
 }
 
 std::filesystem::path localPath(const std::filesystem::path& base, const std::string& value)
@@ -141,7 +173,6 @@ struct Source {
     Json provenance;
     vc::lasagna::LasagnaDatasetManifest predictionManifest;
     std::shared_ptr<Volume> renderVolume;
-    std::unique_ptr<std::mutex> renderMutex;
     std::string renderCt;
     FiberReplayStripTextureSource renderSource;
     std::shared_ptr<FiberletOnDemandPreprocessor> fiberlets;
@@ -185,7 +216,30 @@ struct Case {
     double length = 0;
     size_t run = 0;
     Json selection;
+    std::vector<std::vector<cv::Vec3d>> contrastChoices;
 };
+
+std::vector<cv::Vec3d> fiberLinePoints(const Json& annotation,
+                                       const std::filesystem::path& path)
+{
+    if (!annotation.contains("line_points") ||
+        !annotation.at("line_points").is_array() ||
+        annotation.at("line_points").size() < 2)
+        throw std::invalid_argument("fiber has no usable line_points: " + path.string());
+    std::vector<cv::Vec3d> points;
+    points.reserve(annotation.at("line_points").size());
+    for (const auto& p : annotation.at("line_points")) {
+        if (!p.is_array() || p.size() != 3)
+            throw std::invalid_argument("fiber line point is not xyz: " + path.string());
+        cv::Vec3d point{p[0].get<double>(), p[1].get<double>(), p[2].get<double>()};
+        if (!std::isfinite(point[0]) || !std::isfinite(point[1]) ||
+            !std::isfinite(point[2]))
+            throw std::invalid_argument("fiber line point is nonfinite: " + path.string());
+        points.push_back(point);
+    }
+    (void)makePolylineArcGeometry(points);
+    return points;
+}
 
 Json selfProximity(const Json& plan, const vc::lasagna::NormalSampler& normals,
                    double threshold, double factor, double separation, double spacing)
@@ -431,8 +485,26 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     const int constructionWorkers = fiberletSettings.value("construction_workers",
         fiberletSettings.value("workers_per_source", 4));
     const int storageSide = fiberletSettings.value("storage_chunk_side_base", 512);
-    if (constructionWorkers <= 0 || storageSide <= 0)
+    const bool prefetchReferencePaths = fiberletSettings.value(
+        "prefetch_reference_paths", true);
+    const int referencePrefetchPriorityOffset = fiberletSettings.value(
+        "reference_prefetch_priority_offset", 1'000'000);
+    const int referencePrefetchWindow = fiberletSettings.value(
+        "reference_prefetch_window", std::max(1, constructionWorkers / 2));
+    const double contrastCorridorRadius = fiberletSettings.value(
+        "contrast_corridor_radius_base_voxels", 0.0);
+    if (constructionWorkers <= 0 || storageSide <= 0 ||
+        referencePrefetchPriorityOffset <= 0 || referencePrefetchWindow <= 0)
         throw std::invalid_argument("invalid fiberlet worker/chunk configuration");
+    if (!(contrastCorridorRadius >= 0.0) || !std::isfinite(contrastCorridorRadius))
+        throw std::invalid_argument("invalid fiberlet contrast corridor radius");
+    const auto contrastChoiceBindings = config.value(
+        "fiberlet_contrast_choices", Json::object());
+    if (!contrastChoiceBindings.is_object() ||
+        (!fiberletBackend && !contrastChoiceBindings.empty()) ||
+        (contrastChoiceBindings.empty() != (contrastCorridorRadius == 0.0)))
+        throw std::invalid_argument(
+            "fiberlet contrast choices require fiberlet backend and positive radius");
     FiberletPathConfig fiberletPaths;
     FiberAnchorConfig fiberletAnchors;
     if (fiberletSettings.contains("path")) {
@@ -492,13 +564,28 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     graphConfig.beamWidth = fiberletSettings.value("beam_width", 16);
     graphConfig.lookaheadDistanceBaseVoxels = fiberletSettings.value("lookahead_base_voxels", 384.0);
     graphConfig.beamStepDistanceBaseVoxels = fiberletSettings.value("beam_step_base_voxels", 48.0);
+    graphConfig.searchWidth = fiberletSettings.value("search_width", size_t{0});
+    graphConfig.pruneDistanceBaseVoxels = fiberletSettings.value(
+        "prune_distance_base_voxels", 48.0);
+    graphConfig.maximumGeneratedStatesPerIteration = fiberletSettings.value(
+        "maximum_generated_states_per_iteration", size_t{1'000'000});
     graphConfig.requireInitialSeedInFirstWindow = true;
+    const bool continueRouteStateLimit = fiberletSettings.value(
+        "continue_route_state_limit", false);
     const bool live = config.contains("live_endpoint");
     const bool profileTracing = config.value("profile_tracing", false);
+    const bool resumeVisualization = config.value("resume_visualization", false);
+    const auto resumeRenderLimit = config.value("resume_render_limit", size_t{24});
+    if (resumeVisualization && (!config.value("render", false) || renderFlag ||
+            anchorBackend || profileTracing || !resumeRenderLimit))
+        throw std::invalid_argument("visualization resume requires configured beam/fiberlet rendering, a positive limit and no profiling/CLI render override");
     const auto readinessEntries = config.value("readiness_cache_entries", int64_t{4096});
     if (readinessEntries < 0) throw std::invalid_argument("readiness_cache_entries must be nonnegative");
     auto persistedConfig = config;
     persistedConfig.erase("reference_plan");
+    persistedConfig.erase("resume_visualization");
+    persistedConfig.erase("resume_render_limit");
+    persistedConfig.erase("resume_render_cases");
     persistedConfig["decoded_cache_bytes"] = configureEvaluationCache(config);
     const bool render = config.value("render", false) || renderFlag;
     persistedConfig["render"] = render;
@@ -587,7 +674,6 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 source.renderVolume = Volume::New(source.renderCt);
                 source.renderSource = validateFiberReplayStripCtVolume(*source.renderVolume, source.renderCt);
             }
-            source.renderMutex = std::make_unique<std::mutex>();
         }
         source.provenance["trace_to_base"] = source.traceScale;
         source.provenance["effective_trace"] = cli::traceConfigJson(trace);
@@ -610,6 +696,27 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     throw std::invalid_argument("annotation base voxel size mismatch: " + fiberPath.string());
             }
             const auto& selected = references.at("sources").at(sources.size()).at("fibers").at(fiberIndex);
+            std::vector<std::vector<cv::Vec3d>> contrastChoices;
+            const auto binding = contrastChoiceBindings.find(
+                std::filesystem::absolute(fiberPath).lexically_normal().string());
+            if (binding != contrastChoiceBindings.end()) {
+                if (!binding->is_array() || binding->empty())
+                    throw std::invalid_argument("fiberlet contrast choice list is empty");
+                for (const auto& value : *binding) {
+                    if (!value.is_string())
+                        throw std::invalid_argument("fiberlet contrast choice path is not a string");
+                    const auto choicePath = localPath(configPath.parent_path(), value.get<std::string>());
+                    const auto choice = readJson(choicePath);
+                    for (const auto& key : {"vc_open_data_coordinate_space",
+                                             "vc_open_data_source_original_resolution"})
+                        if (annotation.contains(key) != choice.contains(key) ||
+                            (annotation.contains(key) && annotation.at(key) != choice.at(key)))
+                            throw std::invalid_argument(
+                                "fiberlet contrast choice coordinate binding mismatch: " +
+                                choicePath.string());
+                    contrastChoices.push_back(fiberLinePoints(choice, choicePath));
+                }
+            }
             const auto evaluationDirection = annotation.value("evaluation_direction", std::string("both"));
             if (evaluationDirection != "both" && evaluationDirection != "forward" && evaluationDirection != "reverse")
                 throw std::invalid_argument("invalid annotation evaluation_direction");
@@ -623,7 +730,8 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     auto provenance = run; provenance.erase("points_base_xyz");
                     provenance["original_length_base_voxels"] = selected.at("original_length_base_voxels");
                     cases.push_back({sources.size(), fiberIndex, reverse, fiberPath, std::move(points),
-                        run.at("length_base_voxels").get<double>(), run.at("run_index").get<size_t>(), std::move(provenance)});
+                        run.at("length_base_voxels").get<double>(), run.at("run_index").get<size_t>(),
+                        std::move(provenance), contrastChoices});
                 }
             }
             ++fiberIndex;
@@ -653,7 +761,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             }
         }
     } generationShutdown{sources, bridge};
-    if (fiberletBackend) {
+    if (fiberletBackend && !resumeVisualization) {
         // The generator owns bounded, distinct anchor and path services. Graph
         // threads never occupy those services while waiting for dependencies.
         std::map<std::filesystem::path, size_t> shared;
@@ -757,11 +865,91 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             shared.emplace(root, s);
         }
     }
-    std::filesystem::create_directories(output.parent_path());
-    if (!std::filesystem::create_directory(output)) throw std::invalid_argument("evaluation output already exists");
-    std::filesystem::create_directory(output / "cases");
+    std::unique_ptr<vc::core::util::ExclusiveDirectoryLock> outputLock;
+    if (resumeVisualization) {
+        if (!std::filesystem::is_directory(output) || !std::filesystem::is_directory(output / "cases"))
+            throw std::invalid_argument("visualization resume requires an existing evaluation output");
+        outputLock = std::make_unique<vc::core::util::ExclusiveDirectoryLock>(output);
+    } else {
+        std::filesystem::create_directories(output.parent_path());
+        if (!std::filesystem::create_directory(output)) throw std::invalid_argument("evaluation output already exists");
+        std::filesystem::create_directory(output / "cases");
+    }
     std::vector<FiberReferenceReplayOutcome> outcomes(cases.size());
+    std::vector<std::optional<Json>> infrastructureFailures(cases.size());
     std::vector<Json> anchorOutcomes(cases.size());
+    std::vector<std::optional<FiberReplayTraceResult>> savedReplays(cases.size());
+    std::vector<std::optional<Json>> savedReplayProvenance(cases.size());
+    std::set<size_t> resumeRenderCases;
+    if (resumeVisualization) {
+        // Validate the complete deterministic case manifest before rendering
+        // anything. The saved artifact remains the scientific trace authority;
+        // resume only reconstructs its in-memory replay for the inline renderer.
+        std::vector<std::vector<size_t>> missingBySource(sources.size());
+        for (size_t index = 0; index < cases.size(); ++index) {
+            const auto& item = cases[index];
+            const auto& source = sources[item.source];
+            auto provenance = source.provenance;
+            provenance["source_id"] = source.id;
+            provenance["fiber_path"] = item.fiberPath.string();
+            provenance["reverse"] = item.reverse;
+            provenance["case_index"] = index;
+            provenance["reference_run"] = item.selection;
+            const auto artifactPath = output / "cases" / std::to_string(index) / "trace.json";
+            if (!std::filesystem::is_regular_file(artifactPath))
+                throw std::invalid_argument("visualization resume is missing trace artifact for case " + std::to_string(index));
+            const auto artifact = readJson(artifactPath);
+            auto replay = fiberReplayTraceFromJson(artifact.at("replay"));
+            const auto& savedProvenance = artifact.at("provenance");
+            // A render-only resume may add CT bindings and deliberately skips
+            // rebuilding derived fiberlet-cache metadata.  Every scientific
+            // binding present in the current evaluation must still match; the
+            // saved superset remains the authority for the canonical artifact.
+            for (auto it = provenance.begin(); it != provenance.end(); ++it) {
+                if (it.key() == "ct_volume" || it.key() == "ct_base_volume")
+                    continue;
+                if (!savedProvenance.contains(it.key()) ||
+                    savedProvenance.at(it.key()) != it.value())
+                    throw std::invalid_argument("visualization resume trace/provenance mismatch for case " + std::to_string(index));
+            }
+            if (artifact != expectedReplayArtifact(item.points, replay, threshold, savedProvenance))
+                throw std::invalid_argument("visualization resume trace/provenance mismatch for case " + std::to_string(index));
+            savedReplays[index] = std::move(replay);
+            savedReplayProvenance[index] = savedProvenance;
+            if (!completeInspectionGallery(artifactPath.parent_path() / "rendered"))
+                missingBySource.at(item.source).push_back(index);
+        }
+        if (config.contains("resume_render_cases")) {
+            const auto& selected = config.at("resume_render_cases");
+            if (!selected.is_array() || selected.size() > resumeRenderLimit)
+                throw std::invalid_argument("invalid explicit visualization-resume case selection");
+            std::set<size_t> missing;
+            for (const auto& sourceCases : missingBySource)
+                missing.insert(sourceCases.begin(), sourceCases.end());
+            for (const auto& value : selected) {
+                if (!value.is_number_unsigned())
+                    throw std::invalid_argument("visualization-resume case index must be unsigned");
+                const auto index = value.get<size_t>();
+                if (!missing.contains(index) || !resumeRenderCases.insert(index).second)
+                    throw std::invalid_argument("visualization-resume case selection is stale or duplicated");
+            }
+        } else {
+            // Select across sources deterministically. The shared chunk caches
+            // support concurrent readers and every selected direction may
+            // issue demand independently.
+            for (size_t rank = 0; resumeRenderCases.size() < resumeRenderLimit; ++rank) {
+                bool added = false;
+                for (const auto& sourceCases : missingBySource) if (rank < sourceCases.size()) {
+                    resumeRenderCases.insert(sourceCases[rank]);
+                    added = true;
+                    if (resumeRenderCases.size() == resumeRenderLimit) break;
+                }
+                if (!added) break;
+            }
+        }
+        std::cout << "visualization-resume selected=" << resumeRenderCases.size()
+                  << " limit=" << resumeRenderLimit << " cases=" << cases.size() << std::endl;
+    }
     std::vector<size_t> order(cases.size());
     std::iota(order.begin(), order.end(), size_t{0});
     std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return cases[a].length > cases[b].length; });
@@ -769,6 +957,44 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     std::atomic<bool> failed{false};
     std::mutex errorMutex;
     std::exception_ptr error;
+    struct ReferencePrefetchGroup {
+        std::shared_ptr<FiberletOnDemandPreprocessor> preprocessor;
+        std::vector<FiberletReferencePrefetchCandidate> candidates;
+        std::vector<FiberletScheduledChunk> schedule;
+        std::set<std::string> sourceIds;
+        size_t cases = 0;
+    };
+    std::vector<ReferencePrefetchGroup> referencePrefetchGroups;
+    if (fiberletBackend && bridge && prefetchReferencePaths &&
+        !resumeVisualization) {
+        std::map<const FiberletOnDemandPreprocessor*, ReferencePrefetchGroup> groups;
+        for (size_t index = 0; index < cases.size(); ++index) {
+            const auto& item = cases[index];
+            const auto& source = sources[item.source];
+            auto& group = groups[source.fiberlets.get()];
+            group.preprocessor = source.fiberlets;
+            group.sourceIds.insert(source.id);
+            ++group.cases;
+            const auto geometry = makePolylineArcGeometry(item.points);
+            const auto schedule = source.fiberlets->referenceChunkSchedule(
+                geometry, 0.0, geometry.length(), 0.0);
+            for (const auto& scheduled : schedule) {
+                group.candidates.push_back({
+                    scheduled,
+                    std::max(
+                        0.0,
+                        item.length - scheduled.nearestReferenceArcBase),
+                    index,
+                });
+            }
+        }
+        referencePrefetchGroups.reserve(groups.size());
+        for (auto& [identity, group] : groups) {
+            (void)identity;
+            group.schedule = orderFiberletReferencePrefetch(group.candidates);
+            referencePrefetchGroups.push_back(std::move(group));
+        }
+    }
     const auto start = std::chrono::steady_clock::now();
     std::vector<std::jthread> pool;
     for (size_t w = 0; w < (live ? cases.size() : workers); ++w) pool.emplace_back([&] {
@@ -844,7 +1070,8 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 const auto caseStart = std::chrono::steady_clock::now();
                 auto nextProfile = caseStart + std::chrono::seconds(10);
                 std::unique_ptr<FiberPredictionField> livePredictions;
-                if (bridge) {
+                const bool renderThisCase = render && (!resumeVisualization || resumeRenderCases.contains(index));
+                if (bridge && (!resumeVisualization || renderThisCase)) {
                     livePredictions = std::make_unique<FiberPredictionField>(
                         vc::lasagna::LasagnaDataset(source.predictionManifest),
                         FiberPredictionFieldBindingMode::TraceOptions, trace.embeddingWeight > 0);
@@ -869,16 +1096,65 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 request.config.traceToBaseScale = source.traceScale;
                 request.config.baseVoxelSizeUm = source.voxelSizeUm;
                 std::optional<FiberletGraphReplayResult> graphReplay;
-                const auto replay = [&]() {
+                std::optional<Json> infrastructureFailure;
+                double lastGraphProgressArc = 0.0;
+                const auto replay = [&]() -> FiberReplayTraceResult {
+                    if (resumeVisualization) return *savedReplays.at(index);
                     if (fiberletBackend) {
-                        FiberletCachedReplayGraphSource graph(source.fiberlets, fiberletPaths,
-                            defaultFiberletReplayQuantization(storageSide));
+                        std::set<std::array<size_t, 3>> contrastCells;
+                        if (!item.contrastChoices.empty()) {
+                            const auto& grid = source.fiberlets->grid();
+                            const auto cellSide = source.fiberlets->anchorConfig().cellSizePredictionVoxels;
+                            const auto add = [&](const auto& line) {
+                                const auto cells = fiberAnchorCellsNearPolyline(
+                                    line, contrastCorridorRadius, grid, cellSide);
+                                contrastCells.insert(cells.begin(), cells.end());
+                            };
+                            add(item.points);
+                            for (const auto& choice : item.contrastChoices) add(choice);
+                        }
+                        FiberletAnchorCellPredicate corridor;
+                        if (!contrastCells.empty()) {
+                            corridor = [cells = std::move(contrastCells)](
+                                           const std::array<size_t, 3>& cell) {
+                                return cells.contains(cell);
+                            };
+                        }
+                        auto graph = corridor
+                            ? FiberletCachedReplayGraphSource(
+                                  source.fiberlets, std::move(corridor), fiberletPaths,
+                                  defaultFiberletReplayQuantization(storageSide))
+                            : FiberletCachedReplayGraphSource(
+                                  source.fiberlets, fiberletPaths,
+                                  defaultFiberletReplayQuantization(storageSide));
                         graph.setWaitExecutor([&](const auto& wait) { permit.suspend(wait); });
-                        graphReplay = traceFiberletGraphReplay(graph, item.points, *source.normals,
-                            source.traceScale, graphConfig, {}, [&](const FiberletGraphReplayProgress& progress) {
-                                remaining.store(item.length * (1 - std::clamp(progress.referenceArcFraction, 0.0, 1.0)));
-                                caseRemaining[index].store(remaining.load());
-                            });
+                        try {
+                            graphReplay = traceFiberletGraphReplay(graph, item.points, *source.normals,
+                                source.traceScale, graphConfig, {}, [&](const FiberletGraphReplayProgress& progress) {
+                                    lastGraphProgressArc = std::clamp(progress.referenceArcBase, 0.0, item.length);
+                                    remaining.store(item.length * (1 - std::clamp(progress.referenceArcFraction, 0.0, 1.0)));
+                                    caseRemaining[index].store(remaining.load());
+                                });
+                        } catch (const FiberletRouteStateLimitError& limit) {
+                            if (!continueRouteStateLimit)
+                                throw;
+                            infrastructureFailure = Json{
+                                {"format", "vc_fiberlet_replay_infrastructure_failure"},
+                                {"version", 1},
+                                {"reason", "route_state_limit"},
+                                {"attempted_generated_states", limit.attemptedStates()},
+                                {"maximum_generated_states_per_iteration", limit.maximumStates()},
+                                {"reached_reference_arc_base", lastGraphProgressArc},
+                                {"reached_reference_arc_fraction", item.length > 0.0
+                                    ? lastGraphProgressArc / item.length : 0.0},
+                            };
+                            FiberReplayTraceResult incomplete;
+                            incomplete.graphGeometry = true;
+                            incomplete.tangentialThresholdFactor = tangentialFactor;
+                            incomplete.referenceEndArcBase = item.length;
+                            incomplete.completedReferenceArcBase = lastGraphProgressArc;
+                            return incomplete;
+                        }
                         return fiberletInspectionReplay(*graphReplay, tangentialFactor);
                     }
                     return traceFiberReplay(livePredictions ? *livePredictions : *source.predictions,
@@ -901,7 +1177,42 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 provenance["reverse"] = item.reverse;
                 provenance["case_index"] = index;
                 provenance["reference_run"] = item.selection;
-                writeFiberReplayTraceArtifacts(output / "cases" / std::to_string(index), item.points, replay, threshold, provenance);
+                if (resumeVisualization) {
+                    provenance = *savedReplayProvenance.at(index);
+                    // Texture provenance is specific to this rendering pass;
+                    // it is not part of the immutable saved trace binding.
+                    for (const char* key : {"ct_volume", "ct_base_volume"})
+                        if (source.provenance.contains(key))
+                            provenance[key] = source.provenance.at(key);
+                }
+                if (infrastructureFailure) {
+                    infrastructureFailure->update({
+                        {"case_index", index},
+                        {"source_id", source.id},
+                        {"fiber_path", item.fiberPath.string()},
+                        {"source_index", item.fiber},
+                        {"run_index", item.run},
+                        {"direction", item.reverse ? "reverse" : "forward"},
+                        {"reference_length_base_voxels", item.length},
+                        {"provenance", provenance},
+                    });
+                    const auto directory = output / "cases" / std::to_string(index);
+                    std::filesystem::create_directories(directory);
+                    vc::core::util::atomicWriteString(
+                        directory / "infrastructure_failure.json",
+                        infrastructureFailure->dump(2) + "\n");
+                    infrastructureFailures[index] = *infrastructureFailure;
+                    caseRemaining[index].store(0);
+                    std::osyncstream(std::cout)
+                        << "replay infrastructure-failure progress=" << ++completed
+                        << '/' << cases.size() << " case=" << index
+                        << " source=" << source.id << " reverse=" << item.reverse
+                        << " reason=route_state_limit reached_arc="
+                        << lastGraphProgressArc << '\n';
+                    continue;
+                }
+                if (!resumeVisualization)
+                    writeFiberReplayTraceArtifacts(output / "cases" / std::to_string(index), item.points, replay, threshold, provenance);
                 if (graphReplay)
                     vc::core::util::atomicWriteString(output / "cases" / std::to_string(index) / "graph.json",
                         fiberletGraphReplayJson(*graphReplay, graphConfig).dump(2) + "\n");
@@ -909,14 +1220,10 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     vc::core::util::atomicWriteString(output / "cases" / std::to_string(index) / "profile.json",
                         caseProfileJson(index, std::chrono::duration<double>(std::chrono::steady_clock::now() - caseStart).count(),
                             readinessProfile, traceProfile).dump(2) + "\n");
-                if (render) {
-                    // Render directly from this completed replay, never reload
-                    // trace.json. Bound concurrent textures per source and keep
-                    // the same normal scale/geometry as the post-hoc API.
-                    std::unique_lock renderLock(*source.renderMutex, std::defer_lock);
-                    // A renderer may await inference and release its CPU permit.
-                    // Mutex waiters must not consume all permits needed to resume it.
-                    permit.suspend([&] { renderLock.lock(); });
+                if (renderThisCase) {
+                    // Render directly from this completed replay. Volume,
+                    // prediction and normal chunk caches are concurrent; all
+                    // selected directions may render and request data together.
                     const auto& predictions = livePredictions ? *livePredictions : *source.predictions;
                     // Coordinates stay in the bound source lattice; Volume applies
                     // the pyramid transform. Do not divide coordinates a second time.
@@ -934,10 +1241,15 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                             return renderFiberReplayPresenceTexture(coords, scale, source.renderSource,
                                 source.traceScale, predictions);
                         }, threshold, item.reverse, source.voxelSizeUm, ctSampling);
-                    const auto directory = output / "cases" / std::to_string(index) / "rendered";
-                    if (!std::filesystem::create_directory(directory)) throw std::runtime_error("render output already exists");
+                    const auto caseDirectory = output / "cases" / std::to_string(index);
+                    const auto directory = caseDirectory / "rendered";
+                    auto temporary = caseDirectory / ("rendered.resume." + std::to_string(
+                        std::chrono::steady_clock::now().time_since_epoch().count()));
+                    const auto writeDirectory = resumeVisualization ? temporary : directory;
+                    if (!std::filesystem::create_directory(writeDirectory))
+                        throw std::runtime_error("render staging output already exists");
                     for (size_t p = 0; p < inspection.pages.size(); ++p)
-                        if (!cv::imwrite((directory / ("strips_" + std::to_string(p) + ".jpg")).string(), inspection.pages[p]))
+                        if (!cv::imwrite((writeDirectory / ("strips_" + std::to_string(p) + ".jpg")).string(), inspection.pages[p]))
                             throw std::runtime_error("failed writing inspection image");
                     inspection.metadata.update({{"case_index", index}, {"provenance", provenance},
                         {"texture_source", {{"locator", source.renderSource.locator},
@@ -950,7 +1262,15 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                         entry["original_fiber_arc_base"] = entry["original_fiber_arc_base"].get<double>() + originalBegin;
                         entry["original_fiber_arc_mm"] = entry["original_fiber_arc_base"].get<double>() * source.voxelSizeUm / 1000;
                     }
-                    vc::core::util::atomicWriteString(directory / "render.json", inspection.metadata.dump(2) + "\n");
+                    vc::core::util::atomicWriteString(writeDirectory / "render.json", inspection.metadata.dump(2) + "\n");
+                    if (resumeVisualization) {
+                        if (std::filesystem::exists(directory)) {
+                            auto quarantine = caseDirectory / ("rendered.incomplete." + std::to_string(
+                                std::chrono::steady_clock::now().time_since_epoch().count()));
+                            std::filesystem::rename(directory, quarantine);
+                        }
+                        std::filesystem::rename(writeDirectory, directory);
+                    }
                 }
                 FiberReferenceReplayCase replayCase{item.fiber, item.run, item.reverse, item.points, item.length};
                 outcomes[index] = graphReplay ? measureFiberReferenceReplayOutcome(replayCase, *graphReplay)
@@ -967,11 +1287,76 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             if (!error) error = std::current_exception();
         }
     });
+    std::vector<std::jthread> referencePrefetchers;
+    referencePrefetchers.reserve(referencePrefetchGroups.size());
+    for (auto& group : referencePrefetchGroups) {
+        referencePrefetchers.emplace_back([&, group = &group] {
+            try {
+                {
+                    std::osyncstream out(std::cout);
+                    out << "fiberlet-reference-prefetch sources=";
+                    bool first = true;
+                    for (const auto& id : group->sourceIds) {
+                        out << (first ? "" : ",") << id;
+                        first = false;
+                    }
+                    out << " cases=" << group->cases
+                        << " scheduled=" << group->candidates.size()
+                        << " unique=" << group->schedule.size()
+                        << " window=" << referencePrefetchWindow
+                        << " priority_offset=" << referencePrefetchPriorityOffset
+                        << std::endl;
+                }
+                for (size_t begin = 0;
+                     begin < group->schedule.size() && !failed.load();
+                     begin += static_cast<size_t>(referencePrefetchWindow)) {
+                    const auto count = std::min(
+                        static_cast<size_t>(referencePrefetchWindow),
+                        group->schedule.size() - begin);
+                    group->preprocessor->prefetchScheduled(
+                        group->schedule,
+                        begin,
+                        count,
+                        true,
+                        referencePrefetchPriorityOffset);
+                    std::osyncstream(std::cout)
+                        << "fiberlet-reference-prefetch progress="
+                        << std::min(group->schedule.size(), begin + count)
+                        << '/' << group->schedule.size() << std::endl;
+                }
+            } catch (...) {
+                failed.store(true);
+                if (bridge)
+                    bridge->cancel("native fiberlet reference prefetch failed");
+                std::lock_guard lock(errorMutex);
+                if (!error)
+                    error = std::current_exception();
+            }
+        });
+    }
     pool.clear(); // join before consuming results or propagating errors
+    referencePrefetchers.clear();
     for (auto& source : sources) if (source.fiberlets) source.fiberlets->shutdown();
     if (error) {
         vc::core::util::atomicWriteString(output / "incomplete.json", Json{{"completed_cases", completed.load()}, {"requested_cases", cases.size()}, {"config", persistedConfig}}.dump(2) + "\n");
         std::rethrow_exception(error);
+    }
+    if (resumeVisualization) {
+        Json remaining = Json::array();
+        for (size_t index = 0; index < cases.size(); ++index)
+            if (!completeInspectionGallery(output / "cases" / std::to_string(index) / "rendered"))
+                remaining.push_back(index);
+        const Json status{{"format", "vc_visualization_resume"}, {"version", 1},
+            {"cases", cases.size()}, {"rendered_cases", cases.size() - remaining.size()},
+            {"remaining_cases", remaining}, {"batch_selected_cases", resumeRenderCases}};
+        vc::core::util::atomicWriteString(output / "visualization_resume.json", status.dump(2) + "\n");
+        // The Python publisher removes interruption markers only after the
+        // complete visualization report validates every declared page.  The
+        // original scientific summary and its timing remain byte-for-byte
+        // untouched by this render-only operation.
+        vc::core::util::atomicWriteString(output / "incomplete.json", Json{
+            {"visualization_resume", status}, {"config", persistedConfig}}.dump(2) + "\n");
+        return 0;
     }
     Json summaries = Json::array();
     if (anchorBackend) {
@@ -986,15 +1371,28 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         }.dump(2) + "\n");
         return 0;
     }
-    double directedLengthMm = 0.0;
-    size_t totalFailures = 0, selectedFibers = 0;
+    double directedLengthMm = 0.0, requestedDirectedLengthMm = 0.0;
+    size_t totalFailures = 0, selectedFibers = 0, evaluatedCases = 0;
+    Json allInfrastructureFailures = Json::array();
     auto commonConfig = persistedConfig;
     commonConfig["error_threshold_base_voxels"] = threshold;
     commonConfig["match_refine_steps"] = refine;
     for (size_t s = 0; s < sources.size(); ++s) {
         selectedFibers += sources[s].provenance.at("fibers").size();
         std::vector<FiberReferenceReplayOutcome> selected;
-        for (size_t i = 0; i < cases.size(); ++i) if (cases[i].source == s) selected.push_back(outcomes[i]);
+        Json sourceInfrastructureFailures = Json::array();
+        size_t requestedCases = 0;
+        double requestedLengthBase = 0.0;
+        for (size_t i = 0; i < cases.size(); ++i) if (cases[i].source == s) {
+            ++requestedCases;
+            requestedLengthBase += cases[i].length;
+            if (infrastructureFailures[i]) {
+                sourceInfrastructureFailures.push_back(*infrastructureFailures[i]);
+                allInfrastructureFailures.push_back(*infrastructureFailures[i]);
+            } else {
+                selected.push_back(outcomes[i]);
+            }
+        }
         const auto summary = summarizeFiberReferenceReplay(sources[s].provenance.at("fibers").size(), selected, sources[s].voxelSizeUm);
         auto value = fiberReferenceReplayBenchmarkJson(summary, selected,
             fiberletBackend ? "fiberlet" : trace.beamWidth == 1 ? "native_greedy" : "native_beam", commonConfig, sources[s].provenance,
@@ -1015,25 +1413,38 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         }
         value["source_id"] = sources[s].id;
         value["threshold"] = fiberReplayThresholdDescriptorJson(threshold, tangentialFactor);
+        value["requested_directed_cases"] = requestedCases;
+        value["requested_directed_reference_length_base_voxels"] = requestedLengthBase;
+        value["infrastructure_failures"] = std::move(sourceInfrastructureFailures);
+        value["summary"]["requested_directed_cases"] = requestedCases;
+        value["summary"]["requested_directed_reference_length_base_voxels"] = requestedLengthBase;
+        value["summary"]["route_state_limit_cases"] = value["infrastructure_failures"].size();
         summaries.push_back(std::move(value));
         directedLengthMm += summary.directedReferenceLengthBaseVoxels * sources[s].voxelSizeUm / 1000.0;
+        requestedDirectedLengthMm += requestedLengthBase * sources[s].voxelSizeUm / 1000.0;
+        evaluatedCases += selected.size();
         totalFailures += summary.totalFailures;
     }
     vc::core::util::atomicWriteString(output / "summary.json", Json{
         {"version", 2}, {"metric_definition", "complete-reference-partition-v1"},
         {"completed", true}, {"cases", cases.size()}, {"workers", workers},
+        {"evaluated_cases", evaluatedCases},
+        {"route_state_limit_cases", allInfrastructureFailures.size()},
+        {"infrastructure_failures", std::move(allInfrastructureFailures)},
         {"selected_fibers", selectedFibers}, {"eligible_runs", [&] {
             size_t count = 0;
             for (const auto& source : references.at("sources"))
                 for (const auto& fiber : source.at("fibers")) count += fiber.at("runs").size();
             return count;
         }()},
-        {"directed_reference_length_mm", directedLengthMm}, {"failures", totalFailures},
+        {"directed_reference_length_mm", directedLengthMm},
+        {"requested_directed_reference_length_mm", requestedDirectedLengthMm},
+        {"failures", totalFailures},
         {"reference_selection_policy", references.at("policy")},
         {"failures_per_directed_mm", directedLengthMm > 0 ? Json(totalFailures / directedLengthMm) : Json(nullptr)},
-        {"reliability_segments", totalFailures + cases.size()},
-        {"mean_segment_length_mm", cases.empty() ? Json(nullptr) : Json(directedLengthMm / (totalFailures + cases.size()))},
-        {"mean_segment_length_percent", cases.empty() ? Json(nullptr) : Json(100.0 / (totalFailures + cases.size()))},
+        {"reliability_segments", totalFailures + evaluatedCases},
+        {"mean_segment_length_mm", evaluatedCases == 0 ? Json(nullptr) : Json(directedLengthMm / (totalFailures + evaluatedCases))},
+        {"mean_segment_length_percent", evaluatedCases == 0 ? Json(nullptr) : Json(100.0 / (totalFailures + evaluatedCases))},
         {"wall_seconds", std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()},
         {"config", persistedConfig}, {"effective_trace", cli::traceConfigJson(trace)}, {"sources", summaries}}.dump(2) + "\n");
     return 0;

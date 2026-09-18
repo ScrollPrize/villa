@@ -2,6 +2,7 @@ import importlib.util
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,6 +29,22 @@ def test_short_extraction_owns_one_outer_grant(tmp_path, monkeypatch):
     assert module.main() == 0
     assert len(launches) == len(runs) == 1
     assert runs[0][1]['devices'] == '0,1,2,3,4,5,6,7'
+
+
+def test_full_and_pilot_use_demand_grant_not_fixed_outer_grant():
+    script = Path(__file__).resolve().parents[2] / 'scripts/run_classic_fiber_evaluation.py'
+    spec = importlib.util.spec_from_file_location('classic_eval_grant_modes', script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert 'full' not in module.FIXED_GPU_GRANT_MODES
+    assert 'pilot' not in module.FIXED_GPU_GRANT_MODES
+    assert module.FIXED_GPU_GRANT_MODES == {
+        'profile', 'fixed-path-fit', 'integration-fit', 'integration-audit'}
+    args = SimpleNamespace(manager_socket='manager.sock', manager_priority=321,
+                           unmanaged=True)
+    assert module.live_run_manager_options(args) == {
+        'manager_socket': 'manager.sock', 'manager_priority': 321,
+        'unmanaged': True}
 
 
 def test_default_classic_workload_uses_full_set_validated_batching():

@@ -5,6 +5,7 @@ Set VC_REPLAY_TEST_BINARY to the rebuilt vc_fiber_trace_metric executable.
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import socket
 import threading
@@ -469,6 +470,76 @@ def test_batch_render_flag_matches_posthoc_and_preserves_traces(replay_fixture):
     assert list((root / "rendered").glob("strips_*.jpg"))  # Legacy CT-only posthoc remains available.
 
 
+def test_visualization_resume_preserves_complete_galleries_and_trace_artifacts(replay_fixture):
+    root, config, run = replay_fixture
+    config.update(output="inline", render=True)
+    path = root / "inline.json"
+    path.write_text(json.dumps(config))
+    run("replay-set", "--config", path)
+    trace_before = {i: (root / f"inline/cases/{i}/trace.json").read_bytes() for i in range(2)}
+    summary_before = (root / "inline/summary.json").read_bytes()
+    preserved = {p.name: p.read_bytes() for p in (root / "inline/cases/0/rendered").iterdir()}
+    shutil.rmtree(root / "inline/cases/1/rendered")
+    config.update(resume_visualization=True, resume_render_limit=1,
+                  resume_render_cases=[1])
+    path.write_text(json.dumps(config))
+    run("replay-set", "--config", path)
+    assert trace_before == {i: (root / f"inline/cases/{i}/trace.json").read_bytes() for i in range(2)}
+    assert (root / "inline/summary.json").read_bytes() == summary_before
+    assert preserved == {p.name: p.read_bytes() for p in (root / "inline/cases/0/rendered").iterdir()}
+    status = json.loads((root / "inline/visualization_resume.json").read_text())
+    assert status["batch_selected_cases"] == [1]
+    assert status["remaining_cases"] == []
+    regenerated = {p.name: p.read_bytes() for p in (root / "inline/cases/1/rendered").iterdir()}
+    del config["resume_render_cases"]
+    path.write_text(json.dumps(config))
+    run("replay-set", "--config", path)
+    summary_before = (root / "resume-derived/summary.json").read_bytes()
+    assert regenerated == {p.name: p.read_bytes() for p in (root / "inline/cases/1/rendered").iterdir()}
+    assert json.loads((root / "inline/visualization_resume.json").read_text())["batch_selected_cases"] == []
+
+    artifact = json.loads((root / "inline/cases/1/trace.json").read_text())
+    artifact["provenance"]["source_id"] = "changed"
+    (root / "inline/cases/1/trace.json").write_text(json.dumps(artifact))
+    failed = run("replay-set", "--config", path, check=False)
+    assert failed.returncode != 0
+    assert "trace/provenance mismatch" in failed.stderr
+
+
+def test_visualization_resume_accepts_render_only_and_saved_derived_provenance(replay_fixture):
+    root, config, run = replay_fixture
+    config.update(output="resume-derived", render=False)
+    config["sources"][0].pop("ct_volume")
+    path = root / "resume-derived.json"
+    path.write_text(json.dumps(config))
+    run("replay-set", "--config", path)
+    traces = {}
+    for index in range(2):
+        artifact_path = root / f"resume-derived/cases/{index}/trace.json"
+        artifact = json.loads(artifact_path.read_text())
+        artifact["provenance"]["fiberlet_processing"] = {"derived": True}
+        artifact_path.write_text(json.dumps(artifact))
+        traces[index] = artifact_path.read_bytes()
+
+    config.update(render=True, resume_visualization=True, resume_render_limit=2,
+                  resume_render_cases=[0, 1])
+    config["sources"][0].update(ct_volume="ct.zarr/0")
+    path.write_text(json.dumps(config))
+    run("replay-set", "--config", path)
+
+    assert traces == {
+        index: (root / f"resume-derived/cases/{index}/trace.json").read_bytes()
+        for index in range(2)
+    }
+    assert (root / "resume-derived/summary.json").read_bytes() == summary_before
+    for index in range(2):
+        rendered = root / f"resume-derived/cases/{index}/rendered"
+        assert list(rendered.glob("strips_*.jpg"))
+        provenance = json.loads((rendered / "render.json").read_text())["provenance"]
+        assert provenance["fiberlet_processing"] == {"derived": True}
+        assert provenance["ct_volume"] == str(root / "ct.zarr/0")
+
+
 def test_batch_render_base_pyramid(replay_fixture):
     root, config, run = replay_fixture
     config["sources"][0].update(ct_volume="ct.zarr", ct_base_volume=True)
@@ -720,8 +791,16 @@ def test_complete_runner_cold_and_warm_with_identity_model(replay_fixture, monke
                            "chunk_size": 4, "input_workers": 2, "slots_per_gpu": 2, "compressor": "none"}
     for name in ("cold", "warm"):
         config["output"] = name
+        if name == "warm":
+            config["gpu_manager"] = {"enabled": True,
+                "vram_bytes_per_gpu": 4 << 30, "cpu_cores": 1}
+            from vesuvius.neural_tracing.fiber_trace_3d import demand_gpu
+            monkeypatch.setattr(demand_gpu, "DemandGpuLease",
+                lambda *a, **k: pytest.fail("warm cache acquired a manager lease"))
         (root / "live-run.json").write_text(json.dumps(config))
-        runner.run(root / "live-run.json", checkpoint, "0", os.environ["VC_REPLAY_TEST_BINARY"], render=True)
+        runner.run(root / "live-run.json", checkpoint, "0",
+                   os.environ["VC_REPLAY_TEST_BINARY"], render=True,
+                   unmanaged=name == "cold")
         summary = json.loads((root / name / "summary.json").read_text())
         assert summary["completed"] and summary["cases"] == 2 and summary["failures"] == 0
         assert summary["config"]["render"] is True

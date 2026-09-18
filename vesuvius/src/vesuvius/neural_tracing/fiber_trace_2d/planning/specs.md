@@ -1,5 +1,15 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Benchmark documentation
+
+- `docs/benchmark_runbook.md` is the central benchmark index. It must label the
+  scientific authority and selection bias of each workload, current versus
+  superseded/historical status, exact config/mode/output identity, cache reuse
+  semantics and evidence required to call a run complete.
+- Frozen benchmark manifests and completed results are immutable. Annotation
+  audit drafts are not benchmark replacements until promoted under a new
+  versioned manifest, config and result series.
+
 ## Short-benchmark review exports
 
 - Optional single-case pair diagnostics freeze a separately hashed auxiliary
@@ -354,6 +364,15 @@
   post-hoc API; never reload saved traces for inline rendering. Preflight every
   source's local concrete uint8 CT metadata before tracing. Rendering failures
   result in incomplete evaluation; enabling it must not change trace geometry.
+- Visualization-only resume is explicit and validation-first. It validates every
+  immutable saved trace/provenance artifact and every declared gallery page,
+  preserves complete galleries byte-for-byte, and atomically publishes only
+  missing rich inline galleries under their original case IDs. All selected
+  directed cases remain concurrent even when they share one source/cache.
+  Their exact saved reference centerlines are queued through the ordinary
+  low-priority reference-intersection prefetch before higher-priority on-demand
+  strip-margin/cross-section requests. Only a globally complete validated report
+  may clear interruption markers; resume never changes scientific trace output.
 - Persist every completed case's segmented replay/reference JSON/OBJ, failures,
   reset discontinuities and provenance. `render-replay` consumes saved artifacts
   and local CT/sheet normals to produce reference/traced top/side strips without
@@ -7529,3 +7548,16 @@ recomputed using report-metrics without mutating their trace artifacts.
 - Locked manager protocol remains unchanged; existing Supervisor coordinates
   reconnect/release. Numerical inference and cached output conventions stay
   unchanged; any cache compatibility must be exact and explicitly audited.
+- The ordinary `pilot` and `full` live-evaluation entry points use this same
+  demand-scoped lifecycle. Their parent process may resolve checkpoint policy
+  and cache identity on CPU, but must not call CUDA, construct a model worker,
+  register with the manager, or acquire GPUs before a missing tile input is
+  ready. Device precision is validated inside the authorized gated worker.
+  Fully warm tracing/rendering therefore performs no manager bootstrap or GPU
+  acquisition. Explicit unmanaged operation strips any stale adaptive setting.
+  Direct unmanaged execution retains device-capability validation. For an
+  exclusive demand grant, spawned workers remain blocked and CUDA-free while
+  the coordinator rejects unmanaged external CUDA processes on the granted
+  devices; only then may the worker gates be authorized.
+  Bounded profile/fit/audit modes and short-failure extraction retain their
+  separately specified fixed outer grants.

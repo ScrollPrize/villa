@@ -1,0 +1,6 @@
+{
+  "review_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/short_failures_200_gt_review_20260918_v1",
+  "rendered_case": "/ephemeral/hendrik/fiber3d_train2/evaluations/short200_fullres_refinement_213753_best_ema999_vis_20260918_v1/full/cases/38",
+  "rendered_case_index": 38,
+  "reason": "broken-ground-truth"
+}

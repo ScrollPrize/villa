@@ -88,6 +88,26 @@ def test_retained_session_reuses_pool_and_closes_before_stores(monkeypatch):
                    'authorize gpu','run','close pool','close stores']
 
 
+def test_cached_session_reference_backgrounds_are_exact(tmp_path):
+    from types import SimpleNamespace
+    from vesuvius.neural_tracing.fiber_trace_3d import cached_trace_profile as cached
+    from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import reference_chunks
+
+    root = tmp_path / 'cache'
+    root.mkdir()
+    identity = {'source': {'level': 1}}
+    geometry = {'shape': [64, 64, 64], 'tile': 32, 'overlap': 8,
+                'border': 4, 'scale': 2, 'chunk': 8}
+    (root / 'cache_identity.json').write_text(json.dumps(
+        {'identity': identity, 'geometry': geometry}))
+    points = [[0, 0, 0], [40, 0, 0]]
+    evaluation = {'reference_plan': {'sources': [{'source_id': 'source', 'fibers': [
+        {'runs': [{'points_base_xyz': points}]}]}]}}
+    backgrounds = cached.reference_backgrounds(
+        evaluation, {'cache': SimpleNamespace(root=root)}, {'source': 'cache'})
+    assert backgrounds == {'cache': reference_chunks(points, 4, (32, 32, 32), 8)}
+
+
 def test_worker_evicts_overlapping_idle_session_and_reuses_matching(monkeypatch,tmp_path):
     from threading import Event
     from collections import OrderedDict

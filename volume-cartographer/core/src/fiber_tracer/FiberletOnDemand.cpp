@@ -153,6 +153,57 @@ std::string fiberletScheduledResolutionError(
     return message;
 }
 
+std::vector<FiberletScheduledChunk> orderFiberletReferencePrefetch(
+    std::span<const FiberletReferencePrefetchCandidate> candidates)
+{
+    std::map<std::array<int, 4>, FiberletReferencePrefetchCandidate> unique;
+    const auto better = [](const auto& left, const auto& right) {
+        return std::tuple{
+                   left.remainingReferenceBase,
+                   -left.scheduled.nearestReferenceDistanceBase,
+                   std::numeric_limits<std::size_t>::max() - left.stableOrder} >
+               std::tuple{
+                   right.remainingReferenceBase,
+                   -right.scheduled.nearestReferenceDistanceBase,
+                   std::numeric_limits<std::size_t>::max() - right.stableOrder};
+    };
+    for (const auto& candidate : candidates) {
+        if (!std::isfinite(candidate.remainingReferenceBase) ||
+            candidate.remainingReferenceBase < 0.0 ||
+            !std::isfinite(candidate.scheduled.nearestReferenceArcBase) ||
+            !std::isfinite(candidate.scheduled.nearestReferenceDistanceBase)) {
+            throw std::invalid_argument(
+                "fiberlet reference prefetch candidate is invalid");
+        }
+        const auto& key = candidate.scheduled.key;
+        const std::array<int, 4> id{key.level, key.iz, key.iy, key.ix};
+        const auto found = unique.find(id);
+        if (found == unique.end() || better(candidate, found->second))
+            unique[id] = candidate;
+    }
+    std::vector<FiberletReferencePrefetchCandidate> ordered;
+    ordered.reserve(unique.size());
+    for (auto& [id, candidate] : unique) {
+        (void)id;
+        ordered.push_back(std::move(candidate));
+    }
+    std::sort(ordered.begin(), ordered.end(), [&](const auto& left, const auto& right) {
+        if (better(left, right))
+            return true;
+        if (better(right, left))
+            return false;
+        const auto& a = left.scheduled.key;
+        const auto& b = right.scheduled.key;
+        return std::tuple{a.level, a.iz, a.iy, a.ix} <
+               std::tuple{b.level, b.iz, b.iy, b.ix};
+    });
+    std::vector<FiberletScheduledChunk> result;
+    result.reserve(ordered.size());
+    for (auto& candidate : ordered)
+        result.push_back(std::move(candidate.scheduled));
+    return result;
+}
+
 std::vector<vc::render::ChunkKey> fiberletOutputChunksForNonemptyPresence(
     const FiberPresenceChunkScanReport& presence, const FiberletDatasetMetadata& outputMetadata, int anchorCellSizePredictionVoxels)
 {
@@ -757,7 +808,7 @@ std::vector<vc::render::ChunkKey> FiberletOnDemandPreprocessor::anchorDependenci
 std::vector<FiberletScheduledChunk> FiberletOnDemandPreprocessor::referenceChunkSchedule(
     const PolylineArcGeometry& reference, double beginArcBase, double endArcBase, double radiusBaseVoxels) const
 {
-    if (!(beginArcBase >= 0.0) || !(endArcBase > beginArcBase) || endArcBase > reference.length() || !(radiusBaseVoxels > 0.0) ||
+    if (!(beginArcBase >= 0.0) || !(endArcBase > beginArcBase) || endArcBase > reference.length() || !(radiusBaseVoxels >= 0.0) ||
         !std::isfinite(radiusBaseVoxels)) {
         throw std::invalid_argument("fiberlet reference chunk schedule is invalid");
     }
@@ -833,14 +884,28 @@ std::vector<FiberletScheduledChunk> FiberletOnDemandPreprocessor::anchorChunkSch
     return referenceChunkSchedule(reference, begin, end, radius + padding);
 }
 
-void FiberletOnDemandPreprocessor::prefetchScheduled(std::span<const FiberletScheduledChunk> schedule, std::size_t begin, std::size_t count, bool wait) const
+void FiberletOnDemandPreprocessor::prefetchScheduled(
+    std::span<const FiberletScheduledChunk> schedule,
+    std::size_t begin,
+    std::size_t count,
+    bool wait,
+    int priorityOffset) const
 {
     if (begin > schedule.size())
         throw std::out_of_range("fiberlet prefetch schedule offset is invalid");
     const auto end = std::min(schedule.size(), begin + std::min(count, schedule.size() - begin));
     std::map<std::array<int, 4>, std::pair<vc::render::ChunkKey, int>> anchorPriorities;
+    const auto priorityFor = [&](std::size_t index) {
+        const auto rank = static_cast<std::int64_t>(std::min<std::size_t>(
+            index - begin,
+            static_cast<std::size_t>(std::numeric_limits<int>::max())));
+        return static_cast<int>(std::clamp<std::int64_t>(
+            static_cast<std::int64_t>(priorityOffset) + rank,
+            std::numeric_limits<int>::min(),
+            std::numeric_limits<int>::max()));
+    };
     for (std::size_t index = begin; index < end; ++index) {
-        const int priority = static_cast<int>(std::min<std::size_t>(index - begin, static_cast<std::size_t>(std::numeric_limits<int>::max())));
+        const int priority = priorityFor(index);
         for (const auto& dependency : anchorDependencies(schedule[index].key)) {
             const std::array<int, 4> dependencyId{dependency.level, dependency.iz, dependency.iy, dependency.ix};
             auto [found, inserted] = anchorPriorities.emplace(dependencyId, std::pair{dependency, priority});
@@ -854,7 +919,7 @@ void FiberletOnDemandPreprocessor::prefetchScheduled(std::span<const FiberletSch
         state_->anchorCache->prefetchChunks({key}, false, priority);
     }
     for (std::size_t index = begin; index < end; ++index) {
-        const int priority = static_cast<int>(std::min<std::size_t>(index - begin, static_cast<std::size_t>(std::numeric_limits<int>::max())));
+        const int priority = priorityFor(index);
         state_->fiberletCache->prefetchChunks({schedule[index].key}, false, priority);
     }
     if (wait) {

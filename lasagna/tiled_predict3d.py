@@ -2657,17 +2657,20 @@ def _execute_accumulate_process_task(task, shms, mmaps, arena=None, record_spec=
 		if arena is None or record_spec is None:
 			raise RuntimeError("arena accumulation task without an owner arena")
 		record = arena.mutable_record(task.arena_key, create=True)
-		record_layouts = {layout.name: layout for layout in record_spec.layouts}
-		destination = (slice(lz0, lz1), slice(ly0, ly1), slice(lx0, lx1))
-		backend = _add_accumulator_view(
-			_record_array(record, record_layouts["weight"])[destination], weight)
-		for name in task.dirty_products:
-			product = _slot_array(shm, layouts[f"product:{name}"])
-			for channel in range(int(product.shape[0])):
-				backend = _add_accumulator_view(
-					_record_array(record, record_layouts[f"product:{name}:{channel}"])[destination],
-					product[channel, pz0:pz1, py0:py1, px0:px1])
-		return backend
+		try:
+			record_layouts = {layout.name: layout for layout in record_spec.layouts}
+			destination = (slice(lz0, lz1), slice(ly0, ly1), slice(lx0, lx1))
+			backend = _add_accumulator_view(
+				_record_array(record, record_layouts["weight"])[destination], weight)
+			for name in task.dirty_products:
+				product = _slot_array(shm, layouts[f"product:{name}"])
+				for channel in range(int(product.shape[0])):
+					backend = _add_accumulator_view(
+						_record_array(record, record_layouts[f"product:{name}:{channel}"])[destination],
+						product[channel, pz0:pz1, py0:py1, px0:px1])
+			return backend
+		finally:
+			arena.record_mutated(task.arena_key)
 	backend = _add_mmap_band_chunk(
 		task.weight, 0, lz0, lz1, ly0, ly1, lx0, lx1, weight, mmaps,
 	)
@@ -2685,7 +2688,7 @@ def _execute_accumulate_process_task(task, shms, mmaps, arena=None, record_spec=
 
 def _accumulate_process_main(worker_index: int, task_queue, result_queue,
 		record_spec=None, hot_slots=None, spill_segment_slots=256, scratch_dir=None,
-		spill_open_path=None, spill_request_queue=None, spill_response_queue=None,
+		spill_request_queue=None, spill_response_queue=None,
 		spill_segment_stride=None) -> None:
 	# Emit the active Python frame for fatal native/mmap faults instead of
 	# leaving the coordinator with only a negative child exit code.
@@ -2695,23 +2698,21 @@ def _accumulate_process_main(worker_index: int, task_queue, result_queue,
 	shms: dict[str, shared_memory.SharedMemory] = {}
 	mmaps = _BoundedMmapCache()
 	arena = None
-	spill_fd = None
 	try:
 		if record_spec is not None:
 			from lasagna.chunk_accumulator_arena import ChunkAccumulatorArena
 			arena_arguments = {}
-			if spill_open_path is not None:
-				spill_fd = os.open(spill_open_path, os.O_RDWR)
+			if spill_request_queue is not None:
 				def acquire_spill_slot():
 					spill_request_queue.put(("acquire", worker_index, -1))
-					kind, value = spill_response_queue.get()
+					response = spill_response_queue.get()
+					kind, value = response[:2]
 					if kind != "slot":
 						raise RuntimeError(f"spill arena allocation failed: {value}")
-					return value
+					return value, response[2]
 				def release_spill_slot(slot):
 					spill_request_queue.put(("release", worker_index, int(slot)))
 				arena_arguments = {
-					"spill_fd": spill_fd,
 					"spill_slot_acquire": acquire_spill_slot,
 					"spill_slot_release": release_spill_slot,
 					"spill_segment_stride": spill_segment_stride,
@@ -2719,7 +2720,7 @@ def _accumulate_process_main(worker_index: int, task_queue, result_queue,
 			arena = ChunkAccumulatorArena(scratch_dir, record_bytes=record_spec.nbytes,
 				hot_slots=int(hot_slots), spill_segment_slots=spill_segment_slots,
 				**arena_arguments)
-			if spill_open_path is not None:
+			if spill_request_queue is not None:
 				result_queue.put(("arena_attached", worker_index))
 		while True:
 			item = task_queue.get()
@@ -2764,8 +2765,6 @@ def _accumulate_process_main(worker_index: int, task_queue, result_queue,
 	finally:
 		if arena is not None:
 			arena.close()
-		if spill_fd is not None:
-			os.close(spill_fd)
 		mmaps.close()
 		for shm in shms.values():
 			shm.close()
