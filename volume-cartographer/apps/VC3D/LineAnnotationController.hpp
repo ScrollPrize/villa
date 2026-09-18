@@ -152,6 +152,13 @@ public:
         // Mirrors FiberBranchRef::pending: the link still awaits reviewer
         // approval, and the map colours it like the annotation views do.
         bool pending = false;
+        // Mirrors FiberBranchRef::adjacent: the endpoints are one winding
+        // apart (V inside H), which the map's winding solve honours.
+        bool adjacent = false;
+        // Mirrors FiberBranchRef::adjacentKeyPresent: an explicit kind, so
+        // two refs of one pair saying true and false is a real disagreement
+        // the map reports (an absent key would have been healed at load).
+        bool adjacentExplicit = true;
     };
 
     struct FiberMapFiber {
@@ -230,6 +237,15 @@ public:
     // saved-fiber control-point ordering. Any live mutation of control points or
     // branches must go through the private session paths that call
     // syncLinkedBranchMetadataAfterFiberModification().
+    // JSON key of FiberBranchRef::adjacent in a fiber file's "branches"
+    // entries. Written EXPLICITLY, true or false, on every entry this build
+    // saves: an absent key then means the entry was last written by
+    // something that does not know the kind (an older VC3D strips unknown
+    // keys on save), which lets a stripped flag be told apart from a
+    // deliberate re-link as an ordinary link and healed or reported instead
+    // of silently winning.
+    static constexpr const char* kAdjacentLinkJsonKey = "adjacent";
+
     struct FiberBranchRef {
         int controlPointIndex = -1;
         uint64_t branchFiberId = 0;
@@ -241,6 +257,24 @@ public:
         cv::Vec3d branchControlPointPosition{0.0, 0.0, 0.0};
         // Link awaits reviewer approval; kept in sync on both reciprocal refs.
         bool pending = false;
+        // The two control points sit on ADJACENT windings, not the same one:
+        // the V fiber's point one winding inside the H fiber's (horizontals
+        // lie on the front of the sheet, verticals on the back, so a V fiber
+        // showing through to the next wrap out is one sheet thickness from
+        // it). Which side is inside follows from the fibers' effective H/V
+        // tags; a pair that is not one H and one V (a tag can change, a new
+        // fiber has none yet) is not refused here but flagged as an error by
+        // the fiber map, and carries no winding constraint there. Immutable
+        // for a link (delete and re-link to change), mirrored on both
+        // reciprocal refs.
+        bool adjacent = false;
+        // The file carried the key (true or false) when this ref was read;
+        // false for an entry written by a build that does not know it, and
+        // for refs created in memory before their first save. The load-time
+        // heal (healOneSidedAdjacentLinks) restores a stripped flag from the
+        // reciprocal only when the key is absent, never over an explicit
+        // false.
+        bool adjacentKeyPresent = true;
     };
 
     // Per-fiber data for the fiber overlay's "Show linked" mode. Only fibers
@@ -547,6 +581,14 @@ private:
         // shape so a downsampled active volume can display them correctly.
         std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX;
         bool needsSave = false;
+        // The file's write time as of the READ that produced this record
+        // (loadFiberFile), so a save decided from that read - the adjacent
+        // link heal - can tell a file the sync replaced in the meantime and
+        // leave it alone (the next load heals again). Unset for fibers not
+        // read from disk.
+        std::optional<std::filesystem::file_time_type> loadedWriteTime;
+        // healOneSidedAdjacentLinks marked this record for saving.
+        bool adjacentHealed = false;
     };
 
     struct StoredFiberSessionSnapshot {
@@ -682,6 +724,8 @@ private:
     struct LinkedSeedParent {
         uint64_t fiberId = 0;
         int controlPointIndex = -1;
+        // The seed's link to the parent is an adjacent-winding link.
+        bool adjacent = false;
         cv::Vec3d point{0.0, 0.0, 0.0};
         std::vector<cv::Vec3d> linePoints;
         std::function<void(const FiberBranchRef&)> addRef;
@@ -724,9 +768,12 @@ private:
     void handleGeneratedControlPointSetKollesisTermination(const std::string& surfaceName,
                                                            size_t controlPointIndex,
                                                            bool enabled);
+    // adjacent: designate the point as an ADJACENT link candidate (see
+    // LinkCandidate::adjacent) rather than an ordinary one.
     void handleGeneratedControlPointLinkCandidate(const std::string& surfaceName,
                                                   size_t controlPointIndex,
-                                                  cv::Vec3f volumePoint);
+                                                  cv::Vec3f volumePoint,
+                                                  bool adjacent = false);
     void handleGeneratedControlPointLinkWithCandidate(const std::string& surfaceName,
                                                       size_t controlPointIndex,
                                                       cv::Vec3f volumePoint);
@@ -913,6 +960,23 @@ private:
                                   const std::vector<std::filesystem::path>& sourcePreference);
     [[nodiscard]] std::string loadedFiberLinkKey(const StoredFiber& from,
                                                  const std::string& branchFileName) const;
+    // A link whose one ref says adjacent while the reciprocal carries no
+    // adjacent key at all was saved on the reciprocal's side by a build that
+    // does not know the kind; the flag is put back and that fiber marked for
+    // saving. An explicit false on the reciprocal is a real disagreement
+    // (a deliberate re-link mid-sync) and is left for the sync merge.
+    void healOneSidedAdjacentLinks(std::vector<StoredFiber>& fibers) const;
+    // The heal's save must not overwrite a file that changed on disk since it
+    // was READ (a concurrent sync download): stale when the write time moved,
+    // and, failing closed, when it cannot be read.
+    [[nodiscard]] bool adjacentHealSaveIsStale(const StoredFiber& fiber) const;
+    // `candidate` (a ref on the linked fiber) is the reciprocal of `branch`
+    // (a ref on `fiber`): the same two control points named from the other
+    // side, positions and directions agreeing. The one predicate for pairing
+    // refs across files, shared by the load-time validation and the heal.
+    [[nodiscard]] static bool isReciprocalBranchRef(const StoredFiber& fiber,
+                                                    const FiberBranchRef& branch,
+                                                    const FiberBranchRef& candidate);
     [[nodiscard]] bool validateLoadedFiberLinks(std::vector<StoredFiber>& fibers,
                                                 std::vector<std::string>& errors) const;
     // Fibers merged by the sync tool (scripts/fiber_merge.py) carry a
@@ -1061,7 +1125,11 @@ private:
     [[nodiscard]] std::optional<StoredFiber> loadFiberJson(const nlohmann::json& root,
                                                            const std::filesystem::path& path,
                                                            std::vector<std::string>* branchErrors = nullptr) const;
-    [[nodiscard]] std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path) const;
+    [[nodiscard]] // Reads and parses one fiber file, stamping StoredFiber::loadedWriteTime
+    // from before the read; branchErrors, when given, collects per-branch
+    // load problems the way loadFiberJson reports them.
+    std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path,
+                                             std::vector<std::string>* branchErrors = nullptr) const;
     [[nodiscard]] std::vector<BranchLinkValidationIssue> collectLoadedFiberBranchIssues(
         const std::vector<StoredFiber>& fibers) const;
     [[nodiscard]] bool repairLoadedFiberBranchLinks(
@@ -1348,6 +1416,9 @@ private:
         std::string fiberFileName;
         cv::Vec3d position{0.0, 0.0, 0.0};
         int storedControlPointIndexHint = -1;
+        // Designated as an ADJACENT link candidate: the link made from it
+        // ties adjacent windings (FiberBranchRef::adjacent).
+        bool adjacent = false;
     };
     std::optional<LinkCandidate> _linkCandidate;
     std::optional<LinkCandidate> _splitCandidate;

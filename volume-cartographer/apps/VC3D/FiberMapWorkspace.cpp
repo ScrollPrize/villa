@@ -564,14 +564,18 @@ public:
     // radius and maxRadius are scene units (voxels); minPixels and maxPixels
     // are on screen, and the level-of-detail factor converts between the two,
     // so this needs to know nothing about what a scene unit measures.
+    // triangle: an upright triangle of the same circumradius instead of a
+    // disc - the marker of an adjacent-winding link, as in the annotation
+    // views.
     ScaledDot(const QBrush& fill, const QPen& outline, qreal radius,
-              qreal minPixels, qreal maxPixels, qreal maxRadius)
+              qreal minPixels, qreal maxPixels, qreal maxRadius, bool triangle = false)
         : _fill(fill)
         , _outline(outline)
         , _radius(radius)
         , _minPixels(minPixels)
         , _maxPixels(maxPixels)
         , _maxRadius(maxRadius)
+        , _triangle(triangle)
     {
     }
 
@@ -603,7 +607,12 @@ public:
         painter->setRenderHint(QPainter::Antialiasing, true);
         painter->setPen(_outline);
         painter->setBrush(_fill);
-        painter->drawEllipse(QPointF(0.0, 0.0), radius, radius);
+        if (_triangle) {
+            painter->drawPath(
+                vc3d::line_annotation::generatedTriangleMarkerPath(QPointF(0.0, 0.0), radius));
+        } else {
+            painter->drawEllipse(QPointF(0.0, 0.0), radius, radius);
+        }
     }
 
 private:
@@ -613,6 +622,7 @@ private:
     qreal _minPixels = 0.0;
     qreal _maxPixels = 0.0;
     qreal _maxRadius = 0.0;
+    bool _triangle = false;
 };
 
 // Appends the package's umbilicus state to a pre-rebuild status line. Unrolling
@@ -1427,7 +1437,9 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
                     vc3d::fiber_map::InputLink{link.controlPointIndex,
                                                link.branchFiberId,
                                                link.branchControlPointIndex,
-                                               link.pending});
+                                               link.pending,
+                                               link.adjacent,
+                                               link.adjacentExplicit});
             }
             inputs.push_back(std::move(input));
         }
@@ -2228,7 +2240,8 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
                                               : cosmeticPen(palette.pen, 1.0),
                                           crossingDotRadius,
                                           kMinCrossingDotPx, kMaxCrossingDotPx,
-                                          crossingDotBounds);
+                                          crossingDotBounds,
+                                          /*triangle=*/link.adjacent);
                 _scene->addItem(dot);
                 dot->setPos(endpoint);
                 // A tagged endpoint sits above its untagged twin where the two
@@ -2253,7 +2266,10 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
             ring->setZValue(kSuspectRingZ);
         }
         auto* label = _scene->addSimpleText(
-            tr("+%1 turn").arg(link.turnErr, 0, 'f', 1), labelFont);
+            link.adjacentDisagrees ? tr("adjacent kind disagrees between the fibers")
+            : link.adjacentUnpaired ? tr("adjacent: not an H\u2013V pair")
+                                    : tr("+%1 turn").arg(link.turnErr, 0, 'f', 1),
+            labelFont);
         label->setBrush(kSuspect);
         pinText(label, middle, 0.0, -14.0, true);
         label->setZValue(5.0);
@@ -2459,8 +2475,13 @@ void FiberMapWorkspace::rebuildTree()
         // The rings sit on the two linked control points.
         const QPointF ringA(link.a.x(), -link.a.y());
         const QPointF ringB(link.b.x(), -link.b.y());
-        errors.push_back(ErrorEntry{QRectF(ringA, ringB).normalized(), link.fiberA, link.fiberB,
-                                    tr("link, +%1 turn").arg(link.turnErr, 0, 'f', 1)});
+        errors.push_back(ErrorEntry{
+            QRectF(ringA, ringB).normalized(), link.fiberA, link.fiberB,
+            link.adjacentDisagrees
+                ? tr("adjacent kind disagrees between the two fibers")
+                : link.adjacentUnpaired
+                    ? tr("adjacent link, fibers are not one H and one V")
+                    : tr("link, +%1 turn").arg(link.turnErr, 0, 'f', 1)});
     }
     std::sort(errors.begin(), errors.end(), [](const ErrorEntry& a, const ErrorEntry& b) {
         const QPointF ca = a.extent.center();

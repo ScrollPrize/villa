@@ -42,6 +42,17 @@ struct InputLink {
     // The annotation keeps this in sync on both reciprocal refs; the layout
     // ORs the two sides on dedup anyway.
     bool pending = false;
+    // The endpoints are one winding apart, the V fiber's inside the H
+    // fiber's (FiberBranchRef::adjacent). The solver gets the one-turn
+    // offset instead of an equality. A pair that is not one H and one V has
+    // no inside: such a link is an annotation error (PlacedLink::
+    // adjacentUnpaired), reported suspect and given no constraint. ORed on
+    // dedup like pending.
+    bool adjacent = false;
+    // The ref stated its kind explicitly (FiberBranchRef::adjacentKeyPresent).
+    // Two explicit refs of one pair disagreeing (true here, false there) is
+    // reported as PlacedLink::adjacentDisagrees.
+    bool adjacentExplicit = true;
 };
 
 struct InputFiber {
@@ -124,6 +135,17 @@ struct PlacedLink {
     bool suspect = false;
     // True when either input ref of the deduped pair still awaits review.
     bool pending = false;
+    // An adjacent-winding link (InputLink::adjacent): turnErr is measured
+    // against the one-turn offset, and the map draws the endpoints as
+    // triangles.
+    bool adjacent = false;
+    // An adjacent link between fibers that are not one H and one V: the
+    // error the map flags for it (always suspect; it constrained nothing).
+    bool adjacentUnpaired = false;
+    // The pair's two refs state different kinds (one adjacent, one explicitly
+    // ordinary): the annotation is inconsistent between the two files. Always
+    // suspect, constrains nothing; the sync merge arbitrates.
+    bool adjacentDisagrees = false;
 };
 
 struct WindingMark {
@@ -157,6 +179,12 @@ struct Result {
 // umbilicusCenters are dense volume-frame centers (x, y, z), one per z slice;
 // an empty list means the network cannot be unrolled and yields an empty
 // result.
+//
+// This per-network unroll has no winding dimension - x is angle at one
+// reference radius - so every link, adjacent or not, is an angular tie here
+// and InputLink::adjacent only rides through to PlacedLink (and marks an
+// unpaired one suspect). The winding semantics of adjacent links live in
+// buildGlobalLayout, which is what the Fiber Map draws.
 [[nodiscard]] Result buildLayout(const std::vector<InputFiber>& fibers,
                                  const std::vector<cv::Vec3f>& umbilicusCenters,
                                  const LayoutParams& params);
