@@ -1042,7 +1042,6 @@ def merge_fibers(base, local, remote):
         return result
     if local == remote or remote == base:
         merged = copy.deepcopy(local)
-        merged.setdefault('adjacent_branches', [])
         result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(local),
                       notes=(["remote side unchanged; kept local"]
@@ -1051,7 +1050,6 @@ def merge_fibers(base, local, remote):
         return result
     if local == base:
         merged = copy.deepcopy(remote)
-        merged.setdefault('adjacent_branches', [])
         result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(remote),
                       notes=["local side unchanged; took remote"])
@@ -1285,9 +1283,6 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
                 f"link {a_name} -> {b_name}: ordinary and adjacent kinds disagree"]
             return original
 
-    for label in ('a', 'b'):
-        if out[f'{label}_changed']:
-            out[f'{label}_doc'].setdefault('adjacent_branches', [])
     if out['b_changed']:
         out['b_doc']['generation'] = int(b_doc.get('generation', 1) or 1) + 1
     out['ok'] = True

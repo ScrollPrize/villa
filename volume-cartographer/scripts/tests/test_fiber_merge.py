@@ -812,6 +812,18 @@ def test_refresh_syncs_pending_on_existing_reciprocal():
     assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
 
 
+def test_refresh_ordinary_link_does_not_create_missing_adjacent_array():
+    a, b = make_pair('a.json', 'b.json', BASE_CPS,
+                     [cp(i, dz=50.0) for i in range(4)], 2, 1)
+    del b['adjacent_branches']
+    a['branches'][0].pop('pending', None)
+
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+
+    assert out['ok']
+    assert 'adjacent_branches' not in out['b_doc']
+
+
 def adjacent_pair():
     b_cps = [cp(i, dz=50.0) for i in range(4)]
     a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1)
@@ -958,7 +970,7 @@ def test_legacy_regression_requires_base_adjacent_entries(has_array):
     del legacy['adjacent_branches']
     assert fiber_merge.legacy_regression(legacy, base) is None
     result = merge_fibers(base, legacy, legacy)
-    assert result['ok'] and result['merged']['adjacent_branches'] == []
+    assert result['ok'] and 'adjacent_branches' not in result['merged']
 
 
 def test_merge_kind_mismatch_without_a_base_is_a_conflict():
