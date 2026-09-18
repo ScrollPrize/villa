@@ -331,6 +331,10 @@ def max_composite(tif_paths):
 @click.option('--remote-url', default='', help='Remote OME-Zarr URL for --volume, passed through to vc_render_tifxyz as --remote-url. Required when --volume is a not-yet-populated local cache dir for a scroll that only exists remotely; omit once the cache already records the URL (vc_render_tifxyz --help)')
 @click.option('--vc-render-bin', default='vc_render_tifxyz', show_default=True, help='Path to the vc_render_tifxyz binary')
 @click.option('--scale', type=float, default=0.25, show_default=True)
+@click.option('--scale-segmentation', type=float, default=1.0, show_default=True,
+              help='Multiply tifxyz coordinates before sampling the volume. '
+                   'Use only a mesh-to-volume frame scale established from metadata; '
+                   'this is independent of --scale, which controls output resolution.')
 @click.option('--group-idx', type=int, default=1, show_default=True)
 @click.option('--num-slices', type=int, default=5, show_default=True)
 @click.option('--num-processes', '-j', type=int, default=1, show_default=True, help='Number of meshes to render (and flatten) concurrently')
@@ -357,12 +361,18 @@ def max_composite(tif_paths):
 @click.option('--lasagna-config', default='', help='Base lasagna flatten config json. Default: <lasagna-dir>/configs/flatten_fast_nofilter.json')
 @click.option('--lasagna-fit-script', default='', help='Lasagna fit entrypoint run for the full-scroll flatten. Default: _run_flatten_threaded.py if present, else fit.py')
 @click.option('--lasagna-device', default='cuda', show_default=True, help='--device passed to the lasagna flattener for the full-scroll flatten')
-def main(meshes_dir, volume, remote_url, vc_render_bin, scale, group_idx, num_slices, num_processes,
+def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentation,
+         group_idx, num_slices, num_processes,
          flatten, flatboi_bin, tifxyz2obj_bin, obj2tifxyz_bin, uv_lift_bin, flatten_keep,
          flatten_iters, flatten_energy, flatten_tol, flatten_inpaint, pre_erode,
          keep_largest, flatboi_threads,
          openblas_coretype, strips, full_scroll, max_strip_width, full_scroll_trim,
          tifxyz_trim_bin, lasagna_dir, lasagna_config, lasagna_fit_script, lasagna_device):
+    if not np.isfinite(scale_segmentation) or scale_segmentation <= 0:
+        raise click.BadParameter(
+            'must be finite and greater than zero',
+            param_hint='--scale-segmentation',
+        )
     meshes = sorted(
         (winding_idx(name), name)
         for name in os.listdir(meshes_dir)
@@ -524,6 +534,7 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, group_idx, num_sl
             vc_render_bin,
             '--segmentation', concat_path,
             '--scale', str(scale),
+            '--scale-segmentation', str(scale_segmentation),
             '--group-idx', str(group_idx),
             '--volume', volume,
             '--tif-output', per_mesh_ink,
