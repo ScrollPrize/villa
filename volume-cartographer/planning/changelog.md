@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-18
+
+- Fixed double decompression and byte swapping when decoding Zarr inner chunks from cached shards.
+
 ## 2026-09-14
 
 - Fixed QuadSurface derived-cache eviction racing in-flight renders during surface and project switches.
