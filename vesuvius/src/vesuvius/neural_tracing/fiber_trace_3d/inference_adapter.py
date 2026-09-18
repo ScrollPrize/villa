@@ -184,6 +184,7 @@ class FiberTrace3DPredictAdapter:
         zarr_path_prefix: str | Path | None = None,
         recurrent_steps: int | None = None,
         emit_embeddings: bool = False,
+        embedding_bank: str | None = None,
     ) -> None:
         self.checkpoint = None if checkpoint is None else Path(checkpoint)
         self.config = _config_from_checkpoint(config, self.checkpoint)
@@ -218,7 +219,18 @@ class FiberTrace3DPredictAdapter:
         )
         from .embedding import EmbeddingConfig
         embedding = EmbeddingConfig.from_mapping(self.config)
-        self.embedding_channels = embedding.channels if emit_embeddings and embedding.enabled else 0
+        self.embedding_slice = slice(0, embedding.channels)
+        if emit_embeddings and embedding.short_range_channels:
+            if embedding_bank == "short":
+                self.embedding_slice = slice(0, embedding.short_range_channels)
+            elif embedding_bank == "long":
+                self.embedding_slice = slice(embedding.short_range_channels, embedding.channels)
+            else:
+                raise ValueError("split-range embedding checkpoint requires embedding_bank='short' or 'long'")
+        elif embedding_bank is not None:
+            raise ValueError("embedding_bank is only valid for split-range embedding checkpoints")
+        self.embedding_channels = ((self.embedding_slice.stop - self.embedding_slice.start)
+                                   if emit_embeddings and embedding.enabled else 0)
         if emit_embeddings and not self.embedding_channels:
             raise ValueError("embedding tracing requires an embedding-enabled checkpoint")
         if self.embedding_channels:
@@ -371,7 +383,7 @@ class FiberTrace3DPredictAdapter:
                 if self.embedding_channels:
                     result = model(tile_device, return_embeddings=True)
                     return torch.cat((result["prediction"].float().clamp(0, 1),
-                                      result["embeddings"].float()), dim=1)
+                                      result["embeddings"][:, self.embedding_slice].float()), dim=1)
                 output = model(tile_device)
         return output.to(dtype=torch.float32).clamp(0.0, 1.0)
 

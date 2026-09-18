@@ -12,6 +12,7 @@ import statistics
 import glob
 import hashlib
 import pickle
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +33,37 @@ def input_manifest(raw):
                              'sha256':hashlib.sha256(path.read_bytes()).hexdigest()})
         result[key] = rows
     return result
+
+
+def remote_auth_probe():
+    """Verify a public remote volume opens without invoking an AWS helper."""
+    settings = json.loads(CONTROL.read_text())['remote_auth_probe']
+    with tempfile.TemporaryDirectory(prefix='vc-public-auth-probe-') as temporary:
+        root = Path(temporary)
+        fake_bin = root / 'bin'
+        fake_bin.mkdir()
+        marker = root / 'aws-called'
+        helper = fake_bin / 'aws'
+        helper.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 97\n')
+        helper.chmod(0o755)
+        code = (
+            'from vc.volume import Volume\n'
+            'import sys\n'
+            'volume = Volume.open_url(sys.argv[1], sys.argv[2])\n'
+            'print({"shape": volume.shape, "levels": volume.present_scale_levels()})\n'
+        )
+        env = dict(os.environ)
+        env['PATH'] = str(fake_bin) + os.pathsep + env.get('PATH', '')
+        subprocess.run(
+            [sys.executable, '-c', code, settings['url'], str(root / 'cache')],
+            cwd=ROOT,
+            env=env,
+            check=True,
+            timeout=float(settings.get('timeout_seconds', 60)),
+        )
+        if marker.exists():
+            raise RuntimeError('public remote open invoked the AWS credential helper')
+        print('public remote open completed without AWS credential discovery', flush=True)
 
 
 def trace_evaluate(settings=None):
@@ -754,7 +786,7 @@ def main():
         return subprocess.call([sys.executable, '-m',
             'vesuvius.neural_tracing.fiber_trace_3d.embedding_consistency', str(CONTROL)])
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs', 'evaluate', 'audit-latest', 'production-start', 'production-status', 'production-stop', 'production-watch', 'trace-evaluate', 'comparison', 'comparison-followup', 'trace-series-prepare', 'trace-series-next', 'trace-series-retry'])
+    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs', 'evaluate', 'audit-latest', 'production-start', 'production-status', 'production-stop', 'production-watch', 'trace-evaluate', 'comparison', 'comparison-followup', 'trace-series-prepare', 'trace-series-next', 'trace-series-retry', 'remote-auth-probe'])
     args = parser.parse_args()
     if args.command == 'inspect':
         inspect()
@@ -778,6 +810,8 @@ def main():
         production_status()
     elif args.command == 'production-stop':
         production_status(stop=True)
+    elif args.command == 'remote-auth-probe':
+        remote_auth_probe()
     elif args.command == 'audit-latest':
         audit_latest()
     elif args.command == 'start':

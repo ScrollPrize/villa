@@ -1,4 +1,8 @@
 {
+  "remote_auth_probe": {
+    "url": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+    "timeout_seconds": 60
+  },
   "embedding_milestone": {
     "step": 5400,
     "checkpoint": "/ephemeral/hendrik/fiber3d_train2/runs/combined_5scroll_s1a_paired_contrastive_128_sd1_16x8_ema_20260913_174112/snapshots/current.pt",
@@ -298,7 +302,7 @@
     "continuation_config": "/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/continuation_config.json"
   },
   "production": {
-    "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_5scroll_json_eligible_refinement_ema_16x8.json"
+    "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_5scroll_json_eligible_fullres_frozen_refined_split_embedding_ema_16x8.json"
   },
   "trace_series": {
     "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/finetune_5scroll_s1a_128_sd1_16x8_ema_lr0001-20260912_223739",

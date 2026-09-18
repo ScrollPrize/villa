@@ -35,6 +35,7 @@ class FiberTrace3DModelConfig:
     output_stride: int = 1
     embedding_channels: int = 0
     embedding_objective: str = "pairwise"
+    embedding_short_range_channels: int = 0
 
 
 class FiberTrace3DNet(nn.Module):
@@ -50,8 +51,11 @@ class FiberTrace3DNet(nn.Module):
         self.conditioned_decoder_enabled = bool(cfg.conditioned_decoder_enabled)
         self.embedding_channels = int(cfg.embedding_channels)
         self.embedding_objective = cfg.embedding_objective
+        self.embedding_short_range_channels = int(cfg.embedding_short_range_channels)
         if self.embedding_channels < 0 or (self.embedding_channels and self.conditioned_decoder_enabled):
             raise ValueError("embedding channels require an unconditioned U-Net")
+        if not 0 <= self.embedding_short_range_channels < max(1, self.embedding_channels):
+            raise ValueError("invalid embedding short-range channel split")
         if self.conditioned_decoder_enabled:
             if int(cfg.output_channels) != 7:
                 raise ValueError(
@@ -407,5 +411,6 @@ def build_fiber_trace_3d_model(config: dict[str, Any]) -> FiberTrace3DNet:
             output_stride=int(model_cfg.get("output_stride", 1)),
             embedding_channels=embedding.channels if embedding.enabled else 0,
             embedding_objective=embedding.objective,
+            embedding_short_range_channels=embedding.short_range_channels,
         )
     )

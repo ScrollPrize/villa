@@ -36,6 +36,18 @@ CPU_TESTS = [
     "tests/neural_tracing/test_cooperative_reference.py",
 ]
 SUITES = {
+    "split-embedding-cpu": [
+        "tests/neural_tracing/test_paired_embeddings.py",
+        "tests/neural_tracing/test_refinement.py::test_config_rejects_invalid",
+        "tests/neural_tracing/test_refinement.py::test_frozen_geometry_store_is_read_only",
+        "tests/neural_tracing/test_refinement.py::test_frozen_session_uses_explicit_geometry_checkpoint_without_model_resume",
+        "tests/neural_tracing/test_training_spans.py::test_frozen_refined_split_embedding_config_starts_model_from_scratch",
+        "tests/neural_tracing/test_embedding_tracer.py::test_split_embedding_inference_requires_explicit_bank",
+    ],
+    "split-embedding-data": [
+        "tests/neural_tracing/test_paired_embeddings.py::test_frozen_split_real_data_preflight",
+        "-s",
+    ],
     "refinement": ["tests/neural_tracing/test_refinement.py", "tests/neural_tracing/test_fiber_trace.py::test_parse_vc3d_fiber_v3_segment_metadata", "-s"],
     "cuda-refinement": ["tests/neural_tracing/test_refinement.py", "-k", "cuda", "-s"],
     "demand-gpu-cpu": ["tests/neural_tracing/test_demand_gpu.py", "../lasagna/tests/test_demand_predict3d.py", "../gpu_manager/tests/test_supervisor.py"],
@@ -122,7 +134,7 @@ def main():
             # exclusive reservation which would prevent reacquisition.
             env.pop("CUDA_VISIBLE_DEVICES", None)
             env["FIBER_DEMAND_GPU_SMOKE"] = "1"
-        if suite in ("embedding-data", "paired-data"):
+        if suite in ("embedding-data", "paired-data", "split-embedding-data"):
             env["FIBER_EMBEDDING_DATA_TEST"] = "1"
         if control.get("native_build", False):
             env["FIBER_COOPERATIVE_NATIVE_BUILD"] = str(ROOT / 'volume-cartographer/build/dev-quickbuild-gcc/python')

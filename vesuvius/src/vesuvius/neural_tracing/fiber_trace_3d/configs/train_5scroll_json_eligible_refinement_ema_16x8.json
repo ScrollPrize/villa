@@ -224,6 +224,9 @@
   },
   "_config_dir": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs",
   "refinement": {
-    "enabled": true
+    "enabled": true,
+    "shape_normal_weight": 0.1,
+    "shape_tangent_weight": 10.0,
+    "direction_weight": 0.1
   }
 }

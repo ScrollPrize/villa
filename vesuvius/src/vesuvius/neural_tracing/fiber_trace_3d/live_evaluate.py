@@ -295,10 +295,14 @@ class NativeTileReader:
 def create_demand_store(cache, source_identity, model_identity, geometry, effective, snapshot, level, settings):
     """Shared numerical/output setup for live tracing and isolated profiling."""
     power = int(math.log2(geometry.scale))
+    adapter_options = {}
+    if settings.get("embedding_bank") is not None:
+        adapter_options["embedding_bank"] = settings["embedding_bank"]
     adapter = inference_adapter.FiberTrace3DPredictAdapter(effective, checkpoint=snapshot,
         level=level + power, scaledown=(1 << level) * geometry.scale, inference_scaledown=geometry.scale,
         chunk_size=geometry.chunk, product_prefix="fiber", zarr_path_prefix=cache / "fiber",
-        emit_embeddings=bool(settings.get("emit_embeddings", False)))
+        emit_embeddings=bool(settings.get("emit_embeddings", False)),
+        **adapter_options)
     # Construction restores checkpoint config; reapply the resolved precision.
     adapter.config["training"] = {**adapter.config.get("training", {}),
         "mixed_precision": effective["training"]["mixed_precision"]}

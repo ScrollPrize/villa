@@ -17,10 +17,19 @@ import numpy as np
 
 from vesuvius.neural_tracing.fiber_trace_3d.training_state import checkpoint_sources
 
+REFINEMENT_LOSS_NAMES = ("presence", "smoothing_normal", "smoothing_tangent", "localization", "direction")
+
+
+def empty_refinement_statistics():
+    return [0.] * (1+len(REFINEMENT_LOSS_NAMES))
+
 
 @dataclass(frozen=True)
 class RefinementConfig:
     enabled: bool = False
+    update_enabled: bool = True
+    state_checkpoint: str | None = None
+    state_sha256: str | None = None
     iterations: int = 4
     spacing_base: float = 8.0
     samples_per_segment: int = 4
@@ -28,6 +37,9 @@ class RefinementConfig:
     tangent_radius_base: float = 80.0
     gt_weight: float = 1.0
     shape_weight: float = 0.01
+    shape_normal_weight: float | None = None
+    shape_tangent_weight: float | None = None
+    direction_weight: float = 0.0
     learning_rate: float = 0.01
     max_step_fraction: float = 0.125
     border_fraction: float = 0.125
@@ -41,8 +53,17 @@ class RefinementConfig:
         if unknown:
             raise ValueError(f"unknown refinement settings: {sorted(unknown)}")
         result = cls(**values)
-        if type(result.enabled) is not bool:
-            raise ValueError("refinement.enabled must be boolean")
+        if type(result.enabled) is not bool or type(result.update_enabled) is not bool:
+            raise ValueError("refinement enabled/update_enabled must be boolean")
+        if result.state_checkpoint is not None and (not isinstance(result.state_checkpoint, str) or not result.state_checkpoint):
+            raise ValueError("refinement.state_checkpoint must be a nonempty path string")
+        if result.state_sha256 is not None and (not isinstance(result.state_sha256, str) or len(result.state_sha256) != 64 or
+                any(c not in "0123456789abcdef" for c in result.state_sha256)):
+            raise ValueError("refinement.state_sha256 must be a lowercase SHA256")
+        if not result.update_enabled and (not result.enabled or not result.state_checkpoint or not result.state_sha256):
+            raise ValueError("frozen refinement requires enabled=true plus state_checkpoint/state_sha256")
+        if (result.state_checkpoint is None) != (result.state_sha256 is None):
+            raise ValueError("refinement state_checkpoint and state_sha256 must be specified together")
         for name in ("iterations", "samples_per_segment"):
             if type(getattr(result, name)) is not int or not 1 <= getattr(result, name) <= 64:
                 raise ValueError(f"refinement.{name} must be an integer in [1,64]")
@@ -51,8 +72,10 @@ class RefinementConfig:
             value = getattr(result, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value <= 0:
                 raise ValueError(f"refinement.{name} must be positive finite")
-        for name in ("gt_weight", "shape_weight"):
+        for name in ("gt_weight", "shape_weight", "direction_weight", "shape_normal_weight", "shape_tangent_weight"):
             value = getattr(result, name)
+            if value is None and name.startswith("shape_") and name != "shape_weight":
+                continue
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
                 raise ValueError(f"refinement.{name} must be nonnegative finite")
         if result.border_fraction > 0.5 or result.max_step_fraction > 1:
@@ -115,37 +138,106 @@ def step_limits(points_patch, shape, cfg, independent, endpoints):
     return limits
 
 
-def semi_implicit_step(points, baseline, metric, force, cfg, links=None, spacing=None):
-    """Cartesian 3x3 block-tridiagonal solve followed by plane projection.
+def bending_terms(points, links=None, metric=None):
+    """Lumped arc mass and B=D2.T W D2 for integral |d²x/ds²|² ds.
 
-    I + dt*(2*gt_weight*Q + 2*shape_weight*L/h^2). SciPy executes
-    the narrow-band solve in native code, with no Python node iteration.
+    Current arc lengths are frozen within each solve. Interior three-point
+    stencils only: free ends, no virtual fixed neighbours or cross-piece links.
+    Return diagonal/upper bands and B*x, using differences for translation stability.
+    """
+    lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    connected = np.ones(len(lengths), dtype=bool) if links is None else np.asarray(links, dtype=bool)
+    h = np.maximum(lengths, 1e-6)
+    edge_mass = np.where(connected, h, 0.) / 2
+    mass = np.maximum(np.r_[edge_mass, 0.] + np.r_[0., edge_mass], 1e-6)
+    left, right = h[:-1], h[1:]
+    weights = .5 * (left + right) * (connected[:-1] & connected[1:])
+    a = 2 / (left * (left + right))
+    c = 2 / (right * (left + right))
+    b = -a-c
+    if metric is not None:
+        # Frozen symmetric 3x3 metric per interior curvature stencil.
+        weighted = weights[:,None,None]*metric[1:-1]
+        diagonal = np.zeros((len(points),3,3))
+        diagonal[:-2] += weighted*a[:,None,None]**2
+        diagonal[1:-1] += weighted*b[:,None,None]**2
+        diagonal[2:] += weighted*c[:,None,None]**2
+        upper = np.zeros((len(points)-1,3,3))
+        upper[:-1] += weighted*(a*b)[:,None,None]
+        upper[1:] += weighted*(b*c)[:,None,None]
+        upper2 = weighted*(a*c)[:,None,None]
+        curvature = a[:,None]*(points[:-2]-points[1:-1]) + c[:,None]*(points[2:]-points[1:-1])
+        response = np.einsum("nij,nj->ni",weighted,curvature)
+        gradient = np.zeros_like(points)
+        for view, coefficient in ((gradient[:-2],a),(gradient[1:-1],b),(gradient[2:],c)):
+            view += coefficient[:,None]*response
+        return mass,diagonal,upper,upper2,gradient,float(np.sum(curvature*response))
+    diagonal = np.zeros(len(points))
+    diagonal[:-2] += weights*a*a
+    diagonal[1:-1] += weights*b*b
+    diagonal[2:] += weights*c*c
+    upper = np.zeros(len(points)-1)
+    upper[:-1] += weights*a*b
+    upper[1:] += weights*b*c
+    upper2 = weights*a*c
+    curvature = a[:,None]*(points[:-2]-points[1:-1]) + c[:,None]*(points[2:]-points[1:-1])
+    gradient = np.zeros_like(points)
+    for view, coefficient in ((gradient[:-2], a), (gradient[1:-1], b), (gradient[2:], c)):
+        view += (weights*coefficient)[:,None]*curvature
+    return mass, diagonal, upper, upper2, gradient, float(np.sum(weights[:,None]*curvature**2))
+
+
+def shape_metric(normal_projectors, cfg):
+    normal = cfg.shape_weight if cfg.shape_normal_weight is None else cfg.shape_normal_weight
+    tangent = cfg.shape_weight if cfg.shape_tangent_weight is None else cfg.shape_tangent_weight
+    return normal*normal_projectors + tangent*(np.eye(3)-normal_projectors)
+
+
+def normal_projectors(normals):
+    n = np.asarray(normals,dtype=np.float64)
+    n = n/np.maximum(np.linalg.norm(n,axis=-1,keepdims=True),1e-12)
+    return n[:,:,None]*n[:,None,:]
+
+
+def semi_implicit_step(points, baseline, metric, force, cfg, links=None, material_lengths=None, normal_metric=None):
+    """Native block-pentadiagonal bending/tether solve, then caller projects.
+
+    With B including the anisotropic shape weights:
+    [M + 2dt*gt*M*Q + 2dt*B] delta =
+       dt*M*(force - 2gt*Q*(x-x_GT)) - 2dt*B*x.
+    This smooths the resulting line, not displacement from the baseline.
     """
     from scipy.linalg import solve_banded
     n = len(points)
     dt = cfg.learning_rate * cfg.normal_radius_base**2
-    h = max(arclength(baseline)[-1] / max(1, n - 1), 1e-6) if spacing is None else spacing
-    k = np.broadcast_to(dt * 2 * cfg.shape_weight / np.asarray(h)**2, (n,))
-    edge_k = .5 * (k[:-1] + k[1:])
-    if links is not None:
-        edge_k = edge_k * links
+    if normal_metric is None:
+        if cfg.shape_normal_weight is not None or cfg.shape_tangent_weight is not None:
+            raise ValueError("anisotropic refinement requires normal projectors")
+        bending_metric = np.broadcast_to(np.eye(3)*cfg.shape_weight,(n,3,3))
+    else:
+        bending_metric = shape_metric(normal_metric,cfg)
+    mass, diagonal, upper, upper2, gradient, _ = bending_terms(points, links, bending_metric)
+    if material_lengths is not None:
+        edges = np.asarray(material_lengths) / 2
+        if links is not None:
+            edges = np.where(links, edges, 0.)
+        mass = np.maximum(np.r_[edges, 0.] + np.r_[0., edges], 1e-12)
+    k = dt * 2
     displacement = points - baseline
-    lap = np.zeros_like(displacement)
-    edge = (displacement[1:] - displacement[:-1]) * edge_k[:, None]
-    lap[:-1] -= edge
-    lap[1:] += edge
-    rhs = dt * force - dt * 2 * cfg.gt_weight * np.einsum("nij,nj->ni", metric, displacement) - lap
-    blocks = dt * 2 * cfg.gt_weight * metric
-    degree = np.r_[edge_k, 0.] + np.r_[0., edge_k]
-    blocks = blocks + np.eye(3)[None] * (1 + degree)[:, None, None]
-    band = np.zeros((7, n * 3), dtype=np.float64)
+    rhs = dt * mass[:,None] * (force - 2 * cfg.gt_weight * np.einsum("nij,nj->ni", metric, displacement)) - k*gradient
+    blocks = mass[:,None,None] * (np.eye(3)[None] + dt * 2 * cfg.gt_weight * metric)
+    blocks = blocks + k*diagonal
+    band = np.zeros((17, n * 3), dtype=np.float64)
     for i in range(3):
         for j in range(3):
             columns = np.arange(n) * 3 + j
-            band[3 + i - j, columns] = blocks[:, i, j]
-    band[0, 3:] = np.repeat(-edge_k, 3)
-    band[6, :-3] = np.repeat(-edge_k, 3)
-    return solve_banded((3, 3), band, rhs.reshape(-1), check_finite=False).reshape(n, 3)
+            band[8 + i - j, columns] = blocks[:, i, j]
+            for offset,values in ((1,upper),(2,upper2)):
+                columns = np.arange(offset,n)*3+j
+                band[8-3*offset+i-j,columns] = k*values[:,i,j]
+                columns = np.arange(n-offset)*3+j
+                band[8+3*offset+i-j,columns] = k*values[:,j,i]
+    return solve_banded((8, 8), band, rhs.reshape(-1), check_finite=False).reshape(n, 3)
 
 
 def presence_force(points, to_patch, presence, patch_shape, cfg, output_stride=1, segment_weights=None, independent_piece=False):
@@ -180,18 +272,25 @@ def presence_force(points, to_patch, presence, patch_shape, cfg, output_stride=1
     return force / np.maximum(mass[:, None], 1e-12)
 
 
-def refine_curve(current, baseline_points, baseline_arc, normals, presence, to_patch, patch_shape, cfg, output_stride=1, *, independent_piece=False):
+def refine_curve(current, baseline_points, baseline_arc, normals, presence, to_patch, patch_shape, cfg, output_stride=1, *, independent_piece=False, directions=None):
     curve = np.asarray(current, dtype=np.float64).copy()
     normal_arc = curve[:, 3].copy()
     # Sheet axes are unoriented: interpolate nn^T metrics, never signed normals.
     metrics = ellipse_metric(normals, cfg).reshape(-1, 9)
+    projectors = normal_projectors(normals).reshape(-1,9)
     for _ in range(cfg.iterations):
         points = curve[:, :3]
         baseline = interpolate(baseline_points, baseline_arc, curve[:, 3])
         metric = interpolate(metrics, normal_arc, curve[:, 3]).reshape(-1, 3, 3)
         force = presence_force(points, to_patch, presence, patch_shape, cfg, output_stride,
                                segment_weights=np.diff(curve[:, 3]), independent_piece=independent_piece)
-        update = semi_implicit_step(points, baseline, metric, force, cfg)
+        if cfg.direction_weight:
+            extra, _ = direction_feedback(points,np.arange(len(points)-1),np.diff(curve[:,3]),
+                lambda p,ids: to_patch(p),np.zeros(len(points),dtype=int),
+                None if directions is None else np.asarray(directions)[None],output_stride,cfg)
+            force += extra
+        normal_metric = interpolate(projectors,normal_arc,curve[:,3]).reshape(-1,3,3)
+        update = semi_implicit_step(points, baseline, metric, force, cfg, material_lengths=np.diff(curve[:,3]),normal_metric=normal_metric)
         limits = step_limits(to_patch(points), patch_shape, cfg, independent_piece, np.array([0, len(points)-1]))
         update = clamp_update(update, points, metric, limits)
         curve = resample(points + update, curve[:, 3])
@@ -199,6 +298,7 @@ def refine_curve(current, baseline_points, baseline_arc, normals, presence, to_p
 
 
 _ENV = "VILLA_FIBER_REFINEMENT_STATE"
+_FROZEN_ENV = "VILLA_FIBER_REFINEMENT_FROZEN"
 
 
 @contextmanager
@@ -211,9 +311,10 @@ def file_lock(path, shared=False):
 
 
 class GeometryStore:
-    def __init__(self, root):
+    def __init__(self, root, *, read_only=False):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self.read_only = bool(read_only)
 
     def register(self, key, points, metadata, cfg):
         path = self.root / key
@@ -222,6 +323,8 @@ class GeometryStore:
                 if json.loads((path / "metadata.json").read_text()) != json.loads(json.dumps(metadata)):
                     raise ValueError("refinement geometry metadata changed for an existing source")
                 return
+            if self.read_only:
+                raise ValueError("frozen refinement archive is missing a configured training fiber")
             if (self.root / "restored.json").exists():
                 raise ValueError("refinement resume sources differ from the saved geometry; refusing to reset GT")
             arc = arclength(points)
@@ -244,6 +347,8 @@ class GeometryStore:
         New deterministic crops may be first encountered after a checkpoint.
         They always start from immutable GT, including after legacy resumes.
         """
+        if self.read_only:
+            raise RuntimeError("frozen refinement cannot create test-patch state")
         from dataclasses import asdict
         identity = dict(protocol="fixed-test-crop-v1", parent=parent,
                         sample_index=int(sample_index), params=asdict(params),
@@ -272,6 +377,8 @@ class GeometryStore:
         return np.load(self.root / key / "baseline.npy", mmap_mode="r")
 
     def commit(self, key, start, before, after):
+        if self.read_only:
+            raise RuntimeError("frozen refinement geometry is read-only")
         path = self.root / key
         with file_lock(path / "lock"):
             target = np.load(path / "current.npy", mmap_mode="r+")
@@ -285,6 +392,8 @@ class GeometryStore:
 
     def save(self, target):
         """One portable archive shared by raw/EMA snapshots at this step."""
+        if self.read_only:
+            raise RuntimeError("frozen refinement reuses its immutable source archive")
         import zipfile
         target = Path(target)
         temporary = target.with_suffix(".tmp")
@@ -350,21 +459,36 @@ def refinement_session(function):
         if int(os.environ.get("WORLD_SIZE", "1")) > 1:
             raise ValueError("refinement multi-GPU launch must use the cooperative manager, not torchrun")
         resume, initialize_from = checkpoint_sources(raw, kwargs.get("resume_checkpoint"))
-        state_checkpoint = resume or initialize_from
+        state_source = None
+        if cfg.state_checkpoint:
+            state_source = Path(cfg.state_checkpoint).expanduser()
+            if not state_source.is_absolute():
+                state_source = Path(config_path).resolve().parent / state_source
+        elif resume or initialize_from:
+            state_source = Path(resume or initialize_from)
         with tempfile.TemporaryDirectory(prefix="fiber-refinement-") as root:
-            if state_checkpoint:
+            if state_source:
                 import torch
-                state = torch.load(state_checkpoint, map_location="cpu", weights_only=False)
+                state = torch.load(state_source, map_location="cpu", weights_only=False)
                 saved = state.get("refinement_state")
                 if saved:
-                    GeometryStore(root).restore(
-                        Path(state_checkpoint).parent / saved["file"], saved["sha256"])
+                    if cfg.state_sha256 and saved["sha256"] != cfg.state_sha256:
+                        raise ValueError("configured frozen refinement SHA does not match source checkpoint")
+                    GeometryStore(root).restore(state_source.parent / saved["file"], saved["sha256"])
+                    if not cfg.update_enabled:
+                        print(f"fiber refinement: frozen geometry restored source={state_source} "
+                              f"archive={saved['file']} sha256={saved['sha256']}", flush=True)
                 elif state.get("config", {}).get("refinement", {}).get("enabled"):
                     raise ValueError("refinement checkpoint is missing its fiber state")
+                elif cfg.state_checkpoint:
+                    raise ValueError("configured refinement state checkpoint has no fiber state")
             os.environ[_ENV] = root
+            if not cfg.update_enabled:
+                os.environ[_FROZEN_ENV] = "1"
             try:
                 return function(config_path, **kwargs)
             finally:
+                os.environ.pop(_FROZEN_ENV, None)
                 os.environ.pop(_ENV, None)
     return wrapped
 
@@ -372,7 +496,7 @@ def refinement_session(function):
 def active_store():
     if _ENV not in os.environ:
         raise RuntimeError("enabled refinement requires the training launcher (missing shared state)")
-    return GeometryStore(os.environ[_ENV])
+    return GeometryStore(os.environ[_ENV], read_only=os.environ.get(_FROZEN_ENV) == "1")
 
 
 def export_metadata(fiber):
@@ -437,7 +561,57 @@ class BatchedPatchTransform:
         return self.local[ids] + np.einsum("ni,nji->nj", relative, self.matrices[ids])
 
 
-def refine_observations(observations, maps):
+def direction_feedback(points, edges, material_lengths, transform, ids, maps, stride, cfg):
+    """Frozen predicted base-space axes; exact endpoint derivative for that field.
+
+    Decode sparse interpolated six-channel predictions, not interpolated signed axes.
+    Full finite-difference warp Jacobian pulls tangent vectors back to base ZYX.
+    Field/Jacobian are refreshed next iteration, not differentiated spatially.
+    """
+    from scipy.ndimage import map_coordinates
+    from .direction import decode_lasagna_direction_3x2_analytic
+    if maps is None:
+        raise ValueError("direction refinement requires predicted direction channels")
+    maps = np.asarray(maps)
+    t = (np.arange(cfg.samples_per_segment)+.5)/cfg.samples_per_segment
+    q = (points[edges,None]*(1-t)[None,:,None]+points[edges+1,None]*t[None,:,None]).reshape(-1,3)
+    qids = np.repeat(ids[edges],len(t))
+    mapped = transform(q,qids)
+    coordinates = np.r_[qids[None],(mapped/stride).T]
+    encoded = np.stack([map_coordinates(maps[:,c],coordinates,order=1,mode="nearest",prefilter=False)
+                        for c in range(6)],axis=-1)
+    axes = decode_lasagna_direction_3x2_analytic(encoded)[:,::-1].astype(np.float64)
+    offsets = np.concatenate((np.eye(3),-np.eye(3)))*.5
+    perturbed = transform((q[None]+offsets[:,None]).reshape(-1,3),np.tile(qids,6)).reshape(6,-1,3)
+    jacobian = (perturbed[:3]-perturbed[3:]).transpose(1,2,0)
+    if not np.isfinite(jacobian).all() or np.any(np.linalg.cond(jacobian)>1e8):
+        raise ValueError("direction refinement encountered a singular/nonfinite patch Jacobian")
+    axes = np.linalg.solve(jacobian,axes[...,None])[...,0]
+    norms = np.linalg.norm(axes,axis=-1)
+    valid = np.all((mapped/stride >= 0)&(mapped/stride <= np.array(maps.shape[2:])-1),axis=1)
+    valid &= np.isfinite(axes).all(axis=1)&(norms>1e-10)
+    axes = np.divide(axes,norms[:,None],out=np.zeros_like(axes),where=norms[:,None]>1e-10)
+    axes = axes.reshape(len(edges),len(t),3)
+    valid = valid.reshape(len(edges),len(t))
+    displacement = points[edges+1]-points[edges]
+    lengths = np.maximum(np.linalg.norm(displacement,axis=1),1e-12)
+    tangent = displacement/lengths[:,None]
+    cosine = np.sum(tangent[:,None]*axes,axis=-1)
+    # Negative gradient with respect to the right endpoint; left is opposite.
+    right_force = (2*cfg.direction_weight*material_lengths/lengths)[:,None]*np.mean(
+        valid[:,:,None]*cosine[:,:,None]*(axes-cosine[:,:,None]*tangent[:,None]),axis=1)
+    force = np.zeros_like(points)
+    np.add.at(force,edges,-right_force)
+    np.add.at(force,edges+1,right_force)
+    mass = np.zeros(len(points))
+    np.add.at(mass,edges,material_lengths/2)
+    np.add.at(mass,edges+1,material_lengths/2)
+    force /= np.maximum(mass[:,None],1e-12)
+    losses = cfg.direction_weight*np.mean(valid*np.maximum(0.,1-cosine**2),axis=1)
+    return force,losses
+
+
+def refine_observations(observations, maps, directions=None):
     """Solve independent ragged curves as one narrow-band system.
 
     Zero off-diagonal links separate patches. Grouping changes dispatch only;
@@ -461,6 +635,7 @@ def refine_observations(observations, maps):
     following[offsets[1:]-1] = offsets[1:]-1
     curves = [o.current.copy() for o in observations]
     metrics = [ellipse_metric(o.normals, cfg).reshape(-1, 9) for o in observations]
+    projectors = [normal_projectors(o.normals).reshape(-1,9) for o in observations]
     maps = np.stack(maps)
     t = (np.arange(cfg.samples_per_segment) + .5) / cfg.samples_per_segment
     qids = np.repeat(ids[edges], len(t))
@@ -492,14 +667,78 @@ def refine_observations(observations, maps):
         mass[edges] += weights/2
         mass[edges+1] += weights/2
         force /= np.maximum(mass[:,None], 1e-12)
-        spacing = np.concatenate([np.full(len(b), max(arclength(b)[-1]/(len(b)-1),1e-6)) for b in baseline_parts])
-        delta = semi_implicit_step(points, baseline, metric, force, cfg, links=links, spacing=spacing)
+        if cfg.direction_weight:
+            extra, _ = direction_feedback(points,edges,weights,transform,ids,directions,observations[0].output_stride,cfg)
+            force += extra
+        normal_metric = np.concatenate([interpolate(p,o.current[:,3],c[:,3]).reshape(-1,3,3)
+                                        for p,o,c in zip(projectors,observations,curves)])
+        delta = semi_implicit_step(points, baseline, metric, force, cfg, links=links,
+                                   material_lengths=np.diff(curve[:,3]),normal_metric=normal_metric)
         independent = np.array([o.independent_piece for o in observations], dtype=bool)[ids]
         limits = step_limits(transform(points, ids), observations[0].shape, cfg, independent, endpoint)
         delta = clamp_update(delta, points, metric, limits, tangent=points[following]-points[previous])
         updated = points+delta
         curves = [resample(updated[a:b], curve[a:b,3]) for a,b in zip(offsets[:-1], offsets[1:])]
     return curves
+
+
+def refinement_losses(observations, curves, maps, directions=None):
+    """Post-solve weighted losses per patch, each normalized by material length.
+
+    Presence is 1-mean(probability), normal/tangent bending are weighted curvature
+    energies, localization is the weighted ellipse displacement, direction is
+    weighted sign-invariant tangent disagreement. All use material normalization.
+    """
+    from scipy.ndimage import map_coordinates
+    if not observations:
+        return []
+    transform = BatchedPatchTransform(observations)
+    queries, query_ids = [], []
+    for i,(o,c) in enumerate(zip(observations,curves)):
+        t = (np.arange(o.config.samples_per_segment)+.5)/o.config.samples_per_segment
+        queries.append((c[:-1,None,:3]*(1-t)[None,:,None] + c[1:,None,:3]*t[None,:,None]).reshape(-1,3))
+        query_ids.append(np.full(len(queries[-1]),i))
+    ids = np.concatenate(query_ids)
+    mapped = transform(np.concatenate(queries), ids) / observations[0].output_stride
+    stack = np.stack(maps)
+    values = map_coordinates(stack,np.concatenate((ids[None],mapped.T)),order=1,mode="nearest",prefilter=False)
+    independent = np.array([o.independent_piece for o in observations])[ids]
+    supported = np.all((mapped >= 0) & (mapped <= np.array(stack.shape[1:])-1),axis=1)
+    values[independent & ~supported] = 0.
+    losses, offset = [], 0
+    for o,c,q in zip(observations,curves,queries):
+        lengths = np.diff(c[:,3])
+        length = float(lengths.sum())
+        mass = (np.r_[lengths,0.] + np.r_[0.,lengths])/2
+        presence = 1-float(np.sum(values[offset:offset+len(q)].reshape(len(lengths),-1).mean(axis=1)*lengths)/length)
+        offset += len(q)
+        baseline = interpolate(o.baseline[:,:3],o.baseline[:,3],c[:,3])
+        metric = interpolate(ellipse_metric(o.normals,o.config).reshape(-1,9),o.current[:,3],c[:,3]).reshape(-1,3,3)
+        delta = c[:,:3]-baseline
+        localization = o.config.gt_weight*float(np.sum(mass*np.einsum("ni,nij,nj->n",delta,metric,delta))/length)
+        projector = interpolate(normal_projectors(o.normals).reshape(-1,9),o.current[:,3],c[:,3]).reshape(-1,3,3)
+        normal_weight = o.config.shape_weight if o.config.shape_normal_weight is None else o.config.shape_normal_weight
+        tangent_weight = o.config.shape_weight if o.config.shape_tangent_weight is None else o.config.shape_tangent_weight
+        normal_loss = normal_weight*bending_terms(c[:,:3],metric=projector)[-1]/length
+        tangent_loss = tangent_weight*bending_terms(c[:,:3],metric=np.eye(3)-projector)[-1]/length
+        direction_loss = 0.
+        if o.config.direction_weight:
+            _, edge_losses = direction_feedback(c[:,:3],np.arange(len(c)-1),lengths,transform,
+                np.full(len(c),len(losses),dtype=int),directions,o.output_stride,o.config)
+            direction_loss = float(np.sum(lengths*edge_losses)/length)
+        losses.append((presence,normal_loss,tangent_loss,localization,direction_loss))
+    return losses
+
+
+def log_refinement_scalars(writer, phase, statistics, step):
+    count, *sums = statistics
+    if writer is None or count == 0:
+        return
+    means = dict(zip(REFINEMENT_LOSS_NAMES, np.asarray(sums)/count))
+    means["total"] = sum(means.values())
+    means["smoothing"] = means["smoothing_normal"]+means["smoothing_tangent"]
+    for key, value in means.items():
+        writer.add_scalar(f"refinement_{phase}/loss_{key}", float(value), step)
 
 
 class RefinementObserver:
@@ -510,46 +749,72 @@ class RefinementObserver:
         self.accepted = self.stale = 0
 
     def __call__(self, batch, output):
-        if not self.config.enabled:
+        if not self.config.enabled or not self.config.update_enabled:
             return
-        from .model import presence_outputs
+        from .model import presence_outputs, direction_outputs
+        directions = None
+        if self.config.direction_weight:
+            branches = direction_outputs(output.detach())
+            if branches.shape[1] != 1:
+                raise ValueError("direction-guided refinement currently requires a single direction branch")
+            directions = branches[:,0].float()
         # Retain only the small output probabilities, not the training graph.
         self.pending.append((batch.stream_indices.detach(), batch.refinement_geometry,
-                             presence_outputs(output.detach()).amax(dim=1).squeeze(1).float()))
+                             presence_outputs(output.detach()).amax(dim=1).squeeze(1).float(),directions))
 
-    def flush(self, distributed):
-        if not self.config.enabled:
+    def flush(self, distributed, *, phase=None, step=None, writer=None, batch=None):
+        if not self.config.enabled or not self.config.update_enabled:
             return
         import torch.distributed as dist
         started = time.perf_counter()
         proposals = []
-        todo, images = [], []
-        for indices, observations, presence in self.pending:
+        todo, images, directions = [], [], []
+        for indices, observations, presence, predicted_directions in self.pending:
             indices = indices.cpu().tolist()
             maps = presence.cpu().numpy()
-            for index, observation, values in zip(indices, observations, maps):
+            direction_maps = predicted_directions.cpu().numpy() if predicted_directions is not None else [None]*len(indices)
+            for index, observation, values, encoded in zip(indices, observations, maps, direction_maps):
                 if observation is None:
                     continue
                 todo.append((index, observation))
                 images.append(values)
-        afters = refine_observations([o for _,o in todo], images)
-        for (index, observation), after in zip(todo, afters):
-            proposals.append((index, observation.key, observation.start, observation.current, after))
+                directions.append(encoded)
+        direction_maps = np.stack(directions) if directions and self.config.direction_weight else None
+        afters = refine_observations([o for _,o in todo], images, direction_maps)
+        losses = refinement_losses([o for _,o in todo], afters, images, direction_maps)
+        for (index, observation), after, loss in zip(todo, afters, losses):
+            proposals.append((index, observation.key, observation.start, observation.current, after, loss))
         self.pending.clear()
         if distributed.enabled:
             gathered = [None] * distributed.world_size if distributed.is_main else None
             dist.gather_object(proposals, gathered, dst=0)
         else:
             gathered = [proposals]
+        statistics = empty_refinement_statistics()
         if distributed.is_main:
             store = active_store()
-            for _, key, start, before, after in sorted((p for rows in gathered for p in rows), key=lambda p: p[0]):
+            applied_losses = []
+            for _, key, start, before, after, loss in sorted((p for rows in gathered for p in rows), key=lambda p: p[0]):
                 if store.commit(key, start, before, after):
                     self.accepted += 1
+                    applied_losses.append(loss)
                 else:
                     self.stale += 1
+            if applied_losses:
+                statistics = [float(len(applied_losses)), *np.sum(applied_losses,axis=0).tolist()]
+            if phase is not None:
+                if applied_losses:
+                    averages = dict(zip(REFINEMENT_LOSS_NAMES,np.mean(applied_losses,axis=0)))
+                    averages["total"] = sum(averages.values())
+                    details = " ".join(f"loss_{k}={v:.7g}" for k,v in averages.items())
+                else:
+                    details = "losses=unavailable (no committed refinement proposals)"
+                print(f"refinement_{phase} update={step} batch={batch if batch is not None else step} "
+                      f"patches={len(applied_losses)} {details}",flush=True)
+                log_refinement_scalars(writer,phase,statistics,step)
         # Do not let another rank start preparing a new test phase before all
         # proposals have been committed. Queue lookahead stays immutable.
         if distributed.enabled:
             dist.barrier()
         self.seconds += time.perf_counter() - started
+        return statistics

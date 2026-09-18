@@ -13,7 +13,9 @@ from vesuvius.neural_tracing.fiber_trace_3d.refinement import (
     RefinementConfig, GeometryStore, RefinementObserver, RefinementObservation,
     arclength, resample, ellipse_metric, clamp_update, taper, semi_implicit_step,
     presence_force, refine_curve, refinement_session,
-    refine_observations, BatchedPatchTransform, step_limits,
+    refine_observations, BatchedPatchTransform, step_limits, bending_terms, refinement_losses,
+    normal_projectors, shape_metric, direction_feedback, REFINEMENT_LOSS_NAMES,
+    active_store,
 )
 
 
@@ -31,6 +33,26 @@ def test_config_rejects_invalid():
     for key in ("model", "model_3d"):
         with pytest.raises(ValueError, match="unconditioned"):
             RefinementConfig.parse({"refinement": {"enabled": True}, key: {"conditioned_decoder_enabled": True}})
+    frozen = {"enabled": True, "update_enabled": False,
+              "state_checkpoint": "/tmp/state.pt", "state_sha256": "a" * 64}
+    assert not RefinementConfig.parse({"refinement": frozen}).update_enabled
+    for invalid in ({**frozen, "state_sha256": None}, {**frozen, "state_sha256": "BAD"},
+                    {**frozen, "enabled": False}):
+        with pytest.raises(ValueError):
+            RefinementConfig.parse({"refinement": invalid})
+
+
+def test_frozen_geometry_store_is_read_only(tmp_path):
+    writable = GeometryStore(tmp_path / "state")
+    cfg = RefinementConfig(enabled=True)
+    key = "f" * 64
+    writable.register(key, line()[:, :3], {"split": "train"}, cfg)
+    frozen = GeometryStore(writable.root, read_only=True)
+    frozen.register(key, line()[:, :3], {"split": "train"}, cfg)
+    with pytest.raises(RuntimeError, match="read-only"):
+        frozen.commit(key, 0, frozen.read(key), frozen.read(key))
+    with pytest.raises(ValueError, match="missing"):
+        frozen.register("e" * 64, line()[:, :3], {"split": "train"}, cfg)
 
 
 def test_ellipse_plane_step_and_border():
@@ -53,6 +75,180 @@ def test_shape_translation_and_tether():
     cfg = replace(cfg, gt_weight=1)
     delta = semi_implicit_step(points, baseline, q, np.zeros_like(points), cfg)
     assert np.all(delta[:, 1] < 0)
+
+
+def test_bending_matches_dense_reference_and_piece_isolation():
+    rng = np.random.default_rng(24)
+    points = np.cumsum(rng.normal(size=(9,3)),axis=0)
+    baseline = points + rng.normal(size=points.shape)*.1
+    force = rng.normal(size=points.shape)*.01
+    cfg = RefinementConfig()
+    q = ellipse_metric(np.tile([0,1,0],(len(points),1)),cfg)
+    h = np.linalg.norm(np.diff(points,axis=0),axis=1)
+    d = np.zeros((len(points)-2,len(points)))
+    for i in range(len(d)):
+        a,c = 2/(h[i]*(h[i]+h[i+1])),2/(h[i+1]*(h[i]+h[i+1]))
+        d[i,i:i+3] = [a,-a-c,c]
+    b = d.T @ np.diag((h[:-1]+h[1:])/2) @ d
+    material = h*1.3
+    mass = (np.r_[material,0.] + np.r_[0.,material])/2
+    dt = cfg.learning_rate*cfg.normal_radius_base**2
+    matrix = np.kron(np.diag(mass)+2*dt*cfg.shape_weight*b,np.eye(3))
+    for i in range(len(points)):
+        matrix[3*i:3*i+3,3*i:3*i+3] += 2*dt*cfg.gt_weight*mass[i]*q[i]
+    rhs = dt*mass[:,None]*(force-2*cfg.gt_weight*np.einsum("nij,nj->ni",q,points-baseline))-2*dt*cfg.shape_weight*b@points
+    actual = semi_implicit_step(points,baseline,q,force,cfg,material_lengths=material)
+    np.testing.assert_allclose(actual,np.linalg.solve(matrix,rhs.ravel()).reshape(-1,3),atol=1e-12)
+    joined = np.r_[points,points+10000]
+    links = np.ones(len(joined)-1,dtype=bool)
+    links[len(points)-1] = False
+    result = semi_implicit_step(joined,np.r_[baseline,baseline+10000],np.tile(q,(2,1,1)),
+        np.tile(force,(2,1)),cfg,links=links,material_lengths=np.r_[material,1,material])
+    np.testing.assert_allclose(result[:len(points)],actual,atol=1e-10)
+    np.testing.assert_allclose(result[len(points):],actual,atol=1e-10)
+
+
+def test_anisotropic_bending_dense_reference():
+    rng = np.random.default_rng(53)
+    points = np.cumsum(rng.normal(size=(8,3)),axis=0)
+    normals = rng.normal(size=points.shape)
+    proj = normal_projectors(normals)
+    cfg = RefinementConfig(shape_normal_weight=.1,shape_tangent_weight=1.)
+    q = ellipse_metric(normals,cfg)
+    h = np.linalg.norm(np.diff(points,axis=0),axis=1)
+    d = np.zeros((len(points)-2,len(points)))
+    for i in range(len(d)):
+        a,c = 2/(h[i]*(h[i]+h[i+1])),2/(h[i+1]*(h[i]+h[i+1]))
+        d[i,i:i+3] = [a,-a-c,c]
+    operator = np.kron(d,np.eye(3))
+    metric = shape_metric(proj,cfg)
+    w = np.zeros((len(d)*3,len(d)*3))
+    for i in range(len(d)):
+        w[3*i:3*i+3,3*i:3*i+3] = (h[i]+h[i+1])/2*metric[i+1]
+    b = operator.T@w@operator
+    mass = (np.r_[h,0]+np.r_[0,h])/2
+    dt = cfg.learning_rate*cfg.normal_radius_base**2
+    system = np.diag(np.repeat(mass,3))+2*dt*b
+    for i in range(len(points)):
+        system[3*i:3*i+3,3*i:3*i+3] += 2*dt*mass[i]*q[i]
+    expected = np.linalg.solve(system,-2*dt*b@points.ravel()).reshape(-1,3)
+    actual = semi_implicit_step(points,points,q,np.zeros_like(points),cfg,normal_metric=proj,material_lengths=h)
+    np.testing.assert_allclose(actual,expected,atol=1e-11)
+    np.testing.assert_allclose(normal_projectors(-normals),proj)
+    # Normal vs sheet-tangential bending energy differs by exactly10x.
+    p = np.array([[-4.,0.,0.],[0.,1.,0.],[4.,0.,0.]])
+    m = shape_metric(normal_projectors(np.tile([0,1,0],(len(p),1))),cfg)
+    normal_energy = bending_terms(p,metric=m)[-1]
+    tangent_energy = bending_terms(p[:,[0,2,1]],metric=m)[-1]
+    np.testing.assert_allclose(tangent_energy,10*normal_energy,rtol=1e-10)
+
+
+def test_direction_gradient_and_warp_pullback():
+    from vesuvius.neural_tracing.fiber_trace_3d.direction import encode_lasagna_direction_3x2
+    cfg = RefinementConfig(direction_weight=.1)
+    points = np.array([[8.,8.,8.],[12.,9.,8.],[16.,10.,9.]])
+    edges = np.arange(2); material = np.array([4.,5.]); ids = np.zeros(3,dtype=int)
+    axis = np.array([1.,.3,.2]); axis /= np.linalg.norm(axis)
+    def maps_for(vector):
+        encoded = encode_lasagna_direction_3x2(vector[::-1][None])[0]
+        return np.broadcast_to(encoded[None,:,None,None,None],(1,6,32,32,32)).copy()
+    maps = maps_for(axis)
+    identity = lambda p,ids:p
+    force,loss = direction_feedback(points,edges,material,identity,ids,maps,1,cfg)
+    def energy(p):
+        return np.sum(direction_feedback(p,edges,material,identity,ids,maps,1,cfg)[1]*material)
+    gradient = np.zeros_like(points)
+    for i in range(3):
+        for j in range(3):
+            plus,minus=points.copy(),points.copy(); plus[i,j]+=1e-4; minus[i,j]-=1e-4
+            gradient[i,j]=(energy(plus)-energy(minus))/2e-4
+    mass = (np.r_[material,0]+np.r_[0,material])/2
+    np.testing.assert_allclose(force*mass[:,None],-gradient,atol=1e-8)
+    assert energy(points+.1*force)<energy(points)
+    np.testing.assert_allclose(direction_feedback(points,edges,material,identity,ids,maps_for(-axis),1,cfg)[1],loss)
+    # Nonlinear shear with known local tangent Jacobian: no affine-only shortcut.
+    def warp(p,ids):
+        p=p.copy(); p[:,1]+=.01*p[:,0]**2; return p
+    straight = np.array([[8.,8.,8.],[12.,8.,8.],[16.,8.,8.]])
+    grid = np.indices((32,32,32))[0].astype(float)
+    vectors = np.stack([np.ones_like(grid),.02*grid,np.zeros_like(grid)],axis=-1)
+    vectors /= np.linalg.norm(vectors,axis=-1,keepdims=True)
+    encoded = encode_lasagna_direction_3x2(vectors[...,::-1]).transpose(3,0,1,2)[None]
+    _,loss = direction_feedback(straight,edges,material,warp,ids,encoded,1,cfg)
+    assert max(loss)<1e-6
+    with pytest.raises(ValueError,match="Jacobian"):
+        direction_feedback(points,edges,material,lambda p,ids:np.zeros_like(p),ids,maps,1,cfg)
+
+
+def test_weak_bending_smooths_noisy_original_not_displacement():
+    p = np.c_[np.arange(24)*8., np.sin(np.arange(24)*2.)*.5, np.zeros(24)]
+    cfg = RefinementConfig()
+    q = ellipse_metric(np.tile([0,1,0],(len(p),1)),cfg)
+    smooth = semi_implicit_step(p,p,q,np.zeros_like(p),cfg)
+    projected = clamp_update(smooth,p,q,np.full(len(p),cfg.max_step_fraction))
+    assert np.linalg.norm(projected) > 0
+    assert bending_terms(p+projected)[-1] < bending_terms(p)[-1]
+    force = np.tile([0,.02,0],(len(p),1))
+    presence_only = semi_implicit_step(p,p,q,force,replace(cfg,shape_weight=0))
+    together = semi_implicit_step(p,p,q,force,cfg)
+    ratio = np.linalg.norm(together-presence_only)/np.linalg.norm(presence_only)
+    assert 0 < ratio < .01
+    print(f"weak bending synthetic one-step contribution={ratio*100:.6f}% of presence-only update; h~8, noise amplitude0.5, presence gradient0.02/base-voxel")
+
+
+def test_refinement_loss_components_and_logging(monkeypatch,tmp_path,capsys):
+    from vesuvius.neural_tracing.fiber_trace_3d.loader import _Augment3DParams
+    store = GeometryStore(tmp_path / "state")
+    monkeypatch.setenv("VILLA_FIBER_REFINEMENT_STATE",str(store.root))
+    cfg = RefinementConfig(enabled=True)
+    store.register("c"*64,line()[:,:3],{},cfg)
+    c = store.read("c"*64)
+    params = _Augment3DParams(0,np.zeros(3),np.zeros(3),np.eye(3),np.eye(3),0,1,1,0,0,None,0,0,None)
+    o = RefinementObservation("c"*64,0,c,store.baseline("c"*64).copy(),np.tile([0,1,0],(len(c),1)),params,1.,(64,)*3,cfg,4,True)
+    moved = c.copy(); moved[:,1] += 4
+    loss = refinement_losses([o],[moved],[np.full((16,)*3,.75)])[0]
+    np.testing.assert_allclose(loss,[.25,0.,0.,.01,0.],atol=1e-12)
+    observer = RefinementObserver(cfg)
+    batch = SimpleNamespace(stream_indices=torch.tensor([0]),refinement_geometry=(o,))
+    output = torch.zeros(1,7,16,16,16); output[:,6] = .75
+    observer(batch,output)
+    calls = []
+    observer.flush(SimpleNamespace(enabled=False,is_main=True),phase="test",step=100,batch=2,
+                   writer=SimpleNamespace(add_scalar=lambda *args:calls.append(args)))
+    assert "refinement_test update=100 batch=2 patches=1" in capsys.readouterr().out
+    assert {t for t,_,_ in calls} == {f"refinement_test/loss_{k}" for k in (*REFINEMENT_LOSS_NAMES,"total","smoothing")}
+    np.testing.assert_allclose([v for _,v,_ in calls],[.25,0,0,0,0,.25,0],atol=1e-12)
+
+
+def test_raw_and_both_emas_use_same_refined_test_line(monkeypatch,tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d import train
+    from vesuvius.neural_tracing.fiber_trace_3d.loader import FiberTrace3DLoader, collate_fiber_trace_3d_samples
+    from vesuvius.neural_tracing.fiber_trace_3d.ema import ModelEMA
+    source = make_refining_loader(monkeypatch,tmp_path)
+    cfg = replace(source.config,refinement_split="test",batch_size=1)
+    object.__setattr__(cfg,"_array_records",source.config._array_records)
+    loader = FiberTrace3DLoader(cfg)
+    initial = loader.load_sample(0).refinement_geometry
+    moved = initial.current.copy(); moved[:,1] += 1
+    assert loader._refinement_store.commit(initial.key,0,initial.current,moved)
+    batch = collate_fiber_trace_3d_samples([loader.load_sample(0)])
+    model = torch.nn.Sequential(torch.nn.Conv3d(1,7,1),torch.nn.Sigmoid())
+    ema = ModelEMA(model,[.99,.999])
+    observer = RefinementObserver(cfg.refinement)
+    evaluate = train._evaluate_loaded_batch
+    seen = []
+    def checked(model, current, *args, **kwargs):
+        np.testing.assert_array_equal(current.refinement_geometry[0].current,moved)
+        np.testing.assert_array_equal(loader._refinement_store.read(initial.key),moved)
+        seen.append(current.target_segment_starts_zyx.clone())
+        return evaluate(model,current,*args,**kwargs)
+    monkeypatch.setattr(train,"_evaluate_loaded_batch",checked)
+    train._evaluate_dense_loss_rows(model,loader,device=torch.device("cpu"),start_sample_index=0,
+        sample_count=1,direction_weight=10,presence_weight=1,ema=ema,batch_iterator=iter([batch]),
+        prediction_observer=observer)
+    assert len(seen) == 3 and len(observer.pending) == 1
+    for targets in seen[1:]:
+        torch.testing.assert_close(targets,seen[0],rtol=0,atol=0)
 
 
 def test_quadrature_matches_linear_field():
@@ -294,6 +490,40 @@ def test_session_restores_geometry_for_weights_initialization(tmp_path, monkeypa
     assert "VILLA_FIBER_REFINEMENT_STATE" not in os.environ
 
 
+def test_frozen_session_uses_explicit_geometry_checkpoint_without_model_resume(tmp_path, monkeypatch):
+    monkeypatch.delenv("VILLA_FIBER_REFINEMENT_STATE", raising=False)
+    source = tmp_path / "source"
+    source.mkdir()
+    key = "d" * 64
+    store = GeometryStore(source / "state")
+    store.register(key, line()[:, :3], {"split": "train"}, RefinementConfig(enabled=True))
+    saved = store.save(source / "fibers.zip")
+    checkpoint = source / "current.pt"
+    torch.save({"refinement_state": saved}, checkpoint)
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"refinement": {
+        "enabled": True,
+        "update_enabled": False,
+        "state_checkpoint": str(checkpoint),
+        "state_sha256": saved["sha256"],
+    }}))
+
+    @refinement_session
+    def run(path, **kwargs):
+        assert "resume_checkpoint" not in kwargs
+        frozen = active_store()
+        assert frozen.read_only
+        np.testing.assert_array_equal(frozen.read(key), store.read(key))
+        with pytest.raises(RuntimeError, match="read-only"):
+            frozen.commit(key, 0, frozen.read(key), frozen.read(key))
+        return os.environ["VILLA_FIBER_REFINEMENT_STATE"]
+
+    root = run(cfg)
+    assert not os.path.exists(root)
+    assert "VILLA_FIBER_REFINEMENT_STATE" not in os.environ
+    assert "VILLA_FIBER_REFINEMENT_FROZEN" not in os.environ
+
+
 def _distributed_refinement_worker(rank, world, rendezvous, root):
     import torch.distributed as dist
     from datetime import timedelta
@@ -397,6 +627,20 @@ def test_augmented_mapping_quadrature_and_cost():
     print(f"refinement batched CPU one-core solver: 16 patches,24 nodes each,4 iterations,affine+smooth; "
           f"ms/batch min/median/max={np.array([min(durations),np.median(durations),max(durations)])*1000}; "
           f"patches/s={16/np.median(durations):.1f}")
+    from vesuvius.neural_tracing.fiber_trace_3d.direction import encode_lasagna_direction_3x2
+    cfg = replace(observations[0].config,shape_normal_weight=.1,shape_tangent_weight=1.,direction_weight=.1)
+    guided = [replace(o,config=cfg) for o in observations]
+    axis = encode_lasagna_direction_3x2(np.array([[1.,.2,.1]]))[0]
+    directions = np.broadcast_to(axis[None,:,None,None,None],(16,6,*presence.shape)).copy()
+    durations = []
+    for _ in range(10):
+        start = time.perf_counter()
+        curves = refine_observations(guided,[presence]*16,directions)
+        losses = refinement_losses(guided,curves,[presence]*16,directions)
+        assert np.isfinite(losses).all()
+        durations.append(time.perf_counter()-start)
+    print(f"guided refinement CPU one-core solve+losses: 16 patches,24 nodes,4 iterations,10 repeats; "
+          f"ms/batch min/median/max={np.array([min(durations),np.median(durations),max(durations)])*1000}")
 
 
 @pytest.mark.skipif(os.environ.get("FIBER_COOPERATIVE_CUDA_TEST") != "1", reason="manager-gated CUDA only")
@@ -423,7 +667,7 @@ def test_cuda_fixed_test_crop_feedback(tmp_path, monkeypatch):
 @pytest.mark.skipif(os.environ.get("FIBER_COOPERATIVE_CUDA_TEST") != "1", reason="manager-gated CUDA only")
 def test_cuda_observer_detaches_and_preserves_backward(tmp_path, monkeypatch):
     from vesuvius.neural_tracing.fiber_trace_3d.loader import _Augment3DParams
-    cfg = RefinementConfig(enabled=True)
+    cfg = RefinementConfig(enabled=True,shape_normal_weight=.1,shape_tangent_weight=1.,direction_weight=.1)
     monkeypatch.setenv("VILLA_FIBER_REFINEMENT_STATE", str(tmp_path / "store"))
     store = GeometryStore(tmp_path / "store")
     key = "b"*64

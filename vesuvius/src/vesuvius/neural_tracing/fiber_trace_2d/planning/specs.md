@@ -85,6 +85,13 @@
 
 ## Opt-in training-feedback refinement (2026-09-15)
 
+- Optional normal/tangent bending weights override isotropic shape_weight;
+  current trial0.1/10.0 vs initial anisotropic0.1/1.0. Use unoriented normal tensors and full block
+  banded solve. Optional direction_weight (current trial1.0) penalizes sign-invariant tangent-axis
+  disagreement, sampled from detached raw predictions with full warp-Jacobian
+  pullback. Lag directions each iteration; no spatial field derivative. Requires
+  one direction branch. Report both bending components and direction separately.
+
 - Test crops are fixed by original GT selection and transforms. Refined local
   test curves are independent per deterministic crop, never merged into the full
   test fiber; checkpoint archives preserve them. Old whole-test updates are
@@ -99,9 +106,13 @@
   autograd, refines persistent train and test curves; no frozen teacher or extra
   forward. Subsequent queued loads reuse refined geometry, never mutate input files.
 - Immutable-original GT tether uses 40/80 base-voxel normal/tangent radii;
-  small displacement shape penalty, current tangent-plane updates, per-iteration
+  weak resulting-line arclength bending (not displacement smoothing), current tangent-plane updates, per-iteration
   1/8-ellipse cap tapered over 1/8 patch width, and arclength resampling.
 - Shared native normal sampling/validity and existing fast data queues are reused.
+  Bending uses frozen current arc coefficients and material masses in the native
+  banded solve; no length penalty or cross-piece coupling. Report weighted post-solve
+  presence/bending/localization per committed patch, train batch and test wave;
+  TB test values aggregate patch-weighted across the pass. Remove cumulative TB counters.
   Invalid normals skip refinement. Already prepared targets stay immutable.
   Test raw/EMA targets agree within a wave; only raw predictions update geometry.
 - All component geometries and provenance are archived alongside snapshots and

@@ -1132,25 +1132,23 @@ OpenedRemoteChunkedZarr openRemoteZarrPyramid(
 {
     auto spec = vc::parseRemoteVolumeSpec(url);
     auto auth = std::move(options.auth);
-    if (spec.useAwsSigv4 && auth.empty() && options.discoverAwsCredentials) {
-        auth = vc::loadAwsCredentials();
-        if (auth.region.empty())
-            auth.region = spec.awsRegion;
-        if (auth.access_key.empty() || auth.secret_key.empty())
-            auth = {};
-    } else if (spec.useAwsSigv4 && !auth.empty() && auth.region.empty()) {
-        auth.region = spec.awsRegion;
-    }
+    vc::DeferredAwsAuth deferredAuth(
+        auth,
+        spec.useAwsSigv4 && options.discoverAwsCredentials,
+        spec.awsRegion);
 
     OpenedChunkedZarr opened;
-    if (!spec.useAwsSigv4 || auth.empty()) {
+    if (!spec.useAwsSigv4) {
         opened = openHttpZarrPyramid(spec.portableLocator, auth);
     } else {
         try {
             opened = openHttpZarrPyramid(spec.portableLocator, {});
             auth = {};
         } catch (const std::exception& error) {
-            if (!isRemoteAuthError(error))
+            if (!isRemoteAuthError(error) || !deferredAuth.available())
+                throw;
+            auth = deferredAuth.resolve();
+            if (auth.empty())
                 throw;
             opened = openHttpZarrPyramid(spec.portableLocator, auth);
         }

@@ -31,6 +31,21 @@ run was launched as `5scroll_json_eligible_128_sd1_16x8_ema_20260914_105436` in
 `/ephemeral/hendrik/fiber3d_train2/runs`. It completed startup calibration and
 entered adaptive training; manager scheduling may pause/resume it.
 
+The full-resolution comparison config is
+`train_5scroll_json_eligible_fullres_ema_16x8.json`. It is an exact copy of the
+regular configuration except for `model_3d.output_stride: 1` and the distinct
+run name `5scroll_json_eligible_fullres_128_sd1_16x8_ema`. It starts from random
+initialization with no refinement, embedding, or resume source. Its config
+fingerprint is distinct, so cooperative startup measures stride-1 memory rather
+than accepting the stride-4 calibration.
+
+The managed run launched at 2026-09-16 19:23 UTC as
+`5scroll_json_eligible_fullres_128_sd1_16x8_ema_20260916_192344`. Startup
+measured microbatch 8, saved calibration fingerprint
+`7fa1c121dd3ca12a56efeda8046f3725d81bdd565c281961e115ca977d6305e5`,
+then re-registered for adaptive training. It reached update 200 and completed
+the update-100 and update-200 raw/EMA tests during launch verification.
+
 The subsequent contrastive variant is
 `train_5scroll_json_eligible_paired_contrastive_ema_16x8.json`: identical regular
 settings plus16 embedding channels, paired local contrastive loss (64pairs per
@@ -53,6 +68,10 @@ failures),26.06s. Approved runner output under
 and `20260914_105208_737537`. No training-speed claim is made for this data-policy
 change. Ambiguous repeated CP coordinates fail explicitly; the full configured
 JSON corpus passes the exact CP mapping.
+
+The full-resolution config comparison was validated separately by the same
+approved `training-spans` suite: 40 passed, 2 CUDA-gated skips in 33.02s, output
+`20260916_191912_825700`. No performance claim is made before the real run.
 
 | Scroll | Train sources → components | Test sources → components |
 |---|---:|---:|

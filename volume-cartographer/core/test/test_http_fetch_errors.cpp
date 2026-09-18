@@ -4,6 +4,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/HttpFetch.hpp"
+#include "vc/core/util/RemoteAuth.hpp"
 #include "vc/core/util/S3AuthFallback.hpp"
 
 #include <utils/http_fetch.hpp>
@@ -94,6 +95,62 @@ TEST_CASE("successful anonymous HEAD avoids stale credentials")
     CHECK(anonymousAttempts == 1);
     CHECK(signedAttempts == 0);
     CHECK(fallback.usesAnonymous());
+}
+
+TEST_CASE("public S3 success never resolves deferred AWS credentials")
+{
+    std::atomic<int> loads{0};
+    vc::DeferredAwsAuth auth(
+        {}, true, "us-east-1", [&] {
+            ++loads;
+            vc::HttpAuth loaded;
+            loaded.access_key = "key";
+            loaded.secret_key = "secret";
+            return loaded;
+        });
+    vc::S3AuthFallback fallback(true, auth.available());
+
+    const auto first = fallback.request([&](bool anonymous) {
+        if (!anonymous)
+            (void)auth.resolve();
+        return response(anonymous ? 200 : 500);
+    });
+    const auto second = fallback.request([&](bool anonymous) {
+        if (!anonymous)
+            (void)auth.resolve();
+        return response(anonymous ? 200 : 500);
+    });
+
+    CHECK(first.response.ok());
+    CHECK(second.response.ok());
+    CHECK(loads == 0);
+}
+
+TEST_CASE("private S3 denial resolves deferred AWS credentials once")
+{
+    std::atomic<int> loads{0};
+    vc::DeferredAwsAuth auth(
+        {}, true, "us-east-1", [&] {
+            ++loads;
+            vc::HttpAuth loaded;
+            loaded.access_key = "key";
+            loaded.secret_key = "secret";
+            return loaded;
+        });
+    vc::S3AuthFallback fallback(true, auth.available());
+
+    auto request = [&](bool anonymous) {
+        if (anonymous)
+            return response(403, "<Code>AccessDenied</Code>");
+        const auto resolved = auth.resolve();
+        CHECK(resolved.access_key == "key");
+        CHECK(resolved.secret_key == "secret");
+        CHECK(resolved.region == "us-east-1");
+        return response(200);
+    };
+    CHECK(fallback.request(request).response.ok());
+    CHECK(fallback.request(request).response.ok());
+    CHECK(loads == 1);
 }
 
 TEST_CASE("S3 access falls back once and preserves private authenticated mode")

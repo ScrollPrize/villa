@@ -94,6 +94,25 @@ def test_missing_embedding_config_and_nonfinite_output_error():
         adapter.finalize_product_slab(product, np.full((16, 2, 2, 2), np.nan))
 
 
+def test_split_embedding_inference_requires_explicit_bank():
+    raw = config()
+    raw["embedding"] = {
+        "enabled": True,
+        "channels": 16,
+        "short_range_channels": 8,
+        "objective": "local_contrastive",
+        "paired_patches": True,
+    }
+    with pytest.raises(ValueError, match="requires embedding_bank"):
+        FiberTrace3DPredictAdapter(raw, emit_embeddings=True)
+    for bank in ("short", "long"):
+        adapter = FiberTrace3DPredictAdapter(raw, emit_embeddings=True, embedding_bank=bank)
+        assert adapter.embedding_channels == 8
+        assert len(adapter.output_products[-1].channels) == 8
+    with pytest.raises(ValueError, match="only valid"):
+        FiberTrace3DPredictAdapter(config(), emit_embeddings=True, embedding_bank="short")
+
+
 @pytest.mark.parametrize("optimum", [0, 3, 5, 8])
 def test_weight_search(optimum):
     from vesuvius.neural_tracing.fiber_trace_3d.embedding_trace_sweep import search_weight

@@ -494,7 +494,6 @@ def test_visualization_resume_preserves_complete_galleries_and_trace_artifacts(r
     del config["resume_render_cases"]
     path.write_text(json.dumps(config))
     run("replay-set", "--config", path)
-    summary_before = (root / "resume-derived/summary.json").read_bytes()
     assert regenerated == {p.name: p.read_bytes() for p in (root / "inline/cases/1/rendered").iterdir()}
     assert json.loads((root / "inline/visualization_resume.json").read_text())["batch_selected_cases"] == []
 
@@ -513,6 +512,7 @@ def test_visualization_resume_accepts_render_only_and_saved_derived_provenance(r
     path = root / "resume-derived.json"
     path.write_text(json.dumps(config))
     run("replay-set", "--config", path)
+    summary_before = (root / "resume-derived/summary.json").read_bytes()
     traces = {}
     for index in range(2):
         artifact_path = root / f"resume-derived/cases/{index}/trace.json"

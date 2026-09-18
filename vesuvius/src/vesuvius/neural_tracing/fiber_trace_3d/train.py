@@ -73,7 +73,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.direction import (
     decode_lasagna_direction_3x2_analytic,
     encode_lasagna_direction_3x2,
 )
-from .refinement import RefinementConfig, RefinementObserver, refinement_session, active_store
+from .refinement import RefinementConfig, RefinementObserver, refinement_session, active_store, log_refinement_scalars, empty_refinement_statistics
 from vesuvius.neural_tracing.fiber_trace_3d.model import (
     build_fiber_trace_3d_model,
     direction_output,
@@ -979,9 +979,13 @@ def _finalize_loss_statistics(
         "positive_embedding",
         "negative_embedding",
         "contrastive_embedding",
+        "short_embedding",
+        "long_embedding",
     )
     local_pairs = {
         "contrastive_embedding": (statistics.contrastive_embedding_sum, statistics.contrastive_embedding_count),
+        "short_embedding": (statistics.short_embedding_sum, statistics.short_embedding_count),
+        "long_embedding": (statistics.long_embedding_sum, statistics.long_embedding_count),
         "positive_embedding": (statistics.positive_embedding_sum, statistics.positive_embedding_count),
         "negative_embedding": (statistics.negative_embedding_sum, statistics.negative_embedding_count),
         "direction": (statistics.direction_sum, statistics.direction_count),
@@ -1051,7 +1055,15 @@ def _finalize_loss_statistics(
         * negative_presence_loss
         * (negative_count > 0.0).to(dtype=negative_presence_loss.dtype)
     )
-    embedding_loss = 0.5 * (ratio("positive_embedding") + ratio("negative_embedding")) + ratio("contrastive_embedding")
+    split_embedding = (local_pairs["short_embedding"][1] > 0) | (local_pairs["long_embedding"][1] > 0)
+    if global_values:
+        split_embedding = ((global_values["short_embedding"][1] > 0) |
+                           (global_values["long_embedding"][1] > 0))
+    embedding_loss = torch.where(
+        split_embedding,
+        0.5 * (ratio("short_embedding") + ratio("long_embedding")),
+        0.5 * (ratio("positive_embedding") + ratio("negative_embedding")) + ratio("contrastive_embedding"),
+    )
     total = float(direction_weight) * direction_loss + float(presence_weight) * presence_loss + embedding_loss
     return {
         "total": total,
@@ -1060,6 +1072,10 @@ def _finalize_loss_statistics(
         "embedding": embedding_loss,
         "embedding_contrastive": ratio("contrastive_embedding"),
         "embedding_anchors": global_values["contrastive_embedding"][1] if global_values else statistics.contrastive_embedding_count,
+        "embedding_short": ratio("short_embedding"),
+        "embedding_short_anchors": global_values["short_embedding"][1] if global_values else statistics.short_embedding_count,
+        "embedding_long": ratio("long_embedding"),
+        "embedding_long_anchors": global_values["long_embedding"][1] if global_values else statistics.long_embedding_count,
         "embedding_positive": ratio("positive_embedding"),
         "embedding_negative": ratio("negative_embedding"),
         "embedding_negative_pairs": global_values["negative_embedding"][1] if global_values else statistics.negative_embedding_count,
@@ -1530,6 +1546,14 @@ def compute_losses(
         if len(embedding_values) == 6:
             statistics = replace(statistics, contrastive_embedding_sum=embedding_values[4],
                                  contrastive_embedding_count=embedding_values[5])
+        elif len(embedding_values) == 10:
+            statistics = replace(statistics,
+                contrastive_embedding_sum=embedding_values[4],
+                contrastive_embedding_count=embedding_values[5],
+                short_embedding_sum=embedding_values[6],
+                short_embedding_count=embedding_values[7],
+                long_embedding_sum=embedding_values[8],
+                long_embedding_count=embedding_values[9])
     if _return_statistics:
         return statistics
     return _finalize_loss_statistics(
@@ -2714,10 +2738,17 @@ def _embedding_log(losses, model):
     if not getattr(_unwrap_model(model), "embedding_channels", 0):
         return ""
     extra = ''
-    for key in ('positive_mean', 'negative_mean', 'negative_above_0p9', 'hardest_negative_mean', 'positive_hardest_gap'):
+    for key in ('positive_mean', 'negative_mean', 'negative_above_0p9', 'hardest_negative_mean', 'positive_hardest_gap',
+                'short_positive_mean', 'short_negative_mean', 'short_positive_hardest_gap',
+                'long_positive_mean', 'long_negative_mean', 'long_positive_hardest_gap'):
         if 'embedding_similarity/'+key in losses:
             extra += f"emb_{key}={losses['embedding_similarity/'+key]:.4f} "
-    budget = (f"embedding_anchors={losses.get('embedding_anchors', 0):.0f} "
+    if getattr(_unwrap_model(model), 'embedding_short_range_channels', 0):
+        budget = (f"embedding_short={losses.get('embedding_short', 0):.6f} "
+                  f"embedding_long={losses.get('embedding_long', 0):.6f} "
+                  f"embedding_bank_anchors={losses.get('embedding_short_anchors', 0):.0f} ")
+    else:
+        budget = (f"embedding_anchors={losses.get('embedding_anchors', 0):.0f} "
               if getattr(_unwrap_model(model), 'embedding_objective', 'pairwise') == 'local_contrastive'
               else f"embedding_negative_pairs={losses['embedding_negative_pairs']:.0f} ")
     return f"loss_embedding={losses['embedding']:.6f} " + budget + extra
@@ -2725,7 +2756,8 @@ def _embedding_log(losses, model):
 
 def _log_embedding_scalars(writer, prefix, losses, model, step):
     if getattr(_unwrap_model(model), "embedding_channels", 0):
-        for key in ("embedding", "embedding_positive", "embedding_negative", "embedding_negative_pairs", "embedding_contrastive", "embedding_anchors"):
+        for key in ("embedding", "embedding_positive", "embedding_negative", "embedding_negative_pairs", "embedding_contrastive", "embedding_anchors",
+                    "embedding_short", "embedding_short_anchors", "embedding_long", "embedding_long_anchors"):
             if key not in losses:
                 continue
             writer.add_scalar(f"{prefix}/{key}", losses[key], step)
@@ -3435,7 +3467,7 @@ def training_units(
     def save_test_snapshots(test_step, metric, metric_name, *, initial=False):
         nonlocal best_metric
         if metric is None:
-            if refinement.config.enabled and not initial and test_step % checkpoint_interval == 0:
+            if refinement.config.update_enabled and refinement.config.enabled and not initial and test_step % checkpoint_interval == 0:
                 _distributed_barrier(distributed)
                 if distributed.is_main:
                     saved = active_store().save(snapshot_dir / f"fibers_step_{test_step:08d}.zip")
@@ -3471,7 +3503,7 @@ def training_units(
             planned.extend((filename, name, value, value_name) for filename in filenames)
         # Update every track's best before serializing the resumable raw state.
         saved_refinement = None
-        if planned and refinement.config.enabled:
+        if planned and refinement.config.enabled and refinement.config.update_enabled:
             _distributed_barrier(distributed)
             if distributed.is_main:
                 saved_refinement = active_store().save(snapshot_dir / f"fibers_step_{test_step:08d}.zip")
@@ -3540,6 +3572,8 @@ def training_units(
                             "dense_logged": False, "elapsed": 0.0}
         diagnostics.arm_test_watchdog(step)
         diagnostics.marker("test-routine-begin", step=step)
+        test_refinement_totals = (pending_test.setdefault("refinement_loss_totals", empty_refinement_statistics())
+                                  if pending_test is not None else empty_refinement_statistics())
         def collect_evaluation(evaluation_loader, options, *, source, rows_key, visualization=None):
             nonlocal test_started
             count, offset = options["sample_count"], options["start_sample_index"]
@@ -3566,15 +3600,23 @@ def training_units(
                             if pending_test is not None else evaluation_microbatch_size))
                 finally:
                     iterator.close()
-                if source == "test":
+                refinement_stats = empty_refinement_statistics()
+                if source == "test" and refinement.config.enabled and refinement.config.update_enabled:
                     # Raw and all EMA tracks have now consumed identical batch
                     # targets. Commit before a possible managed yield/restart.
-                    refinement.flush(distributed)
+                    refinement_stats = refinement.flush(distributed, phase="test", step=step,
+                        batch=f"{remaining[start]}:{remaining[min(start+wave_size,len(remaining))-1]}")
                 rows = _distributed_gather_dense_test_rows(local, distributed)
                 if pending_test is None:
+                    test_refinement_totals[:] = [a+b for a,b in zip(test_refinement_totals,refinement_stats)]
                     all_rows.extend(rows)
                     continue
-                rows = _distributed_broadcast_object(rows if distributed.is_main else None, distributed)
+                if source == "test" and refinement.config.enabled and refinement.config.update_enabled:
+                    rows, refinement_stats = _distributed_broadcast_object(
+                        (rows,refinement_stats) if distributed.is_main else None, distributed)
+                    test_refinement_totals[:] = [a+b for a,b in zip(test_refinement_totals,refinement_stats)]
+                else:
+                    rows = _distributed_broadcast_object(rows if distributed.is_main else None, distributed)
                 pending_test[rows_key].extend(rows)
                 if visualization is not None:
                     sheets = _distributed_broadcast_object(
@@ -3610,7 +3652,7 @@ def training_units(
                     diagnostics=diagnostics, diagnostic_step=step,
                     output_upsample=training.get("test_output_upsample"),
                     prediction_observer=_combine_prediction_observers(
-                        refinement if refinement.config.enabled else None,
+                        refinement if refinement.config.enabled and refinement.config.update_enabled else None,
                         test_visualization if distributed.is_main and writer is not None and test_vis_due else None),
                 )
                 gathered_rows = yield from collect_evaluation(
@@ -3635,6 +3677,7 @@ def training_units(
                     if writer is not None and (pending_test is None or not pending_test["dense_logged"]):
                         diagnostics.marker("test-tensorboard-scalars-begin", step=step)
                         _log_test_scalars(writer, "test", test_losses, raw_model, step)
+                        log_refinement_scalars(writer,"test",test_refinement_totals,step)
                         diagnostics.marker("test-tensorboard-scalars-end", step=step)
                 if (
                     distributed.is_main
@@ -4011,7 +4054,7 @@ def training_units(
                             next_batch,
                             conditioned_loss_options=conditioned_loss_options,
                             prediction_observer=_combine_prediction_observers(
-                                refinement if refinement.config.enabled else None, train_visualization),
+                                refinement if refinement.config.enabled and refinement.config.update_enabled else None, train_visualization),
                         )
                     if component_accumulator is not None:
                         if scaler_enabled:
@@ -4177,11 +4220,8 @@ def training_units(
             if train_vis_due:
                 _distributed_barrier(distributed)
 
-            refinement.flush(distributed)
-            if writer is not None and refinement.config.enabled and scalar_metrics_due:
-                writer.add_scalar("refinement/seconds_cumulative", refinement.seconds, step)
-                writer.add_scalar("refinement/accepted", refinement.accepted, step)
-                writer.add_scalar("refinement/stale", refinement.stale, step)
+            if refinement.config.enabled and refinement.config.update_enabled:
+                refinement.flush(distributed, phase="train", step=step, writer=writer)
             test_metric = None
             test_metric_name = None
             test_due = test_interval > 0 and step % test_interval == 0

@@ -7,6 +7,38 @@
   and separated current canonical results from focused diagnostics, helper modes
   and historical model/embedding sweeps.
 
+## 2026-09-18 — Merge fiber-tweaks
+
+- Merged full-resolution training, frozen refined split-range embeddings and
+  deferred public-remote authentication into `fiber-vischeck` while retaining
+  the current tracing/evaluation work.
+- The semantic refinement resolution supports both existing
+  resume/initialize-from geometry and explicit SHA-verified frozen geometry.
+  Optional embedding-bank selection remains compatible with legacy adapters.
+- Preserved the current task files and fused both durable changelog histories.
+
+## 2026-09-17 — Frozen refined fibers and split-range embeddings
+
+- Added read-only, SHA-verified refined training geometry imports independent
+  of model resume, plus separately normalized short-/long-range embedding banks
+  with explicit downstream bank selection. Legacy behavior is unchanged when
+  the new settings are absent.
+
+## 2026-09-15 — Anisotropic and direction-guided refinement
+
+- Separated surface-normal/tangential bending (production 0.1/1.0), added weak
+  predicted-direction guidance 0.1, full smooth-warp pullback and split
+  objective logs while preserving the original-GT tether, shared raw/EMA
+  targets and independent test pieces.
+
+## 2026-09-15 — Weak result-line bending and refinement loss reporting
+
+- Replaced displacement smoothing with weak arclength bending of the resulting
+  line while retaining training stitching and free test endpoints.
+- Replaced cumulative refinement TensorBoard counters with weighted presence,
+  bending and localization losses; batch means and full-test aggregates are
+  reported. Regression coverage keeps raw/EMA99/EMA999 refined targets equal.
+
 ## 2026-09-16 — Refinement default and run062136 evaluations
 
 - Promoted tracing-selected refinement EMA999u22000 (99restarts/68.676mm) as
