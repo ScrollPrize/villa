@@ -2004,6 +2004,7 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
                                 link.branchControlPointIndex)));
             hashU64(digest, link.pending ? 1 : 0);
             hashU64(digest, link.adjacent ? 1 : 0);
+            hashU64(digest, link.adjacentExplicit ? 1 : 0);
         }
     }
     hashDouble(digest, params.suspectTurns);

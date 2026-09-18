@@ -470,17 +470,21 @@ private slots:
         const GlobalPlacedFiber* v = findFiber(result, 901);
         QVERIFY(v != nullptr);
         QVERIFY(!v->meta.linked);
-        // A legacy (absent-key) ordinary ref on the other side is not a
-        // disagreement: the loader would have healed it.
-        std::vector<InputFiber> healed = adjacentPair(4000.0, 150.0, 0.3 * kTwoPi, 'V');
-        healed[0].links.push_back({1, healed[1].id, 1, false, true, true});
-        healed[1].links.push_back({1, healed[0].id, 1, false, false, false});
+        // At the layout API, an unspecified ordinary kind does not disagree
+        // with the adjacent ref. Change only this field to exercise its
+        // effect on both the solver output and the verification input digest.
+        std::vector<InputFiber> implicitKind = fibers;
+        implicitKind[1].links.front().adjacentExplicit = false;
         const GlobalResult fine =
-            vc3d::fiber_map::buildGlobalLayout(healed, umbilicus, defaultParams());
+            vc3d::fiber_map::buildGlobalLayout(implicitKind, umbilicus, defaultParams());
         QCOMPARE(fine.links.size(), std::size_t(1));
         QVERIFY(!fine.links.front().adjacentDisagrees);
         QVERIFY(fine.links.front().adjacent);
         QVERIFY(!fine.links.front().suspect);
+        QVERIFY(!(vc3d::fiber_map::digestGlobalResult(result) ==
+                  vc3d::fiber_map::digestGlobalResult(fine)));
+        QVERIFY(!(vc3d::fiber_map::digestGlobalInputs(fibers, umbilicus, defaultParams()) ==
+                  vc3d::fiber_map::digestGlobalInputs(implicitKind, umbilicus, defaultParams())));
     }
 
     // A pair that is not one H and one V has no inside: the link is an
