@@ -367,6 +367,16 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
     }
     attrs["note_axes_order"] = "ZYX (slice, row, col)";
 
+    // A non-positive baseVoxelSize means "unknown", not "1.0 units". Writing a
+    // scale of 1.0 in that case invents a physical measurement: readers cannot
+    // distinguish it from a real one, and the absence of a unit does not stop
+    // them multiplying by it. Omit the multiscales block instead -- the caller
+    // is responsible for having said so on stderr.
+    if (!(std::isfinite(baseVoxelSize) && baseVoxelSize > 0.0)) {
+        vc::writeZarrAttributes(outDir, attrs);
+        return;
+    }
+
     Json ms;
     ms["version"] = "0.4"; ms["name"] = "render";
     auto makeAxis = [&](const char* name) -> Json {

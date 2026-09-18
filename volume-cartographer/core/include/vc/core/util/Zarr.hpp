@@ -88,6 +88,11 @@ void createPyramidDatasets(const std::filesystem::path& outFile,
 // Write OME-Zarr .zattrs multiscales JSON. The declared scale is per-axis:
 // Z = baseVoxelSize * sliceStep, Y/X = baseVoxelSize / pixelsPerVoxel
 // (baseVoxelSize describes one source voxel at the rendered level).
+//
+// baseVoxelSize <= 0 means the physical size is unknown: the multiscales block
+// is then omitted entirely instead of writing a scale of 1.0. A
+// coordinateTransformations scale with no meaningful unit is a physical
+// measurement that was never made, and a reader cannot tell it from a real one.
 void writeZarrAttrs(const std::filesystem::path& outFile,
                     const std::filesystem::path& volPath, int groupIdx,
                     size_t baseZ, double sliceStep, double accumStep,
