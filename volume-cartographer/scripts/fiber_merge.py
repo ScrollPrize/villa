@@ -13,7 +13,9 @@ invariants, from LineAnnotationController.cpp / Atlas.cpp:
   1e-8 (validateFiberInputControlPoints); violating this makes the whole
   file unloadable. Consequence: control_points and line_points must always
   be written as a consistent pair from the same source.
-- C2: cross-fiber link reciprocity is index-exact across files, plus
+- C2: cross-fiber link reciprocity is index-exact across files (and both
+  refs of a pair agree on `pending` and on `adjacent`, the adjacent-winding
+  link kind), plus
   positions (1e-6) and directions.
 - C3: stored link directions must match tangents recomputed from
   line_points within ~0.26 deg (branchDirectionsCompatible, 1e-5 on
@@ -756,11 +758,115 @@ def _find_link(entries, branch, used):
     return None
 
 
+# A link across ADJACENT windings (VC3D FiberBranchRef::adjacent). A build
+# that knows the kind writes the key on EVERY entry, true or false; an
+# absent key means the entry was last written by something that does not
+# know it (an older VC3D drops unknown keys on save). That third state is
+# what tells a stripped flag from a deliberate re-link as an ordinary link:
+# a kind is never changed on an existing link, so `true` in the base turning
+# into an explicit `false` is a delete-and-relink and wins like any change,
+# while `true` turning into an absent key is a strip and a conflict.
+ADJACENT_KEY = 'adjacent'
+
+
+def _link_kind(entry):
+    """True / False for an explicit kind, None when the entry carries no key."""
+    if ADJACENT_KEY not in entry:
+        return None
+    return bool(entry.get(ADJACENT_KEY))
+
+
+def _link_adjacent(entry):
+    return _link_kind(entry) is True
+
+
+def _kind_stripped(entry, base_entry):
+    """The base knew the kind was adjacent and this copy carries no key at
+    all: an older writer saved it, not an annotator."""
+    return _link_kind(base_entry) is True and _link_kind(entry) is None
+
+
+def legacy_regression(doc, base_doc):
+    """Was `doc` saved by a writer that does not know the link kind since
+    its base (last-synced copy)? Such a save strips every adjacent flag and
+    may move anchors, so nothing about the kind in the file can be trusted.
+    Two signs, either enough:
+    - a link the base knew as adjacent is present with no key at all, or is
+      no longer found while some entry carries no key (moved by the older
+      writer, or deleted and a legacy entry added - indistinguishable);
+    - the base knew the kind on every entry (a knowing writer) and the
+      file now has an entry without it.
+    A base that itself carries legacy entries (copied in from an older
+    build's additions) proves nothing about those entries, which is why the
+    per-link sign comes first. Returns a message or None."""
+    if not (is_fiber_doc(doc) and is_fiber_doc(base_doc)):
+        return None
+    base_entries, _ = split_branches(base_doc)
+    entries, _ = split_branches(doc)
+    if not base_entries:
+        return None
+    any_legacy = any(_link_kind(entry) is None for entry in entries)
+    used = set()
+    for base_entry in base_entries:
+        if _link_kind(base_entry) is not True:
+            continue
+        index = _find_link(entries, base_entry, used)
+        if index is None:
+            if any_legacy:
+                return (f"the adjacent link to {_branch_target(base_entry) or '?'} the "
+                        "last-synced copy had is gone while a link entry carries no kind "
+                        "key (moved by an older VC3D?)")
+            continue
+        used.add(index)
+        if _link_kind(entries[index]) is None:
+            return (f"the adjacent link to {_branch_target(base_entry) or '?'} lost its "
+                    "kind key (saved by an older VC3D?)")
+    if any_legacy and all(_link_kind(entry) is not None for entry in base_entries):
+        return ("link entries lost their adjacent kind key (saved by an older VC3D?) "
+                "where the last-synced copy had it on every entry")
+    return None
+
+
+def _stripped_kind_conflicts(base_doc, local_doc, remote_doc):
+    """Every link the base knew as adjacent whose copy on a side carries no
+    key at all: an older writer saved that side. Checked before any
+    whole-document shortcut, so a stripped copy can never win by being
+    "identical to the other side" or "the only side that changed"."""
+    conflicts = []
+    if not (is_fiber_doc(base_doc) and is_fiber_doc(local_doc) and is_fiber_doc(remote_doc)):
+        return conflicts
+    base_entries, _ = split_branches(base_doc)
+    for side_name, doc in (('local', local_doc), ('remote', remote_doc)):
+        regression = legacy_regression(doc, base_doc)
+        if regression:
+            conflicts.append(f"{side_name}: {regression}")
+            continue
+        entries, _ = split_branches(doc)
+        used = set()
+        for base_entry in base_entries:
+            if _link_kind(base_entry) is not True:
+                continue
+            index = _find_link(entries, base_entry, used)
+            if index is None:
+                continue
+            used.add(index)
+            if _link_kind(entries[index]) is None:
+                conflicts.append(
+                    f"link to {_branch_target(base_entry) or '?'}: the adjacent kind is "
+                    f"missing on {side_name} (saved by an older VC3D?) where the base had it")
+    return conflicts
+
+
 def _link_modified(entry, base_entry):
     """The review state is the meaningful mutable field on a link; indices
-    and directions are derived and re-resolved elsewhere."""
+    and directions are derived and re-resolved elsewhere. A changed kind
+    (the pair re-linked as adjacent, or back) is a modification too: the
+    other side deleting the original must not delete the replacement. A
+    stripped kind counts as well - conservatively, so the copy survives for
+    the conflict below rather than being deleted."""
     return (bool(entry.get('pending', False)) !=
-            bool(base_entry.get('pending', False)))
+            bool(base_entry.get('pending', False)) or
+            _link_adjacent(entry) != _link_adjacent(base_entry))
 
 
 def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
@@ -768,7 +874,14 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
     either side survive; untouched-here-but-gone-there means deletion;
     approving a link beats deleting it; pending=False wins over
     pending=True for the same link. Local anchor indices are NOT touched
-    here — the caller re-anchors entries against the merged geometry."""
+    here — the caller re-anchors entries against the merged geometry.
+
+    Returns (merged, notes, stats, conflict_message_or_None). The kind of
+    a link (adjacent or ordinary) merges like the review state: the side
+    that changed it relative to the base wins, because a kind only changes
+    by delete-and-relink. Two conflicts are never guessed away: a side that
+    LOST the key altogether where the base had adjacent (an older VC3D saved
+    it), and two sides that disagree with no base to arbitrate."""
     base_entries, _ = split_branches(base_doc)
     local_entries, _ = split_branches(local_doc)
     remote_entries, _ = split_branches(remote_doc)
@@ -779,6 +892,7 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
              'links_deleted': 0, 'links_approved': 0}
     used_remote = set()
     used_base = set()
+    conflict = None
 
     def base_match(branch):
         index = _find_link(base_entries, branch, used_base)
@@ -798,8 +912,19 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
             merged.append(copy.deepcopy(entry))
             stats['links_added_%s' % side_name] += 1
             return
-        # Present in base, gone from the other side: deletion unless this
-        # side meaningfully modified it (approving a link beats deleting it).
+        # Present in base, gone from the other side. A copy that LOST the
+        # adjacent kind (an older writer's save) is neither a deletion nor a
+        # decision: a conflict.
+        if _kind_stripped(entry, base_entry):
+            nonlocal conflict
+            conflict = conflict or (
+                f"link to {entry.get('branch_file', '?')}: the adjacent kind is missing "
+                f"on {side_name} (saved by an older VC3D?) where the base had it, and "
+                f"the other side deleted the link")
+            merged.append(copy.deepcopy(entry))
+            return
+        # Deletion unless this side meaningfully modified it (approving a
+        # link beats deleting it).
         if not _link_modified(entry, base_entry):
             stats['links_deleted'] += 1
             notes.append(f"link to {entry.get('branch_file', '?')} deleted on "
@@ -818,6 +943,30 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
         used_remote.add(remote_index)
         base_entry = base_match(local_entry)
         remote_entry = remote_entries[remote_index]
+        target_name = _branch_target(local_entry) or '?'
+        kind_winner = None
+        if base_entry is not None:
+            stripped_sides = [name for name, entry in (('local', local_entry),
+                                                       ('remote', remote_entry))
+                              if _kind_stripped(entry, base_entry)]
+            if stripped_sides:
+                conflict = (f"link to {target_name}: the adjacent kind is missing on "
+                            f"{' and '.join(stripped_sides)} (saved by an older VC3D?) "
+                            f"where the base had it")
+        if _link_adjacent(local_entry) != _link_adjacent(remote_entry):
+            if base_entry is None:
+                conflict = conflict or (
+                    f"link to {target_name} is an adjacent-winding link on "
+                    f"{'local' if _link_adjacent(local_entry) else 'remote'} "
+                    f"and an ordinary link on the other side")
+            elif conflict is None:
+                # One side re-linked the pair as the other kind; that side wins.
+                base_adjacent = _link_adjacent(base_entry)
+                kind_winner = (local_entry if _link_adjacent(local_entry) != base_adjacent
+                               else remote_entry)
+                notes.append(f"link to {target_name} re-linked as "
+                             f"{'adjacent' if _link_adjacent(kind_winner) else 'ordinary'} on "
+                             f"{'local' if kind_winner is local_entry else 'remote'}")
         local_pending = bool(local_entry.get('pending', False))
         remote_pending = bool(remote_entry.get('pending', False))
         if local_pending != remote_pending:
@@ -831,13 +980,20 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
             else:
                 # No base entry to arbitrate: prefer the approved state.
                 chosen = remote_entry if local_pending else local_entry
+        else:
+            chosen = local_entry if prefer_local else remote_entry
+        if kind_winner is not None:
+            # A re-link is a new entry: its kind AND its review state (a new
+            # link starts pending) come from the side that made it.
+            chosen = kind_winner
+        # Review-state bookkeeping on the FINAL choice: a re-link that beat
+        # an approval is not an approval.
+        if local_pending != remote_pending:
             if bool(chosen.get('pending', False)):
                 notes.append(f"link to {_branch_target(chosen) or '?'} "
                              "re-flagged as pending")
             else:
                 stats['links_approved'] += 1
-        else:
-            chosen = local_entry if prefer_local else remote_entry
         merged.append(copy.deepcopy(chosen))
         stats['links_kept'] += 1
 
@@ -845,7 +1001,7 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
         if i not in used_remote:
             merge_one_sided(remote_entry, 'remote')
 
-    return merged, notes, stats
+    return merged, notes, stats, conflict
 
 
 def _has_trace_span(doc):
@@ -1008,6 +1164,10 @@ def merge_fibers(base, local, remote):
         return sorted({_branch_target(entry) for entry in links_to_any(doc)} |
                       {_branch_target(entry) for entry in links_to_any(base)})
 
+    stripped = _stripped_kind_conflicts(base, local, remote)
+    if stripped:
+        result['conflicts'] = stripped
+        return result
     if local == remote or remote == base:
         merged = copy.deepcopy(local)
         result.update(ok=True, merged=merged,
@@ -1039,8 +1199,14 @@ def merge_fibers(base, local, remote):
     prefer_local = generation_local >= generation_remote
     newer = local if prefer_local else remote
 
-    merged_branches, branch_notes, branch_stats = merge_branches(
+    merged_branches, branch_notes, branch_stats, branch_conflict = merge_branches(
         base, local, remote, prefer_local)
+    if branch_conflict:
+        result['conflicts'] = [branch_conflict]
+        return result
+    # Legacy entries (no kind key) pass through untouched: normalising them
+    # here would make the consistency pass rewrite every peer of a merely
+    # re-opened fiber. The per-link regression check does not need it.
 
     geometry_same = (_seq_eq(local['control_points'], remote['control_points'])
                      and _seq_eq(local['line_points'], remote['line_points']))
@@ -1241,14 +1407,41 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
         set_field(entry, key, _snapped_direction(entry.get(key), tangent),
                   doc_flag)
 
-    def snap_pending(entry, desired, doc_flag):
-        if bool(entry.get('pending', False)) == desired:
+    def snap_flag(entry, key, desired, doc_flag):
+        """A boolean written as true or absent, never false."""
+        if bool(entry.get(key, False)) == desired:
             return
         if desired:
-            entry['pending'] = True
+            entry[key] = True
         else:
-            entry.pop('pending', None)
+            entry.pop(key, None)
         out[doc_flag] = True
+
+    def snap_pending(entry, desired, doc_flag):
+        snap_flag(entry, 'pending', desired, doc_flag)
+
+    # A's merge is the decided truth for this pair - unless A itself lost
+    # the adjacent kind the base knew (an older writer saved A): then A
+    # decides nothing about the kind, whatever B says.
+    if base_doc is not None and is_fiber_doc(base_doc):
+        regression = legacy_regression(a, base_doc)
+        if regression:
+            out['conflicts'].append(f"link {a_name} -> {b_name}: {a_name}: {regression}")
+            return out
+        base_used = set()
+        for base_entry in links_to(base_doc, b_name):
+            if _link_kind(base_entry) is not True:
+                continue
+            index = _find_link(a_entries, base_entry, base_used)
+            if index is None:
+                continue
+            base_used.add(index)
+            if _link_kind(a_entries[index]) is None:
+                out['conflicts'].append(
+                    f"link {a_name} -> {b_name}: {a_name} carries no adjacent kind "
+                    f"(saved by an older VC3D?) where its base had it")
+        if out['conflicts']:
+            return out
 
     used_reciprocals = []
     for entry in a_entries:
@@ -1284,6 +1477,13 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
             None)
         if reciprocal is not None:
             used_reciprocals.append(reciprocal)
+            # Decided before anything on B is touched: an A without a kind
+            # facing a B that says adjacent leaves B exactly as it was.
+            if _link_kind(entry) is None and _link_adjacent(reciprocal):
+                out['conflicts'].append(
+                    f"link {a_name} -> {b_name}: {a_name} carries no adjacent kind "
+                    f"(saved by an older VC3D?) while {b_name} says adjacent")
+                continue
         if reciprocal is None:
             reciprocal = {
                 'control_point_index': far_index,
@@ -1298,6 +1498,8 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
             }
             if entry.get('pending', False):
                 reciprocal['pending'] = True
+            if _link_kind(entry) is not None:
+                reciprocal[ADJACENT_KEY] = _link_kind(entry)
             b['branches'] = _branches_of(b) + [reciprocal]
             out['b_changed'] = True
             out['notes'].append(f"restored reciprocal link {b_name} -> {a_name}")
@@ -1314,6 +1516,14 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
             # Review state stays in lockstep on both refs, as VC3D keeps it.
             snap_pending(reciprocal, bool(entry.get('pending', False)),
                          'b_changed')
+            # So does the link's kind, when A states one: an explicit kind on
+            # A is written onto B. A carrying NO key while B says adjacent is
+            # an older writer's save of A, not a decision - a conflict, never
+            # a strip of B.
+            a_kind = _link_kind(entry)
+            if a_kind is not None and _link_kind(reciprocal) != a_kind:
+                reciprocal[ADJACENT_KEY] = a_kind
+                out['b_changed'] = True
 
     # Pairs present in the base but absent from merged A were deleted by
     # the merge: mirror the deletion. Unrelated B->A entries (pairs A never
