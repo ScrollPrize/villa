@@ -973,6 +973,40 @@ def test_legacy_regression_requires_base_adjacent_entries(has_array):
     assert result['ok'] and 'adjacent_branches' not in result['merged']
 
 
+def test_full_merge_preserves_an_absent_adjacent_array():
+    """All three inputs lack adjacent_branches and both sides edited tags,
+    so no whole-document shortcut applies and the full merge runs. It must
+    not manufacture an empty array: that reads as "deliberately no adjacent
+    links" and would hide a peer's missing reciprocal from the sync check
+    and from the loader's repair."""
+    base = make_fiber(BASE_CPS)
+    del base['adjacent_branches']
+    local = copy.deepcopy(base)
+    local['tags'] = ['x']
+    local['generation'] = 2
+    remote = copy.deepcopy(base)
+    remote['tags'] = ['y']
+    remote['generation'] = 2
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert 'adjacent_branches' not in result['merged']
+    assert 'branches' in result['merged']
+    assert loader_issues({'dj_x_000001.json': result['merged']}) == []
+    # Same when only the BASE knew the kind: it contributes no entries, so
+    # an empty array on it says nothing about what the two saved files know.
+    known_base = make_fiber(BASE_CPS)
+    assert known_base['adjacent_branches'] == []
+    result = merge_fibers(known_base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert 'adjacent_branches' not in result['merged']
+    # An input that knows the kind still yields an explicit empty array.
+    knowing = copy.deepcopy(local)
+    knowing['adjacent_branches'] = []
+    result = merge_fibers(base, knowing, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['adjacent_branches'] == []
+
+
 def test_merge_kind_mismatch_without_a_base_is_a_conflict():
     entry = link('kb_a.json', BASE_CPS[2], OTHER, 2)
     result = merge_fibers(make_fiber(BASE_CPS),

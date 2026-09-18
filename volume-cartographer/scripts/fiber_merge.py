@@ -1219,7 +1219,19 @@ def merge_fibers(base, local, remote):
         notes.append("hv_classification is stale for the merged geometry; "
                      "VC3D recomputes it on load")
     for kind in BRANCH_ARRAYS:
-        merged[kind] = merged_branches[kind] + opaque_branches[kind]
+        entries = merged_branches[kind] + opaque_branches[kind]
+        if not entries and all(kind not in doc for doc in (local, remote)):
+            # Neither content side carried the array and the merge produced
+            # nothing for it: writing one would turn "a legacy writer saved
+            # this, the kind is unknown" into "deliberately none", which
+            # hides a peer's missing reciprocal from the sync check and
+            # stops the loader restoring it. The base is deliberately not
+            # consulted: it only arbitrates deletions and contributes no
+            # entries, so its own array says nothing about what the two
+            # saved files know - and a base with real adjacent entries
+            # facing a stripped side is already a hard conflict above.
+            continue
+        merged[kind] = entries
         if opaque_branches[kind]:
             notes.append(f"{len(opaque_branches[kind])} unparseable {kind} "
                          "entries carried through unchanged")
