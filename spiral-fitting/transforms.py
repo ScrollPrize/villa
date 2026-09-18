@@ -286,12 +286,12 @@ class PinnedGapExpandingTransform(GapExpandingTransform):
     The parent's winding radii are blended with constraints from ``pin_table``
     (:class:`pins.PinTable`) in intermediate-radius space. The resulting
     radius deformation is composed with the free map, with exact full-strength
-    pins unless constraints conflict. The fused Triton path is bypassed:
-    every call runs the eager pinned arithmetic,
+    pins unless constraints conflict. Anchor construction stays eager; CUDA
+    interval evaluation uses the uncapped Triton forward/backward kernel,
     chunked over points to bound the ``[chunk, windings]`` intermediates.
     """
 
-    def __init__(self, *args, pin_table, chunk_size=16384, **kwargs):
+    def __init__(self, *args, pin_table, chunk_size=65536, **kwargs):
         super().__init__(*args, **kwargs)
         self.pin_table = pin_table
         self.chunk_size = int(chunk_size)
@@ -536,10 +536,6 @@ def ray_specialized_spiral_to_scroll(
         parts = list(getattr(base, 'parts', None) or []) or None
     if not parts or not isinstance(parts[0], GapExpandingTransform):
         return None
-    if getattr(parts[0], 'pin_table', None) is not None:
-        # The pinned gap stage is not a per-ray table gather; use the generic
-        # (pinned) transform instead.
-        return None
     gap, rest = parts[0], parts[1:]
     flip = None
     if rest and isinstance(rest[0], pyro.distributions.transforms.AffineTransform):
@@ -553,28 +549,32 @@ def ray_specialized_spiral_to_scroll(
 
     dr = gap.dr_per_winding
     theta_norm = theta / (2 * torch.pi)
-    # Per-ray transformed winding radii (differentiable through logits + dr;
-    # includes the truncate_frac warm-up lerp exactly like the eager path).
-    pre_pin_winding_radii = gap.get_transformed_winding_radii(theta, z)
-    num_windings = pre_pin_winding_radii.shape[-1]
+    if isinstance(gap, PinnedGapExpandingTransform):
+        transformed_radius = pins_module.pinned_map_inverse_rays(
+            radii, gap.ray_map(theta, z), pair_id)
+    else:
+        # Per-ray transformed winding radii (differentiable through logits + dr;
+        # includes the truncate_frac warm-up lerp exactly like the eager path).
+        pre_pin_winding_radii = gap.get_transformed_winding_radii(theta, z)
+        num_windings = pre_pin_winding_radii.shape[-1]
 
-    # Eager _call per-sample pipeline, with per-ray quantities gathered.
-    tn_s = theta_norm[pair_id]
-    shifted = (radii - tn_s * dr).clamp(min=0.)
-    inner = torch.floor(shifted / dr).to(torch.int64).clip(
-        min=0, max=num_windings - 2)
-    # Flat per-sample gather from the per-ray table; never materialize the
-    # [samples, windings] expansion. F.embedding rather than plain indexing:
-    # index backward is a pathological _index_put_impl_ accumulate here,
-    # embedding_dense_backward is the fused gather-accumulate kernel.
-    flat_table = pre_pin_winding_radii.reshape(-1, 1)
-    flat_idx = pair_id * num_windings + inner
-    r_in = F.embedding(flat_idx, flat_table).squeeze(-1)
-    r_out = F.embedding(flat_idx + 1, flat_table).squeeze(-1)
-    original_inner = (inner + tn_s) * dr
-    original_outer = original_inner + dr
-    frac = (radii - original_inner) / (original_outer - original_inner)
-    transformed_radius = torch.lerp(r_in, r_out, frac)
+        # Eager _call per-sample pipeline, with per-ray quantities gathered.
+        tn_s = theta_norm[pair_id]
+        shifted = (radii - tn_s * dr).clamp(min=0.)
+        inner = torch.floor(shifted / dr).to(torch.int64).clip(
+            min=0, max=num_windings - 2)
+        # Flat per-sample gather from the per-ray table; never materialize the
+        # [samples, windings] expansion. F.embedding rather than plain indexing:
+        # index backward is a pathological _index_put_impl_ accumulate here,
+        # embedding_dense_backward is the fused gather-accumulate kernel.
+        flat_table = pre_pin_winding_radii.reshape(-1, 1)
+        flat_idx = pair_id * num_windings + inner
+        r_in = F.embedding(flat_idx, flat_table).squeeze(-1)
+        r_out = F.embedding(flat_idx + 1, flat_table).squeeze(-1)
+        original_inner = (inner + tn_s) * dr
+        original_outer = original_inner + dr
+        frac = (radii - original_inner) / (original_outer - original_inner)
+        transformed_radius = torch.lerp(r_in, r_out, frac)
     sin_s, cos_s = sin_t[pair_id], cos_t[pair_id]
     x_sign = -1.0 if flip is not None else 1.0
     pts = torch.stack([
@@ -751,9 +751,16 @@ class SpiralAndTransform(nn.Module):
             return None
         device = registry.zyx.device
         counts = torch.bincount(registry.component, minlength=registry.num_components).to(torch.float32)
-        fraction = sample_count / num_pins
-        quota = torch.clamp(torch.floor(counts * fraction), min=1.0)
-        quota = torch.where(counts > 0, torch.minimum(quota, counts), torch.zeros_like(quota))
+        present = counts > 0
+        budget = min(num_pins, max(sample_count, int(present.sum())))
+        remaining = budget - int(present.sum())
+        capacity = (counts - 1).clamp(min=0)
+        share = capacity * (remaining / max(float(capacity.sum()), 1.0))
+        quota = share.floor() + present.to(counts.dtype)
+        extra = budget - int(quota.sum())
+        if extra:
+            winners = torch.argsort(share - share.floor(), descending=True, stable=True)[:extra]
+            quota[winners] += 1
         # Rank each pin within its component by a random key.
         key = torch.rand([num_pins], device=device)
         order = torch.argsort(registry.component.to(torch.float64) * 2.0 + key.to(torch.float64))
@@ -776,7 +783,7 @@ class SpiralAndTransform(nn.Module):
         return (float(self.cfg.get('model_pin_kernel_max_theta_radians', 0.25)),
                 float(self.cfg.get('model_pin_kernel_max_z_voxels', 200.0)))
 
-    def compute_pins(self, shared=None, registry=None, chunk_size=None, subsample=False):
+    def compute_pins(self, shared=None, registry=None, chunk_size=None, subsample=False, full=None):
         """Push the registry through the flow chain.
 
         Returns ``pins`` ``[P, 4]`` = ``(z, theta, r, dr (T + n))`` in
@@ -786,12 +793,28 @@ class SpiralAndTransform(nn.Module):
         (with the graph attached the whole registry goes through at once).
         With ``subsample`` (the training step) only the stratified subset of
         ``sample_count_pins`` registry pins is pushed; export and
-        diagnostics use the full registry.
+        diagnostics use the full registry. The subset is redrawn when the
+        pin table's layout is due for a rebuild (``model_pin_rebin_interval``
+        steps, see ``build_pin_table``) and kept in between, so the amortised
+        layout can actually be reused.
         """
+        if full is not None:
+            subsample = not full
         registry = self.pin_registry if registry is None else registry
         dr = shared[0] if shared is not None else self.get_dr_per_winding()
         transform = self.get_slice_to_intermediate_transform(shared)
-        subset = self.sample_pin_subset(self.cfg.get('sample_count_pins', 0)) if subsample else None
+        subset = None
+        if subsample:
+            sample_count = int(self.cfg.get('sample_count_pins', 0) or 0)
+            interval = int(self.cfg.get('model_pin_rebin_interval', 1) or 1)
+            previous = getattr(self, '_pin_view', None)
+            if (interval > 1 and previous is not None and previous.get('indices') is not None
+                    and previous.get('sample_count') == sample_count
+                    and previous.get('registry_pins') == registry.num_pins
+                    and getattr(self, '_pin_groups_age', 0) < interval):
+                subset = (previous['indices'], previous['eps_theta_sampled'], previous['eps_z_sampled'])
+            else:
+                subset = self.sample_pin_subset(sample_count)
         if subset is None:
             self._pin_view = {
                 'indices': None, 'component': registry.component,
@@ -805,7 +828,9 @@ class SpiralAndTransform(nn.Module):
                 'indices': indices, 'component': registry.component[indices],
                 'eps_theta': eps_theta, 'eps_z': eps_z, 'kind': registry.kind[indices],
                 'n0': registry.n0[indices], 'theta0': registry.theta0[indices],
-                'local_gap': registry.local_gap[indices], 'num_pins': int(indices.numel())}
+                'local_gap': registry.local_gap[indices], 'num_pins': int(indices.numel()),
+                'eps_theta_sampled': eps_theta, 'eps_z_sampled': eps_z,
+                'sample_count': sample_count, 'registry_pins': registry.num_pins}
             zyx = registry.zyx[indices]
         view = self._pin_view
         if chunk_size is None and not torch.is_grad_enabled():
@@ -853,13 +878,55 @@ class SpiralAndTransform(nn.Module):
             return True
         return bool((self._pin_slots != self._pin_slots_next).any())
 
+    @torch.no_grad()
+    def refresh_pin_footprints(self, pins):
+        """Refresh own-object spacings from available grid/chain neighbours.
+
+        Missing sampled neighbours retain the stratified thinning estimate;
+        legacy registries without adjacency retain their saved widths.
+        """
+        registry, view = self.pin_registry, self._pin_view
+        if registry.neighbours is None or not pins.shape[0]:
+            return
+        indices = view['indices']
+        if indices is None:
+            neighbours = registry.neighbours
+        else:
+            lookup = torch.full((registry.num_pins,), -1, device=pins.device, dtype=torch.long)
+            lookup[indices] = torch.arange(indices.numel(), device=pins.device)
+            original = registry.neighbours[indices]
+            neighbours = lookup[original.clamp(min=0)]
+            neighbours = torch.where(original >= 0, neighbours, -1)
+        present = neighbours >= 0
+        safe = neighbours.clamp(min=0)
+        dt = pins_module.wrap_angle(pins[safe, 1] - pins[:, None, 1]).abs()
+        dz = (pins[safe, 0] - pins[:, None, 0]).abs()
+        spacing_t = torch.where(present, dt, 0.).amax(dim=1)
+        spacing_z = torch.where(present, dz, 0.).amax(dim=1)
+        rule = pins_module.FootprintRule(
+            spacing_factor=float(self.cfg.get('model_pin_kernel_spacing_factor', 1.5)),
+            min_arc_voxels=float(self.cfg.get('model_pin_kernel_min_arc_voxels', 3.)),
+            min_z_voxels=float(self.cfg.get('model_pin_kernel_min_z_voxels', 3.)),
+            max_theta_radians=self._pin_footprint_caps()[0], max_z_voxels=self._pin_footprint_caps()[1])
+        eps_t, eps_z = rule.apply(spacing_t, spacing_z, pins[:, 2])
+        # Complete neighbours reproduce the stage-2a grid/chain spacing rule.
+        # Partial training neighbourhoods keep their wider sampling estimate.
+        original_neighbours = registry.neighbours if indices is None else registry.neighbours[indices]
+        complete = (original_neighbours != -1).sum(1) == present.sum(1)
+        new_t = torch.where(complete, eps_t, view['eps_theta'])
+        new_z = torch.where(complete, eps_z, view['eps_z'])
+        self._pin_footprint_drift = max(float(((new_t / view['eps_theta']) - 1).abs().max()),
+                                        float(((new_z / view['eps_z']) - 1).abs().max()))
+        view['eps_theta'], view['eps_z'] = new_t, new_z
+
     def build_pin_table(self, pins, coincidence_frac, conflict_tolerance, dr=None,
                         rebin_interval=1):
         """Rasterise ``pins`` into a :class:`pins.PinTable`.
 
         The slot assignment and coincidence groups are rebuilt whenever any
         pin's slot changed; otherwise the cached groups are reused
-        and only the differentiable values and the cells are refreshed.
+        and fresh differentiable values reuse the detached CSR layout until
+        its interval expires or a member crosses a bin margin.
         """
         registry = self.pin_registry
         view = self._pin_view
@@ -868,7 +935,31 @@ class SpiralAndTransform(nn.Module):
         min_z = float(self.flow_min_corner_zyx[0])
         max_z = float(self.flow_max_corner_zyx[0])
         settings_key = (float(coincidence_frac), float(conflict_tolerance))
-        if self.pin_groups_stale(settings_key, rebin_interval):
+        cached = getattr(self, '_pin_layout_cache', None)
+        crossed = False
+        if cached is not None and not self.pin_slots_changed():
+            # Raw member movement is checked against its original cells, so
+            # stale coincidence groups cannot mask movement across a margin.
+            for cells, order, tb, zb in cached['raw_bins']:
+                now_t, now_z = cells.bin_of(pins[order, 1].detach(), pins[order, 0].detach())
+                if not torch.equal(now_t, tb) or not torch.equal(now_z, zb):
+                    crossed = True
+                    break
+            if not crossed and self._pin_groups.num_groups != pins.shape[0]:
+                group = self._pin_groups.group
+                ng = self._pin_groups.num_groups
+                with torch.no_grad():
+                    mt = torch.atan2(pins_module._segment_mean(pins[:, 1].sin(), group, ng),
+                                     pins_module._segment_mean(pins[:, 1].cos(), group, ng)) % (2 * torch.pi)
+                    mz = pins_module._segment_mean(pins[:, 0], group, ng)
+                    for c in cached['classes']:
+                        tb, zb = c['cells'].bin_of(mt[c['order']], mz[c['order']])
+                        if not torch.equal(tb, c['bin_theta']) or not torch.equal(zb, c['bin_z']):
+                            crossed = True
+                            break
+        rebuild = self.pin_groups_stale(settings_key, rebin_interval) or crossed or cached is None
+        if rebuild:
+            self.refresh_pin_footprints(pins)
             self._pin_slots = self._pin_slots_next
             self._pin_slots_indices = view.get('indices')
             self._pin_groups_key = settings_key
@@ -884,10 +975,24 @@ class SpiralAndTransform(nn.Module):
                     kinds=view['kind'])
             self._pin_rebuilds += 1
         self._pin_groups_age = getattr(self, '_pin_groups_age', 0) + 1
-        return pins_module.PinTable(
+        if not rebuild:
+            view['eps_theta'], view['eps_z'] = cached['eps_theta'], cached['eps_z']
+        table = pins_module.PinTable(
             pins[:, 0], pins[:, 1], pins[:, 2], pins[:, 3], self._pin_slots,
             view['eps_theta'], view['eps_z'], num_slots, min_z, max_z, dr,
-            groups=self._pin_groups, num_registry_pins=view['num_pins'])
+            groups=self._pin_groups, num_registry_pins=view['num_pins'],
+            layout=None if rebuild else cached['classes'])
+        if rebuild:
+            raw_bins = []
+            with torch.no_grad():
+                for c in table.classes:
+                    # A group belongs to one footprint class; test all its members.
+                    member = torch.isin(table._group, c['order']).nonzero().flatten()
+                    tb, zb = c['cells'].bin_of(pins[member, 1], pins[member, 0])
+                    raw_bins.append((c['cells'], member, tb, zb))
+            self._pin_layout_cache = {'classes': table.classes, 'raw_bins': raw_bins,
+                                      'eps_theta': view['eps_theta'], 'eps_z': view['eps_z']}
+        return table
 
     @property
     def pin_conflicts(self):

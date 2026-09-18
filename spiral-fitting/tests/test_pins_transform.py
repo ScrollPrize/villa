@@ -569,7 +569,7 @@ def test_coincidence_groups_follow_moving_pins():
     with torch.no_grad():
         model.pin_registry.zyx[merged[0], 0] -= 30.0
     model.get_slice_to_spiral_transform()
-    assert int(model.merged_pin_mask().sum()) == 0   # not re-merged: age < interval
+    assert int(model.merged_pin_mask().sum()) == 2   # bin crossing forces safe rebuild
 
 
 def test_checkpoint_resume_preserves_pin_frame_after_seam_crossing():

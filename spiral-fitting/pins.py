@@ -168,12 +168,32 @@ class PinnedRayMap:
         return torch.minimum(result, minimum_between(last, torch.full_like(last, float('inf'))))
 
 
+def _piecewise_triton(query, knot_x, knot_y, knot_counts, ray_id=None):
+    from gap_triton import gap_triton_available, pinned_affine_map
+    if not gap_triton_available(query, knot_x, knot_y):
+        return None
+    valid = torch.arange(knot_x.shape[1] - 1, device=knot_x.device)[None] + 1 < knot_counts[:, None]
+    span = torch.where(valid, knot_x[:, 1:] - knot_x[:, :-1], 1.)
+    scale = torch.where(valid, (knot_y[:, 1:] - knot_y[:, :-1]) / span, 1.)
+    scale = torch.cat([scale, torch.ones_like(knot_x[:, :1])], dim=1)
+    result = pinned_affine_map(query, knot_x, knot_x, knot_y, scale, knot_counts, ray_ids=ray_id)
+    # This radius deformation uses unit slope also below its fixed origin.
+    first_x = knot_x[:, 0] if ray_id is None else knot_x[ray_id, 0]
+    first_y = knot_y[:, 0] if ray_id is None else knot_y[ray_id, 0]
+    if ray_id is None and query.ndim == 2:
+        first_x, first_y = first_x[:, None], first_y[:, None]
+    return torch.where(query <= first_x, query + first_y - first_x, result)
+
+
 def piecewise_linear_map(query, knot_x, knot_y, knot_counts):
     """Map pin-only knots with unit-slope extrapolation at both ends.
 
     Each row includes the origin and may contain no other valid knots.
     Padding is excluded from searches and interpolation arithmetic.
     """
+    fused = _piecewise_triton(query, knot_x, knot_y, knot_counts)
+    if fused is not None:
+        return fused
     squeeze = query.dim() == 1
     if squeeze:
         query = query[:, None]
@@ -191,6 +211,40 @@ def piecewise_linear_map(query, knot_x, knot_y, knot_counts):
     return result.squeeze(-1) if squeeze else result
 
 
+def piecewise_linear_map_rays(query, knot_x, knot_y, knot_counts, ray_id):
+    """Evaluate shared ray knots without expanding a samples-by-knots table."""
+    fused = _piecewise_triton(query, knot_x, knot_y, knot_counts, ray_id)
+    if fused is not None:
+        return fused
+    lo = torch.zeros_like(ray_id)
+    hi = knot_counts[ray_id]
+    for _ in range(knot_x.shape[1].bit_length()):
+        mid = (lo + hi) // 2
+        value = knot_x.detach()[ray_id, mid.clamp(max=knot_x.shape[1] - 1)]
+        below = (mid < knot_counts[ray_id]) & (value < query.detach())
+        lo = torch.where(below, mid + 1, lo)
+        hi = torch.where(below, hi, mid)
+    interior = (lo > 0) & (lo < knot_counts[ray_id])
+    left = torch.minimum((lo - 1).clamp(min=0), knot_counts[ray_id] - 1)
+    right = torch.minimum(lo, knot_counts[ray_id] - 1)
+    x0, x1 = knot_x[ray_id, left], knot_x[ray_id, right]
+    y0, y1 = knot_y[ray_id, left], knot_y[ray_id, right]
+    span = torch.where(interior, x1 - x0, torch.ones_like(x0))
+    return torch.where(interior, torch.lerp(y0, y1, (query - x0) / span), query + y0 - x0)
+
+
+def pinned_map_inverse_rays(c, ray_map, ray_id):
+    """Canonical samples sharing a ray reuse its free table and pin knots."""
+    table, dr = ray_map.pre_pin_winding_radii, ray_map.dr
+    tn = ray_map.theta_norm[ray_id]
+    inner = torch.floor((c.detach() - tn.detach() * dr.detach()).clamp(min=0) / dr.detach())
+    inner = inner.long().clamp(0, table.shape[1] - 2)
+    u = torch.lerp(table[ray_id, inner], table[ray_id, inner + 1],
+                   (c - (inner + tn) * dr) / dr)
+    return piecewise_linear_map_rays(u, ray_map.unpinned_anchors,
+                                    ray_map.radius_anchors, ray_map.anchor_counts, ray_id)
+
+
 def _merge_equal_targets(R, S, w, valid):
     """Combine equal canonical targets by support-weighted radius.
 
@@ -198,6 +252,11 @@ def _merge_equal_targets(R, S, w, valid):
     an invertible map. Their disagreement is reported, and zero support
     contributes neither to the representative radius nor its strength.
     """
+    # Compact to the valid columns first: rays carry far fewer anchors than
+    # there are winding slots, and every dense op below scales with width.
+    order = torch.argsort((~valid).to(torch.int32), dim=-1, stable=True)
+    count = int(valid.sum(dim=-1).max()) if valid.numel() else 0
+    R, S, w, valid = (torch.gather(a, -1, order)[:, :max(count, 1)] for a in (R, S, w, valid))
     order = torch.argsort(torch.where(valid, S.detach(), float('inf')), dim=-1, stable=True)
     R, S, w, valid = (torch.gather(a, -1, order) for a in (R, S, w, valid))
     width = S.shape[-1]
@@ -243,16 +302,8 @@ def _transparent_radius_corrections(u, desired_radius, weight, valid):
     sub = -(1. - w) * lam
     sup = -(1. - w) * (1. - lam)
     rhs = w * torch.where(valid, desired_radius - u, torch.zeros_like(u))
-    diag = [torch.ones_like(u[:, 0])]
-    values = [rhs[:, 0]]
-    for j in range(1, u.shape[-1]):
-        factor = sub[:, j] / diag[-1]
-        diag.append(1. - factor * sup[:, j - 1])
-        values.append(rhs[:, j] - factor * values[-1])
-    delta = [values[-1] / diag[-1]]
-    for j in range(u.shape[-1] - 2, -1, -1):
-        delta.append((values[j] - sup[:, j] * delta[-1]) / diag[j])
-    delta = torch.stack(delta[::-1], dim=-1)
+    from gap_triton import tridiagonal_solve
+    delta = tridiagonal_solve(sub, torch.ones_like(u), sup, rhs)
     return torch.where(w >= 1., desired_radius, u + delta)
 
 
@@ -435,6 +486,16 @@ def _accumulate_anchor_sums(theta_q, z_q, cells, pin_theta, pin_z, pin_eps_theta
     """
     num_queries = theta_q.shape[0]
     dtype = mass.dtype
+    from gap_triton import anchor_sums
+    fused = anchor_sums(
+        theta_q, z_q, pin_theta, pin_z, pin_r, pin_target_shifted, dr,
+        offsets=cells.offsets, pin_eps_theta=pin_eps_theta, pin_eps_z=pin_eps_z,
+        pin_slot=pin_slot, n_theta=cells.n_theta, n_z=cells.n_z,
+        theta_width=cells.theta_width, z_width=cells.z_width, min_z=cells.min_z,
+        radius_theta=cells.radius_theta, radius_z=cells.radius_z, num_slots=num_slots) \
+        if torch.is_tensor(dr) else None
+    if fused is not None:
+        return mass + fused[0], R_sum + fused[1], S_sum + fused[2]
     q_idx, p_idx = cells.gather_pairs(theta_q.detach(), z_q.detach())
     if q_idx.numel() == 0:
         return mass, R_sum, S_sum
@@ -580,26 +641,37 @@ def compute_coincidence_groups(theta, z, slot, component, n, r, eps_theta,
         (np.ones(len(rows), dtype=np.int8), (rows, cols)), shape=(num, num))
     num_groups, labels = scipy.sparse.csgraph.connected_components(
         adjacency, directed=False)
-    labels_t = torch.from_numpy(labels.astype(np.int64)).to(device)
-    counts = torch.bincount(labels_t, minlength=num_groups)
-    multi = torch.nonzero(counts > 1, as_tuple=True)[0]
+    labels = labels.astype(np.int64)
+    labels_t = torch.from_numpy(labels).to(device)
+    counts = np.bincount(labels, minlength=num_groups)
     conflicts = []
-    if multi.numel():
+    if (counts > 1).any():
+        # Host-side grouping of the multi-member groups only (no per-pin
+        # device round trips), then per-group conflict checks in numpy.
+        multi_pins = np.nonzero(counts[labels] > 1)[0]
+        multi_pins = multi_pins[np.argsort(labels[multi_pins], kind='stable')]
+        multi_labels = labels[multi_pins]
+        boundaries = np.nonzero(np.diff(multi_labels))[0] + 1
+        member_lists = np.split(multi_pins, boundaries)
         r_cpu = r.detach().cpu().numpy()
         gap_cpu = local_gap.detach().cpu().numpy()
         comp_cpu = component.cpu().numpy()
         n_cpu = n.cpu().numpy()
         kinds_cpu = kinds.cpu().numpy() if kinds is not None else None
-        members_by_group = collections.defaultdict(list)
-        for pin_idx, label in enumerate(labels):
-            if counts[label] > 1:
-                members_by_group[int(label)].append(pin_idx)
-        for label, members in members_by_group.items():
-            radii = r_cpu[members]
-            spread = float(radii.max() - radii.min())
-            tolerance = conflict_tolerance * float(gap_cpu[members].min())
+        # Vectorised spread/tolerance per group; only conflicts are listed.
+        group_max = np.full(num_groups, -np.inf)
+        group_min = np.full(num_groups, np.inf)
+        group_gap = np.full(num_groups, np.inf)
+        np.maximum.at(group_max, multi_labels, r_cpu[multi_pins])
+        np.minimum.at(group_min, multi_labels, r_cpu[multi_pins])
+        np.minimum.at(group_gap, multi_labels, gap_cpu[multi_pins])
+        for members in member_lists:
+            label = int(labels[members[0]])
+            spread = float(group_max[label] - group_min[label])
+            tolerance = conflict_tolerance * float(group_gap[label])
             if spread < tolerance:
                 continue
+            members = [int(m) for m in members]
             same = (len({int(comp_cpu[m]) for m in members}) == 1
                     and len({int(n_cpu[m]) for m in members}) == 1)
             conflicts.append({
@@ -643,7 +715,7 @@ class PinTable:
     """
 
     def __init__(self, z, theta, r, r_target_shifted, slot, eps_theta, eps_z,
-                 num_slots, min_z, max_z, dr, groups=None, num_registry_pins=None):
+                 num_slots, min_z, max_z, dr, groups=None, num_registry_pins=None, layout=None):
         device = theta.device
         self.dr = dr
         num_pins = theta.shape[0]
@@ -691,6 +763,9 @@ class PinTable:
         with torch.no_grad():
             theta_d, z_d, _, _ = self._values()
         slot = slot.clamp(0, self.num_slots - 1)
+        if layout is not None:
+            self.classes = layout
+            return
         # Footprint classes: octaves of each width, keyed jointly.
         if self.num_pins:
             class_theta = torch.ceil(torch.log2(eps_theta / eps_theta.min().clamp(min=1e-9))).to(torch.int64)
@@ -710,6 +785,8 @@ class PinTable:
                 'cells': cells, 'order': order,
                 'eps_theta': eps_theta[order], 'eps_z': eps_z[order],
                 'slot': slot[order],
+                'bin_theta': cells.bin_of(theta_d[order], z_d[order])[0],
+                'bin_z': cells.bin_of(theta_d[order], z_d[order])[1],
             })
 
     def _values(self):
@@ -1019,6 +1096,7 @@ class PinRegistry:
     # the patch contributed no pins.
     patch_component: torch.Tensor
     patch_offset: torch.Tensor
+    neighbours: torch.Tensor | None = None  # own-object grid/chain adjacency, -1 = absent
 
     @property
     def num_pins(self):
@@ -1040,6 +1118,7 @@ class PinRegistry:
             'fingerprint': self.fingerprint, 'local_gap': self.local_gap.cpu(),
             'patch_component': self.patch_component.cpu(),
             'patch_offset': self.patch_offset.cpu(),
+            'neighbours': self.neighbours.cpu() if self.neighbours is not None else None,
         }
 
     @classmethod
@@ -1053,7 +1132,8 @@ class PinRegistry:
             initial_T=state['initial_T'].to(device), fingerprint=str(state['fingerprint']),
             consistency_report={}, local_gap=state['local_gap'].to(device),
             patch_component=state['patch_component'].to(device),
-            patch_offset=state['patch_offset'].to(device))
+            patch_offset=state['patch_offset'].to(device),
+            neighbours=state['neighbours'].to(device) if state.get('neighbours') is not None else None)
 
     def adjusted_n(self, theta):
         """``n_i(t) = n_i(0) + round((theta0_i - theta_i(t)) / 2pi)``."""
@@ -1264,6 +1344,8 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
     # -- emit pins --------------------------------------------------------
     pin_zyx, pin_comp, pin_n, pin_theta, pin_kind = [], [], [], [], []
     spacing_theta, spacing_z, pin_z = [], [], []
+    neighbours = []
+    emitted = 0
     for i, node in enumerate(graph.nodes):
         if node.kind != 'patch':
             continue
@@ -1286,6 +1368,18 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
         crossing_map.assert_no_pending_potential_errors()
         sp_t, sp_z = grid_neighbour_spacing(theta_g, z_g, valid_t)
         sel = valid_t.reshape(-1)
+        ids = torch.full(valid_t.shape, -1, dtype=torch.long, device=device)
+        ids[valid_t] = torch.arange(int(valid_t.sum()), device=device) + emitted
+        adjacent = []
+        for axis, shift in ((0, 1), (0, -1), (1, 1), (1, -1)):
+            other = ids.roll(shift, axis)
+            if axis == 0:
+                other[0 if shift > 0 else -1, :] = -1
+            else:
+                other[:, 0 if shift > 0 else -1] = -1
+            adjacent.append(other[valid_t])
+        neighbours.append(torch.stack(adjacent, dim=-1))
+        emitted += int(valid_t.sum())
         pin_zyx.append(zyx_g.reshape(-1, 3).to(device)[sel])
         pin_theta.append(theta_g.reshape(-1)[sel])
         pin_z.append(z_g.reshape(-1)[sel])
@@ -1331,6 +1425,11 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
             sp_t[here] = torch.maximum(torch.nan_to_num(sp_t[here], nan=0.0), dt)
             sp_z[here] = torch.maximum(torch.nan_to_num(sp_z[here], nan=0.0), dz)
             kinds[here] = PIN_KIND_CHAIN
+        node_to_pin = {int(node): emitted + j for j, node in enumerate(idx)}
+        adjacent = torch.full((len(idx), 4), -1, dtype=torch.long, device=device)
+        for column, neighbour_idx in enumerate((prev_idx, next_idx)):
+            adjacent[:, column] = torch.tensor([node_to_pin.get(int(i), -2 if i >= 0 else -1) for i in neighbour_idx], device=device)
+        neighbours.append(adjacent)
         pin_zyx.append(zyx)
         pin_theta.append(theta_p)
         pin_z.append(z_p)
@@ -1402,7 +1501,8 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
         fixed_T=fixed_T_t, fixed_T_value=fixed_T_value_t, initial_T=initial_T,
         fingerprint=graph.fingerprint(), consistency_report=consistency_report,
         local_gap=local_gap.to(torch.float32),
-        patch_component=patch_component.to(device), patch_offset=patch_offset.to(device))
+        patch_component=patch_component.to(device), patch_offset=patch_offset.to(device),
+        neighbours=cat(neighbours, torch.int64, (0, 4)))
 
 
 def _patch_quad_grid(patch_atlas, patch_index, stride, with_node_ids=True):

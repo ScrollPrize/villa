@@ -295,8 +295,8 @@ _PIN_DESCRIPTIONS = {
         "Verified patches with quad centres within this distance are linked "
         "into one pin component (the same sheet observed twice); 0 disables."),
     "model_pin_rebin_interval": (
-        "Steps between rebuilds of the pin coincidence groups; slot or "
-        "pin-set changes always rebuild."),
+        "Steps between pin CSR, footprint and coincidence rebuilds; slot, "
+        "pin-set and spatial bin crossings always force a safe rebuild."),
 }
 
 _OPTIMIZER_DESCRIPTIONS = {
