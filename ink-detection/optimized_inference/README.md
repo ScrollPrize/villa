@@ -41,7 +41,9 @@ GPU-accelerated, containerized inference for ink detection models. The GPU image
 - `TILE_SIZE`: Sets both the tile extraction size and network input size. Larger values = more context but more memory. Should match training size for best results (typically 64)
 - `STRIDE`: Controls overlap between tiles. Smaller stride = more overlap = smoother blending but slower inference
 - `BATCH_SIZE`: Number of tiles to process in parallel. Larger values = faster but more GPU memory. Reduce if you encounter OOM errors
-- `resnet3d-152-3d-decoder`: Best aligned with the tracked 3D-decoder checkpoints when using `TILE_SIZE=256` and a 62-layer window such as `START_LAYER=1`, `END_LAYER=63`
+- `resnet3d-152-3d-decoder`: Best aligned with the tracked 3D-decoder checkpoints when using `TILE_SIZE=256` and a 62-layer window.
+  **Centre that window in the surface volume rather than starting it at layer 1**: for the 109-layer surface volumes in the open-data bucket that is `START_LAYER=23`, `END_LAYER=85`.
+  Measured against the published `new_canon_autoresearch_recipe` predictions on four scrolls (PHerc. 1667, PHerc. 0139, PHercParis4, PHerc. 0814), `START_LAYER=1` agrees at Pearson r 0.62 to 0.91, while the best window in each case (`START_LAYER` 21 to 25) reaches 0.90 to 0.99.
 
 ### S3 layout (expected)
 
