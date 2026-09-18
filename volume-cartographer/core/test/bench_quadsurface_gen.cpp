@@ -107,3 +107,46 @@ TEST_CASE("QuadSurface::gen bench: warm cache path is faster than cold")
     // robust on shared CI hardware while still catching a broken cache reuse.
     CHECK(tWarm < tCold);
 }
+
+TEST_CASE("QuadSurface::gen bench: smooth mode cost relative to linear")
+{
+    // The Smooth (bicubic) mode reads 16 taps per pixel instead of 4, and
+    // differentiates the basis to get the normal, but it drops the separate
+    // nearest-normal warp and its second pass over the destination buffer.
+    // Both cases are WARM (caches built once), so this isolates the warp.
+    const cv::Mat_<cv::Vec3f> grid = makeWavyGrid(kGrid, kGrid);
+    const cv::Size tile(kTile, kTile);
+    const cv::Vec3f ptr(0, 0, 0);
+    const cv::Vec3f offset(0, 0, 1.5f);
+
+    auto run = [&](GenInterpolation mode) {
+        QuadSurface s(grid.clone(), cv::Vec2f(1.f, 1.f));
+        s.setGenInterpolation(mode);
+        { // warm-up: build _normalCache, _validMaskCache and the support mask
+            cv::Mat_<cv::Vec3f> c, n;
+            s.gen(&c, &n, tile, ptr, 1.0f, offset);
+        }
+        return timeIt([&]() {
+            for (int i = 0; i < kIters; ++i) {
+                cv::Mat_<cv::Vec3f> coords, normals;
+                const float scale = (i % 2) ? 1.0f : 0.5f;
+                s.gen(&coords, &normals, tile, ptr, scale, offset);
+            }
+        });
+    };
+
+    const double tLinear = run(GenInterpolation::Linear);
+    const double tSmooth = run(GenInterpolation::Smooth);
+
+    const double tilePixels = double(kTile) * double(kTile) * double(kIters);
+    std::printf("\nQuadSurface::gen smooth-mode bench (grid %d^2, tile %d^2, %d iters)\n",
+                kGrid, kTile, kIters);
+    std::printf("  LINEAR: %.3f s  (%.1f Mpixel/s)\n", tLinear, tilePixels / tLinear / 1e6);
+    std::printf("  SMOOTH: %.3f s  (%.1f Mpixel/s)\n", tSmooth, tilePixels / tSmooth / 1e6);
+    std::printf("  smooth / linear: %.2fx\n\n", tSmooth / tLinear);
+
+    // A deliberately loose bound: it is there to catch an algorithmic blunder
+    // (an accidental per-pixel allocation, or the support mask being rebuilt
+    // every call), not to pin a ratio on shared CI hardware.
+    CHECK(tSmooth < tLinear * 12.0);
+}

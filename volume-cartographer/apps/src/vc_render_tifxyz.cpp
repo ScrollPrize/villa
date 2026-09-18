@@ -1047,6 +1047,15 @@ int main(int argc, char *argv[])
         // left-handed frame. So --flip-normals is usually what we want: it negates N so the
         // slice stack grows in front of the sheet rather than behind it.
         ("flip-normals", po::bool_switch()->default_value(false), "Negate surface normals (reverses slice ordering along the normal)")
+        // How the surface itself is resampled, as opposed to how the volume is
+        // sampled along the normal (which is always trilinear here).
+        ("surface-interpolation", po::value<std::string>()->default_value("linear"),
+            "Surface resampling: linear (bilinear positions, nearest-neighbour normals) or "
+            "smooth/bicubic (Catmull-Rom positions with normals differentiated from the same "
+            "basis). The source grid is far coarser than the render, so linear leaves the normal "
+            "constant across each grid cell and every offset layer steps at the cell edges; "
+            "smooth removes those steps and the creases between them, at ~3-5x the surface-warp "
+            "cost (a few percent end to end).")
         ("zarr-output", po::value<std::string>(), "Output path for .zarr (optional)")
         ("zarr-compressor", po::value<std::string>()->default_value("blosc"), "Zarr compressor: blosc, zstd, gzip, lz4, none")
         ("zarr-compression-level", po::value<int>()->default_value(-1), "Zarr compression level (<=0 = compressor default)")
@@ -1197,6 +1206,15 @@ int main(int argc, char *argv[])
     else if (accum_type_str == "alpha")  accumType = AccumType::Alpha;
     else if (accum_type_str == "beerlam" || accum_type_str == "beerlambert") accumType = AccumType::BeerLambert;
     else { logPrintf(stderr, "Error: invalid --accum-type\n"); return EXIT_FAILURE; }
+
+    std::string surf_interp_str = parsed["surface-interpolation"].as<std::string>();
+    std::transform(surf_interp_str.begin(), surf_interp_str.end(), surf_interp_str.begin(),
+                   [](unsigned char c){ return char(std::tolower(c)); });
+    GenInterpolation genInterp;
+    if      (surf_interp_str == "linear") genInterp = GenInterpolation::Linear;
+    else if (surf_interp_str == "smooth" || surf_interp_str == "bicubic")
+        genInterp = GenInterpolation::Smooth;
+    else { logPrintf(stderr, "Error: invalid --surface-interpolation\n"); return EXIT_FAILURE; }
 
     // alpha/beerlambert reducers only make sense over a collapsed band, so they always imply
     // composite mode. --composite-collapse extends the same band-collapsing path to max/mean/median,
@@ -1436,6 +1454,8 @@ int main(int argc, char *argv[])
     }
     if (flip_axis >= 0) logPrintf(stdout, "Flip: %s\n", flip_axis == 0 ? "V" : flip_axis == 1 ? "H" : "Both");
     if (g_flipNormals) logPrintf(stdout, "Flip normals: on\n");
+    if (genInterp == GenInterpolation::Smooth)
+        logPrintf(stdout, "Surface interpolation: smooth (bicubic)\n");
 
     if (wantZarr) {
         if (auto p = std::filesystem::path(zarrOutputArg).parent_path(); !p.empty())
@@ -1477,6 +1497,15 @@ int main(int argc, char *argv[])
                 logPrintf(stderr, "Warning: ABF++ failed, using original\n");
             }
         }
+
+        // Set the surface resampling mode here, AFTER the --flatten block above
+        // (which does surf.reset() and would drop it) and BEFORE both the
+        // prefetch planning pass and the render pass. The planner re-runs
+        // gen() itself to work out which chunks the render will touch, so if
+        // this moved below it the planner and the sampler would disagree
+        // silently: prefetching chunks that are never read and missing ones
+        // that are.
+        surf->setGenInterpolation(genInterp);
 
         // Replace sentinel -1 with NaN
         auto* raw_points = surf->rawPointsPtr();
