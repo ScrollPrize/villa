@@ -485,6 +485,12 @@ TEST_CASE("stats: startup scan ignores files newer than its cutoff")
     const auto target = persist / "level_0" / "0" / "0";
     writeSizedFile(target / "0.bin", 31);
     writeSizedFile(target / "1.empty", 1);
+
+    // Stamp the "too new" file before the cache exists. The scan runs on a worker
+    // thread with a cutoff taken at construction, so writing this file afterwards
+    // races the scan: on a slower filesystem the scan can read post.bin before the
+    // future timestamp is applied and count it. Preparing it up front keeps the
+    // timestamp strictly greater than the cutoff without depending on timing.
     writeSizedFile(target / "post.bin", 17);
     std::error_code ec;
     fs::last_write_time(
