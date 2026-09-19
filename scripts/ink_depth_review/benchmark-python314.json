@@ -1,0 +1,25 @@
+{
+  "official_commit": "b218ace879d3239a63047e1e2039f327929d283e",
+  "official_module": "vesuvius/src/vesuvius/label_zarr.py",
+  "executed": [
+    "create_label_group",
+    "create_label_array"
+  ],
+  "official_roundtrip_voxel_equal": true,
+  "official_LABEL_SLICE": 32,
+  "sample_voxels": 4259840,
+  "candidate_voxels": 42662,
+  "candidate_regions": 100,
+  "search_support_voxels": 558688,
+  "candidate_fraction_of_search_support": 0.07636104587891632,
+  "seconds_5_runs": [
+    0.26748608400157536,
+    0.2576711250003427,
+    0.252534667000873,
+    0.24257820800266927,
+    0.24471558300137985
+  ],
+  "seconds_median": 0.252534667000873,
+  "precision_recall": "not measured; no verified 3D ground truth",
+  "human_time_saved": "not measured"
+}

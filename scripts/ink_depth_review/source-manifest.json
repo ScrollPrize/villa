@@ -1,0 +1,102 @@
+{
+  "source": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/",
+  "segment": "w00_20231016151002",
+  "coordinate_system": "surface-volume depth,y,x; NOT native scroll ZYX",
+  "pyramid_level": 0,
+  "origin_dyx": [
+    0,
+    13568,
+    24832
+  ],
+  "shape": [
+    65,
+    256,
+    256
+  ],
+  "selection": "median nonzero coordinate of coarse ink label tile level 5, y=3 x=6; then 2x2 level-0 chunks",
+  "missing_label_chunks_404_fill_zero": [
+    "w00_20231016151002_inklabels.zarr/0/0/106/195"
+  ],
+  "files": [
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002.zarr/0/.zarray",
+      "bytes": 368,
+      "sha256": "bade179b836a88ab5613c6d2a2d1c888e347229d8d742f12b79074343ff82aa3"
+    },
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002.zarr/0/0.106.194",
+      "bytes": 797741,
+      "sha256": "9721b19c1e2a33817b796c4bec504d7eb02aa26fa7317ca25da3afcff6bdb2a5"
+    },
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002.zarr/0/0.106.195",
+      "bytes": 844284,
+      "sha256": "87d3163e38f787a534469683997b8337fc0944de005d86c24eef855dcc085e0f"
+    },
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002.zarr/0/0.107.194",
+      "bytes": 753708,
+      "sha256": "71e6f3ee836a34d749c77bf66d141aacc6040e7ed459905ece12e7a000acd97b"
+    },
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002.zarr/0/0.107.195",
+      "bytes": 715074,
+      "sha256": "568b2c67858652edf940a0032ef337ee85000242303a2d1cb2c8ff323cb9c69e"
+    },
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002_inklabels.zarr/0/.zarray",
+      "bytes": 400,
+      "sha256": "d8029b44cf690767df297cda292ad3305b8a7adfe05592ed74da21e5350322fc"
+    },
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002_inklabels.zarr/0/0/106/194",
+      "bytes": 310,
+      "sha256": "6badabb14908dbc91c6d2e69f0db2c4fde6e37168fec8034e96b1ca1e38669dd"
+    },
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002_inklabels.zarr/0/0/107/194",
+      "bytes": 304,
+      "sha256": "e7b847aa7e9f7913f387be6ecbcfffec95b0c3603a461ba27e0e2234f6af74d1"
+    },
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002_inklabels.zarr/0/0/107/195",
+      "bytes": 306,
+      "sha256": "dcb43090c011b0ef99d90597d9f87070a06b4bbc0d8a59c48f933be74be9d3ab"
+    },
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002_inklabels.zarr/5/.zarray",
+      "bytes": 398,
+      "sha256": "ada1c48f48178e03311ad11aa31b34549b0dd7826575617a5939a338aa10fa4a"
+    },
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002_inklabels.zarr/5/0/3/6",
+      "bytes": 456,
+      "sha256": "05c29de325feb853a91f0cc97097f63ffe936d2ff16a5074f526e49fd0975f11"
+    },
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002_supervision_mask.zarr/0/.zarray",
+      "bytes": 400,
+      "sha256": "d8029b44cf690767df297cda292ad3305b8a7adfe05592ed74da21e5350322fc"
+    },
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002_supervision_mask.zarr/0/0/106/194",
+      "bytes": 338,
+      "sha256": "d9b64711697ff341fbe9bc63eaf26d9a99fffaf3a9a9ea088bcb30283720eafb"
+    },
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002_supervision_mask.zarr/0/0/106/195",
+      "bytes": 338,
+      "sha256": "d9b64711697ff341fbe9bc63eaf26d9a99fffaf3a9a9ea088bcb30283720eafb"
+    },
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002_supervision_mask.zarr/0/0/107/194",
+      "bytes": 338,
+      "sha256": "d9b64711697ff341fbe9bc63eaf26d9a99fffaf3a9a9ea088bcb30283720eafb"
+    },
+    {
+      "url": "https://huggingface.co/buckets/scrollprize/datasets/resolve/ink/phercparis4/w00_20231016151002/w00_20231016151002_supervision_mask.zarr/0/0/107/195",
+      "bytes": 338,
+      "sha256": "d9b64711697ff341fbe9bc63eaf26d9a99fffaf3a9a9ea088bcb30283720eafb"
+    }
+  ]
+}
