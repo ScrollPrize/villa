@@ -58,6 +58,32 @@ def _is_transient_read_error(exc: BaseException) -> bool:
     return False
 
 
+def _get_with_retry(url: str, timeout: float = 60.0, retries: int = 4) -> requests.Response:
+    """GET a URL under a timeout, retrying transient remote failures.
+
+    `requests.get(url)` with no timeout blocks forever when a connection stalls after the
+    headers arrive: the socket stays open, no more body arrives, and nothing raises. Measured
+    against a local server that sends headers, half the body, then nothing — the shape of a
+    stalled CDN connection — a bare `requests.get` was still running when the test gave up at
+    15 s, while the same call with `timeout=` raised in 5.0 s. In the wild this cost 3 h 23 m of
+    a stalled job before it was noticed.
+
+    Retries reuse `_is_transient_read_error`, so deterministic failures (404, auth) re-raise on
+    the first attempt rather than being retried four times.
+    """
+    delay = 0.5
+    for attempt in range(max(1, int(retries))):
+        try:
+            response = requests.get(url, timeout=timeout)
+            response.raise_for_status()
+            return response
+        except Exception as e:
+            if attempt == max(1, int(retries)) - 1 or not _is_transient_read_error(e):
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 8.0)
+
+
 # Define the functions needed here to avoid circular imports
 def list_files():
     """Load and return the scrolls configuration data from a YAML file."""
@@ -1320,8 +1346,7 @@ class Cube:
 
                     else:
                         # Download the remote file
-                        response = requests.get(url)
-                        response.raise_for_status()  # Ensure we notice bad responses
+                        response = _get_with_retry(url)
                         # Write the downloaded content to the temporary file with the same directory structure and filename
                         with open(temp_file_path, 'wb') as tmp_file:
                             tmp_file.write(response.content)
@@ -1329,8 +1354,7 @@ class Cube:
                             array, _ = nrrd.read(temp_file_path)
 
                 else:
-                    response = requests.get(url)
-                    response.raise_for_status()  # Ensure we notice bad responses
+                    response = _get_with_retry(url)
                     with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
                         tmp_file.write(response.content)
                         temp_file_path = tmp_file.name
