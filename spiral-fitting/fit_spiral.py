@@ -6167,6 +6167,7 @@ class FitContext:
                 cfg=self.config,
                 z_begin=self.z_begin,
                 z_end=self.z_end,
+                base_shape_zyx=self.base_shape_zyx,
                 flow_field_radius=self.flow_field_radius,
                 flow_min_corner_spiral_zyx=self.flow_min_corner_spiral_zyx,
                 flow_max_corner_spiral_zyx=self.flow_max_corner_spiral_zyx,

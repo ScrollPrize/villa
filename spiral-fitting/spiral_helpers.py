@@ -1468,6 +1468,25 @@ def _build_spliced_overlay(
           f'{batch_count} batches, {elapsed:.2f}s')
 
 
+def _invalid_mesh_nodes(scroll_zyxs, z_begin, z_end, base_shape_zyx=None):
+    """Nodes that must not be written as surface, as a boolean mask.
+
+    A node is invalid when its z leaves the fitted band, which is the only
+    case this ever tested; when any of its coordinates is not finite, which
+    a transform can return and which json.dump then writes into meta.json as
+    the bare literal NaN, outside RFC 8259 and refused by a strict reader;
+    and when it lies outside the scroll, which the writer can only tell for
+    a dataset whose scroll spec states its base_shape_zyx.
+    """
+    invalid = ~torch.isfinite(scroll_zyxs).all(dim=-1)
+    invalid |= (scroll_zyxs[..., 0] < z_begin) | (scroll_zyxs[..., 0] >= z_end)
+    invalid |= (scroll_zyxs[..., 1] < 0) | (scroll_zyxs[..., 2] < 0)
+    if base_shape_zyx is not None:
+        invalid |= ((scroll_zyxs[..., 1] >= base_shape_zyx[1])
+                    | (scroll_zyxs[..., 2] >= base_shape_zyx[2]))
+    return invalid
+
+
 @torch.inference_mode()
 def save_mesh(
     slice_to_spiral_transform,
@@ -1484,6 +1503,7 @@ def save_mesh(
     winding_range,
     patch_satisfaction_evaluation,
     patch_atlas,
+    base_shape_zyx=None,
     tracks=(),
     run_tag=None,
     name='mesh',
@@ -1517,8 +1537,9 @@ def save_mesh(
             progress.update(chunk_number)
     scroll_zyxs = torch.cat(scroll_pieces, dim=0).reshape(*spiral_zyxs.shape)
 
-    out_of_roi = (scroll_zyxs[..., 0] < z_begin) | (scroll_zyxs[..., 0] >= z_end)
-    scroll_zyxs[out_of_roi] = -1.0
+    invalid_nodes = _invalid_mesh_nodes(
+        scroll_zyxs, z_begin, z_end, base_shape_zyx)
+    scroll_zyxs[invalid_nodes] = -1.0
 
     spliced_scroll_zyxs = scroll_zyxs.clone()
     _build_spliced_overlay(
