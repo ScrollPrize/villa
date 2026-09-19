@@ -428,6 +428,15 @@ def load_tifxyz(path, *, z_range=None):
 def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source):
     path = f'{path}/{uuid}'
     os.makedirs(path, exist_ok=True)
+    # A node that is not finite is not a vertex. Written as it comes it is
+    # counted valid by `zyxs != -1` below, so one NaN puts the bare literal
+    # NaN into meta.json's bbox, which RFC 8259 does not allow and a strict
+    # reader refuses, and every reader that recomputes validity from the
+    # tifs reads that node as surface. merge_concat_runs already sets the
+    # sentinel on its own grids before calling here; do it for every caller.
+    non_finite = ~np.isfinite(zyxs).all(axis=-1)
+    if non_finite.any():
+        zyxs = np.where(non_finite[..., None], np.float32(-1.0), zyxs)
     Image.fromarray(np.asarray(zyxs[..., 2], dtype=np.float32)).save(f'{path}/x.tif')
     Image.fromarray(np.asarray(zyxs[..., 1], dtype=np.float32)).save(f'{path}/y.tif')
     Image.fromarray(np.asarray(zyxs[..., 0], dtype=np.float32)).save(f'{path}/z.tif')
