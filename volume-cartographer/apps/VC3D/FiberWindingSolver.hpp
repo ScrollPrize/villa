@@ -26,7 +26,8 @@
 //    noise. The weak inside form absorbs same-winding contacts at equality;
 //    a contact whose noise flips the sign costs a winding of separation,
 //    accepted rather than guessed away.
-//  - Links: annotated same-crossing ties between two fibers' control points,
+//  - Links: annotated ties between two fibers' control points - the same
+//    winding, or with LinkInput::windingOffset an adjacent one -
 //    an integer equality on k with confidence from the angular residual.
 //  - Local radial ordering: along any ray from the umbilicus the windings stay
 //    radially ordered even when crumpling destroys their spacing. This never
@@ -98,6 +99,15 @@ struct LinkInput {
     std::size_t pointA = 0;
     std::size_t fiberB = 0;
     std::size_t pointB = 0;
+    // The winding gap the link asserts, W_B(pointB) - W_A(pointA): 0 for an
+    // ordinary same-winding tie, -1 or +1 for an adjacent-winding link (the
+    // V fiber one winding inside the H fiber).
+    int windingOffset = 0;
+    // The link carries no constraint (an adjacent link between fibers that
+    // are not one H and one V: an annotation error the caller reports). It
+    // keeps its slot so per-link results stay index-aligned; its turn
+    // error stays unset.
+    bool skip = false;
 };
 
 // Lengths in voxels, like the layout's own parameters. Defaults are the

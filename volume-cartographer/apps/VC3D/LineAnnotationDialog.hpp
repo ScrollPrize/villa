@@ -229,6 +229,9 @@ signals:
     void generatedControlPointLinkCandidateRequested(const std::string& surfaceName,
                                                      size_t controlPointIndex,
                                                      cv::Vec3f volumePoint);
+    void generatedControlPointAdjacentLinkCandidateRequested(const std::string& surfaceName,
+                                                             size_t controlPointIndex,
+                                                             cv::Vec3f volumePoint);
     void generatedControlPointLinkWithCandidateRequested(const std::string& surfaceName,
                                                          size_t controlPointIndex,
                                                          cv::Vec3f volumePoint);

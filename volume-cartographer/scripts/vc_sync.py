@@ -676,6 +676,26 @@ class S3SyncManager:
         return os.path.join(os.path.dirname(target),
                             '.' + os.path.basename(target) + '.s3sync-staged')
 
+    def _fiber_legacy_regression(self, path, tracked):
+        """For a fiber file about to be uploaded as a plain local change: the
+        message when it lost an adjacent_branches array that held links
+        (fiber_merge.legacy_regression), else None. Anything unreadable is
+        not a regression - the ordinary paths deal with it."""
+        if not path.lower().endswith('.json') or not tracked:
+            return None
+        try:
+            with open(os.path.join(self.local_dir, path)) as f:
+                local_doc = json.load(f)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if not fiber_merge.is_fiber_doc(local_doc):
+            return None
+        base_doc = self._load_base(path, tracked)
+        if base_doc is None:
+            return None
+        message = fiber_merge.legacy_regression(local_doc, base_doc)
+        return f"Local fiber {message}" if message else None
+
     def _load_base(self, path, tracked):
         """Return the parsed last-synced (base) version of a file, or None.
 
@@ -1622,7 +1642,14 @@ class S3SyncManager:
                                              f"Both local and {self.REMOTE_NAME} "
                                              "modified since last sync")
                     elif local_changed:
-                        actions[path] = (SyncAction.UPLOAD, "Local file modified")
+                        regression = self._fiber_legacy_regression(path, tracked_info)
+                        if regression:
+                            # An older VC3D on this machine saved a fiber whose
+                            # last-synced copy knew its links' kinds: uploading
+                            # it would spread the loss. Manual resolution.
+                            actions[path] = (SyncAction.CONFLICT, regression)
+                        else:
+                            actions[path] = (SyncAction.UPLOAD, "Local file modified")
                     elif s3_changed:
                         actions[path] = (SyncAction.DOWNLOAD,
                                          f"{self.REMOTE_NAME} file modified")
