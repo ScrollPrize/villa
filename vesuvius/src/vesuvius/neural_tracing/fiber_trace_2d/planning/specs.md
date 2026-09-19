@@ -1,5 +1,118 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Explicit contrast-choice benchmarks (2026-09-18)
+
+- A packaged contrast case binds one directed forward reference, which is the
+  sole evaluation ground truth, and one or more explicit competing choice
+  lines. A choice only defines the allowed traversal scope for a backend: a
+  fiberlet corridor radius or a skeleton crop tube. It never enters evaluation.
+- Every choice carries a role. Current roles are
+  `competing-pre-restart-beam-trace` for a saved beam segment and
+  `companion-fiber-hypothesis` for a user-supplied alternative annotation.
+- `manifest.json` and `manifest_unrestricted.json` are produced together. The
+  unrestricted manifest drops `contrast_choices` from every case and is the
+  control whose scope is the reference alone.
+- Packaging accepts several cases in one manifest. Reference and choice hashes
+  are verified on copy and again at binding; duplicates are rejected.
+- A choice may omit `vc_open_data_coordinate_space` or
+  `vc_open_data_source_original_resolution` when the source annotation has lost
+  its export provenance. The packaging records the absent keys in
+  `unverified_coordinate_bindings`, and the Python runner and native CLI accept
+  exactly those. A stated binding must still agree with the reference.
+- Contrast choices are accepted by the `fiberlet` and `skeleton` backends. A
+  packaged root is immutable evidence; corrections are published as a new
+  versioned package.
+
+## Skeleton-topology least-squares tracing prototype (2026-09-18)
+
+- `backend: "skeleton"` is a diagnostic replay backend. Its crop is scoped to a
+  tube around the benchmark reference and every explicit choice, so its numbers
+  are ground-truth relative and are not comparable to unscoped full-cohort
+  results. It is not a production tracer.
+- Pipeline, in order: threshold the stored presence at one configured
+  `threshold_u8` and drop components below `min_component_voxels`; thin with
+  Lee's algorithm at full resolution, with no downsampling, so neighbouring
+  fibers keep their separation; contract the 26-neighbour voxel graph; merge
+  junctions joined by a bridge shorter than `junction_merge_max_base`, prune
+  terminal spurs shorter than `spur_prune_max_base`, suppress degree-two nodes;
+  cut every edge incident to a junction at `entry_offset_base` to place a
+  port,
+  or place one shared midpoint port when the bridge is shorter than two
+  offsets; give each port its lateral candidates from the section of the
+  prediction; refine each line once per pair of end candidates; then resolve
+  every region over candidates.
+- The threshold is one ordinary configuration parameter, swept through
+  benchmark configs. It is never selected from ground truth at runtime.
+- The skeleton is topology only. The thresholded fibre section is a ribbon,
+  narrow across the sheet and wide along it, and presence does not say where
+  along the sheet the fibre runs, so a port's position along the sheet is left
+  to the tracing. Each port carries sub-ports: the centre of its section and
+  the two extremes along the long axis, an extreme counting only beyond
+  `candidate_min_offset_base` from the centre, each centred by a small
+  presence step in the section plane. The section is measured at the thinning
+  voxel and restricted to the piece of the mask it lies in.
+- Every line variant (one per pair of sub-ports at its ends) and every region
+  connection (one per pair of sub-ports on different ports of the region) is
+  initialised by the cheapest path through the thresholded prediction between
+  its two sub-ports, in a corridor of `search_radius_base` around the skeleton
+  piece, under the tracing metric's presence and direction terms with the
+  smoothness terms off; then refined with Ceres, ends fixed; and kept. It is
+  never the skeleton's own voxels, which run between merged fibres; those are
+  the fallback only when the mask does not connect the sub-ports.
+- Nothing is chosen ahead of tracing. Each sub-port records the cheapest
+  variant into the line from its side and the cheapest connection into the
+  region, so a segment with three entry and three exit sub-ports carries six
+  routes. The tracer walks sub-port to sub-port along those entries; the seed
+  follows the entry route of the sub-port it enters through. The seam centre
+  of a wide section is a routing target only when `route_through_centre` is
+  set; the centre of a narrow section, being its single sub-port, always is.
+- Refinement is Ceres Levenberg-Marquardt over a uniformly resampled polyline
+  with both endpoints fixed and one shared spacing scalar, so a line may grow or
+  shrink while its points stay evenly spread. Presence, direction and the
+  Lasagna normal are trilinear interpolations of the eight grid corners around
+  each vertex, batch-loaded by a `ceres::EvaluationCallback` before every
+  evaluation, so normals are resampled at each solver step and derivatives flow
+  through the interpolation.
+- The objective mirrors the length-scaled shared discrete metric: each residual
+  is the square root of the corresponding discrete term, so squared residuals
+  reproduce its weighting and order. Documented deviations are the
+  invalid-prediction penalty saturating at one per voxel instead of four, the
+  absence of a free angle, a 1e-3 floor inside the alignment square root, and
+  fixed rather than free terminal ends. The beam tracer's unscaled per-step form
+  and its cumulative tangent term are not mirrored.
+- A region's connections follow the region's graph path between two ports,
+  are initialised by the path search between the two sub-ports and refined
+  with both fixed. No matching is enumerated: every connection is kept and
+  each sub-port records its cheapest one. A region with more than `max_ports`
+  items is reported through `port_limit_exceeded` and left unrouted; it is
+  never silently truncated. The fiberlet dynamic program
+  and graph search are not used anywhere in this backend, and neither is the
+  weighted anchor fit.
+- Evaluation reuses the shared reference replay core unchanged: seeding on the
+  reference, forward matching, the threshold ellipse with the tangential factor
+  from the evaluation config, excursion grace, a pending excursion at
+  termination counting as a failure, failure records, and the deterministic
+  reset by `nominal_step_base`. The segment runner emits at `step_base`, so its
+  step budget is scaled by the ratio of the two. Termination reasons are
+  `no_skeleton_seed`, `skeleton_terminal`, `unmatched_port`, `tube_boundary` and
+  `region_unresolved`. A seed outside the acceptance ellipsoid is a counted
+  failure and is never credited as traced coverage.
+- Stored-grid sampling is the offline path, so the backend binds the ungated
+  prediction field and requires a published cache over its crop. Each crop
+  reports its scoped and missing voxel counts; a crop with no published
+  coverage raises rather than producing an empty topology.
+- Artifacts per case: `trace.json` carrying the generic `geometry_backend`
+  label `skeleton`, `skeleton.json` (`vc_skeleton_trace` version 1) with the
+  configuration, stage statistics and timings, reduced graph, ports, lines, and
+  every region's connections and scored matchings, plus `skeleton_graph.obj` and
+  `skeleton_routes.obj` in base XYZ. Rendering is allowed.
+- Determinism: one solver thread, fixed residual insertion order, ordered
+  containers wherever iteration affects output, and lexicographic tie-breaking
+  among matchings. Identical inputs produce identical artifacts.
+- Portability: lookup tables are generated as plain data, with no intrinsics or
+  OS-specific code, and no dependency beyond the Ceres and Eigen already linked
+  into `vc_fiber_tracer`.
+
 ## Benchmark documentation
 
 - `docs/benchmark_runbook.md` is the central benchmark index. It must label the

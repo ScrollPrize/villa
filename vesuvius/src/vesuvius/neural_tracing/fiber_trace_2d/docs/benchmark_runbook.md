@@ -19,6 +19,7 @@ manual run.
 | Anchor-only short200 | **Current diagnostic** | Measure anchor placement/gaps without path construction or tracing | [method](anchor_coverage.md), [result](benchmarks/short200_anchor_coverage_u22000_20260916.md) |
 | Corrected mini5 | **Fast diagnostic** | Iterate on anchor/fiberlet construction and search before short200 | [current corrected result](benchmarks/mini5_corrected_weighted_i4_20260916.md) |
 | Explicit contrast cases | **Oracle/diagnostic only** | Compare a small number of known route choices in a narrow corridor | Case31 configs described below |
+| Skeleton least-squares prototype | **Diagnostic only, tube-scoped** | Exercise the skeleton/NLLS/discrete-choice tracer on selected cases | [method](skeleton_lsq_tracing.md), [case31 result](benchmarks/contrast_case31_skeleton_20260918.md), [geometry](benchmarks/contrast_case31_skeleton_geometry_20260919.md) |
 | Live-inference/cache profiles | **Performance diagnostics** | Isolate input, inference, publication, readiness and cached tracing throughput | [live evaluation architecture](live_inference_trace_evaluation.md), [cached trace profile](cached_trace_profile_20260911.md) |
 | Older snapshot, embedding and fixed-path sweeps | **Historical** | Preserve model-selection and experimental history; do not use as the current headline baseline | Dated files under [`benchmarks/`](benchmarks/) |
 
@@ -248,6 +249,38 @@ Then use `benchmark-full` with one of these configs:
 /home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py benchmark-full --config /home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_contrast_case31_fiberlet_scoped_20260918_v1.json
 /home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py benchmark-full --config /home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_contrast_case31_fiberlet_bounded_w64_20260918_v1.json
 /home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py benchmark-full --config /home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_contrast_case31_fiberlet_unrestricted_20260918_v1.json
+```
+
+The skeleton backend runs on the same packaged material. It is scoped to a
+tube around the reference and any explicit choice, so its numbers are
+diagnostic only and are not comparable to unscoped results. Its configs are
+[`eval_contrast_case31_skeleton_20260918_v1.json`](../../fiber_trace_3d/configs/eval_contrast_case31_skeleton_20260918_v1.json),
+its reference-only control
+[`eval_contrast_case31_skeleton_unrestricted_20260918_v1.json`](../../fiber_trace_3d/configs/eval_contrast_case31_skeleton_unrestricted_20260918_v1.json),
+and the two-case workload
+[`eval_explicit_choices_skeleton_20260918_v1.json`](../../fiber_trace_3d/configs/eval_explicit_choices_skeleton_20260918_v1.json):
+
+```bash
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py benchmark-full --config /home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_contrast_case31_skeleton_20260918_v1.json
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py benchmark-full --config /home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_contrast_case31_skeleton_unrestricted_20260918_v1.json
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py benchmark-full --config /home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_explicit_choices_skeleton_20260918_v1.json
+```
+
+To measure geometry rather than restarts, set `dump_crop_presence` in the
+`skeleton` block. The run then writes `crop_presence.u8` beside the other case
+artifacts, raw bytes in the crop's Z, Y, X order at the shape and origin
+`skeleton.json` reports, and the fibre's cross-section can be measured offline
+against `reference_refined.obj`. It costs about 200 MB per case, so it is left
+off in the committed configs. The
+[geometry report](benchmarks/contrast_case31_skeleton_geometry_20260919.md)
+records what that measurement showed.
+
+The two-case manifest is packaged by
+[`contrast_prepare_explicit_choices_20260918_v2.json`](../../fiber_trace_3d/configs/contrast_prepare_explicit_choices_20260918_v2.json),
+which adds merge/split case000 and its user-supplied companion fiber to case31:
+
+```bash
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py contrast-prepare --config /home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/contrast_prepare_explicit_choices_20260918_v2.json
 ```
 
 These results answer whether the intended route is available/cheaper; they are

@@ -7,6 +7,8 @@
 #include "vc/fiber_tracer/FiberletPipeline.hpp"
 #include "vc/fiber_tracer/FiberletChunkGraph.hpp"
 #include "vc/fiber_tracer/FiberAnchorCoverage.hpp"
+#include "vc/fiber_tracer/FiberSkeletonReplay.hpp"
+#include "vc/fiber_tracer/FiberSkeletonSource.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/util/GlobalCacheRoot.hpp"
@@ -475,10 +477,102 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         throw std::invalid_argument("reference selection changed since inference prefetch planning");
     const auto trace = traceOptions(config.value("trace_args", Json::array()));
     const auto backend = config.value("backend", std::string("beam"));
-    if (backend != "beam" && backend != "fiberlet" && backend != "anchors")
-        throw std::invalid_argument("backend must be beam, fiberlet or anchors");
+    if (backend != "beam" && backend != "fiberlet" && backend != "anchors" &&
+        backend != "skeleton")
+        throw std::invalid_argument("backend must be beam, fiberlet, anchors or skeleton");
     const bool anchorBackend = backend == "anchors";
+    const bool skeletonBackend = backend == "skeleton";
     const bool fiberletBackend = backend == "fiberlet" || anchorBackend;
+    FiberSkeletonTraceConfig skeletonConfig;
+    if (skeletonBackend) {
+        const auto& settings = config.value("skeleton", Json::object());
+        if (!settings.is_object())
+            throw std::invalid_argument("skeleton settings must be an object");
+        const std::set<std::string> allowed{
+            "tube_radius_base", "crop_margin_base", "threshold_u8",
+            "min_component_voxels", "junction_merge_max_base",
+            "spur_prune_max_base", "entry_offset_base",
+            "dump_crop_presence", "render_line_variants", "section_radius_base",
+            "candidate_min_offset_base", "candidate_refine_radius_base",
+            "search_radius_base", "route_through_centre",
+            "step_base", "nominal_step_base", "weights", "choice", "solver",
+            "workers"};
+        for (const auto& [name, value] : settings.items())
+            if (!allowed.contains(name))
+                throw std::invalid_argument("unknown skeleton parameter: " + name);
+        skeletonConfig.tubeRadiusBase = settings.value(
+            "tube_radius_base", skeletonConfig.tubeRadiusBase);
+        skeletonConfig.cropMarginBase = settings.value(
+            "crop_margin_base", skeletonConfig.cropMarginBase);
+        skeletonConfig.thresholdU8 = settings.value(
+            "threshold_u8", skeletonConfig.thresholdU8);
+        skeletonConfig.minComponentVoxels = settings.value(
+            "min_component_voxels", skeletonConfig.minComponentVoxels);
+        skeletonConfig.junctionMergeMaxBase = settings.value(
+            "junction_merge_max_base", skeletonConfig.junctionMergeMaxBase);
+        skeletonConfig.spurPruneMaxBase = settings.value(
+            "spur_prune_max_base", skeletonConfig.spurPruneMaxBase);
+        skeletonConfig.entryOffsetBase = settings.value(
+            "entry_offset_base", skeletonConfig.entryOffsetBase);
+        skeletonConfig.dumpCropPresence = settings.value(
+            "dump_crop_presence", skeletonConfig.dumpCropPresence);
+        skeletonConfig.renderLineVariants = settings.value(
+            "render_line_variants", skeletonConfig.renderLineVariants);
+        skeletonConfig.sectionRadiusBase = settings.value(
+            "section_radius_base", skeletonConfig.sectionRadiusBase);
+        skeletonConfig.candidateMinOffsetBase = settings.value(
+            "candidate_min_offset_base", skeletonConfig.candidateMinOffsetBase);
+        skeletonConfig.candidateRefineRadiusBase = settings.value(
+            "candidate_refine_radius_base",
+            skeletonConfig.candidateRefineRadiusBase);
+        skeletonConfig.searchRadiusBase = settings.value(
+            "search_radius_base", skeletonConfig.searchRadiusBase);
+        skeletonConfig.routeThroughCentre = settings.value(
+            "route_through_centre", skeletonConfig.routeThroughCentre);
+        skeletonConfig.stepBase = settings.value(
+            "step_base", skeletonConfig.stepBase);
+        skeletonConfig.nominalStepBase = settings.value(
+            "nominal_step_base", skeletonConfig.nominalStepBase);
+        skeletonConfig.workers = settings.value("workers", skeletonConfig.workers);
+        if (settings.contains("weights")) {
+            const auto& weights = settings.at("weights");
+            const std::set<std::string> allowedWeights{
+                "normal", "tangent", "isotropic", "spacing"};
+            for (const auto& [name, value] : weights.items())
+                if (!allowedWeights.contains(name))
+                    throw std::invalid_argument("unknown skeleton weight: " + name);
+            skeletonConfig.weights.normal = weights.value(
+                "normal", skeletonConfig.weights.normal);
+            skeletonConfig.weights.tangent = weights.value(
+                "tangent", skeletonConfig.weights.tangent);
+            skeletonConfig.weights.isotropic = weights.value(
+                "isotropic", skeletonConfig.weights.isotropic);
+            skeletonConfig.weights.spacing = weights.value(
+                "spacing", skeletonConfig.weights.spacing);
+        }
+        if (settings.contains("choice")) {
+            const auto& choice = settings.at("choice");
+            const std::set<std::string> allowedChoice{"max_ports"};
+            for (const auto& [name, value] : choice.items())
+                if (!allowedChoice.contains(name))
+                    throw std::invalid_argument("unknown skeleton choice parameter: " + name);
+            skeletonConfig.choice.maxPorts = choice.value(
+                "max_ports", skeletonConfig.choice.maxPorts);
+        }
+        if (settings.contains("solver")) {
+            const auto& solver = settings.at("solver");
+            const std::set<std::string> allowedSolver{
+                "max_iterations", "function_tolerance"};
+            for (const auto& [name, value] : solver.items())
+                if (!allowedSolver.contains(name))
+                    throw std::invalid_argument("unknown skeleton solver parameter: " + name);
+            skeletonConfig.solver.maxIterations = solver.value(
+                "max_iterations", skeletonConfig.solver.maxIterations);
+            skeletonConfig.solver.functionTolerance = solver.value(
+                "function_tolerance", skeletonConfig.solver.functionTolerance);
+        }
+        validateFiberSkeletonTraceConfig(skeletonConfig);
+    }
     if (anchorBackend && (config.value("render", false) || renderFlag))
         throw std::invalid_argument("anchor coverage does not render traces");
     const auto fiberletSettings = config.value("fiberlet", Json::object());
@@ -501,10 +595,12 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     const auto contrastChoiceBindings = config.value(
         "fiberlet_contrast_choices", Json::object());
     if (!contrastChoiceBindings.is_object() ||
-        (!fiberletBackend && !contrastChoiceBindings.empty()) ||
-        (contrastChoiceBindings.empty() != (contrastCorridorRadius == 0.0)))
+        (!fiberletBackend && !skeletonBackend && !contrastChoiceBindings.empty()) ||
+        (fiberletBackend &&
+         contrastChoiceBindings.empty() != (contrastCorridorRadius == 0.0)))
         throw std::invalid_argument(
-            "fiberlet contrast choices require fiberlet backend and positive radius");
+            "contrast choices require the fiberlet or skeleton backend, and the "
+            "fiberlet backend additionally needs a positive corridor radius");
     FiberletPathConfig fiberletPaths;
     FiberAnchorConfig fiberletAnchors;
     if (fiberletSettings.contains("path")) {
@@ -707,12 +803,15 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                         throw std::invalid_argument("fiberlet contrast choice path is not a string");
                     const auto choicePath = localPath(configPath.parent_path(), value.get<std::string>());
                     const auto choice = readJson(choicePath);
+                    // A choice may omit a binding key, which the packaging
+                    // records as unverified; a stated key must still agree.
                     for (const auto& key : {"vc_open_data_coordinate_space",
                                              "vc_open_data_source_original_resolution"})
-                        if (annotation.contains(key) != choice.contains(key) ||
-                            (annotation.contains(key) && annotation.at(key) != choice.at(key)))
+                        if (choice.contains(key) && !choice.at(key).is_null() &&
+                            (!annotation.contains(key) ||
+                             annotation.at(key) != choice.at(key)))
                             throw std::invalid_argument(
-                                "fiberlet contrast choice coordinate binding mismatch: " +
+                                "contrast choice coordinate binding mismatch: " +
                                 choicePath.string());
                     contrastChoices.push_back(fiberLinePoints(choice, choicePath));
                 }
@@ -1096,10 +1195,68 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 request.config.traceToBaseScale = source.traceScale;
                 request.config.baseVoxelSizeUm = source.voxelSizeUm;
                 std::optional<FiberletGraphReplayResult> graphReplay;
+                std::optional<FiberSkeletonModel> skeletonModel;
+                std::optional<FiberSkeletonReplayResult> skeletonResult;
+                std::optional<FiberSkeletonCrop> skeletonCrop;
+                std::optional<FiberSkeletonReferenceCheck> skeletonReference;
+                std::optional<FiberSkeletonTraceRefinement> skeletonTraceRefinement;
                 std::optional<Json> infrastructureFailure;
                 double lastGraphProgressArc = 0.0;
                 const auto replay = [&]() -> FiberReplayTraceResult {
                     if (resumeVisualization) return *savedReplays.at(index);
+                    if (skeletonBackend) {
+                        // The crop is scoped to this case: a tube around the
+                        // reference and every explicit contrast choice.
+                        std::vector<std::vector<cv::Vec3d>> tube{item.points};
+                        for (const auto& choice : item.contrastChoices)
+                            tube.push_back(choice);
+                        // Stored-grid sampling is the offline path: it needs a
+                        // published cache, not the demand-gated live field.
+                        const auto& predictions = *source.predictions;
+                        auto crop = buildFiberSkeletonCrop(
+                            predictions, tube, skeletonConfig.tubeRadiusBase,
+                            skeletonConfig.cropMarginBase, skeletonConfig.workers);
+                        FiberSkeletonCrop metadata;
+                        metadata.originZYX = crop.originZYX;
+                        metadata.shapeZYX = crop.shapeZYX;
+                        metadata.predictionToBaseScale = crop.predictionToBaseScale;
+                        metadata.scopedVoxels = crop.scopedVoxels;
+                        metadata.missingVoxels = crop.missingVoxels;
+                        // The metadata copy normally carries no voxels; the
+                        // diagnostic dump needs them, so keep them only then.
+                        if (skeletonConfig.dumpCropPresence)
+                            metadata.presence = crop.presence;
+                        skeletonCrop = metadata;
+                        FiberSkeletonStoredFields fields(
+                            predictions, *source.normals, source.traceScale,
+                            std::move(crop), skeletonConfig.workers);
+                        skeletonModel =
+                            buildFiberSkeletonModel(fields, skeletonConfig);
+                        FiberSkeletonReplayRequest skeletonRequest;
+                        skeletonRequest.referencePointsBase = item.points;
+                        skeletonRequest.errorThresholdBaseVoxels = threshold;
+                        skeletonRequest.excursionGraceBaseVoxels = excursionGrace;
+                        skeletonRequest.tangentialThresholdFactor = tangentialFactor;
+                        skeletonRequest.matchRefineSteps = refine;
+                        skeletonResult = traceFiberSkeletonReplay(
+                            *skeletonModel, skeletonRequest, *source.normals,
+                            source.traceScale);
+                        // Refine the annotated reference with the same solver
+                        // and cost, so the network can be compared against the
+                        // best line the prediction field itself supports.
+                        skeletonReference = checkFiberSkeletonReference(
+                            *skeletonModel, item.points, fields);
+                        // Re-solve the committed trace at full length, to show
+                        // how much the piecewise frozen-port build costs.
+                        skeletonTraceRefinement = refineFiberSkeletonTrace(
+                            *skeletonModel, skeletonResult->replay,
+                            skeletonReference->refinedPointsBaseXYZ, fields);
+                        remaining.store(0.0);
+                        caseRemaining[index].store(0.0);
+                        auto adapted = skeletonResult->replay;
+                        adapted.geometryBackend = "skeleton";
+                        return adapted;
+                    }
                     if (fiberletBackend) {
                         std::set<std::array<size_t, 3>> contrastCells;
                         if (!item.contrastChoices.empty()) {
@@ -1216,6 +1373,13 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 if (graphReplay)
                     vc::core::util::atomicWriteString(output / "cases" / std::to_string(index) / "graph.json",
                         fiberletGraphReplayJson(*graphReplay, graphConfig).dump(2) + "\n");
+                if (skeletonModel && skeletonCrop && !resumeVisualization)
+                    writeFiberSkeletonArtifacts(
+                        output / "cases" / std::to_string(index), *skeletonModel,
+                        *skeletonCrop,
+                        skeletonResult ? &*skeletonResult : nullptr,
+                        skeletonReference ? &*skeletonReference : nullptr,
+                        skeletonTraceRefinement ? &*skeletonTraceRefinement : nullptr);
                 if (profileTracing)
                     vc::core::util::atomicWriteString(output / "cases" / std::to_string(index) / "profile.json",
                         caseProfileJson(index, std::chrono::duration<double>(std::chrono::steady_clock::now() - caseStart).count(),
@@ -1240,7 +1404,8 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                         [&](const auto& coords, int scale) {
                             return renderFiberReplayPresenceTexture(coords, scale, source.renderSource,
                                 source.traceScale, predictions);
-                        }, threshold, item.reverse, source.voxelSizeUm, ctSampling);
+                        }, threshold, item.reverse, source.voxelSizeUm, ctSampling,
+                        skeletonBackend ? skeletonConfig.thresholdU8 : 0);
                     const auto caseDirectory = output / "cases" / std::to_string(index);
                     const auto directory = caseDirectory / "rendered";
                     auto temporary = caseDirectory / ("rendered.resume." + std::to_string(
@@ -1251,6 +1416,38 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     for (size_t p = 0; p < inspection.pages.size(); ++p)
                         if (!cv::imwrite((writeDirectory / ("strips_" + std::to_string(p) + ".jpg")).string(), inspection.pages[p]))
                             throw std::runtime_error("failed writing inspection image");
+                    if (skeletonReference && skeletonTraceRefinement &&
+                        skeletonReference->refinedPointsBaseXYZ.size() >= 2) {
+                        // The same bench rendering, but of the refined
+                        // reference against the refined trace, so the geometry
+                        // the cost model actually compares is what is drawn.
+                        const auto refinedReplay = replayFiberSkeletonRefinedGeometry(
+                            skeletonTraceRefinement->segmentsBaseXYZ,
+                            skeletonReference->refinedPointsBaseXYZ,
+                            *source.normals, source.traceScale,
+                            skeletonConfig.stepBase, threshold, excursionGrace,
+                            tangentialFactor, refine);
+                        if (!refinedReplay.segments.empty()) {
+                            auto refinedInspection = renderFiberReplayInspection(
+                                skeletonReference->refinedPointsBaseXYZ, refinedReplay,
+                                *source.normals, source.traceScale, source.renderSource,
+                                [&](const auto& coords, int scale) -> cv::Mat_<uint8_t> {
+                                    return vc::core::util::renderCoordsTextureFineToCoarse(
+                                        coords, *source.renderVolume, ctLevel, scale, "Replay CT");
+                                },
+                                [&](const auto& coords, int scale) {
+                                    return renderFiberReplayPresenceTexture(coords, scale,
+                                        source.renderSource, source.traceScale, predictions);
+                                }, threshold, item.reverse, source.voxelSizeUm, ctSampling,
+                                skeletonConfig.thresholdU8);
+                            for (size_t p = 0; p < refinedInspection.pages.size(); ++p) {
+                                if (!cv::imwrite((writeDirectory / ("strips_refined_" +
+                                        std::to_string(p) + ".jpg")).string(),
+                                        refinedInspection.pages[p]))
+                                    throw std::runtime_error("failed writing refined inspection image");
+                            }
+                        }
+                    }
                     inspection.metadata.update({{"case_index", index}, {"provenance", provenance},
                         {"texture_source", {{"locator", source.renderSource.locator},
                             {"shape_zyx", source.renderSource.shapeZYX},
@@ -1395,7 +1592,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         }
         const auto summary = summarizeFiberReferenceReplay(sources[s].provenance.at("fibers").size(), selected, sources[s].voxelSizeUm);
         auto value = fiberReferenceReplayBenchmarkJson(summary, selected,
-            fiberletBackend ? "fiberlet" : trace.beamWidth == 1 ? "native_greedy" : "native_beam", commonConfig, sources[s].provenance,
+            skeletonBackend ? "skeleton" : fiberletBackend ? "fiberlet" : trace.beamWidth == 1 ? "native_greedy" : "native_beam", commonConfig, sources[s].provenance,
             {0, 0, 0}, {0, 0, 0});
         value["coordinates"]["crop_half_open"] = false;
         value["coordinates"].erase("minimum_base_xyz");

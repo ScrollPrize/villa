@@ -1,3 +1,55 @@
+## 2026-09-19 — Skeleton backend: sub-ports, kept variants, per-sub-port routing
+
+- Measured what the thresholded fibre presence constrains. Its section is a
+  ribbon, one sigma 1.3 base voxels across the sheet and 3.6 along it, and the
+  refined reference sits within 0.3 of the ribbon's centre across the sheet
+  but up to 17.6 from it along the sheet. Where two fibres merge the thinning
+  voxels run between them, and presence is saturated across the ribbon, so
+  nothing local says which side is the fibre.
+- Ports now carry sub-ports: the centre and the two extremes of the section
+  along its long axis (`candidate_min_offset_base`), each centred by a small
+  presence step (`candidate_refine_radius_base`). Every line variant and every
+  region connection between sub-ports is initialised by a cheapest path through
+  the thresholded prediction under the tracing metric's presence and direction
+  terms (`search_radius_base`), refined with Ceres, and kept.
+- Nothing is chosen ahead of tracing. Each sub-port records its cheapest
+  variant into the line and its cheapest connection into the region, and the
+  replay walks sub-port to sub-port along those entries, so no sub-port can be
+  a dead end while any option exists. `route_through_centre` decides whether
+  the seam centre of a wide section is a routing target; the committed configs
+  set it false.
+- Removed the port optimizer (`port_radius_base`, `port_sigma_base`,
+  `optimize_ports`), the choice's `end_cost`, `unexplained_weight` and
+  `explain_radius_base`, and an interim graph recentring. `dump_crop_presence`
+  writes the thresholding input beside the artifacts; `render_line_variants`
+  writes every variant of a line as a named polyline.
+- Case31 traces as one segment from start to end without a restart; its worst
+  deviation from the refined reference goes from 21.17 to 8.69 base voxels and
+  p95 from 13.75 to 5.77. The unrestricted control reproduces it. The two-case
+  run goes from three failures to two, both in its second case.
+- Details in `docs/benchmarks/contrast_case31_skeleton_geometry_20260919.md`.
+
+## 2026-09-18 — Skeleton-topology least-squares tracing prototype
+
+- Added a native `skeleton` replay backend: threshold and thin the stored
+  presence at full resolution, contract a skeleton graph, split it into
+  unambiguous lines and ambiguous regions at 32-base-voxel entry offsets,
+  optimize each split point in its line-normal plane, refine every line and
+  every region connection with Ceres while holding the split points fixed, and
+  choose each region's connections by brute-force enumeration of all port
+  matchings scored jointly with an unexplained-support penalty.
+- Extracted the shared directed-reference replay driver out of the beam tracer
+  so beam, Lasagna and skeleton replay all use one unchanged 40/80/160
+  protocol, and gave `trace.json` a generic `geometry_backend` label.
+- Packaged explicit contrast-choice benchmarks can now hold several cases and
+  companion-fiber roles, and record a choice whose coordinate bindings could
+  not be verified.
+- First result on case31: the full eligible length traced with one
+  `skeleton_terminal` failure and no wrong-route event, against one wrong-route
+  failure for beam and none for fiberlets. Two-case run reaches 98.98 %
+  credited coverage. Details in
+  `docs/benchmarks/contrast_case31_skeleton_20260918.md`.
+
 ## 2026-09-18 — Fiber-tracing benchmark runbook
 
 - Added one central inventory of current scientific, targeted-regression,

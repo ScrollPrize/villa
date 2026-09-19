@@ -206,10 +206,19 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberGraph.cpp
     src/fiber_tracer/FiberLocalScoring.cpp
     src/fiber_tracer/FiberPaths.cpp
+    src/fiber_tracer/FiberReferenceReplayCore.cpp
     src/fiber_tracer/FiberReplay.cpp
     src/fiber_tracer/FiberReplayMetric.cpp
     src/fiber_tracer/FiberReferenceReplayBenchmark.cpp
     src/fiber_tracer/FiberAnchorCoverage.cpp
+    src/fiber_tracer/FiberSkeletonGraph.cpp
+    src/fiber_tracer/FiberSkeletonChoice.cpp
+    src/fiber_tracer/FiberSkeletonFields.cpp
+    src/fiber_tracer/FiberSkeletonRefine.cpp
+    src/fiber_tracer/FiberSkeletonRegions.cpp
+    src/fiber_tracer/FiberSkeletonReplay.cpp
+    src/fiber_tracer/FiberSkeletonSource.cpp
+    src/fiber_tracer/FiberSkeletonThinning.cpp
     src/fiber_tracer/PolylineGeometry.cpp
     src/fiber_tracer/FiberTrace.cpp
     src/fiber_tracer/FiberletQuantization.cpp

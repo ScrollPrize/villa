@@ -70,7 +70,9 @@
     - trace multiple fibers (greedily)
     - they make mistakes which depend on where they come from - possibly introduce additional randomness
     - optimize sets of fibers for best explanation of the found predictions
-- [ ] threshold/skeletonize fiber preds and explore the multiple discretet options for scoring!
+- [x] threshold/skeletonize fiber preds and explore the multiple discretet options for scoring!
+    - prototype: docs/skeleton_lsq_tracing.md; first result:
+      docs/benchmarks/contrast_case31_skeleton_20260918.md
 - [ ] check training augmentations again
 - [ ] --vis for fiber trace changes the quality?
 - [ ] fiber jsons should from now on save the volume size they are based on (for scale reference)

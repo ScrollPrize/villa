@@ -262,6 +262,9 @@ vc_add_test(NAME test_fiber_reference_replay_benchmark
     LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiberlet_storage
     LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_skeleton_trace
+    LIBS doctest::doctest vc_fiber_tracer)
+
 vc_add_test(NAME test_fiberlet_crop_trace
     LIBS doctest::doctest vc_fiber_tracer)
 if(VC_HAVE_HIGHS)

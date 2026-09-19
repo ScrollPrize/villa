@@ -8,7 +8,8 @@ import time
 from lasagna.inference_provenance import atomic_write, sha256_file
 
 
-def bind_benchmark(config, manifest, *, backend=None, fiberlet=None, render=False):
+def bind_benchmark(config, manifest, *, backend=None, fiberlet=None, skeleton=None,
+                   render=False):
     if not isinstance(render, bool):
         raise ValueError('render must be a boolean')
     if render and backend == 'anchors':
@@ -30,8 +31,8 @@ def bind_benchmark(config, manifest, *, backend=None, fiberlet=None, render=Fals
             raise ValueError('benchmark must contain directed forward annotations')
         sources[case['candidate']['source_id']]['fibers'].append(path)
         choices = case.get('contrast_choices', [])
-        if choices and backend != 'fiberlet':
-            raise ValueError('contrast choices require the fiberlet backend')
+        if choices and backend not in ('fiberlet', 'skeleton'):
+            raise ValueError('contrast choices require the fiberlet or skeleton backend')
         bound = []
         reference = json.loads(Path(path).read_text())
         for choice in choices:
@@ -40,8 +41,13 @@ def bind_benchmark(config, manifest, *, backend=None, fiberlet=None, render=Fals
                 raise ValueError('duplicate or changed contrast choice')
             seen.add(choice_path)
             document = json.loads(Path(choice_path).read_text())
+            # A binding the packaging recorded as unverified may be absent; any
+            # other difference is still a mismatch.
+            unverified = set(choice.get('unverified_coordinate_bindings', []))
             for key in ('vc_open_data_coordinate_space',
                         'vc_open_data_source_original_resolution'):
+                if key in unverified and document.get(key) is None:
+                    continue
                 if document.get(key) != reference.get(key):
                     raise ValueError('contrast choice coordinate binding mismatch')
             if len(document.get('line_points', [])) < 2:
@@ -59,22 +65,34 @@ def bind_benchmark(config, manifest, *, backend=None, fiberlet=None, render=Fals
                 source['ct_volume'] = source['input_volume']
                 source['ct_base_volume'] = True
     if backend is not None:
-        if backend not in ('fiberlet', 'beam', 'anchors'):
+        if backend not in ('fiberlet', 'beam', 'anchors', 'skeleton'):
             raise ValueError('unsupported benchmark backend')
         if backend == 'beam':
             evaluation.pop('backend', None)
             evaluation.pop('fiberlet', None)
+            evaluation.pop('skeleton', None)
+        elif backend == 'skeleton':
+            # Skeleton tracing reads the stored prediction grid directly; it
+            # needs no fiberlet construction cache.
+            evaluation.pop('fiberlet', None)
+            evaluation['backend'] = backend
+            evaluation['skeleton'] = deepcopy(skeleton or {})
         else:
             for source in evaluation['sources']:
                 if not source.get('fiberlet_source_identity') or not source.get('fiberlet_cache_root'):
                     raise ValueError('fiberlet replay requires canonical source identity/cache root')
             evaluation['backend'] = backend
             evaluation['fiberlet'] = deepcopy(fiberlet or {})
+            evaluation.pop('skeleton', None)
     if contrast_bindings:
-        radius = evaluation.get('fiberlet', {}).get(
-            'contrast_corridor_radius_base_voxels', 0)
+        if backend == 'skeleton':
+            # The skeleton crop is scoped by its own tube radius.
+            radius = evaluation.get('skeleton', {}).get('tube_radius_base', 64)
+        else:
+            radius = evaluation.get('fiberlet', {}).get(
+                'contrast_corridor_radius_base_voxels', 0)
         if not isinstance(radius, (int, float)) or radius <= 0:
-            raise ValueError('contrast choices require a positive corridor radius')
+            raise ValueError('contrast choices require a positive scope radius')
         evaluation['fiberlet_contrast_choices'] = contrast_bindings
     return evaluation
 
@@ -174,7 +192,10 @@ def write_render_review_index(root, result, manifest):
                         reference_begin_arc_base=segment['start_reference_arc_base'],
                         reference_end_arc_base=segment['end_reference_arc_base'],
                         termination_reason=segment['termination_reason']))
-                author = 'evaltrace-' + ('fiberlet' if replay.get('geometry_backend') == 'fiberlet' else 'beam')
+                geometry_backend = replay.get('geometry_backend')
+                author = 'evaltrace-' + (
+                    geometry_backend
+                    if geometry_backend in ('fiberlet', 'skeleton') else 'beam')
                 fiber['review_provenance'] = dict(identity, author=author, role='trace', segment_index=i)
                 for key in ('vc_open_data_coordinate_space', 'vc_open_data_source_original_resolution'):
                     if key in annotation:
@@ -371,7 +392,7 @@ def run(workload, devices, *, gpu_manager=None, cancel_event=None):
             bind_fiberlet_identity(source, identity['source'], identity['model'], source['fiber_manifest'])
     evaluation = bind_benchmark(summary['config'], manifest,
         backend=workload.get('backend'), fiberlet=workload.get('fiberlet'),
-        render=workload.get('render', False))
+        skeleton=workload.get('skeleton'), render=workload.get('render', False))
     inference_overrides = workload.get('inference_overrides', {})
     allowed_inference_overrides = {
         'accumulator_hot_slots', 'accumulator_spill_segment_slots',

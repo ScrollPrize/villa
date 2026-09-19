@@ -4,7 +4,10 @@ See the [fiber-tracing benchmark runbook](benchmark_runbook.md) for the current
 bounded-fiberlet benchmark, fast diagnostics and exact commands.
 
 The existing live evaluation runner supports `evaluation.backend: "fiberlet"`.
-Omitting it retains the ordinary beam tracer. Both consume the same frozen model,
+Omitting it retains the ordinary beam tracer. It also accepts
+`"anchors"` and `"skeleton"`; the latter is the tube-scoped diagnostic
+described in [skeleton least-squares tracing](skeleton_lsq_tracing.md), which
+reads the stored prediction grid directly and needs no fiberlet cache. Both consume the same frozen model,
 source bindings, locked GT split, inference cache and eligible-reference plan.
 
 ## Pipeline and caches
@@ -97,7 +100,9 @@ completed evaluation is not necessarily complete traced coverage.
 
 Each case saves authoritative `graph.json` plus a `trace.json` geometry adapter
 for the existing renderer. The adapter explicitly marks `geometry_backend` as
-`fiberlet`; graph geometry has no fabricated per-point cumulative losses. Existing
+`fiberlet`; graph geometry has no fabricated per-point cumulative losses. That
+field is now a generic backend label: a non-beam backend that keeps ordinary
+per-point geometry, such as `skeleton`, names itself there instead. Existing
 CT/presence top/side strips and restart cross-sections are available with
 `evaluation.render: true`, including empty-seed cases.
 

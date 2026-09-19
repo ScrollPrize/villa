@@ -2894,3 +2894,71 @@ those phases. Its preparation ETAs are local to the current phase; message
 progress deliberately reports `eta_to_limit`, the projected time to the
 configured BP iteration limit, because convergence may terminate earlier and
 cannot be predicted from the current residual.
+
+## Skeleton least-squares tracing backend
+
+The `skeleton` replay backend turns thresholded presence into an explicit
+routable network before tracing. Its design, cost mapping and deviations are in
+[skeleton least-squares tracing](skeleton_lsq_tracing.md); this section records
+where each part lives.
+
+All sources are in `volume-cartographer/core/src/fiber_tracer/`, with headers
+under `core/include/vc/fiber_tracer/`, and all are part of `vc_fiber_tracer`:
+
+- `FiberReferenceReplayCore.{hpp,cpp}` holds `traceReferenceReplayCore`, the one
+  directed-reference driver shared by beam, Lasagna and skeleton replay. It
+  owns seeding on the reference, forward matching, the anisotropic threshold
+  ellipse, excursion grace, failure records and the deterministic reset. It was
+  moved out of `FiberTrace.cpp` without behaviour change; a backend supplies
+  only a `ReplaySegmentRunner`.
+- `FiberSkeletonThinning.cpp` implements the (26,6) simple-point test, Lee
+  thinning with six directional subiterations and sequential re-verification,
+  26-connected labeling, and thresholding with small-component rejection. The
+  simple-point test is used in both thinning passes, which is stricter than
+  scikit-image's second pass and is the correct criterion.
+- `FiberSkeletonGraph.cpp` contracts the thinned mask into a node/edge graph and
+  applies junction merging, spur pruning and degree-two suppression. It mirrors
+  the Python diagnostic `fiber_pair_connectivity.skeleton_topology`.
+- `FiberSkeletonRegions.cpp` measures the thresholded section in the plane
+  normal to a tangent (`fiberSkeletonSectionAt`), splits the reduced graph into
+  ambiguous regions and unambiguous lines, places ports at the entry offset
+  (or one shared midpoint port on a bridge too short for two) with sub-ports
+  from the section (centre and extremes, each centred by
+  `refineFiberSkeletonPointInPlane`), finds the cheapest path through the
+  thresholded prediction between two sub-ports inside a corridor under the
+  tracing metric (`fiberSkeletonSearchPath`), and refines every line once per
+  pair of end sub-ports, recording each sub-port's cheapest variant.
+- `FiberSkeletonRefine.cpp` is the Ceres objective. A `ceres::EvaluationCallback`
+  batch-loads the eight grid corners of presence, direction and normal for every
+  vertex before each evaluation; the residual functors interpolate those
+  constants trilinearly on Jets, so derivatives flow through the interpolation
+  and normals are resampled at every solver step.
+- `FiberSkeletonChoice.cpp` connects every pair of sub-ports on different
+  ports of a region through the region's graph path, initialised by the path
+  search and refined with Ceres, keeps every connection, and records each
+  sub-port's cheapest one. Nothing is chosen ahead of tracing.
+- `FiberSkeletonReplay.cpp` builds the model, walks the network sub-port to
+  sub-port along each sub-port's own entries as a
+  segment runner for the shared core, and writes `skeleton.json`,
+  `skeleton_graph.obj` and `skeleton_routes.obj`.
+- `FiberSkeletonSource.cpp` builds the scoped crop from a stored prediction
+  volume and serves corner blocks and grid-aligned samples through the existing
+  samplers, memoized by grid index.
+- `FiberSkeletonFields.{hpp,cpp}` defines the corner block, the provider
+  interface both real and synthetic implementations satisfy, and scalar
+  interpolation.
+
+`apps/src/FiberTraceEvaluationCli.cpp` parses the `skeleton` config block with
+an allowed-key set, builds one model per case, and writes its artifacts beside
+`trace.json`. `FiberReplay.cpp` carries the generic `geometry_backend` label.
+On the Python side `short_benchmark_evaluate.bind_benchmark` accepts the
+backend without requiring a fiberlet cache, and
+`contrast_choice_benchmark.package_contrast_choice` packages several contrast
+cases at once.
+
+`core/test/test_fiber_skeleton_trace.cpp` covers the simple-point test, the
+three thinning shape invariants, graph reduction, the polyline helpers, matching
+enumeration counts, refinement convergence on a synthetic tube, end-to-end
+routing of a crossing, replay determinism, the unusable-seed path and artifact
+round-tripping. It is built by `run_fiber3d_native_build` and executed by
+`run_fiber3d_native_replay_tests`.

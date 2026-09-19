@@ -38,6 +38,8 @@ if [[ "$suite" == inspection ]]; then
     "$trace_test"
     reference_test=$(find_binary test_fiber_reference_replay_benchmark)
     "$reference_test"
+    skeleton_test=$(find_binary test_fiber_skeleton_trace)
+    "$skeleton_test"
     cd "$repo_dir"
     export VC_REPLAY_TEST_BINARY="$replay_binary"
     export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
@@ -69,7 +71,7 @@ cache_test=$(find_binary test_global_cache_root)
 replay_binary=$(find_binary vc_fiber_trace_metric)
 cache_binary=$(find_binary vc_cache_root)
 "$trace_test"
-for name in test_chunk_cache test_lasagna_normal_sampler test_chunked_plane_sampler test_fiber_anchors test_fiber_replay test_fiber_trace_review test_fiber_reference_replay_benchmark; do
+for name in test_chunk_cache test_lasagna_normal_sampler test_chunked_plane_sampler test_fiber_anchors test_fiber_replay test_fiber_trace_review test_fiber_reference_replay_benchmark test_fiber_skeleton_trace; do
     native_test=$(find_binary "$name")
     "$native_test"
 done

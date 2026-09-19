@@ -562,6 +562,10 @@ struct FiberReplayTraceSegment {
 struct FiberReplayTraceResult {
     // Geometry adapter for graph replay; costs remain in its graph artifact.
     bool graphGeometry = false;
+    // Optional backend label serialized as `geometry_backend`. Graph replay
+    // keeps the historical "fiberlet" label through `graphGeometry`; other
+    // non-beam backends name themselves here.
+    std::string geometryBackend;
     double tangentialThresholdFactor = 4.0;
     double referenceBeginArcBase = 0.0;
     double referenceEndArcBase = 0.0;

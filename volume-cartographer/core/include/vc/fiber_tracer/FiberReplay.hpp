@@ -232,7 +232,11 @@ struct FiberReplaySectionFrame {
     const FiberReplayStripTextureSource& source,
     const FiberReplayTextureRenderer& ct, const FiberReplayTextureRenderer& presence,
     double thresholdBase, bool reverse, double voxelSizeUm,
-    const std::string& ctSamplingDescription = "CT: trilinear interpolation");
+    const std::string& ctSamplingDescription = "CT: trilinear interpolation",
+    // When positive, each presence strip is followed by the same strip
+    // thresholded at this stored presence level, which is what the skeleton
+    // backend actually builds its topology from. Zero omits those rows.
+    int presenceThresholdU8 = 0);
 
 // Uses the existing prediction source (including its readiness gate). Multiple
 // prediction options are visualized as maximum presence, not direction validity.

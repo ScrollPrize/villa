@@ -213,13 +213,47 @@ def test_directed_binding_carries_verified_contrast_choices(tmp_path):
     result = bind_benchmark(config, manifest, backend='fiberlet', fiberlet=fiberlet)
     assert result['fiberlet_contrast_choices'] == {
         str(reference.resolve()): [str(choice.resolve())]}
-    with pytest.raises(ValueError, match='fiberlet backend'):
+    with pytest.raises(ValueError, match='fiberlet or skeleton backend'):
         bind_benchmark(config, manifest)
-    with pytest.raises(ValueError, match='positive corridor'):
+    with pytest.raises(ValueError, match='positive scope radius'):
         bind_benchmark(config, manifest, backend='fiberlet', fiberlet={})
     choice.write_text('{}')
     with pytest.raises(ValueError, match='changed contrast'):
         bind_benchmark(config, manifest, backend='fiberlet', fiberlet=fiberlet)
+
+
+def test_skeleton_backend_binds_without_a_fiberlet_cache(tmp_path):
+    reference = tmp_path / 'reference.json'
+    choice = tmp_path / 'choice.json'
+    common = dict(type='vc3d_fiber', version=1,
+                  vc_open_data_coordinate_space='scroll/scan@L0',
+                  vc_open_data_source_original_resolution=2.4)
+    reference.write_text(json.dumps(dict(common, evaluation_direction='forward',
+                                         line_points=[[0, 0, 0], [8, 0, 0]])))
+    choice.write_text(json.dumps(dict(common, line_points=[[0, 1, 0], [8, 1, 0]])))
+    manifest = dict(completed=True, case_count=1, cases=[dict(
+        path=str(reference), sha256=sha256_file(reference),
+        candidate=dict(source_id='A'),
+        contrast_choices=[dict(path=str(choice), sha256=sha256_file(choice),
+                               role='competing-trace')])])
+    # Skeleton tracing reads the stored prediction grid, so it binds without
+    # any fiberlet construction identity or cache root.
+    config = dict(sources=[dict(id='A', fibers=[])])
+    skeleton = dict(tube_radius_base=32, threshold_u8=224)
+    result = bind_benchmark(config, manifest, backend='skeleton',
+                            skeleton=skeleton)
+    assert result['backend'] == 'skeleton'
+    assert result['skeleton'] == skeleton
+    assert 'fiberlet' not in result
+    assert result['fiberlet_contrast_choices'] == {
+        str(reference.resolve()): [str(choice.resolve())]}
+    with pytest.raises(ValueError, match='positive scope radius'):
+        bind_benchmark(config, manifest, backend='skeleton',
+                       skeleton=dict(tube_radius_base=0))
+    beam = bind_benchmark(config, dict(manifest, cases=[
+        {k: v for k, v in manifest['cases'][0].items()
+         if k != 'contrast_choices'}]), backend='beam')
+    assert 'skeleton' not in beam and beam.get('backend') is None
 
 
 def test_rejects_changed_annotations(tmp_path):

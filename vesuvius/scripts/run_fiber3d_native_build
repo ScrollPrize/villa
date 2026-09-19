@@ -24,4 +24,4 @@ cmake -S "$repo_dir/volume-cartographer" -B "$build_dir" -G Ninja \
     -DVC_TESTING=ON -DVC_USE_PCH=OFF -DVC_USE_CCACHE=OFF -DVC_MARCH_NATIVE=OFF \
     -DVC_USE_SYSTEM_LIBBACKTRACE=ON -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
     -DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D=/home/hendrik/villa/volume-cartographer/build/dev-quickbuild-gcc/_deps/vc_delta3d-src
-cmake --build "$build_dir" --target vc_fiber_trace_metric vc_fiberlets vc_cache_root test_fiber_replay test_fiber_trace3d test_fiberlet_paths test_fiberlet_storage test_fiber_reference_replay_benchmark -j 8
+cmake --build "$build_dir" --target vc_fiber_trace_metric vc_fiberlets vc_cache_root test_fiber_replay test_fiber_trace3d test_fiberlet_paths test_fiberlet_storage test_fiber_skeleton_trace test_fiber_reference_replay_benchmark -j 8

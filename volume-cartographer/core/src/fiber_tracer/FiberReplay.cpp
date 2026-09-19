@@ -2594,10 +2594,12 @@ FiberReplayInspection renderFiberReplayInspection(
     const vc::lasagna::NormalSampler& normals, double workingToBaseScale,
     const FiberReplayStripTextureSource& source, const FiberReplayTextureRenderer& ct,
     const FiberReplayTextureRenderer& presence, double thresholdBase, bool reverse, double voxelSizeUm,
-    const std::string& ctSamplingDescription)
+    const std::string& ctSamplingDescription, int presenceThresholdU8)
 {
     if (!(thresholdBase > 0) || !std::isfinite(thresholdBase) || !(voxelSizeUm > 0))
         throw std::invalid_argument("inspection needs positive threshold and voxel size");
+    if (presenceThresholdU8 < 0 || presenceThresholdU8 > 255)
+        throw std::invalid_argument("presence threshold must be in [0, 255]");
     const double factor = replay.tangentialThresholdFactor;
     const auto descriptor = fiberReplayThresholdDescriptorJson(thresholdBase, factor);
     constexpr int scale = 1;
@@ -2733,6 +2735,29 @@ FiberReplayInspection renderFiberReplayInspection(
                 metadata["modality"] = "presence";
                 if (b == 2) stripPresenceRow = height + 22;
                 addRow(pred.image.rowRange(bands[b][0], bands[b][1]), "Presence / " + std::string(names[b]), metadata, margin);
+                if (presenceThresholdU8 > 0) {
+                    // The presence raster stores 255*presence as grey, so a
+                    // grey pixel carries the stored level exactly. Coloured
+                    // pixels are the reference/trace overlays and are kept.
+                    cv::Mat_<cv::Vec3b> band = pred.image.rowRange(bands[b][0], bands[b][1]).clone();
+                    for (int row = 0; row < band.rows; ++row) {
+                        auto* pixels = band.ptr<cv::Vec3b>(row);
+                        for (int column = 0; column < band.cols; ++column) {
+                            auto& pixel = pixels[column];
+                            if (pixel[0] != pixel[1] || pixel[1] != pixel[2])
+                                continue;
+                            pixel = pixel[0] >= presenceThresholdU8
+                                ? cv::Vec3b(255, 255, 255)
+                                : cv::Vec3b(0, 0, 0);
+                        }
+                    }
+                    if (height + band.rows + 22 > 16000) flush();
+                    metadata["modality"] = "presence_threshold";
+                    metadata["presence_threshold_u8"] = presenceThresholdU8;
+                    addRow(band, "Presence >= " + std::to_string(presenceThresholdU8) +
+                        " / " + std::string(names[b]), metadata, margin);
+                    metadata.erase("presence_threshold_u8");
+                }
             }
             struct Placed {
                 Station station;
@@ -2859,7 +2884,10 @@ nlohmann::json fiberReplayTraceJson(const FiberReplayTraceResult& replay, double
     auto result = greedyReplayJson(replay, normalThresholdBaseVoxels);
     result["format"] = "vc_native_fiber_replay";
     result["version"] = 1;
-    if (replay.graphGeometry) result["geometry_backend"] = "fiberlet";
+    if (replay.graphGeometry)
+        result["geometry_backend"] = "fiberlet";
+    else if (!replay.geometryBackend.empty())
+        result["geometry_backend"] = replay.geometryBackend;
     return result;
 }
 
@@ -2903,7 +2931,8 @@ FiberReplayTraceResult fiberReplayTraceFromJson(const nlohmann::json& document)
         return m;
     };
     FiberReplayTraceResult replay;
-    replay.graphGeometry = document.value("geometry_backend", std::string{}) == "fiberlet";
+    replay.geometryBackend = document.value("geometry_backend", std::string{});
+    replay.graphGeometry = replay.geometryBackend == "fiberlet";
     replay.tangentialThresholdFactor = factor;
     replay.referenceBeginArcBase = document.at("reference_begin_arc_base");
     replay.referenceEndArcBase = document.at("reference_end_arc_base");

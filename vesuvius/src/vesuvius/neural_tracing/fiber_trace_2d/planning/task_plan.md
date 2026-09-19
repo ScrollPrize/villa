@@ -1,57 +1,68 @@
-# Task plan
+# Task plan: construct geometry from the prediction, not from the skeleton
 
-1. Audit the approved evaluation runner modes, active benchmark configs and
-   existing benchmark result documents.
-2. Add one benchmark runbook under `docs/` with an explicit taxonomy:
-   authoritative five-scroll/50-fiber evaluation; frozen short200 regression;
-   beam versus bounded-fiberlet short200; anchor coverage; corrected mini5;
-   explicit contrast diagnostics; live-inference performance profiles; and
-   historical model/embedding sweeps.
-3. For each current benchmark, record its exact runner mode, config, immutable
-   input/manifest, checkpoint identity, output root, expected coverage, result
-   report, cache behavior and completion evidence. Mark every entry canonical,
-   diagnostic, superseded, incomplete or historical.
-4. Document the distinct lifecycles: ordinary full-cohort prepare/validate/run,
-   frozen-manifest `benchmark-full`, saved rendering/review, extraction,
-   anchor/fiberlet sweeps, profiling and contrast packaging/connectivity.
-5. Keep the frozen short200 v3 evidence separate from the versioned GT-review
-   draft; the latter is annotation-audit material unless explicitly promoted as
-   a new frozen benchmark.
-6. Document immutable/host-local evidence rules: never overwrite completed
-   roots; a fresh run uses a copied config and new output/cache namespace while
-   preserving scientific parameters, manifests and checkpoint hashes.
-7. List helper/reporting CLI modes separately so they are not mistaken for
-   benchmark families.
-8. Link the runbook from `short_failure_benchmark.md`,
-   `fiberlet_evaluation.md`, `anchor_coverage.md` and
-   `live_inference_trace_evaluation.md`, and add a changelog entry.
-9. Validate every documented mode/config against the runner and check links,
-   completion references and formatting without launching a benchmark.
+## Principle
+
+Topology is fixed by construction and never changed by an optimizer. Geometry
+is derived from the prediction field. A point shared by several graph elements
+is moved once and every incident element follows it.
+
+## Steps
+
+1. **Recentre the graph onto the prediction.** A new stage between graph
+   reduction and topology construction. It does not add, remove or relabel any
+   node, edge or incidence; it only moves coordinates.
+   - Each node is one point shared by its incident edges. Move it once, by a
+     presence-weighted fit over a small isotropic neighbourhood, so all
+     incident edges follow coherently.
+   - Each edge interior vertex is moved within the plane normal to the local
+     edge tangent, by the same Gaussian-weighted fit of presence times squared
+     direction agreement already used for ports.
+   - Recompute edge lengths afterwards.
+2. **Measure the ceiling first.** Before tuning anything, report the distance
+   from the refined reference to the recentred graph, and the oracle route over
+   the recentred candidate network. If the graph does not approach the 2.00 the
+   threshold mask allows, recentring is not sufficient and step 3 applies.
+3. **If junctions resist recentring**, restrict the fit where the local
+   cross-section is not unimodal, since the ridge is genuinely ambiguous inside
+   a merged contact, and let the region connections carry those stretches.
+4. **Re-measure the whole chain** with the route-based metrics only: best
+   connected route through the graph, oracle route through the candidate
+   network, and the committed trace, each as GT-to-route and route-to-GT.
 
 ## Testing
 
-- Parse each documented JSON configuration and map it to an actual argparse
-  mode/config schema.
-- Check repository paths and host-local canonical artifacts when available;
-  absence of `/ephemeral` must not make repository documentation invalid.
-- Invoke runner `--help` and run focused `test_classic_fiber_evaluation.py` and
-  `test_short_benchmark_evaluate.py`; do not start GPU evaluations.
-- Verify Markdown links and canonical config/report/output/count references.
-- Run `git diff --check`.
+- `test_fiber_skeleton_trace` gains a case: a synthetic fiber whose skeleton is
+  deliberately displaced from the presence ridge must be pulled back onto it by
+  recentring, with the node and edge counts unchanged.
+- The existing twelve cases must stay green.
+- Case31 through the approved runner, comparing the route-based metrics above.
 
 ## Spec update
 
-No scientific benchmark semantics change. Require the benchmark runbook to label
-scientific authority, selection bias, supersession/history, exact
-config/mode/output identity and completion evidence.
+`planning/specs.md`, skeleton prototype section: the skeleton supplies topology
+only; edge and node geometry is recentred onto the prediction before ports are
+placed; recentring may not change topology.
 
 ## Docs updates
 
-- Add `docs/benchmark_runbook.md`.
-- Link existing detailed result documents from the runbook rather than copying
-  their full result tables, and link the central index from the four general
-  benchmark entry documents.
+`docs/skeleton_lsq_tracing.md`: replace the stage list with the recentring
+stage included, and record the measured chain.
 
 ## Changelog
 
-Record the new benchmark inventory/runbook.
+One entry for the geometry-construction change once it measures better.
+
+## What was actually built (2026-09-19)
+
+The plan assumed the skeleton could be pulled back onto a presence ridge. The
+measurement showed there is no ridge to pull to: presence saturates across a
+ribbon that is narrow across the sheet and wide along it, so the fibre is
+localised in one direction only, and inside a merged ribbon nothing local
+picks the fibre. Recentring was dropped. Instead every port gets sub-ports
+from its section, every line variant and region connection between sub-ports
+is refined from a path-search init and kept, and each sub-port carries its own
+cheapest continuation on either side. An interim layer that committed one
+matching per region and per line before tracing was built, measured to be the
+source of every remaining restart, and removed. The tests cover the section
+candidates, the path search and the crossing routes; all fourteen cases are
+green.
