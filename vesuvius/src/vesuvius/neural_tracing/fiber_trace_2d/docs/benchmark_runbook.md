@@ -14,6 +14,7 @@ manual run.
 | Family | Status | Purpose | Current evidence |
 |---|---|---|---|
 | Five-scroll, 50-fiber evaluation | **Canonical scientific evaluation** | Broad model/tracer comparison on the held-out cohort | [full-resolution best EMA999](benchmarks/fullres_refinement_213753_best_ema999_20260917.md) |
+| Beam parameter search on the cohort | **Tuning result, optimized on the cohort itself** | Step-by-step search of native beam parameters for the full-resolution model | [search result](benchmarks/fullres_beam_search_20260919.md) |
 | Frozen short200 v3 | **Canonical targeted regression set** | Reproduce difficult restart regions cheaply; it is deliberately failure-enriched and is not an unbiased model-quality estimate | [dataset definition](short_failure_benchmark.md) |
 | Short200 beam vs bounded fiberlets | **Canonical short-set comparison** | Compare tracing backends on exactly the same 200 directed pieces | [beam result](benchmarks/short200_fullres_refinement_213753_best_ema999_vis_20260918.md), [fiberlet comparison](benchmarks/short200_fullres_fiberlet_vs_beam_20260918.md) |
 | Anchor-only short200 | **Current diagnostic** | Measure anchor placement/gaps without path construction or tracing | [method](anchor_coverage.md), [result](benchmarks/short200_anchor_coverage_u22000_20260916.md) |
@@ -114,6 +115,73 @@ config is
 ```bash
 /home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py resume-visualization --config /home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_fullres_refinement_213753_best_ema999_vis_20260917_v1.json
 ```
+
+### Beam parameter sweep on the cached full-resolution cohort
+
+The full-resolution best EMA999 prediction cache is immutable, and native beam
+replay against it takes about two minutes per variant, so beam-search
+parameters are tuned directly on the 180-direction cohort. A sweep config lists
+`trace_args` overrides under `beam_sweep.variants`; the first variant must be
+the unmodified baseline. Variants run through the `cached-full` runner mode.
+With `beam_sweep.inference` set to `"demand"` each variant opens its own
+manager-backed demand-inference session on the bound prediction namespace, as
+the short benchmark does, because a variant that steps differently from the
+baseline reaches chunks the demand-filled cache never held; the writer lock is
+held only for that variant and a busy writer is waited for. With `"cached"` the
+replay is CPU-only and a missing chunk fails the variant. Ranking uses restart
+episodes, never raw failure counts, and each row records which directed cases
+gained or lost an episode against the baseline.
+
+- Config: [`eval_fullres_beam_search_20260919_v2.json`](../../fiber_trace_3d/configs/eval_fullres_beam_search_20260919_v2.json)
+- Output: `/ephemeral/hendrik/fiber3d_train2/evaluations/fullres_beam_search_20260919_v2`
+  (`matrix.md`, `matrix.json`, `ranking.json`, one `attempt_NNN` per variant)
+- Result: [search report](benchmarks/fullres_beam_search_20260919.md). Best
+  setting cone 35°, beam 16, step 8: 113 episodes against the baseline's 127.
+- The bound cached evaluation still carries stale rendering/inference markers
+  from an interrupted visualization pass; the sweep waives them explicitly via
+  `accept_incomplete_markers` because cached-only replay cannot pass a missing
+  chunk silently.
+- The search extends an independent copy of the prediction namespace,
+  `fullres_refinement_213753_best_ema999_20260917_v2_chunk64_beamsearch_copy_20260919`,
+  selected by `beam_sweep.cache_remap`, so that the recorded namespace stays
+  free for other benchmarks (each demand session takes the cache writer lock).
+  The copy holds the published channels, identity and model manifests only;
+  legacy `.live_tmp` scratch and fiberlet construction data were not copied,
+  so it is not usable for fiberlet replay.
+- Each variant needs some fresh inference (a few hundred to about a thousand
+  tiles) because it steps where the demand-filled cache never went. The
+  session's GPU lease is kept for the whole variant with
+  `gpu_manager.idle_release_seconds` = 3600; the default 30 s made a variant
+  re-queue behind the training several times and stretched it to 40 minutes.
+- `beam_sweep.reference_tube_base_voxels` can prefetch the whole acceptance
+  tube around every reference in one session so later variants are CPU-only.
+  It is off in this config: on this cohort the 250-voxel tube is about 164k
+  chunks and 50k tiles, roughly two GPU hours, far more than the search's
+  variants read in total. Set `inference.background_chunk_cap` (optional, unlimited by default) to
+  feed the prefetch in bounded waves, because requesting the whole tube at
+  once filled the accumulator hot arena and stalled inference.
+
+```bash
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa/vesuvius/scripts/run_classic_fiber_evaluation.py cached-full --config /home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_fullres_beam_search_20260919_v2.json
+```
+
+Rerunning the same command resumes: completed variants are validated against
+their saved metrics and skipped, failed ones are retried. The variant list is
+outside the sweep identity on purpose, so the search proceeds step by step:
+edit the list after each result, rerun, and only the new variants execute.
+The cache, checkpoint, trace protocol and inference mode are pinned by the
+identity; the native binary hash is recorded per variant instead, because the
+tracer gained options during the search (see below) and each row must name the
+binary that produced it. Worker count, decoded-cache budget, GPU manager
+settings and the native environment are runtime-only and also outside the
+identity.
+
+The tracer's `--sample-pool-radius-voxels R` (with `--sample-pool-mode`
+max|mean and `--sample-pool-stencil` cross|cube) was added for this search: it
+samples each candidate at a stencil around it and pools the prediction, which
+mimics tracing a blurred or lower-resolution prediction without building a new
+cache. It disables the fused corner-scoring path, so it costs roughly the
+stencil size in extra samples per candidate.
 
 ## 2. Frozen short200 regression benchmark
 
