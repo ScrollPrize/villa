@@ -1150,9 +1150,12 @@ void QuadSurface::unloadPoints()
     }
     _points.reset();
     _channels.clear();
-    _validMaskCache = cv::Mat_<uint8_t>();
-    _validMaskAllValid = false;
-    _normalCache = cv::Mat_<cv::Vec3f>();
+    {
+        std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+        _validMaskCache = cv::Mat_<uint8_t>();
+        _validMaskAllValid = false;
+        _normalCache = cv::Mat_<cv::Vec3f>();
+    }
     _needsLoad = true;
     if (DebugLoggingEnabled()) {
         std::fprintf(stderr, "[SURF] unload %s (%zu MB freed)\n", id.c_str(), mb);
@@ -1161,9 +1164,12 @@ void QuadSurface::unloadPoints()
 
 void QuadSurface::unloadCaches()
 {
-    _validMaskCache = cv::Mat_<uint8_t>();
-    _validMaskAllValid = false;
-    _normalCache = cv::Mat_<cv::Vec3f>();
+    {
+        std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+        _validMaskCache = cv::Mat_<uint8_t>();
+        _validMaskAllValid = false;
+        _normalCache = cv::Mat_<cv::Vec3f>();
+    }
     // Release loaded channel pixel data but keep the keys so channel(name)
     // still knows which channels exist on disk and can lazy-reload them.
     for (auto& [_, mat] : _channels) {
@@ -1173,7 +1179,13 @@ void QuadSurface::unloadCaches()
 
 cv::Mat_<uint8_t> QuadSurface::validMask() const
 {
+    return validMaskSnapshot(nullptr);
+}
+
+cv::Mat_<uint8_t> QuadSurface::validMaskSnapshot(bool* allValid) const
+{
     const_cast<QuadSurface*>(this)->ensureLoaded();
+    if (allValid) *allValid = false;
     if (!_points || _points->empty()) {
         return cv::Mat_<uint8_t>();
     }
@@ -1186,6 +1198,7 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
     if (!_validMaskCache.empty() &&
         _validMaskCache.rows == _points->rows &&
         _validMaskCache.cols == _points->cols) {
+        if (allValid) *allValid = _validMaskAllValid;
         return _validMaskCache;
     }
 
@@ -1221,6 +1234,7 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
     for (uint8_t v : anyInvalidPerRow) anyInvalid |= v;
     _validMaskAllValid = (anyInvalid == 0);
     _validMaskCache = mask;
+    if (allValid) *allValid = _validMaskAllValid;
     return mask;
 }
 
@@ -1252,6 +1266,7 @@ void QuadSurface::invalidateCache()
     }
 
     _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+    std::lock_guard<std::mutex> cacheLock(_cacheMutex);
     _validMaskCache = cv::Mat_<uint8_t>();
     _validMaskAllValid = false;
     _normalCache = cv::Mat_<cv::Vec3f>();
@@ -1284,12 +1299,12 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     const double oy = static_cast<double>(ul[1]) - 4.0 * sy;
 
     // --- build a source validity mask (255 if point is valid) -------------
-    // Trigger the cache build + set _validMaskAllValid before deciding
-    // whether we need the validity warp below.
-    cv::Mat_<uint8_t> valid_src = validMask();
+    // Retain the mask and its matching fast-path flag before cache eviction.
+    bool skipValidity = false;
+    cv::Mat_<uint8_t> valid_src = validMaskSnapshot(&skipValidity);
     // Strict mode must still evaluate cell support on an all-valid vertex
     // mask so degenerate one-row/one-column components cannot render.
-    bool skipValidity = _validMaskAllValid && !_strictQuadRenderValidity;
+    skipValidity = skipValidity && !_strictQuadRenderValidity;
 
     // --- warp coords and validity ----------------------------------------
     // Per-call scratch is thread_local: gen() runs concurrently per-tile from
@@ -1368,9 +1383,9 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     if (need_normals) {
         // Build source-grid normal cache once per surface. Subsequent gen()
         // calls (panning, zooming) reuse it. Cleared by unloadCaches() when
-        // a different surface becomes active. Guarded by _cacheMutex so the
-        // renderer's concurrent OMP tile calls build it exactly once; reads
-        // below run lock-free since the cache is immutable once built.
+        // a different surface becomes active. Snapshot under the same mutex
+        // as construction and eviction, then warp without holding the lock.
+        cv::Mat_<cv::Vec3f> normal_src;
         {
             std::lock_guard<std::mutex> cacheLock(_cacheMutex);
             if (_normalCache.empty() || _normalCache.size() != _points->size()) {
@@ -1401,12 +1416,13 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
                     }
                 }
             }
+            normal_src = _normalCache;
         }
         const cv::Vec3f qnVec(std::numeric_limits<float>::quiet_NaN(),
                               std::numeric_limits<float>::quiet_NaN(),
                               std::numeric_limits<float>::quiet_NaN());
         normals_big.create(h + 8, w + 8);
-        warpNearestConstVec3f(_normalCache, normals_big,
+        warpNearestConstVec3f(normal_src, normals_big,
                               ox, oy, sx, sy, qnVec);
     }
 
@@ -1788,8 +1804,11 @@ void QuadSurface::invalidateMask()
 {
     // Clear from memory
     _channels.erase("mask");
-    _validMaskCache = cv::Mat_<uint8_t>();
-    _validMaskAllValid = false;
+    {
+        std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+        _validMaskCache = cv::Mat_<uint8_t>();
+        _validMaskAllValid = false;
+    }
 
     // Delete from disk
     if (!path.empty()) {

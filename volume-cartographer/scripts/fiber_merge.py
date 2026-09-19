@@ -13,7 +13,9 @@ invariants, from LineAnnotationController.cpp / Atlas.cpp:
   1e-8 (validateFiberInputControlPoints); violating this makes the whole
   file unloadable. Consequence: control_points and line_points must always
   be written as a consistent pair from the same source.
-- C2: cross-fiber link reciprocity is index-exact across files, plus
+- C2: cross-fiber link reciprocity is index-exact across files (and both
+  refs of a pair agree on `pending` and live in the same array,
+  `branches` or `adjacent_branches`), plus
   positions (1e-6) and directions.
 - C3: stored link directions must match tangents recomputed from
   line_points within ~0.26 deg (branchDirectionsCompatible, 1e-5 on
@@ -212,8 +214,13 @@ def is_fiber_doc(doc):
     else:
         for index, cp in enumerate(control_points):
             if (not isinstance(cp, dict) or
-                    not set(cp) <= {'position', 'segment_to_next'} or
+                    not set(cp) <= {'position', 'segment_to_next', 'tags'} or
                     not _finite_point(cp.get('position'))):
+                return False
+            # Optional per-CP tags (e.g. 'kollesis_termination'): the loader
+            # takes an array of strings and nothing else.
+            if 'tags' in cp and not (isinstance(cp['tags'], list) and
+                                     all(isinstance(t, str) for t in cp['tags'])):
                 return False
             segment = cp.get('segment_to_next')
             if index + 1 == len(control_points):
@@ -510,14 +517,23 @@ def _v3_chunks(doc, anchor_indices):
             'start_controls': copy.deepcopy(controls[first_control:final_control]),
             'end_control': copy.deepcopy(controls[final_control]),
             'end_position': copy.deepcopy(_cp_position(controls[final_control])),
+            # The terminal CP's own tags: its descriptor belongs to the next
+            # chunk, but its tags belong to the point, and for the fiber's
+            # final CP no later chunk would otherwise see them change.
+            'end_tags': copy.deepcopy(_cp_tags(controls[final_control])),
             'line_points': copy.deepcopy(doc['line_points'][line_start:line_end + 1]),
         })
     return chunks, None
 
 
+def _cp_tags(value):
+    return value.get('tags', []) if isinstance(value, dict) else []
+
+
 def _v3_chunk_equal(a, b):
     return (a['start_controls'] == b['start_controls'] and
             a['end_position'] == b['end_position'] and
+            a['end_tags'] == b['end_tags'] and
             a['line_points'] == b['line_points'])
 
 
@@ -644,8 +660,11 @@ def merge_v3_optimization_mode(base, local, remote):
                   f"({local_mode!r} vs {remote_mode!r})")
 
 
-def _branches_of(doc):
-    branches = doc.get('branches', [])
+BRANCH_ARRAYS = ('branches', 'adjacent_branches')
+
+
+def _branches_of(doc, kind='branches'):
+    branches = doc.get(kind, [])
     return branches if isinstance(branches, list) else []
 
 
@@ -674,7 +693,7 @@ def _structured_branch(branch):
             _finite_point(branch.get('branch_control_point_position')))
 
 
-def split_branches(doc):
+def split_branches(doc, kind='branches'):
     """(structured, opaque) partition of a document's branch entries.
 
     Opaque entries (non-objects, missing or malformed fields) are data
@@ -682,21 +701,23 @@ def split_branches(doc):
     only by whole-value comparison — never silently dropped."""
     structured = []
     opaque = []
-    for branch in _branches_of(doc):
+    for branch in _branches_of(doc, kind):
         (structured if _structured_branch(branch) else opaque).append(branch)
     return structured, opaque
 
 
-def links_to(doc, peer_name):
+def links_to(doc, peer_name, kind=None):
     """Structured branch entries of `doc` that point at `peer_name`
     (compared as basenames, like the loader)."""
-    return [entry for entry in _branches_of(doc)
+    return [entry for array in ((kind,) if kind else BRANCH_ARRAYS)
+            for entry in _branches_of(doc, array)
             if _structured_branch(entry) and _branch_target(entry) == peer_name]
 
 
 def links_to_any(doc):
     """All structured branch entries of a document."""
-    return [entry for entry in _branches_of(doc) if _structured_branch(entry)]
+    return [entry for kind in BRANCH_ARRAYS for entry in _branches_of(doc, kind)
+            if _structured_branch(entry)]
 
 
 def _canon_opaque(entries):
@@ -742,22 +763,37 @@ def _find_link(entries, branch, used):
     return None
 
 
-def _link_modified(entry, base_entry):
-    """The review state is the meaningful mutable field on a link; indices
-    and directions are derived and re-resolved elsewhere."""
-    return (bool(entry.get('pending', False)) !=
-            bool(base_entry.get('pending', False)))
+def legacy_regression(doc, base_doc):
+    """An older writer dropped an array that contained adjacent links.
+    An explicitly empty array is a deliberate deletion, not a regression."""
+    if (is_fiber_doc(doc) and is_fiber_doc(base_doc) and
+            _branches_of(base_doc, 'adjacent_branches') and
+            'adjacent_branches' not in doc):
+        return ("adjacent_branches is missing (saved by an older VC3D?) "
+                "where the last-synced copy had adjacent links")
+    return None
 
 
-def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
+def _stripped_array_conflicts(base_doc, local_doc, remote_doc):
+    # Before whole-document shortcuts: even identical legacy saves conflict.
+    return [f"{side}: {message}"
+            for side, doc in (('local', local_doc), ('remote', remote_doc))
+            if (message := legacy_regression(doc, base_doc))]
+
+
+def merge_branches(base_doc, local_doc, remote_doc, prefer_local, kind='branches'):
     """Base-aware set merge of structured link entries. Additions from
     either side survive; untouched-here-but-gone-there means deletion;
     approving a link beats deleting it; pending=False wins over
     pending=True for the same link. Local anchor indices are NOT touched
-    here — the caller re-anchors entries against the merged geometry."""
-    base_entries, _ = split_branches(base_doc)
-    local_entries, _ = split_branches(local_doc)
-    remote_entries, _ = split_branches(remote_doc)
+    here — the caller re-anchors entries against the merged geometry.
+
+    Each array is merged independently: moving a link between arrays is a
+    deletion of the old kind and an addition of the new kind.
+    Returns (merged, notes, stats)."""
+    base_entries, _ = split_branches(base_doc, kind)
+    local_entries, _ = split_branches(local_doc, kind)
+    remote_entries, _ = split_branches(remote_doc, kind)
 
     merged = []
     notes = []
@@ -784,9 +820,14 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
             merged.append(copy.deepcopy(entry))
             stats['links_added_%s' % side_name] += 1
             return
-        # Present in base, gone from the other side: deletion unless this
-        # side meaningfully modified it (approving a link beats deleting it).
-        if not _link_modified(entry, base_entry):
+        # A re-link in the other array replaces the original, including its
+        # review state. Otherwise, an approval beats deletion.
+        other = remote_doc if side_name == 'local' else local_doc
+        other_kind = BRANCH_ARRAYS[1] if kind == BRANCH_ARRAYS[0] else BRANCH_ARRAYS[0]
+        relinked = any(_same_link(entry, candidate)
+                       for candidate in split_branches(other, other_kind)[0])
+        if (relinked or bool(entry.get('pending', False)) ==
+                bool(base_entry.get('pending', False))):
             stats['links_deleted'] += 1
             notes.append(f"link to {entry.get('branch_file', '?')} deleted on "
                          f"{'remote' if side_name == 'local' else 'local'}")
@@ -817,13 +858,14 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
             else:
                 # No base entry to arbitrate: prefer the approved state.
                 chosen = remote_entry if local_pending else local_entry
+        else:
+            chosen = local_entry if prefer_local else remote_entry
+        if local_pending != remote_pending:
             if bool(chosen.get('pending', False)):
                 notes.append(f"link to {_branch_target(chosen) or '?'} "
                              "re-flagged as pending")
             else:
                 stats['links_approved'] += 1
-        else:
-            chosen = local_entry if prefer_local else remote_entry
         merged.append(copy.deepcopy(chosen))
         stats['links_kept'] += 1
 
@@ -994,6 +1036,10 @@ def merge_fibers(base, local, remote):
         return sorted({_branch_target(entry) for entry in links_to_any(doc)} |
                       {_branch_target(entry) for entry in links_to_any(base)})
 
+    stripped = _stripped_array_conflicts(base, local, remote)
+    if stripped:
+        result['conflicts'] = stripped
+        return result
     if local == remote or remote == base:
         merged = copy.deepcopy(local)
         result.update(ok=True, merged=merged,
@@ -1009,29 +1055,48 @@ def merge_fibers(base, local, remote):
                       notes=["local side unchanged; took remote"])
         return result
 
-    # Branch entries this module cannot interpret are preserved by
-    # whole-value comparison; a clean merge must never discard input.
-    _, base_opaque = split_branches(base)
-    _, local_opaque = split_branches(local)
-    _, remote_opaque = split_branches(remote)
-    opaque_branches, opaque_conflict = merge_opaque_branches(
-        base_opaque, local_opaque, remote_opaque)
-    if opaque_conflict:
-        result['conflicts'] = [opaque_conflict]
-        return result
-
     generation_local = int(local.get('generation', 1) or 1)
     generation_remote = int(remote.get('generation', 1) or 1)
     prefer_local = generation_local >= generation_remote
     newer = local if prefer_local else remote
 
-    merged_branches, branch_notes, branch_stats = merge_branches(
-        base, local, remote, prefer_local)
+    merged_branches = {}
+    opaque_branches = {}
+    notes = []
+    stats = {}
+    for kind in BRANCH_ARRAYS:
+        # Preserve uninterpretable entries by whole-value comparison.
+        opaque_branches[kind], conflict = merge_opaque_branches(
+            *(split_branches(doc, kind)[1] for doc in (base, local, remote)))
+        if conflict:
+            result['conflicts'] = [f"{kind}: {conflict}"]
+            return result
+        entries, branch_notes, branch_stats = merge_branches(
+            base, local, remote, prefer_local, kind)
+        merged_branches[kind] = entries
+        notes.extend(branch_notes)
+        for key, value in branch_stats.items():
+            stats[key] = stats.get(key, 0) + value
+
+    # Concurrent additions at the same anchors with different kinds are
+    # ambiguous. Never pair them or quietly retain two different decisions.
+    for entry in merged_branches['branches']:
+        if any(_same_link(entry, candidate)
+               for candidate in merged_branches['adjacent_branches']):
+            result['conflicts'] = [
+                f"link to {_branch_target(entry)} is both ordinary and adjacent"]
+            return result
+
+    def rebind_branches(carrier):
+        for kind in BRANCH_ARRAYS:
+            merged_branches[kind], conflict = _rebind_local_anchors(
+                merged_branches[kind], carrier['control_points'], carrier['line_points'])
+            if conflict:
+                return conflict
+        return None
 
     geometry_same = (_seq_eq(local['control_points'], remote['control_points'])
                      and _seq_eq(local['line_points'], remote['line_points']))
-    notes = list(branch_notes)
-    stats = dict(branch_stats)
     reoptimize = False
     span_owners = None
 
@@ -1059,8 +1124,7 @@ def merge_fibers(base, local, remote):
                          "reoptimizing or replacing their descriptors")
         if not (_seq_eq(carrier['control_points'], newer['control_points']) and
                 _seq_eq(carrier['line_points'], newer['line_points'])):
-            merged_branches, anchor_conflict = _rebind_local_anchors(
-                merged_branches, carrier['control_points'], carrier['line_points'])
+            anchor_conflict = rebind_branches(carrier)
             if anchor_conflict:
                 result['conflicts'] = [anchor_conflict]
                 return result
@@ -1132,8 +1196,7 @@ def merge_fibers(base, local, remote):
                          "control-point polyline pending reoptimization in "
                          "VC3D")
 
-        merged_branches, anchor_conflict = _rebind_local_anchors(
-            merged_branches, carrier['control_points'], carrier['line_points'])
+        anchor_conflict = rebind_branches(carrier)
         if anchor_conflict:
             result['conflicts'] = [anchor_conflict]
             return result
@@ -1155,11 +1218,23 @@ def merge_fibers(base, local, remote):
         # on load, corrected permanently by the reoptimization save).
         notes.append("hv_classification is stale for the merged geometry; "
                      "VC3D recomputes it on load")
-    merged['branches'] = merged_branches + opaque_branches
-    if opaque_branches:
-        noun = 'entry' if len(opaque_branches) == 1 else 'entries'
-        notes.append(f"{len(opaque_branches)} unparseable branch "
-                     f"{noun} carried through unchanged")
+    for kind in BRANCH_ARRAYS:
+        entries = merged_branches[kind] + opaque_branches[kind]
+        if not entries and all(kind not in doc for doc in (local, remote)):
+            # Neither content side carried the array and the merge produced
+            # nothing for it: writing one would turn "a legacy writer saved
+            # this, the kind is unknown" into "deliberately none", which
+            # hides a peer's missing reciprocal from the sync check and
+            # stops the loader restoring it. The base is deliberately not
+            # consulted: it only arbitrates deletions and contributes no
+            # entries, so its own array says nothing about what the two
+            # saved files know - and a base with real adjacent entries
+            # facing a stripped side is already a hard conflict above.
+            continue
+        merged[kind] = entries
+        if opaque_branches[kind]:
+            notes.append(f"{len(opaque_branches[kind])} unparseable {kind} "
+                         "entries carried through unchanged")
     merged['tags'] = merge_tags(base, local, remote)
     if reoptimize and REOPTIMIZE_TAG not in merged['tags']:
         merged['tags'].append(REOPTIMIZE_TAG)
@@ -1180,6 +1255,53 @@ def merge_fibers(base, local, remote):
 
 
 def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
+    """Refresh both kinds independently, atomically, with A's merge deciding
+    additions, review state and base-aware deletions. A missing array must
+    never authorize erasing a peer's adjacent links."""
+    original = {'ok': False, 'a_doc': copy.deepcopy(a_doc),
+                'b_doc': copy.deepcopy(b_doc), 'a_changed': False,
+                'b_changed': False, 'notes': [], 'conflicts': []}
+    if not is_fiber_doc(a_doc) or not is_fiber_doc(b_doc):
+        original['conflicts'] = [f"{a_name} or {b_name} is not a vc3d_fiber document"]
+        return original
+    regression = legacy_regression(a_doc, base_doc)
+    if (regression or ('adjacent_branches' not in a_doc and
+                       links_to(b_doc, a_name, 'adjacent_branches'))):
+        original['conflicts'] = [
+            f"link {a_name} -> {b_name}: " + (regression or
+            f"{a_name} lacks adjacent_branches (saved by an older VC3D?) "
+            f"while {b_name} has an adjacent reciprocal")]
+        return original
+
+    out = copy.deepcopy(original)
+    for kind in BRANCH_ARRAYS:
+        part = _refresh_pair_links_kind(
+            out['a_doc'], out['b_doc'], a_name, b_name, base_doc, kind)
+        if not part['ok']:
+            original['conflicts'] = part['conflicts']
+            return original
+        out['a_doc'], out['b_doc'] = part['a_doc'], part['b_doc']
+        for flag in ('a_changed', 'b_changed'):
+            out[flag] |= part[flag]
+        out['notes'].extend(part['notes'])
+
+    # Only the base authorizes deleting old-kind reciprocals. With no base
+    # a different-kind ref cannot be paired or overwritten.
+    for doc, peer in ((out['a_doc'], b_name), (out['b_doc'], a_name)):
+        if any(_same_link(entry, other)
+               for entry in links_to(doc, peer, 'branches')
+               for other in links_to(doc, peer, 'adjacent_branches')):
+            original['conflicts'] = [
+                f"link {a_name} -> {b_name}: ordinary and adjacent kinds disagree"]
+            return original
+
+    if out['b_changed']:
+        out['b_doc']['generation'] = int(b_doc.get('generation', 1) or 1) + 1
+    out['ok'] = True
+    return out
+
+
+def _refresh_pair_links_kind(a_doc, b_doc, a_name, b_name, base_doc, kind):
     """Make the A<->B cross-fiber link pair consistent, treating A's
     entries as the decided truth (A was just auto-merged).
 
@@ -1203,7 +1325,7 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
         return out
     a_cps, a_line = a['control_points'], a['line_points']
     b_cps, b_line = b['control_points'], b['line_points']
-    a_entries = links_to(a, b_name)
+    a_entries = links_to(a, b_name, kind)
     if a_entries and (len(a_line) < 2 or len(b_line) < 2):
         out['conflicts'].append(
             f"cannot derive endpoint directions between {a_name} and {b_name}")
@@ -1227,14 +1349,18 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
         set_field(entry, key, _snapped_direction(entry.get(key), tangent),
                   doc_flag)
 
-    def snap_pending(entry, desired, doc_flag):
-        if bool(entry.get('pending', False)) == desired:
+    def snap_flag(entry, key, desired, doc_flag):
+        """A boolean written as true or absent, never false."""
+        if bool(entry.get(key, False)) == desired:
             return
         if desired:
-            entry['pending'] = True
+            entry[key] = True
         else:
-            entry.pop('pending', None)
+            entry.pop(key, None)
         out[doc_flag] = True
+
+    def snap_pending(entry, desired, doc_flag):
+        snap_flag(entry, 'pending', desired, doc_flag)
 
     used_reciprocals = []
     for entry in a_entries:
@@ -1263,7 +1389,7 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
         # One reciprocal per entry: two pos_eq-identical A entries must not
         # both claim the same B entry (leaving B one reciprocal short).
         reciprocal = next(
-            (r for r in links_to(b, a_name)
+            (r for r in links_to(b, a_name, kind)
              if not any(r is used for used in used_reciprocals) and
              pos_eq(r.get('control_point_position'), pb) and
              pos_eq(r.get('branch_control_point_position'), pa)),
@@ -1284,7 +1410,7 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
             }
             if entry.get('pending', False):
                 reciprocal['pending'] = True
-            b['branches'] = _branches_of(b) + [reciprocal]
+            b[kind] = _branches_of(b, kind) + [reciprocal]
             out['b_changed'] = True
             out['notes'].append(f"restored reciprocal link {b_name} -> {a_name}")
         else:
@@ -1305,12 +1431,12 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
     # the merge: mirror the deletion. Unrelated B->A entries (pairs A never
     # tracked) are left untouched.
     if base_doc is not None and is_fiber_doc(base_doc):
-        for base_entry in links_to(base_doc, b_name):
+        for base_entry in links_to(base_doc, b_name, kind):
             if any(_same_link(base_entry, entry) for entry in a_entries):
                 continue
             survivors = []
             removed = 0
-            for candidate in _branches_of(b):
+            for candidate in _branches_of(b, kind):
                 if (_structured_branch(candidate) and
                         _branch_target(candidate) == a_name and
                         pos_eq(candidate.get('control_point_position'),
@@ -1321,16 +1447,10 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
                     continue
                 survivors.append(candidate)
             if removed:
-                b['branches'] = survivors
+                b[kind] = survivors
                 out['b_changed'] = True
                 out['notes'].append(
                     f"removed reciprocal of deleted link in {b_name}")
-
-    if out['b_changed']:
-        # A rewritten peer is a newer version; keep the generation
-        # monotonic so later 3-way merges pick the right "newer" side
-        # (VC3D bumps on every save too).
-        b['generation'] = int(b.get('generation', 1) or 1) + 1
 
     out['ok'] = not out['conflicts']
     return out

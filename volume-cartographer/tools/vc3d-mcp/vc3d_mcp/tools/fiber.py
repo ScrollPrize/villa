@@ -125,8 +125,15 @@ async def vc3d_fiber_save() -> dict[str, Any]:
 
 @mcp.tool()
 async def vc3d_fiber_delete(fiber_ids: list[str]) -> dict[str, Any]:
-    """Delete saved fibers by id (>= 1 id; all ids validated first,
-    all-or-nothing). Returns {"deleted": [ids]}."""
+    """Delete saved fibers by id (>= 1 id). Validation is all-or-nothing:
+    any unknown id fails the call before anything is deleted. The deletion
+    itself is not transactional: on success returns {"deleted": [ids]}; if
+    some targets could not be removed (or were skipped as no longer loaded)
+    the call fails with -32005 carrying "detail", "deleted" (the ids whose
+    files were removed or found already absent) and "aborted": false; if
+    the project changed while pending saves were finishing nothing is
+    deleted and the call fails with "aborted": true. Ids are per project and
+    stable across reloads within it."""
     return await _call("fiber.delete", {"fiberIds": fiber_ids})
 
 

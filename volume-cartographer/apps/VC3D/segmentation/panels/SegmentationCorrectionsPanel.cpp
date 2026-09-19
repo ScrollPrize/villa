@@ -46,7 +46,7 @@ SegmentationCorrectionsPanel::SegmentationCorrectionsPanel(const QString& settin
 
     connect(_comboCorrections, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
         if (index < 0) {
-            emit correctionsCollectionSelected(0);
+            emit correctionsCollectionSelectionCleared();
             return;
         }
         const QVariant data = _comboCorrections->itemData(index);

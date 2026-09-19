@@ -107,6 +107,32 @@ void addLink(InputFiber& a, int controlA, InputFiber& b, int controlB)
     b.links.push_back({controlB, a.id, controlA});
 }
 
+void addAdjacentLink(InputFiber& a, int controlA, InputFiber& b, int controlB)
+{
+    a.links.push_back({controlA, b.id, controlB, false, true});
+    b.links.push_back({controlB, a.id, controlA, false, true});
+}
+
+// An H arc over half a turn at radius `radiusH`, and a V fiber at `angle`
+// on it, `inset` inside it (the back of the next wrap in), both with a
+// control at the meeting angle: control 1 of each. With `hvTagV` the V
+// fiber's tag - 'V' for the real pair, 'H' for a same-kind pair.
+std::vector<InputFiber> adjacentPair(double radiusH, double inset, double angle, char hvTagV)
+{
+    std::vector<cv::Vec3d> arc;
+    const double begin = angle - 0.25 * kTwoPi;
+    for (int i = 0; i <= 500; ++i) {
+        const double theta = begin + 0.5 * kTwoPi * i / 500.0;
+        arc.push_back(cv::Vec3d(radiusH * std::cos(theta), radiusH * std::sin(theta), 30000.0));
+    }
+    std::vector<InputFiber> fibers;
+    fibers.push_back(makeFiber(900, QStringLiteral("g-h"), 'H', arc, {0, 250, 500}));
+    fibers.push_back(makeFiber(901, QStringLiteral("g-v"), hvTagV,
+                               verticalPoints(angle, radiusH - inset, 29000.0, 31000.0, 25.0),
+                               {0, 40, 80}));
+    return fibers;
+}
+
 double angleOf(const cv::Vec3d& point)
 {
     return std::atan2(point[1], point[0]);
@@ -176,6 +202,127 @@ std::vector<InputFiber> mirrored(std::vector<InputFiber> fibers)
     return fibers;
 }
 
+// The dented sheet of the solver's traversal-group tests, in volume space:
+// an H fiber at height z along radius R + b(u+2)^2 and angle
+// theta0 + eps(u^3 - 3u), u in [-3, 3] (angle forward, back, forward), and a
+// V fiber on the ray theta0 at a fixed radius. With the V fiber a thickness
+// inside the dent's outer limb it is on the next sheet inward: the three
+// crossings read inside, inside, outside, and only their count says so.
+constexpr double kHairpinR = 20000.0;
+constexpr double kHairpinB = 100.0;
+constexpr double kHairpinEps = 0.03;
+constexpr double kHairpinTheta0 = 0.3 * kTwoPi;
+constexpr int kHairpinOuterIndex = 473;  // u = sqrt3 at 0.01 steps from -3
+
+std::vector<InputFiber> hairpinPair(bool linked)
+{
+    std::vector<cv::Vec3d> arc;
+    for (int i = 0; i <= 600; ++i) {
+        const double u = -3.0 + 0.01 * i;
+        const double r = kHairpinR + kHairpinB * (u + 2.0) * (u + 2.0) - 100.0;
+        const double theta = kHairpinTheta0 + kHairpinEps * (u * u * u - 3.0 * u);
+        arc.push_back(cv::Vec3d(r * std::cos(theta), r * std::sin(theta), 30000.0));
+    }
+    const double outerLimb = kHairpinR + kHairpinB * (1.7320508 + 2.0) * (1.7320508 + 2.0);
+    std::vector<InputFiber> fibers;
+    fibers.push_back(makeFiber(700, QStringLiteral("f-h"), 'H', arc,
+                               {0, kHairpinOuterIndex, 600}));
+    fibers.push_back(makeFiber(701, QStringLiteral("f-v"), 'V',
+                               verticalPoints(kHairpinTheta0, outerLimb - 300.0,
+                                              29000.0, 31000.0, 25.0),
+                               {0, 40, 80}));
+    if (linked) {
+        addLink(fibers[0], 1, fibers[1], 1);
+    }
+    return fibers;
+}
+
+// A kollesis seam in volume space: the inner sheet's H fiber ends just past
+// the seam angle with its last control point tagged, the outer sheet's H
+// fiber starts just before it with its first control point tagged, one step
+// further in, and the outer sheet's V fiber runs at the seam between the two
+// - in front of the inner H fiber by 90 vx, so that crossing reads Outside.
+// The H fibers overrun the V fiber a little, as annotated ends do. `sameSide` puts
+// the second H fiber's tagged end on the same side of the V fiber (a
+// negative control); `linkMask` selects which of the two links exist (bit 0
+// inner, bit 1 outer); `tagMask` which ends are tagged; `shortControl` ends
+// the inner H fiber's controls three line points before its line does and
+// lifts the line beyond them above the V fiber, so the tagged control is not
+// the trace's end and the trace's end sits at a height the V never reaches;
+// `linkAtCrossing` gives each H fiber a control at the crossing and links
+// there instead of at the tagged end, as links are drawn.
+constexpr double kSeamAngle = 0.4 * kTwoPi;
+constexpr double kSeamOverrun = 0.05;
+constexpr double kSeamInnerRadius = 4000.0;
+constexpr double kSeamOuterRadius = kSeamInnerRadius - 150.0;
+constexpr double kSeamVRadius = kSeamOuterRadius + 60.0;
+
+// `extraInner`: 0 none; 1 an untagged inner H fiber (803) alongside the tagged
+// one, ending just past the V and linked to the tagged inner H fiber at a
+// control at the same angle (same winding, no tag); 2 the same but unlinked;
+// 3 linked and running a full turn on past the V, so its only end within a
+// turn of the crossing is its start, on the inner sheet's body side.
+std::vector<InputFiber> kollesisSeam(bool sameSide, int linkMask, int tagMask,
+                                     bool shortControl = false, bool linkAtCrossing = false,
+                                     int extraInner = 0)
+{
+    std::vector<InputFiber> fibers;
+    std::vector<cv::Vec3d> inner =
+        arcPoints(30000.0, kSeamInnerRadius, 0.0, kSeamAngle - 0.6, kSeamAngle + kSeamOverrun);
+    const int innerLast = static_cast<int>(inner.size()) - 1 - (shortControl ? 3 : 0);
+    for (std::size_t i = static_cast<std::size_t>(innerLast) + 1; i < inner.size(); ++i) {
+        inner[i][2] += 1000.0;
+    }
+    // The inner H fiber's seam-end control, and the control its link sits on.
+    const int innerSeam = 2;
+    const int innerCrossing = static_cast<int>(std::lround(0.6 / kStep));
+    const int innerLinked = linkAtCrossing ? 1 : innerSeam;
+    fibers.push_back(makeFiber(800, QStringLiteral("k-inner"), 'H', std::move(inner),
+                               {0, linkAtCrossing ? innerCrossing : innerLast / 2, innerLast}));
+    std::vector<cv::Vec3d> outer = sameSide
+        ? arcPoints(30000.0, kSeamOuterRadius, 0.0, kSeamAngle - 0.6, kSeamAngle + kSeamOverrun)
+        : arcPoints(30000.0, kSeamOuterRadius, 0.0, kSeamAngle - kSeamOverrun, kSeamAngle + 0.6);
+    const int outerLast = static_cast<int>(outer.size()) - 1;
+    const int outerCrossing = static_cast<int>(
+        std::lround((sameSide ? 0.6 : kSeamOverrun) / kStep));
+    const int outerSeam = sameSide ? 2 : 0;
+    const int outerLinked = linkAtCrossing ? 1 : outerSeam;
+    fibers.push_back(makeFiber(801, QStringLiteral("k-outer"), 'H', std::move(outer),
+                               {0, linkAtCrossing ? outerCrossing : outerLast / 2, outerLast}));
+    fibers.push_back(makeFiber(802, QStringLiteral("k-v"), 'V',
+                               verticalPoints(kSeamAngle, kSeamVRadius, 29600.0, 30400.0, 4.0),
+                               {0, 100, 200}));
+    fibers[0].kollesisTerminations.assign(3, false);
+    fibers[1].kollesisTerminations.assign(3, false);
+    if (tagMask & 1) {
+        fibers[0].kollesisTerminations[static_cast<std::size_t>(innerSeam)] = true;
+    }
+    if (tagMask & 2) {
+        fibers[1].kollesisTerminations[static_cast<std::size_t>(outerSeam)] = true;
+    }
+    if (linkMask & 1) {
+        addLink(fibers[0], innerLinked, fibers[2], 1);
+    }
+    if (linkMask & 2) {
+        addLink(fibers[1], outerLinked, fibers[2], 1);
+    }
+    if (extraInner != 0) {
+        const double end = extraInner == 3 ? kSeamAngle + 0.2 + kTwoPi : kSeamAngle + kSeamOverrun;
+        std::vector<cv::Vec3d> extra =
+            arcPoints(30000.0, kSeamInnerRadius, 0.0, kSeamAngle - 0.6, end);
+        const int extraLast = static_cast<int>(extra.size()) - 1;
+        // Its middle control at the tagged inner H fiber's middle control's
+        // angle (same start, same step), so the link joins equal angles.
+        fibers.push_back(makeFiber(803, QStringLiteral("k-inner2"), 'H', std::move(extra),
+                                   {0, linkAtCrossing ? innerCrossing : innerLast / 2, extraLast}));
+        fibers.back().kollesisTerminations.assign(3, false);
+        if (extraInner != 2) {
+            addLink(fibers.back(), 1, fibers[0], 1);
+        }
+    }
+    return fibers;
+}
+
 const GlobalPlacedFiber* findFiber(const GlobalResult& result, uint64_t id)
 {
     for (const GlobalPlacedFiber& fiber : result.fibers) {
@@ -188,6 +335,49 @@ const GlobalPlacedFiber* findFiber(const GlobalResult& result, uint64_t id)
 
 } // namespace
 
+// The positive kollesis seam check, for both control placements.
+void checkKollesisSeam(bool shortControl, bool linkAtCrossing)
+{
+    const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+    const GlobalResult result = vc3d::fiber_map::buildGlobalLayout(
+        kollesisSeam(false, 3, 3, shortControl, linkAtCrossing), umbilicus, defaultParams());
+    const GlobalPlacedFiber* v = findFiber(result, 802);
+    QVERIFY(v != nullptr);
+    QVERIFY(v->meta.onKollesis);
+    // Both tagged ends meet the V fiber: the inner H fiber's encounter is
+    // the false Outside reading, the outer H fiber's already reads Inside;
+    // both are seam encounters.
+    int innerSeam = 0;
+    int outerSeam = 0;
+    for (const auto& event : result.crossingEvents) {
+        if (event.vFiberId != 802) {
+            continue;
+        }
+        QVERIFY(event.kollesis);
+        QCOMPARE(event.kind, vc3d::fiber_map::winding::CrossingKind::Inside);
+        if (event.hFiberId == 800) {
+            QVERIFY(event.deltaR > 0.0);
+            ++innerSeam;
+        } else {
+            QCOMPARE(event.hFiberId, uint64_t{801});
+            QVERIFY(event.deltaR < 0.0);
+            ++outerSeam;
+        }
+    }
+    QVERIFY(innerSeam >= 1);
+    QVERIFY(outerSeam >= 1);
+    QCOMPARE(result.kollesisCrossingCount, innerSeam + outerSeam);
+    QCOMPARE(result.droppedCrossingCount, 0);
+    QCOMPARE(result.declaredGroupCount, 0);
+    QCOMPARE(result.suspectLinkCount, 0);
+    QVERIFY(result.suspectCrossings.empty());
+    const GlobalPlacedFiber* inner = findFiber(result, 800);
+    const GlobalPlacedFiber* outer = findFiber(result, 801);
+    QVERIFY(inner != nullptr && outer != nullptr);
+    QVERIFY(std::abs(inner->meta.windingHi - v->meta.windingLo) < 0.6);
+    QVERIFY(std::abs(outer->meta.windingLo - v->meta.windingLo) < 0.6);
+}
+
 class TestFiberGlobalLayout : public QObject
 {
     Q_OBJECT
@@ -195,6 +385,135 @@ class TestFiberGlobalLayout : public QObject
 private slots:
     // Every input fiber is either placed or reported unplaceable; no gate on
     // network size, no top-N cut.
+    // An adjacent link asserts W_V = W_H - 1: the V fiber, 150 vx inside the
+    // H fiber, lands one winding in, and the link is not suspect. The same
+    // geometry with the V fiber's crossing read alone would only say "H is
+    // outward of V" (W_H >= W_V + 1), which the link pins to equality.
+    void adjacentLinkPlacesTheVerticalOneWindingInside()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers = adjacentPair(4000.0, 150.0, 0.3 * kTwoPi, 'V');
+        addAdjacentLink(fibers[0], 1, fibers[1], 1);
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        const GlobalPlacedFiber* h = findFiber(result, 900);
+        const GlobalPlacedFiber* v = findFiber(result, 901);
+        QVERIFY(h && v);
+        // The H arc spans half a turn and the link sits at its midpoint, so
+        // the H fiber's winding AT the link is its start winding + 0.25.
+        const double hAtLink = h->meta.windingLo + 0.25;
+        QVERIFY2(std::abs((hAtLink - 1.0) - v->meta.windingLo) < 0.05,
+                 qPrintable(QStringLiteral("H at link %1 V %2")
+                                .arg(hAtLink)
+                                .arg(v->meta.windingLo)));
+        QCOMPARE(result.links.size(), std::size_t(1));
+        QVERIFY(result.links.front().adjacent);
+        QVERIFY(!result.links.front().suspect);
+        QVERIFY(result.links.front().turnErr < 0.1);
+        QCOMPARE(result.suspectLinkCount, 0);
+    }
+
+    // An adjacent link is not seam evidence: with the inner H fiber's link
+    // to the V fiber made adjacent, the V fiber is linked to a tagged end on
+    // one side only and is no longer certified on a kollesis, so the inner
+    // encounter reads as the plain Outside crossing it geometrically is.
+    void adjacentLinkDoesNotCertifyAKollesis()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers = kollesisSeam(false, 3, 3, false, true);
+        int flipped = 0;
+        for (InputFiber& fiber : fibers) {
+            for (InputLink& link : fiber.links) {
+                const bool innerPair = (fiber.id == 800 && link.branchFiberId == 802) ||
+                                       (fiber.id == 802 && link.branchFiberId == 800);
+                if (innerPair) {
+                    link.adjacent = true;
+                    ++flipped;
+                }
+            }
+        }
+        QCOMPARE(flipped, 2);
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        const GlobalPlacedFiber* v = findFiber(result, 802);
+        QVERIFY(v != nullptr);
+        QVERIFY(!v->meta.onKollesis);
+        QCOMPARE(result.kollesisCrossingCount, 0);
+        for (const auto& event : result.crossingEvents) {
+            if (event.vFiberId == 802 && event.hFiberId == 800) {
+                QVERIFY(!event.kollesis);
+                QCOMPARE(event.kind, vc3d::fiber_map::winding::CrossingKind::Outside);
+            }
+        }
+        // The adjacent link and the Outside crossing agree (W_H = W_V + 1),
+        // so nothing is dropped and the link is not suspect.
+        QCOMPARE(result.droppedCrossingCount, 0);
+        QCOMPARE(result.suspectLinkCount, 0);
+    }
+
+    // The two files state different kinds for one pair (true on the H side,
+    // an explicit false on the V side): an error, constraining nothing,
+    // for the sync merge to arbitrate.
+    void adjacentKindDisagreementIsAnError()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers = adjacentPair(4000.0, 150.0, 0.3 * kTwoPi, 'V');
+        fibers[0].links.push_back({1, fibers[1].id, 1, false, true, true});
+        fibers[1].links.push_back({1, fibers[0].id, 1, false, false, true});
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QCOMPARE(result.links.size(), std::size_t(1));
+        const vc3d::fiber_map::PlacedLink& link = result.links.front();
+        QVERIFY(link.adjacentDisagrees);
+        QVERIFY(link.suspect);
+        QCOMPARE(result.suspectLinkCount, 1);
+        const GlobalPlacedFiber* v = findFiber(result, 901);
+        QVERIFY(v != nullptr);
+        QVERIFY(!v->meta.linked);
+        // At the layout API, an unspecified ordinary kind does not disagree
+        // with the adjacent ref. Change only this field to exercise its
+        // effect on both the solver output and the verification input digest.
+        std::vector<InputFiber> implicitKind = fibers;
+        implicitKind[1].links.front().adjacentExplicit = false;
+        const GlobalResult fine =
+            vc3d::fiber_map::buildGlobalLayout(implicitKind, umbilicus, defaultParams());
+        QCOMPARE(fine.links.size(), std::size_t(1));
+        QVERIFY(!fine.links.front().adjacentDisagrees);
+        QVERIFY(fine.links.front().adjacent);
+        QVERIFY(!fine.links.front().suspect);
+        QVERIFY(!(vc3d::fiber_map::digestGlobalResult(result) ==
+                  vc3d::fiber_map::digestGlobalResult(fine)));
+        QVERIFY(!(vc3d::fiber_map::digestGlobalInputs(fibers, umbilicus, defaultParams()) ==
+                  vc3d::fiber_map::digestGlobalInputs(implicitKind, umbilicus, defaultParams())));
+    }
+
+    // A pair that is not one H and one V has no inside: the link is an
+    // error - suspect, counted, flagged - and constrains nothing, so the two
+    // fibers are NOT tied to the same winding either (which an ordinary
+    // link would have done). Both an H-H pair and an untagged one.
+    void adjacentLinkBetweenSameKindIsAnErrorAndConstrainsNothing()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        for (const char otherTag : {'H', '?'}) {
+            std::vector<InputFiber> fibers = adjacentPair(4000.0, 150.0, 0.3 * kTwoPi, otherTag);
+            addAdjacentLink(fibers[0], 1, fibers[1], 1);
+            const GlobalResult result =
+                vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+            QCOMPARE(result.links.size(), std::size_t(1));
+            const vc3d::fiber_map::PlacedLink& link = result.links.front();
+            QVERIFY(link.adjacent);
+            QVERIFY(link.adjacentUnpaired);
+            QVERIFY(link.suspect);
+            QCOMPARE(result.suspectLinkCount, 1);
+            // No constraint: the same inputs as an ORDINARY link tie the two
+            // fibers to one winding; here nothing does, so the second fiber
+            // is placed by radial order alone (an island) rather than pinned.
+            const GlobalPlacedFiber* other = findFiber(result, 901);
+            QVERIFY(other != nullptr);
+            QVERIFY(!other->meta.linked);
+        }
+    }
+
     void everyFiberIsAccountedFor()
     {
         const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
@@ -301,6 +620,33 @@ private slots:
         }
     }
 
+    // A mirrored scroll fits the same sheet model: the winding coordinate
+    // still grows outward, so the pitch keeps its sign and size.
+    void sheetModelSurvivesMirroring()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers =
+            makeWeave(100, QStringLiteral("a-"), 30000.0, 4000.0, 300.0,
+                      -0.4, kTwoPi + 0.4, {100, 100 + kStepsPerTurn});
+        const GlobalResult forward =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        for (InputFiber& fiber : fibers) {
+            for (cv::Vec3d& point : fiber.linePoints) {
+                point[1] = -point[1];
+            }
+            for (cv::Vec3d& point : fiber.controlPoints) {
+                point[1] = -point[1];
+            }
+        }
+        const GlobalResult mirrored =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QCOMPARE(mirrored.chirality, -forward.chirality);
+        QVERIFY(forward.sheetPitchVx > 0.0);
+        QVERIFY2(std::abs(mirrored.sheetPitchVx - forward.sheetPitchVx) < 1e-6 * forward.sheetPitchVx,
+                 qPrintable(QString::number(mirrored.sheetPitchVx)));
+        QVERIFY(std::abs(mirrored.sheetRadius0Vx - forward.sheetRadius0Vx) < 1e-6 * forward.sheetRadius0Vx);
+    }
+
     // A mirrored scroll (opposite chirality) produces the same map: the
     // winding coordinate still grows outward and crossings still coincide.
     void mirroredChiralityLaysOutTheSameMap()
@@ -326,11 +672,11 @@ private slots:
         QVERIFY(minW < 1.0);
     }
 
-    // A fiber with no model-traced span never declares winding errors: the
-    // same wrong-winding link that is suspect between two traced fibers is
-    // silent when one end is pure control-point interpolation, and any
-    // dropped crossings it causes draw no red rings.
-    void interpolatedFibersDeclareNoWindingErrors()
+    // Declarations are not gated on trust: an interpolated fiber's wrong
+    // link and the crossings it contradicts are reported exactly as a traced
+    // fiber's would be. Its evidence is attenuated uniformly, so the same
+    // constraints fall.
+    void interpolatedFibersDeclareLikeAnyOther()
     {
         const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
         std::vector<InputFiber> fibers =
@@ -344,19 +690,16 @@ private slots:
             vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
         QVERIFY(trusted.suspectLinkCount > 0);
 
-        // Same geometry, same wrong link - but the H fiber is pure
-        // interpolation, so nothing about it is declarable.
+        // Same geometry, same wrong link, the H fiber pure interpolation.
         std::vector<InputFiber> untrusted = fibers;
         untrusted[0].tracedSegments.assign(
             untrusted[0].controlPoints.size() - 1, false);
-        const GlobalResult silent = vc3d::fiber_map::buildGlobalLayout(
+        const GlobalResult declared = vc3d::fiber_map::buildGlobalLayout(
             untrusted, umbilicus, defaultParams());
-        QCOMPARE(silent.suspectLinkCount, 0);
-        QCOMPARE(silent.droppedCrossingCount, 0);
-        QVERIFY(silent.suspectCrossings.empty());
-        // The fibers are still placed - exclusion is about declarations, not
-        // participation.
-        QCOMPARE(silent.fibers.size(), trusted.fibers.size());
+        QCOMPARE(declared.suspectLinkCount, trusted.suspectLinkCount);
+        QCOMPARE(declared.droppedCrossingCount, trusted.droppedCrossingCount);
+        QCOMPARE(declared.suspectCrossings.size(), trusted.suspectCrossings.size());
+        QCOMPARE(declared.fibers.size(), trusted.fibers.size());
     }
 
     // Linked-network ids drive the dock grouping and the selection's network
@@ -666,6 +1009,24 @@ private slots:
         }
         {
             GlobalResult tweaked = base;
+            QVERIFY(!tweaked.links.empty());
+            tweaked.links[0].adjacent = !tweaked.links[0].adjacent;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = base;
+            QVERIFY(!tweaked.links.empty());
+            tweaked.links[0].adjacentUnpaired = !tweaked.links[0].adjacentUnpaired;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = base;
+            QVERIFY(!tweaked.links.empty());
+            tweaked.links[0].adjacentDisagrees = !tweaked.links[0].adjacentDisagrees;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = base;
             tweaked.fibers[0].meta.networkSize += 1;
             QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
         }
@@ -685,6 +1046,107 @@ private slots:
             tweaked.solveMs += 100.0;
             QVERIFY(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline);
         }
+    }
+
+    // The sheet model recovers an Archimedean weave's pitch and inner radius,
+    // and the distance functions invert each other and integrate the modelled
+    // radius over the angle.
+    void sheetModelRecoversArchimedeanPitch()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        constexpr double kRadius = 4000.0;
+        constexpr double kPitch = 300.0;
+        const std::vector<InputFiber> fibers =
+            makeWeave(100, QStringLiteral("a-"), 30000.0, kRadius, kPitch,
+                      -0.4, kTwoPi + 0.4, {100, 100 + kStepsPerTurn});
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QVERIFY(result.sheetPitchVx > 0.0);
+        QVERIFY2(std::abs(result.sheetPitchVx - kPitch) < 0.02 * kPitch,
+                 qPrintable(QString::number(result.sheetPitchVx)));
+        // The fixture's radius at theta = 0 is kRadius; winding 0 sits at the
+        // innermost anchored winding, within a turn of that angle, so the
+        // fitted radius at winding 0 lands within one pitch of it.
+        QVERIFY2(std::abs(result.sheetRadius0Vx - kRadius) < 1.5 * kPitch,
+                 qPrintable(QString::number(result.sheetRadius0Vx)));
+
+        const vc3d::fiber_map::SheetModel model = vc3d::fiber_map::sheetModelOf(result);
+        QCOMPARE(model.rRefVx, result.rRefVx);
+        QCOMPARE(vc3d::fiber_map::sheetDistanceVx(model, 0.0), 0.0);
+        // One winding out along the map is the integral of r over one turn.
+        const double circumference = kTwoPi * result.rRefVx;
+        const double oneTurn = vc3d::fiber_map::sheetDistanceVx(model, circumference);
+        QVERIFY(std::abs(oneTurn - kTwoPi * (result.sheetRadius0Vx +
+                                            0.5 * result.sheetPitchVx)) < 1e-6);
+        // Outer windings are longer than inner ones, and the map's own
+        // arclength lies between them.
+        const double secondTurn =
+            vc3d::fiber_map::sheetDistanceVx(model, 2.0 * circumference) - oneTurn;
+        QVERIFY(secondTurn > oneTurn);
+        // Round trip through the inverse, on both sides of winding 0.
+        for (double x : {-0.5 * circumference, 0.0, 0.3 * circumference,
+                         2.7 * circumference}) {
+            const double distance = vc3d::fiber_map::sheetDistanceVx(model, x);
+            const double back = vc3d::fiber_map::sheetXForDistanceVx(model, distance);
+            QVERIFY2(std::abs(back - x) < 1e-6,
+                     qPrintable(QStringLiteral("%1 -> %2 -> %3").arg(x).arg(distance).arg(back)));
+        }
+        // A distance no positive radius can reach has no position.
+        QVERIFY(std::isnan(vc3d::fiber_map::sheetXForDistanceVx(model, -1e12)));
+
+        // A vanishingly small positive pitch must not lose the answer to
+        // cancellation: the inverse tends smoothly to the linear case.
+        {
+            const vc3d::fiber_map::SheetModel tiny{4000.0, 4000.0, 1e-14};
+            const double x = kTwoPi * 4000.0;
+            const double distance = vc3d::fiber_map::sheetDistanceVx(tiny, x);
+            const double back = vc3d::fiber_map::sheetXForDistanceVx(tiny, distance);
+            QVERIFY2(std::abs(back - x) < 1e-6 * x, qPrintable(QString::number(back)));
+        }
+
+        // The model is part of the result's identity.
+        const ContentDigest baseline = vc3d::fiber_map::digestGlobalResult(result);
+        GlobalResult tweaked = result;
+        tweaked.sheetPitchVx += 1.0;
+        QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        tweaked = result;
+        tweaked.sheetRadius0Vx += 1.0;
+        QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+    }
+
+    // Too little winding span to fix a slope: the model falls back to the
+    // reference radius with no pitch, and sheet distance is then exactly the
+    // map's arclength.
+    void sheetModelFallsBackWithoutWindingSpan()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        const std::vector<InputFiber> fibers =
+            makeWeave(100, QStringLiteral("a-"), 30000.0, 4000.0, 300.0,
+                      -0.1, 0.8, {10, 120});
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QVERIFY(!result.fibers.empty());
+        // The fallback under test is the short winding span, not an absence
+        // of anchored fibers: the fit saw samples and had too little span.
+        double lo = std::numeric_limits<double>::infinity();
+        double hi = -std::numeric_limits<double>::infinity();
+        int anchored = 0;
+        for (const GlobalPlacedFiber& fiber : result.fibers) {
+            if (fiber.meta.anchor == GlobalAnchor::Unresolved) {
+                continue;
+            }
+            ++anchored;
+            lo = std::min(lo, fiber.meta.windingLo);
+            hi = std::max(hi, fiber.meta.windingHi);
+        }
+        QVERIFY(anchored > 0);
+        QVERIFY2(hi - lo < 0.5, qPrintable(QString::number(hi - lo)));
+        QCOMPARE(result.sheetPitchVx, 0.0);
+        QCOMPARE(result.sheetRadius0Vx, result.rRefVx);
+        const vc3d::fiber_map::SheetModel model = vc3d::fiber_map::sheetModelOf(result);
+        const double x = 0.37 * kTwoPi * result.rRefVx;
+        QVERIFY(std::abs(vc3d::fiber_map::sheetDistanceVx(model, x) - x) < 1e-9);
+        QVERIFY(std::abs(vc3d::fiber_map::sheetXForDistanceVx(model, x) - x) < 1e-9);
     }
 
     // Equal labels tie-break by fileName, never by the runtime id: swapping
@@ -774,6 +1236,462 @@ private slots:
         QCOMPARE(result.unplaced.size(), std::size_t{1});
         QCOMPARE(result.unplaced.front().id, uint64_t{903});
         QVERIFY(findFiber(result, 903) == nullptr);
+    }
+
+    // --- Kollesis terminations: a display-only per-control-point flag that
+    // must reach the placed fiber aligned to its control points, must not
+    // touch the geometry cache keys, and must move both session digests.
+    void kollesisTerminationsReachThePlacedFiberWithoutRecomputingGeometry()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        const GlobalLayoutParams params = defaultParams();
+        std::vector<InputFiber> fibers = cacheFixture();
+        const uint64_t taggedId = fibers.front().id;
+        const std::size_t controlCount = fibers.front().controlPoints.size();
+        QVERIFY(controlCount >= 2);
+
+        vc3d::fiber_map::GlobalLayoutCache cache;
+        const GlobalResult untagged =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        const GlobalPlacedFiber* plain = findFiber(untagged, taggedId);
+        QVERIFY(plain != nullptr);
+        QCOMPARE(plain->fiber.kollesisTerminations.size(), plain->fiber.controlPoints.size());
+        QVERIFY(std::none_of(plain->fiber.kollesisTerminations.begin(),
+                             plain->fiber.kollesisTerminations.end(),
+                             [](bool tagged) { return tagged; }));
+
+        fibers.front().kollesisTerminations.assign(controlCount, false);
+        fibers.front().kollesisTerminations.back() = true;
+        const GlobalResult tagged =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        const GlobalPlacedFiber* placed = findFiber(tagged, taggedId);
+        QVERIFY(placed != nullptr);
+        QCOMPARE(placed->fiber.kollesisTerminations.size(), placed->fiber.controlPoints.size());
+        QVERIFY(placed->fiber.kollesisTerminations.back());
+        QVERIFY(!placed->fiber.kollesisTerminations.front());
+        // Same geometry: every cached slot was reused.
+        QCOMPARE(cache.lastStats().fibersRecomputed, 0);
+        QCOMPARE(cache.lastStats().pairsRecomputed, 0);
+        // Still an input change the memoization check must see, on both sides.
+        QVERIFY(!(vc3d::fiber_map::digestGlobalInputs(fibers, umbilicus, params) ==
+                  vc3d::fiber_map::digestGlobalInputs(cacheFixture(), umbilicus, params)));
+        QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tagged) ==
+                  vc3d::fiber_map::digestGlobalResult(untagged)));
+
+        // A flag vector that does not match the control points is ignored
+        // rather than read misaligned: it still carries a true flag, so a
+        // prefix copy would be caught.
+        fibers.front().kollesisTerminations.front() = true;
+        fibers.front().kollesisTerminations.pop_back();
+        const GlobalResult mismatched =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        const GlobalPlacedFiber* ignored = findFiber(mismatched, taggedId);
+        QVERIFY(ignored != nullptr);
+        QCOMPARE(ignored->fiber.kollesisTerminations.size(), ignored->fiber.controlPoints.size());
+        QVERIFY(std::none_of(ignored->fiber.kollesisTerminations.begin(),
+                             ignored->fiber.kollesisTerminations.end(),
+                             [](bool flagged) { return flagged; }));
+    }
+
+    // A folded pair's crossings are read together: one group with a verdict,
+    // every event carried out for inspection, no rings while the map honours
+    // the verdict - and the verdict recovers the winding gap of one.
+    void foldedPairIsReadAsOneGroup()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        for (const bool mirror : {false, true}) {
+            std::vector<InputFiber> fibers = hairpinPair(false);
+            if (mirror) {
+                fibers = mirrored(fibers);
+            }
+            const GlobalResult result =
+                vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+            QCOMPARE(result.crossingEvents.size(), std::size_t{3});
+            QCOMPARE(result.crossingGroups.size(), std::size_t{1});
+            const auto& group = result.crossingGroups.front();
+            QCOMPARE(group.hFiberId, uint64_t{700});
+            QCOMPARE(group.vFiberId, uint64_t{701});
+            QCOMPARE(group.multiplicity, 3);
+            QCOMPARE(group.insideCount, 2);
+            QVERIFY(group.mixedSigns);
+            QVERIFY(group.hasVerdict);
+            QCOMPARE(group.verdict, vc3d::fiber_map::winding::CrossingKind::Outside);
+            QCOMPARE(group.members.size(), std::size_t{3});
+            for (const auto& event : result.crossingEvents) {
+                QCOMPARE(event.status, vc3d::fiber_map::winding::CrossingStatus::InGroup);
+                QCOMPARE(event.groupId, 0LL);
+                QCOMPARE(event.hFiberId, uint64_t{700});
+            }
+            QCOMPARE(result.traversalGroupCount, 1);
+            QCOMPARE(result.declaredGroupCount, 0);
+            QCOMPARE(result.droppedCrossingCount, 0);
+            QVERIFY(result.suspectCrossings.empty());
+            const GlobalPlacedFiber* h = findFiber(result, 700);
+            const GlobalPlacedFiber* v = findFiber(result, 701);
+            QVERIFY(h != nullptr && v != nullptr);
+            // H strictly outside V: a whole winding between them.
+            QVERIFY(h->meta.windingLo > v->meta.windingHi + 0.5);
+        }
+    }
+
+    // The same pair with a same-winding link the verdict contradicts: the
+    // stronger link holds, the group is dropped as one unit and declared as
+    // one conflict, marked at each of its three places with a shared group.
+    void droppedGroupIsOneConflictMarkedAtEachMember()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        const std::vector<InputFiber> fibers = hairpinPair(true);
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QCOMPARE(result.crossingGroups.size(), std::size_t{1});
+        const auto& group = result.crossingGroups.front();
+        QVERIFY(group.hasVerdict);
+        QCOMPARE(group.status, vc3d::fiber_map::winding::CrossingStatus::Dropped);
+        QCOMPARE(group.violationTurns, 1.0);
+        QCOMPARE(result.declaredGroupCount, 1);
+        QCOMPARE(result.droppedCrossingCount, 0);
+        QCOMPARE(result.suspectLinkCount, 0);
+        QCOMPARE(result.suspectCrossings.size(), std::size_t{3});
+        for (const auto& mark : result.suspectCrossings) {
+            QCOMPARE(mark.groupId, 0LL);
+            QCOMPARE(mark.violationTurns, 1.0);
+            QCOMPARE(mark.hFiberId, uint64_t{700});
+            QCOMPARE(mark.vFiberId, uint64_t{701});
+            QVERIFY(mark.eventIndex < result.crossingEvents.size());
+            QCOMPARE(mark.posVx, result.crossingEvents[mark.eventIndex].posVx);
+        }
+        const GlobalPlacedFiber* h = findFiber(result, 700);
+        const GlobalPlacedFiber* v = findFiber(result, 701);
+        QVERIFY(h != nullptr && v != nullptr);
+        QVERIFY(std::abs(h->meta.windingLo - v->meta.windingLo) < 0.6);
+    }
+
+    // The cache's contract, shard by shard: two independent cold builds of
+    // the same input hold bit-identical detection shards - every raw and
+    // shallow detection with its provenance, and the gate tallies - and a
+    // moved fiber changes some shard.
+    void cachedShardsAreTheFreshOnesBitForBit()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers = hairpinPair(false);
+        std::vector<InputFiber> weave = cacheFixture();
+        fibers.insert(fibers.end(), weave.begin(), weave.end());
+        const GlobalLayoutParams params = defaultParams();
+        vc3d::fiber_map::GlobalLayoutCache first;
+        vc3d::fiber_map::GlobalLayoutCache second;
+        vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &first);
+        vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &second);
+        const auto shardsA = first.cachedDetections();
+        const auto shardsB = second.cachedDetections();
+        QCOMPARE(shardsA.size(), shardsB.size());
+        QVERIFY(!shardsA.empty());
+        bool sawDetections = false;
+        for (std::size_t i = 0; i < shardsA.size(); ++i) {
+            QVERIFY(vc3d::fiber_map::winding::identicalPairDetections(*shardsA[i], *shardsB[i]));
+            sawDetections = sawDetections || !shardsA[i]->raw.empty();
+        }
+        QVERIFY(sawDetections);
+        // Nudge the folded V fiber and rebuild INTO the first cache: exactly
+        // the shards it takes part in (one per H fiber) recompute, and every
+        // shard the warmed cache then holds - recomputed or reused - is the
+        // one an independent cold build produces.
+        for (cv::Vec3d& point : fibers[1].linePoints) {
+            point[2] += 30.0;
+        }
+        fibers[1].controlPoints[1] = fibers[1].linePoints[40];
+        vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &first);
+        int hFibers = 0;
+        for (const InputFiber& fiber : fibers) {
+            hFibers += fiber.hvTag == 'H' ? 1 : 0;
+        }
+        QCOMPARE(first.lastStats().pairsRecomputed, hFibers);
+        QVERIFY(first.lastStats().pairsReused > 0);
+        vc3d::fiber_map::GlobalLayoutCache third;
+        vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &third);
+        const auto shardsWarm = first.cachedDetections();
+        const auto shardsC = third.cachedDetections();
+        QCOMPARE(shardsWarm.size(), shardsC.size());
+        for (std::size_t i = 0; i < shardsC.size(); ++i) {
+            QVERIFY(vc3d::fiber_map::winding::identicalPairDetections(*shardsWarm[i], *shardsC[i]));
+        }
+        // And the move did change some shard against the original build
+        // (recomputation need not change every affected shard's output).
+        int differing = 0;
+        for (std::size_t i = 0; i < shardsB.size(); ++i) {
+            if (!vc3d::fiber_map::winding::identicalPairDetections(*shardsB[i], *shardsC[i])) {
+                ++differing;
+            }
+        }
+        QVERIFY(differing >= 1);
+        QVERIFY(differing <= hFibers);
+    }
+
+    // --- Kollesis.
+
+    // A V fiber linked at the tagged ends of two H fibers departing to
+    // opposite sides is on the kollesis: its seam encounter with the inner
+    // H fiber, which reads Outside by a thickness, is read as Inside and
+    // flagged; nothing is declared, and all three fibers share the winding.
+    void kollesisVIsIdentifiedByLinksToTaggedEnds()
+    {
+        checkKollesisSeam(false, false);
+        checkKollesisSeam(true, false);
+        checkKollesisSeam(false, true);
+    }
+
+    // What does NOT identify a kollesis V: both H fibers ending on the same
+    // side (linked at the tags or at the crossings); only one link; a link
+    // to an untagged H fiber. In each the seam crossing keeps its Outside
+    // reading and, opposed by the link, is declared as before.
+    void kollesisIdentificationNeedsTwoSidesTagsAndLinks()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        struct Case {
+            bool sameSide;
+            int linkMask;
+            int tagMask;
+            bool linkAtCrossing;
+        };
+        for (const Case& c : {Case{true, 3, 3, false}, Case{true, 3, 3, true},
+                              Case{false, 1, 3, false}, Case{false, 3, 2, false}}) {
+            const GlobalResult result = vc3d::fiber_map::buildGlobalLayout(
+                kollesisSeam(c.sameSide, c.linkMask, c.tagMask, false, c.linkAtCrossing),
+                umbilicus, defaultParams());
+            const GlobalPlacedFiber* v = findFiber(result, 802);
+            QVERIFY(v != nullptr);
+            QVERIFY(!v->meta.onKollesis);
+            QCOMPARE(result.kollesisCrossingCount, 0);
+            bool sawOutside = false;
+            for (const auto& event : result.crossingEvents) {
+                if (event.hFiberId == 800 && event.vFiberId == 802) {
+                    QVERIFY(!event.kollesis);
+                    sawOutside = sawOutside ||
+                                 event.kind == vc3d::fiber_map::winding::CrossingKind::Outside;
+                }
+            }
+            QVERIFY(sawOutside);
+        }
+    }
+
+    // The solve finds the seam encounters no tag names: on the certified
+    // kollesis V, a third inner H fiber, untagged, linked to the tagged
+    // inner H fiber (so the rest of its evidence puts it on the V's winding)
+    // and ending just past the V, has its Outside crossing read as an
+    // inferred seam: no ring, flagged. Unlinked, nothing contradicts the
+    // crossing and nothing is inferred; running a full turn on past the V,
+    // the crossing is not terminal and its ring stays.
+    void inferredSeamsClearTheUntaggedInnerFibers()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        for (const int extraInner : {1, 2, 3}) {
+            const GlobalResult result = vc3d::fiber_map::buildGlobalLayout(
+                kollesisSeam(false, 3, 3, false, false, extraInner), umbilicus, defaultParams());
+            const GlobalPlacedFiber* v = findFiber(result, 802);
+            QVERIFY(v != nullptr && v->meta.onKollesis);
+            int extraEvents = 0;
+            int extraInferred = 0;
+            int extraDropped = 0;
+            for (const auto& event : result.crossingEvents) {
+                if (event.hFiberId != 803 || event.vFiberId != 802) {
+                    continue;
+                }
+                ++extraEvents;
+                extraInferred += event.kollesisInferred ? 1 : 0;
+                extraDropped += event.status == vc3d::fiber_map::winding::CrossingStatus::Dropped ? 1 : 0;
+                if (event.kollesisInferred) {
+                    QVERIFY(event.kollesis);
+                    QCOMPARE(event.kind, vc3d::fiber_map::winding::CrossingKind::Inside);
+                    QVERIFY(event.deltaR > 0.0);
+                }
+            }
+            QVERIFY(extraEvents >= 1);
+            QCOMPARE(result.kollesisInferredCount, extraInferred);
+            if (extraInner == 1) {
+                QCOMPARE(extraInferred, extraEvents);
+                QCOMPARE(extraDropped, 0);
+                QCOMPARE(result.droppedCrossingCount, 0);
+                const GlobalPlacedFiber* extra = findFiber(result, 803);
+                QVERIFY(extra != nullptr);
+                QVERIFY(std::abs(extra->meta.windingLo - v->meta.windingLo) < 0.6);
+            } else if (extraInner == 2) {
+                QCOMPARE(extraInferred, 0);
+                QCOMPARE(extraDropped, 0);
+            } else {
+                QCOMPARE(extraInferred, 0);
+                QVERIFY(extraDropped >= 1);
+                QVERIFY(result.droppedCrossingCount >= 1);
+            }
+        }
+    }
+
+    // Tags and links are annotation: adding them recomputes no detection
+    // shard, yet changes the classified result, and the memoized build
+    // equals the fresh one throughout. Every new field is in the digest.
+    void kollesisFlagsInvalidateNoShardsAndAreDigested()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        const GlobalLayoutParams params = defaultParams();
+        vc3d::fiber_map::GlobalLayoutCache cache;
+        const GlobalResult plain = vc3d::fiber_map::buildGlobalLayout(
+            kollesisSeam(false, 0, 0), umbilicus, params, &cache);
+        QCOMPARE(plain.kollesisCrossingCount, 0);
+        const GlobalResult warm = vc3d::fiber_map::buildGlobalLayout(
+            kollesisSeam(false, 3, 3), umbilicus, params, &cache);
+        QCOMPARE(cache.lastStats().pairsRecomputed, 0);
+        QVERIFY(warm.kollesisCrossingCount >= 1);
+        const GlobalResult fresh = vc3d::fiber_map::buildGlobalLayout(
+            kollesisSeam(false, 3, 3), umbilicus, params);
+        QVERIFY(vc3d::fiber_map::digestGlobalResult(warm) ==
+                vc3d::fiber_map::digestGlobalResult(fresh));
+        QVERIFY(!(vc3d::fiber_map::digestGlobalResult(warm) ==
+                  vc3d::fiber_map::digestGlobalResult(plain)));
+
+        const ContentDigest baseline = vc3d::fiber_map::digestGlobalResult(fresh);
+        {
+            GlobalResult tweaked = fresh;
+            tweaked.kollesisCrossingCount += 1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = fresh;
+            for (auto& fiber : tweaked.fibers) {
+                if (fiber.fiber.id == 802) {
+                    fiber.meta.onKollesis = false;
+                }
+            }
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = fresh;
+            bool flipped = false;
+            for (auto& event : tweaked.crossingEvents) {
+                if (event.kollesis && !flipped) {
+                    event.kollesis = false;
+                    flipped = true;
+                }
+            }
+            QVERIFY(flipped);
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = fresh;
+            tweaked.crossingEvents.front().kollesisInferred =
+                !tweaked.crossingEvents.front().kollesisInferred;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = fresh;
+            tweaked.kollesisInferredCount += 1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+    }
+
+    // Groups are classified from the memoized detections: cached and fresh
+    // builds of a folded pair are identical, and every exported group and
+    // event field is in the result digest.
+    void groupsAreCachedAndDigested()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers = hairpinPair(false);
+        std::vector<InputFiber> weave = cacheFixture();
+        fibers.insert(fibers.end(), weave.begin(), weave.end());
+        const GlobalLayoutParams params = defaultParams();
+        const GlobalResult fresh =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params);
+        vc3d::fiber_map::GlobalLayoutCache cache;
+        const GlobalResult cold =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        const GlobalResult warm =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        QVERIFY(vc3d::fiber_map::digestGlobalResult(cold) ==
+                vc3d::fiber_map::digestGlobalResult(fresh));
+        QVERIFY(vc3d::fiber_map::digestGlobalResult(warm) ==
+                vc3d::fiber_map::digestGlobalResult(fresh));
+        QCOMPARE(cache.lastStats().pairsRecomputed, 0);
+        QCOMPARE(warm.traversalGroupCount, 1);
+        QCOMPARE(warm.crossingGroups.size(), fresh.crossingGroups.size());
+        // Adding a link changes no shard, only the solve.
+        addLink(fibers[0], 1, fibers[1], 1);
+        const GlobalResult freshLinked =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params);
+        const GlobalResult warmLinked =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        QVERIFY(vc3d::fiber_map::digestGlobalResult(warmLinked) ==
+                vc3d::fiber_map::digestGlobalResult(freshLinked));
+        QCOMPARE(cache.lastStats().pairsRecomputed, 0);
+        QCOMPARE(warmLinked.declaredGroupCount, 1);
+        // The endpoint clearance is a detection parameter: changing it
+        // recomputes every pair.
+        GlobalLayoutParams strict = params;
+        strict.solver.endpointClearanceTurns = 0.02;
+        const GlobalResult freshStrict =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, strict);
+        const GlobalResult warmStrict =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, strict, &cache);
+        QVERIFY(vc3d::fiber_map::digestGlobalResult(warmStrict) ==
+                vc3d::fiber_map::digestGlobalResult(freshStrict));
+        QVERIFY(cache.lastStats().pairsRecomputed > 0);
+
+        const ContentDigest baseline = vc3d::fiber_map::digestGlobalResult(freshLinked);
+        {
+            GlobalResult tweaked = freshLinked;
+            tweaked.crossingGroups[0].hasVerdict = false;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            tweaked.crossingGroups[0].insideCount += 1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            tweaked.crossingGroups[0].orientationSum += 2;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            tweaked.crossingEvents[0].orientation = -tweaked.crossingEvents[0].orientation;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            // The folded pair sorts after the weave: take one of its events.
+            tweaked.crossingEvents[tweaked.crossingGroups[0].members[0]].groupId = -1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            QVERIFY(!tweaked.suspectCrossings.empty());
+            tweaked.suspectCrossings[0].groupId = -1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            tweaked.declaredGroupCount += 1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            tweaked.traversalGroupCount += 1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            const std::size_t e = tweaked.crossingGroups[0].members[0];
+            tweaked.crossingEvents[e].confidence += 0.25;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            const std::size_t e = tweaked.crossingGroups[0].members[0];
+            tweaked.crossingEvents[e].touch = !tweaked.crossingEvents[e].touch;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            tweaked.unresolvedIntersectionCount += 1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
     }
 };
 

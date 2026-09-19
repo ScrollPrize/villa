@@ -34,6 +34,7 @@ import numpy as np
 import torch
 
 from checkpoint_io import load_checkpoint_cpu
+from checkpoint_migrations import merge_flow_stage_lattices
 from sample_spiral import get_spiral_yxs
 from tifxyz import save_combined_tifxyz
 from transforms import SpiralAndTransform
@@ -43,7 +44,6 @@ from umbilicus import json_umbilicus_z_to_yx
 MODEL_CONFIG_KEYS = (
     "num_flow_integration_steps",
     "flow_integration_solver",
-    "num_flow_timesteps",
     "num_flow_stages",
     "flow_bounds_z_margin",
     "flow_bounds_radius",
@@ -136,6 +136,7 @@ def _build_model(
     umbilicus_path: Path,
     device: torch.device,
 ) -> SpiralAndTransform:
+    checkpoint = merge_flow_stage_lattices(checkpoint)
     try:
         z_begin = int(checkpoint["z_begin"])
         z_end = int(checkpoint["z_end"])
@@ -249,6 +250,7 @@ def _export_source_surface(
         source="flatten_spiral_checkpoint.py",
         first_winding=first,
         cleanup_erosion_cells=3,
+        base_shape_zyx=checkpoint.get("base_shape_zyx"),
     )
     del transform, model, dr_per_winding, winding_grids
     gc.collect()

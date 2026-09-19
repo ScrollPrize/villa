@@ -563,18 +563,19 @@ class TestModeContract:
                   for error in validate_session_request(paths, run)}
         assert 'winding_inference' not in fields
 
-    def test_missing_mode_defaults_to_phase_and_requires_bundle_assets(
+    def test_missing_mode_defaults_to_winding_model_and_requires_its_assets(
         self, tmp_path,
     ):
-        # No dense_spacing_mode in the request: the default is 'phase', so
-        # the bundle's core assets are required even with zero sub-weights.
+        # Omitted modes use the fitter's winding-model default in preflight.
         paths, run = self.base_request(tmp_path, {})
         assert run.config.get('dense_spacing_mode') is None
         fields = {error['field'] for error in validate_session_request(paths, run)}
-        assert {'normal_x', 'normal_y', 'surf_sdt'} <= fields
+        assert {'winding_inference', 'outer_shell'} <= fields
+        assert 'surf_sdt' not in fields
 
     def test_phase_mode_requires_normals_and_sdt(self, tmp_path):
         paths, run = self.base_request(tmp_path, {
+            'dense_spacing_mode': 'phase',
             'loss_weight_dense_spacing': 0.0,
             'loss_weight_dense_attachment': 0.0,
         })
@@ -589,6 +590,7 @@ class TestModeContract:
     ):
         paths, run = self.base_request(tmp_path, {
             disabled: False,
+            'dense_spacing_mode': 'phase',
             'loss_weight_dense_spacing': 12.0,
         })
         paths = replace(paths, surf_sdt=str(tmp_path / 'missing-sdt.zarr'))

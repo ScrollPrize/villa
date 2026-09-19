@@ -38,6 +38,7 @@ public:
 signals:
     void correctionsCreateRequested();
     void correctionsCollectionSelected(uint64_t collectionId);
+    void correctionsCollectionSelectionCleared();
 
 private:
     void writeSetting(const QString& key, const QVariant& value);

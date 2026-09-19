@@ -1,7 +1,9 @@
 #include "SpiralReloadComparison.hpp"
+#include "SpiralFiberRevisionUpload.hpp"
 #include "SpiralSessionSync.hpp"
 
 #include <QJsonObject>
+#include <QTemporaryFile>
 #include <QtTest/QtTest>
 
 class SpiralReloadComparisonTest final : public QObject
@@ -9,6 +11,81 @@ class SpiralReloadComparisonTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void ReconnectResumesLatestUnsentFiberAfterSynchronization()
+    {
+        QTemporaryFile snapshot;
+        QVERIFY(snapshot.open());
+        const QString snapshotPath = snapshot.fileName();
+        snapshot.close();
+        vc3d::SpiralTrackedFiber fiber;
+        fiber.added = true;
+        fiber.revision = "old-base";
+        fiber.sentGeneration = 1;
+        fiber.inFlightGeneration = 2;
+        fiber.latestGeneration = 3;
+        fiber.uploadInFlight = true;
+        fiber.snapshotPath = snapshotPath;
+        fiber.abandonUpload();
+        QVERIFY(!fiber.uploadInFlight);
+        QCOMPARE(fiber.inFlightGeneration, uint64_t(0));
+        QVERIFY(fiber.snapshotPath.isEmpty());
+        QVERIFY(!QFile::exists(snapshotPath));
+        QCOMPARE(fiber.sentGeneration, uint64_t(1));
+        QCOMPARE(fiber.latestGeneration, uint64_t(3));
+        QVERIFY(!fiber.needsUpload(false));
+        fiber.revision = "synchronized-base";
+        QVERIFY(fiber.needsUpload(true));
+        fiber.uploadInFlight = true;
+        QVERIFY(!fiber.needsUpload(true));
+    }
+
+    void ReconnectRetriesInitialFiberAbsentFromLedger()
+    {
+        vc3d::SpiralTrackedFiber fiber;
+        fiber.uploadInFlight = true;
+        fiber.abandonUpload();
+        fiber.abandonUpload(); // Repeated disconnects preserve the pending save.
+        QVERIFY(!fiber.needsUpload(false));
+        QVERIFY(fiber.needsUpload(true));
+        fiber.retryAfterReconnect = false;
+        fiber.added = true;
+        QVERIFY(!fiber.needsUpload(true));
+        fiber.latestGeneration = 1;
+        QVERIFY(!fiber.needsUpload(false));
+        QVERIFY(fiber.needsUpload(true));
+    }
+
+    void FiberCasConflictPreservesCurrentRevisionForRetry()
+    {
+        const QJsonObject conflict{
+            {"error", "fiber revision conflict"},
+            {"current_revision", "revision-2"},
+        };
+        const QString current =
+            vc3d::spiralFiberConflictRevision(conflict);
+
+        QCOMPARE(current, QStringLiteral("revision-2"));
+        QVERIFY(vc3d::spiralFiberUploadNeedsCasRetry(
+            current, conflict["error"].toString()));
+        QVERIFY(!vc3d::spiralFiberUploadNeedsCasRetry(
+            {}, conflict["error"].toString()));
+        QVERIFY(!vc3d::spiralFiberUploadNeedsCasRetry(current, {}));
+    }
+
+    void FiberInputIdIsTheFileStemNotTheRuntimeId()
+    {
+        // The service commits fibers to paths.fibers/<id>.json and the
+        // fitter identifies dataset fibers by stem, so uploading by stem
+        // replaces the resident fiber instead of adding "<number>.json".
+        QCOMPARE(vc3d::spiralFiberInputId(
+                     QStringLiteral("/data/fibers/sean_20260901T120000_3.json")),
+                 QStringLiteral("sean_20260901T120000_3"));
+        QCOMPARE(vc3d::spiralFiberInputId(
+                     QStringLiteral("/data/fibers/scroll.a.json")),
+                 QStringLiteral("scroll.a"));
+        QVERIFY(vc3d::spiralFiberInputId(QString()).isEmpty());
+    }
+
     void CheckpointLoadInitializesWithoutProfileOverrides()
     {
         const QJsonObject request{
@@ -109,6 +186,31 @@ private slots:
         QCOMPARE(configuration["optimizer_learning_rate"].toDouble(), 3e-5);
         QVERIFY(!configuration.contains("z_begin"));
         QVERIFY(!configuration.contains("z_end"));
+    }
+
+    void RunPayloadAlwaysCarriesIndependentDtLossSchedule()
+    {
+        const QJsonObject configuration{{"loss_weight_patch_radius", 8.0}};
+        const QJsonObject influence{{"influence_enabled", false}};
+        const QJsonObject preview{
+            {"cadence_iterations", 100}, {"diagnostics", false}};
+        const QList<QJsonObject> schedules{
+            QJsonObject{{"enabled", false}, {"last_fraction", 0.25}},
+            QJsonObject{{"enabled", true}, {"last_fraction", 0.0}},
+            QJsonObject{{"enabled", true}, {"last_fraction", 0.25}},
+            QJsonObject{{"enabled", true}, {"last_fraction", 1.0}},
+        };
+
+        for (const QJsonObject& schedule : schedules) {
+            const QJsonObject payload = vc3d::spiralRunRequest(
+                configuration, 10'000, influence, schedule, 42, preview);
+            QCOMPARE(payload["configuration"].toObject(), configuration);
+            QCOMPARE(payload["iterations"].toInt(), 10'000);
+            QCOMPARE(payload["influence"].toObject(), influence);
+            QCOMPARE(payload["dt_loss_schedule"].toObject(), schedule);
+            QCOMPARE(payload["expected_session_revision"].toInt(), 42);
+            QCOMPARE(payload["preview_schedule"].toObject(), preview);
+        }
     }
 
     void EffectiveAdvancedConfigurationExcludesDockOwnedZRange()

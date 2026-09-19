@@ -88,6 +88,10 @@ public:
         QGraphicsPathItem* pendingBranchControlPoints = nullptr;
         QGraphicsPathItem* sameHvBranchControlPoints = nullptr;
         QGraphicsPathItem* sameHvPendingBranchControlPoints = nullptr;
+        // Hollow yellow rings of kollesis-tagged points, drawn over whichever
+        // fill (link state) the point keeps; an unlinked tagged point has no
+        // fill at all.
+        QGraphicsPathItem* kollesisRings = nullptr;
         QGraphicsPathItem* fiberIntersections = nullptr;
         QGraphicsPathItem* linkCandidateFiberIntersections = nullptr;
         // One item per link state (kLinkStateCount, indexed by
@@ -225,6 +229,9 @@ signals:
     void generatedControlPointLinkCandidateRequested(const std::string& surfaceName,
                                                      size_t controlPointIndex,
                                                      cv::Vec3f volumePoint);
+    void generatedControlPointAdjacentLinkCandidateRequested(const std::string& surfaceName,
+                                                             size_t controlPointIndex,
+                                                             cv::Vec3f volumePoint);
     void generatedControlPointLinkWithCandidateRequested(const std::string& surfaceName,
                                                          size_t controlPointIndex,
                                                          cv::Vec3f volumePoint);
@@ -254,6 +261,9 @@ signals:
                                                     size_t firstControlPointIndex,
                                                     size_t secondControlPointIndex,
                                                     const std::string& goal);
+    void generatedControlPointKollesisTerminationChangeRequested(const std::string& surfaceName,
+                                                                 size_t controlPointIndex,
+                                                                 bool enabled);
     void generatedPredSnapPointRequested(const std::string& surfaceName,
                                          cv::Vec3f volumePoint);
     void generatedSideStripIntersectionQueryRequested(const std::string& surfaceName);

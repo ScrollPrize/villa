@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from sample_spiral import (
+    get_radial_normal_stretch,
     get_theta_and_radii,
     get_theta_crossing_step_adjustments,
     radius_from_unwrapped_shifted,
@@ -635,7 +636,10 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
     # Shared front-half of the per-strip satisfaction pass: given a flat bundle
     # from the caller, transform points into spiral space, unwrap theta across
     # strip boundaries, and produce the per-point normalised
-    # shifted-radius (`unwrapped_shifted - windings * dr`). Returns
+    # shifted-radius (`unwrapped_shifted - windings * dr - radial_offsets`, the
+    # offsets converted from input-frame voxels along the sheet normal to spiral
+    # radius by the transform's local normal stretch; positive = the fiber sits
+    # outside its winding, on the sheet's back face). Returns
     # `(ctx, lengths_cpu, num_strips)` where `ctx` is None when there are no
     # points; downstream target-winding selectors (median / mode) operate on
     # `ctx['normalised_radii']` and feed the picked per-strip target through
@@ -662,6 +666,9 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
 
     zyxs = flat['zyxs']
     windings = flat['windings']
+    radial_offsets = flat.get('radial_offsets')
+    if radial_offsets is None:
+        radial_offsets = torch.zeros_like(windings)
     strip_id = flat['strip_id']
     starts = flat['starts']
     lengths = flat['lengths']
@@ -670,6 +677,10 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
 
     with torch.no_grad():
         spiral_zyxs = transform_in_chunks(zyxs, slice_to_spiral_transform)
+        if bool((radial_offsets != 0).any()):
+            radial_offsets = radial_offsets * get_radial_normal_stretch(
+                slice_to_spiral_transform, zyxs, spiral_zyx=spiral_zyxs,
+                chunk_size=chunk)
         theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
 
         # Segmented version of _unwrap_track_shifted_radii: build
@@ -690,7 +701,7 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
             adjustments = torch.zeros_like(shifted_radii)
         unwrapped_shifted = shifted_radii + adjustments
 
-        normalised_radii = unwrapped_shifted - windings * dr
+        normalised_radii = unwrapped_shifted - windings * dr - radial_offsets
 
     ctx = {
         'spiral_tolerance': spiral_tolerance,
@@ -703,6 +714,7 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
         'slice_to_spiral_transform': slice_to_spiral_transform,
         'zyxs': zyxs,
         'windings': windings,
+        'radial_offsets': radial_offsets,
         'strip_id': strip_id,
         'starts': starts,
         'lengths': lengths,
@@ -726,6 +738,7 @@ def _strip_satisfaction_from_target(ctx, target_normalised_per_strip):
     S = ctx['S']
     strip_id = ctx['strip_id']
     windings = ctx['windings']
+    radial_offsets = ctx['radial_offsets']
     theta = ctx['theta']
     adjustments = ctx['adjustments']
     unwrapped_shifted = ctx['unwrapped_shifted']
@@ -739,7 +752,7 @@ def _strip_satisfaction_from_target(ctx, target_normalised_per_strip):
 
     with torch.no_grad():
         target_normalised = target_normalised_per_strip[strip_id]
-        target_shifted = target_normalised + windings * dr
+        target_shifted = target_normalised + windings * dr + radial_offsets
         spiral_in_band = (unwrapped_shifted - target_shifted).abs() <= spiral_tolerance
 
         target_radii = radius_from_unwrapped_shifted(

@@ -18,13 +18,21 @@ def test_catalog_covers_every_fit_input_path_field():
     assert set(SCROLL_SPEC_PATH_OVERRIDE_KEYS) == keys - {"pcls"}
 
 
+def test_omitted_spacing_mode_uses_fitter_default():
+    explicit = {"dense_spacing_mode": Config().dense_spacing_mode}
+    for spec in FIT_INPUT_CATALOG:
+        assert spec.enabled({}) == spec.enabled(explicit), spec.key
+        assert spec.required({}) == spec.required(explicit), spec.key
+
+
 def test_outer_shell_is_required_by_shell_losses_or_winding_model():
     spec = fit_input("outer_shell")
     assert spec.kind == "directory"
     # Required by either shell loss weight (the outer weight defaults on) or
     # by winding-model supervision even when both shell losses are disabled.
     assert spec.required({}) is True
-    assert spec.required({"loss_weight_shell_outer": 0.0,
+    assert spec.required({"dense_spacing_mode": "phase",
+                          "loss_weight_shell_outer": 0.0,
                           "loss_weight_shell_patch_radius": 0.0}) is False
     assert spec.required({"loss_weight_shell_outer": 0.0,
                           "loss_weight_shell_patch_radius": 2.0}) is True
@@ -46,12 +54,13 @@ def test_model_configuration_is_a_new_fit_change():
 
 
 def test_lasagna_store_predicates_reproduce_the_mode_contract():
-    # phase (the default) requires normals and the SDT even at zero
+    # Phase requires normals and the SDT even at zero
     # sub-weights; grad_mag requires the gradient store only with a positive
     # spacing weight and never the SDT; an invalid mode enables nothing.
-    assert fit_input("normal_x").required({}) is True
-    assert fit_input("surf_sdt").required({}) is True
-    assert fit_input("gradient_magnitude").required({}) is False
+    phase = {"dense_spacing_mode": "phase"}
+    assert fit_input("normal_x").required(phase) is True
+    assert fit_input("surf_sdt").required(phase) is True
+    assert fit_input("gradient_magnitude").required(phase) is False
 
     grad = {"dense_spacing_mode": "grad_mag",
             "loss_weight_dense_normals": 0.0}
