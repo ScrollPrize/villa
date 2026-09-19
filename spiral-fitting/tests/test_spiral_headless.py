@@ -12,11 +12,13 @@ from unittest import mock
 import numpy as np
 import torch
 
+from config import Config
 from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADATA_NAME,
                          AUTOSAVE_METADATA_SCHEMA, PclInputSpec, PclRole,
                          ScrollSpecError, SessionState, SpiralInputPaths,
-                         load_scroll_spec, resolve_dataset_root,
-                         resolve_logical_dbm, validate_checkpoint_container)
+                         SpiralRunConfig, load_scroll_spec,
+                         resolve_dataset_root, resolve_logical_dbm,
+                         validate_checkpoint_container)
 import spiral_runtime
 from spiral_progress import NullProgressReporter
 from spiral_runtime import (CommandBarrier, CommandBarrierViolation,
@@ -98,11 +100,27 @@ class ScrollSpecTests(unittest.TestCase):
             self.assertEqual(spec.name, "s1")
             self.assertEqual(spec.spiral_outward_sense, "CW")
             self.assertIsNone(spec.base_shape_zyx)
+            self.assertIsNone(spec.winding_count)
+            self.assertEqual(spec.config_defaults(), {})
             self.assertEqual(spec.umbilicus_coordinate_scale, 1.0)
             self.assertEqual(spec.normal_zarr_group, "4")
             self.assertEqual(spec.surf_sdt_zarr_group, "1")
             self.assertEqual(spec.lasagna_scale, 4)
             self.assertEqual(spec.path_overrides, ())
+
+    def test_winding_count_is_validated_and_seeds_the_fit_defaults(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            write_scroll_spec(temporary, winding_count=90)
+            spec = load_scroll_spec(temporary)
+            self.assertEqual(spec.winding_count, 90)
+            self.assertEqual(spec.manifest()["winding_count"], 90)
+            self.assertEqual(spec.config_defaults(), {
+                "shell_outer_winding_idx": 90,
+                "model_gap_expander_num_windings": 90})
+            for invalid in (0, 1, 2.5, "90", True):
+                write_scroll_spec(temporary, winding_count=invalid)
+                with self.assertRaisesRegex(ScrollSpecError, "winding_count"):
+                    load_scroll_spec(temporary)
 
     def test_base_shape_is_validated_and_preserved(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -144,6 +162,52 @@ class ScrollSpecTests(unittest.TestCase):
             self.assertEqual(result.scroll_spec["name"], "s1")
             self.assertEqual(result.resolved["umbilicus"],
                              str(root.resolve() / "annotations" / "umbilicus.json"))
+
+
+class SessionConfigResolutionTests(unittest.TestCase):
+    """A resident session's defaults come from the dataset's scroll spec."""
+
+    def _resolve(self, temporary, advanced=None, **spec_extra):
+        write_scroll_spec(temporary, **spec_extra)
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._status_callback = None
+        session._event_callback = None
+        session.paths = SpiralInputPaths(dataset_root=temporary)
+        session.run_config = SpiralRunConfig(
+            z_begin=100, z_end=900, config=dict(advanced or {}))
+        session.scroll = load_scroll_spec(temporary)
+        config = session._resolve_session_config(world_size=1)
+        return config, session._default_advanced_config
+
+    def test_winding_count_seeds_the_applied_and_default_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config, default = self._resolve(temporary, winding_count=90)
+            self.assertEqual(config["shell_outer_winding_idx"], 90)
+            self.assertEqual(config["model_gap_expander_num_windings"], 90)
+            # Default is what a client falls back to, so it carries the
+            # scroll's count rather than the Python baseline.
+            self.assertEqual(default["shell_outer_winding_idx"], 90)
+            self.assertEqual(default["model_gap_expander_num_windings"], 90)
+
+    def test_without_a_winding_count_the_python_defaults_stand(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config, default = self._resolve(temporary)
+            baseline = Config()
+            self.assertEqual(config["shell_outer_winding_idx"],
+                             baseline.shell_outer_winding_idx)
+            self.assertEqual(config["model_gap_expander_num_windings"],
+                             baseline.model_gap_expander_num_windings)
+            self.assertEqual(default["shell_outer_winding_idx"],
+                             baseline.shell_outer_winding_idx)
+
+    def test_advanced_overrides_win_over_the_winding_count(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config, _ = self._resolve(
+                temporary, advanced={"shell_outer_winding_idx": 70},
+                winding_count=90)
+            self.assertEqual(config["shell_outer_winding_idx"], 70)
+            self.assertEqual(config["model_gap_expander_num_windings"], 90)
 
 
 class DatasetResolverTests(unittest.TestCase):

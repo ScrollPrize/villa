@@ -917,15 +917,20 @@ class InteractiveFitSession:
 
         The one place a session's applied configuration is derived, so a
         model-stage rebuild reproduces exactly the chain the initial build
-        ran: the Python defaults, the resume checkpoint's stored ``cfg``, the
-        request's advanced overrides, z-range/DDP count scaling, and finally
-        the explicit sample counts that must not be scaled twice. It reads
-        ``self.paths`` and ``self.run_config``, so replacing either and
-        calling it again is all a rebuild needs.
+        ran: the Python defaults, the scroll specification's winding count,
+        the resume checkpoint's stored ``cfg``, the request's advanced
+        overrides, z-range/DDP count scaling, and finally the explicit sample
+        counts that must not be scaled twice. It reads ``self.paths`` and
+        ``self.run_config``, so replacing either and calling it again is all
+        a rebuild needs.
         """
         from spiral_helpers import scale_and_split_counts
 
         config = Config().as_dict()
+        # The dataset states its own winding count (spiral-scroll.json
+        # winding_count); a checkpoint's resolved cfg and the request's
+        # advanced overrides below still win over it.
+        config.update(self.scroll.config_defaults())
         checkpoint_profile_config = None
         if self.paths.checkpoint:
             self._progress_reporter().begin(
@@ -1003,7 +1008,8 @@ class InteractiveFitSession:
         if checkpoint_profile_config is not None:
             default_advanced_config = checkpoint_profile_config
         else:
-            # Without a checkpoint, Default is the Python baseline.
+            # Without a checkpoint, Default is the Python baseline plus what
+            # the scroll specification states.
             default_advanced_config = copy.deepcopy(config)
         # Explicit sample-count overrides are literal active counts. This
         # lets VC3D round-trip the host's post-scaling values through a

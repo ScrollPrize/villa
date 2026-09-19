@@ -194,6 +194,7 @@ def run(spec_path, result_path, out_dir):
     # exactly as the CLI uses it: an optional (disabled) logging sink, never
     # a source of configuration.
     config = Config().as_dict()
+    config.update(scroll.config_defaults())
     config.update(spec.get('config_overrides', {}))
     config['z_begin'] = spec['z_begin']
     config['z_end'] = spec['z_end']

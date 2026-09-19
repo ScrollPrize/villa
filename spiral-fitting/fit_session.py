@@ -641,6 +641,32 @@ class ScrollSpecError(ValueError):
     """A missing, malformed, or out-of-contract spiral-scroll.json."""
 
 
+# Fitter configuration keys a scroll specification's winding_count seeds: the
+# outer bound every cylinder sampler and the exporter run out to, and the
+# exporters' legacy physical estimate. Their Python defaults in config.Config
+# are still the PHercParis4 scroll's 130 windings, kept only as the fallback
+# for a dataset whose specification states no count.
+SCROLL_SPEC_WINDING_COUNT_CONFIG_KEYS = (
+    "shell_outer_winding_idx",
+    "model_gap_expander_num_windings",
+)
+
+
+def scroll_spec_config_defaults(winding_count: int | None) -> dict[str, Any]:
+    """The fitter configuration defaults a scroll's winding count implies.
+
+    Applied over ``Config().as_dict()`` and under every explicit source of
+    configuration (FIT_SPIRAL_CONFIG_OVERRIDES, a session request's advanced
+    config, a checkpoint's stored ``cfg``), so the dataset supplies the
+    default and callers still win. Empty when the specification carries no
+    winding_count, leaving the Python defaults untouched.
+    """
+    if winding_count is None:
+        return {}
+    return {key: int(winding_count)
+            for key in SCROLL_SPEC_WINDING_COUNT_CONFIG_KEYS}
+
+
 @dataclass(frozen=True)
 class ScrollSpec:
     """Physical/dataset facts of one scroll, parsed from spiral-scroll.json.
@@ -657,6 +683,10 @@ class ScrollSpec:
     # Shape of the volume coordinate domain used by Spiral surfaces. This is
     # independent of physical voxel size and may be absent in legacy specs.
     base_shape_zyx: tuple[int, int, int] | None = None
+    # How many windings the scroll has from the umbilicus to its outer edge.
+    # Seeds the fitter's winding-count settings (see config_defaults()); None
+    # leaves them at their Python defaults, which are PHercParis4's.
+    winding_count: int | None = None
     umbilicus_coordinate_scale: float = 1.0
     normal_zarr_group: str = "4"
     surf_sdt_zarr_group: str = "1"
@@ -666,6 +696,10 @@ class ScrollSpec:
 
     def path_override(self, key: str) -> str:
         return dict(self.path_overrides).get(key, "")
+
+    def config_defaults(self) -> dict[str, Any]:
+        """Fitter configuration defaults this specification implies."""
+        return scroll_spec_config_defaults(self.winding_count)
 
     def manifest(self) -> dict[str, Any]:
         result = asdict(self)
@@ -733,6 +767,14 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
     if type(lasagna_scale) is not int or lasagna_scale <= 0:
         raise ScrollSpecError(f"{source}: lasagna_scale must be a positive integer")
 
+    # 2 is the smallest outer winding the fitter samples out to (see
+    # spiral_helpers._resolve_shell_outer_winding_idx).
+    winding_count = document.get("winding_count")
+    if winding_count is not None and (
+            type(winding_count) is not int or winding_count < 2):
+        raise ScrollSpecError(
+            f"{source}: winding_count must be an integer of at least 2")
+
     paths = document.get("paths", {})
     if not isinstance(paths, Mapping):
         raise ScrollSpecError(f"{source}: paths must be an object")
@@ -754,6 +796,7 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
         voxel_size_um=voxel_size_um,
         spiral_outward_sense=sense,
         base_shape_zyx=base_shape_zyx,
+        winding_count=winding_count,
         umbilicus_coordinate_scale=coordinate_scale,
         normal_zarr_group=str(document.get("normal_zarr_group", "4")),
         surf_sdt_zarr_group=str(document.get("surf_sdt_zarr_group", "1")),
