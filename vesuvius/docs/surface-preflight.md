@@ -72,4 +72,38 @@ This is an input-pairing preflight, not a proof of surface correctness. It does
 not replace geometric diagnostics such as self-intersection or local
 orientation analysis.
 
-<!-- REAL EXAMPLE -->
+## Example: catching an empty `vc_obj2tifxyz` export
+
+Round-tripping the public Scroll 1 segment
+`https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s1/autogens/02201554/`
+(196x225 grid, `scale = [0.05, 0.05]`) through `vc_tifxyz2obj` and then
+`vc_obj2tifxyz --uv-non-metric` (VC3D build `f07d33b`) produced a 2x2 grid with
+no valid points, yet the converter exited `0`:
+
+```text
+Final grid: 2 x 2
+Valid grid points: 0 / 4 (0%)
+Warning: no valid grid points were rasterized.
+Saving to tifxyz format...
+Successfully converted to tifxyz format
+```
+
+Before this change the preflight could not inspect that output without a CT
+volume (`error: the following arguments are required: --volume`). Now:
+
+```bash
+vesuvius.surface_preflight --surface out_nonmetric --output preflight.json
+```
+
+```text
+FAIL: preflight.json
+valid_surface_vertices: surface has no valid vertices (all coordinates are sentinel/invalid); the producer emitted an empty grid
+valid_surface_quads: surface has no connected valid quads
+tifxyz_scale_consistency: grid has no positive columns spacing pairs to compare with meta.json scale
+tifxyz_bbox_consistency: no valid vertices to compare against bbox
+```
+
+with exit code `2`. The same segment re-exported with
+`--tifxyz-source=<segment>` (224x195 grid, `scale = [0.05, 0.05]`) passes: the
+measured median spacing is `19.98` voxels per cell against the `20.0` implied
+by the metadata.
