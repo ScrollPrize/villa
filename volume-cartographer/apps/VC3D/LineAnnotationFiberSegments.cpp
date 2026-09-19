@@ -632,7 +632,8 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         request.controlPoints.front().optimizedIndex = controlIndex;
         request.controlPoints.front().linePosition =
             static_cast<double>(controlIndex);
-        if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d) {
+        if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d &&
+            request.retainOpenTails) {
             const int shift = replaceOpenTailsWithNative(
                 request, coordinates, controlIndex, controlIndex, output);
             request.controlPoints.front().optimizedIndex += shift;
@@ -872,9 +873,11 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     const auto stitch = [&]() {
         std::pair<std::vector<cv::Vec3d>, std::vector<int>> value;
         auto& [points, indices] = value;
-        points.insert(points.end(), request.linePointsBase.begin(),
-                      request.linePointsBase.begin() +
-                          static_cast<std::ptrdiff_t>(originalControlIndices.front()));
+        if (request.retainOpenTails) {
+            points.insert(points.end(), request.linePointsBase.begin(),
+                          request.linePointsBase.begin() +
+                              static_cast<std::ptrdiff_t>(originalControlIndices.front()));
+        }
         indices.reserve(request.controlPoints.size());
         for (size_t spanIndex = 0; spanIndex < spans.size(); ++spanIndex) {
             const auto& span = spans[spanIndex];
@@ -888,10 +891,12 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             }
             indices.push_back(static_cast<int>(points.size()) - 1);
         }
-        points.insert(points.end(),
-                      request.linePointsBase.begin() +
-                          static_cast<std::ptrdiff_t>(originalControlIndices.back() + 1),
-                      request.linePointsBase.end());
+        if (request.retainOpenTails) {
+            points.insert(points.end(),
+                          request.linePointsBase.begin() +
+                              static_cast<std::ptrdiff_t>(originalControlIndices.back() + 1),
+                          request.linePointsBase.end());
+        }
         return value;
     };
 
@@ -1003,13 +1008,55 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         request.controlPoints[index].linePosition =
             static_cast<double>(reinitialized.fixedPointIndices[index]);
     }
-    if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d) {
+    if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d &&
+        request.retainOpenTails) {
         const int shift = replaceOpenTailsWithNative(
             request, coordinates, firstControl, lastControl, output);
         for (auto& control : request.controlPoints) {
             control.optimizedIndex += shift;
             control.linePosition += static_cast<double>(shift);
         }
+    }
+    if (!request.retainOpenTails) {
+        auto& line = output.optimization.line;
+        if (firstControl < 0 || lastControl < firstControl ||
+            static_cast<size_t>(lastControl) >= line.points.size()) {
+            throw std::runtime_error(
+                "bounded fiber optimization returned an invalid control span");
+        }
+        const size_t originalPointCount = line.points.size();
+        line.points.erase(line.points.begin() + lastControl + 1, line.points.end());
+        line.points.erase(line.points.begin(), line.points.begin() + firstControl);
+        if (line.segmentSamples.size() + 1 == originalPointCount) {
+            line.segmentSamples.erase(line.segmentSamples.begin() + lastControl,
+                                      line.segmentSamples.end());
+            line.segmentSamples.erase(line.segmentSamples.begin(),
+                                      line.segmentSamples.begin() + firstControl);
+        } else {
+            line.segmentSamples.clear();
+        }
+        if (line.displayFrameAnchorIndex >= 0) {
+            line.displayFrameAnchorIndex = std::clamp(
+                line.displayFrameAnchorIndex - firstControl, 0,
+                static_cast<int>(line.points.size()) - 1);
+        }
+        for (size_t index = 0; index < request.controlPoints.size(); ++index) {
+            const int boundedIndex =
+                reinitialized.fixedPointIndices[index] - firstControl;
+            request.controlPoints[index].optimizedIndex = boundedIndex;
+            request.controlPoints[index].linePosition =
+                static_cast<double>(boundedIndex);
+        }
+        if (line.points.empty()) {
+            throw std::runtime_error(
+                "bounded fiber optimization returned an empty line");
+        }
+        line.points.front().position = request.controlPoints.front().volumePoint;
+        line.points.front().sampledNormal =
+            request.baseNormalSampler->sampleNormal(line.points.front().position);
+        line.points.back().position = request.controlPoints.back().volumePoint;
+        line.points.back().sampledNormal =
+            request.baseNormalSampler->sampleNormal(line.points.back().position);
     }
     appendFiberModeReport(output);
     output.controlPoints = std::move(request.controlPoints);
@@ -1206,11 +1253,71 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
     return metadata;
 }
 
+bool hasControlPointTag(const std::vector<std::string>& tags, std::string_view tag) noexcept
+{
+    return std::find(tags.begin(), tags.end(), tag) != tags.end();
+}
+
+bool setControlPointTag(std::vector<std::string>& tags, std::string_view tag, bool enabled)
+{
+    if (tag.empty()) {
+        return false;
+    }
+    const auto it = std::find(tags.begin(), tags.end(), tag);
+    if (enabled) {
+        if (it != tags.end()) {
+            return false;
+        }
+        tags.emplace_back(tag);
+        std::sort(tags.begin(), tags.end());
+        return true;
+    }
+    if (it == tags.end()) {
+        return false;
+    }
+    tags.erase(it);
+    return true;
+}
+
+std::vector<std::string> mergedControlPointTags(const std::vector<std::string>& lhs,
+                                                const std::vector<std::string>& rhs)
+{
+    std::vector<std::string> merged = lhs;
+    for (const auto& tag : rhs) {
+        setControlPointTag(merged, tag, true);
+    }
+    return merged;
+}
+
+std::vector<std::string> controlPointTagsFromJson(const nlohmann::json& json)
+{
+    if (!json.is_array()) {
+        throw std::runtime_error("control point tags must be an array");
+    }
+    std::vector<std::string> tags;
+    for (const auto& entry : json) {
+        if (!entry.is_string()) {
+            throw std::runtime_error("control point tags entries must be strings");
+        }
+        std::string tag = entry.get<std::string>();
+        const auto first = tag.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) {
+            continue;
+        }
+        const auto last = tag.find_last_not_of(" \t\r\n");
+        setControlPointTag(tags, std::string_view(tag).substr(first, last - first + 1), true);
+    }
+    return tags;
+}
+
 nlohmann::json storedControlPointToJson(const StoredControlPoint& control)
 {
     nlohmann::json json{{"position", pointToJson(control)}};
     if (control.segmentToNext) {
         json["segment_to_next"] = fiberTraceSegmentMetadataToJson(*control.segmentToNext);
+    }
+    if (!control.tags.empty()) {
+        json["tags"] = control.tags;
     }
     return json;
 }
@@ -1223,10 +1330,13 @@ StoredControlPoint storedControlPointFromJson(const nlohmann::json& json, int fi
     if (fiberVersion != 3 || !json.is_object()) {
         throw std::runtime_error("version-3 control point entries must be objects");
     }
-    rejectUnknownKeys(json, {"position", "segment_to_next"}, "control point");
+    rejectUnknownKeys(json, {"position", "segment_to_next", "tags"}, "control point");
     StoredControlPoint control{pointFromJson(json.at("position"))};
     if (json.contains("segment_to_next")) {
         control.segmentToNext = fiberTraceSegmentMetadataFromJson(json.at("segment_to_next"));
+    }
+    if (json.contains("tags")) {
+        control.tags = controlPointTagsFromJson(json.at("tags"));
     }
     return control;
 }
@@ -1269,6 +1379,7 @@ std::vector<LineControlPoint> mergeOptimizerControlPoints(std::vector<vc::lasagn
     for (size_t index = 0; index < optimized.size(); ++index) {
         LineControlPoint merged{optimized[index]};
         merged.segmentToNext = original[index].segmentToNext;
+        merged.tags = original[index].tags;
         result.push_back(std::move(merged));
     }
     return result;
@@ -1309,6 +1420,9 @@ ControlPointCollapseResult collapseControlPointsAtClick(
         size_t rightmost = collapsedIndices.front();
         for (const size_t index : collapsedIndices) {
             replacement.isSeed = replacement.isSeed || controls[index].isSeed;
+            // Tags belong to the point: the click that replaces a tagged
+            // control keeps its tags (union over every collapsed control).
+            replacement.tags = mergedControlPointTags(replacement.tags, controls[index].tags);
             if (controls[index].linePosition > controls[rightmost].linePosition) {
                 rightmost = index;
             }
@@ -2278,6 +2392,7 @@ std::vector<StoredControlPoint> reversedStoredControlPoints(
     for (size_t j = 0; j < count; ++j) {
         StoredControlPoint control{
             static_cast<const cv::Vec3d&>(controls[count - 1 - j])};
+        control.tags = controls[count - 1 - j].tags;
         // Span j of the reversed fiber is span (n-2-j) of the original run
         // in the opposite direction; its descriptor travels with it. The
         // new final CP carries none.

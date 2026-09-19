@@ -17,7 +17,13 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from vesuvius.tifxyz_canvas import full_resolution_extent
+
 InterpolationMethod = Literal["linear", "bspline", "catmull_rom"]
+
+
+# Shared with tifxyz_label_transfer so the package has one canvas definition.
+_full_resolution_extent = full_resolution_extent
 
 
 @dataclass
@@ -177,11 +183,7 @@ class Tifxyz:
         if self.resolution == "stored":
             return self._x.shape  # type: ignore[return-value]
         # Full resolution
-        h, w = self._x.shape
-        scale_y, scale_x = self._scale
-        if scale_y == 0 or scale_x == 0:
-            return (h, w)
-        return (int(h / scale_y), int(w / scale_x))
+        return self.full_resolution_shape
 
     @property
     def full_resolution_shape(self) -> Tuple[int, int]:
@@ -194,7 +196,10 @@ class Tifxyz:
         scale_y, scale_x = self._scale
         if scale_y == 0 or scale_x == 0:
             return (h, w)
-        return (int(h / scale_y), int(w / scale_x))
+        return (
+            _full_resolution_extent(h, scale_y),
+            _full_resolution_extent(w, scale_x),
+        )
 
     @property
     def _stored_shape(self) -> Tuple[int, int]:

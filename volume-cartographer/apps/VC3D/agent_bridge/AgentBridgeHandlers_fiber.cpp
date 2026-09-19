@@ -28,7 +28,6 @@
 #include <limits>
 #include <set>
 #include <string>
-#include <unordered_set>
 
 #include "CWindow.hpp"
 #include "AxisAlignedSliceController.hpp"
@@ -393,28 +392,34 @@ QJsonObject AgentBridgeServer::handleFiberDelete(const QJsonValue& params)
     for (uint64_t id : ids)
         requireKnownFiber(ctrl, id);
 
-    const QString err = captureFiberError(ctrl, [&] { ctrl->deleteFibers(ids); });
+    vc3d::line_annotation::FiberDeleteOutcome outcome;
+    const QString err = captureFiberError(ctrl, [&] { outcome = ctrl->deleteFibers(ids); });
 
-    // Determine what actually got removed (deleteFibers continues past
-    // per-file failures).
-    std::unordered_set<uint64_t> remaining;
-    for (const auto& s : ctrl->fiberSummaries())
-        remaining.insert(s.id);
+    // What was removed (or found already absent), in terms of the file names
+    // captured before the controller's save drain: the package can change during that drain,
+    // so "is the requested id still listed" is not the question. deleteFibers
+    // continues past per-file failures.
     QJsonArray deleted;
-    bool allDeleted = true;
+    bool allDeleted = !outcome.aborted;
     for (uint64_t id : ids) {
-        if (remaining.count(id)) {
-            allDeleted = false;
-        } else {
+        if (outcome.deletedRequested(id)) {
             deleted.push_back(QString::number(id));
+        } else {
+            allDeleted = false;
         }
     }
     if (!allDeleted) {
         QJsonObject data;
-        data["detail"] = err.isEmpty()
-            ? QStringLiteral("some fibers could not be deleted") : err;
+        const QString detail = !err.isEmpty() ? err
+            : !outcome.error.empty() ? QString::fromStdString(outcome.error)
+            : QStringLiteral("some fibers could not be deleted");
+        data["detail"] = detail;
         data["deleted"] = deleted;
-        throw AgentBridgeError{-32005, "fiber.delete partially failed", data};
+        data["aborted"] = outcome.aborted;
+        throw AgentBridgeError{-32005,
+                               outcome.aborted ? "fiber.delete aborted"
+                                               : "fiber.delete partially failed",
+                               data};
     }
 
     QJsonObject result;

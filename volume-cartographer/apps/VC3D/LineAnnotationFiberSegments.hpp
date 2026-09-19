@@ -6,6 +6,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -134,6 +135,10 @@ struct FiberTraceSegmentMetadata {
 
 struct LineControlPoint : vc::lasagna::LineControlPoint {
     std::optional<FiberTraceSegmentMetadata> segmentToNext;
+    // Per-control-point tags (see kKollesisTerminationTag). Sorted, unique,
+    // non-empty; they belong to the point itself and travel with it through
+    // every edit, unlike segmentToNext which belongs to the span.
+    std::vector<std::string> tags;
 
     LineControlPoint() = default;
     LineControlPoint(double linePositionValue, cv::Vec3d volumePointValue, bool isSeedValue, int optimizedIndexValue)
@@ -210,6 +215,9 @@ struct PreparedControlPointEdit {
 
 struct StoredControlPoint : cv::Vec3d {
     std::optional<FiberTraceSegmentMetadata> segmentToNext;
+    // Serialized as the control point's optional "tags" array; omitted when
+    // empty so untagged fibers are written exactly as before.
+    std::vector<std::string> tags;
 
     StoredControlPoint() = default;
     explicit StoredControlPoint(const cv::Vec3d& position) : cv::Vec3d(position) {}
@@ -220,6 +228,22 @@ struct StoredControlPoint : cv::Vec3d {
 // sync. A toolbar interpolation-mode switch strips it on the save after a
 // successful re-optimization; nothing else touches it programmatically.
 inline constexpr const char* kReviewedTag = "reviewed";
+
+// Per-control-point tag: the point marks where the fiber terminates at a
+// kollesis (sheet join). Set from the control point context menu; rendered
+// pale yellow in the line annotation views and the Fiber Map.
+inline constexpr const char* kKollesisTerminationTag = "kollesis_termination";
+
+// Sorted-unique tag list helpers shared by the stored and session control
+// point types. controlPointTagsFromJson rejects anything but an array of
+// strings; blank entries are dropped.
+[[nodiscard]] bool hasControlPointTag(const std::vector<std::string>& tags,
+                                      std::string_view tag) noexcept;
+// Returns true when the list changed.
+bool setControlPointTag(std::vector<std::string>& tags, std::string_view tag, bool enabled);
+[[nodiscard]] std::vector<std::string> mergedControlPointTags(
+    const std::vector<std::string>& lhs, const std::vector<std::string>& rhs);
+[[nodiscard]] std::vector<std::string> controlPointTagsFromJson(const nlohmann::json& json);
 
 enum class FiberTraceState {
     Legacy,       // no prediction-traced spans in the stored geometry
@@ -264,6 +288,9 @@ struct FiberModeOptimizationRequest {
     std::optional<std::vector<size_t>> dirtySegments;
     bool globalGoalsOnly = false;
     bool retraceAll = false;
+    // Ordinary line annotation retains open geometry outside the controls.
+    // Spiral 2D annotation uses the controls as inclusive bounds.
+    bool retainOpenTails = true;
     std::function<void(const FiberExtrapolationFallbackDiagnostic&)>
         extrapolationFallbackCallback;
     // Cooperative cancellation (see LineOptimizationConfig::cancelFlag):

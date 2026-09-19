@@ -2610,13 +2610,34 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         if (auto* tabBar = _workspaceTabs->tabBar()) tabBar->setTabButton(spiralIndex, QTabBar::RightSide, nullptr);
         shell->deleteLater();
         connectVolumeSelector(_spiralWorkspace->volumeSelectionControl());
+        connect(_spiralWorkspace, &SpiralWorkspace::patchEditorRequested, this,
+                [this](const QString& id, const QString& path) {
+                    try {
+                        auto surface = std::make_shared<QuadSurface>(path.toStdString());
+                        surface->ensureLoaded();
+                        _state->setSurface(id.toStdString(), surface);
+                        onSurfaceActivatedPreserveEditing(id, surface.get());
+                        if (_segmentationModule) {
+                            _segmentationModule->setEditingEnabled(true);
+                            _segmentationModule->beginEditingSession(surface);
+                        }
+                    } catch (const std::exception& error) {
+                        showStatusBarMessage(QString::fromUtf8(error.what()), 15000);
+                    }
+                });
         connect(_spiralWorkspace->viewerManager(), &ViewerManager::baseViewerCreated,
                 this, [this](VolumeViewerBase* viewer) {
                     if (auto* chunked = viewer
                             ? qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())
                             : nullptr)
                         configureChunkedViewerConnections(chunked);
-                    if (_fiberOverlay && viewer) _fiberOverlay->attachViewer(viewer);
+                    if (_fiberOverlay && viewer) {
+                        _fiberOverlay->attachViewer(
+                            viewer, _spiralWorkspace->viewerManager());
+                        _fiberOverlay->setViewerBaseToViewerFactor(
+                            viewer, _spiralWorkspace->fiberBaseToPreviewFactor()
+                                        .value_or(1.0));
+                    }
                 });
         for (auto* viewer : _spiralWorkspace->viewerManager()->baseViewers()) {
             if (auto* chunked = viewer
@@ -2630,11 +2651,25 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             if (_surfacePanel) _surfacePanel->setSpiralFitAvailable(active);
             if (_fiberWidget) _fiberWidget->setSpiralFitAvailable(active);
         });
+        connect(_spiralWorkspace,
+                &SpiralWorkspace::fiberBaseToPreviewFactorChanged,
+                this, [this](double factor, bool valid) {
+                    if (!_fiberOverlay || !_spiralWorkspace ||
+                        !_spiralWorkspace->viewerManager()) return;
+                    const double applied = valid ? factor : 1.0;
+                    _spiralWorkspace->viewerManager()->forEachBaseViewer(
+                        [this, applied](VolumeViewerBase* viewer) {
+                            _fiberOverlay->setViewerBaseToViewerFactor(viewer, applied);
+                        });
+                });
     }
     _lineAnnotationController = std::make_unique<LineAnnotationController>(_state,
                                                                            _viewerManager.get(),
                                                                            this,
                                                                            this);
+    if (_spiralWorkspace)
+        _spiralWorkspace->setLineAnnotationController(
+            _lineAnnotationController.get());
     _lineAnnotationController->setVolumeSelectorFactory(
         [this](QWidget* parent) { return createAnnotationVolumeSelector(parent); });
     connect(_lineAnnotationController.get(),
@@ -2648,9 +2683,19 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::fiberSaved,
             this,
-            [this](uint64_t fiberId, uint64_t) {
+            [this](uint64_t fiberId, uint64_t generation) {
                 _fiberIntersectionCache.pruneFiber(fiberId);
                 scheduleAtlasSearchDockRefresh();
+                if (_spiralWorkspace && _lineAnnotationController) {
+                    const auto path = _lineAnnotationController->fiberFilePath(fiberId);
+                    if (!path.empty())
+                        _spiralWorkspace->noteTrackedFiberSaved(
+                            generation, QString::fromStdString(path.string()));
+                }
+            });
+    connect(_lineAnnotationController.get(), &LineAnnotationController::fiberFileRemoved,
+            this, [this](const QString& path) {
+                if (_spiralWorkspace) _spiralWorkspace->noteFiberRemoved(path);
             });
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::fibersDeleted,
@@ -2756,8 +2801,39 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _fiberOverlay->bindToViewerManager(_viewerManager.get());
     if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
         _spiralWorkspace->viewerManager()->forEachBaseViewer(
-            [this](VolumeViewerBase* viewer) { _fiberOverlay->attachViewer(viewer); });
+            [this](VolumeViewerBase* viewer) {
+                _fiberOverlay->attachViewer(
+                    viewer, _spiralWorkspace->viewerManager());
+                _fiberOverlay->setViewerBaseToViewerFactor(
+                    viewer, _spiralWorkspace->fiberBaseToPreviewFactor()
+                                .value_or(1.0));
+            });
     }
+    const auto updateMainFiberViewerScales = [this]() {
+        double factor = 1.0;
+        if (_state && _state->vpkg()) {
+            if (const auto identity = vc3d::opendata::coordinateIdentityForVolume(
+                    *_state->vpkg(), _state->currentVolumeId())) {
+                factor = 1.0 / static_cast<double>(
+                    identity->sourceCoordinateScaleFactor);
+            }
+        }
+        if (_fiberOverlay && _viewerManager) {
+            _viewerManager->forEachBaseViewer([this, factor](VolumeViewerBase* viewer) {
+                _fiberOverlay->setViewerBaseToViewerFactor(viewer, factor);
+            });
+        }
+    };
+    updateMainFiberViewerScales();
+    connect(_state, &CState::volumeChanged, this,
+            [updateMainFiberViewerScales](const std::shared_ptr<Volume>&,
+                                          const std::string&) {
+                updateMainFiberViewerScales();
+            });
+    connect(_viewerManager.get(), &ViewerManager::baseViewerCreated, this,
+            [this, updateMainFiberViewerScales](VolumeViewerBase*) {
+                updateMainFiberViewerScales();
+            });
 
     _rawPointsOverlay = std::make_unique<RawPointsOverlayController>(_state, this);
     _viewerManager->setRawPointsOverlay(_rawPointsOverlay.get());
@@ -3601,6 +3677,24 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             }
                         }
 
+                        if (_spiralWorkspace &&
+                            _spiralWorkspace->isFlattenedViewer(viewer)) {
+                            QAction* spiralLineAction =
+                                menu.addAction(tr("2D line annotation"));
+                            spiralLineAction->setObjectName(
+                                QStringLiteral("spiral2dLineAnnotationAction"));
+                            const QString reason = _spiralWorkspace
+                                                       ->lineAnnotationDraftUnavailableReason();
+                            spiralLineAction->setEnabled(reason.isEmpty());
+                            spiralLineAction->setToolTip(reason);
+                            connect(spiralLineAction, &QAction::triggered, this,
+                                    [this]() {
+                                        if (_spiralWorkspace)
+                                            _spiralWorkspace->startLineAnnotationDraft();
+                                    });
+                            menu.addSeparator();
+                        }
+
                         QAction* newLineAnnotationAction = menu.addAction(tr("New line annotation"));
                         newLineAnnotationAction->setEnabled(
                             _lineAnnotationController &&
@@ -3857,10 +3951,14 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
     if (_point_collection_widget && !viewer->property("vc_points_bound").toBool()) {
         connect(_point_collection_widget, &CPointCollectionWidget::collectionSelected,
                 viewer, &CChunkedVolumeViewer::onCollectionSelected, Qt::UniqueConnection);
+        connect(_point_collection_widget, &CPointCollectionWidget::collectionSelectionCleared,
+                viewer, &CChunkedVolumeViewer::clearCollectionSelection, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::sendCollectionSelected,
                 _point_collection_widget, &CPointCollectionWidget::selectCollection, Qt::UniqueConnection);
         connect(_point_collection_widget, &CPointCollectionWidget::pointSelected,
                 viewer, &CChunkedVolumeViewer::onPointSelected, Qt::UniqueConnection);
+        connect(_point_collection_widget, &CPointCollectionWidget::pointSelectionCleared,
+                viewer, &CChunkedVolumeViewer::clearPointSelection, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::pointSelected,
                 _point_collection_widget, &CPointCollectionWidget::selectPoint, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::pointClicked,
@@ -3871,10 +3969,14 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
     if (_wrapAnnotationWidget && !viewer->property("vc_wrap_annotation_bound").toBool()) {
         connect(_wrapAnnotationWidget, &WrapAnnotationWidget::collectionSelected,
                 viewer, &CChunkedVolumeViewer::onCollectionSelected, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::collectionSelectionCleared,
+                viewer, &CChunkedVolumeViewer::clearCollectionSelection, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::sendCollectionSelected,
                 _wrapAnnotationWidget, &WrapAnnotationWidget::selectCollection, Qt::UniqueConnection);
         connect(_wrapAnnotationWidget, &WrapAnnotationWidget::pointSelected,
                 viewer, &CChunkedVolumeViewer::onPointSelected, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::pointSelectionCleared,
+                viewer, &CChunkedVolumeViewer::clearPointSelection, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::pointSelected,
                 _wrapAnnotationWidget, &WrapAnnotationWidget::selectPoint, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::pointClicked,
@@ -7331,6 +7433,18 @@ void CWindow::CreateWidgets(void)
         _state->pointCollection(),
         _segmentationWidget->isEditingEnabled(),
         this);
+    _surfacePanel->setManagedDeletionHandler([this](const QString& id) {
+        return _spiralWorkspace && _state && _state->vpkg()
+            && _spiralWorkspace->stageManagedPatchRemoval(_state->vpkg()->getSurface(id.toStdString()));
+    });
+    _segmentationModule->setEditingDestinationResolver([this](const std::shared_ptr<QuadSurface>& surface) {
+        return !_spiralWorkspace || _spiralWorkspace->prepareManagedPatch(surface);
+    });
+    connect(_segmentationModule.get(), &SegmentationModule::surfaceSavedTo,
+            this, [this](const QString& path) {
+                if (_spiralWorkspace) _spiralWorkspace->noteManagedPatchSaved(path);
+            });
+
 
     if (_segmentationModule && _planeSlicingOverlay) {
         QPointer<PlaneSlicingOverlayController> overlayPtr(_planeSlicingOverlay.get());
@@ -7408,6 +7522,13 @@ void CWindow::CreateWidgets(void)
     _segmentationGrower = std::make_unique<SegmentationGrower>(growerContext, growerCallbacks, this);
 
     _segmentationCommandHandler = std::make_unique<SegmentationCommandHandler>(this, _state, this);
+    _segmentationCommandHandler->setEditingDestinationResolver([this](const std::shared_ptr<QuadSurface>& surface) {
+        return _segmentationModule->prepareEditingDestination(surface);
+    });
+    connect(_segmentationCommandHandler.get(), &SegmentationCommandHandler::surfaceSavedTo,
+            this, [this](const QString& path) {
+                if (_spiralWorkspace) _spiralWorkspace->noteManagedPatchSaved(path);
+            });
     _segmentationCommandHandler->setCmdRunner(_cmdRunner);
     _segmentationCommandHandler->setSurfacePanel(_surfacePanel.get());
     _segmentationCommandHandler->setSegmentationGrower(_segmentationGrower.get());
@@ -7610,9 +7731,23 @@ void CWindow::CreateWidgets(void)
     }
     connect(_point_collection_widget, &CPointCollectionWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
     connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);
-    connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
+    connect(_point_collection_widget, &CPointCollectionWidget::focusCollectionRequested,
+            this, [this](uint64_t collectionId) {
+                onFocusViewsRequested(collectionId, std::nullopt);
+            });
+    connect(_point_collection_widget, &CPointCollectionWidget::focusPointRequested,
+            this, [this](vc::PointRef point) {
+                onFocusViewsRequested(point.collectionId, point);
+            });
     connect(_wrapAnnotationWidget, &WrapAnnotationWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
-    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
+    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::focusCollectionRequested,
+            this, [this](uint64_t collectionId) {
+                onFocusViewsRequested(collectionId, std::nullopt);
+            });
+    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::focusPointRequested,
+            this, [this](vc::PointRef point) {
+                onFocusViewsRequested(point.collectionId, point);
+            });
     if (_pointsOverlay) {
         _pointsOverlay->setViewTolerance(_point_collection_widget->pointViewTolerance());
         connect(_point_collection_widget, &CPointCollectionWidget::pointViewToleranceChanged,
@@ -7628,10 +7763,14 @@ void CWindow::CreateWidgets(void)
             _point_collection_widget, &CPointCollectionWidget::setAnnotateChecked);
     connect(_segmentationModule.get(), &SegmentationModule::annotationPointSelected,
             _point_collection_widget, &CPointCollectionWidget::selectPoint);
+    connect(_segmentationModule.get(), &SegmentationModule::annotationSelectionCleared,
+            _point_collection_widget, &CPointCollectionWidget::clearSelection);
     connect(_segmentationModule.get(), &SegmentationModule::annotationCollectionSelected,
             _point_collection_widget, &CPointCollectionWidget::selectCollection);
     connect(_point_collection_widget, &CPointCollectionWidget::collectionSelected,
             _segmentationModule.get(), &SegmentationModule::setSelectedAnnotationCollection);
+    connect(_point_collection_widget, &CPointCollectionWidget::collectionSelectionCleared,
+            _segmentationModule.get(), &SegmentationModule::clearSelectedAnnotationCollection);
 
     // Create fiber annotation controller and dock
     _fiberController = std::make_unique<FiberAnnotationController>(
@@ -7943,7 +8082,8 @@ void CWindow::CreateWidgets(void)
                                 showStatusBarMessage(tr("Fiber %1 has no saved JSON file yet").arg(fiberId), 5000);
                                 continue;
                             }
-                            _spiralWorkspace->addFiberToCurrentFit(QString::fromStdString(path.string()));
+                            _spiralWorkspace->addFiberToCurrentFit(
+                                QString::fromStdString(path.string()));
                         }
                     });
             connect(widget,
@@ -10394,17 +10534,17 @@ void CWindow::onFocusPOIChanged(std::string name, POI* poi)
     }
 }
 
-void CWindow::onPointDoubleClicked(uint64_t pointId)
+void CWindow::onPointDoubleClicked(vc::PointRef point)
 {
-    auto point_opt = _state->pointCollection()->getPoint(pointId);
+    auto point_opt = _state->pointCollection()->getPoint(point);
     if (point_opt) {
         centerFocusAt(point_opt->p, cv::Vec3f(0, 0, 0), "");
     }
 }
 
-void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
+void CWindow::onConvertPointToAnchor(vc::PointRef point)
 {
-    auto point_opt = _state->pointCollection()->getPoint(pointId);
+    auto point_opt = _state->pointCollection()->getPoint(point);
     if (!point_opt) {
         showStatusBarMessage(tr("Point not found"), 2000);
         return;
@@ -10433,10 +10573,10 @@ void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
     cv::Vec2f anchor2d(loc_3d[0], loc_3d[1]);
 
     // Set the anchor2d on the collection
-    _state->pointCollection()->setCollectionAnchor2d(collectionId, anchor2d);
+    _state->pointCollection()->setCollectionAnchor2d(point.collectionId, anchor2d);
 
     // Remove the point (it's now represented by the anchor)
-    _state->pointCollection()->removePoint(pointId);
+    _state->pointCollection()->removePoint(point);
 
     showStatusBarMessage(tr("Converted point to anchor at grid position (%1, %2)").arg(anchor2d[0]).arg(anchor2d[1]), 3000);
 }
@@ -10931,7 +11071,7 @@ void CWindow::onCopyWithNtRequested()
     }
 }
 
-void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
+void CWindow::onFocusViewsRequested(uint64_t collectionId, std::optional<vc::PointRef> point)
 {
     if (!_state) return;
     auto* pointCollection = _state->pointCollection();
@@ -10958,8 +11098,8 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
 
     // Determine focus position
     cv::Vec3f focusPos = centroid;
-    if (pointId != 0) {
-        auto point_opt = pointCollection->getPoint(pointId);
+    if (point) {
+        auto point_opt = pointCollection->getPoint(*point);
         if (point_opt) focusPos = point_opt->p;
     }
 
