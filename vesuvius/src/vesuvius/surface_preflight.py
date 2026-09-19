@@ -242,7 +242,7 @@ def _spacing_summary(
     median = None
     if positive_count:
         target = positive_count // 2
-        median_bin = int(np.searchsorted(np.cumsum(histogram), target, side="left"))
+        median_bin = int(np.searchsorted(np.cumsum(histogram), target, side="right"))
         median = float(2 ** ((median_bin - 64 * 20 + 0.5) / 64))
     return {
         "pair_count": pair_count,
@@ -332,14 +332,7 @@ def _scan_surface(
                 )
                 row_pair_count += count
                 row_zero_length_count += zero_count
-        if valid.shape[0] > 1:
-            quads = (
-                valid[:-1, :-1]
-                & valid[1:, :-1]
-                & valid[:-1, 1:]
-                & valid[1:, 1:]
-            )
-            valid_quad_count += int(np.count_nonzero(quads))
+        if valid.shape[0]:
             column_pairs = valid[:, :-1] & valid[:, 1:]
             count, zero_count = _accumulate_spacing(
                 (xb[:, :-1], yb[:, :-1], zb[:, :-1]),
@@ -349,6 +342,14 @@ def _scan_surface(
             )
             column_pair_count += count
             column_zero_length_count += zero_count
+        if valid.shape[0] > 1:
+            quads = (
+                valid[:-1, :-1]
+                & valid[1:, :-1]
+                & valid[:-1, 1:]
+                & valid[1:, 1:]
+            )
+            valid_quad_count += int(np.count_nonzero(quads))
             row_pairs = valid[:-1, :] & valid[1:, :]
             count, zero_count = _accumulate_spacing(
                 (xb[:-1, :], yb[:-1, :], zb[:-1, :]),
@@ -490,6 +491,7 @@ def _scale_consistency(
     ratio_bounds = [1.0 / tolerance, tolerance]
     observed: dict[str, Any] = {}
     failed_axis = None
+    failed_scale = None
     for axis, name in enumerate(("columns", "rows")):
         spacing = scan["grid_spacing_voxels"][name]
         median = spacing["median_spacing_voxels"]
@@ -513,6 +515,7 @@ def _scale_consistency(
             )
         ):
             failed_axis = name
+            failed_scale = scale[axis]
 
     passed = failed_axis is None
     if passed:
@@ -526,7 +529,7 @@ def _scale_consistency(
         axis_observed = observed[failed_axis]
         message = (
             "meta.json scale disagrees with the emitted grid spacing "
-            f"({failed_axis}: scale {scale[0 if failed_axis == 'columns' else 1]:.6f} "
+            f"({failed_axis}: scale {failed_scale:.6f} "
             f"implies {axis_observed['expected_spacing_voxels']:.1f} voxels per "
             f"cell, grid measures {axis_observed['median_spacing_voxels']:.1f}); "
             "fix the producer's scale or re-export"
@@ -602,7 +605,7 @@ def _bbox_consistency(
             if passed
             else (
                 "meta.json bbox does not cover the valid vertices "
-                f"(exceeds by {max_excess:g} voxels); the bbox is stale — "
+                f"(exceeds by {max_excess:g} voxels); the bbox is stale, "
                 "rewrite it from the coordinate rasters"
             )
         ),
@@ -791,47 +794,45 @@ def inspect_pair(
             block_rows=block_rows,
         )
         report["surface"].update(scan)
-        gates.append(
-            _gate(
-                "valid_surface_vertices",
-                scan["valid_vertex_count"] > 0,
-                observed=scan["valid_vertex_count"],
-                threshold="> 0",
-                message=(
-                    "surface has valid vertices"
-                    if scan["valid_vertex_count"]
-                    else (
-                        "surface has no valid vertices (all coordinates are "
-                        "sentinel/invalid); the producer emitted an empty grid"
-                    )
+        gates.extend(
+            [
+                _gate(
+                    "valid_surface_vertices",
+                    scan["valid_vertex_count"] > 0,
+                    observed=scan["valid_vertex_count"],
+                    threshold="> 0",
+                    message=(
+                        "surface has valid vertices"
+                        if scan["valid_vertex_count"]
+                        else (
+                            "surface has no valid vertices (all coordinates are "
+                            "sentinel/invalid); the producer emitted an empty grid"
+                        )
+                    ),
                 ),
-            )
-        )
-        gates.append(
-            _gate(
-                "valid_surface_quads",
-                scan["valid_quad_count"] > 0,
-                observed=scan["valid_quad_count"],
-                threshold="> 0",
-                message=(
-                    "surface has connected quads"
-                    if scan["valid_quad_count"]
-                    else "surface has no connected valid quads"
+                _gate(
+                    "valid_surface_quads",
+                    scan["valid_quad_count"] > 0,
+                    observed=scan["valid_quad_count"],
+                    threshold="> 0",
+                    message=(
+                        "surface has connected quads"
+                        if scan["valid_quad_count"]
+                        else "surface has no connected valid quads"
+                    ),
                 ),
-            )
-        )
-        gates.append(
-            _gate(
-                "finite_selected_coordinates",
-                scan["selected_nonfinite_count"] == 0,
-                observed=scan["selected_nonfinite_count"],
-                threshold=0,
-                message=(
-                    "selected coordinates are finite"
-                    if scan["selected_nonfinite_count"] == 0
-                    else "selected coordinates include non-finite values"
+                _gate(
+                    "finite_selected_coordinates",
+                    scan["selected_nonfinite_count"] == 0,
+                    observed=scan["selected_nonfinite_count"],
+                    threshold=0,
+                    message=(
+                        "selected coordinates are finite"
+                        if scan["selected_nonfinite_count"] == 0
+                        else "selected coordinates include non-finite values"
+                    ),
                 ),
-            )
+            ]
         )
         if volume is not None:
             gates.append(
@@ -984,12 +985,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if args.output:
         _atomic_write_json(args.output, report)
+        print(f"{report['status']}: {args.output}", file=sys.stderr)
     else:
         json.dump(report, sys.stdout, indent=2, sort_keys=True, default=_json_scalar)
         sys.stdout.write("\n")
     if report["status"] == "FAIL":
-        if args.output:
-            print(f"FAIL: {args.output}", file=sys.stderr)
         for gate in report["gates"]:
             if not gate["passed"]:
                 print(f"{gate['name']}: {gate['message']}", file=sys.stderr)

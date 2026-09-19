@@ -87,6 +87,41 @@ def test_inspect_pair_surface_only_passes_without_volume(tmp_path, monkeypatch) 
     } & {gate["name"] for gate in report["gates"]}
 
 
+def test_spacing_median_handles_single_column_pair(tmp_path) -> None:
+    surface = write_surface(
+        tmp_path / "surface",
+        x=np.asarray([[1000, 1020]], dtype=np.float32),
+        y=np.asarray([[2000, 2000]], dtype=np.float32),
+        z=np.asarray([[3000, 3000]], dtype=np.float32),
+        scale=[0.05, 0.05],
+    )
+
+    report = surface_preflight.inspect_pair(surface)
+    spacing = report["surface"]["grid_spacing_voxels"]["columns"]
+
+    assert spacing["pair_count"] == 1
+    assert spacing["median_spacing_voxels"] == pytest.approx(20, rel=0.02)
+
+
+def test_spacing_accumulates_single_row_blocks(tmp_path) -> None:
+    rows, columns = np.indices((64, 48), dtype=np.float32)
+    surface = write_surface(
+        tmp_path / "surface",
+        x=1000 + columns * 20,
+        y=2000 + rows * 20,
+        z=np.full((64, 48), 3000, dtype=np.float32),
+        scale=[0.05, 0.05],
+    )
+
+    report = surface_preflight.inspect_pair(surface, block_rows=1)
+    spacing = report["surface"]["grid_spacing_voxels"]
+
+    assert spacing["columns"]["pair_count"] == 64 * 47
+    assert spacing["rows"]["pair_count"] == 63 * 48
+    assert spacing["columns"]["median_spacing_voxels"] == pytest.approx(20, rel=0.02)
+    assert spacing["rows"]["median_spacing_voxels"] == pytest.approx(20, rel=0.02)
+
+
 def test_surface_only_fails_all_sentinel_grid(tmp_path) -> None:
     sentinel = np.full((6, 8), -1.0, dtype=np.float32)
     surface = write_surface(
