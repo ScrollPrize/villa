@@ -197,11 +197,24 @@ inline std::vector<cv::Vec3d> vc3dFiberPointArrayFromJson(const nlohmann::json& 
         }
         for (const auto& [field, item] : value.items()) {
             (void)item;
-            if (field != "position" && field != "segment_to_next") {
+            if (field != "position" && field != "segment_to_next" && field != "tags") {
                 throw std::runtime_error(context + " control point contains unknown field: " + field);
             }
         }
         points.push_back(detail::pointFromJson(value.at("position"), context));
+        // Optional per-control-point tags (e.g. "kollesis_termination"): an
+        // array of strings, written by VC3D only when non-empty.
+        if (value.contains("tags")) {
+            const auto& tags = value.at("tags");
+            if (!tags.is_array()) {
+                throw std::runtime_error(context + " control point tags must be an array");
+            }
+            for (const auto& tag : tags) {
+                if (!tag.is_string()) {
+                    throw std::runtime_error(context + " control point tags entries must be strings");
+                }
+            }
+        }
         if (index + 1 == array.size()) {
             if (value.contains("segment_to_next")) {
                 throw std::runtime_error(context + " final control point cannot contain segment_to_next");

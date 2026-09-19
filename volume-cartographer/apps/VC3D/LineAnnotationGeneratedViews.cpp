@@ -1,5 +1,7 @@
 #include "LineAnnotationGeneratedViews.hpp"
 
+#include <QPainterPath>
+
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -89,6 +91,25 @@ QColor generatedCurrentLineMarkerColor(GeneratedCurrentLineMarkerState state,
 }
 
 } // namespace
+
+QColor generatedKollesisTerminationColor(int alpha)
+{
+    return QColor(255, 230, 0, alpha);
+}
+
+QPainterPath generatedTriangleMarkerPath(const QPointF& center, qreal radius)
+{
+    // Vertices at -90, 30 and 150 degrees: apex up.
+    constexpr qreal kCos30 = 0.86602540378;
+    QPolygonF triangle;
+    triangle << QPointF(center.x(), center.y() - radius)
+             << QPointF(center.x() + kCos30 * radius, center.y() + 0.5 * radius)
+             << QPointF(center.x() - kCos30 * radius, center.y() + 0.5 * radius);
+    QPainterPath path;
+    path.addPolygon(triangle);
+    path.closeSubpath();
+    return path;
+}
 
 QColor generatedLinkStateColor(bool pending, bool sameHv, int alpha)
 {
@@ -313,23 +334,52 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     splitCandidateControlPointStyle.brushColor = QColor(235, 60, 60, 175);
     splitCandidateControlPointStyle.z = 163.5;
 
+    // The transient candidate designations outrank the tag: a candidate keeps
+    // its own colour and size (the fast current-cut overlay does the same).
+    const auto drawsKollesisRing = [](const GeneratedOverlay::ControlPointMarker& control) {
+        return control.isKollesisTermination && !control.isSplitCandidate &&
+               !control.isLinkCandidate;
+    };
+    // Triangle instead of circle: an adjacent-winding link on the point, or
+    // the point designated as an adjacent link candidate (a split candidate
+    // keeps its own red circle).
+    auto drawsTriangle = [](const GeneratedOverlay::ControlPointMarker& control) {
+        if (control.isSplitCandidate) {
+            return false;
+        }
+        return control.isAdjacentLinkCandidate ||
+               (control.hasAdjacentLinks && !control.isLinkCandidate);
+    };
     auto controlStyleForMarker = [&](const GeneratedOverlay::ControlPointMarker& control)
-        -> const ViewerOverlayControllerBase::OverlayStyle& {
+        -> ViewerOverlayControllerBase::OverlayStyle {
         if (control.isSplitCandidate) {
             return splitCandidateControlPointStyle;
         }
         if (control.isLinkCandidate) {
             return linkCandidateControlPointStyle;
         }
+        const bool linked = control.hasPendingLinks || control.hasBranches;
+        ViewerOverlayControllerBase::OverlayStyle style;
         if (control.hasPendingLinks) {
-            return control.hasSameHvPendingLinks ? sameHvPendingBranchControlPointStyle
-                                                 : pendingBranchControlPointStyle;
+            style = control.hasSameHvPendingLinks ? sameHvPendingBranchControlPointStyle
+                                                  : pendingBranchControlPointStyle;
+        } else if (control.hasBranches) {
+            style = control.hasSameHvBranches ? sameHvBranchControlPointStyle
+                                              : branchControlPointStyle;
+        } else {
+            style = control.isSeed ? seedStyle : controlPointStyle;
         }
-        if (control.hasBranches) {
-            return control.hasSameHvBranches ? sameHvBranchControlPointStyle
-                                             : branchControlPointStyle;
+        if (drawsKollesisRing(control)) {
+            // Hollow ring: "yellow means control point, hollow means the
+            // fiber ends here". A linked termination keeps the link-state
+            // fill inside the ring so the link still reads.
+            style.penColor = generatedKollesisTerminationColor(245);
+            style.penWidth = 2.5;
+            if (!linked) {
+                style.brushColor = Qt::transparent;
+            }
         }
-        return control.isSeed ? seedStyle : controlPointStyle;
+        return style;
     };
 
     ViewerOverlayControllerBase::OverlayStyle markerStyle;
@@ -474,11 +524,17 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                     generatedStripControlPointToScene(viewer, quad, control,
                                                       overlay.stripPositionMap);
                 if (finiteScenePoint(controlScene)) {
-                    primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
-                        controlScene,
-                        control.hasBranches ? 6.25 : (control.isSeed ? 5.5 : 5.0),
-                        true,
-                        controlStyleForMarker(control)});
+                    const qreal radius =
+                        (control.hasBranches ? 6.25 : (control.isSeed ? 5.5 : 5.0)) +
+                        (drawsKollesisRing(control) ? 1.0 : 0.0);
+                    if (drawsTriangle(control)) {
+                        primitives.push_back(ViewerOverlayControllerBase::PainterPathPrimitive{
+                            generatedTriangleMarkerPath(controlScene, radius),
+                            controlStyleForMarker(control)});
+                    } else {
+                        primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
+                            controlScene, radius, true, controlStyleForMarker(control)});
+                    }
                 }
             }
             for (const auto& predSnap : overlay.predSnapPoints) {
@@ -570,9 +626,21 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
             }
         }
         for (const auto& control : overlay.controlPoints) {
-            addVolumePointMarker(control.point,
-                                 control.hasBranches ? 12.0 : (control.isSeed ? 11.0 : 10.0),
-                                 controlStyleForMarker(control));
+            const qreal radius = (control.hasBranches ? 12.0 : (control.isSeed ? 11.0 : 10.0)) +
+                                 (drawsKollesisRing(control) ? 2.0 : 0.0);
+            if (drawsTriangle(control) && finiteGeneratedPoint(control.point)) {
+                // Adjacent-winding links and the adjacent candidate are
+                // triangles; the path is built in scene space because the
+                // point primitives only know circles.
+                const QPointF controlScene = viewer->volumeToScene(control.point);
+                if (finiteScenePoint(controlScene)) {
+                    primitives.push_back(ViewerOverlayControllerBase::PainterPathPrimitive{
+                        generatedTriangleMarkerPath(controlScene, radius),
+                        controlStyleForMarker(control)});
+                }
+                continue;
+            }
+            addVolumePointMarker(control.point, radius, controlStyleForMarker(control));
         }
     }
 
@@ -918,11 +986,34 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     }
     QAction* deleteAction = menu.addAction(QWidget::tr("Delete control point"));
     deleteAction->setEnabled(options.controlPoints.size() > 1);
+    QAction* kollesisTerminationAction = nullptr;
+    if (options.setKollesisTermination) {
+        // Only a fiber end can be a termination. An interior point that
+        // somehow carries the tag (an edited file) can still shed it.
+        const bool haveIndex = selectedControlIndex != std::numeric_limits<size_t>::max();
+        const bool endpoint = haveIndex &&
+            generatedControlPointIsEndpoint(options.controlPoints, selectedControlIndex);
+        const bool enabled = haveIndex && (endpoint || selectedControl.isKollesisTermination);
+        kollesisTerminationAction = menu.addAction(
+            enabled ? QWidget::tr("Kollesis termination")
+                    : QWidget::tr("Kollesis termination (fiber ends only)"));
+        kollesisTerminationAction->setCheckable(true);
+        kollesisTerminationAction->setChecked(selectedControl.isKollesisTermination);
+        kollesisTerminationAction->setEnabled(enabled);
+    }
     QAction* designateLinkCandidateAction = nullptr;
     if (options.designateLinkCandidate) {
         designateLinkCandidateAction =
             menu.addAction(QWidget::tr("Designate as link candidate"));
         designateLinkCandidateAction->setEnabled(
+            selectedControlIndex != std::numeric_limits<size_t>::max() &&
+            !selectedControl.hasBranches);
+    }
+    QAction* designateAdjacentLinkCandidateAction = nullptr;
+    if (options.designateAdjacentLinkCandidate) {
+        designateAdjacentLinkCandidateAction =
+            menu.addAction(QWidget::tr("Designate as adjacent link candidate"));
+        designateAdjacentLinkCandidateAction->setEnabled(
             selectedControlIndex != std::numeric_limits<size_t>::max() &&
             !selectedControl.hasBranches);
     }
@@ -1067,6 +1158,12 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         }
         return GeneratedControlPointContextResult::Handled;
     }
+    if (kollesisTerminationAction && selected == kollesisTerminationAction &&
+        kollesisTerminationAction->isEnabled()) {
+        options.setKollesisTermination(selectedControlIndex,
+                                       !selectedControl.isKollesisTermination);
+        return GeneratedControlPointContextResult::Handled;
+    }
     for (const auto& [action, goal] : interpolationGoalActions) {
         if (selected == action) {
             options.setSegmentInterpolationGoal(
@@ -1118,6 +1215,12 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         selected == designateLinkCandidateAction &&
         designateLinkCandidateAction->isEnabled()) {
         options.designateLinkCandidate(selectedControlIndex, selectedControl.point);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (designateAdjacentLinkCandidateAction &&
+        selected == designateAdjacentLinkCandidateAction &&
+        designateAdjacentLinkCandidateAction->isEnabled()) {
+        options.designateAdjacentLinkCandidate(selectedControlIndex, selectedControl.point);
         return GeneratedControlPointContextResult::Handled;
     }
     if (linkWithCandidateAction &&

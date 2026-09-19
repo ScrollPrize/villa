@@ -1,3 +1,4 @@
+import inspect
 import types
 import unittest
 from pathlib import Path
@@ -48,7 +49,7 @@ class CartesianFlowGradientTests(unittest.TestCase):
         reference_loss = reference_output.square().sum()
         reference_loss.backward()
 
-        output = flow.get_sampler(0.0)(points)
+        output = flow.get_sampler(0)(points)
         loss = output.square().sum()
         loss.backward()
         flow.apply_accumulated_field_grad()
@@ -76,12 +77,12 @@ class CartesianFlowGradientTests(unittest.TestCase):
         points_a = torch.rand(29, 3, requires_grad=True)
         points_b = torch.rand(41, 3, requires_grad=True)
 
-        combined_sampler = combined.get_sampler(0.0)
+        combined_sampler = combined.get_sampler(0)
         (combined_sampler(points_a).square().mean()
          + combined_sampler(points_b).abs().mean()).backward()
         combined.apply_accumulated_field_grad()
 
-        streamed_sampler = streamed.get_sampler(0.0)
+        streamed_sampler = streamed.get_sampler(0)
         streamed_sampler(points_a).square().mean().backward(retain_graph=True)
         streamed_sampler(points_b).abs().mean().backward(retain_graph=True)
         streamed.apply_accumulated_field_grad()
@@ -124,7 +125,7 @@ class CylindricalFlowGradientTests(unittest.TestCase):
         reference_out_b = reference_sample(reference_b)
         (reference_out_a.square().mean() + reference_out_b.abs().mean()).backward()
 
-        sampler = flow.get_sampler(0.0)
+        sampler = flow.get_sampler(0)
         out_a = sampler(points_a)
         out_b = sampler(points_b)
         # Two independent backwards through the one cached sampler, WITHOUT
@@ -143,15 +144,15 @@ class CylindricalFlowGradientTests(unittest.TestCase):
         self.assertIsNone(flow._pending_field_graphs)
 
 
-def _make_small_spiral_model(seed, flow_field_type):
+def _make_small_spiral_model(seed, flow_field_type, device='cpu'):
     cfg = Config().as_dict()
     cfg['model_flow_field_type'] = flow_field_type
     cfg['model_gap_expander_num_windings'] = 10
     cfg['model_gap_expander_capacity_windings'] = 10
     z_span = 16 * 12  # 12 flow lattice voxels per axis at the default resolution
-    flow_min = torch.tensor([0, -96, -96], dtype=torch.int64)
-    flow_max = torch.tensor([z_span, 96, 96], dtype=torch.int64)
-    zs = torch.arange(0, z_span + 1, dtype=torch.float32)
+    flow_min = torch.tensor([0, -96, -96], dtype=torch.int64, device=device)
+    flow_max = torch.tensor([z_span, 96, 96], dtype=torch.int64, device=device)
+    zs = torch.arange(0, z_span + 1, dtype=torch.float32, device=device)
     umbilicus_zyx = torch.stack(
         [zs, torch.full_like(zs, 3.), torch.full_like(zs, -2.)], dim=-1)
     torch.manual_seed(seed)
@@ -163,7 +164,7 @@ def _make_small_spiral_model(seed, flow_field_type):
         umbilicus_zyx=umbilicus_zyx,
         config=cfg,
         spiral_outward_sense='CW',
-    )
+    ).to(device)
     with torch.no_grad():
         for parameter in model.parameters():
             if parameter.numel() > 1:
@@ -200,8 +201,7 @@ class SharedTransformLeafTests(unittest.TestCase):
         family_a, family_b = self._loss_families(
             transform, reference.get_dr_per_winding(), points_a, points_b)
         (family_a + family_b).backward()
-        for flow_field in reference.flow_fields:
-            flow_field.apply_accumulated_field_grad()
+        reference.flow_field.apply_accumulated_field_grad()
 
         shared_outputs = streamed.get_shared_transform_tensors()
         shared_leaves = tuple(
@@ -215,8 +215,7 @@ class SharedTransformLeafTests(unittest.TestCase):
         # between families ends at a detached leaf.
         leaf_a.backward()
         leaf_b.backward()
-        for flow_field in streamed.flow_fields:
-            flow_field.apply_accumulated_field_grad()
+        streamed.flow_field.apply_accumulated_field_grad()
         pending = [
             (output, leaf.grad) for output, leaf in zip(shared_outputs, shared_leaves)
             if output.requires_grad and leaf.grad is not None
@@ -239,6 +238,12 @@ class SharedTransformLeafTests(unittest.TestCase):
 
     def test_cylindrical_streamed_leaf_backwards_match_combined(self):
         self._check_streamed_leaf_backwards_match_combined('cylindrical')
+
+    def test_bspline_streamed_leaf_backwards_match_combined(self):
+        self._check_streamed_leaf_backwards_match_combined('bspline')
+
+    def test_bspline_cylindrical_streamed_leaf_backwards_match_combined(self):
+        self._check_streamed_leaf_backwards_match_combined('bspline_cylindrical')
 
 
 class DevicePatchAtlasTests(unittest.TestCase):
@@ -304,34 +309,46 @@ class DevicePatchAtlasTests(unittest.TestCase):
         self.assertEqual(atlas.register_theta_topology(crossing_map), 17)
         self.assertEqual(atlas._theta_node_ranges, [])
 
-    def test_cpu_fallback_append(self):
-        atlas = self.PatchAtlas({'a': self._fake_patch(5, 5, 3)}, device='cpu')
-        extra = self._fake_patch(4, 8, 4)
-        atlas.append_patches({'b': extra})
-        self.assertIsNone(atlas.zyxs_flat)
-        self.assertEqual(atlas.id_to_idx['b'], 1)
-        out = atlas.lookup(torch.tensor([1]), torch.tensor([[1.5, 2.5]]))
-        torch.testing.assert_close(out[0], self._manual_bilinear(extra.zyxs, 1.5, 2.5))
+    def test_replacement_reorders_shared_geometry_and_removes_patches(self):
+        a, b, c = [self._fake_patch(5, width, seed)
+                   for width, seed in [(7, 71), (4, 72), (6, 73)]]
+        original = self.PatchAtlas({'a': a, 'b': b}, device='cpu').materialize()
+        original = original.replaced({'a': a, 'b': b, 'c': c})
+        replacement = self._fake_patch(6, 8, 74)
+        candidate = original.replaced({'c': c, 'a': a, 'new': replacement})
+        self.assertEqual(original.id_to_idx, {'a': 0, 'b': 1, 'c': 2})
+        self.assertIs(candidate._geometry_chunks[0]['zyxs_flat'],
+                      original._geometry_chunks[1]['zyxs_flat'])
+        self.assertIs(candidate._geometry_chunks[1]['zyxs_flat'],
+                      original._geometry_chunks[0]['zyxs_flat'])
+        for atlas, patches in [(candidate, [c, a, replacement]),
+                               (candidate.replaced({'a': a, 'c': c}), [a, c])]:
+            indices = torch.arange(len(patches))
+            ijs = torch.tensor([[1.5, 2.25]] * len(patches))
+            expected = torch.stack([self._manual_bilinear(p.zyxs, 1.5, 2.25)
+                                    for p in patches])
+            torch.testing.assert_close(atlas.lookup(indices, ijs), expected)
+            vertex_ids = atlas.offsets[:-1] + atlas.widths + 2
+            torch.testing.assert_close(atlas.vertex_zyxs(vertex_ids),
+                                       torch.stack([p.zyxs[1, 2] for p in patches]))
+        empty = candidate.replaced({})
+        empty = empty.replaced({'b': b})
+        torch.testing.assert_close(
+            empty.lookup(torch.tensor([0]), torch.tensor([[1.5, 2.25]]))[0],
+            self._manual_bilinear(b.zyxs, 1.5, 2.25))
 
-    def test_materialized_append_keeps_existing_geometry_allocation(self):
-        first = self._fake_patch(5, 5, 31)
-        extra = self._fake_patch(4, 8, 32)
-        atlas = self.PatchAtlas({'a': first}, device='cpu').materialize()
-        original_storage = atlas.zyxs_flat
-        original_pointer = original_storage.data_ptr()
-
-        atlas.append_patches({'b': extra})
-
-        self.assertIs(atlas.zyxs_flat, original_storage)
-        self.assertEqual(atlas.zyxs_flat.data_ptr(), original_pointer)
-        self.assertEqual(len(atlas._geometry_chunks), 2)
-        idx = torch.tensor([0, 1])
-        ijs = torch.tensor([[2.25, 1.5], [1.5, 2.5]])
-        expected = torch.stack([
-            self._manual_bilinear(first.zyxs, 2.25, 1.5),
-            self._manual_bilinear(extra.zyxs, 1.5, 2.5),
-        ])
-        torch.testing.assert_close(atlas.lookup(idx, ijs), expected)
+    def test_replacement_single_remapped_chunk_is_not_packed(self):
+        a, b = self._fake_patch(5, 7, 81), self._fake_patch(6, 8, 82)
+        original = self.PatchAtlas({'a': a, 'b': b}, device='cpu').materialize()
+        candidate = original.replaced({'b': b, 'a': a})
+        self.assertEqual(len(candidate._geometry_chunks), 1)
+        torch.testing.assert_close(candidate.vertex_zyxs(torch.tensor([0, 48])),
+                                   torch.stack([b.zyxs[0, 0], a.zyxs[0, 0]]))
+        expected = torch.stack([self._manual_bilinear(p.zyxs, 1.5, 2.25)
+                                for p in [b, a]])
+        torch.testing.assert_close(
+            candidate.lookup(torch.tensor([0, 1]), torch.tensor([[1.5, 2.25]] * 2)),
+            expected)
 
     def test_largest_patch_component_uses_eight_connectivity(self):
         mask = np.zeros((8, 10), dtype=bool)
@@ -449,6 +466,8 @@ class DevicePatchAtlasTests(unittest.TestCase):
             context.unverified_patch_atlas = self.PatchAtlas(
                 context.unverified_patches, device='cpu').materialize()
             context.cross_patch_pcls = []
+            context.regular_pcl_catalog = {}
+            context.fiber_catalog = {}
             context.unattached_pcl_strips = _UnattachedPclStripList()
             context.unattached_component_edges = []
             context.interactive_driver = None
@@ -471,50 +490,6 @@ class DevicePatchAtlasTests(unittest.TestCase):
                 report,
                 '/inputs/non-liftable-patch.tifxyz\n'
                 '/unverified/non-liftable-unverified-patch.tifxyz\n')
-
-    @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
-    def test_materialized_lookup_and_append_stay_on_cuda(self):
-        atlas = self.PatchAtlas(
-            {'a': self._fake_patch(6, 6, 2)}, device='cuda').materialize()
-        self.assertEqual(atlas.zyxs_flat.device.type, 'cuda')
-        self.assertTrue(atlas.offsets.is_cuda)
-        original_storage = atlas.zyxs_flat
-        original_pointer = original_storage.data_ptr()
-        idx = torch.zeros(3, dtype=torch.int64, device='cuda')
-        ijs = torch.tensor(
-            [[0.5, 0.5], [2.25, 3.75], [4.0, 4.0]], device='cuda')
-        out = atlas.lookup(idx, ijs)
-        self.assertTrue(out.is_cuda)
-        extra = self._fake_patch(4, 5, 8)
-        atlas.append_patches({'b': extra})
-        self.assertIs(atlas.zyxs_flat, original_storage)
-        self.assertEqual(atlas.zyxs_flat.data_ptr(), original_pointer)
-        self.assertTrue(atlas.zyxs_flat.is_cuda)
-        self.assertTrue(atlas.widths.is_cuda)
-        appended = atlas.lookup(
-            torch.tensor([1], device='cuda'),
-            torch.tensor([[1.25, 2.5]], device='cuda'))
-        torch.testing.assert_close(
-            appended.cpu()[0], self._manual_bilinear(extra.zyxs, 1.25, 2.5))
-
-    @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
-    def test_cuda_append_peak_memory_scales_with_new_geometry(self):
-        atlas = self.PatchAtlas(
-            {'large': self._fake_patch(512, 512, 51)},
-            device='cuda').materialize()
-        extra = self._fake_patch(4, 5, 52)
-        torch.cuda.synchronize()
-        baseline = torch.cuda.memory_allocated()
-        torch.cuda.reset_peak_memory_stats()
-
-        atlas.append_patches({'small': extra})
-        torch.cuda.synchronize()
-
-        peak_growth = torch.cuda.max_memory_allocated() - baseline
-        appended_bytes = extra.zyxs.numel() * extra.zyxs.element_size()
-        # Tensor metadata is tiny. A 1 MiB allowance comfortably covers it
-        # while still catching a replacement copy of the 3 MiB base atlas.
-        self.assertLess(peak_growth, appended_bytes + (1 << 20))
 
     @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
     def test_sample_patch_batch_carries_pregathered_points(self):
@@ -623,6 +598,76 @@ class NonFiniteGradCheckTests(unittest.TestCase):
             self.assertFalse(bool(torch.isfinite(grad_min) & torch.isfinite(grad_max)))
         grad_min, grad_max = torch.aminmax(torch.randn(1024))
         self.assertTrue(bool(torch.isfinite(grad_min) & torch.isfinite(grad_max)))
+
+    @staticmethod
+    def _sanitize(named_params):
+        import fit_spiral
+        context = types.SimpleNamespace(
+            dist_grad_named=named_params,
+            nonfinite_grad_steps=torch.zeros((), dtype=torch.int64),
+            nonfinite_grad_by_param={name: torch.zeros((), dtype=torch.int64)
+                                     for name, _ in named_params},
+        )
+        fit_spiral.FitContext._sanitize_nonfinite_grads_(context)
+        return context
+
+    def test_sanitizer_counts_and_zeroes_only_nonfinite_cells(self):
+        bad = torch.nn.Parameter(torch.ones(1, 3, 5, 5, 5))
+        good = torch.nn.Parameter(torch.ones(4))
+        bad.grad = torch.ones_like(bad)
+        bad.grad[0, 0, 2, 2, 2] = float('nan')
+        bad.grad[0, 1, 0, 0, 0] = float('inf')
+        good.grad = torch.full_like(good, 2.0)
+        context = self._sanitize([('bad', bad), ('good', good)])
+
+        self.assertEqual(int(context.nonfinite_grad_steps), 1)
+        self.assertEqual(int(context.nonfinite_grad_by_param['bad']), 1)
+        self.assertEqual(int(context.nonfinite_grad_by_param['good']), 0)
+        self.assertEqual(bad.grad[0, 0, 2, 2, 2].item(), 0.0)
+        self.assertEqual(bad.grad[0, 1, 0, 0, 0].item(), 0.0)
+        # Exactly the two nonfinite cells were touched.
+        self.assertEqual(int((bad.grad == 0).sum()), 2)
+        self.assertTrue(torch.equal(good.grad, torch.full_like(good, 2.0)))
+
+    def test_sanitizer_runs_before_clipping_and_smoothing(self):
+        # Clipping would clamp an infinity to a finite bound and hide it from
+        # the nonfinite counters; smoothing would spread one NaN over every
+        # cell within its kernel and the later sanitizer would then discard
+        # all of them. Sanitizing first keeps both to the single bad cell.
+        import fit_spiral
+        import flow_grad_smoothing
+        from lazy_moment_adamw import robust_clip_
+
+        step_source = inspect.getsource(fit_spiral.FitContext.step)
+        self.assertLess(step_source.index('self._sanitize_nonfinite_grads_()'),
+                        step_source.index('self._clip_flow_grads()'))
+        self.assertLess(step_source.index('self._clip_flow_grads()'),
+                        step_source.index('smooth_flow_grad_('))
+
+        torch.manual_seed(0)
+        param = torch.nn.Parameter(torch.zeros(1, 3, 7, 7, 7))
+        param.grad = torch.rand_like(param) + 0.5
+        param.grad[0, 0, 3, 3, 3] = float('nan')
+        param.grad[0, 2, 1, 1, 1] = float('inf')
+        reference = param.grad.clone()
+        reference[0, 0, 3, 3, 3] = 0.0
+        reference[0, 2, 1, 1, 1] = 0.0
+
+        context = self._sanitize([('flow', param)])
+        self.assertEqual(int(context.nonfinite_grad_by_param['flow']), 1)
+        self.assertTrue(torch.equal(param.grad, reference))
+
+        thresholds, fractions = robust_clip_(param.grad, 100.0)
+        # Nothing finite exceeds 100x the median, and the (zeroed) infinity is
+        # no longer counted as a clipped cell.
+        self.assertEqual(float(fractions[0]), 0.0)
+        self.assertTrue(torch.equal(param.grad, reference))
+
+        flow_grad_smoothing.smooth_cartesian_(param.grad, 1.0)
+        self.assertTrue(torch.isfinite(param.grad).all())
+        # Smoothing a finite field leaves its neighbours non-zero rather than
+        # discarding them, as the old ordering did.
+        self.assertGreater(int((param.grad != 0).sum()), param.grad.numel() - 2)
 
 
 class CpuTrackStorageTests(unittest.TestCase):

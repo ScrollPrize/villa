@@ -108,27 +108,27 @@ std::optional<std::pair<int, int>> segmentationSceneToGrid(VolumeViewerBase* vie
 }
 
 
-bool ensureEditableOpenDataSegmentTarget(CState* state,
-                                         SegmentationWidget* widget,
-                                         std::string* editableSurfaceId)
+bool SegmentationModule::ensureActiveSurfaceEditableForModification()
 {
-    if (editableSurfaceId) {
-        editableSurfaceId->clear();
-    }
-    if (!state || !state->vpkg()) {
+    if (!_state || !_state->vpkg()) {
         return true;
     }
 
-    auto surface = std::dynamic_pointer_cast<QuadSurface>(state->surface("segmentation"));
+    auto surface = _state->activeSurface().lock();
+    if (!surface) {
+        surface = std::dynamic_pointer_cast<QuadSurface>(
+            _state->surface("segmentation"));
+    }
     if (!surface || surface->path.empty() ||
         !vc3d::opendata::isOpenDataCatalogSegmentDirectory(surface->path)) {
         return true;
     }
 
-    const std::filesystem::path activeSegmentsRoot = state->vpkg()->outputSegmentsPath();
+    const std::filesystem::path activeSegmentsRoot =
+        _state->vpkg()->outputSegmentsPath();
     const auto registeredCatalogRoot =
         vc3d::opendata::registeredOpenDataCatalogRootForSegment(
-            *state->vpkg(), surface->path);
+            *_state->vpkg(), surface->path);
     const auto copySourceRoot = registeredCatalogRoot.empty()
         ? activeSegmentsRoot
         : registeredCatalogRoot;
@@ -140,7 +140,7 @@ bool ensureEditableOpenDataSegmentTarget(CState* state,
     prompt.setWindowTitle(QObject::tr("Open Data Segment"));
     prompt.setText(QObject::tr("This open-data segment is an immutable catalog cache."));
     prompt.setInformativeText(
-        QObject::tr("Create or choose an editable copy before enabling editing.\n\nSource: %1\nEditable copy: %2")
+        QObject::tr("Create or choose an editable copy before modifying it.\n\nSource: %1\nEditable copy: %2")
             .arg(QString::fromStdString(surface->path.string()),
                  QString::fromStdString(defaultPath.string())));
     QPushButton* createButton = prompt.addButton(QObject::tr("Create Editable Copy"), QMessageBox::AcceptRole);
@@ -159,20 +159,20 @@ bool ensureEditableOpenDataSegmentTarget(CState* state,
             QString::fromStdString(defaultPath.parent_path().string()),
             QFileDialog::ShowDirsOnly);
         if (chosen.isEmpty()) {
-            if (widget) widget->setEditingEnabled(false);
+            if (_widget) _widget->setEditingEnabled(false);
             return false;
         }
         editablePath = std::filesystem::path(chosen.toStdString());
     } else {
-        if (widget) widget->setEditingEnabled(false);
+        if (_widget) _widget->setEditingEnabled(false);
         return false;
     }
 
     try {
         vc3d::opendata::copyCatalogSegmentToEditableDirectory(
-            *state->vpkg(), surface->path, editablePath);
+            *_state->vpkg(), surface->path, editablePath);
         const std::filesystem::path editableRoot = editablePath.parent_path();
-        auto pkg = state->vpkg();
+        auto pkg = _state->vpkg();
         vc3d::opendata::attachEditableOpenDataSegmentRoot(
             *pkg, surface->path, editableRoot, true);
 
@@ -184,19 +184,17 @@ bool ensureEditableOpenDataSegmentTarget(CState* state,
             editableSurface = std::make_shared<QuadSurface>(editablePath);
         }
         vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
-            *editableSurface, *pkg, state->currentVolumeId());
+            *editableSurface, *pkg, _state->currentVolumeId());
         editableSurface->save_meta();
-        state->setSurface("segmentation", editableSurface, false, false);
-        if (editableSurfaceId) {
-            *editableSurfaceId = segmentId;
-        }
+        _state->setSurface("segmentation", editableSurface, false, false);
+        emit segmentationFolderChanged(QString::fromStdString(segmentId));
         return true;
     } catch (const std::exception& e) {
         QMessageBox::warning(
             QApplication::activeWindow(),
             QObject::tr("Open Data Segment"),
             QObject::tr("Could not create editable copy:\n\n%1").arg(QString::fromUtf8(e.what())));
-        if (widget) widget->setEditingEnabled(false);
+        if (_widget) _widget->setEditingEnabled(false);
         return false;
     }
 }
@@ -345,7 +343,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
             scheduleCorrectionsAutoSave();
         });
 
-        connect(_pointCollection, &VCCollection::pointRemoved, this, [this](uint64_t) {
+        connect(_pointCollection, &VCCollection::pointRemoved, this, [this](vc::PointRef) {
             scheduleCorrectionsAutoSave();
         });
     }
@@ -505,6 +503,8 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::onCorrectionsCreateRequested);
     connect(_widget, &SegmentationWidget::correctionsCollectionSelected,
             this, &SegmentationModule::onCorrectionsCollectionSelected);
+    connect(_widget, &SegmentationWidget::correctionsCollectionSelectionCleared,
+            this, &SegmentationModule::clearActiveCorrectionCollection);
     connect(_widget, &SegmentationWidget::correctionsZRangeChanged,
             this, &SegmentationModule::onCorrectionsZRangeChanged);
     connect(_widget, &SegmentationWidget::showApprovalMaskChanged,
@@ -670,15 +670,9 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     if (_editingEnabled == enabled) {
         return;
     }
-    std::string editableSurfaceId;
     if (enabled) {
-        if (!ensureEditableOpenDataSegmentTarget(
-                _state, _widget, &editableSurfaceId)) {
+        if (!ensureActiveSurfaceEditableForModification()) {
             return;
-        }
-        if (!editableSurfaceId.empty()) {
-            emit segmentationFolderChanged(
-                QString::fromStdString(editableSurfaceId));
         }
     }
     _editingEnabled = enabled;
@@ -1507,18 +1501,26 @@ void SegmentationModule::setActiveCorrectionCollection(uint64_t collectionId, bo
     }
 }
 
+void SegmentationModule::clearActiveCorrectionCollection()
+{
+    if (_corrections) {
+        _corrections->clearActiveCollection();
+    }
+}
+
 uint64_t SegmentationModule::createCorrectionCollection(bool announce)
 {
     return _corrections ? _corrections->createCollection(announce) : 0;
 }
 
-void SegmentationModule::handleCorrectionPointAdded(const cv::Vec3f& worldPos, uint64_t collectionId)
+void SegmentationModule::handleCorrectionPointAdded(
+    const cv::Vec3f& worldPos, std::optional<uint64_t> collectionId)
 {
     if (!_corrections) return;
 
     // If a specific collection is requested, switch to it
-    if (collectionId != 0) {
-        _corrections->setActiveCollection(collectionId, false);
+    if (collectionId) {
+        _corrections->setActiveCollection(*collectionId, false);
     }
 
     // Auto-create collection on first annotation
@@ -1651,10 +1653,10 @@ void SegmentationModule::finishCorrectionDrag()
     }
 
     // Ensure we have an active collection
-    uint64_t collectionId = _corrections->activeCollection();
-    if (collectionId == 0) {
+    auto collectionId = _corrections->activeCollection();
+    if (!collectionId) {
         collectionId = _corrections->createCollection(true);
-        if (collectionId == 0) {
+        if (!collectionId || *collectionId == 0) {
             emit statusMessageRequested(tr("Failed to create correction collection"), kStatusMedium);
             return;
         }
@@ -1662,7 +1664,7 @@ void SegmentationModule::finishCorrectionDrag()
 
     // Set anchor2d on the collection (the grid location where user started dragging)
     cv::Vec2f anchor2d(static_cast<float>(anchorCol), static_cast<float>(anchorRow));
-    _pointCollection->setCollectionAnchor2d(collectionId, anchor2d);
+    _pointCollection->setCollectionAnchor2d(*collectionId, anchor2d);
 
     // Look up winding depth index from d.tif at the anchor position → store in winding_annotation
     float wind_a = lookupDepthIndex(activeBaseSurface(), anchorRow, anchorCol);
@@ -1705,8 +1707,7 @@ SegmentationModule::NearestPointResult SegmentationModule::findNearestPoint(cons
         for (const auto& [ptId, pt] : col.points) {
             const float dist = static_cast<float>(cv::norm(pt.p - worldPos));
             if (dist < result.distance && dist <= maxDist) {
-                result.pointId = ptId;
-                result.collectionId = colId;
+                result.point = vc::PointRef{colId, ptId};
                 result.distance = dist;
             }
         }
@@ -1717,6 +1718,11 @@ SegmentationModule::NearestPointResult SegmentationModule::findNearestPoint(cons
 void SegmentationModule::setSelectedAnnotationCollection(uint64_t collectionId)
 {
     _selectedAnnotationCollectionId = collectionId;
+}
+
+void SegmentationModule::clearSelectedAnnotationCollection()
+{
+    _selectedAnnotationCollectionId.reset();
 }
 
 void SegmentationModule::beginPointMoveDrag(uint64_t pointId, uint64_t collectionId,
@@ -1761,7 +1767,7 @@ void SegmentationModule::finishPointMoveDrag()
     if (didMove) {
         // Update point position
         if (_pointCollection) {
-            auto ptOpt = _pointCollection->getPoint(pointId);
+            auto ptOpt = _pointCollection->getPoint({collectionId, pointId});
             if (ptOpt) {
                 ColPoint updated = *ptOpt;
                 updated.p = targetWorld;
@@ -1773,7 +1779,7 @@ void SegmentationModule::finishPointMoveDrag()
         updateCorrectionsWidget();
     } else {
         // Click without drag: select the point
-        emit annotationPointSelected(pointId);
+        emit annotationPointSelected({collectionId, pointId});
         emit annotationCollectionSelected(collectionId);
     }
 }
@@ -3051,6 +3057,8 @@ void SegmentationModule::performAutosave()
             failureMessage = tr("unknown error");
         }
 
+        if (failureMessage.isEmpty() && savedSnapshot)
+            emit surfaceSavedTo(QString::fromStdString(savedSnapshot->path.string()));
         const bool canRetry = _editManager && _editManager->hasSession();
         const auto completion = failureMessage.isEmpty()
             ? _autosaveState.completeSuccess(autosaveTicket)

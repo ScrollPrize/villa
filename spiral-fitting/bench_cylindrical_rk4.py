@@ -15,7 +15,9 @@ import subprocess
 import sys
 
 
-VARIANTS = ('cylindrical-eager', 'cartesian-direct', 'cylindrical-fused')
+VARIANTS = ('cylindrical-eager', 'cartesian-direct', 'cylindrical-fused',
+            'bspline-cylindrical-fused')
+FUSED_CYLINDRICAL = ('cylindrical-fused', 'bspline-cylindrical-fused')
 
 
 def _arguments():
@@ -32,6 +34,8 @@ def _arguments():
     parser.add_argument('--iterations', type=int, default=100)
     parser.add_argument('--repetitions', type=int, default=3)
     parser.add_argument('--block', type=int, choices=(64, 128, 256), default=128)
+    parser.add_argument('--cyl-defer', choices=('0', '1'), default='1',
+                        help='FIT_SPIRAL_CYL_DEFER for the cubic cylindrical backward')
     parser.add_argument('--blocks', nargs='+', type=int, choices=(64, 128, 256))
     parser.add_argument('--allow-busy', action='store_true')
     return parser.parse_args()
@@ -50,6 +54,7 @@ def _summary(values):
 def _worker(args):
     os.environ['AGENTS_AGENT_MODE'] = '1'
     os.environ['FIT_SPIRAL_CYL_BLOCK'] = str(args.block)
+    os.environ['FIT_SPIRAL_CYL_DEFER'] = args.cyl_defer
     os.environ['FIT_SPIRAL_TRITON'] = (
         '0' if args.variant == 'cylindrical-eager' else '1')
     if args.variant == 'cartesian-direct':
@@ -57,7 +62,8 @@ def _worker(args):
 
     import torch
     import flow_triton
-    from flow_fields import CartesianFlowField, CylindricalFlowField
+    from flow_fields import (BSplineCylindricalFlowField, CartesianFlowField,
+                             CylindricalFlowField)
 
     torch.manual_seed(1701)
     device = torch.device('cuda')
@@ -65,6 +71,8 @@ def _worker(args):
     if args.variant == 'cartesian-direct':
         flow = CartesianFlowField(
             resolution, args.scale_factor, direct_lr=True).to(device)
+    elif args.variant == 'bspline-cylindrical-fused':
+        flow = BSplineCylindricalFlowField(resolution, args.scale_factor).to(device)
     else:
         flow = CylindricalFlowField(resolution, args.scale_factor).to(device)
     with torch.no_grad():
@@ -90,7 +98,7 @@ def _worker(args):
         events[0].record()
         flow.zero_grad(set_to_none=True)
         points.grad = None
-        integrate = flow.get_time_invariant_integrator()
+        integrate = flow.get_integrator()
         events[1].record()
         output = integrate(points, h, args.steps)
         events[2].record()
@@ -121,7 +129,8 @@ def _worker(args):
             'steps': args.steps,
             'warmups': args.warmups,
             'iterations': args.iterations,
-            'block': args.block if args.variant == 'cylindrical-fused' else None,
+            'block': args.block if args.variant in FUSED_CYLINDRICAL else None,
+            'cyl_defer': args.cyl_defer if args.variant == 'bspline-cylindrical-fused' else None,
             'device': torch.cuda.get_device_name(),
             'capability': torch.cuda.get_device_capability(),
             'torch': torch.__version__,
@@ -162,7 +171,7 @@ def _controller(args):
     results = []
     blocks = args.blocks or [args.block]
     for variant in args.variants:
-        variant_blocks = blocks if variant == 'cylindrical-fused' else [args.block]
+        variant_blocks = blocks if variant in FUSED_CYLINDRICAL else [args.block]
         for block in variant_blocks:
             for repetition in range(args.repetitions):
                 command = [
@@ -171,6 +180,7 @@ def _controller(args):
                     '--scale-factor', str(args.scale_factor), '--points', str(args.points),
                     '--steps', str(args.steps), '--warmups', str(args.warmups),
                     '--iterations', str(args.iterations), '--block', str(block),
+                    '--cyl-defer', args.cyl_defer,
                 ]
                 completed = subprocess.run(command, text=True, capture_output=True)
                 output = completed.stdout.strip().splitlines()

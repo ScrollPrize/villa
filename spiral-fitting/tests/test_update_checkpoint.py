@@ -66,3 +66,12 @@ def test_update_checkpoint_preserves_tensor_objects_and_migrates_snapshots():
 def test_unknown_legacy_config_key_is_not_silently_dropped():
     with pytest.raises(ValueError, match="no known migration.*mystery"):
         migrate_config({"mystery": 1})
+
+
+@pytest.mark.parametrize("key", [
+    "influence_disable_dt_frac",
+    "interactive_influence_disable_dt_frac",
+])
+def test_removed_dt_fields_are_unknown_and_unmigratable(key):
+    with pytest.raises(ValueError, match=f"no known migration.*{key}"):
+        migrate_config({key: 0.75})

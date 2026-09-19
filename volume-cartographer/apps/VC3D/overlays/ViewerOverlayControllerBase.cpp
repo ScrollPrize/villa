@@ -293,8 +293,20 @@ void ViewerOverlayControllerBase::OverlayBuilder::addImage(const QImage& image,
                                                             qreal opacity,
                                                             qreal z)
 {
+    addImage(image, QPixmap(), offset, scaleX, scaleY, opacity, z);
+}
+
+void ViewerOverlayControllerBase::OverlayBuilder::addImage(const QImage& image,
+                                                            const QPixmap& pixmap,
+                                                            const QPointF& offset,
+                                                            qreal scaleX,
+                                                            qreal scaleY,
+                                                            qreal opacity,
+                                                            qreal z)
+{
     ImagePrimitive prim;
     prim.image = image;
+    prim.pixmap = pixmap;
     prim.offset = offset;
     prim.transform = QTransform::fromScale(scaleX, scaleY);
     prim.opacity = opacity;
@@ -337,7 +349,7 @@ ViewerOverlayControllerBase::~ViewerOverlayControllerBase()
     }
 }
 
-void ViewerOverlayControllerBase::attachViewer(VolumeViewerBase* viewer)
+void ViewerOverlayControllerBase::attachViewer(VolumeViewerBase* viewer, ViewerManager* manager)
 {
     if (!viewer) {
         return;
@@ -347,12 +359,18 @@ void ViewerOverlayControllerBase::attachViewer(VolumeViewerBase* viewer)
         return entry.viewer == viewer;
     });
     if (existing != _viewers.end()) {
+        if (manager && existing->manager != manager) {
+            existing->manager = manager;
+            clearPointChainProjectionCache(viewer);
+            clearSurfacePointsCache(viewer);
+        }
         rebuildOverlay(viewer);
         return;
     }
 
     ViewerEntry entry;
     entry.viewer = viewer;
+    entry.manager = manager ? manager : _manager;
     // Per-viewer 16ms debounce timer. Each overlaysUpdated signal sets the
     // dirty flag and restarts the timer; when the timer fires we rebuild
     // at most once per tick regardless of signal frequency.
@@ -389,6 +407,7 @@ void ViewerOverlayControllerBase::scheduleRebuild(VolumeViewerBase* viewer)
 void ViewerOverlayControllerBase::detachViewer(VolumeViewerBase* viewer)
 {
     clearPointChainProjectionCache(viewer);
+    clearSurfacePointsCache(viewer);
     for (auto iter = _viewers.begin(); iter != _viewers.end();) {
         if (iter->viewer != viewer) {
             ++iter;
@@ -428,7 +447,7 @@ void ViewerOverlayControllerBase::bindToViewerManager(ViewerManager* manager)
 
     _managerCreatedConn = QObject::connect(_manager, &ViewerManager::baseViewerCreated,
                                            this, [this](VolumeViewerBase* viewer) {
-                                               attachViewer(viewer);
+                                               attachViewer(viewer, _manager);
                                            });
     _managerClosingConn = QObject::connect(_manager, &ViewerManager::baseViewerClosing,
                                            this, [this](VolumeViewerBase* viewer) {
@@ -442,7 +461,7 @@ void ViewerOverlayControllerBase::bindToViewerManager(ViewerManager* manager)
                                              });
 
     _manager->forEachBaseViewer([this](VolumeViewerBase* viewer) {
-        attachViewer(viewer);
+        attachViewer(viewer, _manager);
     });
 }
 
@@ -523,7 +542,8 @@ ViewerOverlayControllerBase::filterPoints(VolumeViewerBase* viewer,
     auto* surface = viewer->currentSurface();
     auto* planeSurface = options.clipToSurface ? dynamic_cast<PlaneSurface*>(surface) : nullptr;
     auto* quadSurface = options.clipToSurface ? dynamic_cast<QuadSurface*>(surface) : nullptr;
-    auto* patchIndex = _manager ? _manager->surfacePatchIndex() : nullptr;
+    auto* viewerManager = managerForViewer(viewer);
+    auto* patchIndex = viewerManager ? viewerManager->surfacePatchIndex() : nullptr;
 
     QRectF visibleRect;
     if (options.requireSceneVisibility) {
@@ -602,7 +622,8 @@ ViewerOverlayControllerBase::filterPointsNearViewerSurface(VolumeViewerBase* vie
     Surface* surface = viewerSurface(viewer);
     auto* planeSurface = dynamic_cast<PlaneSurface*>(surface);
     auto* quadSurface = dynamic_cast<QuadSurface*>(surface);
-    auto* patchIndex = _manager ? _manager->surfacePatchIndex() : nullptr;
+    auto* viewerManager = managerForViewer(viewer);
+    auto* patchIndex = viewerManager ? viewerManager->surfacePatchIndex() : nullptr;
 
     std::vector<float> pointOpacities(points.size(), 1.0f);
     PointFilterOptions filter;
@@ -648,13 +669,145 @@ ViewerOverlayControllerBase::filterPointsNearViewerSurface(VolumeViewerBase* vie
 }
 
 ViewerOverlayControllerBase::FilteredPoints
+ViewerOverlayControllerBase::filterPointsNearViewerSurfaceCached(
+    VolumeViewerBase* viewer,
+    std::uint64_t cacheKey,
+    std::uint64_t contentRevision,
+    const std::vector<cv::Vec3f>& points,
+    float tolerance,
+    std::vector<float>* opacities) const
+{
+    FilteredPoints result;
+    if (opacities) {
+        opacities->clear();
+    }
+    if (!viewer || points.empty()) {
+        return result;
+    }
+
+    const SurfaceProjectionContext context =
+        viewer->surfaceProjectionContext();
+
+    SurfacePointsCacheEntry& cached =
+        _surfacePointsCache[SurfacePointsCacheKey{viewer, cacheKey}];
+    const bool cacheMatches = cached.valid &&
+                              cached.context == context &&
+                              cached.tolerance == tolerance &&
+                              cached.contentRevision == contentRevision;
+
+    if (!cacheMatches) {
+        Surface* surface = viewerSurface(viewer);
+        auto* planeSurface = dynamic_cast<PlaneSurface*>(surface);
+        auto* quadSurface = dynamic_cast<QuadSurface*>(surface);
+        auto* viewerManager = managerForViewer(viewer);
+        auto* patchIndex = viewerManager ? viewerManager->surfacePatchIndex() : nullptr;
+
+        // Identical to the fade in filterPointsNearViewerSurface().
+        auto opacityForDistance = [tolerance](float dist) {
+            if (dist < 0.0f) {
+                return 0.0f;
+            }
+            if (tolerance <= 0.0f) {
+                return dist <= 0.0f ? 1.0f : 0.0f;
+            }
+            return dist >= tolerance ? 0.0f : 1.0f - (dist / tolerance);
+        };
+
+        SurfacePointsCacheEntry entry;
+        entry.context = context;
+        entry.tolerance = tolerance;
+        entry.contentRevision = contentRevision;
+        entry.valid = true;
+        entry.projections.reserve(points.size());
+        entry.volumePoints.reserve(points.size());
+        entry.sourceIndices.reserve(points.size());
+        entry.opacities.reserve(points.size());
+
+        for (std::size_t index = 0; index < points.size(); ++index) {
+            const cv::Vec3f& point = points[index];
+            float opacity = 1.0f;
+            if (planeSurface) {
+                opacity = opacityForDistance(std::fabs(planeSurface->pointDist(point)));
+            } else if (quadSurface) {
+                cv::Vec3f ptr(0, 0, 0);
+                const float dist = quadSurface->pointTo(
+                    ptr, point, std::max(tolerance, 0.0f), 100, patchIndex);
+                opacity = opacityForDistance(dist);
+            }
+            if (opacity <= 0.0f) {
+                continue;
+            }
+            // A point that does not project maps to a NaN scene position,
+            // which never satisfies the viewport test the warm path applies
+            // below -- so dropping it here is equivalent, not a new filter.
+            const auto projection = viewer->projectVolumePoint(point);
+            if (!projection) {
+                continue;
+            }
+            entry.projections.push_back(*projection);
+            entry.volumePoints.push_back(point);
+            entry.sourceIndices.push_back(index);
+            entry.opacities.push_back(opacity);
+        }
+
+        cached = std::move(entry);
+    }
+
+    const QRectF visibleRect = visibleSceneRect(viewer);
+    const std::size_t count = cached.projections.size();
+    result.volumePoints.reserve(count);
+    result.scenePoints.reserve(count);
+    result.sourceIndices.reserve(count);
+    if (opacities) {
+        opacities->reserve(count);
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        const QPointF scenePoint =
+            viewer->surfaceProjectionToScene(cached.projections[i]);
+        if (!visibleRect.contains(scenePoint)) {
+            continue;
+        }
+        result.volumePoints.push_back(cached.volumePoints[i]);
+        result.scenePoints.push_back(scenePoint);
+        result.sourceIndices.push_back(cached.sourceIndices[i]);
+        if (opacities) {
+            opacities->push_back(cached.opacities[i]);
+        }
+    }
+    return result;
+}
+
+void ViewerOverlayControllerBase::clearSurfacePointsCache()
+{
+    _surfacePointsCache.clear();
+}
+
+void ViewerOverlayControllerBase::clearSurfacePointsCache(VolumeViewerBase* viewer)
+{
+    std::erase_if(_surfacePointsCache,
+                  [viewer](const auto& item) { return item.first.viewer == viewer; });
+}
+
+std::size_t ViewerOverlayControllerBase::SurfacePointsCacheKeyHash::operator()(
+    const SurfacePointsCacheKey& key) const
+{
+    const std::size_t seed = std::hash<VolumeViewerBase*>{}(key.viewer);
+    return seed ^ (std::hash<std::uint64_t>{}(key.cacheKey) + 0x9e3779b9U +
+                   (seed << 6U) + (seed >> 2U));
+}
+
+ViewerOverlayControllerBase::FilteredPoints
 ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
                                                   const std::vector<cv::Vec3f>& points,
                                                   float tolerance,
-                                                  std::vector<float>* opacities) const
+                                                  std::vector<float>* opacities,
+                                                  float* breakDistance) const
 {
     FilteredPoints filtered;
     if (!viewer || points.empty()) {
+        if (breakDistance) {
+            *breakDistance = std::numeric_limits<float>::infinity();
+        }
         return filtered;
     }
 
@@ -662,11 +815,15 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
     auto* plane = dynamic_cast<PlaneSurface*>(surface);
     auto* quad = dynamic_cast<QuadSurface*>(surface);
     if (!plane && !quad) {
+        if (breakDistance) {
+            *breakDistance = polylineBreakDistance(points);
+        }
         return filterPointsNearViewerSurface(
             viewer, points, tolerance, opacities, std::nullopt, false);
     }
 
-    auto* patchIndex = _manager ? _manager->surfacePatchIndex() : nullptr;
+    auto* viewerManager = managerForViewer(viewer);
+    auto* patchIndex = viewerManager ? viewerManager->surfacePatchIndex() : nullptr;
     SurfacePatchIndex::SurfacePtr indexedQuad;
     bool usePatchIndex = false;
     if (quad && patchIndex && !patchIndex->empty() && std::isfinite(tolerance)) {
@@ -708,6 +865,7 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
         entry.surfacePoints.reserve(points.size());
         entry.sourceIndices.reserve(points.size());
         entry.opacities.reserve(points.size());
+        entry.breakDistance = polylineBreakDistance(points);
 
         auto opacityForDistance = [tolerance](float distance) {
             if (!std::isfinite(distance) || distance < 0.0f) {
@@ -789,6 +947,9 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
     }
     if (opacities) {
         *opacities = cached.opacities;
+    }
+    if (breakDistance) {
+        *breakDistance = cached.breakDistance;
     }
     return filtered;
 }
@@ -902,20 +1063,33 @@ void ViewerOverlayControllerBase::renderPointChain(VolumeViewerBase* viewer,
                                                    OverlayBuilder& builder,
                                                    const std::vector<cv::Vec3f>& points,
                                                    const PointChainStyle& style,
-                                                   const std::optional<VolumeBounds>& bounds) const
+                                                   const std::optional<VolumeBounds>& bounds,
+                                                   FilteredPoints* outFiltered,
+                                                   std::vector<float>* outOpacities) const
 {
     if (points.empty()) {
         return;
     }
-    std::vector<float> opacities;
-    const FilteredPoints filtered = bounds
-        ? filterPointsNearViewerSurface(viewer,
-                                        points,
-                                        style.distanceTolerance,
-                                        &opacities,
-                                        bounds,
-                                        false)
-        : projectedPointChain(viewer, points, style.distanceTolerance, &opacities);
+    std::vector<float> localOpacities;
+    std::vector<float>& opacities = outOpacities ? *outOpacities : localOpacities;
+    float breakDistance = 0.0f;
+    FilteredPoints localFiltered;
+    if (bounds) {
+        localFiltered = filterPointsNearViewerSurface(viewer,
+                                                      points,
+                                                      style.distanceTolerance,
+                                                      &opacities,
+                                                      bounds,
+                                                      false);
+        breakDistance = polylineBreakDistance(points);
+    } else {
+        localFiltered = projectedPointChain(viewer, points, style.distanceTolerance,
+                                            &opacities, &breakDistance);
+    }
+    const FilteredPoints& filtered = localFiltered;
+    if (outFiltered) {
+        *outFiltered = localFiltered;
+    }
     if (filtered.scenePoints.empty()) {
         return;
     }
@@ -930,7 +1104,7 @@ void ViewerOverlayControllerBase::renderPointChain(VolumeViewerBase* viewer,
         const qreal maxScenePerVolume = style.sceneJumpRatio > 0.0f
             ? static_cast<qreal>(viewer->getCurrentScale()) * style.sceneJumpRatio
             : std::numeric_limits<qreal>::infinity();
-        addBrokenLineStrips(builder, filtered, polylineBreakDistance(points), lineStyle,
+        addBrokenLineStrips(builder, filtered, breakDistance, lineStyle,
                             maxScenePerVolume);
     }
 
@@ -977,6 +1151,15 @@ bool ViewerOverlayControllerBase::isScenePointVisible(VolumeViewerBase* viewer, 
 Surface* ViewerOverlayControllerBase::viewerSurface(VolumeViewerBase* viewer) const
 {
     return viewer ? viewer->currentSurface() : nullptr;
+}
+
+ViewerManager* ViewerOverlayControllerBase::managerForViewer(VolumeViewerBase* viewer) const
+{
+    const auto found = std::find_if(_viewers.begin(), _viewers.end(),
+                                    [viewer](const ViewerEntry& entry) {
+                                        return entry.viewer == viewer;
+                                    });
+    return found == _viewers.end() ? _manager : found->manager;
 }
 
 namespace
@@ -1090,8 +1273,54 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
     std::vector<PointGroup> pointGroups;
     pointGroups.reserve(4);
 
+    // Bucket candidate groups by the style fields that compare exactly, then
+    // run the original fuzzy predicate only within a bucket. Two groups can
+    // only ever match if they agree on these fields, so the first match inside
+    // the bucket is the first match in creation order -- identical to the
+    // former linear scan over every group, but without its O(N*G) cost when
+    // per-point opacity gives nearly every point its own brush color.
+    struct ExactStyleKey {
+        QRgb penColor{};
+        QRgb brushColor{};
+        int penStyle{};
+        int penCap{};
+        int penJoin{};
+        std::size_t dashCount{};
+
+        bool operator==(const ExactStyleKey&) const = default;
+    };
+
+    struct ExactStyleKeyHash {
+        std::size_t operator()(const ExactStyleKey& key) const
+        {
+            auto combine = [](std::size_t seed, std::size_t value) {
+                return seed ^ (value + 0x9e3779b9U + (seed << 6U) + (seed >> 2U));
+            };
+            std::size_t seed = std::hash<QRgb>{}(key.penColor);
+            seed = combine(seed, std::hash<QRgb>{}(key.brushColor));
+            seed = combine(seed, std::hash<int>{}(key.penStyle));
+            seed = combine(seed, std::hash<int>{}(key.penCap));
+            seed = combine(seed, std::hash<int>{}(key.penJoin));
+            return combine(seed, std::hash<std::size_t>{}(key.dashCount));
+        }
+    };
+
+    auto exactKeyFor = [](const OverlayStyle& style) {
+        return ExactStyleKey{style.penColor.rgba(),
+                             style.brushColor.rgba(),
+                             static_cast<int>(style.penStyle),
+                             static_cast<int>(style.penCap),
+                             static_cast<int>(style.penJoin),
+                             style.dashPattern.size()};
+    };
+
+    std::unordered_map<ExactStyleKey, std::vector<std::size_t>, ExactStyleKeyHash>
+        pointGroupBuckets;
+
     auto groupForPoint = [&](const PointPrimitive& prim) -> PointGroup& {
-        for (auto& group : pointGroups) {
+        std::vector<std::size_t>& bucket = pointGroupBuckets[exactKeyFor(prim.style)];
+        for (std::size_t index : bucket) {
+            PointGroup& group = pointGroups[index];
             if (fuzzyEqual(group.radius, prim.radius) && styleEquals(group.style, prim.style)) {
                 return group;
             }
@@ -1100,7 +1329,8 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
         group.radius = prim.radius;
         group.style = prim.style;
         group.path = QPainterPath();
-        pointGroups.push_back(group);
+        pointGroups.push_back(std::move(group));
+        bucket.push_back(pointGroups.size() - 1);
         return pointGroups.back();
     };
 
@@ -1113,6 +1343,7 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
             addItem(item, group.style);
         }
         pointGroups.clear();
+        pointGroupBuckets.clear();
     };
 
     for (const auto& primitive : primitives) {
@@ -1326,7 +1557,9 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                         return;
                     }
 
-                    QPixmap pixmap = QPixmap::fromImage(prim.image);
+                    const QPixmap pixmap = prim.pixmap.isNull()
+                        ? QPixmap::fromImage(prim.image)
+                        : prim.pixmap;
                     auto* item = new QGraphicsPixmapItem(pixmap);
                     item->setOpacity(std::clamp(prim.opacity, 0.0, 1.0));
                     item->setZValue(prim.z);

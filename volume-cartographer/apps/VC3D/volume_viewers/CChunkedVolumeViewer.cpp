@@ -1015,6 +1015,14 @@ void CChunkedVolumeViewer::setSurfaceCacheBudgets(std::size_t baseBytes,
     updateStatusLabel();
 }
 
+void CChunkedVolumeViewer::setPreferSurfaceTileFills(bool enabled)
+{
+    if (_closing || _preferSurfaceTileFills == enabled)
+        return;
+    _preferSurfaceTileFills = enabled;
+    submitRender("prefer surface tile fills changed");
+}
+
 void CChunkedVolumeViewer::dropOverlaySurfaceCache()
 {
     if (!_overlaySurfaceCache) {
@@ -2065,6 +2073,7 @@ struct CChunkedVolumeViewer::RenderContext {
     std::string profileReason;
     std::string profileCaller;
     bool debugDownloadQueue = false;
+    bool preferSurfaceTileFills = false;
 };
 
 struct CChunkedVolumeViewer::RenderResult {
@@ -2212,7 +2221,18 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
               *ctx.overlayChunkArray, ctx.overlayStartLevel,
               ctx.fbW, ctx.fbH, pixelsPerLevel0VolumeVoxel)
         : 0;
-
+    // A tile-fill-preferring workspace queues at most one fallback level of
+    // interactive demand. Every level's resident chunks still paint; this
+    // only stops the whole-view coarse prefetch from flooding the shared
+    // scheduler's interactive queue, which the (background-priority)
+    // SurfaceCache tile fills would otherwise wait behind at the
+    // interactive-burst ratio.
+    if (ctx.preferSurfaceTileFills) {
+        options.queuedFallbackLevels =
+            std::min(options.queuedFallbackLevels, 1);
+        overlayOptions.queuedFallbackLevels =
+            std::min(overlayOptions.queuedFallbackLevels, 1);
+    }
     auto generatedSurfaceCoords = [&](bool needNormals) {
         cv::Mat_<cv::Vec3f> coords;
         cv::Mat_<cv::Vec3f> normals;
@@ -2560,7 +2580,11 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                     prepassNormals.push_back(fullNormals(y, x));
                 }
             }
-        } else {
+        } else if (!ctx.preferSurfaceTileFills) {
+            // These coords exist only to collect raw-path viewport demand
+            // below; a tile-fill-preferring frame with every usable channel
+            // cached skips both, so it must not stall here generating
+            // geometry tiles either.
             const auto geometry = ctx.surfaceCache
                 ? ctx.surfaceCache->geometryTiles()
                 : ctx.overlaySurfaceCache->geometryTiles();
@@ -2603,14 +2627,29 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     const bool baseReverse = planeView ? ctx.compositeSettings.planeReverseDirection
                                        : ctx.compositeSettings.reverseDirection;
     const float direction = baseReverse ? -1.0f : 1.0f;
-    auto [baseCoords, baseViewports] = expandedSamples(
-        baseComposite, baseFront, baseBehind, direction);
-    auto baseDemand = vc::render::ChunkedPlaneSampler::collectViewportDependencies(
-        *ctx.chunkArray, ctx.startLevel, baseCoords, baseViewports,
-        ctx.scale, options);
+    // When a channel's SurfaceCache band covers this frame, the raw sampling
+    // path for that channel never executes (see the sampleView/sampleCoords
+    // selection below), so its viewport demand would only compete with the
+    // tile fills that actually paint the frame: fills are background work the
+    // shared scheduler serves at most once per interactive burst while any
+    // interactive demand is queued. A tile-fill-preferring viewer therefore
+    // withholds the unused demand; a frame that falls back to raw sampling
+    // (band exit, no cache yet) publishes it as before.
+    const bool skipBaseViewDemand =
+        ctx.preferSurfaceTileFills && !planeView && baseCacheUsableForPrepass;
+    const bool skipOverlayViewDemand =
+        ctx.preferSurfaceTileFills && !planeView && overlayCacheUsableForPrepass;
+    std::vector<vc::render::ChunkViewportSample> baseDemand;
+    if (!skipBaseViewDemand) {
+        auto [baseCoords, baseViewports] = expandedSamples(
+            baseComposite, baseFront, baseBehind, direction);
+        baseDemand = vc::render::ChunkedPlaneSampler::collectViewportDependencies(
+            *ctx.chunkArray, ctx.startLevel, baseCoords, baseViewports,
+            ctx.scale, options);
+    }
 
     std::vector<vc::render::ChunkViewportSample> overlayDemand;
-    if (overlayActive) {
+    if (overlayActive && !skipOverlayViewDemand) {
         const bool overlayComposite = ctx.overlayComposite.enabled &&
             (ctx.overlayComposite.method == "max" ||
              ctx.overlayComposite.method == "mean" ||
@@ -2643,17 +2682,37 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     if (overlayActive &&
         ctx.overlayChunkArray->sourceId() == ctx.chunkArray->sourceId()) {
         baseDemand.insert(baseDemand.end(), overlayDemand.begin(), overlayDemand.end());
-        ctx.chunkArray->replaceViewDemand(
-            ctx.renderJob.chunkRequest, ctx.renderJob.renderFocus,
-            std::move(baseDemand));
-    } else {
-        ctx.chunkArray->replaceViewDemand(
-            ctx.renderJob.chunkRequest, ctx.renderJob.renderFocus,
-            std::move(baseDemand));
-        if (overlayActive) {
-            ctx.overlayChunkArray->replaceViewDemand(
+        if (skipBaseViewDemand && baseDemand.empty()) {
+            // Nothing withheld may linger either: retire the previous frame's
+            // demand so its interactive fetches stop outranking tile fills.
+            ctx.chunkArray->clearSourceViewDemand(
+                ctx.renderJob.chunkRequest.viewId,
+                ctx.renderJob.chunkRequest.viewVersion);
+        } else {
+            ctx.chunkArray->replaceViewDemand(
                 ctx.renderJob.chunkRequest, ctx.renderJob.renderFocus,
-                std::move(overlayDemand));
+                std::move(baseDemand));
+        }
+    } else {
+        if (skipBaseViewDemand) {
+            ctx.chunkArray->clearSourceViewDemand(
+                ctx.renderJob.chunkRequest.viewId,
+                ctx.renderJob.chunkRequest.viewVersion);
+        } else {
+            ctx.chunkArray->replaceViewDemand(
+                ctx.renderJob.chunkRequest, ctx.renderJob.renderFocus,
+                std::move(baseDemand));
+        }
+        if (overlayActive) {
+            if (skipOverlayViewDemand) {
+                ctx.overlayChunkArray->clearSourceViewDemand(
+                    ctx.renderJob.chunkRequest.viewId,
+                    ctx.renderJob.chunkRequest.viewVersion);
+            } else {
+                ctx.overlayChunkArray->replaceViewDemand(
+                    ctx.renderJob.chunkRequest, ctx.renderJob.renderFocus,
+                    std::move(overlayDemand));
+            }
         }
     }
 
@@ -3485,6 +3544,7 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     ctx.profileReason = job.profileReason;
     ctx.profileCaller = job.profileCaller;
     ctx.debugDownloadQueue = _state && _state->debugDownloadQueueEnabled();
+    ctx.preferSurfaceTileFills = _preferSurfaceTileFills;
     _genCacheDirty = false;
 
     QPointer<CChunkedVolumeViewer> guard(this);
@@ -4243,7 +4303,7 @@ void CChunkedVolumeViewer::onCursorMove(QPointF scenePos)
     _haveChunkFocus = true;
     markChunkRequestViewActive();
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
-    updateCursorCrosshair(scenePos);
+    updateLocalCursorCrosshair(scenePos);
     updateStatusLabel();
     if (_viewerManager) {
         _viewerManager->broadcastLinkedCursor(this, _lastCursorVolumePos);
@@ -4312,8 +4372,8 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
     if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
         if (const auto hit = pointAtScenePosition(scenePos)) {
             _selectedCollectionId = hit->first;
-            _selectedPointId = hit->second;
-            emit pointClicked(_selectedPointId);
+            _selectedPoint = vc::PointRef{hit->first, hit->second};
+            emit pointClicked(*_selectedPoint);
             emit overlaysUpdated();
             return;
         }
@@ -4329,24 +4389,33 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
 void CChunkedVolumeViewer::onCollectionSelected(uint64_t collectionId)
 {
     _selectedCollectionId = collectionId;
-    if (_selectedPointId != 0) {
-        const auto point = _pointCollection ? _pointCollection->getPoint(_selectedPointId)
+    if (_selectedPoint) {
+        const auto point = _pointCollection ? _pointCollection->getPoint(*_selectedPoint)
                                             : std::optional<ColPoint>{};
         if (!point || point->collectionId != collectionId) {
-            _selectedPointId = 0;
+            _selectedPoint.reset();
         }
     }
     emit overlaysUpdated();
 }
 
-void CChunkedVolumeViewer::onPointSelected(uint64_t pointId)
+void CChunkedVolumeViewer::clearCollectionSelection()
 {
-    _selectedPointId = pointId;
-    if (_pointCollection && pointId != 0) {
-        if (const auto point = _pointCollection->getPoint(pointId)) {
-            _selectedCollectionId = point->collectionId;
-        }
-    }
+    _selectedCollectionId.reset();
+    _selectedPoint.reset();
+    emit overlaysUpdated();
+}
+
+void CChunkedVolumeViewer::onPointSelected(vc::PointRef point)
+{
+    _selectedPoint = point;
+    _selectedCollectionId = point.collectionId;
+    emit overlaysUpdated();
+}
+
+void CChunkedVolumeViewer::clearPointSelection()
+{
+    _selectedPoint.reset();
     emit overlaysUpdated();
 }
 
@@ -4456,7 +4525,7 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
     _haveChunkFocus = true;
     markChunkRequestViewActive();
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
-    updateCursorCrosshair(scenePos);
+    updateLocalCursorCrosshair(scenePos);
     updateStatusLabel();
     if (_viewerManager) {
         _viewerManager->broadcastLinkedCursor(this, _lastCursorVolumePos);
@@ -4495,16 +4564,17 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
                             QMessageBox::No);
                         return reply == QMessageBox::Yes;
                     })) {
-                if (_pointCollection && _pointCollection->getPoint(hit->second)) {
+                const vc::PointRef hitRef{hit->first, hit->second};
+                if (_pointCollection && _pointCollection->getPoint(hitRef)) {
                     _selectedCollectionId = hit->first;
-                    _selectedPointId = hit->second;
+                    _selectedPoint = hitRef;
                 } else {
-                    _selectedCollectionId = 0;
-                    _selectedPointId = 0;
+                    _selectedCollectionId.reset();
+                    _selectedPoint.reset();
                 }
                 _sameWrapManualMergePressConsumed = true;
-                if (_selectedPointId != 0) {
-                    emit pointClicked(_selectedPointId);
+                if (_selectedPoint) {
+                    emit pointClicked(*_selectedPoint);
                 }
                 emit overlaysUpdated();
                 return;
@@ -4559,16 +4629,16 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
         _lastCursorVolumePos = cursorVolumePosition(scenePos);
     }
     _lastScenePos = scenePos;
-    updateCursorCrosshair(scenePos);
+    updateLocalCursorCrosshair(scenePos);
     updateStatusLabel();
 
-    const uint64_t previousHighlight = _highlightedPointId;
+    const std::optional<vc::PointRef> previousHighlight = _highlightedPoint;
     if (const auto hit = pointAtScenePosition(scenePos)) {
-        _highlightedPointId = hit->second;
+        _highlightedPoint = vc::PointRef{hit->first, hit->second};
     } else {
-        _highlightedPointId = 0;
+        _highlightedPoint.reset();
     }
-    if (_highlightedPointId != previousHighlight) {
+    if (_highlightedPoint != previousHighlight) {
         emit overlaysUpdated();
     }
 
@@ -4611,7 +4681,7 @@ void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton butt
 {
     _lastScenePos = scenePos;
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
-    updateCursorCrosshair(scenePos);
+    updateLocalCursorCrosshair(scenePos);
     updateStatusLabel();
     if (_viewerManager) {
         _viewerManager->broadcastLinkedCursor(this, _lastCursorVolumePos);
@@ -4742,35 +4812,62 @@ cv::Vec2f CChunkedVolumeViewer::sceneToSurfaceCoords(const QPointF& scenePos) co
     return sceneToSurface(scenePos);
 }
 
-QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
+// Match the points-overlay default view tolerance so points that are meant to
+// render faded still project to their true location rather than collapsing.
+static constexpr float kQuadProjectTolerance = 10.0f;
+
+void CChunkedVolumeViewer::quadProjectDepthBand(float& depthLo, float& depthHi) const
+{
+    // The view shows content displaced by the normal offset — and, when
+    // compositing, the whole slab. Points anywhere in that visible signed
+    // depth band along the normal (e.g. the linked cursor from a slice
+    // view) must still project; points outside it — including the mirror
+    // side of the surface — must not.
+    depthLo = _zOff;
+    depthHi = _zOff;
+    if (isCompositeEnabled()) {
+        const float zStep = _compositeSettings.reverseDirection ? -1.0f : 1.0f;
+        const float front = _zOff + float(std::max(0, _compositeSettings.layersFront)) * zStep;
+        const float behind = _zOff - float(std::max(0, _compositeSettings.layersBehind)) * zStep;
+        depthLo = std::min(front, behind);
+        depthHi = std::max(front, behind);
+    }
+}
+
+SurfaceProjectionContext
+CChunkedVolumeViewer::surfaceProjectionContext() const
+{
+    SurfaceProjectionContext context;
+    auto surf = _surfWeak.lock();
+    context.surface = surf.get();
+    if (auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr) {
+        context.patchIndexGeneration = patchIndex->globalGeneration();
+    }
+    quadProjectDepthBand(context.depthLo, context.depthHi);
+    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+        context.planeOrigin = plane->origin();
+        context.planeBasisX = plane->basisX();
+        context.planeBasisY = plane->basisY();
+    }
+    return context;
+}
+
+std::optional<SurfaceProjection>
+CChunkedVolumeViewer::projectVolumePoint(const cv::Vec3f& volPoint) const
 {
     auto surf = _surfWeak.lock();
     if (!surf)
-        return {};
+        return std::nullopt;
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         const cv::Vec3f proj = plane->project(volPoint, 1.0, 1.0);
-        return surfaceToScene(proj[0], proj[1]);
+        return SurfaceProjection{proj[0], proj[1], 0.0f, false};
     }
     if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
         cv::Vec3f ptr = quad->pointer();
         auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-        // Match the points-overlay default view tolerance so points that are meant to
-        // render faded still project to their true location rather than collapsing.
-        constexpr float kQuadProjectTolerance = 10.0f;
-        // The view shows content displaced by the normal offset — and, when
-        // compositing, the whole slab. Points anywhere in that visible signed
-        // depth band along the normal (e.g. the linked cursor from a slice
-        // view) must still project; points outside it — including the mirror
-        // side of the surface — must not.
-        float depthLo = _zOff;
-        float depthHi = _zOff;
-        if (isCompositeEnabled()) {
-            const float zStep = _compositeSettings.reverseDirection ? -1.0f : 1.0f;
-            const float front = _zOff + float(std::max(0, _compositeSettings.layersFront)) * zStep;
-            const float behind = _zOff - float(std::max(0, _compositeSettings.layersBehind)) * zStep;
-            depthLo = std::min(front, behind);
-            depthHi = std::max(front, behind);
-        }
+        float depthLo = 0.0f;
+        float depthHi = 0.0f;
+        quadProjectDepthBand(depthLo, depthHi);
         const float tolerance =
             kQuadProjectTolerance + std::max(std::abs(depthLo), std::abs(depthHi));
         // pointTo() with a patch index signals "no surface point within tolerance" by
@@ -4779,7 +4876,7 @@ QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
         // segment center. Treat anything outside the tolerance as a failed projection.
         const float dist = quad->pointTo(ptr, volPoint, tolerance, 100, patchIndex);
         if (dist < 0.0f || dist > tolerance)
-            return {NAN, NAN};
+            return std::nullopt;
         // Gate on the signed offset along the surface normal so only the
         // depth band the view actually displays accepts the point.
         float w = _zOff;
@@ -4789,23 +4886,44 @@ QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
             w = (volPoint - surfCoord).dot(surfNormal);
             if (w < depthLo - kQuadProjectTolerance ||
                 w > depthHi + kQuadProjectTolerance)
-                return {NAN, NAN};
-        }
-        // Under the volumetric camera, points off the w=0 anchor plane (the
-        // offset surface) render displaced by tilt/perspective; place the
-        // marker with the render's own per-w mapping. wPx matches the render:
-        // slab w in layers (zStep folds the reverse-direction sign back in)
-        // times output scale times the wScale relief exaggeration.
-        float wPx = 0.0f;
-        if (volumetricCameraActive()) {
-            const float zStep = _compositeSettings.reverseDirection ? -1.0f : 1.0f;
-            const float wScale = std::max(_compositeSettings.params.wScale, 0.01f);
-            wPx = (w - _zOff) * zStep * _scale * wScale;
+                return std::nullopt;
         }
         const cv::Vec3f loc = quad->loc(ptr);
-        return surfaceToScene(loc[0], loc[1], wPx);
+        return SurfaceProjection{loc[0], loc[1], w, true};
     }
-    return {};
+    return std::nullopt;
+}
+
+QPointF CChunkedVolumeViewer::surfaceProjectionToScene(
+    const SurfaceProjection& projection) const
+{
+    // Under the volumetric camera, points off the w=0 anchor plane (the
+    // offset surface) render displaced by tilt/perspective; place the
+    // marker with the render's own per-w mapping. wPx matches the render:
+    // slab w in layers (zStep folds the reverse-direction sign back in)
+    // times output scale times the wScale relief exaggeration.
+    float wPx = 0.0f;
+    if (projection.applyVolumetricW && volumetricCameraActive()) {
+        const float zStep = _compositeSettings.reverseDirection ? -1.0f : 1.0f;
+        const float wScale = std::max(_compositeSettings.params.wScale, 0.01f);
+        wPx = (projection.w - _zOff) * zStep * _scale * wScale;
+    }
+    return surfaceToScene(projection.u, projection.v, wPx);
+}
+
+QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
+{
+    if (const auto projection = projectVolumePoint(volPoint))
+        return surfaceProjectionToScene(*projection);
+    // Only on failure is it worth re-establishing why: a surface that is
+    // absent, or neither a plane nor a quad, maps to a default-constructed
+    // point, which callers treat differently from the NaN that means the
+    // point simply missed the surface.
+    auto surf = _surfWeak.lock();
+    if (!surf ||
+        (!dynamic_cast<PlaneSurface*>(surf.get()) && !dynamic_cast<QuadSurface*>(surf.get())))
+        return {};
+    return {NAN, NAN};
 }
 
 void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos, bool projected)
@@ -4850,6 +4968,28 @@ void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos, bool p
 
     _cursorCrosshair->setPos(scenePos);
     _cursorCrosshair->show();
+}
+
+void CChunkedVolumeViewer::updateLocalCursorCrosshair(const QPointF& scenePos)
+{
+    if (_localCursorCrosshairSuppressed) {
+        if (_cursorCrosshair) _cursorCrosshair->hide();
+        return;
+    }
+    updateCursorCrosshair(scenePos);
+}
+
+void CChunkedVolumeViewer::setLocalCursorCrosshairSuppressed(bool suppressed)
+{
+    if (_localCursorCrosshairSuppressed == suppressed) return;
+    _localCursorCrosshairSuppressed = suppressed;
+    if (suppressed) {
+        if (_cursorCrosshair) _cursorCrosshair->hide();
+    } else if (_lastCursorVolumePos
+               && std::isfinite(_lastScenePos.x())
+               && std::isfinite(_lastScenePos.y())) {
+        updateCursorCrosshair(_lastScenePos);
+    }
 }
 
 void CChunkedVolumeViewer::setSegmentationCursorMirroring(bool enabled)
@@ -5104,7 +5244,7 @@ void CChunkedVolumeViewer::refreshCursorPositionAt(const QPointF& scenePos)
 {
     _lastScenePos = scenePos;
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
-    updateCursorCrosshair(scenePos);
+    updateLocalCursorCrosshair(scenePos);
     updateStatusLabel();
     if (_viewerManager) {
         _viewerManager->broadcastLinkedCursor(this, _lastCursorVolumePos);

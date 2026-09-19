@@ -3544,6 +3544,46 @@ TEST_CASE("fiber mode records only manifest identities used by direct interpolat
     CHECK(spline.controlPoints.front().segmentToNext->fiberManifestLocation.empty());
 }
 
+TEST_CASE("fiber mode can return only the inclusive control span")
+{
+    FiberModeNormalSampler normals;
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {2.0, {0.0, 0.0, 0.0}, true, 2},
+        {6.0, {16.0, 0.0, 0.0}, false, 6},
+    };
+    request.controlPoints.front().segmentToNext.emplace();
+    request.controlPoints.front().segmentToNext->interpGoal =
+        vc3d::line_annotation::SegmentInterpolationGoal::Cspline;
+    for (int x = -8; x <= 24; x += 4) {
+        request.linePointsBase.push_back({static_cast<double>(x), 0.0, 0.0});
+    }
+    request.baseNormalSampler = &normals;
+    request.globalMode =
+        vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d;
+    request.retainOpenTails = false;
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 4.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+
+    const auto result = vc3d::line_annotation::optimizeFiberWithNativeFallback(
+        std::move(request));
+
+    REQUIRE(result.optimization.line.points.size() >= 2);
+    CHECK(cv::norm(result.optimization.line.points.front().position -
+                   cv::Vec3d{0.0, 0.0, 0.0}) < 1.0e-12);
+    CHECK(cv::norm(result.optimization.line.points.back().position -
+                   cv::Vec3d{16.0, 0.0, 0.0}) < 1.0e-12);
+    CHECK(result.nativeExtrapolations == 0);
+    CHECK(result.lasagnaFallbackExtrapolations == 0);
+    REQUIRE(result.controlPoints.size() == 2);
+    CHECK(result.controlPoints.front().optimizedIndex == 0);
+    CHECK(result.controlPoints.back().optimizedIndex ==
+          static_cast<int>(result.optimization.line.points.size()) - 1);
+}
+
 TEST_CASE("fiber mode truncates extrapolation at an invalid prediction edge")
 {
     FiberModeNormalSampler normals;
@@ -3942,4 +3982,217 @@ TEST_CASE("controlled span keeps only the line between the outer control points"
         CHECK(span[1] == c);
         CHECK(span[2] == a);
     }
+}
+
+TEST_CASE("Generated markers map every position into the downsampled viewer")
+{
+    using namespace vc3d::line_annotation;
+    for (const double scale : {1.0, 0.25}) {
+        GeneratedOverlay::BranchLinkMarker branch;
+        branch.localControlPoint = {120, 240, 360};
+        branch.linkedControlPoint = {160, 280, 400};
+        branch.planePoint = branch.linkedControlPoint;
+        branch.localDirection = {1, 0, 0};
+        branch.linkedDirection = {0, 1, 0};
+        branch.linkedFiberId = 42;
+        scaleGeneratedMarkerForVolume(branch, scale);
+        CHECK(branch.localControlPoint == cv::Vec3f(120, 240, 360) * scale);
+        CHECK(branch.linkedControlPoint == cv::Vec3f(160, 280, 400) * scale);
+        CHECK(branch.planePoint == branch.linkedControlPoint);
+        CHECK(branch.localDirection == cv::Vec3f(1, 0, 0));
+        CHECK(branch.linkedDirection == cv::Vec3f(0, 1, 0));
+        CHECK(branch.linkedFiberId == 42);
+
+        GeneratedOverlay::PredSnapMarker snap;
+        snap.controlPoint = {120, 240, 360};
+        snap.snapPoint = {124, 248, 372};
+        snap.linePosition = 2.5;
+        snap.controlIndex = 3;
+        snap.manual = true;
+        scaleGeneratedMarkerForVolume(snap, scale);
+        CHECK(snap.controlPoint == cv::Vec3f(120, 240, 360) * scale);
+        CHECK(snap.snapPoint == cv::Vec3f(124, 248, 372) * scale);
+        CHECK(snap.linePosition == 2.5);
+        CHECK(snap.controlIndex == 3);
+        CHECK(snap.manual);
+    }
+}
+
+TEST_CASE("Winding queries use the center frame at every volume level")
+{
+    using namespace vc3d::line_annotation;
+    std::vector<cv::Vec3f> basePoints;
+    // Off-origin, z-dependent center exposes both XY and Z frame mismatches.
+    const auto towardCenter = [](const cv::Vec3f& p) -> cv::Vec3f {
+        return {1000.0f + p[2] - p[0], 2000.0f - p[2] - p[1], 0};
+    };
+    for (int i = 0; i < 40; ++i) {
+        const float z = 100.0f + i * 4.0f;
+        const float angle = i * 0.3f;
+        basePoints.push_back({1000.0f + z + 100.0f * std::cos(angle),
+                              2000.0f - z + 100.0f * std::sin(angle), z});
+    }
+    const auto expected = unwrappedGeneratedWindingAngles(basePoints, towardCenter);
+    auto viewerPoints = basePoints;
+    for (auto& point : viewerPoints) {
+        point *= 0.25f;
+    }
+    const auto actual = unwrappedGeneratedWindingAngles(viewerPoints, towardCenter, 4.0f);
+    REQUIRE(actual.size() == expected.size());
+    for (size_t i = 0; i < actual.size(); ++i) {
+        CHECK(actual[i] == doctest::Approx(expected[i]));
+    }
+    CHECK(generatedLineIndexRangeWithinWinding(actual, actual.size(), 20.0,
+                                               kGeneratedSideCutHalfWrapAngle) ==
+          generatedLineIndexRangeWithinWinding(expected, expected.size(), 20.0,
+                                               kGeneratedSideCutHalfWrapAngle));
+}
+
+TEST_CASE("control point tags round trip and travel with the point")
+{
+    using namespace vc3d::line_annotation;
+
+    // Untagged points serialize exactly as before: no "tags" key at all.
+    StoredControlPoint untagged{{1.0, 2.0, 3.0}};
+    CHECK(!storedControlPointToJson(untagged).contains("tags"));
+
+    StoredControlPoint tagged{{1.0, 2.0, 3.0}};
+    CHECK(setControlPointTag(tagged.tags, kKollesisTerminationTag, true));
+    CHECK(!setControlPointTag(tagged.tags, kKollesisTerminationTag, true));
+    CHECK(hasControlPointTag(tagged.tags, kKollesisTerminationTag));
+    const auto json = storedControlPointToJson(tagged);
+    REQUIRE(json.contains("tags"));
+    CHECK(json["tags"] == nlohmann::json::array({"kollesis_termination"}));
+    const auto parsed = storedControlPointFromJson(json, 3);
+    CHECK(parsed.tags == tagged.tags);
+    CHECK(setControlPointTag(tagged.tags, kKollesisTerminationTag, false));
+    CHECK(tagged.tags.empty());
+    CHECK(!setControlPointTag(tagged.tags, kKollesisTerminationTag, false));
+
+    // Normalised on read: trimmed, blanks dropped, unique, sorted.
+    const nlohmann::json messy{{"position", {1.0, 2.0, 3.0}},
+                               {"tags", {" b ", "a", "", "a"}}};
+    CHECK(storedControlPointFromJson(messy, 3).tags ==
+          std::vector<std::string>{"a", "b"});
+    const nlohmann::json notArray{{"position", {1.0, 2.0, 3.0}},
+                                  {"tags", "kollesis_termination"}};
+    CHECK_THROWS_AS(storedControlPointFromJson(notArray, 3), std::runtime_error);
+    const nlohmann::json notStrings{{"position", {1.0, 2.0, 3.0}}, {"tags", {1}}};
+    CHECK_THROWS_AS(storedControlPointFromJson(notStrings, 3), std::runtime_error);
+    // Any other per-point field is still rejected.
+    const nlohmann::json unknown{{"position", {1.0, 2.0, 3.0}},
+                                 {"kollesis_termination", true}};
+    CHECK_THROWS_AS(storedControlPointFromJson(unknown, 3), std::runtime_error);
+
+    // The shared core reader (atlas, tracer CLI, inspect tools) accepts the
+    // field and rejects the same malformed shapes.
+    const nlohmann::json root = {{"control_points", nlohmann::json::array({json})}};
+    CHECK_NOTHROW(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+        root, "control_points", 3, "test fiber"));
+    const nlohmann::json badTags = {{"control_points", nlohmann::json::array({notStrings})}};
+    CHECK_THROWS_AS(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+                        badTags, "control_points", 3, "test fiber"),
+                    std::runtime_error);
+    const nlohmann::json badField = {{"control_points", nlohmann::json::array({unknown})}};
+    CHECK_THROWS_AS(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+                        badField, "control_points", 3, "test fiber"),
+                    std::runtime_error);
+
+    // Edits: the click that collapses tagged points keeps the union of their
+    // tags, the optimizer round trip and a reverse carry them unchanged.
+    std::vector<LineControlPoint> controls{
+        LineControlPoint{0.0, cv::Vec3d(0.0, 0.0, 0.0), true, 0},
+        LineControlPoint{5.0, cv::Vec3d(5.0, 0.0, 0.0), false, 5},
+        LineControlPoint{10.0, cv::Vec3d(10.0, 0.0, 0.0), false, 10}};
+    controls[1].tags = {"kollesis_termination"};
+    controls[2].tags = {"other"};
+    const auto collapse =
+        collapseControlPointsAtClick(controls, {1, 2}, 7.0, cv::Vec3d(7.0, 0.0, 0.0));
+    REQUIRE(collapse.replacementIndex < collapse.controlPoints.size());
+    CHECK(collapse.controlPoints[collapse.replacementIndex].tags ==
+          std::vector<std::string>{"kollesis_termination", "other"});
+    CHECK(collapse.controlPoints[0].tags.empty());
+    const auto fresh =
+        collapseControlPointsAtClick(controls, {}, 7.0, cv::Vec3d(7.0, 0.0, 0.0));
+    REQUIRE(fresh.replacementIndex < fresh.controlPoints.size());
+    CHECK(fresh.controlPoints[fresh.replacementIndex].tags.empty());
+
+    const auto merged = mergeOptimizerControlPoints(optimizerControlPoints(controls), controls);
+    REQUIRE(merged.size() == controls.size());
+    CHECK(merged[1].tags == controls[1].tags);
+    CHECK(merged[2].tags == controls[2].tags);
+
+    std::vector<StoredControlPoint> stored{StoredControlPoint{cv::Vec3d(0.0, 0.0, 0.0)},
+                                           StoredControlPoint{cv::Vec3d(5.0, 0.0, 0.0)},
+                                           StoredControlPoint{cv::Vec3d(10.0, 0.0, 0.0)}};
+    stored[2].tags = {"kollesis_termination"};
+    const auto reversed = reversedStoredControlPoints(stored);
+    REQUIRE(reversed.size() == 3);
+    CHECK(reversed[0].tags == stored[2].tags);
+    CHECK(reversed[2].tags.empty());
+}
+
+TEST_CASE("kollesis terminations sit on fiber ends and block placement beyond them")
+{
+    using namespace vc3d::line_annotation;
+    using Marker = GeneratedOverlay::ControlPointMarker;
+    const auto marker = [](size_t index, double linePosition, bool tagged) {
+        Marker m;
+        m.controlIndex = index;
+        m.linePosition = linePosition;
+        m.isKollesisTermination = tagged;
+        return m;
+    };
+
+    // Session order need not be line order: index 2 is the first point.
+    std::vector<Marker> markers{marker(0, 10.0, false), marker(1, 25.0, false),
+                                marker(2, 3.0, false), marker(3, 40.0, false)};
+    CHECK(generatedControlPointIsEndpoint(markers, 2));
+    CHECK(generatedControlPointIsEndpoint(markers, 3));
+    CHECK(!generatedControlPointIsEndpoint(markers, 0));
+    CHECK(!generatedControlPointIsEndpoint(markers, 1));
+    CHECK(!generatedControlPointIsEndpoint(markers, 9));
+    CHECK(generatedControlPointIsEndpoint({marker(0, 5.0, false)}, 0));
+    CHECK(!generatedControlPointIsEndpoint({}, 0));
+    // A marker without a line position neither is an end nor hides one.
+    markers.push_back(marker(4, std::numeric_limits<double>::quiet_NaN(), true));
+    CHECK(!generatedControlPointIsEndpoint(markers, 4));
+    CHECK(generatedControlPointIsEndpoint(markers, 3));
+
+    // Nothing tagged: nothing blocked.
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, -5.0));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, 100.0));
+
+    // Tagged last point: only positions strictly past it are blocked.
+    markers[3].isKollesisTermination = true;
+    CHECK(generatedLinePositionBeyondKollesisTermination(markers, 40.5));
+    CHECK(generatedLinePositionBeyondKollesisTermination(markers, 100.0));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, 40.0));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, 30.0));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, -5.0));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(
+        markers, std::numeric_limits<double>::quiet_NaN()));
+
+    // Tagged first point: the other side.
+    markers[3].isKollesisTermination = false;
+    markers[2].isKollesisTermination = true;
+    CHECK(generatedLinePositionBeyondKollesisTermination(markers, 2.9));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, 3.0));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, 100.0));
+
+    // An interior tag (from an edited file) blocks nothing.
+    markers[2].isKollesisTermination = false;
+    markers[1].isKollesisTermination = true;
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, -5.0));
+    CHECK(!generatedLinePositionBeyondKollesisTermination(markers, 100.0));
+
+    // The rule the controller applies to session controls directly.
+    const std::vector<double> positions{10.0, 25.0, 3.0, 40.0};
+    CHECK(generatedLinePositionBeyondTaggedEnd(positions, {false, false, false, true}, 41.0));
+    CHECK(!generatedLinePositionBeyondTaggedEnd(positions, {false, false, false, true}, 40.0));
+    CHECK(generatedLinePositionBeyondTaggedEnd(positions, {false, false, true, false}, 2.0));
+    CHECK(!generatedLinePositionBeyondTaggedEnd(positions, {false, true, false, false}, 100.0));
+    // Mismatched vectors mean no tags rather than a misaligned read.
+    CHECK(!generatedLinePositionBeyondTaggedEnd(positions, {true}, 100.0));
+    CHECK(!generatedLinePositionBeyondTaggedEnd({}, {}, 5.0));
 }
