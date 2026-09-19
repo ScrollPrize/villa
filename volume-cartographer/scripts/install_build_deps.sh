@@ -38,6 +38,20 @@ apt-get install -y --no-install-recommends \
     file bzip2 wget jq valgrind \
     python3 python3-venv
 
+# GCC's libstdc++ implements std::byteswap (C++23, <bit>) only from GCC 13
+# onward. Jammy's default gcc/g++ (11.4, just installed via build-essential
+# above) predates that; ubuntu:26.04's default gcc is already new enough.
+# Fall back to the ubuntu-toolchain-r/test PPA and register gcc-13/g++-13 as
+# the higher-priority `gcc`/`g++` alternative; no-op wherever the default
+# compiler already satisfies this.
+if [[ "$(gcc -dumpversion | cut -d. -f1)" -lt 13 ]]; then
+    add-apt-repository -y ppa:ubuntu-toolchain-r/test
+    apt-get update -y
+    apt-get install -y --no-install-recommends gcc-13 g++-13
+    update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 130 \
+        --slave /usr/bin/g++ g++ /usr/bin/g++-13
+fi
+
 ln -sf /usr/bin/flang-21 /usr/local/bin/flang
 
 # AWS CLI v2 (architecture-aware official installer).
