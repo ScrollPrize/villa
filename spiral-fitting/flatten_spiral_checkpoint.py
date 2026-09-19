@@ -106,6 +106,42 @@ def _resolve_umbilicus(checkpoint_path: Path, explicit: Path | None) -> Path:
         "SPIRAL_DATASET to the dataset root")
 
 
+def _resolve_voxel_size_um(checkpoint_path: Path, explicit: float | None) -> float:
+    """The scroll's voxel size, taken from the dataset the checkpoint came from.
+
+    This number is written into the exported TIFXYZ metadata, where it sets
+    every area the mesh reports, and is passed to the flattener, where it sets
+    every length. spiral-scroll.json is the one place that states it, so it is
+    read from there, by the same walk _resolve_umbilicus already does: a run
+    that cannot find umbilicus.json this way does not export at all, so the
+    dataset root is already required to be reachable from the checkpoint.
+    """
+    if explicit is not None:
+        if not explicit > 0:
+            raise ValueError("--voxel-size-um must be positive")
+        return float(explicit)
+    candidates = []
+    dataset_env = os.environ.get("SPIRAL_DATASET")
+    if dataset_env:
+        candidates.append(Path(dataset_env).expanduser() / "spiral-scroll.json")
+    for parent in (checkpoint_path.parent, *checkpoint_path.parents):
+        candidates.append(parent / "spiral-scroll.json")
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        document = json.loads(candidate.read_text(encoding="utf-8"))
+        stated = document.get("voxel_size_um")
+        if stated is None:
+            raise ValueError(f"{candidate}: voxel_size_um is missing")
+        stated = float(stated)
+        if not stated > 0:
+            raise ValueError(f"{candidate}: voxel_size_um must be positive")
+        return stated
+    raise FileNotFoundError(
+        "could not locate spiral-scroll.json to read voxel_size_um; pass "
+        "--voxel-size-um or set SPIRAL_DATASET to the dataset root")
+
+
 def _resolve_lasagna(explicit: Path | None) -> tuple[Path, Path]:
     candidates = [explicit.expanduser()] if explicit is not None else []
     configured = os.environ.get("LASAGNA_SERVICE_PATH")
@@ -453,8 +489,9 @@ def _parse_args(argv=None):
         "--device", default="cuda",
         help="Torch device used to reconstruct the Spiral surface (default: cuda)")
     parser.add_argument(
-        "--voxel-size-um", type=float, default=9.6,
-        help="source voxel size written to TIFXYZ metadata (default: 9.6)")
+        "--voxel-size-um", type=float, default=None,
+        help="source voxel size written to TIFXYZ metadata "
+             "(default: voxel_size_um from the dataset's spiral-scroll.json)")
     parser.add_argument(
         "--chunk-size", type=int, default=65536,
         help="points transformed per reconstruction batch (default: 65536)")
@@ -469,8 +506,6 @@ def main(argv=None) -> int:
         raise FileExistsError(
             f"refusing to overwrite existing output: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
-    if args.voxel_size_um <= 0:
-        raise ValueError("--voxel-size-um must be positive")
     if args.chunk_size <= 0:
         raise ValueError("--chunk-size must be positive")
     device = torch.device(args.device)
@@ -478,6 +513,7 @@ def main(argv=None) -> int:
         raise RuntimeError("CUDA is unavailable; pass --device cpu if intentional")
 
     umbilicus = _resolve_umbilicus(checkpoint_path, args.umbilicus)
+    voxel_size_um = _resolve_voxel_size_um(checkpoint_path, args.voxel_size_um)
     service, flatten_config = _resolve_lasagna(args.lasagna_dir)
     print(f"[spiral] loading {checkpoint_path}", flush=True)
     checkpoint = load_checkpoint_cpu(str(checkpoint_path))
@@ -497,7 +533,7 @@ def main(argv=None) -> int:
             umbilicus,
             work / "source",
             device=device,
-            voxel_size_um=float(args.voxel_size_um),
+            voxel_size_um=voxel_size_um,
             chunk_size=int(args.chunk_size),
         )
         del checkpoint
@@ -510,7 +546,7 @@ def main(argv=None) -> int:
             service,
             flatten_config,
             work,
-            voxel_size_um=float(args.voxel_size_um),
+            voxel_size_um=voxel_size_um,
         )
     finally:
         shutil.rmtree(work, ignore_errors=True)
