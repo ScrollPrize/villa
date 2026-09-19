@@ -21,7 +21,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REQUIRED_TIFXYZ_FILES = ("x.tif", "y.tif", "z.tif", "meta.json")
 
 
@@ -210,6 +210,47 @@ def _block_valid_mask(
     return selected & finite, finite
 
 
+def _accumulate_spacing(
+    first: tuple[np.ndarray, np.ndarray, np.ndarray],
+    second: tuple[np.ndarray, np.ndarray, np.ndarray],
+    pairs: np.ndarray,
+    histogram: np.ndarray,
+) -> tuple[int, int]:
+    if not np.any(pairs):
+        return 0, 0
+    first_values = [np.asarray(values, dtype=np.float64) for values in first]
+    second_values = [np.asarray(values, dtype=np.float64) for values in second]
+    distances = np.sqrt(
+        sum(
+            np.square(first_values[axis] - second_values[axis])
+            for axis in range(3)
+        )
+    )[pairs]
+    zero_length = int(np.count_nonzero(distances == 0))
+    positive = distances > 0
+    if np.any(positive):
+        bins = np.floor(np.log2(distances[positive]) * 64).astype(np.int64)
+        bins = np.clip(bins, -64 * 20, 64 * 20 - 1) + 64 * 20
+        np.add.at(histogram, bins, 1)
+    return int(len(distances)), zero_length
+
+
+def _spacing_summary(
+    histogram: np.ndarray, pair_count: int, zero_length: int
+) -> dict[str, Any]:
+    positive_count = int(histogram.sum())
+    median = None
+    if positive_count:
+        target = positive_count // 2
+        median_bin = int(np.searchsorted(np.cumsum(histogram), target, side="left"))
+        median = float(2 ** ((median_bin - 64 * 20 + 0.5) / 64))
+    return {
+        "pair_count": pair_count,
+        "median_spacing_voxels": median,
+        "zero_length_pair_count": zero_length,
+    }
+
+
 def _scan_surface(
     x: np.ndarray,
     y: np.ndarray,
@@ -228,6 +269,13 @@ def _scan_surface(
     minima = np.full(3, np.inf, dtype=np.float64)
     maxima = np.full(3, -np.inf, dtype=np.float64)
     previous_valid: np.ndarray | None = None
+    previous_coordinates: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+    column_histogram = np.zeros(64 * 40, dtype=np.int64)
+    row_histogram = np.zeros(64 * 40, dtype=np.int64)
+    column_pair_count = 0
+    row_pair_count = 0
+    column_zero_length_count = 0
+    row_zero_length_count = 0
     limits_xyz = None
     if volume_shape is not None:
         limits_xyz = np.asarray(
@@ -269,6 +317,21 @@ def _scan_surface(
                 & valid[0, 1:]
             )
             valid_quad_count += int(np.count_nonzero(bridge))
+            bridge_pairs = previous_valid & valid[0]
+            if previous_coordinates is not None:
+                pairs = bridge_pairs
+                count, zero_count = _accumulate_spacing(
+                    (
+                        previous_coordinates[0],
+                        previous_coordinates[1],
+                        previous_coordinates[2],
+                    ),
+                    (xb[0], yb[0], zb[0]),
+                    pairs,
+                    row_histogram,
+                )
+                row_pair_count += count
+                row_zero_length_count += zero_count
         if valid.shape[0] > 1:
             quads = (
                 valid[:-1, :-1]
@@ -277,8 +340,31 @@ def _scan_surface(
                 & valid[1:, 1:]
             )
             valid_quad_count += int(np.count_nonzero(quads))
+            column_pairs = valid[:, :-1] & valid[:, 1:]
+            count, zero_count = _accumulate_spacing(
+                (xb[:, :-1], yb[:, :-1], zb[:, :-1]),
+                (xb[:, 1:], yb[:, 1:], zb[:, 1:]),
+                column_pairs,
+                column_histogram,
+            )
+            column_pair_count += count
+            column_zero_length_count += zero_count
+            row_pairs = valid[:-1, :] & valid[1:, :]
+            count, zero_count = _accumulate_spacing(
+                (xb[:-1, :], yb[:-1, :], zb[:-1, :]),
+                (xb[1:, :], yb[1:, :], zb[1:, :]),
+                row_pairs,
+                row_histogram,
+            )
+            row_pair_count += count
+            row_zero_length_count += zero_count
         if valid.shape[0]:
             previous_valid = valid[-1].copy()
+            previous_coordinates = (
+                xb[-1].copy(),
+                yb[-1].copy(),
+                zb[-1].copy(),
+            )
 
     bounds = None
     if valid_count:
@@ -296,6 +382,18 @@ def _scan_surface(
             out_of_bounds_count if volume_shape is not None else None
         ),
         "coordinate_bounds_xyz": bounds,
+        "grid_spacing_voxels": {
+            "columns": _spacing_summary(
+                column_histogram,
+                column_pair_count,
+                column_zero_length_count,
+            ),
+            "rows": _spacing_summary(
+                row_histogram,
+                row_pair_count,
+                row_zero_length_count,
+            ),
+        },
     }
 
 
@@ -384,6 +482,133 @@ def _sample_volume_support(
     }
 
 
+def _scale_consistency(
+    scan: Mapping[str, Any],
+    scale: tuple[float, float],
+    tolerance: float,
+) -> dict[str, Any]:
+    ratio_bounds = [1.0 / tolerance, tolerance]
+    observed: dict[str, Any] = {}
+    failed_axis = None
+    for axis, name in enumerate(("columns", "rows")):
+        spacing = scan["grid_spacing_voxels"][name]
+        median = spacing["median_spacing_voxels"]
+        pair_count = int(spacing["pair_count"])
+        implied_scale = None if median is None else float(1.0 / median)
+        ratio = None if median is None else float(median * scale[axis])
+        observed[name] = {
+            "expected_spacing_voxels": float(1.0 / scale[axis]),
+            "median_spacing_voxels": median,
+            "ratio": ratio,
+            "pair_count": pair_count,
+            "implied_scale": implied_scale,
+        }
+        if (
+            failed_axis is None
+            and (
+                pair_count == 0
+                or median is None
+                or ratio is None
+                or not ratio_bounds[0] <= ratio <= ratio_bounds[1]
+            )
+        ):
+            failed_axis = name
+
+    passed = failed_axis is None
+    if passed:
+        message = "metadata scale agrees with the emitted grid spacing"
+    elif observed[failed_axis]["median_spacing_voxels"] is None:
+        message = (
+            f"grid has no positive {failed_axis} spacing pairs to compare with "
+            "meta.json scale"
+        )
+    else:
+        axis_observed = observed[failed_axis]
+        message = (
+            "meta.json scale disagrees with the emitted grid spacing "
+            f"({failed_axis}: scale {scale[0 if failed_axis == 'columns' else 1]:.6f} "
+            f"implies {axis_observed['expected_spacing_voxels']:.1f} voxels per "
+            f"cell, grid measures {axis_observed['median_spacing_voxels']:.1f}); "
+            "fix the producer's scale or re-export"
+        )
+    return _gate(
+        "tifxyz_scale_consistency",
+        passed,
+        observed=observed,
+        threshold={"ratio_within": ratio_bounds},
+        message=message,
+    )
+
+
+def _bbox_consistency(
+    scan: Mapping[str, Any],
+    bbox: Any,
+    tolerance: float,
+) -> dict[str, Any]:
+    try:
+        parsed = np.asarray(bbox, dtype=np.float64)
+    except (TypeError, ValueError):
+        parsed = np.asarray([])
+    if parsed.shape != (2, 3) or not np.all(np.isfinite(parsed)):
+        return _gate(
+            "tifxyz_bbox_consistency",
+            False,
+            observed={"error": "meta.json bbox must be a 2x3 array of finite numbers"},
+            threshold={"bbox_tolerance_voxels": tolerance},
+            message="meta.json bbox must be a 2x3 array of finite numbers",
+        )
+
+    coordinate_bounds = scan["coordinate_bounds_xyz"]
+    if scan["valid_vertex_count"] == 0:
+        return _gate(
+            "tifxyz_bbox_consistency",
+            False,
+            observed={
+                "bbox": parsed.tolist(),
+                "coordinate_bounds_xyz": coordinate_bounds,
+                "max_excess_voxels": None,
+            },
+            threshold={"bbox_tolerance_voxels": tolerance},
+            message="no valid vertices to compare against bbox",
+        )
+
+    bounds = np.asarray(
+        [
+            [coordinate_bounds[axis][0] for axis in ("x", "y", "z")],
+            [coordinate_bounds[axis][1] for axis in ("x", "y", "z")],
+        ],
+        dtype=np.float64,
+    )
+    excess = np.maximum(
+        np.maximum(
+            parsed[0] - bounds[0] - tolerance,
+            bounds[1] - parsed[1] - tolerance,
+        ),
+        0,
+    )
+    max_excess = float(np.max(excess))
+    passed = max_excess == 0
+    return _gate(
+        "tifxyz_bbox_consistency",
+        passed,
+        observed={
+            "bbox": parsed.tolist(),
+            "coordinate_bounds_xyz": coordinate_bounds,
+            "max_excess_voxels": max_excess,
+        },
+        threshold={"bbox_tolerance_voxels": tolerance},
+        message=(
+            "metadata bbox covers the valid vertices"
+            if passed
+            else (
+                "meta.json bbox does not cover the valid vertices "
+                f"(exceeds by {max_excess:g} voxels); the bbox is stale — "
+                "rewrite it from the coordinate rasters"
+            )
+        ),
+    )
+
+
 def inspect_pair(
     surface: Path | str,
     volume: str | None = None,
@@ -394,6 +619,8 @@ def inspect_pair(
     minimum_support_fraction: float = 0.95,
     support_threshold: float = 0.0,
     block_rows: int = 256,
+    scale_tolerance: float = 2.0,
+    bbox_tolerance: float = 0.01,
 ) -> dict[str, Any]:
     """Inspect one TIFXYZ/volume pair and return a JSON-serializable report."""
     surface_path = Path(surface)
@@ -414,6 +641,8 @@ def inspect_pair(
             "support_threshold": support_threshold,
             "support_sampling": "evenly ranked valid vertices; nearest CT voxel",
             "block_rows": block_rows,
+            "scale_tolerance": scale_tolerance,
+            "bbox_tolerance": bbox_tolerance,
         },
         "gates": gates,
     }
@@ -429,6 +658,10 @@ def inspect_pair(
             raise ValueError("support_threshold must be non-negative")
         if block_rows <= 0:
             raise ValueError("block_rows must be positive")
+        if scale_tolerance < 1:
+            raise ValueError("scale_tolerance must be at least 1")
+        if bbox_tolerance < 0:
+            raise ValueError("bbox_tolerance must be non-negative")
 
         missing = [
             name
@@ -558,45 +791,47 @@ def inspect_pair(
             block_rows=block_rows,
         )
         report["surface"].update(scan)
-        gates.extend(
-            [
-                _gate(
-                    "valid_surface_vertices",
-                    scan["valid_vertex_count"] > 0,
-                    observed=scan["valid_vertex_count"],
-                    threshold="> 0",
-                    message=(
-                        "surface has valid vertices"
-                        if scan["valid_vertex_count"]
-                        else (
-                            "surface has no valid vertices (all coordinates are "
-                            "sentinel/invalid); the producer emitted an empty grid"
-                        )
-                    ),
+        gates.append(
+            _gate(
+                "valid_surface_vertices",
+                scan["valid_vertex_count"] > 0,
+                observed=scan["valid_vertex_count"],
+                threshold="> 0",
+                message=(
+                    "surface has valid vertices"
+                    if scan["valid_vertex_count"]
+                    else (
+                        "surface has no valid vertices (all coordinates are "
+                        "sentinel/invalid); the producer emitted an empty grid"
+                    )
                 ),
-                _gate(
-                    "valid_surface_quads",
-                    scan["valid_quad_count"] > 0,
-                    observed=scan["valid_quad_count"],
-                    threshold="> 0",
-                    message=(
-                        "surface has connected quads"
-                        if scan["valid_quad_count"]
-                        else "surface has no connected valid quads"
-                    ),
+            )
+        )
+        gates.append(
+            _gate(
+                "valid_surface_quads",
+                scan["valid_quad_count"] > 0,
+                observed=scan["valid_quad_count"],
+                threshold="> 0",
+                message=(
+                    "surface has connected quads"
+                    if scan["valid_quad_count"]
+                    else "surface has no connected valid quads"
                 ),
-                _gate(
-                    "finite_selected_coordinates",
-                    scan["selected_nonfinite_count"] == 0,
-                    observed=scan["selected_nonfinite_count"],
-                    threshold=0,
-                    message=(
-                        "selected coordinates are finite"
-                        if scan["selected_nonfinite_count"] == 0
-                        else "selected coordinates include non-finite values"
-                    ),
+            )
+        )
+        gates.append(
+            _gate(
+                "finite_selected_coordinates",
+                scan["selected_nonfinite_count"] == 0,
+                observed=scan["selected_nonfinite_count"],
+                threshold=0,
+                message=(
+                    "selected coordinates are finite"
+                    if scan["selected_nonfinite_count"] == 0
+                    else "selected coordinates include non-finite values"
                 ),
-            ]
+            )
         )
         if volume is not None:
             gates.append(
@@ -612,7 +847,11 @@ def inspect_pair(
                     ),
                 )
             )
+        gates.append(_scale_consistency(scan, scale, scale_tolerance))
+        if "bbox" in metadata:
+            gates.append(_bbox_consistency(scan, metadata["bbox"], bbox_tolerance))
 
+        if volume is not None:
             points = _sample_points(
                 x,
                 y,
@@ -713,6 +952,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="minimum absolute sampled CT value (strictly greater than)",
     )
+    parser.add_argument(
+        "--scale-tolerance",
+        type=float,
+        default=2.0,
+        help="allowed ratio between metadata scale and grid spacing",
+    )
+    parser.add_argument(
+        "--bbox-tolerance",
+        type=float,
+        default=0.01,
+        help="allowed bbox coverage tolerance in voxels",
+    )
     parser.add_argument("--block-rows", type=int, default=256, help=argparse.SUPPRESS)
     return parser
 
@@ -728,6 +979,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         minimum_support_fraction=args.minimum_support_fraction,
         support_threshold=args.support_threshold,
         block_rows=args.block_rows,
+        scale_tolerance=args.scale_tolerance,
+        bbox_tolerance=args.bbox_tolerance,
     )
     if args.output:
         _atomic_write_json(args.output, report)
