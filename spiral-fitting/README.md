@@ -112,6 +112,16 @@ throws `RuntimeError: lasagna z-ROI [...] is empty` if the mismatch is
 large enough to push the requested z-range outside the (wrongly-scaled)
 store bounds.
 
+Optional `num_windings`: the scroll's winding count, where someone has
+estimated it (an integer of at least 2). It replaces the generic default of
+both `shell_outer_winding_idx` and `model_gap_expander_num_windings`, which is
+Scroll 1's count (130). The exporter writes windings up to
+`shell_outer_winding_idx`, so on a scroll with fewer windings the generic
+value exports windings that lie outside the papyrus. It is a default rather
+than a fact the scroll owns: `FIT_SPIRAL_CONFIG_OVERRIDES` and the Spiral panel
+still override it, and `model_gap_expander_capacity_windings` is raised to
+`num_windings + 3` only when the count would not otherwise fit.
+
 Example (PHerc0826, where group `"2"` is a 4x downsample for this scroll
 specifically):
 
