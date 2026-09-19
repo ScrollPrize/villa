@@ -786,6 +786,8 @@ def main():
             'vesuvius.neural_tracing.fiber_trace_3d.embedding_consistency', str(CONTROL)])
     parser = argparse.ArgumentParser()
     parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs', 'evaluate', 'audit-latest', 'production-start', 'production-status', 'production-stop', 'production-watch', 'trace-evaluate', 'comparison', 'comparison-followup', 'trace-series-prepare', 'trace-series-next', 'trace-series-retry', 'remote-auth-probe'])
+    parser.add_argument('--resume', type=Path,
+                        help='checkpoint passed to production-start')
     args = parser.parse_args()
     if args.command == 'inspect':
         inspect()
@@ -804,7 +806,7 @@ def main():
     elif args.command == 'trace-series-retry':
         trace_series_next(retry_failed=True)
     elif args.command == 'production-start':
-        production_start()
+        production_start(resume=args.resume)
     elif args.command == 'production-status':
         production_status()
     elif args.command == 'production-stop':
