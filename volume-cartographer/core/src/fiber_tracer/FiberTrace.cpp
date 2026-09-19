@@ -514,6 +514,13 @@ void validateTraceConfig(const FiberTraceConfig& config)
             throw std::invalid_argument(std::string(name) + " must be finite");
     };
     requireFinite(config.stepVoxels, "step voxels");
+    requireFinite(config.samplePoolRadiusVoxels, "sample pool radius");
+    if (config.samplePoolRadiusVoxels < 0.0)
+        throw std::invalid_argument("sample pool radius must be non-negative");
+    if (config.samplePoolMode != "max" && config.samplePoolMode != "mean")
+        throw std::invalid_argument("sample pool mode must be max or mean");
+    if (config.samplePoolStencil != "cross" && config.samplePoolStencil != "cube")
+        throw std::invalid_argument("sample pool stencil must be cross or cube");
     requireFinite(config.coneAngleDegrees, "cone angle degrees");
     requireFinite(config.coneAngleStepDegrees, "cone angle step degrees");
     requireFinite(config.beamPruneDistanceVoxels, "beam prune distance");
@@ -747,6 +754,9 @@ struct CandidateScoringScratch {
     std::vector<TraceVec> candidatePoints;
     std::vector<TraceVec> referenceDirections;
     std::vector<FiberPredictionSample> predictionSamples;
+    std::vector<TraceVec> pooledPoints;
+    std::vector<TraceVec> pooledDirections;
+    std::vector<FiberPredictionSample> pooledSamples;
     std::vector<vc::lasagna::NormalSampleWithDerivative> normalSamplesWithDerivative;
     std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample> floatNormalSamples;
     std::vector<vc::lasagna::NormalSample> fallbackNormalSamples;
@@ -1033,6 +1043,87 @@ void sampleCandidateNormals(
     }
 }
 
+[[nodiscard]] bool samplePoolingEnabled(const FiberTraceConfig& config)
+{
+    return config.samplePoolRadiusVoxels > 0.0;
+}
+
+// Stencil offsets in trace voxels; the centre comes first.
+[[nodiscard]] std::vector<TraceVec> samplePoolOffsets(const FiberTraceConfig& config)
+{
+    std::vector<TraceVec> offsets;
+    if (!samplePoolingEnabled(config))
+        return offsets;
+    const float r = static_cast<float>(config.samplePoolRadiusVoxels);
+    offsets.push_back({0.0f, 0.0f, 0.0f});
+    if (config.samplePoolStencil == "cube") {
+        for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx)
+                    if (dx != 0 || dy != 0 || dz != 0)
+                        offsets.push_back({r * static_cast<float>(dx), r * static_cast<float>(dy), r * static_cast<float>(dz)});
+    } else {
+        for (int axis = 0; axis < 3; ++axis) {
+            for (const float sign : {-1.0f, 1.0f}) {
+                TraceVec offset{0.0f, 0.0f, 0.0f};
+                offset[axis] = sign * r;
+                offsets.push_back(offset);
+            }
+        }
+    }
+    return offsets;
+}
+
+// Pools ``stencilSize`` consecutive expanded samples into one sample per
+// candidate. Options match by index. Presence is max-pooled or averaged over
+// the valid stencil samples; the direction is the presence-weighted mean of
+// the stencil directions, which sampleBatch already aligned to the reference
+// direction, falling back to the centre direction when the weights cancel.
+void poolPredictionSamples(
+    const std::vector<FiberPredictionSample>& expanded, size_t stencilSize, const FiberTraceConfig& config,
+    std::vector<FiberPredictionSample>& out)
+{
+    if (stencilSize == 0 || expanded.size() % stencilSize != 0)
+        throw std::invalid_argument("pooled prediction batch is not a whole number of stencils");
+    const bool useMax = config.samplePoolMode == "max";
+    const size_t count = expanded.size() / stencilSize;
+    out.clear();
+    out.resize(count);
+    for (size_t i = 0; i < count; ++i) {
+        const FiberPredictionSample* group = &expanded[i * stencilSize];
+        size_t optionCount = 0;
+        for (size_t j = 0; j < stencilSize; ++j)
+            optionCount = std::max(optionCount, group[j].options.size());
+        auto& options = out[i].options;
+        options.clear();
+        options.reserve(optionCount);
+        for (size_t o = 0; o < optionCount; ++o) {
+            float pooled = 0.0f;
+            size_t validCount = 0;
+            TraceVec direction{0.0f, 0.0f, 0.0f};
+            TraceVec centreDirection{0.0f, 0.0f, 0.0f};
+            for (size_t j = 0; j < stencilSize; ++j) {
+                if (o >= group[j].options.size() || !group[j].options[o].valid)
+                    continue;
+                const auto& option = group[j].options[o];
+                const float presence = traceClamp01(option.presence);
+                pooled = useMax ? std::max(pooled, presence) : pooled + presence;
+                direction += option.direction * presence;
+                if (j == 0)
+                    centreDirection = option.direction;
+                ++validCount;
+            }
+            FiberPredictionSampleOption option;
+            if (validCount > 0) {
+                option.presence = useMax ? pooled : pooled / static_cast<float>(validCount);
+                option.direction = traceNormalizedOr(direction, traceNormalizedOrZero(centreDirection));
+                option.valid = option.direction.dot(option.direction) > 1.0e-12f;
+            }
+            options.push_back(option);
+        }
+    }
+}
+
 [[nodiscard]] const std::vector<CandidateScore>& scoreCandidateTasks(
     const FiberPredictionSource& predictions,
     const vc::lasagna::NormalSampler* normalSampler,
@@ -1111,8 +1202,9 @@ void sampleCandidateNormals(
                 addEmbeddingScore(score, (*context.embeddings)[pointIndex], (*context.beams)[task.beamIndex], (*context.candidatePoints)[pointIndex], *context.config);
             storeScoredFrontierCandidate(context.frontierOutput, *context.beams, task, (*context.candidatePoints)[pointIndex], score, pointIndex);
         };
+    const bool pooling = samplePoolingEnabled(config);
     const bool fusedCornerScoring =
-        field != nullptr && lasagnaSampler != nullptr && normals.empty() && normalAwareSmoothnessEnabled(config) &&
+        !pooling && field != nullptr && lasagnaSampler != nullptr && normals.empty() && normalAwareSmoothnessEnabled(config) &&
         field->visitCornerBatchWithNormals(*lasagnaSampler, candidatePoints, workers, &cornerContext, scoreCornerPoint, lookaheadDepth, profile);
     if (fusedCornerScoring) {
         if (profile != nullptr)
@@ -1123,7 +1215,38 @@ void sampleCandidateNormals(
     referenceDirections.reserve(tasks.size());
     for (const auto& task : tasks)
         referenceDirections.push_back(task.direction);
-    if (field != nullptr) {
+    if (pooling) {
+        const auto offsets = samplePoolOffsets(config);
+        auto& expandedPoints = scratch.pooledPoints;
+        auto& expandedDirections = scratch.pooledDirections;
+        auto& expandedSamples = scratch.pooledSamples;
+        expandedPoints.clear();
+        expandedDirections.clear();
+        expandedPoints.reserve(tasks.size() * offsets.size());
+        expandedDirections.reserve(tasks.size() * offsets.size());
+        for (size_t index = 0; index < tasks.size(); ++index) {
+            for (const auto& offset : offsets) {
+                expandedPoints.push_back(candidatePoints[index] + offset);
+                expandedDirections.push_back(referenceDirections[index]);
+            }
+        }
+        if (field != nullptr) {
+            field->sampleBatch(expandedPoints, expandedDirections, workers, expandedSamples, profile);
+        } else {
+            std::vector<cv::Vec3d> doublePoints;
+            std::vector<cv::Vec3d> doubleDirections;
+            doublePoints.reserve(expandedPoints.size());
+            doubleDirections.reserve(expandedDirections.size());
+            for (const auto& point : expandedPoints)
+                doublePoints.push_back(toVec3d(point));
+            for (const auto& direction : expandedDirections)
+                doubleDirections.push_back(toVec3d(direction));
+            predictions.sampleBatch(doublePoints, doubleDirections, workers, expandedSamples);
+        }
+        if (expandedSamples.size() != expandedPoints.size())
+            throw std::runtime_error("pooled fiber prediction batch returned the wrong number of samples");
+        poolPredictionSamples(expandedSamples, offsets.size(), config, predictionSamples);
+    } else if (field != nullptr) {
         field->sampleBatch(candidatePoints, referenceDirections, workers, predictionSamples, profile);
     } else {
         std::vector<cv::Vec3d> doublePoints;
@@ -2565,6 +2688,20 @@ CandidateScoreDebug debugCandidateLossFromCorners(
     beam.historyDirection = toTraceVec(historyDirection);
     const CandidateScore score = candidateLossFromCorners(corners, optionCount, pointIndex, beam, toTraceVec(candidateDirection), config);
     return {score.loss, toVec3d(score.selectedCurrentDirection), score.selectedPresence, score.valid};
+}
+
+std::vector<FiberPredictionSample> debugPoolPredictionSamples(
+    const std::vector<FiberPredictionSample>& expanded, size_t stencilSize, const FiberTraceConfig& config)
+{
+    std::vector<FiberPredictionSample> out;
+    poolPredictionSamples(expanded, stencilSize, config, out);
+    return out;
+}
+
+std::vector<cv::Vec3f> debugSamplePoolOffsets(const FiberTraceConfig& config)
+{
+    const auto offsets = samplePoolOffsets(config);
+    return {offsets.begin(), offsets.end()};
 }
 
 CandidateScoreDebug debugCandidateLossFromSample(

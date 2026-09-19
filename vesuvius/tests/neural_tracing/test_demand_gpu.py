@@ -212,3 +212,32 @@ def test_cleanup_aborts_on_pump_error_and_still_reconciles():
     lease.pool = SimpleNamespace(pump=broken_pump)
     lease.close()
     assert calls == ['stop', 'abort-and-join', 'release']
+
+
+def test_idle_release_threshold_is_configurable(monkeypatch):
+    from types import SimpleNamespace
+    from concurrent.futures import Future
+    from vesuvius.neural_tracing.fiber_trace_3d import demand_gpu as module
+    import pytest
+    monkeypatch.setattr(module, 'resolve_gpu_uuids', lambda devices: ['GPU-test'])
+    monkeypatch.setattr(module, 'ensure_manager', lambda socket: ('/sock', None))
+    monkeypatch.setattr(module, 'Client', lambda path: SimpleNamespace(path=path, close=lambda: None,
+                                                                   pause=lambda idle: paused.append(idle),
+                                                                   task_id='t'))
+    monkeypatch.setattr(module, 'Supervisor', lambda client, **kwargs: SimpleNamespace(
+        client=client, connected=True, stopping=False, tick=lambda: None, error=None, status='running'))
+    paused = []
+    future = Future(); future.set_result(None)
+    pool = SimpleNamespace(active={}, loading={1: ('s', (), 0, future, 0)}, last_gpu_activity=0)
+    now = [0]
+    lease = DemandGpuLease(pool, dict(vram_bytes_per_gpu=4 << 30, idle_release_seconds=600), clock=lambda: now[0])
+    lease.tick()  # registers; a ready read means GPU work is needed
+    pool.loading = {}
+    now[0] = 100
+    lease.tick()
+    assert paused == []  # 100 s idle is below the configured 600 s
+    now[0] = 700
+    lease.tick()
+    assert paused == [True]
+    with pytest.raises(ValueError, match='idle_release_seconds'):
+        DemandGpuLease(pool, dict(vram_bytes_per_gpu=4 << 30, idle_release_seconds=0))
