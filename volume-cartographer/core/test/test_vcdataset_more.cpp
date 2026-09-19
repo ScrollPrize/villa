@@ -148,24 +148,42 @@ TEST_CASE("VcDataset::writeRegion: spans multiple chunks with partial overlap")
     fs::remove_all(d);
 }
 
-TEST_CASE("VcDataset: region read past dataset bounds (BUG: segfaults under coverage build)")
+TEST_CASE("VcDataset: a region past the dataset bounds is refused, not written past")
 {
-    // FIXME: vc_core bug — VcDataset::readRegion with a region that extends
-    // past the dataset bounds crashes with SIGSEGV instead of clamping,
-    // returning false, or throwing. The origin is in-bounds; only the
-    // far corner is OOB. Reproduces on coverage build (gcc 15, --coverage).
-    // Skipping the actual call so the suite still runs; flip on to repro:
+    // Was disabled with a CHECK(true) placeholder and a FIXME saying readRegion segfaults on
+    // an out-of-bounds region "instead of clamping, returning false, or throwing". Returning
+    // false is the smaller of the two options they listed and matches the bool return type.
     //
-    //   auto d = tmpDir("oob_region");
-    //   auto ds = vc::createZarrDataset(d, "arr",
-    //       {8, 8, 8}, {8, 8, 8}, vc::VcDtype::uint8, "none");
-    //   std::vector<uint8_t> out(8 * 8 * 8, 0xCC);
-    //   (void)ds->readRegion({0, 0, 0}, {16, 16, 16}, out.data());  // <-- crash
-    //
-    // Once the impl is fixed, this test should:
-    //   - never segfault
-    //   - either return false OR clamp to the valid sub-region.
-    CHECK(true);  // placeholder — see comment above
+    // Without the fix this is a heap-buffer-overflow, confirmed with the project's own
+    // -DVC_ENABLE_ASAN=ON: "WRITE of size 8 ... in fillTypedElements". Note that without ASan
+    // the same binary exits 0 and reports all tests passing, which is why the original FIXME
+    // could only reproduce it under a coverage build.
+    auto d = tmpDir("oob_region");
+    auto ds = vc::createZarrDataset(d, "arr",
+        {8, 8, 8}, {8, 8, 8}, vc::VcDtype::uint8, "none");
+    REQUIRE(ds);
+
+    std::vector<uint8_t> out(8 * 8 * 8, 0xCC);
+    CHECK_FALSE(ds->readRegion({0, 0, 0}, {16, 16, 16}, out.data()));
+    // the caller's buffer must be untouched when the call is refused
+    CHECK(out.front() == 0xCC);
+    CHECK(out.back() == 0xCC);
+
+    // an offset that starts inside but runs off the end is equally invalid
+    CHECK_FALSE(ds->readRegion({4, 4, 4}, {8, 8, 8}, out.data()));
+    // and an offset entirely outside
+    CHECK_FALSE(ds->readRegion({99, 0, 0}, {1, 1, 1}, out.data()));
+
+    // writeRegion has the same missing check and the same consequence, in reverse: it would
+    // read past the caller's input buffer.
+    std::vector<uint8_t> in(8 * 8 * 8, 0x11);
+    CHECK_FALSE(ds->writeRegion({0, 0, 0}, {16, 16, 16}, in.data()));
+
+    // the in-bounds cases must be unaffected
+    CHECK(ds->readRegion({0, 0, 0}, {8, 8, 8}, out.data()));
+    CHECK(ds->readRegion({2, 2, 2}, {4, 4, 4}, out.data()));
+    CHECK(ds->writeRegion({0, 0, 0}, {8, 8, 8}, in.data()));
+    fs::remove_all(d);
 }
 
 TEST_CASE("VcDataset::delimiter() returns the configured separator")
