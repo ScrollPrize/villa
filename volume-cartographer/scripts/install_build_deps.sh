@@ -6,9 +6,23 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -y
-apt-get install -y --no-install-recommends software-properties-common ca-certificates curl unzip
+apt-get install -y --no-install-recommends software-properties-common ca-certificates curl unzip gnupg
 add-apt-repository -y universe
 apt-get update -y
+
+# flang-21 / libclang-rt-21-dev ship in Ubuntu 26.04's default archives, but
+# not in older releases (e.g. 22.04 jammy, used by local dev machines, Colab,
+# and any ec2_setup.sh host that isn't on 26.04 yet). Fall back to the
+# official LLVM apt repo for this codename so the install below still
+# resolves; this is a no-op wherever the packages are already native.
+if ! apt-cache show flang-21 >/dev/null 2>&1; then
+    codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+    curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+    echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-21 main" \
+        > /etc/apt/sources.list.d/llvm-21.list
+    apt-get update -y
+fi
+
 apt-get install -y --no-install-recommends \
     build-essential clang lld llvm flang-21 libclang-rt-21-dev mold git cmake ninja-build ccache pkg-config \
     qt6-base-dev \
