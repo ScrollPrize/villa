@@ -520,6 +520,43 @@ volume because those determine the plan. Level 0 is a sparse uint8 Zarr-v2
 array in scroll Z/Y/X coordinates. Five rounded-mean levels are derived from
 it, producing a six-level OME-Zarr pyramid with ceil-halved shapes.
 
+### Post-processing: geometry surface consistency
+
+`vesuvius.ink_detection.postprocessing.surface_consistency` is an optional,
+label-free step for the native OME-Zarr prediction. For every voxel it keeps
+the maximum, over the three axis-aligned planes through it, of the local mean
+probability on a `(2r+1) x (2r+1)` window in that plane, so probability mass
+that is coherent within the papyrus sheet is preserved while isolated,
+off-sheet responses are attenuated. It processes only the chunks present in
+the source (with an `r` voxel halo), rebuilds the five coarser levels by the
+same rounded mean pooling, and writes the same six-level uint8 OME-Zarr
+layout, so the result opens wherever the original prediction does and the
+output support equals the input support.
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.postprocessing.surface_consistency \
+  /data/predictions/w035.ome.zarr \
+  /data/predictions/w035-gsc.ome.zarr \
+  --radius 2
+```
+
+| Argument | Meaning |
+|---|---|
+| `input_zarr output_zarr` | Native prediction pyramid in, same-layout pyramid out. |
+| `--radius` | Plane window half-size, default `2` (5x5 windows). |
+| `--levels` | Pyramid levels to write, default the input's. |
+| `--overwrite` | Replace an existing output; otherwise existing output is refused. |
+| `--receipt` | Optional JSON run receipt (paths, radius, chunk counts, seconds). |
+
+On public Scroll 1 data with the official `ckpt_78k_fullsup` native-3D
+checkpoint, eight sealed 256^3 windows of segment `w00_20231016151002` moved
+from mean cube AUC 0.703 to 0.788 (a rolled, misaligned control gives 0.639)
+and eight windows of `w01_20230702185753_r15` from 0.714 to 0.769; the receipts,
+before/after panels and the standalone tool live at
+https://github.com/danilolapegna/vesuvius-geometry-surface-consistency. The
+transform raises the ranking quality of the soft volume; thresholds downstream
+still need their own calibration.
+
 ## Labeling loop
 
 1. Train from Zarr labels and a surface volume.
