@@ -39,7 +39,7 @@ sidebar_label: "Spiral Fitting"
 import ChatCallout from '@site/src/components/ChatWidget/ChatCallout';
 
 
-*Last updated: July 9, 2026*
+*Last updated: September 16, 2026*
 
 <ChatCallout prefill="Walk me through the spiral fitting tutorial" />
 
@@ -88,7 +88,7 @@ The output is **one `tifxyz` mesh per winding** of the scroll — a full set of 
 
 Since these are ordinary `tifxyz` meshes, everything downstream works as usual: you can load them in VC3D, flatten them, and [render surface volumes for ink detection](tutorial5). The repo also includes a tool ([`render_ink.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/render_ink.py)) that concatenates the windings into fixed-width chunks, flattens them, and renders ink predictions as a series of horizontal strips — more on that [below](#rendering-ink).
 
-Alongside the meshes, a fit writes a model checkpoint, overlay images showing the fitted windings drawn over scan slices, and *satisfaction metrics* — per-input-type statistics of how much of the evidence the final surface actually honors.
+Alongside the meshes, a fit writes a model checkpoint, *satisfaction metrics* — per-input-type statistics of how much of the evidence the final surface actually honors — and, optionally, overlay images showing the fitted windings drawn over scan slices.
 
 ### How to run it
 
@@ -98,11 +98,9 @@ The code lives in the villa repository under [`spiral-fitting`](https://github.c
 git clone https://github.com/ScrollPrize/villa.git
 cd villa/spiral-fitting
 uv sync
-uv pip install torch torchvision   # pick the build matching your CUDA version
-uv pip install -e ../volume-cartographer   # volume-cartographer python bindings
 ```
 
-The spiral scripts declare their dependencies in their own [`pyproject.toml`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/pyproject.toml) — only `torch` is left for you to install, so you can pick the right build for your CUDA version. The last line builds the volume-cartographer Python bindings, which the fit uses to link point annotations to patches; it compiles C++, so you'll need cmake and VC's build dependencies (see the [segmentation tutorial](segmentation#installation-instructions) if it fails).
+Everything the fit needs is declared in the project's own [`pyproject.toml`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/pyproject.toml), `torch` included — on Linux it comes from the CUDA 12.8 wheel index, so there is no separate torch install to get right. `uv sync` also builds `vc_spiral`, a small C++ extension the fit uses to link point annotations to patch surfaces, so the machine needs cmake and a C++ toolchain; you no longer need a volume-cartographer Python install.
 
 #### Get the dataset
 
@@ -114,47 +112,88 @@ rclone copy :http: ./spiral_datasets/phercparis4 \
     --transfers 32 -P
 ```
 
-re-running rclone resumes interrupted downloads. The dataset contains verified and unverified patches, tracks, fibers, the outer shell, winding annotation JSONs, the umbilicus, and the volume inputs — see the [dataset README](pathname:///data/datasets/spiral-input-PHercParis4-README.md) for the exact layout.
+Note that re-running rclone resumes interrupted downloads. For PHerc Paris 4, the dataset contains verified and unverified patches, tracks, fibers, the outer shell, winding annotation JSONs, the umbilicus, and the volume inputs — see the [dataset README](pathname:///data/datasets/spiral-input-PHercParis4-README.md) for the exact layout.
 
 #### Configure
 
-Configuration is straightforward: the input paths and fitting region are plain variables at the top of `fit_spiral.py`. Edit them to point at your download:
+Two separate things configure a run: **where the data is** — given on the command line, plus one file inside the dataset — and **how to fit it**, a flat set of named settings.
 
-- `dataset_path` — the root of the dataset; the per-input paths below it (`verified_patches_path`, `unverified_patches_path`, `pcl_json_paths`, `fibers_path`, `shell_path`, `tracks_dbm_path`, the normals/grad-mag zarr paths, …) default to locations inside it. Set any of them to `None` to fit without that input.
-- `z_begin, z_end` — the slice range (in full-resolution voxels) to fit. **Consider starting with a small range**: the whole written region of Scroll 1 is roughly z 4,000–17,000, and fitting all of it needs a lot of GPU memory (around 60 GB). A ~1,000-slice range is a good first run on a smaller GPU. Per-step sample counts are scaled automatically to the size of the z-range, so hyperparameters don't need retuning when you change it.
+##### The dataset
 
-Everything else — loss weights, resolutions, step counts — lives in the `default_config` dict just below, with one entry per knob. You can override any of them without editing the file via a JSON environment variable, and a few other environment variables control the run:
+`fit_spiral.py` takes a `--dataset` root and resolves the conventional layout underneath it: `umbilicus.json`, `verified_patches/`, `fibers/`, `fiber_directions.npz`, `outer_shell/`, `tracks/`, `winding_inference/`, the `lasagna_inputs/*.ome.zarr` volumes, and the point-collection documents `abs_winding.json`, `relative_windings.json`, `same_windings.json` and `drawn_control_points.json`. A download of the published dataset is already in that layout, so there are no paths to edit. The one input with no conventional location is `unverified_patches/`, which must be named explicitly in the `paths` block described below.
+
+You also need to provide a **`spiral-scroll.json`** in the dataset root, recording the physical facts of the scroll:
+
+```json
+{
+  "schema_version": 1,
+  "name": "PHercParis4",
+  "voxel_size_um": 9.6,
+  "spiral_outward_sense": "CW"
+}
+```
+
+`name` is free-form and is what appears in the generated run-folder name. `spiral_outward_sense` (`"CW"` or `"ACW"`) says which way the spiral turns as it winds outward. No automated method determines it: it is read off the CT data by a person in VC3D, or taken from an already-fitted spiral. The file can also carry a `paths` object naming individual inputs that have no conventional location (`"unverified_patches"`) or whose filenames don't match the conventional ones (`"tracks_dbm"` is the usual one), and `normal_zarr_group` / `lasagna_scale`, which choose the OME-Zarr pyramid level the lasagna normal stores are read at — these are easy to get wrong silently, so read the scale off the store's own `.zattrs` rather than copying another scroll's values. The [spiral-fitting README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md) documents the full schema.
+
+##### The fit configuration
+
+Everything else — the fitted z-range, which inputs participate, loss weights, resolutions, step counts — is a flat dictionary of named settings defined in [`config.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/config.py): one attribute of the `Config` class per knob, each with its default. You can pass overrides as JSON:
+
+```bash
+FIT_SPIRAL_CONFIG_OVERRIDES='{"z_begin": 10500, "z_end": 11500, "optimizer_num_training_steps": 10000}' \
+    python fit_spiral.py --dataset ./spiral_datasets/phercparis4
+```
+
+The settings you are most likely to touch:
+
+- `z_begin`, `z_end` — the slice range (in full-resolution voxels) to fit; the defaults, 4,000 and 17,000, span the whole written region of Scroll 1. **Consider starting with a small range**: fitting all of it needs a lot of GPU memory and time, and a ~1,000-slice range is a good first run on a smaller GPU. Per-step sample counts are scaled automatically to the size of the z-range, so the other hyperparameters don't need retuning when you change it.
+- **`input_use_*` — whether an input that is present is actually used.** Each optional input source has its own toggle, independent of whether its file is there: `input_use_verified_patches`, `input_use_unverified_patches`, `input_use_tracks`, `input_use_fibers`, `input_use_fiber_directions`, `input_use_normals`, `input_use_gradient_magnitude`, `input_use_surf_sdt`, `input_use_winding_inference`, `input_use_outer_shell`, plus one per annotation role — `input_use_pcl_absolute`, `input_use_pcl_relative`, `input_use_pcl_same_winding`, `input_use_pcl_drawn_control_points`.Note that `input_use_tracks` defaults to `false`, so a dataset that includes a tracks DBM will not use it unless you turn it on:
+
+  ```
+  FIT_SPIRAL_CONFIG_OVERRIDES='{"input_use_tracks": true, ...}'
+  ```
+
+  A few ready-made override files live in [`configs/`](https://github.com/ScrollPrize/villa/tree/main/spiral-fitting/configs).
+
+A few environment variables control the run itself rather than the fit:
 
 | Variable | Effect |
 | --- | --- |
-| `FIT_SPIRAL_CONFIG_OVERRIDES` | JSON dict of `default_config` overrides, e.g. `'{"num_training_steps": 10000}'` |
-| `FIT_SPIRAL_OUT_DIR` | Output directory (default `./out`) |
-| `FIT_SPIRAL_CACHE_DIR` | Cache for preprocessed inputs (default `../cache`) — speeds up subsequent runs a lot |
+| `FIT_SPIRAL_CONFIG_OVERRIDES` | JSON dict of `Config` overrides, e.g. `'{"optimizer_num_training_steps": 10000}'` |
+| `FIT_SPIRAL_OUT_DIR` | Parent directory for the generated run folder (default `./out`) |
+| `FIT_SPIRAL_RUN_DIR` | Use this exact directory as the run folder, instead of generating a name |
 | `FIT_SPIRAL_RUN_TAG` | Tag appended to the output folder and mesh names |
 | `FIT_SPIRAL_RESUME_PATH` / `FIT_SPIRAL_RESUME_STEP` | Resume from a checkpoint |
 | `WANDB_MODE` | Set to `online` to log losses and visualizations to Weights & Biases (default `disabled`) |
 
+The cache of preprocessed inputs — which speeds up subsequent runs a lot — defaults to `~/.cache/vc3d/spiral`, shared across datasets since its entries are content-addressed; `--cache DIR` (or `FIT_SPIRAL_CACHE_DIR`) moves it elsewhere.
+
 #### Fit
 
 ```bash
-python fit_spiral.py
+python fit_spiral.py --dataset ./spiral_datasets/phercparis4
 ```
 
-That's it — the script loads the inputs (caching the expensive preprocessing), then runs 30,000 optimization steps, printing the loss breakdown every 200 steps. Multi-GPU is supported via `torchrun --nproc-per-node=N fit_spiral.py`, which splits each step's work across GPUs.
+That's it — the script loads the inputs (caching the expensive preprocessing), then runs 30,000 optimization steps, printing the loss breakdown every 200 steps. Multi-GPU is supported via `torchrun --nproc-per-node=N fit_spiral.py --dataset ...`, which splits each step's work across GPUs.
+
+To run the whole pipeline in one command — fit, then render ink, then score it — use [`runners/run_single.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/runners/run_single.py) instead. It takes the same `--dataset`, plus an `--ink-volume`, and accepts the same configuration overrides as a `--config` JSON file; `runners/run_sweep.py` runs a whole folder of such configs concurrently across GPUs.
 
 When it finishes, you get a self-contained run folder:
 
 ```
 out/2026-07-08_s1_slice-10500-11500_27399-patch_<run-name>/
-├── checkpoint_fitted.ckpt        # fitted model (resumable)
-├── spiral_on_*_fitted.png        # fitted windings overlaid on inputs
-├── satisfied_fitted.json         # how much of each input the fit honors
+├── checkpoint_fitted.ckpt             # fitted model (resumable)
+├── satisfied_fitted.json              # which individual inputs the fit honors
+├── satisfaction_metrics_fitted.json   # and the summary of those, per input type
+├── spiral_on_*_fitted.png             # fitted windings overlaid on inputs
 └── meshes/mesh/
-    ├── w010/                     # one tifxyz mesh per winding...
-    ├── w010_spliced/             # ...plus the patch-spliced variant
+    ├── w010/                          # one tifxyz mesh per winding...
+    ├── w010_spliced/                  # ...plus the patch-spliced variant
     ├── w011/
     └── ...
 ```
+
+The overlay PNGs are only written when `output_save_png_visualizations` is on; it defaults to off, since rendering them means reading scan slices back at the end of the fit.
 
 #### Rendering ink
 

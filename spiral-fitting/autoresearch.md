@@ -49,7 +49,7 @@ We also track **`overall_fg_fraction`** (foreground pixels ÷ total strip pixels
 
 **The first run**: Your very first run should always establish the baseline — run the pipeline as-is, unmodified. After that, prefer simple hyperparameter changes before anything drastic.
 
-**Stochasticity**: The code is sensitive to the random seed and CUDA non-determinism. Prefer changes that are robust across seeds/runs, not ones that only help for one specific seed. Since you run two at a time, a cheap robustness check is to run the same change under two seeds concurrently and see if the ink gain survives. Seemingly-beneficial changes should be verified across seeds/runs before you commit to them.
+**Stochasticity**: The code is sensitive to the random seed and CUDA non-determinism. Prefer changes that are robust across seeds/runs, not ones that only help for one specific seed. Since you run two at a time, a cheap robustness check is to run the same change under two seeds concurrently and see if the ink gain survives. Be aware of what that buys: if the rule is "both change runs beat both baseline runs", a change with no real effect passes it with probability exactly 1/C(2k, k) — **1 in 6** for two seeds, **1 in 20** for three. That is a rank statistic, so it does not depend on the noise level, the metric, or the code version; it cannot be reduced by fitting better, only by using more seeds. Seemingly-beneficial changes should be verified across seeds/runs before you commit to them.
 
 ## The pipeline and how to run it
 
@@ -91,13 +91,15 @@ and writes the same numbers as JSON to `.../ink_metric/metrics.json`:
     "num_strips": 42,
     "total_fg_pixels": 1234567,
     "total_pixels": 9876543,
-    "overall_fg_fraction": 0.125
+    "overall_fg_fraction": 0.125,
+    "overall_line_score": 0.403,
+    "overall_column_score": 0.191
   },
   "strips": [ ... ]
 }
 ```
 
-**Read the metric from `metrics.json`** (robust to log formatting) — the primary field is `summary.total_fg_pixels`, the guard is `summary.overall_fg_fraction`. If `metrics.json` is missing, the run did not finish cleanly; check the three per-step logs (`.fit.log`, `.ink.log`, `.coverage.log`) for the failure. (Absolute numbers depend on the machine; only relative comparisons against the baseline on the same machine matter.)
+**Read the metric from `metrics.json`** (robust to log formatting) — the primary field is `summary.total_fg_pixels`, the guard is `summary.overall_fg_fraction`. The scorer also computes and persists `summary.overall_line_score` and `summary.overall_column_score`, text-layout scores over the ensemble ink probabilities; they are recorded here for completeness and are neither the objective nor a prescribed guard. If `metrics.json` is missing, the run did not finish cleanly; check the three per-step logs (`.fit.log`, `.ink.log`, `.coverage.log`) for the failure. (Absolute numbers depend on the machine; only relative comparisons against the baseline on the same machine matter.)
 
 ## Logging results
 

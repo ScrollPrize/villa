@@ -1,6 +1,9 @@
 #include "SpiralServiceManager.hpp"
 
 #include "SpiralArtifactCache.hpp"
+#include "SpiralArtifactPins.hpp"
+#include "SpiralFiberRevisionUpload.hpp"
+#include "SpiralPreviewProvenance.hpp"
 #include "SpiralSessionSync.hpp"
 #include "SpiralSshTunnel.hpp"
 #include "VCSettings.hpp"
@@ -112,6 +115,7 @@ QString stateName(SpiralServiceManager::ConnectionState state)
 
 SpiralServiceManager::SpiralServiceManager(QObject* parent) : QObject(parent)
 {
+    connect(this, &SpiralServiceManager::inputDraftsChanged, this, [this]() { _inputRowsDirty = true; });
     _network = new QNetworkAccessManager(this);
     _artifactCache = new SpiralArtifactCache(this);
     _tunnel = new SpiralSshTunnel(this);
@@ -240,9 +244,15 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _lastStatusGeneration = -1;
     _installedPreviewArtifact.clear();
     _installedPreviewSession.clear();
+    _displayedPreviewSourceIteration = -1;
     _fetchingPreviewArtifact.clear();
     _installedDiagnosticsArtifact.clear();
     _fetchingDiagnosticsArtifact.clear();
+    for (const auto role : vc3d::spiral::kEditablePclRoles) {
+        _installedPclArtifact[vc3d::spiral::pclRoleIndex(role)].clear();
+        _fetchingPclArtifact[vc3d::spiral::pclRoleIndex(role)].clear();
+        _lastPclLocalPath[vc3d::spiral::pclRoleIndex(role)].clear();
+    }
     _lastPreviewLocalPath.clear();
     _lastDiagnosticsLocalPath.clear();
     _synchronizedSessionId.clear();
@@ -459,6 +469,7 @@ void SpiralServiceManager::handleHealth(const QJsonObject& health)
             ? tr("session %1").arg(sessionName)
             : tr(" / session %1").arg(sessionName);
     setConnectionState(ConnectionState::Ready, identity);
+    claimInputWorkspace();
     _statusFailures = 0;
     _poll->setInterval(kPollMs);
     _poll->start();
@@ -489,13 +500,18 @@ void SpiralServiceManager::fetchAdvertisedDataset()
 
 void SpiralServiceManager::disconnectFromService()
 {
+    cancelWorkingCopies();
     ++_connectionGeneration;
+    _inputOwner = false;
+    _inputCommandBusy = false;
+    if (_inputCommand) _inputSubmission.transportInterrupted();
     _poll->stop();
     _eventPoll->stop();
     _statusInFlight = false;
     _eventsInFlight = false;
     _artifactCache->clearEndpoint();
     _synchronizedSessionId.clear();
+    _displayedPreviewSourceIteration = -1;
     _tunnel->stop();
     // Disconnecting from an independently started service never shuts the
     // service down; only a process this manager launched is terminated.
@@ -510,6 +526,17 @@ void SpiralServiceManager::disconnectFromService()
 void SpiralServiceManager::reconnect()
 {
     if (_profile.id.isEmpty()) return;
+    if (ownsProcess()) {
+        cancelWorkingCopies();
+        ++_connectionGeneration;
+        _inputOwner = false;
+        _inputCommandBusy = false;
+        _statusInFlight = false;
+        _eventsInFlight = false;
+        _synchronizedSessionId.clear();
+        beginHandshake();
+        return;
+    }
     connectToService(_profile);
 }
 
@@ -555,6 +582,7 @@ QNetworkRequest SpiralServiceManager::makeRequest(const QString& path, int timeo
     if (!_credential.isEmpty())
         request.setRawHeader("Authorization", QStringLiteral("Bearer %1").arg(_credential).toUtf8());
     request.setRawHeader("X-Spiral-Client", _clientId.toUtf8());
+    request.setRawHeader("X-Spiral-Workspace-Token", _clientId.toUtf8());
     request.setTransferTimeout(timeoutMs);
     return request;
 }
@@ -763,7 +791,9 @@ void SpiralServiceManager::uploadCheckpointForResume(
 
 void SpiralServiceManager::runIterations(int iterations,
                                          const QJsonObject& influenceConfig,
-                                         const QJsonObject& runConfig)
+                                         const QJsonObject& runConfig,
+                                         const QJsonObject& dtLossSchedule,
+                                         const QJsonObject& previewSchedule)
 {
     const QJsonObject configuration =
         vc3d::completeSpiralRunConfiguration(
@@ -772,13 +802,13 @@ void SpiralServiceManager::runIterations(int iterations,
     // neither their paths nor their contents, so restating the panel's
     // necessarily partial path view here can only create a false mismatch
     // (for example, winding_inference has no editable panel row).
+    QJsonObject body = vc3d::spiralRunRequest(
+        configuration, iterations, influenceConfig, dtLossSchedule,
+        _sessionRevision, previewSchedule);
+    body[QStringLiteral("command_id")] = commandId();
     postWithRetry(
         QStringLiteral("/session/run"),
-        {{QStringLiteral("command_id"), commandId()},
-         {QStringLiteral("configuration"), configuration},
-         {QStringLiteral("iterations"), iterations},
-         {QStringLiteral("influence"), influenceConfig},
-         {QStringLiteral("expected_session_revision"), _sessionRevision}},
+        body,
         Timeout::Command, kMutationRetries, {});
 }
 
@@ -956,155 +986,6 @@ void SpiralServiceManager::downloadCheckpoint(const QString& localPath)
         });
 }
 
-void SpiralServiceManager::commitInputs()
-{
-    postWithRetry(QStringLiteral("/session/commit-inputs"),
-                  {{QStringLiteral("command_id"), commandId()}},
-                  Timeout::LongCommand, kMutationRetries,
-                  [this](const QJsonObject& response) {
-                      fetchAdvertisedDataset();
-                      handleStatus(response);
-                      QStringList committed;
-                      for (const QJsonValue& value : response.value(QStringLiteral("committed")).toArray())
-                          committed.push_back(value.toString());
-                      emit commitInputsFinished(committed, {});
-                  },
-                  [this](const QString& error) {
-                      emit commitInputsFinished({}, error);
-                      emit errorOccurred(error);
-                  });
-}
-
-void SpiralServiceManager::removeEphemeralInput(const QString& kind, const QString& inputId)
-{
-    if (!isReady()) return;
-    // The target is named in the path, so this is a bodyless DELETE and goes
-    // through the same helpers as every other verb.
-    del(QStringLiteral("/session/ephemeral-inputs/%1/%2").arg(kind, inputId),
-        Timeout::Command);
-}
-
-void SpiralServiceManager::uploadPatch(const QString& directory, const QString& inputId)
-{
-    if (!isReady()) { emit inputUploadFinished(inputId, tr("Spiral service is not connected")); return; }
-    const quint64 generation = _connectionGeneration;
-    auto* watcher = new QFutureWatcher<QJsonObject>(this);
-    connect(watcher, &QFutureWatcher<QJsonObject>::finished, this,
-            [this, watcher, directory, inputId, generation]() {
-                const QJsonObject begin = watcher->result();
-                watcher->deleteLater();
-                if (generation != _connectionGeneration) return;
-                if (begin.contains(QStringLiteral("error"))) {
-                    emit inputUploadFinished(inputId, begin.value(QStringLiteral("error")).toString());
-                    return;
-                }
-                QStringList names;
-                for (const QJsonValue& value : begin.value(QStringLiteral("files")).toArray())
-                    names.push_back(value.toObject().value(QStringLiteral("name")).toString());
-                post(QStringLiteral("/session/inputs"), begin, Timeout::Command,
-                     [this, directory, inputId, names](const QJsonObject& response) {
-                         continueUpload(response.value(QStringLiteral("upload_id")).toString(),
-                                        inputId, directory, names);
-                     },
-                     [this, inputId](const QString& error) {
-                         emit inputUploadFinished(inputId, error);
-                     });
-            });
-    watcher->setFuture(QtConcurrent::run([directory, inputId]() -> QJsonObject {
-        QJsonArray files;
-        QDirIterator it(directory, QDir::Files, QDirIterator::Subdirectories);
-        const QDir base(directory);
-        while (it.hasNext()) {
-            const QString path = it.next();
-            QFile file(path);
-            if (!file.open(QIODevice::ReadOnly))
-                return {{QStringLiteral("error"), tr("Cannot read %1").arg(path)}};
-            QCryptographicHash hash(QCryptographicHash::Sha256);
-            hash.addData(&file);
-            files.append(QJsonObject{
-                {QStringLiteral("name"), base.relativeFilePath(path)},
-                {QStringLiteral("size"), file.size()},
-                {QStringLiteral("sha256"), QString::fromLatin1(hash.result().toHex())},
-            });
-        }
-        if (files.isEmpty())
-            return {{QStringLiteral("error"), tr("The patch directory %1 is empty").arg(directory)}};
-        return {{QStringLiteral("kind"), QStringLiteral("patch")},
-                {QStringLiteral("id"), inputId},
-                {QStringLiteral("files"), files}};
-    }));
-}
-
-void SpiralServiceManager::uploadJsonInput(const QString& kind, const QString& filePath,
-                                           const QString& inputId, const QString& role)
-{
-    if (!isReady()) { emit inputUploadFinished(inputId, tr("Spiral service is not connected")); return; }
-    QFile file(filePath);
-    if (!file.open(QIODevice::ReadOnly)) {
-        emit inputUploadFinished(inputId, tr("Cannot read %1").arg(filePath));
-        return;
-    }
-    QCryptographicHash hash(QCryptographicHash::Sha256);
-    hash.addData(&file);
-    const QString name = QFileInfo(filePath).fileName();
-    QJsonObject begin{
-        {QStringLiteral("kind"), kind},
-        {QStringLiteral("id"), inputId},
-        {QStringLiteral("files"), QJsonArray{QJsonObject{
-            {QStringLiteral("name"), name},
-            {QStringLiteral("size"), file.size()},
-            {QStringLiteral("sha256"), QString::fromLatin1(hash.result().toHex())},
-        }}},
-    };
-    if (!role.isEmpty()) begin[QStringLiteral("role")] = role;
-    const QString baseDir = QFileInfo(filePath).absolutePath();
-    post(QStringLiteral("/session/inputs"), begin, Timeout::Command,
-         [this, baseDir, inputId, name](const QJsonObject& response) {
-             continueUpload(response.value(QStringLiteral("upload_id")).toString(),
-                            inputId, baseDir, {name});
-         },
-         [this, inputId](const QString& error) { emit inputUploadFinished(inputId, error); });
-}
-
-void SpiralServiceManager::continueUpload(const QString& uploadId, const QString& inputId,
-                                          const QString& baseDir, QStringList pendingFiles)
-{
-    if (uploadId.isEmpty()) {
-        emit inputUploadFinished(inputId, tr("The service did not return an upload id"));
-        return;
-    }
-    if (pendingFiles.isEmpty()) {
-        post(QStringLiteral("/session/inputs/%1/finalize").arg(uploadId), {}, Timeout::Command,
-             [this, inputId](const QJsonObject&) { emit inputUploadFinished(inputId, {}); },
-             [this, inputId](const QString& error) { emit inputUploadFinished(inputId, error); });
-        return;
-    }
-    const QString name = pendingFiles.takeFirst();
-    auto file = std::make_unique<QFile>(QDir(baseDir).filePath(name));
-    if (!file->open(QIODevice::ReadOnly)) {
-        emit inputUploadFinished(inputId, tr("Cannot read %1").arg(file->fileName()));
-        return;
-    }
-    QNetworkRequest request = makeRequest(
-        QStringLiteral("/session/inputs/%1/files/%2").arg(uploadId, name),
-        static_cast<int>(Timeout::LongCommand));
-    request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/octet-stream"));
-    QFile* fileRaw = file.release();
-    auto* reply = _network->put(request, fileRaw);
-    fileRaw->setParent(reply);
-    const quint64 generation = _connectionGeneration;
-    connect(reply, &QNetworkReply::finished, this,
-            [this, reply, generation, uploadId, inputId, baseDir, pendingFiles]() {
-                handleReply(reply, generation,
-                            [this, uploadId, inputId, baseDir, pendingFiles](const QJsonObject&) {
-                                continueUpload(uploadId, inputId, baseDir, pendingFiles);
-                            },
-                            [this, inputId](const QString& error) {
-                                emit inputUploadFinished(inputId, error);
-                            });
-            });
-}
-
 void SpiralServiceManager::post(const QString& path, QJsonObject body, Timeout timeout,
                                 std::function<void(const QJsonObject&)> success,
                                 std::function<void(const QString&)> failure)
@@ -1152,8 +1033,9 @@ void SpiralServiceManager::postWithRetry(const QString& path, QJsonObject body, 
                     reply->deleteLater();
                     emit logMessage(tr("Retrying %1 with the same command id (%2 retries left)")
                                         .arg(path).arg(retriesLeft));
-                    QTimer::singleShot(1000, this, [this, path, body, timeout, retriesLeft,
+                    QTimer::singleShot(1000, this, [this, generation, path, body, timeout, retriesLeft,
                                                     success, failure, detailedFailure]() {
+                        if (generation != _connectionGeneration) return;
                         postWithRetry(path, body, timeout, retriesLeft - 1, success,
                                       failure, detailedFailure);
                     });
@@ -1336,12 +1218,15 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
     if (!active) {
         _synchronizedSessionId.clear();
         _installedPreviewSession.clear();
+        _displayedPreviewSourceIteration = -1;
     } else if (sessionId != _synchronizedSessionId) {
+        _displayedPreviewSourceIteration = -1;
         const QJsonObject request =
             status.value(QStringLiteral("session_request")).toObject();
         if (!request.isEmpty()) {
             _synchronizedSessionId = sessionId;
             emit sessionSynchronized(request, status);
+            if (_inputOwner) refreshInputCatalog();
         }
     }
     // Pausing no longer exports a preview by itself. Ask for one exactly
@@ -1352,7 +1237,10 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
         _sawRunningSinceIdle = true;
     } else if (state == QStringLiteral("Idle") && _sawRunningSinceIdle) {
         _sawRunningSinceIdle = false;
-        requestPreview();
+        // A service-owned schedule captures the final Run boundary itself.
+        // Do not enqueue the legacy client-triggered duplicate.
+        if (status.value(QStringLiteral("preview_schedule")).toObject().isEmpty())
+            requestPreview();
     }
     emit sessionStatusChanged(status);
     syncArtifacts(status);
@@ -1387,14 +1275,23 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _installedPreviewArtifact = previewId;
                 _installedPreviewSession = sessionId;
                 _lastPreviewLocalPath = entryPath;
+                QFile manifestFile(entryPath);
+                if (manifestFile.open(QIODevice::ReadOnly)) {
+                    const QJsonObject manifest =
+                        QJsonDocument::fromJson(manifestFile.readAll()).object();
+                    const auto provenance =
+                        vc3d::spiralPreviewProvenance(manifest);
+                    _displayedPreviewSourceIteration = provenance.sourceIteration;
+                } else {
+                    _displayedPreviewSourceIteration = -1;
+                }
                 // A newly installed surface has no overlays until its own
                 // diagnostics artifact arrives; the previous generation's
                 // must not be drawn over it.
                 _installedDiagnosticsArtifact.clear();
                 emit previewAvailable(entryPath, sequence);
                 _artifactCache->pruneSession(
-                    sessionId, kPreviewCacheKept,
-                    {_lastPreviewLocalPath, _lastDiagnosticsLocalPath});
+                    sessionId, kPreviewCacheKept, pclArtifactCachePins());
             });
     }
 
@@ -1427,10 +1324,55 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _lastDiagnosticsLocalPath = entryPath;
                 emit previewDiagnosticsAvailable(entryPath, sequence);
                 _artifactCache->pruneSession(
-                    sessionId, kPreviewCacheKept,
-                    {_lastPreviewLocalPath, _lastDiagnosticsLocalPath});
+                    sessionId, kPreviewCacheKept, pclArtifactCachePins());
             });
     }
+
+    // Each editable PCL role publishes its own display-only snapshot.
+    for (const auto role : vc3d::spiral::kEditablePclRoles) {
+        const std::size_t slot = vc3d::spiral::pclRoleIndex(role);
+        const QJsonObject artifactRef =
+            status.value(vc3d::spiral::pclRoleStatusKey(role)).toObject();
+        const QString artifactId = artifactRef.value(QStringLiteral("id")).toString();
+        if (artifactId.isEmpty() || artifactId == _installedPclArtifact[slot]
+            || artifactId == _fetchingPclArtifact[slot])
+            continue;
+        _fetchingPclArtifact[slot] = artifactId;
+        const quint64 sequence = ++_pclSequence[slot];
+        const quint64 generation = _connectionGeneration;
+        _artifactCache->fetchArtifact(
+            sessionId, artifactId,
+            [this, sessionId, role, slot, artifactId, artifactRef, generation, sequence](
+                const QString& entryPath, const QString& error, bool gone) {
+                if (generation != _connectionGeneration) return;
+                // A later snapshot of this role supersedes this download,
+                // including its errors and source revision.
+                if (sequence != _pclSequence[slot]) return;
+                if (_fetchingPclArtifact[slot] == artifactId)
+                    _fetchingPclArtifact[slot].clear();
+                if (entryPath.isEmpty()) {
+                    if (!gone) emit errorOccurred(error);
+                    return;
+                }
+                _installedPclArtifact[slot] = artifactId;
+                _lastPclLocalPath[slot] = entryPath;
+                emit pclArtifactAvailable(role, entryPath, artifactRef);
+                // PCL-only edits republish this artifact without a new
+                // preview, and only the preview callbacks pruned the cache,
+                // so repeated commits left every superseded snapshot on disk
+                // until the next preview arrived. The active preview,
+                // diagnostics and PCL snapshots are pinned.
+                _artifactCache->pruneSession(
+                    sessionId, kPreviewCacheKept, pclArtifactCachePins());
+            });
+    }
+}
+
+QStringList SpiralServiceManager::pclArtifactCachePins() const
+{
+    return vc3d::spiralArtifactCachePins(
+        _lastPreviewLocalPath, _lastDiagnosticsLocalPath,
+        QStringList(_lastPclLocalPath.begin(), _lastPclLocalPath.end()));
 }
 
 void SpiralServiceManager::fetchPreviewFile(const QString& relativeName,

@@ -157,8 +157,14 @@ void from_json(const Json& j, PointCollections::Collection& c) {
         }
     }
 
-    from_json(j.at("metadata"), c.metadata);
-    c.color = vec3f_from_json(j.at("color"));
+    if (j.contains("metadata") && j.at("metadata").is_object())
+        from_json(j.at("metadata"), c.metadata);
+    else
+        c.metadata = {};
+    if (j.contains("color") && j.at("color").is_array())
+        c.color = vec3f_from_json(j.at("color"));
+    else
+        c.color = cv::Vec3f{0.2f, 0.8f, 1.0f};
 
     if (j.contains("anchor2d") && !j.at("anchor2d").is_null()) {
         c.anchor2d = vec2f_from_json(j.at("anchor2d"));
@@ -213,8 +219,6 @@ ColPoint PointCollections::addPoint(const std::string& collectionName, const cv:
         std::chrono::system_clock::now().time_since_epoch()).count());
 
     _collections[collection_id].points[new_point.id] = new_point;
-    _points[new_point.id] = new_point;
-
     onPointAdded(new_point);
     return new_point;
 }
@@ -235,7 +239,6 @@ void PointCollections::addPoints(const std::string& collectionName, const std::v
         new_point.p = p;
         new_point.creation_time = creation_time;
         collection_points[new_point.id] = new_point;
-        _points[new_point.id] = new_point;
         added_points.push_back(new_point);
         onPointAdded(new_point);
     }
@@ -246,24 +249,18 @@ void PointCollections::addPoints(const std::string& collectionName, const std::v
 
 void PointCollections::updatePoint(const ColPoint& point)
 {
-    if (_points.count(point.id)) {
-        _points[point.id] = point;
-        if (_collections.count(point.collectionId)) {
-            _collections.at(point.collectionId).points[point.id] = point;
-        }
+    const auto collection = _collections.find(point.collectionId);
+    if (collection != _collections.end() && collection->second.points.contains(point.id)) {
+        collection->second.points[point.id] = point;
         onPointChanged(point);
     }
 }
 
-void PointCollections::removePoint(uint64_t pointId)
+void PointCollections::removePoint(vc::PointRef point)
 {
-    if (_points.count(pointId)) {
-        uint64_t collection_id = _points.at(pointId).collectionId;
-        _points.erase(pointId);
-        if (_collections.count(collection_id)) {
-            _collections.at(collection_id).points.erase(pointId);
-        }
-        onPointRemoved(pointId);
+    const auto collection = _collections.find(point.collectionId);
+    if (collection != _collections.end() && collection->second.points.erase(point.pointId) != 0) {
+        onPointRemoved(point);
     }
 }
 
@@ -271,14 +268,13 @@ void PointCollections::clearCollection(uint64_t collectionId)
 {
     if (_collections.count(collectionId)) {
         auto& collection = _collections.at(collectionId);
-        std::vector<uint64_t> removed_point_ids;
-        removed_point_ids.reserve(collection.points.size());
+        std::vector<vc::PointRef> removed_points;
+        removed_points.reserve(collection.points.size());
         for (const auto& pair : collection.points) {
-            _points.erase(pair.first);
-            removed_point_ids.push_back(pair.first);
+            removed_points.push_back({collectionId, pair.first});
         }
-        if (!removed_point_ids.empty()) {
-            onPointsRemoved(removed_point_ids);
+        if (!removed_points.empty()) {
+            onPointsRemoved(removed_points);
         }
         _collections.erase(collectionId);
         onCollectionRemoved(collectionId);
@@ -287,16 +283,17 @@ void PointCollections::clearCollection(uint64_t collectionId)
 
 void PointCollections::clearAll()
 {
-    std::vector<uint64_t> removed_point_ids;
-    removed_point_ids.reserve(_points.size());
-    for (auto& point_pair : _points) {
-        removed_point_ids.push_back(point_pair.first);
+    std::vector<vc::PointRef> removed_points;
+    for (const auto& [collectionId, collection] : _collections) {
+        for (const auto& [pointId, point] : collection.points) {
+            (void)point;
+            removed_points.push_back({collectionId, pointId});
+        }
     }
-    if (!removed_point_ids.empty()) {
-        onPointsRemoved(removed_point_ids);
+    if (!removed_points.empty()) {
+        onPointsRemoved(removed_points);
     }
     _collections.clear();
-    _points.clear();
     onCollectionRemoved(-1); // Sentinel for "all removed"
 }
 
@@ -308,10 +305,9 @@ void PointCollections::renameCollection(uint64_t collectionId, const std::string
     }
 }
 
-uint64_t PointCollections::getCollectionId(const std::string& name) const
+std::optional<uint64_t> PointCollections::getCollectionId(const std::string& name) const
 {
-    auto it = findCollectionByName(name);
-    return it.has_value() ? it.value() : 0;
+    return findCollectionByName(name);
 }
 
 const std::unordered_map<uint64_t, PointCollections::Collection>& PointCollections::getAllCollections() const
@@ -385,12 +381,27 @@ void PointCollections::setCollectionWindingsLinked(uint64_t collectionId, const 
     }
 }
 
-std::optional<ColPoint> PointCollections::getPoint(uint64_t pointId) const
+std::optional<ColPoint> PointCollections::getPoint(vc::PointRef point) const
 {
-    if (_points.count(pointId)) {
-        return _points.at(pointId);
+    const auto collection = _collections.find(point.collectionId);
+    if (collection == _collections.end()) {
+        return std::nullopt;
     }
+    const auto found = collection->second.points.find(point.pointId);
+    if (found != collection->second.points.end()) return found->second;
     return std::nullopt;
+}
+
+std::vector<vc::PointRef> PointCollections::findPointRefs(uint64_t pointId) const
+{
+    std::vector<vc::PointRef> refs;
+    for (const auto& [collectionId, collection] : _collections) {
+        if (collection.points.contains(pointId)) refs.push_back({collectionId, pointId});
+    }
+    std::sort(refs.begin(), refs.end(), [](const vc::PointRef& lhs, const vc::PointRef& rhs) {
+        return lhs.collectionId < rhs.collectionId;
+    });
+    return refs;
 }
 
 std::vector<ColPoint> PointCollections::getPoints(const std::string& collectionName) const
@@ -462,7 +473,6 @@ void PointCollections::autoFillWindingNumbers(uint64_t collectionId, WindingFill
                     point->winding_annotation = constantValue;
                     break;
             }
-            _points[point->id] = *point; // keep flat map in sync (value set above)
         }
 
         onCollectionChanged(collectionId); // single signal for the whole batch
@@ -474,9 +484,6 @@ void PointCollections::resetWindingNumbers()
     for (auto& [cid, collection] : _collections) {
         for (auto& [pid, point] : collection.points) {
             point.winding_annotation = std::nan("");
-            if (_points.count(pid)) {
-                _points[pid].winding_annotation = std::nan("");
-            }
         }
         collection.metadata.absolute_winding_number = false;
         collection.autoFillMode = WindingFillMode::None;
@@ -641,14 +648,6 @@ bool PointCollections::loadFromJSON(const std::string& filename)
         }
     }
 
-    // Rebuild the _points map
-    _points.clear();
-    for (const auto& col_pair : _collections) {
-        for (const auto& point_pair : col_pair.second.points) {
-            _points[point_pair.first] = point_pair.second;
-        }
-    }
-
     std::vector<uint64_t> collectionIds;
     for (const auto& [col_id, _] : _collections) {
         collectionIds.push_back(col_id);
@@ -803,7 +802,6 @@ bool PointCollections::loadFromSegmentPath(const std::filesystem::path& segmentP
             _collections[col.id] = col;
             for (auto& point_pair : _collections.at(col.id).points) {
                 point_pair.second.collectionId = col.id;
-                _points[point_pair.first] = point_pair.second;
             }
 
             // Update next IDs

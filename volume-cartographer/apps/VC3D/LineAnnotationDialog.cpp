@@ -483,7 +483,11 @@ public:
     struct ControlDot {
         double linePosition = 0.0;
         QColor color;
+        // Edge colour; unset draws the fill's darker shade (the default look).
+        std::optional<QColor> edge;
         qreal radius = 4.5;
+        // Adjacent-winding link (or adjacent candidate): drawn as a triangle.
+        bool triangle = false;
     };
 
     using QWidget::QWidget;
@@ -540,9 +544,15 @@ protected:
                 continue;
             }
             const qreal x = xForLinePosition(dot.linePosition);
-            painter.setPen(QPen(dot.color.darker(150), 1.0));
+            painter.setPen(dot.edge ? QPen(*dot.edge, 1.5)
+                                    : QPen(dot.color.darker(150), 1.0));
             painter.setBrush(dot.color);
-            painter.drawEllipse(QPointF(x, midY), dot.radius, dot.radius);
+            if (dot.triangle) {
+                painter.drawPath(vc3d::line_annotation::generatedTriangleMarkerPath(
+                    QPointF(x, midY), dot.radius));
+            } else {
+                painter.drawEllipse(QPointF(x, midY), dot.radius, dot.radius);
+            }
         }
     }
 
@@ -2475,6 +2485,12 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
                                                          controlPointIndex,
                                                          volumePoint);
     };
+    options.designateAdjacentLinkCandidate = [this, surfaceName](size_t controlPointIndex,
+                                                                 cv::Vec3f volumePoint) {
+        emit generatedControlPointAdjacentLinkCandidateRequested(surfaceName,
+                                                                 controlPointIndex,
+                                                                 volumePoint);
+    };
     options.linkWithCandidate = [this, surfaceName](size_t controlPointIndex,
                                                     cv::Vec3f volumePoint) {
         emit generatedControlPointLinkWithCandidateRequested(surfaceName,
@@ -2534,6 +2550,12 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
                                                         firstControlPointIndex,
                                                         secondControlPointIndex,
                                                         goal);
+    };
+    options.setKollesisTermination = [this, surfaceName](size_t controlPointIndex,
+                                                         bool enabled) {
+        emit generatedControlPointKollesisTerminationChangeRequested(surfaceName,
+                                                                     controlPointIndex,
+                                                                     enabled);
     };
     return vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
 }
@@ -3543,6 +3565,13 @@ cv::Vec3f LineAnnotationDialog::branchLinkDirectionForViewer(CChunkedVolumeViewe
 
 bool LineAnnotationDialog::controlPointPlacementAllowedAt(double linePosition) const
 {
+    // A kollesis termination declares the fiber's end: nothing goes beyond it
+    // until the tag is removed. Checked before the extrapolation-distance gate
+    // so it applies whatever that limit is set to.
+    if (vc3d::line_annotation::generatedLinePositionBeyondKollesisTermination(
+            _generatedViews.controlPoints, linePosition)) {
+        return false;
+    }
     std::vector<double> controlLinePositions;
     controlLinePositions.reserve(_generatedViews.controlPoints.size());
     for (const auto& control : _generatedViews.controlPoints) {
@@ -3558,6 +3587,10 @@ bool LineAnnotationDialog::controlPointPlacementAllowedAt(double linePosition) c
 vc3d::line_annotation::GeneratedCurrentLineMarkerState
 LineAnnotationDialog::currentLineMarkerState() const
 {
+    if (vc3d::line_annotation::generatedLinePositionBeyondKollesisTermination(
+            _generatedViews.controlPoints, _currentLinePosition)) {
+        return vc3d::line_annotation::GeneratedCurrentLineMarkerState::Blocked;
+    }
     if (maxControlPointExtrapolationDistanceVx() <= 0) {
         return vc3d::line_annotation::GeneratedCurrentLineMarkerState::Neutral;
     }
@@ -4268,6 +4301,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         !_fastCurrentCutOverlayItems.pendingBranchControlPoints ||
         !_fastCurrentCutOverlayItems.sameHvBranchControlPoints ||
         !_fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints ||
+        !_fastCurrentCutOverlayItems.kollesisRings ||
         !_fastCurrentCutOverlayItems.fiberIntersections ||
         !_fastCurrentCutOverlayItems.linkCandidateFiberIntersections ||
         std::any_of(_fastCurrentCutOverlayItems.branchLinkFiberIntersections.begin(),
@@ -4356,6 +4390,15 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             sameHvPendingBranchControlBrush);
         _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setZValue(162.5);
 
+        // Same look as controlStyleForMarker's kollesis branch in the shared
+        // renderer: ring only, above every link-state fill.
+        QPen kollesisRingPen(vc3d::line_annotation::generatedKollesisTerminationColor(245));
+        kollesisRingPen.setWidthF(2.5);
+        _fastCurrentCutOverlayItems.kollesisRings = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.kollesisRings->setPen(kollesisRingPen);
+        _fastCurrentCutOverlayItems.kollesisRings->setBrush(Qt::NoBrush);
+        _fastCurrentCutOverlayItems.kollesisRings->setZValue(162.75);
+
         QPen fiberIntersectionPen(QColor(255, 245, 75, 245));
         fiberIntersectionPen.setWidthF(1.25);
         fiberIntersectionPen.setCapStyle(Qt::FlatCap);
@@ -4424,6 +4467,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             _fastCurrentCutOverlayItems.pendingBranchControlPoints,
             _fastCurrentCutOverlayItems.sameHvBranchControlPoints,
             _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints,
+            _fastCurrentCutOverlayItems.kollesisRings,
             _fastCurrentCutOverlayItems.fiberIntersections,
             _fastCurrentCutOverlayItems.linkCandidateFiberIntersections};
         for (auto* item : _fastCurrentCutOverlayItems.branchLinkFiberIntersections) {
@@ -4468,6 +4512,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     QPainterPath pendingBranchControlPath;
     QPainterPath sameHvBranchControlPath;
     QPainterPath sameHvPendingBranchControlPath;
+    QPainterPath kollesisRingPath;
     const double lineRadius =
         std::max(0.5, (_viewerManager ? _viewerManager->zScrollSensitivity() : 1.0) * 0.5);
     const double lower = cutPosition - lineRadius;
@@ -4502,19 +4547,48 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
             continue;
         }
+        // Radii and precedence mirror the shared renderer
+        // (controlStyleForMarker / addVolumePointMarker): candidates first,
+        // then link state, and a kollesis tag as a ring two units wider that
+        // replaces the plain fill when the point is unlinked.
+        const bool linked = control.hasPendingLinks || control.hasBranches;
+        const double baseRadius = linked ? 12.0 : (control.isSeed ? 11.0 : 10.0);
         if (control.isSplitCandidate) {
             splitCandidatePath.addEllipse(scenePoint, control.isSeed ? 11.0 : 10.0,
                                           control.isSeed ? 11.0 : 10.0);
-        } else if (control.isLinkCandidate) {
-            linkCandidatePath.addEllipse(scenePoint, control.isSeed ? 11.0 : 10.0,
-                                         control.isSeed ? 11.0 : 10.0);
-        } else if (control.hasPendingLinks) {
-            (control.hasSameHvPendingLinks ? sameHvPendingBranchControlPath
-                                           : pendingBranchControlPath)
-                .addEllipse(scenePoint, 12.0, 12.0);
+            continue;
+        }
+        if (control.isLinkCandidate) {
+            const double candidateRadius = control.isSeed ? 11.0 : 10.0;
+            if (control.isAdjacentLinkCandidate) {
+                linkCandidatePath.addPath(vc3d::line_annotation::generatedTriangleMarkerPath(
+                    scenePoint, candidateRadius));
+            } else {
+                linkCandidatePath.addEllipse(scenePoint, candidateRadius, candidateRadius);
+            }
+            continue;
+        }
+        if (control.isKollesisTermination) {
+            kollesisRingPath.addEllipse(scenePoint, baseRadius + 2.0, baseRadius + 2.0);
+            if (!linked) {
+                continue;
+            }
+        }
+        // An adjacent-winding link is a triangle in the same state colour.
+        const auto addLinkedMarker = [&control, &scenePoint](QPainterPath& path) {
+            if (control.hasAdjacentLinks) {
+                path.addPath(
+                    vc3d::line_annotation::generatedTriangleMarkerPath(scenePoint, 12.0));
+            } else {
+                path.addEllipse(scenePoint, 12.0, 12.0);
+            }
+        };
+        if (control.hasPendingLinks) {
+            addLinkedMarker(control.hasSameHvPendingLinks ? sameHvPendingBranchControlPath
+                                                          : pendingBranchControlPath);
         } else if (control.hasBranches) {
-            (control.hasSameHvBranches ? sameHvBranchControlPath : branchControlPath)
-                .addEllipse(scenePoint, 12.0, 12.0);
+            addLinkedMarker(control.hasSameHvBranches ? sameHvBranchControlPath
+                                                      : branchControlPath);
         } else if (control.isSeed) {
             seedPath.addEllipse(scenePoint, 11.0, 11.0);
         } else {
@@ -4530,6 +4604,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     _fastCurrentCutOverlayItems.sameHvBranchControlPoints->setPath(sameHvBranchControlPath);
     _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setPath(
         sameHvPendingBranchControlPath);
+    _fastCurrentCutOverlayItems.kollesisRings->setPath(kollesisRingPath);
 
     // Parallax ghosts: the nearest control point behind and ahead of the cursor
     // within the visibility distance slide in horizontally from the side they
@@ -5152,6 +5227,19 @@ void LineAnnotationDialog::updateOverviewBar()
             dot.color = QColor(255, 230, 0);
         }
         dot.radius = control.isSeed ? 6.0 : 4.5;
+        dot.triangle = !control.isSplitCandidate &&
+                       (control.isAdjacentLinkCandidate ||
+                        (control.hasAdjacentLinks && !control.isLinkCandidate));
+        if (control.isKollesisTermination && !control.isSplitCandidate &&
+            !control.isLinkCandidate) {
+            // As in the cut views: a hollow yellow ring when unlinked, the
+            // link fill inside a yellow ring when linked.
+            if (!control.hasPendingLinks && !control.hasBranches) {
+                dot.color = Qt::transparent;
+            }
+            dot.edge = vc3d::line_annotation::generatedKollesisTerminationColor(255);
+            dot.radius += 1.0;
+        }
         dots.push_back(dot);
     }
     bar->setLineData(_generatedViews.linePoints.size(), std::move(dots));

@@ -356,6 +356,9 @@ public:
     // Drop derived caches (validity mask, etc.) without unloading _points.
     // Called when this surface is no longer the active editing target so
     // RAM is reserved for the segment the user is currently working on.
+    // In-flight gen()/validMask() calls retain their derived-cache snapshots.
+    // Concurrent channel access, point unloading and geometry edits still
+    // require external synchronization.
     void unloadCaches();
 
     // True iff this surface was loaded from disk and can be safely unloaded.
@@ -420,11 +423,9 @@ public:
     // because gen() can be called from concurrent OMP threads.
     mutable std::atomic<bool> _validMaskAllValid{false};
     mutable cv::Mat_<cv::Vec3f> _normalCache;
-    // Guards the lazy one-time build of the shared derived caches
-    // (_normalCache, _validMaskCache) so concurrent gen()/validMask() calls
-    // from the batch renderer's OMP tile loop don't race on construction.
-    // The caches are read-only once built (until unloadCaches() on surface
-    // switch), so reads after the build run lock-free.
+    // Guards derived-cache construction, invalidation and snapshot acquisition.
+    // Readers retain immutable, reference-counted Mat snapshots after unlocking,
+    // so unloadCaches() can evict the cache without freeing in-flight data.
     mutable std::mutex _cacheMutex;
     // NOTE: gen()'s per-call coords/normals/valid scratch buffers used to live
     // here as members and were reused across render ticks to avoid per-frame
@@ -510,6 +511,8 @@ protected:
     float dpi_ = 0.f;
 
 private:
+    cv::Mat_<uint8_t> validMaskSnapshot(bool* allValid) const;
+
     // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.
     void writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel = "");
     // Write a single ancillary channel as dir/<name>.tif.

@@ -1,6 +1,8 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
+#include "vc_seg_add_overlap_metrics.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -8,6 +10,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -32,6 +35,7 @@ constexpr float kOverlapTolerance = 2.0f;
 struct TargetInfo {
     std::string key;
     std::string id;
+    std::string relativePath;
     fs::path path;
 };
 
@@ -39,7 +43,10 @@ struct SourceScanResult {
     fs::path sourcePath;
     std::string sourceKey;
     std::string sourceId;
+    std::string sourceRelativePath;
     std::vector<std::pair<std::string, std::string>> hits;
+    std::map<std::string, size_t> matchedPointsByTarget;
+    size_t validPoints = 0;
     size_t queriedPoints = 0;
 };
 
@@ -48,6 +55,7 @@ struct Config {
     fs::path sourceRoot;
     size_t requestedWorkers = 0;
     size_t pointStride = 1;
+    fs::path reportPath;
     bool help = false;
 };
 
@@ -62,6 +70,60 @@ std::string canonical_key(const fs::path& path)
         p = path;
     }
     return p.lexically_normal().generic_string();
+}
+
+std::string relative_report_path(const fs::path& path, const fs::path& root)
+{
+    std::error_code ec;
+    fs::path relative = fs::relative(path, root, ec);
+    if (ec) {
+        return path.filename().generic_string();
+    }
+    const std::string value = relative.lexically_normal().generic_string();
+    return value.empty() ? "." : value;
+}
+
+void validate_report_path(const fs::path& reportPath,
+                          const std::vector<fs::path>& targetDirs,
+                          const std::vector<fs::path>& sourceDirs)
+{
+    if (reportPath.empty()) {
+        return;
+    }
+
+    fs::path parent = reportPath.parent_path();
+    if (parent.empty()) {
+        parent = fs::current_path();
+    }
+    std::error_code ec;
+    if (!fs::is_directory(parent, ec) || ec) {
+        throw std::runtime_error(
+            "Report parent is not a directory: " + parent.string());
+    }
+
+    const std::string reportKey = canonical_key(reportPath);
+    auto rejectAlias = [&](const fs::path& dir) {
+        for (const char* name : {
+                 "meta.json", "x.tif", "y.tif", "z.tif", "overlapping.json"}) {
+            const fs::path dataPath = dir / name;
+            std::error_code equivalentEc;
+            const bool equivalent = fs::exists(reportPath, equivalentEc) &&
+                !equivalentEc &&
+                fs::equivalent(reportPath, dataPath, equivalentEc) &&
+                !equivalentEc;
+            if (canonical_key(dataPath) == reportKey || equivalent) {
+                throw std::runtime_error(
+                    "Report path would overwrite surface data: " +
+                    reportPath.string());
+            }
+        }
+    };
+    for (const fs::path& dir : targetDirs) {
+        rejectAlias(dir);
+    }
+    for (const fs::path& dir : sourceDirs) {
+        rejectAlias(dir);
+    }
 }
 
 bool is_tifxyz_dir(const fs::path& dir)
@@ -109,7 +171,19 @@ std::vector<fs::path> discover_tifxyz_dirs(const fs::path& root)
         }
     }
     std::sort(dirs.begin(), dirs.end());
-    return dirs;
+
+    // A collection can contain directory symlinks to the same segment. Loading
+    // both would count one target twice in the report (and could make coverage
+    // exceed 1), so retain the first deterministic path for each real segment.
+    std::unordered_set<std::string> seen;
+    std::vector<fs::path> uniqueDirs;
+    uniqueDirs.reserve(dirs.size());
+    for (const fs::path& dir : dirs) {
+        if (seen.insert(canonical_key(dir)).second) {
+            uniqueDirs.push_back(dir);
+        }
+    }
+    return uniqueDirs;
 }
 
 std::vector<SurfacePatchIndex::SurfacePtr>
@@ -136,11 +210,15 @@ void print_usage(const char* argv0)
               << "options:\n"
               << "   --workers N        source-scan workers; default is min(source count, hardware concurrency)\n"
               << "   --point-stride N   check one out of every N valid source points; default is 1\n"
+              << "   --report-json PATH write a deterministic directed-pair proximity report\n"
               << "   --help             show this help\n";
 }
 
 size_t parse_positive_size(const std::string& name, const std::string& value)
 {
+    if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+        throw std::runtime_error("Invalid " + name + " value: " + value);
+    }
     try {
         size_t parsedChars = 0;
         const unsigned long long parsed = std::stoull(value, &parsedChars);
@@ -181,6 +259,8 @@ Config parse_args(int argc, char* argv[])
             cfg.requestedWorkers = parse_positive_size("workers", require_value(i, arg));
         } else if (arg == "--point-stride") {
             cfg.pointStride = parse_positive_size("point-stride", require_value(i, arg));
+        } else if (arg == "--report-json") {
+            cfg.reportPath = require_value(i, arg);
         } else if (!arg.empty() && arg[0] == '-') {
             throw std::runtime_error("Unknown argument: " + arg);
         } else {
@@ -297,6 +377,7 @@ int main(int argc, char *argv[])
             std::cerr << "No tifxyz segments found in source: " << cfg.sourceRoot << std::endl;
             return EXIT_FAILURE;
         }
+        validate_report_path(cfg.reportPath, targetDirs, sourceDirs);
 
         std::cout << "Target tifxyz segments: " << targetDirs.size() << std::endl;
         std::cout << "Source tifxyz segments: " << sourceDirs.size() << std::endl;
@@ -310,7 +391,14 @@ int main(int argc, char *argv[])
         for (const auto& surface : targetSurfaces) {
             const std::string key = canonical_key(surface->path);
             targetByPath.emplace(key, surface);
-            targetInfoBySurface.emplace(surface.get(), TargetInfo{key, surface->id, surface->path});
+            targetInfoBySurface.emplace(
+                surface.get(),
+                TargetInfo{
+                    key,
+                    surface->id,
+                    relative_report_path(surface->path, cfg.targetRoot),
+                    surface->path,
+                });
         }
 
         std::unordered_map<std::string, fs::path> sourcePathByKey;
@@ -326,6 +414,11 @@ int main(int argc, char *argv[])
         index.rebuild(targetSurfaces);
         const double buildSeconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - buildStart).count();
+        if (!cfg.reportPath.empty() &&
+            index.surfaceCount() != targetSurfaces.size()) {
+            throw std::runtime_error(
+                "Cannot report coverage: one or more target surfaces could not be indexed");
+        }
         std::cout << "SurfacePatchIndex built: surfaces=" << index.surfaceCount()
                   << " patches=" << index.patchCount()
                   << " seconds=" << buildSeconds << std::endl;
@@ -376,6 +469,8 @@ int main(int argc, char *argv[])
                         result.sourcePath = source.path;
                         result.sourceKey = canonical_key(source.path);
                         result.sourceId = source.id;
+                        result.sourceRelativePath =
+                            relative_report_path(source.path, cfg.sourceRoot);
 
                         std::unordered_set<SurfacePatchIndex::SurfacePtr> excludedTargetSurfaces;
                         excludedTargetSurfaces.reserve(32);
@@ -383,6 +478,8 @@ int main(int argc, char *argv[])
                             selfIt != targetByPath.end()) {
                             excludedTargetSurfaces.insert(selfIt->second);
                         }
+                        std::unordered_set<std::string> seenTargetKeys;
+                        seenTargetKeys.reserve(32);
                         size_t progressPointBatch = 0;
                         size_t validPointIndex = 0;
                         for (const auto& pointRef : source.validPoints()) {
@@ -416,17 +513,23 @@ int main(int argc, char *argv[])
                                 if (target.key == result.sourceKey) {
                                     continue;
                                 }
-                                if (!excludedTargetSurfaces.insert(hitSurface).second) {
-                                    continue;
-                                }
 
-                                result.hits.emplace_back(target.key, target.id);
-                                discoveredPairs.fetch_add(1, std::memory_order_relaxed);
+                                if (!cfg.reportPath.empty()) {
+                                    ++result.matchedPointsByTarget[target.key];
+                                }
+                                if (seenTargetKeys.insert(target.key).second) {
+                                    result.hits.emplace_back(target.key, target.id);
+                                    discoveredPairs.fetch_add(1, std::memory_order_relaxed);
+                                    if (cfg.reportPath.empty()) {
+                                        excludedTargetSurfaces.insert(hitSurface);
+                                    }
+                                }
                             }
                         }
                         if (progressPointBatch > 0) {
                             queriedPoints.fetch_add(progressPointBatch, std::memory_order_relaxed);
                         }
+                        result.validPoints = validPointIndex;
 
                         scanResults[sourceIndex] = std::move(result);
                     } catch (const std::exception& e) {
@@ -506,6 +609,61 @@ int main(int argc, char *argv[])
                           << sourceIt->second.filename().string()
                           << " (" << overlaps.size() << " overlaps)" << std::endl;
             }
+        }
+
+        if (!cfg.reportPath.empty()) {
+            std::vector<vc_seg_overlap::SurfaceInfo> reportTargets;
+            reportTargets.reserve(targetSurfaces.size());
+            for (const auto& target : targetSurfaces) {
+                const auto infoIt = targetInfoBySurface.find(target.get());
+                if (infoIt == targetInfoBySurface.end()) {
+                    continue;
+                }
+                reportTargets.push_back({
+                    infoIt->second.key,
+                    infoIt->second.id,
+                    infoIt->second.relativePath,
+                });
+            }
+
+            std::vector<vc_seg_overlap::SourceMatches> reportSources;
+            reportSources.reserve(scanResults.size());
+            for (const SourceScanResult& result : scanResults) {
+                if (result.sourceKey.empty()) {
+                    continue;
+                }
+                reportSources.push_back({
+                    {
+                        result.sourceKey,
+                        result.sourceId,
+                        result.sourceRelativePath,
+                    },
+                    result.validPoints,
+                    result.queriedPoints,
+                    result.matchedPointsByTarget,
+                });
+            }
+
+            const Json report = vc_seg_overlap::buildReport(
+                std::move(reportSources), std::move(reportTargets),
+                cfg.pointStride, kOverlapTolerance);
+            std::ofstream out(cfg.reportPath);
+            if (!out) {
+                throw std::runtime_error(
+                    "Failed to create report: " + cfg.reportPath.string());
+            }
+            out << report.dump(2) << '\n';
+            out.flush();
+            if (!out) {
+                throw std::runtime_error(
+                    "Failed to write report: " + cfg.reportPath.string());
+            }
+            out.close();
+            if (out.fail()) {
+                throw std::runtime_error(
+                    "Failed to finish report: " + cfg.reportPath.string());
+            }
+            std::cout << "Pair report written to " << cfg.reportPath << std::endl;
         }
 
         std::cout << "Queried source points: " << queriedPoints.load() << std::endl;

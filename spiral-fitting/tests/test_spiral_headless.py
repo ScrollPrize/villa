@@ -21,10 +21,11 @@ import spiral_runtime
 from spiral_progress import NullProgressReporter
 from spiral_runtime import (CommandBarrier, CommandBarrierViolation,
                             ConfigureCommand,
+                            DtLossScheduleCommand,
                             DistributedInteractiveFitSession,
-                            FileStoreRendezvous, IncorporateCommand,
-                            InteractiveFitSession, SaveCheckpointCommand,
-                            collective_view)
+                            FileStoreRendezvous, InputBatchCommand,
+                            InteractiveFitSession,
+                            SaveCheckpointCommand, collective_view)
 import spiral_helpers
 from spiral_helpers import compute_winding_range_and_input_extents
 from spiral_service import ServiceState
@@ -73,7 +74,7 @@ class ScrollSpecTests(unittest.TestCase):
                 future_extension={"enabled": True})
             spec = load_scroll_spec(temporary)
             self.assertEqual(spec.name, "s1")
-            self.assertNotIn("base_shape_zyx", spec.manifest())
+            self.assertEqual(spec.base_shape_zyx, (18946, 8174, 8174))
             self.assertNotIn("future_extension", spec.manifest())
 
     def test_unknown_path_override_keys_are_rejected(self):
@@ -96,11 +97,22 @@ class ScrollSpecTests(unittest.TestCase):
             spec = load_scroll_spec(temporary)
             self.assertEqual(spec.name, "s1")
             self.assertEqual(spec.spiral_outward_sense, "CW")
+            self.assertIsNone(spec.base_shape_zyx)
             self.assertEqual(spec.umbilicus_coordinate_scale, 1.0)
             self.assertEqual(spec.normal_zarr_group, "4")
             self.assertEqual(spec.surf_sdt_zarr_group, "1")
             self.assertEqual(spec.lasagna_scale, 4)
             self.assertEqual(spec.path_overrides, ())
+
+    def test_base_shape_is_validated_and_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            write_scroll_spec(temporary, base_shape_zyx=[100, 200, 300])
+            spec = load_scroll_spec(temporary)
+            self.assertEqual(spec.base_shape_zyx, (100, 200, 300))
+            for invalid in ([100, 200], [100, 0, 300], [100, 2.5, 300]):
+                write_scroll_spec(temporary, base_shape_zyx=invalid)
+                with self.assertRaisesRegex(ScrollSpecError, "base_shape_zyx"):
+                    load_scroll_spec(temporary)
 
     def test_relative_path_overrides_resolve_against_dataset_root(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -670,9 +682,72 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(session._step_epoch, 1)
         self.assertEqual(session._state, SessionState.Running)
 
+    def test_every_run_queues_and_applies_dt_schedule_before_first_step(self):
+        session = self._idle_session(completed=100)
+        calls = []
+        session._context = SimpleNamespace(
+            run_dt_resume_iteration=175,
+            configure_dt_loss_schedule=lambda start, count, schedule: calls.append(
+                (start, count, schedule)))
+        schedule = {"enabled": True, "last_fraction": 0.25}
+
+        session.run(100, dt_loss_schedule=schedule)
+
+        self.assertEqual([command.kind for command in session._commands],
+                         ["dt_loss_schedule"])
+        session.wait_for_iteration(100)
+        self.assertEqual(calls, [(100, 100, schedule)])
+        self.assertEqual(session._iteration_in_progress, 100)
+
+    def test_failed_run_setup_cancels_schedule_and_clears_run_state(self):
+        session = self._idle_session(completed=10)
+        session._state = SessionState.Running
+        session._pending = 20
+        session._target = 30
+        session._warnings = []
+        session._run_config = {"loss_weight_patch_radius": 8.0}
+        calls = []
+        session._context = SimpleNamespace(
+            apply_config=lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("bad setup")),
+            clear_interactive_run_state=lambda: calls.append("clear"))
+        schedule = DtLossScheduleCommand(
+            session_generation=0, run_start=10, requested_iterations=20,
+            schedule={"enabled": True, "last_fraction": 0.25})
+        session._commands = [schedule]
+        session._progress_reporter = lambda: NullProgressReporter()
+        session._publish_status = lambda: None
+        command = ConfigureCommand(
+            config={"loss_weight_patch_radius": 4.0},
+            previous_run_config={"loss_weight_patch_radius": 8.0})
+
+        session._run_configuration(command)
+
+        self.assertEqual(calls, ["clear"])
+        self.assertTrue(schedule.cancelled)
+        self.assertEqual(session._commands, [])
+        self.assertEqual(session._state, SessionState.Idle)
+        self.assertEqual(session._target, 10)
+
+    def test_distributed_run_propagates_schedule_to_every_rank_call(self):
+        session = self._proxy()
+        session._status["state"] = SessionState.Idle
+        observed = {}
+
+        def call(name, arguments, **kwargs):
+            observed.update({"name": name, "arguments": arguments})
+            return 25
+
+        session._call = call
+        schedule = {"enabled": True, "last_fraction": 0.4}
+
+        self.assertEqual(session.run(20, dt_loss_schedule=schedule), 25)
+        self.assertEqual(observed["name"], "run")
+        self.assertEqual(observed["arguments"]["dt_loss_schedule"], schedule)
+
     def test_command_from_another_epoch_fail_stops_the_rank(self):
         session = self._idle_session(rank=1, world_size=2)
-        session._commands.append(IncorporateCommand(
+        session._commands.append(InputBatchCommand(
             session_generation=0, epoch=99, records=[]))
         with self.assertRaisesRegex(CommandBarrierViolation,
                                     "from epoch 99 while in epoch 0"):
@@ -719,6 +794,12 @@ class ProtocolTests(unittest.TestCase):
         session._stop_requested = False
         session._shutdown = False
         session._run_start_completed = completed
+        session._context = SimpleNamespace(
+            configure_dt_loss_schedule=lambda *_: None)
+        session.requested_config = {
+            "optimizer_num_training_steps": 30_000}
+        session._run_config = dict(session.requested_config)
+        session._warnings = []
         session.rank = rank
         session.world_size = world_size
         session._status_callback = None
@@ -874,7 +955,8 @@ class ProtocolTests(unittest.TestCase):
 
         session.run(250)
 
-        self.assertEqual(session._commands, [])
+        self.assertEqual(len(session._commands), 1)
+        self.assertIsInstance(session._commands[0], DtLossScheduleCommand)
         self.assertEqual(
             session._run_config["optimizer_num_training_steps"], 30_000)
 
@@ -902,7 +984,8 @@ class ProtocolTests(unittest.TestCase):
         target = session.run(250)
 
         self.assertEqual(target, 30_000)
-        self.assertEqual(session._commands, [])
+        self.assertEqual(len(session._commands), 1)
+        self.assertIsInstance(session._commands[0], DtLossScheduleCommand)
         self.assertEqual(
             session._run_config["optimizer_num_training_steps"], 30_000)
 
@@ -938,104 +1021,19 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(
             session._run_config["optimizer_num_training_steps"], 30_250)
 
-    def test_run_queues_influence_config_with_only_pending_inputs(self):
-        session = InteractiveFitSession.__new__(InteractiveFitSession)
-        session._condition = threading.Condition()
-        session._state = SessionState.Idle
-        session._completed = 10
-        session._pending = 0
-        session._target = 10
-        session._context = object()
-        session._commands = []
-        session.session_generation = 0
-        session._config_revision = 0
-        session._command_epoch = 0
-        session._step_epoch = 0
-        session._step_config_revision = 0
-        session.rank = 0
-        session.world_size = 1
-        session.requested_config = {
-            "optimizer_num_training_steps": 30_000,
-        }
-        session._run_config = dict(session.requested_config)
-        pending = [{"id": "new-patch"}]
-        influence = {"influence_theta_frac": 0.25}
-
-        session.run(20, pending_inputs=pending, influence_config=influence)
-
-        command = session._commands[0]
-        self.assertIsInstance(command, IncorporateCommand)
-        self.assertEqual(command.records, pending)
-        self.assertEqual(command.influence_config, influence)
-        self.assertTrue(command.command_id)
-        self.assertEqual(command.session_generation, 0)
-        self.assertEqual(command.expected_iteration, 10)
-
-    def test_run_configuration_is_queued_before_input_incorporation(self):
-        session = InteractiveFitSession.__new__(InteractiveFitSession)
-        session._condition = threading.Condition()
-        session._state = SessionState.Idle
-        session._completed = 10
-        session._pending = 0
-        session._target = 10
-        session._context = object()
-        session._commands = []
-        session.session_generation = 0
-        session._config_revision = 0
-        session._command_epoch = 0
-        session._step_epoch = 0
-        session._step_config_revision = 0
-        session.rank = 0
-        session.world_size = 1
-        session.requested_config = {"loss_weight_patch_radius": 8.0}
-        session._run_config = {"loss_weight_patch_radius": 8.0}
-
-        session.run(
-            20,
-            pending_inputs=[{"id": "new-patch"}],
-            run_config={"loss_weight_patch_radius": 4.0},
-        )
-
-        self.assertEqual([command.kind for command in session._commands],
-                         ["configure", "incorporate"])
-        self.assertEqual(session._run_config["loss_weight_patch_radius"], 4.0)
-
-    def test_incorporation_warnings_reach_the_session_status(self):
-        # The context takes the inputs but reports what it could not honour;
-        # those warnings ride the status the panel already displays.
-        session = self._idle_session(completed=10)
+    def _running_session(self, completed, target, reserved=None, epoch=7):
+        session = self._idle_session(completed=completed)
+        session._state = SessionState.Running
+        session._target = target
+        session._pending = target - completed
+        session._iteration_in_progress = None
+        session._live_reservation_iteration = reserved
+        session._live_reservation_epoch = epoch
         session._warnings = []
-        session._progress_reporter = lambda: NullProgressReporter()
+        session._error = None
         session._publish_status = lambda: None
-        session._context = SimpleNamespace(
-            incorporate_interactive_inputs=lambda *args, **kwargs: [
-                "2 cross-fiber link(s) on 1 added fiber(s) are not used by this session"])
-        command = IncorporateCommand(
-            records=[{"id": "fiber-a", "kind": "fiber"}],
-            influence_config=None,
-            mark_incorporated=None)
-
-        session._run_incorporation(command)
-
-        self.assertEqual(session._warnings, [
-            "2 cross-fiber link(s) on 1 added fiber(s) are not used by this session"])
-
-    def test_incorporation_without_warnings_leaves_the_status_clean(self):
-        session = self._idle_session(completed=10)
-        session._warnings = []
         session._progress_reporter = lambda: NullProgressReporter()
-        session._publish_status = lambda: None
-        # A context predating the warning return value must not break the path.
-        session._context = SimpleNamespace(
-            incorporate_interactive_inputs=lambda *args, **kwargs: None)
-        command = IncorporateCommand(
-            records=[{"id": "patch-a", "kind": "patch"}],
-            influence_config=None,
-            mark_incorporated=None)
-
-        session._run_incorporation(command)
-
-        self.assertEqual(session._warnings, [])
+        return session
 
     def test_run_configuration_applies_active_host_values_exactly(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
@@ -1094,7 +1092,7 @@ class ProtocolTests(unittest.TestCase):
             Path(path).write_bytes(_zip_checkpoint_bytes())
 
         session._context = SimpleNamespace(
-            clear_interactive_influence=lambda: calls.append("finish"),
+            clear_interactive_run_state=lambda: calls.append("finish"),
             save_checkpoint=save_checkpoint)
         session._publish_preview = lambda: calls.append("preview")
         return session
@@ -1137,6 +1135,192 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(session._state, SessionState.Idle)
             # No autosave means no metadata claiming one exists.
             self.assertFalse((Path(output) / AUTOSAVE_METADATA_NAME).exists())
+
+    def _mid_run_session(self, calls, output_path, completed,
+                         autosave_on_pause=True):
+        session = self._paused_session(
+            calls, output_path, autosave_on_pause=autosave_on_pause)
+        session._completed = completed - 1
+        session._pending = 500
+        session._target = completed + 499
+        session._warnings = []
+        return session
+
+    def test_a_long_run_autosaves_every_thousand_iterations(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as output:
+            session = self._mid_run_session(calls, output, completed=3000)
+
+            session.iteration_completed(
+                completed_iterations=3000, total_loss=1.0, losses={},
+                learning_rate=1.e-3)
+
+            # The cadence save neither pauses the run nor clears its state.
+            self.assertEqual(calls, ["save"])
+            self.assertEqual(session._state, SessionState.Running)
+            self.assertEqual(session._phase, "Optimizing")
+            self.assertEqual(session._pending, 499)
+            metadata = json.loads(
+                (Path(output) / AUTOSAVE_METADATA_NAME).read_text())
+            self.assertEqual(metadata["completed_iterations"], 3000)
+            self.assertEqual(metadata["checkpoint"], AUTOSAVE_CHECKPOINT_NAME)
+
+    def test_off_cadence_iterations_do_not_autosave(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as output:
+            session = self._mid_run_session(calls, output, completed=3001)
+            session.iteration_completed(
+                completed_iterations=3001, total_loss=1.0, losses={},
+                learning_rate=1.e-3)
+            self.assertEqual(calls, [])
+            self.assertEqual(session._state, SessionState.Running)
+
+    def test_a_run_without_autosave_skips_the_cadence_too(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as output:
+            session = self._mid_run_session(
+                calls, output, completed=3000, autosave_on_pause=False)
+            session.iteration_completed(
+                completed_iterations=3000, total_loss=1.0, losses={},
+                learning_rate=1.e-3)
+            self.assertEqual(calls, [])
+            self.assertFalse((Path(output) / AUTOSAVE_METADATA_NAME).exists())
+
+    def test_a_failed_cadence_autosave_keeps_the_previous_one_and_warns(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as output:
+            session = self._mid_run_session(calls, output, completed=3000)
+            previous = Path(output) / AUTOSAVE_CHECKPOINT_NAME
+            previous.write_bytes(b"previous autosave")
+
+            def failing_save(path, *_):
+                calls.append("save")
+                raise OSError("disk full")
+            session._context.save_checkpoint = failing_save
+
+            session.iteration_completed(
+                completed_iterations=3000, total_loss=1.0, losses={},
+                learning_rate=1.e-3)
+
+            self.assertEqual(calls, ["save"])
+            self.assertEqual(session._state, SessionState.Running)
+            self.assertEqual(previous.read_bytes(), b"previous autosave")
+            self.assertEqual(len(session._warnings), 1)
+            self.assertIn("disk full", session._warnings[0])
+
+    def test_early_stop_clears_run_state_before_autosave(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as output:
+            session = self._paused_session(calls, output)
+            session._pending = 20
+            session._target = 29
+            session._stop_requested = True
+
+            session.iteration_completed(
+                completed_iterations=10, total_loss=1.0, losses={},
+                learning_rate=1.e-3)
+
+            self.assertEqual(calls, ["finish", "save"])
+            self.assertEqual(session._state, SessionState.Idle)
+            self.assertEqual(session._pending, 0)
+
+    def test_scheduled_preview_is_queued_at_cadence_and_final_boundaries(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as output:
+            session = self._paused_session(
+                calls, output, autosave_on_pause=False)
+            session._commands = []
+            session.session_generation = 0
+            session._preview_schedule = {
+                "cadence_iterations": 10, "diagnostics": True}
+            session._next_preview_iteration = 10
+            session._automatic_previews_disabled = False
+            session._preview_source_iteration = None
+
+            session.iteration_completed(
+                completed_iterations=10, total_loss=1.0, losses={},
+                learning_rate=1.e-3)
+
+            self.assertEqual(session._state, SessionState.Idle)
+            self.assertEqual(len(session._commands), 1)
+            command = session._commands[0]
+            self.assertIsInstance(command, spiral_runtime.ExportPreviewCommand)
+            self.assertTrue(command.automatic)
+            self.assertTrue(command.diagnostics)
+            self.assertEqual(command.expected_iteration, 10)
+            self.assertEqual(session._next_preview_iteration, 20)
+
+    def test_scheduled_preview_failure_disables_future_captures(self):
+        session = self._idle_session(completed=10)
+        session._state = SessionState.Running
+        session._phase = "Optimizing"
+        session._warnings = []
+        session._automatic_previews_disabled = False
+        session._preview_manifest = None
+        session._preview_generation = 0
+        session._preview_source_iteration = None
+        session._progress_reporter = lambda: NullProgressReporter()
+        session._publish_status = lambda: None
+        session.publishes_outputs = True
+        session._publish_preview = lambda diagnostics=False: (_ for _ in ()).throw(
+            RuntimeError("preview OOM"))
+        command = spiral_runtime.ExportPreviewCommand(
+            session_generation=0, expected_iteration=10,
+            automatic=True)
+        session._run_export_preview(command)
+        self.assertTrue(session._automatic_previews_disabled)
+        self.assertIn("preview OOM", "\n".join(session._warnings))
+
+    def test_preview_capture_barriers_surround_rank_zero_export(self):
+        session = self._idle_session(completed=10)
+        session._state = SessionState.Running
+        session._phase = "Optimizing"
+        session._warnings = []
+        session._preview_manifest = None
+        session._preview_generation = 0
+        session._preview_source_iteration = None
+        session._progress_reporter = lambda: NullProgressReporter()
+        session._publish_status = lambda: None
+        session.publishes_outputs = True
+        events = []
+        session._preview_snapshot_barrier = lambda: events.append("barrier")
+        session._share_preview_capture_error = lambda error: (
+            events.append(("share", error)), error)[1]
+        session._publish_preview = lambda diagnostics=False: events.append("export")
+        command = spiral_runtime.ExportPreviewCommand(
+            session_generation=0, expected_iteration=10, automatic=True)
+
+        session._run_export_preview(command)
+
+        self.assertEqual(
+            events, ["barrier", "export", ("share", None), "barrier"])
+        self.assertTrue(command.done.is_set())
+        self.assertIsNone(command.error)
+
+    def test_rank_zero_capture_failure_disables_cadence_on_secondary_rank(self):
+        session = self._idle_session(completed=10)
+        session._state = SessionState.Running
+        session._phase = "Optimizing"
+        session._warnings = []
+        session._automatic_previews_disabled = False
+        session._preview_manifest = None
+        session._preview_generation = 0
+        session._preview_source_iteration = None
+        session._progress_reporter = lambda: NullProgressReporter()
+        session._publish_status = lambda: None
+        session.publishes_outputs = False
+        barriers = []
+        session._preview_snapshot_barrier = lambda: barriers.append(True)
+        session._share_preview_capture_error = lambda error: "rank 0 preview OOM"
+        command = spiral_runtime.ExportPreviewCommand(
+            session_generation=0, expected_iteration=10, automatic=True)
+
+        session._run_export_preview(command)
+
+        self.assertEqual(len(barriers), 2)
+        self.assertTrue(session._automatic_previews_disabled)
+        self.assertIn("rank 0 preview OOM", "\n".join(session._warnings))
+        self.assertIn("rank 0 preview OOM", command.error)
 
     def test_the_autosave_flag_is_decided_when_a_run_is_admitted(self):
         session = self._idle_session(completed=4)
@@ -1243,13 +1427,38 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(results, [{"preview_manifest_path": "/preview/manifest.json",
                                     "preview_generation": 3}])
 
-    def test_export_preview_is_refused_outside_idle(self):
+    def test_export_preview_can_capture_a_running_iteration_boundary(self):
         session = self._idle_session()
         with session._condition:
             session._state = SessionState.Running
-        with self.assertRaisesRegex(RuntimeError, "not allowed in Running"):
-            session.export_preview(timeout=0.1)
-        self.assertEqual(session._commands, [])
+            session._phase = "Optimizing"
+            session._pending = 2
+            session._target = 2
+        session._progress_reporter = lambda: NullProgressReporter()
+        session._publish_status = lambda: None
+        session.publishes_outputs = True
+        session._preview_manifest = None
+        session._preview_generation = 0
+        session._preview_source_iteration = None
+        session._publish_preview = lambda diagnostics=False: None
+        results = []
+        requester = threading.Thread(
+            target=lambda: results.append(
+                session.export_preview(timeout=5.0)))
+        requester.start()
+        deadline = time.time() + 5
+        while not session._commands and time.time() < deadline:
+            time.sleep(0.005)
+        command = session._commands.pop(0)
+        self.assertEqual(command.expected_iteration, 0)
+        session._run_export_preview(command)
+        requester.join(5)
+        self.assertEqual(session._state, SessionState.Running)
+        self.assertEqual(session._phase, "Optimizing")
+        self.assertEqual(results, [{
+            "preview_manifest_path": None,
+            "preview_generation": 0,
+        }])
 
     def test_secondary_gpu_rank_pauses_without_publishing_outputs(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
@@ -1264,7 +1473,7 @@ class ProtocolTests(unittest.TestCase):
         session.publishes_outputs = False
         calls = []
         session._context = SimpleNamespace(
-            clear_interactive_influence=lambda: calls.append("finish"),
+            clear_interactive_run_state=lambda: calls.append("finish"),
             save_checkpoint=lambda *_: calls.append("save"))
         session._publish_preview = lambda: calls.append("preview")
 

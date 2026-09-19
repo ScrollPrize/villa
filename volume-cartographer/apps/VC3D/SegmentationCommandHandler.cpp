@@ -1944,6 +1944,8 @@ QuadSurface* SegmentationCommandHandler::requireSurfaceAndRunner(
         }
     }
 
+    if (_editingDestinationResolver && !_editingDestinationResolver(surf)) return nullptr;
+
     // Safe to return raw pointer: getSurface() returns a shared_ptr backed by
     // Segmentation::surface_ (a cached member), so the pointed-to object remains
     // alive as long as the Segmentation exists in the VolumePkg.
@@ -3637,6 +3639,8 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
         return fail(tr("Invalid segment or segment not loaded: %1")
                         .arg(QString::fromStdString(segmentId)));
     }
+    if (_editingDestinationResolver && !_editingDestinationResolver(surf))
+        return fail(tr("Could not prepare a managed working copy"));
     QuadSurface* surface = surf.get();
 
     cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
@@ -3725,6 +3729,7 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
                         .arg(QString::fromUtf8(ex.what())));
     }
 
+    emit surfaceSavedTo(QString::fromStdString(surface->path.string()));
     croppedPoints.copyTo(*points);
     for (const auto& ch : croppedChannels) {
         surface->setChannel(ch.name, ch.data);
@@ -3782,6 +3787,7 @@ void SegmentationCommandHandler::onFlipSurface(const std::string& segmentId, boo
 
     try {
         surface->save(surface->path.string(), surface->id, true);
+        emit surfaceSavedTo(QString::fromStdString(surface->path.string()));
     } catch (const std::exception& ex) {
         QMessageBox::critical(_parentWidget,
                               tr("Flip failed"),
@@ -3816,6 +3822,7 @@ void SegmentationCommandHandler::onRotateSurface(const std::string& segmentId)
 
     try {
         surface->save(surface->path.string(), surface->id, true);
+        emit surfaceSavedTo(QString::fromStdString(surface->path.string()));
     } catch (const std::exception& ex) {
         QMessageBox::critical(_parentWidget,
                               tr("Rotate failed"),

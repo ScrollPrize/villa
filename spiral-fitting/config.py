@@ -9,9 +9,17 @@ from pathlib import Path
 DEFAULT_GAP_EXPANDER_CAPACITY = 144
 
 
+def filter_known_config_keys(values, allowed, *, label, warn=print):
+    """Copy client settings, reporting keys absent from the current schema."""
+    unknown = sorted(set(values) - set(allowed))
+    if unknown:
+        warn(f"Ignoring unknown {label} keys: {unknown}")
+    return {key: value for key, value in values.items() if key in allowed}
+
+
 _ENUMS = {
     "model_flow_integration_solver": ["rk4"],
-    "model_flow_field_type": ["cartesian", "cylindrical"],
+    "model_flow_field_type": ["cartesian", "cylindrical", "bspline", "bspline_cylindrical"],
     "track_crossing_mode": ["count", "track_walk"],
     "track_radius_target": ["mean", "median"],
     "dense_spacing_mode": ["phase", "grad_mag", "winding_model"],
@@ -27,29 +35,33 @@ _NULL_TYPES = {
     "track_max_tortuosity": "number",
     "loss_start_track_dt": "integer",
     "loss_start_unverified_patch_dt": "number",
+    "loss_start_unattached_pcl_dt": "integer",
     "patch_uuid_filter_regex": "string",
 }
 
+# Settings host preparation consumes irreversibly: the patch loader erodes and
+# filters entries before they reach the resident pools, and the dense-spacing
+# mode decides which dense stores are opened. Nothing retained by a resident
+# session can re-derive their effect, so they demand a full rebuild.
 _PREPARED_INPUT_FIELDS = {
     "patch_erode_patches",
     "patch_uuid_filter_regex",
-    "track_crossing_precompute_max",
-    "track_crossing_mode",
-    "track_exclusion_radius",
     "dense_spacing_mode",
-    "loss_weight_fiber_directions",
-    "output_first_winding",
-    "output_winding_margin",
-    "output_step_size",
-    "output_num_slices_for_visualization",
-    # These values define the discretised outer-shell lookup/atlas. Unlike
-    # ordinary shell loss parameters they cannot be changed on an existing
-    # prepared shell.
+}
+
+# The discretised outer-shell lookup/atlas. These are ordinary run-boundary
+# settings while the resident session only rebuilds its shell polar map from
+# them, but a session whose tracks were filtered against the shell at load
+# (a tracks store and an outer shell both present) consumed them irreversibly:
+# apply_config refuses them there, and a model-only rebuild applies run
+# changes through apply_config before it releases the model, so such a
+# session needs the full rebuild (see rebuild_stage).
+SHELL_ATLAS_KEYS = frozenset({
     "shell_num_theta_bins",
     "shell_table_smooth_sigma_z",
     "shell_table_smooth_sigma_theta",
     "shell_min_confidence",
-}
+})
 
 _SCALE_WITH_Z_FIELDS = {
     "sample_count_patches_per_step",
@@ -109,9 +121,15 @@ _INPUT_TOGGLE_DESCRIPTIONS = {
     "input_use_pcl_absolute":
         "Load absolute-winding point-collection inputs.",
     "input_use_pcl_relative":
-        "Load relative-winding point-collection inputs.",
+        "Load relative-winding point-collection inputs. Applies at a Run "
+        "boundary: enabling loads the dataset's relative_windings.json (and "
+        "any relative document the session named) into the resident fit, "
+        "disabling drops every resident relative collection.",
     "input_use_pcl_same_winding":
-        "Load same-winding point-collection inputs.",
+        "Load same-winding point-collection inputs. Applies at a Run "
+        "boundary: enabling loads the dataset's same_windings.json (and any "
+        "same-winding document the session named) into the resident fit, "
+        "disabling drops every resident same-winding collection.",
     "input_use_pcl_drawn_control_points":
         "Load drawn-control-point point-collection inputs.",
     "input_use_normals":
@@ -141,7 +159,82 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "model_gap_expander_capacity_windings": DEFAULT_GAP_EXPANDER_CAPACITY,
     "model_gap_expander_min_gap": 1.0,
     "model_gap_expander_softplus_bias": 4.0,
+    # Fiber classification thresholds for radial offsets and patch-side linking.
+    "pcl_vertical_fiber_min_z_fraction": 0.8,
+    "pcl_vertical_fiber_min_auto_certainty": 0.5,
+    # The vertical-fiber radial offset postdates durable checkpoints; missing
+    # means it was off.
+    "pcl_vertical_fiber_radial_offset_enabled": False,
+    "pcl_vertical_fiber_radial_offset_voxels": 4.0,
+    # Unattached-PCL (fiber) DT historically started with the verified-patch
+    # DT; missing means that coupling.
+    "loss_start_unattached_pcl_dt": None,
+    # Point-to-patch linking settings postdate durable checkpoints; missing
+    # means the historical fixed tolerance, single-point choice and no fiber
+    # side rules.
+    "pcl_link_distance_tolerance": 2.5,
+    "pcl_link_window_points": 1,
+    "pcl_link_window_min_points": 1,
+    "pcl_fiber_link_side_filter": False,
+    "pcl_fiber_link_side_margin_voxels": 0.5,
+    "pcl_fiber_link_model_direction_step": 10000,
 })
+# The flow-gradient conditioning settings postdate durable checkpoints;
+# missing means off, which is exactly the earlier behaviour.
+BACKFILLABLE_CONFIG_DEFAULTS.update({
+    "optimizer_flow_grad_smoothing": False,
+    "optimizer_flow_grad_smoothing_sigma_voxels": 32.0,
+    "optimizer_flow_lazy_moments": False,
+    "optimizer_flow_grad_smoothing_across_sigma_voxels": 0.0,
+    "optimizer_flow_grad_smoothing_low_res_sigma_voxels": 0.0,
+    "model_flow_field_low_res_lr_scale": 1.0,
+    "optimizer_flow_shared_second_moment": False,
+    "optimizer_flow_shared_second_moment_clip_quantile": 0.99,
+    "optimizer_flow_grad_clip_median_multiple": 0.0,
+})
+
+_PCL_LINK_DESCRIPTIONS = {
+    "pcl_link_distance_tolerance": (
+        "Scroll voxels within which a point collection point attaches to a "
+        "patch surface at load (and on live patch/PCL incorporation). "
+        "General collections take the largest-area patch within tolerance, "
+        "then the nearest; between-patch collections the nearest of their "
+        "named pair. Changing it at a Run boundary relinks every resident "
+        "point collection and rebuilds their views."),
+    "pcl_link_window_points": (
+        "Consecutive points (id order, centred on the point, the point "
+        "included) whose hits on a candidate patch are counted for "
+        "pcl_link_window_min_points. Even counts round up to the next odd "
+        "count; 1 disables the window."),
+    "pcl_link_window_min_points": (
+        "A candidate patch (one the point itself lies within tolerance of) is "
+        "eligible only when at least this many of the window's points lie "
+        "within tolerance of it; eligible candidates are then ranked as usual "
+        "(largest area, then nearest). 1 keeps the single-point choice; the "
+        "requirement is clipped to the window members available at a "
+        "collection's ends. Must not exceed pcl_link_window_points. Changing "
+        "either window setting at a Run boundary relinks every resident "
+        "point collection."),
+    "pcl_fiber_link_side_filter": (
+        "Restrict fibers to patches on the correct side of the sheet: a "
+        "vertical fiber (on the sheet's back) only attaches to a patch whose "
+        "surface lies in front of it (inward: toward the umbilicus / the "
+        "lower-winding neighbour), a horizontal fiber (on the sheet's front) "
+        "only to one behind it. Until "
+        "pcl_fiber_link_model_direction_step steps have run the inward "
+        "direction is the line to the umbilicus; from then on (also when a "
+        "checkpoint that far along is loaded) every fiber is relinked once "
+        "along the fitted spiral's decreasing-winding direction. Changing "
+        "it at a Run boundary relinks every resident fiber."),
+    "pcl_fiber_link_side_margin_voxels": (
+        "Scroll voxels a patch surface may sit on the wrong side of a fiber "
+        "point before the side filter rejects the hit; absorbs points lying "
+        "on the traced surface itself."),
+    "pcl_fiber_link_model_direction_step": (
+        "Completed step from which the fiber side filter takes its inward "
+        "direction from the fitted winding instead of the umbilicus, "
+        "relinking every fiber once at the switch."),
+}
 
 _GAP_EXPANDER_DESCRIPTIONS = {
     "model_gap_expander_num_windings": (
@@ -157,14 +250,81 @@ _GAP_EXPANDER_DESCRIPTIONS = {
         "Bias of the stable lower-bounded softplus gap parameterisation."),
 }
 
+_OPTIMIZER_DESCRIPTIONS = {
+    # See README.md, "Flow-gradient conditioning", for literature precedents
+    # and the limitations of these custom combinations.
+    "optimizer_flow_grad_smoothing": (
+        "Gaussian-smooth flow gradients before the optimizer step. The loss "
+        "is unchanged, but Adam scaling and masks mean the resulting update "
+        "need not retain the kernel profile. Cylindrical smoothing runs "
+        "along z and around rings, with optional separate across-ring smoothing."),
+    "optimizer_flow_grad_smoothing_sigma_voxels": (
+        "Standard deviation in scroll-voxel units of the flow frame: along "
+        "z and around cylindrical rings, or isotropically for Cartesian "
+        "lattices. These lattice directions approximate sheet directions. "
+        "Used for both lattices unless the low-resolution override is set. "
+        "Divide by model_flow_voxel_resolution for fine-cell units; coarse "
+        "cells are six times wider. Very small widths become identity kernels. "
+        "Effective widths are logged at startup when smoothing is enabled."),
+    "optimizer_flow_grad_smoothing_across_sigma_voxels": (
+        "Standard deviation in scroll-voxel units for smoothing across "
+        "cylindrical rings at matching angles. This approximates coupling "
+        "across windings; it does not identify sheet boundaries. 0 disables "
+        "across-ring smoothing. Ignored for Cartesian lattices."),
+    "optimizer_flow_grad_smoothing_low_res_sigma_voxels": (
+        "Along-sheet smoothing width for the coarse lattice alone; 0 uses "
+        "the fine lattice's width in scroll-voxel units. For example, at the "
+        "default 16-voxel fine spacing, 32 voxels is 2 fine cells but about "
+        "0.33 coarse cells. The across-ring width is not affected."),
+    "optimizer_flow_shared_second_moment": (
+        "Use one Adam denominator across cells and components of each "
+        "lattice slab, separately for each flow stage and coarse/fine lattice. "
+        "Preserves relative first-moment magnitudes before lazy masking and "
+        "weight decay, rather than normalizing each entry independently. "
+        "The denominator uses a winsorised mean of positive stored second "
+        "moments. Full per-entry state is retained; the flag can change "
+        "between runs."),
+    "optimizer_flow_shared_second_moment_clip_quantile": (
+        "Quantile of positive second-moment entries, estimated from a "
+        "fixed-stride sample, used to cap values before averaging the full "
+        "slab for the shared denominator. Limits outliers' effect on the "
+        "common scale. 1 disables the cap; an empty positive sample also "
+        "leaves values uncapped."),
+    "model_flow_field_low_res_lr_scale": (
+        "Coarse flow learning-rate multiplier relative to the scheduled "
+        "base rate, independent of the fine flow multiplier. Shared second "
+        "moments can change update sizes; use the logged increments to assess "
+        "the scale. 0 freezes coarse values, including weight decay, but "
+        "moments may still update. Read every step by the fitter; currently "
+        "classified as a model-rebuild setting by the configuration catalog."),
+    "optimizer_flow_grad_clip_median_multiple": (
+        "Clip individual gradient components at this multiple of the median "
+        "nonzero absolute component value, per lattice slab, estimated from "
+        "a fixed-stride sample. Runs after DDP averaging and nonfinite "
+        "sanitization, before smoothing and optimizer moments. Limits spike "
+        "propagation but can suppress valid corrections and change vector "
+        "direction. 0 disables clipping. Logs the bound and clipped fraction."),
+    "optimizer_flow_lazy_moments": (
+        "Use SparseAdam-style masked updates on dense flow gradients: "
+        "entries with zero gradient after conditioning and influence masks "
+        "retain their moments and receive no gradient update. Smoothing can "
+        "activate entries without direct samples. Preserves history through "
+        "quiet steps, including stale momentum, and does not correct first "
+        "touch scaling. Configured weight decay still applies everywhere."),
+}
+
 # Configuration keys that shape the model's parameter tensors. A checkpoint
 # whose stored value for any of them differs describes a different model, and
 # is refused rather than reshaped: a domain/structure change is the explicit
 # rebuild path's job. Configuration metadata, so it lives here beside the
 # rest of it and is readable without importing the fitter.
+# model_num_flow_integration_steps is deliberately absent: the RK4 step count
+# changes the map a fixed parameter set produces (by the discretisation
+# difference) but reshapes nothing, so it is a run-boundary setting and a
+# checkpoint written under another count loads with a printed notice.
 CHECKPOINT_MODEL_SHAPE_KEYS = (
-    "model_num_flow_integration_steps", "model_flow_integration_solver",
-    "model_num_flow_timesteps", "model_flow_bounds_z_margin",
+    "model_flow_integration_solver",
+    "model_num_flow_stages", "model_flow_bounds_z_margin",
     "model_flow_bounds_radius", "model_flow_voxel_resolution",
     "model_flow_field_type", "model_gap_expander_logit_resolution",
     "model_gap_expander_capacity_windings",
@@ -172,6 +332,15 @@ CHECKPOINT_MODEL_SHAPE_KEYS = (
     "model_gap_expander_min_gap", "model_gap_expander_softplus_bias",
     "model_initial_dr_per_winding", "model_linear_z_resolution",
 )
+
+
+# Configuration keys retired from the schema. Checkpoint loaders accept these
+# stored keys after validating their values in checkpoint_migrations.
+RETIRED_CONFIG_KEYS = frozenset({
+    # The leading axis now holds stationary flow stages. Old checkpoints with
+    # more than one interpolated time sample are refused during migration.
+    "model_num_flow_timesteps",
+})
 
 
 # Configuration keys whose every consumer is built by
@@ -189,53 +358,156 @@ CHECKPOINT_MODEL_SHAPE_KEYS = (
 # Both are therefore absent, and a key nobody has audited is absent by
 # construction — the safe answer.
 MODEL_STAGE_KEYS = frozenset({
-    "model_num_flow_integration_steps",
     "model_flow_integration_solver",
-    "model_num_flow_timesteps",
     "model_num_flow_stages",
     "model_flow_bounds_radius",
     "model_flow_voxel_resolution",
     "model_flow_field_type",
-    "model_flow_field_high_res_lr_scale_initial",
-    "model_flow_field_high_res_lr_scale_final",
-    "model_flow_field_high_res_lr_ramp_start_step",
-    "model_flow_field_high_res_lr_ramp_steps",
     "model_flow_field_direct_lr",
     "model_gap_expander_logit_resolution",
-    "model_gap_expander_num_windings",
     "model_gap_expander_capacity_windings",
     "model_gap_expander_min_gap",
     "model_gap_expander_softplus_bias",
     "model_gap_expander_lr_scale",
     "model_linear_z_resolution",
     "model_initial_dr_per_winding",
-    "model_sym_dirichlet_finite_difference_epsilon",
 })
 
+_MODEL_STRUCTURE_KEYS = frozenset({
+    "model_flow_integration_solver",
+    "model_num_flow_stages",
+    "model_flow_bounds_z_margin",
+    "model_flow_bounds_radius",
+    "model_flow_voxel_resolution",
+    "model_flow_field_type",
+    "model_flow_field_direct_lr",
+    "model_gap_expander_logit_resolution",
+    "model_gap_expander_capacity_windings",
+    "model_gap_expander_lr_scale",
+    "model_gap_expander_min_gap",
+    "model_gap_expander_softplus_bias",
+    "model_linear_z_resolution",
+    "model_initial_dr_per_winding",
+})
 
-def rebuild_stage(changed_keys):
-    """The build stage a set of changed configuration keys requires.
+_RUN_MUTABLE_MODEL_KEYS = frozenset({
+    "model_flow_field_low_res_lr_scale",
+    "model_num_flow_integration_steps",
+    "model_flow_field_high_res_lr_scale_initial",
+    "model_flow_field_high_res_lr_scale_final",
+    "model_flow_field_high_res_lr_ramp_start_step",
+    "model_flow_field_high_res_lr_ramp_steps",
+    "model_sym_dirichlet_finite_difference_epsilon",
+    "model_gap_expander_num_windings",
+})
 
-    ``"model"`` when every changed key is on MODEL_STAGE_KEYS, ``"all"``
-    otherwise. The stages are one ordinal, not a graph: "all" is the whole
-    build as it has always run, and "model" is a strict suffix of it.
+# input_ keys a resident session applies at a Run boundary: the participation
+# toggles of the editable point-collection roles (same-winding, relative).
+# Their documents are ordinary regular collections, so FitContext.apply_config
+# loads them through the live-incorporation path when a toggle turns on (the
+# dataset's conventional document plus any document the session request
+# named) and drops the role's resident collections when it turns off. The
+# other roles keep their load-time semantics: absolute annotations are
+# consumed by the theta/winding supervision set up at build, and drawn
+# control points have no live add/remove path.
+_RUN_MUTABLE_INPUT_KEYS = frozenset({
+    "input_use_pcl_relative",
+    "input_use_pcl_same_winding",
+})
 
-    Anything unrecognised falls to "all", so this fails safe: a new key gets
-    today's behaviour until somebody audits its consumers.
-    """
-    return "model" if MODEL_STAGE_KEYS.issuperset(changed_keys) else "all"
+# input_ keys: hard participation gates deciding what host preparation loads
+# and which dense stores open. Always a rebuild.
+_INPUT_GATE_KEYS = (frozenset(_INPUT_TOGGLE_DESCRIPTIONS)
+                    - _RUN_MUTABLE_INPUT_KEYS) | {
+    "input_disable_patches",
+}
+
+_RUN_MUTABLE_PCL_KEYS = frozenset({
+    "pcl_vertical_fiber_radial_offset_enabled",
+    "pcl_vertical_fiber_radial_offset_voxels",
+    "pcl_rel_winding_adjacent_patches_only",
+    "pcl_stratified_pcl_sampling",
+    "pcl_sampling_weights",
+    "pcl_use_fiber_links",
+    "pcl_use_pending_fiber_links",
+    "pcl_unattached_pcl_min_point_spacing",
+    "pcl_fiber_min_point_spacing",
+    # The fiber link side rules relink every resident fiber (the fiber
+    # catalog is re-linked against the resident patches and its views
+    # re-materialised); see FitContext._relink_fibers_to_patches. The
+    # tolerance and window settings relink every resident collection, regular
+    # and fiber, and re-derive every view from the retained catalogs; see
+    # FitContext._relink_all_points_to_patches.
+    "pcl_fiber_link_side_filter",
+    "pcl_fiber_link_side_margin_voxels",
+    "pcl_fiber_link_model_direction_step",
+    "pcl_link_distance_tolerance",
+    "pcl_link_window_points",
+    "pcl_link_window_min_points",
+})
+
+NEW_FIT_KEYS = frozenset(
+    set(_Z_RANGE_DESCRIPTIONS)
+    | _MODEL_STRUCTURE_KEYS
+    | _INPUT_GATE_KEYS
+    | _PREPARED_INPUT_FIELDS
+    | {"optimizer_random_seed", "pcl_vertical_fiber_min_auto_certainty",
+       "pcl_vertical_fiber_min_z_fraction"}
+)
+
+_AUDITED_PREFIXES = ("model_", "input_", "pcl_")
 
 
 def _runtime_impact(key):
-    if key in _Z_RANGE_DESCRIPTIONS:
-        # Changing the z-range invalidates host inputs, dense stores, and the
-        # model's flow-field domain: a new fit, never a run-boundary tweak.
+    if key in NEW_FIT_KEYS:
         return "new_fit"
-    if key.startswith("model_") or key == "optimizer_random_seed":
-        return "new_fit"
-    if key.startswith(("input_", "pcl_")) or key in _PREPARED_INPUT_FIELDS:
+    if (key in _RUN_MUTABLE_MODEL_KEYS or key in _RUN_MUTABLE_PCL_KEYS
+            or key in _RUN_MUTABLE_INPUT_KEYS):
+        return "run_boundary"
+    if key.startswith(_AUDITED_PREFIXES):
         return "new_fit"
     return "run_boundary"
+
+
+def unaudited_prefixed_keys(keys):
+    """Keys with an audited prefix that no classification table names.
+
+    Such a key is reported as "new_fit" by construction; this exists so the
+    tests (and anyone adding a setting) can see the omission explicitly.
+    """
+    tables = (NEW_FIT_KEYS | _RUN_MUTABLE_MODEL_KEYS | _RUN_MUTABLE_PCL_KEYS
+              | _RUN_MUTABLE_INPUT_KEYS)
+    return sorted(key for key in keys
+                  if key.startswith(_AUDITED_PREFIXES) and key not in tables)
+
+
+_known_keys_cache = None
+
+
+def known_config_keys():
+    """Return every configuration key defined by Config."""
+    global _known_keys_cache
+    if _known_keys_cache is None:
+        _known_keys_cache = frozenset(Config().as_dict())
+    return _known_keys_cache
+
+
+def rebuild_stage(changed_keys, *, shell_filtered_tracks=False):
+    """Return the earliest rebuild stage required by changed settings.
+
+    ``shell_filtered_tracks`` says whether the resident session filtered its
+    tracks against the outer shell when it loaded them; the shell atlas keys
+    are then a full rebuild rather than run-boundary settings.
+    """
+    changed = set(changed_keys)
+    if shell_filtered_tracks and changed & SHELL_ATLAS_KEYS:
+        return "all"
+    known = known_config_keys()
+    demanding = {
+        key for key in changed
+        if key not in known or _runtime_impact(key) != "run_boundary"
+    }
+    return "model" if MODEL_STAGE_KEYS.issuperset(demanding) else "all"
 
 
 def _field_spec(key, default):
@@ -263,6 +535,9 @@ def _field_spec(key, default):
         "label": key.split("_", 1)[-1].replace("_", " ").title(),
         "runtime_impact": _runtime_impact(key),
     }
+    if spec["runtime_impact"] == "new_fit":
+        # The build stage a rebuild changing only this key needs.
+        spec["rebuild_stage"] = "model" if key in MODEL_STAGE_KEYS else "all"
     if kind in ("integer", "number"):
         spec.update(
             minimum=(
@@ -270,6 +545,8 @@ def _field_spec(key, default):
                     "output_num_slices_for_visualization",
                     "theta_crossing_map_update_interval",
                     "dt_target_update_interval",
+                    "pcl_link_window_points",
+                    "pcl_link_window_min_points",
                 } else 0),
             maximum=(1_000_000 if key == "output_num_slices_for_visualization"
                      else 1_000_000_000),
@@ -293,6 +570,11 @@ def _field_spec(key, default):
         spec["description"] = _INPUT_TOGGLE_DESCRIPTIONS[key]
     elif key in _GAP_EXPANDER_DESCRIPTIONS:
         spec["description"] = _GAP_EXPANDER_DESCRIPTIONS[key]
+    elif key in _PCL_LINK_DESCRIPTIONS:
+        spec["description"] = _PCL_LINK_DESCRIPTIONS[key]
+
+    elif key in _OPTIMIZER_DESCRIPTIONS:
+        spec["description"] = _OPTIMIZER_DESCRIPTIONS[key]
     return spec
 
 
@@ -309,9 +591,21 @@ class Config:
         self.optimizer_exp_lr_schedule = True
         self.optimizer_lr_final_factor = 0.3
         self.optimizer_num_training_steps = 30000
+        # Flow-lattice gradient conditioning (see _OPTIMIZER_DESCRIPTIONS).
+        # All are read live every step, so they apply at a run boundary
+        # without a rebuild. Off by default.
+        self.optimizer_flow_grad_smoothing = False
+        self.optimizer_flow_grad_smoothing_sigma_voxels = 32.0
+        self.optimizer_flow_grad_smoothing_across_sigma_voxels = 0.0
+        self.optimizer_flow_grad_smoothing_low_res_sigma_voxels = 0.0
+        self.optimizer_flow_lazy_moments = False
+        self.optimizer_flow_shared_second_moment = False
+        self.optimizer_flow_shared_second_moment_clip_quantile = 0.99
+        self.optimizer_flow_grad_clip_median_multiple = 0.0
         self.model_num_flow_integration_steps = 3
         self.model_flow_integration_solver = "rk4"
-        self.model_num_flow_timesteps = 1
+        # Stationary velocity fields composed in sequence, held as the slabs
+        # of the flow lattices' leading axis (see transforms.SpiralAndTransform).
         self.model_num_flow_stages = 2
         self.model_flow_bounds_z_margin = 160
         self.model_flow_bounds_radius = 3200
@@ -321,6 +615,9 @@ class Config:
         self.model_flow_field_high_res_lr_scale_final = 0.2
         self.model_flow_field_high_res_lr_ramp_start_step = 0
         self.model_flow_field_high_res_lr_ramp_steps = 1
+        # Both flow lattices' LRs are optimizer_learning_rate times their
+        # scale; the low-resolution one had no scale of its own before.
+        self.model_flow_field_low_res_lr_scale = 1.0
         self.model_flow_field_direct_lr = True
         self.model_gap_expander_logit_resolution = 24
         # The physical winding estimate and the allocated transform capacity
@@ -416,6 +713,25 @@ class Config:
         self.pcl_sampling_weights = None
         self.pcl_fiber_min_point_spacing = 40.0
         self.pcl_unattached_pcl_min_point_spacing = 16.0
+        # Point-to-patch linking (point_collection.link_points_to_patches;
+        # see _PCL_LINK_DESCRIPTIONS). Every point attaches to a patch surface
+        # within this many scroll voxels; window_min_points > 1 additionally
+        # requires that many of a centred window of window_points consecutive
+        # points to lie within tolerance of a candidate before it is eligible.
+        self.pcl_link_distance_tolerance = 2.5
+        self.pcl_link_window_points = 1
+        self.pcl_link_window_min_points = 1
+        # Fiber side rules: vertical fibers (on the sheet's back) attach only
+        # to patches in front of them (inward, toward the umbilicus / lower
+        # winding), horizontal fibers (on the sheet's front) only to patches
+        # behind them, each with a margin for points on the surface itself.
+        # The inward direction comes from the umbilicus until
+        # pcl_fiber_link_model_direction_step steps have run, then from the
+        # fitted winding (every fiber relinks once at the switch, or at the
+        # first step after loading a checkpoint that far along).
+        self.pcl_fiber_link_side_filter = False
+        self.pcl_fiber_link_side_margin_voxels = 0.5
+        self.pcl_fiber_link_model_direction_step = 10000
         # Cross-fiber links ("branches"): same-winding continuations between
         # fibers. When on, linked collections merge into per-component
         # cross-patch pcls with an explicit fiber graph (winding ties propagate
@@ -427,6 +743,29 @@ class Config:
         self.pcl_use_fiber_links = True
         # Include unapproved (pending) links.
         self.pcl_use_pending_fiber_links = False
+        # Vertical/horizontal classification of fiber strips, used for radial
+        # offsets and patch-side linking. VC3D's manual tag wins, then its automatic
+        # tag when the recorded certainty (0..1) reaches the threshold, then a
+        # geometric fallback: a strip whose z extent is at least this fraction
+        # of its path length is vertical.
+        self.pcl_vertical_fiber_min_z_fraction = 0.8
+        self.pcl_vertical_fiber_min_auto_certainty = 0.5
+        # Vertical fibers lie on the back face of the papyrus sheet (the face
+        # away from the umbilicus), a few voxels off the horizontal-fiber
+        # front face the fit targets, along the sheet normal in the
+        # increasing-winding direction of the fitted spiral (the scan-space
+        # winding gradient, not the line to the umbilicus). When enabled,
+        # vertical strips' radius and DT targets sit this many scroll voxels
+        # along that normal outside the winding instead of on it (positive =
+        # increasing winding), so a vertical fiber is satisfied where it
+        # physically is. The
+        # distance is physical: it is converted to spiral radius per point by
+        # the transform's local stretch along the normal (and, after a
+        # constraint bake, by the frozen stack's accumulated stretch), not
+        # applied as a constant in spiral space. Horizontal strips are
+        # untouched.
+        self.pcl_vertical_fiber_radial_offset_enabled = False
+        self.pcl_vertical_fiber_radial_offset_voxels = 4.0
         self.track_min_sample_spacing = 20.0
         self.track_max_sample_spacing = 60.0
         self.track_length_bin_weights = [0.0, 0.15, 0.85]
@@ -526,6 +865,9 @@ class Config:
         self.loss_start_patch_dt = 25000
         self.loss_start_track_dt = 25000
         self.loss_start_unverified_patch_dt = None
+        # First iteration after which the unattached-PCL (fiber strip) DT snap
+        # acts. None follows loss_start_patch_dt, the historical coupling.
+        self.loss_start_unattached_pcl_dt = None
         self.dt_progressive_windings = False
         self.dt_progressive_inner_winding = 20
         self.dt_progressive_steps = 50000
@@ -552,7 +894,6 @@ class Config:
         self.influence_z = 3000.0
         self.influence_windings = 5.0
         self.influence_theta_frac = 0.5
-        self.influence_disable_dt_frac = 0.75
         self.influence_sigma = 0.3333
         self.influence_anchor_ramp_power = 2.0
         self.dense_spacing_density_lambda = "inverse_gap"
@@ -644,9 +985,15 @@ class Config:
                 "paths": {},
                 # The keys a rebuild can apply without reloading the session's
                 # inputs, advertised so a client can say in advance which kind
-                # of rebuild its pending changes would cause. Authoritative
-                # answers still come from the service (see rebuild_stage).
-                "model_stage_keys": sorted(MODEL_STAGE_KEYS),
+                # of rebuild its pending changes would cause: the model-stage
+                # allowlist plus every run-boundary key, which rebuild_stage()
+                # ignores because a rebuild applies those through
+                # FitContext.apply_config first. Authoritative answers still
+                # come from the service (see rebuild_stage).
+                "model_stage_keys": sorted(
+                    MODEL_STAGE_KEYS | {
+                        key for key, spec in fields.items()
+                        if spec["runtime_impact"] == "run_boundary"}),
                 "fields": fields,
                 # API run-block fields shown in the left-side dock. They are
                 # catalogued for clients but deliberately absent from the

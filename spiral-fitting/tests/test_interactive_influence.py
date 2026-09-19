@@ -19,7 +19,6 @@ TINY_CONFIG = {
     'model_initial_dr_per_winding': 16.,
     'model_flow_voxel_resolution': 8,  # 24^3 high-res lattice, 4^3 low-res: both have interior points
     'model_flow_field_type': 'cartesian',
-    'model_num_flow_timesteps': 1,
     'model_linear_z_resolution': 48,
     'model_gap_expander_logit_resolution': 24,
     'model_gap_expander_num_windings': 6,
@@ -66,9 +65,7 @@ def make_tiny_model(**config_overrides):
 
 
 def make_optimiser(model, gap_weight_decay=1.e-2):
-    flow_field_params = [
-        param for flow_field in model.flow_fields for param in flow_field.parameters()
-    ]
+    flow_field_params = list(model.flow_field.parameters())
     gap_expander_params = list(model.gap_expander_params.parameters())
     linear_params = [model.linear_logits]
     grouped = {id(p) for p in flow_field_params + gap_expander_params + linear_params}
@@ -235,11 +232,11 @@ class FlowLatticeMappingTests(unittest.TestCase):
 
     def test_two_stage_flow_round_trip(self):
         model = make_tiny_model(model_num_flow_stages=2)
-        self.assertEqual(len(model.flow_fields), 2)
+        # The stages are the slabs of one flow field's lattices.
+        self.assertEqual([flow.shape[0] for flow in model.flow_field.flows], [2, 2])
         with torch.no_grad():
-            for flow_field in model.flow_fields:
-                for flow in flow_field.flows:
-                    flow.normal_(std=1e-3)
+            for flow in model.flow_field.flows:
+                flow.normal_(std=1e-3)
         transform = model.get_slice_to_spiral_transform()
         points = torch.stack([
             torch.empty([256]).uniform_(10., 180.),
@@ -333,13 +330,12 @@ class FreezeInvariantTests(unittest.TestCase):
         state._allocate_masks(model)
         state.masks['flow_lr'].zero_()
         state.masks['flow_hr'].zero_()
-        for flow_field in model.flow_fields:
-            for flow in flow_field.flows:
-                flow.grad = torch.ones_like(flow)
+        for flow in model.flow_field.flows:
+            flow.grad = torch.ones_like(flow)
         state.apply_grad_masks_(model)
-        for flow_field in model.flow_fields:
-            for flow in flow_field.flows:
-                self.assertEqual(float(flow.grad.abs().sum()), 0.)
+        for flow in model.flow_field.flows:
+            self.assertEqual(flow.shape[0], 2)
+            self.assertEqual(float(flow.grad.abs().sum()), 0.)
 
     def test_gap_weight_decay_disabled_and_reemulated_in_region(self):
         model, optimiser = self._prepopulated()
@@ -452,6 +448,88 @@ class ActivateAndAnchorTests(unittest.TestCase):
         self.assertTrue((state.masks['gap'] >= gap_before).all())
         self.assertGreater(float((state.masks['gap'] > 0).float().mean()),
                            float((gap_before > 0).float().mean()))
+
+    def test_fiber_revision_replaces_its_influence_contribution(self):
+        model = make_tiny_model()
+        optimiser = make_optimiser(model)
+        state = make_influence_state(INFLUENCE_CONFIG, torch.device('cpu'))
+        anchor_geometry = torch.stack([
+            torch.empty([512]).uniform_(10., 180.),
+            torch.empty([512]).uniform_(-70., 70.),
+            torch.empty([512]).uniform_(-70., 70.),
+        ], dim=-1)
+        first = self._make_collection()
+        first['metadata'] = {
+            'logical_input_kind': 'fiber',
+            'logical_input_id': 'fiber-7',
+            'logical_input_revision': 'r1',
+        }
+        state.activate_or_extend_(
+            new_patches={}, new_collections={1: first},
+            spiral_and_transform=model, optimiser=optimiser,
+            cfg=INFLUENCE_CONFIG, z_begin=0, z_end=192,
+            anchor_geometry_zyx=anchor_geometry)
+        old_footprint = state.contributions[('fiber', 'fiber-7')]['zst'].clone()
+        old_anchor_target = state.anchor_target.clone()
+        with torch.no_grad():
+            for flow in model.flow_field.flows:
+                flow.normal_(std=1e-3)
+        revision_boundary_target = model.get_slice_to_spiral_transform()(
+            state.anchor_scroll).to(torch.float32)
+        self.assertFalse(torch.equal(revision_boundary_target, old_anchor_target))
+
+        revised = self._make_collection()
+        for point in revised['points'].values():
+            point['zyx'] = point['zyx'] + np.array([60., 0., 0.], dtype=np.float32)
+        revised['metadata'] = {
+            'logical_input_kind': 'fiber',
+            'logical_input_id': 'fiber-7',
+            'logical_input_revision': 'r2',
+        }
+        state.activate_or_extend_(
+            new_patches={}, new_collections={2: revised},
+            spiral_and_transform=model, optimiser=optimiser,
+            cfg=INFLUENCE_CONFIG, z_begin=0, z_end=192,
+            anchor_geometry_zyx=None)
+
+        self.assertEqual(list(state.contributions), [('fiber', 'fiber-7')])
+        contribution = state.contributions[('fiber', 'fiber-7')]
+        self.assertEqual(contribution['revision'], 'r2')
+        self.assertGreater(float(contribution['zst'][:, 0].mean()),
+                           float(old_footprint[:, 0].mean()) + 40.)
+        torch.testing.assert_close(state.anchor_target, revision_boundary_target)
+
+    def test_deleting_logical_pcl_removes_its_influence_contribution(self):
+        model = make_tiny_model()
+        optimiser = make_optimiser(model)
+        state = make_influence_state(INFLUENCE_CONFIG, torch.device('cpu'))
+        first = self._make_collection()
+        first['metadata'] = {
+            'logical_input_kind': 'same_winding',
+            'logical_input_id': '5',
+        }
+        second = self._make_collection()
+        for point in second['points'].values():
+            point['zyx'] = point['zyx'] + np.array(
+                [60., 0., 0.], dtype=np.float32)
+        second['metadata'] = {
+            'logical_input_kind': 'same_winding',
+            'logical_input_id': '7',
+        }
+        state.activate_or_extend_(
+            new_patches={}, new_collections={1: first, 2: second},
+            spiral_and_transform=model, optimiser=optimiser,
+            cfg=INFLUENCE_CONFIG, z_begin=0, z_end=192,
+            anchor_geometry_zyx=None)
+
+        state.remove_logical_contributions_(
+            [('same_winding', '5')],
+            spiral_and_transform=model, optimiser=optimiser)
+
+        self.assertEqual(list(state.contributions),
+                         [('same_winding', '7')])
+        self.assertEqual(state.footprints[0]['input_id'], '7')
+        self.assertTrue(state.active)
 
 
 class SubsampleTests(unittest.TestCase):

@@ -44,16 +44,22 @@ async def vc3d_update_point(
     position: Optional[Point3D] = None,
     winding: Optional[float] = None,
     clear_winding: bool = False,
+    collection_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Update an existing point's volume-space position and/or winding
     annotation. Set clear_winding to remove an existing winding. A winding
     value and clear_winding cannot be supplied together. Returns the updated
-    {id, position, winding}."""
+    {id, position, winding}. Use collection_id to select the owning collection."""
     if winding is not None and clear_winding:
         raise ValueError("winding and clear_winding are mutually exclusive")
 
     params = _strip_none(
-        {"pointId": point_id, "position": position, "winding": winding}
+        {
+            "pointId": point_id,
+            "position": position,
+            "winding": winding,
+            "collectionId": collection_id,
+        }
     )
     if clear_winding:
         params["winding"] = None
@@ -64,9 +70,15 @@ async def vc3d_update_point(
 
 
 @mcp.tool()
-async def vc3d_remove_point(point_id: int) -> dict[str, Any]:
-    """Remove a single point by id. Returns {removed: true}."""
-    return await _call("points.remove_point", {"pointId": point_id})
+async def vc3d_remove_point(
+    point_id: int, collection_id: Optional[int] = None
+) -> dict[str, Any]:
+    """Remove a single point by id. Use collection_id to select the owning
+    collection. Returns {removed: true}."""
+    return await _call(
+        "points.remove_point",
+        _strip_none({"pointId": point_id, "collectionId": collection_id}),
+    )
 
 
 @mcp.tool()

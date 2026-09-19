@@ -35,6 +35,12 @@ public:
     {
     }
 
+    std::optional<SurfaceProjection> projectVolumePoint(const cv::Vec3f&) const override
+    {
+        return std::nullopt;
+    }
+    QPointF surfaceProjectionToScene(const SurfaceProjection&) const override { return {}; }
+    SurfaceProjectionContext surfaceProjectionContext() const override { return {}; }
     QPointF volumeToScene(const cv::Vec3f&) override { return {}; }
     cv::Vec3f sceneToVolume(const QPointF&) const override { return {}; }
     cv::Vec2f sceneToSurfaceCoords(const QPointF&) const override { return {}; }
@@ -95,9 +101,9 @@ public:
     void setOverlayComposite(const OverlayCompositeSettings&) override {}
     void reloadPerfSettings() override {}
 
-    uint64_t highlightedPointId() const override { return 0; }
-    uint64_t selectedPointId() const override { return 0; }
-    uint64_t selectedCollectionId() const override { return 0; }
+    std::optional<vc::PointRef> highlightedPoint() const override { return std::nullopt; }
+    std::optional<vc::PointRef> selectedPoint() const override { return std::nullopt; }
+    std::optional<uint64_t> selectedCollectionId() const override { return std::nullopt; }
     bool isPointDragActive() const override { return false; }
     bool isSameWrapAnnotationModeEnabled() const override { return false; }
     double sameWrapAnnotationPolylineOpacity() const override { return 1.0; }
