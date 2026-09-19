@@ -3,6 +3,8 @@
 #include <vector>
 #include <opencv2/core.hpp>
 #include <random>
+#include <optional>
+#include <cstdint>
 #include <memory>
 
 namespace vc {
@@ -19,9 +21,13 @@ class GridStore;
  * to point outwards from this umbilicus.
  *
  * @param grid_store The GridStore containing the normal grid segments.
+ * @param seed Seed for the generator that draws the sampled segments and the candidate
+ *             points. With no seed the generator is seeded once from the hardware, as before,
+ *             so two calls give different answers; with a seed a run can be repeated exactly.
  * @return A cv::Vec2f representing the estimated umbilicus point in the 2D grid space.
  */
-cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store);
+cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store,
+                                      std::optional<std::uint32_t> seed = std::nullopt);
 
 void align_and_filter_segments(const GridStore& grid_store, GridStore& result, const cv::Vec2f& center_point = cv::Vec2f(std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN()));
 
