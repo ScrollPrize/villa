@@ -66,6 +66,8 @@ endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
 
+vc_add_test(NAME test_omp_thread_point_collection)
+
 vc_add_test(NAME test_surface_area_units)
 
 vc_add_test(NAME test_voxel_size_metadata)
@@ -123,18 +125,25 @@ vc_add_test(NAME test_ink_detection_overlay
 
 qt6_wrap_cpp(viewer_overlay_base_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
 qt6_wrap_cpp(fiber_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/FiberOverlayController.hpp)
+qt6_wrap_cpp(points_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/PointsOverlayController.hpp)
+qt6_wrap_cpp(vccollection_surface_primitives_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 vc_add_test(NAME test_viewer_overlay_surface_primitives
     SOURCES test_viewer_overlay_surface_primitives.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/FiberOverlayController.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/PointsOverlayController.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/OverlayBatchItem.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/AtlasOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/AtlasControlPointsOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/AtlasControlPointsDock.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/COutlinedTextItem.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
+            ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             test_viewer_manager_stub.cpp
             ${viewer_overlay_base_surface_primitives_moc}
             ${fiber_overlay_surface_primitives_moc}
+            ${points_overlay_surface_primitives_moc}
+            ${vccollection_surface_primitives_moc}
             ${viewer_manager_overlay_test_moc}
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core vc_atlas
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
@@ -857,6 +866,8 @@ vc_add_test(NAME test_atlas LIBS doctest::doctest vc_atlas)
 # with the command-line tool so the tested code is the shipped code).
 vc_add_test(NAME test_tifxyz_selfcross LIBS doctest::doctest opencv_core)
 
+vc_add_test(NAME test_seg_add_overlap_metrics)
+
 # End-to-end CLI contract for the same tool: exit codes, report
 # serialization, collection envelope. Needs the binary, so it only exists
 # in configurations that build the apps -- the test shards configure with
@@ -867,6 +878,13 @@ if(TARGET vc_tifxyz_selfcross)
         LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
         DEFS VC_SELFCROSS_BIN="$<TARGET_FILE:vc_tifxyz_selfcross>")
     add_dependencies(test_tifxyz_selfcross_cli vc_tifxyz_selfcross)
+endif()
+
+if(TARGET vc_seg_add_overlap)
+    vc_add_test(NAME test_seg_add_overlap_cli
+        LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
+        DEFS VC_SEG_ADD_OVERLAP_BIN="$<TARGET_FILE:vc_seg_add_overlap>")
+    add_dependencies(test_seg_add_overlap_cli vc_seg_add_overlap)
 endif()
 
 if(TARGET vc_render_tifxyz)
@@ -908,6 +926,8 @@ vc_add_test(NAME test_quadsurface_snapshot)
 
 vc_add_test(NAME test_quadsurface_save_concurrency)
 
+vc_add_test(NAME test_quadsurface_cache_concurrency)
+
 vc_add_test(NAME test_quadsurface_save_paths)
 
 vc_add_test(NAME test_segmentation)
@@ -945,6 +965,10 @@ vc_add_test(NAME test_zarr_helpers)
 vc_add_test(NAME test_chunked_plane_sampler)
 
 vc_add_test(NAME test_slicing)
+# The vc_render_tifxyz prefetch planner and PrefetchedArrayView (header-only
+# under apps/src, shared with the command-line tool so the tested code is the
+# shipped code).
+vc_add_test(NAME test_render_prefetch)
 
 vc_add_test(NAME test_volume_pkg)
 

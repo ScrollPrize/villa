@@ -19,8 +19,8 @@ existing one.
 Generated display data (previews, downloadable
 checkpoints) is published as immutable, opaque artifacts and transferred
 through ``/artifacts/...`` instead of host filesystem paths. Session inputs
-(patches, fibers, PCL documents) can be uploaded into a session-scoped
-ephemeral folder and later committed into the dataset.
+(patches, fibers, PCL documents) can be uploaded into a dataset-scoped
+editing workspace and explicitly applied or committed into the dataset.
 
 Host filesystem paths are the service's business. A client never invents
 one: a saved checkpoint is a name the service places under the session
@@ -38,12 +38,18 @@ only verbs that hold a request open are the ones that are genuinely quick.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from input_workspace import MutationCoordinator
+from workspace_storage import reclaim_workspaces
+from service_editing import EditingWorkspace
 from collections import OrderedDict, deque
 from collections.abc import Mapping
 import copy
 import dataclasses
-import errno
+import hashlib
 import json
+import math
+import logging
 import os
 from pathlib import Path
 import re
@@ -53,33 +59,31 @@ import signal
 import socket
 import stat
 import sys
+import tempfile
 import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from fit_session import (API_VERSION, FIT_INPUT_CATALOG, SESSION_BUSY_STATES,
-                         SCROLL_SPEC_FILENAME, SCROLL_SPEC_OWNED_RUN_KEYS,
-                         ScrollSpecError, SessionState,
-                         SpiralInputPaths, default_user_cache_dir,
-                         input_source_enabled, pcl_input_enabled,
-                         phase_bundle_enabled, winding_inference_enabled,
-                         load_scroll_spec,
+from fit_session import (API_VERSION, EDITABLE_PCL_ROLES, FIT_INPUT_CATALOG,
+                         SESSION_BUSY_STATES, SCROLL_SPEC_FILENAME,
+                         SCROLL_SPEC_OWNED_RUN_KEYS, PclRole, ScrollSpecError,
+                         SessionState, SpiralInputPaths, default_user_cache_dir,
+                         input_source_enabled, pcl_input_enabled, phase_bundle_enabled,
+                         winding_inference_enabled, load_scroll_spec,
                          parse_session_request, resolve_dataset_root,
                          validate_session_request)
 from config import (BACKFILLABLE_CONFIG_DEFAULTS,
                     CHECKPOINT_MODEL_SHAPE_KEYS, Config, durable_config,
-                    rebuild_stage)
+                    filter_known_config_keys, rebuild_stage)
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
 from service_artifacts import ArtifactRegistry
-from service_uploads import (EphemeralLedger, PCL_ROLE_FILES,
-                             UPLOADED_CHECKPOINTS_DIRNAME,
-                             UPLOADED_CHECKPOINTS_KEPT,
-                             UPLOAD_GC_SECONDS, UploadEnvironment,
-                             UploadManager, _copy_publish,
-                             _merge_pcl_documents, _utc_stamp)
+from preview_index import PublishedPreviewIndex
+from service_files import ExclusiveFileLock, FileLockUnavailable
+from service_uploads import (PCL_ROLE_FILES, UPLOADED_CHECKPOINTS_DIRNAME,
+                             UploadEnvironment, UploadManager)
 from lasagna_publish import (LasagnaPublisher, PreviewPublication,
                              stop_process_group)
 # Re-exported for the service's own test surface, which addresses the preview
@@ -92,6 +96,25 @@ from lasagna_publish import (_load_flatten_correspondence,  # noqa: F401
 
 
 SERVICE_VERSION = "10.0.0"
+# Per editable PCL role: the /session/status key carrying its display
+# artifact, the artifact registry kind, the artifact directory prefix, and the
+# human label used in client-facing messages.
+PCL_ARTIFACT_STATUS_KEYS = {
+    PclRole.SAME_WINDING.value: "same_winding_artifact",
+    PclRole.RELATIVE.value: "relative_winding_artifact",
+}
+PCL_ARTIFACT_KINDS = {
+    PclRole.SAME_WINDING.value: "spiral-same-winding-pcl",
+    PclRole.RELATIVE.value: "spiral-relative-winding-pcl",
+}
+PCL_ARTIFACT_DIR_PREFIXES = {
+    PclRole.SAME_WINDING.value: "same-winding",
+    PclRole.RELATIVE.value: "relative-winding",
+}
+PCL_ROLE_LABELS = {
+    PclRole.SAME_WINDING.value: "same-winding",
+    PclRole.RELATIVE.value: "relative-winding",
+}
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 PREVIEW_ARTIFACTS_KEPT = 3
@@ -99,8 +122,6 @@ CHECKPOINT_ARTIFACTS_KEPT = 2
 # Upper bound on the checkpoint listing /dataset advertises. A client offers
 # this as a choice, so it is a menu, not an inventory.
 SESSION_CHECKPOINTS_LISTED = 200
-EPHEMERAL_QUOTA_BYTES = int(os.environ.get("SPIRAL_EPHEMERAL_QUOTA_BYTES",
-                                           4 * 1024 * 1024 * 1024))
 MAX_LOG_ENTRY_CHARS = 8192
 # Structured event ring served through /events. This is the whole of what a
 # reconnecting client can recover, so it is sized to hold the loading bars
@@ -112,7 +133,6 @@ MAX_EVENT_READ_ENTRIES = 1000
 # the ProgressReporter publish interval, so the event stream carries the same
 # cadence a status poller already observes.
 EVENT_COALESCE_SECONDS = 1.0
-DATASET_COMMIT_LOCK_TIMEOUT_SECONDS = 20.0
 
 _SAFE_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -174,72 +194,7 @@ def bind_service_paths(resolution, output_directory, cache_directory):
     return resolution
 
 
-class FileLockUnavailable(RuntimeError):
-    pass
-
-
-class ExclusiveFileLock:
-    """Small stdlib-only advisory lock shared by independent service processes."""
-
-    def __init__(self, path):
-        self.path = Path(path)
-        self._stream = None
-
-    def acquire(self, timeout=0.0):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        stream = self.path.open("a+b")
-        if os.name == "nt":
-            stream.seek(0, os.SEEK_END)
-            if stream.tell() == 0:
-                stream.write(b"\0")
-                stream.flush()
-            stream.seek(0)
-        deadline = time.monotonic() + max(0.0, float(timeout))
-        while True:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-                    stream.seek(0)
-                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self._stream = stream
-                return self
-            except OSError as exc:
-                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
-                    stream.close()
-                    raise
-                if time.monotonic() >= deadline:
-                    stream.close()
-                    raise FileLockUnavailable(str(self.path)) from exc
-                time.sleep(0.05)
-
-    def release(self):
-        stream, self._stream = self._stream, None
-        if stream is None:
-            return
-        try:
-            if os.name == "nt":
-                import msvcrt
-                stream.seek(0)
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-        finally:
-            stream.close()
-
-    def __enter__(self):
-        if self._stream is None:
-            self.acquire()
-        return self
-
-    def __exit__(self, _exc_type, _exc, _traceback):
-        self.release()
-
-
-def _validate_run_influence_config(value):
+def _validate_run_influence_config(value, *, warn=print):
     if value is None:
         return {}
     if not isinstance(value, dict):
@@ -250,7 +205,6 @@ def _validate_run_influence_config(value):
         "influence_z",
         "influence_windings",
         "influence_theta_frac",
-        "influence_disable_dt_frac",
         "influence_sigma",
         "sample_count_influence_footprint_points",
         "sample_count_influence_anchor_lattice_points",
@@ -259,10 +213,8 @@ def _validate_run_influence_config(value):
         "influence_anchor_ramp_power",
         "loss_weight_anchor",
     }
-    unknown = sorted(set(value) - allowed)
-    if unknown:
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       f"Unknown influence configuration keys: {unknown}")
+    value = filter_known_config_keys(
+        value, allowed, label="influence configuration", warn=warn)
     result = {}
     if "influence_enabled" in value:
         enabled = value["influence_enabled"]
@@ -274,7 +226,6 @@ def _validate_run_influence_config(value):
         "influence_z": (1.0, 1_000_000.0),
         "influence_windings": (0.1, 100.0),
         "influence_theta_frac": (0.01, 1.0),
-        "influence_disable_dt_frac": (0.0, 1.0),
         "influence_sigma": (0.000001, 10.0),
         "sample_count_influence_footprint_points": (1.0, 1_000_000.0),
         "sample_count_influence_anchor_lattice_points": (1.0, 1_000_000.0),
@@ -305,6 +256,34 @@ def _validate_run_influence_config(value):
             raise ApiError(HTTPStatus.BAD_REQUEST, f"{key} must be an integer")
         result[key] = int(result[key])
     return result
+
+
+def _validate_dt_loss_schedule(value):
+    """Validate the required, transient DT schedule on a Run request."""
+    if not isinstance(value, dict):
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST, "dt_loss_schedule must be a JSON object")
+    expected = {"enabled", "last_fraction"}
+    if set(value) != expected:
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "dt_loss_schedule must contain exactly enabled and last_fraction")
+    enabled = value["enabled"]
+    if not isinstance(enabled, bool):
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST, "dt_loss_schedule.enabled must be boolean")
+    fraction = value["last_fraction"]
+    if (isinstance(fraction, bool)
+            or not isinstance(fraction, (int, float))):
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "dt_loss_schedule.last_fraction must be numeric")
+    fraction = float(fraction)
+    if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "dt_loss_schedule.last_fraction must be finite and between 0 and 1")
+    return {"enabled": enabled, "last_fraction": fraction}
 
 
 # Console lines whose information is already published as structured
@@ -505,7 +484,21 @@ class ServiceState:
                  service_name=None, session_name="", logs=None, events=None,
                  gpu_ids=(0,), startup_run=None):
         self.lock = threading.RLock()
+        self._workspace_condition = threading.Condition(self.lock)
+        self._workspace_closing = False
+        self._service_closed = False
+        self._workspace_users = 0
+        self._background_jobs = set()
+        self._retiring_sessions = []
+        self._teardown_lock = threading.Lock()
+        self._release_receipts = MutationCoordinator()
+        self._pcl_publication_locks = {
+            role: threading.Lock() for role in EDITABLE_PCL_ROLES
+        }
         self.session = None
+        self.editing_workspace = None
+        self._input_content_artifacts = {}
+        self._input_content_artifact_lock = threading.Lock()
         self.session_id = None
         self.session_paths = None
         self.session_request = None
@@ -539,21 +532,249 @@ class ServiceState:
         self._event_errors = {}
         self.gpu_ids = tuple(gpu_ids)
         self.artifacts = ArtifactRegistry()
-        self.uploads_manager = UploadManager(self._upload_environment())
-        self.ephemeral_records = EphemeralLedger(self.lock)
+        self.checkpoint_uploads = UploadManager(self._upload_environment())
+        self._active_run_influence = None
         # One record for the whole of preview publication (see
         # LasagnaPublisher's PreviewPublication), guarded by self.lock.
         self._preview = PreviewPublication()
+        # Display artifacts of the editable PCL roles, keyed by role value.
+        self.pcl_artifacts = {}
         # A preview export runs off the HTTP thread (it costs minutes); this
         # is what makes the verb single-flight and what /session/status
         # reports so a client reconnecting mid-export can see one is running.
         self._preview_export_active = False
+        self._preview_schedule = None
+        self._next_preview_iteration = None
+        self._automatic_previews_disabled = False
+        self._automatic_preview_generations = set()
+        # The checkpoint the fitter last reported its resident model equal
+        # to (see InteractiveFitSession.status()["checkpoint_state"]); a
+        # change here pins that checkpoint's published preview and re-shows
+        # it when one exists.
+        self._checkpoint_state = None
         self.config_catalog = Config.catalog()
         self.session_revision = 0
+        if self._output_root() is not None:
+            reclaim_workspaces(self._output_root())
 
     # ------------------------------------------------------------------
     # Status and health
     # ------------------------------------------------------------------
+
+    @contextmanager
+    def workspace_use(self):
+        with self._workspace_condition:
+            if self._workspace_closing or self._service_closed:
+                raise ApiError(410, "The editing workspace is closing")
+            self._workspace_users += 1
+        try:
+            yield
+        finally:
+            with self._workspace_condition:
+                self._workspace_users -= 1
+                self._workspace_condition.notify_all()
+
+    def _start_background(self, *, target, args=(), name, daemon=True):
+        def run():
+            try:
+                target(*args)
+            finally:
+                with self._workspace_condition:
+                    self._background_jobs.discard(threading.current_thread())
+                    self._workspace_condition.notify_all()
+        with self._workspace_condition:
+            if self._workspace_closing or self._service_closed:
+                raise ApiError(410, "The editing workspace is closing")
+            thread = threading.Thread(target=run, name=name, daemon=daemon)
+            self._background_jobs.add(thread)
+            thread.start()
+
+    def release_editing(self, token, command_id):
+        def release(_):
+            with self._teardown_lock:
+                workspace = self.editing_workspace
+                if workspace is None:
+                    raise ApiError(403, "This client does not own an editing workspace")
+                workspace.require(token)
+                self._teardown_workspace()
+                return {"released": True}
+        return self._release_receipts.execute(command_id, 'release',
+            {'token_digest': hashlib.sha256(str(token).encode()).hexdigest()},
+            release, recoverable=lambda exc: isinstance(exc, (TimeoutError, OSError)))
+
+    def _teardown_workspace(self):
+        try:
+            self._drain_and_remove_workspace()
+        except Exception:
+            root = self.editing_workspace.root if self.editing_workspace else self._output_root()
+            logging.exception("Spiral teardown failed; retained workspace %s", root)
+            raise
+
+    def _drain_and_remove_workspace(self):
+        # Do not drop any references or locks until every file user has stopped.
+        with self._workspace_condition:
+            self._workspace_closing = True
+            self._workspace_condition.notify_all()
+            deadline = time.monotonic() + 15
+            while self._workspace_users or self._background_jobs:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Workspace users did not stop; files retained")
+                self._workspace_condition.wait(remaining)
+            workspace, session = self.editing_workspace, self.session
+            process = self._preview.process
+        if workspace is not None:
+            workspace.coordinator.shutdown(lambda: None)
+        stop_process_group(process)
+        if process is not None and process.poll() is None:
+            raise TimeoutError("Preview process did not stop; workspace retained")
+        for retiring in tuple(self._retiring_sessions):
+            retiring.close()
+            self._retiring_sessions.remove(retiring)
+        if session is not None:
+            session.close()
+        if workspace is not None:
+            self.artifacts.retire_root(workspace.root)
+            # Publication recovery lives beside dataset targets, outside root.
+            for transaction in workspace.transactions.values():
+                for path in transaction.recovery_paths():
+                    self.logs.write('stderr', f'Retained Commit recovery: {path}\n')
+            workspace.close()
+        with self.lock:
+            self.session = None
+            self.session_id = None
+            self.editing_workspace = None
+            self._input_content_artifacts.clear()
+            self._session_state = SessionState.Uninitialized
+            self._session_phase = "Waiting for fit initialization"
+            self._session_error = None
+            self._workspace_closing = False
+
+    def editing(self, *, create=True):
+        """The dataset workspace survives resident generations and disconnects."""
+        with self.lock:
+            if self._workspace_closing or self._service_closed:
+                raise ApiError(410, "The editing workspace is closing")
+            if self.editing_workspace is None:
+                if not create:
+                    raise ApiError(409, "Claim an editing workspace first")
+                if self.dataset_root is None or self._output_root() is None:
+                    raise ApiError(409, "A managed dataset and output are required")
+                sources = (self.dataset_resolution.to_dict()
+                           if self.dataset_resolution is not None else {})
+                self.editing_workspace = EditingWorkspace(
+                    self.dataset_root, self._output_root(), sources,
+                    self._editing_resident, self._editing_influence)
+            return self.editing_workspace
+
+    def _editing_influence(self):
+        with self.lock:
+            return dict(self._active_run_influence or {})
+
+    def input_content_artifact(self, input_id, revision_number):
+        with self.workspace_use():
+            return self._input_content_artifact(input_id, revision_number)
+
+    def _input_content_artifact(self, input_id, revision_number):
+        workspace = self.editing(create=False)
+        revision, = workspace._selection([{'id': input_id, 'revision': int(revision_number)}])
+        if revision.content is None:
+            raise ApiError(410, "This input revision is a deletion")
+        identity = workspace.catalog.entry(input_id).identity
+        siblings = ()
+        if identity.kind == 'fiber':
+            desired = tuple(r for r in workspace.catalog.desired()
+                            if r.content is not None and
+                            workspace.catalog.entry(r.id).identity.kind == 'fiber')
+            by_name = {Path(workspace.catalog.entry(r.id).identity.source).name: r
+                       for r in desired}
+            # Resolve the requested revision's links, including transitive and
+            # pending links, against immutable desired peers. Never substitute
+            # the current revision for the explicitly requested entry point.
+            selected = {input_id}
+            pending = [revision]
+            while pending:
+                current = pending.pop()
+                document = json.loads(Path(current.content.json()['path']).read_text())
+                for branch in document.get('branches', []):
+                    peer = by_name.get(branch.get('branch_file'))
+                    if peer is not None and peer.id not in selected:
+                        selected.add(peer.id)
+                        pending.append(peer)
+            siblings = tuple(r for r in desired if r.id in selected and r.id != input_id)
+        key = (input_id, revision.number, tuple((r.id, r.number) for r in siblings))
+        with self._input_content_artifact_lock:
+            if key not in self._input_content_artifacts:
+                content = revision.content.json()
+                source = Path(content['path'])
+                if source.is_dir():
+                    root, entry = source, 'meta.json'
+                    artifact = self.artifacts.register_directory(
+                        'input-content', workspace.id, revision.number, root, entry)
+                else:
+                    parent = workspace.root / 'artifacts' / input_id
+                    parent.mkdir(parents=True, exist_ok=True)
+                    root = Path(tempfile.mkdtemp(dir=parent))
+                    entry = Path(identity.source).name
+                    try:
+                        workspace._copy(source, root / entry)
+                        for sibling in siblings:
+                            name = Path(workspace.catalog.entry(sibling.id).identity.source).name
+                            workspace._copy(sibling.content.json()['path'], root / name)
+                        artifact = self.artifacts.register_directory(
+                            'input-content', workspace.id, revision.number, root, entry)
+                    except BaseException:
+                        shutil.rmtree(root)
+                        raise
+                self._input_content_artifacts[key] = artifact
+            return {'workspace_id': workspace.id, 'artifact': self._input_content_artifacts[key]}
+
+    def _editing_resident(self):
+        with self.lock:
+            if self.session is None or self._building:
+                raise ApiError(409, "Wait for the resident fit to finish loading")
+            return self.session
+
+    def input_upload_manager(self, upload_id):
+        if upload_id in self.checkpoint_uploads.uploads:
+            return self.checkpoint_uploads
+        return self.editing(create=False).uploads
+
+    def editing_lifecycle(self, token, operation, request, callback):
+        workspace = self.editing()
+        workspace.require(token)
+        def perform(captured):
+            workspace.require(token)
+            rebuilding = operation in {"session_initialize", "session_rebuild"}
+            command_id = captured.get("command_id")
+            if rebuilding and command_id in workspace.lifecycle_started:
+                response = workspace.lifecycle_started[command_id]
+            else:
+                if operation == "session_rebuild":
+                    workspace.refresh_clean(f'{command_id}:refresh')
+                response = callback(captured)
+                if rebuilding:
+                    workspace.lifecycle_started[command_id] = response
+            # Keep the coordinator until background construction and desired
+            # input replay finish. Read-only status remains responsive.
+            if operation in {"session_initialize", "session_rebuild"}:
+                while True:
+                    with self.lock:
+                        building, session = self._building, self.session
+                        state = self._session_state if session is None else session.status()["state"]
+                    if not building and state != SessionState.Loading:
+                        break
+                    time.sleep(0.05)
+                if state == SessionState.Error:
+                    raise ApiError(409, "Resident construction failed", payload=self.status())
+                if session is not None:
+                    result = workspace.replay_resident(self.session_generation)
+                    if not result.get("applied"):
+                        raise ApiError(409, "Desired inputs could not be restored", payload=result)
+                response = {**self.status(), "accepted": True}
+            return response
+        return workspace.coordinator.execute(request.get("command_id"), operation,
+            request, perform, recoverable=lambda exc: isinstance(exc, TimeoutError))
 
     def _base(self):
         """The counters every response carries, and nothing else.
@@ -590,20 +811,6 @@ class ServiceState:
             "gpus": list(self.gpu_ids),
         }
 
-    def _commit_availability(self):
-        if self.session is None or self.session_paths is None:
-            return False, "No fit session is loaded"
-        if not self.ephemeral_records:
-            return False, "No ephemeral inputs have been added"
-        if not self.ephemeral_records.uncommitted():
-            return False, "Every added input is already committed"
-        dataset_root = self.session_paths.dataset_root
-        if not dataset_root or not Path(dataset_root).is_dir():
-            return False, "The session has no dataset root directory"
-        if not os.access(dataset_root, os.W_OK):
-            return False, "The dataset root is read-only"
-        return True, ""
-
     def status(self):
         with self.lock:
             response = self._base()
@@ -628,32 +835,44 @@ class ServiceState:
                     for key, value in response["progress"].items()
                     if key != "eta_seconds"
                 }
+            response["workspace_id"] = self.editing_workspace.id if self.editing_workspace else None
             response["session_request"] = self.session_request
             response["preview_artifact"] = self._preview.artifact
             # Published separately from, and after, the surface: a client that
             # never opens an overlay never waits for one.
             response["preview_diagnostics_artifact"] = (
                 self._preview.diagnostics_artifact)
+            for role_value, status_key in PCL_ARTIFACT_STATUS_KEYS.items():
+                response[status_key] = self.pcl_artifacts.get(role_value)
             response["preview_publish"] = (
                 dict(self._preview.progress)
                 if self._preview.progress else None)
             response["preview_publish_error"] = self._preview.error
+            response["preview_active"] = bool(self._preview.generation)
+            response["preview_pending"] = bool(
+                self._preview.pending_generation)
+            response["preview_source_iteration"] = (
+                self._preview.source_fit_iteration)
+            response["preview_active_source_iteration"] = (
+                self._preview.active_source_fit_iteration)
+            response["preview_pending_source_iteration"] = (
+                self._preview.pending_source_fit_iteration)
+            response["preview_schedule"] = copy.deepcopy(
+                response.get("preview_schedule") or self._preview_schedule)
+            response["next_preview_iteration"] = response.get(
+                "next_preview_iteration", self._next_preview_iteration)
+            response["automatic_previews_disabled"] = (
+                self._automatic_previews_disabled
+                or bool(response.get("automatic_previews_disabled")))
             publishing = self._preview.status_progress()
             if publishing is not None:
                 response["phase"] = publishing["stage_name"]
                 response["progress"] = publishing
-            response["ephemeral_inputs"] = self.ephemeral_records.status_entries()
-            # Persistence and incorporation are independent: an input can be
-            # in the user's dataset while the resident fit has not taken it
-            # yet. Name that set explicitly instead of leaving clients to
-            # rediscover it from the pair of fields above.
-            response["committed_not_incorporated"] = [
-                {"id": record.id, "kind": record.kind, "role": record.role}
-                for record in self.ephemeral_records.committed_not_incorporated()
-            ]
-            available, reason = self._commit_availability()
+            available = (self.editing_workspace is not None
+                         and any(entry.accepted > entry.persisted
+                                 for entry in self.editing_workspace.catalog.entries()))
             response["commit_available"] = available
-            response["commit_unavailable_reason"] = reason
+            response["commit_unavailable_reason"] = "" if available else "No uncommitted revisions"
             response["preview_exporting"] = self._preview_export_active
             return response
 
@@ -975,7 +1194,9 @@ class ServiceState:
         read before or outside the model. Within ``run.config`` the answer is
         ``config.rebuild_stage`` over the keys whose requested value differs
         from the live session's, which is "model" only for the audited
-        allowlist and "all" for everything else.
+        allowlist and "all" for everything else. The shell atlas keys widen
+        to "all" when the session loaded both a tracks store and an outer
+        shell, because it filtered the tracks against the shell then.
 
         Call with the lock held.
         """
@@ -998,16 +1219,21 @@ class ServiceState:
             key for key in set(live_config) | set(new_config)
             if live_config.get(key) != new_config.get(key)
         }
-        return rebuild_stage(changed)
+        # _prepare_session_request already blanked either path when its
+        # input toggle is off, so both being named means the resident
+        # session filtered its tracks against the shell at load: the fitter
+        # refuses the shell atlas settings there, and only the full rebuild
+        # can apply them.
+        return rebuild_stage(
+            changed,
+            shell_filtered_tracks=bool(paths.tracks_dbm and paths.outer_shell))
 
     def _begin_model_rebuild(self, paths, run, preview):
         """Publish the new request and rebuild the model off the HTTP thread.
 
-        The session object, its generation and its whole session scope
-        survive: the host inputs the ephemeral uploads were incorporated into
-        are retained, so neither the ephemeral ledger nor the uploaded files
-        behind it are reset here, and the session reports its own ``Loading``
-        while the fitter thread works.
+        The session object, its generation, and its resident inputs survive.
+        The editing workspace retains revisions across every rebuild; the
+        session reports ``Loading`` while the fitter thread works.
         """
         with self.lock:
             if self._building:
@@ -1024,10 +1250,10 @@ class ServiceState:
             self.status_generation += 1
             session_id = self.session_id
             session = self.session
-        threading.Thread(
+        self._start_background(
             target=self._rebuild_model,
             args=(session_id, session, paths, run),
-            name="spiral-model-rebuild", daemon=True).start()
+            name="spiral-model-rebuild", daemon=True)
 
     def _rebuild_model(self, session_id, session, paths, run):
         """Ask the resident session to replace its model stage."""
@@ -1047,7 +1273,8 @@ class ServiceState:
                 raise ApiError(HTTPStatus.CONFLICT,
                                "A session build is already in progress")
             previous = self.session
-            previous_ephemeral = self._session_ephemeral_dir()
+            if previous is not None:
+                self._retiring_sessions.append(previous)
             self.session = None
             self._building = True
             self.session_generation += 1
@@ -1065,13 +1292,16 @@ class ServiceState:
             self._session_error = None
             self.status_generation += 1
             session_id = self.session_id
-        threading.Thread(
+        self._start_background(
             target=self._build,
-            args=(session_id, previous, previous_ephemeral, paths, run,
+            args=(session_id, previous, paths, run,
                   preview, scroll),
-            name="spiral-session-build", daemon=True).start()
+            name="spiral-session-build", daemon=True)
+        self._start_background(
+            target=self._refresh_pcl_artifacts,
+            name="spiral-pcl-artifact-publish", daemon=True)
 
-    def _build(self, session_id, previous, previous_ephemeral, paths, run,
+    def _build(self, session_id, previous, paths, run,
                preview, scroll):
         """Close the old resident session, then construct the new one.
 
@@ -1084,8 +1314,8 @@ class ServiceState:
         try:
             if previous is not None:
                 previous.close()
-            if previous_ephemeral:
-                shutil.rmtree(previous_ephemeral, ignore_errors=True)
+                with self.lock:
+                    self._retiring_sessions.remove(previous)
             from spiral_runtime import create_session
             session = create_session(
                 paths, run, preview, scroll, self._status_changed,
@@ -1120,21 +1350,130 @@ class ServiceState:
 
     def _reset_session_scope(self):
         self._preview_export_active = False
+        self._preview_schedule = None
+        self._next_preview_iteration = None
+        self._automatic_previews_disabled = False
+        self._automatic_preview_generations.clear()
+        self._checkpoint_state = None
         self._event_progress_signatures = {}
         self._event_metric_iterations = {}
         self._event_errors = {}
-        self.ephemeral_records.clear()
-        self.uploads_manager.reset()
-        previous_raw = self._preview.reset_session_scope()
-        if previous_raw:
+        self.pcl_artifacts = {}
+        stale_raw = self._preview.reset_session_scope()
+        for manifest in stale_raw:
             shutil.rmtree(
-                Path(previous_raw).parent, ignore_errors=True)
+                Path(manifest).parent, ignore_errors=True)
+
+    def _publish_pcl_artifact(self, role, source_path=None):
+        """Snapshot one editable role's PCL file without exposing host paths."""
+        role = PclRole(role)
+        if role not in EDITABLE_PCL_ROLES:
+            raise ValueError(f"{role.value} PCLs have no display artifact")
+        # Keep snapshot creation, registration, installation and retention in
+        # one role-scoped transaction, including concurrent session refreshes.
+        with self._pcl_publication_locks[role]:
+            return self._publish_pcl_artifact_locked(role, source_path)
+
+    def _publish_pcl_artifact_locked(self, role, source_path):
+        with self.lock:
+            session_id = self.session_id
+            paths = self.session_paths
+            generation = self.session_revision
+            resolution = self.dataset_resolution
+        if not session_id or paths is None:
+            return None
+        source = Path(source_path) if source_path else None
+        if source is None:
+            for pcl in paths.pcls:
+                if pcl.role == role and pcl.path:
+                    source = Path(pcl.path)
+                    break
+        if source is None:
+            candidate = Path(paths.dataset_root) / PCL_ROLE_FILES[role.value]
+            if candidate.is_file():
+                source = candidate
+        if source is None or not source.is_file():
+            with self.lock:
+                self.pcl_artifacts.pop(role.value, None)
+            return None
+        base_shape = None
+        if resolution is not None and resolution.scroll_spec is not None:
+            base_shape = resolution.scroll_spec.get("base_shape_zyx")
+        if base_shape is None:
+            with self.lock:
+                self.pcl_artifacts.pop(role.value, None)
+            return None
+        kind = PCL_ARTIFACT_KINDS[role.value]
+        root = (Path(paths.output_directory) / ".spiral-artifacts" /
+                f"{PCL_ARTIFACT_DIR_PREFIXES[role.value]}-{generation}-"
+                f"{secrets.token_hex(6)}")
+        root.mkdir(parents=True, exist_ok=False)
+        try:
+            pcl_name = PCL_ROLE_FILES[role.value]
+            shutil.copy2(source, root / pcl_name)
+            # Hash the snapshot, not the live source: publishing runs without
+            # the commit lock, and a write landing between the copy and the
+            # hash would advertise the newer document's revision for the
+            # older bytes, letting a client edit the stale snapshot and still
+            # pass the revision check.
+            source_revision = self._file_sha256(root / pcl_name)
+            editable = self._pcl_source_editable(role, source)
+            descriptor = {
+                "schema_version": 1,
+                "kind": kind,
+                "role": role.value,
+                "base_shape_zyx": list(base_shape),
+                "pcl_file": pcl_name,
+                "source": str(source.resolve()),
+                "source_revision": source_revision,
+                "editable": editable,
+            }
+            (root / "manifest.json").write_text(
+                json.dumps(descriptor, indent=2) + "\n", encoding="utf-8")
+            ref = self.artifacts.register_directory(
+                kind, session_id, generation, root,
+                "manifest.json", delete_root_on_prune=True)
+            ref["role"] = role.value
+            ref["base_shape_zyx"] = list(base_shape)
+            ref["source_revision"] = source_revision
+            ref["editable"] = editable
+            with self.lock:
+                if self.session_id != session_id:
+                    shutil.rmtree(root, ignore_errors=True)
+                    return None
+                self.pcl_artifacts[role.value] = ref
+                self.status_generation += 1
+            self.artifacts.prune(kind, session_id, 1)
+            return ref
+        except BaseException:
+            shutil.rmtree(root, ignore_errors=True)
+            raise
+
+    def _refresh_pcl_artifact(self, role, source_path=None):
+        role = PclRole(role)
+        try:
+            self._publish_pcl_artifact(role, source_path)
+        except Exception as exc:
+            self.events.append(
+                "log", f"{PCL_ROLE_LABELS[role.value].capitalize()} overlay "
+                f"could not be published: {type(exc).__name__}: {exc}",
+                severity="warning", source="service",
+                operation=f"publishing_{role.value}")
+
+    def _refresh_pcl_artifacts(self):
+        for role in EDITABLE_PCL_ROLES:
+            self._refresh_pcl_artifact(role)
 
     def _status_changed(self, status):
-        # Runs on the fitter thread inside the pause/export window, so artifact
-        # digests are computed while training is stopped.
+        # Runs on the fitter thread. It may only claim immutable raw work;
+        # publication itself is background work and must never hold the fit.
         try:
             self._maybe_register_artifacts(status)
+        except Exception as exc:
+            print(f"SPIRAL_ARTIFACT_ERROR {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+        try:
+            self._note_checkpoint_state(status)
         except Exception as exc:
             print(f"SPIRAL_ARTIFACT_ERROR {type(exc).__name__}: {exc}",
                   file=sys.stderr, flush=True)
@@ -1211,14 +1550,44 @@ class ServiceState:
                     rank=rank, session_generation=generation)
 
     def _maybe_register_artifacts(self, status):
+        """Offer a raw snapshot to the bounded background publisher.
+
+        This callback runs on the fitter thread.  It must only claim or
+        coalesce the immutable raw generation; all Lasagna, mapping, hashing,
+        and indexing work belongs to the background publication thread.
+        """
         with self.lock:
             session_id = self.session_id
             preview_generation = int(status.get("preview_generation") or 0)
             preview_manifest = status.get("preview_manifest_path")
+            if preview_generation and status.get("preview_schedule"):
+                self._automatic_preview_generations.add(preview_generation)
+            old_pending = self._preview.pending_manifest
             publish_preview = bool(preview_manifest) and self._preview.claim(
-                session_id, preview_generation)
+                session_id, preview_generation, manifest=preview_manifest,
+                source_fit_iteration=status.get("preview_source_iteration",
+                                                status.get("current_iteration")),
+                diagnostics=bool(status.get("preview_diagnostics")))
+            replaced_pending = (
+                old_pending
+                and old_pending != self._preview.pending_manifest
+                and old_pending != self._preview.previous_raw_manifest)
+        if replaced_pending:
+            shutil.rmtree(Path(old_pending).parent, ignore_errors=True)
         if not publish_preview:
             return
+
+        snapshot = dict(status)
+        threading.Thread(
+            target=self._publish_preview_artifact,
+            args=(snapshot,), name="spiral-preview-publish",
+            daemon=True).start()
+
+    def _publish_preview_artifact(self, status):
+        with self.lock:
+            session_id = self.session_id
+            preview_generation = int(status.get("preview_generation") or 0)
+            preview_manifest = status.get("preview_manifest_path")
 
         try:
             publisher, published = self._publish_flattened_preview(
@@ -1255,13 +1624,36 @@ class ServiceState:
             ref = index("spiral-preview", published.manifest_path.parent,
                         published.manifest_path.name,
                         "Indexing preview files")
+            model_state = (published.raw_manifest or {}).get(
+                "model_state_sha256")
             with self.lock:
                 if self.session_id == session_id:
                     self._preview.artifact = ref
                     self._preview.error = None
+                    self._preview.source_fit_iteration = (
+                        published.source_fit_iteration)
+                    self._preview.model_state_sha256 = model_state
                 self.status_generation += 1
+            # Remember which model state this surface belongs to, so a
+            # checkpoint load that lands on it can re-show it (see
+            # _note_checkpoint_state) instead of flattening it again.
+            preview_index = self._published_preview_index()
+            if preview_index is not None and model_state:
+                try:
+                    preview_index.record(
+                        model_state,
+                        manifest_path=published.manifest_path,
+                        session_id=session_id, generation=preview_generation,
+                        source_fit_iteration=published.source_fit_iteration)
+                except Exception as exc:
+                    self.events.append(
+                        "log", "Could not index the published preview by "
+                        f"model state: {type(exc).__name__}: {exc}",
+                        severity="warning", source="service",
+                        operation="publishing_preview")
             self.artifacts.prune(
-                "spiral-preview", session_id, PREVIEW_ARTIFACTS_KEPT)
+                "spiral-preview", session_id, PREVIEW_ARTIFACTS_KEPT,
+                retain=self._retain_pinned_previews())
 
             # The overlays are a second, optional wave. Their failure is
             # reported as a warning, not as a failed preview: the surface is
@@ -1307,11 +1699,147 @@ class ServiceState:
             with self.lock:
                 if self.session_id == session_id:
                     self._preview.error = error
+                    if preview_generation in self._automatic_preview_generations:
+                        self._automatic_previews_disabled = True
+                        disable_automatic = self.session
+                    else:
+                        disable_automatic = None
+                else:
+                    disable_automatic = None
+            if disable_automatic is not None:
+                try:
+                    disable_automatic.disable_automatic_previews(error)
+                except Exception as disable_exc:
+                    self.events.append(
+                        "log", "Could not disable automatic previews on the "
+                        f"fit workers: {type(disable_exc).__name__}: "
+                        f"{disable_exc}", severity="warning", source="service")
         finally:
+            next_status = None
             with self.lock:
                 if self.session_id == session_id:
                     self._preview.finish(preview_generation)
+                    next_status = self._preview.take_pending()
+                    if next_status is not None:
+                        self._preview.claim(
+                            session_id, next_status["preview_generation"],
+                            manifest=next_status["preview_manifest_path"],
+                            source_fit_iteration=next_status.get(
+                                "current_iteration"),
+                            diagnostics=next_status.get(
+                                "preview_diagnostics", False))
                     self.status_generation += 1
+            if next_status is not None:
+                threading.Thread(
+                    target=self._publish_preview_artifact,
+                    args=(next_status,), name="spiral-preview-publish",
+                    daemon=True).start()
+
+    def _published_preview_index(self):
+        """The on-disk model-state index for this session's output root."""
+        with self.lock:
+            paths = self.session_paths
+        if paths is None or not paths.output_directory:
+            return None
+        return PublishedPreviewIndex(paths.output_directory)
+
+    def _retain_pinned_previews(self):
+        """A prune exemption for surfaces a saved checkpoint still names."""
+        preview_index = self._published_preview_index()
+        if preview_index is None:
+            return None
+        try:
+            pinned = preview_index.pinned_roots()
+        except Exception:
+            return None
+        if not pinned:
+            return None
+        return lambda artifact: Path(artifact.root).resolve(
+            strict=False) in pinned
+
+    def _note_checkpoint_state(self, status):
+        """React to the fitter naming the checkpoint its model now equals.
+
+        Runs on the fitter thread, so it only records the change; the index
+        write and any artifact registration happen on a background thread.
+        A save pins that checkpoint's published surface against retention.
+        A load or resume also re-shows that surface, when the service has
+        one, so the client sees the restored model at once rather than after
+        a fresh export and flatten.
+        """
+        state = status.get("checkpoint_state")
+        if not isinstance(state, dict):
+            return
+        path = str(state.get("path") or "")
+        digest = str(state.get("model_state_sha256") or "")
+        if not path or not digest:
+            return
+        with self.lock:
+            key = (path, digest)
+            if self._checkpoint_state == key or self.session_id is None:
+                return
+            self._checkpoint_state = key
+            session_id = self.session_id
+            shown = self._preview.model_state_sha256
+        threading.Thread(
+            target=self._restore_published_preview,
+            args=(session_id, path, digest, shown,
+                  state.get("completed_iterations")),
+            name="spiral-preview-restore", daemon=True).start()
+
+    def _restore_published_preview(self, session_id, checkpoint_path, digest,
+                                   shown_digest, completed_iterations):
+        preview_index = self._published_preview_index()
+        if preview_index is None:
+            return
+        try:
+            preview_index.pin(checkpoint_path, digest)
+            if shown_digest == digest:
+                # The surface on display already is this model state.
+                return
+            entry = preview_index.lookup(digest)
+            if entry is None:
+                return
+            manifest_path = Path(str(entry["manifest_path"]))
+            root = manifest_path.parent
+            # One directory, one artifact: re-use a registration this
+            # session already holds rather than letting two prunes race
+            # over the same files. A directory another session registered
+            # is shared read-only; that owner never prunes it again.
+            ref = self.artifacts.find("spiral-preview", root, session_id)
+            if ref is None:
+                unclaimed = self.artifacts.find("spiral-preview", root) is None
+                with self.lock:
+                    generation = self._preview.completed_generation
+                ref = self.artifacts.register_directory(
+                    "spiral-preview", session_id, generation, root,
+                    manifest_path.name,
+                    delete_root_on_prune=unclaimed, hash_workers=4)
+            with self.lock:
+                if self.session_id != session_id:
+                    return
+                self._preview.artifact = ref
+                self._preview.diagnostics_artifact = None
+                self._preview.error = None
+                self._preview.source_fit_iteration = entry.get(
+                    "source_fit_iteration")
+                self._preview.model_state_sha256 = digest
+                self.status_generation += 1
+            self.events.append(
+                "log",
+                f"Preview restored from the surface published for "
+                f"{Path(checkpoint_path).name}"
+                + (f" (iteration {completed_iterations})"
+                   if completed_iterations is not None else ""),
+                source="service", operation="publishing_preview")
+        except Exception as exc:
+            print(f"SPIRAL_PREVIEW_ERROR restore: {type(exc).__name__}: "
+                  f"{exc}", file=sys.stderr, flush=True)
+            self.events.append(
+                "log", "Could not restore the published preview for "
+                f"{Path(checkpoint_path).name}: {type(exc).__name__}: {exc}",
+                severity="warning", source="service",
+                operation="publishing_preview")
 
     def _update_preview_publish(self, generation, **values):
         with self.lock:
@@ -1323,6 +1851,12 @@ class ServiceState:
             "progress", str(snapshot.get("stage_name") or ""),
             source="service", operation="publishing_preview",
             payload=snapshot, coalesce_key=("preview-publish",))
+
+    def _warn_ignored_config(self, warning):
+        print(warning)
+        self.events.append(
+            "log", warning, severity="warning", source="service",
+            operation="run")
 
     def run(self, request):
         autosave_on_pause = request.get("autosave_on_pause", True)
@@ -1337,8 +1871,13 @@ class ServiceState:
         if expected != self.session_revision:
             raise ApiError(HTTPStatus.CONFLICT, "Session revision is stale")
         configuration = request.get("configuration")
-        if not isinstance(configuration, dict) or \
-                set(configuration) != set(self.config_catalog["defaults"]):
+        if not isinstance(configuration, dict):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "Running requires a complete configuration")
+        configuration = filter_known_config_keys(
+            configuration, self.config_catalog["defaults"],
+            label="run configuration", warn=self._warn_ignored_config)
+        if set(configuration) != set(self.config_catalog["defaults"]):
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "Running requires a complete configuration")
         try:
@@ -1349,6 +1888,26 @@ class ServiceState:
         if iterations < 1:
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "iterations must be at least 1")
+        dt_loss_schedule = _validate_dt_loss_schedule(
+            request.get("dt_loss_schedule"))
+        schedule = request.get("preview_schedule")
+        if schedule is not None:
+            if not isinstance(schedule, dict):
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "preview_schedule must be an object when enabled")
+            try:
+                cadence = int(schedule.get("cadence_iterations"))
+            except (TypeError, ValueError):
+                cadence = 0
+            diagnostics = schedule.get("diagnostics", False)
+            if cadence < 1 or not isinstance(diagnostics, bool):
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "preview_schedule requires cadence_iterations >= 1 and "
+                    "a boolean diagnostics value")
+            schedule = {"cadence_iterations": cadence,
+                        "diagnostics": diagnostics}
         current = session.status().get("applied_config")
         request_run = self.session_request.get("run") or {}
         if current is None:
@@ -1385,32 +1944,32 @@ class ServiceState:
                 HTTPStatus.CONFLICT,
                 "Static dataset inputs cannot be changed by a run")
         influence_config = _validate_run_influence_config(
-            request.get("influence") or {})
+            request.get("influence") or {}, warn=self._warn_ignored_config)
         run_config = changes
         with self.lock:
-            # The fitter (and, under DDP, its child ranks) receives plain
-            # records; the ledger maps them back to its own entries when the
-            # incorporation outcome arrives.
-            pending = [record.payload()
-                       for record in self.ephemeral_records.pending()]
-
-            def mark_incorporated(records, error=None):
-                with self.lock:
-                    self.ephemeral_records.mark_incorporated(
-                        self.ephemeral_records.resolve(records), error=error)
-                    self.status_generation += 1
+            self._active_run_influence = dict(influence_config)
+            current_iteration = int(
+                session.status().get("current_iteration") or 0)
+            self._preview_schedule = copy.deepcopy(schedule)
+            self._next_preview_iteration = (
+                current_iteration + schedule["cadence_iterations"]
+                if schedule else None)
+            self._automatic_previews_disabled = False
 
         run_arguments = {
-                "pending_inputs": pending,
-                "mark_incorporated": mark_incorporated,
-                "influence_config": influence_config,
-                "run_config": run_config,
-                # Whether this run's pause writes the durable autosave. It
-                # belongs to the run request, not to the plan: it changes
-                # nothing about the model, so it needs no planning round.
-                "autosave_on_pause": autosave_on_pause,
+            "influence_config": influence_config,
+            "run_config": run_config,
+            "autosave_on_pause": autosave_on_pause,
+            "dt_loss_schedule": dt_loss_schedule,
         }
-        target = session.run(iterations, **run_arguments)
+        if schedule is not None:
+            run_arguments["preview_schedule"] = copy.deepcopy(schedule)
+        try:
+            target = session.run(iterations, **run_arguments)
+        except BaseException:
+            with self.lock:
+                self._active_run_influence = None
+            raise
         with self.lock:
             self.status_generation += 1
         return {**self.status(), "accepted": True, "target_iteration": target}
@@ -1488,26 +2047,27 @@ class ServiceState:
                 raise ApiError(HTTPStatus.CONFLICT,
                                "A preview export is already in progress")
             state = session.status().get("state")
-            if state != SessionState.Idle:
+            if state not in {SessionState.Idle, SessionState.Running}:
                 raise ApiError(
                     HTTPStatus.CONFLICT,
-                    f"Exporting a preview requires an idle session (state is "
+                    f"Exporting a preview requires an idle or running session (state is "
                     f"{SessionState(state).name})")
             self._preview_export_active = True
             self.status_generation += 1
             session_id = self.session_id
-        threading.Thread(
+        self._start_background(
             target=self._export_preview,
             args=(session, session_id, diagnostics),
-            name="spiral-preview-export", daemon=True).start()
+            name="spiral-preview-export", daemon=True)
         return {**self.status(), "accepted": True}
 
     def _export_preview(self, session, session_id, diagnostics=False):
-        """Run one export off the HTTP thread and report it through status.
+        """Capture one raw generation off the HTTP thread.
 
-        Publication follows the session's preview status on the fitter
-        thread, so this returns only once the whole generation is published;
-        nothing but this thread is waiting on it.
+        The session callback hands the immutable raw snapshot to the bounded
+        publication coordinator. This worker returns as soon as capture is
+        complete; Lasagna, mapping, indexing, and transfer remain background
+        work and cannot hold either fitting or a later Run.
         """
         try:
             session.export_preview(diagnostics=diagnostics)
@@ -1911,26 +2471,23 @@ class ServiceState:
     @property
     def uploads(self):
         """Uploads in flight, keyed by upload ID (owned by the manager)."""
-        return self.uploads_manager.uploads
+        return self.checkpoint_uploads.uploads
 
     def _output_root(self):
         """Output directory known before any session in dataset mode."""
         if self.session_paths is not None and self.session_paths.output_directory:
             return Path(self.session_paths.output_directory)
         if self.dataset_resolution is not None:
-            return Path(self.dataset_resolution.resolved["output_directory"])
+            output = self.dataset_resolution.resolved.get("output_directory")
+            if output:
+                return Path(output)
         return None
 
-    def _session_ephemeral_dir(self):
-        if self.session_paths is None or self.session_id is None:
-            return None
-        return Path(self.session_paths.output_directory) / ".spiral-ephemeral" / self.session_id
-
     def _staging_root(self):
-        return self.uploads_manager.staging_root()
+        return self.checkpoint_uploads.staging_root()
 
     def _checkpoint_upload_root(self):
-        return self.uploads_manager.checkpoint_root()
+        return self.checkpoint_uploads.checkpoint_root()
 
     def _upload_environment(self):
         """The whole of what the upload manager may ask this service."""
@@ -1938,181 +2495,73 @@ class ServiceState:
             lock=self.lock,
             output_root=self._output_root,
             session_id=lambda: self.session_id,
-            ephemeral_dir=self._session_ephemeral_dir,
-            require_session=self._require_session,
             active_checkpoint=self._active_checkpoint,
-            reserve_ephemeral=self._reserve_ephemeral)
+            allowed_kinds=("checkpoint",))
+
+    @staticmethod
+    def _file_sha256(path):
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _pcl_source_editable(self, role, source):
+        role = PclRole(role)
+        with self.lock:
+            paths = self.session_paths
+        if paths is None:
+            return False
+        configured = (Path(paths.dataset_root) /
+                      PCL_ROLE_FILES[role.value])
+        try:
+            return (Path(source).resolve() == configured.resolve()
+                    and Path(source).is_file()
+                    and os.access(source, os.R_OK | os.W_OK)
+                    and os.access(Path(source).parent, os.W_OK))
+        except OSError:
+            return False
 
     def _active_checkpoint(self):
         with self.lock:
             return self.session_paths.checkpoint if self.session_paths else ""
 
-    def _reserve_ephemeral(self, kind, input_id, declared):
-        """Admit one new ephemeral input, or refuse it.
-
-        Duplicate identities and the ephemeral quota are ledger questions,
-        not transfer questions, so the upload manager delegates them here.
-        """
-        with self.lock:
-            if self.ephemeral_records.contains(kind, input_id):
-                raise ApiError(HTTPStatus.CONFLICT,
-                               f"An ephemeral {kind} named {input_id!r} already exists")
-            if self._ephemeral_bytes_in_use() + declared > EPHEMERAL_QUOTA_BYTES:
-                raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                               "The ephemeral input quota is exhausted")
-
-    def _ephemeral_bytes_in_use(self):
-        return (self.ephemeral_records.bytes_in_use()
-                + self.uploads_manager.staged_ephemeral_bytes())
-
     def begin_upload(self, request):
-        return {**self._base(), **self.uploads_manager.begin(request)}
+        manager = (self.checkpoint_uploads if request.get("kind") == "checkpoint"
+                   else self.editing().uploads)
+        return {**self._base(), **manager.begin(request)}
 
-    def receive_upload_file(self, upload_id, relative_name, stream, length):
-        received = self.uploads_manager.receive(
-            upload_id, relative_name, stream, length)
+    def receive_upload_file(self, upload_id, relative_name, stream, length, *, offset=None):
+        received = self.input_upload_manager(upload_id).receive(
+            upload_id, relative_name, stream, length, offset=offset)
         return {**self._base(), "received": received, "accepted": True}
 
     def finalize_upload(self, upload_id):
-        finalized = self.uploads_manager.finalize(upload_id)
-        if not finalized.replayed:
-            with self.lock:
-                if finalized.kind != "checkpoint":
-                    self.ephemeral_records.add(finalized.record)
-                self.status_generation += 1
-        return {**self.status(), "input": dict(finalized.record),
-                "accepted": True}
+        finalized = self.input_upload_manager(upload_id).finalize(upload_id)
+        return {**self._base(), "accepted": True, "input": finalized.record}
+
+    def commit_input_revisions(self, token, request):
+        result = self.editing().commit(token, request)
+        with self.lock:
+            if self.dataset_resolution is not None:
+                previous = self.dataset_resolution
+                self.dataset_resolution = bind_service_paths(
+                    resolve_dataset_root(previous.root),
+                    previous.resolved.get("output_directory", ""),
+                    previous.resolved.get("cache_directory", ""))
+        self._refresh_pcl_artifacts()
+        return {**self.status(), **result}
 
     def gc_uploads(self):
-        self.uploads_manager.collect_garbage()
-
-    def commit_inputs(self):
-        with self.lock:
-            self._require_session()
-            available, reason = self._commit_availability()
-            if not available:
-                raise ApiError(HTTPStatus.CONFLICT, f"Commit is unavailable: {reason}")
-            expected_session_id = self.session_id
-            dataset_root = Path(self.session_paths.dataset_root)
-        commit_lock = ExclusiveFileLock(dataset_root / ".spiral-commit.lock")
         try:
-            commit_lock.acquire(DATASET_COMMIT_LOCK_TIMEOUT_SECONDS)
-        except FileLockUnavailable as exc:
-            raise ApiError(
-                HTTPStatus.CONFLICT,
-                "Dataset commit is busy in another Spiral session; try again") from exc
-        try:
-            # Re-check after acquiring the process-wide lock: another request
-            # may have completed while this one was waiting.
-            with self.lock:
-                self._require_session()
-                if self.session_id != expected_session_id:
-                    raise ApiError(
-                        HTTPStatus.CONFLICT,
-                        "The Spiral session changed while waiting to commit")
-                available, reason = self._commit_availability()
-                if not available:
-                    raise ApiError(
-                        HTTPStatus.CONFLICT, f"Commit is unavailable: {reason}")
-                records = self.ephemeral_records.uncommitted()
-                paths = self.session_paths
-            patches_dir = Path(paths.verified_patches) if paths.verified_patches \
-                else dataset_root / "verified_patches"
-            fibers_dir = Path(paths.fibers) if paths.fibers else dataset_root / "fibers"
+            with self.workspace_use():
+                self.checkpoint_uploads.collect_garbage()
+                if self.editing_workspace is not None:
+                    self.editing_workspace.uploads.collect_garbage()
+        except ApiError as exc:
+            if exc.status != 410:
+                raise
 
-            # Validation happens entirely under the dataset lock, before any
-            # record is published: collision checks cannot race a cooperating
-            # service process, and a record whose staged copy went missing
-            # fails the whole commit instead of leaving it half applied.
-            for record in records:
-                if not Path(record.path).exists():
-                    raise ApiError(
-                        HTTPStatus.CONFLICT,
-                        f"The staged copy of {record.kind} {record.id!r} is gone; "
-                        "it can no longer be committed")
-                if record.kind == "patch" and (patches_dir / record.id).exists():
-                    raise ApiError(
-                        HTTPStatus.CONFLICT,
-                        f"A patch named {record.id!r} already exists in the dataset")
-                if record.kind == "fiber" and \
-                        (fibers_dir / f"{record.id}.json").exists():
-                    raise ApiError(
-                        HTTPStatus.CONFLICT,
-                        f"A fiber named {record.id!r} already exists in the dataset")
-
-            committed = []
-            for record in records:
-                source = Path(record.path)
-                # A still-pending record keeps its staged copy: it remains the
-                # incorporation source for the next run, so committing never
-                # removes an input from the live session's queue.
-                keep_source = not record.incorporated
-                if record.kind == "patch":
-                    _copy_publish(source, patches_dir / record.id, keep_source)
-                elif record.kind == "fiber":
-                    _copy_publish(source, fibers_dir / f"{record.id}.json", keep_source)
-                else:
-                    target = dataset_root / PCL_ROLE_FILES[record.role]
-                    with source.open("r", encoding="utf-8") as stream:
-                        incoming = json.load(stream)
-                    if target.exists():
-                        backup = target.with_name(f"{target.name}.{_utc_stamp()}.bak")
-                        shutil.copy2(target, backup)
-                        with target.open("r", encoding="utf-8") as stream:
-                            existing = json.load(stream)
-                        merged = _merge_pcl_documents(existing, incoming)
-                    else:
-                        merged = incoming
-                    temp = target.with_name(
-                        f".{target.name}.incoming-{secrets.token_hex(4)}")
-                    with temp.open("w", encoding="utf-8") as stream:
-                        json.dump(merged, stream, indent=2)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    os.replace(temp, target)
-                    if not keep_source:
-                        source.unlink(missing_ok=True)
-                committed.append(record.id)
-            with self.lock:
-                # Committed records that already joined the resident fit are
-                # done; the rest stay queued for the next run.
-                self.ephemeral_records.mark_committed(records)
-                if self.dataset_resolution is not None:
-                    # Re-advertise the dataset with the committed inputs, but
-                    # keep the startup-bound output/cache roots: deployment
-                    # paths never change after launch.
-                    previous = self.dataset_resolution.resolved
-                    self.dataset_resolution = bind_service_paths(
-                        resolve_dataset_root(self.dataset_root),
-                        previous.get("output_directory", ""),
-                        previous.get("cache_directory", ""))
-                self.status_generation += 1
-            return {**self.status(), "committed": committed, "accepted": True}
-        finally:
-            commit_lock.release()
-
-    def remove_input(self, kind, input_id):
-        with self.lock:
-            self._require_session()
-            record = self.ephemeral_records.find(kind, input_id)
-            if record is None:
-                raise ApiError(HTTPStatus.NOT_FOUND,
-                               f"No ephemeral {kind or 'input'} named {input_id!r} exists")
-            if record.incorporated:
-                raise ApiError(HTTPStatus.CONFLICT,
-                               "This input already joined the resident fit; removing it "
-                               "requires reloading the session")
-            self.ephemeral_records.remove(record)
-            self.status_generation += 1
-        # The staged copy is only deleted when the dataset holds no committed
-        # copy; a committed record's file is the user's data now.
-        if not record.committed:
-            path = Path(record.path)
-            if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                path.unlink(missing_ok=True)
-        return {**self.status(), "removed": input_id, "accepted": True}
 
     # ------------------------------------------------------------------
     # Command-ID replay
@@ -2150,13 +2599,10 @@ class ServiceState:
                 self.command_condition.notify_all()
 
     def close(self):
-        with self.lock:
-            session = self.session
-            self.session = None
-            process = self._preview.process
-        stop_process_group(process)
-        if session:
-            session.close()
+        with self._teardown_lock:
+            with self.lock:
+                self._service_closed = True
+            self._teardown_workspace()
 
 
 class SpiralServer(ThreadingHTTPServer):
@@ -2265,8 +2711,14 @@ def _route_upload_file(ctx):
         raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid Content-Length")
     if length < 0:
         raise ApiError(HTTPStatus.LENGTH_REQUIRED, "Content-Length is required")
+    offset = None
+    if "offset" in ctx.query:
+        try:
+            offset = int(ctx.query["offset"][-1])
+        except ValueError:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid upload offset")
     return ctx.state.receive_upload_file(
-        ctx.args[0], ctx.args[1], handler.rfile, length)
+        ctx.args[0], ctx.args[1], handler.rfile, length, offset=offset)
 
 
 _UPLOAD_ID = r"[0-9a-f]{32}"
@@ -2275,6 +2727,33 @@ _UPLOAD_ID = r"[0-9a-f]{32}"
 # no hand-written if-ladder, so a route's method, path, handler and retry
 # semantics are visible in one place.
 ROUTES = (
+    Route("POST", "/session/editing/claim", "editing_claim",
+          lambda ctx: ctx.state.editing().claim(ctx.handler.headers.get("X-Spiral-Workspace-Token"),
+                                                ctx.body.get("command_id")),
+          Idempotency.NONE, reads_body=True),
+    Route("POST", "/session/editing/release", "editing_release",
+          lambda ctx: ctx.state.release_editing(ctx.handler.headers.get("X-Spiral-Workspace-Token"),
+                                                  ctx.body.get("command_id")),
+          Idempotency.NONE, reads_body=True),
+    Route("GET", re.compile(r"/session/input-content/([0-9a-f-]+)/([0-9]+)"), "input_content",
+          lambda ctx: ctx.state.input_content_artifact(ctx.args[0], ctx.args[1]), Idempotency.NONE),
+    Route("GET", "/session/input-catalog", "input_catalog",
+          lambda ctx: (ctx.state.editing_workspace.status() if ctx.state.editing_workspace else
+                       {"workspace_id": None, "ready": False, "inputs": [], "transactions": {}}), Idempotency.NONE),
+    Route("GET", re.compile(r"/session/input-commands/([^/]+)"), "input_command",
+          lambda ctx: ctx.state.editing(create=False).coordinator.outcome(ctx.args[0]), Idempotency.NONE),
+    Route("POST", "/session/input-changes", "input_changes",
+          lambda ctx: ctx.state.editing().change(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
+          Idempotency.NONE, reads_body=True),
+    Route("POST", "/session/discard-inputs", "discard_inputs",
+          lambda ctx: ctx.state.editing().discard(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
+          Idempotency.NONE, reads_body=True),
+    Route("POST", "/session/resolve-input", "resolve_input",
+          lambda ctx: ctx.state.editing().resolve_conflict(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
+          Idempotency.NONE, reads_body=True),
+    Route("POST", "/session/apply-inputs", "apply_inputs",
+          lambda ctx: ctx.state.editing().apply(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
+          Idempotency.NONE, reads_body=True),
     Route("GET", "/health", "health",
           lambda ctx: ctx.state.health(), Idempotency.NONE),
     Route("GET", "/configuration", "configuration",
@@ -2293,17 +2772,13 @@ ROUTES = (
 
     Route("PUT", re.compile(rf"/session/inputs/({_UPLOAD_ID})/files/(.+)"),
           "upload_file", _route_upload_file, Idempotency.CONTENT),
-
-    # There is deliberately no DELETE /session. The first session is created
-    # explicitly and replacing one is POST /session/rebuild.
-    #
-    # A removal names its target in the path, so it needs no body: the
-    # operation is already idempotent (a second DELETE finds nothing to
-    # remove), and clients do not retry it.
-    Route("DELETE",
-          re.compile(r"/session/ephemeral-inputs/([a-z]+)/([A-Za-z0-9._-]+)"),
-          "ephemeral_input_remove",
-          lambda ctx: ctx.state.remove_input(ctx.args[0], ctx.args[1]),
+    Route("GET", re.compile(rf"/session/inputs/({_UPLOAD_ID})"),
+          "upload_status",
+          lambda ctx: ctx.state.input_upload_manager(ctx.args[0]).status(ctx.args[0]),
+          Idempotency.NONE),
+    Route("DELETE", re.compile(rf"/session/inputs/({_UPLOAD_ID})"),
+          "upload_cancel",
+          lambda ctx: ctx.state.input_upload_manager(ctx.args[0]).cancel(ctx.args[0]),
           Idempotency.NONE),
 
     Route("POST", re.compile(rf"/session/inputs/({_UPLOAD_ID})/finalize"),
@@ -2338,7 +2813,8 @@ ROUTES = (
           lambda ctx: ctx.state.download_checkpoint(),
           Idempotency.COMMAND_ID, reads_body=True),
     Route("POST", "/session/commit-inputs", "commit_inputs",
-          lambda ctx: ctx.state.commit_inputs(), Idempotency.COMMAND_ID,
+          lambda ctx: ctx.state.commit_input_revisions(
+              ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body), Idempotency.NONE,
           reads_body=True),
 )
 
@@ -2481,6 +2957,14 @@ class SpiralHandler(BaseHTTPRequestHandler):
             registry.release(artifact)
 
     def _dispatch(self):
+        self._authorise()
+        path = unquote(urlparse(self.path).path).rstrip("/")
+        if self.command == "POST" and path == "/session/editing/release":
+            return self._dispatch_active()
+        with self.server.state.workspace_use():
+            return self._dispatch_active()
+
+    def _dispatch_active(self):
         """Authorise, resolve one route, and apply its retry semantics."""
         self._authorise()
         parsed_url = urlparse(self.path)
@@ -2497,6 +2981,18 @@ class SpiralHandler(BaseHTTPRequestHandler):
             body = self._body()
         context = RouteContext(self, state, args,
                                parse_qs(parsed_url.query), body)
+        workspace = state.editing_workspace
+        if (state.dataset_root is not None and workspace is None
+                and self.command != "GET"
+                and route.operation not in {"editing_claim", "editing_release"}):
+            raise ApiError(403, "Claim an editing workspace first")
+        if workspace is not None and self.command != "GET" and route.operation not in {"editing_claim", "editing_release"}:
+            token = self.headers.get("X-Spiral-Workspace-Token")
+            workspace.require(token)
+            if route.idempotency == Idempotency.COMMAND_ID:
+                return state.editing_lifecycle(token, route.operation, body or {},
+                                                lambda captured: route.handler(RouteContext(
+                                                    self, state, args, context.query, captured)))
         if route.idempotency == Idempotency.COMMAND_ID:
             return state.replay_command(
                 route.operation, (body or {}).get("command_id"),
@@ -2512,14 +3008,14 @@ class SpiralHandler(BaseHTTPRequestHandler):
                 self._send(HTTPStatus.OK, response)
         except ApiError as exc:
             payload = self.server.state._base()
-            payload.update({"error": exc.message, "details": exc.details,
+            payload.update({"error": exc.message, "http_status": int(exc.status), "details": exc.details,
                             **exc.payload})
             # The request body may not have been fully consumed; do not reuse
             # the connection after an error.
             self._send(exc.status, payload, close=True)
         except Exception as exc:
             payload = self.server.state._base()
-            payload.update({"error": f"{type(exc).__name__}: {exc}"})
+            payload.update({"error": f"{type(exc).__name__}: {exc}", "http_status": 500})
             self._send(HTTPStatus.INTERNAL_SERVER_ERROR, payload, close=True)
 
     do_GET = _handle
@@ -2603,7 +3099,7 @@ def main(argv=None):
                              "/dataset). Clients cannot repoint base inputs.")
     parser.add_argument("--output", required=True,
                         help="Root for all generated state (run directories, "
-                             "autosaves, previews, ephemeral inputs, upload "
+                             "autosaves, previews, input revisions, upload "
                              "staging, uploaded checkpoints). Must resolve "
                              "outside the dataset root.")
     parser.add_argument("--cache", default=None,

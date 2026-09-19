@@ -18,14 +18,14 @@ from pathlib import Path
 import torch
 
 from checkpoint_io import load_checkpoint_cpu
-from checkpoint_migrations import migrate_legacy_gap_parameterization
-from config import Config, durable_config
+from checkpoint_migrations import (merge_flow_stage_lattices,
+                                   migrate_legacy_gap_parameterization)
+from config import RETIRED_CONFIG_KEYS, Config, durable_config
 
 
 MODEL_KEYS = (
     "num_flow_integration_steps",
     "flow_integration_solver",
-    "num_flow_timesteps",
     "num_flow_stages",
     "flow_bounds_z_margin",
     "flow_bounds_radius",
@@ -143,7 +143,6 @@ LEGACY_RENAMES = {
     "interactive_influence_z": "influence_z",
     "interactive_influence_windings": "influence_windings",
     "interactive_influence_theta_frac": "influence_theta_frac",
-    "interactive_influence_disable_dt_frac": "influence_disable_dt_frac",
     "interactive_influence_sigma": "influence_sigma",
     "interactive_influence_anchor_ramp_power":
         "influence_anchor_ramp_power",
@@ -155,7 +154,9 @@ LEGACY_REMOVED = {
     "patch_strip_sampling",
     "patch_2d_sampling_max_area",
     "track_walk_require_loop_consistency",
-}
+    # Unprefixed spelling of a retired model key (see RETIRED_CONFIG_KEYS).
+    "num_flow_timesteps",
+} | set(RETIRED_CONFIG_KEYS)
 
 CONFIG_FIELDS = ("cfg", "requested_config", "resolved_config")
 
@@ -211,7 +212,8 @@ def update_checkpoint(checkpoint: dict) -> tuple[dict, dict]:
     if "spiral_and_transform" not in checkpoint:
         raise ValueError("checkpoint has no 'spiral_and_transform' model state")
 
-    checkpoint = migrate_legacy_gap_parameterization(checkpoint)
+    checkpoint = migrate_legacy_gap_parameterization(
+        merge_flow_stage_lattices(checkpoint))
     updated = dict(checkpoint)
     reports = {}
     fallback = checkpoint.get("cfg")

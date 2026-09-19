@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-14
+
+- Fixed QuadSurface derived-cache eviction racing in-flight renders during surface and project switches.
+
 ## 2026-08-31
 
 - Added optional base-XYZ focus bounds that dim plane and annotation-strip views and roughly constrain new or reoptimized fiber geometry.

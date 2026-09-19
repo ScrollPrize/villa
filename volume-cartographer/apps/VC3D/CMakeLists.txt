@@ -27,12 +27,18 @@ set(srcs
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
     LineAnnotationFiberClassification.hpp
+    LineAnnotationFiberDeletion.hpp
     LineAnnotationFiberSaveJob.cpp
     LineAnnotationFiberSaveJob.hpp
     FiberNameDisplay.cpp
     FiberNameDisplay.hpp
     FiberMapWorkspace.cpp
     FiberMapWorkspace.hpp
+    FiberMapRuler.cpp
+    FiberMapRuler.hpp
+    FiberMapRulerMath.hpp
+    FiberMapGapField.cpp
+    FiberMapGapField.hpp
     FiberNetworkLayout.cpp
     FiberNetworkLayout.hpp
     FiberWindingSolver.cpp
@@ -176,6 +182,7 @@ set(srcs
     overlays/PlaneSlicingOverlayController.hpp
     overlays/SurfaceRotationOverlayController.cpp
     overlays/SurfaceRotationOverlayController.hpp
+    overlays/SurfaceRotationTransform.hpp
     overlays/AtlasOverlayController.cpp
     overlays/AtlasOverlayController.hpp
     overlays/AtlasControlPointsOverlayController.cpp
@@ -184,6 +191,9 @@ set(srcs
     overlays/FiberSliceOverlayController.hpp
     overlays/FiberOverlayController.cpp
     overlays/FiberOverlayController.hpp
+    overlays/OverlayBatchItem.cpp
+    overlays/OverlayBatchItem.hpp
+    overlays/ScreenSpacePointIndex.hpp
     overlays/InkDetectionOverlayController.cpp
     overlays/InkDetectionOverlayController.hpp
     overlays/VolumeOverlayController.cpp
@@ -211,11 +221,18 @@ set(srcs
     LasagnaServiceManager.hpp
     SpiralArtifactCache.cpp
     SpiralArtifactCache.hpp
+    SpiralBrushCursorWidget.cpp
+    SpiralBrushCursorWidget.hpp
     SpiralBrushController.cpp
     SpiralBrushController.hpp
+    SpiralPclRole.hpp
+    SpiralPointPlacementMode.hpp
+    SpiralPointCollectionEdit.cpp
+    SpiralPointCollectionEdit.hpp
     SpiralPointChain.cpp
     SpiralPointChain.hpp
     SpiralServiceManager.cpp
+    SpiralServiceManagerInputs.cpp
     SpiralServiceManager.hpp
     SpiralServiceProfile.hpp
     SpiralSessionSync.hpp

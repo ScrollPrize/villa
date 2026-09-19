@@ -1,4 +1,5 @@
 #include <iostream>
+#include "RenderPrefetch.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -374,88 +375,8 @@ static std::vector<float> buildCompositeOffsetList(
     std::vector<float> out;
     out.reserve(std::max(0, compositeEnd - compositeStart + 1));
     for (int zi = compositeStart; zi <= compositeEnd; zi++)
-        out.push_back(float(double(zi) * sliceStep));
+        out.push_back(float(zi) * float(sliceStep));
     return out;
-}
-
-struct ChunkRegion {
-    int minIz = 0, maxIz = -1;
-    int minIy = 0, maxIy = -1;
-    int minIx = 0, maxIx = -1;
-
-    [[nodiscard]] bool valid() const
-    {
-        return minIz <= maxIz && minIy <= maxIy && minIx <= maxIx;
-    }
-};
-
-static ChunkRegion computeChunkRegionForSamples(
-    const cv::Mat_<cv::Vec3f>& base,
-    const cv::Mat_<cv::Vec3f>& dirs,
-    const std::vector<float>& offsets,
-    vc::render::IChunkedArray* ds,
-    int level)
-{
-    ChunkRegion invalid;
-    if (!ds || base.empty() || offsets.empty()) return invalid;
-
-    float loX = std::numeric_limits<float>::max();
-    float loY = std::numeric_limits<float>::max();
-    float loZ = std::numeric_limits<float>::max();
-    float hiX = std::numeric_limits<float>::lowest();
-    float hiY = std::numeric_limits<float>::lowest();
-    float hiZ = std::numeric_limits<float>::lowest();
-    bool found = false;
-
-    auto updateBounds = [&](int r, int c) {
-        const auto& pt = base(r, c);
-        if (!std::isfinite(pt[0]) || !std::isfinite(pt[1]) || !std::isfinite(pt[2])) return;
-
-        const auto& dir = dirs(r, c);
-        for (float off : offsets) {
-            float px = pt[0] + dir[0] * off;
-            float py = pt[1] + dir[1] * off;
-            float pz = pt[2] + dir[2] * off;
-            loX = std::min(loX, px); hiX = std::max(hiX, px);
-            loY = std::min(loY, py); hiY = std::max(hiY, py);
-            loZ = std::min(loZ, pz); hiZ = std::max(hiZ, pz);
-            found = true;
-        }
-    };
-
-    const int h = base.rows;
-    const int w = base.cols;
-    for (int c = 0; c < w; c++) {
-        updateBounds(0, c);
-        updateBounds(h - 1, c);
-    }
-    for (int r = 1; r < h - 1; r++) {
-        updateBounds(r, 0);
-        updateBounds(r, w - 1);
-    }
-    for (int r = 32; r < h - 1; r += 32)
-        for (int c = 32; c < w - 1; c += 32)
-            updateBounds(r, c);
-
-    if (!found) return invalid;
-
-    loX -= 2.0f; loY -= 2.0f; loZ -= 2.0f;
-    hiX += 2.0f; hiY += 2.0f; hiZ += 2.0f;
-
-    const auto chunkShape = ds->chunkShape(level);
-    const auto shape = ds->shape(level);
-
-    ChunkRegion region;
-    region.minIx = std::max(0, int(std::floor(loX / double(chunkShape[2]))));
-    region.maxIx = std::min(int(std::ceil(hiX / double(chunkShape[2]))),
-                            int((shape[2] - 1) / chunkShape[2]));
-    region.minIy = std::max(0, int(std::floor(loY / double(chunkShape[1]))));
-    region.maxIy = std::min(int(std::ceil(hiY / double(chunkShape[1]))),
-                            int((shape[1] - 1) / chunkShape[1]));
-    region.minIz = std::max(0, int(std::floor(loZ / double(chunkShape[0]))));
-    region.maxIz = std::min(int(std::ceil(hiZ / double(chunkShape[0]))),
-                            int((shape[0] - 1) / chunkShape[0]));
-    return region;
 }
 
 static std::string loadCachedRemoteUrl(const std::filesystem::path& volumePath)
@@ -526,7 +447,8 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
     const std::vector<float>& accumOffsets,
     bool isComposite,
     int compositeStart,
-    int compositeEnd)
+    int compositeEnd,
+    vc::Sampling method)
 {
     std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> uniq;
     std::vector<float> offsets = isComposite
@@ -552,13 +474,7 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
         cv::Mat_<cv::Vec3f> base, dirs;
         prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
 
-        auto region = computeChunkRegionForSamples(base, dirs, offsets, ds, level);
-        if (region.valid()) {
-            for (int iz = region.minIz; iz <= region.maxIz; iz++)
-                for (int iy = region.minIy; iy <= region.maxIy; iy++)
-                    for (int ix = region.minIx; ix <= region.maxIx; ix++)
-                        uniq.insert(vc::render::ChunkKey{level, iz, iy, ix});
-        }
+        vc::render::prefetch::insertExactChunksForSamples(base, dirs, offsets, ds, level, method, uniq);
 
         auto now = std::chrono::steady_clock::now();
         double since = std::chrono::duration<double>(now - lastPrint).count();
@@ -682,7 +598,7 @@ static void renderBands(
                 readCompositeFast(compOut, cache, level, base, dirs,
                                   float(sliceStep),
                                   compositeStart, compositeEnd,
-                                  compositeParams);
+                                  compositeParams, vc::render::prefetch::samplingForRender(true));
             }
             cv::Mat s = compOut;
             rotateFlipIfNeeded(s, rotQuad, flipAxis);
@@ -891,7 +807,7 @@ static void renderTiles(
                     readCompositeFast(compOut, cache, level, base, dirs,
                                       float(sliceStep),
                                       compositeStart, compositeEnd,
-                                      compositeParams);
+                                      compositeParams, vc::render::prefetch::samplingForRender(true));
                     raw.resize(1);
                     raw[0] = compOut;
                 }
@@ -1104,8 +1020,8 @@ int main(int argc, char *argv[])
         ("help,h", "Show this help message")
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
         ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
-        ("prefetch-remote", po::bool_switch()->default_value(false), "Prefetch required remote chunks into the existing staged cache before rendering")
-        ("remote-url", po::value<std::string>(), "Remote OME-Zarr URL for remote cache streaming/prefetch (optional if --volume cache already records it)")
+        ("prefetch-remote", po::bool_switch()->default_value(false), "Prefetch the chunks this render reads into the shared remote cache before rendering")
+        ("remote-url", po::value<std::string>(), "Remote OME-Zarr URL for remote cache streaming/prefetch; fetched chunks persist under the shared remote cache root (optional if --volume cache already records it)")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
         ("timeout", po::value<int>()->default_value(0), "Kill process if not finished within N minutes")
         ("num-slices,n", po::value<int>()->default_value(1), "Number of slices to render")
@@ -1384,15 +1300,23 @@ int main(int argc, char *argv[])
 
     const size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
     std::unique_ptr<vc::render::ChunkCache> ownedChunkCache;
+    std::shared_ptr<Volume> remoteVolume;
+    std::shared_ptr<vc::render::ChunkCache> remoteCache;
     vc::render::IChunkedArray* chunk_cache = nullptr;
 
     if (useRemoteCache) {
         try {
             vc::HttpAuth remoteAuth = vc::HttpAuth::from_env();
-            ownedChunkCache = vc::render::createChunkCache(
-                vc::render::openHttpZarrPyramid(remoteUrl, remoteAuth),
+            // Open through Volume so the renderer shares VC3D's remote cache:
+            // the globally configured cache root, the URL-derived source
+            // identity and the process-wide cache service, with fetched chunks
+            // persisted. Opening the pyramid directly rebuilt a private cache
+            // each run and re-downloaded the whole ROI.
+            remoteVolume = Volume::NewFromUrl(remoteUrl, remoteAuth);
+            vc::render::processChunkCacheService()->configureDecodedByteCapacity(
                 cache_bytes);
-            chunk_cache = ownedChunkCache.get();
+            remoteCache = remoteVolume->sharedChunkCache();
+            chunk_cache = remoteCache.get();
             if (!chunkLevelPresent(*chunk_cache, cacheLevel)) {
                 logPrintf(stderr,
                           "Error: group index %d not available in remote zarr (present levels: %s)\n",
@@ -1740,6 +1664,7 @@ int main(int argc, char *argv[])
             }
         }
 
+        bool exactPrefetchComplete = false;
         if (prefetchRemote) {
             constexpr uint32_t kPrefetchBandH = 128;
             uint32_t rowStart = 0;
@@ -1767,7 +1692,8 @@ int main(int argc, char *argv[])
                 hasAffine, affineTransform,
                 rowStart, rowEnd, kPrefetchBandH,
                 num_slices, slice_step, accumOffsets,
-                isCompositeMode, compositeStart, compositeEnd);
+                isCompositeMode, compositeStart, compositeEnd,
+                vc::render::prefetch::samplingForRender(isCompositeMode));
 
             logPrintf(stdout, "Prefetch: %zu chunk(s) across rows %u..%u\n",
                       prefetchKeys.size(),
@@ -1776,14 +1702,18 @@ int main(int argc, char *argv[])
             if (!prefetchChunkKeys(chunk_cache, prefetchKeys)) {
                 return false;
             }
+            exactPrefetchComplete = true;
         }
 
         // ---- Render pass ----
         {
+            vc::render::prefetch::PrefetchedArrayView prefetchedView(*chunk_cache);
+            auto* renderingCache = exactPrefetchComplete
+                ? static_cast<vc::render::IChunkedArray*>(&prefetchedView) : chunk_cache;
             if (wantZarr) {
                 // Tile-based: OMP-parallel over output zarr chunks
                 if (useU16)
-                    renderTiles<uint16_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
+                    renderTiles<uint16_t>(surf.get(), chunk_cache, renderingCache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
@@ -1793,7 +1723,7 @@ int main(int argc, char *argv[])
                         tifWriters.empty() ? nullptr : &tifWriters, tiffTileH, quickTif,
                         resumeFlag);
                 else
-                    renderTiles<uint8_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
+                    renderTiles<uint8_t>(surf.get(), chunk_cache, renderingCache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
@@ -1825,13 +1755,13 @@ int main(int argc, char *argv[])
                 };
 
                 if (useU16)
-                    renderBands<uint16_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
+                    renderBands<uint16_t>(surf.get(), chunk_cache, renderingCache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                         compositeParams, rotQuad, flip_axis, numParts, partId, cvType, bandH, writerFn);
                 else
-                    renderBands<uint8_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
+                    renderBands<uint8_t>(surf.get(), chunk_cache, renderingCache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
@@ -1866,6 +1796,12 @@ int main(int argc, char *argv[])
 
     if (!process_one(seg_path))
         return EXIT_FAILURE;
+
+    // Band prefetch can outlive the final sampled pixel. Let its downloads and
+    // cache writes finish before the cache is destroyed and invalidates them.
+    if (useRemoteCache && remoteCache &&
+        remoteCache->stats().persistentCacheEnabled)
+        remoteCache->waitForPendingChunks();
 
     return EXIT_SUCCESS;
 }
