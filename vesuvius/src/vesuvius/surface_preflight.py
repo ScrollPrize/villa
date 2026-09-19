@@ -215,7 +215,7 @@ def _scan_surface(
     y: np.ndarray,
     z: np.ndarray,
     mask: np.ndarray | None,
-    volume_shape: Sequence[int],
+    volume_shape: Sequence[int] | None,
     *,
     margin: float,
     block_rows: int,
@@ -228,10 +228,12 @@ def _scan_surface(
     minima = np.full(3, np.inf, dtype=np.float64)
     maxima = np.full(3, -np.inf, dtype=np.float64)
     previous_valid: np.ndarray | None = None
-    limits_xyz = np.asarray(
-        [volume_shape[2] - 1, volume_shape[1] - 1, volume_shape[0] - 1],
-        dtype=np.float64,
-    )
+    limits_xyz = None
+    if volume_shape is not None:
+        limits_xyz = np.asarray(
+            [volume_shape[2] - 1, volume_shape[1] - 1, volume_shape[0] - 1],
+            dtype=np.float64,
+        )
 
     for start, stop in _iter_blocks(height, block_rows):
         xb = np.asarray(x[start:stop])
@@ -251,12 +253,13 @@ def _scan_surface(
             for axis, values in enumerate(coordinates):
                 minima[axis] = min(minima[axis], float(np.min(values[valid])))
                 maxima[axis] = max(maxima[axis], float(np.max(values[valid])))
-            out_of_bounds = valid.copy()
-            for axis, values in enumerate(coordinates):
-                out_of_bounds &= (
-                    (values >= margin) & (values <= limits_xyz[axis] - margin)
-                )
-            out_of_bounds_count += int(np.count_nonzero(valid & ~out_of_bounds))
+            if limits_xyz is not None:
+                out_of_bounds = valid.copy()
+                for axis, values in enumerate(coordinates):
+                    out_of_bounds &= (
+                        (values >= margin) & (values <= limits_xyz[axis] - margin)
+                    )
+                out_of_bounds_count += int(np.count_nonzero(valid & ~out_of_bounds))
 
         if previous_valid is not None and valid.shape[0]:
             bridge = (
@@ -289,7 +292,9 @@ def _scan_surface(
         "valid_vertex_count": valid_count,
         "valid_quad_count": valid_quad_count,
         "selected_nonfinite_count": selected_nonfinite_count,
-        "out_of_bounds_count": out_of_bounds_count,
+        "out_of_bounds_count": (
+            out_of_bounds_count if volume_shape is not None else None
+        ),
         "coordinate_bounds_xyz": bounds,
     }
 
@@ -381,7 +386,7 @@ def _sample_volume_support(
 
 def inspect_pair(
     surface: Path | str,
-    volume: str,
+    volume: str | None = None,
     *,
     array_key: str | None = None,
     margin: float = 0.0,
@@ -397,7 +402,11 @@ def inspect_pair(
         "schema_version": SCHEMA_VERSION,
         "status": "FAIL",
         "surface": {"path": str(surface_path)},
-        "volume": {"path": volume, "requested_array_key": array_key},
+        "volume": (
+            {"path": volume, "requested_array_key": array_key}
+            if volume is not None
+            else None
+        ),
         "configuration": {
             "margin_voxels": margin,
             "max_support_samples": max_samples,
@@ -507,32 +516,37 @@ def inspect_pair(
             if not mask_matches:
                 return _finalize_report(report)
 
-        array, resolved_key = _open_volume(volume, array_key)
-        volume_shape = tuple(int(item) for item in array.shape)
-        volume_is_3d = len(volume_shape) == 3 and all(item > 0 for item in volume_shape)
-        report["volume"].update(
-            {
-                "resolved_array_key": resolved_key,
-                "shape_zyx": list(volume_shape),
-                "dtype": str(array.dtype),
-                "chunks_zyx": list(getattr(array, "chunks", None) or volume_shape),
-            }
-        )
-        gates.append(
-            _gate(
-                "volume_is_3d",
-                volume_is_3d,
-                observed=list(volume_shape),
-                threshold="positive z/y/x shape",
-                message=(
-                    "volume is a 3D z/y/x array"
-                    if volume_is_3d
-                    else "volume must be a 3D z/y/x array"
-                ),
+        array = None
+        volume_shape = None
+        if volume is not None:
+            array, resolved_key = _open_volume(volume, array_key)
+            volume_shape = tuple(int(item) for item in array.shape)
+            volume_is_3d = len(volume_shape) == 3 and all(
+                item > 0 for item in volume_shape
             )
-        )
-        if not volume_is_3d:
-            return _finalize_report(report)
+            report["volume"].update(
+                {
+                    "resolved_array_key": resolved_key,
+                    "shape_zyx": list(volume_shape),
+                    "dtype": str(array.dtype),
+                    "chunks_zyx": list(getattr(array, "chunks", None) or volume_shape),
+                }
+            )
+            gates.append(
+                _gate(
+                    "volume_is_3d",
+                    volume_is_3d,
+                    observed=list(volume_shape),
+                    threshold="positive z/y/x shape",
+                    message=(
+                        "volume is a 3D z/y/x array"
+                        if volume_is_3d
+                        else "volume must be a 3D z/y/x array"
+                    ),
+                )
+            )
+            if not volume_is_3d:
+                return _finalize_report(report)
 
         scan = _scan_surface(
             x,
@@ -554,7 +568,10 @@ def inspect_pair(
                     message=(
                         "surface has valid vertices"
                         if scan["valid_vertex_count"]
-                        else "surface has no valid vertices"
+                        else (
+                            "surface has no valid vertices (all coordinates are "
+                            "sentinel/invalid); the producer emitted an empty grid"
+                        )
                     ),
                 ),
                 _gate(
@@ -579,6 +596,10 @@ def inspect_pair(
                         else "selected coordinates include non-finite values"
                     ),
                 ),
+            ]
+        )
+        if volume is not None:
+            gates.append(
                 _gate(
                     "coordinates_within_volume",
                     scan["out_of_bounds_count"] == 0,
@@ -589,41 +610,40 @@ def inspect_pair(
                         if scan["out_of_bounds_count"] == 0
                         else "valid coordinates fall outside the volume margin"
                     ),
-                ),
-            ]
-        )
-
-        points = _sample_points(
-            x,
-            y,
-            z,
-            mask,
-            valid_count=scan["valid_vertex_count"],
-            max_samples=max_samples,
-            block_rows=block_rows,
-        )
-        support = _sample_volume_support(array, points, threshold=support_threshold)
-        report["volume"]["sampled_signal_support"] = support
-        support_passed = (
-            support["sample_count"] > 0
-            and support["support_fraction"] >= minimum_support_fraction
-        )
-        gates.append(
-            _gate(
-                "sampled_volume_signal_support",
-                support_passed,
-                observed=support,
-                threshold={
-                    "minimum_support_fraction": minimum_support_fraction,
-                    "absolute_signal_greater_than": support_threshold,
-                },
-                message=(
-                    "sampled surface points have CT signal support"
-                    if support_passed
-                    else "sampled surface points lack sufficient CT signal support"
-                ),
+                )
             )
-        )
+
+            points = _sample_points(
+                x,
+                y,
+                z,
+                mask,
+                valid_count=scan["valid_vertex_count"],
+                max_samples=max_samples,
+                block_rows=block_rows,
+            )
+            support = _sample_volume_support(array, points, threshold=support_threshold)
+            report["volume"]["sampled_signal_support"] = support
+            support_passed = (
+                support["sample_count"] > 0
+                and support["support_fraction"] >= minimum_support_fraction
+            )
+            gates.append(
+                _gate(
+                    "sampled_volume_signal_support",
+                    support_passed,
+                    observed=support,
+                    threshold={
+                        "minimum_support_fraction": minimum_support_fraction,
+                        "absolute_signal_greater_than": support_threshold,
+                    },
+                    message=(
+                        "sampled surface points have CT signal support"
+                        if support_passed
+                        else "sampled surface points lack sufficient CT signal support"
+                    ),
+                )
+            )
     except Exception as exc:
         gates.append(
             _gate(
@@ -654,10 +674,16 @@ def _atomic_write_json(path: Path, report: Mapping[str, Any]) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fail closed when a TIFXYZ surface is not safely paired with its CT volume."
+        description=(
+            "Fail closed when a TIFXYZ surface is structurally unusable or not "
+            "safely paired with its CT volume."
+        )
     )
     parser.add_argument("--surface", required=True, type=Path, help="TIFXYZ directory")
-    parser.add_argument("--volume", required=True, help="Zarr/OME-Zarr path or URI")
+    parser.add_argument(
+        "--volume",
+        help="Zarr/OME-Zarr path or URI; omit to validate the surface alone",
+    )
     parser.add_argument(
         "--array-key",
         help="base-resolution OME-Zarr array key; defaults to the base level",
@@ -705,10 +731,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if args.output:
         _atomic_write_json(args.output, report)
-        print(f"{report['status']}: {args.output}", file=sys.stderr)
     else:
         json.dump(report, sys.stdout, indent=2, sort_keys=True, default=_json_scalar)
         sys.stdout.write("\n")
+    if report["status"] == "FAIL":
+        if args.output:
+            print(f"FAIL: {args.output}", file=sys.stderr)
+        for gate in report["gates"]:
+            if not gate["passed"]:
+                print(f"{gate['name']}: {gate['message']}", file=sys.stderr)
     return 0 if report["status"] == "PASS" else 2
 
 
