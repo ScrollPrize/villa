@@ -1923,7 +1923,7 @@ def iter_phase_bundle_losses(
     if weights['dense_attachment'] > 0 and sdt_volume is not None:
         attachment_loss, attachment_metrics = get_dense_attachment_loss(
             slice_to_spiral_transform, dr_per_winding, sdt_volume,
-            outer_winding_idx, cfg, z_begin, z_end)
+            outer_winding_idx, cfg, z_begin, z_end, generator=generator)
         yield 'dense_attachment', attachment_loss, attachment_metrics
 
 
@@ -1970,7 +1970,7 @@ def get_min_spacing_loss(
 
 def get_dense_attachment_loss(
     slice_to_spiral_transform, dr_per_winding, sdt_volume, outer_winding_idx,
-    cfg, z_begin, z_end,
+    cfg, z_begin, z_end, *, generator=None,
 ):
     """smooth_l1(relu(sd) / attachment_scale) at dense points on fitted winding
     surfaces. Zero on or inside the predicted mask, smooth-L1 growth outside,
@@ -1990,9 +1990,12 @@ def get_dense_attachment_loss(
         return zero, {}
 
     winding_idx = _sample_windings_by_circumference(
-        inner_winding, float(outer_winding), num_points, device)
-    theta = torch.rand(num_points, device=device) * (2 * np.pi)
-    z = torch.empty(num_points, device=device).uniform_(float(z_begin), float(z_end - 1))
+        inner_winding, float(outer_winding), num_points, device,
+        generator=generator)
+    theta = torch.rand(
+        num_points, device=device, generator=generator) * (2 * np.pi)
+    z = torch.empty(num_points, device=device).uniform_(
+        float(z_begin), float(z_end - 1), generator=generator)
     radius = (winding_idx + theta / (2 * np.pi)) * dr_per_winding.detach()
     spiral_zyx = torch.stack(
         [z, torch.sin(theta) * radius, torch.cos(theta) * radius], dim=-1)
