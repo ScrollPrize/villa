@@ -395,6 +395,13 @@ jobs:
         working-directory: volume-cartographer
         timeout-minutes: 2
         run: python3 core/test/test_render_tifxyz_logging.py build/ci-fast-cli/bin/vc_render_tifxyz
+      - name: Test renderer exit code on remote fetch failure
+        working-directory: volume-cartographer
+        timeout-minutes: 5
+        run: |
+          python3 -m venv build/ci-fast-cli/pytest-env
+          build/ci-fast-cli/pytest-env/bin/pip install --quiet numpy tifffile
+          build/ci-fast-cli/pytest-env/bin/python core/test/test_render_fetch_failure.py build/ci-fast-cli/bin/vc_render_tifxyz
 
   flatboi-compile:
     name: Linux Flatboi/PaStiX compile coverage (Clang QuickBuild)
