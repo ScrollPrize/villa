@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import warnings
 from typing import Iterable, Mapping
 
 from vesuvius.ink_detection.config import InkDataConfig
@@ -57,7 +58,6 @@ def patch_cache_path(config: InkDataConfig) -> Path:
 def save_patch_cache(path: str | Path, patches: Iterable[Patch]) -> None:
     """Write the complete patch identity needed to reject stale caches."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     records = []
     for patch in patches:
         segment = patch.segment
@@ -84,6 +84,11 @@ def save_patch_cache(path: str | Path, patches: Iterable[Patch]) -> None:
                 "bbox": list(patch.bbox),
             }
         )
+    if not records:
+        # An empty index means discovery found nothing; writing it would make the
+        # next run read the failure back as a valid cache.
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as stream:
         json.dump(records, stream)
 
@@ -99,6 +104,14 @@ def load_patch_cache(
         records = json.load(stream)
     if not isinstance(records, list):
         raise ValueError(f"patch cache {path} must contain a JSON array")
+    if not records:
+        warnings.warn(
+            f"Discarding empty patch cache {path}; an empty index records a failed "
+            "discovery run, not a dataset without patches",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
     segments_by_key = {segment.cache_key: segment for segment in segments}
     expected_token = patch_finding_cache_token(config)
     patches: list[Patch] = []

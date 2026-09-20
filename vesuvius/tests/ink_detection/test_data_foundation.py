@@ -838,3 +838,20 @@ def test_segment_gathering_stays_silent_when_every_segment_has_a_grid(tmp_path):
 
     assert [segment.segment_name for segment in segments] == ["segment-with-grid"]
 
+
+def test_empty_patch_cache_is_not_written_and_not_trusted(tmp_path):
+    config = _config(tmp_path)
+    segment = replace(
+        _segment(config, tmp_path),
+        inklabels=tmp_path / "ink.zarr",
+        supervision_mask=tmp_path / "supervision.zarr",
+        validation_mask=tmp_path / "validation.zarr",
+    )
+    path = tmp_path / "patches.json"
+
+    save_patch_cache(path, [])
+    assert not path.exists()
+
+    path.write_text("[]", encoding="utf-8")
+    with pytest.warns(RuntimeWarning, match="empty"):
+        assert load_patch_cache(path, config=config, segments=[segment]) is None
