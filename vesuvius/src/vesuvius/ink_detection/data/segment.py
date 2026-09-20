@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import warnings
 
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.types import Segment
@@ -125,6 +126,7 @@ def discover_segment_labels(
 def gather_segments(config: InkDataConfig) -> tuple[Segment, ...]:
     """Discover usable segment representations in stable directory-name order."""
     segments: list[Segment] = []
+    skipped_without_grid: list[Path] = []
     native_mode = config.mode in {"full_3d", "full_3d_single_wrap"}
     for dataset_idx, source in enumerate(config.active_datasets):
         allowlist = set(source.segment_names)
@@ -139,6 +141,7 @@ def gather_segments(config: InkDataConfig) -> tuple[Segment, ...]:
             if (native_mode or not explicit_surface) and not any(
                 segment_dir.rglob("x.tif")
             ):
+                skipped_without_grid.append(segment_dir)
                 continue
             relpath = segment_dir.relative_to(source.segments_path).as_posix()
             if native_mode:
@@ -201,4 +204,13 @@ def gather_segments(config: InkDataConfig) -> tuple[Segment, ...]:
                         f"{segment_dir.name} is missing required image, supervision, or labels"
                     )
             segments.append(segment)
+    if skipped_without_grid:
+        noun = "directory" if len(skipped_without_grid) == 1 else "directories"
+        listed = ", ".join(str(path) for path in skipped_without_grid)
+        warnings.warn(
+            f"Skipped {len(skipped_without_grid)} segment {noun} without a tifxyz "
+            f"surface grid (no x.tif below the segment directory): {listed}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return tuple(segments)
