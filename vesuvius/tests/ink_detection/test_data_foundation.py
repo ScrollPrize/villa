@@ -790,3 +790,68 @@ def test_full_3d_merges_intersecting_segment_supervision(tmp_path, monkeypatch):
     expected_labels[1, 2, 2] = 1
     np.testing.assert_array_equal(supervision, expected_supervision)
     np.testing.assert_array_equal(labels, expected_labels)
+
+
+def _flat_segment_dir(root: Path, name: str, *, with_surface_grid: bool) -> Path:
+    segment_dir = root / name
+    segment_dir.mkdir(parents=True)
+    if with_surface_grid:
+        (segment_dir / "x.tif").touch()
+    (segment_dir / f"{name}.zarr").mkdir()
+    (segment_dir / f"{name}_inklabels.zarr").mkdir()
+    (segment_dir / f"{name}_supervision_mask.zarr").mkdir()
+    return segment_dir
+
+
+def test_segment_gathering_warns_about_segments_without_surface_grid(tmp_path):
+    root = tmp_path / "segments"
+    _flat_segment_dir(root, "segment-with-grid", with_surface_grid=True)
+    _flat_segment_dir(root, "segment-without-grid", with_surface_grid=False)
+    config = _config(
+        tmp_path,
+        datasets=[{"segments_path": str(root), "volume_scale": 0}],
+    )
+
+    with pytest.warns(RuntimeWarning) as caught:
+        segments = gather_segments(config)
+
+    assert [segment.segment_name for segment in segments] == ["segment-with-grid"]
+    messages = [str(record.message) for record in caught]
+    assert any(
+        str(root / "segment-without-grid") in message and "x.tif" in message
+        for message in messages
+    ), messages
+    assert any("1 segment" in message for message in messages), messages
+
+
+def test_segment_gathering_stays_silent_when_every_segment_has_a_grid(tmp_path):
+    root = tmp_path / "segments"
+    _flat_segment_dir(root, "segment-with-grid", with_surface_grid=True)
+    config = _config(
+        tmp_path,
+        datasets=[{"segments_path": str(root), "volume_scale": 0}],
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        segments = gather_segments(config)
+
+    assert [segment.segment_name for segment in segments] == ["segment-with-grid"]
+
+
+def test_empty_patch_cache_is_not_written_and_not_trusted(tmp_path):
+    config = _config(tmp_path)
+    segment = replace(
+        _segment(config, tmp_path),
+        inklabels=tmp_path / "ink.zarr",
+        supervision_mask=tmp_path / "supervision.zarr",
+        validation_mask=tmp_path / "validation.zarr",
+    )
+    path = tmp_path / "patches.json"
+
+    save_patch_cache(path, [])
+    assert not path.exists()
+
+    path.write_text("[]", encoding="utf-8")
+    with pytest.warns(RuntimeWarning, match="empty"):
+        assert load_patch_cache(path, config=config, segments=[segment]) is None
