@@ -305,6 +305,7 @@ def test_default_labeled_and_unlabeled_patch_origins(tmp_path):
     labels[1, 1, 1] = 1
     supervision = np.zeros_like(image)
     supervision[1, 1, 1] = 1
+    supervision[1, 1, 0] = 1  # some ink-free background in the training patch
     supervision[1, 4, 4] = 1
     validation = np.zeros_like(image)
     validation[1, 4, 4] = 1
@@ -351,6 +352,37 @@ def test_default_labeled_and_unlabeled_patch_origins(tmp_path):
         (0, 4, 2, 3, 6, 4),
     ]
     assert held_out == []
+
+
+def test_training_composition_warns_when_patches_have_no_background(tmp_path):
+    config = _config(tmp_path, patch_size=[3, 2, 2], patch_overlap=1.0)
+    segment = replace(
+        _segment(config, tmp_path, image_volume="image"),
+        inklabels=Path("labels"),
+        supervision_mask=Path("supervision"),
+    )
+    image = np.zeros((3, 6, 6), dtype=np.uint8)
+    image[1] = 1
+    labels = np.zeros_like(image)
+    labels[1, :2, :2] = 1
+    # Supervision only where there is ink: the patch is kept, but every voxel
+    # the loss sees is ink, so the model never learns what background is.
+    volumes = {"image": image, "labels": labels, "supervision": labels.copy()}
+    opener = lambda path, resolution: volumes[str(path)]
+    with pytest.warns(RuntimeWarning, match="no background"):
+        training, _ = find_segment_patches(segment, opener)
+    assert [patch.bbox for patch in training] == [(0, 0, 0, 3, 2, 2)]
+
+    # The same patch with ink-free papyrus in its supervision: no warning.
+    supervision = np.zeros_like(image)
+    supervision[1, :2, :2] = 1
+    labels = np.zeros_like(image)
+    labels[1, 0, 0] = 1
+    volumes = {"image": image, "labels": labels, "supervision": supervision}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        training, _ = find_segment_patches(segment, opener)
+    assert [patch.bbox for patch in training] == [(0, 0, 0, 3, 2, 2)]
 
 
 def test_v6_patch_cache_round_trip_and_stale_rejection(tmp_path):
