@@ -5,6 +5,8 @@
 #   ci.sh                                                  # all (default for dev/EC2)
 #   ci.sh all                                              # full matrix + coverage
 #   ci.sh builder <image>                                  # build a builder docker image
+#   ci.sh publish <image>                                  # publish dependency builder image
+#   ci.sh publish-runtime <image>                          # build, smoke, and publish runtime image
 #   ci.sh test <image> <compiler> <preset>                 # configure + build + test
 #   ci.sh coverage [image]                                 # coverage report (in volume-cartographer/coverage/)
 #   ci.sh patch-coverage <base_ref> [image]                # diff-cover gate vs base_ref
@@ -180,15 +182,109 @@ cmd_publish() {
     dockerfile="$(dockerfile_for "$image")"
     local repo="ghcr.io/$owner/villa/volume-cartographer"
     local sha=${GITHUB_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo local)}
+    local builder_tag="$repo:builder-$image"
+    local want_hash
+    want_hash="$(builder_deps_hash "$image")"
+
+    # Source-only changes should refresh the runtime image without rebuilding
+    # an identical dependency builder. Reuse the published builder when its
+    # dependency fingerprint matches this checkout.
+    if docker pull "$builder_tag" >/dev/null 2>&1; then
+        local published_hash
+        published_hash="$(docker image inspect "$builder_tag" \
+            --format '{{ index .Config.Labels "vc-builder-deps-hash" }}' \
+            2>/dev/null || true)"
+        if [[ "$published_hash" == "$want_hash" ]]; then
+            echo "ci.sh: $builder_tag already matches deps-hash $want_hash; skipping builder publish"
+            return 0
+        fi
+    fi
 
     docker buildx build \
         --target builder \
-        --tag "$repo:builder-$image" \
+        --tag "$builder_tag" \
         --tag "$repo:builder-$image-$sha" \
-        --label "vc-builder-deps-hash=$(builder_deps_hash "$image")" \
+        --label "vc-builder-deps-hash=$want_hash" \
         --file "$dockerfile" \
         --push \
         .
+}
+
+runtime_image_smoke() {
+    local image_ref=$1
+    docker run --rm --entrypoint bash "$image_ref" -c '
+        set -euo pipefail
+
+        for tool in vc_obj_uv_lift vc_tifxyz2obj; do
+            path="/usr/local/bin/$tool"
+            if [[ ! -x "$path" ]]; then
+                echo "runtime smoke: missing executable $path" >&2
+                exit 1
+            fi
+            if ldd "$path" | grep -Fq "not found"; then
+                echo "runtime smoke: unresolved shared library for $tool" >&2
+                ldd "$path" >&2
+                exit 1
+            fi
+        done
+
+        help="$(/usr/local/bin/vc_tifxyz2obj --help 2>&1)"
+        if ! grep -Fq -- "--keep=<p>" <<<"$help"; then
+            echo "runtime smoke: vc_tifxyz2obj lacks --keep" >&2
+            exit 1
+        fi
+
+        set +e
+        uv_usage="$(/usr/local/bin/vc_obj_uv_lift 2>&1)"
+        uv_rc=$?
+        set -e
+        if [[ $uv_rc -ne 1 ]] || ! grep -Fq "Usage:" <<<"$uv_usage"; then
+            echo "runtime smoke: vc_obj_uv_lift did not execute its usage path" >&2
+            printf "%s\n" "$uv_usage" >&2
+            exit 1
+        fi
+    '
+}
+
+cmd_publish_runtime() {
+    local image=$1
+    local owner
+    owner=$(echo "${VC_BUILDER_REGISTRY_OWNER:-${GITHUB_REPOSITORY_OWNER:-scrollprize}}" | tr 'A-Z' 'a-z')
+    local dockerfile
+    dockerfile="$(dockerfile_for "$image")"
+    local repo="ghcr.io/$owner/villa/volume-cartographer"
+    local sha=${GITHUB_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo local)}
+    local local_tag="vc-runtime:$image-$sha"
+
+    local cache_args=()
+    if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+        cache_args+=(
+            --cache-from "type=gha,scope=vc-runtime-$image"
+            --cache-to "type=gha,mode=max,scope=vc-runtime-$image"
+        )
+    fi
+
+    # Build locally first. No rolling tag is pushed until the image itself
+    # proves that the two interfaces required by render_ink.py are present,
+    # loadable, and current.
+    docker buildx build \
+        --target runtime \
+        --tag "$local_tag" \
+        --label "org.opencontainers.image.revision=$sha" \
+        --file "$dockerfile" \
+        --load \
+        "${cache_args[@]}" \
+        .
+
+    runtime_image_smoke "$local_tag"
+
+    local tags=(edge main "sha-$sha")
+    for tag in "${tags[@]}"; do
+        docker tag "$local_tag" "$repo:$tag"
+    done
+    for tag in "${tags[@]}"; do
+        docker push "$repo:$tag"
+    done
 }
 
 cmd_test() {
@@ -353,11 +449,13 @@ case "${1:-all}" in
     coverage-regression)  shift; cmd_coverage_regression "$@" ;;
     dead-code)            shift; cmd_dead_code "$@" ;;
     publish)              shift; cmd_publish "$@" ;;
+    publish-runtime)      shift; cmd_publish_runtime "$@" ;;
     *)
         cat >&2 <<EOF
 Usage: $0 [all
           | builder <image>
           | publish <image>
+          | publish-runtime <image>
           | test <image> <compiler> <preset>
           | compile <image> <compiler> <preset>
           | coverage [image]

@@ -1,21 +1,15 @@
-name: Publish builder images (ghcr.io)
+name: Publish VC3D images (ghcr.io)
 
-# Publishes the volume-cartographer CI builder image (Ubuntu base +
-# all apt deps) to ghcr.io so PR CI can `docker pull` it instead of
-# rebuilding from scratch each time. Triggered only when the relevant
-# Dockerfile / ci.sh / install_build_deps.sh changes land on main.
-#
-# Image:  ghcr.io/<owner>/villa/volume-cartographer
-# Tags:   builder-ubuntu-26.04 (plus a sha suffix for traceability)
+# Publishes both the reusable dependency builder and the user-facing
+# volume-cartographer runtime image. The runtime stage is rebuilt for every
+# VC source change, smoke-tested before publication, then advances :edge and
+# :main only after the required CLI interfaces are verified.
 
 on:
   push:
     branches: [main]
     paths:
-      - 'volume-cartographer/Dockerfile'
-      - 'volume-cartographer/.dockerignore'
-      - 'volume-cartographer/scripts/ci.sh'
-      - 'volume-cartographer/scripts/install_build_deps.sh'
+      - 'volume-cartographer/**'
       - '.github/workflows/vc3d-publish-ghcr.yml'
   workflow_dispatch:
 
@@ -25,9 +19,9 @@ permissions:
 
 jobs:
   publish:
-    name: Publish ${{ matrix.image }} builder
+    name: Publish ${{ matrix.image }} images
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 120
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.image }}
       cancel-in-progress: true
@@ -43,5 +37,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push builder image
+      - name: Publish dependency builder if its inputs changed
         run: volume-cartographer/scripts/ci.sh publish ${{ matrix.image }}
+      - name: Build, smoke, and publish runtime image
+        run: volume-cartographer/scripts/ci.sh publish-runtime ${{ matrix.image }}
