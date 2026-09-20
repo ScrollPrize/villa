@@ -203,6 +203,13 @@ To get from per-winding meshes to readable images, use `render_ink.py`. It group
 python render_ink.py /path/to/run/meshes/mesh --volume /path/to/ink_prediction.zarr
 ```
 
+If the fitted meshes and the ink volume use different voxel-coordinate frames, pass
+`--scale-segmentation FACTOR`. The option is forwarded directly to
+`vc_render_tifxyz`; for example, a mesh expressed in a frame four times coarser than
+the ink volume uses `--scale-segmentation 4`. The scale is not inferred automatically,
+so confirm it from the mesh and volume metadata instead of treating a black render as
+evidence that the surface contains no ink.
+
 You'll need a [VC3D build](segmentation#installation-instructions) on your `PATH` for the rendering and flattening binaries (`vc_render_tifxyz`, `flatboi`, …), and an ink-prediction zarr for the scroll. The output `ink/` folder fills with strips named by winding range (e.g. `w010-027.jpg`).
 
 #### Ink metrics
