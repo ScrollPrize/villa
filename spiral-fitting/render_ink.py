@@ -325,6 +325,24 @@ def max_composite(tif_paths):
     return composite
 
 
+def build_render_command(vc_render_bin, segmentation, scale, scale_segmentation,
+                         group_idx, volume, tif_output, num_slices, remote_url=''):
+    """Build the vc_render_tifxyz command used for one concatenated mesh."""
+    command = [
+        vc_render_bin,
+        '--segmentation', segmentation,
+        '--scale', str(scale),
+        '--scale-segmentation', str(scale_segmentation),
+        '--group-idx', str(group_idx),
+        '--volume', volume,
+        '--tif-output', tif_output,
+        '--num-slices', str(num_slices),
+    ]
+    if remote_url:
+        command += ['--remote-url', remote_url]
+    return command
+
+
 @click.command(help=__doc__)
 @click.argument('meshes_dir', type=click.Path(exists=True, file_okay=False))
 @click.option('--volume', required=True, help='Ink volume zarr path')
@@ -332,6 +350,7 @@ def max_composite(tif_paths):
 @click.option('--vc-render-bin', default='vc_render_tifxyz', show_default=True, help='Path to the vc_render_tifxyz binary')
 @click.option('--scale', type=float, default=0.25, show_default=True)
 @click.option('--group-idx', type=int, default=1, show_default=True)
+@click.option('--scale-segmentation', type=float, default=1.0, show_default=True, help='Scale segmentation coordinates before sampling the ink volume; passed through to vc_render_tifxyz when mesh and volume frames differ')
 @click.option('--num-slices', type=int, default=5, show_default=True)
 @click.option('--num-processes', '-j', type=int, default=1, show_default=True, help='Number of meshes to render (and flatten) concurrently')
 @click.option('--flatten/--no-flatten', default=True, show_default=True, help='SLIM-flatten each concatenated mesh before rendering')
@@ -357,7 +376,7 @@ def max_composite(tif_paths):
 @click.option('--lasagna-config', default='', help='Base lasagna flatten config json. Default: <lasagna-dir>/configs/flatten_fast_nofilter.json')
 @click.option('--lasagna-fit-script', default='', help='Lasagna fit entrypoint run for the full-scroll flatten. Default: _run_flatten_threaded.py if present, else fit.py')
 @click.option('--lasagna-device', default='cuda', show_default=True, help='--device passed to the lasagna flattener for the full-scroll flatten')
-def main(meshes_dir, volume, remote_url, vc_render_bin, scale, group_idx, num_slices, num_processes,
+def main(meshes_dir, volume, remote_url, vc_render_bin, scale, group_idx, scale_segmentation, num_slices, num_processes,
          flatten, flatboi_bin, tifxyz2obj_bin, obj2tifxyz_bin, uv_lift_bin, flatten_keep,
          flatten_iters, flatten_energy, flatten_tol, flatten_inpaint, pre_erode,
          keep_largest, flatboi_threads,
@@ -520,17 +539,10 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, group_idx, num_sl
     def render(name, concat_path):
         per_mesh_ink = os.path.join(concat_path, 'ink')
         os.makedirs(per_mesh_ink, exist_ok=True)
-        render_cmd = [
-            vc_render_bin,
-            '--segmentation', concat_path,
-            '--scale', str(scale),
-            '--group-idx', str(group_idx),
-            '--volume', volume,
-            '--tif-output', per_mesh_ink,
-            '--num-slices', str(num_slices),
-        ]
-        if remote_url:
-            render_cmd += ['--remote-url', remote_url]
+        render_cmd = build_render_command(
+            vc_render_bin, concat_path, scale, scale_segmentation, group_idx,
+            volume, per_mesh_ink, num_slices, remote_url,
+        )
         subprocess.run(render_cmd, check=True)
         tif_paths = sorted(glob.glob(os.path.join(per_mesh_ink, '*.tif')))
         if not tif_paths:
