@@ -21,6 +21,7 @@
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/Umbilicus.hpp"
+#include "vc/core/util/ScrollUmbilicus.hpp"
 #include "vc/tracer/CostFunctions.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 
@@ -1040,7 +1041,8 @@ static std::filesystem::path normalized_existing_path(const std::filesystem::pat
 static std::unique_ptr<TraceData::PatchNormalContext> load_patch_normal_context(
     const utils::Json& params,
     const std::array<int, 3>& volume_shape_zyx,
-    QuadSurface* resume_surf)
+    QuadSurface* resume_surf,
+    std::optional<double> voxelsize_um = std::nullopt)
 {
     std::string patches_path;
     for (const char* key : {"patch_normal_path", "patch_normal_dir", "patch_normals_path"}) {
@@ -1096,10 +1098,34 @@ static std::unique_ptr<TraceData::PatchNormalContext> load_patch_normal_context(
     ctx->index->rebuild(ctx->surfaces, 0.0f);
 
     if (params.contains("umbilicus_path") && params["umbilicus_path"].is_string()) {
+        // The tracing grid comes from volume.shape(level): authoritative, so
+        // a declared frame that does not fit it is refused rather than read
+        // as though it had declared nothing (which silently mis-orients the
+        // patch normals below).
+        const std::filesystem::path umbilicus_path =
+            params["umbilicus_path"].get_string();
         const cv::Vec3i volume_shape(volume_shape_zyx[0],
                                      volume_shape_zyx[1],
                                      volume_shape_zyx[2]);
-        ctx->umbilicus = Umbilicus::FromFile(params["umbilicus_path"].get_string(), volume_shape);
+        const std::array<double, 3> target_grid_xyz{
+            static_cast<double>(volume_shape_zyx[2]),
+            static_cast<double>(volume_shape_zyx[1]),
+            static_cast<double>(volume_shape_zyx[0])};
+        auto loaded = vc::core::util::loadUmbilicusWithFrameCheck(
+            umbilicus_path, target_grid_xyz, volume_shape,
+            vc::core::util::UmbilicusTargetGridAuthority::Authoritative,
+            voxelsize_um);
+        if (!loaded.warning.empty()) {
+            std::cerr << "Warning: " << loaded.warning << std::endl;
+        }
+        if (!loaded.scaleDescription.empty()) {
+            std::cout << "Umbilicus " << umbilicus_path.string() << ": "
+                      << loaded.scaleDescription << std::endl;
+        }
+        if (!loaded.error.empty()) {
+            throw std::runtime_error(loaded.error);
+        }
+        ctx->umbilicus = std::move(loaded.umbilicus);
         ctx->signed_normals = true;
     }
 
@@ -3344,7 +3370,12 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
     if (patch_normals_requested) {
         try {
-            trace_data.patch_normals = load_patch_normal_context(params, volume_shape_zyx, resume_surf);
+            // volume.voxelSize() is the level-0 um/voxel figure; each
+            // pyramid level doubles the voxel edge.
+            const double level_voxelsize_um =
+                static_cast<double>(voxelsize) * (1 << level);
+            trace_data.patch_normals = load_patch_normal_context(
+                params, volume_shape_zyx, resume_surf, level_voxelsize_um);
         } catch (const std::exception& e) {
             std::cerr << "Failed to load patch-normal constraints: " << e.what() << std::endl;
             trace_data.patch_normals.reset();

@@ -15,7 +15,9 @@
 #include <fstream>
 #include <memory>
 #include <random>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 using vc::core::util::deriveUmbilicusScale;
@@ -44,7 +46,7 @@ void writeUmbilicus(const fs::path& path, double voxelsizeUm)
       << R"({"x": 4, "y": 5, "z": 6, "score": 100}]})";
 }
 
-// Same file shape, but with a caller-supplied metadata body so malformed
+// Same file shape, but with caller-supplied metadata body so malformed
 // frame fields can be exercised.
 void writeUmbilicusWithMetadata(const fs::path& path, const std::string& metadata)
 {
@@ -52,6 +54,23 @@ void writeUmbilicusWithMetadata(const fs::path& path, const std::string& metadat
     f << R"({"metadata": {)" << metadata << R"(}, "control_points": [)"
       << R"({"x": 1, "y": 2, "z": 3, "score": 100},)"
       << R"({"x": 4, "y": 5, "z": 6, "score": 100}]})";
+}
+
+// Same file shape, but with caller-supplied control points so the
+// point-inference fallback in deriveUmbilicusScale() can be exercised.
+void writeUmbilicusWithPoints(const fs::path& path, const std::string& metadata,
+                              const std::vector<std::array<double, 3>>& points)
+{
+    std::ofstream f(path);
+    f << R"({"metadata": {)" << metadata << R"(}, "control_points": [)";
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        if (i != 0) {
+            f << ",";
+        }
+        f << R"({"x": )" << points[i][0] << R"(, "y": )" << points[i][1]
+          << R"(, "z": )" << points[i][2] << R"(, "score": 100})";
+    }
+    f << "]}";
 }
 
 // Keeps the project autosaves the resolver's fixtures trigger out of the
@@ -1012,4 +1031,209 @@ TEST_CASE("decideUmbilicusLoadAction: a contradicted stamp refuses outright")
     // Uncontradicted, the same inputs keep their previous outcomes.
     CHECK(decideUmbilicusLoadAction(viaVoxel, claimed, true, false) ==
           UmbilicusLoadAction::Apply);
+}
+
+TEST_CASE("loadUmbilicusWithFrameCheck: an unstamped file keeps the legacy reading")
+{
+    using vc::core::util::loadUmbilicusWithFrameCheck;
+    using vc::core::util::UmbilicusTargetGridAuthority;
+    const auto dir = tmpDir("frame_load_legacy");
+    const auto path = dir / "umbilicus.json";
+    writeUmbilicusWithMetadata(path, "\"total_points\": 2");
+
+    const auto loaded = loadUmbilicusWithFrameCheck(
+        path, {20.0, 40.0, 60.0}, cv::Vec3i{64, 64, 64},
+        UmbilicusTargetGridAuthority::Inferred);
+    CHECK(loaded.error.empty());
+    CHECK(loaded.warning.empty());
+    CHECK(loaded.scaleDescription.empty());
+    REQUIRE(loaded.umbilicus.has_value());
+    // Legacy reading: points used as-is, so z=4 interpolates a third of the
+    // way from (1,2,3) to (4,5,6).
+    const auto c = loaded.umbilicus->center_at(4);
+    CHECK(c[0] == doctest::Approx(2.0));
+    CHECK(c[1] == doctest::Approx(3.0));
+    CHECK(c[2] == doctest::Approx(4.0));
+}
+
+TEST_CASE("loadUmbilicusWithFrameCheck: malformed frame metadata is refused")
+{
+    using vc::core::util::loadUmbilicusWithFrameCheck;
+    using vc::core::util::UmbilicusTargetGridAuthority;
+    const auto dir = tmpDir("frame_load_malformed");
+    const auto path = dir / "umbilicus.json";
+    writeUmbilicusWithMetadata(
+        path,
+        "\"volume_width\": \"wide\", \"volume_height\": 40, \"volume_slices\": 60");
+
+    const auto loaded = loadUmbilicusWithFrameCheck(
+        path, {20.0, 40.0, 60.0}, cv::Vec3i{64, 64, 64},
+        UmbilicusTargetGridAuthority::Inferred);
+    CHECK_FALSE(loaded.umbilicus.has_value());
+    CHECK_FALSE(loaded.error.empty());
+    CHECK(loaded.error.find("volume_width") != std::string::npos);
+}
+
+TEST_CASE("loadUmbilicusWithFrameCheck: a stamped half-res frame is rescaled")
+{
+    using vc::core::util::loadUmbilicusWithFrameCheck;
+    using vc::core::util::UmbilicusTargetGridAuthority;
+    const auto dir = tmpDir("frame_load_apply");
+    const auto path = dir / "umbilicus.json";
+    writeUmbilicusWithMetadata(
+        path, "\"volume_width\": 10, \"volume_height\": 20, \"volume_slices\": 30");
+
+    // Stamped 10x20x30 against a 20x40x60 working grid: a uniform x2.
+    const auto loaded = loadUmbilicusWithFrameCheck(
+        path, {20.0, 40.0, 60.0}, cv::Vec3i{64, 64, 64},
+        UmbilicusTargetGridAuthority::Inferred);
+    CHECK(loaded.error.empty());
+    CHECK(loaded.warning.empty());
+    CHECK_FALSE(loaded.scaleDescription.empty());
+    REQUIRE(loaded.umbilicus.has_value());
+    // Points carried x2 into the working frame: (1,2,3)-(4,5,6) became
+    // (2,4,6)-(8,10,12), so z=9 interpolates to (5,7,9). The legacy reading
+    // would clamp z=9 past the (4,5,6) endpoint to (4,5,9).
+    const auto c = loaded.umbilicus->center_at(9);
+    CHECK(c[0] == doctest::Approx(5.0));
+    CHECK(c[1] == doctest::Approx(7.0));
+    CHECK(c[2] == doctest::Approx(9.0));
+}
+
+TEST_CASE("loadUmbilicusWithFrameCheck: an unconfirmable stamp warns and keeps the legacy reading")
+{
+    using vc::core::util::loadUmbilicusWithFrameCheck;
+    using vc::core::util::UmbilicusTargetGridAuthority;
+    const auto dir = tmpDir("frame_load_warn");
+    const auto path = dir / "umbilicus.json";
+    // 11x20x30 is no uniform rescale of the 20x40x60 working grid -- but the
+    // grid is inferred, so that proves nothing about the file.
+    writeUmbilicusWithMetadata(
+        path, "\"volume_width\": 11, \"volume_height\": 20, \"volume_slices\": 30");
+
+    const auto loaded = loadUmbilicusWithFrameCheck(
+        path, {20.0, 40.0, 60.0}, cv::Vec3i{64, 64, 64},
+        UmbilicusTargetGridAuthority::Inferred);
+    CHECK(loaded.error.empty());
+    CHECK_FALSE(loaded.warning.empty());
+    CHECK(loaded.scaleDescription.empty());
+    REQUIRE(loaded.umbilicus.has_value());
+    // Legacy reading kept: points as-is.
+    const auto c = loaded.umbilicus->center_at(4);
+    CHECK(c[0] == doctest::Approx(2.0));
+    CHECK(c[1] == doctest::Approx(3.0));
+    CHECK(c[2] == doctest::Approx(4.0));
+}
+
+TEST_CASE("loadUmbilicusWithFrameCheck: an unreadable file throws like FromFile")
+{
+    using vc::core::util::loadUmbilicusWithFrameCheck;
+    using vc::core::util::UmbilicusTargetGridAuthority;
+    CHECK_THROWS(loadUmbilicusWithFrameCheck(
+        tmpDir("frame_load_missing") / "no-such-file.json",
+        {20.0, 40.0, 60.0},
+        cv::Vec3i{64, 64, 64},
+        UmbilicusTargetGridAuthority::Inferred));
+}
+
+TEST_CASE("loadUmbilicusWithFrameCheck: an authoritative grid refuses an unfitting stamp")
+{
+    using vc::core::util::loadUmbilicusWithFrameCheck;
+    using vc::core::util::UmbilicusTargetGridAuthority;
+    const auto dir = tmpDir("frame_load_refuse");
+    const auto path = dir / "umbilicus.json";
+    // 11x20x30 is no uniform rescale of the authoritative 20x40x60 volume
+    // grid: the file is wrong about itself, so it is refused outright --
+    // the GrowPatch case, where a silent misread would mis-orient every
+    // patch normal.
+    writeUmbilicusWithMetadata(
+        path, "\"volume_width\": 11, \"volume_height\": 20, \"volume_slices\": 30");
+
+    const auto loaded = loadUmbilicusWithFrameCheck(
+        path, {20.0, 40.0, 60.0}, cv::Vec3i{60, 40, 20},
+        UmbilicusTargetGridAuthority::Authoritative);
+    CHECK_FALSE(loaded.umbilicus.has_value());
+    CHECK_FALSE(loaded.error.empty());
+    CHECK(loaded.error.find("refusing") != std::string::npos);
+    CHECK(loaded.warning.empty());
+}
+
+TEST_CASE("loadUmbilicusWithFrameCheck: an authoritative grid still rescales a fitting stamp")
+{
+    using vc::core::util::loadUmbilicusWithFrameCheck;
+    using vc::core::util::UmbilicusTargetGridAuthority;
+    const auto dir = tmpDir("frame_load_auth_apply");
+    const auto path = dir / "umbilicus.json";
+    writeUmbilicusWithMetadata(
+        path, "\"volume_width\": 10, \"volume_height\": 20, \"volume_slices\": 30");
+
+    // Stamped 10x20x30 against the authoritative 20x40x60 grid: uniform x2.
+    const auto loaded = loadUmbilicusWithFrameCheck(
+        path, {20.0, 40.0, 60.0}, cv::Vec3i{60, 40, 20},
+        UmbilicusTargetGridAuthority::Authoritative);
+    CHECK(loaded.error.empty());
+    CHECK(loaded.warning.empty());
+    CHECK_FALSE(loaded.scaleDescription.empty());
+    REQUIRE(loaded.umbilicus.has_value());
+    // Points carried x2 into the working frame, as in the inferred case.
+    const auto c = loaded.umbilicus->center_at(9);
+    CHECK(c[0] == doctest::Approx(5.0));
+    CHECK(c[1] == doctest::Approx(7.0));
+    CHECK(c[2] == doctest::Approx(9.0));
+}
+
+TEST_CASE("loadUmbilicusWithFrameCheck: a contradicted stamp is refused even when the points infer a scale")
+{
+    using vc::core::util::loadUmbilicusWithFrameCheck;
+    using vc::core::util::UmbilicusTargetGridAuthority;
+    const auto dir = tmpDir("frame_load_contradicted");
+    const auto path = dir / "umbilicus.json";
+    // 11x20x30 is no uniform rescale of the authoritative 20x40x60 grid, so
+    // the stamp is contradicted -- but the points fill the half grid well
+    // enough (z 4..26 over a 30-deep half grid) that the point-inference
+    // fallback would derive x2 on its own. The contradiction outranks the
+    // derived scale: a file wrong about itself is refused, not rescaled on
+    // a reading of points its own stamp disproves.
+    writeUmbilicusWithPoints(
+        path, "\"volume_width\": 11, \"volume_height\": 20, \"volume_slices\": 30",
+        {{1.0, 2.0, 4.0}, {9.0, 18.0, 26.0}});
+
+    const auto loaded = loadUmbilicusWithFrameCheck(
+        path, {20.0, 40.0, 60.0}, cv::Vec3i{60, 40, 20},
+        UmbilicusTargetGridAuthority::Authoritative);
+    CHECK_FALSE(loaded.umbilicus.has_value());
+    CHECK_FALSE(loaded.error.empty());
+    CHECK(loaded.error.find("refusing") != std::string::npos);
+    CHECK(loaded.warning.empty());
+    fs::remove_all(dir);
+}
+
+TEST_CASE("loadUmbilicusWithFrameCheck: a contradicted stamp warns under an inferred grid even when the points infer a scale")
+{
+    using vc::core::util::loadUmbilicusWithFrameCheck;
+    using vc::core::util::UmbilicusTargetGridAuthority;
+    const auto dir = tmpDir("frame_load_contradicted_inferred");
+    const auto path = dir / "umbilicus.json";
+    // Same contradicted stamp and inferable points as the authoritative
+    // case, but the grid is inferred: the mismatch proves nothing about
+    // the file, so it warns and keeps the legacy reading instead of
+    // applying the scale the points suggest.
+    writeUmbilicusWithPoints(
+        path, "\"volume_width\": 11, \"volume_height\": 20, \"volume_slices\": 30",
+        {{1.0, 2.0, 4.0}, {9.0, 18.0, 26.0}});
+
+    const auto loaded = loadUmbilicusWithFrameCheck(
+        path, {20.0, 40.0, 60.0}, cv::Vec3i{64, 64, 64},
+        UmbilicusTargetGridAuthority::Inferred);
+    CHECK(loaded.error.empty());
+    CHECK_FALSE(loaded.warning.empty());
+    CHECK(loaded.scaleDescription.empty());
+    REQUIRE(loaded.umbilicus.has_value());
+    // Legacy reading kept: points as-is, so z=15 interpolates halfway
+    // from (1,2,4) to (9,18,26). The x2 the points infer is not applied.
+    const auto c = loaded.umbilicus->center_at(15);
+    CHECK(c[0] == doctest::Approx(5.0));
+    CHECK(c[1] == doctest::Approx(10.0));
+    CHECK(c[2] == doctest::Approx(15.0));
+    fs::remove_all(dir);
 }

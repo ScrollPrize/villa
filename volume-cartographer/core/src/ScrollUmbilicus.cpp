@@ -508,4 +508,84 @@ UmbilicusLoadAction decideUmbilicusLoadAction(
     return UmbilicusLoadAction::UseLegacy;
 }
 
+UmbilicusFrameLoad loadUmbilicusWithFrameCheck(
+    const std::filesystem::path& path,
+    const std::array<double, 3>& targetGridXyz,
+    const cv::Vec3i& volumeShape,
+    UmbilicusTargetGridAuthority authority,
+    std::optional<double> targetVoxelSizeUm)
+{
+    UmbilicusFrameLoad result;
+    UmbilicusFileInfo info = Umbilicus::LoadFileInfo(path);
+    if (!info.metadataErrors.empty()) {
+        // A file that garbles its own frame statement is refused outright: a
+        // typo must never read as a legacy file that declared nothing.
+        std::string error = "refusing umbilicus '" + path.string() +
+                            "': malformed frame metadata:";
+        for (const auto& entry : info.metadataErrors) {
+            error += "\n  " + entry;
+        }
+        result.error = std::move(error);
+        return result;
+    }
+    const UmbilicusFrameClaim claim = umbilicusFrameClaim(info);
+    if (!claim.any()) {
+        // Unstamped legacy file: keep the historical reading.
+        result.umbilicus = Umbilicus::FromFile(path, volumeShape);
+        return result;
+    }
+    const auto scale =
+        deriveUmbilicusScale(info, targetGridXyz, targetVoxelSizeUm);
+    // The header documents this verdict as the consumer's responsibility
+    // where the target grid is the named volume's (Authoritative). Under
+    // Inferred it can only turn an Apply into warn+legacy, which is the safe
+    // direction: a contradicted stamp is evidence against the stamp itself,
+    // so the file is refused even when its points happen to infer a clean
+    // scale from a frame the file disproves.
+    const auto contradiction =
+        umbilicusStampContradiction(info, targetGridXyz, targetVoxelSizeUm);
+    const auto action = decideUmbilicusLoadAction(
+        scale, claim, /*haveTargetGrid=*/true,
+        /*stampContradicted=*/contradiction.has_value());
+    if (action == UmbilicusLoadAction::Apply) {
+        auto points = Umbilicus::LoadControlPoints(path);
+        const float factor = static_cast<float>(scale->factor);
+        for (auto& point : points) {
+            point = point * factor;
+        }
+        result.umbilicus = Umbilicus::FromPoints(points, volumeShape);
+        result.scaleDescription = scale->description;
+        return result;
+    }
+    if (action == UmbilicusLoadAction::Refuse) {
+        if (authority == UmbilicusTargetGridAuthority::Authoritative) {
+            // The grid is the volume's own: a declared frame that fits
+            // nothing about it means the file is wrong about itself, so
+            // it is refused outright rather than read as though it had
+            // declared nothing.
+            result.error = "refusing umbilicus '" + path.string() +
+                           "': its declared frame does not fit the volume "
+                           "grid; re-stamp it with volume_width, "
+                           "volume_height and volume_slices.";
+            return result;
+        }
+        // The grid is caller-inferred, not authoritative, so the mismatch
+        // proves nothing about the file: a surface patch's bounding box is
+        // not its frame. Warn loudly and keep the legacy reading rather
+        // than breaking a working invocation over an unverifiable claim.
+        result.warning =
+            "umbilicus '" + path.string() +
+            "' declares a frame that does not fit the working grid; using "
+            "its points as-is. If the umbilicus was drawn on a different "
+            "resolution of this data, re-stamp it with volume_width, "
+            "volume_height and volume_slices.";
+        result.umbilicus = Umbilicus::FromFile(path, volumeShape);
+        return result;
+    }
+    // Unreachable while the claim is non-empty: decide() only answers Apply
+    // or Refuse there. Kept so a future decide() change still fails safe.
+    result.umbilicus = Umbilicus::FromFile(path, volumeShape);
+    return result;
+}
+
 } // namespace vc::core::util

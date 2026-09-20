@@ -211,4 +211,57 @@ namespace vc::core::util {
         bool haveTargetGrid,
         bool stampContradicted = false);
 
+    // Outcome of loading an umbilicus file for a caller whose target grid is
+    // inferred rather than authoritative (e.g. a command-line tool working
+    // from a surface bounding box). It mirrors the resolver's Apply / Refuse /
+    // UseLegacy semantics, adapted: an inferred grid can confirm a stamped
+    // frame but can never refute one, so a stamp that does not fit it warns
+    // and keeps the legacy reading instead of refusing.
+    struct UmbilicusFrameLoad {
+        // The loaded umbilicus. Empty only when the file was refused.
+        std::optional<Umbilicus> umbilicus;
+        // Why the file was refused. Empty when loading proceeded; callers
+        // should print it and exit non-zero.
+        std::string error;
+        // A frame concern that did not stop loading. Empty when there is
+        // none; callers should print it to stderr.
+        std::string warning;
+        // How the file's frame related to the working grid, for status
+        // lines. Empty when the legacy reading was kept.
+        std::string scaleDescription;
+    };
+
+    // How much the target grid passed to loadUmbilicusWithFrameCheck() may
+    // say about a declared frame.
+    enum class UmbilicusTargetGridAuthority {
+        // The grid is inferred from data (e.g. surface bounding boxes): it
+        // can confirm a declared frame but never refute one. A declared
+        // frame that does not fit it warns and keeps the legacy reading.
+        Inferred,
+        // The grid is the authoritative volume grid: a declared frame that
+        // does not fit it is refused outright.
+        Authoritative,
+    };
+
+    // Loads the umbilicus at `path` for a caller whose points live in the
+    // frame of the working grid `targetGridXyz` (x, y, z voxel counts).
+    // `volumeShape` ([z, y, x]) is the shape handed to the Umbilicus
+    // constructor, exactly as Umbilicus::FromFile took it.
+    //
+    //   - malformed frame metadata   -> refused, with the errors listed;
+    //   - stamped frame fits the grid -> points rescaled, scaleDescription set;
+    //   - stamped frame does not fit  -> Inferred grids warn and keep the
+    //                                  legacy reading (a mismatch proves
+    //                                  nothing about the file); Authoritative
+    //                                  grids refuse the file outright;
+    //   - nothing stamped             -> legacy reading, as before.
+    //
+    // Throws when the file cannot be read, like FromFile.
+    [[nodiscard]] UmbilicusFrameLoad loadUmbilicusWithFrameCheck(
+        const std::filesystem::path& path,
+        const std::array<double, 3>& targetGridXyz,
+        const cv::Vec3i& volumeShape,
+        UmbilicusTargetGridAuthority authority,
+        std::optional<double> targetVoxelSizeUm = std::nullopt);
+
 } // namespace vc::core::util

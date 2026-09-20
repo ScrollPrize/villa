@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -12,6 +13,7 @@
 #include <numeric>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -22,6 +24,7 @@
 #include "utils/Json.hpp"
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/ScrollUmbilicus.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/Umbilicus.hpp"
 
@@ -1133,9 +1136,38 @@ int main(int argc, char** argv)
         std::max(1, static_cast<int>(std::ceil(maxCoord[1])) + 2),
         std::max(1, static_cast<int>(std::ceil(maxCoord[0])) + 2)
     };
-    Umbilicus umb = Umbilicus::FromFile(cfg.umbilicus, volumeShape);
+    vc::core::util::UmbilicusFrameLoad umbilicusLoad;
+    try {
+        // The shape below is inferred from the surface bounding box: good
+        // enough to confirm a stamped frame, but not authoritative, so a
+        // stamp it cannot confirm warns rather than refuses.
+        umbilicusLoad = vc::core::util::loadUmbilicusWithFrameCheck(
+            cfg.umbilicus,
+            {static_cast<double>(volumeShape[2]),
+             static_cast<double>(volumeShape[1]),
+             static_cast<double>(volumeShape[0])},
+            volumeShape,
+            vc::core::util::UmbilicusTargetGridAuthority::Inferred);
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: cannot load umbilicus '" << cfg.umbilicus.string()
+                  << "': " << e.what() << "\n";
+        return EXIT_FAILURE;
+    }
+    if (!umbilicusLoad.error.empty()) {
+        std::cerr << "ERROR: " << umbilicusLoad.error << "\n";
+        return EXIT_FAILURE;
+    }
+    if (!umbilicusLoad.warning.empty()) {
+        std::cerr << "WARNING: " << umbilicusLoad.warning << "\n";
+    }
+    Umbilicus umb = *umbilicusLoad.umbilicus;
     std::cout << "Umbilicus loaded with inferred volume shape [z,y,x]=["
-              << volumeShape[0] << "," << volumeShape[1] << "," << volumeShape[2] << "]\n";
+              << volumeShape[0] << "," << volumeShape[1] << "," << volumeShape[2]
+              << "]";
+    if (!umbilicusLoad.scaleDescription.empty()) {
+        std::cout << " (" << umbilicusLoad.scaleDescription << ")";
+    }
+    std::cout << "\n";
 
     std::cout << "Building surface patch index with " << patchSurfaces.size()
               << " surfaces, stride " << cfg.indexStride << "...\n";
