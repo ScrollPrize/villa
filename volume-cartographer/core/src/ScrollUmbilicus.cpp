@@ -563,10 +563,14 @@ UmbilicusFrameLoad loadUmbilicusWithFrameCheck(
             // nothing about it means the file is wrong about itself, so
             // it is refused outright rather than read as though it had
             // declared nothing.
-            result.error = "refusing umbilicus '" + path.string() +
-                           "': its declared frame does not fit the volume "
-                           "grid; re-stamp it with volume_width, "
-                           "volume_height and volume_slices.";
+            const std::string reason =
+                contradiction.has_value()
+                    ? *contradiction
+                    : "its declared frame does not fit the volume grid; "
+                      "re-stamp it with volume_width, volume_height and "
+                      "volume_slices.";
+            result.error =
+                "refusing umbilicus '" + path.string() + "': " + reason;
             return result;
         }
         // The grid is caller-inferred, not authoritative, so the mismatch
