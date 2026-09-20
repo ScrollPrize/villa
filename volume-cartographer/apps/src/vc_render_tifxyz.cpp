@@ -1819,7 +1819,16 @@ int main(int argc, char *argv[])
         // the transfers still in flight so the process exits now rather than
         // after their own timeouts, then report which chunk failed and why.
         utils::HttpClient::abortAll();
-        logPrintf(stderr, "\nError: %s\n", e.what());
+        // An HTTP status error carries the server's response body in its
+        // message; for a 503 that is a whole HTML page. Keep the first line.
+        std::string what = e.what();
+        if (auto nl = what.find('\n'); nl != std::string::npos) {
+            what.erase(nl);
+            while (!what.empty() && (what.back() == '\r' || what.back() == ' '))
+                what.pop_back();
+            what += " [...]";
+        }
+        logPrintf(stderr, "\nError: %s\n", what.c_str());
     }
     if (!ok)
         return EXIT_FAILURE;
