@@ -135,36 +135,23 @@ std::vector<vc::render::ChunkKey> chunkKeysForBounds(
 
 Bounds scaleBounds(
     const Bounds& source,
-    const std::array<int, 3>& sourceShape,
-    const std::array<int, 3>& destShape)
+    const vc::render::IChunkedArray::LevelTransform& transform)
 {
-    if (sourceShape == destShape)
-        return source;
-    if (sourceShape[0] <= 0 || sourceShape[1] <= 0 || sourceShape[2] <= 0 ||
-        destShape[0] <= 0 || destShape[1] <= 0 || destShape[2] <= 0) {
-        throw std::runtime_error("cannot scale bounds across an empty level shape");
-    }
-
-    auto mapMin = [](int value, int sourceDim, int destDim) {
-        return static_cast<int>(
-            (static_cast<std::int64_t>(value) * destDim) / sourceDim);
+    auto mapMin = [](int value, double scale, double offset) {
+        return static_cast<int>(std::floor(value * scale + offset));
     };
-    auto mapExclusive = [](std::int64_t exclusive, int sourceDim, int destDim) {
+    auto mapExclusive = [](int inclusive, double scale, double offset) {
         return static_cast<int>(
-            (exclusive * destDim + sourceDim - 1) /
-            sourceDim);
+            std::ceil((static_cast<double>(inclusive) + 1.0) * scale + offset));
     };
 
     Bounds dest;
-    dest.zMin = mapMin(source.zMin, sourceShape[0], destShape[0]);
-    dest.yMin = mapMin(source.yMin, sourceShape[1], destShape[1]);
-    dest.xMin = mapMin(source.xMin, sourceShape[2], destShape[2]);
-    dest.zMax = mapExclusive(
-        static_cast<std::int64_t>(source.zMax) + 1, sourceShape[0], destShape[0]) - 1;
-    dest.yMax = mapExclusive(
-        static_cast<std::int64_t>(source.yMax) + 1, sourceShape[1], destShape[1]) - 1;
-    dest.xMax = mapExclusive(
-        static_cast<std::int64_t>(source.xMax) + 1, sourceShape[2], destShape[2]) - 1;
+    dest.zMin = mapMin(source.zMin, transform.scaleFromLevel0[0], transform.offsetFromLevel0[0]);
+    dest.yMin = mapMin(source.yMin, transform.scaleFromLevel0[1], transform.offsetFromLevel0[1]);
+    dest.xMin = mapMin(source.xMin, transform.scaleFromLevel0[2], transform.offsetFromLevel0[2]);
+    dest.zMax = mapExclusive(source.zMax, transform.scaleFromLevel0[0], transform.offsetFromLevel0[0]) - 1;
+    dest.yMax = mapExclusive(source.yMax, transform.scaleFromLevel0[1], transform.offsetFromLevel0[1]) - 1;
+    dest.xMax = mapExclusive(source.xMax, transform.scaleFromLevel0[2], transform.offsetFromLevel0[2]) - 1;
     return dest;
 }
 
@@ -337,13 +324,15 @@ int main(int argc, char** argv)
         if (!project)
             throw std::runtime_error("failed to load project: " + projectPath.string());
 
-        const fs::path configuredCacheRoot = vc::settings::remoteCachePath();
+        vc::render::ChunkCacheService::Options cacheOptions;
+        cacheOptions.persistentCacheEncoding =
+            vc::settings::remoteCacheDelta3dEnabled()
+                ? vc::render::PersistentCacheEncoding::Delta3dLossless
+                : vc::render::PersistentCacheEncoding::SourceMirror;
+        vc::render::configureProcessChunkCacheService(std::move(cacheOptions));
 
         const auto spec = vc::parseRemoteVolumeSpec(url);
         const auto projectEntry = project->matchingVolumeEntry(url);
-        const fs::path volumeCacheRoot = projectEntry
-            ? vc::project::remoteVolumeCacheRootForEntry(configuredCacheRoot, *projectEntry)
-            : configuredCacheRoot;
         const bool anonymous = projectEntry && vc::project::usesAnonymousRemoteAuth(*projectEntry);
         const auto metadata = projectEntry
             ? vc::project::volumeMetadataFromEntryTags(projectEntry->tags)
@@ -351,7 +340,7 @@ int main(int argc, char** argv)
         std::cout << "Opening "
                   << vc::core::util::redactedRemoteLocation(spec.portableLocator)
                   << '\n';
-        auto volume = Volume::NewFromUrl(url, volumeCacheRoot, {}, metadata, !anonymous);
+        auto volume = Volume::NewFromUrl(url, {}, metadata, !anonymous);
         const auto levels = requestedLevels
             ? *requestedLevels
             : volume->presentScaleLevels();
@@ -387,7 +376,8 @@ int main(int argc, char** argv)
         for (const int level : levels) {
             const auto shape = volume->shape(level);
             const auto chunkShape = volume->chunkShape(level);
-            const auto levelBounds = scaleBounds(requested, coordinateShape, shape);
+            const auto levelBounds = scaleBounds(
+                requested, volume->sharedChunkCache()->levelTransform(level));
             Bounds clamped;
             auto levelKeys = chunkKeysForBounds(
                 level, levelBounds, shape, chunkShape, clamped);
