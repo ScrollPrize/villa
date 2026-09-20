@@ -1728,7 +1728,17 @@ QString MenuActionController::promptLocation(const QString& title,
     });
     if (dlg.exec() != QDialog::Accepted) return {};
     QString uri = dlg.selectedUri();
-    if (uri.startsWith("file://", Qt::CaseInsensitive)) uri = uri.mid(7);
+    if (uri.startsWith(QLatin1String("file:"), Qt::CaseInsensitive)) {
+        const QUrl localUrl(uri);
+        if (localUrl.isLocalFile()) {
+            QString localPath = QDir::fromNativeSeparators(localUrl.toLocalFile());
+            while (localPath.size() > 1 && localPath.endsWith('/') &&
+                   !QDir(localPath).isRoot()) {
+                localPath.chop(1);
+            }
+            return localPath;
+        }
+    }
     const int schemeSep = uri.indexOf("://");
     const int minLen = (schemeSep < 0) ? 1 : schemeSep + 4;
     while (uri.size() > minLen && uri.endsWith('/')) uri.chop(1);

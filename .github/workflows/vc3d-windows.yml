@@ -91,6 +91,12 @@ jobs:
       - name: Build
         run: ninja -C build/ci-windows-mingw
 
+      - name: Test unified browser Windows paths
+        run: >-
+          ctest --test-dir build/ci-windows-mingw
+          --output-on-failure
+          -R '^unified_browser_dialog$'
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'

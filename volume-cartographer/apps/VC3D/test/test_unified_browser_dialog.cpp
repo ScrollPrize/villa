@@ -1,10 +1,12 @@
 #include "UnifiedBrowserDialog.hpp"
 
+#include <QDir>
 #include <QFile>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QPushButton>
 #include <QTemporaryDir>
+#include <QUrl>
 #include <QtTest/QtTest>
 
 namespace
@@ -152,6 +154,38 @@ private slots:
         QCOMPARE(dialog.result(), int(QDialog::Accepted));
         QCOMPARE(dialog.selectedUri(), QStringLiteral("file://") + temporary.path() + QStringLiteral("/"));
     }
+
+    void fileUriPreservesUncAuthority()
+    {
+        UnifiedBrowserDialog dialog;
+        dialog.setStartUri(
+            QStringLiteral("file://wsl.localhost/Ubuntu/home/user/segments"));
+
+        QCOMPARE(pathBar(dialog)->text(),
+                 QStringLiteral("//wsl.localhost/Ubuntu/home/user/segments"));
+    }
+
+#ifdef Q_OS_WIN
+    void typedWindowsNativeSeparators()
+    {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+
+        UnifiedBrowserDialog dialog;
+        dialog.setAcceptsFiles(false);
+        dialog.setAcceptsDirs(true);
+
+        const QString nativePath = QDir::toNativeSeparators(temporary.path());
+        typePath(dialog, nativePath);
+        clickOpen(dialog);
+
+        QCOMPARE(dialog.result(), int(QDialog::Accepted));
+        QCOMPARE(dialog.selectedUri(),
+                 QUrl::fromLocalFile(QDir::fromNativeSeparators(nativePath))
+                         .toString() +
+                     QStringLiteral("/"));
+    }
+#endif
 
     void rejectsHostlessRemoteUrls_data()
     {

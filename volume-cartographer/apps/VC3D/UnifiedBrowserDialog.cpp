@@ -69,23 +69,30 @@ QString stripTrailingSlash(QString s)
     return s;
 }
 
-// Convert local absolute path -> file:// URI.
+// Convert local absolute path -> a standards-compliant file: URI.
+// QUrl owns the platform details here: notably, UNC paths keep their server
+// authority instead of being flattened into an ordinary slash-prefixed path.
 QString pathToFileUri(const QString& absPath, bool isDir)
 {
-    QString out = QStringLiteral("file://") + absPath;
+    const QString normalized = QDir::fromNativeSeparators(absPath);
+    QString out = QUrl::fromLocalFile(normalized).toString();
     if (isDir) out = withTrailingSlash(out);
     return out;
 }
 
-// Convert any incoming URI/path to a normalized form for the given mode.
-//   Local mode: returns absolute path (no scheme).
-//   Remote mode: returns URL with trailing slash.
+// Convert any incoming URI/path to the normalized local-path form used by
+// QFileInfo/QDir.  QUrl::toLocalFile preserves a file://server/share UNC
+// authority as //server/share, while fromNativeSeparators accepts paths pasted
+// with Windows backslashes (including \\wsl.localhost\...).
 QString fileUriToPath(QString uri)
 {
-    if (uri.startsWith(QLatin1String("file://"), Qt::CaseInsensitive)) {
-        return uri.mid(7);
+    if (uri.startsWith(QLatin1String("file:"), Qt::CaseInsensitive)) {
+        const QUrl parsed(uri);
+        if (parsed.isLocalFile()) {
+            return QDir::fromNativeSeparators(parsed.toLocalFile());
+        }
     }
-    return uri;
+    return QDir::fromNativeSeparators(uri);
 }
 
 struct S3Location {
@@ -451,12 +458,13 @@ void UnifiedBrowserDialog::onUpClicked()
 
 void UnifiedBrowserDialog::navigateLocal(const QString& absDir)
 {
-    _currentLocalDir = absDir;
-    _pathBar->setText(absDir);
+    const QString normalizedDir = QDir::fromNativeSeparators(absDir);
+    _currentLocalDir = normalizedDir;
+    _pathBar->setText(normalizedDir);
     _pathBarEdited = false;
     _list->clear();
 
-    QDir d(absDir);
+    QDir d(normalizedDir);
     if (!d.exists()) {
         _status->setText(tr("No such directory"));
         return;
