@@ -900,7 +900,7 @@ if(TARGET vc_render_tifxyz)
         COMMAND ${Python3_EXECUTABLE}
             "${CMAKE_CURRENT_SOURCE_DIR}/test_render_fetch_failure.py"
             $<TARGET_FILE:vc_render_tifxyz>)
-    set_tests_properties(test_render_fetch_failure PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    set_tests_properties(test_render_fetch_failure PROPERTIES TIMEOUT 300)
     vc_register_ctest(test_render_fetch_failure vc_render_tifxyz)
 endif()
 
