@@ -14,6 +14,31 @@ import render_ink
 
 
 class RenderInkPathTests(unittest.TestCase):
+    def test_render_command_forwards_segmentation_scale_and_remote_url(self):
+        command = render_ink.build_render_command(
+            "vc_render_tifxyz",
+            "mesh",
+            0.25,
+            4.0,
+            1,
+            "ink.zarr",
+            "mesh/ink",
+            5,
+            "https://example.test/volume.zarr",
+        )
+
+        self.assertEqual(command, [
+            "vc_render_tifxyz",
+            "--segmentation", "mesh",
+            "--scale", "0.25",
+            "--scale-segmentation", "4.0",
+            "--group-idx", "1",
+            "--volume", "ink.zarr",
+            "--tif-output", "mesh/ink",
+            "--num-slices", "5",
+            "--remote-url", "https://example.test/volume.zarr",
+        ])
+
     def test_default_lasagna_dir_is_sibling_of_spiral_fitting(self):
         script = Path("/checkout/spiral-fitting/render_ink.py")
 
