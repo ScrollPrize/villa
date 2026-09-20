@@ -4,6 +4,88 @@ Code and helpers to fit a canonical Archimedean spiral to deformed scrolls.
 `spiral_service.py` hosts one persistent interactive fit session over HTTP for
 the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
+## CUDA startup check
+
+VC3D fit sessions and command-line fits allocate one CUDA element and synchronize
+before loading fit inputs. This creates the CUDA context before dataset reads
+increase filesystem cache pressure, and reports startup failures independently
+of atlas size. CPU-only `FitContext.load_host_inputs()` callers remain unchanged.
+The GPU atlas progress messages appear when geometry is actually materialized.
+
+On Linux NVIDIA GB10 systems, startup OOM diagnostics include host memory figures
+and NVIDIA's manual cache-flush workaround. The application never flushes system
+caches itself. Early initialization does not guarantee that the full fit will
+fit in shared CPU/GPU memory.
+
+Validate with the existing environment, from the repository root:
+
+```sh
+AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_cuda_startup.py \
+  spiral-fitting/tests/test_spiral_headless.py \
+  spiral-fitting/tests/test_spiral_progress.py
+AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -c \
+  'from types import SimpleNamespace; from fit_spiral import FitContext; FitContext.check_cuda_ready(SimpleNamespace(progress=None))'
+```
+
+See [NVIDIA's DGX Spark memory guidance](https://docs.nvidia.com/dgx/dgx-spark/known-issues.html).
+
+## Editing input snapshots
+
+The service snapshots patch directories, fiber JSON files and point collections
+when claiming a dataset editing workspace. `input_snapshot.py` tries Linux
+`FICLONE` or macOS `clonefile` for independent copy-on-write files. Unsupported
+filesystems and cross-filesystem copies fall back to a streamed copy; other I/O
+errors propagate. Hard links are never used.
+
+The fallback hashes bytes while copying, verifies the destination, and compares
+the final source fingerprint with the captured tree. Clones are hashed once and
+compared with the final source. This reduces full content reads from four to
+three for ordinary copies and two for clones. Snapshots retain the existing
+SHA-256 format, sorted tree membership, empty directories and symlink rejection.
+Changes during capture that leave the source different from the captured bytes
+are rejected. No model inputs, precision or numerical algorithms change.
+
+Run the focused tests using the existing environment, from the repository root:
+
+```sh
+PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_input_snapshot.py \
+  spiral-fitting/tests/test_service_editing.py \
+  spiral-fitting/tests/test_service_editing_http.py
+```
+
+Benchmark real patches (temporary copies are removed; sources stay unchanged):
+
+```sh
+PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python \
+  spiral-fitting/tests/benchmark_input_snapshots.py \
+  /home/sean/Desktop/spiral_dataset/verified_patches --iterations 5 --profile
+```
+
+Use `--destination PATH` to test another filesystem. The default is `/tmp`.
+`--count` selects the first N sorted patch directories (default 32).
+
+Measured on Linux arm64, CPython 3.14, without Python optimization flags, with
+`cProfile` enabled for both versions: 32 real verified patches, 55,302,864 bytes,
+five iterations, ordinary-copy fallback on the local ext-family filesystem.
+These are cache-warm measurements, not end-to-end fit initialization times.
+
+| Snapshot implementation | Mean | Min | Median | Max |
+| --- | ---: | ---: | ---: | ---: |
+| Previous copy plus three hash passes | 166.8 ms | 160.8 ms | 162.2 ms | 181.0 ms |
+| Streamed copy/hash plus verification | 152.3 ms | 148.9 ms | 153.2 ms | 154.0 ms |
+
+Mean time decreased 8.7%. Before the change, fingerprint calls accounted for
+0.649 s of 0.834 s total across all five iterations; file copying accounted for
+0.177 s. Afterwards, hashing remains the largest cost (0.336 s in SHA-256 updates),
+but the separate source pre-read is eliminated. Reflink throughput and actual
+macOS cloning require validation on supporting filesystems; unit tests cover
+the platform dispatch and fallback/error paths.
+
+Filesystem API references: [Linux FICLONE](https://man7.org/linux/man-pages/man2/FICLONE.2const.html)
+and [Apple file cloning support](https://developer.apple.com/documentation/foundation/urlresourcevalues/volumesupportsfilecloning).
+
 ## Scroll specification (spiral-scroll.json)
 
 `fit_spiral.py` requires a `spiral-scroll.json` file in the dataset root.
@@ -77,6 +159,120 @@ looks for `umbilicus.json` in the checkpoint's ancestors, in
 layouts, pass `--umbilicus /path/to/umbilicus.json`. Use `--lasagna-dir` if
 the Lasagna repository is not in its standard sibling or `~/villa` location.
 An existing output path is never overwritten.
+
+## Flow stages
+
+`model_num_flow_stages` sets how many stationary velocity fields the flow
+diffeomorphism composes. The stages are the slabs of the flow lattices'
+leading axis (`flow_field.flows.{0,1}` are `[stages, 3, ...]`), integrated in
+order by one fused kernel launch per direction; the inverse runs the slabs
+backwards in reverse order. One stage is the original single-field model.
+Checkpoints written with the earlier per-stage module layout
+(`extra_flow_fields.*`) are migrated on load, Adam moments included
+(`checkpoint_migrations.merge_flow_stage_lattices`). The retired
+`model_num_flow_timesteps` key is dropped from old configurations on load;
+checkpoints with a time axis longer than 1 are rejected.
+
+## Flow-gradient conditioning
+
+These optional settings change how the flow lattices are optimized, without
+adding loss terms or changing the model parameterization. The smoothing,
+lazy-moment and shared-second-moment switches default to off; gradient
+clipping defaults to disabled. The `optimizer_flow_*` settings apply at run
+boundaries and are read every step. Older checkpoints backfill these defaults.
+
+The step order is: DDP gradient averaging, NaN/Inf detection and replacement
+with zero, optional clipping, optional smoothing, influence masks, then the
+optimizer update. Sanitizing before smoothing prevents a single invalid entry
+from contaminating its neighborhood. Influence masks constrain the processed
+gradient after smoothing.
+
+- `optimizer_flow_grad_smoothing` Gaussian-smooths each flow lattice's
+  gradient. `optimizer_flow_grad_smoothing_sigma_voxels` sets the standard
+  deviation in scroll-voxel units of the flow coordinate frame. Cartesian
+  smoothing is isotropic. Cylindrical smoothing runs along z and periodically
+  around each ring, independently for the local z/radial/tangential components.
+  `optimizer_flow_grad_smoothing_across_sigma_voxels` optionally smooths across
+  rings at matching angles; its default of 0 disables this pass. These are
+  lattice directions approximating along/across-sheet directions, not measured
+  sheet tangents or winding boundaries. Kernels are truncated at three sigma
+  and renormalized at nonperiodic borders to preserve constant gradients.
+- `optimizer_flow_grad_smoothing_low_res_sigma_voxels` overrides the coarse
+  lattice's along-sheet width; 0 uses the same width as the fine lattice. With
+  the default fine spacing of 16 voxels and sixfold coarse spacing, a width of
+  32 voxels is 2 fine cells but only about 0.33 coarse cells. Very small widths
+  become identity kernels. The fitter reports effective widths at startup
+  when smoothing is enabled. The across-ring width has no separate coarse
+  override and is ignored for Cartesian fields.
+- `optimizer_flow_lazy_moments` updates moments and applies the gradient step
+  only to entries whose **processed gradient is nonzero**. Smoothing can make
+  an entry active even without a direct sample there. Other entries retain
+  their moments; configured AdamW weight decay still applies everywhere.
+  This preserves gradient-scale history through unsampled steps and suppresses
+  momentum-only movement there, but retains stale history too. It does not
+  prevent large relative steps on a previously untouched smoothing tail.
+- `optimizer_flow_shared_second_moment` uses one denominator across all cells
+  and vector components of each lattice's leading slab, independently for
+  each flow stage and for the coarse/fine lattices. Per-entry Adam scaling can
+  make even a smooth gradient produce nearly sign-sized steps, particularly
+  on first touch. A shared denominator preserves relative magnitudes and
+  direction of the first moment before lazy masking and weight decay; it
+  does not guarantee a smooth final displacement. The shared statistic is the
+  mean of positive stored second moments, capped before averaging at
+  `optimizer_flow_shared_second_moment_clip_quantile` (default 0.99). A value
+  of 1 disables the cap. This limits outliers' effect on the common scale at
+  the cost of local adaptivity. Full per-entry moments remain stored.
+- `optimizer_flow_grad_clip_median_multiple` clips individual gradient
+  components to this multiple of the median nonzero absolute component value,
+  separately for each lattice slab. Zero disables it. Clipping before blur
+  limits how far an extreme gradient can affect neighbors and optimizer
+  moments, but can also suppress legitimate corrections and change vector
+  direction. The median and second-moment cap are estimated from fixed-stride
+  samples; the final averages and clipped fractions use the whole slab.
+  Sampling is deterministic for identical inputs but may miss sparse support.
+- `model_flow_field_low_res_lr_scale` multiplies the scheduled base learning
+  rate for the coarse lattice independently of the fine lattice's existing
+  ramp. It defaults to 1; 0 freezes coarse parameter values, including weight
+  decay, although moments may still update. The fitter reads it every step,
+  but the configuration catalog currently classifies it as a model-rebuild
+  setting, like the other `model_` learning-rate controls.
+
+`flow_grad_smoothing.py` provides Triton CUDA kernels and PyTorch reference/
+fallback paths. `lazy_moment_adamw.LazyMomentAdamW` retains AdamW's state format
+so its flags can be switched between runs without converting moment buffers.
+For custom optimizer updates, diagnostics report the denominator, nonzero
+update fraction, and per-component RMS over nonzero updates in voxel units.
+These describe flow-parameter increments, excluding weight decay, not final
+sheet displacement after integration. After both moment flags are disabled,
+stored optimizer diagnostics can still describe the last custom step rather
+than the current fused AdamW step. Clipping diagnostics report the bound
+and fraction clipped. No full-scroll accuracy or throughput comparison is
+established by the implementation tests.
+
+### Rationale and references
+
+Gaussian update smoothing has precedent in
+[Vercauteren et al., *Diffeomorphic Demons*](https://www-sop.inria.fr/asclepios/Publications/Tom.Vercauteren/DiffeoDemons-NeuroImage08-Vercauteren.pdf).
+Smooth velocity metrics are central to
+[Beg et al., *Computing Large Deformation Metric Mappings*](https://www.cs.jhu.edu/~misha/ReadingSeminar/Papers/Beg05.pdf).
+These motivate the preconditioning here; this discrete blur followed by Adam,
+clipping and masking is not an implementation of classical Sobolev gradient
+descent or LDDMM, and inherits no guarantee of the same fitted solution or
+fold-free numerical integration. Direction-dependent smoothing has a related
+motivation in [Pace et al.'s sliding-organ registration](https://pmc.ncbi.nlm.nih.gov/articles/PMC4112204/),
+although this fitter uses cylindrical coordinates rather than detected sliding
+interfaces.
+
+Lazy moments follow the masked-update idea of
+[PyTorch SparseAdam](https://docs.pytorch.org/docs/main/generated/torch.optim.SparseAdam.html),
+using an explicit nonzero mask on dense gradients, a global per-parameter step
+counter, AdamW's epsilon placement, and optional decoupled weight decay.
+[Adam-mini](https://arxiv.org/abs/2406.16793) provides precedent for sharing
+adaptive scales within parameter blocks; our grouping and winsorization are
+custom choices, and retaining full moments does not provide its state-memory
+saving. [Koloskova et al., *Revisiting Gradient Clipping*](https://proceedings.mlr.press/v202/koloskova23a/koloskova23a.pdf)
+analyze clipping's stabilization and stochastic bias; their results do not
+validate this particular sampled-median rule or its combination with Adam.
 
 ## Spiral service host setup
 
@@ -193,6 +389,19 @@ dimensions differ from the Spiral grid. If flattening or artifact mapping
 fails, the service reports the publication error and VC3D keeps displaying the
 previous successfully published preview.
 
+Every checkpoint and every raw preview export carry a content digest of the
+model state that placed the surface (`model_state_sha256`: live parameters,
+frozen constraint-bake epochs and run window). The service records each
+published preview under that digest in
+`<output>/.spiral-published/preview-index.json`. When the fitter reports that
+its resident model equals a checkpoint - after a save, an in-session load or a
+startup resume - the service re-shows the flattened surface it already
+published for that digest instead of waiting for a new export and flatten, and
+pins that surface against the fixed-count preview retention for as long as the
+checkpoint file exists. A checkpoint saved without a published preview, or one
+whose preview has already been pruned, gets nothing back; request a preview as
+before.
+
 On first start the service generates a strong API key at
 `~/.config/vc3d/spiral_api_key` (mode `0600`) and prints it to the console.
 For an SSH profile you never copy it: VC3D reads that file over SSH.
@@ -307,26 +516,161 @@ inference, and the outer shell. For example:
 }
 ```
 
-Changing one requires a whole-fit rebuild. Disabling a prerequisite also
-disables its dependent supervision: phase spacing needs normals and surface
-SDT, while winding inference needs the outer shell.
+Most role switches require a whole-fit rebuild; same-winding and relative PCL
+switches apply at the next Run. Disabled roles retain their accepted workspace
+content, and enabling a role restores that desired content. Disabling a
+prerequisite also disables its dependent supervision: phase spacing needs
+normals and surface SDT, while winding inference needs the outer shell.
 
-While a session is active you can right-click a patch in the Surface panel or
-a fiber in the Fibers panel and pick *Add to current spiral fit*. Added inputs
-are uploaded into a session-scoped ephemeral folder, used from the next run
-onward, and can be moved into the shared dataset with *Commit current inputs*.
-Commits from multiple service processes are serialized; distinct inputs and
-point collections are preserved, while an existing patch or fiber identifier
-is reported as a conflict and is never overwritten.
+The API 33 client and service use one revisioned input workspace per dataset.
+One service holds the dataset editing lease and one client owns that workspace;
+other connections can observe. Disconnecting retains ownership, drafts and
+command receipts. Reconnect with the same client resumes them. A fit rebuild
+replays desired inputs without replacing the editing workspace. Reconnect and
+rebuild also discover newly added dataset inputs, preserving their collection
+IDs and any existing workspace edits. A restarted service replaces a clean
+client catalog; pending edits or commands stay tied to their original workspace.
 
-Interactive influence settings are scoped to each **Run** request. The fitter
-builds a fresh influence region from only the inputs pending for that run,
-uses it for the requested iteration window, and discards it before autosaving.
+**Add/Apply changes** captures the selected local revisions and applies the
+whole validated batch at a worker boundary, including while idle or after the
+final step. **Commit current inputs** first applies the selected revisions,
+then persists those exact revisions. Editing can continue during either action;
+a response for an older revision leaves newer edits dirty. Failed transfers or
+publication can be retried with the retained command and bytes.
+
+In the flattened Spiral preview, tap `Ctrl` to toggle patch painting: left-drag
+paints, right-drag erases, and `Escape` exits. Ctrl+wheel changes brush size
+without toggling the mode; Shift+right-drag draws control-point lines. Starting
+a stroke on a session-drawn selection extends that patch in its original color.
+Drawn selections remain brush-editable after Apply and Commit, including across
+preview updates when their original surface can be projected onto the new one.
+Finalization keeps the largest edge-connected component of complete quads;
+selections with no complete quad remain editable and report an error.
+
+Drawn patches use the same editing workspace as other inputs. Add/Apply and
+Commit capture their current selections; an edit made while an older snapshot
+is being saved stays dirty. Erasing a previously staged patch completely stages
+a deletion on the next Add/Apply. The input list shows local brush errors and
+colors; Remove on a local brush edit discards that edit. Dataset patches use
+the existing managed patch editor.
+
+Brush regression checks use the existing build and Python environment:
+
+```bash
+AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target VC3D test_spiral_brush_patch test_spiral_input_workflow test_spiral_input_draft test_spiral_point_placement_mode test_spiral_point_collection_edit -j 4
+AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" ctest --test-dir volume-cartographer/build -R '^spiral_(brush_patch|input_workflow|input_draft|point_placement_mode|point_collection_edit)$' --output-on-failure
+```
+
+Set `SPIRAL_PATCH_REAL_INPUT` to a real tifxyz patch directory to include the
+read-only selection check and draft-copy validation. `SPIRAL_PATCH_EVIDENCE_DIR`
+optionally receives before/after selection-mask images. These checks cover CPU
+geometry and the editing workflow; they do not run GPU fitting.
+
+In the Spiral workspace, `Q` and `E` place same-winding and relative-winding
+points. Relative annotations count 0, 1, 2, ... in placement order; `F` reverses
+the chain and mirrors annotations. Existing collections remain editable after
+Apply. Shift+E prepares local drafts. Managed patch and fiber editors save to
+session working copies; successful saves update drafts and do not apply or
+commit automatically. Linked-fiber saves use working copies for their peers.
+
+The input list includes baseline dataset entries and additions, with a filter
+and selection checkboxes. Edit, Remove, Restore, Retry and Discard Local Changes
+operate on individual drafts. Applying Remove stops future supervision;
+Commit deletes the managed dataset entry. Restore remains available before
+committing a deletion. Baseline restores reference the retained service revision
+and do not require access to the service filesystem. Removal cannot reverse
+completed optimizer steps.
+Invalid selected drafts keep the batch unapplied and remain editable. Scoped
+external-source conflicts offer Use Current, Apply Local After Review, or Save
+Local as New; unrelated PCL collection changes are merged during publication.
+
+Editing workspaces are disposable session storage. **Discard and Exit** drops
+local drafts and releases the workspace directly. **Commit** exits only after
+publication succeeds, then releases temporary copies. Release and service
+shutdown stop file users and remove the entire `editing-workspaces/<id>`
+directory, including baseline snapshots, revisions and uploads. Reconnect,
+Stop, and Rebuild keep the workspace and its drafts. The next claim snapshots
+only committed dataset inputs.
+
+New workspaces carry versioned ownership metadata and a lifetime advisory lock.
+Startup reclaims marked directories whose owner has exited, including after a
+crash or forced termination. Live owners, symlinks, unrecognized markers and
+legacy folders without markers are left untouched; legacy storage requires
+manual cleanup. Dataset inputs, saved fit outputs, exports and shared caches
+are preserved. Interrupted Commit recovery directories (`.spiral-publication-*`
+beside dataset targets) are retained and their paths logged. Cleanup errors are
+reported with the workspace path; when a reader or worker cannot stop, files
+and ownership remain intact for a release retry or later startup reclamation.
+
+Cleanup regression checks (no installation needed):
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_workspace_cleanup.py \
+  spiral-fitting/tests/test_service_editing.py \
+  spiral-fitting/tests/test_service_editing_http.py \
+  spiral-fitting/tests/test_spiral_service_v2.py
+```
+
+Set `SPIRAL_REAL_PCL=/path/to/real/abs_winding.json` for the real-scroll
+close/reopen check. It edits a temporary dataset copy and verifies that both the
+source bytes and committed copy remain unchanged; it uses a resident test double
+and does not run GPU fitting.
+
+Regression checks for this workflow (using existing environments/builds):
+
+```bash
+# From the repository root:
+AGENTS_AGENT_MODE=1 spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_service_editing.py spiral-fitting/tests/test_service_editing_http.py \
+  spiral-fitting/tests/test_revisioned_runtime.py spiral-fitting/tests/test_revisioned_geometry.py
+AGENTS_AGENT_MODE=1 ninja -C volume-cartographer/build test_spiral_input_draft test_spiral_input_workflow -j 2
+AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" ctest --test-dir volume-cartographer/build -R '^spiral_input_(draft|workflow)$' --output-on-failure
+```
+
+The workflow tests start a loopback HTTP service and cover remote baseline
+restore, service restart, and edits made while a submission is running.
+The service suite includes transfer, revision, conflict, and publication recovery
+checks; runtime and geometry tests cover worker boundaries and supervision.
+For the retained CUDA check on temporary copies of a real dataset patch:
+
+```bash
+AGENTS_AGENT_MODE=1 SPIRAL_REVISION_LIVE_DATASET=/path/to/dataset \
+  SPIRAL_REVISION_PATCH=patch-directory-name \
+  spiral-fitting/.venv/bin/python -m pytest -q spiral-fitting/tests/test_revisioned_live_fit.py
+```
+
+Input uploads only transfer immutable bytes. The editing workspace owns
+acceptance, application, and persistence; there is no separate ephemeral-input
+ledger or automatic commit on editor save. Checkpoint uploads remain service-scoped.
+
+Interactive influence settings are captured when each **Run** request starts.
+Applying input revisions uses those captured settings and extends the
+influence region's union.
+The region is cleared only when the Run pauses, before autosaving.
 Influence masks, limits, and controls are not checkpoint state. All
 `interactive_influence_*` advanced settings can therefore change between runs
-without reloading the resident session. The **Disable DT** percentage controls
-how much of that run suppresses directional DT losses after incorporating its
-pending inputs.
+without reloading the resident session.
+
+Directional DT timing is an independent control on every interactive Run.
+When **Restrict DT losses to final** is unchecked, the Run adds no DT gate.
+When checked, the adjacent percentage is the eligible suffix of the originally
+requested Run: the first eligible iteration is
+`run_start + floor(iterations * (1 - percentage / 100))`. Thus 25% of a
+10,000-iteration Run suppresses DT for 7,500 iterations and permits it for the
+final 2,500; for small Runs the eligible step count is rounded up. Zero percent
+suppresses DT for the whole Run and 100% adds no suppression. Stopping early
+does not recalculate the original window. The schedule is transient Run state,
+not advanced configuration or checkpoint state, and is cleared before the
+Run's autosave.
+
+Input-local validation failures reject the entire selected candidate without
+changing active supervision. Distributed ranks prepare the same candidate and
+must all agree before installation. Unexpected worker/device failures retain
+fail-stop behavior. Publication prepares all outputs before changing targets;
+a failure after publication starts retains the transaction and queues later
+mutations behind recovery. Recovery covers the running service, not crashes,
+and does not promise atomic visibility across multiple dataset files.
 
 **Checkpoints** are one panel section, and loading one is one button. It lists
 what the service advertises (checkpoints at the dataset root, and those under
@@ -348,8 +692,8 @@ With an existing fit, *Load* replaces the resident model's weights, optimiser
 and RNG state in place. When the checkpoint does not match the live model the service refuses
 it and says what a rebuild would have to replace: rebuilding the **model only**
 keeps the loaded dataset inputs and everything already added to the fit, while
-a **whole-fit** rebuild re-reads the dataset and discards added inputs that
-were never committed. The panel reports the reasons and asks; a checkpoint no
+a **whole-fit** rebuild re-reads the dataset and replays the workspace's desired
+revisions, including uncommitted additions. The panel reports the reasons and asks; a checkpoint no
 rebuild can accept — one written against another dataset, or against a
 configuration schema this service does not have — is reported and nothing is
 offered. A checkpoint-backed session takes its durable configuration from the
@@ -550,3 +894,107 @@ loss. The fitter then loads the conventional `fiber_directions.npz` artifact
 and samples `sample_count_fiber_direction_points` observations per step.
 Positions and directions constrain only local fitted-sheet orientation; they
 do not attach a sample to a particular winding.
+
+## Fiber classification
+
+Each fiber strip is tagged at load time (`spiral_helpers.classify_fiber_hv`):
+VC3D's manual H/V tag wins, then its automatic tag when the recorded certainty
+reaches `pcl_vertical_fiber_min_auto_certainty`, then a geometric fallback that
+calls a strip vertical when its z extent is at least
+`pcl_vertical_fiber_min_z_fraction` of its path length. The fit log reports the
+vertical / horizontal / untagged split.
+
+## Vertical-fiber radial offset
+
+Papyrus carries its horizontal fibers on the front face of the sheet (the face
+toward the umbilicus and the lower-winding neighbour) and its vertical fibers
+on the back face, so the two fiber classes sit a few voxels apart along the
+sheet normal and at most one of them can lie on the face the fit targets. The
+strip losses read every fiber as lying *on* the fitted winding, which leaves a
+permanent residual on vertical strips and on every vertical-to-horizontal link
+junction. With `pcl_vertical_fiber_radial_offset_enabled` set, vertical strips
+(as classified by `spiral_helpers.classify_fiber_hv`, see above) carry a
+per-point target offset of `pcl_vertical_fiber_radial_offset_voxels` (default
+4, positive = outward) along the sheet normal of the fitted spiral (the
+scan-space gradient of the fitted winding, not the straight line to the
+umbilicus): the radius loss, the whole-strip DT target, the DT snap, and the
+satisfaction metric all expect those points that far outside the winding, on
+its back face, instead of on it. Horizontal strips and regular point
+collections are never offset.
+
+The offset is a physical scroll-space distance, not a spiral-space constant.
+In spiral space the fitted sheet's normal is the radial direction, so the
+offset acts on the shifted radius, but the scroll-to-spiral map is not an
+isometry (the gap expander rescales the radial coordinate per gap and the flow
+stretches locally), so each point's offset is multiplied by the transform's
+local stretch along the sheet normal, `|J^T n|`
+(`sample_spiral.get_radial_normal_stretch`; the same `J^T` covector transport
+the dense-normals loss uses). `J^T n` is the scan-space gradient of the fitted
+winding, so a positive offset displaces the expected fiber position along it:
+the increasing-winding direction of the fitted spiral at that point, away from
+the umbilicus, which coincides with the line from the umbilicus only where the
+sheet happens to be perpendicular to it. The loss evaluates that stretch for its sampled
+points each step under `no_grad`, the DT target cache and the satisfaction
+metric for the points they read. After a constraint bake the resident geometry
+lives in the frozen stack's output frame, so each vertical strip and fiber
+catalog point also carries `radial_offset_bake_scale`, the product of every
+frozen epoch's normal stretch at the pre-bake point
+(`fit_spiral.accumulate_radial_offset_bake_scale`); ingested inputs pick it up
+when they are pushed through the stack, re-materialised strips inherit it from
+the catalog, and the final scroll-space export drops it because the composed
+transform's Jacobian then carries the whole stretch. The offset travels with
+the strip bundle (`radial_offsets`, resident-frame voxels after the bake
+scale) next to the winding annotations, so linked components mixing both fiber
+classes read as one winding. Unlike the other `pcl_` settings, both keys are
+Run-scoped: a Run that changes them refills every retained strip's offsets from
+its stored vertical/horizontal tag and rebuilds the strip bundle and DT target
+caches, so no fit rebuild is needed. VC3D's spiral panel exposes them as a
+checkbox and a voxel distance next to the fibers path.
+
+## Point-to-patch linking
+
+Every point of every point collection (regular PCLs and fibers) is attached to
+the patch surface it lies on when the inputs load, and again for inputs added
+to a running session. A point attaches when a patch surface is within
+`pcl_link_distance_tolerance` scroll voxels (default 2.5). General collections
+take the largest-area patch within tolerance, then the nearest;
+`between_patches__A__B` collections take the nearest of their named pair.
+Every linking setting applies at a Run boundary. The tolerance and window
+settings re-link every resident collection, regular and fiber, from the
+retained catalogs against the resident patches and re-derive all the
+point-collection views (cross-patch groups and unattached strips); the fiber
+side-rule settings below only affect fibers, so they re-link and
+re-materialise the fibers alone.
+
+`pcl_link_window_points` and `pcl_link_window_min_points` (both default 1)
+gate candidates on their neighbours: a patch the point itself lies within
+tolerance of is eligible only when at least `pcl_link_window_min_points` of the
+centred window of `pcl_link_window_points` consecutive points (id order, the
+point included) also lie within tolerance of it. Eligible candidates are ranked
+as usual, largest area then nearest, so a fiber stays on the big patch its
+neighbours share instead of hopping onto a patch only one point touches. Even
+window counts round up to the next odd count, and at a collection's ends the
+requirement is clipped to the window members available. Points already
+attached to a patch count as window members when a session relinks.
+
+`pcl_fiber_link_side_filter` keeps fibers off patches on the wrong side of the
+sheet, which is how a fiber ends up on an adjacent winding when windings touch.
+The front of a sheet faces inward, toward the umbilicus and the neighbouring
+winding with the lower winding number; horizontal fibers lie on that front
+face and vertical fibers on the back. A vertical fiber (classified as described above) therefore only attaches to a patch whose surface is
+in front of it, a horizontal fiber only to one behind it, and untagged fibers
+and regular collections are unrestricted. A hit is rejected when the projection
+foot lies more than `pcl_fiber_link_side_margin_voxels` (default 0.5) on the
+wrong side of the point along the inward direction; the margin absorbs points
+lying on the traced surface itself.
+
+No fitted transform exists when the inputs load, so the inward direction starts
+as the line to the umbilicus at the point's z, which local deformation can turn
+away from the true sheet normal. Once `pcl_fiber_link_model_direction_step`
+steps (default 10000) have completed, whether run in the session or restored
+from a checkpoint, every fiber is relinked once with the inward direction taken
+from the fitted spiral's decreasing-winding direction (the negative scan-space
+gradient of the fitted winding, `fit_spiral.inward_winding_direction`), and the
+fiber training views are re-materialised. A checkpoint from before that step
+loaded after the switch relinks back under the umbilicus direction at its first
+step.

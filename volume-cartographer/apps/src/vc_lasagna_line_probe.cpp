@@ -249,8 +249,16 @@ void saveFiberOutput(const FiberInput& fiber,
         root["version"] = 3;
         root["optimization_mode"] = fiber.parsed.optimizationMode;
         root["control_points"] = nlohmann::json::array();
+        const nlohmann::json originalControls =
+            fiber.root.value("control_points", nlohmann::json::array());
         for (size_t index = 0; index < fiber.controlPoints.size(); ++index) {
             nlohmann::json control{{"position", pointToJson(fiber.controlPoints[index])}};
+            // Per-point tags belong to the point, not the re-fit span: carry
+            // them over from the version-3 input entry.
+            if (index < originalControls.size() && originalControls[index].is_object() &&
+                originalControls[index].contains("tags")) {
+                control["tags"] = originalControls[index].at("tags");
+            }
             if (index + 1 < fiber.controlPoints.size()) {
                 const std::string goal = fiber.parsed.version == 3
                     ? fiber.parsed.segmentMetadata[index].at("interp_goal").get<std::string>()

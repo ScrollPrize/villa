@@ -53,6 +53,7 @@ def _live_context():
         lasagna_scale=4,
         normal_zarr_group="4",
         spiral_outward_sense="CW",
+        base_shape_zyx=(100, 200, 300),
         paths=SimpleNamespace(dataset_root="/data/scroll1"),
         phase_mode=True,
         winding_model_mode=False,
@@ -184,6 +185,16 @@ class CheckpointPreflightTests(unittest.TestCase):
                 self.assertFalse(verdict.accepted)
                 self.assertIn(expected, verdict.message())
 
+        self.assertTrue(_inspect(_checkpoint()).accepted)
+        self.assertTrue(_inspect(
+            _checkpoint(base_shape_zyx=[100, 200, 300])).accepted)
+        verdict = _inspect(_checkpoint(base_shape_zyx=[100, 201, 300]))
+        self.assertFalse(verdict.accepted)
+        self.assertIn("base_shape_zyx", verdict.message())
+        verdict = _inspect(_checkpoint(base_shape_zyx=[100, 0, 300]))
+        self.assertFalse(verdict.accepted)
+        self.assertIn("positive integers", verdict.message())
+
     def test_sdt_identity_invariant_applies_when_an_sdt_loss_is_enabled(self):
         stale = _checkpoint(surf_sdt_fingerprint={"sha256": "def"})
         verdict = _inspect(stale)
@@ -210,6 +221,9 @@ class CheckpointPreflightTests(unittest.TestCase):
         unknown = _checkpoint(cfg={**durable_config(CONFIG), "who_am_i": 1})
         self.assertIn("does not match the current schema",
                       _inspect(unknown).message())
+        removed = _checkpoint(cfg={
+            **durable_config(CONFIG), "influence_disable_dt_frac": 0.75})
+        self.assertIn("influence_disable_dt_frac", _inspect(removed).message())
         incomplete = durable_config(CONFIG)
         del incomplete["optimizer_learning_rate"]
         self.assertIn("optimizer_learning_rate",
@@ -567,7 +581,8 @@ class InSessionCheckpointLoadTests(unittest.TestCase):
         self.assertEqual(session._command_epoch, 0)
         self.assertEqual(session._commands, [])
 
-        # A matching barrier queues the command in the coordinator's epoch.
+        # A matching barrier advances the coordinator's epoch, then removes
+        # and cancels the queued command when its caller times out.
         def queue_and_wait():
             try:
                 session.preflight_checkpoint(
@@ -579,8 +594,7 @@ class InSessionCheckpointLoadTests(unittest.TestCase):
         thread.start()
         thread.join(2.0)
         self.assertEqual(session._command_epoch, 1)
-        self.assertEqual(len(session._commands), 1)
-        self.assertEqual(session._commands[0].epoch, 1)
+        self.assertEqual(session._commands, [])
 
     def test_a_rank_with_iterations_pending_refuses_the_load_barrier(self):
         session = _idle_session()

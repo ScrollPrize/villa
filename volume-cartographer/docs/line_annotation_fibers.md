@@ -3,7 +3,28 @@
 VC3D writes line annotations as `vc3d_fiber` JSON. Version 3 stores
 `control_points` as objects with a required `position`. Every non-final control
 point owns a required `segment_to_next` descriptor for its span to control point
-`i+1`; the final control point cannot contain `segment_to_next`.
+`i+1`; the final control point cannot contain `segment_to_next`. A control point
+may also carry an optional `tags` array of strings, written only when non-empty;
+the one tag today is `kollesis_termination`, set from the control point's
+Ctrl+right-click menu ("Kollesis termination", a toggle) to mark where the fiber
+ends at a kollesis. Only the first or last control point can take it (the menu
+item is disabled elsewhere, except to remove a tag an edited file put on an
+interior point). While an end is tagged, no control point can be placed beyond
+it: the click, the `/` and `0` keys and the current-position marker all treat
+that region as blocked (red marker), and a merge whose join side is a tagged end
+is refused. Remove the tag to extend or merge. The toggle itself is refused
+while a solve is running or pending for the session (its rollback would
+restore the pre-edit points). The extrapolated tail still draws past a tagged
+end. Tags belong to the point, not its span: they survive a
+click that replaces the point, a split, a reverse and a merge (union of both
+points' tags), and go with a deleted point. Loaders reject any other
+control-point field, so a tagged fiber does not load on builds older than this
+field.
+
+Tagged points draw as a hollow ring in the control-point yellow, a step larger
+than a filled point, in the cut and strip views and the overview bar; a tagged
+point that is also linked keeps the link-state fill inside the yellow ring. The
+Fiber Map marks every tagged point of every fiber the same way, selected or not.
 
 The top-level `optimization_mode` is either `lasagna` or
 `native_fiber_trace3d`. It is required in version 3; only legacy version-1

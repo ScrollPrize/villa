@@ -618,6 +618,7 @@ def run_main(argv):
     summary = {
         'ink_dir': ink_dir,
         'model': args.model,
+        'model_dir': model_dir,
         'checkpoint': args.checkpoint,
         'folds': folds,
         'fg_threshold': args.fg_threshold,
