@@ -573,9 +573,14 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                     # monopolizing every batch. At most128 trials per model job.
                     start = rotations[model] % len(entries)
                     entries = entries[start:]+entries[:start]
-                    ahead = max(1,min(16,128//len(entries)-1))
+                    # Prime several causal distance steps for each candidate.
+                    # The old 128-trial cap usually submitted one step per
+                    # candidate, leaving the shared inference session idle
+                    # between tiny batches.  Results are still consumed in
+                    # order by advance_search; this only prefetches them.
+                    ahead = max(1,min(8,(worker_budget*4)//max(1,len(entries))-1))
                     requests = []
-                    batch_limit = max(128, int(settings.get('candidate_batch', 256)))
+                    batch_limit = max(worker_budget*4, int(settings.get('candidate_batch', 512)))
                     used = 0
                     for c,d,n in entries:
                         if any(same_location(c,x['candidate']) for x in selected):
