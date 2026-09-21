@@ -127,6 +127,22 @@ mkdir /content/drive
 rclone mount gdrive: /content/drive --vfs-cache-mode writes &
 ```
 
+### Troubleshooting: `oauth2: cannot fetch token: 401 Unauthorized` / `"unauthorized_client"` (token expired)
+
+Expect to hit this **repeatedly, roughly every 7 days**, not just once. `drive`'s full-access scope is a Google "restricted" scope, and for any *unverified* app using a restricted scope, Google caps the refresh token to a 7-day lifetime — and this applies **regardless of whether the OAuth consent screen's publishing status is "Testing" or "In production."** Publishing to production does not remove this cap for a restricted scope; only completing Google's full app-verification process does (a real security-review process — domain/ownership verification, a security assessment, etc.), which isn't worth pursuing for a personal single-user tool. So treat this as expected, recurring maintenance rather than a one-time bug to fix.
+
+**When the token expires, get a fresh one:**
+```bash
+rclone config reconnect gdrive: --config <path-to-your-rclone.conf>
+```
+If `reconnect` doesn't work, do a full `rclone config` re-auth from scratch instead (same manual/headless flow as the original setup).
+
+Along the way you'll see a **"Google hasn't verified this app"** warning — expected every time, for the same restricted-scope reason above. Click **Advanced → Go to \<app name\> (unsafe)** to proceed.
+
+Verify it worked: `rclone lsd gdrive: --config <path>` should list folders with no error.
+
+If this cadence is too disruptive for your workflow, the alternative is rclone's default shared client (no custom OAuth client at all) — it doesn't hit this 7-day cap, but is heavily rate-limited instead (see the HF sync troubleshooting note below for what that looks like in practice). There's no way to get both a long-lived custom-client token and skip full verification for this scope.
+
 ### Making the rclone config reproducible across sessions
 
 Since each new Colab session starts from a clean VM, redoing the `rclone config` wizard every time is painful. Which persistence method applies depends on whether you're driving Colab through the CLI (as the rest of this guide does) or through the notebook UI — they are **not** interchangeable: `google.colab.userdata` is a notebook-frontend API and is unreachable from a bare `colab console`/`colab exec` shell session, so it doesn't work for the CLI-driven workflow this guide otherwise uses.
@@ -191,13 +207,22 @@ If you're instead working inside the notebook UI rather than this guide's CLI-dr
 
 ## 6. Downloading datasets from Hugging Face
 
-To pull a dataset directly onto the mounted Drive (so it survives past the session):
+This doesn't need a GPU and isn't really part of environment setup, so **run it on your local machine, not inside the Colab session** — better bandwidth and persistent storage than an ephemeral VM, and it doesn't tie up a billed GPU session while a large dataset transfers. Point it at a locally-mounted Drive path (via your own `rclone mount`, independent of the Colab-session `gdrive:` remote this guide otherwise uses):
 
 ```bash
 uvx --from huggingface_hub hf buckets sync \
       hf://buckets/scrollprize/datasets/ink/phercparis4/w00_20231016151002 \
-      /content/drive/ink-dataset/phercparis4/w00_20231016151002
+      ~/google_drive/vesuvius/ink-dataset/phercparis4/w00_20231016151002
 ```
+
+If you'd rather run it from inside the Colab session anyway (e.g. no local Drive mount set up), the same command works against the session's mount instead — just swap the destination for `/content/drive/ink-dataset/phercparis4/w00_20231016151002`.
+
+### Troubleshooting: `RuntimeError: ... IO Error: Input/output error (os error 5)` partway through
+
+Hit this on a real run, at ~90% through a multi-GB sync into a locally-mounted `rclone` Drive. Root cause: the local rclone remote was using **rclone's default shared OAuth client** (no `client_id`/`client_secret` in its config section) — the same shared client this guide already warns is heavily rate-limited (see the "Mounting Google Drive" section above), and which we independently hit `Quota exceeded ... Requests per minute` on during ordinary testing. A bulk sync makes far more API calls than casual use, so it can trip that same per-minute quota partway through a large transfer. FUSE has no rich error channel for "your API quota was exceeded" — it just surfaces a generic `EIO` (`os error 5`) to whatever's writing, which is what Xet's file-reconstruction step hit here.
+
+- **To finish the download**: just re-run the exact same `hf buckets sync` command. It diffs source vs. destination first (see below), so it should skip everything already downloaded and only fetch the remaining gap — much less API load, much less likely to re-trip the same limit.
+- **To avoid this on future large syncs**: set up your own OAuth client for whichever local `rclone` remote you're syncing into, the same way this guide has you do for the Colab-side `gdrive:` remote — follow rclone's [own instructions](https://rclone.org/drive/#making-your-own-client-id) and `rclone config reconnect <remote>:` with the new client ID/secret. The shared client is fine for occasional small operations; it isn't for bulk dataset transfers.
 
 ### Verifying the sync actually completed
 
@@ -282,7 +307,7 @@ The two **cache-hit** rows are the real payoff of the wheel-caching work below: 
 **Implemented and confirmed working** in `colab_bootstrap.sh`:
 
 - **Cache key**: the git tree hash of `volume-cartographer/` specifically (`git rev-parse HEAD:volume-cartographer`), not the whole repo's commit — so unrelated changes elsewhere in the monorepo don't invalidate a perfectly good cached wheel, but any real change under `volume-cartographer/` does.
-- **Cache location**: `/content/drive/vesuvius/vc-wheel-cache/<tree-hash>/*.whl` on the mounted Drive — only active when `RCLONE_CONF_LOCAL` is set; otherwise falls back to a session-local `/root/.cache/vc-wheel` with no cross-session reuse.
+- **Cache location**: `/content/drive/vesuvius/vc-wheel-cache/<tree-hash>/*.whl` on the mounted Drive — only active when `RCLONE_CONF_LOCAL` is set; otherwise falls back to a session-local `/root/.cache/vc-wheel` with no cross-session reuse. The benchmark runs below originally used a copy of the shared/default rclone client (rate-limited, see the HF sync troubleshooting note above); re-running against a freshly-reconnected custom-client credential confirmed the exact same cache (and cached wheel) is visible either way, since both point at the same underlying Drive account. Which credential to use is a tradeoff, not a solved problem — see the "token expired" troubleshooting note above: the custom client avoids rate limits but needs reconnecting roughly every 7 days, and the shared client needs no maintenance but is rate-limited under bulk load.
 - **Portability**: confirmed safe. `VC_MARCH_NATIVE` defaults to `OFF` in `CMakeLists.txt`, and the non-native build path compiles for the portable `-march=x86-64-v3` baseline, not `-march=native` — so a wheel built on one Colab host's CPU runs fine on another, and the same cached wheel was successfully reused across both a T4 and an L4 session.
 - **Mechanics**: `uv sync --extra models --no-install-package volume-cartographer` always runs first (fast, resolves everything else from the lockfile). On a cache hit, the cached wheel is installed directly; on a miss, `install_build_deps.sh` runs, the RAM-aware job cap is computed, `uv build --wheel` compiles exactly once, and the result is both installed and left in the cache dir for next time.
 - **Known limitation**: `install_build_deps.sh` still runs on every cache miss (needed for the runtime shared-library deps the compiled `.so` links against — Qt6/OpenCV/CGAL/Ceres — not just for building), so a cache hit doesn't skip *all* setup work, only the actual C++ compile.
