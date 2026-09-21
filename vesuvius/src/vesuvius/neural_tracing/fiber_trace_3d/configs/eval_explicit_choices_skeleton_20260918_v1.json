@@ -23,14 +23,16 @@
       "spacing": 1.0
     },
     "choice": {
-      "max_ports": 14
+      "max_ports": 64
     },
     "solver": {
       "max_iterations": 2000,
       "function_tolerance": 1e-06
     },
     "workers": 16,
-    "route_through_centre": false
+    "route_through_centre": false,
+    "lookahead_length_base": 128,
+    "beam_width": 16
   },
   "devices": "0,1,2,3,4,5,6,7",
   "gpu_manager": {

@@ -19,8 +19,11 @@ namespace vc::fiber_tracer
 {
 
 struct FiberSkeletonChoiceConfig {
-    // A region with more items (sub-ports) than this is left unresolved.
-    std::size_t maxPorts = 8;
+    // A region with more items (sub-ports) than this is left unresolved. It
+    // is only a runtime guard now: the cost of a region is one short solve
+    // per pair of items on different ports, so 64 items is about two thousand
+    // solves, not an enumeration.
+    std::size_t maxPorts = 64;
     // See `FiberSkeletonTraceConfig::routeThroughCentre`.
     bool routeThroughCentre = true;
     // The initial geometry of a connection is the cheapest path through the

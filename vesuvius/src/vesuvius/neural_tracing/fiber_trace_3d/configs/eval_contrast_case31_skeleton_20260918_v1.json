@@ -4,7 +4,7 @@
   "checkpoint": "/ephemeral/hendrik/fiber3d_train2/evaluations/fullres_refinement_213753_best_ema999_off_20260917_v1/frozen/live_inference/_models/5ec278f71b15b27187b55805310176fe2fa3b00c5264fc528b95bc6d0690206e/snapshot.pt",
   "checkpoint_sha256": "5ec278f71b15b27187b55805310176fe2fa3b00c5264fc528b95bc6d0690206e",
   "native_binary": "/home/hendrik/villa2/volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_metric",
-  "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/contrast_case31_skeleton_20260919_r3",
+  "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/contrast_case31_skeleton_20260919_beam4_h1024",
   "backend": "skeleton",
   "skeleton": {
     "tube_radius_base": 32,
@@ -23,14 +23,16 @@
       "spacing": 1.0
     },
     "choice": {
-      "max_ports": 14
+      "max_ports": 64
     },
     "solver": {
       "max_iterations": 2000,
       "function_tolerance": 1e-06
     },
     "workers": 16,
-    "route_through_centre": false
+    "route_through_centre": false,
+    "lookahead_length_base": 1024,
+    "beam_width": 16
   },
   "devices": "0,1,2,3,4,5,6,7",
   "gpu_manager": {

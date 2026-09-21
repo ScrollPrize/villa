@@ -88,38 +88,50 @@ struct RouteSegment {
 // region's connection for it. Nothing is chosen ahead of tracing.
 struct RouteNetwork {
     std::vector<RouteSegment> segments;
-    // (line, end, candidate) -> segment of the variant entered there.
-    std::map<std::tuple<std::size_t, std::size_t, std::size_t>, std::size_t> lineEntry;
-    // (region, port, candidate) -> segment of the connection entered there.
-    std::map<std::tuple<std::size_t, std::size_t, std::size_t>, std::size_t> regionEntry;
+    std::vector<double> segmentCost;     // the element's refined cost
+    std::vector<double> segmentLength;   // base voxels
+    using Key = std::tuple<std::size_t, std::size_t, std::size_t>;
+    // (line, end, candidate) -> every variant with that candidate at that end.
+    std::map<Key, std::vector<std::size_t>> lineOptions;
+    // (region, port, candidate) -> every available connection from there.
+    std::map<Key, std::vector<std::size_t>> regionOptions;
 };
 
 RouteNetwork buildRouteNetwork(const FiberSkeletonModel& model)
 {
     RouteNetwork network;
+    // The seam centre of a wide section is a routing target only when asked;
+    // otherwise no variant or connection ending on it enters the network.
+    const auto usable = [&](std::size_t port, std::size_t candidate) {
+        if (model.config.routeThroughCentre || port == kFiberSkeletonNoIndex)
+            return true;
+        const auto& flags = model.topology.ports[port].candidateIsFibre;
+        return candidate >= flags.size() || flags[candidate] != 0;
+    };
+    const auto add = [&](RouteSegment segment, double cost) {
+        network.segmentLength.push_back(fiberPolylineLength(segment.pointsBaseXYZ));
+        network.segmentCost.push_back(cost);
+        network.segments.push_back(std::move(segment));
+        return network.segments.size() - 1;
+    };
     for (const auto& line : model.topology.lines) {
-        std::vector<std::size_t> segmentOfVariant(
-            line.variants.size(), kFiberSkeletonNoIndex);
-        for (std::size_t index = 0; index < line.variants.size(); ++index) {
-            const auto& variant = line.variants[index];
+        for (const auto& variant : line.variants) {
             if (variant.pointsBaseXYZ.size() < 2)
                 continue;
+            if (!usable(line.portIds[0], variant.candidates[0]) ||
+                !usable(line.portIds[1], variant.candidates[1])) {
+                continue;
+            }
             RouteSegment segment;
             segment.sourceId = line.id;
             segment.portIds = line.portIds;
             segment.candidates = variant.candidates;
             segment.pointsBaseXYZ = variant.pointsBaseXYZ;
-            segmentOfVariant[index] = network.segments.size();
-            network.segments.push_back(std::move(segment));
-        }
-        for (std::size_t end = 0; end < 2; ++end) {
-            for (std::size_t candidate = 0;
-                 candidate < line.entryVariants[end].size(); ++candidate) {
-                const auto variant = line.entryVariants[end][candidate];
-                if (variant != kFiberSkeletonNoIndex &&
-                    segmentOfVariant[variant] != kFiberSkeletonNoIndex) {
-                    network.lineEntry[{line.id, end, candidate}] =
-                        segmentOfVariant[variant];
+            const auto index = add(std::move(segment), variant.cost.total());
+            for (std::size_t end = 0; end < 2; ++end) {
+                if (line.portIds[end] != kFiberSkeletonNoIndex) {
+                    network.lineOptions[{line.id, end, variant.candidates[end]}]
+                        .push_back(index);
                 }
             }
         }
@@ -128,11 +140,13 @@ RouteNetwork buildRouteNetwork(const FiberSkeletonModel& model)
         if (choice.portLimitExceeded)
             continue;
         const auto& region = model.topology.regions[choice.regionId];
-        std::vector<std::size_t> segmentOfConnection(
-            choice.connections.size(), kFiberSkeletonNoIndex);
         for (const auto& connection : choice.connections) {
             if (!connection.available || connection.pointsBaseXYZ.size() < 2)
                 continue;
+            if (!usable(region.portIds[connection.portIds[0]], connection.candidates[0]) ||
+                !usable(region.portIds[connection.portIds[1]], connection.candidates[1])) {
+                continue;
+            }
             RouteSegment segment;
             segment.connection = true;
             segment.sourceId = connection.id;
@@ -141,22 +155,216 @@ RouteNetwork buildRouteNetwork(const FiberSkeletonModel& model)
                                region.portIds[connection.portIds[1]]};
             segment.candidates = connection.candidates;
             segment.pointsBaseXYZ = connection.pointsBaseXYZ;
-            segmentOfConnection[connection.id] = network.segments.size();
-            network.segments.push_back(std::move(segment));
-        }
-        for (std::size_t index = 0; index < choice.items.size() &&
-             index < choice.entryConnections.size(); ++index) {
-            const auto connection = choice.entryConnections[index];
-            if (connection == kFiberSkeletonNoIndex ||
-                segmentOfConnection[connection] == kFiberSkeletonNoIndex) {
-                continue;
+            const auto index = add(std::move(segment), connection.costTotal);
+            for (std::size_t end = 0; end < 2; ++end) {
+                network.regionOptions[{choice.regionId,
+                                       network.segments[index].portIds[end],
+                                       network.segments[index].candidates[end]}]
+                    .push_back(index);
             }
-            const auto& item = choice.items[index];
-            network.regionEntry[{choice.regionId, region.portIds[item.slot],
-                                 item.candidate}] = segmentOfConnection[connection];
         }
     }
     return network;
+}
+
+// The segments a fibre may continue on after leaving `segment` at the
+// sub-port (`exitPort`, `exitCandidate`): out of a line into the region
+// beyond it, out of a connection into the line beyond it, or across a shared
+// midpoint port into the other region.
+std::vector<std::size_t> continuationsFrom(
+    const RouteNetwork& network, const FiberSkeletonModel& model,
+    std::size_t segment, std::size_t exitPort, std::size_t exitCandidate)
+{
+    std::vector<std::size_t> options;
+    if (exitPort == kFiberSkeletonNoIndex)
+        return options;
+    const auto& current = network.segments[segment];
+    const auto& port = model.topology.ports[exitPort];
+    const auto take = [&](const auto& table, const RouteNetwork::Key& key) {
+        const auto found = table.find(key);
+        if (found != table.end())
+            options.insert(options.end(), found->second.begin(), found->second.end());
+    };
+    if (current.connection) {
+        const std::size_t other = port.shared
+            ? (port.regionIds[0] == current.regionId ? port.regionIds[1]
+                                                     : port.regionIds[0])
+            : kFiberSkeletonNoIndex;
+        if (other != kFiberSkeletonNoIndex) {
+            take(network.regionOptions, {other, exitPort, exitCandidate});
+        } else {
+            for (const auto& line : model.topology.lines) {
+                for (std::size_t end = 0; end < 2; ++end) {
+                    if (line.portIds[end] == exitPort)
+                        take(network.lineOptions, {line.id, end, exitCandidate});
+                }
+            }
+        }
+    } else {
+        take(network.regionOptions, {port.regionIds[0], exitPort, exitCandidate});
+    }
+    return options;
+}
+
+// Where a segment entered at (`enterPort`, `enterCandidate`) exits.
+std::pair<std::size_t, std::size_t> exitOf(
+    const RouteSegment& segment, std::size_t enterPort, std::size_t enterCandidate)
+{
+    const bool atStart =
+        segment.portIds[0] == enterPort && segment.candidates[0] == enterCandidate;
+    return atStart ? std::make_pair(segment.portIds[1], segment.candidates[1])
+                   : std::make_pair(segment.portIds[0], segment.candidates[0]);
+}
+
+// Receding-horizon beam search over the sub-port graph. From the sub-port
+// the trace is leaving through, every continuation is expanded until the
+// route has covered `horizonBase` of arc, the element that crosses the
+// horizon counted pro rata, so every live route is compared over the same
+// length and cost decides between them. Routes that die before the horizon
+// rank after every live one, longest first. `beamWidth` partial routes are
+// kept per expansion. The first element of the best route is taken; the
+// search runs again at the next sub-port, so a branch that dies inside the
+// horizon is never entered while another continues.
+struct RouteChoice {
+    std::size_t segment = kFiberSkeletonNoIndex;
+    bool continues = false;
+    // Cost per unit length of the best route, for comparing seeds.
+    double density = std::numeric_limits<double>::infinity();
+    double length = 0.0;
+};
+
+RouteChoice chooseContinuation(
+    const RouteNetwork& network, const FiberSkeletonModel& model,
+    const std::vector<std::size_t>& firstOptions, std::size_t enterPort,
+    std::size_t enterCandidate, const std::set<std::size_t>& visited,
+    double horizonBase, double requiredBase, std::size_t beamWidth)
+{
+    // Elements are cheap to expand but a route could in principle wander
+    // through many tiny ones; this only bounds the loop.
+    constexpr int kMaxElements = 64;
+    struct Partial {
+        std::size_t first = kFiberSkeletonNoIndex;
+        std::size_t last = kFiberSkeletonNoIndex;
+        std::size_t exitPort = kFiberSkeletonNoIndex;
+        std::size_t exitCandidate = 0;
+        double cost = 0.0;
+        double length = 0.0;
+        int depth = 0;
+        bool alive = true;      // can still be extended
+        bool complete = false;  // reached the horizon
+        std::vector<std::size_t> path;
+    };
+    // Adds an element, cutting it at the horizon so no route is credited
+    // beyond it.
+    const auto extend = [&](Partial& partial, std::size_t option) {
+        const double length = network.segmentLength[option];
+        const double cost = network.segmentCost[option];
+        const double remaining = horizonBase - partial.length;
+        if (length > remaining && length > 1e-9) {
+            partial.cost += cost * (remaining / length);
+            partial.length = horizonBase;
+            partial.complete = true;
+        } else {
+            partial.cost += cost;
+            partial.length += length;
+            partial.complete = partial.length >= horizonBase;
+        }
+    };
+    const auto density = [](const Partial& partial) {
+        return partial.length > 1e-9 ? partial.cost / partial.length
+                                     : std::numeric_limits<double>::infinity();
+    };
+    // A route that dies after covering what the reference still needs has
+    // reached the target area; the crop holds no prediction beyond it, so
+    // dying there is not a dead end.
+    const auto settle = [&](Partial& partial) {
+        if (!partial.alive && !partial.complete && partial.length >= requiredBase)
+            partial.complete = true;
+    };
+    // Complete routes first, by cost per unit length (equal to cost over the
+    // common horizon, and still comparable where the reference end cuts a
+    // route short); then routes that died, longest first, then by density.
+    const auto better = [&](const Partial& a, const Partial& b) {
+        if (a.complete != b.complete)
+            return a.complete;
+        if (a.complete)
+            return density(a) < density(b);
+        if (a.length != b.length)
+            return a.length > b.length;
+        return density(a) < density(b);
+    };
+
+    std::vector<Partial> frontier;
+    for (const auto option : firstOptions) {
+        if (visited.count(option) != 0)
+            continue;
+        Partial partial;
+        partial.first = option;
+        partial.last = option;
+        const auto exit = exitOf(network.segments[option], enterPort, enterCandidate);
+        partial.exitPort = exit.first;
+        partial.exitCandidate = exit.second;
+        extend(partial, option);
+        partial.depth = 1;
+        partial.path = {option};
+        partial.alive = partial.exitPort != kFiberSkeletonNoIndex && !partial.complete;
+        settle(partial);
+        frontier.push_back(std::move(partial));
+    }
+    std::vector<Partial> finished;
+    for (int depth = 1; depth < kMaxElements && !frontier.empty(); ++depth) {
+        std::vector<Partial> next;
+        for (auto& partial : frontier) {
+            if (!partial.alive) {
+                finished.push_back(std::move(partial));
+                continue;
+            }
+            const auto options = continuationsFrom(
+                network, model, partial.last, partial.exitPort, partial.exitCandidate);
+            bool extended = false;
+            for (const auto option : options) {
+                if (visited.count(option) != 0 ||
+                    std::find(partial.path.begin(), partial.path.end(), option) !=
+                        partial.path.end()) {
+                    continue;
+                }
+                Partial grown = partial;
+                grown.last = option;
+                const auto exit = exitOf(network.segments[option],
+                                         partial.exitPort, partial.exitCandidate);
+                grown.exitPort = exit.first;
+                grown.exitCandidate = exit.second;
+                extend(grown, option);
+                ++grown.depth;
+                grown.path.push_back(option);
+                grown.alive = grown.exitPort != kFiberSkeletonNoIndex && !grown.complete;
+                settle(grown);
+                next.push_back(std::move(grown));
+                extended = true;
+            }
+            if (!extended) {
+                partial.alive = false;
+                settle(partial);
+                finished.push_back(std::move(partial));
+            }
+        }
+        std::sort(next.begin(), next.end(), better);
+        if (next.size() > beamWidth)
+            next.resize(beamWidth);
+        frontier = std::move(next);
+    }
+    for (auto& partial : frontier)
+        finished.push_back(std::move(partial));
+
+    RouteChoice choice;
+    if (finished.empty())
+        return choice;
+    const auto best = std::min_element(finished.begin(), finished.end(), better);
+    choice.segment = best->first;
+    choice.continues = best->complete;
+    choice.density = density(*best);
+    choice.length = best->length;
+    return choice;
 }
 
 struct SeedLocation {
@@ -423,6 +631,9 @@ void validateFiberSkeletonTraceConfig(const FiberSkeletonTraceConfig& config)
     requireFinitePositive(config.entryOffsetBase, "entry offset");
     requireFinitePositive(config.sectionRadiusBase, "section radius");
     requireFinitePositive(config.searchRadiusBase, "search radius");
+    requireFinitePositive(config.lookaheadLengthBase, "lookahead length");
+    if (config.beamWidth < 1)
+        throw std::invalid_argument("beam width must be at least one");
     requireFiniteNonNegative(config.candidateMinOffsetBase, "candidate offset");
     requireFiniteNonNegative(
         config.candidateRefineRadiusBase, "candidate refine radius");
@@ -551,32 +762,76 @@ FiberSkeletonReplayResult traceFiberSkeletonReplay(
         [&](const PolylineArcSample& start, double segmentRemainingBase,
             int maximumSteps, const ReplayPointObserver& observe,
             const FiberTraceProgressCallback& segmentProgress) {
-            (void)segmentRemainingBase;
             FiberSkeletonSegmentReport report;
             report.startReferenceArcBase = start.arc;
 
             auto seed =
                 findSeed(network, start.point, normalizedOrZero(start.tangent));
-            // Variants of one line coincide near their ends, so the nearest
-            // one is arbitrary among them. The trace is entering the line
-            // through the sub-port behind it, so it follows that sub-port's
-            // own route, as it would had it arrived there from the network.
-            if (seed.segment != kFiberSkeletonNoIndex &&
-                !network.segments[seed.segment].connection) {
-                const auto& found = network.segments[seed.segment];
-                const std::size_t entryEnd = seed.forward ? 0 : 1;
-                const auto entry = network.lineEntry.find(
-                    {found.sourceId, entryEnd, found.candidates[entryEnd]});
-                if (entry != network.lineEntry.end() &&
-                    entry->second != seed.segment) {
-                    const auto& replacement = network.segments[entry->second];
-                    const double length =
-                        fiberPolylineLength(replacement.pointsBaseXYZ);
-                    seed.arcBase = std::min(seed.arcBase, length);
-                    seed.pointBaseXYZ = fiberPolylinePointAtArc(
-                        replacement.pointsBaseXYZ, seed.arcBase);
-                    seed.segment = entry->second;
+            // Several segments can lie within the seed tolerance of the
+            // reference start: the variants of one line coincide near their
+            // ends, and a connection stub may end right there. The seed is
+            // chosen among all of them by the same lookahead the walk uses,
+            // so a seed onto a route that dies is never taken while one that
+            // continues is available; among continuing ones the cheapest,
+            // then the nearest.
+            if (seed.segment != kFiberSkeletonNoIndex) {
+                const double tolerance = std::max(
+                    2.0 * model.config.stepBase, request.errorThresholdBaseVoxels);
+                struct SeedOption {
+                    SeedLocation location;
+                    RouteChoice route;
+                };
+                std::vector<SeedOption> options;
+                for (std::size_t index = 0; index < network.segments.size(); ++index) {
+                    const auto& segment = network.segments[index];
+                    double arc = 0.0;
+                    SeedLocation candidate;
+                    for (std::size_t vertex = 1; vertex < segment.pointsBaseXYZ.size(); ++vertex) {
+                        const cv::Vec3d delta = segment.pointsBaseXYZ[vertex] - segment.pointsBaseXYZ[vertex - 1];
+                        const double lengthSquared = delta.dot(delta);
+                        const double segmentLength = std::sqrt(std::max(0.0, lengthSquared));
+                        const double t = lengthSquared > kEpsilon
+                            ? std::clamp((start.point - segment.pointsBaseXYZ[vertex - 1]).dot(delta) / lengthSquared, 0.0, 1.0)
+                            : 0.0;
+                        const cv::Vec3d projected = segment.pointsBaseXYZ[vertex - 1] + delta * t;
+                        const double distance = cv::norm(start.point - projected);
+                        if (distance < candidate.distanceBase) {
+                            candidate.distanceBase = distance;
+                            candidate.segment = index;
+                            candidate.arcBase = arc + segmentLength * t;
+                            candidate.pointBaseXYZ = projected;
+                            candidate.forward = normalizedOrZero(delta).dot(normalizedOrZero(start.tangent)) >= 0.0;
+                        }
+                        arc += segmentLength;
+                    }
+                    if (candidate.segment == kFiberSkeletonNoIndex ||
+                        candidate.distanceBase > seed.distanceBase + tolerance) {
+                        continue;
+                    }
+                    // The route from here onward: this segment, entered at the
+                    // end behind the walker, and its lookahead.
+                    const std::size_t entryEnd = candidate.forward ? 0 : 1;
+                    SeedOption option;
+                    option.location = candidate;
+                    option.route = chooseContinuation(
+                        network, model, {index}, segment.portIds[entryEnd],
+                        segment.candidates[entryEnd], {},
+                        model.config.lookaheadLengthBase, segmentRemainingBase,
+                        model.config.beamWidth);
+                    options.push_back(std::move(option));
                 }
+                const auto better = [](const SeedOption& a, const SeedOption& b) {
+                    if (a.route.continues != b.route.continues)
+                        return a.route.continues;
+                    if (!a.route.continues && a.route.length != b.route.length)
+                        return a.route.length > b.route.length;
+                    if (std::abs(a.route.density - b.route.density) > 1e-9)
+                        return a.route.density < b.route.density;
+                    return a.location.distanceBase < b.location.distanceBase;
+                };
+                const auto best = std::min_element(options.begin(), options.end(), better);
+                if (best != options.end())
+                    seed = best->location;
             }
             if (seed.segment == kFiberSkeletonNoIndex) {
                 ++result.unseededSegments;
@@ -666,50 +921,41 @@ FiberSkeletonReplayResult traceFiberSkeletonReplay(
                     reason = kFiberSkeletonTerminal;
                     break;
                 }
-                // The continuation belongs to the sub-port: out of a line
-                // into the region beyond it, out of a connection into the
-                // line beyond it, or across a shared midpoint port into the
-                // other region.
-                std::size_t nextSegment = kFiberSkeletonNoIndex;
-                const auto& exitPortRef = model.topology.ports[exitPort];
-                if (segment.connection) {
-                    const std::size_t other = exitPortRef.shared
-                        ? (exitPortRef.regionIds[0] == segment.regionId
-                               ? exitPortRef.regionIds[1] : exitPortRef.regionIds[0])
-                        : kFiberSkeletonNoIndex;
-                    if (other != kFiberSkeletonNoIndex) {
-                        const auto found = network.regionEntry.find(
-                            {other, exitPort, exitCandidate});
-                        if (found != network.regionEntry.end())
-                            nextSegment = found->second;
-                    } else {
-                        for (const auto& line : model.topology.lines) {
-                            for (std::size_t end = 0; end < 2; ++end) {
-                                if (line.portIds[end] != exitPort)
-                                    continue;
-                                const auto found = network.lineEntry.find(
-                                    {line.id, end, exitCandidate});
-                                if (found != network.lineEntry.end())
-                                    nextSegment = found->second;
-                            }
-                        }
-                    }
-                } else {
-                    const auto found = network.regionEntry.find(
-                        {exitPortRef.regionIds[0], exitPort, exitCandidate});
-                    if (found != network.regionEntry.end())
-                        nextSegment = found->second;
-                }
+                const auto options = continuationsFrom(
+                    network, model, segmentIndex, exitPort, exitCandidate);
+                // A route that reaches what the reference still asks for
+                // is complete even if the network ends right after it.
+                const auto chosen = chooseContinuation(
+                    network, model, options, exitPort, exitCandidate, visited,
+                    model.config.lookaheadLengthBase,
+                    std::max(0.0, segmentRemainingBase - routed),
+                    model.config.beamWidth);
+                const std::size_t nextSegment = chosen.segment;
                 if (nextSegment == kFiberSkeletonNoIndex) {
-                    // The sub-port has no continuation on the other side:
-                    // its region could not be resolved, or has no connection
-                    // through its skeleton, or the line has no variant.
+                    // The sub-port has no continuation on the other side. A
+                    // port with no line behind it, or whose region has one
+                    // port, is where the skeleton ends; a region over the
+                    // port limit is unresolved; anything else is a sub-port
+                    // the network does not connect.
+                    const auto& exitPortRef = model.topology.ports[exitPort];
                     const std::size_t region = exitPortRef.regionIds[0];
-                    reason = region != kFiberSkeletonNoIndex &&
-                            region < model.choices.size() &&
-                            model.choices[region].portLimitExceeded
-                        ? kFiberSkeletonRegionUnresolved
-                        : kFiberSkeletonUnmatchedPort;
+                    bool lineBehind = false;
+                    for (const auto& line : model.topology.lines) {
+                        if (line.portIds[0] == exitPort || line.portIds[1] == exitPort)
+                            lineBehind = true;
+                    }
+                    const bool singlePortRegion = region != kFiberSkeletonNoIndex &&
+                        model.topology.regions[region].portIds.size() <= 1;
+                    if (region != kFiberSkeletonNoIndex &&
+                        region < model.choices.size() &&
+                        model.choices[region].portLimitExceeded) {
+                        reason = kFiberSkeletonRegionUnresolved;
+                    } else if ((segment.connection && !lineBehind && !exitPortRef.shared) ||
+                               (!segment.connection && singlePortRegion)) {
+                        reason = kFiberSkeletonTerminal;
+                    } else {
+                        reason = kFiberSkeletonUnmatchedPort;
+                    }
                     break;
                 }
                 const auto& next = network.segments[nextSegment];
@@ -768,6 +1014,8 @@ nlohmann::json fiberSkeletonModelJson(
         {"candidate_refine_radius_base", config.candidateRefineRadiusBase},
         {"search_radius_base", config.searchRadiusBase},
         {"route_through_centre", config.routeThroughCentre},
+        {"lookahead_length_base", config.lookaheadLengthBase},
+        {"beam_width", config.beamWidth},
         {"dump_crop_presence", config.dumpCropPresence},
         {"render_line_variants", config.renderLineVariants},
         {"step_base", config.stepBase},

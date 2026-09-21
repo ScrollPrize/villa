@@ -44,6 +44,11 @@ struct FiberSkeletonTraceConfig {
     // leaves through the extremes there, and the centre remains only where it
     // is a port's single candidate.
     bool routeThroughCentre = true;
+    // The walk is a receding-horizon beam search over the sub-port graph:
+    // how much arc it looks ahead, so routes are compared over one common
+    // length, and how many partial routes it keeps per expansion.
+    double lookaheadLengthBase = 256.0;
+    std::size_t beamWidth = 16;
     // Writes the thresholding input beside the other artifacts, as raw bytes in
     // the crop's own Z,Y,X order. It is a diagnostic: it lets the geometry be
     // re-measured against the prediction offline instead of by rebuilding.

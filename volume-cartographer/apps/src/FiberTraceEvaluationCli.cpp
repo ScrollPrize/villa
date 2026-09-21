@@ -494,7 +494,8 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             "spur_prune_max_base", "entry_offset_base",
             "dump_crop_presence", "render_line_variants", "section_radius_base",
             "candidate_min_offset_base", "candidate_refine_radius_base",
-            "search_radius_base", "route_through_centre",
+            "search_radius_base", "route_through_centre", "lookahead_length_base",
+            "beam_width",
             "step_base", "nominal_step_base", "weights", "choice", "solver",
             "workers"};
         for (const auto& [name, value] : settings.items())
@@ -529,6 +530,10 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             "search_radius_base", skeletonConfig.searchRadiusBase);
         skeletonConfig.routeThroughCentre = settings.value(
             "route_through_centre", skeletonConfig.routeThroughCentre);
+        skeletonConfig.lookaheadLengthBase = settings.value(
+            "lookahead_length_base", skeletonConfig.lookaheadLengthBase);
+        skeletonConfig.beamWidth = settings.value(
+            "beam_width", skeletonConfig.beamWidth);
         skeletonConfig.stepBase = settings.value(
             "step_base", skeletonConfig.stepBase);
         skeletonConfig.nominalStepBase = settings.value(
