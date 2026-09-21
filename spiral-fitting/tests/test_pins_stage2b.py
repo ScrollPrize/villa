@@ -283,3 +283,33 @@ def test_sampled_subset_persists_for_rebin_interval():
     assert model.compute_pins(full=True).shape[0] == model.pin_registry.num_pins
     model.get_shared_transform_tensors()
     assert model._pin_view['indices'].numel() == 20
+
+
+def test_step_patch_pin_subset_is_exact_for_chosen_patches():
+    """With step patches set, the training subset is every pin of those
+    patches plus all chain/isolated pins at registry footprints; the loss's
+    patch draw and the pins then agree by construction."""
+    model = scene()
+    reg = model.pin_registry
+    assert reg.patch_index is not None
+    patches = torch.unique(reg.patch_index[reg.patch_index >= 0])
+    chosen = patches[:1]
+    model.cfg['sample_count_pins'] = 10 ** 6
+    model.set_step_pin_patches(chosen)
+    pins_t = model.compute_pins(subsample=True)
+    idx = model._pin_view['indices']
+    expected = (reg.kind != pins.PIN_KIND_PATCH) | torch.isin(reg.patch_index, chosen)
+    assert torch.equal(torch.sort(idx).values, torch.nonzero(expected, as_tuple=True)[0])
+    assert torch.equal(model._pin_view['eps_theta'], reg.eps_theta[idx])
+    assert torch.equal(model.active_step_pin_patches(), chosen)
+    assert pins_t.shape[0] == idx.numel()
+    # Budget thinning keeps every chain pin and widens the remaining patch pins.
+    model.cfg['sample_count_pins'] = int((reg.kind != pins.PIN_KIND_PATCH).sum()) + 4
+    model.compute_pins(subsample=True)
+    idx2 = model._pin_view['indices']
+    assert idx2.numel() == model.cfg['sample_count_pins']
+    assert bool(torch.isin(torch.nonzero(reg.kind != pins.PIN_KIND_PATCH, as_tuple=True)[0], idx2).all())
+    assert (model._pin_view['eps_z'] >= reg.eps_z[idx2]).all()
+    model.set_step_pin_patches(None)
+    model.compute_pins(subsample=True)
+    assert model.active_step_pin_patches() is None

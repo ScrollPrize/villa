@@ -3366,9 +3366,8 @@ class FitContext:
         """
         model = self.spiral_and_transform
         started_at = time.perf_counter()
-        if self.pin_targets_loaded:
-            registry = model.pin_registry
-        else:
+
+        def finalize_fresh():
             with torch.no_grad():
                 intermediate = model.get_slice_to_intermediate_transform()
                 dr = model.get_dr_per_winding()
@@ -3380,7 +3379,7 @@ class FitContext:
                     idx = slot.clamp(0, gaps.shape[-1] - 1)
                     return torch.gather(gaps, -1, idx[:, None]).squeeze(-1)
 
-                registry = pins_module.finalize_registry(
+                return pins_module.finalize_registry(
                     self.pin_graph,
                     intermediate_transform=intermediate, dr=dr,
                     canonical_transform=model.get_unpinned_slice_to_spiral_transform(),
@@ -3389,6 +3388,20 @@ class FitContext:
                     min_z=float(self.flow_min_corner_spiral_zyx[0]),
                     max_z=float(self.flow_max_corner_spiral_zyx[0]),
                     device=self.device)
+
+        if self.pin_targets_loaded:
+            registry = model.pin_registry
+            if registry.patch_index is None:
+                # Registry saved before per-pin patch indices existed: the
+                # same graph emits pins in the same order, so borrow them.
+                fresh = finalize_fresh()
+                if fresh.num_pins == registry.num_pins and torch.equal(fresh.zyx, registry.zyx):
+                    registry.patch_index = fresh.patch_index
+                elif self.dist.is_main_process:
+                    print('WARNING: could not backfill pin patch indices from the constraint graph; '
+                          'pins fall back to uniform subsampling')
+        else:
+            registry = finalize_fresh()
         model.set_pin_registry(registry, reset_targets=not self.pin_targets_loaded)
         if self.dist.is_main_process:
             print(registry.summary())
@@ -3410,6 +3423,27 @@ class FitContext:
         if self.pin_targets_loaded and self.start_iteration >= warmup:
             model.pins_active = True
             self.slice_to_spiral_transform = model.get_slice_to_spiral_transform()
+
+    def _draw_step_pin_patches(self):
+        """Draw this step's patch set for the pins and the patch losses."""
+        num = len(self.verified_patches_list)
+        count = min(num, max(int(self.config['sample_count_patches_per_step']),
+                             int(self.config['sample_count_patches_per_step_for_dt'])))
+        probs = self.patch_sampling_probabilities
+        drawn = np.random.choice(num, count, replace=False, p=probs)
+        return np.unique(drawn)
+
+    def _restrict_patch_probabilities(self, patch_indices):
+        """Patch sampling probabilities supported only on ``patch_indices``."""
+        num = len(self.verified_patches_list)
+        base = (np.ones(num, dtype=np.float64) / num if self.patch_sampling_probabilities is None
+                else np.asarray(self.patch_sampling_probabilities, dtype=np.float64))
+        mask = np.zeros(num, dtype=np.float64)
+        mask[np.asarray(patch_indices.cpu() if torch.is_tensor(patch_indices) else patch_indices)] = 1.0
+        probs = base * mask
+        if probs.sum() <= 0:
+            probs = mask
+        return probs / probs.sum()
 
     def _maybe_activate_pins(self, iteration):
         model = self.spiral_and_transform
@@ -3511,7 +3545,8 @@ class FitContext:
         # registry's estimate from the model state at construction, which is
         # stale once the soft fit has moved on. Such a checkpoint keeps its
         # registry but re-estimates T at activation (_maybe_activate_pins).
-        saved_active = bool(checkpoint.get('pins_active', False))
+        # (Checkpoints predating the flag are taken as active: legacy behaviour.)
+        saved_active = bool(checkpoint.get('pins_active', True))
         if (saved_T is not None and tuple(saved_T.shape) == tuple(live.shape)
                 and fingerprint == self.pin_graph.fingerprint()):
             self.spiral_and_transform.set_pin_registry(
@@ -5825,7 +5860,17 @@ class FitContext:
         # accumulated across families flow through the real shared paths once,
         # next to the flow-field gradient flush below.
         self._maybe_activate_pins(iteration)
+        # Pin subset for this step: every pin of the patches the patch losses
+        # will sample (drawn here, the losses then draw from that set), so the
+        # pinned map is exact where it is evaluated rather than a thin uniform
+        # subsample smeared over widened footprints.
+        step_patch_probabilities = self.patch_sampling_probabilities
+        if self.spiral_and_transform._pins_enabled() and self.verified_patches_list:
+            self.spiral_and_transform.set_step_pin_patches(self._draw_step_pin_patches())
         shared_transform_outputs = self.spiral_and_transform.get_shared_transform_tensors()
+        active_patches = self.spiral_and_transform.active_step_pin_patches()
+        if active_patches is not None and self.verified_patches_list:
+            step_patch_probabilities = self._restrict_patch_probabilities(active_patches)
         shared_transform_leaves = tuple(
             output.detach().requires_grad_(True) for output in shared_transform_outputs)
         self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform(
@@ -5951,7 +5996,7 @@ class FitContext:
             self.config['sample_count_patches_per_step_for_dt'],
             self.verified_patches_list,
             self.patch_atlas,
-            self.patch_sampling_probabilities,
+            step_patch_probabilities,
             self.umbilicus_zyx,
             compute_dt=compute_patch_dt,
             shell_valid_zyxs=self.shell_valid_zyxs_gpu,

@@ -1,3 +1,4 @@
+import math
 import os
 
 import numpy as np
@@ -779,6 +780,52 @@ class SpiralAndTransform(nn.Module):
         eps_z = (registry.eps_z[indices] * widen).clamp(max=rule[1])
         return indices, eps_theta, eps_z
 
+    def set_step_pin_patches(self, patch_indices):
+        """Candidate atlas patch indices for the next step's pin subset.
+
+        When set, the training subset is every pin of these patches plus all
+        chain and isolated pins, at their registry footprints, so the pinned
+        map is exact where this step's patch losses sample (the losses draw
+        from ``active_step_pin_patches()``). ``None`` restores the uniform
+        stratified subsample.
+        """
+        self._pin_step_patches = None if patch_indices is None else torch.as_tensor(
+            patch_indices, dtype=torch.int64).reshape(-1)
+
+    def active_step_pin_patches(self):
+        """The patch set the current pin subset was built from (or None)."""
+        view = getattr(self, '_pin_view', None)
+        return None if view is None else view.get('step_patches')
+
+    def sample_pin_subset_for_patches(self, patch_indices, sample_count):
+        """Pins of ``patch_indices`` plus every chain/isolated pin.
+
+        Over ``sample_count`` (when positive) the patch pins are thinned
+        uniformly and widened like :meth:`sample_pin_subset`.
+        """
+        registry = self.pin_registry
+        device = registry.zyx.device
+        patch_indices = patch_indices.to(device)
+        keep = (registry.kind != pins_module.PIN_KIND_PATCH) | torch.isin(registry.patch_index, patch_indices)
+        indices = torch.nonzero(keep, as_tuple=True)[0]
+        eps_theta = registry.eps_theta[indices]
+        eps_z = registry.eps_z[indices]
+        budget = int(sample_count or 0)
+        if budget > 0 and indices.numel() > budget:
+            is_patch = registry.kind[indices] == pins_module.PIN_KIND_PATCH
+            num_other = int((~is_patch).sum())
+            patch_budget = max(budget - num_other, 1)
+            patch_pins = indices[is_patch]
+            scale = patch_pins.numel() / patch_budget
+            chosen = patch_pins[torch.randperm(patch_pins.numel(), device=device)[:patch_budget]]
+            indices = torch.cat([indices[~is_patch], chosen])
+            caps = self._pin_footprint_caps()
+            widen = torch.where(registry.kind[indices] == pins_module.PIN_KIND_PATCH,
+                                torch.full([indices.numel()], math.sqrt(scale), device=device), torch.ones([indices.numel()], device=device))
+            eps_theta = (registry.eps_theta[indices] * widen).clamp(max=caps[0])
+            eps_z = (registry.eps_z[indices] * widen).clamp(max=caps[1])
+        return indices, eps_theta, eps_z
+
     def _pin_footprint_caps(self):
         return (float(self.cfg.get('model_pin_kernel_max_theta_radians', 0.25)),
                 float(self.cfg.get('model_pin_kernel_max_z_voxels', 200.0)))
@@ -808,13 +855,20 @@ class SpiralAndTransform(nn.Module):
             sample_count = int(self.cfg.get('sample_count_pins', 0) or 0)
             interval = int(self.cfg.get('model_pin_rebin_interval', 1) or 1)
             previous = getattr(self, '_pin_view', None)
+            step_patches = getattr(self, '_pin_step_patches', None)
+            by_patches = step_patches is not None and registry.patch_index is not None
             if (interval > 1 and previous is not None and previous.get('indices') is not None
                     and previous.get('sample_count') == sample_count
                     and previous.get('registry_pins') == registry.num_pins
+                    and previous.get('by_patches') == by_patches
                     and getattr(self, '_pin_groups_age', 0) < interval):
                 subset = (previous['indices'], previous['eps_theta_sampled'], previous['eps_z_sampled'])
+                step_patches = previous.get('step_patches')
+            elif by_patches:
+                subset = self.sample_pin_subset_for_patches(step_patches, sample_count)
             else:
                 subset = self.sample_pin_subset(sample_count)
+                step_patches = None
         if subset is None:
             self._pin_view = {
                 'indices': None, 'component': registry.component,
@@ -830,7 +884,8 @@ class SpiralAndTransform(nn.Module):
                 'n0': registry.n0[indices], 'theta0': registry.theta0[indices],
                 'local_gap': registry.local_gap[indices], 'num_pins': int(indices.numel()),
                 'eps_theta_sampled': eps_theta, 'eps_z_sampled': eps_z,
-                'sample_count': sample_count, 'registry_pins': registry.num_pins}
+                'sample_count': sample_count, 'registry_pins': registry.num_pins,
+                'by_patches': by_patches, 'step_patches': step_patches}
             zyx = registry.zyx[indices]
         view = self._pin_view
         if chunk_size is None and not torch.is_grad_enabled():

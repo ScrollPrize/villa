@@ -1119,6 +1119,7 @@ class PinRegistry:
     patch_component: torch.Tensor
     patch_offset: torch.Tensor
     neighbours: torch.Tensor | None = None  # own-object grid/chain adjacency, -1 = absent
+    patch_index: torch.Tensor | None = None  # atlas patch index per pin, -1 for chain/isolated
 
     @property
     def num_pins(self):
@@ -1141,6 +1142,7 @@ class PinRegistry:
             'patch_component': self.patch_component.cpu(),
             'patch_offset': self.patch_offset.cpu(),
             'neighbours': self.neighbours.cpu() if self.neighbours is not None else None,
+            'patch_index': self.patch_index.cpu() if self.patch_index is not None else None,
         }
 
     @classmethod
@@ -1155,7 +1157,8 @@ class PinRegistry:
             consistency_report={}, local_gap=state['local_gap'].to(device),
             patch_component=state['patch_component'].to(device),
             patch_offset=state['patch_offset'].to(device),
-            neighbours=state['neighbours'].to(device) if state.get('neighbours') is not None else None)
+            neighbours=state['neighbours'].to(device) if state.get('neighbours') is not None else None,
+            patch_index=state['patch_index'].to(device) if state.get('patch_index') is not None else None)
 
     def adjusted_n(self, theta):
         """``n_i(t) = n_i(0) + round((theta0_i - theta_i(t)) / 2pi)``."""
@@ -1367,6 +1370,7 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
     pin_zyx, pin_comp, pin_n, pin_theta, pin_kind = [], [], [], [], []
     spacing_theta, spacing_z, pin_z = [], [], []
     neighbours = []
+    pin_patch = []   # atlas patch index per pin, -1 for chain/isolated pins
     emitted = 0
     for i, node in enumerate(graph.nodes):
         if node.kind != 'patch':
@@ -1408,6 +1412,7 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
         pin_n.append((int(n_node[i]) - pots.to(device).reshape(-1)[sel].to(torch.int64)))
         pin_comp.append(torch.full([int(sel.sum())], int(component_of[i]), dtype=torch.int64, device=device))
         pin_kind.append(torch.full([int(sel.sum())], patch_pin_kind, dtype=torch.int64, device=device))
+        pin_patch.append(torch.full([int(sel.sum())], int(node.patch_index), dtype=torch.int64, device=device))
         spacing_theta.append(sp_t.reshape(-1)[sel])
         spacing_z.append(sp_z.reshape(-1)[sel])
     # Point pins.
@@ -1458,6 +1463,7 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
         pin_n.append(torch.from_numpy(n_node[idx]).to(device))
         pin_comp.append(torch.from_numpy(component_of[idx]).to(device))
         pin_kind.append(kinds)
+        pin_patch.append(torch.full([kinds.shape[0]], -1, dtype=torch.int64, device=device))
         spacing_theta.append(sp_t)
         spacing_z.append(sp_z)
 
@@ -1524,7 +1530,8 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
         fingerprint=graph.fingerprint(), consistency_report=consistency_report,
         local_gap=local_gap.to(torch.float32),
         patch_component=patch_component.to(device), patch_offset=patch_offset.to(device),
-        neighbours=cat(neighbours, torch.int64, (0, 4)))
+        neighbours=cat(neighbours, torch.int64, (0, 4)),
+        patch_index=cat(pin_patch, torch.int64))
 
 
 def _patch_quad_grid(patch_atlas, patch_index, stride, with_node_ids=True):
