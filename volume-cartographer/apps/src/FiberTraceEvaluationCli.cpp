@@ -270,6 +270,29 @@ std::vector<cv::Vec3d> sliceFiberLine(const std::vector<cv::Vec3d>& input,
     return out;
 }
 
+std::vector<cv::Vec3d> sliceFiberLine(const std::vector<cv::Vec3d>& input,
+                                      const std::vector<double>& arc,
+                                      double lo, double hi)
+{
+    if (input.size() < 2 || arc.size() != input.size() ||
+        !(std::isfinite(lo) && std::isfinite(hi) && lo >= 0.0 && hi > lo) ||
+        hi > arc.back() + 1e-6)
+        throw std::invalid_argument("invalid cached trial arc interval");
+    auto at = [&](double s) {
+        const auto it = std::lower_bound(arc.begin(), arc.end(), s);
+        if (it == arc.begin()) return input.front();
+        if (it == arc.end()) return input.back();
+        const size_t i = size_t(it - arc.begin());
+        const double d = arc[i] - arc[i-1];
+        return d > 0.0 ? input[i-1] + (input[i]-input[i-1]) * ((s-arc[i-1])/d) : input[i];
+    };
+    std::vector<cv::Vec3d> out{at(lo)};
+    for (size_t i = 1; i + 1 < input.size(); ++i)
+        if (arc[i] > lo && arc[i] < hi) out.push_back(input[i]);
+    out.push_back(at(hi));
+    return out;
+}
+
 Json selfProximity(const Json& plan, const vc::lasagna::NormalSampler& normals,
                    double threshold, double factor, double separation, double spacing)
 {
@@ -878,6 +901,8 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         const auto& trials = config.at("failure_search_trials");
         if (!trials.is_array()) throw std::invalid_argument("failure_search_trials must be an array");
         std::unordered_map<std::string, size_t> sourceIndex;
+        std::unordered_map<std::string, std::vector<cv::Vec3d>> trialFiberCache;
+        std::unordered_map<std::string, std::vector<double>> trialArcCache;
         for (size_t i = 0; i < sources.size(); ++i) sourceIndex.emplace(sources[i].id, i);
         if (config.value("failure_search_trials_only", false)) cases.clear();
         for (const auto& trial : trials) {
@@ -888,14 +913,23 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             const bool reverse = trial.at("direction").get<std::string>() == "reverse";
             if (!reverse && trial.at("direction").get<std::string>() != "forward")
                 throw std::invalid_argument("trial direction must be forward or reverse");
-            const auto path = sourceLocation(configPath.parent_path(), trial.at("fiber_path").get<std::string>());
-            const auto annotation = readJson(path);
-            auto full = fiberLinePoints(annotation, path);
+            const std::filesystem::path path = sourceLocation(configPath.parent_path(), trial.at("fiber_path").get<std::string>());
+            const auto cacheKey = path.string();
+            auto cacheIt = trialFiberCache.find(cacheKey);
+            if (cacheIt == trialFiberCache.end()) {
+                auto full = fiberLinePoints(readJson(path), path);
+                std::vector<double> arc(full.size(), 0.0);
+                for (size_t i = 1; i < full.size(); ++i) arc[i] = arc[i-1] + cv::norm(full[i]-full[i-1]);
+                cacheIt = trialFiberCache.emplace(cacheKey, std::move(full)).first;
+                trialArcCache.emplace(cacheKey, std::move(arc));
+            }
+            const auto& full = cacheIt->second;
+            const auto& arc = trialArcCache.at(cacheKey);
             const double distance = trial.at("distance").get<double>();
             const double lo = trial.value("lo", 0.0);
             const double hi = trial.value("hi", 0.0);
             if (!(hi > lo)) throw std::invalid_argument("trial requires lo < hi");
-            auto points = sliceFiberLine(full, lo, hi);
+            auto points = sliceFiberLine(full, arc, lo, hi);
             if (reverse) std::reverse(points.begin(), points.end());
             Json provenance = trial;
             provenance["global_trial"] = true;
