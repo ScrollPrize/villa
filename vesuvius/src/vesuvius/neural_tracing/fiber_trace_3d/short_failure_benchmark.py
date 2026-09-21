@@ -625,7 +625,11 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                             continue
                         geometry(c)  # State/hash/cache writes only on coordinator.
                         extent = c['target']-c['run']['original_arcs_base'][0] if d=='forward' else c['run']['original_arcs_base'][1]-c['target']
-                        for k in range(ahead+1):
+                        # Bound the global sentinel by the candidate's actual
+                        # feasible 100-voxel grid; never spin through 100k
+                        # empty iterations for a short run.
+                        steps = min(ahead, max(0, int(np.floor(extent / 100.0))))
+                        for k in range(steps + 1):
                             distance = n+k*100
                             tag = f"{c['id']}_{d}_{distance}"
                             cache = root/'trials'/f'{tag}.json'
