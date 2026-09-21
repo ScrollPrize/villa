@@ -8,6 +8,11 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 
+#include <QCoreApplication>
+#include <QProcess>
+#include <QString>
+#include <QStringList>
+
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -21,37 +26,25 @@ namespace {
 constexpr int kGrid = 41;
 constexpr double kSpacing = 10.0;
 
-fs::path locateBinary(const fs::path& candidate)
+fs::path findVcObj2Tifxyz()
 {
-    if (fs::exists(candidate) && fs::is_regular_file(candidate)) return candidate;
+    const char* env = std::getenv("VC_OBJ2TIFXYZ_BIN");
+    if (env && fs::is_regular_file(env)) return env;
     return {};
 }
 
-fs::path findVcObj2Tifxyz()
+QString q(const fs::path& p)
 {
-    if (const char* env = std::getenv("VC_OBJ2TIFXYZ_BIN")) {
-        if (auto p = locateBinary(env); !p.empty()) return p;
-    }
-    for (const fs::path& base : {fs::path("build/bin"),
-                                 fs::path("build-macos/bin"),
-                                 fs::path("build-macos-rel/bin")}) {
-        if (auto p = locateBinary(base / "vc_obj2tifxyz"); !p.empty()) return p;
-    }
-    if (const char* path = std::getenv("PATH")) {
-        std::string s = path;
-        std::string::size_type from = 0;
-        while (from <= s.size()) {
-            auto next = s.find(':', from);
-            std::string seg = s.substr(from, next == std::string::npos ? std::string::npos
-                                                                       : next - from);
-            if (!seg.empty()) {
-                if (auto p = locateBinary(fs::path(seg) / "vc_obj2tifxyz"); !p.empty()) return p;
-            }
-            if (next == std::string::npos) break;
-            from = next + 1;
-        }
-    }
-    return {};
+    return QString::fromStdString(p.string());
+}
+
+QCoreApplication& app()
+{
+    static int argc = 1;
+    static char name[] = "test_obj2tifxyz_e2e";
+    static char* argv[] = {name, nullptr};
+    static QCoreApplication instance(argc, argv);
+    return instance;
 }
 
 void writePlaneObj(const fs::path& obj, double uvStep)
@@ -102,10 +95,16 @@ void writeSourceTifxyz(const fs::path& dir)
     surf.save(dir.string(), surf.id, false);
 }
 
-int run(const fs::path& bin, const std::string& args, const fs::path& log)
+int run(const fs::path& bin, const QStringList& args, const fs::path& log)
 {
-    const std::string cmd = bin.string() + " " + args + " > " + log.string() + " 2>&1";
-    return std::system(cmd.c_str());
+    QProcess p;
+    p.setProcessChannelMode(QProcess::MergedChannels);
+    p.setStandardOutputFile(q(log));
+    p.start(q(bin), args);
+    REQUIRE_MESSAGE(p.waitForStarted(-1), "could not start " << bin.string());
+    REQUIRE(p.waitForFinished(-1));
+    REQUIRE(p.exitStatus() == QProcess::NormalExit);
+    return p.exitCode();
 }
 
 nlohmann::json readMeta(const fs::path& dir)
@@ -137,11 +136,12 @@ TEST_CASE("vc_obj2tifxyz writes a scale that describes the emitted grid")
 
     const fs::path bin = findVcObj2Tifxyz();
     REQUIRE_MESSAGE(!bin.empty(),
-                    "vc_obj2tifxyz binary not found; build first or set VC_OBJ2TIFXYZ_BIN");
+                    "vc_obj2tifxyz binary not found; set VC_OBJ2TIFXYZ_BIN (ctest does)");
+    app();
 
     std::random_device rd;
     std::mt19937_64 rng(rd());
-    const fs::path root = fs::temp_directory_path() / ("vc_obj2tifxyz_e2e_" + std::to_string(rng()));
+    const fs::path root = fs::temp_directory_path() / ("vc_obj2tifxyz e2e " + std::to_string(rng()));
     fs::create_directories(root);
     const fs::path normalised = root / "normalised.obj";
     writePlaneObj(normalised, 1.0 / (kGrid - 1));
@@ -149,7 +149,7 @@ TEST_CASE("vc_obj2tifxyz writes a scale that describes the emitted grid")
     writePlaneObj(metric, kSpacing);
     const fs::path source = root / "source";
     writeSourceTifxyz(source);
-    const std::string stretch = std::to_string(kGrid - 1);
+    const QString stretch = QString::number(kGrid - 1);
 
     SUBCASE("default stretch factor rasterizes nothing and must fail")
     {
@@ -157,7 +157,7 @@ TEST_CASE("vc_obj2tifxyz writes a scale that describes the emitted grid")
         writeDiamondObj(diamond);
         const fs::path out = root / "default";
         const fs::path log = root / "default.log";
-        const int rc = run(bin, diamond.string() + " " + out.string(), log);
+        const int rc = run(bin, {q(diamond), q(out)}, log);
         INFO("log: ", log.string());
         CHECK(rc != 0);
         CHECK_FALSE(fs::exists(out / "meta.json"));
@@ -168,7 +168,7 @@ TEST_CASE("vc_obj2tifxyz writes a scale that describes the emitted grid")
         const fs::path out = root / "degenerate";
         const fs::path log = root / "degenerate.log";
         INFO("log: ", log.string());
-        CHECK(run(bin, normalised.string() + " " + out.string(), log) != 0);
+        CHECK(run(bin, {q(normalised), q(out)}, log) != 0);
         CHECK_FALSE(fs::exists(out / "meta.json"));
     }
 
@@ -177,7 +177,7 @@ TEST_CASE("vc_obj2tifxyz writes a scale that describes the emitted grid")
         const fs::path out = root / "stretched";
         const fs::path log = root / "stretched.log";
         INFO("log: ", log.string());
-        REQUIRE(run(bin, normalised.string() + " " + out.string() + " " + stretch, log) == 0);
+        REQUIRE(run(bin, {q(normalised), q(out), stretch}, log) == 0);
         checkScale(out, 1.0 / kSpacing);
     }
 
@@ -187,7 +187,7 @@ TEST_CASE("vc_obj2tifxyz writes a scale that describes the emitted grid")
             const fs::path out = root / ("stretch-" + std::to_string(s));
             const fs::path log = root / ("stretch-" + std::to_string(s) + ".log");
             INFO("stretch ", s, ", log: ", log.string());
-            REQUIRE(run(bin, normalised.string() + " " + out.string() + " " + std::to_string(s), log) == 0);
+            REQUIRE(run(bin, {q(normalised), q(out), QString::number(s)}, log) == 0);
             const cv::Mat x = cv::imread((out / "x.tif").string(), cv::IMREAD_UNCHANGED);
             REQUIRE_FALSE(x.empty());
             CHECK(x.cols == s + 1);
@@ -201,7 +201,7 @@ TEST_CASE("vc_obj2tifxyz writes a scale that describes the emitted grid")
         const fs::path out = root / "decimated";
         const fs::path log = root / "decimated.log";
         INFO("log: ", log.string());
-        REQUIRE(run(bin, normalised.string() + " " + out.string() + " " + stretch + " --uv-downsample=2", log) == 0);
+        REQUIRE(run(bin, {q(normalised), q(out), stretch, "--uv-downsample=2"}, log) == 0);
         checkScale(out, 1.0 / (2 * kSpacing));
     }
 
@@ -210,7 +210,7 @@ TEST_CASE("vc_obj2tifxyz writes a scale that describes the emitted grid")
         const fs::path out = root / "mesh-units";
         const fs::path log = root / "mesh-units.log";
         INFO("log: ", log.string());
-        REQUIRE(run(bin, normalised.string() + " " + out.string() + " " + stretch + " 7.91", log) == 0);
+        REQUIRE(run(bin, {q(normalised), q(out), stretch, "7.91"}, log) == 0);
         checkScale(out, 1.0 / kSpacing);
     }
 
@@ -219,7 +219,7 @@ TEST_CASE("vc_obj2tifxyz writes a scale that describes the emitted grid")
         const fs::path out = root / "source-scale";
         const fs::path log = root / "source-scale.log";
         INFO("log: ", log.string());
-        REQUIRE(run(bin, metric.string() + " " + out.string() + " --tifxyz-source=" + source.string(), log) == 0);
+        REQUIRE(run(bin, {q(metric), q(out), "--tifxyz-source=" + q(source)}, log) == 0);
         checkScale(out, 1.0 / kSpacing);
     }
 
@@ -228,7 +228,7 @@ TEST_CASE("vc_obj2tifxyz writes a scale that describes the emitted grid")
         const fs::path out = root / "source-scale-decimated";
         const fs::path log = root / "source-scale-decimated.log";
         INFO("log: ", log.string());
-        REQUIRE(run(bin, metric.string() + " " + out.string() + " --tifxyz-source=" + source.string() + " --uv-downsample=4", log) == 0);
+        REQUIRE(run(bin, {q(metric), q(out), "--tifxyz-source=" + q(source), "--uv-downsample=4"}, log) == 0);
         checkScale(out, 1.0 / (4 * kSpacing));
     }
 
