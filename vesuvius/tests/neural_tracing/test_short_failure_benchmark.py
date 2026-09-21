@@ -1,5 +1,6 @@
 import pytest
-from vesuvius.neural_tracing.fiber_trace_3d.short_failure_benchmark import slice_line, same_location, audit_failure
+from vesuvius.neural_tracing.fiber_trace_3d.short_failure_benchmark import (
+    slice_line, same_location, audit_failure, merge_failure_intervals)
 
 
 def test_exact_slice_and_duplicate_vertices():
@@ -12,6 +13,11 @@ def test_location_dedup_respects_eligible_span():
     assert same_location(a,dict(piece_key=['f',0],target=1200))
     assert not same_location(a,dict(piece_key=['f',1],target=1000))
     assert not same_location(a,dict(piece_key=['f',0],target=1201))
+
+
+def test_union_interval_merge_is_deterministic_and_keeps_separate_gaps():
+    assert merge_failure_intervals([(1000, 1500), (1600, 1800), (2101, 2200)], 100) == [
+        (1000, 1800), (2101, 2200)]
 
 
 def artifact(outside_steps=2, arc=200, segment=0):

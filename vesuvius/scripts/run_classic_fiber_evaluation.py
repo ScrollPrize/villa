@@ -198,7 +198,7 @@ def prepare(workload, *, pilot_only=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["contrast-prepare", "benchmark-remove-case", "benchmark-review", "benchmark-render", "benchmark-full", "pair-connectivity", "short-failures", "integration-report", "integration-fit", "integration-audit", "fixed-path-report", "fixed-path-extract", "fixed-path-fit", "freeze-snapshot", "prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "resume-visualization", "cached-full", "report-metrics", "profile", "observe", "report-progress", "reference-plan"])
+    parser.add_argument("mode", choices=["contrast-prepare", "benchmark-remove-case", "benchmark-review", "benchmark-render", "benchmark-full", "pair-connectivity", "short-failures", "failure-union", "integration-report", "integration-fit", "integration-audit", "fixed-path-report", "fixed-path-extract", "fixed-path-fit", "freeze-snapshot", "prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "resume-visualization", "cached-full", "report-metrics", "profile", "observe", "report-progress", "reference-plan"])
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--devices", help="runtime device selection (default from workload)")
     parser.add_argument("--manager-socket")
@@ -209,7 +209,7 @@ def main():
     parser.add_argument("--extraction-time-limit-seconds", type=float,
                         help="checkpoint and stop short-failures scheduling after this duration (cleanup follows)")
     args = parser.parse_args()
-    workload = (json.loads(args.config.read_text()) if args.mode in ('contrast-prepare', 'benchmark-remove-case', 'short-failures', 'benchmark-full', 'benchmark-render', 'benchmark-review', 'pair-connectivity') else load_workload(args.config))
+    workload = (json.loads(args.config.read_text()) if args.mode in ('contrast-prepare', 'benchmark-remove-case', 'short-failures', 'failure-union', 'benchmark-full', 'benchmark-render', 'benchmark-review', 'pair-connectivity') else load_workload(args.config))
     if args.mode == 'contrast-prepare':
         from vesuvius.neural_tracing.fiber_trace_3d.contrast_choice_benchmark import package_contrast_choice
         print(package_contrast_choice(workload))
@@ -273,6 +273,10 @@ def main():
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
         from vesuvius.neural_tracing.fiber_trace_3d.short_failure_benchmark import run
         run(workload, devices=devices, time_limit_seconds=args.extraction_time_limit_seconds)
+        return 0
+    if args.mode == "failure-union":
+        from vesuvius.neural_tracing.fiber_trace_3d.short_failure_benchmark import run_union
+        run_union(workload)
         return 0
     if args.mode == "integration-report":
         from vesuvius.neural_tracing.fiber_trace_3d.embedding_integration_report import report

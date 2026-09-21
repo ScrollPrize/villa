@@ -7685,3 +7685,13 @@ recomputed using report-metrics without mutating their trace artifacts.
   devices; only then may the worker gates be authorized.
   Bounded profile/fit/audit modes and short-failure extraction retain their
   separately specified fixed outer grants.
+# Full hard-region failure union (2026-09-21)
+
+The full hard-region extractor consumes completed model evaluations as evidence
+only. It unions all filtered restart episodes from the configured evaluations,
+clips each interval to its already CP-bounded/non-Lasagna reference run, adds
+the configured reference context, and merges nearby intervals on the same
+piece. Public output annotations are reference-only and must not depend on
+which model caused a failure. Model-specific provenance may remain in the
+top-level audit manifest. Cache coverage is a read-only audit against the
+full-resolution OME-Zarr channels; missing chunks are reported explicitly.

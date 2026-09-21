@@ -319,6 +319,26 @@ reports include [dynamic GPU batching](dynamic_inference_batching_20260911.md),
 
 ## Helper modes, not benchmark families
 
+## Full hard-region failure union
+
+`failure-union` extracts a quota-free, deduplicated corpus from completed
+evaluations.  The checked-in configuration combines the full-resolution,
+Classic and best output-stride-4 reports, clips each failure to its eligible
+reference span, adds 500 base-voxels of context, and audits the existing
+full-resolution OME-Zarr cache within a 64-base-voxel corridor:
+
+```bash
+/home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py failure-union --config /home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/failure_union_full_20260921_v1.json
+```
+
+The output directory contains reference-only annotations under `fibers/`,
+`manifest.json`, `cache_coverage.json`, and `vc3d_channels/` symlinks to the
+published presence and normal channels.  A missing chunk is reported in the
+coverage manifest rather than interpreted as an all-zero prediction.
+The completed 2026-09-21 run is in
+`/ephemeral/hendrik/fiber3d_train2/evaluations/full_failure_union_20260921_v2`
+(190 pieces; 573.7638 mm; 8,421 of 11,124 required channel chunks present).
+
 - `observe --pid PID` and `report-progress` inspect an active/saved run.
 - `report-metrics` regenerates metric comparisons from saved traces.
 - `reference-plan` audits eligible CP/non-Lasagna spans without evaluation.

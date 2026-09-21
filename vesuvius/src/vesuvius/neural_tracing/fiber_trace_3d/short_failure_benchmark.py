@@ -7,6 +7,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 from threading import Event
 import time
@@ -20,6 +21,23 @@ from .replay_metrics import _episode_indices
 PROTOCOL = dict(version=1, start_step=100, start_padding=100, end_padding=100,
                 match_tolerance=100, dedup_distance=200, first_failure_only=True,
                 require_exhausted_grace=True)
+
+
+def merge_failure_intervals(intervals, merge_distance=PROTOCOL['dedup_distance']):
+    """Merge sorted reference intervals while retaining no model semantics.
+
+    ``intervals`` contains ``(lo, hi)`` pairs on one eligible reference run.
+    Intervals whose gap is at most ``merge_distance`` are one hard region.  The
+    result is deterministic and clipped only by the caller's eligible run.
+    """
+    ordered = sorted((float(lo), float(hi)) for lo, hi in intervals if hi > lo)
+    merged = []
+    for lo, hi in ordered:
+        if not merged or lo > merged[-1][1] + float(merge_distance):
+            merged.append([lo, hi])
+        else:
+            merged[-1][1] = max(merged[-1][1], hi)
+    return [tuple(pair) for pair in merged]
 
 
 class TrialJobs:
@@ -556,3 +574,262 @@ def run(workload, *, devices='0', time_limit_seconds=None):
         total_base_voxels=sum(x['length_base_voxels'] for x in exported),
         total_mm=sum(x['length_mm'] for x in exported),protocol=PROTOCOL,identity=identity_hash, cases=exported))
     print(json.dumps(dict(case_count=len(exported),total_mm=sum(x['length_mm'] for x in exported),output=str(root))),flush=True)
+
+
+def _summary_path(value):
+    path = Path(value)
+    return path / 'summary.json' if path.is_dir() else path
+
+
+def _cache_source_roots(inference_summary):
+    """Index published full-resolution stores by their exact source locator."""
+    roots = {}
+    for root_value in inference_summary.get('cache_roots', {}).values():
+        root = Path(root_value)
+        try:
+            metadata = json.loads((root / 'inference.json').read_text())
+            source = metadata.get('source') or metadata.get('source_volume') or {}
+            locator = source['locator'].rstrip('/')
+        except (OSError, KeyError, json.JSONDecodeError):
+            continue
+        roots[locator] = root
+    return roots
+
+
+def _zarr_chunk_geometry(root):
+    metadata = json.loads((root / 'fiber_presence.ome.zarr' / '1' / '.zarray').read_text())
+    attrs = json.loads((root / 'inference.lasagna.json').read_text())
+    shape = tuple(int(v) for v in metadata['shape'])
+    chunks = tuple(int(v) for v in metadata['chunks'])
+    base_shape = tuple(float(v) for v in attrs['base_shape_zyx'])
+    scale = tuple(base / size for base, size in zip(base_shape, shape))
+    return shape, chunks, scale
+
+
+def _corridor_chunk_keys(points_xyz, root, radius_base):
+    """Return output-lattice chunk keys intersecting a conservative GT tube."""
+    shape, chunks, scale = _zarr_chunk_geometry(root)
+    points = np.asarray(points_xyz, dtype=np.float64)
+    # Cache arrays are Z,Y,X; annotations and replay points are X,Y,Z.
+    # Do not form one global XYZ bounding box: a long diagonal fibre would
+    # turn that box into billions of unrelated chunks.  Add the small chunk
+    # neighbourhood around each reference sample instead.  Reference points
+    # are densely sampled, so this covers both the tube and the spans between
+    # consecutive points while keeping work proportional to fibre length.
+    radius_out = np.asarray([float(radius_base) / scale[2],
+                             float(radius_base) / scale[1],
+                             float(radius_base) / scale[0]])
+    shape_zyx = np.asarray(shape, dtype=int)
+    keys = set()
+    if len(points) > 1:
+        # The saved replay geometry is commonly sampled at 1-base-voxel
+        # spacing.  Four-voxel spacing is still safely below the 64-voxel
+        # corridor radius and avoids repeatedly visiting the same chunk.
+        sampled = points[::4]
+        if not np.array_equal(sampled[-1], points[-1]):
+            sampled = np.concatenate((sampled, points[-1:]), axis=0)
+    else:
+        sampled = points
+    for point_xyz in sampled:
+        centre_zyx = (np.asarray([point_xyz[2], point_xyz[1], point_xyz[0]]) /
+                      np.asarray([scale[0], scale[1], scale[2]]))
+        lo_zyx = np.maximum(np.floor(centre_zyx - radius_out[::-1]).astype(int), 0)
+        hi_zyx = np.minimum(np.floor(centre_zyx + radius_out[::-1]).astype(int),
+                            shape_zyx - 1)
+        if np.any(hi_zyx < lo_zyx):
+            continue
+        for cz in range(lo_zyx[0] // chunks[0], hi_zyx[0] // chunks[0] + 1):
+            for cy in range(lo_zyx[1] // chunks[1], hi_zyx[1] // chunks[1] + 1):
+                for cx in range(lo_zyx[2] // chunks[2], hi_zyx[2] // chunks[2] + 1):
+                    keys.add((cz, cy, cx))
+    return keys
+
+
+def _chunk_present(array_root, key):
+    return (array_root / '1' / str(key[0]) / str(key[1]) / str(key[2])).is_file()
+
+
+def _safe_symlink(target, link):
+    link.parent.mkdir(parents=True, exist_ok=True)
+    target = Path(target)
+    if os.path.lexists(link):
+        if link.is_symlink() and link.resolve() == target.resolve():
+            return
+        raise ValueError(f'refusing to replace existing VC3D link: {link}')
+    os.symlink(os.path.relpath(target, link.parent), link)
+
+
+def run_union(workload):
+    """Extract all deduplicated GT hard regions from completed evaluations.
+
+    This deliberately performs no new tracing.  It consumes saved failure
+    episodes, exports reference-only annotations and audits the existing
+    full-resolution published cache around each resulting corridor.
+    """
+    settings = workload['failure_union']
+    output = Path(workload['output_root'])
+    output.mkdir(parents=True, exist_ok=True)
+    context = float(settings.get('context_base_voxels', 500))
+    radius = float(settings.get('corridor_radius_base_voxels', 64))
+    merge_distance = float(settings.get('merge_distance_base_voxels', PROTOCOL['dedup_distance']))
+    if context < 0 or radius < 0 or merge_distance < 0:
+        raise ValueError('union extraction distances must be nonnegative')
+    cache_summary = json.loads(Path(settings['fullres_inference_summary']).read_text())
+    cache_by_locator = _cache_source_roots(cache_summary)
+    records = {}
+    input_audit = []
+    for item in settings['evaluations']:
+        summary_path = _summary_path(item['summary'])
+        summary = json.loads(summary_path.read_text())
+        if not summary.get('completed'):
+            raise ValueError(f'incomplete evaluation: {summary_path}')
+        root = summary_path.parent
+        input_audit.append({'name': item['name'], 'summary': str(summary_path),
+                            'summary_sha256': sha256_file(summary_path)})
+        global_case = 0
+        for source in summary['sources']:
+            for case in source['cases']:
+                trace_path = root / 'cases' / str(global_case) / 'trace.json'
+                if not trace_path.is_file():
+                    raise FileNotFoundError(f'missing saved GT trace: {trace_path}')
+                trace = json.loads(trace_path.read_text())
+                provenance = trace.get('provenance', {})
+                if provenance.get('case_index') != global_case:
+                    raise ValueError(f'case index mismatch: {trace_path}')
+                fiber_path = str(Path(provenance['fiber_path']).resolve())
+                run = case['reference_run']
+                run_index = int(run['run_index'])
+                piece_key = (fiber_path, run_index)
+                failures = case.get('failures', [])
+                if failures:
+                    points = np.asarray(trace['reference_points_base_xyz'], dtype=np.float64)
+                    if provenance.get('reverse'):
+                        points = points[::-1]
+                    a, b = (float(run['original_arcs_base'][0]),
+                            float(run['original_arcs_base'][1]))
+                    length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+                    if abs(length - (b - a)) > 2.0:
+                        raise ValueError(f'reference geometry mismatch: {trace_path}')
+                    entry = records.setdefault(piece_key, {
+                        'source_id': provenance['source_id'],
+                        'input_volume': provenance['input_volume'].rstrip('/'),
+                        'coordinate_space': provenance['coordinate_space'],
+                        'base_voxel_size_um': float(provenance['base_voxel_size_um']),
+                        'fiber_path': fiber_path,
+                        'run_index': run_index,
+                        'run_arcs': [a, b],
+                        'points_forward': points.tolist(),
+                        'intervals': [],
+                        'episode_count': 0,
+                    })
+                    for failure_index in _episode_indices(
+                            [float(f['directional_reference_arc_base_voxels']) for f in failures],
+                            int(summary.get('restart_episode_distance_base_voxels', 80))):
+                        target = float(failures[failure_index]['original_fiber_reference_arc_base_voxels'])
+                        entry['intervals'].append((max(a, target - context), min(b, target + context)))
+                        entry['episode_count'] += 1
+                global_case += 1
+    merged = []
+    for piece_key, entry in sorted(records.items()):
+        for lo, hi in merge_failure_intervals(entry['intervals'], merge_distance):
+            points = slice_line(entry['points_forward'], lo - entry['run_arcs'][0],
+                                hi - entry['run_arcs'][0])
+            merged.append({**entry, 'interval': [lo, hi], 'points': points,
+                           'episode_count': entry['episode_count']})
+    merged.sort(key=lambda item: (item['source_id'], item['fiber_path'],
+                                  item['run_index'], item['interval'][0]))
+    annotations = []
+    annotation_dir = output / 'fibers'
+    for index, item in enumerate(merged):
+        annotation = {
+            'type': 'vc3d_fiber', 'version': 1,
+            'line_points': item['points'],
+            'control_points': [item['points'][0], item['points'][-1]],
+            'optimization_mode': 'native_fiber_trace3d',
+            'evaluation_direction': 'forward',
+            'vc_open_data_coordinate_space': item['coordinate_space'],
+            'vc_open_data_source_original_resolution': item['base_voxel_size_um'],
+            'hard_region_provenance': {
+                'source_id': item['source_id'],
+                'fiber_path': item['fiber_path'],
+                'run_index': item['run_index'],
+                'reference_arcs_base_voxels': item['interval'],
+                'context_base_voxels': context,
+                'merge_distance_base_voxels': merge_distance,
+            },
+        }
+        path = annotation_dir / f'{index:04d}_{Path(item["fiber_path"]).stem}_run{item["run_index"]}.json'
+        # The extractor is safely restartable.  Keeping already completed
+        # reference-only files avoids repeating an fsync-heavy write after a
+        # runner interruption; their content is deterministic for this config.
+        if not path.is_file():
+            atomic_write(path, annotation, durable=False)
+        annotations.append({
+            'index': index, 'path': str(path), 'sha256': sha256_file(path),
+            'source_id': item['source_id'], 'fiber_path': item['fiber_path'],
+            'run_index': item['run_index'], 'coordinate_space': item['coordinate_space'],
+            'input_volume': item['input_volume'],
+            'reference_arcs_base_voxels': item['interval'],
+            'length_base_voxels': float(item['interval'][1] - item['interval'][0]),
+            'length_mm': float(item['interval'][1] - item['interval'][0]) * item['base_voxel_size_um'] / 1000,
+        })
+    coverage = []
+    missing_total = 0
+    for coverage_index, item in enumerate(annotations):
+        root = cache_by_locator.get(item['input_volume'].rstrip('/'))
+        missing = []
+        if root is None:
+            missing = ['cache-source-not-found']
+            required = 0
+        else:
+            required_keys = _corridor_chunk_keys(
+                next(x['points'] for x in merged
+                     if x['source_id'] == item['source_id']
+                     and x['fiber_path'] == item['fiber_path']
+                     and x['run_index'] == item['run_index']
+                     and x['interval'] == item['reference_arcs_base_voxels']),
+                root, radius)
+            required = len(required_keys)
+            for channel in ('fiber_presence.ome.zarr', 'fiber_nx.ome.zarr', 'fiber_ny.ome.zarr'):
+                array_root = root / channel
+                for key in sorted(required_keys):
+                    if not _chunk_present(array_root, key):
+                        missing.append(f'{channel}:{key[0]}/{key[1]}/{key[2]}')
+        missing_total += len(missing)
+        coverage.append({'index': item['index'], 'required_chunk_count': required,
+                         'missing_chunk_count': len(missing), 'missing_chunks': missing,
+                         'covered': not missing})
+        if coverage_index % 25 == 0:
+            print(json.dumps({'coverage_progress': coverage_index + 1,
+                              'total': len(annotations)}), flush=True)
+    link_root = output / 'vc3d_channels'
+    link_manifest = []
+    for locator, root in sorted(cache_by_locator.items()):
+        # Exact source-volume identity is authoritative.  This avoids guessing
+        # from scroll labels (which can contain aliases such as 1229/1299).
+        source_ids = sorted({item['source_id'] for item in annotations
+                             if item['input_volume'].rstrip('/') == locator.rstrip('/')})
+        if not source_ids:
+            continue
+        for source_id in source_ids:
+            destination = link_root / source_id
+            for channel in ('fiber_presence.ome.zarr', 'fiber_nx.ome.zarr', 'fiber_ny.ome.zarr'):
+                _safe_symlink(root / channel, destination / channel)
+            link_manifest.append({'source_id': source_id, 'input_volume': locator,
+                                  'cache_root': str(root), 'channels': {
+                                      c: str(destination / c) for c in (
+                                          'fiber_presence.ome.zarr', 'fiber_nx.ome.zarr', 'fiber_ny.ome.zarr')}})
+    manifest = {'version': 1, 'kind': 'full-hard-region-union',
+                'completed': True, 'case_count': len(annotations),
+                'total_length_mm': sum(x['length_mm'] for x in annotations),
+                'context_base_voxels': context, 'corridor_radius_base_voxels': radius,
+                'merge_distance_base_voxels': merge_distance,
+                'evaluations': input_audit, 'fullres_inference_summary': settings['fullres_inference_summary'],
+                'cases': annotations, 'cache_coverage': coverage,
+                'cache_missing_chunk_count': missing_total, 'vc3d_channels': link_manifest}
+    atomic_write(output / 'cache_coverage.json', {'version': 1, 'cases': coverage,
+                                                  'missing_chunk_count': missing_total},
+                 durable=False)
+    atomic_write(output / 'manifest.json', manifest, durable=False)
+    print(json.dumps({'case_count': len(annotations), 'total_length_mm': manifest['total_length_mm'],
+                      'missing_chunk_count': missing_total, 'output': str(output)}, indent=2), flush=True)

@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/full_failure_union_20260921_v2",
+  "failure_union": {
+    "context_base_voxels": 500,
+    "corridor_radius_base_voxels": 64,
+    "merge_distance_base_voxels": 200,
+    "fullres_inference_summary": "/ephemeral/hendrik/fiber3d_train2/evaluations/fullres_refinement_213753_best_ema999_vis_20260917_v1/full/inference_summary.json",
+    "evaluations": [
+      {
+        "name": "fullres_refinement_213753_best_ema999",
+        "summary": "/ephemeral/hendrik/fiber3d_train2/evaluations/fullres_refinement_213753_best_ema999_vis_20260917_v1/full/summary.json"
+      },
+      {
+        "name": "classic_best91_5k",
+        "summary": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_thickness40_grace160_20260914_v2/full/summary.json"
+      },
+      {
+        "name": "refinement_212757_best_ema999_u22000",
+        "summary": "/ephemeral/hendrik/fiber3d_train2/evaluations/refinement_212757_best_ema999_off_20260916_v1/full/summary.json"
+      }
+    ]
+  }
+}

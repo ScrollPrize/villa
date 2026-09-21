@@ -3086,3 +3086,9 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
   fiberlet pieces. Render-only resume now preserves trace and summary artifacts.
 - Full case mapping and review paths:
   `../docs/benchmarks/short200_fullres_fiberlet_vs_beam_20260918.md`.
+# 2026-09-21 — Full hard-region failure union
+
+- Added the quota-free, model-agnostic union extraction plan for full-resolution,
+  Classic and best output-stride-4 evaluations. It exports GT-only pieces with
+  500-base-voxel context, deduplicates nearby intervals, audits full-resolution
+  cache coverage and prepares stable VC3D channel links.
