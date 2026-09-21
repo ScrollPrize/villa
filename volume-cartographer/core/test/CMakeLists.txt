@@ -857,6 +857,9 @@ vc_add_test(NAME test_open_data_manifest
 vc_add_test(NAME test_lasagna_line_optimizer LIBS doctest::doctest vc_lasagna)
 
 vc_add_test(NAME test_lasagna_line_view_surfaces LIBS doctest::doctest vc_lasagna)
+vc_add_test(NAME test_robust_line_strip LIBS doctest::doctest vc_lasagna)
+add_executable(robust_line_strip_probe robust_line_strip_probe.cpp)
+target_link_libraries(robust_line_strip_probe PRIVATE vc_lasagna)
 
 vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_atlas)
 

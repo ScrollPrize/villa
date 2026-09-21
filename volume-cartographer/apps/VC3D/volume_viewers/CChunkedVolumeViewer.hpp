@@ -157,6 +157,9 @@ public:
     void setOverlayOpacity(float opacity) override;
     void setSurfaceComparison(std::shared_ptr<Surface> base,std::shared_ptr<Surface> overlay) override;
     void setSurfaceComparisonOpacity(float opacity) override;
+    void setSurfaceLayers(std::shared_ptr<Surface> base, std::vector<std::shared_ptr<Surface>> overlays,
+                          std::vector<float> opacities, std::vector<QColor> tints = {}) override;
+    void blendSurfaceLayers();
     void setOverlayColormap(const std::string& colormapId) override;
     void setOverlaySamplingMethod(vc::Sampling method) override;
     void setOverlayThreshold(float threshold) override;
@@ -419,7 +422,8 @@ private:
         float windowHigh = 255.0f;
         std::string baseColormapId;
         std::shared_ptr<Surface> surf;
-        std::shared_ptr<Surface> comparisonBase, comparisonOverlay;
+        std::shared_ptr<Surface> comparisonBase;
+        std::vector<std::shared_ptr<Surface>> comparisonOverlays;
         std::string surfaceName;
         std::shared_ptr<vc::render::ChunkCache> chunkArray;
         std::shared_ptr<Volume> overlayVolume;
@@ -466,6 +470,7 @@ private:
                                        const PendingRenderJob& b);
     struct RenderContext;
     struct RenderResult;
+    QImage compositeSurfaceLayers(const RenderResult&);
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     void markInteractiveMotion(double motionPx);
@@ -579,7 +584,14 @@ private:
     std::uint64_t _chunkRemoteFetchCbId = 0;
 
     QImage _framebuffer;
-    std::shared_ptr<Surface> _comparisonBase, _comparisonOverlay;
+    std::shared_ptr<Surface> _comparisonBase;
+    std::vector<std::shared_ptr<Surface>> _comparisonOverlays;
+    std::vector<float> _comparisonOpacities;
+    std::vector<QColor> _comparisonTints;
+    std::shared_ptr<const RenderResult> _layerCompositeBase;
+    struct CompositedLayer { std::shared_ptr<const RenderResult> image; float opacity; QColor tint; };
+    std::vector<CompositedLayer> _layerCompositePrefix;
+    QImage _layerCompositeImage;
     float _comparisonOpacity = 0.5f;
     std::atomic<bool> _renderWorkerBusy{false};
     std::optional<PendingRenderJob> _activeRenderJob;

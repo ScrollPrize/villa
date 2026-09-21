@@ -2,6 +2,8 @@
 
 #include "vc/core/util/SymmetricDirichlet.hpp"
 #include <ceres/ceres.h>
+#include <algorithm>
+#include <limits>
 #include <vector>
 
 namespace vc::constraints::detail {
@@ -52,6 +54,46 @@ public:
             j[4+axis]=m.weight*dc;j[6+axis]=m.weight*dd;
             for(int k=0;k<4;++k)
                 j[2*(k+4)+axis]=m.weight*(delta[k]/det-numerator[k]*deltaDet/(det*det));
+        }
+        return true;
+    }
+};
+
+// Keep the ordinary symmetric Dirichlet energy, and penalize its excess per
+// triangle. The additional term is flat at an isometry but grows quartically
+// with stretch: a few damaged elements cannot cheaply absorb an overlap's
+// entire displacement. Reuse the same no-flip barrier and analytic Jacobian.
+class ReviewChartMetricCost final : public ceres::SizedCostFunction<9,2,2,2> {
+    double weight_;
+    ChartMetricCost metric_;
+public:
+    explicit ReviewChartMetricCost(ChartMetric metric)
+        :weight_(metric.weight),metric_([&]{metric.weight=1;return metric;}()) {}
+    double distortion(double const* const* p)const {
+        double r[8];
+        if(!metric_.Evaluate(p,r,nullptr))return std::numeric_limits<double>::infinity();
+        // Singular values of J: measure the worst stretch OR compression,
+        // including shear that an edge-length percentile can miss.
+        const double a=r[0]*r[0]+r[2]*r[2],b=r[1]*r[1]+r[3]*r[3],c=r[0]*r[1]+r[2]*r[3];
+        const double largest=std::sqrt(.5*(a+b+std::hypot(a-b,2*c)));
+        const double determinant=std::abs(r[0]*r[3]-r[1]*r[2]);
+        return std::max(largest,largest/determinant);
+    }
+    bool Evaluate(double const* const* p,double* r,double** jacobians)const override {
+        double values[8],derivatives[3][16];
+        double* blocks[3]={nullptr,nullptr,nullptr};
+        if(jacobians)for(int i=0;i<3;++i)if(jacobians[i])blocks[i]=derivatives[i];
+        if(!metric_.Evaluate(p,values,jacobians?blocks:nullptr))return false;
+        double energy=0;
+        for(int k=0;k<8;++k){energy+=values[k]*values[k];r[k]=weight_*values[k];}
+        r[8]=weight_*.25*std::max(0.,energy-4.);
+        if(jacobians)for(int i=0;i<3;++i)if(jacobians[i])for(int axis=0;axis<2;++axis) {
+            double derivative=0;
+            for(int k=0;k<8;++k){
+                jacobians[i][2*k+axis]=weight_*derivatives[i][2*k+axis];
+                derivative+=values[k]*derivatives[i][2*k+axis];
+            }
+            jacobians[i][16+axis]=energy>4?weight_*.5*derivative:0;
         }
         return true;
     }

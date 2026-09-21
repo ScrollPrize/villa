@@ -1,5 +1,6 @@
 #pragma once
 #include "vc/constraints/ConstraintGraph.hpp"
+#include "vc/constraints/FiberReview.hpp"
 #include "ConstraintGraphPatchColors.hpp"
 #include <QMainWindow>
 #include <QThreadPool>
@@ -17,6 +18,7 @@ class VolumeViewerBase;
 class QComboBox;
 class QLineEdit;
 class QDoubleSpinBox;
+class QSpinBox;
 class QCheckBox;
 class QPushButton;
 class QLabel;
@@ -26,6 +28,8 @@ class OverlayBatchItem;
 class QSplitter;
 class QSlider;
 class Volume;
+class Surface;
+class QToolBar;
 namespace vc::lasagna { class LasagnaDataset;class LasagnaNormalSampler; }
 
 class ConstraintGraphWorkspace : public QMainWindow {
@@ -59,6 +63,10 @@ private:
         std::vector<vc::constraints::Candidate> candidates;
         std::string error;
         std::string notice;
+        bool regeneratedStrips=false;
+        std::optional<vc::constraints::ReviewFiber> regeneratedReviewFiber;
+        std::optional<vc::constraints::FiberReview> review;
+        std::vector<std::pair<std::string,vc::constraints::FitResult>> reviewLayers;
     };
     using Worker=std::function<Job(const std::atomic_bool*,vc::constraints::Progress)>;
     void run(const QString& title,Worker,std::function<void(Job)>,bool stoppable=true);
@@ -82,6 +90,7 @@ private:
     void navigateHistory(bool redo);
     void save(bool choosePath=false);
     void clicked(int pane,const QPointF& scene);
+    void quarantineSelected();
     void beginPair();
     void removePair();
     void refreshPairs();
@@ -96,6 +105,45 @@ private:
     void report(const QString&);
     void refreshAudit();
     bool eventFilter(QObject*,QEvent*) override;
+    bool reviewing() const;
+    void setupReview(QToolBar*);
+    void startReview(const vc::constraints::Settings&);
+    void selectReviewFiber(const std::string&);
+    void refreshReviewList();
+    void searchReview();
+    void previewReview(int);
+    void decideReview(vc::constraints::ReviewStatus);
+    std::optional<vc::constraints::PatchEntry> reviewPatch() const;
+    void quarantineReview();
+    void reopenReview(const std::string&);
+    void rememberReview();
+    void reviewHistory(bool);
+    void saveReview(bool);
+    void displayReview();
+    void updateReviewControls();
+    void installReview(vc::constraints::FiberReview, const QString&, Job);
+    void rebuildReviewLayers();
+    void captureReviewEdit();
+    vc::constraints::Graph reviewDisplayGraph() const;
+    static std::shared_ptr<QuadSurface> displaySurface(const vc::constraints::FitResult&);
+
+    QComboBox* _mode{};
+    QListWidget* _reviewFibers{}, *_reviewDecisions{};
+    QWidget* _reviewPanel{};
+    QSlider* _committedOpacity{};
+    QSpinBox* _committedTint{};
+    std::set<std::string> _reviewAvailablePatches;
+    QSpinBox* _fiberLineOpacity{};
+    QDoubleSpinBox* _fiberLineWidth{};
+    bool _centerFirstReviewProposal=false;
+    QCheckBox* _reverseReview{};
+    QPushButton* _rejectReview{}, *_skipReview{}, *_alternateReview{};
+    std::optional<vc::constraints::FiberReview> _review;
+    std::vector<vc::constraints::FiberReview> _reviewUndo,_reviewRedo;
+    std::vector<std::pair<std::string,vc::constraints::FitResult>> _reviewLayers;
+    std::shared_ptr<Surface> _reviewFiberSurface, _reviewPatchSurface;
+    std::vector<std::shared_ptr<Surface>> _reviewContextSurfaces;
+    std::map<std::string,std::pair<std::weak_ptr<QuadSurface>,std::shared_ptr<Surface>>> _reviewSurfaceCache;
 
     CState* _main;
     CState* _state;
@@ -110,7 +158,8 @@ private:
     QCheckBox* _whole{}, *_showCommitted{}, *_showAllBoundaries{};
     QCheckBox* _compareSources{};
     QSlider* _patchOpacity{};
-    QPushButton* _commit{}, *_pair{}, *_previous{}, *_next{}, *_cancelButton{};
+    QPushButton* _commit{}, *_pair{}, *_previous{}, *_next{}, *_cancelButton{}, *_quarantine{};
+    QWidget* _opacityControls{};
     QLabel* _candidateLabel{}, *_audit{};
     QListWidget* _pairs{};
     std::vector<QGraphicsItem*> _items[2];

@@ -7,9 +7,14 @@ namespace vc3d::constraint_graph {
 // including all new fibers in a proposed linked component.
 inline bool showBoundary(const std::string& id,
                          const vc::constraints::Graph& committed,
-                         bool showAllBoundaries)
+                         bool showAllBoundaries,
+                         const std::string& selected = {})
 {
-    return showAllBoundaries || !committed.nodes.contains(id);
+    if(showAllBoundaries||!committed.nodes.contains(id)||id==selected)return true;
+    const auto found=committed.nodes.find(selected);
+    if(found==committed.nodes.end()||found->second.source->fiber)return false;
+    const auto& node=*committed.nodes.at(id).source;
+    return !node.fiber&&!node.path.empty()&&node.path==found->second.source->path;
 }
 
 struct InitialView {

@@ -6,12 +6,247 @@ Set the coordinate scales before **Load folders / New graph**. The largest
 linked fiber component is selected first; the component dropdown can start a
 new graph from another component.
 
-Fibers are trimmed to their first and last controls and sampled at uniform
-20-voxel arclength intervals. Sheet-tangent ribbons use the same surface builder
-as Line Annotation. The output is a dynamically sized, strict-quad tifxyz grid.
+Fibers are trimmed to their first and last controls. Their sheet strips use the
+same [v7 robust normal fit](RobustLineStrips.md) as Line Annotation, sampled at
+20-voxel intervals where the coarser mesh remains valid. Difficult fibers retain
+the finer fitting mesh. Saved strips regenerate on opening a full graph or first
+selecting a review fiber, preserving patch placements and review decisions.
+The output is a dynamically sized, strict-quad tifxyz grid.
 Missing support remains invalid rather than connecting unrelated boundaries.
 
 ## Reviewing additions
+
+### Fiber review mode
+
+Choose **Fiber review** in the toolbar to review patch associations one fiber at
+a time. Select the fiber and patch folders and the usual CT volume, Lasagna
+normals, and coordinate scales, then **Load folders / New graph**. The input
+panel collapses after loading; **Graph inputs** in the toolbar reopens it.
+The left list shows each fiber and its number of accepted patches.
+The sidebar's **Fiber line opacity** and **Fiber line thickness** control the
+center line and contact highlights (defaults: 35%, 1 screen pixel). Set opacity
+to 0% to hide them. These settings are saved in the review workspace.
+
+Committed context patches have a tint in their boundary color, even when
+boundaries are hidden. **Committed tint** controls its strength from 0–100%
+(default 4%; 0% disables it) and is saved with the workspace. The tint follows **Committed opacity**
+and leaves holes untouched. The active proposal is untinted; reopening an
+accepted patch removes its context tint while it is being reviewed.
+
+Selecting a fiber frames its first proposal. Advancing, committing, rejecting,
+or reopening a proposal preserves the current zoom and pan. Use **Fit view**
+to explicitly reset the view.
+
+The selected fiber has a fixed, straight 2D ribbon. Proposals are ordered from
+left to right for horizontal fibers and top to bottom for vertical fibers;
+**Reverse order** reverses traversal. Discovery finishes before review begins,
+so worker completion order cannot reorder proposals. Proximity defaults to
+**1.5 graph voxels**, after coordinate scaling, using the existing exact
+fiber-point-to-patch-surface query. A patch qualifies when at least **two dense
+fiber points** fall within Proximity. Discovery always checks every dense point
+in fiber review; the stride control applies only to full graph mode.
+
+Only the current proposal moves; the fiber and earlier accepted patches stay
+fixed. Accepted patches on the selected fiber supply overlap constraints to
+the proposal, but do not change discovery eligibility. Each patch has one proposal:
+alignment uses all dense contacts within **twice Proximity** (3 vx with the
+default setting), including separated regions and contacts far apart in the
+initial flattened view. The solver displays its best valid fit even when some
+residual alignment error exceeds Proximity; the reported RMS helps review it.
+Overlap matching searches immutable 3D surface positions within twice Proximity
+and rejects strongly disagreeing surface normals. The resulting targets use
+the accepted patches' fitted chart positions. Their total weight is capped at
+the fiber-contact weight so dense patch grids do not overwhelm the fiber.
+Rejected/skipped patches and the proposal itself never supply targets.
+
+Review starts with a deterministic, iteratively reweighted rigid alignment,
+then refines the proposal parameterization with symmetric Dirichlet energy.
+An additional squared per-triangle excess-energy term discourages concentrating
+the deformation into a few severely stretched or compressed triangles. Review
+allows up to 240 solver iterations, stopping earlier on convergence.
+Automatic fiber contacts use Huber losses; committed-patch targets use Cauchy
+losses so incompatible regions of an already distorted placement lose influence.
+Manual keypoints retain their strict constraints. The complete
+proposal is free to move: review does not impose the full graph editor's local
+region boundary or require a fused fiber/patch surface. The displayed patch
+layer must still pass geometry validation, including the checks for collapsed
+or inverted charts. Failed fits report their actual solver, keypoint, or patch
+layer error. Overlap constraints are rebuilt from current accepted decisions
+on reopen, resume, and manual refit; saved associations remain independent.
+If deformation creates a folded raster cell, or any triangle exceeds 4x stretch
+or compression in a principal direction, review retries with progressively
+stronger shape regularization (4x, 16x, then 64x). This checks every triangle,
+including shear, rather than relying on a percentile over edge lengths. Remaining
+excessive distortion reports its measured maximum and prevents committing the
+proposal. All contacts remain in the fit with their robust weights,
+and invalid geometry is still rejected. The activity log records retries; the
+preview reports the overlap sample count and any regularization used.
+
+Previously committed placements keep their saved geometry until reopened and
+committed again. Reopening uses the refined objective and current accepted
+overlaps; it does not move the fixed fiber or other committed patches.
+
+The refinement regression replay on saved fiber
+`anon_20260817T021012847_000129.json` covers all 29 accepted patches, with
+fiber-only, earlier accepted context, all current context, and saved-placement
+reopening (116 fits). All 116 fits pass. For `band-seed4179111`, the same
+historical five overlap targets previously produced 27.45x maximum edge stretch;
+refinement produces 1.39x. `band-seed3343090` improves from 5.40x to 1.53x.
+The worst edge stretch across all 29 reopened patches is 3.57x. These are edge
+measurements for comparison; acceptance uses principal stretch and compression.
+Regression tests also check the refined metric's derivatives and inversion
+barrier, recovery from a saved spike with conflicting overlap evidence, and
+explicit failure when manual constraints require excessive distortion.
+
+**Add keypoint pair** opens the source
+pane for manual alignment; valid fits can be committed. A failed fit cannot be
+committed and never falls back to deforming the fiber.
+
+- **Commit / Enter** accepts the current alignment; **Reject / Delete** rejects
+  the pair. Both automatically advance and suppress all remaining placements
+  of that patch on this fiber. Other fibers retain independent decisions.
+- **Skip** advances and suppresses that patch for the current fiber, recording
+  **Skipped** separately from **Rejected**. It persists on save/reopen, leaves
+  other fibers unaffected, and can be undone or reopened from the decisions
+  list. Skipped pairs are excluded from rejection audits and remain unlabeled
+  in learning exports.
+- **Quarantine patch** moves the current patch's whole source folder to the
+  same quarantine destination used by full graph mode: a sibling of the saved
+  workspace directory named `<directory>_quarantined`. It removes that source's
+  proposals and accepted associations across all fibers, saves the updated
+  review, and advances without changing the camera. To quarantine an accepted
+  patch, reopen its pair first. A new review prompts for a save location.
+  The shared transaction creates a `before-quarantine` backup and move journal
+  and rolls back file moves if publication fails. Quarantine clears undo/redo;
+  the saved exclusion remains active when reopening or rediscovering proposals.
+- Accepted patches remain visible at **Committed opacity**, initially 20%.
+  **Patch opacity**, initially 50%, controls only the active proposal. Accepted
+  patches overlap in acceptance order; the active proposal is drawn last.
+  Holes reveal underlying layers. Opacity changes reuse sampled images.
+- **Show all boundaries** is off initially and uses the ordinary workspace's
+  boundary display, including the current proposal outline.
+- Click an accepted patch, or double-click an accepted/rejected/skipped entry in the
+  decision list, to reopen that pair. Undo/redo covers the last 20 decisions
+  during this session. **Pause / Resume** retains pending alignment edits.
+- Switching fibers preserves decisions and each fiber's current review position.
+  The camera keeps its zoom and pans to each next proposal's contact.
+
+**Save / Save as** writes a `vc3d_fiber_review` version-2 JSON workspace using
+atomic replacement. It stores shared immutable source geometry once, per-pair
+contacts and placements, rejected decisions, fixed fiber charts, pending edits,
+source paths and scales, review settings, and positions. **Open** restores the
+mode automatically and still reads version-1 workspaces. Version 2 stores
+accepted, rejected, and skipped decisions explicitly. Saved accepted views can be reconstructed without their
+original files; new proposals require the source catalog and normals. CT still
+requires the volume. Keep input folders unchanged during a review. After reopening
+with a successfully loaded source catalog, saved proposal lists drop unavailable
+patches and advance past them. Decisions and embedded pending alignments are
+retained; save the workspace to persist the cleaned lists. If the source catalog
+is unavailable, proposal lists are left intact.
+Older proposal caches refresh to use whole-fiber contacts when sources are
+available. Saved decisions and manual keypoint edits are retained.
+
+An accepted patch can have a different placement for each fiber. These charts
+are deliberately stored as separate associations, not as one globally fitted
+surface. Source files are never rewritten. There is no spiral-fitting integration
+or tifxyz export for this mode.
+
+The read-only real-data validation probe takes input locations from an existing
+ordinary graph session, creates single-fiber reviews, checks that fits preserve
+the fibers, and verifies a saved review round trip:
+
+```sh
+AGENTS_AGENT_MODE=1 ninja -C volume-cartographer/build VC3D constraint_graph_probe test_constraint_graph test_constraint_graph_overlay test_constraint_graph_activity -j 4
+QT_QPA_PLATFORM=offscreen OMP_NUM_THREADS=1 ctest --test-dir volume-cartographer/build --output-on-failure -R '^constraint_graph(_overlay|_activity)?$'
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 volume-cartographer/build/bin/constraint_graph_probe --fiber-review /path/to/graph.json /tmp/fiber-review.json
+volume-cartographer/build/bin/VC3D --volpkg /path/to/project.json --constraint-graph-session /tmp/fiber-review.json
+```
+
+Validation on Ubuntu arm64 used the real inputs referenced by
+`/home/sean/Desktop/new_graph_2.json`: 765 catalog fibers, two reviewed fibers,
+four accepted patches and one rejection. Fiber coordinates stayed unchanged,
+and the saved review round-tripped exactly. An offscreen UI replay with
+`s1_ds2.zarr` checked opacity, commit/reject, decision reopening, undo/redo,
+rapid fiber switching, and save/open. All three constraint-graph CTest suites
+passed, including the new review and layered-opacity cases.
+
+#### Registration validation
+
+The read-only replay below samples up to 12 rejected decisions and four
+accepted controls from a saved review. A rejected decision is a human label,
+not evidence that its automatic fit failed. `--review-fit-audit` isolates the
+fiber-only solver; `--review-overlap-audit` also measures overlap RMS before
+and after fitting against the other accepted patches on the same fiber.
+Outputs must be separate from the input workspace.
+
+```sh
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 volume-cartographer/build/bin/test_constraint_graph
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 volume-cartographer/build/bin/constraint_graph_probe --review-fit-audit /home/sean/Desktop/fiber_linking.json /tmp/review-fiber-audit.jsonl 12 4
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 volume-cartographer/build/bin/constraint_graph_probe --review-overlap-audit /home/sean/Desktop/fiber_linking.json /tmp/review-overlap-audit.jsonl 12 4
+```
+
+On Ubuntu arm64, RelWithDebInfo, workspace revision `41f9d05d3bc17956`, the
+same 16 pairs produced 12 valid previews before the review-specific solver
+changes and 16 afterward, both fiber-only and with overlap constraints.
+The four original failures reported only a generic error; their underlying
+cause was the local-region boundary. Four overlap fits required stronger
+regularization to pass patch-raster validation (two at 4x, two at 16x).
+Fourteen pairs had accepted overlaps; all fourteen reduced their overlap RMS.
+The median per-pair RMS fell from 31.181 to 9.295 working voxels compared with
+the new fiber-only fit. These are registration residuals on matched targets,
+not independent ground-truth accuracy: the worst remaining overlap RMS was
+36.009 voxels. Human review is still needed, especially for nearby sheets and
+inconsistent accepted placements. No macOS or amd64 validation was performed.
+All 53 constraint tests passed. An offscreen replay using `s1_ds2.zarr` and a
+temporary two-fiber copy of that workspace also passed opacity changes,
+commit/reject, undo/redo, accepted-pair reopening, rapid fiber switching, and
+save/open. The original workspace was not modified.
+
+#### Rendering performance validation
+
+Accepted layers reuse rendered pixels while their surfaces, camera, volume
+chunks, bounds and display settings remain unchanged. The viewer also retains
+their composited image, so a new proposal only samples and blends its own
+layer. Chunk arrivals and view changes invalidate reuse. Scaled accepted
+surfaces keep their identities across commits. Blending retains the original
+layer order, per-layer rounding and full precision.
+
+After a normal build, prepare and build the isolated render benchmark. It
+links existing application objects and writes its own object/executable:
+
+```sh
+AGENTS_AGENT_MODE=1 ninja -C build -j 12
+python3 apps/VC3D/test/prepare_fiber_review_benchmark.py --build-dir build
+AGENTS_AGENT_MODE=1 ninja -C build -f fiber-review-benchmark/build.ninja
+AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen OMP_NUM_THREADS=1 build/bin/benchmark_fiber_review_render /tmp/fiber-review-real.json /home/sean/Documents/volpkgs/s1_ds2.volpkg/volumes/s1_ds2.zarr /tmp/fiber-review-render-after.json
+```
+
+Run these commands from `volume-cartographer`. Substitute a review with an
+accepted patch and volume scale 1, and its CT volume. The benchmark repeats a
+real accepted patch as independently rendered layers to stress accumulation;
+it is not a timing of fitting or disk loading. Each count uses three warm-ups
+and 12 timed proposal replacements at a fixed camera, 0.75 pixels per voxel,
+with a 1320 × 910 viewport. It also compares cached images with forced fresh
+renders after layer replacement/reordering/removal, opacity changes, tint
+changes/removal, zoom, pan and windowing.
+
+Ubuntu arm64, GCC 13, RelWithDebInfo, one OpenMP thread; input was the saved
+review and `s1_ds2.zarr` above. Times below include rendering and UI composition:
+
+| Accepted layers | Before mean / p50 / p95 (ms) | After mean / p50 / p95 (ms) |
+| --- | --- | --- |
+| 1 | 61.7 / 61 / 80 | 25.7 / 27 / 36 |
+| 8 | 164.5 / 163 / 195 | 22.9 / 22 / 29 |
+| 32 | 493.5 / 500 / 529 | 16.8 / 14 / 25 |
+
+All three final framebuffer hashes matched before/after. At 32 layers,
+profiling showed worker time dropping from 403 to 13 ms: the fiber and 32
+accepted layers were reused and only the proposal was sampled. Previously,
+repeated coordinate generation, chunk lookup/sampling and composition scaled
+with the layer count. Camera changes still require resampling the layers;
+this benchmark measures stationary-camera proposal review with warmed chunks.
+
+### Full graph mode
 
 - Orange marks identify attachment locations within **Proximity (vx)**, initially
   4 voxels in graph coordinates. Marks appear progressively as exact proximity

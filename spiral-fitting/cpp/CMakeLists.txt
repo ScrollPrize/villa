@@ -44,6 +44,7 @@ vc_spiral_module(vc_spiral_sampling spiral_sampling.cpp spiral_sampling)
 vc_spiral_module(vc_spiral_track_crossings track_crossings.cpp track_crossings)
 vc_spiral_module(vc_spiral_track_store track_store.cpp track_store)
 vc_spiral_module(vc_spiral_surface_index surface_index.cpp surface_index)
+vc_spiral_module(vc_spiral_winding_coincidence winding_coincidence.cpp winding_coincidence)
 
 target_compile_options(vc_spiral_track_crossings PRIVATE
     $<$<AND:$<CONFIG:RelWithDebInfo>,$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>>:-O3>

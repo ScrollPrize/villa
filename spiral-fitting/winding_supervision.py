@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import copy
-import hashlib
 import json
 from pathlib import Path
 
@@ -13,37 +11,10 @@ import torch.nn.functional as F
 
 from loss_maps import record_loss_samples
 from sample_spiral import get_theta_and_radii, unwrap_shifted_radii
-
-
-ARTIFACT_TYPE = "winding_inference_crossings"
-FORMAT_VERSION = 1
-
-
-def _canonical_digest(value) -> str:
-    encoded = json.dumps(
-        value, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(8 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _load_array(root: Path, description: dict, *, verify: bool) -> np.ndarray:
-    path = root / description["file"]
-    if verify and _sha256(path) != description["sha256"]:
-        raise ValueError(f"winding-inference array checksum mismatch: {path}")
-    value = np.load(path, mmap_mode="r", allow_pickle=False)
-    if list(value.shape) != list(description["shape"]):
-        raise ValueError(f"winding-inference array shape mismatch: {path}")
-    if np.dtype(value.dtype).str != str(description["dtype"]):
-        raise ValueError(f"winding-inference array dtype mismatch: {path}")
-    return value
+from winding_inference_io import (
+    ARTIFACT_TYPE, FORMAT_VERSION, _canonical_digest, _sha256, _load_array,
+    manifest_fingerprint,
+)
 
 
 class WindingInferenceStore:
@@ -65,14 +36,7 @@ class WindingInferenceStore:
                 f"{manifest.get('format_version')!r}")
         if manifest.get("coordinate_order") != "zyx":
             raise ValueError("winding-inference coordinates must use zyx order")
-        identity_view = copy.deepcopy(manifest)
-        claimed_fingerprint = identity_view.pop("fingerprint", None)
-        identity_view.pop("elapsed_seconds", None)
-        identity_view.pop("export_workers", None)
-        identity_view.pop("rays_per_task", None)
-        for shard in identity_view.get("shards", []):
-            shard.pop("elapsed_seconds", None)
-        if claimed_fingerprint != _canonical_digest(identity_view):
+        if manifest.get("fingerprint") != manifest_fingerprint(manifest):
             raise ValueError("winding-inference manifest fingerprint mismatch")
 
         origins = []

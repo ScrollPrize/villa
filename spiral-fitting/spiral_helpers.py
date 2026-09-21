@@ -32,8 +32,13 @@ def patch_intersects_z_roi(patch, z_begin, z_end):
 
 
 def load_patch_payload_chunk(path, entries, z_begin, z_end,
-                             erode_cells_default, io_threads=1):
+                             erode_cells_default, io_threads=1,
+                             keep_largest_component=False):
     """Load, erode, and z-filter a chunk of patch directories.
+
+    With ``keep_largest_component`` each surviving patch is then reduced to
+    its largest 4-connected component of valid quads (see
+    keep_largest_patch_component); a patch is dropped when nothing remains.
 
     Runs inside patch-loader worker processes (must stay a picklable
     module-level function). Returns one (entry, payload, error, drop_reason)
@@ -52,6 +57,8 @@ def load_patch_payload_chunk(path, entries, z_begin, z_end,
             cells_to_erode = patch.erosion_cells(erode_cells_default)
             if (cells_to_erode > 0
                     and not erode_patch_valid_region(patch, cells_to_erode)):
+                return entry, None, None, 'erosion'
+            if keep_largest_component and not keep_largest_patch_component(patch):
                 return entry, None, None, 'erosion'
             if not patch_intersects_z_roi(patch, z_begin, z_end):
                 return entry, None, None, 'z ROI after erosion'
@@ -136,18 +143,71 @@ def _decimate_ordered_points_min_spacing(points, min_spacing, return_indices=Fal
         keep = list(range(len(points)))
         return (points, np.asarray(keep, dtype=np.int64)) if return_indices else points
 
+    # Greedy scan: keep point i when it is forced or at least min_spacing from
+    # the last kept point. The scan is sequential, but the distances from one
+    # kept point to the following window of points are independent, so they are
+    # evaluated vectorised and only the candidates that could pass (forced, or
+    # within a hair of the threshold or beyond) are re-tested with the exact
+    # scalar expression the original per-point loop used, in order. The kept
+    # set is therefore identical to that loop's.
+    n = len(points)
+    forced = np.zeros(n, dtype=bool)
+    for i in force_keep:
+        if 0 <= i < n:
+            forced[i] = True
     keep = [0]
-    last_kept = points[0]
-    for i in range(1, len(points)):
-        if i in force_keep or np.linalg.norm(points[i] - last_kept) >= min_spacing:
-            keep.append(i)
-            last_kept = points[i]
+    last = 0
+    i = 1
+    window = 64
+    slack = 1e-3  # far above the vectorised norm's rounding difference
+    while i < n:
+        end = min(n, i + window)
+        delta = points[i:end] - points[last]
+        distances = np.sqrt((delta * delta).sum(axis=1))
+        candidates = np.flatnonzero(forced[i:end] | (distances >= min_spacing - slack))
+        found = None
+        for offset in candidates:
+            j = i + int(offset)
+            if forced[j] or np.linalg.norm(points[j] - points[last]) >= min_spacing:
+                found = j
+                break
+        if found is None:
+            i = end
+            window = min(window * 2, 4096)
+            continue
+        keep.append(found)
+        last = found
+        i = found + 1
     if return_indices:
         return points[keep], np.asarray(keep, dtype=np.int64)
     return points[keep]
 
 
 def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0, *, base_shape_zyx=None):
+    """Load one fiber JSON as a point collection (None when unusable).
+
+    Parsing and decimation happen in _load_fiber_payload (which loader worker
+    processes can run); the per-point dictionaries are assembled here by
+    _fiber_collection_from_payload."""
+    payload = _load_fiber_payload(path, coordinate_scale=coordinate_scale,
+                                  min_point_spacing=min_point_spacing,
+                                  base_shape_zyx=base_shape_zyx)
+    for warning in payload['warnings']:
+        print(warning)
+    if payload['skipped']:
+        return None
+    return _fiber_collection_from_payload(payload, collection_id)
+
+
+def _load_fiber_payload(path, coordinate_scale=0.25, min_point_spacing=20.0, *, base_shape_zyx=None):
+    """Parse, trim and decimate one fiber JSON into picklable numpy payloads.
+
+    Returns a dict with ``skipped`` (True when the fiber is unusable, with the
+    reason under ``warnings``), the decimated ``points_xyz`` (N, 3) float32,
+    ``kept_orig_indices``, ``control_line_indices`` and the collection-level
+    fields load_fiber_point_collection records. Runs in fiber-loader worker
+    processes (must stay a picklable module-level function); warnings are
+    returned rather than printed so the parent prints them in file order."""
     # Fiber JSONs are stored as one vc3d_fiber per file. Their control_points and
     # line_points are x/y/z coordinates at 4x the scale used by the regular PCL
     # JSONs unless coordinate_base_shape_zyx declares their domain. line_points
@@ -186,15 +246,16 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
             raise ValueError('Fiber and dataset coordinate domains are incompatible or ambiguous')
         coordinate_scale = scales[0]
 
+    def skipped(warning):
+        return {'skipped': True, 'warnings': [warning]}
+
     if data.get('version', 1) == 1 and not data.get('control_points'):
-        print(f'WARNING: fiber {path} has no control_points; skipping')
-        return None
+        return skipped(f'WARNING: fiber {path} has no control_points; skipping')
     parsed = parse_vc3d_fiber_format(data, path=path)
 
     control_xyz = np.asarray(parsed.control_points_xyz, dtype=np.float32)
     if control_xyz.ndim != 2 or control_xyz.shape[1] != 3:
-        print(f'WARNING: fiber {path} control points have shape {control_xyz.shape}; expected (N, 3); skipping')
-        return None
+        return skipped(f'WARNING: fiber {path} control points have shape {control_xyz.shape}; expected (N, 3); skipping')
     num_control_points = len(control_xyz)
 
     line_xyz = np.asarray(parsed.line_points_xyz, dtype=np.float32)
@@ -238,41 +299,6 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
         float(wk_color.get('b', 0.0)),
     ]
 
-    collection = {
-        'id': collection_id,
-        'name': name,
-        'points': {},
-        'metadata': {
-            'source_format': data.get('type', 'vc3d_fiber'),
-            'fiber_version': parsed.version,
-            'fiber_generation': parsed.generation,
-            'fiber_sequence': data.get('sequence'),
-            'fiber_started_at': data.get('started_at'),
-            'fiber_tags': data.get('tags', []),
-            'hv_classification': data.get('hv_classification', {}),
-            'input_coordinate_scale': coordinate_scale,
-            'pcl_fiber_min_point_spacing': min_point_spacing,
-            'fiber_original_num_points': original_num_points,
-            'fiber_num_control_points': num_control_points,
-        },
-        'color': color,
-    }
-    # Two-step index mapping for cross-fiber links (which reference control_point
-    # indices): control_line_indices maps a control_point index to its trimmed
-    # line-point index, kept_orig_indices maps that to the retained point id
-    # (0..k-1 in kept order, i.e. the position within kept_orig_indices).
-    collection['kept_orig_indices'] = kept_orig_indices
-    collection['control_line_indices'] = control_line_indices
-    for point_id, (p, orig_index) in enumerate(zip(points_xyz, kept_orig_indices)):
-        collection['points'][point_id] = {
-            'id': point_id,
-            'collectionId': collection_id,
-            'p': p.tolist(),
-            'winding_annotation': float('nan'),
-            'creation_time': 0,
-            'orig_index': int(orig_index),
-        }
-
     # Cross-fiber links ("branches"): each entry connects one of this fiber's
     # control points to a control point on another fiber (by explicit original
     # control_point index), expressing a same-winding continuation across the
@@ -292,9 +318,94 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
             'branch_index': branch_index,
             'pending': bool(br.get('pending', False)),
         })
-    collection['branches'] = branches
-    collection['file_basename'] = os.path.basename(path)
+    return {
+        'skipped': False,
+        'warnings': [],
+        'name': name,
+        'metadata': {
+            'source_format': data.get('type', 'vc3d_fiber'),
+            'fiber_version': parsed.version,
+            'fiber_generation': parsed.generation,
+            'fiber_sequence': data.get('sequence'),
+            'fiber_started_at': data.get('started_at'),
+            'fiber_tags': data.get('tags', []),
+            'hv_classification': data.get('hv_classification', {}),
+            'input_coordinate_scale': coordinate_scale,
+            'pcl_fiber_min_point_spacing': min_point_spacing,
+            'fiber_original_num_points': original_num_points,
+            'fiber_num_control_points': num_control_points,
+        },
+        'color': color,
+        'points_xyz': np.ascontiguousarray(points_xyz, dtype=np.float32),
+        'kept_orig_indices': kept_orig_indices,
+        'control_line_indices': control_line_indices,
+        'branches': branches,
+        'file_basename': os.path.basename(path),
+    }
+
+
+def _fiber_collection_from_payload(payload, collection_id):
+    """Assemble load_fiber_point_collection's collection dict from a payload."""
+    collection = {
+        'id': collection_id,
+        'name': payload['name'],
+        'points': {},
+        'metadata': dict(payload['metadata']),
+        'color': payload['color'],
+    }
+    # Two-step index mapping for cross-fiber links (which reference control_point
+    # indices): control_line_indices maps a control_point index to its trimmed
+    # line-point index, kept_orig_indices maps that to the retained point id
+    # (0..k-1 in kept order, i.e. the position within kept_orig_indices).
+    kept_orig_indices = payload['kept_orig_indices']
+    collection['kept_orig_indices'] = kept_orig_indices
+    collection['control_line_indices'] = payload['control_line_indices']
+    nan = float('nan')
+    collection['points'] = {
+        point_id: {
+            'id': point_id,
+            'collectionId': collection_id,
+            'p': p,
+            'winding_annotation': nan,
+            'creation_time': 0,
+            'orig_index': int(orig_index),
+        }
+        for point_id, (p, orig_index) in enumerate(zip(payload['points_xyz'].tolist(), kept_orig_indices))
+    }
+    collection['branches'] = payload['branches']
+    collection['file_basename'] = payload['file_basename']
     return collection
+
+
+def _load_fiber_payload_chunk(paths, coordinate_scale, min_point_spacing, base_shape_zyx):
+    """Worker-side: one (path, payload, error) per fiber path, in order."""
+    out = []
+    for path in paths:
+        try:
+            out.append((path, _load_fiber_payload(
+                path, coordinate_scale=coordinate_scale,
+                min_point_spacing=min_point_spacing, base_shape_zyx=base_shape_zyx), None))
+        except Exception as error:
+            out.append((path, None, str(error)))
+    return out
+
+
+def _hv_tag_from_metadata(hv_classification, *, min_auto_certainty):
+    """VC3D's manual H/V tag, else its automatic tag when certain enough, else
+    None (the geometric fallback of classify_fiber_hv then decides)."""
+    hv = hv_classification if isinstance(hv_classification, dict) else {}
+    manual = str(hv.get('manual_tag') or '').strip().upper()
+    if manual in ('H', 'V'):
+        return manual
+    automatic = str(hv.get('automatic_tag') or '').strip().upper()
+    if automatic in ('H', 'V'):
+        try:
+            certainty = float(hv.get('automatic_certainty', 0.0))
+        except (TypeError, ValueError):
+            certainty = 0.0
+        if certainty >= min_auto_certainty:
+            return automatic
+    return None
 
 
 def classify_fiber_hv(hv_classification, zyxs, *, min_z_fraction,
@@ -308,18 +419,9 @@ def classify_fiber_hv(hv_classification, zyxs, *, min_z_fraction,
     z extent covers at most ``1 - min_z_fraction`` of it, and untagged
     otherwise. These tags drive radial offsets and patch-side linking.
     """
-    hv = hv_classification if isinstance(hv_classification, dict) else {}
-    manual = str(hv.get('manual_tag') or '').strip().upper()
-    if manual in ('H', 'V'):
-        return manual
-    automatic = str(hv.get('automatic_tag') or '').strip().upper()
-    if automatic in ('H', 'V'):
-        try:
-            certainty = float(hv.get('automatic_certainty', 0.0))
-        except (TypeError, ValueError):
-            certainty = 0.0
-        if certainty >= min_auto_certainty:
-            return automatic
+    tag = _hv_tag_from_metadata(hv_classification, min_auto_certainty=min_auto_certainty)
+    if tag is not None:
+        return tag
     zyxs = np.asarray(zyxs, dtype=np.float64)
     if zyxs.ndim != 2 or len(zyxs) < 2:
         return None
@@ -346,6 +448,12 @@ def fiber_collection_hv_tag(pcl, *, min_z_fraction, min_auto_certainty):
     metadata = pcl.get('metadata') or {}
     if metadata.get('logical_input_kind') != 'fiber':
         return None
+    # The metadata tags decide most collections; only the geometric fallback
+    # needs the (id-ordered) polyline, so gather it just for that case.
+    tag = _hv_tag_from_metadata(metadata.get('hv_classification'),
+                                min_auto_certainty=min_auto_certainty)
+    if tag is not None:
+        return tag
     points = pcl.get('points') or {}
     ordered = sorted(points.items(), key=lambda kv: int(kv[0]))
     zyxs = np.asarray(
@@ -366,21 +474,54 @@ def load_fiber_point_collections(path, next_id, min_point_spacing=20.0, *, base_
         print(f'no fiber point collections found in {path}')
         return {}, next_id
 
+    # Parsing (JSON decode, format validation, control-point matching,
+    # decimation) is per-file Python work, so it runs in worker processes when
+    # there are enough files; the per-point dictionaries are then built here.
+    # Results are consumed in sorted path order either way, so collection ids
+    # and contents do not depend on the worker count.
+    payloads = {}
+    configured_workers = int(os.environ.get(
+        'FIT_SPIRAL_FIBER_LOAD_WORKERS', max(1, min(16, os.cpu_count() or 1))))
+    chunk_size = 8
+    chunks = [fiber_paths[start:start + chunk_size]
+              for start in range(0, len(fiber_paths), chunk_size)]
+    num_workers = max(1, min(configured_workers, len(chunks)))
+    if num_workers == 1 or len(chunks) < 4:
+        for chunk in chunks:
+            for path, payload, error in _load_fiber_payload_chunk(
+                    chunk, 0.25, min_point_spacing, base_shape_zyx):
+                payloads[path] = (payload, error)
+    else:
+        import multiprocessing
+        mp_context = multiprocessing.get_context(
+            'forkserver'
+            if 'forkserver' in multiprocessing.get_all_start_methods()
+            else 'spawn')
+        with concurrent.futures.ProcessPoolExecutor(
+                max_workers=num_workers, mp_context=mp_context) as executor:
+            futures = [
+                executor.submit(_load_fiber_payload_chunk, chunk, 0.25,
+                                min_point_spacing, base_shape_zyx)
+                for chunk in chunks]
+            for future in concurrent.futures.as_completed(futures):
+                for path, payload, error in future.result():
+                    payloads[path] = (payload, error)
+
     point_collections = {}
     total_points = 0
     skipped = 0
     for fiber_path in fiber_paths:
-        try:
-            pcl = load_fiber_point_collection(
-                fiber_path, next_id, min_point_spacing=min_point_spacing,
-                base_shape_zyx=base_shape_zyx)
-        except Exception as e:
-            print(f'WARNING: failed to load fiber {fiber_path}: {e}')
+        payload, error = payloads[fiber_path]
+        if error is not None:
+            print(f'WARNING: failed to load fiber {fiber_path}: {error}')
             skipped += 1
             continue
-        if pcl is None:
+        for warning in payload['warnings']:
+            print(warning)
+        if payload['skipped']:
             skipped += 1
             continue
+        pcl = _fiber_collection_from_payload(payload, next_id)
         pcl['source_file'] = fiber_path
         point_collections[next_id] = pcl
         total_points += len(pcl['points'])
@@ -828,6 +969,11 @@ def merge_linked_point_collections(point_collections, link_components,
                          'logical_input_ids': logical_members},
             'points': merged_points,
             'link_member_cids': [cid for cid, _ in members],
+            'link_members': [
+                {'collection_id': cid, 'name': pcl.get('name'),
+                 'source_file': pcl.get('source_file')}
+                for cid, pcl in members
+            ],
             'chain': ComponentChain(member_sorted, pos_of, tree_parent, extra_edges),
         }
         num_merged += 1
@@ -1761,6 +1907,33 @@ def erode_patch_valid_region(patch, num_cells):
     if not bool(new_valid_quad.any()):
         return False
     patch.__post_init__()
+    return True
+
+
+def keep_largest_patch_component(patch):
+    """Keep only the patch's largest 4-connected component of valid quads.
+
+    Vertices outside that component (other islands, and vertices that belong
+    to no valid quad) are invalidated. Returns False when the patch has no
+    valid quad at all. Ties go to the lowest component label, which is
+    deterministic for a given grid."""
+    quads = patch.valid_quad_mask.cpu().numpy()
+    labels, count = scipy.ndimage.label(quads)  # 4-connectivity
+    if count == 0:
+        return False
+    if count > 1:
+        sizes = np.bincount(labels.ravel())
+        sizes[0] = 0
+        quads = labels == int(np.argmax(sizes))
+    keep = np.zeros(patch.valid_vertex_mask.shape, dtype=bool)
+    keep[:-1, :-1] |= quads
+    keep[:-1, 1:] |= quads
+    keep[1:, :-1] |= quads
+    keep[1:, 1:] |= quads
+    remove = patch.valid_vertex_mask.cpu().numpy() & ~keep
+    if remove.any():
+        patch.zyxs[torch.from_numpy(remove)] = -1.0
+        patch.__post_init__()
     return True
 
 

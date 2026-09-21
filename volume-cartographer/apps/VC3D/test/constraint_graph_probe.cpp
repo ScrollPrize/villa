@@ -1,4 +1,5 @@
 #include "vc/constraints/ConstraintGraph.hpp"
+#include "vc/constraints/FiberReview.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -23,7 +24,122 @@ vc::constraints::Catalog benchmarkCatalog(vc::constraints::Settings settings) {
     return vc::constraints::loadCatalog(settings);
 }
 }
+#include "fiber_review_fit_audit.hpp"
+#include "fiber_review_normal_features.hpp"
+#include "fiber_review_registered_maps.hpp"
+#include "fiber_review_anchor_evidence.hpp"
 int main(int argc,char** argv){
+    if(argc==3&&std::string(argv[1])=="--review-anchor-session") {
+        try { return fiber_review_evidence::anchorSession(argv[2]); }
+        catch(const std::exception& e) { std::cerr<<e.what()<<std::endl;return 1; }
+    }
+    if(argc>=4&&std::string(argv[1])=="--review-anchor-dataset") {
+        try { return fiber_review_evidence::exportAnchors(argc,argv); }
+        catch(const std::exception& e) { std::cerr<<e.what()<<std::endl;return 1; }
+    }
+    if(argc==5&&std::string(argv[1])=="--review-render-dataset") {
+        try { return exportFiberReviewMaps(argv[2],argv[3],argv[4]); }
+        catch(const std::exception& e) { std::cerr<<e.what()<<std::endl;return 1; }
+    }
+    if(argc==4&&std::string(argv[1])=="--sample-review-normals") {
+        try { return sampleFiberReviewNormals(argv[2],argv[3]); }
+        catch(const std::exception& e) { std::cerr<<e.what()<<std::endl;return 1; }
+    }
+    if(argc>=4&&(std::string(argv[1])=="--review-fit-audit"||std::string(argv[1])=="--review-fit-dataset"||std::string(argv[1])=="--review-overlap-audit")) {
+        try { return auditFiberReviewFits(argc,argv); }
+        catch(const std::exception& e) { std::cerr<<e.what()<<std::endl;return 1; }
+    }
+    if(argc==4&&std::string(argv[1])=="--fiber-review") {
+        try {
+            using namespace vc::constraints;
+            std::ifstream input(argv[2]);const auto source=nlohmann::json::parse(input);
+            FiberReview review;review.settings=settingsFromJson(source.at("settings"));review.settings.radius=1.5;
+            const auto catalog=benchmarkCatalog(review.settings);
+            vc::lasagna::LasagnaDatasetOpenOptions options;options.workingToBaseScale=review.settings.normalScale;
+            const auto dataset=vc::lasagna::LasagnaDataset::openLocation(review.settings.normalManifest,options);
+            vc::lasagna::LasagnaNormalSampler normals(dataset);
+            for(const auto& [id,f]:catalog.fibers){ReviewFiber state;state.path=f.path;state.direction=f.direction;review.fibers.emplace(id,std::move(state));}
+            std::vector<std::string> fibers;
+            const auto seed=source.at("seed").get<std::string>();if(catalog.fibers.contains(seed))fibers.push_back(seed);
+            for(const auto& [id,f]:catalog.fibers)if(id!=seed)fibers.push_back(id);
+            size_t accepted=0,rejected=0,visited=0;
+            for(const auto& id:fibers) {
+                if(visited>=2&&accepted>=2&&rejected)break;
+                if(visited++>=12)break;
+                std::cout<<"review fiber="<<id<<std::endl;
+                auto& f=review.fibers.at(id);auto node=makeFiberNode(catalog.fibers.at(id),review.settings,normals);
+                f.base.settings=review.settings;f.base.seed=id;f.base.nodes.emplace(id,Placement{node,node->initialUv});
+                const auto base=renderPlacement(f.base);if(!base.valid)throw std::runtime_error(base.message);
+                const auto prepared=prepareGraph(base);
+                f.proposals=discover(catalog,f.base,id,nullptr,[](const auto& message){std::cout<<message<<std::endl;},{},1,{},ContactPolicy::FiberReview);f.discovered=true;orderReviewProposals(f);
+                std::cout<<"proposals="<<f.proposals.size()<<std::endl;
+                size_t attempts=0,localAccepted=0;
+                for(const auto& c:f.proposals) {
+                    if(f.decisions.contains(c.id))continue;
+                    if(attempts++>=8||localAccepted>=2)break;
+                    auto edit=proposeEdit(catalog,prepared,c,false,normals,nullptr,ContactPolicy::FiberReview);
+                    addReviewOverlapTargets(edit,f);
+                    const auto fit=fitEdit(edit,nullptr,{},FitPolicy::FiberReview);
+                    if(fit.graph.nodes.at(id).uv!=f.base.nodes.at(id).uv)throw std::runtime_error("Fiber moved during patch review");
+                    std::cout<<"patch="<<c.id<<" valid="<<fit.valid<<" rms="<<fit.correspondenceRms<<" message="<<fit.message<<std::endl;
+                    ReviewDecision d;d.status=fit.valid?ReviewStatus::Accepted:ReviewStatus::Rejected;d.order=review.nextOrder++;
+                    if(fit.valid){d.alignment=fit.graph;++accepted;++localAccepted;review.selected=id;}
+                    else ++rejected;
+                    f.decisions.emplace(c.id,std::move(d));
+                }
+                f.current=nextReviewProposal(f);
+                if(!rejected&&f.current>=0){f.decisions[f.proposals[f.current].id]={ReviewStatus::Rejected,review.nextOrder++,{}};++rejected;f.current=nextReviewProposal(f);}
+                if(f.current>=0&&localAccepted) {
+                    auto edit=proposeEdit(catalog,prepared,f.proposals[f.current],false,normals,nullptr,ContactPolicy::FiberReview);
+                    addReviewOverlapTargets(edit,f);
+                    auto fit=fitEdit(edit,nullptr,{},FitPolicy::FiberReview);f.pending=fit.graph;
+                }
+            }
+            if(!accepted||!rejected)throw std::runtime_error("Real review validation needs an accepted and rejected pair");
+            saveReview(review,argv[3]);const auto restored=loadReview(argv[3]);
+            if(reviewToJson(review)!=reviewToJson(restored))throw std::runtime_error("Review did not round trip exactly");
+            for(const auto& [id,f]:restored.fibers)for(const auto& [patch,d]:f.decisions)if(d.status==ReviewStatus::Accepted){
+                const auto layer=renderSourceLayer(d.alignment,false);if(!layer.valid)throw std::runtime_error(layer.message);
+            }
+            std::cout<<"review roundtrip=passed accepted="<<accepted<<" rejected="<<rejected<<" visited="<<visited<<std::endl;return 0;
+        }catch(const std::exception& e){std::cerr<<e.what()<<std::endl;return 1;}
+    }
+    if(argc>=4&&std::string(argv[1])=="--quarantine") {
+        try {
+            auto result=vc::constraints::loadSession(argv[2]);
+            std::vector<std::string> selected;for(int i=3;i<argc;++i)selected.push_back(argv[i]);
+            result=vc::constraints::quarantinePatches(result,argv[2],selected,[](const auto& message){std::cout<<message<<std::endl;});
+            std::cout<<result.message<<std::endl;return 0;
+        }catch(const std::exception& e){std::cerr<<e.what()<<std::endl;return 1;}
+    }
+    if(argc==5&&std::string(argv[1])=="--pick-layout") {
+        try {
+            const auto result=vc::constraints::loadSession(argv[2]);
+            const auto hit=vc::constraints::pickRendered(result,{std::stod(argv[3]),std::stod(argv[4])});
+            if(!hit)throw std::runtime_error("No displayed source at this position");
+            std::cout<<hit->node<<" "<<result.graph.nodes.at(hit->node).source->path<<std::endl;return 0;
+        }catch(const std::exception& e){std::cerr<<e.what()<<std::endl;return 1;}
+    }
+    if(argc>=3&&std::string(argv[1])=="--inspect-layout") {
+        try {
+            const auto result=vc::constraints::loadSession(argv[2]);
+            if(!result.valid)throw std::runtime_error(result.message);
+            size_t fibers=0;for(const auto& [id,p]:result.graph.nodes)fibers+=p.source->fiber;
+            const auto& grid=*result.surface->rawPointsPtr();
+            size_t vertices=0,quads=0,sourceTriangles=0;
+            for(const auto& [id,p]:result.graph.nodes)sourceTriangles+=p.source->triangles.size();
+            for(const auto& xyz:grid)vertices+=xyz[0]!=-1;
+            for(int y=0;y+1<grid.rows;++y)for(int x=0;x+1<grid.cols;++x)
+                quads+=grid(y,x)[0]!=-1&&grid(y,x+1)[0]!=-1&&grid(y+1,x)[0]!=-1&&grid(y+1,x+1)[0]!=-1;
+            std::cout<<"valid_samples="<<vertices<<" complete_quads="<<quads<<" source_triangles="<<sourceTriangles<<std::endl;
+            std::cout<<"nodes="<<result.graph.nodes.size()<<" fibers="<<fibers<<" patches="<<result.graph.nodes.size()-fibers
+                     <<" grid="<<grid.cols<<"x"<<grid.rows<<" fixed="<<!result.graph.windingLayout.is_null()
+                     <<" message="<<result.message<<std::endl;
+            if(argc>=4)vc::constraints::exportSurface(result,argv[3]);
+            return 0;
+        }catch(const std::exception& e){std::cerr<<e.what()<<std::endl;return 1;}
+    }
+
     if(argc>=4&&std::string(argv[1])=="--fresh-edit-growth") {
         try {
             using namespace vc::constraints;

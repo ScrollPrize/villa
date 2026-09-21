@@ -30,6 +30,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from typing import Optional
 
 import click
 import numpy as np
@@ -199,12 +200,12 @@ class PatchGraph:
     ids: np.ndarray              # (Hq, Wq) int64, local node id per valid quad else -1
     node_qi: np.ndarray          # (N,) int64, quad row per node
     node_qj: np.ndarray          # (N,) int64, quad col per node
-    quad_center_xyz: np.ndarray  # (N, 3) float32, quad centre in world xyz (for index queries)
+    quad_center_xyz: Optional[np.ndarray]  # (N, 3) float32, quad centre in world xyz (for index queries); None if not lifted
     csr: sp.csr_matrix           # (N, N) directed weighted adjacency among valid quads
     n: int
 
 
-def build_patch_graph(patch, medial_weight):
+def build_patch_graph(patch, medial_weight, *, lift_quad_centres=True):
     """Build (and weight) the quad-grid graph for one patch.
 
     Nodes are valid quads (cells with four valid corners); the node's position
@@ -212,6 +213,11 @@ def build_patch_graph(patch, medial_weight):
     u -> v carries weight ``base_len * (1 + medial_weight / max(dt_v, 1))`` where
     base_len is 1 (orthogonal) or sqrt(2) (diagonal): steps into shallow,
     near-the-boundary quads cost more, so shortest paths drift to the middle.
+
+    ``lift_quad_centres=False`` skips lifting every quad centre to world xyz
+    (``quad_center_xyz`` is then None). Only surface-index overlap queries need
+    those; callers that only route paths within one patch (e.g.
+    find_inconsistent_windings) save the per-patch interpolation.
     """
     vq = patch.valid_quad_mask.detach().cpu().numpy()
     hq, wq = vq.shape
@@ -228,12 +234,14 @@ def build_patch_graph(patch, medial_weight):
 
     # Lift quad centres to world xyz for surface-index queries. Centres of valid
     # quads are always interior to a valid quad, so ij_to_zyx never rejects them.
-    ij = torch.stack([
-        torch.from_numpy(node_qi).to(torch.float32) + 0.5,
-        torch.from_numpy(node_qj).to(torch.float32) + 0.5,
-    ], dim=-1)
-    zyx, _ = patch.ij_to_zyx(ij)
-    quad_center_xyz = np.ascontiguousarray(zyx.cpu().numpy()[:, ::-1], dtype=np.float32)
+    quad_center_xyz = None
+    if lift_quad_centres:
+        ij = torch.stack([
+            torch.from_numpy(node_qi).to(torch.float32) + 0.5,
+            torch.from_numpy(node_qj).to(torch.float32) + 0.5,
+        ], dim=-1)
+        zyx, _ = patch.ij_to_zyx(ij)
+        quad_center_xyz = np.ascontiguousarray(zyx.cpu().numpy()[:, ::-1], dtype=np.float32)
 
     rows, cols, data = [], [], []
     for di, dj in _DIRS8:

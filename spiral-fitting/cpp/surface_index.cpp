@@ -15,6 +15,10 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace nb = nanobind;
 
 namespace {
@@ -264,6 +268,114 @@ struct BestHit {
     float j = 0.0f;
 };
 
+// Bool numpy array over a uint8 vector (nanobind maps bool ndarrays to bytes).
+nb::ndarray<nb::numpy, bool, nb::ndim<1>> own_bool_1d(std::vector<uint8_t>&& values)
+{
+    auto* held = new std::vector<uint8_t>(std::move(values));
+    nb::capsule owner(held, [](void* pointer) noexcept {
+        delete static_cast<std::vector<uint8_t>*>(pointer);
+    });
+    return nb::ndarray<nb::numpy, bool, nb::ndim<1>>(
+        reinterpret_cast<bool*>(held->data()), {held->size()}, owner);
+}
+
+// tifxyz.Patch.valid_vertex_mask: torch.any(zyxs != -1, dim=-1).
+bool tifxyz_vertex_valid(const Vec3& point)
+{
+    return point.x != -1.0f || point.y != -1.0f || point.z != -1.0f;
+}
+
+// One sample of tifxyz.Patch.ij_to_zyx (see PySurfacePatchIndex::interpolate_ij).
+// Each arithmetic step mirrors one torch op on float32 tensors, so this
+// function must not be compiled with floating-point contraction (a fused
+// multiply-add rounds once where torch rounds twice). The rest of this file
+// keeps the toolchain's default, so the projection queries are unchanged.
+#if defined(__clang__)
+#define VC_NO_FP_CONTRACT_ATTR
+#define VC_NO_FP_CONTRACT_BODY _Pragma("clang fp contract(off)")
+#elif defined(__GNUC__)
+#define VC_NO_FP_CONTRACT_ATTR __attribute__((optimize("fp-contract=off")))
+#define VC_NO_FP_CONTRACT_BODY
+#else
+// MSVC's default /fp:precise does not contract.
+#define VC_NO_FP_CONTRACT_ATTR
+#define VC_NO_FP_CONTRACT_BODY
+#endif
+
+VC_NO_FP_CONTRACT_ATTR
+bool interpolate_one(
+    const SurfaceData& data, float i, float j, bool triangulated, float out[3])
+{
+    VC_NO_FP_CONTRACT_BODY
+    if (!std::isfinite(i) || !std::isfinite(j)) {
+        return false;
+    }
+    const int64_t rows = static_cast<int64_t>(data.rows);
+    const int64_t cols = static_cast<int64_t>(data.cols);
+    int64_t i0 = static_cast<int64_t>(std::floor(i));
+    int64_t j0 = static_cast<int64_t>(std::floor(j));
+    if (triangulated) {
+        // Projection may land exactly on the outer edge of the last quad.
+        if (i == static_cast<float>(rows - 1)) {
+            i0 = rows - 2;
+        }
+        if (j == static_cast<float>(cols - 1)) {
+            j0 = cols - 2;
+        }
+    }
+    if (!(i0 >= 0 && j0 >= 0 && i0 < rows - 1 && j0 < cols - 1)) {
+        return false;
+    }
+    const Vec3& tl = data.at(static_cast<size_t>(i0), static_cast<size_t>(j0));
+    const Vec3& tr = data.at(static_cast<size_t>(i0), static_cast<size_t>(j0 + 1));
+    const Vec3& bl = data.at(static_cast<size_t>(i0 + 1), static_cast<size_t>(j0));
+    const Vec3& br = data.at(static_cast<size_t>(i0 + 1), static_cast<size_t>(j0 + 1));
+    if (!(tifxyz_vertex_valid(tl) && tifxyz_vertex_valid(tr)
+          && tifxyz_vertex_valid(bl) && tifxyz_vertex_valid(br))) {
+        return false;
+    }
+    const float di = i - static_cast<float>(i0);
+    const float dj = j - static_cast<float>(j0);
+    // SurfaceData stores x, y, z; emit z, y, x like the patch grid.
+    const float c_tl[3] = {tl.z, tl.y, tl.x};
+    const float c_tr[3] = {tr.z, tr.y, tr.x};
+    const float c_bl[3] = {bl.z, bl.y, bl.x};
+    const float c_br[3] = {br.z, br.y, br.x};
+    if (triangulated) {
+        const bool lower = (di + dj) <= 1.0f;
+        const float one_minus_di = 1.0f - di;
+        const float one_minus_dj = 1.0f - dj;
+        for (int c = 0; c < 3; ++c) {
+            if (lower) {
+                // tl + di * (bl - tl) + dj * (tr - tl)
+                const float t1 = c_bl[c] - c_tl[c];
+                const float t2 = di * t1;
+                const float t3 = c_tl[c] + t2;
+                const float t4 = c_tr[c] - c_tl[c];
+                const float t5 = dj * t4;
+                out[c] = t3 + t5;
+            } else {
+                // br + (1 - di) * (tr - br) + (1 - dj) * (bl - br)
+                const float t1 = c_tr[c] - c_br[c];
+                const float t2 = one_minus_di * t1;
+                const float t3 = c_br[c] + t2;
+                const float t4 = c_bl[c] - c_br[c];
+                const float t5 = one_minus_dj * t4;
+                out[c] = t3 + t5;
+            }
+        }
+    } else {
+        for (int c = 0; c < 3; ++c) {
+            // top = tl + (tr - tl) * dj; bottom = bl + (br - bl) * dj;
+            // top + (bottom - top) * di
+            const float top = c_tl[c] + (c_tr[c] - c_tl[c]) * dj;
+            const float bottom = c_bl[c] + (c_br[c] - c_bl[c]) * dj;
+            out[c] = top + (bottom - top) * di;
+        }
+    }
+    return true;
+}
+
 template <typename T>
 nb::ndarray<nb::numpy, T, nb::ndim<1>> own_1d(std::vector<T>&& values)
 {
@@ -300,66 +412,64 @@ public:
         float bbox_padding = 0.0f,
         int sampling_stride = 1)
     {
-        if (sampling_stride < 1) {
-            throw std::runtime_error("sampling_stride must be >= 1");
-        }
-
         std::vector<std::shared_ptr<SurfaceData>> new_surfaces;
         for (nb::handle item : py_surfaces) {
             new_surfaces.push_back(nb::cast<PyQuadSurface&>(item).data);
         }
+        rebuild_from_surfaces(std::move(new_surfaces), bbox_padding, sampling_stride);
+    }
 
-        const int new_tile_stride = compute_tile_stride(sampling_stride);
-        std::vector<Tile> new_tiles;
-        for (size_t surface_index = 0; surface_index < new_surfaces.size(); ++surface_index) {
-            const SurfaceData& surface = *new_surfaces[surface_index];
-            if (surface.rows < 2 || surface.cols < 2) {
-                continue;
-            }
-            for (size_t row = 0; row + 1 < surface.rows; row += new_tile_stride) {
-                for (size_t col = 0; col + 1 < surface.cols; col += new_tile_stride) {
-                    const size_t row_end = std::min(
-                        surface.rows - 1, row + static_cast<size_t>(new_tile_stride));
-                    const size_t col_end = std::min(
-                        surface.cols - 1, col + static_cast<size_t>(new_tile_stride));
-                    Aabb bounds;
-                    bool any_valid = false;
-                    for (size_t r = row; r <= row_end; ++r) {
-                        for (size_t c = col; c <= col_end; ++c) {
-                            const Vec3& point = surface.at(r, c);
-                            if (valid_surface_point(point)) {
-                                bounds.extend(point);
-                                any_valid = true;
-                            }
-                        }
-                    }
-                    if (any_valid) {
-                        bounds.pad(bbox_padding);
-                        new_tiles.push_back({
-                            bounds,
-                            static_cast<int32_t>(surface_index),
-                            static_cast<int>(row),
-                            static_cast<int>(col),
-                        });
-                    }
+    using GridArray = nb::ndarray<
+        nb::numpy, const float, nb::shape<-1, -1, 3>, nb::c_contig>;
+    using ScaleBatch = nb::ndarray<
+        nb::numpy, const float, nb::shape<-1>, nb::c_contig>;
+
+    // rebuild() over (id, zyx grid, scale_i, scale_j) columns: the same index
+    // as building one QuadSurface per grid, but the geometry copies run in
+    // parallel and no per-surface Python objects are created.
+    void rebuild_grids(
+        const std::vector<std::string>& ids,
+        const nb::sequence& grids,
+        ScaleBatch scales_i,
+        ScaleBatch scales_j,
+        float bbox_padding = 0.0f,
+        int sampling_stride = 1)
+    {
+        const size_t count = ids.size();
+        if (static_cast<size_t>(nb::len(grids)) != count
+            || scales_i.shape(0) != count || scales_j.shape(0) != count) {
+            throw std::runtime_error("ids, grids and scales must have the same length");
+        }
+        std::vector<GridArray> arrays;
+        arrays.reserve(count);
+        for (nb::handle item : grids) {
+            arrays.push_back(nb::cast<GridArray>(item));
+        }
+        std::vector<std::shared_ptr<SurfaceData>> new_surfaces(count);
+        for (size_t index = 0; index < count; ++index) {
+            auto data = std::make_shared<SurfaceData>();
+            data->id = ids[index];
+            data->rows = arrays[index].shape(0);
+            data->cols = arrays[index].shape(1);
+            data->scale_i = scales_i(index);
+            data->scale_j = scales_j(index);
+            new_surfaces[index] = std::move(data);
+        }
+        {
+            nb::gil_scoped_release release;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 64)
+#endif
+            for (std::ptrdiff_t index = 0; index < static_cast<std::ptrdiff_t>(count); ++index) {
+                SurfaceData& data = *new_surfaces[static_cast<size_t>(index)];
+                const float* zyx = arrays[static_cast<size_t>(index)].data();
+                data.xyz.resize(data.rows * data.cols);
+                for (size_t vertex = 0; vertex < data.rows * data.cols; ++vertex) {
+                    data.xyz[vertex] = {zyx[3 * vertex + 2], zyx[3 * vertex + 1], zyx[3 * vertex]};
                 }
             }
         }
-
-        std::vector<uint32_t> new_order(new_tiles.size());
-        std::iota(new_order.begin(), new_order.end(), uint32_t{0});
-        std::vector<BvhNode> new_nodes;
-        if (!new_tiles.empty()) {
-            new_nodes.reserve(new_tiles.size() * 2);
-            build_bvh(new_tiles, new_order, new_nodes, 0, new_order.size());
-        }
-
-        surfaces_ = std::move(new_surfaces);
-        tiles_ = std::move(new_tiles);
-        tile_order_ = std::move(new_order);
-        nodes_ = std::move(new_nodes);
-        sampling_stride_ = sampling_stride;
-        tile_stride_ = new_tile_stride;
+        rebuild_from_surfaces(std::move(new_surfaces), bbox_padding, sampling_stride);
     }
 
     std::vector<std::string> surface_ids() const
@@ -375,6 +485,68 @@ public:
     nb::object locate_all_xyz_batch(XyzBatch xyzs, float tolerance) const
     {
         return query_batch(xyzs, nullptr, tolerance);
+    }
+
+    using SurfaceBatch = nb::ndarray<
+        nb::numpy, const int32_t, nb::shape<-1>, nb::c_contig>;
+    using IjBatch = nb::ndarray<
+        nb::numpy, const float, nb::shape<-1, 2>, nb::c_contig>;
+
+    // tifxyz.Patch.ij_to_zyx over many (surface, ij) pairs at once, with the
+    // out-of-range nudge point_collection._projection_feet applies on top.
+    //
+    // Reproduces the torch implementation's float32 arithmetic operation for
+    // operation (interpolate_one is compiled without floating-point
+    // contraction), so a foot computed here is bit-identical to one computed
+    // by patch.ij_to_zyx(ij, triangulated=...) on the same patch: bilinear
+    // interpolation of the quad's four corners, or the two-triangle
+    // interpolation of interpolate_quad_triangles when `triangulated`. A hit
+    // whose ij lands outside the grid or on an invalid quad is retried with ij
+    // clamped into the grid's last quad (the "nudge"); returns (zyx, valid)
+    // with zyx == -1 where still invalid.
+    nb::object interpolate_ij(
+        SurfaceBatch surface_indices, IjBatch ijs, bool triangulated) const
+    {
+        const size_t count = surface_indices.shape(0);
+        if (ijs.shape(0) != count) {
+            throw std::runtime_error("surface_indices and ijs must have the same length");
+        }
+        std::vector<float> zyx(count * 3, -1.0f);
+        std::vector<uint8_t> valid(count, 0);
+        const int32_t* surfaces = surface_indices.data();
+        const float* ij = ijs.data();
+        {
+            nb::gil_scoped_release release;
+            for (size_t k = 0; k < count; ++k) {
+                const int32_t surface = surfaces[k];
+                if (surface < 0 || static_cast<size_t>(surface) >= surfaces_.size()) {
+                    continue;
+                }
+                const SurfaceData& data = *surfaces_[static_cast<size_t>(surface)];
+                float out[3];
+                if (interpolate_one(data, ij[2 * k], ij[2 * k + 1], triangulated, out)) {
+                    valid[k] = 1;
+                } else {
+                    // Nudge: clamp into [0, extent - 1 - 1e-3] (float32 of the
+                    // python double, as torch's clamp does) and retry.
+                    const float max_i = static_cast<float>(
+                        static_cast<double>(data.rows) - 1.0 - 1e-3);
+                    const float max_j = static_cast<float>(
+                        static_cast<double>(data.cols) - 1.0 - 1e-3);
+                    const float ni = std::min(std::max(ij[2 * k], 0.0f), max_i);
+                    const float nj = std::min(std::max(ij[2 * k + 1], 0.0f), max_j);
+                    if (interpolate_one(data, ni, nj, triangulated, out)) {
+                        valid[k] = 1;
+                    } else {
+                        continue;
+                    }
+                }
+                zyx[3 * k] = out[0];
+                zyx[3 * k + 1] = out[1];
+                zyx[3 * k + 2] = out[2];
+            }
+        }
+        return nb::make_tuple(own_2d(std::move(zyx), 3), own_bool_1d(std::move(valid)));
     }
 
     nb::object locate_all_xyz_batch_in(
@@ -401,27 +573,167 @@ private:
         return ((8 + sampling_stride - 1) / sampling_stride) * sampling_stride;
     }
 
-    static uint32_t build_bvh(
+    void rebuild_from_surfaces(
+        std::vector<std::shared_ptr<SurfaceData>> new_surfaces,
+        float bbox_padding,
+        int sampling_stride)
+    {
+        if (sampling_stride < 1) {
+            throw std::runtime_error("sampling_stride must be >= 1");
+        }
+        const int new_tile_stride = compute_tile_stride(sampling_stride);
+
+        // Tiles per surface, computed independently (parallel) and concatenated
+        // in surface order, so the tile list is the one a serial pass produces.
+        std::vector<std::vector<Tile>> per_surface(new_surfaces.size());
+        {
+            nb::gil_scoped_release release;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 16)
+#endif
+            for (std::ptrdiff_t surface_index = 0;
+                 surface_index < static_cast<std::ptrdiff_t>(new_surfaces.size());
+                 ++surface_index) {
+                per_surface[static_cast<size_t>(surface_index)] = surface_tiles(
+                    *new_surfaces[static_cast<size_t>(surface_index)],
+                    static_cast<int32_t>(surface_index), new_tile_stride, bbox_padding);
+            }
+        }
+        std::vector<Tile> new_tiles;
+        size_t total = 0;
+        for (const auto& tiles : per_surface) {
+            total += tiles.size();
+        }
+        new_tiles.reserve(total);
+        for (auto& tiles : per_surface) {
+            new_tiles.insert(new_tiles.end(), tiles.begin(), tiles.end());
+        }
+        per_surface.clear();
+
+        std::vector<uint32_t> new_order(new_tiles.size());
+        std::iota(new_order.begin(), new_order.end(), uint32_t{0});
+        std::vector<BvhNode> new_nodes;
+        if (!new_tiles.empty()) {
+            nb::gil_scoped_release release;
+            build_bvh_levels(new_tiles, new_order, new_nodes);
+        }
+
+        surfaces_ = std::move(new_surfaces);
+        tiles_ = std::move(new_tiles);
+        tile_order_ = std::move(new_order);
+        nodes_ = std::move(new_nodes);
+        sampling_stride_ = sampling_stride;
+        tile_stride_ = new_tile_stride;
+    }
+
+    static std::vector<Tile> surface_tiles(
+        const SurfaceData& surface, int32_t surface_index, int tile_stride, float bbox_padding)
+    {
+        std::vector<Tile> tiles;
+        if (surface.rows < 2 || surface.cols < 2) {
+            return tiles;
+        }
+        for (size_t row = 0; row + 1 < surface.rows; row += tile_stride) {
+            for (size_t col = 0; col + 1 < surface.cols; col += tile_stride) {
+                const size_t row_end = std::min(
+                    surface.rows - 1, row + static_cast<size_t>(tile_stride));
+                const size_t col_end = std::min(
+                    surface.cols - 1, col + static_cast<size_t>(tile_stride));
+                Aabb bounds;
+                bool any_valid = false;
+                for (size_t r = row; r <= row_end; ++r) {
+                    for (size_t c = col; c <= col_end; ++c) {
+                        const Vec3& point = surface.at(r, c);
+                        if (valid_surface_point(point)) {
+                            bounds.extend(point);
+                            any_valid = true;
+                        }
+                    }
+                }
+                if (any_valid) {
+                    bounds.pad(bbox_padding);
+                    tiles.push_back({
+                        bounds,
+                        surface_index,
+                        static_cast<int>(row),
+                        static_cast<int>(col),
+                    });
+                }
+            }
+        }
+        return tiles;
+    }
+
+    // Median-split BVH built one depth level at a time: every node of a level
+    // is bounded, split-sorted and (if not a leaf) split in parallel, then its
+    // children are allocated serially in node order. The tree -- each node's
+    // tile range, split axis and stable centroid order -- is exactly the one the
+    // depth-first recursion built; only node numbering differs, and queries
+    // gather then sort candidate tiles, so their results do not depend on it.
+    static void build_bvh_levels(
         const std::vector<Tile>& tiles,
         std::vector<uint32_t>& order,
-        std::vector<BvhNode>& nodes,
+        std::vector<BvhNode>& nodes)
+    {
+        struct Work {
+            uint32_t node;
+            size_t first;
+            size_t last;
+        };
+        nodes.reserve(tiles.size() * 2);
+        nodes.emplace_back();
+        std::vector<Work> level{{0, 0, order.size()}};
+        std::vector<uint8_t> is_leaf;
+        while (!level.empty()) {
+            is_leaf.assign(level.size(), 0);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+            for (std::ptrdiff_t w = 0; w < static_cast<std::ptrdiff_t>(level.size()); ++w) {
+                const Work& work = level[static_cast<size_t>(w)];
+                is_leaf[static_cast<size_t>(w)] = split_node(
+                    tiles, order, nodes[work.node], work.first, work.last) ? 0 : 1;
+            }
+            std::vector<Work> next;
+            for (size_t w = 0; w < level.size(); ++w) {
+                if (is_leaf[w]) {
+                    continue;
+                }
+                const Work& work = level[w];
+                const size_t middle = work.first + (work.last - work.first) / 2;
+                const uint32_t left = static_cast<uint32_t>(nodes.size());
+                nodes.emplace_back();
+                const uint32_t right = static_cast<uint32_t>(nodes.size());
+                nodes.emplace_back();
+                nodes[work.node].left = left;
+                nodes[work.node].right = right;
+                next.push_back({left, work.first, middle});
+                next.push_back({right, middle, work.last});
+            }
+            level = std::move(next);
+        }
+    }
+
+    // Bounds `node`; for an interior node also stable-sorts its tile range by
+    // split-axis centroid (the recursion's exact key) and returns true.
+    static bool split_node(
+        const std::vector<Tile>& tiles,
+        std::vector<uint32_t>& order,
+        BvhNode& node,
         size_t first,
         size_t last)
     {
-        const uint32_t node_index = static_cast<uint32_t>(nodes.size());
-        nodes.emplace_back();
-
         Aabb bounds;
         for (size_t index = first; index < last; ++index) {
             bounds.extend(tiles[order[index]].bounds);
         }
-        nodes[node_index].bounds = bounds;
+        node.bounds = bounds;
 
         const size_t count = last - first;
         if (count <= leaf_size) {
-            nodes[node_index].first = static_cast<uint32_t>(first);
-            nodes[node_index].count = static_cast<uint32_t>(count);
-            return node_index;
+            node.first = static_cast<uint32_t>(first);
+            node.count = static_cast<uint32_t>(count);
+            return false;
         }
 
         Aabb centroids;
@@ -451,12 +763,7 @@ private:
                 const float cb = tiles[b].bounds.centroid(axis);
                 return ca < cb || (ca == cb && a < b);
             });
-        const size_t middle = first + count / 2;
-        const uint32_t left = build_bvh(tiles, order, nodes, first, middle);
-        const uint32_t right = build_bvh(tiles, order, nodes, middle, last);
-        nodes[node_index].left = left;
-        nodes[node_index].right = right;
-        return node_index;
+        return true;
     }
 
     void find_candidate_tiles(const Vec3& point, float tolerance, std::vector<uint32_t>& out) const
@@ -546,20 +853,24 @@ private:
         return best;
     }
 
-    nb::object query_batch(
-        XyzBatch xyzs,
+    struct QueryResult {
+        std::vector<int64_t> offsets;
+        std::vector<int32_t> surfaces;
+        std::vector<float> distances;
+        std::vector<float> ij;
+    };
+
+    QueryResult query_points(
+        const float* coordinates, size_t count,
         const std::vector<uint8_t>* included,
         float tolerance) const
     {
-        const size_t count = xyzs.shape(0);
-        const float* coordinates = xyzs.data();
         std::vector<int64_t> offsets(count + 1, 0);
         std::vector<int32_t> surface_indices;
         std::vector<float> distances;
         std::vector<float> ij;
 
         {
-            nb::gil_scoped_release release;
             if (tolerance >= 0.0f) {
                 const float tolerance_squared = tolerance * tolerance;
                 for (size_t point_index = 0; point_index < count; ++point_index) {
@@ -625,11 +936,55 @@ private:
             }
         }
 
+        return {std::move(offsets), std::move(surface_indices), std::move(distances), std::move(ij)};
+    }
+
+    nb::object query_batch(
+        XyzBatch xyzs,
+        const std::vector<uint8_t>* included,
+        float tolerance) const
+    {
+        const size_t count = xyzs.shape(0);
+        QueryResult result;
+        {
+            nb::gil_scoped_release release;
+            // Each point executes the identical serial tile traversal. Work is
+            // partitioned into contiguous batches and concatenated in input
+            // order, preserving nearest-hit ties and every output bit.
+            constexpr size_t chunk_size = 1024;
+            const size_t chunks = (count + chunk_size - 1) / chunk_size;
+            if (chunks <= 1) {
+                result = query_points(xyzs.data(), count, included, tolerance);
+            } else {
+                std::vector<QueryResult> pieces(chunks);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+                for (int64_t k = 0; k < static_cast<int64_t>(chunks); ++k) {
+                    const size_t start = static_cast<size_t>(k) * chunk_size;
+                    pieces[static_cast<size_t>(k)] = query_points(
+                        xyzs.data() + 3 * start, std::min(chunk_size, count - start), included, tolerance);
+                }
+                size_t hits = 0;
+                for (const auto& piece : pieces) hits += piece.surfaces.size();
+                result.offsets.resize(count + 1, 0);
+                result.surfaces.reserve(hits); result.distances.reserve(hits); result.ij.reserve(2 * hits);
+                for (size_t k = 0; k < chunks; ++k) {
+                    const auto& piece = pieces[k];
+                    const int64_t base = static_cast<int64_t>(result.surfaces.size());
+                    for (size_t i = 1; i < piece.offsets.size(); ++i)
+                        result.offsets[k * chunk_size + i] = base + piece.offsets[i];
+                    result.surfaces.insert(result.surfaces.end(), piece.surfaces.begin(), piece.surfaces.end());
+                    result.distances.insert(result.distances.end(), piece.distances.begin(), piece.distances.end());
+                    result.ij.insert(result.ij.end(), piece.ij.begin(), piece.ij.end());
+                }
+            }
+        }
         return nb::make_tuple(
-            own_1d(std::move(offsets)),
-            own_1d(std::move(surface_indices)),
-            own_1d(std::move(distances)),
-            own_2d(std::move(ij), 2));
+            own_1d(std::move(result.offsets)),
+            own_1d(std::move(result.surfaces)),
+            own_1d(std::move(result.distances)),
+            own_2d(std::move(result.ij), 2));
     }
 
     std::vector<std::shared_ptr<SurfaceData>> surfaces_;
@@ -662,12 +1017,27 @@ NB_MODULE(surface_index, module)
             nb::arg("surfaces"),
             nb::arg("bbox_padding") = 0.0f,
             nb::arg("sampling_stride") = 1)
+        .def(
+            "rebuild_grids",
+            &PySurfacePatchIndex::rebuild_grids,
+            nb::arg("ids"),
+            nb::arg("grids"),
+            nb::arg("scales_i"),
+            nb::arg("scales_j"),
+            nb::arg("bbox_padding") = 0.0f,
+            nb::arg("sampling_stride") = 1)
         .def("surface_ids", &PySurfacePatchIndex::surface_ids)
         .def(
             "locate_all_xyz_batch",
             &PySurfacePatchIndex::locate_all_xyz_batch,
             nb::arg("xyzs"),
             nb::arg("tolerance"))
+        .def(
+            "interpolate_ij",
+            &PySurfacePatchIndex::interpolate_ij,
+            nb::arg("surface_indices"),
+            nb::arg("ijs"),
+            nb::arg("triangulated") = false)
         .def(
             "locate_all_xyz_batch_in",
             &PySurfacePatchIndex::locate_all_xyz_batch_in,

@@ -1,4 +1,5 @@
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include "LineStripInternal.hpp"
 
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -873,8 +874,9 @@ double LineStripPositionMap::stripGridColumnToOriginalPosition(double stripGridC
                static_cast<double>(second - first);
 }
 
-LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConfig& config)
+LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConfig& requested)
 {
+    LineViewConfig config=requested;
     if (!std::isfinite(config.targetSpacingBaseVoxels) ||
         config.targetSpacingBaseVoxels <= 0.0) {
         throw std::invalid_argument(
@@ -885,7 +887,7 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
         throw std::invalid_argument("Cannot build line annotation views for an empty LineModel");
     }
 
-    const LineStripPositionMap positionMap =
+    LineStripPositionMap positionMap =
         buildPositionMap(frameData.samples,
                          config.targetSpacingBaseVoxels,
                          config.controlPointLinePositions);
@@ -920,7 +922,51 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
                                        positionMap.stripGridSpacingBaseVoxels,
                                        config.crossSpacingBaseVoxels,
                                        true);
-    surfaces.lineSideSlice = buildRibbon(ribbonSamples,
+    if(config.normalSampler) {
+        // Fitting density is independent of the caller's output grid. In
+        // particular, graph charts/contacts must not gain 100x more unknowns
+        // just because their source XYZ is now fitted to the normal field.
+        LineViewConfig denseConfig=config;denseConfig.normalSampler=nullptr;denseConfig.buildLineZSlices=false;
+        denseConfig.targetSpacingBaseVoxels=std::min(config.targetSpacingBaseVoxels,2.);
+        const double half=(config.crossSampleCount/2)*config.crossSpacingBaseVoxels;
+        const int steps=std::max(1,int(std::ceil(half/2.)));
+        denseConfig.crossSampleCount=2*steps+1;denseConfig.crossSpacingBaseVoxels=half/steps;
+        const auto dense=buildLineViewSurfaces(line,denseConfig);
+        RobustLineStripOptions options;
+        options.alongSpacing=dense.stripPositionMap.stripGridSpacingBaseVoxels;
+        options.crossSpacing=denseConfig.crossSpacingBaseVoxels;
+        options.checkCancelled=config.checkCancelled;
+        const auto fitted=buildRobustLineStrip(*dense.lineSurface->rawPointsPtr(),*config.normalSampler,options);
+        auto grid=surfaces.lineSurface->rawPointsPtr()->clone();
+        const auto& arc=dense.stripPositionMap.stripGridArclengths;
+        for(int col=0;col<grid.cols;++col) {
+            const double at=positionMap.stripGridArclengths[col];
+            const auto it=std::lower_bound(arc.begin(),arc.end(),at);
+            const int hi=std::clamp(int(it-arc.begin()),1,int(arc.size()-1)),lo=hi-1;
+            const double u=std::clamp((at-arc[lo])/std::max(arc[hi]-arc[lo],1e-12),0.,1.);
+            for(int row=0;row<grid.rows;++row)if(row!=grid.rows/2) {
+                const double y=row*double(fitted.rows-1)/(grid.rows-1);const int iy=std::min(int(y),fitted.rows-2);const double v=y-iy;
+                const cv::Vec3d a=fitted(iy,lo),b=fitted(iy,hi),c=fitted(iy+1,lo),d=fitted(iy+1,hi);
+                grid(row,col)=cv::Vec3f(u+v<=1?a*(1-u-v)+b*u+c*v:d*(u+v-1)+b*(1-v)+c*(1-u));
+            }
+        }
+        RobustLineStripOptions outputOptions=options;
+        outputOptions.alongSpacing=positionMap.stripGridSpacingBaseVoxels;
+        outputOptions.crossSpacing=config.crossSpacingBaseVoxels;
+        auto outputScale=surfaces.lineSurface->scale();
+        if(!strip::valid(strip::fromMat(grid),outputOptions)) {
+            // A coarse chart can fold even when the fitted sheet is valid.
+            // Retain the validated fitting mesh in that case. Consumers use
+            // the returned position map rather than assuming a fixed density.
+            grid=fitted;
+            outputScale=dense.lineSurface->scale();
+            positionMap=dense.stripPositionMap;
+            surfaces.lineSideSlice=dense.lineSideSlice;
+        }
+        surfaces.lineSurface=std::make_shared<QuadSurface>(grid,outputScale);
+        surfaces.lineSurface->setStrictQuadRenderValidity(true);
+    }
+    if(!surfaces.lineSideSlice) surfaces.lineSideSlice = buildRibbon(ribbonSamples,
                                          fixedCrossOffsets,
                                          ribbonFrames,
                                          positionMap.stripGridSpacingBaseVoxels,

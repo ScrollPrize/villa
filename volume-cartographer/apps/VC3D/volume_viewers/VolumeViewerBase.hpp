@@ -155,6 +155,9 @@ public:
     // Independent source surfaces in the same chart coordinates, for fit inspection.
     virtual void setSurfaceComparison(std::shared_ptr<Surface> base,std::shared_ptr<Surface> overlay) = 0;
     virtual void setSurfaceComparisonOpacity(float opacity) = 0;
+    // Tint alpha is its strength; omitted/invalid colors leave CT untinted.
+    virtual void setSurfaceLayers(std::shared_ptr<Surface> base, std::vector<std::shared_ptr<Surface>> overlays,
+                                  std::vector<float> opacities, std::vector<QColor> tints = {}) = 0;
     virtual void setOverlayColormap(const std::string& colormapId) = 0;
     virtual void setOverlaySamplingMethod(vc::Sampling method) = 0;
     virtual void setOverlayThreshold(float threshold) = 0;

@@ -6,6 +6,11 @@
 #include <stdexcept>
 
 namespace vc::constraints::detail {
+void remapFiberLocation(Location&, const Node& oldStrip, const Node& newStrip);
+void replaceFiberStrip(Graph&, const std::shared_ptr<const Node>&);
+std::vector<Link> patchOverlapContacts(const Node& proposal,
+    const std::map<std::string, Placement>& references, double radius,
+    const std::atomic_bool* cancel, bool checkNormals = false);
 FitResult restoreSurface(Graph, const cv::Mat_<cv::Vec3f>&, cv::Vec2d origin);
 inline void cancelled(const std::atomic_bool* flag) {
     if (flag && flag->load()) throw std::runtime_error("Operation cancelled");
@@ -22,6 +27,7 @@ inline double cross(const cv::Vec2d& a, const cv::Vec2d& b) {
 }
 inline void triangulate(Node& node) {
     for (int y=0; y+1<node.rows; ++y) for (int x=0; x+1<node.cols; ++x) {
+        if (!node.quadMask.empty() && !node.quadMask[y*(node.cols-1)+x]) continue;
         int a=y*node.cols+x, b=a+1, c=a+node.cols, d=c+1;
         if (!valid(node.xyz[a]) || !valid(node.xyz[b]) || !valid(node.xyz[c]) || !valid(node.xyz[d])) continue;
         if (cv::norm((node.xyz[b]-node.xyz[a]).cross(node.xyz[c]-node.xyz[a])) < 1e-10 ||
@@ -46,6 +52,7 @@ inline Weights weights(const Node& n, cv::Vec2d p) {
         double u=p[0]-x,v=p[1]-y;
         if(u<-epsilon||v<-epsilon||u>1+epsilon||v>1+epsilon)continue;
         u=std::clamp(u,0.0,1.0);v=std::clamp(v,0.0,1.0);
+        if(!n.quadMask.empty()&&!n.quadMask[y*(n.cols-1)+x])continue;
         int a=y*n.cols+x,b=a+1,c=a+n.cols,d=c+1;
         if(!valid(n.xyz[a])||!valid(n.xyz[b])||!valid(n.xyz[c])||!valid(n.xyz[d]))continue;
         if(u+v<=1)return {{a,b,c},{1-u-v,u,v}};

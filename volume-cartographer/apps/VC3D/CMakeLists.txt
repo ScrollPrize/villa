@@ -33,6 +33,7 @@ set(srcs
     FiberNameDisplay.cpp
     FiberNameDisplay.hpp
     ConstraintGraphWorkspace.cpp
+    ConstraintGraphFiberReview.cpp
     ConstraintGraphWorkspace.hpp
     FiberMapWorkspace.cpp
     FiberMapWorkspace.hpp

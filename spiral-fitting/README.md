@@ -314,13 +314,18 @@ uv sync            # creates .venv from pyproject.toml
 
 This also builds Spiral's native helpers as `vc_spiral.spiral_sampling`,
 `vc_spiral.track_crossings`, `vc_spiral.track_store`, and
-`vc_spiral.surface_index`. OpenMP is used when the toolchain provides it; the
+`vc_spiral.surface_index`, and `vc_spiral.winding_coincidence`. OpenMP is used when the toolchain provides it; the
 same modules build with serial kernels when it does not.
 
 or with conda/pip, install `torch` for your CUDA version and then
 `pip install -e .` from `spiral-fitting/`.
 
 ### Resident sparse field pools
+
+To first remove the dim CT rim and exterior predictions from new Zarr copies,
+use [`mask_zarr_from_ct.py`](docs/ct_region_masking.md). It builds a smooth,
+single-component mask per CT slice and applies it to all target pyramid levels
+in bounded Z batches with parallel chunk workers.
 
 Normals, gradient magnitude, and surf-SDT samples are served by fully
 resident device brick pools. Each store's occupied bricks are packed once
@@ -342,6 +347,15 @@ prepacking with `--ct` remains useful because the CT mask can substantially
 reduce the resident pool size.
 Set `FIT_SPIRAL_RESIDENT_BOUNDS_CHECK=1` to enable per-gather bounds
 assertions when debugging new sampling code.
+
+Completed signed patch-normal exports can be packed separately with
+`--what signed_normals --signed-brick 16 --io-threads 2`. This writes a version-4
+pool with only three uint8 `nx/ny/nz` channels, encoding signed components as
+`round(127 * component) + 128`; `[0,0,0]` means missing. Decode all three and
+normalize. Presence and alignment are not stored. Packing uses bounded chunk
+I/O. `open_pool()` returns memory maps for current and older pool versions.
+The fitter's existing uint8 loader/loss is unchanged. See
+[signed-normal pool layout and reading examples](docs/signed_normal_pools.md).
 
 ### Internet flow (SSH attach)
 
@@ -864,6 +878,12 @@ The compact store is created by the Vesuvius winding-model
 `export_spiral_supervision.py` tool; see its `NATIVE_PHASE_CACHE.md` for the
 exact export command and format.
 
+To exclude exterior CT background from both winding and density supervision,
+use `mask_winding_from_ct.py` to create a filtered copy. It removes a whole ray
+if any portion of its full length leaves the reviewed CT envelope. See
+[CT masking](docs/ct_region_masking.md#filter-winding-inference-rays) for the
+command, coordinate mapping, and fitting input path.
+
 For a headless fit, pass the dataset root with `--dataset` and select inference
 mode (plus any independently disabled losses) through
 `FIT_SPIRAL_CONFIG_OVERRIDES`. The dataset's `spiral-scroll.json` and the
@@ -894,6 +914,249 @@ loss. The fitter then loads the conventional `fiber_directions.npz` artifact
 and samples `sample_count_fiber_direction_points` observations per step.
 Positions and directions constrain only local fitted-sheet orientation; they
 do not attach a sample to a particular winding.
+
+### Signed normals from patches
+
+`patch_normal_samples.py` defaults to **one-voxel bilinear surface sampling,
+3×3×3 volumetric box averaging, and 4-voxel output cells**. Normals come from
+analytic surface derivatives. Overlapping patches first contribute one
+representative per one-voxel cell, chosen nearest its center with stable ties.
+The reference checkpoint signs these normals inward before averaging.
+
+The box filter averages occupied, valid signed neighbors on that one-voxel
+lattice and normalizes the resulting vector. Empty voxels contribute no weight.
+It blends across patch boundaries and can blend different sheets within the
+kernel; it does not restrict averaging to a patch or winding. Each output cell
+keeps the filtered normal at the fine representative nearest its center. The
+averaged vector is checked against the inward gradient again at that location.
+Missing cells are not filled, and representatives with invalid initial signs
+remain invalid.
+
+The filter follows the same operation order as the 3×3×3 / 5×5×5 comparison.
+With `--device cuda`, quad grouping, bilinear sampling, stable overlap pooling,
+signing, coarse sample selection, and box averaging run on CUDA. Quad geometry
+is grouped in bounded CUDA batches and staged to disk; each tile is then
+loaded onto the GPU with complete filter halos.
+Triton kernels retain float64 geometry and deterministic nearest-cell ties.
+CPU workers read patches and compress/write output chunks. `--workers` controls
+these I/O workers. `--geometry-batch-quads` caps each grouping batch (default
+250,000). `--cuda-memory-gb` limits PyTorch CUDA allocations (default 8 GiB;
+CPU memory and driver allocations are separate). The exporter releases cached
+CUDA allocations between staging batches and periodically between tiles. On
+Linux it stops between batches/tiles if available system RAM falls below 16 GiB.
+Two I/O workers are recommended on shared-memory GPUs. Reduce `--chunk-size` to
+16384 to lower checkpoint evaluation workspace.
+
+`--tile-edge` controls the processing tile edge (CUDA/auto default 256 fitting
+voxels, explicit CPU default 64); it must be divisible by the output cell size.
+The CPU fallback stages geometry on disk and processes tiles with NumPy.
+Temporary packed columns and staged geometry shards live beside the output and
+are removed when the command exits. Allow space for these intermediates.
+
+For a direct sparse OME-Zarr export, avoiding a large packed intermediate:
+
+```bash
+./.venv/bin/python patch_normal_samples.py \
+  /path/to/patches /path/to/output/patch_normals_zarr \
+  --checkpoint /path/to/checkpoint.ckpt \
+  --umbilicus /path/to/umbilicus.json \
+  --output-format zarr --base-scale 4 --workers 8 --device cuda
+```
+
+Exact checkpoint evaluation remains the default. For the optional accelerated
+sign lookup, add `--sign-grid-spacing 8`. This evaluates the checkpoint on an
+8-fitting-voxel grid covering each tile, interpolates its inward direction, and
+uses exact evaluation wherever the surrounding grid directions do not all
+strongly agree on the sign (minimum absolute corner cosine 0.75). Patch geometry,
+sampling density, and the 3×3×3 filter are unchanged. This is an approximation:
+the metadata records the lookup spacing and exact-fallback count, and
+`inward_alignment` is approximate outside the fallback locations. A real-data
+audit of 1,058,478 fine samples and 243,307 output normals reproduced all tested
+output normals and validity flags exactly, but does not guarantee equality at
+every location. Use spacing 0 to retain exact checkpoint evaluation throughout.
+
+For packed samples, omit `--output-format zarr` and give an `.npz` output path.
+Both paths use the same default filter and output cells. Direct Zarr writes
+signed float32 `nx`, `ny`, `nz`, `inward_alignment`, and uint8 `presence` stores,
+with OME coordinates at output cell centers. `--base-scale` is base voxels per
+fitter voxel, default 4. Chunk edges are `tile-edge / cell-size`, and the shape
+is padded to full tiles. A manifest records the settings and readback checks;
+`complete` is only set after successful validation.
+
+For an interrupted CUDA Zarr export, use `--resume` with the **same output path**,
+checkpoint, input patches, ROI, tile edge, cell size, filter, and sign-grid settings.
+Inputs must not have changed. Every existing chunk is decompressed and checked
+across all five channels before reuse; incomplete or invalid chunks are replaced.
+Channel writes use atomic replacement. Resume stages geometry again, but skips
+sampling/filtering for reusable chunks. A legacy chunk does not retain its
+invalid sample count, so resumed manifests report that count as unknown while
+retaining the exact valid/occupied count.
+
+For additional Linux host-memory containment, run the export inside
+`systemd-run --user --scope -p MemoryHigh=16G -p MemoryMax=24G -p MemorySwapMax=0`.
+This limits memory charged to the process scope and its workers; the separate
+CUDA allocator limit remains necessary. Exhausting a limit stops the job;
+`--resume` can recover it. These are memory controls, not thermal controls.
+
+Override `--box-width 5` to use the larger tested kernel, or `--cell-size 8`
+for coarser output. `--box-width 0 --surface-spacing 1` selects unfiltered
+bilinear sampling and direct coarse pooling. `--box-width 0 --cell-size 8`
+without a surface-spacing option reproduces the legacy triangle-centroid
+export. Unfiltered exports use the packed path; they can be rasterized with
+`patch_normal_volume.py` below. Bilinear spacing interpolates existing geometry
+and does not recover detail absent from the mesh. Filtering always uses a
+one-voxel intermediate lattice, even when `--surface-spacing` is overridden.
+
+`--coordinate-scale` multiplies stored TIFF coordinates (default 1; use 0.25 to
+map base `/0` patch coordinates into a `/2` fitter). Patch `meta.json` UV scale
+is not a world-coordinate multiplier. `--z-roi BEGIN END` is half-open in fitter
+coordinates; it defaults to the checkpoint's z range and must stay within it.
+Empty patches, invalid quads and degenerate triangles contribute no samples.
+Existing outputs are never overwritten.
+
+The NPZ contains `position_zyx` and signed float32 `normal_zyx` arrays, both
+(N, 3), plus `sign_valid`, `inward_alignment`, `presence`, and `metadata_json`.
+Filtered positions use float64 to preserve exact voxel membership.
+Normals point toward **decreasing fitted winding** (inward). The checkpoint
+chooses only their sign; their direction comes from patch geometry.
+`inward_alignment` is the absolute cosine between the patch normal and the
+reference inward gradient. Undefined gradients or nearly perpendicular normals
+produce invalid signs, zero normals, and presence 0; valid rows have presence
+255. Signed vectors are stored directly, without a hemisphere encoding.
+
+The reference uses the winding gradient including its angular term, with the
+same finite-difference transport as the fitter. Metadata records the checkpoint
+path, model digest, z range and umbilicus for provenance. Checkpoints containing
+frozen/baked epochs are currently rejected. `--chunk-size` controls checkpoint
+evaluation batches (default 65536); `--device auto` prefers CUDA when available,
+and `--torch-threads` controls CPU inference threads. The existing GPU flow and
+gap kernels accelerate the full gradient computation without coarsening samples.
+GPU and CPU floating-point evaluation can differ near ambiguous orientations;
+use `inward_alignment` to filter weak sign cues when consuming the store.
+
+The input can also be a previously pooled `patch_normal_samples` NPZ with
+`position_zyx`, `normal_zyx`, and metadata. Its cell size is inherited unless
+explicitly given, in which case it must match `--cell-size`; coordinates are
+already in the fitter frame. This reorients saved geometry
+without rereading patches, filtering again, or repeating global pooling.
+Resampling and box filtering require the original patches.
+
+This exports normals only. Existing fitting losses are unchanged; consuming
+these samples in a normal loss is a separate future step.
+
+To rasterize the packed normals and compare them with local Lasagna and fiber
+observations:
+
+```bash
+./.venv/bin/python patch_normal_volume.py outputs/patch_normals/patch_normals.npz \
+  outputs/patch_normals/zarr --base-scale 4 --workers 8 \
+  --lasagna /home/sean/Desktop/spiral_dataset/lasagna_inputs \
+  --fibers /home/sean/Desktop/spiral_dataset/fiber_directions.npz
+```
+
+`--base-scale` explicitly specifies base `/0` voxels per fitting voxel (4 for
+this dataset). The output contains separate `patch_nx.ome.zarr`, `patch_ny.ome.zarr`,
+and `patch_nz.ome.zarr` float32 components, `patch_presence.ome.zarr` (uint8), and
+`patch_inward_alignment.ome.zarr` (float32), each with array `0`. All three signed
+components are retained exactly; this is not the two-component unsigned fiber
+encoding. The cell size comes from the packed store. OME scale/translation place
+each cell at its center in base-volume coordinates: for 8-voxel cells and scale
+4, index `i` maps to `32*i + 16`. Empty cells remain zero, with presence zero;
+there is no surface filling. `manifest.json` records provenance, coverage,
+collision handling, and completion. Rounded packed positions that fall into
+the same cell are resolved by nearest centroid to cell center.
+
+Without `--fibers` and `--lasagna`, only the export runs. With both supplied,
+`comparison/` contains a JSON report, CSV of matched spots, two sampled NPZs,
+and a plot. The default comparison uses 100,000 uniform patch cells and up to
+100,000 distinct patch cells matched to a uniform sample of 2 million fiber
+rows. Matching picks the nearest **sampled** fiber in the same cell, within
+one cell width; it is not a nearest-neighbor search over all fibers. Reports
+include tighter separation thresholds and z strata. Lasagna is read at its
+finest declared level using the fitter's nearest-voxel sampling. Normal
+agreement is `acos(abs(dot))`; fiber error is `asin(abs(dot))`, the angle from
+the normal's tangent plane. Smaller is better for both. The reference axes
+cannot independently validate inward sign. Input datasets are read-only.
+
+To compare bilinear sampling with 8-, 4-, and 1-voxel pooling on fixed fiber
+locations before choosing an export density:
+
+```bash
+./.venv/bin/python compare_bilinear_patch_normals.py \
+  /home/sean/Desktop/graph_patch_merging/graph_patches_only \
+  outputs/patch_normals/zarr/comparison/matched_samples.npz \
+  outputs/patch_normals/bilinear_study --sites 5000 --workers 8
+```
+
+This study selects a reproducible subset of the existing matched fiber cohort,
+scans all patch overlaps, and retains quads near the selected fiber locations.
+A halo of the query radius plus an 8-voxel cell diagonal preserves all pooling
+competitors. Analytic bilinear normals are sampled at one-voxel spacing, then
+pooled separately at each density. Each method uses its nearest retained sample
+within 8 fitting voxels. Lasagna is evaluated at the fiber positions; the old
+packed matches and triangle-centroid sampling are baselines. Reports separate
+coverage from errors at common sites and include tighter distance thresholds,
+paired error changes, and z strata. The cohort is conditional on the earlier
+patch/fiber matching, not a coverage estimate over all fibers. Study normals
+are unsigned axes; production exports still use the checkpoint to choose
+inward sign. Existing stores are not overwritten.
+
+`compare_winding_normals.py` tests adjacent windings separately from overall
+angular agreement. It maps fiber positions through the reference checkpoint,
+unwraps the angular seam, and pairs fibers approximately one winding apart
+with small sideways displacement. For each normal source it measures the
+normal difference between layers and the increase in fiber-plane error when
+the two layers' normals are swapped. Positive swap penalty supports useful
+winding-specific information; large normal variation alone does not establish
+accuracy. Reports include sample-to-winding assignment checks, coverage,
+normal-separation strata, and counts of pairs sharing a retained sample.
+Fiber directions constrain only one tangent direction, so this test does not
+fully validate the 3D normal. Pair labels depend on the reference checkpoint.
+The completed study and cached input cohorts are in
+`outputs/patch_normals/winding_study/`; its README gives the reproduction command.
+
+`compare_compressed_patch_normals.py` targets the separate question of spatial
+fidelity where two model-inferred windings occupy the same 8-voxel cell.
+Discovery uses bilinear patch geometry and GPU checkpoint mapping; evaluation
+rescans all patch overlaps and compares one-voxel surface sampling with 8-, 4-,
+and 1-voxel output cells. It measures preservation of both layers inside each
+parent cell, nearest-sample winding assignments, and angular fidelity to the
+unpooled patch normals. Patch geometry is a rasterization reference, not accuracy
+ground truth. A separate full fiber-archive scan selects nearby observations
+for directional validation without requiring prior patch/fiber matches.
+Results, caveats, and reproduction commands are in
+`outputs/patch_normals/compressed_study/README.md`. The earlier common-site
+angle comparisons do not by themselves establish a preferred output density.
+
+`compare_sheet_smoothed_normals.py` tests averaging the one-voxel samples along
+each patch surface before using the 4- or 8-voxel representatives. It holds output
+positions and overlap selection fixed and averages analytic normals using surface
+area and a Gaussian in along-surface distance (sigma 2 or 4 fitting voxels,
+truncated at three sigma). Distances follow the patch's grid chart through valid
+bilinear quads; paths crossing missing quads are excluded. Smoothing stays inside
+the representative's source patch, so neighboring patches/windings are not blended.
+Overlaps still use one selected patch per output cell; this experiment does not
+merge or estimate consensus across overlapping patches. Its cached cohorts,
+measurements, limitations, and reproduction command are in
+`outputs/patch_normals/sheet_smoothing_study/README.md`.
+
+`compare_volume_smoothed_normals.py` tests a uniform 3×3×3 convolution on the
+signed one-voxel normal field, without patch or winding restrictions. It divides
+the vector sum by the occupied-voxel count and renormalizes, retaining the original
+occupancy. Sparse neighbor lookup is tested against dense convolution. Outputs at
+1, 4, and 8 voxels use fixed representatives from the same one-voxel input field,
+with paired unfiltered controls and the earlier sheet-smoothing results. It reuses
+the sheet study's cached geometry and records how often the cube contains other
+patches or distant fitted winding values. Results and reproduction instructions
+are in `outputs/patch_normals/volume_smoothing_study/README.md`.
+Use `--output-cell-sizes 1 2 4 8` to include two-fitting-voxel output in the same
+comparison. Production export accepts `--cell-size 2`; its default remains 4.
+The kernel stays on the one-voxel intermediate lattice at every output density.
+The same script accepts `--kernel-size 5` for a 5×5×5 box and
+`--reuse-query-locations outputs/patch_normals/volume_smoothing_study` to rebuild
+only the fine cells needed around the previous representatives. This keeps the
+kernel comparison at identical locations. The completed width comparison is in
+`outputs/patch_normals/volume_smoothing_5_study/README.md`.
 
 ## Fiber classification
 

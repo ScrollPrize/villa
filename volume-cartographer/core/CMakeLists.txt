@@ -163,6 +163,8 @@ add_library(vc_lasagna
     src/lasagna/LaplaceRank.cpp
     src/lasagna/LasagnaNormalSampler.cpp
     src/lasagna/LineViewBuilder.cpp
+    src/lasagna/RobustLineStrip.cpp
+    src/lasagna/LineStripRepair.cpp
     src/lasagna/LineOptimizer.cpp
     src/lasagna/LineSpline.cpp
     src/lasagna/Manifest.cpp
@@ -225,8 +227,10 @@ endif()
 # Interactive constraint graph geometry is independent of the Qt workspace.
 add_library(vc_constraints
     src/constraints/GraphCatalog.cpp
+    src/constraints/GraphFiberStrips.cpp
     src/constraints/GraphCycleAudit.cpp
     src/constraints/GraphFit.cpp
     src/constraints/GraphPrepared.cpp
-    src/constraints/GraphSession.cpp)
+    src/constraints/GraphSession.cpp
+    src/constraints/FiberReview.cpp)
 target_link_libraries(vc_constraints PUBLIC vc_core vc_lasagna PRIVATE Ceres::ceres)

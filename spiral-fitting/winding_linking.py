@@ -9,7 +9,8 @@ import numpy as np
 
 from point_collection import (
     PatchLinkOptions, SIDE_BEHIND, SIDE_FRONT, SampledLinkPatch,
-    _resolve_between_patches_targets, link_points_to_patches, sample_patches_for_linking,
+    _build_surface_patch_index, _resolve_between_patches_targets, link_points_to_patches,
+    sample_patches_for_linking,
 )
 from spiral_helpers import fiber_collection_hv_tag
 
@@ -25,6 +26,11 @@ class AnalysisLinkingConfig:
     selection: str = 'support_then_distance'
     fiber_stride: int = 1
     patch_stride: int = 1
+    strips: bool = False
+    strip_max_gap: int | None = None
+    strip_claim_gap: int | None = None
+    strip_rank: str = 'fit'
+    strip_fit_resolution: float = 0.25
 
     @classmethod
     def from_json(cls, value):
@@ -41,8 +47,15 @@ class AnalysisLinkingConfig:
         for key in ('window_points', 'min_points', 'fiber_stride', 'patch_stride'):
             if key in settings and (type(settings[key]) is not int or settings[key] < 1):
                 raise ValueError(f'linking.{key} must be a positive integer')
+        for key in ('strip_max_gap', 'strip_claim_gap'):
+            if settings.get(key) is not None and (type(settings[key]) is not int or settings[key] < 0):
+                raise ValueError(f'linking.{key} must be null or an integer >= 0')
+        if 'strips' in settings and type(settings['strips']) is not bool:
+            raise ValueError('linking.strips must be a JSON boolean')
+        if settings.get('strip_rank', 'fit') not in ('fit', 'hits'):
+            raise ValueError("linking.strip_rank must be 'fit' or 'hits'")
         for key in ('distance', 'side_margin_voxels', 'vertical_max_behind_fraction',
-                    'horizontal_max_front_fraction'):
+                    'horizontal_max_front_fraction', 'strip_fit_resolution'):
             if key not in settings:
                 continue
             val = settings[key]
@@ -50,15 +63,16 @@ class AnalysisLinkingConfig:
             if fraction and val is None:
                 continue
             if (type(val) not in (int, float) or not math.isfinite(val)
-                    or val < 0 or (key == 'distance' and val == 0)
+                    or val < 0 or (key in ('distance', 'strip_fit_resolution') and val == 0)
                     or (fraction and val > 1)):
-                domain = '[0, 1] or null' if fraction else ('> 0' if key == 'distance' else '>= 0')
+                domain = ('[0, 1] or null' if fraction
+                          else '> 0' if key in ('distance', 'strip_fit_resolution') else '>= 0')
                 raise ValueError(f'linking.{key} must be a finite number {domain}')
             settings[key] = float(val)
         config = cls(**settings)
         if config.window_points % 2 != 1:
             raise ValueError('linking.window_points must be odd')
-        if config.min_points > config.window_points:
+        if config.min_points > config.window_points and not config.strips:
             raise ValueError('linking.min_points must not exceed window_points')
         if config.selection not in ('support_then_distance', 'nearest', 'largest_area'):
             raise ValueError('linking.selection must be support_then_distance, nearest, or largest_area')
@@ -73,6 +87,10 @@ class AnalysisLinkingConfig:
 
 def sampled_fiber_view(pcl, stride, forced_controls=()):
     """Keep point objects/IDs and the original chain intact; sample only queries."""
+    if stride == 1:
+        # Every point is a query; linking orders the points itself, so the
+        # shared points dict serves as-is.
+        return dict(pcl)
     items = sorted(pcl['points'].items(), key=lambda item: int(item[0]))
     if not items:
         return dict(pcl, points={})
@@ -128,13 +146,21 @@ class AnalysisPointLinker:
                 source_points=sum(len(p['points']) for p in original.values()),
                 sampled_points=sum(len(p['points']) for p in sampled.values()),
                 candidate_hits=0, undefined_side_hits=0, side_rejected_candidates=0,
-                support_rejected_candidates=0, attached_points=0)
+                support_rejected_candidates=0, attached_points=0,
+                **(dict(strip_overruled_candidates=0, strips_kept=0)
+                   if group == 'fibers' and cfg.strips else {}))
+
+        # Annotations and fibers link against the same geometry: build its
+        # surface index once and hand it to both passes.
+        shared_index = (_build_surface_patch_index(sampled_patches, cfg.distance)
+                        if sampled_patches else None)
 
         def link(inputs, options, selection, geometry=sampled_patches):
             return link_points_to_patches(
                 geometry, inputs, tolerance=cfg.distance,
                 surface_index_tolerance=cfg.distance,
-                general_hit_policy=selection, options=options)
+                general_hit_policy=selection, options=options,
+                built_index=shared_index if geometry is sampled_patches else None)
 
         annotation_options = replace(self.annotation_options, report_counts=self._record('annotations'))
         # Resolve pairs against the original set: if coarse sampling removes
@@ -164,7 +190,10 @@ class AnalysisPointLinker:
             strict_min_points=True, rank_by_support=cfg.selection == 'support_then_distance',
             side_rules=rules, max_wrong_side_fractions=fractions,
             inward_direction=self.inward_direction, side_margin=cfg.side_margin_voxels,
-            report_counts=self._record('fibers'))
+            report_counts=self._record('fibers'),
+            strips=cfg.strips, strip_max_gap=cfg.strip_max_gap, strip_claim_gap=cfg.strip_claim_gap,
+            strip_rank=cfg.strip_rank,
+            strip_fit_resolution=cfg.strip_fit_resolution)
         if sampled_fibers:
             link(sampled_fibers, options, cfg.selection)
 

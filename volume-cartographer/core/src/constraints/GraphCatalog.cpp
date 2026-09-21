@@ -4,6 +4,7 @@
 #include "vc/fiber_tracer/FiberGeometry.hpp"
 #include "vc/atlas/FiberHvClassification.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include "vc/lasagna/RobustLineStrip.hpp"
 #include "vc/lasagna/Manifest.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include <boost/geometry.hpp>
@@ -85,9 +86,40 @@ std::optional<PatchContact> patchContact(const Node& node,const QuadSurface& sur
     try { (void)detail::weights(node,location); } catch(const std::exception&) { return {}; }
     return PatchContact{location,hit->distance};
 }
+std::vector<Link> overlapContacts(const Node& proposal,const QuadSurface& surface,
+    const SurfacePatchIndex& index,const std::map<std::string,Placement>& references,
+    double radius,const std::atomic_bool* cancel,bool checkNormals) {
+    std::vector<Link> contacts;
+    cv::Vec3d low=cv::Vec3d::all(INFINITY),high=cv::Vec3d::all(-INFINITY);
+    for(const auto& xyz:proposal.xyz)if(detail::valid(xyz))for(int d=0;d<3;++d) {
+        low[d]=std::min(low[d],xyz[d]-radius);high[d]=std::max(high[d],xyz[d]+radius);
+    }
+    auto normal=[](const Node& n,const detail::Weights& w) {
+        return detail::unit((n.xyz[w.indices[1]]-n.xyz[w.indices[0]]).cross(n.xyz[w.indices[2]]-n.xyz[w.indices[0]]));
+    };
+    for(const auto& [id,p]:references)if(!p.source->fiber&&id!=proposal.id) {
+        const auto& n=*p.source;
+        for(size_t i=0;i<n.xyz.size();++i) {
+            detail::cancelled(cancel);const auto& xyz=n.xyz[i];
+            if(!detail::valid(xyz))continue;
+            if(xyz[0]<low[0]||xyz[0]>high[0]||xyz[1]<low[1]||xyz[1]>high[1]||xyz[2]<low[2]||xyz[2]>high[2])continue;
+            auto hit=patchContact(proposal,surface,index,xyz,radius);if(!hit)continue;
+            Location a{id,{double(i%n.cols),double(i/n.cols)}};
+            try {
+                const auto wa=detail::weights(n,a);
+                // Winding and grid handedness may differ between patches.
+                // Reject crossing sheets, allowing either normal orientation.
+                if(checkNormals&&std::abs(normal(n,wa).dot(normal(proposal,detail::weights(proposal,hit->location))))<.7)continue;
+            }catch(const std::exception&){continue;}
+            contacts.push_back({a,hit->location});
+        }
+    }
+    return contacts;
+}
 void addFiberPatchContacts(Graph& g,const Node& n,const QuadSurface& surface,
                            const SurfacePatchIndex& index,const std::set<std::string>& included,
-                           const std::atomic_bool* cancel) {
+                           const std::atomic_bool* cancel,ContactPolicy policy) {
+    const double radius=g.settings.radius*(policy==ContactPolicy::FiberReview?2:1);
     std::set<std::pair<std::string,int64_t>> attached;
     std::set<std::string> manual;
     for(const auto& link:g.links.read()) {
@@ -101,8 +133,8 @@ void addFiberPatchContacts(Graph& g,const Node& n,const QuadSurface& surface,
     // Bounds only prune impossible hits; the shared exact query decides.
     cv::Vec3d low=cv::Vec3d::all(INFINITY),high=cv::Vec3d::all(-INFINITY);
     for(const auto& xyz:n.xyz)if(detail::valid(xyz))for(int d=0;d<3;++d) {
-        low[d]=std::min(low[d],xyz[d]-g.settings.radius);
-        high[d]=std::max(high[d],xyz[d]+g.settings.radius);
+        low[d]=std::min(low[d],xyz[d]-radius);
+        high[d]=std::max(high[d],xyz[d]+radius);
     }
     for(const auto& [id,p]:g.nodes)if(included.contains(id)&&p.source->fiber&&!manual.contains(id)) {
         const auto& fiber=*p.source;
@@ -110,11 +142,11 @@ void addFiberPatchContacts(Graph& g,const Node& n,const QuadSurface& surface,
             detail::cancelled(cancel);const auto& xyz=fiber.line[i];
             if(attached.contains({id,int64_t(i)}))continue;
             if(xyz[0]<low[0]||xyz[0]>high[0]||xyz[1]<low[1]||xyz[1]>high[1]||xyz[2]<low[2]||xyz[2]>high[2])continue;
-            auto hit=patchContact(n,surface,index,xyz,g.settings.radius);if(!hit)continue;
+            auto hit=patchContact(n,surface,index,xyz,radius);if(!hit)continue;
             // A winding fiber can revisit this XYZ on a distant chart
             // traversal. Only extend the clicked placement locally, using
             // the same four-spacing neighborhood as incremental fitting.
-            if(cv::norm(placedLocation(g,atLine(id,i))-placedLocation(g,hit->location))>4*g.settings.spacing)continue;
+            if(policy==ContactPolicy::LocalPlacement&&cv::norm(placedLocation(g,atLine(id,i))-placedLocation(g,hit->location))>4*g.settings.spacing)continue;
             g.links.push_back({atLine(id,i),hit->location});
         }
     }
@@ -338,7 +370,7 @@ Catalog loadCatalog(const Settings& settings,const std::atomic_bool* cancel,Prog
     return out;
 }
 
-std::shared_ptr<const Node> makeFiberNode(const Fiber& f,const Settings& s,const lasagna::NormalSampler& sampler) {
+std::shared_ptr<const Node> makeFiberNode(const Fiber& f,const Settings& s,const lasagna::NormalSampler& sampler,const std::atomic_bool* cancel) {
     lasagna::LineModel line;
     bool haveNormal=false;
     cv::Vec3d firstNormal{0,0,0};
@@ -350,6 +382,7 @@ std::shared_ptr<const Node> makeFiberNode(const Fiber& f,const Settings& s,const
     }
     if(!haveNormal)throw std::runtime_error("No Lasagna normals along fiber "+f.id);
     lasagna::LineViewConfig config;
+    config.normalSampler=&sampler;config.checkCancelled=[cancel]{detail::cancelled(cancel);};
     config.targetSpacingBaseVoxels=s.spacing;config.crossSpacingBaseVoxels=s.spacing;
     config.crossSampleCount=7;config.buildLineZSlices=false;
     // Uniform arclength columns; controls remain exact fractional references.
@@ -357,6 +390,7 @@ std::shared_ptr<const Node> makeFiberNode(const Fiber& f,const Settings& s,const
     auto views=lasagna::buildLineViewSurfaces(line,config);
     auto node=std::make_shared<Node>();node->id=f.id;node->path=f.path;node->fiber=true;node->direction=f.direction;
     node->line=f.line;node->controls=f.controls;
+    node->stripGeneration=lasagna::kRobustLineStripVersion;
     node->lineArclength=views.stripPositionMap.originalArclengths;
     node->columnArclength=views.stripPositionMap.stripGridArclengths;
     const auto& grid=*views.lineSurface->rawPointsPtr();node->rows=grid.rows;node->cols=grid.cols;
@@ -376,7 +410,7 @@ std::shared_ptr<const Node> makeFiberNode(const Fiber& f,const Settings& s,const
     for(int x=0;x<grid.cols;++x) for(int y=0;y<grid.rows;++y) {
         node->xyz[y*grid.cols+x]=cv::Vec3d(grid(y,x));
         node->initialUv[y*grid.cols+x]=along*node->columnArclength[x]
-            +across*((y-grid.rows/2)*s.spacing);
+            +across*((y-grid.rows/2)*(3*s.spacing/(grid.rows/2)));
     }
     // LineViewBuilder chooses a coherent normal sign independently of the
     // dataset. Normalize the chart orientation once, preserving its geometry.
@@ -420,14 +454,16 @@ cv::Vec3d sourceLocation(const Node& n,const cv::Vec2d& p) {return detail::inter
 Graph seedGraph(const Catalog& c,size_t component,const Settings& s,const lasagna::NormalSampler& sampler,const std::atomic_bool* cancel) {
     Graph g;g.settings=s;
     for(const auto& id:c.components.at(component)) {
-        detail::cancelled(cancel);auto n=makeFiberNode(c.fibers.at(id),s,sampler);g.nodes.emplace(id,Placement{n,n->initialUv});
+        detail::cancelled(cancel);auto n=makeFiberNode(c.fibers.at(id),s,sampler,cancel);g.nodes.emplace(id,Placement{n,n->initialUv});
     }
     if(g.nodes.empty()) throw std::runtime_error("No eligible fibers in component");
     g.seed=g.nodes.begin()->first;addFiberLinks(g,c);alignNewNodes(g,{});return g;
 }
 
-std::vector<Candidate> discover(const Catalog& c,const Graph& g,const std::string& selected,const std::atomic_bool* cancel,Progress progress,DiscoveryBatch found,int lineStride) {
+std::vector<Candidate> discover(const Catalog& c,const Graph& g,const std::string& selected,const std::atomic_bool* cancel,Progress progress,DiscoveryBatch found,int lineStride,const std::set<std::string>& excludedPatches,ContactPolicy policy) {
     if(lineStride<1)throw std::invalid_argument("Discovery stride must be positive");
+    // Eligibility is defined by dense contacts, independent of discovery stride.
+    if(policy==ContactPolicy::FiberReview)lineStride=1;
     detail::cancelled(cancel);
     std::map<std::string,Candidate> results;
     std::vector<Candidate> out;
@@ -436,6 +472,12 @@ std::vector<Candidate> discover(const Catalog& c,const Graph& g,const std::strin
         const auto first=out.size();
         const auto onFiber=[&](const Link& l)->const Location& {return candidate.fiber?l.b:l.a;};
         std::sort(candidate.contacts.begin(),candidate.contacts.end(),[&](const auto& a,const auto& b){return std::tie(onFiber(a).node,onFiber(a).lineIndex)<std::tie(onFiber(b).node,onFiber(b).lineIndex);});
+        if(policy==ContactPolicy::FiberReview) {
+            if(candidate.fiber||candidate.contacts.size()<2)return;
+            out.push_back(std::move(candidate));
+            if(found)found({out.back()});
+            return;
+        }
         std::vector<double> arclength;
         if(candidate.fiber) {
             const auto& line=c.fibers.at(candidate.id).line;arclength.resize(line.size());
@@ -528,7 +570,7 @@ std::vector<Candidate> discover(const Catalog& c,const Graph& g,const std::strin
                     cache.fiberBounds.emplace(id,bounds);
                 }
             }
-            for(const auto& [patch,runs]:bounds->patches)if(!g.nodes.contains(c.patches[patch].id)) {
+            for(const auto& [patch,runs]:bounds->patches)if(!g.nodes.contains(c.patches[patch].id)&&!excludedPatches.contains(c.patches[patch].id)) {
                 queries[patch].push_back({id,placement.source,runs});
             }
         }
@@ -638,7 +680,7 @@ std::vector<Candidate> discover(const Catalog& c,const Graph& g,const std::strin
     std::stable_sort(out.begin(),out.end(),[](const auto& a,const auto& b){return a.distance!=b.distance?a.distance<b.distance:a.id<b.id;});return out;
 }
 namespace {
-void appendProposal(Graph& g,const Catalog& c,const Graph& committed,const Candidate& candidate,bool whole,const lasagna::NormalSampler& sampler,const std::atomic_bool* cancel) {
+void appendProposal(Graph& g,const Catalog& c,const Graph& committed,const Candidate& candidate,bool whole,const lasagna::NormalSampler& sampler,const std::atomic_bool* cancel,ContactPolicy policy) {
     std::set<std::string> existing;for(const auto& [id,p]:g.nodes) existing.insert(id);
     // Keep the clicked attachment first for initial placement; other contacts
     // participate in the same joint fit rather than defining separate patches.
@@ -647,7 +689,7 @@ void appendProposal(Graph& g,const Catalog& c,const Graph& committed,const Candi
         std::vector<std::string> additions{candidate.id};
         if(whole) for(const auto& component:c.components) if(std::find(component.begin(),component.end(),candidate.id)!=component.end()) {additions=component;break;}
         for(const auto& id:additions) if(!g.nodes.contains(id)) {
-            detail::cancelled(cancel);auto n=makeFiberNode(c.fibers.at(id),g.settings,sampler);g.nodes.emplace(id,Placement{n,n->initialUv});
+            detail::cancelled(cancel);auto n=makeFiberNode(c.fibers.at(id),g.settings,sampler,cancel);g.nodes.emplace(id,Placement{n,n->initialUv});
         }
     } else {
         auto it=std::find_if(c.patches.begin(),c.patches.end(),[&](const auto& p){return p.id==candidate.id;});
@@ -655,18 +697,10 @@ void appendProposal(Graph& g,const Catalog& c,const Graph& committed,const Candi
         auto n=loadPatchNode(*it,g.settings);g.nodes.emplace(n->id,Placement{n,n->initialUv});
         alignNewNodes(g,existing);
         auto surface=detail::sourceSurface(*n);SurfacePatchIndex index;index.setSamplingStride(1);index.rebuild({surface});
-        addFiberPatchContacts(g,*n,*surface,index,existing,cancel);
+        addFiberPatchContacts(g,*n,*surface,index,existing,cancel,policy);
         // Actual 3-D overlap couples every already accepted patch into the same fit.
-        for(const auto& [id,p]:committed.nodes) if(!p.source->fiber) {
-            detail::cancelled(cancel);
-            for(size_t i=0;i<p.source->xyz.size();++i) {
-                if(!detail::valid(p.source->xyz[i])) continue;
-                auto hit=patchContact(*n,*surface,index,p.source->xyz[i],g.settings.radius);if(!hit)continue;
-                Location a{id,{static_cast<double>(i%p.source->cols),static_cast<double>(i/p.source->cols)}};
-                try {detail::weights(*p.source,a);}catch(...){continue;}
-                g.links.push_back({a,hit->location});
-            }
-        }
+        const auto overlaps=overlapContacts(*n,*surface,index,committed.nodes,g.settings.radius,cancel,false);
+        g.links.insert(g.links.end(),overlaps.begin(),overlaps.end());
     }
     addFiberLinks(g,c,&existing);alignNewNodes(g,existing);
     if(candidate.fiber) {
@@ -676,23 +710,31 @@ void appendProposal(Graph& g,const Catalog& c,const Graph& committed,const Candi
             detail::cancelled(cancel);
             auto surface=detail::sourceSurface(*p.source);
             SurfacePatchIndex index;index.setSamplingStride(1);index.rebuild({surface});
-            addFiberPatchContacts(g,*p.source,*surface,index,added,cancel);
+            addFiberPatchContacts(g,*p.source,*surface,index,added,cancel,policy);
         }
     }
 }
 }
+std::vector<Link> detail::patchOverlapContacts(const Node& proposal,
+    const std::map<std::string,Placement>& references,double radius,
+    const std::atomic_bool* cancel,bool checkNormals) {
+    detail::cancelled(cancel);
+    auto surface=detail::sourceSurface(proposal);
+    SurfacePatchIndex index;index.setSamplingStride(1);index.rebuild({surface});
+    return overlapContacts(proposal,*surface,index,references,radius,cancel,checkNormals);
+}
 Graph propose(const Catalog& c,const Graph& committed,const Candidate& candidate,bool whole,const lasagna::NormalSampler& sampler,const std::atomic_bool* cancel) {
-    Graph g=committed;appendProposal(g,c,committed,candidate,whole,sampler,cancel);return g;
+    Graph g=committed;appendProposal(g,c,committed,candidate,whole,sampler,cancel,ContactPolicy::LocalPlacement);return g;
 }
 GraphEdit proposeEdit(const Catalog& c,std::shared_ptr<const PreparedGraph> base,const Candidate& candidate,bool whole,
-                      const lasagna::NormalSampler& sampler,const std::atomic_bool* cancel){
+                      const lasagna::NormalSampler& sampler,const std::atomic_bool* cancel,ContactPolicy policy){
     if(!base)throw std::runtime_error("Proposal has no committed revision");
     const auto& committed=base->accepted.graph;
     if(committed.nodes.contains(candidate.id))throw std::runtime_error("Proposal is already committed");
     // The placement map shares UV storage; only the new nodes and links are
     // writable. Accepted contacts never enter proposal construction.
     Graph context;context.settings=committed.settings;context.seed=committed.seed;context.nodes=committed.nodes;
-    appendProposal(context,c,committed,candidate,whole,sampler,cancel);
+    appendProposal(context,c,committed,candidate,whole,sampler,cancel,policy);
     GraphEdit edit;edit.base=std::move(base);
     for(auto& [id,p]:context.nodes)if(!committed.nodes.contains(id))edit.addedNodes.emplace(id,std::move(p));
     edit.addedLinks=context.links.read();

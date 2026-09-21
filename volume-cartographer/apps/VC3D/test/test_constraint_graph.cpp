@@ -2,6 +2,7 @@
 #include <QTemporaryDir>
 #include <QProcess>
 #include "vc/constraints/ConstraintGraph.hpp"
+#include "vc/constraints/FiberReview.hpp"
 #include "vc/fiber_tracer/FiberGeometry.hpp"
 #include "vc/lasagna/LineModel.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -9,6 +10,7 @@
 #include "../../../core/src/constraints/GraphFiberJunctions.hpp"
 #include "../../../core/src/constraints/GraphFitCosts.hpp"
 #include <fstream>
+#include <bit>
 using namespace vc::constraints;
 namespace {
 struct Normals : vc::lasagna::NormalSampler {
@@ -21,10 +23,632 @@ std::shared_ptr<Node> plane(std::string id,double offset=0) {
     return n;
 }
 Graph base(){Graph g;auto n=plane("a");g.seed="a";g.nodes.emplace("a",Placement{n,n->initialUv});return g;}
+Graph legacyFiberGraph() {
+    Graph g;auto n=std::make_shared<Node>();n->id="fiber:legacy";n->fiber=true;n->direction='H';n->rows=7;n->cols=5;n->controls={0,4};
+    for(int c=0;c<5;++c){n->line.push_back({100.+20*c,100,100});n->lineArclength.push_back(20*c);n->columnArclength.push_back(20*c);}
+    for(int r=0;r<7;++r)for(int c=0;c<5;++c){n->xyz.push_back({100.+20*c,100.+20*(r-3),100});n->initialUv.push_back({20.*c,20.*(r-3)});}
+    for(int r=0;r<6;++r)for(int c=0;c<4;++c){int a=r*5+c;n->triangles.push_back({a,a+1,a+5});n->triangles.push_back({a+6,a+5,a+1});}
+    g.seed=n->id;auto uv=n->initialUv;for(auto& p:uv)p+=cv::Vec2d{12,34};g.nodes.emplace(n->id,Placement{n,std::move(uv)});return g;
+}
+std::filesystem::path quarantineFixture(const std::filesystem::path& root) {
+    const auto directory=root/"project",patches=directory/"patches";
+    std::filesystem::create_directories(patches);
+    nlohmann::json sources=nlohmann::json::array();
+    std::ofstream geometry(directory/"layout.bin",std::ios::binary);uint64_t offset=0;
+    for(const auto& id:{"a:0","a:1","b:0","c:0"}) {
+        const auto source=patches/std::string(1,id[0]);std::filesystem::create_directories(source);
+        std::ofstream(source/"marker.txt")<<id[0];auto node=plane(id);
+        for(size_t i=0;i<node->xyz.size();++i) {
+            const std::array<double,5> values{node->xyz[i][0],node->xyz[i][1],100.+(id[0]-'a'),node->initialUv[i][0],node->initialUv[i][1]};
+            for(double v:values){const auto bits=std::bit_cast<uint64_t>(v);for(int b=0;b<8;++b)geometry.put(char(bits>>(8*b)));}
+        }
+        sources.push_back({{"id",id},{"path",source.string()},{"fiber",false},{"rows",5},{"cols",5},
+            {"byte_offset",offset},{"quad_runs",nlohmann::json::array({{0,16}})}});offset+=25*40;
+    }
+    geometry.close();auto settings=graphToJson(base()).at("settings");settings["patch_folder"]=patches.string();
+    nlohmann::json document={{"type","vc3d_winding_layout"},{"version",2},{"seed","a:0"},
+        {"geometry_format","little_endian_float64_xyzuv"},{"geometry_file","layout.bin"},{"geometry_bytes",offset},
+        {"settings",settings},{"layout",{{"read_only",true}}},{"sources",sources}};
+    const auto path=directory/"layout.workspace.json";std::ofstream(path)<<document.dump(2);return path;
+}
+std::string readFile(const std::filesystem::path& path) {
+    std::ifstream input(path,std::ios::binary);return {std::istreambuf_iterator<char>(input),std::istreambuf_iterator<char>()};
+}
+std::filesystem::path reviewQuarantineFixture(const std::filesystem::path& root) {
+    FiberReview review;review.settings.patchFolder=root/"project/patches";review.selected="fiber:a";
+    for(const auto* name:{"one","two"}){
+        std::filesystem::create_directories(review.settings.patchFolder/name);
+        std::ofstream(review.settings.patchFolder/name/"marker.txt")<<name;
+    }
+    Normals normals;
+    for(const auto* id:{"fiber:a","fiber:b"}){
+        Fiber fiber;fiber.id=id;fiber.direction='H';fiber.controls={0,4};
+        for(int i=0;i<5;++i)fiber.line.push_back({100.+20*i,100,100});
+        auto node=makeFiberNode(fiber,review.settings,normals);
+        auto& f=review.fibers[id];f.path=id;f.direction='H';f.discovered=true;
+        f.base.settings=review.settings;f.base.seed=id;f.base.nodes.emplace(id,Placement{node,node->initialUv});
+        for(const auto* patchId:{"patch:one","patch:two","patch:one-component"}){
+            auto patch=plane(patchId);patch->path=review.settings.patchFolder/(std::string(patchId)=="patch:two"?"two":"one");
+            auto graph=f.base;graph.nodes.emplace(patchId,Placement{patch,patch->initialUv});
+            graph.links.push_back({{id,{},0},{patchId,{0,0}},true});
+            Candidate c;c.id=patchId;c.contacts=graph.links.read();f.proposals.push_back(c);
+            if(std::string(id)=="fiber:b")f.decisions[patchId]={ReviewStatus::Accepted,review.nextOrder++,graph};
+            else if(std::string(patchId)=="patch:one")f.pending=graph;
+        }
+        f.current=0;
+    }
+    const auto path=root/"project/review.json";saveReview(review,path);return path;
+}
+
 }
 class ConstraintGraphTest:public QObject {
     Q_OBJECT
 private slots:
+    void robustStripUpgradePreservesPatchPlacementAndContacts(){
+        Normals normals;auto graph=legacyFiberGraph();auto patch=plane("patch:test");graph.nodes.emplace(patch->id,Placement{patch,patch->initialUv});
+        graph.links.push_back({{graph.seed,{1.3,2.7}},{patch->id,{1,1}},true});
+        const auto location=placedLocation(graph,graph.links[0].a);const auto oldPatch=graph.nodes.at(patch->id);
+        auto legacy=graphToJson(graph);for(auto& n:legacy["nodes"])n.erase("strip_generation");graph=graphFromJson(legacy);
+        QVERIFY(regenerateFiberStrips(graph,normals));QCOMPARE(graph.nodes.at(graph.seed).source->stripGeneration,7);
+        QCOMPARE(graph.nodes.at(patch->id).source->xyz,oldPatch.source->xyz);QCOMPARE(graph.nodes.at(patch->id).uv,oldPatch.uv);
+        QVERIFY(cv::norm(placedLocation(graph,graph.links[0].a)-location)<1e-8);
+        QCOMPARE(graphToJson(graphFromJson(graphToJson(graph))),graphToJson(graph));
+        const auto upgraded=graphToJson(graph);QVERIFY(!regenerateFiberStrips(graph,normals));QCOMPARE(graphToJson(graph),upgraded);
+    }
+    void robustReviewUpgradePreservesDecisionsAndPendingEdits(){
+        Normals normals;ReviewFiber f;f.base=legacyFiberGraph();f.direction='H';f.reverse=true;f.discovered=true;f.current=0;
+        auto graph=f.base;auto patch=plane("patch:test");graph.nodes.emplace(patch->id,Placement{patch,patch->initialUv});
+        graph.links.push_back({{graph.seed,{1.25,3}},{patch->id,{1,1}},true});
+        f.decisions[patch->id]={ReviewStatus::Accepted,42,graph};f.pending=graph;
+        Candidate c;c.id=patch->id;c.contacts=graph.links.read();f.proposals.push_back(c);
+        const auto patchUv=graph.nodes.at(patch->id).uv;const auto beforeContact=placedLocation(graph,graph.links[0].a);
+        QVERIFY(regenerateReviewFiber(f,normals));QCOMPARE(f.current,0);QVERIFY(f.reverse);QVERIFY(f.discovered);
+        const auto& decision=f.decisions.at(patch->id);QCOMPARE(decision.order,uint64_t(42));QCOMPARE(decision.status,ReviewStatus::Accepted);
+        QCOMPARE(decision.alignment.nodes.at(patch->id).uv,patchUv);QCOMPARE(f.pending->nodes.at(patch->id).uv,patchUv);
+        QCOMPARE(f.base.nodes.at(f.base.seed).source,decision.alignment.nodes.at(f.base.seed).source);
+        QCOMPARE(f.base.nodes.at(f.base.seed).uv,decision.alignment.nodes.at(f.base.seed).uv);
+        QCOMPARE(f.base.nodes.at(f.base.seed).uv,f.pending->nodes.at(f.base.seed).uv);
+        QVERIFY(cv::norm(placedLocation(f.base,f.proposals[0].contacts[0].a)-beforeContact)<1e-8);
+        FiberReview review;review.selected=f.base.seed;review.fibers.emplace(review.selected,f);
+        const auto saved=reviewToJson(review);QCOMPARE(reviewToJson(reviewFromJson(saved)),saved);
+        QVERIFY(!regenerateReviewFiber(f,normals));
+    }
+    void robustStripUpgradeCancellationIsTransactional(){
+        Normals normals;auto graph=legacyFiberGraph();const auto before=graphToJson(graph);std::atomic_bool cancel=true;
+        QVERIFY_EXCEPTION_THROWN(regenerateFiberStrips(graph,normals,&cancel),std::runtime_error);QCOMPARE(graphToJson(graph),before);
+    }
+    void robustStripUpgradeRemapsContactsWhenFinerGeometryIsRequired(){
+        Normals normals;auto graph=legacyFiberGraph();
+        auto source=std::make_shared<Node>(*graph.nodes.at(graph.seed).source);
+        for(int c=0;c<source->cols;++c){
+            source->line[c][0]=100+1.25*c;source->lineArclength[c]=1.25*c;source->columnArclength[c]=1.25*c;
+            for(int r=0;r<source->rows;++r)source->xyz[r*source->cols+c][0]=100+1.25*c;
+        }
+        graph.nodes.at(graph.seed).source=source;
+        auto patch=plane("patch:test");graph.nodes.emplace(patch->id,Placement{patch,patch->initialUv});
+        graph.links.push_back({{graph.seed,{1.3,2.7}},{patch->id,{1,1}},true});
+        const auto before=placedLocation(graph,graph.links[0].a);
+        const auto patchUv=graph.nodes.at(patch->id).uv;
+        QVERIFY(regenerateFiberStrips(graph,normals));
+        const auto& upgraded=*graph.nodes.at(graph.seed).source;
+        QCOMPARE(upgraded.rows,61);QCOMPARE(upgraded.stripGeneration,7);
+        QVERIFY(cv::norm(placedLocation(graph,graph.links[0].a)-before)<1e-8);
+        QCOMPARE(graph.nodes.at(patch->id).uv,patchUv);
+        QVERIFY(std::abs(upgraded.initialUv.front()[1]-upgraded.initialUv[(upgraded.rows/2)*upgraded.cols][1])==60);
+    }
+    void fiberReviewPrunesMissingProposalsAndPreservesEmbeddedWork(){
+        QTemporaryDir temp;const auto path=reviewQuarantineFixture(temp.path().toStdString());
+        auto review=loadReview(path);auto& f=review.fibers.at("fiber:a");
+        const auto accepted=reviewToJson(review).at("fibers").at("fiber:b");
+        const auto pending=graphToJson(*f.pending);
+        // The pending patch survives even though its source is unavailable.
+        QCOMPARE(pruneUnavailableReviewProposals(f,{"patch:two"}),size_t(1));
+        QCOMPARE(f.current,0);QCOMPARE(graphToJson(*f.pending),pending);
+        QCOMPARE(pruneUnavailableReviewProposals(review.fibers.at("fiber:b"),{}),size_t(0));
+        QCOMPARE(reviewToJson(review).at("fibers").at("fiber:b"),accepted);
+        f.pending.reset();f.proposals.push_back(f.proposals.front());
+        f.decisions["patch:one"]={ReviewStatus::Skipped,review.nextOrder++,{}};
+        QCOMPARE(pruneUnavailableReviewProposals(f,{"patch:two"}),size_t(2));
+        QCOMPARE(f.current,0);QCOMPARE(f.proposals.front().id,std::string("patch:two"));
+        QCOMPARE(f.decisions.at("patch:one").status,ReviewStatus::Skipped);
+        QCOMPARE(pruneUnavailableReviewProposals(f,{"patch:two"}),size_t(0));
+        saveReview(review,path);QCOMPARE(reviewToJson(loadReview(path)),reviewToJson(review));
+        QCOMPARE(pruneUnavailableReviewProposals(f,{}),size_t(1));
+        QCOMPARE(f.current,-1);QVERIFY(f.proposals.empty());QCOMPARE(f.decisions.size(),size_t(1));
+    }
+    void fiberReviewPruningRemapsSelectionAndWraps(){
+        ReviewFiber f;
+        for(const char* id:{"missing","first","decided","last"}){Candidate c;c.id=id;f.proposals.push_back(c);}
+        f.current=3;f.decisions["decided"]={ReviewStatus::Rejected};
+        QCOMPARE(pruneUnavailableReviewProposals(f,{"first","decided","last"}),size_t(1));
+        QCOMPARE(f.current,2);QCOMPARE(f.proposals[f.current].id,std::string("last"));
+        QCOMPARE(pruneUnavailableReviewProposals(f,{"first","decided"}),size_t(1));
+        QCOMPARE(f.current,0);QCOMPARE(f.proposals[f.current].id,std::string("first"));
+        QCOMPARE(pruneUnavailableReviewProposals(f,{"decided"}),size_t(1));
+        QCOMPARE(f.current,-1);QCOMPARE(f.decisions.at("decided").status,ReviewStatus::Rejected);
+    }
+    void fiberReviewQuarantineRemovesAllAssociationsAndPersists(){
+        QTemporaryDir temp;const auto path=reviewQuarantineFixture(temp.path().toStdString());
+        auto before=loadReview(path);const auto original=readFile(path);
+        const auto retained=graphToJson(before.fibers.at("fiber:b").decisions.at("patch:two").alignment);
+        before.proposalOpacity=37; // Unsaved review edits are published too.
+        const PatchEntry patch{"patch:one",before.settings.patchFolder/"one",{}, {}};
+        const auto result=quarantineReviewPatch(before,path,patch);
+        QVERIFY(!std::filesystem::exists(patch.path));
+        QCOMPARE(readFile(quarantineDirectory(path)/"one/marker.txt"),std::string("one"));
+        QVERIFY(result.quarantined.contains("patch:one"));QVERIFY(result.quarantined.contains("patch:one-component"));
+        const auto& a=result.fibers.at("fiber:a");QCOMPARE(a.current,0);QVERIFY(!a.pending);
+        QCOMPARE(a.proposals.size(),size_t(1));QCOMPARE(a.proposals.front().id,std::string("patch:two"));
+        const auto& b=result.fibers.at("fiber:b");QCOMPARE(acceptedPatchCount(b),size_t(1));
+        QCOMPARE(graphToJson(b.decisions.at("patch:two").alignment),retained);
+        QCOMPARE(graphToJson(a.base),graphToJson(before.fibers.at("fiber:a").base));
+        const auto reopened=loadReview(path);QCOMPARE(reviewToJson(reopened),reviewToJson(result));
+        QCOMPARE(reopened.sessionRevision,result.sessionRevision);QCOMPARE(reopened.proposalOpacity,37);
+        size_t backups=0;for(const auto& file:std::filesystem::directory_iterator(path.parent_path()))
+            if(file.path().filename().string().find("before-quarantine-")!=std::string::npos){++backups;QCOMPARE(readFile(file.path()),original);}
+        QCOMPARE(backups,size_t(1));
+        QVERIFY_EXCEPTION_THROWN(quarantineReviewPatch(before,path,{"patch:two",before.settings.patchFolder/"two",{}, {}}),std::runtime_error);
+        // Quarantining the final available patch leaves a usable empty review.
+        const auto complete=quarantineReviewPatch(result,path,{"patch:two",result.settings.patchFolder/"two",{}, {}});
+        QCOMPARE(nextReviewProposal(complete.fibers.at("fiber:a")),-1);
+        QCOMPARE(acceptedPatchCount(complete.fibers.at("fiber:b")),size_t(0));
+        QCOMPARE(reviewToJson(loadReview(path)),reviewToJson(complete));
+    }
+    void fiberReviewQuarantineFailurePreservesWorkspaceAndFiles(){
+        QTemporaryDir temp;const auto path=reviewQuarantineFixture(temp.path().toStdString());
+        const auto before=loadReview(path);const auto original=readFile(path);
+        const PatchEntry patch{"patch:one",before.settings.patchFolder/"one",{}, {}};
+        QVERIFY_EXCEPTION_THROWN(quarantineReviewPatch(before,path,patch,[&](const auto& progress){
+            if(progress.starts_with("Saving the workspace"))std::filesystem::create_directories(quarantineDirectory(path)/"one");
+        }),std::runtime_error);
+        QCOMPARE(readFile(path),original);QCOMPARE(readFile(patch.path/"marker.txt"),std::string("one"));
+        QVERIFY(!std::filesystem::exists(path.string()+".quarantine-lock"));
+        QVERIFY_EXCEPTION_THROWN(quarantineReviewPatch(before,path,{"patch:outside",temp.path().toStdString(),{}, {}}),std::runtime_error);
+        QCOMPARE(readFile(path),original);
+    }
+
+    void fiberReviewOrderingAndPairDecisions(){
+        Normals normals;Fiber fiber;fiber.id="fiber";fiber.direction='H';fiber.controls={0,4};
+        for(int i=0;i<5;++i)fiber.line.push_back({100.+20*i,100,100});
+        ReviewFiber review;auto node=makeFiberNode(fiber,Settings{},normals);
+        review.base.seed=fiber.id;review.base.nodes.emplace(fiber.id,Placement{node,node->initialUv});
+        auto candidate=[&](std::string patch,int i){Candidate c;c.id=patch;c.contacts.push_back({{fiber.id,{},i},{patch,{0,0}}});return c;};
+        review.proposals={candidate("c",4),candidate("a",0),candidate("b",0),candidate("a",3)};
+        orderReviewProposals(review);QCOMPARE(review.proposals[0].id,std::string("a"));QCOMPARE(review.proposals[1].id,std::string("b"));
+        QCOMPARE(nextReviewProposal(review),0);
+        review.decisions["a"]={ReviewStatus::Rejected};QCOMPARE(nextReviewProposal(review),1);
+        review.decisions["b"]={ReviewStatus::Accepted};review.decisions["c"]={ReviewStatus::Rejected};QCOMPARE(nextReviewProposal(review),-1);QCOMPARE(acceptedPatchCount(review),size_t(1));
+        auto other=review;other.decisions.clear();QCOMPARE(nextReviewProposal(other),0);QCOMPARE(nextReviewProposal(other,-1,-1),3);
+        review.decisions.erase("a");QCOMPARE(nextReviewProposal(review),0);
+        review.reverse=true;orderReviewProposals(review);QCOMPARE(review.proposals.front().id,std::string("c"));QCOMPARE(nextReviewProposal(review),1);
+        review.proposals.clear();QCOMPARE(nextReviewProposal(review),-1);
+    }
+
+    void fiberReviewSkipIsDistinctPersistentAndLocal(){
+        QTemporaryDir temp;const auto path=reviewQuarantineFixture(temp.path().toStdString());
+        auto review=loadReview(path);auto& fiber=review.fibers.at("fiber:a");
+        const auto otherBefore=reviewToJson(review).at("fibers").at("fiber:b");
+        fiber.proposals.push_back(fiber.proposals.front());
+        fiber.decisions["patch:one"]={ReviewStatus::Skipped,review.nextOrder++,{}};fiber.pending.reset();
+        QCOMPARE(nextReviewProposal(fiber,0),1);QCOMPARE(nextReviewProposal(fiber,3),1);
+        QCOMPARE(acceptedPatchCount(fiber),size_t(0));
+        fiber.current=nextReviewProposal(fiber,0);
+        saveReview(review,path);auto reopened=loadReview(path);const auto& restored=reopened.fibers.at("fiber:a");
+        QCOMPARE(restored.decisions.at("patch:one").status,ReviewStatus::Skipped);
+        QCOMPARE(nextReviewProposal(restored),1);QCOMPARE(acceptedPatchCount(restored),size_t(0));
+        const auto document=reviewToJson(reopened);QCOMPARE(document.at("version"),2);
+        QCOMPARE(document.at("fibers").at("fiber:a").at("decisions").at("patch:one").at("status"),"skipped");
+        QCOMPARE(document.at("fibers").at("fiber:b"),otherBefore);
+        QVERIFY(std::filesystem::exists(review.settings.patchFolder/"one/marker.txt"));QVERIFY(reopened.quarantined.empty());
+        reopened.fibers.at("fiber:a").decisions.erase("patch:one");
+        QCOMPARE(nextReviewProposal(reopened.fibers.at("fiber:a")),0);
+        auto invalid=document;invalid["fibers"]["fiber:a"]["decisions"]["patch:one"]["status"]="unknown";
+        QVERIFY_EXCEPTION_THROWN(reviewFromJson(invalid),std::runtime_error);
+    }
+    void fiberReviewRoundTripAndSharedSources(){
+        Normals normals;Fiber fiber;fiber.id="fiber";fiber.direction='H';fiber.controls={0,4};
+        for(int i=0;i<5;++i)fiber.line.push_back({100.+20*i,100,100});
+        FiberReview review;review.settings.radius=1.5;review.selected="fiber";
+        auto& f=review.fibers["fiber"];f.path="missing/fiber.json";f.direction='H';f.reverse=true;f.discovered=true;
+        auto node=makeFiberNode(fiber,review.settings,normals);f.base.settings=review.settings;f.base.seed=fiber.id;f.base.nodes.emplace(fiber.id,Placement{node,node->initialUv});
+        auto patch=plane("patch");auto graph=f.base;graph.nodes.emplace(patch->id,Placement{patch,patch->initialUv});
+        graph.links.push_back({{fiber.id,{},0},{patch->id,{0,0}},true});
+        f.decisions[patch->id]={ReviewStatus::Accepted,1,graph};f.decisions["rejected"]={ReviewStatus::Rejected,2,{}};
+        Candidate c;c.id="patch";c.contacts=graph.links.read();f.proposals.push_back(c);f.current=0;f.pending=graph;
+        review.nextOrder=3;review.committedOpacity=17;review.proposalOpacity=61;review.boundaries=true;
+        review.fiberLineOpacity=23;review.fiberLineWidth=1.5;review.committedTint=27;
+        const auto json=reviewToJson(review);QCOMPARE(json.at("sources").size(),size_t(2));
+        const auto restored=reviewFromJson(json);const auto& saved=restored.fibers.at("fiber");
+        QCOMPARE(reviewToJson(restored),json);QCOMPARE(saved.base.nodes.at("fiber").source,saved.decisions.at("patch").alignment.nodes.at("fiber").source);
+        QCOMPARE(saved.pending->nodes.at("patch").source,saved.decisions.at("patch").alignment.nodes.at("patch").source);
+        QTemporaryDir dir;auto path=std::filesystem::path(dir.path().toStdString())/"review.json";
+        saveReview(review,path);QCOMPARE(reviewToJson(loadReview(path)),json);
+        auto broken=json;broken["fibers"]["fiber"]["current"]=100;QVERIFY_EXCEPTION_THROWN(reviewFromJson(broken),std::runtime_error);
+        broken=json;broken["version"]=999;QVERIFY_EXCEPTION_THROWN(reviewFromJson(broken),std::runtime_error);
+        auto legacy=json;legacy["version"]=1;
+        for(auto& f:legacy["fibers"])for(auto& d:f["decisions"]){d["accepted"]=d["status"]=="accepted";d.erase("status");}
+        QCOMPARE(reviewToJson(reviewFromJson(legacy)),json);
+        legacy.erase("committed_tint");QCOMPARE(reviewFromJson(legacy).committedTint,4);
+        for(int tint:{-1,101}){broken=json;broken["committed_tint"]=tint;QVERIFY_EXCEPTION_THROWN(reviewFromJson(broken),std::runtime_error);}
+        legacy.erase("fiber_line_opacity");legacy.erase("fiber_line_width");
+        QCOMPARE(reviewFromJson(legacy).fiberLineOpacity,FiberReview{}.fiberLineOpacity);
+        QCOMPARE(reviewFromJson(legacy).fiberLineWidth,FiberReview{}.fiberLineWidth);
+        for(int opacity:{-1,101}){broken=json;broken["fiber_line_opacity"]=opacity;QVERIFY_EXCEPTION_THROWN(reviewFromJson(broken),std::runtime_error);}
+        for(double width:{0.,11.}){broken=json;broken["fiber_line_width"]=width;QVERIFY_EXCEPTION_THROWN(reviewFromJson(broken),std::runtime_error);}
+        // Rejection-only and not-yet-built fibers can be saved too.
+        f.base={};f.pending.reset();f.proposals.clear();f.current=-1;f.decisions.erase("patch");
+        QCOMPARE(acceptedPatchCount(reviewFromJson(reviewToJson(review)).fibers.at("fiber")),size_t(0));
+    }
+
+    void fiberReviewVerticalTraversalStartsAtTop(){
+        Normals normals;Fiber fiber;fiber.id="fiber";fiber.direction='H';fiber.controls={0,4};
+        for(int i=0;i<5;++i)fiber.line.push_back({100.+20*i,100,100});
+        auto node=std::make_shared<Node>(*makeFiberNode(fiber,Settings{},normals));node->direction='V';
+        auto uv=node->initialUv;for(auto& p:uv)p={-p[1],p[0]};
+        ReviewFiber review;review.base.seed=fiber.id;review.base.nodes.emplace(fiber.id,Placement{node,uv});
+        for(int i:{0,4,2}){Candidate c;c.id=std::to_string(i);c.contacts.push_back({{fiber.id,{},i},{c.id,{0,0}}});review.proposals.push_back(c);}
+        orderReviewProposals(review);QCOMPARE(review.proposals[0].id,std::string("4"));QCOMPARE(review.proposals[2].id,std::string("0"));
+        review.reverse=true;orderReviewProposals(review);QCOMPARE(review.proposals[0].id,std::string("0"));
+    }
+
+    void fixedReferenceReviewDoesNotMoveFiber(){
+        Normals normals;Fiber fiber;fiber.id="fiber";fiber.direction='H';fiber.controls={0,4};
+        for(int i=0;i<5;++i)fiber.line.push_back({100.+20*i,100,100});
+        Graph graph;graph.seed=fiber.id;auto node=makeFiberNode(fiber,graph.settings,normals);graph.nodes.emplace(node->id,Placement{node,node->initialUv});
+        auto baseResult=renderPlacement(graph);QVERIFY2(baseResult.valid,baseResult.message.c_str());
+        auto patch=plane("patch");auto draft=graph;draft.nodes.emplace(patch->id,Placement{patch,patch->initialUv});
+        for(int i=0;i<5;++i)draft.links.push_back({{fiber.id,{},i},{patch->id,{double(i),0}}});
+        auto edit=graphEdit(prepareGraph(baseResult),draft);
+        const auto result=fitEdit(edit,nullptr,{},FitPolicy::FixedReference);QVERIFY2(result.valid,result.message.c_str());
+        QCOMPARE(result.graph.nodes.at("fiber").uv,graph.nodes.at("fiber").uv);
+        QCOMPARE(result.graph.nodes.at("fiber").source->xyz,node->xyz);
+        QCOMPARE(result.graph.nodes.at("patch").source->xyz,patch->xyz);
+        // Repeating the same pair never incorporates independently stored decisions.
+        const auto repeated=fitEdit(edit,nullptr,{},FitPolicy::FixedReference);QVERIFY(repeated.valid);
+        QCOMPARE(result.graph.nodes.at("patch").uv,repeated.graph.nodes.at("patch").uv);
+        std::atomic_bool cancelled{true};QVERIFY_EXCEPTION_THROWN(fitEdit(edit,&cancelled,{},FitPolicy::FixedReference),std::runtime_error);
+        // An imperfect automatic correspondence should still produce a review
+        // overlay, while the strict full-graph attachment policy stays intact.
+        auto imperfect=edit;imperfect.addedLinks.back().b=imperfect.addedLinks.front().b;
+        QVERIFY(!fitEdit(imperfect,nullptr,{},FitPolicy::FixedReference).valid);
+        const auto best=fitEdit(imperfect,nullptr,{},FitPolicy::FiberReview);
+        QVERIFY2(best.valid,best.message.c_str());QVERIFY(best.correspondenceRms>graph.settings.radius);
+        QCOMPARE(best.graph.nodes.at("fiber").uv,graph.nodes.at("fiber").uv);
+        QVERIFY(renderSourceLayer(best.graph,false).valid);
+        QVERIFY_EXCEPTION_THROWN(fitEdit(edit,&cancelled,{},FitPolicy::FiberReview),std::runtime_error);
+    }
+
+    void fiberReviewFitsAcceptedOverlaps(){
+        Normals normals;Fiber fiber;fiber.id="fiber";fiber.direction='H';fiber.controls={0,4};
+        for(int i=0;i<5;++i)fiber.line.push_back({100.+20*i,100,100});
+        ReviewFiber review;auto& graph=review.base;graph.seed=fiber.id;
+        auto node=makeFiberNode(fiber,graph.settings,normals);graph.nodes.emplace(node->id,Placement{node,node->initialUv});
+        const auto baseResult=renderPlacement(graph);QVERIFY(baseResult.valid);
+        auto patch=plane("proposal"),reference=plane("accepted");
+        auto accepted=graph;auto uv=reference->initialUv;
+        for(auto& p:uv)p[0]+=.15*p[1]; // Agrees at the fiber, shears away from it.
+        accepted.nodes.emplace(reference->id,Placement{reference,uv});
+        for(int i=0;i<5;++i)accepted.links.push_back({{fiber.id,{},i},{reference->id,{double(i),0}}});
+        review.decisions[reference->id]={ReviewStatus::Accepted,1,accepted};
+        auto draft=graph;draft.nodes.emplace(patch->id,Placement{patch,patch->initialUv});
+        for(int i=0;i<5;++i)draft.links.push_back({{fiber.id,{},i},{patch->id,{double(i),0}}});
+        auto edit=graphEdit(prepareGraph(baseResult),draft);
+        const auto alone=fitEdit(edit,nullptr,{},FitPolicy::FiberReview);QVERIFY2(alone.valid,alone.message.c_str());
+        addReviewOverlapTargets(edit,review);QCOMPARE(edit.fixedTargets.size(),size_t(25));
+        auto error=[&](const Graph& g){double sum=0;for(const auto& t:edit.fixedTargets){const auto e=placedLocation(g,t.point)-t.uv;sum+=e.dot(e);}return std::sqrt(sum/edit.fixedTargets.size());};
+        const auto fitted=fitEdit(edit,nullptr,{},FitPolicy::FiberReview);QVERIFY2(fitted.valid,fitted.message.c_str());
+        QVERIFY(error(fitted.graph)<error(alone.graph)*.25);
+        QCOMPARE(fitted.graph.nodes.size(),size_t(2));
+        QCOMPARE(fitted.graph.nodes.at(fiber.id).uv,graph.nodes.at(fiber.id).uv);
+        QCOMPARE(review.decisions.at(reference->id).alignment.nodes.at(reference->id).uv.read(),uv);
+        QCOMPARE(fitted.graph.nodes.at(patch->id).source->xyz,patch->xyz);
+        // Targets are derived again on reopen; do not persist reference nodes
+        // in an independently editable two-node association.
+        FiberReview workspace;workspace.selected=fiber.id;workspace.fibers[fiber.id]=review;
+        Candidate c;c.id=patch->id;c.contacts=draft.links.read();
+        auto& saved=workspace.fibers.at(fiber.id);saved.proposals={c};saved.current=0;saved.pending=fitted.graph;
+        const auto restored=reviewFromJson(reviewToJson(workspace));
+        auto reopened=graphEdit(prepareGraph(renderPlacement(restored.fibers.at(fiber.id).base)),*restored.fibers.at(fiber.id).pending);
+        addReviewOverlapTargets(reopened,restored.fibers.at(fiber.id));
+        QCOMPARE(reopened.fixedTargets.size(),edit.fixedTargets.size());
+        for(size_t i=0;i<edit.fixedTargets.size();++i)QCOMPARE(reopened.fixedTargets[i].uv,edit.fixedTargets[i].uv);
+        const auto repeated=fitEdit(edit,nullptr,{},FitPolicy::FiberReview);QVERIFY(repeated.valid);
+        QCOMPARE(repeated.graph.nodes.at(patch->id).uv,fitted.graph.nodes.at(patch->id).uv);
+        // Neither rejected/skipped decisions nor the reopened proposal itself
+        // can constrain the fit. Refresh also removes stale overlap targets.
+        review.decisions[patch->id]={ReviewStatus::Accepted,2,fitted.graph};
+        for(auto status:{ReviewStatus::Rejected,ReviewStatus::Skipped}) {
+            review.decisions.at(reference->id).status=status;addReviewOverlapTargets(edit,review);QVERIFY(edit.fixedTargets.empty());
+        }
+        review.decisions.at(reference->id).status=ReviewStatus::Accepted;
+        auto far=std::make_shared<Node>(*reference);for(auto& p:far->xyz)p[2]+=100;
+        review.decisions.at(reference->id).alignment.nodes.at(reference->id).source=far;
+        addReviewOverlapTargets(edit,review);QVERIFY(edit.fixedTargets.empty());
+        // Crossing sheets are not same-surface matches, even at zero distance.
+        auto crossing=std::make_shared<Node>(*reference);for(auto& p:crossing->xyz){p[2]+=p[1]-100;p[1]=100;}
+        review.decisions.at(reference->id).alignment.nodes.at(reference->id).source=crossing;
+        addReviewOverlapTargets(edit,review);QVERIFY(edit.fixedTargets.empty());
+        std::atomic_bool cancel{true};QVERIFY_EXCEPTION_THROWN(addReviewOverlapTargets(edit,review,&cancel),std::runtime_error);
+    }
+
+    void fiberReviewRefinesDistortedPlacementDespiteBadOverlap(){
+        Normals normals;Fiber fiber;fiber.id="fiber";fiber.direction='H';fiber.controls={0,4};
+        for(int i=0;i<5;++i)fiber.line.push_back({100.+20*i,100,100});
+        Graph graph;graph.seed=fiber.id;auto node=makeFiberNode(fiber,graph.settings,normals);
+        graph.nodes.emplace(node->id,Placement{node,node->initialUv});
+        auto patch=plane("patch");auto uv=patch->initialUv;
+        uv.back()+=cv::Vec2d{600,600}; // A previously committed spike, with no flipped triangles.
+        auto draft=graph;draft.nodes.emplace(patch->id,Placement{patch,uv});
+        for(int i=0;i<5;++i)draft.links.push_back({{fiber.id,{},i},{patch->id,{double(i),0}}});
+        auto edit=graphEdit(prepareGraph(renderPlacement(graph)),draft);
+        for(int i=1;i<4;++i)edit.fixedTargets.push_back({{patch->id,{double(i),3}},{20.*i,60}});
+        edit.fixedTargets.push_back({{patch->id,{4,4}},{1000,1000}});
+        const auto fit=fitEdit(edit,nullptr,{},FitPolicy::FiberReview);QVERIFY2(fit.valid,fit.message.c_str());
+        const auto& placed=fit.graph.nodes.at(patch->id);
+        for(const auto& t:patch->triangles)for(int i=0;i<3;++i){
+            const int a=t[i],b=t[(i+1)%3];
+            QVERIFY(cv::norm(placed.uv[b]-placed.uv[a])<2*cv::norm(patch->xyz[b]-patch->xyz[a]));
+        }
+        for(int i=1;i<4;++i)QVERIFY(cv::norm(placedLocation(fit.graph,{patch->id,{double(i),3}})-cv::Vec2d{20.*i,60})<1);
+        QVERIFY(cv::norm(placed.uv.back()-cv::Vec2d{1000,1000})>1000);
+        QCOMPARE(fit.graph.nodes.at(fiber.id).uv,graph.nodes.at(fiber.id).uv);
+        QCOMPARE(placed.source->xyz,patch->xyz);QCOMPARE(draft.nodes.at(patch->id).uv.read(),uv);
+        // Consistent manual constraints can still require an unusable chart:
+        // pin two source voxels to an 80-voxel fiber span. Even with a nearly
+        // disabled shape penalty, this must report distortion rather than Ready.
+        auto fixed=graph;fixed.settings.stiffness=1e-12;
+        auto impossible=fixed;auto stretched=patch->initialUv;
+        for(auto& p:stretched)p[0]*=40;
+        impossible.nodes.emplace(patch->id,Placement{patch,stretched});
+        for(int i=0;i<5;++i)impossible.links.push_back({{fiber.id,{},i},{patch->id,{.025*i,0}},true});
+        const auto failed=fitEdit(graphEdit(prepareGraph(renderPlacement(fixed)),impossible),nullptr,{},FitPolicy::FiberReview);
+        QVERIFY(!failed.valid);
+        QVERIFY2(failed.message.find("Excessive local chart distortion")!=std::string::npos,failed.message.c_str());
+    }
+
+    void fiberReviewRobustInitializationAndDiagnostics(){
+        Normals normals;Fiber fiber;fiber.id="fiber";fiber.direction='H';fiber.controls={0,4};
+        for(int i=0;i<5;++i)fiber.line.push_back({100.+20*i,100,100});
+        Graph graph;graph.seed=fiber.id;auto node=makeFiberNode(fiber,graph.settings,normals);
+        graph.nodes.emplace(node->id,Placement{node,node->initialUv});
+        auto patch=plane("patch");auto uv=patch->initialUv;
+        // A half-turn plus a distant translation used to stall rotation and/or
+        // trip the local region boundary although the complete patch is free.
+        for(auto& p:uv)p=-p+cv::Vec2d{10000,10000};
+        auto draft=graph;draft.nodes.emplace(patch->id,Placement{patch,uv});
+        for(int i=0;i<5;++i)draft.links.push_back({{fiber.id,{},i},{patch->id,{double(i),0}}});
+        auto edit=graphEdit(prepareGraph(renderPlacement(graph)),draft);
+        const auto fit=fitEdit(edit,nullptr,{},FitPolicy::FiberReview);QVERIFY2(fit.valid,fit.message.c_str());
+        QVERIFY(fit.correspondenceRms<.01);QCOMPARE(fit.graph.nodes.at(fiber.id).uv,graph.nodes.at(fiber.id).uv);
+        // Keep genuine user-keypoint conflicts strict, and expose their cause.
+        edit.addedLinks.front().keypoint=true;
+        edit.addedLinks.push_back({{fiber.id,{},4},{patch->id,{0,0}},true});
+        const auto conflict=fitEdit(edit,nullptr,{},FitPolicy::FiberReview);
+        QVERIFY(!conflict.valid);QVERIFY2(conflict.message.find("Keypoint constraints conflict")!=std::string::npos,conflict.message.c_str());
+        QVERIFY(!conflict.needsRefit);
+    }
+
+    void fiberReviewUsesWholeFiberAndTwoProximityRadii(){
+        QTemporaryDir dir;const auto root=std::filesystem::path(dir.path().toStdString());
+        std::filesystem::create_directory(root/"fibers");std::filesystem::create_directory(root/"patches");
+        nlohmann::json points=nlohmann::json::array();
+        for(int x=100;x<=300;x+=20)points.push_back({x,120,100});
+        std::ofstream(root/"fibers/a.json")<<nlohmann::json{{"type","vc3d_fiber"},{"version",1},{"line_points",points},
+            {"control_points",{points.front(),points.back()}},{"branches",nlohmann::json::array()}};
+        for(const auto* name:{"two","one","none"}) {
+            cv::Mat_<cv::Vec3f> grid(3,11);
+            for(int y=0;y<grid.rows;++y)for(int x=0;x<grid.cols;++x) {
+                float distance=x==5?4:2;
+                if(x==0&&std::string(name)!="none")distance=0;
+                if(x==10&&std::string(name)=="two")distance=0;
+                grid(y,x)={100+x*20.f,100+y*20.f,100+distance};
+            }
+            // The initial chart is much longer than the fiber, so many useful
+            // correspondences start over 80 vx apart in the flattened view.
+            QuadSurface(grid,{.01f,.05f}).save(root/"patches"/name,name);
+        }
+        Settings settings;settings.fiberFolder=root/"fibers";settings.patchFolder=root/"patches";
+        settings.fiberScale=1;settings.radius=1.5;
+        const auto catalog=loadCatalog(settings);Normals normals;
+        const auto graph=seedGraph(catalog,0,settings,normals);
+        const auto baseline=discover(catalog,graph,graph.seed,nullptr,{},{},1);
+        QCOMPARE(std::count_if(baseline.begin(),baseline.end(),[](const auto& c){return c.id=="patch:two";}),2);
+        std::vector<Candidate> published;
+        const auto proposals=discover(catalog,graph,graph.seed,nullptr,{},[&](auto batch){published.insert(published.end(),batch.begin(),batch.end());},8,{},ContactPolicy::FiberReview);
+        QCOMPARE(proposals.size(),size_t(1));QCOMPARE(published.size(),size_t(1));
+        QCOMPARE(proposals[0].id,std::string("patch:two"));QCOMPARE(proposals[0].contacts.size(),size_t(2));
+        QCOMPARE(proposals[0].contacts.front().a.lineIndex,int64_t(0));QCOMPARE(proposals[0].contacts.back().a.lineIndex,int64_t(10));
+        const auto rendered=renderPlacement(graph);QVERIFY2(rendered.valid,rendered.message.c_str());
+        const auto prepared=prepareGraph(rendered);
+        const auto local=proposeEdit(catalog,prepared,proposals[0],false,normals);
+        const auto edit=proposeEdit(catalog,prepared,proposals[0],false,normals,nullptr,ContactPolicy::FiberReview);
+        QCOMPARE(local.addedLinks.size(),size_t(2));QCOMPARE(edit.addedLinks.size(),size_t(10));
+        std::set<int64_t> indices;
+        for(const auto& link:edit.addedLinks)indices.insert(link.a.lineIndex);
+        QVERIFY(indices.contains(9));QVERIFY(!indices.contains(5));QCOMPARE(indices.size(),edit.addedLinks.size());
+        const auto fitted=fitEdit(edit,nullptr,{},FitPolicy::FiberReview);QVERIFY2(fitted.valid,fitted.message.c_str());
+        QCOMPARE(fitted.graph.nodes.at(graph.seed).uv,graph.nodes.at(graph.seed).uv);
+        QCOMPARE(fitted.graph.links.size(),edit.addedLinks.size());QVERIFY(std::isfinite(fitted.correspondenceRms));
+        QVERIFY(renderSourceLayer(fitted.graph,false).valid);
+        // Eligibility still uses r, not 2r, and exclusions apply to review too.
+        QVERIFY(discover(catalog,graph,graph.seed,nullptr,{},{},1,{"patch:two"},ContactPolicy::FiberReview).empty());
+        auto wider=graph;wider.settings.radius=2.1;
+        QCOMPARE(discover(catalog,wider,graph.seed,nullptr,{},{},1,{},ContactPolicy::FiberReview).size(),size_t(3));
+        std::atomic_bool cancelled{true};
+        QVERIFY_EXCEPTION_THROWN(proposeEdit(catalog,prepared,proposals[0],false,normals,&cancelled,ContactPolicy::FiberReview),std::runtime_error);
+    }
+
+    void fiberReviewRefreshesLegacyContactsWithoutLosingDecisions(){
+        QTemporaryDir temp;const auto path=reviewQuarantineFixture(temp.path().toStdString());
+        auto document=reviewToJson(loadReview(path));
+        for(auto& fiber:document["fibers"])fiber.erase("contact_policy");
+        const auto restored=reviewFromJson(document);
+        QVERIFY(!restored.fibers.at("fiber:a").discovered);QVERIFY(!restored.fibers.at("fiber:b").discovered);
+        QVERIFY(restored.fibers.at("fiber:a").pending); // Manual keypoint retained.
+        QCOMPARE(reviewToJson(restored)["fibers"]["fiber:b"]["decisions"],document["fibers"]["fiber:b"]["decisions"]);
+        // Automatic pending fits are regenerated; accepted decisions stay intact.
+        auto automatic=loadReview(path);automatic.fibers.at("fiber:a").contactPolicyVersion=0;
+        for(auto& link:automatic.fibers.at("fiber:a").pending->links)link.keypoint=false;
+        const auto migrated=reviewFromJson(reviewToJson(automatic));
+        QVERIFY(!migrated.fibers.at("fiber:a").pending);QVERIFY(!migrated.fibers.at("fiber:a").discovered);
+        QCOMPARE(migrated.fibers.at("fiber:a").current,automatic.fibers.at("fiber:a").current);
+    }
+
+    void windingLayoutLoadsWithoutSourcesAndCannotRefit(){
+        QTemporaryDir temp;QVERIFY(temp.isValid());
+        const auto directory=std::filesystem::path(temp.path().toStdString());
+        const auto binary=directory/"layout.bin",manifest=directory/"layout.workspace.json";
+        auto n=plane("patch");
+        std::ofstream stream(binary,std::ios::binary);
+        for(size_t i=0;i<n->xyz.size();++i){
+            const std::array<double,5> values{n->xyz[i][0],n->xyz[i][1],n->xyz[i][2],n->initialUv[i][0]-400,n->initialUv[i][1]+7000};
+            for(double v:values){auto bits=std::bit_cast<uint64_t>(v);for(int b=0;b<8;++b)stream.put(char(bits>>(8*b)));}
+        }
+        stream.close();
+        auto settings=graphToJson(base()).at("settings");
+        nlohmann::json document={{"type","vc3d_winding_layout"},{"version",1},{"seed","patch"},
+            {"geometry_format","little_endian_float64_xyzuv"},{"geometry_file","layout.bin"},
+            {"geometry_bytes",std::filesystem::file_size(binary)},{"settings",settings},
+            {"layout",{{"read_only",true}}},
+            {"sources",nlohmann::json::array({{{"id","patch"},{"path","missing.tifxyz"},
+                {"fiber",false},{"rows",5},{"cols",5},{"byte_offset",0}}})}};
+        auto write=[&]{std::ofstream output(manifest);output<<document;};write();
+        auto result=loadSession(manifest);QVERIFY2(result.valid,result.message.c_str());
+        QCOMPARE(result.graph.nodes.at("patch").uv[0],cv::Vec2d(-400,7000));
+        QVERIFY(!result.graph.windingLayout.is_null());
+        QVERIFY_EXCEPTION_THROWN(fit(result.graph),std::runtime_error);
+        QVERIFY_EXCEPTION_THROWN(prepareGraph(result),std::runtime_error);
+        QVERIFY_EXCEPTION_THROWN(saveSession(result,directory/"saved.json"),std::runtime_error);
+        // The raster uses source XYZ without a surface-refinement solve.
+        const auto& grid=*result.surface->rawPointsPtr();
+        for(int y=0;y<grid.rows;++y)for(int x=0;x<grid.cols;++x)if(grid(y,x)[0]!=-1){
+            const auto uv=result.origin+cv::Vec2d(x*20.,y*20.);
+            QCOMPARE(grid(y,x)[0],float(uv[0]+500));QCOMPARE(grid(y,x)[1],float(uv[1]-6900));
+            QCOMPARE(grid(y,x)[2],100.f);
+        }
+        // All vertices exist, including around an explicitly unaccepted cell.
+        // The importer must preserve the cell mask instead of filling its hole.
+        document["version"]=2;
+        document["sources"][0]["quad_runs"]={{0,5},{6,10}};write();
+        auto masked=loadSession(manifest);QVERIFY2(masked.valid,masked.message.c_str());
+        QCOMPARE(masked.graph.nodes.at("patch").source->triangles.size(),size_t(30));
+        QVERIFY_EXCEPTION_THROWN(sourceLocation(*masked.graph.nodes.at("patch").source,{1.5,1.5}),std::runtime_error);
+        // A one-cell-wide strip still has faces and remains continuous.
+        document["sources"][0]["quad_runs"]={{0,1},{4,1},{8,1},{12,1}};write();
+        auto strip=loadSession(manifest);QVERIFY2(strip.valid,strip.message.c_str());
+        QCOMPARE(strip.graph.nodes.at("patch").source->triangles.size(),size_t(8));
+        document["sources"][0]["quad_runs"]={{0,17}};write();
+        QVERIFY_EXCEPTION_THROWN(loadSession(manifest),std::runtime_error);
+        document["sources"][0]["quad_runs"]={{0,5},{4,1}};write();
+        QVERIFY_EXCEPTION_THROWN(loadSession(manifest),std::runtime_error);
+        document["version"]=1;document["sources"][0].erase("quad_runs");
+        document["geometry_bytes"]=1;write();QVERIFY_EXCEPTION_THROWN(loadSession(manifest),std::runtime_error);
+        document["geometry_bytes"]=std::filesystem::file_size(binary);
+        document["geometry_file"]="../layout.bin";write();QVERIFY_EXCEPTION_THROWN(loadSession(manifest),std::runtime_error);
+        document["geometry_file"]="layout.bin";document["sources"][0]["byte_offset"]=40;write();
+        QVERIFY_EXCEPTION_THROWN(loadSession(manifest),std::runtime_error);
+    }
+    void fixedOverlapRetainsCoverageAndMeasuredPositions(){
+        auto graph=base();graph.settings.radius=1;graph.windingLayout={{"read_only",true}};
+        const auto baseline=renderPlacement(graph);QVERIFY(baseline.valid);
+        auto other=plane("b");
+        for(auto& xyz:other->xyz)xyz[2]+=3;
+        graph.nodes.emplace("b",Placement{other,other->initialUv});
+        const auto overlap=renderPlacement(graph);QVERIFY2(overlap.valid,overlap.message.c_str());
+        QCOMPARE(cv::norm(*baseline.surface->rawPointsPtr(),*overlap.surface->rawPointsPtr(),cv::NORM_INF),0.0);
+        QVERIFY(overlap.message.find("overlap samples resolved by source ownership")!=std::string::npos);
+        // Duplicate sources cannot change either the winner or its position.
+        auto duplicate=std::make_shared<Node>(*other);duplicate->id="c";
+        graph.nodes.emplace("c",Placement{duplicate,duplicate->initialUv});
+        const auto repeated=renderPlacement(graph);QVERIFY(repeated.valid);
+        QCOMPARE(cv::norm(*overlap.surface->rawPointsPtr(),*repeated.surface->rawPointsPtr(),cv::NORM_INF),0.0);
+    }
+    void fixedOverlapTransitionsDoNotBridgeUnrelatedSheets(){
+        auto graph=base();graph.settings.radius=1;graph.windingLayout={{"read_only",true}};
+        auto other=plane("b",40);
+        for(auto& xyz:other->xyz){xyz[0]+=40;xyz[2]+=3;}
+        graph.nodes.emplace("b",Placement{other,other->initialUv});
+        auto result=renderPlacement(graph);QVERIFY2(result.valid,result.message.c_str());
+        auto quads=[](const FitResult& result){
+            const auto& grid=*result.surface->rawPointsPtr();size_t count=0;
+            for(int y=0;y+1<grid.rows;++y)for(int x=0;x+1<grid.cols;++x)
+                count+=grid(y,x)[0]!=-1&&grid(y,x+1)[0]!=-1&&grid(y+1,x)[0]!=-1&&grid(y+1,x+1)[0]!=-1;
+            return count;
+        };
+        QCOMPARE(quads(result),size_t(24));
+        QVERIFY(result.message.find("0 discontinuous transition cells")!=std::string::npos);
+        auto far=std::make_shared<Node>(*other);for(auto& xyz:far->xyz)xyz[2]+=100;
+        graph.nodes.at("b").source=far;
+        result=renderPlacement(graph);QVERIFY2(result.valid,result.message.c_str());
+        QVERIFY(quads(result)>0&&quads(result)<24);
+        const auto& grid=*result.surface->rawPointsPtr();
+        for(const auto& xyz:grid)if(xyz[0]!=-1)QVERIFY(xyz[2]==100||xyz[2]==203);
+    }
+    void renderedPickingUsesTheVisibleOwnerAndRejectsGaps(){
+        auto graph=base();graph.windingLayout={{"read_only",true}};
+        auto large=plane("z");
+        for(auto& xyz:large->xyz){xyz[0]=100+(xyz[0]-100)*2;xyz[1]=100+(xyz[1]-100)*2;}
+        for(auto& uv:large->initialUv)uv*=2;
+        graph.nodes.emplace("z",Placement{large,large->initialUv});
+        const auto result=renderPlacement(graph);QVERIFY2(result.valid,result.message.c_str());
+        QCOMPARE(pick(graph,{55,55})->node,std::string("a"));
+        const auto visible=pickRendered(result,{55,55});QVERIFY(visible);
+        QCOMPARE(visible->node,std::string("z"));
+        QVERIFY(!pickRendered(result,{-100,-100}));
+        QVERIFY(!pickRendered(result,{100000,100000}));
+        QVERIFY(!pickRendered(result,{NAN,0}));
+        QVERIFY(pickRendered(result,{160,60}));
+    }
+    void selectedPatchBoundaryIncludesAllItsComponents(){
+        auto graph=base();auto a=std::make_shared<Node>(*graph.nodes.at("a").source);a->path="patches/shared";graph.nodes.at("a").source=a;
+        auto component=plane("another-component");component->path=a->path;graph.nodes.emplace(component->id,Placement{component,component->initialUv});
+        auto other=plane("other");other->path="patches/other";graph.nodes.emplace(other->id,Placement{other,other->initialUv});
+        QVERIFY(vc3d::constraint_graph::showBoundary("a",graph,false,"a"));
+        QVERIFY(vc3d::constraint_graph::showBoundary("another-component",graph,false,"a"));
+        QVERIFY(!vc3d::constraint_graph::showBoundary("other",graph,false,"a"));
+        QVERIFY(!vc3d::constraint_graph::showBoundary("a",graph,false));
+    }
+    void quarantineMovesWholePatchAndPersistsWithoutChangingGeometry(){
+        QTemporaryDir temp;const auto path=quarantineFixture(temp.path().toStdString());
+        const auto original=readFile(path),binary=readFile(path.parent_path()/"layout.bin");
+        const auto before=loadSession(path);QVERIFY(before.valid);
+        QCOMPARE(pickRendered(before,{30,30})->node,std::string("a:0"));
+        const auto result=quarantinePatches(before,path,{"a:0"});QVERIFY(result.valid);
+        QVERIFY(!result.graph.nodes.contains("a:0"));QVERIFY(!result.graph.nodes.contains("a:1"));
+        QCOMPARE(result.graph.nodes.size(),size_t(2));QCOMPARE(result.graph.seed,std::string("b:0"));
+        QCOMPARE(readFile(path.parent_path()/"layout.bin"),binary);
+        QVERIFY(!std::filesystem::exists(path.parent_path()/"patches/a"));
+        QCOMPARE(readFile(quarantineDirectory(path)/"a/marker.txt"),std::string("a"));
+        QVERIFY(!std::filesystem::exists(path.string()+".quarantine-lock"));
+        size_t backups=0;for(const auto& file:std::filesystem::directory_iterator(path.parent_path()))
+            if(file.path().filename().string().find("before-quarantine-")!=std::string::npos){++backups;QCOMPARE(readFile(file.path()),original);}
+        QCOMPARE(backups,size_t(1));
+        auto reopened=loadSession(path);QVERIFY(reopened.valid);
+        QCOMPARE(reopened.graph.nodes.size(),size_t(2));QCOMPARE(reopened.sessionRevision,result.sessionRevision);
+        QCOMPARE(pickRendered(reopened,{30,30})->node,std::string("b:0"));
+        QCOMPARE(cv::norm(*reopened.surface->rawPointsPtr(),*result.surface->rawPointsPtr(),cv::NORM_INF),0.0);
+        // The old snapshot cannot publish over this newer manifest.
+        QVERIFY_EXCEPTION_THROWN(quarantinePatches(before,path,{"b:0"}),std::runtime_error);
+        QVERIFY(std::filesystem::exists(path.parent_path()/"patches/b"));
+    }
+    void quarantineFailureRestoresEarlierMovesAndPreservesManifest(){
+        QTemporaryDir temp;const auto path=quarantineFixture(temp.path().toStdString());
+        const auto original=readFile(path);const auto before=loadSession(path);
+        QVERIFY_EXCEPTION_THROWN(quarantinePatches(before,path,{"a:0","b:0"},[&](const auto& progress){
+            if(progress.starts_with("Saving the workspace")) {
+                std::filesystem::create_directories(quarantineDirectory(path)/"b");
+                std::ofstream(quarantineDirectory(path)/"b/existing.txt")<<"keep";
+            }
+        }),std::runtime_error);
+        QCOMPARE(readFile(path),original);
+        QVERIFY(std::filesystem::exists(path.parent_path()/"patches/a/marker.txt"));
+        QVERIFY(std::filesystem::exists(path.parent_path()/"patches/b/marker.txt"));
+        QVERIFY(!std::filesystem::exists(quarantineDirectory(path)/"a"));
+        QCOMPARE(readFile(quarantineDirectory(path)/"b/existing.txt"),std::string("keep"));
+        QVERIFY(!std::filesystem::exists(path.string()+".quarantine-lock"));
+        QVERIFY_EXCEPTION_THROWN(quarantinePatches(before,path,{"a:0","b:0","c:0"}),std::runtime_error);
+        QCOMPARE(readFile(path),original);
+    }
     void progressReportsIterationsWithoutChangingTheFit(){
         auto graph=base();std::vector<std::string> messages;
         const auto reported=fit(graph,nullptr,[&](const auto& message){messages.push_back(message);});
@@ -67,6 +691,33 @@ private slots:
             p[1]=p[0];QVERIFY(!cost.Evaluate(p,actual,nullptr));
         }
     }
+    void reviewDirichletJacobianAndBarrier(){
+        for(double orientation:{1.,-1.})for(double scale:{.3,1.,4.}) {
+            const detail::ChartMetric metric{.05,-.017,.04,1.3,orientation};
+            detail::ReviewChartMetricCost cost(metric);detail::ChartMetricCost original(metric);
+            double p[3][2]={{3,7},{3+20*scale,7+2*scale},{8,7+orientation*30*scale}};
+            const double* blocks[3]={p[0],p[1],p[2]};double r[9],reference[8],jac[3][18];double* j[3]={jac[0],jac[1],jac[2]};
+            QVERIFY(cost.Evaluate(blocks,r,j));QVERIFY(original.Evaluate(blocks,reference,nullptr));
+            for(int k=0;k<8;++k)QVERIFY(std::abs(r[k]-reference[k])<1e-12);
+            for(int i=0;i<3;++i)for(int axis=0;axis<2;++axis){
+                const auto saved=p[i][axis];double plus[9],minus[9];
+                p[i][axis]=saved+1e-5;QVERIFY(cost.Evaluate(blocks,plus,nullptr));
+                p[i][axis]=saved-1e-5;QVERIFY(cost.Evaluate(blocks,minus,nullptr));p[i][axis]=saved;
+                for(int k=0;k<9;++k)QVERIFY(std::abs((plus[k]-minus[k])/2e-5-jac[i][2*k+axis])<1e-6*(1+std::abs(jac[i][2*k+axis])));
+            }
+            j[1]=nullptr;QVERIFY(cost.Evaluate(blocks,r,j));
+            std::swap(blocks[1],blocks[2]);QVERIFY(!cost.Evaluate(blocks,r,j));
+            blocks[1]=blocks[0];QVERIFY(!cost.Evaluate(blocks,r,nullptr));
+        }
+        detail::ReviewChartMetricCost identity({1,0,1,2,1});
+        double a[2]={0,0},b[2]={1,0},c[2]={0,1};const double* p[3]={a,b,c};double r[9];
+        QVERIFY(identity.Evaluate(p,r,nullptr));QCOMPARE(r[8],0.);
+        QCOMPARE(identity.distortion(p),1.);
+        b[0]=5;QCOMPARE(identity.distortion(p),5.);
+        b[0]=.2;QVERIFY(std::abs(identity.distortion(p)-5)<1e-12);
+        b[0]=0;QVERIFY(!std::isfinite(identity.distortion(p)));
+    }
+
     void analyticMatchJacobian(){
         detail::MatchCost cost({.25,.75,-1},1.5);
         double a[2]={2,3},b[2]={4,7},c[2]={5,9},residuals[2],jac[3][4];
@@ -897,6 +1548,30 @@ private slots:
         QCOMPARE(graphToJson(graph).dump(),before);
         QVERIFY_EXCEPTION_THROWN(discover(catalog,graph,graph.seed,nullptr,{},{},0),std::invalid_argument);
         QVERIFY_EXCEPTION_THROWN(discover(catalog,graph,graph.seed,nullptr,{},{},-1),std::invalid_argument);
+        // Exclusions must bypass both cached contacts and source loading,
+        // including when a previously indexed patch has been moved away.
+        const auto freshCatalog=loadCatalog(settings);
+        std::filesystem::rename(root/"patches/one",root/"quarantined-one");
+        for(const auto* c:{&catalog,&freshCatalog})
+            QVERIFY(discover(*c,graph,graph.seed,nullptr,{},{},1,{"patch:one"}).empty());
+    }
+    void sourceChartGroupsDoNotRequireAFusedRaster(){
+        auto graph=base();
+        for(const auto& [id,offset]:std::vector<std::pair<std::string,double>>{{"b",100},{"c",200}}) {
+            auto node=plane(id,offset);graph.nodes.emplace(id,Placement{node,node->initialUv});
+        }
+        for(const auto& [a,b]:std::vector<std::pair<std::string,std::string>>{{"a","b"},{"b","c"}})
+            for(const auto& xy:std::vector<cv::Vec2d>{{0,0},{4,0},{0,4},{4,4}})
+                graph.links.push_back({{a,xy},{b,xy}});
+        const auto before=graphToJson(graph).dump();
+        for(bool rigid:{false,true}) {
+            const auto result=fitSourceCharts(graph,nullptr,{},rigid);
+            QVERIFY2(result.valid,result.message.c_str());QVERIFY(!result.surface);
+            for(const auto& link:graph.links)
+                QVERIFY(cv::norm(placedLocation(result.graph,link.a)-placedLocation(result.graph,link.b))<1e-3);
+            for(const auto& [id,p]:graph.nodes)QVERIFY(result.graph.nodes.at(id).source==p.source);
+        }
+        QCOMPARE(graphToJson(graph).dump(),before);
     }
     void discoveryAndComponents(){
         QTemporaryDir dir;auto root=std::filesystem::path(dir.path().toStdString());std::filesystem::create_directory(root/"fibers");std::filesystem::create_directory(root/"patches");

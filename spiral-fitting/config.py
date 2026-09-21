@@ -45,6 +45,7 @@ _NULL_TYPES = {
 # session can re-derive their effect, so they demand a full rebuild.
 _PREPARED_INPUT_FIELDS = {
     "patch_erode_patches",
+    "patch_keep_largest_component",
     "patch_uuid_filter_regex",
     "dense_spacing_mode",
 }
@@ -679,6 +680,11 @@ class Config:
         # probabilities: 0 = uniform, 1 = proportional to area.
         self.patch_sampling_area_exponent = 0.5
         self.patch_erode_patches = 1
+        # After erosion, keep only a patch's largest 4-connected component of
+        # valid quads: erosion (or the producer) can leave islands, and a
+        # patch made of islands has no quad path between them, so within-patch
+        # winding transport and projection treat it as one surface wrongly.
+        self.patch_keep_largest_component = True
         # Rebuild-scoped supervision-source switches. A false value is a hard
         # participation gate: the source is not loaded, prepared, sampled, or
         # used by losses. Loss weights and sample counts remain unchanged so
@@ -975,6 +981,9 @@ class Config:
                 if key not in run_owned
             }
             for path in (Path(__file__).parent / "configs").glob("*.json")
+            # The winding diagnostic shares this directory but has its own
+            # schema. Continue validating every actual training preset.
+            if path.name != "inconsistent_wind_config.json"
         }
         return {
             "defaults": defaults,

@@ -4,6 +4,7 @@ namespace vc::constraints {
 namespace {
 std::shared_ptr<const PreparedGraph> prepareGraphImpl(const FitResult& result,const GraphEdit* edit,const std::atomic_bool* cancel){
     detail::cancelled(cancel);
+    if(!result.graph.windingLayout.is_null())throw std::runtime_error("Imported winding layouts cannot be edited");
     if(!result.valid||!result.surface)throw std::runtime_error("Only a validated graph can be prepared for attachment");
     auto prepared=std::make_shared<PreparedGraph>();prepared->accepted=result;
     const auto& graph=result.graph;

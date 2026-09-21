@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 #include "vc/constraints/SharedVector.hpp"
@@ -94,9 +95,12 @@ struct Node {
     bool fiber = false;
     char direction = '?';
     int rows = 0, cols = 0;
+    int stripGeneration = 0; // zero denotes legacy straight fiber ribbons
     std::vector<cv::Vec3d> xyz;
     std::vector<cv::Vec2d> initialUv;
     std::vector<cv::Vec3i> triangles;
+    // Empty for implicit grids; otherwise one byte per source cell.
+    std::vector<unsigned char> quadMask;
     std::vector<double> lineArclength, columnArclength;
     std::vector<cv::Vec3d> line;
     std::vector<size_t> controls;
@@ -106,6 +110,8 @@ struct Placement {
     SharedVector<cv::Vec2d> uv;
 };
 struct Graph {
+    // Nonempty only for immutable theta/z display imports, never a fitted chart.
+    nlohmann::json windingLayout;
     Settings settings;
     std::string seed;
     std::map<std::string, Placement> nodes;
@@ -118,9 +124,16 @@ struct Candidate {
     std::vector<Link> contacts;
 };
 using DiscoveryBatch = std::function<void(std::vector<Candidate>)>;
+struct RenderOwnership {
+    cv::Mat_<int> nodes;
+    std::vector<std::string> sourceIds;
+};
 struct FitResult {
     Graph graph;
     std::shared_ptr<QuadSurface> surface;
+    // Provenance of fixed-layout raster samples, retained for exact picking.
+    std::shared_ptr<const RenderOwnership> ownership;
+    std::string sessionRevision;
     cv::Vec2d origin{0, 0};
     double correspondenceRms = 0;
     double stretchP95 = 1;
@@ -142,6 +155,10 @@ struct GraphEdit {
     std::map<std::string,Placement> addedNodes;
     std::vector<Link> addedLinks;
     std::vector<size_t> removedLinks;
+    // Transient fiber-review constraints in the accepted fiber's chart. Rebuilt
+    // from accepted decisions, never embedded in a two-node association.
+    struct FixedTarget { Location point; cv::Vec2d uv; };
+    std::vector<FixedTarget> fixedTargets;
 };
 std::shared_ptr<const PreparedGraph> prepareGraph(const FitResult&, const std::atomic_bool* cancel = nullptr);
 std::shared_ptr<const PreparedGraph> prepareGraph(const FitResult&, const GraphEdit&, const std::atomic_bool* cancel = nullptr);
@@ -152,9 +169,18 @@ Graph materialize(const GraphEdit&);
 GraphEdit graphEdit(std::shared_ptr<const PreparedGraph>, const Graph&);
 void addKeypoint(GraphEdit&, Link);
 void removeKeypoint(GraphEdit&, const Link&);
+// Fiber review uses one proposal per patch with at least two dense contacts
+// within radius, then fits all dense contacts within twice radius.
+enum class ContactPolicy { LocalPlacement, FiberReview };
 GraphEdit proposeEdit(const Catalog&, std::shared_ptr<const PreparedGraph>, const Candidate&, bool wholeComponent,
-                      const lasagna::NormalSampler&, const std::atomic_bool* cancel = nullptr);
-FitResult fitEdit(const GraphEdit&, const std::atomic_bool* cancel = nullptr, Progress = {});
+                      const lasagna::NormalSampler&, const std::atomic_bool* cancel = nullptr,
+                      ContactPolicy = ContactPolicy::LocalPlacement);
+enum class FitPolicy { Joint, FixedReference, FiberReview };
+// FiberReview uses robust automatic contacts and validates an independent
+// patch layer. Its surface contains that layer; graph retains the fixed fiber
+// and proposal association. Fixed targets are transient review inputs only.
+FitResult fitEdit(const GraphEdit&, const std::atomic_bool* cancel = nullptr, Progress = {},
+                  FitPolicy = FitPolicy::Joint);
 FitResult renderProposalSources(const GraphEdit&, const std::string& selected,
                                 const std::atomic_bool* cancel = nullptr);
 
@@ -164,16 +190,26 @@ Catalog loadCatalog(const Settings&, const std::atomic_bool* cancel = nullptr, P
 // closure needs review or a chart cut; it is not proof of an annotation error.
 CycleAudit auditFiberCycles(const Catalog&, const std::vector<cv::Vec3d>& centers,
                            double minimumRadius, const std::atomic_bool* cancel = nullptr);
-std::shared_ptr<const Node> makeFiberNode(const Fiber&, const Settings&, const lasagna::NormalSampler&);
+std::shared_ptr<const Node> makeFiberNode(const Fiber&, const Settings&, const lasagna::NormalSampler&, const std::atomic_bool* cancel = nullptr);
+// Upgrade a saved graph transactionally; patch placements and fiber chart
+// coordinates are preserved by interpolation on the old source triangles.
+bool regenerateFiberStrips(Graph&, const lasagna::NormalSampler&, const std::atomic_bool* cancel = nullptr);
 std::shared_ptr<const Node> loadPatchNode(const PatchEntry&, const Settings&);
 Graph seedGraph(const Catalog&, size_t component, const Settings&, const lasagna::NormalSampler&,
                 const std::atomic_bool* cancel = nullptr);
 // Search every lineStride-th dense point, plus both endpoints. Use 1 for a full scan.
 std::vector<Candidate> discover(const Catalog&, const Graph&, const std::string& selectedNode,
-                                const std::atomic_bool* cancel = nullptr, Progress = {}, DiscoveryBatch = {}, int lineStride = 4);
+                                const std::atomic_bool* cancel = nullptr, Progress = {}, DiscoveryBatch = {}, int lineStride = 4,
+                                const std::set<std::string>& excludedPatches = {},
+                                ContactPolicy = ContactPolicy::LocalPlacement);
 Graph propose(const Catalog&, const Graph&, const Candidate&, bool wholeComponent,
               const lasagna::NormalSampler&, const std::atomic_bool* cancel = nullptr);
 FitResult fit(Graph, const std::atomic_bool* cancel = nullptr, Progress = {});
+// Align source charts without creating a fused raster. Used by initialization
+// and group-registration experiments; valid does not imply renderability.
+// rigidOnly estimates one planar pose per source and preserves its chart shape.
+FitResult fitSourceCharts(Graph, const std::atomic_bool* cancel = nullptr,
+                          Progress = {}, bool rigidOnly = false);
 // Fit an edit against a committed surface, preserving distant geometry. Expand
 // the free region while its boundary remains strained; fall back to fit() for
 // broad edits or changed global settings. Residuals and tolerances are shared.
@@ -186,7 +222,7 @@ FitResult renderProposalSources(const Graph& draft, const Graph& committed, cons
                                 const std::atomic_bool* cancel = nullptr);
 // Temporary display of the initial attachment, without shared XYZ optimization.
 // Never commit this result: fit() must still validate the joint solution.
-FitResult renderPlacement(Graph, const std::atomic_bool* cancel = nullptr);
+FitResult renderPlacement(Graph, const std::atomic_bool* cancel = nullptr, Progress = {});
 // Inspect immutable fiber/patch XYZ independently at the fitted chart positions.
 // Display only: no shared-surface refinement and no change to the accepted fit.
 FitResult renderSourceLayer(const Graph&, bool fibers, const std::atomic_bool* cancel = nullptr);
@@ -199,9 +235,19 @@ Location fiberLineLocation(const Node&, size_t lineIndex);
 
 // Session embeds immutable loaded geometry so a preview is never reconstructed
 // against silently changed input files. Catalog paths remain for further growth.
+nlohmann::json settingsToJson(const Settings&);
+Settings settingsFromJson(const nlohmann::json&);
+nlohmann::json locationToJson(const Location&);
+Location locationFromJson(const nlohmann::json&);
 nlohmann::json graphToJson(const Graph&);
 Graph graphFromJson(const nlohmann::json&);
 void saveSession(const FitResult&, const std::filesystem::path&);
 FitResult loadSession(const std::filesystem::path&);
+std::optional<Location> pickRendered(const FitResult&, const cv::Vec2d& graphUv);
+std::filesystem::path quarantineDirectory(const std::filesystem::path& workspace);
+// Moves complete source folders, excludes all their components, and publishes
+// the saved winding workspace only after the replacement surface is valid.
+FitResult quarantinePatches(const FitResult&, const std::filesystem::path& workspace,
+                            const std::vector<std::string>& sourceIds, const Progress& = {});
 void exportSurface(const FitResult&, const std::filesystem::path&);
 } // namespace vc::constraints

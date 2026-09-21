@@ -1,5 +1,6 @@
 #pragma once
 #include <QColor>
+#include <algorithm>
 #include <map>
 #include <string>
 
@@ -7,6 +8,9 @@
 // not recolor patches already on screen. Golden-angle hues separate neighbors.
 class ConstraintGraphPatchColors {
 public:
+    QColor contextTint(const std::string& id,int percent=4) {
+        auto tint=color(id);tint.setAlpha((std::clamp(percent,0,100)*255+50)/100);return tint;
+    }
     QColor color(const std::string& id) {
         if(auto it=_colors.find(id);it!=_colors.end())return it->second;
         const auto ordinal=_colors.size();

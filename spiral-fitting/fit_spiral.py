@@ -139,6 +139,7 @@ from sdt_losses import (
     phase_bundle_component_weights,
 )
 from spiral_helpers import (
+    keep_largest_patch_component,
     REFERENCE_Z_RANGE_NUM_SLICES,
     erode_patch_valid_region,
     load_patch_payload_chunk,
@@ -1663,6 +1664,7 @@ class FitContext:
             'FIT_SPIRAL_PATCH_LOAD_IO_THREADS', 4)))
         chunk_size = 256
         erode_cells_default = self.config['patch_erode_patches']
+        keep_largest = bool(self.config.get('patch_keep_largest_component', True))
 
         results_by_entry = {}
         loaded = 0
@@ -1688,7 +1690,7 @@ class FitContext:
             for chunk in chunks:
                 consume(load_patch_payload_chunk(
                     path, chunk, self.z_begin, self.z_end,
-                    erode_cells_default, io_threads))
+                    erode_cells_default, io_threads, keep_largest))
         else:
             # spawn/forkserver rather than fork: loader workers only touch
             # CPU code, and forking after torch/OpenMP threads exist is not
@@ -1705,7 +1707,7 @@ class FitContext:
                     executor.submit(
                         load_patch_payload_chunk, path, chunk,
                         self.z_begin, self.z_end,
-                        erode_cells_default, io_threads)
+                        erode_cells_default, io_threads, keep_largest)
                     for chunk in chunks]
                 for future in concurrent.futures.as_completed(futures):
                     consume(future.result())
@@ -2205,12 +2207,17 @@ class FitContext:
                         pass
             raise RuntimeError(message) from exc
 
-    def load_host_inputs(self, *, point_linker=None, fiber_min_point_spacing=None):
+    def load_host_inputs(self, *, point_linker=None, fiber_min_point_spacing=None,
+                         training_caches=True):
         """Load and prepare every host-side input for a fit.
 
         Analysis callers may supply ``point_linker(patches, collections,
         fibers)`` to attach points before classification, and override fiber
         loading's spacing without changing the training configuration.
+        ``training_caches=False`` stops after the patches and point
+        collections are loaded, linked and classified: the patch sampling
+        caches, atlases, trusted-geometry index, tracks and DT targets that
+        only a fit consumes are skipped (their attributes are None / empty).
 
         Seeds the host RNG streams, then loads patches, point collections,
         fibers, tracks, and the outer shell; links and classifies PCLs;
@@ -2392,6 +2399,33 @@ class FitContext:
             **({'point_linker': point_linker} if point_linker is not None else {}))
         unattached_pcl_strips = self.unattached_pcl_strips
         link_distance_tolerance = self.link_distance_tolerance
+
+        if not training_caches:
+            self.umbilicus = umbilicus
+            self.scroll_zarr = scroll_zarr
+            self.fiber_direction_samples = fiber_direction_samples
+            self.filter_tracks_by_shell = filter_tracks_by_shell
+            self.shell_patch = shell_patch
+            self.shell_envelope = None
+            self.verified_patches = verified_patches
+            self.unverified_patches = unverified_patches
+            self.next_id = next_id
+            self.link_distance_tolerance = link_distance_tolerance
+            self.verified_patches_list = list(verified_patches.values())
+            self.num_verified_patches = len(verified_patches)
+            self.unverified_patches_list = list(unverified_patches.values())
+            for name in ('dense_spacing_mode', 'phase_mode', 'winding_model_mode',
+                         'dense_normals_enabled', 'grad_mag_spacing_enabled',
+                         'track_sampling_config', 'tracks', 'track_families',
+                         'track_source_ids', 'track_crossing_cache', 'track_graph',
+                         'track_reload_source', 'track_reload_families',
+                         'track_reload_source_ids', 'patch_sampling_probabilities',
+                         'patch_atlas', 'using_tracks', 'trusted_geometry_tree',
+                         'unverified_patch_sampling_probabilities',
+                         'unverified_patch_atlas', 'influence_anchor_geometry',
+                         'dt_target_whole_object'):
+                setattr(self, name, None)
+            return
 
         # ==========================================================================
         # dense-spacing mode, shell envelope, and tracks
@@ -4780,6 +4814,8 @@ class FitContext:
                         patch._source_path = os.path.abspath(path)
                         cells = patch.erosion_cells(self.config['patch_erode_patches'])
                         valid = cells <= 0 or erode_patch_valid_region(patch, cells)
+                        if valid and self.config.get('patch_keep_largest_component', True):
+                            valid = keep_largest_patch_component(patch)
                         intersects = patch_intersects_z_roi(patch, self.z_begin, self.z_end)
                         if not valid or not intersects:
                             reason = 'has no valid quads' if not valid else 'is outside the fitted z range'
