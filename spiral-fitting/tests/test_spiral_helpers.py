@@ -133,6 +133,23 @@ class FiberPointCollectionTests(unittest.TestCase):
             points = [point["p"] for point in collection["points"].values()]
             np.testing.assert_array_equal(points, [[1, 2, 3], [5, 6, 7]])
 
+    def test_ignores_adjacent_links_unsupported_by_spiral_fitting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write_fiber(temporary, {
+                "control_points": [[4, 8, 12], [20, 24, 28]],
+                "line_points": [[4, 8, 12], [20, 24, 28]],
+                "adjacent_branches": [{
+                    "branch_file": "peer.json",
+                    "control_point_index": 0,
+                    "branch_control_point_index": 1,
+                }],
+            })
+
+            collection = load_fiber_point_collection(
+                path, collection_id=7, min_point_spacing=0)
+
+            self.assertEqual(collection["branches"], [])
+
     def test_declared_coordinate_domain_overrides_legacy_scale(self):
         for shape, expected_scale in (([101, 201, 301], 1),
                                       ([100, 200, 300], 1),

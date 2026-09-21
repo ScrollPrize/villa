@@ -293,7 +293,38 @@ struct LinkRecord {
     int ib = -1;
     double turnErr = 0.0;
     bool pending = false;
+    bool adjacent = false;
+    // Any ref of the deduped pair said adjacent / said explicitly ordinary;
+    // both at once is a disagreement between the two files.
+    bool anyAdjacent = false;
+    bool anyExplicitOrdinary = false;
+    bool disagrees() const { return anyAdjacent && anyExplicitOrdinary; }
 };
+
+// The winding gap an adjacent link asserts between its two fibers, W_b - W_a:
+// the V fiber sits one winding inside the H fiber. Anything but an H-V pair
+// has no defined inside (0; see adjacentUnpaired).
+int adjacentWindingOffset(bool adjacent, char hvTagA, char hvTagB)
+{
+    if (!adjacent) {
+        return 0;
+    }
+    if (hvTagA == 'H' && hvTagB == 'V') {
+        return -1;
+    }
+    if (hvTagA == 'V' && hvTagB == 'H') {
+        return 1;
+    }
+    return 0;
+}
+
+// An adjacent link whose fibers are not one H and one V: an annotation
+// error (a tag changed, or a fiber is not classified yet), flagged on the
+// map and kept out of the solve.
+bool adjacentUnpaired(bool adjacent, char hvTagA, char hvTagB)
+{
+    return adjacent && adjacentWindingOffset(true, hvTagA, hvTagB) == 0;
+}
 
 struct HeapEntry {
     double frac = 0.0;
@@ -399,11 +430,17 @@ std::vector<LinkRecord> collectValidLinks(
                 seen.emplace(here < there ? std::make_pair(here, there)
                                           : std::make_pair(there, here),
                              links.size());
+            const bool explicitOrdinary = !link.adjacent && link.adjacentExplicit;
             if (!inserted.second) {
-                links[inserted.first->second].pending |= link.pending;
+                LinkRecord& seen = links[inserted.first->second];
+                seen.pending |= link.pending;
+                seen.adjacent |= link.adjacent;
+                seen.anyAdjacent |= link.adjacent;
+                seen.anyExplicitOrdinary |= explicitOrdinary;
                 continue;
             }
-            links.push_back(LinkRecord{member, ia, other, ib, 0.0, link.pending});
+            links.push_back(LinkRecord{member, ia, other, ib, 0.0, link.pending, link.adjacent,
+                                       link.adjacent, explicitOrdinary});
         }
     }
     std::sort(links.begin(), links.end(),
@@ -923,7 +960,12 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
                                .controlPoints[static_cast<std::size_t>(link.ib)];
             placedLink.turnErr = link.turnErr;
             placedLink.pending = link.pending;
-            placedLink.suspect = link.turnErr > params.suspectTurns;
+            placedLink.adjacent = link.adjacent;
+            placedLink.adjacentUnpaired = adjacentUnpaired(
+                link.adjacent, ordered[link.a]->hvTag, ordered[link.b]->hvTag);
+            placedLink.adjacentDisagrees = link.disagrees();
+            placedLink.suspect = link.turnErr > params.suspectTurns ||
+                                 placedLink.adjacentUnpaired || placedLink.adjacentDisagrees;
             if (placedLink.suspect) {
                 ++result.suspectLinkCount;
             }
@@ -1234,13 +1276,19 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     std::vector<winding::LinkInput> linkInputs;
     linkInputs.reserve(allLinks.size());
     for (const LinkRecord& link : allLinks) {
+        const char tagA = ordered[link.a]->hvTag;
+        const char tagB = ordered[link.b]->hvTag;
         linkInputs.push_back(winding::LinkInput{
             link.a,
             prepared[link.a].controlLineIndex[static_cast<std::size_t>(link.ia)] -
                 domainBegin[link.a],
             link.b,
             prepared[link.b].controlLineIndex[static_cast<std::size_t>(link.ib)] -
-                domainBegin[link.b]});
+                domainBegin[link.b],
+            adjacentWindingOffset(link.adjacent, tagA, tagB),
+            // An unpaired or self-contradicting adjacent link is an error,
+            // not evidence.
+            adjacentUnpaired(link.adjacent, tagA, tagB) || link.disagrees()});
     }
 
     winding::SolverParams solverParams = params.solver;
@@ -1293,6 +1341,12 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
             }
         }
         for (const LinkRecord& link : allLinks) {
+            if (link.adjacent) {
+                // An adjacent link puts the V fiber a winding INSIDE the H
+                // fiber; a kollesis seam is a same-winding contact at a
+                // tagged end. It is not the evidence this reads.
+                continue;
+            }
             std::size_t h = link.a;
             int ih = link.ia;
             std::size_t v = link.b;
@@ -1651,12 +1705,18 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
             geometry[link.b].controlPoints[static_cast<std::size_t>(link.ib)];
         placedLink.turnErr = solve.linkTurnErrors[l];
         placedLink.pending = link.pending;
+        placedLink.adjacent = link.adjacent;
+        placedLink.adjacentUnpaired =
+            adjacentUnpaired(link.adjacent, ordered[link.a]->hvTag, ordered[link.b]->hvTag);
+        placedLink.adjacentDisagrees = link.disagrees();
         // A link the repair had to drop is winding-suspect whatever its
         // residual now reads: the map placed its endpoints against it. The
         // boundary is inclusive because a residual AT the threshold already
-        // solves with zero confidence.
+        // solves with zero confidence. An unpaired adjacent link never
+        // constrained (its turn error is unset) and is suspect as an error.
         placedLink.suspect = placedLink.turnErr >= params.suspectTurns ||
-                             droppedLinks.count(l) != 0;
+                             droppedLinks.count(l) != 0 || placedLink.adjacentUnpaired ||
+                             placedLink.adjacentDisagrees;
         if (placedLink.suspect) {
             ++result.suspectLinkCount;
         }
@@ -1943,6 +2003,8 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
             hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(
                                 link.branchControlPointIndex)));
             hashU64(digest, link.pending ? 1 : 0);
+            hashU64(digest, link.adjacent ? 1 : 0);
+            hashU64(digest, link.adjacentExplicit ? 1 : 0);
         }
     }
     hashDouble(digest, params.suspectTurns);
@@ -2058,6 +2120,9 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         hashDouble(digest, link.turnErr);
         hashU64(digest, link.suspect ? 1 : 0);
         hashU64(digest, link.pending ? 1 : 0);
+        hashU64(digest, link.adjacent ? 1 : 0);
+        hashU64(digest, link.adjacentUnpaired ? 1 : 0);
+        hashU64(digest, link.adjacentDisagrees ? 1 : 0);
     }
     hashU64(digest, result.windings.size());
     for (const WindingMark& mark : result.windings) {
