@@ -676,7 +676,10 @@ def run(workload, *, devices='0', time_limit_seconds=None):
             optimization_mode='native_fiber_trace3d', evaluation_direction='forward', benchmark_provenance=item)
         for key in ('vc_open_data_coordinate_space','vc_open_data_source_original_resolution'):
             if key in original: annotation[key]=original[key]
-        path=root/'fibers'/f'{i:03d}_{c["id"]}.json';atomic_write(path,annotation)
+        path=root/'fibers'/f'{i:03d}_{c["id"]}.json'
+        # Per-case annotations are regenerable.  Avoid a journal fsync for
+        # every tiny file; the final manifest below is the durable commit.
+        _write_json_ephemeral(path, annotation)
         exported.append(dict(path=str(path),sha256=sha256_file(path),length_base_voxels=hi-lo,
                              length_mm=(hi-lo)*c['voxel_um']/1000,**item))
     atomic_write(root/'manifest.json',dict(version=1,completed=len(exported)==total_cases,case_count=len(exported),
