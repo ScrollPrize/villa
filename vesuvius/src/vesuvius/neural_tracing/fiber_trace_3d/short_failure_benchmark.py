@@ -586,9 +586,12 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                     # candidate/direction.  The search still consumes results
                     # in order, but does not have to stop the native replay
                     # after a handful of 100-voxel steps.
-                    ahead = max(1,min(8,(worker_budget*4)//max(1,len(entries))-1))
+                    # For the resumed tail, queue the complete feasible
+                    # distance horizon so native replay can run all trials in
+                    # one pass; advance_search still consumes them ascending.
+                    ahead = max(1,min(64,(worker_budget*32)//max(1,len(entries))-1))
                     requests = []
-                    batch_limit = max(worker_budget*4, int(settings.get('candidate_batch', 512)))
+                    batch_limit = max(worker_budget*32, int(settings.get('candidate_batch', 4096)))
                     used = 0
                     for c,d,n in entries:
                         if any(same_location(c,x['candidate']) for x in selected):
