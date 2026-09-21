@@ -32,7 +32,12 @@ def _write_json_ephemeral(path, value):
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, separators=(',', ':'), default=str))
+    # Keep the no-fsync fast path, but never expose a partially-written JSON
+    # file to the coordinator.  The scheduler may inspect a trial immediately
+    # after a worker publishes it, so direct writes can race with json.loads().
+    tmp = path.with_name(f'.{path.name}.tmp-{os.getpid()}-{time.time_ns()}')
+    tmp.write_text(json.dumps(value, separators=(',', ':'), default=str))
+    os.replace(tmp, path)
 
 
 def merge_failure_intervals(intervals, merge_distance=PROTOCOL['dedup_distance']):
@@ -472,7 +477,14 @@ def run(workload, *, devices='0', time_limit_seconds=None):
 
     def result(c,d,n):
         path = root/'trials'/f"{c['id']}_{d}_{n}.json"
-        return json.loads(path.read_text()) if path.exists() else None
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            # A pre-fix run could have left a truncated ephemeral artifact.
+            # Treat it as a cache miss; the next batch will regenerate it.
+            return None
 
     selected = state['selected']
     device_ids = str(devices).split(',')
