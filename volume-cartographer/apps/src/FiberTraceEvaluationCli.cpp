@@ -221,6 +221,22 @@ struct Case {
     std::vector<std::vector<cv::Vec3d>> contrastChoices;
 };
 
+// Global failure-search trials are initially only compact interval
+// descriptors.  Materialising every trial polyline while parsing the config
+// made a large worklist effectively single-threaded before the evaluator's
+// worker pool could start.  Keep the shared source geometry here and slice the
+// individual intervals in a bounded native preparation pool below.
+struct DeferredGlobalTrial {
+    size_t source = 0;
+    bool reverse = false;
+    std::filesystem::path fiberPath;
+    std::shared_ptr<std::vector<cv::Vec3d>> full;
+    std::shared_ptr<std::vector<double>> arc;
+    double lo = 0.0;
+    double hi = 0.0;
+    Json provenance;
+};
+
 std::vector<cv::Vec3d> fiberLinePoints(const Json& annotation,
                                        const std::filesystem::path& path)
 {
@@ -286,9 +302,15 @@ std::vector<cv::Vec3d> sliceFiberLine(const std::vector<cv::Vec3d>& input,
         const double d = arc[i] - arc[i-1];
         return d > 0.0 ? input[i-1] + (input[i]-input[i-1]) * ((s-arc[i-1])/d) : input[i];
     };
-    std::vector<cv::Vec3d> out{at(lo)};
-    for (size_t i = 1; i + 1 < input.size(); ++i)
-        if (arc[i] > lo && arc[i] < hi) out.push_back(input[i]);
+    const auto first = std::upper_bound(arc.begin(), arc.end(), lo);
+    const auto last = std::lower_bound(arc.begin(), arc.end(), hi);
+    const size_t firstIndex = size_t(first - arc.begin());
+    const size_t lastIndex = size_t(last - arc.begin());
+    std::vector<cv::Vec3d> out;
+    out.reserve((lastIndex > firstIndex ? lastIndex - firstIndex : 0) + 2);
+    out.push_back(at(lo));
+    for (size_t i = firstIndex; i < lastIndex && i < input.size(); ++i)
+        out.push_back(input[i]);
     out.push_back(at(hi));
     return out;
 }
@@ -893,6 +915,10 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         if (!fiberIndex) throw std::invalid_argument("source has no selected fibers: " + source.id);
         sources.push_back(std::move(source));
     }
+    const int requestedWorkers = config.value("workers", 0);
+    if (requestedWorkers < 0) throw std::invalid_argument("workers must be nonnegative");
+    std::vector<DeferredGlobalTrial> deferredTrials;
+
     // Optional global trial worklist.  The Python extractor can submit every
     // distance for every candidate in one replay invocation.  Native workers
     // then execute the fixed list continuously; ordering/cancellation is
@@ -901,8 +927,8 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         const auto& trials = config.at("failure_search_trials");
         if (!trials.is_array()) throw std::invalid_argument("failure_search_trials must be an array");
         std::unordered_map<std::string, size_t> sourceIndex;
-        std::unordered_map<std::string, std::vector<cv::Vec3d>> trialFiberCache;
-        std::unordered_map<std::string, std::vector<double>> trialArcCache;
+        std::unordered_map<std::string, std::shared_ptr<std::vector<cv::Vec3d>>> trialFiberCache;
+        std::unordered_map<std::string, std::shared_ptr<std::vector<double>>> trialArcCache;
         for (size_t i = 0; i < sources.size(); ++i) sourceIndex.emplace(sources[i].id, i);
         if (config.value("failure_search_trials_only", false)) cases.clear();
         for (const auto& trial : trials) {
@@ -917,31 +943,67 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             const auto cacheKey = path.string();
             auto cacheIt = trialFiberCache.find(cacheKey);
             if (cacheIt == trialFiberCache.end()) {
-                auto full = fiberLinePoints(readJson(path), path);
-                std::vector<double> arc(full.size(), 0.0);
-                for (size_t i = 1; i < full.size(); ++i) arc[i] = arc[i-1] + cv::norm(full[i]-full[i-1]);
+                auto full = std::make_shared<std::vector<cv::Vec3d>>(fiberLinePoints(readJson(path), path));
+                auto arc = std::make_shared<std::vector<double>>(full->size(), 0.0);
+                for (size_t i = 1; i < full->size(); ++i)
+                    (*arc)[i] = (*arc)[i-1] + cv::norm((*full)[i]-(*full)[i-1]);
                 cacheIt = trialFiberCache.emplace(cacheKey, std::move(full)).first;
                 trialArcCache.emplace(cacheKey, std::move(arc));
             }
-            const auto& full = cacheIt->second;
-            const auto& arc = trialArcCache.at(cacheKey);
             const double distance = trial.at("distance").get<double>();
             const double lo = trial.value("lo", 0.0);
             const double hi = trial.value("hi", 0.0);
             if (!(hi > lo)) throw std::invalid_argument("trial requires lo < hi");
-            auto points = sliceFiberLine(full, arc, lo, hi);
-            if (reverse) std::reverse(points.begin(), points.end());
             Json provenance = trial;
             provenance["global_trial"] = true;
             provenance["candidate_id"] = trial.at("candidate_id");
             provenance["target_distance_base"] = distance;
             provenance["fiber_path"] = path;
-            cases.push_back({sourceIt->second, cases.size(), reverse, path, std::move(points),
-                hi-lo, 0, std::move(provenance), {}});
+            deferredTrials.push_back({sourceIt->second, reverse, path,
+                cacheIt->second, trialArcCache.at(cacheKey), lo, hi,
+                std::move(provenance)});
         }
     }
-    const int requestedWorkers = config.value("workers", 0);
-    if (requestedWorkers < 0) throw std::invalid_argument("workers must be nonnegative");
+
+    // Slice all global trials concurrently before starting tracing.  The
+    // source JSON and arc geometry are shared once per path; only the compact
+    // interval copy is per trial.  Preserve descriptor order when appending
+    // Cases so provenance/case indices remain reproducible.
+    if (!deferredTrials.empty()) {
+        const size_t prepWorkers = std::min(
+            deferredTrials.size(),
+            requestedWorkers ? size_t(requestedWorkers)
+                              : size_t(std::max(1u, std::thread::hardware_concurrency())));
+        std::vector<std::vector<cv::Vec3d>> materialized(deferredTrials.size());
+        std::atomic<size_t> nextTrial{0};
+        std::mutex prepErrorMutex;
+        std::exception_ptr prepError;
+        std::vector<std::jthread> prepPool;
+        prepPool.reserve(prepWorkers);
+        for (size_t w = 0; w < prepWorkers; ++w) prepPool.emplace_back([&] {
+            try {
+                while (true) {
+                    const size_t index = nextTrial.fetch_add(1);
+                    if (index >= deferredTrials.size()) break;
+                    const auto& trial = deferredTrials[index];
+                    auto points = sliceFiberLine(*trial.full, *trial.arc, trial.lo, trial.hi);
+                    if (trial.reverse) std::reverse(points.begin(), points.end());
+                    materialized[index] = std::move(points);
+                }
+            } catch (...) {
+                std::lock_guard lock(prepErrorMutex);
+                if (!prepError) prepError = std::current_exception();
+            }
+        });
+        prepPool.clear();
+        if (prepError) std::rethrow_exception(prepError);
+        for (size_t i = 0; i < deferredTrials.size(); ++i) {
+            auto& trial = deferredTrials[i];
+            cases.push_back({trial.source, cases.size(), trial.reverse,
+                trial.fiberPath, std::move(materialized[i]), trial.hi-trial.lo,
+                0, std::move(trial.provenance), {}});
+        }
+    }
     const size_t workers = std::min(cases.size(), requestedWorkers ? size_t(requestedWorkers) : size_t(std::max(1u, std::thread::hardware_concurrency())));
     if (live && cases.size() > config.value("max_live_cases", size_t{256}))
         throw std::invalid_argument("live case count exceeds explicit stack-preserving thread budget");
