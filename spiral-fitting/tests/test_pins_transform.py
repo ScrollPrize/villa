@@ -145,11 +145,11 @@ def build_scene(*, inconsistent=False):
     return patches, atlas, [link, absolute, link2], strips
 
 
-def build_registry(model, patches, atlas, pcls, strips, stride=1):
+def build_registry(model, patches, atlas, pcls, strips, stride=1, z_range=None):
     graph = pins.build_pin_graph(
         verified_patches=patches, patch_atlas=atlas, cross_patch_pcls=pcls,
         unattached_pcl_strips=strips, unattached_components=[[0]],
-        unattached_component_edges=[[]], patch_grid_stride=stride)
+        unattached_component_edges=[[]], patch_grid_stride=stride, z_range=z_range)
     crossing_map = ThetaCrossingMap('cpu')
     atlas.register_theta_topology(crossing_map)
     transform = model.get_slice_to_spiral_transform()
@@ -641,3 +641,38 @@ def test_checkpoint_resume_preserves_pin_frame_after_seam_crossing():
     with torch.no_grad():
         actual = resumed.get_slice_to_spiral_transform()(registry.zyx)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_pin_graph_and_registry_exclude_points_outside_flow_z_domain():
+    """PCL/strip points and patch quad centres outside the flow z domain are
+    not pins, and chains are cut there (whole-scroll PCLs extend far beyond a
+    z-range fit; the transform is undefined outside its box)."""
+    model = make_model()
+    patches, atlas, pcls, strips = build_scene()
+    # Push one cross-patch PCL point far outside z in [0, 192].
+    far = None
+    for pcl in pcls:
+        for point in pcl['points'].values():
+            if 'on_patch' not in point:
+                point['zyx'] = np.array([900.0, point['zyx'][1], point['zyx'][2]], dtype=np.float32)
+                far = point
+                break
+        if far is not None:
+            break
+    assert far is not None
+    graph_all = pins.build_pin_graph(
+        verified_patches=patches, patch_atlas=atlas, cross_patch_pcls=pcls,
+        unattached_pcl_strips=strips, unattached_components=[[0]],
+        unattached_component_edges=[[]], patch_grid_stride=1)
+    graph = pins.build_pin_graph(
+        verified_patches=patches, patch_atlas=atlas, cross_patch_pcls=pcls,
+        unattached_pcl_strips=strips, unattached_components=[[0]],
+        unattached_component_edges=[[]], patch_grid_stride=1, z_range=(0.0, 192.0))
+    point_nodes = [n for n in graph.nodes if n.kind != 'patch']
+    assert len(point_nodes) == len([n for n in graph_all.nodes if n.kind != 'patch']) - 1
+    assert all(0.0 <= float(n.zyx[0]) <= 192.0 for n in point_nodes)
+    assert len(graph.edges) < len(graph_all.edges)
+    # Registry built from the filtered graph carries no out-of-domain pin.
+    _, registry = build_registry(model, patches, atlas, pcls, strips, z_range=(0.0, 192.0))
+    assert registry.num_pins > 0
+    assert bool((registry.zyx[:, 0] >= 0.0).all() and (registry.zyx[:, 0] <= 192.0).all())

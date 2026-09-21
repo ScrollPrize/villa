@@ -195,6 +195,11 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "model_pin_overlap_tolerance_voxels": 0.0,
     "optimizer_lr_pin_targets": 0.01,
     "sample_count_pins": 100000,
+    # Stage-3 pin strain loss postdates checkpoints written with pins.
+    "loss_weight_pin_strain": 8.0,
+    "loss_margin_pin_strain": 0.025,
+    "loss_pin_strain_detach_targets": True,
+    "loss_pins_replace_constraint_losses": True,
 })
 # The flow-gradient conditioning settings postdate durable checkpoints;
 # missing means off, which is exactly the earlier behaviour.
@@ -942,6 +947,17 @@ class Config:
         self.loss_weight_abs_winding = 5.0
         self.loss_weight_unattached_pcl_radius = 2.0
         self.loss_weight_unattached_pcl_dt = 4.0
+        # Pin strain (pinned_spiral_plan.md stage 3): the correction each pin
+        # asks of the free map, hinged at loss_margin_pin_strain windings.
+        # Replaces the patch-radius, rel/abs-winding and unattached-strip
+        # radius losses on pinned inputs once pins are active (they are
+        # identically ~0 there); DT losses and the unverified-input losses
+        # are unchanged. With detach_targets the strain shapes only the flow
+        # and gaps, leaving the component targets T to the other losses.
+        self.loss_weight_pin_strain = 8.0
+        self.loss_margin_pin_strain = 0.025
+        self.loss_pin_strain_detach_targets = True
+        self.loss_pins_replace_constraint_losses = True
         # Probability of hopping onto the linked fiber at each junction while
         # sampling a chain walk through a link component in the
         # unattached-strip loss.

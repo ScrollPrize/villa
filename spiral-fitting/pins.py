@@ -1389,6 +1389,12 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
         theta_g = torch.atan2(inter[..., 1], inter[..., 2]) % TWO_PI
         z_g = inter[..., 0]
         valid_t = torch.from_numpy(valid_g).to(device)
+        # Quad centres outside the flow z domain (patches that straddle the
+        # fit's z-range) are not pins: the transform is undefined there.
+        scroll_z = zyx_g[..., 0].to(device)
+        valid_t = valid_t & (scroll_z >= float(min_z)) & (scroll_z <= float(max_z))
+        if not bool(valid_t.any()):
+            continue
         pots = crossing_map.winding_potentials(
             torch.from_numpy(node_ids_g.reshape(-1)).to(crossing_map.device)).reshape(*valid_g.shape)
         crossing_map.assert_no_pending_potential_errors()
@@ -1627,7 +1633,7 @@ def patch_overlap_pairs(patch_atlas, tolerance, *, max_pairs_per_patch_pair=3,
 def build_pin_graph(*, verified_patches, patch_atlas, cross_patch_pcls,
                     unattached_pcl_strips, unattached_components,
                     unattached_component_edges, patch_grid_stride=1,
-                    strip_radial_offsets=None, overlap_pairs=None):
+                    strip_radial_offsets=None, overlap_pairs=None, z_range=None):
     """Assemble the :class:`PinGraph` from the fit's prepared inputs.
 
     ``verified_patches`` is the id -> Patch mapping whose order matches
@@ -1648,10 +1654,19 @@ def build_pin_graph(*, verified_patches, patch_atlas, cross_patch_pcls,
 
     point_node = {}  # id(point dict) -> node
 
+    def in_domain(zyx):
+        # Points outside the flow's z domain cannot be pins: the transform is
+        # undefined there, and a pin pushed through it lands on a clamped z
+        # bin with a meaningless target. (Whole-scroll PCLs and fiber chains
+        # extend far beyond a z-range fit.) Chains are cut at such points.
+        return z_range is None or (z_range[0] <= float(zyx[0]) <= z_range[1])
+
     def node_for_point(pcl_id, key, point):
         node = point_node.get(id(point))
         if node is not None:
             return node
+        if not in_domain(point['zyx']):
+            return None
         on_patch = point.get('on_patch')
         patch_index = None
         attach_ij = None
@@ -1678,9 +1693,11 @@ def build_pin_graph(*, verified_patches, patch_atlas, cross_patch_pcls,
         keys = {id(point): key for key, point in pcl['points'].items()}
         nodes = [node_for_point(pcl_id, keys.get(id(point), i), point) for i, point in enumerate(chain)]
         for point, node in zip(chain, nodes):
-            zyx_node[np.asarray(point['zyx'], dtype=np.float32).tobytes()] = node
+            if node is not None:
+                zyx_node[np.asarray(point['zyx'], dtype=np.float32).tobytes()] = node
         for u, v in zip(nodes[:-1], nodes[1:]):
-            graph.add_chain_edge(u, v, f'pcl:{pcl_id}')
+            if u is not None and v is not None:
+                graph.add_chain_edge(u, v, f'pcl:{pcl_id}')
         if pcl.get('metadata', {}).get('winding_is_absolute', False):
             for point in pcl['points'].values():
                 node = point_node.get(id(point))
@@ -1700,17 +1717,19 @@ def build_pin_graph(*, verified_patches, patch_atlas, cross_patch_pcls,
         for j in range(zyxs.shape[0]):
             key = zyxs[j].tobytes()
             node = zyx_node.get(key)
-            if node is None:
+            if node is None and in_domain(zyxs[j]):
                 is_pin = offsets is None or float(offsets[j]) == 0.0
                 node = graph.add_point(zyxs[j], f'strip:{strip["id"]}:{j}',
                                        winding=float(windings[j]), is_pin=is_pin)
                 zyx_node[key] = node
             nodes.append(node)
         for u, v in zip(nodes[:-1], nodes[1:]):
-            graph.add_chain_edge(u, v, f'strip:{strip["id"]}')
+            if u is not None and v is not None:
+                graph.add_chain_edge(u, v, f'strip:{strip["id"]}')
         strip_nodes.append(nodes)
     for edges in unattached_component_edges:
         for strip_a, pos_a, strip_b, pos_b in edges:
-            graph.add_chain_edge(strip_nodes[strip_a][pos_a], strip_nodes[strip_b][pos_b],
-                                 f'link:{strip_a}:{strip_b}')
+            u, v = strip_nodes[strip_a][pos_a], strip_nodes[strip_b][pos_b]
+            if u is not None and v is not None:
+                graph.add_chain_edge(u, v, f'link:{strip_a}:{strip_b}')
     return graph

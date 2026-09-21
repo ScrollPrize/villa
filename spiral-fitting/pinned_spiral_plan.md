@@ -635,6 +635,37 @@ Then, by config flags defaulting to the new behaviour:
 Constraint losses are removed from the pinned path, strain gives a measurable smoothness
 gain on the A/B, exactness and monotonicity tests still pass.
 
+### Status (2026-09-21)
+
+Implemented: `losses.get_pin_strain_loss` (spiral-space form, hinge at
+`loss_margin_pin_strain` windings, `loss_pin_strain_detach_targets` default true),
+evaluated in the step on the pins leaf with the step's own gap stage, as its own loss
+family with `loss_weight_pin_strain`. While pins are active and
+`loss_pins_replace_constraint_losses` is on (default), the patch-radius, rel/abs-winding
+and unattached-strip radius weights are zero; their DT terms and the unverified-input
+losses are untouched; the unweighted patch-radius value is still logged
+(`patch_radius_unweighted`) along with `pin_strain_median/p90/frac_over_margin`. Tests in
+`tests/test_pin_strain.py` (zero iff the free map satisfies the pins, descent direction
+on the gap logits, agreement with the free-map winding deviation, detached targets, a
+float64 gradcheck). The "T converges to integers" regression is deliberately not built:
+integer-ness is not a goal at this point.
+
+Registry bug found by the strain diagnostics (fixed 2026-09-21): cross-patch PCL and
+fiber-chain points outside the flow z domain (whole-scroll inputs extend far beyond a
+z-range fit: 18.8k of 23k chain pins here) were pins. The transform is undefined there,
+so they landed on clamped z bins with targets a median 16 windings from the free map,
+were pinned on every step, and dominated the strain. `build_pin_graph(z_range=...)` now
+drops such points (cutting chains there) and `finalize_registry` drops patch quad
+centres outside the domain.
+
+Prerequisite found on the way (committed separately): the training-time pin subset must
+be the pins of the patches and PCLs the step's losses sample (all of them, at registry
+footprints), not a thin uniform subsample with widened footprints; the latter left the
+constraint losses unchanged on the training transform even though the full-registry
+export was aligned. Note that the strain loss's hinge is essential: at margin 0 every
+satisfied pin sits on the |strain| kink and, since gaps accumulate outward, any change
+gives them nonzero strain.
+
 ---
 
 ## Out of scope for these stages (recorded so they are not lost)

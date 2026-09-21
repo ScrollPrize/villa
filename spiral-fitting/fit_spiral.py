@@ -119,6 +119,7 @@ from sample_spiral import (
     get_winding_xy,
 )
 from losses import (
+    get_pin_strain_loss,
     draw_abs_winding_rows,
     draw_rel_winding_rows,
     MissingPclSamplingWeightError,
@@ -3936,6 +3937,8 @@ class FitContext:
                 unattached_component_edges=self.unattached_component_edges,
                 patch_grid_stride=self.config.get('model_pin_patch_grid_stride', 1),
                 overlap_pairs=overlap_pairs,
+                z_range=(float(self.flow_min_corner_spiral_zyx[0]),
+                         float(self.flow_max_corner_spiral_zyx[0])),
             )
             print(self.pin_graph.summary())
             self.spiral_and_transform.init_pin_targets(self.pin_graph.num_components)
@@ -5868,14 +5871,22 @@ class FitContext:
         # subsample smeared over widened footprints.
         step_patch_probabilities = self.patch_sampling_probabilities
         rel_winding_rows = abs_winding_rows = None
+        # Stage 3: while pins are active the constraint losses on pinned
+        # inputs are replaced by the pin strain loss (config-gated).
+        pins_replace = (self.spiral_and_transform._pins_enabled()
+                        and bool(self.config.get('loss_pins_replace_constraint_losses', True)))
+        weight_patch_radius = 0.0 if pins_replace else self.config['loss_weight_patch_radius']
+        weight_rel_winding = 0.0 if pins_replace else self.config['loss_weight_rel_winding']
+        weight_abs_winding = 0.0 if pins_replace else self.config['loss_weight_abs_winding']
+        weight_unattached_radius = 0.0 if pins_replace else self.config['loss_weight_unattached_pcl_radius']
         if self.spiral_and_transform._pins_enabled() and self.verified_patches_list:
             # The PCL winding losses are drawn here too, so the patches they
             # touch are pinned this step as well as the patch-loss patches.
-            if self.config['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
+            if weight_rel_winding > 0 and self.cross_patch_pcls:
                 rel_winding_rows = draw_rel_winding_rows(
                     self.verified_patches, self.patch_atlas, self.cross_patch_pcls,
                     self.pcl_sampling_strata['cross_patch'], self.config)
-            if self.config['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
+            if weight_abs_winding > 0 and self.cross_patch_pcls:
                 abs_winding_rows = draw_abs_winding_rows(
                     self.verified_patches, self.patch_atlas, self.cross_patch_pcls, self.config)
             pcl_patches = [idx for row in (rel_winding_rows or []) for idx in row['patch_indices']]
@@ -6004,6 +6015,21 @@ class FitContext:
                     max_total_points=5_000_000,
                 ))
 
+        # Stage 3: pin strain, evaluated on this step's pins leaf against the
+        # step's own free gap map (see losses.get_pin_strain_loss).
+        if pins_leaf is not None and self.config.get('loss_weight_pin_strain', 0.0) > 0:
+            strain_loss, strain = get_pin_strain_loss(
+                pins_leaf, pinned_gap_stage(self.slice_to_spiral_transform), self.dr_per_winding,
+                margin=float(self.config.get('loss_margin_pin_strain', 0.0)),
+                detach_targets=bool(self.config.get('loss_pin_strain_detach_targets', True)))
+            backward_family({'pin_strain': strain_loss * self.config['loss_weight_pin_strain']})
+            if strain.numel() and iteration % 20 == 0:
+                magnitude = strain.abs()
+                log_metrics['pin_strain_median'] = float(magnitude.median())
+                log_metrics['pin_strain_p90'] = float(torch.quantile(magnitude, 0.9))
+                log_metrics['pin_strain_frac_over_margin'] = float(
+                    (magnitude > float(self.config.get('loss_margin_pin_strain', 0.0))).float().mean())
+
         patch_loss_values = get_patch_and_umbilicus_losses(
             self.slice_to_spiral_transform,
             self.dr_per_winding,
@@ -6028,13 +6054,16 @@ class FitContext:
             patch_family.update({
                 'patch_radius': (
                     patch_loss_values[0]
-                    * self.config['loss_weight_patch_radius']),
+                    * weight_patch_radius),
                 'patch_dt': (
                     patch_loss_values[2]
                     * self.config['loss_weight_patch_dt']),
             })
         if self.shell_valid_zyxs_gpu is not None:
             patch_family['shell_patch_radius'] = patch_loss_values[3] * self.config['loss_weight_shell_patch_radius']
+        if pins_replace and self.verified_patches_list:
+            # The replaced constraint loss stays visible, unweighted.
+            log_metrics['patch_radius_unweighted'] = float(patch_loss_values[0].detach())
         backward_family(patch_family)
         del patch_family, patch_loss_values
 
@@ -6073,7 +6102,7 @@ class FitContext:
                 ) * self.config['loss_weight_sym_dirichlet'],
             })
 
-        if self.config['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
+        if weight_rel_winding > 0 and self.cross_patch_pcls:
             backward_family({
                 'rel_winding': get_patch_rel_winding_loss(
                     self.slice_to_spiral_transform,
@@ -6085,10 +6114,10 @@ class FitContext:
                     crossing_map=self.theta_crossing_map,
                     cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
                     rows=rel_winding_rows,
-                ) * self.config['loss_weight_rel_winding'],
+                ) * weight_rel_winding,
             })
 
-        if self.config['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
+        if weight_abs_winding > 0 and self.cross_patch_pcls:
             backward_family({
                 'abs_winding': get_patch_abs_winding_loss(
                     self.slice_to_spiral_transform,
@@ -6099,7 +6128,7 @@ class FitContext:
                     crossing_map=self.theta_crossing_map,
                     cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
                     rows=abs_winding_rows,
-                ) * self.config['loss_weight_abs_winding'],
+                ) * weight_abs_winding,
             })
 
         if (
@@ -6240,7 +6269,7 @@ class FitContext:
                 })
 
         if (
-            (self.config['loss_weight_unattached_pcl_radius'] > 0
+            (weight_unattached_radius > 0
              or self.config['loss_weight_unattached_pcl_dt'] > 0)
             and self.unattached_pcl_strips
         ):
@@ -6261,7 +6290,7 @@ class FitContext:
                 cfg=self.config,
             )
             backward_family({
-                'unattached_pcl_radius': unattached_loss_values[0] * self.config['loss_weight_unattached_pcl_radius'],
+                'unattached_pcl_radius': unattached_loss_values[0] * weight_unattached_radius,
                 'unattached_pcl_dt': unattached_loss_values[1] * self.config['loss_weight_unattached_pcl_dt'],
             })
             del unattached_loss_values

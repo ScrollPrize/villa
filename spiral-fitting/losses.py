@@ -1,4 +1,5 @@
 import itertools
+import math
 import os
 from dataclasses import dataclass
 
@@ -843,6 +844,42 @@ def _sample_requested_patch_rows(patch_indices, point_cap, patch_atlas):
         torch.from_numpy(counts_np), patch_atlas.device)
     mask = torch.arange(point_cap, device=patch_atlas.device)[None, :] < counts[:, None]
     return ijs, zyxs, node_ids, mask
+
+
+def get_pin_strain_loss(pins, gap_stage, dr_per_winding, *, margin,
+                        detach_targets=True, chunk_size=65536):
+    """Stage-3 pin strain: the correction each pin asks of the free map.
+
+    ``pins`` is the step's ``[P, 4]`` pins leaf ``(z, theta, r, dr (T + n))``
+    in intermediate space; ``gap_stage`` is the step's (pinned) gap expander,
+    whose parent free map ``s_free`` is evaluated on each pin's own ray.
+    ``strain_i = s_free(r_i) - r_target_i`` in windings, and the loss is
+    ``mean relu(|strain_i| - margin)``. Strain is zero exactly when the pin
+    is not needed. Its gradient reaches the flow chain (through ``r``,
+    ``theta``, ``z``), the gap logits (through ``s_free``) and, unless
+    ``detach_targets``, the component targets ``T`` (a centring force that
+    competes with DT's pull to integers, hence detached by default).
+
+    Returns ``(loss, strain.detach())``.
+    """
+    from pins import unpinned_map_forward
+    z, theta, r, target_shifted = pins.unbind(-1)
+    theta_norm = theta / (2. * math.pi)
+    target = target_shifted + dr_per_winding * theta_norm
+    if detach_targets:
+        target = target.detach()
+    strains = []
+    for start in range(0, pins.shape[0], chunk_size):
+        sl = slice(start, start + chunk_size)
+        table = gap_stage.get_transformed_winding_radii(theta[sl], z[sl])
+        s_free = unpinned_map_forward(r[sl], table, dr_per_winding, theta_norm[sl])
+        strains.append((s_free - target[sl]) / dr_per_winding)
+    if not strains:
+        zero = torch.zeros([], device=pins.device, dtype=pins.dtype)
+        return zero, pins.new_zeros([0])
+    strain = torch.cat(strains)
+    loss = F.relu(strain.abs() - float(margin)).mean()
+    return loss, strain.detach()
 
 
 def draw_rel_winding_rows(patches_dict, patch_atlas, point_collections,
