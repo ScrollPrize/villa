@@ -333,7 +333,11 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                 or candidate identities.
                 """
                 value = deepcopy(x)
+                # The native executable hash is retained in the revision
+                # record, but I/O-only replay rebuilds must resume an existing
+                # search checkpoint rather than invalidate it.
                 value.pop('implementation_sha256', None)
+                value.pop('native_sha256', None)
                 settings_value = value.get('settings')
                 if isinstance(settings_value, dict):
                     # ``run`` stores the short-failure settings directly;
