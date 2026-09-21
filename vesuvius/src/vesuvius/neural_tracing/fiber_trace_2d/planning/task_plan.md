@@ -1,5 +1,26 @@
 # Task plan: full hard-region failure extraction
 
+## Active correction: continuous native search (supersedes batch scheduling)
+
+Construct the global trial list once per model, using every unresolved
+candidate/direction and all feasible 100-voxel distances. Keep the self-fold
+exclusion and historical result/checkpoint semantics. Send this list to one
+native evaluator, not successive distance batches. Use compact trial metadata
+and native reference slicing to avoid thousands of reference JSON files.
+Native workers admit trials in ascending distance order and publish audits
+incrementally. After the earliest valid failure and its 100-voxel padding check
+are known, cancel longer queued trials for that candidate/direction. Consume
+out-of-order results in distance order; never substitute a later failure for an
+unfinished earlier result. Reuse the existing demand inference bridge and one
+writer owner/model. Persist actual completed audits for resume.
+
+Validation: unit tests for ordered completion, cancellation/padding and resume;
+native smoke test/build; resumed real extraction with process start counts and
+phase timings. Do not claim continuous scheduling from batch size alone.
+Spec update: require global native worklist and native incremental cancellation.
+Docs updates: document the execution path and measured timings in task_log.md
+and the extraction benchmark docs. Changelog: record the scheduler correction.
+
 ## Inputs
 
 Use the completed five-scroll/50-fiber evaluations already recorded in the

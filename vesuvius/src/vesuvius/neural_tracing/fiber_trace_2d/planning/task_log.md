@@ -53,3 +53,14 @@
   reference-file preparation, and lets each native batch use all available
   case workers.  The resumed v3 search is checkpointed and currently running;
   no v3 piece count is reported until its reproduction manifest is complete.
+# 2026-09-21 — Global failure-search worklist
+
+- Corrected the extractor scheduler to support `global_worklist`: all
+  candidates/directions and feasible 100-voxel distances are queued before a
+  native replay, with distance-order consumption after completion. Larger
+  distances are ignored once the shortest valid minimal+padded reproduction is
+  known. This removes repeated Python decision/replay boundaries.
+- Preserved native self-proximity preflight (`excluded=4 of50fibers` in the
+  current corpus) before candidate scheduling.
+- Earlier rolling-window implementations were retained only as resumable
+  checkpoints; they were not continuous and are superseded by this mode.

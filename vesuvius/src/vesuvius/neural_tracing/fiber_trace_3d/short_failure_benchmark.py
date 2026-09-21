@@ -282,6 +282,7 @@ def run(workload, *, devices='0', time_limit_seconds=None):
     total_cases=settings.get('total_cases',200)
     best_quota=settings.get('best_quota',99)
     other_quota=settings.get('other_quota',50)
+    global_worklist=bool(settings.get('global_worklist', False))
     if any(type(x) is not int or x<0 for x in (total_cases,best_quota,other_quota)) or total_cases<1:
         raise ValueError('case quotas must be nonnegative integers and total_cases positive')
     root = Path(workload['output_root']); root.mkdir(parents=True, exist_ok=True)
@@ -350,7 +351,7 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                     # outside this identity.  Keep execution knobs out of the
                     # resume compatibility check in either representation.
                     for key in ('fill_missing', 'candidate_batch', 'workers',
-                                'reuse_trial_root'):
+                                'global_worklist', 'reuse_trial_root'):
                         settings_value.pop(key, None)
                 return value
             if scientific(previous) != scientific(identity):
@@ -545,7 +546,7 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                     pos = positions.setdefault(c['id'],{})
                     advance_search(c, record, pos, result)
                     if not all(d in record for d in ('forward','reverse')):
-                        if unresolved>=128:
+                        if not global_worklist and unresolved>=128:
                             continue
                         unresolved+=1
                     for d in ('forward','reverse'):
@@ -589,9 +590,11 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                     # For the resumed tail, queue the complete feasible
                     # distance horizon so native replay can run all trials in
                     # one pass; advance_search still consumes them ascending.
-                    ahead = max(1,min(64,(worker_budget*32)//max(1,len(entries))-1))
+                    ahead = (100000 if global_worklist else
+                             max(1,min(64,(worker_budget*32)//max(1,len(entries))-1)))
                     requests = []
-                    batch_limit = max(worker_budget*32, int(settings.get('candidate_batch', 4096)))
+                    batch_limit = (10_000_000 if global_worklist else
+                                   max(worker_budget*32, int(settings.get('candidate_batch', 4096))))
                     used = 0
                     for c,d,n in entries:
                         if any(same_location(c,x['candidate']) for x in selected):
@@ -792,6 +795,10 @@ def run_union(workload):
             # reproduction search rather than a silently truncated cached-only
             # result.
             'fill_missing': True,
+            # Build the complete ordered trial worklist once per model.  The
+            # native evaluator then receives one continuous case set; Python
+            # only consumes audits afterward in distance order.
+            'global_worklist': True,
             'reuse_trial_root': None,
         }
         run(reproduction, devices=reproduction.get('devices', '0'))
