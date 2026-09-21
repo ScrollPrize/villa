@@ -666,8 +666,8 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                 _write_json_ephemeral(root/'progress.json',dict(status='stopped',selected=len(selected),
                     category=category,active_model_jobs=0,elapsed_seconds=time.monotonic()-scheduler_started),
                     )
-    exported=[]
-    for i, item in enumerate(selected):
+    def export_case(index_item):
+        i, item = index_item
         c=item['candidate']; trial=item['padded']; lo,hi=trial['original_arcs_base']; a=c['run']['original_arcs_base'][0]
         points=slice_line(geometry(c),lo-a,hi-a)
         if trial['direction']=='reverse': points.reverse()
@@ -680,8 +680,12 @@ def run(workload, *, devices='0', time_limit_seconds=None):
         # Per-case annotations are regenerable.  Avoid a journal fsync for
         # every tiny file; the final manifest below is the durable commit.
         _write_json_ephemeral(path, annotation)
-        exported.append(dict(path=str(path),sha256=sha256_file(path),length_base_voxels=hi-lo,
-                             length_mm=(hi-lo)*c['voxel_um']/1000,**item))
+        return dict(path=str(path),sha256=sha256_file(path),length_base_voxels=hi-lo,
+                    length_mm=(hi-lo)*c['voxel_um']/1000,**item)
+    # Each exported case is independent; preserve manifest order while using
+    # the same worker budget as trial-reference preparation.
+    with ThreadPoolExecutor(max_workers=min(128, max(1, len(selected)))) as writer:
+        exported = list(writer.map(export_case, enumerate(selected)))
     atomic_write(root/'manifest.json',dict(version=1,completed=len(exported)==total_cases,case_count=len(exported),
         total_base_voxels=sum(x['length_base_voxels'] for x in exported),
         total_mm=sum(x['length_mm'] for x in exported),protocol=PROTOCOL,identity=identity_hash, cases=exported))
