@@ -845,18 +845,19 @@ def _sample_requested_patch_rows(patch_indices, point_cap, patch_atlas):
     return ijs, zyxs, node_ids, mask
 
 
-def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
-                               patches_dict, patch_atlas, point_collections,
-                               sampling_strata, *, crossing_map, cfg,
-                               z_begin, z_end):
-    """Relative winding supervision over unordered uniform patch samples."""
-    point_cap = cfg['sample_count_points_per_patch']
+def draw_rel_winding_rows(patches_dict, patch_atlas, point_collections,
+                          sampling_strata, cfg):
+    """Draw the PCL / patch-pair / point rows for one relative-winding loss
+    evaluation (the sampling half of :func:`get_patch_rel_winding_loss`).
+
+    Separated so the training step can draw before building its transform
+    and include the rows' patches in the step's pin set.
+    """
     num_pcls = min(
         cfg['sample_count_relative_winding_pcls'],
         sampling_strata['effective_size'])
     if num_pcls <= 0:
-        return torch.zeros([], device=dr_per_winding.device)
-
+        return []
     rows = []
     for pcl_idx in _choose_pcl_indices(sampling_strata, num_pcls, cfg):
         pcl = point_collections[pcl_idx]
@@ -896,6 +897,22 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
                 'winding_diff': p2['winding_annotation'] - p1['winding_annotation'],
                 'chain_nodes': chain_nodes,
             })
+    return rows
+
+
+def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
+                               patches_dict, patch_atlas, point_collections,
+                               sampling_strata, *, crossing_map, cfg,
+                               z_begin, z_end, rows=None):
+    """Relative winding supervision over unordered uniform patch samples.
+
+    ``rows`` are pre-drawn by :func:`draw_rel_winding_rows`; drawn here
+    when omitted.
+    """
+    point_cap = cfg['sample_count_points_per_patch']
+    if rows is None:
+        rows = draw_rel_winding_rows(
+            patches_dict, patch_atlas, point_collections, sampling_strata, cfg)
     if not rows:
         return torch.zeros([], device=dr_per_winding.device)
 
@@ -954,17 +971,15 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
     return loss
 
 
-def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
-                               patches_dict, patch_atlas, point_collections,
-                               *, crossing_map, cfg, z_begin, z_end):
-    """Absolute winding supervision over unordered uniform patch samples."""
+def draw_abs_winding_rows(patches_dict, patch_atlas, point_collections, cfg):
+    """Draw the (patch, node, theta node, annotation) rows for one
+    absolute-winding loss evaluation (see :func:`draw_rel_winding_rows`)."""
     abs_pcls = [
         pcl for pcl in point_collections
         if pcl.get('metadata', {}).get('winding_is_absolute', False)]
     num_pcls = min(cfg['sample_count_absolute_winding_pcls'], len(abs_pcls))
     if num_pcls <= 0:
-        return torch.zeros([], device=dr_per_winding.device)
-
+        return []
     rows = []
     for pcl_idx in np.random.choice(len(abs_pcls), num_pcls, replace=False):
         pcl = abs_pcls[pcl_idx]
@@ -986,6 +1001,19 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
             rows.append((
                 resolved[0], resolved[1], int(point['_theta_node_id']),
                 point['winding_annotation']))
+    return rows
+
+
+def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
+                               patches_dict, patch_atlas, point_collections,
+                               *, crossing_map, cfg, z_begin, z_end, rows=None):
+    """Absolute winding supervision over unordered uniform patch samples.
+
+    ``rows`` are pre-drawn by :func:`draw_abs_winding_rows`; drawn here when
+    omitted.
+    """
+    if rows is None:
+        rows = draw_abs_winding_rows(patches_dict, patch_atlas, point_collections, cfg)
     if not rows:
         return torch.zeros([], device=dr_per_winding.device)
 

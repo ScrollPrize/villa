@@ -119,6 +119,8 @@ from sample_spiral import (
     get_winding_xy,
 )
 from losses import (
+    draw_abs_winding_rows,
+    draw_rel_winding_rows,
     MissingPclSamplingWeightError,
     build_pcl_sampling_strata,
     pcl_sampling_group_weight,
@@ -5865,8 +5867,21 @@ class FitContext:
         # pinned map is exact where it is evaluated rather than a thin uniform
         # subsample smeared over widened footprints.
         step_patch_probabilities = self.patch_sampling_probabilities
+        rel_winding_rows = abs_winding_rows = None
         if self.spiral_and_transform._pins_enabled() and self.verified_patches_list:
-            self.spiral_and_transform.set_step_pin_patches(self._draw_step_pin_patches())
+            # The PCL winding losses are drawn here too, so the patches they
+            # touch are pinned this step as well as the patch-loss patches.
+            if self.config['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
+                rel_winding_rows = draw_rel_winding_rows(
+                    self.verified_patches, self.patch_atlas, self.cross_patch_pcls,
+                    self.pcl_sampling_strata['cross_patch'], self.config)
+            if self.config['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
+                abs_winding_rows = draw_abs_winding_rows(
+                    self.verified_patches, self.patch_atlas, self.cross_patch_pcls, self.config)
+            pcl_patches = [idx for row in (rel_winding_rows or []) for idx in row['patch_indices']]
+            pcl_patches += [row[0] for row in (abs_winding_rows or [])]
+            self.spiral_and_transform.set_step_pin_patches(
+                np.union1d(self._draw_step_pin_patches(), np.asarray(pcl_patches, dtype=np.int64)))
         shared_transform_outputs = self.spiral_and_transform.get_shared_transform_tensors()
         active_patches = self.spiral_and_transform.active_step_pin_patches()
         if active_patches is not None and self.verified_patches_list:
@@ -6069,6 +6084,7 @@ class FitContext:
                     self.pcl_sampling_strata['cross_patch'],
                     crossing_map=self.theta_crossing_map,
                     cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
+                    rows=rel_winding_rows,
                 ) * self.config['loss_weight_rel_winding'],
             })
 
@@ -6082,6 +6098,7 @@ class FitContext:
                     self.cross_patch_pcls,
                     crossing_map=self.theta_crossing_map,
                     cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
+                    rows=abs_winding_rows,
                 ) * self.config['loss_weight_abs_winding'],
             })
 
