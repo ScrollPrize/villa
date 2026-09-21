@@ -307,6 +307,14 @@ def _transparent_radius_corrections(u, desired_radius, weight, valid):
     return torch.where(w >= 1., desired_radius, u + delta)
 
 
+def _localised_guard(solved, min_rise):
+    """Running-max ordering guard; unlifted anchors are returned bit-identical."""
+    floor = min_rise.cumsum(dim=-1)
+    lifted_value, lifted_from = torch.cummax(solved - floor, dim=-1)
+    lifted = lifted_from != torch.arange(solved.shape[-1], device=solved.device)[None]
+    return torch.where(lifted, lifted_value + floor, solved), lifted
+
+
 def build_pinned_ray_map(pre_pin_winding_radii, dr, theta_norm, anchor_R, anchor_S,
                          anchor_w, anchor_valid, min_gap):
     """Blend pin radii and build a deformation of the unpinned radius field.
@@ -317,11 +325,12 @@ def build_pinned_ray_map(pre_pin_winding_radii, dr, theta_norm, anchor_R, anchor
     Evaluation composes the original winding map with this pin-only
     deformation; original winding knots are never merged with pin knots.
 
-    The guard clips each solved interval's radial slope, then accumulates
-    the extra rise outwards. Splitting an interval with a zero-weight knot
-    therefore does not change the guard or map. The slope floor relative to
-    u is min_gap / dr; diagnostics measure the resulting physical gaps.
-    Conflicts shift subsequent radii outwards; compatible pins remain exact.
+    The guard floors each anchor's radius at the previous resolved radius
+    plus a minimum rise (slope floor min_gap / dr relative to u), lifting
+    only the anchors whose targets fall below that floor; outer anchors
+    whose targets clear it stay exact. Splitting an interval with a
+    zero-weight knot does not change the guard or map. Diagnostics measure
+    the resulting physical gaps.
     """
     num_rays = pre_pin_winding_radii.shape[0]
     device = pre_pin_winding_radii.device
@@ -353,9 +362,22 @@ def build_pinned_ray_map(pre_pin_winding_radii, dr, theta_norm, anchor_R, anchor
     rise = solved - prev_radius
     min_ratio = float(min_gap) / dr
     min_rise = min_ratio * (u - prev_u)
-    guard = valid & (rise < min_rise)
-    extra = torch.where(guard, min_rise - rise, torch.zeros_like(rise)).cumsum(dim=-1)
-    resolved = solved + extra
+    # Localised ordering guard: resolved_j = max(solved_j, resolved_{j-1} +
+    # min_rise_j), i.e. a running max of (solved - cumsum(min_rise)). An
+    # anchor is lifted only while its own target sits below the floor left
+    # by the anchors inside it; an outer anchor whose target clears that
+    # floor is exact again. (Adding every lift to all outer anchors instead
+    # made almost every pin on a ray inexact once a few inner anchors
+    # conflicted.) The map stays strictly increasing: each rise is at least
+    # min_rise_j > 0. Lifted anchors then take their lifted radius as the
+    # desired radius (at their own weight) and the blend is re-solved, so
+    # weak anchors follow their lifted neighbours instead of the unlifted
+    # corrections (zero-mass anchors stay transparent); a second guard pass
+    # restores monotonicity where the re-blend still falls below the floor.
+    resolved, lifted = _localised_guard(solved, min_rise)
+    solved = _transparent_radius_corrections(u, torch.where(lifted, resolved, R), w, valid)
+    resolved, lifted_again = _localised_guard(solved, min_rise)
+    guard = valid & (lifted | lifted_again)
     return PinnedRayMap(
         pre_pin_winding_radii, dr, theta_norm,
         torch.cat([zero[:, None], u], dim=-1),

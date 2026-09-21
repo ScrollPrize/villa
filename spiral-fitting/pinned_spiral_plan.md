@@ -554,6 +554,17 @@ gains need either fewer sampled pins per step (`sample_count_pins`, the cost is
 roughly linear in it) or fusing the anchor merge/guard into the anchor kernel.
 Retained memory is ~13 KB per query point (2.9 GB at 98k points).
 
+**Ordering guard made local (2026-09-18).** The 2a guard added every lift to all
+outer anchors (a cumulative sum), so on real rays carrying ~70 anchors with a
+fraction of them out of order, almost every pin ended up inexact and the pinned
+map missed its targets by far more than the free map did (600-step smoke fit:
+median miss 11.4 windings pinned vs 1.06 free; 96% of pins inexact with 18% of
+anchors guard-active). `build_pinned_ray_map` now applies
+`resolved_j = max(solved_j, resolved_{j-1} + min_rise_j)` (a running max), re-solves
+the blend with lifted anchors' radii as their desired radii so weak anchors follow
+them (zero-mass anchors stay transparent), and guards once more. Only anchors whose
+own target sits below the floor are inexact, as the plan text always intended.
+
 Note on fp32 gradients: gradients into ray angles and pin positions pass through
 the singular kernel's derivative and are resolved by fp32 only to ~1e-2 relative
 in *either* implementation (both differ from a float64 reference by O(1) on

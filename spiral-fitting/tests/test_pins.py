@@ -137,26 +137,40 @@ def _hand_count_guard(table_row, theta_row, R, S, w, dr=DR, min_gap=MIN_GAP):
     lam = np.where(u_next > u_prev, (u_next - u) / np.where(u_next > u_prev, u_next - u_prev, 1.0), 0.5)
     lam[-1] = 1.0
     A = np.eye(J)
-    b = w * (R - u)
-    for j in range(J):
-        if j > 0:
-            A[j, j - 1] = -(1 - w[j]) * lam[j]
-        if j + 1 < J:
-            A[j, j + 1] = -(1 - w[j]) * (1 - lam[j])
-    delta = np.linalg.solve(A, b)
-    solved = np.where(w == 1, R, u + delta)
-    prev_radius, prev_u, extra = 0.0, 0.0, 0.0
-    result, violations, causes = [], 0, []
-    for j in range(J):
-        rise = solved[j] - prev_radius
-        min_rise = min_gap * (u[j] - prev_u) / dr
-        if rise < min_rise:
-            violations += 1
-            causes.append('order' if rise <= 0 else 'min_rise')
-            extra += min_rise - rise
-        result.append(solved[j] + extra)
-        prev_radius, prev_u = solved[j], u[j]
-    return np.asarray(result), violations, causes, order
+    min_rise = min_gap * (u - u_prev) / dr
+
+    def solve(R_, w_):
+        b = w_ * (R_ - u)
+        A_ = A.copy()
+        for j in range(J):
+            if j > 0:
+                A_[j, j - 1] = -(1 - w_[j]) * lam[j]
+            if j + 1 < J:
+                A_[j, j + 1] = -(1 - w_[j]) * (1 - lam[j])
+        return np.where(w_ == 1, R_, u + np.linalg.solve(A_, b))
+
+    def guard(solved):
+        # Localised: lift an anchor only up to the previous resolved radius
+        # plus its minimum rise.
+        result, lifted, prev = [], [], 0.0
+        for j in range(J):
+            floor = prev + min_rise[j]
+            lifted.append(solved[j] < floor)
+            result.append(max(solved[j], floor))
+            prev = result[-1]
+        return np.asarray(result), np.asarray(lifted)
+
+    solved = solve(R, w)
+    rise = np.diff(np.concatenate([[0.0], solved]))
+    resolved, lifted = guard(solved)
+    # Lifted anchors take their lifted radius as desired radius; the blend
+    # is re-solved so weak anchors follow them.
+    solved2 = solve(np.where(lifted, resolved, R), w)
+    result, lifted2 = guard(solved2)
+    active = lifted | lifted2
+    violations = int(active.sum())
+    causes = ['order' if rise[j] <= 0 else 'min_rise' for j in range(J) if active[j]]
+    return result, violations, causes, order
 
 
 def test_pinned_map_monotone():

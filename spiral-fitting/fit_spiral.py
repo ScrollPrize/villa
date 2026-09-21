@@ -3506,12 +3506,20 @@ class FitContext:
         saved_registry = checkpoint.get('pin_registry')
         fingerprint = saved_registry.get('fingerprint') if isinstance(saved_registry, Mapping) else None
         live = self.spiral_and_transform.pin_targets
+        # T carries information only if the checkpoint was written with pins
+        # active: before activation T has no gradient and still holds the
+        # registry's estimate from the model state at construction, which is
+        # stale once the soft fit has moved on. Such a checkpoint keeps its
+        # registry but re-estimates T at activation (_maybe_activate_pins).
+        saved_active = bool(checkpoint.get('pins_active', False))
         if (saved_T is not None and tuple(saved_T.shape) == tuple(live.shape)
                 and fingerprint == self.pin_graph.fingerprint()):
             self.spiral_and_transform.set_pin_registry(
                 pins_module.PinRegistry.from_state_dict(saved_registry, live.device),
-                reset_targets=False)
-            self.pin_targets_loaded = True
+                reset_targets=not saved_active)
+            self.pin_targets_loaded = saved_active
+            if not saved_active:
+                model_state['pin_targets'] = self.spiral_and_transform.pin_targets.detach().clone().cpu()
         else:
             if saved_T is not None:
                 print('checkpoint pin_targets do not match this fit\'s constraint '
