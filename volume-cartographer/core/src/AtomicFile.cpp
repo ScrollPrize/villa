@@ -134,7 +134,31 @@ void atomicWriteString(
     atomicWriteBytes(
         target,
         std::span<const std::byte>(
-            reinterpret_cast<const std::byte*>(text.data()), text.size()));
+        reinterpret_cast<const std::byte*>(text.data()), text.size()));
+}
+
+void ephemeralWriteString(
+    const std::filesystem::path& target,
+    std::string_view text)
+{
+    if (!target.parent_path().empty())
+        std::filesystem::create_directories(target.parent_path());
+    auto temporary = target;
+    temporary += uniqueTemporarySuffix();
+    try {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output)
+            throw std::runtime_error("cannot open temporary file for write: " + temporary.string());
+        output.write(text.data(), static_cast<std::streamsize>(text.size()));
+        if (!output)
+            throw std::runtime_error("write failed for " + temporary.string());
+        output.close();
+        replaceFileAtomically(temporary, target);
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw;
+    }
 }
 
 void atomicWriteBytes(

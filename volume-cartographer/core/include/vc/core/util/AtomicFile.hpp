@@ -16,6 +16,13 @@ void atomicWriteString(
     const std::filesystem::path& target,
     std::string_view text);
 
+// Atomic rename without file or directory fsync.  Intended only for
+// regenerable trial artifacts; callers that publish durable results must use
+// atomicWriteString instead.
+void ephemeralWriteString(
+    const std::filesystem::path& target,
+    std::string_view text);
+
 void atomicWriteBytes(
     const std::filesystem::path& target,
     std::span<const std::byte> bytes);

@@ -3000,11 +3000,11 @@ void writeFiberReplayTraceArtifacts(
     (void)matchedGreedySegments(replay, reference);
     if (!std::filesystem::create_directory(outputDirectory))
         throw std::invalid_argument("native replay artifact directory already exists");
-    vc::core::util::atomicWriteString(outputDirectory / "reference.obj",
+    vc::core::util::ephemeralWriteString(outputDirectory / "reference.obj",
         lineObj("# vc_native_replay_reference", referenceGeometryBase));
-    vc::core::util::atomicWriteString(outputDirectory / "trace.obj",
+    vc::core::util::ephemeralWriteString(outputDirectory / "trace.obj",
         segmentedLineObj("# vc_native_replay_segments; resets are disconnected", greedySegments(replay)));
-    vc::core::util::atomicWriteString(outputDirectory / "trace.json", nlohmann::json{
+    vc::core::util::ephemeralWriteString(outputDirectory / "trace.json", nlohmann::json{
         {"format", "vc_native_replay_artifact"}, {"version", 1},
         {"reference_points_base_xyz", pointsJson(referenceGeometryBase)},
         {"provenance", provenance}, {"replay", serialized}}.dump(2) + "\n");
