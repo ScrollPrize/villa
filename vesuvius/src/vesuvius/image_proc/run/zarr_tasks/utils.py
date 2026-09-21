@@ -20,6 +20,8 @@ import zarr
 from numcodecs import Blosc
 from tqdm import tqdm
 
+from vesuvius.data.utils import create_zarr_array, open_zarr_group
+
 
 def get_chunk_coords(
     shape: Tuple[int, ...], chunks: Tuple[int, ...]
@@ -87,41 +89,24 @@ def create_level_dataset(
     compressor,
     overwrite: bool = True,
 ) -> zarr.Array:
-    """Create a dataset using NestedDirectoryStore for nested chunk directories.
+    """Create a nested-key Zarr v2 dataset under either supported zarr major.
 
-    Args:
-        root_group_path: Path to the root zarr group
-        level_name: Name of the level (e.g., "0", "1")
-        shape: Array shape
-        chunks: Chunk sizes
-        dtype: Data type
-        compressor: Compressor instance
-        overwrite: Whether to overwrite existing level
-
-    Returns:
-        Created zarr array
+    The Vesuvius pipeline still consumes the Zarr v2 on-disk layout.  Use the
+    package's shared compatibility helpers so zarr-python 3.x does not create
+    a v3 store or require APIs removed since zarr 2.
     """
-    root_path = Path(root_group_path)
-    root_path.mkdir(parents=True, exist_ok=True)
-    zgroup_path = root_path / ".zgroup"
-    if not zgroup_path.exists():
-        with open(zgroup_path, "w") as f:
-            json.dump({"zarr_format": 2}, f, indent=4)
-
-    level_path = root_path / level_name
-    if overwrite and level_path.exists():
-        shutil.rmtree(level_path)
-
-    store = zarr.NestedDirectoryStore(str(level_path))
-    return zarr.open(
-        store=store,
+    root = open_zarr_group(root_group_path, mode="a")
+    return create_zarr_array(
+        root,
+        level_name,
         shape=shape,
         chunks=chunks,
         dtype=dtype,
         compressor=compressor,
-        mode="w",
-        write_empty_chunks=False,
         fill_value=0,
+        write_empty_chunks=False,
+        overwrite=overwrite,
+        dimension_separator="/",
     )
 
 
