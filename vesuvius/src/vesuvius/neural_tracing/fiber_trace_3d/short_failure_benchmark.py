@@ -430,7 +430,11 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                     vc_open_data_coordinate_space=source['coordinate_space'])))
                 source['fibers'].append(str(annotation))
                 expected[str(annotation)] = (c,direction,distance,cache,lo,hi)
-            with ThreadPoolExecutor(max_workers=min(32, max(1, len(pending_references)))) as writer:
+            # Reference JSONs are independent preparation work.  The old
+            # 32-thread cap became the bottleneck once deep prefetching
+            # produced thousands of trial fibers; use the native worker
+            # budget for this I/O-bound publication step.
+            with ThreadPoolExecutor(max_workers=min(worker_budget, max(1, len(pending_references)))) as writer:
                 list(writer.map(lambda item: _write_json_ephemeral(*item), pending_references))
             evaluation['sources'] = [s for s in sources.values() if s['fibers']]
             _write_json_ephemeral(batch/'evaluation.json', evaluation)
