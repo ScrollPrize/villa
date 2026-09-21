@@ -8,11 +8,13 @@
 #include "vc/core/util/CacheCompression.hpp"
 #include "utils/zarr.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -152,12 +154,12 @@ TEST_CASE("VcDataset: a region past the dataset bounds is refused, not written p
 {
     // Was disabled with a CHECK(true) placeholder and a FIXME saying readRegion segfaults on
     // an out-of-bounds region "instead of clamping, returning false, or throwing". Returning
-    // false is the smaller of the two options they listed and matches the bool return type.
+    // false is one of the outcomes it asked for, and matches the bool return type.
     //
     // Without the fix this is a heap-buffer-overflow, confirmed with the project's own
-    // -DVC_ENABLE_ASAN=ON: "WRITE of size 8 ... in fillTypedElements". Note that without ASan
-    // the same binary exits 0 and reports all tests passing, which is why the original FIXME
-    // could only reproduce it under a coverage build.
+    // -DVC_ENABLE_ASAN=ON: "WRITE of size 8 ... in fillTypedElements". Without ASan the
+    // overflow can pass unnoticed or crash later, depending on the heap; the original FIXME
+    // saw it only under a coverage build.
     auto d = tmpDir("oob_region");
     auto ds = vc::createZarrDataset(d, "arr",
         {8, 8, 8}, {8, 8, 8}, vc::VcDtype::uint8, "none");
@@ -165,19 +167,24 @@ TEST_CASE("VcDataset: a region past the dataset bounds is refused, not written p
 
     std::vector<uint8_t> out(8 * 8 * 8, 0xCC);
     CHECK_FALSE(ds->readRegion({0, 0, 0}, {16, 16, 16}, out.data()));
-    // the caller's buffer must be untouched when the call is refused
-    CHECK(out.front() == 0xCC);
-    CHECK(out.back() == 0xCC);
-
     // an offset that starts inside but runs off the end is equally invalid
     CHECK_FALSE(ds->readRegion({4, 4, 4}, {8, 8, 8}, out.data()));
     // and an offset entirely outside
     CHECK_FALSE(ds->readRegion({99, 0, 0}, {1, 1, 1}, out.data()));
+    // an extent so large that offset + extent wraps around to a small number
+    CHECK_FALSE(ds->readRegion({8, 0, 0}, {std::numeric_limits<size_t>::max(), 1, 1}, out.data()));
+    // the wrong number of dimensions
+    CHECK_FALSE(ds->readRegion({0, 0}, {1, 1}, out.data()));
+    // a refused read leaves every byte of the caller's buffer as it was (VcDataset.hpp contract)
+    CHECK(std::all_of(out.begin(), out.end(), [](uint8_t v) { return v == 0xCC; }));
 
-    // writeRegion has the same missing check and the same consequence, in reverse: it would
+    // writeRegion needs the same check for the same reason, in reverse: without it, it would
     // read past the caller's input buffer.
     std::vector<uint8_t> in(8 * 8 * 8, 0x11);
     CHECK_FALSE(ds->writeRegion({0, 0, 0}, {16, 16, 16}, in.data()));
+    CHECK_FALSE(ds->writeRegion({0, 0}, {1, 1}, in.data()));
+    // a refused write leaves the dataset as it was: nothing has been written to it yet
+    CHECK_FALSE(ds->chunkExists(0, 0, 0));
 
     // the in-bounds cases must be unaffected
     CHECK(ds->readRegion({0, 0, 0}, {8, 8, 8}, out.data()));

@@ -633,6 +633,30 @@ static Shape3 toShape3(const std::vector<std::size_t>& shape)
     return {shape[0], shape[1], shape[2]};
 }
 
+// VcDataset::readRegion refuses a region that does not fit inside the dataset and leaves the
+// buffer as it was (the bounds contract in VcDataset.hpp). Every read in this tool goes through
+// here, so a refusal stops the run instead of passing on a buffer that was never filled. In the
+// worker threads the exception lands in their existing firstError handling and is reported
+// after the join.
+static void readRegionOrThrow(const vc::VcDataset& ds,
+                              const Shape3& origin,
+                              const Shape3& shape,
+                              void* output)
+{
+    if (ds.readRegion({origin[0], origin[1], origin[2]}, {shape[0], shape[1], shape[2]}, output)) {
+        return;
+    }
+    std::ostringstream msg;
+    msg << "read refused: origin (" << origin[0] << ", " << origin[1] << ", " << origin[2]
+        << ") size (" << shape[0] << ", " << shape[1] << ", " << shape[2]
+        << ") does not fit inside " << ds.path().string() << ", shape (";
+    for (std::size_t d = 0; d < ds.shape().size(); ++d) {
+        msg << (d ? ", " : "") << ds.shape()[d];
+    }
+    msg << ')';
+    throw std::runtime_error(msg.str());
+}
+
 static bool hasAnyNonZero(const std::vector<uint8_t>& data)
 {
     return std::any_of(data.begin(), data.end(), [](uint8_t v) { return v != 0; });
@@ -2465,9 +2489,10 @@ static std::vector<ChunkIndex> buildLabelPriorityPyramidLevelTouched(
                                                        srcActualX,
                                                        srcBuf)) {
                         srcBuf.assign(srcElems, ignoreValue);
-                        srcLocal.readRegion({srcZ0, srcY0, srcX0},
-                                            {srcActualZ, srcActualY, srcActualX},
-                                            srcBuf.data());
+                        readRegionOrThrow(srcLocal,
+                                          {srcZ0, srcY0, srcX0},
+                                          {srcActualZ, srcActualY, srcActualX},
+                                          srcBuf.data());
                     }
                     auto tReadEnd = std::chrono::steady_clock::now();
                     localProfile.tPyramidRead.add(std::chrono::duration<double>(tReadEnd - tReadStart).count());
@@ -3047,9 +3072,7 @@ static int processChunkAlphaWrap(
                     haloBuf.assign(volumeElements(haloBox.shape), 0);
                     {
                         ScopedTimer readTimer(localProfile.tSliceLoad);
-                        localCompute.readRegion({haloBox.origin[0], haloBox.origin[1], haloBox.origin[2]},
-                                                {haloBox.shape[0], haloBox.shape[1], haloBox.shape[2]},
-                                                haloBuf.data());
+                        readRegionOrThrow(localCompute, haloBox.origin, haloBox.shape, haloBuf.data());
                     }
                     localProfile.bytesRead += haloBuf.size() * sizeof(uint8_t);
 
@@ -3245,9 +3268,10 @@ static void visualizeSlice(const Config& cfg)
     }
 
     std::vector<uint8_t> slice(computeShape[1] * computeShape[2], 0);
-    computeDs.readRegion({static_cast<std::size_t>(z), 0, 0},
-                         {1, computeShape[1], computeShape[2]},
-                         slice.data());
+    readRegionOrThrow(computeDs,
+                      {static_cast<std::size_t>(z), 0, 0},
+                      {1, computeShape[1], computeShape[2]},
+                      slice.data());
     cv::Mat1b label(static_cast<int>(computeShape[1]),
                     static_cast<int>(computeShape[2]),
                     slice.data());
@@ -3263,9 +3287,10 @@ static void visualizeSlice(const Config& cfg)
         }
 
         std::vector<uint8_t> outSlice(computeShape[1] * computeShape[2], 0);
-        outputDs.readRegion({static_cast<std::size_t>(z), 0, 0},
-                            {1, computeShape[1], computeShape[2]},
-                            outSlice.data());
+        readRegionOrThrow(outputDs,
+                          {static_cast<std::size_t>(z), 0, 0},
+                          {1, computeShape[1], computeShape[2]},
+                          outSlice.data());
         cv::Mat1b outputIgnore(static_cast<int>(computeShape[1]),
                                static_cast<int>(computeShape[2]),
                                outSlice.data());
@@ -3780,7 +3805,7 @@ static bool runSelfTest()
             }
 
             std::vector<uint8_t> volume(volumeElements(shape), 0);
-            ds->readRegion({0, 0, 0}, {shape[0], shape[1], shape[2]}, volume.data());
+            readRegionOrThrow(*ds, {0, 0, 0}, shape, volume.data());
             for (std::size_t y = 0; y < shape[1]; ++y) {
                 for (std::size_t x = 0; x < shape[2]; ++x) {
                     if (volume[linearIndex(shape, 0, y, x)] != 0 ||
@@ -3974,9 +3999,10 @@ static int process(const Config& cfg)
     if (cachePlan.mode == ComputeCacheMode::preload) {
         auto ioStart = std::chrono::steady_clock::now();
         preloadedCompute.resize(cachePlan.requiredBytes);
-        computeDs.readRegion({static_cast<std::size_t>(zStart), 0, 0},
-                             {zCount, computeShape[1], computeShape[2]},
-                             preloadedCompute.data());
+        readRegionOrThrow(computeDs,
+                          {static_cast<std::size_t>(zStart), 0, 0},
+                          {zCount, computeShape[1], computeShape[2]},
+                          preloadedCompute.data());
         auto ioEnd = std::chrono::steady_clock::now();
         profile.tSliceLoad.add(std::chrono::duration<double>(ioEnd - ioStart).count());
         profile.bytesRead += cachePlan.requiredBytes;
@@ -4046,9 +4072,10 @@ static int process(const Config& cfg)
         } else {
             {
                 ScopedTimer readTimer(localProfile.tSliceLoad);
-                localCompute.readRegion({static_cast<std::size_t>(z), 0, 0},
-                                       {1, computeShape[1], computeShape[2]},
-                                       sliceData.data());
+                readRegionOrThrow(localCompute,
+                                  {static_cast<std::size_t>(z), 0, 0},
+                                  {1, computeShape[1], computeShape[2]},
+                                  sliceData.data());
             }
             localProfile.bytesRead += sliceElems * sizeof(uint8_t);
             hasForeground = hasAnyNonZero(sliceData);
@@ -4240,9 +4267,10 @@ static int process(const Config& cfg)
                             } else {
                                 {
                                     ScopedTimer readTimer(localProfile.tSliceLoad);
-                                    localCompute.readRegion({z, 0, 0},
-                                                           {1, computeShape[1], computeShape[2]},
-                                                           sliceData.data());
+                                    readRegionOrThrow(localCompute,
+                                                      {z, 0, 0},
+                                                      {1, computeShape[1], computeShape[2]},
+                                                      sliceData.data());
                                 }
                                 localProfile.bytesRead += sliceElems * sizeof(uint8_t);
                                 hasForeground = hasAnyNonZero(sliceData);

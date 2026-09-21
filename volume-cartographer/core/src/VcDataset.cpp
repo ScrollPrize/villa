@@ -771,11 +771,12 @@ bool VcDataset::readRegion(const std::vector<size_t>& offset,
     for (size_t d = 0; d < regionShape.size(); ++d) {
         if (regionShape[d] == 0) return true;
     }
-    // A region that extends past the dataset is rejected rather than attempted. Without this
-    // the chunk loop below runs past the last chunk, gets nothing back, and then writes fill
-    // values at output offsets computed from the REGION shape - past the end of whatever the
-    // caller allocated. core/test/test_vcdataset_more.cpp documents the resulting crash and
-    // disables its own test for it. Checked with subtraction so the sum cannot overflow.
+    // Refuse a region that does not lie inside the dataset (the bounds contract in
+    // VcDataset.hpp). Unchecked, the chunk loop below filled the part past the dataset's edge
+    // with the fill value, at offsets set by the requested region, so a buffer sized to the part
+    // that exists was written past its end: the heap-buffer-overflow the bounds test in
+    // core/test/test_vcdataset_more.cpp hit under ASan before this check. Checked with
+    // subtraction so offset + extent cannot overflow.
     const auto& dsShape = impl_->shape_;
     if (offset.size() != dsShape.size() || regionShape.size() != dsShape.size()) return false;
     for (size_t d = 0; d < dsShape.size(); ++d) {
@@ -882,11 +883,8 @@ bool VcDataset::writeRegion(const std::vector<size_t>& offset,
     for (size_t d = 0; d < regionShape.size(); ++d) {
         if (regionShape[d] == 0) return true;
     }
-    // A region that extends past the dataset is rejected rather than attempted. Without this
-    // the chunk loop below runs past the last chunk, gets nothing back, and then writes fill
-    // values at output offsets computed from the REGION shape - past the end of whatever the
-    // caller allocated. core/test/test_vcdataset_more.cpp documents the resulting crash and
-    // disables its own test for it. Checked with subtraction so the sum cannot overflow.
+    // Refuse a region that does not lie inside the dataset, as readRegion does (the bounds
+    // contract in VcDataset.hpp). Checked with subtraction so offset + extent cannot overflow.
     const auto& dsShape = impl_->shape_;
     if (offset.size() != dsShape.size() || regionShape.size() != dsShape.size()) return false;
     for (size_t d = 0; d < dsShape.size(); ++d) {
