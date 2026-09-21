@@ -7,6 +7,7 @@ both ends of that range, zarr 2.18.7 and 3.2.1, so each case is checked on each.
 import json
 
 import numpy as np
+import pytest
 from numcodecs import Blosc
 
 from vesuvius.image_proc.run.zarr_tasks.utils import create_level_dataset
@@ -62,3 +63,23 @@ def test_overwrite_replaces_an_existing_level(tmp_path):
     _level(tmp_path)[:] = 5
     arr = _level(tmp_path, overwrite=True)
     assert int(np.asarray(arr[:]).max()) == 0
+
+
+def test_overwrite_false_refuses_an_existing_level_and_keeps_its_data(tmp_path):
+    # Before this, overwrite=False skipped the delete and then opened the level with mode="w", which
+    # truncates it anyway, so the flag lost the data it was meant to protect.
+    first = _level(tmp_path)
+    first[:] = 7
+    level = tmp_path / "vol.zarr" / "0"
+    chunks_before = _chunk_files(level)
+    assert len(chunks_before) == 8
+    with pytest.raises(FileExistsError):
+        _level(tmp_path, overwrite=False)
+    assert _chunk_files(level) == chunks_before              # nothing deleted
+    assert int(np.asarray(first[:]).min()) == 7              # and the data reads back intact
+
+
+def test_overwrite_false_still_creates_a_new_level(tmp_path):
+    level = _level(tmp_path, overwrite=False)
+    level[:] = 3
+    assert int(level[:].min()) == 3

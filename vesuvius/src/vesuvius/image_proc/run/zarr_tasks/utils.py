@@ -100,7 +100,8 @@ def create_level_dataset(
         chunks: Chunk sizes
         dtype: Data type
         compressor: Compressor instance
-        overwrite: Whether to overwrite existing level
+        overwrite: Whether to replace an existing level. With False, an existing level raises
+            FileExistsError rather than being silently truncated.
 
     Returns:
         Created zarr array
@@ -113,7 +114,10 @@ def create_level_dataset(
             json.dump({"zarr_format": 2}, f, indent=4)
 
     level_path = root_path / level_name
-    if overwrite and level_path.exists():
+    if level_path.exists():
+        if not overwrite:
+            # open_zarr below uses mode="w", which truncates; without this, overwrite=False lost the level
+            raise FileExistsError(f"{level_path} already exists; pass overwrite=True to replace it")
         shutil.rmtree(level_path)
 
     # zarr 3 removed NestedDirectoryStore (and DirectoryStore). Its only purpose here was
