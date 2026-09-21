@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import itertools
 import json
-import shutil
 from multiprocessing import Pool
 from pathlib import Path
 from typing import List, Tuple
