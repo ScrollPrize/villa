@@ -125,6 +125,49 @@ void checkScale(const fs::path& dir, double expected)
     CHECK(meta["scale"][1].get<double>() == doctest::Approx(expected).epsilon(0.02));
 }
 
+cv::Vec2d measureSpacing(const fs::path& dir)
+{
+    const char* names[3] = {"x.tif", "y.tif", "z.tif"};
+    cv::Mat xyz[3];
+    for (int i = 0; i < 3; ++i) {
+        xyz[i] = cv::imread((dir / names[i]).string(), cv::IMREAD_UNCHANGED);
+        REQUIRE_FALSE(xyz[i].empty());
+        REQUIRE(xyz[i].type() == CV_32F);
+        REQUIRE(xyz[i].size() == xyz[0].size());
+    }
+    auto valid = [&](int r, int c) { return xyz[0].at<float>(r, c) != -1.f; };
+    auto at = [&](int r, int c) {
+        return cv::Vec3d(xyz[0].at<float>(r, c), xyz[1].at<float>(r, c), xyz[2].at<float>(r, c));
+    };
+    double sum[2] = {0.0, 0.0};
+    int count[2] = {0, 0};
+    for (int r = 0; r < xyz[0].rows; ++r) {
+        for (int c = 0; c < xyz[0].cols; ++c) {
+            if (!valid(r, c)) continue;
+            if (c > 0 && valid(r, c - 1)) {
+                sum[0] += cv::norm(at(r, c) - at(r, c - 1));
+                ++count[0];
+            }
+            if (r > 0 && valid(r - 1, c)) {
+                sum[1] += cv::norm(at(r, c) - at(r - 1, c));
+                ++count[1];
+            }
+        }
+    }
+    REQUIRE(count[0] > 0);
+    REQUIRE(count[1] > 0);
+    return {sum[0] / count[0], sum[1] / count[1]};
+}
+
+void checkScaleMatchesGrid(const fs::path& dir)
+{
+    const auto meta = readMeta(dir);
+    REQUIRE(meta.contains("scale"));
+    const cv::Vec2d spacing = measureSpacing(dir);
+    CHECK(meta["scale"][0].get<double>() == doctest::Approx(1.0 / spacing[0]).epsilon(0.02));
+    CHECK(meta["scale"][1].get<double>() == doctest::Approx(1.0 / spacing[1]).epsilon(0.02));
+}
+
 bool logContains(const fs::path& log, const std::string& needle)
 {
     std::ifstream f(log);
@@ -227,6 +270,26 @@ TEST_CASE("vc_obj2tifxyz writes a scale that describes the emitted grid")
         CHECK(run(bin, {q(normalised), q(rejected), stretch, "7.91"}, rejectedLog) != 0);
         CHECK_FALSE(fs::exists(rejected));
         CHECK(logContains(rejectedLog, "mesh_units 7.91 is not supported"));
+    }
+
+    SUBCASE("non-metric mode: scale is the reciprocal of the spacing measured from the emitted grid")
+    {
+        const int voxelGrid = static_cast<int>((kGrid - 1) * kSpacing) + 1;
+        for (const char* decimation : {"", "--uv-downsample=2"}) {
+            const std::string tag = *decimation ? "non-metric-decimated" : "non-metric";
+            const fs::path out = root / tag;
+            const fs::path log = root / (tag + ".log");
+            INFO(tag, ", log: ", log.string());
+            QStringList args{q(normalised), q(out), stretch, "--uv-non-metric"};
+            if (*decimation) args << decimation;
+            REQUIRE(run(bin, args, log) == 0);
+            const cv::Mat x = cv::imread((out / "x.tif").string(), cv::IMREAD_UNCHANGED);
+            REQUIRE_FALSE(x.empty());
+            CHECK(x.cols == voxelGrid);
+            CHECK(x.rows == voxelGrid);
+            checkScaleMatchesGrid(out);
+            checkScale(out, 1.0);
+        }
     }
 
     SUBCASE("source-scale mode keeps the source scale")
