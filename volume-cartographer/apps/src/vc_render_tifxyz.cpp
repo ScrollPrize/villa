@@ -1626,6 +1626,8 @@ int main(int argc, char *argv[])
             // header but no directory -- TiffWriter writes the IFD in
             // close() -- and a bare exists() check would treat those torn
             // files as done and skip them on every rerun (#1404).
+            // isReadableTiff also decodes every tile, so a slice whose
+            // directory survived but whose data did not is re-rendered too.
             bool tifSkip = false;
             if (resumeFlag && numParts <= 1) {
                 int missing = 0, torn = 0;
@@ -1639,7 +1641,7 @@ int main(int argc, char *argv[])
                     logPrintf(stdout, "[tif] all slices exist, skipping tif output.\n");
                     tifSkip = true;
                 } else if (torn > 0) {
-                    logPrintf(stdout, "[tif] %d of %d existing slices are not readable TIFFs (interrupted render?), re-rendering all slices.\n",
+                    logPrintf(stdout, "[tif] %d of %d existing slices are not complete, readable TIFFs (interrupted render or damaged file?), re-rendering all slices.\n",
                               torn, tifSlices - missing);
                 }
             }

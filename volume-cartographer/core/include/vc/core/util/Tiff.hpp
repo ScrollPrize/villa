@@ -90,12 +90,16 @@ private:
     std::filesystem::path _path;     // For error messages
 };
 
-// True if `path` opens as a TIFF with a readable first directory.
-// TiffWriter (like libtiff in general) writes the directory in close(), so
-// a file left behind by a writer that was killed mid-way has a header and
-// tile data but no directory: exists() says "done", this says "torn".
-// libtiff diagnostics are suppressed while probing; the caller decides
-// what to report.
+// True if `path` opens as a TIFF whose first directory is present and whose
+// every tile (or strip) decodes to its full size. TiffWriter (like libtiff
+// in general) writes the directory in close(), so a file left behind by a
+// writer that was killed mid-way has a header and tile data but no
+// directory: exists() says "done", this says "torn". Decoding the payload
+// additionally rejects a file whose directory survived but whose tile data
+// is truncated or does not decompress; it reads the whole file, so this
+// costs about as much as one pass over the output. Pixel values are not
+// checked against anything. libtiff diagnostics are suppressed while
+// probing; the caller decides what to report.
 bool isReadableTiff(const std::filesystem::path& path);
 
 // Merge partial .partN.tif files into final TIFFs.

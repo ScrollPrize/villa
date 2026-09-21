@@ -16,6 +16,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -226,6 +227,75 @@ TEST_CASE("isReadableTiff: finished vs torn, empty and absent files")
     { std::ofstream empty(d / "empty.tif"); }
     CHECK_FALSE(isReadableTiff(d / "empty.tif"));
     CHECK_FALSE(isReadableTiff(d / "absent.tif"));
+    fs::remove_all(d);
+}
+
+namespace {
+
+// Offsets and byte counts of a finished file's tiles, through libtiff itself.
+void tileLayout(const fs::path& p, std::vector<uint64_t>& offs, std::vector<uint64_t>& counts)
+{
+    TIFF* tf = TIFFOpen(p.string().c_str(), "r");
+    REQUIRE(tf);
+    uint64_t* o = nullptr;
+    uint64_t* c = nullptr;
+    REQUIRE(TIFFGetField(tf, TIFFTAG_TILEOFFSETS, &o));
+    REQUIRE(TIFFGetField(tf, TIFFTAG_TILEBYTECOUNTS, &c));
+    const ttile_t n = TIFFNumberOfTiles(tf);
+    offs.assign(o, o + n);
+    counts.assign(c, c + n);
+    TIFFClose(tf);
+}
+
+bool opensAsTiff(const fs::path& p)
+{
+    TIFFErrorHandler prevErr = TIFFSetErrorHandler(nullptr);
+    TIFFErrorHandler prevWarn = TIFFSetWarningHandler(nullptr);
+    TIFF* tf = TIFFOpen(p.string().c_str(), "r");
+    TIFFSetErrorHandler(prevErr);
+    TIFFSetWarningHandler(prevWarn);
+    if (tf) TIFFClose(tf);
+    return tf != nullptr;
+}
+
+} // namespace
+
+TEST_CASE("isReadableTiff: intact directory over corrupt tile data")
+{
+    auto d = tmpDir("corruptpayload");
+    auto p = d / "out.tif";
+    auto bad = d / "bad.tif";
+
+    std::mt19937 rng(7);
+    cv::Mat img(128, 128, CV_8UC1);
+    for (auto it = img.begin<uint8_t>(); it != img.end<uint8_t>(); ++it)
+        *it = static_cast<uint8_t>(rng());
+    {
+        TiffWriter w(p, 128, 128, CV_8UC1, 64, 64);
+        for (int y = 0; y < 128; y += 64)
+            for (int x = 0; x < 128; x += 64)
+                w.writeTile(x, y, img(cv::Rect(x, y, 64, 64)));
+    }
+    REQUIRE(isReadableTiff(p));
+
+    // Keep header and directory, overwrite one tile's LZW payload with 0xFF:
+    // the directory is intact, exists() and TIFFOpen() both say "fine", but
+    // the tile does not decode. This is what a file looks like when its
+    // payload was damaged after the directory had been written.
+    std::vector<uint64_t> offs, counts;
+    tileLayout(p, offs, counts);
+    REQUIRE(offs.size() == 4);
+    fs::copy_file(p, bad);
+    {
+        std::fstream f(bad, std::ios::in | std::ios::out | std::ios::binary);
+        REQUIRE(f.good());
+        std::string ff(static_cast<size_t>(counts[2]), char(0xFF));
+        f.seekp(static_cast<std::streamoff>(offs[2]));
+        f.write(ff.data(), std::streamsize(ff.size()));
+    }
+    CHECK(fs::file_size(bad) == fs::file_size(p));
+    CHECK(opensAsTiff(bad));
+    CHECK_FALSE(isReadableTiff(bad));
     fs::remove_all(d);
 }
 
