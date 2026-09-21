@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <random>
 #include <string>
 
@@ -124,6 +125,13 @@ void checkScale(const fs::path& dir, double expected)
     CHECK(meta["scale"][1].get<double>() == doctest::Approx(expected).epsilon(0.02));
 }
 
+bool logContains(const fs::path& log, const std::string& needle)
+{
+    std::ifstream f(log);
+    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return text.find(needle) != std::string::npos;
+}
+
 }
 
 TEST_CASE("vc_obj2tifxyz writes a scale that describes the emitted grid")
@@ -205,13 +213,20 @@ TEST_CASE("vc_obj2tifxyz writes a scale that describes the emitted grid")
         checkScale(out, 1.0 / (2 * kSpacing));
     }
 
-    SUBCASE("mesh_units does not change the scale")
+    SUBCASE("mesh_units: 1.0 is accepted, any other value is rejected")
     {
         const fs::path out = root / "mesh-units";
         const fs::path log = root / "mesh-units.log";
         INFO("log: ", log.string());
-        REQUIRE(run(bin, {q(normalised), q(out), stretch, "7.91"}, log) == 0);
+        REQUIRE(run(bin, {q(normalised), q(out), stretch, "1.0"}, log) == 0);
         checkScale(out, 1.0 / kSpacing);
+
+        const fs::path rejected = root / "mesh-units-rejected";
+        const fs::path rejectedLog = root / "mesh-units-rejected.log";
+        INFO("log: ", rejectedLog.string());
+        CHECK(run(bin, {q(normalised), q(rejected), stretch, "7.91"}, rejectedLog) != 0);
+        CHECK_FALSE(fs::exists(rejected));
+        CHECK(logContains(rejectedLog, "mesh_units 7.91 is not supported"));
     }
 
     SUBCASE("source-scale mode keeps the source scale")

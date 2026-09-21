@@ -531,7 +531,8 @@ int main(int argc, char *argv[])
         std::cout << "  stretch_factor: grid cells per UV unit (default: 1.0). OBJs with UVs normalised" << std::endl;
         std::cout << "                  to [0,1] (e.g. the published segment meshes) need a value such as 800," << std::endl;
         std::cout << "                  otherwise the grid is 2 x 2 and the tool refuses it." << std::endl;
-        std::cout << "  mesh_units    : micrometers per OBJ unit (default: 1.0; accepted for compatibility, not used for the tifxyz scale)" << std::endl;
+        std::cout << "  mesh_units    : deprecated; must be 1.0. OBJ coordinates are expected in base voxels and are" << std::endl;
+        std::cout << "                  written unchanged; the tool does not convert physical units." << std::endl;
         std::cout << "Flags:" << std::endl;
         std::cout << "  --uv-metric         : UVs are metric (default; UV units == OBJ units unless --uv-to-obj is set)" << std::endl;
         std::cout << "  --uv-non-metric     : Revert to legacy behavior (measure scale from 3D mesh)" << std::endl;
@@ -549,7 +550,7 @@ int main(int argc, char *argv[])
         std::cout << "      The tool exits non-zero when no grid point is rasterized or the output grid is only 2 x 2." << std::endl;
         std::cout << "Examples:" << std::endl;
         std::cout << "  " << argv[0] << " mesh.obj outdir                       (UV-metric mode, 1 cell per UV unit)" << std::endl;
-        std::cout << "  " << argv[0] << " mesh.obj outdir 800 1.0 --uv-metric  (UV is metric, OBJ units == UV units)" << std::endl;
+        std::cout << "  " << argv[0] << " mesh.obj outdir 800 --uv-metric      (UV is metric, OBJ units == UV units)" << std::endl;
         std::cout << "  " << argv[0] << " mesh.obj outdir --uv-metric --uv-to-obj=0.001" << std::endl;
         return EXIT_SUCCESS;
     }
@@ -557,7 +558,6 @@ int main(int argc, char *argv[])
     std::filesystem::path obj_path = argv[1];
     std::filesystem::path output_dir = argv[2];
     float stretch_factor = 1.0f;
-    float mesh_units = 1.0f;      // micrometers per OBJ unit
     bool  uv_metric = true;       // treat UV as metric parametrization
     float uv_to_obj = 1.0f;       // OBJ units per UV unit (only when uv_metric)
     float uv_downsample = 1.0f;
@@ -628,9 +628,10 @@ int main(int argc, char *argv[])
             }
             consumed_numbers++;
         } else if (consumed_numbers == 1) {
-            mesh_units = std::atof(a.c_str());
-            if (mesh_units <= 0) {
-                std::cerr << "Invalid mesh units: " << a << std::endl;
+            if (std::atof(a.c_str()) != 1.0) {
+                std::cerr << "Error: mesh_units " << a << " is not supported. vc_obj2tifxyz expects OBJ coordinates in\n"
+                          << "base voxels and writes them unchanged; it does not convert physical units. The\n"
+                          << "argument is deprecated and only its default 1.0 is accepted." << std::endl;
                 return EXIT_FAILURE;
             }
             consumed_numbers++;
@@ -649,7 +650,7 @@ int main(int argc, char *argv[])
     std::cout << "Input: " << obj_path << std::endl;
     std::cout << "Output: " << output_dir << std::endl;
     std::cout << "Stretch factor: " << stretch_factor << std::endl;
-    std::cout << "Mesh units: " << mesh_units << " micrometers per OBJ unit" << std::endl;
+    std::cout << "OBJ coordinates: base voxels (written unchanged)" << std::endl;
     if (uv_metric) {
         std::cout << "UV mode: metric (default)" << std::endl;
         std::cout << "UV->OBJ scale: " << uv_to_obj << " OBJ units / UV unit" << std::endl;
