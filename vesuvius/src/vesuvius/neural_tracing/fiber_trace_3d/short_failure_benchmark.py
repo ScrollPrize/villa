@@ -414,30 +414,48 @@ def run(workload, *, devices='0', time_limit_seconds=None):
             inference['input_slots'] = max(int(inference.get('max_batch_size', 8)), 256//lane_count)
             inference['result_slots'] = max(int(inference.get('max_batch_size', 8)), 128//lane_count)
             sources = {s['id']: deepcopy(s) for s in evaluation['sources']}
-            for s in sources.values(): s['fibers'] = []
+            if global_worklist:
+                # Native replay slices the original annotation directly.  Do
+                # not materialize one Python JSON file per trial.
+                sources = {s['id']: s for s in sources.values()
+                           if any(c['source_id'] == s['id'] for c, *_ in requests)}
+            else:
+                for s in sources.values(): s['fibers'] = []
             expected = {}
             pending_references = []
+            global_trials = []
             for c, direction, distance, tag, cache in requests:
                 a, b = c['run']['original_arcs_base']; target = c['target']
                 lo, hi = ((target-distance, min(b, target+100)) if direction == 'forward'
                           else (max(a,target-100), target+distance))
-                points = slice_line(geometry(c), lo-a, hi-a)
-                if direction == 'reverse': points.reverse()
-                annotation = batch/'references'/f'{tag}.json'
-                source = sources[c['source_id']]
-                pending_references.append((annotation, dict(type='vc3d_fiber', version=1, line_points=points,
-                    control_points=[points[0],points[-1]], evaluation_direction='forward',
-                    optimization_mode='native_fiber_trace3d',
-                    vc_open_data_coordinate_space=source['coordinate_space'])))
-                source['fibers'].append(str(annotation))
-                expected[str(annotation)] = (c,direction,distance,cache,lo,hi)
+                if global_worklist:
+                    global_trials.append(dict(candidate_id=c['id'], direction=direction,
+                        distance=distance, fiber_path=c['piece_key'][0],
+                        source_id=c['source_id'], lo=lo-a, hi=hi-a,
+                        original_arcs_base=[lo,hi]))
+                    expected[(c['id'], direction, float(distance))] = (c,direction,distance,cache,lo,hi)
+                else:
+                    points = slice_line(geometry(c), lo-a, hi-a)
+                    if direction == 'reverse': points.reverse()
+                    annotation = batch/'references'/f'{tag}.json'
+                    source = sources[c['source_id']]
+                    pending_references.append((annotation, dict(type='vc3d_fiber', version=1, line_points=points,
+                        control_points=[points[0],points[-1]], evaluation_direction='forward',
+                        optimization_mode='native_fiber_trace3d',
+                        vc_open_data_coordinate_space=source['coordinate_space'])))
+                    source['fibers'].append(str(annotation))
+                    expected[str(annotation)] = (c,direction,distance,cache,lo,hi)
             # Reference JSONs are independent preparation work.  The old
             # 32-thread cap became the bottleneck once deep prefetching
             # produced thousands of trial fibers; use the native worker
             # budget for this I/O-bound publication step.
-            with ThreadPoolExecutor(max_workers=min(worker_budget, max(1, len(pending_references)))) as writer:
-                list(writer.map(lambda item: _write_json_ephemeral(*item), pending_references))
-            evaluation['sources'] = [s for s in sources.values() if s['fibers']]
+            if not global_worklist:
+                with ThreadPoolExecutor(max_workers=min(worker_budget, max(1, len(pending_references)))) as writer:
+                    list(writer.map(lambda item: _write_json_ephemeral(*item), pending_references))
+            if global_worklist:
+                evaluation['failure_search_trials'] = global_trials
+                evaluation['failure_search_trials_only'] = True
+            evaluation['sources'] = list(sources.values())
             _write_json_ephemeral(batch/'evaluation.json', evaluation)
             if not (result_root/'summary.json').exists():
                 try:
@@ -474,7 +492,13 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                 raise ValueError('trial batch incomplete')
             for path in (result_root/'cases').glob('*/trace.json'):
                 doc = json.loads(path.read_text())
-                c,direction,distance,cache,lo,hi = expected[doc['provenance']['fiber_path']]
+                if global_worklist:
+                    provenance = doc['provenance']
+                    key = (provenance['candidate_id'], provenance['direction'],
+                           float(provenance['target_distance_base']))
+                    c,direction,distance,cache,lo,hi = expected[key]
+                else:
+                    c,direction,distance,cache,lo,hi = expected[doc['provenance']['fiber_path']]
                 audit = audit_failure(doc, distance, evaluation.get('excursion_grace_base_voxels',0))
                 _write_json_ephemeral(cache, dict(**audit, artifact=str(path), direction=direction,
                     distance=distance, original_arcs_base=[lo,hi]))
