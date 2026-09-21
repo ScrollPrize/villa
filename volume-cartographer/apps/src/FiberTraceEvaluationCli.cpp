@@ -243,6 +243,33 @@ std::vector<cv::Vec3d> fiberLinePoints(const Json& annotation,
     return points;
 }
 
+// Return a polyline slice at arc coordinates measured from the first point.
+// Trial extraction uses this instead of materializing one annotation per
+// distance; all descriptors can therefore be submitted to one replay-set.
+std::vector<cv::Vec3d> sliceFiberLine(const std::vector<cv::Vec3d>& input,
+                                      double lo, double hi)
+{
+    if (!(std::isfinite(lo) && std::isfinite(hi) && lo >= 0.0 && hi > lo))
+        throw std::invalid_argument("invalid trial arc interval");
+    std::vector<double> arc(input.size(), 0.0);
+    for (size_t i = 1; i < input.size(); ++i) arc[i] = arc[i-1] + cv::norm(input[i]-input[i-1]);
+    if (input.size() < 2 || hi > arc.back() + 1e-6)
+        throw std::invalid_argument("trial arc interval outside reference fiber");
+    auto at = [&](double s) {
+        const auto it = std::lower_bound(arc.begin(), arc.end(), s);
+        if (it == arc.begin()) return input.front();
+        if (it == arc.end()) return input.back();
+        const size_t i = size_t(it - arc.begin());
+        const double d = arc[i] - arc[i-1];
+        return d > 0.0 ? input[i-1] + (input[i]-input[i-1]) * ((s-arc[i-1])/d) : input[i];
+    };
+    std::vector<cv::Vec3d> out{at(lo)};
+    for (size_t i = 1; i + 1 < input.size(); ++i)
+        if (arc[i] > lo && arc[i] < hi) out.push_back(input[i]);
+    out.push_back(at(hi));
+    return out;
+}
+
 Json selfProximity(const Json& plan, const vc::lasagna::NormalSampler& normals,
                    double threshold, double factor, double separation, double spacing)
 {
@@ -842,6 +869,42 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         }
         if (!fiberIndex) throw std::invalid_argument("source has no selected fibers: " + source.id);
         sources.push_back(std::move(source));
+    }
+    // Optional global trial worklist.  The Python extractor can submit every
+    // distance for every candidate in one replay invocation.  Native workers
+    // then execute the fixed list continuously; ordering/cancellation is
+    // decided by the coordinator from the emitted audit fields.
+    if (config.contains("failure_search_trials")) {
+        const auto& trials = config.at("failure_search_trials");
+        if (!trials.is_array()) throw std::invalid_argument("failure_search_trials must be an array");
+        std::unordered_map<std::string, size_t> sourceIndex;
+        for (size_t i = 0; i < sources.size(); ++i) sourceIndex.emplace(sources[i].id, i);
+        if (config.value("failure_search_trials_only", false)) cases.clear();
+        for (const auto& trial : trials) {
+            for (const auto& key : {"candidate_id", "direction", "distance", "fiber_path", "source_id"})
+                if (!trial.contains(key)) throw std::invalid_argument(std::string("trial missing ") + key);
+            const auto sourceIt = sourceIndex.find(trial.at("source_id").get<std::string>());
+            if (sourceIt == sourceIndex.end()) throw std::invalid_argument("trial source_id is unknown");
+            const bool reverse = trial.at("direction").get<std::string>() == "reverse";
+            if (!reverse && trial.at("direction").get<std::string>() != "forward")
+                throw std::invalid_argument("trial direction must be forward or reverse");
+            const auto path = sourceLocation(configPath.parent_path(), trial.at("fiber_path").get<std::string>());
+            const auto annotation = readJson(path);
+            auto full = fiberLinePoints(annotation, path);
+            const double distance = trial.at("distance").get<double>();
+            const double lo = trial.value("lo", 0.0);
+            const double hi = trial.value("hi", 0.0);
+            if (!(hi > lo)) throw std::invalid_argument("trial requires lo < hi");
+            auto points = sliceFiberLine(full, lo, hi);
+            if (reverse) std::reverse(points.begin(), points.end());
+            Json provenance = trial;
+            provenance["global_trial"] = true;
+            provenance["candidate_id"] = trial.at("candidate_id");
+            provenance["target_distance_base"] = distance;
+            provenance["fiber_path"] = path;
+            cases.push_back({sourceIt->second, cases.size(), reverse, path, std::move(points),
+                hi-lo, 0, std::move(provenance), {}});
+        }
     }
     const int requestedWorkers = config.value("workers", 0);
     if (requestedWorkers < 0) throw std::invalid_argument("workers must be nonnegative");
