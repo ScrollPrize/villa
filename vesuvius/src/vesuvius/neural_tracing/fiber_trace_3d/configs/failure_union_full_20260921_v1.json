@@ -1,7 +1,11 @@
 {
   "version": 1,
-  "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/full_failure_union_20260921_v2",
+  "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/full_failure_union_20260921_v3",
   "failure_union": {
+    "run_reproduction_search": true,
+    "reproduction_base_config": "/home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_short_failures_200_20260916_v3.json",
+    "reproduction_manifest": "/ephemeral/hendrik/fiber3d_train2/evaluations/full_failure_union_20260921_v3/reproduction_search/manifest.json",
+    "baseline_name": "classic_best91_5k",
     "context_base_voxels": 500,
     "corridor_radius_base_voxels": 64,
     "merge_distance_base_voxels": 200,

@@ -23,6 +23,18 @@ PROTOCOL = dict(version=1, start_step=100, start_padding=100, end_padding=100,
                 require_exhausted_grace=True)
 
 
+def _write_json_ephemeral(path, value):
+    """Write regenerable scheduler artifacts without forcing filesystem flushes.
+
+    Trial references, audits, and checkpoints are all reproducible from the
+    input protocol.  They must not issue a flush/fsync per tiny file while the
+    extraction queue is being prepared; the final manifest remains durable.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, separators=(',', ':'), default=str))
+
+
 def merge_failure_intervals(intervals, merge_distance=PROTOCOL['dedup_distance']):
     """Merge sorted reference intervals while retaining no model semantics.
 
@@ -312,7 +324,26 @@ def run(workload, *, devices='0', time_limit_seconds=None):
         state = json.loads(state_path.read_text())
         if state['identity'] != identity_hash:
             previous = json.loads((root/'protocol.json').read_text())
-            scientific = lambda x: {k:v for k,v in x.items() if k != 'implementation_sha256'}
+            def scientific(x):
+                """Compare reproducibility semantics, not scheduler knobs.
+
+                A stopped cached-only pass is intentionally resumable as a
+                filling pass.  Worker count, batch size, and fill policy change
+                execution only; they do not change the failure-search protocol
+                or candidate identities.
+                """
+                value = deepcopy(x)
+                value.pop('implementation_sha256', None)
+                settings_value = value.get('settings')
+                if isinstance(settings_value, dict):
+                    # ``run`` stores the short-failure settings directly;
+                    # ``run_union`` stores them under ``failure_union`` only
+                    # outside this identity.  Keep execution knobs out of the
+                    # resume compatibility check in either representation.
+                    for key in ('fill_missing', 'candidate_batch', 'workers',
+                                'reuse_trial_root'):
+                        settings_value.pop(key, None)
+                return value
             if scientific(previous) != scientific(identity):
                 raise ValueError('benchmark scientific identity changed; choose a new output directory')
             # PROTOCOL.version binds result semantics; implementation-only changes
@@ -356,8 +387,15 @@ def run(workload, *, devices='0', time_limit_seconds=None):
             while (batch/f'attempt_{attempt}'/'full').exists() and not (batch/f'attempt_{attempt}'/'full/summary.json').exists():
                 attempt+=1
             result_root=batch/f'attempt_{attempt}'/'full'
+            # One native replay owns the shared demand/inference session for a
+            # cache root.  Put all of the requests in that replay and let its
+            # case worker pool run them concurrently; starting one replay
+            # process per request would contend on the same published stores
+            # and serialize inference behind writer locks.
             evaluation.update(output=str(result_root), render=False, backend='beam',
-                              workers=worker_budget, decoded_cache_bytes=(64 << 30)//lane_count)
+                              workers=min(max(1, len(requests)), worker_budget),
+                              max_live_cases=max(256, len(requests)),
+                              decoded_cache_bytes=(64 << 30)//lane_count)
             # Operational limits only: keep model/tile/precision/tracing semantics.
             inference = evaluation['inference']
             for key in ('input_workers', 'accumulator_workers', 'flush_workers'):
@@ -368,6 +406,7 @@ def run(workload, *, devices='0', time_limit_seconds=None):
             sources = {s['id']: deepcopy(s) for s in evaluation['sources']}
             for s in sources.values(): s['fibers'] = []
             expected = {}
+            pending_references = []
             for c, direction, distance, tag, cache in requests:
                 a, b = c['run']['original_arcs_base']; target = c['target']
                 lo, hi = ((target-distance, min(b, target+100)) if direction == 'forward'
@@ -376,14 +415,16 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                 if direction == 'reverse': points.reverse()
                 annotation = batch/'references'/f'{tag}.json'
                 source = sources[c['source_id']]
-                atomic_write(annotation, dict(type='vc3d_fiber', version=1, line_points=points,
+                pending_references.append((annotation, dict(type='vc3d_fiber', version=1, line_points=points,
                     control_points=[points[0],points[-1]], evaluation_direction='forward',
                     optimization_mode='native_fiber_trace3d',
-                    vc_open_data_coordinate_space=source['coordinate_space']))
+                    vc_open_data_coordinate_space=source['coordinate_space'])))
                 source['fibers'].append(str(annotation))
                 expected[str(annotation)] = (c,direction,distance,cache,lo,hi)
+            with ThreadPoolExecutor(max_workers=min(32, max(1, len(pending_references)))) as writer:
+                list(writer.map(lambda item: _write_json_ephemeral(*item), pending_references))
             evaluation['sources'] = [s for s in sources.values() if s['fibers']]
-            atomic_write(batch/'evaluation.json', evaluation)
+            _write_json_ephemeral(batch/'evaluation.json', evaluation)
             if not (result_root/'summary.json').exists():
                 try:
                     replay_processes[job_devices].submit(execute_trial_replay,evaluation,binary,
@@ -412,7 +453,7 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                                 execute_batch(model, part, job_devices)
                         else:
                             c,d,n,tag,cache=requests[0]
-                            atomic_write(cache,dict(valid=False,reason='uncached_dependency',distance=n,direction=d,error=str(error)))
+                            _write_json_ephemeral(cache,dict(valid=False,reason='uncached_dependency',distance=n,direction=d,error=str(error)))
                         return
             summary = json.loads((result_root/'summary.json').read_text())
             if not summary['completed'] or summary['cases'] != len(requests):
@@ -421,7 +462,7 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                 doc = json.loads(path.read_text())
                 c,direction,distance,cache,lo,hi = expected[doc['provenance']['fiber_path']]
                 audit = audit_failure(doc, distance, evaluation.get('excursion_grace_base_voxels',0))
-                atomic_write(cache, dict(**audit, artifact=str(path), direction=direction,
+                _write_json_ephemeral(cache, dict(**audit, artifact=str(path), direction=direction,
                     distance=distance, original_arcs_base=[lo,hi]))
             print(f"short-benchmark batch={batch_key} trials={len(requests)} model={models[model]['name']}", flush=True)
 
@@ -435,6 +476,13 @@ def run(workload, *, devices='0', time_limit_seconds=None):
         raise ValueError('select distinct GPU device ordinals')
     resources = {key: {str(Path(s['fiber_manifest']).resolve().parent)
                        for s in model['config']['sources']} for key, model in models.items()}
+    if not fill_missing:
+        # All configured producers are already complete and cached.  There is
+        # no writer ownership to serialize: replay workers only read decoded
+        # chunks and write disjoint trial artifacts.  Keeping the cache roots
+        # in the affinity graph here accidentally collapsed every model into
+        # one lane and left most CPU capacity idle.
+        resources = {key: set() for key in models}
     scheduler_started = time.monotonic()
     for category in ('best','other','classic'):
         count = sum(x['candidate']['category']==category for x in selected)
@@ -498,7 +546,7 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                         best = min(options,key=lambda v:(v['padded']['original_arcs_base'][1]-v['padded']['original_arcs_base'][0],v['padded']['direction']))
                         selected.append(dict(candidate=c,**best));count+=1
                     frontier+=1
-                atomic_write(state_path,state)
+                _write_json_ephemeral(state_path,state)
                 if frontier==len(pool) or count>=limit or len(selected)>=total_cases:
                     break
                 for model in sorted(active,key=lambda m:(not jobs.prefer_warm(m),dispatched[m])):
@@ -511,6 +559,7 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                     entries = entries[start:]+entries[:start]
                     ahead = max(1,min(16,128//len(entries)-1))
                     requests = []
+                    batch_limit = max(128, int(settings.get('candidate_batch', 256)))
                     used = 0
                     for c,d,n in entries:
                         if any(same_location(c,x['candidate']) for x in selected):
@@ -523,10 +572,10 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                             cache = root/'trials'/f'{tag}.json'
                             if distance<=extent and not cache.exists():
                                 requests.append((c,d,distance,tag,cache))
-                                if len(requests)>=128:
-                                    break
+                            if len(requests)>=batch_limit:
+                                break
                         used+=1
-                        if len(requests)>=128:
+                        if len(requests)>=batch_limit:
                             break
                     if requests and jobs.submit(model,execute_batch,requests):
                         rotations[model] = start+used
@@ -540,7 +589,7 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                         active_model_jobs=len(jobs.pending),model_job_capacity=lane_count,
                         workers_per_job=worker_budget,frontier=frontier,candidates=len(pool),
                         elapsed_seconds=time.monotonic()-scheduler_started)
-                    atomic_write(root/'progress.json',progress)
+                    _write_json_ephemeral(root/'progress.json',progress)
                     print('short-benchmark '+json.dumps(progress),flush=True)
                     last_report=time.monotonic()
                 jobs.collect()
@@ -554,9 +603,10 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                 finally:
                     for process in replay_processes.values():
                         process.shutdown(wait=True,cancel_futures=True)
-                atomic_write(state_path,state)
-                atomic_write(root/'progress.json',dict(status='stopped',selected=len(selected),
-                    category=category,active_model_jobs=0,elapsed_seconds=time.monotonic()-scheduler_started))
+                _write_json_ephemeral(state_path,state)
+                _write_json_ephemeral(root/'progress.json',dict(status='stopped',selected=len(selected),
+                    category=category,active_model_jobs=0,elapsed_seconds=time.monotonic()-scheduler_started),
+                    )
     exported=[]
     for i, item in enumerate(selected):
         c=item['candidate']; trial=item['padded']; lo,hi=trial['original_arcs_base']; a=c['run']['original_arcs_base'][0]
@@ -674,6 +724,51 @@ def run_union(workload):
     merge_distance = float(settings.get('merge_distance_base_voxels', PROTOCOL['dedup_distance']))
     if context < 0 or radius < 0 or merge_distance < 0:
         raise ValueError('union extraction distances must be nonnegative')
+    reproduction_manifest = Path(settings.get('reproduction_manifest', '')) if settings.get('reproduction_manifest') else None
+    if settings.get('run_reproduction_search') and (reproduction_manifest is None or
+                                                     not reproduction_manifest.is_file()):
+        # Reuse the established short-failure extractor verbatim.  We only
+        # synthesize its normal history-report input from the three completed
+        # evaluations; all trial scheduling, self-proximity filtering,
+        # bidirectional search, 100-voxel stepping, and minimal/padded audits
+        # remain in ``run`` above.
+        base_config = Path(settings['reproduction_base_config'])
+        reproduction = json.loads(base_config.read_text())
+        report_path = output / 'reproduction_history_report.json'
+        rows = []
+        for evaluation in settings['evaluations']:
+            summary_path = _summary_path(evaluation['summary'])
+            summary = json.loads(summary_path.read_text())
+            failures = sum(len(case.get('failures', []))
+                           for source in summary['sources'] for case in source['cases'])
+            rows.append({'name': evaluation['name'], 'path': str(summary_path),
+                         'metrics': {'global_result': {'failures': failures}}})
+        atomic_write(report_path, {'version': 1, 'rows': rows}, durable=False)
+        reproduction['output_root'] = str(output / 'reproduction_search')
+        reproduction['short_failures'] = {
+            **reproduction.get('short_failures', {}),
+            'history_report': str(report_path),
+            'baseline_name': settings.get('baseline_name', 'Classic'),
+            'best_name': settings.get('best_name') or min(rows, key=lambda row: row['metrics']['global_result']['failures'])['name'],
+            'evaluation_names': [row['name'] for row in rows],
+            'total_cases': 100000,
+            'best_quota': 100000,
+            'other_quota': 100000,
+            # The three published evaluations are the source of truth.  Missing
+            # corridor chunks are filled on demand by the shared inference
+            # queue; cached chunks are reused.  This is required for a complete
+            # reproduction search rather than a silently truncated cached-only
+            # result.
+            'fill_missing': True,
+            'reuse_trial_root': None,
+        }
+        run(reproduction, devices=reproduction.get('devices', '0'))
+        if reproduction_manifest is None:
+            reproduction_manifest = Path(reproduction['output_root']) / 'manifest.json'
+        if not reproduction_manifest.is_file():
+            raise FileNotFoundError(f'reproduction extractor did not produce {reproduction_manifest}')
+    if reproduction_manifest is not None and not reproduction_manifest.is_file():
+        raise FileNotFoundError(f'missing reproduction manifest: {reproduction_manifest}')
     cache_summary = json.loads(Path(settings['fullres_inference_summary']).read_text())
     cache_by_locator = _cache_source_roots(cache_summary)
     records = {}
@@ -697,16 +792,16 @@ def run_union(workload):
                 if provenance.get('case_index') != global_case:
                     raise ValueError(f'case index mismatch: {trace_path}')
                 fiber_path = str(Path(provenance['fiber_path']).resolve())
-                run = case['reference_run']
-                run_index = int(run['run_index'])
+                reference_run = case['reference_run']
+                run_index = int(reference_run['run_index'])
                 piece_key = (fiber_path, run_index)
                 failures = case.get('failures', [])
                 if failures:
                     points = np.asarray(trace['reference_points_base_xyz'], dtype=np.float64)
                     if provenance.get('reverse'):
                         points = points[::-1]
-                    a, b = (float(run['original_arcs_base'][0]),
-                            float(run['original_arcs_base'][1]))
+                    a, b = (float(reference_run['original_arcs_base'][0]),
+                            float(reference_run['original_arcs_base'][1]))
                     length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
                     if abs(length - (b - a)) > 2.0:
                         raise ValueError(f'reference geometry mismatch: {trace_path}')
@@ -729,6 +824,27 @@ def run_union(workload):
                         entry['intervals'].append((max(a, target - context), min(b, target + context)))
                         entry['episode_count'] += 1
                 global_case += 1
+    if reproduction_manifest is not None:
+        # Replace raw historical failure points with the already audited
+        # minimal/padded intervals selected by the established extractor.
+        # The extra context is deliberately applied only after that search.
+        for entry in records.values():
+            entry['intervals'] = []
+            entry['episode_count'] = 0
+        reproduction = json.loads(reproduction_manifest.read_text())
+        for selected in reproduction.get('cases', []):
+            candidate = selected['candidate']
+            padded = selected['padded']
+            piece_key = (str(Path(candidate['fiber']).resolve()),
+                         int(candidate['run']['run_index']))
+            entry = records.get(piece_key)
+            if entry is None:
+                raise ValueError(f'reproduction case is absent from configured evaluations: {piece_key}')
+            lo, hi = (float(padded['original_arcs_base'][0]),
+                      float(padded['original_arcs_base'][1]))
+            a, b = entry['run_arcs']
+            entry['intervals'].append((max(a, lo - context), min(b, hi + context)))
+            entry['episode_count'] += 1
     merged = []
     for piece_key, entry in sorted(records.items()):
         for lo, hi in merge_failure_intervals(entry['intervals'], merge_distance):
