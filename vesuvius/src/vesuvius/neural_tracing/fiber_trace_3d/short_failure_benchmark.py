@@ -578,9 +578,13 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                     # candidate, leaving the shared inference session idle
                     # between tiny batches.  Results are still consumed in
                     # order by advance_search; this only prefetches them.
-                    ahead = max(1,min(8,(worker_budget*4)//max(1,len(entries))-1))
+                    # Queue a deep causal horizon for every independent
+                    # candidate/direction.  The search still consumes results
+                    # in order, but does not have to stop the native replay
+                    # after a handful of 100-voxel steps.
+                    ahead = max(1,min(64,(worker_budget*32)//max(1,len(entries))-1))
                     requests = []
-                    batch_limit = max(worker_budget*4, int(settings.get('candidate_batch', 512)))
+                    batch_limit = max(worker_budget*32, int(settings.get('candidate_batch', 4096)))
                     used = 0
                     for c,d,n in entries:
                         if any(same_location(c,x['candidate']) for x in selected):
