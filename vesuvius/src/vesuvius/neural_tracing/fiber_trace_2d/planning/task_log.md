@@ -36,3 +36,20 @@
 - The first output directory (`...full_failure_union_20260921_v1`) was an
   interrupted/restarted attempt; the config now points to the complete `v2`
   result and it is the canonical output.
+
+## 2026-09-21 — corrected reproduction-search implementation
+
+- The direct `v2` union was invalid because it bypassed the established
+  bidirectional reproduction search; it was deleted and must not be used as a
+  result.  The corrected run is
+  `/ephemeral/hendrik/fiber3d_train2/evaluations/full_failure_union_20260921_v3`.
+- The corrected workflow first runs the existing 100-base-voxel stepping
+  search (minimal and padded audits in both directions), then adds the
+  requested ±500-base-voxel context and performs interval union/deduplication.
+  Missing inference is filled on demand (`fill_missing=true`) through the
+  shared cache owner.
+- Commit `8422ea88a` removes hot-loop `fsync`/flush barriers, writes
+  regenerable scheduler artifacts without durability barriers, parallelizes
+  reference-file preparation, and lets each native batch use all available
+  case workers.  The resumed v3 search is checkpointed and currently running;
+  no v3 piece count is reported until its reproduction manifest is complete.
