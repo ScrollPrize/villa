@@ -41,7 +41,7 @@ import BeforeAfter from '@site/src/components/BeforeAfter';
 import ChatCallout from '@site/src/components/ChatWidget/ChatCallout';
 
 
-*Last updated: September 6, 2026*
+*Last updated: September 20, 2026*
 
 <ChatCallout prefill="Walk me through the ink detection tutorial" />
 
@@ -507,6 +507,12 @@ aws s3 sync --no-sign-request \
   s3://vesuvius-challenge-open-data/PHerc0139/segments/20260317000000-w035_2026031718/mesh/20260317000000-on-20250728140407-9.362um.tifxyz/ \
   ink-dataset/pherc0139/w035/w035.tifxyz
 ```
+
+:::tip Choosing a published mesh
+A public segment can have several `.tifxyz` meshes, often expressed in different volume frames. Do not assume those variants are interchangeable. Prefer a mesh that is already in the frame of the volume you plan to render, so the render does not need a catalogue transform; if more than one mesh is available in that same frame, prefer the finer grid unless you have measured evidence for another choice.
+
+The published mesh name makes the frame visible: in `20260317000000-on-20250728140407-9.362um.tifxyz`, the `on-20250728140407-9.362um` part matches the volume used below. On one PHerc. 0139 validation segment, [issue #1845](https://github.com/ScrollPrize/villa/issues/1845) measured a 0.0395 downstream ink-model AUC gap between a coarse transformed mesh and the fine in-frame mesh. Decimating the fine in-frame mesh to the coarse grid density accounted for 0.0098 of that gap, so most of the measured difference was associated with the mesh variant/transform rather than grid density alone. That is one measured segment, not a guarantee of the same effect size everywhere.
+:::
 
 Render the geometry against the scroll's native 9.362&nbsp;µm volume with `vc_render_tifxyz`, the same tool that rendered the prediction volumes above. This time it streams the scroll volume from S3 and writes the surface volume as a Zarr. The 28-slice depth matches how the released segments on the data server are rendered; you can render deeper or shallower if you want to experiment:
 
