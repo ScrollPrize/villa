@@ -128,11 +128,14 @@ def denoise_3d(volume, h=0.03):
 def adjust_contrast(volume, kernel_size=8):
     return equalize_adapthist(volume, kernel_size, clip_limit=0.01, nbins=256)
 
-def hessian(volume, gauss_sigma=2, sigma=6):
+def hessian_of_normalized(volume, sigma=6):
+    """Derivative half of `hessian`, on an ALREADY smoothed+normalized volume.
+
+    Split out so it can be evaluated on a z-slab: everything here is local (two
+    np.gradient passes), unlike the gaussian+normalize step above it, which is not.
+    `hessian` keeps its old signature and result, so existing callers are untouched.
+    """
     # N.B. this only returns the upper triangular matrix to save time
-    volume = xndimage.gaussian_filter(volume, sigma=gauss_sigma)
-    volume = normalize(volume)
-    
     joint_hessian = xp.zeros((volume.shape[0], volume.shape[1], volume.shape[2], 3, 3), dtype=float)
     
     Dz = xp.gradient(volume, axis=0, edge_order=2)
@@ -159,6 +162,11 @@ def hessian(volume, gauss_sigma=2, sigma=6):
     zero_mask = xp.trace(joint_hessian, axis1=3, axis2=4) == 0
     
     return joint_hessian, zero_mask
+
+def hessian(volume, gauss_sigma=2, sigma=6):
+    volume = xndimage.gaussian_filter(volume, sigma=gauss_sigma)
+    volume = normalize(volume)
+    return hessian_of_normalized(volume, sigma)
 
 def detect_ridges(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, sigma=6):
     joint_hessian, zero_mask = hessian(volume, gauss_sigma, sigma)
@@ -187,22 +195,9 @@ def detect_ridges(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, sigma=
  
     return ridges
 
-def detect_vesselness(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, sigma=6):
-    """
-    Detect vesselness using the Frangi filter.
-    
-    Parameters:
-    - volume: 3D array representing the input volume.
-    - gamma: Sensitivity to overall structure strength (controls suppression of background).
-    - beta1: Controls sensitivity to tubular structures.
-    - beta2: Controls sensitivity to blob-like structures.
-    - gauss_sigma: Gaussian smoothing applied to the Hessian matrix.
-    - sigma: Scale of differentiation for computing the Hessian.
-    
-    Returns:
-    - vesselness: 3D array representing vesselness probability at each voxel.
-    """
-    joint_hessian, zero_mask = hessian(volume, gauss_sigma, sigma)
+def frangi_from_hessian(joint_hessian, zero_mask, gamma=1.5, beta1=0.5, beta2=0.5):
+    """Frangi response for an already-built Hessian. Unchanged maths, split out so that
+    `detect_vesselness` can apply it one z-slab at a time."""
     eigvals = LA.eigvalsh(joint_hessian, "U")
     # Sort eigenvalues by magnitude (ascending order)
     idxs = np.argsort(np.abs(eigvals), axis=-1)
@@ -230,6 +225,51 @@ def detect_vesselness(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, si
     # Suppress areas where L2 or L3 are positive (non-tubular regions)
     vesselness[L2 > 0] = 0
     vesselness[L3 > 0] = 0
+
+    return vesselness
+
+def detect_vesselness(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, sigma=6,
+                      slab=64, halo=16):
+    """
+    Detect vesselness using the Frangi filter.
+
+    Evaluated in z-slabs. The Hessian is float64 of shape (Z, Y, X, 3, 3) = 72 bytes per
+    voxel, so holding it for a whole cube costs 9.7 GB at 512^3 before eigvalsh, the int64
+    argsort index and the intermediate terms are added. Slabbing bounds that by the slab
+    size; the output is unchanged.
+
+    Parameters:
+    - volume: 3D array representing the input volume.
+    - gamma: Sensitivity to overall structure strength (controls suppression of background).
+    - beta1: Controls sensitivity to tubular structures.
+    - beta2: Controls sensitivity to blob-like structures.
+    - gauss_sigma: Gaussian smoothing applied to the Hessian matrix.
+    - sigma: Scale of differentiation for computing the Hessian.
+    - slab: number of z-planes evaluated at a time.
+    - halo: z-planes of context kept around each slab and then discarded. Only two operations
+      are non-local: gaussian_filter (radius 4*gauss_sigma, scipy truncate=4.0) and the two
+      np.gradient passes (2 planes each at a boundary), so the default covers them exactly
+      rather than approximately, and the result is bit-for-bit the unslabbed one.
+
+    Returns:
+    - vesselness: 3D array representing vesselness probability at each voxel.
+    """
+    # Both of these are GLOBAL: normalize() takes min/max over the whole cube, so it has to
+    # run once, here, before any slabbing. Doing it per slab would rescale each slab by its
+    # own extrema and silently change the output.
+    volume = xndimage.gaussian_filter(volume, sigma=gauss_sigma)
+    volume = normalize(volume)
+
+    n_z = volume.shape[0]
+    vesselness = xp.empty(volume.shape, dtype=float)
+    for z0 in range(0, n_z, slab):
+        z1 = min(z0 + slab, n_z)
+        a, b = max(0, z0 - halo), min(n_z, z1 + halo)
+        joint_hessian, zero_mask = hessian_of_normalized(volume[a:b], sigma)
+        chunk = frangi_from_hessian(joint_hessian, zero_mask, gamma, beta1, beta2)
+        del joint_hessian, zero_mask
+        vesselness[z0:z1] = chunk[z0 - a: z0 - a + (z1 - z0)]
+        del chunk
 
     return vesselness
 
