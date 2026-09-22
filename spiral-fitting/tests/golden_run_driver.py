@@ -39,8 +39,6 @@ sys.path.insert(0, SPIRAL_DIR)
 Z_RANGE_SCALED_COUNT_KEYS = (
     'sample_count_patches_per_step',
     'sample_count_patches_per_step_for_dt',
-    'sample_count_unverified_patches_per_step',
-    'sample_count_unverified_patches_per_step_for_dt',
     'sample_count_relative_winding_pcls',
     'sample_count_absolute_winding_pcls',
     'sample_count_unattached_pcls_per_step',
@@ -131,8 +129,7 @@ def _canonicalize_satisfied(satisfied):
     """Sort entry lists by identity: patch/PCL load order is not
     deterministic run-to-run, only the set of entries is."""
     canonical = dict(satisfied)
-    for key, identity in (('patches', 'id'), ('unverified_patches', 'id'),
-                          ('pcls', 'name')):
+    for key, identity in (('patches', 'id'), ('pcls', 'name')):
         entries = canonical.get(key)
         if isinstance(entries, list):
             canonical[key] = sorted(
@@ -147,7 +144,6 @@ def _satisfied_aggregates(satisfied):
     aggregates = {}
     for key, satisfied_field, total_field in (
             ('patches', 'satisfied_area', 'total_area'),
-            ('unverified_patches', 'satisfied_area', 'total_area'),
             ('pcls', 'satisfied_points', 'total_points')):
         entries = satisfied.get(key) or []
         total_satisfied = sum(entry[satisfied_field] for entry in entries)

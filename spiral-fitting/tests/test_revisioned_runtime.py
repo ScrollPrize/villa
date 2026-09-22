@@ -30,7 +30,7 @@ def resident():
             raise ValueError("invalid selected draft")
         return SimpleNamespace(
             _workspace_membership=copy.deepcopy(records[0]),
-            verified_patches={}, unverified_patches={})
+            verified_patches={})
 
     def install(candidate):
         active.update(candidate._workspace_membership)
@@ -93,8 +93,7 @@ def test_input_batch_restores_progress_after_preparation(running, outcome):
                                step=0, total_steps=0, unit='patches')
         if outcome == 'invalid':
             raise ValueError('invalid patch')
-        return SimpleNamespace(_workspace_membership={}, verified_patches={},
-                               unverified_patches={})
+        return SimpleNamespace(_workspace_membership={}, verified_patches={})
 
     session._context = SimpleNamespace(
         prepare_input_changes=prepare,

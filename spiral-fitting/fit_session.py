@@ -185,7 +185,6 @@ RUN_MUTABLE_PCL_ROLES: tuple[PclRole, ...] = EDITABLE_PCL_ROLES
 
 _INPUT_TOGGLE_KEYS = {
     "verified_patches": "input_use_verified_patches",
-    "unverified_patches": "input_use_unverified_patches",
     "tracks_dbm": "input_use_tracks",
     "fibers": "input_use_fibers",
     "fiber_directions": "input_use_fiber_directions",
@@ -211,7 +210,7 @@ def pcl_role_toggle_key(role: PclRole | str) -> str:
 def input_source_enabled(config: Mapping[str, Any], source: str) -> bool:
     """Whether a rebuild may include one optional supervision source."""
     enabled = bool(config.get(_INPUT_TOGGLE_KEYS[source], True))
-    if source in {"verified_patches", "unverified_patches"}:
+    if source == "verified_patches":
         enabled = enabled and not bool(config.get("input_disable_patches", False))
     return enabled
 
@@ -267,10 +266,6 @@ def _never(config: Mapping[str, Any]) -> bool:
 
 def _verified_patches_enabled(config: Mapping[str, Any]) -> bool:
     return input_source_enabled(config, "verified_patches")
-
-
-def _unverified_patches_enabled(config: Mapping[str, Any]) -> bool:
-    return input_source_enabled(config, "unverified_patches")
 
 
 def _fibers_enabled(config: Mapping[str, Any]) -> bool:
@@ -373,8 +368,6 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
                  conventional_relative="verified_patches",
                  enabled=_verified_patches_enabled,
                  required=_verified_patches_enabled),
-    FitInputSpec("unverified_patches", "directory",
-                 enabled=_unverified_patches_enabled),
     FitInputSpec("fibers", "directory", conventional_relative="fibers",
                  enabled=_fibers_enabled),
     FitInputSpec("fiber_directions", "file",
@@ -457,7 +450,6 @@ class SpiralInputPaths:
     fiber_directions: str = ""
     tracks_dbm: str = ""
     verified_patches: str = ""
-    unverified_patches: str = ""
     outer_shell: str = ""
     normal_x: str = ""
     normal_y: str = ""
@@ -802,7 +794,6 @@ def conventional_input_paths(
         fiber_directions=resolve("fiber_directions"),
         tracks_dbm=resolve("tracks_dbm"),
         verified_patches=resolve("verified_patches"),
-        unverified_patches=spec.path_override("unverified_patches"),
         outer_shell=resolve("outer_shell"),
         normal_x=resolve("normal_x"),
         normal_y=resolve("normal_y"),

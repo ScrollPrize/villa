@@ -42,7 +42,7 @@ STOCHASTIC_PREFIXES = (
 # tighter because the per-entry noise averages out) and in the exact entry
 # identities and counts, both of which are still asserted.
 PER_ENTRY_SATISFIED_RE = re.compile(
-    r'^\["satisfied", "(patches|pcls|unverified_patches)", "\d+", '
+    r'^\["satisfied", "(patches|pcls)", "\d+", '
     r'"(fraction|satisfied_area|satisfied_points)"')
 PER_ENTRY_SATISFIED_REASON = (
     'per-entry satisfaction value: quantized and individually noisy; '

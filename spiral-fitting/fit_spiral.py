@@ -128,7 +128,6 @@ from losses import (
     get_shell_outer_loss,
     get_symmetric_dirichlet_loss,
     get_unattached_pcl_strip_losses,
-    get_unverified_patch_losses,
 )
 from loss_maps import (LossMapRecorder, attach_loss_maps_to_manifest,
                        capture_loss_maps)
@@ -1178,13 +1177,9 @@ def get_dt_loss_eligibility(cfg, iteration, run_dt_resume_iteration=None):
     patch_start = cfg['loss_start_patch_dt']
     track_start = (patch_start if cfg['loss_start_track_dt'] is None
                    else cfg['loss_start_track_dt'])
-    unverified_start = (
-        patch_start if cfg['loss_start_unverified_patch_dt'] is None
-        else cfg['loss_start_unverified_patch_dt'])
     unattached_start = get_unattached_pcl_dt_start(cfg)
     return {
         'verified_patch': run_eligible and iteration > patch_start,
-        'unverified_patch': run_eligible and iteration > unverified_start,
         'track': run_eligible and iteration > track_start,
         'unattached_pcl': run_eligible and iteration > unattached_start,
     }
@@ -1326,117 +1321,6 @@ def _query_near_trusted_geometry(points_np, trusted_geometry_tree, threshold):
     return np.isfinite(dist)
 
 
-def _apply_unverified_patch_trusted_mask(patch, vertices_to_invalidate):
-    if not vertices_to_invalidate.any():
-        return 0, False
-
-    invalid_mask_2d = torch.from_numpy(vertices_to_invalidate.reshape(patch.zyxs.shape[:2]))
-    # Keep the pre-exclusion geometry available for later supervision removal.
-    patch.zyxs = patch.zyxs.clone()
-    patch.zyxs[invalid_mask_2d] = -1.0
-    n_masked = int(vertices_to_invalidate.sum())
-
-    new_valid_vertex_mask = torch.any(patch.zyxs != -1, dim=-1)
-    new_valid_quad_mask = (
-        new_valid_vertex_mask[:-1, :-1]
-        & new_valid_vertex_mask[1:, :-1]
-        & new_valid_vertex_mask[:-1, 1:]
-        & new_valid_vertex_mask[1:, 1:]
-    )
-
-    if not bool(new_valid_quad_mask.any()):
-        return n_masked, True
-
-    patch.__post_init__()
-    return n_masked, False
-
-
-def _mask_unverified_patches_near_trusted_geometry(
-    unverified_patches,
-    trusted_geometry_tree,
-    threshold,
-    max_query_points=2_000_000,
-):
-    if threshold <= 0 or trusted_geometry_tree is None:
-        return dict(unverified_patches), 0, 0
-
-    kept_unverified_patches = {}
-    n_masked_vertices = 0
-    n_dropped_patches = 0
-
-    batch_entries = []
-    batch_points = []
-    batch_total = 0
-
-    def flush_batch():
-        nonlocal batch_entries, batch_points, batch_total
-        nonlocal n_masked_vertices, n_dropped_patches
-
-        if batch_total == 0:
-            return
-
-        points_np = batch_points[0] if len(batch_points) == 1 else np.concatenate(batch_points, axis=0)
-        near_trusted = _query_near_trusted_geometry(points_np, trusted_geometry_tree, threshold)
-
-        offset = 0
-        for patch_id, patch, valid_indices in batch_entries:
-            n_valid = len(valid_indices)
-            patch_near_trusted = near_trusted[offset:offset + n_valid]
-            offset += n_valid
-
-            vertices_to_invalidate = np.zeros(patch.zyxs.shape[0] * patch.zyxs.shape[1], dtype=bool)
-            vertices_to_invalidate[valid_indices[patch_near_trusted]] = True
-            n_masked, dropped = _apply_unverified_patch_trusted_mask(patch, vertices_to_invalidate)
-            n_masked_vertices += n_masked
-            if dropped:
-                n_dropped_patches += 1
-            else:
-                kept_unverified_patches[patch_id] = patch
-
-        batch_entries = []
-        batch_points = []
-        batch_total = 0
-
-    for patch_id, patch in unverified_patches.items():
-        zyxs_flat = patch.zyxs.reshape(-1, 3).cpu().numpy()
-        valid_flat = patch.valid_vertex_mask.reshape(-1).cpu().numpy()
-        valid_indices = np.flatnonzero(valid_flat)
-
-        if len(valid_indices) == 0:
-            kept_unverified_patches[patch_id] = patch
-            continue
-
-        if len(valid_indices) > max_query_points:
-            flush_batch()
-            vertices_to_invalidate = np.zeros(len(valid_flat), dtype=bool)
-            for start in range(0, len(valid_indices), max_query_points):
-                chunk_indices = valid_indices[start:start + max_query_points]
-                near_trusted = _query_near_trusted_geometry(
-                    zyxs_flat[chunk_indices],
-                    trusted_geometry_tree,
-                    threshold,
-                )
-                vertices_to_invalidate[chunk_indices[near_trusted]] = True
-
-            n_masked, dropped = _apply_unverified_patch_trusted_mask(patch, vertices_to_invalidate)
-            n_masked_vertices += n_masked
-            if dropped:
-                n_dropped_patches += 1
-            else:
-                kept_unverified_patches[patch_id] = patch
-            continue
-
-        if batch_total + len(valid_indices) > max_query_points:
-            flush_batch()
-
-        batch_entries.append((patch_id, patch, valid_indices))
-        batch_points.append(zyxs_flat[valid_indices])
-        batch_total += len(valid_indices)
-
-    flush_batch()
-    return kept_unverified_patches, n_masked_vertices, n_dropped_patches
-
-
 class FitContext:
     """Owner of all mutable state and resources for one spiral fit.
 
@@ -1552,9 +1436,6 @@ class FitContext:
         self.verified_patches_path = (
             (paths.verified_patches or None)
             if input_source_enabled(config, 'verified_patches') else None)
-        self.unverified_patches_path = (
-            (paths.unverified_patches or None)
-            if input_source_enabled(config, 'unverified_patches') else None)
         self.shell_path = (
             (paths.outer_shell or None)
             if input_source_enabled(config, 'outer_shell') else None)
@@ -2178,14 +2059,12 @@ class FitContext:
         analysis tools can construct a context, call this, and read:
 
         - patches: verified_patches (+ verified_patches_list,
-          num_verified_patches), unverified_patches
-          (+ unverified_patches_list), shell_patch
+          num_verified_patches), shell_patch
         - point collections: cross_patch_pcls, unattached_pcl_strips,
           unattached_strip_sampling_groups, pcl_sampling_strata, next_id,
           fiber_catalog, link_distance_tolerance, resolved_links, link_components,
           unattached_components / _component_groups / _component_edges
-        - sampling: patch_sampling_probabilities, patch_atlas,
-          unverified_patch_sampling_probabilities, unverified_patch_atlas
+        - sampling: patch_sampling_probabilities, patch_atlas
         - trusted geometry: trusted_geometry_tree,
           influence_anchor_geometry
         - tracks: tracks, track_families, track_source_ids,
@@ -2245,29 +2124,16 @@ class FitContext:
             shell_patch = load_tifxyz(self.shell_path)
 
         use_verified_patches = bool(self.verified_patches_path) and not self.config['input_disable_patches']
-        use_unverified_patches = bool(self.unverified_patches_path) and not self.config['input_disable_patches']
-        if not use_verified_patches and not use_unverified_patches:
+        if not use_verified_patches:
             verified_patches = {}
-            unverified_patches = {}
-            print('skipping all verified/unverified patch loading')
+            print('skipping patch loading')
         else:
-            # An empty verified dir is allowed when unverified patches are supplied
-            # (unverified-only ablations); both empty is a configuration error.
-            verified_patches = (
-                self._load_patches_from_dir(self.verified_patches_path, 'verified patches')
-                if use_verified_patches and self.verified_patches_path else {}
-            )
-            unverified_patches = {}
-            if use_unverified_patches and self.unverified_patches_path:
-                unverified_patches = self._load_patches_from_dir(
-                    self.unverified_patches_path, 'unverified patches')
-
-        if (not verified_patches and not unverified_patches
-                and (use_verified_patches or use_unverified_patches)):
-            raise RuntimeError('No patches could be loaded')
+            verified_patches = self._load_patches_from_dir(
+                self.verified_patches_path, 'verified patches')
+            if not verified_patches:
+                raise RuntimeError('No patches could be loaded')
 
         print(f" loaded {len(verified_patches)} patches")
-        print(f" loaded {len(unverified_patches)} unverified patches")
 
         # ==========================================================================
         # Point collection loading
@@ -2330,9 +2196,6 @@ class FitContext:
                 pid: catalog_copy_of_pcl(pcl) for pid, pcl in point_collections.items()
             }
             self._source_verified_patches = dict(verified_patches)
-            self._source_unverified_patches = {
-                pid: copy.copy(patch) for pid, patch in unverified_patches.items()
-            }
         self._derive_point_inputs(
             verified_patches, point_collections, fiber_point_collections)
         unattached_pcl_strips = self.unattached_pcl_strips
@@ -2436,7 +2299,7 @@ class FitContext:
                 f"({_startup_resource_suffix()})")
 
         # ==========================================================================================
-        # trusted geometry (verified patches and pcls) kdtree / unverified patches + tracks masking
+        # trusted geometry (verified patches and pcls) kdtree / tracks masking
         # ==========================================================================================
 
         # The trusted point cloud is consumed only by a CPU cKDTree. Build it directly
@@ -2479,9 +2342,6 @@ class FitContext:
                     trusted_offset:trusted_offset + count].copy_(zyxs[selected])
                 trusted_offset += count
 
-        unverified_patches_list = []
-        unverified_patch_sampling_probabilities = None
-        unverified_patch_atlas = None
         using_tracks = (
             (self.config['loss_weight_track_radius'] > 0 or self.config['loss_weight_track_dt'] > 0)
             and bool(tracks)
@@ -2489,10 +2349,9 @@ class FitContext:
         trusted_geometry_tree = None
         verified_patches_and_pcls_np = None
 
-        # Untrusted 'unverified' patches: mask away wherever they fall near trusted geometry (verified
-        # patch vertices + pcl strips, same anchor cloud used for snap-anchors / track-exclusion), then
-        # build their own sampling cache + GPU atlas. They feed only their own radius/DT losses.
-        if unverified_patches or using_tracks:
+        # The trusted anchor cloud (verified patch vertices + pcl strips) drives
+        # the DBM-track exclusion in tracks.py.
+        if using_tracks:
             # Build a cKDTree over the scroll-space anchor points (CPU) for fixed-radius
             # nearest-neighbour queries.
             verified_patches_and_pcls_np = verified_patches_and_pcls_cpu.numpy()
@@ -2503,33 +2362,6 @@ class FitContext:
                     detail=f'{len(verified_patches_and_pcls_np):,} points')
                 trusted_geometry_tree = cKDTree(verified_patches_and_pcls_np)
 
-        if unverified_patches:
-            # For each unverified patch, invalidate (set zyxs -> -1) every currently-valid vertex
-            # lying within the exclusion radius of trusted geometry, then re-derive the patch's
-            # masks/area. Patches left with no valid quad are dropped. This is the patch analogue
-            # of the DBM-track exclusion in tracks.py: untrusted patches only constrain regions
-            # the trusted inputs don't already cover, so they can't fight verified geometry.
-            exclusion_radius = float(self.config['patch_unverified_patch_exclusion_radius'])
-            progress.begin(
-                'loading', 'Masking unverified patches',
-                detail=f'{len(unverified_patches):,} patches')
-            unverified_patches, n_masked_vertices, n_dropped_patches = (
-                _mask_unverified_patches_near_trusted_geometry(
-                    unverified_patches,
-                    trusted_geometry_tree,
-                    exclusion_radius,
-                )
-            )
-            print(
-                f'unverified patches: masked {n_masked_vertices} vertices near trusted geometry '
-                f'(radius {exclusion_radius:.1f}), dropped {n_dropped_patches} fully-masked patches; '
-                f'{len(unverified_patches)} remain'
-            )
-
-        if unverified_patches:
-            unverified_patches_list = list(unverified_patches.values())
-            unverified_patch_sampling_probabilities = self._prepare_patch_sampling_cache(unverified_patches_list)
-            unverified_patch_atlas = PatchAtlas(unverified_patches, device='cuda')
 
         # Loaded host inputs, kept as inspectable attributes (ownership
         # class (b): host-prepared inputs and caches). cross_patch_pcls,
@@ -2542,7 +2374,6 @@ class FitContext:
         self.shell_patch = shell_patch
         self.shell_envelope = shell_envelope
         self.verified_patches = verified_patches
-        self.unverified_patches = unverified_patches
         self.next_id = next_id
         self.link_distance_tolerance = link_distance_tolerance
         self.dense_spacing_mode = dense_spacing_mode
@@ -2565,9 +2396,6 @@ class FitContext:
         self.patch_atlas = patch_atlas
         self.using_tracks = using_tracks
         self.trusted_geometry_tree = trusted_geometry_tree
-        self.unverified_patches_list = unverified_patches_list
-        self.unverified_patch_sampling_probabilities = unverified_patch_sampling_probabilities
-        self.unverified_patch_atlas = unverified_patch_atlas
 
         # A compact subsample of the trusted cloud seeds a future Run's
         # influence anchor bank. Keep it for every interactive session because
@@ -2602,16 +2430,10 @@ class FitContext:
         if self.dt_target_whole_object:
             progress.begin(
                 'loading', 'Preparing distance-target samples',
-                detail=(
-                    f'{len(self.verified_patches_list) + len(self.unverified_patches_list):,} '
-                    'patches'))
+                detail=f'{len(self.verified_patches_list):,} patches')
             prepare_patch_dt_target_samples(
                 self.verified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
             )
-            if self.unverified_patches_list:
-                prepare_patch_dt_target_samples(
-                    self.unverified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
-                )
 
     def _vertical_fiber_radial_offset(self):
         """Radial target offset (voxels) applied to vertical fiber strips; 0 when off."""
@@ -3259,8 +3081,6 @@ class FitContext:
             self.device,
             self.config['theta_crossing_map_update_interval'])
         self.patch_atlas.register_theta_topology(crossing_map)
-        if self.unverified_patch_atlas is not None:
-            self.unverified_patch_atlas.register_theta_topology(crossing_map)
 
         flat = get_or_build_unattached_pcl_flat(
             self.unattached_pcl_strips, self.device)
@@ -3345,7 +3165,7 @@ class FitContext:
                 pieces.append(points[in_roi])
         return torch.cat(pieces, dim=0) if pieces else torch.empty((0, 3))
 
-    def _exclude_non_liftable_patches(self, verified_ids, unverified_ids, report):
+    def _exclude_non_liftable_patches(self, verified_ids, report):
         """Remove inconsistent patches from every active patch sampling pool."""
         warnings = []
         rejected_verified = set(verified_ids)
@@ -3362,18 +3182,6 @@ class FitContext:
             warnings.append(warning)
             del self.verified_patches[patch_id]
 
-        for patch_id in unverified_ids:
-            patch = self.unverified_patches[patch_id]
-            path = self._patch_input_path(
-                patch_id, patch, self.unverified_patches_path)
-            self.non_liftable_patch_paths.add(path)
-            warning = (
-                f'non-liftable patch {path!r} has theta cycle inconsistencies; '
-                'excluding it from this fit')
-            print(f'WARNING: {warning}')
-            warnings.append(warning)
-            del self.unverified_patches[patch_id]
-
         # Preserve list identities where possible because resident-session
         # loss closures may already hold them.
         self.verified_patches_list[:] = self.verified_patches.values()
@@ -3382,16 +3190,6 @@ class FitContext:
             if self.verified_patches_list else np.empty(0, dtype=np.float32))
         self.num_verified_patches = len(self.verified_patches_list)
         self.patch_atlas = self.patch_atlas.replaced(self.verified_patches)
-
-        self.unverified_patches_list[:] = self.unverified_patches.values()
-        if self.unverified_patches_list:
-            self.unverified_patch_sampling_probabilities = \
-                self._patch_sampling_probabilities(self.unverified_patches_list)
-            self.unverified_patch_atlas = self.unverified_patch_atlas.replaced(
-                self.unverified_patches)
-        else:
-            self.unverified_patch_sampling_probabilities = None
-            self.unverified_patch_atlas = None
 
         if rejected_verified and self.cross_patch_pcls:
             for pcl in self.cross_patch_pcls:
@@ -3431,7 +3229,7 @@ class FitContext:
         self._write_non_liftable_patch_report()
         print(
             'WARNING: theta consistency gate rejected '
-            f'{len(verified_ids) + len(unverified_ids)} patch(es) from '
+            f'{len(verified_ids)} patch(es) from '
             f'{report["inconsistent_edges"]} inconsistent edge(s)')
         return warnings
 
@@ -3445,15 +3243,12 @@ class FitContext:
                 self._write_non_liftable_patch_report()
                 return warnings
             verified_ids = self.patch_atlas.patch_ids_for_theta_nodes(bad_nodes)
-            unverified_ids = (
-                self.unverified_patch_atlas.patch_ids_for_theta_nodes(bad_nodes)
-                if self.unverified_patch_atlas is not None else [])
-            if not verified_ids and not unverified_ids:
+            if not verified_ids:
                 raise RuntimeError(
                     'theta consistency gate found inconsistent potential edges '
                     'that could not be attributed to a patch')
             warnings.extend(self._exclude_non_liftable_patches(
-                verified_ids, unverified_ids, report))
+                verified_ids, report))
             self.theta_crossing_map = self._make_theta_crossing_map()
             self.theta_crossing_map.force_refresh(
                 self.slice_to_spiral_transform)
@@ -3486,11 +3281,6 @@ class FitContext:
             'loading', 'Building verified-patch GPU atlas',
             detail=f'{len(self.verified_patches):,} patches')
         self.patch_atlas.materialize(self.device)
-        if self.unverified_patch_atlas is not None:
-            progress.begin(
-                'loading', 'Building unverified-patch GPU atlas',
-                detail=f'{len(self.unverified_patches):,} patches')
-            self.unverified_patch_atlas.materialize(self.device)
 
         # The full z series is a model input. PNG-only slice grids and raster inputs
         # are prepared lazily at final export, and never in a resident VC3D session.
@@ -4200,35 +3990,6 @@ class FitContext:
         if checkpoint.get('scheduler') is not None:
             self.lr_scheduler.load_state_dict(checkpoint['scheduler'])
 
-    def _rebuild_unverified_patch_inputs(self, exclusion_radius):
-        """Remask retained unverified sources for a Run-boundary mask edit."""
-        if not input_source_enabled(self.config, 'unverified_patches'):
-            return {}, [], None, None
-        if hasattr(self, '_source_unverified_patches'):
-            candidates = {
-                pid: copy.copy(patch)
-                for pid, patch in self._source_unverified_patches.items()
-            }
-        elif self.unverified_patches_path:
-            candidates = self._load_patches_from_dir(self.unverified_patches_path)
-        else:
-            return {}, [], None, None
-        candidates, n_masked, n_dropped = \
-            _mask_unverified_patches_near_trusted_geometry(
-                candidates, self.trusted_geometry_tree, exclusion_radius)
-        print(
-            f'unverified patches: remasked {n_masked} vertices near trusted '
-            f'geometry (radius {exclusion_radius:.1f}), dropped {n_dropped}; '
-            f'{len(candidates)} remain')
-        candidate_list = list(candidates.values())
-        probabilities = (
-            self._prepare_patch_sampling_cache(candidate_list)
-            if candidate_list else None)
-        atlas = (
-            PatchAtlas(candidates, device=self.device)
-            if candidate_list else None)
-        return candidates, candidate_list, probabilities, atlas
-
     def _prepare_png_visualization_inputs(self):
         zs = np.linspace(
             self.z_begin,
@@ -4391,7 +4152,6 @@ class FitContext:
                 name: self.config.get(f'loss_weight_{name}', 0.0)
                 for name in (
                     'patch_radius', 'patch_dt',
-                    'unverified_patch_radius', 'unverified_patch_dt',
                     'sym_dirichlet', 'rel_winding', 'abs_winding',
                     'dense_normals', 'dense_spacing',
                     'unattached_pcl_radius', 'unattached_pcl_dt',
@@ -4429,17 +4189,6 @@ class FitContext:
                     crossing_map=self.theta_crossing_map,
                     cfg=self.config,
                 )
-                if self.unverified_patch_atlas is not None:
-                    get_unverified_patch_losses(
-                        transform, dr,
-                        self.config['sample_count_unverified_patches_per_step'],
-                        self.config['sample_count_unverified_patches_per_step_for_dt'],
-                        self.unverified_patches_list, self.unverified_patch_atlas,
-                        self.unverified_patch_sampling_probabilities,
-                        compute_dt=self.config['loss_weight_unverified_patch_dt'] > 0,
-                        crossing_map=self.theta_crossing_map,
-                        cfg=self.config,
-                    )
                 if self.config['loss_weight_sym_dirichlet'] > 0:
                     get_symmetric_dirichlet_loss(
                         transform, dr, self.shell_outer_winding_idx,
@@ -4568,7 +4317,6 @@ class FitContext:
             candidate._preparing_inputs = True
             candidate.non_liftable_patch_paths = set(self.non_liftable_patch_paths)
             candidate._source_verified_patches = dict(self._source_verified_patches)
-            candidate._source_unverified_patches = dict(self._source_unverified_patches)
             candidate._source_point_collections = {
                 cid: catalog_copy_of_pcl(pcl)
                 for cid, pcl in self._source_point_collections.items()
@@ -4588,9 +4336,10 @@ class FitContext:
                 path = record.get('path')
                 source_id = str(record.get('source_id', logical_id))
                 if kind == 'patch':
-                    unverified = record.get('role') == 'unverified'
-                    source = (candidate._source_unverified_patches if unverified
-                              else candidate._source_verified_patches)
+                    if record.get('role') not in (None, 'verified'):
+                        raise ValueError(
+                            f"Patch {logical_id} has unsupported role {record.get('role')!r}")
+                    source = candidate._source_verified_patches
                     if source_id != logical_id and source_id in source:
                         # Preserve the dataset patch name for between-patch
                         # annotations; catalog UUID is independent of that name.
@@ -4616,8 +4365,7 @@ class FitContext:
                             reason = 'has no valid quads' if not valid else 'is outside the fitted z range'
                             raise ValueError(f'Patch {logical_id} {reason}')
                         source[patch_id] = patch
-                        if not unverified:
-                            changed_patches[logical_id] = patch
+                        changed_patches[logical_id] = patch
                     resident_id = patch_id
                 elif kind in {'pcl', 'fiber'}:
                     source = candidate._source_point_collections
@@ -4696,7 +4444,6 @@ class FitContext:
             candidate.patch_sampling_probabilities = candidate._prepare_patch_sampling_cache(
                 candidate.verified_patches_list)
             candidate.patch_atlas = self.patch_atlas.replaced(candidate.verified_patches)
-            rejected_unverified = set()
             candidate._input_warnings = []
             while True:
                 points, fibers = {}, {}
@@ -4719,25 +4466,9 @@ class FitContext:
                                    if candidate._workspace_membership[logical_id]['resident_id']
                                    in candidate.verified_patches}
                 candidate._refresh_trusted_geometry()
-                unverified = {
-                    pid: copy.copy(patch) for pid, patch in candidate._source_unverified_patches.items()
-                    if pid not in rejected_unverified
-                } if input_source_enabled(self.config, 'unverified_patches') else {}
-                candidate.unverified_patches, _, _ = _mask_unverified_patches_near_trusted_geometry(
-                    unverified, candidate.trusted_geometry_tree,
-                    float(self.config['patch_unverified_patch_exclusion_radius']))
-                candidate.unverified_patches_list = list(candidate.unverified_patches.values())
-                candidate.unverified_patch_sampling_probabilities = candidate._prepare_patch_sampling_cache(
-                    candidate.unverified_patches_list)
-                candidate.unverified_patch_atlas = None
-                if candidate.unverified_patches:
-                    candidate.unverified_patch_atlas = (
-                        self.unverified_patch_atlas.replaced(candidate.unverified_patches)
-                        if self.unverified_patch_atlas is not None else
-                        PatchAtlas(candidate.unverified_patches, self.device).materialize())
                 if self.dt_target_whole_object:
                     prepare_patch_dt_target_samples(
-                        candidate.verified_patches_list + candidate.unverified_patches_list,
+                        candidate.verified_patches_list,
                         self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'])
                 candidate.dt_target_cache_manager = DtTargetCacheManager(
                     self.dt_target_cache_manager.update_interval,
@@ -4753,26 +4484,22 @@ class FitContext:
                         track_source_ids=self.track_source_ids, crossing_cache=self.track_crossing_cache,
                         track_graph=self.track_graph, progress=self.progress)
                 before_verified = set(candidate.verified_patches)
-                before_unverified = set(candidate.unverified_patches)
                 candidate._input_warnings.extend(candidate._build_theta_crossing_map())
                 rejected_verified = before_verified - set(candidate.verified_patches)
-                rejected = before_unverified - set(candidate.unverified_patches)
                 for record in records:
                     # Sources predate startup theta validation. Adoption may
                     # repeat its exclusions; only live revisions must fail.
                     if (record['kind'] != 'patch' or record.get('deleted')
                             or record.get('adopt')):
                         continue
-                    rejected_ids = rejected if record.get('role') == 'unverified' else rejected_verified
                     member = candidate._workspace_membership[str(record['id'])]
-                    if member['resident_id'] in rejected_ids:
+                    if member['resident_id'] in rejected_verified:
                         raise ValueError(f"Patch {record['id']} failed theta consistency validation")
-                rejected_unverified.update(rejected)
-                if before_verified == set(candidate.verified_patches) and not rejected:
+                if not rejected_verified:
                     break
-                # Theta rejection can detach points and reveal formerly masked
-                # unverified geometry. Re-derive both from their immutable sources
-                # before accepting this candidate, with rejected patches excluded.
+                # Theta rejection can detach points. Re-derive the point inputs
+                # from their immutable sources before accepting this candidate,
+                # with rejected patches excluded.
             active_point_ids = set(candidate.regular_pcl_catalog)
             active_point_ids.update(pcl['id'] for pcl in candidate.fiber_catalog.values())
             for cid, pcl in self._source_point_collections.items():
@@ -5133,29 +4860,9 @@ class FitContext:
                 self.patch_sampling_probabilities = \
                     self._prepare_patch_sampling_cache(self.verified_patches_list)
                 self.patch_atlas.rebuild_sampling_atlas()
-                if self.unverified_patches_list:
-                    self.unverified_patch_sampling_probabilities = \
-                        self._prepare_patch_sampling_cache(
-                            self.unverified_patches_list)
-                    self.unverified_patch_atlas.rebuild_sampling_atlas()
             elif 'patch_sampling_area_exponent' in changed:
                 self.patch_sampling_probabilities = self._patch_sampling_probabilities(
                     self.verified_patches_list)
-                if self.unverified_patches_list:
-                    self.unverified_patch_sampling_probabilities = \
-                        self._patch_sampling_probabilities(self.unverified_patches_list)
-            if 'patch_unverified_patch_exclusion_radius' in changed:
-                (rebuilt_unverified, rebuilt_unverified_list,
-                 rebuilt_unverified_probabilities,
-                 rebuilt_unverified_atlas) = \
-                    self._rebuild_unverified_patch_inputs(float(
-                        self.config['patch_unverified_patch_exclusion_radius']))
-            else:
-                rebuilt_unverified = self.unverified_patches
-                rebuilt_unverified_list = self.unverified_patches_list
-                rebuilt_unverified_probabilities = \
-                    self.unverified_patch_sampling_probabilities
-                rebuilt_unverified_atlas = self.unverified_patch_atlas
 
             # Loss weights are live settings. If a shell loss is enabled for
             # the first time, construct only the resident structure that loss
@@ -5194,11 +4901,6 @@ class FitContext:
                         self.verified_patches_list,
                         self.config['sample_count_patch_dt_target_points'],
                         self.config['dt_target_max_stride'])
-                    if self.unverified_patches_list:
-                        prepare_patch_dt_target_samples(
-                            self.unverified_patches_list,
-                            self.config['sample_count_patch_dt_target_points'],
-                            self.config['dt_target_max_stride'])
             if any(key.startswith('dt_') for key in changed) \
                     or dt_preparation_changed:
                 self.dt_target_cache_manager.update_interval = max(
@@ -5236,10 +4938,6 @@ class FitContext:
             relinked_everything = False
             if fiber_records is not None:
                 self._reingest_fiber_documents(fiber_records)
-                rebuilt_unverified = self.unverified_patches
-                rebuilt_unverified_list = self.unverified_patches_list
-                rebuilt_unverified_probabilities = self.unverified_patch_sampling_probabilities
-                rebuilt_unverified_atlas = self.unverified_patch_atlas
                 rederived_views = True
             if changed & all_link_keys and (fiber_catalog or regular_catalog):
                 self._relink_all_points_to_patches(iteration=current_iteration)
@@ -5270,10 +4968,6 @@ class FitContext:
                     [], {'influence_enabled': False}, current_iteration=current_iteration,
                     target_iteration=current_iteration)
                 self.install_input_changes(candidate)
-                rebuilt_unverified = self.unverified_patches
-                rebuilt_unverified_list = self.unverified_patches_list
-                rebuilt_unverified_probabilities = self.unverified_patch_sampling_probabilities
-                rebuilt_unverified_atlas = self.unverified_patch_atlas
                 rederived_views = True
             # Prepare tracks against the final participation geometry and policy.
             if reprepare_tracks and rebuilt_tracks is None and self.tracks:
@@ -5318,22 +5012,12 @@ class FitContext:
             self.preview_extent_tracks = (
                 (self.prepared_main_tracks['flat_zyx_cpu'],)
                 if self.prepared_main_tracks is not None else ())
-        self.unverified_patches = rebuilt_unverified
-        self.unverified_patches_list = rebuilt_unverified_list
-        self.unverified_patch_sampling_probabilities = \
-            rebuilt_unverified_probabilities
-        self.unverified_patch_atlas = rebuilt_unverified_atlas
-        if self.unverified_patch_atlas is not None:
-            self.unverified_patch_atlas.materialize(self.device)
         if changed & {
                 'pcl_vertical_fiber_radial_offset_enabled',
                 'pcl_vertical_fiber_radial_offset_voxels',
         }:
             self._refill_vertical_fiber_radial_offsets()
-        if changed & {
-                'patch_loss_z_margin',
-                'patch_unverified_patch_exclusion_radius',
-        }:
+        if 'patch_loss_z_margin' in changed:
             self._build_theta_crossing_map()
             self.dt_target_cache_manager.reset()
         elif 'theta_crossing_map_update_interval' in changed:
@@ -5414,8 +5098,6 @@ class FitContext:
         compute_patch_dt = dt_eligibility['verified_patch']
         track_dt_start = self.config['loss_start_patch_dt'] if self.config['loss_start_track_dt'] is None else self.config['loss_start_track_dt']
         compute_track_dt = dt_eligibility['track']
-        unverified_patch_dt_start = self.config['loss_start_patch_dt'] if self.config['loss_start_unverified_patch_dt'] is None else self.config['loss_start_unverified_patch_dt']
-        compute_unverified_patch_dt = dt_eligibility['unverified_patch']
         compute_unattached_pcl_dt = dt_eligibility['unattached_pcl']
         unattached_pcl_dt_start = get_unattached_pcl_dt_start(self.config)
 
@@ -5424,7 +5106,6 @@ class FitContext:
         dt_progressive_outer = self.shell_outer_winding_idx
         patch_dt_max_winding = get_progressive_dt_max_winding(self.config, iteration, self.config['loss_start_patch_dt'], dt_progressive_outer)
         track_dt_max_winding = get_progressive_dt_max_winding(self.config, iteration, track_dt_start, dt_progressive_outer)
-        unverified_patch_dt_max_winding = get_progressive_dt_max_winding(self.config, iteration, unverified_patch_dt_start, dt_progressive_outer)
         unattached_pcl_dt_max_winding = get_progressive_dt_max_winding(self.config, iteration, unattached_pcl_dt_start, dt_progressive_outer)
         if patch_dt_max_winding is not None:
             log_metrics['patch_dt_max_winding'] = patch_dt_max_winding
@@ -5434,7 +5115,6 @@ class FitContext:
             log_metrics['unattached_pcl_dt_max_winding'] = unattached_pcl_dt_max_winding
 
         patch_dt_target_cache = None
-        unverified_patch_dt_target_cache = None
         unattached_pcl_dt_target_cache = None
         track_dt_target_cache = None
         if self.dt_target_whole_object:
@@ -5442,13 +5122,6 @@ class FitContext:
                 patch_dt_target_cache = self.dt_target_cache_manager.get('patch', iteration, lambda: compute_patch_dt_target_cache(
                     self.slice_to_spiral_transform, self.dr_per_winding,
                     self.verified_patches_list, self.patch_atlas,
-                    self.theta_crossing_map,
-                    self.config['dt_target_floating_threshold'],
-                ))
-            if compute_unverified_patch_dt and self.config['loss_weight_unverified_patch_dt'] > 0 and self.unverified_patch_atlas is not None:
-                unverified_patch_dt_target_cache = self.dt_target_cache_manager.get('unverified_patch', iteration, lambda: compute_patch_dt_target_cache(
-                    self.slice_to_spiral_transform, self.dr_per_winding,
-                    self.unverified_patches_list, self.unverified_patch_atlas,
                     self.theta_crossing_map,
                     self.config['dt_target_floating_threshold'],
                 ))
@@ -5510,29 +5183,6 @@ class FitContext:
         backward_family(patch_family)
         del patch_family, patch_loss_values
 
-        if self.unverified_patch_atlas is not None and (
-            self.config['loss_weight_unverified_patch_radius'] > 0
-            or self.config['loss_weight_unverified_patch_dt'] > 0
-        ):
-            unverified_loss_values = get_unverified_patch_losses(
-                self.slice_to_spiral_transform,
-                self.dr_per_winding,
-                self.config['sample_count_unverified_patches_per_step'],
-                self.config['sample_count_unverified_patches_per_step_for_dt'],
-                self.unverified_patches_list,
-                self.unverified_patch_atlas,
-                self.unverified_patch_sampling_probabilities,
-                compute_dt=compute_unverified_patch_dt,
-                dt_max_winding=unverified_patch_dt_max_winding,
-                dt_target_cache=unverified_patch_dt_target_cache,
-                crossing_map=self.theta_crossing_map,
-                cfg=self.config,
-            )
-            backward_family({
-                'unverified_patch_radius': unverified_loss_values[0] * self.config['loss_weight_unverified_patch_radius'],
-                'unverified_patch_dt': unverified_loss_values[1] * self.config['loss_weight_unverified_patch_dt'],
-            })
-            del unverified_loss_values
 
         if self.config['loss_weight_sym_dirichlet'] > 0:
             backward_family({
@@ -5960,9 +5610,6 @@ class FitContext:
                 patch_atlas=self.patch_atlas,
                 unattached_pcl_strips=self.unattached_pcl_strips,
                 tracks=self.tracks,
-                unverified_patches_list=self.unverified_patches_list,
-                unverified_patches_dict=self.unverified_patches,
-                unverified_patch_atlas=self.unverified_patch_atlas,
                 out_path=self.out_path,
                 cfg=self.config,
                 z_begin=self.z_begin,
@@ -6105,8 +5752,6 @@ if __name__ == '__main__':
         z_range_scaled_count_keys = (
             'sample_count_patches_per_step',
             'sample_count_patches_per_step_for_dt',
-            'sample_count_unverified_patches_per_step',
-            'sample_count_unverified_patches_per_step_for_dt',
             'sample_count_relative_winding_pcls',
             'sample_count_absolute_winding_pcls',
             'sample_count_unattached_pcls_per_step',

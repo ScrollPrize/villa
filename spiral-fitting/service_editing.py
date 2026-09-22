@@ -174,7 +174,6 @@ class EditingWorkspace:
                 raise ApiError(409, 'PCL source changed while snapshotting the editing workspace')
         resolved = self.sources.get('resolved', {})
         for key, kind, role in [('verified_patches', 'patch', 'verified'),
-                                ('unverified_patches', 'patch', 'unverified'),
                                 ('fibers', 'fiber', None)]:
             directory = Path(resolved.get(key) or self.dataset / key)
             if not directory.is_dir():
@@ -210,7 +209,7 @@ class EditingWorkspace:
                 raise ApiError(400, 'Input name must be a safe file name')
             if kind == 'pcl' and role in PCL_ROLE_FILES:
                 target = self.dataset / PCL_ROLE_FILES[role]
-            elif kind == 'patch' and role in {'verified', 'unverified', None}:
+            elif kind == 'patch' and role in {'verified', None}:
                 role = role or 'verified'
                 target = Path(self.sources.get('resolved', {}).get(f'{role}_patches') or self.dataset / f'{role}_patches') / name
             elif kind == 'fiber':

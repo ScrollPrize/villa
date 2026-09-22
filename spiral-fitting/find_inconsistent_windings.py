@@ -206,9 +206,7 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
     # This analysis needs no scroll volume, track store, or outer shell:
     # leaving those paths empty keeps load_host_inputs() from touching the
     # training-only inputs. Legacy role-less PCL specs (role=None) retain the
-    # historical abs_winding.json basename inference. Attachment is over the
-    # verified patch set only, so the (slow, unrelated) unverified patches
-    # are skipped; they don't change the cross-patch / attached pcl set.
+    # historical abs_winding.json basename inference.
     # Fibers are same-winding annotations: when loaded they classify as 'neither'
     # pcls (delta-0 cross-patch edges), exactly like same_windings.json. Off
     # unless a fibers dir is passed.

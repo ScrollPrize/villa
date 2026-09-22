@@ -62,7 +62,7 @@ The [last section](#how-it-works) of this tutorial goes into how it works intern
 
 The spiral is flexible about its inputs: it consumes many kinds of evidence, in almost any combination, and each kind can be created manually or automatically.
 
-- **Surface patches** — small pieces of scroll surface, stored as `tifxyz` meshes (the grid-of-3D-points format used by VC3D). These can come from [GrowPatch](2026_open_problems#normal-grids-growpatch-and-local-tracing), [lasagna](2026_open_problems#lasagna-smoother-optimization-of-one-or-more-sheets) (direct growth, or growth around fibers), neural [Copy In/Out](2026_open_problems#copy-outin-exploiting-neighboring-wraps), or any other segmentation method. Patches are split into two groups, **verified** and **unverified**: the fit places strong weight on the human-checked verified patches, and treats the unverified ones as weaker hints. The verified patches are also used to calculate evaluation metrics.
+- **Surface patches** — small pieces of scroll surface, stored as `tifxyz` meshes (the grid-of-3D-points format used by VC3D). These can come from [GrowPatch](2026_open_problems#normal-grids-growpatch-and-local-tracing), [lasagna](2026_open_problems#lasagna-smoother-optimization-of-one-or-more-sheets) (direct growth, or growth around fibers), neural [Copy In/Out](2026_open_problems#copy-outin-exploiting-neighboring-wraps), or any other segmentation method. Only human-checked (**verified**) patches are recommended; they are also used to calculate evaluation metrics.
 - **Strips and lines of points** that follow the surface of a single sheet — either *point collections* drawn in VC3D, or *fibers* traced in VC3D.
 - **Relative winding annotations** — sets of points lying on different windings, annotated with how many windings apart they are (e.g. "these two points are exactly one wrap apart"). Represented as VC3D point collections with relative-winding annotations.
 - **Absolute winding annotations** — points annotated with the absolute winding number they lie on (e.g. "this patch is on winding 20"). Also VC3D point collections.
@@ -120,7 +120,7 @@ Two separate things configure a run: **where the data is** — given on the comm
 
 ##### The dataset
 
-`fit_spiral.py` takes a `--dataset` root and resolves the conventional layout underneath it: `umbilicus.json`, `verified_patches/`, `fibers/`, `fiber_directions.npz`, `outer_shell/`, `tracks/`, `winding_inference/`, the `lasagna_inputs/*.ome.zarr` volumes, and the point-collection documents `abs_winding.json`, `relative_windings.json`, `same_windings.json` and `drawn_control_points.json`. A download of the published dataset is already in that layout, so there are no paths to edit. The one input with no conventional location is `unverified_patches/`, which must be named explicitly in the `paths` block described below.
+`fit_spiral.py` takes a `--dataset` root and resolves the conventional layout underneath it: `umbilicus.json`, `verified_patches/`, `fibers/`, `fiber_directions.npz`, `outer_shell/`, `tracks/`, `winding_inference/`, the `lasagna_inputs/*.ome.zarr` volumes, and the point-collection documents `abs_winding.json`, `relative_windings.json`, `same_windings.json` and `drawn_control_points.json`. A download of the published dataset is already in that layout, so there are no paths to edit.
 
 You also need to provide a **`spiral-scroll.json`** in the dataset root, recording the physical facts of the scroll:
 
@@ -133,7 +133,7 @@ You also need to provide a **`spiral-scroll.json`** in the dataset root, recordi
 }
 ```
 
-`name` is free-form and is what appears in the generated run-folder name. `spiral_outward_sense` (`"CW"` or `"ACW"`) says which way the spiral turns as it winds outward. No automated method determines it: it is read off the CT data by a person in VC3D, or taken from an already-fitted spiral. The file can also carry a `paths` object naming individual inputs that have no conventional location (`"unverified_patches"`) or whose filenames don't match the conventional ones (`"tracks_dbm"` is the usual one), and `normal_zarr_group` / `lasagna_scale`, which choose the OME-Zarr pyramid level the lasagna normal stores are read at — these are easy to get wrong silently, so read the scale off the store's own `.zattrs` rather than copying another scroll's values. The [spiral-fitting README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md) documents the full schema.
+`name` is free-form and is what appears in the generated run-folder name. `spiral_outward_sense` (`"CW"` or `"ACW"`) says which way the spiral turns as it winds outward. No automated method determines it: it is read off the CT data by a person in VC3D, or taken from an already-fitted spiral. The file can also carry a `paths` object naming individual inputs whose filenames don't match the conventional ones (`"tracks_dbm"` is the usual one), and `normal_zarr_group` / `lasagna_scale`, which choose the OME-Zarr pyramid level the lasagna normal stores are read at — these are easy to get wrong silently, so read the scale off the store's own `.zattrs` rather than copying another scroll's values. The [spiral-fitting README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md) documents the full schema.
 
 ##### The fit configuration
 
@@ -147,7 +147,7 @@ FIT_SPIRAL_CONFIG_OVERRIDES='{"z_begin": 10500, "z_end": 11500, "optimizer_num_t
 The settings you are most likely to touch:
 
 - `z_begin`, `z_end` — the slice range (in full-resolution voxels) to fit; the defaults, 4,000 and 17,000, span the whole written region of Scroll 1. **Consider starting with a small range**: fitting all of it needs a lot of GPU memory and time, and a ~1,000-slice range is a good first run on a smaller GPU. Per-step sample counts are scaled automatically to the size of the z-range, so the other hyperparameters don't need retuning when you change it.
-- **`input_use_*` — whether an input that is present is actually used.** Each optional input source has its own toggle, independent of whether its file is there: `input_use_verified_patches`, `input_use_unverified_patches`, `input_use_tracks`, `input_use_fibers`, `input_use_fiber_directions`, `input_use_normals`, `input_use_gradient_magnitude`, `input_use_winding_inference`, `input_use_outer_shell`, plus one per annotation role — `input_use_pcl_absolute`, `input_use_pcl_relative`, `input_use_pcl_same_winding`, `input_use_pcl_drawn_control_points`.Note that `input_use_tracks` defaults to `false`, so a dataset that includes a tracks DBM will not use it unless you turn it on:
+- **`input_use_*` — whether an input that is present is actually used.** Each optional input source has its own toggle, independent of whether its file is there: `input_use_verified_patches`, `input_use_tracks`, `input_use_fibers`, `input_use_fiber_directions`, `input_use_normals`, `input_use_gradient_magnitude`, `input_use_winding_inference`, `input_use_outer_shell`, plus one per annotation role — `input_use_pcl_absolute`, `input_use_pcl_relative`, `input_use_pcl_same_winding`, `input_use_pcl_drawn_control_points`.Note that `input_use_tracks` defaults to `false`, so a dataset that includes a tracks DBM will not use it unless you turn it on:
 
   ```
   FIT_SPIRAL_CONFIG_OVERRIDES='{"input_use_tracks": true, ...}'
@@ -258,7 +258,7 @@ Fitting is then an inverse problem: find the winding tightness $\omega$ and the 
 
 - points from a same-sheet strip should all land on *some* winding surface (and the same one);
 - two points annotated as $k$ windings apart should land exactly $k$ windings apart;
-- a verified patch should coincide with a single winding across its whole extent — with unverified patches pulled in more gently;
+- a verified patch should coincide with a single winding across its whole extent;
 - tracks, normals, and gradient-magnitude volumes nudge the surface orientation and winding density;
 - the innermost winding should wrap the umbilicus, and the outermost should follow the outer shell;
 - and regularization terms keep the sheet parameterization from distorting.

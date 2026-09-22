@@ -29,10 +29,6 @@ def _context(**overrides):
     context.prepared_main_tracks = None
     context.verified_patches = {}
     context.verified_patches_list = []
-    context.unverified_patches = None
-    context.unverified_patches_list = []
-    context.unverified_patch_sampling_probabilities = None
-    context.unverified_patch_atlas = None
     context.cross_patch_pcls = []
     context.unattached_pcl_strips = _UnattachedPclStripList()
     context.unattached_strip_sampling_groups = []

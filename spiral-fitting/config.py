@@ -31,7 +31,6 @@ _NULL_TYPES = {
     "track_length_bin_weights": "vector",
     "track_max_tortuosity": "number",
     "loss_start_track_dt": "integer",
-    "loss_start_unverified_patch_dt": "number",
     "loss_start_unattached_pcl_dt": "integer",
     "patch_uuid_filter_regex": "string",
 }
@@ -63,8 +62,6 @@ SHELL_ATLAS_KEYS = frozenset({
 _SCALE_WITH_Z_FIELDS = {
     "sample_count_patches_per_step",
     "sample_count_patches_per_step_for_dt",
-    "sample_count_unverified_patches_per_step",
-    "sample_count_unverified_patches_per_step_for_dt",
     "sample_count_relative_winding_pcls",
     "sample_count_absolute_winding_pcls",
     "sample_count_unattached_pcls_per_step",
@@ -104,8 +101,6 @@ _Z_RANGE_DESCRIPTIONS = {
 _INPUT_TOGGLE_DESCRIPTIONS = {
     "input_use_verified_patches":
         "Load verified patches and allow their radius/DT supervision.",
-    "input_use_unverified_patches":
-        "Load unverified patches and allow their radius/DT supervision.",
     "input_use_tracks":
         "Load tracks and allow track sampling and losses.",
     "input_use_fibers":
@@ -631,9 +626,6 @@ class Config:
         self.sample_count_patches_per_step = 360
         self.sample_count_patches_per_step_for_dt = 240
         self.sample_count_points_per_patch = 800
-        self.sample_count_unverified_patches_per_step = 120
-        self.sample_count_unverified_patches_per_step_for_dt = 80
-        self.sample_count_unverified_points_per_patch = 800
         self.sample_count_relative_winding_pcls = 48
         self.sample_count_relative_winding_patch_pairs_per_pcl = 4
         self.sample_count_absolute_winding_pcls = 48
@@ -664,7 +656,6 @@ class Config:
         # used by losses. Loss weights and sample counts remain unchanged so
         # re-enabling a source restores its previous tuning.
         self.input_use_verified_patches = True
-        self.input_use_unverified_patches = True
         self.input_use_tracks = False
         self.input_use_fibers = True
         self.input_use_fiber_directions = False
@@ -680,13 +671,6 @@ class Config:
         # When set, only patch directory entries (uuid-named) whose name
         # matches this regex (re.search) are loaded; None loads everything.
         self.patch_uuid_filter_regex = None
-        self.patch_unverified_patch_radius_loss_margin = 0.025
-        self.patch_unverified_patch_radius_loss_inv = False
-        self.patch_unverified_patch_radius_within_norm_p = 3.0
-        self.patch_unverified_patch_dt_norm_p = 0.5
-        self.patch_unverified_patch_dt_within_patch_norm_p = 3.0
-        self.patch_unverified_patch_dt_loss_margin = 0.025
-        self.patch_unverified_patch_exclusion_radius = 64.0
         self.pcl_rel_winding_adjacent_patches_only = True
         self.pcl_stratified_pcl_sampling = True
         self.pcl_sampling_weights = None
@@ -774,8 +758,6 @@ class Config:
         self.loss_weight_dense_spacing_density = 12.0
         self.loss_weight_patch_radius = 8.0
         self.loss_weight_patch_dt = 4.0
-        self.loss_weight_unverified_patch_radius = 2.0
-        self.loss_weight_unverified_patch_dt = 1.0
         self.loss_weight_rel_winding = 5.0
         self.loss_weight_abs_winding = 5.0
         self.loss_weight_unattached_pcl_radius = 2.0
@@ -802,7 +784,6 @@ class Config:
         self.optimizer_weight_decay_flow_field = 0.0
         self.loss_start_patch_dt = 25000
         self.loss_start_track_dt = 25000
-        self.loss_start_unverified_patch_dt = None
         # First iteration after which the unattached-PCL (fiber strip) DT snap
         # acts. None follows loss_start_patch_dt, the historical coupling.
         self.loss_start_unattached_pcl_dt = None

@@ -46,13 +46,11 @@ class RunDtLossScheduleTests(unittest.TestCase):
         cfg = Config({
             'loss_start_patch_dt': 10,
             'loss_start_track_dt': 20,
-            'loss_start_unverified_patch_dt': 30,
             'loss_start_unattached_pcl_dt': 25,
         }).as_dict()
         resume = 15
         self.assertEqual(get_dt_loss_eligibility(cfg, 14, resume), {
             'verified_patch': False,
-            'unverified_patch': False,
             'track': False,
             'unattached_pcl': False,
         })
@@ -61,7 +59,6 @@ class RunDtLossScheduleTests(unittest.TestCase):
         self.assertTrue(at_starts['verified_patch'])
         self.assertFalse(at_starts['unattached_pcl'])
         self.assertFalse(at_starts['track'])
-        self.assertFalse(at_starts['unverified_patch'])
         self.assertFalse(get_dt_loss_eligibility(cfg, 25, resume)['unattached_pcl'])
         self.assertTrue(get_dt_loss_eligibility(cfg, 26, resume)['unattached_pcl'])
         after_all = get_dt_loss_eligibility(cfg, 31, resume)

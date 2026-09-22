@@ -1083,7 +1083,6 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(
             request["paths"]["verified_patches"],
             str(self.root / "verified_patches"))
-        self.assertEqual(request["paths"]["unverified_patches"], "")
 
         disabled = self.state._dataset_session_request({
             "paths": {"tracks_dbm": "/not/an/advertised/store.dbm"},

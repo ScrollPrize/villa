@@ -26,7 +26,6 @@ def context(monkeypatch):
     ctx.progress = None
     ctx.non_liftable_patch_paths = set()
     ctx._source_verified_patches = {'baseline': relink._flat_patch(50, 10, 10)}
-    ctx._source_unverified_patches = {}
     pcl = relink._regular_pcl(5, [[50, 20, 20], [50, 30, 30]])
     ctx._source_point_collections = {5: pcl}
     ctx.next_id = 6
@@ -35,7 +34,6 @@ def context(monkeypatch):
     ctx.verified_patches_list = list(ctx.verified_patches.values())
     ctx._prepare_patch_sampling_cache(ctx.verified_patches_list)
     ctx.patch_atlas = PatchAtlas(ctx.verified_patches, 'cpu').materialize()
-    ctx.unverified_patch_atlas = None
     ctx.dt_target_whole_object = False
     ctx.dt_target_cache_manager = DtTargetCacheManager(100)
     ctx.using_tracks = False
@@ -46,7 +44,6 @@ def context(monkeypatch):
     ctx.dist = SimpleNamespace(is_main_process=False)
     ctx.interactive_driver = None
     ctx.verified_patches_path = ''
-    ctx.unverified_patches_path = ''
     ctx._derive_point_inputs(ctx.verified_patches, copy.deepcopy(ctx._source_point_collections), {})
     from test_run_boundary_settings import _context
     for name, value in vars(_context()).items():
@@ -260,7 +257,7 @@ def test_rebuild_adopts_baseline_geometry_without_reading_it_again(context):
     assert 'baseline' in ctx.verified_patches
 
 
-@pytest.mark.parametrize('role', ['verified', 'unverified'])
+@pytest.mark.parametrize('role', ['verified', None])
 def test_baseline_adoption_preserves_initial_loader_exclusions(context, monkeypatch, role):
     import fit_spiral
     # A baseline may be absent because it has no valid quads, was eroded
@@ -279,28 +276,24 @@ def test_baseline_adoption_preserves_initial_loader_exclusions(context, monkeypa
     }
     context.install_input_changes(candidate)
     assert context._source_verified_patches == {'baseline': original}
-    assert not context._source_unverified_patches
     assert set(context.verified_patches) == {'baseline'}
 
 
-@pytest.mark.parametrize('role', ['verified', 'unverified'])
 @pytest.mark.parametrize('adopt', [True, False])
-def test_theta_rejected_baseline_replay(context, monkeypatch, role, adopt):
+def test_theta_rejected_baseline_replay(context, monkeypatch, adopt):
     import fit_spiral
     # Startup retains pre-validation sources, even after excluding a patch
     # from the active geometry. Replay must repeat that exclusion successfully.
     excluded = relink._flat_patch(50, 510, 510)
-    source = getattr(context, f'_source_{role}_patches')
+    source = context._source_verified_patches
     source['excluded'] = excluded
     build_theta = FitContext._build_theta_crossing_map
 
     def reject(candidate):
         warnings = []
-        if 'excluded' in getattr(candidate, f'{role}_patches'):
+        if 'excluded' in candidate.verified_patches:
             warnings = candidate._exclude_non_liftable_patches(
-                ['excluded'] if role == 'verified' else [],
-                ['excluded'] if role == 'unverified' else [],
-                {'inconsistent_edges': 1})
+                ['excluded'], {'inconsistent_edges': 1})
         return warnings + build_theta(candidate)
 
     monkeypatch.setattr(FitContext, '_build_theta_crossing_map', reject)
@@ -308,7 +301,7 @@ def test_theta_rejected_baseline_replay(context, monkeypatch, role, adopt):
                         lambda path: pytest.fail('baseline was reloaded') if adopt
                         else copy.copy(excluded))
     record = {'id': 'excluded-uuid', 'kind': 'patch', 'source_id': 'excluded',
-              'path': '/immutable/excluded', 'role': role, 'revision': 1,
+              'path': '/immutable/excluded', 'role': 'verified', 'revision': 1,
               'adopt': adopt}
     if not adopt:
         with pytest.raises(ValueError, match='theta consistency'):
@@ -319,8 +312,8 @@ def test_theta_rejected_baseline_replay(context, monkeypatch, role, adopt):
 
     for _ in range(2):
         candidate = context.prepare_input_changes([record])
-        assert 'excluded' not in getattr(candidate, f'{role}_patches')
-        assert getattr(candidate, f'_source_{role}_patches')['excluded'] is excluded
+        assert 'excluded' not in candidate.verified_patches
+        assert candidate._source_verified_patches['excluded'] is excluded
         assert set(candidate.verified_patches) == {'baseline'}
         assert any('non-liftable patch' in warning for warning in candidate._input_warnings)
         assert candidate._workspace_membership['excluded-uuid'] == {
@@ -402,36 +395,6 @@ def test_input_revision_preserves_current_track_policy(context, monkeypatch):
     assert policy.keys() == expected.keys()
     for key in expected:
         np.testing.assert_equal(policy[key], expected[key])
-
-
-def test_exclusion_radius_preserves_unverified_revisions(context, monkeypatch):
-    import fit_spiral
-    ctx = context
-    ctx._source_unverified_patches = {
-        'deleted': relink._flat_patch(100, 510, 510),
-        'replaced': relink._flat_patch(100, 610, 610),
-    }
-    replacement = relink._flat_patch(100, 710, 710)
-    added = relink._flat_patch(100, 810, 810)
-    monkeypatch.setattr(fit_spiral, 'load_tifxyz',
-                        lambda path: {'replacement': replacement, 'added': added}[path])
-    records = [
-        {'id': 'deleted', 'kind': 'patch', 'role': 'unverified', 'deleted': True, 'revision': 2},
-        {'id': 'replaced', 'kind': 'patch', 'role': 'unverified', 'path': 'replacement', 'revision': 2},
-        {'id': 'added', 'kind': 'patch', 'role': 'unverified', 'path': 'added', 'revision': 1},
-    ]
-    ctx.install_input_changes(ctx.prepare_input_changes(records))
-    membership = copy.deepcopy(ctx._workspace_membership)
-    ctx.unverified_patches_path = '/mutable/dataset'
-    monkeypatch.setattr(ctx, '_load_patches_from_dir',
-                        lambda path: pytest.fail('revisioned patches reloaded from dataset'))
-    for radius in (1, 0):
-        ctx.apply_config({'patch_unverified_patch_exclusion_radius': radius}, current_iteration=0)
-        assert set(ctx.unverified_patches) == {'replaced', 'added'}
-        assert ctx._workspace_membership == membership
-        for pid, source in [('replaced', replacement), ('added', added)]:
-            assert ctx.unverified_patches[pid] is not source
-            torch.testing.assert_close(ctx.unverified_patches[pid].zyxs, source.zyxs)
 
 
 @pytest.mark.parametrize('dataset_change', ['edit', 'delete'])

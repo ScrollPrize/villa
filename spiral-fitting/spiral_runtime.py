@@ -1500,7 +1500,6 @@ class InteractiveFitSession:
             command.complete(prepared=True, prepare_seconds=time.perf_counter() - started, membership={
                 "inputs": candidate._workspace_membership,
                 "verified_patches": list(candidate.verified_patches),
-                "unverified_patches": list(candidate.unverified_patches),
             })
             return
         prepared = self._input_batches[command.batch_id]["prepare"]

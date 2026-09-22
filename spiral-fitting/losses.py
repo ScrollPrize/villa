@@ -509,8 +509,7 @@ def _patch_radius_and_dt_losses(
 ):
     # Shared radius + DT patch losses, operating on padded uniform 2D samples
     # (all_*; see _sample_patch_tracks). Pulled out of get_patch_and_umbilicus_losses so the
-    # same loss can serve both the verified and the untrusted ('unverified') patch sets with
-    # independent hyperparameters. Returns (mean_radius_deviation, patch_dt_loss).
+    # sampling and loss stages stay separable. Returns (mean_radius_deviation, patch_dt_loss).
     # `dt_target_cache` is the whole-object DT target cache (see dt_targets.py) or None
     # in legacy strip-median mode; `patch_indices` maps the sampled tracks to cache rows.
     radius_hinge_margin = dr_per_winding.detach() * radius_loss_margin
@@ -727,49 +726,6 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
 
     return mean_radius_deviation, umbilicus_loss, patch_dt_loss, shell_patch_radius_loss
 
-
-
-def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, compute_dt=True, dt_max_winding=None, dt_target_cache=None, *, crossing_map, cfg):
-    # Radius + DT losses for the untrusted 'unverified' patch set. Same machinery as the
-    # verified patches (shared _sample_patch_tracks + _patch_radius_and_dt_losses) but with the
-    # independent unverified_* hyperparameters and no umbilicus/shell extras. These patches are
-    # masked away near trusted geometry upstream (see _mask_patches_near_trusted_geometry), so
-    # they only constrain regions the verified inputs don't cover.
-    num_patches_to_sample = max(num_patches_for_radius, num_patches_for_dt) if compute_dt else num_patches_for_radius
-    batch = _sample_patch_batch(
-        'unverified_patches', patches, patch_sampling_probabilities,
-        num_patches_to_sample, cfg['sample_count_unverified_points_per_patch'],
-        cfg, patch_atlas, crossing_map)
-
-    (
-        sample_ijs,
-        all_slice_zyxs,
-        all_spiral_zyxs,
-        all_theta,
-        all_shifted_radii,
-        all_crossing_adjustments,
-        sample_mask,
-        _,
-    ) = _sample_patch_tracks(
-        slice_to_spiral_transform,
-        dr_per_winding,
-        patches,
-        patch_atlas,
-        batch,
-        crossing_map,
-    )
-
-    return _patch_radius_and_dt_losses(
-        slice_to_spiral_transform, dr_per_winding,
-        all_slice_zyxs, all_spiral_zyxs, all_theta, all_shifted_radii,
-        all_crossing_adjustments,
-        num_patches_for_radius, num_patches_for_dt, compute_dt, dt_max_winding,
-        cfg['patch_unverified_patch_radius_loss_margin'], cfg['patch_unverified_patch_radius_loss_inv'], cfg['patch_unverified_patch_radius_within_norm_p'],
-        cfg['patch_unverified_patch_dt_loss_margin'], cfg['patch_unverified_patch_dt_norm_p'], cfg['patch_unverified_patch_dt_within_patch_norm_p'],
-        patch_indices=batch[1], sample_ijs=sample_ijs, dt_target_cache=dt_target_cache,
-        sample_mask=sample_mask,
-        diagnostic_prefix='unverified_patch',
-    )
 
 
 

@@ -489,7 +489,7 @@ per profile. Generated previews, geometry, and
 checkpoints transfer through the artifact API into a local cache — no shared
 filesystem is needed. Optional: set the profile's **Local dataset path** if
 this machine mounts the same dataset, so input surface overlays
-(verified/unverified/shell) can be displayed locally. It is assumed to
+(verified patches/shell) can be displayed locally. It is assumed to
 correspond to the dataset root the service advertises, which is the prefix
 service paths are translated from; without it those overlays are simply marked
 unavailable.
@@ -503,7 +503,7 @@ read-only, and the service rejects a session request that carries
 Optional supervision sources have rebuild-scoped boolean switches in Advanced
 config. Set an `input_use_*` key to `false` to skip validation, loading,
 sampling, and losses for that source without changing its tuned weights or
-sample counts. Available switches cover verified/unverified patches, tracks,
+sample counts. Available switches cover verified patches, tracks,
 fibers, each PCL role (`absolute`, `relative`, `same_winding`, and
 `drawn_control_points`), normals, gradient magnitude, winding inference, and
 the outer shell. For example:

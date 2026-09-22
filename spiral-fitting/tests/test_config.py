@@ -54,7 +54,7 @@ def test_dt_target_cadence_alias_remains_positive_in_schema():
 def test_input_participation_toggles_are_rebuild_scoped_booleans():
     catalog = Config.catalog()
     expected = {
-        "input_use_verified_patches", "input_use_unverified_patches",
+        "input_use_verified_patches",
         "input_use_tracks", "input_use_fibers",
         "input_use_fiber_directions", "input_use_pcl_absolute",
         "input_use_pcl_relative", "input_use_pcl_same_winding",

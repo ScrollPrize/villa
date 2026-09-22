@@ -1005,7 +1005,6 @@ class ServiceState:
         # and fitter all describe the same source set.
         selected_paths = {
             "verified_patches": "verified_patches",
-            "unverified_patches": "unverified_patches",
             "fibers": "fibers",
             "outer_shell": "outer_shell",
             "tracks_dbm": "tracks_dbm",

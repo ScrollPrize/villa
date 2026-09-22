@@ -36,7 +36,6 @@ def test_disabled_sources_are_removed_before_any_loader_can_see_them():
     paths = SpiralInputPaths(
         umbilicus="/inputs/umbilicus.json",
         verified_patches="/inputs/verified",
-        unverified_patches="/inputs/unverified",
         fibers="/inputs/fibers",
         tracks_dbm="/inputs/tracks.dbm",
         normal_x="/inputs/nx.zarr",
@@ -55,7 +54,6 @@ def test_disabled_sources_are_removed_before_any_loader_can_see_them():
     context = make_context(config, paths)
 
     assert context.verified_patches_path is None
-    assert context.unverified_patches_path is None
     assert context.fibers_path is None
     assert context.tracks_dbm_path is None
     assert context.normal_nx_zarr_path is None

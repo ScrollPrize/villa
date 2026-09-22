@@ -81,7 +81,6 @@ def test_lasagna_store_predicates_reproduce_the_mode_contract():
 
 def test_patch_inputs_follow_the_disable_switch():
     verified = fit_input("verified_patches")
-    unverified = fit_input("unverified_patches")
     # Dataset discovery cannot know the initialization config yet; validation
     # enforces this only when the default-on source is actually selected.
     assert verified.resolve_required is False
@@ -89,12 +88,8 @@ def test_patch_inputs_follow_the_disable_switch():
     assert verified.required({"input_disable_patches": True}) is False
     # A disabled source is not validated at all.
     assert verified.enabled({"input_disable_patches": True}) is False
-    assert unverified.enabled({"input_disable_patches": True}) is False
-    assert unverified.enabled({}) is True
-    assert unverified.required({}) is False
 
     assert verified.enabled({"input_use_verified_patches": False}) is False
-    assert unverified.enabled({"input_use_unverified_patches": False}) is False
 
 
 def test_source_toggles_and_dependencies_are_centralized():
