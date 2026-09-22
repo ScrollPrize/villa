@@ -909,13 +909,22 @@ def _export_paris4_subset(settings, output, cache_by_locator, required_by_root):
     destination = Path(spec.get('output_root', output / 'paris4_failure_subset'))
     _export_channel_subset(source_root, destination, keys,
                             ('fiber_presence.ome.zarr', 'fiber_nx.ome.zarr', 'fiber_ny.ome.zarr'))
-    link = output / 'vc3d_channels' / 'PHercParis4_failure_subset'
-    if link.exists() or link.is_symlink():
-        if not link.is_symlink() or link.resolve() != destination.resolve():
-            raise ValueError(f'refusing to replace existing subset link: {link}')
-    else:
-        link.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(os.path.relpath(destination, link.parent), link)
+    link_root = output / 'vc3d_channels'
+    link_root.mkdir(parents=True, exist_ok=True)
+    old_special = link_root / 'PHercParis4_failure_subset'
+    if old_special.is_symlink():
+        old_special.unlink()
+    elif old_special.exists():
+        raise ValueError(f'refusing to replace non-symlink subset entry: {old_special}')
+    link = link_root / 'PHercParis4'
+    if link.exists() and not link.is_symlink():
+        entries = list(link.rglob('*'))
+        if not all(entry.is_symlink() for entry in entries if entry.is_file() or entry.is_symlink()):
+            raise ValueError(f'refusing to replace non-generated Paris4 directory: {link}')
+        shutil.rmtree(link)
+    if link.is_symlink():
+        link.unlink()
+    os.symlink(os.path.relpath(destination, link.parent), link)
     result = {'output_root': str(destination), 'link': str(link),
               'chunk_count': len(keys), 'source_root': str(source_root)}
     atomic_write(output / 'paris4_subset_manifest.json', result, durable=False)
@@ -1124,7 +1133,7 @@ def run_union(workload):
     fill = settings.get('fill_missing_inference')
     if fill:
         _fill_union_corridor(workload, fill, required_by_root, output)
-    _export_paris4_subset(settings, output, cache_by_locator, required_by_root)
+    paris4_subset = _export_paris4_subset(settings, output, cache_by_locator, required_by_root)
 
     coverage = []
     missing_total = 0
@@ -1160,6 +1169,15 @@ def run_union(workload):
         if not source_ids:
             continue
         for source_id in source_ids:
+            if source_id == 'PHercParis4' and paris4_subset is not None:
+                destination = Path(paris4_subset['output_root'])
+                link_manifest.append({'source_id': source_id, 'input_volume': locator,
+                                      'cache_root': str(destination), 'subset': True,
+                                      'channels': {
+                                          c: str(destination / c) for c in (
+                                              'fiber_presence.ome.zarr', 'fiber_nx.ome.zarr',
+                                              'fiber_ny.ome.zarr')}})
+                continue
             destination = link_root / source_id
             for channel in ('fiber_presence.ome.zarr', 'fiber_nx.ome.zarr', 'fiber_ny.ome.zarr'):
                 _safe_symlink(root / channel, destination / channel)

@@ -109,3 +109,8 @@
 - The subset contains 8,858 unique chunk keys and occupies 4.9 GiB. It is
   available at `paris4_failure_subset/` and through the symlink
   `vc3d_channels/PHercParis4_failure_subset`.
+
+- The canonical `vc3d_channels/PHercParis4` entry now points directly to that
+  subset; the special subset-labelled entry is removed. The manifest records
+  the canonical link as `subset: true`, so rsyncing `vc3d_channels/` no longer
+  exposes the 703 GiB full Paris4 cache.
