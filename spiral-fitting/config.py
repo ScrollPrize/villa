@@ -130,48 +130,6 @@ _INPUT_TOGGLE_DESCRIPTIONS = {
         "Allow outer-shell losses, lookup maps, and shell-based track filtering.",
 }
 
-# These fields were added after durable checkpoints already existed. Missing
-# values are unambiguous: historical fits used every available input, so a
-# missing toggle means True. Checkpoint readers use this mapping instead of
-# weakening strict schema checks for unrelated future fields.
-BACKFILLABLE_CONFIG_DEFAULTS = {
-    key: True for key in _INPUT_TOGGLE_DESCRIPTIONS
-}
-BACKFILLABLE_CONFIG_DEFAULTS.update({
-    # Fiber classification thresholds for radial offsets and patch-side linking.
-    "pcl_vertical_fiber_min_z_fraction": 0.8,
-    "pcl_vertical_fiber_min_auto_certainty": 0.5,
-    # The vertical-fiber radial offset postdates durable checkpoints; missing
-    # means it was off.
-    "pcl_vertical_fiber_radial_offset_enabled": False,
-    "pcl_vertical_fiber_radial_offset_voxels": 4.0,
-    # Unattached-PCL (fiber) DT historically started with the verified-patch
-    # DT; missing means that coupling.
-    "loss_start_unattached_pcl_dt": None,
-    # Point-to-patch linking settings postdate durable checkpoints; missing
-    # means the historical fixed tolerance, single-point choice and no fiber
-    # side rules.
-    "pcl_link_distance_tolerance": 2.5,
-    "pcl_link_window_points": 1,
-    "pcl_link_window_min_points": 1,
-    "pcl_fiber_link_side_filter": False,
-    "pcl_fiber_link_side_margin_voxels": 0.5,
-    "pcl_fiber_link_model_direction_step": 10000,
-})
-# The flow-gradient conditioning settings postdate durable checkpoints;
-# missing means off, which is exactly the earlier behaviour.
-BACKFILLABLE_CONFIG_DEFAULTS.update({
-    "optimizer_flow_grad_smoothing": False,
-    "optimizer_flow_grad_smoothing_sigma_voxels": 32.0,
-    "optimizer_flow_lazy_moments": False,
-    "optimizer_flow_grad_smoothing_across_sigma_voxels": 0.0,
-    "optimizer_flow_grad_smoothing_low_res_sigma_voxels": 0.0,
-    "model_flow_field_low_res_lr_scale": 1.0,
-    "optimizer_flow_shared_second_moment": False,
-    "optimizer_flow_shared_second_moment_clip_quantile": 0.99,
-    "optimizer_flow_grad_clip_median_multiple": 0.0,
-})
-
 _PCL_LINK_DESCRIPTIONS = {
     "pcl_link_distance_tolerance": (
         "Scroll voxels within which a point collection point attaches to a "
@@ -312,14 +270,6 @@ CHECKPOINT_MODEL_SHAPE_KEYS = (
     "model_initial_dr_per_winding", "model_linear_z_resolution",
 )
 
-
-# Configuration keys retired from the schema. Checkpoint loaders accept these
-# stored keys after validating their values in checkpoint_migrations.
-RETIRED_CONFIG_KEYS = frozenset({
-    # The leading axis now holds stationary flow stages. Old checkpoints with
-    # more than one interpolated time sample are refused during migration.
-    "model_num_flow_timesteps",
-})
 
 
 # Configuration keys whose every consumer is built by

@@ -425,7 +425,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     // The scroll's name and voxel resolution are not here: spiral-scroll.json
     // in the dataset root is their only source, and the service rejects a
     // request that restates them.
-    _legacyCheckpointStep = new QSpinBox(outputContents); _legacyCheckpointStep->setRange(0, 1000000000);
     _renderVolumeScale = new QSpinBox(outputContents); _renderVolumeScale->setRange(1, 4096); _renderVolumeScale->setValue(16);
     _savePngVisualizations = new QCheckBox(tr("Save diagnostic PNG visualizations"), outputContents);
     _savePngVisualizations->setChecked(false);
@@ -435,7 +434,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _advanced = _advancedProfiles->textEdit();
     outputForm->addRow(tr("z begin"), _zBegin);
     outputForm->addRow(tr("z end"), _zEnd);
-    outputForm->addRow(tr("Legacy checkpoint step"), _legacyCheckpointStep);
     outputForm->addRow(tr("Run tag"), _runTag);
     outputForm->addRow(tr("Render-volume scale"), _renderVolumeScale);
     outputForm->addRow(_savePngVisualizations);
@@ -1454,8 +1452,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         else if (choice == retry) _service->applyInputDrafts(false, {id});
         else if (choice == discard) _service->discardInputDraft(id);
     });
-    for (QSpinBox* spin : {_zBegin, _zEnd, _legacyCheckpointStep,
-                           _renderVolumeScale})
+    for (QSpinBox* spin : {_zBegin, _zEnd, _renderVolumeScale})
         connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) { refreshReloadRequired(); });
     for (QLineEdit* edit : {_runTag})
         connect(edit, &QLineEdit::textEdited, this, [this](const QString&) { refreshReloadRequired(); });
@@ -1902,7 +1899,6 @@ QJsonObject SpiralPanel::sessionRequest() const
     }
     QJsonObject run{{"z_begin", _zBegin->value()}, {"z_end", _zEnd->value()},
                     {"storage_backend", QStringLiteral("sparse_cuda")},
-                    {"legacy_checkpoint_step", _legacyCheckpointStep->value()},
                     {"run_tag", _runTag->text()},
                     {"render_volume_scale", _renderVolumeScale->value()},
                     {"config", config}};
@@ -2105,9 +2101,6 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
 
     _zBegin->setValue(run.value(QStringLiteral("z_begin")).toInt(_zBegin->value()));
     _zEnd->setValue(run.value(QStringLiteral("z_end")).toInt(_zEnd->value()));
-    _legacyCheckpointStep->setValue(
-        run.value(QStringLiteral("legacy_checkpoint_step"))
-            .toInt(_legacyCheckpointStep->value()));
     _runTag->setText(
         run.value(QStringLiteral("run_tag")).toString(_runTag->text()));
     _renderVolumeScale->setValue(
@@ -2564,7 +2557,6 @@ void SpiralPanel::persist() const
     settings.setValue(prefix + "z_begin", _zBegin->value());
     settings.setValue(prefix + "z_end", _zEnd->value());
     settings.setValue(prefix + "storage_backend", QStringLiteral("sparse_cuda"));
-    settings.setValue(prefix + "legacy_checkpoint_step", _legacyCheckpointStep->value());
     settings.setValue(prefix + "run_tag", _runTag->text());
     settings.setValue(prefix + "render_volume_scale", _renderVolumeScale->value());
     settings.setValue(prefix + "output_save_png_visualizations", _savePngVisualizations->isChecked());
@@ -2623,7 +2615,6 @@ void SpiralPanel::restore()
     }
     _zBegin->setValue(settings.value(valuePrefix + "z_begin", 4000).toInt());
     _zEnd->setValue(settings.value(valuePrefix + "z_end", 17000).toInt());
-    _legacyCheckpointStep->setValue(settings.value(valuePrefix + "legacy_checkpoint_step", 0).toInt());
     _runTag->setText(settings.value(valuePrefix + "run_tag").toString());
     _renderVolumeScale->setValue(settings.value(valuePrefix + "render_volume_scale", 16).toInt());
     _savePngVisualizations->setChecked(

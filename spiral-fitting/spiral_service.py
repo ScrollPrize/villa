@@ -74,8 +74,7 @@ from fit_session import (API_VERSION, EDITABLE_PCL_ROLES, FIT_INPUT_CATALOG,
                          winding_inference_enabled, load_scroll_spec,
                          parse_session_request, resolve_dataset_root,
                          validate_session_request)
-from config import (BACKFILLABLE_CONFIG_DEFAULTS,
-                    CHECKPOINT_MODEL_SHAPE_KEYS, Config,
+from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config,
                     filter_known_config_keys, rebuild_stage)
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
@@ -2184,11 +2183,7 @@ class ServiceState:
         live = dict(status.get("applied_config") or {})
         # What no rebuild can fix: a checkpoint from another dataset, or one
         # whose configuration is not this schema's at all.
-        if checkpoint_cfg is None or (
-                set(checkpoint_cfg) - set(live)
-                or set(live) - set(checkpoint_cfg) - (
-                    {"z_begin", "z_end"}
-                    | set(BACKFILLABLE_CONFIG_DEFAULTS))):
+        if checkpoint_cfg is None or set(checkpoint_cfg) != set(live):
             return ApiError(
                 HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
                 payload={"reasons": reasons, "refused": True})
@@ -2197,11 +2192,7 @@ class ServiceState:
             return ApiError(
                 HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
                 payload={"reasons": reasons, "refused": True})
-        resolved_checkpoint_cfg = {
-            **BACKFILLABLE_CONFIG_DEFAULTS,
-            **checkpoint_cfg,
-        }
-        changed = {key for key, value in resolved_checkpoint_cfg.items()
+        changed = {key for key, value in checkpoint_cfg.items()
                    if live.get(key) != value}
         return ApiError(
             HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",

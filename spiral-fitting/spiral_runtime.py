@@ -28,9 +28,7 @@ from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_INTERVAL_ITERATIONS,
                          SpiralInputPaths, SpiralPreviewConfig,
                          SpiralRunConfig, run_mutable_config,
                          write_autosave_metadata)
-from config import (BACKFILLABLE_CONFIG_DEFAULTS, RETIRED_CONFIG_KEYS,
-                    Config, FitConfig,
-                    filter_known_config_keys)
+from config import Config, FitConfig, filter_known_config_keys
 from spiral_progress import NullProgressReporter, ProgressReporter
 
 
@@ -867,8 +865,6 @@ class InteractiveFitSession:
                 interactive_driver=self,
                 progress=self.progress,
                 resume_path=self.paths.checkpoint or None,
-                resume_step=(self.run_config.legacy_checkpoint_step
-                             if self.paths.checkpoint else 0),
                 out_base_dir=self.paths.output_directory,
                 run_tag=self.run_config.run_tag or None,
                 cache_dir=self.paths.cache_directory,
@@ -936,36 +932,11 @@ class InteractiveFitSession:
                         checkpoint_config.get('cfg'), Mapping):
                     raise ValueError("Checkpoint has no current Spiral configuration")
                 durable = dict(checkpoint_config['cfg'])
-                for key in RETIRED_CONFIG_KEYS:
-                    durable.pop(key, None)
-                # A small explicit allowlist records fields whose
-                # historical default is unambiguous; every other key-set
-                # mismatch stays a strict error.
-                durable_schema = set(config)
-                missing = durable_schema - set(durable)
-                backfillable = set(BACKFILLABLE_CONFIG_DEFAULTS) | {
-                    "z_begin", "z_end"}
-                if set(durable) - durable_schema or missing - backfillable:
+                # Checkpoints store the full schema, and the key sets must
+                # agree exactly; nothing is backfilled or retired.
+                if set(durable) != set(config):
                     raise ValueError(
                         "Checkpoint configuration does not match the current schema")
-                if missing:
-                    assumed = {
-                        **BACKFILLABLE_CONFIG_DEFAULTS,
-                        "z_begin": int(self.run_config.z_begin),
-                        "z_end": int(self.run_config.z_end),
-                    }
-                    durable.update(
-                        {key: assumed[key] for key in missing})
-                    warning = (
-                        f"Checkpoint {self.paths.checkpoint} predates "
-                        "defaultable fields in the stored configuration; "
-                        "assuming "
-                        + ", ".join(f"{key}={assumed[key]}"
-                                    for key in sorted(missing))
-                        + " from the session request")
-                    print(warning)
-                    with self._condition:
-                        self._warnings.append(warning)
                 durable = Config(durable).as_dict()
                 # Keep the durable configuration aligned with the canonical
                 # run window. The service restores a newly loaded checkpoint's
@@ -1792,8 +1763,6 @@ class InteractiveFitSession:
         context.config.update(config)
         context.paths = paths
         context.resume_path = paths.checkpoint or None
-        context.resume_step = (run.legacy_checkpoint_step
-                               if paths.checkpoint else 0)
         try:
             context.rebuild_model_state()
         except BaseException as exc:

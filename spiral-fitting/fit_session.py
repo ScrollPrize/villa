@@ -509,7 +509,6 @@ class SpiralRunConfig:
     z_begin: int
     z_end: int
     storage_backend: str = "sparse_cuda"
-    legacy_checkpoint_step: int = 0
     run_tag: str = ""
     render_volume_scale: int = 16
     config: Mapping[str, Any] = field(default_factory=dict)
@@ -520,7 +519,6 @@ class SpiralRunConfig:
             z_begin=int(value.get("z_begin", 0)),
             z_end=int(value.get("z_end", 0)),
             storage_backend=str(value.get("storage_backend", "sparse_cuda")).lower(),
-            legacy_checkpoint_step=int(value.get("legacy_checkpoint_step", 0)),
             run_tag=str(value.get("run_tag", "")),
             render_volume_scale=int(value.get("render_volume_scale", 16)),
             config=dict(value.get("config", {})),

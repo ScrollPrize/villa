@@ -167,11 +167,6 @@ diffeomorphism composes. The stages are the slabs of the flow lattices'
 leading axis (`flow_field.flows.{0,1}` are `[stages, 3, ...]`), integrated in
 order by one fused kernel launch per direction; the inverse runs the slabs
 backwards in reverse order. One stage is the original single-field model.
-Checkpoints written with the earlier per-stage module layout
-(`extra_flow_fields.*`) are migrated on load, Adam moments included
-(`checkpoint_migrations.merge_flow_stage_lattices`). The retired
-`model_num_flow_timesteps` key is dropped from old configurations on load;
-checkpoints with a time axis longer than 1 are rejected.
 
 ## Flow-gradient conditioning
 
@@ -179,7 +174,7 @@ These optional settings change how the flow lattices are optimized, without
 adding loss terms or changing the model parameterization. The smoothing,
 lazy-moment and shared-second-moment switches default to off; gradient
 clipping defaults to disabled. The `optimizer_flow_*` settings apply at run
-boundaries and are read every step. Older checkpoints backfill these defaults.
+boundaries and are read every step.
 
 The step order is: DDP gradient averaging, NaN/Inf detection and replacement
 with zero, optional clipping, optional smoothing, then the optimizer update.

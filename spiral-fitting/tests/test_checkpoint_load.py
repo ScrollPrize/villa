@@ -21,7 +21,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import fit_spiral
-from config import BACKFILLABLE_CONFIG_DEFAULTS, Config
+from config import Config
 from fit_session import SessionState
 from spiral_progress import NullProgressReporter
 import spiral_runtime
@@ -206,15 +206,14 @@ class CheckpointPreflightTests(unittest.TestCase):
         del incomplete["optimizer_learning_rate"]
         self.assertIn("optimizer_learning_rate",
                       _inspect(_checkpoint(cfg=incomplete)).message())
-        # z_begin/z_end joined the schema late and are session-owned anyway.
-        carve_out = dict(CONFIG)
-        carve_out.pop("z_begin", None)
-        carve_out.pop("z_end", None)
-        self.assertTrue(_inspect(_checkpoint(cfg=carve_out)).accepted)
-        pre_toggles = dict(CONFIG)
-        for key in BACKFILLABLE_CONFIG_DEFAULTS:
-            pre_toggles.pop(key)
-        self.assertTrue(_inspect(_checkpoint(cfg=pre_toggles)).accepted)
+        # Every schema key is required; nothing is carved out or backfilled.
+        for key in ("z_begin", "z_end", "input_use_tracks",
+                    "optimizer_flow_grad_smoothing"):
+            partial = dict(CONFIG)
+            del partial[key]
+            verdict = _inspect(_checkpoint(cfg=partial))
+            self.assertFalse(verdict.accepted, key)
+            self.assertIn(key, verdict.message())
         shaped = dict(CONFIG)
         shaped["model_flow_bounds_radius"] = (
             int(shaped["model_flow_bounds_radius"]) + 1)
@@ -353,16 +352,10 @@ class CheckpointApplyTests(unittest.TestCase):
             context.optimiser.param_groups[0]["lr"],
             context.config["optimizer_learning_rate"], places=12)
 
-    def test_a_checkpoint_without_an_iteration_falls_back_to_the_caller(self):
-        context = _StubContext()
-        payload = {
-            "spiral_and_transform": context.model.state_dict(),
-            "optimiser": context.optimiser.state_dict(),
-            "scheduler": context.lr_scheduler.state_dict(),
-        }
-        self.assertEqual(
-            context.apply_checkpoint(payload, fallback_iteration=17), 17)
-        self.assertEqual(context.start_iteration, 17)
+    def test_a_checkpoint_without_an_iteration_is_refused(self):
+        verdict = _inspect(_checkpoint(completed_iterations=None))
+        self.assertFalse(verdict.accepted)
+        self.assertIn("completed_iterations", verdict.message())
 
 
 class _FakeContext:

@@ -246,8 +246,7 @@ def build_transform(checkpoint, cfg, context, model_z_begin, model_z_end):
         spiral_outward_sense=context.spiral_outward_sense,
     )
     model.to(device)
-    model.load_state_dict(fs.merge_flow_stage_lattices(
-        checkpoint)['spiral_and_transform'])
+    model.load_state_dict(checkpoint['spiral_and_transform'])
     model.eval()
 
     transform = model.get_slice_to_spiral_transform()

@@ -46,10 +46,9 @@ from ddp_helpers import (
     maybe_init_distributed,
     process_context,
 )
-from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
-                    RETIRED_CONFIG_KEYS, Config, FitConfig, SHELL_ATLAS_KEYS)
-from checkpoint_migrations import (expand_gap_checkpoint_capacity,
-                                   merge_flow_stage_lattices)
+from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, FitConfig,
+                    SHELL_ATLAS_KEYS)
+from checkpoint_migrations import expand_gap_checkpoint_capacity
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, EDITABLE_PCL_ROLE_VALUES,
                          RUN_MUTABLE_PCL_ROLES,
                          fit_input, input_source_enabled, pcl_input_enabled,
@@ -1292,7 +1291,7 @@ class FitContext:
     """
 
     def __init__(self, config, *, scroll, paths, interactive_driver=None,
-                 progress=None, resume_path=None, resume_step=0,
+                 progress=None, resume_path=None,
                  out_base_dir=None, run_dir=None, run_tag=None, run_name=None,
                  cache_dir=None, storage_backend='sparse_cuda',
                  render_volume_scale=16, dist_context=None):
@@ -1314,8 +1313,8 @@ class FitContext:
         #
         # The fit controls that used to arrive through FIT_SPIRAL_*
         # environment variables are constructor arguments now:
-        #   resume_path / resume_step - checkpoint to restore and its legacy
-        #     explicit step (the checkpoint's own completed_iterations wins);
+        #   resume_path - checkpoint to restore (its completed_iterations is
+        #     the step the fit resumes at);
         #   out_base_dir - parent directory for resolve_output_path();
         #   run_dir - an exact existing output directory to reuse when a
         #     headless runner resumes an interrupted fit;
@@ -1346,7 +1345,6 @@ class FitContext:
         self.interactive_driver = interactive_driver
         self.progress = progress
         self.resume_path = resume_path or None
-        self.resume_step = int(resume_step or 0)
         self.out_base_dir = out_base_dir if out_base_dir is not None else './out'
         self.run_dir = run_dir or None
         self.run_tag = run_tag or None
@@ -3219,7 +3217,7 @@ class FitContext:
         # affects the model's flow-field domain; the optimisation continues to use
         # the current z_begin/z_end for sampling, losses and rendering.
         resume_path = self.resume_path
-        self.start_iteration = int(self.resume_step)
+        self.start_iteration = 0
         resume_checkpoint = None
         self.model_z_begin, self.model_z_end = self.z_begin, self.z_end
         if resume_path:
@@ -3358,14 +3356,13 @@ class FitContext:
             if not verdict.accepted:
                 raise RuntimeError(verdict.message())
             print(f'resuming from {resume_path} at iteration '
-                  f'{verdict.completed_iterations if verdict.completed_iterations is not None else self.start_iteration}')
+                  f'{verdict.completed_iterations}')
             progress.begin(
                 'loading', 'Restoring model and optimizer',
                 detail=os.path.basename(resume_path))
             # Phase 2: apply. The LR realignment for a resident session is the
             # unconditional one below, so it is not requested twice here.
-            self.apply_checkpoint(resume_checkpoint,
-                                  fallback_iteration=self.start_iteration)
+            self.apply_checkpoint(resume_checkpoint)
             # load_state_dict has moved the model and optimiser state to their
             # destination tensors.  Release the CPU-side archive mappings before
             # entering the resident training loop.
@@ -3654,8 +3651,7 @@ class FitContext:
             # without mutating the caller's checkpoint. load_checkpoint()
             # performs the same migration only after this verdict succeeds.
             checkpoint = expand_gap_checkpoint_capacity(
-                merge_flow_stage_lattices(checkpoint),
-                self.config['model_gap_expander_capacity_windings'])
+                checkpoint, self.config['model_gap_expander_capacity_windings'])
         except ValueError as exc:
             reasons.append(str(exc))
 
@@ -3730,14 +3726,12 @@ class FitContext:
         # --- structural configuration -------------------------------------
         checkpoint_cfg = checkpoint.get('cfg')
         if isinstance(checkpoint_cfg, Mapping):
-            # z_begin/z_end joined the schema after many checkpoints were
-            # written and are owned by the session request either way, so
-            # exactly those two may be absent; a retired key is dropped, not
-            # refused (config.RETIRED_CONFIG_KEYS).
+            # Checkpoints store the full schema; the key sets must agree
+            # exactly. There is no key backfill or retirement: a checkpoint
+            # written under another schema is refused.
             schema = set(self.config)
-            unknown = set(checkpoint_cfg) - schema - RETIRED_CONFIG_KEYS
-            missing = schema - set(checkpoint_cfg) - (
-                {'z_begin', 'z_end'} | set(BACKFILLABLE_CONFIG_DEFAULTS))
+            unknown = set(checkpoint_cfg) - schema
+            missing = schema - set(checkpoint_cfg)
             if unknown or missing:
                 reasons.append(
                     'checkpoint configuration does not match the current '
@@ -3847,13 +3841,14 @@ class FitContext:
                             f'parameter groups, this fit has {len(live_base)}')
 
         completed = checkpoint.get('completed_iterations')
+        if completed is None:
+            reasons.append('checkpoint has no completed_iterations entry')
         return CheckpointVerdict(
             not reasons, tuple(reasons),
             completed_iterations=(None if completed is None else int(completed)),
             source=source)
 
-    def apply_checkpoint(self, checkpoint, *, fallback_iteration=0,
-                         realign_lr=False):
+    def apply_checkpoint(self, checkpoint, *, realign_lr=False):
         """Phase 2: move a preflighted checkpoint into the live fit.
 
         Only ever called after :meth:`inspect_checkpoint` accepted this exact
@@ -3863,11 +3858,11 @@ class FitContext:
         session rather than as a refusal.
 
         ``completed_iterations`` comes from the checkpoint - the durable step
-        the fit actually reached - and the LR schedule is realigned to it
-        rather than reset to zero.
+        the fit actually reached (every checkpoint carries it; the preflight
+        refuses one without) - and the LR schedule is realigned to it rather
+        than reset to zero.
         """
-        embedded = checkpoint.get('completed_iterations')
-        completed = int(fallback_iteration if embedded is None else embedded)
+        completed = int(checkpoint['completed_iterations'])
         self.start_iteration = completed
         self.load_checkpoint(checkpoint)
         self._restore_rng_state(checkpoint)
@@ -3894,8 +3889,7 @@ class FitContext:
 
     def load_checkpoint(self, checkpoint):
         checkpoint = expand_gap_checkpoint_capacity(
-            merge_flow_stage_lattices(checkpoint),
-            self.config['model_gap_expander_capacity_windings'])
+            checkpoint, self.config['model_gap_expander_capacity_windings'])
         transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
         self.spiral_and_transform.load_state_dict(transformed_spiral_state)
         self.optimiser.load_state_dict(optimiser_state)
@@ -5441,7 +5435,7 @@ class FitContext:
 
 
 def main(config, *, scroll, paths, progress=None, resume_path=None,
-         resume_step=0, out_base_dir=None, run_dir=None, run_tag=None,
+         out_base_dir=None, run_dir=None, run_tag=None,
          run_name=None,
          cache_dir=None, storage_backend='sparse_cuda',
          render_volume_scale=16, dist_context=None):
@@ -5457,7 +5451,6 @@ def main(config, *, scroll, paths, progress=None, resume_path=None,
         paths=paths,
         progress=progress,
         resume_path=resume_path,
-        resume_step=resume_step,
         out_base_dir=out_base_dir,
         run_dir=run_dir,
         run_tag=run_tag,
@@ -5588,7 +5581,6 @@ if __name__ == '__main__':
             paths=input_paths,
             progress=cli_progress,
             resume_path=os.environ.get('FIT_SPIRAL_RESUME_PATH'),
-            resume_step=int(os.environ.get('FIT_SPIRAL_RESUME_STEP', '0')),
             out_base_dir=os.environ.get('FIT_SPIRAL_OUT_DIR'),
             run_dir=os.environ.get('FIT_SPIRAL_RUN_DIR'),
             run_tag=os.environ.get('FIT_SPIRAL_RUN_TAG'),

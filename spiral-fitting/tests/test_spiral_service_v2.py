@@ -52,7 +52,7 @@ from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADAT
                          AutosaveError, PclRole, SessionState, SpiralInputPaths,
                          resolve_dataset_root, select_startup_autosave,
                          validate_autosave, write_autosave_metadata)
-from config import BACKFILLABLE_CONFIG_DEFAULTS, Config
+from config import Config
 
 
 class FakeSession:
@@ -1475,10 +1475,7 @@ class DatasetOwnershipTests(unittest.TestCase):
 
     def test_a_refusal_reports_the_rebuild_that_would_accept_the_checkpoint(self):
         session = _attach_fake_session(self.state, self.output, self.root)
-        # Pin every input toggle to its historical value so the legacy
-        # backfill sub-case below stays a pure absence-vs-backfill check even
-        # though some toggles now default off.
-        live = Config(dict(BACKFILLABLE_CONFIG_DEFAULTS)).as_dict()
+        live = Config().as_dict()
         session.applied_config = dict(live)
 
         # A checkpoint differing only in allowlisted model configuration is a
@@ -1504,26 +1501,15 @@ class DatasetOwnershipTests(unittest.TestCase):
             "domain.ckpt", {**live, "z_end": live["z_end"] + 1000}))
         self.assertEqual(error.payload["stage"], "all")
 
-        # Input toggles have an unambiguous historical default. Their absence
-        # in a legacy checkpoint must not turn an otherwise rebuildable model
-        # mismatch into a permanent refusal.
-        pre_toggles = {
-            key: value for key, value in live.items()
-            if key not in BACKFILLABLE_CONFIG_DEFAULTS
-        }
-        pre_toggles["model_num_flow_stages"] = 3
+        # A checkpoint missing any schema key (here an input toggle) is not
+        # this schema's at all: no rebuild can accept it.
+        partial = {key: value for key, value in live.items()
+                   if key != "input_use_tracks"}
+        partial["model_num_flow_stages"] = 3
         error = self._refuse_load(session, self._write_checkpoint(
-            "pre-input-toggles.ckpt", pre_toggles))
-        self.assertEqual(error.payload["stage"], "model")
-        self.assertNotIn("refused", error.payload)
-
-        # The stage calculation uses the same historical True defaults as the
-        # rebuild. A live disabled input therefore promotes the rebuild to the
-        # full host-input stage.
-        session.applied_config["input_use_tracks"] = False
-        error = self._refuse_load(session, self._write_checkpoint(
-            "pre-input-toggles-disabled-live.ckpt", pre_toggles))
-        self.assertEqual(error.payload["stage"], "all")
+            "missing-toggle.ckpt", partial))
+        self.assertTrue(error.payload["refused"])
+        self.assertNotIn("stage", error.payload)
 
     def test_a_refusal_no_rebuild_can_fix_offers_nothing(self):
         session = _attach_fake_session(self.state, self.output, self.root)

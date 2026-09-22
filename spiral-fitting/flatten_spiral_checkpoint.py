@@ -34,7 +34,6 @@ import numpy as np
 import torch
 
 from checkpoint_io import load_checkpoint_cpu
-from checkpoint_migrations import merge_flow_stage_lattices
 from sample_spiral import get_spiral_yxs
 from tifxyz import save_combined_tifxyz
 from transforms import SpiralAndTransform
@@ -136,7 +135,6 @@ def _build_model(
     umbilicus_path: Path,
     device: torch.device,
 ) -> SpiralAndTransform:
-    checkpoint = merge_flow_stage_lattices(checkpoint)
     try:
         z_begin = int(checkpoint["z_begin"])
         z_end = int(checkpoint["z_end"])
