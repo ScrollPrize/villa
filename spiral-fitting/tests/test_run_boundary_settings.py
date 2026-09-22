@@ -264,8 +264,8 @@ def test_unattached_spacing_rederives_regular_strips_from_the_catalog():
 
 
 @pytest.mark.parametrize('settings, error', [
-    ({'track_min_walk_steps_per_track': 300}, 'min_walk_steps_per_track'),
-    ({'track_min_walks_per_track': 5}, 'min_walks_per_track'),
+    ({'track_max_track_crossing_per_step': -1}, 'max_track_crossing_per_step'),
+    ({'track_crossing_precompute_max': 1.5}, 'track_crossing_precompute_max'),
 ])
 def test_invalid_track_policy_preserves_enabled_pcl_inputs(settings, error):
     context = _context(input_use_pcl_same_winding=True)
@@ -320,12 +320,10 @@ def test_track_crossing_settings_reprepare_the_retained_tracks(monkeypatch):
         fit_spiral, 'configure_prepared_track_sampling', Mock())
 
     context.apply_config(
-        {'track_crossing_mode': 'track_walk',
-         'track_crossing_precompute_max': 12},
+        {'track_crossing_precompute_max': 12},
         current_iteration=0)
     prepare.assert_called_once()
     policy = prepare.call_args.kwargs['sampling_config']
-    assert policy['crossing_mode'] == 'track_walk'
     assert policy['crossing_precompute_max'] == 12
     assert context.prepared_main_tracks is prepared
 

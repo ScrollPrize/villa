@@ -69,10 +69,6 @@ class FakeSession:
             "track_max_track_crossing_per_step": 0,
             "track_min_sample_spacing": 20.0,
             "track_max_sample_spacing": 60.0,
-            "track_min_walk_steps_per_track": 24,
-            "track_max_walk_steps_per_track": 256,
-            "track_min_walks_per_track": 2,
-            "track_max_walks_per_track": 4,
         }
         # The resolved configuration the fit is running, as a real session
         # publishes it once it has one; a checkpoint refusal is analysed
@@ -83,8 +79,6 @@ class FakeSession:
             "sample_count_patches_per_step": 360,
             "loss_weight_patch_radius": 8.0,
             "track_crossing_precompute_max": 8,
-            "track_crossing_mode": "track_walk",
-            "track_walk_minimum_cycle_travel": 20.0,
         }
         self.saved = []
         self.autosave_calls = []
@@ -2429,9 +2423,6 @@ class UploadTests(unittest.TestCase):
             "track_max_track_crossing_per_step": 3,
             "track_min_sample_spacing": 12.0,
             "track_max_sample_spacing": 32.0,
-            "track_min_walk_steps_per_track": 18,
-            "track_max_walk_steps_per_track": 96,
-            "track_max_walks_per_track": 5,
         }
 
         response = _planned_run(self.state, {"iterations": 10, "run_config": config})

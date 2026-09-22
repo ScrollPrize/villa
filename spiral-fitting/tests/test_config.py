@@ -125,9 +125,6 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
         "track_min_sample_spacing", "track_max_sample_spacing",
         "track_length_bin_weights", "track_max_tortuosity",
         "track_max_track_crossing_per_step",
-        "track_min_walk_steps_per_track", "track_max_walk_steps_per_track",
-        "track_min_walks_per_track", "track_max_walks_per_track",
-        "track_walk_minimum_cycle_travel",
         "track_radius_target", "track_radius_loss_margin",
         "track_radius_within_norm_p", "track_dt_within_track_norm_p",
         "track_dt_norm_p", "track_dt_loss_margin",
@@ -136,7 +133,7 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
                for key in mutable_tracks)
     assert all(fields[key]["runtime_impact"] == "run_boundary"
                for key in {
-                   "track_crossing_precompute_max", "track_crossing_mode",
+                   "track_crossing_precompute_max",
                    "track_exclusion_radius",
                })
     run_mutable_pcl = {

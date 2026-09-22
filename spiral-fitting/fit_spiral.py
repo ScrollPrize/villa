@@ -2216,8 +2216,7 @@ class FitContext:
                 'loading', 'Resolving track store',
                 detail=os.path.basename(self.tracks_dbm_path))
             print(f'loading tracks from {self.tracks_dbm_path}')
-            if (track_sampling_config['crossing_precompute_max'] > 0
-                    or track_sampling_config['crossing_mode'] == 'track_walk'):
+            if track_sampling_config['crossing_precompute_max'] > 0:
                 track_crossing_cache = load_track_crossing_cache(self.tracks_dbm_path)
                 if track_crossing_cache is not None:
                     track_graph = TrackGraph(track_crossing_cache)
@@ -4803,7 +4802,6 @@ class FitContext:
             reprepare_tracks = bool(changed & {
                 'track_max_tortuosity',
                 'track_exclusion_radius',
-                'track_crossing_mode',
                 'track_crossing_precompute_max',
             })
             shell_atlas_keys = SHELL_ATLAS_KEYS
@@ -4955,12 +4953,7 @@ class FitContext:
                 rebuilt_tracks
                 if replace_prepared_tracks else self.prepared_main_tracks)
             if ({'track_length_bin_weights',
-                 'track_max_track_crossing_per_step',
-                 'track_min_walk_steps_per_track',
-                 'track_max_walk_steps_per_track',
-                 'track_min_walks_per_track',
-                 'track_max_walks_per_track',
-                 'track_walk_minimum_cycle_travel'}
+                 'track_max_track_crossing_per_step'}
                     & changed):
                 configure_prepared_track_sampling(target_tracks, config)
 

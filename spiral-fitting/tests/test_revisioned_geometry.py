@@ -383,7 +383,6 @@ def test_input_revision_preserves_current_track_policy(context, monkeypatch):
     monkeypatch.setattr(fit_spiral, 'prepare_main_phase_tracks', prepare)
     monkeypatch.setattr(fit_spiral, 'configure_prepared_track_sampling', Mock())
     ctx.apply_config({'track_exclusion_radius': 10, 'track_max_tortuosity': 2,
-                      'track_crossing_mode': 'track_walk',
                       'track_crossing_precompute_max': 12,
                       'track_length_bin_weights': [1, 2, 3]}, current_iteration=0)
     prepare.reset_mock()

@@ -20,7 +20,6 @@ def filter_known_config_keys(values, allowed, *, label, warn=print):
 _ENUMS = {
     "model_flow_integration_solver": ["rk4"],
     "model_flow_field_type": ["cartesian", "cylindrical", "bspline", "bspline_cylindrical"],
-    "track_crossing_mode": ["count", "track_walk"],
     "track_radius_target": ["mean", "median"],
     "dense_spacing_mode": ["grad_mag", "winding_model"],
     "dt_target_mode": ["strip_median", "whole_object_quantile"],
@@ -735,12 +734,6 @@ class Config:
         self.track_max_tortuosity = None
         self.track_crossing_precompute_max = 8
         self.track_max_track_crossing_per_step = 2
-        self.track_crossing_mode = "count"
-        self.track_min_walk_steps_per_track = 24
-        self.track_max_walk_steps_per_track = 256
-        self.track_min_walks_per_track = 2
-        self.track_max_walks_per_track = 4
-        self.track_walk_minimum_cycle_travel = 20.0
         self.track_exclusion_radius = 16.0
         self.track_radius_target = "mean"
         self.track_radius_loss_margin = 0.025

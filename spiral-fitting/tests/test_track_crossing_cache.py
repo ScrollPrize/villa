@@ -12,8 +12,6 @@ from tracks import (
     PackedTrackCollection,
     _build_crossing_partner_csr,
     _load_native_track_crossings,
-    _materialize_cached_crossing_partner_table,
-    _materialize_crossing_partner_table,
     _pack_track_points,
     _restrict_crossing_partner_csr,
     load_track_crossing_cache,
@@ -72,7 +70,6 @@ class TrackCrossingCacheTests(unittest.TestCase):
             prepared = prepare_main_phase_tracks(
                 tracks, None, 0.0, 'cpu',
                 sampling_config={
-                    'track_crossing_mode': 'count',
                     'track_crossing_precompute_max': 1,
                     'track_max_track_crossing_per_step': 1,
                 },
@@ -118,7 +115,6 @@ class TrackCrossingCacheTests(unittest.TestCase):
             prepared = prepare_main_phase_tracks(
                 tracks, None, 0.0, 'cpu',
                 sampling_config={
-                    'track_crossing_mode': 'count',
                     'track_crossing_precompute_max': 1,
                     'track_max_track_crossing_per_step': 1,
                 },
@@ -153,7 +149,6 @@ class TrackCrossingCacheTests(unittest.TestCase):
             prepared = prepare_main_phase_tracks(
                 tracks, None, 0.0, 'cpu',
                 sampling_config={
-                    'track_crossing_mode': 'count',
                     'track_crossing_precompute_max': 1,
                     'track_max_track_crossing_per_step': 1,
                 },
@@ -193,27 +188,6 @@ class TrackCrossingCacheTests(unittest.TestCase):
             self.assertEqual(len(cache['partners']), 2)
             self.assertEqual(int(cache['self_local'][0]), 2)
             self.assertEqual(int(cache['partner_local'][0]), 2)
-
-    def test_native_fused_table_matches_python_restrict_and_spacing(self):
-        horizontal = line_track(20, z=10, y=10, axis=2)
-        tracks = [horizontal]
-        for x in (3, 7, 12, 18):
-            vertical = line_track(20, z=10, y=0, axis=1)
-            vertical[:, 2] = x
-            tracks.append(vertical)
-        source_ids = np.arange(10, 60, 10, dtype=np.uint64)
-        csr = _build_crossing_partner_csr(
-            tracks, ['horizontal'] + ['vertical'] * 4,
-            source_ids=source_ids)
-        selected_source_ids = source_ids[[0, 1, 3, 4]]
-        expected = _materialize_crossing_partner_table(
-            _restrict_crossing_partner_csr(csr, selected_source_ids),
-            3, 'cpu')
-        actual = _materialize_cached_crossing_partner_table(
-            csr, selected_source_ids, 3, 'cpu', workers=2)
-        for expected_array, actual_array in zip(expected, actual):
-            np.testing.assert_array_equal(
-                expected_array.numpy(), actual_array.numpy())
 
     def test_hybrid_parallel_builder_matches_serial(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -320,12 +294,10 @@ class TrackCrossingCacheTests(unittest.TestCase):
             np.empty(0, dtype=np.int32),
             np.asarray([len(track) for track in tracks], dtype=np.int32),
         )
-        empty_table = np.empty((len(tracks), 0), dtype=np.int32)
         result = native.resample_tracks(
             np.concatenate(tracks).astype(np.float32),
             np.asarray([0, len(tracks[0]), sum(map(len, tracks))],
                        dtype=np.int64),
-            empty_table, empty_table, empty_table,
             minimum_spacing=1.0, maximum_spacing=2.0,
             crossing_index=crossing_index,
         )
