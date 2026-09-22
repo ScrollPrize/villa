@@ -100,3 +100,12 @@
 - Existing generated alias-only channel directories are safely replaced during
   union export; unrelated/non-symlink content is refused. The regenerated v3
   manifest has five physical source labels and zero missing chunks.
+
+## 2026-09-22 — Paris4 failure-region cache subset
+
+- Added an opt-in exporter for the canonical PHercParis4 cache. It copies only
+  level-1 metadata and the audited presence/nx/ny chunks intersecting the 100
+  exported failure pieces; it does not copy the full-volume cache.
+- The subset contains 8,858 unique chunk keys and occupies 4.9 GiB. It is
+  available at `paris4_failure_subset/` and through the symlink
+  `vc3d_channels/PHercParis4_failure_subset`.

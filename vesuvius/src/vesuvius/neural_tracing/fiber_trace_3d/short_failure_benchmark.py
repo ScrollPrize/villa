@@ -862,6 +862,67 @@ def _fill_union_corridor(workload, fill, required_by_root, output):
     print(json.dumps({'coverage_fill_complete': result}), flush=True)
 
 
+def _export_channel_subset(source_root, destination, keys, channels):
+    """Copy Zarr metadata and only selected level-1 chunks for inspection."""
+    source_root, destination = Path(source_root), Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    for channel in channels:
+        source = source_root / channel
+        target = destination / channel
+        target.mkdir(parents=True, exist_ok=True)
+        for metadata in source.glob('*'):
+            if metadata.is_file():
+                shutil.copy2(metadata, target / metadata.name)
+        source_level, target_level = source / '1', target / '1'
+        target_level.mkdir(exist_ok=True)
+        for metadata in source_level.glob('*'):
+            if metadata.is_file():
+                shutil.copy2(metadata, target_level / metadata.name)
+        for z, y, x in sorted(keys):
+            source_chunk = source_level / str(z) / str(y) / str(x)
+            if not source_chunk.is_file():
+                raise FileNotFoundError(f'missing source chunk: {source_chunk}')
+            target_chunk = target_level / str(z) / str(y) / str(x)
+            target_chunk.parent.mkdir(parents=True, exist_ok=True)
+            if not target_chunk.exists():
+                shutil.copy2(source_chunk, target_chunk)
+    atomic_write(destination / 'subset_manifest.json', {
+        'version': 1, 'source_root': str(source_root),
+        'level': 1, 'channels': list(channels),
+        'chunk_count': len(keys),
+    }, durable=False)
+
+
+def _export_paris4_subset(settings, output, cache_by_locator, required_by_root):
+    spec = settings.get('export_paris4_subset')
+    if not spec:
+        return None
+    if not isinstance(spec, dict):
+        raise ValueError('export_paris4_subset must be an object')
+    locator = spec.get('input_volume')
+    roots = [Path(root) for source_locator, root in cache_by_locator.items()
+             if _canonical_source_label(locator or source_locator) == 'PHercParis4']
+    if len(roots) != 1:
+        raise ValueError(f'expected one Paris4 cache root, found {len(roots)}')
+    source_root = roots[0]
+    keys = required_by_root.get(str(source_root.resolve()), set())
+    destination = Path(spec.get('output_root', output / 'paris4_failure_subset'))
+    _export_channel_subset(source_root, destination, keys,
+                            ('fiber_presence.ome.zarr', 'fiber_nx.ome.zarr', 'fiber_ny.ome.zarr'))
+    link = output / 'vc3d_channels' / 'PHercParis4_failure_subset'
+    if link.exists() or link.is_symlink():
+        if not link.is_symlink() or link.resolve() != destination.resolve():
+            raise ValueError(f'refusing to replace existing subset link: {link}')
+    else:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(os.path.relpath(destination, link.parent), link)
+    result = {'output_root': str(destination), 'link': str(link),
+              'chunk_count': len(keys), 'source_root': str(source_root)}
+    atomic_write(output / 'paris4_subset_manifest.json', result, durable=False)
+    print(json.dumps({'paris4_subset': result}), flush=True)
+    return result
+
+
 def run_union(workload):
     """Extract all deduplicated GT hard regions from completed evaluations.
 
@@ -1063,6 +1124,7 @@ def run_union(workload):
     fill = settings.get('fill_missing_inference')
     if fill:
         _fill_union_corridor(workload, fill, required_by_root, output)
+    _export_paris4_subset(settings, output, cache_by_locator, required_by_root)
 
     coverage = []
     missing_total = 0

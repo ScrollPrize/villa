@@ -20,6 +20,9 @@
         "result_slots": 8
       }
     },
+    "export_paris4_subset": {
+      "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/full_failure_union_20260921_v3/paris4_failure_subset"
+    },
     "evaluations": [
       {
         "name": "fullres_refinement_213753_best_ema999",
