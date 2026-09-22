@@ -193,7 +193,9 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "model_pin_conflict_tolerance": 0.1,
     "model_pin_rebin_interval": 1,
     "model_pin_overlap_tolerance_voxels": 0.0,
+    "model_pin_max_patch_spread_windings": 0.0,
     "optimizer_lr_pin_targets": 0.01,
+    "model_pin_targets_integer": False,
     "sample_count_pins": 100000,
     # Stage-3 pin strain loss postdates checkpoints written with pins.
     "loss_weight_pin_strain": 8.0,
@@ -302,6 +304,12 @@ _PIN_DESCRIPTIONS = {
     "model_pin_rebin_interval": (
         "Steps between pin CSR, footprint and coincidence rebuilds; slot, "
         "pin-set and spatial bin crossings always force a safe rebuild."),
+    "model_pin_targets_integer": (
+        "Snap the component winding targets to integers when pins activate "
+        "and hold them fixed."),
+    "model_pin_max_patch_spread_windings": (
+        "Do not pin verified patches whose quad centres the unpinned model "
+        "spreads over more than this many windings; 0 disables."),
 }
 
 _OPTIMIZER_DESCRIPTIONS = {
@@ -417,6 +425,7 @@ RETIRED_CONFIG_KEYS = frozenset({
 MODEL_STAGE_KEYS = frozenset({
     "model_pins_enabled",
     "model_pin_overlap_tolerance_voxels",
+    "model_pin_max_patch_spread_windings",
     "model_pin_patch_grid_stride",
     "model_pin_kernel_spacing_factor",
     "model_pin_kernel_min_arc_voxels",
@@ -441,6 +450,7 @@ MODEL_STAGE_KEYS = frozenset({
 _MODEL_STRUCTURE_KEYS = frozenset({
     "model_pins_enabled",
     "model_pin_overlap_tolerance_voxels",
+    "model_pin_max_patch_spread_windings",
     "model_pin_patch_grid_stride",
     "model_pin_kernel_spacing_factor",
     "model_pin_kernel_min_arc_voxels",
@@ -465,6 +475,7 @@ _MODEL_STRUCTURE_KEYS = frozenset({
 
 _RUN_MUTABLE_MODEL_KEYS = frozenset({
     "model_pins_warmup_steps",
+    "model_pin_targets_integer",
     "model_pin_rebin_interval",
     "model_pin_coincidence_frac",
     "model_pin_conflict_tolerance",
@@ -735,7 +746,15 @@ class Config:
         # test, and a false link is a hard wrong constraint. ~1.5 is a
         # reasonable opt-in value for overlapping surface annotations.
         self.model_pin_overlap_tolerance_voxels = 0.0
+        # Verified patches whose quad centres the unpinned model spreads over
+        # more than this many windings (std of canonical shifted winding at
+        # registry finalisation) are not pinned; 0 disables. Such patches
+        # conflict on every ray they share with their neighbours.
+        self.model_pin_max_patch_spread_windings = 0.0
         self.optimizer_lr_pin_targets = 0.01
+        # Snap the component targets T to integers at activation and hold
+        # them fixed (no fractional winding coordinate to optimise).
+        self.model_pin_targets_integer = False
         # Registry pins pushed through the flow per training step (stratified
         # by component; 0 = all). Export and diagnostics always use them all.
         # Memory of the eager pinned lookup grows with the (sample, pin) pairs

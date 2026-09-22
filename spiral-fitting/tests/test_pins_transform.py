@@ -145,7 +145,7 @@ def build_scene(*, inconsistent=False):
     return patches, atlas, [link, absolute, link2], strips
 
 
-def build_registry(model, patches, atlas, pcls, strips, stride=1, z_range=None):
+def build_registry(model, patches, atlas, pcls, strips, stride=1, z_range=None, max_patch_spread=None):
     graph = pins.build_pin_graph(
         verified_patches=patches, patch_atlas=atlas, cross_patch_pcls=pcls,
         unattached_pcl_strips=strips, unattached_components=[[0]],
@@ -166,7 +166,8 @@ def build_registry(model, patches, atlas, pcls, strips, stride=1, z_range=None):
         dr=model.get_dr_per_winding(), crossing_map=crossing_map, patch_atlas=atlas,
         footprint_rule=pins.FootprintRule(), free_gap_fn=free_gap,
         min_z=0.0, max_z=192.0, device=torch.device('cpu'),
-        canonical_transform=model.get_unpinned_slice_to_spiral_transform())
+        canonical_transform=model.get_unpinned_slice_to_spiral_transform(),
+        max_patch_spread=max_patch_spread)
     return graph, registry
 
 
@@ -676,3 +677,21 @@ def test_pin_graph_and_registry_exclude_points_outside_flow_z_domain():
     _, registry = build_registry(model, patches, atlas, pcls, strips, z_range=(0.0, 192.0))
     assert registry.num_pins > 0
     assert bool((registry.zyx[:, 0] >= 0.0).all() and (registry.zyx[:, 0] <= 192.0).all())
+
+
+def test_spread_filter_excludes_patches_and_clears_their_component():
+    """A patch the free map spreads over more than the cap is not pinned and
+    keeps the -1 patch_component sentinel, so it is neither routed to the
+    pinned DT targets nor counted as pinned by the loss routing."""
+    model = make_model(flow_std=0.05, gap_std=0.5)
+    patches, atlas, pcls, strips = build_scene()
+    _, full = build_registry(model, patches, atlas, pcls, strips)
+    _, filtered = build_registry(model, patches, atlas, pcls, strips, max_patch_spread=1e-6)
+    excluded = filtered.consistency_report['excluded_patches']
+    assert len(excluded) == len(patches)          # every patch has nonzero spread under a random flow
+    assert int((filtered.kind == pins.PIN_KIND_PATCH).sum()) == 0
+    assert bool((filtered.patch_component == -1).all())
+    assert bool((filtered.patch_offset == 0).all())
+    # Chain pins survive, and the unfiltered registry still marks the patches.
+    assert int((filtered.kind == pins.PIN_KIND_CHAIN).sum()) == int((full.kind == pins.PIN_KIND_CHAIN).sum())
+    assert bool((full.patch_component >= 0).all())

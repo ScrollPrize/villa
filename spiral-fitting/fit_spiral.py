@@ -3390,7 +3390,8 @@ class FitContext:
                     footprint_rule=self._pin_footprint_rule(), free_gap_fn=free_gap,
                     min_z=float(self.flow_min_corner_spiral_zyx[0]),
                     max_z=float(self.flow_max_corner_spiral_zyx[0]),
-                    device=self.device)
+                    device=self.device,
+                    max_patch_spread=(float(self.config.get('model_pin_max_patch_spread_windings', 0.0)) or None))
 
         if self.pin_targets_loaded:
             registry = model.pin_registry
@@ -3405,10 +3406,25 @@ class FitContext:
                           'pins fall back to uniform subsampling')
         else:
             registry = finalize_fresh()
+        if registry.patch_index is not None and registry.patch_component.numel():
+            # A patch is pinned only if it contributed pins (registries saved
+            # before the spread filter marked every graph patch).
+            has_pins = torch.zeros(registry.patch_component.numel(), dtype=torch.bool,
+                                   device=registry.patch_component.device)
+            pinned_idx = registry.patch_index[registry.patch_index >= 0]
+            has_pins[pinned_idx[pinned_idx < has_pins.numel()]] = True
+            registry.patch_component = torch.where(has_pins, registry.patch_component,
+                                                   torch.full_like(registry.patch_component, -1))
         model.set_pin_registry(registry, reset_targets=not self.pin_targets_loaded)
         if self.dist.is_main_process:
             print(registry.summary())
             report = registry.consistency_report
+            excluded = report.get('excluded_patches') or []
+            if excluded:
+                print(f'pin registry: {len(excluded)} verified patch(es) not pinned (free-map spread above '
+                      f'{self.config.get("model_pin_max_patch_spread_windings")} windings), '
+                      f'{sum(q for _, _, q in excluded)} quads; worst: '
+                      + ', '.join(f'{p}:{sp:.1f}' for p, sp, _ in sorted(excluded, key=lambda t: -t[1])[:5]))
             if report.get('inconsistent_edges'):
                 print(f'WARNING: pin registry has {report["inconsistent_edges"]} '
                       f'inconsistent constraint cycles '
@@ -3425,6 +3441,7 @@ class FitContext:
         self.pins_activation_iteration = warmup
         if self.pin_targets_loaded and self.start_iteration >= warmup:
             model.pins_active = True
+            self._apply_integer_pin_targets()
             self.slice_to_spiral_transform = model.get_slice_to_spiral_transform()
 
     def _draw_step_pin_patches(self):
@@ -3448,6 +3465,40 @@ class FitContext:
             probs = mask
         return probs / probs.sum()
 
+    def _apply_integer_pin_targets(self):
+        """Honour ``model_pin_targets_integer`` on the live targets.
+
+        On: round the component targets to integers and freeze them, so
+        every component is pinned onto an integer winding (the integer-
+        snapping satisfaction metric then measures pin exactness directly
+        and DT has nothing to do). Off: targets are trainable. Called at
+        activation, when a resumed checkpoint restores active pins, and when
+        the setting changes at a run boundary; ``requires_grad`` is not part
+        of the state dict, so a resume must re-apply it.
+        """
+        model = self.spiral_and_transform
+        if getattr(model, 'pin_targets', None) is None:
+            return
+        if self.config.get('model_pin_targets_integer', False):
+            with torch.no_grad():
+                model.pin_targets.copy_(torch.round(model.pin_targets))
+            model.pin_targets.requires_grad_(False)
+        else:
+            model.pin_targets.requires_grad_(True)
+
+    def unpinned_verified_patch_mask(self):
+        """Bool per verified patch: True when the registry pins none of its
+        quads (excluded by the spread filter, outside the flow z domain, or
+        without sampling-valid quads). These keep the soft constraint losses
+        while pins replace them on pinned inputs. None when pins are off."""
+        model = self.spiral_and_transform
+        if not model._pins_enabled() or model.pin_registry is None:
+            return None
+        mask = model.pin_registry.patch_component < 0
+        if mask.numel() != len(self.verified_patches_list):
+            return None
+        return mask
+
     def _maybe_activate_pins(self, iteration):
         model = self.spiral_and_transform
         if (model.pin_registry is None or model.pins_active
@@ -3458,6 +3509,7 @@ class FitContext:
             # T from the state the soft fit has reached.
             with torch.no_grad():
                 model.pin_targets.copy_(model.estimate_pin_targets())
+        self._apply_integer_pin_targets()
         model.pins_active = True
         if self.dist.is_main_process:
             T = model.effective_pin_targets().detach()
@@ -5561,6 +5613,8 @@ class FitContext:
         old_values = {key: self.config[key] for key in tracked}
         self.config.update(config)
         try:
+            if 'model_pin_targets_integer' in changed and self.spiral_and_transform.pins_active:
+                self._apply_integer_pin_targets()
             if changed & {'pcl_link_window_points', 'pcl_link_window_min_points'}:
                 window = int(self.config['pcl_link_window_points'])
                 minimum = int(self.config['pcl_link_window_min_points'])
@@ -5879,20 +5933,40 @@ class FitContext:
         weight_rel_winding = 0.0 if pins_replace else self.config['loss_weight_rel_winding']
         weight_abs_winding = 0.0 if pins_replace else self.config['loss_weight_abs_winding']
         weight_unattached_radius = 0.0 if pins_replace else self.config['loss_weight_unattached_pcl_radius']
+        # Inputs without pins keep their soft constraint losses when pins
+        # replace them: verified patches the registry does not pin (spread
+        # filter, flow z domain), PCL rows touching such a patch, and strips
+        # with non-pin points (vertical fibers with radial offsets).
+        unpinned_patch_mask = self.unpinned_verified_patch_mask() if pins_replace else None
+        unpinned_patches = (torch.nonzero(unpinned_patch_mask, as_tuple=True)[0].cpu().numpy()
+                            if unpinned_patch_mask is not None and bool(unpinned_patch_mask.any()) else None)
+        if pins_replace and any(
+                strip.get('radial_offsets') is not None and bool((np.asarray(strip['radial_offsets']) != 0).any())
+                for strip in self.unattached_pcl_strips):
+            weight_unattached_radius = self.config['loss_weight_unattached_pcl_radius']
         if self.spiral_and_transform._pins_enabled() and self.verified_patches_list:
             # The PCL winding losses are drawn here too, so the patches they
             # touch are pinned this step as well as the patch-loss patches.
-            if weight_rel_winding > 0 and self.cross_patch_pcls:
+            if self.config['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
                 rel_winding_rows = draw_rel_winding_rows(
                     self.verified_patches, self.patch_atlas, self.cross_patch_pcls,
                     self.pcl_sampling_strata['cross_patch'], self.config)
-            if weight_abs_winding > 0 and self.cross_patch_pcls:
+            if self.config['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
                 abs_winding_rows = draw_abs_winding_rows(
                     self.verified_patches, self.patch_atlas, self.cross_patch_pcls, self.config)
             pcl_patches = [idx for row in (rel_winding_rows or []) for idx in row['patch_indices']]
             pcl_patches += [row[0] for row in (abs_winding_rows or [])]
             self.spiral_and_transform.set_step_pin_patches(
                 np.union1d(self._draw_step_pin_patches(), np.asarray(pcl_patches, dtype=np.int64)))
+            if pins_replace:
+                # Keep only the rows that touch an unpinned patch, at full weight.
+                pinned = None if unpinned_patch_mask is None else ~unpinned_patch_mask.cpu()
+                def touches_unpinned(indices):
+                    return pinned is None or any(not bool(pinned[int(i)]) for i in indices)
+                rel_winding_rows = [row for row in (rel_winding_rows or []) if touches_unpinned(row['patch_indices'])]
+                abs_winding_rows = [row for row in (abs_winding_rows or []) if touches_unpinned(row[:1])]
+                weight_rel_winding = self.config['loss_weight_rel_winding'] if rel_winding_rows else 0.0
+                weight_abs_winding = self.config['loss_weight_abs_winding'] if abs_winding_rows else 0.0
         shared_transform_outputs = self.spiral_and_transform.get_shared_transform_tensors()
         active_patches = self.spiral_and_transform.active_step_pin_patches()
         if active_patches is not None and self.verified_patches_list:
@@ -6066,6 +6140,25 @@ class FitContext:
             log_metrics['patch_radius_unweighted'] = float(patch_loss_values[0].detach())
         backward_family(patch_family)
         del patch_family, patch_loss_values
+        if pins_replace and unpinned_patches is not None and self.config['loss_weight_patch_radius'] > 0:
+            # Verified patches without pins keep the soft radius loss.
+            unpinned_values = get_patch_and_umbilicus_losses(
+                self.slice_to_spiral_transform,
+                self.dr_per_winding,
+                min(int(self.config['sample_count_patches_per_step']), int(unpinned_patches.size)),
+                0,
+                self.verified_patches_list,
+                self.patch_atlas,
+                self._restrict_patch_probabilities(unpinned_patches),
+                self.umbilicus_zyx,
+                compute_dt=False,
+                shell_valid_zyxs=None,
+                shell_outer_winding_idx=self.shell_outer_winding_idx,
+                crossing_map=self.theta_crossing_map,
+                cfg=self.config,
+            )
+            backward_family({'patch_radius_unpinned': unpinned_values[0] * self.config['loss_weight_patch_radius']})
+            del unpinned_values
 
         if self.unverified_patch_atlas is not None and (
             self.config['loss_weight_unverified_patch_radius'] > 0
@@ -6480,6 +6573,15 @@ class FitContext:
                 conditioning_lines, conditioning_payload = self._flow_conditioning_report()
                 for line in conditioning_lines:
                     print(line)
+                pin_keys = ('pin_inexact_fraction', 'pin_rays_with_violation_fraction',
+                            'pin_order_violations', 'pin_anchors_evaluated', 'pin_conflicts',
+                            'pin_strain_median', 'pin_strain_p90', 'pin_strain_frac_over_margin',
+                            'pin_T_frac_mean', 'patch_radius_unweighted')
+                pin_items = [(k, log_metrics[k]) for k in pin_keys if k in log_metrics]
+                if pin_items:
+                    print('  pins: ' + ', '.join(
+                        f'{k.removeprefix("pin_")} = {v:.3f}' if isinstance(v, float) and abs(v) < 1e4
+                        else f'{k.removeprefix("pin_")} = {v:.0f}' for k, v in pin_items))
                 payload = {
                     'total_loss': loss.item(),
                     **conditioning_payload,

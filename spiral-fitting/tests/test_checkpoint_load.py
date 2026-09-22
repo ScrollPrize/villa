@@ -683,6 +683,21 @@ class PinOptimizerResumeTests(unittest.TestCase):
                 else:
                     torch.testing.assert_close(model_state['pin_targets'], targets.detach())
 
+    def test_integer_targets_applied_on_resume_and_run_update(self):
+        # requires_grad is not state-dict state: a resumed fit with active
+        # pins must round and freeze again, and toggling the setting at a
+        # run boundary must take effect on the live targets.
+        targets = torch.nn.Parameter(torch.tensor([1.3, 2.6, -0.4]))
+        context = SimpleNamespace(
+            spiral_and_transform=SimpleNamespace(pin_targets=targets, pins_active=True),
+            config={'model_pin_targets_integer': True})
+        fit_spiral.FitContext._apply_integer_pin_targets(context)
+        torch.testing.assert_close(targets.detach(), torch.tensor([1., 3., -0.]))
+        self.assertFalse(targets.requires_grad)
+        context.config['model_pin_targets_integer'] = False
+        fit_spiral.FitContext._apply_integer_pin_targets(context)
+        self.assertTrue(targets.requires_grad)
+
 
 if __name__ == "__main__":
     unittest.main()

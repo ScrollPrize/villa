@@ -1250,7 +1250,7 @@ def _crossing_step(theta_from, theta_to):
 def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
                       patch_atlas, footprint_rule, free_gap_fn, min_z, max_z,
                       device, canonical_transform=None, patch_pin_kind=PIN_KIND_PATCH,
-                      chunk_size=262144):
+                      chunk_size=262144, max_patch_spread=None):
     """Resolve the graph against the current model into a :class:`PinRegistry`.
 
     ``intermediate_transform`` maps scroll -> intermediate space (the flow
@@ -1345,10 +1345,13 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
             'edge': edge.label or f'{graph.nodes[edge.u].label}->{graph.nodes[edge.v].label}',
             'kind': edge.kind, 'mismatch': int(mismatch)})
     by_kind = collections.Counter(graph.edges[k].kind for k, _ in inconsistent)
+    excluded_patches = []   # (patch index, spread, quads) dropped by max_patch_spread, filled below
+    pinned_patch_nodes = set()   # graph patch nodes that emitted at least one pin
     consistency_report = {
         'inconsistent_edges': len(inconsistent),
         'inconsistent_edges_by_kind': dict(by_kind),
         'components': dict(by_component),
+        'excluded_patches': excluded_patches,
     }
     # -- absolute components ---------------------------------------------
     fixed_T = np.zeros(graph.num_components, dtype=bool)
@@ -1398,6 +1401,22 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
         pots = crossing_map.winding_potentials(
             torch.from_numpy(node_ids_g.reshape(-1)).to(crossing_map.device)).reshape(*valid_g.shape)
         crossing_map.assert_no_pending_potential_errors()
+        if max_patch_spread is not None and canonical_transform is not None:
+            # A patch the current free map cannot hold on one sheet (its
+            # quad centres spread over more than max_patch_spread windings
+            # of canonical shifted winding, after seam adjustment) is not
+            # pinned: its pins would conflict on every ray it shares with
+            # its neighbours and the ordering guard would sacrifice them.
+            with torch.no_grad():
+                spiral = torch.cat([canonical_transform(flat[start:start + chunk_size])
+                                    for start in range(0, flat.shape[0], chunk_size)], dim=0)
+                canon_w = (torch.linalg.norm(spiral[:, 1:], dim=-1) / dr_f
+                           - theta_g.reshape(-1) / TWO_PI
+                           + pots.to(device).reshape(-1).to(torch.float32))[valid_t.reshape(-1)]
+                spread_w = float(canon_w.std()) if canon_w.numel() > 1 else 0.0
+            if spread_w > float(max_patch_spread):
+                excluded_patches.append((int(node.patch_index), spread_w, int(valid_t.sum())))
+                continue
         sp_t, sp_z = grid_neighbour_spacing(theta_g, z_g, valid_t)
         sel = valid_t.reshape(-1)
         ids = torch.full(valid_t.shape, -1, dtype=torch.long, device=device)
@@ -1412,6 +1431,7 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
             adjacent.append(other[valid_t])
         neighbours.append(torch.stack(adjacent, dim=-1))
         emitted += int(valid_t.sum())
+        pinned_patch_nodes.add(i)
         pin_zyx.append(zyx_g.reshape(-1, 3).to(device)[sel])
         pin_theta.append(theta_g.reshape(-1)[sel])
         pin_z.append(z_g.reshape(-1)[sel])
@@ -1523,8 +1543,10 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
     num_patches = len(patch_atlas._patches) if patch_atlas is not None else 0
     patch_component = torch.full([num_patches], -1, dtype=torch.int64)
     patch_offset = torch.zeros([num_patches], dtype=torch.int64)
+    # Only patches that contributed pins are "pinned" for the DT-target and
+    # loss routing purposes; excluded or empty patches keep the -1 sentinel.
     for patch_index, node in graph.patch_nodes.items():
-        if patch_index < num_patches:
+        if patch_index < num_patches and node in pinned_patch_nodes:
             patch_component[patch_index] = int(component_of[node])
             patch_offset[patch_index] = int(n_node[node])
 

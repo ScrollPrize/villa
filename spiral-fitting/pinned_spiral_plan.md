@@ -668,6 +668,33 @@ gives them nonzero strain.
 
 ---
 
+### Where the pinned fit stands (2026-09-22)
+
+Measured on the real z 10000-11000 fit (5000 unpinned warm-up, then pinned with strain),
+relative to each patch's own median shifted winding (no integer snapping), over all
+quad centres of the pinned verified patches:
+
+| | quad centres within 0.5 winding | patches with every quad within 0.5 |
+|---|---|---|
+| free stage | 91% | 31% |
+| pinned, all patches | 96% | 75% |
+| pinned, patches with free-map spread > 1 winding not pinned (240 of 9309) | 97.3% | 81% |
+| pinned, spread > 0.5 not pinned (590) | 97.9% | 84% |
+
+3000 pinned steps give the same numbers as 300: the residual is structural, not a matter
+of training time, and quadrupling the strain weight barely moves the strain plateau
+(median ~0.13 winding). The residual is the ordering guard: on a ray the radial pinned
+map cannot swap points, so two components whose free-map radial order disagrees with
+their targets cost one of them its exactness. Half of those conflicts are whole-winding
+target disagreements between components (independent per-component estimates; overlap
+linking reduces them but adds inconsistent cycles), half are components the free map
+bends across a neighbour at their edges. 9% of patches hold 57% of the inexact pins;
+excluding them (`model_pin_max_patch_spread_windings`) is the cheapest lever so far.
+Integer-snapped frozen targets (`model_pin_targets_integer`) lift the integer-snapping
+satisfaction metric from 58% to 89% of area but are slightly worse on the fractional
+yardstick. Not yet tried: a joint (consistent) integer assignment across neighbouring
+components, and a finer flow lattice.
+
 ## Out of scope for these stages (recorded so they are not lost)
 
 - Discrete optimisation of `T` (integer search, difference-constraint feasibility). `T`
