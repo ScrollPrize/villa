@@ -505,9 +505,7 @@ auto main(int argc, char* argv[]) -> int
                 perf::REMOTE_DOWNLOAD_PARALLELISM,
                 perf::REMOTE_DOWNLOAD_PARALLELISM_DEFAULT).toInt(),
             1, perf::REMOTE_DOWNLOAD_WORKER_CAPACITY));
-        remoteCacheDelta3d = settings.value(
-            perf::REMOTE_CACHE_DELTA3D,
-            perf::REMOTE_CACHE_DELTA3D_DEFAULT).toBool();
+        remoteCacheDelta3d = vc::settings::remoteCacheDelta3dEnabled();
 
         // Per-segment rotating-backup count -> core (used by saveOverwrite/growth).
         QuadSurface::setBackupCount(
