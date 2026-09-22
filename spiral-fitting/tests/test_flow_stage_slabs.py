@@ -22,11 +22,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import flow_triton
 from checkpoint_migrations import (merge_flow_stage_lattices,
                                    merge_flow_stage_state)
-from config import RETIRED_CONFIG_KEYS, Config, durable_config
+from config import RETIRED_CONFIG_KEYS, Config
 from flow_fields import (BSplineCylindricalFlowField, BSplineFlowField,
                          CartesianFlowField, CylindricalFlowField)
 from transforms import SpiralAndTransform
-import update_checkpoint
 
 
 N_STEPS = 3
@@ -421,14 +420,7 @@ def test_merge_flow_stage_lattices_migrates_optimizer():
     assert merge_flow_stage_lattices(migrated) is migrated
 
 
-def test_retired_time_axis_key_is_dropped_by_config_migration():
+def test_retired_time_axis_key_is_not_a_config_key():
     assert 'model_num_flow_timesteps' in RETIRED_CONFIG_KEYS
     with pytest.raises(ValueError, match='Unknown Spiral config keys'):
         Config({'model_num_flow_timesteps': 1})
-    source = {**durable_config(Config().as_dict()), 'model_num_flow_timesteps': 1}
-    migrated, renamed, removed, added = update_checkpoint.migrate_config(source)
-    assert 'model_num_flow_timesteps' not in migrated
-    assert removed == ['model_num_flow_timesteps']
-    legacy = {**durable_config(Config().as_dict()), 'num_flow_timesteps': 1}
-    _, _, removed, _ = update_checkpoint.migrate_config(legacy)
-    assert removed == ['num_flow_timesteps']

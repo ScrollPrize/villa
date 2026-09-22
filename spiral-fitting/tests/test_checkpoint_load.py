@@ -163,11 +163,6 @@ class CheckpointPreflightTests(unittest.TestCase):
         legacy = _inspect(_checkpoint(schema_version=1))
         self.assertFalse(legacy.accepted)
         self.assertIn("schema version 1", legacy.message())
-        # The startup/CLI restore has no live session to protect and still
-        # accepts pre-v2 checkpoints through the same implementation.
-        self.assertTrue(
-            _inspect(_checkpoint(schema_version=1),
-                     allow_legacy_schema=True).accepted)
         missing = _inspect(_checkpoint(optimiser=None))
         self.assertFalse(missing.accepted)
         self.assertIn("'optimiser'", missing.message())

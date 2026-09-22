@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 
 
-GAP_PARAMETERIZATION_VERSION = 2
 LEGACY_EXPONENT_SCALE = 200.0
 DR_PARAMETER_SCALE = 12.0
 

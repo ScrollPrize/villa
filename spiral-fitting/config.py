@@ -152,13 +152,6 @@ BACKFILLABLE_CONFIG_DEFAULTS = {
     key: True for key in _INPUT_TOGGLE_DESCRIPTIONS
 }
 BACKFILLABLE_CONFIG_DEFAULTS.update({
-    # Historical checkpoints used an unbounded exponential gap map and used
-    # model_gap_expander_num_windings for both the physical estimate and the
-    # allocated lattice extent.  The checkpoint loader migrates their tensors;
-    # these defaults make the added semantic fields schema-compatible too.
-    "model_gap_expander_capacity_windings": DEFAULT_GAP_EXPANDER_CAPACITY,
-    "model_gap_expander_min_gap": 1.0,
-    "model_gap_expander_softplus_bias": 4.0,
     # Fiber classification thresholds for radial offsets and patch-side linking.
     "pcl_vertical_fiber_min_z_fraction": 0.8,
     "pcl_vertical_fiber_min_auto_certainty": 0.5,

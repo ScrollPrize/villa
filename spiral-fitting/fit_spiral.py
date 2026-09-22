@@ -50,8 +50,7 @@ from ddp_helpers import (
 from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
                     RETIRED_CONFIG_KEYS, Config, FitConfig, SHELL_ATLAS_KEYS, durable_config)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
-                                   merge_flow_stage_lattices,
-                                   migrate_legacy_gap_parameterization)
+                                   merge_flow_stage_lattices)
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, EDITABLE_PCL_ROLE_VALUES,
                          RUN_MUTABLE_PCL_ROLES,
                          fit_input, input_source_enabled, pcl_input_enabled,
@@ -3726,12 +3725,9 @@ class FitContext:
         if resume_path:
             # Phase 1 of the same two-phase load an in-session checkpoint
             # request uses: inspect on the CPU and refuse before anything
-            # resident is touched. Checkpoints written before schema version 2
-            # predate several identity fields and are still accepted here, on
-            # the CLI/startup path that has no live state to protect; an
-            # in-session load refuses them.
+            # resident is touched.
             verdict = self.inspect_checkpoint(
-                resume_checkpoint, source=resume_path, allow_legacy_schema=True)
+                resume_checkpoint, source=resume_path)
             if not verdict.accepted:
                 raise RuntimeError(verdict.message())
             print(f'resuming from {resume_path} at iteration '
@@ -3937,7 +3933,6 @@ class FitContext:
         return {
             'schema_version': 2,
             'model_state_sha256': self.model_state_digest(),
-            'gap_parameterization_version': 2,
             'completed_iterations': int(completed_iterations),
             'spiral_and_transform': self.spiral_and_transform.state_dict(),
             'optimiser': self.optimiser.state_dict(),
@@ -4010,8 +4005,7 @@ class FitContext:
             return None
         return self._save_model('fitted', completed_iterations)
 
-    def inspect_checkpoint(self, checkpoint, *, source='',
-                           allow_legacy_schema=False):
+    def inspect_checkpoint(self, checkpoint, *, source=''):
         """Decide, on the CPU and without mutating anything, whether this
         checkpoint may be applied to this live fit.
 
@@ -4026,11 +4020,6 @@ class FitContext:
         does not match the live model domain and structural configuration is
         refused here, and the explicit rebuild/new-fit path is what changes a
         model domain.
-
-        ``allow_legacy_schema`` admits pre-v2 checkpoints, which do not carry
-        the Lasagna group, outward sense, SDT fingerprint or model z-domain
-        fields. Only the startup/CLI restore passes it: there is no live
-        session to protect there, and the model is built from the checkpoint.
         """
         reasons = []
         if not isinstance(checkpoint, dict):
@@ -4041,18 +4030,17 @@ class FitContext:
             # without mutating the caller's checkpoint. load_checkpoint()
             # performs the same migration only after this verdict succeeds.
             checkpoint = expand_gap_checkpoint_capacity(
-                migrate_legacy_gap_parameterization(merge_flow_stage_lattices(checkpoint)),
+                merge_flow_stage_lattices(checkpoint),
                 self.config['model_gap_expander_capacity_windings'])
         except ValueError as exc:
             reasons.append(str(exc))
 
         # --- schema -------------------------------------------------------
         schema_version = int(checkpoint.get('schema_version', 1) or 1)
-        modern = schema_version >= 2
-        if not modern and not allow_legacy_schema:
+        if schema_version < 2:
             reasons.append(
                 f'checkpoint schema version {schema_version} predates the '
-                'identity fields an in-session load verifies (expected >= 2)')
+                'identity fields a load verifies (expected >= 2)')
         for key in ('spiral_and_transform', 'optimiser', 'cfg'):
             if checkpoint.get(key) is None:
                 reasons.append(f'checkpoint has no {key!r} entry')
@@ -4062,17 +4050,16 @@ class FitContext:
             reasons.append(
                 f'checkpoint lasagna_scale={checkpoint.get("lasagna_scale")!r} '
                 f'does not match this fit ({self.lasagna_scale!r})')
-        if modern:
-            if checkpoint.get('lasagna_group') != self.normal_zarr_group:
-                reasons.append(
-                    f'checkpoint Lasagna group '
-                    f'{checkpoint.get("lasagna_group")!r} does not match '
-                    f'requested group {self.normal_zarr_group!r}')
-            if checkpoint.get('spiral_outward_sense') != self.spiral_outward_sense:
-                reasons.append(
-                    f'checkpoint outward sense '
-                    f'{checkpoint.get("spiral_outward_sense")!r} does not '
-                    f'match requested sense {self.spiral_outward_sense!r}')
+        if checkpoint.get('lasagna_group') != self.normal_zarr_group:
+            reasons.append(
+                f'checkpoint Lasagna group '
+                f'{checkpoint.get("lasagna_group")!r} does not match '
+                f'requested group {self.normal_zarr_group!r}')
+        if checkpoint.get('spiral_outward_sense') != self.spiral_outward_sense:
+            reasons.append(
+                f'checkpoint outward sense '
+                f'{checkpoint.get("spiral_outward_sense")!r} does not '
+                f'match requested sense {self.spiral_outward_sense!r}')
         checkpoint_base_shape = checkpoint.get('base_shape_zyx')
         if checkpoint_base_shape is not None:
             if (not isinstance(checkpoint_base_shape, (list, tuple))
@@ -4106,7 +4093,7 @@ class FitContext:
         # extension of an ROI-first build), so only the content-identity fields
         # compare - 'created'/'git_commit' are stamped once at store creation
         # and anchor the identity.
-        if modern and self.phase_mode:
+        if self.phase_mode:
             checkpoint_fingerprint = comparable_sdt_fingerprint(
                 checkpoint.get('surf_sdt_fingerprint'))
             current_fingerprint = comparable_sdt_fingerprint(
@@ -4120,7 +4107,7 @@ class FitContext:
                     f'\n      checkpoint: {checkpoint_fingerprint}'
                     f'\n      current:    {current_fingerprint}')
 
-        if modern and self.winding_model_mode:
+        if self.winding_model_mode:
             checkpoint_fingerprint = checkpoint.get(
                 'winding_inference_fingerprint')
             current_fingerprint = (
@@ -4184,7 +4171,7 @@ class FitContext:
                     f'not the live model domain [{self.model_z_begin}, '
                     f'{self.model_z_end}); rebuild the fit to change the model '
                     'domain')
-        elif not allow_legacy_schema:
+        else:
             reasons.append(
                 'checkpoint does not record a model z-domain, so it cannot be '
                 'shown to match the live model')
@@ -4281,9 +4268,6 @@ class FitContext:
         completed = int(fallback_iteration if embedded is None else embedded)
         self.start_iteration = completed
         self.load_checkpoint(checkpoint)
-        if checkpoint.get('scheduler') is None:
-            for _ in range(completed):
-                self.lr_scheduler.step()
         self._restore_rng_state(checkpoint)
         if realign_lr:
             self._realign_lr_schedule(completed)
@@ -4308,18 +4292,11 @@ class FitContext:
 
     def load_checkpoint(self, checkpoint):
         checkpoint = expand_gap_checkpoint_capacity(
-            migrate_legacy_gap_parameterization(merge_flow_stage_lattices(checkpoint)),
+            merge_flow_stage_lattices(checkpoint),
             self.config['model_gap_expander_capacity_windings'])
         transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
         self.spiral_and_transform.load_state_dict(transformed_spiral_state)
         self.optimiser.load_state_dict(optimiser_state)
-        # Older checkpoints could have been saved while influence masking had
-        # disabled gap weight decay. Influence state is no longer restored, so
-        # restore the session configuration explicitly as well.
-        gap_param = self.gap_expander_params[0]
-        gap_group = next(group for group in self.optimiser.param_groups
-                         if any(param is gap_param for param in group['params']))
-        gap_group['weight_decay'] = self.config['optimizer_weight_decay_gap_expander']
         if checkpoint.get('scheduler') is not None:
             self.lr_scheduler.load_state_dict(checkpoint['scheduler'])
 
