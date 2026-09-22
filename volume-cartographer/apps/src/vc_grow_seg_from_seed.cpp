@@ -201,10 +201,10 @@ static auto load_direction_fields(Json const&params, std::filesystem::path const
     return direction_fields;
 }
 
-// A remote chunk fetch that fails after its retries is rethrown by Volume::read as a
-// std::runtime_error (core/src/Volume.cpp). Nothing above it catches, so the process aborts with no
-// usable message. Report it and exit non-zero instead, the same way vc_render_tifxyz does since
-// #1817. The body is unchanged: it moves to run_main so the diff carries no re-indentation.
+// A remote chunk fetch that fails after its retries ends in a std::runtime_error. run_main catches
+// it only around tracer(), so elsewhere, as at the seed point, it would abort the process. Catch
+// what reaches main here (a throw inside an OpenMP loop may not), report it and exit non-zero, as
+// #1817 does for vc_render_tifxyz. run_main is main's old body, moved unchanged.
 static int run_main(int argc, char *argv[]);
 
 int main(int argc, char *argv[])
@@ -213,7 +213,7 @@ int main(int argc, char *argv[])
         return run_main(argc, argv);
     } catch (const std::exception& e) {
         // An HTTP status error carries the server's response body in its message; for a 503 that is
-        // a whole HTML page. Keep the first line, as vc_render_tifxyz does.
+        // a whole HTML page. Keep the first line, as #1817 does for vc_render_tifxyz.
         std::string what = e.what();
         if (auto nl = what.find('\n'); nl != std::string::npos) {
             what.erase(nl);
