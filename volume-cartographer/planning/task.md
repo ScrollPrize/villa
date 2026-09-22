@@ -1,6 +1,5 @@
-# QuadSurface cache invalidation race
+# Sharded Zarr Double Decode
 
-Fix the reproduced render-worker crash when switching projects or active
-surfaces clears derived caches during QuadSurface::gen(). Branch from current
-main. Preserve rendering results and in-flight work. Submit the PR title/body
-for user approval before publishing the PR.
+Fix compressed Zarr inner chunks being decoded twice in the whole-storage-object
+path used by the viewer cache. Branch from current main and present the PR title
+and body for approval before publishing.
