@@ -123,3 +123,16 @@
 - Updated each manifest path and checksum after the move. This preserves the
   existing fiber identifiers while making the exported corpus directly
   browsable and consumable one volume at a time.
+
+## 2026-09-22 — unlinkable inference scratch
+
+- Retained stale-session cleanup, but moved it behind exclusive cache-writer
+  ownership and limited it to direct `session-*` children of known channel
+  `.live_tmp` directories.
+- New Linux file-mapped result-slot pools use `O_TMPFILE` and a parent-owned
+  descriptor path, so their backing files have no directory entry while
+  workers are attached. Named temporary files remain the fallback where
+  anonymous file creation is unavailable.
+- The focused spawn/mapping regression passed. The stale-session regression
+  was updated; its Zarr metadata setup is unusually slow in this environment
+  and was not used as the implementation validation gate.

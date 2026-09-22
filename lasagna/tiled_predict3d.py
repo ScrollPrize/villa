@@ -2349,12 +2349,31 @@ class _FileMappedSlotPool:
 		granularity = int(mmap.ALLOCATIONGRANULARITY)
 		self.slot_bytes = int(size)
 		self.stride = ((self.slot_bytes + granularity - 1) // granularity) * granularity
-		fd, path = tempfile.mkstemp(prefix=prefix, suffix=".mmap", dir=directory)
+		self._anonymous_fd = None
+		# Keep the backing file out of the namespace from the moment it is
+		# created.  Spawned workers can still open the parent-owned descriptor
+		# through /proc while the pool is alive.  The named fallback is needed
+		# on filesystems/platforms without O_TMPFILE.
+		if sys.platform.startswith("linux") and hasattr(os, "O_TMPFILE"):
+			try:
+				fd = os.open(directory, os.O_RDWR | os.O_TMPFILE, 0o600)
+				self._anonymous_fd = fd
+				path = f"/proc/{os.getpid()}/fd/{fd}"
+			except OSError:
+				fd, path = tempfile.mkstemp(prefix=prefix, suffix=".mmap", dir=directory)
+		else:
+			fd, path = tempfile.mkstemp(prefix=prefix, suffix=".mmap", dir=directory)
 		self.path = Path(path)
 		self.count = int(count)
 		try:
 			os.ftruncate(fd, self.count * self.stride)
-		finally:
+		except BaseException:
+			os.close(fd)
+			self._anonymous_fd = None
+			if self.path.parent == directory:
+				self.path.unlink(missing_ok=True)
+			raise
+		if self._anonymous_fd is None:
 			os.close(fd)
 
 	def handles(self) -> list[_FileMappedSlot]:
@@ -2366,7 +2385,11 @@ class _FileMappedSlotPool:
 			str(self.path), index * self.stride) for index in range(self.count))
 
 	def close(self) -> None:
-		self.path.unlink(missing_ok=True)
+		if self._anonymous_fd is not None:
+			os.close(self._anonymous_fd)
+			self._anonymous_fd = None
+		else:
+			self.path.unlink(missing_ok=True)
 
 
 def _packed_layouts(entries: Iterable[tuple[str, tuple[int, ...], Any]]) -> tuple[tuple[_SharedArrayLayout, ...], int]:

@@ -21,11 +21,14 @@ Legacy database-only caches are also refused without opening/deleting their
 database or outputs. Use a fresh identity-keyed cache root. Metadata-only new
 Zarr groups can be initialized normally. No legacy migration was implemented.
 
-Temporary chunk-major/flat mmap accumulation remains under each output product's
-hidden `.live_tmp/session-*` directory. Fresh sparse files read as zero without
-reservation or initial clearing. No scratch fsync, staged NPZ, or on-disk
-contribution records. Restart removes only validated owned scratch and recomputes
-unfinished contributions. All stale candidates are validated before any deletion.
+Legacy temporary chunk-major/flat mmap accumulation may remain under an output
+product's hidden `.live_tmp/session-*` directory. New reusable result-slot
+backing is anonymous/unlinked where supported. Fresh sparse files read as zero
+without reservation or initial clearing. No scratch fsync, staged NPZ, or
+on-disk contribution records. After writer ownership is acquired, startup
+scans known channel `.live_tmp` directories and removes only direct stale
+`session-*` directories; symlinks, unrelated files, and published chunks are
+left untouched.
 
 Publication still uses the shared finalizer and atomic Zarr writer, with final
 file/directory synchronization before notifying readiness. When replacing an

@@ -62,6 +62,8 @@ def test_file_mapped_slot_pool_shares_bytes_across_spawn_and_unlinks(tmp_path):
     import multiprocessing as mp
     layouts, size = tiled._packed_layouts((("value", (8, 8), np.float32),))
     pool = tiled._FileMappedSlotPool(tmp_path, count=2, size=size, prefix="results-")
+    if tiled.sys.platform.startswith("linux") and hasattr(tiled.os, "O_TMPFILE"):
+        assert not list(tmp_path.iterdir())
     owners = pool.handles()
     specs = pool.specs(layouts)
     attached = tiled._attach_slot(specs[1])
@@ -914,7 +916,7 @@ def test_publication_rejects_nested_external_symlink_before_any_unlink(tmp_path)
         assert (outside / "0").read_bytes() == b"preserve"
 
 
-def test_legacy_stale_scratch_is_not_walked_or_deleted_on_resume(tmp_path):
+def test_legacy_stale_scratch_is_cleaned_on_resume(tmp_path):
     geometry = DemandGeometry((4, 4, 4), 4, 0, 0, 1, 4)
     adapter, output = outputs(tmp_path, geometry.shape, 4)
     with DemandStore(tmp_path, {}, geometry, adapter, output):
@@ -929,7 +931,7 @@ def test_legacy_stale_scratch_is_not_walked_or_deleted_on_resume(tmp_path):
     unrelated.write_text("keep")
     with DemandStore(tmp_path, {}, geometry, adapter, output):
         pass
-    assert (good / "raw-0.mmap").read_bytes() == b"temporary"
+    assert not good.exists()
     assert unrelated.read_text() == "keep"
 
 

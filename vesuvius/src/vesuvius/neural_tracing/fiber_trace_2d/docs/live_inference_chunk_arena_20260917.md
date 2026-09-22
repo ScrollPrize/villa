@@ -47,8 +47,15 @@ pool unlinks the result-ring file only after child processes detach.
   publication slot. The owner then returns its accumulator slot immediately.
   The publisher finalizes the immutable snapshot and atomically writes the Zarr
   siblings. A failed publication aborts the run and never marks readiness.
-- No arena path is scanned or deleted during resume. Old `.live_tmp/session-*`
-  directories are ignored and require deliberate offline cleanup.
+- New reusable result-slot pools use Linux `O_TMPFILE` backing and keep the
+  parent-owned descriptor alive while spawned workers attach through its
+  descriptor path. These files therefore have no directory entry during the
+  run and cannot leak into an exported Zarr view. Filesystems without
+  `O_TMPFILE` retain the named-file fallback until pool close.
+- Legacy `.live_tmp/session-*` directories remain subject to an explicit,
+  writer-locked cleanup scan at cache startup. The scan examines only known
+  channel `.live_tmp` directories and direct `session-*` children; it does not
+  follow symlinks or touch published Zarr data.
 
 The arrival-order adds, float16 per-add rounding, float32 weights, finalizer,
 output cache format, explicit zero chunks, and atomic sibling replacement are

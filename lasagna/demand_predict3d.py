@@ -44,6 +44,31 @@ MMAP_SHARD_TARGET_BYTES = 128 << 30
 MAX_MMAP_FILE_BYTES = 8 << 40
 
 
+def cleanup_stale_live_tmp(channel_paths: Iterable[Path]) -> int:
+    """Remove abandoned accumulator sessions from known channel roots.
+
+    Only directories named ``session-*`` directly below a channel's
+    ``.live_tmp`` directory are eligible. Symlinks and unrelated files are
+    never followed or removed. The caller must hold the cache writer lock, so
+    no live writer can own one of these sessions while the scan runs.
+    """
+    removed = 0
+    for channel_path in channel_paths:
+        live_tmp = Path(channel_path) / ".live_tmp"
+        try:
+            entries = tuple(os.scandir(live_tmp))
+        except FileNotFoundError:
+            continue
+        for entry in entries:
+            if not entry.name.startswith("session-") or entry.is_symlink():
+                continue
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            shutil.rmtree(entry.path)
+            removed += 1
+    return removed
+
+
 @dataclass(frozen=True)
 class _MmapHandle:
     paths: tuple[str, ...]
@@ -151,6 +176,12 @@ class DemandStore:
         if not self.products or any(p.chunk_size != geometry.chunk or p.inference_scaledown != geometry.scale for p in self.products):
             self.lock.close()
             raise ValueError("demand products must share the configured storage lattice")
+        # Clean legacy named scratch only after writer ownership is established.
+        # New slot pools use anonymous/unlinked backing where supported, but old
+        # killed sessions must still be reclaimed explicitly.
+        cleanup_stale_live_tmp(
+            Path(channel.relative_path) for product in self.products
+            for channel in product.channels)
         self.dtype = np.dtype(accumulator_dtype)
         if self.dtype not in (np.dtype("float16"), np.dtype("float32")):
             self.lock.close()
