@@ -358,7 +358,7 @@ def test_reconnect_discovers_external_inputs_without_replacing_local_changes(wor
     assert len(entries) == 5
     imported = [e for e in entries if e.identity.id != baseline.identity.id]
     assert {(e.identity.kind, e.identity.role) for e in imported} == {
-        ('pcl', 'same_winding'), ('pcl', 'relative'), ('fiber', None), ('patch', 'verified')}
+        ('pcl', 'same_winding'), ('pcl', 'relative'), ('fiber', None), ('patch', None)}
     assert all(e.accepted == e.applied == e.persisted == 1 for e in imported)
     assert {r['id'] for r in resident.calls[-1][1]} == {e.identity.id for e in imported}
     assert editing.catalog.entry(baseline.identity.id).accepted == 2

@@ -99,7 +99,7 @@ def test_real_patch_revision_boundaries(tmp_path, influence):
         context = session._context
         model, optimiser = context.spiral_and_transform, context.optimiser
         logical_id = str(uuid.uuid4())
-        record = {'id': logical_id, 'kind': 'patch', 'role': 'verified',
+        record = {'id': logical_id, 'kind': 'patch',
                   'source_id': 'baseline', 'path': str(replacement), 'revision': 2}
         session.run(2, autosave_on_pause=False)
         wait_idle()

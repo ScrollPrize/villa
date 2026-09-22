@@ -4336,9 +4336,6 @@ class FitContext:
                 path = record.get('path')
                 source_id = str(record.get('source_id', logical_id))
                 if kind == 'patch':
-                    if record.get('role') not in (None, 'verified'):
-                        raise ValueError(
-                            f"Patch {logical_id} has unsupported role {record.get('role')!r}")
                     source = candidate._source_verified_patches
                     if source_id != logical_id and source_id in source:
                         # Preserve the dataset patch name for between-patch

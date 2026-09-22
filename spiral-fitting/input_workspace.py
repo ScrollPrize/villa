@@ -56,6 +56,8 @@ class InputIdentity:
             raise ValueError("Logical input ids must be canonical UUIDs")
         if self.kind not in {"pcl", "patch", "fiber"} or not self.source:
             raise ValueError("An input needs a kind and persistence source")
+        if self.kind != "pcl" and self.role is not None:
+            raise ValueError("Only PCLs carry a role")
         if self.collection_id is not None and (
                 self.kind != "pcl" or type(self.collection_id) is not int
                 or self.collection_id < 0):

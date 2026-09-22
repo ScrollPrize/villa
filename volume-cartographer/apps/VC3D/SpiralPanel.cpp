@@ -388,7 +388,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     updateTrackSamplingUi();
 
     addPathRow(pathsForm, "verified_patches", tr("Verified patches"), true);
-    addPathRow(pathsForm, "unverified_patches", tr("Unverified patches"), true);
     addPathRow(pathsForm, "outer_shell", tr("Outer shell"), true);
 
     auto* lasagnaSection = makeSection(tr("Lasagna inputs"),
@@ -669,14 +668,14 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
 
     for (const auto& item : std::initializer_list<std::pair<const char*, const char*>>{
              {"output", "Output"}, {"verified", "Verified patches"},
-             {"unverified", "Unverified patches"}, {"pending_only", "Pending patches only"},
+             {"pending_only", "Pending patches only"},
              {"shell", "Shell"}, {"lasagna", "Lasagna inputs"}}) {
         auto* check = new QCheckBox(tr(item.second), _displayDialog);
         const QString key = QString::fromLatin1(item.first);
         _visibilityChecks[key] = check;
         if (key == QStringLiteral("pending_only")) {
             check->setObjectName(QStringLiteral("spiralPendingPatchesOnly"));
-            check->setToolTip(tr("Replace the verified/unverified patch selections with only "
+            check->setToolTip(tr("Replace the verified patch selection with only "
                                  "interactive-fit patches that are not yet committed to the dataset"));
         }
         check->setChecked(key == QStringLiteral("output"));

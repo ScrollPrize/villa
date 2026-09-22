@@ -251,14 +251,13 @@ def test_rebuild_adopts_baseline_geometry_without_reading_it_again(context):
     original = ctx._source_verified_patches['baseline']
     candidate = ctx.prepare_input_changes([{'id': 'baseline-uuid', 'kind': 'patch',
         'source_id': 'baseline', 'path': '/immutable/source/need-not-be-reloaded',
-        'role': 'verified', 'revision': 1, 'adopt': True}])
+        'revision': 1, 'adopt': True}])
     assert candidate._source_verified_patches['baseline'] is original
     ctx.install_input_changes(candidate)
     assert 'baseline' in ctx.verified_patches
 
 
-@pytest.mark.parametrize('role', ['verified', None])
-def test_baseline_adoption_preserves_initial_loader_exclusions(context, monkeypatch, role):
+def test_baseline_adoption_preserves_initial_loader_exclusions(context, monkeypatch):
     import fit_spiral
     # A baseline may be absent because it has no valid quads, was eroded
     # away, or was excluded by the ROI, name filter, or source toggle.
@@ -268,7 +267,7 @@ def test_baseline_adoption_preserves_initial_loader_exclusions(context, monkeypa
     original = context._source_verified_patches['baseline']
     candidate = context.prepare_input_changes([{
         'id': 'excluded-uuid', 'kind': 'patch', 'source_id': 'excluded',
-        'path': '/immutable/excluded', 'role': role, 'revision': 1,
+        'path': '/immutable/excluded', 'revision': 1,
         'adopt': True,
     }])
     assert candidate._workspace_membership['excluded-uuid'] == {
@@ -301,7 +300,7 @@ def test_theta_rejected_baseline_replay(context, monkeypatch, adopt):
                         lambda path: pytest.fail('baseline was reloaded') if adopt
                         else copy.copy(excluded))
     record = {'id': 'excluded-uuid', 'kind': 'patch', 'source_id': 'excluded',
-              'path': '/immutable/excluded', 'role': 'verified', 'revision': 1,
+              'path': '/immutable/excluded', 'revision': 1,
               'adopt': adopt}
     if not adopt:
         with pytest.raises(ValueError, match='theta consistency'):

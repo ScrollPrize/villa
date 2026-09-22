@@ -173,8 +173,7 @@ class EditingWorkspace:
             if fingerprint(path) != before:
                 raise ApiError(409, 'PCL source changed while snapshotting the editing workspace')
         resolved = self.sources.get('resolved', {})
-        for key, kind, role in [('verified_patches', 'patch', 'verified'),
-                                ('fibers', 'fiber', None)]:
+        for key, kind in [('verified_patches', 'patch'), ('fibers', 'fiber')]:
             directory = Path(resolved.get(key) or self.dataset / key)
             if not directory.is_dir():
                 continue
@@ -187,7 +186,7 @@ class EditingWorkspace:
                     continue
                 input_id = str(uuid5(namespace, str(source.resolve())))
                 destination = snapshot_root / (input_id if kind == 'patch' else f'{input_id}.json')
-                discovered.append((InputIdentity(input_id, kind, str(source.resolve()), role),
+                discovered.append((InputIdentity(input_id, kind, str(source.resolve())),
                                    self._copy(source, destination)))
         return discovered
 
@@ -204,14 +203,16 @@ class EditingWorkspace:
             return self.catalog.entry(input_id).identity
         except KeyError:
             kind, role = change.get('kind'), change.get('role')
+            if kind != 'pcl' and role is not None:
+                raise ApiError(400, 'Only PCL inputs carry a role')
             name = change.get('name') or input_id
             if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', name):
                 raise ApiError(400, 'Input name must be a safe file name')
             if kind == 'pcl' and role in PCL_ROLE_FILES:
                 target = self.dataset / PCL_ROLE_FILES[role]
-            elif kind == 'patch' and role in {'verified', None}:
-                role = role or 'verified'
-                target = Path(self.sources.get('resolved', {}).get(f'{role}_patches') or self.dataset / f'{role}_patches') / name
+            elif kind == 'patch':
+                target = Path(self.sources.get('resolved', {}).get('verified_patches')
+                              or self.dataset / 'verified_patches') / name
             elif kind == 'fiber':
                 target = Path(self.sources.get('resolved', {}).get('fibers') or self.dataset / 'fibers') / f'{name.removesuffix(".json")}.json'
             else:
