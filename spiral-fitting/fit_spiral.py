@@ -3357,6 +3357,31 @@ class FitContext:
             min_z_voxels=float(cfg.get('model_pin_kernel_min_z_voxels', 3.0)),
             max_z_voxels=float(cfg.get('model_pin_kernel_max_z_voxels', 200.0)))
 
+    def _finalize_pin_registry_fresh(self):
+        """Resolve the pin graph against the current unpinned model (every
+        patch pinned; no demotion)."""
+        model = self.spiral_and_transform
+        with torch.no_grad():
+            intermediate = model.get_slice_to_intermediate_transform()
+            dr = model.get_dr_per_winding()
+            gap_expander, _, _, _ = model._get_transform_parts(with_pins=False)
+
+            def free_gap(theta, z, slot):
+                table = gap_expander.get_transformed_winding_radii(theta, z)
+                gaps = table.diff(dim=-1)
+                idx = slot.clamp(0, gaps.shape[-1] - 1)
+                return torch.gather(gaps, -1, idx[:, None]).squeeze(-1)
+
+            return pins_module.finalize_registry(
+                self.pin_graph,
+                intermediate_transform=intermediate, dr=dr,
+                canonical_transform=model.get_unpinned_slice_to_spiral_transform(),
+                crossing_map=self.theta_crossing_map, patch_atlas=self.patch_atlas,
+                footprint_rule=self._pin_footprint_rule(), free_gap_fn=free_gap,
+                min_z=float(self.flow_min_corner_spiral_zyx[0]),
+                max_z=float(self.flow_max_corner_spiral_zyx[0]),
+                device=self.device)
+
     def _finalize_pin_registry(self):
         """Resolve the pin graph against the current (unpinned) model.
 
@@ -3369,46 +3394,26 @@ class FitContext:
         """
         model = self.spiral_and_transform
         started_at = time.perf_counter()
-
-        def finalize_fresh():
-            with torch.no_grad():
-                intermediate = model.get_slice_to_intermediate_transform()
-                dr = model.get_dr_per_winding()
-                gap_expander, _, _, _ = model._get_transform_parts(with_pins=False)
-
-                def free_gap(theta, z, slot):
-                    table = gap_expander.get_transformed_winding_radii(theta, z)
-                    gaps = table.diff(dim=-1)
-                    idx = slot.clamp(0, gaps.shape[-1] - 1)
-                    return torch.gather(gaps, -1, idx[:, None]).squeeze(-1)
-
-                return pins_module.finalize_registry(
-                    self.pin_graph,
-                    intermediate_transform=intermediate, dr=dr,
-                    canonical_transform=model.get_unpinned_slice_to_spiral_transform(),
-                    crossing_map=self.theta_crossing_map, patch_atlas=self.patch_atlas,
-                    footprint_rule=self._pin_footprint_rule(), free_gap_fn=free_gap,
-                    min_z=float(self.flow_min_corner_spiral_zyx[0]),
-                    max_z=float(self.flow_max_corner_spiral_zyx[0]),
-                    device=self.device,
-                    max_patch_spread=(float(self.config.get('model_pin_max_patch_spread_windings', 0.0)) or None))
-
+        self._pin_registry_full = None
         if self.pin_targets_loaded:
             registry = model.pin_registry
             if registry.patch_index is None:
                 # Registry saved before per-pin patch indices existed: the
                 # same graph emits pins in the same order, so borrow them.
-                fresh = finalize_fresh()
+                fresh = self._finalize_pin_registry_fresh()
                 if fresh.num_pins == registry.num_pins and torch.equal(fresh.zyx, registry.zyx):
                     registry.patch_index = fresh.patch_index
+                    self._pin_registry_full = fresh
                 elif self.dist.is_main_process:
                     print('WARNING: could not backfill pin patch indices from the constraint graph; '
                           'pins fall back to uniform subsampling')
         else:
-            registry = finalize_fresh()
+            registry = self._finalize_pin_registry_fresh()
+            # Demotion (at activation and on re-checks) starts from this.
+            self._pin_registry_full = registry
         if registry.patch_index is not None and registry.patch_component.numel():
-            # A patch is pinned only if it contributed pins (registries saved
-            # before the spread filter marked every graph patch).
+            # A patch is pinned only if it contributed pins (older registries
+            # marked every graph patch).
             has_pins = torch.zeros(registry.patch_component.numel(), dtype=torch.bool,
                                    device=registry.patch_component.device)
             pinned_idx = registry.patch_index[registry.patch_index >= 0]
@@ -3419,12 +3424,6 @@ class FitContext:
         if self.dist.is_main_process:
             print(registry.summary())
             report = registry.consistency_report
-            excluded = report.get('excluded_patches') or []
-            if excluded:
-                print(f'pin registry: {len(excluded)} verified patch(es) not pinned (free-map spread above '
-                      f'{self.config.get("model_pin_max_patch_spread_windings")} windings), '
-                      f'{sum(q for _, _, q in excluded)} quads; worst: '
-                      + ', '.join(f'{p}:{sp:.1f}' for p, sp, _ in sorted(excluded, key=lambda t: -t[1])[:5]))
             if report.get('inconsistent_edges'):
                 print(f'WARNING: pin registry has {report["inconsistent_edges"]} '
                       f'inconsistent constraint cycles '
@@ -3481,23 +3480,111 @@ class FitContext:
             return
         if self.config.get('model_pin_targets_integer', False):
             with torch.no_grad():
-                model.pin_targets.copy_(torch.round(model.pin_targets))
+                if self.config.get('model_pin_targets_joint', False) and model.pin_registry is not None:
+                    registry = model.pin_registry
+                    _, estimate = model.estimate_pin_targets(return_per_pin=True)
+                    T_int, relations, inconsistent = pins_module.joint_integer_targets(
+                        registry.zyx, registry.component, estimate, model.pin_targets,
+                        registry.fixed_T, registry.fixed_T_value, registry.num_components,
+                        tolerance=float(self.config.get('model_pin_targets_joint_tolerance_voxels', 3.0)))
+                    changed = int((T_int.to(model.pin_targets.device) != torch.round(model.pin_targets)).sum())
+                    if self.dist.is_main_process:
+                        print(f'joint integer pin targets: {relations} component relations, '
+                              f'{inconsistent} inconsistent, {changed} components differ from independent rounding')
+                    model.pin_targets.copy_(T_int.to(model.pin_targets.device))
+                else:
+                    model.pin_targets.copy_(torch.round(model.pin_targets))
             model.pin_targets.requires_grad_(False)
         else:
             model.pin_targets.requires_grad_(True)
 
     def unpinned_verified_patch_mask(self):
         """Bool per verified patch: True when the registry pins none of its
-        quads (excluded by the spread filter, outside the flow z domain, or
-        without sampling-valid quads). These keep the soft constraint losses
-        while pins replace them on pinned inputs. None when pins are off."""
+        quads for a benign reason (outside the flow z domain, no sampling-
+        valid quads). These keep the soft constraint losses while pins replace
+        them on pinned inputs. Patches excluded by the spread filter are not
+        included. None when pins are off."""
         model = self.spiral_and_transform
         if not model._pins_enabled() or model.pin_registry is None:
             return None
-        mask = model.pin_registry.patch_component < 0
+        registry = model.pin_registry
+        mask = registry.patch_component < 0
         if mask.numel() != len(self.verified_patches_list):
             return None
+        excluded = registry.excluded_patches
+        if excluded is not None and excluded.numel():
+            # Spread-excluded patches are left out on purpose: no soft loss
+            # either, or they would drag the flow toward sheets they do not
+            # consistently describe.
+            mask = mask.clone()
+            mask[excluded[excluded < mask.numel()].to(mask.device)] = False
         return mask
+
+    def _full_pin_registry(self):
+        """The registry with every patch pinned (before any demotion). Kept
+        from finalisation; a resumed checkpoint carries only the demoted
+        registry, so it is rebuilt from the constraint graph on demand."""
+        full = getattr(self, '_pin_registry_full', None)
+        if full is None:
+            full = self._finalize_pin_registry_fresh()
+            self._pin_registry_full = full
+        return full
+
+    def _demote_conflicting_patches(self, iteration=None):
+        """Leave unpinned the verified patches that contradict their
+        neighbours (``model_pin_demote_conflicting_patches``); see
+        pins.conflicting_patch_demotion. Runs at activation and, every
+        ``model_pin_demote_recheck_interval`` steps, again on the current free
+        map starting from the full registry, so patches that no longer
+        conflict are pinned again. The demoted set is recorded in the
+        registry (a resumed checkpoint keeps it) and such patches get no soft
+        constraint loss; each decision is appended to pin_demotion.jsonl.
+        """
+        if not self.config.get('model_pin_demote_conflicting_patches', False):
+            return
+        model = self.spiral_and_transform
+        full = self._full_pin_registry()
+        if full is None or full.patch_index is None or not full.num_pins:
+            return
+        current = model.pin_registry
+        model.set_pin_registry(full, reset_targets=False)
+        try:
+            with torch.no_grad():
+                T = model.effective_pin_targets()
+                _, estimate = model.estimate_pin_targets(return_per_pin=True)
+                pins_t = model.compute_pins(full=True)
+                n = pins_t[:, 3] / model.get_dr_per_winding() - T[full.component]
+            demoted, report = pins_module.conflicting_patch_demotion(
+                full.zyx, full.patch_index, full.component, torch.round(n), estimate, T,
+                tolerance=float(self.config.get('model_pin_demote_pair_tolerance_voxels', 30.0)),
+                min_conflict_fraction=float(self.config.get('model_pin_demote_conflict_fraction', 0.05)),
+                min_conflict_ratio=float(self.config.get('model_pin_demote_conflict_ratio', 0.0)))
+        except Exception:
+            model.set_pin_registry(current, reset_targets=False)
+            raise
+        previous = set(current.excluded_patches.tolist()) if current.excluded_patches is not None else set()
+        now = set(int(p) for p in demoted)
+        if len(demoted):
+            demoted_t = torch.as_tensor(demoted, dtype=torch.int64, device=full.zyx.device)
+            keep = ~torch.isin(full.patch_index, demoted_t)
+            model.set_pin_registry(full.subset(keep, demoted_patches=demoted_t), reset_targets=False)
+        # (No demotion: the full registry stays installed.)
+        if self.dist.is_main_process:
+            print(f'pin conflicts (step {iteration if iteration is not None else "activation"}): '
+                  f'{report["inconsistent"]} of {report["pairs"]} cross-component pin pairs inconsistent; '
+                  f'{len(demoted)} patch(es) demoted ({len(now - previous)} new, {len(previous - now)} reinstated)')
+            names = [getattr(patch, 'uuid', None) for patch in self.verified_patches_list]
+            entry = {
+                'iteration': iteration, 'pairs': report['pairs'], 'inconsistent': report['inconsistent'],
+                'demoted': [{**e, 'id': names[e['patch']] if e['patch'] < len(names) else None,
+                             'neighbours': [{'patch': q, 'id': names[q] if q < len(names) else None, 'conflicting_pairs': c}
+                                            for q, c in e['neighbours']]} for e in report['demoted']],
+                'reinstated': sorted(previous - now),
+            }
+            out_path = getattr(self, 'out_path', None)
+            if out_path:
+                with open(os.path.join(out_path, 'pin_demotion.jsonl'), 'a') as handle:
+                    handle.write(json.dumps(entry) + '\n')
 
     def _maybe_activate_pins(self, iteration):
         model = self.spiral_and_transform
@@ -3510,6 +3597,7 @@ class FitContext:
             with torch.no_grad():
                 model.pin_targets.copy_(model.estimate_pin_targets())
         self._apply_integer_pin_targets()
+        self._demote_conflicting_patches(iteration)
         model.pins_active = True
         if self.dist.is_main_process:
             T = model.effective_pin_targets().detach()
@@ -5919,6 +6007,12 @@ class FitContext:
         # accumulated across families flow through the real shared paths once,
         # next to the flow-field gradient flush below.
         self._maybe_activate_pins(iteration)
+        recheck = int(self.config.get('model_pin_demote_recheck_interval', 0) or 0)
+        if (recheck > 0 and self.spiral_and_transform._pins_enabled()
+                and self.pins_activation_iteration is not None
+                and iteration > self.pins_activation_iteration
+                and (iteration - self.pins_activation_iteration) % recheck == 0):
+            self._demote_conflicting_patches(iteration)
         # Pin subset for this step: every pin of the patches the patch losses
         # will sample (drawn here, the losses then draw from that set), so the
         # pinned map is exact where it is evaluated rather than a thin uniform

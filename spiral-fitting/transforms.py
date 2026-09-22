@@ -701,10 +701,11 @@ class SpiralAndTransform(nn.Module):
             self.pins_active = active
 
     @torch.no_grad()
-    def estimate_pin_targets(self, chunk_size=262144):
+    def estimate_pin_targets(self, chunk_size=262144, return_per_pin=False):
         """``T_g`` = median over the component's pins of the canonical
         shifted winding ``s_free(r_i)/dr - n_i`` under the current unpinned
-        model; fixed components keep their value."""
+        model; fixed components keep their value. With ``return_per_pin``
+        also returns the per-pin estimates."""
         registry = self.pin_registry
         dr = self.get_dr_per_winding()
         transform = self.get_unpinned_slice_to_spiral_transform()
@@ -720,7 +721,8 @@ class SpiralAndTransform(nn.Module):
             mask = registry.component == component
             if mask.any():
                 T[component] = estimate[mask].median()
-        return torch.where(registry.fixed_T, registry.fixed_T_value, T)
+        T = torch.where(registry.fixed_T, registry.fixed_T_value, T)
+        return (T, estimate) if return_per_pin else T
 
     def get_slice_to_intermediate_transform(self, shared=None, truncate_at_step=None):
         """Scroll -> intermediate space: the chain without the gap expander."""

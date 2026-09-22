@@ -193,9 +193,16 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "model_pin_conflict_tolerance": 0.1,
     "model_pin_rebin_interval": 1,
     "model_pin_overlap_tolerance_voxels": 0.0,
-    "model_pin_max_patch_spread_windings": 0.0,
+    # Demotion postdates checkpoints written with pins; those fits ran with it off.
+    "model_pin_demote_conflicting_patches": False,
+    "model_pin_demote_conflict_fraction": 0.05,
+    "model_pin_demote_pair_tolerance_voxels": 30.0,
+    "model_pin_demote_conflict_ratio": 0.5,
+    "model_pin_demote_recheck_interval": 1000,
     "optimizer_lr_pin_targets": 0.01,
     "model_pin_targets_integer": False,
+    "model_pin_targets_joint": False,
+    "model_pin_targets_joint_tolerance_voxels": 3.0,
     "sample_count_pins": 100000,
     # Stage-3 pin strain loss postdates checkpoints written with pins.
     "loss_weight_pin_strain": 8.0,
@@ -307,9 +314,27 @@ _PIN_DESCRIPTIONS = {
     "model_pin_targets_integer": (
         "Snap the component winding targets to integers when pins activate "
         "and hold them fixed."),
-    "model_pin_max_patch_spread_windings": (
-        "Do not pin verified patches whose quad centres the unpinned model "
-        "spreads over more than this many windings; 0 disables."),
+    "model_pin_targets_joint": (
+        "With integer targets, choose the integers jointly so components "
+        "whose pins coincide agree, instead of rounding each on its own."),
+    "model_pin_demote_conflicting_patches": (
+        "At activation, leave unpinned the verified patches whose pins "
+        "contradict their neighbours about relative winding."),
+    "model_pin_demote_conflict_fraction": (
+        "Fraction of a patch's pins in conflicting pairs above which it is "
+        "a demotion candidate."),
+    "model_pin_demote_pair_tolerance_voxels": (
+        "Scroll-voxel distance within which pins of different components "
+        "form a pair for the conflict test."),
+    "model_pin_demote_conflict_ratio": (
+        "Minimum share of a patch's neighbour pairs that must conflict "
+        "before it can be demoted (0.5: disagrees more than it agrees)."),
+    "model_pin_demote_recheck_interval": (
+        "Steps between re-checks of the demotion against the current free "
+        "map (patches that no longer conflict are pinned again); 0 = never."),
+    "model_pin_targets_joint_tolerance_voxels": (
+        "Scroll-voxel distance within which pins of different components "
+        "count as coincident for the joint integer assignment."),
 }
 
 _OPTIMIZER_DESCRIPTIONS = {
@@ -405,6 +430,8 @@ RETIRED_CONFIG_KEYS = frozenset({
     # The leading axis now holds stationary flow stages. Old checkpoints with
     # more than one interpolated time sample are refused during migration.
     "model_num_flow_timesteps",
+    # Free-map spread cap on pinned patches, superseded by conflict-based demotion.
+    "model_pin_max_patch_spread_windings",
 })
 
 
@@ -425,7 +452,6 @@ RETIRED_CONFIG_KEYS = frozenset({
 MODEL_STAGE_KEYS = frozenset({
     "model_pins_enabled",
     "model_pin_overlap_tolerance_voxels",
-    "model_pin_max_patch_spread_windings",
     "model_pin_patch_grid_stride",
     "model_pin_kernel_spacing_factor",
     "model_pin_kernel_min_arc_voxels",
@@ -450,7 +476,6 @@ MODEL_STAGE_KEYS = frozenset({
 _MODEL_STRUCTURE_KEYS = frozenset({
     "model_pins_enabled",
     "model_pin_overlap_tolerance_voxels",
-    "model_pin_max_patch_spread_windings",
     "model_pin_patch_grid_stride",
     "model_pin_kernel_spacing_factor",
     "model_pin_kernel_min_arc_voxels",
@@ -476,6 +501,13 @@ _MODEL_STRUCTURE_KEYS = frozenset({
 _RUN_MUTABLE_MODEL_KEYS = frozenset({
     "model_pins_warmup_steps",
     "model_pin_targets_integer",
+    "model_pin_targets_joint",
+    "model_pin_targets_joint_tolerance_voxels",
+    "model_pin_demote_conflicting_patches",
+    "model_pin_demote_conflict_fraction",
+    "model_pin_demote_pair_tolerance_voxels",
+    "model_pin_demote_conflict_ratio",
+    "model_pin_demote_recheck_interval",
     "model_pin_rebin_interval",
     "model_pin_coincidence_frac",
     "model_pin_conflict_tolerance",
@@ -746,15 +778,29 @@ class Config:
         # test, and a false link is a hard wrong constraint. ~1.5 is a
         # reasonable opt-in value for overlapping surface annotations.
         self.model_pin_overlap_tolerance_voxels = 0.0
-        # Verified patches whose quad centres the unpinned model spreads over
-        # more than this many windings (std of canonical shifted winding at
-        # registry finalisation) are not pinned; 0 disables. Such patches
-        # conflict on every ray they share with their neighbours.
-        self.model_pin_max_patch_spread_windings = 0.0
+        # Conflict-based demotion: verified patches whose pins contradict
+        # their neighbours' about relative winding (cross-component pin pairs
+        # within the tolerance, compared the way the ray map treats slots)
+        # on more than the fraction of their pins, and on at least the ratio
+        # of their pairs (0.5: disagreeing more than agreeing), are left
+        # unpinned and get no soft loss. Decided at activation and re-checked
+        # against the current free map every recheck_interval steps (0 =
+        # never), reinstating patches that no longer conflict. Each decision
+        # is written to pin_demotion.jsonl in the run directory.
+        self.model_pin_demote_conflicting_patches = True
+        self.model_pin_demote_conflict_fraction = 0.05
+        self.model_pin_demote_pair_tolerance_voxels = 30.0
+        self.model_pin_demote_conflict_ratio = 0.5
+        self.model_pin_demote_recheck_interval = 1000
         self.optimizer_lr_pin_targets = 0.01
         # Snap the component targets T to integers at activation and hold
         # them fixed (no fractional winding coordinate to optimise).
         self.model_pin_targets_integer = False
+        # With integer targets: choose the integers jointly so components
+        # whose pins coincide (within the tolerance, in scroll voxels) agree,
+        # instead of rounding each component's estimate on its own.
+        self.model_pin_targets_joint = False
+        self.model_pin_targets_joint_tolerance_voxels = 3.0
         # Registry pins pushed through the flow per training step (stratified
         # by component; 0 = all). Export and diagnostics always use them all.
         # Memory of the eager pinned lookup grows with the (sample, pin) pairs

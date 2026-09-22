@@ -1120,6 +1120,9 @@ class PinRegistry:
     patch_offset: torch.Tensor
     neighbours: torch.Tensor | None = None  # own-object grid/chain adjacency, -1 = absent
     patch_index: torch.Tensor | None = None  # atlas patch index per pin, -1 for chain/isolated
+    # Atlas indices of verified patches deliberately not pinned (free-map
+    # spread above the cap): untrustworthy, so they get no soft loss either.
+    excluded_patches: torch.Tensor | None = None
 
     @property
     def num_pins(self):
@@ -1143,6 +1146,7 @@ class PinRegistry:
             'patch_offset': self.patch_offset.cpu(),
             'neighbours': self.neighbours.cpu() if self.neighbours is not None else None,
             'patch_index': self.patch_index.cpu() if self.patch_index is not None else None,
+            'excluded_patches': self.excluded_patches.cpu() if self.excluded_patches is not None else None,
         }
 
     @classmethod
@@ -1158,7 +1162,44 @@ class PinRegistry:
             patch_component=state['patch_component'].to(device),
             patch_offset=state['patch_offset'].to(device),
             neighbours=state['neighbours'].to(device) if state.get('neighbours') is not None else None,
-            patch_index=state['patch_index'].to(device) if state.get('patch_index') is not None else None)
+            patch_index=state['patch_index'].to(device) if state.get('patch_index') is not None else None,
+            excluded_patches=state['excluded_patches'].to(device) if state.get('excluded_patches') is not None else None)
+
+    def subset(self, keep, *, demoted_patches=None):
+        """Registry restricted to the pins with ``keep`` True.
+
+        Neighbour indices are remapped (dropped neighbours become -1);
+        patches that lose all their pins get the -1 ``patch_component``
+        sentinel and are appended to ``excluded_patches`` (together with
+        ``demoted_patches``, which may name patches explicitly).
+        """
+        keep = keep.to(self.zyx.device)
+        index = torch.full([self.num_pins], -1, dtype=torch.int64, device=keep.device)
+        index[keep] = torch.arange(int(keep.sum()), device=keep.device)
+        fields = {}
+        for f in dataclasses.fields(self):
+            value = getattr(self, f.name)
+            if torch.is_tensor(value) and value.shape[:1] == (self.num_pins,) and f.name not in ('neighbours',):
+                fields[f.name] = value[keep]
+            else:
+                fields[f.name] = value
+        if self.neighbours is not None:
+            nb = self.neighbours[keep]
+            fields['neighbours'] = torch.where(nb >= 0, index[nb.clamp(min=0)], nb)
+        patch_component = self.patch_component.clone()
+        if self.patch_index is not None and patch_component.numel():
+            has_pins = torch.zeros(patch_component.numel(), dtype=torch.bool, device=patch_component.device)
+            kept_patches = fields['patch_index'][fields['patch_index'] >= 0]
+            has_pins[kept_patches[kept_patches < has_pins.numel()]] = True
+            lost = (self.patch_component >= 0) & ~has_pins
+            patch_component[lost] = -1
+            excluded = [self.excluded_patches] if self.excluded_patches is not None else []
+            excluded.append(torch.nonzero(lost, as_tuple=True)[0].to(torch.int64))
+            if demoted_patches is not None:
+                excluded.append(torch.as_tensor(demoted_patches, dtype=torch.int64, device=patch_component.device))
+            fields['excluded_patches'] = torch.unique(torch.cat(excluded)) if excluded else self.excluded_patches
+        fields['patch_component'] = patch_component
+        return PinRegistry(**fields)
 
     def adjusted_n(self, theta):
         """``n_i(t) = n_i(0) + round((theta0_i - theta_i(t)) / 2pi)``."""
@@ -1241,6 +1282,182 @@ def _robust_integer_offsets(num_nodes, edges, deltas, component_of, num_componen
     return n, inconsistent
 
 
+def conflicting_patch_demotion(zyx, patch_index, component, n, estimate, T, *,
+                               tolerance=30.0, stride=4, min_conflict_fraction=0.05,
+                               min_conflicts=20, min_rise_fraction=1.0 / 16.0,
+                               min_conflict_ratio=0.0):
+    """Patches to leave unpinned because they contradict their neighbours.
+
+    A patch alone is always satisfiable by the monotone radial map; pins
+    fail only where two constraints disagree about their relative winding
+    on a shared ray. Pairs of pins of different components within
+    ``tolerance`` scroll voxels (every ``stride``-th pin, KD-tree) are
+    compared the way the ray map treats them: their winding slots
+    ``round(T + n)`` and the free-map winding difference ``dW = w_i - w_j``
+    (``w = estimate + n``). Same-slot pins are averaged into one anchor and
+    conflict only if the free map has them on different sheets (``|dW| >
+    0.5``); pins in different slots conflict when the free-map radial order
+    contradicts the slot order or the rise is below the minimum gap
+    (``min_rise_fraction`` windings per slot step). Other pairs *agree*. Patches are then demoted greedily: while some patch has at
+    least ``min_conflicts`` conflicting pairs and more than
+    ``min_conflict_fraction`` of its sampled pins in conflict (and, with
+    ``min_conflict_ratio``, at least that share of its pairs conflicting),
+    demote the patch with the highest conflicting-to-agreeing pair ratio
+    (the outlier relative to its neighbours) and drop its pairs. Returns
+    ``(demoted_patch_indices, report)`` with per-patch pair counts.
+    """
+    from scipy.spatial import cKDTree
+    num = int(zyx.shape[0])
+    empty = np.zeros([0], dtype=np.int64)
+    if num == 0:
+        return empty, {'pairs': 0, 'inconsistent': 0, 'demoted': []}
+    sel = np.arange(0, num, max(int(stride), 1))
+    is_patch = (patch_index[sel] >= 0).cpu().numpy()
+    sel = sel[is_patch]
+    pts = zyx[sel].detach().cpu().numpy().astype(np.float64)
+    pidx = patch_index[sel].cpu().numpy()
+    comp = component[sel].cpu().numpy()
+    nn = n[sel].cpu().numpy().astype(np.float64)
+    est = estimate[sel].detach().cpu().numpy().astype(np.float64)
+    Tn = T.detach().cpu().numpy().astype(np.float64)
+    pairs = cKDTree(pts).query_pairs(r=float(tolerance), output_type='ndarray')
+    if len(pairs) == 0:
+        return empty, {'pairs': 0, 'inconsistent': 0, 'demoted': []}
+    a, b = pairs[:, 0], pairs[:, 1]
+    cross = comp[a] != comp[b]
+    a, b = a[cross], b[cross]
+    # Mirror the ray map: pins land in winding slots round(T + n); pins of
+    # different components in the same slot are averaged into one anchor,
+    # so they conflict only when the free map has them on different sheets
+    # (|dW| > 0.5). Pins in different slots conflict when their free-map
+    # radial order contradicts the slot order, or their rise is below the
+    # minimum gap (min_rise_fraction windings per slot step).
+    slot_a = np.round(Tn[comp[a]] + nn[a]); slot_b = np.round(Tn[comp[b]] + nn[b])
+    dS = slot_a - slot_b
+    dW = (est[a] + nn[a]) - (est[b] + nn[b])
+    same_slot = dS == 0
+    inconsistent = ((same_slot & (np.abs(dW) > 0.5))
+                    | (~same_slot & ((dW * dS <= 0) | (np.abs(dW) < min_rise_fraction * np.abs(dS)))))
+    pa, pb = pidx[a], pidx[b]
+    num_patches = int(patch_index.max()) + 1 if patch_index.numel() else 0
+    sampled = np.bincount(pidx, minlength=num_patches).astype(np.float64)
+    conflict_pairs = np.stack([pa[inconsistent], pb[inconsistent]], axis=1)
+    agree_count = np.bincount(np.concatenate([pa[~inconsistent], pb[~inconsistent]]), minlength=num_patches).astype(np.float64)
+    conflict_count = np.bincount(conflict_pairs.reshape(-1), minlength=num_patches).astype(np.float64)
+    demoted = []
+    alive = np.ones(len(conflict_pairs), dtype=bool)
+    while True:
+        ratio_all = conflict_count / np.maximum(conflict_count + agree_count, 1.0)
+        eligible = ((conflict_count >= min_conflicts)
+                    & (conflict_count > min_conflict_fraction * np.maximum(sampled, 1.0))
+                    & (ratio_all >= min_conflict_ratio))
+        if not eligible.any():
+            break
+        ratio = np.where(eligible, ratio_all, -1.0)
+        worst = int(np.argmax(ratio))
+        demoted.append(worst)
+        hit = alive & ((conflict_pairs[:, 0] == worst) | (conflict_pairs[:, 1] == worst))
+        conflict_count -= np.bincount(conflict_pairs[hit].reshape(-1), minlength=num_patches)
+        alive &= ~hit
+        conflict_count[worst] = 0
+    total_conflicts = np.bincount(conflict_pairs.reshape(-1), minlength=num_patches)
+    total_agree = agree_count
+    entries = []
+    for p in demoted:
+        rows = conflict_pairs[(conflict_pairs[:, 0] == p) | (conflict_pairs[:, 1] == p)]
+        others = np.where(rows[:, 0] == p, rows[:, 1], rows[:, 0])
+        ids, counts = np.unique(others, return_counts=True)
+        top = np.argsort(-counts)[:8]
+        entries.append({'patch': int(p), 'conflicting_pairs': int(total_conflicts[p]),
+                        'agreeing_pairs': int(total_agree[p]), 'sampled_pins': int(sampled[p]),
+                        'neighbours': [(int(ids[k]), int(counts[k])) for k in top]})
+    report = {'pairs': int(len(a)), 'inconsistent': int(inconsistent.sum()), 'demoted': entries}
+    return np.asarray(demoted, dtype=np.int64), report
+
+
+def joint_integer_targets(zyx, component, estimate, T_frac, fixed_T, fixed_T_value,
+                          num_components, *, tolerance=3.0, stride=3, min_pairs=3):
+    """Integer component targets that agree wherever components coincide.
+
+    Independent rounding of each component's fractional target splits two
+    observations of one sheet whose estimates straddle a half winding, and
+    every ray they share then carries an ordering conflict. Here pins of
+    different components within ``tolerance`` scroll voxels (coincident
+    observations, from a KD-tree over every ``stride``-th pin) give integer
+    relations ``T_a - T_b = round(est_i - est_j)`` (``est`` is the per-pin
+    fractional estimate ``s_free/dr - n``, so this is the rounded winding
+    difference of the two observations at the same place, normally 0).
+    Relations are aggregated per component pair (median delta, kept with at
+    least ``min_pairs`` supporting pairs), solved as robust integer potentials
+    over the component graph, and each connected group is shifted by one
+    integer so that its members sit nearest their fractional targets (or so
+    that its absolute-winding members keep their fixed values). Components
+    without relations are rounded on their own. Returns ``(T_int,
+    num_relations, num_inconsistent)``.
+    """
+    from scipy.spatial import cKDTree
+    import scipy.sparse
+    import scipy.sparse.csgraph
+    T_frac = T_frac.detach().cpu().numpy().astype(np.float64)
+    fixed = fixed_T.cpu().numpy().astype(bool)
+    fixed_value = fixed_T_value.cpu().numpy().astype(np.float64)
+    T_int = np.where(fixed, fixed_value, np.round(T_frac))
+    n = int(zyx.shape[0])
+    if n == 0 or num_components == 0:
+        return torch.from_numpy(T_int.astype(np.float32)), 0, 0
+    sel = np.arange(0, n, max(int(stride), 1))
+    pts = zyx[sel].detach().cpu().numpy().astype(np.float64)
+    comp = component[sel].cpu().numpy()
+    est = estimate[sel].detach().cpu().numpy().astype(np.float64)
+    pairs = cKDTree(pts).query_pairs(r=float(tolerance), output_type='ndarray')
+    if len(pairs) == 0:
+        return torch.from_numpy(T_int.astype(np.float32)), 0, 0
+    a, b = comp[pairs[:, 0]], comp[pairs[:, 1]]
+    cross = a != b
+    pairs, a, b = pairs[cross], a[cross], b[cross]
+    if len(pairs) == 0:
+        return torch.from_numpy(T_int.astype(np.float32)), 0, 0
+    swap = a > b
+    lo = np.where(swap, b, a); hi = np.where(swap, a, b)
+    d = est[pairs[:, 0]] - est[pairs[:, 1]]
+    d = np.where(swap, -d, d)                     # delta for (lo, hi): T_lo - T_hi
+    key = lo.astype(np.int64) * num_components + hi
+    order = np.argsort(key, kind='stable')
+    key, lo, hi, d = key[order], lo[order], hi[order], d[order]
+    bounds = np.concatenate([[0], np.nonzero(np.diff(key))[0] + 1, [len(key)]])
+    edges, deltas = [], []
+    for s0, s1 in zip(bounds[:-1], bounds[1:]):
+        if s1 - s0 < min_pairs:
+            continue
+        edges.append((int(lo[s0]), int(hi[s0])))
+        deltas.append(int(np.round(np.median(d[s0:s1]))))
+    if not edges:
+        return torch.from_numpy(T_int.astype(np.float32)), 0, 0
+    e = np.asarray(edges, dtype=np.int64)
+    adjacency = scipy.sparse.coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])),
+                                        shape=(num_components, num_components))
+    num_groups, group_of = scipy.sparse.csgraph.connected_components(adjacency, directed=False)
+    # potentials: T_hi = T_lo - delta  <=>  n[v] - n[u] = -delta for edge (u=lo, v=hi)
+    potential, inconsistent = _robust_integer_offsets(
+        num_components, [(int(u), int(v)) for u, v in e], -np.asarray(deltas, dtype=np.int64),
+        group_of, num_groups, root_labels=[str(c) for c in range(num_components)])
+    potential = np.asarray(potential, dtype=np.float64)
+    linked = np.zeros(num_components, dtype=bool)
+    linked[e.reshape(-1)] = True
+    for g in range(num_groups):
+        members = np.nonzero((group_of == g) & linked)[0]
+        if members.size < 2:
+            continue
+        fixed_members = members[fixed[members]]
+        if fixed_members.size:
+            shift = np.round(np.median(fixed_value[fixed_members] - potential[fixed_members]))
+        else:
+            shift = np.round(np.median(T_frac[members] - potential[members]))
+        T_int[members] = potential[members] + shift
+    T_int = np.where(fixed, fixed_value, T_int)
+    return torch.from_numpy(T_int.astype(np.float32)), len(edges), len(inconsistent)
+
+
 def _crossing_step(theta_from, theta_to):
     """+1 / -1 seam step for a |dtheta| < pi move (matches ThetaCrossingMap)."""
     delta = theta_to - theta_from
@@ -1250,7 +1467,7 @@ def _crossing_step(theta_from, theta_to):
 def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
                       patch_atlas, footprint_rule, free_gap_fn, min_z, max_z,
                       device, canonical_transform=None, patch_pin_kind=PIN_KIND_PATCH,
-                      chunk_size=262144, max_patch_spread=None):
+                      chunk_size=262144):
     """Resolve the graph against the current model into a :class:`PinRegistry`.
 
     ``intermediate_transform`` maps scroll -> intermediate space (the flow
@@ -1345,13 +1562,11 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
             'edge': edge.label or f'{graph.nodes[edge.u].label}->{graph.nodes[edge.v].label}',
             'kind': edge.kind, 'mismatch': int(mismatch)})
     by_kind = collections.Counter(graph.edges[k].kind for k, _ in inconsistent)
-    excluded_patches = []   # (patch index, spread, quads) dropped by max_patch_spread, filled below
     pinned_patch_nodes = set()   # graph patch nodes that emitted at least one pin
     consistency_report = {
         'inconsistent_edges': len(inconsistent),
         'inconsistent_edges_by_kind': dict(by_kind),
         'components': dict(by_component),
-        'excluded_patches': excluded_patches,
     }
     # -- absolute components ---------------------------------------------
     fixed_T = np.zeros(graph.num_components, dtype=bool)
@@ -1401,22 +1616,6 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
         pots = crossing_map.winding_potentials(
             torch.from_numpy(node_ids_g.reshape(-1)).to(crossing_map.device)).reshape(*valid_g.shape)
         crossing_map.assert_no_pending_potential_errors()
-        if max_patch_spread is not None and canonical_transform is not None:
-            # A patch the current free map cannot hold on one sheet (its
-            # quad centres spread over more than max_patch_spread windings
-            # of canonical shifted winding, after seam adjustment) is not
-            # pinned: its pins would conflict on every ray it shares with
-            # its neighbours and the ordering guard would sacrifice them.
-            with torch.no_grad():
-                spiral = torch.cat([canonical_transform(flat[start:start + chunk_size])
-                                    for start in range(0, flat.shape[0], chunk_size)], dim=0)
-                canon_w = (torch.linalg.norm(spiral[:, 1:], dim=-1) / dr_f
-                           - theta_g.reshape(-1) / TWO_PI
-                           + pots.to(device).reshape(-1).to(torch.float32))[valid_t.reshape(-1)]
-                spread_w = float(canon_w.std()) if canon_w.numel() > 1 else 0.0
-            if spread_w > float(max_patch_spread):
-                excluded_patches.append((int(node.patch_index), spread_w, int(valid_t.sum())))
-                continue
         sp_t, sp_z = grid_neighbour_spacing(theta_g, z_g, valid_t)
         sel = valid_t.reshape(-1)
         ids = torch.full(valid_t.shape, -1, dtype=torch.long, device=device)
@@ -1559,7 +1758,8 @@ def finalize_registry(graph, *, intermediate_transform, dr, crossing_map,
         local_gap=local_gap.to(torch.float32),
         patch_component=patch_component.to(device), patch_offset=patch_offset.to(device),
         neighbours=cat(neighbours, torch.int64, (0, 4)),
-        patch_index=cat(pin_patch, torch.int64))
+        patch_index=cat(pin_patch, torch.int64),
+        excluded_patches=torch.zeros([0], dtype=torch.int64, device=device))
 
 
 def _patch_quad_grid(patch_atlas, patch_index, stride, with_node_ids=True):

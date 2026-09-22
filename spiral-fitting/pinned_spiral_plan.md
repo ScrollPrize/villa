@@ -692,8 +692,42 @@ bends across a neighbour at their edges. 9% of patches hold 57% of the inexact p
 excluding them (`model_pin_max_patch_spread_windings`) is the cheapest lever so far.
 Integer-snapped frozen targets (`model_pin_targets_integer`) lift the integer-snapping
 satisfaction metric from 58% to 89% of area but are slightly worse on the fractional
-yardstick. Not yet tried: a joint (consistent) integer assignment across neighbouring
-components, and a finer flow lattice.
+yardstick. A joint integer assignment (`model_pin_targets_joint`: coincident cross-
+component pin pairs give integer relations, solved as robust potentials over the
+component graph) changes 826 of 9194 components and removes a fifth of the same-sheet
+conflicts, but pin inexactness stays at ~11% (95.6% vs 95.3% of quads): the swapped-
+order class dominates once same-sheet disagreements shrink.
+
+The flow field matters more. Same warm-up/pinning protocol, fractional targets, no
+exclusion, quads within 0.5 winding of own patch median / patches fully within:
+cartesian lattice 16: 96.0% / 75%; B-spline lattice 16: 96.4% / 80%; B-spline lattice
+24: 96.9% / 82% (free stage 42% of patches fully flat vs 31%); B-spline lattice 32:
+97.1% / 82% (plateau). The C2 B-spline with a coarser lattice represents the sheet-scale
+bends the pins need better than the trilinear field does, and it is the one change that
+helps without discarding inputs. Combined with the spread filter at 1.0 winding (152
+patches, 2.3% of quads, not pinned and given no soft loss): 98.0% / 87%, with the best
+free stage too (49% of patches fully flat). Keeping the soft radius loss on the
+spread-excluded patches instead drags the free stage down to 28% while leaving the
+pinned numbers unchanged, so they get neither pins nor soft loss.
+
+The spread cap was a proxy: a lone patch is always satisfiable by the radial map, and
+what breaks pins is *pairwise* inconsistency, two constraints disagreeing about their
+relative winding on shared rays. `model_pin_demote_conflicting_patches` demotes on that
+directly (cross-component pin pairs within 30 voxels, compared the way the ray map
+treats slots; greedy demotion of the patch with the highest conflicting-to-agreeing pair
+ratio). With `model_pin_demote_conflict_ratio` 0.5 (disagrees more than it agrees) on the
+B-spline 24 fit it demotes 346 patches (4.3% of pins) and gives 98.5% / 88% (spread cap:
+98.0% / 87% with 2.3% excluded); with ratio 0 it demotes 1701 patches (19% of pins) and
+the kept set is essentially exact (99.8% / 93%), which is the trade-off curve. The
+demoted set is recorded in the registry (`excluded_patches`) and gets no soft loss.
+Only 35 of the 152 spread-capped patches are among the 346 demoted, so the spread cap
+was not even a good proxy; it has been retired (`model_pin_max_patch_spread_windings`
+is a retired key). Demotion is on by default with ratio 0.5, is re-checked against the
+current free map every `model_pin_demote_recheck_interval` steps (reinstating patches
+that no longer conflict; the full registry is kept from finalisation or rebuilt on
+resume), and every decision is appended to `pin_demotion.jsonl` in the run directory
+with each demoted patch's id, pair counts and most-conflicting neighbours, as a review
+queue for the annotations.
 
 ## Out of scope for these stages (recorded so they are not lost)
 

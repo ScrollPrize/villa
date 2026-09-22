@@ -875,3 +875,56 @@ def test_origin_constraints_report_only_incompatible_pins():
     assert int(m.base_conflicts[0]) == 2
     assert float(pinned_map_inverse(torch.tensor([0.]), m)) == 0.
     assert float(pinned_map_inverse(torch.tensor([64.]), m)) == 80.
+
+
+def test_joint_integer_targets_agree_on_coincident_components():
+    # Components 0 and 1 observe the same sheet (their pins coincide) with
+    # fractional estimates straddling a half winding; component 2 is a
+    # separate sheet one winding out, coincident with component 1; 3 is
+    # isolated and just rounds; 4 is absolute (fixed) and anchors its group.
+    gen = torch.Generator().manual_seed(0)
+    base = torch.rand(40, 3, generator=gen) * 100
+    zyx = torch.cat([base, base + 0.5, base + 1.0, base + 500., base + 0.7])
+    component = torch.repeat_interleave(torch.arange(5), 40)
+    est = torch.cat([torch.full([40], 4.4), torch.full([40], 4.6), torch.full([40], 5.55),
+                     torch.full([40], 7.3), torch.full([40], 4.45)])
+    T_frac = torch.tensor([4.4, 4.6, 5.55, 7.3, 4.45])
+    fixed = torch.tensor([False, False, False, False, True])
+    fixed_value = torch.tensor([0., 0., 0., 0., 9.])
+    T_int, relations, inconsistent = pins.joint_integer_targets(
+        zyx, component, est, T_frac, fixed, fixed_value, 5, tolerance=3.0, stride=1)
+    assert relations >= 3 and inconsistent == 0
+    # Independent rounding would give 4 and 5 for the same sheet; jointly they
+    # agree, sit one below component 2, and the fixed component pins the
+    # whole group to its absolute value.
+    assert T_int[0] == T_int[1]
+    assert T_int[2] == T_int[1] + 1
+    assert T_int[4] == 9.0 and T_int[0] == 9.0
+    assert T_int[3] == 7.0
+    # Without the fixed anchor the group sits nearest its fractional targets.
+    T_int2, _, _ = pins.joint_integer_targets(
+        zyx[:160], component[:160], est[:160], T_frac[:4], fixed[:4], fixed_value[:4], 4, tolerance=3.0, stride=1)
+    assert T_int2[0] == T_int2[1] and T_int2[2] == T_int2[0] + 1 and T_int2[0] in (4.0, 5.0)
+
+
+def test_conflicting_patch_demotion_picks_the_outlier():
+    # Patches 0, 1, 2 lie on one sheet and agree (targets equal, free map
+    # equal); patch 3 overlaps all of them at the same places but its target
+    # sits one winding off. Patch 4 is far away and unrelated.
+    gen = torch.Generator().manual_seed(0)
+    base = torch.rand(60, 3, generator=gen) * 100
+    zyx = torch.cat([base, base + 1.0, base + 2.0, base + 0.5, base + 900.])
+    patch = torch.repeat_interleave(torch.arange(5), 60)
+    component = patch.clone()
+    n = torch.zeros(300)
+    est = torch.cat([torch.full([60], 7.0)] * 3 + [torch.full([60], 7.0), torch.full([60], 12.0)])
+    T = torch.tensor([7.0, 7.0, 7.0, 8.0, 12.0])
+    demoted, report = pins.conflicting_patch_demotion(
+        zyx, patch, component, n, est, T, tolerance=5.0, stride=1, min_conflicts=10)
+    assert demoted.tolist() == [3]
+    assert report['inconsistent'] > 0
+    # Consistent targets: nothing is demoted.
+    demoted2, report2 = pins.conflicting_patch_demotion(
+        zyx, patch, component, n, est, torch.tensor([7.0, 7.0, 7.0, 7.0, 12.0]), tolerance=5.0, stride=1, min_conflicts=10)
+    assert demoted2.size == 0 and report2['inconsistent'] == 0
+
