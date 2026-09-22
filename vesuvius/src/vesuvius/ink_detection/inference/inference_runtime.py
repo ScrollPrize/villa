@@ -11,6 +11,7 @@ import torch
 from torch import nn
 
 from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
+from vesuvius.models.utilities.get_accelerator import get_accelerator
 
 
 LOGGER = logging.getLogger(__name__)
@@ -194,7 +195,9 @@ def prepare_model_for_inference(
             )
         device = torch.device(f"cuda:{requested[0]}")
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # get_accelerator() tries cuda first, so CUDA hosts resolve exactly as before;
+        # it adds mps for Apple Silicon, which otherwise fell back to cpu here.
+        device = get_accelerator()
 
     model = model.to(device)
     if len(requested) > 1:
