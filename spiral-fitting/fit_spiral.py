@@ -3548,12 +3548,27 @@ class FitContext:
             return
         current = model.pin_registry
         model.set_pin_registry(full, reset_targets=False)
+        shift_report = None
         try:
             with torch.no_grad():
                 T = model.effective_pin_targets()
                 _, estimate = model.estimate_pin_targets(return_per_pin=True)
                 pins_t = model.compute_pins(full=True)
                 n = pins_t[:, 3] / model.get_dr_per_winding() - T[full.component]
+            if self.config.get('model_pin_shift_patch_offsets', False):
+                # Pairwise target shift: a patch a whole winding from where
+                # its component's offsets place it, whose neighbours agree
+                # with the free map, gets its integer offset corrected
+                # instead of being demoted.
+                shifts, shift_report = pins_module.patch_offset_shifts(
+                    full.zyx, full.patch_index, full.component, torch.round(n), estimate, T,
+                    tolerance=float(self.config.get('model_pin_demote_pair_tolerance_voxels', 30.0)))
+                if shifts:
+                    full = full.with_patch_offset_shifts(shifts)
+                    model.set_pin_registry(full, reset_targets=False)
+                    with torch.no_grad():
+                        pins_t = model.compute_pins(full=True)
+                        n = pins_t[:, 3] / model.get_dr_per_winding() - T[full.component]
             demoted, report = pins_module.conflicting_patch_demotion(
                 full.zyx, full.patch_index, full.component, torch.round(n), estimate, T,
                 tolerance=float(self.config.get('model_pin_demote_pair_tolerance_voxels', 30.0)),
@@ -3570,8 +3585,10 @@ class FitContext:
             model.set_pin_registry(full.subset(keep, demoted_patches=demoted_t), reset_targets=False)
         # (No demotion: the full registry stays installed.)
         if self.dist.is_main_process:
+            shifted = shift_report['shifted'] if shift_report else []
             print(f'pin conflicts (step {iteration if iteration is not None else "activation"}): '
-                  f'{report["inconsistent"]} of {report["pairs"]} cross-component pin pairs inconsistent; '
+                  + (f'{len(shifted)} patch offset(s) shifted by a whole winding; ' if shift_report else '')
+                  + f'{report["inconsistent"]} of {report["pairs"]} cross-component pin pairs inconsistent; '
                   f'{len(demoted)} patch(es) demoted ({len(now - previous)} new, {len(previous - now)} reinstated)')
             names = [getattr(patch, 'uuid', None) for patch in self.verified_patches_list]
             entry = {
@@ -3580,6 +3597,8 @@ class FitContext:
                              'neighbours': [{'patch': q, 'id': names[q] if q < len(names) else None, 'conflicting_pairs': c}
                                             for q, c in e['neighbours']]} for e in report['demoted']],
                 'reinstated': sorted(previous - now),
+                'offset_shifts': [{**e, 'id': names[e['patch']] if e['patch'] < len(names) else None}
+                                  for e in (shift_report['shifted'] if shift_report else [])],
             }
             out_path = getattr(self, 'out_path', None)
             if out_path:

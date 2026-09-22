@@ -928,3 +928,26 @@ def test_conflicting_patch_demotion_picks_the_outlier():
         zyx, patch, component, n, est, torch.tensor([7.0, 7.0, 7.0, 7.0, 12.0]), tolerance=5.0, stride=1, min_conflicts=10)
     assert demoted2.size == 0 and report2['inconsistent'] == 0
 
+
+
+def test_patch_offset_shift_corrects_a_patch_one_winding_off_its_component():
+    # Component 0 holds patches 0 (offset right) and 1 (its offset is one
+    # winding too low: the free map puts its pins a winding above where the
+    # component places them). Patch 2 is another component on the same sheet
+    # as patch 1's true position. Shifting patch 1 by +1 makes it agree with
+    # patch 2 and with its own component.
+    gen = torch.Generator().manual_seed(0)
+    base = torch.rand(60, 3, generator=gen) * 100
+    zyx = torch.cat([base + 400., base, base + 1.0])
+    patch = torch.repeat_interleave(torch.arange(3), 60)
+    component = torch.tensor([0] * 120 + [1] * 60)
+    n = torch.cat([torch.zeros(60), torch.zeros(60), torch.zeros(60)])
+    est = torch.cat([torch.full([60], 5.0), torch.full([60], 6.0), torch.full([60], 6.0)])
+    T = torch.tensor([5.0, 6.0])
+    shifts, report = pins.patch_offset_shifts(zyx, patch, component, n, est, T, tolerance=5.0, stride=1, min_pins=10)
+    assert shifts == {1: 1}
+    assert report['shifted'][0]['consistent_after'] > report['shifted'][0]['consistent_before']
+    # Without a neighbour to agree with, a lone off-by-one patch is not shifted.
+    shifts2, _ = pins.patch_offset_shifts(zyx[:120], patch[:120], component[:120], n[:120], est[:120], T,
+                                          tolerance=5.0, stride=1, min_pins=10)
+    assert shifts2 == {}

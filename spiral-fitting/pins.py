@@ -1201,6 +1201,18 @@ class PinRegistry:
         fields['patch_component'] = patch_component
         return PinRegistry(**fields)
 
+    def with_patch_offset_shifts(self, shifts):
+        """Registry with each patch's integer offset shifted by ``shifts[patch]``
+        (added to its pins' ``n0`` and to ``patch_offset``)."""
+        if not shifts or self.patch_index is None:
+            return self
+        n0 = self.n0.clone(); patch_offset = self.patch_offset.clone()
+        for patch, k in shifts.items():
+            n0[self.patch_index == int(patch)] += int(k)
+            if int(patch) < patch_offset.numel():
+                patch_offset[int(patch)] += int(k)
+        return dataclasses.replace(self, n0=n0, patch_offset=patch_offset)
+
     def adjusted_n(self, theta):
         """``n_i(t) = n_i(0) + round((theta0_i - theta_i(t)) / 2pi)``."""
         return self.n0 + torch.round((self.theta0 - theta) / TWO_PI).to(torch.int32)
@@ -1280,6 +1292,74 @@ def _robust_integer_offsets(num_nodes, edges, deltas, component_of, num_componen
     residual = n[edges[:, 1]] - n[edges[:, 0]] - deltas.astype(np.int64)
     inconsistent = [(int(k), int(residual[k])) for k in np.nonzero(residual != 0)[0]]
     return n, inconsistent
+
+
+def patch_offset_shifts(zyx, patch_index, component, n, estimate, T, *,
+                        tolerance=30.0, stride=4, min_pins=20, same_sheet_tolerance=0.35):
+    """Integer offset corrections for patches that sit a whole winding from
+    where their component's offsets place them, when their neighbours agree.
+
+    Each component's target ``T`` is the median of its pins' estimates, so
+    a same-place pair whose targets differ by a winding means one patch's
+    integer offset ``n`` within its component is off by that winding (the
+    PCL link or theta bookkeeping that placed it disagrees with where the
+    free map and the neighbouring patches put it). Candidate patches have a
+    median pin residual ``estimate - T`` at least half a winding from zero
+    (over at least ``min_pins`` sampled pins); the candidate shift
+    ``k = round(median residual)`` is applied only if it turns more of the
+    patch's same-place cross-component pairs (free-map difference below
+    ``same_sheet_tolerance``) consistent than it breaks. Returns ``{patch:
+    k}`` and a report with per-patch pair counts before and after.
+    """
+    from scipy.spatial import cKDTree
+    num = int(zyx.shape[0])
+    if num == 0:
+        return {}, {'candidates': 0, 'shifted': []}
+    sel = np.arange(0, num, max(int(stride), 1))
+    sel = sel[(patch_index[sel] >= 0).cpu().numpy()]
+    pidx = patch_index[sel].cpu().numpy()
+    comp = component[sel].cpu().numpy()
+    nn = n[sel].cpu().numpy().astype(np.float64)
+    est = estimate[sel].detach().cpu().numpy().astype(np.float64)
+    Tn = T.detach().cpu().numpy().astype(np.float64)
+    resid = est - Tn[comp]
+    num_patches = int(patch_index.max()) + 1
+    counts = np.bincount(pidx, minlength=num_patches)
+    med = np.zeros(num_patches)
+    order = np.argsort(pidx, kind='stable'); bounds = np.concatenate([[0], np.cumsum(counts)])
+    for pp in range(num_patches):
+        if counts[pp]:
+            med[pp] = np.median(resid[order[bounds[pp]:bounds[pp + 1]]])
+    candidates = np.nonzero((np.abs(med) >= 0.5) & (counts >= min_pins))[0]
+    if candidates.size == 0:
+        return {}, {'candidates': 0, 'shifted': []}
+    pts = zyx[sel].detach().cpu().numpy().astype(np.float64)
+    pairs = cKDTree(pts).query_pairs(r=float(tolerance), output_type='ndarray')
+    if len(pairs) == 0:
+        return {}, {'candidates': int(candidates.size), 'shifted': []}
+    a, b = pairs[:, 0], pairs[:, 1]
+    cross = comp[a] != comp[b]
+    a, b = a[cross], b[cross]
+    dW = (est[a] + nn[a]) - (est[b] + nn[b])
+    same_place = np.abs(dW) < same_sheet_tolerance
+    a, b = a[same_place], b[same_place]
+    dT = (Tn[comp[a]] + nn[a]) - (Tn[comp[b]] + nn[b])
+    consistent = np.abs(dT) < 0.5
+    shifts, report = {}, []
+    for pp in candidates:
+        k = int(np.round(med[pp]))
+        in_a = pidx[a] == pp; in_b = pidx[b] == pp
+        involved = in_a | in_b
+        if not involved.any():
+            continue
+        before = int(consistent[involved].sum())
+        dT_after = dT[involved] + np.where(in_a[involved], k, -k)
+        after = int((np.abs(dT_after) < 0.5).sum())
+        if after > before:
+            shifts[int(pp)] = k
+            report.append({'patch': int(pp), 'shift': k, 'median_residual': float(med[pp]),
+                           'pairs': int(involved.sum()), 'consistent_before': before, 'consistent_after': after})
+    return shifts, {'candidates': int(candidates.size), 'shifted': report}
 
 
 def conflicting_patch_demotion(zyx, patch_index, component, n, estimate, T, *,

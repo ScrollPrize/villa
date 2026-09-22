@@ -199,6 +199,7 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "model_pin_demote_pair_tolerance_voxels": 30.0,
     "model_pin_demote_conflict_ratio": 0.5,
     "model_pin_demote_recheck_interval": 1000,
+    "model_pin_shift_patch_offsets": False,
     "output_satisfaction_overlay_profile": "strict",
     "output_satisfaction_log_interval": 0,
     "optimizer_lr_pin_targets": 0.01,
@@ -334,6 +335,9 @@ _PIN_DESCRIPTIONS = {
     "model_pin_demote_recheck_interval": (
         "Steps between re-checks of the demotion against the current free "
         "map (patches that no longer conflict are pinned again); 0 = never."),
+    "model_pin_shift_patch_offsets": (
+        "Correct a patch's integer offset by a whole winding when that "
+        "makes it agree with its neighbours, instead of demoting it."),
     "model_pin_targets_joint_tolerance_voxels": (
         "Scroll-voxel distance within which pins of different components "
         "count as coincident for the joint integer assignment."),
@@ -510,6 +514,7 @@ _RUN_MUTABLE_MODEL_KEYS = frozenset({
     "model_pin_demote_pair_tolerance_voxels",
     "model_pin_demote_conflict_ratio",
     "model_pin_demote_recheck_interval",
+    "model_pin_shift_patch_offsets",
     "model_pin_rebin_interval",
     "model_pin_coincidence_frac",
     "model_pin_conflict_tolerance",
@@ -794,6 +799,11 @@ class Config:
         self.model_pin_demote_pair_tolerance_voxels = 30.0
         self.model_pin_demote_conflict_ratio = 0.5
         self.model_pin_demote_recheck_interval = 1000
+        # Before demotion: correct by a whole winding the integer offset of a
+        # patch that sits a winding from where its component's offsets place
+        # it, when that makes it agree with its neighbours (pairwise target
+        # shift) instead of leaving it unpinned.
+        self.model_pin_shift_patch_offsets = False
         self.optimizer_lr_pin_targets = 0.01
         # Snap the component targets T to integers at activation and hold
         # them fixed (no fractional winding coordinate to optimise).
