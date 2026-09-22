@@ -4916,6 +4916,31 @@ class FitContext:
               f'patches for splice in {time.perf_counter() - started:.2f}s')
         return evaluation
 
+    def periodic_satisfaction_metrics(self):
+        """Patch satisfaction (strict and fractional profiles) on the live
+        export transform, over every ROI quad centre of the verified patches.
+        Costs about a minute on a production atlas; the headless loop calls it
+        every ``output_satisfaction_log_interval`` steps so the curve of the
+        metric the export reports is visible during the fit."""
+        if not self.verified_patches_list:
+            return {}
+        with torch.no_grad():
+            transform = self._export_transform()
+            evaluation = evaluate_patch_satisfaction_packed(
+                transform, self.dr_per_winding.detach() if torch.is_tensor(self.dr_per_winding)
+                else self.spiral_and_transform.get_dr_per_winding().detach(),
+                self.verified_patches_list, self.patch_atlas,
+                self.z_begin, self.z_end, include_splicing=False)
+        metrics = {}
+        for name in ('strict', 'fractional'):
+            profile = evaluation.profiles[name]
+            total_area = float(profile.total_areas.sum())
+            metrics[f'{name}_satisfied_area_fraction'] = float(profile.satisfied_areas.sum()) / max(total_area, 1e-9)
+            metrics[f'{name}_satisfied_patches_fraction'] = float(profile.satisfied_patches.float().mean())
+            metrics[f'{name}_satisfied_patches_area_weighted_fraction'] = (
+                float(profile.total_areas[profile.satisfied_patches].sum()) / max(total_area, 1e-9))
+        return metrics
+
     def configure_dt_loss_schedule(self, run_start, requested_iterations,
                                    schedule):
         """Install one Run's independent directional-DT eligibility window."""
@@ -6667,6 +6692,14 @@ class FitContext:
                 conditioning_lines, conditioning_payload = self._flow_conditioning_report()
                 for line in conditioning_lines:
                     print(line)
+                interval = int(self.config.get('output_satisfaction_log_interval', 0) or 0)
+                if interval > 0 and iteration % interval == 0 and self.verified_patches_list:
+                    started = time.perf_counter()
+                    satisfaction = self.periodic_satisfaction_metrics()
+                    log_metrics.update(satisfaction)
+                    print('  satisfaction: ' + ', '.join(
+                        f'{k.replace("_satisfied_", " ").replace("_fraction", "")} = {v * 100:.1f}%'
+                        for k, v in satisfaction.items()) + f'  ({time.perf_counter() - started:.0f}s)')
                 pin_keys = ('pin_inexact_fraction', 'pin_rays_with_violation_fraction',
                             'pin_order_violations', 'pin_anchors_evaluated', 'pin_conflicts',
                             'pin_strain_median', 'pin_strain_p90', 'pin_strain_frac_over_margin',

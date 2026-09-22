@@ -199,6 +199,8 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "model_pin_demote_pair_tolerance_voxels": 30.0,
     "model_pin_demote_conflict_ratio": 0.5,
     "model_pin_demote_recheck_interval": 1000,
+    "output_satisfaction_overlay_profile": "strict",
+    "output_satisfaction_log_interval": 0,
     "optimizer_lr_pin_targets": 0.01,
     "model_pin_targets_integer": False,
     "model_pin_targets_joint": False,
@@ -1076,6 +1078,12 @@ class Config:
         self.shell_table_smooth_sigma_theta = 1.0
         self.shell_min_confidence = 0.25
         self.output_save_png_visualizations = False
+        # Which satisfaction profile colours the overlay PNGs: 'strict'
+        # (integer-snapped target) or 'fractional' (own patch median).
+        self.output_satisfaction_overlay_profile = 'strict'
+        # Evaluate and print the patch satisfaction metrics (strict and
+        # fractional) every this many steps during the fit; 0 = only at export.
+        self.output_satisfaction_log_interval = 0
         self.influence_enabled = False
         self.influence_z = 3000.0
         self.influence_windings = 5.0

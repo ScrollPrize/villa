@@ -223,22 +223,43 @@ def evaluate_patch_satisfaction_packed(
     target_winding = target_winding_cpu.to(device=device)
     target_set = target_winding >= 0
     safe_target_raw = torch.where(target_set, target_raw, shifted)
+    # Fractional targets: each patch's own median shifted radius (in the
+    # snapped target's seam frame) without rounding to an integer winding.
+    # The signed deviation from the snapped target is the unwrapped shifted
+    # radius minus the integer; its per-patch median is the patch's
+    # fractional offset. With fractional pin targets this is the yardstick
+    # that measures how well a patch is held on one sheet.
+    signed = shifted - safe_target_raw
+    fractional_offset = torch.zeros(len(patches), dtype=signed.dtype, device=device)
+    for patch_index in range(len(patches)):
+        begin, end = int(offsets_np[patch_index]), int(offsets_np[patch_index + 1])
+        if end > begin:
+            valid = target_set[begin:end]
+            if bool(valid.any()):
+                fractional_offset[patch_index] = signed[begin:end][valid].median()
+    fractional_target_raw = safe_target_raw + fractional_offset[patch_indices]
     scan_residual = torch.empty(count, dtype=torch.float32, device=device)
+    fractional_scan_residual = torch.empty(count, dtype=torch.float32, device=device)
     inverse_batches = 0
     with torch.no_grad():
         for begin, end in _patch_aligned_chunks(offsets_np):
-            target_radius = (safe_target_raw[begin:end]
-                             + theta[begin:end] / (2 * np.pi) * dr)
+            # Both targets (snapped, fractional) in one inverse call per chunk.
+            targets = torch.cat([safe_target_raw[begin:end], fractional_target_raw[begin:end]])
+            theta_c = theta[begin:end].repeat(2)
+            target_radius = targets + theta_c / (2 * np.pi) * dr
             target_spiral = torch.stack([
-                center_spiral[begin:end, 0],
-                torch.sin(theta[begin:end]) * target_radius,
-                torch.cos(theta[begin:end]) * target_radius,
+                center_spiral[begin:end, 0].repeat(2),
+                torch.sin(theta_c) * target_radius,
+                torch.cos(theta_c) * target_radius,
             ], dim=-1)
             target_scroll = slice_to_spiral_transform.inv(target_spiral)
-            scan_residual[begin:end] = torch.linalg.norm(
-                target_scroll - center_scroll[begin:end], dim=-1)
+            distances = torch.linalg.norm(
+                target_scroll - center_scroll[begin:end].repeat(2, 1), dim=-1)
+            scan_residual[begin:end] = distances[:end - begin]
+            fractional_scan_residual[begin:end] = distances[end - begin:]
             inverse_batches += 1
     spiral_residual = (shifted - safe_target_raw).abs()
+    fractional_spiral_residual = (shifted - fractional_target_raw).abs()
     del center_scroll
 
     patch_count = len(patches)
@@ -247,7 +268,7 @@ def evaluate_patch_satisfaction_packed(
         [float(patch.area) for patch in patches], dtype=torch.float64)
     total_areas = patch_areas * roi_counts.to(torch.float64) / full_valid_counts.clamp_min(1)
 
-    def build_profile(overrides):
+    def build_profile(overrides, spiral_residual=spiral_residual, scan_residual=scan_residual):
         thresholds = dict(metrics_config)
         thresholds.update(overrides)
         satisfied = (target_set
@@ -279,6 +300,8 @@ def evaluate_patch_satisfaction_packed(
             boundary_satisfied.cpu(), satisfied.cpu())
 
     profiles = {'strict': build_profile({})}
+    profiles['fractional'] = build_profile(
+        {}, spiral_residual=fractional_spiral_residual, scan_residual=fractional_scan_residual)
     if include_splicing:
         profiles['splicing'] = build_profile(SPLICING_METRICS_CONFIG)
 
@@ -875,6 +898,16 @@ def save_overlay_and_print_satisfaction(
     total_area = float(total_areas.sum().item())
     satisfied_area_ratio = satisfied_area / max(total_area, 1e-9)
     print(f'satisfied_area = {satisfied_area:.1f}/{total_area:.1f} ({satisfied_area_ratio * 100:.1f}%)')
+    # The same thresholds against each patch's own fractional median shifted
+    # radius (no integer snap): the yardstick for fractional pin targets.
+    fractional_profile = patch_evaluation.profiles['fractional']
+    f_count = int(fractional_profile.satisfied_patches.sum().item())
+    f_area = float(fractional_profile.satisfied_areas.sum().item())
+    f_patches_area = float(total_areas[fractional_profile.satisfied_patches].sum().item())
+    print(f'fractional_satisfied_patches = {f_count}/{total_count} ({f_count / max(total_count, 1) * 100:.1f}%)')
+    print(f'fractional_satisfied_patches_area_weighted = {f_patches_area:.1f}/{all_patches_area:.1f} '
+          f'({f_patches_area / max(all_patches_area, 1e-9) * 100:.1f}%)')
+    print(f'fractional_satisfied_area = {f_area:.1f}/{total_area:.1f} ({f_area / max(total_area, 1e-9) * 100:.1f}%)')
     satisfaction_summary = {
         'satisfied_patches': int(satisfied_count),
         'total_patches': int(total_count),
@@ -886,6 +919,11 @@ def save_overlay_and_print_satisfaction(
         'boundary_total_patches': int(total_count),
         'boundary_satisfied_patches_fraction': boundary_satisfied_ratio,
         'satisfied_area': satisfied_area,
+        'fractional_satisfied_patches': f_count,
+        'fractional_satisfied_patches_fraction': f_count / max(total_count, 1),
+        'fractional_satisfied_patches_area_weighted_fraction': f_patches_area / max(all_patches_area, 1e-9),
+        'fractional_satisfied_area': f_area,
+        'fractional_satisfied_area_fraction': f_area / max(total_area, 1e-9),
         'total_area': total_area,
         'satisfied_area_fraction': satisfied_area_ratio,
     }
@@ -1062,14 +1100,16 @@ def save_overlay_and_print_satisfaction(
             flow_field_radius,
             cfg,
         )
-        satisfied_quad_masks = patch_evaluation.dense_masks('strict')
+        overlay_profile = str(cfg.get('output_satisfaction_overlay_profile', 'strict') or 'strict')
+        overlay_satisfied_patches = patch_evaluation.profiles[overlay_profile].satisfied_patches
+        satisfied_quad_masks = patch_evaluation.dense_masks(overlay_profile)
         if satisfied_quad_masks:
             satisfied_quads_flat = torch.cat(
                 [mask.flatten() for mask in satisfied_quad_masks])
             quads_per_patch = torch.tensor(
                 [mask.numel() for mask in satisfied_quad_masks],
                 dtype=torch.int64)
-            overall_satisfied_per_quad = satisfied_patches.repeat_interleave(
+            overall_satisfied_per_quad = overlay_satisfied_patches.repeat_interleave(
                 quads_per_patch)
         else:
             satisfied_quads_flat = torch.zeros(0, dtype=torch.bool)
