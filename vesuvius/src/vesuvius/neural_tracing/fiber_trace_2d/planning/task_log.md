@@ -64,3 +64,39 @@
   current corpus) before candidate scheduling.
 - Earlier rolling-window implementations were retained only as resumable
   checkpoints; they were not continuous and are superseded by this mode.
+
+## 2026-09-21 — native global-trial preparation parallelized
+
+- Global replay descriptors no longer materialize a complete sliced polyline
+  serially while parsing the request.  Each source annotation and its arc
+  geometry are cached once, interval slicing uses indexed arc bounds, and all
+  trial polylines are materialized in a bounded native preparation pool before
+  the tracing workers start.  Descriptor order and provenance remain stable.
+- Verified with the approved native build command; commit `136f7fbf7`.
+- The approved failure-union command was rerun after the build and reused the
+  already complete v3 manifest (`case_count=100`, `completed=true`).  A fresh
+  non-complete worklist will exercise the new preparation pool.
+
+## 2026-09-21 — explicit high-resolution inspection coverage fill
+
+- Added opt-in `fill_missing_inference` to the approved failure-union config,
+  scoped to `fullres_refinement_213753_best_ema999` only. It requests the exact
+  deduplicated corridor chunk keys through the existing demand cache/session;
+  it does not create synthetic fibers or rerun tracing.
+- The first centerline replay attempt was abandoned after CUDA OOM and did not
+  mutate the final audit. The direct-key implementation used batch size 1 and
+  completed 13,213 unique requested chunks: 849 were initially absent and all
+  849 were published. Final `cache_missing_chunk_count=0`.
+- Final output remains `/ephemeral/hendrik/fiber3d_train2/evaluations/full_failure_union_20260921_v3`
+  with 100 reference-only cases and 722.455325 mm. `highres_coverage_fill.json`
+  records the fill counts. The task-plan requirement was changed from a
+  read-only audit to an explicit opt-in mutation for inspection coverage.
+
+## 2026-09-22 — canonical physical-volume labels
+
+- Canonicalized exported source labels from the physical volume locator. The
+  two Paris4 collections now share one `PHercParis4` channel directory, and
+  the `PHerc1229` collection is exported as `PHerc1299`.
+- Existing generated alias-only channel directories are safely replaced during
+  union export; unrelated/non-symlink content is refused. The regenerated v3
+  manifest has five physical source labels and zero missing chunks.

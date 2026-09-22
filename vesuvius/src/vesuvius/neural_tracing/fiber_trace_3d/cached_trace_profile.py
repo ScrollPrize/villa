@@ -202,6 +202,41 @@ class CachedReplaySession:
             reference_backgrounds(evaluation, stores, mapping),readers,devices,settings,
             cancel_event=self.cancel_event,inference_session=self)
 
+    def fill_chunks(self, requests):
+        """Publish exact ZYX chunk indices; reuse the ordinary demand engine."""
+        from .live_evaluate import create_managed_demand_pool
+        import time
+        stores, mapping, channels, readers, devices, settings = self.resources
+        targets = set()
+        for key, indices in requests.items():
+            if key not in stores:
+                raise ValueError(f'inspection cache is not bound to selected model: {key}')
+            for index in sorted(set(indices)):
+                targets.add((key, stores[key].request(index)))
+        remaining = {(key, origin) for key, origin in targets if not stores[key].ready(origin)}
+        initial = len(remaining)
+        print(f'coverage-fill required={len(targets)} missing={initial}', flush=True)
+        if remaining and self.pool is None:
+            self.pool, self.gpu_lease = create_managed_demand_pool(
+                stores, readers, devices, settings)
+        last_report = 0.0
+        while remaining or (self.pool is not None and self.pool.busy):
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                from concurrent.futures import CancelledError
+                raise CancelledError('inspection coverage fill cancelled')
+            if self.gpu_lease is not None:
+                self.gpu_lease.tick()
+            self.pool.pump()
+            remaining = {(key, origin) for key, origin in remaining
+                         if not stores[key].ready(origin)}
+            if time.monotonic() - last_report >= 5:
+                print(f'coverage-fill published={initial-len(remaining)}/{initial} '
+                      f'queues={self.pool.queue_snapshot()}', flush=True)
+                last_report = time.monotonic()
+            time.sleep(.005)
+        return dict(required_chunks=len(targets), missing_before=initial,
+                    missing_after=len(remaining))
+
     def pause_gpu(self):
         if self.pool is not None and not self.gpu_paused:
             if self.pool.busy:

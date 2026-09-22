@@ -9,6 +9,7 @@ from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import shutil
 from threading import Event
 import time
 
@@ -779,12 +780,96 @@ def _safe_symlink(target, link):
     os.symlink(os.path.relpath(target, link.parent), link)
 
 
+def _canonical_source_label(locator):
+    """Return the physical scroll label, not an evaluation collection alias."""
+    parts = locator.rstrip('/').split('/')
+    if 'volumes' in parts:
+        index = parts.index('volumes')
+        if index and parts[index - 1].startswith('PHerc'):
+            return parts[index - 1]
+    return parts[-1] or 'unknown'
+
+
+def _remove_generated_channel_aliases(root):
+    """Replace only the generated per-source symlink directories."""
+    root = Path(root)
+    if not root.is_dir() or root.is_symlink():
+        return
+    for child in root.iterdir():
+        if not child.is_dir() or child.is_symlink():
+            continue
+        entries = list(child.rglob('*'))
+        if all(entry.is_symlink() for entry in entries if entry.is_file() or entry.is_symlink()):
+            shutil.rmtree(child)
+        else:
+            raise ValueError(f'refusing to replace non-generated VC3D directory: {child}')
+
+
+def _fill_union_corridor(workload, fill, required_by_root, output):
+    """Request audited missing output chunks through the existing demand pool."""
+    if not isinstance(fill, dict):
+        raise ValueError('fill_missing_inference must be an object')
+    name = fill.get('evaluation_name')
+    selected = next((x for x in workload['failure_union']['evaluations']
+                     if x.get('name') == name), None)
+    if selected is None:
+        raise ValueError('fill_missing_inference evaluation_name is not configured')
+    summary_path = _summary_path(selected['summary'])
+    summary = json.loads(summary_path.read_text())
+    if not summary.get('completed'):
+        raise ValueError(f'incomplete selected evaluation: {summary_path}')
+    evaluation_root = summary_path.parent.parent
+    bindings = json.loads((evaluation_root / 'full_bindings.json').read_text())
+    model_config = deepcopy(summary['config'])
+    model_config.pop('live_endpoint', None)
+    model_config.pop('reference_plan', None)
+    for key in ('render', 'backend', 'fiberlet', 'skeleton'):
+        model_config.pop(key, None)
+    overrides = fill.get('inference_overrides', {})
+    if overrides:
+        model_config['inference'].update(overrides)
+    # Match each physical cache root to the source binding used by the
+    # historical producer; aliases are canonicalized before deduplication.
+    source_roots = {}
+    for source in model_config['sources']:
+        source_roots[str(Path(source['fiber_manifest']).resolve().parent)] = source
+    requests = {}
+    for root, indices in required_by_root.items():
+        canonical = str(Path(root).resolve())
+        if canonical in source_roots:
+            requests[canonical] = sorted(indices)
+    if not requests:
+        raise ValueError('selected high-resolution evaluation has no requested cache roots')
+    from .cached_trace_profile import CachedReplaySession
+    binary = workload.get('native_binary')
+    if not binary:
+        binary = json.loads(Path(workload['failure_union']['reproduction_base_config']).read_text()).get('native_binary')
+    if not binary:
+        raise ValueError('native_binary is required for coverage filling')
+    checkpoint = bindings['checkpoint']
+    checkpoint_sha = bindings['checkpoint_sha256']
+    if sha256_file(checkpoint) != checkpoint_sha:
+        raise ValueError('selected high-resolution checkpoint changed')
+    devices = fill.get('devices', '0')
+    print(json.dumps({'coverage_fill_start': name,
+                      'cache_roots': len(requests),
+                      'requested_chunks': sum(len(v) for v in requests.values())}), flush=True)
+    with CachedReplaySession(model_config, binary, checkpoint, devices=devices) as session:
+        result = session.fill_chunks(requests)
+    atomic_write(output / 'highres_coverage_fill.json', {
+        'version': 1, 'evaluation_name': name, 'requests':
+        {key: len(value) for key, value in requests.items()}, 'result': result}, durable=False)
+    print(json.dumps({'coverage_fill_complete': result}), flush=True)
+
+
 def run_union(workload):
     """Extract all deduplicated GT hard regions from completed evaluations.
 
-    This deliberately performs no new tracing.  It consumes saved failure
-    episodes, exports reference-only annotations and audits the existing
-    full-resolution published cache around each resulting corridor.
+    By default this consumes saved failure episodes, exports reference-only
+    annotations and audits the existing full-resolution published cache around
+    each resulting corridor.  An explicit ``fill_missing_inference`` setting
+    can additionally run the selected historical evaluation on the exported
+    corridors, filling only its missing inference chunks before the audit.
     """
     settings = workload['failure_union']
     output = Path(workload['output_root'])
@@ -956,13 +1041,29 @@ def run_union(workload):
             atomic_write(path, annotation, durable=False)
         annotations.append({
             'index': index, 'path': str(path), 'sha256': sha256_file(path),
-            'source_id': item['source_id'], 'fiber_path': item['fiber_path'],
+            'source_id': _canonical_source_label(item['input_volume']),
+            'fiber_path': item['fiber_path'],
             'run_index': item['run_index'], 'coordinate_space': item['coordinate_space'],
             'input_volume': item['input_volume'],
             'reference_arcs_base_voxels': item['interval'],
             'length_base_voxels': float(item['interval'][1] - item['interval'][0]),
             'length_mm': float(item['interval'][1] - item['interval'][0]) * item['base_voxel_size_um'] / 1000,
         })
+
+    # Complete the exact inspection corridor, not another tracing workload.
+    required_by_root = defaultdict(set)
+    required_by_case = {}
+    for item, geometry_item in zip(annotations, merged):
+        root = cache_by_locator.get(item['input_volume'].rstrip('/'))
+        if root is None:
+            continue
+        keys = _corridor_chunk_keys(geometry_item['points'], root, radius)
+        required_by_case[item['index']] = keys
+        required_by_root[str(root.resolve())].update(keys)
+    fill = settings.get('fill_missing_inference')
+    if fill:
+        _fill_union_corridor(workload, fill, required_by_root, output)
+
     coverage = []
     missing_total = 0
     for coverage_index, item in enumerate(annotations):
@@ -972,13 +1073,7 @@ def run_union(workload):
             missing = ['cache-source-not-found']
             required = 0
         else:
-            required_keys = _corridor_chunk_keys(
-                next(x['points'] for x in merged
-                     if x['source_id'] == item['source_id']
-                     and x['fiber_path'] == item['fiber_path']
-                     and x['run_index'] == item['run_index']
-                     and x['interval'] == item['reference_arcs_base_voxels']),
-                root, radius)
+            required_keys = required_by_case[item['index']]
             required = len(required_keys)
             for channel in ('fiber_presence.ome.zarr', 'fiber_nx.ome.zarr', 'fiber_ny.ome.zarr'):
                 array_root = root / channel
@@ -993,11 +1088,12 @@ def run_union(workload):
             print(json.dumps({'coverage_progress': coverage_index + 1,
                               'total': len(annotations)}), flush=True)
     link_root = output / 'vc3d_channels'
+    _remove_generated_channel_aliases(link_root)
     link_manifest = []
     for locator, root in sorted(cache_by_locator.items()):
         # Exact source-volume identity is authoritative.  This avoids guessing
         # from scroll labels (which can contain aliases such as 1229/1299).
-        source_ids = sorted({item['source_id'] for item in annotations
+        source_ids = sorted({_canonical_source_label(locator) for item in annotations
                              if item['input_volume'].rstrip('/') == locator.rstrip('/')})
         if not source_ids:
             continue
@@ -1010,7 +1106,7 @@ def run_union(workload):
                                       c: str(destination / c) for c in (
                                           'fiber_presence.ome.zarr', 'fiber_nx.ome.zarr', 'fiber_ny.ome.zarr')}})
     manifest = {'version': 1, 'kind': 'full-hard-region-union',
-                'completed': True, 'case_count': len(annotations),
+                'completed': not fill or missing_total == 0, 'case_count': len(annotations),
                 'total_length_mm': sum(x['length_mm'] for x in annotations),
                 'context_base_voxels': context, 'corridor_radius_base_voxels': radius,
                 'merge_distance_base_voxels': merge_distance,

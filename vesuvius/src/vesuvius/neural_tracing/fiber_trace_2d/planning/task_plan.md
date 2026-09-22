@@ -1,5 +1,16 @@
 # Task plan: full hard-region failure extraction
 
+## Inspection coverage fill (2026-09-21)
+
+Add opt-in `fill_missing_inference.evaluation_name`. Reuse historical model,
+cache identity and managed demand session. Deduplicate audited corridor chunk
+keys by physical cache, request those keys directly, and drain publication;
+do not create synthetic fibers or rerun tracing. Re-audit all channel files.
+Use only the approved failure-union runner and test command. Test deduplication,
+cached no-op and failure propagation. Spec update: inspection completion requires
+zero missing chunks when filling is requested. Docs/log: record exact command,
+before/after coverage and abandoned replay-based attempts.
+
 ## Active correction: continuous native search (supersedes batch scheduling)
 
 Construct the global trial list once per model, using every unresolved

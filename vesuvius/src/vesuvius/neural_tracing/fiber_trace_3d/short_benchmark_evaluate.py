@@ -396,6 +396,10 @@ def run(workload, devices, *, gpu_manager=None, cancel_event=None):
     inference_overrides = workload.get('inference_overrides', {})
     allowed_inference_overrides = {
         'accumulator_hot_slots', 'accumulator_spill_segment_slots',
+        # Coverage-only fills may need a smaller transient GPU batch than the
+        # historical full evaluation.  These do not alter the cache identity
+        # or model outputs; they only bound live request memory.
+        'max_batch_size', 'input_slots', 'result_slots',
     }
     if (not isinstance(inference_overrides, dict)
             or set(inference_overrides) - allowed_inference_overrides):

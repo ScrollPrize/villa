@@ -559,6 +559,31 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
             pool_groups=pool_groups if mixed is not None else None)
 
 
+def create_managed_demand_pool(stores, readers, device_list, settings, pool_groups=None):
+    """Shared worker/lease setup for tracing and explicit inspection fills."""
+    from .mixed_inference import ModelWorkerPools
+    from .demand_gpu import DemandGpuLease
+    adaptive = settings.get("demand_gpu_manager")
+    factory = demand.DemandWorkerPool if pool_groups is None else (
+        lambda *args, **kwargs: ModelWorkerPools(*args, groups=pool_groups, **kwargs))
+    pool = factory(stores, readers, device_list,
+        slots_per_gpu=int(settings.get("slots_per_gpu", 2)),
+        input_workers=int(settings.get("input_workers", 8)),
+        input_slots=settings.get("input_slots"), result_slots=settings.get("result_slots"),
+        max_batch_size=settings.get("max_batch_size", 1),
+        accumulator_workers=settings.get("accumulator_workers"),
+        accumulator_hot_slots=settings.get("accumulator_hot_slots"),
+        accumulator_spill_segment_slots=int(settings.get("accumulator_spill_segment_slots", 256)),
+        flush_workers=int(settings.get("flush_workers", 4)),
+        deferred_gpu=adaptive is not None)
+    try:
+        lease = DemandGpuLease(pool, adaptive) if adaptive is not None else None
+    except BaseException:
+        pool.close()
+        raise
+    return pool, lease
+
+
 def coordinate_native(evaluation, binary, stores, source_to_store, channel_indices,
                       backgrounds, readers, device_list, settings, *, started=None, allow_inference=True,
                       pool_groups=None, cancel_event=None, inference_session=None):
@@ -687,22 +712,8 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                 if pool is None and queued:
                     if not allow_inference:
                         raise RuntimeError("cached-only replay cannot schedule inference")
-                    from .mixed_inference import ModelWorkerPools
-                    factory = demand.DemandWorkerPool if pool_groups is None else (
-                        lambda *args, **kwargs: ModelWorkerPools(*args, groups=pool_groups, **kwargs))
-                    pool = factory(stores, readers, device_list,
-                        slots_per_gpu=int(settings.get("slots_per_gpu", 2)), input_workers=int(settings.get("input_workers", 8)),
-                        input_slots=settings.get("input_slots"),
-                        result_slots=settings.get("result_slots"),
-                        max_batch_size=max_batch_size,
-                        accumulator_workers=settings.get("accumulator_workers"),
-                        accumulator_hot_slots=settings.get("accumulator_hot_slots"),
-                        accumulator_spill_segment_slots=int(settings.get("accumulator_spill_segment_slots", 256)),
-                        flush_workers=int(settings.get("flush_workers", 4)),
-                        deferred_gpu=adaptive is not None)
-                    if adaptive is not None:
-                        from .demand_gpu import DemandGpuLease
-                        gpu_lease = DemandGpuLease(pool, adaptive)
+                    pool, gpu_lease = create_managed_demand_pool(
+                        stores, readers, device_list, settings, pool_groups)
                     if inference_session is not None:
                         inference_session.pool = pool
                         inference_session.gpu_lease = gpu_lease

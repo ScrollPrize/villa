@@ -23,6 +23,14 @@ def validate_cached_model(model, checkpoint_digest, settings):
             "border": "border", "chunk_size": "chunk", "accumulator_dtype": "accumulator_dtype",
             "compressor": "compressor", "max_batch_size": "max_batch_size"}
     for setting, key in keys.items():
+        # Batch size controls transient GPU memory and throughput; it does not
+        # change published prediction values or the cache identity.  Allow a
+        # smaller value when extending a cache for a constrained inspection
+        # fill (the historical producer may have used a larger batch).
+        if setting == "max_batch_size" and setting in settings:
+            if int(settings[setting]) < 1:
+                raise ValueError("max_batch_size must be positive")
+            continue
         if setting == "precision" and settings.get(setting) == "auto":
             settings.pop(setting)
         if setting in settings and settings[setting] != model.get(key):
