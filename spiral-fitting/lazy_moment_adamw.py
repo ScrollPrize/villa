@@ -91,7 +91,7 @@ class LazyMomentAdamW(torch.optim.AdamW):
     gradients: only these entries update moments and receive a gradient step.
     This follows torch.optim.SparseAdam's masked-update idea, although that
     implementation uses materialized sparse entries as its mask. The fitter
-    passes gradients after clipping, smoothing and influence masks, so active
+    passes gradients after clipping and smoothing, so active
     entries need not have been directly sampled. Inactive entries retain
     history, including stale momentum. A global per-parameter step counter
     drives bias correction; there are no per-entry touch counters. Lazy

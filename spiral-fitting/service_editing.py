@@ -25,15 +25,13 @@ from service_uploads import (PCL_ROLE_FILES, UploadEnvironment, UploadManager,
 
 
 class EditingWorkspace:
-    def __init__(self, dataset, output, sources, resident, influence=None):
+    def __init__(self, dataset, output, sources, resident):
         self.dataset = Path(dataset).resolve()
         self.id = str(uuid4())
         self.root = Path(output) / 'editing-workspaces' / self.id
         self._owner_lock = create_workspace(self.root)
         self.sources = copy.deepcopy(sources)
         self.resident = resident
-        self.influence = influence or (lambda: {})
-        self.application_influence = {}
         self.catalog = Catalog()
         self.coordinator = MutationCoordinator()
         self.lease = WorkspaceLease(self.dataset)
@@ -350,10 +348,7 @@ class EditingWorkspace:
         pending = [r for r in revisions if self.catalog.entry(r.id).applied < r.number]
         if not pending:
             return {'applied': True}
-        if command_id not in self.application_influence:
-            self.application_influence[command_id] = copy.deepcopy(self.influence())
-        result = self.resident().apply_input_changes(command_id, self._records(pending),
-            influence_config=self.application_influence[command_id])
+        result = self.resident().apply_input_changes(command_id, self._records(pending))
         if result.get('applied'):
             self.catalog.mark_applied(pending)
         else:

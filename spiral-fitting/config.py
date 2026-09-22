@@ -285,7 +285,7 @@ _OPTIMIZER_DESCRIPTIONS = {
         "direction. 0 disables clipping. Logs the bound and clipped fraction."),
     "optimizer_flow_lazy_moments": (
         "Use SparseAdam-style masked updates on dense flow gradients: "
-        "entries with zero gradient after conditioning and influence masks "
+        "entries with zero gradient after conditioning "
         "retain their moments and receive no gradient update. Smoothing can "
         "activate entries without direct samples. Preserves history through "
         "quiet steps, including stale momentum, and does not correct first "
@@ -642,10 +642,6 @@ class Config:
         self.sample_count_patch_dt_target_points = 256
         self.sample_count_dt_target_points_per_strip = 512
         self.sample_count_shell_samples = 24576
-        self.sample_count_influence_footprint_points = 2048
-        self.sample_count_influence_anchor_lattice_points = 100000
-        self.sample_count_influence_anchor_geometry_points = 100000
-        self.sample_count_influence_anchor_samples_per_step = 4096
         # Exponent applied to patch areas when building patch sampling
         # probabilities: 0 = uniform, 1 = proportional to area.
         self.patch_sampling_area_exponent = 0.5
@@ -768,7 +764,6 @@ class Config:
         self.loss_weight_umbilicus = 1.25
         self.loss_weight_shell_outer = 1.0
         self.loss_weight_shell_patch_radius = 0.0
-        self.loss_weight_anchor = 0.0
         self.dense_min_spacing_d_min_wv = 6.0
         self.dense_normals_finite_difference_epsilon = 8.0
         self.fiber_directions_finite_difference_epsilon = 8.0
@@ -798,12 +793,6 @@ class Config:
         self.shell_table_smooth_sigma_theta = 1.0
         self.shell_min_confidence = 0.25
         self.output_save_png_visualizations = False
-        self.influence_enabled = False
-        self.influence_z = 3000.0
-        self.influence_windings = 5.0
-        self.influence_theta_frac = 0.5
-        self.influence_sigma = 0.3333
-        self.influence_anchor_ramp_power = 2.0
         self.output_num_slices_for_visualization = 20
 
         defaults = vars(self)
@@ -908,22 +897,6 @@ class Config:
             },
             "presets": presets,
         }
-
-
-def durable_config(values):
-    """The checkpoint-durable subset of a configuration.
-
-    Interactive influence state is session-scoped and the anchor weight only
-    exists while an influence window is active, so neither is stored in (or
-    expected from) a checkpoint's cfg/requested_config/resolved_config.
-    Checkpoint compatibility checks must compare stored key sets against
-    this durable subset of the schema, not the raw schema.
-    """
-    return {
-        key: item for key, item in dict(values).items()
-        if not key.startswith("interactive_influence_")
-        and key != "loss_weight_anchor"
-    }
 
 
 class FitConfig:

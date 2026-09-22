@@ -44,7 +44,7 @@ class Resident:
         self.members = {}
         self.fail = False
 
-    def apply_input_changes(self, command, records, influence_config=None):
+    def apply_input_changes(self, command, records):
         self.calls.append((command, copy.deepcopy(records)))
         if self.fail:
             return {'applied': False, 'errors': {'rank0': 'invalid input'}}
@@ -257,27 +257,24 @@ def test_discard_restores_current_dataset_in_one_resident_batch(workspace):
     assert all(e.accepted == e.persisted for e in ws.catalog.entries())
 
 
-def test_timeout_reuses_captured_influence_and_accepted_revision(workspace):
+def test_timeout_retries_the_accepted_revision(workspace):
     editing, resident = workspace
-    settings = {'influence_radius': 12}
-    editing.influence = lambda: settings
-    seen = []
+    attempts = []
     original = resident.apply_input_changes
-    def interrupted(command, records, influence_config=None):
-        seen.append(copy.deepcopy(influence_config))
-        if len(seen) == 1:
+    def interrupted(command, records):
+        attempts.append(command)
+        if len(attempts) == 1:
             raise TimeoutError('lost application response')
-        return original(command, records, influence_config)
+        return original(command, records)
     resident.apply_input_changes = interrupted
     input_id = str(uuid4())
-    request = {'command_id': 'captured-influence', 'changes': [{'id': input_id,
+    request = {'command_id': 'retried-command', 'changes': [{'id': input_id,
         'kind': 'pcl', 'role': 'same_winding', 'expected_revision': 0,
         'upload_id': upload(editing, 'new')}]}
     with pytest.raises(TimeoutError):
         editing.change(TOKEN, request)
-    settings['influence_radius'] = 99
     assert editing.change(TOKEN, request)['applied']
-    assert seen == [{'influence_radius': 12}, {'influence_radius': 12}]
+    assert attempts == ['retried-command', 'retried-command']
     assert editing.catalog.entry(input_id).accepted == 1
 
 

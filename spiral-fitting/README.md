@@ -182,10 +182,9 @@ clipping defaults to disabled. The `optimizer_flow_*` settings apply at run
 boundaries and are read every step. Older checkpoints backfill these defaults.
 
 The step order is: DDP gradient averaging, NaN/Inf detection and replacement
-with zero, optional clipping, optional smoothing, influence masks, then the
-optimizer update. Sanitizing before smoothing prevents a single invalid entry
-from contaminating its neighborhood. Influence masks constrain the processed
-gradient after smoothing.
+with zero, optional clipping, optional smoothing, then the optimizer update.
+Sanitizing before smoothing prevents a single invalid entry from
+contaminating its neighborhood.
 
 - `optimizer_flow_grad_smoothing` Gaussian-smooths each flow lattice's
   gradient. `optimizer_flow_grad_smoothing_sigma_voxels` sets the standard
@@ -643,14 +642,6 @@ AGENTS_AGENT_MODE=1 SPIRAL_REVISION_LIVE_DATASET=/path/to/dataset \
 Input uploads only transfer immutable bytes. The editing workspace owns
 acceptance, application, and persistence; there is no separate ephemeral-input
 ledger or automatic commit on editor save. Checkpoint uploads remain service-scoped.
-
-Interactive influence settings are captured when each **Run** request starts.
-Applying input revisions uses those captured settings and extends the
-influence region's union.
-The region is cleared only when the Run pauses, before autosaving.
-Influence masks, limits, and controls are not checkpoint state. All
-`interactive_influence_*` advanced settings can therefore change between runs
-without reloading the resident session.
 
 Directional DT timing is an independent control on every interactive Run.
 When **Restrict DT losses to final** is unchecked, the Run adds no DT gate.

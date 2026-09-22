@@ -478,20 +478,6 @@ class SpiralAndTransform(nn.Module):
             self.umbilicus_transform,
         ]).inv
 
-    def get_flowbox_to_spiral_transform(self, include_diffeomorphism=True):
-        # Maps positions expressed in the flow lattice's coordinate frame (the
-        # spiral-side intermediate space in which the diffeomorphism integrates)
-        # back to canonical spiral space. With include_diffeomorphism a lattice
-        # position is treated as an integration-trajectory *end* point; without,
-        # as a trajectory *start* point. The two differ by at most the flow
-        # displacement, so evaluating both brackets the material coordinates a
-        # flow voxel can influence.
-        gap_expander, maybe_flip, diffeomorphism, _ = self._get_transform_parts()
-        parts = [gap_expander, *maybe_flip]
-        if include_diffeomorphism:
-            parts.append(diffeomorphism)
-        return pyro.distributions.transforms.ComposeTransform(parts).inv
-
     def get_dr_per_winding(self):
         return lower_bounded_dr(
             self.dr_per_winding_logit, self.gap_min_gap)

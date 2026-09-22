@@ -30,7 +30,7 @@ from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_INTERVAL_ITERATIONS,
                          write_autosave_metadata)
 from config import (BACKFILLABLE_CONFIG_DEFAULTS, RETIRED_CONFIG_KEYS,
                     Config, FitConfig,
-                    durable_config, filter_known_config_keys)
+                    filter_known_config_keys)
 from spiral_progress import NullProgressReporter, ProgressReporter
 
 
@@ -108,8 +108,8 @@ COMMAND_ACK_TIMEOUT_S = 30.0
 # close) before the parent calls the worker wedged.
 COMMAND_ACK_GRACE_S = 5.0
 
-# Input application rebuilds resident catalogs, indices, fiber views, and GPU
-# influence masks.  Its acknowledgement is the result of that whole operation,
+# Input application rebuilds resident catalogs, indices and fiber views.
+# Its acknowledgement is the result of that whole operation,
 # not the quick queue-admission acknowledgement covered above.
 INPUT_BATCH_TIMEOUT_S = 1200.0
 
@@ -310,14 +310,14 @@ class RendezvousEndpoint:
     store_path: str
 
 
-def _apply_input_changes_at_boundary(session, batch_id, records, influence_config, *,
+def _apply_input_changes_at_boundary(session, batch_id, records, *,
                                      timeout, distributed):
     """Use the same prepare/decision protocol for local and distributed fits.
 
     Coordinator receipts survive caller timeouts. Device/worker timeouts still
     use the distributed runtime's existing fail-stop policy.
     """
-    payload = json.dumps([records, influence_config], sort_keys=True,
+    payload = json.dumps(records, sort_keys=True,
                          separators=(",", ":"), allow_nan=False)
     with session._condition:
         if not hasattr(session, "_revision_batch_lock"):
@@ -369,10 +369,9 @@ def _apply_input_changes_at_boundary(session, batch_id, records, influence_confi
         if "result" in receipt:
             return copy.deepcopy(receipt["result"])
         if "preparations" not in receipt:
-            captured_records, captured_config = json.loads(payload)
+            captured_records = json.loads(payload)
             receipt["preparations"] = call("prepare_input_batch", {
                 "batch_id": batch_id, "records": captured_records,
-                "influence_config": captured_config,
                 "target_iteration": receipt["target"],
                 "reservation_epoch": receipt["epoch"], "timeout": timeout})
         preparations = receipt["preparations"]
@@ -501,7 +500,6 @@ class InputBatchCommand(SessionCommand):
     batch_id: str = ""
     action: str = "prepare"
     records: list = dataclasses.field(default_factory=list)
-    influence_config: dict = dataclasses.field(default_factory=dict)
     reservation_epoch: int | None = None
     candidate: Any = dataclasses.field(default=None, repr=False)
 
@@ -940,12 +938,10 @@ class InteractiveFitSession:
                 durable = dict(checkpoint_config['cfg'])
                 for key in RETIRED_CONFIG_KEYS:
                     durable.pop(key, None)
-                # Checkpoints store the durable subset of the schema
-                # (see config.durable_config), so key sets compare
-                # against that subset. A small explicit allowlist records
-                # fields whose historical default is unambiguous; every
-                # other key-set mismatch stays a strict error.
-                durable_schema = set(durable_config(config))
+                # A small explicit allowlist records fields whose
+                # historical default is unambiguous; every other key-set
+                # mismatch stays a strict error.
+                durable_schema = set(config)
                 missing = durable_schema - set(durable)
                 backfillable = set(BACKFILLABLE_CONFIG_DEFAULTS) | {
                     "z_begin", "z_end"}
@@ -1486,7 +1482,7 @@ class InteractiveFitSession:
             self._prepared_input_batch_id = command.batch_id
             try:
                 command.candidate = self._context.prepare_input_changes(
-                    command.records, command.influence_config,
+                    command.records,
                     current_iteration=self._completed, target_iteration=self._target)
             except (ValueError, OSError) as exc:
                 # Content/domain preparation failures leave the active context
@@ -1532,10 +1528,10 @@ class InteractiveFitSession:
         self._publish_status()
         command.complete(**result)
 
-    def prepare_input_batch(self, batch_id, records, influence_config=None, *,
+    def prepare_input_batch(self, batch_id, records, *,
                             target_iteration, reservation_epoch,
                             timeout=INPUT_BATCH_TIMEOUT_S):
-        payload = json.dumps([records, influence_config or {}], sort_keys=True,
+        payload = json.dumps(records, sort_keys=True,
                              allow_nan=False, separators=(",", ":"))
         with self._condition:
             if self._state not in {SessionState.Idle, SessionState.Running}:
@@ -1550,13 +1546,12 @@ class InteractiveFitSession:
                 if (self._live_reservation_iteration != target_iteration
                         or self._live_reservation_epoch != reservation_epoch):
                     raise ValueError("Input batch does not own its worker boundary")
-                captured_records, captured_config = json.loads(payload)
+                captured_records = json.loads(payload)
                 command = InputBatchCommand(
                     batch_id=batch_id, session_generation=self.session_generation,
                     expected_iteration=target_iteration,
                     expected_config_revision=self._live_expected_config_revision_locked(),
-                    reservation_epoch=reservation_epoch, records=captured_records,
-                    influence_config=captured_config)
+                    reservation_epoch=reservation_epoch, records=captured_records)
                 batches[batch_id] = {"payload": payload, "prepare": command}
                 self._commands.append(command)
                 self._condition.notify_all()
@@ -1690,9 +1685,6 @@ class InteractiveFitSession:
             clear()
             return
         # Source compatibility for small in-process test/embedder contexts.
-        clear = getattr(self._context, "clear_interactive_influence", None)
-        if clear is not None:
-            clear()
         clear = getattr(self._context, "clear_dt_loss_schedule", None)
         if clear is not None:
             clear()
@@ -1960,7 +1952,7 @@ class InteractiveFitSession:
         self._publish_status()
 
     # Coordinator-thread commands.
-    def run(self, count, influence_config=None, run_config=None, path_changes=None,
+    def run(self, count, run_config=None, path_changes=None,
             autosave_on_pause=True, preview_schedule=None,
             dt_loss_schedule=None, barrier=None):
         if count < 1:
@@ -2091,11 +2083,10 @@ class InteractiveFitSession:
                 self._condition.notify_all()
         return {"cancelled": True}
 
-    def apply_input_changes(self, batch_id, records, influence_config=None, *,
+    def apply_input_changes(self, batch_id, records, *,
                             timeout=INPUT_BATCH_TIMEOUT_S):
         return _apply_input_changes_at_boundary(
-            self, batch_id, records, influence_config or {}, timeout=timeout,
-            distributed=False)
+            self, batch_id, records, timeout=timeout, distributed=False)
 
     def stop(self, barrier=None):
         with self._condition:
@@ -2312,7 +2303,6 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
                 if name == "run":
                     result = session.run(
                         arguments["count"],
-                        influence_config=arguments.get("influence_config"),
                         run_config=arguments.get("run_config"),
                         path_changes=arguments.get("path_changes"),
                         autosave_on_pause=arguments.get(
@@ -2767,7 +2757,7 @@ class DistributedInteractiveFitSession:
             f"Timed out after {timeout:.0f}s waiting for GPU worker ranks "
             f"{silent} to {name}"))
 
-    def run(self, count, influence_config=None, run_config=None, path_changes=None,
+    def run(self, count, run_config=None, path_changes=None,
             autosave_on_pause=True, preview_schedule=None,
             dt_loss_schedule=None):
         state = self.status()["state"]
@@ -2775,7 +2765,6 @@ class DistributedInteractiveFitSession:
             raise RuntimeError(f"Run is not allowed while session state is {state}")
         arguments = {
             "count": count,
-            "influence_config": dict(influence_config or {}),
             "run_config": dict(run_config or {}),
             "path_changes": dict(path_changes or {}),
             "autosave_on_pause": bool(autosave_on_pause),
@@ -2785,11 +2774,10 @@ class DistributedInteractiveFitSession:
         }
         return self._call("run", arguments, timeout=COMMAND_ACK_TIMEOUT_S)
 
-    def apply_input_changes(self, batch_id, records, influence_config=None, *,
+    def apply_input_changes(self, batch_id, records, *,
                             timeout=INPUT_BATCH_TIMEOUT_S):
         return _apply_input_changes_at_boundary(
-            self, batch_id, records, influence_config or {}, timeout=timeout,
-            distributed=True)
+            self, batch_id, records, timeout=timeout, distributed=True)
 
     def stop(self):
         state = self.status()["state"]

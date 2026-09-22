@@ -20,7 +20,7 @@ def context(monkeypatch):
     monkeypatch.setattr(torch.cuda, 'get_rng_state_all', lambda: [])
     monkeypatch.setattr(torch.cuda, 'set_rng_state_all', lambda states: None)
     ctx = FitContext.__new__(FitContext)
-    ctx.config = FitConfig(Config({'influence_enabled': False, 'z_begin': 0, 'z_end': 200,
+    ctx.config = FitConfig(Config({'z_begin': 0, 'z_end': 200,
         'patch_erode_patches': 0, 'pcl_unattached_pcl_min_point_spacing': 0}).as_dict())
     ctx.device = torch.device('cpu')
     ctx.progress = None
@@ -39,7 +39,6 @@ def context(monkeypatch):
     ctx.using_tracks = False
     ctx.slice_to_spiral_transform = lambda x: x
     ctx.optimiser = torch.optim.Adam([torch.nn.Parameter(torch.tensor([1.0]))])
-    ctx.influence_state = None
     ctx.run_dt_resume_iteration = None
     ctx.dist = SimpleNamespace(is_main_process=False)
     ctx.interactive_driver = None

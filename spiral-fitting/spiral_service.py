@@ -75,7 +75,7 @@ from fit_session import (API_VERSION, EDITABLE_PCL_ROLES, FIT_INPUT_CATALOG,
                          parse_session_request, resolve_dataset_root,
                          validate_session_request)
 from config import (BACKFILLABLE_CONFIG_DEFAULTS,
-                    CHECKPOINT_MODEL_SHAPE_KEYS, Config, durable_config,
+                    CHECKPOINT_MODEL_SHAPE_KEYS, Config,
                     filter_known_config_keys, rebuild_stage)
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
@@ -192,70 +192,6 @@ def bind_service_paths(resolution, output_directory, cache_directory):
     resolution.resolved["output_directory"] = str(output_directory)
     resolution.resolved["cache_directory"] = str(cache_directory)
     return resolution
-
-
-def _validate_run_influence_config(value, *, warn=print):
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       "influence_config must be a JSON object")
-    allowed = {
-        "influence_enabled",
-        "influence_z",
-        "influence_windings",
-        "influence_theta_frac",
-        "influence_sigma",
-        "sample_count_influence_footprint_points",
-        "sample_count_influence_anchor_lattice_points",
-        "sample_count_influence_anchor_geometry_points",
-        "sample_count_influence_anchor_samples_per_step",
-        "influence_anchor_ramp_power",
-        "loss_weight_anchor",
-    }
-    value = filter_known_config_keys(
-        value, allowed, label="influence configuration", warn=warn)
-    result = {}
-    if "influence_enabled" in value:
-        enabled = value["influence_enabled"]
-        if not isinstance(enabled, bool):
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "influence_enabled must be boolean")
-        result["influence_enabled"] = enabled
-    ranges = {
-        "influence_z": (1.0, 1_000_000.0),
-        "influence_windings": (0.1, 100.0),
-        "influence_theta_frac": (0.01, 1.0),
-        "influence_sigma": (0.000001, 10.0),
-        "sample_count_influence_footprint_points": (1.0, 1_000_000.0),
-        "sample_count_influence_anchor_lattice_points": (1.0, 1_000_000.0),
-        "sample_count_influence_anchor_geometry_points": (1.0, 100_000.0),
-        "sample_count_influence_anchor_samples_per_step": (1.0, 1_000_000.0),
-        "influence_anchor_ramp_power": (0.000001, 100.0),
-        "loss_weight_anchor": (0.0, 10_000.0),
-    }
-    for key, (minimum, maximum) in ranges.items():
-        if key not in value:
-            continue
-        item = value[key]
-        if isinstance(item, bool) or not isinstance(item, (int, float)):
-            raise ApiError(HTTPStatus.BAD_REQUEST, f"{key} must be numeric")
-        number = float(item)
-        if not minimum <= number <= maximum:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           f"{key} must be between {minimum} and {maximum}")
-        result[key] = number
-    integer_keys = {
-        "sample_count_influence_footprint_points",
-        "sample_count_influence_anchor_lattice_points",
-        "sample_count_influence_anchor_geometry_points",
-        "sample_count_influence_anchor_samples_per_step",
-    }
-    for key in integer_keys & result.keys():
-        if not result[key].is_integer():
-            raise ApiError(HTTPStatus.BAD_REQUEST, f"{key} must be an integer")
-        result[key] = int(result[key])
-    return result
 
 
 def _validate_dt_loss_schedule(value):
@@ -533,7 +469,6 @@ class ServiceState:
         self.gpu_ids = tuple(gpu_ids)
         self.artifacts = ArtifactRegistry()
         self.checkpoint_uploads = UploadManager(self._upload_environment())
-        self._active_run_influence = None
         # One record for the whole of preview publication (see
         # LasagnaPublisher's PreviewPublication), guarded by self.lock.
         self._preview = PreviewPublication()
@@ -664,12 +599,8 @@ class ServiceState:
                            if self.dataset_resolution is not None else {})
                 self.editing_workspace = EditingWorkspace(
                     self.dataset_root, self._output_root(), sources,
-                    self._editing_resident, self._editing_influence)
+                    self._editing_resident)
             return self.editing_workspace
-
-    def _editing_influence(self):
-        with self.lock:
-            return dict(self._active_run_influence or {})
 
     def input_content_artifact(self, input_id, revision_number):
         with self.workspace_use():
@@ -1939,11 +1870,8 @@ class ServiceState:
             raise ApiError(
                 HTTPStatus.CONFLICT,
                 "Static dataset inputs cannot be changed by a run")
-        influence_config = _validate_run_influence_config(
-            request.get("influence") or {}, warn=self._warn_ignored_config)
         run_config = changes
         with self.lock:
-            self._active_run_influence = dict(influence_config)
             current_iteration = int(
                 session.status().get("current_iteration") or 0)
             self._preview_schedule = copy.deepcopy(schedule)
@@ -1953,19 +1881,13 @@ class ServiceState:
             self._automatic_previews_disabled = False
 
         run_arguments = {
-            "influence_config": influence_config,
             "run_config": run_config,
             "autosave_on_pause": autosave_on_pause,
             "dt_loss_schedule": dt_loss_schedule,
         }
         if schedule is not None:
             run_arguments["preview_schedule"] = copy.deepcopy(schedule)
-        try:
-            target = session.run(iterations, **run_arguments)
-        except BaseException:
-            with self.lock:
-                self._active_run_influence = None
-            raise
+        target = session.run(iterations, **run_arguments)
         with self.lock:
             self.status_generation += 1
         return {**self.status(), "accepted": True, "target_iteration": target}
@@ -2259,7 +2181,7 @@ class ServiceState:
             status = self.session.status() if self.session else {}
             dataset_root = str(
                 getattr(self.session_paths, "dataset_root", "") or "")
-        live = durable_config(status.get("applied_config") or {})
+        live = dict(status.get("applied_config") or {})
         # What no rebuild can fix: a checkpoint from another dataset, or one
         # whose configuration is not this schema's at all.
         if checkpoint_cfg is None or (

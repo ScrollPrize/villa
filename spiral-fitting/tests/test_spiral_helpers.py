@@ -333,7 +333,6 @@ class FiberPointCollectionTests(unittest.TestCase):
         context._trusted_geometry_from_active_inputs = mock.Mock(
             return_value=torch.empty((0, 3)))
         context.run_dt_resume_iteration = None
-        context.influence_state = None
         return context
 
 

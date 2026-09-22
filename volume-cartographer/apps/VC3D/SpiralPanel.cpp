@@ -430,23 +430,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _savePngVisualizations = new QCheckBox(tr("Save diagnostic PNG visualizations"), outputContents);
     _savePngVisualizations->setChecked(false);
     _savePngVisualizations->hide();
-    _influenceEnabled = new QCheckBox(tr("Localize fit around added inputs"), outputContents);
-    _influenceEnabled->setChecked(false);
-    _influenceEnabled->setToolTip(tr("Restrict optimization to a region around each input added to "
-                                     "the running fit; the rest of the fit is held in place. Takes "
-                                     "effect when inputs are added to a running session."));
-    _influenceZ = new QSpinBox(outputContents);
-    _influenceZ->setRange(1, 1000000); _influenceZ->setValue(3000);
-    _influenceZ->setToolTip(tr("Max influence half-extent above/below the added input, in voxels"));
-    _influenceWindings = new QDoubleSpinBox(outputContents);
-    _influenceWindings->setRange(0.1, 100.0); _influenceWindings->setDecimals(1); _influenceWindings->setValue(5.0);
-    _influenceWindings->setToolTip(tr("Max influence half-extent across wraps, in windings"));
-    _influenceThetaPct = new QSpinBox(outputContents);
-    _influenceThetaPct->setRange(1, 100); _influenceThetaPct->setSuffix(tr("% of wrap")); _influenceThetaPct->setValue(50);
-    _influenceThetaPct->setToolTip(tr("Max influence half-extent along the wrap, as a fraction of a full turn"));
-    _influenceAnchorWeight = new QDoubleSpinBox(outputContents);
-    _influenceAnchorWeight->setRange(0.0, 10000.0); _influenceAnchorWeight->setDecimals(1); _influenceAnchorWeight->setValue(20.0);
-    _influenceAnchorWeight->setToolTip(tr("Weight of the loss holding the fit in place outside the influence region"));
     _runTag = new QLineEdit(outputContents);
     _advancedProfiles = new SpiralConfigProfileEditor(outputContents);
     _advanced = _advancedProfiles->textEdit();
@@ -456,11 +439,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     outputForm->addRow(tr("Run tag"), _runTag);
     outputForm->addRow(tr("Render-volume scale"), _renderVolumeScale);
     outputForm->addRow(_savePngVisualizations);
-    outputForm->addRow(_influenceEnabled);
-    outputForm->addRow(tr("Influence z extent"), _influenceZ);
-    outputForm->addRow(tr("Influence windings"), _influenceWindings);
-    outputForm->addRow(tr("Influence theta"), _influenceThetaPct);
-    outputForm->addRow(tr("Influence anchor weight"), _influenceAnchorWeight);
     outputForm->addRow(tr("Advanced config JSON"), _advancedProfiles);
 
     auto* displayGroup = makeSection(tr("Display"),
@@ -1274,7 +1252,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             {QStringLiteral("last_fraction"),
              _dtLossLastPct->value() / 100.0},
         };
-        _service->runIterations(_iterations->value(), influenceConfig(),
+        _service->runIterations(_iterations->value(),
                                 runAdvancedConfig(), dtLossSchedule,
                                 previewSchedule);
     });
@@ -1938,34 +1916,6 @@ QJsonObject SpiralPanel::sessionRequest() const
     };
 }
 
-QJsonObject SpiralPanel::influenceConfig() const
-{
-    const QJsonDocument advanced =
-        QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
-    QJsonObject config;
-    if (advanced.isObject()) {
-        const QJsonObject all = advanced.object();
-        for (auto it = all.begin(); it != all.end(); ++it) {
-            if (it.key().startsWith(QStringLiteral("influence_"))
-                || it.key() == QStringLiteral("loss_weight_anchor"))
-                config[it.key()] = it.value();
-        }
-    }
-    config[QStringLiteral("influence_enabled")] =
-        _influenceEnabled->isChecked();
-    if (_influenceEnabled->isChecked()) {
-        config[QStringLiteral("influence_z")] =
-            static_cast<double>(_influenceZ->value());
-        config[QStringLiteral("influence_windings")] =
-            _influenceWindings->value();
-        config[QStringLiteral("influence_theta_frac")] =
-            _influenceThetaPct->value() / 100.0;
-        config[QStringLiteral("loss_weight_anchor")] =
-            _influenceAnchorWeight->value();
-    }
-    return config;
-}
-
 QJsonObject SpiralPanel::sessionAdvancedConfig() const
 {
     const QJsonDocument advanced =
@@ -1986,15 +1936,8 @@ QJsonObject SpiralPanel::sessionAdvancedConfig() const
                && advanced.isObject()) {
         config = advanced.object();
     }
-    for (auto it = config.begin(); it != config.end();) {
-        if (it.key().startsWith(QStringLiteral("influence_"))
-            || it.key() == QStringLiteral("loss_weight_anchor")
-            || it.key() == QStringLiteral("z_begin")
-            || it.key() == QStringLiteral("z_end"))
-            it = config.erase(it);
-        else
-            ++it;
-    }
+    config.remove(QStringLiteral("z_begin"));
+    config.remove(QStringLiteral("z_end"));
     return config;
 }
 
@@ -2004,13 +1947,6 @@ QJsonObject SpiralPanel::runAdvancedConfig() const
         QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
     if (!advanced.isObject()) return {};
     QJsonObject config = advanced.object();
-    for (auto it = config.begin(); it != config.end();) {
-        if (it.key().startsWith(QStringLiteral("influence_"))
-            || it.key() == QStringLiteral("loss_weight_anchor"))
-            it = config.erase(it);
-        else
-            ++it;
-    }
     // The dedicated vertical-fiber offset controls override the profile for
     // their keys, as they do in sessionRequest(). The run-boundary filter
     // below drops them again against a service that still advertises them
@@ -2636,11 +2572,6 @@ void SpiralPanel::persist() const
                       _verticalFiberOffsetEnabled->isChecked());
     settings.setValue(prefix + "vertical_fiber_offset_voxels",
                       _verticalFiberOffsetVoxels->value());
-    settings.setValue(prefix + "influence_enabled", _influenceEnabled->isChecked());
-    settings.setValue(prefix + "influence_z", _influenceZ->value());
-    settings.setValue(prefix + "influence_windings", _influenceWindings->value());
-    settings.setValue(prefix + "influence_theta_pct", _influenceThetaPct->value());
-    settings.setValue(prefix + "influence_anchor_weight", _influenceAnchorWeight->value());
     settings.setValue(prefix + "iterations", _iterations->value());
     settings.setValue(prefix + "dt_loss_schedule_enabled",
                       _dtLossScheduleEnabled->isChecked());
@@ -2702,12 +2633,6 @@ void SpiralPanel::restore()
     _verticalFiberOffsetVoxels->setValue(
         settings.value(valuePrefix + "vertical_fiber_offset_voxels", 4.0).toDouble());
     _verticalFiberOffsetVoxels->setEnabled(_verticalFiberOffsetEnabled->isChecked());
-    _influenceEnabled->setChecked(settings.value(valuePrefix + "influence_enabled", false).toBool());
-    _influenceZ->setValue(settings.value(valuePrefix + "influence_z", 3000).toInt());
-    _influenceWindings->setValue(settings.value(valuePrefix + "influence_windings", 5.0).toDouble());
-    _influenceThetaPct->setValue(settings.value(valuePrefix + "influence_theta_pct", 50).toInt());
-    _influenceAnchorWeight->setValue(
-        settings.value(valuePrefix + "influence_anchor_weight", 20.0).toDouble());
     _iterations->setValue(settings.value(valuePrefix + "iterations", 100).toInt());
     _dtLossScheduleEnabled->setChecked(
         settings.value(valuePrefix + "dt_loss_schedule_enabled", false).toBool());

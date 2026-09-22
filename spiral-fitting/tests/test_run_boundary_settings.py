@@ -181,8 +181,7 @@ def test_fiber_spacing_reloads_the_documents_and_refuses_missing_ones(tmp_path):
         {'pcl_fiber_min_point_spacing': 5.0}, current_iteration=0)
     context.prepare_input_changes.assert_called_once_with(
         [{'kind': 'fiber', 'path': str(present), 'id': 'present', 'source_id': 'present',
-          'revision': 'abc'}],
-        influence_config={'influence_enabled': False})
+          'revision': 'abc'}])
 
 
 @pytest.mark.parametrize('exponential', [False, True])

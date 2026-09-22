@@ -52,7 +52,7 @@ from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADAT
                          AutosaveError, PclRole, SessionState, SpiralInputPaths,
                          resolve_dataset_root, select_startup_autosave,
                          validate_autosave, write_autosave_metadata)
-from config import BACKFILLABLE_CONFIG_DEFAULTS, Config, durable_config
+from config import BACKFILLABLE_CONFIG_DEFAULTS, Config
 
 
 class FakeSession:
@@ -111,9 +111,9 @@ class FakeSession:
             "progress": self.progress,
         }
 
-    def run(self, count, influence_config=None, run_config=None, path_changes=None,
+    def run(self, count, run_config=None, path_changes=None,
             autosave_on_pause=True, preview_schedule=None, dt_loss_schedule=None):
-        self.run_calls.append((count, dict(influence_config or {}), dict(run_config or {})))
+        self.run_calls.append((count, dict(run_config or {})))
         self.path_change_calls.append(dict(path_changes or {}))
         self.autosave_calls.append(autosave_on_pause)
         self.preview_schedules.append(copy.deepcopy(preview_schedule))
@@ -263,7 +263,6 @@ def _planned_run(state, request):
     return state.run({
         "configuration": configuration,
         "iterations": request.pop("iterations"),
-        "influence": request.pop("influence_config", {}),
         "dt_loss_schedule": request.pop("dt_loss_schedule", {
             "enabled": False, "last_fraction": 0.25}),
         "expected_session_revision": state.session_revision,
@@ -1460,9 +1459,9 @@ class DatasetOwnershipTests(unittest.TestCase):
 
         path = self.output / name
         torch.save({
-            # Checkpoints store the durable subset of the schema, and the
-            # refusal analysis compares against exactly that subset.
-            "schema_version": 2, "cfg": durable_config(cfg),
+            # Checkpoints store the full configuration schema, and the
+            # refusal analysis compares key sets against exactly that schema.
+            "schema_version": 2, "cfg": dict(cfg),
             "input_manifest": {"dataset_root": str(
                 self.root if dataset_root is None else dataset_root)},
         }, path)
@@ -1633,7 +1632,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         import torch
         torch.save({
             "schema_version": 2,
-            "cfg": durable_config({**Config().as_dict(), **_NO_DENSE_LOSSES}),
+            "cfg": {**Config().as_dict(), **_NO_DENSE_LOSSES},
             "input_manifest": {"dataset_root": str(self.root)},
         }, checkpoint)
 
@@ -2286,59 +2285,6 @@ class UploadTests(unittest.TestCase):
         self.assertIsNone(status["same_winding_artifact"])
         self.assertEqual(status["relative_winding_artifact"]["id"], ref["id"])
 
-    def test_run_passes_and_validates_transient_influence_config(self):
-        session = self._session()
-        influence = {
-            "influence_enabled": True,
-            "influence_z": 1200,
-            "influence_windings": 2.5,
-            "influence_theta_frac": 0.2,
-            "influence_sigma": 0.25,
-            "sample_count_influence_footprint_points": 512,
-            "sample_count_influence_anchor_lattice_points": 2000,
-            "sample_count_influence_anchor_geometry_points": 1000,
-            "sample_count_influence_anchor_samples_per_step": 128,
-            "influence_anchor_ramp_power": 3.0,
-            "loss_weight_anchor": 15.0,
-        }
-        _planned_run(self.state, {"iterations": 10, "influence_config": influence})
-        self.assertEqual(session.run_calls[-1][1], influence)
-
-        with self.assertRaises(ApiError) as caught:
-            _planned_run(self.state, {"iterations": 10, "influence_config": {
-                "influence_theta_frac": 1.5,
-            }})
-        self.assertEqual(caught.exception.status, 400)
-
-    def test_run_ignores_and_reports_unknown_influence_keys(self):
-        session = self._session()
-        influence = {"influence_enabled": True, "influence_z": 1200,
-                     "influence_disable_dt_frac": 0.4,
-                     "future_unknown_setting": "obsolete"}
-        with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
-            result = _planned_run(self.state, {
-                "iterations": 10,
-                "influence_config": influence,
-            })
-        self.assertTrue(result["accepted"])
-        self.assertEqual(session.run_calls[-1][1], {
-            "influence_enabled": True, "influence_z": 1200})
-        self.assertEqual(self.state._active_run_influence, {
-            "influence_enabled": True, "influence_z": 1200})
-        warning = ("Ignoring unknown influence configuration keys: "
-                   "['future_unknown_setting', 'influence_disable_dt_frac']")
-        self.assertIn(warning, output.getvalue())
-        self.assertTrue(any(
-            event["text"] == warning and event["severity"] == "warning"
-            for event in self.state.events.read_after(0)["events"]))
-        self.assertIn("influence_disable_dt_frac", influence)
-
-        # Ignored keys cannot hide invalid values of known settings.
-        with self.assertRaisesRegex(ApiError, "influence_theta_frac must be between"):
-            _planned_run(self.state, {
-                "iterations": 10, "influence_config": {
-                    **influence, "influence_theta_frac": 1.5}})
-
     def test_run_requires_validates_and_propagates_dt_loss_schedule(self):
         session = self._session()
         for schedule in (
@@ -2356,7 +2302,6 @@ class UploadTests(unittest.TestCase):
         base = {
             "configuration": dict(Config.catalog()["defaults"]),
             "iterations": 10,
-            "influence": {},
             "expected_session_revision": self.state.session_revision,
         }
         invalid = (
@@ -2389,14 +2334,13 @@ class UploadTests(unittest.TestCase):
             result = self.state.run({
                 "configuration": configuration,
                 "iterations": 10,
-                "influence": {},
                 "dt_loss_schedule": {
                     "enabled": False, "last_fraction": 0.25},
                 "expected_session_revision": self.state.session_revision,
             })
         self.assertTrue(result["accepted"])
-        self.assertNotIn("influence_disable_dt_frac", session.run_calls[-1][2])
-        self.assertNotIn("future_unknown_setting", session.run_calls[-1][2])
+        self.assertNotIn("influence_disable_dt_frac", session.run_calls[-1][1])
+        self.assertNotIn("future_unknown_setting", session.run_calls[-1][1])
         warning = ("Ignoring unknown run configuration keys: "
                    "['future_unknown_setting', 'influence_disable_dt_frac']")
         self.assertIn(warning, output.getvalue())
@@ -2427,7 +2371,7 @@ class UploadTests(unittest.TestCase):
 
         response = _planned_run(self.state, {"iterations": 10, "run_config": config})
 
-        self.assertEqual(session.run_calls[-1][2], config)
+        self.assertEqual(session.run_calls[-1][1], config)
         self.assertEqual(response["run_config"]["sample_count_patches_per_step"], 240)
 
         with self.assertRaisesRegex(ApiError, "requires rebuilding"):
@@ -2451,7 +2395,7 @@ class UploadTests(unittest.TestCase):
             "sample_count_fiber_direction_points": 0,
         }})
 
-        self.assertEqual(session.run_calls[-1][2], {
+        self.assertEqual(session.run_calls[-1][1], {
             "sample_count_fiber_direction_points": 0,
         })
         self.assertEqual(response["run_config"]["sample_count_fiber_direction_points"], 0)

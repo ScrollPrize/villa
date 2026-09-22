@@ -19,7 +19,7 @@ from spiral_runtime import create_session
 from tifxyz import load_tifxyz
 
 
-def make_real_revision_session(tmp_path, influence=False):
+def make_real_revision_session(tmp_path):
     source = Path(os.environ['SPIRAL_REVISION_LIVE_DATASET'])
     patch_name = os.environ['SPIRAL_REVISION_PATCH']
     source_patch = source / 'verified_patches' / patch_name
@@ -49,7 +49,7 @@ def make_real_revision_session(tmp_path, influence=False):
         'sample_count_points_per_patch': 32, 'sample_count_regularisation_points': 64,
         'sample_count_shell_samples': 64,
         'sample_count_minimum_spacing_independent_samples': 64,
-        'output_save_png_visualizations': False, 'influence_enabled': influence,
+        'output_save_png_visualizations': False,
     }
     paths = SpiralInputPaths(dataset_root=str(dataset),
                              umbilicus=str(dataset / 'umbilicus.json'),
@@ -64,9 +64,8 @@ def make_real_revision_session(tmp_path, influence=False):
 
 @pytest.mark.skipif(not os.environ.get('SPIRAL_REVISION_LIVE_DATASET'),
                     reason='set SPIRAL_REVISION_LIVE_DATASET to opt into CUDA fitting')
-@pytest.mark.parametrize("influence", [False, True])
-def test_real_patch_revision_boundaries(tmp_path, influence):
-    source_patch, source_digest, dataset, baseline, replacement, patch, config, session = make_real_revision_session(tmp_path, influence)
+def test_real_patch_revision_boundaries(tmp_path):
+    source_patch, source_digest, dataset, baseline, replacement, patch, config, session = make_real_revision_session(tmp_path)
     report = {'source': str(source_patch), 'config': config, 'boundaries': []}
 
     def wait_idle():
@@ -171,5 +170,5 @@ def test_real_patch_revision_boundaries(tmp_path, influence):
         session.close(timeout=30)
         report_path = os.environ.get('SPIRAL_REVISION_LIVE_REPORT')
         if report_path:
-            Path(report_path).with_suffix(f'.influence-{int(influence)}.json').write_text(
+            Path(report_path).write_text(
                 json.dumps(report, indent=2))

@@ -21,7 +21,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import fit_spiral
-from config import BACKFILLABLE_CONFIG_DEFAULTS, Config, durable_config
+from config import BACKFILLABLE_CONFIG_DEFAULTS, Config
 from fit_session import SessionState
 from spiral_progress import NullProgressReporter
 import spiral_runtime
@@ -76,7 +76,7 @@ def _checkpoint(**overrides):
         "spiral_and_transform": dict(MODEL_STATE),
         "optimiser": copy.deepcopy(OPTIMISER_STATE),
         "scheduler": dict(SCHEDULER_STATE),
-        "cfg": durable_config(CONFIG),
+        "cfg": dict(CONFIG),
         "lasagna_scale": 4,
         "lasagna_group": "4",
         "spiral_outward_sense": "CW",
@@ -196,26 +196,26 @@ class CheckpointPreflightTests(unittest.TestCase):
         self.assertFalse(_inspect(undeclared).accepted)
 
     def test_structural_configuration_invariants(self):
-        unknown = _checkpoint(cfg={**durable_config(CONFIG), "who_am_i": 1})
+        unknown = _checkpoint(cfg={**dict(CONFIG), "who_am_i": 1})
         self.assertIn("does not match the current schema",
                       _inspect(unknown).message())
         removed = _checkpoint(cfg={
-            **durable_config(CONFIG), "influence_disable_dt_frac": 0.75})
+            **dict(CONFIG), "influence_disable_dt_frac": 0.75})
         self.assertIn("influence_disable_dt_frac", _inspect(removed).message())
-        incomplete = durable_config(CONFIG)
+        incomplete = dict(CONFIG)
         del incomplete["optimizer_learning_rate"]
         self.assertIn("optimizer_learning_rate",
                       _inspect(_checkpoint(cfg=incomplete)).message())
         # z_begin/z_end joined the schema late and are session-owned anyway.
-        carve_out = durable_config(CONFIG)
+        carve_out = dict(CONFIG)
         carve_out.pop("z_begin", None)
         carve_out.pop("z_end", None)
         self.assertTrue(_inspect(_checkpoint(cfg=carve_out)).accepted)
-        pre_toggles = durable_config(CONFIG)
+        pre_toggles = dict(CONFIG)
         for key in BACKFILLABLE_CONFIG_DEFAULTS:
             pre_toggles.pop(key)
         self.assertTrue(_inspect(_checkpoint(cfg=pre_toggles)).accepted)
-        shaped = durable_config(CONFIG)
+        shaped = dict(CONFIG)
         shaped["model_flow_bounds_radius"] = (
             int(shaped["model_flow_bounds_radius"]) + 1)
         verdict = _inspect(_checkpoint(cfg=shaped))

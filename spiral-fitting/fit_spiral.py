@@ -21,7 +21,6 @@ try:
     import resource
 except ImportError:  # pragma: no cover - unavailable on Windows
     resource = None
-from collections import defaultdict
 from collections.abc import Mapping
 import zarr
 import torch
@@ -48,7 +47,7 @@ from ddp_helpers import (
     process_context,
 )
 from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
-                    RETIRED_CONFIG_KEYS, Config, FitConfig, SHELL_ATLAS_KEYS, durable_config)
+                    RETIRED_CONFIG_KEYS, Config, FitConfig, SHELL_ATLAS_KEYS)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    merge_flow_stage_lattices)
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, EDITABLE_PCL_ROLE_VALUES,
@@ -75,7 +74,6 @@ def _startup_resource_suffix(started_at=None):
 from lasagna_data import ensure_fit_sparse_stores, prepare_lasagna_volume
 from checkpoint_io import load_checkpoint_cpu, model_state_sha256
 from fiber_direction_samples import load_fiber_direction_samples
-from influence import make_influence_state, subsample_rows
 from spiral_sampling import load_spiral_sampling
 from tifxyz import load_tifxyz, patch_from_payload
 from geom_utils import bilinear_atlas_lookup, interp1d
@@ -792,12 +790,12 @@ def longest_run_in_z_window(sorted_items, z_begin, z_end, z_margin):
     return sorted_items[best_start:best_end]
 
 
-def _logical_identity(record):
-    """Return an editable PCL's role-scoped logical identity, if present."""
-    kind = record.get('logical_input_kind')
-    if kind is None:
-        return None
-    return (kind, str(record.get('logical_input_id')))
+def subsample_rows(points, max_points, generator):
+    """Deterministically keep at most ``max_points`` rows of ``points``."""
+    if points.shape[0] <= max_points:
+        return points
+    order = torch.randperm(points.shape[0], generator=generator)[:max_points]
+    return points[order.sort().values]
 
 
 def regular_unattached_strip(pcl_id, pcl, min_point_spacing):
@@ -1276,21 +1274,6 @@ def realign_optimizer_lr_schedule(
     lr_scheduler._last_lr = aligned_lrs
     lr_scheduler._step_count = completed + 1
     return lr_scheduler, horizon
-
-
-def _query_near_trusted_geometry(points_np, trusted_geometry_tree, threshold):
-    # Returns True for each point with at least one trusted-geometry anchor
-    # within `threshold`. query returns dist == inf for misses. Respect the
-    # process CPU budget configured from FIT_SPIRAL_NUM_THREADS instead of
-    # letting scipy consume every host CPU via workers=-1.
-    points_np = np.ascontiguousarray(points_np, dtype=np.float32)
-    dist, _ = trusted_geometry_tree.query(
-        points_np,
-        k=1,
-        distance_upper_bound=float(threshold),
-        workers=torch.get_num_threads(),
-    )
-    return np.isfinite(dist)
 
 
 class FitContext:
@@ -2017,8 +2000,7 @@ class FitContext:
         Seeds the host RNG streams, then loads patches, point collections,
         fibers, tracks, and the outer shell; links and classifies PCLs;
         builds the sampling caches, host-prepared patch atlases, the
-        trusted-geometry index, the interactive influence anchor stash and
-        the whole-object DT target samples. Requires no device state: the
+        trusted-geometry index and the whole-object DT target samples. Requires no device state: the
         patch atlases are moved as part of device-state setup, and the CUDA
         stores, model, and optimiser are built later by
         build_device_state().
@@ -2037,8 +2019,7 @@ class FitContext:
           fiber_catalog, link_distance_tolerance, resolved_links, link_components,
           unattached_components / _component_groups / _component_edges
         - sampling: patch_sampling_probabilities, patch_atlas
-        - trusted geometry: trusted_geometry_tree,
-          influence_anchor_geometry
+        - trusted geometry: trusted_geometry_tree
         - tracks: tracks, track_families, track_source_ids,
           track_crossing_cache, track_graph, track_reload_source /
           _families / _source_ids, track_sampling_config, using_tracks,
@@ -2368,24 +2349,10 @@ class FitContext:
         self.using_tracks = using_tracks
         self.trusted_geometry_tree = trusted_geometry_tree
 
-        # A compact subsample of the trusted cloud seeds a future Run's
-        # influence anchor bank. Keep it for every interactive session because
-        # influence can be enabled or disabled independently on each Run
-        # request. The generator is seeded explicitly, so the stash is
-        # deterministic without perturbing the training RNG streams.
-        self.influence_anchor_geometry = None
-        if self.interactive_driver is not None:
-            stash_generator = torch.Generator()
-            stash_generator.manual_seed(int(self.config['optimizer_random_seed']))
-            self.influence_anchor_geometry = subsample_rows(
-                verified_patches_and_pcls_cpu,
-                int(self.config['sample_count_influence_anchor_geometry_points']),
-                stash_generator,
-            ).clone()
-        # The trusted cloud itself stays local: the cKDTree above and that
-        # stash are all anything downstream reads it for, and consuming it
-        # here rather than in build_device_state() is what leaves the device
-        # stages with nothing of the host's to release.
+        # The trusted cloud itself stays local: the cKDTree above is all
+        # anything downstream reads it for, and consuming it here rather
+        # than in build_device_state() is what leaves the device stages
+        # with nothing of the host's to release.
         del verified_patches_and_pcls_cpu, verified_patches_and_pcls_np
 
         # ==========================================================================
@@ -2502,19 +2469,12 @@ class FitContext:
 
 
     def _refresh_trusted_geometry(self):
-        """Rebuild the trusted-geometry tree and the influence anchor seed
-        from the active patches and strips (both read the strips)."""
+        """Rebuild the trusted-geometry tree from the active patches and strips."""
         trusted = self._trusted_geometry_from_active_inputs()
         trusted_np = np.ascontiguousarray(
             trusted.cpu().numpy(), dtype=np.float32)
         self.trusted_geometry_tree = (
             cKDTree(trusted_np) if len(trusted_np) else None)
-        generator = torch.Generator().manual_seed(
-            int(self.config['optimizer_random_seed']))
-        self.influence_anchor_geometry = subsample_rows(
-            trusted,
-            int(self.config['sample_count_influence_anchor_geometry_points']),
-            generator).clone()
 
 
     def _commit_rederived_pcl_views(self, cross_patch, strips, strip_groups,
@@ -3178,22 +3138,10 @@ class FitContext:
                                 attachment['id'] in rejected_verified):
                             del point['on_patch']
 
-        if rejected_verified:
-            # Future interactive masking and influence anchors must not retain
-            # geometry from a patch that the consistency gate rejected.
-            if self.interactive_driver is not None:
-                trusted = self._trusted_geometry_from_active_inputs()
-                trusted_np = np.ascontiguousarray(
-                    trusted.numpy(), dtype=np.float32)
-                self.trusted_geometry_tree = (
-                    cKDTree(trusted_np) if trusted_np.shape[0] else None)
-                generator = torch.Generator().manual_seed(
-                    int(self.config['optimizer_random_seed']))
-                self.influence_anchor_geometry = subsample_rows(
-                    trusted,
-                    int(self.config['sample_count_influence_anchor_geometry_points']),
-                    generator,
-                ).clone()
+        if rejected_verified and self.interactive_driver is not None:
+            # Track exclusion masks prepared later must not retain geometry
+            # from a patch that the consistency gate rejected.
+            self._refresh_trusted_geometry()
 
         if hasattr(self, 'dt_target_cache_manager'):
             self.dt_target_cache_manager.reset()
@@ -3395,11 +3343,6 @@ class FitContext:
         # _apply_flow_group_settings), which keeps AdamW's state format.
         self.optimiser = LazyMomentAdamW(param_groups, lr=self.config['optimizer_learning_rate'], betas=(0.9, 0.999), eps=1.e-8, fused=True)
         self._report_flow_grad_conditioning()
-        # Influence masks are scoped to one interactive Run request. They are
-        # created from that run's pending inputs and discarded before its autosave.
-        self.influence_state = None
-        self.interactive_influence_loss_weight = 0.0
-        self.interactive_influence_anchor_samples = 0
         if self.config['optimizer_exp_lr_schedule']:
             gamma = self.config['optimizer_lr_final_factor'] ** (1.0 / max(1, self.num_training_steps))
             self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimiser, gamma=gamma)
@@ -3562,8 +3505,7 @@ class FitContext:
         'shell_valid_zyxs_gpu', 'shell_outer_winding_idx',
         '_dense_inactive_warned', 'low_res_flow_params',
         'high_res_flow_params', 'gap_expander_params', 'optimiser',
-        'influence_state', 'interactive_influence_loss_weight',
-        'interactive_influence_anchor_samples', 'lr_scheduler', 'profiler',
+        'lr_scheduler', 'profiler',
         'slice_to_spiral_transform', 'dr_per_winding',
         'dt_target_cache_manager', 'dist_grad_params', 'dist_grad_named',
         'step_timer', 'nonfinite_grad_steps', 'nonfinite_grad_by_param',
@@ -3621,10 +3563,10 @@ class FitContext:
             'spiral_and_transform': self.spiral_and_transform.state_dict(),
             'optimiser': self.optimiser.state_dict(),
             'scheduler': self.lr_scheduler.state_dict(),
-            'cfg': durable_config(self.config),
-            'requested_config': durable_config(
+            'cfg': dict(self.config),
+            'requested_config': dict(
                 getattr(self.interactive_driver, 'requested_config', dict(self.config))),
-            'resolved_config': durable_config(self.config),
+            'resolved_config': dict(self.config),
             'lasagna_scale': self.lasagna_scale,
             'lasagna_group': self.normal_zarr_group,
             'base_shape_zyx': (
@@ -3788,14 +3730,13 @@ class FitContext:
         # --- structural configuration -------------------------------------
         checkpoint_cfg = checkpoint.get('cfg')
         if isinstance(checkpoint_cfg, Mapping):
-            # Checkpoints store the durable subset of the schema, so the key
-            # set compares against that subset. z_begin/z_end joined the schema
-            # after many checkpoints were written and are owned by the session
-            # request either way, so exactly those two may be absent; a
-            # retired key is dropped, not refused (config.RETIRED_CONFIG_KEYS).
-            durable_schema = set(durable_config(dict(self.config)))
-            unknown = set(checkpoint_cfg) - durable_schema - RETIRED_CONFIG_KEYS
-            missing = durable_schema - set(checkpoint_cfg) - (
+            # z_begin/z_end joined the schema after many checkpoints were
+            # written and are owned by the session request either way, so
+            # exactly those two may be absent; a retired key is dropped, not
+            # refused (config.RETIRED_CONFIG_KEYS).
+            schema = set(self.config)
+            unknown = set(checkpoint_cfg) - schema - RETIRED_CONFIG_KEYS
+            missing = schema - set(checkpoint_cfg) - (
                 {'z_begin', 'z_end'} | set(BACKFILLABLE_CONFIG_DEFAULTS))
             if unknown or missing:
                 reasons.append(
@@ -3999,21 +3940,6 @@ class FitContext:
         ), axis=-1).to(self.device) * self.render_volume_scale
         return zs, yx, scroll_slices, prediction_slices, quad_labels
 
-    def clear_interactive_influence(self):
-        """End the current Run request's localization window.
-
-        Called by the runtime when an interactive Run reaches its target, and
-        defensively before a new incorporation begins.
-        """
-        if self.influence_state is None:
-            self.interactive_influence_loss_weight = 0.0
-            self.interactive_influence_anchor_samples = 0
-            return
-        self.influence_state.deactivate_(self.spiral_and_transform, self.optimiser)
-        self.influence_state = None
-        self.interactive_influence_loss_weight = 0.0
-        self.interactive_influence_anchor_samples = 0
-
     def _preview_splice_evaluation(self, live_transform, dr_per_winding,
                                    progress):
         """The patch-satisfaction evaluation the preview splice reads.
@@ -4061,12 +3987,11 @@ class FitContext:
                 f'{int(requested_iterations)} requested iterations)')
 
     def clear_dt_loss_schedule(self):
-        """Remove the transient DT window without touching localization."""
+        """Remove the transient DT window."""
         self.run_dt_resume_iteration = None
 
     def clear_interactive_run_state(self):
         """Clear every transient state installed for one interactive Run."""
-        self.clear_interactive_influence()
         self.clear_dt_loss_schedule()
 
     def export_preview(self, generation_path, surface_id, *, diagnostics=False):
@@ -4269,7 +4194,7 @@ class FitContext:
             f'{reserved_after / gib:.2f} GiB still reserved)',
             flush=True)
 
-    def prepare_input_changes(self, records, influence_config=None, *,
+    def prepare_input_changes(self, records, *,
                               current_iteration=0, target_iteration=0):
         """Prepare a complete revision batch without changing active state.
 
@@ -4294,7 +4219,6 @@ class FitContext:
             }
             candidate._workspace_membership = dict(getattr(self, '_workspace_membership', {}))
             candidate.next_id = self.next_id
-            changed_patches, changed_points, removed = {}, {}, []
             seen = set()
             for record in records:
                 logical_id = str(record['id'])
@@ -4317,7 +4241,6 @@ class FitContext:
                             'resident_id', source_id)
                     if deleted:
                         source.pop(patch_id, None)
-                        removed.extend([('patch', logical_id), ('patch', patch_id)])
                     elif not adopt:
                         # Baseline adoption only binds workspace identities.
                         # The initial loader already selected usable geometry
@@ -4333,7 +4256,6 @@ class FitContext:
                             reason = 'has no valid quads' if not valid else 'is outside the fitted z range'
                             raise ValueError(f'Patch {logical_id} {reason}')
                         source[patch_id] = patch
-                        changed_patches[logical_id] = patch
                     resident_id = patch_id
                 elif kind in {'pcl', 'fiber'}:
                     source = candidate._source_point_collections
@@ -4357,9 +4279,7 @@ class FitContext:
                         resident_id = candidate.next_id
                         candidate.next_id += 1
                     if deleted:
-                        old = source.pop(resident_id, None)
-                        if old:
-                            removed.append(_logical_identity(old.get('metadata', {})))
+                        source.pop(resident_id, None)
                     elif adopt and kind == 'fiber' and resident_id not in source:
                         # Preserve startup exclusions (including disabled or
                         # malformed fibers) while retaining workspace identity.
@@ -4395,8 +4315,6 @@ class FitContext:
                             'logical_input_revision': record.get('revision'),
                         })
                         source[resident_id] = pcl
-                        if not adopt:
-                            changed_points[resident_id] = pcl
                 else:
                     raise ValueError(f'Unknown input kind {kind!r}')
                 candidate._workspace_membership[logical_id] = {
@@ -4429,10 +4347,6 @@ class FitContext:
                 candidate._derive_point_inputs(
                     candidate.verified_patches, points, fibers,
                     direction_source=candidate._desired_fiber_link_direction_source(current_iteration))
-                changed_points = {cid: points[cid] for cid in changed_points if cid in points}
-                changed_patches = {logical_id: patch for logical_id, patch in changed_patches.items()
-                                   if candidate._workspace_membership[logical_id]['resident_id']
-                                   in candidate.verified_patches}
                 candidate._refresh_trusted_geometry()
                 if self.dt_target_whole_object:
                     prepare_patch_dt_target_samples(
@@ -4468,50 +4382,7 @@ class FitContext:
                 # Theta rejection can detach points. Re-derive the point inputs
                 # from their immutable sources before accepting this candidate,
                 # with rejected patches excluded.
-            active_point_ids = set(candidate.regular_pcl_catalog)
-            active_point_ids.update(pcl['id'] for pcl in candidate.fiber_catalog.values())
-            for cid, pcl in self._source_point_collections.items():
-                if cid not in active_point_ids:
-                    identity = _logical_identity(pcl.get('metadata', {}))
-                    if identity is not None:
-                        removed.append(identity)
-            for patch_id in set(self.verified_patches) - set(candidate.verified_patches):
-                removed.append(('patch', patch_id))
-                removed.extend(('patch', logical_id) for logical_id, member in
-                               getattr(self, '_workspace_membership', {}).items()
-                               if member['kind'] == 'patch' and member['resident_id'] == patch_id)
-
-            # Prepare optimizer momentum/weight-decay changes privately too.
-            # Parameter tensors, second moments and the trained model stay shared.
-            candidate.optimiser = copy.copy(self.optimiser)
-            candidate.optimiser.param_groups = [dict(group) for group in self.optimiser.param_groups]
-            candidate.optimiser.state = (defaultdict(self.optimiser.state.default_factory)
-                                         if isinstance(self.optimiser.state, defaultdict) else {})
-            cfg = dict(self.config)
-            cfg.update(influence_config or {})
-            if self.influence_state is not None or cfg['influence_enabled']:
-                for parameter, state in self.optimiser.state.items():
-                    candidate.optimiser.state[parameter] = dict(state)
-                    if 'exp_avg' in state:
-                        candidate.optimiser.state[parameter]['exp_avg'] = state['exp_avg'].clone()
-                candidate.influence_state = copy.deepcopy(self.influence_state)
-                if candidate.influence_state is not None and removed:
-                    candidate.influence_state.remove_logical_contributions_(
-                        [identity for identity in removed if identity is not None],
-                        spiral_and_transform=self.spiral_and_transform, optimiser=candidate.optimiser)
-                if cfg['influence_enabled'] and (changed_patches or changed_points):
-                    if candidate.influence_state is None:
-                        candidate.influence_state = make_influence_state(cfg, self.device)
-                    candidate.influence_state.activate_or_extend_(
-                        new_patches=changed_patches, new_collections=changed_points,
-                        spiral_and_transform=self.spiral_and_transform, optimiser=candidate.optimiser,
-                        cfg=cfg, z_begin=self.z_begin, z_end=self.z_end,
-                        anchor_geometry_zyx=candidate.influence_anchor_geometry)
-                    candidate.interactive_influence_loss_weight = float(cfg['loss_weight_anchor'])
-                    candidate.interactive_influence_anchor_samples = int(
-                        cfg['sample_count_influence_anchor_samples_per_step'])
-            else:
-                candidate.optimiser.state = self.optimiser.state
+            # The optimiser, parameter tensors and the trained model stay shared.
             return candidate
         except MissingPclSamplingWeightError as exc:
             # Reject configuration errors without stopping the resident worker.
@@ -4523,11 +4394,9 @@ class FitContext:
 
     def install_input_changes(self, candidate):
         """Install a successfully prepared candidate on the fitter thread."""
-        ignored = {'optimiser', '_preparing_inputs', '_input_warnings'}
+        ignored = {'_preparing_inputs', '_input_warnings'}
         updates = {key: value for key, value in vars(candidate).items()
                    if key not in ignored and value is not getattr(self, key, None)}
-        self.optimiser.state = candidate.optimiser.state
-        self.optimiser.param_groups = candidate.optimiser.param_groups
         self.__dict__.update(updates)
         self._write_non_liftable_patch_report()
         return list(candidate._input_warnings)
@@ -4734,8 +4603,7 @@ class FitContext:
 
     def _reingest_fiber_documents(self, records):
         if records:
-            candidate = self.prepare_input_changes(
-                records, influence_config={'influence_enabled': False})
+            candidate = self.prepare_input_changes(records)
             warnings = self.install_input_changes(candidate)
             for warning in warnings or ():
                 print(f'WARNING: {warning}')
@@ -4932,7 +4800,7 @@ class FitContext:
             role_changes = changed & {pcl_role_toggle_key(role) for role in RUN_MUTABLE_PCL_ROLES}
             if role_changes:
                 candidate = self.prepare_input_changes(
-                    [], {'influence_enabled': False}, current_iteration=current_iteration,
+                    [], current_iteration=current_iteration,
                     target_iteration=current_iteration)
                 self.install_input_changes(candidate)
                 rederived_views = True
@@ -5323,16 +5191,6 @@ class FitContext:
             })
             del shell_outer_loss
 
-        if (self.influence_state is not None and self.influence_state.active
-                and self.interactive_influence_loss_weight > 0):
-            backward_family({
-                'anchor': self.influence_state.get_anchor_loss(
-                    self.slice_to_spiral_transform,
-                    self.dr_per_winding,
-                    self.interactive_influence_anchor_samples,
-                ) * self.interactive_influence_loss_weight,
-            })
-
         loss = sum(losses.values())
 
         self.step_timer.stop('fwd')
@@ -5373,16 +5231,10 @@ class FitContext:
 
         if self.config.get('optimizer_flow_grad_smoothing', False):
             # After the all-reduce (smoothing is linear, and every rank then
-            # smooths identical gradients) and before the influence masks, so
-            # smoothing cannot leak gradient outside a masked region.
+            # smooths identical gradients).
             self.step_timer.start('smooth')
             self.spiral_and_transform.smooth_flow_grad_(*self._flow_grad_smoothing_widths())
             self.step_timer.stop('smooth')
-
-        if self.influence_state is not None and self.influence_state.active:
-            # After the all-reduce and the accumulated-field-grad handoff, so
-            # every rank masks identical averaged gradients on both flow paths.
-            self.influence_state.apply_grad_masks_(self.spiral_and_transform)
 
         # The unset-potential hard error is deferred off the sampler hot path
         # (theta_crossing_map.winding_potentials); resolve every pending
@@ -5392,8 +5244,6 @@ class FitContext:
         self.step_timer.start('opt')
         self.optimiser.step()
         self.step_timer.stop('opt')
-        if self.influence_state is not None and self.influence_state.active:
-            self.influence_state.apply_masked_gap_decay_(self.spiral_and_transform, self.optimiser)
         self.optimiser.zero_grad(set_to_none=True)
         self.lr_scheduler.step()
         self.step_timer.tick()

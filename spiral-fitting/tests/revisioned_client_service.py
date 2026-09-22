@@ -53,7 +53,7 @@ state.export_preview = lambda _: {**state.status(), "accepted": True}
 resident = {}
 
 
-def apply(command, records, influence_config=None):
+def apply(command, records):
     (root / 'applying').write_text(command)
     while (root / 'hold-apply').exists():
         time.sleep(0.01)
@@ -63,7 +63,7 @@ def apply(command, records, influence_config=None):
         context = session._context
         model, optimizer = context.spiral_and_transform, context.optimiser
         torch.cuda.reset_peak_memory_stats()
-        result = original_apply(command, records, influence_config=influence_config)
+        result = original_apply(command, records)
         assert context.spiral_and_transform is model and context.optimiser is optimizer
         boundaries.append({**result, 'peak_allocated_bytes': torch.cuda.max_memory_allocated(),
                            'kinds': [r['kind'] for r in records]})
