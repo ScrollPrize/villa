@@ -59,14 +59,13 @@ def test_input_participation_toggles_are_rebuild_scoped_booleans():
         "input_use_fiber_directions", "input_use_pcl_absolute",
         "input_use_pcl_relative", "input_use_pcl_same_winding",
         "input_use_pcl_drawn_control_points", "input_use_normals",
-        "input_use_surf_sdt", "input_use_gradient_magnitude",
+        "input_use_gradient_magnitude",
         "input_use_winding_inference", "input_use_outer_shell",
     }
     assert {key for key in catalog["defaults"]
             if key.startswith("input_use_")} == expected
     default_off = {
-        "input_use_surf_sdt", "input_use_fiber_directions",
-        "input_use_tracks",
+        "input_use_fiber_directions", "input_use_tracks",
     }
     # The editable point-collection roles (same-winding, relative) have a
     # live add/replace/delete path, so their toggles apply at a Run boundary;
@@ -237,7 +236,7 @@ def test_mapping_and_json_overrides_and_validation(tmp_path):
     with pytest.raises(ValueError, match="Invalid value"):
         Config({"dense_spacing_mode": "unknown"})
     with pytest.raises(ValueError, match="Invalid vector length"):
-        Config({"dense_spacing_pair_m_short": [1]})
+        Config({"winding_model_relative_pair_delta": [1]})
     with pytest.raises(ValueError):
         Config({"track_max_tortuosity": "unlimited"})
 

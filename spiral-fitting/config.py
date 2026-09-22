@@ -22,11 +22,8 @@ _ENUMS = {
     "model_flow_field_type": ["cartesian", "cylindrical", "bspline", "bspline_cylindrical"],
     "track_crossing_mode": ["count", "track_walk"],
     "track_radius_target": ["mean", "median"],
-    "dense_spacing_mode": ["phase", "grad_mag", "winding_model"],
-    "dense_spacing_support_policy": ["product", "minimum"],
+    "dense_spacing_mode": ["grad_mag", "winding_model"],
     "dt_target_mode": ["strip_median", "whole_object_quantile"],
-    "dense_spacing_density_lambda": [
-        "inverse_gap", "soft_mass", "soft_mass_wide"],
 }
 
 _NULL_TYPES = {
@@ -75,12 +72,9 @@ _SCALE_WITH_Z_FIELDS = {
     "sample_count_dense_normal_points",
     "sample_count_fiber_direction_points",
     "sample_count_regularisation_points",
-    "sample_count_dense_spacing_pairs",
-    "sample_count_dense_spacing_density_extra_pairs",
     "sample_count_winding_model_relative_pairs",
     "sample_count_winding_model_density_pairs",
     "sample_count_minimum_spacing_independent_samples",
-    "sample_count_dense_attachment_points",
     "sample_count_shell_samples",
 }
 
@@ -89,8 +83,8 @@ _SCALE_WITH_Z_FIELDS = {
 # every effect so nothing treats them as cheap run-boundary knobs:
 #   - host input filtering: patches, PCLs, unattached strips, and tracks are
 #     loaded/kept only where they intersect [z_begin, z_end);
-#   - dense-store coverage: the Lasagna normal/grad-mag and surf-SDT brick
-#     pools are materialised for exactly this z window;
+#   - dense-store coverage: the Lasagna normal/grad-mag brick pools are
+#     materialised for exactly this z window;
 #   - count scaling: every scale_with_z sample count is scaled by the number
 #     of slices in the range relative to the 9500-slice reference;
 #   - rendering/preview: the preview/export z window and the output-directory
@@ -134,8 +128,6 @@ _INPUT_TOGGLE_DESCRIPTIONS = {
         "Load drawn-control-point point-collection inputs.",
     "input_use_normals":
         "Allow dense normal stores, sampling, and normal-dependent losses.",
-    "input_use_surf_sdt":
-        "Allow the surface-SDT store and SDT-dependent phase losses.",
     "input_use_gradient_magnitude":
         "Allow gradient-magnitude dense-spacing supervision.",
     "input_use_winding_inference":
@@ -653,14 +645,9 @@ class Config:
         self.sample_count_dense_normal_points = 60000
         self.sample_count_fiber_direction_points = 60000
         self.sample_count_regularisation_points = 4500
-        self.sample_count_dense_spacing_pairs = 12000
-        self.sample_count_dense_spacing_count_extra_pairs = 0
-        self.sample_count_dense_spacing_density_extra_pairs = 24000
-        self.sample_count_dense_spacing_density_chunk_pairs = 24000
         self.sample_count_winding_model_relative_pairs = 128000
         self.sample_count_winding_model_density_pairs = 128000
         self.sample_count_minimum_spacing_independent_samples = 2000
-        self.sample_count_dense_attachment_points = 20000
         self.sample_count_patch_dt_target_points = 256
         self.sample_count_dt_target_points_per_strip = 512
         self.sample_count_shell_samples = 24576
@@ -686,7 +673,6 @@ class Config:
         self.input_use_pcl_same_winding = True
         self.input_use_pcl_drawn_control_points = True
         self.input_use_normals = True
-        self.input_use_surf_sdt = False
         self.input_use_gradient_magnitude = True
         self.input_use_winding_inference = True
         self.input_use_outer_shell = True
@@ -784,44 +770,8 @@ class Config:
         self.dense_spacing_mode = "winding_model"
         self.winding_model_relative_pair_delta = [3, 15]
         self.winding_model_huber_delta = 0.5
-        self.dense_spacing_pair_m_short = [
-            3,
-            7
-        ]
-        self.dense_spacing_pair_m_long = [
-            5,
-            15
-        ]
-        self.dense_spacing_pair_long_fraction = 0.15
-        self.dense_spacing_count_temperature_wv = 0.5
-        self.dense_spacing_target_step_wv = 1.0
-        self.dense_spacing_max_step_wv = 2.0
-        self.dense_spacing_max_steps = 1400
-        self.dense_spacing_step_oversample = 1.25
-        self.dense_spacing_use_support_gate = True
-        self.dense_spacing_support_sigma = 4.0
-        self.dense_spacing_support_floor_alpha = 0.05
-        self.dense_spacing_support_policy = "product"
-        self.dense_spacing_phase_huber_delta = 0.5
-        self.dense_spacing_phase_extension_windings = 1.0
-        self.dense_spacing_phase_min_center_gap_wv = 4.0
-        self.dense_spacing_phase_graze_dot = 0.4
-        self.dense_spacing_phase_graze_depth_wv = 1.0
-        self.dense_spacing_phase_window_windings = 0.75
-        self.dense_spacing_phase_end_free_margin_windings = 0.5
-        self.dense_spacing_phase_missing_cost = 0.55
-        self.dense_spacing_phase_missing_extend_cost = 0.55
-        self.dense_spacing_phase_extra_cost = 0.7
-        self.dense_spacing_phase_extra_extend_cost = 0.7
-        self.dense_spacing_phase_temperature = 0.1
-        self.dense_spacing_phase_band_confidence_cost = 0.25
-        self.dense_spacing_phase_top2_margin = 0.1
-        self.dense_spacing_phase_min_matched_windings = 2
-        self.dense_spacing_phase_min_matched_mass = 1.0
         self.loss_weight_min_spacing = 2.0
-        self.loss_weight_dense_spacing_count = 0.0
         self.loss_weight_dense_spacing_density = 12.0
-        self.loss_weight_dense_attachment = 0.0
         self.loss_weight_patch_radius = 8.0
         self.loss_weight_patch_dt = 4.0
         self.loss_weight_unverified_patch_radius = 2.0
@@ -844,12 +794,7 @@ class Config:
         self.loss_weight_shell_outer = 1.0
         self.loss_weight_shell_patch_radius = 0.0
         self.loss_weight_anchor = 0.0
-        self.dense_spacing_density_min_gap_wv = 0.0
-        self.dense_spacing_density_max_blind_fraction = 0.75
         self.dense_min_spacing_d_min_wv = 6.0
-        self.dense_attachment_scale = 8.0
-        self.dense_attachment_warmup_steps = 3000
-        self.dense_attachment_ramp_steps = 3000
         self.dense_normals_finite_difference_epsilon = 8.0
         self.fiber_directions_finite_difference_epsilon = 8.0
         self.model_sym_dirichlet_finite_difference_epsilon = 4.0
@@ -889,8 +834,6 @@ class Config:
         self.influence_theta_frac = 0.5
         self.influence_sigma = 0.3333
         self.influence_anchor_ramp_power = 2.0
-        self.dense_spacing_density_lambda = "inverse_gap"
-        self.dense_spacing_density_soft_mass_min_gap_wv = 0.0
         self.output_num_slices_for_visualization = 20
 
         defaults = vars(self)

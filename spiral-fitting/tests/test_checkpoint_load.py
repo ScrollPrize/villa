@@ -55,11 +55,8 @@ def _live_context():
         spiral_outward_sense="CW",
         base_shape_zyx=(100, 200, 300),
         paths=SimpleNamespace(dataset_root="/data/scroll1"),
-        phase_mode=True,
         winding_model_mode=False,
         winding_inference=None,
-        sdt_volume={"fingerprint": {"sha256": "abc", "path": "/store/a",
-                                    "complete": True}},
         config=dict(CONFIG),
         model_z_begin=1000,
         model_z_end=2000,
@@ -83,10 +80,6 @@ def _checkpoint(**overrides):
         "lasagna_scale": 4,
         "lasagna_group": "4",
         "spiral_outward_sense": "CW",
-        # Only the content-identity fields compare: the store may legitimately
-        # have moved and grown since the checkpoint was written.
-        "surf_sdt_fingerprint": {"sha256": "abc", "path": "/store/b",
-                                 "complete": False},
         "z_begin": 1000,
         "z_end": 2000,
         "input_manifest": {"dataset_root": "/data/scroll1"},
@@ -190,16 +183,6 @@ class CheckpointPreflightTests(unittest.TestCase):
         self.assertFalse(verdict.accepted)
         self.assertIn("positive integers", verdict.message())
 
-    def test_sdt_identity_invariant_applies_when_an_sdt_loss_is_enabled(self):
-        stale = _checkpoint(surf_sdt_fingerprint={"sha256": "def"})
-        verdict = _inspect(stale)
-        self.assertFalse(verdict.accepted)
-        self.assertIn("surf-SDT fingerprint", verdict.message())
-        # With no SDT-driven loss active the store is not an input at all.
-        context = _live_context()
-        context.phase_mode = False
-        self.assertTrue(_inspect(stale, context).accepted)
-
     def test_model_z_domain_must_match_exactly(self):
         for domain in ((900, 2000), (1000, 2100)):
             with self.subTest(domain=domain):
@@ -287,13 +270,10 @@ class SparseStoreDdpTests(unittest.TestCase):
             dist=fit_spiral.DistributedContext(
                 rank=rank, world_size=2, local_rank=rank),
             grad_mag_spacing_enabled=False,
-            phase_mode=True,
             normal_nx_zarr_path='/data/nx',
             normal_ny_zarr_path='/data/ny',
             grad_mag_zarr_path=None,
             normal_zarr_group='4',
-            surf_sdt_zarr_path='/data/sdt',
-            surf_sdt_zarr_group='1',
         )
 
     def test_nonzero_rank_waits_for_rank_zero_without_building(self):

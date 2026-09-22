@@ -54,7 +54,7 @@ from checkpoint_migrations import (expand_gap_checkpoint_capacity,
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, EDITABLE_PCL_ROLE_VALUES,
                          RUN_MUTABLE_PCL_ROLES,
                          fit_input, input_source_enabled, pcl_input_enabled,
-                         pcl_role_toggle_key, phase_bundle_enabled,
+                         pcl_role_toggle_key,
                          shell_losses_enabled, winding_inference_enabled)
 from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
 
@@ -72,8 +72,7 @@ def _startup_resource_suffix(started_at=None):
     return ', '.join(fields)
 
 
-from lasagna_data import (ensure_fit_sparse_stores, prepare_lasagna_volume,
-                          prepare_surf_sdt_volume)
+from lasagna_data import ensure_fit_sparse_stores, prepare_lasagna_volume
 from checkpoint_io import load_checkpoint_cpu, model_state_sha256
 from fiber_direction_samples import load_fiber_direction_samples
 from influence import make_influence_state, subsample_rows
@@ -121,6 +120,7 @@ from losses import (
     build_pcl_sampling_strata,
     pcl_sampling_group_weight,
     get_fiber_direction_loss,
+    get_min_spacing_loss,
     iter_lasagna_losses,
     get_patch_abs_winding_loss,
     get_patch_and_umbilicus_losses,
@@ -132,11 +132,6 @@ from losses import (
 )
 from loss_maps import (LossMapRecorder, attach_loss_maps_to_manifest,
                        capture_loss_maps)
-from sdt_losses import (
-    aggregate_pair_counts,
-    iter_phase_bundle_losses,
-    phase_bundle_component_weights,
-)
 from spiral_helpers import (
     REFERENCE_Z_RANGE_NUM_SLICES,
     erode_patch_valid_region,
@@ -190,21 +185,7 @@ def largest_patch_quad_component(mask):
     return component_labels == int(component_sizes.argmax())
 
 
-# Fields of a surf-SDT fingerprint that describe where the store lives and how
-# much of it has been built, rather than what it contains.
-_SDT_COVERAGE_AND_LOCATION_KEYS = (
-    'path', 'source', 'complete', 'z_range_working', 'built_z_ranges_working',
-)
-
 _HEADLESS_AUTOSAVE_INTERVAL = AUTOSAVE_INTERVAL_ITERATIONS
-
-
-def comparable_sdt_fingerprint(fingerprint):
-    """The content-identity subset of a surf-SDT fingerprint."""
-    if not fingerprint:
-        return None
-    return {key: value for key, value in fingerprint.items()
-            if key not in _SDT_COVERAGE_AND_LOCATION_KEYS}
 
 
 class CheckpointVerdict:
@@ -1244,19 +1225,6 @@ def unresolved_fiber_link_warning(fiber_catalog, *, use_links, use_pending_links
         f'branch(es) target absent resident fibers: {named}')
 
 
-def get_dense_attachment_ramp(cfg, iteration):
-    """Warm-up/ramp factor for the attachment weight, measured against the
-    durable completed-iteration count so a resumed run continues the schedule
-    instead of restarting it."""
-    warmup = int(cfg['dense_attachment_warmup_steps'])
-    ramp = int(cfg['dense_attachment_ramp_steps'])
-    if iteration < warmup:
-        return 0.0
-    if ramp <= 0:
-        return 1.0
-    return min(1.0, (iteration - warmup + 1) / ramp)
-
-
 def get_exponential_lr_at_step(
         initial_lr, final_factor, completed_steps, training_horizon):
     """LR on the absolute exponential curve for a completed-step count."""
@@ -1495,7 +1463,7 @@ class FitContext:
         #
         # scroll is the frozen ScrollSpec: physical facts of the scanned
         # scroll (name, voxel size, outward sense, umbilicus coordinate
-        # scale, Lasagna/SDT groups and scale). paths is the resolved
+        # scale, Lasagna group and scale). paths is the resolved
         # SpiralInputPaths for this fit: the interactive runtime passes the
         # service's per-session selection; the CLI resolves the conventional
         # dataset layout (fit_session.conventional_input_paths).
@@ -1558,9 +1526,6 @@ class FitContext:
         self.base_shape_zyx = scroll.base_shape_zyx
         self.spiral_outward_sense = scroll.spiral_outward_sense
         self.normal_zarr_group = scroll.normal_zarr_group
-        # The surf-SDT store's scale/encoding are read from the store's own
-        # metadata, never from normal_zarr_group/lasagna_scale.
-        self.surf_sdt_zarr_group = scroll.surf_sdt_zarr_group
         self.lasagna_scale = int(scroll.lasagna_scale)
         umbilicus_path = paths.umbilicus
         umbilicus_scale = float(scroll.umbilicus_coordinate_scale)
@@ -1575,9 +1540,6 @@ class FitContext:
         self.grad_mag_zarr_path = (
             (paths.gradient_magnitude or None)
             if input_source_enabled(config, 'gradient_magnitude') else None)
-        self.surf_sdt_zarr_path = (
-            (paths.surf_sdt or None)
-            if phase_bundle_enabled(config) else None)
         self.winding_inference_path = (
             (paths.winding_inference or None)
             if winding_inference_enabled(config) else None)
@@ -1611,7 +1573,6 @@ class FitContext:
         self.render_volume_scale = int(render_volume_scale)
 
         self._lasagna_store = None
-        self._scalar_stores = []
     # The optimisation z window lives in the fit configuration (its catalog
     # metadata records the full effect list); these properties are the one
     # reading point for the many z-window consumers below.
@@ -2232,7 +2193,7 @@ class FitContext:
           _families / _source_ids, track_sampling_config, using_tracks,
           filter_tracks_by_shell
         - misc: umbilicus, scroll_zarr, shell_envelope,
-          dense_spacing_mode, phase_mode, grad_mag_spacing_enabled
+          dense_spacing_mode, grad_mag_spacing_enabled
         """
         progress = progress_or_null(self.progress)
 
@@ -2384,11 +2345,10 @@ class FitContext:
         # Dense-spacing input contract. Checked before any asset paths so
         # an invalid mode fails as itself, not as a missing-file error.
         dense_spacing_mode = self.config['dense_spacing_mode']
-        if dense_spacing_mode not in ('phase', 'grad_mag', 'winding_model'):
+        if dense_spacing_mode not in ('grad_mag', 'winding_model'):
             raise ValueError(
                 f'dense_spacing_mode={dense_spacing_mode!r} must be '
-                "'phase', 'grad_mag', or 'winding_model'")
-        phase_mode = phase_bundle_enabled(self.config)
+                "'grad_mag' or 'winding_model'")
         winding_model_mode = winding_inference_enabled(self.config)
         grad_mag_spacing_enabled = (
             dense_spacing_mode == 'grad_mag'
@@ -2586,7 +2546,6 @@ class FitContext:
         self.next_id = next_id
         self.link_distance_tolerance = link_distance_tolerance
         self.dense_spacing_mode = dense_spacing_mode
-        self.phase_mode = phase_mode
         self.winding_model_mode = winding_model_mode
         self.dense_normals_enabled = input_source_enabled(
             self.config, 'normals')
@@ -2941,29 +2900,22 @@ class FitContext:
         self.unattached_pcl_strips.flat = None
         self.dt_target_cache_manager.reset()
 
-    def _phase_mode_active(self):
-        return self.phase_mode and self.sdt_volume is not None and self.lasagna_volume is not None
-
     def _winding_model_mode_active(self):
         return self.winding_model_mode and self.winding_inference is not None
 
-    def _warn_if_sdt_loss_inactive(self):
-        # Run-mutable weights are read afresh every step, but the SDT-backed
-        # components only exist in phase mode; make other sessions' nonzero
-        # SDT-only weights a visible no-op. The native min-spacing
-        # barrier is asset-independent and remains active in either mode.
-        if self.phase_mode:
+    def _warn_if_density_loss_inactive(self):
+        # Run-mutable weights are read afresh every step, but the density
+        # component only exists in winding-model mode; make another
+        # session's nonzero density weight a visible no-op. The native
+        # min-spacing barrier is asset-independent and active in every mode.
+        if self.winding_model_mode:
             return
-        inactive = ['loss_weight_dense_spacing_count',
-                    'loss_weight_dense_attachment']
-        if not self.winding_model_mode:
-            inactive.append('loss_weight_dense_spacing_density')
-        for weight_key in inactive:
-            if self.config[weight_key] > 0 and weight_key not in self._sdt_inactive_warned:
-                self._sdt_inactive_warned.add(weight_key)
-                print(f'WARNING: {weight_key} > 0 but dense_spacing_mode='
-                      f'{self.dense_spacing_mode!r}; this component runs only as '
-                      "part of the 'phase' bundle and is INACTIVE.")
+        weight_key = 'loss_weight_dense_spacing_density'
+        if self.config[weight_key] > 0 and weight_key not in self._density_inactive_warned:
+            self._density_inactive_warned.add(weight_key)
+            print(f'WARNING: {weight_key} > 0 but dense_spacing_mode='
+                  f'{self.dense_spacing_mode!r}; this component runs only in '
+                  "'winding_model' mode and is INACTIVE.")
 
     def _subsample_shell_radius_pool(self, patch):
         # The shell-patch radius loss draws sample_count_shell_samples random
@@ -3008,7 +2960,7 @@ class FitContext:
                       'inferred one); this loss samples the spiral out to that '
                       'winding and stays INACTIVE. Set shell_outer_winding_idx '
                       'to enable it (some of these losses also need the '
-                      'phase/SDT assets, see any warnings above).')
+                      'winding-model assets, see any warnings above).')
 
     def _apply_flow_group_settings(self, iteration):
         """Per-step optimizer settings of the two flow-lattice groups: their
@@ -3214,13 +3166,10 @@ class FitContext:
                 ensure_fit_sparse_stores(
                     use_normals=use_normals,
                     use_spacing=self.grad_mag_spacing_enabled,
-                    use_sdt=self.phase_mode,
                     normal_nx_zarr_path=self.normal_nx_zarr_path,
                     normal_ny_zarr_path=self.normal_ny_zarr_path,
                     grad_mag_zarr_path=self.grad_mag_zarr_path,
                     normal_zarr_group=self.normal_zarr_group,
-                    sdt_zarr_path=self.surf_sdt_zarr_path,
-                    sdt_zarr_group=self.surf_sdt_zarr_group,
                     progress=progress,
                 )
             except Exception as exc:
@@ -3241,7 +3190,7 @@ class FitContext:
             raise build_error
 
     def _build_store_state(self):
-        """Materialise the Lasagna and surf-SDT brick pools.
+        """Materialise the Lasagna brick pools.
 
         The expensive half of the device build, and the half nothing but the
         z window, the store paths and the dense-loss mode can invalidate.
@@ -3250,11 +3199,11 @@ class FitContext:
         progress = progress_or_null(self.progress)
 
         # ==========================================================================
-        # lasagna and SDT stores
+        # lasagna stores
         # ==========================================================================
 
-        use_normals = self.dense_normals_enabled and (
-            self.config['loss_weight_dense_normals'] > 0 or self.phase_mode)
+        use_normals = (self.dense_normals_enabled
+                       and self.config['loss_weight_dense_normals'] > 0)
         self._ensure_sparse_volume_stores(
             use_normals=use_normals, progress=progress)
 
@@ -3275,32 +3224,6 @@ class FitContext:
         )
         if interactive_driver is not None and self.lasagna_volume:
             self._lasagna_store = self.lasagna_volume['store']
-
-        # Surf-SDT store: a core input of the whole phase bundle (registration,
-        # count, attachment), required in phase mode even when individual
-        # sub-weights are zero so run-mutable weights can be adjusted (or zeroed
-        # and re-raised) at run boundaries without a session reload.
-        self.sdt_volume = None
-        if self.phase_mode:
-            if not self.surf_sdt_zarr_path or not os.path.exists(self.surf_sdt_zarr_path):
-                raise RuntimeError(
-                    "dense_spacing_mode='phase' requires the surf-SDT store: "
-                    f'{self.surf_sdt_zarr_path!r}')
-            if self.lasagna_volume is None:
-                raise RuntimeError(
-                    "dense_spacing_mode='phase' requires the dense normal stores "
-                    'for band incidence/fragment handling')
-            self.sdt_volume = prepare_surf_sdt_volume(
-                self.surf_sdt_zarr_path,
-                self.surf_sdt_zarr_group,
-                z_begin=self.z_begin,
-                z_end=self.z_end,
-                cache_directory=self.cache_path,
-                storage_backend=self.lasagna_storage_backend,
-                progress=progress,
-            )
-            if interactive_driver is not None:
-                self._scalar_stores.append(self.sdt_volume['store'])
 
         self.winding_inference = None
         if self.winding_model_mode:
@@ -3328,7 +3251,7 @@ class FitContext:
                 f"{self.winding_inference.fingerprint['num_crossings']:,} "
                 'crossings')
 
-        self._sdt_inactive_warned = set()
+        self._density_inactive_warned = set()
 
     def _make_theta_crossing_map(self):
         """Construct the shared patch/PCL source topology."""
@@ -3946,8 +3869,6 @@ class FitContext:
             'base_shape_zyx': (
                 list(self.base_shape_zyx)
                 if self.base_shape_zyx is not None else None),
-            'surf_sdt_fingerprint': (
-                self.sdt_volume['fingerprint'] if self.sdt_volume is not None else None),
             'winding_inference_fingerprint': (
                 self.winding_inference.fingerprint
                 if self.winding_inference is not None else None),
@@ -4085,28 +4006,7 @@ class FitContext:
                 f'checkpoint was written against dataset {checkpoint_dataset!r}, '
                 f'not {dataset_root!r}')
 
-        # --- Lasagna / SDT store identity ---------------------------------
-        # The SDT store is an independent input: the Lasagna group/scale checks
-        # above do not cover it. Reject an unexpected change in its content
-        # fingerprint whenever an SDT-driven loss is enabled. Paths may
-        # legitimately move and coverage may legitimately grow (--resume
-        # extension of an ROI-first build), so only the content-identity fields
-        # compare - 'created'/'git_commit' are stamped once at store creation
-        # and anchor the identity.
-        if self.phase_mode:
-            checkpoint_fingerprint = comparable_sdt_fingerprint(
-                checkpoint.get('surf_sdt_fingerprint'))
-            current_fingerprint = comparable_sdt_fingerprint(
-                self.sdt_volume['fingerprint']
-                if self.sdt_volume is not None else None)
-            if (checkpoint_fingerprint is not None
-                    and checkpoint_fingerprint != current_fingerprint):
-                reasons.append(
-                    'checkpoint surf-SDT fingerprint does not match the '
-                    'resolved store while an SDT-driven loss is enabled:'
-                    f'\n      checkpoint: {checkpoint_fingerprint}'
-                    f'\n      current:    {current_fingerprint}')
-
+        # --- Winding-inference store identity ------------------------------
         if self.winding_model_mode:
             checkpoint_fingerprint = checkpoint.get(
                 'winding_inference_fingerprint')
@@ -4493,16 +4393,11 @@ class FitContext:
                     'patch_radius', 'patch_dt',
                     'unverified_patch_radius', 'unverified_patch_dt',
                     'sym_dirichlet', 'rel_winding', 'abs_winding',
-                    'dense_normals', 'dense_spacing', 'dense_attachment',
+                    'dense_normals', 'dense_spacing',
                     'unattached_pcl_radius', 'unattached_pcl_dt',
                     'track_radius', 'track_dt', 'shell_patch_radius',
                 )
             }
-            if self._phase_mode_active():
-                diagnostic_weights['dense_spacing_phase'] = max(
-                    float(self.config['loss_weight_dense_spacing']), 1.0)
-                diagnostic_weights['dense_spacing_count'] = max(
-                    float(self.config['loss_weight_dense_spacing_count']), 1.0)
             if self._winding_model_mode_active():
                 diagnostic_weights['dense_spacing_winding_model_relative'] = max(
                     float(self.config['loss_weight_dense_spacing']), 1.0)
@@ -4576,14 +4471,6 @@ class FitContext:
                                 and self.config['loss_weight_dense_normals'] > 0),
                             cfg=self.config, z_begin=self.z_begin, z_end=self.z_end):
                         pass
-                if self._phase_mode_active():
-                    preview_generator = torch.Generator(device=dr.device)
-                    preview_generator.manual_seed(0x243F6A88)
-                    for _loss_name, _loss_value, _metrics in iter_phase_bundle_losses(
-                            self.spiral_and_transform, transform, dr, self.sdt_volume,
-                            self.lasagna_volume, self.shell_outer_winding_idx, self.config,
-                            self.z_begin, self.z_end, generator=preview_generator):
-                        pass
                 if self._winding_model_mode_active():
                     preview_generator = torch.Generator(device=dr.device)
                     preview_generator.manual_seed(0x13198A2E)
@@ -4614,25 +4501,6 @@ class FitContext:
             # drain its deferred unset-potential verdicts, so resolve them
             # before the diagnostics are published.
             self.theta_crossing_map.assert_no_pending_potential_errors()
-            # Per-pair aggregated crossing counts: mean_count - m per winding
-            # pair, the measurement behind any future discrete
-            # insert/remove/reindex operation (gradient descent cannot perform
-            # those). Written next to the loss maps as a preview artifact.
-            if self._phase_mode_active() and self.shell_outer_winding_idx is not None:
-                try:
-                    with torch.no_grad():
-                        pair_rows = aggregate_pair_counts(
-                            transform, dr, self.sdt_volume,
-                            self.shell_outer_winding_idx, self.config, self.z_begin, self.z_end)
-                    pair_table_name = 'dense_spacing_pair_counts.json'
-                    with open(os.path.join(generation_path, pair_table_name),
-                              'w', encoding='utf-8') as stream:
-                        json.dump(pair_rows, stream, indent=1)
-                    manifest = dict(manifest)
-                    manifest['dense_spacing_pair_counts'] = pair_table_name
-                except Exception as error:
-                    print('WARNING: could not aggregate per-pair crossing counts: '
-                          f'{type(error).__name__}: {error}')
             if recorder.error is not None:
                 print('WARNING: could not generate Spiral loss overlays: '
                       f'{type(recorder.error).__name__}: {recorder.error}')
@@ -5751,7 +5619,7 @@ class FitContext:
                 * self.config['loss_weight_fiber_directions']
             })
 
-        self._warn_if_sdt_loss_inactive()
+        self._warn_if_density_loss_inactive()
         self._warn_if_dense_losses_structurally_disabled()
         if self._winding_model_mode_active():
             inference_losses, inference_metrics = get_winding_inference_losses(
@@ -5777,69 +5645,24 @@ class FitContext:
             })
             log_metrics.update(inference_metrics)
             del inference_losses, inference_metrics
-        phase_components_active = self._phase_mode_active()
-        min_spacing_active = self.config['loss_weight_min_spacing'] > 0
-        if phase_components_active or min_spacing_active:
-            # SDT-backed phase components require phase mode; the native
-            # min-spacing barrier does not. Weights are re-read every step so
-            # the barrier can be enabled at a Run boundary in either mode.
-            attachment_ramp = (
-                get_dense_attachment_ramp(self.config, iteration)
-                if phase_components_active else 0.0)
-            if phase_components_active:
-                log_metrics['dense_attachment_ramp'] = attachment_ramp
-            component_weights = phase_bundle_component_weights(
-                self.config, attachment_ramp)
-            # Components tagged '_shared_graph' (count, phase, shared-batch
-            # density) backpropagate through one central-ray graph; summing
-            # them into a single backward traverses that graph once instead
-            # of once per component. Untagged components (density supplement
-            # chunks, min_spacing, attachment) keep their own backward so at
-            # most one supplement-chunk graph is resident at a time.
-            pending_shared = {}
-            for component_name, component_loss, component_metrics in \
-                    iter_phase_bundle_losses(
-                        self.spiral_and_transform,
-                        self.slice_to_spiral_transform,
-                        self.dr_per_winding,
-                        self.sdt_volume,
-                        self.lasagna_volume,
-                        self.shell_outer_winding_idx,
-                        self.config,
-                        self.z_begin,
-                        self.z_end,
-                        attachment_ramp=attachment_ramp,
-                        # Metrics are only reported every 200 steps; their
-                        # .item() reads each stall on the full GPU queue.
-                        with_metrics=iteration % 200 == 0,
-                    ):
-                weighted = (
-                    component_loss * component_weights[component_name])
-                if component_metrics.pop('_shared_graph', False):
-                    pending_shared[component_name] = weighted
-                else:
-                    if pending_shared:
-                        backward_family(pending_shared)
-                        pending_shared = {}
-                    backward_family({component_name: weighted})
-                # Release before the generator builds the next component's
-                # graph, or several large graphs are resident at peak.
-                del component_loss, weighted
-                log_metrics.update(component_metrics)
-            if pending_shared:
-                backward_family(pending_shared)
-            del pending_shared
-            if (phase_components_active
-                    and self.lasagna_volume['backend'] == 'sparse_cuda'):
-                log_metrics.update({
-                    f'dense_spacing_phase_normal_{name}': value
-                    for name, value in self.lasagna_volume['store'].last_timings.items()
-                })
-            if phase_components_active and self.sdt_volume['backend'] == 'sparse_cuda':
-                log_metrics.update({
-                    f'dense_spacing_phase_sdt_store_{name}': value
-                    for name, value in self.sdt_volume['store'].last_timings.items()
-                })
+        # The native min-spacing barrier is asset-independent; its weight is
+        # re-read every step so it can be enabled at a Run boundary in any
+        # dense-spacing mode.
+        min_spacing_weight = float(self.config['loss_weight_min_spacing'])
+        if min_spacing_weight > 0:
+            min_spacing_loss, min_spacing_metrics = get_min_spacing_loss(
+                self.spiral_and_transform,
+                self.shell_outer_winding_idx,
+                self.config,
+                self.z_begin,
+                self.z_end,
+                # Metrics are only reported every 200 steps; their .item()
+                # reads each stall on the full GPU queue.
+                with_metrics=iteration % 200 == 0,
+            )
+            backward_family({'min_spacing': min_spacing_loss * min_spacing_weight})
+            log_metrics.update(min_spacing_metrics)
+            del min_spacing_loss, min_spacing_metrics
 
         if (
             (self.config['loss_weight_unattached_pcl_radius'] > 0
@@ -6173,8 +5996,6 @@ class FitContext:
         store, self._lasagna_store = self._lasagna_store, None
         if store is not None:
             store.close()
-        while self._scalar_stores:
-            self._scalar_stores.pop().close()
         self.winding_inference = None
 
 
@@ -6292,11 +6113,8 @@ if __name__ == '__main__':
             'sample_count_tracks_per_step',
             'sample_count_dense_normal_points',
             'sample_count_fiber_direction_points',
-            'sample_count_dense_spacing_pairs',
-            'sample_count_dense_spacing_density_extra_pairs',
             'sample_count_winding_model_relative_pairs',
             'sample_count_winding_model_density_pairs',
-            'sample_count_dense_attachment_points',
             'sample_count_regularisation_points',
             'sample_count_shell_samples',
         )

@@ -8,7 +8,6 @@ except ImportError:  # pragma: no cover - unavailable on Windows
 
 import numpy as np
 import torch
-import zarr
 
 from pack_resident_pools import pack_arrays, sidecar_path
 
@@ -71,13 +70,10 @@ def ensure_fit_sparse_stores(
     *,
     use_normals,
     use_spacing,
-    use_sdt,
     normal_nx_zarr_path,
     normal_ny_zarr_path,
     grad_mag_zarr_path,
     normal_zarr_group,
-    sdt_zarr_path,
-    sdt_zarr_group,
     progress=None,
 ):
     """Build the resident pools required by one fit when they are absent."""
@@ -108,21 +104,6 @@ def ensure_fit_sparse_stores(
             sidecar,
             label='lasagna grad_mag',
             stage_name='Building Lasagna gradient sparse store',
-            progress=progress,
-        )
-
-    if use_sdt:
-        if not sdt_zarr_path or not os.path.exists(sdt_zarr_path):
-            raise RuntimeError(
-                "dense_spacing_mode='phase' requires the surf-SDT store: "
-                f'{sdt_zarr_path!r}')
-        group = str(sdt_zarr_group)
-        sidecar = sidecar_path(sdt_zarr_path, group)
-        _ensure_sidecar(
-            [os.path.join(sdt_zarr_path, group)],
-            sidecar,
-            label='surf_sdt',
-            stage_name='Building surface-distance sparse store',
             progress=progress,
         )
 
@@ -274,180 +255,3 @@ def prepare_lasagna_volume(
         'shape': roi_shape,
     }
 
-
-def _resolve_ome_group_scale(root_attrs, group_name):
-    """Per-axis scale of one OME multiscales dataset, in working voxels per
-    stored grid voxel. Rejects datasets with a nonzero translation: the fitter
-    assumes a shared origin with the working volume."""
-    multiscales = root_attrs.get('multiscales')
-    for dataset in (multiscales[0].get('datasets', []) if multiscales else []):
-        if str(dataset.get('path')) != str(group_name):
-            continue
-        scale = None
-        for transformation in dataset.get('coordinateTransformations', []):
-            if transformation.get('type') == 'scale':
-                scale = tuple(float(s) for s in transformation['scale'])
-            elif transformation.get('type') == 'translation':
-                if any(abs(float(t)) > 1e-9 for t in transformation.get('translation', ())):
-                    raise RuntimeError(
-                        f'OME dataset {group_name!r} carries a nonzero translation; '
-                        'the fitter only supports stores sharing the working-volume origin')
-        return scale
-    return None
-
-
-def _merged_ranges_cover(ranges, lo, hi):
-    """Whether the union of [lo, hi) working-z intervals covers [lo, hi)."""
-    covered_to = lo
-    for range_lo, range_hi in sorted((float(a), float(b)) for a, b in ranges):
-        if range_lo > covered_to:
-            return False
-        covered_to = max(covered_to, range_hi)
-        if covered_to >= hi:
-            return True
-    return covered_to >= hi
-
-
-def prepare_surf_sdt_volume(
-    sdt_zarr_path,
-    sdt_zarr_group,
-    *,
-    z_begin,
-    z_end,
-    cache_directory,
-    storage_backend='sparse_cuda',
-    workers=None,
-    yx_bounds_working=None,
-    interior_fn=None,
-    paged_chunk=64,
-    progress=None,
-):
-    """Resolve and validate a surf-SDT store as a sparse CUDA input.
-
-    Geometry and encoding are read from the store's own metadata - never from
-    ``normal_zarr_group``/``lasagna_scale``. The scale convention is working
-    voxels per stored grid voxel (group 1 of the standard build = 2.0), so
-    sampling maps ``working_zyx / scale`` into the store grid.
-    """
-    if storage_backend != 'sparse_cuda':
-        raise ValueError(
-            f"storage_backend={storage_backend!r} is no longer supported; "
-            "use 'sparse_cuda'")
-    if not torch.cuda.is_available():
-        raise RuntimeError('sparse CUDA SDT sampling requires an available CUDA device')
-    root = zarr.open_group(sdt_zarr_path, mode='r')
-    attrs = dict(root.attrs)
-    group_name = str(sdt_zarr_group)
-    if group_name not in root:
-        raise RuntimeError(f'group {group_name!r} not found in {sdt_zarr_path}')
-    array = root[group_name]
-
-    scale_zyx = _resolve_ome_group_scale(attrs, group_name)
-    if scale_zyx is None:
-        raise RuntimeError(
-            f'no OME multiscales scale for group {group_name!r} in {sdt_zarr_path}; '
-            'the fitter refuses to infer the store geometry')
-
-    if attrs.get('kind') != 'surf_sdt':
-        raise RuntimeError(
-            f"{sdt_zarr_path} has kind={attrs.get('kind')!r}, expected 'surf_sdt'")
-    for key in ('unit_working_voxels', 'offset', 'cap_working_voxels'):
-        if key not in attrs:
-            raise RuntimeError(f'{sdt_zarr_path} is missing encoding attribute {key!r}')
-    unit = float(attrs['unit_working_voxels'])
-    offset = int(attrs['offset'])
-    cap = float(attrs['cap_working_voxels'])
-    declared = attrs.get('scale_vs_working')
-    if declared is not None:
-        declared = [declared] * 3 if np.isscalar(declared) else list(declared)
-        base_scale = [s / 2 ** _pyramid_level(attrs, group_name) for s in scale_zyx]
-        if any(abs(a - b) > 1e-6 for a, b in zip(base_scale, declared)):
-            print(f'WARNING: {sdt_zarr_path} attrs scale_vs_working {declared} does not '
-                  f'match the OME scale {scale_zyx} for group {group_name}')
-    # Coverage: the store is trusted only when it is stamped complete or its
-    # embedded built working-z ranges cover the requested fit range. The
-    # done_tiles sidecar is deliberately not consulted - it may not travel
-    # with the zarr.
-    if not attrs.get('complete', False):
-        ranges = attrs.get('built_z_ranges_working')
-        if not ranges and 'z_range_working' in attrs:
-            ranges = [attrs['z_range_working']]
-        if not ranges or not _merged_ranges_cover(ranges, z_begin, z_end):
-            raise RuntimeError(
-                f'{sdt_zarr_path} is not stamped complete and its built working-z ranges '
-                f'{ranges!r} do not cover the fit range [{z_begin}, {z_end}); rebuild or '
-                'extend the store (unbuilt tiles read as no-data and would silently '
-                'disable the SDT losses there)')
-    volume_kind = 'sdt'
-
-    z_size = int(array.shape[0])
-    z_lo = max(0, int(np.floor(z_begin / scale_zyx[0])))
-    z_hi = min(z_size, int(np.ceil(z_end / scale_zyx[0])))
-    if z_hi <= z_lo:
-        raise RuntimeError(f'surf_sdt z-ROI [{z_lo}, {z_hi}) is empty (z size {z_size})')
-
-    fingerprint = {
-        'path': os.path.abspath(sdt_zarr_path),
-        'group': group_name,
-        'kind': attrs.get('kind'),
-        'source': attrs.get('source'),
-        'source_group': attrs.get('source_group'),
-        'threshold': attrs.get('threshold'),
-        'unit_working_voxels': attrs.get('unit_working_voxels'),
-        'offset': attrs.get('offset'),
-        'cap_working_voxels': attrs.get('cap_working_voxels'),
-        'erode_source_voxels': attrs.get('erode_source_voxels'),
-        'ct_mask': (attrs.get('ct_mask') or {}).get('group'),
-        'ct_zero': (attrs.get('ct_zero') or {}).get('group'),
-        'scale_zyx': list(scale_zyx),
-        'complete': bool(attrs.get('complete', False)),
-        'z_range_working': attrs.get('z_range_working'),
-        'built_z_ranges_working': attrs.get('built_z_ranges_working'),
-        'created': attrs.get('created'),
-        'git_commit': attrs.get('git_commit'),
-    }
-
-    shape = (z_hi - z_lo, int(array.shape[1]), int(array.shape[2]))
-    from sparse_cuda_cache import ResidentBrickPool, SparseScalarStore
-    sidecar = _require_sidecar(sdt_zarr_path, group_name, label='surf_sdt')
-    if progress is not None:
-        progress.begin(
-            'loading', 'Loading surface-distance volume onto GPU',
-            step=0, total_steps=0, unit='bricks')
-    cache = ResidentBrickPool(
-        sidecar,
-        origin_zyx=(z_lo, 0, 0),
-        z_roi=(z_lo, z_hi),
-        device=torch.device('cuda'),
-        label='surf_sdt',
-        expected_channels=1,
-        expected_shape_zyx=tuple(int(v) for v in array.shape),
-        progress_callback=(
-            (lambda current, total, detail: progress.update(
-                current, total_steps=total, detail=detail))
-            if progress is not None else None
-        ),
-    )
-    fingerprint['respool_ct_mask'] = cache.meta.get('ct_mask')
-    common = {
-        'kind': volume_kind,
-        'backend': 'sparse_cuda',
-        'store': SparseScalarStore(cache),
-        'z_origin': z_lo,
-        'scale_zyx': tuple(scale_zyx),
-        'unit': unit,
-        'offset': offset,
-        'cap': cap,
-        'shape': shape,
-        'fingerprint': fingerprint,
-    }
-    return common
-
-
-def _pyramid_level(root_attrs, group_name):
-    multiscales = root_attrs.get('multiscales')
-    datasets = multiscales[0].get('datasets', []) if multiscales else []
-    for level, dataset in enumerate(datasets):
-        if str(dataset.get('path')) == str(group_name):
-            return level
-    return 0

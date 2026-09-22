@@ -4,7 +4,7 @@ from config import Config
 from fit_session import (FIT_INPUT_CATALOG, PCL_ROLE_CONVENTIONS, PclRole,
                          SCROLL_SPEC_PATH_OVERRIDE_KEYS, SpiralInputPaths,
                          fit_input, input_source_enabled, pcl_input_enabled,
-                         phase_bundle_enabled, winding_inference_enabled)
+                         winding_inference_enabled)
 
 
 def test_catalog_covers_every_fit_input_path_field():
@@ -54,19 +54,15 @@ def test_model_configuration_is_a_new_fit_change():
 
 
 def test_lasagna_store_predicates_reproduce_the_mode_contract():
-    # Phase requires normals and the SDT even at zero
-    # sub-weights; grad_mag requires the gradient store only with a positive
-    # spacing weight and never the SDT; an invalid mode enables nothing.
-    phase = {"dense_spacing_mode": "phase"}
-    assert fit_input("normal_x").required(phase) is True
-    assert fit_input("surf_sdt").required(phase) is True
-    assert fit_input("gradient_magnitude").required(phase) is False
-
+    # grad_mag requires the gradient store only with a positive spacing
+    # weight; normals are required only with a positive normals weight; an
+    # invalid mode enables nothing.
     grad = {"dense_spacing_mode": "grad_mag",
             "loss_weight_dense_normals": 0.0}
     assert fit_input("gradient_magnitude").required(grad) is True
-    assert fit_input("surf_sdt").required(grad) is False
     assert fit_input("normal_x").required(grad) is False
+    assert fit_input("normal_x").required(
+        {**grad, "loss_weight_dense_normals": 100.0}) is True
     assert fit_input("gradient_magnitude").required(
         {**grad, "loss_weight_dense_spacing": 0.0}) is False
 
@@ -75,14 +71,12 @@ def test_lasagna_store_predicates_reproduce_the_mode_contract():
     assert fit_input("winding_inference").required(winding_model) is True
     assert fit_input("winding_inference").enabled(winding_model) is True
     assert fit_input("normal_x").required(winding_model) is False
-    assert fit_input("surf_sdt").required(winding_model) is False
 
-    invalid = {"dense_spacing_mode": "crossing_count",
+    invalid = {"dense_spacing_mode": "phase",
                "loss_weight_dense_normals": 0.0}
     assert not any(fit_input(key).required(invalid)
                    for key in ("normal_x", "normal_y",
-                               "gradient_magnitude", "surf_sdt",
-                               "winding_inference"))
+                               "gradient_magnitude", "winding_inference"))
 
 
 def test_patch_inputs_follow_the_disable_switch():
@@ -107,14 +101,6 @@ def test_source_toggles_and_dependencies_are_centralized():
     assert input_source_enabled({}, "tracks_dbm") is True
     assert input_source_enabled({"input_use_tracks": False}, "tracks_dbm") is False
     assert fit_input("tracks_dbm").enabled({"input_use_tracks": False}) is False
-
-    assert phase_bundle_enabled({"dense_spacing_mode": "phase"}) is True
-    assert phase_bundle_enabled({
-        "dense_spacing_mode": "phase", "input_use_normals": False,
-    }) is False
-    assert phase_bundle_enabled({
-        "dense_spacing_mode": "phase", "input_use_surf_sdt": False,
-    }) is False
 
     winding = {"dense_spacing_mode": "winding_model"}
     assert winding_inference_enabled(winding) is True

@@ -445,9 +445,7 @@ class ShellOuterWindingIdxResolutionTests(unittest.TestCase):
             (
                 'loss_weight_dense_normals',
                 'loss_weight_dense_spacing',
-                'loss_weight_dense_spacing_count',
                 'loss_weight_dense_spacing_density',
-                'loss_weight_dense_attachment',
                 'loss_weight_min_spacing',
                 'loss_weight_sym_dirichlet',
             ))

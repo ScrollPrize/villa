@@ -1107,10 +1107,10 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
     #   (normals) the spiral radial covector at each sample is pulled back to scroll space via
     #             central-difference J^T (a normal is a covector, not a finite-length displacement)
     #             and matched in direction to the precomputed nx/ny scroll-space normal.
-    #   (spacing) [the legacy dense_spacing_mode='grad_mag' objective, retained
-    #             unchanged for comparison/rollback; the production mode is the
-    #             'phase' bundle in sdt_losses.py, and compute_spacing=False skips
-    #             this entirely] at each sample, shift inward and outward by dr_per_winding/2
+    #   (spacing) [the dense_spacing_mode='grad_mag' objective; the production
+    #             mode is 'winding_model' (winding_supervision.py), and
+    #             compute_spacing=False skips this entirely] at each sample,
+    #             shift inward and outward by dr_per_winding/2
     #             along the spiral radial direction (so the two endpoints span exactly one
     #             winding in spiral space), map both endpoints to scroll space, and
     #             integrate the winding-density field (grad_mag, windings per voxel) along
@@ -1630,3 +1630,70 @@ def get_symmetric_dirichlet_loss(slice_to_spiral_transform, dr_per_winding, oute
     energy = energy.clamp(max=1.e2)
     record_loss_samples('sym_dirichlet', spiral_zyx, energy)
     return energy.mean()
+
+
+def _sample_windings_by_circumference(
+    lowest, highest, num_samples, device, generator=None,
+):
+    """Integer windings in [lowest, highest] with probability proportional to
+    winding circumference (weight k + 0.5). ``highest`` may be a per-sample
+    tensor. Uses the analytic inverse CDF: cum-mass to k is ((k+1)^2 - a^2)/2."""
+    a = float(lowest)
+    if torch.is_tensor(highest):
+        b = highest.to(device=device, dtype=torch.float32)
+    else:
+        # A pageable scalar upload would stall on the whole GPU queue.
+        b = _cached_scalar_tensor(highest, device)
+    total_mass = ((b + 1.0) ** 2 - a * a) / 2.0
+    u = torch.rand(num_samples, device=device, generator=generator)
+    k = torch.ceil(torch.sqrt(2.0 * u * total_mass + a * a) - 1.0)
+    return torch.minimum(k.clamp(min=a), b)
+
+
+def get_min_spacing_loss(
+    spiral_and_transform, outer_winding_idx, cfg, z_begin, z_end, *,
+    generator=None, with_metrics=True,
+):
+    """Squared hinge on sampled native log gaps before exponentiation: the
+    asset-independent exact-collapse recovery barrier.
+
+    Every float()/.item() in the metrics dict is a device synchronization,
+    so callers that log on a cadence pass ``with_metrics=False`` on the other
+    steps; the loss and its gradient are identical either way.
+    """
+    device = spiral_and_transform.device
+    zero = torch.zeros([], device=device)
+    if outer_winding_idx is None:
+        return zero, {}
+    num_samples = int(cfg['sample_count_minimum_spacing_independent_samples'])
+    # Gaps are indexed by their inner winding; winding 1 is the innermost by
+    # convention, so the sampled gaps are [1, outer_winding_idx - 2].
+    inner, outer = 1, int(outer_winding_idx) - 1
+    if outer <= inner or num_samples <= 0:
+        return zero, {}
+    winding = _sample_windings_by_circumference(
+        inner, outer - 1, num_samples, device, generator=generator).long()
+    theta = torch.rand(
+        num_samples, device=device, generator=generator) * (2 * np.pi)
+    z = torch.empty(num_samples, device=device).uniform_(
+        float(z_begin), float(z_end - 1), generator=generator)
+    ell_gap = spiral_and_transform.get_native_log_gaps(winding, theta, z)
+    ell_min = float(np.log(float(cfg['dense_min_spacing_d_min_wv'])))
+    deficiency = F.relu(ell_min - ell_gap)
+    loss = deficiency.square().mean()
+    if not with_metrics:
+        return loss, {}
+    with torch.no_grad():
+        gap = torch.exp(ell_gap)
+        q = torch.quantile(gap, torch.tensor([0.1, 0.5, 0.9], device=device))
+        active = deficiency > 0
+        metrics = {
+            'min_spacing_active_fraction': float(active.float().mean().item()),
+            'min_spacing_gap_p10': float(q[0].item()),
+            'min_spacing_gap_p50': float(q[1].item()),
+            'min_spacing_gap_p90': float(q[2].item()),
+            'min_spacing_ell_gap_mean': float(ell_gap.mean().item()),
+            'min_spacing_violation_depth_mean': float(
+                deficiency[active].mean().item()) if active.any() else 0.0,
+        }
+    return loss, metrics

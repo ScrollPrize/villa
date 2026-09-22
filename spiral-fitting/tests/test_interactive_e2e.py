@@ -78,7 +78,7 @@ class InteractiveEndToEndTests(unittest.TestCase):
                 "cache_directory": cache_dir,
             })
             # The dense (Lasagna) losses are zero-weighted so the session runs
-            # without the resident normal/SDT stores, like the golden run.
+            # without the resident normal/grad-mag stores, like the golden run.
             run = SpiralRunConfig.from_mapping({
                 "z_begin": 10_000,
                 "z_end": 11_000,

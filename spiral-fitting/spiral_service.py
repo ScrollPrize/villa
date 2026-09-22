@@ -70,7 +70,7 @@ from fit_session import (API_VERSION, EDITABLE_PCL_ROLES, FIT_INPUT_CATALOG,
                          SESSION_BUSY_STATES, SCROLL_SPEC_FILENAME,
                          SCROLL_SPEC_OWNED_RUN_KEYS, PclRole, ScrollSpecError,
                          SessionState, SpiralInputPaths, default_user_cache_dir,
-                         input_source_enabled, pcl_input_enabled, phase_bundle_enabled,
+                         input_source_enabled, pcl_input_enabled,
                          winding_inference_enabled, load_scroll_spec,
                          parse_session_request, resolve_dataset_root,
                          validate_session_request)
@@ -1012,14 +1012,11 @@ class ServiceState:
             "normal_x": "normals",
             "normal_y": "normals",
             "gradient_magnitude": "gradient_magnitude",
-            "surf_sdt": "surf_sdt",
             "winding_inference": "winding_inference",
         }
         for path_key, source in selected_paths.items():
             if not input_source_enabled(config, source):
                 paths[path_key] = ""
-        if not phase_bundle_enabled(config):
-            paths["surf_sdt"] = ""
         if not winding_inference_enabled(config):
             paths["winding_inference"] = ""
         paths["pcls"] = [

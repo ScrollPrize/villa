@@ -100,7 +100,6 @@ class ScrollSpecTests(unittest.TestCase):
             self.assertIsNone(spec.base_shape_zyx)
             self.assertEqual(spec.umbilicus_coordinate_scale, 1.0)
             self.assertEqual(spec.normal_zarr_group, "4")
-            self.assertEqual(spec.surf_sdt_zarr_group, "1")
             self.assertEqual(spec.lasagna_scale, 4)
             self.assertEqual(spec.path_overrides, ())
 

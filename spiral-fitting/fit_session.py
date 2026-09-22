@@ -190,7 +190,6 @@ _INPUT_TOGGLE_KEYS = {
     "fibers": "input_use_fibers",
     "fiber_directions": "input_use_fiber_directions",
     "normals": "input_use_normals",
-    "surf_sdt": "input_use_surf_sdt",
     "gradient_magnitude": "input_use_gradient_magnitude",
     "winding_inference": "input_use_winding_inference",
     "outer_shell": "input_use_outer_shell",
@@ -300,25 +299,12 @@ def _dense_spacing_mode(config: Mapping[str, Any]) -> str | None:
     # Partial requests must select the same inputs as the fitter, which fills
     # omitted fields from Config before constructing its context.
     mode = str(config.get("dense_spacing_mode", Config().dense_spacing_mode))
-    return mode if mode in ("phase", "grad_mag", "winding_model") else None
-
-
-def _phase_bundle_enabled(config: Mapping[str, Any]) -> bool:
-    return (
-        _dense_spacing_mode(config) == "phase"
-        and input_source_enabled(config, "normals")
-        and input_source_enabled(config, "surf_sdt")
-    )
+    return mode if mode in ("grad_mag", "winding_model") else None
 
 
 def _normals_required(config: Mapping[str, Any]) -> bool:
-    # The phase bundle requires both normal channels (band incidence
-    # handling) even when individual sub-weights are zero, so run-mutable
-    # weights can be raised at run boundaries.
-    return input_source_enabled(config, "normals") and (
-        float(config.get("loss_weight_dense_normals", 100.0)) > 0
-        or _phase_bundle_enabled(config)
-    )
+    return (input_source_enabled(config, "normals")
+            and float(config.get("loss_weight_dense_normals", 100.0)) > 0)
 
 
 def _fiber_directions_enabled(config: Mapping[str, Any]) -> bool:
@@ -342,10 +328,6 @@ def _winding_model_enabled(config: Mapping[str, Any]) -> bool:
 
 def _outer_shell_required(config: Mapping[str, Any]) -> bool:
     return _shell_losses_enabled(config) or _winding_model_enabled(config)
-
-
-def phase_bundle_enabled(config: Mapping[str, Any]) -> bool:
-    return _phase_bundle_enabled(config)
 
 
 def winding_inference_enabled(config: Mapping[str, Any]) -> bool:
@@ -421,10 +403,6 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
                  enabled=lambda config: input_source_enabled(
                      config, "gradient_magnitude"),
                  required=_grad_mag_required),
-    FitInputSpec("surf_sdt", "zarr-group",
-                 conventional_relative="lasagna_inputs/las_008_surf_sdt.ome.zarr",
-                 enabled=_phase_bundle_enabled,
-                 required=_phase_bundle_enabled),
     FitInputSpec("winding_inference", "directory",
                  conventional_relative="winding_inference",
                  enabled=_winding_model_enabled,
@@ -484,7 +462,6 @@ class SpiralInputPaths:
     normal_x: str = ""
     normal_y: str = ""
     gradient_magnitude: str = ""
-    surf_sdt: str = ""
     winding_inference: str = ""
     scroll_zarr: str = ""
     checkpoint: str = ""
@@ -659,7 +636,6 @@ class ScrollSpec:
     base_shape_zyx: tuple[int, int, int] | None = None
     umbilicus_coordinate_scale: float = 1.0
     normal_zarr_group: str = "4"
-    surf_sdt_zarr_group: str = "1"
     lasagna_scale: int = 4
     # Allow-listed absolute-path overrides, (key, resolved path) pairs.
     path_overrides: tuple[tuple[str, str], ...] = ()
@@ -756,7 +732,6 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
         base_shape_zyx=base_shape_zyx,
         umbilicus_coordinate_scale=coordinate_scale,
         normal_zarr_group=str(document.get("normal_zarr_group", "4")),
-        surf_sdt_zarr_group=str(document.get("surf_sdt_zarr_group", "1")),
         lasagna_scale=lasagna_scale,
         path_overrides=tuple(overrides),
     )
@@ -832,7 +807,6 @@ def conventional_input_paths(
         normal_x=resolve("normal_x"),
         normal_y=resolve("normal_y"),
         gradient_magnitude=resolve("gradient_magnitude"),
-        surf_sdt=resolve("surf_sdt"),
         winding_inference=resolve("winding_inference"),
         checkpoint=_normalise_path(checkpoint) if checkpoint else "",
         output_directory=_normalise_path(output_directory) if output_directory else "",
@@ -1270,18 +1244,16 @@ def validate_session_request(
                     else:
                         _validate_json_file(path, f"pcls[{index}]", errors)
 
-    # The Lasagna store requirements (see the catalog's predicates: the
-    # phase bundle needs SDT and both normal channels even at zero
-    # sub-weights; grad_mag never needs the SDT) are checked after the
-    # dense-spacing mode below, so an invalid mode errors as itself rather
-    # than as missing-file errors.
+    # The Lasagna store requirements (see the catalog's predicates) are
+    # checked after the dense-spacing mode below, so an invalid mode errors
+    # as itself rather than as missing-file errors.
     for spec in FIT_INPUT_CATALOG:
         if spec.kind != "zarr-group":
             check_catalog_input(spec)
 
     if _dense_spacing_mode(run.config) is None:
         errors.append({"field": "dense_spacing_mode",
-                       "message": "Must be phase, grad_mag, or winding_model"})
+                       "message": "Must be grad_mag or winding_model"})
 
     for spec in FIT_INPUT_CATALOG:
         if spec.kind == "zarr-group":

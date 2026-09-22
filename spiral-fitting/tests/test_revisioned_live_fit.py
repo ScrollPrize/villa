@@ -47,8 +47,6 @@ def make_real_revision_session(tmp_path, influence=False):
         'model_flow_voxel_resolution': 64,
         'sample_count_patches_per_step': 8, 'sample_count_patches_per_step_for_dt': 8,
         'sample_count_points_per_patch': 32, 'sample_count_regularisation_points': 64,
-        'sample_count_dense_spacing_pairs': 64,
-        'sample_count_dense_spacing_density_extra_pairs': 64,
         'sample_count_shell_samples': 64,
         'sample_count_minimum_spacing_independent_samples': 64,
         'output_save_png_visualizations': False, 'influence_enabled': influence,

@@ -46,9 +46,6 @@ Z_RANGE_SCALED_COUNT_KEYS = (
     'sample_count_unattached_pcls_per_step',
     'sample_count_tracks_per_step',
     'sample_count_dense_normal_points',
-    'sample_count_dense_spacing_pairs',
-    'sample_count_dense_spacing_density_extra_pairs',
-    'sample_count_dense_attachment_points',
     'sample_count_regularisation_points',
     'sample_count_shell_samples',
 )
@@ -119,7 +116,6 @@ def _checkpoint_structure(checkpoint):
         'spiral_outward_sense': checkpoint.get('spiral_outward_sense'),
         'lasagna_scale': checkpoint.get('lasagna_scale'),
         'lasagna_group': checkpoint.get('lasagna_group'),
-        'surf_sdt_fingerprint': checkpoint.get('surf_sdt_fingerprint'),
         'input_manifest': checkpoint.get('input_manifest'),
         'preview_first_winding': checkpoint.get('preview_first_winding'),
         'cfg_keys': sorted(checkpoint.get('cfg', {}).keys()),
@@ -180,7 +176,7 @@ def run(spec_path, result_path, out_dir):
     import fit_spiral as fs
     from config import Config, FitConfig
     from fit_session import conventional_input_paths, load_scroll_spec
-    from spiral_helpers import SAMPLING_COUNT_FLOORS, scale_counts_for_z_range
+    from spiral_helpers import scale_counts_for_z_range
 
     # The dataset's spiral-scroll.json supplies the physical scroll facts;
     # inputs follow the conventional layout it describes.
@@ -201,7 +197,6 @@ def run(spec_path, result_path, out_dir):
     scale_counts_for_z_range(
         config, config['z_begin'], config['z_end'],
         REFERENCE_Z_RANGE_NUM_SLICES, Z_RANGE_SCALED_COUNT_KEYS,
-        floors=SAMPLING_COUNT_FLOORS,
     )
     fit_config = FitConfig(config)
 

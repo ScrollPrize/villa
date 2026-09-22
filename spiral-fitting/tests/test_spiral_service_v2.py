@@ -1120,7 +1120,6 @@ class DatasetOwnershipTests(unittest.TestCase):
         paths, run, _, _ = self.state._prepare_session_request(request)
 
         self.assertEqual(paths.winding_inference, str(winding))
-        self.assertEqual(paths.surf_sdt, "")
         self.assertEqual(run.config, config)
 
         # Missing default-mode inputs must fail preflight, before GPU work.
@@ -1486,7 +1485,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         session = _attach_fake_session(self.state, self.output, self.root)
         # Pin every input toggle to its historical value so the legacy
         # backfill sub-case below stays a pure absence-vs-backfill check even
-        # though input_use_surf_sdt now defaults off.
+        # though some toggles now default off.
         live = Config(dict(BACKFILLABLE_CONFIG_DEFAULTS)).as_dict()
         session.applied_config = dict(live)
 
@@ -2456,16 +2455,16 @@ class UploadTests(unittest.TestCase):
 
     def test_run_accepts_advertised_zero_count_for_disabled_input(self):
         session = self._session()
-        session.run_config["sample_count_dense_attachment_points"] = 0
+        session.run_config["sample_count_fiber_direction_points"] = 0
 
         response = _planned_run(self.state, {"iterations": 10, "run_config": {
-            "sample_count_dense_attachment_points": 0,
+            "sample_count_fiber_direction_points": 0,
         }})
 
         self.assertEqual(session.run_calls[-1][2], {
-            "sample_count_dense_attachment_points": 0,
+            "sample_count_fiber_direction_points": 0,
         })
-        self.assertEqual(response["run_config"]["sample_count_dense_attachment_points"], 0)
+        self.assertEqual(response["run_config"]["sample_count_fiber_direction_points"], 0)
 
     def test_outer_shell_path_change_requires_session_reload(self):
         self._session()

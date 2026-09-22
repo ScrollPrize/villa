@@ -42,7 +42,6 @@ def test_disabled_sources_are_removed_before_any_loader_can_see_them():
         normal_x="/inputs/nx.zarr",
         normal_y="/inputs/ny.zarr",
         gradient_magnitude="/inputs/grad.zarr",
-        surf_sdt="/inputs/sdt.zarr",
         winding_inference="/inputs/winding",
         outer_shell="/inputs/shell",
         pcls=(
@@ -62,7 +61,6 @@ def test_disabled_sources_are_removed_before_any_loader_can_see_them():
     assert context.normal_nx_zarr_path is None
     assert context.normal_ny_zarr_path is None
     assert context.grad_mag_zarr_path is None
-    assert context.surf_sdt_zarr_path is None
     assert context.winding_inference_path is None
     assert context.shell_path is None
     assert context.pcl_input_specs == []

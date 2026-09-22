@@ -48,7 +48,7 @@ class _ResidentDriver:
 
 def _resolved_config(spec, extra=None):
     from config import Config
-    from spiral_helpers import SAMPLING_COUNT_FLOORS, scale_counts_for_z_range
+    from spiral_helpers import scale_counts_for_z_range
 
     config = Config().as_dict()
     config.update(spec.get('config_overrides', {}))
@@ -59,7 +59,6 @@ def _resolved_config(spec, extra=None):
     scale_counts_for_z_range(
         config, config['z_begin'], config['z_end'],
         REFERENCE_Z_RANGE_NUM_SLICES, Z_RANGE_SCALED_COUNT_KEYS,
-        floors=SAMPLING_COUNT_FLOORS,
     )
     return config
 
