@@ -114,3 +114,12 @@
   subset; the special subset-labelled entry is removed. The manifest records
   the canonical link as `subset: true`, so rsyncing `vc3d_channels/` no longer
   exposes the 703 GiB full Paris4 cache.
+
+## 2026-09-22 — per-volume failure-fiber layout
+
+- Kept every exported fiber JSON filename unchanged, but moved it under
+  `fibers/<canonical physical-volume label>/` (`PHerc0139`, `PHerc0332`,
+  `PHerc1299`, `PHerc1451`, or `PHercParis4`).
+- Updated each manifest path and checksum after the move. This preserves the
+  existing fiber identifiers while making the exported corpus directly
+  browsable and consumable one volume at a time.

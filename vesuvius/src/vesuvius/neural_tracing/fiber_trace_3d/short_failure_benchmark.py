@@ -1119,6 +1119,22 @@ def run_union(workload):
             'length_base_voxels': float(item['interval'][1] - item['interval'][0]),
             'length_mm': float(item['interval'][1] - item['interval'][0]) * item['base_voxel_size_um'] / 1000,
         })
+    # Keep the exported corpus browsable by physical scroll.  The source label
+    # is canonicalized above, so aliases cannot create duplicate directories.
+    for item in annotations:
+        old_path = Path(item['path'])
+        target_dir = output / 'fibers' / item['source_id']
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / old_path.name
+        if old_path != target_path and old_path.exists():
+            if target_path.exists() and sha256_file(target_path) != sha256_file(old_path):
+                raise ValueError(f'refusing to replace changed annotation: {target_path}')
+            if not target_path.exists():
+                old_path.rename(target_path)
+            else:
+                old_path.unlink()
+        item['path'] = str(target_path)
+        item['sha256'] = sha256_file(target_path)
 
     # Complete the exact inspection corridor, not another tracing workload.
     required_by_root = defaultdict(set)
