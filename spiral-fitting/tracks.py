@@ -1885,19 +1885,11 @@ def _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding):
     return unwrap_shifted_radii(theta, shifted_radii, dr_per_winding)[0]
 
 
-def _aggregate_dt_track_losses(track_losses, across_p, active_mask=None):
-    if active_mask is not None:
-        track_losses = track_losses[active_mask]
+def _aggregate_dt_track_losses(track_losses, across_p):
     if track_losses.numel() == 0:
         return torch.zeros([], device=track_losses.device)
     return ((track_losses ** across_p).sum() / track_losses.numel()) ** (1 / across_p)
 
-
-def _progressive_dt_active_mask(snapped_winding, dr_per_winding, dt_max_winding):
-    if dt_max_winding is None:
-        return None
-    winding_idx = (snapped_winding / dr_per_winding).detach()
-    return winding_idx <= dt_max_winding
 
 
 def _build_track_flat_bundle(tracks, device):
@@ -3412,7 +3404,7 @@ def _crossing_row_alignments(
     return row_alignment
 
 
-def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, cfg, compute_dt=True, dt_max_winding=None, dt_target_cache=None):
+def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, cfg, compute_dt=True, dt_target_cache=None):
     """Yield radius then DT losses so the caller can backward them separately.
 
     The DT target is detached before its inverse transform, so its graph does
@@ -3521,9 +3513,6 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
         torch.sin(theta) * target_radii,
         torch.cos(theta) * target_radii,
     ], dim=-1).detach()
-    active_mask = _progressive_dt_active_mask(
-        target_shifted_per_group.squeeze(-1), dr_per_winding,
-        dt_max_winding)
 
     yield 'track_radius', radius_loss
     # The caller has now released the radius graph.  Keep only detached DT
@@ -3543,12 +3532,8 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
     sums.scatter_add_(0, flat_group_id, point_distances ** within_p)
     counts.scatter_add_(0, flat_group_id, torch.ones_like(point_distances))
     group_losses = (sums / counts.clamp(min=1)) ** (1 / within_p)
-    dt_loss = _aggregate_dt_track_losses(
-        group_losses, across_p, active_mask)
-    record_loss_samples(
-        'track_dt', target_spiral_zyxs, point_distances,
-        active_mask[flat_group_id] if active_mask is not None else None,
-    )
+    dt_loss = _aggregate_dt_track_losses(group_losses, across_p)
+    record_loss_samples('track_dt', target_spiral_zyxs, point_distances, None)
 
     yield 'track_dt', dt_loss
 

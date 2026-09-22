@@ -21,7 +21,6 @@ from fit_spiral import (
     _UnattachedPclStripList,
     get_dt_loss_eligibility,
     get_unattached_pcl_dt_start,
-    get_progressive_dt_max_winding,
     get_run_dt_resume_iteration,
     materialize_fiber_fit_inputs,
 )
@@ -75,16 +74,6 @@ class RunDtLossScheduleTests(unittest.TestCase):
         self.assertEqual(get_unattached_pcl_dt_start(decoupled), 0)
         self.assertTrue(get_dt_loss_eligibility(decoupled, 1)['unattached_pcl'])
         self.assertFalse(get_dt_loss_eligibility(decoupled, 1)['verified_patch'])
-
-    def test_progressive_winding_cutoff_is_unchanged(self):
-        cfg = Config({
-            'dt_progressive_windings': True,
-            'dt_progressive_inner_winding': 20,
-            'dt_progressive_steps': 100,
-            'dt_progressive_exponent': 1.0,
-        }).as_dict()
-        self.assertEqual(
-            get_progressive_dt_max_winding(cfg, 60, 10, 120), 70.0)
 
 
 class FiberPointCollectionTests(unittest.TestCase):

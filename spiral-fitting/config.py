@@ -787,10 +787,6 @@ class Config:
         # First iteration after which the unattached-PCL (fiber strip) DT snap
         # acts. None follows loss_start_patch_dt, the historical coupling.
         self.loss_start_unattached_pcl_dt = None
-        self.dt_progressive_windings = False
-        self.dt_progressive_inner_winding = 20
-        self.dt_progressive_steps = 50000
-        self.dt_progressive_exponent = 1.0
         self.dt_target_mode = "strip_median"
         self.dt_target_floating_threshold = 0.25
         # Backward-compatible alias. FitContext phase-locks whole-object DT

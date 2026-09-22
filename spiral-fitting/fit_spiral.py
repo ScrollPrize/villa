@@ -1129,34 +1129,6 @@ def get_or_build_unattached_pcl_flat(pcl_strips, device):
     return flat
 
 
-def get_progressive_dt_max_winding(cfg, iteration, dt_start_step, shell_outer_winding_idx):
-    # When `dt_progressive_windings` is set, the DT losses (patch, track, unattached-pcl) only act
-    # on tracks/patches whose snapped spiral-space winding is <= the returned cutoff. The cutoff
-    # grows outwards from `dt_progressive_inner_winding` (when the DT loss first turns on, at
-    # `dt_start_step`) to `shell_outer_winding_idx` over `dt_progressive_steps` steps, so the
-    # constraint expands across windings even after it has started. Returns None to disable gating
-    # (include everything) -- when the feature is off, or no outer winding is known.
-    #
-    # The membership test lives in spiral space, but tracks/patches are sampled in scroll space;
-    # callers reuse the per-track snapped winding (round(median(shifted_radius)/dr)) already needed
-    # for the DT target, so deciding inclusion needs no extra transform (only a handful of points).
-    #
-    # `dt_progressive_exponent` warps the linear time fraction f -> f**exponent before mapping to
-    # the winding cutoff. exponent == 1 grows the winding index (radius) linearly; exponent < 1 is
-    # concave (fast early, slow late), so the outermost windings -- which gain area/volume
-    # quadratically -- expand more slowly and get more time to catch up (~0.5 ≈ constant
-    # area-introduction rate); exponent > 1 is the opposite.
-    if not cfg['dt_progressive_windings'] or shell_outer_winding_idx is None:
-        return None
-    span = max(1, int(cfg['dt_progressive_steps']))
-    f = min(1., max(0., (iteration - dt_start_step) / span))
-    exponent = float(cfg['dt_progressive_exponent'])
-    f_warped = f ** exponent if exponent != 1.0 else f
-    w_inner = float(cfg['dt_progressive_inner_winding'])
-    w_outer = float(shell_outer_winding_idx)
-    return w_inner + (w_outer - w_inner) * f_warped
-
-
 def get_run_dt_resume_iteration(run_start, requested_iterations,
                                 last_fraction):
     """Return the first Run iteration eligible for directional DT losses.
@@ -5093,23 +5065,8 @@ class FitContext:
         dt_eligibility = get_dt_loss_eligibility(
             self.config, iteration, self.run_dt_resume_iteration)
         compute_patch_dt = dt_eligibility['verified_patch']
-        track_dt_start = self.config['loss_start_patch_dt'] if self.config['loss_start_track_dt'] is None else self.config['loss_start_track_dt']
         compute_track_dt = dt_eligibility['track']
         compute_unattached_pcl_dt = dt_eligibility['unattached_pcl']
-        unattached_pcl_dt_start = get_unattached_pcl_dt_start(self.config)
-
-        # Progressive-outward DT gating: winding cutoff that grows from the
-        # respective DT start step. None means no gating.
-        dt_progressive_outer = self.shell_outer_winding_idx
-        patch_dt_max_winding = get_progressive_dt_max_winding(self.config, iteration, self.config['loss_start_patch_dt'], dt_progressive_outer)
-        track_dt_max_winding = get_progressive_dt_max_winding(self.config, iteration, track_dt_start, dt_progressive_outer)
-        unattached_pcl_dt_max_winding = get_progressive_dt_max_winding(self.config, iteration, unattached_pcl_dt_start, dt_progressive_outer)
-        if patch_dt_max_winding is not None:
-            log_metrics['patch_dt_max_winding'] = patch_dt_max_winding
-        if track_dt_max_winding is not None:
-            log_metrics['track_dt_max_winding'] = track_dt_max_winding
-        if unattached_pcl_dt_max_winding is not None:
-            log_metrics['unattached_pcl_dt_max_winding'] = unattached_pcl_dt_max_winding
 
         patch_dt_target_cache = None
         unattached_pcl_dt_target_cache = None
@@ -5158,7 +5115,6 @@ class FitContext:
             compute_dt=compute_patch_dt,
             shell_valid_zyxs=self.shell_valid_zyxs_gpu,
             shell_outer_winding_idx=self.shell_outer_winding_idx,
-            dt_max_winding=patch_dt_max_winding,
             dt_target_cache=patch_dt_target_cache,
             crossing_map=self.theta_crossing_map,
             cfg=self.config,
@@ -5327,7 +5283,6 @@ class FitContext:
                 self.config['sample_count_unattached_pcls_per_step'],
                 self.config['sample_count_unattached_pcl_points_per_step'],
                 compute_dt=compute_unattached_pcl_dt,
-                dt_max_winding=unattached_pcl_dt_max_winding,
                 dt_target_cache=unattached_pcl_dt_target_cache,
                 crossing_map=self.theta_crossing_map,
                 cfg=self.config,
@@ -5345,7 +5300,6 @@ class FitContext:
                 self.prepared_main_tracks,
                 self.config,
                 compute_dt=compute_track_dt,
-                dt_max_winding=track_dt_max_winding,
                 dt_target_cache=track_dt_target_cache,
             ):
                 weight = (

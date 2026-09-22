@@ -29,15 +29,6 @@ def _masked_mean(values, mask):
     return (values * mask_f).sum() / mask_f.sum().clamp(min=1.)
 
 
-def _masked_median(values, mask):
-    """Lower median along the last dimension, excluding padded values."""
-    counts = mask.sum(dim=-1).clamp(min=1)
-    sortable = torch.where(mask, values, torch.full_like(values, torch.inf))
-    sorted_values = sortable.sort(dim=-1).values
-    median_idx = torch.div(counts - 1, 2, rounding_mode='floor')
-    return torch.gather(sorted_values, -1, median_idx[..., None]).squeeze(-1)
-
-
 _pinned_to_device = geom_utils.pinned_to_device
 _cached_scalar_tensor = geom_utils.cached_scalar_tensor
 
@@ -209,28 +200,14 @@ def _sample_patch_points(patch_indices, cap, rng, patch_atlas):
 
 
 
-def _aggregate_dt_track_losses(track_losses, across_p, active_mask=None):
-    # Power-mean across tracks/patches: ((sum x^p) / n)^(1/p). When `active_mask` is given
-    # (progressive DT gating), only the masked-in tracks contribute and n is the number active;
-    # returns a zero scalar when none are active.
-    if active_mask is not None:
-        track_losses = track_losses[active_mask]
+def _aggregate_dt_track_losses(track_losses, across_p):
+    # Power-mean across tracks/patches: ((sum x^p) / n)^(1/p); a zero scalar
+    # when there are none.
     if track_losses.numel() == 0:
         return torch.zeros([], device=track_losses.device)
     return ((track_losses ** across_p).sum() / track_losses.numel()) ** (1 / across_p)
 
 
-
-def _progressive_dt_active_mask(snapped_winding, dr_per_winding, dt_max_winding):
-    # Boolean mask over tracks/patches whose snapped spiral-space winding index is within the
-    # progressive cutoff (see get_progressive_dt_max_winding); None when gating is disabled.
-    # `snapped_winding` is the per-track round(median(shifted_radius)/dr)*dr target (sampled in
-    # scroll space, transformed to spiral space upstream); we divide dr_per_winding back out to
-    # recover the integer winding index.
-    if dt_max_winding is None:
-        return None
-    winding_idx = (snapped_winding / dr_per_winding).detach()
-    return winding_idx <= dt_max_winding
 
 
 @geom_utils.maybe_compile
@@ -501,7 +478,7 @@ def _patch_radius_and_dt_losses(
     slice_to_spiral_transform, dr_per_winding,
     all_slice_zyxs, all_spiral_zyxs, all_theta, all_shifted_radii,
     all_crossing_adjustments,
-    num_patches_for_radius, num_patches_for_dt, compute_dt, dt_max_winding,
+    num_patches_for_radius, num_patches_for_dt, compute_dt,
     radius_loss_margin, radius_loss_inv, radius_within_norm_p,
     dt_loss_margin, dt_norm_p, dt_within_patch_norm_p,
     patch_indices=None, sample_ijs=None, dt_target_cache=None, sample_mask=None,
@@ -619,15 +596,10 @@ def _patch_radius_and_dt_losses(
             ((point_distances ** dt_within_patch_norm_p) * dt_mask).sum(dim=-1)
             / dt_counts
         ) ** (1 / dt_within_patch_norm_p)
-        # Progressive DT: only patches whose snapped winding is within the current cutoff contribute.
-        active_mask = _progressive_dt_active_mask(target_shifted_radii.squeeze(-1), dr_per_winding, dt_max_winding)
-        patch_dt_loss = _aggregate_dt_track_losses(track_losses, dt_norm_p, active_mask)
-        diagnostic_mask = dt_mask
-        if active_mask is not None:
-            diagnostic_mask = diagnostic_mask & active_mask[..., None]
+        patch_dt_loss = _aggregate_dt_track_losses(track_losses, dt_norm_p)
         record_loss_samples(
             f'{diagnostic_prefix}_dt', dt_spiral_zyxs,
-            point_distances, diagnostic_mask,
+            point_distances, dt_mask,
             display_spiral_zyx=target_spiral_zyxs,
         )
     else:
@@ -637,7 +609,7 @@ def _patch_radius_and_dt_losses(
 
 
 
-def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True, shell_valid_zyxs=None, shell_outer_winding_idx=None, dt_max_winding=None, dt_target_cache=None, *, crossing_map, cfg):
+def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True, shell_valid_zyxs=None, shell_outer_winding_idx=None, dt_target_cache=None, *, crossing_map, cfg):
 
     n_umb = umbilicus_zyx.shape[0]
     if shell_valid_zyxs is not None:
@@ -685,7 +657,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
             slice_to_spiral_transform, dr_per_winding,
             all_slice_zyxs, all_spiral_zyxs, all_theta, all_shifted_radii,
             all_crossing_adjustments,
-            num_patches_for_radius, num_patches_for_dt, compute_dt, dt_max_winding,
+            num_patches_for_radius, num_patches_for_dt, compute_dt,
             cfg['patch_radius_loss_margin'], cfg['patch_radius_loss_inv'], cfg['patch_radius_within_norm_p'],
             cfg['patch_dt_loss_margin'], cfg['patch_dt_norm_p'], cfg['patch_dt_within_patch_norm_p'],
             patch_indices=batch[1], sample_ijs=sample_ijs, dt_target_cache=dt_target_cache,
@@ -1267,7 +1239,6 @@ def get_unattached_pcl_strip_losses(
     num_pcls_per_step,
     num_points_per_pcl,
     compute_dt,
-    dt_max_winding=None,
     dt_target_cache=None,
     *,
     crossing_map,
@@ -1524,19 +1495,10 @@ def get_unattached_pcl_strip_losses(
         ((point_distances ** within_p) * sample_mask).sum(dim=-1)
         / radius_counts.squeeze(-1)
     ) ** (1 / within_p)
-    # Progressive DT: only strips whose snapped (raw, spiral-space) winding is within the current
-    # cutoff contribute. Use shifted_radii (the strip's actual spiral position), not normalised_radii.
-    strip_snapped_winding = (
-        torch.round(_masked_median(shifted_radii, sample_mask) / dr_per_winding)
-        * dr_per_winding)
-    active_mask = _progressive_dt_active_mask(strip_snapped_winding, dr_per_winding, dt_max_winding)
-    dt_loss = _aggregate_dt_track_losses(track_losses, across_p, active_mask)
-    diagnostic_mask = sample_mask
-    if active_mask is not None:
-        diagnostic_mask = diagnostic_mask & active_mask[..., None]
+    dt_loss = _aggregate_dt_track_losses(track_losses, across_p)
     record_loss_samples(
         'unattached_pcl_dt', spiral_zyxs, point_distances,
-        diagnostic_mask,
+        sample_mask,
         display_spiral_zyx=target_spiral_zyxs,
     )
 

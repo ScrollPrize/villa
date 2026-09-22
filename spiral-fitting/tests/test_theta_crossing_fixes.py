@@ -135,7 +135,7 @@ class ThetaCrossingLossTests(unittest.TestCase):
             for inverse in (False, True):
                 radius_loss, dt_loss = _patch_radius_and_dt_losses(
                     _IdentityTransform(), dr, spiral, spiral, theta, shifted,
-                    torch.zeros_like(shifted), 1, 1, True, None,
+                    torch.zeros_like(shifted), 1, 1, True,
                     0.0, inverse, 3.0, 0.0, 1.0, 3.0,
                     sample_mask=mask)
                 self.assertLess(float(radius_loss), 2e-5)
@@ -220,7 +220,6 @@ class ThetaCrossingLossTests(unittest.TestCase):
             1,
             1,
             True,
-            None,
             0.0,
             True,
             1.0,
