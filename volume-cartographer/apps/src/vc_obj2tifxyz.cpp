@@ -313,10 +313,21 @@ public:
         std::cout << "Valid grid points: " << valid_count << " / " << (grid_size[0] * grid_size[1]) 
                   << " (" << (100.0f * valid_count / (grid_size[0] * grid_size[1])) << "%)" << std::endl;
         
-        // Scale is currently in OBJ units. Convert to micrometers now.
+        // An all-invalid surface is not a usable tifxyz. Returning nullptr
+        // prevents main() from saving sentinel-only x/y/z files and reporting
+        // success to scripts. This commonly happens when normalized [0,1] UVs
+        // are used with the default stretch_factor=1, which produces a 2x2 grid.
         if (valid_count == 0) {
-            std::cerr << "Warning: no valid grid points were rasterized." << std::endl;
+            std::cerr
+                << "Error: no valid grid points were rasterized; refusing to save an empty tifxyz. "
+                << "If the OBJ uses normalized [0,1] UVs, pass an explicit larger stretch_factor "
+                << "or use --tifxyz-source to preserve the source sampling density."
+                << std::endl;
+            delete points;
+            return nullptr;
         }
+
+        // Scale is currently in OBJ units. Convert to micrometers now.
         const bool src_scale_mode = (src_scale[0] > 0.f && src_scale[1] > 0.f);
         if (src_scale_mode) {
             // Scale was adopted verbatim from the source tifxyz; do not rescale.
@@ -523,7 +534,9 @@ int main(int argc, char *argv[])
         std::cout << "Converts an OBJ file to tifxyz format" << std::endl;
         std::cout << std::endl;
         std::cout << "Parameters:" << std::endl;
-        std::cout << "  stretch_factor: UV scaling factor (default: 1.0)" << std::endl;
+        std::cout << "  stretch_factor: UV grid-density multiplier (default: 1.0)." << std::endl;
+        std::cout << "                  Normalized [0,1] UVs usually need an explicit larger value" << std::endl;
+        std::cout << "                  or --tifxyz-source to preserve source sampling density." << std::endl;
         std::cout << "  mesh_units    : micrometers per OBJ unit (default: 1.0)" << std::endl;
         std::cout << "Flags:" << std::endl;
         std::cout << "  --uv-metric         : UVs are metric (default; UV units == OBJ units unless --uv-to-obj is set)" << std::endl;
@@ -539,7 +552,7 @@ int main(int argc, char *argv[])
         std::cout << std::endl;
         std::cout << "Note: Scale factors are automatically calculated from the mesh grid structure." << std::endl;
         std::cout << "Examples:" << std::endl;
-        std::cout << "  " << argv[0] << " mesh.obj outdir                       (legacy behavior)" << std::endl;
+        std::cout << "  " << argv[0] << " mesh.obj outdir                       (default UV-metric mode)" << std::endl;
         std::cout << "  " << argv[0] << " mesh.obj outdir 800 1.0 --uv-metric  (UV is metric, OBJ units == UV units)" << std::endl;
         std::cout << "  " << argv[0] << " mesh.obj outdir --uv-metric --uv-to-obj=0.001" << std::endl;
         return EXIT_SUCCESS;
@@ -705,7 +718,6 @@ int main(int argc, char *argv[])
     // Create quad surface
     QuadSurface* surf = converter.createQuadSurface(mesh_units);
     if (!surf) {
-        std::cerr << "Failed to create quad surface" << std::endl;
         return EXIT_FAILURE;
     }
     surf->meta = std::move(sourceMeta);
