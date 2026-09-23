@@ -882,6 +882,51 @@ def get_pin_strain_loss(pins, gap_stage, dr_per_winding, *, margin,
     return loss, strain.detach()
 
 
+def pair_agreement_residuals(w_a, w_b):
+    """Signed distance of the winding difference ``w_a - w_b`` from the
+    nearest integer, in ``(-0.5, 0.5]``. Zero for points on the same sheet
+    and for points on sheets a whole number of windings apart, so it needs
+    no seam bookkeeping: the theta=0 seam shifts one side by exactly one
+    winding. The rounding carries no gradient, so d(residual) = d(w_a - w_b).
+    """
+    difference = w_a - w_b
+    return difference - torch.round(difference).detach()
+
+
+def get_pair_agreement_loss(zyx_a, zyx_b, slice_to_spiral_transform, dr_per_winding, *,
+                            margin, chunk_size=65536):
+    """Modular pairwise winding agreement on the free map.
+
+    ``zyx_a[k]`` and ``zyx_b[k]`` are scroll-space points of *different*
+    constraint components that lie close together (within the pair
+    tolerance), so the sheet structure says their windings under the free map
+    differ by an integer. The loss is ``mean relu(|residual| - margin)`` over
+    the pairs with ``residual = pair_agreement_residuals(w_a, w_b)`` and
+    ``w = shifted_radius / dr``. It commits to no absolute integer: a pair on
+    the same sheet is as satisfied as a pair on adjacent sheets. Its purpose
+    is the warm-up before pinning: the per-component targets ``T`` are read
+    off the free map at activation, and pairs whose free-map difference is far
+    from an integer are exactly the cross-component conflicts the pinned map
+    cannot honour (pinned_spiral_plan.md, "preparing the warm-up").
+
+    Returns ``(loss, residual.detach())``; ``residual`` is empty when there
+    are no pairs.
+    """
+    count = int(zyx_a.shape[0])
+    if count == 0:
+        zero = torch.zeros([], device=zyx_a.device, dtype=torch.float32)
+        return zero, zero.new_zeros([0])
+    zyx = torch.cat([zyx_a, zyx_b], dim=0)
+    spiral = torch.cat([
+        slice_to_spiral_transform(zyx[start:start + chunk_size])
+        for start in range(0, zyx.shape[0], chunk_size)], dim=0)
+    _, _, shifted = get_theta_and_radii(spiral[..., 1:], dr_per_winding)
+    winding = shifted / dr_per_winding
+    residual = pair_agreement_residuals(winding[:count], winding[count:])
+    loss = F.relu(residual.abs() - float(margin)).mean()
+    return loss, residual.detach()
+
+
 def draw_rel_winding_rows(patches_dict, patch_atlas, point_collections,
                           sampling_strata, cfg):
     """Draw the PCL / patch-pair / point rows for one relative-winding loss

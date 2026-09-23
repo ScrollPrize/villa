@@ -691,12 +691,14 @@ class SpiralAndTransform(nn.Module):
         registry = self.pin_registry
         return torch.where(registry.fixed_T, registry.fixed_T_value, self.pin_targets)
 
-    def get_unpinned_slice_to_spiral_transform(self):
-        """The full scroll -> spiral transform with the free gap expander."""
+    def get_unpinned_slice_to_spiral_transform(self, shared=None):
+        """The full scroll -> spiral transform with the free gap expander.
+        ``shared`` is passed through to get_slice_to_spiral_transform (the
+        pins leaf, if present, is ignored)."""
         active = self.pins_active
         self.pins_active = False
         try:
-            return self.get_slice_to_spiral_transform()
+            return self.get_slice_to_spiral_transform(shared=shared)
         finally:
             self.pins_active = active
 

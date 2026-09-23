@@ -1042,6 +1042,30 @@ registries still load, but an already pinned checkpoint is evaluated with the
 new mapping. Unpinned transforms are unchanged. No speedup is assumed from
 this representation change.
 
+### Pair-agreement warm-up loss
+
+`loss_weight_pair_agreement` (default 0, off) adds a loss on the *free* map for
+the warm-up before pinning: pairs of verified-patch quad centres that belong to
+different constraint components and lie within
+`loss_pair_agreement_tolerance_voxels` of each other must differ by a whole
+number of windings, `mean relu(|d - round(d)| - loss_margin_pair_agreement)`
+with `d` the free-map winding difference. It commits to no absolute integer
+(same sheet and adjacent sheets are equally satisfied) and needs no seam
+bookkeeping. The pin targets are read off the free map at activation, so pairs
+whose difference is far from an integer are exactly the cross-component
+conflicts the pinned map cannot honour. Pairs are built once per model state
+from the full pin registry (every `loss_pair_agreement_stride`-th pin, KD-tree,
+capped at `loss_pair_agreement_max_pairs` by a seeded thinning) and
+`sample_count_pair_agreement` of them are drawn per step. The loss requires
+`model_pins_enabled` and keeps acting on the free map after activation. The
+headless log reports `pair_agreement_median` and
+`pair_agreement_frac_over_margin` with the pin diagnostics; the activation
+line `pin conflicts (step N)` is the number to watch.
+
+```bash
+AGENTS_AGENT_MODE=1 .venv/bin/python -m pytest -q tests/test_pair_agreement.py
+```
+
 Validate the synthetic radial maps and full CPU transform chain with:
 
 ```bash

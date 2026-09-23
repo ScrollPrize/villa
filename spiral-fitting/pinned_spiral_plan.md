@@ -765,3 +765,55 @@ queue for the annotations.
   `loss_pin_strain_detach_targets`, `optimizer_lr_pin_targets`.
 - `spiral_helpers.py`, `flatten_spiral_checkpoint.py`: ensure full pins at export.
 - `tests/`: as listed per stage.
+
+## Proposed: preparing the warm-up for pinning (2026-09-23)
+
+The pin targets `T` are read off the free map at activation (median free winding per
+component), so every conflict the pinned map meets is an inconsistency the free map
+already carries at that moment; the warm-up decides the conflict count, and the export
+metric is fixed at activation (satisfaction at step 0 after activation equals the value
+after 300 or 10,000 pinned steps). On the z 10000-11000 B-spline 24 fit the activation
+pairs diagnostic splits the ~10% inconsistent cross-component pin pairs as: same slot but
+free map more than half a winding apart, 66%; different slots with inverted free-map
+radial order, 21%; different slots with the gap compressed below the minimum rise, 12%.
+Nothing in the current warm-up objective sees the first class: the soft winding losses
+act only on annotated PCL pairs, patch-radius flattens each patch against its own
+median, and with 9194 components for 9309 patches almost nothing is linked. Three
+warm-up changes follow.
+
+1. **Modular pairwise agreement loss on the free map.** For nearby cross-patch quad
+   pairs (the pairs `conflicting_patch_demotion` already gathers: within 30 voxels,
+   cross-component) penalise the distance of the free-map winding difference from the
+   nearest integer, `dist(w_i - w_j, Z)`, hinged at a small margin. It commits to no
+   absolute integer, so it avoids the hardness of frozen integer targets, but it makes
+   the pairwise structure integer-consistent before `T` is estimated. Targets the 66%
+   class. Runs on the free map at roughly unpinned step cost (no pinned map needed).
+   *Implemented 2026-09-23* as `losses.get_pair_agreement_loss` /
+   `pins.cross_component_pairs`, config `loss_weight_pair_agreement` (off by default),
+   `loss_margin_pair_agreement`, `loss_pair_agreement_tolerance_voxels`,
+   `loss_pair_agreement_stride`, `loss_pair_agreement_max_pairs`,
+   `sample_count_pair_agreement`; tests in `tests/test_pair_agreement.py`. Pairs are
+   built once from the full registry and cached; the loss is evaluated on the unpinned
+   transform built from the step's shared leaves, before and after activation.
+
+2. **Order and spacing on shared rays against a detached provisional `T`.** Every few
+   hundred warm-up steps compute the component medians under `no_grad`, exactly as
+   activation would (`estimate_pin_targets`), and penalise pins whose free-map radial
+   order on a ray contradicts the provisional target order, plus gaps below the minimum
+   rise. This is the strain loss's job today, applied while the map is still free so it
+   can fix the 21% and 12% classes instead of the ordering guard dropping exactness
+   after activation.
+
+3. **Stop paying for work pinning does exactly.** Per-patch flatness is what the pinned
+   map delivers structurally, so `loss_weight_patch_radius` can be lowered during the
+   warm-up and the budget shifted to the two terms above. Not removed: a patch spread
+   over more than half a winding at activation cannot have its edges pinned without
+   order conflicts, so some flatness is a precondition. Independently of any loss, run
+   overlap linking (`patch_overlap_pairs` / `connect_overlapping_patches.py`) so that
+   co-located patches share one component and one `T`; the inconsistent cycles it adds
+   are what term 1 is meant to shrink first.
+
+Measurement: conflicts must be read on the free map at the activation step (the
+`pin conflicts (step N)` line and the pairs diagnostic), not through the export metric.
+The cleanest single readout is the demotion count at activation: today 300-430 patches;
+a warm-up that prepares for pinning should drive it toward zero.

@@ -1455,6 +1455,43 @@ def conflicting_patch_demotion(zyx, patch_index, component, n, estimate, T, *,
     return np.asarray(demoted, dtype=np.int64), report
 
 
+def cross_component_pairs(zyx, patch_index, component, *, tolerance=30.0, stride=4,
+                          max_pairs=None, seed=0):
+    """Index pairs of patch pins of different components within ``tolerance``
+    scroll voxels: the pairs the pair-agreement warm-up loss trains on
+    (losses.get_pair_agreement_loss). Every ``stride``-th pin is considered
+    (KD-tree, as in conflicting_patch_demotion); non-patch pins are skipped.
+    The result is an ``int64 [M, 2]`` tensor of indices into ``zyx`` on its
+    device, sorted, and thinned to ``max_pairs`` by a seeded permutation when
+    over that cap (so the pair set is a deterministic function of the
+    registry). Purely geometric: it does not depend on the model.
+    """
+    from scipy.spatial import cKDTree
+    num = int(zyx.shape[0])
+    empty = torch.zeros([0, 2], dtype=torch.int64, device=zyx.device)
+    if num == 0:
+        return empty
+    sel = np.arange(0, num, max(int(stride), 1))
+    sel = sel[(patch_index[sel] >= 0).cpu().numpy()]
+    if len(sel) < 2:
+        return empty
+    pts = zyx[sel].detach().cpu().numpy().astype(np.float64)
+    comp = component[sel].cpu().numpy()
+    pairs = cKDTree(pts).query_pairs(r=float(tolerance), output_type='ndarray')
+    if len(pairs) == 0:
+        return empty
+    a, b = pairs[:, 0], pairs[:, 1]
+    cross = comp[a] != comp[b]
+    a, b = sel[a[cross]], sel[b[cross]]
+    order = np.lexsort((b, a))
+    a, b = a[order], b[order]
+    if max_pairs is not None and len(a) > int(max_pairs):
+        keep = np.random.RandomState(int(seed)).permutation(len(a))[:int(max_pairs)]
+        keep.sort()
+        a, b = a[keep], b[keep]
+    return torch.from_numpy(np.stack([a, b], axis=1).astype(np.int64)).to(zyx.device)
+
+
 def joint_integer_targets(zyx, component, estimate, T_frac, fixed_T, fixed_T_value,
                           num_components, *, tolerance=3.0, stride=3, min_pairs=3):
     """Integer component targets that agree wherever components coincide.

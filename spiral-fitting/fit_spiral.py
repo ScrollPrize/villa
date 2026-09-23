@@ -120,6 +120,7 @@ from sample_spiral import (
 )
 from losses import (
     get_pin_strain_loss,
+    get_pair_agreement_loss,
     draw_abs_winding_rows,
     draw_rel_winding_rows,
     MissingPclSamplingWeightError,
@@ -3530,6 +3531,37 @@ class FitContext:
             self._pin_registry_full = full
         return full
 
+    def _pair_agreement_pairs(self):
+        """``(pairs, zyx)`` for the pair-agreement loss: cross-component
+        patch-pin index pairs within ``loss_pair_agreement_tolerance_voxels``
+        (pins.cross_component_pairs) over the full registry's points. Built
+        once per model state (the pairs are geometric, independent of the
+        model and of demotion) and cached; the registry itself is not kept.
+        """
+        cache = getattr(self, '_pair_agreement_cache', None)
+        if cache is not None:
+            return cache
+        if self.pin_graph is None:
+            raise ValueError('loss_weight_pair_agreement needs model_pins_enabled: '
+                             'its pairs come from the pin constraint graph')
+        started_at = time.perf_counter()
+        full = self._full_pin_registry()
+        pairs = pins_module.cross_component_pairs(
+            full.zyx, full.patch_index, full.component,
+            tolerance=float(self.config['loss_pair_agreement_tolerance_voxels']),
+            stride=int(self.config['loss_pair_agreement_stride']),
+            max_pairs=int(self.config['loss_pair_agreement_max_pairs']),
+            seed=int(self.config['optimizer_random_seed']))
+        zyx = full.zyx.detach().clone()
+        if self.dist.is_main_process:
+            print(f'pair agreement: {pairs.shape[0]} cross-component pin pairs within '
+                  f"{float(self.config['loss_pair_agreement_tolerance_voxels']):g} voxels "
+                  f"(every {int(self.config['loss_pair_agreement_stride'])}th of {full.num_pins} pins, "
+                  f"cap {int(self.config['loss_pair_agreement_max_pairs'])}; "
+                  f'{time.perf_counter() - started_at:.1f}s)')
+        self._pair_agreement_cache = (pairs, zyx)
+        return self._pair_agreement_cache
+
     def _demote_conflicting_patches(self, iteration=None):
         """Leave unpinned the verified patches that contradict their
         neighbours (``model_pin_demote_conflicting_patches``); see
@@ -4074,6 +4106,7 @@ class FitContext:
         self.pin_targets_loaded = False
         self.pins_activation_iteration = None
         self.pin_grad_by_family = {}
+        self._pair_agreement_cache = None
         if self.config.get('model_pins_enabled', False):
             progress.begin('loading', 'Building pin constraint graph')
             overlap_tolerance = float(self.config.get('model_pin_overlap_tolerance_voxels', 0.0) or 0.0)
@@ -6242,6 +6275,32 @@ class FitContext:
                 log_metrics['pin_strain_frac_over_margin'] = float(
                     (magnitude > float(self.config.get('loss_margin_pin_strain', 0.0))).float().mean())
 
+        # Pair agreement on the free map (pinned_spiral_plan.md, "preparing
+        # the warm-up"): nearby quad centres of different constraint
+        # components must differ by a whole number of windings. Evaluated on
+        # the unpinned transform (the step's own leaves) whether or not pins
+        # are active, since the pin targets are read off the free map.
+        weight_pair_agreement = float(self.config.get('loss_weight_pair_agreement', 0.0) or 0.0)
+        if weight_pair_agreement > 0:
+            pairs, pair_zyx = self._pair_agreement_pairs()
+            count = min(int(self.config['sample_count_pair_agreement']), int(pairs.shape[0]))
+            if count > 0:
+                chosen = pairs[torch.randint(int(pairs.shape[0]), [count], device=pairs.device)]
+                free_transform = (
+                    self.slice_to_spiral_transform
+                    if not self.spiral_and_transform._pins_enabled()
+                    else self.spiral_and_transform.get_unpinned_slice_to_spiral_transform(
+                        shared=shared_transform_leaves))
+                pair_loss, pair_residual = get_pair_agreement_loss(
+                    pair_zyx[chosen[:, 0]], pair_zyx[chosen[:, 1]], free_transform, self.dr_per_winding,
+                    margin=float(self.config.get('loss_margin_pair_agreement', 0.0)))
+                backward_family({'pair_agreement': pair_loss * weight_pair_agreement})
+                if pair_residual.numel() and iteration % 20 == 0:
+                    magnitude = pair_residual.abs()
+                    log_metrics['pair_agreement_median'] = float(magnitude.median())
+                    log_metrics['pair_agreement_frac_over_margin'] = float(
+                        (magnitude > float(self.config.get('loss_margin_pair_agreement', 0.0))).float().mean())
+
         patch_loss_values = get_patch_and_umbilicus_losses(
             self.slice_to_spiral_transform,
             self.dr_per_winding,
@@ -6722,7 +6781,8 @@ class FitContext:
                 pin_keys = ('pin_inexact_fraction', 'pin_rays_with_violation_fraction',
                             'pin_order_violations', 'pin_anchors_evaluated', 'pin_conflicts',
                             'pin_strain_median', 'pin_strain_p90', 'pin_strain_frac_over_margin',
-                            'pin_T_frac_mean', 'patch_radius_unweighted')
+                            'pin_T_frac_mean', 'patch_radius_unweighted',
+                            'pair_agreement_median', 'pair_agreement_frac_over_margin')
                 pin_items = [(k, log_metrics[k]) for k in pin_keys if k in log_metrics]
                 if pin_items:
                     print('  pins: ' + ', '.join(

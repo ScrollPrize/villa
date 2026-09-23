@@ -212,6 +212,14 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "loss_margin_pin_strain": 0.025,
     "loss_pin_strain_detach_targets": True,
     "loss_pins_replace_constraint_losses": True,
+    # The pair-agreement warm-up loss postdates checkpoints written with pins;
+    # missing means off.
+    "loss_weight_pair_agreement": 0.0,
+    "loss_margin_pair_agreement": 0.05,
+    "loss_pair_agreement_tolerance_voxels": 30.0,
+    "loss_pair_agreement_stride": 4,
+    "loss_pair_agreement_max_pairs": 4000000,
+    "sample_count_pair_agreement": 16384,
 })
 # The flow-gradient conditioning settings postdate durable checkpoints;
 # missing means off, which is exactly the earlier behaviour.
@@ -341,6 +349,21 @@ _PIN_DESCRIPTIONS = {
     "model_pin_targets_joint_tolerance_voxels": (
         "Scroll-voxel distance within which pins of different components "
         "count as coincident for the joint integer assignment."),
+    "loss_weight_pair_agreement": (
+        "Weight of the pair-agreement loss: nearby quad centres of different "
+        "constraint components must differ by a whole number of windings "
+        "under the free map (0 = off). Needs model_pins_enabled."),
+    "loss_margin_pair_agreement": (
+        "Hinge margin of the pair-agreement loss, in windings."),
+    "loss_pair_agreement_tolerance_voxels": (
+        "Scroll-voxel distance within which two quad centres of different "
+        "components form a pair for the pair-agreement loss."),
+    "loss_pair_agreement_stride": (
+        "Consider every n-th registry pin when building pair-agreement pairs."),
+    "loss_pair_agreement_max_pairs": (
+        "Cap on the stored pair-agreement pairs (seeded thinning above it)."),
+    "sample_count_pair_agreement": (
+        "Pair-agreement pairs evaluated per step."),
 }
 
 _OPTIMIZER_DESCRIPTIONS = {
@@ -1035,6 +1058,23 @@ class Config:
         self.loss_margin_pin_strain = 0.025
         self.loss_pin_strain_detach_targets = True
         self.loss_pins_replace_constraint_losses = True
+        # Pair agreement (pinned_spiral_plan.md, "preparing the warm-up"):
+        # nearby quad centres of different constraint components must differ
+        # by a whole number of windings under the *free* map, hinged at
+        # loss_margin_pair_agreement windings. Commits to no absolute integer;
+        # its job is to hand pin activation a free map whose cross-component
+        # pairs are consistent, since the pin targets are read off that map.
+        # Off by default. Needs model_pins_enabled (the pairs come from the
+        # pin constraint graph); acts on the free map before and after
+        # activation alike. Pairs: every stride-th patch pin, cross-component,
+        # within the tolerance, capped at max_pairs (seeded), of which
+        # sample_count_pair_agreement are drawn per step.
+        self.loss_weight_pair_agreement = 0.0
+        self.loss_margin_pair_agreement = 0.05
+        self.loss_pair_agreement_tolerance_voxels = 30.0
+        self.loss_pair_agreement_stride = 4
+        self.loss_pair_agreement_max_pairs = 4000000
+        self.sample_count_pair_agreement = 16384
         # Probability of hopping onto the linked fiber at each junction while
         # sampling a chain walk through a link component in the
         # unattached-strip loss.
