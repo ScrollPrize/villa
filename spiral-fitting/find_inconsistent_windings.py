@@ -668,12 +668,9 @@ def solve_min_edge_fix(reached, rel_adjacency, strip_delta, allowed_edge_keys=No
     winding(to) - winding(from) (or None if unmeasurable). Returns a result dict; an
     edge with z_e == 1 is one to change, with its suggested corrected delta.
 
-    `allowed_edge_keys`, when given, restricts the model to that set of edge keys
-    (`(pcl_id, frozenset((from_point_id, to_point_id)))`) -- pass the edges lying on the
-    inconsistent fundamental cycles so the solve only touches edges that can actually
-    close a broken loop. Edges on only-consistent cycles cannot help and only add
-    gauge freedom (a hub patch's potential can then float to its box bound, producing
-    huge spurious residuals), so excluding them keeps the suggestions sane and tight.
+    `allowed_edge_keys`, when given, restricts which edges may change, not
+    which consistency equations are retained. All measurable reached edges
+    remain in the model, including edges on previously consistent cycles.
     """
     # --- collect unique undirected rel edges among reached patches ---
     strip_memo = {}
@@ -696,8 +693,6 @@ def solve_min_edge_fix(reached, rel_adjacency, strip_delta, allowed_edge_keys=No
             if R not in reached:
                 continue
             key = (e['pcl_id'], frozenset((e['from_point_id'], e['to_point_id'])))
-            if allowed_edge_keys is not None and key not in allowed_edge_keys:
-                continue
             if key in seen:
                 continue
             seen.add(key)  # also blocks the reverse-direction copy from R's list
@@ -708,6 +703,7 @@ def solve_min_edge_fix(reached, rel_adjacency, strip_delta, allowed_edge_keys=No
                 continue
             edges.append({
                 'P': P, 'R': R,
+                'editable': allowed_edge_keys is None or key in allowed_edge_keys,
                 'D': int(e['winding_delta'] + sP - sR),
                 'pcl_id': e['pcl_id'], 'pcl_name': e['pcl_name'], 'source_file': e['source_file'],
                 'kind': e.get('kind'),
@@ -727,10 +723,10 @@ def solve_min_edge_fix(reached, rel_adjacency, strip_delta, allowed_edge_keys=No
     node_idx = {p: i for i, p in enumerate(nodes)}
     n, m = len(nodes), len(edges)
 
-    # BFS gives a feasible labelling u0_p = -acc_p (acc = winding(seed) - winding(entry)),
-    # so the box only needs to span the BFS winding range plus a small correction margin.
-    u0 = np.array([-reached[p]['acc'] for p in nodes], dtype=float)
-    big = float(np.max(np.abs(u0 - u0.mean())) + m + 10)  # generous, but contains u0
+    # Every consistent retained component admits potentials obtained along a
+    # simple path, after fixing one root at zero. This bound contains an
+    # optimum independently of the (possibly inconsistent) BFS accumulation.
+    big = float(sum(abs(e['D']) for e in edges) + 1)
     M = 2.0 * big + max(abs(e['D']) for e in edges) + 1.0
 
     # constraints: for edge i (u_R - u_P) - D_i <=  M z_i   and  -(...) <= -... + M z_i
@@ -744,18 +740,14 @@ def solve_min_edge_fix(reached, rel_adjacency, strip_delta, allowed_edge_keys=No
     A = coo_matrix((vals, (rows, cols)), shape=(2 * m, n + m)).tocsr()
     constraints = LinearConstraint(A, -np.inf, np.array(ub))
 
-    lb = np.concatenate([u0 - big, np.zeros(m)])
-    hi = np.concatenate([u0 + big, np.ones(m)])
-    if 'seed' not in node_idx:  # gauge-fix one node to break the per-component constant
-        seed_node = nodes[int(np.argmin(np.abs(u0)))]
-    else:
-        seed_node = 'seed'
-    si = node_idx[seed_node]
-    lb[si] = hi[si] = u0[si]
+    lb = np.concatenate([np.full(n, -big), np.zeros(m)])
+    hi = np.concatenate([np.full(n, big),
+                         np.array([float(e['editable']) for e in edges])])
+    lb[0] = hi[0] = 0.0
 
     c = np.concatenate([np.zeros(n), np.ones(m)])
     res = milp(c, constraints=constraints, integrality=np.ones(n + m),
-               bounds=Bounds(lb, hi), options={'time_limit': time_limit})
+               bounds=Bounds(lb, hi), options={'time_limit': time_limit, 'mip_rel_gap': 0.0})
 
     out_edges = []
     if res.x is not None:
@@ -1277,11 +1269,8 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
 
     loop_cycles = build_loop_cycles(loops, tree_edge_by_child, loop_patch_strip_delta)
 
-    # Edges lying on the inconsistent fundamental cycles (each cycle's tree-path steps plus
-    # its closing edge), keyed exactly as solve_min_edge_fix keys edges. Only these edges
-    # can close a broken loop, so the MILP is restricted to them -- edges on only-consistent
-    # cycles add gauge freedom that lets a hub patch's potential float to its box bound and
-    # produce huge spurious residuals.
+    # Allow edits on inconsistent fundamental cycles, while retaining all
+    # other reached-edge equations so a repair cannot break a consistent cycle.
     def _edge_key(step):
         return (step['rel_pcl_id'], frozenset((step['from_point_id'], step['to_point_id'])))
     inconsistent_cycle_edge_keys = set()
