@@ -59,6 +59,12 @@ inline bool parseTraceOption(
     };
     if (argument == "--step-voxels")
         config.stepVoxels = parseDouble(value("step-voxels"), "step-voxels");
+    else if (argument == "--sample-pool-radius-voxels")
+        config.samplePoolRadiusVoxels = parseDouble(value("sample-pool-radius-voxels"), "sample-pool-radius-voxels");
+    else if (argument == "--sample-pool-mode")
+        config.samplePoolMode = value("sample-pool-mode");
+    else if (argument == "--sample-pool-stencil")
+        config.samplePoolStencil = value("sample-pool-stencil");
     else if (argument == "--cone-angle-degrees")
         config.coneAngleDegrees = parseDouble(value("cone-angle-degrees"), "cone-angle-degrees");
     else if (argument == "--cone-angle-step-degrees")
@@ -164,6 +170,12 @@ inline void validateTraceOptions(const FiberTraceConfig& config)
 {
     if (!(config.stepVoxels > 0.0))
         throw std::invalid_argument("--step-voxels must be positive");
+    if (!(config.samplePoolRadiusVoxels >= 0.0) || !std::isfinite(config.samplePoolRadiusVoxels))
+        throw std::invalid_argument("--sample-pool-radius-voxels must be finite and non-negative");
+    if (config.samplePoolMode != "max" && config.samplePoolMode != "mean")
+        throw std::invalid_argument("--sample-pool-mode must be max or mean");
+    if (config.samplePoolStencil != "cross" && config.samplePoolStencil != "cube")
+        throw std::invalid_argument("--sample-pool-stencil must be cross or cube");
     if (!(config.coneAngleDegrees >= 0.0))
         throw std::invalid_argument("--cone-angle-degrees must be non-negative");
     if (config.coneGridSize < 1 || config.beamWidth < 1 ||
@@ -211,6 +223,9 @@ inline nlohmann::json traceConfigJson(const FiberTraceConfig& config)
         {"embedding_ema_half_life_base_voxels", config.embeddingEmaHalfLifeBaseVoxels},
         {"embedding_ema_delay_base_voxels", config.embeddingEmaDelayBaseVoxels},
         {"step_voxels", config.stepVoxels},
+        {"sample_pool_radius_voxels", config.samplePoolRadiusVoxels},
+        {"sample_pool_mode", config.samplePoolMode},
+        {"sample_pool_stencil", config.samplePoolStencil},
         {"cone_angle_degrees", config.coneAngleDegrees},
         {"cone_angle_step_degrees", config.coneAngleStepDegrees},
         {"cone_grid_size", config.coneGridSize},

@@ -28,6 +28,7 @@ DEFAULT_RCLONE_PARAMS = (
     "--stats-one-line",
 )
 DEFAULT_FIBERLET_THREADS = 32
+DEFAULT_MODEL_DIR = "~/.local/share/las_manager/models"
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class ManagerConfig:
     catalog_url: str = DEFAULT_CATALOG_URL
     open_data_bucket: str = DEFAULT_OPEN_DATA_BUCKET
     snapshot_dirs: tuple[str, ...] = ()
+    model_dir: str = DEFAULT_MODEL_DIR
     cache_dir: str = ""
     output_dir: str = ""
     venv: str = ""
@@ -49,7 +51,7 @@ class ManagerConfig:
     rclone_params: tuple[str, ...] = DEFAULT_RCLONE_PARAMS
 
     def resolved_path(self, name: str, *, required: bool = False) -> Path | None:
-        if name not in {"cache_dir", "output_dir", "venv", "atlas_dir", "fiberlet_binary"}:
+        if name not in {"cache_dir", "output_dir", "venv", "atlas_dir", "fiberlet_binary", "model_dir"}:
             raise KeyError(name)
         value = str(getattr(self, name)).strip()
         if not value:
@@ -59,7 +61,11 @@ class ManagerConfig:
         return _resolve_path(value, config_path().parent)
 
     def resolved_snapshot_dirs(self) -> tuple[Path, ...]:
-        return tuple(_resolve_path(value, config_path().parent) for value in self.snapshot_dirs)
+        model_dir = self.resolved_path("model_dir", required=True)
+        assert model_dir is not None
+        roots = [model_dir]
+        roots.extend(_resolve_path(value, config_path().parent) for value in self.snapshot_dirs)
+        return tuple(dict.fromkeys(roots))
 
 
 def config_path() -> Path:
@@ -91,7 +97,7 @@ def _validate(raw: dict[str, Any]) -> ManagerConfig:
         if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
             raise ValueError(f"{array_name} must be an array of strings")
         raw[array_name] = tuple(values)
-    for name in ("catalog_url", "open_data_bucket", "cache_dir", "output_dir", "venv", "atlas_dir", "upload_staging_s3", "fiberlet_binary"):
+    for name in ("catalog_url", "open_data_bucket", "cache_dir", "output_dir", "venv", "atlas_dir", "upload_staging_s3", "fiberlet_binary", "model_dir"):
         if name in raw and not isinstance(raw[name], str):
             raise ValueError(f"{name} must be a string")
     if "catalog_max_age_seconds" in raw:
@@ -126,6 +132,8 @@ def render_config(config: ManagerConfig = ManagerConfig()) -> str:
         f"catalog_url = {_toml_string(values['catalog_url'])}",
         f"open_data_bucket = {_toml_string(values['open_data_bucket'])}",
         f"snapshot_dirs = [{snapshots}]",
+        "# Persistent manager-owned checkpoints imported with `snapshot import`.",
+        f"model_dir = {_toml_string(values['model_dir'])}",
         f"cache_dir = {_toml_string(values['cache_dir'])}",
         f"output_dir = {_toml_string(values['output_dir'])}",
         f"venv = {_toml_string(values['venv'])}",
@@ -179,8 +187,10 @@ def initialize_config(*, path: Path | None = None, force: bool = False) -> Path:
 def display_config(config: ManagerConfig) -> dict[str, Any]:
     result = asdict(config)
     result["config_path"] = str(config_path())
-    result["snapshot_dirs"] = [str(path) for path in config.resolved_snapshot_dirs()]
-    for name in ("cache_dir", "output_dir", "venv", "atlas_dir", "fiberlet_binary"):
+    result["snapshot_dirs"] = [
+        str(_resolve_path(value, config_path().parent)) for value in config.snapshot_dirs
+    ]
+    for name in ("cache_dir", "output_dir", "venv", "atlas_dir", "fiberlet_binary", "model_dir"):
         value = config.resolved_path(name)
         result[name] = str(value) if value is not None else ""
     return result

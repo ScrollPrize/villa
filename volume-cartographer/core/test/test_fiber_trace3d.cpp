@@ -2595,3 +2595,46 @@ TEST_CASE("Case-local readiness eviction and disabled mode conservatively rechec
     disabled.await(a, wait, active);
     CHECK(calls == 5);
 }
+
+TEST_CASE("sample pooling max-pools or averages presence and weights direction by presence")
+{
+    using vc::fiber_tracer::FiberPredictionSample;
+    vc::fiber_tracer::FiberTraceConfig config;
+    config.samplePoolRadiusVoxels = 2.0;
+    const auto cross = vc::fiber_tracer::testing::debugSamplePoolOffsets(config);
+    REQUIRE(cross.size() == 7);
+    CHECK(cross[0] == cv::Vec3f(0.0f, 0.0f, 0.0f));
+    CHECK(cross[2] == cv::Vec3f(2.0f, 0.0f, 0.0f));
+    config.samplePoolStencil = "cube";
+    CHECK(vc::fiber_tracer::testing::debugSamplePoolOffsets(config).size() == 27);
+    config.samplePoolRadiusVoxels = 0.0;
+    CHECK(vc::fiber_tracer::testing::debugSamplePoolOffsets(config).empty());
+
+    // One candidate, stencil of three: centre, a stronger neighbour, an invalid one.
+    std::vector<FiberPredictionSample> expanded(3);
+    expanded[0].options.push_back({{1.0f, 0.0f, 0.0f}, 0.2f, true});
+    expanded[1].options.push_back({{0.0f, 1.0f, 0.0f}, 0.8f, true});
+    expanded[2].options.push_back({{0.0f, 0.0f, 1.0f}, 1.0f, false});
+    config.samplePoolRadiusVoxels = 1.0;
+    config.samplePoolMode = "max";
+    auto pooled = vc::fiber_tracer::testing::debugPoolPredictionSamples(expanded, 3, config);
+    REQUIRE(pooled.size() == 1);
+    REQUIRE(pooled[0].options.size() == 1);
+    CHECK(pooled[0].options[0].valid);
+    CHECK(pooled[0].options[0].presence == doctest::Approx(0.8));
+    const float norm = std::sqrt(0.2f * 0.2f + 0.8f * 0.8f);
+    CHECK(pooled[0].options[0].direction[0] == doctest::Approx(0.2 / norm));
+    CHECK(pooled[0].options[0].direction[1] == doctest::Approx(0.8 / norm));
+    CHECK(pooled[0].options[0].direction[2] == doctest::Approx(0.0));
+    config.samplePoolMode = "mean";
+    pooled = vc::fiber_tracer::testing::debugPoolPredictionSamples(expanded, 3, config);
+    CHECK(pooled[0].options[0].presence == doctest::Approx(0.5));
+
+    // All stencil samples invalid: the pooled option is invalid, not zero-presence valid.
+    std::vector<FiberPredictionSample> empty(3);
+    for (auto& sample : empty)
+        sample.options.push_back({{1.0f, 0.0f, 0.0f}, 1.0f, false});
+    pooled = vc::fiber_tracer::testing::debugPoolPredictionSamples(empty, 3, config);
+    CHECK_FALSE(pooled[0].options[0].valid);
+    CHECK_THROWS(vc::fiber_tracer::testing::debugPoolPredictionSamples(expanded, 2, config));
+}

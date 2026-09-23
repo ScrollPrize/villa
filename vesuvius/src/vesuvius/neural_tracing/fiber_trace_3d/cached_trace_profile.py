@@ -21,13 +21,21 @@ _trial_session_limit = 1
 
 
 def reference_backgrounds(evaluation, stores, mapping):
-    """Build low-priority centerline chunk sets for a bound reference plan."""
+    """Build low-priority centerline chunk sets for a bound reference plan.
+
+    ``evaluation["reference_prefetch_margin_base_voxels"]`` widens the set to
+    the whole tube within that many base voxels of each reference, so that a
+    tracer-parameter search can prefill everything a variant may read.
+    """
     from lasagna.demand_predict3d import DemandGeometry
-    from .live_evaluate import reference_chunks
+    from .live_evaluate import reference_chunks, tube_chunks
     backgrounds = {key: set() for key in stores}
     plan = evaluation.get("reference_plan")
     if not plan:
         return backgrounds
+    margin = evaluation.get("reference_prefetch_margin_base_voxels")
+    if margin is not None and (isinstance(margin, bool) or not isinstance(margin, (int, float)) or margin <= 0):
+        raise ValueError("reference_prefetch_margin_base_voxels must be a positive number")
     cache_geometry = {}
     for source in plan["sources"]:
         key = mapping[source["source_id"]]
@@ -41,6 +49,9 @@ def reference_backgrounds(evaluation, stores, mapping):
             for run in fiber["runs"]:
                 backgrounds[key].update(reference_chunks(
                     run["points_base_xyz"], factor, geometry.output_shape, geometry.chunk))
+                if margin is not None:
+                    backgrounds[key].update(tube_chunks(
+                        run["points_base_xyz"], float(margin), factor, geometry.output_shape, geometry.chunk))
     return backgrounds
 
 

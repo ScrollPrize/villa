@@ -110,6 +110,16 @@ struct FiberTraceConfig {
     std::string embeddingAnchorTouch = "nearest";
     double embeddingAnchorTemperature = 0.1;
     double stepVoxels = 4.0;
+    // Neighbourhood pooling of the prediction sample. With a positive radius
+    // (trace voxels) every candidate point is also sampled at a stencil of
+    // offsets around it and the per-option presence is max-pooled ("max") or
+    // averaged ("mean"), with a presence-weighted mean direction. This mimics
+    // tracing a blurred or lower-resolution prediction without a new cache.
+    // "cross" samples the centre and the six axis neighbours; "cube" samples
+    // the full 3x3x3 stencil.
+    double samplePoolRadiusVoxels = 0.0;
+    std::string samplePoolMode = "max";
+    std::string samplePoolStencil = "cross";
     double coneAngleDegrees = 25.0;
     double coneAngleStepDegrees = 5.0;
     int coneGridSize = 25;
@@ -629,6 +639,15 @@ struct CandidateScoreDebug {
     const cv::Vec3d& historyDirection,
     const cv::Vec3d& candidateDirection,
     const FiberTraceConfig& config);
+
+// Pools ``stencilSize`` consecutive samples per candidate as the tracer does
+// for ``--sample-pool-radius-voxels``; exposed for tests.
+[[nodiscard]] std::vector<FiberPredictionSample> debugPoolPredictionSamples(
+    const std::vector<FiberPredictionSample>& expanded, size_t stencilSize, const FiberTraceConfig& config);
+
+// Stencil offsets (trace voxels) for the configured pooling radius; the first is
+// always the centre. Empty when pooling is disabled.
+[[nodiscard]] std::vector<cv::Vec3f> debugSamplePoolOffsets(const FiberTraceConfig& config);
 
 [[nodiscard]] CandidateScoreDebug debugCandidateLossFromSample(
     const FiberPredictionSample& sample,

@@ -320,6 +320,12 @@ def main():
     if args.mode == "cached-full":
         # Read-only published-cache evaluator: no manager GPU lease, no CUDA.
         import os
+        if workload.get("beam_sweep"):
+            # The sweep blanks CUDA itself unless it was configured for
+            # manager-backed demand inference.
+            from vesuvius.neural_tracing.fiber_trace_3d.beam_parameter_sweep import run_sweep
+            run_sweep(workload)
+            return 0
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         from vesuvius.neural_tracing.fiber_trace_3d.cached_trace_profile import run_full
         run_full(workload)

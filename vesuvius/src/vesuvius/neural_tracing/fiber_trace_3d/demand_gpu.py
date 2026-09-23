@@ -68,6 +68,8 @@ class DemandCohort:
 
 
 class DemandGpuLease:
+    idle_release_seconds = 30
+
     def __init__(self, pool, settings, *, clock=time.monotonic):
         selected = resolve_gpu_uuids(settings.get("devices", "0"))
         budget = settings.get("vram_bytes_per_gpu")
@@ -77,6 +79,14 @@ class DemandGpuLease:
         if type(exclusive) is not bool:
             raise ValueError("gpu_manager.exclusive must be boolean")
         self.manager_socket = settings.get("socket")
+        # Seconds of GPU idleness before the lease self-pauses and yields the
+        # grant. A tracer that reads warm chunks for a while and then needs one
+        # more tile re-queues behind other tenants on every pause, so a
+        # parameter search that runs many short variants raises this.
+        self.idle_release_seconds = settings.get("idle_release_seconds", 30)
+        if (isinstance(self.idle_release_seconds, bool) or not isinstance(self.idle_release_seconds, (int, float))
+                or not self.idle_release_seconds > 0):
+            raise ValueError("gpu_manager.idle_release_seconds must be a positive number")
         request = dict(max_cpu_cores=int(settings.get("cpu_cores", 16)),
                        max_gpus=len(selected), min_vram_bytes_per_gpu=budget,
                        max_vram_bytes_per_gpu=budget, allowed_gpu_uuids=selected,
@@ -108,7 +118,7 @@ class DemandGpuLease:
         idle = self.idle_paused
         if need:
             idle = False
-        elif self.clock() - pool.last_gpu_activity >= 30:
+        elif self.clock() - pool.last_gpu_activity >= self.idle_release_seconds:
             idle = True
         if supervisor.connected and not supervisor.stopping and idle != self.idle_paused:
             # Self-pause is distinct from administrative pause/other contenders.

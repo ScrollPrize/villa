@@ -58,6 +58,7 @@ ${EDITOR:-vi} "${XDG_CONFIG_HOME:-$HOME/.config}/las_manager/config.toml"
 las_manager fetch
 las_manager volume ls --sample PHerc0332
 las_manager snapshot ls
+las_manager snapshot import /path/to/RUN/snapshots/best.pt --model-identifier OWNER/REPOSITORY
 las_manager volume prefetch <volume> 1 --workers 512
 las_manager inference run <snapshot> <volume> [scale]
 las_manager las-inference <snapshot> <volume> [scale]

@@ -6,6 +6,7 @@ the ordinary Lasagna/OME-Zarr format and the existing model/tiled finalizers.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from contextlib import ExitStack
 import hashlib
 import itertools
@@ -141,6 +142,56 @@ def reference_chunks(points_base, factor, shape, chunk):
             for corner in itertools.product((0, 1), repeat=3):
                 index = np.minimum(floor + corner, np.asarray(shape) - 1) // chunk
                 result.add(tuple(int(v) for v in index))
+    return result
+
+
+def tube_chunks(points_base, margin_base, factor, shape, chunk):
+    """Output chunks within ``margin_base`` base voxels of a reference polyline.
+
+    ``reference_chunks`` returns only the chunks the line itself crosses, which
+    is what a trace that follows the reference reads. A trace that steps
+    differently reads anywhere the evaluator lets it drift before restarting,
+    so a parameter search prefetches the whole acceptance tube once and then
+    replays every variant without inference. Membership is exact per sample:
+    a chunk is included when the distance from a sample point to its axis
+    aligned box is at most the margin. Samples are the polyline vertices plus
+    midpoints subdivided until spacing is below a quarter chunk, so no chunk
+    within the margin of the line can be skipped between samples by more
+    than that spacing; the margin should include that slack.
+    """
+    if not (margin_base >= 0) or not math.isfinite(margin_base):
+        raise ValueError("tube margin must be finite and non-negative")
+    points = np.asarray(points_base, dtype=np.float64) / factor
+    radius = float(margin_base) / factor
+    if len(points) == 0:
+        return set()
+    if len(points) == 1:
+        samples = points
+    else:
+        pieces = []
+        spacing = chunk / 4.0
+        for left, right in zip(points[:-1], points[1:]):
+            n = max(1, int(math.ceil(float(np.linalg.norm(right - left)) / spacing)))
+            pieces.append(left + (right - left) * (np.arange(n, dtype=np.float64) / n)[:, None])
+        pieces.append(points[-1:])
+        samples = np.concatenate(pieces)
+    samples = samples[:, ::-1]  # XYZ points to ZYX lattice order
+    extent = np.asarray(shape, dtype=np.float64)
+    # Chunks entirely outside the array cannot exist; clip candidate windows.
+    n_chunks = np.ceil(extent / chunk).astype(np.int64)
+    result = set()
+    lo_all = np.maximum(np.floor((samples - radius) / chunk).astype(np.int64), 0)
+    hi_all = np.minimum(np.floor((samples + radius) / chunk).astype(np.int64), n_chunks - 1)
+    for sample, lo, hi in zip(samples, lo_all, hi_all):
+        if np.any(hi < lo):
+            continue
+        grids = np.meshgrid(*(np.arange(a, b + 1) for a, b in zip(lo, hi)), indexing="ij")
+        index = np.stack([g.ravel() for g in grids], axis=1)
+        box_lo = index * chunk
+        box_hi = np.minimum(box_lo + chunk, extent) - 1
+        nearest = np.clip(sample, box_lo, box_hi)
+        inside = np.sum((nearest - sample) ** 2, axis=1) <= radius * radius
+        result.update(tuple(int(v) for v in row) for row in index[inside])
     return result
 
 
@@ -607,6 +658,34 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
             from concurrent.futures import CancelledError
             raise CancelledError('trace extraction cancelled')
     check_cancelled()
+    # Reference prefetch is normally requested in full at hello. An optional
+    # cap feeds it in bounded waves instead: every requested chunk holds
+    # accumulator records until it publishes, so requesting a whole reference
+    # tube at once exhausts the hot arena and stalls accumulation with the GPUs
+    # idle. The cap bounds requested-but-unpublished background chunks.
+    background_cap = settings.get("background_chunk_cap")
+    if background_cap is None:
+        background_cap = float("inf")
+    elif type(background_cap) is not int or background_cap < 1:
+        raise ValueError("inference.background_chunk_cap must be a positive integer")
+    background_queues = {}
+    background_inflight = {key: deque() for key in stores}
+
+    def background_remaining():
+        return any(background_queues.values())
+
+    def top_up_backgrounds():
+        inflight = 0
+        for key, origins in background_inflight.items():
+            while origins and stores[key].ready(origins[0]):
+                origins.popleft()
+            inflight += len(origins)
+        for key, queue in background_queues.items():
+            while queue and inflight < background_cap:
+                origin = stores[key].request(queue.popleft(), background=True)
+                if not stores[key].ready(origin):
+                    background_inflight[key].append(origin)
+                    inflight += 1
     with ExitStack() as cleanup, tempfile.TemporaryDirectory(prefix="fiber-live-control-") as control:
         listener = cleanup.enter_context(socket.socket())
         listener.bind(("127.0.0.1", 0))
@@ -620,7 +699,16 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
         runtime_config = Path(control) / "evaluation.json"
         atomic_write(runtime_config, evaluation)
         log = cleanup.enter_context((Path(control) / "native.log").open("w+"))
-        native = subprocess.Popen([str(binary), "replay-set", "--config", str(runtime_config)], stdout=log, stderr=subprocess.STDOUT)
+        # Runtime-only environment for the native evaluator (for example an
+        # alternative allocator via LD_PRELOAD); it never reaches the config
+        # the native process reads and is not part of any cache identity.
+        native_environment = evaluation.get("native_environment", {})
+        if not isinstance(native_environment, dict) or any(
+                not isinstance(k, str) or not isinstance(v, str) for k, v in native_environment.items()):
+            raise ValueError("native_environment must map strings to strings")
+        native = subprocess.Popen([str(binary), "replay-set", "--config", str(runtime_config)],
+                                  stdout=log, stderr=subprocess.STDOUT,
+                                  env={**os.environ, **native_environment} if native_environment else None)
         try:
             # Observe startup failure instead of waiting the whole accept timeout.
             listener.settimeout(0.1)
@@ -694,9 +782,8 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                             # Hello is sent only after native source/annotation
                             # validation. Prefetch is required even for a case
                             # that terminates without issuing a sample demand.
-                            for background_key, indices in backgrounds.items():
-                                for index in sorted(indices):
-                                    stores[background_key].request(index, background=True)
+                            background_queues = {key: deque(sorted(indices)) for key, indices in backgrounds.items()}
+                            top_up_backgrounds()
                             continue
                         if message.get("type") != "demand" or message["request_id"] in waiters:
                             raise ValueError("invalid/duplicate native request")
@@ -708,6 +795,8 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                             origin = stores[key].request(item["index_zyx"], remaining=float(message["remaining_base_voxels"]))
                             targets.add((key, origin))
                         waiters[message["request_id"]] = targets
+                if authenticated:
+                    top_up_backgrounds()
                 queued = any(s.pending_tile_key() is not None for s in stores.values())
                 if pool is None and queued:
                     if not allow_inference:
@@ -749,11 +838,14 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                 raise RuntimeError("native evaluation failed (see native.log)")
             # Reference-intersection work is explicitly drained even if traces
             # finished before lower-priority prefetch did.
+            if pool is None and background_remaining():
+                raise RuntimeError("reference prefetch remains queued without an inference pool")
             if pool is not None:
                 if queue_log is None:
                     open_queue_log()
-                while pool.busy:
+                while pool.busy or background_remaining():
                     check_cancelled()
+                    top_up_backgrounds()
                     if gpu_lease is not None:
                         gpu_lease.tick()
                     pool.pump()

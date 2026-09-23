@@ -3099,3 +3099,7 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
   all five physical scrolls, including the Paris4 subset. Preserve source base
   dimensions and scale; validate all relative array bindings. Approved runner
   supports --export-manifests-only to refresh metadata without inference.
+# 2026-09-23
+
+- Added manager-owned, SHA-256-bound snapshot imports and required stable
+  external model identifiers for new inference runs.

@@ -16,6 +16,7 @@ COMMAND_REGISTRY: tuple[tuple[Command, str], ...] = (
     (("config", "show"), "show resolved configuration"),
     (("fetch",), "refresh the open-data catalog"),
     (("snapshot", "ls"), "list configured snapshots"),
+    (("snapshot", "import"), "copy and identify a checkpoint"),
     (("volume", "ls"), "list open-data volumes"),
     (("volume", "prefetch"), "download one volume scale"),
     (("inference", "ls"), "list durable inference records"),
@@ -39,6 +40,7 @@ COMMANDS: tuple[Command, ...] = tuple(command for command, _description in COMMA
 _OPTIONS: dict[Command, dict[str, tuple[str, ...] | None]] = {
     ("config", "init"): {"--force": None},
     ("snapshot", "ls"): {"--backend": ("fiber3d", "lasagna")},
+    ("snapshot", "import"): {"--model-identifier": (), "--run": ()},
     ("volume", "ls"): {"--sample": ("@samples",), "--format": ("@formats",), "--json": None},
     ("volume", "prefetch"): {"--workers": (), "--no-remote-inventory": None},
     ("inference", "run"): {
