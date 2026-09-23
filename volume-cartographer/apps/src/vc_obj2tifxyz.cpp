@@ -313,7 +313,6 @@ public:
         std::cout << "Valid grid points: " << valid_count << " / " << (grid_size[0] * grid_size[1]) 
                   << " (" << (100.0f * valid_count / (grid_size[0] * grid_size[1])) << "%)" << std::endl;
         
-        // Scale is currently in OBJ units. Convert to micrometers now.
         if (valid_count == 0) {
             std::cerr << "Warning: no valid grid points were rasterized." << std::endl;
         }
@@ -321,16 +320,73 @@ public:
         if (src_scale_mode) {
             // Scale was adopted verbatim from the source tifxyz; do not rescale.
             std::cout << "Scale (from source tifxyz): " << scale[0] << ", " << scale[1] << std::endl;
-        } else if (uv_is_metric) {
-            scale[0] *= mesh_units;
-            scale[1] *= mesh_units;
-            std::cout << "Scale from UV (micrometers): " << scale[0] << ", " << scale[1] << std::endl;
         } else {
-            // Measure from 3D to preserve anisotropy and noise-robustness (already compensated in determineGridDimensions)
-            calculateScaleFromGrid(*points, mesh_units);
+            // Tifxyz scale is a density: grid cells per surface/volume unit.
+            // The UV stretch factor only chooses how densely to rasterize the OBJ;
+            // it does not describe the spacing of the resulting 3D grid. Measure
+            // the final rasterized grid and store the reciprocal spacing so
+            // QuadSurface::size/gridToSurface and vc_flatten see the same geometry.
+            calculateDensityScaleFromGrid(*points, mesh_units);
         }
         
         return new QuadSurface(points, scale);
+    }
+
+    void calculateDensityScaleFromGrid(const cv::Mat_<cv::Vec3f>& points, float mesh_units = 1.0f) {
+        double sum_x = 0.0;
+        double sum_y = 0.0;
+        int count = 0;
+
+        int jmin = static_cast<int>(points.rows * 0.1) + 1;
+        int jmax = static_cast<int>(points.rows * 0.9);
+        int imin = static_cast<int>(points.cols * 0.1) + 1;
+        int imax = static_cast<int>(points.cols * 0.9);
+        int step = 4;
+
+        if (points.rows < 20 || points.cols < 20) {
+            jmin = 1;
+            jmax = points.rows;
+            imin = 1;
+            imax = points.cols;
+            step = 1;
+        }
+
+        for (int j = jmin; j < jmax; j += step) {
+            for (int i = imin; i < imax; i += step) {
+                if (points(j, i)[0] == -1 || points(j, i-1)[0] == -1 || points(j-1, i)[0] == -1)
+                    continue;
+
+                const cv::Vec3f dx = points(j, i) - points(j, i-1);
+                const cv::Vec3f dy = points(j, i) - points(j-1, i);
+                const double dist_x_sq = dx.dot(dx);
+                const double dist_y_sq = dy.dot(dy);
+                if (dist_x_sq <= 0.0 || dist_y_sq <= 0.0)
+                    continue;
+
+                sum_x += std::sqrt(dist_x_sq);
+                sum_y += std::sqrt(dist_y_sq);
+                count++;
+            }
+        }
+
+        if (count > 0 && sum_x > 0.0 && sum_y > 0.0) {
+            const double spacing_x = (sum_x / count) * mesh_units;
+            const double spacing_y = (sum_y / count) * mesh_units;
+            scale[0] = static_cast<float>(1.0 / spacing_x);
+            scale[1] = static_cast<float>(1.0 / spacing_y);
+            std::cout << "Measured tifxyz scale (grid cells per unit): "
+                      << scale[0] << ", " << scale[1] << std::endl;
+            return;
+        }
+
+        // If the final grid is too sparse to measure, preserve the previous
+        // UV-derived fallback but convert its spacing convention to tifxyz
+        // density instead of writing spacing into meta.json.
+        if (scale[0] > 0.f) scale[0] = 1.0f / (scale[0] * mesh_units);
+        if (scale[1] > 0.f) scale[1] = 1.0f / (scale[1] * mesh_units);
+        std::cerr << "Warning: Could not measure final grid spacing; "
+                     "using reciprocal UV-derived scale "
+                  << scale[0] << ", " << scale[1] << std::endl;
     }
     
     void calculateScaleFromGrid(const cv::Mat_<cv::Vec3f>& points, float mesh_units = 1.0f) {
