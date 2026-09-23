@@ -6303,6 +6303,9 @@ if __name__ == '__main__':
     maybe_init_distributed(dist_context)
     try:
         config = Config().as_dict()
+        # The dataset's own winding count (spiral-scroll.json winding_count)
+        # replaces the Python defaults before any explicit override.
+        config.update(scroll_spec.config_defaults())
         config.update(get_env_config_overrides())
         z_range_scaled_count_keys = (
             'sample_count_patches_per_step',

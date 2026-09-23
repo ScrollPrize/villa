@@ -48,9 +48,11 @@ class _ResidentDriver:
 
 def _resolved_config(spec, extra=None):
     from config import Config
+    from fit_session import load_scroll_spec
     from spiral_helpers import SAMPLING_COUNT_FLOORS, scale_counts_for_z_range
 
     config = Config().as_dict()
+    config.update(load_scroll_spec(spec['dataset_path']).config_defaults())
     config.update(spec.get('config_overrides', {}))
     config.update(extra or {})
     config['z_begin'] = spec['z_begin']
