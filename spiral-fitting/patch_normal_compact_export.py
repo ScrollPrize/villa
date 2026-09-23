@@ -37,6 +37,7 @@ class CompactPatchNormalWriter:
             raise ValueError('invalid compact patch-normal grid or brick size')
         self.shape = tuple(map(int, shape))
         self.cell_size = float(cell_size)
+        self.base_scale = float(base_scale)
         self.chunk_edge = int(chunk_edge)
         self.brick_edge = int(brick_edge)
         self.grid = tuple((s + brick_edge - 1) // brick_edge for s in self.shape)
@@ -45,12 +46,10 @@ class CompactPatchNormalWriter:
         self.written = set()
         self.lock = threading.Lock()
         self.output.mkdir(parents=True)
-        self.sidecar = self.output / 'signed_normals_u8.respool'
-        self.sidecar.mkdir()
         self.table = np.lib.format.open_memmap(
-            self.sidecar / 'table.npy', mode='w+', dtype=np.int32, shape=self.grid)
+            self.output / 'table.npy', mode='w+', dtype=np.int32, shape=self.grid)
         self.table[:] = 0
-        self.files = {name: (self.sidecar / name).open('wb') for name in
+        self.files = {name: (self.output / name).open('wb') for name in
                       ('brick_coords.i32', 'bits.i64', 'prefix.i16', 'offsets.i64', 'values.u8')}
         self.files['brick_coords.i32'].write(np.asarray([[-1, -1, -1]], dtype=np.int32).tobytes())
         words = (brick_edge ** 3 + 63) // 64
@@ -58,19 +57,18 @@ class CompactPatchNormalWriter:
         self.files['prefix.i16'].write(bytes(words * 2))
         self.files['offsets.i64'].write(np.asarray([1, 1], dtype=np.int64).tobytes())
         self.files['values.u8'].write(b'\0\0\0')
-        self.info = dict(artifact_type='signed_patch_normal_volume', format_version=1,
-                         complete=False, source_metadata=metadata,
-                         shape_zyx=list(self.shape), cell_size_fitter_voxels=cell_size,
-                         fitter_voxel_scale_base_voxels=base_scale,
-                         scale_base_voxels=cell_size * base_scale,
-                         translation_base_voxels=.5 * cell_size * base_scale,
-                         chunks_zyx=[chunk_edge] * 3,
-                         normal_encoding='signed unit vector uint8, vector order XYZ in compact pool',
-                         channels={'normals': 'signed_normals_u8.respool'})
-        self._write_manifest()
+        self.metadata = metadata
 
-    def _write_manifest(self):
-        (self.output / 'manifest.json').write_text(json.dumps(self.info, indent=2) + '\n')
+    def _finish_array(self, raw_name, npy_name, dtype, shape):
+        source = np.memmap(self.output / raw_name, dtype=dtype, mode='r', shape=shape)
+        target = np.lib.format.open_memmap(
+            self.output / npy_name, mode='w+', dtype=dtype, shape=shape)
+        for begin in range(0, shape[0], 4096):
+            end = min(begin + 4096, shape[0])
+            target[begin:end] = source[begin:end]
+        target.flush()
+        del target, source
+        (self.output / raw_name).unlink()
 
     def reuse_chunk(self, _key):
         raise ValueError('compact export does not support resume')
@@ -132,14 +130,19 @@ class CompactPatchNormalWriter:
             stream.close()
         self.table.flush()
         del self.table
-        sidecar_meta = dict(format='compact_patch_normals', version=1,
-                            array_shape=list(self.shape), brick_shape=[self.brick_edge] * 3,
-                            grid_shape=list(self.grid), rows=self.rows,
-                            total_values=self.total_values, normal_encoding=ENCODING,
-                            source_metadata={'cell_size_fitter_voxels': self.cell_size})
-        (self.sidecar / 'meta.json').write_text(json.dumps(sidecar_meta, indent=2) + '\n')
-        self.info.update(source_metadata=metadata, input_rows=self.count,
-                         invalid_sign_rows=self.count - self.valid_count,
-                         occupied_cells=self.valid_count, spatial_chunks=len(self.written),
-                         compact_bricks=self.rows - 1, complete=True)
-        self._write_manifest()
+        words = (self.brick_edge ** 3 + 63) // 64
+        self._finish_array('brick_coords.i32', 'brick_coords.npy', np.int32,
+                           (self.rows, 3))
+        self._finish_array('bits.i64', 'bits.npy', np.int64, (self.rows, words))
+        self._finish_array('prefix.i16', 'prefix.npy', np.int16, (self.rows, words))
+        self._finish_array('offsets.i64', 'offsets.npy', np.int64, (self.rows + 1,))
+        info = dict(format='prepacked_patch_normals', version=1, format_version=1,
+                    complete=True, array_shape=list(self.shape),
+                    brick_shape=[self.brick_edge] * 3, grid_shape=list(self.grid),
+                    rows=self.rows, total_values=self.total_values,
+                    cell_size_fitter_voxels=self.cell_size,
+                    fitter_voxel_scale_base_voxels=self.base_scale,
+                    normal_encoding=ENCODING, source_metadata=metadata,
+                    input_rows=self.count, invalid_sign_rows=self.count - self.valid_count,
+                    occupied_cells=self.valid_count, spatial_chunks=len(self.written))
+        (self.output / 'meta.json').write_text(json.dumps(info, indent=2) + '\n')

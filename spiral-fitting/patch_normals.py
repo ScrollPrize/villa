@@ -34,9 +34,28 @@ class PatchNormals:
         self.cache.close()
 
 
+def _valid_encoding(encoding):
+    return (encoding.get('name') == 'signed_unit_vector_u8'
+            and encoding.get('components') == ['nx', 'ny', 'nz']
+            and encoding.get('offset') == 128 and encoding.get('scale') == 127
+            and encoding.get('missing_vector') == [0, 0, 0])
+
+
 def patch_normal_export_info(path):
     """Validate a signed export without loading its normal payload."""
     path = Path(path)
+    standalone_meta = path / 'meta.json'
+    if standalone_meta.is_file():
+        meta = json.loads(standalone_meta.read_text())
+        if (meta.get('format') != 'prepacked_patch_normals'
+                or meta.get('version') != 1 or not meta.get('complete')):
+            raise ValueError(f'{path}: expected a complete standalone patch-normal pool')
+        if not _valid_encoding(meta.get('normal_encoding', {})):
+            raise ValueError(f'{path}: unsupported patch-normal encoding')
+        cell_size = float(meta['cell_size_fitter_voxels'])
+        if not np.isfinite(cell_size) or cell_size <= 0:
+            raise ValueError(f'{path}: invalid patch-normal cell size')
+        return path, cell_size, tuple(int(v) for v in meta['array_shape'])
     manifest = json.loads((path / 'manifest.json').read_text())
     if (manifest.get('artifact_type') != 'signed_patch_normal_volume'
             or manifest.get('format_version') != 1 or not manifest.get('complete')):
@@ -47,10 +66,7 @@ def patch_normal_export_info(path):
     sidecar = path / 'signed_normals_u8.respool'
     meta = json.loads((sidecar / 'meta.json').read_text())
     encoding = meta.get('normal_encoding', {})
-    if (encoding.get('name') != 'signed_unit_vector_u8'
-            or encoding.get('components') != ['nx', 'ny', 'nz']
-            or encoding.get('offset') != 128 or encoding.get('scale') != 127
-            or encoding.get('missing_vector') != [0, 0, 0]):
+    if not _valid_encoding(encoding):
         raise ValueError(f'{path}: unsupported patch-normal encoding')
     if meta.get('source_metadata', {}).get('cell_size_fitter_voxels') != cell_size:
         raise ValueError(f'{path}: patch-normal sidecar grid differs from manifest')

@@ -11,7 +11,8 @@ import numpy as np
 import torch
 
 from pack_resident_pools import open_pool
-from prepacked_patch_normals import (open_direct_compact_export, open_prepacked_cache, pack_rows,
+from prepacked_patch_normals import (open_direct_compact_export, open_standalone_prepacked,
+                                    open_prepacked_cache, pack_rows,
                                     prepacked_cache_path)
 
 
@@ -36,8 +37,12 @@ class CompactPatchNormalPool:
         import json
         from pathlib import Path
         source_format = json.loads((Path(sidecar_dir) / 'meta.json').read_text()).get('format')
+        standalone = source_format == 'prepacked_patch_normals'
         direct = source_format == 'compact_patch_normals'
-        if direct:
+        if standalone:
+            meta, table, coords, direct_data = open_standalone_prepacked(sidecar_dir)
+            pools = None
+        elif direct:
             meta, table, coords, direct_data = open_direct_compact_export(sidecar_dir)
             pools = None
         else:
@@ -67,8 +72,10 @@ class CompactPatchNormalPool:
         self.total_bricks = rows
         remap = np.zeros(rows, dtype=np.int32)
         remap[ids] = np.arange(len(ids), dtype=np.int32)
-        prepacked_path = None if direct else prepacked_cache_path(cache_directory, sidecar_dir)
-        prepacked = direct_data if direct else open_prepacked_cache(prepacked_path, meta)
+        prepacked_path = (None if direct or standalone else
+                          prepacked_cache_path(cache_directory, sidecar_dir))
+        prepacked = (direct_data if direct or standalone else
+                     open_prepacked_cache(prepacked_path, meta))
         self.prepacked_cache_used = prepacked is not None
         batches = []
         total_values = 1  # reserved zero vector for absent cells
@@ -174,7 +181,7 @@ class CompactPatchNormalPool:
         print(f'patch normals: compact pool {self.pool_bytes / 1024**3:.2f} GiB '
               f'(formerly {self.dense_pool_bytes / 1024**3:.2f} GiB), '
               f'{total_values - 1:,} occupied cells loaded in {self.load_seconds:.1f}s'
-              f'{" from direct compact export" if direct else " from prepacked cache" if self.prepacked_cache_used else ""}', flush=True)
+              f'{" from standalone export" if standalone else " from direct compact export" if direct else " from prepacked cache" if self.prepacked_cache_used else ""}', flush=True)
         if self.exclusion is not None:
             print(f'patch normals: exclusion mask {self.exclusion_bytes / 1024**2:.1f} MiB '
                   f'(included above), radius {exclusion_radius_cells:g} export cells', flush=True)

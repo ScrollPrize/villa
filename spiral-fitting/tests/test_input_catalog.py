@@ -18,6 +18,10 @@ def test_catalog_covers_every_fit_input_path_field():
     assert set(SCROLL_SPEC_PATH_OVERRIDE_KEYS) == keys - {"pcls"}
 
 
+def test_patch_normals_resolve_from_standalone_dataset_folder():
+    assert fit_input("patch_normals").conventional_relative == "patch-normals"
+
+
 def test_omitted_spacing_mode_uses_fitter_default():
     explicit = {"dense_spacing_mode": Config().dense_spacing_mode}
     for spec in FIT_INPUT_CATALOG:

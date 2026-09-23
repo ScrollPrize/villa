@@ -118,12 +118,13 @@ def build_exclusion_mask(table, bits, brick, shape, radius, *, z_roi=None,
 
 
 def exclusion_cache_path(cache_directory, sidecar_dir, *, shape, brick, z_roi, radius):
-    if cache_directory is None:
-        return None
     root = Path(sidecar_dir).resolve()
     import json
     source_format = json.loads((root / 'meta.json').read_text()).get('format')
-    if source_format == 'compact_patch_normals':
+    if source_format == 'prepacked_patch_normals':
+        names = ['meta.json', 'table.npy', 'brick_coords.npy', 'bits.npy',
+                 'prefix.npy', 'offsets.npy', 'values.u8']
+    elif source_format == 'compact_patch_normals':
         names = ['meta.json', 'table.npy', 'brick_coords.i32', 'bits.i64',
                  'prefix.i16', 'offsets.i64', 'values.u8']
     else:
@@ -133,6 +134,10 @@ def exclusion_cache_path(cache_directory, sidecar_dir, *, shape, brick, z_roi, r
                      files=[(name, (root / name).stat().st_size, (root / name).stat().st_mtime_ns)
                             for name in names])
     digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
+    if source_format == 'prepacked_patch_normals':
+        return root / f'exclusion-{digest}.npz'
+    if cache_directory is None:
+        return None
     return Path(cache_directory) / 'patch-normal-exclusion' / f'{digest}.npz'
 
 

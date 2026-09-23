@@ -467,7 +467,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('patches_dir', type=Path,
                         help='patch directory, or pooled normal NPZ to reorient')
-    parser.add_argument('output', type=Path, help='signed normal .npz store or Zarr output directory')
+    parser.add_argument('output', type=Path,
+                        help='signed normal .npz file, Zarr directory, or dataset/patch-normals directory')
     parser.add_argument('--checkpoint', type=Path, required=True,
                         help='reference fit used to choose inward signs')
     parser.add_argument('--umbilicus', type=Path, help='umbilicus used by the reference fit')

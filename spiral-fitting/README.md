@@ -1004,7 +1004,7 @@ step.
 In VC3D's Spiral advanced config, set `dense_normals_source` to
 `patch_preferred` and rebuild the session. The default is `lasagna`;
 `input_use_normals` remains the overall normal-input gate. The service
-discovers `patch_normals.zarr` in the dataset root;
+discovers `patch-normals` in the dataset root;
 for another location, set `paths.patch_normals` in `spiral-scroll.json`.
 Historical checkpoints default to `lasagna`.
 
@@ -1016,11 +1016,9 @@ AGENTS_AGENT_MODE=1 FIT_SPIRAL_CONFIG_OVERRIDES='{"dense_normals_source": "patch
   --dataset /mnt/raid_nvme/spiral_dataset_working
 ```
 
-The supported export is a complete `signed_patch_normal_volume` manifest plus
-`signed_normals_u8.respool`. New exports can store occupied cells directly in
-the compact bitmap/rank format; existing exports with three dense uint8
-channels (nx, ny, nz) remain supported. Sampling
-uses the export's `cell_size_fitter_voxels` and floor-cell indexing in the
+The dataset's `patch-normals` directory contains `meta.json`, `table.npy`,
+`brick_coords.npy`, `bits.npy`, `prefix.npy`, `offsets.npy`, and `values.u8`.
+Sampling uses its `cell_size_fitter_voxels` and floor-cell indexing in the
 same fitter coordinate frame as the dataset. Occupied patch cells replace
 Lasagna targets in both the dense-normal loss and phase-spacing normal lookup;
 missing cells fall back to Lasagna only when farther than
@@ -1049,53 +1047,31 @@ patch surfaces and a reference checkpoint:
 ```sh
 AGENTS_AGENT_MODE=1 spiral-fitting/.venv/bin/python \
   spiral-fitting/patch_normal_samples.py /path/to/patches \
-  /path/to/dataset/patch_normals.zarr \
+  /path/to/dataset/patch-normals \
   --checkpoint /path/to/reference_checkpoint.pt \
   --output-format compact --box-width 3 --cell-size 2 --device cuda
 ```
 
-This writes the `signed_normals_u8.respool` compact pool as each tile is
-processed. It does not create float32 OME-Zarr normal channels or require a
-second prepack step. The source scripts for CPU and CUDA export are included
-in this branch. Compact export currently starts from a fresh output directory;
-`--resume` remains available for the legacy Zarr export only.
+This writes compact normal data as each tile is processed and finalizes the
+lookup arrays in the same directory. It does not create float32 OME-Zarr normal
+channels or require a second prepack step. Compact export currently starts
+from a fresh output directory.
 
 The compact pool is loaded onto the GPU for the fit's z range.
 Only occupied cells retain three uint8 components; presence bitmaps and rank
 offsets provide exact lookup without storing empty-cell payloads. The supplied
-full export needs approximately 11 GiB instead of 60 GiB before ROI selection,
-in addition to other fitting allocations. No values, coverage, resolution, or
-quantization change. Existing exports work unchanged and are not rewritten.
-The existing export's `signed_normals_u8.respool` is a dense-per-brick source
-layout; it is not the compact GPU layout. Without a prepacked cache, startup reads
-selected bricks from those channel files and temporarily stages the compact
-representation in system RAM (approximately another 11 GiB for the full
-export, plus bounded raw batches and lookup metadata).
-
-Prepack the whole export once into the service's cache directory before
-starting a fit:
-
-```sh
-AGENTS_AGENT_MODE=1 spiral-fitting/.venv/bin/python \
-  spiral-fitting/prepacked_patch_normals.py \
-  /mnt/raid_nvme/spiral_dataset_working/patch_normals.zarr \
-  --cache-directory /mnt/raid_nvme/spiral_cache
-```
-
-Use the same cache root as the VC3D Spiral connection profile. The output is
-under `patch-normal-prepacked/` there; the original export is untouched. Fits
-reuse it across z ranges and skip dense-channel CPU compaction. A change to
-the source pool's sizes or timestamps selects a new cache key. The separate
-exclusion mask is still cached per z range and radius. Sampling after loading
-stays entirely on the device, with no disk reads or CPU transfers.
+full dataset needs approximately 11 GiB before ROI selection, in addition to
+other fitting allocations. Values, coverage, resolution, and quantization are
+unchanged from the equivalent uint8 pool. Sampling after loading stays entirely
+on the device, with no disk reads or CPU transfers.
 
 The exclusion mask adds an int32 brick table plus one bit per voxel in mixed
 bricks; entirely empty/full bricks share two constant rows. The added memory
 is reported at load time, separately from the normal payload. CPU preprocessing
 uses tiles with halos, including patch coverage just outside the fit's z range.
-The first load builds the mask and caches it under the fit cache directory;
-later loads reuse it if source file sizes/timestamps, z range, grid, and radius
-match. Without a cache directory, each load rebuilds it. During fitting the
+The first load builds the mask and caches it as an `exclusion-*.npz` file in
+`patch-normals`; later loads reuse it if source file sizes/timestamps, z range,
+grid, and radius match. During fitting the
 mask reuses the normal gather's brick/local indices: one extra table/bit lookup,
 no radius search, additional samples, host synchronization, or disk access.
 
@@ -1103,25 +1079,10 @@ Run CPU-only compact lookup equivalence checks from `spiral-fitting`:
 
 ```sh
 AGENTS_AGENT_MODE=1 CUDA_VISIBLE_DEVICES='' .venv/bin/python -m pytest -q \
-  tests/test_compact_patch_normals.py tests/test_patch_normals.py \
+  tests/test_patch_normal_compact_export.py tests/test_compact_patch_normals.py \
+  tests/test_patch_normals.py \
   tests/test_patch_normal_exclusion.py
 ```
-
-Benchmark 200,000 points on a small real-data region without using the GPU:
-
-```sh
-AGENTS_AGENT_MODE=1 CUDA_VISIBLE_DEVICES='' PYTHONPATH=. .venv/bin/python \
-  tests/benchmark_patch_normal_exclusion.py \
-  --source /mnt/raid_nvme/spiral_dataset_working/patch_normals.zarr
-```
-
-This uses a temporary 144³-cell neighborhood and reports mask memory, startup
-time, and mean/min/median/p95/max CPU sampling times over 20 iterations. It does
-not measure full-export memory or GPU throughput.
-
-Set `PATCH_NORMALS_TEST_EXPORT=/path/to/patch_normals.zarr` when running
-`tests/test_compact_patch_normals.py` to also compare 60,000 CPU lookups against
-the original encoded sidecar in one real z slab. This check never uses CUDA.
 
 Run focused regression checks from the repository root:
 
@@ -1132,15 +1093,3 @@ AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m
   spiral-fitting/tests/test_config.py spiral-fitting/tests/test_sparse_cuda_cache.py \
   spiral-fitting/tests/test_phase_spacing.py spiral-fitting/tests/test_spiral_service_v2.py
 ```
-
-Validate a small occupied slab against a real export's float32 source channels:
-
-```sh
-AGENTS_AGENT_MODE=1 PATCH_NORMALS_TEST_EXPORT=/mnt/raid_nvme/spiral_dataset_working/patch_normals.zarr \
-  PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
-  spiral-fitting/tests/test_patch_normals.py -k real_patch_export
-```
-
-This read-only check loads one z slab on the CPU, compares up to 32 occupied
-cells within uint8 quantization tolerance, and verifies precedence and bounds.
-It does not measure convergence or full-ROI GPU memory use.

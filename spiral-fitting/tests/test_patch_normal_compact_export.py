@@ -9,7 +9,7 @@ from patch_normals import load_patch_normals
 
 @pytest.mark.parametrize('radius', [0., 2.])
 def test_direct_compact_export_roundtrip(tmp_path, radius):
-    output = tmp_path / 'patch_normals.zarr'
+    output = tmp_path / 'patch-normals'
     writer = CompactPatchNormalWriter(output, [8, 4, 4], 2., 4., 2, {}, brick_edge=2)
     # Two nonadjacent tiles, including a normal with quantized zero components.
     positions = np.array([[1., 1., 1.], [3., 3., 3.], [9., 1., 1.],
@@ -20,8 +20,10 @@ def test_direct_compact_export_roundtrip(tmp_path, radius):
         writer.append(dict(position_zyx=positions[indices], normal_zyx=normals[indices],
                            sign_valid=np.ones(len(indices), dtype=bool)))
     writer.finish(output, {})
-    assert not list(output.rglob('channel_*.u8'))
-    assert not list(output.glob('patch_*.ome.zarr'))
+    assert set(p.name for p in output.iterdir()) == {
+        'table.npy', 'brick_coords.npy', 'bits.npy', 'prefix.npy',
+        'offsets.npy', 'values.u8', 'meta.json',
+    }
 
     store = load_patch_normals(output, z_begin=0, z_end=16, device='cpu',
                                exclusion_radius=radius, cache_directory=tmp_path / 'cache')
@@ -35,6 +37,8 @@ def test_direct_compact_export_roundtrip(tmp_path, radius):
     _, present, near = store.sample(torch.from_numpy(positions), return_exclusion=True)
     assert present.all()
     assert near.all()
+    if radius:
+        assert len(list(output.glob('exclusion-*.npz'))) == 1
     store.close()
 
 
@@ -65,7 +69,7 @@ def test_cpu_tiled_export_selects_direct_compact_writer(tmp_path, monkeypatch):
                             position_zyx=np.asarray([[1., 1., 1.]]),
                             normal_zyx=np.asarray([[0., 0., 1.]]),
                             sign_valid=np.asarray([True])))
-    output = tmp_path / 'patch_normals.zarr'
+    output = tmp_path / 'patch-normals'
     tiled.export_filtered([tmp_path], output, {}, coordinate_scale=1., z_roi=(0, 4),
                           cell_size=2., surface_spacing=1., width=3, tile_edge=4,
                           workers=1, device='cpu', chunk_size=100, metadata={},

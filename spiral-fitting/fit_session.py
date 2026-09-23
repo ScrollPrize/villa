@@ -412,7 +412,7 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
     FitInputSpec("pcls", "pcl-set", json_content=True,
                  enabled=_pcls_enabled),
     FitInputSpec("patch_normals", "directory",
-                 conventional_relative="patch_normals.zarr",
+                 conventional_relative="patch-normals",
                  enabled=lambda config: input_source_enabled(config, "patch_normals"),
                  required=lambda config: input_source_enabled(config, "patch_normals")),
     FitInputSpec("normal_x", "zarr-group",

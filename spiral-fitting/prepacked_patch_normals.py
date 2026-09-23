@@ -59,6 +59,31 @@ class PrepackedPatchNormals:
     values: np.ndarray
 
 
+def open_standalone_prepacked(path):
+    """Read a self-contained dataset-root patch-normals directory."""
+    path = Path(path)
+    meta = json.loads((path / 'meta.json').read_text())
+    if (meta.get('format') != 'prepacked_patch_normals'
+            or meta.get('version') != 1 or not meta.get('complete')):
+        raise ValueError(f'{path}: expected a complete standalone patch-normal pool')
+    shape = tuple(meta['array_shape'])
+    brick = tuple(meta['brick_shape'])
+    grid = tuple((s + b - 1) // b for s, b in zip(shape, brick))
+    if (len(shape) != 3 or len(brick) != 3 or any(s < 1 for s in shape)
+            or any(b < 1 for b in brick) or tuple(meta['grid_shape']) != grid):
+        raise ValueError(f'{path}: invalid standalone patch-normal grid')
+    table = np.load(path / 'table.npy', mmap_mode='r', allow_pickle=False)
+    coords = np.load(path / 'brick_coords.npy', mmap_mode='r', allow_pickle=False)
+    rows = int(meta['rows'])
+    if (table.shape != grid or table.dtype != np.int32
+            or coords.shape != (rows, 3) or coords.dtype != np.int32
+            or np.any(table < 0) or np.any(table >= rows)
+            or not np.array_equal(coords[0], [-1, -1, -1])):
+        raise ValueError(f'{path}: invalid standalone patch-normal brick lookup')
+    prepacked = open_prepacked_cache(path, meta)
+    return meta, table, coords, prepacked
+
+
 def open_direct_compact_export(sidecar_dir):
     """Open a completed compact export without touching any dense channel files."""
     sidecar_dir = Path(sidecar_dir)
