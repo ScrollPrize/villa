@@ -103,8 +103,7 @@ public:
     // Withhold raw-path viewport chunk demand from frames the SurfaceCache
     // fully serves, so tile fills are not starved behind interactive fetches
     // (see VolumeViewerBase::setPreferSurfaceTileFills). Applied to every
-    // viewer this manager owns; workspaces where the flattened view is the
-    // primary pane (Spiral) enable it on their own manager only.
+    // viewer this manager owns; enabled by the main and Spiral workspaces.
     void setPreferSurfaceTileFills(bool enabled);
 
     void setIntersectionOpacity(float opacity);
@@ -227,6 +226,8 @@ public:
     bool segmentationCursorMirroring() const { return _mirrorCursorToSegmentation; }
     void broadcastLinkedCursor(VolumeViewerBase* source,
                                const std::optional<cv::Vec3f>& point);
+    // Delivers a coalesced linked-cursor point now, if one is pending.
+    void flushLinkedCursor();
 
     void setZScrollSensitivity(double sensitivity);
     double zScrollSensitivity() const { return _zScrollSensitivity; }
@@ -339,6 +340,12 @@ private:
     float _volumeWindowLow{0.0f};
     float _volumeWindowHigh{255.0f};
     bool _mirrorCursorToSegmentation{false};
+    // Mirrored cursor points are coalesced to one broadcast per ~render tick:
+    // each broadcast repaints every other viewer, and mouse moves arrive much
+    // faster than viewers can repaint on large sessions.
+    QTimer* _linkedCursorTimer{nullptr};
+    VolumeViewerBase* _pendingLinkedCursorSource{nullptr};
+    std::optional<cv::Vec3f> _pendingLinkedCursorPoint;
     bool _showCoordinateFrames{true};
     double _zScrollSensitivity{1.0};
     int _surfacePatchSamplingStride{1};
