@@ -7695,3 +7695,8 @@ piece. Public output annotations are reference-only and must not depend on
 which model caused a failure. Model-specific provenance may remain in the
 top-level audit manifest. Cache coverage is a read-only audit against the
 full-resolution OME-Zarr channels; missing chunks are reported explicitly.
+
+The inspection channel export includes inference.lasagna.json and its
+inference.json provenance per physical scroll. Channel paths are relative to
+the exported manifest so copying the directory preserves bindings. Exact
+source base dimensions and scale must be preserved, including for subsets.

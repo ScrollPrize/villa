@@ -3092,3 +3092,10 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
   Classic and best output-stride-4 evaluations. It exports GT-only pieces with
   500-base-voxel context, deduplicates nearby intervals, audits full-resolution
   cache coverage and prepares stable VC3D channel links.
+
+# 2026-09-22 — Portable failure-piece cache manifests
+
+- Export inference.lasagna.json and inference.json beside the channel Zarrs for
+  all five physical scrolls, including the Paris4 subset. Preserve source base
+  dimensions and scale; validate all relative array bindings. Approved runner
+  supports --export-manifests-only to refresh metadata without inference.

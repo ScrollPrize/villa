@@ -7,6 +7,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED
 from copy import deepcopy
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -790,6 +791,12 @@ def _canonical_source_label(locator):
     return parts[-1] or 'unknown'
 
 
+def _generated_channel_directory(directory):
+    return all(entry.is_symlink() or (entry.parent == directory and entry.name in
+                   {'inference.lasagna.json', 'inference.json'})
+               for entry in directory.rglob('*') if entry.is_file() or entry.is_symlink())
+
+
 def _remove_generated_channel_aliases(root):
     """Replace only the generated per-source symlink directories."""
     root = Path(root)
@@ -798,8 +805,7 @@ def _remove_generated_channel_aliases(root):
     for child in root.iterdir():
         if not child.is_dir() or child.is_symlink():
             continue
-        entries = list(child.rglob('*'))
-        if all(entry.is_symlink() for entry in entries if entry.is_file() or entry.is_symlink()):
+        if _generated_channel_directory(child):
             shutil.rmtree(child)
         else:
             raise ValueError(f'refusing to replace non-generated VC3D directory: {child}')
@@ -918,8 +924,7 @@ def _export_paris4_subset(settings, output, cache_by_locator, required_by_root):
         raise ValueError(f'refusing to replace non-symlink subset entry: {old_special}')
     link = link_root / 'PHercParis4'
     if link.exists() and not link.is_symlink():
-        entries = list(link.rglob('*'))
-        if not all(entry.is_symlink() for entry in entries if entry.is_file() or entry.is_symlink()):
+        if not _generated_channel_directory(link):
             raise ValueError(f'refusing to replace non-generated Paris4 directory: {link}')
         shutil.rmtree(link)
     if link.is_symlink():
@@ -930,6 +935,40 @@ def _export_paris4_subset(settings, output, cache_by_locator, required_by_root):
     atomic_write(output / 'paris4_subset_manifest.json', result, durable=False)
     print(json.dumps({'paris4_subset': result}), flush=True)
     return result
+
+
+def export_union_lasagna_manifests(output):
+    """Export existing inference manifests with portable relative channels."""
+    output = Path(output)
+    inventory = json.loads((output / 'manifest.json').read_text())
+    exported = []
+    for entry in inventory['vc3d_channels']:
+        destination = output / 'vc3d_channels' / entry['source_id']
+        source = Path(entry['cache_root'])
+        if entry.get('subset'):
+            source = Path(json.loads((source / 'subset_manifest.json').read_text())['source_root'])
+        manifest = json.loads((source / 'inference.lasagna.json').read_text())
+        # Preserve exact base shape and scale, including odd base dimensions.
+        for group in manifest['groups'].values():
+            relative = Path(group['zarr'])
+            if relative.is_absolute() or '..' in relative.parts:
+                raise ValueError(f'nonportable channel path: {relative}')
+            metadata = destination / relative / '.zarray'
+            array = json.loads(metadata.read_text())
+            scale = manifest.get('source_to_base', 1.0) * (2 ** group.get('scaledown', 0))
+            expected = [math.ceil(n / scale) for n in manifest['base_shape_zyx']]
+            if array['shape'] != expected:
+                raise ValueError(f'export channel shape mismatch: {metadata}')
+        provenance = Path(manifest.get('provenance', 'inference.json'))
+        if provenance.is_absolute() or '..' in provenance.parts:
+            raise ValueError(f'nonportable provenance path: {provenance}')
+        atomic_write(destination / provenance,
+                     json.loads((source / provenance).read_text()), durable=False)
+        target = destination / 'inference.lasagna.json'
+        atomic_write(target, manifest, durable=False)
+        exported.append(str(target))
+    print(json.dumps({'lasagna_manifests': exported}, indent=2), flush=True)
+    return exported
 
 
 def run_union(workload):
@@ -1213,5 +1252,6 @@ def run_union(workload):
                                                   'missing_chunk_count': missing_total},
                  durable=False)
     atomic_write(output / 'manifest.json', manifest, durable=False)
+    export_union_lasagna_manifests(output)
     print(json.dumps({'case_count': len(annotations), 'total_length_mm': manifest['total_length_mm'],
                       'missing_chunk_count': missing_total, 'output': str(output)}, indent=2), flush=True)

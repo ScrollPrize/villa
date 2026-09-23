@@ -200,6 +200,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["contrast-prepare", "benchmark-remove-case", "benchmark-review", "benchmark-render", "benchmark-full", "pair-connectivity", "short-failures", "failure-union", "integration-report", "integration-fit", "integration-audit", "fixed-path-report", "fixed-path-extract", "fixed-path-fit", "freeze-snapshot", "prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "resume-visualization", "cached-full", "report-metrics", "profile", "observe", "report-progress", "reference-plan"])
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--export-manifests-only", action="store_true",
+                        help="failure-union: export Lasagna manifests from completed output")
     parser.add_argument("--devices", help="runtime device selection (default from workload)")
     parser.add_argument("--manager-socket")
     parser.add_argument("--manager-priority", type=int)
@@ -275,6 +277,10 @@ def main():
         run(workload, devices=devices, time_limit_seconds=args.extraction_time_limit_seconds)
         return 0
     if args.mode == "failure-union":
+        if args.export_manifests_only:
+            from vesuvius.neural_tracing.fiber_trace_3d.short_failure_benchmark import export_union_lasagna_manifests
+            export_union_lasagna_manifests(workload['output_root'])
+            return 0
         from vesuvius.neural_tracing.fiber_trace_3d.short_failure_benchmark import run_union
         run_union(workload)
         return 0

@@ -1,28 +1,15 @@
-# Task plan: unlinkable inference scratch
+# Plan: portable cache manifests
 
-## Implementation
-
-1. Add a bounded cleanup helper that scans only known channel `.live_tmp`
-   directories and removes direct `session-*` directories after the cache
-   writer lock is held.
-2. Make `_FileMappedSlotPool` use Linux `O_TMPFILE` and a parent-owned
-   `/proc/<pid>/fd/<fd>` descriptor path for spawned workers. Close the
-   descriptor only after the pool and workers are finished. Retain the named
-   tempfile fallback elsewhere.
-3. Update focused regression tests and document the lifecycle.
+Reuse original inference manifests and provenance. Validate relative channel paths, exact base dimensions and array shapes. Use Paris4 subset source metadata with local subset channels. Integrate into normal export and expose metadata-only refresh through the approved runner. Preserve fiber filenames.
 
 ## Spec update
 
-The cache lifecycle now requires stale-session cleanup under writer ownership
-and anonymous scratch backing for new Linux slot pools.
+The exported channel view includes portable inference.lasagna.json and inference.json in each scroll directory.
 
 ## Docs updates
 
-Record the unlink handoff, fallback behavior, and the fact that old sessions
-are still explicitly cleaned in the task log and inference scratch docs.
+Document use and regeneration in docs/benchmarks/failure_union_vc3d_manifests.md; record results and durable changelog.
 
-## Testing
+## Validation
 
-- compile the changed Python modules;
-- run the file-mapped spawn/unlink test;
-- run the stale-scratch cleanup regression.
+Generate all five files using approved runner; validate 15 array bindings; rerun metadata export to verify repeatability. Independent review covers portability and rerun behavior.
