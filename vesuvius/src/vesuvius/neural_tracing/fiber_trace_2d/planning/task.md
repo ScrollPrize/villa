@@ -1,6 +1,8 @@
 # Task
 
-Correct whole-volume inference ETA estimation so it extrapolates the observed
-empty-input tile fraction. Resume skips caused by already-complete output must
-not be treated as empty tiles or bias that fraction. Preserve the fast resume
-path: the correction must not add a whole-volume pre-scan or extra source I/O.
+Add a `las_manager snapshot import` command which copies a training checkpoint
+into persistent manager-owned storage and binds the copied bytes to a required
+external model identifier (for example `scrollprize/lasagna-fiber`). Snapshot
+identity must be keyed by checkpoint SHA-256 rather than a mutable path.
+Inference must refuse to launch any checkpoint for which no trusted model
+identifier can be resolved.

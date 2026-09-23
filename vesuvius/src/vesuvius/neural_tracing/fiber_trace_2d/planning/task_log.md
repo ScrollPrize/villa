@@ -1,24 +1,22 @@
 # Task log
 
-## 2026-09-22
+## 2026-09-23
 
-- Diagnosed the pessimistic ETA: processed-tile wall time was multiplied by all
-  remaining candidates, even though most candidates in sparse volumes are
-  empty and complete quickly.
-- Planned separate empty-input and resume-complete skip counters. The estimator
-  will learn sparsity only from processed plus empty tiles, and will not add a
-  pre-scan or source read to the resume path.
-- Implemented skip classification using the output/source checks already made
-  by tile work discovery. The existing early resume rejection remains intact;
-  classification adds only counter bookkeeping.
-- Changed tile ETA to `observed wall / (processed + empty) * remaining`.
-  Resume-complete candidates are excluded from the denominator, so a completed
-  prefix cannot make the unfinished suffix appear free.
-- Added clean-sparse, resume-prefix and resume-only ETA regression cases.
-- Validation:
-  - focused ETA tests: 4 passed;
-  - `py_compile` passed for the shared runner, compatibility wrapper and tests;
-  - `git diff --check` passed.
-- Broader end-to-end tests were started but did not reach their first result in
-  the available interval on the busy host and were stopped; no GPU workload was
-  launched by this change.
+- Confirmed existing discovery can inherit identity only from embedded
+  checkpoint metadata or an already-registered Atlas model. There was no
+  trusted pre-inference manager identity source, and launch accepted null.
+- Implemented persistent `model_dir`, atomic byte-preserving import, adjacent
+  SHA-keyed identity sidecars, CLI/completion integration, and a pre-launch
+  requirement for `model_identifier`.
+- When the original configured run and its manager-owned copy are both visible,
+  byte-identical logical snapshots are deduplicated and the manager-owned copy
+  is selected; differing bytes retain ambiguity and fail normal resolution.
+- The checkpoint is deliberately not modified: doing so would invalidate the
+  SHA-256 of the externally uploaded artifact.
+- Fixed Atlas enrichment so an older Atlas record with no external identifier
+  does not conflict with a manager-owned identifier for the exact same bytes.
+- Independent plan delegation is unavailable in the current agent mode; the
+  plan was reviewed locally against the manager code and repository rules.
+- Validation: `python -m pytest -q lasagna/tests/test_manager.py
+  lasagna/tests/test_manager_open_data.py` -> 81 passed in 2.16s;
+  `git diff --check` passed.

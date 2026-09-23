@@ -3034,3 +3034,7 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
   fiberlet pieces. Render-only resume now preserves trace and summary artifacts.
 - Full case mapping and review paths:
   `../docs/benchmarks/short200_fullres_fiberlet_vs_beam_20260918.md`.
+# 2026-09-23
+
+- Added manager-owned, SHA-256-bound snapshot imports and required stable
+  external model identifiers for new inference runs.

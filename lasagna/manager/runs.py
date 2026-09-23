@@ -318,6 +318,11 @@ def launch_inference(
 ) -> Path:
     if snapshot.backend not in {"fiber3d", "lasagna"}:
         raise ValueError(f"unsupported inference backend: {snapshot.backend}")
+    if not snapshot.model_identifier:
+        raise ValueError(
+            f"snapshot {snapshot.selector!r} has no model_identifier; import it first with "
+            "`las_manager snapshot import CHECKPOINT --model-identifier OWNER/REPOSITORY`"
+        )
     if snapshot.backend == "lasagna" and legacy_config is not None:
         raise ValueError("--legacy-config applies only to Fiber checkpoints")
     if int(download_workers) <= 0:

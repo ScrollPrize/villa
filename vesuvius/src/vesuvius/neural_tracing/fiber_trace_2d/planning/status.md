@@ -1,9 +1,10 @@
-# Status
+# Manager-owned snapshot identity
 
-- [x] Capture the ETA correction task.
-- [x] Write the implementation plan.
-- [x] Separate empty and resume skip accounting.
-- [x] Apply sparse-work ETA extrapolation.
-- [x] Add regression tests.
-- [x] Update specification/task log.
-- [x] Run focused validation and diff checks.
+- [x] Capture task and implementation plan
+- [x] Inspect snapshot indexing, launch, completion, and configuration paths
+- [x] Add manager model storage and trusted identity sidecars
+- [x] Add CLI and completion support
+- [x] Enforce identity at inference launch
+- [x] Add and run regression tests
+- [x] Update documentation and changelog
+- [x] Review final diff

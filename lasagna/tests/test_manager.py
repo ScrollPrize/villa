@@ -37,7 +37,7 @@ from lasagna.manager.runner import main as runner_main
 from lasagna.manager.runs import atomic_json, launch_inference, read_runs, reconcile_runs
 from lasagna.manager.snapshots import (
     completion_snapshot_candidates, discover_snapshot_paths, index_snapshots,
-    resolve_snapshot,
+    import_snapshot, resolve_snapshot,
 )
 from lasagna.manager.tmux import Tmux
 
@@ -45,6 +45,7 @@ from lasagna.manager.tmux import Tmux
 def configured(tmp_path: Path, *, snapshot_dirs=(), output=True, venv=True) -> ManagerConfig:
     return ManagerConfig(
         snapshot_dirs=tuple(str(path) for path in snapshot_dirs),
+        model_dir=str(tmp_path / "models"),
         cache_dir=str(tmp_path / "cache"),
         output_dir=str(tmp_path / "outputs") if output else "",
         venv=str(tmp_path / "venv") if venv else "",
@@ -156,6 +157,7 @@ def test_config_init_round_trip_and_no_overwrite(tmp_path, monkeypatch):
     loaded = load_config()
     assert loaded.catalog_max_age_seconds == 3600
     assert loaded.snapshot_dirs == ()
+    assert loaded.model_dir == "~/.local/share/las_manager/models"
     assert loaded.atlas_dir == ""
     assert loaded.upload_staging_s3 == ""
     assert loaded.fiberlet_binary == ""
@@ -178,11 +180,11 @@ def test_config_init_round_trip_and_no_overwrite(tmp_path, monkeypatch):
 def test_relative_config_paths_resolve_from_config_location(tmp_path, monkeypatch):
     path = tmp_path / "cfg" / "config.toml"
     path.parent.mkdir()
-    path.write_text('cache_dir = "../cache"\nsnapshot_dirs = ["../runs"]\n', encoding="utf-8")
+    path.write_text('cache_dir = "../cache"\nmodel_dir = "../models"\nsnapshot_dirs = ["../runs"]\n', encoding="utf-8")
     monkeypatch.setenv("LAS_MANAGER_CONFIG", str(path))
     loaded = load_config()
     assert loaded.resolved_path("cache_dir") == tmp_path / "cache"
-    assert loaded.resolved_snapshot_dirs() == (tmp_path / "runs",)
+    assert loaded.resolved_snapshot_dirs() == (tmp_path / "models", tmp_path / "runs")
 
 
 @pytest.mark.parametrize("name", ["params", "lasagna_params"])
@@ -210,6 +212,7 @@ def test_config_fiberlet_threads_must_be_positive_integer(tmp_path, value):
 
 def test_command_unique_prefix_and_ambiguity():
     assert _expand_command(["sn", "l"]) == ["snapshot", "ls"]
+    assert _expand_command(["sn", "i"]) == ["snapshot", "import"]
     assert _expand_command(["con", "sh"]) == ["config", "show"]
     with pytest.raises(ValueError, match="ambiguous"):
         _expand_command(["f"])
@@ -451,6 +454,7 @@ def test_contextual_completion_commands_options_and_values(tmp_path, monkeypatch
     assert values(["volume", "ls", "--backend=f"]) == []
     assert values(["snapshot", "ls", "--backend", "f"]) == ["fiber3d"]
     assert values(["snapshot", "ls", "--backend=f"]) == ["--backend=fiber3d"]
+    assert "--model-identifier" in values(["snapshot", "import", "checkpoint.pt", "--"])
     assert "--sample" in values(["volume", "ls", "--"])
     assert "PHerc0001" in values(["volume", "ls", "--sample", ""])
     assert "--format=uint8" in values(["volume", "ls", "--format="])
@@ -578,6 +582,51 @@ def test_snapshot_completion_rescans_uncached_files_without_loading_them(tmp_pat
         in contextual_candidates(config, ["inference", "run", "new"])
     ]
     assert values == ["new-run/best.pt"]
+
+
+def test_snapshot_import_copies_bytes_and_binds_identifier_by_sha256(tmp_path):
+    torch = pytest.importorskip("torch")
+    source = tmp_path / "training" / "run-a" / "snapshots" / "best.pt"
+    source.parent.mkdir(parents=True)
+    torch.save({
+        "model": {"weight": torch.ones(1)},
+        "config": {"model_3d": {"output_channels": 4}},
+    }, source)
+    config = configured(tmp_path, snapshot_dirs=(tmp_path / "training",))
+
+    record = import_snapshot(
+        config, source, model_identifier="scrollprize/lasagna-fiber",
+    )
+
+    destination = tmp_path / "models" / "run-a" / "snapshots" / "best.pt"
+    sidecar = destination.with_name("best.pt.identity.json")
+    assert destination.read_bytes() == source.read_bytes()
+    assert record.path == str(destination.resolve())
+    assert record.model_identifier == "scrollprize/lasagna-fiber"
+    assert record.sha256 == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert json.loads(sidecar.read_text()) == {
+        "schema_version": 1,
+        "sha256": record.sha256,
+        "model_identifier": "scrollprize/lasagna-fiber",
+    }
+    # Identity projection is independent of the cached checkpoint metadata,
+    # and the managed copy wins over its byte-identical configured source.
+    indexed = index_snapshots(config)
+    assert len(indexed) == 1
+    assert indexed[0].path == str(destination.resolve())
+    assert indexed[0].model_identifier == "scrollprize/lasagna-fiber"
+
+
+def test_snapshot_import_rejects_identifier_conflict(tmp_path):
+    torch = pytest.importorskip("torch")
+    source = tmp_path / "run-a" / "snapshots" / "best.pt"
+    source.parent.mkdir(parents=True)
+    torch.save({"model": {"weight": torch.ones(1)}, "config": {}}, source)
+    config = configured(tmp_path)
+    import_snapshot(config, source, model_identifier="owner/model-a")
+
+    with pytest.raises(ValueError, match="conflicts with existing sidecar"):
+        import_snapshot(config, source, model_identifier="owner/model-b")
 
 
 def test_lasagna_snapshot_discovery_is_namespaced_and_extracts_metadata(tmp_path):
@@ -1055,12 +1104,30 @@ def _snapshot_and_config(tmp_path: Path):
     snapshots = tmp_path / "runs" / "run one" / "snapshots"
     snapshots.mkdir(parents=True)
     checkpoint = snapshots / "best model.pt"
-    torch.save({"model": {"w": torch.ones(1)}, "step": 8, "config": {"patch_shape_zyx": [64, 64, 64]}}, checkpoint)
+    torch.save({
+        "model": {"w": torch.ones(1)}, "step": 8,
+        "model_identifier": "test-owner/test-model",
+        "config": {"patch_shape_zyx": [64, 64, 64]},
+    }, checkpoint)
     python = tmp_path / "venv" / "bin" / "python"
     python.parent.mkdir(parents=True)
     python.write_text("", encoding="utf-8")
     config = configured(tmp_path, snapshot_dirs=(tmp_path / "runs",))
     return config, index_snapshots(config)[0]
+
+
+def test_launch_refuses_snapshot_without_model_identifier(tmp_path):
+    config, snapshot = _snapshot_and_config(tmp_path)
+    snapshot = replace(snapshot, model_identifier=None)
+    volume = index_volumes(CatalogCache(
+        sample_catalog(), {"sha256": "digest", "fetched_at": "now"},
+    ))[0]
+    with pytest.raises(ValueError, match="snapshot import.*model-identifier"):
+        launch_inference(
+            config, snapshot, volume, 1,
+            original_argv=["inference", "run"], tmux=FakeTmux(),
+        )
+    assert not (tmp_path / "outputs").exists()
 
 
 def test_launch_writes_backend_neutral_record_and_argv(tmp_path):

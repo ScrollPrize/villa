@@ -28,7 +28,7 @@ from .runs import (
     _process_matches, atomic_json, launch_inference, read_runs, reconcile_runs,
     resolve_run,
 )
-from .snapshots import index_snapshots, resolve_snapshot
+from .snapshots import import_snapshot, index_snapshots, resolve_snapshot
 from .tmux import Tmux
 
 
@@ -116,6 +116,18 @@ def _parser() -> argparse.ArgumentParser:
     snapshot_sub = snapshot.add_subparsers(dest="snapshot_command", required=True)
     snapshot_ls = snapshot_sub.add_parser("ls", help="list configured snapshots")
     snapshot_ls.add_argument("--backend", choices=("fiber3d", "lasagna"), default=None)
+    snapshot_import = snapshot_sub.add_parser(
+        "import", help="copy and identify a checkpoint in manager-owned storage",
+    )
+    snapshot_import.add_argument("checkpoint")
+    snapshot_import.add_argument(
+        "--model-identifier", required=True, metavar="OWNER/REPOSITORY",
+        help="stable external model identifier, normally a Hugging Face repository",
+    )
+    snapshot_import.add_argument(
+        "--run", default=None,
+        help="run name when it cannot be inferred from RUN/snapshots/CHECKPOINT",
+    )
     volume = sub.add_parser("volume")
     volume_sub = volume.add_subparsers(dest="volume_command", required=True)
     volume_ls = volume_sub.add_parser("ls", help="list open-data volumes")
@@ -506,6 +518,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 _print_volume_table(records, config)
         elif args.command == "snapshot":
+            if args.snapshot_command == "import":
+                record = import_snapshot(
+                    config, args.checkpoint,
+                    model_identifier=args.model_identifier,
+                    run=args.run,
+                )
+                _print_snapshot(1, record)
+                return 0
             records = index_snapshots(config)
             if args.backend:
                 records = [record for record in records if record.backend == args.backend]

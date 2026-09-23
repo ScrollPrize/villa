@@ -19,12 +19,15 @@ resolved relative to the config file. The initial file deliberately leaves
 `snapshot_dirs`, `cache_dir`, `output_dir`, `venv`, `atlas_dir`, and
 `upload_staging_s3` empty. Commands validate only the values they need. AWS
 credentials and profiles are external and must not be written to this file.
+`model_dir` defaults to persistent manager-owned storage at
+`~/.local/share/las_manager/models`.
 
 Configure `snapshot_dirs` with any combination of a run collection, one
 TensorBoard run directory, or a `snapshots/` directory:
 
 ```toml
 snapshot_dirs = ["/ephemeral/me/fiber/runs"]
+model_dir = "~/.local/share/las_manager/models"
 cache_dir = "/ephemeral/me/las_manager_cache"
 output_dir = "/ephemeral/me/fiber_inferences"
 venv = "/home/me/.venv_las"
@@ -92,6 +95,25 @@ las_manager snapshot ls
 las_manager sn l --backend fiber3d
 ```
 
+Before inference, import a training checkpoint into manager-owned storage and
+bind its exact bytes to the stable external model identifier used by Atlas
+(normally its Hugging Face repository):
+
+```bash
+las_manager snapshot import \
+  /path/to/RUN/snapshots/best.pt \
+  --model-identifier scrollprize/lasagna-fiber
+```
+
+The run name is inferred from `RUN/snapshots/CHECKPOINT`; use `--run RUN` for a
+checkpoint elsewhere. The checkpoint is copied unchanged to
+`<model_dir>/RUN/snapshots/CHECKPOINT`. An adjacent `.identity.json` sidecar
+binds `model_identifier` to the checkpoint SHA-256. Re-importing identical
+bytes with the same identifier is idempotent; different bytes at the same
+destination or a conflicting identifier are rejected. Keeping identity outside
+the checkpoint is deliberate: adding metadata to a PyTorch file would change
+the hash of the model uploaded to its external repository.
+
 The first listing inspects checkpoints with `torch.load(..., mmap=True,
 weights_only=True)` and computes their SHA-256. Extracted metadata is cached by
 canonical path, byte size, and nanosecond mtime. Subsequent unchanged listings
@@ -106,6 +128,10 @@ identity, precision, code revision, and optional Atlas model ID). Fiber and
 Lasagna checkpoints are detected from checkpoint structure rather than their
 filenames and have distinct `fiber3d/...` and `lasagna/...` selectors. Use
 `--backend` only to disambiguate a legacy shorthand that matches both.
+Inference requires a non-empty trusted `model_identifier` and fails before
+creating a run otherwise. Identity may come from the manager import sidecar,
+matching embedded checkpoint metadata, or an exact-SHA Atlas registration;
+conflicting sources are rejected.
 
 ## Prefetch and inference
 

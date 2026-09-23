@@ -1,30 +1,27 @@
-# Task plan
+# Plan: manager-owned snapshot identity
 
-1. Separate skipped inference tiles into empty-input and resume-complete
-   categories at the existing work-discovery points.
-2. Estimate remaining inference work by applying only the observed empty-input
-   fraction to the remaining candidate tiles. Do not extrapolate resume skips.
-3. Keep resume classification on the existing output checks; add no eager scan
-   and no source read solely for ETA reporting.
-4. Add focused unit coverage for clean sparse runs and resumed runs, including
-   the case where many resume skips precede observed inference work.
-5. Run the focused Lasagna test module and `git diff --check`.
-
-## Testing
-
-- Unit-test ETA arithmetic with distinct processed, empty and resume counts.
-- Exercise the existing small inference fixtures if practical.
-- Run `git diff --check`.
+1. Add a persistent manager model directory with a backwards-compatible
+   default, include it in snapshot discovery, and expose it in `config show`.
+2. Implement atomic snapshot import which preserves checkpoint bytes, verifies
+   SHA-256, records the required external model identifier in an adjacent
+   manager-owned identity sidecar, and rejects identity conflicts.
+3. Add `snapshot import` to the CLI and shell completion.
+4. Resolve manager identities on every index pass independently of the
+   checkpoint metadata cache, rejecting conflicts with checkpoint/Atlas data.
+5. Refuse inference before creating a run unless the selected checkpoint has a
+   non-empty model identifier.
+6. Add regression tests and run the complete manager test suite.
 
 ## Spec update
 
-Specify that whole-volume inference ETA extrapolates empty-input sparsity but
-does not interpret already-complete output as evidence of future emptiness.
+Document that external model identity is mandatory for inference and that a
+manager sidecar binds it to immutable checkpoint bytes by SHA-256.
 
 ## Docs updates
 
-No user-facing workflow changes; progress-line behavior is self-describing.
+Document configuration, import, storage layout, selectors, and error behavior
+in `lasagna/docs/manager.md` and the manager README quick start.
 
-## Changelog
+## Changelog update
 
-Not required for this focused reporting correction.
+Record the new manager-owned snapshot import and identity requirement.
