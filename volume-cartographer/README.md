@@ -234,9 +234,18 @@ remote cache directory, `~/.VC3D/remote_cache/<volume>-<id>/` unless
 `remote_cache_dir` under `[viewer]` in `~/.VC3D/VC3D.ini` points elsewhere,
 and later runs on the same volume read from there. On this volume the eight
 generations take ten to twenty seconds on a 14-core workstation and fetch
-about 2 MiB the first time;
-`--resume out/auto_grown_<timestamp>` continues a segment against the remote
-volume in the same way.
+about 2 MiB the first time.
+
+To grow the segment further, pass `--resume out/auto_grown_<timestamp>` and
+raise `generations` in `params.json`: it is the total generation count the
+segment stops at, not a number of additional generations, so resuming with
+the unchanged `generations: 8` reports `Resuming from generation 7 with 196
+points`, adds nothing and writes the same 196 points again
+(`--resume-generations 8` on the command line changes nothing either; the
+tracer does not read that option). With `generations: 16` the same command
+continues from generation 8 to 15 (1.41 cm² to 7.02 cm² here) and writes the
+result to a new `auto_grown_<timestamp>/` under the target directory, reading
+the remote volume as before.
 
 #### Rendering it
 
