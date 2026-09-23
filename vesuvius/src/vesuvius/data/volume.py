@@ -1126,7 +1126,7 @@ class Volume:
 
         resolution_mapping = {
             "1": 7.91, "1b": 7.91, "2": 7.91, "2b": 7.91, "2c": 7.91,
-            "3": 3.24, "4": 3.24, "5": 7.91
+            "3": 7.91, "4": 3.24, "5": 7.91
         }
         return resolution_mapping.get(scroll_id_key)
 
