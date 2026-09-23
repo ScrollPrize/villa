@@ -43,6 +43,19 @@ TORCH_BUILDS = {
 }
 CUDA13_ONLY_PACKAGES = {"cucim-cu13", "cupy-cuda13x", "nvidia-nvimgcodec-cu13"}
 
+# Lowest CUDA compute capability the official wheels carry SASS for. The cu128
+# and cu130 builds start at sm_75, so a Pascal or Volta card installs cleanly
+# and then fails at the first kernel launch with
+# "no kernel image is available for execution on the device".
+BACKEND_MIN_COMPUTE_CAP = {"cu128": (7, 5), "cu130": (7, 5)}
+
+
+def venv_interpreter(venv: Path) -> Path:
+    """Interpreter inside `venv`: Scripts/python.exe on Windows, bin/python elsewhere."""
+    if os.name == "nt":
+        return venv / "Scripts" / "python.exe"
+    return venv / "bin" / "python"
+
 
 def parse_cuda_version(output: str) -> tuple[int, int] | None:
     match = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", output)
@@ -64,6 +77,27 @@ def select_backend(cuda_version: tuple[int, int] | None) -> str:
     )
 
 
+def parse_compute_caps(output: str) -> list[tuple[int, int]]:
+    caps = []
+    for line in output.splitlines():
+        match = re.fullmatch(r"\s*(\d+)\.(\d+)\s*", line)
+        if match is not None:
+            caps.append((int(match.group(1)), int(match.group(2))))
+    return caps
+
+
+def query_compute_caps(nvidia_smi: str) -> list[tuple[int, int]]:
+    result = subprocess.run(
+        [nvidia_smi, "--query-gpu=compute_cap", "--format=csv,noheader"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    return parse_compute_caps(result.stdout)
+
+
 def detect_backend() -> tuple[str, str]:
     nvidia_smi = shutil.which("nvidia-smi")
     if nvidia_smi is None:
@@ -81,7 +115,21 @@ def detect_backend() -> tuple[str, str]:
     if cuda_version is None:
         raise RuntimeError("could not read 'CUDA Version' from nvidia-smi output")
     backend = select_backend(cuda_version)
-    return backend, f"nvidia-smi reports CUDA {cuda_version[0]}.{cuda_version[1]}"
+    reason = f"nvidia-smi reports CUDA {cuda_version[0]}.{cuda_version[1]}"
+
+    # The driver's CUDA version says nothing about whether the wheels contain
+    # kernels for this GPU. Check the card itself before picking a CUDA build.
+    minimum = BACKEND_MIN_COMPUTE_CAP.get(backend)
+    caps = query_compute_caps(nvidia_smi) if minimum is not None else []
+    if minimum is not None and caps and max(caps) < minimum:
+        best = max(caps)
+        return "cpu", (
+            f"{reason}, but the newest GPU is compute capability "
+            f"{best[0]}.{best[1]} and the {backend} wheels start at "
+            f"{minimum[0]}.{minimum[1]}; falling back to cpu. Pass "
+            f"--backend {backend} to override"
+        )
+    return backend, reason
 
 
 def run(command: list[str], *, dry_run: bool) -> None:
@@ -149,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
     build = TORCH_BUILDS[backend]
     venv = args.venv.expanduser().resolve()
     project = args.project.resolve()
-    venv_python = venv / "bin" / "python"
+    venv_python = venv_interpreter(venv)
     print(f"PyTorch backend: {backend} ({reason})", flush=True)
 
     if not venv_python.exists():
@@ -184,15 +232,26 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         return 0
-    check = (
-        "import json, torch; "
-        "import vesuvius.neural_tracing.fiber_trace_3d.infer as fiber_infer; "
-        "print(json.dumps({'torch': torch.__version__, "
-        "'torch_cuda': torch.version.cuda, 'cuda_available': torch.cuda.is_available(), "
-        "'fiber_infer': fiber_infer.__file__})); "
-        f"raise SystemExit(0 if {backend == 'cpu' or args.skip_cuda_check!r} "
-        "or torch.cuda.is_available() else 1)"
-    )
+    # torch.cuda.is_available() only reports that a driver and a device are
+    # present; it stays True on a GPU whose compute capability the wheel has
+    # no kernels for. Launch one real kernel so a mismatch surfaces here
+    # rather than part-way through a fit.
+    check = "\n".join([
+        "import json, torch",
+        "import vesuvius.neural_tracing.fiber_trace_3d.infer as fiber_infer",
+        "print(json.dumps({'torch': torch.__version__,"
+        " 'torch_cuda': torch.version.cuda,"
+        " 'cuda_available': torch.cuda.is_available(),"
+        " 'fiber_infer': fiber_infer.__file__}))",
+        "ok = torch.cuda.is_available()",
+        "if ok:",
+        "    try:",
+        "        (torch.ones(8, device='cuda') * 2).sum().item()",
+        "    except Exception as exc:",
+        "        print('CUDA smoke test failed:', exc)",
+        "        ok = False",
+        f"raise SystemExit(0 if {backend == 'cpu' or args.skip_cuda_check!r} or ok else 1)",
+    ])
     check_environment = dict(os.environ)
     check_environment.pop("PYTHONPATH", None)
     result = subprocess.run(
