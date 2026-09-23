@@ -28,4 +28,5 @@ struct DirectionField
 
 QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurface*> &surfs_v, const utils::Json &params, float voxelsize = 1.0);
 QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurface*> &surfs_v, const utils::Json &params, float voxelsize, SurfacePatchIndex* surface_patch_index);
+int resume_stop_generation(const utils::Json &params, int start_gen, int stop_gen);
 QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root = "", float voxelsize = 1.0, const std::vector<DirectionField> &direction_fields = {}, QuadSurface* resume_surf = nullptr, const std::filesystem::path& tgt_path = "", const utils::Json& meta_params = {}, const PointCollections &corrections = PointCollections(), const cv::Mat* allowed_growth_mask = nullptr);
