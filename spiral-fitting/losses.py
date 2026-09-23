@@ -1211,6 +1211,12 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
     if compute_normals:
         target_normal, valid_normal = _decode_uint8_normal(nx_u8, ny_u8)  # zyx
         normal_weight = valid_normal * in_bounds.float()
+        patch_present = None
+        if lasagna_volume.get('patch_normals') is not None:
+            from patch_normals import override_patch_normals
+            target_normal, normal_weight, patch_present = override_patch_normals(
+                lasagna_volume, scroll_mid, target_normal, normal_weight,
+                return_presence=True)
 
     if compute_spacing:
         # grad_mag encodes a winding density (windings per base-volume voxel); the decode factor below
@@ -1251,7 +1257,14 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
         spiral_zyx=spiral_zyx_detached,
         epsilon=epsilon,
     )
-    normals_residual = 1. - (scroll_normal * target_normal).sum(dim=-1).abs()
+    normal_dot = (scroll_normal * target_normal).sum(dim=-1)
+    alignment = normal_dot.abs()
+    if cfg.get('dense_normals_patch_signed', False) and patch_present is not None:
+        # Patch exports point inward (negative winding gradient), whereas the
+        # transported radial normal points outward. Only patch-covered cells
+        # enforce that orientation; Lasagna targets remain axial.
+        alignment = torch.where(patch_present, -normal_dot, alignment)
+    normals_residual = 1. - alignment
     normals_loss = (normals_residual * normal_weight).sum() / normal_weight.sum().clamp(min=1)
     record_loss_samples('dense_normals', spiral_zyx_detached, normals_residual,
                         normal_weight.bool())

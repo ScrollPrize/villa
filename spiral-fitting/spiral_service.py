@@ -1009,6 +1009,7 @@ class ServiceState:
             "fibers": "fibers",
             "outer_shell": "outer_shell",
             "tracks_dbm": "tracks_dbm",
+            "patch_normals": "patch_normals",
             "normal_x": "normals",
             "normal_y": "normals",
             "gradient_magnitude": "gradient_magnitude",

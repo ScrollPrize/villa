@@ -211,6 +211,9 @@ def pcl_role_toggle_key(role: PclRole | str) -> str:
 
 def input_source_enabled(config: Mapping[str, Any], source: str) -> bool:
     """Whether a rebuild may include one optional supervision source."""
+    if source == "patch_normals":
+        return (bool(config.get("input_use_normals", True))
+                and config.get("dense_normals_source", "lasagna") == "patch_preferred")
     enabled = bool(config.get(_INPUT_TOGGLE_KEYS[source], True))
     if source in {"verified_patches", "unverified_patches"}:
         enabled = enabled and not bool(config.get("input_disable_patches", False))
@@ -408,6 +411,10 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
                  enabled=_tracks_enabled),
     FitInputSpec("pcls", "pcl-set", json_content=True,
                  enabled=_pcls_enabled),
+    FitInputSpec("patch_normals", "directory",
+                 conventional_relative="patch_normals.zarr",
+                 enabled=lambda config: input_source_enabled(config, "patch_normals"),
+                 required=lambda config: input_source_enabled(config, "patch_normals")),
     FitInputSpec("normal_x", "zarr-group",
                  conventional_relative="lasagna_inputs/las_008_nx.ome.zarr",
                  enabled=lambda config: input_source_enabled(config, "normals"),
@@ -481,6 +488,7 @@ class SpiralInputPaths:
     verified_patches: str = ""
     unverified_patches: str = ""
     outer_shell: str = ""
+    patch_normals: str = ""
     normal_x: str = ""
     normal_y: str = ""
     gradient_magnitude: str = ""
@@ -829,6 +837,7 @@ def conventional_input_paths(
         verified_patches=resolve("verified_patches"),
         unverified_patches=spec.path_override("unverified_patches"),
         outer_shell=resolve("outer_shell"),
+        patch_normals=resolve("patch_normals"),
         normal_x=resolve("normal_x"),
         normal_y=resolve("normal_y"),
         gradient_magnitude=resolve("gradient_magnitude"),

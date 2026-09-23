@@ -410,7 +410,19 @@ def open_pool(sidecar_dir: str):
     sidecar_dir = Path(sidecar_dir)
     with open(sidecar_dir / 'meta.json') as f:
         meta = json.load(f)
-    if meta.get('format') != 'respool' or meta.get('version') != RESPOOL_FORMAT_VERSION:
+    if meta.get('version') == 4:
+        # v4 allows per-channel types; this uint8 reader only accepts the
+        # explicit, contiguous uint8 layout used by signed patch normals.
+        layout = meta.get('channel_layout', [])
+        expected_shape = [int(meta['rows']), int(np.prod(meta['brick_shape']))]
+        if (len(layout) != len(meta['channels']) or not all(
+                entry.get('dtype') == '|u1'
+                and entry.get('file') == f'channel_{i}.u8'
+                and entry.get('shape') == expected_shape
+                and entry.get('order') == 'C'
+                for i, entry in enumerate(layout))):
+            raise ValueError(f'{sidecar_dir}: unsupported v4 channel layout')
+    if meta.get('format') != 'respool' or meta.get('version') not in (RESPOOL_FORMAT_VERSION, 4):
         raise ValueError(f'{sidecar_dir}: unsupported sidecar format {meta.get("format")!r} '
                          f'v{meta.get("version")!r}')
     table = np.load(sidecar_dir / 'table.npy')

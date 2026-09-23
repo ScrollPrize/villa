@@ -23,6 +23,7 @@ _ENUMS = {
     "track_crossing_mode": ["count", "track_walk"],
     "track_radius_target": ["mean", "median"],
     "dense_spacing_mode": ["phase", "grad_mag", "winding_model"],
+    "dense_normals_source": ["lasagna", "patch_preferred"],
     "dense_spacing_support_policy": ["product", "minimum"],
     "dt_target_mode": ["strip_median", "whole_object_quantile"],
     "dense_spacing_density_lambda": [
@@ -152,6 +153,9 @@ BACKFILLABLE_CONFIG_DEFAULTS = {
     key: True for key in _INPUT_TOGGLE_DESCRIPTIONS
 }
 BACKFILLABLE_CONFIG_DEFAULTS.update({
+    "dense_normals_source": "lasagna",
+    "dense_normals_patch_signed": False,
+    "dense_normals_patch_exclusion_radius": 8.0,
     # Historical checkpoints used an unbounded exponential gap map and used
     # model_gap_expander_num_windings for both the physical estimate and the
     # allocated lattice extent.  The checkpoint loader migrates their tensors;
@@ -452,7 +456,8 @@ NEW_FIT_KEYS = frozenset(
     | _INPUT_GATE_KEYS
     | _PREPARED_INPUT_FIELDS
     | {"optimizer_random_seed", "pcl_vertical_fiber_min_auto_certainty",
-       "pcl_vertical_fiber_min_z_fraction"}
+       "pcl_vertical_fiber_min_z_fraction", "dense_normals_source",
+       "dense_normals_patch_exclusion_radius"}
 )
 
 _AUDITED_PREFIXES = ("model_", "input_", "pcl_")
@@ -568,6 +573,20 @@ def _field_spec(key, default):
         spec["ui_owner"] = "run"
     elif key in _INPUT_TOGGLE_DESCRIPTIONS:
         spec["description"] = _INPUT_TOGGLE_DESCRIPTIONS[key]
+    elif key == "dense_normals_source":
+        spec["description"] = (
+            "Use Lasagna normals, or prefer patch-export normals in occupied "
+            "cells with Lasagna fallback. Requires a fit rebuild.")
+    elif key == "dense_normals_patch_signed":
+        spec["description"] = (
+            "Enforce inward patch-normal orientation in the dense-normal loss. "
+            "Lasagna fallback and phase-spacing geometry remain unsigned.")
+    elif key == "dense_normals_patch_exclusion_radius":
+        spec["description"] = (
+            "Suppress Lasagna fallback within this Euclidean distance of patch "
+            "coverage, in fitter voxels, evaluated on export-cell centers. "
+            "Empty nearby cells receive no normal supervision. Zero restores "
+            "pointwise fallback. Reload required to rebuild the cached mask.")
     elif key in _GAP_EXPANDER_DESCRIPTIONS:
         spec["description"] = _GAP_EXPANDER_DESCRIPTIONS[key]
     elif key in _PCL_LINK_DESCRIPTIONS:
@@ -693,6 +712,7 @@ class Config:
         self.input_use_pcl_same_winding = True
         self.input_use_pcl_drawn_control_points = True
         self.input_use_normals = True
+        self.dense_normals_source = "lasagna"
         self.input_use_surf_sdt = False
         self.input_use_gradient_magnitude = True
         self.input_use_winding_inference = True
@@ -858,6 +878,8 @@ class Config:
         self.dense_attachment_warmup_steps = 3000
         self.dense_attachment_ramp_steps = 3000
         self.dense_normals_finite_difference_epsilon = 8.0
+        self.dense_normals_patch_signed = False
+        self.dense_normals_patch_exclusion_radius = 8.0
         self.fiber_directions_finite_difference_epsilon = 8.0
         self.model_sym_dirichlet_finite_difference_epsilon = 4.0
         self.optimizer_weight_decay_gap_expander = 0.01

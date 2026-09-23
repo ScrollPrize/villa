@@ -998,3 +998,112 @@ gradient of the fitted winding, `fit_spiral.inward_winding_direction`), and the
 fiber training views are re-materialised. A checkpoint from before that step
 loaded after the switch relinks back under the umbilicus direction at its first
 step.
+
+## Optional patch-export normals
+
+In VC3D's Spiral advanced config, set `dense_normals_source` to
+`patch_preferred` and rebuild the session. The default is `lasagna`;
+`input_use_normals` remains the overall normal-input gate. The service
+discovers `patch_normals.zarr` in the dataset root;
+for another location, set `paths.patch_normals` in `spiral-scroll.json`.
+Historical checkpoints default to `lasagna`.
+
+For a headless fit using the existing environment:
+
+```sh
+AGENTS_AGENT_MODE=1 FIT_SPIRAL_CONFIG_OVERRIDES='{"dense_normals_source": "patch_preferred"}' \
+  spiral-fitting/.venv/bin/python spiral-fitting/fit_spiral.py \
+  --dataset /mnt/raid_nvme/spiral_dataset_working
+```
+
+The supported export is a complete `signed_patch_normal_volume` manifest plus
+`signed_normals_u8.respool` with three uint8 channels (nx, ny, nz). Sampling
+uses the export's `cell_size_fitter_voxels` and floor-cell indexing in the
+same fitter coordinate frame as the dataset. Occupied patch cells replace
+Lasagna targets in both the dense-normal loss and phase-spacing normal lookup;
+missing cells fall back to Lasagna only when farther than
+`dense_normals_patch_exclusion_radius` (default **8 fitter voxels**) from patch
+coverage. Empty cells inside that radius have zero normal weight/invalid normal
+support, rather than borrowing a nearby patch normal. Distances are Euclidean,
+inclusive at the radius, evaluated between export-cell centers: the query uses
+its floor-indexed patch cell, not a continuous-point nearest-neighbor search.
+For this export, 8 fitter voxels equals 4 patch-grid cells. There is no blending
+or extrapolation. Set the radius to `0` to restore pointwise fallback. Changing
+it requires reloading the inputs.
+Signed components are retained. Normal losses default to unsigned comparisons.
+Set `dense_normals_patch_signed: true` to enforce patch orientation in the
+dense-normal loss. Exported patch normals point inward, opposite the fitter's
+outward radial normal, so the signed residual is `1 + dot(outward, patch)`:
+zero for the correct orientation and two for the reversed orientation.
+Only patch-covered cells use this residual; Lasagna fallback stays unsigned
+(`1 - abs(dot)`). Phase-spacing geometry also stays unsigned. The setting
+applies at the next Run boundary without reloading normals; old checkpoints
+default to unsigned.
+Lasagna inputs are still required for fallback. Gradient magnitudes are unchanged.
+
+The pool is compacted on the CPU and loaded onto the GPU for the fit's z range.
+Only occupied cells retain three uint8 components; presence bitmaps and rank
+offsets provide exact lookup without storing empty-cell payloads. The supplied
+full export needs approximately 11 GiB instead of 60 GiB before ROI selection,
+in addition to other fitting allocations. No values, coverage, resolution, or
+quantization change. Existing exports work unchanged and are not rewritten.
+Startup still reads the original selected bricks and temporarily stages the
+compact representation in system RAM (approximately another 11 GiB for the
+full export, plus bounded raw batches and lookup metadata). Sampling after
+loading stays entirely on the device, with no disk reads or CPU transfers.
+
+The exclusion mask adds an int32 brick table plus one bit per voxel in mixed
+bricks; entirely empty/full bricks share two constant rows. The added memory
+is reported at load time, separately from the normal payload. CPU preprocessing
+uses tiles with halos, including patch coverage just outside the fit's z range.
+The first load builds the mask and caches it under the fit cache directory;
+later loads reuse it if source file sizes/timestamps, z range, grid, and radius
+match. Without a cache directory, each load rebuilds it. During fitting the
+mask reuses the normal gather's brick/local indices: one extra table/bit lookup,
+no radius search, additional samples, host synchronization, or disk access.
+
+Run CPU-only compact lookup equivalence checks from `spiral-fitting`:
+
+```sh
+AGENTS_AGENT_MODE=1 CUDA_VISIBLE_DEVICES='' .venv/bin/python -m pytest -q \
+  tests/test_compact_patch_normals.py tests/test_patch_normals.py \
+  tests/test_patch_normal_exclusion.py
+```
+
+Benchmark 200,000 points on a small real-data region without using the GPU:
+
+```sh
+AGENTS_AGENT_MODE=1 CUDA_VISIBLE_DEVICES='' PYTHONPATH=. .venv/bin/python \
+  tests/benchmark_patch_normal_exclusion.py \
+  --source /mnt/raid_nvme/spiral_dataset_working/patch_normals.zarr
+```
+
+This uses a temporary 144³-cell neighborhood and reports mask memory, startup
+time, and mean/min/median/p95/max CPU sampling times over 20 iterations. It does
+not measure full-export memory or GPU throughput.
+
+Set `PATCH_NORMALS_TEST_EXPORT=/path/to/patch_normals.zarr` when running
+`tests/test_compact_patch_normals.py` to also compare 60,000 CPU lookups against
+the original encoded sidecar in one real z slab. This check never uses CUDA.
+
+Run focused regression checks from the repository root:
+
+```sh
+AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_patch_normals.py \
+  spiral-fitting/tests/test_input_catalog.py spiral-fitting/tests/test_input_toggles.py \
+  spiral-fitting/tests/test_config.py spiral-fitting/tests/test_sparse_cuda_cache.py \
+  spiral-fitting/tests/test_phase_spacing.py spiral-fitting/tests/test_spiral_service_v2.py
+```
+
+Validate a small occupied slab against a real export's float32 source channels:
+
+```sh
+AGENTS_AGENT_MODE=1 PATCH_NORMALS_TEST_EXPORT=/mnt/raid_nvme/spiral_dataset_working/patch_normals.zarr \
+  PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_patch_normals.py -k real_patch_export
+```
+
+This read-only check loads one z slab on the CPU, compares up to 32 occupied
+cells within uint8 quantization tolerance, and verifies precedence and bounds.
+It does not measure convergence or full-ROI GPU memory use.

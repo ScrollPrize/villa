@@ -83,6 +83,16 @@ def test_input_participation_toggles_are_rebuild_scoped_booleans():
     assert rebuild_stage(["input_use_pcl_absolute"]) == "all"
 
 
+def test_dense_normals_source_is_a_rebuild_scoped_enum():
+    field = Config.catalog()["schema"]["fields"]["dense_normals_source"]
+    assert field["type"] == "enum"
+    assert field["values"] == ["lasagna", "patch_preferred"]
+    assert field["runtime_impact"] == "new_fit"
+    assert Config({"dense_normals_source": "patch_preferred"}).dense_normals_source == "patch_preferred"
+    with pytest.raises(ValueError, match="Invalid value for dense_normals_source"):
+        Config({"dense_normals_source": "patch_only"})
+
+
 def test_z_range_is_advertised_as_owned_by_the_run_controls():
     catalog = Config.catalog()
     assert "z_begin" not in catalog["defaults"]
@@ -107,7 +117,9 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
         if key.startswith("dense_"):
             expected = (
                 "new_fit"
-                if key == "dense_spacing_mode" else "run_boundary")
+                if key in {"dense_spacing_mode", "dense_normals_source",
+                           "dense_normals_patch_exclusion_radius"}
+                else "run_boundary")
             assert field["runtime_impact"] == expected
         if key.startswith("dt_"):
             assert field["runtime_impact"] == "run_boundary"

@@ -1571,6 +1571,9 @@ class FitContext:
         # Resolved input paths ('' means absent).
         self.scroll_zarr_path = paths.scroll_zarr or None
         use_normals = input_source_enabled(config, 'normals')
+        self.patch_normals_path = (
+            (paths.patch_normals or None)
+            if input_source_enabled(config, 'patch_normals') else None)
         self.normal_nx_zarr_path = (paths.normal_x or None) if use_normals else None
         self.normal_ny_zarr_path = (paths.normal_y or None) if use_normals else None
         self.grad_mag_zarr_path = (
@@ -3274,6 +3277,14 @@ class FitContext:
             cache_directory=self.cache_path,
             progress=progress,
         )
+        if self.patch_normals_path and use_normals:
+            from patch_normals import load_patch_normals
+            patch_store = load_patch_normals(
+                self.patch_normals_path, z_begin=self.z_begin, z_end=self.z_end,
+                progress=progress, cache_directory=self.cache_path,
+                exclusion_radius=self.config.get('dense_normals_patch_exclusion_radius', 8.))
+            self.lasagna_volume['patch_normals'] = patch_store
+            self._scalar_stores.append(patch_store)
         if interactive_driver is not None and self.lasagna_volume:
             self._lasagna_store = self.lasagna_volume['store']
 

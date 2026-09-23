@@ -487,6 +487,10 @@ def sample_lasagna_normals_nearest(lasagna_volume, points_working_zyx):
     ny = (ny_u8.to(torch.float32) - 128.0) / 127.0
     nz = torch.sqrt((1.0 - nx.square() - ny.square()).clamp(min=0.0))
     normal = F.normalize(torch.stack([nz, ny, nx], dim=-1), dim=-1)
+    if lasagna_volume.get('patch_normals') is not None:
+        from patch_normals import override_patch_normals
+        normal, valid = override_patch_normals(
+            lasagna_volume, points_working_zyx, normal, valid)
     return normal, valid
 
 
