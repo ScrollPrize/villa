@@ -21,7 +21,6 @@ try:
     import resource
 except ImportError:  # pragma: no cover - unavailable on Windows
     resource = None
-from collections import defaultdict
 from collections.abc import Mapping
 import zarr
 import torch
@@ -47,15 +46,14 @@ from ddp_helpers import (
     maybe_init_distributed,
     process_context,
 )
-from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
-                    RETIRED_CONFIG_KEYS, Config, FitConfig, SHELL_ATLAS_KEYS, durable_config)
+from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, FitConfig,
+                    SHELL_ATLAS_KEYS)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
-                                   merge_flow_stage_lattices,
-                                   migrate_legacy_gap_parameterization)
+                                   tolerate_checkpoint_config)
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, EDITABLE_PCL_ROLE_VALUES,
                          RUN_MUTABLE_PCL_ROLES,
                          fit_input, input_source_enabled, pcl_input_enabled,
-                         pcl_role_toggle_key, phase_bundle_enabled,
+                         pcl_role_toggle_key,
                          shell_losses_enabled, winding_inference_enabled)
 from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
 
@@ -73,11 +71,9 @@ def _startup_resource_suffix(started_at=None):
     return ', '.join(fields)
 
 
-from lasagna_data import (ensure_fit_sparse_stores, prepare_lasagna_volume,
-                          prepare_surf_sdt_volume)
+from lasagna_data import ensure_fit_sparse_stores, prepare_lasagna_volume
 from checkpoint_io import load_checkpoint_cpu, model_state_sha256
 from fiber_direction_samples import load_fiber_direction_samples
-from influence import make_influence_state, subsample_rows
 from spiral_sampling import load_spiral_sampling
 from tifxyz import load_tifxyz, patch_from_payload
 from geom_utils import bilinear_atlas_lookup, interp1d
@@ -122,6 +118,7 @@ from losses import (
     build_pcl_sampling_strata,
     pcl_sampling_group_weight,
     get_fiber_direction_loss,
+    get_min_spacing_loss,
     iter_lasagna_losses,
     get_patch_abs_winding_loss,
     get_patch_and_umbilicus_losses,
@@ -129,15 +126,9 @@ from losses import (
     get_shell_outer_loss,
     get_symmetric_dirichlet_loss,
     get_unattached_pcl_strip_losses,
-    get_unverified_patch_losses,
 )
 from loss_maps import (LossMapRecorder, attach_loss_maps_to_manifest,
                        capture_loss_maps)
-from sdt_losses import (
-    aggregate_pair_counts,
-    iter_phase_bundle_losses,
-    phase_bundle_component_weights,
-)
 from spiral_helpers import (
     REFERENCE_Z_RANGE_NUM_SLICES,
     erode_patch_valid_region,
@@ -191,21 +182,7 @@ def largest_patch_quad_component(mask):
     return component_labels == int(component_sizes.argmax())
 
 
-# Fields of a surf-SDT fingerprint that describe where the store lives and how
-# much of it has been built, rather than what it contains.
-_SDT_COVERAGE_AND_LOCATION_KEYS = (
-    'path', 'source', 'complete', 'z_range_working', 'built_z_ranges_working',
-)
-
 _HEADLESS_AUTOSAVE_INTERVAL = AUTOSAVE_INTERVAL_ITERATIONS
-
-
-def comparable_sdt_fingerprint(fingerprint):
-    """The content-identity subset of a surf-SDT fingerprint."""
-    if not fingerprint:
-        return None
-    return {key: value for key, value in fingerprint.items()
-            if key not in _SDT_COVERAGE_AND_LOCATION_KEYS}
 
 
 class CheckpointVerdict:
@@ -329,6 +306,16 @@ class ShellPolarMap:
             f'shell polar table: {num_z} z bins x {self.num_theta_bins} theta bins, '
             f'{occupied}/{total} occupied ({occupied / max(total, 1) * 100:.1f}%)'
         )
+
+    def to(self, device):
+        # The table is built once on the host (the track filter reads it
+        # there) and shared with the losses on the training device: a shallow
+        # copy whose tensors live on ``device``.
+        moved = copy.copy(self)
+        moved.device = device
+        moved.lookup_table = self.lookup_table.to(device=device)
+        moved.umbilicus_zyx = self.umbilicus_zyx.to(device=device)
+        return moved
 
     def lookup(self, scan_zyx):
         centre_yx = interp1d(scan_zyx[..., 0].contiguous(), self.umbilicus_zyx[:, :1], self.umbilicus_zyx[:, 1:])
@@ -813,12 +800,12 @@ def longest_run_in_z_window(sorted_items, z_begin, z_end, z_margin):
     return sorted_items[best_start:best_end]
 
 
-def _logical_identity(record):
-    """Return an editable PCL's role-scoped logical identity, if present."""
-    kind = record.get('logical_input_kind')
-    if kind is None:
-        return None
-    return (kind, str(record.get('logical_input_id')))
+def subsample_rows(points, max_points, generator):
+    """Deterministically keep at most ``max_points`` rows of ``points``."""
+    if points.shape[0] <= max_points:
+        return points
+    order = torch.randperm(points.shape[0], generator=generator)[:max_points]
+    return points[order.sort().values]
 
 
 def regular_unattached_strip(pcl_id, pcl, min_point_spacing):
@@ -1150,34 +1137,6 @@ def get_or_build_unattached_pcl_flat(pcl_strips, device):
     return flat
 
 
-def get_progressive_dt_max_winding(cfg, iteration, dt_start_step, shell_outer_winding_idx):
-    # When `dt_progressive_windings` is set, the DT losses (patch, track, unattached-pcl) only act
-    # on tracks/patches whose snapped spiral-space winding is <= the returned cutoff. The cutoff
-    # grows outwards from `dt_progressive_inner_winding` (when the DT loss first turns on, at
-    # `dt_start_step`) to `shell_outer_winding_idx` over `dt_progressive_steps` steps, so the
-    # constraint expands across windings even after it has started. Returns None to disable gating
-    # (include everything) -- when the feature is off, or no outer winding is known.
-    #
-    # The membership test lives in spiral space, but tracks/patches are sampled in scroll space;
-    # callers reuse the per-track snapped winding (round(median(shifted_radius)/dr)) already needed
-    # for the DT target, so deciding inclusion needs no extra transform (only a handful of points).
-    #
-    # `dt_progressive_exponent` warps the linear time fraction f -> f**exponent before mapping to
-    # the winding cutoff. exponent == 1 grows the winding index (radius) linearly; exponent < 1 is
-    # concave (fast early, slow late), so the outermost windings -- which gain area/volume
-    # quadratically -- expand more slowly and get more time to catch up (~0.5 ≈ constant
-    # area-introduction rate); exponent > 1 is the opposite.
-    if not cfg['dt_progressive_windings'] or shell_outer_winding_idx is None:
-        return None
-    span = max(1, int(cfg['dt_progressive_steps']))
-    f = min(1., max(0., (iteration - dt_start_step) / span))
-    exponent = float(cfg['dt_progressive_exponent'])
-    f_warped = f ** exponent if exponent != 1.0 else f
-    w_inner = float(cfg['dt_progressive_inner_winding'])
-    w_outer = float(shell_outer_winding_idx)
-    return w_inner + (w_outer - w_inner) * f_warped
-
-
 def get_run_dt_resume_iteration(run_start, requested_iterations,
                                 last_fraction):
     """Return the first Run iteration eligible for directional DT losses.
@@ -1198,13 +1157,9 @@ def get_dt_loss_eligibility(cfg, iteration, run_dt_resume_iteration=None):
     patch_start = cfg['loss_start_patch_dt']
     track_start = (patch_start if cfg['loss_start_track_dt'] is None
                    else cfg['loss_start_track_dt'])
-    unverified_start = (
-        patch_start if cfg['loss_start_unverified_patch_dt'] is None
-        else cfg['loss_start_unverified_patch_dt'])
     unattached_start = get_unattached_pcl_dt_start(cfg)
     return {
         'verified_patch': run_eligible and iteration > patch_start,
-        'unverified_patch': run_eligible and iteration > unverified_start,
         'track': run_eligible and iteration > track_start,
         'unattached_pcl': run_eligible and iteration > unattached_start,
     }
@@ -1243,19 +1198,6 @@ def unresolved_fiber_link_warning(fiber_catalog, *, use_links, use_pending_links
     return (
         f'{sum(len(missing) for _, missing in counted)} active cross-fiber '
         f'branch(es) target absent resident fibers: {named}')
-
-
-def get_dense_attachment_ramp(cfg, iteration):
-    """Warm-up/ramp factor for the attachment weight, measured against the
-    durable completed-iteration count so a resumed run continues the schedule
-    instead of restarting it."""
-    warmup = int(cfg['dense_attachment_warmup_steps'])
-    ramp = int(cfg['dense_attachment_ramp_steps'])
-    if iteration < warmup:
-        return 0.0
-    if ramp <= 0:
-        return 1.0
-    return min(1.0, (iteration - warmup + 1) / ramp)
 
 
 def get_exponential_lr_at_step(
@@ -1344,132 +1286,6 @@ def realign_optimizer_lr_schedule(
     return lr_scheduler, horizon
 
 
-def _query_near_trusted_geometry(points_np, trusted_geometry_tree, threshold):
-    # Returns True for each point with at least one trusted-geometry anchor
-    # within `threshold`. query returns dist == inf for misses. Respect the
-    # process CPU budget configured from FIT_SPIRAL_NUM_THREADS instead of
-    # letting scipy consume every host CPU via workers=-1.
-    points_np = np.ascontiguousarray(points_np, dtype=np.float32)
-    dist, _ = trusted_geometry_tree.query(
-        points_np,
-        k=1,
-        distance_upper_bound=float(threshold),
-        workers=torch.get_num_threads(),
-    )
-    return np.isfinite(dist)
-
-
-def _apply_unverified_patch_trusted_mask(patch, vertices_to_invalidate):
-    if not vertices_to_invalidate.any():
-        return 0, False
-
-    invalid_mask_2d = torch.from_numpy(vertices_to_invalidate.reshape(patch.zyxs.shape[:2]))
-    # Keep the pre-exclusion geometry available for later supervision removal.
-    patch.zyxs = patch.zyxs.clone()
-    patch.zyxs[invalid_mask_2d] = -1.0
-    n_masked = int(vertices_to_invalidate.sum())
-
-    new_valid_vertex_mask = torch.any(patch.zyxs != -1, dim=-1)
-    new_valid_quad_mask = (
-        new_valid_vertex_mask[:-1, :-1]
-        & new_valid_vertex_mask[1:, :-1]
-        & new_valid_vertex_mask[:-1, 1:]
-        & new_valid_vertex_mask[1:, 1:]
-    )
-
-    if not bool(new_valid_quad_mask.any()):
-        return n_masked, True
-
-    patch.__post_init__()
-    return n_masked, False
-
-
-def _mask_unverified_patches_near_trusted_geometry(
-    unverified_patches,
-    trusted_geometry_tree,
-    threshold,
-    max_query_points=2_000_000,
-):
-    if threshold <= 0 or trusted_geometry_tree is None:
-        return dict(unverified_patches), 0, 0
-
-    kept_unverified_patches = {}
-    n_masked_vertices = 0
-    n_dropped_patches = 0
-
-    batch_entries = []
-    batch_points = []
-    batch_total = 0
-
-    def flush_batch():
-        nonlocal batch_entries, batch_points, batch_total
-        nonlocal n_masked_vertices, n_dropped_patches
-
-        if batch_total == 0:
-            return
-
-        points_np = batch_points[0] if len(batch_points) == 1 else np.concatenate(batch_points, axis=0)
-        near_trusted = _query_near_trusted_geometry(points_np, trusted_geometry_tree, threshold)
-
-        offset = 0
-        for patch_id, patch, valid_indices in batch_entries:
-            n_valid = len(valid_indices)
-            patch_near_trusted = near_trusted[offset:offset + n_valid]
-            offset += n_valid
-
-            vertices_to_invalidate = np.zeros(patch.zyxs.shape[0] * patch.zyxs.shape[1], dtype=bool)
-            vertices_to_invalidate[valid_indices[patch_near_trusted]] = True
-            n_masked, dropped = _apply_unverified_patch_trusted_mask(patch, vertices_to_invalidate)
-            n_masked_vertices += n_masked
-            if dropped:
-                n_dropped_patches += 1
-            else:
-                kept_unverified_patches[patch_id] = patch
-
-        batch_entries = []
-        batch_points = []
-        batch_total = 0
-
-    for patch_id, patch in unverified_patches.items():
-        zyxs_flat = patch.zyxs.reshape(-1, 3).cpu().numpy()
-        valid_flat = patch.valid_vertex_mask.reshape(-1).cpu().numpy()
-        valid_indices = np.flatnonzero(valid_flat)
-
-        if len(valid_indices) == 0:
-            kept_unverified_patches[patch_id] = patch
-            continue
-
-        if len(valid_indices) > max_query_points:
-            flush_batch()
-            vertices_to_invalidate = np.zeros(len(valid_flat), dtype=bool)
-            for start in range(0, len(valid_indices), max_query_points):
-                chunk_indices = valid_indices[start:start + max_query_points]
-                near_trusted = _query_near_trusted_geometry(
-                    zyxs_flat[chunk_indices],
-                    trusted_geometry_tree,
-                    threshold,
-                )
-                vertices_to_invalidate[chunk_indices[near_trusted]] = True
-
-            n_masked, dropped = _apply_unverified_patch_trusted_mask(patch, vertices_to_invalidate)
-            n_masked_vertices += n_masked
-            if dropped:
-                n_dropped_patches += 1
-            else:
-                kept_unverified_patches[patch_id] = patch
-            continue
-
-        if batch_total + len(valid_indices) > max_query_points:
-            flush_batch()
-
-        batch_entries.append((patch_id, patch, valid_indices))
-        batch_points.append(zyxs_flat[valid_indices])
-        batch_total += len(valid_indices)
-
-    flush_batch()
-    return kept_unverified_patches, n_masked_vertices, n_dropped_patches
-
-
 class FitContext:
     """Owner of all mutable state and resources for one spiral fit.
 
@@ -1486,7 +1302,7 @@ class FitContext:
     """
 
     def __init__(self, config, *, scroll, paths, interactive_driver=None,
-                 progress=None, resume_path=None, resume_step=0,
+                 progress=None, resume_path=None,
                  out_base_dir=None, run_dir=None, run_tag=None, run_name=None,
                  cache_dir=None, storage_backend='sparse_cuda',
                  render_volume_scale=16, dist_context=None):
@@ -1496,7 +1312,7 @@ class FitContext:
         #
         # scroll is the frozen ScrollSpec: physical facts of the scanned
         # scroll (name, voxel size, outward sense, umbilicus coordinate
-        # scale, Lasagna/SDT groups and scale). paths is the resolved
+        # scale, Lasagna group and scale). paths is the resolved
         # SpiralInputPaths for this fit: the interactive runtime passes the
         # service's per-session selection; the CLI resolves the conventional
         # dataset layout (fit_session.conventional_input_paths).
@@ -1508,8 +1324,8 @@ class FitContext:
         #
         # The fit controls that used to arrive through FIT_SPIRAL_*
         # environment variables are constructor arguments now:
-        #   resume_path / resume_step - checkpoint to restore and its legacy
-        #     explicit step (the checkpoint's own completed_iterations wins);
+        #   resume_path - checkpoint to restore (its completed_iterations is
+        #     the step the fit resumes at);
         #   out_base_dir - parent directory for resolve_output_path();
         #   run_dir - an exact existing output directory to reuse when a
         #     headless runner resumes an interrupted fit;
@@ -1540,7 +1356,6 @@ class FitContext:
         self.interactive_driver = interactive_driver
         self.progress = progress
         self.resume_path = resume_path or None
-        self.resume_step = int(resume_step or 0)
         self.out_base_dir = out_base_dir if out_base_dir is not None else './out'
         self.run_dir = run_dir or None
         self.run_tag = run_tag or None
@@ -1559,9 +1374,6 @@ class FitContext:
         self.base_shape_zyx = scroll.base_shape_zyx
         self.spiral_outward_sense = scroll.spiral_outward_sense
         self.normal_zarr_group = scroll.normal_zarr_group
-        # The surf-SDT store's scale/encoding are read from the store's own
-        # metadata, never from normal_zarr_group/lasagna_scale.
-        self.surf_sdt_zarr_group = scroll.surf_sdt_zarr_group
         self.lasagna_scale = int(scroll.lasagna_scale)
         umbilicus_path = paths.umbilicus
         umbilicus_scale = float(scroll.umbilicus_coordinate_scale)
@@ -1576,9 +1388,6 @@ class FitContext:
         self.grad_mag_zarr_path = (
             (paths.gradient_magnitude or None)
             if input_source_enabled(config, 'gradient_magnitude') else None)
-        self.surf_sdt_zarr_path = (
-            (paths.surf_sdt or None)
-            if phase_bundle_enabled(config) else None)
         self.winding_inference_path = (
             (paths.winding_inference or None)
             if winding_inference_enabled(config) else None)
@@ -1591,9 +1400,6 @@ class FitContext:
         self.verified_patches_path = (
             (paths.verified_patches or None)
             if input_source_enabled(config, 'verified_patches') else None)
-        self.unverified_patches_path = (
-            (paths.unverified_patches or None)
-            if input_source_enabled(config, 'unverified_patches') else None)
         self.shell_path = (
             (paths.outer_shell or None)
             if input_source_enabled(config, 'outer_shell') else None)
@@ -1612,7 +1418,6 @@ class FitContext:
         self.render_volume_scale = int(render_volume_scale)
 
         self._lasagna_store = None
-        self._scalar_stores = []
     # The optimisation z window lives in the fit configuration (its catalog
     # metadata records the full effect list); these properties are the one
     # reading point for the many z-window consumers below.
@@ -2204,8 +2009,7 @@ class FitContext:
         Seeds the host RNG streams, then loads patches, point collections,
         fibers, tracks, and the outer shell; links and classifies PCLs;
         builds the sampling caches, host-prepared patch atlases, the
-        trusted-geometry index, the interactive influence anchor stash and
-        the whole-object DT target samples. Requires no device state: the
+        trusted-geometry index and the whole-object DT target samples. Requires no device state: the
         patch atlases are moved as part of device-state setup, and the CUDA
         stores, model, and optimiser are built later by
         build_device_state().
@@ -2218,22 +2022,19 @@ class FitContext:
         analysis tools can construct a context, call this, and read:
 
         - patches: verified_patches (+ verified_patches_list,
-          num_verified_patches), unverified_patches
-          (+ unverified_patches_list), shell_patch
+          num_verified_patches), shell_patch
         - point collections: cross_patch_pcls, unattached_pcl_strips,
           unattached_strip_sampling_groups, pcl_sampling_strata, next_id,
           fiber_catalog, link_distance_tolerance, resolved_links, link_components,
           unattached_components / _component_groups / _component_edges
-        - sampling: patch_sampling_probabilities, patch_atlas,
-          unverified_patch_sampling_probabilities, unverified_patch_atlas
-        - trusted geometry: trusted_geometry_tree,
-          influence_anchor_geometry
+        - sampling: patch_sampling_probabilities, patch_atlas
+        - trusted geometry: trusted_geometry_tree
         - tracks: tracks, track_families, track_source_ids,
           track_crossing_cache, track_graph, track_reload_source /
           _families / _source_ids, track_sampling_config, using_tracks,
           filter_tracks_by_shell
         - misc: umbilicus, scroll_zarr, shell_envelope,
-          dense_spacing_mode, phase_mode, grad_mag_spacing_enabled
+          dense_spacing_mode, grad_mag_spacing_enabled
         """
         progress = progress_or_null(self.progress)
 
@@ -2285,29 +2086,16 @@ class FitContext:
             shell_patch = load_tifxyz(self.shell_path)
 
         use_verified_patches = bool(self.verified_patches_path) and not self.config['input_disable_patches']
-        use_unverified_patches = bool(self.unverified_patches_path) and not self.config['input_disable_patches']
-        if not use_verified_patches and not use_unverified_patches:
+        if not use_verified_patches:
             verified_patches = {}
-            unverified_patches = {}
-            print('skipping all verified/unverified patch loading')
+            print('skipping patch loading')
         else:
-            # An empty verified dir is allowed when unverified patches are supplied
-            # (unverified-only ablations); both empty is a configuration error.
-            verified_patches = (
-                self._load_patches_from_dir(self.verified_patches_path, 'verified patches')
-                if use_verified_patches and self.verified_patches_path else {}
-            )
-            unverified_patches = {}
-            if use_unverified_patches and self.unverified_patches_path:
-                unverified_patches = self._load_patches_from_dir(
-                    self.unverified_patches_path, 'unverified patches')
-
-        if (not verified_patches and not unverified_patches
-                and (use_verified_patches or use_unverified_patches)):
-            raise RuntimeError('No patches could be loaded')
+            verified_patches = self._load_patches_from_dir(
+                self.verified_patches_path, 'verified patches')
+            if not verified_patches:
+                raise RuntimeError('No patches could be loaded')
 
         print(f" loaded {len(verified_patches)} patches")
-        print(f" loaded {len(unverified_patches)} unverified patches")
 
         # ==========================================================================
         # Point collection loading
@@ -2370,9 +2158,6 @@ class FitContext:
                 pid: catalog_copy_of_pcl(pcl) for pid, pcl in point_collections.items()
             }
             self._source_verified_patches = dict(verified_patches)
-            self._source_unverified_patches = {
-                pid: copy.copy(patch) for pid, patch in unverified_patches.items()
-            }
         self._derive_point_inputs(
             verified_patches, point_collections, fiber_point_collections)
         unattached_pcl_strips = self.unattached_pcl_strips
@@ -2385,11 +2170,10 @@ class FitContext:
         # Dense-spacing input contract. Checked before any asset paths so
         # an invalid mode fails as itself, not as a missing-file error.
         dense_spacing_mode = self.config['dense_spacing_mode']
-        if dense_spacing_mode not in ('phase', 'grad_mag', 'winding_model'):
+        if dense_spacing_mode not in ('grad_mag', 'winding_model'):
             raise ValueError(
                 f'dense_spacing_mode={dense_spacing_mode!r} must be '
-                "'phase', 'grad_mag', or 'winding_model'")
-        phase_mode = phase_bundle_enabled(self.config)
+                "'grad_mag' or 'winding_model'")
         winding_model_mode = winding_inference_enabled(self.config)
         grad_mag_spacing_enabled = (
             dense_spacing_mode == 'grad_mag'
@@ -2422,8 +2206,7 @@ class FitContext:
                 'loading', 'Resolving track store',
                 detail=os.path.basename(self.tracks_dbm_path))
             print(f'loading tracks from {self.tracks_dbm_path}')
-            if (track_sampling_config['crossing_precompute_max'] > 0
-                    or track_sampling_config['crossing_mode'] == 'track_walk'):
+            if track_sampling_config['crossing_precompute_max'] > 0:
                 track_crossing_cache = load_track_crossing_cache(self.tracks_dbm_path)
                 if track_crossing_cache is not None:
                     track_graph = TrackGraph(track_crossing_cache)
@@ -2477,7 +2260,7 @@ class FitContext:
                 f"({_startup_resource_suffix()})")
 
         # ==========================================================================================
-        # trusted geometry (verified patches and pcls) kdtree / unverified patches + tracks masking
+        # trusted geometry (verified patches and pcls) kdtree / tracks masking
         # ==========================================================================================
 
         # The trusted point cloud is consumed only by a CPU cKDTree. Build it directly
@@ -2520,9 +2303,6 @@ class FitContext:
                     trusted_offset:trusted_offset + count].copy_(zyxs[selected])
                 trusted_offset += count
 
-        unverified_patches_list = []
-        unverified_patch_sampling_probabilities = None
-        unverified_patch_atlas = None
         using_tracks = (
             (self.config['loss_weight_track_radius'] > 0 or self.config['loss_weight_track_dt'] > 0)
             and bool(tracks)
@@ -2530,10 +2310,9 @@ class FitContext:
         trusted_geometry_tree = None
         verified_patches_and_pcls_np = None
 
-        # Untrusted 'unverified' patches: mask away wherever they fall near trusted geometry (verified
-        # patch vertices + pcl strips, same anchor cloud used for snap-anchors / track-exclusion), then
-        # build their own sampling cache + GPU atlas. They feed only their own radius/DT losses.
-        if unverified_patches or using_tracks:
+        # The trusted anchor cloud (verified patch vertices + pcl strips) drives
+        # the DBM-track exclusion in tracks.py.
+        if using_tracks:
             # Build a cKDTree over the scroll-space anchor points (CPU) for fixed-radius
             # nearest-neighbour queries.
             verified_patches_and_pcls_np = verified_patches_and_pcls_cpu.numpy()
@@ -2544,33 +2323,6 @@ class FitContext:
                     detail=f'{len(verified_patches_and_pcls_np):,} points')
                 trusted_geometry_tree = cKDTree(verified_patches_and_pcls_np)
 
-        if unverified_patches:
-            # For each unverified patch, invalidate (set zyxs -> -1) every currently-valid vertex
-            # lying within the exclusion radius of trusted geometry, then re-derive the patch's
-            # masks/area. Patches left with no valid quad are dropped. This is the patch analogue
-            # of the DBM-track exclusion in tracks.py: untrusted patches only constrain regions
-            # the trusted inputs don't already cover, so they can't fight verified geometry.
-            exclusion_radius = float(self.config['patch_unverified_patch_exclusion_radius'])
-            progress.begin(
-                'loading', 'Masking unverified patches',
-                detail=f'{len(unverified_patches):,} patches')
-            unverified_patches, n_masked_vertices, n_dropped_patches = (
-                _mask_unverified_patches_near_trusted_geometry(
-                    unverified_patches,
-                    trusted_geometry_tree,
-                    exclusion_radius,
-                )
-            )
-            print(
-                f'unverified patches: masked {n_masked_vertices} vertices near trusted geometry '
-                f'(radius {exclusion_radius:.1f}), dropped {n_dropped_patches} fully-masked patches; '
-                f'{len(unverified_patches)} remain'
-            )
-
-        if unverified_patches:
-            unverified_patches_list = list(unverified_patches.values())
-            unverified_patch_sampling_probabilities = self._prepare_patch_sampling_cache(unverified_patches_list)
-            unverified_patch_atlas = PatchAtlas(unverified_patches, device='cuda')
 
         # Loaded host inputs, kept as inspectable attributes (ownership
         # class (b): host-prepared inputs and caches). cross_patch_pcls,
@@ -2583,11 +2335,9 @@ class FitContext:
         self.shell_patch = shell_patch
         self.shell_envelope = shell_envelope
         self.verified_patches = verified_patches
-        self.unverified_patches = unverified_patches
         self.next_id = next_id
         self.link_distance_tolerance = link_distance_tolerance
         self.dense_spacing_mode = dense_spacing_mode
-        self.phase_mode = phase_mode
         self.winding_model_mode = winding_model_mode
         self.dense_normals_enabled = input_source_enabled(
             self.config, 'normals')
@@ -2607,28 +2357,11 @@ class FitContext:
         self.patch_atlas = patch_atlas
         self.using_tracks = using_tracks
         self.trusted_geometry_tree = trusted_geometry_tree
-        self.unverified_patches_list = unverified_patches_list
-        self.unverified_patch_sampling_probabilities = unverified_patch_sampling_probabilities
-        self.unverified_patch_atlas = unverified_patch_atlas
 
-        # A compact subsample of the trusted cloud seeds a future Run's
-        # influence anchor bank. Keep it for every interactive session because
-        # influence can be enabled or disabled independently on each Run
-        # request. The generator is seeded explicitly, so the stash is
-        # deterministic without perturbing the training RNG streams.
-        self.influence_anchor_geometry = None
-        if self.interactive_driver is not None:
-            stash_generator = torch.Generator()
-            stash_generator.manual_seed(int(self.config['optimizer_random_seed']))
-            self.influence_anchor_geometry = subsample_rows(
-                verified_patches_and_pcls_cpu,
-                int(self.config['sample_count_influence_anchor_geometry_points']),
-                stash_generator,
-            ).clone()
-        # The trusted cloud itself stays local: the cKDTree above and that
-        # stash are all anything downstream reads it for, and consuming it
-        # here rather than in build_device_state() is what leaves the device
-        # stages with nothing of the host's to release.
+        # The trusted cloud itself stays local: the cKDTree above is all
+        # anything downstream reads it for, and consuming it here rather
+        # than in build_device_state() is what leaves the device stages
+        # with nothing of the host's to release.
         del verified_patches_and_pcls_cpu, verified_patches_and_pcls_np
 
         # ==========================================================================
@@ -2644,16 +2377,10 @@ class FitContext:
         if self.dt_target_whole_object:
             progress.begin(
                 'loading', 'Preparing distance-target samples',
-                detail=(
-                    f'{len(self.verified_patches_list) + len(self.unverified_patches_list):,} '
-                    'patches'))
+                detail=f'{len(self.verified_patches_list):,} patches')
             prepare_patch_dt_target_samples(
                 self.verified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
             )
-            if self.unverified_patches_list:
-                prepare_patch_dt_target_samples(
-                    self.unverified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
-                )
 
     def _vertical_fiber_radial_offset(self):
         """Radial target offset (voxels) applied to vertical fiber strips; 0 when off."""
@@ -2751,19 +2478,12 @@ class FitContext:
 
 
     def _refresh_trusted_geometry(self):
-        """Rebuild the trusted-geometry tree and the influence anchor seed
-        from the active patches and strips (both read the strips)."""
+        """Rebuild the trusted-geometry tree from the active patches and strips."""
         trusted = self._trusted_geometry_from_active_inputs()
         trusted_np = np.ascontiguousarray(
             trusted.cpu().numpy(), dtype=np.float32)
         self.trusted_geometry_tree = (
             cKDTree(trusted_np) if len(trusted_np) else None)
-        generator = torch.Generator().manual_seed(
-            int(self.config['optimizer_random_seed']))
-        self.influence_anchor_geometry = subsample_rows(
-            trusted,
-            int(self.config['sample_count_influence_anchor_geometry_points']),
-            generator).clone()
 
 
     def _commit_rederived_pcl_views(self, cross_patch, strips, strip_groups,
@@ -2942,43 +2662,29 @@ class FitContext:
         self.unattached_pcl_strips.flat = None
         self.dt_target_cache_manager.reset()
 
-    def _phase_mode_active(self):
-        return self.phase_mode and self.sdt_volume is not None and self.lasagna_volume is not None
-
     def _winding_model_mode_active(self):
         return self.winding_model_mode and self.winding_inference is not None
 
-    def _warn_if_sdt_loss_inactive(self):
-        # Run-mutable weights are read afresh every step, but the SDT-backed
-        # components only exist in phase mode; make other sessions' nonzero
-        # SDT-only weights a visible no-op. The native min-spacing
-        # barrier is asset-independent and remains active in either mode.
-        if self.phase_mode:
+    def _warn_if_density_loss_inactive(self):
+        # Run-mutable weights are read afresh every step, but the density
+        # component only exists in winding-model mode; make another
+        # session's nonzero density weight a visible no-op. The native
+        # min-spacing barrier is asset-independent and active in every mode.
+        if self.winding_model_mode:
             return
-        inactive = ['loss_weight_dense_spacing_count',
-                    'loss_weight_dense_attachment']
-        if not self.winding_model_mode:
-            inactive.append('loss_weight_dense_spacing_density')
-        for weight_key in inactive:
-            if self.config[weight_key] > 0 and weight_key not in self._sdt_inactive_warned:
-                self._sdt_inactive_warned.add(weight_key)
-                print(f'WARNING: {weight_key} > 0 but dense_spacing_mode='
-                      f'{self.dense_spacing_mode!r}; this component runs only as '
-                      "part of the 'phase' bundle and is INACTIVE.")
-
-    def _subsample_shell_radius_pool(self, patch):
-        # The shell-patch radius loss draws sample_count_shell_samples random
-        # shell points per step; keep a pool of exactly that size resident on
-        # the GPU instead of the full shell cloud. A dedicated generator makes
-        # the pool deterministic (identical across DDP ranks) without
-        # perturbing the training RNG streams.
-        pool_generator = torch.Generator()
-        pool_generator.manual_seed(int(self.config['optimizer_random_seed']))
-        return subsample_rows(
-            patch.valid_zyxs, int(self.config['sample_count_shell_samples']), pool_generator,
-        ).to(device=self.device, dtype=torch.float32)
+        weight_key = 'loss_weight_dense_spacing_density'
+        if self.config[weight_key] > 0 and weight_key not in self._density_inactive_warned:
+            self._density_inactive_warned.add(weight_key)
+            print(f'WARNING: {weight_key} > 0 but dense_spacing_mode='
+                  f'{self.dense_spacing_mode!r}; this component runs only in '
+                  "'winding_model' mode and is INACTIVE.")
 
     def _make_shell_polar_map(self):
+        # A session that filtered its tracks against the shell already built
+        # the identical table on the host (the atlas keys are frozen for it,
+        # and shell_min_confidence is read live at lookup): share it.
+        if self.shell_envelope is not None:
+            return self.shell_envelope.to(self.device)
         return ShellPolarMap(
             self.shell_patch, self.umbilicus,
             z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
@@ -3009,7 +2715,7 @@ class FitContext:
                       'inferred one); this loss samples the spiral out to that '
                       'winding and stays INACTIVE. Set shell_outer_winding_idx '
                       'to enable it (some of these losses also need the '
-                      'phase/SDT assets, see any warnings above).')
+                      'winding-model assets, see any warnings above).')
 
     def _apply_flow_group_settings(self, iteration):
         """Per-step optimizer settings of the two flow-lattice groups: their
@@ -3215,13 +2921,10 @@ class FitContext:
                 ensure_fit_sparse_stores(
                     use_normals=use_normals,
                     use_spacing=self.grad_mag_spacing_enabled,
-                    use_sdt=self.phase_mode,
                     normal_nx_zarr_path=self.normal_nx_zarr_path,
                     normal_ny_zarr_path=self.normal_ny_zarr_path,
                     grad_mag_zarr_path=self.grad_mag_zarr_path,
                     normal_zarr_group=self.normal_zarr_group,
-                    sdt_zarr_path=self.surf_sdt_zarr_path,
-                    sdt_zarr_group=self.surf_sdt_zarr_group,
                     progress=progress,
                 )
             except Exception as exc:
@@ -3242,7 +2945,7 @@ class FitContext:
             raise build_error
 
     def _build_store_state(self):
-        """Materialise the Lasagna and surf-SDT brick pools.
+        """Materialise the Lasagna brick pools.
 
         The expensive half of the device build, and the half nothing but the
         z window, the store paths and the dense-loss mode can invalidate.
@@ -3251,11 +2954,11 @@ class FitContext:
         progress = progress_or_null(self.progress)
 
         # ==========================================================================
-        # lasagna and SDT stores
+        # lasagna stores
         # ==========================================================================
 
-        use_normals = self.dense_normals_enabled and (
-            self.config['loss_weight_dense_normals'] > 0 or self.phase_mode)
+        use_normals = (self.dense_normals_enabled
+                       and self.config['loss_weight_dense_normals'] > 0)
         self._ensure_sparse_volume_stores(
             use_normals=use_normals, progress=progress)
 
@@ -3276,32 +2979,6 @@ class FitContext:
         )
         if interactive_driver is not None and self.lasagna_volume:
             self._lasagna_store = self.lasagna_volume['store']
-
-        # Surf-SDT store: a core input of the whole phase bundle (registration,
-        # count, attachment), required in phase mode even when individual
-        # sub-weights are zero so run-mutable weights can be adjusted (or zeroed
-        # and re-raised) at run boundaries without a session reload.
-        self.sdt_volume = None
-        if self.phase_mode:
-            if not self.surf_sdt_zarr_path or not os.path.exists(self.surf_sdt_zarr_path):
-                raise RuntimeError(
-                    "dense_spacing_mode='phase' requires the surf-SDT store: "
-                    f'{self.surf_sdt_zarr_path!r}')
-            if self.lasagna_volume is None:
-                raise RuntimeError(
-                    "dense_spacing_mode='phase' requires the dense normal stores "
-                    'for band incidence/fragment handling')
-            self.sdt_volume = prepare_surf_sdt_volume(
-                self.surf_sdt_zarr_path,
-                self.surf_sdt_zarr_group,
-                z_begin=self.z_begin,
-                z_end=self.z_end,
-                cache_directory=self.cache_path,
-                storage_backend=self.lasagna_storage_backend,
-                progress=progress,
-            )
-            if interactive_driver is not None:
-                self._scalar_stores.append(self.sdt_volume['store'])
 
         self.winding_inference = None
         if self.winding_model_mode:
@@ -3329,7 +3006,7 @@ class FitContext:
                 f"{self.winding_inference.fingerprint['num_crossings']:,} "
                 'crossings')
 
-        self._sdt_inactive_warned = set()
+        self._density_inactive_warned = set()
 
     def _make_theta_crossing_map(self):
         """Construct the shared patch/PCL source topology."""
@@ -3337,8 +3014,6 @@ class FitContext:
             self.device,
             self.config['theta_crossing_map_update_interval'])
         self.patch_atlas.register_theta_topology(crossing_map)
-        if self.unverified_patch_atlas is not None:
-            self.unverified_patch_atlas.register_theta_topology(crossing_map)
 
         flat = get_or_build_unattached_pcl_flat(
             self.unattached_pcl_strips, self.device)
@@ -3423,7 +3098,7 @@ class FitContext:
                 pieces.append(points[in_roi])
         return torch.cat(pieces, dim=0) if pieces else torch.empty((0, 3))
 
-    def _exclude_non_liftable_patches(self, verified_ids, unverified_ids, report):
+    def _exclude_non_liftable_patches(self, verified_ids, report):
         """Remove inconsistent patches from every active patch sampling pool."""
         warnings = []
         rejected_verified = set(verified_ids)
@@ -3440,18 +3115,6 @@ class FitContext:
             warnings.append(warning)
             del self.verified_patches[patch_id]
 
-        for patch_id in unverified_ids:
-            patch = self.unverified_patches[patch_id]
-            path = self._patch_input_path(
-                patch_id, patch, self.unverified_patches_path)
-            self.non_liftable_patch_paths.add(path)
-            warning = (
-                f'non-liftable patch {path!r} has theta cycle inconsistencies; '
-                'excluding it from this fit')
-            print(f'WARNING: {warning}')
-            warnings.append(warning)
-            del self.unverified_patches[patch_id]
-
         # Preserve list identities where possible because resident-session
         # loss closures may already hold them.
         self.verified_patches_list[:] = self.verified_patches.values()
@@ -3460,16 +3123,6 @@ class FitContext:
             if self.verified_patches_list else np.empty(0, dtype=np.float32))
         self.num_verified_patches = len(self.verified_patches_list)
         self.patch_atlas = self.patch_atlas.replaced(self.verified_patches)
-
-        self.unverified_patches_list[:] = self.unverified_patches.values()
-        if self.unverified_patches_list:
-            self.unverified_patch_sampling_probabilities = \
-                self._patch_sampling_probabilities(self.unverified_patches_list)
-            self.unverified_patch_atlas = self.unverified_patch_atlas.replaced(
-                self.unverified_patches)
-        else:
-            self.unverified_patch_sampling_probabilities = None
-            self.unverified_patch_atlas = None
 
         if rejected_verified and self.cross_patch_pcls:
             for pcl in self.cross_patch_pcls:
@@ -3487,29 +3140,17 @@ class FitContext:
                                 attachment['id'] in rejected_verified):
                             del point['on_patch']
 
-        if rejected_verified:
-            # Future interactive masking and influence anchors must not retain
-            # geometry from a patch that the consistency gate rejected.
-            if self.interactive_driver is not None:
-                trusted = self._trusted_geometry_from_active_inputs()
-                trusted_np = np.ascontiguousarray(
-                    trusted.numpy(), dtype=np.float32)
-                self.trusted_geometry_tree = (
-                    cKDTree(trusted_np) if trusted_np.shape[0] else None)
-                generator = torch.Generator().manual_seed(
-                    int(self.config['optimizer_random_seed']))
-                self.influence_anchor_geometry = subsample_rows(
-                    trusted,
-                    int(self.config['sample_count_influence_anchor_geometry_points']),
-                    generator,
-                ).clone()
+        if rejected_verified and self.interactive_driver is not None:
+            # Track exclusion masks prepared later must not retain geometry
+            # from a patch that the consistency gate rejected.
+            self._refresh_trusted_geometry()
 
         if hasattr(self, 'dt_target_cache_manager'):
             self.dt_target_cache_manager.reset()
         self._write_non_liftable_patch_report()
         print(
             'WARNING: theta consistency gate rejected '
-            f'{len(verified_ids) + len(unverified_ids)} patch(es) from '
+            f'{len(verified_ids)} patch(es) from '
             f'{report["inconsistent_edges"]} inconsistent edge(s)')
         return warnings
 
@@ -3523,15 +3164,12 @@ class FitContext:
                 self._write_non_liftable_patch_report()
                 return warnings
             verified_ids = self.patch_atlas.patch_ids_for_theta_nodes(bad_nodes)
-            unverified_ids = (
-                self.unverified_patch_atlas.patch_ids_for_theta_nodes(bad_nodes)
-                if self.unverified_patch_atlas is not None else [])
-            if not verified_ids and not unverified_ids:
+            if not verified_ids:
                 raise RuntimeError(
                     'theta consistency gate found inconsistent potential edges '
                     'that could not be attributed to a patch')
             warnings.extend(self._exclude_non_liftable_patches(
-                verified_ids, unverified_ids, report))
+                verified_ids, report))
             self.theta_crossing_map = self._make_theta_crossing_map()
             self.theta_crossing_map.force_refresh(
                 self.slice_to_spiral_transform)
@@ -3564,11 +3202,6 @@ class FitContext:
             'loading', 'Building verified-patch GPU atlas',
             detail=f'{len(self.verified_patches):,} patches')
         self.patch_atlas.materialize(self.device)
-        if self.unverified_patch_atlas is not None:
-            progress.begin(
-                'loading', 'Building unverified-patch GPU atlas',
-                detail=f'{len(self.unverified_patches):,} patches')
-            self.unverified_patch_atlas.materialize(self.device)
 
         # The full z series is a model input. PNG-only slice grids and raster inputs
         # are prepared lazily at final export, and never in a resident VC3D session.
@@ -3588,7 +3221,7 @@ class FitContext:
         # affects the model's flow-field domain; the optimisation continues to use
         # the current z_begin/z_end for sampling, losses and rendering.
         resume_path = self.resume_path
-        self.start_iteration = int(self.resume_step)
+        self.start_iteration = 0
         resume_checkpoint = None
         self.model_z_begin, self.model_z_end = self.z_begin, self.z_end
         if resume_path:
@@ -3646,24 +3279,12 @@ class FitContext:
         # ==========================================================================
 
         self.shell_map = None
-        self.shell_valid_zyxs_gpu = None
 
         shell_active = self.shell_patch is not None and self.shell_losses_enabled()
-        if shell_active:
-            if self.config['loss_weight_shell_patch_radius'] > 0:
-                self.shell_valid_zyxs_gpu = self._subsample_shell_radius_pool(self.shell_patch)
         if (self.shell_patch is not None
                 and (self.config['loss_weight_shell_outer'] > 0
                      or self.winding_model_mode)):
-            self.shell_map = ShellPolarMap(
-                self.shell_patch,
-                self.umbilicus,
-                z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
-                z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
-                num_theta_bins=self.config['shell_num_theta_bins'],
-                device=self.device,
-                config=self.config,
-            )
+            self.shell_map = self._make_shell_polar_map()
 
         # Dense losses sample out to this index even when shell losses are off.
         self.shell_outer_winding_idx, outer_winding_notes = resolve_outer_winding_idx_and_notes(
@@ -3712,11 +3333,6 @@ class FitContext:
         # _apply_flow_group_settings), which keeps AdamW's state format.
         self.optimiser = LazyMomentAdamW(param_groups, lr=self.config['optimizer_learning_rate'], betas=(0.9, 0.999), eps=1.e-8, fused=True)
         self._report_flow_grad_conditioning()
-        # Influence masks are scoped to one interactive Run request. They are
-        # created from that run's pending inputs and discarded before its autosave.
-        self.influence_state = None
-        self.interactive_influence_loss_weight = 0.0
-        self.interactive_influence_anchor_samples = 0
         if self.config['optimizer_exp_lr_schedule']:
             gamma = self.config['optimizer_lr_final_factor'] ** (1.0 / max(1, self.num_training_steps))
             self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimiser, gamma=gamma)
@@ -3726,23 +3342,19 @@ class FitContext:
         if resume_path:
             # Phase 1 of the same two-phase load an in-session checkpoint
             # request uses: inspect on the CPU and refuse before anything
-            # resident is touched. Checkpoints written before schema version 2
-            # predate several identity fields and are still accepted here, on
-            # the CLI/startup path that has no live state to protect; an
-            # in-session load refuses them.
+            # resident is touched.
             verdict = self.inspect_checkpoint(
-                resume_checkpoint, source=resume_path, allow_legacy_schema=True)
+                resume_checkpoint, source=resume_path)
             if not verdict.accepted:
                 raise RuntimeError(verdict.message())
             print(f'resuming from {resume_path} at iteration '
-                  f'{verdict.completed_iterations if verdict.completed_iterations is not None else self.start_iteration}')
+                  f'{verdict.completed_iterations}')
             progress.begin(
                 'loading', 'Restoring model and optimizer',
                 detail=os.path.basename(resume_path))
             # Phase 2: apply. The LR realignment for a resident session is the
             # unconditional one below, so it is not requested twice here.
-            self.apply_checkpoint(resume_checkpoint,
-                                  fallback_iteration=self.start_iteration)
+            self.apply_checkpoint(resume_checkpoint)
             # load_state_dict has moved the model and optimiser state to their
             # destination tensors.  Release the CPU-side archive mappings before
             # entering the resident training loop.
@@ -3879,11 +3491,10 @@ class FitContext:
         'flow_field_radius', 'flow_min_corner_spiral_zyx',
         'flow_max_corner_spiral_zyx', 'num_training_steps',
         '_initial_num_training_steps', 'spiral_and_transform', 'shell_map',
-        'shell_valid_zyxs_gpu', 'shell_outer_winding_idx',
+        'shell_outer_winding_idx',
         '_dense_inactive_warned', 'low_res_flow_params',
         'high_res_flow_params', 'gap_expander_params', 'optimiser',
-        'influence_state', 'interactive_influence_loss_weight',
-        'interactive_influence_anchor_samples', 'lr_scheduler', 'profiler',
+        'lr_scheduler', 'profiler',
         'slice_to_spiral_transform', 'dr_per_winding',
         'dt_target_cache_manager', 'dist_grad_params', 'dist_grad_named',
         'step_timer', 'nonfinite_grad_steps', 'nonfinite_grad_by_param',
@@ -3937,22 +3548,19 @@ class FitContext:
         return {
             'schema_version': 2,
             'model_state_sha256': self.model_state_digest(),
-            'gap_parameterization_version': 2,
             'completed_iterations': int(completed_iterations),
             'spiral_and_transform': self.spiral_and_transform.state_dict(),
             'optimiser': self.optimiser.state_dict(),
             'scheduler': self.lr_scheduler.state_dict(),
-            'cfg': durable_config(self.config),
-            'requested_config': durable_config(
+            'cfg': dict(self.config),
+            'requested_config': dict(
                 getattr(self.interactive_driver, 'requested_config', dict(self.config))),
-            'resolved_config': durable_config(self.config),
+            'resolved_config': dict(self.config),
             'lasagna_scale': self.lasagna_scale,
             'lasagna_group': self.normal_zarr_group,
             'base_shape_zyx': (
                 list(self.base_shape_zyx)
                 if self.base_shape_zyx is not None else None),
-            'surf_sdt_fingerprint': (
-                self.sdt_volume['fingerprint'] if self.sdt_volume is not None else None),
             'winding_inference_fingerprint': (
                 self.winding_inference.fingerprint
                 if self.winding_inference is not None else None),
@@ -4010,8 +3618,7 @@ class FitContext:
             return None
         return self._save_model('fitted', completed_iterations)
 
-    def inspect_checkpoint(self, checkpoint, *, source='',
-                           allow_legacy_schema=False):
+    def inspect_checkpoint(self, checkpoint, *, source=''):
         """Decide, on the CPU and without mutating anything, whether this
         checkpoint may be applied to this live fit.
 
@@ -4026,33 +3633,32 @@ class FitContext:
         does not match the live model domain and structural configuration is
         refused here, and the explicit rebuild/new-fit path is what changes a
         model domain.
-
-        ``allow_legacy_schema`` admits pre-v2 checkpoints, which do not carry
-        the Lasagna group, outward sense, SDT fingerprint or model z-domain
-        fields. Only the startup/CLI restore passes it: there is no live
-        session to protect there, and the model is built from the checkpoint.
         """
         reasons = []
         if not isinstance(checkpoint, dict):
             return CheckpointVerdict(
                 False, ('checkpoint is not a state dictionary',), source=source)
         try:
-            # Capacity growth is prefix-preserving: inspect the expanded copy
-            # without mutating the caller's checkpoint. load_checkpoint()
-            # performs the same migration only after this verdict succeeds.
+            # The stored configuration is brought onto the current schema
+            # first (dropped and defaulted keys), and each edit is
+            # reported; only an invalid value refuses. Capacity growth is
+            # prefix-preserving: inspect the expanded copy without mutating
+            # the caller's checkpoint. load_checkpoint() performs the same
+            # normalisation and migration only after this verdict succeeds.
+            checkpoint, notes = tolerate_checkpoint_config(checkpoint)
+            for note in notes:
+                print(f'NOTE: checkpoint {note}', flush=True)
             checkpoint = expand_gap_checkpoint_capacity(
-                migrate_legacy_gap_parameterization(merge_flow_stage_lattices(checkpoint)),
-                self.config['model_gap_expander_capacity_windings'])
+                checkpoint, self.config['model_gap_expander_capacity_windings'])
         except ValueError as exc:
             reasons.append(str(exc))
 
         # --- schema -------------------------------------------------------
         schema_version = int(checkpoint.get('schema_version', 1) or 1)
-        modern = schema_version >= 2
-        if not modern and not allow_legacy_schema:
+        if schema_version < 2:
             reasons.append(
                 f'checkpoint schema version {schema_version} predates the '
-                'identity fields an in-session load verifies (expected >= 2)')
+                'identity fields a load verifies (expected >= 2)')
         for key in ('spiral_and_transform', 'optimiser', 'cfg'):
             if checkpoint.get(key) is None:
                 reasons.append(f'checkpoint has no {key!r} entry')
@@ -4062,17 +3668,16 @@ class FitContext:
             reasons.append(
                 f'checkpoint lasagna_scale={checkpoint.get("lasagna_scale")!r} '
                 f'does not match this fit ({self.lasagna_scale!r})')
-        if modern:
-            if checkpoint.get('lasagna_group') != self.normal_zarr_group:
-                reasons.append(
-                    f'checkpoint Lasagna group '
-                    f'{checkpoint.get("lasagna_group")!r} does not match '
-                    f'requested group {self.normal_zarr_group!r}')
-            if checkpoint.get('spiral_outward_sense') != self.spiral_outward_sense:
-                reasons.append(
-                    f'checkpoint outward sense '
-                    f'{checkpoint.get("spiral_outward_sense")!r} does not '
-                    f'match requested sense {self.spiral_outward_sense!r}')
+        if checkpoint.get('lasagna_group') != self.normal_zarr_group:
+            reasons.append(
+                f'checkpoint Lasagna group '
+                f'{checkpoint.get("lasagna_group")!r} does not match '
+                f'requested group {self.normal_zarr_group!r}')
+        if checkpoint.get('spiral_outward_sense') != self.spiral_outward_sense:
+            reasons.append(
+                f'checkpoint outward sense '
+                f'{checkpoint.get("spiral_outward_sense")!r} does not '
+                f'match requested sense {self.spiral_outward_sense!r}')
         checkpoint_base_shape = checkpoint.get('base_shape_zyx')
         if checkpoint_base_shape is not None:
             if (not isinstance(checkpoint_base_shape, (list, tuple))
@@ -4098,29 +3703,8 @@ class FitContext:
                 f'checkpoint was written against dataset {checkpoint_dataset!r}, '
                 f'not {dataset_root!r}')
 
-        # --- Lasagna / SDT store identity ---------------------------------
-        # The SDT store is an independent input: the Lasagna group/scale checks
-        # above do not cover it. Reject an unexpected change in its content
-        # fingerprint whenever an SDT-driven loss is enabled. Paths may
-        # legitimately move and coverage may legitimately grow (--resume
-        # extension of an ROI-first build), so only the content-identity fields
-        # compare - 'created'/'git_commit' are stamped once at store creation
-        # and anchor the identity.
-        if modern and self.phase_mode:
-            checkpoint_fingerprint = comparable_sdt_fingerprint(
-                checkpoint.get('surf_sdt_fingerprint'))
-            current_fingerprint = comparable_sdt_fingerprint(
-                self.sdt_volume['fingerprint']
-                if self.sdt_volume is not None else None)
-            if (checkpoint_fingerprint is not None
-                    and checkpoint_fingerprint != current_fingerprint):
-                reasons.append(
-                    'checkpoint surf-SDT fingerprint does not match the '
-                    'resolved store while an SDT-driven loss is enabled:'
-                    f'\n      checkpoint: {checkpoint_fingerprint}'
-                    f'\n      current:    {current_fingerprint}')
-
-        if modern and self.winding_model_mode:
+        # --- Winding-inference store identity ------------------------------
+        if self.winding_model_mode:
             checkpoint_fingerprint = checkpoint.get(
                 'winding_inference_fingerprint')
             current_fingerprint = (
@@ -4140,15 +3724,11 @@ class FitContext:
         # --- structural configuration -------------------------------------
         checkpoint_cfg = checkpoint.get('cfg')
         if isinstance(checkpoint_cfg, Mapping):
-            # Checkpoints store the durable subset of the schema, so the key
-            # set compares against that subset. z_begin/z_end joined the schema
-            # after many checkpoints were written and are owned by the session
-            # request either way, so exactly those two may be absent; a
-            # retired key is dropped, not refused (config.RETIRED_CONFIG_KEYS).
-            durable_schema = set(durable_config(dict(self.config)))
-            unknown = set(checkpoint_cfg) - durable_schema - RETIRED_CONFIG_KEYS
-            missing = durable_schema - set(checkpoint_cfg) - (
-                {'z_begin', 'z_end'} | set(BACKFILLABLE_CONFIG_DEFAULTS))
+            # tolerate_checkpoint_config() has already brought the key set
+            # onto the schema, so a mismatch here is a normalisation bug.
+            schema = set(self.config)
+            unknown = set(checkpoint_cfg) - schema
+            missing = schema - set(checkpoint_cfg)
             if unknown or missing:
                 reasons.append(
                     'checkpoint configuration does not match the current '
@@ -4184,7 +3764,7 @@ class FitContext:
                     f'not the live model domain [{self.model_z_begin}, '
                     f'{self.model_z_end}); rebuild the fit to change the model '
                     'domain')
-        elif not allow_legacy_schema:
+        else:
             reasons.append(
                 'checkpoint does not record a model z-domain, so it cannot be '
                 'shown to match the live model')
@@ -4258,13 +3838,14 @@ class FitContext:
                             f'parameter groups, this fit has {len(live_base)}')
 
         completed = checkpoint.get('completed_iterations')
+        if completed is None:
+            reasons.append('checkpoint has no completed_iterations entry')
         return CheckpointVerdict(
             not reasons, tuple(reasons),
             completed_iterations=(None if completed is None else int(completed)),
             source=source)
 
-    def apply_checkpoint(self, checkpoint, *, fallback_iteration=0,
-                         realign_lr=False):
+    def apply_checkpoint(self, checkpoint, *, realign_lr=False):
         """Phase 2: move a preflighted checkpoint into the live fit.
 
         Only ever called after :meth:`inspect_checkpoint` accepted this exact
@@ -4274,16 +3855,13 @@ class FitContext:
         session rather than as a refusal.
 
         ``completed_iterations`` comes from the checkpoint - the durable step
-        the fit actually reached - and the LR schedule is realigned to it
-        rather than reset to zero.
+        the fit actually reached (every checkpoint carries it; the preflight
+        refuses one without) - and the LR schedule is realigned to it rather
+        than reset to zero.
         """
-        embedded = checkpoint.get('completed_iterations')
-        completed = int(fallback_iteration if embedded is None else embedded)
+        completed = int(checkpoint['completed_iterations'])
         self.start_iteration = completed
         self.load_checkpoint(checkpoint)
-        if checkpoint.get('scheduler') is None:
-            for _ in range(completed):
-                self.lr_scheduler.step()
         self._restore_rng_state(checkpoint)
         if realign_lr:
             self._realign_lr_schedule(completed)
@@ -4307,50 +3885,23 @@ class FitContext:
                 torch.cuda.set_rng_state(state, device_index)
 
     def load_checkpoint(self, checkpoint):
+        checkpoint, _ = tolerate_checkpoint_config(checkpoint)
         checkpoint = expand_gap_checkpoint_capacity(
-            migrate_legacy_gap_parameterization(merge_flow_stage_lattices(checkpoint)),
-            self.config['model_gap_expander_capacity_windings'])
+            checkpoint, self.config['model_gap_expander_capacity_windings'])
         transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
         self.spiral_and_transform.load_state_dict(transformed_spiral_state)
         self.optimiser.load_state_dict(optimiser_state)
-        # Older checkpoints could have been saved while influence masking had
-        # disabled gap weight decay. Influence state is no longer restored, so
-        # restore the session configuration explicitly as well.
+        # Stored optimiser hyperparameters yield to the session configuration.
+        # The flow groups are reapplied at every run boundary
+        # (_apply_flow_group_settings) and the learning rates by the schedule
+        # realignment; the gap group's weight decay has no later owner, so a
+        # checkpoint saved while it was altered must not carry that forward.
         gap_param = self.gap_expander_params[0]
-        gap_group = next(group for group in self.optimiser.param_groups
-                         if any(param is gap_param for param in group['params']))
-        gap_group['weight_decay'] = self.config['optimizer_weight_decay_gap_expander']
+        for group in self.optimiser.param_groups:
+            if any(param is gap_param for param in group['params']):
+                group['weight_decay'] = self.config['optimizer_weight_decay_gap_expander']
         if checkpoint.get('scheduler') is not None:
             self.lr_scheduler.load_state_dict(checkpoint['scheduler'])
-
-    def _rebuild_unverified_patch_inputs(self, exclusion_radius):
-        """Remask retained unverified sources for a Run-boundary mask edit."""
-        if not input_source_enabled(self.config, 'unverified_patches'):
-            return {}, [], None, None
-        if hasattr(self, '_source_unverified_patches'):
-            candidates = {
-                pid: copy.copy(patch)
-                for pid, patch in self._source_unverified_patches.items()
-            }
-        elif self.unverified_patches_path:
-            candidates = self._load_patches_from_dir(self.unverified_patches_path)
-        else:
-            return {}, [], None, None
-        candidates, n_masked, n_dropped = \
-            _mask_unverified_patches_near_trusted_geometry(
-                candidates, self.trusted_geometry_tree, exclusion_radius)
-        print(
-            f'unverified patches: remasked {n_masked} vertices near trusted '
-            f'geometry (radius {exclusion_radius:.1f}), dropped {n_dropped}; '
-            f'{len(candidates)} remain')
-        candidate_list = list(candidates.values())
-        probabilities = (
-            self._prepare_patch_sampling_cache(candidate_list)
-            if candidate_list else None)
-        atlas = (
-            PatchAtlas(candidates, device=self.device)
-            if candidate_list else None)
-        return candidates, candidate_list, probabilities, atlas
 
     def _prepare_png_visualization_inputs(self):
         zs = np.linspace(
@@ -4389,21 +3940,6 @@ class FitContext:
             indexing='ij',
         ), axis=-1).to(self.device) * self.render_volume_scale
         return zs, yx, scroll_slices, prediction_slices, quad_labels
-
-    def clear_interactive_influence(self):
-        """End the current Run request's localization window.
-
-        Called by the runtime when an interactive Run reaches its target, and
-        defensively before a new incorporation begins.
-        """
-        if self.influence_state is None:
-            self.interactive_influence_loss_weight = 0.0
-            self.interactive_influence_anchor_samples = 0
-            return
-        self.influence_state.deactivate_(self.spiral_and_transform, self.optimiser)
-        self.influence_state = None
-        self.interactive_influence_loss_weight = 0.0
-        self.interactive_influence_anchor_samples = 0
 
     def _preview_splice_evaluation(self, live_transform, dr_per_winding,
                                    progress):
@@ -4452,12 +3988,11 @@ class FitContext:
                 f'{int(requested_iterations)} requested iterations)')
 
     def clear_dt_loss_schedule(self):
-        """Remove the transient DT window without touching localization."""
+        """Remove the transient DT window."""
         self.run_dt_resume_iteration = None
 
     def clear_interactive_run_state(self):
         """Clear every transient state installed for one interactive Run."""
-        self.clear_interactive_influence()
         self.clear_dt_loss_schedule()
 
     def export_preview(self, generation_path, surface_id, *, diagnostics=False):
@@ -4514,18 +4049,12 @@ class FitContext:
                 name: self.config.get(f'loss_weight_{name}', 0.0)
                 for name in (
                     'patch_radius', 'patch_dt',
-                    'unverified_patch_radius', 'unverified_patch_dt',
                     'sym_dirichlet', 'rel_winding', 'abs_winding',
-                    'dense_normals', 'dense_spacing', 'dense_attachment',
+                    'dense_normals', 'dense_spacing',
                     'unattached_pcl_radius', 'unattached_pcl_dt',
-                    'track_radius', 'track_dt', 'shell_patch_radius',
+                    'track_radius', 'track_dt',
                 )
             }
-            if self._phase_mode_active():
-                diagnostic_weights['dense_spacing_phase'] = max(
-                    float(self.config['loss_weight_dense_spacing']), 1.0)
-                diagnostic_weights['dense_spacing_count'] = max(
-                    float(self.config['loss_weight_dense_spacing_count']), 1.0)
             if self._winding_model_mode_active():
                 diagnostic_weights['dense_spacing_winding_model_relative'] = max(
                     float(self.config['loss_weight_dense_spacing']), 1.0)
@@ -4552,22 +4081,9 @@ class FitContext:
                     self.verified_patches_list, self.patch_atlas,
                     self.patch_sampling_probabilities, self.umbilicus_zyx,
                     compute_dt=self.config['loss_weight_patch_dt'] > 0,
-                    shell_valid_zyxs=self.shell_valid_zyxs_gpu,
-                    shell_outer_winding_idx=self.shell_outer_winding_idx,
                     crossing_map=self.theta_crossing_map,
                     cfg=self.config,
                 )
-                if self.unverified_patch_atlas is not None:
-                    get_unverified_patch_losses(
-                        transform, dr,
-                        self.config['sample_count_unverified_patches_per_step'],
-                        self.config['sample_count_unverified_patches_per_step_for_dt'],
-                        self.unverified_patches_list, self.unverified_patch_atlas,
-                        self.unverified_patch_sampling_probabilities,
-                        compute_dt=self.config['loss_weight_unverified_patch_dt'] > 0,
-                        crossing_map=self.theta_crossing_map,
-                        cfg=self.config,
-                    )
                 if self.config['loss_weight_sym_dirichlet'] > 0:
                     get_symmetric_dirichlet_loss(
                         transform, dr, self.shell_outer_winding_idx,
@@ -4599,14 +4115,6 @@ class FitContext:
                                 and self.config['loss_weight_dense_normals'] > 0),
                             cfg=self.config, z_begin=self.z_begin, z_end=self.z_end):
                         pass
-                if self._phase_mode_active():
-                    preview_generator = torch.Generator(device=dr.device)
-                    preview_generator.manual_seed(0x243F6A88)
-                    for _loss_name, _loss_value, _metrics in iter_phase_bundle_losses(
-                            self.spiral_and_transform, transform, dr, self.sdt_volume,
-                            self.lasagna_volume, self.shell_outer_winding_idx, self.config,
-                            self.z_begin, self.z_end, generator=preview_generator):
-                        pass
                 if self._winding_model_mode_active():
                     preview_generator = torch.Generator(device=dr.device)
                     preview_generator.manual_seed(0x13198A2E)
@@ -4637,25 +4145,6 @@ class FitContext:
             # drain its deferred unset-potential verdicts, so resolve them
             # before the diagnostics are published.
             self.theta_crossing_map.assert_no_pending_potential_errors()
-            # Per-pair aggregated crossing counts: mean_count - m per winding
-            # pair, the measurement behind any future discrete
-            # insert/remove/reindex operation (gradient descent cannot perform
-            # those). Written next to the loss maps as a preview artifact.
-            if self._phase_mode_active() and self.shell_outer_winding_idx is not None:
-                try:
-                    with torch.no_grad():
-                        pair_rows = aggregate_pair_counts(
-                            transform, dr, self.sdt_volume,
-                            self.shell_outer_winding_idx, self.config, self.z_begin, self.z_end)
-                    pair_table_name = 'dense_spacing_pair_counts.json'
-                    with open(os.path.join(generation_path, pair_table_name),
-                              'w', encoding='utf-8') as stream:
-                        json.dump(pair_rows, stream, indent=1)
-                    manifest = dict(manifest)
-                    manifest['dense_spacing_pair_counts'] = pair_table_name
-                except Exception as error:
-                    print('WARNING: could not aggregate per-pair crossing counts: '
-                          f'{type(error).__name__}: {error}')
             if recorder.error is not None:
                 print('WARNING: could not generate Spiral loss overlays: '
                       f'{type(recorder.error).__name__}: {recorder.error}')
@@ -4704,7 +4193,7 @@ class FitContext:
             f'{reserved_after / gib:.2f} GiB still reserved)',
             flush=True)
 
-    def prepare_input_changes(self, records, influence_config=None, *,
+    def prepare_input_changes(self, records, *,
                               current_iteration=0, target_iteration=0):
         """Prepare a complete revision batch without changing active state.
 
@@ -4723,14 +4212,12 @@ class FitContext:
             candidate._preparing_inputs = True
             candidate.non_liftable_patch_paths = set(self.non_liftable_patch_paths)
             candidate._source_verified_patches = dict(self._source_verified_patches)
-            candidate._source_unverified_patches = dict(self._source_unverified_patches)
             candidate._source_point_collections = {
                 cid: catalog_copy_of_pcl(pcl)
                 for cid, pcl in self._source_point_collections.items()
             }
             candidate._workspace_membership = dict(getattr(self, '_workspace_membership', {}))
             candidate.next_id = self.next_id
-            changed_patches, changed_points, removed = {}, {}, []
             seen = set()
             for record in records:
                 logical_id = str(record['id'])
@@ -4743,9 +4230,7 @@ class FitContext:
                 path = record.get('path')
                 source_id = str(record.get('source_id', logical_id))
                 if kind == 'patch':
-                    unverified = record.get('role') == 'unverified'
-                    source = (candidate._source_unverified_patches if unverified
-                              else candidate._source_verified_patches)
+                    source = candidate._source_verified_patches
                     if source_id != logical_id and source_id in source:
                         # Preserve the dataset patch name for between-patch
                         # annotations; catalog UUID is independent of that name.
@@ -4755,7 +4240,6 @@ class FitContext:
                             'resident_id', source_id)
                     if deleted:
                         source.pop(patch_id, None)
-                        removed.extend([('patch', logical_id), ('patch', patch_id)])
                     elif not adopt:
                         # Baseline adoption only binds workspace identities.
                         # The initial loader already selected usable geometry
@@ -4771,8 +4255,6 @@ class FitContext:
                             reason = 'has no valid quads' if not valid else 'is outside the fitted z range'
                             raise ValueError(f'Patch {logical_id} {reason}')
                         source[patch_id] = patch
-                        if not unverified:
-                            changed_patches[logical_id] = patch
                     resident_id = patch_id
                 elif kind in {'pcl', 'fiber'}:
                     source = candidate._source_point_collections
@@ -4796,9 +4278,7 @@ class FitContext:
                         resident_id = candidate.next_id
                         candidate.next_id += 1
                     if deleted:
-                        old = source.pop(resident_id, None)
-                        if old:
-                            removed.append(_logical_identity(old.get('metadata', {})))
+                        source.pop(resident_id, None)
                     elif adopt and kind == 'fiber' and resident_id not in source:
                         # Preserve startup exclusions (including disabled or
                         # malformed fibers) while retaining workspace identity.
@@ -4834,8 +4314,6 @@ class FitContext:
                             'logical_input_revision': record.get('revision'),
                         })
                         source[resident_id] = pcl
-                        if not adopt:
-                            changed_points[resident_id] = pcl
                 else:
                     raise ValueError(f'Unknown input kind {kind!r}')
                 candidate._workspace_membership[logical_id] = {
@@ -4851,7 +4329,6 @@ class FitContext:
             candidate.patch_sampling_probabilities = candidate._prepare_patch_sampling_cache(
                 candidate.verified_patches_list)
             candidate.patch_atlas = self.patch_atlas.replaced(candidate.verified_patches)
-            rejected_unverified = set()
             candidate._input_warnings = []
             while True:
                 points, fibers = {}, {}
@@ -4869,30 +4346,10 @@ class FitContext:
                 candidate._derive_point_inputs(
                     candidate.verified_patches, points, fibers,
                     direction_source=candidate._desired_fiber_link_direction_source(current_iteration))
-                changed_points = {cid: points[cid] for cid in changed_points if cid in points}
-                changed_patches = {logical_id: patch for logical_id, patch in changed_patches.items()
-                                   if candidate._workspace_membership[logical_id]['resident_id']
-                                   in candidate.verified_patches}
                 candidate._refresh_trusted_geometry()
-                unverified = {
-                    pid: copy.copy(patch) for pid, patch in candidate._source_unverified_patches.items()
-                    if pid not in rejected_unverified
-                } if input_source_enabled(self.config, 'unverified_patches') else {}
-                candidate.unverified_patches, _, _ = _mask_unverified_patches_near_trusted_geometry(
-                    unverified, candidate.trusted_geometry_tree,
-                    float(self.config['patch_unverified_patch_exclusion_radius']))
-                candidate.unverified_patches_list = list(candidate.unverified_patches.values())
-                candidate.unverified_patch_sampling_probabilities = candidate._prepare_patch_sampling_cache(
-                    candidate.unverified_patches_list)
-                candidate.unverified_patch_atlas = None
-                if candidate.unverified_patches:
-                    candidate.unverified_patch_atlas = (
-                        self.unverified_patch_atlas.replaced(candidate.unverified_patches)
-                        if self.unverified_patch_atlas is not None else
-                        PatchAtlas(candidate.unverified_patches, self.device).materialize())
                 if self.dt_target_whole_object:
                     prepare_patch_dt_target_samples(
-                        candidate.verified_patches_list + candidate.unverified_patches_list,
+                        candidate.verified_patches_list,
                         self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'])
                 candidate.dt_target_cache_manager = DtTargetCacheManager(
                     self.dt_target_cache_manager.update_interval,
@@ -4908,70 +4365,23 @@ class FitContext:
                         track_source_ids=self.track_source_ids, crossing_cache=self.track_crossing_cache,
                         track_graph=self.track_graph, progress=self.progress)
                 before_verified = set(candidate.verified_patches)
-                before_unverified = set(candidate.unverified_patches)
                 candidate._input_warnings.extend(candidate._build_theta_crossing_map())
                 rejected_verified = before_verified - set(candidate.verified_patches)
-                rejected = before_unverified - set(candidate.unverified_patches)
                 for record in records:
                     # Sources predate startup theta validation. Adoption may
                     # repeat its exclusions; only live revisions must fail.
                     if (record['kind'] != 'patch' or record.get('deleted')
                             or record.get('adopt')):
                         continue
-                    rejected_ids = rejected if record.get('role') == 'unverified' else rejected_verified
                     member = candidate._workspace_membership[str(record['id'])]
-                    if member['resident_id'] in rejected_ids:
+                    if member['resident_id'] in rejected_verified:
                         raise ValueError(f"Patch {record['id']} failed theta consistency validation")
-                rejected_unverified.update(rejected)
-                if before_verified == set(candidate.verified_patches) and not rejected:
+                if not rejected_verified:
                     break
-                # Theta rejection can detach points and reveal formerly masked
-                # unverified geometry. Re-derive both from their immutable sources
-                # before accepting this candidate, with rejected patches excluded.
-            active_point_ids = set(candidate.regular_pcl_catalog)
-            active_point_ids.update(pcl['id'] for pcl in candidate.fiber_catalog.values())
-            for cid, pcl in self._source_point_collections.items():
-                if cid not in active_point_ids:
-                    identity = _logical_identity(pcl.get('metadata', {}))
-                    if identity is not None:
-                        removed.append(identity)
-            for patch_id in set(self.verified_patches) - set(candidate.verified_patches):
-                removed.append(('patch', patch_id))
-                removed.extend(('patch', logical_id) for logical_id, member in
-                               getattr(self, '_workspace_membership', {}).items()
-                               if member['kind'] == 'patch' and member['resident_id'] == patch_id)
-
-            # Prepare optimizer momentum/weight-decay changes privately too.
-            # Parameter tensors, second moments and the trained model stay shared.
-            candidate.optimiser = copy.copy(self.optimiser)
-            candidate.optimiser.param_groups = [dict(group) for group in self.optimiser.param_groups]
-            candidate.optimiser.state = (defaultdict(self.optimiser.state.default_factory)
-                                         if isinstance(self.optimiser.state, defaultdict) else {})
-            cfg = dict(self.config)
-            cfg.update(influence_config or {})
-            if self.influence_state is not None or cfg['influence_enabled']:
-                for parameter, state in self.optimiser.state.items():
-                    candidate.optimiser.state[parameter] = dict(state)
-                    if 'exp_avg' in state:
-                        candidate.optimiser.state[parameter]['exp_avg'] = state['exp_avg'].clone()
-                candidate.influence_state = copy.deepcopy(self.influence_state)
-                if candidate.influence_state is not None and removed:
-                    candidate.influence_state.remove_logical_contributions_(
-                        [identity for identity in removed if identity is not None],
-                        spiral_and_transform=self.spiral_and_transform, optimiser=candidate.optimiser)
-                if cfg['influence_enabled'] and (changed_patches or changed_points):
-                    if candidate.influence_state is None:
-                        candidate.influence_state = make_influence_state(cfg, self.device)
-                    candidate.influence_state.activate_or_extend_(
-                        new_patches=changed_patches, new_collections=changed_points,
-                        spiral_and_transform=self.spiral_and_transform, optimiser=candidate.optimiser,
-                        cfg=cfg, z_begin=self.z_begin, z_end=self.z_end,
-                        anchor_geometry_zyx=candidate.influence_anchor_geometry)
-                    candidate.interactive_influence_loss_weight = float(cfg['loss_weight_anchor'])
-                    candidate.interactive_influence_anchor_samples = int(
-                        cfg['sample_count_influence_anchor_samples_per_step'])
-            else:
-                candidate.optimiser.state = self.optimiser.state
+                # Theta rejection can detach points. Re-derive the point inputs
+                # from their immutable sources before accepting this candidate,
+                # with rejected patches excluded.
+            # The optimiser, parameter tensors and the trained model stay shared.
             return candidate
         except MissingPclSamplingWeightError as exc:
             # Reject configuration errors without stopping the resident worker.
@@ -4983,11 +4393,9 @@ class FitContext:
 
     def install_input_changes(self, candidate):
         """Install a successfully prepared candidate on the fitter thread."""
-        ignored = {'optimiser', '_preparing_inputs', '_input_warnings'}
+        ignored = {'_preparing_inputs', '_input_warnings'}
         updates = {key: value for key, value in vars(candidate).items()
                    if key not in ignored and value is not getattr(self, key, None)}
-        self.optimiser.state = candidate.optimiser.state
-        self.optimiser.param_groups = candidate.optimiser.param_groups
         self.__dict__.update(updates)
         self._write_non_liftable_patch_report()
         return list(candidate._input_warnings)
@@ -5194,8 +4602,7 @@ class FitContext:
 
     def _reingest_fiber_documents(self, records):
         if records:
-            candidate = self.prepare_input_changes(
-                records, influence_config={'influence_enabled': False})
+            candidate = self.prepare_input_changes(records)
             warnings = self.install_input_changes(candidate)
             for warning in warnings or ():
                 print(f'WARNING: {warning}')
@@ -5257,12 +4664,10 @@ class FitContext:
             replace_prepared_tracks = False
             rebuilt_shell_map = self.shell_map
             rebuilt_shell_outer = self.shell_outer_winding_idx
-            rebuilt_shell_valid = self.shell_valid_zyxs_gpu
 
             reprepare_tracks = bool(changed & {
                 'track_max_tortuosity',
                 'track_exclusion_radius',
-                'track_crossing_mode',
                 'track_crossing_precompute_max',
             })
             shell_atlas_keys = SHELL_ATLAS_KEYS
@@ -5288,29 +4693,9 @@ class FitContext:
                 self.patch_sampling_probabilities = \
                     self._prepare_patch_sampling_cache(self.verified_patches_list)
                 self.patch_atlas.rebuild_sampling_atlas()
-                if self.unverified_patches_list:
-                    self.unverified_patch_sampling_probabilities = \
-                        self._prepare_patch_sampling_cache(
-                            self.unverified_patches_list)
-                    self.unverified_patch_atlas.rebuild_sampling_atlas()
             elif 'patch_sampling_area_exponent' in changed:
                 self.patch_sampling_probabilities = self._patch_sampling_probabilities(
                     self.verified_patches_list)
-                if self.unverified_patches_list:
-                    self.unverified_patch_sampling_probabilities = \
-                        self._patch_sampling_probabilities(self.unverified_patches_list)
-            if 'patch_unverified_patch_exclusion_radius' in changed:
-                (rebuilt_unverified, rebuilt_unverified_list,
-                 rebuilt_unverified_probabilities,
-                 rebuilt_unverified_atlas) = \
-                    self._rebuild_unverified_patch_inputs(float(
-                        self.config['patch_unverified_patch_exclusion_radius']))
-            else:
-                rebuilt_unverified = self.unverified_patches
-                rebuilt_unverified_list = self.unverified_patches_list
-                rebuilt_unverified_probabilities = \
-                    self.unverified_patch_sampling_probabilities
-                rebuilt_unverified_atlas = self.unverified_patch_atlas
 
             # Loss weights are live settings. If a shell loss is enabled for
             # the first time, construct only the resident structure that loss
@@ -5322,13 +4707,6 @@ class FitContext:
                     if (self.shell_patch is not None
                         and (self.config['loss_weight_shell_outer'] > 0
                              or self.winding_model_mode)) else None
-                )
-            if 'loss_weight_shell_patch_radius' in changed:
-                rebuilt_shell_valid = (
-                    self._subsample_shell_radius_pool(self.shell_patch)
-                    if (self.shell_patch is not None
-                        and self.config['loss_weight_shell_patch_radius'] > 0)
-                    else None
                 )
             if (changed & (shell_atlas_keys - {'shell_min_confidence'})
                     and 'loss_weight_shell_outer' not in changed
@@ -5349,11 +4727,6 @@ class FitContext:
                         self.verified_patches_list,
                         self.config['sample_count_patch_dt_target_points'],
                         self.config['dt_target_max_stride'])
-                    if self.unverified_patches_list:
-                        prepare_patch_dt_target_samples(
-                            self.unverified_patches_list,
-                            self.config['sample_count_patch_dt_target_points'],
-                            self.config['dt_target_max_stride'])
             if any(key.startswith('dt_') for key in changed) \
                     or dt_preparation_changed:
                 self.dt_target_cache_manager.update_interval = max(
@@ -5391,10 +4764,6 @@ class FitContext:
             relinked_everything = False
             if fiber_records is not None:
                 self._reingest_fiber_documents(fiber_records)
-                rebuilt_unverified = self.unverified_patches
-                rebuilt_unverified_list = self.unverified_patches_list
-                rebuilt_unverified_probabilities = self.unverified_patch_sampling_probabilities
-                rebuilt_unverified_atlas = self.unverified_patch_atlas
                 rederived_views = True
             if changed & all_link_keys and (fiber_catalog or regular_catalog):
                 self._relink_all_points_to_patches(iteration=current_iteration)
@@ -5422,13 +4791,9 @@ class FitContext:
             role_changes = changed & {pcl_role_toggle_key(role) for role in RUN_MUTABLE_PCL_ROLES}
             if role_changes:
                 candidate = self.prepare_input_changes(
-                    [], {'influence_enabled': False}, current_iteration=current_iteration,
+                    [], current_iteration=current_iteration,
                     target_iteration=current_iteration)
                 self.install_input_changes(candidate)
-                rebuilt_unverified = self.unverified_patches
-                rebuilt_unverified_list = self.unverified_patches_list
-                rebuilt_unverified_probabilities = self.unverified_patch_sampling_probabilities
-                rebuilt_unverified_atlas = self.unverified_patch_atlas
                 rederived_views = True
             # Prepare tracks against the final participation geometry and policy.
             if reprepare_tracks and rebuilt_tracks is None and self.tracks:
@@ -5447,12 +4812,7 @@ class FitContext:
                 rebuilt_tracks
                 if replace_prepared_tracks else self.prepared_main_tracks)
             if ({'track_length_bin_weights',
-                 'track_max_track_crossing_per_step',
-                 'track_min_walk_steps_per_track',
-                 'track_max_walk_steps_per_track',
-                 'track_min_walks_per_track',
-                 'track_max_walks_per_track',
-                 'track_walk_minimum_cycle_travel'}
+                 'track_max_track_crossing_per_step'}
                     & changed):
                 configure_prepared_track_sampling(target_tracks, config)
 
@@ -5467,28 +4827,17 @@ class FitContext:
             self.spiral_and_transform.flow_integration_steps = int(
                 self.config['model_num_flow_integration_steps'])
         self.shell_outer_winding_idx = rebuilt_shell_outer
-        self.shell_valid_zyxs_gpu = rebuilt_shell_valid
         if replace_prepared_tracks:
             self.prepared_main_tracks = rebuilt_tracks
             self.preview_extent_tracks = (
                 (self.prepared_main_tracks['flat_zyx_cpu'],)
                 if self.prepared_main_tracks is not None else ())
-        self.unverified_patches = rebuilt_unverified
-        self.unverified_patches_list = rebuilt_unverified_list
-        self.unverified_patch_sampling_probabilities = \
-            rebuilt_unverified_probabilities
-        self.unverified_patch_atlas = rebuilt_unverified_atlas
-        if self.unverified_patch_atlas is not None:
-            self.unverified_patch_atlas.materialize(self.device)
         if changed & {
                 'pcl_vertical_fiber_radial_offset_enabled',
                 'pcl_vertical_fiber_radial_offset_voxels',
         }:
             self._refill_vertical_fiber_radial_offsets()
-        if changed & {
-                'patch_loss_z_margin',
-                'patch_unverified_patch_exclusion_radius',
-        }:
+        if 'patch_loss_z_margin' in changed:
             self._build_theta_crossing_map()
             self.dt_target_cache_manager.reset()
         elif 'theta_crossing_map_update_interval' in changed:
@@ -5567,29 +4916,10 @@ class FitContext:
         dt_eligibility = get_dt_loss_eligibility(
             self.config, iteration, self.run_dt_resume_iteration)
         compute_patch_dt = dt_eligibility['verified_patch']
-        track_dt_start = self.config['loss_start_patch_dt'] if self.config['loss_start_track_dt'] is None else self.config['loss_start_track_dt']
         compute_track_dt = dt_eligibility['track']
-        unverified_patch_dt_start = self.config['loss_start_patch_dt'] if self.config['loss_start_unverified_patch_dt'] is None else self.config['loss_start_unverified_patch_dt']
-        compute_unverified_patch_dt = dt_eligibility['unverified_patch']
         compute_unattached_pcl_dt = dt_eligibility['unattached_pcl']
-        unattached_pcl_dt_start = get_unattached_pcl_dt_start(self.config)
-
-        # Progressive-outward DT gating: winding cutoff that grows from the
-        # respective DT start step. None means no gating.
-        dt_progressive_outer = self.shell_outer_winding_idx
-        patch_dt_max_winding = get_progressive_dt_max_winding(self.config, iteration, self.config['loss_start_patch_dt'], dt_progressive_outer)
-        track_dt_max_winding = get_progressive_dt_max_winding(self.config, iteration, track_dt_start, dt_progressive_outer)
-        unverified_patch_dt_max_winding = get_progressive_dt_max_winding(self.config, iteration, unverified_patch_dt_start, dt_progressive_outer)
-        unattached_pcl_dt_max_winding = get_progressive_dt_max_winding(self.config, iteration, unattached_pcl_dt_start, dt_progressive_outer)
-        if patch_dt_max_winding is not None:
-            log_metrics['patch_dt_max_winding'] = patch_dt_max_winding
-        if track_dt_max_winding is not None:
-            log_metrics['track_dt_max_winding'] = track_dt_max_winding
-        if unattached_pcl_dt_max_winding is not None:
-            log_metrics['unattached_pcl_dt_max_winding'] = unattached_pcl_dt_max_winding
 
         patch_dt_target_cache = None
-        unverified_patch_dt_target_cache = None
         unattached_pcl_dt_target_cache = None
         track_dt_target_cache = None
         if self.dt_target_whole_object:
@@ -5597,13 +4927,6 @@ class FitContext:
                 patch_dt_target_cache = self.dt_target_cache_manager.get('patch', iteration, lambda: compute_patch_dt_target_cache(
                     self.slice_to_spiral_transform, self.dr_per_winding,
                     self.verified_patches_list, self.patch_atlas,
-                    self.theta_crossing_map,
-                    self.config['dt_target_floating_threshold'],
-                ))
-            if compute_unverified_patch_dt and self.config['loss_weight_unverified_patch_dt'] > 0 and self.unverified_patch_atlas is not None:
-                unverified_patch_dt_target_cache = self.dt_target_cache_manager.get('unverified_patch', iteration, lambda: compute_patch_dt_target_cache(
-                    self.slice_to_spiral_transform, self.dr_per_winding,
-                    self.unverified_patches_list, self.unverified_patch_atlas,
                     self.theta_crossing_map,
                     self.config['dt_target_floating_threshold'],
                 ))
@@ -5641,9 +4964,6 @@ class FitContext:
             self.patch_sampling_probabilities,
             self.umbilicus_zyx,
             compute_dt=compute_patch_dt,
-            shell_valid_zyxs=self.shell_valid_zyxs_gpu,
-            shell_outer_winding_idx=self.shell_outer_winding_idx,
-            dt_max_winding=patch_dt_max_winding,
             dt_target_cache=patch_dt_target_cache,
             crossing_map=self.theta_crossing_map,
             cfg=self.config,
@@ -5660,34 +4980,9 @@ class FitContext:
                     patch_loss_values[2]
                     * self.config['loss_weight_patch_dt']),
             })
-        if self.shell_valid_zyxs_gpu is not None:
-            patch_family['shell_patch_radius'] = patch_loss_values[3] * self.config['loss_weight_shell_patch_radius']
         backward_family(patch_family)
         del patch_family, patch_loss_values
 
-        if self.unverified_patch_atlas is not None and (
-            self.config['loss_weight_unverified_patch_radius'] > 0
-            or self.config['loss_weight_unverified_patch_dt'] > 0
-        ):
-            unverified_loss_values = get_unverified_patch_losses(
-                self.slice_to_spiral_transform,
-                self.dr_per_winding,
-                self.config['sample_count_unverified_patches_per_step'],
-                self.config['sample_count_unverified_patches_per_step_for_dt'],
-                self.unverified_patches_list,
-                self.unverified_patch_atlas,
-                self.unverified_patch_sampling_probabilities,
-                compute_dt=compute_unverified_patch_dt,
-                dt_max_winding=unverified_patch_dt_max_winding,
-                dt_target_cache=unverified_patch_dt_target_cache,
-                crossing_map=self.theta_crossing_map,
-                cfg=self.config,
-            )
-            backward_family({
-                'unverified_patch_radius': unverified_loss_values[0] * self.config['loss_weight_unverified_patch_radius'],
-                'unverified_patch_dt': unverified_loss_values[1] * self.config['loss_weight_unverified_patch_dt'],
-            })
-            del unverified_loss_values
 
         if self.config['loss_weight_sym_dirichlet'] > 0:
             backward_family({
@@ -5774,7 +5069,7 @@ class FitContext:
                 * self.config['loss_weight_fiber_directions']
             })
 
-        self._warn_if_sdt_loss_inactive()
+        self._warn_if_density_loss_inactive()
         self._warn_if_dense_losses_structurally_disabled()
         if self._winding_model_mode_active():
             inference_losses, inference_metrics = get_winding_inference_losses(
@@ -5800,69 +5095,24 @@ class FitContext:
             })
             log_metrics.update(inference_metrics)
             del inference_losses, inference_metrics
-        phase_components_active = self._phase_mode_active()
-        min_spacing_active = self.config['loss_weight_min_spacing'] > 0
-        if phase_components_active or min_spacing_active:
-            # SDT-backed phase components require phase mode; the native
-            # min-spacing barrier does not. Weights are re-read every step so
-            # the barrier can be enabled at a Run boundary in either mode.
-            attachment_ramp = (
-                get_dense_attachment_ramp(self.config, iteration)
-                if phase_components_active else 0.0)
-            if phase_components_active:
-                log_metrics['dense_attachment_ramp'] = attachment_ramp
-            component_weights = phase_bundle_component_weights(
-                self.config, attachment_ramp)
-            # Components tagged '_shared_graph' (count, phase, shared-batch
-            # density) backpropagate through one central-ray graph; summing
-            # them into a single backward traverses that graph once instead
-            # of once per component. Untagged components (density supplement
-            # chunks, min_spacing, attachment) keep their own backward so at
-            # most one supplement-chunk graph is resident at a time.
-            pending_shared = {}
-            for component_name, component_loss, component_metrics in \
-                    iter_phase_bundle_losses(
-                        self.spiral_and_transform,
-                        self.slice_to_spiral_transform,
-                        self.dr_per_winding,
-                        self.sdt_volume,
-                        self.lasagna_volume,
-                        self.shell_outer_winding_idx,
-                        self.config,
-                        self.z_begin,
-                        self.z_end,
-                        attachment_ramp=attachment_ramp,
-                        # Metrics are only reported every 200 steps; their
-                        # .item() reads each stall on the full GPU queue.
-                        with_metrics=iteration % 200 == 0,
-                    ):
-                weighted = (
-                    component_loss * component_weights[component_name])
-                if component_metrics.pop('_shared_graph', False):
-                    pending_shared[component_name] = weighted
-                else:
-                    if pending_shared:
-                        backward_family(pending_shared)
-                        pending_shared = {}
-                    backward_family({component_name: weighted})
-                # Release before the generator builds the next component's
-                # graph, or several large graphs are resident at peak.
-                del component_loss, weighted
-                log_metrics.update(component_metrics)
-            if pending_shared:
-                backward_family(pending_shared)
-            del pending_shared
-            if (phase_components_active
-                    and self.lasagna_volume['backend'] == 'sparse_cuda'):
-                log_metrics.update({
-                    f'dense_spacing_phase_normal_{name}': value
-                    for name, value in self.lasagna_volume['store'].last_timings.items()
-                })
-            if phase_components_active and self.sdt_volume['backend'] == 'sparse_cuda':
-                log_metrics.update({
-                    f'dense_spacing_phase_sdt_store_{name}': value
-                    for name, value in self.sdt_volume['store'].last_timings.items()
-                })
+        # The native min-spacing barrier is asset-independent; its weight is
+        # re-read every step so it can be enabled at a Run boundary in any
+        # dense-spacing mode.
+        min_spacing_weight = float(self.config['loss_weight_min_spacing'])
+        if min_spacing_weight > 0:
+            min_spacing_loss, min_spacing_metrics = get_min_spacing_loss(
+                self.spiral_and_transform,
+                self.shell_outer_winding_idx,
+                self.config,
+                self.z_begin,
+                self.z_end,
+                # Metrics are only reported every 200 steps; their .item()
+                # reads each stall on the full GPU queue.
+                with_metrics=iteration % 200 == 0,
+            )
+            backward_family({'min_spacing': min_spacing_loss * min_spacing_weight})
+            log_metrics.update(min_spacing_metrics)
+            del min_spacing_loss, min_spacing_metrics
 
         if (
             (self.config['loss_weight_unattached_pcl_radius'] > 0
@@ -5880,7 +5130,6 @@ class FitContext:
                 self.config['sample_count_unattached_pcls_per_step'],
                 self.config['sample_count_unattached_pcl_points_per_step'],
                 compute_dt=compute_unattached_pcl_dt,
-                dt_max_winding=unattached_pcl_dt_max_winding,
                 dt_target_cache=unattached_pcl_dt_target_cache,
                 crossing_map=self.theta_crossing_map,
                 cfg=self.config,
@@ -5898,7 +5147,6 @@ class FitContext:
                 self.prepared_main_tracks,
                 self.config,
                 compute_dt=compute_track_dt,
-                dt_max_winding=track_dt_max_winding,
                 dt_target_cache=track_dt_target_cache,
             ):
                 weight = (
@@ -5928,16 +5176,6 @@ class FitContext:
                 'shell_outer': shell_outer_loss * self.config['loss_weight_shell_outer'],
             })
             del shell_outer_loss
-
-        if (self.influence_state is not None and self.influence_state.active
-                and self.interactive_influence_loss_weight > 0):
-            backward_family({
-                'anchor': self.influence_state.get_anchor_loss(
-                    self.slice_to_spiral_transform,
-                    self.dr_per_winding,
-                    self.interactive_influence_anchor_samples,
-                ) * self.interactive_influence_loss_weight,
-            })
 
         loss = sum(losses.values())
 
@@ -5979,16 +5217,10 @@ class FitContext:
 
         if self.config.get('optimizer_flow_grad_smoothing', False):
             # After the all-reduce (smoothing is linear, and every rank then
-            # smooths identical gradients) and before the influence masks, so
-            # smoothing cannot leak gradient outside a masked region.
+            # smooths identical gradients).
             self.step_timer.start('smooth')
             self.spiral_and_transform.smooth_flow_grad_(*self._flow_grad_smoothing_widths())
             self.step_timer.stop('smooth')
-
-        if self.influence_state is not None and self.influence_state.active:
-            # After the all-reduce and the accumulated-field-grad handoff, so
-            # every rank masks identical averaged gradients on both flow paths.
-            self.influence_state.apply_grad_masks_(self.spiral_and_transform)
 
         # The unset-potential hard error is deferred off the sampler hot path
         # (theta_crossing_map.winding_potentials); resolve every pending
@@ -5998,8 +5230,6 @@ class FitContext:
         self.step_timer.start('opt')
         self.optimiser.step()
         self.step_timer.stop('opt')
-        if self.influence_state is not None and self.influence_state.active:
-            self.influence_state.apply_masked_gap_decay_(self.spiral_and_transform, self.optimiser)
         self.optimiser.zero_grad(set_to_none=True)
         self.lr_scheduler.step()
         self.step_timer.tick()
@@ -6160,9 +5390,6 @@ class FitContext:
                 patch_atlas=self.patch_atlas,
                 unattached_pcl_strips=self.unattached_pcl_strips,
                 tracks=self.tracks,
-                unverified_patches_list=self.unverified_patches_list,
-                unverified_patches_dict=self.unverified_patches,
-                unverified_patch_atlas=self.unverified_patch_atlas,
                 out_path=self.out_path,
                 cfg=self.config,
                 z_begin=self.z_begin,
@@ -6196,13 +5423,11 @@ class FitContext:
         store, self._lasagna_store = self._lasagna_store, None
         if store is not None:
             store.close()
-        while self._scalar_stores:
-            self._scalar_stores.pop().close()
         self.winding_inference = None
 
 
 def main(config, *, scroll, paths, progress=None, resume_path=None,
-         resume_step=0, out_base_dir=None, run_dir=None, run_tag=None,
+         out_base_dir=None, run_dir=None, run_tag=None,
          run_name=None,
          cache_dir=None, storage_backend='sparse_cuda',
          render_volume_scale=16, dist_context=None):
@@ -6218,7 +5443,6 @@ def main(config, *, scroll, paths, progress=None, resume_path=None,
         paths=paths,
         progress=progress,
         resume_path=resume_path,
-        resume_step=resume_step,
         out_base_dir=out_base_dir,
         run_dir=run_dir,
         run_tag=run_tag,
@@ -6307,19 +5531,14 @@ if __name__ == '__main__':
         z_range_scaled_count_keys = (
             'sample_count_patches_per_step',
             'sample_count_patches_per_step_for_dt',
-            'sample_count_unverified_patches_per_step',
-            'sample_count_unverified_patches_per_step_for_dt',
             'sample_count_relative_winding_pcls',
             'sample_count_absolute_winding_pcls',
             'sample_count_unattached_pcls_per_step',
             'sample_count_tracks_per_step',
             'sample_count_dense_normal_points',
             'sample_count_fiber_direction_points',
-            'sample_count_dense_spacing_pairs',
-            'sample_count_dense_spacing_density_extra_pairs',
             'sample_count_winding_model_relative_pairs',
             'sample_count_winding_model_density_pairs',
-            'sample_count_dense_attachment_points',
             'sample_count_regularisation_points',
             'sample_count_shell_samples',
         )
@@ -6354,7 +5573,6 @@ if __name__ == '__main__':
             paths=input_paths,
             progress=cli_progress,
             resume_path=os.environ.get('FIT_SPIRAL_RESUME_PATH'),
-            resume_step=int(os.environ.get('FIT_SPIRAL_RESUME_STEP', '0')),
             out_base_dir=os.environ.get('FIT_SPIRAL_OUT_DIR'),
             run_dir=os.environ.get('FIT_SPIRAL_RUN_DIR'),
             run_tag=os.environ.get('FIT_SPIRAL_RUN_TAG'),

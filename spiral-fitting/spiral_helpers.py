@@ -74,28 +74,14 @@ def scale_counts_for_z_range(
     z_end,
     reference_z_range_num_slices,
     z_range_scaled_count_keys,
-    floors=None,
 ):
-    """Scale per-step sample counts with the z-range, respecting floors.
-
-    Floors exist for losses whose per-sample information is sparse: the
-    phase bundle sees ~6 winding gradient sites per pair, so
-    volume-proportional scaling starves it on narrow windows (a 300-slice
-    session got ~380 pairs from the 12k default and corrected at half
-    grad_mag's rate - 2026-07-17 sampling-scale probes).
-    """
+    """Scale per-step sample counts with the z-range (never below 1)."""
     num_slices = z_end - z_begin
     scale = num_slices / reference_z_range_num_slices
     for key in z_range_scaled_count_keys:
-        floor = 1 if floors is None else int(floors.get(key, 1))
-        config[key] = max(floor, round(config[key] * scale))
+        config[key] = max(1, round(config[key] * scale))
     return scale, num_slices
 
-
-SAMPLING_COUNT_FLOORS = {
-    'sample_count_dense_spacing_pairs': 8_000,
-    'sample_count_dense_spacing_density_extra_pairs': 16_000,
-}
 
 # All per-step sample-count defaults are tuned for a 9500-slice z-range;
 # scale_counts_for_z_range() scales them relative to this reference.
@@ -119,7 +105,6 @@ def scale_and_split_counts(config, z_begin, z_end, count_keys, world_size=None):
     scale, num_slices = scale_counts_for_z_range(
         config, z_begin, z_end,
         REFERENCE_Z_RANGE_NUM_SLICES, count_keys,
-        floors=SAMPLING_COUNT_FLOORS,
     )
     split_divisor = split_counts_across_ranks(
         config, count_keys, world_size=world_size)
@@ -1128,7 +1113,7 @@ def _infer_shell_outer_winding_idx(
 def _resolve_shell_outer_winding_idx(cfg):
     # Winding bound shared by every sampler that integrates over the spiral
     # cylinder: the dense lasagna losses, the symmetric Dirichlet
-    # regulariser and the phase bundle (incl. min_spacing). Resolved once per
+    # regulariser and the native min_spacing barrier. Resolved once per
     # run from the config; the shell branch may still override it with the
     # inferred value. None disables those samplers (they early-return zero),
     # whatever their weights: _structurally_disabled_dense_weight_keys
@@ -1189,9 +1174,7 @@ def resolve_outer_winding_idx_and_notes(cfg, shell_active, infer_outer_winding_i
 _DENSE_WEIGHT_KEYS_NEEDING_OUTER_WINDING_IDX = (
     'loss_weight_dense_normals',
     'loss_weight_dense_spacing',
-    'loss_weight_dense_spacing_count',
     'loss_weight_dense_spacing_density',
-    'loss_weight_dense_attachment',
     'loss_weight_min_spacing',
     'loss_weight_sym_dirichlet',
 )

@@ -167,11 +167,6 @@ diffeomorphism composes. The stages are the slabs of the flow lattices'
 leading axis (`flow_field.flows.{0,1}` are `[stages, 3, ...]`), integrated in
 order by one fused kernel launch per direction; the inverse runs the slabs
 backwards in reverse order. One stage is the original single-field model.
-Checkpoints written with the earlier per-stage module layout
-(`extra_flow_fields.*`) are migrated on load, Adam moments included
-(`checkpoint_migrations.merge_flow_stage_lattices`). The retired
-`model_num_flow_timesteps` key is dropped from old configurations on load;
-checkpoints with a time axis longer than 1 are rejected.
 
 ## Flow-gradient conditioning
 
@@ -179,13 +174,12 @@ These optional settings change how the flow lattices are optimized, without
 adding loss terms or changing the model parameterization. The smoothing,
 lazy-moment and shared-second-moment switches default to off; gradient
 clipping defaults to disabled. The `optimizer_flow_*` settings apply at run
-boundaries and are read every step. Older checkpoints backfill these defaults.
+boundaries and are read every step.
 
 The step order is: DDP gradient averaging, NaN/Inf detection and replacement
-with zero, optional clipping, optional smoothing, influence masks, then the
-optimizer update. Sanitizing before smoothing prevents a single invalid entry
-from contaminating its neighborhood. Influence masks constrain the processed
-gradient after smoothing.
+with zero, optional clipping, optional smoothing, then the optimizer update.
+Sanitizing before smoothing prevents a single invalid entry from
+contaminating its neighborhood.
 
 - `optimizer_flow_grad_smoothing` Gaussian-smooths each flow lattice's
   gradient. `optimizer_flow_grad_smoothing_sigma_voxels` sets the standard
@@ -322,7 +316,7 @@ or with conda/pip, install `torch` for your CUDA version and then
 
 ### Resident sparse field pools
 
-Normals, gradient magnitude, and surf-SDT samples are served by fully
+Normals and gradient magnitude samples are served by fully
 resident device brick pools. Each store's occupied bricks are packed once
 into a flat sidecar next to the source zarr by `pack_resident_pools.py`:
 
@@ -334,8 +328,8 @@ python pack_resident_pools.py /path/to/lasagna_inputs \
 `--ct` zeroes every voxel whose CT voxel reads 0 (the mask region around the
 scroll) so those bricks drop out of the pool and sample as no-data. The
 fitter loads the sidecars restricted to the configured z-ROI in one
-sequential read per channel (for the full s1 ROI: ~33 GiB SDT + ~10 GiB
-normals); after that every gather is pure device indexing with no I/O and no
+sequential read per channel (for the full s1 ROI: ~10 GiB normals); after
+that every gather is pure device indexing with no I/O and no
 eviction. When a required sidecar is missing, the fitter builds it before GPU
 loading and reports chunk progress. In DDP runs only rank 0 builds it. Manual
 prepacking with `--ct` remains useful because the CT mask can substantially
@@ -489,7 +483,7 @@ per profile. Generated previews, geometry, and
 checkpoints transfer through the artifact API into a local cache — no shared
 filesystem is needed. Optional: set the profile's **Local dataset path** if
 this machine mounts the same dataset, so input surface overlays
-(verified/unverified/shell) can be displayed locally. It is assumed to
+(verified patches/shell) can be displayed locally. It is assumed to
 correspond to the dataset root the service advertises, which is the prefix
 service paths are translated from; without it those overlays are simply marked
 unavailable.
@@ -503,10 +497,10 @@ read-only, and the service rejects a session request that carries
 Optional supervision sources have rebuild-scoped boolean switches in Advanced
 config. Set an `input_use_*` key to `false` to skip validation, loading,
 sampling, and losses for that source without changing its tuned weights or
-sample counts. Available switches cover verified/unverified patches, tracks,
+sample counts. Available switches cover verified patches, tracks,
 fibers, each PCL role (`absolute`, `relative`, `same_winding`, and
-`drawn_control_points`), normals, surface SDT, gradient magnitude, winding
-inference, and the outer shell. For example:
+`drawn_control_points`), normals, gradient magnitude, winding inference, and
+the outer shell. For example:
 
 ```json
 {
@@ -519,8 +513,8 @@ inference, and the outer shell. For example:
 Most role switches require a whole-fit rebuild; same-winding and relative PCL
 switches apply at the next Run. Disabled roles retain their accepted workspace
 content, and enabling a role restores that desired content. Disabling a
-prerequisite also disables its dependent supervision: phase spacing needs
-normals and surface SDT, while winding inference needs the outer shell.
+prerequisite also disables its dependent supervision: winding inference
+needs the outer shell.
 
 The API 33 client and service use one revisioned input workspace per dataset.
 One service holds the dataset editing lease and one client owns that workspace;
@@ -644,14 +638,6 @@ Input uploads only transfer immutable bytes. The editing workspace owns
 acceptance, application, and persistence; there is no separate ephemeral-input
 ledger or automatic commit on editor save. Checkpoint uploads remain service-scoped.
 
-Interactive influence settings are captured when each **Run** request starts.
-Applying input revisions uses those captured settings and extends the
-influence region's union.
-The region is cleared only when the Run pauses, before autosaving.
-Influence masks, limits, and controls are not checkpoint state. All
-`interactive_influence_*` advanced settings can therefore change between runs
-without reloading the resident session.
-
 Directional DT timing is an independent control on every interactive Run.
 When **Restrict DT losses to final** is unchecked, the Run adds no DT gate.
 When checked, the adjacent percentage is the eligible suffix of the originally
@@ -694,10 +680,20 @@ it and says what a rebuild would have to replace: rebuilding the **model only**
 keeps the loaded dataset inputs and everything already added to the fit, while
 a **whole-fit** rebuild re-reads the dataset and replays the workspace's desired
 revisions, including uncommitted additions. The panel reports the reasons and asks; a checkpoint no
-rebuild can accept — one written against another dataset, or against a
-configuration schema this service does not have — is reported and nothing is
-offered. A checkpoint-backed session takes its durable configuration from the
-checkpoint, so the local advanced-config profile does not override it.
+rebuild can accept — one written against another dataset, or whose stored
+configuration holds a value the schema cannot interpret — is reported and
+nothing is offered. A checkpoint-backed session takes its durable configuration
+from the checkpoint, so the local advanced-config profile does not override it.
+
+A checkpoint's stored configuration is loaded tolerantly
+(`checkpoint_migrations.tolerate_config`): keys the schema no longer has are
+dropped and keys the checkpoint predates take their current defaults. Each
+such edit is reported as a note or session warning. Only a stored value the
+schema cannot validate (a retired enum member, an out-of-range number) refuses
+the checkpoint. Tolerance covers configuration alone: a checkpoint whose
+parameters do not fit the live model — a multi-stage flow saved in the
+pre-slab `extra_flow_fields.*` layout, or an exponential-gap fit from before
+late August 2026 — is still refused on tensor geometry.
 
 The Iterations value on *Run* is a count added to the checkpoint's durable
 iteration. The progress bar is local to that run and therefore starts at zero;
@@ -856,9 +852,8 @@ and optimisation then does no inference-store filesystem I/O. The default
 24,000 samples per step are split evenly between long relative-winding pairs
 (`sample_count_winding_model_relative_pairs`, index separation drawn from
 `winding_model_relative_pair_delta`) and adjacent-passage density pairs
-(`sample_count_winding_model_density_pairs`). In this mode surf-SDT is
-neither loaded nor required, while the independent Lasagna normal and native
-minimum-spacing losses remain available.
+(`sample_count_winding_model_density_pairs`). The independent Lasagna normal
+and native minimum-spacing losses remain available alongside it.
 
 The compact store is created by the Vesuvius winding-model
 `export_spiral_supervision.py` tool; see its `NATIVE_PHASE_CACHE.md` for the
