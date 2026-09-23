@@ -23,7 +23,6 @@ def _context(**overrides):
     context.shell_map = None
     context.shell_envelope = None
     context.shell_outer_winding_idx = None
-    context.shell_valid_zyxs_gpu = None
     context.shell_patch = None
     context.tracks = []
     context.prepared_main_tracks = None

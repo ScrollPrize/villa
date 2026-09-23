@@ -545,28 +545,24 @@ class LiveShellConfigTests(unittest.TestCase):
         context = self.FitContext.__new__(self.FitContext)
         context.config = {
             'loss_weight_shell_outer': 0.0,
-            'loss_weight_shell_patch_radius': 0.0,
         }
         context.shell_patch = None
         context.shell_map = None
-        context.shell_valid_zyxs_gpu = None
         context.shell_outer_winding_idx = 4
         context.winding_model_mode = False
         context.device = torch.device('cpu')
         context.tracks = None
         context.prepared_main_tracks = None
 
-        def unexpected_subsample(_shell):
-            self.fail('a disabled outer-shell source must not be subsampled')
+        def unexpected_polar_map():
+            self.fail('a disabled outer-shell source must not build a polar map')
 
-        context._subsample_shell_radius_pool = unexpected_subsample
+        context._make_shell_polar_map = unexpected_polar_map
         context.apply_config({
             'loss_weight_shell_outer': 1.0,
-            'loss_weight_shell_patch_radius': 1.0,
         }, current_iteration=0)
 
         self.assertIsNone(context.shell_map)
-        self.assertIsNone(context.shell_valid_zyxs_gpu)
 
 
 class NonFiniteGradCheckTests(unittest.TestCase):

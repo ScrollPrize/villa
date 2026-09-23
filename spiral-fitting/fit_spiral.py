@@ -307,6 +307,16 @@ class ShellPolarMap:
             f'{occupied}/{total} occupied ({occupied / max(total, 1) * 100:.1f}%)'
         )
 
+    def to(self, device):
+        # The table is built once on the host (the track filter reads it
+        # there) and shared with the losses on the training device: a shallow
+        # copy whose tensors live on ``device``.
+        moved = copy.copy(self)
+        moved.device = device
+        moved.lookup_table = self.lookup_table.to(device=device)
+        moved.umbilicus_zyx = self.umbilicus_zyx.to(device=device)
+        return moved
+
     def lookup(self, scan_zyx):
         centre_yx = interp1d(scan_zyx[..., 0].contiguous(), self.umbilicus_zyx[:, :1], self.umbilicus_zyx[:, 1:])
         rel_yx = scan_zyx[..., 1:] - centre_yx
@@ -2669,19 +2679,12 @@ class FitContext:
                   f'{self.dense_spacing_mode!r}; this component runs only in '
                   "'winding_model' mode and is INACTIVE.")
 
-    def _subsample_shell_radius_pool(self, patch):
-        # The shell-patch radius loss draws sample_count_shell_samples random
-        # shell points per step; keep a pool of exactly that size resident on
-        # the GPU instead of the full shell cloud. A dedicated generator makes
-        # the pool deterministic (identical across DDP ranks) without
-        # perturbing the training RNG streams.
-        pool_generator = torch.Generator()
-        pool_generator.manual_seed(int(self.config['optimizer_random_seed']))
-        return subsample_rows(
-            patch.valid_zyxs, int(self.config['sample_count_shell_samples']), pool_generator,
-        ).to(device=self.device, dtype=torch.float32)
-
     def _make_shell_polar_map(self):
+        # A session that filtered its tracks against the shell already built
+        # the identical table on the host (the atlas keys are frozen for it,
+        # and shell_min_confidence is read live at lookup): share it.
+        if self.shell_envelope is not None:
+            return self.shell_envelope.to(self.device)
         return ShellPolarMap(
             self.shell_patch, self.umbilicus,
             z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
@@ -3276,24 +3279,12 @@ class FitContext:
         # ==========================================================================
 
         self.shell_map = None
-        self.shell_valid_zyxs_gpu = None
 
         shell_active = self.shell_patch is not None and self.shell_losses_enabled()
-        if shell_active:
-            if self.config['loss_weight_shell_patch_radius'] > 0:
-                self.shell_valid_zyxs_gpu = self._subsample_shell_radius_pool(self.shell_patch)
         if (self.shell_patch is not None
                 and (self.config['loss_weight_shell_outer'] > 0
                      or self.winding_model_mode)):
-            self.shell_map = ShellPolarMap(
-                self.shell_patch,
-                self.umbilicus,
-                z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
-                z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
-                num_theta_bins=self.config['shell_num_theta_bins'],
-                device=self.device,
-                config=self.config,
-            )
+            self.shell_map = self._make_shell_polar_map()
 
         # Dense losses sample out to this index even when shell losses are off.
         self.shell_outer_winding_idx, outer_winding_notes = resolve_outer_winding_idx_and_notes(
@@ -3500,7 +3491,7 @@ class FitContext:
         'flow_field_radius', 'flow_min_corner_spiral_zyx',
         'flow_max_corner_spiral_zyx', 'num_training_steps',
         '_initial_num_training_steps', 'spiral_and_transform', 'shell_map',
-        'shell_valid_zyxs_gpu', 'shell_outer_winding_idx',
+        'shell_outer_winding_idx',
         '_dense_inactive_warned', 'low_res_flow_params',
         'high_res_flow_params', 'gap_expander_params', 'optimiser',
         'lr_scheduler', 'profiler',
@@ -4061,7 +4052,7 @@ class FitContext:
                     'sym_dirichlet', 'rel_winding', 'abs_winding',
                     'dense_normals', 'dense_spacing',
                     'unattached_pcl_radius', 'unattached_pcl_dt',
-                    'track_radius', 'track_dt', 'shell_patch_radius',
+                    'track_radius', 'track_dt',
                 )
             }
             if self._winding_model_mode_active():
@@ -4090,8 +4081,6 @@ class FitContext:
                     self.verified_patches_list, self.patch_atlas,
                     self.patch_sampling_probabilities, self.umbilicus_zyx,
                     compute_dt=self.config['loss_weight_patch_dt'] > 0,
-                    shell_valid_zyxs=self.shell_valid_zyxs_gpu,
-                    shell_outer_winding_idx=self.shell_outer_winding_idx,
                     crossing_map=self.theta_crossing_map,
                     cfg=self.config,
                 )
@@ -4675,7 +4664,6 @@ class FitContext:
             replace_prepared_tracks = False
             rebuilt_shell_map = self.shell_map
             rebuilt_shell_outer = self.shell_outer_winding_idx
-            rebuilt_shell_valid = self.shell_valid_zyxs_gpu
 
             reprepare_tracks = bool(changed & {
                 'track_max_tortuosity',
@@ -4719,13 +4707,6 @@ class FitContext:
                     if (self.shell_patch is not None
                         and (self.config['loss_weight_shell_outer'] > 0
                              or self.winding_model_mode)) else None
-                )
-            if 'loss_weight_shell_patch_radius' in changed:
-                rebuilt_shell_valid = (
-                    self._subsample_shell_radius_pool(self.shell_patch)
-                    if (self.shell_patch is not None
-                        and self.config['loss_weight_shell_patch_radius'] > 0)
-                    else None
                 )
             if (changed & (shell_atlas_keys - {'shell_min_confidence'})
                     and 'loss_weight_shell_outer' not in changed
@@ -4846,7 +4827,6 @@ class FitContext:
             self.spiral_and_transform.flow_integration_steps = int(
                 self.config['model_num_flow_integration_steps'])
         self.shell_outer_winding_idx = rebuilt_shell_outer
-        self.shell_valid_zyxs_gpu = rebuilt_shell_valid
         if replace_prepared_tracks:
             self.prepared_main_tracks = rebuilt_tracks
             self.preview_extent_tracks = (
@@ -4984,8 +4964,6 @@ class FitContext:
             self.patch_sampling_probabilities,
             self.umbilicus_zyx,
             compute_dt=compute_patch_dt,
-            shell_valid_zyxs=self.shell_valid_zyxs_gpu,
-            shell_outer_winding_idx=self.shell_outer_winding_idx,
             dt_target_cache=patch_dt_target_cache,
             crossing_map=self.theta_crossing_map,
             cfg=self.config,
@@ -5002,8 +4980,6 @@ class FitContext:
                     patch_loss_values[2]
                     * self.config['loss_weight_patch_dt']),
             })
-        if self.shell_valid_zyxs_gpu is not None:
-            patch_family['shell_patch_radius'] = patch_loss_values[3] * self.config['loss_weight_shell_patch_radius']
         backward_family(patch_family)
         del patch_family, patch_loss_values
 

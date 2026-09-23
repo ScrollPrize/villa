@@ -293,7 +293,6 @@ class ThetaCrossingCacheCadenceTests(unittest.TestCase):
         }
         context.shell_map = None
         context.shell_outer_winding_idx = None
-        context.shell_valid_zyxs_gpu = None
         context.tracks = []
         context.prepared_main_tracks = None
         context.verified_patches_list = []

@@ -27,7 +27,6 @@ class TestModeContract:
         base = {
             'input_disable_patches': True,
             'loss_weight_shell_outer': 0.0,
-            'loss_weight_shell_patch_radius': 0.0,
             'loss_weight_dense_normals': 0.0,
         }
         base.update(config)

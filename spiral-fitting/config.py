@@ -713,7 +713,6 @@ class Config:
         self.loss_weight_dense_spacing = 12.0
         self.loss_weight_umbilicus = 1.25
         self.loss_weight_shell_outer = 1.0
-        self.loss_weight_shell_patch_radius = 0.0
         self.dense_min_spacing_d_min_wv = 6.0
         self.dense_normals_finite_difference_epsilon = 8.0
         self.fiber_directions_finite_difference_epsilon = 8.0

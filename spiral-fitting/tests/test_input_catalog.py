@@ -28,17 +28,13 @@ def test_omitted_spacing_mode_uses_fitter_default():
 def test_outer_shell_is_required_by_shell_losses_or_winding_model():
     spec = fit_input("outer_shell")
     assert spec.kind == "directory"
-    # Required by either shell loss weight (the outer weight defaults on) or
-    # by winding-model supervision even when both shell losses are disabled.
+    # Required by the outer shell loss weight (which defaults on) or by
+    # winding-model supervision even when the shell loss is disabled.
     assert spec.required({}) is True
     assert spec.required({"dense_spacing_mode": "phase",
-                          "loss_weight_shell_outer": 0.0,
-                          "loss_weight_shell_patch_radius": 0.0}) is False
-    assert spec.required({"loss_weight_shell_outer": 0.0,
-                          "loss_weight_shell_patch_radius": 2.0}) is True
+                          "loss_weight_shell_outer": 0.0}) is False
     assert spec.required({"dense_spacing_mode": "winding_model",
-                          "loss_weight_shell_outer": 0.0,
-                          "loss_weight_shell_patch_radius": 0.0}) is True
+                          "loss_weight_shell_outer": 0.0}) is True
 
 
 def test_no_input_path_is_advertised_as_takeable_by_a_resident_session():

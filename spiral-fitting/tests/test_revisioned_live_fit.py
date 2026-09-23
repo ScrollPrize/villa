@@ -43,7 +43,6 @@ def make_real_revision_session(tmp_path):
     config = {
         'dense_spacing_mode': 'grad_mag', 'loss_weight_dense_spacing': 0,
         'loss_weight_dense_normals': 0, 'loss_weight_shell_outer': 0,
-        'loss_weight_shell_patch_radius': 0,
         'model_flow_voxel_resolution': 64,
         'sample_count_patches_per_step': 8, 'sample_count_patches_per_step_for_dt': 8,
         'sample_count_points_per_patch': 32, 'sample_count_regularisation_points': 64,

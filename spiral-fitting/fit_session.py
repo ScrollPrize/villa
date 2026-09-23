@@ -281,10 +281,8 @@ def _pcls_enabled(config: Mapping[str, Any]) -> bool:
 
 
 def _shell_losses_enabled(config: Mapping[str, Any]) -> bool:
-    return input_source_enabled(config, "outer_shell") and (
-        float(config.get("loss_weight_shell_outer", 1.0)) > 0
-        or float(config.get("loss_weight_shell_patch_radius", 0)) > 0
-    )
+    return (input_source_enabled(config, "outer_shell")
+            and float(config.get("loss_weight_shell_outer", 1.0)) > 0)
 
 
 def _dense_spacing_mode(config: Mapping[str, Any]) -> str | None:

@@ -609,19 +609,13 @@ def _patch_radius_and_dt_losses(
 
 
 
-def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True, shell_valid_zyxs=None, shell_outer_winding_idx=None, dt_target_cache=None, *, crossing_map, cfg):
+def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True, dt_target_cache=None, *, crossing_map, cfg):
 
-    n_umb = umbilicus_zyx.shape[0]
-    if shell_valid_zyxs is not None:
-        num_shell_samples = min(int(cfg['sample_count_shell_samples']), shell_valid_zyxs.shape[0])
-        sample_idx = torch.randint(shell_valid_zyxs.shape[0], (num_shell_samples,), device=shell_valid_zyxs.device)
-        extra_zyxs = torch.cat([umbilicus_zyx, shell_valid_zyxs[sample_idx]], dim=0)
-    else:
-        extra_zyxs = umbilicus_zyx
+    extra_zyxs = umbilicus_zyx
 
     if len(patches) == 0:
-        # supervision-free (disable_patches) fits: the umbilicus and shell
-        # anchors still apply; the patch radius/DT terms are inert zeros
+        # supervision-free (disable_patches) fits: the umbilicus anchor
+        # still applies; the patch radius/DT terms are inert zeros
         extra_spiral = slice_to_spiral_transform(extra_zyxs)
         mean_radius_deviation = torch.zeros([], device=dr_per_winding.device)
         patch_dt_loss = torch.zeros([], device=dr_per_winding.device)
@@ -665,38 +659,10 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
             diagnostic_prefix='patch',
         )
 
-    umbilicus_spiral = extra_spiral[:n_umb]
-    shell_spiral_zyxs = extra_spiral[n_umb:] if shell_valid_zyxs is not None else None
-
     # Umbilicus should map to the spiral origin (yx ≈ 0)
-    umbilicus_loss = umbilicus_spiral[..., 1:].abs().mean()
+    umbilicus_loss = extra_spiral[..., 1:].abs().mean()
 
-    if shell_spiral_zyxs is not None:
-        radius_hinge_margin = dr_per_winding.detach() * cfg['patch_radius_loss_margin']
-        shell_theta, _, shell_shifted_radii = get_theta_and_radii(
-            shell_spiral_zyxs[..., 1:], dr_per_winding)
-        shell_target = dr_per_winding * float(shell_outer_winding_idx)
-        shell_patch_radius_residual = F.relu(
-            (shell_shifted_radii - shell_target).abs() - radius_hinge_margin)
-        shell_patch_radius_loss = shell_patch_radius_residual.mean()
-        shell_target_radii = (
-            shell_target
-            + shell_theta / (2 * np.pi) * dr_per_winding.detach()
-        )
-        shell_target_spiral_zyxs = torch.stack([
-            shell_spiral_zyxs[..., 0],
-            torch.sin(shell_theta) * shell_target_radii,
-            torch.cos(shell_theta) * shell_target_radii,
-        ], dim=-1).detach()
-        record_loss_samples(
-            'shell_patch_radius', shell_spiral_zyxs,
-            shell_patch_radius_residual,
-            display_spiral_zyx=shell_target_spiral_zyxs,
-        )
-    else:
-        shell_patch_radius_loss = torch.zeros([], device=dr_per_winding.device)
-
-    return mean_radius_deviation, umbilicus_loss, patch_dt_loss, shell_patch_radius_loss
+    return mean_radius_deviation, umbilicus_loss, patch_dt_loss
 
 
 

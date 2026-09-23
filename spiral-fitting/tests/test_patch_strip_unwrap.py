@@ -128,7 +128,7 @@ def _run_losses(grid, cfg, num_steps=6, seed=0, device='cpu'):
     dr = torch.tensor(DR, device=device)
     radius_losses, dt_losses = [], []
     for _ in range(num_steps):
-        radius_loss, _umbilicus_loss, dt_loss, _shell_loss = get_patch_and_umbilicus_losses(
+        radius_loss, _umbilicus_loss, dt_loss = get_patch_and_umbilicus_losses(
             IdentityTransform(), dr, 1, 1, [patch], atlas,
             np.array([1.0]), torch.zeros((1, 3), device=device), compute_dt=True,
             crossing_map=crossing_map, cfg=cfg)

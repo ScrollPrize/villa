@@ -163,7 +163,6 @@ _NO_DENSE_LOSSES = {
     "loss_weight_dense_spacing": 0,
     "loss_weight_dense_normals": 0,
     "loss_weight_shell_outer": 0,
-    "loss_weight_shell_patch_radius": 0,
 }
 
 
@@ -1182,7 +1181,6 @@ class DatasetOwnershipTests(unittest.TestCase):
             "loss_weight_dense_spacing": 0,
             "loss_weight_dense_normals": 0,
             "loss_weight_shell_outer": 0,
-            "loss_weight_shell_patch_radius": 0,
             "loss_weight_patch_radius": 7.5,
         }
         request = {
@@ -1251,7 +1249,6 @@ class DatasetOwnershipTests(unittest.TestCase):
                     "loss_weight_dense_spacing": 0,
                     "loss_weight_dense_normals": 0,
                     "loss_weight_shell_outer": 0,
-                    "loss_weight_shell_patch_radius": 0,
                 },
             },
         }

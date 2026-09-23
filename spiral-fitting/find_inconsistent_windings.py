@@ -188,12 +188,11 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
     # (disable_patches, e.g. the 2026-07-17 normals-only baseline) must not
     # stop the loaders from reading the patches it wants to analyse.
     cfg['input_disable_patches'] = False
-    # We compute no shell losses; zero their weights so the context's
+    # We compute no shell losses; zero the weight so the context's
     # shell_losses_enabled() gate stops load_host_inputs() from loading the
     # shell (replacing the old fs.shell_losses_enabled = lambda: False
-    # override). Nothing else in the host-loading path reads these weights.
+    # override). Nothing else in the host-loading path reads this weight.
     cfg['loss_weight_shell_outer'] = 0.0
-    cfg['loss_weight_shell_patch_radius'] = 0.0
     # The filtering z-range is the optimisation window this analysis uses.
     cfg['z_begin'] = int(filter_z_begin)
     cfg['z_end'] = int(filter_z_end)
