@@ -532,10 +532,12 @@ void OpenDataCatalogWindow::buildUi()
         tr("Download the volume's full normal-grid store into the remote cache. "
            "Not required: normal grids stream on demand as they are used."));
     _copyVolumeUrlButton = new QPushButton(tr("Copy URL"), volumesPage);
+    _attachVolumeButton = new QPushButton(tr("Attach to Current Project..."), volumesPage);
     _openVolumeUrlButton = new QPushButton(tr("Open URL"), volumesPage);
     volumeActions->addStretch(1);
     volumeActions->addWidget(_downloadNormalGridsButton);
     volumeActions->addWidget(_copyVolumeUrlButton);
+    volumeActions->addWidget(_attachVolumeButton);
     volumeActions->addWidget(_openVolumeUrlButton);
     volumesLayout->addWidget(_volumesTable, 1);
     volumesLayout->addLayout(volumeActions);
@@ -665,6 +667,10 @@ void OpenDataCatalogWindow::buildUi()
     connect(_segmentsTable->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &OpenDataCatalogWindow::updateActionButtons);
     connect(_copyVolumeUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::copySelectedVolumeUrl);
+    connect(_attachVolumeButton, &QPushButton::clicked, this, [this]() {
+        const QString url = selectedVolumeUrl();
+        if (!url.isEmpty()) emit attachVolumeRequested(url);
+    });
     connect(_openVolumeUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedVolumeUrl);
     connect(_copyRepresentationUrlButton,
             &QPushButton::clicked,
@@ -1327,6 +1333,9 @@ void OpenDataCatalogWindow::updateActionButtons()
     }
     if (_copyVolumeUrlButton) {
         _copyVolumeUrlButton->setEnabled(hasVolumeUrl);
+    }
+    if (_attachVolumeButton) {
+        _attachVolumeButton->setEnabled(manifestReady && hasVolumeUrl);
     }
     if (_openVolumeUrlButton) {
         _openVolumeUrlButton->setEnabled(hasVolumeUrl);

@@ -455,6 +455,12 @@ void MenuActionController::updateRecentRemoteList(const QString& url)
 
 void MenuActionController::attachRemoteZarr()
 {
+    const QStringList recentUrls = loadRecentRemoteUrls();
+    showAttachRemoteZarrDialog(recentUrls.isEmpty() ? QString() : recentUrls.first());
+}
+
+void MenuActionController::showAttachRemoteZarrDialog(const QString& initialUrl)
+{
     if (!_window) return;
 
     if (!_window->_state || !_window->_state->vpkg()) {
@@ -464,16 +470,13 @@ void MenuActionController::attachRemoteZarr()
         return;
     }
 
-    QStringList recentUrls = loadRecentRemoteUrls();
-    QString lastUrl = recentUrls.isEmpty() ? QString() : recentUrls.first();
-
     bool ok = false;
     QString url = QInputDialog::getText(
         _window,
         QObject::tr("Attach Remote Zarr"),
         QObject::tr("Enter remote OME-Zarr URL (http://, https://, s3://):"),
         QLineEdit::Normal,
-        lastUrl,
+        initialUrl,
         &ok);
 
     if (!ok || url.trimmed().isEmpty()) {
@@ -499,6 +502,8 @@ void MenuActionController::showOpenDataCatalog()
 
     auto* dialog = new vc3d::opendata::OpenDataCatalogWindow(_window);
     _openDataCatalogDialog = dialog;
+    connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachVolumeRequested,
+            this, &MenuActionController::showAttachRemoteZarrDialog);
     dialog->setOpenSampleHandler([this](const vc3d::opendata::OpenDataSample& sample) {
         return openOpenDataSample(sample);
     });

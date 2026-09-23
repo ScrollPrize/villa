@@ -142,6 +142,7 @@ private:
     QStringList loadRecentRemoteUrls() const;
     void saveRecentRemoteUrls(const QStringList& urls);
     void updateRecentRemoteList(const QString& url);
+    void showAttachRemoteZarrDialog(const QString& initialUrl);
     void attachRemoteZarrUrl(const QString& url);
     void beginLasagnaManifestAttachment(bool remote);
     struct LasagnaAttachTaskResult;
