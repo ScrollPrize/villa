@@ -1,0 +1,1131 @@
+{
+  "results": [
+    {
+      "crop": 2048,
+      "trace_path": "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/beam-crop-new2048-coverage40x80-angle45-reverse-v2.obj",
+      "trace_count": 2778,
+      "normal_radius": 40,
+      "references": [
+        {
+          "winding": 0,
+          "reference_length": 2829.3859084613555,
+          "candidates_evaluated": 40,
+          "best": [
+            {
+              "trace": 47,
+              "mean_ellipse": 1.2206301349121025,
+              "mean_distance": 76.82292475214643,
+              "median_distance": 78.43036254476745,
+              "reference_inside_length": 568.1915421749425,
+              "reference_coverage_percent": 20.081797271830265,
+              "trace_length": 2764.9060379668636,
+              "trace_inside_length": 538.1030579181152,
+              "trace_inside_percent": 19.46189311785083,
+              "trace_mean_distance": 76.1517760401951
+            },
+            {
+              "trace": 95,
+              "mean_ellipse": 1.487390008011865,
+              "mean_distance": 87.63408541381172,
+              "median_distance": 91.99879313931228,
+              "reference_inside_length": 634.7039642582201,
+              "reference_coverage_percent": 22.43256963852547,
+              "trace_length": 2843.8768041479343,
+              "trace_inside_length": 591.0914008313154,
+              "trace_inside_percent": 20.784704877833647,
+              "trace_mean_distance": 88.40481542746376
+            },
+            {
+              "trace": 122,
+              "mean_ellipse": 1.81742712687564,
+              "mean_distance": 139.07912998867417,
+              "median_distance": 138.94474601433757,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2933.083703293909,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 138.74444048972606
+            }
+          ]
+        },
+        {
+          "winding": 0.5,
+          "reference_length": 2443.6991917414516,
+          "candidates_evaluated": 49,
+          "best": [
+            {
+              "trace": 542,
+              "mean_ellipse": 0.08177053129872702,
+              "mean_distance": 4.872505688348832,
+              "median_distance": 4.549666723229306,
+              "reference_inside_length": 2443.6991917414516,
+              "reference_coverage_percent": 100,
+              "trace_length": 2445.0733725801733,
+              "trace_inside_length": 2445.0733725801733,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 4.874866467630193
+            },
+            {
+              "trace": 1580,
+              "mean_ellipse": 1.5481510513756367,
+              "mean_distance": 115.41589155711905,
+              "median_distance": 118.93795536565472,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2384.7754414815026,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 115.28350262301913
+            },
+            {
+              "trace": 60,
+              "mean_ellipse": 1.8795717191355066,
+              "mean_distance": 110.87377470977601,
+              "median_distance": 94.81876295923337,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2354.7862127228786,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 106.01011841886633
+            }
+          ]
+        },
+        {
+          "winding": 1,
+          "reference_length": 2843.303645326232,
+          "candidates_evaluated": 41,
+          "best": [
+            {
+              "trace": 95,
+              "mean_ellipse": 0.09517653639975428,
+              "mean_distance": 5.913576448176555,
+              "median_distance": 5.189850237932297,
+              "reference_inside_length": 2843.303645326232,
+              "reference_coverage_percent": 100,
+              "trace_length": 2843.8768041479343,
+              "trace_inside_length": 2843.8768041479343,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 5.9099689443722285
+            },
+            {
+              "trace": 1165,
+              "mean_ellipse": 1.4118652587322615,
+              "mean_distance": 81.71594196795691,
+              "median_distance": 82.11347726773936,
+              "reference_inside_length": 116.80903914169657,
+              "reference_coverage_percent": 4.108215432203488,
+              "trace_length": 2888.96963652056,
+              "trace_inside_length": 150.9102258132835,
+              "trace_inside_percent": 5.22366950159566,
+              "trace_mean_distance": 83.25178163466471
+            },
+            {
+              "trace": 47,
+              "mean_ellipse": 1.8660536973410407,
+              "mean_distance": 143.22850681451928,
+              "median_distance": 145.79633738916704,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2764.9060379668636,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 143.54481879824667
+            }
+          ]
+        },
+        {
+          "winding": 1.5,
+          "reference_length": 2377.910957521536,
+          "candidates_evaluated": 53,
+          "best": [
+            {
+              "trace": 60,
+              "mean_ellipse": 0.10835488134660867,
+              "mean_distance": 5.8835039072863164,
+              "median_distance": 5.709780354653577,
+              "reference_inside_length": 2377.910957521536,
+              "reference_coverage_percent": 100,
+              "trace_length": 2354.7862127228786,
+              "trace_inside_length": 2354.7862127228786,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 5.801603047907506
+            },
+            {
+              "trace": 542,
+              "mean_ellipse": 1.7507811562962234,
+              "mean_distance": 102.19770087875419,
+              "median_distance": 88.71982357575209,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2445.0733725801733,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 106.64236245151322
+            },
+            {
+              "trace": 279,
+              "mean_ellipse": 1.941597251016092,
+              "mean_distance": 147.21886708100325,
+              "median_distance": 177.87440569155075,
+              "reference_inside_length": 417.9990534640463,
+              "reference_coverage_percent": 17.578414874698293,
+              "trace_length": 2417.0532771354265,
+              "trace_inside_length": 382.81749514121884,
+              "trace_inside_percent": 15.838190194752986,
+              "trace_mean_distance": 150.52311461283
+            }
+          ]
+        },
+        {
+          "winding": 2,
+          "reference_length": 2644.2507659012026,
+          "candidates_evaluated": 38,
+          "best": [
+            {
+              "trace": 24,
+              "mean_ellipse": 0.14135294870827403,
+              "mean_distance": 9.375645757409737,
+              "median_distance": 9.447454809010935,
+              "reference_inside_length": 2644.2507659012026,
+              "reference_coverage_percent": 100,
+              "trace_length": 2656.230743937296,
+              "trace_inside_length": 2656.230743937296,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 9.42332737957251
+            },
+            {
+              "trace": 1438,
+              "mean_ellipse": 1.4582230055514205,
+              "mean_distance": 95.6953703303662,
+              "median_distance": 94.52633958556441,
+              "reference_inside_length": 794.0374861219013,
+              "reference_coverage_percent": 30.028826931294496,
+              "trace_length": 2619.107250781478,
+              "trace_inside_length": 802.416377899488,
+              "trace_inside_percent": 30.637018688717937,
+              "trace_mean_distance": 96.10387264808172
+            },
+            {
+              "trace": 47,
+              "mean_ellipse": 1.8020241994223192,
+              "mean_distance": 76.4338018948034,
+              "median_distance": 75.42807505944164,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2764.9060379668636,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 80.74531792390952
+            }
+          ]
+        },
+        {
+          "winding": 2.5,
+          "reference_length": 2356.3762946563984,
+          "candidates_evaluated": 31,
+          "best": [
+            {
+              "trace": 71,
+              "mean_ellipse": 0.06315265154690479,
+              "mean_distance": 3.4371963789810156,
+              "median_distance": 3.130649635891075,
+              "reference_inside_length": 2356.3762946563984,
+              "reference_coverage_percent": 100,
+              "trace_length": 2351.8512457404095,
+              "trace_inside_length": 2351.8512457404095,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 3.435830809697236
+            },
+            {
+              "trace": 2715,
+              "mean_ellipse": 1.2276590839669472,
+              "mean_distance": 69.36763204503171,
+              "median_distance": 67.56964498561408,
+              "reference_inside_length": 478.0392394135746,
+              "reference_coverage_percent": 20.287050098816295,
+              "trace_length": 2357.1622167923533,
+              "trace_inside_length": 417.00475146613667,
+              "trace_inside_percent": 17.6909653690954,
+              "trace_mean_distance": 69.15814212539499
+            },
+            {
+              "trace": 51,
+              "mean_ellipse": 1.2346787322489097,
+              "mean_distance": 71.20029799731365,
+              "median_distance": 68.7051413646412,
+              "reference_inside_length": 405.22322162902867,
+              "reference_coverage_percent": 17.196880759153853,
+              "trace_length": 2350.106768119352,
+              "trace_inside_length": 378.4779603055513,
+              "trace_inside_percent": 16.104713430038082,
+              "trace_mean_distance": 71.05400739397074
+            }
+          ]
+        },
+        {
+          "winding": 3,
+          "reference_length": 2651.5127316979047,
+          "candidates_evaluated": 41,
+          "best": [
+            {
+              "trace": 1438,
+              "mean_ellipse": 0.21692222604356326,
+              "mean_distance": 15.776233282032138,
+              "median_distance": 10.719848569594859,
+              "reference_inside_length": 2622.9811720105617,
+              "reference_coverage_percent": 98.92395162405754,
+              "trace_length": 2619.107250781478,
+              "trace_inside_length": 2619.107250781478,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 14.940065483542266
+            },
+            {
+              "trace": 24,
+              "mean_ellipse": 1.6414181417347669,
+              "mean_distance": 109.6835616962589,
+              "median_distance": 105.59282131783613,
+              "reference_inside_length": 269.95073247793977,
+              "reference_coverage_percent": 10.181008344812886,
+              "trace_length": 2656.230743937296,
+              "trace_inside_length": 301.6016668295831,
+              "trace_inside_percent": 11.354498005038632,
+              "trace_mean_distance": 108.29705647545022
+            },
+            {
+              "trace": 1165,
+              "mean_ellipse": 2.3057176588200368,
+              "mean_distance": 161.31439733587607,
+              "median_distance": 134.93766324307643,
+              "reference_inside_length": 54.178977835858824,
+              "reference_coverage_percent": 2.0433233145806975,
+              "trace_length": 2888.96963652056,
+              "trace_inside_length": 35.98212576622998,
+              "trace_inside_percent": 1.245500309569415,
+              "trace_mean_distance": 167.51514461921175
+            }
+          ]
+        },
+        {
+          "winding": 3.5,
+          "reference_length": 2368.052851169664,
+          "candidates_evaluated": 31,
+          "best": [
+            {
+              "trace": 51,
+              "mean_ellipse": 0.09447927950013858,
+              "mean_distance": 5.583928662047189,
+              "median_distance": 4.56692915656331,
+              "reference_inside_length": 2368.052851169664,
+              "reference_coverage_percent": 100,
+              "trace_length": 2350.106768119352,
+              "trace_inside_length": 2350.106768119352,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 5.552324107526264
+            },
+            {
+              "trace": 2715,
+              "mean_ellipse": 0.13771624031156804,
+              "mean_distance": 9.257990260184815,
+              "median_distance": 4.7149610500821435,
+              "reference_inside_length": 2368.052851169664,
+              "reference_coverage_percent": 100,
+              "trace_length": 2357.1622167923533,
+              "trace_inside_length": 2357.1622167923533,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 9.281869803924431
+            },
+            {
+              "trace": 813,
+              "mean_ellipse": 1.1809978314226464,
+              "mean_distance": 83.23461932836179,
+              "median_distance": 85.90330131632128,
+              "reference_inside_length": 317.21089285910637,
+              "reference_coverage_percent": 13.395431301392822,
+              "trace_length": 2342.78453033244,
+              "trace_inside_length": 311.95746587627497,
+              "trace_inside_percent": 13.31567038442107,
+              "trace_mean_distance": 83.07686830840464
+            }
+          ]
+        },
+        {
+          "winding": 4,
+          "reference_length": 3048.941649532775,
+          "candidates_evaluated": 28,
+          "best": [
+            {
+              "trace": 33,
+              "mean_ellipse": 0.0901959951299524,
+              "mean_distance": 5.43032388405542,
+              "median_distance": 5.102765376011657,
+              "reference_inside_length": 3048.941649532775,
+              "reference_coverage_percent": 100,
+              "trace_length": 3047.4288439641978,
+              "trace_inside_length": 3047.4288439641978,
+              "trace_inside_percent": 100.00000000000001,
+              "trace_mean_distance": 5.4304491288744945
+            },
+            {
+              "trace": 2633,
+              "mean_ellipse": 0.45793173387171515,
+              "mean_distance": 32.096104782898635,
+              "median_distance": 5.453898951596165,
+              "reference_inside_length": 2718.9862165362592,
+              "reference_coverage_percent": 89.17803385817243,
+              "trace_length": 2650.3015433042974,
+              "trace_inside_length": 2650.3015433042974,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 5.962138572134461
+            },
+            {
+              "trace": 186,
+              "mean_ellipse": 2.1010634395965733,
+              "mean_distance": 145.96878947587982,
+              "median_distance": 137.2368103126868,
+              "reference_inside_length": 53.18322038953052,
+              "reference_coverage_percent": 1.7443174223317919,
+              "trace_length": 3048.760846564797,
+              "trace_inside_length": 65.58559583869797,
+              "trace_inside_percent": 2.151221402380472,
+              "trace_mean_distance": 148.64914194057857
+            }
+          ]
+        },
+        {
+          "winding": 4.5,
+          "reference_length": 2292.4123285425285,
+          "candidates_evaluated": 31,
+          "best": [
+            {
+              "trace": 416,
+              "mean_ellipse": 0.19044711183223867,
+              "mean_distance": 12.614370856659761,
+              "median_distance": 11.86356453816241,
+              "reference_inside_length": 2292.4123285425285,
+              "reference_coverage_percent": 100,
+              "trace_length": 2297.6580769592047,
+              "trace_inside_length": 2297.6580769592047,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 12.598558609876573
+            },
+            {
+              "trace": 2205,
+              "mean_ellipse": 1.1915397241559016,
+              "mean_distance": 90.38041635868808,
+              "median_distance": 83.5508380807754,
+              "reference_inside_length": 290.7476500669931,
+              "reference_coverage_percent": 12.683043379540925,
+              "trace_length": 2327.9323536303555,
+              "trace_inside_length": 289.02291876528454,
+              "trace_inside_percent": 12.415434594332613,
+              "trace_mean_distance": 90.91813892020697
+            },
+            {
+              "trace": 454,
+              "mean_ellipse": 1.3087659219714036,
+              "mean_distance": 73.80725067936378,
+              "median_distance": 77.01846727277812,
+              "reference_inside_length": 50.45453663817605,
+              "reference_coverage_percent": 2.200936367771764,
+              "trace_length": 2321.666966650797,
+              "trace_inside_length": 71.61863910316104,
+              "trace_inside_percent": 3.084793819781872,
+              "trace_mean_distance": 73.66249183891088
+            }
+          ]
+        },
+        {
+          "winding": 5,
+          "reference_length": 2857.701489566133,
+          "candidates_evaluated": 19,
+          "best": [
+            {
+              "trace": 17,
+              "mean_ellipse": 0.4665629616582847,
+              "mean_distance": 33.15129286834238,
+              "median_distance": 10.593042770710106,
+              "reference_inside_length": 2570.869066685803,
+              "reference_coverage_percent": 89.9628276806519,
+              "trace_length": 2482.7023203232357,
+              "trace_inside_length": 2482.7023203232357,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 11.5212486616213
+            },
+            {
+              "trace": 161,
+              "mean_ellipse": 0.887529496489294,
+              "mean_distance": 44.75883713143197,
+              "median_distance": 42.36268489378393,
+              "reference_inside_length": 1863.8205559717048,
+              "reference_coverage_percent": 65.22096736754254,
+              "trace_length": 2903.183919780393,
+              "trace_inside_length": 1862.9921406592657,
+              "trace_inside_percent": 64.17065511992051,
+              "trace_mean_distance": 48.65998554295719
+            },
+            {
+              "trace": 1565,
+              "mean_ellipse": 1.1111950856763264,
+              "mean_distance": 70.06155983592708,
+              "median_distance": 72.24185778461121,
+              "reference_inside_length": 1009.435105303598,
+              "reference_coverage_percent": 35.323322222044055,
+              "trace_length": 2708.045512295488,
+              "trace_inside_length": 996.7312193700775,
+              "trace_inside_percent": 36.80629497711777,
+              "trace_mean_distance": 67.90064292956949
+            }
+          ]
+        },
+        {
+          "winding": 5.5,
+          "reference_length": 2376.949626599345,
+          "candidates_evaluated": 41,
+          "best": [
+            {
+              "trace": 41,
+              "mean_ellipse": 1.2040273231725827,
+              "mean_distance": 84.30580176942755,
+              "median_distance": 86.58831165202135,
+              "reference_inside_length": 308.1740632795893,
+              "reference_coverage_percent": 12.965107035965582,
+              "trace_length": 2433.4596402759967,
+              "trace_inside_length": 366.84260341116544,
+              "trace_inside_percent": 15.0749409334588,
+              "trace_mean_distance": 84.09590649245447
+            },
+            {
+              "trace": 813,
+              "mean_ellipse": 1.4465638328093315,
+              "mean_distance": 112.5667171633168,
+              "median_distance": 113.9996803640647,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2342.78453033244,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 112.98951927730104
+            },
+            {
+              "trace": 458,
+              "mean_ellipse": 1.9986541733060414,
+              "mean_distance": 157.85946988121626,
+              "median_distance": 46.56968199915489,
+              "reference_inside_length": 1649.0123099271445,
+              "reference_coverage_percent": 69.37514751990577,
+              "trace_length": 1564.379282694701,
+              "trace_inside_length": 1564.379282694701,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 39.92729657734991
+            }
+          ]
+        },
+        {
+          "winding": 6,
+          "reference_length": 2174.4508902226326,
+          "candidates_evaluated": 29,
+          "best": [
+            {
+              "trace": 436,
+              "mean_ellipse": 0.14693858862647352,
+              "mean_distance": 9.415301401869328,
+              "median_distance": 9.571982119474233,
+              "reference_inside_length": 2174.4508902226326,
+              "reference_coverage_percent": 100,
+              "trace_length": 2165.9123088885663,
+              "trace_inside_length": 2165.9123088885663,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 9.266083673528549
+            },
+            {
+              "trace": 1236,
+              "mean_ellipse": 1.217701596245795,
+              "mean_distance": 67.42526090674862,
+              "median_distance": 66.38354110032252,
+              "reference_inside_length": 472.3374184427755,
+              "reference_coverage_percent": 21.722146982791365,
+              "trace_length": 2188.7015156738403,
+              "trace_inside_length": 454.3634108731036,
+              "trace_inside_percent": 20.759496332382156,
+              "trace_mean_distance": 67.91875718585968
+            },
+            {
+              "trace": 1093,
+              "mean_ellipse": 1.6517433923603504,
+              "mean_distance": 71.10453013935214,
+              "median_distance": 70.59835510831579,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2097.5931900857795,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 71.23594959172519
+            }
+          ]
+        },
+        {
+          "winding": 6.5,
+          "reference_length": 2437.2832351327074,
+          "candidates_evaluated": 44,
+          "best": [
+            {
+              "trace": 41,
+              "mean_ellipse": 0.07585036838598855,
+              "mean_distance": 3.861123154641092,
+              "median_distance": 3.8376116069183297,
+              "reference_inside_length": 2437.2832351327074,
+              "reference_coverage_percent": 100,
+              "trace_length": 2433.4596402759967,
+              "trace_inside_length": 2433.4596402759967,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 3.852556467661771
+            },
+            {
+              "trace": 203,
+              "mean_ellipse": 1.8026116678177426,
+              "mean_distance": 97.88541243553577,
+              "median_distance": 97.99933973201682,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2373.6048637111303,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 95.96639625008861
+            },
+            {
+              "trace": 78,
+              "mean_ellipse": 2.2044850441256294,
+              "mean_distance": 112.60670808399689,
+              "median_distance": 109.59151301537854,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2477.1479048745514,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 112.71655786524772
+            }
+          ]
+        },
+        {
+          "winding": 7,
+          "reference_length": 2237.6425401670103,
+          "candidates_evaluated": 27,
+          "best": [
+            {
+              "trace": 179,
+              "mean_ellipse": 0.10968757247038079,
+              "mean_distance": 7.603439169200946,
+              "median_distance": 6.976280110757673,
+              "reference_inside_length": 2237.6425401670103,
+              "reference_coverage_percent": 100,
+              "trace_length": 2233.47383821547,
+              "trace_inside_length": 2233.47383821547,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 7.590351237880757
+            },
+            {
+              "trace": 1845,
+              "mean_ellipse": 1.8580227095462714,
+              "mean_distance": 115.39708397025844,
+              "median_distance": 116.47471966055399,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2290.460017692325,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 115.96844307645686
+            },
+            {
+              "trace": 304,
+              "mean_ellipse": 1.8598370040987162,
+              "mean_distance": 115.5368706919157,
+              "median_distance": 117.14674889052642,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2295.3909723299184,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 115.93935938236054
+            }
+          ]
+        },
+        {
+          "winding": 7.5,
+          "reference_length": 2429.9073126374024,
+          "candidates_evaluated": 20,
+          "best": [
+            {
+              "trace": 203,
+              "mean_ellipse": 0.9160211490321671,
+              "mean_distance": 44.81249174057365,
+              "median_distance": 44.55475495312806,
+              "reference_inside_length": 1521.0931264476555,
+              "reference_coverage_percent": 62.59881265992295,
+              "trace_length": 2373.6048637111303,
+              "trace_inside_length": 1539.6769838382038,
+              "trace_inside_percent": 64.86660890266796,
+              "trace_mean_distance": 43.7460178940557
+            },
+            {
+              "trace": 41,
+              "mean_ellipse": 1.2863013097222324,
+              "mean_distance": 85.04083636516906,
+              "median_distance": 84.48597223596093,
+              "reference_inside_length": 439.54604140492677,
+              "reference_coverage_percent": 18.08900442905565,
+              "trace_length": 2433.4596402759967,
+              "trace_inside_length": 423.6202897340556,
+              "trace_inside_percent": 17.40814939860723,
+              "trace_mean_distance": 84.07723370005304
+            },
+            {
+              "trace": 1337,
+              "mean_ellipse": 1.298660187943451,
+              "mean_distance": 88.4401912685208,
+              "median_distance": 77.82543054417484,
+              "reference_inside_length": 370.3068115914726,
+              "reference_coverage_percent": 15.2395447211336,
+              "trace_length": 2355.1546543675877,
+              "trace_inside_length": 380.32669840296546,
+              "trace_inside_percent": 16.148693152598586,
+              "trace_mean_distance": 85.29389737948293
+            }
+          ]
+        },
+        {
+          "winding": 8,
+          "reference_length": 2201.751857246139,
+          "candidates_evaluated": 22,
+          "best": [
+            {
+              "trace": 182,
+              "mean_ellipse": 1.0794207095140707,
+              "mean_distance": 64.50697520934577,
+              "median_distance": 63.94895239927779,
+              "reference_inside_length": 866.0215925739996,
+              "reference_coverage_percent": 39.33329678927505,
+              "trace_length": 2184.1317121322154,
+              "trace_inside_length": 896.8649521335053,
+              "trace_inside_percent": 41.06276865775455,
+              "trace_mean_distance": 64.54653059074465
+            },
+            {
+              "trace": 225,
+              "mean_ellipse": 1.2528730356958673,
+              "mean_distance": 92.61781736508908,
+              "median_distance": 88.3296326998214,
+              "reference_inside_length": 949.3847127189936,
+              "reference_coverage_percent": 43.11951456266489,
+              "trace_length": 2211.793568130809,
+              "trace_inside_length": 938.0786111972461,
+              "trace_inside_percent": 42.41257523820445,
+              "trace_mean_distance": 94.27968042301137
+            },
+            {
+              "trace": 1236,
+              "mean_ellipse": 1.6707788210439796,
+              "mean_distance": 131.5126123185598,
+              "median_distance": 133.55728025182418,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2188.7015156738403,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 131.7865183747897
+            }
+          ]
+        },
+        {
+          "winding": 8.5,
+          "reference_length": 2299.1948153637004,
+          "candidates_evaluated": 30,
+          "best": [
+            {
+              "trace": 94,
+              "mean_ellipse": 0.08670413333328691,
+              "mean_distance": 5.35268381837152,
+              "median_distance": 5.128741184387865,
+              "reference_inside_length": 2299.1948153637004,
+              "reference_coverage_percent": 100,
+              "trace_length": 2294.48618607055,
+              "trace_inside_length": 2294.48618607055,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 5.353114258704317
+            },
+            {
+              "trace": 1535,
+              "mean_ellipse": 1.366258984281625,
+              "mean_distance": 69.85493346513475,
+              "median_distance": 71.89003575600687,
+              "reference_inside_length": 186.47972699140954,
+              "reference_coverage_percent": 8.110653596872828,
+              "trace_length": 2308.651676642943,
+              "trace_inside_length": 212.4349993955898,
+              "trace_inside_percent": 9.201691253160192,
+              "trace_mean_distance": 69.83329821620885
+            },
+            {
+              "trace": 502,
+              "mean_ellipse": 1.368524895186262,
+              "mean_distance": 88.54653791519596,
+              "median_distance": 96.73928708577262,
+              "reference_inside_length": 9.5767179208175,
+              "reference_coverage_percent": 0.416524857172775,
+              "trace_length": 2295.745069193526,
+              "trace_inside_length": 14.000070363477995,
+              "trace_inside_percent": 0.6098268728241717,
+              "trace_mean_distance": 89.04290418092168
+            }
+          ]
+        },
+        {
+          "winding": 9,
+          "reference_length": 2175.4805031173605,
+          "candidates_evaluated": 31,
+          "best": [
+            {
+              "trace": 970,
+              "mean_ellipse": 0.3568255276297521,
+              "mean_distance": 26.804544597530697,
+              "median_distance": 8.941131964775366,
+              "reference_inside_length": 1962.973706118783,
+              "reference_coverage_percent": 90.23173056738199,
+              "trace_length": 1883.6372138334577,
+              "trace_inside_length": 1883.6372138334577,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 8.33715889819001
+            },
+            {
+              "trace": 517,
+              "mean_ellipse": 0.9173428400273841,
+              "mean_distance": 55.93813511478388,
+              "median_distance": 57.01091904530024,
+              "reference_inside_length": 1286.5297441556277,
+              "reference_coverage_percent": 59.13772807028569,
+              "trace_length": 2206.1546140751634,
+              "trace_inside_length": 1282.08525645808,
+              "trace_inside_percent": 58.11402556640572,
+              "trace_mean_distance": 56.16246898849534
+            },
+            {
+              "trace": 466,
+              "mean_ellipse": 1.787899588793351,
+              "mean_distance": 131.3359421997218,
+              "median_distance": 126.39605032397148,
+              "reference_inside_length": 74.91510763115659,
+              "reference_coverage_percent": 3.443611998535808,
+              "trace_length": 1807.0749611982058,
+              "trace_inside_length": 75.85037699020594,
+              "trace_inside_percent": 4.1974117631463566,
+              "trace_mean_distance": 113.09232932016677
+            }
+          ]
+        },
+        {
+          "winding": 9.5,
+          "reference_length": 2310.51609902401,
+          "candidates_evaluated": 24,
+          "best": [
+            {
+              "trace": 502,
+              "mean_ellipse": 0.10777185368847454,
+              "mean_distance": 6.140716019908566,
+              "median_distance": 5.93525213635432,
+              "reference_inside_length": 2310.51609902401,
+              "reference_coverage_percent": 100,
+              "trace_length": 2295.745069193526,
+              "trace_inside_length": 2295.745069193526,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 6.117448121938423
+            },
+            {
+              "trace": 144,
+              "mean_ellipse": 1.1126408953605025,
+              "mean_distance": 68.70405919974097,
+              "median_distance": 66.94103808822445,
+              "reference_inside_length": 601.914631268266,
+              "reference_coverage_percent": 26.05109012322061,
+              "trace_length": 2286.275917950369,
+              "trace_inside_length": 660.6121768220862,
+              "trace_inside_percent": 28.894682904866553,
+              "trace_mean_distance": 68.58231525265053
+            },
+            {
+              "trace": 94,
+              "mean_ellipse": 1.1988532864086852,
+              "mean_distance": 81.37389543261169,
+              "median_distance": 84.8842925693554,
+              "reference_inside_length": 363.55308963394936,
+              "reference_coverage_percent": 15.734713546792362,
+              "trace_length": 2294.48618607055,
+              "trace_inside_length": 389.71142015090686,
+              "trace_inside_percent": 16.984692368896404,
+              "trace_mean_distance": 80.74344894514627
+            }
+          ]
+        },
+        {
+          "winding": 10,
+          "reference_length": 2422.9765875236735,
+          "candidates_evaluated": 32,
+          "best": [
+            {
+              "trace": 319,
+              "mean_ellipse": 0.13884130603321246,
+              "mean_distance": 9.249381346178952,
+              "median_distance": 7.257578141372952,
+              "reference_inside_length": 2422.9765875236735,
+              "reference_coverage_percent": 100,
+              "trace_length": 2430.224851979084,
+              "trace_inside_length": 2430.224851979084,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 9.292343563028819
+            },
+            {
+              "trace": 1136,
+              "mean_ellipse": 1.5305321565846635,
+              "mean_distance": 101.5624973405334,
+              "median_distance": 82.07204452363591,
+              "reference_inside_length": 137.4515894388432,
+              "reference_coverage_percent": 5.672840181230197,
+              "trace_length": 2552.397691509066,
+              "trace_inside_length": 104.80394007347586,
+              "trace_inside_percent": 4.106097589028618,
+              "trace_mean_distance": 105.49687282268627
+            },
+            {
+              "trace": 25,
+              "mean_ellipse": 2.31178835017125,
+              "mean_distance": 112.94608954065983,
+              "median_distance": 102.86665535206168,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2220.4865967482674,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 101.268460906847
+            }
+          ]
+        },
+        {
+          "winding": 10.5,
+          "reference_length": 2335.5394651348697,
+          "candidates_evaluated": 33,
+          "best": [
+            {
+              "trace": 50,
+              "mean_ellipse": 0.07694849225550748,
+              "mean_distance": 4.196291591961975,
+              "median_distance": 3.6215669484062376,
+              "reference_inside_length": 2335.5394651348697,
+              "reference_coverage_percent": 100,
+              "trace_length": 2330.5465948738274,
+              "trace_inside_length": 2330.5465948738274,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 4.192833294814072
+            },
+            {
+              "trace": 49,
+              "mean_ellipse": 1.4478056703624718,
+              "mean_distance": 101.77427101420271,
+              "median_distance": 102.55734311013454,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2327.7972787740123,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 101.7639355088668
+            },
+            {
+              "trace": 950,
+              "mean_ellipse": 1.6020168657845477,
+              "mean_distance": 103.73705585595236,
+              "median_distance": 97.55043287834188,
+              "reference_inside_length": 121.86146854718746,
+              "reference_coverage_percent": 5.217701107874465,
+              "trace_length": 2353.541871564546,
+              "trace_inside_length": 126.34761409964312,
+              "trace_inside_percent": 5.3684030705454155,
+              "trace_mean_distance": 102.88352299509005
+            }
+          ]
+        },
+        {
+          "winding": 11,
+          "reference_length": 2223.2150402685384,
+          "candidates_evaluated": 34,
+          "best": [
+            {
+              "trace": 25,
+              "mean_ellipse": 0.09186188235478521,
+              "mean_distance": 6.472865417303625,
+              "median_distance": 6.125038586101444,
+              "reference_inside_length": 2223.2150402685384,
+              "reference_coverage_percent": 100,
+              "trace_length": 2220.4865967482674,
+              "trace_inside_length": 2220.4865967482674,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 6.4618842356945985
+            },
+            {
+              "trace": 1501,
+              "mean_ellipse": 1.6736131662950944,
+              "mean_distance": 93.53514346988143,
+              "median_distance": 97.23194823622788,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2229.6745355897856,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 94.34647574013675
+            },
+            {
+              "trace": 1562,
+              "mean_ellipse": 2.1603900139967562,
+              "mean_distance": 152.43871323165158,
+              "median_distance": 101.83662769848685,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 1414.6991026782464,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 98.31588863151362
+            }
+          ]
+        },
+        {
+          "winding": 11.5,
+          "reference_length": 2327.6915086635145,
+          "candidates_evaluated": 32,
+          "best": [
+            {
+              "trace": 398,
+              "mean_ellipse": 0.09426857453754436,
+              "mean_distance": 6.230838604449372,
+              "median_distance": 5.248719004215058,
+              "reference_inside_length": 2327.6915086635145,
+              "reference_coverage_percent": 100,
+              "trace_length": 2312.046534914382,
+              "trace_inside_length": 2312.046534914382,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 6.181300380859943
+            },
+            {
+              "trace": 108,
+              "mean_ellipse": 1.4453125929476933,
+              "mean_distance": 93.02994875322615,
+              "median_distance": 97.11778541561468,
+              "reference_inside_length": 172.39589232330766,
+              "reference_coverage_percent": 7.406303270070863,
+              "trace_length": 2298.4676520203348,
+              "trace_inside_length": 195.9856960987218,
+              "trace_inside_percent": 8.526798100745596,
+              "trace_mean_distance": 93.32353569816037
+            },
+            {
+              "trace": 1397,
+              "mean_ellipse": 1.4661977404644582,
+              "mean_distance": 68.1929077075026,
+              "median_distance": 65.17518964539151,
+              "reference_inside_length": 121.65587339419436,
+              "reference_coverage_percent": 5.226460333828568,
+              "trace_length": 2332.280235833947,
+              "trace_inside_length": 115.27640787540724,
+              "trace_inside_percent": 4.942648233443876,
+              "trace_mean_distance": 67.70602079921413
+            }
+          ]
+        },
+        {
+          "winding": 12,
+          "reference_length": 2131.3421407891874,
+          "candidates_evaluated": 30,
+          "best": [
+            {
+              "trace": 364,
+              "mean_ellipse": 0.10643944999913879,
+              "mean_distance": 6.121755956029437,
+              "median_distance": 4.914186975342415,
+              "reference_inside_length": 2131.3421407891874,
+              "reference_coverage_percent": 100,
+              "trace_length": 2136.936209054732,
+              "trace_inside_length": 2136.936209054732,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 6.154905065185941
+            },
+            {
+              "trace": 145,
+              "mean_ellipse": 1.4180615996754822,
+              "mean_distance": 93.5249389354462,
+              "median_distance": 72.58456994572988,
+              "reference_inside_length": 608.2510103917147,
+              "reference_coverage_percent": 28.538403044313345,
+              "trace_length": 2184.23942057997,
+              "trace_inside_length": 629.3792593808982,
+              "trace_inside_percent": 28.81457286462591,
+              "trace_mean_distance": 95.33378834003909
+            },
+            {
+              "trace": 1357,
+              "mean_ellipse": 1.9068007908536635,
+              "mean_distance": 109.34905708939644,
+              "median_distance": 96.01315411823511,
+              "reference_inside_length": 57.60807886846697,
+              "reference_coverage_percent": 2.7029015082081567,
+              "trace_length": 2195.3560109897335,
+              "trace_inside_length": 40.81968999861341,
+              "trace_inside_percent": 1.859365396513099,
+              "trace_mean_distance": 110.54764986945247
+            }
+          ]
+        },
+        {
+          "winding": 12.5,
+          "reference_length": 2304.882384215638,
+          "candidates_evaluated": 25,
+          "best": [
+            {
+              "trace": 108,
+              "mean_ellipse": 0.07672978654066809,
+              "mean_distance": 4.3297434769397185,
+              "median_distance": 3.6292459300711504,
+              "reference_inside_length": 2304.882384215638,
+              "reference_coverage_percent": 100,
+              "trace_length": 2298.4676520203348,
+              "trace_inside_length": 2298.4676520203348,
+              "trace_inside_percent": 100,
+              "trace_mean_distance": 4.299855042387991
+            },
+            {
+              "trace": 398,
+              "mean_ellipse": 1.3356726166764867,
+              "mean_distance": 86.69835969308446,
+              "median_distance": 91.84968309126793,
+              "reference_inside_length": 268.8231960047185,
+              "reference_coverage_percent": 11.663206671441515,
+              "trace_length": 2312.046534914382,
+              "trace_inside_length": 282.0327635183769,
+              "trace_inside_percent": 12.198403417032475,
+              "trace_mean_distance": 86.2003637202134
+            },
+            {
+              "trace": 1397,
+              "mean_ellipse": 1.4636507032139712,
+              "mean_distance": 110.82710223981395,
+              "median_distance": 111.18682614621066,
+              "reference_inside_length": 0,
+              "reference_coverage_percent": 0,
+              "trace_length": 2332.280235833947,
+              "trace_inside_length": 0,
+              "trace_inside_percent": 0,
+              "trace_mean_distance": 110.80739987125222
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "wall_seconds": 17.50389653700404
+}

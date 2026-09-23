@@ -285,6 +285,40 @@ inline std::vector<size_t> vc3dControlPointLineIndices(const Vc3dFiberJson& fibe
     return indices;
 }
 
+// Collection coordinates must already be absolute native L0 voxels. Metadata
+// about an earlier conversion is provenance, never an additional transform.
+inline std::vector<Vc3dFiberJson> parseNativeVc3dFiberCollection(
+    const nlohmann::json& root, const std::string& context)
+{
+    if (root.value("type", std::string{}) != "vc3d_fiber_collection" ||
+        root.value("version", 0) != 1 || !root.contains("scale") ||
+        root.at("scale").get<double>() != 1.0 ||
+        root.value("vc_open_data_source_coordinate_level", 0) != 0 ||
+        root.value("vc_open_data_source_coordinate_scale_factor", 1.0) != 1.0 ||
+        !root.contains("point_collections") || !root.at("point_collections").is_array())
+        throw std::invalid_argument(context + " requires a scale-1 native L0 VC3D collection");
+    std::vector<Vc3dFiberJson> result;
+    for (const auto& entry : root.at("point_collections")) {
+        if (entry.value("vc_open_data_source_coordinate_level", 0) != 0 ||
+            entry.value("vc_open_data_source_coordinate_scale_factor", 1.0) != 1.0)
+            throw std::invalid_argument(context + " entry is not native L0");
+        auto fiber = parseVc3dFiberJson(entry, context + " entry " + std::to_string(result.size()));
+        if (fiber.linePoints.size() < 2)
+            throw std::invalid_argument(context + " entry has fewer than two points");
+        result.push_back(std::move(fiber));
+    }
+    return result;
+}
+
+inline nlohmann::json readNativeVc3dFiberCollectionJson(const std::filesystem::path& path)
+{
+    std::ifstream input(path);
+    if (!input) throw std::runtime_error("cannot open collection " + path.string());
+    nlohmann::json root;
+    input >> root;
+    return root;
+}
+
 // Canonical selection is shared by replay-set and its reference-prefetch export.
 // Each run retains original line coordinates/arcs; gaps never become edges.
 inline nlohmann::json vc3dEvaluationReferencePlan(const Vc3dFiberJson& fiber,

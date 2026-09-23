@@ -261,6 +261,10 @@ struct FiberTraceJointGridProgress {
     double minimumGain = 1.0;
     double maximumGain = 1.0;
     double elapsedSeconds = 0.0;
+    std::size_t inputFactors = 0;
+    std::size_t retainedFactors = 0;
+    std::size_t inputMeasurements = 0;
+    std::size_t retainedMeasurements = 0;
 };
 
 using FiberTraceJointGridProgressCallback =
@@ -379,6 +383,8 @@ struct FiberTracePreparedWindingEdge {
 };
 
 struct FiberTracePreparedWindingModel {
+    std::size_t inputFactors = 0;
+    std::size_t inputMeasurements = 0;
     std::vector<std::size_t> pieceToNode;
     std::vector<std::vector<std::size_t>> piecesByNode;
     std::vector<FiberTracePreparedWindingEdge> edges;
@@ -394,6 +400,12 @@ struct FiberTracePreparedWindingModel {
     FiberTraceWindingBeliefPropagationConfig config;
     double preparedMeasurementScale = 1.0;
 };
+
+// Expand integer support without letting a normalized constant message favor
+// newly inserted states. Existing relative log evidence is preserved.
+[[nodiscard]] std::vector<double> expandFiberTraceWindingLogMessage(
+    std::span<const double> message, int oldLower, int oldUpper,
+    int newLower, int newUpper, std::size_t orientationCount);
 
 [[nodiscard]] FiberTracePreparedWindingModel prepareFiberTraceWindingModel(
     const FiberTraceConstraintReport& constraints,
@@ -533,6 +545,11 @@ struct FiberTraceWindingBeliefPropagationReport {
 };
 
 struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationReport {
+    // Joint-grid hot-graph counts; full factorDiagnostics remain available.
+    std::size_t inputFactors = 0;
+    std::size_t retainedFactors = 0;
+    std::size_t inputMeasurements = 0;
+    std::size_t retainedMeasurements = 0;
     std::vector<double> classAProbability;
     std::vector<double> mixedProbability;
     std::vector<double> classBProbability;
@@ -1105,7 +1122,49 @@ struct FiberTraceReferenceSourceConstraintGroups {
     const FiberTraceWindingBeliefPropagationConfig& config = {});
 
 [[nodiscard]] FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(
-    std::span<const FiberTraceReferenceWindingObservation> observations, double tolerance = 0.5);
+    std::span<const FiberTraceReferenceWindingObservation> observations, double tolerance = 0.5,
+    bool preserveConfiguredWeights = false);
+
+struct FiberTraceIndependentReferenceCandidate {
+    double winding = 0.0;
+    double rawWinding = 0.0;
+    std::size_t hardViolations = 0;
+    double finiteLoss = 0.0;
+    // A satisfied observation has no hard violation and zero finite loss.
+    std::size_t satisfiedObservations = 0;
+    std::size_t violatedObservations = 0;
+};
+
+struct FiberTraceIndependentReferenceAssignment {
+    std::size_t referenceSource = 0;
+    // Missing sources use size_t(-1); distinct gauges are never pooled.
+    std::size_t integerGauge = static_cast<std::size_t>(-1);
+    bool calibrated = false;
+    std::size_t observations = 0;
+    std::size_t admittedObservations = 0;
+    std::size_t excludedInactive = 0;
+    std::size_t ignoredZeroWeight = 0;
+    double minimumCandidateWinding = 0.0;
+    double maximumCandidateWinding = 0.0;
+    std::size_t evaluatedCandidates = 0;
+    std::size_t bestTies = 0;
+    bool lowerUnboundedBest = false;
+    bool upperUnboundedBest = false;
+    bool lowerUnboundedFeasible = false;
+    bool upperUnboundedFeasible = false;
+    std::vector<FiberTraceIndependentReferenceCandidate> candidates;
+};
+
+// Frozen observations only: exhaustive raw half-grid spanning all energy
+// breakpoints plus two windings on each side. Throws rather than truncating a
+// range exceeding one million candidates. Calibration only changes coordinates.
+// bestTies counts finite-grid ties; unbounded flags describe omitted tails.
+[[nodiscard]] std::vector<FiberTraceIndependentReferenceAssignment>
+rankFiberTraceIndependentReferenceWindings(
+    std::span<const FiberTraceReferenceWindingObservation> observations,
+    const FiberTraceReferenceWindingBenchmark& calibration,
+    std::size_t referenceSources,
+    std::size_t maximumCandidates = 5);
 
 [[nodiscard]] std::vector<FiberTraceReferenceClampedFactorConflict>
 diagnoseFiberTraceReferenceClampedConflicts(

@@ -2,6 +2,7 @@
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/io/PolylineObj.hpp"
 #include "vc/fiber_tracer/FiberletChunkGraph.hpp"
+#include "vc/fiber_tracer/FiberletPipeline.hpp"
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
 #include "vc/fiber_tracer/FiberletCropTraceArtifact.hpp"
 #include "vc/fiber_tracer/FiberletCropVisualization.hpp"
@@ -73,14 +74,51 @@ enum class BpBalanceSelection {
 enum class ReferenceReplayTracer {
     Fiberlet,
     Greedy,
+    Beam,
     Lasagna,
+    Precomputed,
 };
 
+bool isDenseReplay(ReferenceReplayTracer tracer)
+{
+    return tracer == ReferenceReplayTracer::Greedy || tracer == ReferenceReplayTracer::Beam;
+}
+
 constexpr double kDefaultWindingPhase = 0.5;
+
+void validateCollectionNormalSpace(const nlohmann::json& collection,
+    const vc::lasagna::LasagnaDatasetManifest& manifest)
+{
+    const auto provenancePath = manifest.baseDirectory /
+        manifest.raw.at("provenance").get<std::string>();
+    std::ifstream input(provenancePath);
+    if (!input) throw std::invalid_argument("collection import/replay requires readable normal inference provenance");
+    nlohmann::json provenance;
+    input >> provenance;
+    const auto& source = provenance.at("source");
+    const auto space = source.at("sample_id").get<std::string>() + "/" +
+        source.at("volume_id").get<std::string>();
+    if (collection.value("vc_open_data_coordinate_space", std::string{}) != space)
+        throw std::invalid_argument("collection and normal manifest coordinate spaces differ");
+    for (const auto& entry : collection.at("point_collections"))
+        if (entry.value("vc_open_data_coordinate_space", space) != space)
+            throw std::invalid_argument("collection entry and normal coordinate spaces differ");
+}
+
+void validateArtifactQuality(const vc::fiber_tracer::FiberletCropTraceArtifact& artifact,
+    bool filtering)
+{
+    if (filtering && artifact.metadata.processing.contains("preprocessing") &&
+        artifact.metadata.processing.at("preprocessing").value("quality_cost", std::string{}) == "unavailable")
+        throw std::invalid_argument("Imported fibers have no quality score; remove quality filtering");
+}
 constexpr double kDefaultWindingMeasurementScale = 0.822;
 
 struct Options {
     Mode mode = Mode::Trace;
+    bool denseBeamCrop = false;
+    bool importedCrop = false;
+    std::filesystem::path candidateFibers;
     std::filesystem::path input;
     std::string normalManifest;
     std::filesystem::path remoteCacheDirectory;
@@ -110,6 +148,8 @@ struct Options {
     ReferenceReplayTracer referenceReplayTracer =
         ReferenceReplayTracer::Fiberlet;
     std::string fiberManifest;
+    std::filesystem::path fiberletCacheRoot;
+    int fiberletStorageChunkSide = 512;
     int inferenceScaledownPower = 2;
     double lasagnaReplayStepBaseVoxels = 16.0;
     vc::fiber_tracer::FiberTraceConfig directReplayTrace;
@@ -127,6 +167,7 @@ struct Options {
     bool hasReferenceOracleOption = false;
     bool referenceOracleAcceptMessageLimit = false;
     bool referenceConstraintDetails = false;
+    bool referenceIndependent = false;
     std::size_t ablationStep = 5;
     std::optional<std::size_t> ablationLimit;
     std::size_t postIterations = 0;
@@ -146,6 +187,7 @@ struct Options {
     bool windingSignFirst = false;
     std::size_t windingSignFirstSteps = 1;
     std::optional<std::size_t> windingLevelGrowthMaximum;
+    std::size_t windingMaximumCandidateStates = 4'000'000;
     bool hardSplitContinuity = true;
     std::optional<double> hardSignMinimumNormalAlignment =
         0.8660254037844386;
@@ -172,6 +214,9 @@ struct Options {
     bool orderedPruneOffenders = false;
     bool hasBounds = false;
     bool hasTraceOnlyOption = false;
+    bool hasReverseOption = false;
+    bool hasReverseParameters = false;
+    std::optional<bool> reverseChoice;
     bool hasConstraintOnlyOption = false;
     bool hasSolverOnlyOption = false;
     bool hasSharedRuntimeOption = false;
@@ -344,10 +389,15 @@ void usage(const char* executable)
               << "  --reference-oracle-accept-message-limit\n"
               << "                              score capped conditioned states (diagnostic only)\n\n"
               << "  --reference-constraint-details\n"
+              << "  --reference-independent   Rank each reference against frozen initial BP; no reference pruning\n"
               << "                              print every reference piece-pair constraint\n\n"
               << "Reference replay benchmark options:\n"
-              << "  --replay-tracer NAME       fiberlet, greedy, or lasagna [fiberlet]\n"
-              << "  --fiber-manifest PATH      Fiber prediction manifest (greedy only)\n"
+              << "  --trace-tracer NAME        fiberlet, beam, or imported [fiberlet]\n"
+              << "  --candidate-fibers PATH    native L0 scale-1 collection for precomputed replay\n"
+              << "  --replay-tracer NAME       fiberlet, beam, greedy, lasagna, or precomputed [fiberlet]\n"
+              << "  --fiber-manifest PATH      Fiber prediction for dense replay or generated Fiberlets\n"
+              << "  --fiberlet-cache-root PATH  reusable on-demand Fiberlet cache (trace/replay)\n"
+              << "  --fiberlet-storage-chunk-side N  generated cache side in base voxels [512]\n"
               << "  --inference-scaledown-power N  direct tracer scale exponent [2]\n"
               << "  --lasagna-step N           normal-transport step in base voxels [16]\n"
               << "  --base-voxel-size-um N     physical base-voxel size; required\n"
@@ -368,6 +418,12 @@ void usage(const char* executable)
               << "  --lookahead N              lookahead in base voxels [384]\n"
               << "  --coverage N               normal coverage radius in base voxels [20]\n"
               << "  --coverage-angle N         parallel-axis coverage angle [25]\n"
+              << "  --coverage-tangential N    in-sheet coverage radius [4 x --coverage]\n"
+              << "  --reverse-consistency     split dense beam fibers failing reverse checks [on]\n"
+              << "  --no-reverse-consistency  disable reverse checks for a dense-beam control\n"
+              << "  --reverse-normal N        reverse normal radius, base voxels [20]\n"
+              << "  --reverse-tangential N    reverse in-sheet radius, base voxels [40]\n"
+              << "  --reverse-backoff N       skip original arc on failure, base voxels [40]\n"
               << "  --stop-at-covered          stop output after reaching a covered anchor\n"
               << "  --ambiguity-margin F       stop before a distinct route within relative cost gap F\n"
               << "  --ambiguity-radius N       distinct-route normal radius in base voxels [20]\n"
@@ -410,6 +466,7 @@ void usage(const char* executable)
               << "  --winding-sign-first-steps N\n"
               << "                              magnitude continuation stages after sign-only [1]\n"
               << "  --winding-level-growth N  grow sign-only integer support to N levels\n"
+              << "  --winding-max-candidate-states N  BP memory safety limit (default 4000000)\n"
               << "  --parallel-winding-cutoff F\n"
               << "                              exclusive parallel integer-distance cutoff [off]\n"
               << "  --winding-hard-signs MODE  none, perpendicular, parallel, or both [both]\n"
@@ -664,16 +721,26 @@ Options parse(int argc, char** argv)
             const std::string tracer = value(index, argc, argv, "--replay-tracer");
             if (tracer == "fiberlet")
                 options.referenceReplayTracer = ReferenceReplayTracer::Fiberlet;
+            else if (tracer == "beam")
+                options.referenceReplayTracer = ReferenceReplayTracer::Beam;
             else if (tracer == "greedy")
                 options.referenceReplayTracer = ReferenceReplayTracer::Greedy;
             else if (tracer == "lasagna")
                 options.referenceReplayTracer = ReferenceReplayTracer::Lasagna;
+            else if (tracer == "precomputed")
+                options.referenceReplayTracer = ReferenceReplayTracer::Precomputed;
             else
-                fail("--replay-tracer must be fiberlet, greedy, or lasagna");
+                fail("--replay-tracer must be fiberlet, beam, greedy, or lasagna");
             options.hasDirectReplayOption = true;
+        } else if (argument == "--candidate-fibers") {
+            options.candidateFibers = value(index, argc, argv, "--candidate-fibers");
         } else if (argument == "--fiber-manifest") {
             options.fiberManifest = value(index, argc, argv, "--fiber-manifest");
-            options.hasDirectReplayOption = true;
+        } else if (argument == "--fiberlet-cache-root") {
+            options.fiberletCacheRoot = value(index, argc, argv, "--fiberlet-cache-root");
+        } else if (argument == "--fiberlet-storage-chunk-side") {
+            options.fiberletStorageChunkSide = static_cast<int>(count(
+                index, argc, argv, "--fiberlet-storage-chunk-side"));
         } else if (argument == "--inference-scaledown-power") {
             options.inferenceScaledownPower = static_cast<int>(count(
                 index, argc, argv, "--inference-scaledown-power"));
@@ -767,6 +834,10 @@ Options parse(int argc, char** argv)
             options.hasReferenceOracleOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-independent") {
+            options.referenceIndependent = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--reference-constraint-details") {
             options.referenceConstraintDetails = true;
             options.hasAblationOnlyOption = true;
@@ -833,6 +904,13 @@ Options parse(int argc, char** argv)
         } else if (argument == "--profile-memory") {
             options.profileMemory = true;
             options.hasTraceOnlyOption = true;
+        } else if (argument == "--trace-tracer") {
+            const auto tracer = value(index, argc, argv, "--trace-tracer");
+            if (tracer != "fiberlet" && tracer != "beam" && tracer != "imported")
+                fail("--trace-tracer must be fiberlet, beam, or imported");
+            options.denseBeamCrop = tracer == "beam";
+            options.importedCrop = tracer == "imported";
+            options.hasTraceOnlyOption = true;
         } else if (argument == "--beam") {
             options.trace.beamWidth = count(index, argc, argv, "--beam");
             options.hasTraceOnlyOption = true;
@@ -842,8 +920,32 @@ Options parse(int argc, char** argv)
         } else if (argument == "--coverage") {
             options.trace.coverageNormalRadiusBaseVoxels = number(index, argc, argv, "--coverage");
             options.hasTraceOnlyOption = true;
+        } else if (argument == "--coverage-tangential") {
+            options.trace.coverageTangentialRadiusBaseVoxels = number(index, argc, argv, "--coverage-tangential");
+            options.hasTraceOnlyOption = true;
         } else if (argument == "--coverage-angle") {
             options.trace.coverageDirectionDegrees = number(index, argc, argv, "--coverage-angle");
+            options.hasTraceOnlyOption = true;
+        } else if (argument == "--reverse-consistency" || argument == "--no-reverse-consistency") {
+            const bool enabled = argument == "--reverse-consistency";
+            if (options.reverseChoice && *options.reverseChoice != enabled)
+                fail("conflicting reverse consistency enable/disable flags");
+            options.reverseChoice = enabled;
+            options.hasReverseOption = true;
+            options.hasTraceOnlyOption = true;
+        } else if (argument == "--reverse-normal" || argument == "--reverse-tangential" ||
+                   argument == "--reverse-backoff") {
+            options.hasReverseOption = true;
+            options.hasReverseParameters = true;
+            const double setting = number(index, argc, argv, argument.c_str());
+            if (!(setting > 0.0) || !std::isfinite(setting))
+                fail("reverse consistency parameters must be finite and positive");
+            if (argument == "--reverse-normal")
+                options.trace.reverseNormalRadiusBaseVoxels = setting;
+            else if (argument == "--reverse-tangential")
+                options.trace.reverseTangentialRadiusBaseVoxels = setting;
+            else
+                options.trace.reverseBackoffBaseVoxels = setting;
             options.hasTraceOnlyOption = true;
         } else if (argument == "--stop-at-covered") {
             options.trace.stopAtCoveredAnchors = true;
@@ -1164,6 +1266,13 @@ Options parse(int argc, char** argv)
             }
             options.windingSignFirst = true;
             options.hasJointGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-max-candidate-states") {
+            options.windingMaximumCandidateStates = count(
+                index, argc, argv, "--winding-max-candidate-states");
+            if (options.windingMaximumCandidateStates == 0)
+                fail("--winding-max-candidate-states must be positive");
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-level-growth") {
@@ -1536,6 +1645,12 @@ Options parse(int argc, char** argv)
             fail("unknown option: " + argument);
         }
     }
+    options.trace.reverseConsistency = options.mode == Mode::Trace &&
+        options.denseBeamCrop && options.reverseChoice.value_or(true);
+    if (options.hasReverseOption &&
+        (options.mode != Mode::Trace || !options.denseBeamCrop ||
+         (options.hasReverseParameters && !options.trace.reverseConsistency)))
+        fail("reverse options require trace --trace-tracer beam and enabled checks when tuning");
     if (options.qualityFraction && options.qualityThreshold) {
         fail("--quality-fraction and --quality-threshold are mutually exclusive");
     }
@@ -1557,7 +1672,25 @@ Options parse(int argc, char** argv)
     if (vc::lasagna::isRemoteLasagnaLocation(options.normalManifest) && options.remoteCacheDirectory.empty()) {
         fail("a remote normal manifest requires --remote-cache-dir");
     }
+    if (!options.fiberletCacheRoot.empty()) {
+        if (options.mode != Mode::Trace && options.mode != Mode::ReferenceReplayBenchmark)
+            fail("--fiberlet-cache-root requires trace or reference-replay-benchmark");
+        if (options.input != "-" || options.fiberManifest.empty())
+            fail("on-demand Fiberlets require input '-' and --fiber-manifest");
+        if (options.referenceReplayTracer != ReferenceReplayTracer::Fiberlet)
+            fail("on-demand Fiberlets require the fiberlet replay tracer");
+        if (!options.filterStages.empty())
+            fail("--stage requires an already generated combined Fiberlet dataset");
+        if (options.fiberletStorageChunkSide <= 0)
+            fail("--fiberlet-storage-chunk-side must be positive");
+    } else if (!options.fiberManifest.empty() &&
+               !(options.mode == Mode::ReferenceReplayBenchmark &&
+                 isDenseReplay(options.referenceReplayTracer))) {
+        fail("--fiber-manifest requires dense replay or --fiberlet-cache-root");
+    }
     if (options.mode == Mode::ReferenceReplayBenchmark) {
+        if ((options.referenceReplayTracer == ReferenceReplayTracer::Precomputed) != !options.candidateFibers.empty())
+            fail("precomputed replay requires --candidate-fibers; other backends do not accept it");
         if (options.output.empty())
             fail("--output is required");
         if (!options.hasBounds)
@@ -1574,18 +1707,20 @@ Options parse(int argc, char** argv)
             fail("--failure-threshold must be nonnegative");
         if (!(options.replayMatchRefineSteps >= 0.0))
             fail("--match-refine-steps must be nonnegative");
-        if (options.referenceReplayTracer == ReferenceReplayTracer::Greedy &&
+        if (isDenseReplay(options.referenceReplayTracer) &&
             options.fiberManifest.empty()) {
-            fail("greedy reference replay requires --fiber-manifest");
+            fail("dense reference replay requires --fiber-manifest");
         }
-        if (options.referenceReplayTracer != ReferenceReplayTracer::Greedy &&
-            !options.fiberManifest.empty()) {
-            fail("--fiber-manifest is valid only with --replay-tracer greedy");
+        if (!isDenseReplay(options.referenceReplayTracer) &&
+            !options.fiberManifest.empty() && options.fiberletCacheRoot.empty()) {
+            fail("--fiber-manifest requires dense replay or --fiberlet-cache-root");
         }
         if (!(options.lasagnaReplayStepBaseVoxels > 0.0))
             fail("--lasagna-step must be positive");
-        options.directReplayTrace.beamWidth = 1;
-        options.directReplayTrace.beamLookaheadSteps = 1;
+        if (options.referenceReplayTracer == ReferenceReplayTracer::Greedy) {
+            options.directReplayTrace.beamWidth = 1;
+            options.directReplayTrace.beamLookaheadSteps = 1;
+        }
         options.directReplayTrace.parallelThreads = options.threads;
         vc::fiber_tracer::cli::validateTraceOptions(
             options.directReplayTrace);
@@ -1597,7 +1732,24 @@ Options parse(int argc, char** argv)
         options.trace.parallelThreads = static_cast<std::size_t>(options.threads);
         return options;
     }
-    if (options.hasDirectReplayOption)
+    if (!options.candidateFibers.empty()) fail("--candidate-fibers requires precomputed replay");
+    if (options.trace.reverseConsistency && !options.denseBeamCrop)
+        fail("--reverse-consistency requires --trace-tracer beam");
+    if (options.importedCrop && (options.mode != Mode::Trace || options.input == "-" ||
+        !options.fiberletCacheRoot.empty() || !options.fiberManifest.empty() ||
+        options.qualityThreshold || options.qualityFraction || !options.filterStages.empty() ||
+        options.trace.ambiguityRelativeCostMargin || options.trace.stopAtCoveredAnchors))
+        fail("imported crop requires a native collection input and no graph generation/quality/stopping options");
+    if (options.denseBeamCrop) {
+        if (options.mode != Mode::Trace || options.fiberletCacheRoot.empty())
+            fail("--trace-tracer beam requires trace - --fiber-manifest and --fiberlet-cache-root (anchors only)");
+        if (options.trace.ambiguityRelativeCostMargin || options.trace.stopAtCoveredAnchors ||
+            options.trace.maximumAcceptedCostDensity || options.qualityThreshold || options.qualityFraction ||
+            !options.filterStages.empty())
+            fail("dense beam crop does not support graph ambiguity/stopping or Fiberlet quality filters");
+        vc::fiber_tracer::cli::validateTraceOptions(options.directReplayTrace);
+    }
+    if (options.hasDirectReplayOption && !options.denseBeamCrop)
         fail("direct replay options require reference-replay-benchmark");
     if (options.mode == Mode::Constraints ||
         options.mode == Mode::Consensus ||
@@ -1687,6 +1839,13 @@ Options parse(int argc, char** argv)
         if (options.referenceConstraintDetails &&
             !options.hasReferenceFiberDirectoryOption) {
             fail("--reference-constraint-details requires reference fibers");
+        }
+        if (options.referenceIndependent &&
+            (!options.hasReferenceFiberDirectoryOption || options.referencePruneOffenders ||
+             options.referenceConditioningDiagnostic ||
+             options.windingSolver != vc::fiber_tracer::FiberTraceWindingSolver::JointGrid ||
+             !options.bpOnly || options.bpInference != vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed)) {
+            fail("--reference-independent requires reference fibers and joint-grid mixed BP without reference pruning or conditioning");
         }
         if (options.mode == Mode::Consensus && options.hasSolverOnlyOption)
             fail("consensus does not accept HiGHS labeling options");
@@ -3592,6 +3751,10 @@ makeJointGridWindingProgressPrinter()
             break;
         }
         line << " states=" << p.candidateStates
+             << " factors=" << p.retainedFactors << '/' << p.inputFactors
+             << " measurements=" << p.retainedMeasurements << '/' << p.inputMeasurements
+             << " pruned_factors=" << p.inputFactors - p.retainedFactors
+             << " pruned_measurements=" << p.inputMeasurements - p.retainedMeasurements
              << " grid=" << p.gainCells << 'x' << p.phaseCells
              << " shifts=" << p.gridShifts
              << std::scientific << std::setprecision(3)
@@ -6357,10 +6520,52 @@ std::string formatReferenceBpWindingBenchmark(
     const vc::fiber_tracer::FiberTraceConstraintReport& bpConstraints,
     std::span<const std::size_t> bpOriginalTraceIndices,
     bool includeConstraintDetails,
-    std::optional<int> windingOutputOffsetOverride = std::nullopt)
+    std::optional<int> windingOutputOffsetOverride = std::nullopt,
+    bool independent = false)
 {
     const auto observations = makeReferenceBpWindingObservations(
         reference, cross, winding, config);
+
+    if (independent) {
+        const auto calibration = vc::fiber_tracer::calibrateFiberTraceReferenceWindings(
+            observations, 0.5, true);
+        const auto assignments = vc::fiber_tracer::rankFiberTraceIndependentReferenceWindings(
+            observations, calibration, reference.sourceNames.size(), 5);
+        std::ostringstream result;
+        result.imbue(std::locale::classic());
+        result << "independent reference assignment frozen_initial_bp=1 conditioned_solve=0 pruning=0"
+               << " configured_weights=1 half_grid=0.5 orientation_parity_filter=off"
+               << " global_sign=" << calibration.globalSign
+               << " bp_status=" << winding.status << '\n';
+        result << "gauge,offset\n";
+        for (const auto& gauge : calibration.gauges)
+            result << gauge.integerGauge << ',' << gauge.offset << '\n';
+        result << "independent_reference_summary\n"
+               << "reference,gauge,calibrated,observations,admitted,inactive,zero_weight,min_candidate,max_candidate,evaluated,best_ties,lower_unbounded_best,upper_unbounded_best,lower_unbounded_feasible,upper_unbounded_feasible\n";
+        for (const auto& row : assignments) {
+            result << row.referenceSource * 0.5 << ',' << row.integerGauge << ','
+                   << row.calibrated << ',' << row.observations << ',' << row.admittedObservations << ','
+                   << row.excludedInactive << ',' << row.ignoredZeroWeight << ','
+                   << row.minimumCandidateWinding << ',' << row.maximumCandidateWinding << ','
+                   << row.evaluatedCandidates << ',' << row.bestTies << ','
+                   << row.lowerUnboundedBest << ',' << row.upperUnboundedBest << ','
+                   << row.lowerUnboundedFeasible << ',' << row.upperUnboundedFeasible << '\n';
+        }
+        result << "independent_reference_candidates\n"
+               << "reference,gauge,rank,winding,raw_winding,hard_sign_errors,finite_loss,satisfied_observations,violated_observations\n";
+        result << std::setprecision(12);
+        for (const auto& row : assignments) {
+            for (std::size_t rank = 0; rank < row.candidates.size(); ++rank) {
+                const auto& candidate = row.candidates[rank];
+                result << row.referenceSource * 0.5 << ',' << row.integerGauge << ',' << rank + 1 << ','
+                       << candidate.winding << ',' << candidate.rawWinding << ','
+                       << candidate.hardViolations << ',' << candidate.finiteLoss << ','
+                       << candidate.satisfiedObservations << ',' << candidate.violatedObservations << '\n';
+            }
+        }
+        result << "independent_reference_end\n";
+        return result.str();
+    }
 
     const auto benchmark = vc::fiber_tracer::calibrateFiberTraceReferenceWindings(observations);
     const int windingOutputOffset = windingOutputOffsetOverride.value_or(
@@ -7485,6 +7690,7 @@ int main(int argc, char** argv)
             const auto cpuStarted = std::clock();
             auto artifact =
                 vc::fiber_tracer::readFiberletCropTraceArtifact(options.input);
+            validateArtifactQuality(artifact, options.qualityFraction.has_value() || options.qualityThreshold.has_value());
             const auto retainedOriginalTraceIndices = applyQualityFilter(
                 artifact.lines, options.qualityFraction,
                 options.qualityThreshold);
@@ -7766,6 +7972,8 @@ int main(int argc, char** argv)
                                 ? options.windingTemperature
                                 : options.bp.horizontalnessTemperature;
                             windingConfig.messageDamping = options.bp.messageDamping;
+                            windingConfig.maximumTotalCandidateStates =
+                                options.windingMaximumCandidateStates;
                             windingConfig.messageResidualTolerance =
                                 options.bp.messageResidualTolerance;
                             windingConfig.maximumMessageIterations =
@@ -10038,7 +10246,9 @@ int main(int argc, char** argv)
                                             windingConfig,
                                             bpConstraints,
                                             bpOriginalTraceIndices,
-                                            options.referenceConstraintDetails);
+                                            options.referenceConstraintDetails,
+                                            std::nullopt,
+                                            options.referenceIndependent);
                                 }
                                 if (options.referencePruneOffenders) {
                                     referenceBenchmark =
@@ -10272,6 +10482,8 @@ int main(int argc, char** argv)
                                 options.bp.horizontalnessTemperature;
                             windingConfig.messageDamping =
                                 options.bp.messageDamping;
+                            windingConfig.maximumTotalCandidateStates =
+                                options.windingMaximumCandidateStates;
                             windingConfig.messageResidualTolerance =
                                 options.bp.messageResidualTolerance;
                             windingConfig.maximumMessageIterations =
@@ -10594,6 +10806,7 @@ int main(int argc, char** argv)
         if (options.mode == Mode::Visualize) {
             auto artifact =
                 vc::fiber_tracer::readFiberletCropTraceArtifact(options.input);
+            validateArtifactQuality(artifact, options.qualityFraction.has_value() || options.qualityThreshold.has_value());
             applyQualityFilter(
                 artifact.lines, options.qualityFraction,
                 options.qualityThreshold);
@@ -10602,6 +10815,44 @@ int main(int argc, char** argv)
             printDirectionReport(report.directions, options.output);
             std::cout << "fiberlet crop visualization completed"
                       << " traces=" << artifact.lines.size() << " input=" << options.input << " output=" << options.output << '\n';
+            return 0;
+        }
+
+        if (options.importedCrop) {
+            using namespace vc::fiber_tracer;
+            const auto collection = readNativeVc3dFiberCollectionJson(options.input);
+            const auto fibers = parseNativeVc3dFiberCollection(collection, options.input.string());
+            vc::lasagna::LasagnaDatasetOpenOptions normalOptions;
+            normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
+            const auto normals = vc::lasagna::LasagnaDataset::openLocation(options.normalManifest, normalOptions);
+            validateCollectionNormalSpace(collection, normals.manifest());
+            std::vector<std::vector<cv::Vec3d>> sourceLines;
+            for (const auto& fiber : fibers) sourceLines.push_back(fiber.linePoints);
+            const auto lines = importFiberCropLines(sourceLines, options.trace);
+            FiberletDatasetMetadata source;
+            source.kind = FiberletDatasetKind::Combined;
+            source.spatialChunkSideBaseVoxels = 64;
+            source.chunkGridShapeZYX = {1, 1, 1};
+            source.coordinateUnitsPerChunkZYX = {8, 8, 8};
+            source.maximumEndpointReachCoordinateUnitsZYX = {0, 0, 0};
+            source.predictionToBaseScale = 1;
+            source.sources = {{"collection", std::filesystem::absolute(options.input).string()},
+                {"collection_metadata", collection}};
+            source.processing = {{"backend", "imported"}};
+            finalizeFiberletDatasetIdentity(source);
+            nlohmann::json runs = nlohmann::json::array();
+            for (const auto& line : lines) {
+                const auto sourceIndex = static_cast<std::size_t>(line.seed.coordinateZYX[1]);
+                runs.push_back({{"source_index", sourceIndex}, {"crop_run_id", line.seed.coordinateZYX[2]},
+                    {"filename", collection.at("point_collections").at(sourceIndex).value("filename", std::string{})}});
+            }
+            const nlohmann::json provenance = {{"tracer", "imported"}, {"quality_cost", "unavailable"},
+                {"serialized_cost_zero_is_sentinel", true}, {"family_labels_used", false},
+                {"coordinate_scale", 1}, {"source_fibers", fibers.size()}, {"runs", runs}};
+            writeFiberletCropTraceArtifact(options.output, source, normals.manifest().raw, options.trace, lines, provenance);
+            (void)visualize(lines, options.obj, options.directionDominance);
+            std::cout << "imported crop source_fibers=" << fibers.size() << " crop_runs=" << lines.size()
+                      << " output=" << options.output << '\n';
             return 0;
         }
 
@@ -10631,7 +10882,7 @@ int main(int argc, char** argv)
             std::optional<vc::lasagna::LasagnaDataset> fiberDataset;
             std::optional<vc::fiber_tracer::FiberPredictionField> predictions;
             std::optional<vc::fiber_tracer::FiberPredictionTraceScales> scales;
-            if (options.referenceReplayTracer == ReferenceReplayTracer::Greedy) {
+            if (isDenseReplay(options.referenceReplayTracer)) {
                 vc::lasagna::LasagnaDatasetOpenOptions fiberOptions;
                 fiberOptions.remoteCacheRoot = options.remoteCacheDirectory;
                 auto opened = vc::lasagna::LasagnaDataset::openLocation(
@@ -10652,6 +10903,15 @@ int main(int argc, char** argv)
             const vc::lasagna::LasagnaNormalSampler normals(
                 normalDataset);
 
+            std::vector<vc::fiber_tracer::PolylineArcGeometry> precomputed;
+            if (options.referenceReplayTracer == ReferenceReplayTracer::Precomputed) {
+                const auto collection = vc::fiber_tracer::readNativeVc3dFiberCollectionJson(options.candidateFibers);
+                const auto fibers = vc::fiber_tracer::parseNativeVc3dFiberCollection(collection, options.candidateFibers.string());
+                validateCollectionNormalSpace(collection, normalDataset.manifest());
+                for (const auto& fiber : fibers)
+                    precomputed.push_back(vc::fiber_tracer::makePolylineArcGeometry(fiber.linePoints));
+            }
+
             std::vector<vc::fiber_tracer::FiberReferenceReplayOutcome>
                 outcomes(cases.size());
             std::atomic<std::size_t> next{0};
@@ -10671,8 +10931,7 @@ int main(int argc, char** argv)
                             return;
                         try {
                             vc::fiber_tracer::FiberReplayTraceResult replay;
-                            if (options.referenceReplayTracer ==
-                                ReferenceReplayTracer::Greedy) {
+                            if (isDenseReplay(options.referenceReplayTracer)) {
                                 vc::fiber_tracer::FiberReplayTraceRequest request;
                                 request.fiber.linePointsXyzBase =
                                     cases[index].pointsBaseXYZ;
@@ -10694,6 +10953,10 @@ int main(int argc, char** argv)
                                 replay = vc::fiber_tracer::traceFiberReplay(
                                     *predictions, request, normals,
                                     scales->traceToBaseScale);
+                            } else if (options.referenceReplayTracer == ReferenceReplayTracer::Precomputed) {
+                                replay = vc::fiber_tracer::tracePrecomputedFiberReplay(precomputed,
+                                    cases[index].pointsBaseXYZ, normals, 1.0,
+                                    options.replayFailureThresholdBaseVoxels, options.replayMatchRefineSteps);
                             } else {
                                 vc::fiber_tracer::LasagnaReplayTraceRequest request;
                                 request.referencePointsBase =
@@ -10731,12 +10994,14 @@ int main(int argc, char** argv)
 
             const auto summary = vc::fiber_tracer::summarizeFiberReferenceReplay(
                 selection.fibers.size(), outcomes, *options.baseVoxelSizeUm);
-            const bool greedy = options.referenceReplayTracer ==
-                ReferenceReplayTracer::Greedy;
-            const double evaluationStepBase = greedy
+            const bool dense = isDenseReplay(options.referenceReplayTracer);
+            const bool fixed = options.referenceReplayTracer == ReferenceReplayTracer::Precomputed;
+            const double evaluationStepBase = fixed ? 8.0 : dense
                 ? options.directReplayTrace.stepVoxels * scales->traceToBaseScale
                 : options.lasagnaReplayStepBaseVoxels;
-            const std::string tracer = greedy ? "greedy" : "lasagna";
+            const std::string tracer = dense
+                ? (options.referenceReplayTracer == ReferenceReplayTracer::Beam ? "beam" : "greedy")
+                : fixed ? "precomputed" : "lasagna";
             const nlohmann::json commonConfig = {
                 {"error_threshold_base_voxels",
                  options.replayFailureThresholdBaseVoxels},
@@ -10745,12 +11010,12 @@ int main(int argc, char** argv)
                 {"minimum_reset_advance_base_voxels", evaluationStepBase},
                 {"stop_at_first_failure", false},
                 {"post_failure_policy", "native_step_reset"},
-                {"initialization", greedy
+                {"initialization", fixed ? "nearest_locally_aligned_candidate_projection" : dense
                     ? "exact_reference_endpoint_and_prediction"
                     : "exact_reference_endpoint_and_reference_tangent"},
             };
             nlohmann::json backendConfig;
-            if (greedy) {
+            if (dense) {
                 backendConfig = vc::fiber_tracer::cli::traceConfigJson(
                     options.directReplayTrace);
                 backendConfig["inference_scaledown_power"] =
@@ -10758,6 +11023,14 @@ int main(int argc, char** argv)
                 backendConfig["prediction_to_base"] =
                     scales->predictionToBaseScale;
                 backendConfig["trace_to_base"] = scales->traceToBaseScale;
+            } else if (fixed) {
+                backendConfig = {{"kind", "frozen_precomputed_polyline"}, {"step_base_voxels", 8.0},
+                    {"acquisition_angle_degrees", 25.0}, {"acquisition_distance", "existing_acceptance_ellipse"},
+                    {"selection", "nearest_euclidean_then_source_then_segment"},
+                    {"selection_inputs", "current_start_point_and_tangent_only"},
+                    {"emit_actual_projection", true}, {"emit_terminal_endpoint", true},
+                    {"candidate_switching", false}, {"warping", false}, {"coordinate_scale", 1},
+                    {"candidate_count", precomputed.size()}, {"max_step_factor", 3.0}};
             } else {
                 backendConfig = {
                     {"kind", "reference_tangent_normal_transport_control"},
@@ -10777,8 +11050,10 @@ int main(int argc, char** argv)
                 {"reference_fiber_tag", options.referenceFiberTag},
                 {"reference_files", std::move(sources)},
             };
-            if (greedy)
+            if (dense)
                 output["inputs"]["fiber_manifest"] = options.fiberManifest;
+            if (fixed)
+                output["inputs"]["candidate_fibers"] = options.candidateFibers.string();
             output["runtime"] = {
                 {"workers", workers},
                 {"wall_seconds", std::chrono::duration<double>(
@@ -10796,11 +11071,6 @@ int main(int argc, char** argv)
             return 0;
         }
 
-        auto dataset = vc::fiber_tracer::FiberletChunkDataset::openExisting(options.input);
-        if (dataset->metadata().kind != vc::fiber_tracer::FiberletDatasetKind::Combined) {
-            fail("input must be a combined Fiberlet dataset");
-        }
-
         vc::fiber_tracer::FiberletChunkCacheOptions cacheOptions;
         cacheOptions.service.decodedByteCapacity = options.cacheBytes;
         auto graphBudget = std::make_shared<vc::render::DecodedChunkCacheBudget>(
@@ -10808,11 +11078,90 @@ int main(int argc, char** argv)
         cacheOptions.service.decodedByteBudget = graphBudget;
         cacheOptions.service.fetchConcurrency.workerCapacity = static_cast<std::size_t>(options.threads);
         cacheOptions.service.fetchConcurrency.maxConcurrentReads = static_cast<std::size_t>(options.threads);
+        std::unique_ptr<vc::core::util::ExclusiveDirectoryLock> generationLock;
+        std::shared_ptr<vc::fiber_tracer::FiberletOnDemandPreprocessor> generation;
+        struct GenerationShutdown {
+            std::shared_ptr<vc::fiber_tracer::FiberletOnDemandPreprocessor>& value;
+            ~GenerationShutdown() {
+                if (value) {
+                    try { value->shutdown(); }
+                    catch (const std::exception& error) {
+                        std::cerr << "Fiberlet generation shutdown: " << error.what() << '\n';
+                    }
+                }
+            }
+        } generationShutdown{generation};
+        std::shared_ptr<vc::fiber_tracer::FiberletChunkDataset> dataset;
+        if (options.fiberletCacheRoot.empty()) {
+            dataset = vc::fiber_tracer::FiberletChunkDataset::openExisting(options.input);
+        } else {
+            using namespace vc::fiber_tracer;
+            vc::lasagna::LasagnaDatasetOpenOptions predictionOptions;
+            predictionOptions.remoteCacheRoot = options.remoteCacheDirectory;
+            const auto predictions = vc::lasagna::LasagnaDataset::openLocation(
+                options.fiberManifest, predictionOptions);
+            auto field = std::make_shared<FiberPredictionField>(
+                predictions, FiberPredictionFieldBindingMode::CanonicalStoredGrid);
+            const auto grid = field->storedGridInfo();
+            auto normalOptions = predictionOptions;
+            normalOptions.workingToBaseScale = grid.predictionToBaseScale;
+            const auto normals = vc::lasagna::LasagnaDataset::openLocation(
+                options.normalManifest, normalOptions);
+            const auto sources = makeFiberletSourceIdentity(
+                predictions.manifest().manifestPath, normals.manifest().manifestPath);
+            const FiberAnchorConfig anchors;
+            const FiberletPathConfig paths;
+            const FiberletGeometryCacheProfile profile{
+                .geometry = {.positionQuantumBaseVoxels = 0.0, .compactDirections = true},
+                .compatibilityCostTagBits = 16,
+                .storageChunkSideBaseVoxels = options.fiberletStorageChunkSide};
+            const auto anchorMetadata = makeFiberletDatasetMetadata(
+                FiberletDatasetKind::Anchors, grid, anchors, paths,
+                options.fiberletStorageChunkSide, sources);
+            const auto fiberletMetadata = makeFiberletDatasetMetadata(
+                FiberletDatasetKind::Fiberlets, grid, anchors, paths,
+                options.fiberletStorageChunkSide, sources, {}, 0.0, profile,
+                FiberletStorageProfile::CompactDirectionsFixedCost);
+            std::ostringstream fingerprint;
+            for (const auto byte : fiberletMetadata.datasetFingerprint)
+                fingerprint << std::hex << std::setfill('0') << std::setw(2)
+                            << static_cast<unsigned>(byte);
+            const auto root = options.fiberletCacheRoot / fingerprint.str();
+            generationLock = std::make_unique<vc::core::util::ExclusiveDirectoryLock>(root);
+            auto config = makeCanonicalFiberletOnDemandConfig(
+                root / "anchors.zarr", root / "fiberlets.zarr",
+                anchorMetadata, fiberletMetadata, grid, anchors, paths,
+                [field](const auto& indices, int threads, auto& samples) {
+                    field->sampleStoredGridBatch(indices, threads, samples);
+                }, std::make_shared<vc::lasagna::LasagnaNormalSampler>(normals), cacheOptions);
+            config.progress = [](const FiberletOnDemandProgress& event) {
+                if (event.status == "completed")
+                    std::osyncstream(std::cout) << "fiberlet-preprocess stage=" << event.stage
+                        << " key=" << event.key.iz << '/' << event.key.iy << '/' << event.key.ix
+                        << " seconds=" << event.elapsedSeconds << " outputs=" << event.outputCount
+                        << '\n' << std::flush;
+            };
+            generation = FiberletOnDemandPreprocessor::create(std::move(config));
+            dataset = generation->fiberletDataset();
+            std::cout << "fiberlet generation cache=" << dataset->root()
+                      << " identity=" << fingerprint.str() << '\n' << std::flush;
+        }
+        if (!generation && dataset->metadata().kind != vc::fiber_tracer::FiberletDatasetKind::Combined)
+            fail("input must be a combined Fiberlet dataset");
         std::shared_ptr<TransientCropFilter> transientFilter;
         std::unique_ptr<vc::fiber_tracer::FiberletStoredReplayGraphSource> graph;
         nlohmann::json filterProvenance;
         if (options.filterStages.empty()) {
-            graph = std::make_unique<
+            if (generation) {
+                graph = std::make_unique<vc::fiber_tracer::FiberletStoredReplayGraphSource>(
+                    generation->anchorDataset(), generation->anchorCache(),
+                    generation->fiberletDataset(), generation->fiberletCache(),
+                    vc::fiber_tracer::fiberletPathConfigFromDatasetMetadata(
+                        dataset->metadata(), options.threads), 45.0F,
+                    [generation](const auto& key, auto payload) {
+                        return generation->evaluationAnchorChunk(key, std::move(payload));
+                    });
+            } else graph = std::make_unique<
                 vc::fiber_tracer::FiberletStoredReplayGraphSource>(
                 dataset, cacheOptions);
         } else {
@@ -10986,6 +11335,59 @@ int main(int argc, char** argv)
         vc::fiber_tracer::validateFiberletNormalDatasetCompatibility(dataset->metadata(), normalDataset);
         const vc::lasagna::LasagnaNormalSampler normals(normalDataset);
 
+        if (options.denseBeamCrop) {
+            using namespace vc::fiber_tracer;
+            vc::lasagna::LasagnaDatasetOpenOptions fiberOptions;
+            fiberOptions.remoteCacheRoot = options.remoteCacheDirectory;
+            const auto opened = vc::lasagna::LasagnaDataset::openLocation(options.fiberManifest, fiberOptions);
+            const auto scales = resolveFiberPredictionTraceScales(opened.manifest(), options.inferenceScaledownPower);
+            auto manifest = opened.manifest();
+            manifest.workingToBaseScale = scales.traceToBaseScale;
+            const vc::lasagna::LasagnaDataset traceDataset(std::move(manifest));
+            const FiberPredictionField predictions(traceDataset);
+            auto denseNormalOptions = normalOptions;
+            denseNormalOptions.workingToBaseScale = scales.traceToBaseScale;
+            const auto denseNormalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifest, denseNormalOptions);
+            const vc::lasagna::LasagnaNormalSampler denseNormals(denseNormalDataset);
+            auto denseConfig = options.directReplayTrace;
+            denseConfig.traceToBaseScale = scales.traceToBaseScale;
+            auto anchors = graph->anchorsInBaseBox(options.trace.minimumBaseXYZ, options.trace.maximumBaseXYZ);
+            std::cout << "dense beam crop anchors=" << anchors.size() << " fiberlet_paths=0\n" << std::flush;
+            const auto result = traceDenseBeamCrop(predictions, std::move(anchors),
+                dataset->metadata().predictionToBaseScale, denseNormals, denseConfig, options.trace,
+                [](const auto& current, std::size_t remaining) {
+                    std::osyncstream(std::cout) << "dense beam crop attempted=" << current.attemptedAnchors
+                        << " accepted=" << current.lines.size() << " remaining=" << remaining << '\n' << std::flush;
+                });
+            const nlohmann::json provenance = {
+                {"tracer", "dense_beam"}, {"seeding", "canonical_prediction_anchors_no_gt"},
+                {"dense_config", vc::fiber_tracer::cli::traceConfigJson(denseConfig)},
+                {"beam_width", denseConfig.beamWidth}, {"lookahead_steps", denseConfig.beamLookaheadSteps},
+                {"step_trace_voxels", denseConfig.stepVoxels}, {"cone_degrees", denseConfig.coneAngleDegrees},
+                {"trace_to_base_scale", denseConfig.traceToBaseScale},
+                {"quality_cost", "production_beam_loss_per_prediction_voxel_not_fiberlet_calibrated"},
+                {"graph_ambiguity", "not_applicable"}, {"fiberlet_paths_generated", 0}};
+            double retainedLengthBase = 0.0;
+            for (const auto& line : result.lines)
+                retainedLengthBase += line.pathLengthPredictionVoxels * dataset->metadata().predictionToBaseScale;
+            const nlohmann::json summary = {
+                {"reverse_attempts", result.reverseAttempts},
+                {"reverse_failures", result.reverseFailures},
+                {"reverse_skipped_length_base", result.reverseSkippedLengthBaseVoxels},
+                {"retained_length_base", retainedLengthBase},
+                {"attempted_anchors", result.attemptedAnchors},
+                {"computed_candidates", result.computedCandidates},
+                {"discarded_candidates", result.discardedCandidates},
+                {"candidate_batch_seconds", result.candidateBatchSeconds},
+                {"candidate_task_seconds", result.candidateTaskSeconds}};
+            writeFiberletCropTraceArtifact(options.output, dataset->metadata(), normalDataset.manifest().raw,
+                options.trace, result.lines, provenance, summary);
+            const auto visualization = visualize(result.lines, options.obj, options.directionDominance);
+            std::cout << "dense beam crop completed traces=" << result.lines.size() << " output=" << options.output << '\n';
+            std::cout << "dense beam crop summary " << summary.dump() << '\n';
+            return 0;
+        }
+
         vc::fiber_tracer::FiberletGraphMaterializationDiagnostics
             graphDiagnostics;
         const auto normalChunkCache =
@@ -11131,12 +11533,18 @@ int main(int argc, char** argv)
                 summary, outcomes, "fiberlet", commonConfig, backendConfig,
                 options.trace.minimumBaseXYZ, options.trace.maximumBaseXYZ);
             output["inputs"] = {
-                {"fiberlet_dataset", options.input.string()},
+                {"fiberlet_dataset", dataset->root().string()},
                 {"normal_manifest", options.normalManifest},
                 {"reference_fiber_directory", options.referenceFiberDirectory.string()},
                 {"reference_fiber_tag", options.referenceFiberTag},
                 {"reference_files", std::move(sources)},
             };
+            if (generation) {
+                output["inputs"]["fiber_manifest"] = options.fiberManifest;
+                output["inputs"]["anchor_dataset"] = generation->anchorDataset()->root().string();
+                output["inputs"]["fiberlet_processing"] = dataset->metadata().processing;
+                output["inputs"]["fiberlet_sources"] = dataset->metadata().sources;
+            }
             output["runtime"] = {
                 {"workers", workers},
                 {"wall_seconds", std::chrono::duration<double>(std::chrono::steady_clock::now() - benchmarkStarted).count()},

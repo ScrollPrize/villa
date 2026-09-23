@@ -7,6 +7,17 @@ CI performance gates.
 
 ## Progress Plots
 
+Separate larger-context experiment: [2048³ beam8 hard-order BP](fiber_benchmark_runs/2026-09-23-beam2048-context.md)
+finished at80.77%exact references versus88.46%for the corrected1024³control.
+The different-cohort constraint score is not inserted into these1024³plots.
+[Zero-weight solver correction and timings](fiber_benchmark_runs/2026-09-23-inactive-winding-factors.md)
+records omission-equivalence tests and the corrected control.
+
+Latest external comparison: [Qual supplied fibers, all three crop metrics](fiber_benchmark_runs/2026-09-23-qual-supplied-fibers.md).
+Fixed-geometry replay0.0464%, constraint score-55.31%, exact references84.62%.
+The low replay score is dominated by local acquisition gaps, not wrong-branch
+events; see the report for the explicitly different static-geometry policy.
+
 ![Reference-fiber replay reliability over chronological experiment steps](fiber_benchmarks/imgs/fiber_reference_replay_progress.svg)
 
 Reference replay uses `100 / (failures + 1)`: every failure splits the complete
@@ -38,6 +49,11 @@ filtered at density `0.25` is 84.62%. Ambiguity stopping at margin `0.40` and
 density `0.21` reaches 92.31%. These are reference-tuned measurements on the
 same crop, not held-out validation results.
 
+The historical "pre-pruning" label refers to oracle round zero, not absence of
+all filtering: conditioned-inlier closure can already remove pieces before that
+table is emitted. Dense VC3D beam candidates and their Classic/new BP comparison
+are documented in the [2026-09-23 beam BP report](fiber_benchmark_runs/2026-09-23-dense-beam-bp.md).
+
 The horizontal coordinate is an integer experiment step after a stable sort by
 historical algorithm completion date; experiments recorded on the same date
 retain their JSON order. Step numbers label every result, while a few spaced
@@ -50,10 +66,15 @@ python volume-cartographer/scripts/plot_fiber_benchmarks.py
 
 Add later results to `docs/fiber_benchmark_plot_data.json`; scores are derived
 from raw failure or unique-constraint counts rather than copied percentages.
+The document's `plot_excluded_measurements` records reproduction-only reruns
+omitted from the plots: Classic greedy and Classic Fiberlet v2/v3 cache checks.
+Their measurements remain available in the JSON and dated reports. The Classic
+BP rerun is omitted as a validation run, not claimed numerically identical to
+the historical BP baseline. New-model and beam experiments remain plotted.
 Markers show every measured result at its actual score. Strict measured
 best-so-far points form the Pareto frontier, receive the only text annotations,
 and advance the step line. Every later non-frontier result has its own marker
-and named entry in the legend below the graph, without lowering the historical
+and named entry with its numeric percentage in the legend below the graph, without lowering the historical
 progress line. Assumed-floor controls are named individually there as well and
 never initialize or advance the measured frontier.
 
@@ -64,6 +85,21 @@ base label: for example, `Fiberlet + staged filtering` becomes
 do not receive a stage suffix for work they did not execute.
 
 ## Reference endpoint replay
+
+### Current crop rerun (2026-09-23)
+
+Same 48 directions / 101.035764 mm. Score is **100/(failures+1)**, higher is
+better. VC3D beam means native defaults: beam8/lookahead2/step4/cone25, not the
+unrelated full-resolution model sweep. These results are included in the plot
+above. Full commands and artifact identities: [run record](fiber_benchmark_runs/2026-09-23-crop-new-predictions.md).
+
+| Prediction | Greedy control | VC3D beam | Fiberlet |
+|---|---:|---:|---:|
+| Classic | 7.143% | **50.000%** | 14.286% |
+| New best EMA999 u22000 (`7ff0ce6c`) | 6.667% | **33.333%** | 2.500% |
+
+Classic fiberlet score was reproduced with both the supplied v2 cache and
+regenerated current v3 cache. Historical observations below remain unchanged.
 
 | Date | Revision | Policy | Crop | Tested length | Failures | Mean segment | Segment % | Wall time | Run |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |

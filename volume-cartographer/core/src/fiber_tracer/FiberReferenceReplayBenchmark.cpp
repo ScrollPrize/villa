@@ -1,4 +1,5 @@
 #include "vc/fiber_tracer/FiberReferenceReplayBenchmark.hpp"
+#include "vc/fiber_tracer/FiberReferenceReplayCore.hpp"
 
 #include "vc/fiber_tracer/FiberReplayMetric.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
@@ -6,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <limits>
 #include <stdexcept>
 
 namespace vc::fiber_tracer
@@ -31,6 +33,66 @@ nlohmann::json optionalPointJson(const std::optional<cv::Vec3d>& point)
 }
 
 }  // namespace
+
+FiberReplayTraceResult tracePrecomputedFiberReplay(
+    std::span<const PolylineArcGeometry> candidates,
+    const std::vector<cv::Vec3d>& referenceBaseXYZ,
+    const vc::lasagna::NormalSampler& normals,
+    double normalWorkingToBaseScale,
+    double errorThresholdBaseVoxels,
+    double matchRefineSteps)
+{
+    if (!(normalWorkingToBaseScale > 0) || !std::isfinite(normalWorkingToBaseScale) ||
+        !(errorThresholdBaseVoxels >= 0) || !std::isfinite(errorThresholdBaseVoxels) ||
+        !(matchRefineSteps >= 0) || !std::isfinite(matchRefineSteps))
+        throw std::invalid_argument("invalid precomputed replay configuration");
+    const auto reference = makePolylineArcGeometry(referenceBaseXYZ);
+    constexpr double step = 8.0;
+    const double minimumDot = std::cos(25.0 * std::acos(-1.0) / 180.0);
+    const ReplaySegmentRunner run = [&](const PolylineArcSample& start, double, int maximumSteps,
+                                       const ReplayPointObserver& observe, const FiberTraceProgressCallback&) {
+        const PolylineArcGeometry* selected = nullptr;
+        PolylineArcProjection projection;
+        int direction = 1;
+        double bestDistance = std::numeric_limits<double>::infinity();
+        // Stable iteration order breaks equal-distance ties by source then segment.
+        // No reference samples beyond this start point/tangent are consulted.
+        for (const auto& candidate : candidates) {
+            for (std::size_t segment = 1; segment < candidate.points.size(); ++segment) {
+                const auto delta = candidate.points[segment] - candidate.points[segment - 1];
+                const double length = cv::norm(delta);
+                if (!(length > kEpsilon)) continue;
+                const double dot = (delta / length).dot(start.tangent);
+                if (std::abs(dot) < minimumDot) continue;
+                const auto current = projectPointToPolylineSegment({
+                    candidate.points[segment - 1], candidate.points[segment],
+                    candidate.vertexArcs[segment - 1], candidate.vertexArcs[segment], segment - 1}, start.point);
+                if (!(current.distance < bestDistance)) continue;
+                const auto measurement = measureFiberReplayThreshold(current.point, start.point,
+                    normals, normalWorkingToBaseScale, errorThresholdBaseVoxels);
+                if (fiberReplayThresholdExceeded(measurement, errorThresholdBaseVoxels)) continue;
+                selected = &candidate;
+                projection = current;
+                direction = dot >= 0 ? 1 : -1;
+                bestDistance = current.distance;
+            }
+        }
+        if (!selected) return std::string("no_aligned_candidate");
+        // Expose the real offset acquisition, never a fabricated on-GT seed.
+        if (!observe(projection.point, 0.0, 0)) return std::string("observer_stop");
+        const double available = direction > 0 ? selected->length() - projection.arc : projection.arc;
+        double advanced = 0;
+        for (int index = 1; index <= maximumSteps && advanced < available - kEpsilon; ++index) {
+            advanced = std::min(available, static_cast<double>(index) * step);
+            const auto point = samplePolylineArc(*selected, projection.arc + direction * advanced).point;
+            if (!observe(point, 0.0, index)) return std::string("observer_stop");
+        }
+        return std::string(advanced >= available - kEpsilon ? "candidate_end" : "candidate_step_budget");
+    };
+    return traceReferenceReplayCore(reference, 0, reference.length(), step, 3.0,
+        errorThresholdBaseVoxels, 0.0, kFiberReplayTangentialThresholdFactor,
+        matchRefineSteps, normals, normalWorkingToBaseScale, run, {}, {});
+}
 
 std::vector<FiberReferenceReplayCase> makeFiberReferenceReplayCases(
     std::span<const std::vector<cv::Vec3d>> sourceFibersBaseXYZ, const cv::Vec3d& minimumBaseXYZ, const cv::Vec3d& maximumBaseXYZ)
@@ -303,7 +365,7 @@ FiberReferenceReplaySummary summarizeFiberReferenceReplay(std::size_t selectedSo
         summary.failuresPerDirectedMillimeter =
             static_cast<double>(summary.totalFailures) / (summary.directedReferenceLengthBaseVoxels * baseToMillimeters);
     if (summary.directedReferenceLengthBaseVoxels > 0.0) {
-        const double segmentCount = static_cast<double>(summary.totalFailures + summary.directedCases);
+        const double segmentCount = static_cast<double>(summary.totalFailures + 1);
         summary.meanSegmentLengthBaseVoxels = summary.directedReferenceLengthBaseVoxels / segmentCount;
         summary.meanSegmentLengthMillimeters = summary.meanSegmentLengthBaseVoxels * baseToMillimeters;
         summary.meanSegmentLengthPercent = 100.0 * summary.meanSegmentLengthBaseVoxels / summary.directedReferenceLengthBaseVoxels;
@@ -359,8 +421,8 @@ nlohmann::json fiberReferenceReplayBenchmarkJson(
         reasons[reason] = count;
     return {
         {"format", "vc_fiber_reference_replay_benchmark"},
-        {"version", 5},
-        {"metric_definition", "complete-reference-partition-v1"},
+        {"version", 6},
+        {"metric_definition", "corpus-failures-plus-one-v1"},
         {"tracer", tracer},
         {"coordinates",
          {
@@ -400,7 +462,7 @@ nlohmann::json fiberReferenceReplayBenchmarkJson(
              {"length_weighted_success_percent", summary.lengthWeightedSuccessPercent},
              {"failure_free_cases_percent", summary.failureFreeCasesPercent},
              {"failures_per_directed_mm", summary.failuresPerDirectedMillimeter},
-             {"reliability_segments", summary.totalFailures + summary.directedCases},
+             {"reliability_segments", summary.directedReferenceLengthBaseVoxels > 0.0 ? summary.totalFailures + 1 : 0},
              {"mean_segment_length_base_voxels", summary.meanSegmentLengthBaseVoxels},
              {"mean_segment_length_mm", summary.meanSegmentLengthMillimeters},
              {"mean_segment_length_percent", summary.meanSegmentLengthPercent},

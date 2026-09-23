@@ -1163,14 +1163,15 @@ FiberletStoredReplayGraphSource::FiberletStoredReplayGraphSource(
     std::shared_ptr<FiberletChunkDataset> fiberletDataset,
     std::shared_ptr<vc::render::ChunkCache> fiberletCache,
     FiberletPathConfig pathConfig,
-    float maximumJoinAngleDegrees)
+    float maximumJoinAngleDegrees,
+    FiberletAnchorView anchorView)
     : dataset_(std::move(fiberletDataset))
     , anchorCache_(std::move(anchorCache))
     , pathCache_(std::move(fiberletCache))
     , pathConfig_(std::move(pathConfig))
     , chunks_(
           std::move(anchorDataset), anchorCache_, dataset_, pathCache_,
-          pathConfig_)
+          pathConfig_, std::move(anchorView))
     , maximumJoinAngleDegrees_(maximumJoinAngleDegrees)
 {
     if (!dataset_ ||

@@ -294,6 +294,330 @@ std::filesystem::path createNormalManifest(
 
 }  // namespace
 
+TEST_CASE("Dense beam crop shares deterministic coverage and roundtrips the BP artifact")
+{
+    class StraightField final : public FiberPredictionSource {
+    public:
+        bool supportsConcurrentSampling() const noexcept override { return true; }
+        FiberPredictionSample sample(const cv::Vec3d&, const cv::Vec3d&) const override {
+            FiberPredictionSample result;
+            result.options.push_back({{1, 0, 0}, 1.0F, true});
+            return result;
+        }
+    } field;
+    ZNormalSampler normals;
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {0, 0, 0};
+    config.maximumBaseXYZ = {64, 64, 64};
+    config.parallelThreads = 1;
+    FiberTraceConfig dense;
+    dense.coneGridSize = 5;
+    const std::vector<FiberletStoredAnchor> anchors{
+        anchor(key(1), {32, 32, 32}, {1, 0, 0}, 1.0F),
+        anchor(key(2), {40, 32, 32}, {1, 0, 0}, 0.9F)};
+    const auto serial = traceDenseBeamCrop(field, anchors, 1.0, normals, dense, config);
+    REQUIRE(serial.lines.size() == 1);
+    CHECK(serial.coveredAnchors == 1);
+    CHECK(serial.lines[0].negativeTermination == "crop_exit");
+    CHECK(serial.lines[0].positiveTermination == "crop_exit");
+    CHECK(serial.lines[0].pointsBaseXYZ.front()[0] == doctest::Approx(0));
+    CHECK(serial.lines[0].pointsBaseXYZ.back()[0] == doctest::Approx(64));
+    CHECK(serial.lines[0].pathLengthPredictionVoxels == doctest::Approx(64));
+    CHECK(std::isfinite(serial.lines[0].totalMetricCost));
+    config.parallelThreads = 2;
+    const auto concurrent = traceDenseBeamCrop(field, anchors, 1.0, normals, dense, config);
+    REQUIRE(concurrent.lines.size() == 1);
+    CHECK(concurrent.lines[0].pointsBaseXYZ == serial.lines[0].pointsBaseXYZ);
+    CHECK(concurrent.lines[0].totalMetricCost == serial.lines[0].totalMetricCost);
+
+    TemporaryDirectory directory("dense_crop_artifact");
+    FiberletDatasetMetadata source;
+    source.kind = FiberletDatasetKind::Combined;
+    source.chunkGridShapeZYX = {1, 1, 1};
+    source.coordinateUnitsPerChunkZYX = {8, 8, 8};
+    source.maximumEndpointReachCoordinateUnitsZYX = {4, 4, 4};
+    source.spatialChunkSideBaseVoxels = 64;
+    source.predictionToBaseScale = 1.0;
+    source.sources = {{"fixture", "dense-crop"}};
+    source.processing = {{"fixture", true}};
+    finalizeFiberletDatasetIdentity(source);
+    writeFiberletCropTraceArtifact(directory.path / "dense.zarr", source,
+        nlohmann::json{{"version", 2}}, config, serial.lines);
+    const auto artifact = readFiberletCropTraceArtifact(directory.path / "dense.zarr");
+    REQUIRE(artifact.lines.size() == 1);
+    CHECK(artifact.lines[0].totalMetricCost == serial.lines[0].totalMetricCost);
+    CHECK(artifact.lines[0].pathLengthPredictionVoxels == serial.lines[0].pathLengthPredictionVoxels);
+    FiberTraceConstraintConfig constraintConfig;
+    constraintConfig.preserveInputLinesAsPieces = true;
+    const auto constraints = extractFiberTraceConstraints(artifact.lines, constraintConfig,
+        [](const cv::Vec3d&, const cv::Vec3d&, double) { return 0.0; });
+    FiberTraceBeliefPropagationConfig bp;
+    bp.cropMinimumBaseXYZ = config.minimumBaseXYZ;
+    bp.cropMaximumBaseXYZ = config.maximumBaseXYZ;
+    const auto belief = solveFiberTraceBeliefPropagation(artifact.lines, constraints, bp);
+    REQUIRE(belief.horizontalness.size() == 1);
+    CHECK(std::isfinite(belief.horizontalness[0]));
+    CHECK_FALSE(config.maximumAcceptedCostDensity.has_value());
+    config.ambiguityRelativeCostMargin = 0.4;
+    CHECK_THROWS_AS(traceDenseBeamCrop(field, anchors, 1.0, normals, dense, config), std::invalid_argument);
+    config.ambiguityRelativeCostMargin.reset();
+    config.maximumAcceptedCostDensity = 0.21;
+    CHECK_THROWS_AS(traceDenseBeamCrop(field, anchors, 1.0, normals, dense, config), std::invalid_argument);
+}
+
+TEST_CASE("Dense beam crop keeps trace prediction and base coordinate units distinct")
+{
+    class StraightField final : public FiberPredictionSource {
+    public:
+        FiberPredictionSample sample(const cv::Vec3d&, const cv::Vec3d&) const override {
+            FiberPredictionSample result;
+            result.options.push_back({{1, 0, 0}, 1.0F, true});
+            return result;
+        }
+    } field;
+    class RecordingNormals final : public vc::lasagna::NormalSampler {
+    public:
+        mutable std::vector<cv::Vec3d> points;
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& point) const override {
+            points.push_back(point);
+            return {{0, 0, 1}, true, {}};
+        }
+    } normals;
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {0, 0, 0};
+    config.maximumBaseXYZ = {64, 64, 64};
+    config.parallelThreads = 1;
+    FiberTraceConfig dense;
+    dense.traceToBaseScale = 2.0;
+    dense.coneGridSize = 5;
+    const std::vector<FiberletStoredAnchor> anchors{
+        anchor(key(1), {4, 4, 4}, {1, 0, 0}, 1.0F),
+        anchor(key(2), {5, 4, 4}, {1, 0, 0}, 0.9F)};
+    const auto result = traceDenseBeamCrop(field, anchors, 8.0, normals, dense, config);
+    REQUIRE(result.lines.size() == 1);
+    CHECK(result.coveredAnchors == 1);
+    const auto& line = result.lines.front();
+    CHECK(line.seedBaseXYZ == cv::Vec3d(32, 32, 32));
+    CHECK(line.pointsBaseXYZ.front() == cv::Vec3d(0, 32, 32));
+    CHECK(line.pointsBaseXYZ.back() == cv::Vec3d(64, 32, 32));
+    CHECK(line.pathLengthPredictionVoxels == doctest::Approx(8));
+    CHECK(line.negativeTermination == "crop_exit");
+    CHECK(line.positiveTermination == "crop_exit");
+    REQUIRE_FALSE(normals.points.empty());
+    // Both tracing and coverage must query the normal sampler in trace units,
+    // around z=16, not in prediction (z=4) or base (z=32) coordinates.
+    for (const auto& point : normals.points) {
+        CHECK(point[2] > 8.0);
+        CHECK(point[2] < 24.0);
+    }
+    TemporaryDirectory directory("dense_crop_nonunit_artifact");
+    FiberletDatasetMetadata source;
+    source.kind = FiberletDatasetKind::Combined;
+    source.chunkGridShapeZYX = {1, 1, 1};
+    source.coordinateUnitsPerChunkZYX = {8, 8, 8};
+    source.maximumEndpointReachCoordinateUnitsZYX = {4, 4, 4};
+    source.spatialChunkSideBaseVoxels = 64;
+    source.predictionToBaseScale = 8.0;
+    source.sources = {{"fixture", "dense-crop-nonunit"}};
+    source.processing = {{"fixture", true}};
+    finalizeFiberletDatasetIdentity(source);
+    writeFiberletCropTraceArtifact(directory.path / "dense.zarr", source,
+        nlohmann::json{{"version", 2}}, config, result.lines);
+    const auto artifact = readFiberletCropTraceArtifact(directory.path / "dense.zarr");
+    REQUIRE(artifact.lines.size() == 1);
+    CHECK(artifact.lines.front().pointsBaseXYZ == line.pointsBaseXYZ);
+    CHECK(artifact.lines.front().seedBaseXYZ == line.seedBaseXYZ);
+    CHECK(artifact.lines.front().pathLengthPredictionVoxels == doctest::Approx(8));
+    CHECK(artifact.lines.front().totalMetricCost == line.totalMetricCost);
+}
+
+TEST_CASE("Dense reverse consistency preserves a reversible route and its cost")
+{
+    class StraightField final : public FiberPredictionSource {
+    public:
+        bool supportsConcurrentSampling() const noexcept override { return true; }
+        FiberPredictionSample sample(const cv::Vec3d&, const cv::Vec3d&) const override {
+            FiberPredictionSample result;
+            result.options.push_back({{1, 0, 0}, 0.9F, true});
+            return result;
+        }
+    } field;
+    ZNormalSampler normals;
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {0, 0, 0};
+    config.maximumBaseXYZ = {256, 256, 256};
+    config.parallelThreads = 1;
+    FiberTraceConfig dense;
+    dense.traceToBaseScale = 2;
+    dense.coneGridSize = 5;
+    const std::vector<FiberletStoredAnchor> anchors{
+        anchor(key(1), {16, 16, 16}, {1, 0, 0}, 1)};
+    const auto original = traceDenseBeamCrop(field, anchors, 8, normals, dense, config);
+    REQUIRE(original.lines.size() == 1);
+    config.reverseConsistency = true;
+    const auto checked = traceDenseBeamCrop(field, anchors, 8, normals, dense, config);
+    REQUIRE(checked.lines.size() == 1);
+    CHECK(checked.reverseAttempts == 2);
+    CHECK(checked.reverseFailures == 0);
+    CHECK(checked.reverseSkippedLengthBaseVoxels == 0);
+    CHECK(checked.lines.front().pointsBaseXYZ == original.lines.front().pointsBaseXYZ);
+    CHECK(checked.lines.front().totalMetricCost == doctest::Approx(original.lines.front().totalMetricCost));
+    CHECK(checked.lines.front().pathLengthPredictionVoxels == original.lines.front().pathLengthPredictionVoxels);
+    CHECK_FALSE(checked.lines.front().originalSeedBaseXYZ);
+    config.parallelThreads = 4;
+    CHECK(traceDenseBeamCrop(field, anchors, 8, normals, dense, config).lines.front().pointsBaseXYZ == checked.lines.front().pointsBaseXYZ);
+    for (double invalid : {0.0, -1.0, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
+        auto bad = config;
+        bad.reverseBackoffBaseVoxels = invalid;
+        CHECK_THROWS(traceDenseBeamCrop(field, anchors, 8, normals, dense, bad));
+        bad = config;
+        bad.reverseNormalRadiusBaseVoxels = invalid;
+        CHECK_THROWS(traceDenseBeamCrop(field, anchors, 8, normals, dense, bad));
+        bad = config;
+        bad.reverseTangentialRadiusBaseVoxels = invalid;
+        CHECK_THROWS(traceDenseBeamCrop(field, anchors, 8, normals, dense, bad));
+    }
+    const std::vector<std::vector<cv::Vec3d>> imported{{{0, 128, 128}, {256, 128, 128}}};
+    CHECK_THROWS(importFiberCropLines(imported, config));
+}
+
+TEST_CASE("Dense reverse consistency preserves gaps and split provenance")
+{
+    class OneWayGap final : public FiberPredictionSource {
+    public:
+        FiberPredictionSample sample(const cv::Vec3d& point, const cv::Vec3d& direction) const override {
+            FiberPredictionSample result;
+            if (direction[0] < 0 && point[0] > 160 && point[0] < 192)
+                return result;
+            result.options.push_back({{1, 0, 0}, 0.9F, true});
+            return result;
+        }
+    } field;
+    ZNormalSampler normals;
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {0, 0, 0};
+    config.maximumBaseXYZ = {256, 256, 256};
+    config.parallelThreads = 1;
+    config.reverseConsistency = true;
+    FiberTraceConfig dense;
+    dense.coneGridSize = 5;
+    const std::vector<FiberletStoredAnchor> anchors{
+        anchor(key(1), {128, 128, 128}, {1, 0, 0}, 1)};
+    const auto checked = traceDenseBeamCrop(field, anchors, 1, normals, dense, config);
+    REQUIRE(checked.lines.size() >= 2);
+    CHECK(checked.reverseFailures >= 1);
+    CHECK(checked.reverseSkippedLengthBaseVoxels >= 40);
+    double retained = 0;
+    std::size_t relocatedSeeds = 0;
+    for (const auto& line : checked.lines) {
+        retained += line.pathLengthPredictionVoxels;
+        CHECK(line.totalMetricCost >= 0);
+        CHECK(std::find(line.pointsBaseXYZ.begin(), line.pointsBaseXYZ.end(), line.seedBaseXYZ) != line.pointsBaseXYZ.end());
+        if (line.originalSeedBaseXYZ) {
+            ++relocatedSeeds;
+            CHECK(*line.originalSeedBaseXYZ == cv::Vec3d(128, 128, 128));
+        }
+        CHECK_FALSE(line.pointsBaseXYZ.front()[0] < 160 && line.pointsBaseXYZ.back()[0] > 192);
+    }
+    CHECK(relocatedSeeds >= 1);
+    CHECK(retained + checked.reverseSkippedLengthBaseVoxels == doctest::Approx(256));
+    TemporaryDirectory directory("reverse_crop_artifact");
+    FiberletDatasetMetadata source;
+    source.kind = FiberletDatasetKind::Combined;
+    source.chunkGridShapeZYX = {1, 1, 1};
+    source.coordinateUnitsPerChunkZYX = {8, 8, 8};
+    source.maximumEndpointReachCoordinateUnitsZYX = {4, 4, 4};
+    source.spatialChunkSideBaseVoxels = 256;
+    source.predictionToBaseScale = 1;
+    source.sources = {{"fixture", "reverse-crop"}};
+    source.processing = {{"fixture", true}};
+    finalizeFiberletDatasetIdentity(source);
+    writeFiberletCropTraceArtifact(directory.path / "reverse.zarr", source,
+        nlohmann::json{{"version", 2}}, config, checked.lines);
+    const auto restored = readFiberletCropTraceArtifact(directory.path / "reverse.zarr");
+    REQUIRE(restored.lines.size() == checked.lines.size());
+    for (std::size_t i = 0; i < checked.lines.size(); ++i) {
+        CHECK(restored.lines[i].originalSeedBaseXYZ == checked.lines[i].originalSeedBaseXYZ);
+        CHECK(restored.lines[i].seed == checked.lines[i].seed);
+        CHECK(restored.lines[i].negativeTermination == checked.lines[i].negativeTermination);
+        CHECK(restored.lines[i].positiveTermination == checked.lines[i].positiveTermination);
+        CHECK(restored.lines[i].pointsBaseXYZ == checked.lines[i].pointsBaseXYZ);
+        CHECK(restored.lines[i].totalMetricCost == checked.lines[i].totalMetricCost);
+    }
+}
+
+TEST_CASE("Dense reverse consistency detects lateral disagreement and bounds immediate failure")
+{
+    class ReverseField final : public FiberPredictionSource {
+    public:
+        bool missing = false;
+        bool supportsConcurrentSampling() const noexcept override { return true; }
+        FiberPredictionSample sample(const cv::Vec3d& point, const cv::Vec3d& direction) const override {
+            FiberPredictionSample result;
+            const bool reversePositiveHalf = direction[0] < 0 && point[0] > 128;
+            if (reversePositiveHalf && missing)
+                return result;
+            result.options.push_back({reversePositiveHalf ? cv::Vec3f(1, -0.5F, 0) : cv::Vec3f(1, 0, 0), 1, true});
+            return result;
+        }
+    } field;
+    ZNormalSampler normals;
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {0, 0, 0};
+    config.maximumBaseXYZ = {256, 1024, 256};
+    config.parallelThreads = 1;
+    config.reverseConsistency = true;
+    config.reverseTangentialRadiusBaseVoxels = 10;
+    FiberTraceConfig dense;
+    dense.coneGridSize = 5;
+    const std::vector<FiberletStoredAnchor> anchors{
+        anchor(key(1), {128, 128, 128}, {1, 0, 0}, 1),
+        anchor(key(2), {128, 512, 128}, {1, 0, 0}, 0.9F)};
+    const auto tight = traceDenseBeamCrop(field, anchors, 1, normals, dense, config);
+    CHECK(tight.reverseFailures > 0);
+    CHECK(tight.reverseSkippedLengthBaseVoxels > 0);
+    auto parallel = config;
+    parallel.parallelThreads = 4;
+    const auto concurrent = traceDenseBeamCrop(field, anchors, 1, normals, dense, parallel);
+    REQUIRE(concurrent.lines.size() == tight.lines.size());
+    CHECK(concurrent.reverseAttempts == tight.reverseAttempts);
+    for (std::size_t i = 0; i < tight.lines.size(); ++i)
+        CHECK(concurrent.lines[i].pointsBaseXYZ == tight.lines[i].pointsBaseXYZ);
+    auto loose = config;
+    loose.reverseTangentialRadiusBaseVoxels = 200;
+    const auto wide = traceDenseBeamCrop(field, anchors, 1, normals, dense, loose);
+    CHECK(wide.reverseSkippedLengthBaseVoxels < tight.reverseSkippedLengthBaseVoxels);
+    field.missing = true;
+    const auto stopped = traceDenseBeamCrop(field, anchors, 1, normals, dense, config);
+    CHECK(stopped.reverseFailures > 0);
+    CHECK(stopped.reverseAttempts < 20);
+    CHECK(stopped.reverseSkippedLengthBaseVoxels == doctest::Approx(256));
+    REQUIRE(stopped.lines.size() == 2);
+    for (const auto& line : stopped.lines)
+        CHECK(line.pathLengthPredictionVoxels == doctest::Approx(128));
+}
+
+TEST_CASE("imported crop preserves reentry runs and rejects quality scoring")
+{
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {0,0,0};
+    config.maximumBaseXYZ = {10,10,10};
+    const std::vector<std::vector<cv::Vec3d>> sources{
+        {{-5,2,2},{15,2,2},{15,8,2},{-5,8,2}}};
+    const auto lines = importFiberCropLines(sources, config);
+    REQUIRE(lines.size() == 2);
+    CHECK(lines[0].pointsBaseXYZ.front() == cv::Vec3d(0,2,2));
+    CHECK(lines[0].pointsBaseXYZ.back() == cv::Vec3d(10,2,2));
+    CHECK(lines[1].pointsBaseXYZ.front() == cv::Vec3d(10,8,2));
+    CHECK(lines[1].pointsBaseXYZ.back() == cv::Vec3d(0,8,2));
+    CHECK(lines[0].pathLengthPredictionVoxels == doctest::Approx(10));
+    CHECK(lines[1].pathLengthPredictionVoxels == doctest::Approx(10));
+    CHECK(lines[1].seed.coordinateZYX[2] == 1);
+    CHECK(lines[1].seedBaseXYZ == cv::Vec3d(5,8,2));
+    config.maximumAcceptedCostDensity = 0.21;
+    CHECK_THROWS_AS(importFiberCropLines(sources, config), std::invalid_argument);
+}
+
 TEST_CASE("Fiberlet crop search box expands every face by exact lookahead")
 {
     FiberletCropTraceConfig config;
@@ -479,6 +803,28 @@ TEST_CASE("Fiberlet crop tracing is bidirectional and uses anisotropic direction
     CHECK(limited.coveredAnchors == 1);
     CHECK(limited.lines.size() == 1);
     CHECK(limited.noEdgeAnchors == 1);
+
+    auto wide = config;
+    wide.coverageNormalRadiusBaseVoxels = 40;
+    wide.coverageTangentialRadiusBaseVoxels = 80;
+    CHECK(fiberletCropCoverageTangentialRadius(wide) == 80);
+    const auto widened = traceFiberletCrop(graph, anchors, normals, 1.0, wide);
+    CHECK(widened.coveredAnchors == 2); // Normal offset 21 now covered.
+    CHECK(widened.attemptedAnchors == 2); // Crossing direction still excluded.
+    auto far = anchors;
+    far[1].positionPredictionXYZ = {50, 90, 0};
+    const auto fixedTangent = traceFiberletCrop(graph, far, normals, 1.0, wide);
+    CHECK(fixedTangent.coveredAnchors == 1); // 90 in-sheet is NOT covered.
+    wide.coverageTangentialRadiusBaseVoxels.reset();
+    CHECK(fiberletCropCoverageTangentialRadius(wide) == 160);
+    CHECK(traceFiberletCrop(graph, far, normals, 1.0, wide).coveredAnchors == 2);
+    auto explicitDefault = config;
+    explicitDefault.coverageTangentialRadiusBaseVoxels = 80;
+    CHECK(traceFiberletCrop(graph, anchors, normals, 1.0, explicitDefault).coveredAnchors == result.coveredAnchors);
+    for (double invalid : {0.0, -1.0, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
+        wide.coverageTangentialRadiusBaseVoxels = invalid;
+        CHECK_THROWS(fiberletCropCoverageTangentialRadius(wide));
+    }
 }
 
 TEST_CASE("Fiberlet crop tracing accepts an immediate minimum-face exit")

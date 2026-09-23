@@ -687,7 +687,8 @@ struct CandidateScoreDebug {
     double distanceVoxels,
     const FiberTraceConfig& config,
     const vc::lasagna::NormalSampler* normalSampler = nullptr,
-    const FiberTraceProgressCallback& progress = {});
+    const FiberTraceProgressCallback& progress = {},
+    const std::function<bool(const cv::Vec3d&, double, int)>& committedStep = {});
 
 // Fraction of a segment's start-to-target distance that bounds the endpoint
 // acceptance threshold for that segment. The fixed threshold

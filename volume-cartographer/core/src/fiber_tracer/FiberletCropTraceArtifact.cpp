@@ -178,6 +178,7 @@ FiberletDatasetMetadata traceMetadata(
              {"maximum_generated_states_per_step", config.maximumGeneratedStatesPerStep},
              {"maximum_fiberlets_per_side", config.maximumFiberletsPerSide},
              {"coverage_normal_radius_base", config.coverageNormalRadiusBaseVoxels},
+             {"coverage_tangential_radius_base", fiberletCropCoverageTangentialRadius(config)},
              {"coverage_direction_degrees", config.coverageDirectionDegrees},
              {"stop_at_covered_anchors", config.stopAtCoveredAnchors},
              {"ambiguity_relative_cost_margin",
@@ -201,6 +202,11 @@ FiberletDatasetMetadata traceMetadata(
     };
     if (!preprocessing.empty())
         result.processing["preprocessing"] = preprocessing;
+    if (config.reverseConsistency)
+        result.processing["trace"]["reverse_consistency"] = {
+            {"normal_radius_base", config.reverseNormalRadiusBaseVoxels},
+            {"tangential_radius_base", config.reverseTangentialRadiusBaseVoxels},
+            {"backoff_base", config.reverseBackoffBaseVoxels}};
     if (!traceSummary.empty())
         result.processing["artifact"]["trace_summary"] = traceSummary;
     finalizeFiberletDatasetIdentity(result);
@@ -214,7 +220,8 @@ void validateEqual(const std::vector<FiberletCropTraceLine>& expected, const std
     for (std::size_t index = 0; index < expected.size(); ++index) {
         const auto& left = expected[index];
         const auto& right = actual[index];
-        if (left.seedBaseXYZ != right.seedBaseXYZ || left.seedPresence != right.seedPresence || left.totalMetricCost != right.totalMetricCost ||
+        if (left.originalSeedBaseXYZ != right.originalSeedBaseXYZ ||
+            left.seedBaseXYZ != right.seedBaseXYZ || left.seedPresence != right.seedPresence || left.totalMetricCost != right.totalMetricCost ||
             left.pathLengthPredictionVoxels != right.pathLengthPredictionVoxels || left.pointsBaseXYZ != right.pointsBaseXYZ) {
             throw std::runtime_error("published Fiber trace changed during validation");
         }
@@ -263,10 +270,23 @@ void writeFiberletCropTraceArtifact(
 {
     if (std::filesystem::exists(output))
         throw std::invalid_argument("Fiber trace output already exists: " + output.string());
+    auto summary = traceSummary;
+    if (config.reverseConsistency) {
+        summary["reverse_piece_provenance"] = nlohmann::json::array();
+        for (const auto& line : lines) {
+            summary["reverse_piece_provenance"].push_back({
+                {"seed_coordinate_zyx", line.seed.coordinateZYX},
+                {"seed_variant", line.seed.variant},
+                {"original_seed_base_xyz", line.originalSeedBaseXYZ
+                    ? nlohmann::json(jsonVector(*line.originalSeedBaseXYZ)) : nlohmann::json(nullptr)},
+                {"negative_termination", line.negativeTermination},
+                {"positive_termination", line.positiveTermination}});
+        }
+    }
     std::map<ChunkCoordinate, std::vector<FiberletStoredTrace>> grouped;
     FiberletDatasetMetadata layout = traceMetadata(
         sourceMetadata, normalManifest, config, {}, lines.size(),
-        preprocessing, traceSummary);
+        preprocessing, summary);
     for (std::size_t index = 0; index < lines.size(); ++index) {
         const auto& line = lines[index];
         grouped[ownerFor(layout, line.seedBaseXYZ)].push_back({
@@ -286,7 +306,7 @@ void writeFiberletCropTraceArtifact(
     }
     auto metadata = traceMetadata(
         sourceMetadata, normalManifest, config, populated, lines.size(),
-        preprocessing, traceSummary);
+        preprocessing, summary);
 
     const auto parent = output.parent_path().empty() ? std::filesystem::path{"."} : output.parent_path();
     std::filesystem::create_directories(parent);
@@ -363,6 +383,22 @@ FiberletCropTraceArtifact readFiberletCropTraceArtifact(const std::filesystem::p
         "maximum_attempts", "maximum_fibers"};
     if (hasCoveredStop)
         traceKeys.push_back("stop_at_covered_anchors");
+    if (trace.contains("reverse_consistency")) {
+        traceKeys.push_back("reverse_consistency");
+        const auto& reverse = trace.at("reverse_consistency");
+        requireObjectKeys(reverse, {"normal_radius_base", "tangential_radius_base", "backoff_base"},
+            "Reverse consistency parameters");
+        for (const auto* key : {"normal_radius_base", "tangential_radius_base", "backoff_base"})
+            if (!reverse.at(key).is_number() || !std::isfinite(reverse.at(key).get<double>()) ||
+                reverse.at(key).get<double>() <= 0.0)
+                throw std::invalid_argument("Invalid reverse consistency parameter");
+    }
+    if (trace.contains("coverage_tangential_radius_base")) {
+        traceKeys.push_back("coverage_tangential_radius_base");
+        const auto& radius = trace.at("coverage_tangential_radius_base");
+        if (!radius.is_number() || !std::isfinite(radius.get<double>()) || radius.get<double>() <= 0.0)
+            throw std::invalid_argument("Invalid tangential coverage radius");
+    }
     if (hasAmbiguityMargin) {
         traceKeys.push_back("ambiguity_relative_cost_margin");
         traceKeys.push_back("ambiguity_normal_radius_base");
@@ -471,9 +507,25 @@ FiberletCropTraceArtifact readFiberletCropTraceArtifact(const std::filesystem::p
     if (ordered.size() != expectedCount)
         throw std::invalid_argument("Fiber trace record count does not match metadata");
     std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) { return left.ordinal < right.ordinal; });
+    if (trace.contains("reverse_consistency")) {
+        const auto& provenance = artifactMetadata.at("trace_summary").at("reverse_piece_provenance");
+        if (!provenance.is_array() || provenance.size() != ordered.size())
+            throw std::invalid_argument("Invalid reverse piece provenance count");
+    }
     for (std::size_t index = 0; index < ordered.size(); ++index) {
         if (ordered[index].ordinal != index)
             throw std::invalid_argument("Fiber trace ordinals are duplicate or incomplete");
+        if (trace.contains("reverse_consistency")) {
+            const auto& provenance = artifactMetadata.at("trace_summary").at("reverse_piece_provenance");
+            const auto& piece = provenance.at(index);
+            auto& line = ordered[index].line;
+            line.seed.coordinateZYX = piece.at("seed_coordinate_zyx").get<std::array<std::int64_t, 3>>();
+            line.seed.variant = piece.at("seed_variant").get<std::uint8_t>();
+            if (!piece.at("original_seed_base_xyz").is_null())
+                line.originalSeedBaseXYZ = parseVector(piece.at("original_seed_base_xyz"), "Original trace seed");
+            line.negativeTermination = piece.at("negative_termination").get<std::string>();
+            line.positiveTermination = piece.at("positive_termination").get<std::string>();
+        }
         result.lines.push_back(std::move(ordered[index].line));
     }
     return result;

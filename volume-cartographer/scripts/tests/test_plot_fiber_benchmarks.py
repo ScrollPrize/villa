@@ -1,10 +1,24 @@
 import os
 import sys
+from pathlib import Path
 from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import plot_fiber_benchmarks as plots
+
+
+def test_reproduction_measurements_retained_but_not_plotted():
+    project = Path(__file__).resolve().parents[2]
+    document, parsed = plots.load_plot_data(project / "docs/fiber_benchmark_plot_data.json")
+    excluded = document["plot_excluded_measurements"]
+    raw_ids = {p.get("measurement_id") for b in document["benchmarks"].values()
+               for p in b["points"]}
+    assert set(excluded) <= raw_ids
+    for points in parsed.values():
+        assert not ({p.method_id for p in points} & set(excluded))
+    assert "beam_classic_20260923" in {p.method_id for p in parsed["crop_pruning"]}
+    assert "fiberlet_new_v3_20260923" in {p.method_id for p in parsed["reference_replay"]}
 
 
 def _point(name, day, score, measured=True):
@@ -116,11 +130,11 @@ def test_render_labels_frontier_and_names_each_other_result_in_legend(tmp_path):
 
     svg = output.read_text(encoding="utf-8")
     assert "<!-- Pareto frontier -->" in svg
-    assert "<!-- equal algorithm -->" in svg
+    assert "<!-- equal algorithm: 10.00% -->" in svg
     assert "<!-- assumed algorithm (assumed floor) -->" in svg
     assert "<!-- frontier algorithm -->" in svg
     assert "<!-- better algorithm -->" in svg
     assert svg.count("<!-- frontier algorithm -->") == 1
     assert svg.count("<!-- better algorithm -->") == 1
-    assert svg.count("<!-- equal algorithm -->") == 1
+    assert svg.count("<!-- equal algorithm: 10.00% -->") == 1
     assert "rotate(-330)" in svg

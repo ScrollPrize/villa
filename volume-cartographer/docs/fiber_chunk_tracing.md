@@ -1066,6 +1066,22 @@ state per integer winding plus one Defect state; Defect is not duplicated over
 the winding support. The chosen backend still controls phase/scale calibration,
 component sign, integer-support expansion, and winding factor evaluation.
 
+In joint-grid fixed-orientation mode, a measurement with no active winding
+magnitude, sign, continuity or local-span term is excluded before building the
+winding graph. It cannot join components, choose gauges, affect initialization,
+add Defect incidence, or allocate BP messages. Its original-index diagnostic row
+is still available. Zero magnitude weight removes that term only: an independently
+enabled sign/order loss is retained. With adaptive calibration, removal requires
+neutrality across all reachable scale classes, not just the current scale.
+The orientation prepass has independent direction-class scores and is unchanged.
+Plain/alternating legacy winding backends are outside this joint-grid correction.
+
+When winding support or the calibration grid expands, old log messages are
+shifted to a common max-zero gauge before new neutral entries are inserted.
+Thus a uniform message remains uniform instead of temporarily preferring new
+states through damping. This corrects the previous finite-iteration behavior;
+see [validation and timings](fiber_benchmark_runs/2026-09-23-inactive-winding-factors.md).
+
 A late Defect pays `--winding-defect-cost` times its retained incident winding
 measurement count at `--bp-temperature` and is
 selected only from winding evidence; fixed mode does not repeat the H/V
@@ -2005,6 +2021,32 @@ provide an adequate unsupervised stopping rule.
 
 ## Reference endpoint replay
 
+For a new dense prediction without a preprocessed Fiberlet dataset, `trace`
+and Fiberlet `reference-replay-benchmark` accept input `-`,
+`--fiber-manifest prediction.lasagna.json`, and
+`--fiberlet-cache-root /path/to/generated-cache`. They use the canonical
+whole-volume anchor/path algorithms through the shared on-demand preprocessor.
+The graph requests only the crop's lookahead-expanded region and its required
+incident-edge/anchor dependencies. The generated `anchors.zarr` and
+`fiberlets.zarr` reside under a fingerprint directory based on both prediction
+manifests, algorithm parameters and storage layout; crop bounds are excluded,
+so subsequent crops and replay/trace commands reuse completed chunks.
+`--fiberlet-storage-chunk-side` defaults to 512 base voxels. These are separate
+anchor and path caches; reopen them through the same options, rather than
+passing the path cache as a standalone combined Fiberlet dataset. Transient
+`--stage` filtering continues to require a preprocessed combined dataset.
+
+```bash
+vc_fiber_trace_chunk reference-replay-benchmark - \
+  --fiber-manifest prediction.lasagna.json \
+  --fiberlet-cache-root generated-fiberlets \
+  --normal-manifest normals.lasagna.json \
+  --bbox 10240 22016 6144 11264 23040 7168 \
+  --reference-fiber-dir reference-fibers \
+  --reference-fiber-tag hendrik_crop1 \
+  --base-voxel-size-um 2.4 --output reference-replay.json
+```
+
 Use `reference-replay-benchmark` to run Fiberlet, direct greedy, or Lasagna
 normal-transport tracing from both ends of every tagged reference run inside a
 crop. Fiberlet remains the default. The two direct controls are selected with
@@ -2020,6 +2062,104 @@ vc_fiber_trace_chunk reference-replay-benchmark fiberlets.zarr \
   --base-voxel-size-um 2.4 \
   --output reference-replay.json
 ```
+
+Use `--replay-tracer beam` for the same native dense beam implementation and
+`FiberTraceConfig` defaults used by VC3D: beam width 8, lookahead 2, step 4 trace
+voxels, cone 25 degrees, lazy lookahead enabled. It shares the dense replay
+implementation and scale resolution with the greedy control. No full-resolution
+model-specific tuning is applied. CLI `--beam`/`--lookahead` are Fiberlet options;
+do not use them to configure this dense mode.
+
+### Imported fixed fibers (BP input and static replay)
+
+Native L0 collections can be imported without retracing predictions:
+
+```bash
+vc_fiber_trace_chunk trace candidates.vc3d.json --trace-tracer imported \
+  --normal-manifest normals.lasagna.json \
+  --bbox 10240 22016 6144 11264 23040 7168 --output imported-traces.zarr
+
+vc_fiber_trace_chunk reference-replay-benchmark - --replay-tracer precomputed \
+  --candidate-fibers candidates.vc3d.json --normal-manifest normals.lasagna.json \
+  --bbox 10240 22016 6144 11264 23040 7168 \
+  --reference-fiber-dir reference-fibers --reference-fiber-tag hendrik_crop1 \
+  --base-voxel-size-um 2.4 --output precomputed-replay.json
+```
+
+The collection must be `vc3d_fiber_collection` version 1 with `scale: 1` and
+native-L0 coordinate metadata. Its `point_collections` entries use the shared
+VC3D fiber parser. Coordinates are never multiplied by a historical conversion
+factor: an input already converted from L2 to L0 remains unchanged. The CLI
+checks collection/entry coordinate spaces against `source.sample_id` and
+`source.volume_id` in the normal manifest's adjacent inference provenance.
+A readable local provenance file is currently required for this check.
+H/V classifications and family labels are not used in import, replay, or BP.
+
+Import clips every contiguous run independently to the half-open crop. Reentry
+runs stay separate; crop-external gaps never become edges. A collinear interior
+midpoint supplies the artifact seed without altering route geometry. Provenance
+records a fingerprint of collection content, original filename, source index,
+and crop run ID.
+The artifact has **no metric quality score**: its zero cost is an unavailable
+sentinel, not a perfect score. Import and downstream CLI quality filtering are
+rejected for these artifacts. BP receives all imported runs.
+
+Precomputed replay is a static-geometry evaluation, **not beam tracing**. At
+each shared evaluator restart it considers only the current reference start
+point and tangent. It selects the nearest Euclidean segment projection that is
+inside the existing anisotropic acceptance ellipse and whose unoriented tangent
+is within 25 degrees of the seed tangent. Equal-distance ties use collection
+order then segment order. Polyline and orientation are then frozen until the
+evaluator stops the segment or the candidate ends. It emits the actual projected
+seed, uniformly spaced 8-base-voxel arc samples, and the exact terminal endpoint
+when reached. It never snaps/translates candidates to GT, selects using future
+reference points, or switches candidates during a segment. Acquisition scans
+segments linearly using the same segment-projection helper as the geometry
+library. Missing candidates and short tails produce failures through the shared
+replay driver; its reset rules and metric aggregation are unchanged.
+
+Regression tests are in `test_fiber_reference_replay_benchmark` (offset seed,
+reverse traversal, missing/wrong-direction/short candidates, terminal samples,
+scale rejection) and `test_fiberlet_crop_trace` (independent reentry runs and
+quality rejection).
+
+### Dense beam candidate crops (BP input)
+
+`trace - --trace-tracer beam --fiber-manifest PREDICTIONS
+--fiberlet-cache-root CACHE --normal-manifest NORMALS --bbox X0 Y0 Z0 X1 Y1 Z1
+--output crop-traces.zarr` traces full candidates from canonical prediction
+anchors, without reference seeding or replay resets. The cache supplies anchors
+only: no Fiberlet paths are generated. It uses the production dense beam tracer
+and the same deterministic crop scheduling and coverage suppression as Fiberlet
+crop tracing. Dense defaults are beam width 8, lookahead 2, step 4 trace voxels,
+and cone 25 degrees; configure these with `--beam-width`, `--beam-lookahead-steps`,
+`--step-voxels`, and `--cone-angle-degrees`, not graph `--beam`/`--lookahead`.
+
+Each side stops at its first crop exit and is clipped to that face. A finite
+fallback length budget of **three times the crop diagonal per side** bounds
+paths that remain inside the crop; this is an arclength budget in base voxels,
+converted to trace units for extrapolation. Native step discretization applies.
+Only committed production-beam points and their cumulative loss contribute to
+the retained route; the exit segment's loss is prorated by its retained length.
+Artifact points and seeds are in base units, while path length is in prediction
+voxels. Normal sampling uses the trace-to-base conversion, independently of the
+prediction-to-base conversion.
+
+The output remains a `FiberletCropTraceArtifact` for existing BP consumers.
+Its legacy graph trace configuration fields are retained for format
+compatibility and **are not the effective dense beam configuration**. The
+preprocessing provenance's `dense_config` is authoritative for dense tracing.
+Production beam loss per prediction voxel is not calibrated to the Fiberlet
+quality score: omit the historical Fiberlet `--quality-threshold 0.21` for
+dense candidates. Graph ambiguity stopping (`--ambiguity-margin`)
+and covered-anchor endpoint stopping do not apply to dense tracing and are
+rejected. Downstream BP should consume these candidates without a graph-quality
+cutoff.
+
+For large BP candidate graphs, `direction-ablation
+--winding-max-candidate-states N` raises the winding solver's memory safety
+guard (default 4,000,000). It does not truncate the state alphabet or change the
+objective. Use an explicit bounded value and record it with benchmark settings.
 
 Direct greedy replay consumes the dense Fiber prediction manifest and forces
 the historical greedy policy of beam width one and lookahead one:
@@ -2081,3 +2221,42 @@ reference endpoint and reset by their respective evaluation step. JSON records
 the tracer, common evaluator settings, backend settings, and only the consumed
 input artifacts. Sampling cadence can affect observed failures and must be
 considered when comparing backends.
+
+## Dense-beam reverse consistency
+
+For `trace --trace-tracer beam`, add:
+
+```text
+--coverage 40 --coverage-tangential 80 --coverage-angle 45
+--reverse-consistency --reverse-normal 20 --reverse-tangential 40 --reverse-backoff 40
+```
+
+Reverse checking is enabled by default for CLI `trace --trace-tracer beam`,
+the dense crop generation path feeding BP. Use `--no-reverse-consistency` for
+a control run. It remains opt-in in the shared C++ crop configuration and does
+not change reference replay, imported fibers or fiberlet tracing.
+This is not a reference/GT check. Each
+original seed-to-end half is independently traced backwards with the same
+production beam settings, starting with the reversed endpoint tangent.
+Each committed reverse point is locally projected onto the original half in a
+monotonically decreasing arc window (at most twice that step's travel).
+The existing Lasagna-normal ellipse metric uses20 normal/40 in-sheet base-voxel
+radii. Failure includes leaving this ellipse, no backward progress, or early
+tracer termination before reaching the seed.
+
+Only verified intervals of the **original forward geometry** are retained.
+At a failure, the checker cuts at the last verified arc, skips40 base voxels
+towards the seed, and retries. Backoff is configurable and repeated failures can
+create larger gaps. The two seed-adjacent intervals join only if both reach the
+seed; all other pieces remain separate. Only retained geometry suppresses other
+seeds. These pieces may therefore be supplemented by another seed's valid trace.
+The reverse check is sampled at the normal beam step cadence, not a continuous
+geometric proof.
+
+Piece costs integrate the original step losses, interpolating at cuts.
+A piece not containing its original seed gets a local storage point and retains
+its original seed position/key in artifact provenance. Metadata records thresholds,
+backoff, per-piece terminations and reverse attempts/failures/skipped length.
+Counters describe active committed candidates, excluding discarded speculative
+work. Existing readers predating this extension may reject the new optional
+metadata; existing artifacts remain readable by the updated reader.

@@ -373,6 +373,20 @@ std::vector<PolylineArcSegment> clippedPolylineArcSegments(
     return segments;
 }
 
+PolylineArcProjection projectPointToPolylineSegment(
+    const PolylineArcSegment& segment, const cv::Vec3d& point)
+{
+    const cv::Vec3d clippedDelta = segment.finish - segment.start;
+    const double denominator = clippedDelta.dot(clippedDelta);
+    const double fraction = denominator > kEpsilon
+        ? std::clamp((point - segment.start).dot(clippedDelta) / denominator, 0.0, 1.0)
+        : 0.0;
+    const cv::Vec3d projected = segment.start + clippedDelta * fraction;
+    const double arc = segment.beginArc +
+        (segment.endArc - segment.beginArc) * fraction;
+    return {projected, arc, vectorLength(point - projected), segment.segmentIndex};
+}
+
 PolylineArcProjection projectPointToPolylineArc(
     const PolylineArcGeometry& geometry,
     const cv::Vec3d& point,
@@ -388,15 +402,10 @@ PolylineArcProjection projectPointToPolylineArc(
     bool found = false;
     visitClippedPolylineArcSegments(
         geometry, beginArc, endArc, [&](const PolylineArcSegment& segment) {
-        const cv::Vec3d clippedDelta = segment.finish - segment.start;
-        const double denominator = clippedDelta.dot(clippedDelta);
-        const double fraction = denominator > kEpsilon
-            ? std::clamp((point - segment.start).dot(clippedDelta) / denominator, 0.0, 1.0)
-            : 0.0;
-        const cv::Vec3d projected = segment.start + clippedDelta * fraction;
-        const double arc = segment.beginArc +
-            (segment.endArc - segment.beginArc) * fraction;
-        const double distance = vectorLength(point - projected);
+        const auto projection = projectPointToPolylineSegment(segment, point);
+        const auto& projected = projection.point;
+        const double arc = projection.arc;
+        const double distance = projection.distance;
         if (!found || distance < best.distance - kEpsilon ||
             (std::abs(distance - best.distance) <= kEpsilon &&
              (arc < best.arc - kEpsilon ||
