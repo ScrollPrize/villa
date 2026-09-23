@@ -11,6 +11,7 @@ was, and that the verb is only valid in Idle.
 import copy
 from pathlib import Path
 import sys
+import io
 import threading
 from types import SimpleNamespace
 import unittest
@@ -196,24 +197,27 @@ class CheckpointPreflightTests(unittest.TestCase):
         self.assertFalse(_inspect(undeclared).accepted)
 
     def test_structural_configuration_invariants(self):
-        unknown = _checkpoint(cfg={**dict(CONFIG), "who_am_i": 1})
-        self.assertIn("does not match the current schema",
-                      _inspect(unknown).message())
-        removed = _checkpoint(cfg={
-            **dict(CONFIG), "influence_disable_dt_frac": 0.75})
-        self.assertIn("influence_disable_dt_frac", _inspect(removed).message())
-        incomplete = dict(CONFIG)
-        del incomplete["optimizer_learning_rate"]
-        self.assertIn("optimizer_learning_rate",
-                      _inspect(_checkpoint(cfg=incomplete)).message())
-        # Every schema key is required; nothing is carved out or backfilled.
-        for key in ("z_begin", "z_end", "input_use_tracks",
-                    "optimizer_flow_grad_smoothing"):
-            partial = dict(CONFIG)
-            del partial[key]
-            verdict = _inspect(_checkpoint(cfg=partial))
-            self.assertFalse(verdict.accepted, key)
-            self.assertIn(key, verdict.message())
+        # The stored configuration is loaded tolerantly (see
+        # test_checkpoint_tolerance): dropped and defaulted keys are NOTEs,
+        # not refusals; only an uninterpretable value refuses.
+        stale = dict(CONFIG)
+        del stale["input_use_tracks"]
+        stale["who_am_i"] = 1
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.assertTrue(_inspect(_checkpoint(cfg=stale)).accepted)
+        self.assertIn("NOTE: checkpoint drops configuration keys", output.getvalue())
+        self.assertIn("NOTE: checkpoint predates configuration keys", output.getvalue())
+        invalid = _inspect(_checkpoint(
+            cfg={**dict(CONFIG), "dense_spacing_mode": "phase"}))
+        self.assertIn("Invalid value for dense_spacing_mode", invalid.message())
+        # A defaulted model-shaping key still has to agree with the live fit.
+        shaped_default = dict(CONFIG)
+        del shaped_default["model_flow_bounds_radius"]
+        context = _live_context()
+        context.config["model_flow_bounds_radius"] = (
+            int(CONFIG["model_flow_bounds_radius"]) + 1)
+        self.assertIn("model-shaping config mismatch",
+                      _inspect(_checkpoint(cfg=shaped_default), context).message())
         shaped = dict(CONFIG)
         shaped["model_flow_bounds_radius"] = (
             int(shaped["model_flow_bounds_radius"]) + 1)

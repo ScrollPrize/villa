@@ -28,6 +28,7 @@ from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_INTERVAL_ITERATIONS,
                          SpiralInputPaths, SpiralPreviewConfig,
                          SpiralRunConfig, run_mutable_config,
                          write_autosave_metadata)
+from checkpoint_migrations import tolerate_config
 from config import Config, FitConfig, filter_known_config_keys
 from spiral_progress import NullProgressReporter, ProgressReporter
 
@@ -931,12 +932,15 @@ class InteractiveFitSession:
                 if not isinstance(checkpoint_config, dict) or not isinstance(
                         checkpoint_config.get('cfg'), Mapping):
                     raise ValueError("Checkpoint has no current Spiral configuration")
-                durable = dict(checkpoint_config['cfg'])
-                # Checkpoints store the full schema, and the key sets must
-                # agree exactly; nothing is backfilled or retired.
-                if set(durable) != set(config):
-                    raise ValueError(
-                        "Checkpoint configuration does not match the current schema")
+                # Dropped and defaulted keys are tolerated and reported;
+                # only an invalid stored value refuses.
+                durable, notes = tolerate_config(
+                    checkpoint_config['cfg'], defaults=config)
+                for note in notes:
+                    warning = f"Checkpoint {self.paths.checkpoint} {note}"
+                    print(warning)
+                    with self._condition:
+                        self._warnings.append(warning)
                 durable = Config(durable).as_dict()
                 # Keep the durable configuration aligned with the canonical
                 # run window. The service restores a newly loaded checkpoint's

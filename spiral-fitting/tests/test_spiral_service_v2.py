@@ -1501,15 +1501,25 @@ class DatasetOwnershipTests(unittest.TestCase):
             "domain.ckpt", {**live, "z_end": live["z_end"] + 1000}))
         self.assertEqual(error.payload["stage"], "all")
 
-        # A checkpoint missing any schema key (here an input toggle) is not
-        # this schema's at all: no rebuild can accept it.
+        # Stored configurations are loaded tolerantly: a key the checkpoint
+        # predates takes its default and a key the schema no longer has is
+        # dropped, so neither turns a rebuildable model mismatch into a
+        # permanent refusal.
         partial = {key: value for key, value in live.items()
                    if key != "input_use_tracks"}
         partial["model_num_flow_stages"] = 3
+        partial["a_setting_that_no_longer_exists"] = 1
         error = self._refuse_load(session, self._write_checkpoint(
-            "missing-toggle.ckpt", partial))
-        self.assertTrue(error.payload["refused"])
-        self.assertNotIn("stage", error.payload)
+            "tolerated.ckpt", partial))
+        self.assertEqual(error.payload["stage"], "model")
+        self.assertNotIn("refused", error.payload)
+        # The default the rebuild would resume with is what the stage
+        # calculation diffs, so a live setting that differs from it promotes
+        # the rebuild to the full host-input stage.
+        session.applied_config["input_use_tracks"] = not live["input_use_tracks"]
+        error = self._refuse_load(session, self._write_checkpoint(
+            "tolerated-live-differs.ckpt", partial))
+        self.assertEqual(error.payload["stage"], "all")
 
     def test_a_refusal_no_rebuild_can_fix_offers_nothing(self):
         session = _attach_fake_session(self.state, self.output, self.root)
@@ -1522,10 +1532,11 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertTrue(error.payload["refused"])
         self.assertNotIn("stage", error.payload)
 
-        # A cfg key set that is not this schema's.
+        # A stored value the schema cannot interpret.
         error = self._refuse_load(session, self._write_checkpoint(
-            "stale.ckpt", {**live, "a_setting_that_no_longer_exists": 1}))
+            "invalid.ckpt", {**live, "dense_spacing_mode": "bogus"}))
         self.assertTrue(error.payload["refused"])
+        self.assertNotIn("stage", error.payload)
 
         # A file that will not load at all.
         unreadable = self.output / "unreadable.ckpt"

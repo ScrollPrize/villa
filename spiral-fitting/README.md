@@ -680,10 +680,20 @@ it and says what a rebuild would have to replace: rebuilding the **model only**
 keeps the loaded dataset inputs and everything already added to the fit, while
 a **whole-fit** rebuild re-reads the dataset and replays the workspace's desired
 revisions, including uncommitted additions. The panel reports the reasons and asks; a checkpoint no
-rebuild can accept — one written against another dataset, or against a
-configuration schema this service does not have — is reported and nothing is
-offered. A checkpoint-backed session takes its durable configuration from the
-checkpoint, so the local advanced-config profile does not override it.
+rebuild can accept — one written against another dataset, or whose stored
+configuration holds a value the schema cannot interpret — is reported and
+nothing is offered. A checkpoint-backed session takes its durable configuration
+from the checkpoint, so the local advanced-config profile does not override it.
+
+A checkpoint's stored configuration is loaded tolerantly
+(`checkpoint_migrations.tolerate_config`): keys the schema no longer has are
+dropped and keys the checkpoint predates take their current defaults. Each
+such edit is reported as a note or session warning. Only a stored value the
+schema cannot validate (a retired enum member, an out-of-range number) refuses
+the checkpoint. Tolerance covers configuration alone: a checkpoint whose
+parameters do not fit the live model — a multi-stage flow saved in the
+pre-slab `extra_flow_fields.*` layout, or an exponential-gap fit from before
+late August 2026 — is still refused on tensor geometry.
 
 The Iterations value on *Run* is a count added to the checkpoint's durable
 iteration. The progress bar is local to that run and therefore starts at zero;

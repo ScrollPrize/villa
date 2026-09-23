@@ -48,7 +48,8 @@ from ddp_helpers import (
 )
 from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, FitConfig,
                     SHELL_ATLAS_KEYS)
-from checkpoint_migrations import expand_gap_checkpoint_capacity
+from checkpoint_migrations import (expand_gap_checkpoint_capacity,
+                                   tolerate_checkpoint_config)
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, EDITABLE_PCL_ROLE_VALUES,
                          RUN_MUTABLE_PCL_ROLES,
                          fit_input, input_source_enabled, pcl_input_enabled,
@@ -3647,9 +3648,15 @@ class FitContext:
             return CheckpointVerdict(
                 False, ('checkpoint is not a state dictionary',), source=source)
         try:
-            # Capacity growth is prefix-preserving: inspect the expanded copy
-            # without mutating the caller's checkpoint. load_checkpoint()
-            # performs the same migration only after this verdict succeeds.
+            # The stored configuration is brought onto the current schema
+            # first (dropped and defaulted keys), and each edit is
+            # reported; only an invalid value refuses. Capacity growth is
+            # prefix-preserving: inspect the expanded copy without mutating
+            # the caller's checkpoint. load_checkpoint() performs the same
+            # normalisation and migration only after this verdict succeeds.
+            checkpoint, notes = tolerate_checkpoint_config(checkpoint)
+            for note in notes:
+                print(f'NOTE: checkpoint {note}', flush=True)
             checkpoint = expand_gap_checkpoint_capacity(
                 checkpoint, self.config['model_gap_expander_capacity_windings'])
         except ValueError as exc:
@@ -3726,9 +3733,8 @@ class FitContext:
         # --- structural configuration -------------------------------------
         checkpoint_cfg = checkpoint.get('cfg')
         if isinstance(checkpoint_cfg, Mapping):
-            # Checkpoints store the full schema; the key sets must agree
-            # exactly. There is no key backfill or retirement: a checkpoint
-            # written under another schema is refused.
+            # tolerate_checkpoint_config() has already brought the key set
+            # onto the schema, so a mismatch here is a normalisation bug.
             schema = set(self.config)
             unknown = set(checkpoint_cfg) - schema
             missing = schema - set(checkpoint_cfg)
@@ -3888,11 +3894,21 @@ class FitContext:
                 torch.cuda.set_rng_state(state, device_index)
 
     def load_checkpoint(self, checkpoint):
+        checkpoint, _ = tolerate_checkpoint_config(checkpoint)
         checkpoint = expand_gap_checkpoint_capacity(
             checkpoint, self.config['model_gap_expander_capacity_windings'])
         transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
         self.spiral_and_transform.load_state_dict(transformed_spiral_state)
         self.optimiser.load_state_dict(optimiser_state)
+        # Stored optimiser hyperparameters yield to the session configuration.
+        # The flow groups are reapplied at every run boundary
+        # (_apply_flow_group_settings) and the learning rates by the schedule
+        # realignment; the gap group's weight decay has no later owner, so a
+        # checkpoint saved while it was altered must not carry that forward.
+        gap_param = self.gap_expander_params[0]
+        for group in self.optimiser.param_groups:
+            if any(param is gap_param for param in group['params']):
+                group['weight_decay'] = self.config['optimizer_weight_decay_gap_expander']
         if checkpoint.get('scheduler') is not None:
             self.lr_scheduler.load_state_dict(checkpoint['scheduler'])
 

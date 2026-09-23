@@ -1,7 +1,8 @@
-"""In-memory migrations of checkpoint tensor layouts."""
+"""In-memory migrations of checkpoint tensor layouts and configurations."""
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 
 import torch
@@ -15,6 +16,66 @@ _CONFIG_FIELDS = ("cfg", "requested_config", "resolved_config")
 
 def _config_value(config: Mapping, name: str, default=None):
     return config.get(name, default)
+
+
+def tolerate_config(stored: Mapping, *, defaults: Mapping):
+    """Bring a checkpoint's stored configuration onto the current schema.
+
+    Keys the schema no longer has are dropped and keys the checkpoint
+    predates are filled with their current defaults. Every such edit is
+    described in the returned notes so the caller can report it. Values are
+    then validated against the schema; an invalid one (a retired enum member,
+    an out-of-range number) raises ValueError, since no default can say what
+    the fit meant.
+
+    Returns ``(config, notes)``. Nothing about the model tensors is inspected
+    here; a checkpoint whose parameters do not fit the live model is still
+    refused by the preflight's geometry checks.
+    """
+    from config import Config
+    config = dict(stored)
+    notes = []
+    unknown = sorted(set(config) - set(defaults))
+    for key in unknown:
+        del config[key]
+    if unknown:
+        notes.append(
+            "drops configuration keys the schema no longer has: "
+            + ", ".join(unknown))
+    missing = sorted(set(defaults) - set(config))
+    for key in missing:
+        config[key] = copy.deepcopy(defaults[key])
+    if missing:
+        notes.append(
+            "predates configuration keys, which take their defaults: "
+            + ", ".join(f"{key}={defaults[key]!r}" for key in missing))
+    Config(config)  # value validation: raises ValueError on an invalid value
+    return config, notes
+
+
+def tolerate_checkpoint_config(checkpoint):
+    """Apply tolerate_config to every configuration field of a checkpoint.
+
+    Returns ``(checkpoint, notes)`` with the notes for the durable ``cfg``;
+    the requested/resolved copies are normalised the same way. A checkpoint
+    without a mapping ``cfg`` is returned unchanged with no notes, and the
+    caller's own checks then refuse it.
+    """
+    if not isinstance(checkpoint, Mapping) or not isinstance(
+            checkpoint.get("cfg"), Mapping):
+        return checkpoint, []
+    from config import Config
+    defaults = Config().as_dict()
+    updated = dict(checkpoint)
+    notes = []
+    for field in _CONFIG_FIELDS:
+        source = checkpoint.get(field)
+        if isinstance(source, Mapping):
+            updated[field], field_notes = tolerate_config(
+                source, defaults=defaults)
+            if field == "cfg":
+                notes = field_notes
+    return updated, notes
 
 
 def _updated_configs(checkpoint: dict, updates: Mapping) -> dict:

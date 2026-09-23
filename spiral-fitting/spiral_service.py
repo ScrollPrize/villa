@@ -74,6 +74,7 @@ from fit_session import (API_VERSION, EDITABLE_PCL_ROLES, FIT_INPUT_CATALOG,
                          winding_inference_enabled, load_scroll_spec,
                          parse_session_request, resolve_dataset_root,
                          validate_session_request)
+from checkpoint_migrations import tolerate_config
 from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config,
                     filter_known_config_keys, rebuild_stage)
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
@@ -2136,6 +2137,15 @@ class ServiceState:
             if not isinstance(payload, dict):
                 return None, "", None
             cfg = payload.get("cfg")
+            if isinstance(cfg, Mapping):
+                # The same normalisation the preflight applies, so the
+                # refusal analysis diffs the configuration a rebuild would
+                # actually resume with. An invalid stored value is what no
+                # rebuild can fix.
+                try:
+                    cfg, _ = tolerate_config(cfg, defaults=Config().as_dict())
+                except ValueError:
+                    cfg = None
             manifest = payload.get("input_manifest") or {}
             # z_begin/z_end are run-block settings in the service API.  A
             # checkpoint load is the one other source allowed to choose them:
