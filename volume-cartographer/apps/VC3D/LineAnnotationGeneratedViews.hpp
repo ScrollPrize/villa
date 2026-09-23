@@ -8,6 +8,8 @@
 #include <QPointF>
 #include <QString>
 
+class QPainterPath;
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +52,8 @@ struct GeneratedOverlay {
             uint64_t fiberId = 0;
             int controlPointIndex = -1;
             bool pending = false;
+            // Adjacent-winding link (FiberBranchRef::adjacent).
+            bool adjacent = false;
         };
 
         size_t controlIndex = std::numeric_limits<size_t>::max();
@@ -64,7 +68,13 @@ struct GeneratedOverlay {
         // controller, which owns the fiber HV state.
         bool hasSameHvBranches = false;
         bool hasSameHvPendingLinks = false;
+        // An adjacent-winding link on this point: the marker is a triangle
+        // in the link-state colour instead of a circle.
+        bool hasAdjacentLinks = false;
         bool isLinkCandidate = false;
+        // With isLinkCandidate: designated as an ADJACENT link candidate, a
+        // green triangle rather than a green circle.
+        bool isAdjacentLinkCandidate = false;
         bool isSplitCandidate = false;
         bool hasTracedSegmentToNext = false;
         std::string interpolationGoal = "global";
@@ -1614,6 +1624,8 @@ struct GeneratedControlPointContextMenuOptions {
     // (controlIndex, linkedFiberId, linkedControlPointIndex, newPendingState)
     std::function<void(size_t, uint64_t, int, bool)> setBranchLinkPending;
     std::function<void(size_t, cv::Vec3f)> designateLinkCandidate;
+    // Same as designateLinkCandidate, for a link across adjacent windings.
+    std::function<void(size_t, cv::Vec3f)> designateAdjacentLinkCandidate;
     std::function<void(size_t, cv::Vec3f)> linkWithCandidate;
     std::function<void(size_t, cv::Vec3f)> mergeWithCandidate;
     std::function<void(size_t, cv::Vec3f)> designateSplitCandidate;
@@ -1625,6 +1637,15 @@ struct GeneratedControlPointContextMenuOptions {
     // point. The menu item is checkable and reflects the marker's state.
     std::function<void(size_t, bool)> setKollesisTermination;
 };
+
+// The marker of an adjacent-winding link: an upright triangle whose
+// circumradius is the circle radius the point would otherwise draw with, so
+// it reads at the same size next to the circles. Shared by every view that
+// draws control markers. Declared with QPainterPath incomplete: this header
+// is also compiled into QtCore-only tests, so it must not pull in QtGui;
+// callers include <QPainterPath> themselves (the forward declaration sits
+// at global scope, above the namespace).
+QPainterPath generatedTriangleMarkerPath(const QPointF& center, qreal radius);
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                           QuadSurface* surface,

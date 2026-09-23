@@ -217,6 +217,10 @@ add_executable(vc_gen_normalgrids src/vc_gen_normalgrids.cpp diffusion/support.c
 target_link_libraries(vc_gen_normalgrids vc_core Boost::program_options opencv_core opencv_imgproc opencv_ximgproc OpenMP::OpenMP_CXX Ceres::ceres)
 target_include_directories(vc_gen_normalgrids PRIVATE diffusion)
 
+# Estimate an umbilicus from a NormalGridVolume
+add_executable(vc_gen_umbilicus src/vc_gen_umbilicus.cpp)
+target_link_libraries(vc_gen_umbilicus vc_core Boost::program_options opencv_core)
+
 # Read / visualize NormalGridVolume
 add_executable(vc_ngrids src/vc_ngrids.cpp)
 target_link_libraries(vc_ngrids vc_core Boost::program_options opencv_core Ceres::ceres OpenMP::OpenMP_CXX)
@@ -254,6 +258,9 @@ target_link_libraries(vc_zarr_recompress vc_core Blosc::blosc)
 add_executable(vc_zarr_download_bench src/vc_zarr_download_bench.cpp)
 target_link_libraries(vc_zarr_download_bench vc_core Boost::program_options)
 
+add_executable(vc_zarr_download_region src/vc_zarr_download_region.cpp)
+target_link_libraries(vc_zarr_download_region vc_core Boost::program_options)
+
 # Stable compile-coverage entry point for CI. Keep every command-line
 # executable here so the CLI shard cannot silently omit a newly added tool.
 set(VC_CLI_TARGETS
@@ -267,9 +274,11 @@ set(VC_CLI_TARGETS
     vc_atlas_inspect vc_atlas_constraints_export vc_atlas_pred_snap_rebuild
     vc_tifxyz_gengt vc_diffuse_winding vc_tifxyz_mmap_prepare
     vc_create_segment_mask vc_merge_tifxyz vc_merge_patch vc_visualize
-    vc_volpkg_convert vc_transform_geom vc_gen_normalgrids vc_ngrids
+    vc_volpkg_convert vc_transform_geom vc_gen_normalgrids vc_gen_umbilicus
+    vc_ngrids
     vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning vc_tifxyz vc_project_tifxyz
-    vc_zarr_to_tiff vc_zarr_recompress vc_zarr_download_bench)
+    vc_zarr_to_tiff vc_zarr_recompress vc_zarr_download_bench
+    vc_zarr_download_region)
 get_property(_vc_apps_directory_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 list(FILTER _vc_apps_directory_targets INCLUDE REGEX "^vc_")
 set(_vc_expected_cli_targets ${VC_CLI_TARGETS})
@@ -296,9 +305,10 @@ if(VC_USE_PCH)
         vc_calc_surface_metrics
         vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph vc_atlas_inspect vc_atlas_constraints_export vc_tifxyz_gengt vc_diffuse_winding vc_create_segment_mask
         vc_merge_tifxyz vc_merge_patch vc_visualize vc_volpkg_convert vc_transform_geom
-        vc_gen_normalgrids vc_ngrids vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning
+        vc_gen_normalgrids vc_gen_umbilicus vc_ngrids vc_tifxyz2rgb vc_rgb2tifxyz
+        vc_thinning
         vc_tifxyz vc_project_tifxyz vc_zarr_to_tiff vc_zarr_recompress
-        vc_zarr_download_bench
+        vc_zarr_download_bench vc_zarr_download_region
         vc_straighten
     )
         target_precompile_headers(${_app} REUSE_FROM vc_common_pch)
