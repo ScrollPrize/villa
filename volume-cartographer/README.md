@@ -183,9 +183,9 @@ Your folder structure should resemble this:
 
 ### Working on remote volumes from the command line
 
-`vc_grow_seg_from_seed` accepts the remote locators described above and
-`vc_render_tifxyz` streams through `--remote-url`, so a segment can be grown
-and rendered on a public OME-Zarr volume without downloading it or building a
+`vc_grow_seg_from_seed` and `vc_render_tifxyz` both take the remote locators
+described above as `-v` and stream them, so a segment can be grown and
+rendered on a public OME-Zarr volume without downloading it or building a
 volpkg. The tools fetch only the chunks they touch, over anonymous HTTPS or
 S3. The GUI equivalent is `File -> Open Data Catalog…`, covered in the
 [VC3D tutorial](https://scrollprize.org/tutorial_VC3D).
@@ -250,24 +250,27 @@ the remote volume as before.
 #### Rendering it
 
 ```bash
-vc_render_tifxyz -v render_cache --remote-url "$URL" -s out/auto_grown_* \
+vc_render_tifxyz -v "$URL" -s out/auto_grown_* \
   --scale 1 -g 0 --voxel-size 45.532 --voxel-unit micrometer --tif-output render/
 ```
 
 This writes `render/00.tif` (360×360 pixels for the segment above, about
 17 MiB fetched). Things to know:
 
-- `-v` is mandatory, but with `--remote-url` it is only consulted for a local
-  `meta.json`: a nonexistent or empty directory works and stays empty. Since
-  #1657 the renderer opens the remote volume the same way the tracer does, so
-  the chunks it fetches persist in the shared remote cache
+- `-v` takes the URL itself, and nothing is written under a local directory.
+  `--remote-url` is a deprecated alias for the same locator: alone it fills
+  `-v`, next to an equal `-v` it warns, next to a different one it is an
+  error. Since #1657 the renderer opens the remote volume the same way the
+  tracer does, so the chunks it fetches persist in the shared remote cache
   (`~/.VC3D/remote_cache/<volume>-<id>/`, or `remote_cache_dir` under
   `[viewer]` in `VC3D.ini`); `--cache-gb` (default 16) sizes the process-wide
   decoded-chunk cache and `--prefetch-remote` warms it before rendering starts.
-- Remote volumes are not probed for a voxel size. Without `--voxel-size` the
-  log says `Voxel size: 1.0 (no metadata found; override with --voxel-size)`
-  and the TIFF carries no resolution tag. `--voxel-unit` defaults to
-  `nanometer`, so pass both flags; `--voxel-size 45.532` alone yields a TIFF
+- The renderer reads the voxel size from the remote volume's metadata, as the
+  tracer does: without `--voxel-size` the log says
+  `Voxel size (from volume metadata): 45.532` and the TIFF carries the
+  matching resolution tag. Metadata values count as micrometers, while
+  `--voxel-unit` applies to `--voxel-size` and defaults to `nanometer`, so
+  pass both flags when overriding; `--voxel-size 45.532` alone yields a TIFF
   resolution 1000× too large.
 - `-g` selects the pyramid level: `-g 3` renders the same segment at 1/8
   scale (45×45 pixels, about 4 MiB fetched). A level the remote pyramid does
