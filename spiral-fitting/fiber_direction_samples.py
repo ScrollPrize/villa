@@ -11,10 +11,14 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
+import shutil
+import tempfile
 import time
 from urllib.parse import unquote, urljoin, urlparse
 import xml.etree.ElementTree as ET
+import zipfile
 
 import numpy as np
 
@@ -34,7 +38,6 @@ def _chunk_url(array_url, index, metadata):
 
 
 def _read_chunk(session, array_url, metadata, index):
-    import numcodecs
     import requests
 
     url = _chunk_url(array_url, index, metadata)
@@ -49,17 +52,31 @@ def _read_chunk(session, array_url, metadata, index):
         if attempt == 5:
             response.raise_for_status()
         time.sleep(min(2 ** attempt, 8))
+    if response.status_code == 404:
+        return _empty_chunk(metadata, index)
+    response.raise_for_status()
+    return _decode_chunk(response.content, metadata, index)
+
+
+def _empty_chunk(metadata, index):
     shape = np.asarray(metadata["shape"], dtype=np.int64)
     chunks = np.asarray(metadata["chunks"], dtype=np.int64)
     begin = np.asarray(index, dtype=np.int64) * chunks
     chunk_shape = tuple(np.minimum(chunks, shape - begin))
-    if response.status_code == 404:
-        return np.full(chunk_shape, metadata.get("fill_value") or 0,
-                       dtype=np.dtype(metadata["dtype"]))
-    response.raise_for_status()
+    return np.full(chunk_shape, metadata.get("fill_value") or 0,
+                   dtype=np.dtype(metadata["dtype"]))
+
+
+def _decode_chunk(raw, metadata, index):
+    import numcodecs
+
+    shape = np.asarray(metadata["shape"], dtype=np.int64)
+    chunks = np.asarray(metadata["chunks"], dtype=np.int64)
+    begin = np.asarray(index, dtype=np.int64) * chunks
+    chunk_shape = tuple(np.minimum(chunks, shape - begin))
     compressor = metadata.get("compressor")
-    decoded = (numcodecs.get_codec(compressor).decode(response.content)
-               if compressor is not None else response.content)
+    decoded = (numcodecs.get_codec(compressor).decode(raw)
+               if compressor is not None else raw)
     dtype = np.dtype(metadata["dtype"])
     values = np.frombuffer(decoded, dtype=dtype)
     edge_size = int(np.prod(chunk_shape))
@@ -279,6 +296,179 @@ def extract(manifest_url, z_roi, output, *, output_scale=1.0,
           f"{len(work):,} chunks to {output}")
 
 
+def _local_arrays(directory, group):
+    directory = Path(directory)
+    hits = sorted(directory.glob('*_presence.ome.zarr'))
+    if len(hits) != 1:
+        raise ValueError(f'{directory}: expected exactly one *_presence.ome.zarr store')
+    prefix = hits[0].name.removesuffix('_presence.ome.zarr')
+    paths = {name: directory / f'{prefix}_{name}.ome.zarr' / str(group)
+             for name in ('presence', 'nx', 'ny')}
+    metadata = {}
+    scales = []
+    for name, path in paths.items():
+        metadata[name] = json.loads((path / '.zarray').read_text())
+        attrs = json.loads((path.parent / '.zattrs').read_text())
+        datasets = attrs['multiscales'][0]['datasets']
+        dataset = next(item for item in datasets if item['path'] == str(group))
+        scale = next(transform['scale'] for transform in dataset['coordinateTransformations']
+                     if transform['type'] == 'scale')
+        if len(scale) != 3 or not np.allclose(scale, scale[0]):
+            raise ValueError(f'{path}: expected an isotropic three-dimensional scale')
+        scales.append(float(scale[0]))
+    reference = metadata['presence']
+    if (not np.allclose(scales, scales[0]) or scales[0] <= 0
+            or any(metadata[name]['shape'] != reference['shape']
+                   or metadata[name]['chunks'] != reference['chunks']
+                   or np.dtype(metadata[name]['dtype']) != np.uint8
+                   for name in paths)):
+        raise ValueError('local presence/nx/ny arrays must share a uint8 grid and scale')
+    return paths, metadata, scales[0]
+
+
+def _local_chunk_indices(array_dir, metadata, first_chunk, last_chunk):
+    separator = metadata.get('dimension_separator', '.')
+    indices = []
+    if separator == '/':
+        for cz in range(int(first_chunk[0]), int(last_chunk[0]) + 1):
+            z_dir = array_dir / str(cz)
+            if not z_dir.is_dir():
+                continue
+            for y_dir in z_dir.iterdir():
+                if not y_dir.is_dir() or not y_dir.name.isdecimal():
+                    continue
+                cy = int(y_dir.name)
+                if not first_chunk[1] <= cy <= last_chunk[1]:
+                    continue
+                for file in y_dir.iterdir():
+                    if file.is_file() and file.name.isdecimal():
+                        cx = int(file.name)
+                        if first_chunk[2] <= cx <= last_chunk[2]:
+                            indices.append((cz, cy, cx))
+    elif separator == '.':
+        for file in array_dir.iterdir():
+            if not file.is_file():
+                continue
+            try:
+                index = tuple(int(v) for v in file.name.split('.'))
+            except ValueError:
+                continue
+            if len(index) == 3 and all(first_chunk[a] <= index[a] <= last_chunk[a]
+                                       for a in range(3)):
+                indices.append(index)
+    else:
+        raise ValueError(f'unsupported Zarr dimension separator {separator!r}')
+    return sorted(indices)
+
+
+def _read_local_chunk(array_dir, metadata, index):
+    separator = metadata.get('dimension_separator', '.')
+    path = array_dir / separator.join(map(str, index))
+    return (_decode_chunk(path.read_bytes(), metadata, index) if path.is_file()
+            else _empty_chunk(metadata, index))
+
+
+def _write_streamed_npz(output, directory, count, metadata):
+    temporary = directory / 'fiber_directions.npz'
+    schema = {'position_zyx': (np.float32, (count, 3)),
+              'nx': (np.uint8, (count,)), 'ny': (np.uint8, (count,)),
+              'presence': (np.uint8, (count,))}
+    with zipfile.ZipFile(temporary, 'w', compression=zipfile.ZIP_DEFLATED,
+                         compresslevel=3, allowZip64=True) as archive:
+        for name, (dtype, shape) in schema.items():
+            with archive.open(f'{name}.npy', 'w', force_zip64=True) as target:
+                np.lib.format.write_array_header_2_0(target, {
+                    'descr': np.lib.format.dtype_to_descr(np.dtype(dtype)),
+                    'fortran_order': False, 'shape': shape})
+                with (directory / f'{name}.bin').open('rb') as source:
+                    shutil.copyfileobj(source, target, length=8 * 1024 * 1024)
+        with archive.open('metadata_json.npy', 'w', force_zip64=True) as target:
+            np.lib.format.write_array(target, np.asarray(json.dumps(metadata)),
+                                      allow_pickle=False)
+    os.replace(temporary, output)
+
+
+def extract_local(directory, z_roi, output, *, group='3', output_scale=4.0,
+                  threshold=160, cell_size=2, overwrite=False, workers=4):
+    """Extract a sparse fitted-coordinate NPZ from local Lasagna Zarr stores."""
+    output = Path(output)
+    if output.exists() and not overwrite:
+        raise FileExistsError(f'output already exists: {output} (use --overwrite)')
+    paths, metadata, base_scale = _local_arrays(directory, group)
+    chunks = np.asarray(metadata['presence']['chunks'], dtype=np.int64)
+    if np.any(chunks % cell_size):
+        raise ValueError(f'cell size {cell_size} must divide source chunks {tuple(chunks)}')
+    prediction_to_output_scale = base_scale / output_scale
+    shape = np.asarray(metadata['presence']['shape'], dtype=np.int64)
+    begin = np.asarray((np.floor(z_roi[0] / prediction_to_output_scale), 0, 0),
+                       dtype=np.int64)
+    end = np.asarray((np.ceil(z_roi[1] / prediction_to_output_scale), shape[1], shape[2]),
+                     dtype=np.int64)
+    begin = np.maximum(begin, 0)
+    end = np.minimum(end, shape)
+    if end[0] <= begin[0]:
+        raise ValueError('requested z ROI does not intersect the fiber prediction volume')
+    work = _local_chunk_indices(paths['presence'], metadata['presence'],
+                                begin // chunks, (end - 1) // chunks)
+    if not work:
+        raise ValueError('no stored fiber presence chunks intersect the requested z ROI')
+    print(f'found {len(work):,} local presence chunks at pyramid group {group}', flush=True)
+
+    def process(index):
+        presence = _read_local_chunk(paths['presence'], metadata['presence'], index)
+        chunk_begin = np.asarray(index) * chunks
+        local_begin = max(0, int(begin[0] - chunk_begin[0]))
+        local_end = min(len(presence), int(end[0] - chunk_begin[0]))
+        partial = presence[local_begin:local_end]
+        selected, prediction_zyx = _cell_argmax(
+            partial, chunk_begin + [local_begin, 0, 0], cell_size, threshold,
+            begin, end)
+        position = (prediction_zyx.astype(np.float32)
+                    * np.float32(prediction_to_output_scale))
+        if len(selected):
+            selected = selected + local_begin * presence.shape[1] * presence.shape[2]
+            nx = _read_local_chunk(paths['nx'], metadata['nx'], index).reshape(-1)[selected]
+            ny = _read_local_chunk(paths['ny'], metadata['ny'], index).reshape(-1)[selected]
+            confidence = presence.reshape(-1)[selected]
+        else:
+            nx = ny = confidence = np.empty(0, dtype=np.uint8)
+        return position, nx, ny, confidence
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix=f'.{output.name}.', dir=output.parent) as temp:
+        temporary = Path(temp)
+        files = {name: (temporary / f'{name}.bin').open('wb')
+                 for name in ('position_zyx', 'nx', 'ny', 'presence')}
+        count = 0
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                for completed, arrays in enumerate(
+                        executor.map(process, work, buffersize=workers * 2), 1):
+                    count += len(arrays[0])
+                    for stream, values in zip(files.values(), arrays):
+                        stream.write(values.tobytes())
+                    if completed % 100 == 0 or completed == len(work):
+                        print(f'processed {completed:,}/{len(work):,} chunks; '
+                              f'{count:,} samples; {time.monotonic()-started:.0f}s',
+                              flush=True)
+        finally:
+            for stream in files.values():
+                stream.close()
+        if count == 0:
+            raise ValueError('no fiber direction samples met the presence threshold in this z ROI')
+        metadata_out = {
+            'artifact_type': 'fiber_direction_samples', 'format_version': FORMAT_VERSION,
+            'source_directory': str(Path(directory).resolve()), 'source_group': str(group),
+            'z_roi': list(z_roi), 'output_scale_base_voxels': float(output_scale),
+            'prediction_to_output_scale': prediction_to_output_scale,
+            'presence_threshold': int(threshold),
+            'dedup_cell_size_prediction_voxels': int(cell_size), 'sample_count': count,
+        }
+        _write_streamed_npz(output, temporary, count, metadata_out)
+    print(f'wrote {count:,} fiber direction samples to {output}', flush=True)
+
+
 def load_fiber_direction_samples(path, z_begin, z_end):
     """Load one packed artifact, filtering in the fitter's coordinate frame."""
     if not path:
@@ -309,7 +499,7 @@ def load_fiber_direction_samples(path, z_begin, z_end):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("manifest", help="HTTP(S) Lasagna fiber manifest")
+    parser.add_argument("manifest", help="HTTP(S) fiber manifest or local fiber_zarrs directory")
     parser.add_argument("output", type=Path, help="output packed .npz artifact")
     parser.add_argument("--z-roi", required=True, type=_parse_z_roi,
                         help="output-coordinate half-open z range BEGIN,END")
@@ -319,9 +509,11 @@ def main():
     parser.add_argument("--presence-threshold", type=int, default=160)
     parser.add_argument("--cell-size", type=int, default=2,
                         help="deduplication cell edge in prediction voxels")
+    parser.add_argument("--group", default="3",
+                        help="local Zarr pyramid group (default: 3)")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--workers", type=int, default=1,
-                        help="parallel chunk downloads (default: 1)")
+                        help="parallel chunk readers (default: 1)")
     args = parser.parse_args()
     if not 0 <= args.presence_threshold <= 255:
         parser.error("--presence-threshold must be in [0, 255]")
@@ -331,10 +523,18 @@ def main():
         parser.error("--output-scale must be positive")
     if args.workers <= 0:
         parser.error("--workers must be positive")
-    extract(args.manifest, args.z_roi, args.output,
-            output_scale=args.output_scale,
-            threshold=args.presence_threshold, cell_size=args.cell_size,
-            overwrite=args.overwrite, workers=args.workers)
+    if Path(args.manifest).is_dir():
+        extract_local(args.manifest, args.z_roi, args.output, group=args.group,
+                      output_scale=args.output_scale, threshold=args.presence_threshold,
+                      cell_size=args.cell_size, overwrite=args.overwrite,
+                      workers=args.workers)
+    elif urlparse(args.manifest).scheme in ('http', 'https'):
+        extract(args.manifest, args.z_roi, args.output,
+                output_scale=args.output_scale,
+                threshold=args.presence_threshold, cell_size=args.cell_size,
+                overwrite=args.overwrite, workers=args.workers)
+    else:
+        parser.error(f'fiber source directory does not exist: {args.manifest}')
 
 
 if __name__ == "__main__":

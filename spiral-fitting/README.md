@@ -871,10 +871,22 @@ declarative input catalog determine which conventional inputs are resolved.
 
 ## Fiber direction samples
 
-The optional fiber-direction loss consumes one packed artifact extracted from a
-remote Lasagna fiber prediction. Extraction downloads only chunks intersecting
-the requested z ROI and keeps the highest-presence voxel in each fixed
-prediction-space cell:
+The optional fiber-direction loss consumes one packed artifact extracted from
+Lasagna fiber predictions. For the local `fiber_zarrs` in the working dataset:
+
+```bash
+./.venv/bin/python fiber_direction_samples.py \
+  /mnt/raid_nvme/spiral_dataset_working/fiber_zarrs \
+  /mnt/raid_nvme/spiral_dataset_working/fiber_directions.npz \
+  --group 3 --z-roi 3500,17500 --output-scale 4 \
+  --presence-threshold 160 --cell-size 2 --workers 8
+```
+
+Use the z range for the fit you intend to run. Group 3 has 8-base-voxel
+spacing, so `--output-scale 4` places samples at 2-fitter-voxel spacing. The
+extractor reads only stored presence chunks in the requested z range, selects
+the highest-presence voxel in each prediction-space cell, and streams the
+artifact to the dataset root. An HTTP(S) Lasagna fiber manifest also works:
 
 ```bash
 ./.venv/bin/python fiber_direction_samples.py \

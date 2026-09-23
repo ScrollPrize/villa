@@ -11,7 +11,7 @@ if str(SPIRAL_DIR) not in sys.path:
     sys.path.insert(0, str(SPIRAL_DIR))
 
 from fiber_direction_samples import (FORMAT_VERSION, _cell_argmax, _parse_z_roi,
-                                     load_fiber_direction_samples)
+                                     extract_local, load_fiber_direction_samples)
 from losses import get_fiber_direction_loss
 
 
@@ -79,6 +79,57 @@ def test_load_filters_z_and_decodes_axis(tmp_path):
     assert samples["nx"].tolist() == [128]
     assert samples["ny"].tolist() == [128]
     assert samples["presence"].tolist() == [200]
+
+
+def test_extract_local_zarrs_to_fitter_coordinates(tmp_path):
+    source = tmp_path / 'fiber_zarrs'
+    arrays = {}
+    for name in ('presence', 'nx', 'ny'):
+        root = source / f'demo_{name}.ome.zarr'
+        group = root / '3'
+        group.mkdir(parents=True)
+        (root / '.zattrs').write_text(json.dumps({'multiscales': [{'datasets': [
+            {'path': '3', 'coordinateTransformations': [
+                {'type': 'scale', 'scale': [8., 8., 8.]}]}]}]}))
+        (group / '.zarray').write_text(json.dumps({
+            'shape': [5, 4, 4], 'chunks': [4, 4, 4], 'dtype': '|u1',
+            'compressor': None, 'dimension_separator': '/', 'order': 'C',
+            'fill_value': 0,
+        }))
+        arrays[name] = group
+    presence = np.zeros((4, 4, 4), dtype=np.uint8)
+    presence[0, 0, 0] = 180
+    presence[1, 1, 1] = 220
+    presence[2, 0, 0] = 200
+    nx = np.zeros_like(presence)
+    ny = np.zeros_like(presence)
+    nx[1, 1, 1], nx[2, 0, 0] = 255, 128
+    ny[1, 1, 1], ny[2, 0, 0] = 128, 255
+    for name, values in [('presence', presence), ('nx', nx), ('ny', ny)]:
+        path = arrays[name] / '0' / '0' / '0'
+        path.parent.mkdir(parents=True)
+        path.write_bytes(values.tobytes())
+    boundary = np.zeros((4, 4, 4), dtype=np.uint8)
+    boundary[0, 0, 0] = 250
+    path = arrays['presence'] / '1' / '0' / '0'
+    path.parent.mkdir(parents=True)
+    path.write_bytes(boundary.tobytes())
+
+    output = tmp_path / 'fiber_directions.npz'
+    extract_local(source, (0, 10), output, group='3', output_scale=4.,
+                  threshold=160, cell_size=2, workers=2)
+    result = load_fiber_direction_samples(output, 0, 10)
+    assert result['position_zyx'].tolist() == [[2., 2., 2.], [4., 0., 0.], [8., 0., 0.]]
+    assert result['nx'].tolist() == [255, 128, 0]
+    assert result['ny'].tolist() == [128, 255, 0]
+    assert result['presence'].tolist() == [220, 200, 250]
+    assert result['metadata']['prediction_to_output_scale'] == 2.
+
+    subset = tmp_path / 'one_slice.npz'
+    extract_local(source, (8, 10), subset, group='3', output_scale=4.,
+                  threshold=160, cell_size=2, workers=2)
+    filtered = load_fiber_direction_samples(subset, 8, 10)
+    assert filtered['position_zyx'].tolist() == [[8., 0., 0.]]
 
 
 class _IdentityTransform(torch.nn.Module):
