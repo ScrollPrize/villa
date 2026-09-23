@@ -11,7 +11,7 @@ import pytest
 import yaml
 
 from vesuvius.data import volume as volume_module
-from vesuvius.data.volume import Volume
+from vesuvius.data.volume import Volume, describe_scroll_config
 
 CONFIG_PATH = (Path(volume_module.__file__).resolve().parents[1]
                / "install" / "configs" / "scrolls.yaml")
@@ -64,3 +64,13 @@ def test_segment_lookup_survives_the_new_scroll_key(config, monkeypatch) -> None
     scroll_id, energy, resolution, url = vol.find_segment_details("20230827161847")
     assert (scroll_id, energy, resolution) == ("1", "54", "7.91")
     assert url.endswith("20230827161847.zarr/")
+
+
+def test_a_missed_lookup_names_the_scans_that_exist(config) -> None:
+    scroll_4 = describe_scroll_config(config, "4")
+    assert "energy=53, resolution=7.91" in scroll_4
+    assert "energy=88, resolution=3.24" in scroll_4
+
+    unlisted = describe_scroll_config(config, "2c")
+    assert "not in the config" in unlisted
+    assert "1b" in unlisted
