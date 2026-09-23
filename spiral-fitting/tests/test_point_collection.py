@@ -294,5 +294,51 @@ class SideRuleLinkingTests(unittest.TestCase, _BackendCases):
             PatchLinkOptions(side_rules={1: 'sideways'}, inward_direction=lambda z: z)
 
 
+class PatchFilterLinkingTests(unittest.TestCase, _BackendCases):
+    """Reviewed placements: allowed / rejected patch ids per collection."""
+    TOL = 2.0
+
+    def _link(self, **filters):
+        # The window scene: largest-area A under all three points, B under
+        # the middle one only.
+        patches, pcl = WindowLinkingTests._scene(self)
+        other = _collection(2, [(50.0, 0.0, 0.0)])
+        link_points_to_patches(
+            patches, {1: pcl, 2: other}, tolerance=self.TOL, surface_index_tolerance=self.TOL,
+            general_hit_policy='largest_area', options=PatchLinkOptions(**filters))
+        return pcl, other
+
+    def test_no_filter_keeps_the_native_choice(self):
+        def body():
+            pcl, other = self._link()
+            self.assertEqual(_attached(pcl), ['a', 'b', 'a'])
+            self.assertEqual(_attached(other), ['b'])
+        self.for_each_backend(body)
+
+    def test_rejected_patch_is_never_linked(self):
+        def body():
+            pcl, other = self._link(rejected_patches={1: ['b']})
+            self.assertEqual(_attached(pcl), ['a', 'a', 'a'])
+            self.assertEqual(_attached(other), ['b'])  # other collections untouched
+        self.for_each_backend(body)
+
+    def test_allowed_set_restricts_the_collection(self):
+        def body():
+            pcl, _ = self._link(allowed_patches={1: ['b']})
+            self.assertEqual(_attached(pcl), [None, 'b', None])
+            pcl, _ = self._link(allowed_patches={1: []})
+            self.assertEqual(_attached(pcl), [None, None, None])
+        self.for_each_backend(body)
+
+    def test_filter_applies_before_the_window_gate(self):
+        def body():
+            # With A rejected only B remains; one window member hits it, so
+            # the two-of-three gate drops it too.
+            pcl, _ = self._link(rejected_patches={1: ['a']}, window_points=3,
+                                window_min_points=2)
+            self.assertEqual(_attached(pcl), [None, None, None])
+        self.for_each_backend(body)
+
+
 if __name__ == "__main__":
     unittest.main()

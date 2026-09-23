@@ -60,12 +60,20 @@ class PatchLinkOptions:
     ``s >= -side_margin`` and a SIDE_BEHIND one hits with ``s <= side_margin``
     (margin in point units). Rejected hits are dropped before selection, so
     in a window they count as misses.
+
+    ``allowed_patches`` / ``rejected_patches`` map a collection id to patch
+    ids, e.g. from a human review of fiber-to-patch placements: a collection
+    with an allowed set only attaches to those patches, and never to a
+    rejected one. Collections without an entry are unaffected. Like the side
+    rules, the filter drops hits before the window gate and selection.
     """
     window_points: int = 1
     window_min_points: int = 1
     side_rules: Mapping[int, str] = None
     inward_direction: Optional[Callable[[np.ndarray], np.ndarray]] = None
     side_margin: float = 0.0
+    allowed_patches: Mapping[int, frozenset] = None
+    rejected_patches: Mapping[int, frozenset] = None
 
     def __post_init__(self):
         if int(self.window_points) < 1:
@@ -87,6 +95,19 @@ class PatchLinkOptions:
         object.__setattr__(self, 'side_rules', rules)
         if rules and self.inward_direction is None:
             raise ValueError('side rules need an inward_direction function')
+        for name in ('allowed_patches', 'rejected_patches'):
+            object.__setattr__(self, name, {
+                collection_id: frozenset(patch_ids)
+                for collection_id, patch_ids in dict(getattr(self, name) or {}).items()})
+
+    def patch_filter(self, collection_id):
+        """(allowed or None, rejected) patch ids for a collection, or None
+        when neither applies."""
+        allowed = self.allowed_patches.get(collection_id)
+        rejected = self.rejected_patches.get(collection_id, frozenset())
+        if allowed is None and not rejected:
+            return None
+        return allowed, rejected
 
     @property
     def window_half(self) -> int:
@@ -386,6 +407,13 @@ def _link_from_hits(
     keep = surf_idx >= 0
     if target_idxs is not None:
         keep &= np.isin(surf_idx, target_idxs)
+    patch_filter = options.patch_filter(collection_id)
+    if patch_filter is not None:
+        allowed, rejected = patch_filter
+        for surface in np.unique(surf_idx[keep]):
+            patch_id = surface_ids[int(surface)]
+            if (allowed is not None and patch_id not in allowed) or patch_id in rejected:
+                keep &= surf_idx != surface
     if not keep.all():
         point_idx, surf_idx, distances, ijs = (
             point_idx[keep], surf_idx[keep], distances[keep], ijs[keep])
