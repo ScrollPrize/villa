@@ -11,6 +11,7 @@
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/render/ChunkCache.hpp"
+#include "vc/core/util/SeedScanCheck.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
 
@@ -203,12 +204,13 @@ static auto load_direction_fields(Json const&params, std::filesystem::path const
 
 int main(int argc, char *argv[])
 {
-    std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path;
+    std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path, scan_path;
     cv::Vec3d origin;
     Json params;
     PointCollections corrections;
     bool skip_overlap_check = false;
     std::string segment_name;
+    vc::util::SeedScanPolicy scan_policy = vc::util::SeedScanPolicy::Warn;
 
     bool use_old_args = (argc == 4 || argc == 7) && argv[1][0] != '-' && argv[2][0] != '-' && argv[3][0] != '-';
 
@@ -234,6 +236,8 @@ int main(int argc, char *argv[])
             ("inpaint", "perform automatic inpainting on all detected holes.")
             ("resume-opt", po::value<std::string>(), "Resume optimization option (skip, local, global)")
             ("resume-generations", po::value<int>(), "Number of additional generations to grow from current (overrides JSON generations)")
+            ("scan-volume", po::value<std::string>(), "Raw masked scan OME-Zarr (path or URL) the prediction was made from; the seed is checked against it")
+            ("require-scan-data", "Refuse a seed the --scan-volume has no data for instead of warning")
             ("segment-name", po::value<std::string>(), "Output segment name (uses target-dir directly instead of creating subfolder)");
 
         po::variables_map vm;
@@ -309,6 +313,18 @@ int main(int argc, char *argv[])
             params["resume_generations"] = vm["resume-generations"].as<int>();
         }
 
+        if (vm.count("scan-volume")) {
+            scan_path = vm["scan-volume"].as<std::string>();
+        }
+
+        if (vm.count("require-scan-data")) {
+            if (!vm.count("scan-volume")) {
+                std::cerr << "ERROR: --require-scan-data can only be used with --scan-volume" << std::endl;
+                return EXIT_FAILURE;
+            }
+            scan_policy = vc::util::SeedScanPolicy::Require;
+        }
+
         if (vm.count("segment-name")) {
             segment_name = vm["segment-name"].as<std::string>();
         }
@@ -359,6 +375,34 @@ int main(int argc, char *argv[])
     std::cout << "chunk shape shape "
               << "[" << chunk_shape_zyx[0] << ", " << chunk_shape_zyx[1] << ", " << chunk_shape_zyx[2] << "]"
               << std::endl;
+
+    std::shared_ptr<Volume> scan_volume;
+    if (!scan_path.empty()) {
+        const std::string scan_arg = scan_path.string();
+        scan_volume = is_remote_volume_path(scan_arg)
+            ? Volume::NewFromUrl(scan_arg)
+            : Volume::New(scan_path);
+        if (!scan_volume->hasScaleLevel(0)) {
+            std::cerr << "ERROR: scan volume has no full-resolution level 0, which the seed check reads;"
+                      << " present levels:";
+            for (int level : scan_volume->presentScaleLevels())
+                std::cerr << " " << level;
+            std::cerr << std::endl;
+            return EXIT_FAILURE;
+        }
+        const std::array<int, 3> scan_shape_zyx{
+            scan_volume->numSlices(),
+            scan_volume->sliceHeight(),
+            scan_volume->sliceWidth()};
+        if (scan_shape_zyx != volume_shape_zyx) {
+            std::cerr << "ERROR: scan volume shape "
+                      << "[" << scan_shape_zyx[0] << ", " << scan_shape_zyx[1] << ", " << scan_shape_zyx[2] << "]"
+                      << " differs from the traced volume's, so a seed coordinate is not the same voxel in both"
+                      << std::endl;
+            return EXIT_FAILURE;
+        }
+        std::cout << "scan volume " << scan_arg << std::endl;
+    }
 
     passTroughComputor pass;
     Chunked3d<uint8_t,passTroughComputor> tensor(pass, volume_shape_zyx, chunk_cache, 0);
@@ -598,6 +642,21 @@ int main(int argc, char *argv[])
                         << max_attempts << " attempts" << std::endl;
                 return EXIT_SUCCESS;
             }
+        }
+    }
+
+    if (scan_volume && mode != "resume" && mode != "gen_neighbor") {
+        const auto sample = vc::util::sampleSeedInScan(*scan_volume->chunkedCache(), origin);
+        const auto decision = vc::util::evaluateSeedScan(sample, origin, scan_policy);
+        if (decision.abort) {
+            std::cerr << "ERROR: " << decision.message << std::endl;
+            return EXIT_FAILURE;
+        }
+        if (!decision.message.empty()) {
+            std::cerr << "WARNING: " << decision.message
+                      << ". Pass --require-scan-data to refuse such a seed." << std::endl;
+        } else {
+            std::cout << "scan value at seed " << origin << " is " << sample.value << std::endl;
         }
     }
 
