@@ -34,9 +34,8 @@ class PatchNormals:
         self.cache.close()
 
 
-def load_patch_normals(path, *, z_begin, z_end, progress=None, device='cuda',
-                       exclusion_radius=8., cache_directory=None):
-    from compact_patch_normals import CompactPatchNormalPool
+def patch_normal_export_info(path):
+    """Validate a signed export without loading its normal payload."""
     path = Path(path)
     manifest = json.loads((path / 'manifest.json').read_text())
     if (manifest.get('artifact_type') != 'signed_patch_normal_volume'
@@ -55,7 +54,16 @@ def load_patch_normals(path, *, z_begin, z_end, progress=None, device='cuda',
         raise ValueError(f'{path}: unsupported patch-normal encoding')
     if meta.get('source_metadata', {}).get('cell_size_fitter_voxels') != cell_size:
         raise ValueError(f'{path}: patch-normal sidecar grid differs from manifest')
+    if meta.get('format') not in ('respool', 'compact_patch_normals'):
+        raise ValueError(f'{path}: unsupported patch-normal pool format')
     shape = tuple(int(v) for v in manifest['shape_zyx'])
+    return sidecar, cell_size, shape
+
+
+def load_patch_normals(path, *, z_begin, z_end, progress=None, device='cuda',
+                       exclusion_radius=8., cache_directory=None):
+    from compact_patch_normals import CompactPatchNormalPool
+    sidecar, cell_size, shape = patch_normal_export_info(path)
     z_roi = (max(0, int(np.floor(z_begin / cell_size))),
              min(shape[0], int(np.ceil(z_end / cell_size))))
     if progress is not None:

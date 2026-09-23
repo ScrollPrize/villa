@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from compact_patch_normals import CompactPatchNormalPool, _popcount
+from prepacked_patch_normals import (prepacked_cache_path, preprocess_patch_normal_pool)
 from sparse_cuda_cache import ResidentBrickPool
 from pack_resident_pools import open_pool
 
@@ -68,6 +69,65 @@ def test_rejects_nonempty_reserved_row(tmp_path):
         f.write(b'\x01')
     with pytest.raises(ValueError, match='reserved row'):
         CompactPatchNormalPool(tmp_path, device='cpu')
+
+
+@pytest.mark.parametrize('roi', [None, (0, 1), (17, 31), (1000, 1001)])
+@pytest.mark.parametrize('radius', [0., 2.])
+def test_prepacked_cache_matches_on_the_fly_and_skips_dense_channels(
+        tmp_path, monkeypatch, roi, radius):
+    import compact_patch_normals
+
+    source = tmp_path / 'source'
+    source.mkdir()
+    make_pool(source, 16)
+    expected = CompactPatchNormalPool(
+        source, z_roi=roi, device='cpu', batch_rows=2,
+        exclusion_radius_cells=radius)
+    cache_root = tmp_path / 'cache'
+    path = preprocess_patch_normal_pool(source, cache_root, batch_rows=2)
+    assert path == prepacked_cache_path(cache_root, source)
+    assert preprocess_patch_normal_pool(source, cache_root) == path
+
+    original_open_pool = compact_patch_normals.open_pool
+
+    class NoDenseReads:
+        def __getitem__(self, key):
+            raise AssertionError('prepacked load read a dense channel')
+
+    def no_dense_pool(path):
+        meta, table, coords, _channels = original_open_pool(path)
+        return meta, table, coords, [NoDenseReads()] * 3
+
+    monkeypatch.setattr(compact_patch_normals, 'open_pool', no_dense_pool)
+    actual = CompactPatchNormalPool(
+        source, z_roi=roi, device='cpu', batch_rows=2,
+        exclusion_radius_cells=radius, cache_directory=cache_root)
+    assert actual.prepacked_cache_used
+    indices = torch.from_numpy(np.indices((32, 16, 32)).reshape(3, -1).T.copy())
+    assert torch.equal(actual.gather(indices), expected.gather(indices))
+    actual_values, actual_near = actual.gather_with_exclusion(indices)
+    expected_values, expected_near = expected.gather_with_exclusion(indices)
+    assert torch.equal(actual_values, expected_values)
+    assert torch.equal(actual_near, expected_near)
+    assert actual.pool_bytes == expected.pool_bytes
+    actual.close()
+    expected.close()
+
+
+def test_prepacked_cache_is_invalidated_when_source_changes(tmp_path):
+    source = tmp_path / 'source'
+    source.mkdir()
+    make_pool(source, 4)
+    cache_root = tmp_path / 'cache'
+    old_path = preprocess_patch_normal_pool(source, cache_root, batch_rows=2)
+    channel = source / 'channel_0.u8'
+    with channel.open('r+b') as output:
+        output.seek(4 * 4 * 4 * 3)
+        output.write(b'\x01')
+    assert prepacked_cache_path(cache_root, source) != old_path
+    pool = CompactPatchNormalPool(source, device='cpu', cache_directory=cache_root)
+    assert not pool.prepacked_cache_used
+    pool.close()
 
 
 @pytest.mark.skipif(not os.environ.get('PATCH_NORMALS_TEST_EXPORT'),

@@ -121,7 +121,13 @@ def exclusion_cache_path(cache_directory, sidecar_dir, *, shape, brick, z_roi, r
     if cache_directory is None:
         return None
     root = Path(sidecar_dir).resolve()
-    names = ['meta.json', 'table.npy', 'brick_coords.npy'] + [f'channel_{i}.u8' for i in range(3)]
+    import json
+    source_format = json.loads((root / 'meta.json').read_text()).get('format')
+    if source_format == 'compact_patch_normals':
+        names = ['meta.json', 'table.npy', 'brick_coords.i32', 'bits.i64',
+                 'prefix.i16', 'offsets.i64', 'values.u8']
+    else:
+        names = ['meta.json', 'table.npy', 'brick_coords.npy'] + [f'channel_{i}.u8' for i in range(3)]
     signature = dict(version=1, source=str(root), shape=list(shape), brick=list(brick),
                      z_roi=z_roi, radius=float(radius),
                      files=[(name, (root / name).stat().st_size, (root / name).stat().st_mtime_ns)

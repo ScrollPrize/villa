@@ -1,7 +1,7 @@
 """Lossless, resident patch normals: bitmap/rank lookup into packed uint8 values.
 
-The on-disk respool remains unchanged. Startup stages compact CPU batches,
-then allocates the final device buffers once (no double-sized device concat).
+The on-disk respool remains unchanged. A prepacked cache can skip CPU
+compaction; otherwise startup stages compact CPU batches as before.
 """
 from __future__ import annotations
 
@@ -11,22 +11,8 @@ import numpy as np
 import torch
 
 from pack_resident_pools import open_pool
-from patch_normal_exclusion import pack_presence_bits
-
-
-def _pack(values):
-    """Pack (rows, cells, 3) bytes, retaining partially-zero valid vectors."""
-    present = np.any(values != 0, axis=-1)
-    rows, cells = present.shape
-    # Pad the final word for brick sizes not divisible by 64.
-    words = (cells + 63) // 64
-    padded = np.zeros((rows, words * 64), dtype=bool)
-    padded[:, :cells] = present
-    counts = padded.reshape(rows, words, 64).sum(axis=-1, dtype=np.int64)
-    prefix = (counts.cumsum(axis=1) - counts).astype(np.int16)
-    bits = pack_presence_bits(padded)
-    totals = counts.sum(axis=1)
-    return bits, prefix, totals, values[present]
+from prepacked_patch_normals import (open_direct_compact_export, open_prepacked_cache, pack_rows,
+                                    prepacked_cache_path)
 
 
 def _popcount(value):
@@ -47,12 +33,20 @@ class CompactPatchNormalPool:
                  exclusion_radius_cells=0., cache_directory=None):
         started = time.perf_counter()
         self.device = torch.device(device)
-        meta, table, coords, pools = open_pool(sidecar_dir)
+        import json
+        from pathlib import Path
+        source_format = json.loads((Path(sidecar_dir) / 'meta.json').read_text()).get('format')
+        direct = source_format == 'compact_patch_normals'
+        if direct:
+            meta, table, coords, direct_data = open_direct_compact_export(sidecar_dir)
+            pools = None
+        else:
+            meta, table, coords, pools = open_pool(sidecar_dir)
         self.meta = meta
         self.shape_zyx = tuple(meta['array_shape'])
         brick = tuple(meta['brick_shape'])
         cells = int(np.prod(brick))
-        if len(pools) != 3 or cells > 32767:
+        if (pools is not None and len(pools) != 3) or cells > 32767:
             raise ValueError('compact patch normals require three channels and <=32767 cells per brick')
         if expected_shape_zyx is not None and tuple(expected_shape_zyx) != self.shape_zyx:
             raise ValueError('patch-normal pool shape differs from manifest')
@@ -73,22 +67,35 @@ class CompactPatchNormalPool:
         self.total_bricks = rows
         remap = np.zeros(rows, dtype=np.int32)
         remap[ids] = np.arange(len(ids), dtype=np.int32)
-        # Stage only compact bytes on the host; raw batches are bounded.
+        prepacked_path = None if direct else prepacked_cache_path(cache_directory, sidecar_dir)
+        prepacked = direct_data if direct else open_prepacked_cache(prepacked_path, meta)
+        self.prepacked_cache_used = prepacked is not None
         batches = []
         total_values = 1  # reserved zero vector for absent cells
-        for lo in range(0, len(ids), batch_rows):
-            selected = ids[lo:lo + batch_rows]
-            raw = np.stack([p[selected] for p in pools], axis=-1)
-            bits, prefix, counts, packed = _pack(raw)
-            if lo == 0 and counts[0] != 0:
-                raise ValueError('patch-normal reserved row 0 must be empty')
-            offsets = counts.cumsum() - counts + total_values
-            total_values += int(counts.sum())
-            batches.append((lo, bits, prefix, offsets, packed))
-            del raw
+        selected_offsets = None
+        if prepacked is not None:
+            counts = prepacked.offsets[ids + 1] - prepacked.offsets[ids]
+            selected_offsets = np.empty(len(ids) + 1, dtype=np.int64)
+            selected_offsets[0] = 1
+            selected_offsets[1:] = 1 + counts.cumsum()
+            total_values = int(selected_offsets[-1])
             if progress_callback:
-                progress_callback(min(lo + batch_rows, len(ids)), len(ids),
-                                  'compacting patch normals on CPU')
+                progress_callback(1, 1, 'reusing prepacked patch normals')
+        else:
+            # Stage only compact bytes on the host; raw batches are bounded.
+            for lo in range(0, len(ids), batch_rows):
+                selected = ids[lo:lo + batch_rows]
+                raw = np.stack([p[selected] for p in pools], axis=-1)
+                bits, prefix, counts, packed = pack_rows(raw)
+                if lo == 0 and counts[0] != 0:
+                    raise ValueError('patch-normal reserved row 0 must be empty')
+                offsets = counts.cumsum() - counts + total_values
+                total_values += int(counts.sum())
+                batches.append((lo, bits, prefix, offsets, packed))
+                del raw
+                if progress_callback:
+                    progress_callback(min(lo + batch_rows, len(ids)), len(ids),
+                                      'compacting patch normals on CPU')
         words = (cells + 63) // 64
         table = remap[table]
         exclusion_arrays = None
@@ -102,7 +109,8 @@ class CompactPatchNormalPool:
                 z_roi=z_roi, radius=exclusion_radius_cells)
             exclusion_arrays = load_exclusion_mask(cache_path, table.shape, words)
             if exclusion_arrays is None:
-                source_bits = np.concatenate([batch[1] for batch in batches])
+                source_bits = (np.asarray(prepacked.bits[ids]) if prepacked is not None
+                               else np.concatenate([batch[1] for batch in batches]))
                 exclusion_arrays = build_exclusion_mask(
                     table, source_bits, brick, self.shape_zyx, exclusion_radius_cells,
                     z_roi=z_roi, progress_callback=progress_callback)
@@ -118,15 +126,41 @@ class CompactPatchNormalPool:
         self.offsets = torch.empty(len(ids), dtype=torch.int64, device=self.device)
         self.values = torch.empty((total_values, 3), dtype=torch.uint8, device=self.device)
         self.values[0] = 0
-        # Pop batches as they are uploaded so CPU staging memory is released.
-        while batches:
-            lo, bits, prefix, offsets, packed = batches.pop()
-            end = lo + len(bits)
-            self.bits[lo:end].copy_(torch.from_numpy(bits))
-            self.prefix[lo:end].copy_(torch.from_numpy(prefix))
-            self.offsets[lo:end].copy_(torch.from_numpy(offsets))
-            begin = int(offsets[0])
-            self.values[begin:begin + len(packed)].copy_(torch.from_numpy(packed))
+        if prepacked is not None:
+            for lo in range(0, len(ids), batch_rows):
+                hi = min(lo + batch_rows, len(ids))
+                selected = ids[lo:hi]
+                self.bits[lo:hi].copy_(torch.from_numpy(np.asarray(prepacked.bits[selected])))
+                self.prefix[lo:hi].copy_(torch.from_numpy(np.asarray(prepacked.prefix[selected])))
+                self.offsets[lo:hi].copy_(torch.from_numpy(selected_offsets[lo:hi].copy()))
+                if progress_callback:
+                    progress_callback(hi, len(ids), 'loading prepacked patch normals')
+            # Consecutive source rows have consecutive packed values. Copy
+            # each run in bounded chunks without unpacking the dense channels.
+            breaks = np.flatnonzero(np.diff(ids) != 1) + 1
+            run_starts = np.r_[0, breaks]
+            run_ends = np.r_[breaks, len(ids)]
+            for first, end in zip(run_starts, run_ends):
+                source = int(prepacked.offsets[ids[first]])
+                destination = int(selected_offsets[first])
+                remaining = int(selected_offsets[end] - selected_offsets[first])
+                while remaining:
+                    count = min(remaining, 8_000_000)
+                    values = np.asarray(prepacked.values[source:source + count]).copy()
+                    self.values[destination:destination + count].copy_(torch.from_numpy(values))
+                    source += count
+                    destination += count
+                    remaining -= count
+        else:
+            # Pop batches as they are uploaded so CPU staging memory is released.
+            while batches:
+                lo, bits, prefix, offsets, packed = batches.pop()
+                end = lo + len(bits)
+                self.bits[lo:end].copy_(torch.from_numpy(bits))
+                self.prefix[lo:end].copy_(torch.from_numpy(prefix))
+                self.offsets[lo:end].copy_(torch.from_numpy(offsets))
+                begin = int(offsets[0])
+                self.values[begin:begin + len(packed)].copy_(torch.from_numpy(packed))
         self.table = torch.from_numpy(table).to(self.device)
         self.exclusion_bytes = 0
         if exclusion_arrays is not None:
@@ -139,7 +173,8 @@ class CompactPatchNormalPool:
         self.load_seconds = time.perf_counter() - started
         print(f'patch normals: compact pool {self.pool_bytes / 1024**3:.2f} GiB '
               f'(formerly {self.dense_pool_bytes / 1024**3:.2f} GiB), '
-              f'{total_values - 1:,} occupied cells loaded in {self.load_seconds:.1f}s', flush=True)
+              f'{total_values - 1:,} occupied cells loaded in {self.load_seconds:.1f}s'
+              f'{" from direct compact export" if direct else " from prepacked cache" if self.prepacked_cache_used else ""}', flush=True)
         if self.exclusion is not None:
             print(f'patch normals: exclusion mask {self.exclusion_bytes / 1024**2:.1f} MiB '
                   f'(included above), radius {exclusion_radius_cells:g} export cells', flush=True)
