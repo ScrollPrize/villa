@@ -27,6 +27,10 @@
 class QuadSurface;
 class SurfacePatchIndex;
 
+// Interpolation used by QuadSurface::gen() when resampling the point grid.
+// See QuadSurface::setGenInterpolation() for what each mode does.
+enum class GenInterpolation { Linear, Smooth };
+
 // Reference to a valid point in the grid (for iteration)
 template<typename PointType>
 struct PointRef {
@@ -335,6 +339,24 @@ public:
     void shiftSurfaceOrigin(const cv::Vec2d& delta);
     [[nodiscard]] SurfaceSample sampleAtSurface(const cv::Vec2d& surface) const;
 
+    // How gen() resamples the point grid into the output raster.
+    //
+    // Linear  — bilinear positions, nearest-neighbour normals resampled from
+    //           the per-vertex normal cache. The source grid is typically much
+    //           coarser than the render (scale 0.05 => one cell spans ~20x20
+    //           output pixels), so the normal is piecewise-constant over those
+    //           blocks and any surface offset along it steps at cell edges.
+    // Smooth  — bicubic (Catmull-Rom) positions with the normal differentiated
+    //           analytically from the same basis, so the position field is C1
+    //           and the normal field is continuous. Pixels whose 4x4 support is
+    //           incomplete (holes, grid border) fall back to the exact Linear
+    //           result, so the valid footprint is unchanged.
+    //
+    // Set this before any concurrent gen(); like setStrictQuadRenderValidity it
+    // is not synchronized against in-flight renders.
+    void setGenInterpolation(GenInterpolation m) { _genInterpolation = m; }
+    [[nodiscard]] GenInterpolation genInterpolation() const { return _genInterpolation; }
+
     // The legacy renderer treats native vertex validity as pixel coverage.
     // Spiral's drawn-input view opts into the stricter contract that a rendered
     // location must be backed by a complete bilinear quad. The default remains
@@ -423,6 +445,11 @@ public:
     // because gen() can be called from concurrent OMP threads.
     mutable std::atomic<bool> _validMaskAllValid{false};
     mutable cv::Mat_<cv::Vec3f> _normalCache;
+    // 4x4 Catmull-Rom support mask over the source grid, built lazily and only
+    // in Smooth mode. cubicOk(r,c) != 0 iff the stencil anchored at floor cell
+    // (r,c) is complete, so gen() can pick interpolant per pixel with one load
+    // instead of testing sixteen points.
+    mutable cv::Mat_<uint8_t> _cubicSupportCache;
     // Guards derived-cache construction, invalidation and snapshot acquisition.
     // Readers retain immutable, reference-counted Mat snapshots after unlocking,
     // so unloadCaches() can evict the cache without freeing in-flight data.
@@ -508,10 +535,13 @@ protected:
     // Each pair is [col_start, col_end). Empty = single contiguous surface.
     std::vector<std::pair<int,int>> _components;
     bool _strictQuadRenderValidity = false;
+    GenInterpolation _genInterpolation = GenInterpolation::Linear;
     float dpi_ = 0.f;
 
 private:
     cv::Mat_<uint8_t> validMaskSnapshot(bool* allValid) const;
+    // Lazily built, _cacheMutex-guarded snapshot of _cubicSupportCache.
+    cv::Mat_<uint8_t> cubicSupportSnapshot() const;
 
     // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.
     void writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel = "");

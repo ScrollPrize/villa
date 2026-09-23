@@ -227,6 +227,34 @@ bool loc_valid_xy(const cv::Mat_<float> &m, const cv::Vec2d &l) {
     return loc_valid_xy_scalar(m, l);
 }
 
+bool loc_valid_cubic(const cv::Mat_<cv::Vec3f> &m, const cv::Vec2d &l)
+{
+    if (m.rows < 4 || m.cols < 4 ||
+        !std::isfinite(l[0]) || !std::isfinite(l[1]))
+        return false;
+
+    const int row = static_cast<int>(std::floor(l[0]));
+    const int col = static_cast<int>(std::floor(l[1]));
+
+    // The 4x4 stencil reaches one cell back and two forward.
+    if (row < 1 || row > m.rows - 3 || col < 1 || col > m.cols - 3)
+        return false;
+
+    for (int dy = -1; dy <= 2; ++dy) {
+        const cv::Vec3f* r = m.ptr<cv::Vec3f>(row + dy);
+        for (int dx = -1; dx <= 2; ++dx) {
+            const float v = r[col + dx][0];
+            if (v == -1.f || !std::isfinite(v))
+                return false;
+        }
+    }
+    return true;
+}
+
+bool loc_valid_cubic_xy(const cv::Mat_<cv::Vec3f> &m, const cv::Vec2d &l)
+{
+    return loc_valid_cubic(m, {l[1], l[0]});
+}
 
 float tdist(const cv::Vec3f &a, const cv::Vec3f &b, float t_dist)
 {
