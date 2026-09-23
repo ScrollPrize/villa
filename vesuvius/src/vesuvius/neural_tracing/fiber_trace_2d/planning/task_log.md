@@ -1,26 +1,24 @@
 # Task log
 
-## 2026-09-18
+## 2026-09-22
 
-- Began an inventory of current benchmark families, canonical configs, approved
-  runner modes and detailed result reports. This task is documentation-only and
-  will not launch evaluation workloads.
-- Independent plan review identified missing taxonomy, immutable-evidence,
-  lifecycle and completion-check details. Expanded the plan before writing docs.
-- Added `docs/benchmark_runbook.md` as the central index. It separates the
-  canonical five-scroll scientific evaluation, frozen failure-enriched short200,
-  current beam/fiberlet comparison, anchor/mini5/contrast diagnostics,
-  performance profiles and historical model/embedding evidence.
-- Explicitly retained short200 v3 as immutable evidence and marked the later
-  ground-truth review directory as an unpromoted annotation-audit draft.
-- Linked the runbook from the live-inference, short-failure, fiberlet and anchor
-  entry docs; added durable specification and changelog entries.
+- Diagnosed the pessimistic ETA: processed-tile wall time was multiplied by all
+  remaining candidates, even though most candidates in sparse volumes are
+  empty and complete quickly.
+- Planned separate empty-input and resume-complete skip counters. The estimator
+  will learn sparsity only from processed plus empty tiles, and will not add a
+  pre-scan or source read to the resume path.
+- Implemented skip classification using the output/source checks already made
+  by tile work discovery. The existing early resume rejection remains intact;
+  classification adds only counter bookkeeping.
+- Changed tile ETA to `observed wall / (processed + empty) * remaining`.
+  Resume-complete candidates are excluded from the denominator, so a completed
+  prefix cannot make the unfinished suffix appear free.
+- Added clean-sparse, resume-prefix and resume-only ETA regression cases.
 - Validation:
-  - runner `--help` succeeded and exposed every documented mode;
-  - all 40 Markdown links resolve in the worktree;
-  - all 21 absolute JSON configs named by commands exist and parse;
-  - initial focused pytest collection lacked the repository `PYTHONPATH` and
-    failed before running tests;
-  - rerun with `PYTHONPATH=/home/hendrik/villa2/vesuvius/src:/home/hendrik/villa2`
-    passed 21 tests in 2.89 seconds.
-- No benchmark, inference, rendering or GPU workload was launched.
+  - focused ETA tests: 4 passed;
+  - `py_compile` passed for the shared runner, compatibility wrapper and tests;
+  - `git diff --check` passed.
+- Broader end-to-end tests were started but did not reach their first result in
+  the available interval on the busy host and were stopped; no GPU workload was
+  launched by this change.

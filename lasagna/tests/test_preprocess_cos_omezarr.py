@@ -54,6 +54,7 @@ from preprocess_cos_omezarr import (
 	_omezarr_chunk_exists,
 	_omezarr_chunk_group_complete,
 	_predict3d_overall_eta,
+	_predict3d_tile_eta,
 	cli_main,
 	run_preprocess_3d,
 )
@@ -1150,7 +1151,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["download_workers"], 123)
 		self.assertEqual(kwargs["ome_compressor"], "none")
 
-	def test_predict3d_overall_eta_uses_processed_counts_not_skipped_done(self):
+	def test_predict3d_overall_eta_uses_processed_counts_for_dense_work(self):
 		progress = {
 			"tiles_total": 100,
 			"tiles_done": 90,
@@ -1163,6 +1164,48 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		}
 
 		self.assertEqual(_predict3d_overall_eta(progress), " | overall eta 02:50")
+
+	def test_predict3d_tile_eta_extrapolates_observed_empty_fraction(self):
+		progress = {
+			"tiles_total": 100,
+			"tiles_done": 60,
+			"tiles_processed": 15,
+			"tiles_skipped_empty": 45,
+			"tiles_skipped_resume": 0,
+			"tile_time_sum": 30.0,
+		}
+
+		# 75% of clean-run candidates were empty, so only 10 of the 40
+		# remaining candidates are predicted to consume processed-tile time.
+		self.assertEqual(_predict3d_tile_eta(progress), 20.0)
+		self.assertEqual(_predict3d_overall_eta(progress), " | overall eta 00:20")
+
+	def test_predict3d_tile_eta_does_not_extrapolate_resume_skips(self):
+		progress = {
+			"tiles_total": 100,
+			"tiles_done": 90,
+			"tiles_processed": 5,
+			"tiles_skipped_empty": 5,
+			"tiles_skipped_resume": 80,
+			"tile_time_sum": 10.0,
+		}
+
+		# Resume skips are commonly a completed prefix. They do not imply that
+		# the unfinished suffix will also be skipped; only the 50% empty fraction
+		# observed among clean-run candidates reduces the remaining estimate.
+		self.assertEqual(_predict3d_tile_eta(progress), 10.0)
+
+	def test_predict3d_tile_eta_waits_for_nonresume_observation(self):
+		progress = {
+			"tiles_total": 100,
+			"tiles_done": 80,
+			"tiles_processed": 0,
+			"tiles_skipped_empty": 0,
+			"tiles_skipped_resume": 80,
+			"tile_time_sum": 0.0,
+		}
+
+		self.assertIsNone(_predict3d_tile_eta(progress))
 
 	def test_predict3d_status_reports_finalized_z_after_band_flush(self):
 		with tempfile.TemporaryDirectory() as td:

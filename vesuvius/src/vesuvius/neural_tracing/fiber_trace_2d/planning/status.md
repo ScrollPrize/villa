@@ -1,10 +1,9 @@
 # Status
 
-- [x] Capture the documentation task.
+- [x] Capture the ETA correction task.
 - [x] Write the implementation plan.
-- [x] Complete independent plan review.
-- [x] Audit current runner modes, configurations and result reports.
-- [x] Write the benchmark runbook.
-- [x] Update specification/changelog/task log.
-- [x] Validate paths, configs and focused tests.
-- [x] Complete final formatting/diff check.
+- [x] Separate empty and resume skip accounting.
+- [x] Apply sparse-work ETA extrapolation.
+- [x] Add regression tests.
+- [x] Update specification/task log.
+- [x] Run focused validation and diff checks.

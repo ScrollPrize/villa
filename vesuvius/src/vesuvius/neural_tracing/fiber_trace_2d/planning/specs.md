@@ -703,6 +703,11 @@
   Resume/skipped work is rejected before read submission. The lazy prefetch
   window is `prefetch_tiles_per_gpu * selected_device_count` (CPU/single-device
   counts as one) and is independent of GPU shared-memory slots.
+- Whole-volume inference ETA extrapolates the observed empty-input tile fraction
+  from processed plus empty candidates. Already-complete output skipped during
+  resume is counted separately and never treated as evidence that unfinished
+  candidates will be empty. ETA accounting adds no eager output scan or source
+  read to the resume path.
 - Every outstanding TensorStore read may own a full padded input tile. Input
   memory is bounded by that window times tile bytes, plus the separately bounded
   TensorStore cache, existing input/result shared memory, and request/cache

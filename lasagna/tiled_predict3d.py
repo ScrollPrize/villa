@@ -1356,19 +1356,43 @@ def _eta_from_processed_rate(time_sum: float, processed: int, remaining: int) ->
 	return max(0.0, float(time_sum) / float(processed) * float(remaining))
 
 
+def _predict3d_tile_eta(progress: Mapping[str, Any]) -> float | None:
+	"""Estimate inference ETA while preserving the observed empty-tile ratio.
+
+	Resume-complete tiles are deliberately excluded from the observation.  They
+	describe durable output state, not input sparsity, and are commonly clustered
+	at the beginning of a resumed run.  Extrapolating them would therefore make a
+	resume ETA collapse just before inference reaches unfinished output.
+	"""
+	processed = int(progress.get("tiles_processed", 0))
+	empty = int(progress.get("tiles_skipped_empty", 0))
+	remaining = max(0, int(progress.get(
+		"tiles_remaining_est",
+		max(0, int(progress.get("tiles_total", 0)) - int(progress.get("tiles_done", 0))),
+	)))
+	if remaining == 0:
+		return 0.0 if processed > 0 else None
+	observed_clean_tiles = processed + empty
+	if processed <= 0 or observed_clean_tiles <= 0:
+		return None
+	# Each observed clean-run candidate consumed tile_time_sum / observed_clean_tiles
+	# on average: expensive processed tiles contribute wall time while empty tiles
+	# contribute to the denominator.  This is equivalent to applying the observed
+	# empty fraction to the remaining candidate count.
+	return max(
+		0.0,
+		float(progress.get("tile_time_sum", 0.0))
+		/ float(observed_clean_tiles)
+		* float(remaining),
+	)
+
+
 def _predict3d_overall_eta(progress: dict | None) -> str:
 	if progress is None:
 		return ""
 	eta = 0.0
 	have_rate = False
-	tile_eta = _eta_from_processed_rate(
-		float(progress.get("tile_time_sum", 0.0)),
-		int(progress.get("tiles_processed", 0)),
-		int(progress.get(
-			"tiles_remaining_est",
-			max(0, int(progress.get("tiles_total", 0)) - int(progress.get("tiles_done", 0))),
-		)),
-	)
+	tile_eta = _predict3d_tile_eta(progress)
 	if tile_eta is not None:
 		eta += tile_eta
 		have_rate = True
@@ -1407,11 +1431,7 @@ def _predict3d_progress_line(progress: dict) -> str:
 	done = int(progress.get("tiles_done", 0))
 	processed = int(progress.get("tiles_processed", 0))
 	tile_time_sum = float(progress.get("tile_time_sum", 0.0))
-	tile_eta = _eta_from_processed_rate(
-		tile_time_sum,
-		processed,
-		int(progress.get("tiles_remaining_est", max(0, total - done))),
-	)
+	tile_eta = _predict3d_tile_eta(progress)
 	if tile_eta is None:
 		eta_text = "--:--"
 	else:
@@ -3367,7 +3387,13 @@ def run_tiled_inference_3d(
 			)
 		return bool(cache[origin])
 
-	def _needed_chunks(sd: int, g: dict[str, Any], reg: RegionZYX) -> dict[ChunkOriginZYX, tuple[OutputProductSpec, ...]]:
+	def _needed_chunks(
+		sd: int,
+		g: dict[str, Any],
+		reg: RegionZYX,
+		*,
+		outcome: dict[str, int] | None = None,
+	) -> dict[ChunkOriginZYX, tuple[OutputProductSpec, ...]]:
 		shape = g["full_shape"]
 		needed: dict[ChunkOriginZYX, tuple[OutputProductSpec, ...]] = {}
 		for origin in _iter_chunk_origins_for_region(*reg, g["oc"], shape):
@@ -3376,10 +3402,16 @@ def run_tiled_inference_3d(
 				if not output_adapter.product_chunk_complete(p, chunk_origin_zyx=origin)
 			)
 			if not missing:
+				if outcome is not None:
+					outcome["complete"] = outcome.get("complete", 0) + 1
 				g["resume_origins"].add(origin)
 			elif _chunk_supported(sd, g, origin):
+				if outcome is not None:
+					outcome["supported"] = outcome.get("supported", 0) + 1
 				needed[origin] = missing
 			else:
+				if outcome is not None:
+					outcome["unsupported"] = outcome.get("unsupported", 0) + 1
 				g["unsupported_origins"].add(origin)
 		return needed
 
@@ -3414,15 +3446,16 @@ def run_tiled_inference_3d(
 					return True
 		return False
 
-	def _tile_work(tz: int, ty: int, tx: int) -> tuple[str, ...]:
+	def _tile_work(tz: int, ty: int, tx: int) -> tuple[tuple[str, ...], str | None]:
 		bounds = _tile_input_bounds(tz, ty, tx)
 		has_source = (
 			live_cache.region_has_remote_chunks(bounds)
 			if live_cache is not None else _input_has_chunks(input_dir, *bounds)
 		)
 		if not has_source:
-			return ()
+			return (), "empty"
 		needed_names: set[str] = set()
+		outcome: dict[str, int] = {}
 		for sd, g in groups.items():
 			Zo, Yo, Xo = g["shape"]
 			ts = tile_size // sd
@@ -3434,9 +3467,15 @@ def run_tiled_inference_3d(
 				max(oy0, oy0 + clips[1][0] - b), min(oy1, oy0 + clips[1][1] - b),
 				max(ox0, ox0 + clips[2][0] - b), min(ox1, ox0 + clips[2][1] - b),
 			)
-			for missing in _needed_chunks(sd, g, reg).values():
+			for missing in _needed_chunks(sd, g, reg, outcome=outcome).values():
 				needed_names.update(product.name for product in missing)
-		return tuple(sorted(needed_names))
+		if needed_names:
+			return tuple(sorted(needed_names)), None
+		# An incomplete but unsupported output is a sparse/empty skip.  Only a tile
+		# whose relevant output is entirely complete is a resume skip.
+		if outcome.get("unsupported", 0) > 0 or not outcome:
+			return (), "empty"
+		return (), "resume"
 
 	def _accumulate_group(
 		sd: int, g: dict[str, Any], product_np: Mapping[str, np.ndarray],
@@ -3858,28 +3897,60 @@ def run_tiled_inference_3d(
 
 	total = len(z_positions) * len(y_positions) * len(x_positions)
 	done = processed = skipped = 0
+	skipped_empty = skipped_resume = 0
 	tile_time = 0.0
 	t0 = time.time()
+	eta_started_at: float | None = None
 	if progress is not None:
-		progress.update(tiles_total=total, tiles_done=0, tiles_processed=0, tiles_skipped=0, tile_time_sum=0.0, tiles_remaining_est=total)
+		progress.update(
+			tiles_total=total, tiles_done=0, tiles_processed=0, tiles_skipped=0,
+			tiles_skipped_empty=0, tiles_skipped_resume=0,
+			tile_time_sum=0.0, tiles_remaining_est=total,
+		)
 		if live_cache is not None:
 			progress["live_cache"] = live_cache.snapshot()
 	print(_predict3d_progress_line(progress) if progress is not None else f"[predict3d] 0/{total} tiles", flush=True)
 	progress_emitter = _Predict3dProgressEmitter()
 	try:
-		def _record_commit(*, was_processed: bool, elapsed: float, row_end: bool, next_tz: int) -> None:
-			nonlocal done, processed, skipped, tile_time
+		def _record_commit(
+			*,
+			was_processed: bool,
+			elapsed: float,
+			row_end: bool,
+			next_tz: int,
+			skip_reason: str | None = None,
+		) -> None:
+			nonlocal done, processed, skipped, skipped_empty, skipped_resume
+			nonlocal tile_time, eta_started_at
 			done += 1
 			if was_processed:
+				if skip_reason is not None:
+					raise ValueError(f"processed tile cannot have skip_reason={skip_reason!r}")
 				processed += 1
+				if eta_started_at is None:
+					eta_started_at = time.time() - (max(0.0, float(elapsed)) if parallel else 0.0)
 				# Parallel ETA is based on observed committed throughput, not the
 				# sum of overlapping per-GPU durations (which would overestimate by
 				# approximately the worker count).
-				tile_time = time.time() - t0 if parallel else tile_time + float(elapsed)
+				tile_time = time.time() - eta_started_at if parallel else tile_time + float(elapsed)
 			else:
 				skipped += 1
+				if skip_reason == "empty":
+					skipped_empty += 1
+					if eta_started_at is None:
+						eta_started_at = time.time()
+					if parallel:
+						tile_time = time.time() - eta_started_at
+				elif skip_reason == "resume":
+					skipped_resume += 1
+				else:
+					raise ValueError(f"skipped tile requires known skip_reason, got {skip_reason!r}")
 			if progress is not None:
-				progress.update(tiles_done=done, tiles_processed=processed, tiles_skipped=skipped, tile_time_sum=tile_time, tiles_remaining_est=total-done)
+				progress.update(
+					tiles_done=done, tiles_processed=processed, tiles_skipped=skipped,
+					tiles_skipped_empty=skipped_empty, tiles_skipped_resume=skipped_resume,
+					tile_time_sum=tile_time, tiles_remaining_est=total-done,
+				)
 				if live_cache is not None:
 					progress["live_cache"] = live_cache.snapshot()
 			status = _predict3d_progress_line(progress) if progress is not None else f"[predict3d] {done}/{total} tiles"
@@ -3929,7 +4000,7 @@ def run_tiled_inference_3d(
 							coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz,
 						)
 						if not _tile_may_need_output(tz, ty, tx):
-							event.update(status="done_skip", needed=())
+							event.update(status="done_skip", needed=(), skip_reason="resume")
 						else:
 							event.update(
 								status="fetching",
@@ -3945,7 +4016,7 @@ def run_tiled_inference_3d(
 							return False
 						task.result()
 						tz, ty, tx = event["coord"]
-						event["needed"] = _tile_work(tz, ty, tx)
+						event["needed"], event["skip_reason"] = _tile_work(tz, ty, tx)
 						event["status"] = "awaiting_read" if event["needed"] else "done_skip"
 						return True
 
@@ -3999,19 +4070,25 @@ def run_tiled_inference_3d(
 						tz, ty, tx, row_end, next_tz = next(serial_source)
 					except StopIteration:
 						return None
-					needed = _tile_work(tz, ty, tx)
+					needed, skip_reason = _tile_work(tz, ty, tx)
 					tile_np = None if not needed else _read_tile_zarr(
 						zarr_arr, volume_shape, (z0, y0, x0), tz, ty, tx, tile_size, pad,
 					)
-					return dict(coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz, needed=needed, tile=tile_np)
+					return dict(
+						coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz,
+						needed=needed, skip_reason=skip_reason, tile=tile_np,
+					)
 				while not serial_source_done and len(serial_pending) < int(prefetch_tiles_per_gpu):
 					try:
 						tz, ty, tx, row_end, next_tz = next(serial_source)
 					except StopIteration:
 						serial_source_done = True
 						break
-					needed = _tile_work(tz, ty, tx)
-					event = dict(coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz, needed=needed)
+					needed, skip_reason = _tile_work(tz, ty, tx)
+					event = dict(
+						coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz,
+						needed=needed, skip_reason=skip_reason,
+					)
 					if needed:
 						event["read_task"] = serial_reader.submit(
 							volume_shape=volume_shape, crop_offset=(z0, y0, x0), coord=(tz, ty, tx),
@@ -4033,7 +4110,10 @@ def run_tiled_inference_3d(
 					row_end, next_tz, needed_names = event["row_end"], event["next_tz"], event["needed"]
 					_pump_pending_flush(block=False)
 					if not needed_names:
-						_record_commit(was_processed=False, elapsed=0.0, row_end=row_end, next_tz=next_tz)
+						_record_commit(
+							was_processed=False, elapsed=0.0, row_end=row_end,
+							next_tz=next_tz, skip_reason=event["skip_reason"],
+						)
 						continue
 					tile_t0 = time.time()
 					if serial_reader is None:
@@ -4623,7 +4703,7 @@ def run_tiled_inference_3d(
 								coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz, band=int(tz),
 							)
 							if not _tile_may_need_output(tz, ty, tx):
-								event.update(status="done_skip", needed=())
+								event.update(status="done_skip", needed=(), skip_reason="resume")
 							else:
 								event.update(
 									status="fetching",
@@ -4654,8 +4734,9 @@ def run_tiled_inference_3d(
 								coord=(tz, ty, tx), row_end=row_end, next_tz=active_band.next_z,
 								band=active_band.z,
 							)
-							needed_names = _tile_work(tz, ty, tx)
+							needed_names, skip_reason = _tile_work(tz, ty, tx)
 							event["needed"] = needed_names
+							event["skip_reason"] = skip_reason
 							event["status"] = "reading" if needed_names else "done_skip"
 							events[next_sequence] = event
 							if needed_names:
@@ -4673,7 +4754,7 @@ def run_tiled_inference_3d(
 							continue
 						cache_task.result()
 						tz, ty, tx = event["coord"]
-						event["needed"] = _tile_work(tz, ty, tx)
+						event["needed"], event["skip_reason"] = _tile_work(tz, ty, tx)
 						event["status"] = "awaiting_read" if event["needed"] else "done_skip"
 						made_progress = True
 					for seq, event in events.items():
@@ -4828,7 +4909,10 @@ def run_tiled_inference_3d(
 					while next_commit in events and events[next_commit]["status"] in ("done_skip", "done_accum"):
 						event = events.pop(next_commit)
 						if event["status"] == "done_skip":
-							_record_commit(was_processed=False, elapsed=0.0, row_end=event["row_end"], next_tz=event["next_tz"])
+							_record_commit(
+								was_processed=False, elapsed=0.0, row_end=event["row_end"],
+								next_tz=event["next_tz"], skip_reason=event["skip_reason"],
+							)
 						else:
 							_record_commit(was_processed=True, elapsed=event["gpu_elapsed"], row_end=event["row_end"], next_tz=event["next_tz"])
 						if active_band is None or int(event["band"]) != active_band.z:

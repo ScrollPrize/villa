@@ -1,6 +1,6 @@
 # Task
 
-Document the currently relevant fiber-tracing benchmark families and the exact
-commands used to create, run, render and review them. Distinguish authoritative
-benchmarks from focused tuning/diagnostic workloads and historical results.
-Link existing result reports and identify the canonical current configurations.
+Correct whole-volume inference ETA estimation so it extrapolates the observed
+empty-input tile fraction. Resume skips caused by already-complete output must
+not be treated as empty tiles or bias that fraction. Preserve the fast resume
+path: the correction must not add a whole-volume pre-scan or extra source I/O.
