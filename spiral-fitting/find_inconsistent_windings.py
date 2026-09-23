@@ -714,7 +714,8 @@ def solve_min_edge_fix(reached, rel_adjacency, strip_delta, allowed_edge_keys=No
 
     if not edges:
         return {
-            'num_edges_considered': 0, 'num_edges_changed': 0, 'num_edges_unmeasurable': num_unmeasurable,
+            'num_edges_considered': 0, 'num_edges_editable': 0, 'num_edges_changed': 0,
+            'num_edges_unmeasurable': num_unmeasurable,
             'solver_status': 'no edges', 'objective': 0.0, 'edges': [],
         }
 
@@ -779,6 +780,7 @@ def solve_min_edge_fix(reached, rel_adjacency, strip_delta, allowed_edge_keys=No
             out_edges.append(out)
     return {
         'num_edges_considered': m,
+        'num_edges_editable': int(sum(e['editable'] for e in edges)),
         'num_edges_changed': len(out_edges),
         'num_edges_unmeasurable': num_unmeasurable,
         'solver_status': res.message,
@@ -1283,12 +1285,13 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
     min_edge_fix = None
     if min_fix and detect_loops:
         print(f'\nsolving minimal-fix MILP (fewest relative edges to change so all loops close); '
-              f'restricted to {len(inconsistent_cycle_edge_keys)} edge(s) on inconsistent cycle(s)')
+              f'edits restricted to {len(inconsistent_cycle_edge_keys)} edge(s) on inconsistent cycle(s)')
         min_edge_fix = solve_min_edge_fix(reached, rel_adjacency, loop_patch_strip_delta,
                                           allowed_edge_keys=inconsistent_cycle_edge_keys,
                                           time_limit=min_fix_time_limit)
         print(f'minimal fix: change {min_edge_fix["num_edges_changed"]} relative edge(s) '
-              f'(of {min_edge_fix["num_edges_considered"]} considered'
+              f'(of {min_edge_fix["num_edges_considered"]} considered, '
+              f'{min_edge_fix["num_edges_editable"]} editable'
               + (f', {min_edge_fix["num_edges_unmeasurable"]} unmeasurable' if min_edge_fix["num_edges_unmeasurable"] else '')
               + f'); solver: {min_edge_fix["solver_status"]}')
         for e in min_edge_fix['edges']:
