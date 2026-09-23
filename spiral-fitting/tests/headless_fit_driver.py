@@ -1,14 +1,12 @@
-"""Golden-run driver: one short headless fit, executed the same way the
+"""Headless fit driver: one short headless fit, executed the same way the
 fit_spiral CLI drives it, with dataset locations supplied by a JSON spec
 instead of edits to fit_spiral module globals.
 
-This is the measurement half of the golden-run characterization harness
-(REFACTOR_PLAN.md, PR 1 commit 0). It is meant to run as a subprocess so
-each run gets a fresh interpreter, CUDA context, and RNG state:
+    python tests/headless_fit_driver.py <spec.json> <result.json> <out_dir>
 
-    python tests/golden_run_driver.py <spec.json> <result.json> <out_dir>
-
-It records, into <result.json>:
+The default spec is tests/headless_fit_spec.json (z 10000-11000, 401
+iterations, on the local PHercParis4 dataset; needs a GPU, ~1 minute). It
+records, into <result.json>:
   - the fully resolved (z-range-scaled) config actually used;
   - every wandb.log payload from the training loop (the per-loss-family
     traces emitted every 200 iterations), tensors converted to floats;
@@ -19,9 +17,19 @@ It records, into <result.json>:
     preserved;
   - the parsed satisfied_fitted.json metrics.
 
-The assertion half lives in tests/test_golden_run.py; tolerance bands are
-calibrated by tests/record_golden_run.py from repeated runs of unmodified
-code.
+This is an A/B tool, not a test with a stored baseline: run it once on the
+unmodified code and once on the change, in fresh subprocesses, and diff the
+two result files. Iteration-0 metrics are deterministic; later iterations
+vary run to run from GPU nondeterminism (umbilicus_loss by ~15%, the other
+losses by under 1%), so compare those as trends rather than exactly. The
+structural leaves (config, checkpoint structure, RNG hashes, satisfied entry
+identities and counts) should match exactly across a numerics-preserving
+change. (A calibrated golden-bands version of this harness existed until
+September 2026; it was never re-recorded after the dataset changed and was
+removed rather than maintained.)
+
+tests/rebuild_equivalence_driver.py shares this module's config resolution
+and checkpoint-structure helpers.
 """
 
 import glob
@@ -162,7 +170,7 @@ def run(spec_path, result_path, out_dir):
         spec = json.load(spec_file)
 
     os.makedirs(out_dir, exist_ok=True)
-    # Mesh export is slow and exercises no fitting behavior; keep the golden
+    # Mesh export is slow and exercises no fitting behavior; keep the driver
     # run focused on the training loop and checkpoint.
     os.environ.setdefault('FIT_SPIRAL_SKIP_SAVE_MESH', '1')
 
@@ -244,7 +252,7 @@ def run(spec_path, result_path, out_dir):
     }
     with open(result_path, 'w') as result_file:
         json.dump(result, result_file, indent=2, sort_keys=True)
-    print(f'golden-run driver: wrote {result_path}')
+    print(f'headless fit driver: wrote {result_path}')
 
 
 if __name__ == '__main__':

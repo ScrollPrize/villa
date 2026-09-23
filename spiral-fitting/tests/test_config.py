@@ -1,6 +1,5 @@
 import inspect
 import json
-from pathlib import Path
 
 import pytest
 
@@ -271,10 +270,3 @@ def test_dt_loss_schedule_is_not_advanced_or_durable_configuration():
     assert "influence_disable_dt_frac" not in catalog["schema"]["fields"]
     with pytest.raises(ValueError, match="Unknown"):
         Config({"influence_disable_dt_frac": 0.75})
-
-
-def test_golden_metadata_uses_new_metric_and_excludes_removed_field():
-    golden = (Path(__file__).parent / "golden" / "golden_bands.json").read_text()
-    assert "run_dt_suppressed" in golden
-    assert "interactive_dt_suppressed" not in golden
-    assert "influence_disable_dt_frac" not in golden

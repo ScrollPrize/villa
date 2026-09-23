@@ -857,7 +857,7 @@ class FitConfig:
     scaling); FitConfig performs no resolution of its own because the
     resolution policies legitimately differ per entry point (the CLI
     scales-and-splits for DDP, the interactive runtime round-trips
-    checkpoint counts, the golden driver scales without splitting).
+    checkpoint counts, the headless fit driver scales without splitting).
 
     Construction copies the mapping. update() mutates in place, so every
     holder of the same FitConfig (the context, its losses call sites, a
