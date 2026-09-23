@@ -231,7 +231,7 @@ void ConstraintGraphWorkspace::refreshAudit(){
     _audit->setText((warning?tr("Warning — "):QString{})+text);
     _audit->setToolTip(tr("Checks current source annotations across all components, independently of the fitted grid. See details for scope and affected links."));
 }
-void ConstraintGraphWorkspace::run(const QString& title,Worker worker,std::function<void(Job)> finish,bool stoppable) {
+void ConstraintGraphWorkspace::run(const QString& title,Worker worker,std::function<void(Job)> finish,bool stoppable,std::function<void()> failed) {
     if(_saving)return;
     if(_cancel)_cancel->store(true);auto cancel=std::make_shared<std::atomic_bool>(false);_cancel=cancel;auto generation=++_generation;
     _activity->finish(ConstraintGraphActivity::Operation,tr("Superseded"));
@@ -246,7 +246,7 @@ void ConstraintGraphWorkspace::run(const QString& title,Worker worker,std::funct
         if(logProgress)std::clog<<"constraint graph +"<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count()<<" ms: "<<message<<std::endl;
         if(guard)QMetaObject::invokeMethod(guard,[guard,generation,message]{if(guard&&guard->_generation==generation)guard->_activity->update(ConstraintGraphActivity::Operation,QString::fromStdString(message));},Qt::QueuedConnection);};
     auto* watcher=new QFutureWatcher<Job>(this);
-    connect(watcher,&QFutureWatcher<Job>::finished,this,[this,watcher,generation,cancel,finish=std::move(finish)]()mutable{
+    connect(watcher,&QFutureWatcher<Job>::finished,this,[this,watcher,generation,cancel,finish=std::move(finish),failed=std::move(failed)]()mutable{
         auto job=watcher->result();watcher->deleteLater();
         if(generation!=_generation){
             if(_cancel==cancel&&!_busy)_activity->finish(ConstraintGraphActivity::Operation,tr("Cancelled"));
@@ -257,7 +257,7 @@ void ConstraintGraphWorkspace::run(const QString& title,Worker worker,std::funct
         const auto outcome=!job.error.empty()?tr("Failed"):
             !job.fit.graph.nodes.empty()&&!job.fit.valid?tr("Needs attention"):tr("Completed");
         _activity->finish(ConstraintGraphActivity::Operation,outcome);
-        if(!job.error.empty()){report(QString::fromStdString(job.error));_closing=false;updateControls();emit operationFinished(false);return;}
+        if(!job.error.empty()){report(QString::fromStdString(job.error));_closing=false;if(failed)failed();updateControls();emit operationFinished(false);return;}
         try{finish(std::move(job));}catch(const std::exception& e){report(QString::fromUtf8(e.what()));emit operationFinished(false);updateControls();return;}
         updateControls();emit operationFinished(true);
     });
@@ -468,7 +468,7 @@ void ConstraintGraphWorkspace::fitPreview(cg::Graph draft,std::string selected,b
             job.edit=edit;
             job.proposalView=cg::renderProposalSources(edit,selected,cancel);
             job.fit=cg::fitEdit(edit,cancel,progress,review?cg::FitPolicy::FiberReview:cg::FitPolicy::Joint);
-            if(review&&job.fit.valid)job.patchView=cg::renderSourceLayer(job.fit.graph,false,cancel);
+            if(review&&job.fit.valid)job.patchView=reviewPatchLayer(job.fit,cancel);
         }
         return job;
     },[this,fitView](Job job){finishPreview(std::move(job),fitView);});
@@ -666,7 +666,7 @@ void ConstraintGraphWorkspace::overlays(){
         auto* scene=_view[pane]->graphicsView()->scene();if(!scene)continue;
         cg::FitResult reviewResult;cg::Graph reviewCommitted;
         if(reviewing()){reviewResult.graph=reviewDisplayGraph();reviewResult.valid=_committed.valid;reviewCommitted=reviewResult.graph;
-            if(_review&&!_review->selected.empty()){const auto& f=_review->fibers.at(_review->selected);if(f.current>=0)reviewCommitted.nodes.erase(f.proposals[f.current].id);}}
+            if(const auto* f=displayedReviewFiber();f&&f->current>=0)reviewCommitted.nodes.erase(f->proposals[f->current].id);}
         const auto& result=reviewing()&&pane==0?reviewResult:pane==1?_proposalView:(!_showCommitted->isChecked()&&_preview.valid?_preview:_committed);if(!result.valid)continue;
         if(!_overlayRoot[pane]){auto* root=new OverlayBatchItem;root->setFlag(QGraphicsItem::ItemHasNoContents);root->setZValue(20);scene->addItem(root);_overlayRoot[pane]=root;}
         if(pane==0&&!_highlights){_highlights=new OverlayBatchItem;_highlights->setZValue(25);scene->addItem(_highlights);}
@@ -788,7 +788,7 @@ void ConstraintGraphWorkspace::openSession(const QString& path){
     stopDiscovery();report(tr("Opening saved graph…"));
     run(tr("Opening saved graph"),[path](auto* cancel,auto progress){progress("Reading session and checking saved surface");Job j;
         {std::ifstream input(path.toStdString());auto document=nlohmann::json::parse(input);
-            if(document.value("type",std::string{})=="vc3d_fiber_review")j.review=cg::reviewFromJson(document);}
+            if(document.value("type",std::string{})=="vc3d_fiber_review"||cg::isLinksDocument(document))j.review=cg::reviewFromDocument(document);}
         if(j.review){
             const auto& s=j.review->settings;
             try{vc::lasagna::LasagnaDatasetOpenOptions options;options.workingToBaseScale=s.normalScale;

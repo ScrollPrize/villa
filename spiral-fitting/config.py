@@ -179,6 +179,9 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "pcl_fiber_link_side_filter": False,
     "pcl_fiber_link_side_margin_voxels": 0.5,
     "pcl_fiber_link_model_direction_step": 10000,
+    # Explicit fiber-patch links postdate durable checkpoints; missing means
+    # the tags were ignored.
+    "pcl_fiber_explicit_links_only": False,
 })
 # The flow-gradient conditioning settings postdate durable checkpoints;
 # missing means off, which is exactly the earlier behaviour.
@@ -235,6 +238,14 @@ _PCL_LINK_DESCRIPTIONS = {
         "Completed step from which the fiber side filter takes its inward "
         "direction from the fitted winding instead of the umbilicus, "
         "relinking every fiber once at the switch."),
+    "pcl_fiber_explicit_links_only": (
+        "Attach fiber collections only to the patches named by their "
+        "explicit_link:<patch id> document tags (written by "
+        "auto_link_fibers.py); a fiber without such tags attaches to no "
+        "patch and is fitted as an unattached strip. Ordinary and "
+        "absolute-winding point collections and fiber-to-fiber bridge links "
+        "are unaffected; off, the tags are ignored. Changing it at a Run "
+        "boundary relinks every resident point collection."),
 }
 
 _GAP_EXPANDER_DESCRIPTIONS = {
@@ -445,6 +456,7 @@ _RUN_MUTABLE_PCL_KEYS = frozenset({
     "pcl_link_distance_tolerance",
     "pcl_link_window_points",
     "pcl_link_window_min_points",
+    "pcl_fiber_explicit_links_only",
 })
 
 NEW_FIT_KEYS = frozenset(
@@ -738,6 +750,10 @@ class Config:
         self.pcl_fiber_link_side_filter = False
         self.pcl_fiber_link_side_margin_voxels = 0.5
         self.pcl_fiber_link_model_direction_step = 10000
+        # Explicit fiber-patch links: fibers whose JSON carries
+        # ``explicit_link:<patch id>`` tags attach only to those patches, and
+        # untagged fibers to none (regular collections link as usual).
+        self.pcl_fiber_explicit_links_only = False
         # Cross-fiber links ("branches"): same-winding continuations between
         # fibers. When on, linked collections merge into per-component
         # cross-patch pcls with an explicit fiber graph (winding ties propagate

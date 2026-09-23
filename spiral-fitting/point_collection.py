@@ -85,6 +85,16 @@ class PatchLinkOptions:
     keeps is split at claimed points and re-checked: fragments with fewer
     than ``window_min_points`` free hits are dropped. With a
     fraction rule the wrong-side gate applies per strip.
+
+    ``target_patches`` maps a fiber collection id to the patch ids its points
+    may attach to (its ``explicit_link:`` tags, see
+    spiral_helpers.explicit_patch_links_from_tags); hits on any other patch
+    are dropped before selection. With ``restrict_untargeted`` a fiber
+    collection absent from the map attaches to no patch at all. Only fiber
+    collections (``sampling_group == 'fibers'`` or
+    ``metadata.logical_input_kind == 'fiber'``) are restricted; regular and
+    absolute-winding collections never are. ``None`` (the default) restricts
+    nothing.
     """
     window_points: int = 1
     window_min_points: int = 1
@@ -101,6 +111,8 @@ class PatchLinkOptions:
     strip_claim_gap: Optional[int] = None
     strip_rank: str = 'fit'
     strip_fit_resolution: float = 0.25
+    target_patches: Optional[Mapping[int, frozenset]] = None
+    restrict_untargeted: bool = False
 
     def __post_init__(self):
         if int(self.window_points) < 1:
@@ -140,10 +152,43 @@ class PatchLinkOptions:
                 f'strip_fit_resolution must be > 0, got {self.strip_fit_resolution!r}')
         if self.strip_rank not in ('fit', 'hits'):
             raise ValueError(f"strip_rank must be 'fit' or 'hits', got {self.strip_rank!r}")
+        if self.target_patches is not None:
+            targets = {}
+            for collection_id, patch_ids in dict(self.target_patches).items():
+                if isinstance(patch_ids, str) or not all(
+                        isinstance(patch_id, str) for patch_id in patch_ids):
+                    raise ValueError(
+                        f'target patches for collection {collection_id!r} must be a '
+                        f'set of patch id strings, got {patch_ids!r}')
+                targets[collection_id] = frozenset(patch_ids)
+            object.__setattr__(self, 'target_patches', targets)
+        elif self.restrict_untargeted:
+            raise ValueError('restrict_untargeted needs a target_patches map')
+        object.__setattr__(self, 'restrict_untargeted', bool(self.restrict_untargeted))
 
     @property
     def strip_mode(self) -> bool:
         return bool(self.strips)
+
+    @property
+    def restricts_patches(self) -> bool:
+        """Whether any collection's candidate patches may be restricted."""
+        return self.target_patches is not None
+
+    def allowed_patches(self, collection_id, collection) -> Optional[frozenset]:
+        """Patch ids ``collection`` may attach to, or ``None`` when it is
+        unrestricted. Only fiber collections are ever restricted."""
+        if self.target_patches is None:
+            return None
+        metadata = collection.get('metadata') or {}
+        is_fiber = (collection.get('sampling_group') == 'fibers'
+                    or metadata.get('logical_input_kind') == 'fiber')
+        if not is_fiber:
+            return None
+        allowed = self.target_patches.get(collection_id)
+        if allowed is None and self.restrict_untargeted:
+            return frozenset()
+        return allowed
 
     @property
     def window_half(self) -> int:
@@ -693,6 +738,14 @@ def _link_from_hits(
     keep = surf_idx >= 0
     if target_idxs is not None:
         keep &= np.isin(surf_idx, target_idxs)
+    allowed = options.allowed_patches(collection_id, collection)
+    if allowed is not None:
+        # Explicit patch links: only the named patches remain candidates (an
+        # empty set drops every hit, so the collection stays unattached).
+        allowed_idxs = np.fromiter(
+            (surface for surface, patch_id in enumerate(surface_ids) if patch_id in allowed),
+            dtype=np.int64)
+        keep &= np.isin(surf_idx, allowed_idxs)
     if not keep.all():
         point_idx, surf_idx, distances, ijs = (
             point_idx[keep], surf_idx[keep], distances[keep], ijs[keep])
@@ -833,9 +886,10 @@ def _link_points_to_patches_with_surface_index(
 
     if not hasattr(index, 'locate_all_xyz_batch'):
         if (options.gates_on_window or options.side_rules or options.rank_by_support
-                or options.report_counts or options.strip_mode):
-            # The single-hit legacy query cannot count window hits or test
-            # the side rules; let the brute-force path handle it.
+                or options.report_counts or options.strip_mode or options.restricts_patches):
+            # The single-hit legacy query cannot count window hits, test the
+            # side rules or restrict candidate patches; let the brute-force
+            # path handle it.
             return None
         for collection_id, collection in tqdm(point_collections.items(), 'linking points to patches'):
             for point_id, point in collection['points'].items():

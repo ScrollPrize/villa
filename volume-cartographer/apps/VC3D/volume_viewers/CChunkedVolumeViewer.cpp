@@ -48,6 +48,7 @@
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
+#include <type_traits>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -2089,6 +2090,9 @@ struct CChunkedVolumeViewer::RenderResult {
     // back to direct volume sampling. Surfaced in the status bar because the
     // performance cliff is otherwise invisible.
     bool surfaceCacheOutOfBand = false;
+    // For a clipped comparison overlay: the only pixels that can be covered.
+    // Empty (but set) when the layer lies entirely outside the viewport.
+    std::optional<cv::Rect> layerRect;
     std::vector<vc::render::ChunkedPlaneSampler::ChunkPixelLookupLevel>
         debugBaseLookup;
     std::vector<vc::render::ChunkedPlaneSampler::ChunkPixelLookupLevel>
@@ -2128,6 +2132,134 @@ void CChunkedVolumeViewer::refreshDownloadQueueDebugOverlay()
         _view->viewport()->update();
 }
 
+CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderLayerFrame(RenderContext ctx)
+{
+    // A review layer is one small patch on a long fiber. Rendering it through
+    // the whole viewport generated coordinates, sampled and blitted every
+    // pixel for each of up to a hundred layers per camera change. Pixels
+    // outside the surface's own extent are uncovered in a full render, so
+    // render only the sub-viewport that can cover and embed it.
+    auto* quad = dynamic_cast<QuadSurface*>(ctx.surf.get());
+    if (!quad || ctx.fbW <= 0 || ctx.fbH <= 0 || !(ctx.scale > 0.0f))
+        return renderFrame(std::move(ctx));
+    const cv::Mat_<cv::Vec3f>* points = nullptr;
+    try {
+        points = quad->rawPointsPtr();
+    } catch (const std::exception&) {
+        return renderFrame(std::move(ctx));
+    }
+    const cv::Vec2f gridScale = quad->scale();
+    if (!points || points->empty() || gridScale[0] <= 0.0f || gridScale[1] <= 0.0f)
+        return renderFrame(std::move(ctx));
+    // Nominal surface-unit bounds of the grid: gridToSurface is grid/scale - center.
+    const cv::Vec3f center = quad->center();
+    const double minU = -double(center[0]);
+    const double maxU = double(points->cols - 1) / double(gridScale[0]) - double(center[0]);
+    const double minV = -double(center[1]);
+    const double maxV = double(points->rows - 1) / double(gridScale[1]) - double(center[1]);
+    // generatedSurfaceCoords maps pixel x to nominal u = (offset.x + x) / scale
+    // with offset = ptr * scale - fb / 2.
+    const double offsetX = double(ctx.surfacePtrX) * double(ctx.scale) - double(ctx.fbW) * 0.5;
+    const double offsetY = double(ctx.surfacePtrY) * double(ctx.scale) - double(ctx.fbH) * 0.5;
+    // Bilinear and strict-quad validity reach one grid cell; gen() pads four pixels.
+    const double cellPx = double(ctx.scale) / double(std::min(gridScale[0], gridScale[1]));
+    const int margin = int(std::ceil(2.0 * cellPx)) + 8;
+    const int x0 = std::max(0, int(std::floor(minU * ctx.scale - offsetX)) - margin);
+    const int x1 = std::min(ctx.fbW, int(std::ceil(maxU * ctx.scale - offsetX)) + margin + 1);
+    const int y0 = std::max(0, int(std::floor(minV * ctx.scale - offsetY)) - margin);
+    const int y1 = std::min(ctx.fbH, int(std::ceil(maxV * ctx.scale - offsetY)) + margin + 1);
+    const cv::Rect full(0, 0, ctx.fbW, ctx.fbH);
+    const cv::Rect rect = cv::Rect(x0, y0, std::max(0, x1 - x0), std::max(0, y1 - y0)) & full;
+    if (rect == full)
+        return renderFrame(std::move(ctx));
+
+    RenderResult result;
+    result.serial = ctx.serial;
+    result.renderJob = ctx.renderJob;
+    result.surfacePtrX = ctx.surfacePtrX;
+    result.surfacePtrY = ctx.surfacePtrY;
+    result.scale = ctx.scale;
+    result.submittedAt = ctx.renderJob.submittedAt;
+    result.workerStartedAt = std::chrono::steady_clock::now();
+    // renderFrame's uncovered pixel for a non-plane surface.
+    result.framebuffer = QImage(ctx.fbW, ctx.fbH, QImage::Format_RGB32);
+    result.framebuffer.fill(uint(0xFF000000u));
+    result.values = cv::Mat_<uint8_t>(ctx.fbH, ctx.fbW, uint8_t(0));
+    result.coverage = cv::Mat_<uint8_t>(ctx.fbH, ctx.fbW, uint8_t(0));
+    result.layerRect = rect;
+    if (rect.empty()) {
+        result.workerFinishedAt = std::chrono::steady_clock::now();
+        return result;
+    }
+
+    RenderContext sub = ctx;
+    sub.fbW = rect.width;
+    sub.fbH = rect.height;
+    // Keep offset' = offset + rect origin so every sub pixel samples the same
+    // nominal coordinate as its full-viewport counterpart.
+    sub.surfacePtrX = float(double(ctx.surfacePtrX) +
+                            (double(rect.x) + 0.5 * (double(rect.width) - double(ctx.fbW))) / double(ctx.scale));
+    sub.surfacePtrY = float(double(ctx.surfacePtrY) +
+                            (double(rect.y) + 0.5 * (double(rect.height) - double(ctx.fbH))) / double(ctx.scale));
+    sub.renderJob.fbW = sub.fbW;
+    sub.renderJob.fbH = sub.fbH;
+    sub.renderJob.surfacePtrX = sub.surfacePtrX;
+    sub.renderJob.surfacePtrY = sub.surfacePtrY;
+    sub.renderJob.renderFocus = {
+        std::clamp(ctx.renderJob.renderFocus[0] - float(rect.x), 0.0f, float(rect.width - 1)),
+        std::clamp(ctx.renderJob.renderFocus[1] - float(rect.y), 0.0f, float(rect.height - 1))};
+    // Carry the previous frame's pixels for the same region, so chunk arrivals
+    // keep filling holes exactly as a full render would.
+    sub.prevResult.reset();
+    if (ctx.prevResult && !ctx.genCacheDirty &&
+        renderJobsSameGeometry(ctx.renderJob, ctx.prevResult->renderJob)) {
+        const auto& prev = *ctx.prevResult;
+        auto cropped = std::make_shared<RenderResult>();
+        cropped->renderJob = prev.renderJob;
+        cropped->renderJob.fbW = sub.fbW;
+        cropped->renderJob.fbH = sub.fbH;
+        cropped->renderJob.surfacePtrX = sub.surfacePtrX;
+        cropped->renderJob.surfacePtrY = sub.surfacePtrY;
+        auto crop = [&](auto& dst, const auto& src) {
+            if (!src.empty() && src.cols == ctx.fbW && src.rows == ctx.fbH)
+                dst = src(rect).clone();
+        };
+        crop(cropped->values, prev.values);
+        crop(cropped->coverage, prev.coverage);
+        crop(cropped->colorValues, prev.colorValues);
+        crop(cropped->overlayValues, prev.overlayValues);
+        crop(cropped->overlayCoverage, prev.overlayCoverage);
+        crop(cropped->overlayTargetCoverage, prev.overlayTargetCoverage);
+        sub.prevResult = std::move(cropped);
+    }
+    auto part = renderFrame(std::move(sub));
+
+    auto embed = [&](auto& dst, const auto& src) {
+        using Mat = std::remove_cvref_t<decltype(src)>;
+        if (src.empty() || src.cols != rect.width || src.rows != rect.height)
+            return;
+        if (dst.empty())
+            dst = Mat(ctx.fbH, ctx.fbW, typename Mat::value_type{});
+        src.copyTo(dst(rect));
+    };
+    embed(result.values, part.values);
+    embed(result.coverage, part.coverage);
+    embed(result.colorValues, part.colorValues);
+    embed(result.overlayValues, part.overlayValues);
+    embed(result.overlayCoverage, part.overlayCoverage);
+    embed(result.overlayTargetCoverage, part.overlayTargetCoverage);
+    if (!part.framebuffer.isNull() && part.framebuffer.format() == QImage::Format_RGB32 &&
+        part.framebuffer.size() == QSize(rect.width, rect.height)) {
+        for (int y = 0; y < rect.height; ++y)
+            std::memcpy(result.framebuffer.scanLine(rect.y + y) + size_t(rect.x) * 4,
+                        part.framebuffer.constScanLine(y), size_t(rect.width) * 4);
+    }
+    result.surfaceCacheOutOfBand = part.surfaceCacheOutOfBand;
+    result.renderFrameElapsedMs = part.renderFrameElapsedMs;
+    result.workerFinishedAt = std::chrono::steady_clock::now();
+    return result;
+}
+
 CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderContext ctx)
 {
     if(ctx.renderJob.comparisonBase) {
@@ -2144,7 +2276,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         ctx.renderJob.comparisonBase.reset();ctx.renderJob.comparisonOverlays.clear();
         ctx.surfaceCache.reset();ctx.overlaySurfaceCache.reset();ctx.genCache.reset();
         ctx.renderJob.surfaceCache.reset();ctx.renderJob.overlaySurfaceCache.reset();ctx.renderJob.genCache.reset();
-        auto renderLayer=[&](const std::shared_ptr<Surface>& surface)->std::shared_ptr<const RenderResult>{
+        auto renderLayer=[&](const std::shared_ptr<Surface>& surface,bool clip)->std::shared_ptr<const RenderResult>{
             ctx.surf=surface;ctx.renderJob.surf=surface;
             const auto found=previousLayers.find(surface.get());
             ctx.prevResult=found==previousLayers.end()?nullptr:found->second;
@@ -2156,14 +2288,14 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                 cachedJob.genCacheDirty=ctx.renderJob.genCacheDirty;
                 if(renderJobsEquivalentForDisplay(ctx.renderJob,cachedJob)){++reused;return ctx.prevResult;}
             }
-            return std::make_shared<RenderResult>(renderFrame(ctx));
+            return std::make_shared<RenderResult>(clip?renderLayerFrame(ctx):renderFrame(ctx));
         };
-        auto base=renderLayer(original.comparisonBase);
+        auto base=renderLayer(original.comparisonBase,false);
         auto result=*base;result.renderJob=original;result.comparisonBase=std::move(base);
         result.serial=ctx.serial;result.submittedAt=original.submittedAt;
         result.workerStartedAt=startedAt;
         result.comparisonOverlays.clear();
-        for(const auto& surface:original.comparisonOverlays)result.comparisonOverlays.push_back(renderLayer(surface));
+        for(const auto& surface:original.comparisonOverlays)result.comparisonOverlays.push_back(renderLayer(surface,true));
         result.renderFrameElapsedMs=layerTimer.nsecsElapsed()/1e6;
         result.workerFinishedAt=std::chrono::steady_clock::now();
         if(ProfileLoggingEnabled())Logger()->info("[vc3d-profile] surfaceLayers elapsed_ms={} reused={} sampled={}",result.renderFrameElapsedMs,reused,1+original.comparisonOverlays.size()-reused);
@@ -3939,13 +4071,14 @@ QImage CChunkedVolumeViewer::compositeSurfaceLayers(const RenderResult& result)
     // The last layer is the changing proposal. Keep the accepted prefix so
     // switching proposals or adjusting their opacity only blends one image.
     // Each intermediate blend retains exactly the original rounding/order.
+    auto region=[](const RenderResult& layer){return layer.layerRect?&*layer.layerRect:nullptr;};
     for(size_t i=_layerCompositePrefix.size();i+1<layers.size();++i){
-        vc3d::blendSurfaceImageInPlace(_layerCompositeImage,layers[i]->framebuffer,layers[i]->coverage,opacity(i),tint(i));
+        vc3d::blendSurfaceImageInPlace(_layerCompositeImage,layers[i]->framebuffer,layers[i]->coverage,opacity(i),tint(i),region(*layers[i]));
         _layerCompositePrefix.push_back({layers[i],opacity(i),tint(i)});
     }
     auto image=_layerCompositeImage;
     if(_layerCompositePrefix.size()<layers.size())
-        vc3d::blendSurfaceImageInPlace(image,layers.back()->framebuffer,layers.back()->coverage,opacity(layers.size()-1),tint(layers.size()-1));
+        vc3d::blendSurfaceImageInPlace(image,layers.back()->framebuffer,layers.back()->coverage,opacity(layers.size()-1),tint(layers.size()-1),region(*layers.back()));
     return image;
 }
 void CChunkedVolumeViewer::blendSurfaceLayers()

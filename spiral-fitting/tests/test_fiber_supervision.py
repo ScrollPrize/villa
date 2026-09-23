@@ -408,6 +408,61 @@ class RelinkFibersTests(unittest.TestCase):
         self.assertEqual(context._fiber_link_side_rules({1: vertical}), {})
 
 
+class ExplicitLinkOptionsTests(unittest.TestCase):
+    def _context(self, **overrides):
+        context = FitContext.__new__(FitContext)
+        context.config = FitConfig(Config({
+            'pcl_fiber_explicit_links_only': True, **overrides}).as_dict())
+        context.verified_patches = {'front': _y_plane(20.0, 40.0, -20.0)}
+        return context
+
+    def _collections(self):
+        tagged = _fiber(1, [(60.0, 21.0, 0.0), (61.0, 21.0, 1.0)])
+        tagged['metadata']['explicit_patch_links'] = ['front', 'gone']
+        untagged = _fiber(2, [(60.0, 21.0, 5.0)])
+        untagged['metadata']['explicit_patch_links'] = []
+        regular = _fiber(3, [(60.0, 21.0, 9.0)], kind=None)
+        regular['metadata']['explicit_patch_links'] = ['front']
+        return {1: tagged, 2: untagged, 3: regular}
+
+    def test_targets_follow_the_fiber_tags_and_warn_once_about_unknown_patches(self):
+        context = self._context()
+        with self.assertLogs('fit_spiral', level='WARNING') as logs:
+            options = context._patch_link_options(self._collections(), 1.0)
+        self.assertEqual(options.target_patches,
+                         {1: frozenset({'front', 'gone'}), 2: frozenset()})
+        self.assertTrue(options.restrict_untargeted)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn('gone', logs.output[0])
+        # The same unknown id is not reported again.
+        with mock.patch.object(fit_spiral.logging.getLogger('fit_spiral'), 'warning') as warning:
+            context._patch_link_options(self._collections(), 1.0)
+        warning.assert_not_called()
+
+    def test_off_by_default_leaves_the_options_unrestricted(self):
+        context = self._context(pcl_fiber_explicit_links_only=False)
+        options = context._patch_link_options(self._collections(), 1.0)
+        self.assertIsNone(options.target_patches)
+        self.assertFalse(options.restrict_untargeted)
+        self.assertFalse(Config().pcl_fiber_explicit_links_only)
+
+    def test_relink_attaches_only_tagged_fibers(self):
+        context = self._context()
+        collections = self._collections()
+        context.fiber_catalog = {'1': collections[1], '2': collections[2]}
+        context.link_distance_tolerance = 2.0
+        context._baked_voxel_scale = mock.Mock(return_value=1.0)
+        context._rematerialize_fiber_views = mock.Mock()
+        context.dist = mock.Mock(is_main_process=True)
+        with mock.patch.object(point_collection, 'can_use_surface_index_backend',
+                               return_value=False):
+            context._relink_fibers_to_patches('umbilicus', iteration=0)
+        self.assertEqual(
+            [p['on_patch']['id'] for _, p in sorted(collections[1]['points'].items())],
+            ['front'] * 2)
+        self.assertNotIn('on_patch', collections[2]['points'][0])
+
+
 class YxScale:
     """Scroll -> spiral map scaling y by `sy` and x by `sx` about the axis."""
 

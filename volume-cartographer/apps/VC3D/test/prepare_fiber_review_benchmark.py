@@ -13,11 +13,15 @@ import subprocess
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, required=True)
+    parser.add_argument("--source", default="benchmark_fiber_review_render.cpp",
+                        help="harness source next to this script (default: the render benchmark)")
+    parser.add_argument("--name", default=None, help="executable name (default: source stem)")
     args = parser.parse_args()
     build = args.build_dir.resolve()
-    output = build / "fiber-review-benchmark"
+    source = Path(__file__).with_name(args.source).resolve()
+    name = args.name or source.stem
+    output = build / ("fiber-review-benchmark" if name == "benchmark_fiber_review_render" else f"fiber-review-{name}")
     output.mkdir(exist_ok=True)
-    source = Path(__file__).with_name("benchmark_fiber_review_render.cpp").resolve()
     obj = output / "benchmark.o"
     depfile = output / "benchmark.d"
     commands = json.loads((build / "compile_commands.json").read_text())
@@ -31,7 +35,7 @@ def main():
     link = next(line for line in reversed(link_commands.splitlines()) if " -o bin/VC3D " in line)
     link = link.replace("apps/VC3D/CMakeFiles/VC3D.dir/VCAppMain.cpp.o", shlex.quote(str(obj)))
     # Keep the executable next to VC3D so its existing relative library paths work.
-    binary = build / "bin" / "benchmark_fiber_review_render"
+    binary = build / "bin" / name
     link = link.replace(" -o bin/VC3D ", " -o " + shlex.quote(str(binary)) + " ")
 
     def command_escape(text):

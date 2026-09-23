@@ -28,7 +28,14 @@ vc::constraints::Catalog benchmarkCatalog(vc::constraints::Settings settings) {
 #include "fiber_review_normal_features.hpp"
 #include "fiber_review_registered_maps.hpp"
 #include "fiber_review_anchor_evidence.hpp"
+#include "fiber_review_auto_link.hpp"
+#include <mutex>
+#include <memory>
 int main(int argc,char** argv){
+    if(argc>=4&&std::string(argv[1])=="--auto-link-review") {
+        try { return autoLinkReview(argc,argv); }
+        catch(const std::exception& e) { std::cerr<<e.what()<<std::endl;return 1; }
+    }
     if(argc==3&&std::string(argv[1])=="--review-anchor-session") {
         try { return fiber_review_evidence::anchorSession(argv[2]); }
         catch(const std::exception& e) { std::cerr<<e.what()<<std::endl;return 1; }

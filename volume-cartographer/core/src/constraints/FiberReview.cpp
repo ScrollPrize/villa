@@ -46,7 +46,7 @@ void addReviewOverlapTargets(GraphEdit& edit,const ReviewFiber& fiber,const std:
     const auto& base=preparedResult(*edit.base).graph;
     std::map<std::string,Placement> references;
     for(const auto& [id,decision]:fiber.decisions) {
-        if(decision.status!=ReviewStatus::Accepted||edit.addedNodes.contains(id))continue;
+        if(!fitted(decision)||edit.addedNodes.contains(id))continue;
         const auto& alignment=decision.alignment;
         if(alignment.seed!=base.seed||alignment.nodes.at(base.seed).uv!=base.nodes.at(base.seed).uv)
             throw std::runtime_error("Accepted patch belongs to a different fiber placement");
@@ -119,7 +119,14 @@ Json reviewToJson(const FiberReview& review) {
         Json j={{"path",f.path.string()},{"direction",std::string(1,f.direction)},{"base",graph(f.base)},
             {"reverse",f.reverse},{"discovered",f.discovered},{"current",f.current},{"contact_policy",f.contactPolicyVersion},
             {"decisions",Json::object()},{"proposals",Json::array()},{"pending",f.pending?graph(*f.pending):Json(nullptr)}};
-        for(const auto& [patch,d]:f.decisions)j["decisions"][patch]={{"status",d.status==ReviewStatus::Accepted?"accepted":d.status==ReviewStatus::Skipped?"skipped":"rejected"},{"order",d.order},{"alignment",graph(d.alignment)}};
+        for(const auto& [patch,d]:f.decisions) {
+            Json decision={{"status",d.status==ReviewStatus::Accepted?"accepted":d.status==ReviewStatus::Skipped?"skipped":"rejected"},{"order",d.order},{"alignment",graph(d.alignment)}};
+            if(d.automatic)decision["automatic"]=true;
+            if(!d.note.empty())decision["note"]=d.note;
+            if(!d.keypoints.empty()){Json k=Json::array();for(const auto& l:d.keypoints)k.push_back({{"a",locationToJson(l.a)},{"b",locationToJson(l.b)}});decision["keypoints"]=std::move(k);}
+            if(!d.measurements.is_null())decision["measurements"]=d.measurements;
+            j["decisions"][patch]=std::move(decision);
+        }
         for(const auto& c:f.proposals) {
             Json links=Json::array();for(const auto& l:c.contacts)links.push_back({{"a",locationToJson(l.a)},{"b",locationToJson(l.b)}});
             j["proposals"].push_back({{"id",c.id},{"distance",c.distance},{"contacts",std::move(links)}});
@@ -168,6 +175,9 @@ FiberReview reviewFromJson(const Json& document) {
                 else throw std::runtime_error("Unknown fiber review decision status: "+value);
             }
             ReviewDecision decision{status,d.at("order"),graph(d.at("alignment"))};
+            decision.automatic=d.value("automatic",false);decision.note=d.value("note",std::string{});
+            if(d.contains("keypoints"))for(const auto& l:d.at("keypoints"))decision.keypoints.push_back({locationFromJson(l.at("a")),locationFromJson(l.at("b")),true});
+            if(d.contains("measurements"))decision.measurements=d.at("measurements");
             if(status==ReviewStatus::Accepted&&(decision.alignment.seed!=id||decision.alignment.nodes.size()!=2||!decision.alignment.nodes.contains(patch)))throw std::runtime_error("Invalid accepted association");
             if(status==ReviewStatus::Accepted&&(f.base.nodes.empty()||decision.alignment.nodes.at(id).uv!=f.base.nodes.at(id).uv))throw std::runtime_error("Accepted association moved its fiber");
             f.decisions.emplace(patch,std::move(decision));
@@ -199,6 +209,114 @@ FiberReview reviewFromJson(const Json& document) {
     if(!review.selected.empty()&&!review.fibers.contains(review.selected))throw std::runtime_error("Selected fiber missing");
     return review;
 }
+namespace {
+std::string statusName(ReviewStatus s){return s==ReviewStatus::Accepted?"accepted":s==ReviewStatus::Skipped?"skipped":"rejected";}
+ReviewStatus statusFromName(const std::string& value) {
+    if(value=="accepted")return ReviewStatus::Accepted;if(value=="rejected")return ReviewStatus::Rejected;if(value=="skipped")return ReviewStatus::Skipped;
+    throw std::runtime_error("Unknown fiber review decision status: "+value);
+}
+std::string autoNote(const Json& e,bool linked) {
+    char buffer[200];
+    const double contact=e.value("contact",0.),ss=e.value("strip_same",0.),sa=e.value("strip_adjacent",0.),ls=e.value("linked_same",0.),la=e.value("linked_adjacent",0.);
+    if(linked){if(e.value("anchor",false))std::snprintf(buffer,sizeof buffer,"Auto-linked anchor: %.0f vx fiber contact, strip agreement %.2f vs %.2f adjacent",contact,ss,sa);
+        else std::snprintf(buffer,sizeof buffer,"Auto-linked in round %d: %.2f same-sheet vs %.2f adjacent overlap with linked patches",e.value("round",0),ls,la);}
+    else if(ss>0||sa>0)std::snprintf(buffer,sizeof buffer,"Auto-rejected: %.0f vx contact but strip agreement %.2f does not clear %.2f adjacent",contact,ss,sa);
+    else std::snprintf(buffer,sizeof buffer,"Auto-rejected: %.0f vx contact, %.2f same-sheet vs %.2f adjacent overlap with linked patches",contact,ls,la);
+    return buffer;
+}
+Json keypointsToJson(const std::vector<Link>& links){Json k=Json::array();for(const auto& l:links)k.push_back({{"a",locationToJson(l.a)},{"b",locationToJson(l.b)}});return k;}
+std::vector<Link> keypointsFromJson(const Json& k){std::vector<Link> out;if(k.is_array())for(const auto& l:k)out.push_back({locationFromJson(l.at("a")),locationFromJson(l.at("b")),true});return out;}
+}
+bool isLinksDocument(const Json& document){return document.value("type",std::string{})=="vc_fiber_patch_links";}
+FiberReview reviewFromLinks(const Json& document) {
+    if(!isLinksDocument(document))throw std::runtime_error("Not a vc_fiber_patch_links document");
+    const int version=document.value("version",1);
+    if(version!=1&&version!=2)throw std::runtime_error("Unsupported vc_fiber_patch_links version");
+    FiberReview review;review.settings=settingsFromJson(document.at("settings"));review.stride=1;
+    review.sessionRevision=detail::workspaceRevision(document.dump());
+    review.proposalOpacity=document.value("proposal_opacity",review.proposalOpacity);review.committedOpacity=document.value("committed_opacity",review.committedOpacity);
+    review.committedTint=document.value("committed_tint",review.committedTint);review.fiberLineOpacity=document.value("fiber_line_opacity",review.fiberLineOpacity);
+    review.fiberLineWidth=document.value("fiber_line_width",review.fiberLineWidth);review.boundaries=document.value("boundaries",review.boundaries);
+    if(document.contains("quarantined"))for(const auto& [id,p]:document.at("quarantined").items())
+        review.quarantined[id]={p.at("source").get<std::string>(),p.at("destination").get<std::string>()};
+    uint64_t maxOrder=0;
+    for(const auto& [name,row]:document.at("fibers").items()) {
+        ReviewFiber f;f.path=row.value("path",(review.settings.fiberFolder/name).string());
+        const auto direction=row.value("direction",std::string("?"));f.direction=direction.empty()?'?':direction[0];
+        f.contactPolicyVersion=1;
+        const std::string id="fiber:"+name;
+        auto readEntries=[&](const char* key,bool linked) {
+            if(!row.contains(key))return;
+            for(const auto& e:row.at(key)) {
+                auto patch=e.at("patch").get<std::string>();if(patch.rfind("patch:",0)!=0)patch="patch:"+patch;
+                ReviewDecision d;d.status=e.contains("status")?statusFromName(e.at("status").get<std::string>()):linked?ReviewStatus::Accepted:ReviewStatus::Rejected;
+                // vc_fiber_auto_link (version 1) writes no flag and every entry is automatic; VC3D (version 2) writes it explicitly.
+                d.automatic=e.value("automatic",version==1);d.note=e.value("note",std::string{});
+                if(d.note.empty()&&d.automatic)d.note=autoNote(e,linked);
+                d.order=e.value("order",uint64_t(0));if(!d.order)d.order=++maxOrder;else maxOrder=std::max(maxOrder,d.order);
+                if(e.contains("keypoints"))d.keypoints=keypointsFromJson(e.at("keypoints"));
+                Json m=Json::object();for(const auto& k:{"contact","anchor","round","strip_same","strip_adjacent","linked_same","linked_adjacent"})if(e.contains(k))m[k]=e.at(k);
+                if(!m.empty())d.measurements=std::move(m);
+                f.decisions[patch]=std::move(d);
+            }
+        };
+        readEntries("linked",true);readEntries("unlinked",false);
+        if(row.contains("pending_keypoints"))for(const auto& [patch,k]:row.at("pending_keypoints").items())f.savedKeypoints[patch.rfind("patch:",0)==0?patch:"patch:"+patch]=keypointsFromJson(k);
+        review.fibers.emplace(id,std::move(f));
+    }
+    review.nextOrder=maxOrder+1;
+    review.selected=document.value("selected",std::string{});
+    if(!review.selected.empty()&&!review.fibers.contains(review.selected))review.selected.clear();
+    if(review.selected.empty()&&!review.fibers.empty())review.selected=review.fibers.begin()->first;
+    return review;
+}
+Json linksFromReview(const FiberReview& review) {
+    Json out={{"type","vc_fiber_patch_links"},{"version",2},{"settings",settingsToJson(review.settings)},{"selected",review.selected},
+        {"proposal_opacity",review.proposalOpacity},{"committed_opacity",review.committedOpacity},{"committed_tint",review.committedTint},
+        {"fiber_line_opacity",review.fiberLineOpacity},{"fiber_line_width",review.fiberLineWidth},{"boundaries",review.boundaries},
+        {"quarantined",Json::object()},{"fibers",Json::object()}};
+    for(const auto& [id,p]:review.quarantined)out["quarantined"][id]={{"source",p.source.string()},{"destination",p.destination.string()}};
+    for(const auto& [id,f]:review.fibers) {
+        Json row={{"path",f.path.string()},{"direction",std::string(1,f.direction)},{"linked",Json::array()},{"unlinked",Json::array()}};
+        // Decisions in order, so the saved lists read like the review happened.
+        std::vector<std::pair<std::string,const ReviewDecision*>> ordered;for(const auto& [patch,d]:f.decisions)ordered.emplace_back(patch,&d);
+        std::sort(ordered.begin(),ordered.end(),[](const auto& a,const auto& b){return std::tie(a.second->order,a.first)<std::tie(b.second->order,b.first);});
+        for(const auto& [patch,d]:ordered) {
+            Json e={{"patch",patch.rfind("patch:",0)==0?patch.substr(6):patch},{"status",statusName(d->status)},{"order",d->order}};
+            e["automatic"]=d->automatic;
+            if(!d->note.empty())e["note"]=d->note;
+            // Manual pairs from a fitted placement survive as keypoints.
+            std::vector<Link> keypoints=d->keypoints;
+            if(keypoints.empty())for(const auto& l:d->alignment.links.read())if(l.keypoint)keypoints.push_back(l);
+            if(!keypoints.empty())e["keypoints"]=keypointsToJson(keypoints);
+            if(!d->measurements.is_null())for(const auto& [k,v]:d->measurements.items())e[k]=v;
+            row[d->status==ReviewStatus::Accepted?"linked":"unlinked"].push_back(std::move(e));
+        }
+        Json pending=Json::object();
+        for(const auto& [patch,k]:f.savedKeypoints)if(!k.empty()&&!f.decisions.contains(patch))pending[patch.rfind("patch:",0)==0?patch.substr(6):patch]=keypointsToJson(k);
+        if(f.pending&&f.current>=0&&f.current<int(f.proposals.size())) {
+            const auto& patch=f.proposals[f.current].id;
+            std::vector<Link> k;for(const auto& l:f.pending->links.read())if(l.keypoint)k.push_back(l);
+            if(!k.empty()&&!f.decisions.contains(patch))pending[patch.rfind("patch:",0)==0?patch.substr(6):patch]=keypointsToJson(k);
+        }
+        if(!pending.empty())row["pending_keypoints"]=std::move(pending);
+        out["fibers"][f.path.filename().string()]=std::move(row);
+    }
+    return out;
+}
+FiberReview reviewFromDocument(const Json& document) {
+    return isLinksDocument(document)?reviewFromLinks(document):reviewFromJson(document);
+}
+std::string saveLinks(const FiberReview& review,const std::filesystem::path& path) {
+    const auto document=linksFromReview(review);
+    auto temporary=path;temporary+=".tmp";
+    try {
+        std::ofstream output(temporary,std::ios::trunc);output<<document.dump(1);output.flush();
+        if(!output)throw std::runtime_error("Failed to write fiber links workspace");output.close();
+        std::filesystem::rename(temporary,path);
+    } catch(...) {std::error_code error;std::filesystem::remove(temporary,error);throw;}
+    return detail::workspaceRevision(document.dump());
+}
 std::string saveReview(const FiberReview& review,const std::filesystem::path& path) {
     const auto document=reviewToJson(review);
     auto temporary=path;temporary+=".tmp";
@@ -211,7 +329,7 @@ std::string saveReview(const FiberReview& review,const std::filesystem::path& pa
 }
 FiberReview loadReview(const std::filesystem::path& path) {
     std::ifstream input(path);if(!input)throw std::runtime_error("Cannot open fiber review workspace");
-    return reviewFromJson(Json::parse(input));
+    return reviewFromDocument(Json::parse(input));
 }
 FiberReview quarantineReviewPatch(const FiberReview& current,const std::filesystem::path& workspace,
                                  const PatchEntry& patch,const Progress& progress) {
@@ -236,9 +354,10 @@ FiberReview quarantineReviewPatch(const FiberReview& current,const std::filesyst
         removeReviewProposals(f,excluded);
         for(const auto& patchId:excluded)f.decisions.erase(patchId);
     }
-    const auto document=reviewToJson(result);const auto candidate=document.dump();
+    const bool compact=isLinksDocument(Json::parse(original));
+    const auto document=compact?linksFromReview(result):reviewToJson(result);const auto candidate=compact?document.dump(1):document.dump();
     // Validate all remaining associations before the filesystem transaction.
-    (void)reviewFromJson(document);
+    (void)reviewFromDocument(document);
     if(progress)progress("Saving the workspace and moving source folders to "+destination.parent_path().string());
     detail::publishQuarantine(path,original,candidate,moves);
     result.sessionRevision=detail::workspaceRevision(candidate);

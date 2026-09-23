@@ -6,11 +6,17 @@ Set the coordinate scales before **Load folders / New graph**. The largest
 linked fiber component is selected first; the component dropdown can start a
 new graph from another component.
 
-Fibers are trimmed to their first and last controls. Their sheet strips use the
-same [v7 robust normal fit](RobustLineStrips.md) as Line Annotation, sampled at
-20-voxel intervals where the coarser mesh remains valid. Difficult fibers retain
-the finer fitting mesh. Saved strips regenerate on opening a full graph or first
-selecting a review fiber, preserving patch placements and review decisions.
+Fibers are trimmed to their first and last controls. Their sheet strips are
+seven-row ribbons at 20-voxel columns built by marching outward from each
+fiber sample along the in-sheet cross direction while re-reading the Lasagna
+normal field, re-centring on the `pred_dt` sheet score when the manifest has
+one, with invalid, folded or disagreeing normals interpolated from their
+neighbours (see *Automatic linking* below for the measurements). This
+replaced the [v7 robust normal fit](RobustLineStrips.md) used by Line
+Annotation, whose regularization pulled the outer rows off the sheet and cost
+seconds to minutes per fiber. Saved strips of any other generation regenerate
+on opening a full graph or first selecting a review fiber, preserving patch
+placements and review decisions.
 The output is a dynamically sized, strict-quad tifxyz grid.
 Missing support remains invalid rather than connecting unrelated boundaries.
 
@@ -127,12 +133,117 @@ committed and never falls back to deforming the fiber.
   boundary display, including the current proposal outline.
 - Click an accepted patch, or double-click an accepted/rejected/skipped entry in the
   decision list, to reopen that pair. Undo/redo covers the last 20 decisions
-  during this session. **Pause / Resume** retains pending alignment edits.
+  during this session; each entry restores the decided fiber and returns to
+  it, leaving other fibers' discovery and decisions untouched. **Pause /
+  Resume** retains pending alignment edits.
 - Switching fibers preserves decisions and each fiber's current review position.
-  The camera keeps its zoom and pans to each next proposal's contact.
+  The camera keeps its zoom and pans to each next proposal's contact. The
+  previous fiber stays on screen until the new layout is ready. Accepted
+  layers are rasterized in parallel and kept in a per-session cache (768 MB,
+  least recently shown evicted) so returning to a fiber reuses them.
+- The viewer renders each accepted layer only over the pixels its patch can
+  cover, so a fiber with a hundred accepted patches pans and zooms at roughly
+  the cost of the fiber itself. `--profile` logs `surfaceLayers elapsed_ms`.
 
-**Save / Save as** writes a `vc3d_fiber_review` version-2 JSON workspace using
-atomic replacement. It stores shared immutable source geometry once, per-pair
+### Automatic linking
+
+**Auto link fiber** decides every undecided proposal of the selected fiber
+from geometry alone; **Auto link all fibers** discovers and decides every
+fiber in the catalog (cancel keeps the fibers finished so far; not undoable).
+Decisions made by hand are kept. Linked patches are fitted with the ordinary
+review solver, using earlier automatic accepts as overlap targets, and stored
+as **Auto-accepted**; a linked patch whose fit fails becomes **Auto-skipped**
+with the solver message; everything else becomes **Auto-rejected**. Each
+automatic decision carries a note (shown as the decision's tooltip) with the
+measurements behind it. **Next auto-rejected** reopens the next automatically
+rejected pair in proposal order so a reviewer can walk through what the
+linker declined; deciding a reopened pair by hand clears its automatic mark.
+The workspace stores `automatic` and `note` on decisions; older files load
+with both absent.
+
+The linker (`vc::constraints::autoLinkFiber`, `core/src/constraints/AutoLink.cpp`)
+has two mechanisms and no learned model:
+
+- **Anchors** are patches the fiber lies on for at least **Anchor contact**
+  (default 75 graph voxels of contact runs, merging gaps up to twice the strip
+  spacing) whose vertices inside the fiber strip's footprint agree with the
+  strip more than they sit one sheet away from it. Agreement is the fraction
+  of vertices within 3 vx of the strip with parallel normals, adjacency the
+  fraction 4.5–16 vx away with parallel normals, both weighted 1, 0.7, 0.4,
+  0.15 by strip rows from the centerline, since the normal-field strip is
+  less reliable away from the fiber.
+- **Growth** links any remaining patch whose vertices overlap the linked set
+  on the same sheet (≥10% within 3 vx with parallel normals) clearly more
+  than on an adjacent sheet (more than twice the adjacent fraction), repeated
+  until nothing changes. A wrong-sheet cluster is internally consistent but
+  never touches the linked set, so it stays unlinked for human review.
+
+Validation on the `fiber_linking.json` review (2998 accepted, 335 rejected
+pairs after the reviewer re-checked every disputed rejection): 10-fold
+cross-validation grouped by fiber gave 0 false links and 84% recall of the
+accepted pairs. Without the strip gate anchors needed 150 vx of contact to
+avoid a wrong-sheet cluster on fiber `…000123`; with it, false links only
+appear below 60 vx. The C++ port reproduces the Python prototype's decisions
+on 3630 of 3644 pairs and links 0 rejected pairs on the same review:
+
+```sh
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 volume-cartographer/build/bin/constraint_graph_probe --auto-link-review /home/sean/Desktop/fiber_linking.json /tmp/auto-link.jsonl [anchor_contact]
+```
+
+`vc_fiber_auto_link` runs the same linker without the UI over a fiber folder,
+patch folder and normals manifest, writing a `vc_fiber_patch_links` JSON that
+`spiral-fitting/auto_link_fibers.py` converts into `explicit_link:<patch>`
+tags on the fiber files for `fit_spiral.py`. The CLI builds each fiber's
+strip with the same builder as VC3D (`makeFiberNode`): the fiber resampled
+every 20 vx, each row marched outward along the in-sheet cross direction
+while re-reading the normal field, with invalid, folded or disagreeing
+normals interpolated from their neighbours and a light smoothing along the
+fiber. When the normals manifest has a `pred_dt` channel (a sheet score that
+peaks on the papyrus), every marched point also climbs that score along the
+local normal within 2 vx, so the ribbon re-centres on the sheet instead of
+drifting: measured against the same-sheet accepted patch, the ±60 vx rows go
+from 1.6 to 0.95 vx median (79% to 94% within 3 vx), as close as the fiber
+line itself. It has none of the robust fit's validity guarantees, which the
+distance-based linker does not need, and takes milliseconds per fiber where
+the v7 fit's repair cascade takes seconds to minutes. Because a re-centred
+ribbon agrees more with a neighbouring sheet where two sheets touch, the
+anchor gate requires the strip same-sheet fraction to exceed **1.5x** the
+adjacent fraction (`--anchor-strip-ratio`); with a plain 1x gate the snapped
+strip linked 8 rejected patches on two fibers. On the reviewed fibers
+the two ribbons share the centerline and differ by a median 0.7 / 1.4 / 2.1 vx
+at the ±20 / 40 / 60 vx rows; where they disagree by more than 12 vx the fast
+ribbon lies on the human-accepted patches (median 3 vx) and the robust one
+does not (median 16 vx), so the fast strip is the better sheet estimate for
+linking. On the review of 2026-09-22 (3492 accepted, 409 rejected) the snapped
+fast strip links 83% of accepted pairs, the unsnapped 80%, both with the same
+single rejected pair linked (fiber `…000201`, `band-seed2763590…`: 14 vx of
+contact but 93% same-sheet overlap with the linked patches). `-j` spawns worker *processes* over longest-first shards and
+merges their outputs; the result is independent of the job count.
+`--strip-cache DIR` stores every strip keyed by the fiber file's bytes and the
+strip settings, so re-runs skip the strip stage entirely. The
+whole 765-fiber catalog runs in about a minute with 12 workers.
+
+```sh
+volume-cartographer/build/bin/vc_fiber_auto_link --fibers <fibers> --patches <patches> --normals <las.lasagna.json> --fiber-scale 0.25 --normal-scale 4 -j 12 --strip-cache <fibers>_strips -o fiber_patch_links.json
+```
+
+**Save / Save as** writes the compact `vc_fiber_patch_links` document (version
+2): the settings and, per fiber, each decided patch with its status, decision
+order, automatic flag, note, linker measurements and any manual keypoint pairs,
+plus keypoints added to a still-undecided proposal. A whole review is a few
+hundred kilobytes. Strips, proposals and fitted placements are not stored:
+selecting a fiber rebuilds its strip, discovers its proposals and fits its
+accepted patches in decision order (about half a second per patch, cached for
+the session), each fit using the placements fitted before it as overlap
+targets. An accepted link that cannot be registered becomes Auto-skipped with
+the solver message. Because placements are refitted, a review reopened after a
+solver change shows the new fit. **Open** accepts this document directly,
+including the version-1 file `vc_fiber_auto_link` writes, so the CLI's result
+can be reviewed in the workspace without any conversion, and it still opens
+the legacy multi-gigabyte `vc3d_fiber_review` workspace described below, which
+saves back down to the compact form.
+
+The legacy `vc3d_fiber_review` version-2 JSON workspace used It stores shared immutable source geometry once, per-pair
 contacts and placements, rejected decisions, fixed fiber charts, pending edits,
 source paths and scales, review settings, and positions. **Open** restores the
 mode automatically and still reads version-1 workspaces. Version 2 stores
@@ -149,7 +260,8 @@ available. Saved decisions and manual keypoint edits are retained.
 An accepted patch can have a different placement for each fiber. These charts
 are deliberately stored as separate associations, not as one globally fitted
 surface. Source files are never rewritten. There is no spiral-fitting integration
-or tifxyz export for this mode.
+or tifxyz export for this mode beyond the compact links document, which
+`spiral-fitting/auto_link_fibers.py` reads directly.
 
 The read-only real-data validation probe takes input locations from an existing
 ordinary graph session, creates single-fiber reviews, checks that fits preserve

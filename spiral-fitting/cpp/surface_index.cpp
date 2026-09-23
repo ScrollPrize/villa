@@ -482,6 +482,70 @@ public:
         return ids;
     }
 
+    auto sample_xyz(int32_t surface_index, int stride) const
+    {
+        if (surface_index < 0 || static_cast<size_t>(surface_index) >= surfaces_.size()) {
+            throw std::runtime_error("surface_index out of range");
+        }
+        if (stride < 1) {
+            throw std::runtime_error("stride must be >= 1");
+        }
+        const SurfaceData& surface = *surfaces_[static_cast<size_t>(surface_index)];
+        std::vector<float> xyz;
+        for (size_t row = 0; row < surface.rows; row += static_cast<size_t>(stride)) {
+            for (size_t col = 0; col < surface.cols; col += static_cast<size_t>(stride)) {
+                const Vec3& point = surface.at(row, col);
+                // Match patch_query_points: discard only the [-1, -1, -1] sentinel.
+                if (point.x == -1.0f && point.y == -1.0f && point.z == -1.0f) {
+                    continue;
+                }
+                xyz.insert(xyz.end(), {point.x, point.y, point.z});
+            }
+        }
+        return own_2d(std::move(xyz), 3);
+    }
+
+    auto nearby_surfaces(int32_t surface_index) const
+    {
+        if (surface_index < 0 || static_cast<size_t>(surface_index) >= surfaces_.size()) {
+            throw std::runtime_error("surface_index out of range");
+        }
+        std::vector<int32_t> result;
+        {
+            nb::gil_scoped_release release;
+            std::vector<uint8_t> seen(surfaces_.size(), 0);
+            std::vector<uint32_t> stack;
+            for (size_t source_tile = surface_tile_offsets_[static_cast<size_t>(surface_index)];
+                 source_tile < surface_tile_offsets_[static_cast<size_t>(surface_index) + 1];
+                 ++source_tile) {
+                const Aabb& query = tiles_[source_tile].bounds;
+                if (nodes_.empty()) break;
+                stack.clear();
+                stack.push_back(0);
+                while (!stack.empty()) {
+                    const BvhNode& node = nodes_[stack.back()];
+                    stack.pop_back();
+                    if (!node.bounds.intersects(query)) continue;
+                    if (node.count != 0) {
+                        for (uint32_t offset = 0; offset < node.count; ++offset) {
+                            const Tile& tile = tiles_[tile_order_[node.first + offset]];
+                            const size_t other = static_cast<size_t>(tile.surface);
+                            if (!seen[other] && tile.bounds.intersects(query)) {
+                                seen[other] = 1;
+                                result.push_back(tile.surface);
+                            }
+                        }
+                    } else {
+                        stack.push_back(node.right);
+                        stack.push_back(node.left);
+                    }
+                }
+            }
+            std::sort(result.begin(), result.end());
+        }
+        return own_1d(std::move(result));
+    }
+
     nb::object locate_all_xyz_batch(XyzBatch xyzs, float tolerance) const
     {
         return query_batch(xyzs, nullptr, tolerance);
@@ -600,6 +664,9 @@ private:
             }
         }
         std::vector<Tile> new_tiles;
+        std::vector<size_t> new_surface_tile_offsets;
+        new_surface_tile_offsets.reserve(per_surface.size() + 1);
+        new_surface_tile_offsets.push_back(0);
         size_t total = 0;
         for (const auto& tiles : per_surface) {
             total += tiles.size();
@@ -607,6 +674,7 @@ private:
         new_tiles.reserve(total);
         for (auto& tiles : per_surface) {
             new_tiles.insert(new_tiles.end(), tiles.begin(), tiles.end());
+            new_surface_tile_offsets.push_back(new_tiles.size());
         }
         per_surface.clear();
 
@@ -619,6 +687,7 @@ private:
         }
 
         surfaces_ = std::move(new_surfaces);
+        surface_tile_offsets_ = std::move(new_surface_tile_offsets);
         tiles_ = std::move(new_tiles);
         tile_order_ = std::move(new_order);
         nodes_ = std::move(new_nodes);
@@ -988,6 +1057,7 @@ private:
     }
 
     std::vector<std::shared_ptr<SurfaceData>> surfaces_;
+    std::vector<size_t> surface_tile_offsets_;
     std::vector<Tile> tiles_;
     std::vector<uint32_t> tile_order_;
     std::vector<BvhNode> nodes_;
@@ -1027,6 +1097,10 @@ NB_MODULE(surface_index, module)
             nb::arg("bbox_padding") = 0.0f,
             nb::arg("sampling_stride") = 1)
         .def("surface_ids", &PySurfacePatchIndex::surface_ids)
+        .def("sample_xyz", &PySurfacePatchIndex::sample_xyz,
+             nb::arg("surface_index"), nb::arg("stride") = 1)
+        .def("nearby_surfaces", &PySurfacePatchIndex::nearby_surfaces,
+             nb::arg("surface_index"))
         .def(
             "locate_all_xyz_batch",
             &PySurfacePatchIndex::locate_all_xyz_batch,

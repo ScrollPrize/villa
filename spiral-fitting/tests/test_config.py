@@ -144,6 +144,7 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
         "pcl_vertical_fiber_radial_offset_enabled", "pcl_vertical_fiber_radial_offset_voxels",
         "pcl_link_distance_tolerance", "pcl_link_window_points", "pcl_link_window_min_points",
         "pcl_fiber_link_side_filter", "pcl_fiber_link_side_margin_voxels", "pcl_fiber_link_model_direction_step",
+        "pcl_fiber_explicit_links_only",
 
         "pcl_rel_winding_adjacent_patches_only",
         "pcl_stratified_pcl_sampling", "pcl_sampling_weights",

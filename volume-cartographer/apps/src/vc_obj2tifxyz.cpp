@@ -1,6 +1,8 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/util/LoadJson.hpp"
+#include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/TifxyzIdentity.hpp"
 #include <cctype>
 
@@ -519,7 +521,7 @@ int main(int argc, char *argv[])
         std::cout << "usage: " << argv[0]
                   << " <input.obj> <output_directory> [stretch_factor] [mesh_units]"
                   << " [--uv-metric] [--uv-to-obj=<ratio>] [--uv-downsample=<f>]"
-                  << " [--grid-cap=<pixels>] [--uuid=<id>]" << std::endl;
+                  << " [--grid-cap=<pixels>] [--uuid=<id>] [--voxel-size=<um>]" << std::endl;
         std::cout << "Converts an OBJ file to tifxyz format" << std::endl;
         std::cout << std::endl;
         std::cout << "Parameters:" << std::endl;
@@ -536,6 +538,9 @@ int main(int argc, char *argv[])
         std::cout << "                        output grid to the input sampling density (output scale == input" << std::endl;
         std::cout << "                        scale). If <dir>/approval.tif exists, it is resampled onto the new" << std::endl;
         std::cout << "                        grid via the <input.obj>.griduv sidecar. Absent: legacy metric sizing." << std::endl;
+        std::cout << "  --voxel-size=<um>   : Micrometers per voxel, used for meta.json area_cm2. area_vx2 is always" << std::endl;
+        std::cout << "                        recomputed from the output grid. Absent: the voxel size is recovered" << std::endl;
+        std::cout << "                        from the source meta's area_cm2/area_vx2 pair; else area_cm2 is dropped." << std::endl;
         std::cout << std::endl;
         std::cout << "Note: Scale factors are automatically calculated from the mesh grid structure." << std::endl;
         std::cout << "Examples:" << std::endl;
@@ -555,6 +560,7 @@ int main(int argc, char *argv[])
     uint64_t grid_cap = 0;
     std::string tifxyz_source;  // original tifxyz dir: provides scale + approval mask
     std::string uuid_override;
+    double voxel_size = 0.0;    // micrometers per voxel; <=0 = unset
 
     // Backward-compatible parsing:
     // positional numbers: stretch_factor, mesh_units
@@ -609,6 +615,16 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
             continue;
+        }
+        if (starts_with(a, "--voxel-size=")) {
+            try {
+                voxel_size = std::stod(a.substr(std::string("--voxel-size=").size()));
+                if (!std::isfinite(voxel_size) || voxel_size <= 0.0) throw 1;
+                continue;
+            } catch (...) {
+                std::cerr << "Invalid value for --voxel-size (must be > 0)\n";
+                return EXIT_FAILURE;
+            }
         }
         // numbers (legacy positional)
         if (consumed_numbers == 0) {
@@ -709,6 +725,24 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
     surf->meta = std::move(sourceMeta);
+
+    // The output grid is new geometry, so any area carried over from the
+    // source meta is stale. Without an explicit voxel size, recover the one the
+    // source's area pair was recorded with (area_cm2 = area_vx2 * vs^2 / 1e8).
+    if (voxel_size <= 0.0) {
+        const double src_vx2 = vc::json::number_or(surf->meta, "area_vx2", 0.0);
+        const double src_cm2 = vc::json::number_or(surf->meta, "area_cm2", 0.0);
+        if (std::isfinite(src_vx2) && std::isfinite(src_cm2) && src_vx2 > 0.0 && src_cm2 > 0.0)
+            voxel_size = std::sqrt(src_cm2 * 1e8 / src_vx2);
+    }
+    const double area_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
+    vc::surface::storeAreaMeta(surf->meta, area_vx2, voxel_size);
+    std::cout << "Area: " << area_vx2 << " vx^2";
+    if (surf->meta.contains("area_cm2"))
+        std::cout << ", " << surf->meta["area_cm2"].get_double() << " cm^2 (voxel size " << voxel_size << " um)";
+    else
+        std::cout << " (no voxel size; area_cm2 omitted)";
+    std::cout << std::endl;
 
     // Attach the resampled approval mask so save() writes approval.tif at the
     // new grid size alongside x/y/z.tif.

@@ -99,6 +99,7 @@ public:
     }
 };
 
+
 // Correspondences are linear. Dynamic autodiff otherwise evaluates each one
 // repeatedly in strides of four derivatives, even though its Jacobian is fixed.
 class MatchCost final : public ceres::CostFunction {

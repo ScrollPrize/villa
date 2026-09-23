@@ -472,6 +472,9 @@ private:
     struct RenderResult;
     QImage compositeSurfaceLayers(const RenderResult&);
     static RenderResult renderFrame(RenderContext ctx);
+    // A comparison overlay restricted to the viewport pixels its surface can
+    // cover; identical to renderFrame elsewhere, which is uncovered anyway.
+    static RenderResult renderLayerFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     void markInteractiveMotion(double motionPx);
     void markChunkRequestViewActive();

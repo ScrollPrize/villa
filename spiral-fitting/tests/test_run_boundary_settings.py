@@ -476,6 +476,18 @@ def test_window_min_points_must_fit_the_window_at_a_run_boundary():
     context._relink_all_points_to_patches.assert_called_once_with(iteration=5)
 
 
+def test_explicit_links_only_relinks_every_collection_at_a_run_boundary():
+    context = _context()
+    context.regular_pcl_catalog = {3: _linkable_regular(3, [[51.5, 0.0, 0.0]])}
+    context.fiber_catalog = {'f': _fiber(9, 'f', [[58.5, 0.0, 0.0], [58.5, 0.0, 10.0]])}
+    context._relink_all_points_to_patches = Mock()
+    context._relink_fibers_to_patches = Mock()
+    context.apply_config({'pcl_fiber_explicit_links_only': True}, current_iteration=7)
+    context._relink_all_points_to_patches.assert_called_once_with(iteration=7)
+    context._relink_fibers_to_patches.assert_not_called()
+    assert context.config['pcl_fiber_explicit_links_only'] is True
+
+
 def test_link_settings_are_a_no_op_without_catalogs():
     context = _context()
     context._relink_all_points_to_patches = Mock()

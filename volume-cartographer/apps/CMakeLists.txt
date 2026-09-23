@@ -159,6 +159,9 @@ target_link_libraries(vc_atlas_pred_snap_rebuild vc_atlas)
 add_executable(vc_tifxyz_gengt src/vc_tifxyz_gengt.cpp)
 target_link_libraries(vc_tifxyz_gengt vc_core Boost::program_options)
 
+add_executable(vc_fiber_auto_link src/vc_fiber_auto_link.cpp)
+target_link_libraries(vc_fiber_auto_link vc_constraints Boost::program_options)
+
 set(vc_diffuse_winding_sources
     diffusion/continuous3d.cpp
     diffusion/continous.cpp
@@ -265,7 +268,7 @@ set(VC_CLI_TARGETS
     vc_calc_surface_metrics
     vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph
     vc_atlas_inspect vc_atlas_constraints_export vc_atlas_pred_snap_rebuild
-    vc_tifxyz_gengt vc_diffuse_winding vc_tifxyz_mmap_prepare
+    vc_fiber_auto_link vc_tifxyz_gengt vc_diffuse_winding vc_tifxyz_mmap_prepare
     vc_create_segment_mask vc_merge_tifxyz vc_merge_patch vc_visualize
     vc_volpkg_convert vc_transform_geom vc_gen_normalgrids vc_ngrids
     vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning vc_tifxyz vc_project_tifxyz

@@ -12,6 +12,7 @@ import copy
 import concurrent.futures
 import gc
 import hashlib
+import logging
 import multiprocessing
 import json
 import glob
@@ -1920,9 +1921,15 @@ class FitContext:
             point_linker(verified_patches, point_collections, fiber_point_collections)
         else:
             link_options = self._patch_link_options(
-                point_collections, 1.0, direction_source=direction_source)
+                point_collections, 1.0, direction_source=direction_source,
+                patches=verified_patches)
             if link_options.side_rules:
                 print(self._describe_fiber_link_side_rules(link_options))
+            if link_options.target_patches is not None:
+                tagged = sum(1 for allowed in link_options.target_patches.values() if allowed)
+                print(f'fiber explicit links only: {tagged} of '
+                      f'{len(link_options.target_patches)} fiber(s) carry explicit_link '
+                      f'tags; untagged fibers attach to no patch')
             link_points_to_patches(
                 verified_patches,
                 point_collections,
@@ -2872,12 +2879,47 @@ class FitContext:
                 if getattr(self, 'frozen_epochs', ()) else 1.0)
 
 
+    def _fiber_explicit_link_targets(self, collections, patches=None):
+        """Explicit patch links per fiber collection id under
+        pcl_fiber_explicit_links_only (PatchLinkOptions.target_patches):
+        each fiber's ``metadata.explicit_patch_links`` (its
+        ``explicit_link:<patch id>`` document tags). Regular collections are
+        skipped; ``None`` while the setting is off. Named patches missing
+        from ``patches`` (the verified patches by default) are reported
+        once per patch id."""
+        if not self.config.get('pcl_fiber_explicit_links_only', False):
+            return None
+        targets = {}
+        for cid, pcl in collections.items():
+            metadata = pcl.get('metadata') or {}
+            if (pcl.get('sampling_group') != 'fibers'
+                    and metadata.get('logical_input_kind') != 'fiber'):
+                continue
+            targets[cid] = frozenset(
+                str(patch_id) for patch_id in metadata.get('explicit_patch_links') or ())
+        if patches is None:
+            patches = getattr(self, 'verified_patches', None)
+        if patches is not None:
+            warned = self.__dict__.setdefault('_warned_explicit_link_patches', set())
+            unknown = sorted(
+                {patch_id for allowed in targets.values() for patch_id in allowed}
+                - set(patches) - warned)
+            if unknown:
+                warned.update(unknown)
+                shown = ', '.join(unknown[:10]) + (', ...' if len(unknown) > 10 else '')
+                logging.getLogger(__name__).warning(
+                    'explicit_link tags name %d patch id(s) that are not among the '
+                    'loaded patches (ignored): %s', len(unknown), shown)
+        return targets
+
     def _patch_link_options(self, collections, voxel_scale, *,
-                            direction_source=None, umbilicus_z_to_yx=None):
+                            direction_source=None, umbilicus_z_to_yx=None,
+                            patches=None):
         """PatchLinkOptions for linking ``collections`` (resident id -> pcl)
         in the current input frame. ``voxel_scale`` converts scroll-voxel
         thresholds to that frame; ``direction_source`` defaults to the
-        session's current fiber link direction source."""
+        session's current fiber link direction source; ``patches`` (default:
+        the verified patches) only checks the explicit link tags."""
         rules = self._fiber_link_side_rules(collections)
         inward = None
         if rules:
@@ -2886,13 +2928,16 @@ class FitContext:
                     self, '_fiber_link_direction_source', 'umbilicus')
             inward = self._fiber_link_inward_direction(
                 direction_source, umbilicus_z_to_yx=umbilicus_z_to_yx)
+        targets = self._fiber_explicit_link_targets(collections, patches)
         return PatchLinkOptions(
             window_points=int(self.config['pcl_link_window_points']),
             window_min_points=int(self.config['pcl_link_window_min_points']),
             side_rules=rules,
             inward_direction=inward,
             side_margin=(float(self.config['pcl_fiber_link_side_margin_voxels'])
-                         * voxel_scale))
+                         * voxel_scale),
+            target_patches=targets,
+            restrict_untargeted=targets is not None)
 
     def _describe_fiber_link_side_rules(self, options):
         rules = options.side_rules
@@ -5434,6 +5479,7 @@ class FitContext:
                 'pcl_link_distance_tolerance',
                 'pcl_link_window_points',
                 'pcl_link_window_min_points',
+                'pcl_fiber_explicit_links_only',
             }
             fiber_catalog = getattr(self, 'fiber_catalog', None) or {}
             regular_catalog = getattr(self, 'regular_pcl_catalog', None) or {}

@@ -1,6 +1,7 @@
 #pragma once
 #include "vc/constraints/ConstraintGraph.hpp"
 #include "vc/constraints/FiberReview.hpp"
+#include "vc/constraints/AutoLink.hpp"
 #include "ConstraintGraphPatchColors.hpp"
 #include <QMainWindow>
 #include <QThreadPool>
@@ -67,9 +68,15 @@ private:
         std::optional<vc::constraints::ReviewFiber> regeneratedReviewFiber;
         std::optional<vc::constraints::FiberReview> review;
         std::vector<std::pair<std::string,vc::constraints::FitResult>> reviewLayers;
+        // Auto-link results: replaced fibers plus the advanced order counter.
+        std::vector<std::pair<std::string,vc::constraints::ReviewFiber>> autoLinked;
+        uint64_t nextOrder=0;
+        // Layout changed saved decisions (a stored link could not be fitted).
+        bool decisionsChanged=false;
     };
     using Worker=std::function<Job(const std::atomic_bool*,vc::constraints::Progress)>;
-    void run(const QString& title,Worker,std::function<void(Job)>,bool stoppable=true);
+    // failed runs on the UI thread when the worker throws; superseded jobs call neither.
+    void run(const QString& title,Worker,std::function<void(Job)>,bool stoppable=true,std::function<void()> failed={});
     vc::constraints::Settings settings() const;
     void setSettings(const vc::constraints::Settings&);
     void seed(int component);
@@ -116,6 +123,11 @@ private:
     std::optional<vc::constraints::PatchEntry> reviewPatch() const;
     void quarantineReview();
     void reopenReview(const std::string&);
+    // Geometric auto-linking of the selected fiber (or every fiber): links are
+    // fitted and accepted, the rest rejected, all marked automatic for review.
+    void autoLinkReview(bool allFibers);
+    void reopenNextAutoRejected();
+    std::vector<std::string> autoRejectedPatches() const;
     void rememberReview();
     void reviewHistory(bool);
     void saveReview(bool);
@@ -124,8 +136,27 @@ private:
     void installReview(vc::constraints::FiberReview, const QString&, Job);
     void rebuildReviewLayers();
     void captureReviewEdit();
+    // The fiber whose layout is on screen; differs from the selection while a
+    // newly selected fiber is still being laid out.
+    const vc::constraints::ReviewFiber* displayedReviewFiber() const;
     vc::constraints::Graph reviewDisplayGraph() const;
     static std::shared_ptr<QuadSurface> displaySurface(const vc::constraints::FitResult&);
+    // The review fit already validated and returned the rendered patch layer.
+    static vc::constraints::FitResult reviewPatchLayer(const vc::constraints::FitResult&,const std::atomic_bool*);
+    // Rendered accepted layers, keyed by fiber and patch, valid while the
+    // association keeps its placement identity and render settings.
+    struct ReviewLayerEntry {
+        vc::constraints::Placement placement;
+        vc::constraints::FitResult layer;
+        uint64_t used=0;
+        size_t bytes=0;
+    };
+    using ReviewLayerCache=std::map<std::pair<std::string,std::string>,ReviewLayerEntry>;
+    void rememberReviewLayers(const std::string& fiber,const std::vector<std::pair<std::string,vc::constraints::FitResult>>&);
+    static std::vector<std::pair<std::string,vc::constraints::FitResult>> renderReviewLayers(const std::string& fiber,
+        const std::vector<std::pair<std::string,vc::constraints::ReviewDecision>>& accepted,const vc::constraints::Settings&,
+        const ReviewLayerCache&,const std::atomic_bool* cancel,const vc::constraints::Progress&);
+    struct ReviewSnapshot { std::string fiber; vc::constraints::ReviewFiber state; uint64_t nextOrder=0; };
 
     QComboBox* _mode{};
     QListWidget* _reviewFibers{}, *_reviewDecisions{};
@@ -138,8 +169,13 @@ private:
     bool _centerFirstReviewProposal=false;
     QCheckBox* _reverseReview{};
     QPushButton* _rejectReview{}, *_skipReview{}, *_alternateReview{};
+    QPushButton* _autoLinkFiber{}, *_autoLinkAll{}, *_nextAutoRejected{};
+    QDoubleSpinBox* _autoLinkContact{};
     std::optional<vc::constraints::FiberReview> _review;
-    std::vector<vc::constraints::FiberReview> _reviewUndo,_reviewRedo;
+    std::vector<ReviewSnapshot> _reviewUndo,_reviewRedo;
+    ReviewLayerCache _reviewLayerCache;
+    uint64_t _reviewLayerClock=0;
+    size_t _reviewLayerCacheBytes=0;
     std::vector<std::pair<std::string,vc::constraints::FitResult>> _reviewLayers;
     std::shared_ptr<Surface> _reviewFiberSurface, _reviewPatchSurface;
     std::vector<std::shared_ptr<Surface>> _reviewContextSurfaces;

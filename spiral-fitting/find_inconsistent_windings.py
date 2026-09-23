@@ -1712,7 +1712,8 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
             min_auto_certainty=fit_config['pcl_vertical_fiber_min_auto_certainty'],
             annotation_options=PatchLinkOptions(
                 window_points=fit_config['pcl_link_window_points'],
-                window_min_points=fit_config['pcl_link_window_min_points']))
+                window_min_points=fit_config['pcl_link_window_min_points']),
+            explicit_links_only=fit_config.get('pcl_fiber_explicit_links_only', False))
     print('loading + z-filtering patches and point-collections')
     # Analysis reads only the loaded patches and the linked, classified point
     # collections; the fit-only caches (sampling caches, device atlases,

@@ -68,6 +68,26 @@ def test_distance_is_fractional_and_inclusive_for_annotations(backend):
     assert linker.report['counts']['annotations']['attached_points'] == 1
 
 
+def test_explicit_links_only_restricts_fibers_to_their_tagged_patches(backend):
+    points = [(50, 5, x) for x in (5, 10, 15)]
+    tagged = fiber(1, points)
+    tagged['metadata']['explicit_patch_links'] = ['q']
+    untagged = fiber(2, points)
+    regular = _collection(3, points)
+    patches = {'p': _z_plane(50, 0, 0), 'q': _z_plane(50.5, 0, 0)}
+    linker = AnalysisPointLinker(policy(), inward_z, explicit_links_only=True)
+    linker(patches, {1: tagged, 2: untagged, 3: regular}, {1: tagged, 2: untagged})
+    assert _attached(tagged) == ['q'] * 3
+    assert _attached(untagged) == [None] * 3
+    assert _attached(regular) == ['p'] * 3
+    assert linker.report['explicit_links_only'] is True
+    # Off (the default), the tags are ignored and both fibers take the nearest patch.
+    tagged, untagged = fiber(1, points), fiber(2, points)
+    tagged['metadata']['explicit_patch_links'] = ['q']
+    AnalysisPointLinker(policy(), inward_z)(patches, {1: tagged, 2: untagged}, {1: tagged, 2: untagged})
+    assert _attached(tagged) == _attached(untagged) == ['p'] * 3
+
+
 def test_strict_support_does_not_relax_for_short_fibers(backend):
     pcl = fiber(1, [(50, 5, x) for x in (5, 10, 15)])
     linker = AnalysisPointLinker(policy(min_points=4), inward_z)

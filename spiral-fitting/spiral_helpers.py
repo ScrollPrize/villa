@@ -199,6 +199,29 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
     return _fiber_collection_from_payload(payload, collection_id)
 
 
+# Fiber JSON document tag naming a patch the fiber is known to lie on:
+# ``explicit_link:<patch id>`` with the patch's tifxyz folder name. Written by
+# auto_link_fibers.py from VC3D fiber reviews or vc_fiber_auto_link output and
+# consumed under pcl_fiber_explicit_links_only (see PatchLinkOptions).
+EXPLICIT_LINK_TAG_PREFIX = 'explicit_link:'
+
+
+def explicit_patch_links_from_tags(tags):
+    """Sorted, de-duplicated patch ids named by ``explicit_link:`` tags.
+
+    Non-string entries, other tags and tags with an empty patch id are
+    ignored; ``[]`` when ``tags`` is not a list."""
+    if not isinstance(tags, (list, tuple)):
+        return []
+    patches = set()
+    for tag in tags:
+        if isinstance(tag, str) and tag.startswith(EXPLICIT_LINK_TAG_PREFIX):
+            patch_id = tag[len(EXPLICIT_LINK_TAG_PREFIX):].strip()
+            if patch_id:
+                patches.add(patch_id)
+    return sorted(patches)
+
+
 def _load_fiber_payload(path, coordinate_scale=0.25, min_point_spacing=20.0, *, base_shape_zyx=None):
     """Parse, trim and decimate one fiber JSON into picklable numpy payloads.
 
@@ -329,6 +352,7 @@ def _load_fiber_payload(path, coordinate_scale=0.25, min_point_spacing=20.0, *, 
             'fiber_sequence': data.get('sequence'),
             'fiber_started_at': data.get('started_at'),
             'fiber_tags': data.get('tags', []),
+            'explicit_patch_links': explicit_patch_links_from_tags(data.get('tags')),
             'hv_classification': data.get('hv_classification', {}),
             'input_coordinate_scale': coordinate_scale,
             'pcl_fiber_min_point_spacing': min_point_spacing,

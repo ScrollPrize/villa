@@ -90,6 +90,24 @@ private slots:
         layers[0].opacity=0;QCOMPARE(vc3d::blendSurfaceLayers(fiber,layers),fiber);
         layers[1].opacity=1;QCOMPARE(vc3d::blendSurfaceLayers(fiber,layers).pixelColor(0,0),QColor(Qt::red));
     }
+    void regionLimitedBlendMatchesWholeImageBlend(){
+        QImage base(9,7,QImage::Format_RGB32);
+        for(int y=0;y<7;++y)for(int x=0;x<9;++x)base.setPixel(x,y,qRgb(x*20,y*30,(x+y)*10));
+        QImage patch(9,7,QImage::Format_RGB32);patch.fill(QColor(200,40,90));
+        cv::Mat_<uint8_t> coverage(7,9,uint8_t(0));
+        for(int y=2;y<5;++y)for(int x=3;x<7;++x)coverage(y,x)=1;
+        const auto whole=vc3d::blendSurfaceImages(base,patch,coverage,.35f,QColor(10,200,30,40));
+        auto limited=base;const cv::Rect region(3,2,4,3);
+        vc3d::blendSurfaceImageInPlace(limited,patch,coverage,.35f,QColor(10,200,30,40),&region);
+        QCOMPARE(limited,whole);
+        // A region beyond the image is clipped; an empty region blends nothing.
+        auto clipped=base;const cv::Rect large(-5,-5,100,100);
+        vc3d::blendSurfaceImageInPlace(clipped,patch,coverage,.35f,QColor(10,200,30,40),&large);
+        QCOMPARE(clipped,whole);
+        auto none=base;const cv::Rect empty;
+        vc3d::blendSurfaceImageInPlace(none,patch,coverage,.35f,{},&empty);
+        QCOMPARE(none,base);
+    }
     void comparisonOpacityPreservesHolesAndBlackPixels(){
         QImage base(3,1,QImage::Format_RGB32);base.fill(Qt::white);
         QImage patch(3,1,QImage::Format_RGB32);patch.fill(Qt::black);

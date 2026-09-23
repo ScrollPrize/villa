@@ -371,56 +371,7 @@ Catalog loadCatalog(const Settings& settings,const std::atomic_bool* cancel,Prog
 }
 
 std::shared_ptr<const Node> makeFiberNode(const Fiber& f,const Settings& s,const lasagna::NormalSampler& sampler,const std::atomic_bool* cancel) {
-    lasagna::LineModel line;
-    bool haveNormal=false;
-    cv::Vec3d firstNormal{0,0,0};
-    for(const auto& p:f.line) {
-        auto normal=sampler.sampleNormal(p);
-        if(normal.valid&&!haveNormal)firstNormal=normal.normal;
-        haveNormal|=normal.valid;
-        line.points.push_back({p,normal,true});
-    }
-    if(!haveNormal)throw std::runtime_error("No Lasagna normals along fiber "+f.id);
-    lasagna::LineViewConfig config;
-    config.normalSampler=&sampler;config.checkCancelled=[cancel]{detail::cancelled(cancel);};
-    config.targetSpacingBaseVoxels=s.spacing;config.crossSpacingBaseVoxels=s.spacing;
-    config.crossSampleCount=7;config.buildLineZSlices=false;
-    // Uniform arclength columns; controls remain exact fractional references.
-    config.controlPointLinePositions={0.0,static_cast<double>(f.line.size()-1)};
-    auto views=lasagna::buildLineViewSurfaces(line,config);
-    auto node=std::make_shared<Node>();node->id=f.id;node->path=f.path;node->fiber=true;node->direction=f.direction;
-    node->line=f.line;node->controls=f.controls;
-    node->stripGeneration=lasagna::kRobustLineStripVersion;
-    node->lineArclength=views.stripPositionMap.originalArclengths;
-    node->columnArclength=views.stripPositionMap.stripGridArclengths;
-    const auto& grid=*views.lineSurface->rawPointsPtr();node->rows=grid.rows;node->cols=grid.cols;
-    node->xyz.resize(grid.total());node->initialUv.resize(grid.total());
-    // An intrinsic straight ribbon is an injective starting chart even for
-    // a fiber that winds repeatedly around the scroll. Integrating projected
-    // XYZ tangents here can fold the initial chart before optimization begins.
-    const auto delta=f.line.back()-f.line.front();
-    cv::Vec2d along{1,0};
-    if(f.direction=='V') along={0,delta[2]>=0?-1.0:1.0};
-    else {
-        const auto normal=detail::unit(firstNormal);
-        const auto right=detail::unit(cv::Vec3d{0,0,-1}.cross(normal));
-        if(delta.dot(right)<0) along={-1,0};
-    }
-    const cv::Vec2d across{-along[1],along[0]};
-    for(int x=0;x<grid.cols;++x) for(int y=0;y<grid.rows;++y) {
-        node->xyz[y*grid.cols+x]=cv::Vec3d(grid(y,x));
-        node->initialUv[y*grid.cols+x]=along*node->columnArclength[x]
-            +across*((y-grid.rows/2)*(3*s.spacing/(grid.rows/2)));
-    }
-    // LineViewBuilder chooses a coherent normal sign independently of the
-    // dataset. Normalize the chart orientation once, preserving its geometry.
-    detail::triangulate(*node);
-    if(!node->triangles.empty()) {
-        auto t=node->triangles.front();
-        if(detail::cross(node->initialUv[t[1]]-node->initialUv[t[0]],node->initialUv[t[2]]-node->initialUv[t[0]])<0)
-            for(auto& uv:node->initialUv) uv[0]*=-1;
-    }
-    return node;
+    return makeFastFiberNode(f,s,sampler,cancel);
 }
 std::shared_ptr<const Node> loadPatchNode(const PatchEntry& p,const Settings& s) {
     QuadSurface surf(p.path);surf.ensureLoaded();const auto& grid=*surf.rawPointsPtr();

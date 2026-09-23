@@ -232,5 +232,6 @@ add_library(vc_constraints
     src/constraints/GraphFit.cpp
     src/constraints/GraphPrepared.cpp
     src/constraints/GraphSession.cpp
-    src/constraints/FiberReview.cpp)
+    src/constraints/FiberReview.cpp
+    src/constraints/AutoLink.cpp)
 target_link_libraries(vc_constraints PUBLIC vc_core vc_lasagna PRIVATE Ceres::ceres)

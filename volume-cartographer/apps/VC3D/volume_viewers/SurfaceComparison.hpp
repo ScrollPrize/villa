@@ -26,18 +26,24 @@ inline uint32_t alphaBlendArgb(uint32_t base, uint32_t overlay, float alpha)
 
 // Only covered comparison pixels contribute. Holes keep the base image;
 // opacity zero restores it exactly, including genuinely black CT pixels.
+// region, when given, bounds the overlay's coverage: pixels outside it are
+// uncovered, so restricting the loop to it is exact. Null means the whole image.
 inline void blendSurfaceImageInPlace(QImage& result,const QImage& overlay,
-                                    const cv::Mat_<uint8_t>& coverage,float opacity,const QColor& tint = {}) {
+                                    const cv::Mat_<uint8_t>& coverage,float opacity,const QColor& tint = {},
+                                    const cv::Rect* region = nullptr) {
     if(result.size()!=overlay.size()||coverage.cols!=result.width()||coverage.rows!=result.height())return;
     result=result.convertToFormat(QImage::Format_RGB32);
     if(opacity<=0)return;
+    const cv::Rect whole(0,0,result.width(),result.height());
+    const cv::Rect bounds=region?(*region&whole):whole;
+    if(bounds.empty())return;
     const auto source=overlay.convertToFormat(QImage::Format_RGB32);
     const float tintOpacity=tint.isValid()?tint.alphaF():0.f;
     const auto tintRgb=tintOpacity>0?tint.rgb():0;
-    for(int y=0;y<result.height();++y) {
+    for(int y=bounds.y;y<bounds.y+bounds.height;++y) {
         auto* dst=reinterpret_cast<uint32_t*>(result.scanLine(y));
         const auto* src=reinterpret_cast<const uint32_t*>(source.constScanLine(y));
-        for(int x=0;x<result.width();++x)if(coverage(y,x)) {
+        for(int x=bounds.x;x<bounds.x+bounds.width;++x)if(coverage(y,x)) {
             const auto pixel=tintOpacity>0?alphaBlendArgb(src[x],tintRgb,tintOpacity):src[x];
             dst[x]=alphaBlendArgb(dst[x],pixel,opacity);
         }

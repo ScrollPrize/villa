@@ -105,6 +105,7 @@ struct RasterSample {
     cv::Vec3d sum{0,0,0},normal{0,0,0},point{-1,-1,-1},target{-1,-1,-1};
     double mass=0,priority=-1;
     cv::Vec3d tangentU{0,0,0},tangentV{0,0,0};
+    cv::Vec2d ownerGrid{0,0};
     int owner=-1,visited=-1;
     bool active=false;
 };
@@ -194,6 +195,42 @@ struct Fidelity {
     cv::Vec3d target;double weight;
     template<class T> bool operator()(const T* p,T* r) const {
         for(int i=0;i<3;++i) r[i]=T(weight)*(p[i]-T(target[i]));return true;
+    }
+};
+// Integrate measured source tangents across a merge seam. Position fidelity
+// fixes the global translation; edge fidelity prevents source membership
+// changes from reversing the local parameterization.
+struct MergeEdge {
+    cv::Vec3d delta;double weight;
+    template<class T> bool operator()(const T* a,const T* b,T* residual)const {
+        for(int d=0;d<3;++d)residual[d]=T(weight)*(b[d]-a[d]-T(delta[d]));
+        return true;
+    }
+};
+struct MergeOrientation {
+    cv::Vec3d normal;double spacing;
+    template<class T> bool operator()(const T* a,const T* b,const T* c,T* residual)const {
+        const T u[3]={b[0]-a[0],b[1]-a[1],b[2]-a[2]};
+        const T v[3]={c[0]-a[0],c[1]-a[1],c[2]-a[2]};
+        const T area=((u[1]*v[2]-u[2]*v[1])*T(normal[0])+
+                      (u[2]*v[0]-u[0]*v[2])*T(normal[1])+
+                      (u[0]*v[1]-u[1]*v[0])*T(normal[2]))/T(spacing*spacing);
+        residual[0]=area<T(.05)?T(1000)*(.05-area):T(0);
+        return true;
+    }
+};
+// Source-normal agreement alone still permits the two halves of a quad to
+// point away from each other. Keep their dihedral angle below a right angle.
+struct MergeQuadOrientation {
+    template<class T> bool operator()(const T* a,const T* b,const T* c,const T* d,T* residual)const {
+        const T u[3]={b[0]-a[0],b[1]-a[1],b[2]-a[2]},v[3]={c[0]-a[0],c[1]-a[1],c[2]-a[2]};
+        const T w[3]={c[0]-d[0],c[1]-d[1],c[2]-d[2]},z[3]={b[0]-d[0],b[1]-d[1],b[2]-d[2]};
+        const T n[3]={u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]};
+        const T m[3]={w[1]*z[2]-w[2]*z[1],w[2]*z[0]-w[0]*z[2],w[0]*z[1]-w[1]*z[0]};
+        T dot=T(0),nn=T(0),mm=T(0);for(int i=0;i<3;++i){dot+=n[i]*m[i];nn+=n[i]*n[i];mm+=m[i]*m[i];}
+        const T cosine=dot/sqrt(nn*mm+T(1e-12));
+        residual[0]=cosine<T(.1)?T(1000)*(.1-cosine):T(0);
+        return true;
     }
 };
 struct HorizontalAnchor {
@@ -338,7 +375,7 @@ FitResult renderSourceLayer(const Graph& fitted,bool fibers,const std::atomic_bo
 }
 namespace {
 FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,LocalFit* local=nullptr,
-                        const cv::Mat_<cv::Vec3f>* saved=nullptr,const cv::Vec2d* savedOrigin=nullptr,const Progress& progress={}) {
+                        const cv::Mat_<cv::Vec3f>* saved=nullptr,const cv::Vec2d* savedOrigin=nullptr,const Progress& progress={},bool feather=false) {
     FitResult result;result.graph=std::move(graph);auto& g=result.graph;
     const bool fixed=!g.windingLayout.is_null();
     if(fixed)refine=false;
@@ -417,6 +454,8 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
     if(local&&local->edit)linked=detail::editedPairs(*local->edit);
     else for(const auto& l:g.links.read()) linked.insert(std::minmax(l.a.node,l.b.node));
     size_t conflicts=0;int ordinal=0;std::set<size_t> projectionConflicts;
+    struct CollisionSummary {size_t count=0;double minimum=INFINITY,maximum=0;size_t first=0;cv::Vec3d firstA,firstB;};
+    std::map<std::pair<std::string,std::string>,CollisionSummary> collisionSummaries;
     // Synthetic ribbons are support only; real patches replace that support.
     for(bool fiber:{true,false}) for(const auto& [id,p]:g.nodes) {
         if(p.source->fiber!=fiber) continue;
@@ -431,7 +470,7 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
         // holes), in physical units. This keeps interiors coherent instead of
         // erasing every sample at which two independent charts disagree.
         cv::Mat_<float> interior;
-        if(fixed&&!fiber) {
+        if((fixed||feather)&&!fiber) {
             cv::Mat_<unsigned char> support(n.rows+2,n.cols+2,uchar{0});
             for(const auto& t:n.triangles)for(int i:t.val)support(i/n.cols+1,i%n.cols+1)=255;
             if(!n.quadMask.empty())for(int y=0;y+1<n.rows;++y)for(int x=0;x+1<n.cols;++x)
@@ -466,14 +505,25 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
                 auto& sample=samples.insert(index);if(sample.visited==current&&!fixed)continue;
                 sample.visited=current;
                 auto xyz=n.xyz[t[0]]*(*w)[0]+n.xyz[t[1]]*(*w)[1]+n.xyz[t[2]]*(*w)[2];
-                double sourceColumn=0;for(int j=0;j<3;++j)sourceColumn+=(t[j]%n.cols)*(*w)[j];
+                cv::Vec2d sourceGrid{0,0};
+                for(int j=0;j<3;++j)sourceGrid+=cv::Vec2d{double(t[j]%n.cols),double(t[j]/n.cols)}*(*w)[j];
+                double sourceColumn=sourceGrid[0];
                 xyz+=junctions.offset(n,sourceColumn);
                 double weight=1;
+                if(feather&&!fiber) {
+                    // Uniform averaging jumps when another source starts or
+                    // ends inside an overlap. Let its influence enter smoothly
+                    // from zero at its boundary, including internal holes.
+                    double distance=0;
+                    for(int j=0;j<3;++j)distance+=interior(t[j]/n.cols+1,t[j]%n.cols+1)*(*w)[j];
+                    const double u=std::clamp((distance-1)*sourceStep/(2*spacing),0.0,1.0);
+                    weight=std::max(1e-6,u*u*(3-2*u));
+                }
                 if(fiber) {
                     double sourceRow=0;for(int j=0;j<3;++j) sourceRow+=(t[j]/n.cols)*(*w)[j];
                     weight=1/(1+std::abs(sourceRow-n.rows/2));
                 }
-                if(sample.owner>=0&&!fiber&&g.nodes.at(ids[sample.owner]).source->fiber) {sample.mass=0;sample.sum={0,0,0};sample.normal={0,0,0};}
+                if(sample.owner>=0&&!fiber&&g.nodes.at(ids[sample.owner]).source->fiber) {sample.mass=0;sample.sum={0,0,0};sample.normal={0,0,0};sample.tangentU={0,0,0};sample.tangentV={0,0,0};}
                 if(fixed) {
                     if(sample.mass>0&&!fiber&&cv::norm(sample.sum/sample.mass-xyz)>g.settings.radius)
                         projectionConflicts.insert(index);
@@ -487,13 +537,29 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
                     // average unrelated 3D locations into an invented sheet.
                     if(sample.mass==0||priority>sample.priority+1e-9) {
                         sample.sum=xyz;sample.normal=normal;sample.mass=1;sample.owner=current;
-                        sample.priority=priority;sample.tangentU=tangentU;sample.tangentV=tangentV;
+                        sample.priority=priority;sample.tangentU=tangentU;sample.tangentV=tangentV;sample.ownerGrid=sourceGrid;
                     }
                     continue;
                 }
                 if(!fixed&&sample.mass>0&&!fiber&&cv::norm(sample.sum/sample.mass-xyz)>g.settings.radius &&
-                   !linked.contains(std::minmax(id,ids[sample.owner]))) ++conflicts;
-                sample.sum+=xyz*weight;sample.normal+=normal*weight;sample.mass+=weight;sample.owner=current;
+                   !linked.contains(std::minmax(id,ids[sample.owner]))) {
+                    ++conflicts;
+                    if(feather)result.projectionCollisions.push_back({
+                        {ids[sample.owner],sample.ownerGrid},{id,sourceGrid},
+                        low+cv::Vec2d{double(x)*spacing,double(y)*spacing},sample.sum/sample.mass,xyz,
+                        detail::unit(sample.normal),normal,tangentU,tangentV});
+                    if(feather&&std::getenv("VC3D_DIAGNOSE_MERGE_COLLISIONS")) {
+                        const auto pair=std::minmax(id,ids[sample.owner]);
+                        auto& summary=collisionSummaries[pair];
+                        const auto old=sample.sum/sample.mass;
+                        const double distance=cv::norm(old-xyz);
+                        if(!summary.count) {summary.first=index;summary.firstA=old;summary.firstB=xyz;}
+                        ++summary.count;summary.minimum=std::min(summary.minimum,distance);
+                        summary.maximum=std::max(summary.maximum,distance);
+                    }
+                }
+                sample.sum+=xyz*weight;sample.normal+=normal*weight;sample.mass+=weight;sample.owner=current;sample.ownerGrid=sourceGrid;
+                if(feather){sample.tangentU+=tangentU*weight;sample.tangentV+=tangentV*weight;}
             }
         }
     }
@@ -517,7 +583,14 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
         }
         if(discontinuous){coverage[a]=0;++discontinuousCells;}
     }
-    if(conflicts) {result.message="Unlinked patches collide in the flattened view ("+std::to_string(conflicts)+" samples)";return result;}
+    if(conflicts) {
+        if(!collisionSummaries.empty())for(const auto& [pair,summary]:collisionSummaries)
+            std::clog<<"Merge collision: "<<pair.first<<" "<<pair.second
+                     <<" count="<<summary.count<<" distance="<<summary.minimum<<".."<<summary.maximum
+                     <<" first_grid="<<summary.first%cols<<","<<summary.first/cols
+                     <<" xyz="<<summary.firstA<<" / "<<summary.firstB<<std::endl;
+        result.message="Unlinked patches collide in the flattened view ("+std::to_string(conflicts)+" samples)";return result;
+    }
     // A complete set of vertices does not prove that their cell has source
     // support. Remove one boundary vertex for each uncovered cell so strict
     // QuadSurface rendering cannot bridge across a gap between ribbons.
@@ -583,8 +656,39 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
     for(size_t i=0;i<count;++i)if(samples[i].active)active.push_back(int(i));
     if(active.empty()){result.message="No complete quads after rasterization";return result;}
     if(refine) {
-        for(int i:active)if(movable(i))problem.AddResidualBlock(new ceres::AutoDiffCostFunction<Fidelity,3,3>(new Fidelity{samples[i].target,5.0/spacing}),nullptr,point(i).val);
+        for(int i:active)if(movable(i))problem.AddResidualBlock(new ceres::AutoDiffCostFunction<Fidelity,3,3>(new Fidelity{samples[i].target,5.0/spacing}),
+            feather?new ceres::HuberLoss(5*g.settings.radius/spacing):nullptr,point(i).val);
+        if(feather)for(int i:active)for(int offset:{1,cols}) {
+            const int j=i+offset;
+            if(j>=int(count)||(offset==1&&j/cols!=i/cols)||!samples[j].active)continue;
+            // Only edges belonging to a complete supported quad may constrain
+            // the fit: nearby islands must never be coupled across a gap.
+            const auto complete=[&](int a){return a>=0&&a+cols+1<int(count)&&a%cols+1<cols&&samples[a].active&&samples[a+1].active&&samples[a+cols].active&&samples[a+cols+1].active;};
+            if(!complete(i)&&!complete(i-(offset==1?cols:1)))continue;
+            const auto a=offset==1?samples[i].tangentU:samples[i].tangentV;
+            const auto b=offset==1?samples[j].tangentU:samples[j].tangentV;
+            const auto delta=(a/samples[i].mass+b/samples[j].mass)*(spacing*.5);
+            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<MergeEdge,3,3,3>(new MergeEdge{delta,50.0/spacing}),nullptr,point(i).val,point(j).val);
+        }
+        if(feather) {
+            // Start the nonlinear metric solve from the convex tangent fit,
+            // rather than an already folded arithmetic-average raster.
+            Cancellation cb(cancel,progress,"Joining source seams",12);
+            auto options=solverOptions(cb,12);ceres::Solver::Summary summary;
+            ceres::Solve(options,&problem,&summary);profileSolve("merge seams",summary);detail::cancelled(cancel);
+            if(!summary.IsSolutionUsable()){result.message="Merge seam fit failed: "+summary.BriefReport();return result;}
+        }
         for(const auto& t:triangles) problem.AddResidualBlock(vc::SymmetricDirichletLoss::Create(spacing,g.settings.stiffness,1e-8,0),nullptr,point(t[0]).val,point(t[1]).val,point(t[2]).val);
+        if(feather)for(const auto& t:triangles) {
+            const auto normal=detail::unit(samples[t[0]].normal+samples[t[1]].normal+samples[t[2]].normal);
+            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<MergeOrientation,1,3,3,3>(new MergeOrientation{normal,spacing}),
+                nullptr,point(t[0]).val,point(t[1]).val,point(t[2]).val);
+        }
+        if(feather)for(size_t i=0;i<triangles.size();i+=2) {
+            const auto& t=triangles[i];const int d=triangles[i+1][0];
+            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<MergeQuadOrientation,1,3,3,3,3>(new MergeQuadOrientation),
+                nullptr,point(t[0]).val,point(t[1]).val,point(t[2]).val,point(d).val);
+        }
         // Rasterization and metric regularization must not pull an explicit
         // H/V junction back between the front and back of the sheet. Anchor
         // the rendered bilinear sample itself to the horizontal position.
@@ -612,7 +716,8 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
                 nullptr,point(a).val,point(b).val,point(c).val,point(d).val);
         }
         if(local)for(int i:active)if(!movable(i))problem.SetParameterBlockConstant(point(i).val);
-        Cancellation cb(cancel,progress,"Refining output surface",12);auto options=solverOptions(cb,12);ceres::Solver::Summary summary;ceres::Solve(options,&problem,&summary);profileSolve("surface",summary);detail::cancelled(cancel);
+        const int iterations=feather?100:12;
+        Cancellation cb(cancel,progress,"Refining output surface",iterations);auto options=solverOptions(cb,iterations);ceres::Solver::Summary summary;ceres::Solve(options,&problem,&summary);profileSolve("surface",summary);detail::cancelled(cancel);
         if(!summary.IsSolutionUsable()){result.message="Shared surface fit failed: "+summary.BriefReport();return result;}
     }
     if(local) {
@@ -656,6 +761,7 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
                         <<" edges="<<cv::norm(point(t[1])-point(t[0]))<<","<<cv::norm(point(t[2])-point(t[0]))
                         <<" raster="<<cv::norm(samples[t[1]].sum/samples[t[1]].mass-samples[t[0]].sum/samples[t[0]].mass)<<","<<cv::norm(samples[t[2]].sum/samples[t[2]].mass-samples[t[0]].sum/samples[t[0]].mass)
                         <<" moved="<<cv::norm(point(t[0])-samples[t[0]].sum/samples[t[0]].mass)<<std::endl;
+                    if(feather)for(int i:t.val)std::clog<<" sample="<<i%cols<<","<<i/cols<<" xyz="<<point(i)<<" tangentU="<<samples[i].tangentU/samples[i].mass<<" tangentV="<<samples[i].tangentV/samples[i].mass<<std::endl;
                 }
                 result.message="Patch geometry contains an inverted quad";return result;
             }
@@ -663,6 +769,13 @@ FitResult renderSurface(Graph graph,const std::atomic_bool* cancel,bool refine,L
             if(local&&!movable(victim)){local->expand=true;result.message="Quad validation reaches the local boundary";return result;}
             grid(victim/cols,victim%cols)={-1,-1,-1};unsupported.insert(victim);
         }
+    }
+    if(feather)for(size_t i=0;i<triangles.size();i+=2) {
+        const auto& t=triangles[i];const int d=triangles[i+1][0];
+        if(grid(t[0]/cols,t[0]%cols)[0]==-1||grid(t[1]/cols,t[1]%cols)[0]==-1||grid(t[2]/cols,t[2]%cols)[0]==-1||grid(d/cols,d%cols)[0]==-1)continue;
+        const auto n=(point(t[1])-point(t[0])).cross(point(t[2])-point(t[0]));
+        const auto m=(point(t[2])-point(d)).cross(point(t[1])-point(d));
+        if(n.dot(m)<=0){result.message="Merged surface contains a twisted quad";return result;}
     }
     if(local) {
         const auto& old=*local->committed.surface->rawPointsPtr();
@@ -731,6 +844,43 @@ FitResult detail::restoreSurface(Graph graph,const cv::Mat_<cv::Vec3f>& grid,cv:
     return renderSurface(std::move(graph),nullptr,false,nullptr,&grid,&origin);
 }
 FitResult render(Graph graph,const std::atomic_bool* cancel) {return renderSurface(std::move(graph),cancel,true);}
+FitResult renderMergedSurface(Graph graph,const std::atomic_bool* cancel) {
+    return renderSurface(std::move(graph),cancel,true,nullptr,nullptr,nullptr,{},true);
+}
+std::vector<FitResult> splitSurfaceComponents(const FitResult& result,size_t minimumQuads) {
+    if(!minimumQuads)throw std::invalid_argument("Minimum component size must be positive");
+    if(!result.valid||!result.surface)return {};
+    const auto& grid=*result.surface->rawPointsPtr();
+    if(grid.rows<2||grid.cols<2)return {};
+    cv::Mat_<uchar> mask(grid.rows-1,grid.cols-1,uchar{0});
+    for(int y=0;y<mask.rows;++y)for(int x=0;x<mask.cols;++x)
+        mask(y,x)=grid(y,x)[0]!=-1&&grid(y+1,x)[0]!=-1&&grid(y,x+1)[0]!=-1&&grid(y+1,x+1)[0]!=-1;
+    cv::Mat labels,stats,centroids;
+    const int count=cv::connectedComponentsWithStats(mask,labels,stats,centroids,4,CV_32S);
+    std::vector<int> components;
+    for(int i=1;i<count;++i)if(size_t(stats.at<int>(i,cv::CC_STAT_AREA))>=minimumQuads)components.push_back(i);
+    std::sort(components.begin(),components.end(),[&](int a,int b){
+        const auto key=[&](int i){return std::tuple{-stats.at<int>(i,cv::CC_STAT_AREA),stats.at<int>(i,cv::CC_STAT_TOP),stats.at<int>(i,cv::CC_STAT_LEFT)};};
+        return key(a)<key(b);
+    });
+    std::vector<FitResult> out;
+    for(int component:components) {
+        const int x=stats.at<int>(component,cv::CC_STAT_LEFT),y=stats.at<int>(component,cv::CC_STAT_TOP);
+        const int width=stats.at<int>(component,cv::CC_STAT_WIDTH),height=stats.at<int>(component,cv::CC_STAT_HEIGHT);
+        cv::Mat_<cv::Vec3f> points(height+1,width+1,cv::Vec3f{-1,-1,-1});
+        for(int r=0;r<height;++r)for(int c=0;c<width;++c)if(labels.at<int>(y+r,x+c)==component)
+            for(int dy:{0,1})for(int dx:{0,1})points(r+dy,c+dx)=grid(y+r+dy,x+c+dx);
+        FitResult part=result;
+        part.ownership.reset();part.sessionRevision.clear();part.changedSurfaceBounds.reset();
+        part.origin=result.origin+cv::Vec2d{x*result.graph.settings.spacing,y*result.graph.settings.spacing};
+        part.surface=std::make_shared<QuadSurface>(points,result.surface->scale());
+        part.surface->setStrictQuadRenderValidity(true);
+        const auto defaultOrigin=part.surface->gridToSurface({0,0});
+        part.surface->shiftSurfaceOrigin(defaultOrigin-part.origin);
+        out.push_back(std::move(part));
+    }
+    return out;
+}
 FitResult renderPlacement(Graph graph,const std::atomic_bool* cancel,Progress progress) {return renderSurface(std::move(graph),cancel,false,nullptr,nullptr,nullptr,progress);}
 
 namespace {
@@ -1110,7 +1260,7 @@ Region changedSurfaceBounds(const Graph& graph,const Graph& committed,LocalFit* 
 }
 }
 namespace {
-FitResult fitIncrementalImpl(Graph graph,const FitResult& committed,const std::atomic_bool* cancel,Progress progress,const GraphEdit* edit=nullptr,bool fixedReference=false,bool review=false) {
+FitResult fitIncrementalImpl(Graph graph,const FitResult& committed,const std::atomic_bool* cancel,Progress progress,const GraphEdit* edit=nullptr,bool fixedReference=false,bool review=false,double reviewRegularization=1) {
     graph.settings.validate();detail::cancelled(cancel);
     const auto& a=graph.settings;const auto& b=committed.graph.settings;
     std::set<std::string> deformablePatches;
@@ -1217,7 +1367,7 @@ FitResult fitIncrementalImpl(Graph graph,const FitResult& committed,const std::a
     for(size_t attempt=0;attempt<maxAttempts;++attempt,margin*=2) {
         detail::cancelled(cancel);
         LocalFit local{committed,affected.padded(margin)};
-        if(edit){local.prepared=edit->base.get();local.edit=edit;local.geometry=geometry;local.fixedReference=fixedReference;local.review=review;}
+        if(edit){local.prepared=edit->base.get();local.edit=edit;local.geometry=geometry;local.fixedReference=fixedReference;local.review=review;local.reviewRegularization=reviewRegularization;}
         selectActiveCharts(graph,local);
         // Interactive edits have a deterministic work budget. They never
         // silently switch to a different full-graph objective.
@@ -1345,8 +1495,10 @@ FitResult fitIncremental(Graph graph,const FitResult& committed,const std::atomi
     if(!graph.windingLayout.is_null())throw std::runtime_error("Imported winding layouts cannot be refitted");
     return fitIncrementalImpl(std::move(graph),committed,cancel,std::move(progress));
 }
-FitResult fitEdit(const GraphEdit& edit,const std::atomic_bool* cancel,Progress progress,FitPolicy policy){
+FitResult fitEdit(const GraphEdit& edit,const std::atomic_bool* cancel,Progress progress,FitPolicy policy,double reviewRegularization){
     detail::cancelled(cancel);
+    if(!std::isfinite(reviewRegularization)||reviewRegularization<1)
+        throw std::invalid_argument("Review regularization must be at least 1 and finite");
     if(!edit.base)throw std::runtime_error("Graph edit has no committed revision");
     if(policy==FitPolicy::FiberReview&&progress)progress("Review constraints: "+std::to_string(edit.addedLinks.size())+
         " fiber/keypoint pairs, "+std::to_string(edit.fixedTargets.size())+" accepted patch samples");
@@ -1375,7 +1527,7 @@ FitResult fitEdit(const GraphEdit& edit,const std::atomic_bool* cancel,Progress 
     FitResult result;
     if(reached.size()!=graph.nodes.size()){result.graph=std::move(graph);result.message="Every node must remain linked to the seed";}
     else if(edit.addedNodes.empty()&&edit.addedLinks.empty()&&edit.removedLinks.empty())return committed;
-    else result=fitIncrementalImpl(std::move(graph),committed,cancel,std::move(progress),&edit,policy!=FitPolicy::Joint,policy==FitPolicy::FiberReview);
+    else result=fitIncrementalImpl(std::move(graph),committed,cancel,std::move(progress),&edit,policy!=FitPolicy::Joint,policy==FitPolicy::FiberReview,reviewRegularization);
     // Materialize contact storage once, after fitting; all intermediate stages
     // use the delta and prepared incident-contact lists.
     result.graph.links=materialize(edit).links;

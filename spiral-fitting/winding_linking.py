@@ -107,12 +107,16 @@ class AnalysisPointLinker:
     """Host-loader callback, run before annotations and fiber components derive."""
 
     def __init__(self, config, inward_direction, *, min_z_fraction=0.8,
-                 min_auto_certainty=0.5, annotation_options=None):
+                 min_auto_certainty=0.5, annotation_options=None,
+                 explicit_links_only=False):
         self.config = config
         self.inward_direction = inward_direction
         self.min_z_fraction = min_z_fraction
         self.min_auto_certainty = min_auto_certainty
         self.annotation_options = annotation_options or PatchLinkOptions()
+        # pcl_fiber_explicit_links_only parity: fibers attach only to the
+        # patches their explicit_link tags name (see PatchLinkOptions).
+        self.explicit_links_only = bool(explicit_links_only)
         self.counts = {'fibers': Counter(), 'annotations': Counter()}
         self._lock = threading.Lock()
 
@@ -125,6 +129,7 @@ class AnalysisPointLinker:
     @property
     def report(self):
         return dict(settings=asdict(self.config),
+                    explicit_links_only=self.explicit_links_only,
                     counts={group: dict(counts) for group, counts in self.counts.items()})
 
     def __call__(self, patches, collections, fibers):
@@ -185,6 +190,13 @@ class AnalysisPointLinker:
             if fraction is not None:
                 rules[cid] = SIDE_FRONT if tag == 'V' else SIDE_BEHIND
                 fractions[cid] = fraction
+        targets = None
+        if self.explicit_links_only:
+            targets = {
+                cid: frozenset(str(pid) for pid in
+                               (pcl.get('metadata') or {}).get('explicit_patch_links') or ())
+                for cid, pcl in fibers.items()
+            }
         options = PatchLinkOptions(
             window_points=cfg.window_points, window_min_points=cfg.min_points,
             strict_min_points=True, rank_by_support=cfg.selection == 'support_then_distance',
@@ -193,7 +205,8 @@ class AnalysisPointLinker:
             report_counts=self._record('fibers'),
             strips=cfg.strips, strip_max_gap=cfg.strip_max_gap, strip_claim_gap=cfg.strip_claim_gap,
             strip_rank=cfg.strip_rank,
-            strip_fit_resolution=cfg.strip_fit_resolution)
+            strip_fit_resolution=cfg.strip_fit_resolution,
+            target_patches=targets, restrict_untargeted=targets is not None)
         if sampled_fibers:
             link(sampled_fibers, options, cfg.selection)
 

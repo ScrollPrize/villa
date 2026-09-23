@@ -4,6 +4,50 @@ Code and helpers to fit a canonical Archimedean spiral to deformed scrolls.
 `spiral_service.py` hosts one persistent interactive fit session over HTTP for
 the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
+## Extend existing fiber strips with graph patches
+
+`extend_fiber_strips.py` reads `outputs/fiber_merge_all_strips/strips_flattened`
+and `/home/sean/Desktop/graph_patch_merging/graph_patches_only` by default.
+It builds one `SurfacePatchIndex` containing all graph patches and strips being
+scanned. Tile neighborhoods shortlist nearby graph patches without relying on
+metadata bounding boxes. Each candidate must overlap an original measured source patch **and**
+the exported strip on at least 20% of its valid vertices, with at least 64
+overlapping and 32 new vertices. Fiber-only strips are copied unchanged. The
+native merger fits accepted candidates to the original strip placements; the
+runner checks connectivity, original strip retention, and contributed area
+before keeping a merged strip. Results go to a new directory and each strip's
+plan and merge report are saved for review and resume.
+
+With the existing Spiral Python environment and `volume-cartographer/build`:
+
+```sh
+AGENTS_AGENT_MODE=1 cmake -S spiral-fitting/cpp \
+  -B spiral-fitting/build/strip-extension \
+  -DPython_EXECUTABLE="$PWD/spiral-fitting/.venv/bin/python"
+AGENTS_AGENT_MODE=1 cmake --build spiral-fitting/build/strip-extension \
+  --target vc_spiral_surface_index -j 2
+cp spiral-fitting/build/strip-extension/vc_spiral/surface_index*.so \
+  spiral-fitting/vc_spiral/
+AGENTS_AGENT_MODE=1 python volume-cartographer/apps/VC3D/test/prepare_fiber_review_benchmark.py \
+  --build-dir volume-cartographer/build --source anchored_strip_merge.cpp
+AGENTS_AGENT_MODE=1 ninja -C volume-cartographer/build \
+  -f fiber-review-anchored_strip_merge/build.ninja
+AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting OMP_NUM_THREADS=1 \
+  OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 spiral-fitting/.venv/bin/python \
+  spiral-fitting/extend_fiber_strips.py \
+  --plan-output spiral-fitting/outputs/anchored_strip_extension/plan.json
+AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting OMP_NUM_THREADS=1 \
+  OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 spiral-fitting/.venv/bin/python \
+  spiral-fitting/extend_fiber_strips.py \
+  --plan-output spiral-fitting/outputs/anchored_strip_extension/plan.json \
+  --merge-workers 4 \
+  --merge-output spiral-fitting/outputs/anchored_strip_extension
+```
+
+`--strip NAME` or `--limit-strips N` limits a trial;
+`--min-overlap-fraction` changes the 20% admission threshold. Running the same
+command again resumes strips recorded in the plan.
+
 ## CUDA startup check
 
 VC3D fit sessions and command-line fits allocate one CUDA element and synchronize
@@ -1228,6 +1272,33 @@ retained catalogs against the resident patches and re-derive all the
 point-collection views (cross-patch groups and unattached strips); the fiber
 side-rule settings below only affect fibers, so they re-link and
 re-materialise the fibers alone.
+
+### Explicit fiber links
+
+`pcl_fiber_explicit_links_only` (default off) replaces the fitter's own
+fiber-to-patch proximity linking with links decided elsewhere. Each fiber JSON
+may carry document-level tags `explicit_link:<patch id>` naming the tifxyz
+folders it lies on; with the setting on, a fiber attaches only to those
+patches (its points still need to be within tolerance of them) and a fiber
+without such tags attaches to no patch and is fitted as an unattached strip.
+Regular and absolute-winding point collections, and fiber-to-fiber bridge
+links (`branches`), are unaffected; with the setting off the tags are ignored.
+Tags naming patches that are not loaded are reported once and ignored.
+Changing the setting at a Run boundary re-links every resident collection.
+
+`auto_link_fibers.py` writes the tags from a `vc_fiber_patch_links` document,
+which is both what the geometric auto-linker writes and what VC3D's fiber
+review saves after a human pass (accepted decisions land in `linked`), or from
+a legacy `vc3d_fiber_review` workspace:
+
+```sh
+# geometry-only linker (volume-cartographer), zero cross-validated false links
+# at ~84% of human-accepted associations; see apps/VC3D/ConstraintGraph.md
+vc_fiber_auto_link --fibers FIBERS --patches PATCHES --normals las.lasagna.json --fiber-scale 0.25 --normal-scale 4 -j 12 --strip-cache FIBERS_strips -o fiber_patch_links.json
+python auto_link_fibers.py --links fiber_patch_links.json --fibers FIBERS          # dry run
+python auto_link_fibers.py --links fiber_patch_links.json --fibers FIBERS --apply  # writes, with backups
+python auto_link_fibers.py --review fiber_review.json --fibers FIBERS --apply      # from a VC3D review
+```
 
 `pcl_link_window_points` and `pcl_link_window_min_points` (both default 1)
 gate candidates on their neighbours: a patch the point itself lies within

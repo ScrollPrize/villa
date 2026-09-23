@@ -128,6 +128,11 @@ struct RenderOwnership {
     cv::Mat_<int> nodes;
     std::vector<std::string> sourceIds;
 };
+struct ProjectionCollision {
+    Location a, b;
+    cv::Vec2d uv;
+    cv::Vec3d xyzA, xyzB, normalA, normalB, tangentU, tangentV;
+};
 struct FitResult {
     Graph graph;
     std::shared_ptr<QuadSurface> surface;
@@ -145,6 +150,9 @@ struct FitResult {
     std::optional<std::array<cv::Vec2d,2>> changedSurfaceBounds;
     // Diagnostics for an incremental fit; zero for the global path.
     size_t localChartVertices = 0, localSurfaceSamples = 0, localExpansions = 0;
+    // Source witnesses retained when a merged raster is blocked by unrelated
+    // patches at the same UV address. Empty for ordinary workspace rendering.
+    std::vector<ProjectionCollision> projectionCollisions;
     std::string message;
 };
 
@@ -180,7 +188,7 @@ enum class FitPolicy { Joint, FixedReference, FiberReview };
 // patch layer. Its surface contains that layer; graph retains the fixed fiber
 // and proposal association. Fixed targets are transient review inputs only.
 FitResult fitEdit(const GraphEdit&, const std::atomic_bool* cancel = nullptr, Progress = {},
-                  FitPolicy = FitPolicy::Joint);
+                  FitPolicy = FitPolicy::Joint, double reviewRegularization = 1);
 FitResult renderProposalSources(const GraphEdit&, const std::string& selected,
                                 const std::atomic_bool* cancel = nullptr);
 
@@ -190,7 +198,43 @@ Catalog loadCatalog(const Settings&, const std::atomic_bool* cancel = nullptr, P
 // closure needs review or a chart cut; it is not proof of an annotation error.
 CycleAudit auditFiberCycles(const Catalog&, const std::vector<cv::Vec3d>& centers,
                            double minimumRadius, const std::atomic_bool* cancel = nullptr);
+// Fiber strips are built by the solver-free marching ribbon below (makeFastFiberNode);
+// this generation marks such strips, and saved strips of any other generation
+// (legacy straight ribbons, the earlier robust Ceres fit) regenerate on load.
+inline constexpr int kFiberStripGeneration = 100;
 std::shared_ptr<const Node> makeFiberNode(const Fiber&, const Settings&, const lasagna::NormalSampler&, const std::atomic_bool* cancel = nullptr);
+// Solver-free strip for automatic linking: the fiber resampled every
+// settings.spacing along its arclength, with rows marched outward along the
+// in-sheet cross direction while re-reading the normal field, then lightly
+// smoothed along the fiber. It estimates where the fiber's sheet is across the
+// ribbon without the robust fit's validity guarantees (folds are possible on
+// bad normals), which the distance-based linker tolerates, and re-centres on
+// the sampler's sheet score when it provides one. Seconds per thousand fibers
+// rather than minutes per fiber. makeFiberNode is this builder with defaults.
+struct FastStripOptions {
+    double step = 5;              // marching step across the sheet, in graph voxels
+    double followAngle = 35;      // degrees: a sampled normal within this of the current one is followed
+    double normalSigma = 2;       // Gaussian sigma (columns) smoothing the per-column normals
+    double offsetSigma = 1;       // Gaussian sigma (columns) smoothing each row's offsets
+    double outlierAngle = 35;     // degrees: per-column normals farther than this from the smoothed field are interpolated
+    // Optional sheet score (higher on the sheet, e.g. the Lasagna pred_dt
+    // channel): every marched point moves along the local normal to the
+    // nearest clear peak within snapRange, so the ribbon re-centres on the
+    // sheet instead of drifting off it.
+    std::function<std::optional<double>(const cv::Vec3d&)> sheetScore;
+    double snapRange = 2, snapStep = 1;
+    double snapMinContrast = 8;  // peak must exceed the value at the current point by this much
+};
+std::shared_ptr<const Node> makeFastFiberNode(const Fiber&, const Settings&, const lasagna::NormalSampler&, const std::atomic_bool* cancel = nullptr,
+                                              const FastStripOptions& = {});
+// Disk cache of fitted fiber strips. The key covers the fiber file's bytes, the
+// strip settings and the robust strip version, so a hit reproduces
+// makeFiberNode bit for bit while skipping its solver cascade (seconds to
+// minutes per fiber). Absent or mismatched entries return null.
+// method names the builder ("robust" for makeFiberNode, "fast" for makeFastFiberNode).
+std::string fiberStripCacheKey(const Fiber&, const Settings&, const std::string& method = "robust");
+std::shared_ptr<const Node> loadCachedFiberNode(const std::filesystem::path& directory, const Fiber&, const Settings&, const std::string& method = "robust");
+void saveCachedFiberNode(const std::filesystem::path& directory, const Fiber&, const Settings&, const Node&, const std::string& method = "robust");
 // Upgrade a saved graph transactionally; patch placements and fiber chart
 // coordinates are preserved by interpolation on the old source triangles.
 bool regenerateFiberStrips(Graph&, const lasagna::NormalSampler&, const std::atomic_bool* cancel = nullptr);
@@ -227,6 +271,14 @@ FitResult renderPlacement(Graph, const std::atomic_bool* cancel = nullptr, Progr
 // Display only: no shared-surface refinement and no change to the accepted fit.
 FitResult renderSourceLayer(const Graph&, bool fibers, const std::atomic_bool* cancel = nullptr);
 FitResult render(Graph, const std::atomic_bool* cancel = nullptr);
+// Fuse registered charts with boundary-tapered weights and source-tangent
+// seam fitting. Fiber strips participate only when explicitly in the graph.
+// Keeps shared-grid geometry validation and does not fill unsupported gaps.
+// Opt-in: ordinary workspace rendering retains its existing weighting.
+FitResult renderMergedSurface(Graph, const std::atomic_bool* cancel = nullptr);
+// Strict-quad, edge-connected components; single-quad islands are omitted.
+// Crop each result to its own bounds without creating or interpolating samples.
+std::vector<FitResult> splitSurfaceComponents(const FitResult&, size_t minimumQuads = 2);
 cv::Vec2d placedLocation(const Graph&, const Location&);
 cv::Vec3d sourceLocation(const Node&, const cv::Vec2d&);
 std::optional<Location> pick(const Graph&, const cv::Vec2d& graphUv,
