@@ -1,15 +1,12 @@
-# Plan: portable cache manifests
+# Plan
 
-Reuse original inference manifests and provenance. Validate relative channel paths, exact base dimensions and array shapes. Use Paris4 subset source metadata with local subset channels. Integrate into normal export and expose metadata-only refresh through the approved runner. Preserve fiber filenames.
+1. Reuse existing independent-reference config, changing only trace input to reverse-v2 and output prefix.
+2. Independently review config/plan. Use approved crop benchmark runner; no inference/retracing/build needed.
+3. Verify completed unpruned initial BP and independently ranked references; report rank1 accuracy, zero-hard-sign errors and per-reference ladder against7/26baseline. Check initial states match preceding reverse BP run if available.
+4. Persist exact config/results in dated benchmark report, task_log/status/changelog.
 
 ## Spec update
-
-The exported channel view includes portable inference.lasagna.json and inference.json in each scroll directory.
+No spec.md exists. No algorithm changes; initial BP frozen and references independently estimated, with existing global gauge alignment for scoring. Defect-state inactive evidence remains as before.
 
 ## Docs updates
-
-Document use and regeneration in docs/benchmarks/failure_union_vc3d_manifests.md; record results and durable changelog.
-
-## Validation
-
-Generate all five files using approved runner; validate 15 array bindings; rerun metadata export to verify repeatability. Independent review covers portability and rerun behavior.
+Extend reverse consistency report with unassisted results and command, retain removal metric distinction. Record convergence/iteration cap.

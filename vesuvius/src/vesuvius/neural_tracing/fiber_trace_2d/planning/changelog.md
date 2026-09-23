@@ -1,3 +1,64 @@
+## 2026-09-23 — Reproducible Paris4 crop benchmark
+
+- Reverse-consistency unpruned independent BP improves correct reference windings7/26(26.92%)→10/26(38.46%);9/26zero-hard-sign errors. Initial500cap,all6790initial states reproduce preceding run. Full ladder:2026-09-23-reverse-consistency-independent.md.
+
+- User-approved promotion:reverse consistency is now default for CLI dense-beam crop generation feeding BP. Explicit --no-reverse-consistency preserves control runs;historical configs updated. Replay/fiberlet/shared-API defaults unchanged.22CLItests plus default/disabled real-data smoke pass.
+
+- Optional dense-beam reverse consistency added:20/40base ellipse,40base backoff, preserved gaps/provenance and retained forward costs. With40/80suppression/45° gate,2048crop BP removal score improves−169.64%→−110.68%,removed constraints36.50%→24.33%;2778pieces,2.26%checked length skipped.86native/20CLItests pass. Disabled by default. Full report/commands:2026-09-23-reverse-consistency.md.
+
+-40/80,45° unpruned independent reference assignment gives7/26 correct(26.92%) versus original8/26(30.77%),despite improved removal metric;11/26 sign-feasible. Frozen initial states match preceding run. Full ladder:2026-09-23-coverage40x80-angle45-independent.md.
+
+-2048 BP removal benchmark with40/80,45° traces improves score−210.44%→−169.64%;problematic fraction67.79%→62.91%,conditioned reference diagnostic21/26→26/26.339.22s,same capped BP/pruning protocol. See2026-09-23-coverage40x80-angle45-bp.md.
+
+-40/80 seed suppression with45° gate reduces2382→1484 traces and removes the audited winding0.5 duplicates.40/80 reference-matching success remains23/26. Config experiment only,default unchanged; full tables in `volume-cartographer/docs/fiber_benchmark_runs/2026-09-23-coverage40x80-angle45.md`.
+
+- Explicit tangential seed-coverage radius added;40/80 experiment reduces2048 source traces3697→2382 but preserves winding0.5 triplicate.22/26 strong matches unchanged; some partial coverage worsens.83 crop tests pass; defaults unchanged. Full results: `volume-cartographer/docs/fiber_benchmark_runs/2026-09-23-coverage40x80.md`.
+
+- Independent reference assignment now ranks each reference against frozen initial BP using configured weights/hard signs, without reference-assisted solves or pruning. Exposes five alternatives, sign errors, finite loss, ties and unbounded tails.103 native tests and3 CLI checks pass. Completed1024/2048 runs; full results in `volume-cartographer/docs/fiber_benchmark_runs/2026-09-23-independent-reference-assignment.md`. Historical conditioned scores are not initial-BP accuracy.
+
+- Joint-grid BP zero-weight correction: remove fully inactive winding factors
+  before graph preparation; preserve separate original-index diagnostics.
+  Fix support-expansion normalization so neutral messages stay neutral.
+ 100native winding tests plus7runner tests passed; omitted-input equality
+  covers disconnected bridges, defects and short iteration caps. User approved
+  correcting outputs rather than preserving the old finite-iteration artifact.
+  See docs/fiber_benchmark_runs/2026-09-23-inactive-winding-factors.md.
+  Corrected small run: 53.04 s (was 68.69 s), 88.46% exact references.
+  Larger 2048³ run: 24m52s, 80.77% exact; extra context did not improve
+  accuracy. Full assignment table and capped-solver caveats saved separately.
+
+- New beam8 BP ablation: hard perpendicular order +parallel-one weight0.1,
+  other measurement classes disabled. Constraint-119.57% versus-178.90%;
+  exact88.46% unchanged with same three errors. Logged message-limit and
+  defect-neutralization caveats; production defaults unchanged.
+
+- Imported third-party Qual275-fiber collection and added frozen-polyline replay
+  using the shared evaluator. All three crop plots updated: replay0.0464%,
+  constraint-55.31%, exact references84.62%. Documented acquisition-gap-heavy
+  replay semantics, sparse BP graph and preserved native L0 geometry/provenance.
+
+- Added shared-scheduler, canonical-anchor dense VC3D beam candidate generation
+  for BP. Classic/new constraint scores -240.90%/-178.90%, both88.46% exact
+  references; 1145.24s/45.73s. Historical Fiberlet quality filtering is not
+  transferable to beam costs; report and plots label this difference. Added
+  explicit bounded winding state memory guard override (default unchanged).
+
+- Corrected direct comparison to actual VC3D beam defaults, without fullres
+  tuning: Classic50.000%, new33.333% (1/2 failures). Restored the historical
+  failures+1 headline in native summaries, migrated current crop artifacts and
+  added measurements to the existing progress plots. Greedy remains an explicit
+  historical control, not the default VC3D result.
+
+- Added the approved evaluation runner's `crop-benchmark` mode and reproducible
+  direct/fiberlet/BP configs for the handoff's 24 in-crop fibers (48 directions).
+- Integrated crop-scoped canonical on-demand anchor/fiberlet caches into
+  `vc_fiber_trace_chunk`; shared helpers with production preprocessing and
+  preserved the evaluated-anchor view for compact path storage.
+- Recorded new/Classic controls, historical metrics and generation-version
+  caveats in `volume-cartographer/docs/fiber_benchmark_runs/2026-09-23-crop-new-predictions.md`.
+  BP reference-assisted and unassisted results are explicitly separated.
+- Validated 18 native replay tests, 43 storage tests and 3 recording-runner tests.
+
 ## 2026-09-19 — Skeleton backend: sub-ports, kept variants, per-sub-port routing
 
 - Measured what the thresholded fibre presence constrains. Its section is a

@@ -1,3 +1,3 @@
 # Task
 
-Export portable Lasagna manifests and provenance for all five generated failure-piece cache volumes, usable after rsync in VC3D.
+Measure unpruned independent winding inference for the reverse-consistency2048crop. No reference conditioning or constraint/trace removal; compare correct-reference percentage with preceding45degree baseline.

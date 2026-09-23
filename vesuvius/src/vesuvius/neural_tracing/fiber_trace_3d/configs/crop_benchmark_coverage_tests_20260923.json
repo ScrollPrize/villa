@@ -1,0 +1,1 @@
+{"output_root":"/ephemeral/hendrik/fiber_crop_bench/20260923_coverage_tests","reference_dir":"/home/hendrik/test_datasets/2026-09-01_fiber_stack2","commands":[{"name":"crop-coverage","binary":"test_fiberlet_crop_trace","args":[]}]}

@@ -288,7 +288,7 @@ def test_eligible_spans_trim_extrapolation_and_skip_lasagna(replay_fixture):
     summary = json.loads((root / "evaluation/summary.json").read_text())
     assert summary["cases"] == 4 and summary["failures"] == 0
     assert summary["directed_reference_length_mm"] == pytest.approx(.024)
-    assert summary["mean_segment_length_mm"] == pytest.approx(.006)
+    assert summary["mean_segment_length_mm"] == pytest.approx(.024)
     for case in range(4):
         document = json.loads((root / f"evaluation/cases/{case}/trace.json").read_text())
         span = document["provenance"]["reference_run"]
@@ -348,11 +348,11 @@ def test_bidirectional_export_and_posthoc_strips(replay_fixture):
     assert summary["config"]["decoded_cache_bytes"] == 1024 * 1024
     assert summary["failures"] == 0
     assert summary["directed_reference_length_mm"] == pytest.approx(0.032)
-    assert summary["version"] == 2
-    assert summary["metric_definition"] == "complete-reference-partition-v1"
-    assert summary["reliability_segments"] == 2
-    assert summary["mean_segment_length_mm"] == pytest.approx(0.016)
-    assert all(source["version"] == 5 for source in summary["sources"])
+    assert summary["version"] == 3
+    assert summary["metric_definition"] == "corpus-failures-plus-one-v1"
+    assert summary["reliability_segments"] == 1
+    assert summary["mean_segment_length_mm"] == pytest.approx(0.032)
+    assert all(source["version"] == 6 for source in summary["sources"])
     for index in range(2):
         artifact = root / "evaluation/cases" / str(index)
         data = json.loads((artifact / "trace.json").read_text())

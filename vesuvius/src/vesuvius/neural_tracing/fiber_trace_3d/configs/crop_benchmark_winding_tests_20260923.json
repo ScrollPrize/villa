@@ -1,0 +1,7 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260923_winding_tests",
+  "reference_dir": "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+  "commands": [
+    {"name": "winding-bp", "binary": "test_fiber_trace_winding_bp", "args": []}
+  ]
+}

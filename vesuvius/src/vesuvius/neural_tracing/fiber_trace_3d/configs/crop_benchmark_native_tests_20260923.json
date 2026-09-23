@@ -1,0 +1,21 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260923_v1",
+  "reference_dir": "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+  "input_files": [
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-7ff0ce6c/artifacts/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json",
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd1-d74cca79/artifacts/PHercParis4-20260411134726-las-sd1-d74cca79.lasagna.json",
+    "/ephemeral/hendrik/las_manager_inference/PHercParis4-20260411134726-las-sd2-5b17ff6c/artifacts/PHercParis4-20260411134726-las-sd2-5b17ff6c.lasagna.json"
+  ],
+  "commands": [
+    {
+      "name": "reference-replay-tests",
+      "binary": "test_fiber_reference_replay_benchmark",
+      "args": []
+    },
+    {
+      "name": "fiberlet-storage-tests",
+      "binary": "test_fiberlet_storage",
+      "args": []
+    }
+  ]
+}

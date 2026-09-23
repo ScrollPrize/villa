@@ -198,7 +198,7 @@ def prepare(workload, *, pilot_only=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["contrast-prepare", "benchmark-remove-case", "benchmark-review", "benchmark-render", "benchmark-full", "pair-connectivity", "short-failures", "failure-union", "integration-report", "integration-fit", "integration-audit", "fixed-path-report", "fixed-path-extract", "fixed-path-fit", "freeze-snapshot", "prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "resume-visualization", "cached-full", "report-metrics", "profile", "observe", "report-progress", "reference-plan"])
+    parser.add_argument("mode", choices=["crop-benchmark", "contrast-prepare", "benchmark-remove-case", "benchmark-review", "benchmark-render", "benchmark-full", "pair-connectivity", "short-failures", "failure-union", "integration-report", "integration-fit", "integration-audit", "fixed-path-report", "fixed-path-extract", "fixed-path-fit", "freeze-snapshot", "prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "resume-visualization", "cached-full", "report-metrics", "profile", "observe", "report-progress", "reference-plan"])
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--export-manifests-only", action="store_true",
                         help="failure-union: export Lasagna manifests from completed output")
@@ -211,6 +211,10 @@ def main():
     parser.add_argument("--extraction-time-limit-seconds", type=float,
                         help="checkpoint and stop short-failures scheduling after this duration (cleanup follows)")
     args = parser.parse_args()
+    if args.mode == 'crop-benchmark':
+        from vesuvius.neural_tracing.fiber_trace_3d.crop_benchmark import run
+        run(json.loads(args.config.read_text()))
+        return 0
     workload = (json.loads(args.config.read_text()) if args.mode in ('contrast-prepare', 'benchmark-remove-case', 'short-failures', 'failure-union', 'benchmark-full', 'benchmark-render', 'benchmark-review', 'pair-connectivity') else load_workload(args.config))
     if args.mode == 'contrast-prepare':
         from vesuvius.neural_tracing.fiber_trace_3d.contrast_choice_benchmark import package_contrast_choice

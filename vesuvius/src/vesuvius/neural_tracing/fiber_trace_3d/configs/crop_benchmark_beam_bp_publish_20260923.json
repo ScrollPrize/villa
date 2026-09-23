@@ -1,0 +1,11 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260923_v1",
+  "reference_dir": "/home/hendrik/test_datasets/2026-09-01_fiber_stack2",
+  "commands": [],
+  "publish_bp_plots": [
+    {"id": "fiberlet_classic_v2_20260923", "label": "Fiberlet / Classic cache v2", "log": "bp-classic-q021.log"},
+    {"id": "fiberlet_new_v3_20260923", "label": "Fiberlet / new u22000", "log": "bp-7ff0ce6c-q021.log"},
+    {"id": "beam_classic_20260923", "label": "VC3D beam / Classic", "log": "bp-beam-classic.log"},
+    {"id": "beam_new_20260923", "label": "VC3D beam / new u22000", "log": "bp-beam-new.log"}
+  ]
+}
