@@ -4,6 +4,12 @@
 
 - Fixed double decompression and byte swapping when decoding Zarr inner chunks from cached shards.
 
+## 2026-09-17
+
+- Added persistent line and polygon cross-section annotations to VC3D fibers,
+  including exact cut-plane restoration, transactional editing and saving,
+  split/merge preservation, and UUID-based three-way sync conflict handling.
+
 ## 2026-09-14
 
 - Fixed QuadSurface derived-cache eviction racing in-flight renders during surface and project switches.

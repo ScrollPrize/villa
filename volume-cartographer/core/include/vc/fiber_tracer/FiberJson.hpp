@@ -9,6 +9,8 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core/types.hpp>
 
+#include "vc/fiber_tracer/FiberCrossSection.hpp"
+
 namespace vc::fiber_tracer
 {
 struct Vc3dFiberJson {
@@ -17,6 +19,7 @@ struct Vc3dFiberJson {
     std::vector<cv::Vec3d> linePoints;
     std::vector<cv::Vec3d> controlPoints;
     std::vector<nlohmann::json> segmentMetadata;
+    std::vector<FiberCrossSectionAnnotation> crossSections;
 };
 
 namespace detail
@@ -263,6 +266,11 @@ inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
         for (size_t index = 0; index + 1 < controls.size(); ++index)
             fiber.segmentMetadata[index] = controls.at(index).at("segment_to_next");
     }
+    if (fiber.version != 3 && root.contains("cross_sections")) {
+        throw std::runtime_error(
+            context + " cross_sections require vc3d_fiber version 3");
+    }
+    fiber.crossSections = fiberCrossSectionAnnotationsFromJson(root, context);
     return fiber;
 }
 

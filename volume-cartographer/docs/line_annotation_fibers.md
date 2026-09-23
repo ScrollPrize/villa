@@ -21,6 +21,40 @@ points' tags), and go with a deleted point. Loaders reject any other
 control-point field, so a tagged fiber does not load on builds older than this
 field.
 
+## Cross-section annotations
+
+The line-annotation window can attach cross-section geometry to a version-3
+fiber. Enable **Cross-section editing** from the top-left annotation menu, then
+choose **Add** or **Edit** and **Line** or **Poly**. A line commits after two
+clicks. A polygon commits with Enter, right-click, or a click on its first
+vertex. Edit mode drags vertices, inserts a polygon vertex by clicking an edge,
+and removes a polygon vertex with right-click while at least three remain. The
+annotation selector jumps to the stored cut plane; its delete button removes
+the selected record. Escape cancels an unfinished gesture and Ctrl+Z reverts
+the last committed cross-section edit in the open window.
+
+The optional top-level `cross_sections` array stores versioned records with a
+stable UUID, `line` or `polygon` kind, XYZ vertices, exact plane origin/normal/up,
+the fiber position and arclength recorded when it was created, source geometry
+generation, and detached status. Coordinates and arclength use the owning
+fiber's base-voxel domain. Polygon closure is implicit. Readers reject malformed
+UUIDs, non-finite or non-coplanar geometry, invalid frames, degenerate lines,
+self-intersecting polygons, and duplicate IDs.
+
+Cross-section geometry is a fixed world-space annotation: retracing a fiber
+does not move it. Merge preserves all records and rejects different records
+with the same UUID. Split assigns each record to the nearest surviving polyline
+piece, preferring the prefix on ties, and marks it detached when removed
+geometry was closer. Cross-section edits preserve the fiber's `reviewed` and
+interpolation-review tags because they do not change traced geometry.
+
+Sync merges `cross_sections` by UUID using the same three-way base/local/remote
+transaction as the fiber. Independent additions and edits merge; divergent
+edits and edit/delete pairs conflict explicitly. Fibers containing these
+records must be edited and synced with an updated client: older writers do not
+preserve unknown top-level fields and can drop the annotations when rewriting
+the fiber.
+
 Tagged points draw as a hollow ring in the control-point yellow, a step larger
 than a filled point, in the cut and strip views and the overview bar; a tagged
 point that is also linked keeps the link-state fill inside the yellow ring. The

@@ -325,3 +325,30 @@ During active remote downloads, the existing cache status bar appends:
 - Worker callbacks only publish activity state. Framebuffer composition and Qt
   repaint requests happen on the UI thread, and diagnostics never queue chunks
   or alter request priority.
+
+## Fiber cross-section annotations
+
+- A version-3 fiber may contain an optional `cross_sections` collection. Every
+  record has a stable UUID, a version, a line or closed-polygon kind, 3D
+  vertices, an exact plane origin/normal/up frame, creation-time line position
+  and arclength, geometry generation, and detached status. Missing means empty.
+- Positions and arclength use the fiber's base-volume coordinate domain. Plane
+  normal and up are finite orthonormal unit vectors; all annotation vertices
+  are finite and coplanar. Lines contain exactly two distinct points. Polygon
+  closure is implicit and polygons have at least three distinct vertices,
+  nonzero area, and no self-intersection.
+- Annotation geometry and its recorded frame are fixed in world space.
+  Retracing changes only the current navigation projection and must not move the
+  annotation. Jumping restores the exact stored plane frame.
+- Cross-section edit mode consumes current-cut placement gestures. Drafts are
+  never persisted. Completed additions, vertex edits, insertions, deletions,
+  and record deletion are committed transactions using the ordinary queued
+  fiber save path, without triggering optimization or changing review tags.
+- Merge unions records by UUID and rejects different same-ID records. Split
+  assigns each record to the nearest surviving polyline, with prefix ownership
+  on ties; removed-span proximity sets detached status. Operations never
+  silently duplicate or discard records.
+- Remote three-way merge treats records atomically by UUID. Independent changes
+  combine, equal changes converge, unilateral deletion beats unchanged data,
+  and divergent edits, edit/delete pairs, and differing same-ID additions are
+  explicit conflicts. Output ordering is deterministic.

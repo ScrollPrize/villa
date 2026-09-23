@@ -18,6 +18,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QBrush>
+#include <QButtonGroup>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QCursor>
@@ -36,6 +37,7 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QLineF>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QPainterPath>
@@ -54,6 +56,8 @@
 #include <QVariant>
 #include <QTimer>
 #include <QToolButton>
+#include <QToolTip>
+#include <QUuid>
 #include <QVariantAnimation>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -277,6 +281,40 @@ std::optional<float> generatedStripScaleForLinePositionRange(
 bool finitePoint(const cv::Vec3f& point)
 {
     return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+}
+
+bool crossSectionCollectionsEquivalent(
+    const std::vector<vc::fiber_tracer::FiberCrossSectionAnnotation>& first,
+    const std::vector<vc::fiber_tracer::FiberCrossSectionAnnotation>& second)
+{
+    constexpr double tolerance = 1.0e-8;
+    const auto near = [tolerance](const cv::Vec3d& lhs, const cv::Vec3d& rhs) {
+        return cv::norm(lhs - rhs) <= tolerance;
+    };
+    if (first.size() != second.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < first.size(); ++index) {
+        const auto& lhs = first[index];
+        const auto& rhs = second[index];
+        if (lhs.id != rhs.id || lhs.kind != rhs.kind || lhs.detached != rhs.detached ||
+            lhs.geometryGeneration != rhs.geometryGeneration ||
+            lhs.pointsXyz.size() != rhs.pointsXyz.size() ||
+            std::abs(lhs.recordedArclengthBaseVoxels -
+                     rhs.recordedArclengthBaseVoxels) > tolerance ||
+            !near(lhs.planeOriginXyz, rhs.planeOriginXyz) ||
+            !near(lhs.planeNormalXyz, rhs.planeNormalXyz) ||
+            !near(lhs.planeUpXyz, rhs.planeUpXyz) ||
+            !near(lhs.recordedLinePositionXyz, rhs.recordedLinePositionXyz)) {
+            return false;
+        }
+        for (size_t point = 0; point < lhs.pointsXyz.size(); ++point) {
+            if (!near(lhs.pointsXyz[point], rhs.pointsXyz[point])) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool shouldShowSpanAlignmentMetric(
@@ -792,8 +830,81 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     connect(_resetViewsAction, &QAction::triggered, this, [this]() {
         resetGeneratedViews();
     });
+    annotationMenu->addSeparator();
+    _crossSectionEditAction = annotationMenu->addAction(tr("Cross-section editing"));
+    _crossSectionEditAction->setCheckable(true);
+    connect(_crossSectionEditAction, &QAction::toggled,
+            this, &LineAnnotationDialog::setCrossSectionEditMode);
     annotationMenuButton->setMenu(annotationMenu);
     buttonLayout->addWidget(annotationMenuButton);
+
+    _crossSectionControls = new QWidget(buttonRow);
+    auto* crossSectionLayout = new QHBoxLayout(_crossSectionControls);
+    crossSectionLayout->setContentsMargins(0, 0, 0, 0);
+    crossSectionLayout->setSpacing(4);
+    const auto makeToggle = [this, crossSectionLayout](const QString& text,
+                                                       const QString& tooltip) {
+        auto* button = new QToolButton(_crossSectionControls);
+        button->setText(text);
+        button->setToolTip(tooltip);
+        button->setCheckable(true);
+        crossSectionLayout->addWidget(button);
+        return button;
+    };
+    _crossSectionAddButton = makeToggle(tr("Add"), tr("Create a cross-section annotation"));
+    _crossSectionEditButton = makeToggle(tr("Edit"), tr("Edit the selected annotation"));
+    auto* actionGroup = new QButtonGroup(_crossSectionControls);
+    actionGroup->setExclusive(true);
+    actionGroup->addButton(_crossSectionAddButton);
+    actionGroup->addButton(_crossSectionEditButton);
+    _crossSectionAddButton->setChecked(true);
+    connect(_crossSectionAddButton, &QToolButton::toggled, this, [this](bool checked) {
+        if (checked) {
+            _crossSectionAddMode = true;
+            cancelCrossSectionGesture();
+        }
+    });
+    connect(_crossSectionEditButton, &QToolButton::toggled, this, [this](bool checked) {
+        if (checked) {
+            _crossSectionAddMode = false;
+            cancelCrossSectionGesture();
+            rebuildCrossSectionOverlay();
+        }
+    });
+    _crossSectionLineButton = makeToggle(tr("Line"), tr("Create a two-point line"));
+    _crossSectionPolyButton = makeToggle(tr("Poly"), tr("Create a closed polygon mask"));
+    auto* shapeGroup = new QButtonGroup(_crossSectionControls);
+    shapeGroup->setExclusive(true);
+    shapeGroup->addButton(_crossSectionLineButton);
+    shapeGroup->addButton(_crossSectionPolyButton);
+    _crossSectionLineButton->setChecked(true);
+    connect(_crossSectionLineButton, &QToolButton::toggled, this, [this](bool checked) {
+        if (checked) {
+            _crossSectionPolygonMode = false;
+            cancelCrossSectionGesture();
+        }
+    });
+    connect(_crossSectionPolyButton, &QToolButton::toggled, this, [this](bool checked) {
+        if (checked) {
+            _crossSectionPolygonMode = true;
+            cancelCrossSectionGesture();
+        }
+    });
+    _crossSectionCombo = new QComboBox(_crossSectionControls);
+    _crossSectionCombo->setMinimumContentsLength(14);
+    _crossSectionCombo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    installComboEventFilter(_crossSectionCombo, this);
+    crossSectionLayout->addWidget(_crossSectionCombo);
+    connect(_crossSectionCombo, qOverload<int>(&QComboBox::activated),
+            this, [this](int) { jumpToSelectedCrossSection(); });
+    _crossSectionDeleteButton = new QToolButton(_crossSectionControls);
+    _crossSectionDeleteButton->setText(QStringLiteral("×"));
+    _crossSectionDeleteButton->setToolTip(tr("Delete the selected cross-section annotation"));
+    crossSectionLayout->addWidget(_crossSectionDeleteButton);
+    connect(_crossSectionDeleteButton, &QToolButton::clicked,
+            this, &LineAnnotationDialog::deleteSelectedCrossSection);
+    _crossSectionControls->setVisible(false);
+    buttonLayout->addWidget(_crossSectionControls);
 
     if (volumeSelectorFactory) {
         if (auto* volumeSelector = volumeSelectorFactory(buttonRow)) {
@@ -1950,6 +2061,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         updateOptimizationStatusIndicator();
         updateUmbilicusNotice();
         rebuildGeneratedOverlays();
+        rebuildCrossSectionOverlay();
         if (_showAsMeshAction) {
             _showAsMeshAction->setEnabled(true);
         }
@@ -2122,7 +2234,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                    cv::Vec3f,
                    Qt::MouseButton button,
                    Qt::KeyboardModifiers modifiers,
-                   QPointF) {
+                   QPointF scenePoint) {
+                if (handleCrossSectionPress(volumePoint, button, modifiers, scenePoint)) {
+                    return;
+                }
                 if (button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
                     // Unlike a plain click this leaves follow untouched, so it
                     // must stop a keyboard pan itself.
@@ -2139,6 +2254,24 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                                                         _currentLinePosition,
                                                         interpolatedLinePoint(_currentLinePosition));
                 }
+            });
+    connect(currentViewer,
+            &CChunkedVolumeViewer::sendMouseMoveVolume,
+            this,
+            [this](cv::Vec3f volumePoint,
+                   Qt::MouseButtons buttons,
+                   Qt::KeyboardModifiers,
+                   QPointF scenePoint) {
+                handleCrossSectionMove(volumePoint, buttons, scenePoint);
+            });
+    connect(currentViewer,
+            &CChunkedVolumeViewer::sendMouseReleaseVolume,
+            this,
+            [this](cv::Vec3f volumePoint,
+                   Qt::MouseButton button,
+                   Qt::KeyboardModifiers,
+                   QPointF scenePoint) {
+                handleCrossSectionRelease(volumePoint, button, scenePoint);
             });
     topSplitter->addWidget(currentViewer);
     _currentCutViewer = currentViewer;
@@ -2364,6 +2497,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     updateOptimizationStatusIndicator();
     updateUmbilicusNotice();
     rebuildGeneratedOverlays();
+    rebuildCrossSectionOverlay();
     if (_showAsMeshAction) {
         _showAsMeshAction->setEnabled(true);
     }
@@ -2622,6 +2756,9 @@ void LineAnnotationDialog::setCurrentLinePosition(double position,
                                                   bool updateCurrentCutOverlay,
                                                   bool forceApply)
 {
+    if (!_crossSectionDraftPoints.empty() || _crossSectionDragVertex) {
+        cancelCrossSectionGesture();
+    }
     // An immediate apply supersedes any coalesced mouse-follow update still pending in the timer,
     // so a discrete jump/click/scroll isn't clobbered by a stale flush a few ms later.
     _lineUpdatePending = false;
@@ -3797,6 +3934,436 @@ const std::vector<double>& LineAnnotationDialog::currentLineArclengths() const
     return vc3d::line_annotation::lineArclengthsUsable(arclengths, _generatedViews.linePoints.size())
         ? arclengths
         : kNone;
+}
+
+double LineAnnotationDialog::currentLineArclength() const
+{
+    const auto& arclengths = currentLineArclengths();
+    if (arclengths.empty()) {
+        return std::max(0.0, _currentLinePosition);
+    }
+    const size_t first = std::min(
+        static_cast<size_t>(std::floor(std::max(0.0, _currentLinePosition))),
+        arclengths.size() - 1);
+    const size_t second = std::min(first + 1, arclengths.size() - 1);
+    const double t = std::clamp(_currentLinePosition - static_cast<double>(first), 0.0, 1.0);
+    return arclengths[first] * (1.0 - t) + arclengths[second] * t;
+}
+
+void LineAnnotationDialog::setCrossSectionAnnotations(
+    std::vector<vc::fiber_tracer::FiberCrossSectionAnnotation> annotations)
+{
+    vc::fiber_tracer::validateFiberCrossSectionAnnotations(
+        annotations, "line annotation cross_sections");
+    std::sort(annotations.begin(), annotations.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.recordedArclengthBaseVoxels != rhs.recordedArclengthBaseVoxels) {
+            return lhs.recordedArclengthBaseVoxels < rhs.recordedArclengthBaseVoxels;
+        }
+        return lhs.id < rhs.id;
+    });
+    const bool sameCollection = crossSectionCollectionsEquivalent(_crossSections, annotations);
+    _crossSections = std::move(annotations);
+    if (!sameCollection) {
+        _crossSectionUndoStack.clear();
+    }
+    cancelCrossSectionGesture();
+    rebuildCrossSectionControls();
+    rebuildCrossSectionOverlay();
+}
+
+void LineAnnotationDialog::setCrossSectionEditMode(bool enabled)
+{
+    _crossSectionMode = enabled;
+    if (_crossSectionControls) {
+        _crossSectionControls->setVisible(enabled);
+    }
+    if (!enabled) {
+        cancelCrossSectionGesture();
+    }
+    rebuildCrossSectionControls();
+    rebuildCrossSectionOverlay();
+}
+
+void LineAnnotationDialog::cancelCrossSectionGesture()
+{
+    if (_crossSectionDragOriginal && _crossSectionCombo) {
+        const QString id = _crossSectionCombo->currentData().toString();
+        const auto it = std::find_if(_crossSections.begin(), _crossSections.end(),
+                                     [&id](const auto& item) {
+                                         return QString::fromStdString(item.id) == id;
+                                     });
+        if (it != _crossSections.end()) {
+            *it = *_crossSectionDragOriginal;
+        }
+    }
+    _crossSectionDraftPoints.clear();
+    _crossSectionDragVertex.reset();
+    _crossSectionDragOriginal.reset();
+    rebuildCrossSectionOverlay();
+}
+
+void LineAnnotationDialog::rebuildCrossSectionControls()
+{
+    if (!_crossSectionCombo) {
+        return;
+    }
+    const QString selected = _crossSectionCombo->currentData().toString();
+    const QSignalBlocker blocker(_crossSectionCombo);
+    _crossSectionCombo->clear();
+    int selectedIndex = -1;
+    for (size_t i = 0; i < _crossSections.size(); ++i) {
+        const auto& annotation = _crossSections[i];
+        const QString kind = annotation.kind == vc::fiber_tracer::FiberCrossSectionKind::Line
+            ? tr("Line") : tr("Poly");
+        _crossSectionCombo->addItem(
+            tr("%1 @ %2 vx").arg(kind).arg(annotation.recordedArclengthBaseVoxels, 0, 'f', 1),
+            QString::fromStdString(annotation.id));
+        if (_crossSectionCombo->itemData(static_cast<int>(i)).toString() == selected) {
+            selectedIndex = static_cast<int>(i);
+        }
+    }
+    if (!_crossSections.empty()) {
+        _crossSectionCombo->setCurrentIndex(selectedIndex >= 0 ? selectedIndex : 0);
+    }
+    _crossSectionCombo->setEnabled(!_crossSections.empty());
+    if (_crossSectionDeleteButton) {
+        _crossSectionDeleteButton->setEnabled(!_crossSections.empty());
+    }
+}
+
+void LineAnnotationDialog::commitCrossSectionAnnotations()
+{
+    vc::fiber_tracer::validateFiberCrossSectionAnnotations(
+        _crossSections, "line annotation cross_sections");
+    std::sort(_crossSections.begin(), _crossSections.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.recordedArclengthBaseVoxels != rhs.recordedArclengthBaseVoxels) {
+            return lhs.recordedArclengthBaseVoxels < rhs.recordedArclengthBaseVoxels;
+        }
+        return lhs.id < rhs.id;
+    });
+    rebuildCrossSectionControls();
+    rebuildCrossSectionOverlay();
+    emit crossSectionAnnotationsChanged(_crossSections);
+}
+
+bool LineAnnotationDialog::finishCrossSectionPolygon()
+{
+    if (_crossSectionDraftPoints.size() < 3 || !_generatedViews.currentCutSurface) {
+        return false;
+    }
+    vc::fiber_tracer::FiberCrossSectionAnnotation annotation;
+    annotation.id = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
+    annotation.kind = vc::fiber_tracer::FiberCrossSectionKind::Polygon;
+    annotation.pointsXyz = _crossSectionDraftPoints;
+    annotation.planeOriginXyz = _crossSectionDraftOrigin;
+    annotation.planeNormalXyz = _crossSectionDraftNormal;
+    annotation.planeUpXyz = _crossSectionDraftUp;
+    annotation.recordedLinePositionXyz = cv::Vec3d(interpolatedLinePoint(_currentLinePosition));
+    annotation.recordedArclengthBaseVoxels = currentLineArclength();
+    try {
+        vc::fiber_tracer::validateFiberCrossSectionAnnotation(annotation);
+    } catch (const std::exception& ex) {
+        QToolTip::showText(QCursor::pos(),
+                           tr("Cannot create polygon: %1").arg(ex.what()),
+                           this);
+        return false;
+    }
+    _crossSectionUndoStack.push_back(_crossSections);
+    _crossSections.push_back(std::move(annotation));
+    _crossSectionDraftPoints.clear();
+    commitCrossSectionAnnotations();
+    return true;
+}
+
+bool LineAnnotationDialog::handleCrossSectionPress(
+    cv::Vec3f volumePoint,
+    Qt::MouseButton button,
+    Qt::KeyboardModifiers modifiers,
+    QPointF scenePoint)
+{
+    if (!_crossSectionMode) {
+        return false;
+    }
+    if (modifiers != Qt::NoModifier || !_currentCutViewer ||
+        !_generatedViews.currentCutSurface || !finitePoint(volumePoint)) {
+        return true;
+    }
+    auto selected = _crossSections.end();
+    if (_crossSectionCombo && _crossSectionCombo->currentIndex() >= 0) {
+        const std::string id = _crossSectionCombo->currentData().toString().toStdString();
+        selected = std::find_if(_crossSections.begin(), _crossSections.end(),
+                                [&id](const auto& item) { return item.id == id; });
+    }
+    if (!_crossSectionAddMode) {
+        if (selected == _crossSections.end()) {
+            return true;
+        }
+        size_t nearest = 0;
+        double nearestDistance = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < selected->pointsXyz.size(); ++i) {
+            const QPointF projected = _currentCutViewer->volumeToScene(
+                cv::Vec3f(selected->pointsXyz[i]));
+            const double distance = QLineF(projected, scenePoint).length();
+            if (distance < nearestDistance) {
+                nearestDistance = distance;
+                nearest = i;
+            }
+        }
+        if (nearestDistance > 12.0) {
+            if (button != Qt::LeftButton ||
+                selected->kind != vc::fiber_tracer::FiberCrossSectionKind::Polygon) {
+                return true;
+            }
+
+            size_t nearestEdge = 0;
+            double nearestEdgeDistance = std::numeric_limits<double>::infinity();
+            for (size_t index = 0; index < selected->pointsXyz.size(); ++index) {
+                const QPointF start = _currentCutViewer->volumeToScene(
+                    cv::Vec3f(selected->pointsXyz[index]));
+                const QPointF end = _currentCutViewer->volumeToScene(
+                    cv::Vec3f(selected->pointsXyz[(index + 1) % selected->pointsXyz.size()]));
+                const QPointF segment = end - start;
+                const double lengthSquared = QPointF::dotProduct(segment, segment);
+                const double t = lengthSquared > 0.0
+                    ? std::clamp(QPointF::dotProduct(scenePoint - start, segment) /
+                                     lengthSquared,
+                                 0.0, 1.0)
+                    : 0.0;
+                const double distance = QLineF(start + t * segment, scenePoint).length();
+                if (distance < nearestEdgeDistance) {
+                    nearestEdgeDistance = distance;
+                    nearestEdge = index;
+                }
+            }
+            if (nearestEdgeDistance > 12.0) {
+                return true;
+            }
+            _crossSectionDragOriginal = *selected;
+            nearest = nearestEdge + 1;
+            selected->pointsXyz.insert(
+                selected->pointsXyz.begin() + static_cast<ptrdiff_t>(nearest),
+                cv::Vec3d(volumePoint));
+            _crossSectionDragVertex = nearest;
+            rebuildCrossSectionOverlay();
+            return true;
+        }
+        if (button == Qt::RightButton &&
+            selected->kind == vc::fiber_tracer::FiberCrossSectionKind::Polygon &&
+            selected->pointsXyz.size() > 3) {
+            _crossSectionUndoStack.push_back(_crossSections);
+            selected->pointsXyz.erase(selected->pointsXyz.begin() + static_cast<ptrdiff_t>(nearest));
+            commitCrossSectionAnnotations();
+            return true;
+        }
+        if (button == Qt::LeftButton) {
+            _crossSectionDragVertex = nearest;
+            _crossSectionDragOriginal = *selected;
+        }
+        return true;
+    }
+    if (button == Qt::RightButton && _crossSectionPolygonMode) {
+        (void)finishCrossSectionPolygon();
+        return true;
+    }
+    if (button != Qt::LeftButton) {
+        return true;
+    }
+    if (_crossSectionDraftPoints.empty()) {
+        auto* plane = _generatedViews.currentCutSurface.get();
+        _crossSectionDraftOrigin = cv::Vec3d(plane->origin());
+        _crossSectionDraftNormal = cv::Vec3d(plane->normal({0.0f, 0.0f, 0.0f}));
+        _crossSectionDraftUp = cv::Vec3d(plane->basisY());
+    } else if (_crossSectionPolygonMode && _crossSectionDraftPoints.size() >= 3) {
+        const QPointF first = _currentCutViewer->volumeToScene(
+            cv::Vec3f(_crossSectionDraftPoints.front()));
+        if (QLineF(first, scenePoint).length() <= 10.0) {
+            return finishCrossSectionPolygon();
+        }
+    }
+    _crossSectionDraftPoints.emplace_back(volumePoint);
+    if (!_crossSectionPolygonMode && _crossSectionDraftPoints.size() == 2) {
+        vc::fiber_tracer::FiberCrossSectionAnnotation annotation;
+        annotation.id = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
+        annotation.kind = vc::fiber_tracer::FiberCrossSectionKind::Line;
+        annotation.pointsXyz = _crossSectionDraftPoints;
+        annotation.planeOriginXyz = _crossSectionDraftOrigin;
+        annotation.planeNormalXyz = _crossSectionDraftNormal;
+        annotation.planeUpXyz = _crossSectionDraftUp;
+        annotation.recordedLinePositionXyz = cv::Vec3d(interpolatedLinePoint(_currentLinePosition));
+        annotation.recordedArclengthBaseVoxels = currentLineArclength();
+        try {
+            vc::fiber_tracer::validateFiberCrossSectionAnnotation(annotation);
+        } catch (const std::exception& ex) {
+            _crossSectionDraftPoints.pop_back();
+            QToolTip::showText(QCursor::pos(),
+                               tr("Cannot create line: %1").arg(ex.what()),
+                               this);
+            rebuildCrossSectionOverlay();
+            return true;
+        }
+        _crossSectionUndoStack.push_back(_crossSections);
+        _crossSections.push_back(std::move(annotation));
+        _crossSectionDraftPoints.clear();
+        commitCrossSectionAnnotations();
+    } else {
+        rebuildCrossSectionOverlay();
+    }
+    return true;
+}
+
+void LineAnnotationDialog::handleCrossSectionMove(
+    cv::Vec3f volumePoint,
+    Qt::MouseButtons buttons,
+    QPointF)
+{
+    if (!_crossSectionMode || !_crossSectionDragVertex ||
+        !(buttons & Qt::LeftButton) || !finitePoint(volumePoint) || !_crossSectionCombo) {
+        return;
+    }
+    const std::string id = _crossSectionCombo->currentData().toString().toStdString();
+    const auto selected = std::find_if(_crossSections.begin(), _crossSections.end(),
+                                       [&id](const auto& item) { return item.id == id; });
+    if (selected == _crossSections.end() || *_crossSectionDragVertex >= selected->pointsXyz.size()) {
+        return;
+    }
+    selected->pointsXyz[*_crossSectionDragVertex] = cv::Vec3d(volumePoint);
+    rebuildCrossSectionOverlay();
+}
+
+void LineAnnotationDialog::handleCrossSectionRelease(
+    cv::Vec3f volumePoint,
+    Qt::MouseButton button,
+    QPointF scenePoint)
+{
+    if (!_crossSectionMode || button != Qt::LeftButton || !_crossSectionDragVertex) {
+        return;
+    }
+    handleCrossSectionMove(volumePoint, Qt::LeftButton, scenePoint);
+    try {
+        vc::fiber_tracer::validateFiberCrossSectionAnnotations(_crossSections);
+        _crossSectionUndoStack.push_back(
+            [&]() {
+                auto previous = _crossSections;
+                if (_crossSectionDragOriginal && _crossSectionCombo) {
+                    const std::string id = _crossSectionCombo->currentData().toString().toStdString();
+                    const auto it = std::find_if(previous.begin(), previous.end(),
+                                                 [&id](const auto& item) { return item.id == id; });
+                    if (it != previous.end()) *it = *_crossSectionDragOriginal;
+                }
+                return previous;
+            }());
+        _crossSectionDragVertex.reset();
+        _crossSectionDragOriginal.reset();
+        commitCrossSectionAnnotations();
+    } catch (const std::exception& ex) {
+        cancelCrossSectionGesture();
+        QToolTip::showText(QCursor::pos(),
+                           tr("Cannot edit annotation: %1").arg(ex.what()),
+                           this);
+    }
+}
+
+void LineAnnotationDialog::deleteSelectedCrossSection()
+{
+    if (!_crossSectionCombo || _crossSectionCombo->currentIndex() < 0) {
+        return;
+    }
+    const std::string id = _crossSectionCombo->currentData().toString().toStdString();
+    const auto it = std::find_if(_crossSections.begin(), _crossSections.end(),
+                                 [&id](const auto& item) { return item.id == id; });
+    if (it == _crossSections.end()) return;
+    _crossSectionUndoStack.push_back(_crossSections);
+    _crossSections.erase(it);
+    commitCrossSectionAnnotations();
+}
+
+void LineAnnotationDialog::jumpToSelectedCrossSection()
+{
+    if (!_hasGeneratedViews || !_crossSectionCombo ||
+        _crossSectionCombo->currentIndex() < 0 || !_generatedViews.currentCutSurface) {
+        return;
+    }
+    const std::string id = _crossSectionCombo->currentData().toString().toStdString();
+    const auto selected = std::find_if(_crossSections.begin(), _crossSections.end(),
+                                       [&id](const auto& item) { return item.id == id; });
+    if (selected == _crossSections.end() || _generatedViews.linePoints.empty()) return;
+    size_t nearest = 0;
+    double nearestDistance = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < _generatedViews.linePoints.size(); ++i) {
+        const double distance = cv::norm(
+            cv::Vec3d(_generatedViews.linePoints[i]) - selected->recordedLinePositionXyz);
+        if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nearest = i;
+        }
+    }
+    setCurrentCutFollowsStripMouse(false);
+    setCurrentLinePosition(static_cast<double>(nearest), true, true);
+    _generatedViews.currentCutSurface->setFromNormalAndUp(
+        cv::Vec3f(selected->planeOriginXyz), cv::Vec3f(selected->planeNormalXyz),
+        cv::Vec3f(selected->planeUpXyz));
+    _currentCutStraightAheadActive = true;
+    _currentCutViewer->markSurfaceGeometryChanged();
+    _currentCutViewer->centerOnVolumePoint(cv::Vec3f(selected->planeOriginXyz), false);
+    _currentCutViewer->renderVisible(true, "jump to cross-section annotation");
+    rebuildCrossSectionOverlay();
+}
+
+void LineAnnotationDialog::rebuildCrossSectionOverlay()
+{
+    if (!_currentCutViewer) return;
+    constexpr const char* key = "line_annotation_cross_sections";
+    if (!_crossSectionMode) {
+        _currentCutViewer->clearOverlayGroup(key);
+        return;
+    }
+    std::vector<QGraphicsItem*> items;
+    auto* pathItem = new QGraphicsPathItem();
+    QPainterPath path;
+    const QString selectedId = _crossSectionCombo ? _crossSectionCombo->currentData().toString()
+                                                   : QString{};
+    for (const auto& annotation : _crossSections) {
+        if (annotation.pointsXyz.empty()) continue;
+        if (_generatedViews.currentCutSurface) {
+            auto* plane = _generatedViews.currentCutSurface.get();
+            const cv::Vec3d currentOrigin(plane->origin());
+            const cv::Vec3d currentNormal(plane->normal({0.0f, 0.0f, 0.0f}));
+            if (std::abs((annotation.planeOriginXyz - currentOrigin).dot(currentNormal)) > 0.25 ||
+                std::abs(annotation.planeNormalXyz.dot(currentNormal)) < 0.999) {
+                continue;
+            }
+        }
+        const QPointF first = _currentCutViewer->volumeToScene(cv::Vec3f(annotation.pointsXyz[0]));
+        path.moveTo(first);
+        for (size_t i = 1; i < annotation.pointsXyz.size(); ++i) {
+            path.lineTo(_currentCutViewer->volumeToScene(cv::Vec3f(annotation.pointsXyz[i])));
+        }
+        if (annotation.kind == vc::fiber_tracer::FiberCrossSectionKind::Polygon) {
+            path.closeSubpath();
+        }
+        if (QString::fromStdString(annotation.id) == selectedId) {
+            for (const auto& point : annotation.pointsXyz) {
+                const QPointF scene = _currentCutViewer->volumeToScene(cv::Vec3f(point));
+                path.addEllipse(scene, 4.0, 4.0);
+            }
+        }
+    }
+    if (!_crossSectionDraftPoints.empty()) {
+        path.moveTo(_currentCutViewer->volumeToScene(cv::Vec3f(_crossSectionDraftPoints[0])));
+        for (size_t i = 1; i < _crossSectionDraftPoints.size(); ++i) {
+            path.lineTo(_currentCutViewer->volumeToScene(cv::Vec3f(_crossSectionDraftPoints[i])));
+        }
+        for (const auto& point : _crossSectionDraftPoints) {
+            const QPointF scene = _currentCutViewer->volumeToScene(cv::Vec3f(point));
+            path.addEllipse(scene, 4.0, 4.0);
+        }
+    }
+    pathItem->setPath(path);
+    pathItem->setPen(QPen(QColor(0, 255, 200), 2.0));
+    pathItem->setBrush(QBrush(QColor(0, 255, 200, 36)));
+    pathItem->setZValue(1500.0);
+    items.push_back(pathItem);
+    _currentCutViewer->setOverlayGroup(key, items);
 }
 
 LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::staticStripOverlay() const
@@ -5041,6 +5608,29 @@ bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
 {
     if (!event) {
         return false;
+    }
+    if (_crossSectionMode && !keyboardFocusIsTextEntry()) {
+        if (event->key() == Qt::Key_Escape &&
+            (!_crossSectionDraftPoints.empty() || _crossSectionDragVertex)) {
+            cancelCrossSectionGesture();
+            event->accept();
+            return true;
+        }
+        if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) &&
+            _crossSectionAddMode && _crossSectionPolygonMode) {
+            (void)finishCrossSectionPolygon();
+            event->accept();
+            return true;
+        }
+        if (event->key() == Qt::Key_Z &&
+            event->modifiers() == Qt::ControlModifier &&
+            !_crossSectionUndoStack.empty()) {
+            _crossSections = std::move(_crossSectionUndoStack.back());
+            _crossSectionUndoStack.pop_back();
+            commitCrossSectionAnnotations();
+            event->accept();
+            return true;
+        }
     }
     if (event->key() == Qt::Key_Space && event->modifiers() == Qt::NoModifier) {
         (void)toggleCurrentCutFollowFromKeyboard();

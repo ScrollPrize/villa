@@ -38,6 +38,7 @@
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
 #include "vc/core/util/ScrollUmbilicus.hpp"
+#include "vc/fiber_tracer/FiberCrossSection.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
@@ -556,6 +557,7 @@ private:
         uint64_t generation = 1;
         std::vector<vc3d::line_annotation::StoredControlPoint> controlPoints;
         std::vector<cv::Vec3d> linePoints;
+        std::vector<vc::fiber_tracer::FiberCrossSectionAnnotation> crossSections;
         // Stored snapshots only. Live-session branch metadata must be converted
         // through storedFiberFromSession()/saveSessionAsFiber() so the central
         // hook can remap linked control-point indices before serialization.
@@ -1083,7 +1085,8 @@ private:
     [[nodiscard]] StoredFiberSessionSnapshot makeStoredFiberSessionSnapshot(
         LineAnnotationSession& session);
     [[nodiscard]] StoredFiber storedFiberFromSession(LineAnnotationSession& session);
-    void saveSessionAsFiber(LineAnnotationSession& session);
+    void saveSessionAsFiber(LineAnnotationSession& session,
+                            bool finalizeOptimization = true);
     // Debounced autosave after a solve landing: consecutive landings coalesce
     // into one saveSessionAsFiber (with its no-op probe, fiber summary
     // rebuild, and linked-fiber sync) instead of paying it per landing. The

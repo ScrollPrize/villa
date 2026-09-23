@@ -34,6 +34,7 @@ add_library(vc_core
         src/S3AuthFallback.cpp
         src/PostProcess.cpp
         src/Geometry.cpp
+        src/fiber_tracer/FiberCrossSection.cpp
         src/PointCollections.cpp
         src/surface_metrics.cpp
         src/Thinning.cpp

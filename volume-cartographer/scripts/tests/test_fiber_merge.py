@@ -107,6 +107,28 @@ def make_v3_fiber(cps, generation=1, filename='dj_x_000001.json',
     return doc
 
 
+def cross_section(record_id, *, label='base', arclength=20.0):
+    """Representative versioned payload; fiber_merge treats it atomically."""
+    return {
+        'id': record_id,
+        'schema_version': 1,
+        'kind': 'line',
+        'points_xyz': [[120.0, 199.0, 300.0], [120.0, 201.0, 300.0]],
+        'plane_origin_xyz': [120.0, 200.0, 300.0],
+        'plane_normal_xyz': [1.0, 0.0, 0.0],
+        'plane_up_xyz': [0.0, 0.0, 1.0],
+        'recorded_line_position_xyz': [120.0, 200.0, 300.0],
+        'recorded_arclength': arclength,
+        'geometry_generation': 1,
+        'label': label,
+    }
+
+
+CROSS_A = '00000000-0000-4000-8000-000000000001'
+CROSS_B = '00000000-0000-4000-8000-000000000002'
+CROSS_C = '00000000-0000-4000-8000-000000000003'
+
+
 def set_v3_span(doc, index, *, goal, bend):
     mode = 'trace' if goal == 'global' else goal
     metric = None if mode == 'cspline' else 2.0
@@ -1779,3 +1801,162 @@ def test_v3_tagging_and_refitting_the_same_final_span_is_a_manual_conflict():
 
     assert not result['ok']
     assert any('changed differently on both sides' in c for c in result['conflicts'])
+
+
+# --- cross-section stable-ID merge ---------------------------------------
+
+
+def test_cross_sections_merge_independent_additions_deterministically():
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['cross_sections'] = [cross_section(CROSS_C, label='local')]
+    remote['cross_sections'] = [cross_section(CROSS_A, label='remote')]
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    assert [item['id'] for item in result['merged']['cross_sections']] == [
+        CROSS_A, CROSS_C]
+    assert {item['label'] for item in result['merged']['cross_sections']} == {
+        'local', 'remote'}
+
+
+def test_cross_sections_merge_independent_edits():
+    base = make_v3_fiber(BASE_CPS)
+    base['cross_sections'] = [cross_section(CROSS_A), cross_section(CROSS_B)]
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['cross_sections'][0]['label'] = 'local edit'
+    remote['cross_sections'][1]['label'] = 'remote edit'
+    local['generation'] = 2
+    remote['generation'] = 50
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    by_id = {item['id']: item for item in result['merged']['cross_sections']}
+    assert by_id[CROSS_A]['label'] == 'local edit'
+    assert by_id[CROSS_B]['label'] == 'remote edit'
+
+
+def test_cross_sections_identical_two_sided_edit_agrees():
+    base = make_v3_fiber(BASE_CPS)
+    base['cross_sections'] = [cross_section(CROSS_A)]
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['cross_sections'][0]['label'] = 'same edit'
+    remote['cross_sections'][0]['label'] = 'same edit'
+    local['tags'] = ['local']
+    remote['tags'] = ['remote']
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    assert result['merged']['cross_sections'][0]['label'] == 'same edit'
+
+
+def test_cross_section_unilateral_deletion_beats_unchanged_record():
+    base = make_v3_fiber(BASE_CPS)
+    base['cross_sections'] = [cross_section(CROSS_A)]
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['cross_sections'] = []
+    remote['tags'] = ['unrelated']
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    assert 'cross_sections' not in result['merged']
+
+
+@pytest.mark.parametrize('delete_side', ['local', 'remote'])
+def test_cross_section_edit_delete_is_a_conflict(delete_side):
+    base = make_v3_fiber(BASE_CPS)
+    base['cross_sections'] = [cross_section(CROSS_A)]
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    edited = remote if delete_side == 'local' else local
+    deleted = local if delete_side == 'local' else remote
+    edited['cross_sections'][0]['label'] = 'edited'
+    deleted['cross_sections'] = []
+
+    result = merge_fibers(base, local, remote)
+
+    assert not result['ok']
+    assert result['merged'] is None
+    assert any('deleted' in conflict and 'edited' in conflict
+               for conflict in result['conflicts'])
+
+
+def test_cross_section_divergent_edits_are_a_conflict():
+    base = make_v3_fiber(BASE_CPS)
+    base['cross_sections'] = [cross_section(CROSS_A)]
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['cross_sections'][0]['label'] = 'local edit'
+    remote['cross_sections'][0]['label'] = 'remote edit'
+    local['generation'] = 100
+    remote['generation'] = 2
+
+    result = merge_fibers(base, local, remote)
+
+    assert not result['ok']
+    assert any(CROSS_A in conflict and 'edited differently' in conflict
+               for conflict in result['conflicts'])
+
+
+def test_cross_section_different_same_id_additions_are_a_conflict():
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['cross_sections'] = [cross_section(CROSS_A, label='local')]
+    remote['cross_sections'] = [cross_section(CROSS_A, label='remote')]
+
+    result = merge_fibers(base, local, remote)
+
+    assert not result['ok']
+    assert any(CROSS_A in conflict and 'added differently' in conflict
+               for conflict in result['conflicts'])
+
+
+def test_cross_sections_missing_and_empty_are_equivalent():
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['cross_sections'] = []
+    remote['tags'] = ['remote edit']
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    assert 'cross_sections' not in result['merged']
+    assert result['merged']['tags'] == ['remote edit']
+
+
+@pytest.mark.parametrize('bad_cross_sections', [
+    None,
+    {},
+    ['not an object'],
+    [{}],
+    [{'id': 'not-a-uuid'}],
+    [{'id': CROSS_A}, {'id': CROSS_A}],
+])
+def test_cross_sections_are_validated_before_document_fast_paths(
+        bad_cross_sections):
+    base = make_v3_fiber(BASE_CPS)
+    base['cross_sections'] = copy.deepcopy(bad_cross_sections)
+    local = make_v3_fiber(BASE_CPS)
+    remote = copy.deepcopy(local)  # would otherwise take the identical fast path
+
+    assert not fiber_merge.is_fiber_doc(base)
+    result = merge_fibers(base, local, remote)
+    assert not result['ok']
+    assert result['merged'] is None
+    assert any('base version' in conflict for conflict in result['conflicts'])
+
+
+def test_cross_sections_are_rejected_on_legacy_v1_fibers():
+    doc = make_fiber(BASE_CPS)
+    doc['cross_sections'] = [cross_section(CROSS_A)]
+    assert not fiber_merge.is_fiber_doc(doc)

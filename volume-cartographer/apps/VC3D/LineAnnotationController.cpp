@@ -223,6 +223,7 @@ struct LineAnnotationController::LineAnnotationSession {
     fs::path fiberSourceRoot;
     std::string fiberManualHvTag;
     std::vector<std::string> fiberTags;
+    std::vector<vc::fiber_tracer::FiberCrossSectionAnnotation> crossSections;
     vc3d::line_annotation::FiberOptimizationMode fiberOptimizationMode =
         vc3d::line_annotation::kDefaultNewFiberOptimizationMode;
     vc3d::line_annotation::FiberOptimizationMode fiberOptimizationModeBeforeTask =
@@ -2543,6 +2544,44 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                 setFiberTag(pane->session->fiberId, tag, enabled);
             });
     connect(dialog,
+            &LineAnnotationDialog::crossSectionAnnotationsChanged,
+            this,
+            [this, surfaceName](
+                std::vector<vc::fiber_tracer::FiberCrossSectionAnnotation> annotations) {
+                auto* sourcePane = paneForSurface(surfaceName);
+                if (!sourcePane || !sourcePane->session ||
+                    sourcePane->session->fiberDeleted) {
+                    return;
+                }
+                auto& source = *sourcePane->session;
+                const double inverseScale = 1.0 / source.fiberBaseToVolumeScale;
+                for (auto& annotation : annotations) {
+                    if (!approximatelyEqual(inverseScale, 1.0)) {
+                        vc::fiber_tracer::scaleFiberCrossSectionAnnotation(
+                            annotation, inverseScale);
+                    }
+                    annotation.geometryGeneration =
+                        std::max<std::uint64_t>(uint64_t{1}, source.lineRevision);
+                }
+                vc::fiber_tracer::validateFiberCrossSectionAnnotations(
+                    annotations, "line annotation cross_sections");
+                source.crossSections = annotations;
+
+                // One fiber can be open in more than one pane. Publish the
+                // committed collection to each live session immediately so a
+                // later save from another pane cannot restore stale records.
+                for (auto& pane : _panes) {
+                    if (!pane.session || pane.session.get() == &source ||
+                        pane.session->fiberId != source.fiberId) {
+                        continue;
+                    }
+                    pane.session->crossSections = annotations;
+                    pushFiberUiState(pane);
+                }
+                saveSessionAsFiber(source, false);
+                pushFiberUiState(*sourcePane);
+            });
+    connect(dialog,
             &LineAnnotationDialog::lasagnaDatasetSelectionChanged,
             this,
             [this](const std::string& location) {
@@ -2960,6 +2999,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     session->fiberSourceRoot = it->sourceRoot;
     session->fiberManualHvTag = it->manualHvTag;
     session->fiberTags = it->tags;
+    session->crossSections = it->crossSections;
     session->fiberOptimizationMode = it->optimizationMode;
     session->coordinateBaseShapeZYX = coordinateBaseShapeZYX;
     session->fiberBaseToVolumeScale = fiberBaseToVolumeScale;
@@ -3901,6 +3941,14 @@ void LineAnnotationController::pushFiberUiState(const PaneRecord& pane) const
     pane.dialog->setFiberTags(knownFiberTags(),
                               loaded ? it->tags : pane.session->fiberTags,
                               loaded);
+    auto crossSections = pane.session->crossSections;
+    if (!approximatelyEqual(pane.session->fiberBaseToVolumeScale, 1.0)) {
+        for (auto& annotation : crossSections) {
+            vc::fiber_tracer::scaleFiberCrossSectionAnnotation(
+                annotation, pane.session->fiberBaseToVolumeScale);
+        }
+    }
+    pane.dialog->setCrossSectionAnnotations(std::move(crossSections));
 }
 
 void LineAnnotationController::recalculateFiberHvClassification(uint64_t fiberId)
@@ -8867,6 +8915,28 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
     for (const auto& tag : far.tags) {
         addUniqueSorted(merged.tags, tag);
     }
+    merged.crossSections = clicked.crossSections;
+    for (const auto& annotation : far.crossSections) {
+        const auto duplicate = std::find_if(
+            merged.crossSections.begin(), merged.crossSections.end(),
+            [&annotation](const auto& existing) {
+                return existing.id == annotation.id;
+            });
+        if (duplicate == merged.crossSections.end()) {
+            merged.crossSections.push_back(annotation);
+            continue;
+        }
+        if (vc::fiber_tracer::fiberCrossSectionAnnotationToJson(*duplicate) !=
+            vc::fiber_tracer::fiberCrossSectionAnnotationToJson(annotation)) {
+            showError(tr("Cannot merge: both fibers contain different cross-section "
+                         "annotations with id %1.")
+                          .arg(QString::fromStdString(annotation.id)),
+                      suppressErrors);
+            return;
+        }
+    }
+    vc::fiber_tracer::validateFiberCrossSectionAnnotations(
+        merged.crossSections, "merged fiber cross_sections");
     // The join span has no real geometry until the merged line is re-fit.
     addUniqueSorted(merged.tags, std::string{kNeedsReoptimizationTag});
     merged.hvClassification = vc3d::line_annotation::classifyFiberHv(
@@ -9312,6 +9382,21 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
                                 parent.controlPoints.end());
     suffix.linePoints.assign(parent.linePoints.begin() + plan->suffixLineBegin,
                              parent.linePoints.end());
+
+    for (const auto& source : parent.crossSections) {
+        const double prefixDistance = vc::fiber_tracer::fiberCrossSectionDistanceToPolyline(
+            prefix.linePoints, source.recordedLinePositionXyz);
+        const double suffixDistance = vc::fiber_tracer::fiberCrossSectionDistanceToPolyline(
+            suffix.linePoints, source.recordedLinePositionXyz);
+        const double parentDistance = vc::fiber_tracer::fiberCrossSectionDistanceToPolyline(
+            parent.linePoints, source.recordedLinePositionXyz);
+        auto annotation = source;
+        const double survivingDistance = std::min(prefixDistance, suffixDistance);
+        annotation.detached = annotation.detached ||
+            survivingDistance > parentDistance + 1.0e-4;
+        (prefixDistance <= suffixDistance ? prefix : suffix)
+            .crossSections.push_back(std::move(annotation));
+    }
 
     for (const auto& branch : parent.branches) {
         const auto remapped =
@@ -16263,6 +16348,9 @@ void LineAnnotationController::scaleStoredFiber(StoredFiber& fiber, double scale
         branch.controlPointPosition = branch.controlPointPosition * scale;
         branch.branchControlPointPosition = branch.branchControlPointPosition * scale;
     }
+    for (auto& annotation : fiber.crossSections) {
+        vc::fiber_tracer::scaleFiberCrossSectionAnnotation(annotation, scale);
+    }
     fiber.hvClassification = vc3d::line_annotation::classifyFiberHv(
         vc3d::line_annotation::storedControlPointPositions(fiber.controlPoints));
 }
@@ -16519,6 +16607,7 @@ LineAnnotationController::makeIntersectionLineSession(
     session->fiberSourceRoot = fiber.sourceRoot;
     session->fiberManualHvTag = fiber.manualHvTag;
     session->fiberTags = fiber.tags;
+    session->crossSections = fiber.crossSections;
     session->fiberOptimizationMode = fiber.optimizationMode;
     // Carried through to the saved fiber; without it a re-save from this
     // pane-less session (re-optimization, intersection edits) drops the
@@ -16732,6 +16821,7 @@ LineAnnotationController::makeStoredFiberSessionSnapshot(LineAnnotationSession& 
         vc3d::line_annotation::storedControlPointPositions(fiber.controlPoints));
     fiber.manualHvTag = session.fiberManualHvTag;
     fiber.tags = session.fiberTags;
+    fiber.crossSections = session.crossSections;
     fiber.optimizationMode = session.fiberOptimizationMode;
     return snapshot;
 }
@@ -16795,7 +16885,8 @@ void LineAnnotationController::flushAllPendingSessionAutoSaves()
     }
 }
 
-void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session)
+void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session,
+                                                  bool finalizeOptimization)
 {
     // Any direct save supersedes a pending debounced autosave.
     session.autoSaveScheduled = false;
@@ -16811,13 +16902,14 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         return;
     }
     try {
-        if (!finalizeSessionOptimizationSynchronously(session, false)) {
+        if (finalizeOptimization &&
+            !finalizeSessionOptimizationSynchronously(session, false)) {
             return;
         }
         if (session.fiberDeleted) {
             return;
         }
-        if (session.lineWasOptimized) {
+        if (finalizeOptimization && session.lineWasOptimized) {
             // The line being saved was produced by the optimizer in this
             // session, so any sync-applied needs_reoptimization tag is
             // satisfied. Without this, an ordinary pane save would write
@@ -16827,7 +16919,7 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
                             std::string{kNeedsReoptimizationTag}),
                 session.fiberTags.end());
         }
-        if (session.stripReviewedTagOnSave) {
+        if (finalizeOptimization && session.stripReviewedTagOnSave) {
             // An interpolation-mode switch overwrote the geometry; any prior
             // human review verdict is stale. Ordinary edits/merges/splits keep it.
             session.fiberTags.erase(
@@ -17066,6 +17158,11 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
         root["coordinate_base_shape_zyx"] = *serialized.coordinateBaseShapeZYX;
     }
     root["tags"] = serialized.tags;
+    if (!serialized.crossSections.empty()) {
+        root["cross_sections"] =
+            vc::fiber_tracer::fiberCrossSectionAnnotationsToJson(
+                serialized.crossSections);
+    }
     root["hv_classification"] = {
         {"z_distance", serialized.hvClassification.zDistance},
         {"control_point_length", serialized.hvClassification.fiberLength},
@@ -17622,6 +17719,7 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
     fiber.optimizationMode =
         vc3d::line_annotation::fiberOptimizationModeFromString(
             parsedFiber.optimizationMode);
+    fiber.crossSections = parsedFiber.crossSections;
     if (root.contains("coordinate_base_shape_zyx")) {
         const auto& shape = root.at("coordinate_base_shape_zyx");
         if (!shape.is_array() || shape.size() != 3) {
