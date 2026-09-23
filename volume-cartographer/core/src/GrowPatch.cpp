@@ -3112,6 +3112,14 @@ struct thresholdedDistance
 
 };
 
+int resume_stop_generation(const utils::Json &params, int start_gen, int stop_gen)
+{
+    if (!params.contains("resume_generations"))
+        return stop_gen;
+
+    return start_gen + std::max(0, params.value("resume_generations", 0)) + 1;
+}
+
 QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
 {
     const std::array<int, 3> volume_shape_zyx = volume.shape(level);
@@ -3507,6 +3515,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         double min_val, max_val;
         cv::minMaxLoc(resume_generations, &min_val, &max_val);
         int start_gen = (rewind_gen == -1) ? static_cast<int>(max_val) : rewind_gen;
+        stop_gen = resume_stop_generation(params, start_gen, stop_gen);
         int gen_diff = std::max(0, stop_gen - start_gen);
         const bool disable_grid_expansion = params.value("disable_grid_expansion", false);
         const int grow_extra_cols = std::max(0, params.value("grow_extra_cols", 0));

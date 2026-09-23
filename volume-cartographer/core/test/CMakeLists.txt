@@ -946,6 +946,8 @@ vc_add_test(NAME test_growth_helpers
     LIBS doctest::doctest vc_tracer
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
+vc_add_test(NAME test_resume_generations LIBS doctest::doctest vc_tracer)
+
 vc_add_test(NAME test_surf_tracker_data
     LIBS doctest::doctest vc_tracer
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/..)
