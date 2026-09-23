@@ -898,6 +898,17 @@ if(TARGET vc_render_tifxyz)
     vc_register_ctest(test_render_tifxyz_logging vc_render_tifxyz)
 endif()
 
+if(TARGET vc_obj2tifxyz)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    vc_register_test_target(vc_obj2tifxyz)
+    add_test(NAME test_obj2tifxyz_scale
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_obj2tifxyz_scale.py"
+            $<TARGET_FILE:vc_obj2tifxyz>)
+    set_tests_properties(test_obj2tifxyz_scale PROPERTIES TIMEOUT 90)
+    vc_register_ctest(test_obj2tifxyz_scale vc_obj2tifxyz)
+endif()
+
 vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)
 
 vc_add_test(NAME test_remote_url)
