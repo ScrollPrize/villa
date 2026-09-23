@@ -108,15 +108,21 @@ Common fields produced by tools:
 
 ### 5.1 `scale` meaning
 
-`scale = [sx, sy]` describes the grid spacing in surface-parameter space.
+`scale = [sx, sy]` is a **grid density**: grid cells per surface/volume unit.
 
-- Many tools interpret the parametric coordinate of a vertex `(row, col)` as `(u = col * sx, v = row * sy)`.
-- Some operations may also use `1/sx` and `1/sy` as a “pixels-per-unit” scaling.
+The reference `QuadSurface` implementation uses it in both directions:
+
+- surface → grid: `(col = u * sx, row = v * sy)`
+- grid → surface: `(u = col / sx, v = row / sy)`
+
+Therefore the physical spacing between adjacent grid samples is approximately
+`(1/sx, 1/sy)` surface/volume units. For example, a surface sampled every
+20 voxels should store `scale = [0.05, 0.05]`, not `[20, 20]`.
 
 To stay compatible:
 
-- Preserve `scale` when copying/transforming surfaces.
-- If you resample the grid resolution, update `scale` consistently.
+- Preserve `scale` when copying/transforming a surface without changing its grid density.
+- If you change the grid resolution, update `scale` so the surface-to-grid mapping remains consistent.
 
 ## 6. Writing rules (recommended)
 
