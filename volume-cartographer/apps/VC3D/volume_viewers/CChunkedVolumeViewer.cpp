@@ -7,6 +7,7 @@
 #include "elements/DownloadQueueStats.hpp"
 #include "CameraGizmoWidget.hpp"
 #include "VolumetricCompositor.hpp"
+#include "IntersectionLayerItem.hpp"
 #include "elements/ViewerStatsBar.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
@@ -53,6 +54,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -6883,19 +6885,50 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         }
     }
 
-    std::size_t itemIndex = 0;
-    _intersectionItems.reserve(std::max(_intersectionItems.size(), groupedPaths.size()));
+    // One layer item per z value. Styles are sorted so the draw order inside a
+    // layer is stable across rebuilds (unordered_map iteration is not).
+    std::vector<IntersectionStyle> styles;
+    styles.reserve(groupedPaths.size());
     for (const auto& [style, path] : groupedPaths) {
-        if (path.isEmpty())
-            continue;
-        QGraphicsPathItem* item = nullptr;
+        if (!path.isEmpty())
+            styles.push_back(style);
+    }
+    std::sort(styles.begin(), styles.end(), [](const IntersectionStyle& a, const IntersectionStyle& b) {
+        return std::tie(a.z, a.color, a.widthQ, a.dashed, a.filled) <
+               std::tie(b.z, b.color, b.widthQ, b.dashed, b.filled);
+    });
+    std::map<int, std::vector<IntersectionLayerItem::Entry>> layers;
+    for (const auto& style : styles) {
+        QPen pen(groupedColors[style]);
+        pen.setWidthF(static_cast<qreal>(style.widthQ) / 1000.0);
+        // Every segment is its own subpath, so a round cap is stroked twice per
+        // segment. Wide non-cosmetic-fast-path round caps dominate repaint cost
+        // on large sessions (~15x slower than flat caps for 200k segments);
+        // keep them only for the active segmentation's few segments.
+        pen.setCapStyle(style.z >= kActiveIntersectionZ ? Qt::RoundCap : Qt::FlatCap);
+        pen.setJoinStyle(Qt::RoundJoin);
+        pen.setCosmetic(true);
+        if (style.dashed) {
+            pen.setStyle(Qt::DotLine);
+            pen.setCapStyle(Qt::FlatCap);
+        }
+        QBrush brush = Qt::NoBrush;
+        if (style.filled) {
+            brush = QBrush(groupedColors[style]);
+            pen = QPen(Qt::NoPen);
+        }
+        layers[style.z].push_back({groupedPaths[style], pen, brush});
+    }
+
+    std::size_t itemIndex = 0;
+    _intersectionItems.reserve(std::max(_intersectionItems.size(), layers.size()));
+    for (auto& [z, entries] : layers) {
+        IntersectionLayerItem* item = nullptr;
         if (itemIndex < _intersectionItems.size()) {
-            item = dynamic_cast<QGraphicsPathItem*>(_intersectionItems[itemIndex]);
+            item = dynamic_cast<IntersectionLayerItem*>(_intersectionItems[itemIndex]);
         }
         if (!item) {
-            item = new QGraphicsPathItem();
-            item->setBrush(Qt::NoBrush);
-            item->setAcceptedMouseButtons(Qt::NoButton);
+            item = new IntersectionLayerItem();
             _scene->addItem(item);
             if (itemIndex < _intersectionItems.size()) {
                 if (_intersectionItems[itemIndex] && _intersectionItems[itemIndex]->scene()) {
@@ -6907,25 +6940,9 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
                 _intersectionItems.push_back(item);
             }
         }
-        QPen pen(groupedColors[style]);
-        pen.setWidthF(static_cast<qreal>(style.widthQ) / 1000.0);
-        pen.setCapStyle(Qt::RoundCap);
-        pen.setJoinStyle(Qt::RoundJoin);
-        pen.setCosmetic(true);
-        if (style.dashed) {
-            pen.setStyle(Qt::DotLine);
-            pen.setCapStyle(Qt::FlatCap);
-        }
-        if (style.filled) {
-            item->setBrush(groupedColors[style]);
-            pen = QPen(Qt::NoPen);
-        } else {
-            item->setBrush(Qt::NoBrush);
-        }
         item->setTransform(QTransform());
-        item->setPath(path);
-        item->setPen(pen);
-        item->setZValue(style.z);
+        item->setEntries(std::move(entries));
+        item->setZValue(z);
         ++itemIndex;
     }
     while (_intersectionItems.size() > itemIndex) {

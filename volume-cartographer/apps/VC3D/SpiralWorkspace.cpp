@@ -287,8 +287,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     // The flattened preview is this workspace's primary pane: stop publishing
     // raw-path chunk demand for frames the SurfaceCache fully serves, so its
     // tile fills are not starved behind interactive fetches the frame never
-    // reads. Spiral's own ViewerManager only; the main workspace keeps the
-    // default demand behavior.
+    // reads.
     _viewerManager->setPreferSurfaceTileFills(true);
     _slices = std::make_unique<AxisAlignedSliceController>(_state, this);
     _slices->setViewerManager(_viewerManager.get());

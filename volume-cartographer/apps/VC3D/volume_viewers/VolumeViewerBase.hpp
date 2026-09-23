@@ -168,8 +168,8 @@ public:
     // When the SurfaceCache band covers a frame, stop publishing that frame's
     // raw-path viewport chunk demand so the (background-priority) tile fills
     // are not starved by interactive fetches for a sampling path the frame
-    // never executes. Off by default; enabled by workspaces where the
-    // flattened view is the primary pane (the Spiral workspace).
+    // never executes. Off by default; enabled by the main and Spiral
+    // workspaces.
     virtual void setPreferSurfaceTileFills(bool) {}
 
     // --- Interaction state ---
