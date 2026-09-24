@@ -5496,7 +5496,7 @@ if __name__ == '__main__':
     import argparse
 
     from fit_session import (conventional_input_paths, default_user_cache_dir,
-                             load_scroll_spec)
+                             load_scroll_spec, preflight_dataset)
 
     parser = argparse.ArgumentParser(
         description='Headless Spiral fit over one dataset root.')
@@ -5513,7 +5513,21 @@ if __name__ == '__main__':
         help='Directory for derived host caches, shared with the interactive '
              'service (default: $FIT_SPIRAL_CACHE_DIR if set, else '
              '$XDG_CACHE_HOME/vc3d/spiral, i.e. ~/.cache/vc3d/spiral)')
+    parser.add_argument(
+        '--check', action='store_true',
+        help='Report which inputs this configuration needs, which the '
+             'dataset has and where each one will be read from, then exit '
+             '(0 when a fit can start). Reads the dataset only: no GPU, no '
+             'download, no fit')
     cli_args = parser.parse_args()
+
+    if cli_args.check:
+        check_config = Config().as_dict()
+        check_config.update(get_env_config_overrides())
+        preflight = preflight_dataset(cli_args.dataset, check_config,
+                                      spec_path=cli_args.scroll_spec)
+        print(preflight.report(), flush=True)
+        raise SystemExit(0 if preflight.ok else 1)
 
     scroll_spec = load_scroll_spec(cli_args.dataset, cli_args.scroll_spec)
     input_paths = conventional_input_paths(cli_args.dataset, scroll_spec)

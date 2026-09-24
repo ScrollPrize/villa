@@ -86,6 +86,49 @@ the platform dispatch and fallback/error paths.
 Filesystem API references: [Linux FICLONE](https://man7.org/linux/man-pages/man2/FICLONE.2const.html)
 and [Apple file cloning support](https://developer.apple.com/documentation/foundation/urlresourcevalues/volumesupportsfilecloning).
 
+## Checking a dataset before fitting
+
+`fit_spiral.py --dataset DIR --check` reports what a fit of the current
+configuration needs from that dataset and what the dataset has, then exits
+0 when a fit can start and 1 when it cannot. It reads the dataset only: no
+GPU, no fit, no download, so it answers before `uv sync` has a CUDA device
+to talk to and before the rest of a 90 GB dataset has finished arriving.
+
+```
+$ python fit_spiral.py --dataset ./spiral_datasets/phercparis4 --check
+dataset: /data/spiral_datasets/phercparis4
+spiral-scroll.json: PHercParis4, 9.6 um, outward CW, lasagna group 4 at scale 4
+
+inputs (dense_spacing_mode=winding_model):
+  required  umbilicus                 present  umbilicus.json
+  optional  fibers                    MISSING  fibers
+  off       tracks_dbm                off      tracks/2um_ds2_ps256_surf_v2.dbm
+  required  normal_x                  present  lasagna_inputs/las_008_nx.ome.zarr.respool_g4_pair
+  ...
+
+This dataset can start a fit.
+```
+
+Each row names the path the fit will actually open, so a Lasagna input
+shows its resident-pool sidecar rather than the OME-Zarr store it was
+packed from. `required` / `optional` / `off` come from the same catalog
+predicates the fitter uses, so `FIT_SPIRAL_CONFIG_OVERRIDES` changes the
+report: `dense_spacing_mode=grad_mag` makes `gradient_magnitude` required
+and turns `winding_inference` off, and `input_use_tracks=true` brings the
+tracks DBM back.
+
+With no `spiral-scroll.json` in the dataset root the check prints one to
+paste, with every value it can read off the dataset already filled in --
+including `normal_zarr_group`, taken from the packed sidecar's own
+directory name. `voxel_size_um` and `spiral_outward_sense` are left as
+`<...>` placeholders: nothing in a published dataset records them, and a
+specification still carrying one is refused rather than guessed at.
+
+`--check` also applies the Lasagna geometry checks that otherwise wait
+until a CUDA device is up, so a `lasagna_scale` that puts the fitted
+z-range outside the store is reported here instead of as
+`RuntimeError: lasagna z-ROI [...] is empty` several minutes in.
+
 ## Scroll specification (spiral-scroll.json)
 
 `fit_spiral.py` requires a `spiral-scroll.json` file in the dataset root.
@@ -99,6 +142,12 @@ This is not covered by scrollprize.org/tutorial_spiral. Required keys:
 
 Optional `paths` object for per-input overrides when a dataset's file names
 don't match the catalog's conventional defaults (e.g. `tracks_dbm`).
+
+The Lasagna entries name the OME-Zarr stores, but a fit reads the
+`pack_resident_pools.py` sidecar beside each one, so a dataset published
+with its pools already packed -- which is what
+`dl.ash2txt.org/datasets/spiral_datasets/PHercParis4/` ships -- does not
+need the stores themselves. `--check` names whichever of the two it found.
 
 Also optional, and easy to get wrong silently: `normal_zarr_group`
 (default `"4"`) and `lasagna_scale` (default `4`) select which OME-Zarr

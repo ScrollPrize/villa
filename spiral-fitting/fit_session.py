@@ -603,6 +603,33 @@ def lasagna_sidecar_ready(store_path: str | os.PathLike[str],
     return sidecar if metadata.is_file() else ""
 
 
+def lasagna_sidecar_group(sidecar_path: str | os.PathLike[str]) -> str:
+    """The OME-Zarr group a sidecar directory name records, or ""."""
+    name = Path(str(sidecar_path)).name
+    _, marker, tail = name.partition(LASAGNA_SIDECAR_INFIX)
+    if not marker:
+        return ""
+    return tail[: -len("_pair")] if tail.endswith("_pair") else tail
+
+
+def packed_lasagna_group(store_path: str | os.PathLike[str]) -> str:
+    """The group of the one packed sidecar beside a store, or "".
+
+    Empty when nothing is packed and when several groups are, so a caller
+    reporting a discovered value never has to choose between them.
+    """
+    if not str(store_path or "").strip():
+        return ""
+    store = Path(str(store_path))
+    groups = {
+        lasagna_sidecar_group(entry)
+        for entry in store.parent.glob(f"{store.name}{LASAGNA_SIDECAR_INFIX}*")
+        if (entry / LASAGNA_SIDECAR_METADATA).is_file()
+    }
+    groups.discard("")
+    return groups.pop() if len(groups) == 1 else ""
+
+
 # Input keys whose paths may depart from the directory conventions. Values in
 # the spec file are resolved relative to the dataset root; conventional paths
 # need no entry at all. PCL collections are per-role request entries, not
@@ -1120,6 +1147,18 @@ def default_user_cache_dir() -> str:
     return _normalise_path(base / "vc3d" / "spiral")
 
 
+def dataset_input_candidate(
+        dataset_root: str | os.PathLike[str],
+        scroll: ScrollSpec | None, key: str) -> Path | None:
+    """Where one catalog input lives under a dataset root, spec overrides
+    first and the directory convention otherwise."""
+    override = scroll.path_override(key) if scroll is not None else ""
+    if override:
+        return Path(override)
+    relative = _CONVENTIONAL_INPUT_RELATIVES.get(key)
+    return Path(dataset_root) / relative if relative else None
+
+
 def resolve_dataset_root(
     root_value: str | os.PathLike[str],
 ) -> SpiralDatasetResolution:
@@ -1142,11 +1181,7 @@ def resolve_dataset_root(
         result.scroll_spec = spec.manifest()
 
     def conventional_or_override(key: str) -> Path | None:
-        override = spec.path_override(key) if spec is not None else ""
-        if override:
-            return Path(override)
-        relative = _CONVENTIONAL_INPUT_RELATIVES.get(key)
-        return root / relative if relative else None
+        return dataset_input_candidate(root, spec, key)
 
     group = spec.normal_zarr_group if spec is not None \
         else DEFAULT_NORMAL_ZARR_GROUP
@@ -1228,7 +1263,7 @@ def _validate_json_file(path: Path, label: str, errors: list[dict[str, str]]) ->
 def validate_session_request(
     paths: SpiralInputPaths,
     run: SpiralRunConfig,
-    scroll: "ScrollSpec | None" = None,
+    scroll: ScrollSpec | None = None,
 ) -> list[dict[str, str]]:
     """Perform cheap, aggregate validation before any GPU allocation.
 
@@ -1361,6 +1396,273 @@ def validate_session_request(
         except (OSError, ValueError) as exc:
             errors.append({"field": "checkpoint", "message": str(exc)})
     return errors
+
+
+# ---------------------------------------------------------------------------
+# Dataset preflight
+# ---------------------------------------------------------------------------
+#
+# What a headless fit will look for, answered from the dataset alone and
+# without a GPU, so a download can be checked before a fit is started.
+
+PREFLIGHT_REQUIRED = "required"
+PREFLIGHT_OPTIONAL = "optional"
+PREFLIGHT_DISABLED = "off"
+
+SCROLL_SPEC_UNDERIVABLE = {
+    "voxel_size_um": "the scan's voxel size in micrometres",
+    "spiral_outward_sense": "CW or ACW, read off the CT data in VC3D",
+}
+
+
+@dataclass(frozen=True)
+class PreflightInput:
+    """One catalog input's standing for a given fit configuration."""
+
+    key: str
+    requirement: str
+    present: bool
+    path: str
+    note: str = ""
+    # The note names a condition the fit raises on, not one it warns about.
+    blocks: bool = False
+
+    def manifest(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class DatasetPreflight:
+    """Whether one dataset root can start a fit, and what is missing."""
+
+    root: str
+    scroll_spec: dict[str, Any] | None
+    scroll_spec_problem: str
+    scroll_spec_template: dict[str, Any] | None
+    inputs: tuple[PreflightInput, ...]
+    dense_spacing_mode: str
+
+    @property
+    def missing(self) -> tuple[str, ...]:
+        return tuple(item.key for item in self.inputs
+                     if item.requirement == PREFLIGHT_REQUIRED
+                     and not item.present)
+
+    @property
+    def problems(self) -> tuple[str, ...]:
+        return tuple(f"{item.key}: {item.note}"
+                     for item in self.inputs if item.blocks)
+
+    @property
+    def ok(self) -> bool:
+        return (self.scroll_spec is not None and not self.missing
+                and not self.problems)
+
+    def manifest(self) -> dict[str, Any]:
+        return {
+            "root": self.root,
+            "ok": self.ok,
+            "scroll_spec": self.scroll_spec,
+            "scroll_spec_problem": self.scroll_spec_problem,
+            "scroll_spec_template": self.scroll_spec_template,
+            "dense_spacing_mode": self.dense_spacing_mode,
+            "inputs": [item.manifest() for item in self.inputs],
+            "missing": list(self.missing),
+            "problems": list(self.problems),
+        }
+
+    def _display(self, path: str) -> str:
+        if not path:
+            return "-"
+        try:
+            return str(Path(path).relative_to(self.root))
+        except ValueError:
+            return path
+
+    def report(self) -> str:
+        lines = [f"dataset: {self.root}"]
+        if self.scroll_spec is None:
+            lines.append(f"{SCROLL_SPEC_FILENAME}: {self.scroll_spec_problem}")
+            if self.scroll_spec_template is not None:
+                lines.append("")
+                lines.append(
+                    f"  Write this to {Path(self.root) / SCROLL_SPEC_FILENAME} "
+                    "and replace every <...> value;")
+                lines.append(
+                    "  no automated method derives them from the dataset.")
+                lines.append("")
+                document = json.dumps(self.scroll_spec_template, indent=2)
+                lines.extend(f"  {line}" for line in document.splitlines())
+        else:
+            lines.append(
+                f"{SCROLL_SPEC_FILENAME}: {self.scroll_spec['name']}, "
+                f"{self.scroll_spec['voxel_size_um']} um, "
+                f"outward {self.scroll_spec['spiral_outward_sense']}, "
+                f"lasagna group {self.scroll_spec['normal_zarr_group']} "
+                f"at scale {self.scroll_spec['lasagna_scale']}")
+        lines.append("")
+        lines.append(
+            f"inputs (dense_spacing_mode={self.dense_spacing_mode}):")
+        width = max((len(item.key) for item in self.inputs), default=0)
+        for item in self.inputs:
+            if item.requirement == PREFLIGHT_DISABLED:
+                standing = "off"
+            else:
+                standing = "present" if item.present else "MISSING"
+            lines.append(
+                f"  {item.requirement:<8}  {item.key:<{width}}  "
+                f"{standing:<7}  {self._display(item.path)}"
+                + (f"  [{item.note}]" if item.note else ""))
+        lines.append("")
+        if self.ok:
+            lines.append("This dataset can start a fit.")
+        else:
+            lines.append("This dataset cannot start a fit.")
+            if self.scroll_spec is None:
+                lines.append(f"  no {SCROLL_SPEC_FILENAME}")
+            if self.missing:
+                lines.append(
+                    f"  missing required inputs: {', '.join(self.missing)}")
+            lines.extend(f"  {problem}" for problem in self.problems)
+        return "\n".join(lines)
+
+
+def _sidecar_notes(sidecar: str, channels: Iterable[str], group: str,
+                   config: Mapping[str, Any], lasagna_scale: int) -> str:
+    """Reproduce the checks prepare_lasagna_volume makes after CUDA is up."""
+    try:
+        with (Path(sidecar) / LASAGNA_SIDECAR_METADATA).open(
+                "r", encoding="utf-8") as stream:
+            metadata = json.load(stream)
+        shape = [int(value) for value in metadata["array_shape"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        return "unreadable sidecar metadata", True
+    notes = []
+    blocking = []
+    expected = [f"{Path(name).name}/{group}" for name in channels]
+    if len(expected) > 1 and metadata.get("channel_names") != expected:
+        notes.append(
+            f"sidecar channels {metadata.get('channel_names')} are not "
+            f"the configured {expected}")
+    z_begin = int(config.get("z_begin", 0))
+    z_end = int(config.get("z_end", 0))
+    z_lo = max(0, z_begin // lasagna_scale)
+    z_hi = min(shape[0], -(-z_end // lasagna_scale))
+    if z_hi <= z_lo:
+        blocking.append(
+            f"z-ROI [{z_lo}, {z_hi}) is empty against store z size "
+            f"{shape[0]}: check lasagna_scale={lasagna_scale}")
+    notes.extend(blocking)
+    return "; ".join(notes), bool(blocking)
+
+
+def preflight_dataset(
+    dataset_root: str | os.PathLike[str],
+    config: Mapping[str, Any],
+    *,
+    spec_path: str | os.PathLike[str] | None = None,
+) -> DatasetPreflight:
+    """Report what a fit of this configuration needs from this dataset.
+
+    Torch-free and read-only: every answer comes from the dataset's own
+    directory entries and the resident-pool metadata beside them.
+    """
+    root = Path(_normalise_path(dataset_root))
+    scroll: ScrollSpec | None = None
+    problem = ""
+    template: dict[str, Any] | None = None
+    try:
+        scroll = load_scroll_spec(root, spec_path)
+    except ScrollSpecError as exc:
+        problem = str(exc)
+        template = suggested_scroll_spec(root)
+
+    group = scroll.normal_zarr_group if scroll is not None else (
+        (template or {}).get("normal_zarr_group") or DEFAULT_NORMAL_ZARR_GROUP)
+    lasagna_scale = scroll.lasagna_scale if scroll is not None \
+        else DEFAULT_LASAGNA_SCALE
+
+    inputs: list[PreflightInput] = []
+    for spec in FIT_INPUT_CATALOG:
+        if spec.kind == "pcl-set":
+            for role, relative in PCL_ROLE_CONVENTIONS:
+                enabled = pcl_input_enabled(config, role)
+                candidate = root / relative
+                inputs.append(PreflightInput(
+                    key=f"pcl:{role.value}",
+                    requirement=(PREFLIGHT_OPTIONAL if enabled
+                                 else PREFLIGHT_DISABLED),
+                    present=candidate.is_file(),
+                    path=str(candidate),
+                    note="" if enabled else pcl_role_toggle_key(role)))
+            continue
+        enabled = spec.enabled(config)
+        required = enabled and spec.required(config)
+        requirement = (PREFLIGHT_REQUIRED if required else
+                       PREFLIGHT_OPTIONAL if enabled else PREFLIGHT_DISABLED)
+        candidate = dataset_input_candidate(root, scroll, spec.key)
+        note, blocks = "", False
+        if spec.kind == "dbm":
+            resolved = resolve_logical_dbm(candidate) if candidate else ""
+            present, path = bool(resolved), resolved or str(candidate or "")
+        elif candidate is None:
+            present, path = False, ""
+        elif spec.kind == "file":
+            present, path = candidate.is_file(), str(candidate)
+        else:
+            present, path = candidate.is_dir(), str(candidate)
+        if not present and spec.sidecar_store:
+            store = dataset_input_candidate(root, scroll, spec.sidecar_store)
+            sidecar = lasagna_sidecar_ready(store, group,
+                                            pair=spec.sidecar_pair)
+            if sidecar:
+                channels = [str(store)]
+                if spec.sidecar_pair:
+                    channels.append(str(dataset_input_candidate(
+                        root, scroll, "normal_y")))
+                present, path = True, sidecar
+                note, blocks = _sidecar_notes(sidecar, channels, group,
+                                              config, lasagna_scale)
+        inputs.append(PreflightInput(
+            key=spec.key, requirement=requirement, present=present,
+            path=path, note=note, blocks=blocks))
+
+    return DatasetPreflight(
+        root=str(root),
+        scroll_spec=scroll.manifest() if scroll is not None else None,
+        scroll_spec_problem=problem,
+        scroll_spec_template=template,
+        inputs=tuple(inputs),
+        dense_spacing_mode=str(_dense_spacing_mode(config)))
+
+
+def suggested_scroll_spec(
+        dataset_root: str | os.PathLike[str]) -> dict[str, Any]:
+    """A spiral-scroll.json skeleton with every derivable value filled in.
+
+    The two values nothing in a published dataset records are left as
+    <...> placeholders, which parse_scroll_spec then refuses rather than
+    accepting a guess.
+    """
+    root = Path(_normalise_path(dataset_root))
+    document: dict[str, Any] = {
+        "schema_version": SCROLL_SPEC_SCHEMA_VERSION,
+        "name": root.name,
+        "voxel_size_um": f"<{SCROLL_SPEC_UNDERIVABLE['voxel_size_um']}>",
+        "spiral_outward_sense":
+            f"<{SCROLL_SPEC_UNDERIVABLE['spiral_outward_sense']}>",
+    }
+    group = packed_lasagna_group(
+        dataset_input_candidate(root, None, "normal_x"))
+    if group:
+        document["normal_zarr_group"] = group
+    conventional = dataset_input_candidate(root, None, "tracks_dbm")
+    if conventional is not None and not resolve_logical_dbm(conventional):
+        candidates = _dbm_candidates(root)
+        if len(candidates) == 1:
+            document["paths"] = {
+                "tracks_dbm": os.path.relpath(candidates[0], root)}
+    return document
 
 
 def parse_session_request(value: Mapping[str, Any]) -> tuple[SpiralInputPaths, SpiralRunConfig, SpiralPreviewConfig]:
