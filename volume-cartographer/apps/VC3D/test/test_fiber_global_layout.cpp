@@ -1336,12 +1336,15 @@ private slots:
         QVERIFY(!(vc3d::fiber_map::digestGlobalResult(lone) ==
                   vc3d::fiber_map::digestGlobalResult(untagged)));
 
-        // Two consecutive breaks: exactly one gap run, bounded by controls 1
-        // and 2. The layout's own geometry is unchanged by the tag: the runs
-        // are re-partitioned, but the set of drawn/seeded segments is the
-        // same, so the gap heat map (which seeds from run.points) sees no
-        // difference. Still no geometry recomputation.
+        // A gap span (the span descriptor carries the gap tag; the map reads
+        // the span flag, not the pair of rings): exactly one gap run, bounded
+        // by controls 1 and 2. The layout's own geometry is unchanged by the
+        // tag: the runs are re-partitioned, but the set of drawn/seeded
+        // segments is the same, so the gap heat map (which seeds from
+        // run.points) sees no difference. Still no geometry recomputation.
         fibers.front().breaks[2] = true;
+        fibers.front().gapSegments.assign(controlCount - 1, false);
+        fibers.front().gapSegments[1] = true;
         const GlobalResult gapped =
             vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
         const GlobalPlacedFiber* placed = findFiber(gapped, taggedId);
@@ -1415,6 +1418,7 @@ private slots:
 
         // A mismatched flag vector is ignored, not read misaligned.
         fibers.front().breaks.pop_back();
+        fibers.front().gapSegments.pop_back();
         const GlobalResult mismatched =
             vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
         const GlobalPlacedFiber* ignored = findFiber(mismatched, taggedId);

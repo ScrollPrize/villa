@@ -91,3 +91,23 @@ def test_control_point_tags_must_be_a_list_of_strings():
     doc['control_points'][1]['break'] = True
     with pytest.raises(ValueError):
         parse_vc3d_fiber_format(doc)
+
+
+def test_version_4_span_tags():
+    """Version 4 adds optional span tags (VC3D writes ["gap"] on a span between
+    two break points); a version-3 span may not carry them."""
+    doc = _v3_fiber()
+    doc['version'] = 4
+    doc['control_points'][1]['segment_to_next']['tags'] = ['gap']
+    parsed = parse_vc3d_fiber_format(doc)
+    assert parsed.version == 4
+    assert parsed.control_point_segments[1].tags == ('gap',)
+    assert parsed.control_point_segments[0].tags == ()
+    v3 = copy.deepcopy(doc)
+    v3['version'] = 3
+    with pytest.raises(ValueError):
+        parse_vc3d_fiber_format(v3)
+    bad = copy.deepcopy(doc)
+    bad['control_points'][1]['segment_to_next']['tags'] = 'gap'
+    with pytest.raises(ValueError):
+        parse_vc3d_fiber_format(bad)

@@ -115,12 +115,20 @@ _CONFIG_KEYS_COMMON = {
 _CONFIG_KEYS_V3 = _CONFIG_KEYS_COMMON | {'meeting_accept_max_error_ratio'}
 
 
-def _valid_segment(segment):
+def _valid_segment(segment, version=3):
+    """version: the document's vc3d_fiber version; version 4 allows an
+    optional span `tags` list of strings (e.g. 'gap')."""
     if not isinstance(segment, dict):
         return False
     if (segment.get('metadata_version'), segment.get('tracer_version')) != (3, 2):
         return False
-    if (set(segment) != _SEGMENT_KEYS_V3 or
+    keys = set(segment)
+    if version >= 4 and 'tags' in keys:
+        if not (isinstance(segment['tags'], list) and
+                all(isinstance(t, str) for t in segment['tags'])):
+            return False
+        keys.discard('tags')
+    if (keys != _SEGMENT_KEYS_V3 or
             segment.get('optimizer') != 'native_fiber_trace3d' or
             not isinstance(segment.get('normal_manifest'), str) or
             not isinstance(segment.get('fiber_manifest'), str)):
@@ -192,9 +200,10 @@ def is_fiber_doc(doc):
     if not (isinstance(doc, dict) and doc.get('type') == 'vc3d_fiber'):
         return False
     version = doc.get('version', 1)
-    if version not in (1, 3):
+    # Version 4 = version 3 plus optional span tags; one lineage for merging.
+    if version not in (1, 3, 4):
         return False
-    if version == 3 and 'optimization_mode' not in doc:
+    if version >= 3 and 'optimization_mode' not in doc:
         return False
     if 'optimization_mode' in doc:
         mode = doc['optimization_mode']
@@ -226,7 +235,8 @@ def is_fiber_doc(doc):
             if index + 1 == len(control_points):
                 if 'segment_to_next' in cp:
                     return False
-            elif 'segment_to_next' not in cp or not _valid_segment(segment):
+            elif ('segment_to_next' not in cp or
+                  not _valid_segment(segment, version)):
                 return False
     tags = doc.get('tags', [])
     if not (isinstance(tags, list) and
@@ -234,7 +244,7 @@ def is_fiber_doc(doc):
         return False  # tags: null is unloadable ("tags must be an array")
     generation = doc.get('generation', 1)
     if generation is not None:
-        if version == 3:
+        if version >= 3:
             if (isinstance(generation, bool) or
                     not isinstance(generation, int) or generation < 0):
                 return False
@@ -880,7 +890,7 @@ def _has_trace_span(doc):
     """True when any span's stored geometry was produced by the prediction
     tracer (v3 interp_mode == 'trace'). Consumed by
     fiber_strip_stale_review_tags.py."""
-    if doc.get('version', 1) != 3:
+    if doc.get('version', 1) not in (3, 4):
         return False
     control_points = doc.get('control_points') or []
     for cp in control_points[:-1]:
@@ -1021,6 +1031,11 @@ def merge_fibers(base, local, remote):
             return result
     for field in ('type', 'version', 'filename'):
         values = {str(doc.get(field)) for doc in (base, local, remote)}
+        if field == 'version' and values <= {'3', '4'}:
+            # Versions 3 and 4 share the span structure (4 adds optional
+            # span tags): a v3 base with a v4 side is the normal state right
+            # after a VC3D upgrade, not a conflict. The merge writes 4.
+            continue
         if len(values) > 1:
             result['conflicts'].append(
                 f"'{field}' differs between versions: {sorted(values)}")
@@ -1100,7 +1115,7 @@ def merge_fibers(base, local, remote):
     reoptimize = False
     span_owners = None
 
-    if base.get('version', 1) == 3:
+    if base.get('version', 1) >= 3:
         span_geometry, span_conflicts = merge_v3_span_geometry(
             base, local, remote)
         if span_conflicts:
@@ -1208,8 +1223,12 @@ def merge_fibers(base, local, remote):
     merged = copy.deepcopy(newer)
     merged['control_points'] = copy.deepcopy(carrier['control_points'])
     merged['line_points'] = copy.deepcopy(carrier['line_points'])
-    if base.get('version', 1) == 3:
+    if base.get('version', 1) >= 3:
         merged['optimization_mode'] = mode
+        # Any version-4 side makes the merge version 4 (a v4 side may carry
+        # span tags the loader only accepts under version 4).
+        merged['version'] = max(int(doc.get('version', 1))
+                                for doc in (base, local, remote))
     if 'hv_classification' in carrier:
         merged['hv_classification'] = copy.deepcopy(carrier['hv_classification'])
     elif not geometry_same and 'hv_classification' in merged:

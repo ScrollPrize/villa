@@ -72,11 +72,14 @@ struct InputFiber {
     // the cached detection, so it is not part of the cache keys; empty or
     // mismatched means no tags.
     std::vector<bool> kollesisTerminations;
-    // Per control point: tagged break. Display only (the gap span between two
-    // consecutive flags draws dotted amber, the points get a dotted rim);
-    // read when the placed fiber's runs are built from the fresh input, so
-    // not part of the cache keys either. Empty or mismatched means no tags.
+    // Per control point: tagged break (the points get a dotted rim). Display
+    // only; read when the placed fiber is built from the fresh input, so not
+    // part of the cache keys. Empty or mismatched means no tags.
     std::vector<bool> breaks;
+    // Per control-point span: the span descriptor carries the gap span tag
+    // (drawn as a dotted amber run). Display only, same rules; empty or
+    // mismatched means no gaps.
+    std::vector<bool> gapSegments;
     // Raw directed refs; the layout dedupes reciprocal pairs.
     std::vector<InputLink> links;
 };

@@ -329,6 +329,8 @@ QString spanAlignmentMetricText(
     QString firstLine(QChar(metric.modeMarker));
     if (!value.isEmpty())
         firstLine += QStringLiteral(" ") + value;
+    if (metric.gap)
+        firstLine += QObject::tr(" gap");
     if (!metric.message.empty())
         return firstLine + QStringLiteral("\n") + QString::fromStdString(metric.message);
     return firstLine;

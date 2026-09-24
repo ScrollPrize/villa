@@ -1792,26 +1792,81 @@ def test_is_fiber_doc_accepts_the_break_tag():
     assert loader_issues({'dj_x_000001.json': doc}) == []
 
 
-def test_v3_gap_span_tags_and_goal_survive_a_separated_remote_span_change():
-    """VC3D writes a gap as two consecutive break tags plus the cubic-spline
-    goal on the span between them; all three live in the same span run, so a
-    change elsewhere merges and the gap arrives intact."""
+def make_v4_gap(doc, first):
+    """What VC3D writes for a gap between controls first and first+1: both
+    break tags, the span's 'gap' tag and the cubic-spline goal, under format
+    version 4."""
+    doc['version'] = 4
+    doc['control_points'][first]['tags'] = ['break']
+    doc['control_points'][first + 1]['tags'] = ['break']
+    set_v3_span(doc, first, goal='cspline', bend=0.0)
+    doc['control_points'][first]['segment_to_next']['tags'] = ['gap']
+
+
+def test_is_fiber_doc_version_4_span_tags():
+    """Version 4 = version 3 plus optional span tags; a version-3 span may not
+    carry them, and the tags must be a list of strings."""
+    doc = make_v3_fiber(BASE_CPS)
+    make_v4_gap(doc, 1)
+    assert fiber_merge.is_fiber_doc(doc)
+    assert fiber_merge._has_trace_span(doc)
+    v3 = copy.deepcopy(doc)
+    v3['version'] = 3
+    assert not fiber_merge.is_fiber_doc(v3)
+    bad = copy.deepcopy(doc)
+    bad['control_points'][1]['segment_to_next']['tags'] = 'gap'
+    assert not fiber_merge.is_fiber_doc(bad)
+    bad = copy.deepcopy(doc)
+    bad['control_points'][1]['segment_to_next']['tags'] = [1]
+    assert not fiber_merge.is_fiber_doc(bad)
+    bad = copy.deepcopy(doc)
+    bad['control_points'][1]['segment_to_next']['gap'] = True     # unknown field
+    assert not fiber_merge.is_fiber_doc(bad)
+
+
+def test_v4_gap_span_survives_a_separated_remote_span_change():
+    """A gap is two consecutive break tags, the span's own 'gap' tag and the
+    cubic-spline goal; all live in the same span run, so a change elsewhere
+    merges and the gap arrives intact. A v3 base with v4 sides (the normal
+    state right after an upgrade) is not a version conflict; the merge is
+    written as version 4."""
     base = make_v3_fiber(BASE_CPS)
     local = copy.deepcopy(base)
     remote = copy.deepcopy(base)
     local['generation'] = 2
     remote['generation'] = 3
-    local['control_points'][1]['tags'] = ['break']
-    local['control_points'][2]['tags'] = ['break']
-    set_v3_span(local, 1, goal='cspline', bend=0.0)
+    make_v4_gap(local, 1)
+    remote['version'] = 4
     set_v3_span(remote, 5, goal='lasagna', bend=-2.0)
 
     result = merge_fibers(base, local, remote)
 
     assert result['ok'], result['conflicts']
     merged = result['merged']
+    assert merged['version'] == 4
     assert merged['control_points'][1]['tags'] == ['break']
     assert merged['control_points'][2]['tags'] == ['break']
     assert merged['control_points'][1]['segment_to_next']['interp_goal'] == 'cspline'
+    assert merged['control_points'][1]['segment_to_next']['tags'] == ['gap']
     assert merged['control_points'][5]['segment_to_next']['interp_goal'] == 'lasagna'
+    assert 'tags' not in merged['control_points'][5]['segment_to_next']
     assert loader_issues({'dj_x_000001.json': merged}) == []
+
+
+def test_v3_remote_still_merges_with_a_v4_local():
+    """One side still on the old build: its version-3 file merges against
+    the v4 side; the result is version 4."""
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['generation'] = 2
+    remote['generation'] = 3
+    local['version'] = 4
+    set_v3_span(local, 1, goal='cspline', bend=1.5)
+    set_v3_span(remote, 5, goal='lasagna', bend=-2.0)
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    assert result['merged']['version'] == 4
+    assert loader_issues({'dj_x_000001.json': result['merged']}) == []

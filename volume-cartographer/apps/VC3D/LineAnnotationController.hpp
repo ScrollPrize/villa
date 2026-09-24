@@ -177,10 +177,12 @@ public:
         // Per control point: carries the kollesis_termination tag. Same size
         // as controlPoints.
         std::vector<bool> kollesisTerminations;
-        // Per control point: carries the break tag. Same size as
-        // controlPoints. Two consecutive flags make the span between them a
-        // gap span (dotted amber in the map).
+        // Per control point: carries the break tag (dotted rim in the map).
+        // Same size as controlPoints.
         std::vector<bool> breaks;
+        // Per control-point span: the span descriptor carries the gap span
+        // tag (dotted amber run in the map). Size max(0, controlPoints - 1).
+        std::vector<bool> gapSegments;
         // Branch links resolving to a loaded fiber, pending included.
         std::vector<FiberMapLink> links;
     };
@@ -585,6 +587,10 @@ private:
         bool adjacentBranchesPresent = true;
         // healOneSidedAdjacentLinks marked this record for saving.
         bool adjacentHealed = false;
+        // Load put the gap span tags in step with the break point tags (a
+        // version-3 file, or one edited by hand); saved back under the same
+        // stale-file guard as the adjacent heal.
+        bool gapHealed = false;
     };
 
     struct StoredFiberSessionSnapshot {

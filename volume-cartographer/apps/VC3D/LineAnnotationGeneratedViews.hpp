@@ -61,9 +61,13 @@ struct GeneratedOverlay {
         // Tagged kollesis_termination: hollow yellow ring. A linked tagged
         // point keeps the link-state fill inside the yellow ring.
         bool isKollesisTermination = false;
-        // Tagged break: dotted amber ring. Two consecutive tagged points make
-        // the span between them a gap span (see GeneratedOverlay::gapLineRanges).
+        // Tagged break: dotted amber ring.
         bool isBreak = false;
+        // The span this point owns (to the next control in line order)
+        // carries the gap span tag: drawn as the dotted amber line, closed
+        // to placement. Read from the span descriptor, never inferred from
+        // two break rings, so what is drawn is what the file says.
+        bool hasGapToNext = false;
         bool hasBranches = false;
         bool hasPendingLinks = false;
         // Same-orientation links (H-H / V-V) render in the orange warning
@@ -142,12 +146,11 @@ struct GeneratedOverlay {
     // a subset of the controls sets the full fiber's range here so interior
     // spans are not mistaken for tails.
     std::optional<std::pair<double, double>> lineTailControlRange;
-    // Line-position ranges [first, second] of the fiber's gap spans: both
-    // endpoint controls carry the break tag. Drawn as a dotted amber line in
-    // place of the fiber's own line. Computed by the overlay builders from the
-    // FULL control list (generatedGapLineRanges) before any visibility
-    // filtering, so a hidden endpoint or a hidden interior control cannot
-    // make two visible break markers read as a gap.
+    // Line-position ranges [first, second] of the fiber's gap spans: the
+    // owner control's span descriptor carries the gap tag. Drawn as a dotted
+    // amber line in place of the fiber's own line. Computed by the overlay
+    // builders from the FULL control list (generatedGapLineRanges) before any
+    // visibility filtering, so a hidden neighbour cannot move a range's end.
     std::vector<std::pair<double, double>> gapLineRanges;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
@@ -199,6 +202,9 @@ struct GeneratedSpanAlignmentMetric {
     std::string failureDetail;
     char modeMarker = 'L';
     std::string message;
+    // The span carries the gap span tag (shown in the label so the metadata
+    // can be read as text, not only as the dotted amber line).
+    bool gap = false;
 };
 
 // Positions cross from the stored fiber grid to the viewer grid together;
@@ -1356,10 +1362,12 @@ inline bool generatedLinePositionBeyondKollesisTermination(
     const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
     double linePosition);
 
-// The gap spans of a fiber as line-position ranges: consecutive controls (by
-// line position; controls are in line order) that both carry the break tag.
-// Must be given the complete control list. Inline: this header is compiled
-// into QtCore-only tests without the .cpp.
+// The gap spans of a fiber as line-position ranges: a control whose span
+// descriptor carries the gap tag (hasGapToNext) spans to the next control in
+// line position order. Read from the span tag, not from the break rings, so
+// the drawn line reports the file's span metadata. Must be given the complete
+// control list. Inline: this header is compiled into QtCore-only tests
+// without the .cpp.
 inline std::vector<std::pair<double, double>> generatedGapLineRanges(
     const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints)
 {
@@ -1375,7 +1383,7 @@ inline std::vector<std::pair<double, double>> generatedGapLineRanges(
     });
     std::vector<std::pair<double, double>> ranges;
     for (size_t i = 1; i < sorted.size(); ++i) {
-        if (sorted[i - 1]->isBreak && sorted[i]->isBreak &&
+        if (sorted[i - 1]->hasGapToNext &&
             sorted[i - 1]->linePosition < sorted[i]->linePosition) {
             ranges.emplace_back(sorted[i - 1]->linePosition, sorted[i]->linePosition);
         }

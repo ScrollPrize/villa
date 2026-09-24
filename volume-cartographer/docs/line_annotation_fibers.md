@@ -1,9 +1,19 @@
 # VC3D Line Annotation Fibers
 
-VC3D writes line annotations as `vc3d_fiber` JSON. Version 3 stores
-`control_points` as objects with a required `position`. Every non-final control
-point owns a required `segment_to_next` descriptor for its span to control point
-`i+1`; the final control point cannot contain `segment_to_next`. A control point
+VC3D writes line annotations as `vc3d_fiber` JSON, currently **version 4**.
+Version 3 stores `control_points` as objects with a required `position`. Every
+non-final control point owns a required `segment_to_next` descriptor for its
+span to control point `i+1`; the final control point cannot contain
+`segment_to_next`. Version 4 is version 3 plus an optional `tags` array of
+strings on each span descriptor, written only when non-empty, so a span
+without tags serializes exactly as in version 3. A version-3 span carrying
+`tags` is rejected, so the version is a true signal of what a file may
+contain. Every loader (the core strict loader, VC3D, the python format
+package, `fiber_merge`) accepts versions 1, 3 and 4; VC3D and the lasagna
+line probe write 4. The merge tool treats 3 and 4 as one lineage (a v3 base
+with v4 sides is the normal state after an upgrade, not a conflict) and
+writes the merge as version 4 when any side is 4. Builds older than version 4
+refuse to load a version-4 file. A control point
 may also carry an optional `tags` array of strings, written only when non-empty;
 the one tag today is `kollesis_termination`, set from the control point's
 Ctrl+right-click menu ("Kollesis termination", a toggle) to mark where the fiber
@@ -30,24 +40,40 @@ The second control-point tag is `break`, set from the same Ctrl+right-click
 menu ("Break", a toggle), on any control point: the point sits at the edge of
 a break in the papyrus. A point carries `kollesis_termination` or `break`,
 never both: the menu disables adding the second (removing either is always
-possible), the handlers refuse it, and a click that would collapse a break
-point with a termination is refused rather than dropping a tag. Two
-consecutive break points make the span between them a gap span. A gap span
-is closed to placement: the click, the `/` and `0` keys and the
-current-position marker treat any line position strictly inside it as
-blocked (red marker) until one of the breaks is removed. When a toggle forms
-a gap span, that span's `interp_goal` becomes `cspline` and the span is
-re-solved through the same path as the menu's "Interpolation goal", so the
-line bridges the break as a spline instead of a trace hunting for fiber
-signal across it; when a toggle dissolves a gap span whose goal is still
-`cspline`, the goal returns to `global` (any other goal is left alone). The
-tag itself is saved on its own first, like the kollesis tag; the goal change
-follows with that path's rollback. Three or more consecutive break points
-make consecutive gap spans; a lone break point is only a marker. Gaps are
-derived from the tags at draw time and never stored: inserting, deleting,
-splitting, merging or reversing points changes the gaps exactly as it changes
-which tagged points are neighbours, and the goals set by a toggle stay with
-their spans as any goal does.
+possible), the handlers refuse it, also when another pane of the same fiber
+has the other tag on that point, and a click that would collapse a break
+point with a termination is refused rather than dropping a tag.
+
+Two consecutive break points (neighbours in line-position order) make the
+span between them a **gap span**, and VC3D records that on the span itself:
+the span's `segment_to_next.tags` carries `gap` (the one span tag today). A
+reader of the file learns the gap from the span alone, without inferring it
+from neighbouring points, and everything in VC3D that shows or enforces a gap
+reads the span tag: the dotted amber line, the placement block, the goal
+change and the Fiber Map runs. Only the dotted rings read the point tags. VC3D
+keeps the two in step: the span tags are recomputed from the break tags after
+the toggle, after every structural edit (click collapse, delete, solve
+landing, superseded-solve merge) and in every file it writes, and a loaded
+file whose span tags disagree with its break tags (a version-3 file, or a
+hand edit) is healed on load and saved back as version 4 under the same
+stale-file guard as the adjacent-link heal. Every pair of consecutive break
+points is therefore a gap; to keep a span between two breaks open, place
+another control point between them.
+
+A gap span is closed to placement: the click, the `/` and `0` keys and the
+current-position marker (cut views, strips, overview bar and the
+intersection-inspection panes) treat any line position strictly inside it as
+blocked (red marker) until one of the breaks is removed. When a gap span
+forms, its `interp_goal` becomes `cspline` and the span is re-solved (the
+toggle through the same path as the menu's "Interpolation goal", a structural
+edit within the solve it starts anyway), so the line bridges the break as a
+spline instead of a trace hunting for fiber signal across it; when a gap span
+dissolves while its goal is still `cspline`, the goal returns to `global`
+(any other goal is left alone). Span tags survive a re-solve like the goal
+does: the tracer rebuilds the descriptor and copies them back, and the
+lasagna line probe carries them through a re-optimization. The span label in
+the cut views appends "gap" to the mode marker so the span metadata can be
+read as text.
 
 Break points draw as a dotted ring in the break amber (255, 196, 0), one
 step larger than a filled point, in the cut and strip views, the overview
@@ -55,10 +81,11 @@ bar and the Fiber Map (a linked break keeps its link-state fill inside the
 ring). A gap span draws as a dotted amber line in place of the fiber's own
 line in the side cut, the strips and the overview bar; linked and nearby
 fibers keep their solid purple line. The Fiber Map draws every fiber's gap
-spans as dotted amber runs bounded exactly at the two control points, in
-place of the traced or interpolated style, and marks every break point with
-the dotted amber rim. The flag is display-only in the map: it does not
-change heat-map seeding, winding evidence or publishing.
+spans as dotted amber runs trimmed exactly to the two control points at draw
+time (the layout's own run geometry, which seeds the gap heat map, is
+unchanged), in place of the traced or interpolated style, and marks every
+break point with the dotted amber rim. The flag is display-only in the map:
+it does not change heat-map seeding, winding evidence or publishing.
 
 The top-level `optimization_mode` is either `lasagna` or
 `native_fiber_trace3d`. It is required in version 3; only legacy version-1

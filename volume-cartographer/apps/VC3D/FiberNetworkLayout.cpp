@@ -639,8 +639,8 @@ PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
     const std::size_t spanCount =
         fiber.controlPoints.empty() ? 0 : fiber.controlPoints.size() - 1;
     // The two per-span styles are normalised independently: missing or
-    // mismatched traced flags read as all traced (as before), missing break
-    // flags as no gaps. A gap span has both endpoints tagged break.
+    // mismatched traced flags read as all traced (as before), missing gap
+    // flags as no gaps.
     const bool haveTraced = spanCount > 0 && fiber.tracedSegments.size() == spanCount;
     std::vector<bool> traced(spanCount, true);
     if (haveTraced) {
@@ -648,9 +648,9 @@ PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
     }
     std::vector<bool> gap(spanCount, false);
     bool anyGap = false;
-    if (spanCount > 0 && fiber.breaks.size() == fiber.controlPoints.size()) {
+    if (spanCount > 0 && fiber.gapSegments.size() == spanCount) {
         for (std::size_t i = 0; i < spanCount; ++i) {
-            gap[i] = fiber.breaks[i] && fiber.breaks[i + 1];
+            gap[i] = fiber.gapSegments[i];
             anyGap = anyGap || gap[i];
         }
     }
@@ -2060,10 +2060,14 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
         for (const bool tagged : fiber.kollesisTerminations) {
             hashU64(digest, tagged ? 1 : 0);
         }
-        // Display-only, but it shapes the placed runs: same reasoning.
+        // Display-only, but they shape the placed fiber: same reasoning.
         hashU64(digest, fiber.breaks.size());
         for (const bool tagged : fiber.breaks) {
             hashU64(digest, tagged ? 1 : 0);
+        }
+        hashU64(digest, fiber.gapSegments.size());
+        for (const bool gapSpan : fiber.gapSegments) {
+            hashU64(digest, gapSpan ? 1 : 0);
         }
         hashU64(digest, fiber.links.size());
         for (const InputLink& link : fiber.links) {

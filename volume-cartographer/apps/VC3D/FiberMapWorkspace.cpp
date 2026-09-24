@@ -1467,6 +1467,7 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
             input.tracedSegments = std::move(fiber.tracedSegments);
             input.kollesisTerminations = std::move(fiber.kollesisTerminations);
             input.breaks = std::move(fiber.breaks);
+            input.gapSegments = std::move(fiber.gapSegments);
             input.links.reserve(fiber.links.size());
             for (const auto& link : fiber.links) {
                 input.links.push_back(

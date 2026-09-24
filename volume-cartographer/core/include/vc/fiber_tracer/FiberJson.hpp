@@ -35,19 +35,34 @@ inline void requireExactKeys(const nlohmann::json& value, const std::unordered_s
     }
 }
 
-inline void validateSegmentMetadata(const nlohmann::json& value)
+// fiberVersion: the file's vc3d_fiber version. Version 4 adds an optional
+// span `tags` array of strings (omitted when empty); a version-3 span carrying
+// it is an unknown field, so the version stays a true signal.
+inline void validateSegmentMetadata(const nlohmann::json& value, int fiberVersion = 3)
 {
     if (!value.is_object())
         throw std::runtime_error("segment_to_next must be an object");
-    requireExactKeys(
-        value,
-        {"optimizer", "metadata_version", "tracer_version",
-         "interp_goal", "interp_mode", "metric", "msg",
-         "normal_manifest", "fiber_manifest", "trace_to_base_scale",
-         "meeting_error_base_voxels", "meeting_error_ratio",
-         "meeting_source", "failure_code", "failure_detail",
-         "lasagna_failure_code", "lasagna_failure_detail", "config"},
-        "segment_to_next");
+    std::unordered_set<std::string> keys{
+        "optimizer", "metadata_version", "tracer_version",
+        "interp_goal", "interp_mode", "metric", "msg",
+        "normal_manifest", "fiber_manifest", "trace_to_base_scale",
+        "meeting_error_base_voxels", "meeting_error_ratio",
+        "meeting_source", "failure_code", "failure_detail",
+        "lasagna_failure_code", "lasagna_failure_detail", "config"};
+    const bool haveTags = fiberVersion >= 4 && value.contains("tags");
+    if (haveTags) {
+        keys.insert("tags");
+    }
+    requireExactKeys(value, keys, "segment_to_next");
+    if (haveTags) {
+        const auto& tags = value.at("tags");
+        if (!tags.is_array())
+            throw std::runtime_error("segment_to_next tags must be an array");
+        for (const auto& tag : tags) {
+            if (!tag.is_string())
+                throw std::runtime_error("segment_to_next tags entries must be strings");
+        }
+    }
     if (value.at("optimizer").get<std::string>() != "native_fiber_trace3d")
         throw std::runtime_error("unsupported segment_to_next optimizer");
     const int metadataVersion = value.at("metadata_version").get<int>();
@@ -192,8 +207,8 @@ inline std::vector<cv::Vec3d> vc3dFiberPointArrayFromJson(const nlohmann::json& 
             points.push_back(detail::pointFromJson(value, context));
             continue;
         }
-        if (version != 3 || !value.is_object()) {
-            throw std::runtime_error(context + " version-3 control point must be an object");
+        if ((version != 3 && version != 4) || !value.is_object()) {
+            throw std::runtime_error(context + " version-3/4 control point must be an object");
         }
         for (const auto& [field, item] : value.items()) {
             (void)item;
@@ -224,7 +239,7 @@ inline std::vector<cv::Vec3d> vc3dFiberPointArrayFromJson(const nlohmann::json& 
                 throw std::runtime_error(
                     context + " non-final control point is missing segment_to_next");
             }
-            detail::validateSegmentMetadata(value.at("segment_to_next"));
+            detail::validateSegmentMetadata(value.at("segment_to_next"), version);
         }
     }
     return points;
@@ -238,11 +253,12 @@ inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
 
     Vc3dFiberJson fiber;
     fiber.version = root.value("version", 1);
-    if (fiber.version != 1 && fiber.version != 3)
+    // Version 4 = version 3 plus optional span tags (see validateSegmentMetadata).
+    if (fiber.version != 1 && fiber.version != 3 && fiber.version != 4)
         throw std::runtime_error(context + " has unsupported vc3d_fiber version");
 
-    if (fiber.version == 3 && !root.contains("optimization_mode"))
-        throw std::runtime_error(context + " version-3 fiber is missing optimization_mode");
+    if (fiber.version >= 3 && !root.contains("optimization_mode"))
+        throw std::runtime_error(context + " version-3/4 fiber is missing optimization_mode");
     if (root.contains("optimization_mode")) {
         if (!root.at("optimization_mode").is_string())
             throw std::runtime_error(context + " optimization_mode must be a string");
@@ -258,7 +274,7 @@ inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
     fiber.controlPoints = vc3dFiberPointArrayFromJson(
         root, "control_points", fiber.version, context);
     fiber.segmentMetadata.resize(fiber.controlPoints.size());
-    if (fiber.version == 3) {
+    if (fiber.version >= 3) {
         const auto& controls = root.at("control_points");
         for (size_t index = 0; index + 1 < controls.size(); ++index)
             fiber.segmentMetadata[index] = controls.at(index).at("segment_to_next");

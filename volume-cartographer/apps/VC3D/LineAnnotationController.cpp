@@ -1487,6 +1487,7 @@ generatedControlMarkers(
             control.tags, vc3d::line_annotation::kKollesisTerminationTag);
         marker.isBreak = vc3d::line_annotation::hasControlPointTag(
             control.tags, vc3d::line_annotation::kBreakTag);
+        marker.hasGapToNext = vc3d::line_annotation::spanIsGap(control.segmentToNext);
         marker.hasTracedSegmentToNext =
             vc3d::line_annotation::isAcceptedNativeTrace(control.segmentToNext);
         if (control.segmentToNext) {
@@ -7008,6 +7009,11 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
             entry.breaks.push_back(vc3d::line_annotation::hasControlPointTag(
                 control.tags, vc3d::line_annotation::kBreakTag));
         }
+        entry.gapSegments.reserve(spanCount);
+        for (size_t i = 0; i < spanCount; ++i) {
+            entry.gapSegments.push_back(
+                vc3d::line_annotation::spanIsGap(fiber.controlPoints[i].segmentToNext));
+        }
         for (const FiberBranchRef& branch : fiber.branches) {
             if (loadedIds.count(branch.branchFiberId) == 0) {
                 continue;
@@ -7895,6 +7901,9 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     }
 
     session.controlPoints = std::move(prepared.controlPoints);
+    // A collapse can make two break points neighbours (or part them): the
+    // span tags and the gap goal policy follow before the solve below runs.
+    vc3d::line_annotation::applyGapSpanPolicy(session.controlPoints);
     remapCollapsedBranchControlPointIndices(prepared.oldToNewIndices,
                                             session.branches);
     const std::vector<FiberBranchRef> branchRemapBranches = session.branches;
@@ -9997,6 +10006,8 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
     vc3d::line_annotation::invalidateSegmentsAdjacentToControl(
         session.controlPoints, static_cast<size_t>(deletedControlIndex));
     session.controlPoints.erase(selected);
+    // Deleting a point can part two breaks or make two others neighbours.
+    vc3d::line_annotation::applyGapSpanPolicy(session.controlPoints);
     // The session's geometry changed (no solve is in flight - this handler
     // refuses while one runs): bump the epoch so the side-strip fingerprint
     // and the session snapshot cache see the deletion immediately instead of
@@ -10569,6 +10580,9 @@ bool LineAnnotationController::setControlPointTagAndPersist(
             enabled)) {
         return false;
     }
+    // The span tags follow the point tags at once, so the file written below
+    // and the overlays rebuilt afterwards read the gap from the span.
+    vc3d::line_annotation::syncGapSpanTags(session.controlPoints);
 
     // The tag is fiber content: persist and mirror into the loaded fiber so
     // the Fiber Map's next snapshot and any peer reading _fibers see it.
@@ -10662,6 +10676,15 @@ bool LineAnnotationController::setControlPointTagAndPersist(
         }
         if (!changed) {
             continue;
+        }
+        // And their span tags with them.
+        vc3d::line_annotation::syncGapSpanTags(other.controlPoints);
+        if (other.controlPointsBeforeModeChange) {
+            vc3d::line_annotation::syncGapSpanTags(*other.controlPointsBeforeModeChange);
+        }
+        if (other.controlPointCollapseRollback) {
+            vc3d::line_annotation::syncGapSpanTags(
+                other.controlPointCollapseRollback->controlPoints);
         }
         if (otherPane.dialog) {
             otherPane.dialog->setGeneratedBranchOverlayData(
@@ -11014,6 +11037,9 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
         }
     }
     session.controlPoints = std::move(task.controlPoints);
+    // Tags were re-attached from the live session; the span tags follow them
+    // (a toggle mirrored in during the solve is not in the task's snapshot).
+    vc3d::line_annotation::syncGapSpanTags(session.controlPoints);
     // Only the session-local remap before the generated views are rebuilt:
     // materializeGeneratedViews reads session.branches for the link markers,
     // but it can still fail and roll this session back, so the peer-fiber
@@ -11892,6 +11918,9 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                 previousControls = session.controlPoints;
             vc::lasagna::LineModel previousLine = session.optimizedLine;
             session.controlPoints = std::move(merged.controls);
+            // Adopted descriptors come from the task's snapshot; the span
+            // tags follow the current point tags.
+            vc3d::line_annotation::syncGapSpanTags(session.controlPoints);
             session.optimizedLine = std::move(merged.line);
             ++session.lineRevision;
             if (session.suppressGeneratedViews ||
@@ -12250,6 +12279,7 @@ LineAnnotationController::generatedSpanAlignmentMetricsForSession(
             metric.modeMarker = vc3d::line_annotation::segmentInterpolationModeMarker(
                 segment->interpMode);
             metric.message = segment->message;
+            metric.gap = vc3d::line_annotation::spanIsGap(segment);
             if (segment->interpMode ==
                 vc3d::line_annotation::SegmentInterpolationMode::Trace) {
                 metric.kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind::NativeMeetingError;
@@ -17329,7 +17359,7 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
 
     nlohmann::json root = nlohmann::json::object();
     root["type"] = "vc3d_fiber";
-    root["version"] = 3;
+    root["version"] = vc3d::line_annotation::kFiberFormatVersion;
     root["username"] = serialized.username;
     root["started_at"] = serialized.startedAt;
     root["sequence"] = serialized.sequence;
@@ -17401,6 +17431,10 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
     }
     if (!serialized.controlPoints.empty())
         serialized.controlPoints.back().segmentToNext.reset();
+    // Every file VC3D writes has its gap span tags in step with its break
+    // point tags, whatever path produced the controls (split, merge,
+    // reverse, an edit whose session sync was skipped).
+    vc3d::line_annotation::syncGapSpanTags(serialized.controlPoints);
     root["control_points"] = nlohmann::json::array();
     root["line_points"] = nlohmann::json::array();
     for (const auto& point : serialized.controlPoints) {
@@ -17961,6 +17995,13 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
         }
     }
     vc3d::line_annotation::validateStoredControlPoints(fiber.controlPoints);
+    // Heal: every pair of consecutive break points is a gap span. A version-3
+    // file (or a hand edit) can carry the points without the span tag; the
+    // file is rewritten as version 4 under the stale-file guard.
+    if (vc3d::line_annotation::syncGapSpanTags(fiber.controlPoints)) {
+        fiber.needsSave = true;
+        fiber.gapHealed = true;
+    }
     fiber.linePoints.reserve(linePoints.size());
     for (const auto& point : linePoints) {
         fiber.linePoints.push_back(pointFromJson(point));
@@ -18284,15 +18325,15 @@ void LineAnnotationController::healOneSidedAdjacentLinks(std::vector<StoredFiber
 
 bool LineAnnotationController::adjacentHealSaveIsStale(const StoredFiber& fiber) const
 {
-    if (!fiber.adjacentHealed) {
+    if (!fiber.adjacentHealed && !fiber.gapHealed) {
         return false;
     }
     std::error_code stampError;
     const auto now = fs::last_write_time(fiberPath(fiber), stampError);
     const bool stale = stampError || !fiber.loadedWriteTime || now != *fiber.loadedWriteTime;
     if (stale) {
-        Logger()->warn("Not saving the healed adjacent link kind on {}: the file {} since it "
-                       "was read (a sync?); the next load heals it again",
+        Logger()->warn("Not saving the healed metadata (adjacent link kind / gap span tags) on {}: "
+                       "the file {} since it was read (a sync?); the next load heals it again",
                        fiber.fileName,
                        stampError ? "cannot be checked" : "changed on disk");
     }
