@@ -206,6 +206,7 @@ private:
     QMainWindow* segmentWorkspaceWindow() const { return _segmentWorkspaceWindow; }
     ViewerManager* activeWorkspaceViewerManager() const;
     void updateActiveWorkspaceViewerControls();
+    void updateVolumeNameLabel();
     void populateDockToggleMenu(QMenu* menu) const;
     void createAtlasWorkspace();
     void displayAtlasFromDirectory(const std::filesystem::path& atlasDir);
@@ -422,6 +423,7 @@ private:
     bool _destroyingWindow{false};
     bool _spiralCloseGuardBypass{false};
     QTabWidget* _workspaceTabs{nullptr};
+    QLabel* _volumeNameLabel{nullptr};
     QMainWindow* _segmentWorkspaceWindow{nullptr};
     StatusDockPanelHost* _statusDockPanelHost{nullptr};
     QMainWindow* _lasagnaWorkspaceWindow{nullptr};
