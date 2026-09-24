@@ -4092,15 +4092,11 @@ fs::path LineAnnotationController::createAtlasFromFiberCore(uint64_t fiberId)
         throw std::runtime_error("Selected fiber has no line points");
     }
 
-    const auto resolvedLasagna = resolveAlignmentMetricsManifestPath();
+    const auto resolvedLasagna = resolveAlignmentMetricsDataset();
     if (!resolvedLasagna)
         throw std::runtime_error("No Lasagna dataset selected");
-    const fs::path manifestPath = resolvedLasagna->first;
-    if (manifestPath.empty() || !fs::exists(manifestPath)) {
-        throw std::runtime_error("Selected Lasagna dataset does not exist");
-    }
-    vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(
-        manifestPath, {resolvedLasagna->second});
+    const auto& dataset = *resolvedLasagna;
+    const fs::path manifestPath = dataset.manifest().manifestPath;
     vc::lasagna::LasagnaNormalSampler sampler(dataset);
     const fs::path initShellDir =
         vc::atlas::initShellDirectoryFromManifest(dataset.manifest());
@@ -4458,15 +4454,10 @@ bool LineAnnotationController::acceptIntersectionSameWindingChoice()
                 "An atlas must be seeded from one inspected object before linked objects can be added");
         }
 
-        const auto resolvedLasagna = resolveAlignmentMetricsManifestPath();
+        const auto resolvedLasagna = resolveAlignmentMetricsDataset();
         if (!resolvedLasagna)
             throw std::runtime_error("No Lasagna dataset selected");
-        const fs::path manifestPath = resolvedLasagna->first;
-        if (!fs::exists(manifestPath)) {
-            throw std::runtime_error("Selected Lasagna dataset does not exist");
-        }
-        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(
-            manifestPath, {resolvedLasagna->second});
+        const auto& dataset = *resolvedLasagna;
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
 
         const fs::path basePath = *_intersectionInspection->atlasDir / atlas.metadata.baseMeshPath;
@@ -6487,30 +6478,41 @@ bool LineAnnotationController::isAlignmentPendingForFiber(uint64_t fiberId,
            isAlignmentPendingForFiber(fiberId);
 }
 
-std::optional<std::pair<fs::path, double>>
-LineAnnotationController::resolveAlignmentMetricsManifestPath()
+std::shared_ptr<vc::lasagna::LasagnaDataset>
+LineAnnotationController::resolveAlignmentMetricsDataset()
 {
     if (!_state || !_state->vpkg()) {
         showError(tr("No volume package loaded."));
-        return std::nullopt;
+        return {};
     }
 
     auto vpkg = _state->vpkg();
+    const auto openDataset = [&](const std::string& location, double scale) {
+        vc::lasagna::LasagnaDatasetOpenOptions options;
+        options.workingToBaseScale = scale;
+        options.remoteCacheRoot = vc3d::remoteCachePathFs();
+        const auto resolved = vc::project::isLocationRemote(location)
+            ? location
+            : vc::project::resolveLocalPath(location, vpkg->path().parent_path()).string();
+        return std::make_shared<vc::lasagna::LasagnaDataset>(
+            vc::lasagna::LasagnaDataset::openLocation(resolved, options));
+    };
     try {
         if (const auto resolved = vc3d::opendata::resolveLasagnaForVolume(
                 *vpkg, _state->currentVolumeId())) {
-            return std::pair{resolved->manifestPath, resolved->workingToBaseScale};
+            // Marker-backed catalog entries retain their origin/auth policy on
+            // local open; direct remote attachments must retain the source URL.
+            return openDataset(resolved->manifestBacked
+                                   ? resolved->manifestPath.string()
+                                   : resolved->sourceManifestLocation,
+                               resolved->workingToBaseScale);
         }
     } catch (const std::exception& ex) {
         showError(tr("Cannot resolve Lasagna for the active volume: %1")
                       .arg(QString::fromStdString(ex.what())));
-        return std::nullopt;
+        return {};
     }
     std::string selected = vpkg->selectedLasagnaDataset();
-    fs::path manifestPath = vpkg->selectedLasagnaDatasetPath();
-    if (!selected.empty() && !manifestPath.empty()) {
-        return std::pair{manifestPath, 1.0};
-    }
 
     const fs::path startDir = vpkg->path().empty()
         ? fs::path{}
@@ -6523,12 +6525,18 @@ LineAnnotationController::resolveAlignmentMetricsManifestPath()
         if (_errorDialogsSuppressed) {
             showError(tr("No Lasagna dataset is selected for the active volume."));
         }
-        return std::nullopt;
+        return {};
     }
     selected = *picked;
-    manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
-    vpkg->setSelectedLasagnaDataset(selected);
-    return std::pair{manifestPath, 1.0};
+    try {
+        auto dataset = openDataset(selected, 1.0);
+        vpkg->setSelectedLasagnaDataset(selected);
+        return dataset;
+    } catch (const std::exception& ex) {
+        showError(tr("Cannot resolve Lasagna for the active volume: %1")
+                      .arg(QString::fromUtf8(ex.what())));
+        return {};
+    }
 }
 
 void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector<uint64_t> fiberIds)
@@ -6591,8 +6599,8 @@ void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector
         return;
     }
 
-    const auto manifestPath = resolveAlignmentMetricsManifestPath();
-    if (!manifestPath) {
+    const auto dataset = resolveAlignmentMetricsDataset();
+    if (!dataset) {
         for (const auto& fiber : fibers) {
             _pendingFiberAlignmentMetrics.erase(fiber.id);
             _pendingFiberAlignmentMetricTokens.erase(fiber.id);
@@ -6616,15 +6624,14 @@ void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector
     watcher->setFuture(QtConcurrent::run([generation,
                                            suppressErrorDialogs,
                                            self,
-                                           resolvedManifestPath = manifestPath->first,
-                                           workingToBaseScale = manifestPath->second,
+                                           dataset,
                                            fibers = std::move(fibers),
                                            requestTokens = std::move(requestTokens)]() mutable {
         FiberMetricsTaskResult result;
         result.ok = true;
         result.suppressErrorDialogs = suppressErrorDialogs;
         result.generation = generation;
-        result.manifestPath = resolvedManifestPath;
+        result.manifestPath = dataset->manifest().manifestPath;
         result.requestedFiberIds.reserve(fibers.size());
         for (size_t i = 0; i < fibers.size(); ++i) {
             const uint64_t fiberId = fibers[i].id;
@@ -6645,10 +6652,7 @@ void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector
         };
 
         try {
-            vc::lasagna::LasagnaDataset dataset =
-                vc::lasagna::LasagnaDataset::open(
-                    resolvedManifestPath, {workingToBaseScale});
-            vc::lasagna::LasagnaNormalSampler sampler(dataset);
+            vc::lasagna::LasagnaNormalSampler sampler(*dataset);
             result.metrics.reserve(fibers.size());
             for (size_t i = 0; i < fibers.size(); ++i) {
                 const auto& fiber = fibers[i];
