@@ -1574,9 +1574,11 @@ int main(int argc, char *argv[])
             tifDpi = voxelSizeToDpi(umPerOutputPixel);
         } else {
             // There is no measurement to declare. Passing 0 tells writeZarrAttrs
-            // to omit the multiscales block rather than to publish a scale of
-            // 1.0, and a zero tifDpi leaves the TIFF resolution tags unset. Both
-            // outputs therefore say "unknown" instead of inventing a size.
+            // that the physical size is unknown: it then writes no axis unit and
+            // encodes only the relative pyramid scaling, keeping the multiscales
+            // discovery metadata intact. A zero tifDpi leaves the TIFF resolution
+            // tags unset. Both outputs therefore say "unknown" instead of
+            // inventing a size, and neither loses the image structure.
             logPrintf(stderr,
                       "Warning: this volume publishes no usable voxel size, so its "
                       "physical scale is unknown and none will be declared. Pass "
@@ -1591,7 +1593,8 @@ int main(int argc, char *argv[])
         // adjacent layers sit --slice-step level-g voxels apart (buildOffsetList).
         // writeZarrAttrs derives the per-axis .zattrs scale from this base value,
         // so this argument MUST be in the same unit as zarr_voxel_unit -- and 0
-        // when there is no size to declare.
+        // when there is no size to declare, which is the flag that switches
+        // writeZarrAttrs from a physical scale to a relative one.
         render_level_voxel_size = ds_scale > 0
             ? zarr_voxel_value / double(ds_scale)
             : zarr_voxel_value;

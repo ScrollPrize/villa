@@ -126,6 +126,47 @@ std::optional<double> explicitVoxelSize(const utils::Json& doc)
     return std::nullopt;
 }
 
+// `metadata.json` with a top-level `voxelsize` key *inside* its `scan` object.
+//
+// This is the legacy shape the renderer's own pre-patch reader handled, as its
+// second candidate:
+//
+//     if (auto v = tryFile(volPath / "meta.json", nullptr))       return v;
+//     if (auto v = tryFile(volPath / "metadata.json", "scan"))    return v;  <-- this
+//     if (auto v = tryFile(volPath / "metadata.json", nullptr))   return v;
+//
+// It is restored here rather than in the renderer so that every caller of this
+// resolver -- Volume construction included -- keeps agreeing on what a store
+// says. Shape is pinned: the value must be reachable at exactly
+// `scan.voxelsize`, and `scan` must be an object with no `tomo` acquisition
+// record. A bare search for a nested `voxelsize` would also match the
+// `voxelsize` of an unrelated sub-document, which is how a resolver reports a
+// neighbour's measurement as this volume's.
+//
+// Unit: micrometers, decided from the historical code rather than assumed.
+// `readVolumeVoxelSize()` returned this number with no conversion of any kind,
+// and its caller treated every number it returned as micrometers -- the only
+// input that received a unit conversion was an explicit `--voxel-size`, guarded
+// by `voxelSizeFromCli`. Since the same reader produced both `meta.json`'s
+// top-level `voxelsize` (which is micrometers: the published value 7.91 matches
+// the volume's own `-7.910um-` name) and this field, and since a single code path
+// cannot have meant two units, `scan.voxelsize` was micrometers too. Had it not
+// been, the legacy volume would have produced a wrong TIFF resolution -- and that
+// path is the one the repository's live-S3 test exercises.
+std::optional<double> legacyScanVoxelSize(const utils::Json& doc)
+{
+    const auto scan = walk(doc, {"scan"});
+    if (!scan || !scan->is_object())
+        return std::nullopt;
+    // An acquisition record means this is the modern shape; that schema is read
+    // by its own exact path below, and is not this fallback's business.
+    if (scan->contains("tomo"))
+        return std::nullopt;
+    if (!scan->contains("voxelsize"))
+        return std::nullopt;
+    return positiveNumber((*scan)["voxelsize"]);
+}
+
 } // namespace
 
 std::optional<double> voxelSizeFromStoreMetadata(const utils::Json& doc)
@@ -139,6 +180,12 @@ std::optional<double> voxelSizeFromStoreMetadata(const utils::Json& doc)
     // A source volume carries its own scan record.
     if (auto direct = detectorVoxelSize(doc, 0))
         return direct;
+
+    // The legacy `scan.voxelsize`, before the `source` walk: a derived store
+    // records its own acquisition record under `scan` too, and a `voxelsize`
+    // found there describes this document, not its source.
+    if (auto legacy = legacyScanVoxelSize(doc))
+        return legacy;
 
     // A derived store -- a surface or ink prediction -- records the volume it
     // ran on under `source`: that volume's scan record, and the pyramid level
@@ -164,14 +211,27 @@ std::optional<double> voxelSizeFromStoreMetadata(const utils::Json& doc)
 
 std::optional<double> resolveLocalStoreVoxelSize(const std::filesystem::path& storeRoot)
 {
+    // Each candidate is tried in turn, and a candidate that yields nothing does
+    // not stop the search. Two ways a present file can yield nothing:
+    //
+    //   * it parses but carries no schema this resolver recognises -- many
+    //     published `meta.json` files state only dimensions, so stopping there
+    //     would hide a perfectly good `metadata.json` next to them;
+    //   * it is malformed or unreadable. A file we cannot parse tells us nothing
+    //     about the store, and treating it as the final answer would make one
+    //     corrupt file hide the resolution the store does publish.
+    //
+    // Order is the pre-patch renderer's: `meta.json` first because it is the
+    // store's own canonical document, then `metadata.json`.
     for (const char* name : {"meta.json", "metadata.json"}) {
         const auto file = storeRoot / name;
         if (!std::filesystem::exists(file))
             continue;
         try {
-            return voxelSizeFromStoreMetadata(utils::Json::parse_file(file));
+            if (auto resolved = voxelSizeFromStoreMetadata(utils::Json::parse_file(file)))
+                return resolved;
         } catch (const std::exception&) {
-            return std::nullopt;
+            // Fall through to the next candidate.
         }
     }
     return std::nullopt;

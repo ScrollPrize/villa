@@ -27,11 +27,16 @@ namespace vc::metadata
 //   * `tomo.acquisition.detector.samplePixelSize`       -- the same record at the
 //                                                document root, as the fused
 //                                                mosaic exports write it
-//   * the two above under `source.metadata`, for a derived store (surface or
-//     ink prediction), scaled by 2^`source.resolution` because inference runs
-//     on a downscaled level of its source volume. `source.resolution` is
-//     required, not defaulted: without it the factor is unknown, and a voxel
-//     size wrong by an unstated power of two is worse than none.
+//   * `scan.voxelsize` -- the legacy top-level `voxelsize` shape nested under a
+//     `scan` wrapper. Micrometers, like the top-level field it mirrors; see the
+//     definition for why that unit is not a guess. Only matched when `scan` holds
+//     no `tomo` acquisition record, so the modern shape keeps its own path.
+//   * the two acquisition-record paths above under `source.metadata`, for a
+//     derived store (surface or ink prediction), scaled by 2^`source.resolution`
+//     because inference runs on a downscaled level of its source volume.
+//     `source.resolution` is required, not defaulted: without it the factor is
+//     unknown, and a voxel size wrong by an unstated power of two is worse than
+//     none.
 // `samplePixelSize` is in millimeters in all of these.
 [[nodiscard]] std::optional<double> voxelSizeFromStoreMetadata(const utils::Json& doc);
 
@@ -39,6 +44,12 @@ namespace vc::metadata
 // else its `metadata.json`. For tools that read a store without constructing a
 // Volume, so they agree with Volume::voxelSize() on what the store says. Never
 // throws; a missing or malformed document resolves nothing.
+//
+// A candidate that yields no usable voxel size does not end the search: a
+// `meta.json` holding only dimensions, or one that will not parse at all, falls
+// through to `metadata.json`. Treating "no usable size here" as "no usable size
+// in this store" is what made some local inputs lose their physical scale
+// entirely.
 [[nodiscard]] std::optional<double> resolveLocalStoreVoxelSize(
     const std::filesystem::path& storeRoot);
 

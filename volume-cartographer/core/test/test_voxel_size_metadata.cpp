@@ -184,6 +184,56 @@ TEST_CASE("store metadata: a non-positive or unparseable pixel size resolves not
     }
 }
 
+TEST_CASE("store metadata: the legacy scan-wrapped voxelsize")
+{
+    // The shape the renderer's own pre-patch reader handled as its second
+    // candidate: metadata.json -> scan -> voxelsize. Micrometers, like the
+    // top-level field it mirrors -- the same reader produced both and applied no
+    // unit conversion to either.
+    const auto resolved = voxelSizeFromStoreMetadata(
+        parse(R"({"scan": {"voxelsize": 8.64}, "zarr_export": {"z_crop_start": 0}})"));
+    REQUIRE(resolved.has_value());
+    CHECK(*resolved == doctest::Approx(8.64));
+}
+
+TEST_CASE("store metadata: the legacy scan voxelsize is not read when scan holds an acquisition record")
+{
+    // The modern shape keeps its own exact path. If both were present the
+    // acquisition record wins, because a `scan` carrying `tomo` is the declared
+    // modern schema and `scan.voxelsize` in that document describes something
+    // else (or nothing).
+    const auto resolved = voxelSizeFromStoreMetadata(parse(R"({
+        "scan": {
+            "voxelsize": 99.0,
+            "tomo": {"acquisition": {"detector": {"samplePixelSize": 0.00864}}}
+        }
+    })"));
+    REQUIRE(resolved.has_value());
+    CHECK(*resolved == doctest::Approx(8.64));
+}
+
+TEST_CASE("store metadata: an unrelated nested voxelsize is not read")
+{
+    // Exact-path matching, not a search. Each of these looks resolution-shaped
+    // and none of them is this volume's own scan-wrapped voxelsize.
+    for (const char* doc : {
+             R"({"metadata": {"scan": {"voxelsize": 8.64}}})",
+             R"({"source": {"scan": {"voxelsize": 8.64}}})",
+             R"({"properties": {"voxelsize": 8.64}})",
+             R"({"scan": [{"voxelsize": 8.64}]})",
+         }) {
+        CHECK_FALSE(voxelSizeFromStoreMetadata(parse(doc)).has_value());
+    }
+}
+
+TEST_CASE("store metadata: a non-positive legacy scan voxelsize resolves nothing")
+{
+    for (const char* value : {"0", "-8.64", R"("")", R"("8.64 um")", "true", "null", "{}"}) {
+        const auto doc = parse(std::string(R"({"scan": {"voxelsize": )") + value + "}}");
+        CHECK_FALSE(voxelSizeFromStoreMetadata(doc).has_value());
+    }
+}
+
 TEST_CASE("resolveLocalStoreVoxelSize: a local store resolves like a Volume would")
 {
     const auto d = tmpDir("local_store");
@@ -213,10 +263,62 @@ TEST_CASE("resolveLocalStoreVoxelSize: a local store resolves like a Volume woul
         CHECK(*resolved == doctest::Approx(2.4));
     }
 
-    SUBCASE("a malformed document counts as absent")
+    SUBCASE("a meta.json with no usable size falls through to metadata.json")
+    {
+        // The reviewer finding: many published meta.json files state dimensions
+        // and nothing else. Stopping at the first existing file lost the
+        // resolution the store does publish.
+        writeTextFile(d / "meta.json",
+                      R"({"height": 9100, "width": 6700, "slices": 21000, "type": "vol"})");
+        writeTextFile(d / "metadata.json",
+                      R"({"scan": {"tomo": {"acquisition": {"detector": {"samplePixelSize": 0.00864}}}}})");
+        const auto resolved = resolveLocalStoreVoxelSize(d);
+        REQUIRE(resolved.has_value());
+        CHECK(*resolved == doctest::Approx(8.64));
+    }
+
+    SUBCASE("a meta.json whose size is present but unusable falls through too")
+    {
+        // Present but non-positive is "no usable size", not "size zero".
+        writeTextFile(d / "meta.json", R"({"type": "vol", "voxelsize": 0})");
+        writeTextFile(d / "metadata.json", R"({"scan": {"voxelsize": 8.64}})");
+        const auto resolved = resolveLocalStoreVoxelSize(d);
+        REQUIRE(resolved.has_value());
+        CHECK(*resolved == doctest::Approx(8.64));
+    }
+
+    SUBCASE("a malformed meta.json falls through to metadata.json")
+    {
+        writeTextFile(d / "meta.json", "{not json");
+        writeTextFile(d / "metadata.json",
+                      R"({"scan": {"tomo": {"acquisition": {"detector": {"samplePixelSize": 0.0024}}}}})");
+        const auto resolved = resolveLocalStoreVoxelSize(d);
+        REQUIRE(resolved.has_value());
+        CHECK(*resolved == doctest::Approx(2.4));
+    }
+
+    SUBCASE("a malformed metadata.json alongside an unusable meta.json resolves nothing")
+    {
+        // Falling through must not invent an answer when the last candidate is
+        // also unusable. One corrupt file no longer hides a good one; two do.
+        writeTextFile(d / "meta.json", "{not json");
+        writeTextFile(d / "metadata.json", "also not json");
+        CHECK_FALSE(resolveLocalStoreVoxelSize(d).has_value());
+    }
+
+    SUBCASE("a malformed document with no sibling counts as absent")
     {
         writeTextFile(d / "meta.json", "{not json");
         CHECK_FALSE(resolveLocalStoreVoxelSize(d).has_value());
+    }
+
+    SUBCASE("the legacy scan-wrapped voxelsize resolves through a local store")
+    {
+        writeTextFile(d / "metadata.json",
+                      R"({"scan": {"voxelsize": 7.91}, "zarr_export": {"z_crop_end": 42208}})");
+        const auto resolved = resolveLocalStoreVoxelSize(d);
+        REQUIRE(resolved.has_value());
+        CHECK(*resolved == doctest::Approx(7.91));
     }
 
     std::filesystem::remove_all(d);
