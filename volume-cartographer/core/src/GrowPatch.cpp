@@ -881,7 +881,10 @@ public:
             max_value = 0.0;
         }
 
-        const double diff = std::max(0.0, threshold_ - max_value);
+        // max_value was raised to the hit sample before the loop broke, so it is at
+        // least threshold_ here and threshold_ - max_value is never positive: the
+        // residual was zero on every path. The occlusion is max_value - threshold_.
+        const double diff = std::max(0.0, max_value - threshold_);
         residual[0] = weight_ * diff;
         return true;
     }
