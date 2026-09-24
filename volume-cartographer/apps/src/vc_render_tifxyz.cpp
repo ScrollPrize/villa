@@ -1064,6 +1064,7 @@ int main(int argc, char *argv[])
         ("help,h", "Show this help message")
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
         ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
+        ("fetch-concurrency", po::value<size_t>()->default_value(16), "Chunk reads kept in flight (S3 tolerates far more than the default)")
         ("prefetch-remote", po::bool_switch()->default_value(false), "Prefetch required remote chunks into the existing staged cache before rendering")
         ("remote-url", po::value<std::string>(), "Remote OME-Zarr URL for remote cache streaming/prefetch (optional if --volume cache already records it)")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
@@ -1339,6 +1340,9 @@ int main(int argc, char *argv[])
     const int cacheLevel = group_idx;
 
     const size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
+    const size_t fetch_concurrency = parsed["fetch-concurrency"].as<size_t>();
+    if (fetch_concurrency == 0) { logPrintf(stderr, "Error: --fetch-concurrency must be positive\n"); return EXIT_FAILURE; }
+    logPrintf(stdout, "Chunk fetch concurrency: %zu\n", fetch_concurrency);
     std::unique_ptr<vc::render::ChunkCache> ownedChunkCache;
     vc::render::IChunkedArray* chunk_cache = nullptr;
 
@@ -1347,7 +1351,7 @@ int main(int argc, char *argv[])
             vc::HttpAuth remoteAuth = vc::HttpAuth::from_env();
             ownedChunkCache = vc::render::createChunkCache(
                 vc::render::openHttpZarrPyramid(remoteUrl, remoteAuth),
-                cache_bytes);
+                cache_bytes, fetch_concurrency);
             chunk_cache = ownedChunkCache.get();
             if (cacheLevel < 0 || cacheLevel >= chunk_cache->numLevels()) {
                 logPrintf(stderr, "Error: group index %d not available in remote zarr\n", group_idx);
@@ -1362,7 +1366,7 @@ int main(int argc, char *argv[])
         try {
             ownedChunkCache = vc::render::createChunkCache(
                 vc::render::openLocalZarrPyramid(vol_path),
-                cache_bytes);
+                cache_bytes, fetch_concurrency);
         } catch (const std::exception& e) {
             logPrintf(stderr, "Error opening local zarr: %s\n", e.what());
             return EXIT_FAILURE;
