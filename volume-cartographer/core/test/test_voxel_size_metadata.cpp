@@ -196,20 +196,42 @@ TEST_CASE("store metadata: the legacy scan-wrapped voxelsize")
     CHECK(*resolved == doctest::Approx(8.64));
 }
 
-TEST_CASE("store metadata: the legacy scan voxelsize is not read when scan holds an acquisition record")
+TEST_CASE("store metadata: the legacy scan voxelsize beats an acquisition record in the same scan")
 {
-    // The modern shape keeps its own exact path. If both were present the
-    // acquisition record wins, because a `scan` carrying `tomo` is the declared
-    // modern schema and `scan.voxelsize` in that document describes something
-    // else (or nothing).
+    // The historical precedence, which this must not reinterpret. The pre-patch
+    // reader was:
+    //
+    //     tryFile(meta.json,             nullptr)   // meta.json root voxelsize
+    //     tryFile(metadata.json,         "scan")    // <- root["scan"]["voxelsize"]
+    //     tryFile(metadata.json,         nullptr)   // metadata.json root voxelsize
+    //
+    // It had no acquisition-record branch at all, so when a document carried both
+    // `scan.voxelsize` and `scan.tomo...samplePixelSize` it returned
+    // `scan.voxelsize`. Preserving previously supported local metadata means
+    // preserving that choice, not replacing it with the modern field.
+    //
+    // Deliberately distinct numbers: 7.91 from the legacy field, 8.64 from the
+    // acquisition record, so the assertion cannot pass by coincidence.
     const auto resolved = voxelSizeFromStoreMetadata(parse(R"({
         "scan": {
-            "voxelsize": 99.0,
+            "voxelsize": 7.91,
             "tomo": {"acquisition": {"detector": {"samplePixelSize": 0.00864}}}
         }
     })"));
     REQUIRE(resolved.has_value());
-    CHECK(*resolved == doctest::Approx(8.64));
+    CHECK(*resolved == doctest::Approx(7.91));
+}
+
+TEST_CASE("store metadata: a top-level voxelsize still beats the scan-wrapped one")
+{
+    // ... while the *first* historical candidate keeps its own priority. A
+    // document stating both must resolve to the top-level value.
+    const auto resolved = voxelSizeFromStoreMetadata(parse(R"({
+        "voxelsize": 2.4,
+        "scan": {"voxelsize": 7.91}
+    })"));
+    REQUIRE(resolved.has_value());
+    CHECK(*resolved == doctest::Approx(2.4));
 }
 
 TEST_CASE("store metadata: an unrelated nested voxelsize is not read")
@@ -221,6 +243,7 @@ TEST_CASE("store metadata: an unrelated nested voxelsize is not read")
              R"({"source": {"scan": {"voxelsize": 8.64}}})",
              R"({"properties": {"voxelsize": 8.64}})",
              R"({"scan": [{"voxelsize": 8.64}]})",
+             R"({"scan": {"properties": {"voxelsize": 8.64}}})",
          }) {
         CHECK_FALSE(voxelSizeFromStoreMetadata(parse(doc)).has_value());
     }

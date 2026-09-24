@@ -135,13 +135,31 @@ std::optional<double> explicitVoxelSize(const utils::Json& doc)
 //     if (auto v = tryFile(volPath / "metadata.json", "scan"))    return v;  <-- this
 //     if (auto v = tryFile(volPath / "metadata.json", nullptr))   return v;
 //
-// It is restored here rather than in the renderer so that every caller of this
-// resolver -- Volume construction included -- keeps agreeing on what a store
-// says. Shape is pinned: the value must be reachable at exactly
-// `scan.voxelsize`, and `scan` must be an object with no `tomo` acquisition
-// record. A bare search for a nested `voxelsize` would also match the
-// `voxelsize` of an unrelated sub-document, which is how a resolver reports a
-// neighbour's measurement as this volume's.
+// `tryFile(path, "scan")` reads `root["scan"]` and then looks for `voxelsize` in
+// it, so that candidate is exactly `scan.voxelsize` -- nothing deeper. It is
+// restored here rather than in the renderer so that every caller of this resolver
+// -- Volume construction included -- keeps agreeing on what a store says.
+//
+// Precedence, which is the point of restoring it rather than approximating it:
+// the historical reader had no acquisition-record branch at all, so for a
+// document carrying BOTH `scan.voxelsize` and
+// `scan.tomo.acquisition.detector.samplePixelSize` it returned `scan.voxelsize`.
+// That is why there is no `tomo` guard here, and why the caller consults this
+// before `detectorVoxelSize()`: either would silently change which number such a
+// document yields, and the review asked for the previously supported behaviour to
+// be preserved, not reinterpreted. The resulting order is
+//
+//     top-level `voxelsize` > `scan.voxelsize` > acquisition record > source
+//
+// which reduces to the historical order for every document shape the old reader
+// could read -- its only other candidate, `metadata.json`'s own root `voxelsize`,
+// is the top-level case that already comes first -- and extends it with the
+// `source` walk for derived stores that did not exist then.
+//
+// Shape is still pinned: the value must be reachable at exactly `scan.voxelsize`.
+// A bare search for a nested `voxelsize` would also match the `voxelsize` of an
+// unrelated sub-document, which is how a resolver reports a neighbour's
+// measurement as this volume's.
 //
 // Unit: micrometers, decided from the historical code rather than assumed.
 // `readVolumeVoxelSize()` returned this number with no conversion of any kind,
@@ -158,12 +176,12 @@ std::optional<double> legacyScanVoxelSize(const utils::Json& doc)
     const auto scan = walk(doc, {"scan"});
     if (!scan || !scan->is_object())
         return std::nullopt;
-    // An acquisition record means this is the modern shape; that schema is read
-    // by its own exact path below, and is not this fallback's business.
-    if (scan->contains("tomo"))
-        return std::nullopt;
     if (!scan->contains("voxelsize"))
         return std::nullopt;
+    // Positive and finite only. The historical reader accepted any number here
+    // and left the sign check to its caller, which rejected non-positive values;
+    // rejecting them here is the shared resolver's documented contract and gives
+    // the same answer for a store that publishes nonsense.
     return positiveNumber((*scan)["voxelsize"]);
 }
 
@@ -177,15 +195,29 @@ std::optional<double> voxelSizeFromStoreMetadata(const utils::Json& doc)
     if (auto explicitSize = explicitVoxelSize(doc))
         return explicitSize;
 
-    // A source volume carries its own scan record.
-    if (auto direct = detectorVoxelSize(doc, 0))
-        return direct;
-
-    // The legacy `scan.voxelsize`, before the `source` walk: a derived store
-    // records its own acquisition record under `scan` too, and a `voxelsize`
-    // found there describes this document, not its source.
+    // The legacy `scan.voxelsize` comes BEFORE the acquisition record, because
+    // that is where the pre-patch reader put it. The reader was:
+    //
+    //     tryFile(meta.json,     nullptr)   // meta.json root `voxelsize`
+    //     tryFile(metadata.json, "scan")    // <- root["scan"]["voxelsize"]
+    //     tryFile(metadata.json, nullptr)   // metadata.json root `voxelsize`
+    //
+    // and it had no acquisition-record branch at all. So for a document carrying
+    // both `scan.voxelsize` and `scan.tomo...samplePixelSize`, the historical
+    // answer is `scan.voxelsize`, and it has to keep winning here or the review's
+    // "preserve previously supported local metadata" would be reinterpreted rather
+    // than honoured.
+    //
+    // It also sits before the `source` walk: a derived store records its own
+    // acquisition record under `scan` too, and a `voxelsize` found there describes
+    // this document, not its source.
     if (auto legacy = legacyScanVoxelSize(doc))
         return legacy;
+
+    // A source volume carries its own scan record. Reached only when neither an
+    // explicit size nor a scan-wrapped one was stated.
+    if (auto direct = detectorVoxelSize(doc, 0))
+        return direct;
 
     // A derived store -- a surface or ink prediction -- records the volume it
     // ran on under `source`: that volume's scan record, and the pyramid level

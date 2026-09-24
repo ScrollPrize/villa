@@ -23,20 +23,31 @@ namespace vc::metadata
 //     describes this volume: the same names nested under `metadata` on a
 //     derived store belong to its *source* volume, at an unstated pyramid
 //     level.
+//   * `scan.voxelsize` -- the legacy top-level `voxelsize` shape nested under a
+//     `scan` wrapper. Micrometers, like the top-level field it mirrors; see the
+//     definition for why that unit is not a guess. Matched at that exact path
+//     only, and deliberately WITHOUT a `tomo` guard: the pre-patch renderer's
+//     reader had no acquisition-record branch, so a document carrying both
+//     `scan.voxelsize` and `scan.tomo.acquisition.detector.samplePixelSize`
+//     resolved to `scan.voxelsize`, and it still does. This is the second
+//     candidate of that reader, and it comes before the acquisition record
+//     here for the same reason.
 //   * `scan.tomo.acquisition.detector.samplePixelSize`  -- ESRF/BM18 scan record
 //   * `tomo.acquisition.detector.samplePixelSize`       -- the same record at the
 //                                                document root, as the fused
 //                                                mosaic exports write it
-//   * `scan.voxelsize` -- the legacy top-level `voxelsize` shape nested under a
-//     `scan` wrapper. Micrometers, like the top-level field it mirrors; see the
-//     definition for why that unit is not a guess. Only matched when `scan` holds
-//     no `tomo` acquisition record, so the modern shape keeps its own path.
 //   * the two acquisition-record paths above under `source.metadata`, for a
 //     derived store (surface or ink prediction), scaled by 2^`source.resolution`
 //     because inference runs on a downscaled level of its source volume.
 //     `source.resolution` is required, not defaulted: without it the factor is
 //     unknown, and a voxel size wrong by an unstated power of two is worse than
 //     none.
+//
+// Effective precedence, which is the historical order for every document shape
+// the pre-patch reader could read, extended for derived stores:
+//
+//     top-level `voxelsize`  >  `scan.voxelsize`  >  acquisition record  >  source
+//
 // `samplePixelSize` is in millimeters in all of these.
 [[nodiscard]] std::optional<double> voxelSizeFromStoreMetadata(const utils::Json& doc);
 
