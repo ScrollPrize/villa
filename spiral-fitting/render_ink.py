@@ -331,6 +331,7 @@ def max_composite(tif_paths):
 @click.option('--remote-url', default='', help='Remote OME-Zarr URL for --volume, passed through to vc_render_tifxyz as --remote-url. Required when --volume is a not-yet-populated local cache dir for a scroll that only exists remotely; omit once the cache already records the URL (vc_render_tifxyz --help)')
 @click.option('--vc-render-bin', default='vc_render_tifxyz', show_default=True, help='Path to the vc_render_tifxyz binary')
 @click.option('--scale', type=float, default=0.25, show_default=True)
+@click.option('--scale-segmentation', type=float, default=1.0, show_default=True, help='Passed through to vc_render_tifxyz as --scale-segmentation: multiply mesh coordinates by this factor before sampling, for meshes traced in a different-resolution frame than --volume (e.g. 4 for a mesh in a 4x downsampled frame)')
 @click.option('--group-idx', type=int, default=1, show_default=True)
 @click.option('--num-slices', type=int, default=5, show_default=True)
 @click.option('--num-processes', '-j', type=int, default=1, show_default=True, help='Number of meshes to render (and flatten) concurrently')
@@ -352,17 +353,18 @@ def max_composite(tif_paths):
 @click.option('--full-scroll/--no-full-scroll', default=True, show_default=True, help='Concatenate ALL windings into one full-scroll mesh, flatten it with the lasagna forward flattener (not flatboi), and ink-render it')
 @click.option('--max-strip-width', type=int, default=16384, show_default=True, help='Max width (px) of each saved ink jpg. Strips wider than this are chopped into <name>.NNN.jpg tiles of this width (no downsampling); narrower strips stay a single <name>.jpg')
 @click.option('--full-scroll-trim/--no-full-scroll-trim', default=True, show_default=True, help='After the lasagna flatten, trim the flattened tifxyz to its valid-cell bounding box (removes the flatten output-margin border that renders as black bands) with vc_tifxyz_trim')
+@click.option('--fail-on-empty/--no-fail-on-empty', default=True, show_default=True, help='Fail (exit 1) if any rendered strip is entirely zero, which almost always means the mesh does not intersect --volume (wrong frame/resolution; see --scale-segmentation, --scale, --group-idx). --no-fail-on-empty restores writing the black strip with a warning')
 @click.option('--tifxyz-trim-bin', default='vc_tifxyz_trim', show_default=True, help='Path to the vc_tifxyz_trim binary (crops a tifxyz to its valid-cell bbox in place)')
 @click.option('--lasagna-dir', default='', help='Path to the lasagna repo dir (holds fit.py). Default: <this script>/../lasagna')
 @click.option('--lasagna-config', default='', help='Base lasagna flatten config json. Default: <lasagna-dir>/configs/flatten_fast_nofilter.json')
 @click.option('--lasagna-fit-script', default='', help='Lasagna fit entrypoint run for the full-scroll flatten. Default: _run_flatten_threaded.py if present, else fit.py')
 @click.option('--lasagna-device', default='cuda', show_default=True, help='--device passed to the lasagna flattener for the full-scroll flatten')
-def main(meshes_dir, volume, remote_url, vc_render_bin, scale, group_idx, num_slices, num_processes,
+def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentation, group_idx, num_slices, num_processes,
          flatten, flatboi_bin, tifxyz2obj_bin, obj2tifxyz_bin, uv_lift_bin, flatten_keep,
          flatten_iters, flatten_energy, flatten_tol, flatten_inpaint, pre_erode,
          keep_largest, flatboi_threads,
          openblas_coretype, strips, full_scroll, max_strip_width, full_scroll_trim,
-         tifxyz_trim_bin, lasagna_dir, lasagna_config, lasagna_fit_script, lasagna_device):
+         fail_on_empty, tifxyz_trim_bin, lasagna_dir, lasagna_config, lasagna_fit_script, lasagna_device):
     meshes = sorted(
         (winding_idx(name), name)
         for name in os.listdir(meshes_dir)
@@ -529,6 +531,8 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, group_idx, num_sl
             '--tif-output', per_mesh_ink,
             '--num-slices', str(num_slices),
         ]
+        if scale_segmentation != 1.0:
+            render_cmd += ['--scale-segmentation', str(scale_segmentation)]
         if remote_url:
             render_cmd += ['--remote-url', remote_url]
         subprocess.run(render_cmd, check=True)
@@ -538,6 +542,7 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, group_idx, num_sl
         return max_composite(tif_paths)
 
     rendered_strips = 0
+    empty_strips = []
     with ThreadPoolExecutor(max_workers=max(1, num_processes)) as pool:
         futures = {pool.submit(render, name, cp): name for name, cp in render_items}
         for n, future in enumerate(as_completed(futures)):
@@ -546,6 +551,15 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, group_idx, num_sl
             if comp is None:
                 print(f'[{n + 1}/{len(render_items)}] {name}: WARNING no tifs produced, skipping')
                 continue
+            empty = not np.any(comp)
+            if empty:
+                severity = 'ERROR' if fail_on_empty else 'WARNING'
+                print(f'[{n + 1}/{len(render_items)}] {name}: {severity} rendered strip is entirely zero '
+                      f'({comp.shape[1]}px wide): the mesh does not appear to intersect {volume}. '
+                      'Check the mesh/volume frames (--scale-segmentation, --scale, --group-idx)')
+                empty_strips.append(name)
+                if fail_on_empty:
+                    continue
             strip = comp.astype(np.float32)
             p95 = np.percentile(strip, 95)
             strip = np.clip(strip / p95, 0, 1) * 255 if p95 > 0 else strip
@@ -569,6 +583,13 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, group_idx, num_sl
                       f'{name}.000-{n_tiles - 1:03d}.jpg ({width}px wide total, '
                       f'p95={p95:.1f})')
             rendered_strips += 1
+
+    if empty_strips and fail_on_empty:
+        raise click.ClickException(
+            f'{len(empty_strips)} of {len(render_items)} ink strip(s) rendered entirely zero: '
+            f'{", ".join(sorted(empty_strips))}. The mesh does not appear to intersect {volume}; '
+            'check the mesh/volume frames (--scale-segmentation, --scale, --group-idx) or '
+            'pass --no-fail-on-empty to keep black strips')
 
     if rendered_strips == 0:
         raise click.ClickException(
