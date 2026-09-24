@@ -18,22 +18,21 @@ from vesuvius.neural_tracing.fiber_follow.data import (
 from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.model import ARCHITECTURE, FollowNet, FollowNetConfig, prepare_model
 from vesuvius.neural_tracing.fiber_follow.online import OnlineCollector
+from vesuvius.neural_tracing.fiber_follow.runloop import (
+    RunLog, lr_at, optimizer_step, prepare_run_dir,
+    read_checkpoint as _read_checkpoint, save_checkpoint as _save_checkpoint,
+)
 from vesuvius.neural_tracing.fiber_follow.trace import DEFAULT_CONFIDENCE
 from vesuvius.neural_tracing.fiber_follow.supervision import loss_fn, teacher_candidates
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolumeSpec
 
 
 def save_checkpoint(path, model, vol_spec, sample_cfg, extra=None):
-    torch.save(dict(architecture=ARCHITECTURE, data_policy=DATA_POLICY, model=model.state_dict(),
-                    model_cfg=model.cfg.to_dict(), crop=dataclasses.asdict(sample_cfg.crop),
-                    n_history=sample_cfg.n_history, vol_spec=vol_spec.to_dict(), **(extra or {})), path)
+    _save_checkpoint(path, model, vol_spec, sample_cfg.crop, sample_cfg.n_history, ARCHITECTURE, extra)
 
 
 def read_checkpoint(path, device='cuda'):
-    ck = torch.load(path, map_location=device, weights_only=False)
-    if ck['architecture'] != ARCHITECTURE or ck['data_policy'] != DATA_POLICY:
-        raise ValueError('Checkpoint does not match the current architecture and supervision contract')
-    return ck
+    return _read_checkpoint(path, ARCHITECTURE, device)
 
 
 def load_checkpoint(path, device='cuda'):
@@ -52,7 +51,7 @@ def main(argv=None):
     ap.add_argument('--ct')
     ap.add_argument('--ct-level', type=int, default=1)
     ap.add_argument('--ct-grid-scale', type=float, default=8., help='Base voxels per selected CT voxel; s1_ds2 level 0 uses 4')
-    ap.add_argument('--inputs', choices=('fiber', 'fiber+ct', 'ct'))
+    ap.add_argument('--inputs', choices=('fiber', 'fiber+ct', 'ct', 'ct+presence'))
     ap.add_argument('--name', required=True)
     ap.add_argument('--out-root', default=str(Path(__file__).parent/'output'))
     ap.add_argument('--device', default='cuda')
@@ -70,6 +69,7 @@ def main(argv=None):
     ap.add_argument('--log-every', type=int, default=50)
     ap.add_argument('--diag-every', type=int, default=500, help='0 disables validation rollouts and images')
     ap.add_argument('--diag-seeds', type=int, default=16)
+    ap.add_argument('--diag-batch', type=int, default=8, help='Maximum simultaneous diagnostic traces')
     ap.add_argument('--crop-depth', type=int, default=64)
     ap.add_argument('--crop-width', type=int, default=64)
     ap.add_argument('--crop-behind', type=int, default=16)
@@ -82,10 +82,11 @@ def main(argv=None):
     ap.add_argument('--hist-stride', type=int, default=4)
     ap.add_argument('--clean-points', type=int, default=8, help='Number of annotated past points to reconstruct with the current point')
     ap.add_argument('--clean-weight', type=float, default=.5)
-    ap.add_argument('--heat-bins', type=int, default=61)
-    ap.add_argument('--heat-spacing', type=float, default=1., help='Trace-grid voxels per lateral heatmap sample')
-    ap.add_argument('--heatmap-target', choices=('planes', 'tube'), default='planes')
-    ap.add_argument('--tube-sigma', type=float, default=.7, help='Gaussian tube sigma in trace-grid voxels')
+    ap.add_argument('--clean-tangent-points', type=int, default=6,
+                    help='Recent corrected points for the decoder tangent, including current (2 = two-point ablation)')
+    ap.add_argument('--max-history-correction', type=float, default=4.)
+    ap.add_argument('--max-lateral-slope', type=float, default=2.)
+    ap.add_argument('--path-sample-radius', type=float, default=2.)
     ap.add_argument('--n-candidates', type=int, default=4)
     ap.add_argument('--widths', type=int, nargs='+', default=(24, 48, 96))
     ap.add_argument('--hidden', type=int, default=96)
@@ -98,6 +99,7 @@ def main(argv=None):
     ap.add_argument('--history-wobble', type=float, default=1.)
     ap.add_argument('--tolerance', type=float, default=1.5, help='Candidate correctness radius, grid voxels')
     ap.add_argument('--rank-weight', type=float, default=1.)
+    ap.add_argument('--rank-temperature', type=float, default=20., help='Softmax temperature on candidate quality for the ranking target')
     ap.add_argument('--confidence-weight', type=float, default=1.)
     ap.add_argument('--confidence', type=float, default=DEFAULT_CONFIDENCE, help='Rollout confidence threshold; tune on validation')
     ap.add_argument('--onpolicy', nargs='+', default=[], help='Existing decision caches, oldest to newest')
@@ -111,7 +113,7 @@ def main(argv=None):
     ap.add_argument('--dagger-trace-len', type=float, default=6000.)
     ap.add_argument('--replay-keep', type=int, default=4, help='Recent completed collections retained in active replay')
     args = ap.parse_args(argv)
-    if min(args.steps, args.batch, args.ckpt_every, args.log_every, args.replay_keep) < 1:
+    if min(args.steps, args.batch, args.ckpt_every, args.log_every, args.replay_keep, args.diag_batch) < 1:
         ap.error('Steps, batch, checkpoint/log intervals and replay-keep must be positive')
     if min(args.dagger_every, args.diag_every, args.workers) < 0 or args.dagger_batch < 1 or args.dagger_seeds < 1 or args.tolerance <= 0:
         ap.error('Invalid collection, diagnostic, worker, or tolerance settings')
@@ -119,16 +121,15 @@ def main(argv=None):
         ap.error('n-history must cover hist-points * hist-stride')
     if args.clean_points < 1 or args.clean_points > args.hist_points*args.hist_stride or args.clean_weight < 0:
         ap.error('clean-points must be positive, fit in history, and clean-weight must be nonnegative')
-    if min(args.crop_spacing, args.heat_spacing, args.ct_grid_scale, args.tube_sigma) <= 0:
-        ap.error('Voxel spacings and tube sigma must be positive')
+    if args.clean_tangent_points < 2:
+        ap.error('clean-tangent-points must be at least 2')
+    if min(args.crop_spacing, args.ct_grid_scale) <= 0:
+        ap.error('Voxel spacings must be positive')
     if not math.isfinite(args.history_sigma) or args.history_sigma <= 0 or not math.isfinite(args.history_jitter) or args.history_jitter < 0:
         ap.error('History sigma must be positive and jitter nonnegative')
     if args.allow_history_change and not args.init:
         ap.error('--allow-history-change requires --init')
-    out = Path(args.out_root)/args.name
-    if (out/'config.json').exists():
-        raise FileExistsError(f'{out} already contains a run; use a new --name')
-    out.mkdir(parents=True, exist_ok=True)
+    out = prepare_run_dir(args.out_root, args.name)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     spec = FiberVolumeSpec(args.fiber_zarrs, ct_zarr=args.ct, ct_level=args.ct_level, ct_grid_scale=args.ct_grid_scale,
@@ -139,16 +140,15 @@ def main(argv=None):
     sample_cfg = SampleConfig(crop=crop, n_future=args.n_future, future_step=args.future_step, n_candidates=args.n_candidates,
                               n_history=args.n_history, clean_points=args.clean_points,
                               lateral_sigmas=tuple(args.lateral_sigmas),
-                              angle_sigmas_deg=tuple(args.angle_sigmas), history_wobble=args.history_wobble, history_jitter=args.history_jitter,
-                              heatmap_target=args.heatmap_target, tube_sigma=args.tube_sigma)
-    model_cfg = FollowNetConfig(in_channels={'fiber':8, 'fiber+ct':9, 'ct':2}[spec.mode],
+                              angle_sigmas_deg=tuple(args.angle_sigmas), history_wobble=args.history_wobble, history_jitter=args.history_jitter)
+    model_cfg = FollowNetConfig(in_channels={'fiber':8, 'fiber+ct':9, 'ct':2, 'ct+presence':3}[spec.mode],
                                 depth=crop.depth, width=crop.width, behind=crop.behind,
                                 spacing=crop.spacing, widths=tuple(args.widths), hidden=args.hidden,
                                 n_future=args.n_future, future_step=args.future_step, hist_points=args.hist_points,
-                                hist_stride=args.hist_stride, heat_bins=args.heat_bins, n_candidates=args.n_candidates,
-                                clean_points=args.clean_points,
-                                norm=args.norm, heat_spacing=args.heat_spacing,
-                                heatmap_target=args.heatmap_target, tube_sigma=args.tube_sigma)
+                                hist_stride=args.hist_stride, n_candidates=args.n_candidates,
+                                clean_points=args.clean_points, clean_tangent_points=args.clean_tangent_points,
+                                norm=args.norm, max_history_correction=args.max_history_correction,
+                                max_lateral_slope=args.max_lateral_slope, path_sample_radius=args.path_sample_radius)
     model = prepare_model(FollowNet(model_cfg), args.device)
     if args.init:
         initial, initial_crop, nh, initial_spec, _ = load_checkpoint(args.init, args.device)
@@ -186,7 +186,7 @@ def main(argv=None):
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     tracer = None
     if args.diag_every:
-        from vesuvius.neural_tracing.fiber_follow.diag import plot_batch, plot_curves, plot_tube, rollout_diag
+        from vesuvius.neural_tracing.fiber_follow.diag import plot_batch, plot_curves, rollout_diag
         from vesuvius.neural_tracing.fiber_follow.evaluate import make_seeds
         from vesuvius.neural_tracing.fiber_follow.trace import ModelTracer, TraceParams
         from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume
@@ -199,11 +199,8 @@ def main(argv=None):
     print(json.dumps(dict(train_fibers=len(train_f), val_fibers=len(val_f), parameters=sum(p.numel() for p in model.parameters()))), flush=True)
     it = iter(dl)
     start = time.monotonic()
-    log = (out/'log.jsonl').open('a')
-    def record(values):
-        print(json.dumps(values), flush=True)
-        log.write(json.dumps(values)+'\n')
-        log.flush()
+    log = RunLog(out/'log.jsonl')
+    record = log.record
     replay_seen = 0
     try:
         for step in range(1, args.steps+1):
@@ -213,9 +210,7 @@ def main(argv=None):
             parts = [next(it) for _ in range(args.batch//chunk)]
             batch = {k: torch.cat([p[k] for p in parts]).to(args.device) for k in parts[0]}
             replay_seen += int((batch['source'] > 0).sum().item())
-            lr = args.lr*min(1., step/max(1, args.warmup))*.5*(1+math.cos(math.pi*(step-1)/args.steps))
-            for group in opt.param_groups:
-                group['lr'] = lr
+            lr = lr_at(step, args.lr, args.warmup, args.steps)
             model.train()
             # Fixed training shapes benefit from cuDNN's cached kernel search.
             # Rollouts below disable it because their active batch shrinks.
@@ -224,13 +219,8 @@ def main(argv=None):
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.device.startswith('cuda')):
                 output = model(batch['x'].float(), batch['hist'], batch['hmask'], extras)
             loss, metrics = loss_fn(output, batch, model.cfg, args.tolerance, args.rank_weight,
-                                    args.confidence_weight, args.clean_weight)
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f'Non-finite training loss at step {step}')
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
-            opt.step()
+                                    args.confidence_weight, args.clean_weight, args.rank_temperature)
+            optimizer_step(model, opt, loss, step, lr)
             if step % args.log_every == 0 or step == args.steps:
                 record(dict(step=step, loss=loss.item(), lr=lr, replay_samples_seen=replay_seen,
                             fresh_fraction=(batch['source'] == 0).float().mean().item(),
@@ -249,13 +239,9 @@ def main(argv=None):
                 gt = torch.cat([batch['plane_ab'], pred[..., 2:]], -1)
                 plot_batch(batch['x'], pred, gt, batch['plane_mask'], crop, out/'images'/f'batch_{step:06d}.png',
                            output['clean_history'], batch['clean_local'], batch['clean_mask'],
-                           heat_half=model.plane_grid[:, -1, -1, 0].cpu().numpy(),
                            source=batch['source'], offtrack=batch['offtrack'],
                            confidence=output['confidence'][torch.arange(len(chosen), device=chosen.device), chosen])
-                if args.heatmap_target == 'tube':
-                    plot_tube(batch['x'], batch['tube_target'], batch['tube_mask'], output['tube_logits'],
-                              out/'images'/f'tube_{step:06d}.png', offtrack=batch['offtrack'])
-                summ = rollout_diag(tracer, diag_fibers, seeds, out/'images'/f'rollout_{step:06d}.png')
+                summ = rollout_diag(tracer, diag_fibers, seeds, out/'images'/f'rollout_{step:06d}.png', batch=args.diag_batch)
                 record(dict(step=step, roll_coverage=summ['coverage_mean'], roll_diverged=summ['diverged'],
                             roll_precision=summ['length_precision'], roll_unknown_fraction=summ['unknown_length_fraction']))
                 plot_curves(out/'log.jsonl', out/'curves.png')

@@ -135,8 +135,7 @@ def main(argv=None):
     model, crop, n_hist, spec, ck = load_checkpoint(args.checkpoint, args.device)
     cfg = SampleConfig(crop=crop, n_history=n_hist, clean_points=model.cfg.clean_points,
                        n_future=model.cfg.n_future, future_step=model.cfg.future_step,
-                       n_candidates=model.cfg.n_candidates, heatmap_target=model.cfg.heatmap_target,
-                       tube_sigma=model.cfg.tube_sigma)
+                       n_candidates=model.cfg.n_candidates)
     if args.fiber_zarrs:
         spec.fiber_zarr_dir = args.fiber_zarrs
     vol = FiberVolume(spec, cache_bytes=2 << 30)

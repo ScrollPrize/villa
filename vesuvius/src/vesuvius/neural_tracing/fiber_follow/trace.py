@@ -32,10 +32,19 @@ class TraceParams:
     loop_radius: float = 1.5
     loop_skip: int = 40
     explore_calls: int = 0  # collection only: bounded suffix after first would-stop
+    # Stop policy. A would-stop call (no candidate prefix clears ``confidence``)
+    # ends the trace only after ``stop_patience`` consecutive such calls; the
+    # earlier ones commit a single point of the top-ranked candidate, provided
+    # its first-point confidence reaches ``commit_floor`` (None: no floor).
+    # Defaults reproduce the immediate stop.
+    stop_patience: int = 1
+    commit_floor: float | None = None
 
     def __post_init__(self):
         if self.n_commit < 1 or self.max_len <= 0 or not 0 <= self.confidence <= 1 or self.explore_calls < 0:
             raise ValueError('Invalid rollout parameters')
+        if self.stop_patience < 1 or (self.commit_floor is not None and not 0 <= self.commit_floor <= 1):
+            raise ValueError('stop_patience must be positive and commit_floor within [0, 1]')
 
 
 def point_samples(vol: FiberVolume, pts_xyz: np.ndarray) -> np.ndarray:
@@ -49,7 +58,7 @@ def point_samples(vol: FiberVolume, pts_xyz: np.ndarray) -> np.ndarray:
 
 def field_axis(vol: FiberVolume, p_xyz: np.ndarray) -> tuple[np.ndarray, float]:
     """Trilinear axis tensor + presence at a point -> (principal axis xyz, presence)."""
-    if getattr(getattr(vol, 'spec', None), 'mode', None) == 'ct':
+    if getattr(getattr(vol, 'spec', None), 'mode', None) in ('ct', 'ct+presence'):
         # Initialization only: estimate a local ridge axis from presence, never
         # load or expose the predicted direction vectors to CT-only tracing.
         offsets = np.stack(np.meshgrid(*[np.arange(-3, 4)]*3, indexing='ij'), -1).reshape(-1, 3)
@@ -117,6 +126,7 @@ class ModelTracer:
         reasons = ['']*n
         length = np.zeros(n)
         exploration = np.full(n, -1, int)
+        stop_streak = np.zeros(n, int)
         last_segment = [np.asarray([p[-1]]) for p in paths]
         pp = self.p
         while active.any():
@@ -139,9 +149,14 @@ class ModelTracer:
                              tensor(hist).float(), tensor(hm), self.grid, n_render=render_count(self.crop),
                              gate_direction=self.crop.gate_direction, input_scale=getattr(self.vol, 'input_scale', 1.),
                              history_sigma=self.crop.history_sigma, history_render=self.crop.history_render)
+            if self.vol.spec.mode == 'ct+presence':
+                from vesuvius.neural_tracing.fiber_follow.data import add_presence_input
+                items = [dict(pos=p, frame=f) for p, f in zip(pos, fr)]
+                x = add_presence_input(x, items, self.vol, self.crop, self.grid, self.pool)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
                 out = self.model(x, tensor(hist).float(), tensor(hm))
             candidates, ranks, confidence = [out[k].float().cpu().numpy() for k in ('candidates', 'ranks', 'confidence')]
+            clean_history = out['clean_history'].float().cpu().numpy() if on_decision is not None else None
             for j, i in enumerate(idx):
                 conf = np.minimum.accumulate(confidence[j], axis=-1)
                 viable = conf[:, 0] >= pp.confidence
@@ -155,6 +170,8 @@ class ModelTracer:
                              candidates=candidates[j].copy(), rank_scores=ranks[j].copy(), confidence=conf.copy(),
                              chosen=chosen, n_commit=commit, would_stop=would_stop, exploratory=exploratory,
                              travelled=float(length[i]), last_segment=last_segment[i].copy())
+                if on_decision is not None:
+                    state['clean_history'] = clean_history[j].copy()
                 if on_decision is not None and on_decision(int(i), state) is False:
                     active[i], reasons[i] = False, 'oracle'
                     continue
@@ -162,8 +179,13 @@ class ModelTracer:
                     active[i], reasons[i] = False, 'exploration_limit'
                     continue
                 if would_stop and not exploratory:
-                    active[i], reasons[i] = False, 'confidence'
-                    continue
+                    stop_streak[i] += 1
+                    below_floor = pp.commit_floor is not None and conf[chosen, 0] < pp.commit_floor
+                    if stop_streak[i] >= pp.stop_patience or below_floor:
+                        active[i], reasons[i] = False, 'confidence'
+                        continue
+                elif not would_stop:
+                    stop_streak[i] = 0
                 if exploratory:
                     exploration[i] += 1
                 commit = max(1, commit)

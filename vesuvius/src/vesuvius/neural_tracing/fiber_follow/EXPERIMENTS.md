@@ -9,6 +9,296 @@ Status as of 2026-09-24. See `README.md` for file layout and commands.
 > loader/scorer fixes these issues; see `README.md` for the new semantics and
 > fresh-training commands. The numbers below are not a controlled-span benchmark.
 
+## Correcting lateral clipping in the 64-voxel forecast (2026-09-24)
+
+The running `ct0_presence_h32_f64_v6` exposed a crop-support problem. At step
+2700, the last 20 logged training batches averaged 19.6% of known dense future
+crossings outside the image crop and 21.7% outside the heatmap; the previous
+16-voxel-horizon run had roughly 0.4–0.5%. Batch images show genuine clipping
+and proposals continuing on unrelated visible structures after GT leaves view.
+The initial long-horizon preset retained a 64-sample lateral width and
+4°/10°/20° heading-noise scales while quadrupling the forecast horizon.
+
+A geometry-only audit used seed 9301, 1024 length-weighted fresh-state requests
+(935 passed the original crop's holdout check), and 1002 sampled on-track states
+from the active replay caches. All widths were evaluated on the same existing
+frames/labels; no CT reads, network scores, or retraining enter these results.
+The audit does not simulate the wider crop's revised state-admission footprint.
+
+| Lateral samples | Heading-noise scales | Fresh crossings OOB | On-track replay crossings OOB |
+|---|---|---:|---:|
+| 64 | 4/10/20° | 12.94% | 23.77% |
+| 64 | 2/5/10° | 10.23% | unchanged frames |
+| 64 | 0/0/0° | 9.30% | unchanged frames |
+| 96 | 4/10/20° | 5.59% | 12.48% |
+| 128 | 4/10/20° | 2.71% | 7.19% |
+| **128** | **2/5/10°** | **2.06%** | **7.19%** |
+
+Reducing fresh augmentation alone cannot address curvature or policy-heading
+errors in replay. The corrected launcher therefore uses crop **208×128×128**
+at spacing 0.5, still 32 voxels behind and a 64-voxel forecast. Lateral image
+support is ±31.75; `heat_bins=125` covers ±31 at the same 0.5 spacing. Heading
+noise becomes 2/5/10°. Architecture and target semantics are unchanged; known
+geometry outside the crop remains known geometry. This reduces, but does not
+eliminate, clipping (about 15.2% of replay crossings in the final 16 voxels are
+still outside the wider crop in this audit).
+
+The wider crop has 4× the voxels of the initial v6 crop. Preset batch sizes are
+2 training / 1 collection / 1 diagnostic; all 32 diagnostic seeds remain.
+There is no gradient accumulation. At 50k steps this means 100k examples, versus
+400k for the initial v6 preset; `--steps 200000` matches that example budget.
+These GPU batch sizes are provisional until a memory check can run after the
+current narrow job is stopped. The running job is not altered by this preset.
+
+Validation: a production-size CPU float32 forward/backward optimizer step
+with native CT/presence from `anon_20260902T164827563_000384.json`, input shape
+`[1,3,208,128,128]`, all 64 planes annotated, loss 3.25553, finite gradients for
+every parameter, and a v6 checkpoint roundtrip. This is a shape/data check,
+not a quality result or GPU throughput measurement. Existing focused tests
+and launcher shell syntax are also checked.
+
+```bash
+# After stopping the narrow run, launch a fresh run with the corrected preset:
+bash scripts/launch_ct_tube.sh ct0_presence_h32_f64_w128_v6
+# Geometry audit and full-size CPU validation used the existing environment:
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 /home/sean/Documents/villa4/vesuvius/.venv/bin/python /tmp/fiber-follow-context-audit.py
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 /home/sean/Documents/villa4/vesuvius/.venv/bin/python /tmp/fiber-follow-v6-wide-smoke.py
+```
+
+Audit script/results: `/tmp/fiber-follow-context-audit.py` and
+`/tmp/fiber-follow-context-audit.log`. CPU smoke script/results:
+`/tmp/fiber-follow-v6-wide-smoke.py` and `/tmp/fiber-follow-v6-wide-smoke.log`.
+The fresh audit is repeatable with the fixed seed; replay results depend on
+which caches were active when the audit ran.
+
+## 32-voxel visual history, 64-voxel forecast, joint scoring (2026-09-24)
+
+Fresh architecture `spatial_candidates_v6`, requested after the v5 run reached
+8k. V5 cleaning was improving while local proposal metrics had plateaued:
+selected error averaged 0.975 over 3k–5k and 0.969 over 6.5k–8k. Fixed-32-seed
+rollout diagnostics at threshold 0.7 remained variable: 6k coverage/precision
+40.2%/91.9%, 6.5k 63.7%/82.5%, 8k 23.1%/85.5%. These observations motivate
+the experiment; they do not establish the cause of the variation.
+
+Configuration: native CT + presence + own-history tube; crop 208×64×64,
+spacing 0.5, behind 64 samples (=32 trace voxels), forward image extent 71.5.
+Predict 64 future points at spacing 1; clean and explicitly score against
+32 past points plus current. Keep 128-coordinate geometric history, six
+proposals, widths 24/64/128, hidden 128, six-point tangent, and at most four
+committed points. Lateral support stays ±15.75; monitor crop/heatmap OOB rates.
+
+Both ranking and prefix confidence now compare history with the entire
+proposed continuation. History uses an ordered GRU plus masked token pooling;
+future tokens use a history-initialized forward GRU and a backward GRU. A
+fusion head combines both directions, pooled future evidence, and explicit
+history at each point. This provides short gradient paths from older history
+and distant future points. Prefix correctness labels, unknown-end censoring,
+and per-candidate state isolation are unchanged. A wrong distant suffix does
+not label an otherwise correct early prefix negative. The beam model removes
+these spatial-only modules and retains its existing scoring design.
+
+This is a fresh run with no earlier-checkpoint adapters. Launch:
+
+```bash
+bash scripts/launch_ct_tube.sh ct0_presence_h32_f64_v6
+```
+
+The crop has 3.25× as many voxels as v5. On the available RTX 5090 (32 GB),
+a production-shape batch-32 forward ran out of memory. Batch 16 passed two
+forward/backward optimizer steps but peaked at 22.37 GiB allocated / 25.89 GiB
+reserved, leaving too little margin for simultaneous collection. The preset
+therefore uses batch 8 and collection batch 4, without gradient accumulation.
+This halves/quarters examples per step relative to batch 16/32; compare runs
+by examples and elapsed time as well as steps. The 50k-step budget gives 400k
+examples. No learning-rate or normalization changes were made.
+
+Validation of the final model (1,902,846 parameters):
+
+- 19 focused tests passed: both histories affect ranking/confidence; history
+  beyond eight points affects relative ranks; a changed distant suffix affects
+  first-point confidence; candidate permutation/isolation and masked-history
+  behavior; BF16 backward; long-horizon prefix labels and unknown-end censoring;
+  native CT/presence alignment; checkpoint/tracing/training integration; batched
+  diagnostics preserve all seeds and metrics.
+- Broader suite: 88 passed, the same 15 failures recorded before this change,
+  and one beam module skipped because `vc.fiber_trace` is unavailable here.
+- Two GPU optimizer steps with the production shape `[8,3,208,64,64]`, native
+  CT and presence from `anon_20260902T164827563_000384.json` (one real sample
+  repeated for capacity testing). All parameter gradients finite; loss
+  3.27232 then 3.21446; all 64 planes known; v6 checkpoint roundtrip passed.
+  Peak training allocation/reservation: 20.97/22.11 GiB. A separate batch-4
+  scorer passed while the training allocations remained resident, using
+  2.38/3.30 GiB allocated/reserved. This checks simultaneous residency, not
+  end-to-end asynchronous collection throughput.
+- Validation rollouts are now chunked (`--diag-batch 4` in the preset), retaining
+  all 32 diagnostic seeds. This avoids a 32-seed forward at the first diagnostic.
+
+Exact verification commands from this directory (the existing shell Python
+has pytest; the training virtualenv supplies the GPU environment):
+
+```bash
+PYTHONPATH=/home/sean/Documents/villa4/vesuvius/src OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q -p no:cacheprovider \
+  tests/test_history_confidence.py
+SMOKE_BATCH=8 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+  /home/sean/Documents/villa4/vesuvius/.venv/bin/python /tmp/fiber-follow-v6-smoke.py
+```
+
+Logs: `/tmp/fiber-follow-v6-final-tests.log` and
+`/tmp/fiber-follow-v6-smoke-final.log`. The smoke script and collector memory
+probe are `/tmp/fiber-follow-v6-smoke.py` and
+`/tmp/fiber-follow-v6-collector-memory.py`.
+No training-quality or throughput improvement is claimed by the smoke tests.
+
+## CT + presence and observed/cleaned history confidence (2026-09-24)
+
+Implemented for the next fresh run as `spatial_candidates_v5`; no training
+quality result is claimed yet. The stop-policy sweep below motivates stronger
+history evidence for confidence, because changing rank alone seldom rescues
+the examined wrong selections.
+
+- Confidence reads a masked sequence of observed and cleaned recent history,
+  with image features at both positions and their correction vectors, before
+  processing each candidate. Ranking still pools candidate features.
+- Initial proposal tangent is fitted over up to six corrected points; it can
+  be compared with `--clean-tangent-points 2`. First-plane extrapolation uses
+  the corrected anchor's forward coordinate. Stored rollout geometry is not
+  rewritten by the cleaner.
+- `launch_ct_tube.sh` now supplies native CT, independently sampled fiber
+  presence, and the history tube (`--inputs ct+presence`). Presence is a learned
+  input only. Neither direction arrays nor presence-derived labels are used.
+- Position/tangent improvement and correction magnitude are logged with valid
+  counts. `eval_ckpt.py --history-audit` stratifies held-out decisions by gate
+  errors, drift, and departure, without changing the trace. Unknown boundaries
+  censor the audit; departed clean geometry is not scored as supervised truth.
+
+Next comparison: fresh V5 CT + presence versus V5 CT-only, followed by the
+two-point/six-point tangent comparison. Keep ranking temperature, replay
+settings, and evaluation seeds fixed. Sweep confidence and compare coverage at
+matched wrong length. Historical checkpoint results do not establish the new
+head's calibration. V5 has no checkpoint adapters.
+
+Validation: 15 new CPU tests pass, including independent CT/presence sampling
+under rotation, both crop-sampler paths, history masking and recurrent-state
+isolation, BF16 confidence forward/backward with native CPU kernels, corrected
+anchor extrapolation, audit censoring, a checkpoint roundtrip, matching training
+and rollout inputs, and a two-step training-entrypoint smoke. The broader
+follower/CT/history suites report 84 passed and the same 15 failures observed
+before this change (stale clean-head interfaces and the removed replay helper).
+Pytest was loaded from the existing uv cache; no packages were installed.
+
+A CPU forward/backward pass with the actual 64-cube configuration
+(`widths=24,64,128`, hidden 128, batch 1, six candidates) used a real sample from
+`anon_20260902T164827563_000384.json`, native level-0 CT, and the presence zarr.
+The input shape was `[1,3,64,64,64]`, presence ranged from 0 to 0.9995, and all
+gradients were finite. Model size is 1,705,214 parameters. This is a pipeline
+smoke check with random weights, not a training-quality or throughput result.
+Local logs: `/tmp/fiber-history-verified-tests.log` and
+`/tmp/fiber-history-real-smoke.log`.
+
+## Stop policy sweep on the live CT run (2026-09-24)
+
+`ct0_tube_64_clean_history`, checkpoint 24,000 of 50,000. 32 held-out fibers,
+one seed each, both directions (64 rollouts), 400-voxel limit, `rollout_diag`
+scoring (coverage capped at 400). Precision is length precision. Harness:
+`ModelTracer` with `TraceParams`; the new `stop_patience` / `commit_floor`
+fields commit a single point on a would-stop call until `stop_patience`
+consecutive would-stops, unless the top candidate's first-point confidence is
+below `commit_floor`. Defaults reproduce the immediate stop.
+
+| confidence | patience / floor | coverage | precision | diverged | wrong len | followed median | ends by stop |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 0.7 | 1 / - (current default) | 0.122 | 0.864 | 0.06 | 6.6 | 12.6 | |
+| 0.6 | 1 / - | 0.167 | 0.902 | 0.09 | 6.5 | 20.8 | |
+| 0.5 | 1 / - | 0.202 | 0.851 | 0.16 | 13.4 | 30.2 | |
+| 0.4 | 1 / - | 0.247 | 0.850 | 0.23 | 16.7 | 32.8 | |
+| **0.3** | 1 / - | **0.323** | **0.852** | 0.28 | 21.7 | 41.2 | |
+| 0.2 | 1 / - | 0.390 | 0.837 | 0.30 | 29.1 | 78.9 | 46/64 |
+| 0.7 | 2 / - | 0.164 | 0.847 | 0.09 | 10.7 | 24.3 | |
+| 0.7 | 3 / 0.3 | 0.207 | 0.822 | 0.13 | 16.4 | 30.9 | |
+| 0.5 | 2 / - | 0.256 | 0.814 | 0.23 | 21.9 | 41.7 | |
+| 0.5 | 3 / 0.2 | 0.318 | 0.859 | 0.20 | 19.7 | 47.0 | |
+| 0.4 | 2 / - | 0.342 | 0.843 | 0.27 | 24.2 | 50.6 | 53/64 |
+| 0.3 | 2 / - | 0.382 | 0.799 | 0.39 | 37.5 | 72.9 | 45/64 |
+| 0.3 | 3 / 0.15 | 0.386 | 0.817 | 0.33 | 33.8 | 72.1 | 46/64 |
+| 0.3 | 4 / 0.1 | 0.390 | 0.758 | 0.38 | 48.5 | 72.9 | 42/64 |
+
+Reading: lowering the threshold from 0.7 to 0.3 multiplies coverage by 2.6 at
+the same length precision; below 0.3, or with patience on top, coverage gains
+are small and precision drops. Even at 0.2 about 70% of rollouts still end by
+a confidence stop with a median of 75 voxels followed: per-decision false
+stops of a few percent compound over dozens of decisions, so the head's
+discrimination, not the threshold, is the remaining limit. Recommended
+operating point for this checkpoint: `confidence 0.3`, default patience.
+
+Gate calibration on the run's own replay cache (`decisions_023500`, 1,215
+on-policy states, 44% exploratory, 12% off-track; labels recomputed with
+`candidate_labels` for the rank-selected proposal, first prefix point):
+
+| threshold | false stop P(stop \| correct) | false continue P(go \| wrong) |
+|---:|---:|---:|
+| 0.3 | 0.03 | 0.59 |
+| 0.5 | 0.05 | 0.51 |
+| 0.7 | 0.09 | 0.40 |
+
+The selected proposal is wrong in 25% of these (failure-enriched) states, and
+in only 12% of those is another proposal correct, so ranking is not the
+problem there; the confidence head is. Of the 947 hard replay states, 16% are
+off-track (negatives only), 18% are on-track would-stops, 98% of which carry
+a known GT continuation (the intended corrective positives), and 67% are the
+48-voxel pre-departure window.
+
+Changes made for the next run (no effect on the running process):
+`--rank-temperature` (default 20, was a fixed 5) keeps the listwise ranking
+target peaked once proposals are good, with `rank_target_entropy` logged
+(1 = uniform target); `gate{0.3,0.5,0.7}_{first,commit}_{false_stop,false_go}`
+and `gate_*_negatives` are logged every step; `TraceParams.stop_patience` and
+`commit_floor` are available to rollouts, collection and `eval_ckpt --params`.
+
+## Beam re-ranker method: bindings and pipeline validation (2026-09-24)
+
+New training method in `beam/` (see `README.md`, "Beam re-ranker"). The
+volume-cartographer beam tracer gained a per-request beam hook
+(`FiberTraceBeamHookOptions` on the one-way, segment, whole-fiber and
+extrapolation requests) and nanobind bindings `vc.fiber_trace`. With no hook
+the C++ search is unchanged; all 51 `test_fiber_trace3d` and 9
+`test_fiber_trace_review` cases pass, including new cases that check an
+observe-only or identity hook reproduces the plain trace exactly, that
+replacement losses drive the prune, and that `stop` ends the trace.
+
+Real-data checks with the dev build tree (`build-dev`, RelWithDebInfo), the
+`PHercParis4-...-7ff0ce6c` prediction manifest and `las_008` normals:
+
+| check | result |
+|---|---|
+| derived scales | VC trace voxel = 2 base voxels; 4 VC trace voxels per fiber_follow grid voxel |
+| `whole_fiber_metric` on held-out `anon_20260815T020414697_000008.json` (9 spans) | 0 restarts from Python (3.3 s, 1 thread) and from `vc_fiber_trace_metric` (0.8 s wall, OpenMP) |
+| `BeamDataset`, one process, 64-cube CT states, pool 32 | 15 states/s after a 0.5 s first chunk |
+| label sanity, unperturbed starts, no hard oversampling (80 states) | hand-best candidate on-fiber in 100% of pools; 98% of labeled candidates on-fiber; hand-best max error median 0.56 grid voxels, all below 2 |
+| 8-step GPU smoke, batch 16, 2 forkserver workers, shared GPU | 1,620,852 parameters, finite losses, span diagnostics with the model hook ran (1 fiber, 10 spans, 0 restarts hand and model) |
+
+Hand-beam baseline on all 124 held-out fibers
+(`beam.evaluate_spans hand --threads 6`, error threshold 20 base voxels,
+200 s):
+
+| spans | length (grid voxels) | restarts per 1000 grid voxels | span success | fibers with a restart |
+|---:|---:|---:|---:|---:|
+| 4,497 | 533,901 | 0.451 | 94.6% | 75 of 124 |
+
+So the hand beam fails on about one span in twenty, and uniformly sampled
+training traces rarely contain an off-fiber hand choice (about 2% of pool
+entries). `beam/mine.py` therefore runs the same metric once over the
+training fibers, caches the failing span indices, and the dataset traces a
+mined span with `--hard-span-prob` (default 0.5). No model quality claims are
+made yet; the comparison to run is `evaluate_spans` hand versus a trained
+checkpoint on these 124 fibers.
+
+Existing follower suites: the 15 failures in `test_fiber_follow*.py` are
+identical with and without the `runloop.py` extraction and come from the
+in-progress `clean_history` model change (`clean_points`, `replay_dict`), not
+from this work. The new `test_fiber_follow_beam.py` (5 cases) and the VC
+`python/tests/test_fiber_trace.py` (7 cases) pass against the build tree.
+
 ## Uniform-cube performance pass (2026-09-24)
 
 On NVIDIA GB10 / PyTorch 2.12.1+cu130, a CUDA profile of the 64-cube showed

@@ -37,7 +37,7 @@ def _curved_slab(vol, centers, axis, half=2):
 
 
 def plot_batch(x, pred, fut, fmask, crop, path, clean_pred, clean_gt, clean_mask,
-               n=6, heat_half=None, source=None, offtrack=None, confidence=None):
+               n=6, source=None, offtrack=None, confidence=None):
     """Crops exactly as the model sees them (sample-index space, forward = up).
 
     Each panel is a thin curved slab (+-2 samples) that follows the GT fiber
@@ -94,11 +94,6 @@ def plot_batch(x, pred, fut, fmask, crop, path, clean_pred, clean_gt, clean_mask
             a.plot(cgi[valid, comp], cgi[valid, 2], '.', color='lime', ms=3)
             a.axhline(crop.behind, color='cyan', ls=':', lw=.8)
             a.plot(mid, crop.behind, 'D', color='cyan', ms=4)
-            if heat_half is not None:
-                bounds = np.asarray(heat_half)
-                for sign in (-1, 1):
-                    edge = _to_index(np.c_[sign*bounds, sign*bounds, pred[i, :, 2]], crop)
-                    a.plot(edge[:, comp], edge[:, 2], ':', color='cyan', lw=.7, alpha=.7)
             outside = (gi[:, :2] < 0).any(-1) | (gi[:, :2] > crop.width-1).any(-1)
             a.plot(np.clip(gi[outside, comp], 0, crop.width-1), gi[outside, 2], 's', color='magenta', ms=4)
             a.set_xlim(-.5, crop.width-.5)
@@ -120,7 +115,7 @@ def plot_batch(x, pred, fut, fmask, crop, path, clean_pred, clean_gt, clean_mask
             title += f'\nnext-step confidence {confidence[i, 0]:.2f}'
         ax[0, i].set_title(title, fontsize=8)
     fig.suptitle("red observed history | blue predicted clean history | green GT | orange full proposal\n"
-                 "cyan: actual current point / prediction limits | dotted orange: actual first step", fontsize=9)
+                 "cyan: actual current point | dotted orange: actual first step", fontsize=9)
     fig.tight_layout(rect=(0, 0, 1, .96))
     fig.savefig(path, dpi=80)
     plt.close(fig)
@@ -138,41 +133,19 @@ def _gt_frames(points):
     return np.stack(frames)
 
 
-def plot_tube(x, target, mask, logits, path, n=4, offtrack=None):
-    """CT/image, history, Gaussian target, prediction and censoring in two views."""
-    offtrack = offtrack[:n].detach().cpu().numpy() if offtrack is not None else None
-    arrays = [x[:n, 0], x[:n, -1], target[:n], logits[:n].float().sigmoid(), mask[:n]]
-    arrays = [a.detach().float().cpu().numpy() for a in arrays]
-    n = len(arrays[0])
-    fig, axes = plt.subplots(2*n, 5, figsize=(12, 4*n), squeeze=False)
-    for i in range(n):
-        for view, axis in enumerate((1, 2)):
-            for j, (values, label) in enumerate(zip(arrays, ('Image', 'History', 'GT tube', 'Predicted tube', 'Known region'))):
-                ax = axes[2*i+view, j]
-                ax.imshow(values[i].max(axis=axis), origin='lower', cmap='gray', vmin=0, vmax=1)
-                title = label
-                if offtrack is not None and offtrack[i]:
-                    if j == 2:
-                        title = 'GT geometry (target masked)'
-                    elif j == 4:
-                        title = 'OFF TRACK: confidence only'
-                ax.set_title(title)
-                ax.set_xticks([])
-                ax.set_yticks([])
-    fig.suptitle('Full 3D tube: two orthogonal maximum projections per sample')
-    fig.tight_layout()
-    fig.savefig(path, dpi=100)
-    plt.close(fig)
-
-
-def rollout_diag(tracer, fibers, seeds, path, max_len=400.0, half=15):
+def rollout_diag(tracer, fibers, seeds, path, max_len=400.0, half=15, batch=8):
     """Trace held-out seeds and show each in a straightened view along its GT
     fiber: arc length up, lateral offset across (u and v panels), presence
     background, GT = centre line (green), trace = orange."""
     old = tracer.p.max_len
     tracer.p.max_len = max_len
     try:
-        paths, reasons = tracer.trace(np.stack([s["pos"] for s in seeds]), np.stack([s["heading"] for s in seeds]))
+        paths, reasons = [], []
+        for start in range(0, len(seeds), batch):
+            chunk = seeds[start:start+batch]
+            p, r = tracer.trace(np.stack([s["pos"] for s in chunk]), np.stack([s["heading"] for s in chunk]))
+            paths.extend(p)
+            reasons.extend(r)
     finally:
         tracer.p.max_len = old
     rows = []

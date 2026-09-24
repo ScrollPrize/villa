@@ -211,8 +211,6 @@ class SampleConfig:
     history_jitter: float = 0.25  # independent point noise; disable for smooth history
     history_wobble: float = 0.0  # max amplitude (voxels) of slow lateral wobble on the own-trace history
     dense_substeps: int = 4
-    heatmap_target: str = 'planes'
-    tube_sigma: float = .7
 
     @property
     def future_s(self) -> np.ndarray:
@@ -257,6 +255,10 @@ def training_state_allowed(item, crop: CropSpec, band: ZBand | None):
             zs.append((loc @ frame.T + pos)[:, 2])
     if 'tube_segments' in item and len(item['tube_segments']):
         zs.append((item['tube_segments'].reshape(-1, 3) @ frame.T + pos)[:, 2])
+    if 'extra_world' in item and len(item['extra_world']):
+        # World-space geometry a method used to build this state (for example
+        # every beam candidate path), which must also avoid the held-out band.
+        zs.append(np.asarray(item['extra_world'])[:, 2])
     z = np.concatenate(zs)
     return not (z.min() < band.hi and z.max() >= band.lo)
 
@@ -357,12 +359,7 @@ def continuation_targets(fiber, t, reverse, pos, frame, cfg, offtrack=False):
     end = (p[-1]-pos) @ frame
     # Only expose endpoint labels when it is within the local traversal window.
     known = fiber.endpoint_stop[0 if reverse else 1] and s[-1]-t <= 2.5*cfg.future_s[-1]
-    tube = {}
-    if cfg.heatmap_target == 'tube':
-        from vesuvius.neural_tracing.fiber_follow.tube import tube_geometry
-        endpoints = fiber.endpoint_stop[::-1] if reverse else fiber.endpoint_stop
-        tube = tube_geometry(p, pos, frame, cfg.crop, cfg.tube_sigma, endpoints, offtrack)
-    return dict(**tube, clean_local=clean_local.astype(np.float32), clean_mask=clean_mask,
+    return dict(clean_local=clean_local.astype(np.float32), clean_mask=clean_mask,
                 fut_local=(fut-pos) @ frame, fmask=fmask,
                 plane_ab=ab, plane_mask=mask, planes=cfg.future_s,
                 dense_ab=dense_ab, dense_mask=dense_mask, dense_planes=dense_planes,
@@ -491,13 +488,27 @@ def _grid_flat(crop: CropSpec) -> np.ndarray:
     return g
 
 
-def read_blocks(items, vol: FiberVolume, crop: CropSpec, pool=None):
-    scale = getattr(vol, 'input_scale', 1.)
+def read_blocks(items, vol: FiberVolume, crop: CropSpec, pool=None, *, presence=False):
+    scale = 1. if presence else getattr(vol, 'input_scale', 1.)
     S = int(np.ceil(crop.block_size*scale))
     starts = np.floor(np.stack([block_start(it["pos"], it["frame"], crop) for it in items])*scale).astype(np.int64)
-    read = lambda st: vol.raw_block(st, (S, S, S))
+    read = lambda st: vol.presence.read(st, (S, S, S))[None] if presence else vol.raw_block(st, (S, S, S))
     raw = np.stack(list(map(read, starts) if pool is None else pool.map(read, starts)))
     return raw, starts
+
+
+def add_presence_input(x, items, vol, crop, grid, pool=None):
+    """Insert presence before history, sampling the fiber grid independently of CT.
+
+    Shared by training and rollout. CT retains its native samples; the scalar
+    presence prediction is interpolated directly at the same world locations.
+    """
+    raw, starts = read_blocks(items, vol, crop, pool, presence=True)
+    tensor = lambda values: torch.as_tensor(np.asarray(values), device=x.device)
+    presence = sample_oriented_fast(tensor(raw), tensor(starts).float(),
+                                    tensor([it['pos'] for it in items]).float(),
+                                    tensor([it['frame'] for it in items]).float(), grid.to(x.device))
+    return torch.cat([x[:, :-1], presence.to(x.dtype), x[:, -1:]], 1)
 
 
 def render_count(crop: CropSpec) -> int:
@@ -519,6 +530,8 @@ def build_inputs(raw, starts, pos, frames, hist, hmask, grid: torch.Tensor, n_re
 def collate_with_volume(items, vol: FiberVolume, crop: CropSpec, grid: torch.Tensor | None = None):
     """Worker-side batch. With ``grid`` the model input ``x`` (fp16) is built
     here on CPU; otherwise raw blocks + geometry are returned."""
+    if grid is None and vol.spec.mode == 'ct+presence':
+        grid = torch.from_numpy(crop_local_grid(crop)).float()
     raw, starts = read_blocks(items, vol, crop)
     scale = getattr(vol, 'input_scale', 1.)
     st = lambda k: torch.from_numpy(np.stack([it[k] for it in items]).astype(np.float32))
@@ -529,7 +542,7 @@ def collate_with_volume(items, vol: FiberVolume, crop: CropSpec, grid: torch.Ten
             # one fused numba pass per sample (see fast_sample.py); same values as build_inputs
             nr = render_count(crop)
             gf = _grid_flat(crop)
-            C = {"ct": 1, "fiber": 7, "fiber+ct": 8}[vol.spec.mode] + 1
+            C = {"ct": 1, "ct+presence": 1, "fiber": 7, "fiber+ct": 8}[vol.spec.mode] + 1
             x = np.empty((len(items), C, crop.depth, crop.width, crop.width), np.float16)
             for j, it in enumerate(items):
                 x[j] = sample_crop(raw[j], starts[j], it["pos"]*scale, it["frame"]*scale, gf, crop.gate_direction,
@@ -540,6 +553,8 @@ def collate_with_volume(items, vol: FiberVolume, crop: CropSpec, grid: torch.Ten
                              grid, n_render=render_count(crop), gate_direction=crop.gate_direction, input_scale=scale,
                              history_sigma=crop.history_sigma, history_render=crop.history_render)
             out = dict(x=x.half(), hist=out["hist"], hmask=out["hmask"])
+        if vol.spec.mode == 'ct+presence':
+            out['x'] = add_presence_input(out['x'], items, vol, crop, grid)
     if "fut_local" in items[0]:
         out["fut"] = st("fut_local")
         out["fmask"] = st("fmask")
@@ -552,11 +567,6 @@ def collate_with_volume(items, vol: FiberVolume, crop: CropSpec, grid: torch.Ten
     if 'source' in items[0]:
         out['source'] = st('source')
         out['source_step'] = st('source_step')
-    if 'tube_segments' in items[0]:
-        from vesuvius.neural_tracing.fiber_follow.tube import render_tube
-        tubes = [render_tube(it, crop, it['tube_sigma']) for it in items]
-        out['tube_target'] = torch.from_numpy(np.stack([t[0] for t in tubes]))
-        out['tube_mask'] = torch.from_numpy(np.stack([t[1] for t in tubes]))
     return out
 
 

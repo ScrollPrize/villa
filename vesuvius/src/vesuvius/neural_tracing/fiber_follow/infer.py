@@ -51,11 +51,17 @@ def auto_seeds(vol: FiberVolume, box_grid_zyx: tuple[np.ndarray, np.ndarray], n:
     return (peaks + lo)[:, ::-1].astype(np.float64)  # xyz grid
 
 
-def make_fiber_json(points_base_xyz: np.ndarray, cp_every: float, meta: dict) -> dict:
-    """VC3D v3 fiber: dense line_points plus cspline control points."""
+def make_fiber_json(points_base_xyz: np.ndarray, cp_every: float, meta: dict, control_indices=None) -> dict:
+    """VC3D v3 fiber: dense line_points plus cspline control points.
+
+    ``control_indices`` places the controls at given line indices instead of
+    every ``cp_every`` base voxels."""
     s = arclength(points_base_xyz)
-    n_cp = max(2, int(round(s[-1] / cp_every)) + 1)
-    idx = np.unique(np.searchsorted(s, np.linspace(0, s[-1], n_cp)).clip(0, len(s) - 1))
+    if control_indices is None:
+        n_cp = max(2, int(round(s[-1] / cp_every)) + 1)
+        idx = np.unique(np.searchsorted(s, np.linspace(0, s[-1], n_cp)).clip(0, len(s) - 1))
+    else:
+        idx = np.unique(np.asarray(control_indices, np.int64).clip(0, len(s) - 1))
     seg = {
         "config": {
             "beam_lookahead_steps": 2, "beam_prune_distance_voxels": 1.0, "beam_width": 8,

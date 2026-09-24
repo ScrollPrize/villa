@@ -133,12 +133,16 @@ def score_trace(path: np.ndarray, fiber: TracedFiber, t0: float, sign: float, to
                 endpoint_known=bool(endpoint_known), diverged=bool(diverged), err=err)
 
 
-def evaluate(tracer, fibers, seeds, batch: int = 256):
+def evaluate(tracer, fibers, seeds, batch: int = 256, history_audit=None):
     trees = {}
     rows = []
     for b in range(0, len(seeds), batch):
         chunk = seeds[b:b + batch]
-        paths, reasons = tracer.trace(np.stack([s["pos"] for s in chunk]), np.stack([s["heading"] for s in chunk]))
+        kwargs = {}
+        if history_audit is not None:
+            history_audit.start_batch(fibers, chunk)
+            kwargs['on_decision'] = history_audit
+        paths, reasons = tracer.trace(np.stack([s["pos"] for s in chunk]), np.stack([s["heading"] for s in chunk]), **kwargs)
         for s, p, r in zip(chunk, paths, reasons):
             f = fibers[s["fiber"]]
             if s["fiber"] not in trees:

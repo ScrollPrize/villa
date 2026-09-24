@@ -156,8 +156,7 @@ class FiberVolumeSpec:
     ct_grid_scale: float = 8.0  # base voxels per selected CT voxel; s1_ds2 level 0 = 4
     # base voxels per trace-grid voxel (fiber OME level 3 -> 8)
     grid_scale: float = 8.0
-    # model inputs: "fiber" (presence + axis field), "fiber+ct", or "ct" only.
-    # CT-only opens presence for initialization, but never the axis fields.
+    # "ct+presence" samples each scalar field on its own grid, without axes.
     inputs: str = "fiber"
 
     @property
@@ -178,38 +177,38 @@ def _find_channel_zarr(root: str, channel: str) -> str:
 class FiberVolume:
     """Model-image readers plus presence for seed initialization.
 
-    CT-only opens no predicted direction arrays and reads CT at its native
-    resolution. All external positions and ``shape`` remain in trace units.
+    CT and CT + presence open no predicted direction arrays and read CT at its
+    native resolution. External positions and ``shape`` remain in trace units.
     """
 
     def __init__(self, spec: FiberVolumeSpec, cache_bytes: int = 3 << 30) -> None:
         self.spec = spec
-        if spec.mode not in ('fiber', 'fiber+ct', 'ct') or min(spec.grid_scale, spec.ct_grid_scale) <= 0:
+        if spec.mode not in ('fiber', 'fiber+ct', 'ct', 'ct+presence') or min(spec.grid_scale, spec.ct_grid_scale) <= 0:
             raise ValueError('Invalid input mode or voxel scale')
         lvl = str(spec.fiber_level)
         per = cache_bytes // (4 if spec.ct_zarr else 3)
         self.presence = ChunkedArray(os.path.join(_find_channel_zarr(spec.fiber_zarr_dir, "presence"), lvl), per)
         self.nx = self.ny = None
-        if spec.mode != 'ct':
+        if spec.mode in ('fiber', 'fiber+ct'):
             self.nx = ChunkedArray(os.path.join(_find_channel_zarr(spec.fiber_zarr_dir, "nx"), lvl), per)
             self.ny = ChunkedArray(os.path.join(_find_channel_zarr(spec.fiber_zarr_dir, "ny"), lvl), per)
         self.ct = None
-        self.input_scale = spec.grid_scale/spec.ct_grid_scale if spec.mode == 'ct' else 1.
+        self.input_scale = spec.grid_scale/spec.ct_grid_scale if spec.mode in ('ct', 'ct+presence') else 1.
         if not self.input_scale.is_integer():
             raise ValueError('CT sampling currently requires an integer number of CT voxels per trace voxel')
-        if spec.mode in ('ct', 'fiber+ct') and not spec.ct_zarr:
+        if spec.mode in ('ct', 'ct+presence', 'fiber+ct') and not spec.ct_zarr:
             raise ValueError("CT input mode needs ct_zarr")
         if spec.ct_zarr:
-            # CT-only models read nothing else in the hot path: give CT most of the budget
+            # Native CT is the larger field; presence keeps its own cache.
             ct = ChunkedArray(os.path.join(spec.ct_zarr, str(spec.ct_level)),
-                              int(cache_bytes * 0.85) if spec.mode == "ct" else per)
+                              int(cache_bytes * 0.75) if spec.mode in ('ct', 'ct+presence') else per)
             expected = np.asarray(self.presence.shape)*spec.grid_scale/spec.ct_grid_scale
             if np.any(np.abs(np.asarray(ct.shape)-expected) > 1):
                 raise ValueError(
                     f"CT shape {ct.shape} and voxel scale {spec.ct_grid_scale} do not align "
                     f"with presence shape {self.presence.shape} at scale {spec.grid_scale}"
                 )
-            if spec.mode != 'ct' and (ct.shape != self.presence.shape or spec.ct_grid_scale != spec.grid_scale):
+            if spec.mode == 'fiber+ct' and (ct.shape != self.presence.shape or spec.ct_grid_scale != spec.grid_scale):
                 raise ValueError('fiber+ct requires CT on the fiber grid; use ct mode for native-resolution CT')
             if ct.dtype != np.dtype('uint8'):
                 raise ValueError('CT intensity normalization currently requires uint8 data')
@@ -218,14 +217,16 @@ class FiberVolume:
 
     @property
     def raw_channels(self) -> int:
-        if self.spec.mode == 'ct':
+        if self.spec.mode in ('ct', 'ct+presence'):
             return 1
         return 4 if self.ct is not None else 3
 
     @property
     def channels(self) -> int:
-        """Decoded channels (see ``decode_raw``)."""
-        return 1 if self.spec.mode == 'ct' else self.raw_channels + 4
+        """Image input channels, including independently sampled presence."""
+        if self.spec.mode in ('ct', 'ct+presence'):
+            return 2 if self.spec.mode == 'ct+presence' else 1
+        return self.raw_channels + 4
 
     def fiber_raw_block(self, start, size) -> np.ndarray:
         """uint8 (presence, nx, ny) block, zyx, regardless of model inputs."""
@@ -235,7 +236,7 @@ class FiberVolume:
 
     def raw_block(self, start, size) -> np.ndarray:
         """Model-input uint8 block in source-array coordinates (native CT in ct mode)."""
-        if self.spec.mode == "ct":
+        if self.spec.mode in ('ct', 'ct+presence'):
             return self.ct.read(start, size)[None]
         chans = [self.presence.read(start, size), self.nx.read(start, size), self.ny.read(start, size)]
         if self.ct is not None:
@@ -244,7 +245,7 @@ class FiberVolume:
 
     def sample_image_nearest(self, points_zyx):
         """Diagnostic intensities at trace-grid coordinates, with no extra fields."""
-        array = self.ct if self.spec.mode == 'ct' else self.presence
+        array = self.ct if self.spec.mode in ('ct', 'ct+presence') else self.presence
         return array.sample_nearest(np.asarray(points_zyx)*self.input_scale)
 
 

@@ -3,33 +3,39 @@ import torch
 import torch.nn.functional as F
 
 
-def tube_loss(logits, target, mask):
-    """Gaussian-value regression, balancing the 3-sigma neighborhood and background.
+def coordinate_loss(candidates, cleaned, batch, cfg):
+    """One whole-path winner, a shared near-term trunk, and supervised steps.
 
-    Squared error retains the Gaussian itself as the optimum. Separate regional
-    means keep the sparse tube from being overwhelmed by empty crop voxels.
+    Assignment is over the complete known trajectory, so it cannot stitch
+    different modes together point by point. Unknown targets and departed
+    states contribute no coordinate gradients. Teacher paths never enter this
+    loss. No repulsion pushes modes away when the continuation is unambiguous.
     """
-    error = (logits.float().sigmoid()-target.float()).square()
-    near = (target >= 0.0111089965).float()*mask  # exp(-3**2/2)
-    far = (target < 0.0111089965).float()*mask
-    total = logits.sum()*0
-    for weights in (near, far):
-        count = weights.flatten(1).sum(-1)
-        loss = (error*weights).flatten(1).sum(-1)/count.clamp(min=1)
-        total = total + .5*(loss*(count > 0)).sum()/(count > 0).sum().clamp(min=1)
-    return total
-
-
-def heatmap_loss(logits, plane_ab, plane_mask, cfg, sigma=.7):
-    nb = logits.shape[-1]
-    g = (torch.arange(nb, device=logits.device)-(nb-1)/2)*cfg.heat_spacing
-    inside = (plane_ab.abs() <= (nb-1)/2*cfg.heat_spacing).all(-1)
-    mask = plane_mask*inside
-    d2 = ((g[None, None, None, :]-plane_ab[..., 0, None, None])**2 +
-          (g[None, None, :, None]-plane_ab[..., 1, None, None])**2)
-    target = (-d2/(2*sigma*sigma)).flatten(2).softmax(-1)
-    ce = -(target*logits.float().flatten(2).log_softmax(-1)).sum(-1)
-    return (ce*mask).sum()/mask.sum().clamp(min=1)
+    paths = candidates[:, :cfg.n_candidates].float()
+    B, M, K, _ = paths.shape
+    known = batch['dense_mask'].float() * (1-batch['offtrack'])[:, None]
+    Q = known.shape[1]
+    dense = F.interpolate(paths[..., :2].reshape(B*M, K, 2).transpose(1, 2),
+                          size=Q, mode='linear', align_corners=True).transpose(1, 2).reshape(B, M, Q, 2)
+    error = F.smooth_l1_loss(dense, batch['dense_ab'][:, None].expand_as(dense), reduction='none').mean(-1)
+    per_mode = (error*known[:, None]).sum(-1)/known.sum(-1, keepdim=True).clamp_min(1)
+    valid = (known.sum(-1) > 0).float()
+    winner = per_mode.detach().argmin(-1)
+    chosen = per_mode[torch.arange(B, device=paths.device), winner]
+    full = (chosen*valid).sum()/valid.sum().clamp_min(1)
+    z = torch.linspace(cfg.future_step, K*cfg.future_step, Q, device=paths.device)
+    early_mask = known * (z <= min(4, K)*cfg.future_step)[None]
+    early_valid = (early_mask.sum(-1) > 0).float()
+    trunk = (error*early_mask[:, None]).sum((1, 2))/(M*early_mask.sum(-1).clamp_min(1))
+    trunk = (trunk*early_valid).sum()/early_valid.sum().clamp_min(1)
+    path = paths[torch.arange(B, device=paths.device), winner, :, :2]
+    pred = torch.cat([cleaned[:, :1, :2], path], 1)
+    truth = torch.cat([batch['clean_local'][:, :1, :2], batch['plane_ab']], 1)
+    supplied = torch.cat([batch['clean_mask'][:, :1], batch['plane_mask']], 1)
+    step_mask = supplied[:, 1:]*supplied[:, :-1]*(1-batch['offtrack'])[:, None]
+    step_error = F.smooth_l1_loss(pred[:, 1:]-pred[:, :-1], truth[:, 1:]-truth[:, :-1], reduction='none').mean(-1)
+    steps = (step_error*step_mask).sum()/step_mask.sum().clamp_min(1)
+    return full + .5*trunk + .25*steps, dict(coordinate_full=full.item(), coordinate_trunk=trunk.item(), coordinate_steps=steps.item())
 
 
 def teacher_candidates(batch, cfg):
@@ -82,9 +88,10 @@ def candidate_labels(candidates, batch, tolerance=1.5):
     return target, mask, quality, valid_error
 
 
-def loss_fn(output, batch, cfg, tolerance=1.5, rank_weight=1., confidence_weight=1., clean_weight=.5):
+def loss_fn(output, batch, cfg, tolerance=1.5, rank_weight=1., confidence_weight=1., clean_weight=.5,
+            rank_temperature=20.):
     candidates = output['candidates']
-    labels, mask, quality, error = candidate_labels(candidates, batch, tolerance)
+    labels, mask, quality, error = candidate_labels(candidates.detach(), batch, tolerance)
     M = cfg.n_candidates
     candidate_valid = torch.ones_like(quality)
     # Synthetic candidates require an annotated first plane and a recoverable state.
@@ -96,15 +103,17 @@ def loss_fn(output, batch, cfg, tolerance=1.5, rank_weight=1., confidence_weight
     confidence = (bce*mask).sum()/mask.sum().clamp(min=1)
     rank_valid = candidate_valid * (batch['dense_mask'].sum(-1) > 0)[:, None]
     rank_valid = rank_valid * (1-batch['offtrack'][:, None])
-    target = (quality.detach()*5).masked_fill(rank_valid == 0, -1e4).softmax(-1)
+    # Quality differences among correct candidates are hundredths of a unit
+    # (0.1 x mean error); a soft temperature makes the target near-uniform and
+    # the loss pure noise once proposals are good. Keep the target peaked.
+    target = (quality.detach()*rank_temperature).masked_fill(rank_valid == 0, -1e4).softmax(-1)
     logp = output['ranks'].float().masked_fill(rank_valid == 0, -1e4).log_softmax(-1)
     row_valid = rank_valid.any(-1).float()
     ranking = (-(target*logp).sum(-1)*row_valid).sum()/row_valid.sum().clamp(min=1)
-    proposal = (tube_loss(output['tube_logits'], batch['tube_target'], batch['tube_mask'])
-                if cfg.heatmap_target == 'tube' else
-                heatmap_loss(output['heatmap'], batch['plane_ab'], batch['plane_mask'], cfg))
+    proposal, coordinate_metrics = coordinate_loss(candidates, output['clean_history'], batch, cfg)
     clean_error = F.smooth_l1_loss(output['clean_history'].float(), batch['clean_local'], reduction='none').mean(-1)
-    clean_mask = batch['clean_mask']
+    supplied_history = torch.cat([batch['hmask'].new_ones((len(candidates), 1)), batch['hmask'][:, :cfg.clean_points]], 1)
+    clean_mask = batch['clean_mask'] * supplied_history
     clean = (clean_error * clean_mask).sum() / clean_mask.sum().clamp(min=1)
     with torch.no_grad():
         chosen = output['ranks'][:, :M].argmax(-1)
@@ -121,23 +130,52 @@ def loss_fn(output, batch, cfg, tolerance=1.5, rank_weight=1., confidence_weight
                        oracle_error=(oracle_error*eligible).sum().item()/denominator.item(),
                        selected_error=(selected_error*eligible).sum().item()/denominator.item(),
                        oracle_recall=recall.item())
+        metrics.update(coordinate_metrics)
+        # How informative the ranking target is: entropy relative to a uniform
+        # distribution over the valid candidates (1 = uninformative).
+        n_valid = rank_valid.sum(-1).clamp(min=1)
+        entropy = -(target*target.clamp(min=1e-12).log()).sum(-1)/n_valid.log().clamp(min=1e-6)
+        metrics['rank_target_entropy'] = ((entropy*row_valid).sum()/row_valid.sum().clamp(min=1)).item()
+        # Stop-gate calibration for the rank-selected proposal: false stops
+        # (gate closed on a correct prefix) and false continues (gate open on a
+        # wrong prefix), at the first point and the default commit horizon.
+        conf = output['confidence'][b, chosen].float()
+        for point, name in ((0, 'first'), (horizon, 'commit')):
+            known = mask[b, chosen, point]*eligible
+            positive = labels[b, chosen, point]*known
+            negative = (1-labels[b, chosen, point])*known
+            for thr in (0.3, 0.5, 0.7):
+                closed = (conf[:, point] < thr).float()
+                metrics[f'gate{thr:.1f}_{name}_false_stop'] = ((closed*positive).sum()/positive.sum().clamp(min=1)).item()
+                metrics[f'gate{thr:.1f}_{name}_false_go'] = (((1-closed)*negative).sum()/negative.sum().clamp(min=1)).item()
+            metrics[f'gate_{name}_negatives'] = (negative.sum()/known.sum().clamp(min=1)).item()
         current_mask = batch['clean_mask'][:, 0]
         current_error = (output['clean_history'][:, 0] - batch['clean_local'][:, 0]).norm(dim=-1)
         metrics['clean_loss'] = clean.item()
         metrics['clean_current_error'] = (current_error*current_mask).sum().item()/current_mask.sum().clamp(min=1).item()
+        from vesuvius.neural_tracing.fiber_follow.history_metrics import cleaning_measurements, summarize_cleaning
+        metrics.update(summarize_cleaning(cleaning_measurements(
+            output['clean_history'], batch['hist'], batch['hmask'], batch['clean_local'],
+            batch['clean_mask'], cfg.clean_tangent_points)))
         first_step = output['candidates'][:, :M, 0]
+        metrics['candidate_first_step_max'] = first_step.norm(dim=-1).max().item()
         first_step = first_step[b, chosen]
         metrics['first_step_length'] = first_step.norm(dim=-1).mean().item()
+        metrics['first_step_length_max'] = first_step.norm(dim=-1).max().item()
+        metrics['candidate_endpoint_spread'] = output['candidates'][:, :M, -1, :2].std(dim=1, unbiased=False).norm(dim=-1).mean().item()
         first_known = batch['plane_mask'][:, 0]
         first_error = (first_step[:, :2] - batch['plane_ab'][:, 0]).norm(dim=-1)
         metrics['first_plane_error'] = (first_error*first_known).sum().item()/first_known.sum().clamp(min=1).item()
+        truth = torch.cat([batch['clean_local'][:, :1, :2], batch['plane_ab']], 1)
+        supplied = torch.cat([batch['clean_mask'][:, :1], batch['plane_mask']], 1)
+        step_known = supplied[:, 1:]*supplied[:, :-1]*(1-batch['offtrack'])[:, None]
+        outside_step = (truth[:, 1:]-truth[:, :-1]).norm(dim=-1) > cfg.max_lateral_slope*cfg.future_step
+        metrics['target_step_limit_fraction'] = (outside_step*step_known).sum().item()/step_known.sum().clamp_min(1).item()
         # Report observability separately from annotation validity. Leaving the
         # crop is not a physical fiber endpoint and never removes dense GT.
         lateral = batch['dense_ab'].abs().amax(-1)
         known = batch['dense_mask']
         crop_half = (cfg.width-1)*cfg.spacing/2
-        heat_half = (cfg.heat_bins-1)*cfg.heat_spacing/2
-        for name, boundary in [('target_crop_oob', crop_half), ('target_crop_edge', crop_half-3),
-                               ('target_heatmap_oob', heat_half)]:
+        for name, boundary in [('target_crop_oob', crop_half), ('target_crop_edge', crop_half-3)]:
             metrics[name] = ((lateral > boundary)*known).sum().item()/known.sum().clamp(min=1).item()
     return proposal+rank_weight*ranking+confidence_weight*confidence+clean_weight*clean, metrics

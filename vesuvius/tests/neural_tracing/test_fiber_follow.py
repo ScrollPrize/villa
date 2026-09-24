@@ -466,13 +466,14 @@ class FixedPolicy(torch.nn.Module):
         n = len(x)
         candidates = straight_candidates(n)
         return dict(candidates=candidates, ranks=torch.tensor([[1.,0.]]).expand(n,-1),
-                    confidence=torch.tensor(self.conf).reshape(1,1,4).expand(n,2,-1))
+                    confidence=torch.tensor(self.conf).reshape(1,1,4).expand(n,2,-1),
+                    clean_history=torch.zeros(n, 9, 3))
 
 
 def fake_tracer(confidence, params, monkeypatch):
     import vesuvius.neural_tracing.fiber_follow.trace as T
     monkeypatch.setattr(T, 'build_inputs', lambda raw, *a, **kw: torch.zeros(len(raw),8,12,9,9))
-    vol = SimpleNamespace(shape=(1000,1000,1000), raw_block=lambda st, size: np.zeros((1,1,1,1), np.uint8))
+    vol = SimpleNamespace(spec=SimpleNamespace(mode='fiber'), shape=(1000,1000,1000), raw_block=lambda st, size: np.zeros((1,1,1,1), np.uint8))
     return ModelTracer(FixedPolicy(confidence), vol, sample_config().crop, 4, params, device='cpu')
 
 
@@ -786,3 +787,25 @@ def test_replay_still_rejects_invalid_arc_positions_after_roundtrip(tmp_path, ar
     loaded = D.OnPolicyStates.load(path)
     with pytest.raises(ValueError, match='arc positions outside controlled spans'):
         loaded.validate_fibers([f])
+
+
+def test_stop_patience_and_commit_floor_delay_the_confidence_stop(monkeypatch):
+    # Every call is a would-stop (0.4 < 0.7). Patience 3 commits one point on
+    # the first two calls and stops on the third; the floor vetoes that grace.
+    tracer = fake_tracer([.4]*4, TraceParams(stop_patience=3), monkeypatch)
+    seen = []
+    try:
+        paths, reasons = tracer.trace(np.array([[50.,50,50]]), np.array([[1.,0,0]]),
+                                      on_decision=lambda i,s: seen.append(s))
+    finally:
+        tracer.close()
+    assert reasons == ['confidence'] and len(seen) == 3 and all(s['would_stop'] for s in seen)
+    assert arclength(paths[0])[-1] == 4  # two single-point (2-voxel) commits
+    tracer = fake_tracer([.4]*4, TraceParams(stop_patience=3, commit_floor=.5), monkeypatch)
+    try:
+        paths, reasons = tracer.trace(np.array([[50.,50,50]]), np.array([[1.,0,0]]))
+    finally:
+        tracer.close()
+    assert reasons == ['confidence'] and len(paths[0]) == 1
+    with pytest.raises(ValueError):
+        TraceParams(stop_patience=0)

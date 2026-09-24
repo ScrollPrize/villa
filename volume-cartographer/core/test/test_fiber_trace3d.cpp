@@ -1452,3 +1452,200 @@ TEST_CASE("native fiber extrapolation fails at invalid start or first step")
     REQUIRE(result.points.size() == 1);
     CHECK(result.points.front()[0] == doctest::Approx(4.0));
 }
+
+namespace {
+
+vc::fiber_tracer::FiberTraceOneWayRequest beamHookRequest()
+{
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {24.0, 0.0, 0.0};
+    request.initialDirection = {1.0, 0.0, 0.0};
+    setExplicitTargetPlane(request, {1.0, 0.0, 0.0});
+    request.budgetSpanVoxels = 24.0;
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 25.0;
+    request.config.coneAngleStepDegrees = 5.0;
+    request.config.beamWidth = 8;
+    request.config.beamLookaheadSteps = 2;
+    request.config.maxStepFactor = 3.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+    return request;
+}
+
+bool samePoints(
+    const std::vector<cv::Vec3d>& a,
+    const std::vector<cv::Vec3d>& b)
+{
+    if (a.size() != b.size())
+        return false;
+    for (size_t index = 0; index < a.size(); ++index) {
+        if (a[index] != b[index])
+            return false;
+    }
+    return true;
+}
+
+} // namespace
+
+TEST_CASE("native fiber tracer beam hook observe and identity replacement match the plain search")
+{
+    StartAndCurrentBranchPrediction predictions;
+    const auto request = beamHookRequest();
+    const auto baseline =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+    REQUIRE(baseline.reachedTargetPlane);
+    REQUIRE(baseline.steps >= 4);
+
+    std::vector<vc::fiber_tracer::FiberTraceBeamHookEvent> events;
+    auto observed = request;
+    observed.beamHook.hook = [&events](const auto& event) {
+        events.push_back(event);
+        return vc::fiber_tracer::FiberTraceBeamHookResponse{};
+    };
+    const auto observedResult =
+        vc::fiber_tracer::traceFiberOneWay(predictions, observed, nullptr);
+    CHECK(samePoints(observedResult.points, baseline.points));
+    CHECK(observedResult.reason == baseline.reason);
+    CHECK(observedResult.steps == baseline.steps);
+    CHECK(observedResult.selectedTargetPlaneErrorVoxels ==
+          baseline.selectedTargetPlaneErrorVoxels);
+
+    // One event per completed round, none on the round that reached the target.
+    REQUIRE(!events.empty());
+    CHECK(static_cast<int>(events.size()) == (baseline.steps - 1) / 2);
+    for (size_t index = 0; index < events.size(); ++index) {
+        const auto& event = events[index];
+        CHECK(event.round == static_cast<int>(index));
+        CHECK(event.step == 2 * (static_cast<int>(index) + 1));
+        CHECK(event.phase == "trace");
+        CHECK(event.startPoint == request.startPoint);
+        CHECK(event.targetPoint == request.targetPoint);
+        CHECK(event.pool.size() >= 8);
+        CHECK(event.pool.size() <= 32);
+        for (size_t position = 0; position < event.pool.size(); ++position) {
+            const auto& candidate = event.pool[position];
+            CHECK(candidate.depth == event.step);
+            CHECK(candidate.path.size() == static_cast<size_t>(event.step + 1));
+            CHECK(candidate.path.front() == request.startPoint);
+            CHECK_FALSE(candidate.reached);
+            if (position > 0)
+                CHECK(candidate.loss >= event.pool[position - 1].loss);
+        }
+    }
+
+    auto identity = request;
+    identity.beamHook.hook = [](const auto& event) {
+        vc::fiber_tracer::FiberTraceBeamHookResponse response;
+        response.losses.emplace();
+        for (const auto& candidate : event.pool)
+            response.losses->push_back(candidate.loss);
+        return response;
+    };
+    const auto identityResult =
+        vc::fiber_tracer::traceFiberOneWay(predictions, identity, nullptr);
+    CHECK(samePoints(identityResult.points, baseline.points));
+    CHECK(identityResult.reason == baseline.reason);
+    CHECK(identityResult.steps == baseline.steps);
+
+    size_t everyTwoCalls = 0;
+    auto everyTwo = request;
+    everyTwo.beamHook.everyRounds = 2;
+    everyTwo.beamHook.hook = [&everyTwoCalls](const auto&) {
+        ++everyTwoCalls;
+        return vc::fiber_tracer::FiberTraceBeamHookResponse{};
+    };
+    const auto everyTwoResult =
+        vc::fiber_tracer::traceFiberOneWay(predictions, everyTwo, nullptr);
+    CHECK(samePoints(everyTwoResult.points, baseline.points));
+    CHECK(everyTwoCalls == (events.size() + 1) / 2);
+}
+
+TEST_CASE("native fiber tracer beam hook replacement losses drive the prune and stop the search")
+{
+    StartAndCurrentBranchPrediction predictions;
+    auto request = beamHookRequest();
+    std::vector<cv::Vec3d> expectedPath;
+    request.beamHook.hook = [&expectedPath](const auto& event) {
+        // Strictly prefer the last pool entry: replaced losses decrease with
+        // pool position, so it must become the best surviving beam.
+        vc::fiber_tracer::FiberTraceBeamHookResponse response;
+        response.losses.emplace();
+        for (size_t position = 0; position < event.pool.size(); ++position)
+            response.losses->push_back(-static_cast<float>(position));
+        expectedPath = event.pool.back().path;
+        response.stop = true;
+        return response;
+    };
+    const auto result =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+    CHECK(result.reason.rfind("hook_stop", 0) == 0);
+    CHECK_FALSE(result.reachedTargetPlane);
+    CHECK(result.steps == 2);
+    REQUIRE(!expectedPath.empty());
+    CHECK(samePoints(result.points, expectedPath));
+}
+
+TEST_CASE("native fiber tracer beam hook stop keeps the best current beam and does not fire on reaching rounds")
+{
+    StartAndCurrentBranchPrediction predictions;
+    auto request = beamHookRequest();
+    int calls = 0;
+    request.beamHook.hook = [&calls](const auto& event) {
+        ++calls;
+        vc::fiber_tracer::FiberTraceBeamHookResponse response;
+        response.stop = event.round == 1;
+        return response;
+    };
+    const auto result =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+    CHECK(calls == 2);
+    CHECK(result.reason.rfind("hook_stop", 0) == 0);
+    CHECK_FALSE(result.reachedTargetPlane);
+    CHECK(result.steps == 4);
+    CHECK(result.points.size() == 5);
+
+    StraightPrediction straight;
+    auto reaching = beamHookRequest();
+    reaching.targetPoint = {8.0, 0.0, 0.0};
+    setExplicitTargetPlane(reaching, {1.0, 0.0, 0.0});
+    reaching.budgetSpanVoxels = 8.0;
+    int reachingCalls = 0;
+    reaching.beamHook.hook = [&reachingCalls](const auto&) {
+        ++reachingCalls;
+        return vc::fiber_tracer::FiberTraceBeamHookResponse{};
+    };
+    const auto reached =
+        vc::fiber_tracer::traceFiberOneWay(straight, reaching, nullptr);
+    CHECK(reached.reachedTargetPlane);
+    CHECK(reachingCalls == 0);
+}
+
+TEST_CASE("native fiber tracer beam hook validates options and replacement sizes")
+{
+    StartAndCurrentBranchPrediction predictions;
+    auto badEvery = beamHookRequest();
+    badEvery.beamHook.everyRounds = 0;
+    CHECK_THROWS_AS(
+        static_cast<void>(vc::fiber_tracer::traceFiberOneWay(predictions, badEvery, nullptr)),
+        std::invalid_argument);
+
+    auto badPool = beamHookRequest();
+    badPool.beamHook.poolSize = 0;
+    CHECK_THROWS_AS(
+        static_cast<void>(vc::fiber_tracer::traceFiberOneWay(predictions, badPool, nullptr)),
+        std::invalid_argument);
+
+    auto badSize = beamHookRequest();
+    badSize.beamHook.hook = [](const auto& event) {
+        vc::fiber_tracer::FiberTraceBeamHookResponse response;
+        response.losses.emplace(event.pool.size() + 1, 0.0f);
+        return response;
+    };
+    CHECK_THROWS_WITH_AS(
+        static_cast<void>(vc::fiber_tracer::traceFiberOneWay(predictions, badSize, nullptr)),
+        doctest::Contains("beam hook returned"),
+        std::invalid_argument);
+}

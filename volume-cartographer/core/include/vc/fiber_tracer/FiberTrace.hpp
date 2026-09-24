@@ -331,11 +331,65 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// Beam hook: lets a caller observe, re-score or stop the beam search at prune
+// time. Not part of FiberTraceConfig because persisted trace configs are matched
+// key-for-key on load; the hook is a per-request runtime option only.
+//
+// Each round of the one-way search ends with a diversity-aware prune of the
+// final lookahead frontier down to config.beamWidth. When a hook is set and
+// `round % everyRounds == 0`, the tracer first selects a pool of the best
+// max(poolSize, beamWidth) frontier candidates with that same diversity rule,
+// materializes each pool candidate's full path from the trace start, and calls
+// the hook. The hook may return replacement cumulative losses (one per pool
+// candidate, in pool order); the standard width-`beamWidth` prune then runs
+// over the pool using those losses, and the selected states carry the replaced
+// losses forward. Non-finite replacement losses veto a candidate. `stop` ends
+// the trace after that prune with a reason starting "hook_stop" (target-plane
+// traces append the usual ":missing_target_planes=..." suffix). Without a hook, or with a
+// hook that returns no losses, the search is bit-identical to the plain search
+// (the width-`beamWidth` selection is a prefix of the pool selection). The hook
+// is never called on a round whose frontier already reached the target planes.
+struct FiberTraceBeamHookCandidate {
+    std::vector<cv::Vec3d> path;  // trace voxels, trace start through this endpoint
+    float loss = 0.0f;            // cumulative hand loss
+    int depth = 0;
+    double tracedLength = 0.0;
+    bool reached = false;
+    cv::Vec3d previousStepDirection{0.0, 0.0, 0.0};
+    cv::Vec3d currentSampleDirection{0.0, 0.0, 0.0};
+    cv::Vec3d historyDirection{0.0, 0.0, 0.0};
+};
+
+struct FiberTraceBeamHookEvent {
+    int round = 0;      // 0-based outer round index
+    int step = 0;       // depth of the pool candidates
+    int maxSteps = 0;
+    std::string phase;  // trace | forward | reverse | fiber | fiber_retry | extrapolation
+    cv::Vec3d startPoint{0.0, 0.0, 0.0};
+    cv::Vec3d targetPoint{0.0, 0.0, 0.0};
+    std::vector<FiberTraceBeamHookCandidate> pool;  // best hand loss first
+};
+
+struct FiberTraceBeamHookResponse {
+    std::optional<std::vector<float>> losses;  // size == pool.size(); nullopt observes only
+    bool stop = false;
+};
+
+using FiberTraceBeamHook =
+    std::function<FiberTraceBeamHookResponse(const FiberTraceBeamHookEvent&)>;
+
+struct FiberTraceBeamHookOptions {
+    FiberTraceBeamHook hook;  // empty disables the hook
+    int everyRounds = 1;
+    int poolSize = 32;
+};
+
 struct FiberTraceSegmentRequest {
     std::vector<cv::Vec3d> referenceLine;
     size_t startIndex = 0;
     size_t targetIndex = 0;
     FiberTraceConfig config;
+    FiberTraceBeamHookOptions beamHook;
 };
 
 struct FiberTraceTargetPlane {
@@ -359,6 +413,7 @@ struct FiberTraceOneWayRequest {
     bool snapTraceToSelectedCrossing = true;
     double budgetSpanVoxels = 0.0;
     FiberTraceConfig config;
+    FiberTraceBeamHookOptions beamHook;
 };
 
 struct FiberTraceOneWayResult {
@@ -428,6 +483,7 @@ struct FiberTraceWholeFiberMetricRequest {
     double errorThresholdBaseVoxels = 20.0;
     std::optional<double> voxelSizeUm;
     FiberTraceConfig config;
+    FiberTraceBeamHookOptions beamHook;
 };
 
 struct FiberTraceWholeFiberProgress {
@@ -536,7 +592,8 @@ struct CandidateScoreDebug {
     double distanceVoxels,
     const FiberTraceConfig& config,
     const vc::lasagna::NormalSampler* normalSampler = nullptr,
-    const FiberTraceProgressCallback& progress = {});
+    const FiberTraceProgressCallback& progress = {},
+    const FiberTraceBeamHookOptions& beamHook = {});
 
 // Fraction of a segment's start-to-target distance that bounds the endpoint
 // acceptance threshold for that segment. The fixed threshold
@@ -570,5 +627,18 @@ inline constexpr double kEndpointAcceptSpanFraction = 0.25;
     const std::vector<cv::Vec3d>& line,
     size_t startIndex,
     size_t targetIndex);
+
+// Target planes through `targetPoint` for a one-way trace toward reference
+// line index `targetLineIndex`, coming from `sourceLineIndex`: normals toward
+// the next and previous dense line points plus the prediction's inferred
+// direction at the target. This is what traceFiberSegment and
+// traceWholeFiberMetric use; exposed so callers can build one-way requests
+// between arbitrary line indices.
+[[nodiscard]] std::vector<FiberTraceTargetPlane> targetLocalPlanes(
+    const FiberPredictionSource& predictions,
+    const std::vector<cv::Vec3d>& referenceLine,
+    size_t targetLineIndex,
+    size_t sourceLineIndex,
+    const cv::Vec3d& targetPoint);
 
 } // namespace vc::fiber_tracer
