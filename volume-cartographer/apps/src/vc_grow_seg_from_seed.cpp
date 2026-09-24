@@ -205,6 +205,7 @@ int main(int argc, char *argv[])
 {
     std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path;
     cv::Vec3d origin;
+    bool seed_given = false;
     Json params;
     PointCollections corrections;
     bool skip_overlap_check = false;
@@ -263,6 +264,7 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
             origin = {seed_coords[0], seed_coords[1], seed_coords[2]};
+            seed_given = true;
         }
         if (vm.count("resume")) {
             resume_path = vm["resume"].as<std::string>();
@@ -547,13 +549,15 @@ int main(int argc, char *argv[])
             double v;
             interpolator.Evaluate(origin[2], origin[1], origin[0], &v);
             std::cout << "seed location " << origin << " value is " << v << std::endl;
-        } else if (!use_old_args && origin[0] != 0 && origin[1] != 0 && origin[2] != 0) {
+        } else if (!use_old_args && (origin[0] != 0 || origin[1] != 0 || origin[2] != 0)) {
             mode = "explicit_seed";
             double v;
             interpolator.Evaluate(origin[2], origin[1], origin[0], &v);
             std::cout << "seed location " << origin << " value is " << v << std::endl;
         }
         else {
+            if (seed_given)
+                std::cout << "seed " << origin << " discarded: 0 0 0 reads as no seed, picking a random seed" << std::endl;
             mode = "random_seed";
             int count = 0;
             bool succ = false;
