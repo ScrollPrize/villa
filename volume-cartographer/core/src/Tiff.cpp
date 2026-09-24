@@ -356,6 +356,16 @@ bool mergeTiffParts(const std::string& outputPath, int numParts)
         TIFFGetField(first, TIFFTAG_SAMPLESPERPIXEL, &spp);
         TIFFGetField(first, TIFFTAG_SAMPLEFORMAT, &sf);
         TIFFGetField(first, TIFFTAG_COMPRESSION, &comp);
+        // PhotometricInterpretation is a required baseline tag. Leaving it off produced
+        // merged files that libtiff refuses outright ("required field 262 missing"), so
+        // vips/ImageMagick/GDAL could not open any partitioned render while tifffile,
+        // which assumes min-is-black, read them fine and hid the problem.
+        uint16_t photometric = PHOTOMETRIC_MINISBLACK;
+        TIFFGetField(first, TIFFTAG_PHOTOMETRIC, &photometric);
+        // Parts use a horizontal predictor for LZW/deflate. Tiles are re-encoded below
+        // rather than copied raw, so carrying it over is purely about compression ratio.
+        uint16_t predictor = PREDICTOR_NONE;
+        TIFFGetField(first, TIFFTAG_PREDICTOR, &predictor);
         if (!haveGeom || w == 0 || h == 0 || tw == 0 || th == 0) {
             std::cerr << "Skipping " << finalPath
                       << ": first part missing/zero geometry tags\n";
@@ -375,6 +385,8 @@ bool mergeTiffParts(const std::string& outputPath, int numParts)
         TIFFSetField(out, TIFFTAG_TILEWIDTH, tw); TIFFSetField(out, TIFFTAG_TILELENGTH, th);
         TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, bps); TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, spp);
         TIFFSetField(out, TIFFTAG_SAMPLEFORMAT, sf); TIFFSetField(out, TIFFTAG_COMPRESSION, comp);
+        TIFFSetField(out, TIFFTAG_PHOTOMETRIC, photometric);
+        if (predictor != PREDICTOR_NONE) TIFFSetField(out, TIFFTAG_PREDICTOR, predictor);
         TIFFSetField(out, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
         if (hasRes) {
             TIFFSetField(out, TIFFTAG_RESOLUTIONUNIT, resUnit);
