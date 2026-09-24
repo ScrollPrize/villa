@@ -637,6 +637,7 @@ static void renderBands(
 
     auto wallStart = std::chrono::steady_clock::now();
     auto lastPrint = wallStart;
+    uint32_t lastDone = 0;
 
     // Contiguous block assignment: each part gets a contiguous range of bands
     // for better spatial locality (avoids all VMs reading the same volume region)
@@ -687,14 +688,23 @@ static void renderBands(
         double since = std::chrono::duration<double>(now - lastPrint).count();
         uint32_t bandsThis = bandEnd - bandStart;
         uint32_t done = bi - bandStart + 1;
-        if (since >= progressInterval() || done == bandsThis) {
+        // Always print the first band: the throttle otherwise swallows the opening bands, and
+        // a cumulative average that only starts reporting mid-run reads as a far better rate
+        // than the run is sustaining — two partitions of the same render looked an order of
+        // magnitude apart purely from where their first printed band fell.
+        if (since >= progressInterval() || done == bandsThis || done == 1) {
+            const double sinceLast = std::chrono::duration<double>(now - lastPrint).count();
+            const uint32_t doneSinceLast = done - lastDone;
             lastPrint = now;
+            lastDone = done;
             double elapsed = std::chrono::duration<double>(now - wallStart).count();
-            double eta = done > 0 ? elapsed * (double(bandsThis) / done - 1.0) : 0.0;
-            double bandsPerSec = elapsed > 0 ? done / elapsed : 0.0;
+            // Rate and ETA over the last interval rather than the whole run.
+            double bandsPerSec = sinceLast > 0 ? doneSinceLast / sinceLast : 0.0;
+            double eta = bandsPerSec > 0 ? (bandsThis - done) / bandsPerSec
+                                         : (done > 0 ? elapsed * (double(bandsThis) / done - 1.0) : 0.0);
             const char* prefix = progressRedrawsLine() ? "\r  " : "  ";
             const char* suffix = progressRedrawsLine() ? "" : "\n";
-            logPrintf(stderr, "%sband %u/%u (%d%%)  %.1f bands/s  %dm%02ds  eta %dm%02ds%s",
+            logPrintf(stderr, "%sband %u/%u (%d%%)  %.2f bands/s now  %dm%02ds  eta %dm%02ds%s",
                 prefix, done, bandsThis, int(100.0 * done / bandsThis),
                 bandsPerSec,
                 int(elapsed)/60, int(elapsed)%60, int(eta)/60, int(eta)%60, suffix);
