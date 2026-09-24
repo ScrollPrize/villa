@@ -33,6 +33,7 @@ public:
 
 signals:
     void attachVolumeRequested(const QString& url);
+    void attachLasagnaRequested(const QString& url, bool fiber);
 
 private slots:
     void reloadManifest();
@@ -113,6 +114,7 @@ private:
     QPushButton* _openVolumeUrlButton{nullptr};
     QPushButton* _downloadNormalGridsButton{nullptr};
     QPushButton* _copyRepresentationUrlButton{nullptr};
+    QPushButton* _attachRepresentationButton{nullptr};
     QPushButton* _openRepresentationUrlButton{nullptr};
     QPushButton* _copySegmentUrlButton{nullptr};
     QPushButton* _openSegmentUrlButton{nullptr};

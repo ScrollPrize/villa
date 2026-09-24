@@ -4,6 +4,7 @@
 #include "VCSettings.hpp"
 #include "UnifiedBrowserDialog.hpp"
 #include "OpenDataCatalogWindow.hpp"
+#include "OpenDataLasagna.hpp"
 #include "OpenDataSampleProject.hpp"
 #include "OpenDataVolumePrefill.hpp"
 #include "CWindow.hpp"
@@ -504,6 +505,8 @@ void MenuActionController::showOpenDataCatalog()
     _openDataCatalogDialog = dialog;
     connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachVolumeRequested,
             this, &MenuActionController::showAttachRemoteZarrDialog);
+    connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachLasagnaRequested,
+            this, &MenuActionController::attachCatalogLasagna);
     dialog->setOpenSampleHandler([this](const vc3d::opendata::OpenDataSample& sample) {
         return openOpenDataSample(sample);
     });
@@ -1716,12 +1719,12 @@ QString MenuActionController::promptLocation(const QString& title,
                                              const QString& defaultDir,
                                              const QStringList& localFilters,
                                              bool acceptFiles,
-                                             bool acceptDirs)
+                                             bool acceptDirs,
+                                             bool startAtFile)
 {
     UnifiedBrowserDialog dlg(_window);
     dlg.setWindowTitle(title);
     dlg.setHint(hint);
-    dlg.setStartUri(defaultDir);
     dlg.setLocalNameFilters(localFilters);
     dlg.setAcceptsFiles(acceptFiles);
     dlg.setAcceptsDirs(acceptDirs);
@@ -1731,6 +1734,7 @@ QString MenuActionController::promptLocation(const QString& title,
             : nullptr;
         return attachment && attachment->resolveRemoteAuth(url, out, err);
     });
+    dlg.setStartUri(defaultDir, startAtFile);
     if (dlg.exec() != QDialog::Accepted) return {};
     QString uri = dlg.selectedUri();
     if (uri.startsWith("file://", Qt::CaseInsensitive)) uri = uri.mid(7);
@@ -1922,7 +1926,36 @@ void MenuActionController::attachRemoteLasagnaManifest()
     beginLasagnaManifestAttachment(true);
 }
 
-void MenuActionController::beginLasagnaManifestAttachment(bool remote)
+void MenuActionController::attachCatalogLasagna(const QString& artifactUrl, bool fiber)
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    const auto targetPackage = _window->_state->vpkg();
+    using Result = std::pair<QString, QString>;
+    auto* watcher = new QFutureWatcher<Result>(this);
+    connect(watcher, &QFutureWatcher<Result>::finished, this, [this, watcher, targetPackage, fiber]() {
+        const auto [url, error] = watcher->result();
+        watcher->deleteLater();
+        if (!_window || !_window->_state || _window->_state->vpkg() != targetPackage) return;
+        if (!error.isEmpty()) {
+            QMessageBox::warning(_window, QObject::tr("Attach failed"), error);
+            return;
+        }
+        beginLasagnaManifestAttachment(true, url, fiber);
+    });
+    watcher->setFuture(QtConcurrent::run([artifactUrl]() -> Result {
+        try {
+            return {QString::fromStdString(vc3d::opendata::discoverOpenDataLasagnaManifestUrl(
+                        artifactUrl.toStdString())), {}};
+        } catch (const std::exception& ex) {
+            return {{}, QString::fromUtf8(ex.what())};
+        }
+    }));
+}
+
+void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QString& initialUrl, bool fiber)
 {
     if (!_window || !_window->_state || !_window->_state->vpkg()) {
         QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
@@ -1937,7 +1970,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
     QString location;
     if (remote) {
         location =
-            promptLocation(QObject::tr("Attach Remote Lasagna Manifest"), QObject::tr("Pick a remote .lasagna.json manifest."), QStringLiteral("s3://"), {QStringLiteral("*.lasagna.json")}, true, false);
+            promptLocation(QObject::tr("Attach Remote Lasagna Manifest"), QObject::tr("Pick a remote .lasagna.json manifest."), initialUrl.isEmpty() ? QStringLiteral("s3://") : initialUrl, {QStringLiteral("*.lasagna.json")}, true, false, !initialUrl.isEmpty());
         if (location.isEmpty())
             return;
         if (!vc::lasagna::isRemoteLasagnaLocation(location.toStdString())) {
@@ -1955,7 +1988,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
 
     bool roleAccepted = false;
     const QString role =
-        QInputDialog::getItem(_window, QObject::tr("Lasagna Data Role"), QObject::tr("Attach this manifest as:"), {QObject::tr("Regular Lasagna"), QObject::tr("Fiber inference")}, 0, false, &roleAccepted);
+        QInputDialog::getItem(_window, QObject::tr("Lasagna Data Role"), QObject::tr("Attach this manifest as:"), {QObject::tr("Regular Lasagna"), QObject::tr("Fiber inference")}, fiber ? 1 : 0, false, &roleAccepted);
     if (!roleAccepted)
         return;
     const bool fiberInference = role == QObject::tr("Fiber inference");

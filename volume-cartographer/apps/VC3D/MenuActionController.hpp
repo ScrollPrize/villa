@@ -144,7 +144,8 @@ private:
     void updateRecentRemoteList(const QString& url);
     void showAttachRemoteZarrDialog(const QString& initialUrl);
     void attachRemoteZarrUrl(const QString& url);
-    void beginLasagnaManifestAttachment(bool remote);
+    void beginLasagnaManifestAttachment(bool remote, const QString& initialUrl = {}, bool fiber = false);
+    void attachCatalogLasagna(const QString& artifactUrl, bool fiber);
     struct LasagnaAttachTaskResult;
     bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample,
                             bool interactive = true,
@@ -177,7 +178,8 @@ private:
                            const QString& defaultDir,
                            const QStringList& localFilters,
                            bool acceptFiles,
-                           bool acceptDirs);
+                           bool acceptDirs,
+                           bool startAtFile = false);
 
     CWindow* _window{nullptr};
 

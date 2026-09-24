@@ -385,14 +385,20 @@ void UnifiedBrowserDialog::setHint(const QString& text)
     }
 }
 
-void UnifiedBrowserDialog::setStartUri(const QString& uri)
+void UnifiedBrowserDialog::setStartUri(const QString& uri, bool isFile)
 {
     if (uri.isEmpty()) return;
     const QString trimmed = uri.trimmed();
     const Mode m = detectModeFromUri(trimmed);
     if (m == Mode::Remote) {
         _remoteRadio->setChecked(true);
-        navigateRemote(withTrailingSlash(trimmed));
+        if (isFile && _acceptsFiles) {
+            navigateRemote(trimmed.left(trimmed.lastIndexOf('/') + 1));
+            _pathBar->setText(trimmed);
+            _pathBarEdited = true;
+        } else {
+            navigateRemote(withTrailingSlash(trimmed));
+        }
     } else {
         _localRadio->setChecked(true);
         QString p = fileUriToPath(trimmed);
