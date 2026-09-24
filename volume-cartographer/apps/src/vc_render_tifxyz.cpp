@@ -12,6 +12,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VcDataset.hpp"
 #include "utils/Json.hpp"
+#include "utils/http_fetch.hpp"
 
 #include <opencv2/imgproc.hpp>
 #include <fstream>
@@ -28,6 +29,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
+#include <exception>
 #include <thread>
 #include <optional>
 #include <unordered_set>
@@ -746,26 +748,126 @@ static void renderTiles(
         std::vector<std::vector<cv::Mat>> tifRowBuf;
         if (wantTif) tifRowBuf.resize(numTileCols);
 
+        // A throw inside the OpenMP tile loop (a remote chunk fetch that failed
+        // after its retries, for instance) would end in std::terminate. Keep the
+        // first failure and rethrow it once every tile of this row has stopped.
+        std::atomic<bool> rowFailed{false};
+        std::exception_ptr rowError;
         #pragma omp parallel for schedule(dynamic)
         for (uint32_t tx = 0; tx < numTileCols; tx++) {
-            // Resume: skip tile if L0 chunk already exists on disk
-            if (resume) {
-                const bool needsRotFlip = (rotQuad >= 0 || flipAxis >= 0);
-                int dTx = int(tx), dTy = int(ty), dTX, dTY;
-                if (needsRotFlip)
-                    mapTileIndex(int(tx), int(ty), int(tilesXSrc), int(tilesYSrc),
-                                 std::max(rotQuad, 0), flipAxis, dTx, dTy, dTX, dTY);
-                if (dsOut->chunkExists(0, size_t(dTy), size_t(dTx))) {
-                    // Still need to scatter into pyramid accum buffers
-                    // No rotation when inline pyramid is active
+            if (rowFailed.load(std::memory_order_relaxed)) continue;
+            try {
+                // Resume: skip tile if L0 chunk already exists on disk
+                if (resume) {
+                    const bool needsRotFlip = (rotQuad >= 0 || flipAxis >= 0);
+                    int dTx = int(tx), dTy = int(ty), dTX, dTY;
+                    if (needsRotFlip)
+                        mapTileIndex(int(tx), int(ty), int(tilesXSrc), int(tilesYSrc),
+                                     std::max(rotQuad, 0), flipAxis, dTx, dTy, dTX, dTY);
+                    if (dsOut->chunkExists(0, size_t(dTy), size_t(dTx))) {
+                        // Still need to scatter into pyramid accum buffers
+                        // No rotation when inline pyramid is active
+                        if (!pyrAccum.empty()) {
+                            size_t chunkZ = chunks0[0], chunkY = chunks0[1], chunkX = chunks0[2];
+                            std::vector<T> existingBuf(chunkZ * chunkY * chunkX, T(0));
+                            dsOut->readChunk(0, size_t(dTy), size_t(dTx), existingBuf.data());
+                            uint32_t dxTile = std::min(uint32_t(CW), uint32_t(tgtSize.width) - tx * uint32_t(CW));
+                            size_t dy_actual = std::min(chunkY, size_t(dy));
+                            size_t dx_actual = std::min(chunkX, size_t(dxTile));
+                            size_t numZ = isComposite ? 1 : size_t(std::max(1, numSlices));
+                            size_t l1cx = size_t(tx) >> 1;
+                            size_t halfCH = CH / 2, halfCW = CW / 2;
+                            size_t offY = (size_t(ty) & 1) * halfCH;
+                            size_t offX = (size_t(tx) & 1) * halfCW;
+                            auto& pa = pyrAccum[0];
+                            if (l1cx < pa.bufs.size()) {
+                                downsampleTileIntoPreserveZ(
+                                    existingBuf.data(), chunkZ, chunkY, chunkX,
+                                    pa.bufs[l1cx].data(), pa.chZ, pa.chY, pa.chX,
+                                    numZ, dy_actual, dx_actual,
+                                    offY, offX);
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                uint32_t x0 = tx * uint32_t(CW);
+                uint32_t dx = std::min(uint32_t(CW), uint32_t(tgtSize.width) - x0);
+
+                // 1. Generate surface for this tile
+                float u0, v0; computeCanvasOrigin(fullSize, u0, v0);
+                u0 += float(crop.x) + float(x0);
+                v0 += float(crop.y) + float(y0);
+                cv::Mat_<cv::Vec3f> tilePts, tileNrm;
+                genTile(surf, cv::Size(int(dx), int(dy)), renderScale, u0, v0, tilePts, tileNrm);
+
+                // 2. Prepare base coords and step directions
+                cv::Mat_<cv::Vec3f> base, dirs;
+                prepareBaseAndDirs(tilePts, tileNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
+
+                // 3. Sample all slices for this tile (single-threaded)
+                std::vector<cv::Mat_<T>> raw;
+                if (isComposite) {
+                    if constexpr (std::is_same_v<T, uint8_t>) {
+                        // readCompositeFast writes into a pre-allocated buffer (it never calls create),
+                        // and skips non-finite pixels, so size + zero it here.
+                        cv::Mat_<uint8_t> compOut(base.rows, base.cols, uint8_t{0});
+                        readCompositeFast(compOut, cache, level, base, dirs,
+                                          float(sliceStep),
+                                          compositeStart, compositeEnd,
+                                          compositeParams, vc::render::prefetch::samplingForRender(true));
+                        raw.resize(1);
+                        raw[0] = compOut;
+                    }
+                } else {
+                    sampleTileSlices(raw, cache, level, base, dirs, allOffsets);
+                }
+
+                // Accumulate (no rotation — applied per-zarr-chunk and per-tif-band separately)
+                std::vector<cv::Mat> slices = processRawSlices<T>(raw, numSlices, accumOffsets, accumType, cvType, -1, -1);
+
+                // 4. Pack into zarr chunk (with rotation applied to pixel data)
+                {
+                    size_t chunkZ = chunks0[0], chunkY = chunks0[1], chunkX = chunks0[2];
+                    size_t numZ = slices.size();
+                    const bool needsRotFlip = (rotQuad >= 0 || flipAxis >= 0);
+
+                    // Only clone+rotate when rotation/flip is active
+                    const std::vector<cv::Mat>* zarrSlices = &slices;
+                    std::vector<cv::Mat> rotSlices;
+                    if (needsRotFlip) {
+                        rotSlices.resize(numZ);
+                        for (size_t zi = 0; zi < numZ; zi++) {
+                            rotSlices[zi] = slices[zi].clone();
+                            rotateFlipIfNeeded(rotSlices[zi], rotQuad, flipAxis);
+                        }
+                        zarrSlices = &rotSlices;
+                    }
+
+                    int dstTx = int(tx), dstTy = int(ty), dTX, dTY;
+                    if (needsRotFlip)
+                        mapTileIndex(int(tx), int(ty), int(tilesXSrc), int(tilesYSrc),
+                                     std::max(rotQuad, 0), flipAxis, dstTx, dstTy, dTX, dTY);
+
+                    std::vector<T> chunkBuf(chunkZ * chunkY * chunkX, T(0));
+                    size_t dy_actual = std::min(chunkY, size_t((*zarrSlices)[0].rows));
+                    size_t dx_actual = std::min(chunkX, size_t((*zarrSlices)[0].cols));
+                    for (size_t zi = 0; zi < numZ; zi++) {
+                        size_t sliceOff = zi * chunkY * chunkX;
+                        for (size_t yy = 0; yy < dy_actual; yy++) {
+                            const T* row = (*zarrSlices)[zi].ptr<T>(int(yy));
+                            std::memcpy(&chunkBuf[sliceOff + yy * chunkX], row, dx_actual * sizeof(T));
+                        }
+                    }
+                    dsOut->writeChunkSkipEmpty(0, size_t(dstTy), size_t(dstTx),
+                                               chunkBuf.data(), chunkBuf.size() * sizeof(T));
+
+                    // Scatter L0 tile into L1 pyramid accumulation buffer
+                    // No rotation when inline pyramid is active, so tx/ty == dstTx/dstTy.
+                    // L0 tile (ty, tx) maps to L1 pyramid chunk (ty/2, tx/2)
+                    // at sub-offset ((ty%2)*halfCH, (tx%2)*halfCW) within the L1 chunk
                     if (!pyrAccum.empty()) {
-                        size_t chunkZ = chunks0[0], chunkY = chunks0[1], chunkX = chunks0[2];
-                        std::vector<T> existingBuf(chunkZ * chunkY * chunkX, T(0));
-                        dsOut->readChunk(0, size_t(dTy), size_t(dTx), existingBuf.data());
-                        uint32_t dxTile = std::min(uint32_t(CW), uint32_t(tgtSize.width) - tx * uint32_t(CW));
-                        size_t dy_actual = std::min(chunkY, size_t(dy));
-                        size_t dx_actual = std::min(chunkX, size_t(dxTile));
-                        size_t numZ = isComposite ? 1 : size_t(std::max(1, numSlices));
                         size_t l1cx = size_t(tx) >> 1;
                         size_t halfCH = CH / 2, halfCW = CW / 2;
                         size_t offY = (size_t(ty) & 1) * halfCH;
@@ -773,112 +875,27 @@ static void renderTiles(
                         auto& pa = pyrAccum[0];
                         if (l1cx < pa.bufs.size()) {
                             downsampleTileIntoPreserveZ(
-                                existingBuf.data(), chunkZ, chunkY, chunkX,
+                                chunkBuf.data(), chunkZ, chunkY, chunkX,
                                 pa.bufs[l1cx].data(), pa.chZ, pa.chY, pa.chX,
                                 numZ, dy_actual, dx_actual,
                                 offY, offX);
                         }
                     }
-                    continue;
-                }
-            }
-
-            uint32_t x0 = tx * uint32_t(CW);
-            uint32_t dx = std::min(uint32_t(CW), uint32_t(tgtSize.width) - x0);
-
-            // 1. Generate surface for this tile
-            float u0, v0; computeCanvasOrigin(fullSize, u0, v0);
-            u0 += float(crop.x) + float(x0);
-            v0 += float(crop.y) + float(y0);
-            cv::Mat_<cv::Vec3f> tilePts, tileNrm;
-            genTile(surf, cv::Size(int(dx), int(dy)), renderScale, u0, v0, tilePts, tileNrm);
-
-            // 2. Prepare base coords and step directions
-            cv::Mat_<cv::Vec3f> base, dirs;
-            prepareBaseAndDirs(tilePts, tileNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
-
-            // 3. Sample all slices for this tile (single-threaded)
-            std::vector<cv::Mat_<T>> raw;
-            if (isComposite) {
-                if constexpr (std::is_same_v<T, uint8_t>) {
-                    // readCompositeFast writes into a pre-allocated buffer (it never calls create),
-                    // and skips non-finite pixels, so size + zero it here.
-                    cv::Mat_<uint8_t> compOut(base.rows, base.cols, uint8_t{0});
-                    readCompositeFast(compOut, cache, level, base, dirs,
-                                      float(sliceStep),
-                                      compositeStart, compositeEnd,
-                                      compositeParams, vc::render::prefetch::samplingForRender(true));
-                    raw.resize(1);
-                    raw[0] = compOut;
-                }
-            } else {
-                sampleTileSlices(raw, cache, level, base, dirs, allOffsets);
-            }
-
-            // Accumulate (no rotation — applied per-zarr-chunk and per-tif-band separately)
-            std::vector<cv::Mat> slices = processRawSlices<T>(raw, numSlices, accumOffsets, accumType, cvType, -1, -1);
-
-            // 4. Pack into zarr chunk (with rotation applied to pixel data)
-            {
-                size_t chunkZ = chunks0[0], chunkY = chunks0[1], chunkX = chunks0[2];
-                size_t numZ = slices.size();
-                const bool needsRotFlip = (rotQuad >= 0 || flipAxis >= 0);
-
-                // Only clone+rotate when rotation/flip is active
-                const std::vector<cv::Mat>* zarrSlices = &slices;
-                std::vector<cv::Mat> rotSlices;
-                if (needsRotFlip) {
-                    rotSlices.resize(numZ);
-                    for (size_t zi = 0; zi < numZ; zi++) {
-                        rotSlices[zi] = slices[zi].clone();
-                        rotateFlipIfNeeded(rotSlices[zi], rotQuad, flipAxis);
-                    }
-                    zarrSlices = &rotSlices;
                 }
 
-                int dstTx = int(tx), dstTy = int(ty), dTX, dTY;
-                if (needsRotFlip)
-                    mapTileIndex(int(tx), int(ty), int(tilesXSrc), int(tilesYSrc),
-                                 std::max(rotQuad, 0), flipAxis, dstTx, dstTy, dTX, dTY);
-
-                std::vector<T> chunkBuf(chunkZ * chunkY * chunkX, T(0));
-                size_t dy_actual = std::min(chunkY, size_t((*zarrSlices)[0].rows));
-                size_t dx_actual = std::min(chunkX, size_t((*zarrSlices)[0].cols));
-                for (size_t zi = 0; zi < numZ; zi++) {
-                    size_t sliceOff = zi * chunkY * chunkX;
-                    for (size_t yy = 0; yy < dy_actual; yy++) {
-                        const T* row = (*zarrSlices)[zi].ptr<T>(int(yy));
-                        std::memcpy(&chunkBuf[sliceOff + yy * chunkX], row, dx_actual * sizeof(T));
-                    }
+                // 5. Store unrotated slices for TIF assembly
+                if (wantTif) {
+                    tifRowBuf[tx] = std::move(slices);
                 }
-                dsOut->writeChunkSkipEmpty(0, size_t(dstTy), size_t(dstTx),
-                                           chunkBuf.data(), chunkBuf.size() * sizeof(T));
-
-                // Scatter L0 tile into L1 pyramid accumulation buffer
-                // No rotation when inline pyramid is active, so tx/ty == dstTx/dstTy.
-                // L0 tile (ty, tx) maps to L1 pyramid chunk (ty/2, tx/2)
-                // at sub-offset ((ty%2)*halfCH, (tx%2)*halfCW) within the L1 chunk
-                if (!pyrAccum.empty()) {
-                    size_t l1cx = size_t(tx) >> 1;
-                    size_t halfCH = CH / 2, halfCW = CW / 2;
-                    size_t offY = (size_t(ty) & 1) * halfCH;
-                    size_t offX = (size_t(tx) & 1) * halfCW;
-                    auto& pa = pyrAccum[0];
-                    if (l1cx < pa.bufs.size()) {
-                        downsampleTileIntoPreserveZ(
-                            chunkBuf.data(), chunkZ, chunkY, chunkX,
-                            pa.bufs[l1cx].data(), pa.chZ, pa.chY, pa.chX,
-                            numZ, dy_actual, dx_actual,
-                            offY, offX);
-                    }
+            } catch (...) {
+                #pragma omp critical(render_tile_error)
+                {
+                    if (!rowError) rowError = std::current_exception();
                 }
-            }
-
-            // 5. Store unrotated slices for TIF assembly
-            if (wantTif) {
-                tifRowBuf[tx] = std::move(slices);
+                rowFailed.store(true, std::memory_order_relaxed);
             }
         }
+        if (rowError) std::rethrow_exception(rowError);
 
         // After all tx done for this ty: assemble TIF if needed
         if (wantTif) {
@@ -1807,7 +1824,26 @@ int main(int argc, char *argv[])
         return true;
     };
 
-    if (!process_one(seg_path))
+    bool ok = false;
+    try {
+        ok = process_one(seg_path);
+    } catch (const std::exception& e) {
+        // Typically a remote chunk fetch that failed after its retries. Abort
+        // the transfers still in flight so the process exits now rather than
+        // after their own timeouts, then report which chunk failed and why.
+        utils::HttpClient::abortAll();
+        // An HTTP status error carries the server's response body in its
+        // message; for a 503 that is a whole HTML page. Keep the first line.
+        std::string what = e.what();
+        if (auto nl = what.find('\n'); nl != std::string::npos) {
+            what.erase(nl);
+            while (!what.empty() && (what.back() == '\r' || what.back() == ' '))
+                what.pop_back();
+            what += " [...]";
+        }
+        logPrintf(stderr, "\nError: %s\n", what.c_str());
+    }
+    if (!ok)
         return EXIT_FAILURE;
 
     // Band prefetch can outlive the final sampled pixel. Let its downloads and

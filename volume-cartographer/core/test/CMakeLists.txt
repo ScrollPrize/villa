@@ -896,6 +896,12 @@ if(TARGET vc_render_tifxyz)
             $<TARGET_FILE:vc_render_tifxyz>)
     set_tests_properties(test_render_tifxyz_logging PROPERTIES TIMEOUT 90)
     vc_register_ctest(test_render_tifxyz_logging vc_render_tifxyz)
+    add_test(NAME test_render_fetch_failure
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_fetch_failure.py"
+            $<TARGET_FILE:vc_render_tifxyz>)
+    set_tests_properties(test_render_fetch_failure PROPERTIES TIMEOUT 300)
+    vc_register_ctest(test_render_fetch_failure vc_render_tifxyz)
 endif()
 
 vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)
