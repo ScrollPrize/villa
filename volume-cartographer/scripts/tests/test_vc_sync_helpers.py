@@ -2124,3 +2124,48 @@ class TestSftpAnalyzeIntegration:
                          'is_backup': False}}
         actions = sftp_manager.analyze_changes({path: info}, remote)
         assert actions[path][0] == SyncAction.CONFLICT
+
+
+class TestRemoteRegression:
+    """A changed REMOTE fiber that an older build re-saved as version 3 over a
+    version-4 base with span tags is a manual conflict, not a plain download;
+    a base with nothing to lose never fetches the remote."""
+
+    def _v4_gap_base(self):
+        base = test_fiber_merge.make_v3_fiber(test_fiber_merge.BASE_CPS)
+        test_fiber_merge.make_v4_gap(base, 1)
+        return base
+
+    def test_downgraded_remote_is_a_conflict(self, manager, monkeypatch):
+        base = self._v4_gap_base()
+        stale = copy.deepcopy(base)
+        stale['version'] = 3
+        for cp in stale['control_points'][:-1]:
+            cp['segment_to_next'].pop('tags', None)
+        stale['generation'] = 2
+        monkeypatch.setattr(manager, '_load_base', lambda path, tracked: base)
+        fetched = []
+        monkeypatch.setattr(manager, '_fetch_remote_json',
+                            lambda path: (fetched.append(path) or (stale, None)))
+        message = manager._fiber_remote_regression('dj_x_000001.json', {'s3_etag': 'x'})
+        assert message and 'span tags' in message
+        assert fetched == ['dj_x_000001.json']
+
+    def test_remote_that_kept_the_tags_downloads(self, manager, monkeypatch):
+        base = self._v4_gap_base()
+        remote = copy.deepcopy(base)
+        remote['generation'] = 2
+        monkeypatch.setattr(manager, '_load_base', lambda path, tracked: base)
+        monkeypatch.setattr(manager, '_fetch_remote_json', lambda path: (remote, None))
+        assert manager._fiber_remote_regression('dj_x_000001.json', {'s3_etag': 'x'}) is None
+
+    def test_base_without_regressable_metadata_never_fetches(self, manager, monkeypatch):
+        base = test_fiber_merge.make_v3_fiber(test_fiber_merge.BASE_CPS)
+        base['version'] = 4
+        monkeypatch.setattr(manager, '_load_base', lambda path, tracked: base)
+        def boom(path):
+            raise AssertionError('remote fetched although nothing could be lost')
+        monkeypatch.setattr(manager, '_fetch_remote_json', boom)
+        assert manager._fiber_remote_regression('dj_x_000001.json', {'s3_etag': 'x'}) is None
+        assert not fiber_merge.base_carries_regressable_metadata(base)
+        assert fiber_merge.base_carries_regressable_metadata(self._v4_gap_base())
