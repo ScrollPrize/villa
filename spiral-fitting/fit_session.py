@@ -355,6 +355,11 @@ class FitInputSpec:
     # input does today: the checkpoint domain is set by "new_fit" config
     # keys (z-range, model shape, optimizer seed), never by an input path.
     checkpoint_domain: bool = False
+    # Catalog key of the store whose resident-pool sidecar holds this
+    # input's voxels ("" = the input has no sidecar form).
+    sidecar_store: str = ""
+    # That sidecar is the two-channel nx+ny pool.
+    sidecar_pair: bool = False
 
 
 # Entries are ordered as validate_session_request reports them.
@@ -384,16 +389,19 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
     FitInputSpec("normal_x", "zarr-group",
                  conventional_relative="lasagna_inputs/las_008_nx.ome.zarr",
                  enabled=lambda config: input_source_enabled(config, "normals"),
-                 required=_normals_required),
+                 required=_normals_required,
+                 sidecar_store="normal_x", sidecar_pair=True),
     FitInputSpec("normal_y", "zarr-group",
                  conventional_relative="lasagna_inputs/las_008_ny.ome.zarr",
                  enabled=lambda config: input_source_enabled(config, "normals"),
-                 required=_normals_required),
+                 required=_normals_required,
+                 sidecar_store="normal_x", sidecar_pair=True),
     FitInputSpec("gradient_magnitude", "zarr-group",
                  conventional_relative="lasagna_inputs/las_008_grad_mag.ome.zarr",
                  enabled=lambda config: input_source_enabled(
                      config, "gradient_magnitude"),
-                 required=_grad_mag_required),
+                 required=_grad_mag_required,
+                 sidecar_store="gradient_magnitude"),
     FitInputSpec("winding_inference", "directory",
                  conventional_relative="winding_inference",
                  enabled=_winding_model_enabled,
@@ -568,6 +576,32 @@ class SpiralDatasetResolution:
 
 SCROLL_SPEC_FILENAME = "spiral-scroll.json"
 SCROLL_SPEC_SCHEMA_VERSION = 1
+DEFAULT_NORMAL_ZARR_GROUP = "4"
+DEFAULT_LASAGNA_SCALE = 4
+LASAGNA_SIDECAR_INFIX = ".respool_g"
+LASAGNA_SIDECAR_METADATA = "meta.json"
+
+
+def lasagna_sidecar_path(store_path: str | os.PathLike[str],
+                         group: str | int, *, pair: bool = False) -> str:
+    """Canonical resident-pool sidecar directory beside one Lasagna store.
+
+    The pair suffix marks the two-channel nx+ny pool, which lives next to
+    the nx store and is the only place the ny voxels are published.
+    """
+    suffix = f"{LASAGNA_SIDECAR_INFIX}{group}" + ("_pair" if pair else "")
+    return str(store_path).rstrip("/\\") + suffix
+
+
+def lasagna_sidecar_ready(store_path: str | os.PathLike[str],
+                          group: str | int, *, pair: bool = False) -> str:
+    """The sidecar a fit would read for one store, or "" when unpacked."""
+    if not str(store_path or "").strip():
+        return ""
+    sidecar = lasagna_sidecar_path(store_path, group, pair=pair)
+    metadata = Path(sidecar) / LASAGNA_SIDECAR_METADATA
+    return sidecar if metadata.is_file() else ""
+
 
 # Input keys whose paths may depart from the directory conventions. Values in
 # the spec file are resolved relative to the dataset root; conventional paths
@@ -623,8 +657,8 @@ class ScrollSpec:
     # independent of physical voxel size and may be absent in legacy specs.
     base_shape_zyx: tuple[int, int, int] | None = None
     umbilicus_coordinate_scale: float = 1.0
-    normal_zarr_group: str = "4"
-    lasagna_scale: int = 4
+    normal_zarr_group: str = DEFAULT_NORMAL_ZARR_GROUP
+    lasagna_scale: int = DEFAULT_LASAGNA_SCALE
     # Allow-listed absolute-path overrides, (key, resolved path) pairs.
     path_overrides: tuple[tuple[str, str], ...] = ()
 
@@ -693,7 +727,7 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
     except (TypeError, ValueError):
         raise ScrollSpecError(f"{source}: umbilicus coordinate_scale must be a number") from None
 
-    lasagna_scale = document.get("lasagna_scale", 4)
+    lasagna_scale = document.get("lasagna_scale", DEFAULT_LASAGNA_SCALE)
     if type(lasagna_scale) is not int or lasagna_scale <= 0:
         raise ScrollSpecError(f"{source}: lasagna_scale must be a positive integer")
 
@@ -719,7 +753,8 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
         spiral_outward_sense=sense,
         base_shape_zyx=base_shape_zyx,
         umbilicus_coordinate_scale=coordinate_scale,
-        normal_zarr_group=str(document.get("normal_zarr_group", "4")),
+        normal_zarr_group=str(
+            document.get("normal_zarr_group", DEFAULT_NORMAL_ZARR_GROUP)),
         lasagna_scale=lasagna_scale,
         path_overrides=tuple(overrides),
     )
@@ -1106,17 +1141,29 @@ def resolve_dataset_root(
     else:
         result.scroll_spec = spec.manifest()
 
+    def conventional_or_override(key: str) -> Path | None:
+        override = spec.path_override(key) if spec is not None else ""
+        if override:
+            return Path(override)
+        relative = _CONVENTIONAL_INPUT_RELATIVES.get(key)
+        return root / relative if relative else None
+
+    group = spec.normal_zarr_group if spec is not None \
+        else DEFAULT_NORMAL_ZARR_GROUP
     for input_spec in FIT_INPUT_CATALOG:
         # DBM inputs need backing-file probing (below) and PCL collections
         # are per-role files; neither is a plain path probe.
         if input_spec.kind in ("dbm", "pcl-set") or not input_spec.conventional_relative:
             continue
-        override = spec.path_override(input_spec.key) if spec is not None else ""
-        candidate = Path(override) if override \
-            else root / input_spec.conventional_relative
+        candidate = conventional_or_override(input_spec.key)
         found = candidate.is_file() if input_spec.kind == "file" \
             else candidate.is_dir()
-        if found and os.access(candidate, os.R_OK):
+        found = found and os.access(candidate, os.R_OK)
+        if not found and input_spec.sidecar_store:
+            found = bool(lasagna_sidecar_ready(
+                conventional_or_override(input_spec.sidecar_store), group,
+                pair=input_spec.sidecar_pair))
+        if found:
             result.resolved[input_spec.key] = _normalise_path(candidate)
         elif input_spec.resolve_required:
             result.missing_required.append(input_spec.key)
@@ -1181,9 +1228,18 @@ def _validate_json_file(path: Path, label: str, errors: list[dict[str, str]]) ->
 def validate_session_request(
     paths: SpiralInputPaths,
     run: SpiralRunConfig,
+    scroll: "ScrollSpec | None" = None,
 ) -> list[dict[str, str]]:
-    """Perform cheap, aggregate validation before any GPU allocation."""
+    """Perform cheap, aggregate validation before any GPU allocation.
+
+    A Lasagna store counts as present when the OME-Zarr directory is there
+    or when the resident-pool sidecar the fit actually reads is: a packed
+    dataset need not carry the stores it was packed from. ``scroll`` names
+    the sidecar group; without it the schema default is assumed.
+    """
     errors: list[dict[str, str]] = []
+    normal_group = scroll.normal_zarr_group if scroll is not None \
+        else DEFAULT_NORMAL_ZARR_GROUP
 
     def require_file(value: str, field_name: str, *, json_file: bool = False) -> None:
         path = Path(value) if value else None
@@ -1204,8 +1260,17 @@ def validate_session_request(
         elif not os.access(path, os.R_OK):
             errors.append({"field": field_name, "message": "Directory is not readable"})
 
+    def sidecar_stands_in(spec: FitInputSpec) -> bool:
+        if not spec.sidecar_store:
+            return False
+        return bool(lasagna_sidecar_ready(
+            getattr(paths, spec.sidecar_store), normal_group,
+            pair=spec.sidecar_pair))
+
     def check_catalog_input(spec: FitInputSpec) -> None:
         if not spec.enabled(run.config):
+            return
+        if spec.sidecar_store and sidecar_stands_in(spec):
             return
         if spec.kind == "file":
             require_file(getattr(paths, spec.key), spec.key,
