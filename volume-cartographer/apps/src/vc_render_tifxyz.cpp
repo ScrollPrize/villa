@@ -379,21 +379,6 @@ static std::vector<float> buildCompositeOffsetList(
     return out;
 }
 
-static std::string loadCachedRemoteUrl(const std::filesystem::path& volumePath)
-{
-    auto markerPath = volumePath / ".remote_source.json";
-    std::ifstream file(markerPath);
-    if (!file.is_open()) return {};
-
-    try {
-        Json marker = Json::parse_file(markerPath);
-        if (marker.contains("url") && marker["url"].is_string())
-            return marker["url"].get_string();
-    } catch (...) {
-    }
-    return {};
-}
-
 // Sparse pyramids (e.g. lasagna prediction zarrs holding only their scaledown
 // level) keep absent levels as {0,0,0} placeholders, so a pure range check on
 // numLevels() passes and every read at such a level comes back as fill value.
@@ -1011,7 +996,7 @@ int main(int argc, char *argv[])
     // clang-format off
     po::options_description required("Required arguments");
     required.add_options()
-        ("volume,v", po::value<std::string>()->required(), "Path to the OME-Zarr volume")
+        ("volume,v", po::value<std::string>(), "Local OME-Zarr volume directory, or a remote OME-Zarr URL (http(s)://, s3://) to stream; remote chunks persist in the shared remote cache")
         ("scale", po::value<float>()->required(), "Pixels per level-g voxel (Pg)")
         ("group-idx,g", po::value<int>()->required(), "OME-Zarr group index");
 
@@ -1020,8 +1005,8 @@ int main(int argc, char *argv[])
         ("help,h", "Show this help message")
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
         ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
-        ("prefetch-remote", po::bool_switch()->default_value(false), "Prefetch the chunks this render reads into the shared remote cache before rendering")
-        ("remote-url", po::value<std::string>(), "Remote OME-Zarr URL for remote cache streaming/prefetch; fetched chunks persist under the shared remote cache root (optional if --volume cache already records it)")
+        ("prefetch-remote", po::bool_switch()->default_value(false), "With a remote --volume, fetch every chunk this render reads into the shared remote cache before rendering instead of streaming them during the render")
+        ("remote-url", po::value<std::string>(), "[DEPRECATED] Same as passing the remote OME-Zarr URL as --volume")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
         ("timeout", po::value<int>()->default_value(0), "Kill process if not finished within N minutes")
         ("num-slices,n", po::value<int>()->default_value(1), "Number of slices to render")
@@ -1160,17 +1145,25 @@ int main(int argc, char *argv[])
         return mergeTiffParts(tifOutputArg, numParts) ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
-    std::filesystem::path vol_path = parsed["volume"].as<std::string>();
-    const bool prefetchRemote = parsed["prefetch-remote"].as<bool>();
-    std::string remoteUrl = parsed.count("remote-url") ? parsed["remote-url"].as<std::string>() : "";
-    if (remoteUrl.empty()) {
-        remoteUrl = loadCachedRemoteUrl(vol_path);
-        if (!remoteUrl.empty())
-            logPrintf(stdout, "Detected cached remote source: %s\n", remoteUrl.c_str());
+    std::string volumeSource = parsed.count("volume") ? parsed["volume"].as<std::string>() : "";
+    if (parsed.count("remote-url")) {
+        const std::string remoteUrlArg = parsed["remote-url"].as<std::string>();
+        if (volumeSource.empty()) {
+            volumeSource = remoteUrlArg;
+        } else if (volumeSource != remoteUrlArg) {
+            logPrintf(stderr, "Error: --volume (%s) and --remote-url (%s) name different sources; --remote-url is deprecated, pass the remote URL as --volume\n",
+                      volumeSource.c_str(), remoteUrlArg.c_str());
+            return EXIT_FAILURE;
+        }
+        logPrintf(stderr, "Warning: --remote-url is deprecated, pass the remote URL as --volume\n");
     }
+    if (volumeSource.empty()) { logPrintf(stderr, "Error: --volume required\n"); return EXIT_FAILURE; }
+    std::filesystem::path vol_path = volumeSource;
+    const bool prefetchRemote = parsed["prefetch-remote"].as<bool>();
+    const std::string remoteUrl = volumeSource.find("://") != std::string::npos ? volumeSource : std::string{};
     const bool useRemoteCache = !remoteUrl.empty();
     if (prefetchRemote && !useRemoteCache) {
-        logPrintf(stderr, "Error: --prefetch-remote requires --remote-url or a cached remote source marker under --volume\n");
+        logPrintf(stderr, "Error: --prefetch-remote requires a remote --volume URL\n");
         return EXIT_FAILURE;
     }
 
@@ -1374,6 +1367,11 @@ int main(int argc, char *argv[])
     double base_voxel_size = 1.0;
     bool hasPhysicalVoxelSize = false;
     bool voxelSizeFromCli = false;
+    const auto volumeMetadataVoxelSize = [&]() -> std::optional<double> {
+        if (!useRemoteCache) return readVolumeVoxelSize(vol_path);
+        const double v = remoteVolume->voxelSize();
+        return v > 0.0 ? std::optional<double>(v) : std::nullopt;
+    };
     if (parsed.count("voxel-size")) {
         base_voxel_size = parsed["voxel-size"].as<double>();
         if (!std::isfinite(base_voxel_size) || base_voxel_size <= 0.0) {
@@ -1383,7 +1381,7 @@ int main(int argc, char *argv[])
         hasPhysicalVoxelSize = true;
         voxelSizeFromCli = true;
         logPrintf(stdout, "Voxel size (from CLI): %g %s\n", base_voxel_size, voxel_unit.c_str());
-    } else if (auto mv = readVolumeVoxelSize(vol_path); mv.has_value()) {
+    } else if (auto mv = volumeMetadataVoxelSize(); mv.has_value()) {
         if (std::isfinite(*mv) && *mv > 0.0) {
             base_voxel_size = *mv;
             hasPhysicalVoxelSize = true;

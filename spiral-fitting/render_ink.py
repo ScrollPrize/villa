@@ -327,8 +327,8 @@ def max_composite(tif_paths):
 
 @click.command(help=__doc__)
 @click.argument('meshes_dir', type=click.Path(exists=True, file_okay=False))
-@click.option('--volume', required=True, help='Ink volume zarr path')
-@click.option('--remote-url', default='', help='Remote OME-Zarr URL for --volume, passed through to vc_render_tifxyz as --remote-url. Required when --volume is a not-yet-populated local cache dir for a scroll that only exists remotely; omit once the cache already records the URL (vc_render_tifxyz --help)')
+@click.option('--volume', required=True, help='Ink volume zarr path, or a remote OME-Zarr URL that vc_render_tifxyz streams')
+@click.option('--remote-url', default='', help='[DEPRECATED] Passed through to vc_render_tifxyz as --remote-url; pass the remote OME-Zarr URL as --volume instead')
 @click.option('--vc-render-bin', default='vc_render_tifxyz', show_default=True, help='Path to the vc_render_tifxyz binary')
 @click.option('--scale', type=float, default=0.25, show_default=True)
 @click.option('--group-idx', type=int, default=1, show_default=True)
