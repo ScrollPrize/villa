@@ -1,4 +1,4 @@
-"""Supervised spatial fiber follower with asynchronous, dense-GT DAgger replay."""
+"""Supervised joint-flow fiber follower with asynchronous, dense-GT DAgger replay."""
 from __future__ import annotations
 
 import argparse
@@ -81,13 +81,15 @@ def main(argv=None):
     ap.add_argument('--hist-points', type=int, default=32)
     ap.add_argument('--hist-stride', type=int, default=4)
     ap.add_argument('--clean-points', type=int, default=8, help='Number of annotated past points to reconstruct with the current point')
-    ap.add_argument('--clean-weight', type=float, default=.5)
-    ap.add_argument('--clean-tangent-points', type=int, default=6,
-                    help='Recent corrected points for the decoder tangent, including current (2 = two-point ablation)')
-    ap.add_argument('--max-history-correction', type=float, default=4.)
-    ap.add_argument('--max-lateral-slope', type=float, default=2.)
-    ap.add_argument('--path-sample-radius', type=float, default=2.)
     ap.add_argument('--n-candidates', type=int, default=4)
+    ap.add_argument('--flow-layers', type=int, default=4, help='Transformer blocks of the joint polyline flow')
+    ap.add_argument('--flow-heads', type=int, default=4)
+    ap.add_argument('--flow-steps', type=int, default=8, help='Euler steps from the prior to a sampled polyline')
+    ap.add_argument('--flow-samples', type=int, default=16, help='Polyline samples per state; candidates are its modes')
+    ap.add_argument('--flow-draws', type=int, default=8, help='(time, noise) draws per example in the flow loss')
+    ap.add_argument('--prior-scale', type=float, default=4., help='Prior standard deviation around straight ahead / observed history, voxels')
+    ap.add_argument('--candidate-separation', type=float, default=1.5, help='RMS lateral distance on the commit window separating candidate modes')
+    ap.add_argument('--flow-weight', type=float, default=1.)
     ap.add_argument('--widths', type=int, nargs='+', default=(24, 48, 96))
     ap.add_argument('--hidden', type=int, default=96)
     ap.add_argument('--norm', choices=('batch', 'group'), default='batch')
@@ -119,10 +121,12 @@ def main(argv=None):
         ap.error('Invalid collection, diagnostic, worker, or tolerance settings')
     if args.n_history < args.hist_points*args.hist_stride:
         ap.error('n-history must cover hist-points * hist-stride')
-    if args.clean_points < 1 or args.clean_points > args.hist_points*args.hist_stride or args.clean_weight < 0:
-        ap.error('clean-points must be positive, fit in history, and clean-weight must be nonnegative')
-    if args.clean_tangent_points < 2:
-        ap.error('clean-tangent-points must be at least 2')
+    if args.clean_points < 1 or args.clean_points > args.hist_points*args.hist_stride:
+        ap.error('clean-points must be positive and fit in history')
+    if min(args.flow_layers, args.flow_heads, args.flow_steps, args.flow_draws) < 1 or args.flow_samples < args.n_candidates:
+        ap.error('Flow layers/heads/steps/draws must be positive and flow-samples at least n-candidates')
+    if min(args.prior_scale, args.candidate_separation) <= 0 or args.flow_weight < 0:
+        ap.error('prior-scale and candidate-separation must be positive; flow-weight nonnegative')
     if min(args.crop_spacing, args.ct_grid_scale) <= 0:
         ap.error('Voxel spacings must be positive')
     if not math.isfinite(args.history_sigma) or args.history_sigma <= 0 or not math.isfinite(args.history_jitter) or args.history_jitter < 0:
@@ -146,9 +150,10 @@ def main(argv=None):
                                 spacing=crop.spacing, widths=tuple(args.widths), hidden=args.hidden,
                                 n_future=args.n_future, future_step=args.future_step, hist_points=args.hist_points,
                                 hist_stride=args.hist_stride, n_candidates=args.n_candidates,
-                                clean_points=args.clean_points, clean_tangent_points=args.clean_tangent_points,
-                                norm=args.norm, max_history_correction=args.max_history_correction,
-                                max_lateral_slope=args.max_lateral_slope, path_sample_radius=args.path_sample_radius)
+                                clean_points=args.clean_points, norm=args.norm,
+                                flow_layers=args.flow_layers, flow_heads=args.flow_heads, flow_steps=args.flow_steps,
+                                flow_samples=args.flow_samples, flow_draws=args.flow_draws, prior_scale=args.prior_scale,
+                                candidate_separation=args.candidate_separation)
     model = prepare_model(FollowNet(model_cfg), args.device)
     if args.init:
         initial, initial_crop, nh, initial_spec, _ = load_checkpoint(args.init, args.device)
@@ -217,9 +222,9 @@ def main(argv=None):
             torch.backends.cudnn.benchmark = args.device.startswith('cuda')
             extras = teacher_candidates(batch, model.cfg)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.device.startswith('cuda')):
-                output = model(batch['x'].float(), batch['hist'], batch['hmask'], extras)
+                output = model(batch['x'].float(), batch['hist'], batch['hmask'], extras, targets=batch)
             loss, metrics = loss_fn(output, batch, model.cfg, args.tolerance, args.rank_weight,
-                                    args.confidence_weight, args.clean_weight, args.rank_temperature)
+                                    args.confidence_weight, args.flow_weight, args.rank_temperature)
             optimizer_step(model, opt, loss, step, lr)
             if step % args.log_every == 0 or step == args.steps:
                 record(dict(step=step, loss=loss.item(), lr=lr, replay_samples_seen=replay_seen,

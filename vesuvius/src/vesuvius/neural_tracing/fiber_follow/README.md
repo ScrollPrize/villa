@@ -1,115 +1,116 @@
 # fiber_follow
 
-Supervised autoregressive tracing from a high-presence seed. A spatial network
-proposes several continuations, scores them against image features and trace
-history, and estimates how much of each continuation is safe to commit. It
-traces both directions for inference and writes VC3D fiber JSON.
+## Current experiment: direct history-anchored paths (v7)
 
-## Current experiment: longer visual history and continuation scoring (v6)
+`direct_paths_v7` predicts continuation coordinates directly from CT, fiber
+presence, and the actual trace history. The follower has no Gaussian prediction
+head, Gaussian targets or loss, per-plane heatmaps, or peak decoder. The smooth
+rendering of observed history remains an **input channel**.
 
-`spatial_candidates_v6` scores continuations directly against the observed
-history and its predicted clean version. Each history token contains image
-features at both positions, both coordinates, the correction vector, and a
-validity mask. A GRU reads valid points oldest to newest; its final state is
-combined with a masked mean of history tokens so older observations have a
-direct route into the scorer. Masked history never advances recurrent state.
+The production preset in `scripts/launch_ct_paths.sh` uses:
 
-Each candidate is processed in both directions: a forward GRU initialized from
-history, and a backward GRU over the proposed future. Both heads combine the
-forward and backward states, a pooled future summary, and explicit history.
-Ranking pools these joint features across the continuation. Prefix confidence
-uses the same context at each point, so distant evidence can influence the
-first decision. Candidate and batch states are independent; adding training
-teacher candidates cannot change another candidate's scores. At rollout the
-scorer uses proposed paths and visible image features, with no future ground
-truth. Ground-truth and perturbed teacher candidates are training-only inputs.
+| Setting | Value |
+| --- | --- |
+| Inputs | Native level-0 CT, fiber presence, observed history |
+| Crop | 208 × 128 × 128 at 0.5 trace-voxel spacing |
+| Visual support | 32 voxels behind, 71.5 ahead, ±31.75 laterally |
+| Forecast | 6 candidate paths, each 64 points at one forward voxel spacing |
+| Clean history | Current point + previous 32 points |
+| Geometry history | Up to 128 previous points |
+| Encoder widths / hidden size | 24, 64, 128 / 128 |
+| Train / collector / diagnostic batch | 2 / 1 / 1 |
+| Training | 50,000 steps; 100,000 sampled states |
+| Diagnostics | Every 500 steps, 32 seeds |
 
-The CT launcher uses **32 trace voxels of visual history and a 64-voxel
-prediction horizon**. At native CT spacing 0.5 this is a **208×128×128** crop,
-with 64 crop samples behind: physical support is -32 to +71.5 along the
-heading and ±31.75 laterally. The extra 7.5 voxels ahead provide image context
-past the last prediction. All 64 future planes stay one trace voxel apart;
-the cleaner/scorer uses 32 past points plus current. Geometric history remains
-128 points. Tracing still commits at most four future points per decision.
+CT and presence are independently sampled in the same oriented frame. Both are
+scaled by 255. Presence is a learned input cue; annotated fibers supply labels.
+The crop aligns its forward axis with the current heading so that prediction
+planes have a consistent meaning despite changes in global fiber direction.
 
-The crop was widened after the first v6 run showed substantial target clipping.
-The heatmap now has 125 lateral samples at spacing 0.5 (±31 voxels), and the
-heading-noise standard deviations are 2°, 5°, and 10°. A fixed geometry audit
-reduced fresh crossing OOB from 12.9% to 2.1%; widening alone reduced sampled
-on-track replay OOB from 23.8% to 7.2%. Curvature remains a source of clipping.
+### Start and watch
 
-The wider crop has four times the voxels of the initial v6 crop. The preset
-therefore uses training batch **2**, DAgger batch **1**, and diagnostic batch
-**1**, with all 32 diagnostic seeds retained. These conservative GPU batch
-sizes are provisional: the wide configuration passed a full-size CPU
-forward/backward check, but GPU memory has not been measured while the narrow
-run occupies the GPU. There is no gradient accumulation; 50k steps means 100k
-examples. `--steps 200000` would match the initial v6 preset's 400k-example
-budget. Compare examples and elapsed time, not just steps.
-
-The decoder estimates its initial tangent with a weighted line fit over up to
-six corrected points, including the current point. It accounts for the
-corrected anchor's forward coordinate when extrapolating to the first plane.
-`--clean-tangent-points 2` provides a two-point tangent ablation. Rollout still
-commits only future points; corrections do not rewrite the stored trace.
-
-The CT launcher now selects `--inputs ct+presence`. Input channels are **native
-CT / 255, predicted fiber presence / 255, own-history tube**. Presence is read
-on the fiber grid and trilinearly sampled at the same world positions as CT;
-CT is not downsampled. No direction zarrs are opened in this mode. Presence is
-an input feature, not a target, supervision weight, or stopping rule.
-
-Start a fresh run from this directory:
+From this directory, with the existing project environment:
 
 ```bash
-bash scripts/launch_ct_tube.sh ct0_presence_h32_f64_w128_v6
-# Same scorer, two-point tangent ablation:
-bash scripts/launch_ct_tube.sh ct0_presence_h32_f64_w128_v6_tangent2 --clean-tangent-points 2
-# CT-only input ablation:
-bash scripts/launch_ct_tube.sh ct0_h32_f64_w128_v6 --inputs ct
+bash scripts/launch_ct_paths.sh ct0_presence_paths_v7
+tail -F output/logs/ct0_presence_paths_v7.log
 ```
 
-These are separate experiments, not commands to run concurrently. V6 requires
-a fresh checkpoint; no earlier-architecture weight adapters are provided.
+The launcher starts a background process. Run names must be new. Checkpoints,
+`config.json`, `log.jsonl`, images and replay archives live in
+`output/ct0_presence_paths_v7/`. Additional training options go after the name.
+This architecture requires fresh training; no old-checkpoint adapters or old
+Gaussian launcher are retained.
 
-Training logs compare observed and cleaned current/history position errors,
-tangent errors in degrees, fractions improved, and correction size. Every new
-metric includes its valid-state count. Improvement uses only points with both
-observed history and annotated targets; absent history is not treated as a
-successful reconstruction.
+## Architecture and supervision
 
-For held-out rollout auditing, from `vesuvius/`:
+1. A 3D encoder-decoder produces spatial features from the three input channels
+   and local coordinates. The cleaner predicts corrections to the current point
+   and supplied history, capped at four voxels per point. Its loss uses only
+   points that are both annotated and actually supplied.
+2. An ordered history encoder combines observed and cleaned history. Every
+   candidate decoder starts at the cleaned current point, with an initial
+   tangent fitted to six recent corrected points and a learned mode embedding.
+3. A recurrent coordinate decoder advances across all 64 forward planes. At
+   each plane it samples a 3×3 neighborhood of image features around its expected
+   location (radius two voxels), updates its state, and predicts a lateral step.
+   Its state is conditioned on the history throughout the continuation. There
+   is no ground-truth input or teacher forcing in this decoder.
+4. A bidirectional scorer examines each proposed continuation together with
+   the history. Ranking selects a path; prefix confidence controls how far to
+   commit. Candidate coordinates are detached at the scorer input so that
+   classification cannot improve its own labels by moving a path. Coordinate
+   supervision trains the decoder; both objectives train shared features.
 
-```bash
-FF=src/vesuvius/neural_tracing/fiber_follow
-.venv/bin/python "$FF/scripts/eval_ckpt.py" \
-  "$FF/output/ct0_presence_h32_f64_w128_v6/ckpt_010000.pt" \
-  --tag presence_h32_f64_w128_v6_c03 --history-audit --batch 1 \
-  --params '{"confidence":0.3,"max_len":400}'
-```
+The lateral displacement between adjacent points is capped at two voxels per
+forward voxel. The first point is connected to the corrected anchor by the same
+bound. With the preset, its distance from the actual current point cannot exceed
+`sqrt((4 + 2)^2 + 1) ≈ 6.08` voxels. This prevents the old 10–20 voxel first-point
+jumps, but does not guarantee the correct fiber. Cleaning error and local path
+accuracy still need to improve through training.
 
-The evaluation JSON includes `history_audit.groups`: on-track, off-track,
-false first-point stops/continues, recoverable drift, and states without a
-correct first-point candidate. Decisions use DAgger's original-fiber,
-progress-bounded matching. Unknown annotation ends and the end of the short
-departure suffix censor the audit, without stopping the actual trace.
-Already-departed states have correction-size statistics, not supervised clean
-position/tangent errors. The audit measures agreement with the original fiber;
-it does not identify which neighboring fiber a wrong correction selects.
+**Coordinate objective:** Smooth-L1 against dense annotated crossings, choosing
+one best candidate over the whole known trajectory, plus 0.5 times the first-four-
+point loss across **every** candidate, plus 0.25 times the winning candidate's
+step-vector loss. This teaches a common near-term continuation while allowing
+later alternatives. Candidate modes start with small learned directional
+variations; no repulsion forces them apart on unambiguous fibers.
 
-Repeat with identical seeds at confidence 0.2, 0.3, 0.5, and 0.7, using distinct
-tags. Compare coverage at matched `wrong_len_mean`, not only at one threshold.
-The checkpoint-24k sweep in `EXPERIMENTS.md` motivates this evaluation, but does not calibrate
-the newly trained V6 head. Full evaluation coverage uses the entire available
-annotation; the short training diagnostic additionally caps that denominator
-at 400 voxels, so their coverage numbers differ.
+Teacher paths and perturbed paths bootstrap the scorer, but cannot win the
+coordinate assignment. Unknown suffixes are censored. Already departed states
+supply continuation negatives, without coordinate supervision. Known annotated
+points remain coordinate targets even if they leave the crop.
 
-Tests for these changes (from this directory, with pytest available):
+Total loss adds the coordinate objective, ranking, prefix confidence, and
+0.5 times the clean-history loss. `proposal` in the log now means the coordinate
+objective. Useful measurements include:
 
-```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ../../../../.venv/bin/python -m pytest -q \
-  tests/test_history_confidence.py
-```
+- `coordinate_full`, `coordinate_trunk`, `coordinate_steps`: direct losses.
+- `first_plane_error`, `clean_current_error`: placement and anchor accuracy.
+- `candidate_first_step_max`, `first_step_length_max`: worst first-point jumps.
+- `candidate_endpoint_spread`: whether candidates remain distinct.
+- `target_step_limit_fraction`: annotated steps outside the decoder's allowed
+  lateral displacement; persistent values indicate a representational limit.
+- `target_crop_oob`, `target_crop_edge`: lack of visual support, not endpoints.
+- `oracle_error`, `selected_error`, `oracle_recall`: candidate quality and ranking.
+- Gate false stops/continues at thresholds 0.3, 0.5 and 0.7.
+
+At batch two, per-batch oracle recall often takes values 0, 0.5 or 1. Compare
+averages over many batches and held-out rollouts. The old threshold sweep is
+recorded in `EXPERIMENTS.md`; it does not calibrate this new model.
+
+## Direct path decoder trunk loss (`direct_paths_v7`)
+
+The direct decoder's coordinate loss assigns one whole-path winner among the
+proposed modes. On the first four planes (the commit window) it uses relaxed
+winner-takes-all: the winner has weight 1 and every other mode
+`--trunk-loser-weight` (default 0.1). Losing modes are kept alive and near the
+fiber without being pulled onto the average of two plausible branches; a
+weight of 1 recovers the earlier mean over modes, and 0 is pure WTA. The log
+reports `trunk_spread`, the mean lateral spread of the modes over those
+planes: near zero everywhere means the candidates hedge together, while
+opening on some states is the intended behaviour at forks and parallel
+neighbours. Tests: `tests/test_direct_paths.py`.
 
 ## Ground truth
 
@@ -135,127 +136,6 @@ The spatial split uses the arclength-weighted centroid of the controlled curve.
 After augmentation, every training state must exclude the held-out z band from
 its crop read block, active history, and dense targets, with an additional
 48-voxel position guard. The same filter applies to replay and collection.
-
-## Architecture and supervision
-
-`spatial_candidates_v3` uses a 3D encoder-decoder with spatial skip connections,
-metric coordinate channels, and early conditioning on 128 voxels of trace
-history. The default crop is uniformly sampled **64×64×64**, with one trace-grid
-voxel spacing on every axis. It covers 16 voxels behind and 47 ahead, and ±31.5
-laterally. The current point stays offset toward the back of the oriented cube.
-There are 16 future planes, two forward voxels apart; each has a 61×61 heatmap
-covering ±30 lateral voxels with one-voxel spacing. This leaves image context
-around every proposed point. The full-prefix head and 0.7 threshold are retained.
-
-1. Plane heatmaps learn the dense GT curve crossings directly. Peak decoding
-   connects modes into four coherent candidate paths with a curvature penalty
-   and path-diversity suppression. This is local proposal decoding; rollout is
-   greedy and has no multi-step beam yet.
-2. The scorer samples decoded spatial features along each candidate and its
-   lateral neighborhood. It predicts candidate rank and confidence for every
-   prefix. A GRU carries information from the beginning of each candidate into
-   every later confidence prediction; its state resets for each candidate and
-   decision. Training scores current proposals, GT/jittered proposals, and the
-   original proposals saved in replay.
-3. The ranking target is `softmax(quality * --rank-temperature)` (default 20);
-`rank_target_entropy` in the log shows how far it is from uniform, and the
-`gate*` metrics report false stops and false continues of the confidence gate
-on the rank-selected proposal at 0.3/0.5/0.7.
-   Confidence labels compare interpolated candidates with dense GT crossings
-   every 0.5 forward voxel by default. A prefix is positive when every known
-   crossing agrees within `--tolerance` (default 1.5 voxels). A known mistake
-   makes that prefix and subsequent prefixes negative; unknown continuation is
-   masked. Already departed states supply negative confidence labels and no
-   position targets. Prefix checking begins at the first predicted point, so a
-   perturbed state can learn to recover onto its fiber.
-
-Inference selects the highest-ranked candidate whose first prefix clears the
-confidence threshold (default **0.7**), then commits up to four safe points (2–8 forward voxels).
-Confidence is made nonincreasing along each candidate. If no candidate clears
-the threshold, it stops **before** committing. There is no stop trimming or
-presence-based model-stop heuristic. Bounds, loops, and maximum length remain
-geometric limits. Heading updates use committed points only.
-
-The 0.7 default is shared by training diagnostics, DAgger collection, and
-inference, and can be overridden with `--confidence`. On the CT run's
-checkpoint 24,000 a threshold of 0.3 gave 2.6x the coverage at the same
-length precision (see `EXPERIMENTS.md`, stop policy sweep). `TraceParams`
-also offers `stop_patience` (consecutive would-stop calls before stopping,
-committing one point meanwhile) and `commit_floor`; the defaults keep the
-immediate stop. It was selected from
-short held-out rollouts of the preceding model; recalibrate it after training
-the new head.
-
-The confidence threshold is an operating parameter, not a demonstrated
-calibration guarantee. Compare coverage and wrong length on held-out rollouts.
-Logs separate best-proposal error/recall from selected-proposal error to help
-distinguish proposal failures from scoring failures. Error diagnostics clip
-lateral errors at eight voxels and exclude GT/jitter/replay candidates.
-
-`target_crop_oob`, `target_crop_edge`, and `target_heatmap_oob` report fractions
-of known dense crossings outside the crop, within three voxels of its lateral
-edge (including outside), and outside prediction support. Lower is better.
-These measure sample geometry, not model accuracy; no GT is discarded from
-confidence supervision because of these counters. Position heatmap loss only
-applies where the target is representable.
-
-Batch images mark the current point and prediction limits in cyan, supplied
-history in red, GT in green, and the full proposed continuation in orange.
-Magenta squares flag GT outside the crop. Plot bounds remain the actual crop;
-orange shows the full proposal before confidence gating. Rollout images show
-the model-generated path starting from a single seed.
-
-## Native level-0 CT tube experiment
-
-Use `scripts/launch_ct_tube.sh RUN_NAME` for a fresh CT + presence Gaussian-tube run.
-The preset uses `/mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr/0`.
-One CT voxel in this dataset is four base voxels (`--ct-grid-scale 4`). All trace
-geometry and tolerances remain in the original eight-base-voxel trace grid.
-The oriented crop is 208×128×128 with `--crop-spacing 0.5`: one native CT voxel
-per sample. It reads level-0 CT directly. Forward planes are one trace voxel
-apart and lateral heatmap samples are half a trace voxel apart. The 64-plane
-horizon is 64 trace voxels (128 CT voxels); visual history spans 32 trace voxels.
-
-The channels are CT intensity / 255, predicted presence / 255, and the tracer's history tube.
-Metric coordinate channels and geometric history conditioning remain. Presence
-is used for initial seed selection/snapping and a local weighted-PCA heading;
-CT and CT + presence modes never open the predicted nx/ny arrays. Inference also accepts an
-explicit `--heading x,y,z` for each seed. After initialization, crop reads and
-rollout images use CT. Presence-based break statistics in evaluation are only
-additional diagnostics, not inputs or stopping rules.
-
-`--heatmap-target tube --tube-sigma 0.35` supervises the full crop scalar field
-with `exp(-distance_to_annotated_polyline**2 / (2*sigma**2))`, truncated at four
-sigma. Sigma 0.35 trace voxels equals 0.7 native CT voxels. Distance is measured
-to original line segments, retaining bends and multiple plane crossings. This
-is different from the previous per-plane normalized Gaussian crossing targets.
-Unknown annotation ends censor outward continuation; physical endpoints retain
-background supervision. Already-departed states retain confidence negatives
-but have no tube-position loss. The annotated tube is a target, never an input.
-The model still receives only its own history at rollout time.
-
-The tube uses sigmoid outputs and squared-error regression, averaging losses
-in the three-sigma tube neighborhood and remaining known background separately
-to keep empty voxels from dominating. Existing proposal decoding, candidate
-ranking, prefix confidence and DAgger remain. The decoder samples the volume on
-forward planes, so its forward-monotone path representation is unchanged even
-though the supervised volume can represent arbitrary annotated bends.
-
-`images/tube_STEP.png` shows image, history, target tube, predicted tube, and
-known-region masks in two orthogonal projections. `batch_STEP.png` now shows
-CT behind the proposed path. Tube checkpoints record target mode, sigma, CT
-voxel scale and crop/heatmap spacing. Start fresh; old fiber-input checkpoints
-and replay do not match this configuration. Run names remain unique.
-
-```bash
-bash src/vesuvius/neural_tracing/fiber_follow/scripts/launch_ct_tube.sh ct0_tube_64
-# Override ordinary training settings after the name if desired:
-# ... ct0_tube_64 --steps 10000 --batch 16
-
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q \
-  tests/neural_tracing/test_fiber_follow.py \
-  tests/neural_tracing/test_fiber_follow_ct_tube.py
-```
 
 ## GPU execution
 
@@ -305,84 +185,36 @@ changes the exact sample ordering across runs. Use recorded fixed caches with
 `--dagger-every 0` for controlled replay experiments. Training shutdown stops an
 unfinished collector and reports it; incomplete collections are never published.
 
-## Commands
+## Evaluation and checks
 
-From `vesuvius/`, use the existing environment. The codec may need:
+From the `vesuvius/` project root:
 
 ```bash
-export LD_LIBRARY_PATH="$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 FF=src/vesuvius/neural_tracing/fiber_follow
-
-# Fresh spatial model; collection and replay run automatically during training.
-.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.train \
-  --name spatial_dagger_v3 --steps 10000 --batch 32 \
-  --fiber-zarrs /mnt/raid_nvme/spiral_dataset_working/fiber_zarrs \
-  --fibers /mnt/raid_nvme/spiral_dataset_working/fibers
-
-# Fixed geometry-bound validation seeds. Rebuild after annotation geometry changes.
 .venv/bin/python "$FF/scripts/eval_ckpt.py" field --seeds-only --rebuild-seeds
 .venv/bin/python "$FF/scripts/eval_ckpt.py" \
-  "$FF/output/spatial_dagger_v3/last.pt" --tag spatial_dagger_v3 \
-  --params '{"confidence":0.7,"n_commit":4}'
-
-# Independent collection is also available, e.g. for fixed replay ablations.
-.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.collect \
-  --checkpoint "$FF/output/spatial_dagger_v3/last.pt" \
-  --fibers /mnt/raid_nvme/spiral_dataset_working/fibers \
-  --max-seeds 64 --out /tmp/fiber_decisions.npz
-
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q \
-  tests/neural_tracing/test_fiber_follow.py
+  "$FF/output/ct0_presence_paths_v7/last.pt" --tag presence_paths_v7 \
+  --history-audit --batch 1 --params '{"confidence":0.7,"n_commit":4}'
 ```
-
-Add `--dagger-every 0` for fresh-only training. Add `--onpolicy CACHE...` (oldest
-to newest) for existing replay. `--init` accepts only this exact architecture and
-configuration and starts a new optimizer. `--allow-history-change` permits only
-the history renderer and sigma to differ when initializing weights. The uniform-crop v3 architecture requires a fresh
-run; earlier checkpoints cannot initialize it. Continuous DAgger itself never
-restarts the optimizer. Run names must be new. There are no old-checkpoint
-adapters, history-padding fallbacks, or cache migrations.
-
-Each run contains `config.json`, `log.jsonl`, checkpoints, optional diagnostic
-images, and `dagger/` with source snapshots, decision archives, memory-mapped
-arrays, collection logs, and the atomic `replay.json` index. Replay format is v3;
-the controlled-span evaluation format remains v2, with geometry-bound identity.
 
 Evaluation conserves `correct + offtrack + unknown == length`. Read scored
-`length_precision` together with coverage, `unknown_length_fraction`, and
-`verified_length_fraction`; unknown tails are never credited as verified.
-Historical experiments in `EXPERIMENTS.md` are not evidence for the quality of
-this newly implemented architecture. It needs a full training/evaluation run.
+length precision together with coverage, unknown length fraction and verified
+length fraction. Unknown tails are not credited as verified continuation.
 
-
-### Smooth history for the CT tube experiment
-
-`bash scripts/launch_ct_tube.sh RUN_NAME` now uses connected Gaussian history
-segments (including the last segment to the current position), sigma 0.35 trace
-voxels = 0.7 native CT voxels, and zero independent point jitter. Smooth drift
-and wobble remain. Empty histories stay empty and masked gaps are not joined.
-The renderer and width are saved in each checkpoint and used in rollout and
-replay collection. Old checkpoints retain their original point rendering.
-
-V5 starts fresh with a new run name. Stop an existing run with
-`bash scripts/stop.sh OLD_NAME` before replacing it.
-`stop.sh` checks the recorded training PID and terminates only that run's process
-tree (including forkserver workers), rather than matching all Python workers.
-
-History regressions can be checked with the existing environment:
+Focused tests in this directory:
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q \
-  tests/neural_tracing/test_fiber_follow.py \
-  tests/neural_tracing/test_fiber_follow_ct_tube.py \
-  tests/neural_tracing/test_fiber_follow_history.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q \
+  tests/test_history_confidence.py tests/test_direct_paths.py
 ```
 
-Batch diagnostics label fresh versus replay samples, mark already-departed
-examples as `OFF TRACK: reject continuation`, and show the selected proposal's
-next-step confidence. In tube diagnostics these examples retain the reference
-geometry for inspection but explicitly mark it as masked: only rejection
-confidence is supervised, not tube position or ranking.
+Use an environment with PyTorch and pytest and this checkout on `PYTHONPATH`.
+The v7 validation includes coordinate gradients, bounded connectivity, synthetic
+curve fitting, censored targets, teacher independence and checkpoint loading.
+A full-size real-data BF16 GPU check completed two optimizer steps with finite
+gradients (20.94 GiB peak allocated, 22.10 GiB reserved), and a separate collector
+produced a replay archive. These checks establish execution, not trained quality.
+See `EXPERIMENTS.md` for details.
 
 ## Beam re-ranker (`beam/`): learning to choose the VC3D tracer's paths
 
@@ -448,18 +280,18 @@ probability.
 
 ```bash
 # Train (CT level 0, forkserver workers, span diagnostics every 500 steps).
-bash src/vesuvius/neural_tracing/fiber_follow/scripts/launch_beam.sh beam_v1 --steps 20000 --batch 32
+bash src/vesuvius/neural_tracing/fiber_follow/scripts/launch_beam.sh beam_v2 --steps 20000 --batch 32
 
 # VC's restart metric on held-out fibers, hand beam and model in the loop.
 .venv/bin/python -m vesuvius.neural_tracing.fiber_follow.beam.evaluate_spans hand --tag hand
-.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.beam.evaluate_spans output/beam_v1/last.pt --tag beam_v1
+.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.beam.evaluate_spans output/beam_v2/last.pt --tag beam_v2
 
 # Open-ended seed evaluation through the existing harness (hand beam or model).
 .venv/bin/python "$FF/scripts/eval_ckpt.py" hand --tag hand_beam
-.venv/bin/python "$FF/scripts/eval_ckpt.py" output/beam_v1/last.pt --tag beam_v1 --params '{"confidence": 0.5}'
+.venv/bin/python "$FF/scripts/eval_ckpt.py" output/beam_v2/last.pt --tag beam_v2 --params '{"confidence": 0.5}'
 
 # Re-trace the spans of an annotated fiber with the model, or trace from seeds.
-.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.beam.infer output/beam_v1/last.pt --fiber-json fiber.json --out /tmp/retraced
+.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.beam.infer output/beam_v2/last.pt --fiber-json fiber.json --out /tmp/retraced
 
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run --no-sync --with pytest python -m pytest -q \
   tests/neural_tracing/test_fiber_follow_beam.py ../volume-cartographer/python/tests/test_fiber_trace.py
@@ -472,7 +304,7 @@ For development against a CMake build tree configured with `VC_BUILD_PYTHON=ON`,
 set `VC_PYTHON_BUILD_DIR=<build tree>` when running the tests; the tests are
 skipped when `vc.fiber_trace` cannot be imported.
 
-Beam checkpoints carry `architecture = beam_rerank_v1`, the `BeamSpec`
+Beam checkpoints carry `architecture = beam_rerank_v2`, the `BeamSpec`
 (manifests, trace config overrides, hook cadence and pool size) and the state
 configuration; `runloop.py` holds the run-directory, logging, schedule and
 checkpoint helpers shared with `train.py`.

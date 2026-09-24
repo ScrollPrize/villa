@@ -40,7 +40,7 @@ def collate_beam(items, vol, crop, grid):
     """Crop inputs via the shared samplers, plus the stacked pool tensors."""
     out = collate_with_volume(items, vol, crop, grid)
     if 'tube_segments' in items[0]:
-        from vesuvius.neural_tracing.fiber_follow.tube import render_tube
+        from vesuvius.neural_tracing.fiber_follow.beam.tube import render_tube
         tubes = [render_tube(it, crop, it['tube_sigma']) for it in items]
         out['tube_target'] = torch.from_numpy(np.stack([t[0] for t in tubes]))
         out['tube_mask'] = torch.from_numpy(np.stack([t[1] for t in tubes]))

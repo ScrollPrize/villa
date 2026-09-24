@@ -6,7 +6,7 @@ import torch
 
 from vesuvius.neural_tracing.fiber_follow.collect import DecisionCollector
 from vesuvius.neural_tracing.fiber_follow.data import SampleConfig, label_state
-from vesuvius.neural_tracing.fiber_follow.history_metrics import cleaning_measurements
+from vesuvius.neural_tracing.fiber_follow.history_metrics import TANGENT_POINTS, cleaning_measurements
 from vesuvius.neural_tracing.fiber_follow.supervision import candidate_labels
 
 
@@ -21,7 +21,7 @@ class HistoryAudit:
         cfg = tracer.model.cfg
         self.cfg = SampleConfig(crop=tracer.crop, n_history=tracer.n_history, clean_points=cfg.clean_points,
                                 n_future=cfg.n_future, future_step=cfg.future_step, n_candidates=cfg.n_candidates)
-        self.tangent_points, self.tolerance = cfg.clean_tangent_points, tolerance
+        self.tangent_points, self.tolerance = TANGENT_POINTS, tolerance
         self.threshold = tracer.p.confidence
         self.counts = defaultdict(int)
         self.sums = defaultdict(lambda: defaultdict(float))

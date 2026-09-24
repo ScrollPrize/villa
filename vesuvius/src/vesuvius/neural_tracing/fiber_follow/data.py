@@ -244,7 +244,7 @@ def training_state_allowed(item, crop: CropSpec, band: ZBand | None):
             if len(points):
                 zs.append((points @ frame.T + pos)[:, 2])
     if "plane_ab" in item:
-        # The heatmap labels can look farther along GT than arclength targets.
+        # The forward-plane labels can look farther along GT than arclength targets.
         loc = np.c_[item["plane_ab"], item["planes"]]
         loc = loc[item["plane_mask"] > 0]
         if len(loc):

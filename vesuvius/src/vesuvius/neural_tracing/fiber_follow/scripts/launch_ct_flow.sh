@@ -1,8 +1,8 @@
 #!/bin/bash
-# Direct path decoder with CT + presence: 32 voxels of visual history, 64-voxel continuations.
+# Joint flow-matching path generator with CT + presence: 32 voxels of visual history, 64-voxel continuations.
 set -euo pipefail
 FF="$(cd "$(dirname "$0")/.." && pwd)"
-name=${1:?Usage: launch_ct_paths.sh RUN_NAME [train.py options...]}
+name=${1:?Usage: launch_ct_flow.sh RUN_NAME [train.py options...]}
 shift
 CT_ZARR=${CT_ZARR:-/mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr}
 bash "$FF/scripts/launch.sh" "$name" \

@@ -18,7 +18,7 @@ from scipy.spatial import cKDTree
 from vesuvius.neural_tracing.fiber_follow.geometry import (
     CropSpec, arclength, frame_from_heading, normalize, random_rotation_about, resample_polyline,
 )
-from vesuvius.neural_tracing.fiber_follow.tube import tube_geometry
+from vesuvius.neural_tracing.fiber_follow.beam.tube import tube_geometry
 
 
 @dataclass

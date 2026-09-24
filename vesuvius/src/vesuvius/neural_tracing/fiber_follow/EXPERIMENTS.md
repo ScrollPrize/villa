@@ -2,12 +2,86 @@
 
 Status as of 2026-09-24. See `README.md` for file layout and commands.
 
-> **Historical results: pre-`controlled_spans_v2`.** The experiments below used
+> **Historical results: pre-`controlled_spans_v2`.** The early experiments in the Historical implementation section used
 > extrapolated tails as labels, treated annotation ends as stop targets, and
 > permitted cached on-policy states inside the spatial holdout. Their precision
 > also omitted continuation after reaching an annotation endpoint. The current
 > loader/scorer fixes these issues; see `README.md` for the new semantics and
 > fresh-training commands. The numbers below are not a controlled-span benchmark.
+
+## Direct history-anchored coordinates; Gaussian prediction removed (2026-09-24)
+
+Implemented `direct_paths_v7` after the stopped
+`ct0_presence_h32_f64_w128_v6` run showed large errors at the first point after
+history. In the old proposal mechanism, eight global heatmap peaks were chosen
+before applying the history-distance preference. A synthetic reproduction with
+an accurate central peak just below eight remote peaks left all six candidates
+19.8 voxels away at their first point. Better confidence thresholds cannot
+recover a continuation that never reaches the candidate set.
+
+The follower now generates six trainable coordinate paths from the cleaned
+current point, conditioned on observed/cleaned history and locally sampled image
+features at every future plane. Gaussian prediction heads, targets, losses,
+peak selection, their CLI options and the tube launcher have been removed.
+Observed history is still rendered as a smooth input channel. No checkpoint
+adapters were added. The independent beam method owns its optional tube head
+and target rendering under `beam/` (checkpoint schema `beam_rerank_v2`).
+
+Key choices:
+
+- Keep the wide 208×128×128 CT + presence crop, 32 voxels visual history,
+  64 one-voxel forecast planes, 32-point cleaner, and bidirectional scorer.
+- Bound each clean correction to four voxels and each lateral decoder step to
+  two voxels. The first-point distance from the observed anchor is at most
+  6.08 voxels at the preset spacing. Local image samples use a 3×3 stencil of
+  radius two voxels. The bound is a geometric assumption; log
+  `target_step_limit_fraction` to detect targets it cannot represent.
+- Coordinate Smooth-L1 selects one whole-trajectory winner, adds 0.5 times
+  the first-four-point loss for all candidates, and 0.25 times step-vector
+  supervision. Unknown suffixes and departed states have no coordinate loss;
+  out-of-crop but annotated targets remain supervised.
+- Detach proposal coordinates at the scorer input and in label construction.
+  Ranking/confidence train the scorer and shared encoders; direct coordinate
+  supervision trains path placement. Teacher candidates only train scoring.
+- Clean-history loss now excludes history points that were not supplied.
+- Monitor first-plane error, anchor error, maximum first jump, coordinate loss
+  components and endpoint spread. Mode diversity is learned, not forced.
+
+Validation: 31 focused tests passed, including bounded first steps under extreme
+head outputs, coordinate gradients into decoder/history/image features,
+synthetic curved-path fitting, whole-path assignment, unknown-target censoring,
+teacher independence, batch independence, history masks and checkpoints.
+The native `vc.fiber_trace` binding is unavailable in the test environment; the
+separate beam model/head was checked without an end-to-end native beam run.
+
+Production-size BF16 smoke used a real annotated fiber
+`anon_20260902T164827563_000384.json` and real CT/presence, repeated to batch two:
+2,137,331 parameters; input `[2,3,208,128,128]`; all 64 planes known;
+two optimizer steps had losses 4.084775 and 3.998077 and finite gradients for
+every parameter. Peak allocated/reserved GPU memory was 20.94/22.10 GiB.
+A batch-one inference process ran with the training allocations retained
+(2.38/3.31 GiB allocated/reserved for inference). A subsequent independent
+collection from the new checkpoint completed two short traces and wrote four
+replay states. These are execution checks, not evidence of improved tracing.
+
+Reproduction artifacts: `/tmp/fiber-follow-v7-smoke.py`,
+`/tmp/fiber-follow-v7-collector-memory.py`, `/tmp/fiber-follow-v7-smoke.log`,
+`/tmp/fiber-follow-v7-smoke/decisions.npz`, and
+`/tmp/fiber-follow-v7-tests.log`. These temporary artifacts are local to this
+validation session. The tracked regression tests are
+`tests/test_direct_paths.py` and `tests/test_history_confidence.py`.
+
+Fresh run (not launched by this change):
+
+```bash
+bash scripts/launch_ct_paths.sh ct0_presence_paths_v7
+tail -F output/logs/ct0_presence_paths_v7.log
+```
+
+Preset remains batch two for 50k steps (100k examples), collector/diagnostic
+batch one and 32 diagnostic seeds. Compare at matched examples and held-out
+rollout length precision/coverage. Re-sweep confidence after paths improve;
+the earlier threshold sweep remains historical evidence for its own checkpoint.
 
 ## Correcting lateral clipping in the 64-voxel forecast (2026-09-24)
 

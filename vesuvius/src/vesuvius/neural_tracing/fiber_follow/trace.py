@@ -39,6 +39,7 @@ class TraceParams:
     # Defaults reproduce the immediate stop.
     stop_patience: int = 1
     commit_floor: float | None = None
+    seed: int = 0  # seeds the flow sampler once per trace call, so rollouts are reproducible
 
     def __post_init__(self):
         if self.n_commit < 1 or self.max_len <= 0 or not 0 <= self.confidence <= 1 or self.explore_calls < 0:
@@ -129,6 +130,8 @@ class ModelTracer:
         stop_streak = np.zeros(n, int)
         last_segment = [np.asarray([p[-1]]) for p in paths]
         pp = self.p
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(pp.seed)
         while active.any():
             idx = np.flatnonzero(active)
             pos = np.stack([paths[i][-1] for i in idx])
@@ -154,7 +157,7 @@ class ModelTracer:
                 items = [dict(pos=p, frame=f) for p, f in zip(pos, fr)]
                 x = add_presence_input(x, items, self.vol, self.crop, self.grid, self.pool)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
-                out = self.model(x, tensor(hist).float(), tensor(hm))
+                out = self.model(x, tensor(hist).float(), tensor(hm), generator=generator)
             candidates, ranks, confidence = [out[k].float().cpu().numpy() for k in ('candidates', 'ranks', 'confidence')]
             clean_history = out['clean_history'].float().cpu().numpy() if on_decision is not None else None
             for j, i in enumerate(idx):

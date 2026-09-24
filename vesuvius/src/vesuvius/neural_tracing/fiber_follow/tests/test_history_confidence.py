@@ -21,8 +21,8 @@ from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume, FiberVolume
 def config():
     return FollowNetConfig(in_channels=3, depth=16, width=9, behind=6, spacing=.5,
                            widths=(8, 16), hidden=16, n_future=4, future_step=1.,
-                           hist_points=4, hist_stride=2, clean_points=4, clean_tangent_points=4,
-                           n_candidates=2, norm='group')
+                           hist_points=4, hist_stride=2, clean_points=4, n_candidates=2,
+                           flow_layers=1, flow_heads=2, flow_steps=2, flow_samples=4, flow_draws=2, norm='group')
 
 
 def array_at(path, values):
@@ -238,20 +238,6 @@ def test_tangent_fit_uses_several_points_and_ignores_missing_tail():
     torch.testing.assert_close(tangent, torch.tensor([[0., 0., 1.]]))
 
 
-def test_decoder_extrapolates_from_corrected_forward_coordinate():
-    cfg = replace(config(), n_candidates=1, clean_tangent_points=2)
-    model = FollowNet(cfg)
-    torch.nn.init.zeros_(model.proposal_decoder.velocity_head.weight)
-    torch.nn.init.zeros_(model.proposal_decoder.velocity_head.bias)
-    features = torch.zeros(1, cfg.widths[0], cfg.depth, cfg.width, cfg.width)
-    clean = torch.zeros(1, 5, 3)
-    clean[0, 0] = torch.tensor([0., 0., 1.])
-    clean[0, 1] = torch.tensor([-1., 0., 0.])
-    paths = model.proposal_decoder(features, torch.zeros(1, 1, cfg.hidden), clean,
-                                   torch.ones(1, 8), model.sampling_grid)
-    assert abs(paths[0, 0, 0, 0]) < .1
-
-
 def test_cleaning_measurements_use_common_masks_and_do_not_score_departed_geometry():
     _, _, target, hist, mask = score_inputs()
     hist[:, :4, 0] = 1
@@ -283,19 +269,19 @@ def test_training_rollout_checkpoint_and_audit_share_inputs(tmp_path):
                          t=8., reverse=False)
     batch = D.collate_with_volume([item], vol, crop, torch.from_numpy(crop_local_grid(crop)).float())
     model = FollowNet(cfg)
-    out = model(batch['x'].float(), batch['hist'], batch['hmask'], teacher_candidates(batch, cfg))
+    out = model(batch['x'].float(), batch['hist'], batch['hmask'], teacher_candidates(batch, cfg), targets=batch)
     loss, metrics = loss_fn(out, batch, cfg)
     loss.backward()
     assert torch.isfinite(loss)
     assert 'observed_tangent_error_deg' in metrics
-    for parameter in (model.history_tokens[0].weight, model.clean_head[-1].weight,
+    for parameter in (model.history_tokens[0].weight, model.flow.velocity.weight,
                       model.prefix_context.weight_ih_l0, model.encoders[0][0].weight):
         assert parameter.grad is not None and torch.isfinite(parameter.grad).all() and parameter.grad.abs().sum() > 0
     torch.optim.AdamW(model.parameters(), lr=1e-3).step()
     path = tmp_path / 'new.pt'
     save_checkpoint(path, model, vol.spec, sample, dict(tolerance=1.5))
     loaded, loaded_crop, nh, spec, checkpoint = load_checkpoint(path, 'cpu')
-    assert checkpoint['architecture'] == 'direct_paths_v7'
+    assert checkpoint['architecture'] == 'joint_flow_v8'
     assert loaded.cfg == cfg and loaded_crop == crop and nh == 8 and spec == vol.spec
     captured = []
     handle = loaded.register_forward_pre_hook(lambda module, args: captured.append(args[0].clone()))
@@ -326,7 +312,8 @@ def test_training_entrypoint_writes_presence_history_run(tmp_path, monkeypatch):
         '--device', 'cpu', '--workers', '0', '--dagger-every', '0', '--diag-every', '0',
         '--log-every', '1', '--ckpt-every', '2', '--crop-depth', '16', '--crop-width', '9',
         '--crop-behind', '6', '--crop-spacing', '.5', '--n-history', '8', '--hist-points', '4',
-        '--hist-stride', '2', '--clean-points', '4', '--clean-tangent-points', '4',
+        '--hist-stride', '2', '--clean-points', '4', '--flow-layers', '1', '--flow-heads', '2',
+        '--flow-steps', '2', '--flow-samples', '4', '--flow-draws', '2',
         '--n-future', '4', '--future-step', '1',
         '--n-candidates', '2', '--widths', '8', '16', '--hidden', '16',
         '--norm', 'group', '--history-render', 'segments', '--history-jitter', '0'])

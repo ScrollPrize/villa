@@ -21,16 +21,15 @@ class BeamNetConfig(FollowNetConfig):
 class BeamRankNet(FollowNet):
     """Scores every candidate polyline of a pool from one oriented crop.
 
-    Reuses ``FollowNet``'s UNet encoder, history conditioning, dense tube head
-    and the ranking / prefix heads. Candidates are supplied by the beam, so the
-    direct coordinate decoder is unused. Each candidate token additionally sees
+    Reuses ``FollowNet``'s UNet encoder, history conditioning and ranking /
+    prefix heads, and owns an optional dense tube prediction head. Candidates are supplied by the beam, so the
+    joint flow generator is unused. Each candidate token additionally sees
     the hand loss relative to the pool's best and its point validity.
     """
 
     def __init__(self, cfg: BeamNetConfig):
         super().__init__(cfg)
-        del self.clean_head
-        del self.proposal_decoder
+        del self.flow
         self.heat_head = nn.Conv3d(cfg.widths[0], 1, 1)
         del self.history_tokens
         del self.history_fusion
@@ -59,7 +58,7 @@ class BeamRankNet(FollowNet):
         return ranks, onfiber, prefix_logits
 
     def forward(self, x, hist, hmask, candidates, point_mask, hand_rel):
-        features = self.encode(x, hist, hmask)
+        features, _ = self.encode(x, hist, hmask)
         out = {}
         if self.cfg.heatmap_target == 'tube':
             out['tube_logits'] = self.heat_head(features).float()[:, 0]

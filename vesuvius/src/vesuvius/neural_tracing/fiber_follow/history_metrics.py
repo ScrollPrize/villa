@@ -3,9 +3,11 @@ import torch
 
 from vesuvius.neural_tracing.fiber_follow.model import history_tangent
 
+TANGENT_POINTS = 6  # corrected points, including the current one, in the diagnostic tangent fit
+
 
 @torch.no_grad()
-def cleaning_measurements(cleaned, hist, hmask, target, target_mask, tangent_points):
+def cleaning_measurements(cleaned, hist, hmask, target, target_mask, tangent_points=TANGENT_POINTS):
     """Per-state (value, valid) tensors; departed states have correction sizes only.
 
     Improvement is measured only where both observed history and GT exist.
