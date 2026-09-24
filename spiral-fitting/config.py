@@ -788,7 +788,7 @@ class Config:
         # hard-constraint point is sent exactly onto its target winding by a
         # pinned, monotone radial map, with one fractional winding coordinate
         # per constraint component (the model's pin_targets parameter).
-        self.model_pins_enabled = False
+        self.model_pins_enabled = True
         self.model_pins_warmup_steps = 500
         self.model_pin_patch_grid_stride = 1
         self.model_pin_kernel_spacing_factor = 1.5
