@@ -85,18 +85,18 @@ place to look at rather than hundreds of numbers.
 `(p10,p01,p11)`), `vc_tifxyz2zarr_sparse` and `ABFFlattening` all build, with
 the normals formed exactly as `vc_tifxyz2obj` forms them. A quad reported
 here is one those tools will carry as a crossed pair. Papyrus does not turn
-through a right angle between one grid cell and the next — at a 20-voxel step
-on a 7.91 µm scan that is 158 µm — so a quad that does is the trace being
-locally incoherent.
+through 120° between one grid cell and the next — at a 20-voxel step on a
+7.91 µm scan that is 158 µm — so a quad that does is the trace being locally
+incoherent.
 
 Folds across the other diagonal are counted as `quads_on_unused_diagonal` and
 not located: nothing in this repository triangulates that way, so they change
 no consumer's geometry, but `vc_tifxyz_selfcross` censuses both diagonals and
 a crossing it reports under the unused one starts there.
 
-The angle threshold is not decoration:
-coordinates are float32 running to ~1e4 voxels, where one ULP is already
-~1e-3, and real grids hold quads as thin as 0.7 × 20 voxels. On one of those
+The angle threshold is not decoration. Coordinates are float32 running to
+~1e4 voxels, where one ULP is already ~1e-3, and real grids hold quads as
+thin as 0.7 × 20 voxels. On one of those
 the two cross products carry more error than signal, and their dot product
 comes out at ~1e-5 of the product of their magnitudes with an essentially
 random sign — a plain sign test reports 67% of the published corpus as
