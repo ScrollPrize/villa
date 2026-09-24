@@ -27,6 +27,13 @@ from vesuvius.ink_detection.models.checkpoint import (
     select_inference_weights,
 )
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
+from vesuvius.ink_detection.inference.input_contract import (
+    MODES as INPUT_CONTRACT_MODES,
+    Finding,
+    check_input_contract,
+    enforce_input_contract,
+    require_finite_probabilities,
+)
 from vesuvius.ink_detection.inference.inference_runtime import (
     TargetModel,
     flip_spatial,
@@ -76,6 +83,7 @@ class ConfiguredModel:
     patch_size: int
     input_depth: int
     preprocessing: str
+    z_jitter_offset: int
     amp_dtype: torch.dtype | None
 
 
@@ -772,6 +780,7 @@ def run_block_inference(
                     image_hw=tuple(int(value) for value in images_BCZYX.shape[-2:]),
                 )
             probabilities_np = probabilities.cpu().numpy()[:, 0]
+            require_finite_probabilities(probabilities_np)
             for probability, values in zip(probabilities_np, metadata.numpy()):
                 y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
                 tile = probability[:valid_h, :valid_w]
@@ -879,6 +888,72 @@ def load_grayscale_mask(path: Path, target_shape: tuple[int, int]) -> np.ndarray
     return output
 
 
+def input_contract_findings(
+    *,
+    root: Any,
+    volume: Any,
+    depth: int,
+    layer_indices: np.ndarray,
+    requested_direction: str,
+    configured_model: ConfiguredModel,
+) -> list[Finding]:
+    """Check one opened volume against the checkpoint's input contract."""
+
+    try:
+        attrs = dict(root.attrs)
+    except Exception:  # attribute-less or unreadable stores carry no provenance
+        attrs = {}
+    return check_input_contract(
+        depth=depth,
+        dtype=volume.dtype,
+        attrs=attrs,
+        layer_indices=layer_indices,
+        direction=requested_direction,
+        window_depth=configured_model.input_depth,
+        preprocessing=configured_model.preprocessing,
+        max_z_offset=configured_model.z_jitter_offset,
+    )
+
+
+def contract_findings_for(
+    *,
+    input_zarr: str | Path,
+    checkpoint: str | Path,
+    resolution: str,
+    layer_start: int | None,
+    layer_end: int | None,
+    requested_direction: str,
+) -> list[Finding]:
+    """Load only the checkpoint config and volume metadata, then check both."""
+
+    args = argparse.Namespace(checkpoint=Path(checkpoint), amp_dtype="default")
+    configured_model = configure_model(args)
+    root = open_volume_root(input_zarr)
+    resolved = "0" if hasattr(root, "shape") else str(resolution)
+    volume = select_volume_level(root, resolved, source=str(input_zarr))
+    _, depth, _, _, _, _ = _volume_axes(volume)
+    findings: list[Finding] = []
+    for direction in resolve_run_directions(requested_direction):
+        layer_indices = select_layer_indices(
+            depth,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            output_depth=configured_model.input_depth,
+            direction=direction,
+        )
+        for finding in input_contract_findings(
+            root=root,
+            volume=volume,
+            depth=depth,
+            layer_indices=layer_indices,
+            requested_direction=requested_direction,
+            configured_model=configured_model,
+        ):
+            if finding not in findings:
+                findings.append(finding)
+    return findings
+
+
 def load_flat_inference_state(
     model: nn.Module, state: Mapping[str, Any]
 ):
@@ -933,6 +1008,12 @@ def configure_model(args: argparse.Namespace) -> ConfiguredModel:
         patch_size=crop_y,
         input_depth=crop_z,
         preprocessing=flat_preprocessing_from_config(config.data.normalization),
+        z_jitter_offset=(
+            config.data.jitter.max_offset
+            if config.data.jitter.enabled
+            and config.data.jitter.window_depth == crop_z
+            else 0
+        ),
         amp_dtype=resolve_amp_dtype(args.amp_dtype, payload, args.checkpoint),
     )
 
@@ -987,6 +1068,18 @@ def infer_single_zarr(
         direction=layer_direction,
     )
     LOGGER.info("Selected source layer indices=%s", layer_indices.tolist())
+    enforce_input_contract(
+        input_contract_findings(
+            root=root,
+            volume=volume,
+            depth=depth,
+            layer_indices=layer_indices,
+            requested_direction=getattr(args, "direction", layer_direction),
+            configured_model=configured_model,
+        ),
+        mode=getattr(args, "input_contract", "warn"),
+        label=str(input_zarr),
+    )
     LOGGER.info(
         "Input level=%s shape=(depth=%d, height=%d, width=%d) "
         "chunks=(%d, %d) patch=%d stride=%d requested_overlap=%.3f "
@@ -1336,6 +1429,17 @@ def parse_args(argv: Sequence[str] | None = None):
         "--amp-dtype",
         choices=("auto", "default", "fp16", "bf16"),
         default="auto",
+    )
+    parser.add_argument(
+        "--input-contract",
+        choices=INPUT_CONTRACT_MODES,
+        default="warn",
+        help=(
+            "Check the input against what the checkpoint trained on before "
+            "inference: 'warn' (default) logs a WARNING per violated check and "
+            "continues, 'error' refuses a provably wrong input, 'off' skips the "
+            "check. Non-finite model output always stops the run."
+        ),
     )
     parser.add_argument("--tta-mirror", action="store_true")
     parser.add_argument("--tta-batch-size", type=int)
