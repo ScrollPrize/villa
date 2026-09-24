@@ -29,6 +29,9 @@ dependencies = [
     "torchdiffeq>=0.2.5",
     "tqdm>=4.68.3",
     "trimesh>=4.12.2",
+    # PyTorch ships no triton wheel for Windows; this community build stands in
+    # for the triton 3.6 that torch 2.11 pins elsewhere.
+    "triton-windows>=3.6,<3.7; sys_platform == 'win32'",
     "vc-delta3d>=0.1.0,<0.2",
     "wandb>=0.28.0",
     "zarr>=3.2.1",
