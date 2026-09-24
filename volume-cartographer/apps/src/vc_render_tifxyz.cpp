@@ -1115,6 +1115,7 @@ int main(int argc, char *argv[])
         ("help,h", "Show this help message")
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
         ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
+        ("fetch-concurrency", po::value<size_t>()->default_value(16), "Chunk reads kept in flight (S3 tolerates far more than the default)")
         ("prefetch-remote", po::bool_switch()->default_value(false), "Prefetch the chunks this render reads into the shared remote cache before rendering")
         ("remote-url", po::value<std::string>(), "Remote OME-Zarr URL for remote cache streaming/prefetch; fetched chunks persist under the shared remote cache root (optional if --volume cache already records it)")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
@@ -1397,6 +1398,9 @@ int main(int argc, char *argv[])
     if (const size_t mem = usableMemoryBytes(); mem > 0 && cache_bytes >= mem)
         logPrintf(stderr, "Warning: --cache-gb %llu is not below the memory available to this process (%.1f GB): the render can stall without any output. Lower --cache-gb.\n",
                   (unsigned long long)parsed["cache-gb"].as<size_t>(), double(mem) / (1024.0 * 1024.0 * 1024.0));
+    const size_t fetch_concurrency = parsed["fetch-concurrency"].as<size_t>();
+    if (fetch_concurrency == 0) { logPrintf(stderr, "Error: --fetch-concurrency must be positive\n"); return EXIT_FAILURE; }
+    logPrintf(stdout, "Chunk fetch concurrency: %zu\n", fetch_concurrency);
     std::unique_ptr<vc::render::ChunkCache> ownedChunkCache;
     std::shared_ptr<Volume> remoteVolume;
     std::shared_ptr<vc::render::ChunkCache> remoteCache;
@@ -1413,6 +1417,11 @@ int main(int argc, char *argv[])
             remoteVolume = Volume::NewFromUrl(remoteUrl, remoteAuth);
             vc::render::processChunkCacheService()->configureDecodedByteCapacity(
                 cache_bytes);
+            // The shared service owns fetch admission, so --fetch-concurrency
+            // is applied here rather than per-cache. Fixed, not adaptive: a
+            // batch render wants the requested depth from the first band.
+            vc::render::processChunkCacheService()->configureFetchConcurrency(
+                fetch_concurrency, /*adaptive=*/false);
             remoteCache = remoteVolume->sharedChunkCache();
             chunk_cache = remoteCache.get();
             if (!chunkLevelPresent(*chunk_cache, cacheLevel)) {
@@ -1430,7 +1439,7 @@ int main(int argc, char *argv[])
         try {
             ownedChunkCache = vc::render::createChunkCache(
                 vc::render::openLocalZarrPyramid(vol_path),
-                cache_bytes);
+                cache_bytes, fetch_concurrency);
         } catch (const std::exception& e) {
             logPrintf(stderr, "Error opening local zarr: %s\n", e.what());
             return EXIT_FAILURE;
