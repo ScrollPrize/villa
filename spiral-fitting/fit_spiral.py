@@ -5496,7 +5496,7 @@ if __name__ == '__main__':
     import argparse
 
     from fit_session import (conventional_input_paths, default_user_cache_dir,
-                             load_scroll_spec)
+                             load_scroll_spec, scroll_spec_config_defaults)
 
     parser = argparse.ArgumentParser(
         description='Headless Spiral fit over one dataset root.')
@@ -5527,6 +5527,9 @@ if __name__ == '__main__':
     maybe_init_distributed(dist_context)
     try:
         config = Config().as_dict()
+        # A winding count in spiral-scroll.json replaces the generic default;
+        # FIT_SPIRAL_CONFIG_OVERRIDES still wins over it.
+        config.update(scroll_spec_config_defaults(scroll_spec, config))
         config.update(get_env_config_overrides())
         z_range_scaled_count_keys = (
             'sample_count_patches_per_step',

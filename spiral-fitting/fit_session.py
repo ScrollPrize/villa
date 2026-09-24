@@ -625,6 +625,9 @@ class ScrollSpec:
     umbilicus_coordinate_scale: float = 1.0
     normal_zarr_group: str = "4"
     lasagna_scale: int = 4
+    # The scroll's winding count, when someone has estimated it. A default for
+    # the fit, not a fact the scroll owns: see scroll_spec_config_defaults.
+    num_windings: int | None = None
     # Allow-listed absolute-path overrides, (key, resolved path) pairs.
     path_overrides: tuple[tuple[str, str], ...] = ()
 
@@ -697,6 +700,11 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
     if type(lasagna_scale) is not int or lasagna_scale <= 0:
         raise ScrollSpecError(f"{source}: lasagna_scale must be a positive integer")
 
+    num_windings = document.get("num_windings")
+    # Same floor as shell_outer_winding_idx, which this value becomes.
+    if num_windings is not None and (type(num_windings) is not int or num_windings < 2):
+        raise ScrollSpecError(f"{source}: num_windings must be an integer >= 2")
+
     paths = document.get("paths", {})
     if not isinstance(paths, Mapping):
         raise ScrollSpecError(f"{source}: paths must be an object")
@@ -721,6 +729,7 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
         umbilicus_coordinate_scale=coordinate_scale,
         normal_zarr_group=str(document.get("normal_zarr_group", "4")),
         lasagna_scale=lasagna_scale,
+        num_windings=num_windings,
         path_overrides=tuple(overrides),
     )
 
@@ -755,6 +764,36 @@ def load_scroll_spec(dataset_root: str | os.PathLike[str],
     return parse_scroll_spec(document, root if root is not None else path.parent,
                              source=str(path))
 
+
+
+def scroll_spec_config_defaults(spec: ScrollSpec | Mapping[str, Any] | None,
+                                base_config: Mapping[str, Any]) -> dict[str, Any]:
+    """Fit-config defaults a scroll specification supplies.
+
+    The generic default for the outer winding and the exporters' physical
+    winding estimate is Scroll 1's count (130), which on a scroll with fewer
+    windings exports windings that lie outside the papyrus. An optional
+    num_windings in spiral-scroll.json replaces that default for this scroll.
+    The gap-lattice capacity is raised only when the count would not fit.
+
+    Callers apply the result between the Python defaults and any explicit
+    configuration, so an explicit setting still wins. Accepts a ScrollSpec or
+    its manifest() dict; returns {} when the scroll gives no count.
+    """
+    if spec is None:
+        return {}
+    num_windings = (spec.get("num_windings") if isinstance(spec, Mapping)
+                    else spec.num_windings)
+    if num_windings is None:
+        return {}
+    defaults = {
+        "shell_outer_winding_idx": num_windings,
+        "model_gap_expander_num_windings": num_windings,
+    }
+    capacity = base_config.get("model_gap_expander_capacity_windings")
+    if capacity is not None and capacity < num_windings + 3:
+        defaults["model_gap_expander_capacity_windings"] = num_windings + 3
+    return defaults
 
 def conventional_input_paths(
         dataset_root: str | os.PathLike[str], spec: ScrollSpec, *,
