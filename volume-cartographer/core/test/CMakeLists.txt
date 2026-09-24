@@ -866,6 +866,11 @@ vc_add_test(NAME test_atlas LIBS doctest::doctest vc_atlas)
 # with the command-line tool so the tested code is the shipped code).
 vc_add_test(NAME test_tifxyz_selfcross LIBS doctest::doctest opencv_core)
 
+# The vc_tifxyz_topology census kernel, same arrangement. It links vc_core
+# because the quad areas it reports come from vc/core/util/SurfaceArea.hpp,
+# the same header QuadSurface itself uses to write area_vx2.
+vc_add_test(NAME test_tifxyz_topology LIBS doctest::doctest vc_core opencv_core)
+
 vc_add_test(NAME test_seg_add_overlap_metrics)
 
 # End-to-end CLI contract for the same tool: exit codes, report
@@ -878,6 +883,13 @@ if(TARGET vc_tifxyz_selfcross)
         LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
         DEFS VC_SELFCROSS_BIN="$<TARGET_FILE:vc_tifxyz_selfcross>")
     add_dependencies(test_tifxyz_selfcross_cli vc_tifxyz_selfcross)
+endif()
+
+if(TARGET vc_tifxyz_topology)
+    vc_add_test(NAME test_tifxyz_topology_cli
+        LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
+        DEFS VC_TOPOLOGY_BIN="$<TARGET_FILE:vc_tifxyz_topology>")
+    add_dependencies(test_tifxyz_topology_cli vc_tifxyz_topology)
 endif()
 
 if(TARGET vc_seg_add_overlap)
