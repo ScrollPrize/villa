@@ -580,5 +580,96 @@ class InSessionCheckpointLoadTests(unittest.TestCase):
                     pending=0))
 
 
+class PinOptimizerResumeTests(unittest.TestCase):
+    def test_changed_registry_resets_only_pin_moments(self):
+        # Equal shapes still have different component identities; different
+        # shapes used to load successfully and crash at the first Adam step.
+        for count in (2, 3):
+            with self.subTest(num_components=count):
+                saved_other = torch.nn.Parameter(torch.ones(1))
+                saved_pins = torch.nn.Parameter(torch.ones(2))
+                saved_optimizer = torch.optim.AdamW([
+                    {'params': [saved_other]}, {'params': [saved_pins]}])
+                (saved_other.sum() + saved_pins.sum()).backward()
+                saved_optimizer.step()
+                saved_state = saved_optimizer.state_dict()
+                other_id, pin_id = [g['params'][0] for g in saved_state['param_groups']]
+
+                other = torch.nn.Parameter(saved_other.detach().clone())
+                targets = torch.nn.Parameter(torch.zeros(count))
+                optimizer = torch.optim.AdamW([
+                    {'params': [other]}, {'params': [targets]}])
+                context = SimpleNamespace(
+                    spiral_and_transform=SimpleNamespace(pin_targets=targets),
+                    pin_graph=SimpleNamespace(fingerprint=lambda: 'new'),
+                    pin_target_params=[targets], optimiser=optimizer)
+                model_state, adapted, _ = fit_spiral.FitContext._adapt_checkpoint_for_pins(
+                    context, {'pin_registry': {'fingerprint': 'old'}},
+                    {'pin_targets': saved_pins.detach()}, saved_state)
+
+                self.assertFalse(context.pin_targets_loaded)
+                self.assertNotIn(pin_id, adapted['state'])
+                self.assertIn(pin_id, saved_state['state'])
+                self.assertIs(adapted['state'][other_id], saved_state['state'][other_id])
+                torch.testing.assert_close(model_state['pin_targets'], targets)
+                optimizer.load_state_dict(adapted)
+                torch.testing.assert_close(
+                    optimizer.state[other]['exp_avg'],
+                    saved_state['state'][other_id]['exp_avg'])
+                (other.sum() + targets.sum()).backward()
+                optimizer.step()
+                self.assertEqual(optimizer.state[targets]['exp_avg'].shape, targets.shape)
+                self.assertEqual(int(optimizer.state[targets]['step']), 1)
+                self.assertEqual(int(optimizer.state[other]['step']), 2)
+
+    def test_matching_registry_keeps_targets_only_if_pins_were_active(self):
+        # Before activation T has no gradient and still holds the estimate
+        # from the model state at registry construction; a checkpoint written
+        # unpinned must therefore re-estimate T at activation instead of
+        # activating with those stale targets.
+        for saved_active in (False, True):
+            with self.subTest(pins_active=saved_active):
+                targets = torch.nn.Parameter(torch.zeros(3))
+                calls = []
+                model = SimpleNamespace(
+                    pin_targets=targets,
+                    set_pin_registry=lambda registry, reset_targets=True: calls.append(reset_targets))
+                optimizer = torch.optim.AdamW([{'params': [torch.nn.Parameter(torch.ones(1))]},
+                                               {'params': [targets]}])
+                context = SimpleNamespace(
+                    spiral_and_transform=model,
+                    pin_graph=SimpleNamespace(fingerprint=lambda: 'same'),
+                    pin_target_params=[targets], optimiser=optimizer)
+                saved_T = torch.tensor([1.25, 2.5, 3.75])
+                with unittest.mock.patch.object(
+                        fit_spiral.pins_module.PinRegistry, 'from_state_dict',
+                        return_value=object()):
+                    model_state, _, _ = fit_spiral.FitContext._adapt_checkpoint_for_pins(
+                        context,
+                        {'pin_registry': {'fingerprint': 'same'}, 'pins_active': saved_active},
+                        {'pin_targets': saved_T}, optimizer.state_dict())
+                self.assertEqual(context.pin_targets_loaded, saved_active)
+                self.assertEqual(calls, [not saved_active])
+                if saved_active:
+                    torch.testing.assert_close(model_state['pin_targets'], saved_T)
+                else:
+                    torch.testing.assert_close(model_state['pin_targets'], targets.detach())
+
+    def test_integer_targets_applied_on_resume_and_run_update(self):
+        # requires_grad is not state-dict state: a resumed fit with active
+        # pins must round and freeze again, and toggling the setting at a
+        # run boundary must take effect on the live targets.
+        targets = torch.nn.Parameter(torch.tensor([1.3, 2.6, -0.4]))
+        context = SimpleNamespace(
+            spiral_and_transform=SimpleNamespace(pin_targets=targets, pins_active=True),
+            config={'model_pin_targets_integer': True})
+        fit_spiral.FitContext._apply_integer_pin_targets(context)
+        torch.testing.assert_close(targets.detach(), torch.tensor([1., 3., -0.]))
+        self.assertFalse(targets.requires_grad)
+        context.config['model_pin_targets_integer'] = False
+        fit_spiral.FitContext._apply_integer_pin_targets(context)
+        self.assertTrue(targets.requires_grad)
+
+
 if __name__ == "__main__":
     unittest.main()

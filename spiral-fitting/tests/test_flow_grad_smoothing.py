@@ -161,6 +161,7 @@ def test_field_smooth_grad_scales_width_for_the_low_res_lattice(kind, monkeypatc
 def test_model_converts_voxels_to_cells():
     config = Config().as_dict()
     config.update({
+        'model_flow_field_type': 'cartesian',
         'model_flow_voxel_resolution': 16,
         'model_gap_expander_capacity_windings': 8,
         'model_gap_expander_num_windings': 8,

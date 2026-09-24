@@ -187,6 +187,68 @@ _GAP_EXPANDER_DESCRIPTIONS = {
         "Bias of the stable lower-bounded softplus gap parameterisation."),
 }
 
+_PIN_DESCRIPTIONS = {
+    "model_pins_enabled": (
+        "Pin the gap expander's winding radii so every verified-patch, "
+        "cross-patch PCL and unattached-strip point lands exactly on its "
+        "target winding. Adds the per-component "
+        "pin_targets parameter to the model."),
+    "model_pins_warmup_steps": (
+        "Steps of the ordinary unpinned soft fit before the pins are switched "
+        "on (the flow must already have the winding ordering right)."),
+    "model_pin_patch_grid_stride": (
+        "Keep every n-th quad centre of each verified patch as a pin (1 = all)."),
+    "model_pin_kernel_spacing_factor": (
+        "Pin footprint width as a multiple of the pin's own-object spacing."),
+    "model_pin_kernel_min_arc_voxels": (
+        "Footprint floor along theta, in voxels of arc at the pin's radius."),
+    "model_pin_kernel_max_theta_radians": "Footprint cap along theta.",
+    "model_pin_kernel_min_z_voxels": "Footprint floor along z.",
+    "model_pin_kernel_max_z_voxels": "Footprint cap along z.",
+    "model_pin_coincidence_frac": (
+        "Pins in one winding slot closer than this fraction of their "
+        "footprints are treated as one pin."),
+    "model_pin_conflict_tolerance": (
+        "Coincident pins whose radii differ by more than this fraction of "
+        "the local winding gap are reported as conflicts."),
+    "model_pin_overlap_tolerance_voxels": (
+        "Verified patches with quad centres within this distance are linked "
+        "into one pin component (the same sheet observed twice); 0 disables."),
+    "model_pin_rebin_interval": (
+        "Steps between pin CSR, footprint and coincidence rebuilds; slot, "
+        "pin-set and spatial bin crossings always force a safe rebuild."),
+    "model_pin_targets_integer": (
+        "Snap the component winding targets to integers when pins activate "
+        "and hold them fixed."),
+    "model_pin_demote_conflicting_patches": (
+        "At activation, leave unpinned the verified patches whose pins "
+        "contradict their neighbours about relative winding."),
+    "model_pin_demote_conflict_fraction": (
+        "Fraction of a patch's pins in conflicting pairs above which it is "
+        "a demotion candidate."),
+    "model_pin_demote_pair_tolerance_voxels": (
+        "Scroll-voxel distance within which pins of different components "
+        "form a pair for the conflict test."),
+    "model_pin_demote_conflict_ratio": (
+        "Minimum share of a patch's neighbour pairs that must conflict "
+        "before it can be demoted (0.5: disagrees more than it agrees)."),
+    "loss_weight_pair_agreement": (
+        "Weight of the pair-agreement loss: nearby quad centres of different "
+        "constraint components must differ by a whole number of windings "
+        "under the free map (0 = off). Inactive without model_pins_enabled."),
+    "loss_margin_pair_agreement": (
+        "Hinge margin of the pair-agreement loss, in windings."),
+    "loss_pair_agreement_tolerance_voxels": (
+        "Scroll-voxel distance within which two quad centres of different "
+        "components form a pair for the pair-agreement loss."),
+    "loss_pair_agreement_stride": (
+        "Consider every n-th registry pin when building pair-agreement pairs."),
+    "loss_pair_agreement_max_pairs": (
+        "Cap on the stored pair-agreement pairs (seeded thinning above it)."),
+    "sample_count_pair_agreement": (
+        "Pair-agreement pairs evaluated per step."),
+}
+
 _OPTIMIZER_DESCRIPTIONS = {
     # See README.md, "Flow-gradient conditioning", for literature precedents
     # and the limitations of these custom combinations.
@@ -259,6 +321,9 @@ _OPTIMIZER_DESCRIPTIONS = {
 # changes the map a fixed parameter set produces (by the discretisation
 # difference) but reshapes nothing, so it is a run-boundary setting and a
 # checkpoint written under another count loads with a printed notice.
+# model_pins_enabled is deliberately absent: enabling pins on a checkpoint
+# written without them is the intended workflow (the pin_targets parameter is
+# initialised from the loaded model; see FitContext._adapt_checkpoint_for_pins).
 CHECKPOINT_MODEL_SHAPE_KEYS = (
     "model_flow_integration_solver",
     "model_num_flow_stages", "model_flow_bounds_z_margin",
@@ -287,6 +352,14 @@ CHECKPOINT_MODEL_SHAPE_KEYS = (
 # Both are therefore absent, and a key nobody has audited is absent by
 # construction — the safe answer.
 MODEL_STAGE_KEYS = frozenset({
+    "model_pins_enabled",
+    "model_pin_overlap_tolerance_voxels",
+    "model_pin_patch_grid_stride",
+    "model_pin_kernel_spacing_factor",
+    "model_pin_kernel_min_arc_voxels",
+    "model_pin_kernel_max_theta_radians",
+    "model_pin_kernel_min_z_voxels",
+    "model_pin_kernel_max_z_voxels",
     "model_flow_integration_solver",
     "model_num_flow_stages",
     "model_flow_bounds_radius",
@@ -303,6 +376,14 @@ MODEL_STAGE_KEYS = frozenset({
 })
 
 _MODEL_STRUCTURE_KEYS = frozenset({
+    "model_pins_enabled",
+    "model_pin_overlap_tolerance_voxels",
+    "model_pin_patch_grid_stride",
+    "model_pin_kernel_spacing_factor",
+    "model_pin_kernel_min_arc_voxels",
+    "model_pin_kernel_max_theta_radians",
+    "model_pin_kernel_min_z_voxels",
+    "model_pin_kernel_max_z_voxels",
     "model_flow_integration_solver",
     "model_num_flow_stages",
     "model_flow_bounds_z_margin",
@@ -320,6 +401,15 @@ _MODEL_STRUCTURE_KEYS = frozenset({
 })
 
 _RUN_MUTABLE_MODEL_KEYS = frozenset({
+    "model_pins_warmup_steps",
+    "model_pin_targets_integer",
+    "model_pin_demote_conflicting_patches",
+    "model_pin_demote_conflict_fraction",
+    "model_pin_demote_pair_tolerance_voxels",
+    "model_pin_demote_conflict_ratio",
+    "model_pin_rebin_interval",
+    "model_pin_coincidence_frac",
+    "model_pin_conflict_tolerance",
     "model_flow_field_low_res_lr_scale",
     "model_num_flow_integration_steps",
     "model_flow_field_high_res_lr_scale_initial",
@@ -499,6 +589,8 @@ def _field_spec(key, default):
         spec["description"] = _INPUT_TOGGLE_DESCRIPTIONS[key]
     elif key in _GAP_EXPANDER_DESCRIPTIONS:
         spec["description"] = _GAP_EXPANDER_DESCRIPTIONS[key]
+    elif key in _PIN_DESCRIPTIONS:
+        spec["description"] = _PIN_DESCRIPTIONS[key]
     elif key in _PCL_LINK_DESCRIPTIONS:
         spec["description"] = _PCL_LINK_DESCRIPTIONS[key]
 
@@ -538,8 +630,10 @@ class Config:
         self.model_num_flow_stages = 2
         self.model_flow_bounds_z_margin = 160
         self.model_flow_bounds_radius = 3200
-        self.model_flow_voxel_resolution = 16
-        self.model_flow_field_type = "cartesian"
+        # B-spline flow on a 24-voxel lattice: the setting the pinned fit was
+        # evaluated with (pinned_spiral_status.md).
+        self.model_flow_voxel_resolution = 24
+        self.model_flow_field_type = "bspline"
         self.model_flow_field_high_res_lr_scale_initial = 0.2
         self.model_flow_field_high_res_lr_scale_final = 0.2
         self.model_flow_field_high_res_lr_ramp_start_step = 0
@@ -561,6 +655,54 @@ class Config:
         self.model_gap_expander_softplus_bias = 4.0
         self.model_linear_z_resolution = 48
         self.model_initial_dr_per_winding = 16.0
+        # Pinned winding radii: every
+        # hard-constraint point is sent exactly onto its target winding by a
+        # pinned, monotone radial map, with one fractional winding coordinate
+        # per constraint component (the model's pin_targets parameter).
+        self.model_pins_enabled = True
+        self.model_pins_warmup_steps = 500
+        self.model_pin_patch_grid_stride = 1
+        self.model_pin_kernel_spacing_factor = 1.5
+        self.model_pin_kernel_min_arc_voxels = 3.0
+        self.model_pin_kernel_max_theta_radians = 0.25
+        self.model_pin_kernel_min_z_voxels = 3.0
+        self.model_pin_kernel_max_z_voxels = 200.0
+        self.model_pin_coincidence_frac = 0.05
+        self.model_pin_conflict_tolerance = 0.1
+        # Steps between rebuilds of the pins' coincidence groups (pins move
+        # every step; 1 = rebuild every step).
+        self.model_pin_rebin_interval = 1
+        # Patches whose quad centres come within this many scroll voxels of
+        # each other are treated as the same sheet observed twice and join
+        # one pin component with an integer offset from the theta topology.
+        # Off by default: compressed adjacent sheets can pass a proximity
+        # test, and a false link is a hard wrong constraint. ~1.5 is a
+        # reasonable opt-in value for overlapping surface annotations.
+        self.model_pin_overlap_tolerance_voxels = 0.0
+        # Conflict-based demotion: verified patches whose pins contradict
+        # their neighbours' about relative winding (cross-component pin pairs
+        # within the tolerance, compared the way the ray map treats slots)
+        # on more than the fraction of their pins, and on at least the ratio
+        # of their pairs (0.5: disagreeing more than agreeing), are left
+        # unpinned and get no soft loss. Decided at activation and re-checked
+        # against the current free map every 1000 steps
+        # (fit_spiral.PIN_DEMOTE_RECHECK_INTERVAL), reinstating patches that
+        # no longer conflict. Each decision is written to pin_demotion.jsonl
+        # in the run directory.
+        self.model_pin_demote_conflicting_patches = True
+        self.model_pin_demote_conflict_fraction = 0.05
+        self.model_pin_demote_pair_tolerance_voxels = 30.0
+        self.model_pin_demote_conflict_ratio = 0.5
+        self.optimizer_lr_pin_targets = 0.01
+        # Snap the component targets T to integers at activation and hold
+        # them fixed (no fractional winding coordinate to optimise).
+        self.model_pin_targets_integer = False
+        # Registry pins pushed through the flow per training step (stratified
+        # by component; 0 = all). Export and diagnostics always use them all.
+        # Memory of the eager pinned lookup grows with the (sample, pin) pairs
+        # every loss family keeps for backward; 100k fits a 24 GB GPU with the
+        # default sample counts.
+        self.sample_count_pins = 100000
         # Patch/PCL theta=0 topology is transformed only on this cadence. Patch
         # samples use cached node potentials; generic PCL/track walks gather
         # cached signed crossings.
@@ -701,6 +843,34 @@ class Config:
         self.loss_weight_abs_winding = 5.0
         self.loss_weight_unattached_pcl_radius = 2.0
         self.loss_weight_unattached_pcl_dt = 4.0
+        # Pin strain (pinned_spiral_plan.md stage 3): the correction each pin
+        # asks of the free map, hinged at loss_margin_pin_strain windings.
+        # Replaces the patch-radius, rel/abs-winding and unattached-strip
+        # radius losses on pinned inputs once pins are active (they are
+        # identically ~0 there); the DT losses are unchanged. The targets are
+        # detached, so the strain shapes only the flow and gaps, leaving the
+        # component targets T to the other losses.
+        self.loss_weight_pin_strain = 8.0
+        self.loss_margin_pin_strain = 0.025
+        self.loss_pins_replace_constraint_losses = True
+        # Pair agreement (pinned_spiral_plan.md, "preparing the warm-up"):
+        # nearby quad centres of different constraint components must differ
+        # by a whole number of windings under the *free* map, hinged at
+        # loss_margin_pair_agreement windings. Commits to no absolute integer;
+        # its job is to hand pin activation a free map whose cross-component
+        # pairs are consistent, since the pin targets are read off that map.
+        # Weight 512 was still improving on 128 (pinned_spiral_status.md).
+        # Inactive without model_pins_enabled (the pairs come from the
+        # pin constraint graph); acts on the free map before and after
+        # activation alike. Pairs: every stride-th patch pin, cross-component,
+        # within the tolerance, capped at max_pairs (seeded), of which
+        # sample_count_pair_agreement are drawn per step.
+        self.loss_weight_pair_agreement = 512.0
+        self.loss_margin_pair_agreement = 0.05
+        self.loss_pair_agreement_tolerance_voxels = 30.0
+        self.loss_pair_agreement_stride = 4
+        self.loss_pair_agreement_max_pairs = 4000000
+        self.sample_count_pair_agreement = 16384
         # Probability of hopping onto the linked fiber at each junction while
         # sampling a chain walk through a link component in the
         # unattached-strip loss.
@@ -719,7 +889,10 @@ class Config:
         self.model_sym_dirichlet_finite_difference_epsilon = 4.0
         self.optimizer_weight_decay_gap_expander = 0.01
         self.optimizer_weight_decay_flow_field = 0.0
-        self.loss_start_patch_dt = 25000
+        # At or before model_pins_warmup_steps: DT is the only term that moves
+        # fractional pin targets toward integers, and started at activation it
+        # adds 5-15 points of strict area (pinned_spiral_status.md).
+        self.loss_start_patch_dt = 500
         self.loss_start_track_dt = 25000
         # First iteration after which the unattached-PCL (fiber strip) DT snap
         # acts. None follows loss_start_patch_dt, the historical coupling.
@@ -742,6 +915,9 @@ class Config:
         self.shell_table_smooth_sigma_theta = 1.0
         self.shell_min_confidence = 0.25
         self.output_save_png_visualizations = False
+        # Evaluate and print the patch satisfaction metrics (strict and
+        # fractional) every this many steps during the fit; 0 = only at export.
+        self.output_satisfaction_log_interval = 0
         self.output_num_slices_for_visualization = 20
 
         defaults = vars(self)

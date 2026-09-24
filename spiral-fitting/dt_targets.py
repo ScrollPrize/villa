@@ -470,7 +470,7 @@ def _unwrap_block_samples(theta, block_rc, block_shape):
 @torch.no_grad()
 def compute_patch_dt_target_cache(
     slice_to_spiral_transform, dr_per_winding, patches, patch_atlas,
-    crossing_map, floating_threshold, chunk_size=65536,
+    crossing_map, floating_threshold, chunk_size=65536, pinned_values=None,
 ):
     """Choose one target per patch in the shared theta-potential frame.
 
@@ -478,6 +478,11 @@ def compute_patch_dt_target_cache(
     ``ThetaCrossingMap.adjustments_from_potentials``. Reusing that frame here
     avoids retaining a second UV/theta/adjustment atlas. The caller invalidates
     this cache whenever the theta map refreshes.
+
+    ``pinned_values`` (optional, one per patch, nan where absent) is the
+    pinned model's root-frame winding coordinate ``T_g + O_P`` of each patch. For those patches it replaces the sampled
+    unwrapped median as the input to the whole-object selection, so the
+    snapped DT target follows ``T`` rather than a cached median.
     """
     device = dr_per_winding.device
     num_patches = len(patches)
@@ -486,8 +491,20 @@ def compute_patch_dt_target_cache(
     target_relative = torch.zeros(
         num_patches, dtype=torch.int64, device=device)
     valid = torch.from_numpy(counts > 0).to(device=device)
+    pinned_mask = None
+    if pinned_values is not None:
+        pinned_values = torch.as_tensor(pinned_values, dtype=torch.float32).cpu()
+        pinned_mask = torch.isfinite(pinned_values)
+        for n in torch.nonzero(pinned_mask, as_tuple=True)[0].tolist():
+            selected = select_whole_object_target(
+                pinned_values[n:n + 1], 1.0, floating_threshold)
+            target_relative[n] = int(torch.round(selected))
+        valid = valid | pinned_mask.to(device=device)
+        counts = np.where(pinned_mask.numpy(), 0, counts)
+        total = int(counts.sum())
     if total > 0:
-        ijs_np = np.concatenate([p._dt_target_ijs for p in patches], axis=0)
+        ijs_np = np.concatenate(
+            [p._dt_target_ijs[:count] for p, count in zip(patches, counts)], axis=0)
         patch_idx_np = np.repeat(np.arange(num_patches, dtype=np.int64), counts)
         node_ids_np = patch_atlas.theta_node_ids(patch_idx_np, ijs_np)
         # The atlas is host-resident: the gather runs on CPU and only the

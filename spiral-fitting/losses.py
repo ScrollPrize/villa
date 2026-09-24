@@ -1,4 +1,5 @@
 import itertools
+import math
 import os
 from dataclasses import dataclass
 
@@ -739,18 +740,98 @@ def _sample_requested_patch_rows(patch_indices, point_cap, patch_atlas):
     return ijs, zyxs, node_ids, mask
 
 
-def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
-                               patches_dict, patch_atlas, point_collections,
-                               sampling_strata, *, crossing_map, cfg,
-                               z_begin, z_end):
-    """Relative winding supervision over unordered uniform patch samples."""
-    point_cap = cfg['sample_count_points_per_patch']
+def get_pin_strain_loss(pins, gap_stage, dr_per_winding, *, margin,
+                        chunk_size=65536):
+    """Stage-3 pin strain: the correction each pin asks of the free map.
+
+    ``pins`` is the step's ``[P, 4]`` pins leaf ``(z, theta, r, dr (T + n))``
+    in intermediate space; ``gap_stage`` is the step's (pinned) gap expander,
+    whose parent free map ``s_free`` is evaluated on each pin's own ray.
+    ``strain_i = s_free(r_i) - r_target_i`` in windings, and the loss is
+    ``mean relu(|strain_i| - margin)``. Strain is zero exactly when the pin
+    is not needed. Its gradient reaches the flow chain (through ``r``,
+    ``theta``, ``z``) and the gap logits (through ``s_free``), but not the
+    component targets ``T``: that would be a centring force competing with
+    DT's pull to integers, so the targets are detached.
+
+    Returns ``(loss, strain.detach())``.
+    """
+    from pins import unpinned_map_forward
+    z, theta, r, target_shifted = pins.unbind(-1)
+    theta_norm = theta / (2. * math.pi)
+    target = (target_shifted + dr_per_winding * theta_norm).detach()
+    strains = []
+    for start in range(0, pins.shape[0], chunk_size):
+        sl = slice(start, start + chunk_size)
+        table = gap_stage.get_transformed_winding_radii(theta[sl], z[sl])
+        s_free = unpinned_map_forward(r[sl], table, dr_per_winding, theta_norm[sl])
+        strains.append((s_free - target[sl]) / dr_per_winding)
+    if not strains:
+        zero = torch.zeros([], device=pins.device, dtype=pins.dtype)
+        return zero, pins.new_zeros([0])
+    strain = torch.cat(strains)
+    loss = F.relu(strain.abs() - float(margin)).mean()
+    return loss, strain.detach()
+
+
+def pair_agreement_residuals(w_a, w_b):
+    """Signed distance of the winding difference ``w_a - w_b`` from the
+    nearest integer, in ``(-0.5, 0.5]``. Zero for points on the same sheet
+    and for points on sheets a whole number of windings apart, so it needs
+    no seam bookkeeping: the theta=0 seam shifts one side by exactly one
+    winding. The rounding carries no gradient, so d(residual) = d(w_a - w_b).
+    """
+    difference = w_a - w_b
+    return difference - torch.round(difference).detach()
+
+
+def get_pair_agreement_loss(zyx_a, zyx_b, slice_to_spiral_transform, dr_per_winding, *,
+                            margin, chunk_size=65536):
+    """Modular pairwise winding agreement on the free map.
+
+    ``zyx_a[k]`` and ``zyx_b[k]`` are scroll-space points of *different*
+    constraint components that lie close together (within the pair
+    tolerance), so the sheet structure says their windings under the free map
+    differ by an integer. The loss is ``mean relu(|residual| - margin)`` over
+    the pairs with ``residual = pair_agreement_residuals(w_a, w_b)`` and
+    ``w = shifted_radius / dr``. It commits to no absolute integer: a pair on
+    the same sheet is as satisfied as a pair on adjacent sheets. Its purpose
+    is the warm-up before pinning: the per-component targets ``T`` are read
+    off the free map at activation, and pairs whose free-map difference is far
+    from an integer are exactly the cross-component conflicts the pinned map
+    cannot honour (pinned_spiral_plan.md, "preparing the warm-up").
+
+    Returns ``(loss, residual.detach())``; ``residual`` is empty when there
+    are no pairs.
+    """
+    count = int(zyx_a.shape[0])
+    if count == 0:
+        zero = torch.zeros([], device=zyx_a.device, dtype=torch.float32)
+        return zero, zero.new_zeros([0])
+    zyx = torch.cat([zyx_a, zyx_b], dim=0)
+    spiral = torch.cat([
+        slice_to_spiral_transform(zyx[start:start + chunk_size])
+        for start in range(0, zyx.shape[0], chunk_size)], dim=0)
+    _, _, shifted = get_theta_and_radii(spiral[..., 1:], dr_per_winding)
+    winding = shifted / dr_per_winding
+    residual = pair_agreement_residuals(winding[:count], winding[count:])
+    loss = F.relu(residual.abs() - float(margin)).mean()
+    return loss, residual.detach()
+
+
+def draw_rel_winding_rows(patches_dict, patch_atlas, point_collections,
+                          sampling_strata, cfg):
+    """Draw the PCL / patch-pair / point rows for one relative-winding loss
+    evaluation (the sampling half of :func:`get_patch_rel_winding_loss`).
+
+    Separated so the training step can draw before building its transform
+    and include the rows' patches in the step's pin set.
+    """
     num_pcls = min(
         cfg['sample_count_relative_winding_pcls'],
         sampling_strata['effective_size'])
     if num_pcls <= 0:
-        return torch.zeros([], device=dr_per_winding.device)
-
+        return []
     rows = []
     for pcl_idx in _choose_pcl_indices(sampling_strata, num_pcls, cfg):
         pcl = point_collections[pcl_idx]
@@ -790,6 +871,22 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
                 'winding_diff': p2['winding_annotation'] - p1['winding_annotation'],
                 'chain_nodes': chain_nodes,
             })
+    return rows
+
+
+def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
+                               patches_dict, patch_atlas, point_collections,
+                               sampling_strata, *, crossing_map, cfg,
+                               z_begin, z_end, rows=None):
+    """Relative winding supervision over unordered uniform patch samples.
+
+    ``rows`` are pre-drawn by :func:`draw_rel_winding_rows`; drawn here
+    when omitted.
+    """
+    point_cap = cfg['sample_count_points_per_patch']
+    if rows is None:
+        rows = draw_rel_winding_rows(
+            patches_dict, patch_atlas, point_collections, sampling_strata, cfg)
     if not rows:
         return torch.zeros([], device=dr_per_winding.device)
 
@@ -848,17 +945,15 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
     return loss
 
 
-def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
-                               patches_dict, patch_atlas, point_collections,
-                               *, crossing_map, cfg, z_begin, z_end):
-    """Absolute winding supervision over unordered uniform patch samples."""
+def draw_abs_winding_rows(patches_dict, patch_atlas, point_collections, cfg):
+    """Draw the (patch, node, theta node, annotation) rows for one
+    absolute-winding loss evaluation (see :func:`draw_rel_winding_rows`)."""
     abs_pcls = [
         pcl for pcl in point_collections
         if pcl.get('metadata', {}).get('winding_is_absolute', False)]
     num_pcls = min(cfg['sample_count_absolute_winding_pcls'], len(abs_pcls))
     if num_pcls <= 0:
-        return torch.zeros([], device=dr_per_winding.device)
-
+        return []
     rows = []
     for pcl_idx in np.random.choice(len(abs_pcls), num_pcls, replace=False):
         pcl = abs_pcls[pcl_idx]
@@ -880,6 +975,19 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
             rows.append((
                 resolved[0], resolved[1], int(point['_theta_node_id']),
                 point['winding_annotation']))
+    return rows
+
+
+def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
+                               patches_dict, patch_atlas, point_collections,
+                               *, crossing_map, cfg, z_begin, z_end, rows=None):
+    """Absolute winding supervision over unordered uniform patch samples.
+
+    ``rows`` are pre-drawn by :func:`draw_abs_winding_rows`; drawn here when
+    omitted.
+    """
+    if rows is None:
+        rows = draw_abs_winding_rows(patches_dict, patch_atlas, point_collections, cfg)
     if not rows:
         return torch.zeros([], device=dr_per_winding.device)
 

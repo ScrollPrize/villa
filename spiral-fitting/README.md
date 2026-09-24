@@ -993,3 +993,94 @@ gradient of the fitted winding, `fit_spiral.inward_winding_direction`), and the
 fiber training views are re-materialised. A checkpoint from before that step
 loaded after the switch relinks back under the umbilicus direction at its first
 step.
+
+## Pinned radial maps
+
+`model_pins_enabled` enables annotation-derived constraints on the gap
+expander. `model_pins_warmup_steps` sets the absolute activation iteration;
+`sample_count_pins` limits the training subset (0 uses every pin), while export
+uses the full registry.
+
+For each query ray `(theta, z)`, spatial kernel weights produce pin radii and
+canonical targets, including fractional winding targets. The construction
+orders these constraints by canonical target and solves for **intermediate
+radius corrections** relative to the unpinned radius field. A full-strength
+constraint requests the observed pin radius; a fading constraint follows the
+correction interpolated from its neighbours. Consequently, a constraint with
+vanishing support disappears continuously instead of pulling the map back to
+the unpinned field at its location.
+
+A radial slope guard clips each solved interval's rise, accumulating any
+required extra rise outwards. Its minimum slope relative to the unpinned
+radius is `model_gap_expander_min_gap / dr`; this is not an absolute physical
+winding-gap guarantee. `pin_min_effective_gap` measures the minimum local
+`dR/dc * dr` of the final map. Guarding interval slopes makes the result
+independent of splitting an interval with a zero-strength constraint. Equal
+canonical targets are merged by support-weighted radius; conflicting radii
+and supported targets at or below the fixed origin are reported as ordering
+violations. Such conflicting constraints cannot all be exact.
+
+Pinned fits default to a B-spline flow on a 24-voxel lattice, the patch DT
+loss from step 500 (`loss_start_patch_dt`, at or before
+`model_pins_warmup_steps`, since DT is the only term that moves fractional
+targets toward integers) and the pair-agreement warm-up loss below. Verified
+patches whose pins contradict their neighbours about relative winding are
+demoted (left unpinned, `model_pin_demote_conflicting_patches`), re-checked
+against the current free map every 1000 steps; each decision is appended to
+`pin_demotion.jsonl` in the run directory, the review queue for annotation
+fixes. See `pinned_spiral_consolidation_plan.md` for the evaluation behind
+these defaults.
+
+The free winding map and the pin-only radius deformation are evaluated as
+two explicit stages: canonical coordinate -> unpinned radius -> corrected
+radius, with the stages reversed for the inverse. This preserves the relative
+unpinned gap pattern without merging fractional pins and winding knots into
+one table. A pin arbitrarily close to an original winding therefore does not
+create a near-zero interval in a combined float32 search table. Outside the
+outermost pin the radius deformation is a constant offset; below the fixed
+origin it is the identity. Nearly coincident pin anchors themselves remain
+subject to floating-point resolution limits.
+
+This radius-space parameterization changes pinned interpolation between
+annotations and the response to conflicts compared with the earlier
+canonical-coordinate correction map. Existing checkpoint parameters and pin
+registries still load, but an already pinned checkpoint is evaluated with the
+new mapping. Unpinned transforms are unchanged. No speedup is assumed from
+this representation change.
+
+### Pair-agreement warm-up loss
+
+`loss_weight_pair_agreement` (default 512) adds a loss on the *free* map for
+the warm-up before pinning: pairs of verified-patch quad centres that belong to
+different constraint components and lie within
+`loss_pair_agreement_tolerance_voxels` of each other must differ by a whole
+number of windings, `mean relu(|d - round(d)| - loss_margin_pair_agreement)`
+with `d` the free-map winding difference. It commits to no absolute integer
+(same sheet and adjacent sheets are equally satisfied) and needs no seam
+bookkeeping. The pin targets are read off the free map at activation, so pairs
+whose difference is far from an integer are exactly the cross-component
+conflicts the pinned map cannot honour. Pairs are built once per model state
+from the full pin registry (every `loss_pair_agreement_stride`-th pin, KD-tree,
+capped at `loss_pair_agreement_max_pairs` by a seeded thinning) and
+`sample_count_pair_agreement` of them are drawn per step. The loss is inactive
+without `model_pins_enabled` and keeps acting on the free map after activation. The
+headless log reports `pair_agreement_median` and
+`pair_agreement_frac_over_margin` with the pin diagnostics; the activation
+line `pin conflicts (step N)` is the number to watch.
+
+```bash
+AGENTS_AGENT_MODE=1 .venv/bin/python -m pytest -q tests/test_pair_agreement.py
+```
+
+Validate the synthetic radial maps and full CPU transform chain with:
+
+```bash
+AGENTS_AGENT_MODE=1 .venv/bin/python -m pytest -q \
+  tests/test_pins.py tests/test_pins_transform.py \
+  tests/test_checkpoint_load.py tests/test_flatten_spiral_checkpoint.py
+```
+
+The tests cover radius blending, pin exactness, vanishing support with and
+without active guards, duplicate and fractional knots, extrapolation,
+monotonicity, round trips, finite gradients, numerical gradient checks,
+angular seams, and checkpoint resume.

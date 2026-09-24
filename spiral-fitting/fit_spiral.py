@@ -46,6 +46,7 @@ from ddp_helpers import (
     maybe_init_distributed,
     process_context,
 )
+import pins as pins_module
 from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, FitConfig,
                     SHELL_ATLAS_KEYS)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
@@ -114,6 +115,10 @@ from sample_spiral import (
     get_winding_xy,
 )
 from losses import (
+    get_pin_strain_loss,
+    get_pair_agreement_loss,
+    draw_abs_winding_rows,
+    draw_rel_winding_rows,
     MissingPclSamplingWeightError,
     build_pcl_sampling_strata,
     pcl_sampling_group_weight,
@@ -158,7 +163,7 @@ from satisfaction_metrics import (
     save_overlay_and_print_satisfaction,
 )
 from visualization import overlay_patches_on_slices
-from transforms import SpiralAndTransform
+from transforms import SpiralAndTransform, pinned_gap_stage
 from theta_crossing_map import ThetaCrossingMap
 from winding_supervision import (
     get_winding_inference_losses,
@@ -183,6 +188,9 @@ def largest_patch_quad_component(mask):
 
 
 _HEADLESS_AUTOSAVE_INTERVAL = AUTOSAVE_INTERVAL_ITERATIONS
+# Steps between re-checks of the conflict-based pin demotion against the
+# current free map (patches that no longer conflict are pinned again).
+PIN_DEMOTE_RECHECK_INTERVAL = 1000
 
 
 class CheckpointVerdict:
@@ -1207,6 +1215,15 @@ def get_exponential_lr_at_step(
     completed = max(0, int(completed_steps))
     gamma = float(final_factor) ** (1.0 / horizon)
     return float(initial_lr) * gamma ** completed
+
+
+def _checkpoint_lacks_pin_group(context, optimiser_state):
+    """True when this fit has a pin_targets optimiser group but the saved
+    optimiser state predates pins (exactly one group fewer)."""
+    if not getattr(context, 'pin_target_params', None) or not isinstance(optimiser_state, Mapping):
+        return False
+    saved_groups = list(optimiser_state.get('param_groups') or [])
+    return len(saved_groups) == len(context.optimiser.param_groups) - 1
 
 
 def get_flow_field_high_res_lr_scale(cfg, iteration):
@@ -3008,6 +3025,412 @@ class FitContext:
 
         self._density_inactive_warned = set()
 
+    # ==========================================================================
+    # Pinned winding radii
+    # ==========================================================================
+
+    def _pin_footprint_rule(self):
+        cfg = self.config
+        return pins_module.FootprintRule(
+            spacing_factor=float(cfg.get('model_pin_kernel_spacing_factor', 1.5)),
+            min_arc_voxels=float(cfg.get('model_pin_kernel_min_arc_voxels', 3.0)),
+            max_theta_radians=float(cfg.get('model_pin_kernel_max_theta_radians', 0.25)),
+            min_z_voxels=float(cfg.get('model_pin_kernel_min_z_voxels', 3.0)),
+            max_z_voxels=float(cfg.get('model_pin_kernel_max_z_voxels', 200.0)))
+
+    def _finalize_pin_registry_fresh(self):
+        """Resolve the pin graph against the current unpinned model (every
+        patch pinned; no demotion)."""
+        model = self.spiral_and_transform
+        with torch.no_grad():
+            intermediate = model.get_slice_to_intermediate_transform()
+            dr = model.get_dr_per_winding()
+            gap_expander, _, _, _ = model._get_transform_parts(with_pins=False)
+
+            def free_gap(theta, z, slot):
+                table = gap_expander.get_transformed_winding_radii(theta, z)
+                gaps = table.diff(dim=-1)
+                idx = slot.clamp(0, gaps.shape[-1] - 1)
+                return torch.gather(gaps, -1, idx[:, None]).squeeze(-1)
+
+            return pins_module.finalize_registry(
+                self.pin_graph,
+                intermediate_transform=intermediate, dr=dr,
+                canonical_transform=model.get_unpinned_slice_to_spiral_transform(),
+                crossing_map=self.theta_crossing_map, patch_atlas=self.patch_atlas,
+                footprint_rule=self._pin_footprint_rule(), free_gap_fn=free_gap,
+                min_z=float(self.flow_min_corner_spiral_zyx[0]),
+                max_z=float(self.flow_max_corner_spiral_zyx[0]),
+                device=self.device)
+
+    def _finalize_pin_registry(self):
+        """Resolve the pin graph against the current (unpinned) model.
+
+        The theta topology has just been refreshed under
+        self.slice_to_spiral_transform for a newly constructed registry.
+        A matching checkpoint restores its registry together with T: rebuilding
+        integer offsets in the current theta frame would change the meaning of
+        the saved targets after a seam crossing. Otherwise the new registry
+        supplies the initial target estimates.
+        """
+        model = self.spiral_and_transform
+        started_at = time.perf_counter()
+        self._pin_registry_full = None
+        if self.pin_targets_loaded:
+            registry = model.pin_registry
+            if registry.patch_index is None:
+                # Registry saved before per-pin patch indices existed: the
+                # same graph emits pins in the same order, so borrow them.
+                fresh = self._finalize_pin_registry_fresh()
+                if fresh.num_pins == registry.num_pins and torch.equal(fresh.zyx, registry.zyx):
+                    registry.patch_index = fresh.patch_index
+                    self._pin_registry_full = fresh
+                elif self.dist.is_main_process:
+                    print('WARNING: could not backfill pin patch indices from the constraint graph; '
+                          'pins fall back to uniform subsampling')
+        else:
+            registry = self._finalize_pin_registry_fresh()
+            # Demotion (at activation and on re-checks) starts from this.
+            self._pin_registry_full = registry
+        if registry.patch_index is not None and registry.patch_component.numel():
+            # A patch is pinned only if it contributed pins (older registries
+            # marked every graph patch).
+            has_pins = torch.zeros(registry.patch_component.numel(), dtype=torch.bool,
+                                   device=registry.patch_component.device)
+            pinned_idx = registry.patch_index[registry.patch_index >= 0]
+            has_pins[pinned_idx[pinned_idx < has_pins.numel()]] = True
+            registry.patch_component = torch.where(has_pins, registry.patch_component,
+                                                   torch.full_like(registry.patch_component, -1))
+        model.set_pin_registry(registry, reset_targets=not self.pin_targets_loaded)
+        if self.dist.is_main_process:
+            print(registry.summary())
+            report = registry.consistency_report
+            if report.get('inconsistent_edges'):
+                print(f'WARNING: pin registry has {report["inconsistent_edges"]} '
+                      f'inconsistent constraint cycles '
+                      f'(by edge kind: {report.get("inconsistent_edges_by_kind")}):')
+                for comp, entries in list(report['components'].items())[:20]:
+                    print(f'  component {comp}: ' + '; '.join(
+                        f'{e["edge"]} ({e["kind"]}, mismatch {e["mismatch"]})'
+                        for e in entries[:5]))
+            for conflict in report.get('absolute_conflicts', []):
+                print(f'WARNING: absolute winding conflict in component '
+                      f'{conflict["component"]}: {conflict}')
+            print(f'pin registry ready ({_startup_resource_suffix(started_at)})')
+        warmup = int(self.config.get('model_pins_warmup_steps', 0) or 0)
+        self.pins_activation_iteration = warmup
+        if self.pin_targets_loaded and self.start_iteration >= warmup:
+            model.pins_active = True
+            self._apply_integer_pin_targets()
+            self.slice_to_spiral_transform = model.get_slice_to_spiral_transform()
+
+    def _draw_step_pin_patches(self):
+        """Draw this step's patch set for the pins and the patch losses."""
+        num = len(self.verified_patches_list)
+        count = min(num, max(int(self.config['sample_count_patches_per_step']),
+                             int(self.config['sample_count_patches_per_step_for_dt'])))
+        probs = self.patch_sampling_probabilities
+        drawn = np.random.choice(num, count, replace=False, p=probs)
+        return np.unique(drawn)
+
+    def _restrict_patch_probabilities(self, patch_indices):
+        """Patch sampling probabilities supported only on ``patch_indices``."""
+        num = len(self.verified_patches_list)
+        base = (np.ones(num, dtype=np.float64) / num if self.patch_sampling_probabilities is None
+                else np.asarray(self.patch_sampling_probabilities, dtype=np.float64))
+        mask = np.zeros(num, dtype=np.float64)
+        mask[np.asarray(patch_indices.cpu() if torch.is_tensor(patch_indices) else patch_indices)] = 1.0
+        probs = base * mask
+        if probs.sum() <= 0:
+            probs = mask
+        return probs / probs.sum()
+
+    def _apply_integer_pin_targets(self):
+        """Honour ``model_pin_targets_integer`` on the live targets.
+
+        On: round the component targets to integers and freeze them, so
+        every component is pinned onto an integer winding (the integer-
+        snapping satisfaction metric then measures pin exactness directly
+        and DT has nothing to do). Off: targets are trainable. Called at
+        activation, when a resumed checkpoint restores active pins, and when
+        the setting changes at a run boundary; ``requires_grad`` is not part
+        of the state dict, so a resume must re-apply it.
+        """
+        model = self.spiral_and_transform
+        if getattr(model, 'pin_targets', None) is None:
+            return
+        if self.config.get('model_pin_targets_integer', False):
+            with torch.no_grad():
+                model.pin_targets.copy_(torch.round(model.pin_targets))
+            model.pin_targets.requires_grad_(False)
+        else:
+            model.pin_targets.requires_grad_(True)
+
+    def unpinned_verified_patch_mask(self):
+        """Bool per verified patch: True when the registry pins none of its
+        quads for a benign reason (outside the flow z domain, no sampling-
+        valid quads). These keep the soft constraint losses while pins replace
+        them on pinned inputs. Patches excluded by the spread filter are not
+        included. None when pins are off."""
+        model = self.spiral_and_transform
+        if not model._pins_enabled() or model.pin_registry is None:
+            return None
+        registry = model.pin_registry
+        mask = registry.patch_component < 0
+        if mask.numel() != len(self.verified_patches_list):
+            return None
+        excluded = registry.excluded_patches
+        if excluded is not None and excluded.numel():
+            # Spread-excluded patches are left out on purpose: no soft loss
+            # either, or they would drag the flow toward sheets they do not
+            # consistently describe.
+            mask = mask.clone()
+            mask[excluded[excluded < mask.numel()].to(mask.device)] = False
+        return mask
+
+    def _full_pin_registry(self):
+        """The registry with every patch pinned (before any demotion). Kept
+        from finalisation; a resumed checkpoint carries only the demoted
+        registry, so it is rebuilt from the constraint graph on demand."""
+        full = getattr(self, '_pin_registry_full', None)
+        if full is None:
+            full = self._finalize_pin_registry_fresh()
+            self._pin_registry_full = full
+        return full
+
+    def _pair_agreement_pairs(self):
+        """``(pairs, zyx)`` for the pair-agreement loss: cross-component
+        patch-pin index pairs within ``loss_pair_agreement_tolerance_voxels``
+        (pins.cross_component_pairs) over the full registry's points. Built
+        once per model state (the pairs are geometric, independent of the
+        model and of demotion) and cached; the registry itself is not kept.
+        """
+        cache = getattr(self, '_pair_agreement_cache', None)
+        if cache is not None:
+            return cache
+        started_at = time.perf_counter()
+        full = self._full_pin_registry()
+        pairs = pins_module.cross_component_pairs(
+            full.zyx, full.patch_index, full.component,
+            tolerance=float(self.config['loss_pair_agreement_tolerance_voxels']),
+            stride=int(self.config['loss_pair_agreement_stride']),
+            max_pairs=int(self.config['loss_pair_agreement_max_pairs']),
+            seed=int(self.config['optimizer_random_seed']))
+        zyx = full.zyx.detach().clone()
+        if self.dist.is_main_process:
+            print(f'pair agreement: {pairs.shape[0]} cross-component pin pairs within '
+                  f"{float(self.config['loss_pair_agreement_tolerance_voxels']):g} voxels "
+                  f"(every {int(self.config['loss_pair_agreement_stride'])}th of {full.num_pins} pins, "
+                  f"cap {int(self.config['loss_pair_agreement_max_pairs'])}; "
+                  f'{time.perf_counter() - started_at:.1f}s)')
+        self._pair_agreement_cache = (pairs, zyx)
+        return self._pair_agreement_cache
+
+    def _demote_conflicting_patches(self, iteration=None):
+        """Leave unpinned the verified patches that contradict their
+        neighbours (``model_pin_demote_conflicting_patches``); see
+        pins.conflicting_patch_demotion. Runs at activation and, every
+        ``PIN_DEMOTE_RECHECK_INTERVAL`` steps, again on the current free
+        map starting from the full registry, so patches that no longer
+        conflict are pinned again. The demoted set is recorded in the
+        registry (a resumed checkpoint keeps it) and such patches get no soft
+        constraint loss; each decision is appended to pin_demotion.jsonl.
+        """
+        if not self.config.get('model_pin_demote_conflicting_patches', False):
+            return
+        model = self.spiral_and_transform
+        full = self._full_pin_registry()
+        if full is None or full.patch_index is None or not full.num_pins:
+            return
+        current = model.pin_registry
+        model.set_pin_registry(full, reset_targets=False)
+        try:
+            with torch.no_grad():
+                T = model.effective_pin_targets()
+                _, estimate = model.estimate_pin_targets(return_per_pin=True)
+                pins_t = model.compute_pins(full=True)
+                n = pins_t[:, 3] / model.get_dr_per_winding() - T[full.component]
+            demoted, report = pins_module.conflicting_patch_demotion(
+                full.zyx, full.patch_index, full.component, torch.round(n), estimate, T,
+                tolerance=float(self.config.get('model_pin_demote_pair_tolerance_voxels', 30.0)),
+                min_conflict_fraction=float(self.config.get('model_pin_demote_conflict_fraction', 0.05)),
+                min_conflict_ratio=float(self.config.get('model_pin_demote_conflict_ratio', 0.0)))
+        except Exception:
+            model.set_pin_registry(current, reset_targets=False)
+            raise
+        previous = set(current.excluded_patches.tolist()) if current.excluded_patches is not None else set()
+        now = set(int(p) for p in demoted)
+        if len(demoted):
+            demoted_t = torch.as_tensor(demoted, dtype=torch.int64, device=full.zyx.device)
+            keep = ~torch.isin(full.patch_index, demoted_t)
+            model.set_pin_registry(full.subset(keep, demoted_patches=demoted_t), reset_targets=False)
+        # (No demotion: the full registry stays installed.)
+        if self.dist.is_main_process:
+            print(f'pin conflicts (step {iteration if iteration is not None else "activation"}): '
+                  f'{report["inconsistent"]} of {report["pairs"]} cross-component pin pairs inconsistent; '
+                  f'{len(demoted)} patch(es) demoted ({len(now - previous)} new, {len(previous - now)} reinstated)')
+            names = [getattr(patch, 'uuid', None) for patch in self.verified_patches_list]
+            entry = {
+                'iteration': iteration, 'pairs': report['pairs'], 'inconsistent': report['inconsistent'],
+                'demoted': [{**e, 'id': names[e['patch']] if e['patch'] < len(names) else None,
+                             'neighbours': [{'patch': q, 'id': names[q] if q < len(names) else None, 'conflicting_pairs': c}
+                                            for q, c in e['neighbours']]} for e in report['demoted']],
+                'reinstated': sorted(previous - now),
+            }
+            out_path = getattr(self, 'out_path', None)
+            if out_path:
+                with open(os.path.join(out_path, 'pin_demotion.jsonl'), 'a') as handle:
+                    handle.write(json.dumps(entry) + '\n')
+
+    def _maybe_activate_pins(self, iteration):
+        model = self.spiral_and_transform
+        if (model.pin_registry is None or model.pins_active
+                or self.pins_activation_iteration is None
+                or iteration < self.pins_activation_iteration):
+            return
+        if not self.pin_targets_loaded:
+            # T from the state the soft fit has reached.
+            with torch.no_grad():
+                model.pin_targets.copy_(model.estimate_pin_targets())
+        self._apply_integer_pin_targets()
+        self._demote_conflicting_patches(iteration)
+        model.pins_active = True
+        if self.dist.is_main_process:
+            T = model.effective_pin_targets().detach()
+            frac = (T - torch.round(T)).abs()
+            print(f'pins activated at iteration {iteration}: {model.pin_registry.num_pins} pins, '
+                  f'{model.pin_registry.num_components} components, '
+                  f'|T - round(T)| mean {float(frac.mean()) if frac.numel() else 0.0:.3f}')
+        # Whole-object DT targets now come from T; drop the cached medians.
+        self.dt_target_cache_manager.reset()
+
+    def _pinned_patch_dt_values(self):
+        """Per verified patch, ``T_g + O_P`` (nan for unpinned patches)."""
+        model = self.spiral_and_transform
+        if not model._pins_enabled():
+            return None
+        registry = model.pin_registry
+        T = model.effective_pin_targets().detach()
+        values = torch.full([len(self.verified_patches_list)], float('nan'), device=self.device)
+        has = registry.patch_component >= 0
+        values[has] = T[registry.patch_component[has]] + registry.patch_offset[has].to(T.dtype)
+        return values
+
+    def _record_pin_target_grad(self, family, pins_leaf, seen_before):
+        grad = pins_leaf.grad
+        if grad is None:
+            return
+        registry = self.spiral_and_transform.pin_registry
+        # The pins leaf holds the step's sampled subset; its component ids
+        # live in the model's current pin view.
+        component = self.spiral_and_transform._pin_view['component']
+        increment = grad[:, 3] if seen_before is None else grad[:, 3] - seen_before[:, 3]
+        dr = float(self.dr_per_winding.detach())
+        per_component = torch.zeros(
+            [registry.num_components], device=grad.device).index_add(
+            0, component, increment) * dr
+        self.pin_grad_by_family[family] = per_component
+
+    def _pin_step_metrics(self, pins):
+        """Guard/conflict/exactness diagnostics at the pins' own rays."""
+        model = self.spiral_and_transform
+        metrics = {}
+        gap = pinned_gap_stage(self.slice_to_spiral_transform)
+        if gap is not None:
+            metrics.update(gap.pin_diagnostics(pins))
+        metrics['pin_conflicts'] = float(len(model.pin_conflicts))
+        metrics['pin_rebuilds'] = float(model._pin_rebuilds)
+        T = model.effective_pin_targets().detach()
+        if T.numel():
+            frac = (T - torch.round(T)).abs()
+            metrics['pin_T_frac_mean'] = float(frac.mean())
+            metrics['pin_T_frac_max'] = float(frac.max())
+        for family, grad in self.pin_grad_by_family.items():
+            metrics[f'pin_T_grad_norm/{family}'] = float(grad.norm())
+        self.pin_grad_by_family = {}
+        return metrics
+
+    def _export_transform(self):
+        """The live transform for export; pinned with the full registry."""
+        transform = self.spiral_and_transform.get_slice_to_spiral_transform()
+        model = self.spiral_and_transform
+        if model._pins_enabled():
+            gap = pinned_gap_stage(transform)
+            assert gap is not None, 'pins are active but the export transform is unpinned'
+            assert gap.pin_table.num_registry_pins == model.pin_registry.num_pins, (
+                'export transform must carry the full pin registry')
+        return transform
+
+    def _adapt_checkpoint_for_pins(self, checkpoint, model_state, optimiser_state):
+        """Fit a checkpoint written with a different (or no) pin registry.
+
+        ``pin_targets`` is kept only when the checkpoint's registry
+        fingerprint matches this fit's constraint graph; otherwise it is
+        dropped and re-estimated from the loaded model. A checkpoint from
+        before pins existed gets an appended optimiser/scheduler group for T.
+        """
+        scheduler_state = checkpoint.get('scheduler')
+        self.pin_targets_loaded = False
+        if getattr(self.spiral_and_transform, 'pin_targets', None) is None:
+            model_state = {k: v for k, v in model_state.items() if k != 'pin_targets'}
+            return model_state, optimiser_state, scheduler_state
+        model_state = dict(model_state)
+        saved_T = model_state.get('pin_targets')
+        saved_registry = checkpoint.get('pin_registry')
+        fingerprint = saved_registry.get('fingerprint') if isinstance(saved_registry, Mapping) else None
+        live = self.spiral_and_transform.pin_targets
+        # T carries information only if the checkpoint was written with pins
+        # active: before activation T has no gradient and still holds the
+        # registry's estimate from the model state at construction, which is
+        # stale once the soft fit has moved on. Such a checkpoint keeps its
+        # registry but re-estimates T at activation (_maybe_activate_pins).
+        # (Checkpoints predating the flag are taken as active: legacy behaviour.)
+        saved_active = bool(checkpoint.get('pins_active', True))
+        if (saved_T is not None and tuple(saved_T.shape) == tuple(live.shape)
+                and fingerprint == self.pin_graph.fingerprint()):
+            self.spiral_and_transform.set_pin_registry(
+                pins_module.PinRegistry.from_state_dict(saved_registry, live.device),
+                reset_targets=not saved_active)
+            self.pin_targets_loaded = saved_active
+            if not saved_active:
+                model_state['pin_targets'] = self.spiral_and_transform.pin_targets.detach().clone().cpu()
+        else:
+            if saved_T is not None:
+                print('checkpoint pin_targets do not match this fit\'s constraint '
+                      'graph; re-estimating T from the loaded model')
+            model_state['pin_targets'] = live.detach().clone().cpu()
+            # Adam's moments belong to the old component identities, even
+            # when the new target tensor happens to have the same shape.
+            # Preserve every other parameter's state and the source archive.
+            if (isinstance(optimiser_state, Mapping)
+                    and not _checkpoint_lacks_pin_group(self, optimiser_state)):
+                groups = optimiser_state.get('param_groups') or []
+                if len(groups) == len(self.optimiser.param_groups):
+                    pin_ids = set(groups[-1].get('params', []))
+                    optimiser_state = dict(optimiser_state)
+                    optimiser_state['state'] = {
+                        key: value for key, value in optimiser_state.get('state', {}).items()
+                        if key not in pin_ids}
+        if _checkpoint_lacks_pin_group(self, optimiser_state):
+            optimiser_state = dict(optimiser_state)
+            groups = [dict(g) for g in optimiser_state.get('param_groups') or []]
+            next_index = 1 + max(
+                (idx for g in groups for idx in g.get('params', [])), default=-1)
+            live_group = dict(self.optimiser.param_groups[-1])
+            live_group.pop('params', None)
+            groups.append({**live_group, 'params': [next_index]})
+            optimiser_state['param_groups'] = groups
+            if isinstance(scheduler_state, Mapping):
+                scheduler_state = dict(scheduler_state)
+                base = list(scheduler_state.get('base_lrs') or [])
+                base.append(self.lr_scheduler.base_lrs[-1])
+                scheduler_state['base_lrs'] = base
+                last = list(scheduler_state.get('_last_lr') or [])
+                if last:
+                    last.append(live_group['lr'])
+                    scheduler_state['_last_lr'] = last
+        return model_state, optimiser_state, scheduler_state
+
     def _make_theta_crossing_map(self):
         """Construct the shared patch/PCL source topology."""
         crossing_map = ThetaCrossingMap(
@@ -3274,6 +3697,45 @@ class FitContext:
         )
         self.spiral_and_transform.to(self.device)
 
+        # Pinned winding radii. The constraint
+        # graph is model-independent, so its component count -- the size of
+        # the pin_targets parameter T -- is known before the optimiser exists;
+        # the registry itself (integer offsets, footprints) is finalised
+        # against the theta topology below, and the pins are switched on at
+        # model_pins_warmup_steps (see _maybe_activate_pins).
+        self.pin_graph = None
+        self.pin_targets_loaded = False
+        self.pins_activation_iteration = None
+        self.pin_grad_by_family = {}
+        self._pair_agreement_cache = None
+        if self.config.get('model_pins_enabled', False):
+            progress.begin('loading', 'Building pin constraint graph')
+            overlap_tolerance = float(self.config.get('model_pin_overlap_tolerance_voxels', 0.0) or 0.0)
+            overlap_pairs = None
+            if overlap_tolerance > 0:
+                started_at = time.perf_counter()
+                overlap_pairs = pins_module.patch_overlap_pairs(
+                    self.patch_atlas, overlap_tolerance,
+                    stride=int(self.config.get('model_pin_patch_grid_stride', 1)))
+                if self.dist.is_main_process:
+                    linked = len({(a, b) for a, _, b, _, _ in overlap_pairs})
+                    print(f'pin overlaps: {linked} patch pairs within {overlap_tolerance:g} voxels '
+                          f'({_startup_resource_suffix(started_at)})')
+            self.pin_graph = pins_module.build_pin_graph(
+                verified_patches=self.verified_patches,
+                patch_atlas=self.patch_atlas,
+                cross_patch_pcls=self.cross_patch_pcls,
+                unattached_pcl_strips=self.unattached_pcl_strips,
+                unattached_components=self.unattached_components,
+                unattached_component_edges=self.unattached_component_edges,
+                patch_grid_stride=self.config.get('model_pin_patch_grid_stride', 1),
+                overlap_pairs=overlap_pairs,
+                z_range=(float(self.flow_min_corner_spiral_zyx[0]),
+                         float(self.flow_max_corner_spiral_zyx[0])),
+            )
+            print(self.pin_graph.summary())
+            self.spiral_and_transform.init_pin_targets(self.pin_graph.num_components)
+
         # ==========================================================================
         # Outer-shell setup
         # ==========================================================================
@@ -3306,7 +3768,10 @@ class FitContext:
         flow_field_params = self.low_res_flow_params + self.high_res_flow_params
         self.gap_expander_params = list(self.spiral_and_transform.gap_expander_params.parameters())
         linear_params = [self.spiral_and_transform.linear_logits]
-        grouped_ids = {id(p) for p in flow_field_params + self.gap_expander_params + linear_params}
+        pin_target_params = (
+            [self.spiral_and_transform.pin_targets]
+            if self.spiral_and_transform.pin_targets is not None else [])
+        grouped_ids = {id(p) for p in flow_field_params + self.gap_expander_params + linear_params + pin_target_params}
         other_params = [p for p in self.spiral_and_transform.parameters() if id(p) not in grouped_ids]
         initial_high_res_lr_scale = get_flow_field_high_res_lr_scale(self.config, 0)
         initial_low_res_lr_scale = get_flow_field_low_res_lr_scale(self.config)
@@ -3327,6 +3792,19 @@ class FitContext:
                 'lr_scale': initial_high_res_lr_scale,
             },
         ]
+        if pin_target_params:
+            # T has its own group: one Adam step moves a component by at most
+            # about optimizer_lr_pin_targets windings. Expressed as
+            # a scale of the base LR so schedule realignment preserves it.
+            pin_lr = float(self.config.get('optimizer_lr_pin_targets', 0.01))
+            pin_lr_scale = pin_lr / float(self.config['optimizer_learning_rate'])
+            param_groups.append({
+                'params': pin_target_params,
+                'weight_decay': 0.0,
+                'lr': pin_lr,
+                'lr_scale': pin_lr_scale,
+            })
+        self.pin_target_params = pin_target_params
         progress.begin('loading', 'Creating optimizer')
         # AdamW for every group; the flow groups may additionally be stepped
         # with lazy moments (optimizer_flow_lazy_moments, applied per step by
@@ -3437,6 +3915,9 @@ class FitContext:
         self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform()
         self.dr_per_winding = self.spiral_and_transform.get_dr_per_winding()
         self._build_theta_crossing_map()
+        if self.pin_graph is not None:
+            progress.begin('loading', 'Finalising pin registry')
+            self._finalize_pin_registry()
 
         # Caches are recomputed lazily once the corresponding DT loss is active.
         # Updates are deterministic given the transform, so DDP ranks stay consistent.
@@ -3498,7 +3979,7 @@ class FitContext:
         'slice_to_spiral_transform', 'dr_per_winding',
         'dt_target_cache_manager', 'dist_grad_params', 'dist_grad_named',
         'step_timer', 'nonfinite_grad_steps', 'nonfinite_grad_by_param',
-        'run_dt_resume_iteration',
+        'run_dt_resume_iteration', 'pin_graph', 'pin_target_params',
     )
 
     def rebuild_model_state(self):
@@ -3575,6 +4056,12 @@ class FitContext:
             'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
             'input_manifest': dict(getattr(self.interactive_driver, 'input_manifest', {})),
             'preview_first_winding': 10,
+            # Pinned winding radii: the registry lets an offline exporter
+            # rebuild the exact pinned transform without the fit inputs.
+            'pin_registry': (
+                self.spiral_and_transform.pin_registry.state_dict()
+                if self.spiral_and_transform.pin_registry is not None else None),
+            'pins_active': bool(self.spiral_and_transform.pins_active),
         }
 
     def save_checkpoint(self, path, completed_iterations):
@@ -3773,6 +4260,11 @@ class FitContext:
         model_state = checkpoint.get('spiral_and_transform')
         if isinstance(model_state, Mapping):
             live_state = self.spiral_and_transform.state_dict()
+            # The pin_targets parameter is sized by the constraint registry,
+            # which is rebuilt from the inputs: a mismatch is re-initialised
+            # from the loaded model, not refused (see load_checkpoint).
+            model_state = {k: v for k, v in model_state.items() if k != 'pin_targets'}
+            live_state = {k: v for k, v in live_state.items() if k != 'pin_targets'}
             unexpected = sorted(set(model_state) - set(live_state))
             absent = sorted(set(live_state) - set(model_state))
             if unexpected or absent:
@@ -3801,6 +4293,10 @@ class FitContext:
             live_optimiser = self.optimiser.state_dict()
             saved_groups = list(optimiser_state.get('param_groups') or [])
             live_groups = list(live_optimiser.get('param_groups') or [])
+            if _checkpoint_lacks_pin_group(self, optimiser_state):
+                # A checkpoint written before pins existed: the pin group is
+                # appended at load (fresh Adam state for T).
+                live_groups = live_groups[:-1]
             if len(saved_groups) != len(live_groups):
                 reasons.append(
                     f'checkpoint optimiser has {len(saved_groups)} parameter '
@@ -3832,6 +4328,8 @@ class FitContext:
                 else:
                     saved_base = list(scheduler_state.get('base_lrs') or [])
                     live_base = list(live_scheduler.get('base_lrs') or [])
+                    if _checkpoint_lacks_pin_group(self, checkpoint.get('optimiser')):
+                        live_base = live_base[:-1]
                     if len(saved_base) != len(live_base):
                         reasons.append(
                             f'checkpoint scheduler tracks {len(saved_base)} '
@@ -3889,6 +4387,8 @@ class FitContext:
         checkpoint = expand_gap_checkpoint_capacity(
             checkpoint, self.config['model_gap_expander_capacity_windings'])
         transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
+        transformed_spiral_state, optimiser_state, scheduler_state = \
+            self._adapt_checkpoint_for_pins(checkpoint, transformed_spiral_state, optimiser_state)
         self.spiral_and_transform.load_state_dict(transformed_spiral_state)
         self.optimiser.load_state_dict(optimiser_state)
         # Stored optimiser hyperparameters yield to the session configuration.
@@ -3900,8 +4400,8 @@ class FitContext:
         for group in self.optimiser.param_groups:
             if any(param is gap_param for param in group['params']):
                 group['weight_decay'] = self.config['optimizer_weight_decay_gap_expander']
-        if checkpoint.get('scheduler') is not None:
-            self.lr_scheduler.load_state_dict(checkpoint['scheduler'])
+        if scheduler_state is not None:
+            self.lr_scheduler.load_state_dict(scheduler_state)
 
     def _prepare_png_visualization_inputs(self):
         zs = np.linspace(
@@ -3972,6 +4472,31 @@ class FitContext:
               f'patches for splice in {time.perf_counter() - started:.2f}s')
         return evaluation
 
+    def periodic_satisfaction_metrics(self):
+        """Patch satisfaction (strict and fractional profiles) on the live
+        export transform, over every ROI quad centre of the verified patches.
+        Costs about a minute on a production atlas; the headless loop calls it
+        every ``output_satisfaction_log_interval`` steps so the curve of the
+        metric the export reports is visible during the fit."""
+        if not self.verified_patches_list:
+            return {}
+        with torch.no_grad():
+            transform = self._export_transform()
+            evaluation = evaluate_patch_satisfaction_packed(
+                transform, self.dr_per_winding.detach() if torch.is_tensor(self.dr_per_winding)
+                else self.spiral_and_transform.get_dr_per_winding().detach(),
+                self.verified_patches_list, self.patch_atlas,
+                self.z_begin, self.z_end, include_splicing=False)
+        metrics = {}
+        for name in ('strict', 'fractional'):
+            profile = evaluation.profiles[name]
+            total_area = float(profile.total_areas.sum())
+            metrics[f'{name}_satisfied_area_fraction'] = float(profile.satisfied_areas.sum()) / max(total_area, 1e-9)
+            metrics[f'{name}_satisfied_patches_fraction'] = float(profile.satisfied_patches.float().mean())
+            metrics[f'{name}_satisfied_patches_area_weighted_fraction'] = (
+                float(profile.total_areas[profile.satisfied_patches].sum()) / max(total_area, 1e-9))
+        return metrics
+
     def configure_dt_loss_schedule(self, run_start, requested_iterations,
                                    schedule):
         """Install one Run's independent directional-DT eligibility window."""
@@ -4015,8 +4540,7 @@ class FitContext:
             # any constraint bake it is pulled back through the composed
             # frozen+live chain; the resident inputs that bound its winding
             # range are in baked space and are read through the live chain.
-            live_transform = \
-                self.spiral_and_transform.get_slice_to_spiral_transform()
+            live_transform = self._export_transform()
             dr_per_winding = self.spiral_and_transform.get_dr_per_winding()
             splice_evaluation = self._preview_splice_evaluation(
                 live_transform, dr_per_winding, progress)
@@ -4629,6 +5153,8 @@ class FitContext:
         old_values = {key: self.config[key] for key in tracked}
         self.config.update(config)
         try:
+            if 'model_pin_targets_integer' in changed and self.spiral_and_transform.pins_active:
+                self._apply_integer_pin_targets()
             if changed & {'pcl_link_window_points', 'pcl_link_window_min_points'}:
                 window = int(self.config['pcl_link_window_points'])
                 minimum = int(self.config['pcl_link_window_min_points'])
@@ -4874,12 +5400,72 @@ class FitContext:
         # (retain_graph) until the family is released. The leaf gradients
         # accumulated across families flow through the real shared paths once,
         # next to the flow-field gradient flush below.
+        self._maybe_activate_pins(iteration)
+        if (self.spiral_and_transform._pins_enabled()
+                and self.pins_activation_iteration is not None
+                and iteration > self.pins_activation_iteration
+                and (iteration - self.pins_activation_iteration) % PIN_DEMOTE_RECHECK_INTERVAL == 0):
+            self._demote_conflicting_patches(iteration)
+        # Pin subset for this step: every pin of the patches the patch losses
+        # will sample (drawn here, the losses then draw from that set), so the
+        # pinned map is exact where it is evaluated rather than a thin uniform
+        # subsample smeared over widened footprints.
+        step_patch_probabilities = self.patch_sampling_probabilities
+        rel_winding_rows = abs_winding_rows = None
+        # Stage 3: while pins are active the constraint losses on pinned
+        # inputs are replaced by the pin strain loss (config-gated).
+        pins_replace = (self.spiral_and_transform._pins_enabled()
+                        and bool(self.config.get('loss_pins_replace_constraint_losses', True)))
+        weight_patch_radius = 0.0 if pins_replace else self.config['loss_weight_patch_radius']
+        weight_rel_winding = 0.0 if pins_replace else self.config['loss_weight_rel_winding']
+        weight_abs_winding = 0.0 if pins_replace else self.config['loss_weight_abs_winding']
+        weight_unattached_radius = 0.0 if pins_replace else self.config['loss_weight_unattached_pcl_radius']
+        # Inputs without pins keep their soft constraint losses when pins
+        # replace them: verified patches the registry does not pin (spread
+        # filter, flow z domain), PCL rows touching such a patch, and strips
+        # with non-pin points (vertical fibers with radial offsets).
+        unpinned_patch_mask = self.unpinned_verified_patch_mask() if pins_replace else None
+        unpinned_patches = (torch.nonzero(unpinned_patch_mask, as_tuple=True)[0].cpu().numpy()
+                            if unpinned_patch_mask is not None and bool(unpinned_patch_mask.any()) else None)
+        if pins_replace and any(
+                strip.get('radial_offsets') is not None and bool((np.asarray(strip['radial_offsets']) != 0).any())
+                for strip in self.unattached_pcl_strips):
+            weight_unattached_radius = self.config['loss_weight_unattached_pcl_radius']
+        if self.spiral_and_transform._pins_enabled() and self.verified_patches_list:
+            # The PCL winding losses are drawn here too, so the patches they
+            # touch are pinned this step as well as the patch-loss patches.
+            if self.config['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
+                rel_winding_rows = draw_rel_winding_rows(
+                    self.verified_patches, self.patch_atlas, self.cross_patch_pcls,
+                    self.pcl_sampling_strata['cross_patch'], self.config)
+            if self.config['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
+                abs_winding_rows = draw_abs_winding_rows(
+                    self.verified_patches, self.patch_atlas, self.cross_patch_pcls, self.config)
+            pcl_patches = [idx for row in (rel_winding_rows or []) for idx in row['patch_indices']]
+            pcl_patches += [row[0] for row in (abs_winding_rows or [])]
+            self.spiral_and_transform.set_step_pin_patches(
+                np.union1d(self._draw_step_pin_patches(), np.asarray(pcl_patches, dtype=np.int64)))
+            if pins_replace:
+                # Keep only the rows that touch an unpinned patch, at full weight.
+                pinned = None if unpinned_patch_mask is None else ~unpinned_patch_mask.cpu()
+                def touches_unpinned(indices):
+                    return pinned is None or any(not bool(pinned[int(i)]) for i in indices)
+                rel_winding_rows = [row for row in (rel_winding_rows or []) if touches_unpinned(row['patch_indices'])]
+                abs_winding_rows = [row for row in (abs_winding_rows or []) if touches_unpinned(row[:1])]
+                weight_rel_winding = self.config['loss_weight_rel_winding'] if rel_winding_rows else 0.0
+                weight_abs_winding = self.config['loss_weight_abs_winding'] if abs_winding_rows else 0.0
         shared_transform_outputs = self.spiral_and_transform.get_shared_transform_tensors()
+        active_patches = self.spiral_and_transform.active_step_pin_patches()
+        if active_patches is not None and self.verified_patches_list:
+            step_patch_probabilities = self._restrict_patch_probabilities(active_patches)
         shared_transform_leaves = tuple(
             output.detach().requires_grad_(True) for output in shared_transform_outputs)
         self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform(
             shared=shared_transform_leaves)
         self.dr_per_winding = shared_transform_leaves[0]
+        pins_leaf = shared_transform_leaves[3] if len(shared_transform_leaves) > 3 else None
+        log_pins_this_step = pins_leaf is not None and iteration % 200 == 0
+        pin_grad_seen = None
         theta_map_refreshed = self._refresh_theta_crossing_map_for_step(
             iteration,
             self.slice_to_spiral_transform)
@@ -4893,6 +5479,7 @@ class FitContext:
 
         def backward_family(weighted_losses):
             """Accumulate one loss family's gradients, then release its graph."""
+            nonlocal pin_grad_seen
             family_loss = sum(weighted_losses.values())
             if family_loss.requires_grad:
                 self.step_timer.stop('fwd')
@@ -4906,6 +5493,14 @@ class FitContext:
                 self.step_timer.start('fwd')
             for name, value in weighted_losses.items():
                 losses[name] = value.detach()
+            if log_pins_this_step:
+                # Per-family gradient on T: dL/dT_g = dr * sum_i
+                # dL/dr_target_i over the component's pins, read off the pins
+                # leaf as the increment this family added.
+                self._record_pin_target_grad(
+                    '+'.join(weighted_losses), pins_leaf, pin_grad_seen)
+                pin_grad_seen = (
+                    pins_leaf.grad.clone() if pins_leaf.grad is not None else None)
 
         run_dt_suppressed = (
             self.run_dt_resume_iteration is not None
@@ -4929,6 +5524,7 @@ class FitContext:
                     self.verified_patches_list, self.patch_atlas,
                     self.theta_crossing_map,
                     self.config['dt_target_floating_threshold'],
+                    pinned_values=self._pinned_patch_dt_values(),
                 ))
             if compute_unattached_pcl_dt and self.config['loss_weight_unattached_pcl_dt'] > 0 and self.unattached_pcl_strips:
                 pcl_flat = get_or_build_unattached_pcl_flat(self.unattached_pcl_strips, torch.device('cuda'))
@@ -4954,6 +5550,47 @@ class FitContext:
                     max_total_points=5_000_000,
                 ))
 
+        # Stage 3: pin strain, evaluated on this step's pins leaf against the
+        # step's own free gap map (see losses.get_pin_strain_loss).
+        if pins_leaf is not None and self.config.get('loss_weight_pin_strain', 0.0) > 0:
+            strain_loss, strain = get_pin_strain_loss(
+                pins_leaf, pinned_gap_stage(self.slice_to_spiral_transform), self.dr_per_winding,
+                margin=float(self.config.get('loss_margin_pin_strain', 0.0)))
+            backward_family({'pin_strain': strain_loss * self.config['loss_weight_pin_strain']})
+            if strain.numel() and iteration % 20 == 0:
+                magnitude = strain.abs()
+                log_metrics['pin_strain_median'] = float(magnitude.median())
+                log_metrics['pin_strain_p90'] = float(torch.quantile(magnitude, 0.9))
+                log_metrics['pin_strain_frac_over_margin'] = float(
+                    (magnitude > float(self.config.get('loss_margin_pin_strain', 0.0))).float().mean())
+
+        # Pair agreement on the free map (pinned_spiral_plan.md, "preparing
+        # the warm-up"): nearby quad centres of different constraint
+        # components must differ by a whole number of windings. Evaluated on
+        # the unpinned transform (the step's own leaves) whether or not pins
+        # are active, since the pin targets are read off the free map. The
+        # pairs come from the pin constraint graph, so without pins it is off.
+        weight_pair_agreement = float(self.config.get('loss_weight_pair_agreement', 0.0) or 0.0)
+        if weight_pair_agreement > 0 and self.pin_graph is not None:
+            pairs, pair_zyx = self._pair_agreement_pairs()
+            count = min(int(self.config['sample_count_pair_agreement']), int(pairs.shape[0]))
+            if count > 0:
+                chosen = pairs[torch.randint(int(pairs.shape[0]), [count], device=pairs.device)]
+                free_transform = (
+                    self.slice_to_spiral_transform
+                    if not self.spiral_and_transform._pins_enabled()
+                    else self.spiral_and_transform.get_unpinned_slice_to_spiral_transform(
+                        shared=shared_transform_leaves))
+                pair_loss, pair_residual = get_pair_agreement_loss(
+                    pair_zyx[chosen[:, 0]], pair_zyx[chosen[:, 1]], free_transform, self.dr_per_winding,
+                    margin=float(self.config.get('loss_margin_pair_agreement', 0.0)))
+                backward_family({'pair_agreement': pair_loss * weight_pair_agreement})
+                if pair_residual.numel() and iteration % 20 == 0:
+                    magnitude = pair_residual.abs()
+                    log_metrics['pair_agreement_median'] = float(magnitude.median())
+                    log_metrics['pair_agreement_frac_over_margin'] = float(
+                        (magnitude > float(self.config.get('loss_margin_pair_agreement', 0.0))).float().mean())
+
         patch_loss_values = get_patch_and_umbilicus_losses(
             self.slice_to_spiral_transform,
             self.dr_per_winding,
@@ -4961,7 +5598,7 @@ class FitContext:
             self.config['sample_count_patches_per_step_for_dt'],
             self.verified_patches_list,
             self.patch_atlas,
-            self.patch_sampling_probabilities,
+            step_patch_probabilities,
             self.umbilicus_zyx,
             compute_dt=compute_patch_dt,
             dt_target_cache=patch_dt_target_cache,
@@ -4975,13 +5612,35 @@ class FitContext:
             patch_family.update({
                 'patch_radius': (
                     patch_loss_values[0]
-                    * self.config['loss_weight_patch_radius']),
+                    * weight_patch_radius),
                 'patch_dt': (
                     patch_loss_values[2]
                     * self.config['loss_weight_patch_dt']),
             })
+        if pins_replace and self.verified_patches_list:
+            # The replaced constraint loss stays visible, unweighted.
+            log_metrics['patch_radius_unweighted'] = float(patch_loss_values[0].detach())
         backward_family(patch_family)
         del patch_family, patch_loss_values
+        if pins_replace and unpinned_patches is not None and self.config['loss_weight_patch_radius'] > 0:
+            # Verified patches without pins keep the soft radius loss.
+            unpinned_values = get_patch_and_umbilicus_losses(
+                self.slice_to_spiral_transform,
+                self.dr_per_winding,
+                min(int(self.config['sample_count_patches_per_step']), int(unpinned_patches.size)),
+                0,
+                self.verified_patches_list,
+                self.patch_atlas,
+                self._restrict_patch_probabilities(unpinned_patches),
+                self.umbilicus_zyx,
+                compute_dt=False,
+                shell_valid_zyxs=None,
+                shell_outer_winding_idx=self.shell_outer_winding_idx,
+                crossing_map=self.theta_crossing_map,
+                cfg=self.config,
+            )
+            backward_family({'patch_radius_unpinned': unpinned_values[0] * self.config['loss_weight_patch_radius']})
+            del unpinned_values
 
 
         if self.config['loss_weight_sym_dirichlet'] > 0:
@@ -4995,7 +5654,7 @@ class FitContext:
                 ) * self.config['loss_weight_sym_dirichlet'],
             })
 
-        if self.config['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
+        if weight_rel_winding > 0 and self.cross_patch_pcls:
             backward_family({
                 'rel_winding': get_patch_rel_winding_loss(
                     self.slice_to_spiral_transform,
@@ -5006,10 +5665,11 @@ class FitContext:
                     self.pcl_sampling_strata['cross_patch'],
                     crossing_map=self.theta_crossing_map,
                     cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
-                ) * self.config['loss_weight_rel_winding'],
+                    rows=rel_winding_rows,
+                ) * weight_rel_winding,
             })
 
-        if self.config['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
+        if weight_abs_winding > 0 and self.cross_patch_pcls:
             backward_family({
                 'abs_winding': get_patch_abs_winding_loss(
                     self.slice_to_spiral_transform,
@@ -5019,7 +5679,8 @@ class FitContext:
                     self.cross_patch_pcls,
                     crossing_map=self.theta_crossing_map,
                     cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
-                ) * self.config['loss_weight_abs_winding'],
+                    rows=abs_winding_rows,
+                ) * weight_abs_winding,
             })
 
         if (
@@ -5115,7 +5776,7 @@ class FitContext:
             del min_spacing_loss, min_spacing_metrics
 
         if (
-            (self.config['loss_weight_unattached_pcl_radius'] > 0
+            (weight_unattached_radius > 0
              or self.config['loss_weight_unattached_pcl_dt'] > 0)
             and self.unattached_pcl_strips
         ):
@@ -5135,7 +5796,7 @@ class FitContext:
                 cfg=self.config,
             )
             backward_family({
-                'unattached_pcl_radius': unattached_loss_values[0] * self.config['loss_weight_unattached_pcl_radius'],
+                'unattached_pcl_radius': unattached_loss_values[0] * weight_unattached_radius,
                 'unattached_pcl_dt': unattached_loss_values[1] * self.config['loss_weight_unattached_pcl_dt'],
             })
             del unattached_loss_values
@@ -5181,13 +5842,17 @@ class FitContext:
 
         self.step_timer.stop('fwd')
         self.step_timer.start('bwd')
+        if pins_leaf is not None and pins_leaf.grad is not None:
+            # The pins' graph runs through the flow chain, so it must be
+            # propagated before the field's accumulated gradient is flushed.
+            torch.autograd.backward([shared_transform_outputs[3]], [pins_leaf.grad])
         # Flush the sparse-accumulated field gradient into the flow parameters.
         self.spiral_and_transform.flow_field.apply_accumulated_field_grad()
         # Propagate the leaf gradients the family backwards accumulated on the
         # shared transform paths through the real parameters, exactly once.
         shared_transform_pending = [
             (output, leaf.grad)
-            for output, leaf in zip(shared_transform_outputs, shared_transform_leaves)
+            for output, leaf in zip(shared_transform_outputs[:3], shared_transform_leaves[:3])
             if output.requires_grad and leaf.grad is not None
         ]
         if shared_transform_pending:
@@ -5236,6 +5901,12 @@ class FitContext:
         self.step_timer.maybe_report(iteration)
         if self.profiler is not None:
             self.profiler.step()
+        if pins_leaf is not None:
+            log_metrics['pins_active'] = 1.0
+            if log_pins_this_step:
+                log_metrics.update(self._pin_step_metrics(pins_leaf.detach()))
+        elif self.pin_graph is not None:
+            log_metrics['pins_active'] = 0.0
 
         return loss, losses, log_metrics, shell_metrics
 
@@ -5296,6 +5967,24 @@ class FitContext:
                 conditioning_lines, conditioning_payload = self._flow_conditioning_report()
                 for line in conditioning_lines:
                     print(line)
+                interval = int(self.config.get('output_satisfaction_log_interval', 0) or 0)
+                if interval > 0 and iteration % interval == 0 and self.verified_patches_list:
+                    started = time.perf_counter()
+                    satisfaction = self.periodic_satisfaction_metrics()
+                    log_metrics.update(satisfaction)
+                    print('  satisfaction: ' + ', '.join(
+                        f'{k.replace("_satisfied_", " ").replace("_fraction", "")} = {v * 100:.1f}%'
+                        for k, v in satisfaction.items()) + f'  ({time.perf_counter() - started:.0f}s)')
+                pin_keys = ('pin_inexact_fraction', 'pin_rays_with_violation_fraction',
+                            'pin_order_violations', 'pin_anchors_evaluated', 'pin_conflicts',
+                            'pin_strain_median', 'pin_strain_p90', 'pin_strain_frac_over_margin',
+                            'pin_T_frac_mean', 'patch_radius_unweighted',
+                            'pair_agreement_median', 'pair_agreement_frac_over_margin')
+                pin_items = [(k, log_metrics[k]) for k in pin_keys if k in log_metrics]
+                if pin_items:
+                    print('  pins: ' + ', '.join(
+                        f'{k.removeprefix("pin_")} = {v:.3f}' if isinstance(v, float) and abs(v) < 1e4
+                        else f'{k.removeprefix("pin_")} = {v:.0f}' for k, v in pin_items))
                 payload = {
                     'total_loss': loss.item(),
                     **conditioning_payload,
@@ -5383,7 +6072,7 @@ class FitContext:
             save_overlay_and_print_satisfaction(
                 suffix,
                 spiral_and_transform=self.spiral_and_transform,
-                slice_to_spiral_transform=self.slice_to_spiral_transform,
+                slice_to_spiral_transform=self._export_transform(),
                 dr_per_winding=self.dr_per_winding,
                 patches_list=self.verified_patches_list,
                 patches_dict=self.verified_patches,

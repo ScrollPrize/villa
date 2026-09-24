@@ -150,4 +150,28 @@ def test_90k_one_quad_patches_use_point_chunks_not_patch_calls():
     assert evaluation.inverse_batches == expected
     assert transform.forward_calls == expected
     assert transform.inverse_calls == expected
-    assert evaluation.profiles.keys() == {'strict', 'splicing'}
+    assert evaluation.profiles.keys() == {'strict', 'splicing', 'fractional'}
+
+
+def test_fractional_profile_ignores_the_integer_snap():
+    # A patch held perfectly on one sheet but 0.4 winding off an integer:
+    # every quad fails the strict (snapped) profile, all pass the fractional.
+    # dr 16: a 0.4 winding offset is 6.4 voxels, outside the scan tolerance.
+    centres = [[spiral_point(.1 * (c + 1), 3.4, dr=16.0) for c in range(4)] for _ in range(3)]
+    patches = [patch_from_centres(centres)]
+    evaluation = evaluate_patch_satisfaction_packed(
+        CountingIdentityTransform(), torch.tensor(16.0), patches,
+        _ListPatchAtlas(patches, torch.device('cpu')), -1, 1, include_splicing=False)
+    assert not evaluation.profiles['strict'].satisfied_patches.item()
+    assert evaluation.profiles['fractional'].satisfied_patches.item()
+    assert bool(evaluation.profiles['fractional'].packed_satisfied_quads.all())
+    # A patch that is on one sheet except one quad half a winding off: the
+    # fractional profile fails exactly that quad.
+    bent = [[spiral_point(.1 * (c + 1), 3.4, dr=16.0) for c in range(4)] for _ in range(3)]
+    bent[1][2] = spiral_point(.3, 3.9, dr=16.0)
+    patches = [patch_from_centres(bent)]
+    evaluation = evaluate_patch_satisfaction_packed(
+        CountingIdentityTransform(), torch.tensor(16.0), patches,
+        _ListPatchAtlas(patches, torch.device('cpu')), -1, 1, include_splicing=False)
+    quads = evaluation.profiles['fractional'].packed_satisfied_quads
+    assert int((~quads).sum()) == 1
