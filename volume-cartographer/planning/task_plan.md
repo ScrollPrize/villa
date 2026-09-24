@@ -1,22 +1,22 @@
 # Plan
 
-1. Remove LineRibbonSurface and the added virtual sampling API; use ordinary QuadSurface.
-2. Restore support-grid construction, transported/roll-smoothed frames, geometric depth normals and indexed projection.
-3. Apply only manual angular corrections to baseline frames at construction; restore windowed cross-view tangents and linear centers.
-4. Preserve CP displacement and provenance. Add baseline-equivalence and ordinary-surface regression tests; build VC3D and run focused tests.
+1. Share the existing central-chord tangent and minimal frame transport between construction and corrections, rather than defining another tangent.
+2. Interpolate CP target axes in a common transported frame; unset endpoints target the sampled axis. Spans with no manual endpoints retain sampled normals.
+3. Inject the resulting normal field before ordinary frame alignment, resampling and smoothing. Delete all post-construction rotations and separate sign handling.
+4. Test short-span injected-normal equivalence, equal CP normals over a 170-degree baseline, shared tangent behavior and existing annotation tests; rebuild VC3D.
 
 ## Spec Update
 
-Prohibit custom runtime ribbon evaluators and cubic strip upsampling. Document construction-only frame corrections.
+Corrected normals are ordinary display input normals. One regular tangent definition; no post-frame rotations. Common transported frame for target interpolation.
 
 ## Docs Updates
 
-Update line_annotation_fibers.md, spec.md, status and task log.
+Update fiber annotation documentation, spec, status and task log.
 
 ## Review
 
-Independent agent tool unavailable; local diff and regression review instead.
+Local review only; no independent agent tool available.
 
 ## Changelog
 
-Record removal of the runtime ribbon regression.
+Record removal of the separate correction frame pipeline.

@@ -221,7 +221,7 @@ TEST_CASE("Fiber display normals use the cut tangent and preserve unset controls
     CHECK(reset.resetControls[0] == 0);
     points[12][1] = 5;
     const auto tangent = displayTangentAt(points, 8.0);
-    CHECK(cv::norm(tangent - cv::Vec3d(8, 5, 0)) < 1e-6); // Stable +/-4 display window.
+    CHECK(cv::norm(tangent - cv::Vec3d(1, 0, 0)) < 1e-6); // Regular central chord.
     const auto moved = fiberDisplayField(points, normals, {8}, {cv::Vec3d(0, -1, 0)});
     CHECK(cv::norm(moved.controlTangents[0] - *displayUnit(tangent)) < 1e-6);
     const double pi = std::acos(-1.0);
@@ -611,6 +611,82 @@ TEST_CASE("Display normal override rotates both ribbons without changing model n
     CHECK(cv::norm(corrected.lineUpVectors.front() - cv::Vec3f(0, 1, 0)) < 1e-5);
     const auto after = vc::lasagna::buildLineViewSurfaces(model);
     CHECK(cv::norm(*baseline.lineSurface->rawPointsPtr(), *after.lineSurface->rawPointsPtr()) == 0);
+}
+
+TEST_CASE("Display normal axes choose the short rotation for either saved sign")
+{
+    using namespace vc::fiber_tracer;
+    const double pi = std::acos(-1.0);
+    const cv::Vec3d tangent{1,0,0}, baseline{0,0,1};
+    const auto almostReversed = rotateDisplayNormal(baseline, tangent, 179*pi/180);
+    REQUIRE(displayNormalOffset(baseline, almostReversed, tangent));
+    CHECK(*displayNormalOffset(baseline, almostReversed, tangent) ==
+          doctest::Approx(-pi/180));
+    CHECK(*displayNormalOffset(baseline, -almostReversed, tangent) ==
+          doctest::Approx(-pi/180));
+    CHECK(interpolateDisplayOffset({0,1}, {85*pi/180,-85*pi/180}, 0.5) ==
+          doctest::Approx(pi/2));
+    std::vector<cv::Vec3f> points, normals;
+    for (int i=0; i<=20; ++i) {
+        points.emplace_back(i,0,0);
+        normals.emplace_back(0,0,1);
+    }
+    const auto a = fiberDisplayField(points,normals,{0,10,20},
+        {baseline,almostReversed,baseline});
+    const auto b = fiberDisplayField(points,normals,{0,10,20},
+        {-baseline,-almostReversed,-baseline});
+    for (size_t i=0; i<points.size(); ++i) {
+        CHECK(cv::norm(a.normals[i]-b.normals[i]) < 1e-5);
+        CHECK(a.normals[i].dot(normals[i]) > 0.99);
+    }
+    auto model = lineModel();
+    vc::lasagna::LineViewConfig config;
+    config.orientedPointNormals.assign(3, cv::Vec3f(baseline));
+    config.displayPointNormals = {cv::Vec3f(baseline),cv::Vec3f(almostReversed),cv::Vec3f(-baseline)};
+    const auto views = vc::lasagna::buildLineViewSurfaces(model,config);
+    for (auto surface : {views.lineSurface,views.lineSideSlice}) {
+        const auto& grid = *surface->rawPointsPtr();
+        for (int i=1; i<grid.cols; ++i)
+            CHECK((grid(6,i)-grid(0,i)).dot(grid(6,i-1)-grid(0,i-1)) > 0);
+    }
+}
+
+TEST_CASE("Corrected normals use exactly the ordinary construction pipeline")
+{
+    auto model = lineModel();
+    model.points[1].position = {1,0.2,0};
+    model.points[2].position = {2,0,0};
+    vc::lasagna::LineViewConfig config;
+    config.controlPointLinePositions = {0,1,2};
+    config.displayPointNormals = {{0,0,1},{0,0.4f,0.916515f},{0,0,-1}};
+    const auto corrected = vc::lasagna::buildLineViewSurfaces(model,config);
+    auto injected = model;
+    for (size_t i=0; i<model.points.size(); ++i)
+        injected.points[i].sampledNormal = {cv::Vec3d(config.displayPointNormals[i]),true,{}};
+    config.orientedPointNormals = config.displayPointNormals;
+    config.displayPointNormals.clear();
+    const auto ordinary = vc::lasagna::buildLineViewSurfaces(injected,config);
+    CHECK(cv::norm(*ordinary.lineSurface->rawPointsPtr(),
+                   *corrected.lineSurface->rawPointsPtr()) == 0);
+    CHECK(cv::norm(*ordinary.lineSideSlice->rawPointsPtr(),
+                   *corrected.lineSideSlice->rawPointsPtr()) == 0);
+    CHECK(ordinary.lineUpVectors == corrected.lineUpVectors);
+}
+
+TEST_CASE("Equal CP axes do not inherit a half turn from the sampled baseline")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<cv::Vec3f> points, normals;
+    const cv::Vec3d up{0,0,1}, tangent{1,0,0};
+    for (int i=0; i<=20; ++i) {
+        points.emplace_back(i*0.1f,0,0);
+        normals.emplace_back(rotateDisplayNormal(up,tangent,i*170.0/20*std::acos(-1.0)/180));
+    }
+    const auto field = fiberDisplayField(points,normals,{0,20},{up,-up});
+    for (const auto& n : field.normals) CHECK(std::abs(n.dot(cv::Vec3f(up))) > 0.99999);
+    const auto baseline = fiberDisplayField(points,normals,{0,20},{std::nullopt,std::nullopt});
+    for (size_t i=0; i<points.size(); ++i)
+        CHECK(std::abs(baseline.normals[i].dot(normals[i])) > 0.99999);
 }
 
 TEST_CASE("Zero display correction preserves smoothed ribbon geometry")

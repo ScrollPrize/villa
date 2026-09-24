@@ -346,10 +346,18 @@ the source with its vector; resets omit both JSON fields.
 
 Ribbons use ordinary QuadSurface geometry, rendering and indexed projection.
 Only construction resamples the polyline at the existing support spacing and
-builds transported, roll-smoothed frames with manual angular corrections.
+builds transported, roll-smoothed frames from the corrected input normals.
 No cubic strip upsampling or custom runtime surface evaluator is permitted.
-Cross views retain windowed display tangents. CP displacement remains cubic,
+CP correction and cross views share the ordinary central-chord tangent.
+CP displacement remains cubic,
 with zero derivatives at stationary controls and outer local-edit boundaries.
+
+Display normals are sign-ambiguous axes, including stored CP corrections.
+Offset recovery and interpolation use the shortest rotation modulo pi.
+Interpolate target axes in a common transported reference, never by adding
+interpolated offsets to independently rotating baselines. Feed the resulting
+normal field through ordinary alignment and strip construction with no
+post-construction correction rotations. Uncorrected spans retain sampled normals.
 
 The annotation toolbar has **Fiber width** (base voxels; 0 means unset) and
 **CP angle offset** (degrees). The angle control selects the nearest CP within

@@ -4996,7 +4996,7 @@ cv::Vec3f LineAnnotationDialog::interpolatedLineTangent(double linePosition) con
     }
     const double maxPosition = static_cast<double>(_generatedViews.linePoints.size() - 1);
     linePosition = std::clamp(linePosition, 0.0, maxPosition);
-    // Share the stable windowed display tangent with normal editing.
+    // Share the regular line-view tangent with normal editing.
     cv::Vec3f tangent(vc::fiber_tracer::displayTangentAt(_generatedViews.linePoints, linePosition));
     if (cv::norm(tangent) <= 1.0e-6f) {
         return {std::numeric_limits<float>::quiet_NaN(),
@@ -5031,7 +5031,7 @@ cv::Vec3f LineAnnotationDialog::interpolatedLineUp(double linePosition, const cv
                 std::numeric_limits<float>::quiet_NaN(),
                 std::numeric_limits<float>::quiet_NaN()};
     }
-    if (!_generatedViews.hasManualDisplayNormals && lowerUp.dot(upperUp) < 0.0f) {
+    if (lowerUp.dot(upperUp) < 0.0f) {
         upperUp *= -1.0f;
     }
 
@@ -5068,7 +5068,7 @@ cv::Vec3f LineAnnotationDialog::interpolatedOrientedNormal(double linePosition) 
         cv::norm(upperNormal) <= 1.0e-6f) {
         return nan;
     }
-    if (!_generatedViews.hasManualDisplayNormals && lowerNormal.dot(upperNormal) < 0.0f) {
+    if (lowerNormal.dot(upperNormal) < 0.0f) {
         upperNormal = -upperNormal;
     }
 

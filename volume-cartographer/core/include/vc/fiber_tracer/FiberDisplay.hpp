@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 #include "vc/core/util/ArcHermite.hpp"
+#include "vc/core/util/LineFrameGeometry.hpp"
 
 namespace vc::fiber_tracer {
 
@@ -103,7 +104,9 @@ inline std::optional<double> displayNormalOffset(cv::Vec3d baseline, cv::Vec3d n
     const auto b = projectDisplayNormal(normal, tangent);
     const auto t = displayUnit(tangent);
     if (!a || !b || !t) return std::nullopt;
-    return std::atan2(t->dot(a->cross(*b)), a->dot(*b));
+    // Normals describe an axis: n and -n are the same annotation.
+    return std::remainder(std::atan2(t->dot(a->cross(*b)), a->dot(*b)),
+                          std::acos(-1.0));
 }
 
 inline double fiberWidthFromJson(const nlohmann::json& root)
@@ -136,18 +139,22 @@ inline cv::Vec3d displayVectorAt(const std::vector<cv::Vec3f>& values, double po
     return cv::Vec3d(values[i]) * (1 - t) + cv::Vec3d(values[j]) * t;
 }
 
-// Windowed tangent stabilizes cross views and normal editing on dense noisy traces.
+// Use the regular line-view tangent, including at correction controls.
 inline cv::Vec3d displayTangentAt(const std::vector<cv::Vec3f>& points, double position)
 {
     if (points.size() < 2) return {};
     const double last = double(points.size() - 1);
     position = std::clamp(position, 0.0, last);
-    return displayVectorAt(points, std::min(last, position + 4.0)) -
-           displayVectorAt(points, std::max(0.0, position - 4.0));
+    const size_t i = size_t(position), j = std::min(i+1,points.size()-1);
+    const auto at = [&](size_t k) {
+        return vc::geometry::lineTangent(points.size(), k,
+            [&](size_t l) { return points[l]; });
+    };
+    return displayUnit(at(i)*(1-(position-i)) + at(j)*(position-i)).value_or(at(i));
 }
 
 // C1 smooth, bounded interpolation. Zero controls stay exactly zero; shortest
-// circular interpolation avoids a full turn at the +/-pi branch cut.
+// Axis interpolation chooses the shorter rotation, considering both signs.
 inline double interpolateDisplayOffset(const std::vector<double>& arcs,
                                       const std::vector<double>& angles, double arc)
 {
@@ -157,10 +164,11 @@ inline double interpolateDisplayOffset(const std::vector<double>& arcs,
     const size_t j = size_t(std::upper_bound(arcs.begin(), arcs.end(), arc) - arcs.begin());
     double t = (arc - arcs[j - 1]) / (arcs[j] - arcs[j - 1]);
     t = t * t * (3 - 2 * t);
-    return angles[j - 1] + t * std::remainder(angles[j] - angles[j - 1], 2 * std::acos(-1.0));
+    return angles[j - 1] + t * std::remainder(angles[j] - angles[j - 1], std::acos(-1.0));
 }
 struct FiberDisplayField {
     std::vector<cv::Vec3f> normals;
+    std::vector<cv::Vec3f> sampledNormals;
     std::vector<cv::Vec3d> controlBaselines, controlTangents;
     std::vector<double> controlOffsets;
     std::vector<size_t> resetControls;
@@ -172,10 +180,14 @@ inline std::optional<cv::Vec3d> inheritedFiberDisplayNormal(
     const FiberDisplayField& field, const std::vector<double>& controlArcs,
     double arc, double linePosition)
 {
-    if (controlArcs.size() != field.controlOffsets.size() ||
-        interpolateDisplayOffset(controlArcs, field.controlOffsets, arc) == 0.0)
+    (void)arc;
+    if (controlArcs.size() != field.controlOffsets.size())
         return std::nullopt;
-    return displayUnit(displayVectorAt(field.normals, linePosition));
+    const auto normal = displayUnit(displayVectorAt(field.normals, linePosition));
+    const auto baseline = displayUnit(displayVectorAt(field.sampledNormals, linePosition));
+    if (!normal || (baseline && std::abs(normal->dot(*baseline)) >= 1.0-1e-12))
+        return std::nullopt;
+    return normal;
 }
 
 inline FiberDisplayField fiberDisplayField(
@@ -185,6 +197,7 @@ inline FiberDisplayField fiberDisplayField(
 {
     FiberDisplayField out;
     out.normals = normals;
+    out.sampledNormals = normals;
     if (points.size() < 2 || points.size() != normals.size() || positions.size() != manualNormals.size())
         return out;
     std::vector<double> arcs(points.size(), 0.0), controlArcs;
@@ -193,6 +206,18 @@ inline FiberDisplayField fiberDisplayField(
         if (i) arcs[i] = arcs[i - 1] + cv::norm(points[i] - points[i - 1]);
         tangents[i] = cv::Vec3f(displayTangentAt(points, double(i)));
     }
+    // One transported reference frame for the entire fiber, not one baseline
+    // angle per CP. Interpolate target axes in this common frame.
+    std::vector<cv::Vec3f> references(points.size());
+    auto initial = projectDisplayNormal(cv::Vec3d(normals.front()), cv::Vec3d(tangents.front()));
+    if (!initial) initial = projectDisplayNormal({0,0,1}, cv::Vec3d(tangents.front()));
+    if (!initial) initial = projectDisplayNormal({0,1,0}, cv::Vec3d(tangents.front()));
+    references.front() = cv::Vec3f(*initial);
+    for (size_t i=1; i<points.size(); ++i)
+        references[i] = cv::Vec3f(vc::geometry::transportFrameNormal(
+            cv::Vec3d(references[i-1]), cv::Vec3d(tangents[i-1]), cv::Vec3d(tangents[i])));
+    std::vector<double> targetAngles;
+    std::vector<bool> corrected;
     for (size_t i = 0; i < positions.size(); ++i) {
         const double p = std::clamp(positions[i], 0.0, double(points.size() - 1));
         const size_t k = size_t(p), j = std::min(k + 1, points.size() - 1);
@@ -202,19 +227,36 @@ inline FiberDisplayField fiberDisplayField(
         out.controlBaselines.push_back(baseline.value_or(cv::Vec3d{}));
         out.controlTangents.push_back(tangent.value_or(cv::Vec3d{}));
         double angle = 0.0;
+        auto target = baseline;
+        bool hasCorrection = false;
         if (manualNormals[i]) {
             const auto projected = projectDisplayNormal(*manualNormals[i], tangent.value_or(cv::Vec3d{}));
             if (!projected) out.resetControls.push_back(i);
-            else if (baseline) angle = *displayNormalOffset(*baseline, *projected, *tangent);
+            else {
+                target = projected;
+                hasCorrection = true;
+                if (baseline) angle = *displayNormalOffset(*baseline, *projected, *tangent);
+            }
         }
         out.controlOffsets.push_back(angle);
+        corrected.push_back(hasCorrection);
+        targetAngles.push_back(target && tangent ? displayNormalOffset(
+            displayVectorAt(references,p), *target, *tangent).value_or(0.0) : 0.0);
     }
     for (size_t i = 0; i < points.size(); ++i) {
         const auto tangent = displayUnit(cv::Vec3d(tangents[i]));
         const auto baseline = projectDisplayNormal(cv::Vec3d(normals[i]), tangent.value_or(cv::Vec3d{}));
-        if (tangent && baseline)
-            out.normals[i] = cv::Vec3f(rotateDisplayNormal(*baseline, *tangent,
-                interpolateDisplayOffset(controlArcs, out.controlOffsets, arcs[i])));
+        if (tangent && baseline && !controlArcs.empty()) {
+            const size_t right = std::min(size_t(std::upper_bound(
+                controlArcs.begin(),controlArcs.end(),arcs[i])-controlArcs.begin()),
+                controlArcs.size()-1);
+            const size_t left = arcs[i] >= controlArcs.back() ? right : (right ? right-1 : 0);
+            if (corrected[left] || corrected[right])
+                out.normals[i] = cv::Vec3f(rotateDisplayNormal(cv::Vec3d(references[i]), *tangent,
+                    interpolateDisplayOffset(controlArcs, targetAngles, arcs[i])));
+            if (i > 0 && out.normals[i-1].dot(out.normals[i]) < 0)
+                out.normals[i] *= -1;
+        }
     }
     return out;
 }

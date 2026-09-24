@@ -2,6 +2,13 @@
 
 ## 2026-09-24
 
+- Unified corrections with ordinary normal-input alignment and strip construction;
+  shared the regular line tangent and interpolated targets in a transported frame
+  to avoid inheriting baseline half turns between close CPs.
+
+- Display normal corrections consider both equivalent signs, interpolate the
+  shortest axis rotation and preserve sign continuity in constructed strips.
+
 - Removed the regressed analytic ribbon renderer/projection. Strips again use
   ordinary QuadSurface grids, smoothed construction frames and indexed picking;
   cross views retain windowed tangents. Manual offsets rotate baseline frames.

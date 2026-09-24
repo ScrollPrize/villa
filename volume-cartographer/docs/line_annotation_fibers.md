@@ -217,11 +217,20 @@ the cross-row spacing are independent constants
 
 Ribbons are ordinary QuadSurfaces constructed at the existing support spacing.
 Construction resamples the stored polyline and transports/sign-aligns/roll-smooths
-its frames. Manual angular corrections rotate those baseline frames instead of
-replacing them with raw normals. Rendering, depth normals, picking, intersections
+its frames. Corrected normals replace the display input normals before this
+same pipeline; no separate rotation is applied to finished frames.
+Rendering, depth normals, picking, intersections
 and export all use the same support grid. No cubic strip upsampling or custom
-render-time interpolation is used. Cross views retain the windowed (+/-4 points)
-tangent and linear center interpolation. Volume LOD is unchanged.
+render-time interpolation is used. CP editing and cross views share the regular
+central-chord line tangent (one-sided at endpoints), interpolated between samples.
+Centers remain linear and volume LOD is unchanged.
+
+Saved display normals are axes: both signs describe the same cross-section.
+Offsets choose the smallest rotation around the fiber (at most 90 degrees),
+and target axes interpolate in a common parallel-transported reference frame,
+not as corrections added to a rotating Lasagna baseline. Unset CPs target the
+Lasagna normal; spans with no corrected endpoints retain their sampled normals.
+The ordinary construction pipeline owns all subsequent alignment and smoothing.
 
 CP movement uses a cubic displacement field over the original chord arclength.
 It preserves the requested CP positions and only replaces the existing adjacent

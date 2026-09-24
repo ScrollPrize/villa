@@ -39,9 +39,8 @@ struct LineViewConfig {
     // frame mesh normals AND the display up vectors agree with these on a
     // cosine-weighted majority. Empty/mismatched/all-invalid -> legacy signs.
     std::vector<cv::Vec3f> orientedPointNormals;
-    // Display-only normals paired with orientedPointNormals. Their angular
-    // difference rotates the smoothed frames at construction; never optimize
-    // against these or replace the baseline frame with them.
+    // Display-only replacements for sampled normals, fed through the ordinary
+    // resampling, alignment and smoothing pipeline. Never use for optimization.
     // Size-matched input controls both ribbons and the cut-plane up vectors.
     std::vector<cv::Vec3f> displayPointNormals;
     // Build one PlaneSurface per line point into lineZSlices. VC3D's line
