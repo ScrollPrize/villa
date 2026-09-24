@@ -1020,10 +1020,12 @@ canonical targets are merged by support-weighted radius; conflicting radii
 and supported targets at or below the fixed origin are reported as ordering
 violations. Such conflicting constraints cannot all be exact.
 
-Pinned fits default to a B-spline flow on a 24-voxel lattice, the patch DT
-loss from step 500 (`loss_start_patch_dt`, at or before
-`model_pins_warmup_steps`, since DT is the only term that moves fractional
-targets toward integers) and the pair-agreement warm-up loss below. Verified
+Pinned fits default to a B-spline flow on a 24-voxel lattice and the warm-up
+they were evaluated from: 5000 unpinned steps, 5000 more with the
+pair-agreement loss below (`loss_start_pair_agreement`), then pins
+(`model_pins_warmup_steps`) and the patch DT loss (`loss_start_patch_dt`,
+the only term that moves fractional targets toward integers) together at
+step 10000. Verified
 patches whose pins contradict their neighbours about relative winding are
 demoted (left unpinned, `model_pin_demote_conflicting_patches`), re-checked
 against the current free map every 1000 steps; each decision is appended to
@@ -1050,7 +1052,8 @@ this representation change.
 
 ### Pair-agreement warm-up loss
 
-`loss_weight_pair_agreement` (default 512) adds a loss on the *free* map for
+`loss_weight_pair_agreement` (default 512, from step
+`loss_start_pair_agreement` = 5000) adds a loss on the *free* map for
 the warm-up before pinning: pairs of verified-patch quad centres that belong to
 different constraint components and lie within
 `loss_pair_agreement_tolerance_voxels` of each other must differ by a whole

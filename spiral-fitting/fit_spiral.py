@@ -5571,7 +5571,8 @@ class FitContext:
         # are active, since the pin targets are read off the free map. The
         # pairs come from the pin constraint graph, so without pins it is off.
         weight_pair_agreement = float(self.config.get('loss_weight_pair_agreement', 0.0) or 0.0)
-        if weight_pair_agreement > 0 and self.pin_graph is not None:
+        if (weight_pair_agreement > 0 and self.pin_graph is not None
+                and iteration >= int(self.config['loss_start_pair_agreement'])):
             pairs, pair_zyx = self._pair_agreement_pairs()
             count = min(int(self.config['sample_count_pair_agreement']), int(pairs.shape[0]))
             if count > 0:

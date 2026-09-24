@@ -236,6 +236,8 @@ _PIN_DESCRIPTIONS = {
         "Weight of the pair-agreement loss: nearby quad centres of different "
         "constraint components must differ by a whole number of windings "
         "under the free map (0 = off). Inactive without model_pins_enabled."),
+    "loss_start_pair_agreement": (
+        "First iteration at which the pair-agreement loss acts."),
     "loss_margin_pair_agreement": (
         "Hinge margin of the pair-agreement loss, in windings."),
     "loss_pair_agreement_tolerance_voxels": (
@@ -660,7 +662,10 @@ class Config:
         # pinned, monotone radial map, with one fractional winding coordinate
         # per constraint component (the model's pin_targets parameter).
         self.model_pins_enabled = True
-        self.model_pins_warmup_steps = 500
+        # The warm-up the pinned fit was evaluated from
+        # (pinned_spiral_consolidation_plan.md): 5000 plain unpinned steps,
+        # 5000 more with the pair-agreement loss, then pins and DT together.
+        self.model_pins_warmup_steps = 10000
         self.model_pin_patch_grid_stride = 1
         self.model_pin_kernel_spacing_factor = 1.5
         self.model_pin_kernel_min_arc_voxels = 3.0
@@ -866,6 +871,8 @@ class Config:
         # within the tolerance, capped at max_pairs (seeded), of which
         # sample_count_pair_agreement are drawn per step.
         self.loss_weight_pair_agreement = 512.0
+        # First iteration at which the pair-agreement loss acts.
+        self.loss_start_pair_agreement = 5000
         self.loss_margin_pair_agreement = 0.05
         self.loss_pair_agreement_tolerance_voxels = 30.0
         self.loss_pair_agreement_stride = 4
@@ -889,10 +896,10 @@ class Config:
         self.model_sym_dirichlet_finite_difference_epsilon = 4.0
         self.optimizer_weight_decay_gap_expander = 0.01
         self.optimizer_weight_decay_flow_field = 0.0
-        # At or before model_pins_warmup_steps: DT is the only term that moves
+        # = model_pins_warmup_steps: DT is the only term that moves
         # fractional pin targets toward integers, and started at activation it
         # adds 5-15 points of strict area (pinned_spiral_status.md).
-        self.loss_start_patch_dt = 500
+        self.loss_start_patch_dt = 10000
         self.loss_start_track_dt = 25000
         # First iteration after which the unattached-PCL (fiber strip) DT snap
         # acts. None follows loss_start_patch_dt, the historical coupling.

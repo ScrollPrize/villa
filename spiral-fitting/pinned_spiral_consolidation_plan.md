@@ -88,8 +88,10 @@ The pinned fit was re-applied on top of the spiral simplification (#1871), with:
   targets; the overlay is always coloured by the strict profile);
 - the ray-specialised pinned gap path dropped along with its only caller (the phase
   bundle, removed by #1871);
-- the Keep defaults applied: B-spline flow at lattice 24, `loss_weight_pair_agreement`
-  512 (inactive without pins), `loss_start_patch_dt` 500 (= `model_pins_warmup_steps`);
+- the Keep defaults applied, as the warm-up of the decision experiment below: B-spline
+  flow at lattice 24; 5000 unpinned steps, then `loss_weight_pair_agreement` 512 from
+  `loss_start_pair_agreement` 5000 (inactive without pins); pins and patch DT from
+  10000 (`model_pins_warmup_steps`, `loss_start_patch_dt`);
 - `diag_pairs_ckpt.py` moved in as `tests/diag_pin_pairs.py` (CLI arguments instead of
   hard-coded paths). The per-experiment `diag_*.py` under `spiral-out/` are outside the
   repository and were left for manual deletion.
