@@ -39,6 +39,7 @@ import json
 import glob
 import shutil
 import subprocess
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import click
@@ -325,6 +326,68 @@ def max_composite(tif_paths):
     return composite
 
 
+def strip_jpg_paths(collect_dir, name):
+    """Return the primary image and numbered tiles currently belonging to a strip."""
+    tile_prefix = f'{name}.'
+    paths = []
+    for entry in os.scandir(collect_dir):
+        if not entry.is_file():
+            continue
+        filename = entry.name
+        if filename == f'{name}.jpg':
+            paths.append(entry.path)
+            continue
+        tile_index = (
+            filename[len(tile_prefix):-4]
+            if filename.startswith(tile_prefix) and filename.endswith('.jpg')
+            else ''
+        )
+        if tile_index.isdigit():
+            paths.append(entry.path)
+    return paths
+
+
+def remove_strip_jpgs(collect_dir, name):
+    for path in strip_jpg_paths(collect_dir, name):
+        os.remove(path)
+
+
+def write_strip_jpgs(strip8, name, collect_dir, max_strip_width):
+    """Stage all JPEG tiles before replacing this strip's previous outputs."""
+    width = strip8.shape[1]
+    with tempfile.TemporaryDirectory(prefix='.render-', dir=collect_dir) as staging_dir:
+        if width <= max_strip_width:
+            staged = os.path.join(staging_dir, f'{name}.jpg')
+            Image.fromarray(strip8).save(staged, quality=95)
+        else:
+            n_tiles = (width + max_strip_width - 1) // max_strip_width
+            for tile_idx in range(n_tiles):
+                x0 = tile_idx * max_strip_width
+                x1 = min(width, x0 + max_strip_width)
+                staged = os.path.join(staging_dir, f'{name}.{tile_idx:03d}.jpg')
+                Image.fromarray(strip8[:, x0:x1]).save(staged, quality=95)
+
+        # Don't discard a previous usable render until every replacement image is ready.
+        remove_strip_jpgs(collect_dir, name)
+        for filename in sorted(os.listdir(staging_dir)):
+            os.replace(
+                os.path.join(staging_dir, filename),
+                os.path.join(collect_dir, filename),
+            )
+    return width
+
+
+def publish_render_tifs(per_mesh_ink, tif_paths):
+    """Replace cached slice TIFFs only after vc_render_tifxyz completed successfully."""
+    for filename in os.listdir(per_mesh_ink):
+        if filename.lower().endswith('.tif'):
+            path = os.path.join(per_mesh_ink, filename)
+            if os.path.isfile(path):
+                os.remove(path)
+    for tif_path in tif_paths:
+        shutil.move(tif_path, os.path.join(per_mesh_ink, os.path.basename(tif_path)))
+
+
 @click.command(help=__doc__)
 @click.argument('meshes_dir', type=click.Path(exists=True, file_okay=False))
 @click.option('--volume', required=True, help='Ink volume zarr path')
@@ -520,43 +583,30 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentatio
 
     # Render ink from each (flattened, if enabled) mesh and max-composite it into a strip jpg.
     def render(name, concat_path):
-        # These paths are reused across runs. Remove this strip's previous jpg(s)
-        # and its prior slice tifs so an empty/partial new render cannot be
-        # masked by stale nonzero output and then reported as successful.
-        tile_prefix = f'{name}.'
-        for filename in os.listdir(collect_dir):
-            is_primary = filename == f'{name}.jpg'
-            tile_index = (
-                filename[len(tile_prefix):-4]
-                if filename.startswith(tile_prefix) and filename.endswith('.jpg')
-                else ''
-            )
-            if is_primary or tile_index.isdigit():
-                os.remove(os.path.join(collect_dir, filename))
-
         per_mesh_ink = os.path.join(concat_path, 'ink')
         os.makedirs(per_mesh_ink, exist_ok=True)
-        for filename in os.listdir(per_mesh_ink):
-            if filename.lower().endswith('.tif'):
-                os.remove(os.path.join(per_mesh_ink, filename))
-        render_cmd = [
-            vc_render_bin,
-            '--segmentation', concat_path,
-            '--scale', str(scale),
-            '--group-idx', str(group_idx),
-            '--volume', volume,
-            '--tif-output', per_mesh_ink,
-            '--num-slices', str(num_slices),
-        ]
-        if scale_segmentation != 1.0:
-            render_cmd += ['--scale-segmentation', str(scale_segmentation)]
-        if remote_url:
-            render_cmd += ['--remote-url', remote_url]
-        subprocess.run(render_cmd, check=True)
-        tif_paths = sorted(glob.glob(os.path.join(per_mesh_ink, '*.tif')))
-        if not tif_paths:
-            return None
-        return max_composite(tif_paths)
+        # Render to a private staging directory. If vc_render_tifxyz fails, retain the
+        # previous TIFFs/JPGs; a successful empty render replaces the old TIFFs below,
+        # so stale nonzero slices cannot make the max-composite look valid.
+        with tempfile.TemporaryDirectory(prefix='.render-', dir=per_mesh_ink) as staging_dir:
+            render_cmd = [
+                vc_render_bin,
+                '--segmentation', concat_path,
+                '--scale', str(scale),
+                '--group-idx', str(group_idx),
+                '--volume', volume,
+                '--tif-output', staging_dir,
+                '--num-slices', str(num_slices),
+            ]
+            if scale_segmentation != 1.0:
+                render_cmd += ['--scale-segmentation', str(scale_segmentation)]
+            if remote_url:
+                render_cmd += ['--remote-url', remote_url]
+            subprocess.run(render_cmd, check=True)
+            tif_paths = sorted(glob.glob(os.path.join(staging_dir, '*.tif')))
+            comp = max_composite(tif_paths) if tif_paths else None
+            publish_render_tifs(per_mesh_ink, tif_paths)
+        return comp
 
     rendered_strips = 0
     empty_strips = []
@@ -566,6 +616,7 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentatio
             name = futures[future]
             comp = future.result()
             if comp is None:
+                remove_strip_jpgs(collect_dir, name)
                 print(f'[{n + 1}/{len(render_items)}] {name}: WARNING no tifs produced, skipping')
                 continue
             empty = not np.any(comp)
@@ -576,26 +627,23 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentatio
                       'Check the mesh/volume frames (--scale-segmentation, --scale, --group-idx)')
                 empty_strips.append(name)
                 if fail_on_empty:
+                    # This render completed, so any prior image no longer represents its
+                    # current output. Remove it rather than leave a stale success artifact.
+                    remove_strip_jpgs(collect_dir, name)
                     continue
             strip = comp.astype(np.float32)
             p95 = np.percentile(strip, 95)
             strip = np.clip(strip / p95, 0, 1) * 255 if p95 > 0 else strip
             strip8 = strip.astype(np.uint8)
-            width = strip8.shape[1]
-            # Chop strips wider than --max-strip-width into fixed-width jpg tiles
-            # (<name>.NNN.jpg) without downsampling; narrower strips stay one <name>.jpg.
+            # Stage all JPGs before replacing old outputs. This keeps the last usable
+            # strip if image encoding fails midway through writing a tiled result.
+            width = write_strip_jpgs(strip8, name, collect_dir, max_strip_width)
             if width <= max_strip_width:
                 out_path = os.path.join(collect_dir, f'{name}.jpg')
-                Image.fromarray(strip8).save(out_path, quality=95)
                 print(f'[{n + 1}/{len(render_items)}] wrote {out_path} '
                       f'({width}px wide, p95={p95:.1f})')
             else:
                 n_tiles = (width + max_strip_width - 1) // max_strip_width
-                for t in range(n_tiles):
-                    x0 = t * max_strip_width
-                    x1 = min(width, x0 + max_strip_width)
-                    tile_path = os.path.join(collect_dir, f'{name}.{t:03d}.jpg')
-                    Image.fromarray(strip8[:, x0:x1]).save(tile_path, quality=95)
                 print(f'[{n + 1}/{len(render_items)}] wrote {n_tiles} tiles '
                       f'{name}.000-{n_tiles - 1:03d}.jpg ({width}px wide total, '
                       f'p95={p95:.1f})')

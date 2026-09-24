@@ -17,7 +17,7 @@ import render_ink
 
 
 class RenderInkPathTests(unittest.TestCase):
-    def _invoke_render(self, array, extra_args=(), *, stale_outputs=False):
+    def _invoke_render(self, array, extra_args=(), *, stale_outputs=False, render_failure=False):
         meshes_dir = Path("meshes")
         mesh = meshes_dir / "w001_spliced"
         mesh.mkdir(parents=True, exist_ok=True)
@@ -46,6 +46,8 @@ class RenderInkPathTests(unittest.TestCase):
 
         def fake_run(cmd, **_kwargs):
             commands.append(cmd)
+            if render_failure:
+                raise subprocess.CalledProcessError(1, cmd)
             output_dir = Path(cmd[cmd.index("--tif-output") + 1])
             output_dir.mkdir(parents=True, exist_ok=True)
             Image.fromarray(array.astype(np.uint8)).save(output_dir / "slice.tif")
@@ -142,6 +144,35 @@ class RenderInkPathTests(unittest.TestCase):
             )
             self.assertFalse((meshes_dir / "ink" / "w001-001_flat.jpg").exists())
             self.assertFalse((meshes_dir / "ink" / "w001-001_flat.000.jpg").exists())
+
+    def test_successful_render_replaces_stale_tiles_with_current_width(self):
+        with CliRunner().isolated_filesystem():
+            result, _commands, meshes_dir = self._invoke_render(
+                np.full((4, 10), 200, dtype=np.uint8),
+                ("--max-strip-width", "4"),
+                stale_outputs=True,
+            )
+            self.assertEqual(result.exit_code, 0)
+            output_dir = meshes_dir / "ink"
+            self.assertFalse((output_dir / "w001-001_flat.jpg").exists())
+            self.assertTrue((output_dir / "w001-001_flat.000.jpg").exists())
+            self.assertTrue((output_dir / "w001-001_flat.001.jpg").exists())
+            self.assertTrue((output_dir / "w001-001_flat.002.jpg").exists())
+            self.assertFalse((output_dir / "w001-001_flat.003.jpg").exists())
+
+    def test_failed_renderer_preserves_previous_tifs_and_jpgs(self):
+        with CliRunner().isolated_filesystem():
+            result, _commands, meshes_dir = self._invoke_render(
+                np.zeros((4, 10), dtype=np.uint8),
+                stale_outputs=True,
+                render_failure=True,
+            )
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertTrue(
+                (meshes_dir / "concat" / "w001-001" / "ink" / "stale.tif").exists()
+            )
+            self.assertTrue((meshes_dir / "ink" / "w001-001_flat.jpg").exists())
+            self.assertTrue((meshes_dir / "ink" / "w001-001_flat.000.jpg").exists())
 
     def test_no_fail_on_empty_writes_black_jpg_with_warning(self):
         with CliRunner().isolated_filesystem():
