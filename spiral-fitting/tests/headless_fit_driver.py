@@ -1,14 +1,12 @@
-"""Golden-run driver: one short headless fit, executed the same way the
+"""Headless fit driver: one short headless fit, executed the same way the
 fit_spiral CLI drives it, with dataset locations supplied by a JSON spec
 instead of edits to fit_spiral module globals.
 
-This is the measurement half of the golden-run characterization harness
-(REFACTOR_PLAN.md, PR 1 commit 0). It is meant to run as a subprocess so
-each run gets a fresh interpreter, CUDA context, and RNG state:
+    python tests/headless_fit_driver.py <spec.json> <result.json> <out_dir>
 
-    python tests/golden_run_driver.py <spec.json> <result.json> <out_dir>
-
-It records, into <result.json>:
+The default spec is tests/headless_fit_spec.json (z 10000-11000, 401
+iterations, on the local PHercParis4 dataset; needs a GPU, ~1 minute). It
+records, into <result.json>:
   - the fully resolved (z-range-scaled) config actually used;
   - every wandb.log payload from the training loop (the per-loss-family
     traces emitted every 200 iterations), tensors converted to floats;
@@ -19,9 +17,19 @@ It records, into <result.json>:
     preserved;
   - the parsed satisfied_fitted.json metrics.
 
-The assertion half lives in tests/test_golden_run.py; tolerance bands are
-calibrated by tests/record_golden_run.py from repeated runs of unmodified
-code.
+This is an A/B tool, not a test with a stored baseline: run it once on the
+unmodified code and once on the change, in fresh subprocesses, and diff the
+two result files. Iteration-0 metrics are deterministic; later iterations
+vary run to run from GPU nondeterminism (umbilicus_loss by ~15%, the other
+losses by under 1%), so compare those as trends rather than exactly. The
+structural leaves (config, checkpoint structure, RNG hashes, satisfied entry
+identities and counts) should match exactly across a numerics-preserving
+change. (A calibrated golden-bands version of this harness existed until
+September 2026; it was never re-recorded after the dataset changed and was
+removed rather than maintained.)
+
+tests/rebuild_equivalence_driver.py shares this module's config resolution
+and checkpoint-structure helpers.
 """
 
 import glob
@@ -39,16 +47,11 @@ sys.path.insert(0, SPIRAL_DIR)
 Z_RANGE_SCALED_COUNT_KEYS = (
     'sample_count_patches_per_step',
     'sample_count_patches_per_step_for_dt',
-    'sample_count_unverified_patches_per_step',
-    'sample_count_unverified_patches_per_step_for_dt',
     'sample_count_relative_winding_pcls',
     'sample_count_absolute_winding_pcls',
     'sample_count_unattached_pcls_per_step',
     'sample_count_tracks_per_step',
     'sample_count_dense_normal_points',
-    'sample_count_dense_spacing_pairs',
-    'sample_count_dense_spacing_density_extra_pairs',
-    'sample_count_dense_attachment_points',
     'sample_count_regularisation_points',
     'sample_count_shell_samples',
 )
@@ -119,7 +122,6 @@ def _checkpoint_structure(checkpoint):
         'spiral_outward_sense': checkpoint.get('spiral_outward_sense'),
         'lasagna_scale': checkpoint.get('lasagna_scale'),
         'lasagna_group': checkpoint.get('lasagna_group'),
-        'surf_sdt_fingerprint': checkpoint.get('surf_sdt_fingerprint'),
         'input_manifest': checkpoint.get('input_manifest'),
         'preview_first_winding': checkpoint.get('preview_first_winding'),
         'cfg_keys': sorted(checkpoint.get('cfg', {}).keys()),
@@ -135,8 +137,7 @@ def _canonicalize_satisfied(satisfied):
     """Sort entry lists by identity: patch/PCL load order is not
     deterministic run-to-run, only the set of entries is."""
     canonical = dict(satisfied)
-    for key, identity in (('patches', 'id'), ('unverified_patches', 'id'),
-                          ('pcls', 'name')):
+    for key, identity in (('patches', 'id'), ('pcls', 'name')):
         entries = canonical.get(key)
         if isinstance(entries, list):
             canonical[key] = sorted(
@@ -151,7 +152,6 @@ def _satisfied_aggregates(satisfied):
     aggregates = {}
     for key, satisfied_field, total_field in (
             ('patches', 'satisfied_area', 'total_area'),
-            ('unverified_patches', 'satisfied_area', 'total_area'),
             ('pcls', 'satisfied_points', 'total_points')):
         entries = satisfied.get(key) or []
         total_satisfied = sum(entry[satisfied_field] for entry in entries)
@@ -170,7 +170,7 @@ def run(spec_path, result_path, out_dir):
         spec = json.load(spec_file)
 
     os.makedirs(out_dir, exist_ok=True)
-    # Mesh export is slow and exercises no fitting behavior; keep the golden
+    # Mesh export is slow and exercises no fitting behavior; keep the driver
     # run focused on the training loop and checkpoint.
     os.environ.setdefault('FIT_SPIRAL_SKIP_SAVE_MESH', '1')
 
@@ -180,7 +180,7 @@ def run(spec_path, result_path, out_dir):
     import fit_spiral as fs
     from config import Config, FitConfig
     from fit_session import conventional_input_paths, load_scroll_spec
-    from spiral_helpers import SAMPLING_COUNT_FLOORS, scale_counts_for_z_range
+    from spiral_helpers import scale_counts_for_z_range
 
     # The dataset's spiral-scroll.json supplies the physical scroll facts;
     # inputs follow the conventional layout it describes.
@@ -201,7 +201,6 @@ def run(spec_path, result_path, out_dir):
     scale_counts_for_z_range(
         config, config['z_begin'], config['z_end'],
         REFERENCE_Z_RANGE_NUM_SLICES, Z_RANGE_SCALED_COUNT_KEYS,
-        floors=SAMPLING_COUNT_FLOORS,
     )
     fit_config = FitConfig(config)
 
@@ -253,7 +252,7 @@ def run(spec_path, result_path, out_dir):
     }
     with open(result_path, 'w') as result_file:
         json.dump(result, result_file, indent=2, sort_keys=True)
-    print(f'golden-run driver: wrote {result_path}')
+    print(f'headless fit driver: wrote {result_path}')
 
 
 if __name__ == '__main__':

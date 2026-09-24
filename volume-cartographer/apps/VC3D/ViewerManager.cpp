@@ -466,6 +466,9 @@ void ViewerManager::unregisterViewer(VolumeViewerBase* viewer)
         return;
     }
 
+    if (_pendingLinkedCursorSource == viewer) {
+        _pendingLinkedCursorSource = nullptr;
+    }
     emit baseViewerClosing(viewer);
     if (_segmentationModule) {
         _segmentationModule->detachViewer(viewer);
@@ -1995,6 +1998,32 @@ void ViewerManager::broadcastLinkedCursor(VolumeViewerBase* source,
     if (!_mirrorCursorToSegmentation && point.has_value()) {
         return;
     }
+    _pendingLinkedCursorSource = source;
+    _pendingLinkedCursorPoint = point;
+    if (!point.has_value()) {
+        // Clears (cursor left a viewer, mirroring turned off) apply at once and
+        // supersede any point still waiting for the timer.
+        flushLinkedCursor();
+        return;
+    }
+    if (!_linkedCursorTimer) {
+        _linkedCursorTimer = new QTimer(this);
+        _linkedCursorTimer->setSingleShot(true);
+        _linkedCursorTimer->setInterval(16);  // ~one global render tick
+        connect(_linkedCursorTimer, &QTimer::timeout, this, [this]() { flushLinkedCursor(); });
+    }
+    if (!_linkedCursorTimer->isActive()) {
+        _linkedCursorTimer->start();
+    }
+}
+
+void ViewerManager::flushLinkedCursor()
+{
+    if (_linkedCursorTimer) {
+        _linkedCursorTimer->stop();
+    }
+    auto* source = _pendingLinkedCursorSource;
+    const auto point = _pendingLinkedCursorPoint;
     forEachBaseViewer([source, &point](VolumeViewerBase* viewer) {
         if (viewer != source) {
             viewer->setLinkedCursorVolumePoint(point);

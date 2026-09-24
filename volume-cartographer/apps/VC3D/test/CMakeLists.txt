@@ -10,6 +10,22 @@ add_test(NAME line_annotation_adjacent_links COMMAND test_line_annotation_adjace
 vc_register_test_target(test_line_annotation_adjacent_links)
 vc_register_ctest(line_annotation_adjacent_links test_line_annotation_adjacent_links)
 
+add_executable(test_intersection_layer_item
+    test_intersection_layer_item.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/IntersectionLayerItem.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/IntersectionLayerItem.hpp)
+set_target_properties(test_intersection_layer_item PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_intersection_layer_item PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_intersection_layer_item PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Test Qt6::Widgets)
+add_test(NAME intersection_layer_item COMMAND test_intersection_layer_item)
+vc_register_test_target(test_intersection_layer_item)
+vc_register_ctest(intersection_layer_item test_intersection_layer_item)
+set_tests_properties(intersection_layer_item PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 add_executable(test_spiral_input_draft test_spiral_input_draft.cpp)
 set_target_properties(test_spiral_input_draft PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)

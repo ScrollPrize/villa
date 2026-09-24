@@ -1,7 +1,7 @@
 """Rebuild-equivalence driver: is a model-stage rebuild the session a full
 build would have produced?
 
-Builds a resident-style FitContext from the golden run spec, rebuilds its
+Builds a resident-style FitContext from the headless fit spec, rebuilds its
 model stage with one MODEL_STAGE_KEYS setting changed, and records the
 structure of the checkpoint that session would write. Then builds a second
 context from scratch with that same value and records its structure too. The
@@ -31,12 +31,12 @@ SPIRAL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SPIRAL_DIR)
 sys.path.insert(0, os.path.join(SPIRAL_DIR, 'tests'))
 
-from golden_run_driver import (  # noqa: E402
+from headless_fit_driver import (  # noqa: E402
     REFERENCE_Z_RANGE_NUM_SLICES, Z_RANGE_SCALED_COUNT_KEYS,
     _checkpoint_structure)
 
 REBUILD_KEY = 'model_num_flow_stages'
-REBUILD_VALUE = 2
+REBUILD_VALUE = 3  # the default is 2; a rebuild that kept the old model must fail
 
 
 class _ResidentDriver:
@@ -48,7 +48,7 @@ class _ResidentDriver:
 
 def _resolved_config(spec, extra=None):
     from config import Config
-    from spiral_helpers import SAMPLING_COUNT_FLOORS, scale_counts_for_z_range
+    from spiral_helpers import scale_counts_for_z_range
 
     config = Config().as_dict()
     config.update(spec.get('config_overrides', {}))
@@ -59,7 +59,6 @@ def _resolved_config(spec, extra=None):
     scale_counts_for_z_range(
         config, config['z_begin'], config['z_end'],
         REFERENCE_Z_RANGE_NUM_SLICES, Z_RANGE_SCALED_COUNT_KEYS,
-        floors=SAMPLING_COUNT_FLOORS,
     )
     return config
 

@@ -20,13 +20,9 @@ def filter_known_config_keys(values, allowed, *, label, warn=print):
 _ENUMS = {
     "model_flow_integration_solver": ["rk4"],
     "model_flow_field_type": ["cartesian", "cylindrical", "bspline", "bspline_cylindrical"],
-    "track_crossing_mode": ["count", "track_walk"],
     "track_radius_target": ["mean", "median"],
-    "dense_spacing_mode": ["phase", "grad_mag", "winding_model"],
-    "dense_spacing_support_policy": ["product", "minimum"],
+    "dense_spacing_mode": ["grad_mag", "winding_model"],
     "dt_target_mode": ["strip_median", "whole_object_quantile"],
-    "dense_spacing_density_lambda": [
-        "inverse_gap", "soft_mass", "soft_mass_wide"],
 }
 
 _NULL_TYPES = {
@@ -34,7 +30,6 @@ _NULL_TYPES = {
     "track_length_bin_weights": "vector",
     "track_max_tortuosity": "number",
     "loss_start_track_dt": "integer",
-    "loss_start_unverified_patch_dt": "number",
     "loss_start_unattached_pcl_dt": "integer",
     "patch_uuid_filter_regex": "string",
 }
@@ -66,8 +61,6 @@ SHELL_ATLAS_KEYS = frozenset({
 _SCALE_WITH_Z_FIELDS = {
     "sample_count_patches_per_step",
     "sample_count_patches_per_step_for_dt",
-    "sample_count_unverified_patches_per_step",
-    "sample_count_unverified_patches_per_step_for_dt",
     "sample_count_relative_winding_pcls",
     "sample_count_absolute_winding_pcls",
     "sample_count_unattached_pcls_per_step",
@@ -75,12 +68,9 @@ _SCALE_WITH_Z_FIELDS = {
     "sample_count_dense_normal_points",
     "sample_count_fiber_direction_points",
     "sample_count_regularisation_points",
-    "sample_count_dense_spacing_pairs",
-    "sample_count_dense_spacing_density_extra_pairs",
     "sample_count_winding_model_relative_pairs",
     "sample_count_winding_model_density_pairs",
     "sample_count_minimum_spacing_independent_samples",
-    "sample_count_dense_attachment_points",
     "sample_count_shell_samples",
 }
 
@@ -89,8 +79,8 @@ _SCALE_WITH_Z_FIELDS = {
 # every effect so nothing treats them as cheap run-boundary knobs:
 #   - host input filtering: patches, PCLs, unattached strips, and tracks are
 #     loaded/kept only where they intersect [z_begin, z_end);
-#   - dense-store coverage: the Lasagna normal/grad-mag and surf-SDT brick
-#     pools are materialised for exactly this z window;
+#   - dense-store coverage: the Lasagna normal/grad-mag brick pools are
+#     materialised for exactly this z window;
 #   - count scaling: every scale_with_z sample count is scaled by the number
 #     of slices in the range relative to the 9500-slice reference;
 #   - rendering/preview: the preview/export z window and the output-directory
@@ -110,8 +100,6 @@ _Z_RANGE_DESCRIPTIONS = {
 _INPUT_TOGGLE_DESCRIPTIONS = {
     "input_use_verified_patches":
         "Load verified patches and allow their radius/DT supervision.",
-    "input_use_unverified_patches":
-        "Load unverified patches and allow their radius/DT supervision.",
     "input_use_tracks":
         "Load tracks and allow track sampling and losses.",
     "input_use_fibers":
@@ -134,8 +122,6 @@ _INPUT_TOGGLE_DESCRIPTIONS = {
         "Load drawn-control-point point-collection inputs.",
     "input_use_normals":
         "Allow dense normal stores, sampling, and normal-dependent losses.",
-    "input_use_surf_sdt":
-        "Allow the surface-SDT store and SDT-dependent phase losses.",
     "input_use_gradient_magnitude":
         "Allow gradient-magnitude dense-spacing supervision.",
     "input_use_winding_inference":
@@ -143,55 +129,6 @@ _INPUT_TOGGLE_DESCRIPTIONS = {
     "input_use_outer_shell":
         "Allow outer-shell losses, lookup maps, and shell-based track filtering.",
 }
-
-# These fields were added after durable checkpoints already existed. Missing
-# values are unambiguous: historical fits used every available input, so a
-# missing toggle means True. Checkpoint readers use this mapping instead of
-# weakening strict schema checks for unrelated future fields.
-BACKFILLABLE_CONFIG_DEFAULTS = {
-    key: True for key in _INPUT_TOGGLE_DESCRIPTIONS
-}
-BACKFILLABLE_CONFIG_DEFAULTS.update({
-    # Historical checkpoints used an unbounded exponential gap map and used
-    # model_gap_expander_num_windings for both the physical estimate and the
-    # allocated lattice extent.  The checkpoint loader migrates their tensors;
-    # these defaults make the added semantic fields schema-compatible too.
-    "model_gap_expander_capacity_windings": DEFAULT_GAP_EXPANDER_CAPACITY,
-    "model_gap_expander_min_gap": 1.0,
-    "model_gap_expander_softplus_bias": 4.0,
-    # Fiber classification thresholds for radial offsets and patch-side linking.
-    "pcl_vertical_fiber_min_z_fraction": 0.8,
-    "pcl_vertical_fiber_min_auto_certainty": 0.5,
-    # The vertical-fiber radial offset postdates durable checkpoints; missing
-    # means it was off.
-    "pcl_vertical_fiber_radial_offset_enabled": False,
-    "pcl_vertical_fiber_radial_offset_voxels": 4.0,
-    # Unattached-PCL (fiber) DT historically started with the verified-patch
-    # DT; missing means that coupling.
-    "loss_start_unattached_pcl_dt": None,
-    # Point-to-patch linking settings postdate durable checkpoints; missing
-    # means the historical fixed tolerance, single-point choice and no fiber
-    # side rules.
-    "pcl_link_distance_tolerance": 2.5,
-    "pcl_link_window_points": 1,
-    "pcl_link_window_min_points": 1,
-    "pcl_fiber_link_side_filter": False,
-    "pcl_fiber_link_side_margin_voxels": 0.5,
-    "pcl_fiber_link_model_direction_step": 10000,
-})
-# The flow-gradient conditioning settings postdate durable checkpoints;
-# missing means off, which is exactly the earlier behaviour.
-BACKFILLABLE_CONFIG_DEFAULTS.update({
-    "optimizer_flow_grad_smoothing": False,
-    "optimizer_flow_grad_smoothing_sigma_voxels": 32.0,
-    "optimizer_flow_lazy_moments": False,
-    "optimizer_flow_grad_smoothing_across_sigma_voxels": 0.0,
-    "optimizer_flow_grad_smoothing_low_res_sigma_voxels": 0.0,
-    "model_flow_field_low_res_lr_scale": 1.0,
-    "optimizer_flow_shared_second_moment": False,
-    "optimizer_flow_shared_second_moment_clip_quantile": 0.99,
-    "optimizer_flow_grad_clip_median_multiple": 0.0,
-})
 
 _PCL_LINK_DESCRIPTIONS = {
     "pcl_link_distance_tolerance": (
@@ -306,7 +243,7 @@ _OPTIMIZER_DESCRIPTIONS = {
         "direction. 0 disables clipping. Logs the bound and clipped fraction."),
     "optimizer_flow_lazy_moments": (
         "Use SparseAdam-style masked updates on dense flow gradients: "
-        "entries with zero gradient after conditioning and influence masks "
+        "entries with zero gradient after conditioning "
         "retain their moments and receive no gradient update. Smoothing can "
         "activate entries without direct samples. Preserves history through "
         "quiet steps, including stale momentum, and does not correct first "
@@ -333,14 +270,6 @@ CHECKPOINT_MODEL_SHAPE_KEYS = (
     "model_initial_dr_per_winding", "model_linear_z_resolution",
 )
 
-
-# Configuration keys retired from the schema. Checkpoint loaders accept these
-# stored keys after validating their values in checkpoint_migrations.
-RETIRED_CONFIG_KEYS = frozenset({
-    # The leading axis now holds stationary flow stages. Old checkpoints with
-    # more than one interpolated time sample are refused during migration.
-    "model_num_flow_timesteps",
-})
 
 
 # Configuration keys whose every consumer is built by
@@ -646,9 +575,6 @@ class Config:
         self.sample_count_patches_per_step = 360
         self.sample_count_patches_per_step_for_dt = 240
         self.sample_count_points_per_patch = 800
-        self.sample_count_unverified_patches_per_step = 120
-        self.sample_count_unverified_patches_per_step_for_dt = 80
-        self.sample_count_unverified_points_per_patch = 800
         self.sample_count_relative_winding_pcls = 48
         self.sample_count_relative_winding_patch_pairs_per_pcl = 4
         self.sample_count_absolute_winding_pcls = 48
@@ -660,21 +586,12 @@ class Config:
         self.sample_count_dense_normal_points = 60000
         self.sample_count_fiber_direction_points = 60000
         self.sample_count_regularisation_points = 4500
-        self.sample_count_dense_spacing_pairs = 12000
-        self.sample_count_dense_spacing_count_extra_pairs = 0
-        self.sample_count_dense_spacing_density_extra_pairs = 24000
-        self.sample_count_dense_spacing_density_chunk_pairs = 24000
         self.sample_count_winding_model_relative_pairs = 128000
         self.sample_count_winding_model_density_pairs = 128000
         self.sample_count_minimum_spacing_independent_samples = 2000
-        self.sample_count_dense_attachment_points = 20000
         self.sample_count_patch_dt_target_points = 256
         self.sample_count_dt_target_points_per_strip = 512
         self.sample_count_shell_samples = 24576
-        self.sample_count_influence_footprint_points = 2048
-        self.sample_count_influence_anchor_lattice_points = 100000
-        self.sample_count_influence_anchor_geometry_points = 100000
-        self.sample_count_influence_anchor_samples_per_step = 4096
         # Exponent applied to patch areas when building patch sampling
         # probabilities: 0 = uniform, 1 = proportional to area.
         self.patch_sampling_area_exponent = 0.5
@@ -684,7 +601,6 @@ class Config:
         # used by losses. Loss weights and sample counts remain unchanged so
         # re-enabling a source restores its previous tuning.
         self.input_use_verified_patches = True
-        self.input_use_unverified_patches = True
         self.input_use_tracks = False
         self.input_use_fibers = True
         self.input_use_fiber_directions = False
@@ -693,7 +609,6 @@ class Config:
         self.input_use_pcl_same_winding = True
         self.input_use_pcl_drawn_control_points = True
         self.input_use_normals = True
-        self.input_use_surf_sdt = False
         self.input_use_gradient_magnitude = True
         self.input_use_winding_inference = True
         self.input_use_outer_shell = True
@@ -701,13 +616,6 @@ class Config:
         # When set, only patch directory entries (uuid-named) whose name
         # matches this regex (re.search) are loaded; None loads everything.
         self.patch_uuid_filter_regex = None
-        self.patch_unverified_patch_radius_loss_margin = 0.025
-        self.patch_unverified_patch_radius_loss_inv = False
-        self.patch_unverified_patch_radius_within_norm_p = 3.0
-        self.patch_unverified_patch_dt_norm_p = 0.5
-        self.patch_unverified_patch_dt_within_patch_norm_p = 3.0
-        self.patch_unverified_patch_dt_loss_margin = 0.025
-        self.patch_unverified_patch_exclusion_radius = 64.0
         self.pcl_rel_winding_adjacent_patches_only = True
         self.pcl_stratified_pcl_sampling = True
         self.pcl_sampling_weights = None
@@ -772,12 +680,6 @@ class Config:
         self.track_max_tortuosity = None
         self.track_crossing_precompute_max = 8
         self.track_max_track_crossing_per_step = 2
-        self.track_crossing_mode = "count"
-        self.track_min_walk_steps_per_track = 24
-        self.track_max_walk_steps_per_track = 256
-        self.track_min_walks_per_track = 2
-        self.track_max_walks_per_track = 4
-        self.track_walk_minimum_cycle_travel = 20.0
         self.track_exclusion_radius = 16.0
         self.track_radius_target = "mean"
         self.track_radius_loss_margin = 0.025
@@ -791,48 +693,10 @@ class Config:
         self.dense_spacing_mode = "winding_model"
         self.winding_model_relative_pair_delta = [3, 15]
         self.winding_model_huber_delta = 0.5
-        self.dense_spacing_pair_m_short = [
-            3,
-            7
-        ]
-        self.dense_spacing_pair_m_long = [
-            5,
-            15
-        ]
-        self.dense_spacing_pair_long_fraction = 0.15
-        self.dense_spacing_count_temperature_wv = 0.5
-        self.dense_spacing_target_step_wv = 1.0
-        self.dense_spacing_max_step_wv = 2.0
-        self.dense_spacing_max_steps = 1400
-        self.dense_spacing_step_oversample = 1.25
-        self.dense_spacing_use_support_gate = True
-        self.dense_spacing_support_sigma = 4.0
-        self.dense_spacing_support_floor_alpha = 0.05
-        self.dense_spacing_support_policy = "product"
-        self.dense_spacing_phase_huber_delta = 0.5
-        self.dense_spacing_phase_extension_windings = 1.0
-        self.dense_spacing_phase_min_center_gap_wv = 4.0
-        self.dense_spacing_phase_graze_dot = 0.4
-        self.dense_spacing_phase_graze_depth_wv = 1.0
-        self.dense_spacing_phase_window_windings = 0.75
-        self.dense_spacing_phase_end_free_margin_windings = 0.5
-        self.dense_spacing_phase_missing_cost = 0.55
-        self.dense_spacing_phase_missing_extend_cost = 0.55
-        self.dense_spacing_phase_extra_cost = 0.7
-        self.dense_spacing_phase_extra_extend_cost = 0.7
-        self.dense_spacing_phase_temperature = 0.1
-        self.dense_spacing_phase_band_confidence_cost = 0.25
-        self.dense_spacing_phase_top2_margin = 0.1
-        self.dense_spacing_phase_min_matched_windings = 2
-        self.dense_spacing_phase_min_matched_mass = 1.0
         self.loss_weight_min_spacing = 2.0
-        self.loss_weight_dense_spacing_count = 0.0
         self.loss_weight_dense_spacing_density = 12.0
-        self.loss_weight_dense_attachment = 0.0
         self.loss_weight_patch_radius = 8.0
         self.loss_weight_patch_dt = 4.0
-        self.loss_weight_unverified_patch_radius = 2.0
-        self.loss_weight_unverified_patch_dt = 1.0
         self.loss_weight_rel_winding = 5.0
         self.loss_weight_abs_winding = 5.0
         self.loss_weight_unattached_pcl_radius = 2.0
@@ -849,14 +713,7 @@ class Config:
         self.loss_weight_dense_spacing = 12.0
         self.loss_weight_umbilicus = 1.25
         self.loss_weight_shell_outer = 1.0
-        self.loss_weight_shell_patch_radius = 0.0
-        self.loss_weight_anchor = 0.0
-        self.dense_spacing_density_min_gap_wv = 0.0
-        self.dense_spacing_density_max_blind_fraction = 0.75
         self.dense_min_spacing_d_min_wv = 6.0
-        self.dense_attachment_scale = 8.0
-        self.dense_attachment_warmup_steps = 3000
-        self.dense_attachment_ramp_steps = 3000
         self.dense_normals_finite_difference_epsilon = 8.0
         self.fiber_directions_finite_difference_epsilon = 8.0
         self.model_sym_dirichlet_finite_difference_epsilon = 4.0
@@ -864,14 +721,9 @@ class Config:
         self.optimizer_weight_decay_flow_field = 0.0
         self.loss_start_patch_dt = 25000
         self.loss_start_track_dt = 25000
-        self.loss_start_unverified_patch_dt = None
         # First iteration after which the unattached-PCL (fiber strip) DT snap
         # acts. None follows loss_start_patch_dt, the historical coupling.
         self.loss_start_unattached_pcl_dt = None
-        self.dt_progressive_windings = False
-        self.dt_progressive_inner_winding = 20
-        self.dt_progressive_steps = 50000
-        self.dt_progressive_exponent = 1.0
         self.dt_target_mode = "strip_median"
         self.dt_target_floating_threshold = 0.25
         # Backward-compatible alias. FitContext phase-locks whole-object DT
@@ -890,14 +742,6 @@ class Config:
         self.shell_table_smooth_sigma_theta = 1.0
         self.shell_min_confidence = 0.25
         self.output_save_png_visualizations = False
-        self.influence_enabled = False
-        self.influence_z = 3000.0
-        self.influence_windings = 5.0
-        self.influence_theta_frac = 0.5
-        self.influence_sigma = 0.3333
-        self.influence_anchor_ramp_power = 2.0
-        self.dense_spacing_density_lambda = "inverse_gap"
-        self.dense_spacing_density_soft_mass_min_gap_wv = 0.0
         self.output_num_slices_for_visualization = 20
 
         defaults = vars(self)
@@ -1004,22 +848,6 @@ class Config:
         }
 
 
-def durable_config(values):
-    """The checkpoint-durable subset of a configuration.
-
-    Interactive influence state is session-scoped and the anchor weight only
-    exists while an influence window is active, so neither is stored in (or
-    expected from) a checkpoint's cfg/requested_config/resolved_config.
-    Checkpoint compatibility checks must compare stored key sets against
-    this durable subset of the schema, not the raw schema.
-    """
-    return {
-        key: item for key, item in dict(values).items()
-        if not key.startswith("interactive_influence_")
-        and key != "loss_weight_anchor"
-    }
-
-
 class FitConfig:
     """The one explicit fitter configuration: a resolved key -> value mapping.
 
@@ -1029,7 +857,7 @@ class FitConfig:
     scaling); FitConfig performs no resolution of its own because the
     resolution policies legitimately differ per entry point (the CLI
     scales-and-splits for DDP, the interactive runtime round-trips
-    checkpoint counts, the golden driver scales without splitting).
+    checkpoint counts, the headless fit driver scales without splitting).
 
     Construction copies the mapping. update() mutates in place, so every
     holder of the same FitConfig (the context, its losses call sites, a

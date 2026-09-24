@@ -1,7 +1,9 @@
 #include "vc/core/util/RemoteCacheSettings.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -87,33 +89,44 @@ fs::path homeDirectory()
     throw std::runtime_error("Cannot determine the user home directory for VC3D settings");
 }
 
-fs::path configuredRemoteCachePath(const fs::path& settingsPath)
+std::string configuredIniValue(
+    const fs::path& settingsPath,
+    std::string_view section,
+    std::string_view key)
 {
     std::ifstream input(settingsPath);
     if (!input)
         return {};
 
-    bool viewerSection = false;
+    bool matchingSection = false;
     std::string line;
     while (std::getline(input, line)) {
         const std::string stripped = trim(line);
         if (stripped.empty() || stripped.front() == ';' || stripped.front() == '#')
             continue;
         if (stripped.front() == '[' && stripped.back() == ']') {
-            viewerSection = stripped == "[viewer]";
+            matchingSection =
+                stripped.size() == section.size() + 2 &&
+                stripped.substr(1, section.size()) == section;
             continue;
         }
-        if (!viewerSection)
+        if (!matchingSection)
             continue;
         const auto separator = stripped.find('=');
         if (separator == std::string::npos ||
-            trim(stripped.substr(0, separator)) != "remote_cache_dir") {
+            trim(stripped.substr(0, separator)) != key) {
             continue;
         }
-        const std::string configured = decodeIniValue(stripped.substr(separator + 1));
-        return configured.empty() ? fs::path{} : pathFromUtf8(configured);
+        return decodeIniValue(stripped.substr(separator + 1));
     }
     return {};
+}
+
+fs::path configuredRemoteCachePath(const fs::path& settingsPath)
+{
+    const auto configured = configuredIniValue(
+        settingsPath, "viewer", "remote_cache_dir");
+    return configured.empty() ? fs::path{} : pathFromUtf8(configured);
 }
 
 fs::path ensureDirectory(fs::path path)
@@ -205,6 +218,22 @@ fs::path remoteCachePath()
         return ensureWritableDirectory(homeDirectory() / ".VC3D" / "remote_cache");
     }();
     return active;
+}
+
+bool remoteCacheDelta3dEnabled()
+{
+    const auto configured = configuredIniValue(
+        settingsFilePath(), "perf", "remote_cache_delta3d");
+    if (configured.empty())
+        return kRemoteCacheDelta3dDefault;
+
+    std::string normalized;
+    normalized.reserve(configured.size());
+    std::transform(
+        configured.begin(), configured.end(), std::back_inserter(normalized),
+        [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+    return normalized == "1" || normalized == "true" || normalized == "yes" ||
+           normalized == "on";
 }
 
 } // namespace vc::settings

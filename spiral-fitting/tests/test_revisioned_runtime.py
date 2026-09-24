@@ -23,14 +23,14 @@ def resident():
     release.set()
     active = {"revision": 1}
 
-    def prepare(records, config, **kwargs):
+    def prepare(records, **kwargs):
         entered.set()
         assert release.wait(5)
         if records[0].get("invalid"):
             raise ValueError("invalid selected draft")
         return SimpleNamespace(
             _workspace_membership=copy.deepcopy(records[0]),
-            verified_patches={}, unverified_patches={})
+            verified_patches={})
 
     def install(candidate):
         active.update(candidate._workspace_membership)
@@ -93,8 +93,7 @@ def test_input_batch_restores_progress_after_preparation(running, outcome):
                                step=0, total_steps=0, unit='patches')
         if outcome == 'invalid':
             raise ValueError('invalid patch')
-        return SimpleNamespace(_workspace_membership={}, verified_patches={},
-                               unverified_patches={})
+        return SimpleNamespace(_workspace_membership={}, verified_patches={})
 
     session._context = SimpleNamespace(
         prepare_input_changes=prepare,
@@ -198,7 +197,7 @@ def test_distributed_decision_requires_all_ranks_prepared(failure):
 
     session._call = call
     result = _apply_input_changes_at_boundary(
-        session, "batch", [{"revision": 2}], {}, timeout=2, distributed=True)
+        session, "batch", [{"revision": 2}], timeout=2, distributed=True)
     assert decisions == [failure is None]
     assert result["applied"] is (failure is None)
 
@@ -225,7 +224,7 @@ def test_distributed_boundary_retry_handles_mixed_reservations(faster_rank):
 
     session._call = call
     result = _apply_input_changes_at_boundary(
-        session, "batch", [{"revision": 2}], {}, timeout=2, distributed=True)
+        session, "batch", [{"revision": 2}], timeout=2, distributed=True)
     assert result["applied"] and result["iteration"] == 8
     assert [name for name, _ in calls] == [
         "reserve_input_boundary", "cancel_input_boundary", "reserve_input_boundary",

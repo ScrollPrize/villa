@@ -7,10 +7,10 @@ even named during host preparation; this checks the other half end to end —
 that the rebuilt session's checkpoint is structurally identical to one built
 from scratch with the same value.
 
-Like the golden run it needs the dataset and a GPU, so it only runs when
-opted in:
+It needs the local dataset (tests/headless_fit_spec.json) and a GPU, so it
+only runs when opted in:
 
-    RUN_GOLDEN=1 uv run python -m pytest tests/test_rebuild_equivalence.py -s
+    RUN_HEADLESS_FIT=1 uv run python -m pytest tests/test_rebuild_equivalence.py -s
 """
 
 import json
@@ -23,12 +23,12 @@ import pytest
 
 SPIRAL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SPEC_PATH = os.environ.get(
-    'GOLDEN_RUN_SPEC', os.path.join(SPIRAL_DIR, 'tests', 'golden', 'run_spec.json'))
+    'HEADLESS_FIT_SPEC', os.path.join(SPIRAL_DIR, 'tests', 'headless_fit_spec.json'))
 
 
 def _skip_reason():
-    if os.environ.get('RUN_GOLDEN') != '1':
-        return 'set RUN_GOLDEN=1 to run the rebuild-equivalence build (GPU)'
+    if os.environ.get('RUN_HEADLESS_FIT') != '1':
+        return 'set RUN_HEADLESS_FIT=1 to run the rebuild-equivalence build (GPU)'
     with open(SPEC_PATH) as spec_file:
         spec = json.load(spec_file)
     if not os.path.isdir(spec['dataset_path']):

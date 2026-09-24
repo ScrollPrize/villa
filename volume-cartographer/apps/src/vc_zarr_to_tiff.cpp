@@ -127,7 +127,10 @@ int main(int argc, char** argv)
         cv::Mat slice(static_cast<int>(Y), static_cast<int>(X), cvType);
         std::vector<size_t> offset = {z, 0, 0};
         std::vector<size_t> regionShape = {1, Y, X};
-        ds->readRegion(offset, regionShape, slice.data);
+        if (!ds->readRegion(offset, regionShape, slice.data)) {
+            std::cerr << "\nError: failed to read slice " << z << " from " << (inRoot / dsName) << "\n";
+            return 1;
+        }
 
         // Write TIFF
         std::ostringstream fname;
