@@ -71,6 +71,39 @@ static double progressInterval()
     return progressRedrawsLine() ? 1.0 : 15.0;
 }
 
+// --- Render statistics (--stats) --------------------------------------------
+// Set once the cache exists; the render loops only see IChunkedArray, which carries no
+// statistics. Resident bytes against the configured capacity is the first thing to check
+// when a render fetches far more than its access pattern should need — a cache sitting
+// above its budget is running on the eviction hard ceiling rather than on capacity, and a
+// cache never reaching it is being emptied by something else.
+static bool g_stats = false;
+static const vc::render::ChunkCache* g_statsCache = nullptr;
+static std::atomic<double> g_secRead{0.0};   // sampling the volume: fetch, decode, interpolate
+static std::atomic<double> g_secWrite{0.0};  // handing the finished band to the writer
+
+static void addSeconds(std::atomic<double>& acc, double v)
+{
+    for (double cur = acc.load(); !acc.compare_exchange_weak(cur, cur + v);) {}
+}
+
+// "  cache 18.4/32.0 GB  inflight 12  net 431 MB/s  read 82% write 3%"
+static std::string statsSuffix(double intervalSeconds)
+{
+    if (!g_stats || !g_statsCache) return {};
+    const auto st = g_statsCache->stats();
+    const double gb = 1024.0 * 1024.0 * 1024.0;
+    const double rd = g_secRead.exchange(0.0), wr = g_secWrite.exchange(0.0);
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "  cache %.1f/%.1f GB  inflight %zu  net %.0f MB/s  read %.0f%% write %.0f%%",
+                  double(st.decodedBytes) / gb, double(st.decodedByteCapacity) / gb,
+                  st.remoteFetchesInFlight, st.remoteDownloadBytesPerSecond / 1e6,
+                  intervalSeconds > 0 ? 100.0 * rd / intervalSeconds : 0.0,
+                  intervalSeconds > 0 ? 100.0 * wr / intervalSeconds : 0.0);
+    return buf;
+}
+
 // Log to file if active, otherwise to the given default stream.
 // When logging to a shared file in multi-part mode, each line is prefixed with the part id.
 static void logPrintf(FILE* defaultStream, const char* fmt, ...)
@@ -660,6 +693,7 @@ static void renderBands(
 
         std::vector<cv::Mat> slices;
 
+        const auto bandT0 = std::chrono::steady_clock::now();
         if (isComposite) {
             // Composite mode: always u8 — callers always instantiate with T=uint8_t.
             // readCompositeFast writes into a pre-allocated buffer (it never calls create), and
@@ -681,7 +715,11 @@ static void renderBands(
             slices = processRawSlices<T>(raw, numSlices, accumOffsets, accumType, cvType, rotQuad, flipAxis);
         }
 
+        const auto bandT1 = std::chrono::steady_clock::now();
         writeSlices(slices, bi, y0);
+        addSeconds(g_secRead, std::chrono::duration<double>(bandT1 - bandT0).count());
+        addSeconds(g_secWrite, std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - bandT1).count());
 
         // Progress (throttled to ~1/sec)
         auto now = std::chrono::steady_clock::now();
@@ -704,10 +742,12 @@ static void renderBands(
                                          : (done > 0 ? elapsed * (double(bandsThis) / done - 1.0) : 0.0);
             const char* prefix = progressRedrawsLine() ? "\r  " : "  ";
             const char* suffix = progressRedrawsLine() ? "" : "\n";
-            logPrintf(stderr, "%sband %u/%u (%d%%)  %.2f bands/s now  %dm%02ds  eta %dm%02ds%s",
+            const std::string probe = statsSuffix(sinceLast);
+            logPrintf(stderr, "%sband %u/%u (%d%%)  %.2f bands/s now  %dm%02ds  eta %dm%02ds%s%s",
                 prefix, done, bandsThis, int(100.0 * done / bandsThis),
                 bandsPerSec,
-                int(elapsed)/60, int(elapsed)%60, int(eta)/60, int(eta)%60, suffix);
+                int(elapsed)/60, int(elapsed)%60, int(eta)/60, int(eta)%60,
+                probe.c_str(), suffix);
         }
     }
     if (progressRedrawsLine()) std::fprintf(stderr, "\n");
@@ -1108,6 +1148,7 @@ int main(int argc, char *argv[])
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
         ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
         ("fetch-concurrency", po::value<size_t>()->default_value(16), "Chunk reads kept in flight (S3 tolerates far more than the default)")
+        ("stats", po::bool_switch()->default_value(false), "Append cache residency, in-flight fetches, download rate and the read/write time split to each progress line")
         ("prefetch-remote", po::bool_switch()->default_value(false), "Prefetch required remote chunks into the existing staged cache before rendering")
         ("remote-url", po::value<std::string>(), "Remote OME-Zarr URL for remote cache streaming/prefetch (optional if --volume cache already records it)")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
@@ -1384,6 +1425,7 @@ int main(int argc, char *argv[])
 
     const size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
     const size_t fetch_concurrency = parsed["fetch-concurrency"].as<size_t>();
+    g_stats = parsed["stats"].as<bool>();
     if (fetch_concurrency == 0) { logPrintf(stderr, "Error: --fetch-concurrency must be positive\n"); return EXIT_FAILURE; }
     logPrintf(stdout, "Chunk fetch concurrency: %zu\n", fetch_concurrency);
     std::unique_ptr<vc::render::ChunkCache> ownedChunkCache;
@@ -1420,6 +1462,8 @@ int main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
     }
+
+    g_statsCache = ownedChunkCache.get();
 
     {
         std::ostringstream oss;
