@@ -696,6 +696,29 @@ class S3SyncManager:
         message = fiber_merge.legacy_regression(local_doc, base_doc)
         return f"Local fiber {message}" if message else None
 
+    def _fiber_remote_regression(self, path, tracked):
+        """For a fiber file about to be downloaded as a plain remote change:
+        the message when the REMOTE copy lost what the last-synced copy had
+        (an older VC3D on another machine re-saved it, dropping adjacent link
+        kinds or version-4 span tags), else None. The remote is fetched only
+        when the base holds something that could be lost. Anything unreadable
+        is not a regression - the ordinary paths deal with it."""
+        if not path.lower().endswith('.json') or not tracked:
+            return None
+        base_doc = self._load_base(path, tracked)
+        if base_doc is None or not fiber_merge.base_carries_regressable_metadata(base_doc):
+            return None
+        remote_doc, tmp = self._fetch_remote_json(path)
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if remote_doc is None or not fiber_merge.is_fiber_doc(remote_doc):
+            return None
+        message = fiber_merge.legacy_regression(remote_doc, base_doc)
+        return f"{self.REMOTE_NAME} fiber {message}" if message else None
+
     def _load_base(self, path, tracked):
         """Return the parsed last-synced (base) version of a file, or None.
 
@@ -1651,8 +1674,16 @@ class S3SyncManager:
                         else:
                             actions[path] = (SyncAction.UPLOAD, "Local file modified")
                     elif s3_changed:
-                        actions[path] = (SyncAction.DOWNLOAD,
-                                         f"{self.REMOTE_NAME} file modified")
+                        regression = self._fiber_remote_regression(path, tracked_info)
+                        if regression:
+                            # An older VC3D on another machine re-saved a fiber
+                            # whose last-synced copy carried adjacent link kinds
+                            # or span tags: installing it here would lose them
+                            # silently. Manual resolution keeps this copy.
+                            actions[path] = (SyncAction.CONFLICT, regression)
+                        else:
+                            actions[path] = (SyncAction.DOWNLOAD,
+                                             f"{self.REMOTE_NAME} file modified")
                     else:
                         actions[path] = (SyncAction.SKIP, "Files are in sync")
                 else:

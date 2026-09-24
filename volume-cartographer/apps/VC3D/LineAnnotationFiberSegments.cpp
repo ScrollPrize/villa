@@ -705,6 +705,9 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         spans[spanIndex] = inclusiveLineSpan(request.linePointsBase, first, last);
         auto& metadata = *owner.segmentToNext;
         const SegmentInterpolationGoal goal = metadata.interpGoal;
+        // Span tags describe the span, not the trace: they come back onto
+        // the rebuilt descriptor together with the goal.
+        const std::vector<std::string> spanTags = metadata.tags;
         if (!attempt[spanIndex]) {
             modes[spanIndex] = metadata.interpMode;
             fixedSpan[spanIndex] = true;
@@ -792,6 +795,7 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
                       request.traceConfig,
                       std::move(traceException));
             owner.segmentToNext->interpGoal = goal;
+            owner.segmentToNext->tags = spanTags;
             if (goal == SegmentInterpolationGoal::Global &&
                 endpointDistanceBaseVoxels < cutoffs.lasagnaMinimumSpanBaseVoxels) {
                 // Too short for the Lasagna fallback's discretization (it would
@@ -824,6 +828,7 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             request.traceConfig,
             *traced);
         owner.segmentToNext->interpGoal = goal;
+        owner.segmentToNext->tags = spanTags;
         modes[spanIndex] = SegmentInterpolationMode::Trace;
         ++output.nativeSegments;
     }
@@ -1110,10 +1115,16 @@ nlohmann::json fiberTraceSegmentMetadataToJson(const FiberTraceSegmentMetadata& 
              {"endpoint_accept_threshold_base_voxels", config.endpointAcceptThresholdBaseVoxels},
          }},
     };
+    // Omitted when empty: a span without tags serializes exactly as in
+    // version 3.
+    if (!metadata.tags.empty()) {
+        json["tags"] = metadata.tags;
+    }
     return json;
 }
 
-FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json& json)
+FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json& json,
+                                                            int fiberVersion)
 {
     if (!json.is_object()) {
         throw std::runtime_error("segment_to_next must be an object");
@@ -1128,17 +1139,24 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
         tracerVersion == FiberTraceSegmentMetadata::TracerVersion;
     if (!currentVersion)
         throw std::runtime_error("unsupported segment_to_next metadata/tracer version");
-    rejectUnknownKeys(
-        json,
-        {"optimizer", "metadata_version", "tracer_version",
-         "interp_goal", "interp_mode", "metric", "msg",
-         "normal_manifest", "fiber_manifest", "trace_to_base_scale",
-         "meeting_error_base_voxels", "meeting_error_ratio",
-         "meeting_source", "failure_code", "failure_detail",
-         "lasagna_failure_code", "lasagna_failure_detail", "config"},
-        "segment_to_next");
+    std::unordered_set<std::string> segmentKeys{
+        "optimizer", "metadata_version", "tracer_version",
+        "interp_goal", "interp_mode", "metric", "msg",
+        "normal_manifest", "fiber_manifest", "trace_to_base_scale",
+        "meeting_error_base_voxels", "meeting_error_ratio",
+        "meeting_source", "failure_code", "failure_detail",
+        "lasagna_failure_code", "lasagna_failure_detail", "config"};
+    // Span tags arrived with format version 4; a version-3 span carrying
+    // them is an unknown field, so the version stays a true signal.
+    if (fiberVersion >= 4) {
+        segmentKeys.insert("tags");
+    }
+    rejectUnknownKeys(json, segmentKeys, "segment_to_next");
 
     FiberTraceSegmentMetadata metadata;
+    if (json.contains("tags")) {
+        metadata.tags = controlPointTagsFromJson(json.at("tags"));
+    }
     metadata.normalManifestLocation = json.at("normal_manifest").get<std::string>();
     metadata.fiberManifestLocation = json.at("fiber_manifest").get<std::string>();
     metadata.traceToBaseScale = json.at("trace_to_base_scale").get<double>();
@@ -1289,6 +1307,150 @@ std::vector<std::string> mergedControlPointTags(const std::vector<std::string>& 
     return merged;
 }
 
+bool controlPointTagsConflict(const std::vector<std::string>& tags) noexcept
+{
+    return hasControlPointTag(tags, kKollesisTerminationTag) && hasControlPointTag(tags, kBreakTag);
+}
+
+bool spanIsGap(const std::optional<FiberTraceSegmentMetadata>& metadata) noexcept
+{
+    return metadata && hasControlPointTag(metadata->tags, kGapSpanTag);
+}
+
+bool spanIsDamaged(const std::optional<FiberTraceSegmentMetadata>& metadata) noexcept
+{
+    return metadata && hasControlPointTag(metadata->tags, kDamagedSpanTag);
+}
+
+bool setSpanTag(std::optional<FiberTraceSegmentMetadata>& metadata, std::string_view tag, bool enabled)
+{
+    // Never creates a descriptor: a control without one is the fiber's final
+    // control (the v3/v4 contract), which owns no span, and the peer-pane
+    // mirroring reaches controls the initiating pane cannot see (a peer that
+    // has since deleted the span's other end).
+    if (!metadata) {
+        return false;
+    }
+    return setControlPointTag(metadata->tags, tag, enabled);
+}
+
+GapSpanSync syncGapSpanTags(std::vector<LineControlPoint>& controls)
+{
+    std::vector<bool> shouldBeGap(controls.size(), false);
+    for (const auto& [lower, upper] : gapSpansForControls(controls)) {
+        (void)upper;
+        shouldBeGap[lower] = true;
+    }
+    GapSpanSync sync;
+    for (size_t i = 0; i < controls.size(); ++i) {
+        auto& metadata = controls[i].segmentToNext;
+        if (shouldBeGap[i]) {
+            if (!metadata) {
+                metadata.emplace();
+                metadata->interpMode = SegmentInterpolationMode::Lasagna;
+                metadata->message = "lasagna";
+            }
+            if (setControlPointTag(metadata->tags, kGapSpanTag, true)) {
+                sync.formed.push_back(i);
+            }
+            // A gap wins over damaged: the span is missing, not merely hurt.
+            setControlPointTag(metadata->tags, kDamagedSpanTag, false);
+        } else if (metadata && setControlPointTag(metadata->tags, kGapSpanTag, false)) {
+            sync.dissolved.push_back(i);
+        }
+    }
+    return sync;
+}
+
+GapSpanSync applyGapSpanPolicy(std::vector<LineControlPoint>& controls)
+{
+    GapSpanSync sync = syncGapSpanTags(controls);
+    for (const size_t owner : sync.formed) {
+        controls[owner].segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+    }
+    for (const size_t owner : sync.dissolved) {
+        auto& metadata = controls[owner].segmentToNext;
+        if (metadata && metadata->interpGoal == SegmentInterpolationGoal::Cspline) {
+            metadata->interpGoal = SegmentInterpolationGoal::Global;
+        }
+    }
+    return sync;
+}
+
+bool applyGapSpanPolicy(std::vector<StoredControlPoint>& controls)
+{
+    std::vector<bool> gapBefore(controls.size(), false);
+    for (size_t i = 0; i < controls.size(); ++i) {
+        gapBefore[i] = spanIsGap(controls[i].segmentToNext);
+    }
+    bool changed = syncGapSpanTags(controls);
+    for (size_t i = 0; i < controls.size(); ++i) {
+        auto& metadata = controls[i].segmentToNext;
+        if (!metadata) {
+            continue;
+        }
+        const bool gapNow = spanIsGap(metadata);
+        if (gapNow && !gapBefore[i] && metadata->interpGoal != SegmentInterpolationGoal::Cspline) {
+            metadata->interpGoal = SegmentInterpolationGoal::Cspline;
+            changed = true;
+        } else if (!gapNow && gapBefore[i] &&
+                   metadata->interpGoal == SegmentInterpolationGoal::Cspline) {
+            metadata->interpGoal = SegmentInterpolationGoal::Global;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+bool syncGapSpanTags(std::vector<StoredControlPoint>& controls)
+{
+    bool changed = false;
+    for (size_t i = 0; i < controls.size(); ++i) {
+        auto& metadata = controls[i].segmentToNext;
+        const bool shouldBeGap = i + 1 < controls.size() &&
+                                 hasControlPointTag(controls[i].tags, kBreakTag) &&
+                                 hasControlPointTag(controls[i + 1].tags, kBreakTag);
+        if (shouldBeGap) {
+            if (!metadata) {
+                metadata.emplace();
+                metadata->interpMode = SegmentInterpolationMode::Lasagna;
+                metadata->message = "lasagna";
+            }
+            changed = setControlPointTag(metadata->tags, kGapSpanTag, true) || changed;
+            changed = setControlPointTag(metadata->tags, kDamagedSpanTag, false) || changed;
+        } else if (metadata) {
+            changed = setControlPointTag(metadata->tags, kGapSpanTag, false) || changed;
+        }
+    }
+    return changed;
+}
+
+std::vector<std::pair<size_t, size_t>> gapSpansForControls(
+    const std::vector<LineControlPoint>& controls)
+{
+    std::vector<size_t> order;
+    order.reserve(controls.size());
+    for (size_t i = 0; i < controls.size(); ++i) {
+        if (std::isfinite(controls[i].linePosition)) {
+            order.push_back(i);
+        }
+    }
+    std::stable_sort(order.begin(), order.end(), [&controls](size_t a, size_t b) {
+        return controls[a].linePosition < controls[b].linePosition;
+    });
+    std::vector<std::pair<size_t, size_t>> spans;
+    for (size_t k = 1; k < order.size(); ++k) {
+        const size_t lower = order[k - 1];
+        const size_t upper = order[k];
+        if (controls[lower].linePosition < controls[upper].linePosition &&
+            hasControlPointTag(controls[lower].tags, kBreakTag) &&
+            hasControlPointTag(controls[upper].tags, kBreakTag)) {
+            spans.emplace_back(lower, upper);
+        }
+    }
+    return spans;
+}
+
 std::vector<std::string> controlPointTagsFromJson(const nlohmann::json& json)
 {
     if (!json.is_array()) {
@@ -1327,13 +1489,14 @@ StoredControlPoint storedControlPointFromJson(const nlohmann::json& json, int fi
     if (fiberVersion == 1) {
         return StoredControlPoint{pointFromJson(json)};
     }
-    if (fiberVersion != 3 || !json.is_object()) {
-        throw std::runtime_error("version-3 control point entries must be objects");
+    if ((fiberVersion != 3 && fiberVersion != 4) || !json.is_object()) {
+        throw std::runtime_error("version-3/4 control point entries must be objects");
     }
     rejectUnknownKeys(json, {"position", "segment_to_next", "tags"}, "control point");
     StoredControlPoint control{pointFromJson(json.at("position"))};
     if (json.contains("segment_to_next")) {
-        control.segmentToNext = fiberTraceSegmentMetadataFromJson(json.at("segment_to_next"));
+        control.segmentToNext =
+            fiberTraceSegmentMetadataFromJson(json.at("segment_to_next"), fiberVersion);
     }
     if (json.contains("tags")) {
         control.tags = controlPointTagsFromJson(json.at("tags"));
@@ -2240,7 +2403,16 @@ MergedSupersededSolve mergeSupersededSolveResult(
     for (size_t i = 0; i < currentSpanCount; ++i) {
         if (adopt[i]) {
             const auto j = static_cast<size_t>(solvedSpanForCurrentSpan[i]);
+            // The solved descriptor carries the span tags of the solve's
+            // snapshot; the current controls are the authority for tags (a
+            // damaged toggle mirrored in during the solve lives only here).
+            const std::vector<std::string> currentSpanTags =
+                out.controls[i].segmentToNext ? out.controls[i].segmentToNext->tags
+                                              : std::vector<std::string>{};
             out.controls[i].segmentToNext = solvedControls[j].segmentToNext;
+            if (out.controls[i].segmentToNext) {
+                out.controls[i].segmentToNext->tags = currentSpanTags;
+            }
         }
     }
     for (size_t k = 0; k < out.controls.size(); ++k) {
