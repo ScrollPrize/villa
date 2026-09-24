@@ -196,6 +196,42 @@ def test_scale_consistency_tolerance_is_configurable(tmp_path) -> None:
     assert permissive["status"] == "PASS"
 
 
+def test_scale_consistency_exact_match_passes_with_unit_tolerance(tmp_path) -> None:
+    rows, columns = np.indices((6, 8), dtype=np.float32)
+    surface = write_surface(
+        tmp_path / "surface",
+        x=1000 + columns * 32,
+        y=2000 + rows * 32,
+        z=np.full((6, 8), 3000, dtype=np.float32),
+        scale=[1 / 32, 1 / 32],
+    )
+
+    report = surface_preflight.inspect_pair(surface, scale_tolerance=1.0)
+    gate = next(gate for gate in report["gates"] if gate["name"] == "tifxyz_scale_consistency")
+
+    assert report["status"] == "PASS"
+    bounds = gate["observed"]["columns"]["median_spacing_bounds_voxels"]
+    assert bounds[0] <= 32.0 <= bounds[1]
+    assert gate["observed"]["columns"]["ratio_range"][0] <= 1.0 <= gate["observed"]["columns"]["ratio_range"][1]
+
+
+def test_scale_consistency_passes_ratio_exactly_at_tolerance(tmp_path) -> None:
+    rows, columns = np.indices((6, 8), dtype=np.float32)
+    surface = write_surface(
+        tmp_path / "surface",
+        x=1000 + columns * 40,
+        y=2000 + rows * 10,
+        z=np.full((6, 8), 3000, dtype=np.float32),
+        scale=[0.05, 0.05],
+    )
+
+    at_tolerance = surface_preflight.inspect_pair(surface, scale_tolerance=2.0)
+    just_inside = surface_preflight.inspect_pair(surface, scale_tolerance=1.95)
+
+    assert at_tolerance["status"] == "PASS"
+    assert just_inside["status"] == "FAIL"
+
+
 def test_bbox_consistency_fails_stale_bbox(tmp_path) -> None:
     rows, columns = np.indices((6, 8), dtype=np.float32)
     surface = write_surface(

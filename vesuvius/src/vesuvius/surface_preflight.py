@@ -240,13 +240,17 @@ def _spacing_summary(
 ) -> dict[str, Any]:
     positive_count = int(histogram.sum())
     median = None
+    median_bounds = None
     if positive_count:
         target = positive_count // 2
         median_bin = int(np.searchsorted(np.cumsum(histogram), target, side="right"))
-        median = float(2 ** ((median_bin - 64 * 20 + 0.5) / 64))
+        exponent = median_bin - 64 * 20
+        median = float(2 ** ((exponent + 0.5) / 64))
+        median_bounds = [float(2 ** (exponent / 64)), float(2 ** ((exponent + 1) / 64))]
     return {
         "pair_count": pair_count,
         "median_spacing_voxels": median,
+        "median_spacing_bounds_voxels": median_bounds,
         "zero_length_pair_count": zero_length,
     }
 
@@ -495,23 +499,34 @@ def _scale_consistency(
     for axis, name in enumerate(("columns", "rows")):
         spacing = scan["grid_spacing_voxels"][name]
         median = spacing["median_spacing_voxels"]
+        median_bounds = spacing["median_spacing_bounds_voxels"]
         pair_count = int(spacing["pair_count"])
         implied_scale = None if median is None else float(1.0 / median)
         ratio = None if median is None else float(median * scale[axis])
+        ratio_range = (
+            None
+            if median_bounds is None
+            else [float(bound * scale[axis]) for bound in median_bounds]
+        )
         observed[name] = {
             "expected_spacing_voxels": float(1.0 / scale[axis]),
             "median_spacing_voxels": median,
+            "median_spacing_bounds_voxels": median_bounds,
             "ratio": ratio,
+            "ratio_range": ratio_range,
             "pair_count": pair_count,
             "implied_scale": implied_scale,
         }
+        # The median is only known to lie within its histogram bin, so the gate
+        # fails only when the whole bin lies outside the tolerated ratio range.
         if (
             failed_axis is None
             and (
                 pair_count == 0
                 or median is None
-                or ratio is None
-                or not ratio_bounds[0] <= ratio <= ratio_bounds[1]
+                or ratio_range is None
+                or ratio_range[1] < ratio_bounds[0]
+                or ratio_range[0] > ratio_bounds[1]
             )
         ):
             failed_axis = name

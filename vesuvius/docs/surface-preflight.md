@@ -44,7 +44,11 @@ The command checks:
 - deterministic, evenly ranked surface samples for nonzero CT signal support.
 
 The `tifxyz_scale_consistency` gate compares the median adjacent grid spacing
-against the reciprocal metadata scale. Adjust its accepted ratio range with
+against the reciprocal metadata scale. The median is estimated from a
+logarithmic histogram (64 bins per octave), so the report also records the
+median bin bounds (`median_spacing_bounds_voxels`, `ratio_range`) and the gate
+fails only when the whole bin falls outside the accepted ratio range; a grid
+exactly at the tolerance boundary passes. Adjust the accepted range with
 `--scale-tolerance` (default `2.0`, minimum `1.0`). When metadata contains a
 `bbox`, the `tifxyz_bbox_consistency` gate checks that all valid coordinates
 fit inside it. Adjust its coverage allowance with `--bbox-tolerance` (default
