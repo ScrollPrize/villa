@@ -1,6 +1,9 @@
 """All flow, ranking and continuation labels come from dense controlled GT."""
 import torch
 import torch.nn.functional as F
+from vesuvius.neural_tracing.fiber_follow.policy import (
+    DEFAULT_CONFIDENCE, DEFAULT_MAX_RECOVERY_DISTANCE, choose_candidate, recovery_allowed,
+)
 
 
 def teacher_candidates(batch, cfg):
@@ -23,14 +26,16 @@ def teacher_candidates(batch, cfg):
     return torch.cat([gt[:, None], jitter, batch['replay_candidates']], 1)
 
 
-def candidate_labels(candidates, batch, tolerance=1.5):
+def candidate_labels(candidates, batch, tolerance=1.5,
+                     max_recovery_distance=DEFAULT_MAX_RECOVERY_DISTANCE):
     """Prefix agreement sampled every 0.5 forward voxel (with default config).
 
     A prefix is positive only when every sampled crossing is annotated and
     within tolerance. A known failure is negative even if later GT is missing.
     Unknown ends are censored. Tagged physical endpoints and already departed
-    states supply explicit negatives. The first prediction is a recovery point:
-    prefixes begin there, allowing a perturbed state to return to its fiber.
+    states supply explicit negatives. The origin-to-first-point connection must
+    obey the same recovery distance limit as tracing. Within that limit, the
+    first point may recover from a displaced origin; GT agreement begins there.
     """
     B, M, K, _ = candidates.shape
     Q = batch['dense_ab'].shape[1]
@@ -42,22 +47,24 @@ def candidate_labels(candidates, batch, tolerance=1.5):
     forward = candidates[..., 0, 2, None]*(1-c)+candidates[..., -1, 2, None]*c
     beyond_end = batch['endpoint_known'][:, None, None].bool() & (forward > batch['end_local'][:, None, 2, None]+1e-4)
     beyond_end = beyond_end & ~known & (batch['end_local'][:, None, 2, None] >= 0)
-    failed = (known & (error > tolerance)) | beyond_end | batch['offtrack'][:, None, None].bool()
+    bad_recovery = ~recovery_allowed(candidates, max_recovery_distance)
+    failed = ((known & (error > tolerance)) | beyond_end
+              | batch['offtrack'][:, None, None].bool() | bad_recovery[..., None])
     failure_prefix = failed.cumsum(-1) > 0
     known_prefix = (known | beyond_end).int().cummin(-1).values.bool()
     indices = torch.linspace(0, Q-1, K, device=candidates.device).round().long()
     target = (~failure_prefix[..., indices]).float()
     mask = (failure_prefix | known_prefix)[..., indices].float()
-    valid_error = (error.clamp(max=8)*known).sum(-1)/known.sum(-1).clamp(min=1)
+    valid_error = torch.where(known, error.nan_to_num(nan=8).clamp(max=8), 0.).sum(-1)/known.sum(-1).clamp(min=1)
     quality = (target*mask).sum(-1)/mask.sum(-1).clamp(min=1) - .1*valid_error
     return target, mask, quality, valid_error
 
 
 def loss_fn(output, batch, cfg, tolerance=1.5, rank_weight=1., confidence_weight=1., flow_weight=1.,
-            rank_temperature=20.):
+            rank_temperature=20., confidence_threshold=DEFAULT_CONFIDENCE, n_commit=4):
     candidates = output['candidates']
-    labels, mask, quality, error = candidate_labels(candidates.detach(), batch, tolerance)
-    M = cfg.n_candidates
+    labels, mask, quality, error = candidate_labels(candidates.detach(), batch, tolerance, cfg.max_recovery_distance)
+    M = cfg.flow_samples
     candidate_valid = torch.ones_like(quality)
     # Synthetic candidates require an annotated first plane and a recoverable state.
     candidate_valid[:, M:M+5] = (batch['plane_mask'][:, :1] * (1-batch['offtrack'][:, None]))
@@ -75,61 +82,74 @@ def loss_fn(output, batch, cfg, tolerance=1.5, rank_weight=1., confidence_weight
     logp = output['ranks'].float().masked_fill(rank_valid == 0, -1e4).log_softmax(-1)
     row_valid = rank_valid.any(-1).float()
     ranking = (-(target*logp).sum(-1)*row_valid).sum()/row_valid.sum().clamp(min=1)
-    # The joint polyline (anchor, cleaned past, future planes) is trained by
-    # flow matching inside the model forward; the sampled candidates the
-    # scorer sees carry no gradient back into the flow.
+    # Future coordinates are trained by flow matching inside the model forward;
+    # the sampled candidates the scorer sees carry no gradient into the flow.
     flow = output['flow_loss']
     with torch.no_grad():
-        chosen = output['ranks'][:, :M].argmax(-1)
+        chosen, commit, allowed = choose_candidate(
+            candidates[:, :M], output['ranks'][:, :M], output['confidence'][:, :M],
+            confidence_threshold, n_commit, cfg.max_recovery_distance)
         b = torch.arange(len(chosen), device=chosen.device)
         eligible = (batch['dense_mask'].sum(-1) > 0).float()*(1-batch['offtrack'])
         denominator = eligible.sum().clamp(min=1)
         oracle_error = error[:, :M].min(-1).values
         selected_error = error[b, chosen]
-        # At the normal maximum commit horizon: defaults to 8 voxels.
-        horizon = min(3, cfg.n_future-1)
-        known = mask[:, :M, horizon].amin(-1)*eligible
-        recall = (labels[:, :M, horizon].amax(-1)*known).sum()/known.sum().clamp(min=1)
-        metrics = dict(flow=flow.item(), flow_past=output['flow_past'].item(), flow_future=output['flow_future'].item(),
+        horizon = min(n_commit, cfg.n_future)-1
+        positive = (labels[:, :M, horizon]*mask[:, :M, horizon]).amax(-1)
+        known = ((positive > 0) | mask[:, :M, horizon].bool().all(-1)).float()*eligible
+        recall = (positive*known).sum()/known.sum().clamp(min=1)
+        mean_oracle_error = (oracle_error*eligible).sum()/denominator
+        accepted = (commit > 0).float()*eligible
+        metrics = dict(flow=flow.item(),
                        flow_known_fraction=output['flow_known_fraction'].item(),
                        ranking=ranking.item(), confidence=confidence.item(),
-                       oracle_error=(oracle_error*eligible).sum().item()/denominator.item(),
+                       oracle_error=mean_oracle_error.item(),
                        selected_error=(selected_error*eligible).sum().item()/denominator.item(),
                        oracle_recall=recall.item(),
-                       candidate_support=output['candidate_support'].float().mean().item(),
-                       selected_support=output['candidate_support'].float()[b, chosen.clamp(max=M-1)].mean().item())
+                       oracle_recall_known_fraction=(known.sum()/denominator).item(),
+                       selected_accept_fraction=(accepted.sum()/denominator).item(),
+                       accepted_selected_error=((selected_error*accepted).sum()/accepted.sum().clamp(min=1)).item(),
+                       selected_commit=commit.float().mean().item(),
+                       candidate_support=output['candidate_support'][:, :M].float().mean().item(),
+                       selected_support=output['candidate_support'].float()[b, chosen].mean().item())
         # How informative the ranking target is: entropy relative to a uniform
         # distribution over the valid candidates (1 = uninformative).
         n_valid = rank_valid.sum(-1).clamp(min=1)
         entropy = -(target*target.clamp(min=1e-12).log()).sum(-1)/n_valid.log().clamp(min=1e-6)
         metrics['rank_target_entropy'] = ((entropy*row_valid).sum()/row_valid.sum().clamp(min=1)).item()
-        # Stop-gate calibration for the rank-selected proposal: false stops
-        # (gate closed on a correct prefix) and false continues (gate open on a
-        # wrong prefix), at the first point and the default commit horizon.
-        conf = output['confidence'][b, chosen].float()
-        for point, name in ((0, 'first'), (horizon, 'commit')):
-            known = mask[b, chosen, point]*eligible
-            positive = labels[b, chosen, point]*known
-            negative = (1-labels[b, chosen, point])*known
-            for thr in (0.3, 0.5, 0.7):
-                closed = (conf[:, point] < thr).float()
+        # Re-select at each threshold: changing the gate can change which
+        # candidate the tracer chooses, not just whether that candidate stops.
+        for thr in (0.3, 0.5, 0.7):
+            gate_chosen, _, _ = choose_candidate(
+                candidates[:, :M], output['ranks'][:, :M], output['confidence'][:, :M],
+                thr, n_commit, cfg.max_recovery_distance)
+            conf = output['confidence'][b, gate_chosen].float().cummin(-1).values
+            for point, name in ((0, 'first'), (horizon, 'commit')):
+                known = mask[b, gate_chosen, point]*eligible
+                positive = labels[b, gate_chosen, point]*known
+                negative = (1-labels[b, gate_chosen, point])*known
+                closed = ((conf[:, point] < thr) | ~allowed[b, gate_chosen]).float()
                 metrics[f'gate{thr:.1f}_{name}_false_stop'] = ((closed*positive).sum()/positive.sum().clamp(min=1)).item()
                 metrics[f'gate{thr:.1f}_{name}_false_go'] = (((1-closed)*negative).sum()/negative.sum().clamp(min=1)).item()
+        for point, name in ((0, 'first'), (horizon, 'commit')):
+            known = mask[b, chosen, point]*eligible
+            negative = (1-labels[b, chosen, point])*known
             metrics[f'gate_{name}_negatives'] = (negative.sum()/known.sum().clamp(min=1)).item()
-        current_mask = batch['clean_mask'][:, 0]
-        current_error = (output['clean_history'][:, 0] - batch['clean_local'][:, 0]).norm(dim=-1)
-        metrics['clean_current_error'] = (current_error*current_mask).sum().item()/current_mask.sum().clamp(min=1).item()
-        from vesuvius.neural_tracing.fiber_follow.history_metrics import TANGENT_POINTS, cleaning_measurements, summarize_cleaning
-        metrics.update(summarize_cleaning(cleaning_measurements(
-            output['clean_history'], batch['hist'], batch['hmask'], batch['clean_local'],
-            batch['clean_mask'], TANGENT_POINTS)))
+        from vesuvius.neural_tracing.fiber_follow.history_metrics import observed_measurements, summarize_history
+        metrics.update(summarize_history(observed_measurements(
+            batch['hist'], batch['hmask'], batch['gt_history'], batch['gt_history_mask'])))
         first_step = output['candidates'][:, :M, 0]
         metrics['candidate_first_step_max'] = first_step.norm(dim=-1).max().item()
+        metrics['candidate_recovery_reject_fraction'] = (~allowed).float().mean().item()
+        metrics['recovery_blocked_fraction'] = (~allowed.any(-1)).float().mean().item()
         first_step = first_step[b, chosen]
         metrics['first_step_length'] = first_step.norm(dim=-1).mean().item()
         metrics['first_step_length_max'] = first_step.norm(dim=-1).max().item()
         metrics['candidate_endpoint_spread'] = output['candidates'][:, :M, -1, :2].std(dim=1, unbiased=False).norm(dim=-1).mean().item()
         first_known = batch['plane_mask'][:, 0]
+        gt_first_length = (batch['plane_ab'][:, 0].square().sum(-1) + cfg.future_step**2).sqrt()
+        metrics['target_recovery_reject_fraction'] = (
+            ((gt_first_length > cfg.max_recovery_distance)*first_known).sum()/first_known.sum().clamp(min=1)).item()
         first_error = (first_step[:, :2] - batch['plane_ab'][:, 0]).norm(dim=-1)
         metrics['first_plane_error'] = (first_error*first_known).sum().item()/first_known.sum().clamp(min=1).item()
         # Report observability separately from annotation validity. Leaving the

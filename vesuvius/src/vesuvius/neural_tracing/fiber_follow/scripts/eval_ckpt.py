@@ -46,7 +46,7 @@ def main(argv=None):
     ap.add_argument('--n', type=int, default=0, help='0 = all eligible seeds')
     ap.add_argument('--tag', default='')
     ap.add_argument('--params', default='{}', help='TraceParams JSON (model only)')
-    ap.add_argument('--history-audit', action='store_true', help='Audit observed/cleaned geometry on held-out follower decisions')
+    ap.add_argument('--history-audit', action='store_true', help='Audit observed-history drift and gate errors on held-out follower decisions')
     ap.add_argument('--fibers', default='/mnt/raid_nvme/spiral_dataset_working/fibers')
     ap.add_argument('--fiber-zarrs', default=None)
     ap.add_argument('--val-z', type=float, nargs=2, default=(45000.0, 48500.0))

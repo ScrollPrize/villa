@@ -1,116 +1,137 @@
 # fiber_follow
 
-## Current experiment: direct history-anchored paths (v7)
+## Current experiment: normalized future flow with fixed observed history (v10)
 
-`direct_paths_v7` predicts continuation coordinates directly from CT, fiber
-presence, and the actual trace history. The follower has no Gaussian prediction
-head, Gaussian targets or loss, per-plane heatmaps, or peak decoder. The smooth
-rendering of observed history remains an **input channel**.
+`future_flow_v10` generates only the 64 future coordinates. The current point
+and actual trace history are fixed conditioning inputs; no history or anchor
+correction is predicted, averaged, or applied to the trace. CT, fiber presence,
+and the smooth rendering of observed history remain the image inputs.
 
-The production preset in `scripts/launch_ct_paths.sh` uses:
+The production preset in `scripts/launch_ct_flow.sh` uses:
 
 | Setting | Value |
 | --- | --- |
 | Inputs | Native level-0 CT, fiber presence, observed history |
 | Crop | 208 × 128 × 128 at 0.5 trace-voxel spacing |
 | Visual support | 32 voxels behind, 71.5 ahead, ±31.75 laterally |
-| Forecast | 6 candidate paths, each 64 points at one forward voxel spacing |
-| Clean history | Current point + previous 32 points |
+| Forecast | 64 future planes at one forward voxel spacing |
+| Fixed tokens | Current point + up to 32 history points + 64 prior-mean observations |
+| Flow | 4 transformer blocks, 4 heads, hidden 128; 4 midpoint steps (8 evaluations) |
+| Residual scales | Per-plane lateral standard deviations fitted from 2,048 training states; floor 1 voxel |
+| Flow patches | 3 × 3 lateral features at 2 trace-voxel pitch, independent of crop spacing |
+| Samples / candidates | All 16 samples scored; support radius 1.5 voxels RMS |
+| Training draws | 32 stratified (time, noise) draws per state against shared image features |
 | Geometry history | Up to 128 previous points |
-| Encoder widths / hidden size | 24, 64, 128 / 128 |
+| Encoder widths / hidden size | 24, 64, 128 / 128; group norm |
 | Train / collector / diagnostic batch | 2 / 1 / 1 |
-| Training | 50,000 steps; 100,000 sampled states |
+| Training | 50,000 steps; 100,000 sampled states; 1,000-step warmup |
+| EMA | Decay ramps to 0.999; collection, diagnostics and inference use EMA |
 | Diagnostics | Every 500 steps, 32 seeds |
 
-CT and presence are independently sampled in the same oriented frame. Both are
-scaled by 255. Presence is a learned input cue; annotated fibers supply labels.
-The crop aligns its forward axis with the current heading so that prediction
-planes have a consistent meaning despite changes in global fiber direction.
+CT and presence are independently sampled in the same oriented frame and
+scaled by 255. Presence is an input cue; annotated fibers supply labels.
+The crop's forward axis follows the actual trace heading.
 
 ### Start and watch
 
 From this directory, with the existing project environment:
 
 ```bash
-bash scripts/launch_ct_paths.sh ct0_presence_paths_v7
-tail -F output/logs/ct0_presence_paths_v7.log
+bash scripts/launch_ct_flow.sh ct0_presence_flow_v10
+tail -F output/logs/ct0_presence_flow_v10.log
 ```
 
 The launcher starts a background process. Run names must be new. Checkpoints,
 `config.json`, `log.jsonl`, images and replay archives live in
-`output/ct0_presence_paths_v7/`. Additional training options go after the name.
-This architecture requires fresh training; no old-checkpoint adapters or old
-Gaussian launcher are retained.
+`output/ct0_presence_flow_v10/`. Additional training options go after the name.
+This architecture requires fresh training. Checkpoints store live weights in `model`,
+EMA weights in `ema`, and fitted scales in `model_cfg.flow_sigma`.
+`--init` restores both weight copies and the fitted scales with an exact configuration
+match, then starts a new optimizer. Collection, evaluation and inference load EMA.
+`--flow-steps` controls midpoint steps; each step evaluates the flow twice.
+`--flow-calibration-states` controls the initial scale-fitting sample count.
+`--flow-stencil-radius` specifies lateral patch pitch/radius in trace voxels.
 
 ## Architecture and supervision
 
-1. A 3D encoder-decoder produces spatial features from the three input channels
-   and local coordinates. The cleaner predicts corrections to the current point
-   and supplied history, capped at four voxels per point. Its loss uses only
-   points that are both annotated and actually supplied.
-2. An ordered history encoder combines observed and cleaned history. Every
-   candidate decoder starts at the cleaned current point, with an initial
-   tangent fitted to six recent corrected points and a learned mode embedding.
-3. A recurrent coordinate decoder advances across all 64 forward planes. At
-   each plane it samples a 3×3 neighborhood of image features around its expected
-   location (radius two voxels), updates its state, and predicts a lateral step.
-   Its state is conditioned on the history throughout the continuation. There
-   is no ground-truth input or teacher forcing in this decoder.
-4. A bidirectional scorer examines each proposed continuation together with
-   the history. Ranking selects a path; prefix confidence controls how far to
-   commit. Candidate coordinates are detached at the scorer input so that
-   classification cannot improve its own labels by moving a path. Coordinate
-   supervision trains the decoder; both objectives train shared features.
+1. A 3D encoder-decoder produces spatial features from CT, presence, observed
+   history rendering and local coordinates, conditioned on geometric history.
+2. **Future flow** (`PathFlow`). The transformer reads fixed current/history
+   tokens, one always-valid observation token per future plane at the prior mean,
+   and noisy future tokens. Each token carries a 3 × 3 lateral feature patch,
+   voxel coordinates, token type, time and position embeddings, and history
+   context. Static patches are sampled once and reused across training draws
+   and midpoint stages. Only noisy future tokens emit lateral velocities;
+   forward coordinates remain pinned to their planes. Missing history tokens
+   are excluded from attention.
+3. **Flow objective.** A weighted observed-history tangent sets the prior mean:
+   forward distance times lateral slope, clamped inside the crop with space for
+   the observation stencil. Unmeasured, backward and nearly perpendicular
+   tangents fall back to straight ahead. Per-plane lateral residual standard
+   deviations are fitted once from training-loader states, excluding unknown
+   targets and departed states, and floored at one trace voxel. Training uses
+   `y_1 = (x_1 - mu) / sigma`, `y_0 ~ N(0, I)`,
+   `y_t = (1-t) y_0 + t y_1`, and MSE against `y_1 - y_0` over known lateral
+   coordinates. Times are stratified as `(d + uniform()) / draws` per state.
+   Integration stays in normalized coordinates; feature queries and returned
+   paths use `x = mu + sigma * y`. Partial annotations retain their existing
+   behavior: unknown future tokens are excluded from attention keys and loss;
+   all observation tokens stay valid. Sampling generates the full horizon.
+   Crop exits do not censor flow targets or dense scorer labels. Departed states
+   provide no flow supervision but retain confidence negatives. GT history is
+   used only for diagnostics.
+4. **Candidate support.** Every generated sample is scored, including coincident
+   paths. Support is the fraction of generated samples within `--support-radius`
+   RMS lateral distance over the first four planes. Generated candidates exclude
+   their own vote and use the remaining sample count as denominator. Teachers
+   and replay candidates receive measured support against the generated sample
+   set; they do not contribute votes. Support is an input feature for both
+   ranking and confidence, not a correctness label.
+5. **Scoring and tracing.** The bidirectional scorer uses the actual observed
+   history and each future. Its first-step geometry is relative to the actual
+   current point. Generated candidates receive no scorer gradients; ranking
+   and prefix-confidence losses still train the shared spatial features.
+   The tracer commits a confident prefix from its existing current point.
 
-The lateral displacement between adjacent points is capped at two voxels per
-forward voxel. The first point is connected to the corrected anchor by the same
-bound. With the preset, its distance from the actual current point cannot exceed
-`sqrt((4 + 2)^2 + 1) ≈ 6.08` voxels. This prevents the old 10–20 voxel first-point
-jumps, but does not guarantee the correct fiber. Cleaning error and local path
-accuracy still need to improve through training.
+`--recent-history-points` controls the dense observed history seen by the flow and scorer. It does not create history targets
+for learning. The first predicted point can recover from a displaced current
+position. `--max-recovery-distance` bounds the full 3D connection from the actual
+current point to the first prediction (default: 6 trace-grid voxels, independent
+of crop spacing). Longer connections receive negative prefix labels and are
+ineligible for tracing, including exploration and stop-patience overrides.
+If no connection is eligible, the trace stops with `recovery_limit`. The limit
+is saved in the model configuration. Within this recovery segment, departure
+from GT is permitted; dense GT agreement starts at the first prediction.
 
-**Coordinate objective:** Smooth-L1 against dense annotated crossings, choosing
-one best candidate over the whole known trajectory, plus 0.5 times the first-four-
-point loss across **every** candidate, plus 0.25 times the winning candidate's
-step-vector loss. This teaches a common near-term continuation while allowing
-later alternatives. Candidate modes start with small learned directional
-variations; no repulsion forces them apart on unambiguous fibers.
+Total loss is `--flow-weight` × flow + ranking + prefix confidence. Useful
+measurements include:
 
-Teacher paths and perturbed paths bootstrap the scorer, but cannot win the
-coordinate assignment. Unknown suffixes are censored. Already departed states
-supply continuation negatives, without coordinate supervision. Known annotated
-points remain coordinate targets even if they leave the crop.
-
-Total loss adds the coordinate objective, ranking, prefix confidence, and
-0.5 times the clean-history loss. `proposal` in the log now means the coordinate
-objective. Useful measurements include:
-
-- `coordinate_full`, `coordinate_trunk`, `coordinate_steps`: direct losses.
-- `first_plane_error`, `clean_current_error`: placement and anchor accuracy.
-- `candidate_first_step_max`, `first_step_length_max`: worst first-point jumps.
-- `candidate_endpoint_spread`: whether candidates remain distinct.
-- `target_step_limit_fraction`: annotated steps outside the decoder's allowed
-  lateral displacement; persistent values indicate a representational limit.
-- `target_crop_oob`, `target_crop_edge`: lack of visual support, not endpoints.
-- `oracle_error`, `selected_error`, `oracle_recall`: candidate quality and ranking.
+- `flow`, `flow_known_fraction`: future velocity loss and annotated fraction.
+- `observed_current_error`, `observed_history_error`,
+  `observed_tangent_error_deg`: input drift diagnostics, not learned cleaning.
+- `candidate_support`, `selected_support`: sample agreement; low agreement
+  can reflect ambiguity, sampling error, or an undertrained generator.
+- `first_plane_error`, `first_step_length_max`: recovery placement and jumps.
+- `candidate_recovery_reject_fraction`, `recovery_blocked_fraction`,
+  `target_recovery_reject_fraction`: rejected connections, states with no
+  eligible connection, and annotated targets outside the recovery limit.
+- `oracle_error`, `oracle_recall`: all generated candidates, excluding teachers
+  and replay extras. Recall checks the commit horizon and recovery limit;
+  error is mean lateral error at annotated future crossings, clipped at 8
+  voxels as in ranking. `oracle_recall_known_fraction` reports the fraction of
+  eligible states with a known oracle recall outcome.
+- `selected_error`: the tracer's confidence-gated, recovery-eligible choice,
+  including its diagnostic fallback when it stops. `accepted_selected_error`
+  covers accepted choices only; `selected_accept_fraction` reports their share.
+  Training metrics and EMA diagnostic plots/rollouts use `--confidence`.
+- `target_crop_oob`, `target_crop_edge`: missing visual support, not endpoints.
 - Gate false stops/continues at thresholds 0.3, 0.5 and 0.7.
 
-At batch two, per-batch oracle recall often takes values 0, 0.5 or 1. Compare
-averages over many batches and held-out rollouts. The old threshold sweep is
-recorded in `EXPERIMENTS.md`; it does not calibrate this new model.
-
-## Direct path decoder trunk loss (`direct_paths_v7`)
-
-The direct decoder's coordinate loss assigns one whole-path winner among the
-proposed modes. On the first four planes (the commit window) it uses relaxed
-winner-takes-all: the winner has weight 1 and every other mode
-`--trunk-loser-weight` (default 0.1). Losing modes are kept alive and near the
-fiber without being pulled onto the average of two plausible branches; a
-weight of 1 recovers the earlier mean over modes, and 0 is pure WTA. The log
-reports `trunk_spread`, the mean lateral spread of the modes over those
-planes: near zero everywhere means the candidates hedge together, while
-opening on some states is the intended behaviour at forks and parallel
-neighbours. Tests: `tests/test_direct_paths.py`.
+Sampling is stochastic. Training uses the global seed; rollouts seed one
+sampler per `trace()` call using `TraceParams.seed`. Reproduction requires the
+same seeds and batch composition. Compare averaged held-out measurements and
+rollout precision/coverage, not isolated batch-two recall values. Validation
+thresholds from older architectures do not calibrate this one.
 
 ## Ground truth
 
@@ -193,7 +214,7 @@ From the `vesuvius/` project root:
 FF=src/vesuvius/neural_tracing/fiber_follow
 .venv/bin/python "$FF/scripts/eval_ckpt.py" field --seeds-only --rebuild-seeds
 .venv/bin/python "$FF/scripts/eval_ckpt.py" \
-  "$FF/output/ct0_presence_paths_v7/last.pt" --tag presence_paths_v7 \
+  "$FF/output/ct0_presence_flow_v10/last.pt" --tag presence_flow_v9 \
   --history-audit --batch 1 --params '{"confidence":0.7,"n_commit":4}'
 ```
 
@@ -205,16 +226,21 @@ Focused tests in this directory:
 
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q \
-  tests/test_history_confidence.py tests/test_direct_paths.py
+  tests/test_history_confidence.py tests/test_future_flow.py
 ```
 
 Use an environment with PyTorch and pytest and this checkout on `PYTHONPATH`.
-The v7 validation includes coordinate gradients, bounded connectivity, synthetic
-curve fitting, censored targets, teacher independence and checkpoint loading.
-A full-size real-data BF16 GPU check completed two optimizer steps with finite
-gradients (20.94 GiB peak allocated, 22.10 GiB reserved), and a separate collector
-produced a replay archive. These checks establish execution, not trained quality.
-See `EXPERIMENTS.md` for details.
+CUDA-only recovery and metric regressions (skipped if CUDA is unavailable):
+
+```bash
+AGENTS_AGENT_MODE=1 python -m pytest -q -p no:cacheprovider tests/test_recovery_policy.py
+```
+
+The focused suite covers fixed observed history, future-plane pinning,
+masked-token isolation, distinct candidate selection, gradient separation,
+synthetic curve fitting, and training/checkpoint/tracing integration. See
+`EXPERIMENTS.md` for checks performed on each architecture; historical GPU
+measurements are not measurements of v9.
 
 ## Beam re-ranker (`beam/`): learning to choose the VC3D tracer's paths
 

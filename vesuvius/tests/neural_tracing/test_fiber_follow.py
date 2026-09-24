@@ -462,7 +462,7 @@ class FixedPolicy(torch.nn.Module):
         super().__init__()
         self.cfg = SimpleNamespace(future_step=2.)
         self.conf = confidence
-    def forward(self, x, hist, hmask):
+    def forward(self, x, hist, hmask, generator=None):
         n = len(x)
         candidates = straight_candidates(n)
         return dict(candidates=candidates, ranks=torch.tensor([[1.,0.]]).expand(n,-1),

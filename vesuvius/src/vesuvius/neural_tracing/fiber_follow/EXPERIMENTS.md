@@ -9,6 +9,170 @@ Status as of 2026-09-24. See `README.md` for file layout and commands.
 > loader/scorer fixes these issues; see `README.md` for the new semantics and
 > fresh-training commands. The numbers below are not a controlled-span benchmark.
 
+## Normalized future flow and all-sample scoring (v10, 2026-09-24)
+
+The current implementation adds per-plane residual standardization around an
+observed-history tangent prior. Scales are fitted from 2,048 training-loader
+states, floored at one trace voxel, and saved with the run. Training uses 32
+stratified time/noise draws, group norm, zero transformer dropout, and a
+1,000-step warmup. Every future plane has an always-valid image observation
+at the prior mean, with a 3 × 3 lateral patch at configurable voxel pitch.
+The sampler uses four explicit midpoint steps (eight field evaluations).
+
+All 16 generated paths are scored. Mode selection and its distinct-index
+fallback are removed. Generated, teacher and replay candidates all carry
+measured sample support; generated paths exclude their own support vote.
+The ranking objective and partial-annotation behavior are unchanged. Crop
+censoring is not enabled. Live weights train the scorer; an EMA ramps to decay
+0.999 and supplies collection, diagnostic and evaluation weights. Checkpoints
+save both copies. No previous-architecture loading path is provided.
+
+This is an implementation change, not a measured production-quality gain;
+held-out rollout and GPU throughput comparisons still require a fresh run.
+
+## Future-only flow with fixed observed history (2026-09-24)
+
+`future_flow_v9` removes anchor/history reconstruction. The flow reads the
+actual current point and supplied recent history as fixed conditioning tokens,
+with image features sampled there. Only future-plane lateral coordinates are
+generated. The scorer also reads observed history only and measures the first
+step from the actual current point. GT history is used for observed-drift
+diagnostics only. `--recent-history-points` replaces `--clean-points`; the
+production preset keeps 32 recent history points and a 64-point forecast.
+
+Candidate selection now excludes already selected indices from its fallback.
+Full-path distance breaks ties between identical commit prefixes, preserving
+different tails for the scorer. Even identical samples occupy different indices;
+this does not claim that their geometry is distinct. A batched regression with
+six equal prefixes and different tails now selects indices beginning `[0, 5]`
+instead of repeatedly selecting index zero.
+
+Absent history is excluded from transformer attention in both training and
+inference. Partial future annotations train the available subpath: unannotated
+tokens are excluded as attention keys and from the velocity loss. Their padding
+cannot influence known points, and is not interpolated toward a fabricated
+target. At inference the requested full horizon is generated without an
+annotation mask. This removes the padding dependency; held-out rollouts still
+need to establish the quality of full-horizon generation near annotation ends.
+
+History correction outputs, metrics, audit fields and plot overlays have been
+removed. Observed-history drift metrics remain. Curve plots now consume flow
+training records. Follower checkpoints carry the new architecture identifier
+and require fresh training. Beam checkpoint compatibility remains deferred;
+its current trainer only follows the renamed configuration argument.
+
+Validation (existing environments, no installs):
+
+- 38 focused regression tests passed, including candidate ties, masked-token
+  value/gradient isolation, independence from GT history, observed-history
+  conditioning, gradient separation, checkpoint/tracer/audit integration,
+  diagnostic rendering and curve fitting. Command from this directory:
+  `PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 NUMBA_CACHE_DIR=/tmp/fiber-flow-review-numba MPLCONFIGDIR=/tmp/fiber-flow-review-mpl OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 PYTHONPATH=/home/sean/Documents/villa4/vesuvius/src python -m pytest -q -p no:cacheprovider tests/test_future_flow.py tests/test_history_confidence.py`.
+- Escalated CUDA/BF16 validation on the RTX 5090, PyTorch 2.12.1+cu130,
+  exercised the production input `[2,3,208,128,128]`, 16 future samples,
+  six candidates, eight integration steps and eight training draws. One row
+  had missing history and a partially annotated future. Two AdamW steps had
+  finite losses 4.612677 and 4.351247 and finite gradients for every parameter.
+  Model size: 2,718,821 parameters. Peak allocated memory in this synthetic
+  check: 9.79 GiB; this is not a controlled performance comparison with v8.
+- CUDA probes verified masked future coordinates cannot influence known
+  velocities, including NaN padding; unique candidate indices; pinned forward
+  planes; exact repeated seeded sampling; and exact sampling after checkpoint
+  reload. A separate CUDA/BF16 synthetic curve fit took 450 steps: first/last
+  five-step mean loss 0.9775/0.0894, best candidate mean point error 0.3601
+  voxels. These checks establish execution and synthetic fitting, not trained
+  accuracy on real fibers.
+
+CUDA reproduction (run with driver access):
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONPATH=/home/sean/Documents/villa4/vesuvius/src OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+  /home/sean/Documents/villa/vesuvius/.venv/bin/python /tmp/future_flow_cuda_check.py
+```
+
+The CUDA harness and `/tmp/future-flow-v9-cuda/smoke.pt` are local temporary
+artifacts. The tracked regressions are `tests/test_future_flow.py` and
+`tests/test_history_confidence.py`. No full training run was launched.
+
+## Joint flow-matching polylines replace the recurrent decoder (2026-09-24)
+
+Implemented `joint_flow_v8` before any `direct_paths_v7` run was trained, so
+there is no v7 result to compare against and no checkpoint adapter. The v7
+decoder was a per-candidate GRU unrolled over 64 planes with six mode
+embeddings, a whole-path winner-takes-all coordinate loss and a separate
+conv1d history cleaner joined to the decoder by a fitted tangent. Its known
+weaknesses were structural rather than measured: a fixed mode count under
+WTA (dead modes), a mean-over-modes trunk term that pulls every mode onto the
+average of two plausible branches when the near-term continuation is
+ambiguous, and 64 recurrent updates between distant evidence and the first
+step. A relaxed-WTA trunk (`--trunk-loser-weight`) was added briefly and then
+removed with the decoder.
+
+What changed (`model.py`, `supervision.py`, `train.py`, `trace.py`):
+
+- `PathFlow`: a non-causal transformer velocity field over the joint polyline
+  (anchor, 32 past points, 64 future planes = 97 tokens). Anchor/past tokens
+  are free in three axes; future tokens are pinned to their forward plane and
+  move laterally. Prior: Gaussian (σ 4 voxels) around observed history where
+  supplied, straight behind otherwise, straight ahead for the future. Tokens
+  carry their coordinate, prior mean, image stencil at the coordinate,
+  observation flag, time and the history context. Rectified-flow MSE in prior
+  units, 8 (time, noise) draws per example against one image encoding.
+- Candidates are modes of 16 samples: density-peak selection with suppression
+  at 1.5 voxels RMS over the commit window, leftover slots filled by
+  farthest-point. The cleaned history is the sample mean of the past tokens.
+  Per-candidate support (sample agreement) is logged as `candidate_support`
+  and `selected_support`; it is not a scorer input yet.
+- The scorer, labels, teacher candidates, DAgger replay, tracer and
+  diagnostics are unchanged. Candidates reach the scorer without gradient.
+  `TraceParams.seed` seeds one generator per trace call.
+- Removed: `PathDecoder`, `predict_clean_history`/`clean_head`,
+  `coordinate_loss`, `bounded_vector`, the clean-history loss term and CLI
+  options `--clean-weight --clean-tangent-points --max-history-correction
+  --max-lateral-slope --path-sample-radius --trunk-loser-weight`. Added
+  `--flow-layers --flow-heads --flow-steps --flow-samples --flow-draws
+  --prior-scale --candidate-separation --flow-weight`. The launcher is now
+  `scripts/launch_ct_flow.sh`. The beam re-ranker keeps sharing the encoder
+  (`encode` now returns features and the history context).
+
+Validation (existing environment, no installs):
+
+- `tests/test_joint_flow.py` (new) and `tests/test_history_confidence.py`:
+  30 passed, 1 skipped (`vc.fiber_trace` unavailable). Covered: future planes
+  pinned in samples and candidates, seeded reproducibility, flow gradients
+  into flow/image/history parameters while ranking and confidence leave the
+  flow untouched, zero loss and gradient for unknown/departed states, unknown
+  tails and absent history censored, prior construction, synthetic curved
+  continuation fitted in 150 steps (loss below 0.6× initial, best mode within
+  1.5 voxels), mode selection with support, config validation, beam subclass,
+  training entrypoint and checkpoint roundtrip.
+- Broader `tests/neural_tracing/test_fiber_follow*.py`: 59 passed and the same
+  14 pre-existing failures as before this change (stale heatmap-era tests);
+  one stub policy in that file now accepts the `generator` argument.
+- Production-shape BF16 GPU smoke on the RTX 5090 with synthetic data,
+  `[2,3,208,128,128]`, six candidates, 16 samples, 8 steps, 8 draws:
+  2,723,173 parameters (880,899 in the flow). Five optimizer steps had finite
+  losses 4.42 → 4.18; steady train step 0.19 s; peak allocated/reserved
+  20.91/22.06 GiB, matching the v7 footprint. Batch-one inference with
+  sampling took 0.028 s per decision and 2.50 GiB peak; a repeated seeded
+  forward reproduced the samples bit for bit. Script:
+  the session scratchpad `flow_smoke.py`. These are execution checks, not
+  evidence of improved tracing.
+
+Fresh run (not launched by this change):
+
+```bash
+bash scripts/launch_ct_flow.sh ct0_presence_flow_v8
+tail -F output/logs/ct0_presence_flow_v8.log
+```
+
+Judge it on commit-horizon `oracle_recall`, `oracle_error`,
+`clean_current_error` and the gate metrics, which isolate the swapped modules.
+Operating parameters that did not exist before: `--flow-samples`,
+`--flow-steps` and `--candidate-separation` at inference, alongside the
+confidence threshold.
+
 ## Direct history-anchored coordinates; Gaussian prediction removed (2026-09-24)
 
 Implemented `direct_paths_v7` after the stopped

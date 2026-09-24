@@ -201,7 +201,7 @@ class SampleConfig:
     n_future: int = 16
     future_step: float = 2.0
     n_history: int = 128
-    clean_points: int = 8  # annotated current point plus this many past points
+    recent_history_points: int = 8  # GT history for observed-state diagnostics only
     history_step: float = 1.0
     lateral_sigmas: tuple = (0.4, 1.0, 2.0)
     lateral_probs: tuple = (0.5, 0.35, 0.15)
@@ -237,7 +237,7 @@ def training_state_allowed(item, crop: CropSpec, band: ZBand | None):
     if start < band.hi and start + crop.block_size > band.lo:
         return False
     zs = [np.array([pos[2]])]
-    for key, mask in (("hist_local", "hmask"), ("clean_local", "clean_mask"),
+    for key, mask in (("hist_local", "hmask"), ("gt_history", "gt_history_mask"),
                       ("fut_local", "fmask")):
         if key in item:
             points = item[key][item[mask] > 0]
@@ -342,11 +342,11 @@ def continuation_targets(fiber, t, reverse, pos, frame, cfg, offtrack=False):
         p, s = p[::-1], s[-1]-s[::-1]
     tf = t + cfg.future_s
     fut = interp_at(p, s, np.clip(tf, 0, s[-1]))
-    clean_arc = t - np.arange(cfg.clean_points + 1) * cfg.history_step
-    clean_local = (interp_at(p, s, np.clip(clean_arc, 0, s[-1])) - pos) @ frame
-    clean_mask = (clean_arc >= 0).astype(np.float32)
+    history_arc = t - np.arange(cfg.recent_history_points + 1) * cfg.history_step
+    gt_history = (interp_at(p, s, np.clip(history_arc, 0, s[-1])) - pos) @ frame
+    gt_history_mask = (history_arc >= 0).astype(np.float32)
     if offtrack:
-        clean_mask[:] = 0
+        gt_history_mask[:] = 0
     dense_planes = np.linspace(cfg.future_step, cfg.future_s[-1],
                                (cfg.n_future-1)*cfg.dense_substeps+1)
     ab, mask = plane_targets(p, s, t, s[-1], pos, frame, cfg.future_s)
@@ -359,7 +359,7 @@ def continuation_targets(fiber, t, reverse, pos, frame, cfg, offtrack=False):
     end = (p[-1]-pos) @ frame
     # Only expose endpoint labels when it is within the local traversal window.
     known = fiber.endpoint_stop[0 if reverse else 1] and s[-1]-t <= 2.5*cfg.future_s[-1]
-    return dict(clean_local=clean_local.astype(np.float32), clean_mask=clean_mask,
+    return dict(gt_history=gt_history.astype(np.float32), gt_history_mask=gt_history_mask,
                 fut_local=(fut-pos) @ frame, fmask=fmask,
                 plane_ab=ab, plane_mask=mask, planes=cfg.future_s,
                 dense_ab=dense_ab, dense_mask=dense_mask, dense_planes=dense_planes,
@@ -558,8 +558,8 @@ def collate_with_volume(items, vol: FiberVolume, crop: CropSpec, grid: torch.Ten
     if "fut_local" in items[0]:
         out["fut"] = st("fut_local")
         out["fmask"] = st("fmask")
-        out["clean_local"] = st("clean_local")
-        out["clean_mask"] = st("clean_mask")
+        out["gt_history"] = st("gt_history")
+        out["gt_history_mask"] = st("gt_history_mask")
         out["plane_ab"] = st("plane_ab")
         out["plane_mask"] = st("plane_mask")
         for key in ("dense_ab", "dense_mask", "end_local", "endpoint_known", "offtrack", "replay_candidates", "replay_valid"):

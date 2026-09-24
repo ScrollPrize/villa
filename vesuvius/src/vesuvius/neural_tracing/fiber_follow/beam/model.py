@@ -28,8 +28,7 @@ class BeamRankNet(FollowNet):
     """
 
     def __init__(self, cfg: BeamNetConfig):
-        super().__init__(cfg)
-        del self.flow
+        super().__init__(cfg, create_flow=False)
         self.heat_head = nn.Conv3d(cfg.widths[0], 1, 1)
         del self.history_tokens
         del self.history_fusion

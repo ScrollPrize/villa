@@ -1,4 +1,4 @@
-"""History-conditioned joint flow-matching path generator and supervised path scorer."""
+"""Future-path flow matching conditioned on fixed observed trace history."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -9,8 +9,9 @@ from torch import nn
 import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec, crop_local_grid
+from vesuvius.neural_tracing.fiber_follow.policy import DEFAULT_MAX_RECOVERY_DISTANCE
 
-ARCHITECTURE = 'joint_flow_v8'
+ARCHITECTURE = 'future_flow_v10'
 
 
 @dataclass
@@ -26,16 +27,24 @@ class FollowNetConfig:
     future_step: float = 2.0
     hist_points: int = 32
     hist_stride: int = 4
-    clean_points: int = 8
-    n_candidates: int = 4
+    recent_history_points: int = 8  # dense observed history used by the flow and scorer
     flow_layers: int = 4
     flow_heads: int = 4
-    flow_steps: int = 8       # Euler steps from the prior to a path sample
-    flow_samples: int = 16    # joint polyline samples drawn per state
-    flow_draws: int = 8       # (time, noise) draws per example in the training loss
-    prior_scale: float = 4.0  # prior standard deviation, trace-grid voxels
-    candidate_separation: float = 1.5  # RMS lateral distance on the commit window that separates modes
-    norm: str = 'batch'
+    flow_steps: int = 4       # midpoint steps, two flow evaluations per step
+    flow_samples: int = 16    # future-path samples drawn per state
+    flow_draws: int = 32      # stratified (time, noise) draws against shared image features
+    flow_sigma: tuple = ()   # fitted per-plane (a, b) residual std, trace-grid voxels
+    flow_stencil_radius: float = 2.0  # 3x3 lateral patch pitch/radius, trace-grid voxels
+    support_radius: float = 1.5  # RMS lateral distance on the commit window
+    max_recovery_distance: float = DEFAULT_MAX_RECOVERY_DISTANCE  # origin to first point, trace-grid voxels
+    norm: str = 'group'
+
+    def __post_init__(self):
+        self.widths = tuple(self.widths)
+        self.flow_sigma = tuple(tuple(row) for row in self.flow_sigma)
+        if (not math.isfinite(self.max_recovery_distance) or self.max_recovery_distance <= 0
+                or not 0 < self.future_step <= self.max_recovery_distance):
+            raise ValueError('max_recovery_distance must be finite, positive, and at least future_step')
 
     def to_dict(self):
         return asdict(self)
@@ -62,7 +71,7 @@ def block(cin, cout, norm, stride=1):
 
 
 def history_tangent(points, mask, count):
-    """Weighted line fit in arclength order, newest point first (diagnostics only).
+    """Weighted line fit in arclength order, newest point first.
 
     Only the contiguous valid prefix is used. Nearer points get more weight;
     fewer than two distinct points supply no measured tangent.
@@ -91,126 +100,133 @@ def time_embedding(t, dim):
     return torch.cat([angles.sin(), angles.cos()], -1)
 
 
-def select_candidates(paths, count, separation, window):
-    """Pick ``count`` modes of a sample set by density peaks with suppression.
+def prior_mean(hist, hmask, cfg):
+    """Extrapolate the observed tangent, keeping the observation patches in-crop."""
+    tangent, measured = history_tangent(hist, hmask, cfg.recent_history_points)
+    usable = measured & (tangent[:, 2] > 1e-3)
+    slope = tangent[:, :2] / tangent[:, 2:].clamp_min(1e-3)
+    slope = torch.where(usable[:, None], slope, 0.)
+    planes = cfg.future_step * torch.arange(1, cfg.n_future+1, device=hist.device)
+    half = (cfg.width-1)*cfg.spacing/2 - cfg.flow_stencil_radius
+    lateral = (slope[:, None] * planes[None, :, None]).clamp(-half, half)
+    return torch.cat([lateral, planes[None, :, None].expand(len(hist), -1, -1)], -1)
 
-    Samples are compared by the RMS lateral distance over the first ``window``
-    planes (the commit window). The densest unsuppressed sample is taken and
-    everything within ``separation`` of it is suppressed; when all samples are
-    suppressed, remaining slots take the sample farthest from the selection so
-    every slot is a distinct real sample. Returns indices (B, count) and the
-    support of each pick: the fraction of all samples within ``separation``.
+
+def candidate_support(candidates, samples, radius, window):
+    """Local sample density for every path; generated paths occupy the first S slots.
+
+    Leave out each generated path's own vote. Teachers and replay paths are
+    evaluated against the same sample bank, without contributing votes to it.
     """
-    B, S, K, _ = paths.shape
-    if count > S:
-        raise ValueError('Cannot select more candidates than samples')
-    key = paths[:, :, :window, :2].reshape(B, S, -1).float()
-    distance = torch.cdist(key, key) / math.sqrt(window)
-    within = distance < separation
-    support = within.float().mean(-1)
-    suppressed = torch.zeros(B, S, dtype=torch.bool, device=paths.device)
-    batch = torch.arange(B, device=paths.device)
-    selected = []
-    for _ in range(count):
-        density = (within & ~suppressed[:, None, :]).sum(-1).float().masked_fill(suppressed, -1.)
-        pick = density.argmax(-1)
-        if selected:
-            chosen = torch.stack(selected, 1)
-            farthest = distance[batch[:, None], chosen].amin(1).argmax(-1)
-            pick = torch.where(suppressed.all(-1), farthest, pick)
-        suppressed |= within[batch, pick]
-        selected.append(pick)
-    index = torch.stack(selected, 1)
-    return index, support[batch[:, None], index]
+    B, S, _, _ = samples.shape
+    key = candidates[:, :, :window, :2].reshape(B, candidates.shape[1], -1).float()
+    bank = samples[:, :, :window, :2].reshape(B, S, -1).float()
+    within = torch.cdist(key, bank) / math.sqrt(window) < radius
+    within[:, :S] &= ~torch.eye(S, device=samples.device, dtype=torch.bool)[None]
+    counts = within.float().sum(-1)
+    denominator = counts.new_full((counts.shape[1],), S)
+    denominator[:S] = max(1, S-1)
+    return counts / denominator
 
 
 class PathFlow(nn.Module):
-    """Velocity field over the joint polyline: anchor, cleaned past, future planes.
-
-    Every token carries its current coordinate, its prior mean, image features
-    sampled at the current coordinate, and whether an observation exists there.
-    The forward coordinate of future tokens is fixed to its plane; the anchor
-    and past tokens move in all three axes.
-    """
+    """Normalized lateral flow with fixed history and prior-mean image tokens."""
     def __init__(self, cfg, feature_channels):
         super().__init__()
         self.cfg = cfg
+        sigma = torch.tensor(cfg.flow_sigma, dtype=torch.float32)
+        if sigma.shape != (cfg.n_future, 2) or not torch.isfinite(sigma).all() or (sigma < 1).any():
+            raise ValueError('flow_sigma must contain fitted (a, b) scales >= 1 for every future plane')
+        half = (cfg.width-1)*cfg.spacing/2
+        if not math.isfinite(cfg.flow_stencil_radius) or not 0 < cfg.flow_stencil_radius <= half:
+            raise ValueError('flow_stencil_radius must be positive and fit inside the crop')
+        self.register_buffer('sigma', sigma, persistent=False)
         h = cfg.hidden
-        n = cfg.clean_points
-        self.n_tokens = 1 + n + cfg.n_future
-        kind = torch.zeros(self.n_tokens, dtype=torch.long)
-        kind[1:1+n] = 1
-        kind[1+n:] = 2
+        self.n_history = 1 + cfg.recent_history_points
+        self.n_tokens = cfg.n_future
+        self.n_fixed = self.n_history + self.n_tokens
+        kind = torch.cat([torch.zeros(self.n_history), torch.ones(self.n_tokens),
+                          torch.full((self.n_tokens,), 2)]).long()
         self.register_buffer('kind', kind, persistent=False)
-        free = torch.ones(self.n_tokens, 3)
-        free[1+n:, 2] = 0
-        self.register_buffer('free', free, persistent=False)
         self.register_buffer('planes', cfg.future_step*torch.arange(1, cfg.n_future+1), persistent=False)
-        self.register_buffer('stencil', torch.tensor([[0., 0, 0], [1., 0, 0], [-1., 0, 0], [0., 1, 0], [0., -1, 0]])*cfg.spacing,
-                             persistent=False)
+        stencil = torch.tensor([[a, b, 0.] for a in (-1., 0., 1.) for b in (-1., 0., 1.)])
+        self.register_buffer('stencil', stencil*cfg.flow_stencil_radius, persistent=False)
         self.kind_embedding = nn.Embedding(3, h)
-        self.position = nn.Embedding(self.n_tokens, h)
-        self.input = nn.Sequential(nn.Linear(feature_channels*5 + 8, h), nn.SiLU(), nn.Linear(h, h))
+        self.position = nn.Embedding(len(kind), h)
+        self.input = nn.Sequential(nn.Linear(feature_channels*9 + 5, h), nn.SiLU(), nn.Linear(h, h))
         self.time = nn.Sequential(nn.Linear(64, h), nn.SiLU(), nn.Linear(h, h))
         self.context = nn.Linear(h, h)
         layer = nn.TransformerEncoderLayer(h, cfg.flow_heads, 4*h, dropout=0., activation='gelu',
                                            batch_first=True, norm_first=True)
         self.blocks = nn.TransformerEncoder(layer, cfg.flow_layers, enable_nested_tensor=False)
         self.final = nn.LayerNorm(h)
-        self.velocity = nn.Linear(h, 3)
-        # Small, not zero: a zero head would block every upstream gradient on the first step.
+        self.velocity = nn.Linear(h, 2)
         nn.init.normal_(self.velocity.weight, std=.01)
         nn.init.zeros_(self.velocity.bias)
 
     def prior(self, hist, hmask):
-        """Prior mean and observation flags: observed past where supplied, straight ahead otherwise."""
-        cfg = self.cfg
-        B = len(hist)
-        n = cfg.clean_points
-        observed = hist[:, :n].float()
-        supplied = hmask[:, :n].float()
-        default = torch.zeros_like(observed)
-        default[..., 2] = -torch.arange(1, n+1, device=hist.device, dtype=torch.float32)
-        past = torch.where(supplied[..., None] > 0, observed, default)
-        future = torch.zeros(B, cfg.n_future, 3, device=hist.device)
-        future[..., 2] = self.planes
-        mu = torch.cat([torch.zeros(B, 1, 3, device=hist.device), past, future], 1)
-        valid = torch.cat([torch.ones(B, 1, device=hist.device), supplied, torch.zeros(B, cfg.n_future, device=hist.device)], 1)
-        return mu, valid
+        return prior_mean(hist, hmask, self.cfg)
 
-    def forward(self, features, context, x, t, mu, valid, sampling_grid):
-        """features (B, C, D, H, W) float; x, mu (B, N, P, 3); t (B, N); valid (B, P); context (B, hidden)."""
-        B, N, P, _ = x.shape
-        grid = sampling_grid(x.reshape(B, N*P, 1, 3).float() + self.stencil)
+    def to_voxels(self, y, mu):
+        lateral = mu[:, None, :, :2] + self.sigma*y
+        return torch.cat([lateral, mu[:, None, :, 2:].expand(*y.shape[:-1], 1)], -1)
+
+    def sample_features(self, features, coordinates, sampling_grid):
+        B = len(coordinates)
+        grid = sampling_grid(coordinates.reshape(B, -1, 1, 3) + self.stencil)
         sampled = F.grid_sample(features, grid[:, :, :, None], align_corners=True, padding_mode='zeros')
-        sampled = sampled[..., 0].permute(0, 2, 1, 3).reshape(B*N, P, -1)
-        x = x.reshape(B*N, P, 3).float()
-        mu = mu.expand(B, N, P, 3).reshape(B*N, P, 3).float()
+        return sampled[..., 0].permute(0, 2, 1, 3).reshape(*coordinates.shape[:-1], -1)
+
+    def conditioning(self, features, hist, hmask, sampling_grid):
+        """Sample static history/observation patches once per encoded state."""
+        mu = self.prior(hist, hmask)
+        observed = torch.cat([hist.new_zeros((len(hist), 1, 3)), hist[:, :self.n_history-1]], 1).float()
+        supplied = torch.cat([hmask.new_ones((len(hist), 1)), hmask[:, :self.n_history-1]], 1).bool()
+        observed = torch.where(supplied[..., None], observed, 0.)
+        coordinates = torch.cat([observed, mu], 1)
+        valid = torch.cat([supplied, torch.ones_like(mu[..., 0], dtype=torch.bool)], 1)
+        return dict(mu=mu, coordinates=coordinates, valid=valid,
+                    sampled=self.sample_features(features, coordinates, sampling_grid))
+
+    def forward(self, features, context, y, t, fixed, sampling_grid, future_mask=None):
+        """y (B, N, K, 2) is normalized; only feature queries use voxel coordinates."""
+        B, N, K, _ = y.shape
+        known = torch.ones(B, K, device=y.device, dtype=torch.bool) if future_mask is None else future_mask.bool()
+        # Mask before conversion/sampling so arbitrary missing-target values are inert.
+        y = torch.where(known[:, None, :, None], y, 0.)
+        future = self.to_voxels(y.float(), fixed['mu'])
+        future = torch.where(known[:, None, :, None], future, 0.)
+        sampled = self.sample_features(features, future, sampling_grid)
+        sampled = torch.cat([fixed['sampled'][:, None].expand(-1, N, -1, -1), sampled], 2)
+        coordinates = torch.cat([fixed['coordinates'][:, None].expand(-1, N, -1, -1), future], 2)
+        P = coordinates.shape[2]
+        coordinates = coordinates.reshape(B*N, P, 3)
         t = t.reshape(B*N).float()
-        tokens = torch.cat([sampled, x/32, mu/32, valid[:, None].expand(B, N, P).reshape(B*N, P, 1).float(),
+        observed_flag = (self.kind == 0).float()[None, :, None].expand(B*N, -1, -1)
+        tokens = torch.cat([sampled.reshape(B*N, P, -1), coordinates/32, observed_flag,
                             t[:, None, None].expand(-1, P, 1)], -1)
         h = self.input(tokens) + self.kind_embedding(self.kind)[None] + self.position.weight[None]
         h = h + (self.time(time_embedding(t, 64)) + self.context(context[:, None].expand(B, N, -1).reshape(B*N, -1)))[:, None]
-        h = self.blocks(h)
-        return (self.velocity(self.final(h)).float() * self.free).reshape(B, N, P, 3)
+        valid = torch.cat([fixed['valid'], known], 1)
+        padding = ~valid[:, None].expand(B, N, P).reshape(B*N, P)
+        h = self.blocks(h, src_key_padding_mask=padding)
+        return self.velocity(self.final(h[:, self.n_fixed:])).float().reshape(B, N, K, 2)
 
 
 class FollowNet(nn.Module):
-    def __init__(self, cfg: FollowNetConfig):
+    def __init__(self, cfg: FollowNetConfig, *, create_flow=True):
         super().__init__()
         self.cfg = cfg
-        if cfg.n_future < 2 or cfg.n_candidates < 1 or cfg.hist_points < 1:
+        if cfg.n_future < 2 or cfg.flow_samples < 1 or cfg.hist_points < 1:
             raise ValueError('At least two future planes, one candidate, and one history point are required')
-        if cfg.clean_points < 1 or cfg.clean_points > cfg.hist_points * cfg.hist_stride:
-            raise ValueError('clean_points must be positive and fit inside the supplied history')
+        if not 1 <= cfg.recent_history_points <= cfg.hist_points * cfg.hist_stride:
+            raise ValueError('recent_history_points must be positive and fit inside the supplied history')
         if cfg.n_future * cfg.future_step > (cfg.depth-cfg.behind-1)*cfg.spacing:
             raise ValueError('Candidates/forecast horizon exceed the proposal configuration')
         if min(cfg.flow_layers, cfg.flow_heads, cfg.flow_steps, cfg.flow_draws) < 1 or cfg.hidden % cfg.flow_heads:
             raise ValueError('Flow layers, heads, steps and draws must be positive; hidden must divide by heads')
-        if cfg.flow_samples < cfg.n_candidates:
-            raise ValueError('flow_samples must be at least n_candidates')
-        if any(not math.isfinite(v) or v <= 0 for v in (cfg.prior_scale, cfg.candidate_separation)):
-            raise ValueError('prior_scale and candidate_separation must be positive and finite')
+        if any(not math.isfinite(v) or v <= 0 for v in (cfg.support_radius,)):
+            raise ValueError('support_radius must be positive and finite')
         self.crop = CropSpec(depth=cfg.depth, width=cfg.width, behind=cfg.behind,
                              spacing=cfg.spacing)
         grid = torch.from_numpy(crop_local_grid(self.crop)).float()
@@ -221,8 +237,9 @@ class FollowNet(nn.Module):
         self.decoders = nn.ModuleList([block(w[i+1]+w[i], w[i], cfg.norm) for i in range(len(w)-2, -1, -1)])
         self.history = nn.Sequential(nn.Linear(cfg.hist_points*4, cfg.hidden), nn.SiLU())
         self.condition = nn.ModuleList([nn.Linear(cfg.hidden, 2*c) for c in w])
-        self.flow = PathFlow(cfg, w[0])
-        self.path_net = nn.Sequential(nn.Conv1d(w[0]*5+6, cfg.hidden, 3, padding=1), nn.SiLU(),
+        if create_flow:
+            self.flow = PathFlow(cfg, w[0])
+        self.path_net = nn.Sequential(nn.Conv1d(w[0]*5+7, cfg.hidden, 3, padding=1), nn.SiLU(),
                                       nn.Conv1d(cfg.hidden, cfg.hidden, 3, padding=1), nn.SiLU())
         self.rank_head = nn.Linear(cfg.hidden, 1)
         # Prefix labels depend on every earlier candidate point. Carry that
@@ -232,8 +249,7 @@ class FollowNet(nn.Module):
         # has independent recurrent state, including synthetic training paths.
         self.suffix_context = nn.GRU(cfg.hidden, cfg.hidden, batch_first=True)
         self.continuation_fusion = nn.Sequential(nn.Linear(4*cfg.hidden, cfg.hidden), nn.SiLU())
-        # Both paths remain visible: cleaning must not erase evidence of drift.
-        self.history_tokens = nn.Sequential(nn.Linear(2*w[0]+10, cfg.hidden), nn.SiLU(),
+        self.history_tokens = nn.Sequential(nn.Linear(w[0]+4, cfg.hidden), nn.SiLU(),
                                             nn.Linear(cfg.hidden, cfg.hidden), nn.SiLU())
         self.history_fusion = nn.Sequential(nn.Linear(2*cfg.hidden, cfg.hidden), nn.SiLU())
         self.confidence_head = nn.Conv1d(cfg.hidden, 1, 1)
@@ -254,7 +270,8 @@ class FollowNet(nn.Module):
         m = hmask[:, cfg.hist_stride-1::cfg.hist_stride][:, :cfg.hist_points]
         if h.shape[1] != cfg.hist_points:
             raise ValueError('History must cover hist_points * hist_stride')
-        context = self.history(torch.cat([h*m[..., None]/32, m[..., None]], -1).flatten(1).to(x.dtype))
+        h = torch.where(m[..., None] > 0, h, 0.)
+        context = self.history(torch.cat([h/32, m[..., None]], -1).flatten(1).to(x.dtype))
         features = torch.cat([x, self.coordinates.expand(len(x), -1, -1, -1, -1).to(x.dtype)], 1)
         skips = []
         for encoder, condition in zip(self.encoders, self.condition):
@@ -266,76 +283,72 @@ class FollowNet(nn.Module):
             features = decoder(torch.cat([F.interpolate(features, size=skip.shape[-3:], mode='trilinear', align_corners=True), skip], 1))
         return features, context
 
-    def polyline_targets(self, batch):
-        """Joint target polyline and its token mask from dense annotated geometry.
+    def future_targets(self, batch):
+        """Annotated future crossings; departed states have no geometry targets."""
+        ab = batch['plane_ab'].float()
+        future = torch.cat([ab, self.flow.planes[None, :, None].expand(len(ab), -1, 1)], -1)
+        return future, batch['plane_mask'].float()*(1-batch['offtrack'].float())[:, None]
 
-        Past tokens are targets only where observed history was supplied, so an
-        absent history is never a reconstruction target. Unknown planes and
-        departed states are masked; they leave no gradient.
+    def flow_loss(self, features, context, hist, hmask, batch, generator=None, fixed=None):
+        """Stratified flow matching on annotated normalized lateral residuals.
+
+        Missing futures remain excluded as attention keys and from the loss.
+        Observation tokens remain available on every requested plane.
         """
-        n = self.cfg.clean_points
-        clean = batch['clean_local'].float()
-        supplied = torch.cat([batch['hmask'].new_ones((len(clean), 1)), batch['hmask'][:, :n]], 1).float()
-        future = torch.cat([batch['plane_ab'].float(), self.flow.planes[None, :, None].expand(len(clean), -1, 1)], -1)
-        x1 = torch.cat([clean, future], 1)
-        mask = torch.cat([batch['clean_mask'].float()*supplied, batch['plane_mask'].float()], 1)
-        return x1, mask*(1-batch['offtrack'].float())[:, None]
-
-    def flow_loss(self, features, context, hist, hmask, batch, generator=None):
-        """Conditional flow matching on the joint polyline, in units of the prior scale."""
         cfg = self.cfg
-        mu, valid = self.flow.prior(hist, hmask)
-        x1, token_mask = self.polyline_targets(batch)
-        x1 = torch.where(token_mask[..., None] > 0, x1, mu)
+        if fixed is None:
+            fixed = self.flow.conditioning(features, hist, hmask, self.sampling_grid)
+        x1, token_mask = self.future_targets(batch)
+        mu = fixed['mu']
         B, P, _ = mu.shape
         D = cfg.flow_draws
-        t = torch.rand(B, D, device=mu.device, generator=generator)
-        noise = torch.randn(B, D, P, 3, device=mu.device, generator=generator) * self.flow.free
-        x0 = mu[:, None] + cfg.prior_scale*noise
-        xt = (1-t)[..., None, None]*x0 + t[..., None, None]*x1[:, None]
-        velocity = self.flow(features, context, xt, t, mu[:, None], valid, self.sampling_grid)
-        error = (velocity - (x1[:, None]-x0)).square() / cfg.prior_scale**2
-        weight = (token_mask[:, None, :, None]*self.flow.free).expand_as(error)
-        past = torch.zeros(P, device=mu.device)
-        past[:1+cfg.clean_points] = 1
-        def mean(select):
-            w = weight*select[None, None, :, None]
-            return (error*w).sum()/w.sum().clamp_min(1)
-        loss = mean(torch.ones_like(past))
-        return dict(flow_loss=loss, flow_past=mean(past).detach(), flow_future=mean(1-past).detach(),
-                    flow_known_fraction=token_mask.mean().detach())
+        t = (torch.arange(D, device=mu.device)[None] +
+             torch.rand(B, D, device=mu.device, generator=generator)) / D
+        y0 = torch.randn(B, D, P, 2, device=mu.device, generator=generator)
+        residual = torch.where(token_mask[..., None] > 0, x1[..., :2]-mu[..., :2], 0.)
+        y1 = residual / self.flow.sigma
+        target = torch.where(token_mask[:, None, :, None] > 0, y1[:, None], y0)
+        yt = (1-t)[..., None, None]*y0 + t[..., None, None]*target
+        velocity = self.flow(features, context, yt, t, fixed, self.sampling_grid, future_mask=token_mask)
+        error = (velocity - (target-y0)).square()
+        weight = token_mask[:, None, :, None].expand_as(error)
+        loss = (error*weight).sum()/weight.sum().clamp_min(1)
+        return dict(flow_loss=loss, flow_known_fraction=token_mask.mean().detach())
 
     @torch.no_grad()
-    def sample(self, features, context, hist, hmask, n_samples=None, steps=None, generator=None):
-        """Euler integration of the flow from the prior; returns (B, S, P, 3) polylines."""
+    def sample(self, features, context, hist, hmask, n_samples=None, steps=None, generator=None, fixed=None):
+        """Explicit midpoint integration in normalized coordinates; returns voxel-space paths."""
         cfg = self.cfg
-        S = n_samples or cfg.flow_samples
-        T = steps or cfg.flow_steps
-        mu, valid = self.flow.prior(hist, hmask)
+        S = cfg.flow_samples if n_samples is None else n_samples
+        T = cfg.flow_steps if steps is None else steps
+        if min(S, T) < 1:
+            raise ValueError('Sample count and midpoint steps must be positive')
+        if fixed is None:
+            fixed = self.flow.conditioning(features, hist, hmask, self.sampling_grid)
+        mu = fixed['mu']
         B, P, _ = mu.shape
-        x = mu[:, None] + cfg.prior_scale*torch.randn(B, S, P, 3, device=mu.device, generator=generator)*self.flow.free
+        y = torch.randn(B, S, P, 2, device=mu.device, generator=generator)
         for i in range(T):
             t = torch.full((B, S), i/T, device=mu.device)
-            x = x + self.flow(features, context, x, t, mu[:, None], valid, self.sampling_grid)/T
-        return x
+            velocity = self.flow(features, context, y, t, fixed, self.sampling_grid)
+            midpoint = y + velocity/(2*T)
+            y = y + self.flow(features, context, midpoint, t+1/(2*T), fixed, self.sampling_grid)/T
+        return self.flow.to_voxels(y, mu)
 
-    def encode_history(self, features, hist, hmask, clean_history):
-        """Encode observed and cleaned history for both ranking and confidence.
+    def encode_history(self, features, hist, hmask):
+        """Encode actual observed history for both ranking and confidence.
 
         Read oldest to newest, skipping masked points without advancing the
         recurrent state. No future candidate or annotated history is supplied.
         """
-        count = self.cfg.clean_points
+        count = self.cfg.recent_history_points
         observed = torch.cat([hist.new_zeros((len(hist), 1, 3)), hist[:, :count]], 1)
         valid = torch.cat([hmask.new_ones((len(hist), 1)), hmask[:, :count]], 1)
         observed = torch.where(valid[..., None] > 0, observed, 0.)
-        cleaned = torch.where(valid[..., None] > 0, clean_history, 0.)
-        def sample(points):
-            grid = self.sampling_grid(points)[:, :, None, None]
-            return F.grid_sample(features.float(), grid.float(), align_corners=True,
-                                 padding_mode='zeros').squeeze(-1).squeeze(-1).transpose(1, 2)
-        tokens = self.history_tokens(torch.cat([sample(observed), sample(cleaned), observed/32,
-                                               cleaned/32, (cleaned-observed)/4, valid[..., None]], -1))
+        grid = self.sampling_grid(observed)[:, :, None, None]
+        sampled = F.grid_sample(features.float(), grid.float(), align_corners=True,
+                                padding_mode='zeros').squeeze(-1).squeeze(-1).transpose(1, 2)
+        tokens = self.history_tokens(torch.cat([sampled, observed/32, valid[..., None]], -1))
         state = tokens.new_zeros((1, len(hist), self.cfg.hidden))
         for i in range(count, -1, -1):
             _, updated = self.prefix_context(tokens[:, i:i+1].contiguous(), state)
@@ -345,17 +358,19 @@ class FollowNet(nn.Module):
         pooled = (tokens*valid[..., None]).sum(1)/valid.sum(1, keepdim=True).clamp_min(1)
         return self.history_fusion(torch.cat([state[0], pooled], -1))[None]
 
-    def score_candidates(self, features, candidates, clean_history, hist, hmask):
+    def score_candidates(self, features, candidates, hist, hmask, support):
         B, M, K, _ = candidates.shape
         grid = self.sampling_grid(candidates[..., None, :] + self.stencil)
         sampled = F.grid_sample(features.float(), grid.float(), align_corners=True, padding_mode='zeros')
         # B,C,M,K,5 -> B*M,C*5,K
         sampled = sampled.permute(0, 2, 1, 4, 3).reshape(B*M, -1, K)
-        initial = candidates[:, :, :1] - clean_history[:, None, :1]
+        # The tracer connects to the actual current point (local origin).
+        initial = candidates[:, :, :1]
         delta = torch.cat([initial, candidates[:, :, 1:]-candidates[:, :, :-1]], 2)
         geom = torch.cat([candidates/32, delta/4], -1).reshape(B*M, K, 6).transpose(1, 2)
-        tokens = self.path_net(torch.cat([sampled, geom], 1))
-        context = self.encode_history(features, hist, hmask, clean_history)
+        density = support.reshape(B*M, 1, 1).expand(-1, -1, K)
+        tokens = self.path_net(torch.cat([sampled, geom, density], 1))
+        context = self.encode_history(features, hist, hmask)
         context = context[:, :, None].expand(-1, -1, M, -1).reshape(1, B*M, -1).contiguous()
         sequence = tokens.transpose(1, 2).contiguous()
         prefix, _ = self.prefix_context(sequence, context)
@@ -374,7 +389,7 @@ class FollowNet(nn.Module):
         return ranks, confidence_logits
 
     def forward(self, x, hist, hmask, extra_candidates=None, targets=None, generator=None):
-        """Generate joint polyline samples, select candidate modes, and score them.
+        """Generate future paths and score every sample, teacher and replay candidate.
 
         ``targets`` (the training batch) adds the flow-matching loss to the
         output. ``generator`` makes sampling reproducible. Candidates never
@@ -384,22 +399,19 @@ class FollowNet(nn.Module):
         features, context = self.encode(x, hist, hmask)
         image = features.float()
         out = {}
+        fixed = self.flow.conditioning(image, hist, hmask, self.sampling_grid)
         if targets is not None:
-            out.update(self.flow_loss(image, context, hist, hmask, targets, generator))
-        samples = self.sample(image, context, hist, hmask, generator=generator)
-        n = cfg.clean_points
-        clean_history = samples[:, :, :n+1].mean(1)
-        futures = samples[:, :, n+1:]
-        index, support = select_candidates(futures, cfg.n_candidates, cfg.candidate_separation, min(4, cfg.n_future))
-        candidates = futures[torch.arange(len(x), device=x.device)[:, None], index]
+            out.update(self.flow_loss(image, context, hist, hmask, targets, generator, fixed))
+        samples = self.sample(image, context, hist, hmask, generator=generator, fixed=fixed)
+        candidates = samples
         if extra_candidates is not None:
             candidates = torch.cat([candidates, extra_candidates.detach()], 1)
-        ranks, confidence_logits = self.score_candidates(image, candidates, clean_history, hist, hmask)
+        support = candidate_support(candidates, samples, cfg.support_radius, min(4, cfg.n_future))
+        ranks, confidence_logits = self.score_candidates(image, candidates, hist, hmask, support)
         chosen = ranks.argmax(-1)
         points = candidates[torch.arange(len(x), device=x.device), chosen]
-        corrected_path = torch.cat([clean_history.flip(1), points], 1)
-        out.update(clean_history=clean_history, samples=samples, candidate_support=support,
-                   corrected_path=corrected_path, points=points, candidates=candidates,
+        out.update(samples=samples, candidate_support=support,
+                   points=points, candidates=candidates,
                    ranks=ranks, confidence_logits=confidence_logits,
                    confidence=confidence_logits.float().sigmoid().cummin(-1).values)
         return out

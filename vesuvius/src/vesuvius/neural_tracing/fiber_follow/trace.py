@@ -18,10 +18,8 @@ from vesuvius.neural_tracing.fiber_follow.geometry import (
     normalize,
 )
 from vesuvius.neural_tracing.fiber_follow.model import FollowNet
+from vesuvius.neural_tracing.fiber_follow.policy import DEFAULT_CONFIDENCE, choose_candidate
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume
-
-
-DEFAULT_CONFIDENCE = 0.7
 
 
 @dataclass
@@ -158,25 +156,29 @@ class ModelTracer:
                 x = add_presence_input(x, items, self.vol, self.crop, self.grid, self.pool)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
                 out = self.model(x, tensor(hist).float(), tensor(hm), generator=generator)
+            selected, commits, allowed = choose_candidate(
+                out['candidates'], out['ranks'], out['confidence'], pp.confidence, pp.n_commit,
+                self.model.cfg.max_recovery_distance)
+            selected, commits, allowed = [v.cpu().numpy() for v in (selected, commits, allowed)]
             candidates, ranks, confidence = [out[k].float().cpu().numpy() for k in ('candidates', 'ranks', 'confidence')]
-            clean_history = out['clean_history'].float().cpu().numpy() if on_decision is not None else None
             for j, i in enumerate(idx):
                 conf = np.minimum.accumulate(confidence[j], axis=-1)
-                viable = conf[:, 0] >= pp.confidence
-                chosen = int(np.argmax(np.where(viable, ranks[j], -np.inf))) if viable.any() else int(ranks[j].argmax())
-                commit = min(pp.n_commit, int(np.sum(conf[chosen] >= pp.confidence)))
+                chosen, commit = int(selected[j]), int(commits[j])
+                recovery_blocked = not allowed[j].any()
                 would_stop = commit == 0
-                if would_stop and exploration[i] < 0 and pp.explore_calls:
+                if would_stop and not recovery_blocked and exploration[i] < 0 and pp.explore_calls:
                     exploration[i] = 0
                 exploratory = exploration[i] >= 0
                 state = dict(pos=pos[j].copy(), frame=fr[j].copy(), hist=hist_world[j].copy(), hmask=hm[j].copy(),
                              candidates=candidates[j].copy(), rank_scores=ranks[j].copy(), confidence=conf.copy(),
                              chosen=chosen, n_commit=commit, would_stop=would_stop, exploratory=exploratory,
+                             recovery_allowed=allowed[j].copy(), recovery_blocked=bool(recovery_blocked),
                              travelled=float(length[i]), last_segment=last_segment[i].copy())
-                if on_decision is not None:
-                    state['clean_history'] = clean_history[j].copy()
                 if on_decision is not None and on_decision(int(i), state) is False:
                     active[i], reasons[i] = False, 'oracle'
+                    continue
+                if recovery_blocked:
+                    active[i], reasons[i] = False, 'recovery_limit'
                     continue
                 if exploratory and exploration[i] >= pp.explore_calls:
                     active[i], reasons[i] = False, 'exploration_limit'

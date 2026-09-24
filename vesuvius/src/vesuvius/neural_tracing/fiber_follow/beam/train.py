@@ -149,8 +149,8 @@ def main(argv=None):
     model_cfg = BeamNetConfig(in_channels=2, depth=crop.depth, width=crop.width, behind=crop.behind, spacing=crop.spacing,
                                 widths=tuple(args.widths), hidden=args.hidden, n_future=2, future_step=1.,
                                 hist_points=args.hist_points, hist_stride=args.hist_stride,
-                                clean_points=min(8, args.hist_points * args.hist_stride),
-                                n_candidates=1, norm=args.norm,
+                                recent_history_points=min(8, args.hist_points * args.hist_stride),
+                                norm=args.norm,
                                 heatmap_target=heatmap_target, tube_sigma=args.tube_sigma)
     model = prepare_model(BeamRankNet(model_cfg), args.device)
 
