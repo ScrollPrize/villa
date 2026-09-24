@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec, crop_local_grid
 
-ARCHITECTURE = 'spatial_candidates_v3'
+ARCHITECTURE = 'spatial_candidates_v4'
 
 
 @dataclass
@@ -26,6 +26,7 @@ class FollowNetConfig:
     future_step: float = 2.0
     hist_points: int = 32
     hist_stride: int = 4
+    clean_points: int = 8
     heat_bins: int = 61
     heat_spacing: float = 1.0
     n_candidates: int = 4
@@ -75,7 +76,7 @@ def diverse_topk(score, paths, count, separation):
 
 
 @torch.no_grad()
-def decode_candidates(logits, cfg):
+def decode_candidates(logits, cfg, clean_history, clean_mask):
     """Connect heatmap modes into coherent alternative paths; no rollout beam search."""
     B, K, nb, _ = logits.shape
     peaks = min(cfg.peaks_per_plane, nb * nb)
@@ -94,7 +95,13 @@ def decode_candidates(logits, cfg):
     uv = (uv.reshape(B, K, peaks, 2) - (nb-1)/2) * cfg.heat_spacing
     values = values.reshape(B, K, peaks) - logits.float().flatten(2).logsumexp(-1)[..., None]
     paths = uv[:, 0, :, None, :]
-    score = values[:, 0] - .025 * uv[:, 0].square().sum(-1)
+    anchor = clean_history[:, 0]
+    previous = clean_history[:, 1]
+    dc = (anchor[:, 2] - previous[:, 2]).clamp_min(.25)
+    slope = ((anchor[:, :2] - previous[:, :2]) / dc[:, None]).clamp(-2, 2)
+    slope = slope * clean_mask[:, 0, None]
+    expected = anchor[:, :2] + cfg.future_step * slope
+    score = values[:, 0] - .1 * (uv[:, 0] - expected[:, None]).square().sum(-1)
     batch = torch.arange(B, device=lg.device)[:, None]
     keep = diverse_topk(score, paths, cfg.n_candidates, cfg.candidate_separation)
     paths, score = paths[batch, keep], score[batch, keep]
@@ -121,6 +128,8 @@ class FollowNet(nn.Module):
             raise ValueError('Invalid heatmap target or tube width')
         if cfg.n_future < 2 or cfg.n_candidates < 1 or cfg.hist_points < 1:
             raise ValueError('At least two future planes, one candidate, and one history point are required')
+        if cfg.clean_points < 1 or cfg.clean_points > cfg.hist_points * cfg.hist_stride:
+            raise ValueError('clean_points must be positive and fit inside the supplied history')
         if cfg.n_candidates > cfg.peaks_per_plane or cfg.n_future * cfg.future_step > (cfg.depth-cfg.behind-1)*cfg.spacing:
             raise ValueError('Candidates/forecast horizon exceed the proposal configuration')
         self.crop = CropSpec(depth=cfg.depth, width=cfg.width, behind=cfg.behind,
@@ -134,6 +143,10 @@ class FollowNet(nn.Module):
                                      [block(a, b, cfg.norm, 2) for a, b in zip(w[:-1], w[1:])])
         self.decoders = nn.ModuleList([block(w[i+1]+w[i], w[i], cfg.norm) for i in range(len(w)-2, -1, -1)])
         self.history = nn.Sequential(nn.Linear(cfg.hist_points*4, cfg.hidden), nn.SiLU())
+        self.clean_head = nn.Sequential(
+            nn.Conv1d(w[0]+4, cfg.hidden, 3, padding=1), nn.SiLU(),
+            nn.Conv1d(cfg.hidden, cfg.hidden, 3, padding=1), nn.SiLU(),
+            nn.Conv1d(cfg.hidden, 3, 1))
         self.condition = nn.ModuleList([nn.Linear(cfg.hidden, 2*c) for c in w])
         self.heat_head = nn.Conv3d(w[0], 1, 1)
         self.path_net = nn.Sequential(nn.Conv1d(w[0]*5+6, cfg.hidden, 3, padding=1), nn.SiLU(),
@@ -175,13 +188,25 @@ class FollowNet(nn.Module):
             features = decoder(torch.cat([F.interpolate(features, size=skip.shape[-3:], mode='trilinear', align_corners=True), skip], 1))
         return features
 
-    def score_candidates(self, features, candidates):
+    def predict_clean_history(self, features, hist, hmask):
+        count = self.cfg.clean_points
+        observed = torch.cat([hist.new_zeros((len(hist), 1, 3)), hist[:, :count]], 1)
+        valid = torch.cat([hmask.new_ones((len(hist), 1)), hmask[:, :count]], 1)
+        observed = observed * valid[..., None]
+        grid = self.sampling_grid(observed)[:, :, None, None]
+        sampled = F.grid_sample(features.float(), grid.float(), align_corners=True,
+                                padding_mode='zeros').squeeze(-1).squeeze(-1)
+        tokens = torch.cat([sampled, (observed / 32).transpose(1, 2), valid[:, None]], 1)
+        return observed + self.clean_head(tokens).transpose(1, 2)
+
+    def score_candidates(self, features, candidates, clean_history):
         B, M, K, _ = candidates.shape
         grid = self.sampling_grid(candidates[..., None, :] + self.stencil)
         sampled = F.grid_sample(features.float(), grid.float(), align_corners=True, padding_mode='zeros')
         # B,C,M,K,5 -> B*M,C*5,K
         sampled = sampled.permute(0, 2, 1, 4, 3).reshape(B*M, -1, K)
-        delta = torch.cat([candidates[:, :, :1], candidates[:, :, 1:]-candidates[:, :, :-1]], 2)
+        initial = candidates[:, :, :1] - clean_history[:, None, :1]
+        delta = torch.cat([initial, candidates[:, :, 1:]-candidates[:, :, :-1]], 2)
         geom = torch.cat([candidates/32, delta/4], -1).reshape(B*M, K, 6).transpose(1, 2)
         tokens = self.path_net(torch.cat([sampled, geom], 1))
         ranks = self.rank_head(tokens.mean(-1)).reshape(B, M)
@@ -191,6 +216,7 @@ class FollowNet(nn.Module):
 
     def forward(self, x, hist, hmask, extra_candidates=None):
         features = self.encode(x, hist, hmask)
+        clean_history = self.predict_clean_history(features, hist, hmask)
         plane_grid = self.sampling_grid(self.plane_grid)[None].expand(len(x), -1, -1, -1, -1)
         tube = {}
         if self.cfg.heatmap_target == 'tube':
@@ -200,11 +226,14 @@ class FollowNet(nn.Module):
         else:
             planes = F.grid_sample(features.float(), plane_grid, align_corners=True)
             logits = self.heat_head(planes).squeeze(1)
-        candidates = decode_candidates(logits, self.cfg)
+        candidates = decode_candidates(logits, self.cfg, clean_history, hmask)
         if extra_candidates is not None:
             candidates = torch.cat([candidates, extra_candidates.detach()], 1)
-        ranks, confidence_logits = self.score_candidates(features, candidates)
+        ranks, confidence_logits = self.score_candidates(features, candidates, clean_history)
         chosen = ranks.argmax(-1)
-        return dict(**tube, points=candidates[torch.arange(len(x), device=x.device), chosen], candidates=candidates,
+        points = candidates[torch.arange(len(x), device=x.device), chosen]
+        corrected_path = torch.cat([clean_history.flip(1), points], 1)
+        return dict(**tube, clean_history=clean_history,
+                    corrected_path=corrected_path, points=points, candidates=candidates,
                     heatmap=logits, ranks=ranks, confidence_logits=confidence_logits,
                     confidence=confidence_logits.float().sigmoid().cummin(-1).values)

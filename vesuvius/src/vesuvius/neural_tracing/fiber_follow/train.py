@@ -80,6 +80,8 @@ def main(argv=None):
     ap.add_argument('--n-history', type=int, default=128)
     ap.add_argument('--hist-points', type=int, default=32)
     ap.add_argument('--hist-stride', type=int, default=4)
+    ap.add_argument('--clean-points', type=int, default=8, help='Number of annotated past points to reconstruct with the current point')
+    ap.add_argument('--clean-weight', type=float, default=.5)
     ap.add_argument('--heat-bins', type=int, default=61)
     ap.add_argument('--heat-spacing', type=float, default=1., help='Trace-grid voxels per lateral heatmap sample')
     ap.add_argument('--heatmap-target', choices=('planes', 'tube'), default='planes')
@@ -115,6 +117,8 @@ def main(argv=None):
         ap.error('Invalid collection, diagnostic, worker, or tolerance settings')
     if args.n_history < args.hist_points*args.hist_stride:
         ap.error('n-history must cover hist-points * hist-stride')
+    if args.clean_points < 1 or args.clean_points > args.hist_points*args.hist_stride or args.clean_weight < 0:
+        ap.error('clean-points must be positive, fit in history, and clean-weight must be nonnegative')
     if min(args.crop_spacing, args.heat_spacing, args.ct_grid_scale, args.tube_sigma) <= 0:
         ap.error('Voxel spacings and tube sigma must be positive')
     if not math.isfinite(args.history_sigma) or args.history_sigma <= 0 or not math.isfinite(args.history_jitter) or args.history_jitter < 0:
@@ -133,7 +137,8 @@ def main(argv=None):
                     spacing=args.crop_spacing, gate_direction=args.gate_direction,
                     history_render=args.history_render, history_sigma=args.history_sigma)
     sample_cfg = SampleConfig(crop=crop, n_future=args.n_future, future_step=args.future_step, n_candidates=args.n_candidates,
-                              n_history=args.n_history, lateral_sigmas=tuple(args.lateral_sigmas),
+                              n_history=args.n_history, clean_points=args.clean_points,
+                              lateral_sigmas=tuple(args.lateral_sigmas),
                               angle_sigmas_deg=tuple(args.angle_sigmas), history_wobble=args.history_wobble, history_jitter=args.history_jitter,
                               heatmap_target=args.heatmap_target, tube_sigma=args.tube_sigma)
     model_cfg = FollowNetConfig(in_channels={'fiber':8, 'fiber+ct':9, 'ct':2}[spec.mode],
@@ -141,6 +146,7 @@ def main(argv=None):
                                 spacing=crop.spacing, widths=tuple(args.widths), hidden=args.hidden,
                                 n_future=args.n_future, future_step=args.future_step, hist_points=args.hist_points,
                                 hist_stride=args.hist_stride, heat_bins=args.heat_bins, n_candidates=args.n_candidates,
+                                clean_points=args.clean_points,
                                 norm=args.norm, heat_spacing=args.heat_spacing,
                                 heatmap_target=args.heatmap_target, tube_sigma=args.tube_sigma)
     model = prepare_model(FollowNet(model_cfg), args.device)
@@ -217,7 +223,8 @@ def main(argv=None):
             extras = teacher_candidates(batch, model.cfg)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.device.startswith('cuda')):
                 output = model(batch['x'].float(), batch['hist'], batch['hmask'], extras)
-            loss, metrics = loss_fn(output, batch, model.cfg, args.tolerance, args.rank_weight, args.confidence_weight)
+            loss, metrics = loss_fn(output, batch, model.cfg, args.tolerance, args.rank_weight,
+                                    args.confidence_weight, args.clean_weight)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f'Non-finite training loss at step {step}')
             opt.zero_grad(set_to_none=True)
@@ -241,6 +248,7 @@ def main(argv=None):
                 pred = output['candidates'][torch.arange(len(chosen), device=chosen.device), chosen]
                 gt = torch.cat([batch['plane_ab'], pred[..., 2:]], -1)
                 plot_batch(batch['x'], pred, gt, batch['plane_mask'], crop, out/'images'/f'batch_{step:06d}.png',
+                           output['clean_history'], batch['clean_local'], batch['clean_mask'],
                            heat_half=model.plane_grid[:, -1, -1, 0].cpu().numpy(),
                            source=batch['source'], offtrack=batch['offtrack'],
                            confidence=output['confidence'][torch.arange(len(chosen), device=chosen.device), chosen])

@@ -36,19 +36,24 @@ def _curved_slab(vol, centers, axis, half=2):
     return out
 
 
-def plot_batch(x, pred, fut, fmask, crop, path, n=6, heat_half=None,
-               source=None, offtrack=None, confidence=None):
+def plot_batch(x, pred, fut, fmask, crop, path, clean_pred, clean_gt, clean_mask,
+               n=6, heat_half=None, source=None, offtrack=None, confidence=None):
     """Crops exactly as the model sees them (sample-index space, forward = up).
 
     Each panel is a thin curved slab (+-2 samples) that follows the GT fiber
     in the hidden lateral axis, so the fiber being traced stays visible.
-    Gray = first image channel (CT or presence), red = own history, green = GT future, orange = proposal.
+    Gray = first image channel (CT or presence), red = own history, blue = corrected
+    history, green = GT, orange = proposal. The dotted orange segment is the
+    actual tracer's first step from the current point.
     Bounds stay fixed to the actual crop even when GT leaves it. The orange
     path is the complete ranked proposal, not the confidence-gated commit.
     """
     source = source[:n].detach().cpu().numpy() if source is not None else None
     offtrack = offtrack[:n].detach().cpu().numpy() if offtrack is not None else None
     confidence = confidence[:n].detach().float().cpu().numpy() if confidence is not None else None
+    clean_pred = clean_pred[:n].detach().float().cpu().numpy()
+    clean_gt = clean_gt[:n].detach().float().cpu().numpy()
+    clean_mask = clean_mask[:n].detach().float().cpu().numpy()
     x = x[:n].float().cpu().numpy()
     pred = pred[:n].float().detach().cpu().numpy()
     fut = fut[:n].cpu().numpy()
@@ -63,6 +68,8 @@ def plot_batch(x, pred, fut, fmask, crop, path, n=6, heat_half=None,
         m = fmask[i] > 0
         gi = _to_index(fut[i][m], crop)
         pi = _to_index(pred[i], crop)
+        ci = _to_index(clean_pred[i], crop)
+        cgi = _to_index(clean_gt[i], crop)
         mid = (crop.width - 1) / 2.0
         # GT lateral position per row (current point at the centre), held beyond the last future point
         rr = np.concatenate([[crop.behind], gi[:, 2]])
@@ -78,6 +85,13 @@ def plot_batch(x, pred, fut, fmask, crop, path, n=6, heat_half=None,
             a.plot(gi[:, comp], gi[:, 2], "o--", color="lime", ms=3, lw=1)
             line, = a.plot(pi[:, comp], pi[:, 2], "x-", color="orange", ms=4, lw=1.5)
             line.set_path_effects([pe.Stroke(linewidth=2.5, foreground='black'), pe.Normal()])
+            a.plot([mid, pi[0, comp]], [crop.behind, pi[0, 2]], ':', color='orange', lw=1.2)
+            valid = clean_mask[i] > 0
+            a.plot(ci[valid, comp][::-1], ci[valid, 2][::-1], 'o-', color='deepskyblue', ms=2.5, lw=1)
+            if valid[0]:
+                a.plot([ci[0, comp], pi[0, comp]], [ci[0, 2], pi[0, 2]],
+                       '--', color='deepskyblue', lw=1)
+            a.plot(cgi[valid, comp], cgi[valid, 2], '.', color='lime', ms=3)
             a.axhline(crop.behind, color='cyan', ls=':', lw=.8)
             a.plot(mid, crop.behind, 'D', color='cyan', ms=4)
             if heat_half is not None:
@@ -105,8 +119,8 @@ def plot_batch(x, pred, fut, fmask, crop, path, n=6, heat_half=None,
         if confidence is not None:
             title += f'\nnext-step confidence {confidence[i, 0]:.2f}'
         ax[0, i].set_title(title, fontsize=8)
-    fig.suptitle("red history | green GT | orange full proposal (before confidence gate)\n"
-                 "cyan: current point / prediction limits | magenta: GT outside crop", fontsize=9)
+    fig.suptitle("red observed history | blue predicted clean history | green GT | orange full proposal\n"
+                 "cyan: actual current point / prediction limits | dotted orange: actual first step", fontsize=9)
     fig.tight_layout(rect=(0, 0, 1, .96))
     fig.savefig(path, dpi=80)
     plt.close(fig)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import os
 from pathlib import Path
@@ -132,7 +133,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     torch.set_num_threads(args.threads)
     model, crop, n_hist, spec, ck = load_checkpoint(args.checkpoint, args.device)
-    cfg = SampleConfig(crop=crop, n_history=n_hist, n_future=model.cfg.n_future, future_step=model.cfg.future_step,
+    cfg = SampleConfig(crop=crop, n_history=n_hist, clean_points=model.cfg.clean_points,
+                       n_future=model.cfg.n_future, future_step=model.cfg.future_step,
                        n_candidates=model.cfg.n_candidates, heatmap_target=model.cfg.heatmap_target,
                        tube_sigma=model.cfg.tube_sigma)
     if args.fiber_zarrs:
@@ -174,7 +176,7 @@ def main(argv=None):
         raise ValueError('No eligible decision states; no cache was published')
     st = OnPolicyStates(manifest=fiber_manifest(train_f),
                         provenance=dict(checkpoint=os.path.abspath(args.checkpoint), step=ck.get('step'),
-                                        model_cfg=model.cfg.to_dict(), crop=crop.replay_dict(),
+                                        model_cfg=model.cfg.to_dict(), crop=asdict(crop),
                                         volume=spec.to_dict(), collection=vars(args)),
                         **{key: np.asarray([row[key] for row in rows]) for key in OnPolicyStates.FIELDS})
     path = Path(args.out)
@@ -183,8 +185,8 @@ def main(argv=None):
     st.save(temp)
     # Pre-create mmap before publishing so multiple loader workers never race.
     OnPolicyStates.load(temp)
-    temp_mmap = Path(str(temp)[:-4]+'_mmap_v3')
-    final_mmap = Path(str(path)[:-4]+'_mmap_v3')
+    temp_mmap = Path(str(temp)[:-4]+'_mmap_v4')
+    final_mmap = Path(str(path)[:-4]+'_mmap_v4')
     os.replace(temp_mmap, final_mmap)
     os.replace(temp, path)
     print(json.dumps(dict(states=len(st), hard=int(st.hard.sum()), offtrack=int(st.offtrack.sum()), out=str(path))))

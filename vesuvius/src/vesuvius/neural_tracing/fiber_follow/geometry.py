@@ -8,7 +8,7 @@ matrix whose columns are ``(u, v, f)`` in world xyz: ``f`` is the heading,
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -24,20 +24,12 @@ class CropSpec:
     # multiply the direction (axis-tensor) channels by presence so direction
     # is only "loud" on fibers (the field is dense noise in empty space)
     gate_direction: bool = False
-    # Legacy checkpoints default to point splats; CT tube runs opt into segments.
     history_render: str = 'points'
     history_sigma: float = 1.0  # trace-grid voxels
 
     def __post_init__(self):
         if self.history_render not in ('points', 'segments') or not np.isfinite(self.history_sigma) or self.history_sigma <= 0:
             raise ValueError('Invalid history rendering mode or sigma')
-
-    def replay_dict(self):
-        values = asdict(self)
-        # Keep legacy collectors compatible with training processes already running.
-        if self.history_render == 'points' and self.history_sigma == 1.0:
-            del values['history_render'], values['history_sigma']
-        return values
 
     @property
     def forward_coords(self) -> np.ndarray:

@@ -82,7 +82,7 @@ def candidate_labels(candidates, batch, tolerance=1.5):
     return target, mask, quality, valid_error
 
 
-def loss_fn(output, batch, cfg, tolerance=1.5, rank_weight=1., confidence_weight=1.):
+def loss_fn(output, batch, cfg, tolerance=1.5, rank_weight=1., confidence_weight=1., clean_weight=.5):
     candidates = output['candidates']
     labels, mask, quality, error = candidate_labels(candidates, batch, tolerance)
     M = cfg.n_candidates
@@ -103,6 +103,9 @@ def loss_fn(output, batch, cfg, tolerance=1.5, rank_weight=1., confidence_weight
     proposal = (tube_loss(output['tube_logits'], batch['tube_target'], batch['tube_mask'])
                 if cfg.heatmap_target == 'tube' else
                 heatmap_loss(output['heatmap'], batch['plane_ab'], batch['plane_mask'], cfg))
+    clean_error = F.smooth_l1_loss(output['clean_history'].float(), batch['clean_local'], reduction='none').mean(-1)
+    clean_mask = batch['clean_mask']
+    clean = (clean_error * clean_mask).sum() / clean_mask.sum().clamp(min=1)
     with torch.no_grad():
         chosen = output['ranks'][:, :M].argmax(-1)
         b = torch.arange(len(chosen), device=chosen.device)
@@ -118,6 +121,16 @@ def loss_fn(output, batch, cfg, tolerance=1.5, rank_weight=1., confidence_weight
                        oracle_error=(oracle_error*eligible).sum().item()/denominator.item(),
                        selected_error=(selected_error*eligible).sum().item()/denominator.item(),
                        oracle_recall=recall.item())
+        current_mask = batch['clean_mask'][:, 0]
+        current_error = (output['clean_history'][:, 0] - batch['clean_local'][:, 0]).norm(dim=-1)
+        metrics['clean_loss'] = clean.item()
+        metrics['clean_current_error'] = (current_error*current_mask).sum().item()/current_mask.sum().clamp(min=1).item()
+        first_step = output['candidates'][:, :M, 0]
+        first_step = first_step[b, chosen]
+        metrics['first_step_length'] = first_step.norm(dim=-1).mean().item()
+        first_known = batch['plane_mask'][:, 0]
+        first_error = (first_step[:, :2] - batch['plane_ab'][:, 0]).norm(dim=-1)
+        metrics['first_plane_error'] = (first_error*first_known).sum().item()/first_known.sum().clamp(min=1).item()
         # Report observability separately from annotation validity. Leaving the
         # crop is not a physical fiber endpoint and never removes dense GT.
         lateral = batch['dense_ab'].abs().amax(-1)
@@ -127,4 +140,4 @@ def loss_fn(output, batch, cfg, tolerance=1.5, rank_weight=1., confidence_weight
         for name, boundary in [('target_crop_oob', crop_half), ('target_crop_edge', crop_half-3),
                                ('target_heatmap_oob', heat_half)]:
             metrics[name] = ((lateral > boundary)*known).sum().item()/known.sum().clamp(min=1).item()
-    return proposal+rank_weight*ranking+confidence_weight*confidence, metrics
+    return proposal+rank_weight*ranking+confidence_weight*confidence+clean_weight*clean, metrics

@@ -31,6 +31,9 @@ batchgeneratorsv2/transforms/nnunet/seg_to_onehot.py
 batchgeneratorsv2/transforms/noise/__init__.py
 batchgeneratorsv2/transforms/noise/extranoisetransforms.py
 batchgeneratorsv2/transforms/noise/gaussian_blur.py
+batchgeneratorsv2/transforms/noise/ring_artifact.py
+batchgeneratorsv2/transforms/noise/seam_artifact.py
+batchgeneratorsv2/transforms/noise/streak_artifact.py
 batchgeneratorsv2/transforms/spatial/__init__.py
 batchgeneratorsv2/transforms/spatial/decohesion.py
 batchgeneratorsv2/transforms/spatial/low_resolution.py
