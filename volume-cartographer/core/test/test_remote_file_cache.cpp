@@ -140,6 +140,25 @@ TEST_CASE("remote file cache rejects escaping destinations")
     fs::remove_all(options.cacheRoot);
 }
 
+TEST_CASE("remote file cache accepts a cache root with a trailing separator")
+{
+    // A remote_cache_dir typed as ".../remote_cache/" keeps its trailing
+    // separator through lexically_normal().
+    const auto root = temporaryDirectory("trailing_separator");
+    vc::core::util::RemoteFileCacheOptions options;
+    options.cacheRoot = root / "";
+    options.destination = "open_data/lasagna/manifest.json";
+    options.fetcher = [](const std::string&, const fs::path& tmp) { std::ofstream(tmp) << "manifest"; };
+
+    const auto result = vc::core::util::cacheRemoteFile("https://example.test/manifest.json", options);
+    CHECK(fs::equivalent(result.path, root / "open_data" / "lasagna" / "manifest.json"));
+    CHECK(readBytes(root / "open_data" / "lasagna" / "manifest.json") == "manifest");
+
+    options.destination = "../outside";
+    CHECK_THROWS_AS(vc::core::util::cacheRemoteFile("https://example.test/file", options), std::invalid_argument);
+    fs::remove_all(root);
+}
+
 TEST_CASE("remote file cache coalesces concurrent requests")
 {
     const auto root = temporaryDirectory("coalesce");
