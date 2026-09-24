@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -280,6 +281,64 @@ inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
             fiber.segmentMetadata[index] = controls.at(index).at("segment_to_next");
     }
     return fiber;
+}
+
+// VC3D's rule for the span tags derived from point tags, at the JSON level
+// for tools that rewrite control points (the lasagna probe): a span carries
+// `gap` exactly when both its endpoint controls carry the `break` point tag,
+// and a gap span never carries `damaged`. Other span tags are left alone; the
+// `tags` array is omitted when empty. Must agree with
+// vc3d::line_annotation::syncGapSpanTags.
+inline void normalizeGapSpanTagsJson(nlohmann::json& controls)
+{
+    if (!controls.is_array()) {
+        return;
+    }
+    const auto hasBreak = [](const nlohmann::json& control) {
+        if (!control.is_object() || !control.contains("tags") || !control.at("tags").is_array()) {
+            return false;
+        }
+        for (const auto& tag : control.at("tags")) {
+            if (tag.is_string() && tag.get<std::string>() == "break") {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (size_t index = 0; index + 1 < controls.size(); ++index) {
+        auto& control = controls.at(index);
+        if (!control.is_object() || !control.contains("segment_to_next") ||
+            !control.at("segment_to_next").is_object()) {
+            continue;
+        }
+        auto& segment = control.at("segment_to_next");
+        std::vector<std::string> tags;
+        if (segment.contains("tags") && segment.at("tags").is_array()) {
+            for (const auto& tag : segment.at("tags")) {
+                if (tag.is_string()) {
+                    tags.push_back(tag.get<std::string>());
+                }
+            }
+        }
+        const bool gap = hasBreak(control) && hasBreak(controls.at(index + 1));
+        std::vector<std::string> kept;
+        for (const auto& tag : tags) {
+            if (tag == "gap" || (gap && tag == "damaged")) {
+                continue;
+            }
+            kept.push_back(tag);
+        }
+        if (gap) {
+            kept.push_back("gap");
+        }
+        std::sort(kept.begin(), kept.end());
+        kept.erase(std::unique(kept.begin(), kept.end()), kept.end());
+        if (kept.empty()) {
+            segment.erase("tags");
+        } else {
+            segment["tags"] = kept;
+        }
+    }
 }
 
 inline nlohmann::json makeLasagnaSegmentMetadataJson(

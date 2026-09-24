@@ -647,11 +647,18 @@ PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
         traced = fiber.tracedSegments;
     }
     std::vector<bool> gap(spanCount, false);
+    std::vector<bool> damaged(spanCount, false);
     bool anyGap = false;
     if (spanCount > 0 && fiber.gapSegments.size() == spanCount) {
         for (std::size_t i = 0; i < spanCount; ++i) {
             gap[i] = fiber.gapSegments[i];
             anyGap = anyGap || gap[i];
+        }
+    }
+    if (spanCount > 0 && fiber.damagedSegments.size() == spanCount) {
+        for (std::size_t i = 0; i < spanCount; ++i) {
+            damaged[i] = fiber.damagedSegments[i] && !gap[i];
+            anyGap = anyGap || damaged[i];
         }
     }
     if (!haveTraced && !anyGap) {
@@ -672,7 +679,8 @@ PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
     std::size_t k = 0;
     while (k < spanCount) {
         std::size_t j = k;
-        while (j + 1 < spanCount && traced[j + 1] == traced[k] && gap[j + 1] == gap[k]) {
+        while (j + 1 < spanCount && traced[j + 1] == traced[k] && gap[j + 1] == gap[k] &&
+               damaged[j + 1] == damaged[k]) {
             ++j;
         }
         const std::size_t begin = searchSortedLeft(
@@ -685,6 +693,7 @@ PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
             Run run;
             run.traced = traced[k];
             run.gap = gap[k];
+            run.damaged = damaged[k];
             run.firstControl = static_cast<int>(k);
             run.lastControl = static_cast<int>(j + 1);
             run.points.assign(geo.samples.begin() + static_cast<std::ptrdiff_t>(from),
@@ -827,14 +836,18 @@ std::vector<QPointF> displayRunPoints(const PlacedFiber& fiber, std::size_t runI
     // starting at the fiber's first sample (or ending at its last) has no
     // overlap there, and the control sits on that sample, so the replacement
     // is a no-op.
-    const bool previousIsGap = runIndex > 0 && fiber.runs[runIndex - 1].gap;
-    const bool nextIsGap = runIndex + 1 < fiber.runs.size() && fiber.runs[runIndex + 1].gap;
-    if (run.gap || previousIsGap) {
+    // Gap and damaged runs are "styled" runs: they and their neighbours meet
+    // exactly at the shared control so no ordinary stroke shows under the
+    // first dashes and no dashes run past the span.
+    const auto styled = [](const Run& other) { return other.gap || other.damaged; };
+    const bool previousStyled = runIndex > 0 && styled(fiber.runs[runIndex - 1]);
+    const bool nextStyled = runIndex + 1 < fiber.runs.size() && styled(fiber.runs[runIndex + 1]);
+    if (styled(run) || previousStyled) {
         if (const QPointF* first = control(run.firstControl)) {
             points.front() = *first;
         }
     }
-    if (run.gap || nextIsGap) {
+    if (styled(run) || nextStyled) {
         if (const QPointF* last = control(run.lastControl)) {
             points.back() = *last;
         }
@@ -2069,6 +2082,10 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
         for (const bool gapSpan : fiber.gapSegments) {
             hashU64(digest, gapSpan ? 1 : 0);
         }
+        hashU64(digest, fiber.damagedSegments.size());
+        for (const bool damagedSpan : fiber.damagedSegments) {
+            hashU64(digest, damagedSpan ? 1 : 0);
+        }
         hashU64(digest, fiber.links.size());
         for (const InputLink& link : fiber.links) {
             hashU64(digest, static_cast<uint64_t>(
@@ -2166,6 +2183,7 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         for (const Run& run : fiber.fiber.runs) {
             hashU64(digest, run.traced ? 1 : 0);
             hashU64(digest, run.gap ? 1 : 0);
+            hashU64(digest, run.damaged ? 1 : 0);
             hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(run.firstControl)));
             hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(run.lastControl)));
             hashU64(digest, run.points.size());

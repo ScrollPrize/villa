@@ -1429,6 +1429,71 @@ private slots:
                              [](const vc3d::fiber_map::Run& run) { return run.gap; }));
     }
 
+    // --- Damaged spans: a third display-only span style, drawn as its own
+    // run, never together with a gap, and hashed into the session digests.
+    void damagedSpansMakeTheirOwnRuns()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        const GlobalLayoutParams params = defaultParams();
+        std::vector<InputFiber> fibers = cacheFixture();
+        const uint64_t id = fibers.front().id;
+        const std::size_t controlCount = fibers.front().controlPoints.size();
+        QVERIFY(controlCount >= 3);
+
+        vc3d::fiber_map::GlobalLayoutCache cache;
+        const GlobalResult plain =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        fibers.front().damagedSegments.assign(controlCount - 1, false);
+        fibers.front().damagedSegments[0] = true;
+        const GlobalResult damaged =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        const GlobalPlacedFiber* placed = findFiber(damaged, id);
+        QVERIFY(placed != nullptr);
+        QCOMPARE(cache.lastStats().fibersRecomputed, 0);
+        std::size_t damagedRuns = 0;
+        for (const vc3d::fiber_map::Run& run : placed->fiber.runs) {
+            if (run.damaged) {
+                ++damagedRuns;
+                QVERIFY(!run.gap);
+                QCOMPARE(run.firstControl, 0);
+                QCOMPARE(run.lastControl, 1);
+            }
+        }
+        QCOMPARE(damagedRuns, std::size_t{1});
+        // Drawn exactly to its controls, like a gap run, and its neighbour
+        // stops at the shared control instead of overlapping into it.
+        {
+            const auto near = [](const QPointF& a, const QPointF& b) {
+                return std::hypot(a.x() - b.x(), a.y() - b.y()) < 1e-6;
+            };
+            const std::vector<QPointF> shown = vc3d::fiber_map::displayRunPoints(placed->fiber, 0);
+            QVERIFY(shown.size() >= 2);
+            QVERIFY(near(shown.front(), placed->fiber.controlPoints[0]));
+            QVERIFY(near(shown.back(), placed->fiber.controlPoints[1]));
+            QVERIFY(placed->fiber.runs.size() >= 2);
+            const std::vector<QPointF> after = vc3d::fiber_map::displayRunPoints(placed->fiber, 1);
+            QVERIFY(near(after.front(), placed->fiber.controlPoints[1]));
+            QVERIFY(!near(placed->fiber.runs[1].points.front(), placed->fiber.controlPoints[1]));
+        }
+        QVERIFY(!(vc3d::fiber_map::digestGlobalInputs(fibers, umbilicus, params) ==
+                  vc3d::fiber_map::digestGlobalInputs(cacheFixture(), umbilicus, params)));
+        QVERIFY(!(vc3d::fiber_map::digestGlobalResult(damaged) ==
+                  vc3d::fiber_map::digestGlobalResult(plain)));
+
+        // The gap wins where both flags are set on the same span.
+        fibers.front().gapSegments.assign(controlCount - 1, false);
+        fibers.front().gapSegments[0] = true;
+        const GlobalResult both =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        const GlobalPlacedFiber* bothPlaced = findFiber(both, id);
+        QVERIFY(bothPlaced != nullptr);
+        for (const vc3d::fiber_map::Run& run : bothPlaced->fiber.runs) {
+            QVERIFY(!run.damaged);
+        }
+        QVERIFY(std::any_of(bothPlaced->fiber.runs.begin(), bothPlaced->fiber.runs.end(),
+                            [](const vc3d::fiber_map::Run& run) { return run.gap; }));
+    }
+
     // A folded pair's crossings are read together: one group with a verdict,
     // every event carried out for inspection, no rings while the map honours
     // the verdict - and the verdict recovers the winding gap of one.

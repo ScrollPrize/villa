@@ -256,6 +256,13 @@ inline constexpr const char* kBreakTag = "break";
 // until a break is removed, and takes the cubic-spline goal when it forms.
 inline constexpr const char* kGapSpanTag = "gap";
 
+// Span tag: the span follows the fiber correctly, but the papyrus there is
+// damaged, so the section is worth knowing about later. Set from the span
+// menu; changes nothing about the points, the goal or the geometry. Drawn as
+// alternating amber and red dashes. Never on a gap span (a gap wins: making
+// a span a gap clears this tag).
+inline constexpr const char* kDamagedSpanTag = "damaged";
+
 // The vc3d_fiber format version VC3D writes. Version 4 is version 3 plus the
 // optional span `tags` array; a version-3 span carrying tags is rejected so
 // the version is a true signal of what a file may contain.
@@ -307,8 +314,15 @@ bool syncGapSpanTags(std::vector<StoredControlPoint>& controls);
 // other goal is left alone). The break toggle applies the same policy through
 // the controller's goal path so it can start the re-solve itself.
 GapSpanSync applyGapSpanPolicy(std::vector<LineControlPoint>& controls);
+// The same for stored controls (a merge's or split's result, held in memory
+// before it is saved): pairs by index, returns whether anything changed.
+bool applyGapSpanPolicy(std::vector<StoredControlPoint>& controls);
 // Whether the span owned by `control` is a gap span (carries kGapSpanTag).
 [[nodiscard]] bool spanIsGap(const std::optional<FiberTraceSegmentMetadata>& metadata) noexcept;
+[[nodiscard]] bool spanIsDamaged(const std::optional<FiberTraceSegmentMetadata>& metadata) noexcept;
+// Sets or clears a span tag on the span descriptor. Never creates a
+// descriptor (a control without one owns no span). Returns whether it changed.
+bool setSpanTag(std::optional<FiberTraceSegmentMetadata>& metadata, std::string_view tag, bool enabled);
 
 enum class FiberTraceState {
     Legacy,       // no prediction-traced spans in the stored geometry

@@ -103,6 +103,16 @@ QColor generatedBreakColor(int alpha)
     return QColor(255, 196, 0, alpha);
 }
 
+QColor generatedGapLineColor(int alpha)
+{
+    return QColor(235, 120, 120, alpha);
+}
+
+QColor generatedDamagedColor(int alpha)
+{
+    return QColor(255, 170, 205, alpha);
+}
+
 QPainterPath generatedTriangleMarkerPath(const QPointF& center, qreal radius)
 {
     // Vertices at -90, 30 and 150 degrees: apex up.
@@ -303,11 +313,67 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
 
     // A gap span (both endpoint controls tagged break) replaces the fiber's
     // own line with a dotted amber one. Same z as the line it stands in for.
+    // Dashes three pen widths long, six apart (in pen widths): long enough
+    // to read as a broken line at any zoom, unlike the fine dots of the rings.
     ViewerOverlayControllerBase::OverlayStyle gapLineStyle;
-    gapLineStyle.penColor = generatedBreakColor(220);
+    gapLineStyle.penColor = generatedGapLineColor(230);
     gapLineStyle.penWidth = 1.5;
-    gapLineStyle.penStyle = Qt::DotLine;
+    gapLineStyle.penStyle = Qt::CustomDashLine;
+    gapLineStyle.penCap = Qt::FlatCap;
+    gapLineStyle.dashPattern = {kSpanDashOn, kSpanDashOff};
     gapLineStyle.z = 150.0;
+
+    // A damaged span: the same dashes in the pastel pink.
+    ViewerOverlayControllerBase::OverlayStyle damagedLineStyle = gapLineStyle;
+    damagedLineStyle.penColor = generatedDamagedColor(230);
+    // Which of the fiber's span styles a stretch of line takes.
+    enum class SpanStyle { Line, Gap, Damaged };
+    const auto spanStyleAt = [&overlay](double previousLinePosition, double currentLinePosition) {
+        if (generatedLineSegmentInGap(previousLinePosition, currentLinePosition, overlay.gapLineRanges)) {
+            return SpanStyle::Gap;
+        }
+        if (generatedLineSegmentInGap(previousLinePosition, currentLinePosition,
+                                      overlay.damagedLineRanges)) {
+            return SpanStyle::Damaged;
+        }
+        return SpanStyle::Line;
+    };
+    const auto pushStyledStrip = [&](std::vector<QPointF> points, SpanStyle spanStyle) {
+        if (points.size() < 2) {
+            return;
+        }
+        switch (spanStyle) {
+        case SpanStyle::Gap:
+            primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                std::move(points), false, gapLineStyle});
+            break;
+        case SpanStyle::Damaged:
+            primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                std::move(points), false, damagedLineStyle});
+            break;
+        case SpanStyle::Line:
+            primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                std::move(points), false, lineStyle});
+            break;
+        }
+    };
+    const auto pushStyledSurfaceStrip = [&](float x0, float x1, float y, SpanStyle spanStyle) {
+        const std::vector<cv::Vec2f> points{cv::Vec2f(x0, y), cv::Vec2f(x1, y)};
+        switch (spanStyle) {
+        case SpanStyle::Gap:
+            primitives.push_back(ViewerOverlayControllerBase::SurfaceLineStripPrimitive{
+                points, false, gapLineStyle});
+            break;
+        case SpanStyle::Damaged:
+            primitives.push_back(ViewerOverlayControllerBase::SurfaceLineStripPrimitive{
+                points, false, damagedLineStyle});
+            break;
+        case SpanStyle::Line:
+            primitives.push_back(ViewerOverlayControllerBase::SurfaceLineStripPrimitive{
+                points, false, lineStyle});
+            break;
+        }
+    };
 
     ViewerOverlayControllerBase::OverlayStyle seedStyle;
     seedStyle.penColor = QColor(255, 230, 0, 220);
@@ -343,24 +409,18 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     linkCandidateControlPointStyle.brushColor = QColor(60, 235, 120, 175);
     linkCandidateControlPointStyle.z = 163.0;
 
-    ViewerOverlayControllerBase::OverlayStyle splitCandidateControlPointStyle = branchControlPointStyle;
-    splitCandidateControlPointStyle.penColor = QColor(235, 60, 60, 245);
-    splitCandidateControlPointStyle.brushColor = QColor(235, 60, 60, 175);
-    splitCandidateControlPointStyle.z = 163.5;
 
     // The transient candidate designations outrank the tag: a candidate keeps
     // its own colour and size (the fast current-cut overlay does the same).
     const auto drawsKollesisRing = [](const GeneratedOverlay::ControlPointMarker& control) {
-        return control.isKollesisTermination && !control.isSplitCandidate &&
-               !control.isLinkCandidate;
+        return control.isKollesisTermination && !control.isLinkCandidate;
     };
     // A break point: dotted amber ring, same size step as the kollesis ring.
     // A point somehow carrying both tags (an edited file) draws as the
     // kollesis termination.
     const auto drawsBreakRing = [&drawsKollesisRing](
                                     const GeneratedOverlay::ControlPointMarker& control) {
-        return control.isBreak && !control.isSplitCandidate && !control.isLinkCandidate &&
-               !drawsKollesisRing(control);
+        return control.isBreak && !control.isLinkCandidate && !drawsKollesisRing(control);
     };
     const auto drawsTagRing = [&](const GeneratedOverlay::ControlPointMarker& control) {
         return drawsKollesisRing(control) || drawsBreakRing(control);
@@ -369,17 +429,11 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     // the point designated as an adjacent link candidate (a split candidate
     // keeps its own red circle).
     auto drawsTriangle = [](const GeneratedOverlay::ControlPointMarker& control) {
-        if (control.isSplitCandidate) {
-            return false;
-        }
         return control.isAdjacentLinkCandidate ||
                (control.hasAdjacentLinks && !control.isLinkCandidate);
     };
     auto controlStyleForMarker = [&](const GeneratedOverlay::ControlPointMarker& control)
         -> ViewerOverlayControllerBase::OverlayStyle {
-        if (control.isSplitCandidate) {
-            return splitCandidateControlPointStyle;
-        }
         if (control.isLinkCandidate) {
             return linkCandidateControlPointStyle;
         }
@@ -541,39 +595,43 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                     static_cast<float>(quad->gridToSurface({0.0, centerGridRow})[0]);
                 const float lineEndX = static_cast<float>(
                     quad->gridToSurface({static_cast<double>(points->cols - 1), centerGridRow})[0]);
-                std::vector<std::pair<float, float>> gapPieces;
-                for (const auto& [first, second] : overlay.gapLineRanges) {
-                    const float x0 = surfaceXForLinePosition(
-                        std::clamp(first, 0.0, maximumLinePosition));
-                    const float x1 = surfaceXForLinePosition(
-                        std::clamp(second, 0.0, maximumLinePosition));
-                    if (std::isfinite(x0) && std::isfinite(x1) && x1 > x0) {
-                        gapPieces.emplace_back(std::clamp(x0, lineStartX, lineEndX),
-                                               std::clamp(x1, lineStartX, lineEndX));
+                struct StyledPiece {
+                    float x0;
+                    float x1;
+                    SpanStyle spanStyle;
+                    bool operator<(const StyledPiece& other) const { return x0 < other.x0; }
+                };
+                std::vector<StyledPiece> pieces;
+                const auto collectPieces = [&](const std::vector<std::pair<double, double>>& ranges,
+                                               SpanStyle spanStyle) {
+                    for (const auto& [first, second] : ranges) {
+                        const float x0 = surfaceXForLinePosition(
+                            std::clamp(first, 0.0, maximumLinePosition));
+                        const float x1 = surfaceXForLinePosition(
+                            std::clamp(second, 0.0, maximumLinePosition));
+                        if (std::isfinite(x0) && std::isfinite(x1) && x1 > x0) {
+                            pieces.push_back({std::clamp(x0, lineStartX, lineEndX),
+                                              std::clamp(x1, lineStartX, lineEndX),
+                                              spanStyle});
+                        }
                     }
-                }
-                std::sort(gapPieces.begin(), gapPieces.end());
+                };
+                collectPieces(overlay.gapLineRanges, SpanStyle::Gap);
+                collectPieces(overlay.damagedLineRanges, SpanStyle::Damaged);
+                std::sort(pieces.begin(), pieces.end());
                 float cursorX = lineStartX;
-                for (const auto& [x0, x1] : gapPieces) {
-                    if (x0 > cursorX) {
-                        primitives.push_back(ViewerOverlayControllerBase::SurfaceLineStripPrimitive{
-                            {cv::Vec2f(cursorX, surfaceY), cv::Vec2f(x0, surfaceY)},
-                            false,
-                            lineStyle});
+                for (const auto& piece : pieces) {
+                    if (piece.x0 > cursorX) {
+                        pushStyledSurfaceStrip(cursorX, piece.x0, surfaceY, SpanStyle::Line);
                     }
-                    if (x1 > std::max(cursorX, x0)) {
-                        primitives.push_back(ViewerOverlayControllerBase::SurfaceLineStripPrimitive{
-                            {cv::Vec2f(std::max(cursorX, x0), surfaceY), cv::Vec2f(x1, surfaceY)},
-                            false,
-                            gapLineStyle});
+                    const float from = std::max(cursorX, piece.x0);
+                    if (piece.x1 > from) {
+                        pushStyledSurfaceStrip(from, piece.x1, surfaceY, piece.spanStyle);
                     }
-                    cursorX = std::max(cursorX, x1);
+                    cursorX = std::max(cursorX, piece.x1);
                 }
                 if (lineEndX > cursorX) {
-                    primitives.push_back(ViewerOverlayControllerBase::SurfaceLineStripPrimitive{
-                        {cv::Vec2f(cursorX, surfaceY), cv::Vec2f(lineEndX, surfaceY)},
-                        false,
-                        lineStyle});
+                    pushStyledSurfaceStrip(cursorX, lineEndX, surfaceY, SpanStyle::Line);
                 }
             }
             if (overlay.controlPoints.empty() &&
@@ -824,17 +882,12 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         // primitive per segment meant one QGraphicsPathItem per segment,
         // and rebuilding thousands of scene items per overlay refresh
         // dominated zoom/pan lag on long fibers.
-        // A run also ends where the line enters or leaves a gap span, so the
-        // gap draws in its own dotted amber style.
+        // A run also ends where the line enters or leaves a gap or damaged
+        // span, so each draws in its own style.
         std::vector<QPointF> run;
-        bool runInGap = false;
+        SpanStyle runStyle = SpanStyle::Line;
         const auto flushRun = [&]() {
-            if (run.size() >= 2) {
-                primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
-                    std::move(run),
-                    false,
-                    runInGap ? gapLineStyle : lineStyle});
-            }
+            pushStyledStrip(std::move(run), runStyle);
             run = {};
         };
         for (size_t i = 1; i < sceneLine.size(); ++i) {
@@ -844,14 +897,13 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                 flushRun();
                 continue;
             }
-            const bool inGap =
-                generatedLineSegmentInGap(previous.second, current.second, overlay.gapLineRanges);
-            if (!run.empty() && inGap != runInGap) {
+            const SpanStyle spanStyle = spanStyleAt(previous.second, current.second);
+            if (!run.empty() && spanStyle != runStyle) {
                 flushRun();
             }
             if (run.empty()) {
                 run.push_back(previous.first);
-                runInGap = inGap;
+                runStyle = spanStyle;
             }
             run.push_back(current.first);
         }
@@ -904,6 +956,148 @@ void clearGeneratedControlPointContextPreview(CChunkedVolumeViewer* viewer,
         "line_annotation_control_context_" + surfaceName,
         {});
 }
+
+namespace {
+
+// The span menu: `ownerRank` indexes sortedControls (by line position); the
+// span runs from that control to the next.
+GeneratedControlPointContextResult showGeneratedSpanContextMenu(
+    const GeneratedControlPointContextMenuOptions& options,
+    QuadSurface* quad,
+    const std::vector<const GeneratedOverlay::ControlPointMarker*>& sortedControls,
+    size_t ownerRank)
+{
+    const auto& owner = *sortedControls[ownerRank];
+    const auto& next = *sortedControls[ownerRank + 1];
+
+    // Preview: the span itself, highlighted on the centre line.
+    {
+        const QPointF a = generatedStripControlPointToScene(
+            options.viewer, quad, owner, options.stripPositionMap);
+        const QPointF b = generatedStripControlPointToScene(
+            options.viewer, quad, next, options.stripPositionMap);
+        if (finiteScenePoint(a) && finiteScenePoint(b)) {
+            ViewerOverlayControllerBase::OverlayStyle previewStyle;
+            previewStyle.penColor = QColor(255, 120, 40, 245);
+            previewStyle.penWidth = 4.0;
+            previewStyle.z = 180.0;
+            std::vector<ViewerOverlayControllerBase::OverlayPrimitive> primitives;
+            primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                {a, b}, false, previewStyle});
+            ViewerOverlayControllerBase::applyPrimitives(
+                options.viewer,
+                "line_annotation_control_context_" + options.surfaceName,
+                std::move(primitives));
+        }
+    }
+
+    QMenu menu(options.parent);
+    // The span's state as text, so the metadata can be read, not only seen.
+    QString state = QWidget::tr("%1, goal %2")
+                        .arg(QChar(owner.interpolationModeMarker))
+                        .arg(QString::fromStdString(owner.interpolationGoal));
+    if (owner.hasGapToNext) {
+        state += QWidget::tr(", gap");
+    } else if (owner.hasDamagedToNext) {
+        state += QWidget::tr(", damaged");
+    }
+    QAction* header = menu.addAction(
+        QWidget::tr("Span CP %1 to CP %2 (%3)")
+            .arg(QString::number(owner.controlIndex), QString::number(next.controlIndex), state));
+    header->setEnabled(false);
+    menu.addSeparator();
+
+    std::vector<std::pair<QAction*, std::string>> goalActions;
+    {
+        QMenu* goalMenu = menu.addMenu(QWidget::tr("Interpolation goal"));
+        const std::array<std::pair<const char*, const char*>, 4> goals{{
+            {"Global", "global"},
+            {"Cubic spline", "cspline"},
+            {"Lasagna", "lasagna"},
+            {"Fiber trace", "trace"},
+        }};
+        for (const auto& [label, value] : goals) {
+            QAction* action = goalMenu->addAction(QWidget::tr(label));
+            action->setCheckable(true);
+            action->setChecked(owner.interpolationGoal == value);
+            goalActions.push_back({action, value});
+        }
+    }
+
+    QAction* gapAction = nullptr;
+    if (options.setSpanGap) {
+        // Making the span a gap tags both ends as breaks. A break at or
+        // immediately next to a kollesis termination is refused altogether.
+        const bool nextToKollesis =
+            owner.isKollesisTermination || next.isKollesisTermination ||
+            (ownerRank > 0 && sortedControls[ownerRank - 1]->isKollesisTermination) ||
+            (ownerRank + 2 < sortedControls.size() &&
+             sortedControls[ownerRank + 2]->isKollesisTermination);
+        const bool blocked = !owner.hasGapToNext && nextToKollesis;
+        gapAction = menu.addAction(
+            blocked ? QWidget::tr("Gap (at or next to a kollesis termination)")
+                    : QWidget::tr("Gap"));
+        gapAction->setCheckable(true);
+        gapAction->setChecked(owner.hasGapToNext);
+        gapAction->setEnabled(!blocked);
+    }
+    QAction* damagedAction = nullptr;
+    if (options.setSpanDamaged) {
+        // Never on a gap span: the papyrus there is missing, not hurt.
+        const bool blocked = owner.hasGapToNext;
+        damagedAction = menu.addAction(
+            blocked ? QWidget::tr("Damaged (gap span)") : QWidget::tr("Damaged"));
+        damagedAction->setCheckable(true);
+        damagedAction->setChecked(owner.hasDamagedToNext);
+        damagedAction->setEnabled(!blocked);
+    }
+
+    QAction* splitAction = nullptr;
+    QAction* splitAndLinkAction = nullptr;
+    if (options.splitSpan) {
+        menu.addSeparator();
+        // Each half keeps at least 2 control points: the prefix ends at the
+        // owner, the suffix starts at the next control.
+        const bool enabled = ownerRank + 1 >= 2 && sortedControls.size() - (ownerRank + 1) >= 2;
+        splitAction = menu.addAction(
+            enabled ? QWidget::tr("Split, different windings")
+                    : QWidget::tr("Split (needs 2 control points per half)"));
+        splitAction->setEnabled(enabled);
+        splitAndLinkAction = menu.addAction(QWidget::tr("Split and link, same winding"));
+        splitAndLinkAction->setEnabled(enabled);
+    }
+
+    QAction* selected = menu.exec(options.globalPos);
+    clearGeneratedControlPointContextPreview(options.viewer, options.surfaceName);
+    if (!selected) {
+        return GeneratedControlPointContextResult::Handled;
+    }
+    for (const auto& [action, goal] : goalActions) {
+        if (selected == action) {
+            options.setSegmentInterpolationGoal(owner.controlIndex, next.controlIndex, goal);
+            return GeneratedControlPointContextResult::Handled;
+        }
+    }
+    if (gapAction && selected == gapAction && gapAction->isEnabled()) {
+        options.setSpanGap(owner.controlIndex, next.controlIndex, !owner.hasGapToNext);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (damagedAction && selected == damagedAction && damagedAction->isEnabled()) {
+        options.setSpanDamaged(owner.controlIndex, next.controlIndex, !owner.hasDamagedToNext);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (splitAction && selected == splitAction && splitAction->isEnabled()) {
+        options.splitSpan(owner.controlIndex, next.controlIndex, false);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (splitAndLinkAction && selected == splitAndLinkAction && splitAndLinkAction->isEnabled()) {
+        options.splitSpan(owner.controlIndex, next.controlIndex, true);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    return GeneratedControlPointContextResult::Handled;
+}
+
+} // namespace
 
 GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     const GeneratedControlPointContextMenuOptions& options)
@@ -982,6 +1176,39 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     };
 
     clearGeneratedControlPointContextPreview(options.viewer, options.surfaceName);
+
+    // On a strip, a click on the centre line away from every control point
+    // is a SPAN click: the span containing the click's line position gets its
+    // own menu (goal, gap, damaged, split). Within a control marker's reach
+    // the point menu wins, so a point sitting on the line stays reachable;
+    // far from both, the nearest-point fallback below stands.
+    if (options.stripViewer && options.setSegmentInterpolationGoal) {
+        constexpr double kControlHitThreshold = 12.0;
+        constexpr double kLineHitThreshold = 12.0;
+        auto* quad = dynamic_cast<QuadSurface*>(options.viewer->currentSurface());
+        const QPointF lineScene = generatedStripLinePositionToScene(
+            options.viewer, quad, options.linePosition, &options.stripPositionMap);
+        if (bestDistanceSq > kControlHitThreshold * kControlHitThreshold &&
+            finiteScenePoint(lineScene) &&
+            std::abs(lineScene.y() - options.scenePoint.y()) <= kLineHitThreshold) {
+            std::vector<const GeneratedOverlay::ControlPointMarker*> sortedControls;
+            for (const auto& control : options.controlPoints) {
+                if (control.controlIndex != std::numeric_limits<size_t>::max() &&
+                    validGeneratedLinePosition(control.linePosition, options.linePointCount)) {
+                    sortedControls.push_back(&control);
+                }
+            }
+            std::sort(sortedControls.begin(), sortedControls.end(),
+                      [](const auto* a, const auto* b) { return a->linePosition < b->linePosition; });
+            for (size_t rank = 1; rank < sortedControls.size(); ++rank) {
+                if (options.linePosition > sortedControls[rank - 1]->linePosition &&
+                    options.linePosition < sortedControls[rank]->linePosition) {
+                    return showGeneratedSpanContextMenu(options, quad, sortedControls, rank - 1);
+                }
+            }
+        }
+    }
+
     if (finiteScenePoint(options.scenePoint) && finiteScenePoint(targetScene)) {
         ViewerOverlayControllerBase::OverlayStyle previewStyle;
         previewStyle.penColor = QColor(255, 120, 40, 245);
@@ -1010,75 +1237,7 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             ? selectedIndex
             : selectedControl.controlIndex;
 
-    std::optional<std::pair<size_t, size_t>> traceSegment;
-    if (options.setSegmentInterpolationGoal &&
-        (QApplication::keyboardModifiers() & Qt::ControlModifier)) {
-        std::vector<const GeneratedOverlay::ControlPointMarker*> sortedControls;
-        sortedControls.reserve(options.controlPoints.size());
-        for (const auto& control : options.controlPoints) {
-            if (control.controlIndex == std::numeric_limits<size_t>::max() ||
-                !validGeneratedLinePosition(control.linePosition, options.linePointCount)) {
-                continue;
-            }
-            sortedControls.push_back(&control);
-        }
-        std::sort(sortedControls.begin(), sortedControls.end(), [](const auto* a, const auto* b) {
-            return a->linePosition < b->linePosition;
-        });
-        for (size_t i = 1; i < sortedControls.size(); ++i) {
-            const auto* prev = sortedControls[i - 1];
-            const auto* next = sortedControls[i];
-            if (options.linePosition >= prev->linePosition &&
-                options.linePosition <= next->linePosition) {
-                traceSegment = {prev->controlIndex, next->controlIndex};
-                break;
-            }
-        }
-        if (!traceSegment && sortedControls.size() >= 2) {
-            for (size_t i = 0; i < sortedControls.size(); ++i) {
-                if (sortedControls[i]->controlIndex != selectedControlIndex) {
-                    continue;
-                }
-                if (i + 1 < sortedControls.size()) {
-                    traceSegment = {
-                        sortedControls[i]->controlIndex,
-                        sortedControls[i + 1]->controlIndex};
-                } else if (i > 0) {
-                    traceSegment = {
-                        sortedControls[i - 1]->controlIndex,
-                        sortedControls[i]->controlIndex};
-                }
-                break;
-            }
-        }
-    }
-
     QMenu menu(options.parent);
-    std::vector<std::pair<QAction*, std::string>> interpolationGoalActions;
-    if (traceSegment) {
-        const auto owner = std::find_if(
-            options.controlPoints.begin(),
-            options.controlPoints.end(),
-            [ownerIndex = traceSegment->first](const auto& control) {
-                return control.controlIndex == ownerIndex;
-            });
-        const std::string currentGoal = owner != options.controlPoints.end()
-            ? owner->interpolationGoal
-            : "global";
-        QMenu* interpolationMenu = menu.addMenu(QWidget::tr("Interpolation goal"));
-        const std::array<std::pair<const char*, const char*>, 4> goals{{
-            {"Global", "global"},
-            {"Cubic spline", "cspline"},
-            {"Lasagna", "lasagna"},
-            {"Fiber trace", "trace"},
-        }};
-        for (const auto& [label, value] : goals) {
-            QAction* action = interpolationMenu->addAction(QWidget::tr(label));
-            action->setCheckable(true);
-            action->setChecked(currentGoal == value);
-            interpolationGoalActions.push_back({action, value});
-        }
-    }
     QAction* deleteAction = menu.addAction(QWidget::tr("Delete control point"));
     deleteAction->setEnabled(options.controlPoints.size() > 1);
     QAction* kollesisTerminationAction = nullptr;
@@ -1106,11 +1265,16 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         // Any point can be a break; adding the tag to a kollesis termination
         // is refused (one or the other). Removing a tag is always possible.
         const bool haveIndex = selectedControlIndex != std::numeric_limits<size_t>::max();
+        // ... and never immediately next to one: the span between a break
+        // and a termination could otherwise become a gap at the sheet join.
         const bool blockedByKollesis =
-            selectedControl.isKollesisTermination && !selectedControl.isBreak;
+            !selectedControl.isBreak &&
+            (selectedControl.isKollesisTermination ||
+             generatedLineOrderNeighbourIsKollesisTermination(options.controlPoints,
+                                                             selectedControlIndex));
         const bool enabled = haveIndex && !blockedByKollesis;
         breakAction = menu.addAction(
-            blockedByKollesis ? QWidget::tr("Break (point is a kollesis termination)")
+            blockedByKollesis ? QWidget::tr("Break (at or next to a kollesis termination)")
                               : QWidget::tr("Break"));
         breakAction->setCheckable(true);
         breakAction->setChecked(selectedControl.isBreak);
@@ -1131,15 +1295,6 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         designateAdjacentLinkCandidateAction->setEnabled(
             selectedControlIndex != std::numeric_limits<size_t>::max() &&
             !selectedControl.hasBranches);
-    }
-    // Linked CPs are legal split points (their links are remapped onto the
-    // halves), so unlike the link candidate there is no hasBranches gate.
-    QAction* designateSplitCandidateAction = nullptr;
-    if (options.designateSplitCandidate) {
-        designateSplitCandidateAction =
-            menu.addAction(QWidget::tr("Designate as split candidate"));
-        designateSplitCandidateAction->setEnabled(
-            selectedControlIndex != std::numeric_limits<size_t>::max());
     }
     std::vector<std::pair<QAction*, GeneratedOverlay::ControlPointMarker::BranchLink>> openBranchActions;
     if (!selectedControl.branchLinks.empty()) {
@@ -1242,22 +1397,6 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             options.mergeWithCandidateEnabled &&
             selectedControlIndex != std::numeric_limits<size_t>::max());
     }
-    QAction* splitFromCandidateAction = nullptr;
-    if (options.splitFromCandidate && !options.splitFromCandidateLabel.isEmpty()) {
-        splitFromCandidateAction = menu.addAction(options.splitFromCandidateLabel);
-        splitFromCandidateAction->setEnabled(
-            options.splitFromCandidateEnabled &&
-            selectedControlIndex != std::numeric_limits<size_t>::max());
-    }
-    QAction* splitFromCandidateAndLinkAction = nullptr;
-    if (options.splitFromCandidateAndLink &&
-        !options.splitFromCandidateAndLinkLabel.isEmpty()) {
-        splitFromCandidateAndLinkAction =
-            menu.addAction(options.splitFromCandidateAndLinkLabel);
-        splitFromCandidateAndLinkAction->setEnabled(
-            options.splitFromCandidateEnabled &&
-            selectedControlIndex != std::numeric_limits<size_t>::max());
-    }
     QAction* openNearbyAnnotationAction = nullptr;
     if (options.openNearbyAnnotation && nearbyIntersection) {
         openNearbyAnnotationAction = menu.addAction(
@@ -1282,13 +1421,6 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     if (breakAction && selected == breakAction && breakAction->isEnabled()) {
         options.setBreak(selectedControlIndex, !selectedControl.isBreak);
         return GeneratedControlPointContextResult::Handled;
-    }
-    for (const auto& [action, goal] : interpolationGoalActions) {
-        if (selected == action) {
-            options.setSegmentInterpolationGoal(
-                traceSegment->first, traceSegment->second, goal);
-            return GeneratedControlPointContextResult::Handled;
-        }
     }
     for (const auto& [action, branch] : openBranchActions) {
         if (selected == action && action->isEnabled()) {
@@ -1352,24 +1484,6 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         selected == mergeWithCandidateAction &&
         mergeWithCandidateAction->isEnabled()) {
         options.mergeWithCandidate(selectedControlIndex, selectedControl.point);
-        return GeneratedControlPointContextResult::Handled;
-    }
-    if (designateSplitCandidateAction &&
-        selected == designateSplitCandidateAction &&
-        designateSplitCandidateAction->isEnabled()) {
-        options.designateSplitCandidate(selectedControlIndex, selectedControl.point);
-        return GeneratedControlPointContextResult::Handled;
-    }
-    if (splitFromCandidateAction &&
-        selected == splitFromCandidateAction &&
-        splitFromCandidateAction->isEnabled()) {
-        options.splitFromCandidate(selectedControlIndex, selectedControl.point);
-        return GeneratedControlPointContextResult::Handled;
-    }
-    if (splitFromCandidateAndLinkAction &&
-        selected == splitFromCandidateAndLinkAction &&
-        splitFromCandidateAndLinkAction->isEnabled()) {
-        options.splitFromCandidateAndLink(selectedControlIndex, selectedControl.point);
         return GeneratedControlPointContextResult::Handled;
     }
     if (openNearbyAnnotationAction && selected == openNearbyAnnotationAction) {

@@ -773,14 +773,46 @@ def _find_link(entries, branch, used):
     return None
 
 
+def _span_tags_of(doc):
+    """The span tags of a document, per non-final control (empty when the
+    version predates span tags)."""
+    if doc.get('version', 1) < 4:
+        return []
+    tags = []
+    for cp in (doc.get('control_points') or [])[:-1]:
+        segment = cp.get('segment_to_next') if isinstance(cp, dict) else None
+        tags.append(list(segment.get('tags') or [])
+                    if isinstance(segment, dict) else [])
+    return tags
+
+
+def base_carries_regressable_metadata(base_doc):
+    """Whether a last-synced copy holds anything an older writer's re-save
+    could silently drop (adjacent links, span tags), i.e. whether
+    legacy_regression could ever report against it. vc_sync uses this to skip
+    fetching a changed remote fiber when nothing could have been lost."""
+    return (is_fiber_doc(base_doc) and
+            (bool(_branches_of(base_doc, 'adjacent_branches')) or
+             any(_span_tags_of(base_doc))))
+
+
 def legacy_regression(doc, base_doc):
-    """An older writer dropped an array that contained adjacent links.
-    An explicitly empty array is a deliberate deletion, not a regression."""
-    if (is_fiber_doc(doc) and is_fiber_doc(base_doc) and
-            _branches_of(base_doc, 'adjacent_branches') and
+    """An older writer dropped something a newer one had written: an array
+    that contained adjacent links (an explicitly empty array is a deliberate
+    deletion, not a regression), or, for a version-3 save over a version-4
+    base, the span tags (`gap`, `damaged`) that a version-3 writer cannot
+    carry. Either is a conflict for manual resolution, not a silent loss."""
+    if not (is_fiber_doc(doc) and is_fiber_doc(base_doc)):
+        return None
+    if (_branches_of(base_doc, 'adjacent_branches') and
             'adjacent_branches' not in doc):
         return ("adjacent_branches is missing (saved by an older VC3D?) "
                 "where the last-synced copy had adjacent links")
+    if (base_doc.get('version', 1) >= 4 and doc.get('version', 1) < 4 and
+            any(_span_tags_of(base_doc))):
+        return ("saved as version 3 (by an older VC3D?) where the last-synced "
+                "copy was version 4 with span tags (gap/damaged); the tags "
+                "would be lost")
     return None
 
 
@@ -1055,8 +1087,18 @@ def merge_fibers(base, local, remote):
     if stripped:
         result['conflicts'] = stripped
         return result
+
+    def lineage_version(doc):
+        # Any version-4 input makes the output version 4, on the shortcuts
+        # too: a side an older build re-saved as version 3 must not pull the
+        # file back below what the base and the other side already are.
+        version = max(int(d.get('version', 1)) for d in (base, local, remote))
+        if version >= 3 and int(doc.get('version', 1)) >= 3:
+            doc['version'] = version
+        return doc
+
     if local == remote or remote == base:
-        merged = copy.deepcopy(local)
+        merged = lineage_version(copy.deepcopy(local))
         result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(local),
                       notes=(["remote side unchanged; kept local"]
@@ -1064,7 +1106,7 @@ def merge_fibers(base, local, remote):
                              ["both sides identical"]))
         return result
     if local == base:
-        merged = copy.deepcopy(remote)
+        merged = lineage_version(copy.deepcopy(remote))
         result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(remote),
                       notes=["local side unchanged; took remote"])

@@ -1317,6 +1317,23 @@ bool spanIsGap(const std::optional<FiberTraceSegmentMetadata>& metadata) noexcep
     return metadata && hasControlPointTag(metadata->tags, kGapSpanTag);
 }
 
+bool spanIsDamaged(const std::optional<FiberTraceSegmentMetadata>& metadata) noexcept
+{
+    return metadata && hasControlPointTag(metadata->tags, kDamagedSpanTag);
+}
+
+bool setSpanTag(std::optional<FiberTraceSegmentMetadata>& metadata, std::string_view tag, bool enabled)
+{
+    // Never creates a descriptor: a control without one is the fiber's final
+    // control (the v3/v4 contract), which owns no span, and the peer-pane
+    // mirroring reaches controls the initiating pane cannot see (a peer that
+    // has since deleted the span's other end).
+    if (!metadata) {
+        return false;
+    }
+    return setControlPointTag(metadata->tags, tag, enabled);
+}
+
 GapSpanSync syncGapSpanTags(std::vector<LineControlPoint>& controls)
 {
     std::vector<bool> shouldBeGap(controls.size(), false);
@@ -1336,6 +1353,8 @@ GapSpanSync syncGapSpanTags(std::vector<LineControlPoint>& controls)
             if (setControlPointTag(metadata->tags, kGapSpanTag, true)) {
                 sync.formed.push_back(i);
             }
+            // A gap wins over damaged: the span is missing, not merely hurt.
+            setControlPointTag(metadata->tags, kDamagedSpanTag, false);
         } else if (metadata && setControlPointTag(metadata->tags, kGapSpanTag, false)) {
             sync.dissolved.push_back(i);
         }
@@ -1358,6 +1377,31 @@ GapSpanSync applyGapSpanPolicy(std::vector<LineControlPoint>& controls)
     return sync;
 }
 
+bool applyGapSpanPolicy(std::vector<StoredControlPoint>& controls)
+{
+    std::vector<bool> gapBefore(controls.size(), false);
+    for (size_t i = 0; i < controls.size(); ++i) {
+        gapBefore[i] = spanIsGap(controls[i].segmentToNext);
+    }
+    bool changed = syncGapSpanTags(controls);
+    for (size_t i = 0; i < controls.size(); ++i) {
+        auto& metadata = controls[i].segmentToNext;
+        if (!metadata) {
+            continue;
+        }
+        const bool gapNow = spanIsGap(metadata);
+        if (gapNow && !gapBefore[i] && metadata->interpGoal != SegmentInterpolationGoal::Cspline) {
+            metadata->interpGoal = SegmentInterpolationGoal::Cspline;
+            changed = true;
+        } else if (!gapNow && gapBefore[i] &&
+                   metadata->interpGoal == SegmentInterpolationGoal::Cspline) {
+            metadata->interpGoal = SegmentInterpolationGoal::Global;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 bool syncGapSpanTags(std::vector<StoredControlPoint>& controls)
 {
     bool changed = false;
@@ -1373,6 +1417,7 @@ bool syncGapSpanTags(std::vector<StoredControlPoint>& controls)
                 metadata->message = "lasagna";
             }
             changed = setControlPointTag(metadata->tags, kGapSpanTag, true) || changed;
+            changed = setControlPointTag(metadata->tags, kDamagedSpanTag, false) || changed;
         } else if (metadata) {
             changed = setControlPointTag(metadata->tags, kGapSpanTag, false) || changed;
         }
@@ -2358,7 +2403,16 @@ MergedSupersededSolve mergeSupersededSolveResult(
     for (size_t i = 0; i < currentSpanCount; ++i) {
         if (adopt[i]) {
             const auto j = static_cast<size_t>(solvedSpanForCurrentSpan[i]);
+            // The solved descriptor carries the span tags of the solve's
+            // snapshot; the current controls are the authority for tags (a
+            // damaged toggle mirrored in during the solve lives only here).
+            const std::vector<std::string> currentSpanTags =
+                out.controls[i].segmentToNext ? out.controls[i].segmentToNext->tags
+                                              : std::vector<std::string>{};
             out.controls[i].segmentToNext = solvedControls[j].segmentToNext;
+            if (out.controls[i].segmentToNext) {
+                out.controls[i].segmentToNext->tags = currentSpanTags;
+            }
         }
     }
     for (size_t k = 0; k < out.controls.size(); ++k) {

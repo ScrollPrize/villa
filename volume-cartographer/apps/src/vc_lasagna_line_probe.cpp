@@ -281,6 +281,11 @@ void saveFiberOutput(const FiberInput& fiber,
             }
             root["control_points"].push_back(std::move(control));
         }
+        // The span tags follow VC3D's rule (gap iff both ends are breaks,
+        // never damaged on a gap), so a version-3 input with two consecutive
+        // breaks comes out as a consistent version-4 file rather than one
+        // VC3D has to heal on load.
+        vc::fiber_tracer::normalizeGapSpanTagsJson(root["control_points"]);
         root["line_points"] = nlohmann::json::array();
         for (const auto& point : outputLinePoints)
             root["line_points"].push_back(pointToJson(point));

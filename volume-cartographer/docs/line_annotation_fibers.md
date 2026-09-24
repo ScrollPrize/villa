@@ -9,8 +9,9 @@ strings on each span descriptor, written only when non-empty, so a span
 without tags serializes exactly as in version 3. A version-3 span carrying
 `tags` is rejected, so the version is a true signal of what a file may
 contain. Every loader (the core strict loader, VC3D, the python format
-package, `fiber_merge`) accepts versions 1, 3 and 4; VC3D and the lasagna
-line probe write 4. The merge tool treats 3 and 4 as one lineage (a v3 base
+package, `fiber_merge`) accepts versions 1, 3 and 4; VC3D writes 4, and so
+does the lasagna line probe for a re-optimized result (its plain `--output`
+copy still copies the validated input as-is, whatever its version). The merge tool treats 3 and 4 as one lineage (a v3 base
 with v4 sides is the normal state after an upgrade, not a conflict) and
 writes the merge as version 4 when any side is 4. Builds older than version 4
 refuse to load a version-4 file. A control point
@@ -63,7 +64,10 @@ another control point between them.
 A gap span is closed to placement: the click, the `/` and `0` keys and the
 current-position marker (cut views, strips, overview bar and the
 intersection-inspection panes) treat any line position strictly inside it as
-blocked (red marker) until one of the breaks is removed. When a gap span
+blocked (red marker) until one of the breaks is removed. A break is refused
+at or immediately next to a kollesis termination (line-order neighbours), from
+the point menu and the span menu alike, so the span next to a sheet join can
+never become a gap. When a gap span
 forms, its `interp_goal` becomes `cspline` and the span is re-solved (the
 toggle through the same path as the menu's "Interpolation goal", a structural
 edit within the solve it starts anyway), so the line bridges the break as a
@@ -78,14 +82,44 @@ read as text.
 Break points draw as a dotted ring in the break amber (255, 196, 0), one
 step larger than a filled point, in the cut and strip views, the overview
 bar and the Fiber Map (a linked break keeps its link-state fill inside the
-ring). A gap span draws as a dotted amber line in place of the fiber's own
-line in the side cut, the strips and the overview bar; linked and nearby
+ring). A gap span draws as a dashed pastel-red line (235, 120, 120) in place of the
+fiber's own line in the side cut, the strips and the overview bar; linked and nearby
 fibers keep their solid purple line. The Fiber Map draws every fiber's gap
-spans as dotted amber runs trimmed exactly to the two control points at draw
+spans as dotted pastel-red runs trimmed exactly to the two control points at draw
 time (the layout's own run geometry, which seeds the gap heat map, is
 unchanged), in place of the traced or interpolated style, and marks every
 break point with the dotted amber rim. The flag is display-only in the map:
 it does not change heat-map seeding, winding evidence or publishing.
+
+## Span menu (strips)
+
+In the strip views a Ctrl+right-click on the centre line, away from every
+control point marker (12 scene units from a marker, within 12 of the line),
+opens the **span menu** for the span containing the click's line position;
+within a marker's reach the point menu opens as before, and far from both the
+nearest-point fallback stands. The span menu shows the span's state (mode
+marker, goal, gap or damaged) and holds everything that acts on a span:
+
+- **Interpolation goal** (Global / Cubic spline / Lasagna / Fiber trace):
+  lives here and nowhere else now.
+- **Gap** (toggle): tags both ends as breaks, which makes the span a gap
+  through the usual sync and goal policy; refused at or next to a kollesis
+  termination. Unchecking removes the break only from ends no other gap span
+  depends on. Making a span a gap clears its damaged tag.
+- **Damaged** (toggle): the span tag `damaged`; the line is correct but the
+  papyrus there is damaged. Changes nothing about the points, the goal or the
+  geometry. Never on a gap span. Drawn like a gap span, dashed, but in a
+  pastel pink (255, 170, 205) where the gap line is a pastel red (235, 120,
+  120), in the side cut, the strips, the overview bar and the Fiber Map; the
+  span label appends "damaged".
+- **Split, different windings** and **Split and link, same winding**: remove
+  the span. Both halves are saved as brand-new fibers with the
+  reoptimization tag and their branch links remapped, the original is
+  deleted and its workspace closes; nothing is reopened. The second variant
+  also records a pending reciprocal link between the two new ends. Each half
+  needs at least two control points. The split-candidate tooling (red
+  candidate marker, "Designate as split candidate", "Split from candidate",
+  "Split from candidate and link") is gone.
 
 The top-level `optimization_mode` is either `lasagna` or
 `native_fiber_trace3d`. It is required in version 3; only legacy version-1

@@ -183,6 +183,9 @@ public:
         // Per control-point span: the span descriptor carries the gap span
         // tag (dotted amber run in the map). Size max(0, controlPoints - 1).
         std::vector<bool> gapSegments;
+        // Per control-point span: the damaged span tag (alternating amber
+        // and red dashes in the map). Same size.
+        std::vector<bool> damagedSegments;
         // Branch links resolving to a loaded fiber, pending included.
         std::vector<FiberMapLink> links;
     };
@@ -773,15 +776,48 @@ private:
     void handleGeneratedControlPointSetBreak(const std::string& surfaceName,
                                              size_t controlPointIndex,
                                              bool enabled);
-    // Shared body of the two tag toggles: guards, the tag edit, the stored
-    // fiber mirror + save (rolled back if the save cannot be scheduled),
-    // the same edit on every other pane showing this fiber, and the overlay
-    // refreshes. Returns false when nothing changed or the toggle was refused.
+    // Shared body of every per-control edit that is fiber content but not
+    // geometry (point tags, span tags): guards, `edit` on the named control,
+    // the gap span sync, the stored fiber mirror + save (the whole control
+    // list is restored from a pre-edit snapshot if the save cannot be
+    // scheduled, since the sync may have touched neighbouring spans), the
+    // same edit on the matching control of every other pane showing this
+    // fiber (and their rollback snapshots), and the overlay refreshes.
+    // Returns false when nothing changed or the edit was refused.
+    using ControlPointEdit = std::function<bool(vc3d::line_annotation::LineControlPoint&)>;
+    bool applyControlPointEditAndPersist(const std::string& surfaceName,
+                                         size_t controlPointIndex,
+                                         const QString& pendingSolveMessage,
+                                         const ControlPointEdit& edit);
+    // Whether adding `tag` to the control (or the matching control of any
+    // other pane showing this fiber, or of their rollback snapshots) would
+    // combine the kollesis and break tags.
+    [[nodiscard]] bool controlPointTagConflictsAcrossPanes(const LineAnnotationSession& session,
+                                                           size_t controlPointIndex,
+                                                           const char* tag) const;
+    // The point-tag toggle over applyControlPointEditAndPersist, with the
+    // kollesis/break exclusion preflight across panes.
     bool setControlPointTagAndPersist(const std::string& surfaceName,
                                       size_t controlPointIndex,
                                       const char* tag,
                                       bool enabled,
                                       const QString& pendingSolveMessage);
+    // After a break tag edit: the gap spans that formed take the cubic-spline
+    // goal, those that dissolved while still cspline return to global, each
+    // through applySegmentInterpolationGoals.
+    void reconcileGapGoalsAfterBreakEdit(LineAnnotationSession& session,
+                                         const std::vector<size_t>& gapOwnersBefore,
+                                         bool enabled);
+    // The span menu captured its two controls before a nested event loop; a
+    // solve landing meanwhile can reorder the session. A span action runs
+    // only if the two are still neighbours in line-position order.
+    [[nodiscard]] bool spanControlsStillAdjacent(const LineAnnotationSession& session,
+                                                 size_t firstControlPointIndex,
+                                                 size_t secondControlPointIndex) const;
+    // A break is refused at or immediately next to a kollesis termination
+    // (line-order neighbours).
+    [[nodiscard]] bool breakRefusedNearKollesis(const LineAnnotationSession& session,
+                                                size_t controlPointIndex) const;
     // Sets the interpolation goal of the spans owned by `owners` and starts
     // the re-solve, with the mode-change rollback of the menu's goal change.
     // Returns false (nothing changed) when every span already has the goal.
@@ -805,19 +841,28 @@ private:
     void handleGeneratedControlPointMergeWithCandidate(const std::string& surfaceName,
                                                        size_t controlPointIndex,
                                                        cv::Vec3f volumePoint);
-    void handleGeneratedControlPointSplitCandidate(const std::string& surfaceName,
-                                                   size_t controlPointIndex,
-                                                   cv::Vec3f volumePoint);
-    // Splits the session's fiber between the split candidate and the clicked
-    // adjacent control point into two brand-new fibers (fresh identities,
-    // tags/mode/span metadata inherited, branch links remapped onto the
-    // halves), deletes the original, and reopens the candidate's half.
-    // linkHalves additionally records a reciprocal branch link between the
-    // two boundary control points ("Split from candidate and link").
-    void handleGeneratedControlPointSplitFromCandidate(const std::string& surfaceName,
-                                                       size_t controlPointIndex,
-                                                       cv::Vec3f volumePoint,
-                                                       bool linkHalves);
+    // Span menu (strips). Removes the span between the two (line-order
+    // adjacent) control points: both halves become brand-new fibers (fresh
+    // identities, tags/mode/span metadata inherited, branch links remapped
+    // onto the halves), the original is deleted and its workspace closed;
+    // nothing is reopened. linkHalves additionally records a reciprocal
+    // pending branch link between the two new ends ("same winding").
+    void handleGeneratedSpanSplit(const std::string& surfaceName,
+                                  size_t firstControlPointIndex,
+                                  size_t secondControlPointIndex,
+                                  bool linkHalves);
+    // Span menu: make the span a gap by tagging both ends as breaks (refused
+    // at or next to a kollesis termination), or undo that, removing the break
+    // only from ends no other gap span depends on.
+    void handleGeneratedSpanSetGap(const std::string& surfaceName,
+                                   size_t firstControlPointIndex,
+                                   size_t secondControlPointIndex,
+                                   bool enabled);
+    // Span menu: toggle the damaged span tag (never on a gap span).
+    void handleGeneratedSpanSetDamaged(const std::string& surfaceName,
+                                       size_t firstControlPointIndex,
+                                       size_t secondControlPointIndex,
+                                       bool enabled);
     void handleGeneratedOpenNearbyAnnotation(uint64_t fiberId, cv::Vec3f volumePoint);
     void handleGeneratedControlPointUnlink(const std::string& surfaceName,
                                            size_t controlPointIndex,
@@ -832,10 +877,6 @@ private:
         controlMarkersForSession(const LineAnnotationSession& session) const;
     [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
         linkCandidateMenuState(const LineAnnotationSession& session) const;
-    [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
-        splitCandidateMenuState(const LineAnnotationSession& session) const;
-    [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
-        splitAndLinkCandidateMenuState(const LineAnnotationSession& session) const;
     [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
         mergeCandidateMenuState(const LineAnnotationSession& session) const;
     [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
@@ -1425,9 +1466,8 @@ private:
     mutable QString _lastSuppressedError;
 
     // Transient (in-memory only) staging state for a designated control
-    // point: linking two CPs across fibers (_linkCandidate) or splitting a
-    // fiber between adjacent CPs (_splitCandidate). Position is the primary
-    // key; the stored index is a hint re-resolved at use time because
+    // point: linking two CPs across fibers (_linkCandidate). Position is the
+    // primary key; the stored index is a hint re-resolved at use time because
     // indices are remapped on save.
     struct LinkCandidate {
         uint64_t fiberId = 0;
@@ -1439,7 +1479,6 @@ private:
         bool adjacent = false;
     };
     std::optional<LinkCandidate> _linkCandidate;
-    std::optional<LinkCandidate> _splitCandidate;
 
     // Private pool for line-optimization solves. Its own pool rather than the
     // global one so teardown is bounded by waitForDone() in the destructor

@@ -191,6 +191,17 @@ QColor breakColor(int alpha)
     return vc3d::line_annotation::generatedBreakColor(alpha);
 }
 
+QColor gapLineColor(int alpha)
+{
+    return vc3d::line_annotation::generatedGapLineColor(alpha);
+}
+
+QColor damagedColor(int alpha)
+{
+    return vc3d::line_annotation::generatedDamagedColor(alpha);
+}
+
+
 // A link is same-type only when both fibers carry the same known H/V tag; an
 // unknown tag on either end falls back to the cross-type colours.
 const LinkPalette& linkPalette(char hvTagA, char hvTagB, bool pending)
@@ -328,6 +339,14 @@ QPen dottedPen(const QColor& color, qreal width)
     return pen;
 }
 
+// The map keeps the fine dots for gap runs (the dialog's longer dashes are
+// sized for its 1.5 px line; the map's cosmetic runs read better dotted).
+QPen gapPen(const QColor& color, qreal width)
+{
+    return dottedPen(color, width);
+}
+
+
 QPen interpolatedPen(const QColor& color, qreal width)
 {
     QPen pen(color);
@@ -435,12 +454,15 @@ std::vector<QImage> colourGapTiles(const vc3d::fiber_map::gaps::GapField& field,
 
 // The three run styles are mutually exclusive: a gap run is neither traced
 // nor interpolated for drawing purposes.
-enum class RunKind { Traced, Interpolated, Gap };
+enum class RunKind { Traced, Interpolated, Gap, Damaged };
 
 RunKind runKind(const vc3d::fiber_map::Run& run)
 {
     if (run.gap) {
         return RunKind::Gap;
+    }
+    if (run.damaged) {
+        return RunKind::Damaged;
     }
     return run.traced ? RunKind::Traced : RunKind::Interpolated;
 }
@@ -1468,6 +1490,7 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
             input.kollesisTerminations = std::move(fiber.kollesisTerminations);
             input.breaks = std::move(fiber.breaks);
             input.gapSegments = std::move(fiber.gapSegments);
+            input.damagedSegments = std::move(fiber.damagedSegments);
             input.links.reserve(fiber.links.size());
             for (const auto& link : fiber.links) {
                 input.links.push_back(
@@ -2200,8 +2223,14 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         }
         const QPainterPath gapPath = pathForRuns(entry.fiber, RunKind::Gap);
         if (!gapPath.isEmpty()) {
-            entry.gapItem = _scene->addPath(gapPath, dottedPen(breakColor(255), kTracedWidth));
+            entry.gapItem = _scene->addPath(gapPath, gapPen(gapLineColor(255), kTracedWidth));
             entry.gapItem->setZValue(kFiberZ);
+        }
+        const QPainterPath damagedPath = pathForRuns(entry.fiber, RunKind::Damaged);
+        if (!damagedPath.isEmpty()) {
+            entry.damagedItem =
+                _scene->addPath(damagedPath, gapPen(damagedColor(255), kTracedWidth));
+            entry.damagedItem->setZValue(kFiberZ);
         }
 
         // Label chip at whichever fiber end sits nearest a map edge
@@ -2834,9 +2863,14 @@ void FiberMapWorkspace::paintFiberEmphasis(FiberEntry& entry,
         entry.interpolatedItem->setZValue(selected ? kHighlightZ : kFiberZ);
     }
     if (entry.gapItem) {
-        entry.gapItem->setPen(dottedPen(
-            breakColor(255), selected ? kTracedHighlightWidth : kTracedWidth));
+        entry.gapItem->setPen(gapPen(
+            gapLineColor(255), selected ? kTracedHighlightWidth : kTracedWidth));
         entry.gapItem->setZValue(selected ? kHighlightZ : kFiberZ);
+    }
+    if (entry.damagedItem) {
+        entry.damagedItem->setPen(gapPen(
+            damagedColor(255), selected ? kTracedHighlightWidth : kTracedWidth));
+        entry.damagedItem->setZValue(selected ? kHighlightZ : kFiberZ);
     }
     // The network role adds a halo behind the unchanged lines; every other
     // role removes it. The halo strokes the fiber's whole geometry (traced

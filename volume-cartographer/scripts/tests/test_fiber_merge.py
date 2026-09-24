@@ -1870,3 +1870,56 @@ def test_v3_remote_still_merges_with_a_v4_local():
     assert result['ok'], result['conflicts']
     assert result['merged']['version'] == 4
     assert loader_issues({'dj_x_000001.json': result['merged']}) == []
+
+
+def test_v3_side_from_an_old_build_does_not_pull_a_v4_file_back():
+    """A one-sided shortcut result is written at the lineage's highest
+    version: base v4, remote v4 unchanged, local re-saved by an old build as
+    v3 (span tags dropped) still merges to version 4."""
+    base = make_v3_fiber(BASE_CPS)
+    base['version'] = 4
+    remote = copy.deepcopy(base)
+    local = copy.deepcopy(base)
+    local['version'] = 3
+    local['generation'] = 2
+    set_v3_span(local, 1, goal='cspline', bend=1.5)
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    assert result['merged']['version'] == 4
+    assert result['merged']['control_points'][1]['segment_to_next']['interp_goal'] == 'cspline'
+    assert loader_issues({'dj_x_000001.json': result['merged']}) == []
+
+
+def test_v3_save_over_a_v4_base_with_span_tags_is_a_regression_conflict():
+    """An older build re-saving a fiber whose last-synced copy carried span
+    tags cannot have kept them: that is a conflict for manual resolution
+    (before the merge shortcuts and in vc_sync's upload guard), not a silent
+    loss. A v4 base WITHOUT span tags re-saved as v3 is fine."""
+    base = make_v3_fiber(BASE_CPS)
+    make_v4_gap(base, 1)
+    stale = copy.deepcopy(base)
+    stale['version'] = 3
+    for cp in stale['control_points'][:-1]:
+        cp['segment_to_next'].pop('tags', None)
+    stale['generation'] = 2
+    set_v3_span(stale, 5, goal='lasagna', bend=-2.0)
+    assert fiber_merge.legacy_regression(stale, base)
+    # Shortcut path: remote unchanged, local is the stale v3 save.
+    result = merge_fibers(base, stale, copy.deepcopy(base))
+    assert not result['ok']
+    assert any('span tags' in c for c in result['conflicts'])
+    # Content-merge path: remote changed too.
+    remote = copy.deepcopy(base)
+    remote['generation'] = 3
+    set_v3_span(remote, 3, goal='cspline', bend=1.0)
+    result = merge_fibers(base, stale, remote)
+    assert not result['ok']
+    assert any('span tags' in c for c in result['conflicts'])
+    # No span tags in the base: a v3 re-save is no regression.
+    plain = make_v3_fiber(BASE_CPS)
+    plain['version'] = 4
+    downgraded = copy.deepcopy(plain)
+    downgraded['version'] = 3
+    assert fiber_merge.legacy_regression(downgraded, plain) is None

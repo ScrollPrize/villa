@@ -80,6 +80,9 @@ struct InputFiber {
     // (drawn as a dotted amber run). Display only, same rules; empty or
     // mismatched means no gaps.
     std::vector<bool> gapSegments;
+    // Per control-point span: the damaged span tag (alternating amber and
+    // red dashes). Display only, same rules.
+    std::vector<bool> damagedSegments;
     // Raw directed refs; the layout dedupes reciprocal pairs.
     std::vector<InputLink> links;
 };
@@ -121,6 +124,8 @@ struct LayoutParams {
 struct Run {
     bool traced = true;
     bool gap = false;
+    // The damaged span tag; never together with gap (the gap wins).
+    bool damaged = false;
     // The controls (indices into PlacedFiber::controlPoints) bounding the
     // run's spans; -1 when the run is the whole fiber without span flags.
     int firstControl = -1;
@@ -145,10 +150,10 @@ struct PlacedFiber {
 };
 
 // The points to DRAW for fiber.runs[runIndex]: the run's own points, except
-// that a gap run, and any run next to one, ends exactly at the shared
-// control's position on the curve instead of one sample past it, so the
-// dotted amber covers the gap span and nothing else and no solid stroke runs
-// on underneath it. Runs away from every gap are returned unchanged.
+// that a gap or damaged run, and any run next to one, ends exactly at the
+// shared control's position on the curve instead of one sample past it, so
+// the dashes cover their span and nothing else and no solid stroke runs on
+// underneath them. Runs away from every gap or damaged span are unchanged.
 [[nodiscard]] std::vector<QPointF> displayRunPoints(const PlacedFiber& fiber,
                                                     std::size_t runIndex);
 
