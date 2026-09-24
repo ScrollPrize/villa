@@ -856,6 +856,7 @@ if(VC_TESTING)
         test_chunked_tensor_meta
         test_growth_config
         test_growth_helpers
+        test_reference_ray_occlusion_cost
         test_surf_tracker_data
         test_neural_tracer_connection
         bench_lasagna_line_edit
