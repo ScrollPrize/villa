@@ -129,6 +129,33 @@ specifically):
 }
 ```
 
+## Lasagna inputs must be packed first
+
+`fit_spiral.py` reads `normal_x`, `normal_y` and `gradient_magnitude` only
+through the resident-pool sidecars that `pack_resident_pools.py` writes
+(`lasagna_data.py`: there is no other loading path). Before the first fit on a
+dataset, pack the stores at the group named by `normal_zarr_group` in
+`spiral-scroll.json`:
+
+```sh
+python pack_resident_pools.py <dataset>/lasagna_inputs \
+    --what normals,grad_mag --normal-group 2
+```
+
+The packer looks for `*_nx.ome.zarr`, `*_ny.ome.zarr` and `*_grad_mag.ome.zarr`
+in that folder and writes `<store>.respool_g<group>_pair` (normals) and
+`<store>.respool_g<group>` (grad_mag) next to them. Without the sidecars the fit
+stops at input loading with
+
+```
+lasagna normals: resident-pool sidecar '.../PHercXXXX_nx.ome.zarr.respool_g2_pair' not found; build it with pack_resident_pools.py ...
+```
+
+The packer only iterates over chunk files that exist, so a store that holds only
+the z chunk rows of your fit window packs correctly; rows outside it read back
+as no-data. Pass `--ct <scroll zarr> --ct-group <group>` to drop bricks outside
+the CT mask.
+
 ## Sweep runner output
 
 `runners/run_sweep.py` prefixes each active fit's live `PROGRESS` and
