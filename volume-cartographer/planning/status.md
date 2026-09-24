@@ -1,8 +1,8 @@
 # Status
 
-- [x] Inspect main, caller contracts and relevant cache requirements.
-- [x] Independent plan review (fixture construction clarifications incorporated).
-- [x] Regression tests fail before the fix (also reproduced with Paris4 data).
-- [x] Implement the decode fix and API documentation.
-- [x] Run focused tests and independent code review.
-- [x] Record results and prepare PR preview for approval (not published).
+- [x] Audit regression and agree scope with user
+- [x] Remove custom surface and restore baseline construction
+- [x] Restore stable display tangent and center
+- [x] Keep CP displacement and provenance
+- [x] Build VC3D and run six focused C++ suites and 127 Python tests
+- [ ] User verification of live panning and strip-edge appearance

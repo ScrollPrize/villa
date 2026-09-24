@@ -134,6 +134,8 @@ struct FiberTraceSegmentMetadata {
     std::string detail);
 
 struct LineControlPoint : vc::lasagna::LineControlPoint {
+    std::optional<cv::Vec3d> displayNormal;
+    std::string displayNormalSource = "unknown";
     std::optional<FiberTraceSegmentMetadata> segmentToNext;
     // Per-control-point tags (see kKollesisTerminationTag). Sorted, unique,
     // non-empty; they belong to the point itself and travel with it through
@@ -214,6 +216,8 @@ struct PreparedControlPointEdit {
     double linePosition);
 
 struct StoredControlPoint : cv::Vec3d {
+    std::optional<cv::Vec3d> displayNormal;
+    std::string displayNormalSource = "unknown";
     std::optional<FiberTraceSegmentMetadata> segmentToNext;
     // Serialized as the control point's optional "tags" array; omitted when
     // empty so untagged fibers are written exactly as before.

@@ -59,7 +59,6 @@ overlapping edits. Callers keep pre-merge copies of every input.
 import copy
 import json
 import math
-import uuid
 
 POS_TOL = 1.0e-6
 LINE_POS_TOL = 1.0e-8
@@ -76,101 +75,6 @@ REVIEWED_TAG = 'reviewed'
 # ^ the human review verdict and vc_sync.py hfsync's default publish gate;
 #   keep the literal in sync with kReviewedTag in
 #   apps/VC3D/LineAnnotationFiberSegments.hpp.
-
-
-def _cross_sections_by_id(doc):
-    """Return ``cross_sections`` indexed by canonical stable UUID.
-
-    The merge layer owns collection validity and identity. The VC3D fiber
-    parser owns the versioned contents of each record, so records remain
-    atomic here instead of duplicating that schema in Python.
-
-    Missing ``cross_sections`` is the legacy spelling of an empty collection.
-    ``None`` and malformed/duplicate identifiers are invalid rather than being
-    silently discarded.
-    """
-    records = doc.get('cross_sections', [])
-    if not isinstance(records, list):
-        return None
-    indexed = {}
-    for record in records:
-        if not isinstance(record, dict):
-            return None
-        record_id = record.get('id')
-        if not isinstance(record_id, str):
-            return None
-        try:
-            canonical_id = str(uuid.UUID(record_id))
-        except (ValueError, AttributeError):
-            return None
-        # Require the normal UUID text representation. This prevents aliases
-        # such as braced/hex-only spellings from bypassing duplicate detection.
-        if record_id != canonical_id or canonical_id in indexed:
-            return None
-        indexed[canonical_id] = record
-    return indexed
-
-
-def merge_cross_sections(base, local, remote):
-    """Merge atomic cross-section records by stable UUID.
-
-    Returns ``(records, conflicts)``. Output is sorted by UUID so the same
-    logical merge serializes deterministically regardless of input ordering.
-    """
-    indexed = [_cross_sections_by_id(doc) for doc in (base, local, remote)]
-    if any(records is None for records in indexed):
-        return None, ["cross_sections must contain objects with unique "
-                      "canonical UUID 'id' values"]
-    base_by_id, local_by_id, remote_by_id = indexed
-    merged = []
-    conflicts = []
-    all_ids = sorted(set(base_by_id) | set(local_by_id) | set(remote_by_id))
-    for record_id in all_ids:
-        base_record = base_by_id.get(record_id)
-        local_record = local_by_id.get(record_id)
-        remote_record = remote_by_id.get(record_id)
-
-        if base_record is None:
-            if local_record is None:
-                chosen = remote_record
-            elif remote_record is None:
-                chosen = local_record
-            elif local_record == remote_record:
-                chosen = local_record
-            else:
-                conflicts.append(
-                    f"cross_section {record_id} was added differently on both sides")
-                continue
-        elif local_record is None and remote_record is None:
-            chosen = None
-        elif local_record is None:
-            if remote_record == base_record:
-                chosen = None
-            else:
-                conflicts.append(
-                    f"cross_section {record_id} was deleted locally and edited remotely")
-                continue
-        elif remote_record is None:
-            if local_record == base_record:
-                chosen = None
-            else:
-                conflicts.append(
-                    f"cross_section {record_id} was edited locally and deleted remotely")
-                continue
-        elif local_record == remote_record:
-            chosen = local_record
-        elif local_record == base_record:
-            chosen = remote_record
-        elif remote_record == base_record:
-            chosen = local_record
-        else:
-            conflicts.append(
-                f"cross_section {record_id} was edited differently on both sides")
-            continue
-
-        if chosen is not None:
-            merged.append(copy.deepcopy(chosen))
-    return (None, conflicts) if conflicts else (merged, [])
 
 
 def _cp_position(value):
@@ -288,10 +192,13 @@ def is_fiber_doc(doc):
     if not (isinstance(doc, dict) and doc.get('type') == 'vc3d_fiber'):
         return False
     version = doc.get('version', 1)
-    if version not in (1, 3):
+    width = doc.get('width', 0)
+    if isinstance(width, bool) or not isinstance(width, (int, float)) or not math.isfinite(width) or width < 0:
         return False
-    if ('cross_sections' in doc and version != 3) or \
-            _cross_sections_by_id(doc) is None:
+    gap = doc.get('width_gap_fraction', 0.2)
+    if isinstance(gap, bool) or not isinstance(gap, (int, float)) or not math.isfinite(gap) or not 0 <= gap <= 1:
+        return False
+    if version not in (1, 3):
         return False
     if version == 3 and 'optimization_mode' not in doc:
         return False
@@ -313,8 +220,14 @@ def is_fiber_doc(doc):
     else:
         for index, cp in enumerate(control_points):
             if (not isinstance(cp, dict) or
-                    not set(cp) <= {'position', 'segment_to_next', 'tags'} or
+                    not set(cp) <= {'position', 'segment_to_next', 'tags', 'display_normal', 'display_normal_source'} or
                     not _finite_point(cp.get('position'))):
+                return False
+            if 'display_normal' in cp and _normalized(cp['display_normal']) is None:
+                return False
+            if 'display_normal_source' in cp and (
+                    'display_normal' not in cp or cp['display_normal_source'] not in
+                    ('manual', 'interpolated', 'unknown')):
                 return False
             # Optional per-CP tags (e.g. 'kollesis_termination'): the loader
             # takes an array of strings and nothing else.
@@ -1103,6 +1016,57 @@ def _merge_manual_hv_tag(base, local, remote, merged, notes):
     return None
 
 
+def _merge_display_annotations(base, local, remote, merged):
+    def choose(b, l, r, label):
+        if l == r or r == b:
+            return l
+        if l == b:
+            return r
+        raise ValueError(f"conflicting {label}")
+
+    width = choose(base.get('width', 0), local.get('width', 0), remote.get('width', 0), 'fiber widths')
+    merged['width_gap_fraction'] = choose(
+        *(doc.get('width_gap_fraction', 0.2) for doc in (base, local, remote)),
+        'fiber width gaps')
+    if width:
+        merged['width'] = width
+    else:
+        merged.pop('width', None)
+
+    def normal_at(doc, cp):
+        for p in doc['control_points']:
+            if pos_eq(_cp_position(p), _cp_position(cp)):
+                if isinstance(p, dict) and 'display_normal' in p:
+                    return (p['display_normal'], p.get('display_normal_source', 'unknown'))
+                return None
+        return None
+
+    for cp in merged['control_points']:
+        if not isinstance(cp, dict):
+            continue
+        normal = choose(*(normal_at(doc, cp) for doc in (base, local, remote)), 'CP display normals')
+        if normal is None:
+            cp.pop('display_normal', None)
+            cp.pop('display_normal_source', None)
+        else:
+            cp['display_normal'] = copy.deepcopy(normal[0])
+            cp['display_normal_source'] = normal[1]
+    for doc in (local, remote):
+        for cp in doc['control_points']:
+            if normal_at(doc, cp) != normal_at(base, cp) and not any(
+                    pos_eq(_cp_position(p), _cp_position(cp)) for p in merged['control_points']):
+                raise ValueError('display normal edited on a removed or moved CP')
+
+
+def _without_display_normals(doc):
+    doc = copy.deepcopy(doc)
+    for cp in doc['control_points']:
+        if isinstance(cp, dict):
+            cp.pop('display_normal', None)
+            cp.pop('display_normal_source', None)
+    return doc
+
+
 def merge_fibers(base, local, remote):
     """Three-way merge. Returns
     {'ok': bool, 'merged': dict|None, 'conflicts': [str], 'notes': [str],
@@ -1125,20 +1089,6 @@ def merge_fibers(base, local, remote):
                 f"'{field}' differs between versions: {sorted(values)}")
             return result
 
-    merged_cross_sections, cross_section_conflicts = merge_cross_sections(
-        base, local, remote)
-    if cross_section_conflicts:
-        result['conflicts'] = cross_section_conflicts
-        return result
-
-    def set_merged_cross_sections(doc):
-        if merged_cross_sections:
-            doc['cross_sections'] = copy.deepcopy(merged_cross_sections)
-        else:
-            # Keep the optional field absent for an empty collection. This
-            # also makes legacy missing fields and explicit [] equivalent.
-            doc.pop('cross_sections', None)
-
     # Short circuits: only one side truly changed, or both converged. The
     # winning content is a file VC3D itself wrote — normally consistent
     # with its peers, since VC3D writes both sides of a link in lockstep.
@@ -1149,13 +1099,19 @@ def merge_fibers(base, local, remote):
         return sorted({_branch_target(entry) for entry in links_to_any(doc)} |
                       {_branch_target(entry) for entry in links_to_any(base)})
 
+    def normal_defaults(doc):
+        for cp in doc['control_points']:
+            if isinstance(cp, dict) and 'display_normal' in cp:
+                cp.setdefault('display_normal_source', 'unknown')
+
     stripped = _stripped_array_conflicts(base, local, remote)
     if stripped:
         result['conflicts'] = stripped
         return result
     if local == remote or remote == base:
         merged = copy.deepcopy(local)
-        set_merged_cross_sections(merged)
+        merged.setdefault('width_gap_fraction', 0.2)
+        normal_defaults(merged)
         result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(local),
                       notes=(["remote side unchanged; kept local"]
@@ -1164,7 +1120,8 @@ def merge_fibers(base, local, remote):
         return result
     if local == base:
         merged = copy.deepcopy(remote)
-        set_merged_cross_sections(merged)
+        merged.setdefault('width_gap_fraction', 0.2)
+        normal_defaults(merged)
         result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(remote),
                       notes=["local side unchanged; took remote"])
@@ -1217,7 +1174,7 @@ def merge_fibers(base, local, remote):
 
     if base.get('version', 1) == 3:
         span_geometry, span_conflicts = merge_v3_span_geometry(
-            base, local, remote)
+            *(_without_display_normals(doc) for doc in (base, local, remote)))
         if span_conflicts:
             result['conflicts'] = span_conflicts
             return result
@@ -1321,9 +1278,13 @@ def merge_fibers(base, local, remote):
         stats['geometry_merged'] = bool(owners)
 
     merged = copy.deepcopy(newer)
-    set_merged_cross_sections(merged)
     merged['control_points'] = copy.deepcopy(carrier['control_points'])
     merged['line_points'] = copy.deepcopy(carrier['line_points'])
+    try:
+        _merge_display_annotations(base, local, remote, merged)
+    except ValueError as exc:
+        result['conflicts'] = [str(exc)]
+        return result
     if base.get('version', 1) == 3:
         merged['optimization_mode'] = mode
     if 'hv_classification' in carrier:

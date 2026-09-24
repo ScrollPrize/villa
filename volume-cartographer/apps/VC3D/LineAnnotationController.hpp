@@ -3,6 +3,7 @@
 #include <set>
 
 #include "FiberRuntimeIds.hpp"
+#include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include <QObject>
 #include <QPointF>
@@ -38,7 +39,6 @@
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
 #include "vc/core/util/ScrollUmbilicus.hpp"
-#include "vc/fiber_tracer/FiberCrossSection.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
@@ -495,6 +495,7 @@ public:
     [[nodiscard]] bool prepareForPackageSwitch();
 
 signals:
+    void volumeOverlayToggleRequested();
     void lineAnnotationWorkspaceRequested(LineAnnotationDialog* dialog, const QString& title);
     void fibersChanged(std::vector<LineAnnotationController::FiberSummary> fibers);
     void fiberAlignmentMetricsReset(bool pending);
@@ -548,6 +549,8 @@ private:
         std::vector<FiberSummary::AlignmentMetrics> spans;
     };
     struct StoredFiber {
+        double width = 0.0;
+        double widthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
         uint64_t id = 0;
         std::string username;
         std::string startedAt;
@@ -557,7 +560,6 @@ private:
         uint64_t generation = 1;
         std::vector<vc3d::line_annotation::StoredControlPoint> controlPoints;
         std::vector<cv::Vec3d> linePoints;
-        std::vector<vc::fiber_tracer::FiberCrossSectionAnnotation> crossSections;
         // Stored snapshots only. Live-session branch metadata must be converted
         // through storedFiberFromSession()/saveSessionAsFiber() so the central
         // hook can remap linked control-point indices before serialization.
@@ -700,7 +702,8 @@ private:
     void handleGeneratedControlPoint(const std::string& surfaceName,
                                      cv::Vec3f volumePoint,
                                      double linePosition,
-                                     std::optional<cv::Vec3f> lineAnchor = std::nullopt);
+                                     std::optional<cv::Vec3f> lineAnchor = std::nullopt,
+                                     std::optional<cv::Vec3d> displayNormal = std::nullopt);
     void handleGeneratedControlPointDelete(const std::string& surfaceName,
                                            double linePosition,
                                            cv::Vec3f volumePoint);
@@ -917,6 +920,8 @@ private:
     // NaN entries mark invalid samples.
     [[nodiscard]] std::vector<cv::Vec3f> orientedLineNormalsForSession(
         const LineAnnotationSession& session);
+    [[nodiscard]] vc::fiber_tracer::FiberDisplayField displayFieldForSession(
+        const LineAnnotationSession& session, const std::vector<cv::Vec3f>& orientedNormals) const;
     bool materializeGeneratedViews(LineAnnotationSession& session);
     bool materializeGeneratedViews(LineAnnotationSession& session,
                                    const std::string& surfacePrefix);
@@ -1085,8 +1090,7 @@ private:
     [[nodiscard]] StoredFiberSessionSnapshot makeStoredFiberSessionSnapshot(
         LineAnnotationSession& session);
     [[nodiscard]] StoredFiber storedFiberFromSession(LineAnnotationSession& session);
-    void saveSessionAsFiber(LineAnnotationSession& session,
-                            bool finalizeOptimization = true);
+    void saveSessionAsFiber(LineAnnotationSession& session);
     // Debounced autosave after a solve landing: consecutive landings coalesce
     // into one saveSessionAsFiber (with its no-op probe, fiber summary
     // rebuild, and linked-fiber sync) instead of paying it per landing. The
@@ -1154,6 +1158,8 @@ private:
     [[nodiscard]] std::shared_ptr<vc::lasagna::LasagnaDataset>
         resolveAlignmentMetricsDataset();
     void requestFiberAlignmentMetricsForFibers(std::vector<uint64_t> fiberIds);
+    void saveFiberDisplayAnnotations(LineAnnotationSession& session);
+    void setSessionFiberWidth(LineAnnotationSession& session, double width);
     void publishFiberAlignmentMetrics(uint64_t fiberId,
                                       CachedFiberAlignmentMetrics metrics);
     void publishPendingFiberAlignmentMetrics(const StoredFiber& fiber);

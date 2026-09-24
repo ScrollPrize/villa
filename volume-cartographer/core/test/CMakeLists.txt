@@ -257,9 +257,6 @@ vc_add_test(NAME test_fiber_trace3d
     LIBS doctest::doctest vc_fiber_tracer
     DEFS VC_TESTING)
 
-vc_add_test(NAME test_fiber_cross_section
-    LIBS doctest::doctest vc_core)
-
 # Qt-free data/IO layer.
 vc_add_test(NAME test_point_collections)
 

@@ -1,5 +1,16 @@
 # VC3D render and fetch specification
 
+## Native Bidirectional Trace Fusion
+
+- All callers use the shared native fusion implementation. Meeting positions
+  `Pf`, `Pr` with prefix arclengths `Lf`, `Lr` fuse at
+  `Pf + Lf/(Lf+Lr)*(Pr-Pf)`. Each prefix receives a linear arclength warp;
+  longer prefixes absorb proportionally more of the gap.
+- A zero-length prefix stays at its CP, with full endpoint correction on the
+  nonempty side. Never create an artificial connector for an empty prefix.
+- Candidate ranking, error metrics, acceptance and output spacing are unchanged.
+  This does not impose tangent continuity between separate CP spans.
+
 ## Invariants
 
 - Rendering values, interpolation, pyramid transforms, and cache contents must
@@ -326,29 +337,88 @@ During active remote downloads, the existing cache status bar appends:
   repaint requests happen on the UI thread, and diagnostics never queue chunks
   or alter request priority.
 
-## Fiber cross-section annotations
+## Fiber width and display normals
 
-- A version-3 fiber may contain an optional `cross_sections` collection. Every
-  record has a stable UUID, a version, a line or closed-polygon kind, 3D
-  vertices, an exact plane origin/normal/up frame, creation-time line position
-  and arclength, geometry generation, and detached status. Missing means empty.
-- Positions and arclength use the fiber's base-volume coordinate domain. Plane
-  normal and up are finite orthonormal unit vectors; all annotation vertices
-  are finite and coplanar. Lines contain exactly two distinct points. Polygon
-  closure is implicit and polygons have at least three distinct vertices,
-  nonzero area, and no self-intersection.
-- Annotation geometry and its recorded frame are fixed in world space.
-  Retracing changes only the current navigation projection and must not move the
-  annotation. Jumping restores the exact stored plane frame.
-- Cross-section edit mode consumes current-cut placement gestures. Drafts are
-  never persisted. Completed additions, vertex edits, insertions, deletions,
-  and record deletion are committed transactions using the ordinary queued
-  fiber save path, without triggering optimization or changing review tags.
-- Merge unions records by UUID and rejects different same-ID records. Split
-  assigns each record to the nearest surviving polyline, with prefix ownership
-  on ties; removed-span proximity sets detached status. Operations never
-  silently duplicate or discard records.
-- Remote three-way merge treats records atomically by UUID. Independent changes
-  combine, equal changes converge, unilateral deletion beats unchanged data,
-  and divergent edits, edit/delete pairs, and differing same-ID additions are
-  explicit conflicts. Output ordering is deterministic.
+CP normals carry `display_normal_source`: manual for explicit edits,
+interpolated for creation inheritance, unknown when provenance was not stored.
+Only manual normals qualify as manually annotated training data. Copy/merge
+the source with its vector; resets omit both JSON fields.
+
+Ribbons use ordinary QuadSurface geometry, rendering and indexed projection.
+Only construction resamples the polyline at the existing support spacing and
+builds transported, roll-smoothed frames with manual angular corrections.
+No cubic strip upsampling or custom runtime surface evaluator is permitted.
+Cross views retain windowed display tangents. CP displacement remains cubic,
+with zero derivatives at stationary controls and outer local-edit boundaries.
+
+The annotation toolbar has **Fiber width** (base voxels; 0 means unset) and
+**CP angle offset** (degrees). The angle control selects the nearest CP within
+the same arclength radius as CP replacement, and is disabled outside that radius.
+Setting an angle to zero removes its manual normal.
+
+Version-3 JSON stores optional top-level `width`, always-written top-level
+`width_gap_fraction` (default 0.2), and optional per-control-point
+`display_normal: [x,y,z]`. The latter is the baked world-space unit normal,
+not an angle. The gap is a dimensionless fraction between 0 and 1; missing
+values load as 0.2 and are explicitly written on the next save. Existing values
+are retained; there is currently no gap editor in the toolbar. Coordinates
+scale the width but never this fraction. The stored normal is projected into
+the current cross plane after movement,
+reoptimization, or Lasagna reload; the spinbox shows its angle relative to the
+current Lasagna normal. An unprojectable stored direction is cleared, saved,
+and reported with the number of affected CPs.
+
+Display offsets use bounded C1 smoothstep interpolation in arclength between
+CPs (shortest angular path). Unset CPs constrain the offset to zero. The viewer
+and annotation code share the cut-plane tangent calculation. Corrections affect
+the cross-section and both strips, never tracing, alignment metrics, or
+optimization inputs.
+
+Width draws inner and outer guide pairs at `(1-gap)*width` and
+`(1+gap)*width`: by default 80% and 120% of the full width
+(offsets +/-0.40 and +/-0.60 times width from the center). The top strip shows
+continuous boundaries; the cross view shows short ticks. Hovering either view
+shows cyan edge ticks in both panes around the same world-space hover position,
+projected into each view, to preview placement. Cursor ticks
+remain 12 screen pixels long; their spacing follows the physical width and
+view scale. They hide on leaving the view, invalid data, unset width or hiding
+width guides, independently of linked-cursor mirroring.
+Any manual normal enables a horizontal cross-view guide. Both guide types can
+be hidden in the annotation menu. Graphics items are reused; width paths change
+only when the width changes (short tick lengths also adapt on zoom), with
+transforms updated for navigation. Mouse movement only repositions the existing
+cursor overlay, without requesting a volume render.
+
+**Ctrl+Space** in the fiber annotation window toggles the existing volume
+overlay through the main window's shared toggle action. **Space** continues to
+toggle cross-view mouse-follow. The annotation menu also exposes the overlay
+toggle. This is independent of width/normal guide visibility.
+
+Edits use the ordinary queued fiber save/sync path without retracing or changing
+review tags. CP metadata follows CP movement, reversal and split; each split
+inherits width and gap. Joining fibers uses the clicked fiber's nonzero width
+and its gap, otherwise the other fiber's width and gap. Three-way sync merges
+width, gap and per-CP normal changes
+independently of span refits; divergent edits and edits to removed CPs conflict.
+
+The former cross-section polygon/line editor and `cross_sections` storage are
+removed. Old records are not migrated and are omitted when rewriting a fiber.
+
+## Cross-view Shift Drag
+
+New CP insertion inherits the existing effective display normal in corrected
+regions, evaluated before geometry changes. Baseline-only regions remain unset;
+replacement metadata and explicitly dragged normals take precedence.
+
+Shift-left-drag edits the nearest nominal width edge or center in the current
+cross view. Center movement preserves width and manual normal; edge movement
+uses the original opposite edge for orientation, places the selected edge at
+the mouse and the center half the unchanged width behind it. Store only CP
+position and baked display normal. Holding Shift accumulates multiple strokes
+in the preview, without reslicing or reoptimizing; release Shift to commit once
+through the regular CP-edit path (wait for mouse release if still dragging);
+cancel on Escape/focus loss/geometry replacement. No new persistent fields.
+The preview includes inner/outer width-tolerance ticks using the stored gap;
+they move and rotate with the dragged frame, with fixed screen length.
+Hide original normal/width guides and hover-width previews for the entire
+Shift-held sequence; restore their configured visibility on commit/cancel.

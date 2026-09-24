@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include <opencv2/core/types.hpp>
 
@@ -209,6 +210,11 @@ inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::PredSnapMarker& mark
 }
 
 struct GeneratedViews {
+    double fiberWidth = 0.0; // Display-volume voxels, not persisted units.
+    double fiberWidthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
+    double fiberBaseToVolumeScale = 1.0;
+    bool hasManualDisplayNormals = false;
+    std::vector<double> controlAngleOffsetsDegrees;
     std::string lineSurfaceName;
     QString lineSurfaceTitle;
     std::shared_ptr<QuadSurface> lineSurface;
@@ -226,6 +232,9 @@ struct GeneratedViews {
     // scroll center (NaN where the sample is invalid). Empty when
     // unavailable.
     std::vector<cv::Vec3f> lineNormals;
+    // Optional directed display correction; lineNormals still owns the
+    // fiber-wide viewer orientation convention.
+    std::vector<cv::Vec3f> displayLineNormals;
     // Unwrapped winding angle (radians) of each line point about the scroll
     // center, or empty when no center reference exists. See
     // unwrappedGeneratedWindingAngles.
@@ -495,12 +504,7 @@ inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& li
                 std::numeric_limits<float>::quiet_NaN(),
                 std::numeric_limits<float>::quiet_NaN()};
     }
-    linePosition = std::clamp(linePosition, 0.0, static_cast<double>(linePoints.size() - 1));
-    const int lower = static_cast<int>(std::floor(linePosition));
-    const int upper = std::min<int>(lower + 1, static_cast<int>(linePoints.size()) - 1);
-    const float t = static_cast<float>(linePosition - static_cast<double>(lower));
-    return linePoints[static_cast<size_t>(lower)] * (1.0f - t) +
-           linePoints[static_cast<size_t>(upper)] * t;
+    return cv::Vec3f(vc::fiber_tracer::displayVectorAt(linePoints, linePosition));
 }
 
 // The side cut shows the stretch of the fiber within this winding distance of

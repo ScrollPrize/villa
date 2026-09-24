@@ -508,7 +508,9 @@ struct CandidateScoreDebug {
 [[nodiscard]] FiberTraceSegmentResult debugFuseTraceSegment(
     const std::vector<cv::Vec3d>& forward,
     const std::vector<cv::Vec3d>& reverse,
-    const FiberTraceConfig& config);
+    const FiberTraceConfig& config,
+    const std::vector<FiberTraceTargetPlaneCrossing>& forwardCrossings = {},
+    const std::vector<FiberTraceTargetPlaneCrossing>& reverseCrossings = {});
 
 } // namespace testing
 #endif

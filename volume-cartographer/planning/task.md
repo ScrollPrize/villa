@@ -1,5 +1,3 @@
-# Sharded Zarr Double Decode
+# Task
 
-Fix compressed Zarr inner chunks being decoded twice in the whole-storage-object
-path used by the viewer cache. Branch from current main and present the PR title
-and body for approval before publishing.
+Correct the strip construction regression without cubic strip upsampling or custom rendering/projection. Preserve CP displacement smoothing and normal provenance.

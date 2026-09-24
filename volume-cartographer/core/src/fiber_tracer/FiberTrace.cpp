@@ -2881,21 +2881,23 @@ void appendMovingPlaneCandidates(
     return out;
 }
 
-[[nodiscard]] std::vector<cv::Vec3d> warpTracePrefixToMidpoint(
+[[nodiscard]] std::vector<cv::Vec3d> warpTracePrefixToMeeting(
     std::vector<cv::Vec3d> partial,
     const cv::Vec3d& anchor,
     const cv::Vec3d& sourceMeeting,
-    const cv::Vec3d& midpoint)
+    const cv::Vec3d& meeting)
 {
     if (partial.empty())
         return {};
+    // A zero-length side stays at its CP; the other side takes the entire
+    // correction. Do not fabricate a connector for an endpoint meeting.
     if (partial.size() == 1)
-        partial.push_back(sourceMeeting);
+        return {anchor};
     partial.front() = anchor;
     partial.back() = sourceMeeting;
     const auto lengths = arclengths(partial);
     const double total = lengths.back();
-    const cv::Vec3d delta = midpoint - sourceMeeting;
+    const cv::Vec3d delta = meeting - sourceMeeting;
     for (size_t index = 0; index < partial.size(); ++index) {
         const double blend = total > 1.0e-8
             ? std::clamp(lengths[index] / total, 0.0, 1.0)
@@ -2906,7 +2908,7 @@ void appendMovingPlaneCandidates(
         partial[index] += delta * blend;
     }
     partial.front() = anchor;
-    partial.back() = midpoint;
+    partial.back() = meeting;
     return partial;
 }
 
@@ -3003,18 +3005,22 @@ struct TraceMeetingFusion {
 
     auto forwardPartial = tracePrefixAtArc(forward, best->forwardArcLength);
     auto reversePartial = tracePrefixAtArc(reverse, best->reverseArcLength);
-    const cv::Vec3d midpoint =
-        (best->forwardPoint + best->reversePoint) * 0.5;
-    forwardPartial = warpTracePrefixToMidpoint(
+    // Distribute the meeting gap in proportion to traced arclength, so a
+    // short side does not absorb half the correction over almost no distance.
+    // Zero reverse length gives the target CP; zero forward length the start CP.
+    const double forwardWeight = best->forwardArcLength / result.traceLengthTraceVoxels;
+    const cv::Vec3d meeting = best->forwardPoint * (1.0 - forwardWeight) +
+                             best->reversePoint * forwardWeight;
+    forwardPartial = warpTracePrefixToMeeting(
         std::move(forwardPartial),
         forward.points.front(),
         best->forwardPoint,
-        midpoint);
-    reversePartial = warpTracePrefixToMidpoint(
+        meeting);
+    reversePartial = warpTracePrefixToMeeting(
         std::move(reversePartial),
         reverse.points.front(),
         best->reversePoint,
-        midpoint);
+        meeting);
     std::reverse(reversePartial.begin(), reversePartial.end());
     std::vector<cv::Vec3d> fusedDense = std::move(forwardPartial);
     if (!reversePartial.empty()) {
@@ -3242,7 +3248,9 @@ bool debugShouldRetryLookahead(
 FiberTraceSegmentResult debugFuseTraceSegment(
     const std::vector<cv::Vec3d>& forward,
     const std::vector<cv::Vec3d>& reverse,
-    const FiberTraceConfig& config)
+    const FiberTraceConfig& config,
+    const std::vector<FiberTraceTargetPlaneCrossing>& forwardCrossings,
+    const std::vector<FiberTraceTargetPlaneCrossing>& reverseCrossings)
 {
     validateTraceConfig(config);
     FiberTraceSegmentResult result;
@@ -3250,6 +3258,8 @@ FiberTraceSegmentResult debugFuseTraceSegment(
     result.forward.reason = "debug_forward";
     result.reverse.points = reverse;
     result.reverse.reason = "debug_reverse";
+    result.forward.targetPlaneCrossings = forwardCrossings;
+    result.reverse.targetPlaneCrossings = reverseCrossings;
     const TraceMeetingFusion fusion =
         fuseTraceMeetings(result.forward, result.reverse, config);
     result.fusedLine = fusion.fusedLine;

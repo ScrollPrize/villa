@@ -107,28 +107,6 @@ def make_v3_fiber(cps, generation=1, filename='dj_x_000001.json',
     return doc
 
 
-def cross_section(record_id, *, label='base', arclength=20.0):
-    """Representative versioned payload; fiber_merge treats it atomically."""
-    return {
-        'id': record_id,
-        'schema_version': 1,
-        'kind': 'line',
-        'points_xyz': [[120.0, 199.0, 300.0], [120.0, 201.0, 300.0]],
-        'plane_origin_xyz': [120.0, 200.0, 300.0],
-        'plane_normal_xyz': [1.0, 0.0, 0.0],
-        'plane_up_xyz': [0.0, 0.0, 1.0],
-        'recorded_line_position_xyz': [120.0, 200.0, 300.0],
-        'recorded_arclength': arclength,
-        'geometry_generation': 1,
-        'label': label,
-    }
-
-
-CROSS_A = '00000000-0000-4000-8000-000000000001'
-CROSS_B = '00000000-0000-4000-8000-000000000002'
-CROSS_C = '00000000-0000-4000-8000-000000000003'
-
-
 def set_v3_span(doc, index, *, goal, bend):
     mode = 'trace' if goal == 'global' else goal
     metric = None if mode == 'cspline' else 2.0
@@ -611,7 +589,7 @@ def test_short_circuit_local_unchanged():
     remote = make_fiber(BASE_CPS, tags=['new'], generation=4)
     result = merge_fibers(base, copy.deepcopy(base), remote)
     assert result['ok']
-    assert result['merged'] == remote
+    assert result['merged'] == dict(remote, width_gap_fraction=0.2)
     # A wholesale-adopted side is already consistent with its peers
     assert result['peer_files'] == []
 
@@ -620,7 +598,7 @@ def test_noop_stability():
     base = make_fiber(BASE_CPS)
     result = merge_fibers(base, copy.deepcopy(base), copy.deepcopy(base))
     assert result['ok']
-    assert result['merged'] == base
+    assert result['merged'] == dict(base, width_gap_fraction=0.2)
 
 
 def test_tolerance_bounds():
@@ -1301,7 +1279,7 @@ def test_short_circuit_merges_still_report_peers():
     remote = make_fiber(BASE_CPS, branches=[entry], tags=['new'], generation=4)
     result = merge_fibers(base, copy.deepcopy(base), remote)
     assert result['ok']
-    assert result['merged'] == remote
+    assert result['merged'] == dict(remote, width_gap_fraction=0.2)
     assert result['peer_files'] == ['kb_a.json']
 
 
@@ -1681,7 +1659,7 @@ def test_v3_short_circuit_merge_then_refresh(changed_side):
     result = merge_fibers(base_a, local, remote)
     assert result['ok'], result['conflicts']
     assert result['peer_files'] == ['b.json']
-    assert result['merged'] == changed
+    assert result['merged'] == dict(changed, width_gap_fraction=0.2)
 
     out = refresh_pair_links(result['merged'], b, 'a.json', 'b.json',
                              base_doc=base_a)
@@ -1788,6 +1766,80 @@ def test_v3_interior_control_point_tag_survives_a_separated_remote_span_change()
     assert loader_issues({'dj_x_000001.json': merged}) == []
 
 
+def test_display_metadata_merges_independently_of_geometry():
+    base = make_v3_fiber(BASE_CPS)
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['width'] = 24
+    local['control_points'][0]['display_normal'] = [0, 1, 0]
+    remote['control_points'][1]['display_normal'] = [0, 0, 1]
+    set_v3_span(remote, 5, goal='lasagna', bend=-2.0)
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['width'] == 24
+    assert result['merged']['control_points'][0]['display_normal'] == [0, 1, 0]
+    assert result['merged']['control_points'][1]['display_normal'] == [0, 0, 1]
+    assert result['merged']['control_points'][5]['segment_to_next']['interp_goal'] == 'lasagna'
+
+
+def test_display_metadata_conflicts_and_reset():
+    base = make_v3_fiber(BASE_CPS)
+    base['control_points'][0]['display_normal'] = [0, 1, 0]
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    del local['control_points'][0]['display_normal']
+    remote['width'] = 12
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert 'display_normal' not in result['merged']['control_points'][0]
+    remote['control_points'][0]['display_normal'] = [0, 0, 1]
+    assert not merge_fibers(base, local, remote)['ok']
+
+
+def test_display_normal_provenance_merges_with_normal():
+    base = make_v3_fiber(BASE_CPS)
+    base['control_points'][0]['display_normal'] = [0, 1, 0]
+    base['control_points'][0]['display_normal_source'] = 'interpolated'
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['control_points'][0]['display_normal_source'] = 'manual'
+    remote['width'] = 24
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['control_points'][0]['display_normal_source'] == 'manual'
+    # Provenance must not detach from a concurrently changed vector.
+    remote['control_points'][0]['display_normal'] = [0, 0, 1]
+    assert not merge_fibers(base, local, remote)['ok']
+
+
+def test_display_normal_provenance_legacy_and_validation():
+    base = make_v3_fiber(BASE_CPS)
+    base['control_points'][0]['display_normal'] = [0, 1, 0]
+    result = merge_fibers(base, base, base)
+    assert result['ok']
+    assert result['merged']['control_points'][0]['display_normal_source'] == 'unknown'
+    base['control_points'][0]['display_normal_source'] = 'invalid'
+    assert not merge_fibers(base, base, base)['ok']
+
+
+def test_width_gap_defaults_and_three_way_merge():
+    base = make_v3_fiber(BASE_CPS)
+    assert merge_fibers(base, base, base)['merged']['width_gap_fraction'] == 0.2
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['width_gap_fraction'] = 0.3
+    remote['width'] = 15
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['width_gap_fraction'] == 0.3
+    assert result['merged']['width'] == 15
+    assert merge_fibers(base, base, local)['merged']['width_gap_fraction'] == 0.3
+    remote['width_gap_fraction'] = 0.4
+    assert not merge_fibers(base, local, remote)['ok']
+    for bad in [-0.1, 1.1, '20%', None, True]:
+        local['width_gap_fraction'] = bad
+        assert not fiber_merge.is_fiber_doc(local)
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['width'], remote['width'] = 10, 20
+    assert not merge_fibers(base, local, remote)['ok']
+
+
 def test_v3_tagging_and_refitting_the_same_final_span_is_a_manual_conflict():
     base = make_v3_fiber(BASE_CPS)
     local = copy.deepcopy(base)
@@ -1801,162 +1853,3 @@ def test_v3_tagging_and_refitting_the_same_final_span_is_a_manual_conflict():
 
     assert not result['ok']
     assert any('changed differently on both sides' in c for c in result['conflicts'])
-
-
-# --- cross-section stable-ID merge ---------------------------------------
-
-
-def test_cross_sections_merge_independent_additions_deterministically():
-    base = make_v3_fiber(BASE_CPS)
-    local = copy.deepcopy(base)
-    remote = copy.deepcopy(base)
-    local['cross_sections'] = [cross_section(CROSS_C, label='local')]
-    remote['cross_sections'] = [cross_section(CROSS_A, label='remote')]
-
-    result = merge_fibers(base, local, remote)
-
-    assert result['ok'], result['conflicts']
-    assert [item['id'] for item in result['merged']['cross_sections']] == [
-        CROSS_A, CROSS_C]
-    assert {item['label'] for item in result['merged']['cross_sections']} == {
-        'local', 'remote'}
-
-
-def test_cross_sections_merge_independent_edits():
-    base = make_v3_fiber(BASE_CPS)
-    base['cross_sections'] = [cross_section(CROSS_A), cross_section(CROSS_B)]
-    local = copy.deepcopy(base)
-    remote = copy.deepcopy(base)
-    local['cross_sections'][0]['label'] = 'local edit'
-    remote['cross_sections'][1]['label'] = 'remote edit'
-    local['generation'] = 2
-    remote['generation'] = 50
-
-    result = merge_fibers(base, local, remote)
-
-    assert result['ok'], result['conflicts']
-    by_id = {item['id']: item for item in result['merged']['cross_sections']}
-    assert by_id[CROSS_A]['label'] == 'local edit'
-    assert by_id[CROSS_B]['label'] == 'remote edit'
-
-
-def test_cross_sections_identical_two_sided_edit_agrees():
-    base = make_v3_fiber(BASE_CPS)
-    base['cross_sections'] = [cross_section(CROSS_A)]
-    local = copy.deepcopy(base)
-    remote = copy.deepcopy(base)
-    local['cross_sections'][0]['label'] = 'same edit'
-    remote['cross_sections'][0]['label'] = 'same edit'
-    local['tags'] = ['local']
-    remote['tags'] = ['remote']
-
-    result = merge_fibers(base, local, remote)
-
-    assert result['ok'], result['conflicts']
-    assert result['merged']['cross_sections'][0]['label'] == 'same edit'
-
-
-def test_cross_section_unilateral_deletion_beats_unchanged_record():
-    base = make_v3_fiber(BASE_CPS)
-    base['cross_sections'] = [cross_section(CROSS_A)]
-    local = copy.deepcopy(base)
-    remote = copy.deepcopy(base)
-    local['cross_sections'] = []
-    remote['tags'] = ['unrelated']
-
-    result = merge_fibers(base, local, remote)
-
-    assert result['ok'], result['conflicts']
-    assert 'cross_sections' not in result['merged']
-
-
-@pytest.mark.parametrize('delete_side', ['local', 'remote'])
-def test_cross_section_edit_delete_is_a_conflict(delete_side):
-    base = make_v3_fiber(BASE_CPS)
-    base['cross_sections'] = [cross_section(CROSS_A)]
-    local = copy.deepcopy(base)
-    remote = copy.deepcopy(base)
-    edited = remote if delete_side == 'local' else local
-    deleted = local if delete_side == 'local' else remote
-    edited['cross_sections'][0]['label'] = 'edited'
-    deleted['cross_sections'] = []
-
-    result = merge_fibers(base, local, remote)
-
-    assert not result['ok']
-    assert result['merged'] is None
-    assert any('deleted' in conflict and 'edited' in conflict
-               for conflict in result['conflicts'])
-
-
-def test_cross_section_divergent_edits_are_a_conflict():
-    base = make_v3_fiber(BASE_CPS)
-    base['cross_sections'] = [cross_section(CROSS_A)]
-    local = copy.deepcopy(base)
-    remote = copy.deepcopy(base)
-    local['cross_sections'][0]['label'] = 'local edit'
-    remote['cross_sections'][0]['label'] = 'remote edit'
-    local['generation'] = 100
-    remote['generation'] = 2
-
-    result = merge_fibers(base, local, remote)
-
-    assert not result['ok']
-    assert any(CROSS_A in conflict and 'edited differently' in conflict
-               for conflict in result['conflicts'])
-
-
-def test_cross_section_different_same_id_additions_are_a_conflict():
-    base = make_v3_fiber(BASE_CPS)
-    local = copy.deepcopy(base)
-    remote = copy.deepcopy(base)
-    local['cross_sections'] = [cross_section(CROSS_A, label='local')]
-    remote['cross_sections'] = [cross_section(CROSS_A, label='remote')]
-
-    result = merge_fibers(base, local, remote)
-
-    assert not result['ok']
-    assert any(CROSS_A in conflict and 'added differently' in conflict
-               for conflict in result['conflicts'])
-
-
-def test_cross_sections_missing_and_empty_are_equivalent():
-    base = make_v3_fiber(BASE_CPS)
-    local = copy.deepcopy(base)
-    remote = copy.deepcopy(base)
-    local['cross_sections'] = []
-    remote['tags'] = ['remote edit']
-
-    result = merge_fibers(base, local, remote)
-
-    assert result['ok'], result['conflicts']
-    assert 'cross_sections' not in result['merged']
-    assert result['merged']['tags'] == ['remote edit']
-
-
-@pytest.mark.parametrize('bad_cross_sections', [
-    None,
-    {},
-    ['not an object'],
-    [{}],
-    [{'id': 'not-a-uuid'}],
-    [{'id': CROSS_A}, {'id': CROSS_A}],
-])
-def test_cross_sections_are_validated_before_document_fast_paths(
-        bad_cross_sections):
-    base = make_v3_fiber(BASE_CPS)
-    base['cross_sections'] = copy.deepcopy(bad_cross_sections)
-    local = make_v3_fiber(BASE_CPS)
-    remote = copy.deepcopy(local)  # would otherwise take the identical fast path
-
-    assert not fiber_merge.is_fiber_doc(base)
-    result = merge_fibers(base, local, remote)
-    assert not result['ok']
-    assert result['merged'] is None
-    assert any('base version' in conflict for conflict in result['conflicts'])
-
-
-def test_cross_sections_are_rejected_on_legacy_v1_fibers():
-    doc = make_fiber(BASE_CPS)
-    doc['cross_sections'] = [cross_section(CROSS_A)]
-    assert not fiber_merge.is_fiber_doc(doc)

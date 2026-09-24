@@ -1,4 +1,5 @@
 #include "LineAnnotationFiberSegments.hpp"
+#include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include "vc/lasagna/NormalAlignment.hpp"
 
@@ -1313,6 +1314,10 @@ std::vector<std::string> controlPointTagsFromJson(const nlohmann::json& json)
 nlohmann::json storedControlPointToJson(const StoredControlPoint& control)
 {
     nlohmann::json json{{"position", pointToJson(control)}};
+    if (control.displayNormal) {
+        json["display_normal"] = pointToJson(*control.displayNormal);
+        json["display_normal_source"] = control.displayNormalSource;
+    }
     if (control.segmentToNext) {
         json["segment_to_next"] = fiberTraceSegmentMetadataToJson(*control.segmentToNext);
     }
@@ -1330,8 +1335,10 @@ StoredControlPoint storedControlPointFromJson(const nlohmann::json& json, int fi
     if (fiberVersion != 3 || !json.is_object()) {
         throw std::runtime_error("version-3 control point entries must be objects");
     }
-    rejectUnknownKeys(json, {"position", "segment_to_next", "tags"}, "control point");
+    rejectUnknownKeys(json, {"position", "segment_to_next", "tags", "display_normal", "display_normal_source"}, "control point");
     StoredControlPoint control{pointFromJson(json.at("position"))};
+    control.displayNormal = vc::fiber_tracer::displayNormalFromJson(json);
+    control.displayNormalSource = vc::fiber_tracer::displayNormalSourceFromJson(json);
     if (json.contains("segment_to_next")) {
         control.segmentToNext = fiberTraceSegmentMetadataFromJson(json.at("segment_to_next"));
     }
@@ -1380,6 +1387,8 @@ std::vector<LineControlPoint> mergeOptimizerControlPoints(std::vector<vc::lasagn
         LineControlPoint merged{optimized[index]};
         merged.segmentToNext = original[index].segmentToNext;
         merged.tags = original[index].tags;
+        merged.displayNormal = original[index].displayNormal;
+        merged.displayNormalSource = original[index].displayNormalSource;
         result.push_back(std::move(merged));
     }
     return result;
@@ -1428,6 +1437,11 @@ ControlPointCollapseResult collapseControlPointsAtClick(
             }
         }
         replacement.segmentToNext = controls[rightmost].segmentToNext;
+        const auto nearest = *std::min_element(collapsedIndices.begin(), collapsedIndices.end(),
+            [&](size_t a, size_t b) { return std::abs(controls[a].linePosition - clickedLinePosition) <
+                                          std::abs(controls[b].linePosition - clickedLinePosition); });
+        replacement.displayNormal = controls[nearest].displayNormal;
+        replacement.displayNormalSource = controls[nearest].displayNormalSource;
     }
 
     struct PendingControl {
@@ -2393,6 +2407,8 @@ std::vector<StoredControlPoint> reversedStoredControlPoints(
         StoredControlPoint control{
             static_cast<const cv::Vec3d&>(controls[count - 1 - j])};
         control.tags = controls[count - 1 - j].tags;
+        control.displayNormal = controls[count - 1 - j].displayNormal;
+        control.displayNormalSource = controls[count - 1 - j].displayNormalSource;
         // Span j of the reversed fiber is span (n-2-j) of the original run
         // in the opposite direction; its descriptor travels with it. The
         // new final CP carries none.

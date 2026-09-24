@@ -1,4 +1,5 @@
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -877,7 +878,7 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
         throw std::invalid_argument(
             "LineViewConfig::targetSpacingBaseVoxels must be finite and positive");
     }
-    const auto frameData = buildLineFrameData(line, config.orientedPointNormals);
+    auto frameData = buildLineFrameData(line, config.orientedPointNormals);
     if (frameData.samples.empty()) {
         throw std::invalid_argument("Cannot build line annotation views for an empty LineModel");
     }
@@ -905,6 +906,33 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
         for (auto& frame : ribbonFrames) {
             frame.meshNormal *= -1.0;
             frame.side *= -1.0;
+        }
+    }
+
+    // Rotate the smoothed frames by the manual correction, rather than
+    // replacing them with the unsmoothed sampled normals.
+    if (config.displayPointNormals.size() == frameData.samples.size() &&
+        config.orientedPointNormals.size() == frameData.samples.size()) {
+        std::vector<cv::Vec3f> positions;
+        for (const auto& sample : frameData.samples)
+            positions.push_back(toVec3f(sample.position));
+        std::vector<double> offsets;
+        for (size_t i = 0; i < positions.size(); ++i) {
+            const auto tangent = vc::fiber_tracer::displayTangentAt(positions, double(i));
+            offsets.push_back(vc::fiber_tracer::displayNormalOffset(
+                cv::Vec3d(config.orientedPointNormals[i]),
+                cv::Vec3d(config.displayPointNormals[i]), tangent).value_or(0.0));
+            frameData.transportedUpVectors[i] = rotateAroundAxis(
+                frameData.transportedUpVectors[i], frameData.tangents[i], offsets.back());
+        }
+        for (size_t i = 0; i < ribbonFrames.size(); ++i) {
+            const double position = positionMap.stripGridColumnToOriginalPosition(double(i));
+            const size_t lo = size_t(position), hi = std::min(lo + 1, offsets.size() - 1);
+            const double angle = offsets[lo] + (position - double(lo)) *
+                std::remainder(offsets[hi] - offsets[lo], 2.0 * std::acos(-1.0));
+            const auto tangent = tangentAt(ribbonSamples, i);
+            ribbonFrames[i].meshNormal = rotateAroundAxis(ribbonFrames[i].meshNormal, tangent, angle);
+            ribbonFrames[i].side = rotateAroundAxis(ribbonFrames[i].side, tangent, angle);
         }
     }
 

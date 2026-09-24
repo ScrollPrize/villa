@@ -19,14 +19,12 @@
 
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationFiberSegments.hpp"
-#include "vc/fiber_tracer/FiberCrossSection.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
 #include <opencv2/core/mat.hpp>
 
 class CState;
 class QAction;
-class QButtonGroup;
 class QComboBox;
 class QGraphicsPathItem;
 class QGraphicsRectItem;
@@ -45,9 +43,10 @@ class QVariantAnimation;
 class QVBoxLayout;
 class QSplitter;
 class QSpinBox;
-class QToolButton;
+class QDoubleSpinBox;
 class ViewerManager;
 class PlaneSurface;
+namespace vc::fiber_tracer { struct FiberWidthDragResult; }
 class QuadSurface;
 
 class LineAnnotationDialog : public QMainWindow
@@ -55,6 +54,7 @@ class LineAnnotationDialog : public QMainWindow
     Q_OBJECT
 
 public:
+    void setFiberWidth(double baseVoxels, double gapFraction);
     enum class ReoptimizationMode {
         AutoReoptimize,
         NoOptimization,
@@ -208,10 +208,14 @@ public:
     // Programmatic twin of the "current cut follows strip mouse" toggle.
     void setCutFollowEnabled(bool enabled);
     bool cutFollowEnabled() const { return _currentCutFollowsStripMouse; }
-    void setCrossSectionAnnotations(
-        std::vector<vc::fiber_tracer::FiberCrossSectionAnnotation> annotations);
 
 signals:
+    void volumeOverlayToggleRequested();
+    void fiberWidthChanged(double baseVoxels);
+    void controlDisplayAngleChanged(size_t controlIndex, double degrees);
+    void crossSectionDragFinished(const std::string& surfaceName, cv::Vec3f point,
+                                  double linePosition, cv::Vec3f lineAnchor,
+                                  cv::Vec3f normal, bool edge);
     void paneClosed(const std::string& surfaceName);
     void lineSeedRequested(const std::string& surfaceName, cv::Vec3f volumePoint, QPointF scenePoint);
     // lineAnchor: the 3D point of linePosition on the DISPLAYED line, so the
@@ -282,8 +286,6 @@ signals:
     void lasagnaDatasetSelectionChanged(const std::string& location);
     void fiberInferenceDatasetSelectionChanged(const std::string& location);
     void extrapolationDistanceChanged(int distanceVx);
-    void crossSectionAnnotationsChanged(
-        std::vector<vc::fiber_tracer::FiberCrossSectionAnnotation> annotations);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -308,7 +310,8 @@ private:
     // requestCurrentLinePosition): a burst of mouse moves collapses into one
     // projection + crosshair update per non-hovered pane per tick.
     void requestLinkedCursorMirror(CChunkedVolumeViewer* source,
-                                   const std::optional<cv::Vec3f>& point);
+                                   const std::optional<cv::Vec3f>& point,
+                                   std::optional<QPointF> scenePoint = std::nullopt);
     // Pushes the "Mirror cursor across panes" state onto the panes. The block
     // has to sit on the receiving side: the panes belong to the same
     // ViewerManager as the main window, so the global cursor sync would keep
@@ -468,25 +471,6 @@ private:
     void updateUmbilicusNotice();
     void updateOptimizationOverlayGeometry();
     void updateFiberNameLabel();
-    void setCrossSectionEditMode(bool enabled);
-    void cancelCrossSectionGesture();
-    bool handleCrossSectionPress(cv::Vec3f volumePoint,
-                                 Qt::MouseButton button,
-                                 Qt::KeyboardModifiers modifiers,
-                                 QPointF scenePoint);
-    void handleCrossSectionMove(cv::Vec3f volumePoint,
-                                Qt::MouseButtons buttons,
-                                QPointF scenePoint);
-    void handleCrossSectionRelease(cv::Vec3f volumePoint,
-                                   Qt::MouseButton button,
-                                   QPointF scenePoint);
-    bool finishCrossSectionPolygon();
-    void commitCrossSectionAnnotations();
-    void rebuildCrossSectionControls();
-    void rebuildCrossSectionOverlay();
-    void jumpToSelectedCrossSection();
-    void deleteSelectedCrossSection();
-    double currentLineArclength() const;
     void rebuildDatasetMenus();
     void restoreWindowGeometry();
     void saveWindowGeometry() const;
@@ -507,6 +491,38 @@ private:
     QAction* _showAsMeshAction = nullptr;
     QAction* _fullOptimizationAction = nullptr;
     QSpinBox* _initialCenterlineLengthSpin = nullptr;
+    QDoubleSpinBox* _fiberWidthSpin = nullptr;
+    QDoubleSpinBox* _controlAngleSpin = nullptr;
+    std::optional<size_t> _angleControlIndex;
+    QAction* _showFiberWidthAction = nullptr;
+    QAction* _showFiberNormalAction = nullptr;
+    struct FiberGuideItems {
+        QPointer<CChunkedVolumeViewer> viewer;
+        QGraphicsPathItem* center = nullptr;
+        QGraphicsPathItem* width = nullptr;
+        QGraphicsPathItem* cursorWidth = nullptr;
+        double cachedWidth = -1;
+        double cachedGapFraction = -1;
+        double cachedCursorHalfLength = -1;
+    };
+    std::array<FiberGuideItems, 2> _fiberGuides;
+    struct CrossSectionDrag {
+        QPointF pressScene, edgeScene;
+        cv::Vec3d center, normal, axis, planeNormal, sceneX, sceneY, lineAnchor;
+        double width = 0, linePosition = 0;
+        int handle = 0;
+        bool moved = false;
+        bool mouseDown = false, changed = false, normalChanged = false;
+    };
+    std::optional<CrossSectionDrag> _crossSectionDrag;
+    QPointer<QObject> _crossSectionDragPreview;
+    bool handleCrossSectionDragEvent(QObject* watched, QEvent* event);
+    void cancelCrossSectionDrag();
+    void finishCrossSectionDrag();
+    void drawCrossSectionDragPreview(const vc::fiber_tracer::FiberWidthDragResult& result);
+    void updateFiberDisplayControlsAndGuides();
+    void updateFiberWidthCursor(CChunkedVolumeViewer* viewer, std::optional<QPointF> scenePoint);
+    void refreshFiberWidthCursors();
     QSpinBox* _extrapolationDistanceSpin = nullptr;
     // Values committed via the menu rows' Apply buttons; the spinboxes hold
     // uncommitted edits until then (and revert when the menu reopens).
@@ -527,14 +543,6 @@ private:
     QProgressBar* _sideStripIntersectionProgress = nullptr;
     QAction* _mirrorCursorAction = nullptr;
     QAction* _resetViewsAction = nullptr;
-    QAction* _crossSectionEditAction = nullptr;
-    QWidget* _crossSectionControls = nullptr;
-    QToolButton* _crossSectionAddButton = nullptr;
-    QToolButton* _crossSectionEditButton = nullptr;
-    QToolButton* _crossSectionLineButton = nullptr;
-    QToolButton* _crossSectionPolyButton = nullptr;
-    QComboBox* _crossSectionCombo = nullptr;
-    QToolButton* _crossSectionDeleteButton = nullptr;
     QPointer<QWidget> _optimizationOverlay;
     QPointer<QWidget> _optimizationBadge;
     QMdiArea* _mdiArea = nullptr;
@@ -578,19 +586,6 @@ private:
     FastCurrentCutOverlayItems _fastCurrentCutOverlayItems;
     QPointer<CChunkedVolumeViewer> _currentCutViewer;
     QPointer<CChunkedVolumeViewer> _sideCutViewer;
-    std::vector<vc::fiber_tracer::FiberCrossSectionAnnotation> _crossSections;
-    std::vector<std::vector<vc::fiber_tracer::FiberCrossSectionAnnotation>>
-        _crossSectionUndoStack;
-    std::vector<cv::Vec3d> _crossSectionDraftPoints;
-    std::optional<size_t> _crossSectionDragVertex;
-    std::optional<vc::fiber_tracer::FiberCrossSectionAnnotation>
-        _crossSectionDragOriginal;
-    cv::Vec3d _crossSectionDraftOrigin{0.0, 0.0, 0.0};
-    cv::Vec3d _crossSectionDraftNormal{0.0, 0.0, 1.0};
-    cv::Vec3d _crossSectionDraftUp{0.0, 1.0, 0.0};
-    bool _crossSectionMode = false;
-    bool _crossSectionAddMode = true;
-    bool _crossSectionPolygonMode = false;
     // In-place updates: keep drawing each pane's overlays from the pre-update
     // views until THAT pane adopts its first rendered frame of the re-optimized
     // surfaces (renderFrameCompleted), so a newly placed control point appears
@@ -646,6 +641,7 @@ private:
     std::vector<QPointer<CChunkedVolumeViewer>> _linkedCursorPanes;
     QPointer<CChunkedVolumeViewer> _linkedCursorSource;
     std::optional<cv::Vec3f> _pendingLinkedCursorPoint;
+    std::optional<QPointF> _pendingLinkedCursorScenePoint;
     // Owned single-shot coalescing timer (like _lineUpdateTimer); stopped on
     // pane teardown so a pending mirror can't stamp a pre-rebuild point onto
     // freshly built panes.

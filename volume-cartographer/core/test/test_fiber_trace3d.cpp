@@ -1190,6 +1190,49 @@ TEST_CASE("native fiber moving-plane fusion reports no intersection")
     CHECK(result.fusedLine.empty());
 }
 
+TEST_CASE("native fusion apportions the gap by prefix length including endpoints")
+{
+    using namespace vc::fiber_tracer;
+    FiberTraceConfig config;
+    config.stepVoxels = 1.0;
+    config.traceToBaseScale = 1.0;
+    const std::vector<cv::Vec3d> forward{{0, 0, 0}, {100, 0, 0}};
+    // Balanced, strongly asymmetric, sub-sample and exactly zero-length sides.
+    for (double reverseLength : {50.0, 1.0, 0.01, 0.0}) {
+        std::vector<cv::Vec3d> reverse{{100, 6, 0}};
+        if (reverseLength > 0) reverse.push_back({100 - reverseLength, 6, 0});
+        for (bool swap : {false, true}) {
+            const std::vector<FiberTraceTargetPlaneCrossing> crossings{{"target", {100, 0, 0}, 6}};
+            const auto fused = testing::debugFuseTraceSegment(
+                swap ? reverse : forward, swap ? forward : reverse, config,
+                swap ? std::vector<FiberTraceTargetPlaneCrossing>{} : crossings,
+                swap ? crossings : std::vector<FiberTraceTargetPlaneCrossing>{});
+            REQUIRE(fused.accepted);
+            REQUIRE(fused.fusedLine.size() > 2);
+            CHECK(fused.fusedLine.front() == (swap ? reverse.front() : forward.front()));
+            CHECK(fused.fusedLine.back() == (swap ? forward.front() : reverse.front()));
+            CHECK(fused.meetingErrorTraceVoxels == doctest::Approx(6.0));
+            CHECK(fused.meetingTraceLengthTraceVoxels == doctest::Approx(100.0));
+            if (reverseLength == 0)
+                CHECK(fused.meetingSource.find("endpoint") != std::string::npos);
+            else
+                CHECK(fused.meetingSource.find("moving_plane") != std::string::npos);
+            for (size_t i = 0; i < fused.fusedLine.size(); ++i) {
+                const auto& p = fused.fusedLine[i];
+                // Both warped parallel prefixes must lie on one straight line,
+                // independently of meeting position; no terminal sideways leg.
+                CHECK(p[1] == doctest::Approx(0.06 * p[0]).epsilon(1e-8));
+                CHECK(p[2] == doctest::Approx(0));
+                if (i) {
+                    const auto step = p - fused.fusedLine[i - 1];
+                    CHECK((swap ? -step[0] : step[0]) > 0);
+                    CHECK(cv::norm(step) <= config.stepVoxels + 1e-8);
+                }
+            }
+        }
+    }
+}
+
 TEST_CASE("native fiber tracer computes whole-fiber one-way restart metric")
 {
     StraightPrediction predictions;

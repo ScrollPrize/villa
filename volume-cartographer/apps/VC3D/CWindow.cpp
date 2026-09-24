@@ -2681,6 +2681,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             _lineAnnotationController.get());
     _lineAnnotationController->setVolumeSelectorFactory(
         [this](QWidget* parent) { return createAnnotationVolumeSelector(parent); });
+    connect(_lineAnnotationController.get(), &LineAnnotationController::volumeOverlayToggleRequested,
+            this, &CWindow::toggleVolumeOverlayVisibility);
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::atlasCreated,
             this,
