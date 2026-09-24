@@ -63,6 +63,20 @@ def test_uniform_bricks_share_rows(filled):
     assert out_bits.shape == (2, 1)  # no bitmap per brick
 
 
+def test_process_build_matches_serial_rows(monkeypatch):
+    import patch_normal_exclusion as module
+    monkeypatch.setattr(module, '_PROCESS_MIN_CELLS', 0)
+    coverage = np.zeros((16, 16, 16), dtype=bool)
+    coverage[4, 4, 4] = True
+    coverage[12, 12, 12] = True
+    table, bits, _ = sparse_coverage(coverage, (4, 4, 4))
+    args = (table, bits, (4, 4, 4), coverage.shape, 2.2)
+    serial = build_exclusion_mask(*args, tile_bricks=1, workers=1)
+    parallel = build_exclusion_mask(*args, tile_bricks=1, workers=2)
+    for expected, actual in zip(serial, parallel):
+        np.testing.assert_array_equal(actual, expected)
+
+
 def write_export(path, coverage, cell_size=2.):
     brick = (4, 4, 4)
     table, bits, coords = sparse_coverage(coverage, brick)
@@ -159,6 +173,32 @@ def test_cache_reuse_and_invalidation(tmp_path, monkeypatch):
     os.utime(channel, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
     load()
     assert len(calls) == 4
+
+
+def test_full_volume_cache_serves_different_z_range(tmp_path, monkeypatch):
+    import patch_normal_exclusion as module
+    coverage = np.zeros((16, 12, 12), dtype=bool)
+    coverage[7, 5, 5] = True
+    root = write_export(tmp_path, coverage)
+    table, bits, _ = sparse_coverage(coverage, (4, 4, 4))
+    cache_path = module.exclusion_cache_path(
+        tmp_path / 'cache', root, shape=coverage.shape, brick=(4, 4, 4),
+        z_roi=None, radius=4.)
+    module.save_exclusion_mask(
+        cache_path, *build_exclusion_mask(table, bits, (4, 4, 4), coverage.shape, 4.))
+    full_bits = module.load_exclusion_mask(cache_path, table.shape, 1)[1]
+    monkeypatch.setattr(module, 'build_exclusion_mask',
+                        lambda *args, **kwargs: pytest.fail('full-volume cache was not reused'))
+    store = load_patch_normals(tmp_path, z_begin=16, z_end=32, device='cpu',
+                               cache_directory=tmp_path / 'cache')
+    try:
+        points = (torch.tensor([[8, 5, 5], [8, 11, 11]]) + .5) * 2
+        _, present, near = store.sample(points, return_exclusion=True)
+        assert present.tolist() == [False, False]
+        assert near.tolist() == [True, False]
+        assert len(store.cache.exclusion.bits) < len(full_bits)
+    finally:
+        store.close()
 
 
 def test_exclusion_setting_is_rebuild_scoped():

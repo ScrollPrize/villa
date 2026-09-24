@@ -110,11 +110,20 @@ class CompactPatchNormalPool:
         if exclusion_radius_cells > 0:
             from patch_normal_exclusion import (
                 build_exclusion_mask, exclusion_cache_path, load_exclusion_mask,
-                save_exclusion_mask)
+                save_exclusion_mask, select_exclusion_mask_z_roi)
             cache_path = exclusion_cache_path(
                 cache_directory, sidecar_dir, shape=self.shape_zyx, brick=brick,
                 z_roi=z_roi, radius=exclusion_radius_cells)
             exclusion_arrays = load_exclusion_mask(cache_path, table.shape, words)
+            if exclusion_arrays is None and z_roi is not None:
+                # A full-volume cache can serve any fit range of this export.
+                full_cache_path = exclusion_cache_path(
+                    cache_directory, sidecar_dir, shape=self.shape_zyx,
+                    brick=brick, z_roi=None, radius=exclusion_radius_cells)
+                exclusion_arrays = load_exclusion_mask(full_cache_path, table.shape, words)
+                if exclusion_arrays is not None:
+                    exclusion_arrays = select_exclusion_mask_z_roi(
+                        *exclusion_arrays, z_roi, brick[0])
             if exclusion_arrays is None:
                 source_bits = (np.asarray(prepacked.bits[ids]) if prepacked is not None
                                else np.concatenate([batch[1] for batch in batches]))

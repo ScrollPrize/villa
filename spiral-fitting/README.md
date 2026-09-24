@@ -1083,7 +1083,9 @@ is reported at load time, separately from the normal payload. CPU preprocessing
 uses tiles with halos, including patch coverage just outside the fit's z range.
 The first load builds the mask and caches it as an `exclusion-*.npz` file in
 `patch-normals`; later loads reuse it if source file sizes/timestamps, z range,
-grid, and radius match. During fitting the
+grid, and radius match. A full-volume cache can also serve any z range; the
+loader keeps only the bitmap rows needed for the current fit before uploading
+it to the GPU. During fitting the
 mask reuses the normal gather's brick/local indices: one extra table/bit lookup,
 no radius search, additional samples, host synchronization, or disk access.
 

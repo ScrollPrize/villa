@@ -5,7 +5,7 @@ Empty/full bricks share bitmap rows 0/1; only mixed bricks need storage.
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -13,7 +13,9 @@ from pathlib import Path
 import tempfile
 
 import numpy as np
-import torch
+
+
+_PROCESS_MIN_CELLS = 32_000_000
 
 
 def pack_presence_bits(present):
@@ -26,9 +28,7 @@ def pack_presence_bits(present):
     return np.packbits(padded, axis=1, bitorder='little').view('<i8').astype(np.int64, copy=False)
 
 
-def _dilate_tile(tile, table, bits, brick, shape, radius, tile_bricks):
-    import edt
-
+def _prepare_tile(tile, table, bits, brick, shape, radius, tile_bricks):
     start = np.array(tile) * tile_bricks
     end = np.minimum(start + tile_bricks, table.shape)
     origin = start * brick
@@ -38,15 +38,25 @@ def _dilate_tile(tile, table, bits, brick, shape, radius, tile_bricks):
     brick_lo = source_lo // brick
     brick_hi = (source_hi + brick - 1) // brick
     rows = table[tuple(slice(a, b) for a, b in zip(brick_lo, brick_hi))]
+    if not rows.any():
+        return start, end, origin, source_lo, source_hi, brick_lo, brick_hi, None
+    # Send only this tile's packed source rows to a worker, never the full pool.
+    words = np.ascontiguousarray(bits[rows].astype('<i8', copy=False))
+    return start, end, origin, source_lo, source_hi, brick_lo, brick_hi, words
+
+
+def _dilate_prepared_tile(task, brick, shape, radius):
+    import edt
+
+    start, end, origin, source_lo, source_hi, brick_lo, brick_hi, words = task
+    if words is None:
+        return start, end, None, None
     target_grid = end - start
     target_shape = target_grid * brick
-    if not rows.any():
-        return start, end, None, None
     # Unpack only this tile and its halo, including coverage in adjacent bricks.
-    words = np.ascontiguousarray(bits[rows].astype('<i8', copy=False))
     occupied = np.unpackbits(words.view(np.uint8), axis=-1, bitorder='little',
                              count=int(np.prod(brick)))
-    occupied = occupied.reshape(*rows.shape, *brick).transpose(0, 3, 1, 4, 2, 5)
+    occupied = occupied.reshape(*words.shape[:-1], *brick).transpose(0, 3, 1, 4, 2, 5)
     occupied = occupied.reshape((brick_hi - brick_lo) * brick)
     relative_lo = source_lo - brick_lo * brick
     relative_hi = source_hi - brick_lo * brick
@@ -72,14 +82,27 @@ def _dilate_tile(tile, table, bits, brick, shape, radius, tile_bricks):
     return start, end, local_ids.reshape(target_grid), pack_presence_bits(near[mixed])
 
 
+def _dilate_tile(tile, table, bits, brick, shape, radius, tile_bricks):
+    return _dilate_prepared_tile(
+        _prepare_tile(tile, table, bits, brick, shape, radius, tile_bricks),
+        brick, shape, radius)
+
+
+def _dilate_process_task(task):
+    prepared, brick, shape, radius = task
+    return _dilate_prepared_tile(prepared, brick, shape, radius)
+
+
 def build_exclusion_mask(table, bits, brick, shape, radius, *, z_roi=None,
-                         tile_bricks=8, workers=4, progress_callback=None):
+                         tile_bricks=8, workers=None, progress_callback=None):
     """Bounded-memory CPU dilation; returns an int32 table and int64 bitmaps."""
     from scipy.ndimage import maximum_filter
 
     if not np.isfinite(radius) or radius < 0:
         raise ValueError('patch exclusion radius must be finite and nonnegative')
     brick, shape = np.array(brick), np.array(shape)
+    if workers is None:
+        workers = min(os.process_cpu_count() or 1, 12)
     if tile_bricks <= 0 or workers <= 0:
         raise ValueError('tile_bricks and workers must be positive')
     tile_shape = (np.array(table.shape) + tile_bricks - 1) // tile_bricks
@@ -102,10 +125,18 @@ def build_exclusion_mask(table, bits, brick, shape, radius, *, z_roi=None,
     def work(tile):
         return _dilate_tile(tile, table, bits, brick, shape, radius, tile_bricks)
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    tile_cells = int(np.prod(brick)) * tile_bricks**3
+    use_processes = workers > 1 and len(tiles) * tile_cells >= _PROCESS_MIN_CELLS
+    executor_type = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+    with executor_type(max_workers=workers) as executor:
+        if use_processes:
+            tasks = ((_prepare_tile(tile, table, bits, brick, shape, radius, tile_bricks),
+                      brick, shape, radius) for tile in tiles)
+            completed = executor.map(_dilate_process_task, tasks, buffersize=workers * 2)
+        else:
+            completed = executor.map(work, tiles, buffersize=workers * 2)
         # buffersize prevents queued completed tiles from exhausting host RAM.
-        for i, (start, end, local_ids, packed) in enumerate(
-                executor.map(work, tiles, buffersize=workers * 2)):
+        for i, (start, end, local_ids, packed) in enumerate(completed):
             if local_ids is not None:
                 local_ids[local_ids >= 2] += next_row - 2
                 result[tuple(slice(a, b) for a, b in zip(start, end))] = local_ids
@@ -154,6 +185,22 @@ def load_exclusion_mask(path, grid_shape, words):
     return table, bits
 
 
+def select_exclusion_mask_z_roi(table, bits, z_roi, brick_z):
+    """Keep only lookup rows needed by a fit range from a full-volume mask."""
+    first = max(0, z_roi[0] // brick_z)
+    last = min(table.shape[0], (z_roi[1] + brick_z - 1) // brick_z)
+    selected = table[first:last]
+    used = np.zeros(len(bits), dtype=bool)
+    used[:2] = True
+    used[selected] = True
+    ids = np.flatnonzero(used)
+    remap = np.zeros(len(bits), dtype=np.int32)
+    remap[ids] = np.arange(len(ids), dtype=np.int32)
+    restricted = np.zeros_like(table)
+    restricted[first:last] = remap[selected]
+    return restricted, bits[ids].copy()
+
+
 def save_exclusion_mask(path, table, bits):
     if path is None:
         return
@@ -173,6 +220,8 @@ def save_exclusion_mask(path, table, bits):
 
 class PatchExclusionMask:
     def __init__(self, table, bits, device):
+        import torch
+
         self.table = torch.from_numpy(table).to(device)
         self.bits = torch.from_numpy(bits).to(device)
         self.nbytes = table.nbytes + bits.nbytes
