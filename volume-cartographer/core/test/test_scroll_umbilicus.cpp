@@ -1218,6 +1218,32 @@ TEST_CASE("loadUmbilicusWithFrameCheck: an inferred grid does not apply a point-
     fs::remove_all(dir);
 }
 
+TEST_CASE("loadUmbilicusWithFrameCheck: an authoritative grid refuses a voxel-only stamp it cannot check")
+{
+    using vc::core::util::loadUmbilicusWithFrameCheck;
+    using vc::core::util::UmbilicusTargetGridAuthority;
+    const auto dir = tmpDir("frame_load_authoritative_unchecked");
+    const auto path = dir / "umbilicus.json";
+    // A voxel-size-only stamp with no target voxel size to convert against:
+    // the points fill the half grid well enough to infer x2 on their own,
+    // but the stated frame was never evaluated, so rescaling on point
+    // inference would treat an unchecked frame as checked. Under an
+    // authoritative grid the file is refused instead.
+    writeUmbilicusWithPoints(
+        path, "\"voxelsize_um\": 9.6",
+        {{1.0, 2.0, 4.0}, {9.0, 18.0, 26.0}});
+
+    const auto loaded = loadUmbilicusWithFrameCheck(
+        path, {20.0, 40.0, 60.0}, cv::Vec3i{64, 64, 64},
+        UmbilicusTargetGridAuthority::Authoritative);
+    CHECK_FALSE(loaded.umbilicus.has_value());
+    CHECK(loaded.warning.empty());
+    CHECK(loaded.scaleDescription.empty());
+    CHECK_FALSE(loaded.error.empty());
+    CHECK(loaded.error.find("voxelsize_um") != std::string::npos);
+    fs::remove_all(dir);
+}
+
 TEST_CASE("loadUmbilicusWithFrameCheck: an unconfirmable stamp warns and keeps the legacy reading")
 {
     using vc::core::util::loadUmbilicusWithFrameCheck;

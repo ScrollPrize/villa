@@ -578,6 +578,22 @@ UmbilicusFrameLoad loadUmbilicusWithFrameCheck(
             result.umbilicus = Umbilicus::FromFile(path, volumeShape);
             return result;
         }
+        // A scale read off the points means the stated frame was never
+        // evaluated: point inference only runs when the stamped checks
+        // produced no scale — a voxel-size-only stamp with no target voxel
+        // size to compare it against. Rescaling on it would treat an
+        // unchecked frame as checked, so under an authoritative grid the
+        // file is refused instead of rescaled.
+        if (authority == UmbilicusTargetGridAuthority::Authoritative &&
+            scale->source == UmbilicusScaleSource::InferredFromGrid) {
+            result.error =
+                "refusing umbilicus '" + path.string() +
+                "': its stamped voxelsize_um cannot be checked against "
+                "this target (no target voxel size), so its points cannot "
+                "be rescaled; provide the target voxel size or re-stamp "
+                "the file.";
+            return result;
+        }
         auto points = Umbilicus::LoadControlPoints(path);
         const float factor = static_cast<float>(scale->factor);
         for (auto& point : points) {

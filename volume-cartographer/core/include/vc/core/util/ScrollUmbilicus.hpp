@@ -224,7 +224,11 @@ namespace vc::core::util {
     // volume — so those warn and keep the legacy reading instead of
     // rescaling or refusing. Only an explicit coordinate conversion, a
     // stamped voxel size against the target's own, is applied under an
-    // inferred grid.
+    // inferred grid. Under an authoritative grid a scale read off the
+    // points is refused rather than applied: point inference only runs
+    // when the stated frame could not be evaluated (a voxel-size-only
+    // stamp with no target voxel size to compare it against), so rescaling
+    // on it would treat an unchecked frame as checked.
     struct UmbilicusFrameLoad {
         // The loaded umbilicus. Empty only when the file was refused.
         std::optional<Umbilicus> umbilicus;
@@ -251,7 +255,9 @@ namespace vc::core::util {
         // target's own voxel size — is applied.
         Inferred,
         // The grid is the authoritative volume grid: a declared frame that
-        // does not fit it is refused outright.
+        // does not fit it is refused outright, and so is one that cannot
+        // be checked when the only scale comes from point inference — an
+        // unchecked frame must not be rescaled as if it had been checked.
         Authoritative,
     };
 
