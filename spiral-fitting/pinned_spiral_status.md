@@ -179,6 +179,34 @@ schedule, which decays to `optimizer_lr_final_factor` at `optimizer_num_training
 the 8000-step control (1.31M) ends below the 10000- and 15000-step warm-ups (1.50M,
 1.48M) despite fewer steps. Arms within one table share a schedule and are comparable.
 
+**Weight sweep on a shared schedule (2026-09-24).** Warm-up 5000 -> 10000 unpinned, DT
+off, `optimizer_num_training_steps` 10000 for every arm, then pins activated for one step:
+
+| pair-agreement weight | inconsistent pairs at activation | demoted | unpinned strict area / patches | fractional patches | patch radius / Dirichlet at 9800 |
+|---|---|---|---|---|---|
+| 0 | 1,500,885 | 314 | 58.1% / 30.1% | 76.3% | 13.9 / 10.3 |
+| 128 | 1,002,237 (-33%) | 286 | 63.0% / 30.3% | 75.6% | 14.2 / 12.0 |
+| 512 | 729,080 (-51%) | 245 | 69.1% / 33.5% | 71.5% | 15.2 / 12.0 |
+| 128, patch-pair mean | 981,590 (-35%) | 286 | 62.9% / 30.4% | 75.7% | 14.2 / 12.0 |
+
+The loss is still falling at 512 (median residual 0.033, 35% of pairs over the margin,
+from 0.067 and 57%); its cost is a small rise in the smoothness terms and a few points
+of within-patch flatness. Averaging the residual per patch pair before the hinge gave the
+same result as the per-pair form to within noise, so that variant was tried and removed.
+
+**Early DT on top (10000 -> 12000, pins with fractional trainable targets, DT from
+10000, pair loss kept at its warm-up weight):**
+
+| warm-up | strict area / patches at 12000 | area-weighted | conflicts 10000 -> 11000 | T from integer |
+|---|---|---|---|---|
+| weight 0 | 67.5% / 40.1% | 45.6% | 1.50M -> 1.57M | 0.239 -> 0.216 |
+| weight 128 | 72.3% / 41.4% | 48.8% | 1.00M -> 1.04M | 0.232 -> 0.210 |
+
+Pinning itself adds about one point of strict area at activation over the unpinned map
+(64.0% vs 63.0% at weight 128); DT supplies the rest, and the pair loss keeps the
+conflict count from growing during the pinned phase. `T` still drifts toward integers at
+only ~0.012 per 1000 steps.
+
 **Joint integer assignment at a wide tolerance.** `model_pin_targets_joint` uses pairs
 within `model_pin_targets_joint_tolerance_voxels` (default 3), which are exactly the pairs
 that already agree. At 30 voxels on the same checkpoints it re-rounds 7.7k of 9.2k
