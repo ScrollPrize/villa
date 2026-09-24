@@ -26,11 +26,17 @@
 #include <cctype>
 #include <chrono>
 #include <cstdarg>
+#include <cstdio>
 #include <thread>
 #include <optional>
 #include <unordered_set>
 #include <tiffio.h>
 #include <omp.h>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace po = boost::program_options;
 using Json = utils::Json;
@@ -44,6 +50,26 @@ static std::string g_logPrefix;         // e.g. "[part 2/8] " — prepended when
 static bool g_flipNormals = false;      // negate surface normals (--flip-normals); reverses slice ordering along the normal
 static std::atomic<bool> g_logRunning{false};
 static std::thread g_logFlushThread;
+
+// Whether progress may redraw one line with a carriage return. Only a terminal renders
+// that: in a captured stream (Argo, CI, nohup) a \r-updated line is never newline
+// terminated, so none of the progress shows up while the render runs and the job looks
+// hung. Everything else therefore gets whole lines, throttled further apart.
+static bool progressRedrawsLine()
+{
+#ifdef _WIN32
+    static const bool isTerminal = _isatty(_fileno(stderr)) != 0;
+#else
+    static const bool isTerminal = isatty(fileno(stderr)) != 0;
+#endif
+    return !g_logFile && isTerminal;
+}
+
+// Seconds between progress updates; whole lines accumulate in a log, so print fewer.
+static double progressInterval()
+{
+    return progressRedrawsLine() ? 1.0 : 15.0;
+}
 
 // Log to file if active, otherwise to the given default stream.
 // When logging to a shared file in multi-part mode, each line is prefixed with the part id.
@@ -523,12 +549,12 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
         auto now = std::chrono::steady_clock::now();
         double since = std::chrono::duration<double>(now - lastPrint).count();
         uint32_t done = row - rowStart + 1;
-        if (since >= 1.0 || done == totalRows) {
+        if (since >= progressInterval() || done == totalRows) {
             lastPrint = now;
             double elapsed = std::chrono::duration<double>(now - wallStart).count();
             double eta = done > 0 ? elapsed * (double(totalRows) / done - 1.0) : 0.0;
-            const char* prefix = g_logFile ? "  " : "\r  ";
-            const char* suffix = g_logFile ? "\n" : "";
+            const char* prefix = progressRedrawsLine() ? "\r  " : "  ";
+            const char* suffix = progressRedrawsLine() ? "" : "\n";
             logPrintf(stderr,
                       "%sprefetch plan %u/%u rows (%d%%)  %zu chunks  %dm%02ds  eta %dm%02ds%s",
                       prefix, done, totalRows, totalRows ? int(100.0 * done / totalRows) : 100,
@@ -557,7 +583,7 @@ static bool prefetchChunkKeys(
 {
     if (!cache || keys.empty()) return true;
     cache->prefetchChunks(keys, true);
-    if (!g_logFile) std::fprintf(stderr, "\n");
+    if (progressRedrawsLine()) std::fprintf(stderr, "\n");
     return true;
 }
 
@@ -661,20 +687,20 @@ static void renderBands(
         double since = std::chrono::duration<double>(now - lastPrint).count();
         uint32_t bandsThis = bandEnd - bandStart;
         uint32_t done = bi - bandStart + 1;
-        if (since >= 1.0 || done == bandsThis) {
+        if (since >= progressInterval() || done == bandsThis) {
             lastPrint = now;
             double elapsed = std::chrono::duration<double>(now - wallStart).count();
             double eta = done > 0 ? elapsed * (double(bandsThis) / done - 1.0) : 0.0;
             double bandsPerSec = elapsed > 0 ? done / elapsed : 0.0;
-            const char* prefix = g_logFile ? "  " : "\r  ";
-            const char* suffix = g_logFile ? "\n" : "";
+            const char* prefix = progressRedrawsLine() ? "\r  " : "  ";
+            const char* suffix = progressRedrawsLine() ? "" : "\n";
             logPrintf(stderr, "%sband %u/%u (%d%%)  %.1f bands/s  %dm%02ds  eta %dm%02ds%s",
                 prefix, done, bandsThis, int(100.0 * done / bandsThis),
                 bandsPerSec,
                 int(elapsed)/60, int(elapsed)%60, int(eta)/60, int(eta)%60, suffix);
         }
     }
-    if (!g_logFile) std::fprintf(stderr, "\n");
+    if (progressRedrawsLine()) std::fprintf(stderr, "\n");
 }
 
 // ============================================================
@@ -1004,22 +1030,22 @@ static void renderTiles(
         double since = std::chrono::duration<double>(now - lastPrint).count();
         uint32_t tileRowsThis = tyEnd - tyStart;
         uint32_t done = ty - tyStart + 1;
-        if (since >= 1.0 || done == tileRowsThis) {
+        if (since >= progressInterval() || done == tileRowsThis) {
             lastPrint = now;
             double elapsed = std::chrono::duration<double>(now - wallStart).count();
             double eta = done > 0 ? elapsed * (double(tileRowsThis) / done - 1.0) : 0.0;
             // Chunks written this part: done tile-rows × numTileCols chunks per row
             double chunksWritten = double(done) * double(numTileCols);
             double chunksPerSec = elapsed > 0 ? chunksWritten / elapsed : 0.0;
-            const char* prefix = g_logFile ? "  " : "\r  ";
-            const char* suffix = g_logFile ? "\n" : "";
+            const char* prefix = progressRedrawsLine() ? "\r  " : "  ";
+            const char* suffix = progressRedrawsLine() ? "" : "\n";
             logPrintf(stderr, "%stile-row %u/%u (%d%%)  %.1f chunks/s  %dm%02ds  eta %dm%02ds%s",
                 prefix, done, tileRowsThis, int(100.0 * done / tileRowsThis),
                 chunksPerSec,
                 int(elapsed)/60, int(elapsed)%60, int(eta)/60, int(eta)%60, suffix);
         }
     }
-    if (!g_logFile) std::fprintf(stderr, "\n");
+    if (progressRedrawsLine()) std::fprintf(stderr, "\n");
 }
 
 
@@ -1052,6 +1078,13 @@ static std::optional<double> readVolumeVoxelSize(const std::filesystem::path& vo
 
 int main(int argc, char *argv[])
 {
+    // A pipe makes stdout block buffered, which holds the whole setup block — volume
+    // shape, chunk shape, voxel size, remote source — until the process exits. Line
+    // buffering releases it as it happens; stderr is pinned unbuffered so progress
+    // cannot be delayed either.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+
     // clang-format off
     po::options_description required("Required arguments");
     required.add_options()
