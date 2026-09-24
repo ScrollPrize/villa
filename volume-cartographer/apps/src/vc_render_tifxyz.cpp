@@ -35,6 +35,9 @@
 #include <unordered_set>
 #include <tiffio.h>
 #include <omp.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 namespace po = boost::program_options;
 using Json = utils::Json;
@@ -379,6 +382,81 @@ static std::vector<float> buildCompositeOffsetList(
     for (int zi = compositeStart; zi <= compositeEnd; zi++)
         out.push_back(float(zi) * float(sliceStep));
     return out;
+}
+
+#ifdef __linux__
+// Lowest memory limit from this process's cgroup up to the top of its mount: a limit on
+// any ancestor (a systemd slice, a container) applies to every cgroup below it.
+// /proc/self/cgroup gives the cgroup relative to its hierarchy's root, /proc/self/mountinfo
+// where that hierarchy is mounted and which subtree the mount shows. 0 when none is set.
+static unsigned long long cgroupMemoryLimit()
+{
+    const auto listed = [](const std::string& csv, const std::string& name) {
+        return ("," + csv + ",").find("," + name + ",") != std::string::npos;
+    };
+    unsigned long long best = 0;
+    std::ifstream mounts("/proc/self/mountinfo");
+    for (std::string line; std::getline(mounts, line);) {
+        // id parent major:minor root mountpoint options [optional...] - fstype source superoptions
+        std::istringstream fields(line);
+        std::string skip, root, mnt, fstype, superOpts;
+        fields >> skip >> skip >> skip >> root >> mnt;
+        while (fields >> skip && skip != "-") {}
+        fields >> fstype >> skip >> superOpts;
+        const bool v2 = fstype == "cgroup2";
+        if (!v2 && !(fstype == "cgroup" && listed(superOpts, "memory"))) continue;
+
+        // hierarchy:controllers:path, where cgroup v2 is the line "0::path"
+        std::string path;
+        std::ifstream cgroups("/proc/self/cgroup");
+        for (std::string entry; std::getline(cgroups, entry);) {
+            const auto a = entry.find(':'), b = entry.find(':', a + 1);
+            if (a == std::string::npos || b == std::string::npos) continue;
+            const std::string controllers = entry.substr(a + 1, b - a - 1);
+            if (v2 ? entry.compare(0, a, "0") == 0 && controllers.empty() : listed(controllers, "memory"))
+                path = entry.substr(b + 1);
+        }
+        if (path.empty() || path.find("/..") != std::string::npos) continue;
+        // A mount that shows only a subtree (a container without its own cgroup namespace)
+        // has the process's cgroup somewhere under that subtree, or not at all.
+        if (root != "/") {
+            if (path.compare(0, root.size(), root) != 0 || (path.size() > root.size() && path[root.size()] != '/'))
+                continue;
+            path.erase(0, root.size());
+        }
+
+        const std::string file = v2 ? "/memory.max" : "/memory.limit_in_bytes";
+        std::string dir = mnt + path;
+        while (dir.size() > mnt.size() && dir.back() == '/') dir.pop_back();
+        for (;;) {
+            std::ifstream in(dir + file); unsigned long long lim = 0;
+            if (in >> lim && lim > 0 && (best == 0 || lim < best)) best = lim;
+            if (dir.size() <= mnt.size()) break;
+            dir.erase(dir.rfind('/'));
+        }
+    }
+    return best;
+}
+#endif
+
+// Memory this process can actually use: the lowest cgroup limit when one is set
+// (a container, a systemd slice), otherwise the machine's RAM. 0 when unknown (Windows).
+static size_t usableMemoryBytes()
+{
+    size_t bytes = 0;
+#ifndef _WIN32
+    const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page > 0) bytes = size_t(pages) * size_t(page);
+#endif
+#ifdef __linux__
+    for (const char* f : {"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"}) {
+        std::ifstream in(f); unsigned long long lim = 0;
+        if (in >> lim && lim > 0 && (bytes == 0 || lim < bytes)) bytes = size_t(lim);
+    }
+    if (const unsigned long long lim = cgroupMemoryLimit(); lim > 0 && (bytes == 0 || lim < bytes))
+        bytes = size_t(lim);
+#endif
+    return bytes;
 }
 
 static std::string loadCachedRemoteUrl(const std::filesystem::path& volumePath)
@@ -1316,6 +1394,9 @@ int main(int argc, char *argv[])
     const int cacheLevel = group_idx;
 
     const size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
+    if (const size_t mem = usableMemoryBytes(); mem > 0 && cache_bytes >= mem)
+        logPrintf(stderr, "Warning: --cache-gb %llu is not below the memory available to this process (%.1f GB): the render can stall without any output. Lower --cache-gb.\n",
+                  (unsigned long long)parsed["cache-gb"].as<size_t>(), double(mem) / (1024.0 * 1024.0 * 1024.0));
     std::unique_ptr<vc::render::ChunkCache> ownedChunkCache;
     std::shared_ptr<Volume> remoteVolume;
     std::shared_ptr<vc::render::ChunkCache> remoteCache;
