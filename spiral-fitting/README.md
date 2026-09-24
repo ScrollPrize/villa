@@ -129,6 +129,165 @@ specifically):
 }
 ```
 
+## Fitting a scroll that ships only tracks (the 2025-2026 scans)
+
+The spiral datasets published for the 2025-2026 scans
+(`dl.ash2txt.org/datasets/spiral_datasets/<scroll>/<volume>/`) contain a
+`tracks/` directory and nothing else: no `umbilicus.json`, no `outer_shell/`,
+no patches, no `lasagna_inputs/`. The headless fitter still needs an
+umbilicus, the Lasagna normal fields and a `spiral-scroll.json`, so the
+dataset root is assembled by hand:
+
+```
+<dataset>/
+  spiral-scroll.json                # see "Scroll specification" above
+  umbilicus.json                    # published, or made by hand (below)
+  tracks/<dbm>                      # <scroll>_<volume>_surface_m7_L0_th0.2.dbm
+  tracks/<dbm>.crossings.npz        # published beside the DBM
+  tracks/<dbm>.vctracks/            # published beside the DBM, optional
+  lasagna_inputs/las_008_nx.ome.zarr/<group>        # copied from the bucket
+  lasagna_inputs/las_008_ny.ome.zarr/<group>
+  lasagna_inputs/las_008_grad_mag.ome.zarr/<group>  # optional, see below
+```
+
+**Tracks.** Name the DBM in `paths.tracks_dbm` as in the example above: the
+headless CLI otherwise resolves the conventional
+`tracks/2um_ds2_ps256_surf_v2.dbm` and does not look for the published file
+(only the interactive service's dataset resolution picks a lone DBM under
+`tracks/` by itself). Both published sidecars are accepted only while the
+DBM's backing file keeps the name, size and modification time recorded in
+them, to the nanosecond. An HTTP download cannot reproduce that
+(`Last-Modified` carries whole seconds, so `wget`, `curl -R` and rclone all
+stamp `hh:mm:ss.000000000`), so expect both sidecars to be ignored with a
+`WARNING` after any download. The fit still runs: it decodes the DBM directly
+and computes the exact crossings in memory at every start, which is slow but
+not an error; nothing is rebuilt on disk. To use the sidecars, either stamp
+the DBM with the mtime recorded in `<dbm>.vctracks/metadata.json`
+(`touch -d @<seconds>.<nanoseconds>`) or rebuild them once with
+`convert_track_store.py` and `build_track_crossings.py` (see "Packing large
+track databases" and "Caching exact track crossings" below). A
+`.crossings.npz` truncated by an interrupted download stops the fit instead —
+a corrupt requested input is meant to get your attention — so re-download it,
+or delete it and let it be rebuilt.
+
+**Umbilicus.** The fitter always requires `<dataset>/umbilicus.json`: an
+object with a `control_points` array of `{"x": …, "y": …, "z": …}` in the
+voxel coordinates of the volume the tracks were extracted from, sorted by `z`
+and interpolated linearly between points (and extrapolated beyond the first
+and last). A file annotated on a differently scaled grid is rescaled with
+`umbilicus.coordinate_scale` in `spiral-scroll.json` (default `1`). Ways to
+get one, in order of preference:
+
+1. Published. For some scrolls the open-data bucket has one at
+   `<scroll>/representations/umbilicus/<volume>-umbilicus-<date>.json`; copy
+   it to `<dataset>/umbilicus.json`. Check that `<volume>` (also named in
+   the file's `metadata.volume`) is the scan the tracks come from: an
+   umbilicus annotated on another scan of the same scroll is in another
+   frame.
+2. By hand. Open the volume in VC3D (or any slice viewer) and, on 8-12 z
+   slices spread over the range you will fit plus one beyond each end, read
+   off the `(x, y)` of the core — the point the innermost windings wrap
+   around — and write them as control points. Do not substitute the
+   centroid of the papyrus or of the foreground: the umbilicus can be far
+   from it. [Umbilicus Maker](https://github.com/JamesDarby345/Umbilicus_Maker)
+   is a community click-through annotator for this, but it writes a bare list
+   of `[z, y, x]` points (its bundled files cover the 2024 scans, every 500
+   slices), which VC3D reads and the fitter does not: rewrite them as
+   `control_points` objects first. VC3D reads the fitter's format too (File >
+   Attach Umbilicus…) if you want to keep the file with a VC3D project.
+3. Estimated. VC3D's normal-grid code has a RANSAC estimator,
+   `vc::core::util::align_and_extract_umbilicus`
+   (`volume-cartographer/core/src/normalgridtools.cpp`), which returns the
+   point of one normal-grid slice (a `vc_gen_normalgrids` output) that the
+   segment normals converge on. It is a library routine — no VC3D menu item
+   or `vc_ngrids` option calls it at the time of writing — and its result is
+   not guaranteed to be accurate, so treat it as a per-slice hint for the
+   hand method, not a replacement. Any other estimator deserves the same
+   treatment — anything that starts from the centroid of the papyrus or of
+   the foreground inherits the problem above — so check every control point
+   against the slices before fitting.
+
+**Lasagna inputs.** The normal fields the fitter reads are published per
+scroll in the open-data bucket at
+`<scroll>/representations/predictions/lasagna/<volume>-lasagna-<run>/<scroll>_{nx,ny,grad_mag}.ome.zarr`.
+Place them under the conventional names
+`lasagna_inputs/las_008_{nx,ny,grad_mag}.ome.zarr` and set `normal_zarr_group`
+and `lasagna_scale` from the store's own multiscales metadata as described in
+"Scroll specification" above. The fitter opens only the z window
+`[z_begin / lasagna_scale, z_end / lasagna_scale)` of the chosen pyramid
+level, so copying the chunks that cover that band (with a chunk of margin at
+each end) together with the store's metadata files is enough — a whole store
+is not needed. The gradient-magnitude store is required only while
+`loss_weight_dense_spacing` is above zero.
+
+**Configuration.** The headless CLI takes overrides as JSON in
+`FIT_SPIRAL_CONFIG_OVERRIDES` and the output root in `FIT_SPIRAL_OUT_DIR`.
+With tracks only, the switches that matter are:
+
+```sh
+export FIT_SPIRAL_OUT_DIR=/path/to/out
+export FIT_SPIRAL_CONFIG_OVERRIDES='{
+  "z_begin": <z0>, "z_end": <z1>, "optimizer_num_training_steps": 30000,
+  "input_use_tracks": true,
+  "input_disable_patches": true,
+  "input_use_outer_shell": false,
+  "dense_spacing_mode": "grad_mag", "loss_weight_dense_spacing": 0,
+  "shell_outer_winding_idx": <N>, "model_gap_expander_num_windings": <N>
+}'
+python fit_spiral.py --dataset <dataset>
+```
+
+- `input_use_tracks` defaults to `false`; without it the tracks are neither
+  loaded nor sampled, and nothing says so.
+- `input_disable_patches` (or `input_use_verified_patches` and
+  `input_use_unverified_patches` set to `false`) turns the patch loaders off;
+  otherwise `verified_patches/` is a required input.
+- `input_use_outer_shell` must be `false`. At its default the shell is a
+  required input: the default shell loss weight needs it, and even with the
+  shell weights at zero a tracks fit still opens the conventional
+  `outer_shell/` path to filter the tracks, so either way the fit stops on
+  the missing directory. Turning the shell off also disables the shell
+  losses and the winding-model spacing: the default `dense_spacing_mode`
+  then drives nothing while `loss_weight_dense_spacing` stays active, and
+  the only message is a `WARNING` that `loss_weight_dense_spacing_density`
+  is inactive, which names the phase bundle rather than the shell toggle —
+  so set the mode explicitly. `phase` only does anything with
+  `input_use_surf_sdt` on and a surf-SDT store
+  (`lasagna_inputs/las_008_surf_sdt.ome.zarr`) these datasets do not have —
+  at the default toggle it runs with no spacing loss at all — which leaves
+  `grad_mag`. The fits behind this recipe ran it with
+  `loss_weight_dense_spacing` at `0`.
+- `shell_outer_winding_idx` and `model_gap_expander_num_windings` default to
+  130, the value for PHercParis4 (Scroll 1), the dataset the defaults were
+  tuned on. The first bounds every sampler that integrates over the spiral
+  cylinder and caps the exported winding range; the second is the physical
+  winding estimate the exporters fall back on. Left at 130 on a scroll with
+  far fewer windings, the samplers spend their budget outside the papyrus,
+  so set both a little above the scroll's own count, keeping
+  `model_gap_expander_capacity_windings` (default 144) at least 3 above
+  `shell_outer_winding_idx`.
+
+  Count the windings by hand: on a z slice in the middle of the band you will
+  fit, count the sheet crossings along a straight line from the core to the
+  outside of the roll; repeat at two or three angles and at the top and
+  bottom of the band, and take the largest. Sheets pressed together in
+  compressed regions are not separated in the CT, so every such count is a
+  lower bound — set `<N>` above it. An automated counter (crossings of a
+  surface prediction along radial rays, say) automates the same count with
+  the same lower-bound caveat and no more.
+
+**What to expect.** Output lands in
+`<out>/<date>_<scroll>_slice-<z_begin>-<z_end>_0-patch/` (the trailing count
+is the number of verified patches, zero here): `checkpoint_fitted.ckpt`,
+refreshed during the run, and `meshes/fitted/` with one tifxyz directory per
+winding, `w<NNN>` and `w<NNN>_spliced`. The exported range is the windings
+the tracks occupy, widened by `output_winding_margin`, floored at
+`output_first_winding` and capped at `shell_outer_winding_idx`. On one RTX
+3090 (WSL2) the ten 1,500-slice tracks-only fits behind this recipe averaged
+5.2-10.0 it/s (seven of them 7.1-7.8), so 30,000 steps took between 50
+minutes and 1 h 35 min, typically 1 h 05-1 h 15, plus a minute or two of
+track loading.
+
 ## Sweep runner output
 
 `runners/run_sweep.py` prefixes each active fit's live `PROGRESS` and
