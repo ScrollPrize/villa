@@ -4,7 +4,7 @@ set -euo pipefail
 FF="$(cd "$(dirname "$0")/.." && pwd)"
 name=${1:?Usage: launch_ct_tube.sh RUN_NAME [train.py options...]}
 shift
-CT_ZARR=${CT_ZARR:-/home/sean/Documents/volpkgs/s1_ds2.volpkg/volumes/s1_ds2.zarr}
+CT_ZARR=${CT_ZARR:-/mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr}
 bash "$FF/scripts/launch.sh" "$name" \
     --inputs ct --ct "$CT_ZARR" --ct-level 0 --ct-grid-scale 4 \
     --crop-depth 64 --crop-width 64 --crop-behind 16 --crop-spacing 0.5 \

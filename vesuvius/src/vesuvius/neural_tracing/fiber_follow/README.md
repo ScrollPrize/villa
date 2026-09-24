@@ -93,7 +93,7 @@ the model-generated path starting from a single seed.
 ## CT-only, native level-0 experiment
 
 Use `scripts/launch_ct_tube.sh RUN_NAME` for a fresh CT-only Gaussian-tube run.
-The preset uses `/home/sean/Documents/volpkgs/s1_ds2.volpkg/volumes/s1_ds2.zarr/0`.
+The preset uses `/mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr/0`.
 One CT voxel in this dataset is four base voxels (`--ct-grid-scale 4`). All trace
 geometry and tolerances remain in the original eight-base-voxel trace grid.
 The oriented crop is 64 cubed with `--crop-spacing 0.5`: one native CT voxel per
@@ -202,8 +202,8 @@ FF=src/vesuvius/neural_tracing/fiber_follow
 # Fresh spatial model; collection and replay run automatically during training.
 .venv/bin/python -m vesuvius.neural_tracing.fiber_follow.train \
   --name spatial_dagger_v3 --steps 10000 --batch 32 \
-  --fiber-zarrs /home/sean/Documents/volpkgs/s1_2um.volpkg/20260411134726-fibers-20260915212757-L1_masked \
-  --fibers /mnt/bigpc/spiral_dataset_working/fibers
+  --fiber-zarrs /mnt/raid_nvme/spiral_dataset_working/fiber_zarrs \
+  --fibers /mnt/raid_nvme/spiral_dataset_working/fibers
 
 # Fixed geometry-bound validation seeds. Rebuild after annotation geometry changes.
 .venv/bin/python "$FF/scripts/eval_ckpt.py" field --seeds-only --rebuild-seeds
@@ -214,7 +214,7 @@ FF=src/vesuvius/neural_tracing/fiber_follow
 # Independent collection is also available, e.g. for fixed replay ablations.
 .venv/bin/python -m vesuvius.neural_tracing.fiber_follow.collect \
   --checkpoint "$FF/output/spatial_dagger_v3/last.pt" \
-  --fibers /mnt/bigpc/spiral_dataset_working/fibers \
+  --fibers /mnt/raid_nvme/spiral_dataset_working/fibers \
   --max-seeds 64 --out /tmp/fiber_decisions.npz
 
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q \

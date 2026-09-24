@@ -22,7 +22,7 @@ from vesuvius.neural_tracing.fiber_follow.train import load_checkpoint
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume, FiberVolumeSpec
 
 FF = Path(__file__).resolve().parents[1]
-LOCAL = '/home/sean/Documents/volpkgs/s1_2um.volpkg/20260411134726-fibers-20260915212757-L1_masked'
+LOCAL = '/mnt/raid_nvme/spiral_dataset_working/fiber_zarrs'
 
 
 def main(argv=None):
@@ -33,7 +33,7 @@ def main(argv=None):
     ap.add_argument('--n', type=int, default=0, help='0 = all eligible seeds')
     ap.add_argument('--tag', default='')
     ap.add_argument('--params', default='{}', help='TraceParams JSON (model only)')
-    ap.add_argument('--fibers', default='/mnt/bigpc/spiral_dataset_working/fibers')
+    ap.add_argument('--fibers', default='/mnt/raid_nvme/spiral_dataset_working/fibers')
     ap.add_argument('--fiber-zarrs', default=None)
     ap.add_argument('--val-z', type=float, nargs=2, default=(45000.0, 48500.0))
     ap.add_argument('--out-dir', type=Path, default=FF / 'output' / 'eval')

@@ -6,8 +6,8 @@ if __name__ == "__main__":
     from vesuvius.neural_tracing.fiber_follow import train as T
     nw, secs = int(sys.argv[1]), float(sys.argv[2])
     argv = sys.argv[sys.argv.index("--") + 1:]
-    ap_args = ["--fiber-zarrs", "/home/sean/Documents/volpkgs/s1_2um.volpkg/20260411134726-fibers-20260915212757-L1_masked",
-               "--fibers", "/mnt/bigpc/spiral_dataset_working/fibers", "--name", "_bench"] + argv
+    ap_args = ["--fiber-zarrs", "/mnt/raid_nvme/spiral_dataset_working/fiber_zarrs",
+               "--fibers", "/mnt/raid_nvme/spiral_dataset_working/fibers", "--name", "_bench"] + argv
     from vesuvius.neural_tracing.fiber_follow.data import (FollowDataset, OnPolicyStates, SampleConfig, ZBand,
                                                            gt_presence, load_fibers, mark_breaks, split_fibers)
     from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec

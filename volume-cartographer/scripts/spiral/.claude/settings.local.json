@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/sean/Documents/volpkgs/s1_ds2.volpkg/volumes/s1_ink_ome.zarr/**)",
+      "Read(//home/sean/Desktop/spiral_dataset/**)",
+      "Bash(nvidia-smi --query-gpu=name,memory.total --format=csv)",
+      "Bash(python -c \"import torch; print\\(torch.__version__, torch.version.cuda\\)\")",
+      "Bash(python3 *)",
+      "Bash(read d *)",
+      "Bash(ln -sfn /home/sean/Desktop/spiral_dataset/patches/__TRACKED_VAR__ bench/patches_subset/__TRACKED_VAR__)",
+      "Bash(ln -sfn /home/sean/Desktop/spiral_dataset/unproofed_patches_trimmed_deduped/__TRACKED_VAR__ bench/unverified_subset/__TRACKED_VAR__)"
+    ]
+  }
+}
