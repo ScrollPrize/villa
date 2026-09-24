@@ -1138,9 +1138,11 @@ int main(int argc, char** argv)
     };
     vc::core::util::UmbilicusFrameLoad umbilicusLoad;
     try {
-        // The shape below is inferred from the surface bounding box: good
-        // enough to confirm a stamped frame, but not authoritative, so a
-        // stamp it cannot confirm warns rather than refuses.
+        // The shape below is inferred from the surface bounding box, so it
+        // is not authoritative: a stamped frame is never rescaled on its
+        // say-so — a partial surface can exactly mimic a downsampled volume.
+        // Stamped grid rescales warn and keep the legacy reading; only an
+        // explicit stamped voxel-size conversion is applied.
         umbilicusLoad = vc::core::util::loadUmbilicusWithFrameCheck(
             cfg.umbilicus,
             {static_cast<double>(volumeShape[2]),

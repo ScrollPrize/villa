@@ -164,9 +164,12 @@ namespace vc::core::util {
     // that volume: the stamped dimensions must be a uniform rescale of the named
     // volume's own grid, and the stamped voxel size must agree with the voxel
     // size the named volume implies through that rescale (within 1%, the
-    // metadata round-trip slack). Returns a description of the contradiction,
-    // or nothing when the stamp is consistent — or could not be checked, which
-    // is not a contradiction.
+    // metadata round-trip slack). A voxel-size difference on its own is the
+    // conversion deriveUmbilicusScale() applies, not a contradiction: the
+    // voxel-size check only runs when a dimension triplet independently
+    // implies a voxel size for the stamped one to disagree with. Returns a
+    // description of the contradiction, or nothing when the stamp is
+    // consistent — or could not be checked, which is not a contradiction.
     //
     // A contradicted stamp is not weaker evidence than an unverified one; it is
     // evidence against the stamp itself, so consumers refuse the file rather
@@ -211,12 +214,17 @@ namespace vc::core::util {
         bool haveTargetGrid,
         bool stampContradicted = false);
 
-    // Outcome of loading an umbilicus file for a caller whose target grid is
-    // inferred rather than authoritative (e.g. a command-line tool working
-    // from a surface bounding box). It mirrors the resolver's Apply / Refuse /
-    // UseLegacy semantics, adapted: an inferred grid can confirm a stamped
-    // frame but can never refute one, so a stamp that does not fit it warns
-    // and keeps the legacy reading instead of refusing.
+    // Outcome of loading an umbilicus file with a frame check. It mirrors
+    // the resolver's Apply / Refuse / UseLegacy semantics, adapted to how
+    // much the target grid may say about a declared frame. An authoritative
+    // grid (the volume's own) may confirm or refute one; an inferred grid
+    // (e.g. a command-line tool working from a surface bounding box) can do
+    // neither for a grid-derived rescale — a surface patch's bounding box is
+    // not its frame, and a partial surface can exactly mimic a downsampled
+    // volume — so those warn and keep the legacy reading instead of
+    // rescaling or refusing. Only an explicit coordinate conversion, a
+    // stamped voxel size against the target's own, is applied under an
+    // inferred grid.
     struct UmbilicusFrameLoad {
         // The loaded umbilicus. Empty only when the file was refused.
         std::optional<Umbilicus> umbilicus;
@@ -235,8 +243,12 @@ namespace vc::core::util {
     // say about a declared frame.
     enum class UmbilicusTargetGridAuthority {
         // The grid is inferred from data (e.g. surface bounding boxes): it
-        // can confirm a declared frame but never refute one. A declared
-        // frame that does not fit it warns and keeps the legacy reading.
+        // can neither confirm nor refute a grid-derived rescale. A surface
+        // patch's bounding box is not its frame, and a partial surface can
+        // exactly mimic a downsampled volume, so a declared frame implying
+        // such a rescale warns and keeps the legacy reading. Only an
+        // explicit coordinate conversion — a stamped voxel size against the
+        // target's own voxel size — is applied.
         Inferred,
         // The grid is the authoritative volume grid: a declared frame that
         // does not fit it is refused outright.
@@ -249,7 +261,14 @@ namespace vc::core::util {
     // constructor, exactly as Umbilicus::FromFile took it.
     //
     //   - malformed frame metadata   -> refused, with the errors listed;
-    //   - stamped frame fits the grid -> points rescaled, scaleDescription set;
+    //   - stamped frame fits the grid -> points rescaled, scaleDescription
+    //                                  set — but only under an Authoritative
+    //                                  grid, or under an Inferred grid via an
+    //                                  explicit stamped voxel-size
+    //                                  conversion. A grid-derived rescale
+    //                                  under an Inferred grid warns and keeps
+    //                                  the legacy reading: surface bounds
+    //                                  cannot confirm a rescale;
     //   - stamped frame does not fit  -> Inferred grids warn and keep the
     //                                  legacy reading (a mismatch proves
     //                                  nothing about the file); Authoritative

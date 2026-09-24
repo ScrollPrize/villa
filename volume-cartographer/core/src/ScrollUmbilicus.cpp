@@ -432,6 +432,10 @@ std::optional<std::string> umbilicusStampContradiction(
     // The named volume's voxel size, carried onto the stamped grid: ratio 1
     // means the file was annotated on the store's own grid.
     double impliedVoxelUm = 0.0;
+    // Whether impliedVoxelUm came from the dimension triplet rather than
+    // being the named volume's own voxel size untouched: only the former
+    // is independent frame evidence a stamped voxel size can contradict.
+    bool impliedFromDimensions = false;
     if (namedVolumeVoxelSizeUm && std::isfinite(*namedVolumeVoxelSizeUm) &&
         *namedVolumeVoxelSizeUm > 0.0) {
         impliedVoxelUm = *namedVolumeVoxelSizeUm;
@@ -459,11 +463,18 @@ std::optional<std::string> umbilicusStampContradiction(
                    std::to_string(static_cast<long long>(namedVolumeGridXyz[2]));
         }
         impliedVoxelUm *= *storeFactor;
+        impliedFromDimensions = true;
     }
 
     // 1% covers metadata that round-trips a micrometre figure imprecisely; a
     // real disagreement is far larger (the smallest rescale is x2).
-    if (claim.voxelSize && impliedVoxelUm > 0.0 &&
+    //
+    // The voxel-size comparison only runs on a voxel size the dimension
+    // triplet independently implied. A voxel-size difference on its own is
+    // the conversion deriveUmbilicusScale() applies, not evidence against
+    // the stamp: comparing it against the named volume's own voxel size
+    // here refused valid voxel-size-only files.
+    if (claim.voxelSize && impliedFromDimensions && impliedVoxelUm > 0.0 &&
         std::isfinite(impliedVoxelUm) &&
         std::abs(impliedVoxelUm - *info.voxelsizeUm) >
             0.01 * *info.voxelsizeUm) {
@@ -536,18 +547,37 @@ UmbilicusFrameLoad loadUmbilicusWithFrameCheck(
     }
     const auto scale =
         deriveUmbilicusScale(info, targetGridXyz, targetVoxelSizeUm);
-    // The header documents this verdict as the consumer's responsibility
-    // where the target grid is the named volume's (Authoritative). Under
-    // Inferred it can only turn an Apply into warn+legacy, which is the safe
-    // direction: a contradicted stamp is evidence against the stamp itself,
-    // so the file is refused even when its points happen to infer a clean
-    // scale from a frame the file disproves.
+    // A contradiction refuses before anything else is weighed (see
+    // decideUmbilicusLoadAction): the scale was derived from a statement the
+    // named volume disproves. Under an Inferred grid that refusal can only
+    // become warn+legacy — the grid is not the volume's own, so a mismatch
+    // proves nothing about the file. The Apply arm below applies the same
+    // caution in reverse: a fit against an inferred grid cannot confirm a
+    // grid-derived rescale either, since a surface patch's bounding box is
+    // not its frame and a partial surface can exactly mimic a downsampled
+    // volume.
     const auto contradiction =
         umbilicusStampContradiction(info, targetGridXyz, targetVoxelSizeUm);
     const auto action = decideUmbilicusLoadAction(
         scale, claim, /*haveTargetGrid=*/true,
         /*stampContradicted=*/contradiction.has_value());
     if (action == UmbilicusLoadAction::Apply) {
+        // An inferred grid cannot establish a grid-derived rescale, so one
+        // is never applied on its say-so: warn and keep the legacy reading.
+        // Only an explicit coordinate conversion — a stamped voxel size
+        // against the target's own — survives, since it never depended on
+        // the inferred grid at all.
+        if (authority == UmbilicusTargetGridAuthority::Inferred &&
+            scale->source != UmbilicusScaleSource::StampedVoxelSize) {
+            result.warning =
+                "umbilicus '" + path.string() +
+                "' declares a frame implying a rescale (" +
+                scale->description +
+                "), but the working grid is inferred from surface bounds, "
+                "which cannot confirm the rescale; using its points as-is.";
+            result.umbilicus = Umbilicus::FromFile(path, volumeShape);
+            return result;
+        }
         auto points = Umbilicus::LoadControlPoints(path);
         const float factor = static_cast<float>(scale->factor);
         for (auto& point : points) {
