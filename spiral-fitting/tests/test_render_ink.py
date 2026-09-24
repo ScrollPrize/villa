@@ -17,12 +17,32 @@ import render_ink
 
 
 class RenderInkPathTests(unittest.TestCase):
-    def _invoke_render(self, array, extra_args=()):
+    def _invoke_render(self, array, extra_args=(), *, stale_outputs=False):
         meshes_dir = Path("meshes")
         mesh = meshes_dir / "w001_spliced"
         mesh.mkdir(parents=True, exist_ok=True)
         (mesh / "meta.json").write_text(json.dumps({"format": "tifxyz"}))
         commands = []
+
+        def fake_build_full_concat(*_args):
+            concat_path = Path("meshes/concat/w001-001")
+            if stale_outputs:
+                old_ink = concat_path / "ink"
+                old_ink.mkdir(parents=True, exist_ok=True)
+                Image.fromarray(np.full((4, 10), 200, dtype=np.uint8)).save(
+                    old_ink / "stale.tif"
+                )
+            return "w001-001", str(concat_path), 10
+
+        if stale_outputs:
+            old_collect = meshes_dir / "ink"
+            old_collect.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(np.full((4, 10), 200, dtype=np.uint8)).save(
+                old_collect / "w001-001_flat.jpg"
+            )
+            Image.fromarray(np.full((4, 10), 200, dtype=np.uint8)).save(
+                old_collect / "w001-001_flat.000.jpg"
+            )
 
         def fake_run(cmd, **_kwargs):
             commands.append(cmd)
@@ -34,7 +54,7 @@ class RenderInkPathTests(unittest.TestCase):
              patch.object(
                  render_ink,
                  "build_full_concat",
-                 return_value=("w001-001", "meshes/concat/w001-001", 10),
+                 side_effect=fake_build_full_concat,
              ), \
              patch.object(
                  render_ink,
@@ -108,6 +128,20 @@ class RenderInkPathTests(unittest.TestCase):
                 commands[0][i:i + 2] for i in range(len(commands[0]) - 1)
             ])
             self.assertFalse((meshes_dir / "ink" / "w001-001_flat.jpg").exists())
+
+    def test_empty_rerender_cannot_pass_from_stale_tifs_or_leave_old_jpg(self):
+        with CliRunner().isolated_filesystem():
+            result, _commands, meshes_dir = self._invoke_render(
+                np.zeros((4, 10), dtype=np.uint8),
+                stale_outputs=True,
+            )
+            self.assertEqual(result.exit_code, 1)
+            self.assertIn("rendered entirely zero", result.output)
+            self.assertFalse(
+                (meshes_dir / "concat" / "w001-001" / "ink" / "stale.tif").exists()
+            )
+            self.assertFalse((meshes_dir / "ink" / "w001-001_flat.jpg").exists())
+            self.assertFalse((meshes_dir / "ink" / "w001-001_flat.000.jpg").exists())
 
     def test_no_fail_on_empty_writes_black_jpg_with_warning(self):
         with CliRunner().isolated_filesystem():

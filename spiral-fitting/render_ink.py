@@ -520,8 +520,25 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentatio
 
     # Render ink from each (flattened, if enabled) mesh and max-composite it into a strip jpg.
     def render(name, concat_path):
+        # These paths are reused across runs. Remove this strip's previous jpg(s)
+        # and its prior slice tifs so an empty/partial new render cannot be
+        # masked by stale nonzero output and then reported as successful.
+        tile_prefix = f'{name}.'
+        for filename in os.listdir(collect_dir):
+            is_primary = filename == f'{name}.jpg'
+            tile_index = (
+                filename[len(tile_prefix):-4]
+                if filename.startswith(tile_prefix) and filename.endswith('.jpg')
+                else ''
+            )
+            if is_primary or tile_index.isdigit():
+                os.remove(os.path.join(collect_dir, filename))
+
         per_mesh_ink = os.path.join(concat_path, 'ink')
         os.makedirs(per_mesh_ink, exist_ok=True)
+        for filename in os.listdir(per_mesh_ink):
+            if filename.lower().endswith('.tif'):
+                os.remove(os.path.join(per_mesh_ink, filename))
         render_cmd = [
             vc_render_bin,
             '--segmentation', concat_path,
