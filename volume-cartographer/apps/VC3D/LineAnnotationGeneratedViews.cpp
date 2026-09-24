@@ -76,6 +76,9 @@ QPointF generatedStripControlPointToScene(
                                              &controlPositionMap);
 }
 
+
+} // namespace
+
 QColor generatedCurrentLineMarkerColor(GeneratedCurrentLineMarkerState state,
                                        int alpha)
 {
@@ -90,11 +93,14 @@ QColor generatedCurrentLineMarkerColor(GeneratedCurrentLineMarkerState state,
     }
 }
 
-} // namespace
-
 QColor generatedKollesisTerminationColor(int alpha)
 {
     return QColor(255, 230, 0, alpha);
+}
+
+QColor generatedBreakColor(int alpha)
+{
+    return QColor(255, 196, 0, alpha);
 }
 
 QPainterPath generatedTriangleMarkerPath(const QPointF& center, qreal radius)
@@ -295,6 +301,14 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     branchLineStyle.penWidth = 1.25;
     branchLineStyle.z = 149.0;
 
+    // A gap span (both endpoint controls tagged break) replaces the fiber's
+    // own line with a dotted amber one. Same z as the line it stands in for.
+    ViewerOverlayControllerBase::OverlayStyle gapLineStyle;
+    gapLineStyle.penColor = generatedBreakColor(220);
+    gapLineStyle.penWidth = 1.5;
+    gapLineStyle.penStyle = Qt::DotLine;
+    gapLineStyle.z = 150.0;
+
     ViewerOverlayControllerBase::OverlayStyle seedStyle;
     seedStyle.penColor = QColor(255, 230, 0, 220);
     seedStyle.brushColor = QColor(255, 230, 0, 170);
@@ -340,6 +354,17 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         return control.isKollesisTermination && !control.isSplitCandidate &&
                !control.isLinkCandidate;
     };
+    // A break point: dotted amber ring, same size step as the kollesis ring.
+    // A point somehow carrying both tags (an edited file) draws as the
+    // kollesis termination.
+    const auto drawsBreakRing = [&drawsKollesisRing](
+                                    const GeneratedOverlay::ControlPointMarker& control) {
+        return control.isBreak && !control.isSplitCandidate && !control.isLinkCandidate &&
+               !drawsKollesisRing(control);
+    };
+    const auto drawsTagRing = [&](const GeneratedOverlay::ControlPointMarker& control) {
+        return drawsKollesisRing(control) || drawsBreakRing(control);
+    };
     // Triangle instead of circle: an adjacent-winding link on the point, or
     // the point designated as an adjacent link candidate (a split candidate
     // keeps its own red circle).
@@ -375,6 +400,15 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
             // fill inside the ring so the link still reads.
             style.penColor = generatedKollesisTerminationColor(245);
             style.penWidth = 2.5;
+            if (!linked) {
+                style.brushColor = Qt::transparent;
+            }
+        } else if (drawsBreakRing(control)) {
+            // Dotted amber ring: "the papyrus breaks at this point". A linked
+            // break keeps its link-state fill inside the ring as well.
+            style.penColor = generatedBreakColor(245);
+            style.penWidth = 2.5;
+            style.penStyle = Qt::DotLine;
             if (!linked) {
                 style.brushColor = Qt::transparent;
             }
@@ -482,13 +516,65 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
             if (scale[0] != 0.0f && scale[1] != 0.0f && !overlay.linePoints.empty()) {
                 const float centerRow = static_cast<float>(points->rows / 2);
                 const float surfaceY = (centerRow - static_cast<float>(points->rows) / 2.0f) / scale[1];
-                const float startX = -static_cast<float>(points->cols) / 2.0f / scale[0];
-                const float endX = (static_cast<float>(points->cols - 1) -
-                                    static_cast<float>(points->cols) / 2.0f) / scale[0];
-                primitives.push_back(ViewerOverlayControllerBase::SurfaceLineStripPrimitive{
-                    {cv::Vec2f(startX, surfaceY), cv::Vec2f(endX, surfaceY)},
-                    false,
-                    lineStyle});
+                // The centre line, split at the gap spans: each gap piece is
+                // the dotted amber line, everything between stays the fiber's
+                // line. Positions map through the strip position map to grid
+                // columns and then through the surface's own grid-to-surface
+                // mapping, the same route the control point markers take
+                // (generatedStripLinePositionToScene), so the pieces end on
+                // the markers. The half-width formula of startX/endX is not
+                // that mapping: the strip surface's centre need not sit at
+                // half its width.
+                const double centerGridRow = static_cast<double>(points->rows / 2);
+                const auto surfaceXForLinePosition = [&](double linePosition) {
+                    const double gridColumn = overlay.stripPositionMap.valid()
+                        ? overlay.stripPositionMap.originalPositionToStripGridColumn(linePosition)
+                        : linePosition;
+                    if (!std::isfinite(gridColumn)) {
+                        return std::numeric_limits<float>::quiet_NaN();
+                    }
+                    return static_cast<float>(quad->gridToSurface({gridColumn, centerGridRow})[0]);
+                };
+                // The line's own ends in that same frame (the whole strip
+                // width), so a clamp cannot shift a piece off its markers.
+                const float lineStartX =
+                    static_cast<float>(quad->gridToSurface({0.0, centerGridRow})[0]);
+                const float lineEndX = static_cast<float>(
+                    quad->gridToSurface({static_cast<double>(points->cols - 1), centerGridRow})[0]);
+                std::vector<std::pair<float, float>> gapPieces;
+                for (const auto& [first, second] : overlay.gapLineRanges) {
+                    const float x0 = surfaceXForLinePosition(
+                        std::clamp(first, 0.0, maximumLinePosition));
+                    const float x1 = surfaceXForLinePosition(
+                        std::clamp(second, 0.0, maximumLinePosition));
+                    if (std::isfinite(x0) && std::isfinite(x1) && x1 > x0) {
+                        gapPieces.emplace_back(std::clamp(x0, lineStartX, lineEndX),
+                                               std::clamp(x1, lineStartX, lineEndX));
+                    }
+                }
+                std::sort(gapPieces.begin(), gapPieces.end());
+                float cursorX = lineStartX;
+                for (const auto& [x0, x1] : gapPieces) {
+                    if (x0 > cursorX) {
+                        primitives.push_back(ViewerOverlayControllerBase::SurfaceLineStripPrimitive{
+                            {cv::Vec2f(cursorX, surfaceY), cv::Vec2f(x0, surfaceY)},
+                            false,
+                            lineStyle});
+                    }
+                    if (x1 > std::max(cursorX, x0)) {
+                        primitives.push_back(ViewerOverlayControllerBase::SurfaceLineStripPrimitive{
+                            {cv::Vec2f(std::max(cursorX, x0), surfaceY), cv::Vec2f(x1, surfaceY)},
+                            false,
+                            gapLineStyle});
+                    }
+                    cursorX = std::max(cursorX, x1);
+                }
+                if (lineEndX > cursorX) {
+                    primitives.push_back(ViewerOverlayControllerBase::SurfaceLineStripPrimitive{
+                        {cv::Vec2f(cursorX, surfaceY), cv::Vec2f(lineEndX, surfaceY)},
+                        false,
+                        lineStyle});
+                }
             }
             if (overlay.controlPoints.empty() &&
                 overlay.seedLineIndex >= 0 &&
@@ -526,7 +612,7 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                 if (finiteScenePoint(controlScene)) {
                     const qreal radius =
                         (control.hasBranches ? 6.25 : (control.isSeed ? 5.5 : 5.0)) +
-                        (drawsKollesisRing(control) ? 1.0 : 0.0);
+                        (drawsTagRing(control) ? 1.0 : 0.0);
                     if (drawsTriangle(control)) {
                         primitives.push_back(ViewerOverlayControllerBase::PainterPathPrimitive{
                             generatedTriangleMarkerPath(controlScene, radius),
@@ -627,7 +713,7 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         }
         for (const auto& control : overlay.controlPoints) {
             const qreal radius = (control.hasBranches ? 12.0 : (control.isSeed ? 11.0 : 10.0)) +
-                                 (drawsKollesisRing(control) ? 2.0 : 0.0);
+                                 (drawsTagRing(control) ? 2.0 : 0.0);
             if (drawsTriangle(control) && finiteGeneratedPoint(control.point)) {
                 // Adjacent-winding links and the adjacent candidate are
                 // triangles; the path is built in scene space because the
@@ -738,13 +824,16 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         // primitive per segment meant one QGraphicsPathItem per segment,
         // and rebuilding thousands of scene items per overlay refresh
         // dominated zoom/pan lag on long fibers.
+        // A run also ends where the line enters or leaves a gap span, so the
+        // gap draws in its own dotted amber style.
         std::vector<QPointF> run;
+        bool runInGap = false;
         const auto flushRun = [&]() {
             if (run.size() >= 2) {
                 primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
                     std::move(run),
                     false,
-                    lineStyle});
+                    runInGap ? gapLineStyle : lineStyle});
             }
             run = {};
         };
@@ -755,8 +844,14 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                 flushRun();
                 continue;
             }
+            const bool inGap =
+                generatedLineSegmentInGap(previous.second, current.second, overlay.gapLineRanges);
+            if (!run.empty() && inGap != runInGap) {
+                flushRun();
+            }
             if (run.empty()) {
                 run.push_back(previous.first);
+                runInGap = inGap;
             }
             run.push_back(current.first);
         }
@@ -993,13 +1088,33 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         const bool haveIndex = selectedControlIndex != std::numeric_limits<size_t>::max();
         const bool endpoint = haveIndex &&
             generatedControlPointIsEndpoint(options.controlPoints, selectedControlIndex);
-        const bool enabled = haveIndex && (endpoint || selectedControl.isKollesisTermination);
+        // Adding the tag to a break point is refused (one or the other);
+        // removing a tag is always possible.
+        const bool blockedByBreak = selectedControl.isBreak && !selectedControl.isKollesisTermination;
+        const bool enabled = haveIndex && !blockedByBreak &&
+            (endpoint || selectedControl.isKollesisTermination);
         kollesisTerminationAction = menu.addAction(
-            enabled ? QWidget::tr("Kollesis termination")
-                    : QWidget::tr("Kollesis termination (fiber ends only)"));
+            enabled          ? QWidget::tr("Kollesis termination")
+            : blockedByBreak ? QWidget::tr("Kollesis termination (point is a break)")
+                             : QWidget::tr("Kollesis termination (fiber ends only)"));
         kollesisTerminationAction->setCheckable(true);
         kollesisTerminationAction->setChecked(selectedControl.isKollesisTermination);
         kollesisTerminationAction->setEnabled(enabled);
+    }
+    QAction* breakAction = nullptr;
+    if (options.setBreak) {
+        // Any point can be a break; adding the tag to a kollesis termination
+        // is refused (one or the other). Removing a tag is always possible.
+        const bool haveIndex = selectedControlIndex != std::numeric_limits<size_t>::max();
+        const bool blockedByKollesis =
+            selectedControl.isKollesisTermination && !selectedControl.isBreak;
+        const bool enabled = haveIndex && !blockedByKollesis;
+        breakAction = menu.addAction(
+            blockedByKollesis ? QWidget::tr("Break (point is a kollesis termination)")
+                              : QWidget::tr("Break"));
+        breakAction->setCheckable(true);
+        breakAction->setChecked(selectedControl.isBreak);
+        breakAction->setEnabled(enabled);
     }
     QAction* designateLinkCandidateAction = nullptr;
     if (options.designateLinkCandidate) {
@@ -1162,6 +1277,10 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         kollesisTerminationAction->isEnabled()) {
         options.setKollesisTermination(selectedControlIndex,
                                        !selectedControl.isKollesisTermination);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (breakAction && selected == breakAction && breakAction->isEnabled()) {
+        options.setBreak(selectedControlIndex, !selectedControl.isBreak);
         return GeneratedControlPointContextResult::Handled;
     }
     for (const auto& [action, goal] : interpolationGoalActions) {

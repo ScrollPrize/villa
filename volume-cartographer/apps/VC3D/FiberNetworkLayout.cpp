@@ -623,49 +623,79 @@ PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
     placedFiber.label = fiber.label;
     placedFiber.hvTag = fiber.hvTag;
     placedFiber.controlPoints = geo.controlPoints;
-    placedFiber.kollesisTerminations.assign(placedFiber.controlPoints.size(), false);
-    if (fiber.kollesisTerminations.size() == fiber.controlPoints.size()) {
-        for (std::size_t i = 0;
-             i < fiber.kollesisTerminations.size() && i < placedFiber.kollesisTerminations.size();
-             ++i) {
-            placedFiber.kollesisTerminations[i] = fiber.kollesisTerminations[i];
+    // Per-point flags are copied only when they line up with the controls; a
+    // mismatched vector is ignored rather than read misaligned.
+    const auto copyPointFlags = [&](const std::vector<bool>& flags, std::vector<bool>& out) {
+        out.assign(placedFiber.controlPoints.size(), false);
+        if (flags.size() == fiber.controlPoints.size()) {
+            for (std::size_t i = 0; i < flags.size() && i < out.size(); ++i) {
+                out[i] = flags[i];
+            }
         }
-    }
+    };
+    copyPointFlags(fiber.kollesisTerminations, placedFiber.kollesisTerminations);
+    copyPointFlags(fiber.breaks, placedFiber.breaks);
 
     const std::size_t spanCount =
         fiber.controlPoints.empty() ? 0 : fiber.controlPoints.size() - 1;
-    const bool haveFlags = spanCount > 0 &&
-                           fiber.tracedSegments.size() == spanCount;
-    if (!haveFlags) {
+    // The two per-span styles are normalised independently: missing or
+    // mismatched traced flags read as all traced (as before), missing break
+    // flags as no gaps. A gap span has both endpoints tagged break.
+    const bool haveTraced = spanCount > 0 && fiber.tracedSegments.size() == spanCount;
+    std::vector<bool> traced(spanCount, true);
+    if (haveTraced) {
+        traced = fiber.tracedSegments;
+    }
+    std::vector<bool> gap(spanCount, false);
+    bool anyGap = false;
+    if (spanCount > 0 && fiber.breaks.size() == fiber.controlPoints.size()) {
+        for (std::size_t i = 0; i < spanCount; ++i) {
+            gap[i] = fiber.breaks[i] && fiber.breaks[i + 1];
+            anyGap = anyGap || gap[i];
+        }
+    }
+    if (!haveTraced && !anyGap) {
         if (geo.samples.size() > 1) {
-            placedFiber.runs.push_back(Run{true, geo.samples});
+            Run whole;
+            whole.firstControl = 0;
+            whole.lastControl = static_cast<int>(spanCount);
+            whole.points = geo.samples;
+            placedFiber.runs.push_back(std::move(whole));
         }
-    } else {
-        std::size_t k = 0;
-        while (k < spanCount) {
-            std::size_t j = k;
-            while (j + 1 < spanCount &&
-                   fiber.tracedSegments[j + 1] == fiber.tracedSegments[k]) {
-                ++j;
-            }
-            const std::size_t begin = searchSortedLeft(
-                geo.sampleArclength, geo.controlArclength[k]);
-            const std::size_t end = searchSortedRight(
-                geo.sampleArclength, geo.controlArclength[j + 1]);
-            const std::size_t from = begin > 0 ? begin - 1 : 0;
-            const std::size_t to = std::min(geo.samples.size(), end + 1);
-            if (to > from + 1) {
-                placedFiber.runs.push_back(Run{
-                    fiber.tracedSegments[k],
-                    std::vector<QPointF>(
-                        geo.samples.begin() + static_cast<std::ptrdiff_t>(from),
-                        geo.samples.begin() + static_cast<std::ptrdiff_t>(to))});
-            }
-            k = j + 1;
+        return placedFiber;
+    }
+
+    // Maximal stretches of spans with the same (traced, gap) style. Every run
+    // keeps one sample past each bounding control (the same geometry as
+    // before breaks existed, so splitting a run at a gap changes which runs
+    // the samples belong to but not the drawn or seeded segments).
+    std::size_t k = 0;
+    while (k < spanCount) {
+        std::size_t j = k;
+        while (j + 1 < spanCount && traced[j + 1] == traced[k] && gap[j + 1] == gap[k]) {
+            ++j;
         }
+        const std::size_t begin = searchSortedLeft(
+            geo.sampleArclength, geo.controlArclength[k]);
+        const std::size_t end = searchSortedRight(
+            geo.sampleArclength, geo.controlArclength[j + 1]);
+        const std::size_t from = begin > 0 ? begin - 1 : 0;
+        const std::size_t to = std::min(geo.samples.size(), end + 1);
+        if (to > from + 1) {
+            Run run;
+            run.traced = traced[k];
+            run.gap = gap[k];
+            run.firstControl = static_cast<int>(k);
+            run.lastControl = static_cast<int>(j + 1);
+            run.points.assign(geo.samples.begin() + static_cast<std::ptrdiff_t>(from),
+                              geo.samples.begin() + static_cast<std::ptrdiff_t>(to));
+            placedFiber.runs.push_back(std::move(run));
+        }
+        k = j + 1;
     }
     return placedFiber;
 }
+
 
 // --- Content hashing: two independent FNV-1a lanes over raw bytes (IEEE-754
 // doubles hashed by bit pattern, strings length-prefixed, field order fixed).
@@ -776,6 +806,41 @@ ContentDigest combineDigests(uint64_t seed,
 }
 
 } // namespace
+
+std::vector<QPointF> displayRunPoints(const PlacedFiber& fiber, std::size_t runIndex)
+{
+    if (runIndex >= fiber.runs.size()) {
+        return {};
+    }
+    const Run& run = fiber.runs[runIndex];
+    std::vector<QPointF> points = run.points;
+    if (points.size() < 2) {
+        return points;
+    }
+    const auto control = [&fiber](int index) -> const QPointF* {
+        return index >= 0 && static_cast<std::size_t>(index) < fiber.controlPoints.size()
+            ? &fiber.controlPoints[static_cast<std::size_t>(index)]
+            : nullptr;
+    };
+    // The overlap is exactly one sample at each end: the sample before the
+    // first control's arclength and the one after the last control's. A run
+    // starting at the fiber's first sample (or ending at its last) has no
+    // overlap there, and the control sits on that sample, so the replacement
+    // is a no-op.
+    const bool previousIsGap = runIndex > 0 && fiber.runs[runIndex - 1].gap;
+    const bool nextIsGap = runIndex + 1 < fiber.runs.size() && fiber.runs[runIndex + 1].gap;
+    if (run.gap || previousIsGap) {
+        if (const QPointF* first = control(run.firstControl)) {
+            points.front() = *first;
+        }
+    }
+    if (run.gap || nextIsGap) {
+        if (const QPointF* last = control(run.lastControl)) {
+            points.back() = *last;
+        }
+    }
+    return points;
+}
 
 std::vector<const winding::PairDetections*> GlobalLayoutCache::cachedDetections() const
 {
@@ -1995,6 +2060,11 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
         for (const bool tagged : fiber.kollesisTerminations) {
             hashU64(digest, tagged ? 1 : 0);
         }
+        // Display-only, but it shapes the placed runs: same reasoning.
+        hashU64(digest, fiber.breaks.size());
+        for (const bool tagged : fiber.breaks) {
+            hashU64(digest, tagged ? 1 : 0);
+        }
         hashU64(digest, fiber.links.size());
         for (const InputLink& link : fiber.links) {
             hashU64(digest, static_cast<uint64_t>(
@@ -2091,6 +2161,9 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         hashU64(digest, fiber.fiber.runs.size());
         for (const Run& run : fiber.fiber.runs) {
             hashU64(digest, run.traced ? 1 : 0);
+            hashU64(digest, run.gap ? 1 : 0);
+            hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(run.firstControl)));
+            hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(run.lastControl)));
             hashU64(digest, run.points.size());
             for (const QPointF& point : run.points) {
                 hashDouble(digest, point.x());
@@ -2104,6 +2177,10 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         }
         hashU64(digest, fiber.fiber.kollesisTerminations.size());
         for (const bool tagged : fiber.fiber.kollesisTerminations) {
+            hashU64(digest, tagged ? 1 : 0);
+        }
+        hashU64(digest, fiber.fiber.breaks.size());
+        for (const bool tagged : fiber.fiber.breaks) {
             hashU64(digest, tagged ? 1 : 0);
         }
     }

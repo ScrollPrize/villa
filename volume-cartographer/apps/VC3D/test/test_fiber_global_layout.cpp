@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
+#include <tuple>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1291,6 +1293,136 @@ private slots:
         QVERIFY(std::none_of(ignored->fiber.kollesisTerminations.begin(),
                              ignored->fiber.kollesisTerminations.end(),
                              [](bool flagged) { return flagged; }));
+    }
+
+    // --- Break tags: display-only like the kollesis flag, but they also shape
+    // the placed runs: the span between two consecutive tagged points is a
+    // gap run, bounded exactly at the controls, and a lone tag is only a rim.
+    void breakTagsMakeGapRunsWithoutRecomputingGeometry()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        const GlobalLayoutParams params = defaultParams();
+        std::vector<InputFiber> fibers = cacheFixture();
+        const uint64_t taggedId = fibers.front().id;
+        const std::size_t controlCount = fibers.front().controlPoints.size();
+        QVERIFY(controlCount >= 3);
+
+        vc3d::fiber_map::GlobalLayoutCache cache;
+        const GlobalResult untagged =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        const GlobalPlacedFiber* plain = findFiber(untagged, taggedId);
+        QVERIFY(plain != nullptr);
+        QCOMPARE(plain->fiber.breaks.size(), plain->fiber.controlPoints.size());
+        QVERIFY(std::none_of(plain->fiber.runs.begin(), plain->fiber.runs.end(),
+                             [](const vc3d::fiber_map::Run& run) { return run.gap; }));
+        const std::size_t plainRunCount = plain->fiber.runs.size();
+
+        // A lone break: the flag reaches the placed fiber, no run is a gap,
+        // but both session digests move (the rim is drawn from the flag).
+        fibers.front().breaks.assign(controlCount, false);
+        fibers.front().breaks[1] = true;
+        const GlobalResult lone =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        const GlobalPlacedFiber* lonePlaced = findFiber(lone, taggedId);
+        QVERIFY(lonePlaced != nullptr);
+        QVERIFY(lonePlaced->fiber.breaks[1]);
+        QVERIFY(std::none_of(lonePlaced->fiber.runs.begin(), lonePlaced->fiber.runs.end(),
+                             [](const vc3d::fiber_map::Run& run) { return run.gap; }));
+        QCOMPARE(lonePlaced->fiber.runs.size(), plainRunCount);
+        QCOMPARE(cache.lastStats().fibersRecomputed, 0);
+        QCOMPARE(cache.lastStats().pairsRecomputed, 0);
+        QVERIFY(!(vc3d::fiber_map::digestGlobalInputs(fibers, umbilicus, params) ==
+                  vc3d::fiber_map::digestGlobalInputs(cacheFixture(), umbilicus, params)));
+        QVERIFY(!(vc3d::fiber_map::digestGlobalResult(lone) ==
+                  vc3d::fiber_map::digestGlobalResult(untagged)));
+
+        // Two consecutive breaks: exactly one gap run, bounded by controls 1
+        // and 2. The layout's own geometry is unchanged by the tag: the runs
+        // are re-partitioned, but the set of drawn/seeded segments is the
+        // same, so the gap heat map (which seeds from run.points) sees no
+        // difference. Still no geometry recomputation.
+        fibers.front().breaks[2] = true;
+        const GlobalResult gapped =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        const GlobalPlacedFiber* placed = findFiber(gapped, taggedId);
+        QVERIFY(placed != nullptr);
+        QCOMPARE(cache.lastStats().fibersRecomputed, 0);
+        std::vector<std::size_t> gapRuns;
+        for (std::size_t i = 0; i < placed->fiber.runs.size(); ++i) {
+            if (placed->fiber.runs[i].gap) {
+                gapRuns.push_back(i);
+            }
+        }
+        QCOMPARE(gapRuns.size(), std::size_t{1});
+        const std::size_t gapIndex = gapRuns.front();
+        const vc3d::fiber_map::Run& gapRun = placed->fiber.runs[gapIndex];
+        QCOMPARE(gapRun.firstControl, 1);
+        QCOMPARE(gapRun.lastControl, 2);
+        QVERIFY(gapRun.points.size() >= 2);
+        const auto segmentsOf = [](const vc3d::fiber_map::PlacedFiber& fiber) {
+            std::set<std::tuple<long long, long long, long long, long long>> segments;
+            const auto key = [](const QPointF& a, const QPointF& b) {
+                return std::make_tuple(std::llround(a.x() * 1000.0), std::llround(a.y() * 1000.0),
+                                       std::llround(b.x() * 1000.0), std::llround(b.y() * 1000.0));
+            };
+            for (const vc3d::fiber_map::Run& run : fiber.runs) {
+                for (std::size_t i = 1; i < run.points.size(); ++i) {
+                    segments.insert(key(run.points[i - 1], run.points[i]));
+                }
+            }
+            return segments;
+        };
+        QVERIFY(segmentsOf(placed->fiber) == segmentsOf(plain->fiber));
+
+        // Drawing trims the gap run and its neighbours to the shared controls
+        // exactly, while the raw runs keep their one-sample overlap.
+        const auto near = [](const QPointF& a, const QPointF& b) {
+            return std::hypot(a.x() - b.x(), a.y() - b.y()) < 1e-6;
+        };
+        const std::vector<QPointF> gapDisplay =
+            vc3d::fiber_map::displayRunPoints(placed->fiber, gapIndex);
+        QVERIFY(gapDisplay.size() >= 2);
+        QVERIFY(near(gapDisplay.front(), placed->fiber.controlPoints[1]));
+        QVERIFY(near(gapDisplay.back(), placed->fiber.controlPoints[2]));
+        QVERIFY(gapIndex > 0 || gapIndex + 1 < placed->fiber.runs.size());
+        if (gapIndex > 0) {
+            const std::vector<QPointF> before =
+                vc3d::fiber_map::displayRunPoints(placed->fiber, gapIndex - 1);
+            QVERIFY(near(before.back(), placed->fiber.controlPoints[1]));
+            QVERIFY(!near(placed->fiber.runs[gapIndex - 1].points.back(),
+                          placed->fiber.controlPoints[1]));
+        }
+        if (gapIndex + 1 < placed->fiber.runs.size()) {
+            const std::vector<QPointF> after =
+                vc3d::fiber_map::displayRunPoints(placed->fiber, gapIndex + 1);
+            QVERIFY(near(after.front(), placed->fiber.controlPoints[2]));
+            QVERIFY(!near(placed->fiber.runs[gapIndex + 1].points.front(),
+                          placed->fiber.controlPoints[2]));
+        }
+        // A run away from every gap draws its own points unchanged.
+        for (std::size_t i = 0; i < placed->fiber.runs.size(); ++i) {
+            const bool touchesGap = placed->fiber.runs[i].gap ||
+                                    (i > 0 && placed->fiber.runs[i - 1].gap) ||
+                                    (i + 1 < placed->fiber.runs.size() &&
+                                     placed->fiber.runs[i + 1].gap);
+            if (!touchesGap) {
+                QVERIFY(vc3d::fiber_map::displayRunPoints(placed->fiber, i) ==
+                        placed->fiber.runs[i].points);
+            }
+        }
+        QVERIFY(!(vc3d::fiber_map::digestGlobalResult(gapped) ==
+                  vc3d::fiber_map::digestGlobalResult(lone)));
+
+        // A mismatched flag vector is ignored, not read misaligned.
+        fibers.front().breaks.pop_back();
+        const GlobalResult mismatched =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        const GlobalPlacedFiber* ignored = findFiber(mismatched, taggedId);
+        QVERIFY(ignored != nullptr);
+        QVERIFY(std::none_of(ignored->fiber.breaks.begin(), ignored->fiber.breaks.end(),
+                             [](bool flagged) { return flagged; }));
+        QVERIFY(std::none_of(ignored->fiber.runs.begin(), ignored->fiber.runs.end(),
+                             [](const vc3d::fiber_map::Run& run) { return run.gap; }));
     }
 
     // A folded pair's crossings are read together: one group with a verdict,

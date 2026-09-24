@@ -92,6 +92,8 @@ public:
         // fill (link state) the point keeps; an unlinked tagged point has no
         // fill at all.
         QGraphicsPathItem* kollesisRings = nullptr;
+        // Dotted amber rings of break-tagged points, same layering rule.
+        QGraphicsPathItem* breakRings = nullptr;
         QGraphicsPathItem* fiberIntersections = nullptr;
         QGraphicsPathItem* linkCandidateFiberIntersections = nullptr;
         // One item per link state (kLinkStateCount, indexed by
@@ -264,6 +266,9 @@ signals:
     void generatedControlPointKollesisTerminationChangeRequested(const std::string& surfaceName,
                                                                  size_t controlPointIndex,
                                                                  bool enabled);
+    void generatedControlPointBreakChangeRequested(const std::string& surfaceName,
+                                                   size_t controlPointIndex,
+                                                   bool enabled);
     void generatedPredSnapPointRequested(const std::string& surfaceName,
                                          cv::Vec3f volumePoint);
     void generatedSideStripIntersectionQueryRequested(const std::string& surfaceName);

@@ -147,6 +147,8 @@ private:
         int networkId = -1;
         QGraphicsPathItem* tracedItem = nullptr;
         QGraphicsPathItem* interpolatedItem = nullptr;
+        // Gap spans (both endpoint controls tagged break): dotted amber.
+        QGraphicsPathItem* gapItem = nullptr;
         // The network emphasis: a soft semi-transparent halo behind the
         // fiber's whole geometry, created only while its network is
         // selected.

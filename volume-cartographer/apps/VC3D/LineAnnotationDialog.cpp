@@ -485,6 +485,8 @@ public:
         QColor color;
         // Edge colour; unset draws the fill's darker shade (the default look).
         std::optional<QColor> edge;
+        // Dotted edge (the break ring).
+        bool dottedEdge = false;
         qreal radius = 4.5;
         // Adjacent-winding link (or adjacent candidate): drawn as a triangle.
         bool triangle = false;
@@ -494,10 +496,13 @@ public:
 
     std::function<void(double, QPoint)> controlContextRequested;
 
-    void setLineData(size_t linePointCount, std::vector<ControlDot> dots)
+    void setLineData(size_t linePointCount,
+                     std::vector<ControlDot> dots,
+                     std::vector<std::pair<double, double>> gapLineRanges)
     {
         _linePointCount = linePointCount;
         _dots = std::move(dots);
+        _gapLineRanges = std::move(gapLineRanges);
         update();
     }
 
@@ -529,9 +534,36 @@ protected:
         }
         painter.setRenderHint(QPainter::Antialiasing, true);
         const qreal midY = height() * 0.5;
-        painter.setPen(QPen(QColor(190, 190, 190), 2.0));
-        painter.drawLine(QPointF(kMarginPx, midY),
-                         QPointF(width() - kMarginPx, midY));
+        // The baseline, with each gap span replaced (not overdrawn) by the
+        // dotted amber of the cut views: no solid pixels remain inside a gap.
+        std::vector<std::pair<qreal, qreal>> gapPieces;
+        for (const auto& [first, second] : _gapLineRanges) {
+            if (std::isfinite(first) && std::isfinite(second) && second > first) {
+                gapPieces.emplace_back(xForLinePosition(first), xForLinePosition(second));
+            }
+        }
+        std::sort(gapPieces.begin(), gapPieces.end());
+        const QPen basePen(QColor(190, 190, 190), 2.0);
+        QPen gapPen(vc3d::line_annotation::generatedBreakColor(255), 2.0);
+        gapPen.setStyle(Qt::DotLine);
+        qreal cursorX = kMarginPx;
+        const qreal lineEndX = width() - kMarginPx;
+        for (const auto& [x0, x1] : gapPieces) {
+            if (x0 > cursorX) {
+                painter.setPen(basePen);
+                painter.drawLine(QPointF(cursorX, midY), QPointF(x0, midY));
+            }
+            const qreal from = std::max(cursorX, x0);
+            if (x1 > from) {
+                painter.setPen(gapPen);
+                painter.drawLine(QPointF(from, midY), QPointF(x1, midY));
+            }
+            cursorX = std::max(cursorX, x1);
+        }
+        if (lineEndX > cursorX) {
+            painter.setPen(basePen);
+            painter.drawLine(QPointF(cursorX, midY), QPointF(lineEndX, midY));
+        }
 
         if (std::isfinite(_currentPosition)) {
             painter.setPen(QPen(_currentColor, 2.0));
@@ -544,8 +576,11 @@ protected:
                 continue;
             }
             const qreal x = xForLinePosition(dot.linePosition);
-            painter.setPen(dot.edge ? QPen(*dot.edge, 1.5)
-                                    : QPen(dot.color.darker(150), 1.0));
+            QPen edgePen = dot.edge ? QPen(*dot.edge, 1.5) : QPen(dot.color.darker(150), 1.0);
+            if (dot.dottedEdge) {
+                edgePen.setStyle(Qt::DotLine);
+            }
+            painter.setPen(edgePen);
             painter.setBrush(dot.color);
             if (dot.triangle) {
                 painter.drawPath(vc3d::line_annotation::generatedTriangleMarkerPath(
@@ -598,6 +633,7 @@ private:
 
     size_t _linePointCount = 0;
     std::vector<ControlDot> _dots;
+    std::vector<std::pair<double, double>> _gapLineRanges;
     double _currentPosition = std::numeric_limits<double>::quiet_NaN();
     QColor _currentColor{0, 245, 255};
 };
@@ -2557,6 +2593,9 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
                                                                      controlPointIndex,
                                                                      enabled);
     };
+    options.setBreak = [this, surfaceName](size_t controlPointIndex, bool enabled) {
+        emit generatedControlPointBreakChangeRequested(surfaceName, controlPointIndex, enabled);
+    };
     return vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
 }
 
@@ -3572,6 +3611,13 @@ bool LineAnnotationDialog::controlPointPlacementAllowedAt(double linePosition) c
             _generatedViews.controlPoints, linePosition)) {
         return false;
     }
+    // Nothing goes inside a gap span (two consecutive break points) either:
+    // unflag a break first.
+    if (vc3d::line_annotation::generatedLinePositionInsideGap(
+            vc3d::line_annotation::generatedGapLineRanges(_generatedViews.controlPoints),
+            linePosition)) {
+        return false;
+    }
     std::vector<double> controlLinePositions;
     controlLinePositions.reserve(_generatedViews.controlPoints.size());
     for (const auto& control : _generatedViews.controlPoints) {
@@ -3588,7 +3634,10 @@ vc3d::line_annotation::GeneratedCurrentLineMarkerState
 LineAnnotationDialog::currentLineMarkerState() const
 {
     if (vc3d::line_annotation::generatedLinePositionBeyondKollesisTermination(
-            _generatedViews.controlPoints, _currentLinePosition)) {
+            _generatedViews.controlPoints, _currentLinePosition) ||
+        vc3d::line_annotation::generatedLinePositionInsideGap(
+            vc3d::line_annotation::generatedGapLineRanges(_generatedViews.controlPoints),
+            _currentLinePosition)) {
         return vc3d::line_annotation::GeneratedCurrentLineMarkerState::Blocked;
     }
     if (maxControlPointExtrapolationDistanceVx() <= 0) {
@@ -3931,15 +3980,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
 
     const auto markerColorForState =
         [](vc3d::line_annotation::GeneratedCurrentLineMarkerState state) {
-            switch (state) {
-            case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Allowed:
-                return QColor(40, 220, 120, 245);
-            case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Blocked:
-                return QColor(255, 70, 70, 245);
-            case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Neutral:
-            default:
-                return QColor(0, 245, 255, 245);
-            }
+            return vc3d::line_annotation::generatedCurrentLineMarkerColor(state, 245);
         };
 
     const auto ensureStripItems =
@@ -4302,6 +4343,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         !_fastCurrentCutOverlayItems.sameHvBranchControlPoints ||
         !_fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints ||
         !_fastCurrentCutOverlayItems.kollesisRings ||
+        !_fastCurrentCutOverlayItems.breakRings ||
         !_fastCurrentCutOverlayItems.fiberIntersections ||
         !_fastCurrentCutOverlayItems.linkCandidateFiberIntersections ||
         std::any_of(_fastCurrentCutOverlayItems.branchLinkFiberIntersections.begin(),
@@ -4399,6 +4441,15 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.kollesisRings->setBrush(Qt::NoBrush);
         _fastCurrentCutOverlayItems.kollesisRings->setZValue(162.75);
 
+        // The break ring: dotted amber, layered like the kollesis ring.
+        QPen breakRingPen(vc3d::line_annotation::generatedBreakColor(245));
+        breakRingPen.setWidthF(2.5);
+        breakRingPen.setStyle(Qt::DotLine);
+        _fastCurrentCutOverlayItems.breakRings = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.breakRings->setPen(breakRingPen);
+        _fastCurrentCutOverlayItems.breakRings->setBrush(Qt::NoBrush);
+        _fastCurrentCutOverlayItems.breakRings->setZValue(162.75);
+
         QPen fiberIntersectionPen(QColor(255, 245, 75, 245));
         fiberIntersectionPen.setWidthF(1.25);
         fiberIntersectionPen.setCapStyle(Qt::FlatCap);
@@ -4468,6 +4519,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             _fastCurrentCutOverlayItems.sameHvBranchControlPoints,
             _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints,
             _fastCurrentCutOverlayItems.kollesisRings,
+            _fastCurrentCutOverlayItems.breakRings,
             _fastCurrentCutOverlayItems.fiberIntersections,
             _fastCurrentCutOverlayItems.linkCandidateFiberIntersections};
         for (auto* item : _fastCurrentCutOverlayItems.branchLinkFiberIntersections) {
@@ -4503,6 +4555,21 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         centerPath.addEllipse(centerScenePoint, 2.5, 2.5);
     }
     _fastCurrentCutOverlayItems.centerPoint->setPath(centerPath);
+    // The marker takes the blocked colour where nothing may be placed: inside
+    // a gap span or beyond a kollesis termination, judged on the DISPLAYED
+    // controls and position (a pending swap shows the held views), like the
+    // strip marker and the overview bar do from the dialog's state.
+    {
+        const auto centerState = vc3d::line_annotation::generatedBlockedLineMarkerState(
+            cutViews.controlPoints,
+            vc3d::line_annotation::generatedGapLineRanges(cutViews.controlPoints),
+            cutPosition);
+        QPen centerPen(vc3d::line_annotation::generatedCurrentLineMarkerColor(centerState, 245));
+        centerPen.setWidthF(1.5);
+        _fastCurrentCutOverlayItems.centerPoint->setPen(centerPen);
+        _fastCurrentCutOverlayItems.centerPoint->setBrush(
+            QBrush(vc3d::line_annotation::generatedCurrentLineMarkerColor(centerState, 210)));
+    }
 
     QPainterPath controlPath;
     QPainterPath seedPath;
@@ -4513,6 +4580,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     QPainterPath sameHvBranchControlPath;
     QPainterPath sameHvPendingBranchControlPath;
     QPainterPath kollesisRingPath;
+    QPainterPath breakRingPath;
     const double lineRadius =
         std::max(0.5, (_viewerManager ? _viewerManager->zScrollSensitivity() : 1.0) * 0.5);
     const double lower = cutPosition - lineRadius;
@@ -4573,6 +4641,13 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             if (!linked) {
                 continue;
             }
+        } else if (control.isBreak) {
+            // Same ring geometry in the dotted amber pen (a point with both
+            // tags, from an edited file, draws as the kollesis termination).
+            breakRingPath.addEllipse(scenePoint, baseRadius + 2.0, baseRadius + 2.0);
+            if (!linked) {
+                continue;
+            }
         }
         // An adjacent-winding link is a triangle in the same state colour.
         const auto addLinkedMarker = [&control, &scenePoint](QPainterPath& path) {
@@ -4605,6 +4680,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setPath(
         sameHvPendingBranchControlPath);
     _fastCurrentCutOverlayItems.kollesisRings->setPath(kollesisRingPath);
+    _fastCurrentCutOverlayItems.breakRings->setPath(breakRingPath);
 
     // Parallax ghosts: the nearest control point behind and ahead of the cursor
     // within the visibility distance slide in horizontally from the side they
@@ -5239,10 +5315,20 @@ void LineAnnotationDialog::updateOverviewBar()
             }
             dot.edge = vc3d::line_annotation::generatedKollesisTerminationColor(255);
             dot.radius += 1.0;
+        } else if (control.isBreak && !control.isSplitCandidate && !control.isLinkCandidate) {
+            // The break ring: dotted amber, hollow when unlinked.
+            if (!control.hasPendingLinks && !control.hasBranches) {
+                dot.color = Qt::transparent;
+            }
+            dot.edge = vc3d::line_annotation::generatedBreakColor(255);
+            dot.dottedEdge = true;
+            dot.radius += 1.0;
         }
         dots.push_back(dot);
     }
-    bar->setLineData(_generatedViews.linePoints.size(), std::move(dots));
+    bar->setLineData(_generatedViews.linePoints.size(),
+                     std::move(dots),
+                     vc3d::line_annotation::generatedGapLineRanges(_generatedViews.controlPoints));
 
     QColor markerColor(0, 245, 255);
     switch (currentLineMarkerState()) {

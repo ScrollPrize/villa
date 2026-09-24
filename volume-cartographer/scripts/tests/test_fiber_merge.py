@@ -1779,3 +1779,39 @@ def test_v3_tagging_and_refitting_the_same_final_span_is_a_manual_conflict():
 
     assert not result['ok']
     assert any('changed differently on both sides' in c for c in result['conflicts'])
+
+
+def test_is_fiber_doc_accepts_the_break_tag():
+    """The break tag is one more string in the per-CP tags array: every loader
+    already accepts it, on any control point, so untouched fibers and older
+    builds see no new field."""
+    doc = make_v3_fiber(BASE_CPS)
+    doc['control_points'][1]['tags'] = ['break']
+    doc['control_points'][2]['tags'] = ['break']
+    assert fiber_merge.is_fiber_doc(doc)
+    assert loader_issues({'dj_x_000001.json': doc}) == []
+
+
+def test_v3_gap_span_tags_and_goal_survive_a_separated_remote_span_change():
+    """VC3D writes a gap as two consecutive break tags plus the cubic-spline
+    goal on the span between them; all three live in the same span run, so a
+    change elsewhere merges and the gap arrives intact."""
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['generation'] = 2
+    remote['generation'] = 3
+    local['control_points'][1]['tags'] = ['break']
+    local['control_points'][2]['tags'] = ['break']
+    set_v3_span(local, 1, goal='cspline', bend=0.0)
+    set_v3_span(remote, 5, goal='lasagna', bend=-2.0)
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    assert merged['control_points'][1]['tags'] == ['break']
+    assert merged['control_points'][2]['tags'] == ['break']
+    assert merged['control_points'][1]['segment_to_next']['interp_goal'] == 'cspline'
+    assert merged['control_points'][5]['segment_to_next']['interp_goal'] == 'lasagna'
+    assert loader_issues({'dj_x_000001.json': merged}) == []

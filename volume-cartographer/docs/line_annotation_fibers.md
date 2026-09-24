@@ -26,6 +26,40 @@ than a filled point, in the cut and strip views and the overview bar; a tagged
 point that is also linked keeps the link-state fill inside the yellow ring. The
 Fiber Map marks every tagged point of every fiber the same way, selected or not.
 
+The second control-point tag is `break`, set from the same Ctrl+right-click
+menu ("Break", a toggle), on any control point: the point sits at the edge of
+a break in the papyrus. A point carries `kollesis_termination` or `break`,
+never both: the menu disables adding the second (removing either is always
+possible), the handlers refuse it, and a click that would collapse a break
+point with a termination is refused rather than dropping a tag. Two
+consecutive break points make the span between them a gap span. A gap span
+is closed to placement: the click, the `/` and `0` keys and the
+current-position marker treat any line position strictly inside it as
+blocked (red marker) until one of the breaks is removed. When a toggle forms
+a gap span, that span's `interp_goal` becomes `cspline` and the span is
+re-solved through the same path as the menu's "Interpolation goal", so the
+line bridges the break as a spline instead of a trace hunting for fiber
+signal across it; when a toggle dissolves a gap span whose goal is still
+`cspline`, the goal returns to `global` (any other goal is left alone). The
+tag itself is saved on its own first, like the kollesis tag; the goal change
+follows with that path's rollback. Three or more consecutive break points
+make consecutive gap spans; a lone break point is only a marker. Gaps are
+derived from the tags at draw time and never stored: inserting, deleting,
+splitting, merging or reversing points changes the gaps exactly as it changes
+which tagged points are neighbours, and the goals set by a toggle stay with
+their spans as any goal does.
+
+Break points draw as a dotted ring in the break amber (255, 196, 0), one
+step larger than a filled point, in the cut and strip views, the overview
+bar and the Fiber Map (a linked break keeps its link-state fill inside the
+ring). A gap span draws as a dotted amber line in place of the fiber's own
+line in the side cut, the strips and the overview bar; linked and nearby
+fibers keep their solid purple line. The Fiber Map draws every fiber's gap
+spans as dotted amber runs bounded exactly at the two control points, in
+place of the traced or interpolated style, and marks every break point with
+the dotted amber rim. The flag is display-only in the map: it does not
+change heat-map seeding, winding evidence or publishing.
+
 The top-level `optimization_mode` is either `lasagna` or
 `native_fiber_trace3d`. It is required in version 3; only legacy version-1
 files may omit it and default to `lasagna`. The mode

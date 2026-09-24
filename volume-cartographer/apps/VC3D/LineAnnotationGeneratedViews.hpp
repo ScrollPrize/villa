@@ -61,6 +61,9 @@ struct GeneratedOverlay {
         // Tagged kollesis_termination: hollow yellow ring. A linked tagged
         // point keeps the link-state fill inside the yellow ring.
         bool isKollesisTermination = false;
+        // Tagged break: dotted amber ring. Two consecutive tagged points make
+        // the span between them a gap span (see GeneratedOverlay::gapLineRanges).
+        bool isBreak = false;
         bool hasBranches = false;
         bool hasPendingLinks = false;
         // Same-orientation links (H-H / V-V) render in the orange warning
@@ -139,6 +142,13 @@ struct GeneratedOverlay {
     // a subset of the controls sets the full fiber's range here so interior
     // spans are not mistaken for tails.
     std::optional<std::pair<double, double>> lineTailControlRange;
+    // Line-position ranges [first, second] of the fiber's gap spans: both
+    // endpoint controls carry the break tag. Drawn as a dotted amber line in
+    // place of the fiber's own line. Computed by the overlay builders from the
+    // FULL control list (generatedGapLineRanges) before any visibility
+    // filtering, so a hidden endpoint or a hidden interior control cannot
+    // make two visible break markers read as a gap.
+    std::vector<std::pair<double, double>> gapLineRanges;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN()};
@@ -1340,6 +1350,96 @@ inline bool generatedLineSegmentIsTail(
     return midpoint < controlRange->first || midpoint > controlRange->second;
 }
 
+// Defined further down (with the other tagged-end helpers); declared here for
+// the overlay builders' blocked-marker state.
+inline bool generatedLinePositionBeyondKollesisTermination(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+    double linePosition);
+
+// The gap spans of a fiber as line-position ranges: consecutive controls (by
+// line position; controls are in line order) that both carry the break tag.
+// Must be given the complete control list. Inline: this header is compiled
+// into QtCore-only tests without the .cpp.
+inline std::vector<std::pair<double, double>> generatedGapLineRanges(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints)
+{
+    std::vector<const GeneratedOverlay::ControlPointMarker*> sorted;
+    sorted.reserve(controlPoints.size());
+    for (const auto& control : controlPoints) {
+        if (std::isfinite(control.linePosition)) {
+            sorted.push_back(&control);
+        }
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const auto* a, const auto* b) {
+        return a->linePosition < b->linePosition;
+    });
+    std::vector<std::pair<double, double>> ranges;
+    for (size_t i = 1; i < sorted.size(); ++i) {
+        if (sorted[i - 1]->isBreak && sorted[i]->isBreak &&
+            sorted[i - 1]->linePosition < sorted[i]->linePosition) {
+            ranges.emplace_back(sorted[i - 1]->linePosition, sorted[i]->linePosition);
+        }
+    }
+    return ranges;
+}
+
+// Strictly inside a gap span: nothing may be placed there until a break is
+// removed. The endpoints themselves stay available (a click there replaces
+// the break point).
+inline bool generatedLinePositionInsideGap(
+    const std::vector<std::pair<double, double>>& gapLineRanges,
+    double linePosition)
+{
+    if (!std::isfinite(linePosition)) {
+        return false;
+    }
+    for (const auto& [first, second] : gapLineRanges) {
+        if (linePosition > first && linePosition < second) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether the dense line segment between two line positions belongs to a gap
+// span: its midpoint lies within a gap range (the dense points at the
+// endpoints are the controls themselves, so the midpoint test assigns every
+// segment between them and nothing outside).
+inline bool generatedLineSegmentInGap(
+    double previousLinePosition,
+    double currentLinePosition,
+    const std::vector<std::pair<double, double>>& gapLineRanges)
+{
+    const double midpoint = 0.5 * (previousLinePosition + currentLinePosition);
+    if (!std::isfinite(midpoint)) {
+        return false;
+    }
+    for (const auto& [first, second] : gapLineRanges) {
+        if (midpoint >= first && midpoint <= second) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The marker state the shared renderer draws when the overlay's builder has
+// no dialog to ask: Blocked strictly inside a gap span or beyond a kollesis
+// termination (the two placement rules that need no extrapolation-distance
+// setting), Neutral otherwise. The dialog's own current-cut marker adds the
+// Allowed state from its extrapolation limit; the intersection-inspection
+// panes only ever see this.
+inline GeneratedCurrentLineMarkerState generatedBlockedLineMarkerState(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& fullControlPoints,
+    const std::vector<std::pair<double, double>>& gapLineRanges,
+    double linePosition)
+{
+    if (generatedLinePositionInsideGap(gapLineRanges, linePosition) ||
+        generatedLinePositionBeyondKollesisTermination(fullControlPoints, linePosition)) {
+        return GeneratedCurrentLineMarkerState::Blocked;
+    }
+    return GeneratedCurrentLineMarkerState::Neutral;
+}
+
 inline GeneratedOverlay makeGeneratedStripOverlay(
     const GeneratedViews& views,
     double currentLinePosition,
@@ -1353,6 +1453,9 @@ inline GeneratedOverlay makeGeneratedStripOverlay(
     overlay.useSurfaceCenterLine = true;
     overlay.currentLinePosition = currentLinePosition;
     overlay.controlPoints = views.controlPoints;
+    overlay.gapLineRanges = generatedGapLineRanges(views.controlPoints);
+    overlay.currentLineMarkerState = generatedBlockedLineMarkerState(
+        views.controlPoints, overlay.gapLineRanges, currentLinePosition);
     overlay.predSnapPoints = views.predSnapPoints;
     overlay.markerLinePositions = markerLinePositions;
     overlay.stripPositionMap = views.stripPositionMap;
@@ -1368,6 +1471,7 @@ inline GeneratedOverlay makeGeneratedStaticStripOverlay(const GeneratedViews& vi
     overlay.seedLineIndex = views.controlPoints.empty() ? views.seedLineIndex : -1;
     overlay.useSurfaceCenterLine = true;
     overlay.controlPoints = views.controlPoints;
+    overlay.gapLineRanges = generatedGapLineRanges(views.controlPoints);
     overlay.predSnapPoints = views.predSnapPoints;
     overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
@@ -1381,6 +1485,8 @@ inline GeneratedOverlay makeGeneratedDynamicStripOverlay(
     GeneratedOverlay overlay;
     overlay.useSurfaceCenterLine = true;
     overlay.currentLinePosition = currentLinePosition;
+    overlay.currentLineMarkerState = generatedBlockedLineMarkerState(
+        views.controlPoints, generatedGapLineRanges(views.controlPoints), currentLinePosition);
     overlay.markerLinePositions = markerLinePositions;
     overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
@@ -1397,6 +1503,11 @@ inline GeneratedOverlay makeGeneratedCrossSliceOverlay(
 {
     GeneratedOverlay overlay;
     overlay.branchLinePoints = views.branchLinePoints;
+    // From the full list, before the plane-distance filter below keeps only
+    // the nearby controls.
+    overlay.gapLineRanges = generatedGapLineRanges(views.controlPoints);
+    overlay.currentLineMarkerState = generatedBlockedLineMarkerState(
+        views.controlPoints, overlay.gapLineRanges, linePosition);
     overlay.pointMarker = emphasized && finiteGeneratedPoint(views.focusPoint)
         ? views.focusPoint
         : interpolatedGeneratedLinePoint(views.linePoints, linePosition);
@@ -1468,6 +1579,19 @@ struct GeneratedLinkCandidateMenuState {
 // Shared with the overview bar and the Fiber Map so the tag looks the same
 // everywhere.
 [[nodiscard]] QColor generatedKollesisTerminationColor(int alpha);
+
+// The current-position marker colour per placement state: green allowed,
+// red blocked, cyan neutral. Shared by the renderer, the dialog's fast
+// overlays and the overview bar. Defined in the .cpp (QtCore-only tests).
+[[nodiscard]] QColor generatedCurrentLineMarkerColor(GeneratedCurrentLineMarkerState state,
+                                                     int alpha);
+
+// The break colour: amber, told apart from the cyan line and the yellow
+// control points by hue and from every solid stroke by form (a break point is
+// a dotted ring, a gap span a dotted line). Shared with the overview bar and
+// the Fiber Map so the tag looks the same everywhere.
+[[nodiscard]] QColor generatedBreakColor(int alpha);
+
 
 namespace detail
 {
@@ -1636,6 +1760,9 @@ struct GeneratedControlPointContextMenuOptions {
     // (controlIndex, enabled): toggle the kollesis_termination tag on the
     // point. The menu item is checkable and reflects the marker's state.
     std::function<void(size_t, bool)> setKollesisTermination;
+    // (controlIndex, enabled): toggle the break tag on the point. Checkable;
+    // adding it is disabled while the point is a kollesis termination.
+    std::function<void(size_t, bool)> setBreak;
 };
 
 // The marker of an adjacent-winding link: an upright triangle whose

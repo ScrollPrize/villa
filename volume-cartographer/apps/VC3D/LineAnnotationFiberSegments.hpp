@@ -234,6 +234,13 @@ inline constexpr const char* kReviewedTag = "reviewed";
 // pale yellow in the line annotation views and the Fiber Map.
 inline constexpr const char* kKollesisTerminationTag = "kollesis_termination";
 
+// Per-control-point tag: the point sits at the edge of a break in the papyrus.
+// Any control point may carry it. A span whose two endpoints both carry it is
+// a gap span: drawn as a dotted amber line, closed to control point placement
+// until a break is removed, and given the cubic-spline goal when it forms.
+// A point carries either this tag or kKollesisTerminationTag, never both.
+inline constexpr const char* kBreakTag = "break";
+
 // Sorted-unique tag list helpers shared by the stored and session control
 // point types. controlPointTagsFromJson rejects anything but an array of
 // strings; blank entries are dropped.
@@ -244,6 +251,20 @@ bool setControlPointTag(std::vector<std::string>& tags, std::string_view tag, bo
 [[nodiscard]] std::vector<std::string> mergedControlPointTags(
     const std::vector<std::string>& lhs, const std::vector<std::string>& rhs);
 [[nodiscard]] std::vector<std::string> controlPointTagsFromJson(const nlohmann::json& json);
+// True when tags carry both kKollesisTerminationTag and kBreakTag. The two are
+// mutually exclusive on a point: a toggle that would add the second, and a
+// click collapse whose tag union would combine them, are refused.
+[[nodiscard]] bool controlPointTagsConflict(const std::vector<std::string>& tags) noexcept;
+
+// The gap spans of a session's controls: consecutive controls IN LINE-POSITION
+// ORDER (the order the overlays, the placement gate and the goal owner rule
+// all use; a session's vector can be out of line order after a reopen) that
+// both carry kBreakTag. Each pair is (index of the lower-position control,
+// index of the other); the first is the span's owner for interpolation-goal
+// purposes, as handleGeneratedSegmentInterpolationGoal picks it. Controls
+// without a finite line position take no part.
+[[nodiscard]] std::vector<std::pair<size_t, size_t>> gapSpansForControls(
+    const std::vector<LineControlPoint>& controls);
 
 enum class FiberTraceState {
     Legacy,       // no prediction-traced spans in the stored geometry

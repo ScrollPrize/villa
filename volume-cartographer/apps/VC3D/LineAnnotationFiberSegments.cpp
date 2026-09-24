@@ -1289,6 +1289,37 @@ std::vector<std::string> mergedControlPointTags(const std::vector<std::string>& 
     return merged;
 }
 
+bool controlPointTagsConflict(const std::vector<std::string>& tags) noexcept
+{
+    return hasControlPointTag(tags, kKollesisTerminationTag) && hasControlPointTag(tags, kBreakTag);
+}
+
+std::vector<std::pair<size_t, size_t>> gapSpansForControls(
+    const std::vector<LineControlPoint>& controls)
+{
+    std::vector<size_t> order;
+    order.reserve(controls.size());
+    for (size_t i = 0; i < controls.size(); ++i) {
+        if (std::isfinite(controls[i].linePosition)) {
+            order.push_back(i);
+        }
+    }
+    std::stable_sort(order.begin(), order.end(), [&controls](size_t a, size_t b) {
+        return controls[a].linePosition < controls[b].linePosition;
+    });
+    std::vector<std::pair<size_t, size_t>> spans;
+    for (size_t k = 1; k < order.size(); ++k) {
+        const size_t lower = order[k - 1];
+        const size_t upper = order[k];
+        if (controls[lower].linePosition < controls[upper].linePosition &&
+            hasControlPointTag(controls[lower].tags, kBreakTag) &&
+            hasControlPointTag(controls[upper].tags, kBreakTag)) {
+            spans.emplace_back(lower, upper);
+        }
+    }
+    return spans;
+}
+
 std::vector<std::string> controlPointTagsFromJson(const nlohmann::json& json)
 {
     if (!json.is_array()) {

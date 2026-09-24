@@ -1485,6 +1485,8 @@ generatedControlMarkers(
         marker.isSeed = control.isSeed;
         marker.isKollesisTermination = vc3d::line_annotation::hasControlPointTag(
             control.tags, vc3d::line_annotation::kKollesisTerminationTag);
+        marker.isBreak = vc3d::line_annotation::hasControlPointTag(
+            control.tags, vc3d::line_annotation::kBreakTag);
         marker.hasTracedSegmentToNext =
             vc3d::line_annotation::isAcceptedNativeTrace(control.segmentToNext);
         if (control.segmentToNext) {
@@ -2705,6 +2707,12 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
             [this](const std::string& name, size_t controlPointIndex, bool enabled) {
                 handleGeneratedControlPointSetKollesisTermination(
                     name, controlPointIndex, enabled);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::generatedControlPointBreakChangeRequested,
+            this,
+            [this](const std::string& name, size_t controlPointIndex, bool enabled) {
+                handleGeneratedControlPointSetBreak(name, controlPointIndex, enabled);
             });
     connect(dialog, &LineAnnotationDialog::showAsMeshRequested, this, [this, surfaceName]() {
         handleShowAsMesh(surfaceName);
@@ -6314,6 +6322,10 @@ bool LineAnnotationController::showGeneratedControlPointContextMenu(CChunkedVolu
                                                               controlPointIndex,
                                                               enabled);
         };
+        options.setBreak = [this, surfaceName = viewer->surfName()](size_t controlPointIndex,
+                                                                    bool enabled) {
+            handleGeneratedControlPointSetBreak(surfaceName, controlPointIndex, enabled);
+        };
         result = vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
     }
     if (result == LineAnnotationDialog::GeneratedControlPointContextResult::NewLineAnnotationRequested) {
@@ -6990,6 +7002,11 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
         for (const auto& control : fiber.controlPoints) {
             entry.kollesisTerminations.push_back(vc3d::line_annotation::hasControlPointTag(
                 control.tags, vc3d::line_annotation::kKollesisTerminationTag));
+        }
+        entry.breaks.reserve(fiber.controlPoints.size());
+        for (const auto& control : fiber.controlPoints) {
+            entry.breaks.push_back(vc3d::line_annotation::hasControlPointTag(
+                control.tags, vc3d::line_annotation::kBreakTag));
         }
         for (const FiberBranchRef& branch : fiber.branches) {
             if (loadedIds.count(branch.branchFiberId) == 0) {
@@ -7730,6 +7747,20 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
             controlLinePositions, kollesisTerminations, linePosition)) {
         return;
     }
+    // Nothing is placed inside a gap span (two consecutive break points)
+    // either; the breaks have to be removed first. Same reason for checking
+    // here: the intersection-inspection clicks bypass the dialog's gate.
+    {
+        std::vector<std::pair<double, double>> gapLineRanges;
+        for (const auto& [lower, upper] :
+             vc3d::line_annotation::gapSpansForControls(session.controlPoints)) {
+            gapLineRanges.emplace_back(session.controlPoints[lower].linePosition,
+                                       session.controlPoints[upper].linePosition);
+        }
+        if (vc3d::line_annotation::generatedLinePositionInsideGap(gapLineRanges, linePosition)) {
+            return;
+        }
+    }
     if (pane->dialog &&
         pane->dialog->maxControlPointExtrapolationDistanceVx() > 0) {
         if (!vc3d::fiber_slice::linePositionWithinControlExtrapolationDistance(
@@ -7753,6 +7784,24 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                                         nearbyControlIndices,
                                         tr("Replacing the nearby control points"))) {
         return;
+    }
+    // The replacement point takes the union of the collapsed points' tags; a
+    // break and a kollesis termination may not meet on one point, so a click
+    // that would collapse one of each is refused rather than dropping a tag.
+    {
+        std::vector<std::string> unionTags;
+        for (const size_t index : nearbyControlIndices) {
+            if (index < session.controlPoints.size()) {
+                unionTags = vc3d::line_annotation::mergedControlPointTags(
+                    unionTags, session.controlPoints[index].tags);
+            }
+        }
+        if (vc3d::line_annotation::controlPointTagsConflict(unionTags)) {
+            showError(tr("Cannot collapse a break point with a kollesis termination; "
+                         "remove one of the tags first."),
+                      session.suppressErrorDialogs);
+            return;
+        }
     }
 
     const std::vector<vc3d::line_annotation::LineControlPoint> previousControls =
@@ -10414,14 +10463,16 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
     return true;
 }
 
-void LineAnnotationController::handleGeneratedControlPointSetKollesisTermination(
+bool LineAnnotationController::setControlPointTagAndPersist(
     const std::string& surfaceName,
     size_t controlPointIndex,
-    bool enabled)
+    const char* tag,
+    bool enabled,
+    const QString& pendingSolveMessage)
 {
     auto* pane = paneForSurface(surfaceName);
     if (!pane || !pane->session) {
-        return;
+        return false;
     }
     auto& session = *pane->session;
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
@@ -10429,33 +10480,94 @@ void LineAnnotationController::handleGeneratedControlPointSetKollesisTermination
         // about to replace.
         showError(tr("Line optimization is already running."),
                   session.suppressErrorDialogs);
-        return;
+        return false;
     }
     if (session.controlPointCollapseRollback || session.controlPointsBeforeModeChange) {
         // A collapse or mode change is still awaiting its solve. Its rollback
         // restores the pre-edit controls wholesale, and a collapse can have
         // moved the point, so a toggle made now could be undone by a failed
         // solve. Refuse rather than race the debounce.
-        showError(tr("A line optimization is pending; wait for it to finish before "
-                     "changing the kollesis termination."),
-                  session.suppressErrorDialogs);
-        return;
+        showError(pendingSolveMessage, session.suppressErrorDialogs);
+        return false;
     }
     if (session.fiberDeleted) {
         // The fiber was deleted underneath this session; saving would
         // recreate the file under the deleted name.
         showError(tr("This fiber was deleted; it can no longer be edited."),
                   session.suppressErrorDialogs);
-        return;
+        return false;
     }
     if (controlPointIndex >= session.controlPoints.size()) {
-        return;
+        return false;
+    }
+    // The control of another control list that stands for this one: the
+    // NEAREST control within the position tolerance, so an exact twin wins
+    // over a distinct visit that merely passes within tolerance (a line that
+    // revisits its own coordinates). Used by the exclusion preflight and the
+    // peer mirroring below so both name the same point. Null when none.
+    const cv::Vec3d taggedPoint = session.controlPoints[controlPointIndex].volumePoint;
+    const auto nearestControlAt =
+        [&taggedPoint](auto& controls) -> decltype(&controls.front()) {
+            decltype(&controls.front()) best = nullptr;
+            double bestDistance = std::numeric_limits<double>::infinity();
+            for (auto& control : controls) {
+                if (!pointsApproximatelyEqual(control.volumePoint, taggedPoint)) {
+                    continue;
+                }
+                const double distance = cv::norm(control.volumePoint - taggedPoint);
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    best = &control;
+                }
+            }
+            return best;
+        };
+    if (enabled) {
+        // One tag or the other, in every pane: a peer pane's control at this
+        // position may already carry the other tag (a collapse there kept a
+        // termination's tag while this pane still shows the untagged point),
+        // and the mirroring below would give it both. Refuse before anything
+        // is written, checking the peers' rollback snapshots too since those
+        // are mirrored as well.
+        const auto wouldConflict =
+            [&nearestControlAt, tag](const std::vector<vc3d::line_annotation::LineControlPoint>& controls) {
+                const auto* control = nearestControlAt(controls);
+                if (!control) {
+                    return false;
+                }
+                std::vector<std::string> tags = control->tags;
+                vc3d::line_annotation::setControlPointTag(tags, tag, true);
+                return vc3d::line_annotation::controlPointTagsConflict(tags);
+            };
+        bool conflict = wouldConflict(session.controlPoints);
+        for (const auto& otherPane : _panes) {
+            if (conflict || !otherPane.session || otherPane.session.get() == &session) {
+                continue;
+            }
+            const auto& other = *otherPane.session;
+            if (!vc3d::line_annotation::sameFiberIdentity(other.fiberId, other.fiberFileName,
+                                                          session.fiberId, session.fiberFileName)) {
+                continue;
+            }
+            conflict = wouldConflict(other.controlPoints) ||
+                       (other.controlPointsBeforeModeChange &&
+                        wouldConflict(*other.controlPointsBeforeModeChange)) ||
+                       (other.controlPointCollapseRollback &&
+                        wouldConflict(other.controlPointCollapseRollback->controlPoints));
+        }
+        if (conflict) {
+            showError(tr("Cannot tag this control point: it already carries the other tag "
+                         "(kollesis termination or break), possibly in another view of this "
+                         "fiber. Remove that tag first."),
+                      session.suppressErrorDialogs);
+            return false;
+        }
     }
     if (!vc3d::line_annotation::setControlPointTag(
             session.controlPoints[controlPointIndex].tags,
-            vc3d::line_annotation::kKollesisTerminationTag,
+            tag,
             enabled)) {
-        return;
+        return false;
     }
 
     // The tag is fiber content: persist and mirror into the loaded fiber so
@@ -10504,30 +10616,25 @@ void LineAnnotationController::handleGeneratedControlPointSetKollesisTermination
         // retried (setControlPointTag would otherwise report no change).
         vc3d::line_annotation::setControlPointTag(
             session.controlPoints[controlPointIndex].tags,
-            vc3d::line_annotation::kKollesisTerminationTag,
+            tag,
             !enabled);
         showError(tr("Could not save fiber after tagging the control point: %1")
                       .arg(QString::fromStdString(ex.what())),
                   session.suppressErrorDialogs);
-        return;
+        return false;
     }
 
     // The same fiber can be open in another pane (an intersection-inspection
     // side, or a second dialog). Those sessions hold their own control
     // copies and enforce the placement rule from them, so the tag is applied
     // there too: matched by position, since their indices may differ.
-    const cv::Vec3d taggedPoint = session.controlPoints[controlPointIndex].volumePoint;
     // One control per vector: the toggle named a single point, so a
-    // coincident duplicate (should the geometry ever carry one) is left alone.
+    // coincident duplicate (should the geometry ever carry one) is left alone;
+    // the nearest match is the one the preflight above judged.
     const auto applyToControls =
-        [&taggedPoint, enabled](std::vector<vc3d::line_annotation::LineControlPoint>& controls) {
-            for (auto& control : controls) {
-                if (pointsApproximatelyEqual(control.volumePoint, taggedPoint)) {
-                    return vc3d::line_annotation::setControlPointTag(
-                        control.tags,
-                        vc3d::line_annotation::kKollesisTerminationTag,
-                        enabled);
-                }
+        [&nearestControlAt, enabled, tag](std::vector<vc3d::line_annotation::LineControlPoint>& controls) {
+            if (auto* control = nearestControlAt(controls)) {
+                return vc3d::line_annotation::setControlPointTag(control->tags, tag, enabled);
             }
             return false;
         };
@@ -10584,6 +10691,121 @@ void LineAnnotationController::handleGeneratedControlPointSetKollesisTermination
             }
         }
     }
+    return true;
+}
+
+void LineAnnotationController::handleGeneratedControlPointSetKollesisTermination(
+    const std::string& surfaceName,
+    size_t controlPointIndex,
+    bool enabled)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session) {
+        return;
+    }
+    auto& session = *pane->session;
+    // One or the other: a break point cannot also be a termination. Removing
+    // the tag is always allowed, so a point that somehow carries both (an
+    // edited file) can be repaired from either menu item.
+    if (enabled && controlPointIndex < session.controlPoints.size() &&
+        vc3d::line_annotation::hasControlPointTag(
+            session.controlPoints[controlPointIndex].tags, vc3d::line_annotation::kBreakTag)) {
+        showError(tr("Cannot tag a break point as a kollesis termination; remove the break first."),
+                  session.suppressErrorDialogs);
+        return;
+    }
+    setControlPointTagAndPersist(
+        surfaceName,
+        controlPointIndex,
+        vc3d::line_annotation::kKollesisTerminationTag,
+        enabled,
+        tr("A line optimization is pending; wait for it to finish before "
+           "changing the kollesis termination."));
+}
+
+void LineAnnotationController::handleGeneratedControlPointSetBreak(
+    const std::string& surfaceName,
+    size_t controlPointIndex,
+    bool enabled)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session) {
+        return;
+    }
+    auto& session = *pane->session;
+    if (enabled && controlPointIndex < session.controlPoints.size() &&
+        vc3d::line_annotation::hasControlPointTag(
+            session.controlPoints[controlPointIndex].tags,
+            vc3d::line_annotation::kKollesisTerminationTag)) {
+        showError(tr("Cannot tag a kollesis termination as a break; remove the termination first."),
+                  session.suppressErrorDialogs);
+        return;
+    }
+    // The gap spans this toggle forms or dissolves: a span is a gap when both
+    // its endpoints (neighbours in line order) are breaks. Read before the tag
+    // changes; each span is named by its lower-position control, the owner
+    // whose descriptor the goal lives on.
+    const auto ownersOf = [](const std::vector<std::pair<size_t, size_t>>& spans) {
+        std::vector<size_t> owners;
+        owners.reserve(spans.size());
+        for (const auto& span : spans) {
+            owners.push_back(span.first);
+        }
+        return owners;
+    };
+    const std::vector<size_t> gapsBefore =
+        ownersOf(vc3d::line_annotation::gapSpansForControls(session.controlPoints));
+    if (!setControlPointTagAndPersist(
+            surfaceName,
+            controlPointIndex,
+            vc3d::line_annotation::kBreakTag,
+            enabled,
+            tr("A line optimization is pending; wait for it to finish before "
+               "changing the break."))) {
+        return;
+    }
+    // The tag is persisted on its own, exactly like the kollesis toggle. The
+    // goal change below then goes through the same path as the menu's
+    // "Interpolation goal" and keeps that path's failure semantics: a re-solve
+    // that cannot start rolls back the goal (the tag, saved above, stays), a
+    // failed solve rolls back through the mode-change snapshot, which is
+    // taken after the tag was set and so keeps it too.
+    const std::vector<size_t> gapsAfter =
+        ownersOf(vc3d::line_annotation::gapSpansForControls(session.controlPoints));
+    const auto goalOf = [&session](size_t owner) {
+        const auto& metadata = session.controlPoints[owner].segmentToNext;
+        return metadata ? metadata->interpGoal
+                        : vc3d::line_annotation::SegmentInterpolationGoal::Global;
+    };
+    std::vector<size_t> owners;
+    if (enabled) {
+        // A gap span that just formed bridges the break with a cubic spline
+        // rather than a trace hunting for fiber signal across it.
+        for (const size_t owner : gapsAfter) {
+            if (std::find(gapsBefore.begin(), gapsBefore.end(), owner) == gapsBefore.end() &&
+                goalOf(owner) != vc3d::line_annotation::SegmentInterpolationGoal::Cspline) {
+                owners.push_back(owner);
+            }
+        }
+        if (!owners.empty()) {
+            applySegmentInterpolationGoals(
+                session, owners, vc3d::line_annotation::SegmentInterpolationGoal::Cspline);
+        }
+        return;
+    }
+    // A dissolved gap span returns to the global goal, but only when it still
+    // carries the spline the gap gave it: an explicit choice made since is
+    // left alone.
+    for (const size_t owner : gapsBefore) {
+        if (std::find(gapsAfter.begin(), gapsAfter.end(), owner) == gapsAfter.end() &&
+            goalOf(owner) == vc3d::line_annotation::SegmentInterpolationGoal::Cspline) {
+            owners.push_back(owner);
+        }
+    }
+    if (!owners.empty()) {
+        applySegmentInterpolationGoals(
+            session, owners, vc3d::line_annotation::SegmentInterpolationGoal::Global);
+    }
 }
 
 void LineAnnotationController::handleGeneratedSegmentInterpolationGoal(
@@ -10596,11 +10818,6 @@ void LineAnnotationController::handleGeneratedSegmentInterpolationGoal(
     if (!pane || !pane->session)
         return;
     auto& session = *pane->session;
-    if (session.taskState == LineAnnotationSession::TaskState::Running) {
-        showError(tr("Line optimization is already running."),
-                  session.suppressErrorDialogs);
-        return;
-    }
     if (firstControlPointIndex >= session.controlPoints.size() ||
         secondControlPointIndex >= session.controlPoints.size() ||
         firstControlPointIndex == secondControlPointIndex ||
@@ -10624,26 +10841,69 @@ void LineAnnotationController::handleGeneratedSegmentInterpolationGoal(
                 session.controlPoints[secondControlPointIndex].linePosition
             ? firstControlPointIndex
             : secondControlPointIndex;
-    if (session.controlPoints[owner].segmentToNext &&
-        session.controlPoints[owner].segmentToNext->interpGoal == goal) {
-        return;
+    applySegmentInterpolationGoals(session, std::vector<size_t>{owner}, goal);
+}
+
+bool LineAnnotationController::applySegmentInterpolationGoals(
+    LineAnnotationSession& session,
+    const std::vector<size_t>& owners,
+    vc3d::line_annotation::SegmentInterpolationGoal goal)
+{
+    if (session.taskState == LineAnnotationSession::TaskState::Running) {
+        showError(tr("Line optimization is already running."),
+                  session.suppressErrorDialogs);
+        return false;
+    }
+    // Owners are indices into session.controlPoints, whose descriptors hold
+    // the goals. The solver indexes spans in LINE-POSITION order (it sorts the
+    // controls first), and a session's vector can be out of that order after a
+    // reopen, so a span is dirty by the owner's rank in line order, and an
+    // owner counts only when it has a successor in that order.
+    const size_t count = session.controlPoints.size();
+    std::vector<size_t> order(count);
+    for (size_t i = 0; i < count; ++i) {
+        order[i] = i;
+    }
+    std::stable_sort(order.begin(), order.end(), [&session](size_t a, size_t b) {
+        return session.controlPoints[a].linePosition < session.controlPoints[b].linePosition;
+    });
+    std::vector<size_t> rankOf(count);
+    for (size_t rank = 0; rank < count; ++rank) {
+        rankOf[order[rank]] = rank;
+    }
+    std::vector<size_t> changed;
+    std::vector<size_t> dirtySpans;
+    for (const size_t owner : owners) {
+        if (owner >= count || rankOf[owner] + 1 >= count) {
+            continue;
+        }
+        const auto& metadata = session.controlPoints[owner].segmentToNext;
+        if (!metadata || metadata->interpGoal != goal) {
+            changed.push_back(owner);
+            dirtySpans.push_back(rankOf[owner]);
+        }
+    }
+    if (changed.empty()) {
+        return false;
     }
     if (!ensureDatasetForSession(session))
-        return;
+        return false;
 
     session.controlPointsBeforeModeChange = session.controlPoints;
     session.optimizedLineBeforeModeChange = session.optimizedLine;
     session.branchesBeforeModeChange = session.branches;
-    auto& metadata = session.controlPoints[owner].segmentToNext;
-    if (!metadata) {
-        metadata.emplace();
-        metadata->interpMode =
-            vc3d::line_annotation::SegmentInterpolationMode::Lasagna;
-        metadata->message = "lasagna";
+    for (const size_t owner : changed) {
+        auto& metadata = session.controlPoints[owner].segmentToNext;
+        if (!metadata) {
+            metadata.emplace();
+            metadata->interpMode =
+                vc3d::line_annotation::SegmentInterpolationMode::Lasagna;
+            metadata->message = "lasagna";
+        }
+        metadata->interpGoal = goal;
     }
-    metadata->interpGoal = goal;
     setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
-    startFiberModeOptimization(session, true, std::vector<size_t>{owner});
+    startFiberModeOptimization(session, true, dirtySpans);
     if (session.taskState != LineAnnotationSession::TaskState::Running) {
         session.controlPoints = std::move(*session.controlPointsBeforeModeChange);
         session.controlPointsBeforeModeChange.reset();
@@ -10656,7 +10916,9 @@ void LineAnnotationController::handleGeneratedSegmentInterpolationGoal(
             session.branches = std::move(*session.branchesBeforeModeChange);
             session.branchesBeforeModeChange.reset();
         }
+        return false;
     }
+    return true;
 }
 
 bool LineAnnotationController::needsFinalOptimization(const LineAnnotationSession& session) const
@@ -10722,19 +10984,32 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     // The live session is the authority: re-apply its tags by point.
     // One-to-one by position: each live control donates its tags to at most
     // one result control, so coincident points (should the geometry ever
-    // carry any) cannot all inherit the first match.
+    // carry any) cannot all inherit the first match. The donor is the NEAREST
+    // undonated control within tolerance, not the first: two distinct
+    // controls within tolerance of each other (a line revisiting its own
+    // coordinates) must each keep their own tags, or a break could land on
+    // its neighbour after the re-solve the toggle itself starts.
     {
         std::vector<bool> donated(branchRemapControls.size(), false);
         for (auto& control : task.controlPoints) {
+            size_t best = std::numeric_limits<size_t>::max();
+            double bestDistance = std::numeric_limits<double>::infinity();
             for (size_t i = 0; i < branchRemapControls.size(); ++i) {
                 if (donated[i] ||
                     !pointsApproximatelyEqual(branchRemapControls[i].volumePoint,
                                               control.volumePoint)) {
                     continue;
                 }
-                control.tags = branchRemapControls[i].tags;
-                donated[i] = true;
-                break;
+                const double distance =
+                    cv::norm(branchRemapControls[i].volumePoint - control.volumePoint);
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    best = i;
+                }
+            }
+            if (best != std::numeric_limits<size_t>::max()) {
+                control.tags = branchRemapControls[best].tags;
+                donated[best] = true;
             }
         }
     }

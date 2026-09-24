@@ -4196,3 +4196,111 @@ TEST_CASE("kollesis terminations sit on fiber ends and block placement beyond th
     CHECK(!generatedLinePositionBeyondTaggedEnd(positions, {true}, 100.0));
     CHECK(!generatedLinePositionBeyondTaggedEnd({}, {}, 5.0));
 }
+
+TEST_CASE("break tags make gap spans between consecutive tagged points")
+{
+    using namespace vc3d::line_annotation;
+
+    // The tag string loads through both readers like any other tag, and a
+    // point with both tags is a conflict the toggles and the collapse refuse.
+    StoredControlPoint stored{{1.0, 2.0, 3.0}};
+    CHECK(setControlPointTag(stored.tags, kBreakTag, true));
+    const auto json = storedControlPointToJson(stored);
+    REQUIRE(json.contains("tags"));
+    CHECK(json["tags"] == nlohmann::json::array({"break"}));
+    CHECK(storedControlPointFromJson(json, 3).tags == std::vector<std::string>{"break"});
+    const nlohmann::json root = {{"control_points", nlohmann::json::array({json})}};
+    CHECK_NOTHROW(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+        root, "control_points", 3, "test fiber"));
+    CHECK(!controlPointTagsConflict(stored.tags));
+    CHECK(controlPointTagsConflict(
+        mergedControlPointTags(stored.tags, {kKollesisTerminationTag})));
+
+    // Gap spans over control lists: both endpoints tagged, by index.
+    std::vector<LineControlPoint> controls{
+        LineControlPoint{0.0, cv::Vec3d(0.0, 0.0, 0.0), true, 0},
+        LineControlPoint{10.0, cv::Vec3d(10.0, 0.0, 0.0), false, 10},
+        LineControlPoint{20.0, cv::Vec3d(20.0, 0.0, 0.0), false, 20},
+        LineControlPoint{30.0, cv::Vec3d(30.0, 0.0, 0.0), false, 30},
+        LineControlPoint{40.0, cv::Vec3d(40.0, 0.0, 0.0), false, 40}};
+    using Spans = std::vector<std::pair<size_t, size_t>>;
+    CHECK(gapSpansForControls(controls).empty());
+    controls[1].tags = {kBreakTag};
+    // A lone break point makes no gap.
+    CHECK(gapSpansForControls(controls).empty());
+    controls[2].tags = {kBreakTag};
+    CHECK(gapSpansForControls(controls) == Spans{{1, 2}});
+    // Three in a row: two consecutive gap spans.
+    controls[3].tags = {kBreakTag};
+    CHECK(gapSpansForControls(controls) == Spans{{1, 2}, {2, 3}});
+    // A break at either fiber end alone changes nothing.
+    controls[4].tags = {kBreakTag};
+    controls[3].tags.clear();
+    CHECK(gapSpansForControls(controls) == Spans{{1, 2}});
+    // Neighbours are taken in LINE-POSITION order, not vector order, and the
+    // pair is named lower-position first: a session whose controls were
+    // reopened out of order still gates and owns the same span the overlays
+    // draw.
+    {
+        std::vector<LineControlPoint> shuffled{
+            LineControlPoint{0.0, cv::Vec3d(0.0, 0.0, 0.0), true, 0},
+            LineControlPoint{20.0, cv::Vec3d(20.0, 0.0, 0.0), false, 20},
+            LineControlPoint{10.0, cv::Vec3d(10.0, 0.0, 0.0), false, 10},
+            LineControlPoint{40.0, cv::Vec3d(40.0, 0.0, 0.0), false, 40}};
+        shuffled[1].tags = {kBreakTag};
+        shuffled[2].tags = {kBreakTag};
+        CHECK(gapSpansForControls(shuffled) == Spans{{2, 1}});
+        // A break at 40 is not a neighbour of the one at 20 in either order.
+        shuffled[3].tags = {kBreakTag};
+        shuffled[2].tags.clear();
+        CHECK(gapSpansForControls(shuffled) == Spans{{1, 3}});
+        // NaN positions take no part.
+        shuffled[1].linePosition = std::numeric_limits<double>::quiet_NaN();
+        CHECK(gapSpansForControls(shuffled).empty());
+    }
+
+    // The same over overlay markers, in line-position order, and the
+    // placement gate: strictly inside a gap is blocked, the endpoints and
+    // everything else stay open.
+    std::vector<GeneratedOverlay::ControlPointMarker> markers;
+    for (size_t i = 0; i < controls.size(); ++i) {
+        GeneratedOverlay::ControlPointMarker m;
+        m.controlIndex = i;
+        m.linePosition = controls[i].linePosition;
+        m.isBreak = hasControlPointTag(controls[i].tags, kBreakTag);
+        markers.push_back(m);
+    }
+    const auto ranges = generatedGapLineRanges(markers);
+    REQUIRE(ranges.size() == 1);
+    CHECK(ranges[0].first == 10.0);
+    CHECK(ranges[0].second == 20.0);
+    CHECK(generatedLinePositionInsideGap(ranges, 15.0));
+    CHECK(generatedLinePositionInsideGap(ranges, 10.5));
+    CHECK(!generatedLinePositionInsideGap(ranges, 10.0));
+    CHECK(!generatedLinePositionInsideGap(ranges, 20.0));
+    CHECK(!generatedLinePositionInsideGap(ranges, 25.0));
+    CHECK(!generatedLinePositionInsideGap(ranges, std::numeric_limits<double>::quiet_NaN()));
+    // Dense segments: every one between the two controls is in the gap, the
+    // neighbours outside are not.
+    CHECK(generatedLineSegmentInGap(10.0, 11.0, ranges));
+    CHECK(generatedLineSegmentInGap(19.0, 20.0, ranges));
+    CHECK(!generatedLineSegmentInGap(9.0, 10.0, ranges));
+    CHECK(!generatedLineSegmentInGap(20.0, 21.0, ranges));
+
+    // The ranges come from the full list: filtering the markers to the two
+    // break points (as the cross-slice overlay does by plane distance) must
+    // not turn non-adjacent breaks into a gap. Here 10 and 40 are both
+    // tagged but 20 sits between them untagged.
+    markers[2].isBreak = false;
+    std::vector<GeneratedOverlay::ControlPointMarker> filtered{markers[1], markers[4]};
+    CHECK(generatedGapLineRanges(markers).empty());
+    // (A caller deriving from the filtered list would wrongly see one.)
+    CHECK(generatedGapLineRanges(filtered).size() == 1);
+    // Reversed order in the vector does not matter: sorted by line position.
+    std::reverse(markers.begin(), markers.end());
+    markers[2].isBreak = true;  // the point at 20 again
+    const auto reversedRanges = generatedGapLineRanges(markers);
+    REQUIRE(reversedRanges.size() == 1);
+    CHECK(reversedRanges[0].first == 10.0);
+    CHECK(reversedRanges[0].second == 20.0);
+}

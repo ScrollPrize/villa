@@ -177,6 +177,10 @@ public:
         // Per control point: carries the kollesis_termination tag. Same size
         // as controlPoints.
         std::vector<bool> kollesisTerminations;
+        // Per control point: carries the break tag. Same size as
+        // controlPoints. Two consecutive flags make the span between them a
+        // gap span (dotted amber in the map).
+        std::vector<bool> breaks;
         // Branch links resolving to a loaded fiber, pending included.
         std::vector<FiberMapLink> links;
     };
@@ -760,6 +764,24 @@ private:
     void handleGeneratedControlPointSetKollesisTermination(const std::string& surfaceName,
                                                            size_t controlPointIndex,
                                                            bool enabled);
+    void handleGeneratedControlPointSetBreak(const std::string& surfaceName,
+                                             size_t controlPointIndex,
+                                             bool enabled);
+    // Shared body of the two tag toggles: guards, the tag edit, the stored
+    // fiber mirror + save (rolled back if the save cannot be scheduled),
+    // the same edit on every other pane showing this fiber, and the overlay
+    // refreshes. Returns false when nothing changed or the toggle was refused.
+    bool setControlPointTagAndPersist(const std::string& surfaceName,
+                                      size_t controlPointIndex,
+                                      const char* tag,
+                                      bool enabled,
+                                      const QString& pendingSolveMessage);
+    // Sets the interpolation goal of the spans owned by `owners` and starts
+    // the re-solve, with the mode-change rollback of the menu's goal change.
+    // Returns false (nothing changed) when every span already has the goal.
+    bool applySegmentInterpolationGoals(LineAnnotationSession& session,
+                                        const std::vector<size_t>& owners,
+                                        vc3d::line_annotation::SegmentInterpolationGoal goal);
     // adjacent: designate the point as an ADJACENT link candidate (see
     // LinkCandidate::adjacent) rather than an ordinary one.
     void handleGeneratedControlPointLinkCandidate(const std::string& surfaceName,
