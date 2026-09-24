@@ -30,6 +30,34 @@ function uniqStrings(arr) {
   return [...new Set(arr.filter((v) => v !== null && v !== undefined && v !== ""))].sort();
 }
 
+function scanConfigurations(scans) {
+  const by = new Map();
+  for (const s of scans || []) {
+    const px = s.px ?? null;
+    const energy = s.energy ?? null;
+    const loc = s.loc ?? null;
+    const key = `${px}|${energy}|${loc}`;
+    const seen = by.get(key);
+    if (seen) seen.n += 1;
+    else by.set(key, { px, energy, loc, n: 1 });
+  }
+  return [...by.values()].sort(
+    (a, b) =>
+      (a.px ?? Infinity) - (b.px ?? Infinity) ||
+      (a.energy ?? Infinity) - (b.energy ?? Infinity) ||
+      String(a.loc ?? "").localeCompare(String(b.loc ?? ""))
+  );
+}
+
+function webknossosDatasets(progress) {
+  const p = progress || {};
+  const listed = (Array.isArray(p.wk) ? p.wk : []).filter((d) => d && d.url);
+  if (listed.length) {
+    return listed.map((d) => ({ name: d.name ?? null, px: d.px ?? null, url: d.url }));
+  }
+  return p.wkUrl ? [{ name: null, px: null, url: p.wkUrl }] : [];
+}
+
 // Pull {px, energy, loc, name} out of a single scan record. The public
 // metadata stores location only under `creation.metadata`, while energy /
 // pixel size live both there and (sometimes) under `properties`. Be tolerant.
@@ -668,4 +696,10 @@ function buildIndex(samples, opts) {
   };
 }
 
-module.exports = { buildIndex, EMBARGOED, stageRank };
+module.exports = {
+  buildIndex,
+  EMBARGOED,
+  stageRank,
+  scanConfigurations,
+  webknossosDatasets,
+};
