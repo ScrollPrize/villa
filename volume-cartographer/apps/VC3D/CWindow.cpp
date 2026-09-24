@@ -2599,6 +2599,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     _viewerManager->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
+    // Let SurfaceCache tile fills serve the flattened view instead of queueing
+    // behind raw-path chunk demand for frames that never sample it, as Spiral
+    // does.
+    _viewerManager->setPreferSurfaceTileFills(true);
     if (_workspaceTabs && _spiralWorkspaceWindow) {
         const int spiralIndex = _workspaceTabs->indexOf(_spiralWorkspaceWindow);
         auto* shell = _spiralWorkspaceWindow;

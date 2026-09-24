@@ -11,6 +11,7 @@ was, and that the verb is only valid in Idle.
 import copy
 from pathlib import Path
 import sys
+import io
 import threading
 from types import SimpleNamespace
 import unittest
@@ -21,7 +22,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import fit_spiral
-from config import BACKFILLABLE_CONFIG_DEFAULTS, Config, durable_config
+from config import Config
 from fit_session import SessionState
 from spiral_progress import NullProgressReporter
 import spiral_runtime
@@ -55,11 +56,8 @@ def _live_context():
         spiral_outward_sense="CW",
         base_shape_zyx=(100, 200, 300),
         paths=SimpleNamespace(dataset_root="/data/scroll1"),
-        phase_mode=True,
         winding_model_mode=False,
         winding_inference=None,
-        sdt_volume={"fingerprint": {"sha256": "abc", "path": "/store/a",
-                                    "complete": True}},
         config=dict(CONFIG),
         model_z_begin=1000,
         model_z_end=2000,
@@ -79,14 +77,10 @@ def _checkpoint(**overrides):
         "spiral_and_transform": dict(MODEL_STATE),
         "optimiser": copy.deepcopy(OPTIMISER_STATE),
         "scheduler": dict(SCHEDULER_STATE),
-        "cfg": durable_config(CONFIG),
+        "cfg": dict(CONFIG),
         "lasagna_scale": 4,
         "lasagna_group": "4",
         "spiral_outward_sense": "CW",
-        # Only the content-identity fields compare: the store may legitimately
-        # have moved and grown since the checkpoint was written.
-        "surf_sdt_fingerprint": {"sha256": "abc", "path": "/store/b",
-                                 "complete": False},
         "z_begin": 1000,
         "z_end": 2000,
         "input_manifest": {"dataset_root": "/data/scroll1"},
@@ -163,11 +157,6 @@ class CheckpointPreflightTests(unittest.TestCase):
         legacy = _inspect(_checkpoint(schema_version=1))
         self.assertFalse(legacy.accepted)
         self.assertIn("schema version 1", legacy.message())
-        # The startup/CLI restore has no live session to protect and still
-        # accepts pre-v2 checkpoints through the same implementation.
-        self.assertTrue(
-            _inspect(_checkpoint(schema_version=1),
-                     allow_legacy_schema=True).accepted)
         missing = _inspect(_checkpoint(optimiser=None))
         self.assertFalse(missing.accepted)
         self.assertIn("'optimiser'", missing.message())
@@ -195,16 +184,6 @@ class CheckpointPreflightTests(unittest.TestCase):
         self.assertFalse(verdict.accepted)
         self.assertIn("positive integers", verdict.message())
 
-    def test_sdt_identity_invariant_applies_when_an_sdt_loss_is_enabled(self):
-        stale = _checkpoint(surf_sdt_fingerprint={"sha256": "def"})
-        verdict = _inspect(stale)
-        self.assertFalse(verdict.accepted)
-        self.assertIn("surf-SDT fingerprint", verdict.message())
-        # With no SDT-driven loss active the store is not an input at all.
-        context = _live_context()
-        context.phase_mode = False
-        self.assertTrue(_inspect(stale, context).accepted)
-
     def test_model_z_domain_must_match_exactly(self):
         for domain in ((900, 2000), (1000, 2100)):
             with self.subTest(domain=domain):
@@ -218,26 +197,28 @@ class CheckpointPreflightTests(unittest.TestCase):
         self.assertFalse(_inspect(undeclared).accepted)
 
     def test_structural_configuration_invariants(self):
-        unknown = _checkpoint(cfg={**durable_config(CONFIG), "who_am_i": 1})
-        self.assertIn("does not match the current schema",
-                      _inspect(unknown).message())
-        removed = _checkpoint(cfg={
-            **durable_config(CONFIG), "influence_disable_dt_frac": 0.75})
-        self.assertIn("influence_disable_dt_frac", _inspect(removed).message())
-        incomplete = durable_config(CONFIG)
-        del incomplete["optimizer_learning_rate"]
-        self.assertIn("optimizer_learning_rate",
-                      _inspect(_checkpoint(cfg=incomplete)).message())
-        # z_begin/z_end joined the schema late and are session-owned anyway.
-        carve_out = durable_config(CONFIG)
-        carve_out.pop("z_begin", None)
-        carve_out.pop("z_end", None)
-        self.assertTrue(_inspect(_checkpoint(cfg=carve_out)).accepted)
-        pre_toggles = durable_config(CONFIG)
-        for key in BACKFILLABLE_CONFIG_DEFAULTS:
-            pre_toggles.pop(key)
-        self.assertTrue(_inspect(_checkpoint(cfg=pre_toggles)).accepted)
-        shaped = durable_config(CONFIG)
+        # The stored configuration is loaded tolerantly (see
+        # test_checkpoint_tolerance): dropped and defaulted keys are NOTEs,
+        # not refusals; only an uninterpretable value refuses.
+        stale = dict(CONFIG)
+        del stale["input_use_tracks"]
+        stale["who_am_i"] = 1
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.assertTrue(_inspect(_checkpoint(cfg=stale)).accepted)
+        self.assertIn("NOTE: checkpoint drops configuration keys", output.getvalue())
+        self.assertIn("NOTE: checkpoint predates configuration keys", output.getvalue())
+        invalid = _inspect(_checkpoint(
+            cfg={**dict(CONFIG), "dense_spacing_mode": "phase"}))
+        self.assertIn("Invalid value for dense_spacing_mode", invalid.message())
+        # A defaulted model-shaping key still has to agree with the live fit.
+        shaped_default = dict(CONFIG)
+        del shaped_default["model_flow_bounds_radius"]
+        context = _live_context()
+        context.config["model_flow_bounds_radius"] = (
+            int(CONFIG["model_flow_bounds_radius"]) + 1)
+        self.assertIn("model-shaping config mismatch",
+                      _inspect(_checkpoint(cfg=shaped_default), context).message())
+        shaped = dict(CONFIG)
         shaped["model_flow_bounds_radius"] = (
             int(shaped["model_flow_bounds_radius"]) + 1)
         verdict = _inspect(_checkpoint(cfg=shaped))
@@ -292,13 +273,10 @@ class SparseStoreDdpTests(unittest.TestCase):
             dist=fit_spiral.DistributedContext(
                 rank=rank, world_size=2, local_rank=rank),
             grad_mag_spacing_enabled=False,
-            phase_mode=True,
             normal_nx_zarr_path='/data/nx',
             normal_ny_zarr_path='/data/ny',
             grad_mag_zarr_path=None,
             normal_zarr_group='4',
-            surf_sdt_zarr_path='/data/sdt',
-            surf_sdt_zarr_group='1',
         )
 
     def test_nonzero_rank_waits_for_rank_zero_without_building(self):
@@ -378,16 +356,10 @@ class CheckpointApplyTests(unittest.TestCase):
             context.optimiser.param_groups[0]["lr"],
             context.config["optimizer_learning_rate"], places=12)
 
-    def test_a_checkpoint_without_an_iteration_falls_back_to_the_caller(self):
-        context = _StubContext()
-        payload = {
-            "spiral_and_transform": context.model.state_dict(),
-            "optimiser": context.optimiser.state_dict(),
-            "scheduler": context.lr_scheduler.state_dict(),
-        }
-        self.assertEqual(
-            context.apply_checkpoint(payload, fallback_iteration=17), 17)
-        self.assertEqual(context.start_iteration, 17)
+    def test_a_checkpoint_without_an_iteration_is_refused(self):
+        verdict = _inspect(_checkpoint(completed_iterations=None))
+        self.assertFalse(verdict.accepted)
+        self.assertIn("completed_iterations", verdict.message())
 
 
 class _FakeContext:

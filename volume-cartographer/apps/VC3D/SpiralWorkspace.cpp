@@ -287,8 +287,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     // The flattened preview is this workspace's primary pane: stop publishing
     // raw-path chunk demand for frames the SurfaceCache fully serves, so its
     // tile fills are not starved behind interactive fetches the frame never
-    // reads. Spiral's own ViewerManager only; the main workspace keeps the
-    // default demand behavior.
+    // reads.
     _viewerManager->setPreferSurfaceTileFills(true);
     _slices = std::make_unique<AxisAlignedSliceController>(_state, this);
     _slices->setViewerManager(_viewerManager.get());
@@ -324,7 +323,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     _surfaceOverlapOverlay->setViewerManager(_viewerManager.get());
     _viewerManager->setSegmentationOverlay(_surfaceOverlapOverlay.get());
     _surfaceCategoryVisible = {{QStringLiteral("verified"), false},
-                               {QStringLiteral("unverified"), false},
                                {QStringLiteral("shell"), false}};
 
     _grid = new ViewerSplitGrid(this);
@@ -489,7 +487,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         _pendingBrushPatches.remove(alias);
         _pendingPointCollectionPaths.remove(alias);
         _uncommittedPointCollectionIds.remove(alias);
-        _unverifiedBrushIds.remove(alias);
+        _uncommittedBrushPatchIds.remove(alias);
     });
     connect(_service, &SpiralServiceManager::inputDraftStaged, this,
             [this](const QString& alias) {
@@ -508,7 +506,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                         if (!previous.isEmpty() && previous != patch.path)
                             QDir(previous).removeRecursively();
                         _brushProvisionalPaths[alias] = patch.path;
-                        _unverifiedBrushIds.insert(alias);
+                        _uncommittedBrushPatchIds.insert(alias);
                         if (patch.operation != QStringLiteral("delete")) {
                             registerPendingPatchSurface(alias, patch.surface, patch.color);
                         } else {
@@ -574,7 +572,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     if (_brush->hasLocalChangesFor(id)) continue;
                     const QString path = _brushProvisionalPaths.take(id);
                     if (!path.isEmpty()) QDir(path).removeRecursively();
-                    _unverifiedBrushIds.remove(id);
+                    _uncommittedBrushPatchIds.remove(id);
                     const QString pclPath = _pointCollectionProvisionalPaths.take(id);
                     if (!pclPath.isEmpty()) QFile::remove(pclPath);
                     _uncommittedPointCollectionIds.remove(id);
@@ -905,7 +903,7 @@ void SpiralWorkspace::loadInputSurfaces(const QJsonObject& servicePaths, quint64
     // preview or geometry display.
     QJsonObject paths;
     QStringList unavailable;
-    for (const char* key : {"verified_patches", "unverified_patches", "outer_shell"}) {
+    for (const char* key : {"verified_patches", "outer_shell"}) {
         const QString servicePath = servicePaths.value(QString::fromLatin1(key)).toString();
         if (servicePath.isEmpty()) continue;
         const QString local = mapServicePath(servicePath);
@@ -928,7 +926,6 @@ void SpiralWorkspace::loadInputSurfaces(const QJsonObject& servicePaths, quint64
         InputSurfaceLoadResult result;
         const std::pair<const char*, const char*> inputs[] = {
             {"verified", "verified_patches"},
-            {"unverified", "unverified_patches"},
             {"shell", "outer_shell"},
         };
         for (const auto& [categoryText, pathKey] : inputs) {
@@ -976,8 +973,7 @@ void SpiralWorkspace::installInputSurfaces(const InputSurfaceLoadResult& result,
 {
     if (_shuttingDown || generation != _inputSurfaceGeneration) return;
     QHash<QString, QStringList> replacement;
-    for (const QString& category : {QStringLiteral("verified"), QStringLiteral("unverified"),
-                                    QStringLiteral("shell")})
+    for (const QString& category : {QStringLiteral("verified"), QStringLiteral("shell")})
         replacement[category] = {};
     QHash<QString, QString> replacementSourceIds;
     std::map<std::string, cv::Vec3b> replacementColors;
@@ -1117,7 +1113,6 @@ void SpiralWorkspace::updateSurfaceIntersections()
     };
     if (_pendingPatchesOnly) {
         addCategory(QStringLiteral("verified"), true);
-        addCategory(QStringLiteral("unverified"), true);
         addCategory(QStringLiteral("ephemeral"), true);
     } else {
         for (auto visible = _surfaceCategoryVisible.begin();
@@ -1773,7 +1768,7 @@ bool SpiralWorkspace::hasPendingBrushWork() const
     return (_service && _service->hasInputDrafts())
         || (_brush && (_brush->hasUnfinalizedPaint() || _brush->hasUnfinalizedPolylines()))
         || (_brush && _brush->hasReadyDrafts())
-        || !_pendingBrushPatches.isEmpty() || !_unverifiedBrushIds.isEmpty()
+        || !_pendingBrushPatches.isEmpty() || !_uncommittedBrushPatchIds.isEmpty()
         || !_pendingPointCollectionPaths.isEmpty()
         || !_uncommittedPointCollectionIds.isEmpty();
 }
@@ -1791,7 +1786,7 @@ void SpiralWorkspace::discardBrushWork()
         if (!path.isEmpty()) QFile::remove(path);
     _pendingBrushPatches.clear();
     _brushProvisionalPaths.clear();
-    _unverifiedBrushIds.clear();
+    _uncommittedBrushPatchIds.clear();
     _pendingPointCollectionPaths.clear();
     _pointCollectionProvisionalPaths.clear();
     _uncommittedPointCollectionIds.clear();
@@ -1853,7 +1848,7 @@ void SpiralWorkspace::maybeCommitForPendingExit()
         return;
     }
     _commitAfterBrushUploads = false;
-    if (!_service->hasInputDrafts() && _unverifiedBrushIds.isEmpty() && _uncommittedPointCollectionIds.isEmpty()) {
+    if (!_service->hasInputDrafts() && _uncommittedBrushPatchIds.isEmpty() && _uncommittedPointCollectionIds.isEmpty()) {
         if (_pendingExitAction) {
             auto continuation = std::move(_pendingExitAction);
             _pendingExitAction = {};

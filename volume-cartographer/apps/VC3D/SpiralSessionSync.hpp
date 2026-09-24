@@ -93,7 +93,6 @@ inline QJsonObject completeSpiralRunConfiguration(
 inline QJsonObject spiralRunRequest(
     const QJsonObject& configuration,
     int iterations,
-    const QJsonObject& influence,
     const QJsonObject& dtLossSchedule,
     qint64 expectedSessionRevision,
     const QJsonObject& previewSchedule = {})
@@ -101,7 +100,6 @@ inline QJsonObject spiralRunRequest(
     QJsonObject result{
         {QStringLiteral("configuration"), configuration},
         {QStringLiteral("iterations"), iterations},
-        {QStringLiteral("influence"), influence},
         {QStringLiteral("dt_loss_schedule"), dtLossSchedule},
         {QStringLiteral("expected_session_revision"), expectedSessionRevision},
     };

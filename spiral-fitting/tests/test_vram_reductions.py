@@ -437,9 +437,6 @@ class DevicePatchAtlasTests(unittest.TestCase):
             area=4.0,
             _source_path='/inputs/non-liftable-patch.tifxyz',
         )
-        unverified_patch = types.SimpleNamespace(**vars(patch))
-        unverified_patch._source_path = \
-            '/unverified/non-liftable-unverified-patch.tifxyz'
 
         with tempfile.TemporaryDirectory() as out_path:
             context = FitContext.__new__(FitContext)
@@ -453,18 +450,12 @@ class DevicePatchAtlasTests(unittest.TestCase):
             context.out_path = out_path
             context.non_liftable_patch_paths = set()
             context.verified_patches_path = '/inputs'
-            context.unverified_patches_path = '/unverified'
             context.verified_patches = {'bad': patch}
             context.verified_patches_list = [patch]
             context.patch_sampling_probabilities = np.ones(1)
             context.num_verified_patches = 1
             context.patch_atlas = self.PatchAtlas(
                 context.verified_patches, device='cpu').materialize()
-            context.unverified_patches = {'unverified-bad': unverified_patch}
-            context.unverified_patches_list = [unverified_patch]
-            context.unverified_patch_sampling_probabilities = np.ones(1)
-            context.unverified_patch_atlas = self.PatchAtlas(
-                context.unverified_patches, device='cpu').materialize()
             context.cross_patch_pcls = []
             context.regular_pcl_catalog = {}
             context.fiber_catalog = {}
@@ -474,12 +465,9 @@ class DevicePatchAtlasTests(unittest.TestCase):
 
             warnings = context._build_theta_crossing_map()
 
-            self.assertEqual(len(warnings), 2)
+            self.assertEqual(len(warnings), 1)
             self.assertEqual(context.verified_patches, {})
             self.assertEqual(context.verified_patches_list, [])
-            self.assertEqual(context.unverified_patches, {})
-            self.assertEqual(context.unverified_patches_list, [])
-            self.assertIsNone(context.unverified_patch_atlas)
             self.assertEqual(context.num_verified_patches, 0)
             self.assertEqual(
                 context.theta_crossing_map.potential_consistency()[
@@ -488,8 +476,7 @@ class DevicePatchAtlasTests(unittest.TestCase):
             report = Path(out_path, 'non_liftable_patches.txt').read_text()
             self.assertEqual(
                 report,
-                '/inputs/non-liftable-patch.tifxyz\n'
-                '/unverified/non-liftable-unverified-patch.tifxyz\n')
+                '/inputs/non-liftable-patch.tifxyz\n')
 
     @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
     def test_sample_patch_batch_carries_pregathered_points(self):
@@ -558,32 +545,24 @@ class LiveShellConfigTests(unittest.TestCase):
         context = self.FitContext.__new__(self.FitContext)
         context.config = {
             'loss_weight_shell_outer': 0.0,
-            'loss_weight_shell_patch_radius': 0.0,
         }
         context.shell_patch = None
         context.shell_map = None
-        context.shell_valid_zyxs_gpu = None
         context.shell_outer_winding_idx = 4
         context.winding_model_mode = False
         context.device = torch.device('cpu')
         context.tracks = None
         context.prepared_main_tracks = None
-        context.unverified_patches = {}
-        context.unverified_patches_list = []
-        context.unverified_patch_sampling_probabilities = None
-        context.unverified_patch_atlas = None
 
-        def unexpected_subsample(_shell):
-            self.fail('a disabled outer-shell source must not be subsampled')
+        def unexpected_polar_map():
+            self.fail('a disabled outer-shell source must not build a polar map')
 
-        context._subsample_shell_radius_pool = unexpected_subsample
+        context._make_shell_polar_map = unexpected_polar_map
         context.apply_config({
             'loss_weight_shell_outer': 1.0,
-            'loss_weight_shell_patch_radius': 1.0,
         }, current_iteration=0)
 
         self.assertIsNone(context.shell_map)
-        self.assertIsNone(context.shell_valid_zyxs_gpu)
 
 
 class NonFiniteGradCheckTests(unittest.TestCase):

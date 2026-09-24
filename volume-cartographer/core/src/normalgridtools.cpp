@@ -1,5 +1,7 @@
 #include "vc/core/util/GridStore.hpp"
 #include <random>
+#include <optional>
+#include <cstdint>
 #include <iostream>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -12,7 +14,7 @@ long total_candidates_before_dedup = 0;
 long total_candidates_after_dedup = 0;
 long nearest_neighbors_calls = 0;
 
-cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store) {
+cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store, std::optional<std::uint32_t> seed) {
     auto segments = grid_store.get_all();
     if (segments.empty()) {
         return cv::Vec2f(std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
@@ -48,7 +50,13 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store) {
     sample_points.reserve(num_samples_per_iteration);
     sample_normals.reserve(num_samples_per_iteration);
 
-    static std::mt19937 gen(std::random_device{}());
+    // The generator. With no seed it is the one static generator seeded once from the hardware,
+    // as published, so two calls in one process draw different samples. With a seed it is a
+    // fresh generator seeded with that value, so that a run can be repeated exactly.
+    static std::mt19937 shared_gen(std::random_device{}());
+    std::mt19937 seeded_gen;
+    if (seed) seeded_gen.seed(*seed);
+    std::mt19937& gen = seed ? seeded_gen : shared_gen;
     std::uniform_int_distribution<> segment_dist(0, all_line_segments.size() - 1);
 
     for (int j = 0; j < num_samples_per_iteration; ++j) {
@@ -97,7 +105,6 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store) {
     // 5. Refine the best estimate using a hill-climbing direct search.
     auto score_candidate = [&](const cv::Vec2f& candidate) {
         double score = 0.0;
-        double wsum = 0.0;
         for (size_t j = 0; j < sample_points.size(); ++j) {
             const auto& point = sample_points[j];
             const auto& normal = sample_normals[j];
@@ -111,9 +118,21 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store) {
             double cos_angle = umbilicus_to_segment.dot(normal);
             float weight = 1.0f / std::max(100.0f, dist);
             score += (cos_angle * cos_angle) * weight;
-            wsum += weight;
         }
-        return score/wsum;
+        // Weighted sum, not weighted mean. The sum weights the alignment of each normal by the
+        // proximity of its segment, so it favours candidates near many segments as well as
+        // candidates the normals point at; it vanishes far from the section and so has a maximum
+        // at finite distance, which the mean does not on partial predictions. That maximum is a
+        // property of the score and not a guarantee about the search below it: nothing bounds the
+        // number of steps the climb takes or keeps it in the grid, and that it settled inside the
+        // grid on 576 of 576 measured slices is observed and not enforced. On synthetic
+        // sections with a known centre the mean is exact and the sum is biased towards the denser
+        // side by 0.4 to 2.4 mm (evidence/synthetic-density.csv of the validation paper). On
+        // fifteen real scrolls with a manual reference the sum's median error is 0.4 to 7.1 mm
+        // against 0.4 to 133 mm for the mean, with no failure above 10 mm against seven scrolls,
+        // and the failure persists with the walk clipped to the grid: it is the objective and
+        // not the search.
+        return score;
     };
 
     double refined_best_score = score_candidate(best_umbilicus);

@@ -188,12 +188,11 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
     # (disable_patches, e.g. the 2026-07-17 normals-only baseline) must not
     # stop the loaders from reading the patches it wants to analyse.
     cfg['input_disable_patches'] = False
-    # We compute no shell losses; zero their weights so the context's
+    # We compute no shell losses; zero the weight so the context's
     # shell_losses_enabled() gate stops load_host_inputs() from loading the
     # shell (replacing the old fs.shell_losses_enabled = lambda: False
-    # override). Nothing else in the host-loading path reads these weights.
+    # override). Nothing else in the host-loading path reads this weight.
     cfg['loss_weight_shell_outer'] = 0.0
-    cfg['loss_weight_shell_patch_radius'] = 0.0
     # The filtering z-range is the optimisation window this analysis uses.
     cfg['z_begin'] = int(filter_z_begin)
     cfg['z_end'] = int(filter_z_end)
@@ -206,9 +205,7 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
     # This analysis needs no scroll volume, track store, or outer shell:
     # leaving those paths empty keeps load_host_inputs() from touching the
     # training-only inputs. Legacy role-less PCL specs (role=None) retain the
-    # historical abs_winding.json basename inference. Attachment is over the
-    # verified patch set only, so the (slow, unrelated) unverified patches
-    # are skipped; they don't change the cross-patch / attached pcl set.
+    # historical abs_winding.json basename inference.
     # Fibers are same-winding annotations: when loaded they classify as 'neither'
     # pcls (delta-0 cross-patch edges), exactly like same_windings.json. Off
     # unless a fibers dir is passed.
@@ -248,8 +245,7 @@ def build_transform(checkpoint, cfg, context, model_z_begin, model_z_end):
         spiral_outward_sense=context.spiral_outward_sense,
     )
     model.to(device)
-    model.load_state_dict(fs.merge_flow_stage_lattices(
-        checkpoint)['spiral_and_transform'])
+    model.load_state_dict(checkpoint['spiral_and_transform'])
     model.eval()
 
     transform = model.get_slice_to_spiral_transform()

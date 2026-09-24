@@ -822,9 +822,6 @@ def save_overlay_and_print_satisfaction(
     patch_atlas,
     unattached_pcl_strips,
     tracks,
-    unverified_patches_list,
-    unverified_patches_dict,
-    unverified_patch_atlas,
     out_path,
     cfg,
     z_begin,
@@ -953,44 +950,6 @@ def save_overlay_and_print_satisfaction(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             print('WARNING: skipped satisfied_tracks metric (CUDA OOM during track evaluation)')
-    # Unverified patches are reported entirely separately so they never inflate the verified
-    # satisfaction numbers.
-    unverified_patch_satisfaction_entries = []
-    if unverified_patches_list:
-        unverified_evaluation = evaluate_patch_satisfaction_packed(
-            slice_to_spiral_transform, dr_per_winding,
-            unverified_patches_list, unverified_patch_atlas,
-            z_begin, z_end, include_splicing=False, verbose=False)
-        unverified_profile = unverified_evaluation.profiles['strict']
-        u_satisfied = unverified_profile.satisfied_patches
-        u_sat_areas = unverified_profile.satisfied_areas
-        u_tot_areas = unverified_profile.total_areas
-        u_count = int(u_satisfied.sum().item())
-        u_total = u_satisfied.numel()
-        u_ratio = u_count / max(u_total, 1)
-        print(f'unverified_satisfied_patches = {u_count}/{u_total} ({u_ratio * 100:.1f}%)')
-        u_sat_area = float(u_sat_areas.sum().item())
-        u_tot_area = float(u_tot_areas.sum().item())
-        u_area_ratio = u_sat_area / max(u_tot_area, 1e-9)
-        print(f'unverified_satisfied_area = {u_sat_area:.1f}/{u_tot_area:.1f} ({u_area_ratio * 100:.1f}%)')
-        satisfaction_summary.update({
-            'unverified_satisfied_patches': u_count,
-            'unverified_total_patches': u_total,
-            'unverified_satisfied_patches_fraction': u_ratio,
-            'unverified_satisfied_area': u_sat_area,
-            'unverified_total_area': u_tot_area,
-            'unverified_satisfied_area_fraction': u_area_ratio,
-        })
-        for pid, sat_area_t, tot_area_t in zip(unverified_patches_dict.keys(), u_sat_areas.tolist(), u_tot_areas.tolist()):
-            fraction = sat_area_t / tot_area_t if tot_area_t > 0 else 0.0
-            unverified_patch_satisfaction_entries.append({
-                'id': pid,
-                'satisfied_area': sat_area_t,
-                'total_area': tot_area_t,
-                'fraction': fraction,
-            })
-        unverified_patch_satisfaction_entries.sort(key=lambda e: e['fraction'])
-
     patch_ids = list(patches_dict.keys())
     patch_satisfaction_entries = []
     for pid, sat_area_t, tot_area_t in zip(patch_ids, satisfied_areas.tolist(), total_areas.tolist()):
@@ -1021,7 +980,6 @@ def save_overlay_and_print_satisfaction(
         json.dump({
             'patches': patch_satisfaction_entries,
             'pcls': pcl_satisfaction_entries,
-            'unverified_patches': unverified_patch_satisfaction_entries,
         }, f, indent=2)
     with open(f'{out_path}/satisfaction_metrics_{suffix}.json', 'w') as f:
         json.dump({'summary': satisfaction_summary}, f, indent=2)

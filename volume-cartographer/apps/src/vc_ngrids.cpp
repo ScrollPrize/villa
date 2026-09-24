@@ -1051,9 +1051,11 @@ static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::pat
     {
         std::vector<size_t> off = {0, 0, 0};
         std::vector<size_t> regionShape = {Z, Y, X};
-        dsx->readRegion(off, regionShape, ax.data());
-        dsy->readRegion(off, regionShape, ay.data());
-        dsz->readRegion(off, regionShape, az.data());
+        if (!dsx->readRegion(off, regionShape, ax.data()) ||
+            !dsy->readRegion(off, regionShape, ay.data()) ||
+            !dsz->readRegion(off, regionShape, az.data())) {
+            throw std::runtime_error("Failed to read x/y/z datasets under zarr root: " + zarr_root.string());
+        }
     }
 
     const CropBox3i crop = crop_opt.value_or(CropBox3i{
@@ -1165,9 +1167,11 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
     {
         std::vector<size_t> off = {0, 0, 0};
         std::vector<size_t> regionShape = {Z, Y, X};
-        dsx->readRegion(off, regionShape, ax.data());
-        dsy->readRegion(off, regionShape, ay.data());
-        dsz->readRegion(off, regionShape, az.data());
+        if (!dsx->readRegion(off, regionShape, ax.data()) ||
+            !dsy->readRegion(off, regionShape, ay.data()) ||
+            !dsz->readRegion(off, regionShape, az.data())) {
+            throw std::runtime_error("Failed to read x/y/z datasets under zarr root: " + zarr_root.string());
+        }
     }
 
     const CropBox3i crop = crop_opt.value_or(CropBox3i{
@@ -1524,9 +1528,11 @@ static NormalsCropU8 load_normals_crop_u8(
 
     const std::vector<size_t> off(crop.cropZyx.off.begin(), crop.cropZyx.off.end());
     const std::vector<size_t> region_shape(crop.cropZyx.shape.begin(), crop.cropZyx.shape.end());
-    dsx->readRegion(off, region_shape, crop.x.data());
-    dsy->readRegion(off, region_shape, crop.y.data());
-    dsz->readRegion(off, region_shape, crop.z.data());
+    if (!dsx->readRegion(off, region_shape, crop.x.data()) ||
+        !dsy->readRegion(off, region_shape, crop.y.data()) ||
+        !dsz->readRegion(off, region_shape, crop.z.data())) {
+        throw std::runtime_error("Failed to read x/y/z datasets under zarr root: " + zarr_root.string());
+    }
 
     if (read_seconds != nullptr) {
         *read_seconds = std::chrono::duration<double>(

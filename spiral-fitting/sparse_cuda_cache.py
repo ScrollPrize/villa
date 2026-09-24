@@ -1,6 +1,6 @@
 """Fully-resident sparse brick pools for integer gathers from packed sidecars.
 
-The loss code asks for integer SDT corners and nearest-neighbour normal
+The loss code asks for nearest-neighbour normal and gradient-magnitude
 samples at positions scattered uniformly over the whole ROI, so any bounded
 cache thrashes; instead the entire occupied brick set of each field is loaded
 once from a ``pack_resident_pools.py`` sidecar (a single sequential read per
@@ -228,17 +228,3 @@ class SparseLasagnaStore:
             self.normal_cache.close()
         if self.grad_cache is not None:
             self.grad_cache.close()
-
-
-class SparseScalarStore:
-    def __init__(self, cache: ResidentBrickPool) -> None:
-        self.cache = cache
-        self.last_timings: dict[str, float | int] = {}
-
-    def gather(self, indices_zyx, device):
-        values = self.cache.gather(indices_zyx)[..., 0].to(device)
-        self.last_timings = dict(self.cache.last_timings)
-        return values
-
-    def close(self):
-        self.cache.close()
