@@ -2,11 +2,19 @@
 stores they were packed from, which is what dl.ash2txt.org publishes."""
 
 import json
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
 
 from config import Config
-from fit_session import (DEFAULT_NORMAL_ZARR_GROUP, SpiralInputPaths,
-                         SpiralRunConfig, conventional_input_paths,
-                         fit_input, lasagna_sidecar_path, load_scroll_spec,
+from fit_session import (DEFAULT_NORMAL_ZARR_GROUP, SCROLL_SPEC_FILENAME,
+                         SCROLL_SPEC_UNDERIVABLE, ScrollSpecError,
+                         SpiralInputPaths, SpiralRunConfig,
+                         conventional_input_paths, fit_input,
+                         lasagna_sidecar_path, load_scroll_spec,
+                         parse_scroll_spec, preflight_dataset,
                          resolve_dataset_root, validate_session_request)
 from pack_resident_pools import sidecar_path
 
@@ -168,3 +176,115 @@ class TestValidation:
         paths, run, _ = request_for(published_dataset(tmp_path))
         fields = {error['field'] for error in validate_session_request(paths, run)}
         assert not {'normal_x', 'normal_y', 'gradient_magnitude'} & fields
+
+
+class TestPreflight:
+    def test_a_published_dataset_reports_the_sidecar_it_will_read(
+            self, tmp_path):
+        report = preflight_dataset(published_dataset(tmp_path),
+                                   Config().as_dict())
+        assert report.ok
+        rows = {item.key: item for item in report.inputs}
+        assert rows['normal_x'].path.endswith('.respool_g4_pair')
+        assert rows['normal_y'].path == rows['normal_x'].path
+        assert rows['gradient_magnitude'].path.endswith('.respool_g4')
+        assert 'This dataset can start a fit.' in report.report()
+
+    def test_requirements_follow_the_fit_configuration(self, tmp_path):
+        root = published_dataset(tmp_path)
+        config = Config().as_dict()
+        rows = {item.key: item.requirement
+                for item in preflight_dataset(root, config).inputs}
+        assert rows['winding_inference'] == 'required'
+        assert rows['gradient_magnitude'] == 'optional'
+        assert rows['tracks_dbm'] == 'off'
+        config.update({'dense_spacing_mode': 'grad_mag',
+                       'input_use_tracks': True})
+        rows = {item.key: item.requirement
+                for item in preflight_dataset(root, config).inputs}
+        assert rows['winding_inference'] == 'off'
+        assert rows['gradient_magnitude'] == 'required'
+        assert rows['tracks_dbm'] == 'optional'
+
+    def test_a_missing_scroll_spec_is_reported_with_a_filled_template(
+            self, tmp_path):
+        root = published_dataset(tmp_path)
+        (root / 'spiral-scroll.json').unlink()
+        report = preflight_dataset(root, Config().as_dict())
+        assert not report.ok
+        template = report.scroll_spec_template
+        assert template['name'] == root.name
+        assert template['normal_zarr_group'] == '4'
+        assert template['schema_version'] == 1
+        assert SCROLL_SPEC_FILENAME in report.report()
+
+    def test_the_template_placeholders_are_refused_rather_than_guessed(
+            self, tmp_path):
+        root = published_dataset(tmp_path)
+        (root / 'spiral-scroll.json').unlink()
+        template = preflight_dataset(root, Config().as_dict()) \
+            .scroll_spec_template
+        for key in SCROLL_SPEC_UNDERIVABLE:
+            assert str(template[key]).startswith('<')
+        with pytest.raises(ScrollSpecError):
+            parse_scroll_spec(template, root)
+
+    def test_a_track_store_off_the_conventional_name_is_named_in_the_template(
+            self, tmp_path):
+        root = published_dataset(tmp_path)
+        (root / 'spiral-scroll.json').unlink()
+        tracks = root / 'tracks'
+        tracks.mkdir()
+        (tracks / 'PHerc0826_surface_m7_L0_th0.2.dbm').write_text('')
+        template = preflight_dataset(root, Config().as_dict()) \
+            .scroll_spec_template
+        assert template['paths']['tracks_dbm'] == \
+            'tracks/PHerc0826_surface_m7_L0_th0.2.dbm'
+
+    def test_an_empty_lasagna_z_roi_blocks_the_fit_before_any_gpu(
+            self, tmp_path):
+        root = published_dataset(tmp_path)
+        write_scroll_spec(root, lasagna_scale=1)
+        config = Config().as_dict()
+        config.update({'z_begin': 10000, 'z_end': 11000})
+        report = preflight_dataset(root, config)
+        assert not report.ok
+        assert report.missing == ()
+        assert any('z-ROI [10000, 4737) is empty' in problem
+                   for problem in report.problems)
+
+    def test_a_sidecar_packed_from_other_stores_is_reported_not_hidden(
+            self, tmp_path):
+        root = published_dataset(tmp_path)
+        sidecar = root / f'{NORMAL_X}.respool_g4_pair' / 'meta.json'
+        document = json.loads(sidecar.read_text())
+        document['channel_names'] = ['other_nx.ome.zarr/4',
+                                     'other_ny.ome.zarr/4']
+        sidecar.write_text(json.dumps(document))
+        report = preflight_dataset(root, Config().as_dict())
+        rows = {item.key: item for item in report.inputs}
+        assert 'other_nx.ome.zarr/4' in rows['normal_x'].note
+        assert rows['normal_x'].blocks is False
+        assert report.ok
+
+
+class TestCheckFlag:
+    def run_check(self, root):
+        return subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parents[1]
+                                 / 'fit_spiral.py'),
+             '--dataset', str(root), '--check'],
+            capture_output=True, text=True,
+            cwd=str(Path(__file__).resolve().parents[1]))
+
+    def test_a_runnable_dataset_exits_zero(self, tmp_path):
+        result = self.run_check(published_dataset(tmp_path))
+        assert result.returncode == 0, result.stderr
+        assert 'This dataset can start a fit.' in result.stdout
+
+    def test_a_dataset_without_a_scroll_spec_exits_one(self, tmp_path):
+        root = published_dataset(tmp_path)
+        (root / 'spiral-scroll.json').unlink()
+        result = self.run_check(root)
+        assert result.returncode == 1
+        assert '"schema_version": 1' in result.stdout
