@@ -1520,6 +1520,8 @@ def save_mesh(
     os.makedirs(out_dir, exist_ok=True)
     output_total = 2 * len(num_thetas_by_winding)
     output_done = 0
+    layout = GridLayout.export(z_direction_is_top_to_bottom)
+    layout_metadata = export_metadata(z_direction_is_top_to_bottom)
     if progress is not None:
         progress.begin(
             'finalizing', 'Writing final mesh windings',
@@ -1536,13 +1538,13 @@ def save_mesh(
                 winding_zyxs = winding_slice.cpu().numpy().astype(np.float32)
                 winding_zyxs[invalid_mask] = -1.0
                 save_tifxyz(
-                    GridLayout.export(z_direction_is_top_to_bottom).apply(winding_zyxs),
+                    layout.apply(winding_zyxs),
                     out_dir,
                     uuid=f'w{winding_idx:03d}{uuid_suffix}{tag_suffix}',
                     step_size=step_size,
                     voxel_size_um=voxel_size_um,
                     source=f'fit_spiral {name}{uuid_suffix}',
-                    layout_metadata=export_metadata(z_direction_is_top_to_bottom),
+                    layout_metadata=layout_metadata,
                 )
             offset += num_thetas
             output_done += 1

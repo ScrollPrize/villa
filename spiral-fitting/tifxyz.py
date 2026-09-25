@@ -558,13 +558,10 @@ def save_combined_tifxyz(
             "components_after_erosion": int(component_count),
         }
     width = combined.shape[1]
-    layout = GridLayout.export(z_direction_is_top_to_bottom)
-    combined = layout.apply(combined)
-    placed = sorted(
-        (layout.column_range(begin, end, width), winding)
-        for (begin, end), winding in zip(components, ids))
-    components = [bounds for bounds, _ in placed]
-    component_ids = [winding for _, winding in placed]
+    combined = GridLayout.export(z_direction_is_top_to_bottom).apply(combined)
+    # Reversing the columns puts the windings outermost first.
+    components = [[width - end, width - begin] for begin, end in reversed(components)]
+    component_ids = ids[::-1]
     destination = os.path.abspath(os.fspath(path))
     parent = os.path.dirname(destination)
     os.makedirs(parent, exist_ok=True)

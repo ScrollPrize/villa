@@ -3681,6 +3681,15 @@ class FitContext:
                 f'checkpoint outward sense '
                 f'{checkpoint.get("spiral_outward_sense")!r} does not '
                 f'match requested sense {self.spiral_outward_sense!r}')
+        # Checkpoints from before the z direction was saved carry no key.
+        if ('z_direction_is_top_to_bottom' in checkpoint
+                and checkpoint['z_direction_is_top_to_bottom']
+                != self.z_direction_is_top_to_bottom):
+            reasons.append(
+                f'checkpoint z direction (top to bottom: '
+                f'{checkpoint["z_direction_is_top_to_bottom"]!r}) does not '
+                f'match the scroll spec '
+                f'({self.z_direction_is_top_to_bottom!r})')
         checkpoint_base_shape = checkpoint.get('base_shape_zyx')
         if checkpoint_base_shape is not None:
             if (not isinstance(checkpoint_base_shape, (list, tuple))

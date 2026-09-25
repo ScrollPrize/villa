@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 import tifffile
 
-from surface_orientation import GridLayout, METADATA_KEY as LAYOUT_METADATA_KEY
+from surface_orientation import METADATA_KEY as LAYOUT_METADATA_KEY
 
 
 def concat_dir(run_dir):
@@ -203,15 +203,15 @@ def main():
 
         ref = next((p for d, p in wdirs if d == ref_run), wdirs[0][1])
         ref_shape = load_xyz(ref).shape[:2]
-        # Runs may predate the export layout; bring each into the reference's.
-        ref_meta = meta_of(ref)
-        ref_layout = GridLayout.from_metadata(ref_meta)
+        # Cells are merged by normalised index, so every run must share a layout.
+        ref_layout = meta_of(ref).get(LAYOUT_METADATA_KEY)
+        mixed = [p for d, p in wdirs if meta_of(p).get(LAYOUT_METADATA_KEY) != ref_layout]
+        if mixed:
+            raise SystemExit(f"{w}: runs written in different layouts: {ref} vs {mixed[0]}")
 
         stack, valids = [], []
         for d, p in wdirs:
-            layout = GridLayout.from_metadata(meta_of(p))
-            pts = ref_layout.apply(layout.apply(load_xyz(p)))
-            r, vmask = resample_to(pts, ref_shape)
+            r, vmask = resample_to(load_xyz(p), ref_shape)
             r[~vmask] = np.nan  # so the reducer ignores invalid
             stack.append(r)
             valids.append(vmask)
@@ -225,7 +225,7 @@ def main():
 
         area = save_tifxyz(merged, os.path.join(args.out, w), w, step_size, voxel_um,
                            f"merge_concat_runs {args.method} of {len(wdirs)} runs",
-                           ref_meta.get(LAYOUT_METADATA_KEY))
+                           ref_layout)
         n_pts = int((merged[..., 0] != -1).sum())
         print(f"{w}: runs={len(wdirs)} grid={ref_shape[0]}x{ref_shape[1]} "
               f"valid_pts={n_pts} max_overlap={int(n_valid.max())} area_vx2={area}")
