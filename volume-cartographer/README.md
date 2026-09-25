@@ -237,15 +237,17 @@ generations take ten to twenty seconds on a 14-core workstation and fetch
 about 2 MiB the first time.
 
 To grow the segment further, pass `--resume out/auto_grown_<timestamp>` and
-raise `generations` in `params.json`: it is the total generation count the
-segment stops at, not a number of additional generations, so resuming with
-the unchanged `generations: 8` reports `Resuming from generation 7 with 196
-points`, adds nothing and writes the same 196 points again
-(`--resume-generations 8` on the command line changes nothing either; the
-tracer does not read that option). With `generations: 16` the same command
-continues from generation 8 to 15 (1.41 cm² to 7.02 cm² here) and writes the
-result to a new `auto_grown_<timestamp>/` under the target directory, reading
-the remote volume as before.
+`--resume-generations 8`: the option continues the trace for that many
+generations past the one it resumes at, here generations 8 to 15 (1.41 cm² to
+7.02 cm²), and writes the result to a new `auto_grown_<timestamp>/` under the
+target directory, reading the remote volume as before. It is the way to
+continue a trace from the command line, because `generations` in `params.json`
+is the total generation count a trace stops at, not a number of additional
+generations: resuming with the unchanged `generations: 8` and no
+`--resume-generations` reports `Resuming from generation 7 with 196 points`,
+adds nothing and writes the same 196 points again, while raising it to
+`generations: 16` grows the same eight generations `--resume-generations 8`
+does.
 
 #### Rendering it
 
