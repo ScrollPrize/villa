@@ -418,12 +418,13 @@ How it works in code:
 - Dataset loading: Datasets only load label volumes for primary targets. Auxiliary targets do not require separate label files and are not looked up on disk.
 - Loss computation: During training, losses are computed per key present in the batch label dict. The helper `compute_auxiliary_loss` passes `source_pred=outputs[source_target]` to losses that accept it. This enables:
   - Self-consistency/regularization losses that don’t need explicit GT (e.g., `NormalSmoothnessLoss` using only predicted normals with optional masking from `source_pred`).
-  - Losses that need derived GT (e.g., `SignedDistanceLoss`, cosine loss on normals) use the dataset-provided tensors for aux targets.
+  - Losses that need derived GT (e.g., `SignedDistanceLoss`, cosine loss on normals) use the tensors the trainer derives for aux targets.
   - Tip: If you use `SignedDistanceLoss`, set `distance_type: signed` (default). For `inside`/`outside` distances, use regression losses like `MaskedMSELoss` or `WeightedSmoothL1Loss`.
   - For deep supervision, auxiliary targets default to `ds_interpolation: linear`, mapping to bilinear (2D) or trilinear (3D) in downsampling to preserve regression continuity.
 
 Important notes and current behavior:
-- The dataset now auto-generates ground-truth tensors for `distance_transform` (signed DT) and `surface_normals` per patch from the `source_target` labels, so related losses work out of the box.
+- `vesuvius.train` with the default `--trainer base` switches to `AuxiliaryTrainer` when `auxiliary_tasks` are configured. It derives the ground-truth tensors for every auxiliary type above per batch from the augmented `source_target` labels (e.g. signed DT for `distance_transform`), so related losses work out of the box.
+- Other trainers do not derive auxiliary tensors. They stop at startup with an error naming the auxiliary targets instead of training those heads against nothing.
 - Auxiliary losses that are self-supervised or use only predictions (e.g., `NormalSmoothnessLoss`) also work and can be masked using `source_pred` passed through `compute_auxiliary_loss`.
 - If you prefer, you can still precompute and store auxiliary labels on disk using the same naming convention; the dataset will ignore them unless you wire them explicitly.
 

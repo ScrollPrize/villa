@@ -1,3 +1,4 @@
+import pytest
 import torch
 from types import SimpleNamespace
 
@@ -88,3 +89,15 @@ def test_create_optimizer_accepts_parameter_groups():
         [id(model.bias)],
     ]
     assert [group["lr"] for group in optimizer.param_groups] == [2.5e-4, 1e-3]
+
+
+def test_base_trainer_rejects_auxiliary_targets_before_building_datasets(monkeypatch):
+    trainer = _DummyTrainer()
+    trainer.mgr.targets = {
+        "ink": {"weight": 1.0},
+        "ink_dt": {"auxiliary_task": True, "task_type": "distance_transform", "source_target": "ink"},
+    }
+    monkeypatch.setattr(trainer, "_configure_dataset", lambda **kwargs: pytest.fail("dataset was built"))
+
+    with pytest.raises(ValueError, match=r"_DummyTrainer cannot generate auxiliary targets \['ink_dt'\]"):
+        trainer._initialize_training()
