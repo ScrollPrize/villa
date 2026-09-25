@@ -7,7 +7,6 @@ import logging
 import math
 import shutil
 import tempfile
-from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +27,7 @@ from vesuvius.ink_detection.models.checkpoint import (
 )
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
 from vesuvius.ink_detection.inference.inference_runtime import (
+    inference_autocast,
     TargetModel,
     flip_spatial,
     iter_mirror_axes,
@@ -745,12 +745,7 @@ def run_block_inference(
     """Forward nonempty flat patches and feed their weighted probabilities."""
 
     mask_f32 = None if mask is None else mask.astype(np.float32, copy=False)
-    autocast = (
-        torch.autocast("cuda", dtype=amp_dtype)
-        if device.type == "cuda"
-        else nullcontext()
-    )
-    with torch.inference_mode(), autocast:
+    with torch.inference_mode(), inference_autocast(device, amp_dtype):
         for images_BCZYX, metadata in loader:
             # The dataset records occupancy on raw patches; normalized all-zero
             # input is not a valid signal for this skip.
@@ -1336,6 +1331,11 @@ def parse_args(argv: Sequence[str] | None = None):
         "--amp-dtype",
         choices=("auto", "default", "fp16", "bf16"),
         default="auto",
+        help=(
+            "Inference precision on CUDA: 'auto' follows the checkpoint's "
+            "mixed_precision setting, 'default' runs full precision (no "
+            "autocast), 'fp16'/'bf16' force that autocast dtype."
+        ),
     )
     parser.add_argument("--tta-mirror", action="store_true")
     parser.add_argument("--tta-batch-size", type=int)
