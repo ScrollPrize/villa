@@ -42,12 +42,12 @@ class QResizeEvent;
 class QTimer;
 class QVariantAnimation;
 class QVBoxLayout;
+class QWidgetAction;
 class QSplitter;
 class QSpinBox;
 class QSlider;
 class QPushButton;
 class QToolButton;
-class QCheckBox;
 class Volume;
 class ViewerManager;
 class PlaneSurface;
@@ -636,9 +636,10 @@ private:
     QPushButton* _presenceColorButton = nullptr;
     QSlider* _presenceThresholdSlider = nullptr;
     QLabel* _presenceThresholdValue = nullptr;
-    QCheckBox* _presenceAdvancedCheck = nullptr;
-    QLabel* _presenceVolumeLabel = nullptr;
     QComboBox* _presenceVolumeCombo = nullptr;
+    // The flyout's QWidgetAction: QMenu caches an action's size, so a row
+    // shown or hidden later has to be announced through it.
+    QWidgetAction* _presenceFlyoutAction = nullptr;
     std::vector<std::pair<std::string, QString>> _presenceVolumeOptions;
     QAction* _mirrorCursorAction = nullptr;
     QAction* _resetViewsAction = nullptr;
