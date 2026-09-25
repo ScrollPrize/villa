@@ -1,6 +1,6 @@
 # volcomp — single-header lossy u8 volumetric codec (128^3 chunks, zarr v3
 # sharding_indexed friendly). Upstream: https://github.com/SuperOptimizer/volume-compressor
-# (volcomp.h vendored verbatim). volcomp_lib.c compiles the header once and
+# (volcomp.h vendored verbatim; 1.3.0, format revision 4). volcomp_lib.c compiles the header once and
 # exports a plain C surface; see volcomp_lib.h.
 #
 # Portable: the header needs no arch flags. On x86-64 it compiles its AVX2+FMA

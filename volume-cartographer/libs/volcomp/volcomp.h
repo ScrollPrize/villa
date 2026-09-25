@@ -12,7 +12,8 @@
  * (they are declared restrict).
  * Portable: AVX2+FMA kernels are used at runtime on x86-64 CPUs that have
  * them (no compiler flags needed), plain C kernels everywhere else.
- * The only configuration is the quantiser step q in [1,255] (1/256 precision).
+ * The only configuration is the quantiser step q: 0 for the lossless mode
+ * (exact), or [1,255] (1/256 precision) for the lossy DCT codec.
  * volcomp_encode performs one VOLCOMP_MALLOC/VOLCOMP_FREE of scratch;
  * decoding allocates nothing.
  *
@@ -55,14 +56,29 @@
 #define VOLCOMP_FREE(p) free(p)
 #endif
 
-#define VOLCOMP_VERSION_STRING "1.0.0"
+#define VOLCOMP_VERSION_STRING "1.3.0"
 #define VOLCOMP_FORMAT_VERSION 1u
+/* Format revision 2 added the mask chunk mode (header byte 5 = 4); revision 3
+ * added the spatially lossless mask mode (header byte 5 = 5); revision 4 adds the
+ * surface chunk (header byte 5 = 6, spec/format.md §13). The version byte
+ * stays 1 across revisions: every 1.0/1.1 stream is byte for byte what it always
+ * was, and an older decoder rejects a newer mode cleanly (it refuses any mode
+ * above the highest it knows with VOLCOMP_ERR_CORRUPT). A writer must not emit a
+ * mode-5 chunk to a consumer that only reads revision 2; that consumer will
+ * refuse it cleanly rather than misread it, and the same holds for a mode-6
+ * chunk and a revision-3 reader. See spec/format.md §11, §12 and §13.
+ */
+#define VOLCOMP_FORMAT_REVISION 4u
 #define VOLCOMP_BLOCK_DIM 16u
 #define VOLCOMP_CHUNK_DIM 128u
 #define VOLCOMP_BLOCK_VOXELS 4096u
 #define VOLCOMP_CHUNK_VOXELS 2097152u
 #define VOLCOMP_Q_MIN 1.0f
 #define VOLCOMP_Q_MAX 255.0f
+/* q == 0 selects the lossless mode (exact reconstruction; see "lossless mode"
+ * below and spec/format.md §10). Any q in [1,255] is the lossy DCT codec, whose
+ * bitstream is unchanged from volcomp 1.0. */
+#define VOLCOMP_Q_LOSSLESS 0.0f
 /* Provable upper bound on the encoded size of any chunk at any q (spec
  * "Bounds"): 8 header + 680 tables + 256 directory + tANS (<= 2 B/token, <= 8192
  * tokens/block, + 8 flush/substream) + bypass (<= 12288 B/block). Real CT
@@ -71,7 +87,7 @@
 
 typedef enum volcomp_status {
   VOLCOMP_OK = 0,
-  VOLCOMP_ERR_ARG,       /* null pointer, q outside [1,255], bad block coordinate */
+  VOLCOMP_ERR_ARG,       /* null pointer, q not 0 and outside [1,255], bad block coord */
   VOLCOMP_ERR_CORRUPT,   /* malformed, truncated, or non-canonical stream          */
   VOLCOMP_ERR_VERSION,   /* well-formed header with an unsupported version byte    */
   VOLCOMP_ERR_NOMEM,     /* allocation failed                                      */
@@ -79,7 +95,8 @@ typedef enum volcomp_status {
 } volcomp_status;
 
 static inline const char *volcomp_status_string(volcomp_status s);
-/* Encode one 128^3 u8 chunk; writes at most dst_cap bytes, *out_n = stream length. */
+/* Encode one 128^3 u8 chunk at quantiser step q (VOLCOMP_Q_LOSSLESS or
+ * [1,255]); writes at most dst_cap bytes, *out_n = stream length. */
 static inline volcomp_status volcomp_encode(const uint8_t *restrict src_zyx, float q,
                                             void *restrict dst, size_t dst_cap, size_t *out_n);
 /* Decode a whole chunk into dst_zyx (dst_cap >= VOLCOMP_CHUNK_VOXELS). Contents
@@ -99,9 +116,111 @@ static inline volcomp_status volcomp_decode_block(const void *restrict enc, size
  * faces and chunk faces receive identical treatment; the volume's own outer
  * faces are not filtered. q must be the q the chunks were encoded with (the
  * gate strength scales with it). Not part of the format; the caller chooses
- * whether to run it. Measured on scroll data: +0.15 dB (q8) to +0.4 dB (q32)
+ * whether to run it. Exact zeros (masked air) are never filtered into
+ * (VOLCOMP_DEBLOCK_ZERO_GUARD, below). Measured on scroll data: +0.15 dB (q8) to +0.4 dB (q32)
  * PSNR, blocking amplification 1.5x -> ~1.1x, ~5% of decode time. */
 static inline void volcomp_deblock(uint8_t *vol, size_t nz, size_t ny, size_t nx, float q);
+/* volcomp_deblock with options. VOLCOMP_DEBLOCK_ZERO_GUARD: leave every face
+ * position alone where one of the four voxels it reads is exactly 0 — masked CT
+ * stores air as 0, and a mask edge that falls on a 16-plane is a real edge, not a
+ * seam. volcomp_deblock itself now always applies the guard: without it the filter
+ * blurred masked CT's chunk-aligned air edges at q >= 16 (edge error +54 %, chunk
+ * faces 2.8x rougher than unfiltered); with it no chunk is ever worse than no
+ * filter on the measured CT, and nothing else changes (docs/deblocking.md).
+ * flags = 0 is the old, unguarded filter. */
+#define VOLCOMP_DEBLOCK_ZERO_GUARD 1u
+/* volcomp_decode_smooth: smooth with the gated face filter instead of a Gaussian
+ * seam blur (strength then scales the filter's q) */
+#define VOLCOMP_SMOOTH_GATED 2u
+/* Optional decode-side deblocking of one chunk (not part of the format; the
+ * stream is untouched, only this reader's reconstruction differs): decode, smooth
+ * the voxels next to interior block faces (a Gaussian of `strength` voxels, or
+ * with VOLCOMP_SMOOTH_GATED the gated face filter at `strength` x q), then project
+ * every block back onto the quantisation cells its coefficients were decoded from,
+ * so the output is still a reconstruction the stream allows. Lossy (mode 0) and
+ * surface chunks only (a surface chunk keeps its exact threshold); any other chunk
+ * decodes exactly as volcomp_decode. Chunk faces are left as decoded; run
+ * volcomp_deblock_ex on an assembled region for those. VOLCOMP_DEBLOCK_ZERO_GUARD
+ * keeps exact zeros (masked air) and the faces touching them untouched. */
+static inline volcomp_status volcomp_decode_smooth(const void *restrict enc, size_t enc_n, uint8_t *restrict dst_zyx,
+                                                   size_t dst_cap, float strength, unsigned flags);
+static inline void volcomp_deblock_ex(uint8_t *vol, size_t nz, size_t ny, size_t nx, float q, unsigned flags);
+/* True if the stream decodes exactly (was encoded with VOLCOMP_Q_LOSSLESS).
+ * False for a mask chunk, which stores a 2x downscale of its source.
+ * Also validates the magic/version/mode bytes. */
+static inline volcomp_status volcomp_is_lossless(const void *restrict enc, size_t enc_n, bool *out);
+/* The q the stream was encoded with; 0 for a lossless stream and for a mask
+ * chunk (neither is the DCT codec; volcomp_is_lossless tells them apart); the
+ * base's q for a surface chunk. */
+static inline volcomp_status volcomp_stream_q(const void *restrict enc, size_t enc_n, float *out);
+
+/* ---- binary mask chunks (spec/format.md §11) ----
+ * A mask chunk is the storage form of a published binary mask. The 128^3 source
+ * is downscaled 2x2x2 by MAJORITY (count*2 >= 8) to a 64^3 grid, and that grid
+ * is stored EXACTLY, with a context-adaptive binary arithmetic coder (12 causal
+ * neighbours, 4096 contexts). There is nothing to configure.
+ *
+ * `volcomp_decode` returns the grid TRILINEARLY INTERPOLATED back to 128^3 as
+ * u8 0..255: stored voxel i sits at full-res voxel 2i, so output voxel j samples
+ * the grid at j/2 (clamped at the top edge) and the result is a continuous field
+ * with a two-voxel edge ramp around the stored boundary — the training target
+ * itself, not a 0/255 mask. Every existing reader (volcomp_decode_block,
+ * python/volcomp_zarr, the shard readers) therefore works unchanged.
+ * Measured on the 2.4 um PHercParis4 recto: 0.0057 bits per full-res voxel. */
+#define VOLCOMP_MASK_DIM 64u        /* stored grid edge = VOLCOMP_CHUNK_DIM / 2 */
+#define VOLCOMP_MASK_VOXELS 262144u /* VOLCOMP_MASK_DIM^3                       */
+/* Encode a 128^3 mask (any nonzero source voxel is 1); never larger than
+ * 9 + VOLCOMP_MASK_VOXELS/8 = 32 777 bytes. One VOLCOMP_MALLOC of scratch. */
+static inline volcomp_status volcomp_mask_encode(const uint8_t *restrict src_zyx, void *restrict dst,
+                                                 size_t dst_cap, size_t *out_n);
+
+/* ---- spatially lossless mask chunks (mode 5, spec/format.md §12) ----
+ * The same coder, no downscale: the full 128^3 binary mask (any nonzero source
+ * voxel is 1) is coded exactly with the same 12-neighbour context model and the
+ * same adaptation schedule, and `volcomp_decode` returns 0/255 exactly as
+ * stored. Where mode 4 trades a two-voxel boundary ramp for 4x fewer coded bits,
+ * mode 5 is the published mask itself, voxel for voxel.
+ * Measured on the 2.4 um PHercParis4 recto: 0.0255 bits per voxel (0.022 is what
+ * an ideal, two-pass model over the same contexts would cost).
+ * Never larger than VOLCOMP_MASK_LL_BOUND. One VOLCOMP_MALLOC of scratch. */
+#define VOLCOMP_MASK_LL_DIM VOLCOMP_CHUNK_DIM /* the stored grid IS the chunk */
+#define VOLCOMP_MASK_LL_BOUND ((size_t)(9u + VOLCOMP_CHUNK_VOXELS / 8u)) /* 8 header + 1 flags + 262 144 */
+static inline volcomp_status volcomp_mask_encode_lossless(const uint8_t *restrict src_zyx,
+                                                          void *restrict dst, size_t dst_cap,
+                                                          size_t *out_n);
+/* True iff the stream is a mask chunk of either mode; with out_dim, the edge of
+ * the grid it stores — VOLCOMP_MASK_DIM (64) for the 2x mode, VOLCOMP_CHUNK_DIM
+ * (128) for the lossless one, which is how a reader tells the two apart.
+ * VOLCOMP_ERR_ARG if the stream is well formed but is not a mask chunk. */
+static inline volcomp_status volcomp_mask_info(const void *restrict enc, size_t enc_n, uint32_t *out_dim);
+/* The STORED grid of a mask chunk, as 0/255: 64^3 for mode 4, 128^3 for mode 5
+ * (dst_cap >= dim^3, i.e. VOLCOMP_MASK_VOXELS resp. VOLCOMP_CHUNK_VOXELS). */
+static inline volcomp_status volcomp_mask_decode_stored(const void *restrict enc, size_t enc_n,
+                                                        uint8_t *restrict dst, size_t dst_cap);
+/* ---- surface chunks (mode 6, spec/format.md §13) ----
+ * For smooth probability fields (surface predictions: u8 = round(255 p)) whose
+ * consumers threshold them. The chunk is the DCT codec at step q PLUS a
+ * refinement layer that makes the threshold exact: for every voxel,
+ * (source >= thr) == (decoded >= thr), so the binary mask, its skeleton and its
+ * distance field are exactly those of the source, and the soft values carry the
+ * DCT error at q (a wrong-side voxel decodes to thr or thr - 1). thr = 128 is
+ * p >= 0.5. `volcomp_decode` / `volcomp_decode_block` read it like any chunk
+ * (decode_block decodes the whole chunk: the refinement is one adaptive pass);
+ * decoding is bit-identical on every build (the base uses the strict kernels).
+ * The base uses a FLAT step law (every AC step q), so q here is not mode 0's q:
+ * surface q 48 is about the size of mode-0 q 16; q in [2, 255]. Measurements on
+ * the recto and m7 surface teachers: docs/surface_mode.md. Never larger than
+ * VOLCOMP_SURFACE_ENCODE_BOUND; one VOLCOMP_MALLOC of scratch. */
+/* the flat step law's smallest step: below it an AC level of a full-swing block
+ * would exceed the format's cap (|level| <= 5220, spec §4.2) */
+#define VOLCOMP_SURFACE_Q_MIN 2.0f
+#define VOLCOMP_SURFACE_ENCODE_BOUND (VOLCOMP_ENCODE_BOUND + 8u + VOLCOMP_CHUNK_VOXELS + 8u)
+static inline volcomp_status volcomp_surface_encode(const uint8_t *restrict src_zyx, float q, uint32_t thr,
+                                                    void *restrict dst, size_t dst_cap, size_t *out_n);
+/* OK iff a surface chunk; its threshold and refinement margin (0 = the base
+ * alone was already exact). VOLCOMP_ERR_ARG for any other well-formed chunk. */
+static inline volcomp_status volcomp_surface_info(const void *restrict enc, size_t enc_n, uint32_t *out_thr,
+                                                  uint32_t *out_margin);
 /* Which kernel set this process will use: "avx2" or "c". */
 static inline const char *volcomp_kernels(void);
 
@@ -117,6 +236,15 @@ static inline const char *volcomp_kernels(void);
 #define VF_BLOCKS_PER_SUB 16u
 #define VF_VERSION 1u
 #define VF_HDR_BYTES 8u
+/* header byte 5: which codec produced the chunk (see "lossless mode" below) */
+#define VLL_MODE_LOSSY 0u
+#define VLL_MODE_CODED 1u
+#define VLL_MODE_RAW 2u
+#define VLL_MODE_CONST 3u
+#define VLL_MODE_MASK 4u
+#define VLL_MODE_MASK_LL 5u
+#define VLL_MODE_SURFACE 6u
+#define VLL_MODE_MAX 6u
 #define VF_DIR_BYTES (VF_NSUB * 8u)
 #define VF_Q_RAW_MIN 256u
 #define VF_Q_RAW_MAX 65280u
@@ -919,9 +1047,9 @@ static bool vf_model_from_freqs(vf_model *m, const uint32_t freqs[VF_NTOK]) {
   return true;
 }
 /* compact tables: per model u32 LE presence bitmap + LEB128 freq per set bit, ascending */
-static size_t vf_tables_write(const vf_model m[VF_NMODELS], uint8_t *out) {
+static size_t vf_tables_write(const vf_model *m, uint8_t *out, uint32_t nm) {
   size_t n = 0;
-  for (uint32_t i = 0; i < VF_NMODELS; i++) {
+  for (uint32_t i = 0; i < nm; i++) {
     uint32_t bm = 0;
     for (uint32_t s = 0; s < VF_NTOK; s++)
       if (m[i].freq[s]) bm |= 1u << s;
@@ -932,8 +1060,8 @@ static size_t vf_tables_write(const vf_model m[VF_NMODELS], uint8_t *out) {
   }
   return n;
 }
-static bool vf_tables_read(vf_cur *c, vf_model m[VF_NMODELS]) {
-  for (uint32_t i = 0; i < VF_NMODELS; i++) {
+static bool vf_tables_read(vf_cur *c, vf_model *m, uint32_t nm) {
+  for (uint32_t i = 0; i < nm; i++) {
     if (!vf_cur_has(c, 4)) return false;
     uint32_t bm = vf_rd_u32(c->p);
     c->p += 4;
@@ -963,9 +1091,9 @@ typedef struct vf_etab {
   uint16_t state[VF_PROB_SCALE];
   vf_esym sym[VF_NTOK];
 } vf_etab;
-static void vf_etabs_init(const vf_model m[VF_NMODELS], vf_etab et[VF_NMODELS]) {
+static void vf_etabs_init(const vf_model *m, vf_etab *et, uint32_t nm) {
   const uint32_t size = VF_PROB_SCALE, mask = size - 1u, step = (size >> 1) + (size >> 3) + 3u;
-  for (uint32_t c = 0; c < VF_NMODELS; c++) {
+  for (uint32_t c = 0; c < nm; c++) {
     uint8_t tsym[VF_PROB_SCALE];
     uint32_t pos = 0;
     for (uint32_t s = 0; s < VF_NTOK; s++)
@@ -1491,6 +1619,128 @@ static void vf_steps(float q, float step[VF_NRADII]) {
   step[0] = q * VF_DC_FINE;
   for (uint32_t r = 1; r < VF_NRADII; r++) step[r] = q * powf(1.0f + (float)r, VF_HF_EXP);
 }
+
+/* ---- the bit-exact reconstruction of a surface chunk's base (spec §13.2) ----
+ * A surface chunk refines its DCT base with context-coded bits whose contexts
+ * are read from the base's own reconstruction, so encoder and decoder must
+ * compute that reconstruction to the last bit, on every build. The default
+ * kernels are not held to that (AVX2+FMA and C agree to +-1 LSB), so the base
+ * is reconstructed here in plain IEEE single precision: no contraction into
+ * FMA, no reassociation, the operation order of VF_DCT16_INV_BODY, and the
+ * step law from a table instead of powf (libm results differ between
+ * platforms). VF_HF_POW[r] = powf(1 + r, 0.65f) as glibc computes it; the
+ * steps are q * VF_HF_POW[r], one IEEE multiplication. The AVX2 version runs
+ * the same scalar operation sequence on eight lines at once, so the two kernel
+ * sets are bit-identical (tests/test_surfchunk.c checks it on every build). */
+static const float VF_HF_POW[VF_NRADII] = {
+    0x1p+0f,        0x1.91b502p+0f, 0x1.056b84p+1f, 0x1.3b2c48p+1f, 0x1.6c5e42p+1f, 0x1.9a364p+1f,
+    0x1.c571acp+1f, 0x1.ee8f34p+1f, 0x1.0af468p+2f, 0x1.1de0a2p+2f, 0x1.3025eep+2f, 0x1.41d882p+2f,
+    0x1.5308aep+2f, 0x1.63c3d4p+2f, 0x1.74152p+2f,  0x1.8405fep+2f, 0x1.939e8p+2f,  0x1.a2e596p+2f,
+    0x1.b1e152p+2f, 0x1.c097p+2f,   0x1.cf0b54p+2f, 0x1.dd4276p+2f, 0x1.eb4022p+2f, 0x1.f907b4p+2f,
+    0x1.034e16p+3f, 0x1.0a0028p+3f, 0x1.109b4cp+3f, 0x1.1720a6p+3f, 0x1.1d9142p+3f, 0x1.23ee16p+3f,
+    0x1.2a3804p+3f, 0x1.306fdep+3f, 0x1.369668p+3f, 0x1.3cac54p+3f, 0x1.42b24ap+3f, 0x1.48a8e8p+3f,
+    0x1.4e90cp+3f,  0x1.546a5cp+3f, 0x1.5a363cp+3f, 0x1.5ff4dap+3f, 0x1.65a6a8p+3f, 0x1.6b4c12p+3f,
+    0x1.70e57cp+3f, 0x1.767346p+3f, 0x1.7bf5cep+3f, 0x1.816d66p+3f};
+static void vf_steps_strict(float q, float step[VF_NRADII]) {
+  step[0] = q * VF_DC_FINE;
+  for (uint32_t r = 1; r < VF_NRADII; r++) step[r] = q * VF_HF_POW[r];
+}
+/* the surface chunk's step law (§13.1): DC as mode 0, every AC coefficient at q.
+ * A smooth probability field has no perceptual reason to quantise high
+ * frequencies harder, and at equal size this halves the 99th-percentile error
+ * near the threshold (docs/surface_mode.md). Exact on every build. */
+static void vf_steps_flat(float q, float step[VF_NRADII]) {
+  step[0] = q * VF_DC_FINE;
+  for (uint32_t r = 1; r < VF_NRADII; r++) step[r] = q;
+}
+#if defined(__clang__)
+#define VF_STRICT_BEGIN _Pragma("clang fp contract(off) reassociate(off)")
+#define VF_STRICT_FN
+#elif defined(__GNUC__)
+#define VF_STRICT_BEGIN
+#define VF_STRICT_FN __attribute__((optimize("fp-contract=off", "no-fast-math")))
+#else
+#define VF_STRICT_BEGIN
+#define VF_STRICT_FN
+#endif
+/* one 16-point inverse transform, `in` -> `out`, strict */
+#define VF_IDCT16_STRICT(VT, IN, OUT) \
+  do {                                \
+    const VT *in = (IN);              \
+    VT *out = (OUT);                  \
+    VF_DCT16_INV_BODY(VT)             \
+  } while (0)
+/* Same passes, skips and order as vf_dct16_inv_c (planes outside zmask, and a
+ * plane's upper eight x lines outside hmask, are zero and stay zero). */
+VF_STRICT_FN __attribute__((noinline)) static void vf_dct16_inv_strict_c(float blk[VF_BLKV], uint32_t zmask,
+                                                                        uint32_t hmask, float dst[VF_BLKV]) {
+  VF_STRICT_BEGIN
+  float li[16], lo[16];
+  for (int z = 0; z < 16; z++) {
+    if (!(zmask >> z & 1u)) continue;
+    float *pl = blk + z * 256;
+    const int ny = hmask >> z & 1u ? 16 : 8;
+    for (int y = 0; y < ny; y++) {
+      VF_IDCT16_STRICT(float, pl + y * 16, lo);
+      memcpy(pl + y * 16, lo, sizeof lo);
+    }
+    for (int x = 0; x < 16; x++) {
+      for (int t = 0; t < 16; t++) li[t] = pl[t * 16 + x];
+      VF_IDCT16_STRICT(float, li, lo);
+      for (int t = 0; t < 16; t++) pl[t * 16 + x] = lo[t];
+    }
+  }
+  for (int i = 0; i < 256; i++) {
+    for (int t = 0; t < 16; t++) li[t] = zmask >> t & 1u ? blk[t * 256 + i] : 0.0f;
+    VF_IDCT16_STRICT(float, li, lo);
+    for (int t = 0; t < 16; t++) dst[t * 256 + i] = lo[t];
+  }
+}
+#if VF_HAVE_AVX2
+VF_STRICT_FN __attribute__((noinline)) VF_TARGET_AVX2 static void
+vf_dct16_inv_strict_avx2(float blk[VF_BLKV], uint32_t zmask, uint32_t hmask, float dst[VF_BLKV]) {
+  VF_STRICT_BEGIN
+  __m256 li[16], lo[16];
+  for (int z = 0; z < 16; z++) {
+    if (!(zmask >> z & 1u)) continue;
+    float *pl = blk + z * 256;
+    const int nh = hmask >> z & 1u ? 2 : 1;
+    for (int h = 0; h < nh; h++) { /* x lines, eight at a time through two 8x8 transposes */
+      float *l = pl + h * 128;
+      for (int y = 0; y < 8; y++) {
+        li[y] = _mm256_loadu_ps(l + y * 16);
+        li[8 + y] = _mm256_loadu_ps(l + y * 16 + 8);
+      }
+      vf_transpose8(li);
+      vf_transpose8(li + 8);
+      VF_IDCT16_STRICT(__m256, li, lo);
+      vf_transpose8(lo);
+      vf_transpose8(lo + 8);
+      for (int y = 0; y < 8; y++) {
+        _mm256_storeu_ps(l + y * 16, lo[y]);
+        _mm256_storeu_ps(l + y * 16 + 8, lo[8 + y]);
+      }
+    }
+    for (int h = 0; h < 2; h++) { /* y lines: eight x lanes */
+      for (int t = 0; t < 16; t++) li[t] = _mm256_loadu_ps(pl + t * 16 + h * 8);
+      VF_IDCT16_STRICT(__m256, li, lo);
+      for (int t = 0; t < 16; t++) _mm256_storeu_ps(pl + t * 16 + h * 8, lo[t]);
+    }
+  }
+  for (int i = 0; i < 256; i += 8) { /* z lines */
+    for (int t = 0; t < 16; t++)
+      li[t] = zmask >> t & 1u ? _mm256_loadu_ps(blk + t * 256 + i) : _mm256_setzero_ps();
+    VF_IDCT16_STRICT(__m256, li, lo);
+    for (int t = 0; t < 16; t++) _mm256_storeu_ps(dst + t * 256 + i, lo[t]);
+  }
+}
+#endif
+static inline void vf_dct16_inv_strict(float blk[VF_BLKV], uint32_t zmask, uint32_t hmask, float out[VF_BLKV]) {
+#if VF_HAVE_AVX2
+  if (vf_use_avx2()) { vf_dct16_inv_strict_avx2(blk, zmask, hmask, out); return; }
+#endif
+  vf_dct16_inv_strict_c(blk, zmask, hmask, out);
+}
 __attribute__((always_inline)) static inline float vf_dequant_ac(uint32_t mag, float step) {
   return ((float)mag + (mag == 1u ? VF_DZ_DQ1 : VF_DZ_DQ)) * step;
 }
@@ -1591,24 +1841,30 @@ static inline uint8_t vf_flat_value(float dc) {
 /* ---- parsed stream ---- */
 typedef struct vf_parsed {
   float q;
+  bool strict; /* a surface chunk's base: the bit-exact reconstruction (spec §13.2) */
   float step[VF_NRADII];
   vf_model models[VF_NMODELS];
   uint32_t tok_n[VF_NSUB], byp_n[VF_NSUB], off[VF_NSUB + 1];
   const uint8_t *payload;
 } vf_parsed;
 
-static volcomp_status vf_parse(const void *restrict enc, size_t enc_n, vf_parsed *restrict p) {
-  const uint8_t *in = (const uint8_t *)enc;
-  if (enc_n < VF_HDR_BYTES + VF_DIR_BYTES) return VOLCOMP_ERR_CORRUPT;
-  if (in[0] != 'V' || in[1] != 'O' || in[2] != 'L' || in[3] != 'C') return VOLCOMP_ERR_CORRUPT;
-  if (in[4] != VF_VERSION) return VOLCOMP_ERR_VERSION;
-  if (in[5] != 0) return VOLCOMP_ERR_CORRUPT;
-  uint32_t qraw = vf_rd_u16(in + 6);
+/* The body of a DCT stream — tables, directory, payload, i.e. everything after
+ * the 8-byte header — in [body, end), at step q_raw / 256. A surface chunk's
+ * base is such a body (spec §13); `strict` selects its bit-exact reconstruction. */
+static volcomp_status vf_parse_body(const uint8_t *body, const uint8_t *end, uint32_t qraw, bool strict,
+                                    bool flat, vf_parsed *restrict p) {
+  if ((size_t)(end - body) < VF_DIR_BYTES) return VOLCOMP_ERR_CORRUPT;
   if (qraw < VF_Q_RAW_MIN || qraw > VF_Q_RAW_MAX) return VOLCOMP_ERR_CORRUPT;
   p->q = (float)qraw * (1.0f / 256.0f);
-  vf_steps(p->q, p->step);
-  vf_cur c = {in + VF_HDR_BYTES, in + enc_n};
-  if (!vf_tables_read(&c, p->models)) return VOLCOMP_ERR_CORRUPT;
+  p->strict = strict;
+  if (flat)
+    vf_steps_flat(p->q, p->step);
+  else if (strict)
+    vf_steps_strict(p->q, p->step);
+  else
+    vf_steps(p->q, p->step);
+  vf_cur c = {body, end};
+  if (!vf_tables_read(&c, p->models, VF_NMODELS)) return VOLCOMP_ERR_CORRUPT;
   if (!vf_cur_has(&c, VF_DIR_BYTES)) return VOLCOMP_ERR_CORRUPT;
   uint64_t sum = 0;
   for (uint32_t s = 0; s < VF_NSUB; s++) {
@@ -1624,6 +1880,14 @@ static volcomp_status vf_parse(const void *restrict enc, size_t enc_n, vf_parsed
   if ((uint64_t)(c.end - c.p) != sum) return VOLCOMP_ERR_CORRUPT; /* exact accounting */
   p->payload = c.p;
   return VOLCOMP_OK;
+}
+static volcomp_status vf_parse(const void *restrict enc, size_t enc_n, vf_parsed *restrict p) {
+  const uint8_t *in = (const uint8_t *)enc;
+  if (enc_n < VF_HDR_BYTES + VF_DIR_BYTES) return VOLCOMP_ERR_CORRUPT;
+  if (in[0] != 'V' || in[1] != 'O' || in[2] != 'L' || in[3] != 'C') return VOLCOMP_ERR_CORRUPT;
+  if (in[4] != VF_VERSION) return VOLCOMP_ERR_VERSION;
+  if (in[5] != VLL_MODE_LOSSY) return VOLCOMP_ERR_CORRUPT; /* not a lossy chunk */
+  return vf_parse_body(in + VF_HDR_BYTES, in + enc_n, vf_rd_u16(in + 6), false, false, p);
 }
 
 /* Decode substream s. only_block < 0: scatter its 16 blocks into the chunk dst;
@@ -1690,7 +1954,10 @@ static volcomp_status vf_decode_sub(const vf_parsed *restrict p, uint32_t s, uin
         for (uint32_t y = 0; y < 16; y++) memset(dst + vf_row_off(bz, by, bx, z, y), bv, 16);
       continue;
     }
-    vf_dct16_inv(blk, zmask, hmask, vox);
+    if (p->strict)
+      vf_dct16_inv_strict(blk, zmask, hmask, vox);
+    else
+      vf_dct16_inv(blk, zmask, hmask, vox);
     vf_clear_planes(blk, zmask);
     if (only_block >= 0) {
       vf_scatter_block(dst_block, 256, 16, vox);
@@ -1850,12 +2117,961 @@ static bool vf_tokenize_block(vf_enc *e, uint16_t **tp, vf_bitw *bw, const int32
   return true;
 }
 
-static inline volcomp_status volcomp_encode(const uint8_t *restrict src_zyx, float q,
-                                            void *restrict dst_v, size_t dst_cap, size_t *out_n) {
+/* ======================================================================== */
+/*                     lossless mode (q == 0, chunk mode 1..3)              */
+/* ======================================================================== */
+/* Header byte 5 selects the chunk mode; the lossy DCT format is mode 0 and is
+ * unchanged (byte for byte) from format version 1 as shipped. Lossless streams
+ * set qraw = 0, which the mode-0 parser rejects, and a v1.0 decoder rejects any
+ * nonzero byte 5 outright (VOLCOMP_ERR_CORRUPT), so old readers never
+ * misinterpret a lossless stream.
+ *
+ *   mode 1 VLL_MODE_CODED  tables + directory + 32 substreams (below)
+ *   mode 2 VLL_MODE_RAW    8-byte header + 2097152 raw voxels
+ *   mode 3 VLL_MODE_CONST  8-byte header + 1 byte (the chunk's value)
+ *
+ * mode 1 keeps volcomp's block/substream geometry: 512 blocks of 16^3 in
+ * z-major block order, 32 substreams of 16 consecutive blocks, so
+ * volcomp_decode_block() still touches one substream and reproduces exactly the
+ * bytes of the full decode. Layout:
+ *
+ *   tables      VLL_NMODELS tANS models, same encoding as the lossy tables
+ *   directory   32 x { LEB128 token bytes, LEB128 bypass bytes }
+ *   payload     per substream: token bytes then bypass bytes
+ *
+ * Each block starts with a mode token (model VLL_M_MODE):
+ *   0 CONST   4096 equal voxels; 8 bypass bits carry the value (~0 bytes)
+ *   1 SPARSE  (run, level)* EOB over the residual array, models VLL_M_RUN /
+ *             VLL_M_LVLS -- flat and label-like data
+ *   2 DENSE   one level token per voxel, model VLL_M_LVLD + context from the
+ *             previous residual -- smooth / continuous data
+ *   3 RAW     4096 bypass bytes -- incompressible data
+ *
+ * The residual of voxel i is v[i] - pred(i) taken mod 256 and zigzagged, with
+ * pred = the previous voxel along x, or along y at x == 0, or along z at
+ * x == y == 0, or 128 at the block origin. Prediction never crosses a block, so
+ * blocks stay independently decodable. Values are exact for every uint8 input:
+ * a chunk whose coded form would not fit in 2 MiB is stored as mode 2, so the
+ * output is never larger than the raw chunk plus the 8-byte header. */
+
+#define VLL_NMODELS 8u
+#define VLL_M_MODE 0u  /* block mode token                                    */
+#define VLL_M_RUN 1u   /* SPARSE zero-run tokens and EOB, +0..1 by prev run   */
+#define VLL_M_LVLS 3u  /* SPARSE levels (magnitude - 1), +0..1 by this run    */
+#define VLL_M_LVLD 5u  /* DENSE level tokens, +0..2 by previous-plane ctx     */
+
+#define VLL_BM_CONST 0u
+#define VLL_BM_SPARSE 1u
+#define VLL_BM_DENSE 2u
+#define VLL_BM_RAW 3u
+
+/* HybridUint variant for the lossless mode: values 0..15 are literal tokens, so
+ * every residual of magnitude <= 7 costs one token and no bypass bit; above that
+ * tok = 12 + msb(u) with the low msb(u) bits bypassed. Max token 19 for a level
+ * (u <= 255) and 23 for a run (u <= 4095), both below VF_TOK_EOB. */
+#define VLL_NLIT 16u
+__attribute__((always_inline)) static inline bool vll_hyb_emit(vf_bitw *w, uint32_t u, uint32_t *tok) {
+  if (u < VLL_NLIT) {
+    *tok = u;
+    return true;
+  }
+  uint32_t k = vf_highbit(u);
+  *tok = VLL_NLIT - 4u + k;
+  return vf_bw_put(w, u & ((1u << k) - 1u), k);
+}
+__attribute__((always_inline)) static inline bool vll_hyb_read(vf_bitr *r, uint32_t tok, uint32_t *u) {
+  if (tok < VLL_NLIT) {
+    *u = tok;
+    return true;
+  }
+  uint32_t k = tok - (VLL_NLIT - 4u), extra;
+  if (!vf_br_get(r, k, &extra)) return false;
+  *u = (1u << k) | extra;
+  return true;
+}
+#define VLL_TOKMAX_RUN 23u /* run <= 4095 */
+#define VLL_TOKMAX_LVL 19u /* level <= 255 */
+#define VLL_SPARSE_MAX_NNZ 2048u
+/* per block: SPARSE emits at most 2*nnz+1 tokens, DENSE 4096 */
+#define VLL_BLK_TOK_MAX (2u * VLL_SPARSE_MAX_NNZ + 1u)
+/* per block bypass: RAW 4096 B; DENSE 4096*7 bits; SPARSE nnz*(11+7) bits */
+#define VLL_BLK_BYP_MAX 4608u
+#define VLL_SUB_TOK_MAX (2u * VF_BLOCKS_PER_SUB * VLL_BLK_TOK_MAX + 8u)
+#define VLL_SUB_BYP_MAX (VF_BLOCKS_PER_SUB * VLL_BLK_BYP_MAX + 8u)
+
+/* ---- block gather / scatter (plain bytes) ---- */
+static inline void vll_gather(const uint8_t *restrict src, uint32_t bz, uint32_t by, uint32_t bx,
+                              uint8_t *restrict b) {
+  for (uint32_t z = 0; z < VOLCOMP_BLOCK_DIM; z++)
+    for (uint32_t y = 0; y < VOLCOMP_BLOCK_DIM; y++)
+      memcpy(b + (z * VOLCOMP_BLOCK_DIM + y) * VOLCOMP_BLOCK_DIM, src + vf_row_off(bz, by, bx, z, y),
+             VOLCOMP_BLOCK_DIM);
+}
+static inline void vll_scatter(uint8_t *restrict dst, uint32_t bz, uint32_t by, uint32_t bx,
+                               const uint8_t *restrict b) {
+  for (uint32_t z = 0; z < VOLCOMP_BLOCK_DIM; z++)
+    for (uint32_t y = 0; y < VOLCOMP_BLOCK_DIM; y++)
+      memcpy(dst + vf_row_off(bz, by, bx, z, y), b + (z * VOLCOMP_BLOCK_DIM + y) * VOLCOMP_BLOCK_DIM,
+             VOLCOMP_BLOCK_DIM);
+}
+
+/* Residual of a gathered 16^3 block: pred(i) is the voxel one step back along z,
+ * or along y inside the first z-plane, or along x inside the first row, or 128
+ * at the origin; the residual is (v - pred) mod 256 zigzagged into 0..255.
+ * Prediction never leaves the block, so blocks stay independently decodable, and
+ * every step is a plane-at-a-time (or row-at-a-time) byte operation the compiler
+ * vectorises: the reconstruction is 15 vector adds over 256 lanes, 15 over 16
+ * lanes and a 15-step scalar tail, not a 4096-long serial chain. */
+#define VLL_ZZ(d) ((uint8_t)((uint32_t)((d) << 1) ^ (uint32_t)(uint8_t)(0u - ((uint32_t)(d) >> 7))))
+#define VLL_UNZZ(u) ((uint8_t)((uint32_t)((u) >> 1) ^ (uint32_t)(uint8_t)(0u - ((u) & 1u))))
+
+static void vll_residual(const uint8_t *restrict b, uint8_t *restrict u) {
+  u[0] = VLL_ZZ((uint8_t)(b[0] - 128u));
+  for (uint32_t x = 1; x < 16; x++) u[x] = VLL_ZZ((uint8_t)(b[x] - b[x - 1]));
+  for (uint32_t y = 1; y < 16; y++)
+    for (uint32_t x = 0; x < 16; x++)
+      u[y * 16 + x] = VLL_ZZ((uint8_t)(b[y * 16 + x] - b[(y - 1) * 16 + x]));
+  for (uint32_t z = 1; z < 16; z++)
+    for (uint32_t j = 0; j < 256; j++)
+      u[z * 256 + j] = VLL_ZZ((uint8_t)(b[z * 256 + j] - b[(z - 1) * 256 + j]));
+}
+/* inverse; u is consumed (unzigzagged in place) */
+static void vll_rebuild(uint8_t *restrict b, uint8_t *restrict u) {
+  for (uint32_t i = 0; i < VF_BLKV; i++) u[i] = VLL_UNZZ(u[i]);
+  b[0] = (uint8_t)(128u + u[0]);
+  for (uint32_t x = 1; x < 16; x++) b[x] = (uint8_t)(b[x - 1] + u[x]);
+  for (uint32_t y = 1; y < 16; y++)
+    for (uint32_t x = 0; x < 16; x++) b[y * 16 + x] = (uint8_t)(b[(y - 1) * 16 + x] + u[y * 16 + x]);
+  for (uint32_t z = 1; z < 16; z++)
+    for (uint32_t j = 0; j < 256; j++) b[z * 256 + j] = (uint8_t)(b[(z - 1) * 256 + j] + u[z * 256 + j]);
+}
+/* rough cost in bits of coding value u as a HybridUint token plus its bypass bits */
+static inline uint32_t vll_bits(uint32_t u) { return u < VLL_NLIT ? 4u : vf_highbit(u) + 5u; }
+/* DENSE context: the activity of the residual one z-plane back (0 in the first
+ * plane). Deliberately not the immediately preceding residual -- that would put
+ * a table selection on the entropy decoder's critical path; this value is known
+ * 256 symbols ahead and predicts just as well. */
+/* SPARSE contexts: a run following a run of zero (adjacent nonzero residuals,
+ * i.e. inside a busy region) has a very different distribution from one that
+ * follows a gap, and so does the level that goes with it. */
+static inline uint32_t vll_run_ctx(uint32_t prev_run) { return VLL_M_RUN + (prev_run == 0u ? 0u : 1u); }
+static inline uint32_t vll_lvls_ctx(uint32_t run) { return VLL_M_LVLS + (run == 0u ? 0u : 1u); }
+static inline uint32_t vll_dense_ctx(const uint8_t *u, uint32_t i) {
+  uint32_t a = i < 256u ? 0u : u[i - 256u];
+  return VLL_M_LVLD + (a == 0u ? 0u : (a <= 2u ? 1u : 2u));
+}
+
+/* ---- decoder ---- */
+typedef struct vll_parsed {
+  vf_model models[VLL_NMODELS];
+  uint32_t tok_n[VF_NSUB], byp_n[VF_NSUB], off[VF_NSUB + 1];
+  const uint8_t *payload;
+} vll_parsed;
+
+static volcomp_status vll_parse(const uint8_t *in, size_t n, vll_parsed *restrict p) {
+  vf_cur c = {in + VF_HDR_BYTES, in + n};
+  if (!vf_tables_read(&c, p->models, VLL_NMODELS)) return VOLCOMP_ERR_CORRUPT;
+  uint64_t sum = 0;
+  for (uint32_t s = 0; s < VF_NSUB; s++) {
+    uint32_t rn, bn;
+    if (!vf_leb_get(&c, &rn) || !vf_leb_get(&c, &bn)) return VOLCOMP_ERR_CORRUPT;
+    if (rn < 3u || rn > VLL_SUB_TOK_MAX || bn > VLL_SUB_BYP_MAX) return VOLCOMP_ERR_CORRUPT;
+    p->tok_n[s] = rn;
+    p->byp_n[s] = bn;
+    p->off[s] = (uint32_t)sum;
+    sum += (uint64_t)rn + bn;
+  }
+  p->off[VF_NSUB] = (uint32_t)sum;
+  if ((uint64_t)(c.end - c.p) != sum) return VOLCOMP_ERR_CORRUPT; /* exact accounting */
+  p->payload = c.p;
+  return VOLCOMP_OK;
+}
+
+/* Decode substream s. only_block < 0: scatter its 16 blocks into dst; else stop
+ * after absolute block only_block and write it into dst_block[4096]. */
+static volcomp_status vll_decode_sub(const vll_parsed *restrict p, uint32_t s, uint8_t *restrict dst,
+                                     int32_t only_block, uint8_t *restrict dst_block) {
+  const uint8_t *rb = p->payload + p->off[s];
+  vf_rdec rd;
+  if (!vf_rdec_init(&rd, rb, p->tok_n[s])) return VOLCOMP_ERR_CORRUPT;
+  vf_bitr br;
+  vf_br_init(&br, rb + p->tok_n[s], p->byp_n[s]);
+  uint8_t b[VF_BLKV], u[VF_BLKV];
+  for (uint32_t bi = s * VF_BLOCKS_PER_SUB; bi < (s + 1u) * VF_BLOCKS_PER_SUB; bi++) {
+    int t = vf_rdec_get(&rd, &p->models[VLL_M_MODE]);
+    if (t < 0 || (uint32_t)t > VLL_BM_RAW) return VOLCOMP_ERR_CORRUPT;
+    switch ((uint32_t)t) {
+      case VLL_BM_CONST: {
+        uint32_t v;
+        if (!vf_br_get(&br, 8, &v)) return VOLCOMP_ERR_CORRUPT;
+        memset(b, (int)v, VF_BLKV);
+        break;
+      }
+      case VLL_BM_RAW: {
+        for (uint32_t i = 0; i < VF_BLKV; i++) {
+          uint32_t v;
+          if (!vf_br_get(&br, 8, &v)) return VOLCOMP_ERR_CORRUPT;
+          b[i] = (uint8_t)v;
+        }
+        break;
+      }
+      case VLL_BM_SPARSE: {
+        memset(u, 0, VF_BLKV);
+        uint32_t pos = 0, prev_run = 1;
+        for (;;) {
+          int rt = vf_rdec_get(&rd, &p->models[vll_run_ctx(prev_run)]);
+          if (rt < 0) return VOLCOMP_ERR_CORRUPT;
+          if ((uint32_t)rt == VF_TOK_EOB) break;
+          if ((uint32_t)rt > VLL_TOKMAX_RUN) return VOLCOMP_ERR_CORRUPT;
+          uint32_t run;
+          if (!vll_hyb_read(&br, (uint32_t)rt, &run)) return VOLCOMP_ERR_CORRUPT;
+          if (pos >= VF_BLKV || run > VF_BLKV - 1u - pos) return VOLCOMP_ERR_CORRUPT;
+          pos += run;
+          prev_run = run;
+          int lt = vf_rdec_get(&rd, &p->models[vll_lvls_ctx(run)]);
+          if (lt < 0 || (uint32_t)lt > VLL_TOKMAX_LVL) return VOLCOMP_ERR_CORRUPT;
+          uint32_t uu;
+          if (!vll_hyb_read(&br, (uint32_t)lt, &uu)) return VOLCOMP_ERR_CORRUPT;
+          if (uu > 254u) return VOLCOMP_ERR_CORRUPT;
+          u[pos++] = (uint8_t)(uu + 1u);
+        }
+        vll_rebuild(b, u);
+        break;
+      }
+      default: { /* VLL_BM_DENSE */
+        for (uint32_t i = 0; i < VF_BLKV; i++) {
+          int lt = vf_rdec_get(&rd, &p->models[vll_dense_ctx(u, i)]);
+          if (lt < 0 || (uint32_t)lt > VLL_TOKMAX_LVL) return VOLCOMP_ERR_CORRUPT;
+          uint32_t uu;
+          if (!vll_hyb_read(&br, (uint32_t)lt, &uu)) return VOLCOMP_ERR_CORRUPT;
+          u[i] = (uint8_t)uu;
+        }
+        vll_rebuild(b, u);
+        break;
+      }
+    }
+    if (only_block >= 0) {
+      if ((uint32_t)only_block != bi) continue;
+      memcpy(dst_block, b, VF_BLKV);
+      return VOLCOMP_OK;
+    }
+    vll_scatter(dst, bi >> 6, (bi >> 3) & 7u, bi & 7u, b);
+  }
+  if (only_block >= 0) return VOLCOMP_ERR_ARG;
+  if (!vf_rdec_finished(&rd) || !vf_br_finished(&br)) return VOLCOMP_ERR_CORRUPT;
+  return VOLCOMP_OK;
+}
+
+/* ---- encoder ---- */
+typedef struct vll_enc {
+  uint16_t *toks;
+  uint8_t *byp;
+  size_t tok_off[VF_NSUB + 1], byp_off[VF_NSUB + 1];
+  uint32_t counts[VLL_NMODELS][VF_NTOK];
+} vll_enc;
+
+#define VLL_PUT(m, tk)                             \
+  do {                                             \
+    uint32_t m_ = (m), t_ = (tk);                  \
+    *tok++ = (uint16_t)(t_ | m_ << 8);             \
+    e->counts[m_][t_]++;                           \
+  } while (0)
+
+static bool vll_encode_block(vll_enc *restrict e, uint16_t **tp, vf_bitw *bw, const uint8_t *b) {
+  uint16_t *tok = *tp;
+  uint32_t v0 = b[0], i;
+  for (i = 1; i < VF_BLKV; i++)
+    if (b[i] != v0) break;
+  if (i == VF_BLKV) {
+    VLL_PUT(VLL_M_MODE, VLL_BM_CONST);
+    if (!vf_bw_put(bw, v0, 8)) return false;
+    *tp = tok;
+    return true;
+  }
+  uint8_t u[VF_BLKV];
+  vll_residual(b, u);
+  uint64_t cd = 0, cs = 8;
+  uint32_t nnz = 0;
+  for (i = 0; i < VF_BLKV; i++) {
+    uint32_t uu = u[i];
+    cd += vll_bits(uu);
+    if (uu) {
+      nnz++;
+      cs += vll_bits(uu - 1u) + 5u;
+    }
+  }
+  uint32_t mode = (nnz <= VLL_SPARSE_MAX_NNZ && cs < cd) ? VLL_BM_SPARSE : VLL_BM_DENSE;
+  if ((mode == VLL_BM_SPARSE ? cs : cd) >= (uint64_t)VF_BLKV * 8u) mode = VLL_BM_RAW;
+  VLL_PUT(VLL_M_MODE, mode);
+  if (mode == VLL_BM_RAW) {
+    for (i = 0; i < VF_BLKV; i++)
+      if (!vf_bw_put(bw, b[i], 8)) return false;
+  } else if (mode == VLL_BM_SPARSE) {
+    uint32_t pos = 0, prev_run = 1;
+    for (i = 0; i < VF_BLKV; i++) {
+      if (!u[i]) continue;
+      uint32_t t, run = i - pos;
+      if (!vll_hyb_emit(bw, run, &t)) return false;
+      VLL_PUT(vll_run_ctx(prev_run), t);
+      if (!vll_hyb_emit(bw, (uint32_t)u[i] - 1u, &t)) return false;
+      VLL_PUT(vll_lvls_ctx(run), t);
+      prev_run = run;
+      pos = i + 1u;
+    }
+    VLL_PUT(vll_run_ctx(prev_run), VF_TOK_EOB);
+  } else {
+    for (i = 0; i < VF_BLKV; i++) {
+      uint32_t t;
+      if (!vll_hyb_emit(bw, u[i], &t)) return false;
+      VLL_PUT(vll_dense_ctx(u, i), t);
+    }
+  }
+  *tp = tok;
+  return true;
+}
+#undef VLL_PUT
+
+static inline void vll_hdr(uint8_t *dst, uint32_t mode) {
+  dst[0] = 'V';
+  dst[1] = 'O';
+  dst[2] = 'L';
+  dst[3] = 'C';
+  dst[4] = VF_VERSION;
+  dst[5] = (uint8_t)mode;
+  vf_wr_u16(dst + 6, 0);
+}
+
+static volcomp_status vll_encode(const uint8_t *restrict src, uint8_t *restrict dst, size_t dst_cap,
+                                 size_t *out_n) {
+  { /* whole-chunk constant: 9 bytes */
+    size_t i = 1;
+    while (i < VOLCOMP_CHUNK_VOXELS && src[i] == src[0]) i++;
+    if (i == VOLCOMP_CHUNK_VOXELS) {
+      if (dst_cap < VF_HDR_BYTES + 1u) return VOLCOMP_ERR_SHORT_BUF;
+      vll_hdr(dst, VLL_MODE_CONST);
+      dst[VF_HDR_BYTES] = src[0];
+      *out_n = VF_HDR_BYTES + 1u;
+      return VOLCOMP_OK;
+    }
+  }
+  const size_t sz_toks = (size_t)VF_BLOCKS * VLL_BLK_TOK_MAX * sizeof(uint16_t);
+  const size_t sz_byp = (size_t)VLL_SUB_BYP_MAX * VF_NSUB;
+  const size_t sz_code = (size_t)VLL_SUB_TOK_MAX * VF_NSUB;
+  const size_t sz_es = sizeof(vf_etab) * VLL_NMODELS;
+  const size_t sz_fields = ((size_t)VF_BLOCKS_PER_SUB * VLL_BLK_TOK_MAX + 2u) * sizeof(uint32_t);
+  uint8_t *mem = (uint8_t *)VOLCOMP_MALLOC(sz_toks + sz_byp + sz_code + sz_es + sz_fields);
+  if (!mem) return VOLCOMP_ERR_NOMEM;
+  vll_enc e;
+  memset(e.counts, 0, sizeof e.counts);
+  e.toks = (uint16_t *)(void *)mem;
+  e.byp = mem + sz_toks;
+  uint8_t *code = e.byp + sz_byp;
+  vf_etab *es = (vf_etab *)(void *)(code + sz_code);
+  uint32_t *fields = (uint32_t *)(void *)(code + sz_code + sz_es);
+  volcomp_status st = VOLCOMP_ERR_CORRUPT; /* internal invariant failure */
+
+  /* phase A: residuals and tokens, substream by substream */
+  uint16_t *tp = e.toks;
+  size_t byp_pos = 0;
+  for (uint32_t s = 0; s < VF_NSUB; s++) {
+    e.tok_off[s] = (size_t)(tp - e.toks);
+    e.byp_off[s] = byp_pos;
+    vf_bitw bw;
+    vf_bw_init(&bw, e.byp + byp_pos, VLL_SUB_BYP_MAX);
+    for (uint32_t bi = s * VF_BLOCKS_PER_SUB; bi < (s + 1u) * VF_BLOCKS_PER_SUB; bi++) {
+      uint8_t b[VF_BLKV];
+      vll_gather(src, bi >> 6, (bi >> 3) & 7u, bi & 7u, b);
+      if (!vll_encode_block(&e, &tp, &bw, b)) goto out;
+    }
+    size_t bn;
+    if (!vf_bw_flush(&bw, &bn)) goto out;
+    byp_pos += bn;
+  }
+  e.tok_off[VF_NSUB] = (size_t)(tp - e.toks);
+  e.byp_off[VF_NSUB] = byp_pos;
+
+  /* phase B: models and tANS into the staging buffer; phase C: assemble */
+  {
+    vf_model models[VLL_NMODELS];
+    for (uint32_t m = 0; m < VLL_NMODELS; m++) {
+      bool any = false;
+      for (uint32_t t = 0; t < VF_NTOK; t++) any |= e.counts[m][t] != 0;
+      if (!any) e.counts[m][0] = 1; /* unused model: minimal valid table */
+      if (!vf_model_build(&models[m], e.counts[m])) goto out;
+    }
+    vf_etabs_init(models, es, VLL_NMODELS);
+    uint8_t tables[VF_TABLES_MAX_BYTES];
+    size_t tn = vf_tables_write(models, tables, VLL_NMODELS);
+    uint8_t dir[VF_NSUB * 10u];
+    size_t rn[VF_NSUB], dn = 0, body = 0;
+    for (uint32_t s = 0; s < VF_NSUB; s++) {
+      size_t ntok = e.tok_off[s + 1] - e.tok_off[s];
+      rn[s] = vf_tans_encode2(es, e.toks + e.tok_off[s], ntok, fields,
+                              code + (size_t)s * VLL_SUB_TOK_MAX, VLL_SUB_TOK_MAX);
+      if (rn[s] == 0) goto out;
+      size_t bn = e.byp_off[s + 1] - e.byp_off[s];
+      dn += vf_leb_put(dir + dn, (uint32_t)rn[s]);
+      dn += vf_leb_put(dir + dn, (uint32_t)bn);
+      body += rn[s] + bn;
+    }
+    size_t total = VF_HDR_BYTES + tn + dn + body;
+    if (total >= VOLCOMP_CHUNK_VOXELS + VF_HDR_BYTES) { /* incompressible: store raw */
+      if (dst_cap < VOLCOMP_CHUNK_VOXELS + VF_HDR_BYTES) {
+        st = VOLCOMP_ERR_SHORT_BUF;
+        goto out;
+      }
+      vll_hdr(dst, VLL_MODE_RAW);
+      memcpy(dst + VF_HDR_BYTES, src, VOLCOMP_CHUNK_VOXELS);
+      *out_n = VOLCOMP_CHUNK_VOXELS + VF_HDR_BYTES;
+      st = VOLCOMP_OK;
+      goto out;
+    }
+    if (dst_cap < total) {
+      st = VOLCOMP_ERR_SHORT_BUF;
+      goto out;
+    }
+    vll_hdr(dst, VLL_MODE_CODED);
+    memcpy(dst + VF_HDR_BYTES, tables, tn);
+    memcpy(dst + VF_HDR_BYTES + tn, dir, dn);
+    size_t pos = VF_HDR_BYTES + tn + dn;
+    for (uint32_t s = 0; s < VF_NSUB; s++) {
+      size_t bn = e.byp_off[s + 1] - e.byp_off[s];
+      memcpy(dst + pos, code + (size_t)s * VLL_SUB_TOK_MAX, rn[s]);
+      pos += rn[s];
+      memcpy(dst + pos, e.byp + e.byp_off[s], bn);
+      pos += bn;
+    }
+    if (pos != total) goto out;
+    *out_n = pos;
+    st = VOLCOMP_OK;
+  }
+out:
+  VOLCOMP_FREE(mem);
+  return st;
+}
+
+/* ======================= binary mask chunks (mode 4) =======================
+ * spec/format.md §11. The stored grid is 64^3 bits in z-major order (the 2x2x2
+ * majority pool of the source); each bit is coded with an LZMA-style binary
+ * range coder (12-bit probabilities, adaptation shift 5) under the context
+ * formed by its 12 causal neighbours
+ *   (0,0,-1) (0,-1,0) (-1,0,0) (0,-1,-1) (-1,0,-1) (-1,-1,0)
+ *   (0,0,-2) (0,-2,0) (-2,0,0) (0,-1,1)  (-1,0,1)  (-1,1,0)      [(dz,dy,dx)]
+ * (out of the grid = 0), bit j of the context being neighbour j of that list:
+ * 4096 contexts, 8 KB of state, L1 resident.
+ *
+ * Ten of the twelve neighbours lie in earlier ROWS, so they are gathered for a
+ * whole row in one straight-line pass (vmk_pre_row) and the coder loop only ORs
+ * in the two bits it has just coded itself; the gather never sits on the
+ * entropy coder's critical path.
+ *
+ * Decoding interpolates: output voxel j samples the grid at j/2, i.e. with
+ * weights 1 (j even) or 1/2, 1/2 (j odd, the upper neighbour clamped at the top
+ * edge), so the trilinear value is always k/8 for an integer k in 0..8 and the
+ * output is VMK_LUT[k] = round(255 k / 8). */
+static volcomp_status vll_chunk_mode(const void *restrict enc, size_t enc_n, uint32_t *mode);
+
+#define VMK_FORM_CODED 0u
+#define VMK_FORM_CONST 1u
+#define VMK_FORM_RAW 2u
+#define VMK_FORM_MAX 2u
+#define VMK_DIM VOLCOMP_MASK_DIM
+#define VMK_VOXELS VOLCOMP_MASK_VOXELS
+#define VMK_RAW_BYTES (VMK_VOXELS / 8u)
+/* mode 5 codes the chunk itself: the same model over a 128^3 grid */
+#define VMK_LL_DIM VOLCOMP_CHUNK_DIM
+#define VMK_LL_VOXELS VOLCOMP_CHUNK_VOXELS
+#define VMK_LL_RAW_BYTES (VMK_LL_VOXELS / 8u)
+#define VMK_MAX_DIM VMK_LL_DIM
+#define VMK_NCTX 4096u
+#define VMK_PROB_BITS 12u
+#define VMK_PROB_ONE (1u << VMK_PROB_BITS)
+#define VMK_PROB_INIT (VMK_PROB_ONE >> 1)
+#define VMK_TOP (1u << 24)
+/* Adaptation rate per context, by how many bits that context has already seen:
+ * p moves by 1/2, 1/2, 1/4, 1/4 then 1/8 of the way. A context here sees ~64
+ * bits per chunk at mode 4, so LZMA's fixed 1/32 never gets there — measured on
+ * the recto fixture, this schedule is 0.00564 bits per full-res voxel against
+ * 0.00734 for a fixed 1/32 and 0.0050 for an ideal two-pass model over the same
+ * contexts. VMK_NEXT saturates the age without a branch. */
+#define VMK_RATES 5u
+static const uint8_t VMK_SHIFT[VMK_RATES] = {1, 1, 2, 2, 3};
+static const uint8_t VMK_NEXT[VMK_RATES] = {1, 2, 3, 4, 4};
+#define VMK_HDR_BYTES (VF_HDR_BYTES + 1u) /* the 8-byte chunk header + the flags byte */
+
+static const uint8_t VMK_LUT[9] = {0, 32, 64, 96, 128, 159, 191, 223, 255};
+
+/* one adaptive binary probability (of a zero bit) and its age, per context.
+ * They stay in two arrays rather than one packed word: the probability is on the
+ * coder's critical path (load -> multiply -> compare -> next context) and the age
+ * is not, so splitting them keeps the unpacking off that path. */
+typedef struct vmk_model {
+  uint16_t p[VMK_NCTX];
+  uint8_t age[VMK_NCTX];
+} vmk_model;
+
+static inline void vmk_model_init(vmk_model *m) {
+  for (uint32_t i = 0; i < VMK_NCTX; i++) m->p[i] = VMK_PROB_INIT;
+  memset(m->age, 0, sizeof m->age);
+}
+static inline uint32_t vmk_shift(vmk_model *m, uint32_t c) {
+  uint32_t k = m->age[c];
+  m->age[c] = VMK_NEXT[k];
+  return VMK_SHIFT[k];
+}
+
+/* ---- range coder ---- */
+typedef struct vmk_rc_enc {
+  uint64_t low;
+  uint32_t range;
+  uint8_t cache;
+  uint64_t cache_size;
+  uint8_t *out;
+  size_t cap, n;
+  bool full; /* the output reached cap: the caller falls back to the raw form */
+} vmk_rc_enc;
+
+static inline void vmk_put(vmk_rc_enc *e, uint8_t b) {
+  if (e->n < e->cap)
+    e->out[e->n] = b;
+  else
+    e->full = true;
+  e->n++;
+}
+static inline void vmk_rc_enc_init(vmk_rc_enc *e, uint8_t *out, size_t cap) {
+  e->low = 0;
+  e->range = 0xFFFFFFFFu;
+  e->cache = 0;
+  e->cache_size = 1; /* the first byte out is this 0; the decoder checks and skips it */
+  e->out = out;
+  e->cap = cap;
+  e->n = 0;
+  e->full = false;
+}
+static void vmk_shift_low(vmk_rc_enc *e) {
+  if (e->low < 0xFF000000u || e->low > 0xFFFFFFFFu) {
+    uint8_t carry = (uint8_t)(e->low >> 32);
+    vmk_put(e, (uint8_t)(e->cache + carry));
+    while (--e->cache_size) vmk_put(e, (uint8_t)(0xFFu + carry));
+    e->cache = (uint8_t)(e->low >> 24);
+  }
+  e->cache_size++;
+  e->low = (e->low << 8) & 0xFFFFFFFFu;
+}
+__attribute__((always_inline)) static inline void vmk_enc_bit(vmk_rc_enc *e, vmk_model *m, uint32_t c,
+                                                              uint32_t bit) {
+  uint16_t *sp = &m->p[c];
+  uint32_t pr = *sp, sh = vmk_shift(m, c);
+  uint32_t bound = (e->range >> VMK_PROB_BITS) * pr;
+  if (!bit) {
+    e->range = bound;
+    pr += (VMK_PROB_ONE - pr) >> sh;
+  } else {
+    e->low += bound;
+    e->range -= bound;
+    pr -= pr >> sh;
+  }
+  *sp = (uint16_t)pr;
+  while (e->range < VMK_TOP) {
+    e->range <<= 8;
+    vmk_shift_low(e);
+  }
+}
+/* Five shifts push the whole low register out. The last of them always flushes
+ * (low is 0 by then), so exactly one byte is left in the cache and it is never
+ * emitted: the payload is then exactly as long as the decoder's reads (five to
+ * prime it, one per renormalisation), and truncation or trailing garbage is
+ * always detected. */
+static void vmk_rc_enc_finish(vmk_rc_enc *e) {
+  for (int i = 0; i < 5; i++) vmk_shift_low(e);
+}
+
+typedef struct vmk_rc_dec {
+  uint32_t range, code;
+  const uint8_t *in;
+  size_t n, pos;
+  bool over; /* a read past the end of the payload */
+} vmk_rc_dec;
+
+static inline uint8_t vmk_get(vmk_rc_dec *d) {
+  if (d->pos >= d->n) {
+    d->over = true;
+    return 0;
+  }
+  return d->in[d->pos++];
+}
+static inline bool vmk_rc_dec_init(vmk_rc_dec *d, const uint8_t *in, size_t n) {
+  d->in = in;
+  d->n = n;
+  d->pos = 0;
+  d->over = false;
+  d->range = 0xFFFFFFFFu;
+  d->code = 0;
+  if (n < 5 || in[0] != 0) return false; /* the encoder's first byte is always 0 */
+  d->pos = 1;
+  for (int i = 0; i < 4; i++) d->code = d->code << 8 | vmk_get(d);
+  return true;
+}
+__attribute__((always_inline)) static inline uint32_t vmk_dec_bit(vmk_rc_dec *d, vmk_model *m, uint32_t c) {
+  uint16_t *sp = &m->p[c];
+  uint32_t pr = *sp, sh = vmk_shift(m, c);
+  uint32_t bound = (d->range >> VMK_PROB_BITS) * pr, bit;
+  if (d->code < bound) {
+    d->range = bound;
+    pr += (VMK_PROB_ONE - pr) >> sh;
+    bit = 0;
+  } else {
+    d->code -= bound;
+    d->range -= bound;
+    pr -= pr >> sh;
+    bit = 1;
+  }
+  *sp = (uint16_t)pr;
+  while (d->range < VMK_TOP) {
+    d->range <<= 8;
+    d->code = d->code << 8 | vmk_get(d);
+  }
+  return bit;
+}
+
+/* ---- contexts ----
+ * row (z,y) of the stored grid, or a zero row when it is outside it */
+static inline const uint8_t *vmk_row(const uint8_t *g, const uint8_t *zero, int32_t z, int32_t y,
+                                     uint32_t dim) {
+  if (z < 0 || y < 0 || z >= (int32_t)dim || y >= (int32_t)dim) return zero;
+  return g + ((size_t)z * dim + (uint32_t)y) * dim;
+}
+/* The ten context bits of row (z,y) that come from earlier rows. `ap` and `bp`
+ * are scratch of dim + 2 bytes holding rows (z,y-1) and (z-1,y) with a zero
+ * at each end, so the +-1 x offsets need no edge test. */
+__attribute__((always_inline)) static inline void vmk_pre_row(const uint8_t *g, const uint8_t *zero,
+                                                             uint32_t z, uint32_t y, uint8_t *ap,
+                                                             uint8_t *bp, uint16_t *pre, uint32_t dim) {
+  const uint8_t *A = vmk_row(g, zero, (int32_t)z, (int32_t)y - 1, dim);
+  const uint8_t *B = vmk_row(g, zero, (int32_t)z - 1, (int32_t)y, dim);
+  const uint8_t *C = vmk_row(g, zero, (int32_t)z - 1, (int32_t)y - 1, dim);
+  const uint8_t *D = vmk_row(g, zero, (int32_t)z, (int32_t)y - 2, dim);
+  const uint8_t *E = vmk_row(g, zero, (int32_t)z - 2, (int32_t)y, dim);
+  const uint8_t *F = vmk_row(g, zero, (int32_t)z - 1, (int32_t)y + 1, dim);
+  ap[0] = bp[0] = ap[dim + 1] = bp[dim + 1] = 0;
+  memcpy(ap + 1, A, dim);
+  memcpy(bp + 1, B, dim);
+  for (uint32_t x = 0; x < dim; x++)
+    pre[x] = (uint16_t)((uint32_t)ap[x + 1] << 1 | (uint32_t)bp[x + 1] << 2 | (uint32_t)ap[x] << 3 |
+                        (uint32_t)bp[x] << 4 | (uint32_t)C[x] << 5 | (uint32_t)D[x] << 7 |
+                        (uint32_t)E[x] << 8 | (uint32_t)ap[x + 2] << 9 | (uint32_t)bp[x + 2] << 10 |
+                        (uint32_t)F[x] << 11);
+}
+
+/* ---- the 2x2x2 majority pool ---- */
+static void vmk_pool(const uint8_t *restrict src, uint8_t *restrict grid) {
+  const uint32_t C = VOLCOMP_CHUNK_DIM;
+  for (uint32_t z = 0; z < VMK_DIM; z++)
+    for (uint32_t y = 0; y < VMK_DIM; y++) {
+      const uint8_t *s00 = src + ((size_t)(2 * z) * C + 2 * y) * C, *s01 = s00 + C;
+      const uint8_t *s10 = s00 + (size_t)C * C, *s11 = s10 + C;
+      uint8_t *d = grid + ((size_t)z * VMK_DIM + y) * VMK_DIM;
+      for (uint32_t x = 0; x < VMK_DIM; x++) {
+        uint32_t c = (s00[2 * x] != 0) + (s00[2 * x + 1] != 0) + (s01[2 * x] != 0) + (s01[2 * x + 1] != 0) +
+                     (s10[2 * x] != 0) + (s10[2 * x + 1] != 0) + (s11[2 * x] != 0) + (s11[2 * x + 1] != 0);
+        d[x] = c >= 4u; /* count * 2 >= 8 */
+      }
+    }
+}
+
+/* ---- the interpolating upsample ----
+ * `plane` (128*128, values 0..4) is the x and y expansion of one stored plane:
+ * output row jy is the sum of stored rows jy/2 and (jy+1)/2 clamped, each x
+ * expanded the same way, so every value is twice a half-sum. */
+static void vmk_expand_plane(const uint8_t *restrict gp, uint8_t *restrict rx, uint8_t *restrict plane) {
+  const uint32_t C = VOLCOMP_CHUNK_DIM;
+  for (uint32_t iy = 0; iy < VMK_DIM; iy++) {
+    const uint8_t *g = gp + (size_t)iy * VMK_DIM;
+    uint8_t *r = rx + (size_t)iy * C;
+    for (uint32_t i = 0; i < VMK_DIM; i++) {
+      uint32_t hi = i + 1 < VMK_DIM ? i + 1 : i;
+      r[2 * i] = (uint8_t)(2u * g[i]);
+      r[2 * i + 1] = (uint8_t)(g[i] + g[hi]);
+    }
+  }
+  for (uint32_t jy = 0; jy < C; jy++) {
+    uint32_t i0 = jy >> 1, i1 = (jy & 1u) && i0 + 1 < VMK_DIM ? i0 + 1 : i0;
+    const uint8_t *a = rx + (size_t)i0 * C, *b = rx + (size_t)i1 * C;
+    uint8_t *o = plane + (size_t)jy * C;
+    for (uint32_t x = 0; x < C; x++) o[x] = (uint8_t)(a[x] + b[x]);
+  }
+}
+/* scratch for the upsample: two expanded planes plus the row buffer */
+#define VMK_UP_SCRATCH ((size_t)2u * VOLCOMP_CHUNK_DIM * VOLCOMP_CHUNK_DIM + (size_t)VMK_DIM * VOLCOMP_CHUNK_DIM)
+
+/* Output planes [jz0, jz1) of the interpolated 128^3 chunk, written to
+ * dst + (jz - jz0) * 128 * 128. */
+static void vmk_interp(const uint8_t *restrict grid, uint32_t jz0, uint32_t jz1, uint8_t *restrict dst,
+                       uint8_t *restrict scratch) {
+  const uint32_t C = VOLCOMP_CHUNK_DIM;
+  const size_t pl = (size_t)C * C;
+  uint8_t *pa = scratch, *pb = scratch + pl, *rx = scratch + 2 * pl;
+  uint32_t have_a = UINT32_MAX, have_b = UINT32_MAX;
+  for (uint32_t jz = jz0; jz < jz1; jz++) {
+    uint32_t i0 = jz >> 1, i1 = (jz & 1u) && i0 + 1 < VMK_DIM ? i0 + 1 : i0;
+    if (have_a != i0) {
+      if (have_b == i0) { /* the previous row's upper plane is this row's lower one */
+        uint8_t *t = pa;
+        pa = pb;
+        pb = t;
+        have_a = have_b;
+        have_b = UINT32_MAX;
+      } else {
+        vmk_expand_plane(grid + (size_t)i0 * VMK_DIM * VMK_DIM, rx, pa);
+        have_a = i0;
+      }
+    }
+    const uint8_t *b = pa;
+    if (i1 != i0) {
+      if (have_b != i1) {
+        vmk_expand_plane(grid + (size_t)i1 * VMK_DIM * VMK_DIM, rx, pb);
+        have_b = i1;
+      }
+      b = pb;
+    }
+    uint8_t *o = dst + (size_t)(jz - jz0) * pl;
+    for (size_t i = 0; i < pl; i++) o[i] = VMK_LUT[pa[i] + b[i]];
+  }
+}
+
+/* ---- the coded form ---- */
+__attribute__((always_inline)) static inline void vmk_code_grid_dim(uint8_t *restrict grid, vmk_rc_enc *e,
+                                                                    vmk_rc_dec *d, vmk_model *restrict m,
+                                                                    uint32_t dim) {
+  uint8_t zero[VMK_MAX_DIM] = {0}, ap[VMK_MAX_DIM + 2], bp[VMK_MAX_DIM + 2];
+  uint16_t pre[VMK_MAX_DIM];
+  vmk_model_init(m);
+  for (uint32_t z = 0; z < dim; z++)
+    for (uint32_t y = 0; y < dim; y++) {
+      vmk_pre_row(grid, zero, z, y, ap, bp, pre, dim);
+      uint8_t *row = grid + ((size_t)z * dim + y) * dim;
+      uint32_t c1 = 0, c2 = 0;
+      if (e) {
+        for (uint32_t x = 0; x < dim; x++) {
+          uint32_t b = row[x];
+          vmk_enc_bit(e, m, pre[x] | c1 | c2 << 6, b);
+          c2 = c1;
+          c1 = b;
+        }
+        if (e->full) return;
+      } else {
+        for (uint32_t x = 0; x < dim; x++) {
+          uint32_t b = vmk_dec_bit(d, m, pre[x] | c1 | c2 << 6);
+          row[x] = (uint8_t)b;
+          c2 = c1;
+          c1 = b;
+        }
+        if (d->over) return;
+      }
+    }
+}
+/* two instantiations, so the row loops see a constant edge */
+__attribute__((noinline)) static void vmk_code_grid64(uint8_t *restrict grid, vmk_rc_enc *e, vmk_rc_dec *d,
+                                                      vmk_model *restrict m) {
+  vmk_code_grid_dim(grid, e, d, m, VMK_DIM);
+}
+__attribute__((noinline)) static void vmk_code_grid128(uint8_t *restrict grid, vmk_rc_enc *e, vmk_rc_dec *d,
+                                                       vmk_model *restrict m) {
+  vmk_code_grid_dim(grid, e, d, m, VMK_LL_DIM);
+}
+static inline void vmk_code_grid(uint8_t *restrict grid, vmk_rc_enc *e, vmk_rc_dec *d,
+                                 vmk_model *restrict m, uint32_t dim) {
+  if (dim == VMK_DIM)
+    vmk_code_grid64(grid, e, d, m);
+  else
+    vmk_code_grid128(grid, e, d, m);
+}
+
+/* ---- stream ---- */
+typedef struct vmk_parsed {
+  uint32_t form;
+  uint32_t dim;      /* stored grid edge: 64 (mode 4) or 128 (mode 5) */
+  size_t voxels;     /* dim^3 */
+  size_t raw_bytes;  /* voxels / 8 */
+  bool lossless;     /* mode 5: the grid IS the chunk */
+  const uint8_t *payload;
+  size_t payload_n;
+  uint8_t value; /* VMK_FORM_CONST: 0 or 1 */
+} vmk_parsed;
+
+static volcomp_status vmk_parse(const void *restrict enc, size_t enc_n, vmk_parsed *p) {
+  const uint8_t *in = (const uint8_t *)enc;
+  uint32_t mode;
+  volcomp_status st = vll_chunk_mode(enc, enc_n, &mode);
+  if (st != VOLCOMP_OK) return st;
+  if (mode != VLL_MODE_MASK && mode != VLL_MODE_MASK_LL) return VOLCOMP_ERR_ARG;
+  if (enc_n < VMK_HDR_BYTES) return VOLCOMP_ERR_CORRUPT;
+  p->lossless = mode == VLL_MODE_MASK_LL;
+  p->dim = p->lossless ? VMK_LL_DIM : VMK_DIM;
+  p->voxels = p->lossless ? VMK_LL_VOXELS : VMK_VOXELS;
+  p->raw_bytes = p->voxels / 8u;
+  uint32_t flags = in[VF_HDR_BYTES];
+  if (flags >> 2) return VOLCOMP_ERR_CORRUPT; /* reserved bits */
+  p->form = flags & 3u;
+  if (p->form > VMK_FORM_MAX) return VOLCOMP_ERR_CORRUPT;
+  p->payload = in + VMK_HDR_BYTES;
+  p->payload_n = enc_n - VMK_HDR_BYTES;
+  p->value = 0;
+  if (p->form == VMK_FORM_CONST) {
+    if (p->payload_n != 1 || p->payload[0] > 1) return VOLCOMP_ERR_CORRUPT;
+    p->value = p->payload[0];
+  } else if (p->form == VMK_FORM_RAW) {
+    if (p->payload_n != p->raw_bytes) return VOLCOMP_ERR_CORRUPT;
+  } else if (p->payload_n < 5) {
+    return VOLCOMP_ERR_CORRUPT;
+  }
+  return VOLCOMP_OK;
+}
+
+/* the stored grid as 0/1 bytes, into `grid` (p->voxels bytes) */
+static volcomp_status vmk_decode_grid(const vmk_parsed *p, uint8_t *restrict grid, vmk_model *restrict m) {
+  if (p->form == VMK_FORM_CONST) {
+    memset(grid, p->value, p->voxels);
+    return VOLCOMP_OK;
+  }
+  if (p->form == VMK_FORM_RAW) {
+    for (size_t i = 0; i < p->voxels; i++) grid[i] = p->payload[i >> 3] >> (i & 7u) & 1u;
+    return VOLCOMP_OK;
+  }
+  vmk_rc_dec d;
+  if (!vmk_rc_dec_init(&d, p->payload, p->payload_n)) return VOLCOMP_ERR_CORRUPT;
+  vmk_code_grid(grid, NULL, &d, m, p->dim);
+  if (d.over || d.pos != d.n) return VOLCOMP_ERR_CORRUPT;
+  return VOLCOMP_OK;
+}
+
+/* Emit a 0/1 grid of `dim`^3 cells under `mode`: CONST if it is uniform, else the
+ * coded form when it beats the raw one, else RAW. `grid` is scratch the coder
+ * reads in place. */
+static volcomp_status vmk_emit(uint8_t *restrict grid, uint32_t dim, uint32_t mode, uint8_t *restrict dst,
+                               size_t dst_cap, size_t *out_n, vmk_model *model) {
+  const size_t voxels = (size_t)dim * dim * dim, raw_bytes = voxels / 8u;
+  size_t i = 1;
+  while (i < voxels && grid[i] == grid[0]) i++;
+  if (i == voxels) { /* a uniform grid is one byte */
+    if (dst_cap < VMK_HDR_BYTES + 1u) return VOLCOMP_ERR_SHORT_BUF;
+    vll_hdr(dst, mode);
+    dst[VF_HDR_BYTES] = (uint8_t)VMK_FORM_CONST;
+    dst[VMK_HDR_BYTES] = grid[0];
+    *out_n = VMK_HDR_BYTES + 1u;
+    return VOLCOMP_OK;
+  }
+  if (dst_cap > VMK_HDR_BYTES) {
+    /* code it, but never past the raw form's size: whichever is smaller wins */
+    size_t cap = dst_cap - VMK_HDR_BYTES;
+    if (cap > raw_bytes) cap = raw_bytes;
+    vmk_rc_enc e;
+    vmk_rc_enc_init(&e, dst + VMK_HDR_BYTES, cap);
+    vmk_code_grid(grid, &e, NULL, model, dim);
+    if (!e.full) {
+      vmk_rc_enc_finish(&e);
+      if (!e.full) {
+        vll_hdr(dst, mode);
+        dst[VF_HDR_BYTES] = (uint8_t)VMK_FORM_CODED;
+        *out_n = VMK_HDR_BYTES + e.n;
+        return VOLCOMP_OK;
+      }
+    }
+  }
+  if (dst_cap < VMK_HDR_BYTES + raw_bytes) return VOLCOMP_ERR_SHORT_BUF;
+  vll_hdr(dst, mode);
+  dst[VF_HDR_BYTES] = (uint8_t)VMK_FORM_RAW;
+  memset(dst + VMK_HDR_BYTES, 0, raw_bytes);
+  for (size_t k = 0; k < voxels; k++)
+    if (grid[k]) dst[VMK_HDR_BYTES + (k >> 3)] |= (uint8_t)(1u << (k & 7u));
+  *out_n = VMK_HDR_BYTES + raw_bytes;
+  return VOLCOMP_OK;
+}
+
+static inline volcomp_status volcomp_mask_encode(const uint8_t *restrict src_zyx, void *restrict dst_v,
+                                                 size_t dst_cap, size_t *out_n) {
   if (!src_zyx || !dst_v || !out_n) return VOLCOMP_ERR_ARG;
-  if (!(q >= VOLCOMP_Q_MIN && q <= VOLCOMP_Q_MAX)) return VOLCOMP_ERR_ARG;
   *out_n = 0;
-  uint8_t *dst = (uint8_t *)dst_v;
+  uint8_t *grid = (uint8_t *)VOLCOMP_MALLOC(VMK_VOXELS + sizeof(vmk_model));
+  if (!grid) return VOLCOMP_ERR_NOMEM;
+  vmk_model *model = (vmk_model *)(void *)(grid + VMK_VOXELS);
+  vmk_pool(src_zyx, grid);
+  volcomp_status st = vmk_emit(grid, VMK_DIM, VLL_MODE_MASK, (uint8_t *)dst_v, dst_cap, out_n, model);
+  VOLCOMP_FREE(grid);
+  return st;
+}
+
+static inline volcomp_status volcomp_mask_encode_lossless(const uint8_t *restrict src_zyx,
+                                                          void *restrict dst_v, size_t dst_cap,
+                                                          size_t *out_n) {
+  if (!src_zyx || !dst_v || !out_n) return VOLCOMP_ERR_ARG;
+  *out_n = 0;
+  uint8_t *grid = (uint8_t *)VOLCOMP_MALLOC(VMK_LL_VOXELS + sizeof(vmk_model));
+  if (!grid) return VOLCOMP_ERR_NOMEM;
+  vmk_model *model = (vmk_model *)(void *)(grid + VMK_LL_VOXELS);
+  for (size_t i = 0; i < VMK_LL_VOXELS; i++) grid[i] = src_zyx[i] != 0;
+  volcomp_status st = vmk_emit(grid, VMK_LL_DIM, VLL_MODE_MASK_LL, (uint8_t *)dst_v, dst_cap, out_n, model);
+  VOLCOMP_FREE(grid);
+  return st;
+}
+
+static inline volcomp_status volcomp_mask_info(const void *restrict enc, size_t enc_n, uint32_t *out_dim) {
+  if (!enc) return VOLCOMP_ERR_ARG;
+  vmk_parsed p;
+  volcomp_status st = vmk_parse(enc, enc_n, &p);
+  if (st != VOLCOMP_OK) return st;
+  if (out_dim) *out_dim = p.dim;
+  return VOLCOMP_OK;
+}
+
+static inline volcomp_status volcomp_mask_decode_stored(const void *restrict enc, size_t enc_n,
+                                                        uint8_t *restrict dst, size_t dst_cap) {
+  if (!enc || !dst) return VOLCOMP_ERR_ARG;
+  vmk_parsed p;
+  volcomp_status st = vmk_parse(enc, enc_n, &p);
+  if (st != VOLCOMP_OK) return st;
+  if (dst_cap < p.voxels) return VOLCOMP_ERR_SHORT_BUF;
+  vmk_model *m = (vmk_model *)VOLCOMP_MALLOC(sizeof(vmk_model));
+  if (!m) return VOLCOMP_ERR_NOMEM;
+  st = vmk_decode_grid(&p, dst, m);
+  VOLCOMP_FREE(m);
+  if (st != VOLCOMP_OK) return st;
+  for (size_t i = 0; i < p.voxels; i++) dst[i] = dst[i] ? 255u : 0u;
+  return VOLCOMP_OK;
+}
+
+/* Decode a mask chunk. jz0/jz1 select the output planes: the whole chunk
+ * (0, 128) for volcomp_decode, one block's 16 for volcomp_decode_block. `dst`
+ * holds jz1 - jz0 planes of 128*128. Mode 4 interpolates the 64^3 grid; mode 5
+ * stores those planes already and only maps 0/1 to 0/255. */
+static volcomp_status vmk_decode_planes(const void *restrict enc, size_t enc_n, uint32_t jz0, uint32_t jz1,
+                                        uint8_t *restrict dst) {
+  vmk_parsed p;
+  volcomp_status st = vmk_parse(enc, enc_n, &p);
+  if (st != VOLCOMP_OK) return st;
+  const size_t scratch_n = p.lossless ? 0u : VMK_UP_SCRATCH;
+  uint8_t *mem = (uint8_t *)VOLCOMP_MALLOC(p.voxels + scratch_n + sizeof(vmk_model));
+  if (!mem) return VOLCOMP_ERR_NOMEM;
+  uint8_t *grid = mem, *scratch = mem + p.voxels;
+  vmk_model *m = (vmk_model *)(void *)(scratch + scratch_n);
+  st = vmk_decode_grid(&p, grid, m);
+  if (st == VOLCOMP_OK) {
+    if (p.lossless) {
+      const size_t pl = (size_t)VOLCOMP_CHUNK_DIM * VOLCOMP_CHUNK_DIM;
+      const uint8_t *g = grid + (size_t)jz0 * pl;
+      size_t n = (size_t)(jz1 - jz0) * pl;
+      for (size_t i = 0; i < n; i++) dst[i] = g[i] ? 255u : 0u;
+    } else {
+      vmk_interp(grid, jz0, jz1, dst, scratch);
+    }
+  }
+  VOLCOMP_FREE(mem);
+  return st;
+}
+
+/* flat: every AC step is q (the surface chunk's base, §13.1) instead of q (1+r)^0.65 */
+static volcomp_status vf_encode_lossy(const uint8_t *restrict src_zyx, float q, bool flat, uint8_t *restrict dst,
+                                      size_t dst_cap, size_t *out_n) {
   const uint32_t qraw = vf_q_raw(q);
   const float qe = (float)qraw * (1.0f / 256.0f); /* exactly what the decoder sees */
 
@@ -1877,7 +3093,10 @@ static inline volcomp_status volcomp_encode(const uint8_t *restrict src_zyx, flo
   uint32_t *fields = (uint32_t *)(void *)(e.stage + sz_stage + sz_rstep + sz_es);
   {
     float step[VF_NRADII], inv[VF_NRADII];
-    vf_steps(qe, step);
+    if (flat)
+      vf_steps_flat(qe, step);
+    else
+      vf_steps(qe, step);
     for (uint32_t r = 0; r < VF_NRADII; r++) inv[r] = 1.0f / step[r];
     for (uint32_t c = 0; c < VF_BLKV; c++) e.rstep[c] = inv[vf_radius(c)] * vf_dct_scale(c);
   }
@@ -1914,9 +3133,9 @@ static inline volcomp_status volcomp_encode(const uint8_t *restrict src_zyx, flo
       if (!any) e.counts[m][0] = 1; /* unused model: minimal valid table */
       if (!vf_model_build(&models[m], e.counts[m])) goto out;
     }
-    vf_etabs_init(models, es);
+    vf_etabs_init(models, es, VF_NMODELS);
     uint8_t tables[VF_TABLES_MAX_BYTES];
-    size_t tn = vf_tables_write(models, tables);
+    size_t tn = vf_tables_write(models, tables, VF_NMODELS);
     size_t pos = VF_HDR_BYTES + tn + VF_DIR_BYTES;
     if (dst_cap < pos) {
       st = VOLCOMP_ERR_SHORT_BUF;
@@ -1927,7 +3146,7 @@ static inline volcomp_status volcomp_encode(const uint8_t *restrict src_zyx, flo
     dst[2] = 'L';
     dst[3] = 'C';
     dst[4] = VF_VERSION;
-    dst[5] = 0;
+    dst[5] = (uint8_t)VLL_MODE_LOSSY;
     vf_wr_u16(dst + 6, qraw);
     memcpy(dst + VF_HDR_BYTES, tables, tn);
     uint8_t *dir = dst + VF_HDR_BYTES + tn;
@@ -1955,12 +3174,429 @@ out:
   return st;
 }
 
+/* ======================= surface chunks (mode 6) ==========================
+ * spec/format.md §13. A surface chunk is a smooth probability field stored as
+ *
+ *   base        a DCT stream body (§2..§5, the layout mode 0 writes after its
+ *               header) with a FLAT step law — every AC step q, DC q/8 —
+ *               reconstructed BIT-EXACTLY (§13.2: vf_parse_body(strict),
+ *               vf_dct16_inv_strict);
+ *   refinement  one context-coded bit for every voxel whose base value lies
+ *               within M/2 of the threshold: "does this voxel sit on the wrong
+ *               side of thr?". A flipped voxel decodes to thr (source >= thr)
+ *               or thr - 1 (source < thr).
+ *
+ * so that `source >= thr` equals `decoded >= thr` for EVERY voxel: the
+ * thresholded mask is exact (dice 1, identical skeleton and distance field),
+ * and the soft values carry the DCT's error at q. The refinement is cheap
+ * because the base is already right almost everywhere and the bit's context
+ * knows how close the base came (|2d - (2thr - 1)|, six classes), which of six
+ * causal neighbours already ended up on the other side, how many of the three
+ * forward face neighbours sit there in the base, and the base side itself —
+ * 3072 contexts, the mask coder's range coder, probabilities adapting at 1/2,
+ * 1/2, 1/4, 1/4, 1/8, 1/8 then 1/16 and clamped to [16, 4080] / 4096.
+ *
+ * The contexts read the base's reconstruction, which is why that has to be
+ * bit-exact: a decoder on another build seeing one base value off by one LSB
+ * would pick a different context and lose sync. */
+#define VSF_HDR_BYTES 16u
+#define VSF_LAW_FLAT 1u /* header byte 9: the base's step law; revision 4 defines only 1, flat */
+#define VSF_DCLS 6u
+#define VSF_NCTX (VSF_DCLS * 64u * 4u * 2u) /* voxel contexts; the far flags use 8 more */
+#define VSF_NEAR 31u     /* candidates with dd <= 31 are always coded */
+#define VSF_FAR_BLOCK 8u /* the rest only inside flagged 8^3 blocks */
+#define VSF_PMIN 16u
+#define VSF_PMAX (VMK_PROB_ONE - 16u)
+#define VSF_AGE_MAX 6u /* shift = 1 + age / 2: 1, 1, 2, 2, 3, 3, then 4 */
+#define VSF_M_MAX 509u /* |2d - (2thr - 1)| <= 2*255 - 1 */
+
+typedef struct vsf_model {
+  uint16_t p[VSF_NCTX + 8u];
+  uint8_t age[VSF_NCTX + 8u];
+} vsf_model;
+
+static inline void vsf_model_init(vsf_model *m) {
+  for (uint32_t i = 0; i < VSF_NCTX + 8u; i++) m->p[i] = VMK_PROB_INIT;
+  memset(m->age, 0, sizeof m->age);
+}
+static inline uint32_t vsf_shift(vsf_model *m, uint32_t c) {
+  uint32_t a = m->age[c];
+  if (a < VSF_AGE_MAX) m->age[c] = (uint8_t)(a + 1u);
+  return 1u + (a >> 1);
+}
+static inline uint32_t vsf_clamp_p(uint32_t p) { return p < VSF_PMIN ? VSF_PMIN : (p > VSF_PMAX ? VSF_PMAX : p); }
+__attribute__((always_inline)) static inline void vsf_enc_bit(vmk_rc_enc *e, vsf_model *m, uint32_t c,
+                                                              uint32_t bit) {
+  uint32_t pr = m->p[c], sh = vsf_shift(m, c);
+  uint32_t bound = (e->range >> VMK_PROB_BITS) * pr;
+  if (!bit) {
+    e->range = bound;
+    pr += (VMK_PROB_ONE - pr) >> sh;
+  } else {
+    e->low += bound;
+    e->range -= bound;
+    pr -= pr >> sh;
+  }
+  m->p[c] = (uint16_t)vsf_clamp_p(pr);
+  while (e->range < VMK_TOP) {
+    e->range <<= 8;
+    vmk_shift_low(e);
+  }
+}
+__attribute__((always_inline)) static inline uint32_t vsf_dec_bit(vmk_rc_dec *d, vsf_model *m, uint32_t c) {
+  uint32_t pr = m->p[c], sh = vsf_shift(m, c);
+  uint32_t bound = (d->range >> VMK_PROB_BITS) * pr, bit;
+  if (d->code < bound) {
+    d->range = bound;
+    pr += (VMK_PROB_ONE - pr) >> sh;
+    bit = 0;
+  } else {
+    d->code -= bound;
+    d->range -= bound;
+    pr -= pr >> sh;
+    bit = 1;
+  }
+  m->p[c] = (uint16_t)vsf_clamp_p(pr);
+  while (d->range < VMK_TOP) {
+    d->range <<= 8;
+    d->code = d->code << 8 | vmk_get(d);
+  }
+  return bit;
+}
+static inline uint32_t vsf_dcls(uint32_t dd) {
+  return dd <= 1u ? 0u : dd <= 3u ? 1u : dd <= 7u ? 2u : dd <= 15u ? 3u : dd <= 31u ? 4u : 5u;
+}
+
+/* bit x of out[x >> 6] set iff lo <= row[x] <= hi, for a 128-voxel row
+ * (the candidate scan; integer, so both versions agree exactly) */
+static inline void vsf_rowmask_c(const uint8_t *row, uint32_t lo, uint32_t hi, uint64_t out[2]) {
+  const uint32_t w = hi - lo;
+  for (uint32_t h = 0; h < 2; h++) {
+    uint64_t m = 0;
+    for (uint32_t x = 0; x < 64; x++) m |= (uint64_t)((uint32_t)(uint8_t)(row[h * 64 + x] - lo) <= w) << x;
+    out[h] = m;
+  }
+}
+#if VF_HAVE_AVX2
+VF_TARGET_AVX2 static inline void vsf_rowmask_avx2(const uint8_t *row, uint32_t lo, uint32_t hi, uint64_t out[2]) {
+  const __m256i l = _mm256_set1_epi8((char)lo), w = _mm256_set1_epi8((char)(hi - lo));
+  for (uint32_t h = 0; h < 2; h++) {
+    uint64_t m = 0;
+    for (uint32_t k = 0; k < 2; k++) {
+      __m256i d = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *)(const void *)(row + h * 64 + k * 32)), l);
+      __m256i in = _mm256_cmpeq_epi8(_mm256_min_epu8(d, w), d);
+      m |= (uint64_t)(uint32_t)_mm256_movemask_epi8(in) << (32 * k);
+    }
+    out[h] = m;
+  }
+}
+#endif
+static inline void vsf_rowmask(const uint8_t *row, uint32_t lo, uint32_t hi, uint64_t out[2]) {
+#if VF_HAVE_AVX2
+  if (vf_use_avx2()) {
+    vsf_rowmask_avx2(row, lo, hi, out);
+    return;
+  }
+#endif
+  vsf_rowmask_c(row, lo, hi, out);
+}
+
+/* The refinement pass over `v` (the base reconstruction, updated in place: a
+ * flipped voxel becomes thr or thr - 1, so v[j] >= thr is the FINAL side of an
+ * already visited voxel j and the BASE side of a later one). Encodes when e is
+ * set (src gives the truth), decodes otherwise. Neighbours outside the chunk
+ * are the voxel itself, i.e. agree with it.
+ *
+ * Candidates with dd <= VSF_NEAR are always coded. Those further out (dd up to
+ * M) rarely flip but are most of the candidates, so they are coded only inside
+ * the 8^3 blocks whose flag — coded first, one per block holding such a
+ * candidate — says the block has a far flip: 2.3-3.3x fewer coded bits for 2-4 %
+ * fewer bytes than coding every candidate (docs/surface_mode.md). */
+static void vsf_refine(uint8_t *restrict v, const uint8_t *restrict src, uint32_t thr, uint32_t M,
+                       vmk_rc_enc *e, vmk_rc_dec *d, vsf_model *restrict m) {
+  const uint32_t C = VOLCOMP_CHUNK_DIM, T2 = 2u * thr - 1u, NB = C / VSF_FAR_BLOCK;
+  const size_t PL = (size_t)C * C;
+  uint8_t kind[256], dcl[256]; /* per base value: 0 not a candidate, 1 near, 2 far; distance class */
+  for (uint32_t val = 0; val < 256; val++) {
+    const uint32_t dd = 2u * val > T2 ? 2u * val - T2 : T2 - 2u * val;
+    kind[val] = (uint8_t)(dd > M ? 0u : dd <= VSF_NEAR ? 1u : 2u);
+    dcl[val] = (uint8_t)vsf_dcls(dd);
+  }
+  vsf_model_init(m);
+  uint8_t flag[(VOLCOMP_CHUNK_DIM / VSF_FAR_BLOCK) * (VOLCOMP_CHUNK_DIM / VSF_FAR_BLOCK) *
+               (VOLCOMP_CHUNK_DIM / VSF_FAR_BLOCK)];
+  memset(flag, 0, sizeof flag);
+  if (M > VSF_NEAR) /* the far flags, block raster order, before any voxel */
+    for (uint32_t bz = 0; bz < NB; bz++)
+      for (uint32_t by = 0; by < NB; by++)
+        for (uint32_t bx = 0; bx < NB; bx++) {
+          uint32_t any = 0, hit = 0;
+          for (uint32_t z = bz * VSF_FAR_BLOCK; z < (bz + 1) * VSF_FAR_BLOCK; z++)
+            for (uint32_t y = by * VSF_FAR_BLOCK; y < (by + 1) * VSF_FAR_BLOCK; y++) {
+              const size_t row = ((size_t)z * C + y) * C + bx * VSF_FAR_BLOCK;
+              for (uint32_t x = 0; x < VSF_FAR_BLOCK; x++)
+                if (kind[v[row + x]] == 2u) {
+                  any = 1;
+                  if (src && (src[row + x] >= thr) != (v[row + x] >= thr)) hit = 1;
+                }
+            }
+          if (!any) continue;
+          const size_t bi = ((size_t)bz * NB + by) * NB + bx;
+          const uint32_t c = VSF_NCTX + (uint32_t)(bz ? flag[bi - NB * NB] : 0) +
+                             2u * (uint32_t)(by ? flag[bi - NB] : 0) + 4u * (uint32_t)(bx ? flag[bi - 1] : 0);
+          if (e)
+            vsf_enc_bit(e, m, c, hit);
+          else
+            hit = vsf_dec_bit(d, m, c);
+          flag[bi] = (uint8_t)hit;
+        }
+  /* candidates: dd <= M is v in [lo, hi]; near ones (dd <= VSF_NEAR) v in [nlo, nhi] */
+  const uint32_t Mn = M < VSF_NEAR ? M : VSF_NEAR;
+  const uint32_t lo = T2 > M ? (T2 - M) / 2u : 0u, hi = (T2 + M) / 2u > 255u ? 255u : (T2 + M) / 2u;
+  const uint32_t nlo = T2 > Mn ? (T2 - Mn) / 2u : 0u, nhi = (T2 + Mn) / 2u > 255u ? 255u : (T2 + Mn) / 2u;
+  for (uint32_t z = 0; z < C; z++)
+    for (uint32_t y = 0; y < C; y++) {
+      const size_t row = ((size_t)z * C + y) * C;
+      uint64_t all[2], near[2], far[2] = {0, 0};
+      vsf_rowmask(v + row, lo, hi, all);
+      if (!(all[0] | all[1])) continue;
+      vsf_rowmask(v + row, nlo, nhi, near);
+      const uint8_t *fr = flag + ((size_t)(z / VSF_FAR_BLOCK) * NB + y / VSF_FAR_BLOCK) * NB;
+      for (uint32_t g = 0; g < NB; g++)
+        if (fr[g]) far[g / 8u] |= (uint64_t)0xFFu << (8u * (g % 8u));
+      const ptrdiff_t dz = z ? -(ptrdiff_t)PL : 0, dy = y ? -(ptrdiff_t)C : 0;
+      const ptrdiff_t pz = z + 1 < C ? (ptrdiff_t)PL : 0, py = y + 1 < C ? (ptrdiff_t)C : 0;
+      for (uint32_t h = 0; h < 2; h++)
+        for (uint64_t bits = all[h] & (near[h] | far[h]); bits; bits &= bits - 1u) {
+          const uint32_t x = h * 64u + (uint32_t)__builtin_ctzll(bits);
+          const size_t i = row + x;
+          const uint32_t dv = v[i];
+          const uint32_t s = dv >= thr;
+          const ptrdiff_t dx = x ? -1 : 0, px = x + 1 < C ? 1 : 0;
+          const uint8_t *q = v + i;
+          const uint32_t pat = (uint32_t)((q[dx] >= thr) != s) | (uint32_t)((q[dy] >= thr) != s) << 1 |
+                               (uint32_t)((q[dz] >= thr) != s) << 2 | (uint32_t)((q[dy + dx] >= thr) != s) << 3 |
+                               (uint32_t)((q[dz + dx] >= thr) != s) << 4 | (uint32_t)((q[dz + dy] >= thr) != s) << 5;
+          const uint32_t b = (uint32_t)((q[px] >= thr) != s) + (uint32_t)((q[py] >= thr) != s) +
+                             (uint32_t)((q[pz] >= thr) != s);
+          const uint32_t c = (((uint32_t)dcl[dv] * 64u + pat) * 4u + b) * 2u + s;
+          uint32_t f;
+          if (e) {
+            f = (uint32_t)(src[i] >= thr) != s;
+            vsf_enc_bit(e, m, c, f);
+          } else {
+            f = vsf_dec_bit(d, m, c);
+          }
+          if (f) v[i] = (uint8_t)(s ? thr - 1u : thr);
+        }
+      if (e ? e->full : d->over) return;
+    }
+}
+
+typedef struct vsf_parsed {
+  uint32_t qraw, thr, margin;
+  const uint8_t *base, *refine;
+  size_t base_n, refine_n;
+} vsf_parsed;
+
+static volcomp_status vsf_parse(const void *restrict enc, size_t enc_n, vsf_parsed *p) {
+  const uint8_t *in = (const uint8_t *)enc;
+  uint32_t mode;
+  volcomp_status st = vll_chunk_mode(enc, enc_n, &mode);
+  if (st != VOLCOMP_OK) return st;
+  if (mode != VLL_MODE_SURFACE) return VOLCOMP_ERR_ARG;
+  if (enc_n < VSF_HDR_BYTES) return VOLCOMP_ERR_CORRUPT;
+  p->qraw = vf_rd_u16(in + 6);
+  p->thr = in[8];
+  p->margin = vf_rd_u16(in + 10);
+  if (p->qraw < 2u * VF_Q_RAW_MIN || p->qraw > VF_Q_RAW_MAX) return VOLCOMP_ERR_CORRUPT;
+  if (p->thr == 0 || in[9] != VSF_LAW_FLAT) return VOLCOMP_ERR_CORRUPT;
+  if (p->margin > VSF_M_MAX || (p->margin && !(p->margin & 1u))) return VOLCOMP_ERR_CORRUPT;
+  uint32_t bn = vf_rd_u32(in + 12);
+  if (bn > enc_n - VSF_HDR_BYTES) return VOLCOMP_ERR_CORRUPT;
+  p->base = in + VSF_HDR_BYTES;
+  p->base_n = bn;
+  p->refine = p->base + bn;
+  p->refine_n = enc_n - VSF_HDR_BYTES - bn;
+  /* exact accounting: a refinement payload iff a margin, and then at least the coder's five bytes */
+  if (p->margin ? p->refine_n < 5u : p->refine_n != 0u) return VOLCOMP_ERR_CORRUPT;
+  return VOLCOMP_OK;
+}
+
+/* the bit-exact base, into dst (a whole chunk) */
+static volcomp_status vsf_decode_base(const vsf_parsed *sp, uint8_t *restrict dst) {
+  vf_parsed p;
+  volcomp_status st = vf_parse_body(sp->base, sp->base + sp->base_n, sp->qraw, true, true, &p);
+  if (st != VOLCOMP_OK) return st;
+  for (uint32_t s = 0; s < VF_NSUB; s++) {
+    st = vf_decode_sub(&p, s, dst, -1, NULL);
+    if (st != VOLCOMP_OK) return st;
+  }
+  return VOLCOMP_OK;
+}
+
+static volcomp_status vsf_decode(const void *restrict enc, size_t enc_n, uint8_t *restrict dst) {
+  vsf_parsed sp;
+  volcomp_status st = vsf_parse(enc, enc_n, &sp);
+  if (st != VOLCOMP_OK) return st;
+  st = vsf_decode_base(&sp, dst);
+  if (st != VOLCOMP_OK || !sp.margin) return st;
+  vsf_model *m = (vsf_model *)VOLCOMP_MALLOC(sizeof(vsf_model));
+  if (!m) return VOLCOMP_ERR_NOMEM;
+  vmk_rc_dec d;
+  if (!vmk_rc_dec_init(&d, sp.refine, sp.refine_n)) {
+    VOLCOMP_FREE(m);
+    return VOLCOMP_ERR_CORRUPT;
+  }
+  vsf_refine(dst, NULL, sp.thr, sp.margin, NULL, &d, m);
+  VOLCOMP_FREE(m);
+  return d.over || d.pos != d.n ? VOLCOMP_ERR_CORRUPT : VOLCOMP_OK;
+}
+
+static inline volcomp_status volcomp_surface_encode(const uint8_t *restrict src_zyx, float q, uint32_t thr,
+                                                    void *restrict dst_v, size_t dst_cap, size_t *out_n) {
+  if (!src_zyx || !dst_v || !out_n) return VOLCOMP_ERR_ARG;
+  if (!(q >= VOLCOMP_SURFACE_Q_MIN && q <= VOLCOMP_Q_MAX) || thr < 1u || thr > 255u) return VOLCOMP_ERR_ARG;
+  *out_n = 0;
+  uint8_t *dst = (uint8_t *)dst_v;
+  if (dst_cap < VSF_HDR_BYTES + VF_DIR_BYTES) return VOLCOMP_ERR_SHORT_BUF;
+  /* The base is a mode-0 stream written 8 bytes in, so its body lands exactly
+   * where the surface header ends; that header then replaces the mode-0 one. */
+  size_t n0;
+  volcomp_status st = vf_encode_lossy(src_zyx, q, true, dst + (VSF_HDR_BYTES - VF_HDR_BYTES),
+                                      dst_cap - (VSF_HDR_BYTES - VF_HDR_BYTES), &n0);
+  if (st != VOLCOMP_OK) return st;
+  const uint32_t qraw = vf_rd_u16(dst + (VSF_HDR_BYTES - VF_HDR_BYTES) + 6);
+  const size_t base_n = n0 - VF_HDR_BYTES;
+  vll_hdr(dst, VLL_MODE_SURFACE);
+  vf_wr_u16(dst + 6, qraw);
+  dst[8] = (uint8_t)thr;
+  dst[9] = VSF_LAW_FLAT;
+  vf_wr_u16(dst + 10, 0);
+  vf_wr_u32(dst + 12, (uint32_t)base_n);
+  /* reconstruct the base exactly as a decoder will, and find the margin */
+  uint8_t *v = (uint8_t *)VOLCOMP_MALLOC(VOLCOMP_CHUNK_VOXELS + sizeof(vsf_model));
+  if (!v) return VOLCOMP_ERR_NOMEM;
+  vsf_model *m = (vsf_model *)(void *)(v + VOLCOMP_CHUNK_VOXELS);
+  vsf_parsed sp = {qraw, thr, 0, dst + VSF_HDR_BYTES, NULL, base_n, 0};
+  st = vsf_decode_base(&sp, v);
+  uint32_t M = 0;
+  if (st == VOLCOMP_OK)
+    for (size_t i = 0; i < VOLCOMP_CHUNK_VOXELS; i++)
+      if ((src_zyx[i] >= thr) != (v[i] >= thr)) {
+        uint32_t dd = 2u * v[i] > 2u * thr - 1u ? 2u * v[i] - (2u * thr - 1u) : 2u * thr - 1u - 2u * v[i];
+        if (dd > M) M = dd;
+      }
+  size_t n = VSF_HDR_BYTES + base_n;
+  if (st == VOLCOMP_OK && M) {
+    vmk_rc_enc e;
+    vmk_rc_enc_init(&e, dst + n, dst_cap - n);
+    vsf_refine(v, src_zyx, thr, M, &e, NULL, m);
+    if (!e.full) vmk_rc_enc_finish(&e);
+    if (e.full)
+      st = VOLCOMP_ERR_SHORT_BUF;
+    else {
+      vf_wr_u16(dst + 10, M);
+      n += e.n;
+    }
+  }
+  VOLCOMP_FREE(v);
+  if (st == VOLCOMP_OK) *out_n = n;
+  return st;
+}
+
+static inline volcomp_status volcomp_surface_info(const void *restrict enc, size_t enc_n, uint32_t *out_thr,
+                                                  uint32_t *out_margin) {
+  if (!enc) return VOLCOMP_ERR_ARG;
+  vsf_parsed sp;
+  volcomp_status st = vsf_parse(enc, enc_n, &sp);
+  if (st != VOLCOMP_OK) return st;
+  if (out_thr) *out_thr = sp.thr;
+  if (out_margin) *out_margin = sp.margin;
+  return VOLCOMP_OK;
+}
+
+static inline volcomp_status volcomp_encode(const uint8_t *restrict src_zyx, float q,
+                                            void *restrict dst_v, size_t dst_cap, size_t *out_n) {
+  if (!src_zyx || !dst_v || !out_n) return VOLCOMP_ERR_ARG;
+  if (!(q == VOLCOMP_Q_LOSSLESS || (q >= VOLCOMP_Q_MIN && q <= VOLCOMP_Q_MAX))) return VOLCOMP_ERR_ARG;
+  *out_n = 0;
+  if (q == VOLCOMP_Q_LOSSLESS) return vll_encode(src_zyx, (uint8_t *)dst_v, dst_cap, out_n);
+  return vf_encode_lossy(src_zyx, q, false, (uint8_t *)dst_v, dst_cap, out_n);
+}
+
+/* Common header check: magic, version, chunk mode, and (for the lossless modes)
+ * that qraw is 0. */
+static volcomp_status vll_chunk_mode(const void *restrict enc, size_t enc_n, uint32_t *mode) {
+  const uint8_t *in = (const uint8_t *)enc;
+  if (enc_n < VF_HDR_BYTES) return VOLCOMP_ERR_CORRUPT;
+  if (in[0] != 'V' || in[1] != 'O' || in[2] != 'L' || in[3] != 'C') return VOLCOMP_ERR_CORRUPT;
+  if (in[4] != VF_VERSION) return VOLCOMP_ERR_VERSION;
+  if (in[5] > VLL_MODE_MAX) return VOLCOMP_ERR_CORRUPT;
+  /* q_raw is the quantiser step of the lossy modes (0 and the surface chunk's
+   * DCT base) and 0 for every other mode */
+  if (in[5] != VLL_MODE_LOSSY && in[5] != VLL_MODE_SURFACE && vf_rd_u16(in + 6) != 0) return VOLCOMP_ERR_CORRUPT;
+  *mode = in[5];
+  return VOLCOMP_OK;
+}
+
+static inline volcomp_status volcomp_is_lossless(const void *restrict enc, size_t enc_n, bool *out) {
+  if (!enc || !out) return VOLCOMP_ERR_ARG;
+  uint32_t mode;
+  volcomp_status st = vll_chunk_mode(enc, enc_n, &mode);
+  if (st != VOLCOMP_OK) return st;
+  *out = mode != VLL_MODE_LOSSY && mode != VLL_MODE_MASK && mode != VLL_MODE_MASK_LL && mode != VLL_MODE_SURFACE;
+  return VOLCOMP_OK;
+}
+
+static inline volcomp_status volcomp_stream_q(const void *restrict enc, size_t enc_n, float *out) {
+  if (!enc || !out) return VOLCOMP_ERR_ARG;
+  uint32_t mode;
+  volcomp_status st = vll_chunk_mode(enc, enc_n, &mode);
+  if (st != VOLCOMP_OK) return st;
+  if (mode != VLL_MODE_LOSSY && mode != VLL_MODE_SURFACE) {
+    *out = VOLCOMP_Q_LOSSLESS;
+    return VOLCOMP_OK;
+  }
+  uint32_t qraw = vf_rd_u16((const uint8_t *)enc + 6);
+  if (qraw < VF_Q_RAW_MIN || qraw > VF_Q_RAW_MAX) return VOLCOMP_ERR_CORRUPT;
+  *out = (float)qraw * (1.0f / 256.0f);
+  return VOLCOMP_OK;
+}
+
 static inline volcomp_status volcomp_decode(const void *restrict enc, size_t enc_n,
                                             uint8_t *restrict dst_zyx, size_t dst_cap) {
   if (!enc || !dst_zyx) return VOLCOMP_ERR_ARG;
   if (dst_cap < VOLCOMP_CHUNK_VOXELS) return VOLCOMP_ERR_SHORT_BUF;
+  const uint8_t *in = (const uint8_t *)enc;
+  uint32_t mode;
+  volcomp_status st = vll_chunk_mode(enc, enc_n, &mode);
+  if (st != VOLCOMP_OK) return st;
+  if (mode == VLL_MODE_CONST) {
+    if (enc_n != VF_HDR_BYTES + 1u) return VOLCOMP_ERR_CORRUPT;
+    memset(dst_zyx, in[VF_HDR_BYTES], VOLCOMP_CHUNK_VOXELS);
+    return VOLCOMP_OK;
+  }
+  if (mode == VLL_MODE_RAW) {
+    if (enc_n != VF_HDR_BYTES + (size_t)VOLCOMP_CHUNK_VOXELS) return VOLCOMP_ERR_CORRUPT;
+    memcpy(dst_zyx, in + VF_HDR_BYTES, VOLCOMP_CHUNK_VOXELS);
+    return VOLCOMP_OK;
+  }
+  if (mode == VLL_MODE_MASK || mode == VLL_MODE_MASK_LL)
+    return vmk_decode_planes(enc, enc_n, 0, VOLCOMP_CHUNK_DIM, dst_zyx);
+  if (mode == VLL_MODE_SURFACE) return vsf_decode(enc, enc_n, dst_zyx);
+  if (mode == VLL_MODE_CODED) {
+    vll_parsed lp;
+    st = vll_parse(in, enc_n, &lp);
+    if (st != VOLCOMP_OK) return st;
+    for (uint32_t s = 0; s < VF_NSUB; s++) {
+      st = vll_decode_sub(&lp, s, dst_zyx, -1, NULL);
+      if (st != VOLCOMP_OK) return st;
+    }
+    return VOLCOMP_OK;
+  }
   vf_parsed p;
-  volcomp_status st = vf_parse(enc, enc_n, &p);
+  st = vf_parse(enc, enc_n, &p);
   if (st != VOLCOMP_OK) return st;
   for (uint32_t s = 0; s < VF_NSUB; s++) {
     st = vf_decode_sub(&p, s, dst_zyx, -1, NULL);
@@ -1975,13 +3611,299 @@ static inline volcomp_status volcomp_decode_block(const void *restrict enc, size
   if (!enc || !dst_block) return VOLCOMP_ERR_ARG;
   if (bz >= VF_BLOCKS_AXIS || by >= VF_BLOCKS_AXIS || bx >= VF_BLOCKS_AXIS) return VOLCOMP_ERR_ARG;
   if (dst_cap < VOLCOMP_BLOCK_VOXELS) return VOLCOMP_ERR_SHORT_BUF;
-  vf_parsed p;
-  volcomp_status st = vf_parse(enc, enc_n, &p);
+  const uint8_t *in = (const uint8_t *)enc;
+  uint32_t mode, bi = bz * 64u + by * 8u + bx;
+  volcomp_status st = vll_chunk_mode(enc, enc_n, &mode);
   if (st != VOLCOMP_OK) return st;
-  uint32_t bi = bz * 64u + by * 8u + bx;
+  if (mode == VLL_MODE_CONST) {
+    if (enc_n != VF_HDR_BYTES + 1u) return VOLCOMP_ERR_CORRUPT;
+    memset(dst_block, in[VF_HDR_BYTES], VOLCOMP_BLOCK_VOXELS);
+    return VOLCOMP_OK;
+  }
+  if (mode == VLL_MODE_RAW) {
+    if (enc_n != VF_HDR_BYTES + (size_t)VOLCOMP_CHUNK_VOXELS) return VOLCOMP_ERR_CORRUPT;
+    for (uint32_t z = 0; z < VOLCOMP_BLOCK_DIM; z++)
+      for (uint32_t y = 0; y < VOLCOMP_BLOCK_DIM; y++)
+        memcpy(dst_block + (z * VOLCOMP_BLOCK_DIM + y) * VOLCOMP_BLOCK_DIM,
+               in + VF_HDR_BYTES + vf_row_off(bz, by, bx, z, y), VOLCOMP_BLOCK_DIM);
+    return VOLCOMP_OK;
+  }
+  if (mode == VLL_MODE_MASK || mode == VLL_MODE_MASK_LL) {
+    /* a mask chunk has no substreams: the grid decodes as a whole (0.26 MB of
+     * bits at mode 4, 2.1 MB at mode 5) and only this block's 16 output planes
+     * are then materialised */
+    const size_t pl = (size_t)VOLCOMP_CHUNK_DIM * VOLCOMP_CHUNK_DIM;
+    uint8_t *planes = (uint8_t *)VOLCOMP_MALLOC(pl * VOLCOMP_BLOCK_DIM);
+    if (!planes) return VOLCOMP_ERR_NOMEM;
+    st = vmk_decode_planes(enc, enc_n, bz * VOLCOMP_BLOCK_DIM, (bz + 1u) * VOLCOMP_BLOCK_DIM, planes);
+    if (st == VOLCOMP_OK)
+      for (uint32_t z = 0; z < VOLCOMP_BLOCK_DIM; z++)
+        for (uint32_t y = 0; y < VOLCOMP_BLOCK_DIM; y++)
+          memcpy(dst_block + (z * VOLCOMP_BLOCK_DIM + y) * VOLCOMP_BLOCK_DIM,
+                 planes + z * pl + ((size_t)by * VOLCOMP_BLOCK_DIM + y) * VOLCOMP_CHUNK_DIM +
+                     bx * VOLCOMP_BLOCK_DIM,
+                 VOLCOMP_BLOCK_DIM);
+    VOLCOMP_FREE(planes);
+    return st;
+  }
+  if (mode == VLL_MODE_SURFACE) {
+    /* the refinement is one adaptive pass over the chunk: decode it whole */
+    uint8_t *full = (uint8_t *)VOLCOMP_MALLOC(VOLCOMP_CHUNK_VOXELS);
+    if (!full) return VOLCOMP_ERR_NOMEM;
+    st = vsf_decode(enc, enc_n, full);
+    if (st == VOLCOMP_OK)
+      for (uint32_t z = 0; z < VOLCOMP_BLOCK_DIM; z++)
+        for (uint32_t y = 0; y < VOLCOMP_BLOCK_DIM; y++)
+          memcpy(dst_block + (z * VOLCOMP_BLOCK_DIM + y) * VOLCOMP_BLOCK_DIM, full + vf_row_off(bz, by, bx, z, y),
+                 VOLCOMP_BLOCK_DIM);
+    VOLCOMP_FREE(full);
+    return st;
+  }
+  if (mode == VLL_MODE_CODED) {
+    vll_parsed lp;
+    st = vll_parse(in, enc_n, &lp);
+    if (st != VOLCOMP_OK) return st;
+    return vll_decode_sub(&lp, bi / VF_BLOCKS_PER_SUB, NULL, (int32_t)bi, dst_block);
+  }
+  vf_parsed p;
+  st = vf_parse(enc, enc_n, &p);
+  if (st != VOLCOMP_OK) return st;
   return vf_decode_sub(&p, bi / VF_BLOCKS_PER_SUB, NULL, (int32_t)bi, dst_block);
 }
 
+
+/* ---- optional decode-side deblocking by projection (not part of the format) ----
+ * volcomp_decode_smooth: decode the chunk, blur (Gaussian, sigma) the voxels
+ * within two of every block face, then project each 16^3 block back onto the
+ * quantisation cells its coefficients were decoded from (one POCS step): the
+ * result is the smoothest-looking chunk the stream is still consistent with.
+ * Works inside one chunk (chunk faces are smoothed from their own side only),
+ * so it needs nothing but the chunk's stream. docs/deblocking.md has the numbers. */
+
+/* the signed level of every coefficient of the 16 blocks of substream s, natural order */
+static volcomp_status vf_decode_levels_sub(const vf_parsed *restrict p, uint32_t s, int32_t *restrict lv) {
+  const uint8_t *rb = p->payload + p->off[s];
+  vf_rdec rd;
+  if (!vf_rdec_init(&rd, rb, p->tok_n[s])) return VOLCOMP_ERR_CORRUPT;
+  vf_bitr br;
+  vf_br_init(&br, rb + p->tok_n[s], p->byp_n[s]);
+  int64_t prev_dc = 0;
+  for (uint32_t k = 0; k < VF_BLOCKS_PER_SUB; k++) {
+    int32_t *b = lv + (size_t)k * VF_BLKV;
+    memset(b, 0, VF_BLKV * sizeof *b);
+    int t = vf_rdec_get(&rd, &p->models[VF_DC_CTX]);
+    if (t < 0 || (uint32_t)t > VF_TOKMAX_DC) return VOLCOMP_ERR_CORRUPT;
+    uint32_t u;
+    if (!vf_hyb_read(&br, (uint32_t)t, &u)) return VOLCOMP_ERR_CORRUPT;
+    int64_t dc = prev_dc + vf_unzigzag(u);
+    if (dc < -VF_DC_ABS_MAX || dc > VF_DC_ABS_MAX) return VOLCOMP_ERR_CORRUPT;
+    prev_dc = dc;
+    b[0] = (int32_t)dc;
+    uint32_t pos = 1;
+    for (;;) {
+      t = vf_rdec_get(&rd, &p->models[vf_run_ctx(pos)]);
+      if (t < 0) return VOLCOMP_ERR_CORRUPT;
+      if ((uint32_t)t == VF_TOK_EOB) break;
+      if ((uint32_t)t > VF_TOKMAX_RUN) return VOLCOMP_ERR_CORRUPT;
+      uint32_t run;
+      if (!vf_hyb_read(&br, (uint32_t)t, &run)) return VOLCOMP_ERR_CORRUPT;
+      pos += run;
+      if (pos >= VF_BLKV) return VOLCOMP_ERR_CORRUPT;
+      int lt = vf_rdec_get(&rd, &p->models[vf_level_ctx(pos, run)]);
+      if (lt < 0 || (uint32_t)lt > VF_TOKMAX_LVL) return VOLCOMP_ERR_CORRUPT;
+      uint32_t mag1, sign;
+      if (!vf_hyb_read(&br, (uint32_t)lt, &mag1) || !vf_br_get(&br, 1, &sign)) return VOLCOMP_ERR_CORRUPT;
+      if (mag1 + 1u > VF_AC_MAG_MAX) return VOLCOMP_ERR_CORRUPT;
+      b[VF_SCAN16[pos]] = sign ? -(int32_t)(mag1 + 1u) : (int32_t)(mag1 + 1u);
+      pos++;
+    }
+  }
+  if (!vf_rdec_finished(&rd) || !vf_br_finished(&br)) return VOLCOMP_ERR_CORRUPT;
+  return VOLCOMP_OK;
+}
+
+/* separable Gaussian blur of the whole chunk (edge-replicating), radius
+ * floor(4 sigma + 0.5) <= 8, in place on f (C^3 floats). `tmp` holds C^3 + 2 C^2
+ * floats. Every pass runs along contiguous x rows, so it vectorises and stays in
+ * cache: x taps inside a row, y taps across rows of one plane, z taps across planes. */
+static void vf_blur_chunk(float *f, float sigma, float *tmp) {
+  const uint32_t C = VOLCOMP_CHUNK_DIM;
+  const size_t PL = (size_t)C * C;
+  int rad = (int)(4.0f * sigma + 0.5f);
+  if (rad > 8) rad = 8;
+  float w[17], sum = 0;
+  for (int k = -rad; k <= rad; k++) sum += w[k + rad] = expf(-0.5f * (float)(k * k) / (sigma * sigma));
+  for (int k = 0; k <= 2 * rad; k++) w[k] /= sum;
+  float *g = tmp, *line = tmp + C * PL; /* g: the z pass's output; line: one padded row */
+  for (size_t r = 0; r < PL; r++) { /* x */
+    float *row = f + r * C;
+    for (int i = 0; i < rad; i++) line[i] = row[0], line[rad + (int)C + i] = row[C - 1];
+    memcpy(line + rad, row, C * sizeof(float));
+    for (uint32_t x = 0; x < C; x++) {
+      float acc = 0;
+      for (int k = 0; k <= 2 * rad; k++) acc += w[k] * line[x + (uint32_t)k];
+      row[x] = acc;
+    }
+  }
+  for (uint32_t z = 0; z < C; z++) { /* y, one plane at a time through g */
+    float *pl = f + z * PL, *o = g;
+    memcpy(o, pl, PL * sizeof(float));
+    for (uint32_t y = 0; y < C; y++) {
+      float *dst = pl + (size_t)y * C;
+      for (uint32_t x = 0; x < C; x++) dst[x] = 0;
+      for (int k = -rad; k <= rad; k++) {
+        int yy = (int)y + k;
+        yy = yy < 0 ? 0 : (yy >= (int)C ? (int)C - 1 : yy);
+        const float *src = o + (size_t)yy * C, wk = w[k + rad];
+        for (uint32_t x = 0; x < C; x++) dst[x] += wk * src[x];
+      }
+    }
+  }
+  for (uint32_t z = 0; z < C; z++) { /* z, into g */
+    float *dst = g + z * PL;
+    for (size_t i = 0; i < PL; i++) dst[i] = 0;
+    for (int k = -rad; k <= rad; k++) {
+      int zz = (int)z + k;
+      zz = zz < 0 ? 0 : (zz >= (int)C ? (int)C - 1 : zz);
+      const float *src = f + (size_t)zz * PL, wk = w[k + rad];
+      for (size_t i = 0; i < PL; i++) dst[i] += wk * src[i];
+    }
+  }
+  memcpy(f, g, (size_t)C * PL * sizeof(float));
+}
+
+static inline volcomp_status volcomp_decode_smooth(const void *restrict enc, size_t enc_n, uint8_t *restrict dst_zyx,
+                                                   size_t dst_cap, float sigma, unsigned flags) {
+  const bool zg = (flags & VOLCOMP_DEBLOCK_ZERO_GUARD) != 0;
+  if (!enc || !dst_zyx) return VOLCOMP_ERR_ARG;
+  if (dst_cap < VOLCOMP_CHUNK_VOXELS) return VOLCOMP_ERR_SHORT_BUF;
+  volcomp_status st = volcomp_decode(enc, enc_n, dst_zyx, dst_cap);
+  if (st != VOLCOMP_OK || !(sigma > 0.0f)) return st;
+  uint32_t mode;
+  st = vll_chunk_mode(enc, enc_n, &mode);
+  if (st != VOLCOMP_OK) return st;
+  if (mode != VLL_MODE_LOSSY && mode != VLL_MODE_SURFACE) return VOLCOMP_OK; /* nothing to project onto */
+  /* below mode-0 q 4 the seams are within the voxel noise of CT: the gated
+   * filter has nothing to fix there and was measured to lose 0.00-0.03 dB */
+  if ((flags & VOLCOMP_SMOOTH_GATED) && mode == VLL_MODE_LOSSY && vf_rd_u16((const uint8_t *)enc + 6) < 4u * 256u)
+    return VOLCOMP_OK;
+  if (sigma > 4.0f) sigma = 4.0f;
+  vf_parsed p;
+  uint32_t thr = 0;
+  if (mode == VLL_MODE_SURFACE) {
+    vsf_parsed sp;
+    st = vsf_parse(enc, enc_n, &sp);
+    if (st == VOLCOMP_OK) st = vf_parse_body(sp.base, sp.base + sp.base_n, sp.qraw, true, true, &p);
+    thr = sp.thr;
+  } else {
+    st = vf_parse(enc, enc_n, &p);
+  }
+  if (st != VOLCOMP_OK) return st;
+  const size_t NV = VOLCOMP_CHUNK_VOXELS;
+  const bool gauss = !(flags & VOLCOMP_SMOOTH_GATED);
+  const size_t blur_n = gauss ? NV + 2u * (size_t)VOLCOMP_CHUNK_DIM * VOLCOMP_CHUNK_DIM : 0u;
+  float *f = (float *)VOLCOMP_MALLOC(NV * sizeof(float) + VF_BLOCKS_PER_SUB * VF_BLKV * sizeof(int32_t) +
+                                     2u * VF_BLKV * sizeof(float) + blur_n * sizeof(float));
+  if (!f) return VOLCOMP_ERR_NOMEM;
+  int32_t *lv = (int32_t *)(void *)(f + NV);
+  float *blk = (float *)(void *)(lv + VF_BLOCKS_PER_SUB * VF_BLKV), *vox = blk + VF_BLKV, *line = vox + VF_BLKV;
+  /* line: the blur's scratch (gauss only) */
+  if (flags & VOLCOMP_SMOOTH_GATED) {
+    /* the smoothing step is volcomp_deblock's gated face filter (strength = its q
+     * multiplier) on this chunk alone: it only touches block faces whose step is
+     * small against q, so real edges and fine texture are left to the projection */
+    uint8_t *tmp = (uint8_t *)VOLCOMP_MALLOC(NV);
+    if (!tmp) {
+      VOLCOMP_FREE(f);
+      return VOLCOMP_ERR_NOMEM;
+    }
+    memcpy(tmp, dst_zyx, NV);
+    volcomp_deblock_ex(tmp, VOLCOMP_CHUNK_DIM, VOLCOMP_CHUNK_DIM, VOLCOMP_CHUNK_DIM, p.q * sigma, flags);
+    for (size_t i = 0; i < NV; i++) f[i] = (float)tmp[i];
+    VOLCOMP_FREE(tmp);
+  } else if (zg) { /* normalised blur over the nonzero voxels only: masked air neither spreads nor receives */
+    float *wgt = (float *)VOLCOMP_MALLOC(NV * sizeof(float));
+    if (!wgt) {
+      VOLCOMP_FREE(f);
+      return VOLCOMP_ERR_NOMEM;
+    }
+    for (size_t i = 0; i < NV; i++) {
+      f[i] = (float)dst_zyx[i];
+      wgt[i] = dst_zyx[i] ? 1.0f : 0.0f;
+    }
+    vf_blur_chunk(f, sigma, line);
+    vf_blur_chunk(wgt, sigma, line);
+    for (size_t i = 0; i < NV; i++) f[i] = dst_zyx[i] && wgt[i] > 0.0f ? f[i] / wgt[i] : (float)dst_zyx[i];
+    VOLCOMP_FREE(wgt);
+  } else {
+    for (size_t i = 0; i < NV; i++) f[i] = (float)dst_zyx[i];
+    vf_blur_chunk(f, sigma, line);
+  }
+  /* cell bounds (orthonormal domain, units of step): L == 0 -> |X| < 1 - dz; else |X| in [|L| - dz, |L| + 1 - dz] */
+  for (uint32_t s = 0; s < VF_NSUB && st == VOLCOMP_OK; s++) {
+    st = vf_decode_levels_sub(&p, s, lv);
+    for (uint32_t k = 0; k < VF_BLOCKS_PER_SUB && st == VOLCOMP_OK; k++) {
+      const uint32_t bi = s * VF_BLOCKS_PER_SUB + k, bz = bi >> 6, by = (bi >> 3) & 7u, bx = bi & 7u;
+      const int32_t *L = lv + (size_t)k * VF_BLKV;
+      /* the seam-blurred block: blurred values within two voxels of an interior
+       * block face, decoded ones elsewhere (a chunk face is seen from one side
+       * only, so it is left as decoded) */
+#define VF_SEAM(b, u) (((u) <= 1u && (b) > 0u) || ((u) >= 14u && (b) < 7u))
+      uint64_t zeros = 0;
+      for (uint32_t z = 0; z < 16; z++)
+        for (uint32_t y = 0; y < 16; y++) {
+          const size_t off = vf_row_off(bz, by, bx, z, y);
+          const bool zy = VF_SEAM(bz, z) || VF_SEAM(by, y);
+          for (uint32_t x = 0; x < 16; x++) {
+            const bool seam = zy || VF_SEAM(bx, x);
+            const uint8_t d0 = dst_zyx[off + x];
+            zeros += d0 == 0;
+            blk[(z * 16 + y) * 16 + x] = (seam && !(zg && !d0) ? f[off + x] : (float)d0) - 128.0f;
+          }
+        }
+#undef VF_SEAM
+      vf_dct16_fwd(blk);
+      for (uint32_t c = 0; c < VF_BLKV; c++) {
+        const float sc = vf_dct_scale(c), stp = p.step[vf_radius(c)];
+        const float dz = c ? VF_DZ_Q : VF_DZ_Q_DC;
+        float x = blk[c] * sc / stp; /* orthonormal coefficient in steps */
+        const int32_t l = L[c];
+        if (l == 0) {
+          const float h = 1.0f - dz;
+          x = x < -h ? -h : (x > h ? h : x);
+        } else {
+          const float a = (float)(l < 0 ? -l : l), sg = l < 0 ? -1.0f : 1.0f;
+          float m = x * sg; /* magnitude on the level's side; the other side counts as 0 */
+          m = m < a - dz ? a - dz : (m > a + 1.0f - dz ? a + 1.0f - dz : m);
+          x = sg * m;
+        }
+        blk[c] = x * stp * sc; /* back to the inverse transform's input scale */
+      }
+      vf_dct16_inv(blk, 0xFFFFu, 0xFFFFu, vox);
+      if (zg && zeros) { /* masked air stays exactly 0 */
+        for (uint32_t z = 0; z < 16; z++)
+          for (uint32_t y = 0; y < 16; y++) {
+            const size_t off = vf_row_off(bz, by, bx, z, y);
+            for (uint32_t x = 0; x < 16; x++)
+              if (!dst_zyx[off + x]) vox[(z * 16 + y) * 16 + x] = -128.5f;
+          }
+      }
+      vf_scatter_block(dst_zyx + vf_row_off(bz, by, bx, 0, 0), (size_t)VOLCOMP_CHUNK_DIM * VOLCOMP_CHUNK_DIM,
+                       VOLCOMP_CHUNK_DIM, vox);
+    }
+  }
+  if (st == VOLCOMP_OK && mode == VLL_MODE_SURFACE) {
+    /* keep every voxel on the side the refinement put it: the threshold stays exact */
+    uint8_t *ref = (uint8_t *)(void *)f; /* reuse: the refined chunk, re-decoded */
+    st = volcomp_decode(enc, enc_n, ref, NV);
+    for (size_t i = 0; st == VOLCOMP_OK && i < NV; i++) {
+      if (ref[i] >= thr && dst_zyx[i] < thr) dst_zyx[i] = (uint8_t)thr;
+      if (ref[i] < thr && dst_zyx[i] >= thr) dst_zyx[i] = (uint8_t)(thr - 1u);
+    }
+  }
+  VOLCOMP_FREE(f);
+  return st;
+}
 
 /* ---- optional post-decode deblock (c5d's normative face filter, generalised
  * to every 16-plane of an assembled volume) ----
@@ -1991,8 +3913,9 @@ static inline volcomp_status volcomp_decode_block(const void *restrict enc, size
 /* one face position: p0/q0 straddle the face, P1/Q1 one step further out.
  * delta is bounded by |Q0-P0| and moves each side toward the other, so the
  * results stay within [P0, Q0] and need no clamp. */
-__attribute__((always_inline)) static inline void vf_deblock_1(uint8_t *p0, uint8_t *q0, ptrdiff_t s, int c) {
+__attribute__((always_inline)) static inline void vf_deblock_1(uint8_t *p0, uint8_t *q0, ptrdiff_t s, int c, int zg) {
   int P1 = p0[-s], P0 = *p0, Q0 = *q0, Q1 = q0[s];
+  if (zg && !(P1 && P0 && Q0 && Q1)) return; /* an exact zero: masked air, never filtered into */
   int d = Q0 - P0, ad = d < 0 ? -d : d;
   if (ad == 0 || ad >= 4 * c) return;
   int dp = P1 - P0, dq = Q1 - Q0;
@@ -2004,7 +3927,7 @@ __attribute__((always_inline)) static inline void vf_deblock_1(uint8_t *p0, uint
 }
 #if VF_HAVE_AVX2
 /* 16 contiguous face positions at once (lines adjacent in memory) */
-__attribute__((always_inline)) VF_TARGET_AVX2 static inline void vf_deblock_16(uint8_t *p0, uint8_t *q0, ptrdiff_t s, int c) {
+__attribute__((always_inline)) VF_TARGET_AVX2 static inline void vf_deblock_16(uint8_t *p0, uint8_t *q0, ptrdiff_t s, int c, int zg) {
   const __m256i P1 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(p0 - s)));
   const __m256i P0 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)p0));
   const __m256i Q0 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)q0));
@@ -2017,6 +3940,11 @@ __attribute__((always_inline)) VF_TARGET_AVX2 static inline void vf_deblock_16(u
   skip = _mm256_or_si256(skip, _mm256_cmpgt_epi16(ad, _mm256_sub_epi16(c4, _mm256_set1_epi16(1))));
   skip = _mm256_or_si256(skip, _mm256_cmpgt_epi16(adp, _mm256_sub_epi16(cc, _mm256_set1_epi16(1))));
   skip = _mm256_or_si256(skip, _mm256_cmpgt_epi16(adq, _mm256_sub_epi16(cc, _mm256_set1_epi16(1))));
+  if (zg) {
+    const __m256i z0 = _mm256_setzero_si256();
+    skip = _mm256_or_si256(skip, _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi16(P1, z0), _mm256_cmpeq_epi16(P0, z0)),
+                                                 _mm256_or_si256(_mm256_cmpeq_epi16(Q0, z0), _mm256_cmpeq_epi16(Q1, z0))));
+  }
   __m256i delta = _mm256_srai_epi16(_mm256_add_epi16(_mm256_mullo_epi16(ad, _mm256_set1_epi16(3)), _mm256_set1_epi16(4)), 3);
   delta = _mm256_sign_epi16(delta, d); /* negate where d < 0 (d == 0 already skipped) */
   delta = _mm256_andnot_si256(skip, delta);
@@ -2026,7 +3954,7 @@ __attribute__((always_inline)) VF_TARGET_AVX2 static inline void vf_deblock_16(u
   _mm_storeu_si128((__m128i *)q0, _mm256_extracti128_si256(pk, 1));
 }
 VF_TARGET_AVX2 static void vf_deblock_axis_avx2(uint8_t *vol, size_t n_outer, size_t n_mid, size_t n_in,
-                                                size_t s_outer, size_t s_mid, size_t s_in, int c) {
+                                                size_t s_outer, size_t s_mid, size_t s_in, int c, int zg) {
   /* filters planes along the "in" axis; (outer, mid) enumerate the lines */
   for (size_t f = 16; f < n_in; f += 16)
     for (size_t o = 0; o < n_outer; o++) {
@@ -2034,36 +3962,40 @@ VF_TARGET_AVX2 static void vf_deblock_axis_avx2(uint8_t *vol, size_t n_outer, si
       size_t m = 0;
       if (s_mid == 1)
         for (; m + 16 <= n_mid; m += 16)
-          vf_deblock_16(base + m - s_in, base + m, (ptrdiff_t)s_in, c);
+          vf_deblock_16(base + m - s_in, base + m, (ptrdiff_t)s_in, c, zg);
       for (; m < n_mid; m++)
-        vf_deblock_1(base + m * s_mid - s_in, base + m * s_mid, (ptrdiff_t)s_in, c);
+        vf_deblock_1(base + m * s_mid - s_in, base + m * s_mid, (ptrdiff_t)s_in, c, zg);
     }
 }
 #endif /* VF_HAVE_AVX2 */
 static void vf_deblock_axis_c(uint8_t *vol, size_t n_outer, size_t n_mid, size_t n_in,
-                              size_t s_outer, size_t s_mid, size_t s_in, int c) {
+                              size_t s_outer, size_t s_mid, size_t s_in, int c, int zg) {
   for (size_t f = 16; f < n_in; f += 16)
     for (size_t o = 0; o < n_outer; o++) {
       uint8_t *base = vol + o * s_outer + f * s_in;
       for (size_t m = 0; m < n_mid; m++)
-        vf_deblock_1(base + m * s_mid - s_in, base + m * s_mid, (ptrdiff_t)s_in, c);
+        vf_deblock_1(base + m * s_mid - s_in, base + m * s_mid, (ptrdiff_t)s_in, c, zg);
     }
 }
 static inline void vf_deblock_axis(uint8_t *vol, size_t n_outer, size_t n_mid, size_t n_in,
-                                   size_t s_outer, size_t s_mid, size_t s_in, int c) {
+                                   size_t s_outer, size_t s_mid, size_t s_in, int c, int zg) {
 #if VF_HAVE_AVX2
-  if (vf_use_avx2()) { vf_deblock_axis_avx2(vol, n_outer, n_mid, n_in, s_outer, s_mid, s_in, c); return; }
+  if (vf_use_avx2()) { vf_deblock_axis_avx2(vol, n_outer, n_mid, n_in, s_outer, s_mid, s_in, c, zg); return; }
 #endif
-  vf_deblock_axis_c(vol, n_outer, n_mid, n_in, s_outer, s_mid, s_in, c);
+  vf_deblock_axis_c(vol, n_outer, n_mid, n_in, s_outer, s_mid, s_in, c, zg);
 }
-static inline void volcomp_deblock(uint8_t *vol, size_t nz, size_t ny, size_t nx, float q) {
+static inline void volcomp_deblock_ex(uint8_t *vol, size_t nz, size_t ny, size_t nx, float q, unsigned flags) {
   if (!vol || nz < 2 || ny < 2 || nx < 2) return;
+  const int zg = (flags & VOLCOMP_DEBLOCK_ZERO_GUARD) != 0;
   float cf = 0.8f * q + 1.0f;
   int c = (int)(cf < 1.0f ? 1.0f : (cf > 24.0f ? 24.0f : cf));
   const size_t sy = nx, sz = nx * ny;
-  vf_deblock_axis(vol, nz, ny, nx, sz, sy, 1, c);  /* x planes */
-  vf_deblock_axis(vol, nz, nx, ny, sz, 1, sy, c);  /* y planes */
-  vf_deblock_axis(vol, ny, nx, nz, sy, 1, sz, c);  /* z planes */
+  vf_deblock_axis(vol, nz, ny, nx, sz, sy, 1, c, zg);  /* x planes */
+  vf_deblock_axis(vol, nz, nx, ny, sz, 1, sy, c, zg);  /* y planes */
+  vf_deblock_axis(vol, ny, nx, nz, sy, 1, sz, c, zg);  /* z planes */
+}
+static inline void volcomp_deblock(uint8_t *vol, size_t nz, size_t ny, size_t nx, float q) {
+  volcomp_deblock_ex(vol, nz, ny, nx, q, VOLCOMP_DEBLOCK_ZERO_GUARD);
 }
 
 static inline const char *volcomp_status_string(volcomp_status s) {

@@ -52,8 +52,42 @@ int volcomp_lib_decode_block(const void *enc, size_t enc_n, uint32_t bz, uint32_
                              uint8_t *dst_block, size_t dst_cap);
 /* 1 when the buffer starts with the "VOLC" magic and a supported version. */
 int volcomp_lib_is_chunk(const void *enc, size_t enc_n);
-/* q recorded in a chunk header (0 on error). */
+/* q recorded in a chunk header: the DCT step of a lossy chunk, the base's step
+ * of a surface chunk, 0 for lossless / mask chunks and on error. */
 float volcomp_lib_chunk_q(const void *enc, size_t enc_n);
+
+/* Upstream library version ("1.3.0") and format revision (4: mode 6 surface
+ * chunks). Every revision keeps header version byte 1. */
+const char *volcomp_lib_version(void);
+unsigned volcomp_lib_format_revision(void);
+
+/* ---- surface chunks (mode 6, upstream spec/format.md §13) ----
+ * For thresholded probability fields (u8 = round(255 p)): a DCT base at step q
+ * (flat step law, q in [2, 255]; surface q 48 ~ mode-0 q 16) plus a refinement
+ * that makes (source >= thr) == (decoded >= thr) exact for every voxel.
+ * volcomp_lib_decode / volcomp_lib_decode_block read these like any chunk. */
+#define VOLCOMP_LIB_SURFACE_Q_MIN 2.0f
+#define VOLCOMP_LIB_SURFACE_THR_DEFAULT 128u
+/* Capacity that always suffices for volcomp_lib_surface_encode. */
+size_t volcomp_lib_surface_encode_bound(void);
+int volcomp_lib_surface_encode(const uint8_t *src_zyx, float q, uint32_t thr, void *dst, size_t dst_cap,
+                               size_t *out_n);
+/* OK iff a surface chunk: its threshold and refinement margin (0 = the base
+ * alone was already exact). VOLCOMP_LIB_ERR_ARG for any other chunk. */
+int volcomp_lib_surface_info(const void *enc, size_t enc_n, uint32_t *out_thr, uint32_t *out_margin);
+
+/* ---- optional decode-side smoothing (not part of the format) ----
+ * Decode, smooth voxels next to interior 16^3 block faces, then project each
+ * block back onto its quantisation cells (the result is still a reconstruction
+ * the stream allows; a surface chunk keeps its exact threshold). Lossy and
+ * surface chunks only; any other chunk decodes exactly as volcomp_lib_decode.
+ * Opt-in: nothing in VC calls it by default. strength: Gaussian sigma in voxels
+ * (upstream suggests 2.0 for CT, 0.6 for probability maps), or with
+ * VOLCOMP_LIB_SMOOTH_GATED the gated face filter at strength x q. */
+#define VOLCOMP_LIB_DEBLOCK_ZERO_GUARD 1u /* leave exact zeros (masked air) and faces touching them */
+#define VOLCOMP_LIB_SMOOTH_GATED 2u
+int volcomp_lib_decode_smooth(const void *enc, size_t enc_n, uint8_t *dst_zyx, size_t dst_cap, float strength,
+                              unsigned flags);
 
 #ifdef __cplusplus
 }

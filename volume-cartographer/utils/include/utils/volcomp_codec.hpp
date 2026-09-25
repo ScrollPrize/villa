@@ -12,6 +12,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -55,6 +56,36 @@ void volcomp_decode_block_into(std::span<const std::byte> compressed,
 
 // q recorded in a chunk header (0 when not a volcomp chunk).
 [[nodiscard]] float volcomp_chunk_q(std::span<const std::byte> data) noexcept;
+
+// Upstream library version ("1.3.0") and format revision (4 = surface
+// chunks, header mode 6). volcomp_decode* read every mode of that revision.
+[[nodiscard]] const char* volcomp_version() noexcept;
+[[nodiscard]] unsigned volcomp_format_revision() noexcept;
+
+// Surface chunk (mode 6): for thresholded probability fields (u8 = round(255 p)).
+// A DCT base at step q (flat step law, q in [2, 255]; surface q 48 is about
+// mode-0 q 16) plus a refinement that keeps (src >= thr) == (decoded >= thr)
+// exact for every voxel. Decode with volcomp_decode* like any other chunk.
+[[nodiscard]] std::vector<std::byte> volcomp_surface_encode(
+    std::span<const std::byte> raw, float q, unsigned thr = 128);
+
+struct VolcompSurfaceInfo {
+    unsigned thr = 0;     // exact threshold
+    unsigned margin = 0;  // refinement margin (0 = the base alone was exact)
+};
+// Threshold and margin of a surface chunk; nullopt for any other stream.
+[[nodiscard]] std::optional<VolcompSurfaceInfo> volcomp_surface_info(
+    std::span<const std::byte> data) noexcept;
+
+// Opt-in decode-side deblocking (not part of the format, not used by any VC
+// reader by default): decode, smooth voxels next to interior block faces with a
+// Gaussian of `strength` voxels, then project each block back onto the
+// quantisation cells it was decoded from. Lossy and surface chunks only (the
+// latter keep their exact threshold); other chunks decode as volcomp_decode.
+// zero_guard leaves exact zeros (masked air) and faces touching them alone.
+void volcomp_decode_smooth_into(std::span<const std::byte> compressed,
+                                std::span<std::byte> out, float strength,
+                                bool zero_guard = true);
 
 // volcomp chunks are always 128^3; {Z, Y, X} for symmetry with c3d_header_dims().
 [[nodiscard]] inline std::array<int, 3> volcomp_header_dims(

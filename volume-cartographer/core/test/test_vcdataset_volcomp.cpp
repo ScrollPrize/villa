@@ -235,6 +235,114 @@ TEST_CASE("volcomp: v3 sharded array with index_location=end and crc32c index")
     fs::remove_all(d);
 }
 
+namespace {
+// A smooth surface-teacher-like probability field: a wavy sheet, u8 = round(255 p).
+std::vector<uint8_t> synthProb(uint32_t seed)
+{
+    std::vector<uint8_t> v(N);
+    for (uint32_t z = 0; z < 128; ++z)
+        for (uint32_t y = 0; y < 128; ++y)
+            for (uint32_t x = 0; x < 128; ++x) {
+                const double sheet = 64.0 + 18.0 * std::sin(y * 0.06 + seed) * std::cos(x * 0.045);
+                const double dist = (double(z) - sheet) / 2.5;
+                const double p = std::exp(-dist * dist) +
+                                 0.35 * std::exp(-std::pow((double(z) - sheet - 30.0) / 4.0, 2));
+                const double pc = p > 1.0 ? 1.0 : p;
+                v[(std::size_t(z) * 128 + y) * 128 + x] = uint8_t(std::lround(255.0 * pc));
+            }
+    return v;
+}
+} // namespace
+
+TEST_CASE("volcomp: surface chunks (mode 6) decode through the vc3d codec path, threshold exact")
+{
+    CHECK(utils::volcomp_format_revision() >= 4u);
+    MESSAGE("volcomp " << utils::volcomp_version() << " format revision " << utils::volcomp_format_revision());
+    auto src = synthProb(5);
+    std::size_t above = 0;
+    for (auto v : src) above += v >= 128;
+    REQUIRE(above > N / 100);   // the sheet is really there
+    REQUIRE(above < N / 2);
+
+    auto raw = std::span<const std::byte>(reinterpret_cast<const std::byte*>(src.data()), src.size());
+    auto enc = utils::volcomp_surface_encode(raw, 48.0f, 128);
+    REQUIRE(enc.size() > 16);
+    CHECK(std::to_integer<int>(enc[5]) == 6);   // header mode byte
+    CHECK(utils::is_volcomp_compressed(enc));
+    CHECK(utils::volcomp_chunk_q(enc) == doctest::Approx(48.0f));
+    auto info = utils::volcomp_surface_info(enc);
+    REQUIRE(info.has_value());
+    CHECK(info->thr == 128u);
+    MESSAGE("surface chunk: " << enc.size() << " bytes, refinement margin " << info->margin);
+    // a mode-0 chunk is not a surface chunk
+    utils::VolcompCodecParams p;
+    CHECK_FALSE(utils::volcomp_surface_info(utils::volcomp_encode(raw, p)).has_value());
+
+    auto checkExact = [&](const std::vector<std::byte>& dec, const char* what) {
+        REQUIRE(dec.size() == N);
+        std::size_t wrong = 0, maxErr = 0;
+        for (std::size_t i = 0; i < N; ++i) {
+            const auto d = std::to_integer<uint8_t>(dec[i]);
+            wrong += (src[i] >= 128) != (d >= 128);
+            const std::size_t e = std::size_t(std::abs(int(d) - int(src[i])));
+            maxErr = std::max(maxErr, e);
+        }
+        MESSAGE(what << ": threshold mismatches " << wrong << ", max abs error " << maxErr);
+        CHECK(wrong == 0);
+    };
+
+    // plain decode (the default read path)
+    auto dec = utils::volcomp_decode(enc, N);
+    checkExact(dec, "volcomp_decode");
+    std::vector<uint8_t> decU8(N);
+    std::memcpy(decU8.data(), dec.data(), N);
+    CHECK(psnr(src, decU8) > 30.0);
+
+    // block decode agrees with the whole-chunk decode
+    std::vector<std::byte> blk(4096);
+    for (unsigned b : {0u, 3u, 4u, 7u}) {
+        utils::volcomp_decode_block_into(enc, b, b, 7 - b, blk);
+        for (unsigned z = 0; z < 16; ++z)
+            for (unsigned y = 0; y < 16; ++y)
+                CHECK(std::memcmp(blk.data() + (z * 16 + y) * 16,
+                                  dec.data() + ((std::size_t(b) * 16 + z) * 128 + (b * 16 + y)) * 128 +
+                                      (7 - b) * 16,
+                                  16) == 0);
+    }
+
+    // opt-in smoothing keeps the exact threshold too
+    std::vector<std::byte> sm(N);
+    utils::volcomp_decode_smooth_into(enc, sm, 0.6f);
+    checkExact(sm, "volcomp_decode_smooth (opt-in)");
+
+    // the same stream stored as an inner chunk of a v3 shard (index at the
+    // end, as the published exports) reads back through VcDataset unchanged
+    auto d = tmpDir("surface");
+    utils::ZarrMetadata meta;
+    meta.version = utils::ZarrVersion::v3;
+    meta.shape = {128, 128, 256};
+    meta.chunks = {128, 128, 256};
+    meta.dtype = utils::ZarrDtype::uint8;
+    meta.fill_value = 0.0;
+    utils::ShardConfig sc;
+    sc.sub_chunks = {128, 128, 128};
+    sc.index_location = "end";
+    utils::ZarrCodecConfig vcodec;
+    vcodec.name = "volcomp";
+    vcodec.configuration = std::make_shared<utils::JsonValue>(utils::JsonValue{{"q", utils::Json(48.0)}});
+    sc.sub_codecs.push_back(vcodec);
+    meta.shard_config = sc;
+    {
+        auto arr = utils::ZarrArray::create(d / "arr", meta, vc::buildZarrCodecRegistry(1));
+        arr.write_inner_chunk_to_shard(std::array<std::size_t, 3>{0, 0, 1}, enc);
+    }
+    vc::VcDataset ds(d / "arr");
+    std::vector<uint8_t> out(N, 1);
+    CHECK(ds.readChunk(0, 0, 1, out.data()));
+    CHECK(std::memcmp(out.data(), dec.data(), N) == 0);
+    fs::remove_all(d);
+}
+
 TEST_CASE("volcomp: shim guards")
 {
     if (!utils::volcomp_available()) return;

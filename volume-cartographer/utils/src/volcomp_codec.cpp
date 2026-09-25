@@ -94,4 +94,57 @@ void volcomp_decode_block_into(std::span<const std::byte> compressed,
     if (st != VOLCOMP_LIB_OK) fail("volcomp_decode_block", st);
 }
 
+const char* volcomp_version() noexcept { return volcomp_lib_version(); }
+
+unsigned volcomp_format_revision() noexcept { return volcomp_lib_format_revision(); }
+
+std::vector<std::byte> volcomp_surface_encode(std::span<const std::byte> raw, float q, unsigned thr)
+{
+    if (raw.size() != kVolcompChunkBytes) {
+        throw std::runtime_error(
+            "volcomp_surface_encode: input must be exactly 128^3 bytes, got " +
+            std::to_string(raw.size()));
+    }
+    if (!(q >= VOLCOMP_LIB_SURFACE_Q_MIN && q <= VOLCOMP_LIB_Q_MAX)) {
+        throw std::runtime_error("volcomp_surface_encode: q must be in [2, 255]");
+    }
+    if (thr < 1 || thr > 255) {
+        throw std::runtime_error("volcomp_surface_encode: thr must be in [1, 255]");
+    }
+    std::vector<std::byte> out(volcomp_lib_surface_encode_bound());
+    std::size_t n = 0;
+    const int st = volcomp_lib_surface_encode(
+        reinterpret_cast<const uint8_t*>(raw.data()), q, thr, out.data(), out.size(), &n);
+    if (st != VOLCOMP_LIB_OK) fail("volcomp_surface_encode", st);
+    out.resize(n);
+    out.shrink_to_fit();
+    return out;
+}
+
+std::optional<VolcompSurfaceInfo> volcomp_surface_info(std::span<const std::byte> data) noexcept
+{
+    if (!is_volcomp_compressed(data)) return std::nullopt;
+    uint32_t thr = 0, margin = 0;
+    if (volcomp_lib_surface_info(data.data(), data.size(), &thr, &margin) != VOLCOMP_LIB_OK)
+        return std::nullopt;
+    return VolcompSurfaceInfo{thr, margin};
+}
+
+void volcomp_decode_smooth_into(std::span<const std::byte> compressed, std::span<std::byte> out,
+                                float strength, bool zero_guard)
+{
+    if (out.size() != kVolcompChunkBytes) {
+        throw std::runtime_error(
+            "volcomp_decode_smooth: output must be exactly 128^3 bytes, got " +
+            std::to_string(out.size()));
+    }
+    if (!is_volcomp_compressed(compressed)) {
+        throw std::runtime_error("volcomp_decode_smooth: input missing VOLC magic");
+    }
+    const int st = volcomp_lib_decode_smooth(
+        compressed.data(), compressed.size(), reinterpret_cast<uint8_t*>(out.data()), out.size(),
+        strength, zero_guard ? VOLCOMP_LIB_DEBLOCK_ZERO_GUARD : 0u);
+    if (st != VOLCOMP_LIB_OK) fail("volcomp_decode_smooth", st);
+}
+
 }  // namespace utils
