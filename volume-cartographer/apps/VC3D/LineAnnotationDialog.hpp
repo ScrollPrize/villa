@@ -19,6 +19,7 @@
 
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationFiberSegments.hpp"
+#include "LineAnnotationPresenceOverlay.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
 #include <opencv2/core/mat.hpp>
@@ -43,6 +44,11 @@ class QVariantAnimation;
 class QVBoxLayout;
 class QSplitter;
 class QSpinBox;
+class QSlider;
+class QPushButton;
+class QToolButton;
+class QCheckBox;
+class Volume;
 class ViewerManager;
 class PlaneSurface;
 class QuadSurface;
@@ -161,6 +167,27 @@ public:
     void setFiberInferenceDatasetOptions(
         std::vector<std::pair<std::string, std::string>> options,
         const std::string& selectedLocation);
+    // Fiber presence overlay on the four generated panes. Dialog-local: the
+    // panes leave the app-wide Overlay panel and draw only this. The dialog
+    // owns visibility, colour, opacity and threshold; the controller supplies
+    // the volume through setPresenceOverlaySource().
+    bool presenceOverlayEnabled() const;
+    // Advanced mode: any project volume, chosen by id from the flyout's
+    // volume list, instead of the fiber presence channel.
+    bool presenceOverlayAdvanced() const;
+    const std::string& presenceOverlayVolumeId() const;
+    // (id, label) pairs for the advanced volume list; the controller refreshes
+    // them with the dataset menus. A persisted id that is no longer listed
+    // stays selected in the settings but shows as unavailable.
+    void setPresenceOverlayVolumeOptions(std::vector<std::pair<std::string, QString>> options);
+    // `volume` is the selected fiber dataset's presence channel already on the
+    // active volume's grid, and `maxDisplayedResolution` the finest pyramid
+    // level it actually stores (exports start at /3, so finer levels do not
+    // exist to fetch). A null volume clears the panes; `description` then says
+    // why and is shown in the flyout instead of the dataset name.
+    void setPresenceOverlaySource(std::shared_ptr<Volume> volume,
+                                  int maxDisplayedResolution,
+                                  const QString& description);
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
     void setGeneratedBranchLinePoints(std::vector<std::vector<cv::Vec3f>> branchLinePoints);
     void setGeneratedBranchLinks(std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks);
@@ -283,6 +310,14 @@ signals:
     void lasagnaDatasetSelectionChanged(const std::string& location);
     void fiberInferenceDatasetSelectionChanged(const std::string& location);
     void extrapolationDistanceChanged(int distanceVx);
+    // The user switched the presence overlay on or off (button, menu or "P").
+    // On enable the controller resolves the volume and calls
+    // setPresenceOverlaySource(); on disable the dialog has already cleared
+    // the panes itself.
+    void presenceOverlayEnabledChanged(bool enabled);
+    // The source changed while the overlay is on (advanced mode toggled, or
+    // another volume picked); the controller re-resolves it.
+    void presenceOverlaySourceChanged();
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -353,6 +388,11 @@ private:
     // window/app (the key-up is delivered elsewhere; don't render unattended).
     void stopArrowPanForFocusLoss();
     void tickArrowPan();
+    // "P" is also the app-wide raw-points-overlay QShortcut. Shortcuts are
+    // resolved at ShortcutOverride, before any key press is delivered, so the
+    // dialog claims the override while its panes have focus; the press then
+    // reaches handleKeyPress. True when the event was claimed.
+    bool claimPresenceOverlayShortcut(QEvent* event);
     void finishArrowPan(double position);
     void cancelArrowPan();
     // Up/Down: scale the cruise speed (persisted) and flash the badge.
@@ -472,6 +512,21 @@ private:
     void saveWindowGeometry() const;
     void restoreGeneratedViewStateSettings();
     void saveGeneratedViewStateSettings();
+    // Presence overlay: the four generated panes it applies to (never the seed
+    // pane, which keeps following the app-wide overlay).
+    std::vector<CChunkedVolumeViewer*> presenceOverlayPanes() const;
+    // Marks the pane as locally managed and pushes the current settings and
+    // volume (or clears the overlay when off / unresolved).
+    void applyPresenceOverlayToPane(CChunkedVolumeViewer* viewer);
+    void applyPresenceOverlayToPanes();
+    // Swatch icon, checked state, tooltip, flyout header and control positions.
+    void updatePresenceOverlayUi();
+    void savePresenceOverlaySettings() const;
+    // A QMenu lays out its embedded widget once, at popup, so a row shown or
+    // a header wrapped afterwards sits outside the frame and is clipped.
+    // While the flyout is open and its content height no longer matches,
+    // re-pop it at the same spot so it is sized for what it now holds.
+    void relayoutPresenceOverlayFlyout();
 
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
@@ -505,6 +560,24 @@ private:
     QWidget* _tagRowWidget = nullptr;
     QHBoxLayout* _tagRowLayout = nullptr;
     QProgressBar* _sideStripIntersectionProgress = nullptr;
+    // Fiber presence overlay state. The action is shared by the toolbar split
+    // button and the hamburger menu so both show one checked state.
+    vc3d::line_annotation::PresenceOverlaySettings _presenceOverlay;
+    std::shared_ptr<Volume> _presenceOverlayVolume;
+    int _presenceOverlayMaxDisplayedResolution = 0;
+    QString _presenceOverlayDescription;
+    QAction* _presenceOverlayAction = nullptr;
+    QToolButton* _presenceOverlayButton = nullptr;
+    QLabel* _presenceOverlayHeader = nullptr;
+    QSlider* _presenceOpacitySlider = nullptr;
+    QLabel* _presenceOpacityValue = nullptr;
+    QPushButton* _presenceColorButton = nullptr;
+    QSlider* _presenceThresholdSlider = nullptr;
+    QLabel* _presenceThresholdValue = nullptr;
+    QCheckBox* _presenceAdvancedCheck = nullptr;
+    QLabel* _presenceVolumeLabel = nullptr;
+    QComboBox* _presenceVolumeCombo = nullptr;
+    std::vector<std::pair<std::string, QString>> _presenceVolumeOptions;
     QAction* _mirrorCursorAction = nullptr;
     QAction* _resetViewsAction = nullptr;
     QPointer<QWidget> _optimizationOverlay;

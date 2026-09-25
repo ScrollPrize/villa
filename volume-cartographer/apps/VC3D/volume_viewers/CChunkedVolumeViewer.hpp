@@ -161,6 +161,13 @@ public:
     void setOverlayWindow(float low, float high) override;
     void setOverlayMaxDisplayedResolution(int level) override;
     void setOverlayComposite(const OverlayCompositeSettings& settings) override;
+    void setOverlayLocallyManaged(bool managed) override { _overlayLocallyManaged = managed; }
+    bool overlayLocallyManaged() const override { return _overlayLocallyManaged; }
+    void setOverlayValueWeightedAlpha(bool enabled) override;
+    // The overlay volume currently assigned; hosts compare before re-assigning
+    // because setOverlayVolume rebuilds the overlay surface cache even for the
+    // same volume.
+    std::shared_ptr<Volume> overlayVolume() const { return _overlayVolume; }
 
     void setSegmentationEditActive(bool active) override { if (_closing) return; _segmentationEditActive = active; }
     void setSegmentationIntersectionDeferral(bool active) override;
@@ -425,6 +432,7 @@ private:
         std::string overlayColormapId;
         float overlayWindowLow = 0.0f;
         float overlayWindowHigh = 255.0f;
+        bool overlayValueWeightedAlpha = false;
         OverlayCompositeSettings overlayComposite;
         std::uint64_t chunkContentEpoch = 0;
         std::uint64_t surfaceGeometryEpoch = 0;
@@ -645,6 +653,8 @@ private:
     float _overlayWindowLow = 0.0f;
     float _overlayWindowHigh = 255.0f;
     int _overlayMaxDisplayedResolution = 0;
+    bool _overlayValueWeightedAlpha = false;
+    bool _overlayLocallyManaged = false;
     OverlayCompositeSettings _overlayComposite;
 
     CompositeRenderSettings _compositeSettings;

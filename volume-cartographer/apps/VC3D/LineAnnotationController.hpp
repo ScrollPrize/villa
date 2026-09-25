@@ -53,7 +53,7 @@ class SurfacePanelController;
 class ViewerManager;
 class VolumePkg;
 class QWidget;
-namespace vc::lasagna { class LasagnaDataset; class LasagnaNormalSampler; }
+namespace vc::lasagna { class LasagnaDataset; class LasagnaNormalSampler; struct LasagnaDatasetManifest; }
 namespace vc::fiber_tracer { class FiberPredictionField; }
 
 class LineAnnotationController : public QObject
@@ -65,6 +65,11 @@ public:
         Sideways,
         ZInOut,
     };
+
+    // The package's contents changed without a volume switch (a Lasagna or
+    // fiber dataset attached, a catalog reload): open dialogs refresh their
+    // dataset/volume lists and re-resolve their pane overlays.
+    void onPackageContentsRefreshed();
 
     struct OptimizationTaskResult {
         bool ok = false;
@@ -904,6 +909,45 @@ private:
     void refreshLineAnnotationDatasetMenu(LineAnnotationDialog* dialog) const;
     void handleLasagnaDatasetSelectionChanged(const std::string& location);
     void handleFiberInferenceDatasetSelectionChanged(const std::string& location);
+    // Fiber presence overlay: the selected fiber dataset's presence channel,
+    // as a Volume on the active volume's grid, for the dialog's panes.
+    struct PresenceOverlaySource {
+        std::shared_ptr<Volume> volume;
+        // Finest pyramid level the volume stores (exports start coarse).
+        int maxDisplayedResolution = 0;
+        QString description;
+    };
+    // Throws std::runtime_error with a user-readable reason when there is
+    // nothing to show (no dataset, no presence group, volume not attached,
+    // grids not dyadically related).
+    [[nodiscard]] PresenceOverlaySource resolvePresenceOverlaySource();
+    // Advanced mode: any attached volume by id, fitted to the active grid the
+    // same way. Throws like resolvePresenceOverlaySource.
+    [[nodiscard]] PresenceOverlaySource resolveVolumeOverlaySource(
+        const std::string& volumeId);
+    // Shared tail: how many pyramid levels separate the volume from the active
+    // grid (from its finest stored level, cross-checked against the exact
+    // frame it was published against when `exactFrameZYX` is known), a cached
+    // rebased view when the active volume is coarser, and the finest stored
+    // level. Throws with a reason when the volume does not fit.
+    [[nodiscard]] PresenceOverlaySource fitOverlayVolumeToActiveGrid(
+        const std::shared_ptr<Volume>& volume,
+        const std::string& volumeId,
+        const std::optional<std::array<std::size_t, 3>>& exactFrameZYX,
+        const QString& label);
+    // Parses a (cached) Lasagna manifest by project location.
+    [[nodiscard]] vc::lasagna::LasagnaDatasetManifest openLasagnaManifestForOverlay(
+        const std::string& location) const;
+    // Re-resolves and hands the result (or the reason) to a pane's dialog
+    // when its overlay is on; a no-op for dialogs with the overlay off.
+    void refreshPresenceOverlay(const PaneRecord& pane);
+    void refreshPresenceOverlays();
+    // Active-volume switch, step one: every enabled dialog drops its overlay
+    // synchronously so no pane renders the old view against the new base.
+    void clearPresenceOverlaysForRefit();
+    // Step two, on the next event-loop turn, once every pane has adopted the
+    // new base: resolve and install the re-fitted view. Coalesced.
+    void schedulePresenceOverlayRefresh();
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     bool finalizeSessionOptimizationSynchronously(LineAnnotationSession& session,
                                                   bool fireSuccessCallback);
@@ -1338,6 +1382,14 @@ private:
     // reselection of the current volume is not treated as a switch. Cleared on
     // package change.
     std::string _lastVolumeChangedId;
+    // Presence volumes rebased onto a downsampled active volume, keyed by
+    // "<presence volume id>#<levels>". Dropped with the package.
+    struct RebasedPresenceView {
+        std::shared_ptr<Volume> source;
+        std::shared_ptr<Volume> view;
+    };
+    std::map<std::string, RebasedPresenceView> _rebasedPresenceVolumes;
+    bool _presenceOverlayRefreshQueued = false;
     // Why the package's umbilicus could not be used, for the strip notice.
     // Empty when one was applied, and when none exists to complain about.
     // Orienting off the volume centre instead is exactly the silent degradation

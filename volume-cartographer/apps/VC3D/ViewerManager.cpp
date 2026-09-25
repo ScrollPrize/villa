@@ -1143,7 +1143,7 @@ void ViewerManager::setOverlayVolume(std::shared_ptr<Volume> volume, const std::
     }
     _overlayVolume = std::move(volume);
     _overlayVolumeId = _overlayVolume ? volumeId : std::string{};
-    forEachBaseViewer([this](VolumeViewerBase* v) { v->setOverlayVolume(_overlayVolume); });
+    forEachGlobalOverlayViewer([this](VolumeViewerBase* v) { v->setOverlayVolume(_overlayVolume); });
 
     emit overlayVolumeAvailabilityChanged(static_cast<bool>(_overlayVolume));
 }
@@ -1161,13 +1161,13 @@ std::string ViewerManager::currentVolumeId() const
 void ViewerManager::setOverlayOpacity(float opacity)
 {
     _overlayOpacity = std::clamp(opacity, 0.0f, 1.0f);
-    forEachBaseViewer([this](VolumeViewerBase* v) { v->setOverlayOpacity(_overlayOpacity); });
+    forEachGlobalOverlayViewer([this](VolumeViewerBase* v) { v->setOverlayOpacity(_overlayOpacity); });
 }
 
 void ViewerManager::setOverlayColormap(const std::string& colormapId)
 {
     _overlayColormapId = colormapId;
-    forEachBaseViewer([this](VolumeViewerBase* v) { v->setOverlayColormap(_overlayColormapId); });
+    forEachGlobalOverlayViewer([this](VolumeViewerBase* v) { v->setOverlayColormap(_overlayColormapId); });
 }
 
 void ViewerManager::setOverlaySamplingMethod(vc::Sampling method)
@@ -1175,7 +1175,7 @@ void ViewerManager::setOverlaySamplingMethod(vc::Sampling method)
     _overlaySamplingMethod = method == vc::Sampling::Trilinear
         ? vc::Sampling::Trilinear
         : vc::Sampling::Nearest;
-    forEachBaseViewer([this](VolumeViewerBase* v) {
+    forEachGlobalOverlayViewer([this](VolumeViewerBase* v) {
         v->setOverlaySamplingMethod(_overlaySamplingMethod);
     });
 }
@@ -1207,7 +1207,7 @@ void ViewerManager::setOverlayWindow(float low, float high)
         _volumeOverlay->syncWindowFromManager(_overlayWindowLow, _overlayWindowHigh);
     }
 
-    forEachBaseViewer([this](VolumeViewerBase* v) { v->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh); });
+    forEachGlobalOverlayViewer([this](VolumeViewerBase* v) { v->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh); });
 
     emit overlayWindowChanged(_overlayWindowLow, _overlayWindowHigh);
 }
@@ -1215,7 +1215,7 @@ void ViewerManager::setOverlayWindow(float low, float high)
 void ViewerManager::setOverlayMaxDisplayedResolution(int level)
 {
     _overlayMaxDisplayedResolution = std::clamp(level, 0, 5);
-    forEachBaseViewer([this](VolumeViewerBase* v) {
+    forEachGlobalOverlayViewer([this](VolumeViewerBase* v) {
         v->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
     });
 }
@@ -1230,7 +1230,7 @@ void ViewerManager::setOverlayComposite(const OverlayCompositeSettings& settings
     sanitized.layersBehind = std::clamp(sanitized.layersBehind, 0, 64);
 
     _overlayComposite = sanitized;
-    forEachBaseViewer([this](VolumeViewerBase* v) {
+    forEachGlobalOverlayViewer([this](VolumeViewerBase* v) {
         v->setOverlayComposite(_overlayComposite);
     });
 }
@@ -2061,4 +2061,14 @@ void ViewerManager::forEachBaseViewer(const std::function<void(VolumeViewerBase*
             fn(viewer);
         }
     }
+}
+
+void ViewerManager::forEachGlobalOverlayViewer(
+    const std::function<void(VolumeViewerBase*)>& fn) const
+{
+    forEachBaseViewer([&fn](VolumeViewerBase* viewer) {
+        if (viewer && !viewer->overlayLocallyManaged()) {
+            fn(viewer);
+        }
+    });
 }

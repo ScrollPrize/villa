@@ -11,6 +11,7 @@
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSaveJob.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
+#include "LineAnnotationPresenceOverlay.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "SurfacePanelController.hpp"
@@ -2096,6 +2097,12 @@ LineAnnotationController::LineAnnotationController(CState* state,
                     // re-emission. Cleared on package change, since two
                     // projects can name a volume identically.
                     if (volumeId == _lastVolumeChangedId) {
+                        // A package UI refresh (attach, catalog reload) re-emits
+                        // for the current volume: the dialogs' volume lists and
+                        // an overlay whose source was replaced under the same
+                        // id have to follow, the generated views do not.
+                        refreshLineAnnotationDatasetMenus();
+                        refreshPresenceOverlays();
                         return;
                     }
                     _lastVolumeChangedId = volumeId;
@@ -2558,6 +2565,29 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
             [this](const std::string& location) {
                 handleFiberInferenceDatasetSelectionChanged(location);
             });
+    connect(dialog,
+            &LineAnnotationDialog::presenceOverlayEnabledChanged,
+            this,
+            [this, surfaceName](bool enabled) {
+                // Off is handled inside the dialog (it clears its panes).
+                if (!enabled) {
+                    return;
+                }
+                if (auto* pane = paneForSurface(surfaceName)) {
+                    refreshPresenceOverlay(*pane);
+                }
+            });
+    connect(dialog,
+            &LineAnnotationDialog::presenceOverlaySourceChanged,
+            this,
+            [this, surfaceName]() {
+                if (auto* pane = paneForSurface(surfaceName)) {
+                    refreshPresenceOverlay(*pane);
+                }
+            });
+    // A persisted "on" wants its volume before the generated panes exist;
+    // the dialog holds it until they do.
+    refreshPresenceOverlay(_panes.back());
     connect(dialog,
             &LineAnnotationDialog::generatedControlPointRequested,
             this,
@@ -7521,6 +7551,8 @@ void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg>
     // The volume-reselection guard must not carry an id across packages: two
     // projects can name a volume identically.
     _lastVolumeChangedId.clear();
+    // Rebased presence views belong to the old package's volumes.
+    _rebasedPresenceVolumes.clear();
     // Dropped outright rather than left to the frame comparison: two projects can
     // sit in one directory with identical grids, so both halves of the cache key
     // can match while the umbilicus file behind them differs.
@@ -10099,6 +10131,18 @@ void LineAnnotationController::refreshLineAnnotationDatasetMenu(
     dialog->setFiberInferenceDatasetOptions(
         std::move(fiberOptions),
         vpkg->selectedFiberInferenceDataset());
+    // Advanced pane-overlay list: every attached volume, "name (id)" like the
+    // main Overlay panel, unfiltered since the fit is decided per grid.
+    std::vector<std::pair<std::string, QString>> volumeOptions;
+    for (const auto& id : vpkg->volumeIDs()) {
+        const auto volume = vpkg->volume(id);
+        const QString name = volume ? QString::fromStdString(volume->name()) : QString();
+        volumeOptions.emplace_back(
+            id, name.isEmpty()
+                    ? QString::fromStdString(id)
+                    : QStringLiteral("%1 (%2)").arg(name, QString::fromStdString(id)));
+    }
+    dialog->setPresenceOverlayVolumeOptions(std::move(volumeOptions));
 }
 
 void LineAnnotationController::handleLasagnaDatasetSelectionChanged(
@@ -10158,6 +10202,9 @@ void LineAnnotationController::handleFiberInferenceDatasetSelectionChanged(
 
     auto vpkg = _state->vpkg();
     if (vpkg->selectedFiberInferenceDataset() == location) {
+        // Re-picking the current dataset is the user's way to retry an overlay
+        // that could not resolve earlier (e.g. before the dataset was attached).
+        refreshPresenceOverlays();
         return;
     }
     vpkg->setSelectedFiberInferenceDataset(location);
@@ -10174,7 +10221,354 @@ void LineAnnotationController::handleFiberInferenceDatasetSelectionChanged(
         }
     }
     refreshLineAnnotationDatasetMenus();
+    // The overlay follows the dataset menu: a different model, or one without
+    // a presence group (which clears the panes with the reason shown).
+    refreshPresenceOverlays();
 }
+
+namespace
+{
+
+// A volume's level-0 frame as the size_t triple the dyadic matcher takes.
+std::array<std::size_t, 3> volumeFrameShapeZYX(const Volume& volume)
+{
+    const auto shape = volume.shape();
+    return {static_cast<std::size_t>(std::max(0, shape[0])),
+            static_cast<std::size_t>(std::max(0, shape[1])),
+            static_cast<std::size_t>(std::max(0, shape[2]))};
+}
+
+}  // namespace
+
+LineAnnotationController::PresenceOverlaySource
+LineAnnotationController::resolvePresenceOverlaySource()
+{
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg) {
+        throw std::runtime_error(tr("no project is open").toStdString());
+    }
+    const auto active = _state->currentVolume();
+    if (!active) {
+        throw std::runtime_error(tr("no active volume").toStdString());
+    }
+
+    std::string selected = vpkg->selectedFiberInferenceDataset();
+    const auto fiberEntries = vpkg->fiberInferenceDatasetEntries();
+    if (selected.empty() && fiberEntries.size() == 1) {
+        selected = fiberEntries.front().location;
+    }
+    if (selected.empty()) {
+        throw std::runtime_error(
+            tr("no fiber dataset is selected (menu > Fiber dataset)").toStdString());
+    }
+    // The presence volume was tagged with the location the dataset was
+    // attached under; a catalogue entry may also be known by its public URL.
+    std::vector<std::string> manifestCandidates{selected};
+    QString label = QString::fromStdString(fs::path(selected).stem().string());
+    const auto entryIt = std::find_if(
+        fiberEntries.begin(), fiberEntries.end(),
+        [&](const auto& entry) { return entry.location == selected; });
+    if (entryIt != fiberEntries.end()) {
+        const std::string identity = vc3d::opendata::lasagnaSourceManifestLocation(*entryIt);
+        if (!identity.empty() && identity != selected) {
+            manifestCandidates.push_back(identity);
+        }
+        label = QString::fromStdString(datasetEntryMenuLabel(*entryIt));
+    }
+
+    // The manifest names the presence group.
+    std::string presenceGroup;
+    // The manifest's base grid is the exact scroll frame the model was run on.
+    // The presence pyramid itself only implies it: its stored level times 2^k
+    // reverses a ceiling division (2602 x 8 = 20816 for a 20812 scroll), which
+    // the dyadic matcher rightly refuses.
+    std::optional<std::array<std::size_t, 3>> baseShapeZYX;
+    const auto readManifest = [&](const vc::lasagna::LasagnaDatasetManifest& manifest) {
+        if (const auto* group = manifest.groupForChannel("presence")) {
+            presenceGroup = group->name;
+        }
+        baseShapeZYX = manifest.baseShapeZYX;
+    };
+    // Always re-parsed from the (cached) manifest file rather than reused from
+    // the session's open dataset: a re-attach of the same location may have
+    // rewritten the file (a presence group added, a frame corrected), and the
+    // session keeps its old manifest until its next solve.
+    readManifest(openLasagnaManifestForOverlay(selected));
+    if (presenceGroup.empty()) {
+        throw std::runtime_error(
+            tr("%1 has no presence channel").arg(label).toStdString());
+    }
+
+    std::vector<vc3d::line_annotation::TaggedVolumeId> volumes;
+    for (const auto& id : vpkg->volumeIDs()) {
+        volumes.push_back({id, vpkg->volumeTags(id)});
+    }
+    const auto volumeId = vc3d::line_annotation::findLasagnaGroupVolumeId(
+        volumes, manifestCandidates, presenceGroup);
+    if (!volumeId) {
+        throw std::runtime_error(
+            tr("the presence volume of %1 is not attached to this project "
+               "(re-attach the fiber dataset)").arg(label).toStdString());
+    }
+    auto presence = vpkg->volume(*volumeId);
+    if (!presence) {
+        throw std::runtime_error(
+            tr("the presence volume of %1 could not be opened").arg(label).toStdString());
+    }
+
+    // The presence pyramid's level-0 frame is the fiber manifest's base grid.
+    return fitOverlayVolumeToActiveGrid(presence, *volumeId, baseShapeZYX, label);
+}
+
+LineAnnotationController::PresenceOverlaySource
+LineAnnotationController::resolveVolumeOverlaySource(const std::string& volumeId)
+{
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg) {
+        throw std::runtime_error(tr("no project is open").toStdString());
+    }
+    if (volumeId.empty()) {
+        throw std::runtime_error(tr("no volume chosen (advanced mode)").toStdString());
+    }
+    auto volume = vpkg->volume(volumeId);
+    if (!volume) {
+        throw std::runtime_error(
+            tr("volume %1 is not attached to this project")
+                .arg(QString::fromStdString(volumeId)).toStdString());
+    }
+    const QString label = QStringLiteral("%1 (%2)")
+        .arg(QString::fromStdString(volume->name()), QString::fromStdString(volumeId));
+    // A Lasagna-attached volume (presence, nx, ny, grad_mag...) was published
+    // against its manifest's base grid; read that exact frame the same way the
+    // simple mode does. Other volumes fit by their stored level alone.
+    std::optional<std::array<std::size_t, 3>> exactFrame;
+    for (const auto& tag : vpkg->volumeTags(volumeId)) {
+        constexpr std::string_view prefix = vc3d::line_annotation::kLasagnaManifestTagPrefix;
+        if (tag.rfind(prefix, 0) == 0) {
+            try {
+                exactFrame = openLasagnaManifestForOverlay(tag.substr(prefix.size())).baseShapeZYX;
+            } catch (const std::exception& ex) {
+                Logger()->warn("Presence overlay: manifest of volume '{}' unreadable: {}",
+                               volumeId, ex.what());
+            }
+            break;
+        }
+    }
+    return fitOverlayVolumeToActiveGrid(volume, volumeId, exactFrame, label);
+}
+
+vc::lasagna::LasagnaDatasetManifest
+LineAnnotationController::openLasagnaManifestForOverlay(const std::string& location) const
+{
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    vc::lasagna::LasagnaDatasetOpenOptions options;
+    options.remoteCacheRoot = vc3d::remoteCachePathFs();
+    const std::string resolved = vc::project::isLocationRemote(location)
+        ? location
+        : vc::project::resolveLocalPath(
+              location, vpkg ? vpkg->path().parent_path() : fs::path{}).string();
+    return vc::lasagna::LasagnaDataset::openLocation(resolved, options).manifest();
+}
+
+LineAnnotationController::PresenceOverlaySource
+LineAnnotationController::fitOverlayVolumeToActiveGrid(
+    const std::shared_ptr<Volume>& volume,
+    const std::string& volumeId,
+    const std::optional<std::array<std::size_t, 3>>& exactFrameZYX,
+    const QString& label)
+{
+    const auto active = _state ? _state->currentVolume() : nullptr;
+    if (!active) {
+        throw std::runtime_error(tr("no active volume").toStdString());
+    }
+    const auto activeShape = active->shape();
+    const std::array<std::size_t, 3> activeZYX{
+        static_cast<std::size_t>(std::max(0, activeShape[0])),
+        static_cast<std::size_t>(std::max(0, activeShape[1])),
+        static_cast<std::size_t>(std::max(0, activeShape[2]))};
+
+    int rebaseLevel = 0;
+    if (volume != active) {
+        // Two independent readings of how the volume sits on the active grid.
+        // (a) Its finest stored level must fit some level of a view whose
+        //     level 0 is the active grid; this is what the pixels are.
+        // (b) The exact frame it was published against, when known, gives the
+        //     dyadic scale directly.
+        // (a) alone is enough for a normal pyramid; (b) disambiguates tiny
+        // shapes; and when both exist they must agree, otherwise the volume is
+        // not what its manifest says (a single stored level attached as level
+        // 0, for instance) and drawing it would put presence on the wrong
+        // voxels.
+        std::vector<vc3d::line_annotation::StoredPyramidLevel> storedLevels;
+        try {
+            for (const int level : volume->presentScaleLevels()) {
+                storedLevels.push_back({level, volume->shape(level),
+                                        volume->storageChunkShape(level)});
+            }
+        } catch (const std::exception& ex) {
+            throw std::runtime_error(
+                tr("%1 has no readable pyramid level: %2")
+                    .arg(label, QString::fromUtf8(ex.what())).toStdString());
+        }
+        if (exactFrameZYX) {
+            // A known frame is binding. The dyadic matcher gives the rebase
+            // level and tolerates the one-voxel count/inclusive-maximum
+            // difference between frame conventions; the stored levels must then
+            // be that frame's pyramid at their own indices (a single level
+            // attached as level 0 is not). Falling back to the stored-level fit
+            // alone would accept a volume whose manifest says it belongs
+            // elsewhere.
+            std::optional<int> fromFrame;
+            std::string frameProblem;
+            try {
+                const double scale = vc3d::line_annotation::resolveFiberBaseToVolumeScale(
+                    exactFrameZYX, activeShape);
+                fromFrame = vc3d::line_annotation::presenceRebaseLevel(scale);
+                if (!fromFrame) {
+                    frameProblem = tr("the active volume is finer than the frame "
+                                      "(scale %1)").arg(scale).toStdString();
+                }
+            } catch (const std::exception& ex) {
+                frameProblem = ex.what();
+            }
+            if (!fromFrame) {
+                throw std::runtime_error(
+                    tr("%1 was published against a grid that does not match the "
+                       "active volume: %2")
+                        .arg(label, QString::fromStdString(frameProblem)).toStdString());
+            }
+            if (!vc3d::line_annotation::storedLevelsConsistentWithFrame(
+                    *exactFrameZYX, storedLevels)) {
+                throw std::runtime_error(
+                    tr("%1's stored levels are not the pyramid of the frame its "
+                       "manifest records (a single level attached as level 0?); "
+                       "re-attach the dataset")
+                        .arg(label).toStdString());
+            }
+            rebaseLevel = *fromFrame;
+        } else {
+            // No recorded frame: the stored levels themselves must fit the
+            // active grid at exactly one rebase level.
+            const auto fits =
+                vc3d::line_annotation::rebaseLevelsFittingPyramid(activeZYX, storedLevels);
+            if (fits.empty()) {
+                throw std::runtime_error(
+                    tr("%1's stored levels do not fit the active volume at any "
+                       "pyramid level (different scroll, a finer active volume, or a "
+                       "single level attached as level 0)")
+                        .arg(label).toStdString());
+            }
+            if (fits.size() != 1) {
+                throw std::runtime_error(
+                    tr("%1 fits the active volume at several pyramid levels and "
+                       "records no frame to decide")
+                        .arg(label).toStdString());
+            }
+            rebaseLevel = fits.front();
+        }
+    }
+
+    PresenceOverlaySource source;
+    source.volume = volume;
+    source.description = label;
+    if (rebaseLevel > 0) {
+        // Keyed by id and level, but a package reload can replace the Volume
+        // behind an id: a view is only reused for the source it was built on.
+        const std::string key = volumeId + "#" + std::to_string(rebaseLevel);
+        auto cached = _rebasedPresenceVolumes.find(key);
+        if (cached == _rebasedPresenceVolumes.end() || cached->second.source != volume) {
+            RebasedPresenceView entry;
+            entry.source = volume;
+            entry.view = Volume::NewRebasedView(volume, rebaseLevel);
+            cached = _rebasedPresenceVolumes.insert_or_assign(key, std::move(entry)).first;
+        }
+        source.volume = cached->second.view;
+        source.description += tr(" (rebased %1 level(s))").arg(rebaseLevel);
+    }
+    // Exports may start at a coarse level; asking the renderer for finer
+    // levels would wait on chunks that do not exist.
+    source.maxDisplayedResolution = source.volume->firstPresentScaleLevel();
+    return source;
+}
+
+void LineAnnotationController::refreshPresenceOverlay(const PaneRecord& pane)
+{
+    if (!pane.dialog || !pane.dialog->presenceOverlayEnabled()) {
+        return;
+    }
+    try {
+        auto source = pane.dialog->presenceOverlayAdvanced()
+            ? resolveVolumeOverlaySource(pane.dialog->presenceOverlayVolumeId())
+            : resolvePresenceOverlaySource();
+        pane.dialog->setPresenceOverlaySource(
+            std::move(source.volume), source.maxDisplayedResolution, source.description);
+    } catch (const std::exception& ex) {
+        // Not a modal error: the flyout header carries the reason, and the
+        // overlay simply stays empty until the cause is fixed.
+        Logger()->warn("Line annotation presence overlay unavailable: {}", ex.what());
+        pane.dialog->setPresenceOverlaySource(nullptr, 0, QString::fromUtf8(ex.what()));
+    }
+}
+
+void LineAnnotationController::refreshPresenceOverlays()
+{
+    // Snapshot: a dialog's setter re-enters nothing here today, but the
+    // pattern elsewhere in this controller is to never iterate _panes live.
+    std::vector<QPointer<LineAnnotationDialog>> dialogs;
+    std::vector<std::shared_ptr<LineAnnotationSession>> sessions;
+    for (const auto& pane : _panes) {
+        dialogs.push_back(pane.dialog);
+        sessions.push_back(pane.session);
+    }
+    for (std::size_t i = 0; i < dialogs.size(); ++i) {
+        if (!dialogs[i]) {
+            continue;
+        }
+        PaneRecord snapshot;
+        snapshot.dialog = dialogs[i];
+        snapshot.session = sessions[i];
+        refreshPresenceOverlay(snapshot);
+    }
+}
+
+void LineAnnotationController::onPackageContentsRefreshed()
+{
+    if (!_state || !_state->vpkg()) {
+        return;
+    }
+    refreshLineAnnotationDatasetMenus();
+    refreshPresenceOverlays();
+}
+
+void LineAnnotationController::clearPresenceOverlaysForRefit()
+{
+    std::vector<QPointer<LineAnnotationDialog>> dialogs;
+    for (const auto& pane : _panes) {
+        dialogs.push_back(pane.dialog);
+    }
+    for (const auto& dialog : dialogs) {
+        if (dialog && dialog->presenceOverlayEnabled()) {
+            dialog->setPresenceOverlaySource(
+                nullptr, 0, tr("re-fitting to the active volume..."));
+        }
+    }
+}
+
+void LineAnnotationController::schedulePresenceOverlayRefresh()
+{
+    if (_presenceOverlayRefreshQueued) {
+        return;
+    }
+    _presenceOverlayRefreshQueued = true;
+    QMetaObject::invokeMethod(
+        this,
+        [this]() {
+            _presenceOverlayRefreshQueued = false;
+            refreshPresenceOverlays();
+        },
+        Qt::QueuedConnection);
+}
+
 
 bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
     LineAnnotationSession& session)
@@ -10252,6 +10646,8 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
             }
             manifestPath = openedDataset.manifest().manifestPath;
             refreshLineAnnotationDatasetMenus();
+            // The dataset the overlay was waiting for just arrived.
+            refreshPresenceOverlays();
         } catch (const std::exception& error) {
             showError(QString::fromUtf8(error.what()), headless);
             return false;
@@ -12529,6 +12925,18 @@ void LineAnnotationController::onActiveVolumeChanged()
     // through its own frame comparison.
     ++_orientationEpoch;
     scheduleStaleViewRefresh();
+    // A downsample-level switch changes which rebased presence view the panes
+    // need, and every render job must pair a base volume with the view fitted
+    // to it. This slot runs inside the volumeChanged emission, before the
+    // panes' OnVolumeChanged (the controller connected in its constructor,
+    // the panes connect at creation), so the panes still hold the old base:
+    // installing the new view now would render old base + new view, and
+    // deferring everything would render new base + old view. Hence two steps:
+    // clear the overlay synchronously (old base, no overlay; then new base,
+    // no overlay), and install the re-fitted view on the next event-loop turn,
+    // once every pane has adopted the new base.
+    clearPresenceOverlaysForRefit();
+    schedulePresenceOverlayRefresh();
 }
 
 void LineAnnotationController::scheduleStaleViewRefresh()

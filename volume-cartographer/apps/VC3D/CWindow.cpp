@@ -4366,6 +4366,12 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
     updateNormalGridAvailability();
 
     refreshVolumeSelectionUi(preferredVolumeId);
+    // An attach or catalog reload changes the package contents without
+    // necessarily switching the active volume, so the dialogs' volume lists and
+    // pane overlays are told explicitly.
+    if (_lineAnnotationController) {
+        _lineAnnotationController->onPackageContentsRefreshed();
+    }
     if (!_state->vpkg()->hasVolumes()) {
         Logger()->info("Opened volpkg '{}' with no volumes", _state->vpkgPath().toStdString());
         showStatusBarMessage(tr("Opened volume package with no volumes."), 5000);

@@ -233,6 +233,9 @@ public:
     double zScrollSensitivity() const { return _zScrollSensitivity; }
 
     void forEachBaseViewer(const std::function<void(VolumeViewerBase*)>& fn) const;
+    // The viewers that follow the app-wide Overlay panel: every registered
+    // viewer except those whose overlay is locally managed by their host.
+    void forEachGlobalOverlayViewer(const std::function<void(VolumeViewerBase*)>& fn) const;
     void setIntersectionThickness(float thickness);
     float intersectionThickness() const { return _intersectionThickness; }
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids);

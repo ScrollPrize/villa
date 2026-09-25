@@ -51,6 +51,7 @@ set(srcs
     LineAnnotationController.hpp
     LineAnnotationFiberSegments.cpp
     LineAnnotationFiberSegments.hpp
+    LineAnnotationPresenceOverlay.hpp
     LineAnnotationDialog.cpp
     LineAnnotationDialog.hpp
     LineAnnotationGeneratedViews.cpp
@@ -283,6 +284,8 @@ set(srcs
     elements/COutlinedTextItem.cpp
     volume_viewers/CChunkedVolumeViewer.cpp
     volume_viewers/CChunkedVolumeViewer.hpp
+    volume_viewers/OverlayBlendLut.hpp
+    volume_viewers/OverlayLevelSelection.hpp
     volume_viewers/IntersectionLayerItem.cpp
     volume_viewers/IntersectionLayerItem.hpp
     volume_viewers/CameraGizmoWidget.cpp
