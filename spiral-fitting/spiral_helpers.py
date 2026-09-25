@@ -10,6 +10,7 @@ import torch
 from tqdm import tqdm
 
 from sample_spiral import get_spiral_yxs, get_theta_and_radii
+from surface_orientation import GridLayout, export_metadata
 from tifxyz import (load_tifxyz, patch_to_payload, save_tifxyz,
                     save_combined_tifxyz)
 from vc3d_fiber_format_adapter import (
@@ -1467,11 +1468,14 @@ def save_mesh(
     winding_range,
     patch_satisfaction_evaluation,
     patch_atlas,
+    z_direction_is_top_to_bottom,
     tracks=(),
     run_tag=None,
     name='mesh',
     progress=None,
 ):
+    """Write one tifxyz per winding in the export layout (surface_orientation)
+    for ``z_direction_is_top_to_bottom``."""
     min_winding_idx, max_winding_idx = winding_range
     if cfg['shell_outer_winding_idx'] is not None:
         max_winding_idx = min(max_winding_idx, cfg['shell_outer_winding_idx'])
@@ -1532,12 +1536,13 @@ def save_mesh(
                 winding_zyxs = winding_slice.cpu().numpy().astype(np.float32)
                 winding_zyxs[invalid_mask] = -1.0
                 save_tifxyz(
-                    winding_zyxs,
+                    GridLayout.export(z_direction_is_top_to_bottom).apply(winding_zyxs),
                     out_dir,
                     uuid=f'w{winding_idx:03d}{uuid_suffix}{tag_suffix}',
                     step_size=step_size,
                     voxel_size_um=voxel_size_um,
                     source=f'fit_spiral {name}{uuid_suffix}',
+                    layout_metadata=export_metadata(z_direction_is_top_to_bottom),
                 )
             offset += num_thetas
             output_done += 1
@@ -1561,6 +1566,7 @@ def save_combined_preview(
     tracks=(),
     *,
     surface_id,
+    z_direction_is_top_to_bottom,
     base_shape_zyx=None,
     progress=None,
     input_extent_transform=None,
@@ -1592,6 +1598,10 @@ def save_combined_preview(
     caller passes ``None`` only when the resident patches are not in true
     scroll space (after a constraint bake), where splicing would write
     baked-space coordinates into a scroll-space surface.
+
+    The surface is written in the export layout (surface_orientation) for
+    ``z_direction_is_top_to_bottom``; the splice here and the loss maps work in
+    spiral order, the loss maps mapping through the manifest's layout.
     """
     if input_extent_transform is None:
         input_extent_transform = slice_to_spiral_transform
@@ -1696,6 +1706,7 @@ def save_combined_preview(
         grid_spacing,
         voxel_size_um,
         source='fit_spiral interactive preview',
+        z_direction_is_top_to_bottom=z_direction_is_top_to_bottom,
         first_winding=first_winding,
         cleanup_erosion_cells=3,
         base_shape_zyx=base_shape_zyx,

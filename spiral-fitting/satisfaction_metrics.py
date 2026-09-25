@@ -838,6 +838,7 @@ def save_overlay_and_print_satisfaction(
     render_volume_scale,
     voxel_size_um,
     get_or_build_unattached_pcl_flat,
+    z_direction_is_top_to_bottom,
     run_tag=None,
     save_png_visualizations=False,
     progress=None,
@@ -1058,6 +1059,7 @@ def save_overlay_and_print_satisfaction(
             winding_range=winding_range,
             patch_satisfaction_evaluation=patch_evaluation,
             patch_atlas=patch_atlas,
+            z_direction_is_top_to_bottom=z_direction_is_top_to_bottom,
             tracks=tracks,
             run_tag=run_tag, name=suffix, progress=progress,
         )

@@ -49,6 +49,8 @@ import numpy as np
 from PIL import Image
 import scipy.ndimage
 
+from surface_orientation import GridLayout
+
 LASAGNA_PREVIEW_OUTPUT_STEP_VX = 20.0
 LASAGNA_CONFIG_NAME = "flatten_fast_nofilter.json"
 # Lasagna prints this once the optimizer loop is done and the flatten model is
@@ -395,10 +397,24 @@ def _raw_run_diff_rgba(previous_manifest, current_manifest, *,
     rgba = np.zeros((*current_valid.shape, 4), dtype=np.uint8)
     if previous_manifest is None:
         return rgba, 0
+    # A preview from before the export layout (or from a spec whose z
+    # direction changed) is not compared: only one generation is affected.
+    layout = GridLayout.from_metadata(current_manifest)
+    if GridLayout.from_metadata(previous_manifest) != layout:
+        return rgba, 0
     previous_xyz, previous_valid = _surface_xyz(
         Path(previous_manifest["surface_path"]))
+    # Windings are paired from theta = 0 and rows from the lowest z, since
+    # their widths and the z range can differ between generations; in the
+    # export layout those are the right and (z bottom to top) lower ends, so
+    # compare in spiral order and map the result back.
+    current_xyz = layout.apply(current_xyz)
+    current_valid = layout.apply(current_valid)
+    previous_xyz = layout.apply(previous_xyz)
+    previous_valid = layout.apply(previous_valid)
     previous_by_winding = {
-        int(winding): bounds
+        int(winding): layout.column_range(
+            int(bounds[0]), int(bounds[1]), previous_xyz.shape[1])
         for winding, bounds in zip(
             previous_manifest.get("winding_ids", []),
             previous_manifest.get("winding_column_ranges", []))
@@ -410,8 +426,10 @@ def _raw_run_diff_rgba(previous_manifest, current_manifest, *,
         previous_bounds = previous_by_winding.get(int(winding))
         if previous_bounds is None:
             continue
-        current_begin, current_end = map(int, current_bounds)
-        previous_begin, previous_end = map(int, previous_bounds)
+        current_begin, current_end = layout.column_range(
+            int(current_bounds[0]), int(current_bounds[1]),
+            current_xyz.shape[1])
+        previous_begin, previous_end = previous_bounds
         rows = min(current_xyz.shape[0], previous_xyz.shape[0])
         width = min(current_end - current_begin,
                     previous_end - previous_begin)
@@ -427,6 +445,7 @@ def _raw_run_diff_rgba(previous_manifest, current_manifest, *,
         delta = np.linalg.norm(current_region - previous_region, axis=-1)
         target = magnitudes[:rows, current_begin:current_begin + width]
         target[valid] = delta[valid]
+    magnitudes = layout.apply(magnitudes)
     finite = np.isfinite(magnitudes) & (magnitudes > 1.0e-6)
     if not finite.any():
         return rgba, 0

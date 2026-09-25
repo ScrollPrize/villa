@@ -51,6 +51,7 @@ from PIL import Image
 # decompression-bomb guard so max_composite can open them.
 Image.MAX_IMAGE_PIXELS = None
 
+from surface_orientation import METADATA_KEY as LAYOUT_METADATA_KEY
 from tifxyz import load_tifxyz, save_tifxyz
 
 
@@ -106,10 +107,25 @@ def read_step_and_voxel(meta_path):
     return step_size, voxel_size_um
 
 
+def mesh_layout_metadata(mesh_path):
+    """The mesh's export-layout record, or None for a spiral-order mesh."""
+    with open(os.path.join(mesh_path, 'meta.json'), 'r') as f:
+        return json.load(f).get(LAYOUT_METADATA_KEY)
+
+
 def concat_meshes(mesh_paths):
-    """Load the given tifxyz meshes and concatenate their zyxs grids along the
-    theta/width axis (axis=1), padding shorter grids with the -1 invalid sentinel so
-    heights match. Returns the combined zyxs array in zyx order."""
+    """Load the given tifxyz meshes, in ascending winding order, and concatenate
+    their zyxs grids along the theta/width axis (axis=1), padding shorter grids with
+    the -1 invalid sentinel so heights match. Meshes written outermost wrap first are
+    concatenated outermost winding first, so the result keeps their layout. Returns
+    the combined zyxs array in zyx order and their layout record."""
+    layouts = {json.dumps(mesh_layout_metadata(p), sort_keys=True) for p in mesh_paths}
+    if len(layouts) != 1:
+        raise click.ClickException(
+            'Cannot concatenate meshes written in different layouts: ' + ', '.join(layouts))
+    layout = json.loads(layouts.pop())
+    if layout is not None:
+        mesh_paths = list(reversed(mesh_paths))
     grids = [load_tifxyz(p).zyxs.cpu().numpy() for p in mesh_paths]
     max_h = max(g.shape[0] for g in grids)
     padded = [
@@ -117,7 +133,7 @@ def concat_meshes(mesh_paths):
         else np.pad(g, ((0, max_h - g.shape[0]), (0, 0), (0, 0)), constant_values=-1.0)
         for g in grids
     ]
-    return np.concatenate(padded, axis=1).astype(np.float32)
+    return np.concatenate(padded, axis=1).astype(np.float32), layout
 
 
 def clean_concat_zyxs(zyxs, erode_cells, keep_largest):
@@ -242,14 +258,14 @@ def set_tifxyz_id(tifxyz_path, new_id):
 
 
 def build_full_concat(meshes_dir, meshes, concat_dir, step_size, voxel_size_um):
-    """Concatenate *every* _spliced winding mesh (in ascending winding order) into a
+    """Concatenate *every* _spliced winding mesh (see concat_meshes for the order) into a
     single full-scroll tifxyz written to concat/, named `wLLL-HHH`. Returns
     (name, concat_path, width_px)."""
     ordered = sorted(meshes, key=lambda wc: wc[0])
     lo, hi = ordered[0][0], ordered[-1][0]
     name = f'w{lo:03d}-{hi:03d}'
     mesh_paths = [os.path.join(meshes_dir, nm) for _, nm in ordered]
-    concat_zyxs = concat_meshes(mesh_paths)
+    concat_zyxs, layout = concat_meshes(mesh_paths)
     save_tifxyz(
         concat_zyxs,
         concat_dir,
@@ -257,6 +273,7 @@ def build_full_concat(meshes_dir, meshes, concat_dir, step_size, voxel_size_um):
         step_size=step_size,
         voxel_size_um=voxel_size_um,
         source=f'render_ink full-scroll concat {os.path.basename(meshes_dir.rstrip("/"))}',
+        layout_metadata=layout,
     )
     return name, os.path.join(concat_dir, name), int(concat_zyxs.shape[1])
 
@@ -466,7 +483,7 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentatio
             lo, hi = chunk[0][0], chunk[-1][0]
             name = f'w{lo:03d}-{hi:03d}'
             mesh_paths = [os.path.join(meshes_dir, nm) for _, nm in chunk]
-            concat_zyxs = concat_meshes(mesh_paths)
+            concat_zyxs, layout = concat_meshes(mesh_paths)
             # Clean the per-strip concat before it is flatboi-flattened: erode ragged
             # edges and drop dust/fragments that make SLIM diverge. Strips only — the
             # full-scroll concat below goes to the lasagna flattener, which handles
@@ -486,6 +503,7 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentatio
                 step_size=step_size,
                 voxel_size_um=voxel_size_um,
                 source=f'render_ink concat {os.path.basename(meshes_dir.rstrip("/"))}',
+                layout_metadata=layout,
             )
             concat_path = os.path.join(concat_dir, name)
             chunks.append((name, concat_path))
