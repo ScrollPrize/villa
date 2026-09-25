@@ -1,9 +1,8 @@
 """Layout of exported Spiral surface grids.
 
 Surfaces are sampled in spiral order: rows by increasing z, columns by
-increasing spiral-space theta. Spiral-space theta always runs outwards (the
-ACW mirror is applied before spiral space), so spiral order is innermost wrap
-first whatever the sense.
+increasing spiral-space theta. Spiral-space theta always runs outwards, so spiral
+order is innermost wrap first whatever the sense.
 
 Exports use the orient-segment convention instead: outermost wrap in column 0
 (always, by reversing columns) and the scroll top in row 0 (by reversing rows
