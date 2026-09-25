@@ -37,7 +37,7 @@ class TraceParams:
     # Defaults reproduce the immediate stop.
     stop_patience: int = 1
     commit_floor: float | None = None
-    seed: int = 0  # reserved for reproducible seed manifests; inference is deterministic
+    seed: int = 0  # stochastic sampler seed; each directed trace has its own stream
 
     def __post_init__(self):
         if self.n_commit < 1 or self.max_len <= 0 or not 0 <= self.confidence <= 1 or self.explore_calls < 0:
@@ -99,6 +99,20 @@ class ModelTracer:
     def close(self):
         self.pool.shutdown(wait=True)
 
+    def build_inputs(self, pos, frames, hist, hmask):
+        """Read this model's observation; subclasses can supply other image scales."""
+        items = [dict(pos=p, frame=f) for p, f in zip(pos, frames)]
+        raw, starts = read_blocks(items, self.vol, self.crop, self.pool)
+        tensor = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(self.device)
+        x = build_inputs(tensor(raw), tensor(starts).float(), tensor(pos).float(), tensor(frames).float(),
+                         tensor(hist).float(), tensor(hmask), self.grid, n_render=render_count(self.crop),
+                         gate_direction=self.crop.gate_direction, input_scale=getattr(self.vol, 'input_scale', 1.),
+                         history_sigma=self.crop.history_sigma, history_render=self.crop.history_render)
+        if self.vol.spec.mode == 'ct+presence':
+            from vesuvius.neural_tracing.fiber_follow.data import add_presence_input
+            x = add_presence_input(x, items, self.vol, self.crop, self.grid, self.pool)
+        return x
+
     @torch.no_grad()
     def trace(self, seeds_xyz, headings, histories=None, abort=None, on_decision=None, initial_states=None):
         """Greedy rollout, checking supervised confidence before committing.
@@ -128,6 +142,10 @@ class ModelTracer:
                      for s,p in zip(initial_states,seeds_xyz)]
         hist_start = [len(p)-1 for p in paths]
         frames = [frame_from_heading(h) for h in headings]
+        stochastic = getattr(self.model.cfg, 'sampler_mode', 'zero') == 'gaussian'
+        if stochastic:
+            from vesuvius.neural_tracing.fiber_follow.sampling import trace_generator, trace_noise
+            generators = [trace_generator(self.p.seed, p, h) for p, h in zip(seeds_xyz, headings)]
         if initial_states is not None:
             frames = [np.asarray(s['frame']).copy() for s in initial_states]
         active = np.ones(n, bool)
@@ -155,18 +173,13 @@ class ModelTracer:
                 hm[j] = target >= 0
                 hist_world[j] = interp_at(past, arc, target.clip(0))
             hist = np.einsum('bhi,bij->bhj', hist_world-pos[:, None], fr)
-            raw, starts = read_blocks([dict(pos=p, frame=f) for p, f in zip(pos, fr)], self.vol, self.crop, self.pool)
             tensor = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(self.device)
-            x = build_inputs(tensor(raw), tensor(starts).float(), tensor(pos).float(), tensor(fr).float(),
-                             tensor(hist).float(), tensor(hm), self.grid, n_render=render_count(self.crop),
-                             gate_direction=self.crop.gate_direction, input_scale=getattr(self.vol, 'input_scale', 1.),
-                             history_sigma=self.crop.history_sigma, history_render=self.crop.history_render)
-            if self.vol.spec.mode == 'ct+presence':
-                from vesuvius.neural_tracing.fiber_follow.data import add_presence_input
-                items = [dict(pos=p, frame=f) for p, f in zip(pos, fr)]
-                x = add_presence_input(x, items, self.vol, self.crop, self.grid, self.pool)
+            x = self.build_inputs(pos, fr, hist, hm)
+            sampling = {}
+            if stochastic:
+                sampling['initial_noise'] = trace_noise(self.model.cfg, [generators[i] for i in idx], self.device)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
-                out = self.model(x, tensor(hist).float(), tensor(hm))
+                out = self.model(x, tensor(hist).float(), tensor(hm), **sampling)
             commits, allowed = commit_prefix(out['points'], out['confidence'], pp.confidence, pp.n_commit,
                                              self.model.cfg.max_recovery_distance)
             commits, allowed = [v.cpu().numpy() for v in (commits, allowed)]

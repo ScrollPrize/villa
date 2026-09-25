@@ -1,7 +1,7 @@
 """Method-agnostic pieces of a fiber_follow training run.
 
-Shared by the spatial follower (``train.py``) and the beam re-ranker
-(``beam/train.py``): run directory creation, the JSON-lines log, the
+Shared by the flow follower, direct follower and beam re-ranker:
+run directory creation, the JSON-lines log, the
 warmup-cosine schedule, one guarded optimizer step, and checkpoint I/O that
 records which architecture and data policy produced the weights.
 """
@@ -12,6 +12,7 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.data import DATA_POLICY
@@ -79,3 +80,48 @@ def read_checkpoint(path, architecture, device='cuda'):
         raise ValueError(f'Checkpoint {path} is {ck["architecture"]}/{ck["data_policy"]}, '
                          f'not {architecture}/{DATA_POLICY}')
     return ck
+
+
+@torch.no_grad()
+def update_ema(ema, model, step, decay):
+    """Update EMA once per optimizer update, ramping the decay in early updates.
+
+    Without the ramp the average still carries 37% of the random initialization
+    after 1,000 updates, which is what the first collector and diagnostics use.
+    """
+    effective_decay = min(decay, (1+step)/(10+step))
+    for average, current in zip(ema.parameters(), model.parameters(), strict=True):
+        average.lerp_(current.detach(), 1-effective_decay)
+    for average, current in zip(ema.buffers(), model.buffers(), strict=True):
+        average.copy_(current)
+
+
+def training_rng_state():
+    state = dict(torch=torch.get_rng_state(), numpy=np.random.get_state())
+    if torch.cuda.is_available():
+        state['cuda'] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_training_rng(state):
+    torch.set_rng_state(state['torch'].cpu())
+    np.random.set_state(state['numpy'])
+    if 'cuda' in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([s.cpu() for s in state['cuda']])
+
+
+def resume_training(ck, model, ema, opt):
+    """Restore weights, EMA, optimizer and RNG from a resumable checkpoint.
+
+    Only ``ckpt_*.pt``/``last.pt`` written by training carry optimizer state;
+    collector snapshots do not. Loader workers restart their own streams, so
+    the sampled data sequence after a resume differs from an uninterrupted run.
+    Returns the completed update count and replay samples seen so far.
+    """
+    if 'optimizer' not in ck:
+        raise ValueError('Checkpoint holds no optimizer state; resume from ckpt_*.pt or last.pt of a run')
+    model.load_state_dict(ck['model'])
+    ema.load_state_dict(ck['ema'])
+    opt.load_state_dict(ck['optimizer'])
+    restore_training_rng(ck['rng'])
+    return int(ck['step']), int(ck.get('replay_seen', 0))

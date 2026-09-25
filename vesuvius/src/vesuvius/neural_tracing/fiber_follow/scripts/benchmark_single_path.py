@@ -27,6 +27,7 @@ def main(argv=None):
     ap.add_argument('--compile',dest='compile_model',action=argparse.BooleanOptionalAction,default=True,
                     help='Compile CUDA training methods (default: enabled)')
     ap.add_argument('--flow-draws',type=int,default=64)
+    ap.add_argument('--sampler-mode',choices=('zero','gaussian'),default='gaussian')
     ap.add_argument('--updates',type=int,default=3)
     ap.add_argument('--warmup',type=int,default=1)
     ap.add_argument('--conv-memory-format',choices=('contiguous','channels_last_3d'),
@@ -34,7 +35,7 @@ def main(argv=None):
     args=ap.parse_args(argv)
     result=dict(architecture=ARCHITECTURE,device=args.device,microbatch=args.microbatch,
                 effective_batch=8,flow_draws=args.flow_draws,crop=[176,96,96],passed=False,
-                cache_training_encoding=args.cache_training_encoding,compile_model=args.compile_model)
+                cache_training_encoding=args.cache_training_encoding,compile_model=args.compile_model,sampler_mode=args.sampler_mode)
     try:
         if not args.device.startswith('cuda') or not torch.cuda.is_available():
             raise RuntimeError('Preflight requires a working CUDA device; CPU smoke tests do not qualify')
@@ -44,7 +45,7 @@ def main(argv=None):
         manifest=read_manifest(args.manifest);spec=FiberVolumeSpec(**manifest['volume'])
         fibers=load_fibers(args.fibers,grid_scale=spec.grid_scale)
         train,val=split_fibers(fibers,ZBand(45000/spec.grid_scale,48500/spec.grid_scale))
-        cfg=FollowNetConfig(flow_sigma=((1.,1.),)*16,flow_draws=args.flow_draws)
+        cfg=FollowNetConfig(flow_sigma=((1.,1.),)*16,flow_draws=args.flow_draws,sampler_mode=args.sampler_mode)
         sample=SampleConfig(crop=CropSpec(depth=176,width=96,behind=128,history_render='segments',history_sigma=.35))
         batch=next(iter(FollowDataset(train,spec,sample,ZBand(45000/8,48500/8),chunk=8)))
         micro=[{k:v[i:i+args.microbatch] for k,v in batch.items()} for i in range(0,8,args.microbatch)]

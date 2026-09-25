@@ -221,7 +221,7 @@ def test_accumulation_steps_once_and_ema_matches_effective_batch(monkeypatch):
         out['flow_loss']=(out['confidence_logits'].square()*mask).sum()/mask.sum().clamp_min(1)
         out['flow_known_count']=mask.sum()
         return out
-    def generate(self,x,hist,hmask,*,return_steps=False):
+    def generate(self,x,hist,hmask,*,return_steps=False,initial_noise=None):
         points=forward(self,x,hist,hmask)['points']
         return (points,points[:,None].expand(-1,cfg.flow_steps+1,-1,-1)) if return_steps else points
     monkeypatch.setattr(FollowNet,'generate_training_curve',generate)

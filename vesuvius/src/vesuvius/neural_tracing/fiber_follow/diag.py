@@ -224,7 +224,7 @@ def plot_curves(log_path, path):
 
 
 def plot_denoising(curves, history, hmask, path):
-    """Fixed observed history plus zero initialization and every midpoint update."""
+    """Fixed observed history plus the actual sampled initialization and midpoint updates."""
     curves=curves.detach().float().cpu().numpy()
     history=history.detach().float().cpu().numpy()
     mask=hmask.detach().cpu().numpy().astype(bool)

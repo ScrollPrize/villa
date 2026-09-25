@@ -24,10 +24,11 @@ from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume
 class DecisionCollector:
     """Original-fiber, progress-bounded labeler, including pre-failure windows."""
     def __init__(self, fiber, fiber_idx, t0, sign, cfg, band=None, off_dist=3.5,
-                 before=48., after=24., stride=16., max_states=192):
+                 before=48., after=24., stride=16., max_states=192, additional_crops=()):
         self.fiber, self.fi, self.t, self.sign = fiber, fiber_idx, t0, sign
         self.cfg, self.band, self.off_dist = cfg, band, off_dist
         self.before, self.after, self.stride, self.max_states = before, after, stride, max_states
+        self.additional_crops = tuple(additional_crops)
         self.rows, self.distances = [], []
         self.departed = None
         self.last_travelled = 0.
@@ -84,7 +85,8 @@ class DecisionCollector:
                 row['hard'] = True
         item = label_state(f, state['pos'], state['frame'], state['hist'], state['hmask'], self.cfg,
                            t=self.t, reverse=sign < 0, offtrack=offtrack)
-        if not training_state_allowed(item, self.cfg.crop, self.band):
+        if not all(training_state_allowed(item, crop, self.band)
+                   for crop in (self.cfg.crop, *self.additional_crops)):
             return False  # do not trace through held-out space and resume afterwards
         row = {k: state[k] for k in ('pos', 'frame', 'hist', 'hmask', 'exploratory')}
         # Current-position error against the matched GT point, in trace-grid
@@ -113,7 +115,7 @@ class DecisionCollector:
         return kept
 
 
-def main(argv=None):
+def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTracer):
     ap = argparse.ArgumentParser()
     ap.add_argument('--checkpoint', required=True)
     ap.add_argument('--fibers', required=True)
@@ -136,7 +138,7 @@ def main(argv=None):
     ap.add_argument('--seed', type=int, default=1)
     args = ap.parse_args(argv)
     torch.set_num_threads(args.threads)
-    model, crop, n_hist, spec, ck = load_checkpoint(args.checkpoint, args.device)
+    model, crop, n_hist, spec, ck = checkpoint_loader(args.checkpoint, args.device)
     cfg = SampleConfig(crop=crop, n_history=n_hist, recent_history_points=model.cfg.recent_history_points,
                        n_future=model.cfg.n_future, future_step=model.cfg.future_step)
     if args.fiber_zarrs:
@@ -158,16 +160,17 @@ def main(argv=None):
         if args.max_seeds and len(seeds) >= args.max_seeds:
             seeds = seeds[:args.max_seeds]
             break
-    tracer = ModelTracer(model, vol, crop, n_hist,
+    tracer = tracer_class(model, vol, crop, n_hist,
                          TraceParams(max_len=args.trace_len, confidence=args.confidence, explore_calls=args.explore_calls,
-                                     n_commit=args.n_commit),
+                                     n_commit=args.n_commit, seed=args.seed),
                          device=args.device)
     rows = []
     try:
         for offset in range(0, len(seeds), args.batch):
             chunk = seeds[offset:offset+args.batch]
             collectors = [DecisionCollector(train_f[s['fiber']], s['fiber'], s['t'], s['sign'], cfg, band,
-                                           args.off_dist, args.before, args.after, args.stride) for s in chunk]
+                                           args.off_dist, args.before, args.after, args.stride,
+                                           additional_crops=getattr(tracer, 'additional_crops', ())) for s in chunk]
             tracer.trace(np.stack([s['pos'] for s in chunk]), np.stack([s['heading'] for s in chunk]),
                          on_decision=lambda i, state: collectors[i](state))
             for collector in collectors:
@@ -180,6 +183,7 @@ def main(argv=None):
     st = OnPolicyStates(manifest=fiber_manifest(train_f),
                         provenance=dict(checkpoint=os.path.abspath(args.checkpoint), step=ck.get('step'),
                                         model_cfg=model.cfg.to_dict(), crop=asdict(crop),
+                                        sampler_mode=getattr(model.cfg, 'sampler_mode', 'zero'),
                                         volume=spec.to_dict(), collection=vars(args)),
                         **{key: np.asarray([row[key] for row in rows])
                            for key in OnPolicyStates.FIELDS + tuple(OnPolicyStates.OPTIONAL)})

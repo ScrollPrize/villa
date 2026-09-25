@@ -1,4 +1,4 @@
-"""One history-conditioned curve, jointly denoised from zero lateral residuals."""
+"""One history-conditioned curve sampled with a checkpointed initial distribution."""
 from __future__ import annotations
 from dataclasses import asdict, dataclass
 import math
@@ -32,10 +32,15 @@ class FollowNetConfig:
     flow_stencil_radius: float = 2.
     max_recovery_distance: float = DEFAULT_MAX_RECOVERY_DISTANCE
     norm: str = 'group'
+    # Missing in old checkpoints: retain their original deterministic behavior.
+    # New training runs explicitly select gaussian.
+    sampler_mode: str = 'zero'
 
     def __post_init__(self):
         self.widths = tuple(self.widths)
         self.flow_sigma = tuple(tuple(row) for row in self.flow_sigma)
+        if self.sampler_mode not in ('zero', 'gaussian'):
+            raise ValueError('sampler_mode must be zero or gaussian')
         if min(self.hist_points, self.hist_stride, self.n_future, self.flow_layers,
                self.flow_heads, self.flow_steps, self.flow_draws) < 1 or self.hidden % self.flow_heads:
             raise ValueError('Positive dimensions required; hidden must divide by heads')
@@ -83,6 +88,18 @@ def time_embedding(t, dim):
 
 def future_planes(cfg, device=None):
     return cfg.future_step * torch.arange(1, cfg.n_future+1, device=device, dtype=torch.float32)
+
+
+def initial_residuals(cfg, batch, device, generator=None):
+    """One normalized curve per state; gaussian matches the flow-loss prior.
+
+    Call outside compiled training methods so RNG consumption is explicit.
+    Per-plane physical scales are applied only by PathFlow.to_voxels.
+    """
+    shape = (batch, 1, cfg.n_future, 2)
+    if cfg.sampler_mode == 'zero':
+        return torch.zeros(shape, device=device, dtype=torch.float32)
+    return torch.randn(shape, device=device, dtype=torch.float32, generator=generator)
 
 
 def prior_mean(hist, hmask, cfg):
@@ -280,9 +297,12 @@ class FollowNet(SpatialEncoder):
                     flow_censored_fraction=(censored.sum()/(token_mask+censored).sum().clamp_min(1)).detach())
 
     @torch.no_grad()
-    def refine(self, features, context, fixed, *, return_steps=False):
+    def refine(self, features, context, fixed, *, return_steps=False, initial_noise=None, generator=None):
         B,P,_ = fixed['mu'].shape
-        y = features.new_zeros(B,1,P,2,dtype=torch.float32)
+        y = initial_residuals(self.cfg, B, features.device, generator) if initial_noise is None else initial_noise
+        if y.shape != (B, 1, P, 2):
+            raise ValueError('initial_noise must have shape [batch, 1, n_future, 2]')
+        y = y.detach().to(device=features.device, dtype=torch.float32)
         curves = [self.flow.to_voxels(y,fixed['mu'])[:,0]] if return_steps else []
         T = self.cfg.flow_steps
         for i in range(T):
@@ -300,26 +320,26 @@ class FollowNet(SpatialEncoder):
         return features,context,fixed
 
     @torch.no_grad()
-    def generate_training_curve(self,x,hist,hmask,*,return_steps=False,encoding=None):
+    def generate_training_curve(self,x,hist,hmask,*,return_steps=False,encoding=None,initial_noise=None,generator=None):
         """Detached rollout, optionally retaining its initial curve and updates."""
         features,context,fixed = self.encode_conditioning(x,hist,hmask) if encoding is None else encoding
-        y,curves = self.refine(features,context,fixed,return_steps=return_steps)
+        y,curves = self.refine(features,context,fixed,return_steps=return_steps,initial_noise=initial_noise,generator=generator)
         points = self.flow.to_voxels(y,fixed['mu'])[:,0]
         return (points,torch.stack(curves,1)) if return_steps else points
 
     def training_forward(self,x,hist,hmask,targets,points,*,encoding=None):
         return self._forward(x,hist,hmask,targets=targets,training_points=points.detach(),encoding=encoding)
 
-    def forward(self,x,hist,hmask,*,targets=None,generator=None,return_steps=False):
-        return self._forward(x,hist,hmask,targets=targets,generator=generator,return_steps=return_steps)
+    def forward(self,x,hist,hmask,*,targets=None,generator=None,return_steps=False,initial_noise=None):
+        return self._forward(x,hist,hmask,targets=targets,generator=generator,return_steps=return_steps,initial_noise=initial_noise)
 
-    def _forward(self,x,hist,hmask,*,targets=None,generator=None,return_steps=False,training_points=None,encoding=None):
+    def _forward(self,x,hist,hmask,*,targets=None,generator=None,return_steps=False,training_points=None,encoding=None,initial_noise=None):
         features,context,fixed = self.encode_conditioning(x,hist,hmask) if encoding is None else encoding
         out = {}
         if targets is not None:
             out.update(self.flow_loss(features,context,hist,hmask,targets,generator,fixed))
         if training_points is None:
-            y,curves = self.refine(features,context,fixed,return_steps=return_steps)
+            y,curves = self.refine(features,context,fixed,return_steps=return_steps,initial_noise=initial_noise,generator=generator)
         else:
             y = ((training_points[...,:2]-fixed['mu'][...,:2])/self.flow.sigma)[:,None]
             curves = []

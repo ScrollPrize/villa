@@ -60,8 +60,10 @@ def rollout_summary(rows):
 
 def paired_bootstrap(baseline, current, repeats=2000, seed=0):
     """Resample paired fibers, retaining every seed/direction within a fiber."""
-    key=lambda r:(r['fiber'],r['t0'],r['sign'])
+    key=lambda r:(r['fiber'],r['t0'],r['sign'],r.get('sampling_seed',0))
     b={key(r):r for r in baseline}; c={key(r):r for r in current}
+    if len(b)!=len(baseline) or len(c)!=len(current):
+        raise ValueError('Duplicate trace identities; record sampling_seed for repeated rollouts')
     if b.keys()!=c.keys(): raise ValueError('Paired bootstrap requires identical seed identities')
     names=sorted({r['fiber'] for r in baseline})
     groups={name:sorted(k for k in b if k[0]==name) for name in names}

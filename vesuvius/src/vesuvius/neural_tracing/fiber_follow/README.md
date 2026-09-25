@@ -1,5 +1,9 @@
 # fiber_follow
 
+An independent directly supervised alternative is in [`direct/`](direct/README.md).
+It uses fine level-0 CT, coarse backward context, and a direct curve decoder with one bounded local correction.
+Train it separately with `bash scripts/launch_direct.sh NAME`.
+
 The active follower is `single_path_flow_v11`: one jointly denoised future curve,
 trained from scratch. Historical v10 results and the pre-migration source remain
 in `output/single_path_v11_baseline/`; old follower checkpoints are rejected by
@@ -16,14 +20,19 @@ training/inference. The independent beam model keeps its checkpoint names.
 - Six pre-norm blocks, width 256, eight heads, FFN width 1024. Bidirectional
   self-attention joins history and future tokens. Cross-attention reads spatial
   tokens pooled another factor of two from the deepest features of this crop.
-- One 16-point future curve starts at normalized lateral residual zero. Four
+- New training runs start each 16-point future curve from independent standard
+  Gaussian normalized lateral residuals. The fitted per-plane residual scales
+  convert those residuals to voxel coordinates. Four
   midpoint steps require eight velocity evaluations. A ninth evaluation at
   the final coordinates and `t=1` supplies confidence. Local patches refresh
   during refinement; static image/history features and image keys/values cache
   within a decision.
 - The public output is `points [B,16,3]`, `confidence_logits [B,16]`, and
-  monotone `confidence [B,16]`. Inference is deterministic for fixed inputs and
-  execution settings. No forecast is carried into the next decision.
+  monotone `confidence [B,16]`. Each decision samples one curve, with no ranking
+  or averaging. A private RNG stream per directed trace seed makes its initial
+  noise reproducible independently of batching or other traces stopping. Numerical
+  model outputs can still vary across devices and batch shapes. No forecast is
+  carried into the next decision.
 - Commit at most `n_commit` points per decision (default 8, at most the 16-point
   horizon), respecting the six-voxel first connection limit,
   bounds, loops, stop patience, and bounded collection exploration. History
@@ -31,7 +40,10 @@ training/inference. The independent beam model keeps its checkpoint names.
 
 Flow matching retains 64 stratified time/noise draws per state. Residual scales
 are fitted from 2,048 masked training states. Confidence labels describe the
-actually generated curve at tolerance 1.5; generated coordinates and labels are
+actually generated Gaussian-start curve at tolerance 1.5, using the same four
+midpoint steps as inference, diagnostics and replay collection. The curve is
+sampled once per training state and reused for its labels and confidence loss;
+generated coordinates and labels are
 detached, while the final evaluation trains the shared features and denoiser.
 Confidence loss is half masked BCE over the commit window (prefixes 1 to
 `--n-commit`, default 8) and half over all 16.
@@ -74,6 +86,21 @@ before starting training. If microbatch 2 exhausts GPU memory, rerun with
 `MICROBATCH=1`; effective batch remains eight and the crop remains full sized.
 The benchmark reports GPU peak allocated/reserved memory, training throughput and
 complete tracing latency, including data preparation and final confidence.
+
+To adapt existing v11 weights to the aligned sampler in a new run:
+
+```bash
+bash scripts/launch_single_path.sh v11_gaussian_20260925 \
+  --init-from output/v11_compiled_20260925_150551/ckpt_004000.pt --lr 1e-4
+```
+
+`--init-from` loads EMA weights and fitted residual scales, verifies the volume,
+geometry and evaluation split, and starts a fresh optimizer and schedule. New
+runs default to `--sampler-mode gaussian`; the mode is saved in checkpoints.
+Checkpoints without that field retain their historical zero initialization.
+`--resume` preserves the checkpoint's mode and rejects a conflicting override;
+use `--init-from` to change it. `--sampler-mode zero` remains available for
+controlled comparisons. The launcher writes a separate matching preflight per run.
 
 Training defaults: 50,000 optimizer updates; microbatch 2 with four accumulation
 steps; AdamW, peak LR 1e-3, weight decay 1e-4, 1,000-update warmup/cosine decay,
@@ -118,6 +145,9 @@ refreshes replay every 1,000 updates when idle, using EMA, 64 training seeds,
 a 6,000-voxel cap, threshold .7, and eight exploration calls. Diagnostics use the
 original monitor fibers at thresholds .5 and .85. Images show observed history,
 GT, the final curve, and successive denoising updates.
+Diagnostics have private RNG streams and do not advance training's noise stream.
+Inference exposes `--sampling-seed`; collection uses its existing `--seed` for
+sampling as well as seed selection.
 
 Terminal logs show readable loss, throughput, confidence and refinement tables;
 `log.jsonl` retains one complete JSON record per line for analysis. On logging
@@ -160,7 +190,11 @@ python scripts/evaluate_single_path.py final \
 ```
 
 Calibration selects the greatest coverage among checkpoint/threshold pairs
-reaching 95% scored precision, then locks the checkpoint hash and threshold.
+reaching 95% scored precision, then locks the checkpoint hash, threshold and
+sampling seeds. Gaussian checkpoints default to three repeats (`--sampling-seeds
+0 1 2`), with both per-seed summaries and pooled metrics. Final evaluation uses
+the same locked repeats. Zero-start checkpoints default to seed 0; specify the
+same repeat set explicitly when preparing a paired baseline comparison.
 Final evaluation enforces that choice and uses actual 6,000-voxel rollouts.
 Reports include drift-band counts, four-plane correctness, false stops,
 departure continuations, coverage, divergence, total wrong length and its
@@ -171,7 +205,8 @@ prefix confidence labels use 1.5 voxels. Unknown length receives no verified
 continuation credit.
 
 Pass paired final baseline rows via `--baseline-rows` to compute fiber bootstrap
-intervals. Baseline and new rows must have identical seed identities. The target
+intervals. Baseline and new rows must have identical physical and sampling seed
+identities; bootstrap resampling groups all repeats of each fiber together. The target
 is ≥20% relative coverage improvement at matched 95% precision with no worse
 sustained wrong continuations; no improvement is assumed from confidence shifts.
 
@@ -194,23 +229,26 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=../../.. \
 
 Tests cover attention across futures and full history, masked and unsupported
 observations, GT isolation, endpoint censoring, departed states, confidence gradient
-routes, recovery limits, coordinate transforms, deterministic inference, midpoint
+routes, recovery limits, coordinate transforms, seeded Gaussian inference, legacy
+zero-start inference, independence from batch grouping and diagnostic RNG, midpoint
 integration, replay import/rotation, checkpoint round trips, beam compatibility,
 accumulation, collection and synthetic parallel-fiber identity recovery.
 
-The full-crop RTX 5090 benchmark passed: microbatch 2, effective batch 8,
+The original zero-start full-crop RTX 5090 benchmark passed: microbatch 2, effective batch 8,
 9.20 GiB peak allocated / 10.02 GiB reserved, 8.85 samples/second (cached-batch
 training, including accumulation and optimizer updates), and 82.7 ms per complete
 tracing decision over a 64-voxel rollout. There are three measured updates after
 warmup. `output/single_path_v11_preparation/benchmark_b2.json` holds raw timings.
 GPU access requires execution outside this session's filesystem sandbox.
 
-All 34 tests pass with CUDA access. A real-data two-update training/checkpoint
-smoke and two-seed replay publication also passed. Full-crop prediction and
-denoising images are in the preparation directory. `single_path_v11_run1` is the
-fresh 50,000-update run; watch `output/logs/single_path_v11_run1.log`. Training and
-experimental acceptance are still in progress. CT level 1 losing fine neighboring
-fiber detail remains an experimental risk.
+Sampler-alignment validation: 110 CPU tests passed (six CUDA tests skipped), and
+the Gaussian compiled CUDA regression passed separately. The full-crop Gaussian
+preflight passed with microbatch 2, effective batch 8 and 64 flow draws, including
+complete tracing. Two compiled real-data updates initialized from step 4,000
+produced a resumable Gaussian checkpoint; two short traces from that checkpoint
+published nine replay states. These are implementation checks; no accuracy improvement from
+Gaussian sampling is claimed. CT level 1 losing fine neighboring fiber detail
+remains an experimental risk.
 
 ## Beam re-ranker (`beam/`): learning to choose the VC3D tracer's paths
 

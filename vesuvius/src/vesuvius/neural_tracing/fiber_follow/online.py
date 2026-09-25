@@ -26,7 +26,8 @@ class OnlineCollector:
     """
     def __init__(self, directory, fibers, val_z, device, every=1000, max_seeds=64,
                  batch=1, explore_calls=8, seed=0, replay_keep=4, initial=(),
-                 trace_len=6000., confidence=DEFAULT_CONFIDENCE, n_commit=DEFAULT_N_COMMIT):
+                 trace_len=6000., confidence=DEFAULT_CONFIDENCE, n_commit=DEFAULT_N_COMMIT,
+                 collector_module='vesuvius.neural_tracing.fiber_follow.collect'):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.index = self.directory/'replay.json'
@@ -34,6 +35,7 @@ class OnlineCollector:
         self.every, self.max_seeds, self.batch = every, max_seeds, batch
         self.explore_calls, self.seed, self.replay_keep = explore_calls, seed, replay_keep
         self.trace_len, self.confidence, self.n_commit = trace_len, confidence, n_commit
+        self.collector_module = collector_module
         self.paths = list(initial)
         self.process = self.log = None
         self.output = None
@@ -59,7 +61,7 @@ class OnlineCollector:
         checkpoint = self.directory/f'source_{step:06d}.pt'
         self.output = self.directory/f'decisions_{step:06d}.npz'
         save(checkpoint)
-        command = [sys.executable, '-m', 'vesuvius.neural_tracing.fiber_follow.collect',
+        command = [sys.executable, '-m', self.collector_module,
                    '--checkpoint', str(checkpoint), '--fibers', self.fibers,
                    '--val-z', *map(str, self.val_z), '--device', self.device,
                    '--max-seeds', str(self.max_seeds), '--batch', str(self.batch),

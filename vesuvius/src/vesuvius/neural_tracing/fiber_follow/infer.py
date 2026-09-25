@@ -112,7 +112,7 @@ def trace_bidirectional(tracer: ModelTracer, vol: FiberVolume, seeds_grid_xyz: n
     return out
 
 
-def main(argv=None):
+def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTracer):
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--fiber-zarrs", default=None, help="override the checkpoint's fiber zarr dir")
@@ -132,15 +132,17 @@ def main(argv=None):
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--sampling-seed", type=int, default=0, help="Reproducible per-trace sampling noise")
     args = ap.parse_args(argv)
 
-    model, crop, n_hist, spec, _ = load_checkpoint(args.checkpoint, args.device)
+    model, crop, n_hist, spec, _ = checkpoint_loader(args.checkpoint, args.device)
     if args.fiber_zarrs:
         spec.fiber_zarr_dir = args.fiber_zarrs
     if args.ct:
         spec.ct_zarr = args.ct
     vol = FiberVolume(spec, cache_bytes=8 << 30)
-    tracer = ModelTracer(model, vol, crop, n_hist, TraceParams(max_len=args.max_len, confidence=args.confidence, n_commit=args.n_commit), device=args.device)
+    tracer = tracer_class(model, vol, crop, n_hist, TraceParams(max_len=args.max_len, confidence=args.confidence,
+        n_commit=args.n_commit, seed=args.sampling_seed), device=args.device)
     g = spec.grid_scale
 
     seeds = [np.array([float(v) for v in s.split(",")]) for s in args.seed]
@@ -196,6 +198,8 @@ def main(argv=None):
             obj = make_fiber_json(base, args.cp_every, dict(meta, filename=name, started_at=stamp,
                                                              sequence=len(written),
                                                              fiber_follow={"stop_reasons": list(reasons),
+                                                                           "sampling_seed": args.sampling_seed,
+                                                                           "sampler_mode": getattr(model.cfg, 'sampler_mode', 'zero'),
                                                                            "checkpoint": os.path.abspath(args.checkpoint)}))
             with open(os.path.join(args.out, name), "w") as fh:
                 json.dump(obj, fh)

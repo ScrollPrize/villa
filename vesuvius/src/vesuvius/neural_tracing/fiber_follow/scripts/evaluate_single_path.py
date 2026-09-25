@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import time
 from vesuvius.neural_tracing.fiber_follow.experiment import read_manifest
+from vesuvius.neural_tracing.fiber_follow.recovery import recovery_counts
 import numpy as np
 import torch
 from vesuvius.neural_tracing.fiber_follow.data import ZBand,fiber_manifest,load_fibers,split_fibers,label_state
@@ -44,24 +45,21 @@ class RecoveryAudit(HistoryAudit):
         col.rows.clear();col.distances.clear()
 
 
-def recovery_counts(rows):
-    """Keep numerators and denominators; never average empty batch ratios."""
-    result={}
-    bands=[('<1',0,1),('1-1.5',1,1.5),('1.5-2',1.5,2),('2-3.5',2,3.5),('departed',0,0)]
-    for name,lo,hi in bands:
-        sub=[r for r in rows if r['departed']] if name=='departed' else [r for r in rows if not r['departed'] and lo<=r['drift']<hi]
-        result[name]=dict(states=len(sub),four_known=sum(r['four_known'] for r in sub),
-            four_correct=sum(r['four_known'] and r['four_correct'] for r in sub),
-            correct_continuations=sum(r['first_known'] and r['first_correct'] for r in sub),
-            false_stops=sum(r['first_known'] and r['first_correct'] and r['would_stop'] for r in sub),
-            false_continues_after_departure=sum(r['departed'] and not r['would_stop'] for r in sub),
-            recovery_observed=sum('recovered' in r and not r['departed'] for r in sub),
-            recovered=sum(r.get('recovered',False) and not r['departed'] for r in sub),
-            error_reduced=sum(r.get('error_reduced',False) and not r['departed'] for r in sub))
-    return result
+
+def evaluation_sampling_seeds(sampler_mode, requested=None, selection=None):
+    """Final repeats are locked with calibration, just like threshold/checkpoint."""
+    if selection is not None:
+        seeds=selection.get('sampling_seeds',[0])
+        if requested is not None and requested!=seeds:
+            raise ValueError('Final sampling seeds must match the locked calibration selection')
+    else:
+        seeds=requested if requested is not None else ([0,1,2] if sampler_mode=='gaussian' else [0])
+    if not seeds or len(set(seeds))!=len(seeds) or any(s<0 or s>=2**63 for s in seeds):
+        raise ValueError('Sampling seeds must be distinct integers in [0, 2**63)')
+    return seeds
 
 
-def main(argv=None):
+def main(argv=None, *, checkpoint_loader=None, model_tracer=None, volume_validator=None):
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('mode',choices=('calibrate','final'))
     ap.add_argument('--checkpoints',nargs='+')
@@ -72,10 +70,13 @@ def main(argv=None):
     ap.add_argument('--fibers',default='/mnt/raid_nvme/spiral_dataset_working/fibers')
     ap.add_argument('--device',default='cuda')
     ap.add_argument('--batch',type=int,default=1)
+    ap.add_argument('--sampling-seeds',type=int,nargs='+',
+                    help='Gaussian default: 0 1 2; deterministic default: 0. Locked at calibration.')
     ap.add_argument('--baseline-rows',type=Path)
     ap.add_argument('--baseline-archive',type=Path,help='Archived v10 implementation, for baseline calibration/final rollouts only')
     args=ap.parse_args(argv);torch.set_num_threads(4)
     manifest=read_manifest(args.manifest);args.out.mkdir(parents=True,exist_ok=True)
+    selection=None
     if args.mode=='final':
         if args.selection is None or args.checkpoints:
             ap.error('Final evaluation requires a calibration selection; checkpoint overrides are forbidden')
@@ -93,7 +94,7 @@ def main(argv=None):
         choices=[(p,t) for p in args.checkpoints for t in args.thresholds]
     split='final' if args.mode=='final' else 'calibration';reports=[]
     for checkpoint,threshold in choices:
-        tracer_class=ModelTracer
+        tracer_class=model_tracer or ModelTracer
         if args.baseline_archive:
             from evaluate_recovery import load_archived_baseline,ArchivedTracer
             model,crop,nh,spec,ck=load_archived_baseline(checkpoint,args.baseline_archive,args.device)
@@ -101,20 +102,36 @@ def main(argv=None):
             for key in ('fiber_zarr_dir','ct_zarr','grid_scale'):
                 if spec.to_dict()[key]!=manifest['volume'][key]: raise ValueError('Baseline data source differs from manifest')
         else:
-            model,crop,nh,spec,ck=load_checkpoint(checkpoint,args.device)
-            if spec.to_dict()!=manifest['volume']: raise ValueError('Volume differs from frozen manifest')
+            model,crop,nh,spec,ck=(checkpoint_loader or load_checkpoint)(checkpoint,args.device)
+            if volume_validator is not None:
+                volume_validator(spec,manifest)
+            elif spec.to_dict()!=manifest['volume']: raise ValueError('Volume differs from frozen manifest')
         _,val=split_fibers(load_fibers(args.fibers,grid_scale=spec.grid_scale),ZBand(45000/spec.grid_scale,48500/spec.grid_scale))
         if fiber_manifest(val)!=manifest['fibers']: raise ValueError('Geometry differs from frozen manifest')
-        tracer=tracer_class(model,FiberVolume(spec),crop,nh,TraceParams(max_len=6000,confidence=threshold),device=args.device)
-        audit=RecoveryAudit(tracer,ck.get('tolerance',1.5));start=time.monotonic()
-        try: rows,_=evaluate(tracer,val,manifest[split],batch=args.batch,history_audit=audit)
+        sampler_mode=getattr(model.cfg,'sampler_mode','zero')
+        sampling_seeds=evaluation_sampling_seeds(sampler_mode,args.sampling_seeds,selection)
+        tracer=tracer_class(model,FiberVolume(spec),crop,nh,TraceParams(max_len=6000,confidence=threshold,
+            n_commit=ck.get('n_commit',8)),device=args.device)
+        start=time.monotonic();rows=[];audit_rows=[];seed_summaries=[]
+        try:
+            for sampling_seed in sampling_seeds:
+                tracer.p.seed=sampling_seed
+                audit=RecoveryAudit(tracer,ck.get('tolerance',1.5))
+                repeated,_=evaluate(tracer,val,manifest[split],batch=args.batch,history_audit=audit)
+                for r in repeated:
+                    r['avail']=min(r['avail'],6000);r['followed']=min(r['followed'],6000)
+                    r['coverage']=r['followed']/max(r['avail'],1e-6)
+                    r['sampling_seed']=sampling_seed
+                rows.extend(repeated)
+                audit_rows.extend(dict(r,sampling_seed=sampling_seed) for r in audit.rows)
+                seed_summaries.append(dict(sampling_seed=sampling_seed,**rollout_summary(repeated)))
         finally:tracer.close()
-        for r in rows:
-            r['avail']=min(r['avail'],6000);r['followed']=min(r['followed'],6000);r['coverage']=r['followed']/max(r['avail'],1e-6)
         report=rollout_summary(rows)
         report.update(checkpoint=str(Path(checkpoint).resolve()),checkpoint_sha256=hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest(),
             manifest_sha256=manifest['sha256'],split=split,threshold=threshold,max_len=6000,
-            recovery=recovery_counts(audit.rows),seconds=time.monotonic()-start,step=ck['step'],
+            architecture=ck.get('architecture'),vol_spec=spec.to_dict(),n_commit=tracer.p.n_commit,
+            sampler_mode=sampler_mode,sampling_seeds=sampling_seeds,sampling_seed_summaries=seed_summaries,
+            recovery=recovery_counts(audit_rows),seconds=time.monotonic()-start,step=ck['step'],
             baseline_archive=str(args.baseline_archive.resolve()) if args.baseline_archive else None)
         report['coverage_at_95_scored_precision']=report['length_weighted_coverage'] if report['length_precision']>=.95 else None
         if args.baseline_rows:
@@ -129,7 +146,8 @@ def main(argv=None):
                 baseline_wrong_continuation_quantiles=base['wrong_continuation_quantiles'],
                 current_wrong_continuation_quantiles=report['wrong_continuation_quantiles'])
         name=f'{Path(checkpoint).parent.name}_{Path(checkpoint).stem}_c{threshold:.3f}'
-        for suffix,values in (('',report),('_rows',rows),('_decisions',audit.rows)):
+        if sampling_seeds!=[0]: name+='_s'+'-'.join(map(str,sampling_seeds))
+        for suffix,values in (('',report),('_rows',rows),('_decisions',audit_rows)):
             (args.out/(name+suffix+'.json')).write_text(json.dumps(values,indent=2,default=jsonable))
         reports.append(report);print(json.dumps({k:report[k] for k in ('checkpoint','threshold','length_precision','length_weighted_coverage','wrong_length')}),flush=True)
     if args.mode=='calibrate':

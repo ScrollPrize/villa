@@ -403,11 +403,14 @@ class FollowDataset(torch.utils.data.IterableDataset):
     """
     def __init__(self, fibers, vol_spec, cfg, exclude_band, chunk=2, seed=0,
                  cache_bytes=1 << 30, onpolicy=None, fixed=None,
-                 window=256., pool_size=12, window_samples=192, replay_index=None, refresh_chunks=8):
+                 window=256., pool_size=12, window_samples=192, replay_index=None, refresh_chunks=8,
+                 batch_builder=None, additional_crops=()):
         self.fibers, self.vol_spec, self.cfg, self.exclude = fibers, vol_spec, cfg, exclude_band
         self.chunk, self.seed, self.cache_bytes = chunk, seed, cache_bytes
         self.window, self.pool_size, self.window_samples = window, pool_size, window_samples
         self.replay_index, self.refresh_chunks = replay_index, refresh_chunks
+        self.batch_builder = batch_builder
+        self.additional_crops = tuple(additional_crops)
         self._replay_paths = None
         self.fixed = list(fixed or [])
         self._validate(self.fixed)
@@ -454,6 +457,10 @@ class FollowDataset(torch.utils.data.IterableDataset):
             self._set_replay([OnPolicyStates.load(path) for path in paths])
             self._replay_paths = paths
 
+    def state_allowed(self, item):
+        return all(training_state_allowed(item, crop, self.exclude)
+                   for crop in (self.cfg.crop, *self.additional_crops))
+
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
         rng = np.random.default_rng(self.seed*1000 + (0 if info is None else info.id))
@@ -478,7 +485,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
                                        reverse=bool(op.reverse[j]), offtrack=bool(op.offtrack[j]))
                     item['source'],item['stratum'] = source,band
                     item['source_step'] = op.provenance.get('step', -1) or -1
-                    if not training_state_allowed(item,cfg.crop,self.exclude):
+                    if not self.state_allowed(item):
                         item = None
                 if item is None:
                     while len(windows) < self.pool_size:
@@ -497,13 +504,14 @@ class FollowDataset(torch.utils.data.IterableDataset):
                         t = f.length-original_t if rev else original_t
                     item = make_sample(f, t, rev, cfg, rng)
                     item['source'], item['source_step'], item['stratum'] = 0, -1, -1
-                if training_state_allowed(item, cfg.crop, self.exclude):
+                if self.state_allowed(item):
                     items.append(item)
                 if len(items) == self.chunk:
                     break
             if len(items) != self.chunk:
                 raise ValueError('Could not fill a training batch outside the held-out band')
-            yield collate_with_volume(items, vol, cfg.crop, grid)
+            yield (self.batch_builder(items, vol) if self.batch_builder is not None
+                   else collate_with_volume(items, vol, cfg.crop, grid))
 
 
 FUSED_SAMPLER = os.environ.get("FIBER_FOLLOW_FUSED", "1") != "0"
@@ -584,6 +592,14 @@ def collate_with_volume(items, vol: FiberVolume, crop: CropSpec, grid: torch.Ten
             out = dict(x=x.half(), hist=out["hist"], hmask=out["hmask"])
         if vol.spec.mode == 'ct+presence':
             out['x'] = add_presence_input(out['x'], items, vol, crop, grid)
+    out.update(collate_targets(items))
+    return out
+
+
+def collate_targets(items):
+    """Pack annotation-only tensors, independently of a model's image inputs."""
+    st = lambda k: torch.from_numpy(np.stack([it[k] for it in items]).astype(np.float32))
+    out = {}
     if "fut_local" in items[0]:
         out["fut"] = st("fut_local")
         out["fmask"] = st("fmask")
