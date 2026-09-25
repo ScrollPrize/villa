@@ -127,3 +127,40 @@ TEST_CASE("applyPackedLut handles non-contiguous stride")
     CHECK(out[2] == 0xDEADBEEFu); // padding preserved
     CHECK(out[4] == lut[42]);
 }
+
+TEST_CASE("tint colormap ids round-trip through parse and format")
+{
+    CHECK(tintColormapId(0xFF, 0x00, 0xFF) == "tint:ff00ff");
+    CHECK(tintColormapId(0x12, 0xAB, 0x00) == "tint:12ab00");
+
+    const auto parsed = parseTintColormapId("tint:FF8000");
+    REQUIRE(parsed.has_value());
+    CHECK((*parsed)[0] == doctest::Approx(1.0f));
+    CHECK((*parsed)[1] == doctest::Approx(128.0f / 255.0f));
+    CHECK((*parsed)[2] == doctest::Approx(0.0f));
+
+    CHECK_FALSE(parseTintColormapId("tint:ff00f").has_value());
+    CHECK_FALSE(parseTintColormapId("tint:ff00ff0").has_value());
+    CHECK_FALSE(parseTintColormapId("tint:gg00ff").has_value());
+    CHECK_FALSE(parseTintColormapId("magenta").has_value());
+    CHECK_FALSE(parseTintColormapId("").has_value());
+}
+
+TEST_CASE("colormapTint answers for preset tints and free tints only")
+{
+    const auto magenta = colormapTint("magenta");
+    REQUIRE(magenta.has_value());
+    CHECK((*magenta)[0] == doctest::Approx(1.0f));
+    CHECK((*magenta)[1] == doctest::Approx(0.0f));
+    CHECK((*magenta)[2] == doctest::Approx(1.0f));
+
+    const auto free = colormapTint("tint:00ff00");
+    REQUIRE(free.has_value());
+    CHECK((*free)[1] == doctest::Approx(1.0f));
+
+    CHECK_FALSE(colormapTint("fire").has_value());
+    CHECK_FALSE(colormapTint("glasbey_black0").has_value());
+    CHECK_FALSE(colormapTint("").has_value());
+    // resolve() maps unknown ids onto the first spec; the tint lookup must not.
+    CHECK_FALSE(colormapTint("__nope__").has_value());
+}

@@ -3,7 +3,9 @@
 #include <opencv2/core/mat.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // __has_builtin isn't provided by every preprocessor (e.g. pre-16.1 MSVC); fall
@@ -36,6 +38,18 @@ struct OverlayColormapEntry {
 
 const std::vector<OverlayColormapSpec>& specs() noexcept;
 const OverlayColormapSpec& resolve(const std::string& id);
+
+// Free single-colour tints are colormap ids of the form "tint:RRGGBB" (hex,
+// case-insensitive). They are not entries of specs(), so resolve() does not
+// know them; anything that needs the colour behind a colormap id asks
+// colormapTint(), which answers for these and for the preset Tint specs.
+inline constexpr std::string_view kTintColormapIdPrefix = "tint:";
+[[nodiscard]] std::string tintColormapId(uint8_t r, uint8_t g, uint8_t b);
+// R, G, B in [0,1] for a "tint:RRGGBB" id; nullopt for any other string.
+[[nodiscard]] std::optional<cv::Vec3f> parseTintColormapId(std::string_view id);
+// R, G, B in [0,1] when `id` is a single-colour colormap (a preset Tint spec
+// or a tint:RRGGBB id); nullopt for gradients, palettes and grayscale.
+[[nodiscard]] std::optional<cv::Vec3f> colormapTint(const std::string& id);
 
 // Apply colormap and write directly into a caller-provided ARGB32 buffer.
 // outBuf must point to rows*outStride uint32_t elements.
