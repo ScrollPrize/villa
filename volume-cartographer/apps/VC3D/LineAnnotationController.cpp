@@ -6861,6 +6861,24 @@ LineAnnotationController::umbilicusStatus() const
     return {false, tr("no umbilicus")};
 }
 
+std::string LineAnnotationController::fiberMapCoordinateSpace() const
+{
+    // Read off the tags directly, like annotationFrame(): the coordinate
+    // space is a name, and coordinateIdentityForVolume() would withhold it
+    // over absent physical metadata.
+    if (!_state || !_state->vpkg() || _state->currentVolumeId().empty()) {
+        return {};
+    }
+    try {
+        if (const auto identity = vc3d::opendata::coordinateIdentityFromTags(
+                _state->vpkg()->volumeTags(_state->currentVolumeId()))) {
+            return identity->coordinateSpace;
+        }
+    } catch (...) {
+    }
+    return {};
+}
+
 LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSnapshot() const
 {
     FiberMapSnapshot snapshot;
@@ -6889,6 +6907,9 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
         snapshot.annotationZSlices =
             static_cast<int>(std::llround(frame.extentXyz[2]));
     }
+
+    // Which catalog volume this is, for the map's winding sense.
+    snapshot.coordinateSpace = fiberMapCoordinateSpace();
 
     std::unordered_set<uint64_t> loadedIds;
     loadedIds.reserve(_fibers.size());

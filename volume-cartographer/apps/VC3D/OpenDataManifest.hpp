@@ -206,6 +206,10 @@ struct OpenDataManifest {
 [[nodiscard]] OpenDataManifest fetchOpenDataManifest(
     std::string manifestUrl = std::string(kDefaultManifestUrl));
 
+// Where VC3D keeps its copy of the manifest the catalog window last fetched
+// (the application cache location, ~/.VC3D when Qt reports none).
+[[nodiscard]] std::filesystem::path cachedOpenDataManifestPath();
+
 [[nodiscard]] std::string resolveOpenDataUrl(std::string url);
 [[nodiscard]] std::string joinOpenDataUrl(std::string root, std::string path);
 

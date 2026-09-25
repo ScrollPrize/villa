@@ -1694,16 +1694,15 @@ void OpenDataCatalogWindow::openSelectedSegmentCacheFolder()
 
 std::filesystem::path OpenDataCatalogWindow::cacheRoot() const
 {
-    QString base = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
-    if (base.isEmpty()) {
-        base = QDir::home().filePath(QStringLiteral(".VC3D"));
-    }
-    return std::filesystem::path(base.toStdString()) / "open-data-catalog";
+    // The manifest's readers (CWindow, normal grids, the fiber map's
+    // orientation lookup) share the one path; the writer's root is derived
+    // from it so the two cannot drift.
+    return vc3d::opendata::cachedOpenDataManifestPath().parent_path();
 }
 
 std::filesystem::path OpenDataCatalogWindow::cachedManifestPath() const
 {
-    return cacheRoot() / "metadata.json";
+    return vc3d::opendata::cachedOpenDataManifestPath();
 }
 
 std::filesystem::path OpenDataCatalogWindow::cacheMetadataPath() const

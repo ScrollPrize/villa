@@ -16,6 +16,7 @@
 
 #include "FiberNetworkLayout.hpp"
 
+using vc3d::fiber_map::ChiralityBasis;
 using vc3d::fiber_map::ContentDigest;
 using vc3d::fiber_map::GlobalAnchor;
 using vc3d::fiber_map::GlobalLayoutParams;
@@ -189,6 +190,97 @@ GlobalLayoutParams defaultParams()
     params.minPadXVx = vx(2.2);
     params.minPadYVx = vx(1.6);
     return params;
+}
+
+GlobalLayoutParams sensedParams(int chirality)
+{
+    GlobalLayoutParams params = defaultParams();
+    params.solver.chiralityOverride = chirality;
+    return params;
+}
+
+// The one-turn weave (its links and crossings agree only in sense +1; six
+// V fibers, so the mirror contradicts it by a decisive margin over the one
+// net vote against) beside two
+// lone H fibers, each an inward spiral over one and a half turns at its own
+// height: a fiber that wraps votes on the sense by its radius one turn on,
+// so each decoy votes -1 and the three-fiber vote is wrong, 2 to 1.
+std::vector<InputFiber> decoyedWeave()
+{
+    std::vector<InputFiber> fibers =
+        makeWeave(100, QStringLiteral("a-"), 30000.0, 4000.0, 300.0,
+                  -0.4, kTwoPi + 0.4,
+                  {100, 100 + kStepsPerTurn, 130, 130 + kStepsPerTurn, 159,
+                   159 + kStepsPerTurn});
+    fibers.push_back(makeFiber(
+        300, QStringLiteral("d-h-1"), 'H',
+        arcPoints(10000.0, 4000.0, -300.0, 0.0, 1.5 * kTwoPi), {0, 1800}));
+    fibers.push_back(makeFiber(
+        301, QStringLiteral("d-h-2"), 'H',
+        arcPoints(50000.0, 4000.0, -300.0, 0.0, 1.5 * kTwoPi), {0, 1800}));
+    return fibers;
+}
+
+// Independent contradictions of a map: dropped crossings, group conflicts,
+// suspect links.
+int contradictions(const GlobalResult& result)
+{
+    return result.droppedCrossingCount + result.declaredGroupCount + result.suspectLinkCount;
+}
+
+// The figure the winding-sense comparison uses: the crossing contradictions
+// of a solve with the links left out.
+int geometryContradictions(const GlobalResult& result)
+{
+    return result.droppedCrossingCount + result.declaredGroupCount;
+}
+
+std::vector<InputFiber> unlinked(std::vector<InputFiber> fibers)
+{
+    for (InputFiber& fiber : fibers) {
+        fiber.links.clear();
+    }
+    return fibers;
+}
+
+// One growing H spiral and five V fibers on its second pass, every one
+// linked to the H fiber's first pass: five contradictions in the true sense,
+// none in the mirror, one vote.
+std::vector<InputFiber> fiveWrongLinksOnOneFiber()
+{
+    std::vector<InputFiber> fibers =
+        makeWeave(100, QStringLiteral("a-"), 30000.0, 4000.0, 300.0, -0.4, kTwoPi + 0.4,
+                  {100, 1260, 1300, 1340, 1380, 1415});
+    // The first control's V fiber (on the first pass) goes; the rest are
+    // relinked from their own crossings to that first control.
+    fibers.erase(fibers.begin() + 1);
+    InputFiber& h = fibers[0];
+    h.links.clear();
+    for (std::size_t i = 1; i < fibers.size(); ++i) {
+        fibers[i].links.clear();
+        addLink(h, 0, fibers[i], 1);
+    }
+    return fibers;
+}
+
+// The one-turn weave's H fiber and its outer V fiber only (the inner one
+// would contradict the mirror on its own), the V linked to the H fiber's
+// FIRST pass instead of its second: in sense +1 the link contradicts the
+// crossing one turn on (one contradiction); mirrored, the wrong link and
+// both crossings agree (none). The H fiber's radius grows with theta, so it
+// votes +1.
+std::vector<InputFiber> wronglyLinkedPair(uint64_t firstId, const QString& prefix, double z)
+{
+    std::vector<InputFiber> fibers =
+        makeWeave(firstId, prefix, z, 4000.0, 300.0, -0.4, kTwoPi + 0.4,
+                  {100, 100 + kStepsPerTurn});
+    fibers.erase(fibers.begin() + 1);
+    InputFiber& h = fibers[0];
+    InputFiber& v = fibers[1];
+    h.links.clear();
+    v.links.clear();
+    addLink(h, 0, v, 1);
+    return fibers;
 }
 
 std::vector<InputFiber> mirrored(std::vector<InputFiber> fibers)
@@ -674,6 +766,189 @@ private slots:
         QVERIFY(minW < 1.0);
     }
 
+    // The winding sense is settled by which sense the map contradicts less,
+    // not by the data's vote: a weave whose links and crossings only agree
+    // in one sense, beside two lone H fibers drawn as inward spirals (each
+    // votes the other way, so the vote is wrong 2 to 1), lays out in the
+    // weave's sense, reporting the vote it overrode and the other sense's
+    // error count.
+    void unstatedSenseIsSettledByErrorsNotByVote()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(60000);
+        const std::vector<InputFiber> fibers = decoyedWeave();
+        // The deciding figures: the mirror's crossing contradictions with
+        // the links left out, against the true sense's none.
+        const GlobalResult mirror = vc3d::fiber_map::buildGlobalLayout(
+            unlinked(fibers), umbilicus, sensedParams(-1));
+        const int mirrorErrors = geometryContradictions(mirror);
+        QVERIFY2(vc3d::fiber_map::chiralityComparisonDecisive(0, mirrorErrors),
+                 qPrintable(QString::number(mirrorErrors)));
+        const GlobalResult straight = vc3d::fiber_map::buildGlobalLayout(
+            unlinked(fibers), umbilicus, sensedParams(1));
+        QCOMPARE(geometryContradictions(straight), 0);
+        // One net vote against +1 (two decoys to the weave's one).
+        QCOMPARE(mirror.chiralityNetVotes, -1);
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QCOMPARE(result.chiralityVote, -1);
+        QCOMPARE(result.chiralityNetVotes, -1);
+        QCOMPARE(result.chirality, 1);
+        QCOMPARE(result.chiralityBasis, ChiralityBasis::Comparison);
+        QCOMPARE(result.suspectCrossings.size(), std::size_t{0});
+        QCOMPARE(result.suspectLinkCount, 0);
+        QCOMPARE(result.comparedChiralityErrors, 0);
+        QCOMPARE(result.rejectedChiralityErrors, mirrorErrors);
+        // The kept map is the forced map of its sense, field for field.
+        const GlobalResult same = vc3d::fiber_map::buildGlobalLayout(
+            fibers, umbilicus, sensedParams(1));
+        QCOMPARE(result.fibers.size(), same.fibers.size());
+        for (std::size_t i = 0; i < result.fibers.size(); ++i) {
+            QCOMPARE(result.fibers[i].fiber.label, same.fibers[i].fiber.label);
+            QCOMPARE(result.fibers[i].meta.windingLo, same.fibers[i].meta.windingLo);
+            QCOMPARE(result.fibers[i].meta.windingHi, same.fibers[i].meta.windingHi);
+        }
+        QCOMPARE(result.x0Vx, same.x0Vx);
+        QCOMPARE(result.rRefVx, same.rRefVx);
+    }
+
+    // A stated sense is taken as given, right or wrong, and the vote is
+    // still reported beside it.
+    void statedSenseIsTakenAsGiven()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(60000);
+        const std::vector<InputFiber> fibers = decoyedWeave();
+        const GlobalResult right = vc3d::fiber_map::buildGlobalLayout(
+            fibers, umbilicus, sensedParams(1));
+        QCOMPARE(right.chirality, 1);
+        QCOMPARE(right.chiralityBasis, ChiralityBasis::Override);
+        QCOMPARE(right.chiralityVote, -1);
+        QCOMPARE(right.rejectedChiralityErrors, -1);
+        QCOMPARE(right.suspectCrossings.size(), std::size_t{0});
+        const GlobalResult wrong = vc3d::fiber_map::buildGlobalLayout(
+            fibers, umbilicus, sensedParams(-1));
+        QCOMPARE(wrong.chirality, -1);
+        QCOMPARE(wrong.chiralityBasis, ChiralityBasis::Override);
+        QCOMPARE(wrong.chiralityVote, -1);
+        QVERIFY(!wrong.suspectCrossings.empty());
+        // The two senses are different results.
+        QVERIFY(!(vc3d::fiber_map::digestGlobalResult(right) ==
+                  vc3d::fiber_map::digestGlobalResult(wrong)));
+    }
+
+    // Links do not decide the sense: a V fiber linked to the wrong turn of
+    // its H fiber is a contradiction in the true sense and none in the
+    // mirror, so on links the mirror would win - on one such link, on three
+    // (each with its own H fiber), or on five on one H fiber. The geometry
+    // of these fixtures orders nothing between turns, so the comparison
+    // is a tie in every case and the vote decides; the map built in that
+    // sense then reports the bad links as the errors they are. The margin
+    // rule itself first.
+    void aFewErrorsDoNotDecideTheSense()
+    {
+        using vc3d::fiber_map::chiralityComparisonDecisive;
+        QVERIFY(!chiralityComparisonDecisive(0, 1));
+        QVERIFY(!chiralityComparisonDecisive(0, 2));
+        QVERIFY(chiralityComparisonDecisive(0, 3));
+        QVERIFY(!chiralityComparisonDecisive(3, 6));
+        QVERIFY(chiralityComparisonDecisive(3, 7));
+        QVERIFY(!chiralityComparisonDecisive(5, 5));
+        QVERIFY(!chiralityComparisonDecisive(5, 7));
+        // PHerc0139 after the kb-214 edit: a 2-2 vote, 12 against 407.
+        QVERIFY(chiralityComparisonDecisive(12, 407));
+
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(60000);
+        const auto check = [&](const std::vector<InputFiber>& fibers, int badLinks,
+                               int expectedVotes) {
+            // With the links in, the true sense pays for every bad link
+            // and the mirror for none.
+            const GlobalResult right =
+                vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, sensedParams(1));
+            const GlobalResult mirror =
+                vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, sensedParams(-1));
+            QCOMPARE(right.chiralityNetVotes, expectedVotes);
+            QCOMPARE(contradictions(right), badLinks);
+            QCOMPARE(contradictions(mirror), 0);
+            // With the links out, neither sense contradicts anything.
+            QCOMPARE(geometryContradictions(vc3d::fiber_map::buildGlobalLayout(
+                         unlinked(fibers), umbilicus, sensedParams(1))),
+                     0);
+            QCOMPARE(geometryContradictions(vc3d::fiber_map::buildGlobalLayout(
+                         unlinked(fibers), umbilicus, sensedParams(-1))),
+                     0);
+            const GlobalResult result =
+                vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+            QCOMPARE(result.chiralityVote, 1);
+            QCOMPARE(result.chirality, 1);
+            QCOMPARE(result.chiralityBasis, ChiralityBasis::Vote);
+            QCOMPARE(result.comparedChiralityErrors, 0);
+            QCOMPARE(result.rejectedChiralityErrors, 0);
+            QCOMPARE(contradictions(result), badLinks);
+        };
+        check(wronglyLinkedPair(100, QStringLiteral("a-"), 30000.0), 1, 1);
+        {
+            std::vector<InputFiber> fibers = wronglyLinkedPair(100, QStringLiteral("a-"), 20000.0);
+            for (const auto& [id, prefix, z] :
+                 {std::make_tuple(200, QStringLiteral("b-"), 30000.0),
+                  std::make_tuple(300, QStringLiteral("c-"), 40000.0)}) {
+                const std::vector<InputFiber> more = wronglyLinkedPair(id, prefix, z);
+                fibers.insert(fibers.end(), more.begin(), more.end());
+            }
+            check(fibers, 3, 3);
+        }
+        check(fiveWrongLinksOnOneFiber(), 5, 1);
+    }
+
+    // Both senses tied on errors: the vote decides, and says so.
+    void tiedSensesFallToTheVote()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        // One H spiral and nothing to contradict it in either sense.
+        std::vector<InputFiber> fibers;
+        fibers.push_back(makeFiber(
+            100, QStringLiteral("a-h-1"), 'H',
+            arcPoints(30000.0, 4000.0, 300.0, 0.0, 1.5 * kTwoPi), {0, 1500}));
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QCOMPARE(result.chiralityBasis, ChiralityBasis::Vote);
+        QCOMPARE(result.chiralityVote, 1);
+        QCOMPARE(result.chirality, 1);
+        QCOMPARE(result.comparedChiralityErrors, 0);
+        QCOMPARE(result.rejectedChiralityErrors, 0);
+    }
+
+    // Solving both senses leaves both senses' pair shards in the cache: a
+    // later build of either stated sense finds every pair, and the
+    // reported pair counts are the kept sense's own.
+    void bothSensesAreMemoized()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(60000);
+        const std::vector<InputFiber> fibers = decoyedWeave();
+        vc3d::fiber_map::GlobalLayoutCache cache;
+        const GlobalResult cold =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams(), &cache);
+        QCOMPARE(cold.chirality, 1);
+        QVERIFY(cache.lastStats().used);
+        QCOMPARE(cache.lastStats().fibersReused, 0);
+        QCOMPARE(cache.lastStats().fibersRecomputed, static_cast<int>(fibers.size()));
+        const int pairs = cache.lastStats().pairsRecomputed;
+        QVERIFY(pairs > 0);
+        QCOMPARE(cache.lastStats().pairsReused, 0);
+        for (const int sense : {1, -1}) {
+            const GlobalResult warm = vc3d::fiber_map::buildGlobalLayout(
+                fibers, umbilicus, sensedParams(sense), &cache);
+            QCOMPARE(warm.chirality, sense);
+            QCOMPARE(cache.lastStats().fibersRecomputed, 0);
+            QCOMPARE(cache.lastStats().pairsRecomputed, 0);
+            QCOMPARE(cache.lastStats().pairsReused, pairs);
+        }
+        const GlobalResult warm =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams(), &cache);
+        QCOMPARE(cache.lastStats().pairsRecomputed, 0);
+        QCOMPARE(cache.lastStats().pairsReused, pairs);
+        QVERIFY(vc3d::fiber_map::digestGlobalResult(warm) ==
+                vc3d::fiber_map::digestGlobalResult(cold));
+    }
+
     // Declarations are not gated on trust: an interpolated fiber's wrong
     // link and the crossings it contradicts are reported exactly as a traced
     // fiber's would be. Its evidence is attenuated uniformly, so the same
@@ -898,10 +1173,10 @@ private slots:
         const int lastIndex = static_cast<int>(regress.size()) - 1;
         fibers.push_back(makeFiber(1, QStringLiteral("h-regress"), 'H',
                                    std::move(regress), {10, lastIndex - 10}));
-        // Two growing spirals pin the inferred chirality at +1: the
-        // regressing fiber's radius drop otherwise wins the turn-lag vote
-        // and mirrors the map, absorbing the very conflict this fixture
-        // exists to create.
+        // The sense is stated: solved in both, the mirrored map absorbs the
+        // very conflict this fixture exists to create and would be kept for
+        // its fewer errors. The two growing spirals still pin the data's
+        // vote at +1 against the regressing fiber's radius drop.
         fibers.push_back(makeFiber(4, QStringLiteral("a-anchor"), 'H',
                                    arcPoints(z + 300.0, 5000.0, 400.0, 0.0,
                                              3.0 * kTwoPi),
@@ -918,10 +1193,11 @@ private slots:
             3, QStringLiteral("v-b"), 'V',
             verticalPoints(0.4 * kTwoPi, 3000.0, z - 500.0, z + 500.0, 4.0),
             {0, 125, 250}));
-        const GlobalLayoutParams params = defaultParams();
+        const GlobalLayoutParams params = sensedParams(1);
         const GlobalResult fresh =
             vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params);
         QCOMPARE(fresh.chirality, 1);
+        QCOMPARE(fresh.chiralityVote, 1);
         // The fixture must actually conflict: the two inward-regression
         // drops are declared on the map.
         QCOMPARE(fresh.droppedCrossingCount, 2);
@@ -1624,7 +1900,8 @@ private slots:
             }
         }
         QVERIFY(differing >= 1);
-        QVERIFY(differing <= hFibers);
+        // The nudged V fiber has a shard per H fiber in each winding sense.
+        QVERIFY(differing <= 2 * hFibers);
     }
 
     // --- Kollesis.

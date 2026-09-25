@@ -29,12 +29,22 @@ public:
 
     [[nodiscard]] State state() const { return _state; }
     [[nodiscard]] Pending pending() const { return _pending; }
+    // Whether every request folded into the pending slot was automatic
+    // (armed by a staleness gate rather than asked for): the holder may
+    // drop such a pending request when the world it was armed for has
+    // moved on, but never one the user asked for, or one that retries the
+    // build they asked for. False when nothing is pending.
+    [[nodiscard]] bool pendingAutomatic() const
+    {
+        return _pending != Pending::None && _pendingAutomatic;
+    }
     [[nodiscard]] std::uint64_t epoch() const { return _epoch; }
 
     // A request to rebuild. Start means the caller must launch the build
     // now (and is handed the epoch to stamp on it); Coalesced means it was
-    // folded into the pending slot; Refused means shutdown.
-    [[nodiscard]] Request request(bool full)
+    // folded into the pending slot; Refused means shutdown. `automatic`
+    // says who asked (see pendingAutomatic()).
+    [[nodiscard]] Request request(bool full, bool automatic = false)
     {
         if (_state == State::ShuttingDown) {
             return Request::Refused;
@@ -45,6 +55,7 @@ public:
                                 : (_pending == Pending::Full ? Pending::Full
                                                              : Pending::Update);
             }
+            _pendingAutomatic = _pendingAutomatic && automatic;
             return Request::Coalesced;
         }
         _state = State::Running;
@@ -78,12 +89,12 @@ public:
     [[nodiscard]] Pending finishApply()
     {
         if (_state == State::ShuttingDown) {
-            _pending = Pending::None;
+            clearPending();
             return Pending::None;
         }
         _state = State::Idle;
         const Pending dispatch = _pending;
-        _pending = Pending::None;
+        clearPending();
         return dispatch;
     }
 
@@ -92,13 +103,20 @@ public:
     void shutdown()
     {
         _state = State::ShuttingDown;
-        _pending = Pending::None;
+        clearPending();
         ++_epoch;
     }
 
 private:
+    void clearPending()
+    {
+        _pending = Pending::None;
+        _pendingAutomatic = true;
+    }
+
     State _state = State::Idle;
     Pending _pending = Pending::None;
+    bool _pendingAutomatic = true;
     std::uint64_t _epoch = 0;
 };
 

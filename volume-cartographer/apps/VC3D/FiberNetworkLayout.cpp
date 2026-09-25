@@ -1134,7 +1134,71 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
                                const GlobalLayoutParams& params,
                                GlobalLayoutCache* cache)
 {
+    if (params.solver.chiralityOverride == 0) {
+        // No stated sense: decide it on the geometry alone, then build. Both
+        // senses are solved with the links left out and compared on their
+        // crossing contradictions (chiralityComparisonDecisive says why the
+        // links stay out and what the margin is), the data's vote deciding
+        // otherwise; the map is then built in the chosen sense with the
+        // links. Every run is a complete build of its own: the pair shards
+        // are keyed by sense and never read the links, so the deciding runs
+        // leave both senses' shards in the cache and the final run finds its
+        // sense's all there. The products are combined only in the
+        // bookkeeping - the timings sum to the work done, the cache stats
+        // follow the rule on GlobalLayoutCache::Stats.
+        std::vector<InputFiber> unlinked = fibers;
+        for (InputFiber& fiber : unlinked) {
+            fiber.links.clear();
+        }
+        GlobalLayoutParams stated = params;
+        stated.solver.chiralityOverride = 1;
+        const GlobalResult forward =
+            buildGlobalLayout(unlinked, umbilicusCenters, stated, cache);
+        const GlobalLayoutCache::Stats forwardStats =
+            cache != nullptr ? cache->_stats : GlobalLayoutCache::Stats{};
+        stated.solver.chiralityOverride = -1;
+        const GlobalResult backward =
+            buildGlobalLayout(unlinked, umbilicusCenters, stated, cache);
+        const GlobalLayoutCache::Stats backwardStats =
+            cache != nullptr ? cache->_stats : GlobalLayoutCache::Stats{};
+        // Independent contradictions, not rings: a group conflict rings at
+        // every member. No links were solved, so none can be suspect.
+        const auto contradictionsOf = [](const GlobalResult& result) {
+            return result.droppedCrossingCount + result.declaredGroupCount;
+        };
+        const int forwardErrors = contradictionsOf(forward);
+        const int backwardErrors = contradictionsOf(backward);
+        const bool decisive = chiralityComparisonDecisive(
+            std::min(forwardErrors, backwardErrors), std::max(forwardErrors, backwardErrors));
+        const bool keepForward = decisive ? forwardErrors < backwardErrors
+                                          : forward.chiralityVote > 0;
+        stated.solver.chiralityOverride = keepForward ? 1 : -1;
+        GlobalResult kept = buildGlobalLayout(fibers, umbilicusCenters, stated, cache);
+        kept.chiralityBasis = decisive ? ChiralityBasis::Comparison : ChiralityBasis::Vote;
+        kept.comparedChiralityErrors = keepForward ? forwardErrors : backwardErrors;
+        kept.rejectedChiralityErrors = keepForward ? backwardErrors : forwardErrors;
+        for (const GlobalResult* deciding : {&forward, &backward}) {
+            kept.prepMs += deciding->prepMs;
+            kept.detectMs += deciding->detectMs;
+            kept.solveMs += deciding->solveMs;
+            kept.geometryMs += deciding->geometryMs;
+        }
+        if (cache != nullptr) {
+            GlobalLayoutCache::Stats stats = cache->_stats;
+            const GlobalLayoutCache::Stats& deciding =
+                keepForward ? forwardStats : backwardStats;
+            stats.fibersReused = forwardStats.fibersReused;
+            stats.fibersRecomputed = forwardStats.fibersRecomputed;
+            stats.pairsReused = deciding.pairsReused;
+            stats.pairsRecomputed = deciding.pairsRecomputed;
+            cache->_stats = stats;
+        }
+        return kept;
+    }
+
     GlobalResult result;
+    result.chirality = params.solver.chiralityOverride;
+    result.chiralityBasis = ChiralityBasis::Override;
     // Cache bookkeeping runs for every exit path: stats reset up front (so a
     // duplicate-disabled or early-return build never shows the previous
     // build's counts), the duplicate check over the whole input (fileName is
@@ -1170,8 +1234,8 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
                                                  : cache->_prep.erase(it);
             }
             for (auto it = cache->_pairs.begin(); it != cache->_pairs.end();) {
-                it = names.count(it->first.first) != 0 &&
-                             names.count(it->first.second) != 0
+                it = names.count(std::get<0>(it->first)) != 0 &&
+                             names.count(std::get<1>(it->first)) != 0
                          ? std::next(it)
                          : cache->_pairs.erase(it);
             }
@@ -1381,6 +1445,14 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     const auto detectBegin = std::chrono::steady_clock::now();
     const int chirality =
         winding::inferChirality(traces, solverParams.chiralityOverride);
+    // What the data alone would have said, reported whichever way the map
+    // goes (the prior when both senses are solved, a diagnostic when the
+    // sense is stated).
+    {
+        const winding::ChiralityVote tally = winding::tallyChirality(traces);
+        result.chiralityVote = tally.sense;
+        result.chiralityNetVotes = tally.netTurnVotes;
+    }
 
     // Kollesis fields (see winding::FiberTrace). An H fiber's tagged first or
     // last control point marks a seam end, named by that control's sample on
@@ -1528,8 +1600,8 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
             } else {
                 const ContentDigest pairKey = combineDigests(
                     0x9A18, {prepKeys[h], prepKeys[v], chiralityDigest, detectParams});
-                GlobalLayoutCache::PairSlot& slot = cache->_pairs[std::make_pair(
-                    ordered[h]->fileName, ordered[v]->fileName)];
+                GlobalLayoutCache::PairSlot& slot = cache->_pairs[std::make_tuple(
+                    ordered[h]->fileName, ordered[v]->fileName, chirality)];
                 if (slot.key == pairKey) {
                     ++cache->_stats.pairsReused;
                 } else {
@@ -2136,6 +2208,13 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
     hashDouble(digest, result.yMinVx);
     hashDouble(digest, result.yMaxVx);
     hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(result.chirality)));
+    hashU64(digest, static_cast<uint64_t>(result.chiralityBasis));
+    hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(result.chiralityVote)));
+    hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(result.chiralityNetVotes)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.comparedChiralityErrors)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.rejectedChiralityErrors)));
     hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(result.islandCount)));
     hashU64(digest,
             static_cast<uint64_t>(static_cast<int64_t>(result.unresolvedCount)));

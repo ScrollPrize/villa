@@ -214,6 +214,11 @@ public:
         // count scaled back to the annotation (level 0) resolution; 0 when the
         // volume is unknown.
         int annotationZSlices = 0;
+        // The current volume's open-data coordinate space
+        // ("<sample>/<volume>@L<level>", from its vc-open-data tags), which
+        // names the catalog entry that orients it; empty for a volume without
+        // the tags.
+        std::string coordinateSpace;
         QString umbilicusMessage;           // resolver error / ambiguity text; empty on success
         // Ready-to-display description of the frame the scale maps from, for
         // workspace status bars: the stamped volume and its level offset when
@@ -392,6 +397,11 @@ public:
     // for attach and detach it overlaps umbilicusGeneration(), which holders
     // still compare as the reviewer-prescribed mechanism for in-app changes.
     [[nodiscard]] QString umbilicusFingerprint() const;
+    // The current volume's open-data coordinate space
+    // ("<sample>/<volume>@L<level>", from its vc-open-data tags), naming the
+    // catalog entry that orients it; empty for a volume without the tags.
+    // A tag read, no parse, so it is cheap enough for dependency checks.
+    [[nodiscard]] std::string fiberMapCoordinateSpace() const;
     [[nodiscard]] std::vector<FiberLinkOverlayInfo> fiberLinkOverlayInfos() const;
     // Bumped whenever the loaded fiber set changes (load, save, delete, and the
     // edits that refresh the fiber summaries). Holders of derived data compare

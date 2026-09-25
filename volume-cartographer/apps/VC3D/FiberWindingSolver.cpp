@@ -202,10 +202,10 @@ struct OrdinalPoint {
 
 } // namespace
 
-int inferChirality(const std::vector<FiberTrace>& fibers, int chiralityOverride)
+ChiralityVote tallyChirality(const std::vector<FiberTrace>& fibers)
 {
-    int chirality = chiralityOverride;
-    if (chirality == 0) {
+    ChiralityVote tally;
+    {
         // Radius one whole turn along the same fiber is the same ray one
         // winding out: crumpling in angle cancels exactly and only the
         // spiral's sign survives (z drift along the turn does not cancel,
@@ -282,9 +282,17 @@ int inferChirality(const std::vector<FiberTrace>& fibers, int chiralityOverride)
         // wrapping fibers resolves to the deterministic default rather than
         // letting one short crumpled fiber flip the map.
         const int vote = haveTurnEvidence ? turnVotes : covarianceVotes;
-        chirality = vote < 0 ? -1 : 1;
+        tally.sense = vote < 0 ? -1 : 1;
+        tally.haveTurnEvidence = haveTurnEvidence;
+        tally.netTurnVotes = haveTurnEvidence ? turnVotes : 0;
+        tally.covarianceVotes = covarianceVotes;
     }
-    return chirality;
+    return tally;
+}
+
+int inferChirality(const std::vector<FiberTrace>& fibers, int chiralityOverride)
+{
+    return chiralityOverride != 0 ? chiralityOverride : tallyChirality(fibers).sense;
 }
 
 CanonicalTrace canonicalizeTrace(const FiberTrace& fiber, int chirality)
