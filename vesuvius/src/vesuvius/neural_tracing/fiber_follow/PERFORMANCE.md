@@ -1,5 +1,8 @@
 # v11 performance measurements — 2026-09-25
 
+For further measurements against the resulting contiguous-layout baseline, see
+[training encoder reuse](PERFORMANCE_ENCODING.md).
+
 The change from `7fcea8c14` to `68a5e02cb` enlarged the crop from 64³ to
 176×96×96 (6.19× as many voxels), increased flow draws from 16 to 64,
 and expanded the denoiser. `a67f6ce96` added refinement logging, which reuses
@@ -113,11 +116,11 @@ From this directory, using the existing project environment:
 export PYTHONPATH=../../..
 ../../../../.venv/bin/python scripts/benchmark_single_path.py \
   --manifest output/single_path_v11_preparation/seeds.json \
-  --warmup 3 --updates 20 --conv-memory-format channels_last_3d \
+  --warmup 3 --updates 20 --no-compile --no-cache-training-encoding --conv-memory-format channels_last_3d \
   --out output/performance_20260925/channels_last_3d.json
 ../../../../.venv/bin/python scripts/benchmark_single_path.py \
   --manifest output/single_path_v11_preparation/seeds.json \
-  --warmup 3 --updates 20 --conv-memory-format contiguous \
+  --warmup 3 --updates 20 --no-compile --no-cache-training-encoding --conv-memory-format contiguous \
   --out output/performance_20260925/contiguous.json
 ```
 

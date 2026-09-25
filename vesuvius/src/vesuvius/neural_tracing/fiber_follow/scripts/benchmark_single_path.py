@@ -10,7 +10,7 @@ import torch
 from vesuvius.neural_tracing.fiber_follow.data import FollowDataset,SampleConfig,ZBand,load_fibers,split_fibers
 from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.model import ARCHITECTURE,FollowNet,FollowNetConfig,prepare_model
-from vesuvius.neural_tracing.fiber_follow.train import optimizer_update
+from vesuvius.neural_tracing.fiber_follow.train import optimizer_update,compile_training_model
 from vesuvius.neural_tracing.fiber_follow.trace import ModelTracer,TraceParams
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume,FiberVolumeSpec
 
@@ -22,6 +22,10 @@ def main(argv=None):
     ap.add_argument('--fibers',default='/mnt/raid_nvme/spiral_dataset_working/fibers')
     ap.add_argument('--device',default='cuda')
     ap.add_argument('--microbatch',type=int,choices=(1,2),default=2)
+    ap.add_argument('--cache-training-encoding',action=argparse.BooleanOptionalAction,default=True,
+                    help='Measure encoder graph reuse (default: enabled), including its increased memory requirement')
+    ap.add_argument('--compile',dest='compile_model',action=argparse.BooleanOptionalAction,default=True,
+                    help='Compile CUDA training methods (default: enabled)')
     ap.add_argument('--flow-draws',type=int,default=64)
     ap.add_argument('--updates',type=int,default=3)
     ap.add_argument('--warmup',type=int,default=1)
@@ -29,7 +33,8 @@ def main(argv=None):
                     help='Override convolution layout for paired performance experiments')
     args=ap.parse_args(argv)
     result=dict(architecture=ARCHITECTURE,device=args.device,microbatch=args.microbatch,
-                effective_batch=8,flow_draws=args.flow_draws,crop=[176,96,96],passed=False)
+                effective_batch=8,flow_draws=args.flow_draws,crop=[176,96,96],passed=False,
+                cache_training_encoding=args.cache_training_encoding,compile_model=args.compile_model)
     try:
         if not args.device.startswith('cuda') or not torch.cuda.is_available():
             raise RuntimeError('Preflight requires a working CUDA device; CPU smoke tests do not qualify')
@@ -55,13 +60,20 @@ def main(argv=None):
                       precision='cuda_bfloat16_autocast',manifest=str(args.manifest),fibers=args.fibers)
         ema=copy.deepcopy(model).requires_grad_(False)
         opt=torch.optim.AdamW(model.parameters(),lr=1e-3,weight_decay=1e-4)
+        if args.compile_model:
+            print('Compiling CUDA training methods; warmup includes compilation.',flush=True)
+            compile_training_model(model)
         torch.cuda.reset_peak_memory_stats(args.device)
         times=[]
+        result['warmup_seconds']=[]
         for i in range(args.updates+args.warmup):
             torch.cuda.synchronize();start=time.perf_counter()
-            optimizer_update(model,ema,opt,micro,2000+i,1e-3,device=args.device,compute_metrics=False)
+            optimizer_update(model,ema,opt,micro,2000+i,1e-3,device=args.device,compute_metrics=False,
+                             cache_training_encoding=args.cache_training_encoding)
             torch.cuda.synchronize()
-            if i>=args.warmup: times.append(time.perf_counter()-start)
+            elapsed=time.perf_counter()-start
+            if i>=args.warmup: times.append(elapsed)
+            else: result['warmup_seconds'].append(elapsed)
         result.update(peak_allocated_bytes=torch.cuda.max_memory_allocated(args.device),
                       peak_reserved_bytes=torch.cuda.max_memory_reserved(args.device),
                       update_seconds=times,samples_per_second=8/np.mean(times),gpu=torch.cuda.get_device_name(args.device))
@@ -87,7 +99,8 @@ def main(argv=None):
     except Exception as exc:
         result['error']=f'{type(exc).__name__}: {exc}'
         if isinstance(exc,torch.cuda.OutOfMemoryError):
-            result['next_action']='Rerun with --microbatch 1 (eight accumulation steps); retain crop and effective batch 8'
+            result['next_action']=('Rerun with --no-cache-training-encoding to release retained encoder graphs' if args.cache_training_encoding
+                                   else 'Rerun with --microbatch 1 (eight accumulation steps); retain crop and effective batch 8')
         raise
     finally:
         args.out.parent.mkdir(parents=True,exist_ok=True)

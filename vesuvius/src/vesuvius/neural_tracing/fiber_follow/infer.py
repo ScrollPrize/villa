@@ -26,7 +26,7 @@ from scipy import ndimage
 from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.fiber_follow.geometry import arclength, resample_polyline
-from vesuvius.neural_tracing.fiber_follow.trace import DEFAULT_CONFIDENCE, ModelTracer, TraceParams, field_axis
+from vesuvius.neural_tracing.fiber_follow.trace import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, ModelTracer, TraceParams, field_axis
 from vesuvius.neural_tracing.fiber_follow.train import load_checkpoint
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume, FiberVolumeSpec
 
@@ -128,7 +128,7 @@ def main(argv=None):
     ap.add_argument("--cp-every", type=float, default=800.0, help="control-point spacing, base voxels")
     ap.add_argument("--max-len", type=float, default=6000.0, help="per-direction limit, trace-grid voxels")
     ap.add_argument("--confidence", type=float, default=DEFAULT_CONFIDENCE)
-    ap.add_argument("--n-commit", type=int, default=4)
+    ap.add_argument("--n-commit", type=int, default=DEFAULT_N_COMMIT, help="max points committed per decision (<= model n_future)")
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda")

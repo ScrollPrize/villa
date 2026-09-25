@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 from vesuvius.neural_tracing.fiber_follow.data import OnPolicyStates
-from vesuvius.neural_tracing.fiber_follow.trace import DEFAULT_CONFIDENCE
+from vesuvius.neural_tracing.fiber_follow.trace import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT
 
 
 def publish_replay(index, paths):
@@ -26,14 +26,14 @@ class OnlineCollector:
     """
     def __init__(self, directory, fibers, val_z, device, every=1000, max_seeds=64,
                  batch=1, explore_calls=8, seed=0, replay_keep=4, initial=(),
-                 trace_len=6000., confidence=DEFAULT_CONFIDENCE):
+                 trace_len=6000., confidence=DEFAULT_CONFIDENCE, n_commit=DEFAULT_N_COMMIT):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.index = self.directory/'replay.json'
         self.fibers, self.val_z, self.device = fibers, val_z, device
         self.every, self.max_seeds, self.batch = every, max_seeds, batch
         self.explore_calls, self.seed, self.replay_keep = explore_calls, seed, replay_keep
-        self.trace_len, self.confidence = trace_len, confidence
+        self.trace_len, self.confidence, self.n_commit = trace_len, confidence, n_commit
         self.paths = list(initial)
         self.process = self.log = None
         self.output = None
@@ -64,7 +64,8 @@ class OnlineCollector:
                    '--val-z', *map(str, self.val_z), '--device', self.device,
                    '--max-seeds', str(self.max_seeds), '--batch', str(self.batch),
                    '--explore-calls', str(self.explore_calls), '--trace-len', str(self.trace_len),
-                   '--confidence', str(self.confidence), '--seed', str(self.seed+step), '--out', str(self.output)]
+                   '--confidence', str(self.confidence), '--n-commit', str(self.n_commit),
+                   '--seed', str(self.seed+step), '--out', str(self.output)]
         self.log = self.output.with_suffix('.log').open('w')
         self.process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT)
         return True

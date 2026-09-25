@@ -18,13 +18,13 @@ from vesuvius.neural_tracing.fiber_follow.geometry import (
     normalize,
 )
 from vesuvius.neural_tracing.fiber_follow.model import FollowNet
-from vesuvius.neural_tracing.fiber_follow.policy import DEFAULT_CONFIDENCE, commit_prefix
+from vesuvius.neural_tracing.fiber_follow.policy import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, commit_prefix
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume
 
 
 @dataclass
 class TraceParams:
-    n_commit: int = 4  # maximum; confidence can shorten each commit
+    n_commit: int = DEFAULT_N_COMMIT  # maximum per decision, at most the model horizon; confidence can shorten each commit
     max_len: float = 6000.0
     confidence: float = DEFAULT_CONFIDENCE
     loop_radius: float = 1.5
@@ -40,7 +40,7 @@ class TraceParams:
     seed: int = 0  # reserved for reproducible seed manifests; inference is deterministic
 
     def __post_init__(self):
-        if not 1 <= self.n_commit <= 4 or self.max_len <= 0 or not 0 <= self.confidence <= 1 or self.explore_calls < 0:
+        if self.n_commit < 1 or self.max_len <= 0 or not 0 <= self.confidence <= 1 or self.explore_calls < 0:
             raise ValueError('Invalid rollout parameters')
         if self.stop_patience < 1 or (self.commit_floor is not None and not 0 <= self.commit_floor <= 1):
             raise ValueError('stop_patience must be positive and commit_floor within [0, 1]')
@@ -90,6 +90,8 @@ class ModelTracer:
                  params: TraceParams | None = None, device: str = "cuda"):
         self.model, self.vol, self.crop = model, vol, crop
         self.n_history, self.p, self.device = n_history, params or TraceParams(), str(device)
+        if self.p.n_commit > model.cfg.n_future:
+            raise ValueError(f'n_commit={self.p.n_commit} exceeds the model horizon n_future={model.cfg.n_future}')
         self.grid = torch.from_numpy(crop_local_grid(crop)).float().to(device)
         self.S = crop.block_size
         self.pool = ThreadPoolExecutor(max(1, min(16, os.cpu_count() or 1)))

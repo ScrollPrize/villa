@@ -3,6 +3,7 @@ import torch
 
 
 DEFAULT_CONFIDENCE = 0.7
+DEFAULT_N_COMMIT = 8
 DEFAULT_MAX_RECOVERY_DISTANCE = 6.0
 
 
@@ -17,11 +18,15 @@ def recovery_allowed(points, max_distance=DEFAULT_MAX_RECOVERY_DISTANCE):
             & (first.norm(dim=-1) <= max_distance))
 
 
-def commit_prefix(points, confidence, threshold=DEFAULT_CONFIDENCE, n_commit=4,
+def commit_prefix(points, confidence, threshold=DEFAULT_CONFIDENCE, n_commit=DEFAULT_N_COMMIT,
                   max_distance=DEFAULT_MAX_RECOVERY_DISTANCE):
-    """Eligible prefix of a single curve; at most four points per decision."""
-    if not 1 <= n_commit <= 4:
-        raise ValueError('n_commit must lie in [1, 4]')
+    """Eligible prefix of a single curve; at most ``n_commit`` points per decision.
+
+    ``n_commit`` may not exceed the generated horizon (``confidence.shape[-1]``).
+    """
+    horizon = confidence.shape[-1]
+    if not 1 <= n_commit <= horizon:
+        raise ValueError(f'n_commit must lie in [1, {horizon}]')
     allowed = recovery_allowed(points,max_distance)
     conf = confidence.float().cummin(-1).values
     count = (conf >= threshold).int().cumprod(-1).sum(-1).clamp(max=n_commit)

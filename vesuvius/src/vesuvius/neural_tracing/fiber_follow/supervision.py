@@ -1,20 +1,20 @@
 """Dense prefix correctness of the one curve actually generated."""
 import torch
 import torch.nn.functional as F
-from vesuvius.neural_tracing.fiber_follow.policy import DEFAULT_MAX_RECOVERY_DISTANCE, recovery_allowed
+from vesuvius.neural_tracing.fiber_follow.policy import DEFAULT_MAX_RECOVERY_DISTANCE, DEFAULT_N_COMMIT, recovery_allowed
 from vesuvius.neural_tracing.fiber_follow.model import flow_targets
 
 
 @torch.no_grad()
-def refinement_metrics(steps, batch, cfg):
-    """First-four crossing error for the initial curve and every midpoint update.
+def refinement_metrics(steps, batch, cfg, n_commit=DEFAULT_N_COMMIT):
+    """Commit-window crossing error for the initial curve and every midpoint update.
 
     Use the same observable GT mask at every step. Drift is the distance from
     the current origin to its original-fiber correspondence, not the nearest
     fiber. Departed states are excluded. Sums/counts support pooling log rows;
     nonfinite predictions are counted separately, never replaced with zero error.
     """
-    near = min(4, cfg.n_future)
+    near = min(n_commit, cfg.n_future)
     target, mask, _ = flow_targets(batch, cfg)
     known = mask[:, :near].bool()
     error = (steps[:, :, :near, :2].float()-target[:, None, :near, :2]).norm(dim=-1)
@@ -92,11 +92,18 @@ def masked_bce(logits, target, mask, denominator=None):
     return (loss*mask).sum()/denominator.clamp_min(1)
 
 
-def loss_fn(output, batch, cfg, tolerance=1.5, *, update=0, confidence_ramp=2000, compute_metrics=True, normalizers=None):
+def loss_fn(output, batch, cfg, tolerance=1.5, *, update=0, confidence_ramp=2000, compute_metrics=True, normalizers=None,
+            n_commit=DEFAULT_N_COMMIT):
+    """Flow loss plus confidence BCE, half over the commit window and half over the full horizon.
+
+    ``n_commit`` is the rollout commit limit; the near term covers exactly the prefixes a
+    decision can commit, clipped to the model horizon.
+    """
     target, mask, error = prefix_labels(output['points'],batch,tolerance,cfg.max_recovery_distance)
     logits = output['confidence_logits']
     normalizers = normalizers or {}
-    near = masked_bce(logits[:,:4],target[:,:4],mask[:,:4],normalizers.get('near'))
+    window = min(n_commit, logits.shape[1])
+    near = masked_bce(logits[:,:window],target[:,:window],mask[:,:window],normalizers.get('near'))
     full = masked_bce(logits,target,mask,normalizers.get('full'))
     flow = output['flow_loss']
     if 'flow' in normalizers:
@@ -107,11 +114,12 @@ def loss_fn(output, batch, cfg, tolerance=1.5, *, update=0, confidence_ramp=2000
     metrics = {}
     if compute_metrics:
         metrics = dict(flow=flow.item(), confidence_loss=confidence.item(),
-                       confidence_first_four=near.item(),confidence_all=full.item(),confidence_coefficient=coefficient,
+                       confidence_commit=near.item(),confidence_all=full.item(),confidence_coefficient=coefficient,
+                       commit_window=window,
                        flow_known_fraction=output['flow_known_fraction'].item(),
                        flow_censored_fraction=output['flow_censored_fraction'].item(),
-                       four_correct_count=(target[:,min(3,target.shape[1]-1)]*mask[:,min(3,target.shape[1]-1)]).sum().item(),
-                       four_known_count=mask[:,min(3,target.shape[1]-1)].sum().item())
+                       commit_correct_count=(target[:,window-1]*mask[:,window-1]).sum().item(),
+                       commit_known_count=mask[:,window-1].sum().item())
         for threshold in (.5,.85):
             eligible = recovery_allowed(output['points'],cfg.max_recovery_distance)
             open_gate = eligible & (output['confidence'][:,0]>=threshold)

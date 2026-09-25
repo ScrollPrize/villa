@@ -30,6 +30,22 @@ def _sample(raw, start_zyx, pos, frame, grid, gate, hist, hmask, out, sigma, seg
             hmax_c = hist[k, 2]
     if segments and H > 0 and hmask[0] > 0:
         hmax_c = max(hmax_c, 0.0)
+    # Outside this box even exp(-distance² / (2*sigma²)) rounds to
+    # zero in float32: exp(-128) is below half its smallest subnormal.
+    # Include the origin only when the first history segment connects to it.
+    lo = np.full(3, np.inf)
+    hi = np.full(3, -np.inf)
+    for k in range(H):
+        if hmask[k] > 0:
+            for axis in range(3):
+                lo[axis] = min(lo[axis], hist[k, axis])
+                hi[axis] = max(hi[axis], hist[k, axis])
+    if segments and H > 0 and hmask[0] > 0:
+        for axis in range(3):
+            lo[axis] = min(lo[axis], 0.0)
+            hi[axis] = max(hi[axis], 0.0)
+    lo -= 16.0*sigma
+    hi += 16.0*sigma
     for p in range(P):
         ga, gb, gc = grid[p, 0], grid[p, 1], grid[p, 2]
         wx = pos[0] + frame[0, 0] * ga + frame[0, 1] * gb + frame[0, 2] * gc
@@ -98,7 +114,8 @@ def _sample(raw, start_zyx, pos, frame, grid, gate, hist, hmask, out, sigma, seg
             out[0, p] = ctv * (1.0 / 255.0)
         # Own history: nearest point or connected segment, including the current origin.
         best = 1e30
-        if gc - hmax_c > 7.1*sigma:
+        if (gc - hmax_c > 7.1*sigma or ga < lo[0] or ga > hi[0]
+                or gb < lo[1] or gb > hi[1] or gc < lo[2]):
             out[hist_ch, p] = 0.0
             continue
         for k in range(H):

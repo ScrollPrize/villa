@@ -16,7 +16,7 @@ from vesuvius.neural_tracing.fiber_follow.data import (
 )
 from vesuvius.neural_tracing.fiber_follow.evaluate import make_seeds
 from vesuvius.neural_tracing.fiber_follow.geometry import arclength, tangent_at
-from vesuvius.neural_tracing.fiber_follow.trace import DEFAULT_CONFIDENCE, ModelTracer, TraceParams
+from vesuvius.neural_tracing.fiber_follow.trace import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, ModelTracer, TraceParams
 from vesuvius.neural_tracing.fiber_follow.train import load_checkpoint
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume
 
@@ -128,6 +128,7 @@ def main(argv=None):
     ap.add_argument('--after', type=float, default=24.)
     ap.add_argument('--stride', type=float, default=16.)
     ap.add_argument('--confidence', type=float, default=DEFAULT_CONFIDENCE)
+    ap.add_argument('--n-commit', type=int, default=DEFAULT_N_COMMIT)
     ap.add_argument('--explore-calls', type=int, default=8)
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--threads', type=int, default=2)
@@ -158,7 +159,8 @@ def main(argv=None):
             seeds = seeds[:args.max_seeds]
             break
     tracer = ModelTracer(model, vol, crop, n_hist,
-                         TraceParams(max_len=args.trace_len, confidence=args.confidence, explore_calls=args.explore_calls),
+                         TraceParams(max_len=args.trace_len, confidence=args.confidence, explore_calls=args.explore_calls,
+                                     n_commit=args.n_commit),
                          device=args.device)
     rows = []
     try:

@@ -111,9 +111,15 @@ def test_labels_describe_final_detached_curve_balanced_bce_and_ramp():
              flow_known_fraction=torch.ones(()),flow_censored_fraction=torch.zeros(()))
     labels,mask,_=prefix_labels(p,b)
     assert labels[0].all() and not labels[1].any() and mask.all()
-    loss,_=loss_fn(out,b,cfg,update=1000)
+    loss,stats=loss_fn(out,b,cfg,update=1000,n_commit=4)
     expected=.5*(.5*masked_bce(logits[:,:4],labels[:,:4],mask[:,:4])+.5*masked_bce(logits,labels,mask))
-    torch.testing.assert_close(loss,expected);loss.backward()
+    torch.testing.assert_close(loss,expected);assert stats['commit_window']==4
+    loss,stats=loss_fn(out,b,cfg,update=1000,n_commit=6)
+    expected=.5*(.5*masked_bce(logits[:,:6],labels[:,:6],mask[:,:6])+.5*masked_bce(logits,labels,mask))
+    torch.testing.assert_close(loss,expected);assert stats['commit_window']==6
+    loss,stats=loss_fn(out,b,cfg,update=1000)  # default commit exceeds this horizon: clipped to all 8
+    torch.testing.assert_close(loss,.5*masked_bce(logits,labels,mask));assert stats['commit_window']==8
+    loss.backward()
     assert p.grad is None and logits.grad is not None
     b['dense_mask'][:,5:]=0
     target,mask,_=prefix_labels(p,b)
@@ -133,9 +139,12 @@ def test_first_connection_and_unknown_end(distance,allowed):
     assert recovery_allowed(p).item()==allowed
     target,mask,_=prefix_labels(p,b)
     if not allowed: assert mask.all() and not target.any()
-    count,ok=commit_prefix(p,torch.tensor([[.9,.8,.85,.2]]),.7)
+    count,ok=commit_prefix(p,torch.tensor([[.9,.8,.85,.2]]),.7,n_commit=4)
     assert count.item()==(3 if allowed else 0)
     with pytest.raises(ValueError): commit_prefix(p,torch.ones(1,4),n_commit=5)
+    long=torch.zeros(1,16,3);long[...,2]=torch.arange(1,17)
+    conf=torch.ones(1,16);conf[:,10:]=.1
+    assert commit_prefix(long,conf,.7)[0].item()==8 and commit_prefix(long,conf,.7,n_commit=16)[0].item()==10
 
 
 def test_checkpoint_roundtrip_rejects_legacy_and_beam_parameter_names(tmp_path):
@@ -218,12 +227,69 @@ def test_accumulation_steps_once_and_ema_matches_effective_batch(monkeypatch):
     monkeypatch.setattr(FollowNet,'generate_training_curve',generate)
     monkeypatch.setattr(FollowNet,'training_forward',training_forward)
     oa=torch.optim.SGD(a.parameters(),lr=.01);ob=torch.optim.SGD(b.parameters(),lr=.01)
-    _,stats_a,_=optimizer_update(a,ea,oa,[data],2000,.01,device='cpu')
+    _,stats_a,_=optimizer_update(a,ea,oa,[data],2000,.01,device='cpu',cache_training_encoding=False)
     micro=[{k:v[i:i+2] for k,v in data.items()} for i in range(0,8,2)]
-    _,stats_b,_=optimizer_update(b,eb,ob,micro,2000,.01,device='cpu')
+    _,stats_b,_=optimizer_update(b,eb,ob,micro,2000,.01,device='cpu',cache_training_encoding=False)
     assert stats_a['refinement']==stats_b['refinement']
     for x,y in zip(a.parameters(),b.parameters()): torch.testing.assert_close(x,y)
     for x,y in zip(ea.parameters(),eb.parameters()): torch.testing.assert_close(x,y)
+
+
+@pytest.mark.parametrize('compute_metrics',[False,True])
+def test_cached_training_encoding_matches_recompute(compute_metrics):
+    torch.manual_seed(31)
+    cfg=config();reference=FollowNet(cfg);cached=copy.deepcopy(reference)
+    models=(reference,cached)
+    averages=[copy.deepcopy(m).requires_grad_(False) for m in models]
+    optimizers=[torch.optim.AdamW(m.parameters(),lr=1e-3) for m in models]
+    data=batch(cfg,4)
+    data['hmask'][0].zero_()
+    data['plane_mask'][1,2:]=0;data['dense_mask'][1,5:]=0
+    data['offtrack'][2]=1;data['plane_ab'][3,2:]=100
+    micro=[{k:v[i:i+2] for k,v in data.items()} for i in range(0,4,2)]
+    calls=[0,0]
+    def count(index):
+        def hook(*args): calls[index]+=1
+        return hook
+    handles=[m.encoders[0].register_forward_hook(count(i)) for i,m in enumerate(models)]
+    try:
+        # A second update also catches stale graphs/weights retained across updates.
+        for step in (2000,2001):
+            results=[]
+            for i,(m,ema,opt) in enumerate(zip(models,averages,optimizers)):
+                torch.manual_seed(step)
+                results.append(optimizer_update(m,ema,opt,micro,step,1e-3,device='cpu',
+                    compute_metrics=compute_metrics,**({'cache_training_encoding':False} if i==0 else {})))
+            assert results[0][0]==pytest.approx(results[1][0],rel=1e-6)
+            assert results[0][1]==results[1][1]
+            for a,b in zip(reference.parameters(),cached.parameters()):
+                torch.testing.assert_close(a.grad,b.grad)
+                torch.testing.assert_close(a,b)
+            for a,b in zip(averages[0].parameters(),averages[1].parameters()):
+                torch.testing.assert_close(a,b)
+        assert calls==[8,4]
+    finally:
+        for handle in handles: handle.remove()
+
+
+def test_cached_training_encoding_rejects_stateful_normalization():
+    model=FollowNet(config(norm='batch'))
+    ema=copy.deepcopy(model);opt=torch.optim.SGD(model.parameters(),lr=.01)
+    with pytest.raises(ValueError,match='requires group norm'):
+        optimizer_update(model,ema,opt,[batch(model.cfg)],1,.01,device='cpu',cache_training_encoding=True)
+
+
+@pytest.mark.parametrize('cached_benchmark',[False,True])
+def test_preflight_must_match_encoding_cache_mode(tmp_path,cached_benchmark):
+    from vesuvius.neural_tracing.fiber_follow.train import main
+    benchmark=dict(architecture=ARCHITECTURE,passed=True,microbatch=2,flow_draws=64,crop=[176,96,96])
+    if cached_benchmark: benchmark['cache_training_encoding']=True
+    path=tmp_path/'benchmark.json';path.write_text(json.dumps(benchmark))
+    args=['--device','cpu','--fiber-zarrs','unused','--ct','unused','--fibers','unused',
+          '--name','unused','--fixed-bank','unused','--manifest','unused','--benchmark',str(path)]
+    if cached_benchmark: args.append('--no-cache-training-encoding')
+    with pytest.raises(ValueError,match='matching full-crop benchmark'):
+        main(args)
 
 
 def test_end_to_end_trace_collection_and_state_roundtrip(tmp_path,monkeypatch):
@@ -238,7 +304,7 @@ def test_end_to_end_trace_collection_and_state_roundtrip(tmp_path,monkeypatch):
         p=x.new_zeros(len(x),4,3);p[...,2]=torch.arange(1,5)
         return dict(points=p,confidence=x.new_full((len(x),4),.9))
     monkeypatch.setattr(m,'forward',forward)
-    tracer=ModelTracer(m,vol,crop,8,TraceParams(max_len=5),device='cpu')
+    tracer=ModelTracer(m,vol,crop,8,TraceParams(max_len=5,n_commit=4),device='cpu')
     collector=DecisionCollector(f,0,5.,1,sample)
     try:
         paths,reasons=tracer.trace(np.array([[8.,8.,5.]]),np.array([[0.,0.,1.]]),on_decision=lambda i,s:collector(s))
@@ -285,7 +351,7 @@ def test_recovery_limit_cannot_be_overridden(tmp_path,monkeypatch,explore,patien
         return dict(points=p,confidence=x.new_zeros(len(x),4))
     monkeypatch.setattr(m,'forward',forward)
     tracer=ModelTracer(m,vol,CropSpec(depth=20,width=12,behind=10),8,
-                       TraceParams(explore_calls=explore,stop_patience=patience,max_len=10),device='cpu')
+                       TraceParams(explore_calls=explore,stop_patience=patience,max_len=10,n_commit=4),device='cpu')
     try:
         paths,reasons=tracer.trace(np.array([[8.,8.,5.]]),np.array([[0.,0.,1.]]),on_decision=lambda i,s:seen.append(s))
     finally:tracer.close()
@@ -332,7 +398,7 @@ def test_initial_recovery_state_preserves_exact_frame_and_history(tmp_path,monke
     pos=np.array([[8.,8.,8.]]);frame=frame_from_heading([0,0,1],[0,1,0])
     h=np.tile([8.,8.,7.],(8,1));h[:,0]+=np.linspace(0,1,8)
     state=dict(hist=h,hmask=np.ones(8),frame=frame)
-    tracer=ModelTracer(m,vol,CropSpec(depth=20,width=12,behind=10),8,TraceParams(),device='cpu')
+    tracer=ModelTracer(m,vol,CropSpec(depth=20,width=12,behind=10),8,TraceParams(n_commit=4),device='cpu')
     try:tracer.trace(pos,np.array([[0,0,1.]]),initial_states=[state],on_decision=lambda i,s:seen.append(s))
     finally:tracer.close()
     np.testing.assert_array_equal(seen[0]['hist'],h)

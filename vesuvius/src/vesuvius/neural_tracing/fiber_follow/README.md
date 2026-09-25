@@ -24,7 +24,8 @@ training/inference. The independent beam model keeps its checkpoint names.
 - The public output is `points [B,16,3]`, `confidence_logits [B,16]`, and
   monotone `confidence [B,16]`. Inference is deterministic for fixed inputs and
   execution settings. No forecast is carried into the next decision.
-- Commit at most four points, respecting the six-voxel first connection limit,
+- Commit at most `n_commit` points per decision (default 8, at most the 16-point
+  horizon), respecting the six-voxel first connection limit,
   bounds, loops, stop patience, and bounded collection exploration. History
   coordinates and previous commits remain fixed.
 
@@ -32,7 +33,8 @@ Flow matching retains 64 stratified time/noise draws per state. Residual scales
 are fitted from 2,048 masked training states. Confidence labels describe the
 actually generated curve at tolerance 1.5; generated coordinates and labels are
 detached, while the final evaluation trains the shared features and denoiser.
-Confidence loss is half masked BCE over prefixes 1–4 and half over all 16.
+Confidence loss is half masked BCE over the commit window (prefixes 1 to
+`--n-commit`, default 8) and half over all 16.
 Its coefficient ramps from zero to one over 2,000 optimizer updates. Unknown
 annotation endings are censored; confirmed departures have confidence negatives
 and no localization loss. GT history is diagnostic data only.
@@ -75,14 +77,35 @@ complete tracing latency, including data preparation and final confidence.
 
 Training defaults: 50,000 optimizer updates; microbatch 2 with four accumulation
 steps; AdamW, peak LR 1e-3, weight decay 1e-4, 1,000-update warmup/cosine decay,
-gradient clipping at 1, EMA decay .999, CUDA BF16 and contiguous convolutions.
+gradient clipping at 1, EMA decay .999, CUDA BF16, contiguous convolutions and
+compiled CUDA training methods. Compilation preserves eager RNG draws and the
+existing backward precision; the first update can take about a minute.
+Use `--no-compile` for eager training. CPU training, EMA diagnostics and tracing
+remain eager. Preflight uses the selected compilation mode, and resumed runs
+compile after restoring weights/optimizer state. See
+[PERFORMANCE_COMPILE.md](PERFORMANCE_COMPILE.md) for the measured 32% reduction
+in update time and roughly halved allocated GPU memory compared with eager
+training using encoder reuse.
 The v11 convolution layout was selected by full-crop CUDA measurements; the beam
 model retains channels-last. See [PERFORMANCE.md](PERFORMANCE.md) for results,
 numerical checks, and commands to compare layouts on another GPU.
 A detached curve pass establishes masked-loss denominators across the effective
-batch; each microbatch then re-encodes for flow/confidence gradients. Censoring
+batch; each microbatch reuses its encoder graph for flow/confidence gradients. Censoring
 and departures therefore do not change the objective when switching microbatch
 size. Inference still encodes once per decision.
+Encoder reuse is enabled by default. Repeated full-crop trials measured about
+25% less update time in eager training, at roughly 24 GiB peak allocated GPU memory
+(about 12 GiB with compilation). Use
+`--no-cache-training-encoding` to re-encode instead when memory is tight.
+The launcher benchmarks the selected
+mode, and training requires a matching preflight result. See
+[PERFORMANCE_ENCODING.md](PERFORMANCE_ENCODING.md) for measurements, correctness
+checks and reproduction commands.
+CPU batch preparation skips history-distance calculations outside a conservative
+box where the float32 result already rounds to zero. Paired real batches were
+bit-identical and prepared 2.23× faster; see [PERFORMANCE_BATCH.md](PERFORMANCE_BATCH.md).
+Model-only benchmark throughput excludes loading; actual training throughput
+also depends on this CPU pipeline and worker transfers.
 Checkpoints save every 1,000 updates and at completion. `ckpt_*.pt` and
 `last.pt` also hold the optimizer and RNG state; an interrupted run continues
 in place with `--resume output/NAME/last.pt` and the same `--name` and options
@@ -99,7 +122,7 @@ GT, the final curve, and successive denoising updates.
 Terminal logs show readable loss, throughput, confidence and refinement tables;
 `log.jsonl` retains one complete JSON record per line for analysis. On logging
 updates (`--log-every`, default 50, and the final update), `refinement.by_drift`
-records first-four-point lateral Euclidean error at initialization and after
+records commit-window (first `--n-commit` points) lateral Euclidean error at initialization and after
 each midpoint update. It reuses the detached training rollout with no extra
 model evaluations, and measures the full effective batch before the optimizer
 update. These are sampled training states, not a fixed validation set.

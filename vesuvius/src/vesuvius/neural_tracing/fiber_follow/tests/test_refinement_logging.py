@@ -48,7 +48,7 @@ def test_refinement_masks_drift_boundaries_empty_bins_and_nonfinite_predictions(
     long_cfg = config(n_future=8, flow_sigma=((1., 1.),)*8)
     long_steps = torch.zeros(1, 3, 8, 3)
     long_steps[:, :, 4:] = 100
-    assert refinement_metrics(long_steps, batch(long_cfg, 1), long_cfg)['by_drift']['all']['error_mean'] == [0.]*3
+    assert refinement_metrics(long_steps, batch(long_cfg, 1), long_cfg, n_commit=4)['by_drift']['all']['error_mean'] == [0.]*3
 
 
 def test_logging_preserves_rng_rollout_cost_loss_and_optimizer_update(monkeypatch):
@@ -95,7 +95,7 @@ def test_terminal_blocks_preserve_json_and_format_events(tmp_path, capsys):
     row = dict(step=1250, loss=1.23456, lr=.001, samples_per_second=8.765,
                flow=1.1, confidence_loss=.269, confidence_coefficient=.5,
                fresh_fraction=.5, fixed_fraction=.25, recent_fraction=.25,
-               replay_samples_seen=5000, four_correct_count=3, four_known_count=4,
+               replay_samples_seen=5000, commit_correct_count=3, commit_known_count=4, commit_window=8,
                refinement=metrics)
     for threshold in (.5, .85):
         row.update({f'false_stop_count_{threshold}': 1, f'correct_first_count_{threshold}': 4,

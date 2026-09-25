@@ -25,7 +25,7 @@ from vesuvius.neural_tracing.fiber_follow.runloop import (
 )
 from vesuvius.neural_tracing.fiber_follow.trace import DEFAULT_CONFIDENCE
 from vesuvius.neural_tracing.fiber_follow.supervision import loss_fn, prefix_labels, refinement_metrics
-from vesuvius.neural_tracing.fiber_follow.policy import DEFAULT_MAX_RECOVERY_DISTANCE
+from vesuvius.neural_tracing.fiber_follow.policy import DEFAULT_MAX_RECOVERY_DISTANCE, DEFAULT_N_COMMIT
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.training_log import format_training_log
 
@@ -131,8 +131,32 @@ def resume_training(ck, model, ema, opt):
     return int(ck['step']), int(ck.get('replay_seen', 0))
 
 
-def optimizer_update(model, ema, opt, batches, update, lr, *, device, tolerance=1.5, decay=.999, compute_metrics=True):
-    """Accumulate microbatches, clip once, step once, then update EMA once."""
+def compile_training_model(model):
+    """Compile the entry points training actually calls, preserving checkpoint keys.
+
+    Call after copying the EMA and restoring any checkpoint. The EMA stays eager
+    for tracing/diagnostics. Noise draws keep the eager RNG implementation, and
+    backward runs outside autocast, matching optimizer_update.
+    """
+    import torch._functorch.config
+    torch._functorch.config.backward_pass_autocast = 'off'
+    for name in ('encode_conditioning', 'generate_training_curve', 'training_forward'):
+        setattr(model,name,torch.compile(getattr(model,name),options={'fallback_random':True}))
+    return model
+
+
+def optimizer_update(model, ema, opt, batches, update, lr, *, device, tolerance=1.5, decay=.999, compute_metrics=True,
+                     cache_training_encoding=True, n_commit=DEFAULT_N_COMMIT):
+    """Accumulate microbatches, clip once, step once, then update EMA once.
+
+    ``n_commit`` sets the confidence near-window and refinement metric width; it
+    should equal the rollout commit limit.
+
+    Encoding reuse retains each microbatch's encoder graph until its
+    backward pass. It saves a forward pass at a substantial memory cost.
+    """
+    if cache_training_encoding and model.cfg.norm != 'group':
+        raise ValueError('Encoding reuse requires group norm; batch norm updates state on each forward')
     for group in opt.param_groups:
         group['lr']=lr
     opt.zero_grad(set_to_none=True)
@@ -143,40 +167,48 @@ def optimizer_update(model, ema, opt, batches, update, lr, *, device, tolerance=
     total=sum(len(b['hist']) for b in batches)
     last=None
     # Label all detached generated curves first, so censoring and departures do
-    # not change objective scaling with microbatch size. Only coordinates are
-    # retained; the gradient pass re-encodes each microbatch and reuses its static
-    # features for flow matching and the final confidence evaluation.
+    # not change objective scaling with microbatch size. Caching retains encoder
+    # graphs; disabling it retains only coordinates and re-encodes. Refinement
+    # and labels stay detached, and the effective-batch denominators are unchanged.
     normalizers = dict(flow=0.,near=0.,full=0.)
     curves=[]
+    encodings=[]
     refinement_steps=[]
     with torch.no_grad():
         for cpu in batches:
             x,hist,hmask = (cpu[k].to(device) for k in ('x','hist','hmask'))
             with torch.autocast('cuda',dtype=torch.bfloat16,enabled=str(device).startswith('cuda')):
+                encoding_args={}
+                if cache_training_encoding:
+                    with torch.enable_grad():
+                        encoding_args['encoding']=model.encode_conditioning(x.float(),hist,hmask)
+                encodings.append(encoding_args)
                 if compute_metrics:
-                    points,steps=model.generate_training_curve(x.float(),hist,hmask,return_steps=True)
+                    points,steps=model.generate_training_curve(x.float(),hist,hmask,return_steps=True,**encoding_args)
                     refinement_steps.append(steps.float().cpu())
                     del steps
                 else:
-                    points=model.generate_training_curve(x.float(),hist,hmask)
+                    points=model.generate_training_curve(x.float(),hist,hmask,**encoding_args)
                 points=points.float().cpu()
             curves.append(points)
             _,mask,_=prefix_labels(points,cpu,tolerance,model.cfg.max_recovery_distance)
-            normalizers['near'] += mask[:,:4].sum().item()
+            normalizers['near'] += mask[:,:n_commit].sum().item()
             normalizers['full'] += mask.sum().item()
             normalizers['flow'] += flow_targets(cpu,model.cfg)[1].sum().item()
-        del x,hist,hmask
+        del x,hist,hmask,encoding_args
     if compute_metrics:
         targets={key:torch.cat([b[key] for b in batches]) for key in
                  ('plane_ab','plane_mask','offtrack','gt_history','gt_history_mask')}
-        metrics['refinement']=refinement_metrics(torch.cat(refinement_steps),targets,model.cfg)
+        metrics['refinement']=refinement_metrics(torch.cat(refinement_steps),targets,model.cfg,n_commit)
         del refinement_steps,targets
     for cpu,points in zip(batches,curves):
+        encoding_args=encodings.pop(0)
         batch={k:v.to(device) for k,v in cpu.items()}
         weight=len(batch['hist'])/total
         with torch.autocast('cuda',dtype=torch.bfloat16,enabled=str(device).startswith('cuda')):
-            out=model.training_forward(batch['x'].float(),batch['hist'],batch['hmask'],batch,points.to(device))
-            loss,stats=loss_fn(out,batch,model.cfg,tolerance,update=update,compute_metrics=compute_metrics,normalizers=normalizers)
+            out=model.training_forward(batch['x'].float(),batch['hist'],batch['hmask'],batch,points.to(device),**encoding_args)
+            loss,stats=loss_fn(out,batch,model.cfg,tolerance,update=update,compute_metrics=compute_metrics,normalizers=normalizers,
+                               n_commit=n_commit)
         if not torch.isfinite(loss):
             raise FloatingPointError(f'Non-finite loss at update {update}')
         loss.backward()
@@ -190,7 +222,7 @@ def optimizer_update(model, ema, opt, batches, update, lr, *, device, tolerance=
                 for band in range(5):
                     strata[source-1,band]+=int(((cpu['source']==source)&(cpu['stratum']==band)).sum())
         last={k:v.detach() for k,v in batch.items()}
-        del out,loss,batch
+        del out,loss,batch,encoding_args
     torch.nn.utils.clip_grad_norm_(model.parameters(),1.,error_if_nonfinite=True)
     opt.step()
     update_ema(ema,model,update,decay)
@@ -212,6 +244,10 @@ def build_parser():
     ap.add_argument('--steps',type=int,default=50000)
     ap.add_argument('--batch',type=int,default=8,help='Effective batch per optimizer update')
     ap.add_argument('--microbatch',type=int,choices=(1,2),default=2)
+    ap.add_argument('--cache-training-encoding',action=argparse.BooleanOptionalAction,default=True,
+                    help='Reuse encoder graphs across training passes (default: enabled; higher GPU memory use)')
+    ap.add_argument('--compile',dest='compile_model',action=argparse.BooleanOptionalAction,default=True,
+                    help='Compile CUDA training methods (default: enabled; first update includes compilation)')
     ap.add_argument('--lr',type=float,default=1e-3)
     ap.add_argument('--workers',type=int,default=4)
     ap.add_argument('--worker-cache-gb',type=float,default=1.)
@@ -226,6 +262,8 @@ def build_parser():
     ap.add_argument('--flow-draws',type=int,default=64)
     ap.add_argument('--flow-calibration-states',type=int,default=2048)
     ap.add_argument('--tolerance',type=float,default=1.5)
+    ap.add_argument('--n-commit',type=int,default=DEFAULT_N_COMMIT,
+                    help='Rollout commit limit; also the confidence near-window and refinement metric width')
     ap.add_argument('--fixed-bank',required=True)
     ap.add_argument('--onpolicy',nargs='*',default=[])
     ap.add_argument('--dagger-every',type=int,default=1000)
@@ -259,9 +297,12 @@ def main(argv=None):
     crop=CropSpec(depth=176,width=96,behind=128,history_render='segments',history_sigma=.35)
     sample_cfg=SampleConfig(crop=crop,history_jitter=0.,history_wobble=1.,angle_sigmas_deg=(2.,5.,10.))
     model_cfg=FollowNetConfig(flow_draws=args.flow_draws)
+    compile_model=args.compile_model and torch.device(args.device).type=='cuda'
     benchmark=json.loads(Path(args.benchmark).read_text())
     if (benchmark.get('architecture')!=ARCHITECTURE or not benchmark.get('passed')
         or benchmark.get('microbatch')!=args.microbatch or benchmark.get('flow_draws')!=args.flow_draws
+        or benchmark.get('cache_training_encoding',False)!=args.cache_training_encoding
+        or benchmark.get('compile_model',False)!=compile_model
         or benchmark.get('crop')!=[176,96,96]):
         raise ValueError('A successful matching full-crop benchmark is required before training')
     fibers=load_fibers(args.fibers,grid_scale=spec.grid_scale)
@@ -288,7 +329,7 @@ def main(argv=None):
     collector=OnlineCollector(out/'dagger',args.fibers,args.val_z,args.dagger_device or args.device,
                               every=args.dagger_every,max_seeds=args.dagger_seeds,batch=args.dagger_batch,
                               explore_calls=args.dagger_explore_calls,seed=args.seed,replay_keep=args.replay_keep,
-                              initial=[c._dir for c in caches],trace_len=args.dagger_trace_len,confidence=.7)
+                              initial=[c._dir for c in caches],trace_len=args.dagger_trace_len,confidence=.7,n_commit=args.n_commit)
     # A resumed run reseeds its loader workers so it does not replay the run's first states.
     ds=FollowDataset(train_f,spec,sample_cfg,band,chunk=args.microbatch,seed=args.seed+(resume['step'] if resume else 0),
                      cache_bytes=int(args.worker_cache_gb*(1<<30)),fixed=[fixed],onpolicy=caches,replay_index=str(collector.index))
@@ -309,22 +350,27 @@ def main(argv=None):
         done,replay_seen=resume_training(resume,model,ema,opt); first=done+1
         del resume
     else: (out/'config.json').write_text(json.dumps(dict(vars(args),architecture=ARCHITECTURE,model_cfg=model_cfg.to_dict(),
+         compile_model=compile_model,
          sample_cfg=dataclasses.asdict(sample_cfg),vol_spec=spec.to_dict(),flow_calibration=calibration,
          accumulation_steps=args.batch//args.microbatch,data_policy=DATA_POLICY,fiber_manifest=fiber_manifest(fibers),
          train=[f.name for f in train_f],val=[f.name for f in val_f],seed_manifest=manifest,
          cuda_channels_last_3d=(args.device.startswith('cuda') and
                                model.encoders[0][0].weight.is_contiguous(memory_format=torch.channels_last_3d)),
          cudnn_benchmark_training=args.device.startswith('cuda')),indent=2))
+    if compile_model:
+        print('Compiling CUDA training methods; the first update may take about a minute.',flush=True)
+        compile_training_model(model)
     tracer=None
     seeds=manifest['monitor']
     if args.diag_every and seeds:
         from vesuvius.neural_tracing.fiber_follow.diag import plot_batch, plot_denoising, plot_curves, rollout_diag
         from vesuvius.neural_tracing.fiber_follow.trace import ModelTracer,TraceParams
         from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume
-        tracer=ModelTracer(ema,FiberVolume(spec,cache_bytes=2<<30),crop,128,TraceParams(),device=args.device)
+        tracer=ModelTracer(ema,FiberVolume(spec,cache_bytes=2<<30),crop,128,TraceParams(n_commit=args.n_commit),device=args.device)
         (out/'images').mkdir(exist_ok=True)
     log=RunLog(out/'log.jsonl',formatter=format_training_log); start=time.monotonic()
-    if first>1: log.record(dict(step=first,resumed_from=args.resume,replay_caches=len(caches)))
+    if first>1: log.record(dict(step=first,resumed_from=args.resume,replay_caches=len(caches),
+                              compile_model=compile_model,cache_training_encoding=args.cache_training_encoding))
     try:
         for step in range(first,args.steps+1):
             event=collector.poll()
@@ -334,13 +380,14 @@ def main(argv=None):
             model.train(); torch.backends.cudnn.benchmark=args.device.startswith('cuda')
             lr=lr_at(step,args.lr,args.warmup,args.steps)
             loss,metrics,batch=optimizer_update(model,ema,opt,batches,step,lr,device=args.device,
-                                                tolerance=args.tolerance,decay=args.ema_decay,compute_metrics=log_step)
+                                                tolerance=args.tolerance,decay=args.ema_decay,compute_metrics=log_step,
+                                                cache_training_encoding=args.cache_training_encoding,n_commit=args.n_commit)
             replay_seen+=metrics.pop('replay_samples')
             if log_step:
                 log.record(dict(step=step,loss=loss,lr=lr,replay_samples_seen=replay_seen,
                                 samples_per_second=(step-first+1)*args.batch/(time.monotonic()-start),**metrics))
             def save(path,resumable=False):
-                extra=dict(step=step,tolerance=args.tolerance,seed=args.seed,ema_decay=args.ema_decay,ema_updates=step,
+                extra=dict(step=step,tolerance=args.tolerance,n_commit=args.n_commit,seed=args.seed,ema_decay=args.ema_decay,ema_updates=step,
                            flow_calibration=calibration,seed_manifest_sha256=manifest['sha256'],replay_seen=replay_seen)
                 if resumable:  # collector snapshots stay light; training checkpoints can continue the run
                     extra.update(optimizer=opt.state_dict(),rng=training_rng_state())

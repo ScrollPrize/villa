@@ -23,7 +23,7 @@ def format_training_log(row):
         n,d = int(row[numerator]),int(row[denominator])
         return f'{n}/{d} ({n/d:.1%})' if d else 'n/a (0 known)'
 
-    lines.append('  four-point correctness: '+rate('four_correct_count','four_known_count'))
+    lines.append(f"  {int(row.get('commit_window',0)) or 'commit'}-point correctness: "+rate('commit_correct_count','commit_known_count'))
     for threshold in (.5,.85):
         lines.append(f'  gate @ {threshold:.2f}: false stops '
                      +rate(f'false_stop_count_{threshold}',f'correct_first_count_{threshold}')
