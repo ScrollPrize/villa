@@ -76,6 +76,8 @@ private slots:
     void untaggedPublishedNamesAreRecognised();
     void severalSurfacesAndForeignSurfacesAreLabelled();
     void channelsTakeTheirDatasetsScan();
+    void sharedChannelFollowsTheSelectedDataset();
+    void untaggedTwinsKeepTheirOpenedLevel();
 };
 
 void TestLineAnnotationDatasetSets::classifiesByTags()
@@ -93,7 +95,8 @@ void TestLineAnnotationDatasetSets::classifiesByTags()
     QCOMPARE(volumes[4].channel, std::string("cos"));
     QCOMPARE(volumes[7].kind, ProjectVolumeKind::Fiber);
     QCOMPARE(volumes[7].channel, std::string("presence"));
-    QCOMPARE(volumes[7].manifestLocation, std::string("/cache/las-sd1-40cc618f.lasagna.json"));
+    QCOMPARE(volumes[7].manifestLocations.size(), std::size_t{1});
+    QCOMPARE(volumes[7].manifestLocations.front(), std::string("/cache/las-sd1-40cc618f.lasagna.json"));
 }
 
 void TestLineAnnotationDatasetSets::groupsScansWithTheirLevelsFinestFirst()
@@ -135,12 +138,67 @@ void TestLineAnnotationDatasetSets::resolvesDatasetScanByTagOrByFrame()
              std::string("20260319101107"));
     QCOMPARE(datasetScanKey({"c.json", {}, std::array<std::size_t, 3>{16000, 5500, 5500}}, scans),
              std::string("20250521151225"));
-    // Unknown frame, or no frame: applies to any scan.
-    QVERIFY(datasetScanKey({"d.json", {}, std::array<std::size_t, 3>{1000, 1000, 1000}}, scans).empty());
-    QVERIFY(datasetScanKey({"e.json", {}, std::nullopt}, scans).empty());
-    QVERIFY(datasetAppliesToScan("", "20260319101107"));
-    QVERIFY(datasetAppliesToScan("20260319101107", "20260319101107"));
-    QVERIFY(!datasetAppliesToScan("20250521151225", "20260319101107"));
+    // A frame matching no scan is positive evidence: the dataset belongs to
+    // none of them. An unreadable manifest is unknown and applies to any.
+    const DatasetInfo foreign{"d.json", {}, std::array<std::size_t, 3>{1000, 1000, 1000}};
+    const DatasetInfo unreadable{"e.json", {}, std::nullopt};
+    QVERIFY(datasetScanKey(foreign, scans).empty());
+    QVERIFY(datasetScanKey(unreadable, scans).empty());
+    QVERIFY(datasetScanMatch(foreign, scans).kind == DatasetScanMatch::Kind::Incompatible);
+    QVERIFY(datasetScanMatch(unreadable, scans).kind == DatasetScanMatch::Kind::Unknown);
+    QVERIFY(!datasetAppliesToScan(datasetScanMatch(foreign, scans), "20260319101107"));
+    QVERIFY(datasetAppliesToScan(datasetScanMatch(unreadable, scans), "20260319101107"));
+    const DatasetInfo tagged{"a.json", {"vc-open-data-volume-id:20260319101107"}, std::nullopt};
+    QVERIFY(datasetAppliesToScan(datasetScanMatch(tagged, scans), "20260319101107"));
+    QVERIFY(!datasetAppliesToScan(datasetScanMatch(tagged, scans), "20250521151225"));
+    // Two scans of one frame: the dataset applies to either, and to no third.
+    auto twins = scans;
+    twins.push_back(twins.front());
+    twins.back().scanKey = "twin";
+    const DatasetInfo shared{"f.json", {}, std::array<std::size_t, 3>{59944, 20812, 20812}};
+    const auto ambiguous = datasetScanMatch(shared, twins);
+    QVERIFY(ambiguous.kind == DatasetScanMatch::Kind::Ambiguous);
+    QCOMPARE(ambiguous.scanKeys.size(), std::size_t{2});
+    QVERIFY(datasetScanKey(shared, twins).empty());
+    QVERIFY(datasetAppliesToScan(ambiguous, "20260319101107"));
+    QVERIFY(datasetAppliesToScan(ambiguous, "twin"));
+    QVERIFY(!datasetAppliesToScan(ambiguous, "20250521151225"));
+    // A foreign dataset never wins automatic selection.
+    QVERIFY(!newestDatasetForScan({foreign}, scans, "20260319101107").has_value());
+    // A remote manifest still being fetched: usable if already selected
+    // (revalidated once the frame arrives), never chosen automatically.
+    DatasetInfo pending{"https://example/p.lasagna.json", {}, std::nullopt};
+    pending.framePending = true;
+    QVERIFY(datasetScanMatch(pending, scans).kind == DatasetScanMatch::Kind::Pending);
+    QVERIFY(datasetAppliesToScan(datasetScanMatch(pending, scans), "20260319101107"));
+    QVERIFY(!newestDatasetForScan({pending}, scans, "20260319101107").has_value());
+    QCOMPARE(*newestDatasetForScan({pending, unreadable}, scans, "20260319101107"), std::string("e.json"));
+    // Only a coarser twin attached (PHercParis4 at L2): its level-0 count is
+    // an interval, (a-1)*4 < b <= a*4, and the manifest's 32694 lies in it
+    // although 8174 x 4 = 32696 does not equal it within one voxel.
+    std::vector<ProjectVolumeInfo> coarseOnly{
+        {"paris4-l2", "20231027191325-3.24um-Paris4-L2",
+         {"vc-open-data-volume-id:20231027191325", "vc-open-data-source-coordinate-level:2",
+          "vc-open-data-voxel-size-um:12.96"}, {18946, 8174, 8174}, 12.96},
+    };
+    const auto coarseScans = rawScanOptions(classifyProjectVolumes(coarseOnly, {}));
+    QCOMPARE(coarseScans.size(), std::size_t{1});
+    QCOMPARE(coarseScans[0].finestLevel, 2);
+    const DatasetInfo paris4{"p4.json", {}, std::array<std::size_t, 3>{75784, 32694, 32694}};
+    QVERIFY(datasetScanMatch(paris4, coarseScans).kind == DatasetScanMatch::Kind::Matched);
+    QVERIFY(scanFrameMatchesBaseExtent(coarseScans[0], {75784, 32692, 32692}));
+    QVERIFY(scanFrameMatchesBaseExtent(coarseScans[0], {75784, 32697, 32697}));
+    QVERIFY(!scanFrameMatchesBaseExtent(coarseScans[0], {75784, 32691, 32691}));
+    QVERIFY(!scanFrameMatchesBaseExtent(coarseScans[0], {75784, 32698, 32698}));
+    QVERIFY(datasetScanMatch(foreign, coarseScans).kind == DatasetScanMatch::Kind::Incompatible);
+    // With the level-0 twin attached the count is pinned to one voxel.
+    coarseOnly.push_back({"paris4-l0", "20231027191325-3.24um-Paris4",
+                          {"vc-open-data-volume-id:20231027191325",
+                           "vc-open-data-source-coordinate-level:0"}, {75784, 32693, 32693}, 3.24});
+    const auto fullScans = rawScanOptions(classifyProjectVolumes(coarseOnly, {}));
+    QCOMPARE(fullScans[0].finestLevel, 0);
+    QVERIFY(scanFrameMatchesBaseExtent(fullScans[0], {75784, 32694, 32694}));
+    QVERIFY(!scanFrameMatchesBaseExtent(fullScans[0], {75784, 32695, 32695}));
 }
 
 void TestLineAnnotationDatasetSets::picksTheNewestApplicableDataset()
@@ -355,6 +413,110 @@ void TestLineAnnotationDatasetSets::channelsTakeTheirDatasetsScan()
             QCOMPARE(v.scanKey, std::string("20260319101107"));
         }
     }
+}
+
+void TestLineAnnotationDatasetSets::sharedChannelFollowsTheSelectedDataset()
+{
+    // Attachment merges the tags of a zarr two manifests share: the volume
+    // carries both manifest tags and belongs to both datasets.
+    const std::string lasagna = "/cache/a.lasagna.json";
+    const std::string fibers = "/cache/b.lasagna.json";
+    const std::vector<ProjectVolumeInfo> infos{
+        {"scan", "20260319101107-2.399um-0.2m-78keV-masked",
+         {"vc-open-data-volume-id:20260319101107", "vc-open-data-source-coordinate-level:0",
+          "vc-open-data-voxel-size-um:2.399000"}, {59944, 20812, 20812}, 2.399},
+        {"shared-nx", "nx.ome",
+         {"vc-lasagna-manifest:" + lasagna, "vc-lasagna-group:nx", "vc-lasagna-manifest:" + fibers},
+         {59944, 20816, 20816}, 0.0},
+        {"presence", "presence.ome",
+         {"vc-lasagna-manifest:" + fibers, "vc-lasagna-group:presence"}, {59944, 20816, 20816}, 0.0},
+    };
+    auto volumes = classifyProjectVolumes(infos, {fibers});
+    QCOMPARE(volumes[1].manifestLocations.size(), std::size_t{2});
+    QVERIFY(volumeBelongsToDataset(volumes[1], lasagna));
+    QVERIFY(volumeBelongsToDataset(volumes[1], fibers));
+    QVERIFY(!volumeBelongsToDataset(volumes[1], ""));
+    // Mixed memberships classify as Lasagna; all-fiber memberships as Fiber.
+    QCOMPARE(volumes[1].kind, ProjectVolumeKind::Lasagna);
+    QCOMPARE(volumes[2].kind, ProjectVolumeKind::Fiber);
+    // The channel takes its scan from the first membership that resolves.
+    const auto scans = rawScanOptions(volumes);
+    const std::vector<DatasetInfo> datasets{
+        {lasagna, {}, std::nullopt},
+        {fibers, {}, std::array<std::size_t, 3>{59944, 20812, 20812}},
+    };
+    assignDatasetScansToChannels(volumes, datasets, scans);
+    QCOMPARE(volumes[1].scanKey, std::string("20260319101107"));
+    QCOMPARE(volumes[2].scanKey, std::string("20260319101107"));
+    // Selected as the fiber dataset only: the shared channel is listed in
+    // the fiber role, not lost.
+    const auto fiberOnly = volumeSelectorOptions(volumes, scans, "20260319101107", "", fibers, "", "scan");
+    const std::vector<std::string> fiberExpected{"raw scan, 2.399 \xC2\xB5m", "fiber, nx", "fiber, presence"};
+    QVERIFY(labels(fiberOnly) == fiberExpected);
+    // Both selected: it is listed once, under the Lasagna dataset.
+    const auto both = volumeSelectorOptions(volumes, scans, "20260319101107", lasagna, fibers, "", "scan");
+    const std::vector<std::string> bothExpected{"raw scan, 2.399 \xC2\xB5m", "lasagna, nx", "fiber, presence"};
+    QVERIFY(labels(both) == bothExpected);
+    // The frames the shared channel may be validated against: every readable
+    // membership placed under the scan, in Lasagna-then-fiber order, so a
+    // manifest recording 20811 and one recording 20812 are both offered and
+    // neither vetoes the other. A membership of another scan is not offered.
+    const std::vector<DatasetInfo> twoFrames{
+        {lasagna, {}, std::array<std::size_t, 3>{59944, 20811, 20811}},
+    };
+    const std::vector<DatasetInfo> fiberFrames{
+        {fibers, {}, std::array<std::size_t, 3>{59944, 20812, 20812}},
+        {"/cache/other-scan.lasagna.json", {}, std::array<std::size_t, 3>{16000, 5500, 5500}},
+    };
+    auto shared = volumes[1];
+    shared.manifestLocations.push_back("/cache/other-scan.lasagna.json");
+    const auto candidates = channelManifestFrameCandidates(shared, twoFrames, fiberFrames, scans, "20260319101107");
+    QCOMPARE(candidates.size(), std::size_t{2});
+    QCOMPARE(candidates[0][1], std::size_t{20811});
+    QCOMPARE(candidates[1][1], std::size_t{20812});
+    // Unreadable manifests offer nothing.
+    QVERIFY(channelManifestFrameCandidates(shared, datasets, {}, scans, "20260319101107").size() == 1);
+    // A dataset placed by its scan tag offers its manifest frame too (the
+    // controller reads the frame for tagged datasets as well), and a tagged
+    // dataset of another scan does not, whatever its frame says.
+    const std::vector<DatasetInfo> tagged{
+        {lasagna, {"vc-open-data-volume-id:20260319101107"}, std::array<std::size_t, 3>{59944, 20812, 20812}},
+        {fibers, {"vc-open-data-volume-id:20250521151225"}, std::array<std::size_t, 3>{59944, 20812, 20812}},
+    };
+    const auto taggedCandidates = channelManifestFrameCandidates(volumes[1], tagged, {}, scans, "20260319101107");
+    QCOMPARE(taggedCandidates.size(), std::size_t{1});
+    QCOMPARE(taggedCandidates[0][1], std::size_t{20812});
+}
+
+void TestLineAnnotationDatasetSets::untaggedTwinsKeepTheirOpenedLevel()
+{
+    // A published scan URL attached by hand twice, once with #vc-base-scale=1
+    // and no open-data tags: the Volume knows its level, the tags do not.
+    std::vector<ProjectVolumeInfo> infos{
+        {"full", "20260319101107-2.399um-0.2m-78keV-masked", {}, {59944, 20812, 20812}, 2.399},
+        {"half", "20260319101107-2.399um-0.2m-78keV-masked", {}, {29972, 10406, 10406}, 4.798},
+    };
+    infos[1].openedLevel = 1;
+    const auto volumes = classifyProjectVolumes(infos, {});
+    QCOMPARE(volumes[0].level, 0);
+    QCOMPARE(volumes[1].level, 1);
+    const auto scans = rawScanOptions(volumes);
+    QCOMPARE(scans.size(), std::size_t{1});
+    QCOMPARE(scans[0].levels.size(), std::size_t{2});
+    QCOMPARE(scanVolumeIdAtExactLevel(scans[0], 1), std::string("half"));
+    QVERIFY(scanVolumeIdAtExactLevel(scans[0], 2).empty());
+    QCOMPARE(scanVolumeIdAtLevel(scans[0], 2), std::string("full"));
+    QCOMPARE(*rawScanLevelOfVolume(volumes, "half"), 1);
+    // The open-data level tag wins over the opened level when both exist.
+    infos[1].tags = {"vc-open-data-volume-id:20260319101107", "vc-open-data-source-coordinate-level:1"};
+    infos[1].openedLevel = 0;
+    QCOMPARE(classifyProjectVolumes(infos, {})[1].level, 1);
+    // The current volume is its scan's representative whatever level the
+    // selector was asked for, so it is always listed, and only once.
+    const auto atHalf = volumeSelectorOptions(volumes, scans, "20260319101107", "", "", "", "half", 0);
+    QCOMPARE(atHalf.size(), std::size_t{1});
+    QCOMPARE(atHalf[0].id, std::string("half"));
+    QCOMPARE(atHalf[0].label, std::string("raw scan, 2.399 \xC2\xB5m"));
 }
 
 QTEST_APPLESS_MAIN(TestLineAnnotationDatasetSets)

@@ -1433,7 +1433,13 @@ SpiralWorkspace::resolveLineAnnotationInputs(QString* errorMessage) const
     const QString serviceRoot = _sessionPaths.value(QStringLiteral("dataset_root")).toString();
     const QStringList manifests = fallbackFiberManifests();
     if (manifests.size() == 1) fallbackFiber = manifests.front();
+    // Spiral's preview resolves the project's recorded selections; the
+    // optimization must follow the same policy (the line annotation
+    // workspace's raw-scan scoping does not apply here).
+    const auto recordedPkg = _state ? _state->vpkg() : nullptr;
     auto result = _lineAnnotationController->resolveFiberOptimizationInputs(
+        recordedPkg ? recordedPkg->selectedLasagnaDataset() : std::string{},
+        recordedPkg ? recordedPkg->selectedFiberInferenceDataset() : std::string{},
         fallbackNormal.toStdString(), fallbackFiber.toStdString(), errorMessage);
     if (result && result->normalManifestLocation == fallbackNormal.toStdString())
         result->normalManifestLocation = QStringLiteral("spiral-session:%1#normals")

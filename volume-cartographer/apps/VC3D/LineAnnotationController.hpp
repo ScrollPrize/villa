@@ -54,6 +54,11 @@ class SurfacePanelController;
 class ViewerManager;
 class VolumePkg;
 class QWidget;
+
+namespace vc3d::opendata
+{
+struct CoordinateIdentity;
+}
 namespace vc::lasagna { class LasagnaDataset; class LasagnaNormalSampler; struct LasagnaDatasetManifest; }
 namespace vc::fiber_tracer { class FiberPredictionField; }
 
@@ -392,16 +397,23 @@ public:
     [[nodiscard]] vc3d::annotation::AnnotationFrame annotationFrame() const;
     // The volume whose grid frames fiber geometry and the umbilicus: the
     // active volume when it is a raw scan (at whatever pyramid level), else
-    // the selected raw scan at level 0, which is the frame every Lasagna,
-    // fiber and surface channel is opened in (their pyramids' level 0 is the
-    // manifest base grid, padded to whole chunks). A channel shown in the
-    // panes must not redefine the frame: its padded extent fits no manifest
-    // and carries no voxel size. Null with its id empty when nothing applies.
+    // the selected raw scan at the level a Lasagna or fiber channel is opened
+    // at, once that channel's dataset is placed under the selected scan: a
+    // channel pyramid's level 0 is the manifest base grid padded to whole
+    // chunks, same origin and voxel unit as the scan's, only the extent
+    // differs, and it carries no voxel size, so it must not define the frame
+    // itself. A surface prediction is its own frame (it is published at a
+    // scan level and tagged with it). Anything not established stays on the
+    // active volume. Null with its id empty when nothing is active.
     struct FrameVolume {
         std::shared_ptr<Volume> volume;
         std::string id;
     };
     [[nodiscard]] FrameVolume frameVolume() const;
+    // The open-data coordinate identity of the frame volume, stamped into
+    // exports and saved fibers.
+    [[nodiscard]] std::optional<vc3d::opendata::CoordinateIdentity>
+    frameCoordinateIdentity() const;
     // Cheap token over everything resolveScrollUmbilicus() depends on: the
     // project's field plus a stat() of each path the resolver's own scan reports,
     // and no JSON parse. Size and mtime, so it is a metadata token rather than a
@@ -501,8 +513,14 @@ public:
     bool redirectFiberSource(const std::filesystem::path& source,
                              const std::filesystem::path& workingCopy,
                              QString* errorMessage = nullptr);
+    // The caller names the project selections to try first (before the
+    // fallbacks): the Spiral workspace passes the project's recorded
+    // selections, the line annotation workspace would pass its effective
+    // ones (scoped to its selected raw scan).
     [[nodiscard]] std::optional<ResolvedFiberOptimizationInputs>
         resolveFiberOptimizationInputs(
+            const std::string& selectedNormalLocation,
+            const std::string& selectedFiberLocation,
             const std::string& fallbackNormalLocation,
             const std::string& fallbackFiberLocation,
             QString* errorMessage = nullptr) const;
@@ -928,7 +946,10 @@ private:
     // The project's volumes and datasets classified into raw-scan sets (see
     // LineAnnotationDatasetSets.hpp), computed from the package on demand.
     // selectedScanKey is the recorded scan, or the derived default when none
-    // is recorded (or the recorded one is gone).
+    // is recorded (or the recorded one is gone). The one resolver of the
+    // effective scan: menus, the selector and frameVolume() all read it.
+    // Manifest frames are cached per location, so this is cheap enough for
+    // the map's staleness checks; nothing is written to the project here.
     struct DatasetSets {
         std::vector<vc3d::line_annotation::ClassifiedVolume> volumes;
         std::vector<vc3d::line_annotation::RawScanOption> scans;
@@ -938,11 +959,46 @@ private:
         // The recorded surface prediction when it belongs to the selected
         // scan, else that scan's default (newest), else empty.
         std::string selectedSurfaceVolumeId;
+        // The recorded Lasagna / fiber dataset when it applies to the
+        // selected scan (a frame still being fetched counts as applying),
+        // else empty: what every consumer of "the selected dataset" uses.
+        // A recorded dataset that resolves to another scan is thereby
+        // rejected in memory, without writing the project.
+        std::string selectedLasagnaLocation;
+        std::string selectedFiberLocation;
     };
     [[nodiscard]] DatasetSets datasetSets() const;
-    // Writes the derived default scan (and surface) into the project when
-    // none is recorded.
-    void recordDefaultRawScan();
+    [[nodiscard]] std::string effectiveLasagnaDataset() const;
+    [[nodiscard]] std::string effectiveFiberDataset() const;
+    // Drops the sessions' cached dataset handles (samplers, fields) after
+    // the effective Lasagna / fiber dataset changed, marking optimized
+    // lines stale.
+    void invalidateSessionLasagnaDatasets();
+    void invalidateSessionFiberDatasets();
+    void discardRunningSolveForDatasetChange(LineAnnotationSession& session);
+    // A dataset manifest's base frame from the per-location cache. A local
+    // manifest not cached yet is read here (a file read); a remote one is
+    // never read on the GUI thread: it is unknown until
+    // prefetchRemoteManifestFrames() has fetched it on a worker.
+    [[nodiscard]] std::optional<std::array<std::size_t, 3>> manifestBaseFrame(
+        const std::string& location) const;
+    // Fetches, off the GUI thread, every remote manifest frame the workspace
+    // wants and does not have: the untagged datasets (grouped by frame) and
+    // the active channel's memberships (its stand-in scan is gated by the
+    // frame). On completion the menus are redrawn and, when the active
+    // volume is a channel of that dataset, the frame-dependent views are
+    // rebuilt; a completion from a superseded epoch re-requests instead.
+    void prefetchRemoteManifestFrames();
+    // The project's only fiber dataset when it applies to the selected scan:
+    // the one case where no menu pick is needed.
+    [[nodiscard]] std::optional<std::string> soleApplicableFiberDataset(
+        const DatasetSets& sets) const;
+    // Applies a project selection setter; the selection holds for the session
+    // even when the project file cannot be written (read-only folder). The
+    // failure is queued and reported once after the current transition
+    // completes (never a nested event loop inside a menu handler).
+    bool recordProjectSelection(const QString& what, const std::function<void()>& apply);
+    void flushPersistenceWarnings();
     // Surface dataset submenu: records the surface prediction to list.
     void handleSurfaceSelectionChanged(const std::string& volumeId);
     // Raw scan submenu: records the scan, auto-selects the newest Lasagna and
@@ -1443,6 +1499,22 @@ private:
     // Lasagna or fiber volume, which has no level of its own).
     int _lastRawScanLevel = 0;
     bool _presenceOverlayRefreshQueued = false;
+    // Manifest base frames by dataset location, for datasetSets(); dropped on
+    // package change and content refresh.
+    mutable std::unordered_map<std::string, std::optional<std::array<std::size_t, 3>>>
+        _manifestBaseShapeCache;
+    // Selections that applied in memory but could not be written; reported
+    // together from the event loop.
+    // Remote manifest reads in flight (by location) and the epoch they were
+    // started in; a result from an earlier epoch (another package, or a
+    // content refresh that dropped the cache) is discarded.
+    std::set<std::string> _manifestFramePrefetching;
+    std::uint64_t _manifestPrefetchEpoch = 0;
+    std::vector<QString> _pendingPersistenceWarnings;
+    QString _pendingPersistenceReason;
+    std::filesystem::path _pendingPersistenceProjectPath;
+    bool _persistenceWarningQueued = false;
+    bool _tearingDown = false;
     // Why the package's umbilicus could not be used, for the strip notice.
     // Empty when one was applied, and when none exists to complain about.
     // Orienting off the volume centre instead is exactly the silent degradation

@@ -20,6 +20,7 @@ private slots:
     void levelSelectionSkipsMissingFineLevels();
     void storedLevelFitFindsTheRebaseForEachScrollLevel();
     void frameConsistencyAcceptsConventionsAndRejectsLeaves();
+    void channelPyramidMatchesTheScanUnderBothConventions();
 };
 
 using vc3d::line_annotation::TaggedVolumeId;
@@ -264,6 +265,51 @@ void TestLineAnnotationPresenceOverlay::frameConsistencyAcceptsConventionsAndRej
     // against the active grid is what decides those.)
     QVERIFY(!storedLevelsConsistentWithFrame({40000, 20700, 20700}, sparse));
     QVERIFY(!storedLevelsConsistentWithFrame(frame, Levels{}));
+}
+
+void TestLineAnnotationPresenceOverlay::channelPyramidMatchesTheScanUnderBothConventions()
+{
+    using vc3d::line_annotation::channelPyramidMatchesScan;
+    using vc3d::line_annotation::StoredPyramidLevel;
+    using Levels = std::vector<StoredPyramidLevel>;
+    const std::array<std::size_t, 3> scan{59944, 20812, 20812};
+    const std::array<std::size_t, 3> inclusiveMax{59944, 20811, 20811};
+    // A channel stored from /0 at its manifest's inclusive-maximum extent is
+    // one row short of the scan's count: still that scan's pyramid, whether
+    // the manifest frame is known or not.
+    const Levels fullAtMax{{0, {59944, 20811, 20811}, {64, 64, 64}}};
+    QVERIFY(channelPyramidMatchesScan(scan, inclusiveMax, 0, fullAtMax));
+    QVERIFY(channelPyramidMatchesScan(scan, std::nullopt, 0, fullAtMax));
+    // The PHerc1451 presence export (/3, /4) and a chunk-padded /3.
+    const Levels sparse{{3, {7493, 2602, 2602}, {64, 64, 64}},
+                        {4, {3747, 1301, 1301}, {64, 64, 64}}};
+    QVERIFY(channelPyramidMatchesScan(scan, scan, 0, sparse));
+    QVERIFY(channelPyramidMatchesScan(scan, inclusiveMax, 0, sparse));
+    QVERIFY(channelPyramidMatchesScan(scan, std::nullopt, 0, sparse));
+    const Levels padded{{3, {7552, 2624, 2624}, {64, 64, 64}}};
+    QVERIFY(channelPyramidMatchesScan(scan, std::nullopt, 0, padded));
+    // Opened at #vc-base-scale=1: stored indices are relative to that level.
+    const Levels rebased{{2, {7493, 2602, 2602}, {64, 64, 64}},
+                         {3, {3747, 1301, 1301}, {64, 64, 64}}};
+    QVERIFY(channelPyramidMatchesScan({29972, 10406, 10406}, scan, 1, rebased));
+    QVERIFY(channelPyramidMatchesScan({29972, 10406, 10406}, std::nullopt, 1, rebased));
+    // A scan twin whose frame is its chunk-padded stored /1 (29984 = 29972
+    // rounded to whole 64-chunks) is not a frame the fiber maps onto, even
+    // though the manifest names the scan: the channel keeps its own frame.
+    QVERIFY(!channelPyramidMatchesScan({29984, 10432, 10432}, scan, 1, rebased));
+    QVERIFY(!channelPyramidMatchesScan({29984, 10432, 10432}, std::nullopt, 1, rebased));
+    // A manifest of another frame entirely does not pass on the scan's
+    // strength alone.
+    QVERIFY(!channelPyramidMatchesScan(scan, std::array<std::size_t, 3>{16000, 5500, 5500}, 0, sparse));
+    // A leaf attached as level 0, or another scroll's pyramid, is not.
+    const Levels leaf{{0, {7493, 2602, 2602}, {64, 64, 64}}};
+    QVERIFY(!channelPyramidMatchesScan(scan, std::nullopt, 0, leaf));
+    QVERIFY(!channelPyramidMatchesScan(scan, scan, 0, leaf));
+    QVERIFY(!channelPyramidMatchesScan({16000, 5500, 5500}, std::nullopt, 0, sparse));
+    // Two rows short is not a convention, it is a different frame.
+    const Levels twoShort{{0, {59944, 20810, 20810}, {64, 64, 64}}};
+    QVERIFY(!channelPyramidMatchesScan(scan, std::nullopt, 0, twoShort));
+    QVERIFY(!channelPyramidMatchesScan(scan, std::nullopt, 0, Levels{}));
 }
 
 QTEST_APPLESS_MAIN(TestLineAnnotationPresenceOverlay)

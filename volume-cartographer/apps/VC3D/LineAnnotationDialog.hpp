@@ -581,6 +581,10 @@ private:
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
     QComboBox* _fiberOptimizationCombo = nullptr;
+    // The hamburger menu; its submenus are not rebuilt while it is open (a
+    // rebuild drops the highlighted action), only once it hides.
+    QMenu* _annotationMenu = nullptr;
+    bool _datasetMenusStale = false;
     QMenu* _rawScanMenu = nullptr;
     QMenu* _lasagnaDatasetMenu = nullptr;
     QMenu* _fiberInferenceDatasetMenu = nullptr;

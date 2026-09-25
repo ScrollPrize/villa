@@ -180,4 +180,59 @@ inline bool storedLevelsConsistentWithFrame(
     return true;
 }
 
+
+// Whether a channel volume's stored pyramid is the pyramid of a scan's
+// frame, `scanFrameZYX` being the frame of the scan volume attached at the
+// level the channel was opened at. A channel is published against its
+// manifest base frame, which may record the scan's extent as an inclusive
+// maximum (one voxel smaller than the scan's count); the dataset placement
+// already accepts that. With the manifest frame known it is scaled to the
+// opened level, must agree with the scan frame within that one voxel, and
+// the stored levels are validated against it; without it the stored levels
+// are validated against the scan frame and the scan frame one voxel smaller
+// per axis. A scan twin that exposes chunk-padded stored extents as its
+// frame (a `#vc-base-scale=N` opening of a padded pyramid) fails the
+// agreement, and rightly: the fiber cannot be mapped onto that frame
+// dyadically. The chunk-padding rule of storedLevelsConsistentWithFrame()
+// applies throughout.
+inline bool channelPyramidMatchesScan(
+    const std::array<std::size_t, 3>& scanFrameZYX,
+    const std::optional<std::array<std::size_t, 3>>& manifestBaseZYX,
+    int openedLevel,
+    const std::vector<StoredPyramidLevel>& storedLevels)
+{
+    if (openedLevel < 0 || openedLevel > 30) {
+        return false;
+    }
+    const auto atOpenedLevel = [openedLevel](std::array<std::size_t, 3> frame) {
+        const std::size_t divisor = std::size_t{1} << openedLevel;
+        for (auto& extent : frame) {
+            extent = (extent + divisor - 1) / divisor;
+        }
+        return frame;
+    };
+    if (manifestBaseZYX) {
+        const auto manifestFrame = atOpenedLevel(*manifestBaseZYX);
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            const std::size_t a = manifestFrame[axis];
+            const std::size_t b = scanFrameZYX[axis];
+            if (a == 0 || b == 0 || (a > b ? a - b : b - a) > 1) {
+                return false;
+            }
+        }
+        return storedLevelsConsistentWithFrame(manifestFrame, storedLevels);
+    }
+    if (storedLevelsConsistentWithFrame(scanFrameZYX, storedLevels)) {
+        return true;
+    }
+    std::array<std::size_t, 3> inclusiveMax = scanFrameZYX;
+    for (auto& extent : inclusiveMax) {
+        if (extent == 0) {
+            return false;
+        }
+        --extent;
+    }
+    return storedLevelsConsistentWithFrame(inclusiveMax, storedLevels);
+}
+
 }  // namespace vc3d::line_annotation

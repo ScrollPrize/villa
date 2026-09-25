@@ -242,7 +242,8 @@ int dyadicLevelForShapes(const std::array<std::size_t, 3>& baseShape,
 std::optional<ResolvedOpenDataLasagna> resolveForTags(
     const VolumePkg& pkg,
     const std::vector<std::string>& volumeTags,
-    const std::optional<std::array<int, 3>>& workingShape)
+    const std::optional<std::array<int, 3>>& workingShape,
+    const std::optional<std::string>& manualLocation = std::nullopt)
 {
     const auto sampleId = tagValue(volumeTags, kOpenDataSampleIdTagPrefix);
     const auto volumeId = tagValue(volumeTags, "vc-open-data-volume-id:");
@@ -337,18 +338,18 @@ std::optional<ResolvedOpenDataLasagna> resolveForTags(
         }
     }
 
-    const auto manualLocation = pkg.selectedLasagnaDataset();
-    if (manualLocation.empty()) return std::nullopt;
+    const std::string manual = manualLocation.value_or(pkg.selectedLasagnaDataset());
+    if (manual.empty()) return std::nullopt;
     vc::lasagna::LasagnaDatasetOpenOptions options;
     options.remoteCacheRoot = vc3d::remoteCachePathFs();
-    const auto resolvedLocation = vc::project::isLocationRemote(manualLocation)
-        ? manualLocation
+    const auto resolvedLocation = vc::project::isLocationRemote(manual)
+        ? manual
         : vc::project::resolveLocalPath(
-              manualLocation, pkg.path().parent_path()).string();
+              manual, pkg.path().parent_path()).string();
     const auto dataset = vc::lasagna::LasagnaDataset::openLocation(
         resolvedLocation, options);
     return ResolvedOpenDataLasagna{
-        dataset.manifest().manifestPath, manualLocation, 1.0, {}, {}, false};
+        dataset.manifest().manifestPath, manual, 1.0, {}, {}, false};
 }
 
 } // namespace
@@ -646,12 +647,13 @@ int attachOpenDataLasagna(VolumePkg& pkg,
 
 std::optional<ResolvedOpenDataLasagna> resolveLasagnaForVolume(
     const VolumePkg& pkg,
-    const std::string& loadedVolumeId)
+    const std::string& loadedVolumeId,
+    const std::optional<std::string>& manualLocation)
 {
     const auto volume = pkg.volume(loadedVolumeId);
     if (!volume)
         throw std::runtime_error("Active volume is not loaded for Lasagna shape pairing");
-    return resolveForTags(pkg, pkg.volumeTags(loadedVolumeId), volume->shape());
+    return resolveForTags(pkg, pkg.volumeTags(loadedVolumeId), volume->shape(), manualLocation);
 }
 
 std::optional<ResolvedOpenDataLasagna> resolveLasagnaForCoordinateTags(

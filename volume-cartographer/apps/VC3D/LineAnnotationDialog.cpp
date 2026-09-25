@@ -709,6 +709,18 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     annotationMenuButton->installEventFilter(this);
     auto* annotationMenu = new QMenu(annotationMenuButton);
     annotationMenu->setToolTipsVisible(true);
+    _annotationMenu = annotationMenu;
+    connect(annotationMenu, &QMenu::aboutToHide, this, [this]() {
+        if (_datasetMenusStale) {
+            // Deferred from a background refresh that arrived while the
+            // menu was open; the actions are safe to replace once it hides.
+            QMetaObject::invokeMethod(this, [this]() {
+                if (_datasetMenusStale) {
+                    rebuildDatasetMenus();
+                }
+            }, Qt::QueuedConnection);
+        }
+    });
     _autoReoptimizeAction = annotationMenu->addAction(tr("Auto-reoptimize"));
     _autoReoptimizeAction->setCheckable(true);
     _autoReoptimizeAction->setChecked(true);
@@ -1422,6 +1434,14 @@ void LineAnnotationDialog::setSurfaceOptions(std::vector<DatasetMenuOption> opti
 
 void LineAnnotationDialog::rebuildDatasetMenus()
 {
+    if (_annotationMenu && _annotationMenu->isVisible()) {
+        // Replacing the actions under an open popup discards the highlighted
+        // one (Enter would then activate the wrong entry). The stored options
+        // are current; the rebuild runs when the menu hides.
+        _datasetMenusStale = true;
+        return;
+    }
+    _datasetMenusStale = false;
     if (_rawScanMenu) {
         _rawScanMenu->clear();
         if (_rawScanOptions.empty()) {

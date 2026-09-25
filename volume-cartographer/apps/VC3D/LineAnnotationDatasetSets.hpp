@@ -48,6 +48,20 @@ inline bool hasTag(const std::vector<std::string>& tags, std::string_view tag)
     return std::find(tags.begin(), tags.end(), tag) != tags.end();
 }
 
+// Every value of a repeated tag, in tag order (a volume shared by two
+// manifests carries one `vc-lasagna-manifest:` tag per manifest).
+inline std::vector<std::string> tagValues(const std::vector<std::string>& tags,
+                                          std::string_view prefix)
+{
+    std::vector<std::string> values;
+    for (const auto& tag : tags) {
+        if (tag.size() >= prefix.size() && tag.compare(0, prefix.size(), prefix) == 0) {
+            values.push_back(tag.substr(prefix.size()));
+        }
+    }
+    return values;
+}
+
 enum class ProjectVolumeKind { RawScan, Lasagna, Fiber, SurfacePrediction, Other };
 
 // What the controller reads off a loaded project volume.
@@ -58,6 +72,10 @@ struct ProjectVolumeInfo {
     std::array<std::size_t, 3> shapeZYX{};
     // From the Volume's metadata; the open-data tag wins when present.
     double voxelSizeUm = 0.0;
+    // Volume::baseScaleLevel(): the pyramid level the volume was opened at
+    // (`#vc-base-scale=N` locations). The open-data level tag wins when
+    // present; this places untagged twins.
+    int openedLevel = 0;
 };
 
 struct ClassifiedVolume {
@@ -70,11 +88,22 @@ struct ClassifiedVolume {
     int level = 0;
     double voxelSizeUm = 0.0;
     bool virtualSource = false;
-    // Lasagna / fiber: the channel (group name) and the manifest location.
+    // Lasagna / fiber: the channel (group name) and every manifest the
+    // volume belongs to (attachment merges the tags of a zarr two manifests
+    // share). `kind` is Fiber when every membership is a fiber dataset;
+    // volumeSelectorOptions() re-roles a shared volume by the selected dataset.
     std::string channel;
-    std::string manifestLocation;
+    std::vector<std::string> manifestLocations;
     std::array<std::size_t, 3> shapeZYX{};
 };
+
+inline bool volumeBelongsToDataset(const ClassifiedVolume& volume,
+                                   const std::string& manifestLocation)
+{
+    return !manifestLocation.empty() &&
+           std::find(volume.manifestLocations.begin(), volume.manifestLocations.end(),
+                     manifestLocation) != volume.manifestLocations.end();
+}
 
 inline ClassifiedVolume classifyProjectVolume(
     const ProjectVolumeInfo& info,
@@ -85,12 +114,18 @@ inline ClassifiedVolume classifyProjectVolume(
     out.name = info.name;
     out.shapeZYX = info.shapeZYX;
     out.voxelSizeUm = info.voxelSizeUm;
+    out.level = std::max(0, info.openedLevel);
     if (const auto group = tagValue(info.tags, kLasagnaGroupTagPrefixForSets)) {
         out.channel = *group;
-        out.manifestLocation = tagValue(info.tags, kLasagnaManifestTagPrefixForSets).value_or("");
-        const bool fiber = std::find(fiberManifestLocations.begin(), fiberManifestLocations.end(),
-                                     out.manifestLocation) != fiberManifestLocations.end();
-        out.kind = fiber ? ProjectVolumeKind::Fiber : ProjectVolumeKind::Lasagna;
+        out.manifestLocations = tagValues(info.tags, kLasagnaManifestTagPrefixForSets);
+        const bool allFiber = !out.manifestLocations.empty() &&
+            std::all_of(out.manifestLocations.begin(), out.manifestLocations.end(),
+                        [&](const std::string& location) {
+                            return std::find(fiberManifestLocations.begin(),
+                                             fiberManifestLocations.end(),
+                                             location) != fiberManifestLocations.end();
+                        });
+        out.kind = allFiber ? ProjectVolumeKind::Fiber : ProjectVolumeKind::Lasagna;
         out.scanKey = tagValue(info.tags, kOpenDataVolumeIdTagPrefix).value_or("");
         return out;
     }
@@ -201,8 +236,13 @@ struct RawScanOption {
     // "20260319101107, 2.399 µm" (or the volume name when no voxel size).
     std::string label;
     double voxelSizeUm = 0.0;
-    // Level-0 frame, from the level-0 entry or a coarser twin scaled up.
+    // Level-0 frame, from the level-0 entry or a coarser twin scaled up: an
+    // upper bound when only a coarser twin is attached (the finest attached
+    // extent times 2^level rounds the ceiling division back up).
     std::array<std::size_t, 3> level0ShapeZYX{};
+    // The finest attached level and its extent, for frame matching.
+    int finestLevel = 0;
+    std::array<std::size_t, 3> finestShapeZYX{};
     // (level, volume id), ascending level.
     std::vector<std::pair<int, std::string>> levels;
 };
@@ -227,6 +267,8 @@ inline std::vector<RawScanOption> rawScanOptions(const std::vector<ClassifiedVol
         const int finestLevel = scan.levels.front().first;
         const double factor = static_cast<double>(std::size_t{1} << finestLevel);
         scan.voxelSizeUm = finest->voxelSizeUm > 0.0 ? finest->voxelSizeUm / factor : 0.0;
+        scan.finestLevel = finestLevel;
+        scan.finestShapeZYX = finest->shapeZYX;
         for (std::size_t axis = 0; axis < 3; ++axis) {
             scan.level0ShapeZYX[axis] = finest->shapeZYX[axis] << finestLevel;
         }
@@ -252,37 +294,138 @@ struct DatasetInfo {
     std::vector<std::string> tags;
     // From its manifest, when it could be parsed.
     std::optional<std::array<std::size_t, 3>> baseShapeZYX;
+    // The manifest is remote and being fetched: its frame is not known YET,
+    // as opposed to unreadable. Never chosen automatically; a selection made
+    // meanwhile is revalidated once the frame arrives.
+    bool framePending = false;
 };
 
+// Whether a manifest base extent (a level-0 count, or an inclusive maximum
+// one smaller) is the scan's, judged at the scan's finest attached level:
+// a level-L extent of `a` covers base counts (a-1)*2^L < b <= a*2^L, so
+// only a level-0 twin pins the count exactly. One voxel of tolerance for
+// the two recording conventions.
+inline bool scanFrameMatchesBaseExtent(const RawScanOption& scan,
+                                       const std::array<std::size_t, 3>& baseShapeZYX)
+{
+    if (scan.finestLevel < 0 || scan.finestLevel > 30) {
+        return false;
+    }
+    const std::size_t stride = std::size_t{1} << scan.finestLevel;
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        const std::size_t a = scan.finestShapeZYX[axis];
+        const std::size_t b = baseShapeZYX[axis];
+        if (a == 0 || b == 0) {
+            return false;
+        }
+        const std::size_t low = (a - 1) * stride;   // (a-1)*2^L < b, minus the tolerance
+        const std::size_t high = a * stride + 1;    // b <= a*2^L, plus the tolerance
+        if (b < low || b > high) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // The scan a dataset was published against: its open-data scan id tag, else
-// the one scan whose level-0 frame equals its manifest base frame (one voxel
-// per axis tolerance: frames are recorded as voxel counts or inclusive
-// maxima). Empty when unknown, which callers treat as "applies to any scan".
+// the scan(s) whose frame matches its manifest base frame (see
+// scanFrameMatchesBaseExtent). The four outcomes are kept apart: a dataset
+// whose frame matches no scan is positive evidence it belongs to none of
+// them, unlike one whose manifest could not be read.
+struct DatasetScanMatch {
+    enum class Kind { Matched, Ambiguous, Unknown, Incompatible, Pending };
+    Kind kind = Kind::Unknown;
+    // Matched: the one scan. Ambiguous: every scan with that frame.
+    std::vector<std::string> scanKeys;
+};
+
+inline DatasetScanMatch datasetScanMatch(const DatasetInfo& dataset,
+                                         const std::vector<RawScanOption>& scans)
+{
+    DatasetScanMatch match;
+    if (const auto id = tagValue(dataset.tags, kOpenDataVolumeIdTagPrefix)) {
+        match.kind = DatasetScanMatch::Kind::Matched;
+        match.scanKeys = {*id};
+        return match;
+    }
+    if (!dataset.baseShapeZYX) {
+        match.kind = dataset.framePending ? DatasetScanMatch::Kind::Pending
+                                          : DatasetScanMatch::Kind::Unknown;
+        return match;
+    }
+    for (const auto& scan : scans) {
+        if (scanFrameMatchesBaseExtent(scan, *dataset.baseShapeZYX)) {
+            match.scanKeys.push_back(scan.scanKey);
+        }
+    }
+    match.kind = match.scanKeys.empty() ? DatasetScanMatch::Kind::Incompatible
+               : match.scanKeys.size() == 1 ? DatasetScanMatch::Kind::Matched
+                                            : DatasetScanMatch::Kind::Ambiguous;
+    return match;
+}
+
+// The matched scan, empty for anything but a unique match.
 inline std::string datasetScanKey(const DatasetInfo& dataset,
                                   const std::vector<RawScanOption>& scans)
 {
-    if (const auto id = tagValue(dataset.tags, kOpenDataVolumeIdTagPrefix)) {
-        return *id;
+    const auto match = datasetScanMatch(dataset, scans);
+    return match.kind == DatasetScanMatch::Kind::Matched ? match.scanKeys.front() : std::string{};
+}
+
+// Whether a dataset can drive the selected scan: a matched or ambiguous
+// match naming it, or a dataset nothing is known about. A dataset known to
+// belong to another scan, or to no scan of the project, never applies.
+// The manifest base frames a channel volume can be validated against for
+// `scanKey`: one per membership whose dataset is placed under that scan
+// (by tag or by frame) and whose manifest could be read, in Lasagna-then-
+// fiber dataset order. Several memberships may disagree by the recording
+// convention (20811 vs 20812); the caller tries each, so no membership can
+// veto another's valid frame.
+std::vector<std::array<std::size_t, 3>> channelManifestFrameCandidates(
+    const ClassifiedVolume& channel,
+    const std::vector<DatasetInfo>& lasagnaDatasets,
+    const std::vector<DatasetInfo>& fiberDatasets,
+    const std::vector<RawScanOption>& scans,
+    const std::string& scanKey);
+
+// A dataset whose frame is still being fetched applies too: a selection of
+// it is usable meanwhile and revalidated once the frame arrives.
+inline bool datasetAppliesToScan(const DatasetScanMatch& match, const std::string& scanKey)
+{
+    switch (match.kind) {
+    case DatasetScanMatch::Kind::Unknown:
+    case DatasetScanMatch::Kind::Pending:
+        return true;
+    case DatasetScanMatch::Kind::Incompatible:
+        return false;
+    case DatasetScanMatch::Kind::Matched:
+    case DatasetScanMatch::Kind::Ambiguous:
+        return std::find(match.scanKeys.begin(), match.scanKeys.end(), scanKey) !=
+               match.scanKeys.end();
     }
-    if (!dataset.baseShapeZYX) {
-        return {};
-    }
-    std::string match;
-    for (const auto& scan : scans) {
-        bool same = true;
-        for (std::size_t axis = 0; axis < 3 && same; ++axis) {
-            const auto a = scan.level0ShapeZYX[axis];
-            const auto b = (*dataset.baseShapeZYX)[axis];
-            same = a > 0 && b > 0 && (a > b ? a - b : b - a) <= 1;
-        }
-        if (same) {
-            if (!match.empty()) {
-                return {};  // ambiguous
+    return false;
+}
+
+inline std::vector<std::array<std::size_t, 3>> channelManifestFrameCandidates(
+    const ClassifiedVolume& channel,
+    const std::vector<DatasetInfo>& lasagnaDatasets,
+    const std::vector<DatasetInfo>& fiberDatasets,
+    const std::vector<RawScanOption>& scans,
+    const std::string& scanKey)
+{
+    std::vector<std::array<std::size_t, 3>> frames;
+    for (const auto* datasets : {&lasagnaDatasets, &fiberDatasets}) {
+        for (const auto& dataset : *datasets) {
+            if (!volumeBelongsToDataset(channel, dataset.location) || !dataset.baseShapeZYX) {
+                continue;
             }
-            match = scan.scanKey;
+            if (!datasetAppliesToScan(datasetScanMatch(dataset, scans), scanKey)) {
+                continue;
+            }
+            frames.push_back(*dataset.baseShapeZYX);
         }
     }
-    return match;
+    return frames;
 }
 
 // Lasagna and fiber channel volumes carry no scan of their own; they take the
@@ -298,18 +441,18 @@ inline void assignDatasetScansToChannels(std::vector<ClassifiedVolume>& volumes,
         if (!v.scanKey.empty()) {
             continue;
         }
+        // The first membership whose dataset resolves to one scan.
         for (const auto& dataset : datasets) {
-            if (dataset.location == v.manifestLocation) {
-                v.scanKey = datasetScanKey(dataset, scans);
+            if (!volumeBelongsToDataset(v, dataset.location)) {
+                continue;
+            }
+            const std::string key = datasetScanKey(dataset, scans);
+            if (!key.empty()) {
+                v.scanKey = key;
                 break;
             }
         }
     }
-}
-
-inline bool datasetAppliesToScan(const std::string& datasetScanKey, const std::string& scanKey)
-{
-    return datasetScanKey.empty() || datasetScanKey == scanKey;
 }
 
 // The dataset to select when switching scans: the newest applicable one by
@@ -322,7 +465,11 @@ inline std::optional<std::string> newestDatasetForScan(
     std::optional<std::string> best;
     std::string bestModelId;
     for (const auto& dataset : datasets) {
-        if (!datasetAppliesToScan(datasetScanKey(dataset, scans), scanKey)) {
+        // A frame still being fetched is not chosen automatically: it may
+        // turn out to belong elsewhere.
+        const auto match = datasetScanMatch(dataset, scans);
+        if (match.kind == DatasetScanMatch::Kind::Pending ||
+            !datasetAppliesToScan(match, scanKey)) {
             continue;
         }
         const std::string modelId =
@@ -363,12 +510,20 @@ inline std::string defaultRawScanKey(const std::vector<RawScanOption>& scans,
     return scans.empty() ? std::string{} : scans.front().scanKey;
 }
 
-// The scan's volume at `level`, else its finest level.
-inline std::string scanVolumeIdAtLevel(const RawScanOption& scan, int level)
+// The scan's volume at exactly `level`, else empty.
+inline std::string scanVolumeIdAtExactLevel(const RawScanOption& scan, int level)
 {
     for (const auto& [l, id] : scan.levels) {
         if (l == level) return id;
     }
+    return {};
+}
+
+// The scan's volume at `level`, else its finest level.
+inline std::string scanVolumeIdAtLevel(const RawScanOption& scan, int level)
+{
+    const std::string exact = scanVolumeIdAtExactLevel(scan, level);
+    if (!exact.empty()) return exact;
     return scan.levels.empty() ? std::string{} : scan.levels.front().second;
 }
 
@@ -483,10 +638,11 @@ inline std::vector<VolumeSelectorOption> rawVolumeSelectorOptions(
 // selected surface prediction, in that order, under readable labels with the
 // file name in the tooltip. The scan is listed once, as its volume at
 // `preferredLevel` (the level the workspace is on) or its finest level;
-// levels are chosen in the Raw scan submenu, not here. The current volume's
-// scan is always listed so the selector never shows nothing.
+// levels are chosen in the Raw scan submenu, not here. The current volume is
+// always listed (a raw one as its scan's representative), so the selector
+// never shows nothing, and its scan is listed even outside the set.
 inline std::vector<VolumeSelectorOption> volumeSelectorOptions(
-    const std::vector<ClassifiedVolume>& volumes,
+    const std::vector<ClassifiedVolume>& classified,
     const std::vector<RawScanOption>& scans,
     const std::string& scanKey,
     const std::string& lasagnaManifestLocation,
@@ -495,22 +651,37 @@ inline std::vector<VolumeSelectorOption> volumeSelectorOptions(
     const std::string& currentVolumeId,
     int preferredLevel = 0)
 {
-    // One representative volume per scan.
+    // A channel shared by two manifests is shown in the role of the selected
+    // dataset it belongs to.
+    std::vector<ClassifiedVolume> volumes = classified;
+    for (auto& v : volumes) {
+        if (v.kind != ProjectVolumeKind::Lasagna && v.kind != ProjectVolumeKind::Fiber) {
+            continue;
+        }
+        if (volumeBelongsToDataset(v, lasagnaManifestLocation)) {
+            v.kind = ProjectVolumeKind::Lasagna;
+        } else if (volumeBelongsToDataset(v, fiberManifestLocation)) {
+            v.kind = ProjectVolumeKind::Fiber;
+        }
+    }
+    const auto currentIt = std::find_if(volumes.begin(), volumes.end(),
+                                        [&](const auto& v) { return v.id == currentVolumeId; });
+    const std::string currentScanKey =
+        currentIt != volumes.end() ? currentIt->scanKey : std::string{};
+    // One representative volume per scan: the current volume when it is one
+    // of the scan's levels, else the scan at the preferred level.
     std::map<std::string, std::string> scanRepresentative;
     for (const auto& scan : scans) {
         scanRepresentative[scan.scanKey] = scanVolumeIdAtLevel(scan, preferredLevel);
+    }
+    if (currentIt != volumes.end() && currentIt->kind == ProjectVolumeKind::RawScan) {
+        scanRepresentative[currentIt->scanKey] = currentIt->id;
     }
     const auto representsItsScan = [&](const ClassifiedVolume& v) {
         if (v.kind != ProjectVolumeKind::RawScan) return true;
         const auto it = scanRepresentative.find(v.scanKey);
         return it != scanRepresentative.end() && it->second == v.id;
     };
-    const auto currentScanKey = [&]() {
-        for (const auto& v : volumes) {
-            if (v.id == currentVolumeId) return v.scanKey;
-        }
-        return std::string{};
-    }();
     const auto scanVoxel = [&](const std::string& key) {
         for (const auto& scan : scans) {
             if (scan.scanKey == key) return scan.voxelSizeUm;
@@ -524,11 +695,9 @@ inline std::vector<VolumeSelectorOption> volumeSelectorOptions(
         case ProjectVolumeKind::SurfacePrediction:
             return v.scanKey == scanKey && v.id == selectedSurfaceVolumeId;
         case ProjectVolumeKind::Lasagna:
-            return !lasagnaManifestLocation.empty() &&
-                   v.manifestLocation == lasagnaManifestLocation;
+            return volumeBelongsToDataset(v, lasagnaManifestLocation);
         case ProjectVolumeKind::Fiber:
-            return !fiberManifestLocation.empty() &&
-                   v.manifestLocation == fiberManifestLocation;
+            return volumeBelongsToDataset(v, fiberManifestLocation);
         case ProjectVolumeKind::Other:
             return false;
         }
@@ -560,7 +729,7 @@ inline std::vector<VolumeSelectorOption> volumeSelectorOptions(
         if (aIn != bIn) return aIn;  // the stray current volume goes last
         if (rank(*a) != rank(*b)) return rank(*a) < rank(*b);
         if (a->kind == ProjectVolumeKind::RawScan && a->level != b->level) return a->level < b->level;
-        if (a->manifestLocation != b->manifestLocation) return a->manifestLocation < b->manifestLocation;
+        if (a->manifestLocations != b->manifestLocations) return a->manifestLocations < b->manifestLocations;
         if (a->channel != b->channel) return a->channel < b->channel;
         return a->id < b->id;
     });
