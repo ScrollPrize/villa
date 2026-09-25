@@ -10,7 +10,9 @@ import torch
 
 from vesuvius.neural_tracing.fiber_follow.data import SampleConfig, TracedFiber, continuation_targets
 from vesuvius.neural_tracing.fiber_follow.geometry import arclength, frame_from_heading
-from vesuvius.neural_tracing.fiber_follow.model import FollowNet, FollowNetConfig, candidate_support, prior_mean
+from vesuvius.neural_tracing.fiber_follow.model import (
+    FollowNet, FollowNetConfig, candidate_support, flow_targets, observable_half_width, prior_mean,
+)
 from vesuvius.neural_tracing.fiber_follow.supervision import loss_fn, teacher_candidates
 from vesuvius.neural_tracing.fiber_follow.train import fit_flow_sigma, update_ema
 
@@ -19,6 +21,7 @@ def config():
     return FollowNetConfig(in_channels=3, depth=24, width=17, behind=6, spacing=.5,
                            widths=(8, 16), hidden=16, n_future=8, future_step=1.,
                            hist_points=4, hist_stride=2, recent_history_points=4, flow_sigma=((1., 1.),)*8,
+                           flow_stencil_radius=.5,  # leaves 3.5 observable voxels in the 4-voxel half-width
                            flow_layers=1, flow_heads=2, flow_steps=3, flow_samples=6, flow_draws=2, norm='group')
 
 
@@ -100,6 +103,41 @@ def test_flow_loss_reaches_image_history_and_flow_but_scorer_never_trains_the_fl
     assert model.flow.input[0].weight.grad is None or not model.flow.input[0].weight.grad.any()
     assert {'flow', 'candidate_support', 'oracle_recall', 'observed_current_error'} <= metrics.keys()
     assert not any(k.startswith('clean_') or k == 'flow_past' for k in metrics)
+
+
+@pytest.mark.parametrize('case', ['known', 'unknown', 'offtrack'])
+def test_skipping_metrics_preserves_loss_and_gradients(case, monkeypatch):
+    from vesuvius.neural_tracing.fiber_follow import supervision
+    torch.manual_seed(73)
+    cfg = config()
+    model = FollowNet(cfg)
+    x, hist, mask = inputs(cfg)
+    batch = targets(cfg, hist, mask)
+    if case == 'unknown':
+        batch['plane_mask'].zero_()
+        batch['dense_mask'].zero_()
+    elif case == 'offtrack':
+        batch['offtrack'].fill_(1)
+    out = model(x, hist, mask, teacher_candidates(batch, cfg), targets=batch)
+    weights = dict(flow_weight=.7, rank_weight=1.3, confidence_weight=.4)
+    full_loss, metrics = loss_fn(out, batch, cfg, **weights)
+    parameters = tuple(model.parameters())
+    full_grad = torch.autograd.grad(full_loss, parameters, retain_graph=True, allow_unused=True)
+
+    def unexpected_metric(*args, **kwargs):
+        raise AssertionError('Non-logging steps must skip diagnostic selection and scalar extraction')
+    with monkeypatch.context() as patch:
+        patch.setattr(supervision, 'choose_candidate', unexpected_metric)
+        patch.setattr(torch.Tensor, 'item', unexpected_metric)
+        loss, skipped = loss_fn(out, batch, cfg, compute_metrics=False, **weights)
+        grad = torch.autograd.grad(loss, parameters, allow_unused=True)
+    assert skipped == {} and 'oracle_recall' in metrics
+    torch.testing.assert_close(loss, full_loss, rtol=0, atol=0)
+    for actual, expected in zip(grad, full_grad):
+        if expected is None:
+            assert actual is None
+        else:
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize('case', ['unknown', 'offtrack'])
@@ -300,23 +338,56 @@ def test_beam_owns_its_optional_head_without_flow_parameters():
     assert out['ranks'].shape == (1, 2) and out['tube_logits'].shape == x.shape[:1]+x.shape[2:]
 
 
-def test_prior_extrapolates_history_and_guards_unusable_tangents():
+def test_prior_is_straight_ahead_whatever_the_history_says():
     cfg = config()
     _, hist, mask = inputs(cfg)
     hist[..., 0] = .5*hist[..., 2]
     hist[..., 1] = -.25*hist[..., 2]
-    mu = prior_mean(hist, mask, cfg)
-    planes = torch.arange(1, cfg.n_future+1)
-    bound = (cfg.width-1)*cfg.spacing/2-cfg.flow_stencil_radius
-    torch.testing.assert_close(mu[0, :, 0], (.5*planes).clamp(max=bound))
-    torch.testing.assert_close(mu[0, :, 1], (-.25*planes).clamp(min=-bound))
-    mask[:, 1:] = 0
-    assert not prior_mean(hist, mask, cfg)[..., :2].any()
-    mask.fill_(1)
-    hist[..., 2] = 0  # measured but perpendicular to the crop's forward axis
-    assert not prior_mean(hist, mask, cfg)[..., :2].any()
-    hist[..., 2] = torch.arange(1, hist.shape[1]+1)  # backwards
-    assert not prior_mean(hist, mask, cfg)[..., :2].any()
+    planes = cfg.future_step*torch.arange(1, cfg.n_future+1)
+    for supplied in (mask, torch.zeros_like(mask)):
+        mu = prior_mean(hist, supplied, cfg)
+        assert mu.shape == (1, cfg.n_future, 3)
+        assert not mu[..., :2].any()
+        torch.testing.assert_close(mu[0, :, 2], planes)
+
+
+def test_flow_targets_censor_the_prefix_once_the_curve_leaves_the_crop():
+    cfg = config()
+    half = observable_half_width(cfg)
+    assert half == pytest.approx(3.5)
+    batch = targets(cfg)
+    batch['plane_ab'][0, 4, 0] = half+.5   # leaves at plane 5
+    batch['plane_ab'][0, 5:, 0] = 0.       # and re-enters
+    x1, mask, censored = flow_targets(batch, cfg)
+    assert mask[0].tolist() == [1, 1, 1, 1, 0, 0, 0, 0]
+    assert censored[0].tolist() == [0, 0, 0, 0, 1, 1, 1, 1]
+    torch.testing.assert_close(x1[0, :, 2], cfg.future_step*torch.arange(1, cfg.n_future+1))
+    # Unannotated planes never break the observable prefix, whatever their padding holds.
+    gap = targets(cfg)
+    gap['plane_mask'][0, 2] = 0
+    gap['plane_ab'][0, 2] = float('nan')
+    _, mask, censored = flow_targets(gap, cfg)
+    assert mask[0].tolist() == [1, 1, 0, 1, 1, 1, 1, 1] and not censored.any()
+    # Departed states are neither known nor censored.
+    gone = targets(cfg)
+    gone['offtrack'].fill_(1)
+    gone['plane_ab'][0, 1, 0] = 100.
+    _, mask, censored = flow_targets(gone, cfg)
+    assert not mask.any() and not censored.any()
+    # The loss report and the scale calibration apply the same rule.
+    model = FollowNet(cfg)
+    x, hist, hmask = inputs(cfg)
+    row = targets(cfg, hist, hmask)
+    row['plane_ab'][0, 4, 0] = half+.5
+    out = model(x, hist, hmask, targets=row)
+    assert out['flow_known_fraction'].item() == .5 and out['flow_censored_fraction'].item() == .5
+    clean = targets(cfg, hist, hmask)
+    rows = {k: torch.cat([clean[k], clean[k], row[k]]) for k in ('hist', 'hmask', 'plane_ab', 'plane_mask', 'offtrack')}
+    sigma, report = fit_flow_sigma(iter([rows]), cfg, states=3)
+    assert report['known_counts'] == [3]*4+[2]*4 and report['censored_counts'] == [0]*4+[1]*4
+    assert len(sigma) == cfg.n_future
+    with pytest.raises(ValueError, match='observable'):
+        FollowNet(replace(cfg, flow_stencil_radius=(cfg.width-1)*cfg.spacing/2))
 
 
 def test_scale_calibration_uses_masked_history_residuals_and_voxel_floor():
@@ -326,7 +397,8 @@ def test_scale_calibration_uses_masked_history_residuals_and_voxel_floor():
     mask = mask.expand(6, -1).clone()
     hist[..., 0] = hist[..., 2] * torch.arange(6)[:, None]*.02
     mu = prior_mean(hist, mask, cfg)[..., :2]
-    scales = torch.stack([torch.arange(1., 9.), torch.full((8,), .1)], -1)
+    # Residuals stay inside the observable extent; the floor still binds on small scales.
+    scales = torch.stack([torch.linspace(.25, 1.5, 8), torch.full((8,), .1)], -1)
     residual = torch.tensor([-2., -1., 1., 2., 1000., 1e6])[:, None, None]*scales
     batch = dict(hist=hist, hmask=mask, plane_ab=mu+residual,
                  plane_mask=torch.ones(6, 8), offtrack=torch.tensor([0, 0, 0, 0, 1, 0]))
@@ -338,13 +410,16 @@ def test_scale_calibration_uses_masked_history_residuals_and_voxel_floor():
     expected[-1] = residual[1:4, -1].double().std(0, correction=0).clamp_min(1)
     torch.testing.assert_close(torch.tensor(sigma).double(), expected, atol=1e-6, rtol=1e-6)
     assert report['states'] == 5 and report['known_counts'] == [4]*7+[3]
+    assert report['censored_counts'] == [0]*8
+    assert (torch.tensor(sigma)[:, 0] == 1).sum() > 0 and (torch.tensor(sigma)[:, 0] > 1).sum() > 0
     batch['plane_mask'][:, -1] = 0
     with pytest.raises(ValueError, match='at least two known targets'):
         fit_flow_sigma(iter([batch]), cfg, states=5)
 
 
 def test_normalized_loss_and_stratified_times_match_the_training_bridge(monkeypatch):
-    cfg = replace(config(), flow_draws=8, flow_sigma=tuple((float(k), float(k+1)) for k in range(1, 9)))
+    # A wider crop keeps the unit-scale targets below observable; censoring is tested separately.
+    cfg = replace(config(), flow_draws=8, width=65, flow_sigma=tuple((float(k), float(k+1)) for k in range(1, 9)))
     model = FollowNet(cfg)
     x, hist, mask = inputs(cfg)
     hist[..., 0] = .1*hist[..., 2]
@@ -368,8 +443,7 @@ def test_normalized_loss_and_stratified_times_match_the_training_bridge(monkeypa
     expected = (1-y0).square().mean()
     torch.testing.assert_close(result['flow_loss'], expected)
     assert result['flow_known_fraction'].item() == .75
-    # Targets outside the crop are still known: crop censoring was not requested.
-    assert model.future_targets(batch)[1][0, -3] == 1
+    assert result['flow_censored_fraction'].item() == 0
 
 
 def test_midpoint_has_second_order_convergence_in_normalized_space(monkeypatch):

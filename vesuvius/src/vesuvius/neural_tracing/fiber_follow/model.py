@@ -32,7 +32,7 @@ class FollowNetConfig:
     flow_heads: int = 4
     flow_steps: int = 4       # midpoint steps, two flow evaluations per step
     flow_samples: int = 16    # future-path samples drawn per state
-    flow_draws: int = 32      # stratified (time, noise) draws against shared image features
+    flow_draws: int = 16      # stratified (time, noise) draws against shared image features
     flow_sigma: tuple = ()   # fitted per-plane (a, b) residual std, trace-grid voxels
     flow_stencil_radius: float = 2.0  # 3x3 lateral patch pitch/radius, trace-grid voxels
     support_radius: float = 1.5  # RMS lateral distance on the commit window
@@ -100,16 +100,45 @@ def time_embedding(t, dim):
     return torch.cat([angles.sin(), angles.cos()], -1)
 
 
+def future_planes(cfg, device=None):
+    return cfg.future_step * torch.arange(1, cfg.n_future+1, device=device, dtype=torch.float32)
+
+
 def prior_mean(hist, hmask, cfg):
-    """Extrapolate the observed tangent, keeping the observation patches in-crop."""
-    tangent, measured = history_tangent(hist, hmask, cfg.recent_history_points)
-    usable = measured & (tangent[:, 2] > 1e-3)
-    slope = tangent[:, :2] / tangent[:, 2:].clamp_min(1e-3)
-    slope = torch.where(usable[:, None], slope, 0.)
-    planes = cfg.future_step * torch.arange(1, cfg.n_future+1, device=hist.device)
-    half = (cfg.width-1)*cfg.spacing/2 - cfg.flow_stencil_radius
-    lateral = (slope[:, None] * planes[None, :, None]).clamp(-half, half)
-    return torch.cat([lateral, planes[None, :, None].expand(len(hist), -1, -1)], -1)
+    """Straight ahead along the trace heading, at the fixed forward planes.
+
+    The frame axis already follows the trace. On the training data a backward
+    tangent extrapolated forward lowered no per-plane residual scale and raised
+    the near-plane ones, so the mean carries no history term; history
+    conditions the velocity field instead.
+    """
+    mean = torch.zeros(len(hist), cfg.n_future, 3, device=hist.device)
+    mean[..., 2] = future_planes(cfg, hist.device)
+    return mean
+
+
+def observable_half_width(cfg):
+    """Lateral extent within which a target's whole observation patch is in the crop."""
+    return (cfg.width-1)*cfg.spacing/2 - cfg.flow_stencil_radius
+
+
+def flow_targets(batch, cfg):
+    """Annotated crossings the crop can observe: coordinates, token mask, censored mask.
+
+    A token is supervised when its plane is annotated, the state has not
+    departed, and no annotated plane up to it lies outside the observable
+    lateral extent. Once the curve leaves the crop, later crossings are
+    unobservable even if it re-enters, so censoring is a prefix. Unannotated
+    planes never break the prefix, whatever their padding holds. ``censored``
+    marks annotated tokens removed by this rule. Dense scorer labels are not
+    affected: a candidate that leaves the crop toward the fiber is still right.
+    """
+    ab = batch['plane_ab'].float()
+    x1 = torch.cat([ab, future_planes(cfg, ab.device)[None, :, None].expand(len(ab), -1, 1)], -1)
+    annotated = batch['plane_mask'].float()*(1-batch['offtrack'].float())[:, None]
+    lateral = torch.where(annotated[..., None] > 0, ab, 0.).abs().amax(-1)
+    observable = (lateral <= observable_half_width(cfg)).int().cummin(-1).values.float()
+    return x1, annotated*observable, annotated*(1-observable)
 
 
 def candidate_support(candidates, samples, radius, window):
@@ -137,9 +166,8 @@ class PathFlow(nn.Module):
         sigma = torch.tensor(cfg.flow_sigma, dtype=torch.float32)
         if sigma.shape != (cfg.n_future, 2) or not torch.isfinite(sigma).all() or (sigma < 1).any():
             raise ValueError('flow_sigma must contain fitted (a, b) scales >= 1 for every future plane')
-        half = (cfg.width-1)*cfg.spacing/2
-        if not math.isfinite(cfg.flow_stencil_radius) or not 0 < cfg.flow_stencil_radius <= half:
-            raise ValueError('flow_stencil_radius must be positive and fit inside the crop')
+        if not math.isfinite(cfg.flow_stencil_radius) or not 0 < cfg.flow_stencil_radius or observable_half_width(cfg) <= 0:
+            raise ValueError('flow_stencil_radius must be positive and leave an observable lateral extent')
         self.register_buffer('sigma', sigma, persistent=False)
         h = cfg.hidden
         self.n_history = 1 + cfg.recent_history_points
@@ -225,7 +253,7 @@ class FollowNet(nn.Module):
             raise ValueError('Candidates/forecast horizon exceed the proposal configuration')
         if min(cfg.flow_layers, cfg.flow_heads, cfg.flow_steps, cfg.flow_draws) < 1 or cfg.hidden % cfg.flow_heads:
             raise ValueError('Flow layers, heads, steps and draws must be positive; hidden must divide by heads')
-        if any(not math.isfinite(v) or v <= 0 for v in (cfg.support_radius,)):
+        if not math.isfinite(cfg.support_radius) or cfg.support_radius <= 0:
             raise ValueError('support_radius must be positive and finite')
         self.crop = CropSpec(depth=cfg.depth, width=cfg.width, behind=cfg.behind,
                              spacing=cfg.spacing)
@@ -284,21 +312,21 @@ class FollowNet(nn.Module):
         return features, context
 
     def future_targets(self, batch):
-        """Annotated future crossings; departed states have no geometry targets."""
-        ab = batch['plane_ab'].float()
-        future = torch.cat([ab, self.flow.planes[None, :, None].expand(len(ab), -1, 1)], -1)
-        return future, batch['plane_mask'].float()*(1-batch['offtrack'].float())[:, None]
+        """Observable annotated crossings and their token mask; see ``flow_targets``."""
+        x1, token_mask, _ = flow_targets(batch, self.cfg)
+        return x1, token_mask
 
     def flow_loss(self, features, context, hist, hmask, batch, generator=None, fixed=None):
-        """Stratified flow matching on annotated normalized lateral residuals.
+        """Stratified flow matching on observable normalized lateral residuals.
 
-        Missing futures remain excluded as attention keys and from the loss.
-        Observation tokens remain available on every requested plane.
+        Missing and crop-censored futures are excluded as attention keys and
+        from the loss (``flow_targets``). Observation tokens remain available
+        on every requested plane.
         """
         cfg = self.cfg
         if fixed is None:
             fixed = self.flow.conditioning(features, hist, hmask, self.sampling_grid)
-        x1, token_mask = self.future_targets(batch)
+        x1, token_mask, censored = flow_targets(batch, cfg)
         mu = fixed['mu']
         B, P, _ = mu.shape
         D = cfg.flow_draws
@@ -313,7 +341,8 @@ class FollowNet(nn.Module):
         error = (velocity - (target-y0)).square()
         weight = token_mask[:, None, :, None].expand_as(error)
         loss = (error*weight).sum()/weight.sum().clamp_min(1)
-        return dict(flow_loss=loss, flow_known_fraction=token_mask.mean().detach())
+        return dict(flow_loss=loss, flow_known_fraction=token_mask.mean().detach(),
+                    flow_censored_fraction=(censored.sum()/(token_mask+censored).sum().clamp_min(1)).detach())
 
     @torch.no_grad()
     def sample(self, features, context, hist, hmask, n_samples=None, steps=None, generator=None, fixed=None):

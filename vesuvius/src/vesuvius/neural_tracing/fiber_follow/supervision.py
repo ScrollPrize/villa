@@ -61,7 +61,8 @@ def candidate_labels(candidates, batch, tolerance=1.5,
 
 
 def loss_fn(output, batch, cfg, tolerance=1.5, rank_weight=1., confidence_weight=1., flow_weight=1.,
-            rank_temperature=20., confidence_threshold=DEFAULT_CONFIDENCE, n_commit=4):
+            rank_temperature=20., confidence_threshold=DEFAULT_CONFIDENCE, n_commit=4, *, compute_metrics=True):
+    """Training loss, optionally with diagnostic scalars for logging."""
     candidates = output['candidates']
     labels, mask, quality, error = candidate_labels(candidates.detach(), batch, tolerance, cfg.max_recovery_distance)
     M = cfg.flow_samples
@@ -85,6 +86,9 @@ def loss_fn(output, batch, cfg, tolerance=1.5, rank_weight=1., confidence_weight
     # Future coordinates are trained by flow matching inside the model forward;
     # the sampled candidates the scorer sees carry no gradient into the flow.
     flow = output['flow_loss']
+    total = flow_weight*flow+rank_weight*ranking+confidence_weight*confidence
+    if not compute_metrics:
+        return total, {}
     with torch.no_grad():
         chosen, commit, allowed = choose_candidate(
             candidates[:, :M], output['ranks'][:, :M], output['confidence'][:, :M],
@@ -102,6 +106,7 @@ def loss_fn(output, batch, cfg, tolerance=1.5, rank_weight=1., confidence_weight
         accepted = (commit > 0).float()*eligible
         metrics = dict(flow=flow.item(),
                        flow_known_fraction=output['flow_known_fraction'].item(),
+                       flow_censored_fraction=output['flow_censored_fraction'].item(),
                        ranking=ranking.item(), confidence=confidence.item(),
                        oracle_error=mean_oracle_error.item(),
                        selected_error=(selected_error*eligible).sum().item()/denominator.item(),
@@ -159,4 +164,4 @@ def loss_fn(output, batch, cfg, tolerance=1.5, rank_weight=1., confidence_weight
         crop_half = (cfg.width-1)*cfg.spacing/2
         for name, boundary in [('target_crop_oob', crop_half), ('target_crop_edge', crop_half-3)]:
             metrics[name] = ((lateral > boundary)*known).sum().item()/known.sum().clamp(min=1).item()
-    return flow_weight*flow+rank_weight*ranking+confidence_weight*confidence, metrics
+    return total, metrics

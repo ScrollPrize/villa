@@ -20,7 +20,7 @@ The production preset in `scripts/launch_ct_flow.sh` uses:
 | Residual scales | Per-plane lateral standard deviations fitted from 2,048 training states; floor 1 voxel |
 | Flow patches | 3 × 3 lateral features at 2 trace-voxel pitch, independent of crop spacing |
 | Samples / candidates | All 16 samples scored; support radius 1.5 voxels RMS |
-| Training draws | 32 stratified (time, noise) draws per state against shared image features |
+| Training draws | 16 stratified (time, noise) draws per state against shared image features |
 | Geometry history | Up to 128 previous points |
 | Encoder widths / hidden size | 24, 64, 128 / 128; group norm |
 | Train / collector / diagnostic batch | 2 / 1 / 1 |
@@ -64,12 +64,13 @@ match, then starts a new optimizer. Collection, evaluation and inference load EM
    and midpoint stages. Only noisy future tokens emit lateral velocities;
    forward coordinates remain pinned to their planes. Missing history tokens
    are excluded from attention.
-3. **Flow objective.** A weighted observed-history tangent sets the prior mean:
-   forward distance times lateral slope, clamped inside the crop with space for
-   the observation stencil. Unmeasured, backward and nearly perpendicular
-   tangents fall back to straight ahead. Per-plane lateral residual standard
-   deviations are fitted once from training-loader states, excluding unknown
-   targets and departed states, and floored at one trace voxel. Training uses
+3. **Flow objective.** The prior mean is straight ahead along the trace
+   heading at the fixed forward planes. The frame already follows the trace,
+   and on the training data a backward tangent extrapolated forward lowered no
+   per-plane residual scale while raising the near-plane ones (see
+   `EXPERIMENTS.md`). Per-plane lateral residual standard deviations are fitted
+   once from training-loader states, excluding unknown, departed and censored
+   targets, and floored at one trace voxel. Training uses
    `y_1 = (x_1 - mu) / sigma`, `y_0 ~ N(0, I)`,
    `y_t = (1-t) y_0 + t y_1`, and MSE against `y_1 - y_0` over known lateral
    coordinates. Times are stratified as `(d + uniform()) / draws` per state.
@@ -77,9 +78,13 @@ match, then starts a new optimizer. Collection, evaluation and inference load EM
    paths use `x = mu + sigma * y`. Partial annotations retain their existing
    behavior: unknown future tokens are excluded from attention keys and loss;
    all observation tokens stay valid. Sampling generates the full horizon.
-   Crop exits do not censor flow targets or dense scorer labels. Departed states
-   provide no flow supervision but retain confidence negatives. GT history is
-   used only for diagnostics.
+   **Crop censoring.** A target is supervised only while every annotated plane
+   up to it lies within the crop half-width minus `--flow-stencil-radius`; once
+   the curve leaves that extent, later crossings are censored even if it
+   re-enters. Scale calibration applies the same rule. Dense scorer labels are
+   unaffected. `flow_censored_fraction` reports the censored share of annotated
+   tokens. Departed states provide no flow supervision but retain confidence
+   negatives. GT history is used only for diagnostics.
 4. **Candidate support.** Every generated sample is scored, including coincident
    paths. Support is the fraction of generated samples within `--support-radius`
    RMS lateral distance over the first four planes. Generated candidates exclude
@@ -103,10 +108,13 @@ If no connection is eligible, the trace stops with `recovery_limit`. The limit
 is saved in the model configuration. Within this recovery segment, departure
 from GT is permitted; dense GT agreement starts at the first prediction.
 
-Total loss is `--flow-weight` × flow + ranking + prefix confidence. Useful
-measurements include:
+Total loss is `--flow-weight` × flow + ranking + prefix confidence. Detailed
+metrics are computed only every `--log-every` steps and on the final step;
+other steps compute the same loss without diagnostic scalar extraction.
+Useful measurements include:
 
-- `flow`, `flow_known_fraction`: future velocity loss and annotated fraction.
+- `flow`, `flow_known_fraction`, `flow_censored_fraction`: future velocity loss,
+  supervised fraction, and the censored share of annotated tokens.
 - `observed_current_error`, `observed_history_error`,
   `observed_tangent_error_deg`: input drift diagnostics, not learned cleaning.
 - `candidate_support`, `selected_support`: sample agreement; low agreement
@@ -132,6 +140,20 @@ sampler per `trace()` call using `TraceParams.seed`. Reproduction requires the
 same seeds and batch composition. Compare averaged held-out measurements and
 rollout precision/coverage, not isolated batch-two recall values. Validation
 thresholds from older architectures do not calibrate this one.
+
+## Validation
+
+From this directory, using an environment with the project dependencies and pytest:
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=../../.. python -m pytest tests -q -o cache_dir=/tmp/fiber-flow-pytest-cache
+```
+
+The focused tests cover normalized flow, masked scale calibration, midpoint
+convergence, observation tokens, support features, group-norm train/eval behavior,
+EMA loading/diagnostics, and a synthetic curved-path learning run. CUDA-specific
+recovery tests skip when CUDA is unavailable. Production throughput and held-out
+rollout quality require a fresh training run.
 
 ## Ground truth
 
@@ -214,7 +236,7 @@ From the `vesuvius/` project root:
 FF=src/vesuvius/neural_tracing/fiber_follow
 .venv/bin/python "$FF/scripts/eval_ckpt.py" field --seeds-only --rebuild-seeds
 .venv/bin/python "$FF/scripts/eval_ckpt.py" \
-  "$FF/output/ct0_presence_flow_v10/last.pt" --tag presence_flow_v9 \
+  "$FF/output/ct0_presence_flow_v10/last.pt" --tag presence_flow_v10 \
   --history-audit --batch 1 --params '{"confidence":0.7,"n_commit":4}'
 ```
 

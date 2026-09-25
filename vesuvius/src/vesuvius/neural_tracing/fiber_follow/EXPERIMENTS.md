@@ -11,9 +11,9 @@ Status as of 2026-09-24. See `README.md` for file layout and commands.
 
 ## Normalized future flow and all-sample scoring (v10, 2026-09-24)
 
-The current implementation adds per-plane residual standardization around an
-observed-history tangent prior. Scales are fitted from 2,048 training-loader
-states, floored at one trace voxel, and saved with the run. Training uses 32
+The current implementation adds per-plane residual standardization around a
+straight-ahead prior. Scales are fitted from 2,048 training-loader states,
+floored at one trace voxel, and saved with the run. Training uses 32
 stratified time/noise draws, group norm, zero transformer dropout, and a
 1,000-step warmup. Every future plane has an always-valid image observation
 at the prior mean, with a 3 × 3 lateral patch at configurable voxel pitch.
@@ -22,13 +22,73 @@ The sampler uses four explicit midpoint steps (eight field evaluations).
 All 16 generated paths are scored. Mode selection and its distinct-index
 fallback are removed. Generated, teacher and replay candidates all carry
 measured sample support; generated paths exclude their own support vote.
-The ranking objective and partial-annotation behavior are unchanged. Crop
-censoring is not enabled. Live weights train the scorer; an EMA ramps to decay
-0.999 and supplies collection, diagnostic and evaluation weights. Checkpoints
-save both copies. No previous-architecture loading path is provided.
+The ranking objective and partial-annotation behavior are unchanged. Live
+weights train the scorer; an EMA ramps to decay 0.999 and supplies collection,
+diagnostic and evaluation weights. Checkpoints save both copies. No
+previous-architecture loading path is provided.
+
+**Prior mean and crop censoring (same day).** The first v10 draft set the prior
+mean by extrapolating a weighted observed-history tangent. Measured on 3,000
+loader states under the launcher settings, per-axis residual RMS at planes
+1/4/8/16/32/64 was 1.05/1.11/1.75/4.35/9.41/17.37 straight ahead and
+1.08/1.46/2.36/4.80/9.63/17.04 with the tangent mean: no gain at the far
+planes and extra spread at planes 2 to 16. The lateral slope of the backward
+tangent had median 0.18 and 0.47 at the 90th percentile, where the far-plane
+mean hit the crop-edge clamp. Wobble was not the cause; the same held with
+wobble off. The prior mean is now straight ahead in the frame.
+
+Prefix crop censoring is now enabled in the flow loss and in scale
+calibration: known targets outside the crop half-width minus the flow patch
+radius were about 10% of plane-64 targets and carried about 57% of that
+plane's second moment. Restricting the residual to observable targets lowers
+the far-plane RMS from about 17 to 11.8; the near planes are unchanged. Once
+an annotated plane is outside that extent, every later plane is censored even
+if the curve re-enters. `flow_censored_fraction` and `censored_counts` (in the
+calibration record) report the effect. Probe: session scratchpad
+`sigma_probe.py`; the numbers are loader statistics, not model results.
 
 This is an implementation change, not a measured production-quality gain;
 held-out rollout and GPU throughput comparisons still require a fresh run.
+
+### Metrics only on logging steps and 16 training draws (2026-09-24)
+
+The training loop now requests detailed loss metrics only on `--log-every`
+steps and the final step. Other steps use the same loss with no diagnostic
+candidate selection or scalar extraction. Direct `loss_fn` callers still
+receive metrics by default. Model, CLI and launcher defaults now use 16 flow
+draws instead of 32; the number of sampled candidates and midpoint steps stay
+at 16 and 4. Fewer draws change the stochastic gradient estimate and random
+number consumption, so the resulting training trajectory is not identical.
+Existing processes retain their loaded code and configuration.
+
+CPU loss-only benchmark: seed 73, single thread, batch-one curved synthetic
+fixture from `tests/test_future_flow.py` (8 future planes, 6 generated paths,
+5 teachers and 6 masked replay paths), 20 warmups and 200 timed calls. Model
+forward and backward, data loading, and the draw-count change are excluded.
+The CPU profiler found 52 `aten::item` calls with metrics, zero without; after
+the change, logged calls remain dominated by tensor reductions and indexing.
+
+| Loss call | Mean ms | p50 ms | p95 ms |
+| --- | ---: | ---: | ---: |
+| Before, always computing metrics | 0.958 | 0.958 | 0.966 |
+| After, logging step | 0.958 | 0.959 | 0.968 |
+| After, non-logging step | 0.192 | 0.191 | 0.197 |
+
+Command: `OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=../../.. python /tmp/bench_fiber_metrics.py`
+(session scratch benchmark). This is not an end-to-end GPU speed measurement;
+CUDA was unavailable in the execution environment.
+
+Validation: 52 passed, 11 CUDA-only tests skipped. Regression tests require
+bit-identical losses and parameter gradients with metrics enabled/disabled for
+known, unknown and off-track targets, and verify interval/final-step logging
+through the training entrypoint. Run from this directory:
+
+```bash
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=../../.. \
+MPLCONFIGDIR=/tmp/fiber-metrics-mpl NUMBA_CACHE_DIR=/tmp/fiber-metrics-numba \
+python -m pytest tests -q -o cache_dir=/tmp/fiber-metrics-pytest-cache
+```
 
 ## Future-only flow with fixed observed history (2026-09-24)
 

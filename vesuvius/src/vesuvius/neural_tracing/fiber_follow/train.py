@@ -17,7 +17,7 @@ from vesuvius.neural_tracing.fiber_follow.data import (
     FollowDataset, OnPolicyStates, SampleConfig, ZBand, load_fibers, split_fibers, DATA_POLICY, fiber_manifest,
 )
 from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec
-from vesuvius.neural_tracing.fiber_follow.model import ARCHITECTURE, FollowNet, FollowNetConfig, prepare_model, prior_mean
+from vesuvius.neural_tracing.fiber_follow.model import ARCHITECTURE, FollowNet, FollowNetConfig, flow_targets, prepare_model, prior_mean
 from vesuvius.neural_tracing.fiber_follow.online import OnlineCollector
 from vesuvius.neural_tracing.fiber_follow.runloop import (
     RunLog, lr_at, optimizer_step, prepare_run_dir,
@@ -48,20 +48,27 @@ def load_checkpoint(path, device='cuda'):
 
 @torch.no_grad()
 def fit_flow_sigma(batches, cfg, states):
-    """Fit masked residual standard deviations using only the training loader."""
+    """Fit residual standard deviations from the training loader alone.
+
+    Uses exactly the tokens the flow loss supervises: annotated, not departed,
+    and not crop-censored (``flow_targets``).
+    """
     count = torch.zeros(cfg.n_future, dtype=torch.float64)
+    censored_count = torch.zeros_like(count)
     total = torch.zeros(cfg.n_future, 2, dtype=torch.float64)
     square = torch.zeros_like(total)
     seen = 0
     while seen < states:
         batch = next(batches)
         n = min(len(batch['hist']), states-seen)
+        x1, token_mask, censored = flow_targets({k: batch[k][:n] for k in ('plane_ab', 'plane_mask', 'offtrack')}, cfg)
         mu = prior_mean(batch['hist'][:n], batch['hmask'][:n], cfg)[..., :2].double()
-        known = batch['plane_mask'][:n].bool() & ~batch['offtrack'][:n, None].bool()
-        residual = torch.where(known[..., None], batch['plane_ab'][:n].double()-mu, 0.)
+        known = token_mask.bool()
+        residual = torch.where(known[..., None], x1[..., :2].double()-mu, 0.)
         if not torch.isfinite(residual).all():
             raise ValueError('Non-finite annotated residual during flow scale calibration')
         count += known.sum(0)
+        censored_count += censored.sum(0)
         total += residual.sum(0)
         square += residual.square().sum(0)
         seen += n
@@ -72,6 +79,7 @@ def fit_flow_sigma(batches, cfg, states):
     std = (square / count[:, None] - mean.square()).clamp_min(0).sqrt()
     sigma = std.clamp_min(1.)
     return tuple(map(tuple, sigma.tolist())), dict(states=seen, known_counts=count.long().tolist(),
+                                                  censored_counts=censored_count.long().tolist(),
                                                   residual_mean=mean.tolist(), residual_std=std.tolist())
 
 
@@ -126,7 +134,7 @@ def main(argv=None):
     ap.add_argument('--flow-heads', type=int, default=4)
     ap.add_argument('--flow-steps', type=int, default=4, help='Midpoint steps from the prior; two flow evaluations per step')
     ap.add_argument('--flow-samples', type=int, default=16, help='Future samples per state; every sample is scored')
-    ap.add_argument('--flow-draws', type=int, default=32, help='(time, noise) draws per example in the flow loss')
+    ap.add_argument('--flow-draws', type=int, default=16, help='(time, noise) draws per example in the flow loss')
     ap.add_argument('--flow-calibration-states', type=int, default=2048, help='Training states used once to fit residual scales')
     ap.add_argument('--flow-stencil-radius', type=float, default=2., help='3x3 flow patch pitch/radius in trace-grid voxels')
     ap.add_argument('--support-radius', type=float, default=1.5, help='RMS lateral radius for candidate sample support')
@@ -271,6 +279,7 @@ def main(argv=None):
     replay_seen = 0
     try:
         for step in range(1, args.steps+1):
+            log_step = step % args.log_every == 0 or step == args.steps
             event = collector.poll()
             if event:
                 record(dict(step=step, **event))
@@ -287,10 +296,10 @@ def main(argv=None):
                 output = model(batch['x'].float(), batch['hist'], batch['hmask'], extras, targets=batch)
             loss, metrics = loss_fn(output, batch, model.cfg, args.tolerance, args.rank_weight,
                                     args.confidence_weight, args.flow_weight, args.rank_temperature,
-                                    confidence_threshold=args.confidence)
+                                    confidence_threshold=args.confidence, compute_metrics=log_step)
             optimizer_step(model, opt, loss, step, lr)
             update_ema(ema, model, ema_updates+step, args.ema_decay)
-            if step % args.log_every == 0 or step == args.steps:
+            if log_step:
                 record(dict(step=step, loss=loss.item(), lr=lr, replay_samples_seen=replay_seen,
                             fresh_fraction=(batch['source'] == 0).float().mean().item(),
                             replay_fraction=(batch['source'] == 1).float().mean().item(),

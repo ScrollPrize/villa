@@ -84,7 +84,8 @@ def metric_fixture(device):
     out = dict(candidates=candidates, samples=candidates,
                ranks=torch.tensor([[10., 1.]], device=device), confidence=confidence,
                confidence_logits=torch.logit(confidence), candidate_support=torch.ones(1, 2, device=device),
-               flow_loss=torch.zeros((), device=device), flow_known_fraction=torch.ones((), device=device))
+               flow_loss=torch.zeros((), device=device), flow_known_fraction=torch.ones((), device=device),
+               flow_censored_fraction=torch.zeros((), device=device))
     return cfg, out, batch(device)
 
 

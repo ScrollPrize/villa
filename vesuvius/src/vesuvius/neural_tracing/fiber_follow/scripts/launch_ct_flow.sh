@@ -11,6 +11,7 @@ bash "$FF/scripts/launch.sh" "$name" \
     --n-future 64 --future-step 1 --recent-history-points 32 \
     --angle-sigmas 2 5 10 \
     --history-render segments --history-sigma 0.35 --history-jitter 0 \
-    --flow-samples 16 --flow-draws 32 --warmup 1000 --norm group --widths 24 64 128 --hidden 128 \
+    --flow-samples 16 --flow-draws 16 --flow-steps 4 --warmup 1000 --norm group \
+    --widths 24 64 128 --hidden 128 \
     --steps 50000 --batch 2 --dagger-batch 1 --workers 4 \
     --ckpt-every 500 --diag-every 500 --diag-seeds 32 --diag-batch 1 "$@"

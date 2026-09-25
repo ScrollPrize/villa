@@ -23,7 +23,8 @@ def config():
     return FollowNetConfig(in_channels=3, depth=16, width=9, behind=6, spacing=.5,
                            widths=(8, 16), hidden=16, n_future=4, future_step=1.,
                            hist_points=4, hist_stride=2, recent_history_points=4, flow_sigma=((1., 1.),)*4,
-                           flow_layers=1, flow_heads=2, flow_steps=2, flow_samples=4, flow_draws=2, norm='group')
+                           flow_stencil_radius=.5, flow_layers=1, flow_heads=2, flow_steps=2, flow_samples=4,
+                           flow_draws=2, norm='group')
 
 
 def array_at(path, values):
@@ -298,36 +299,62 @@ def test_training_rollout_checkpoint_and_audit_share_inputs(tmp_path):
     assert len(paths) == len(reasons) == 1
 
 
-def test_training_entrypoint_writes_presence_history_run(tmp_path, monkeypatch):
+@pytest.mark.parametrize('log_every', [1, 2])
+def test_training_entrypoint_writes_presence_history_run(tmp_path, monkeypatch, log_every):
     from vesuvius.neural_tracing.fiber_follow import train
+    from vesuvius.neural_tracing.fiber_follow import diag, evaluate
     vol = volume(tmp_path)
     points = np.array([[float(x), 8., 8.] for x in range(16)])
     fiber = D.TracedFiber('line', points, arclength(points), '')
     monkeypatch.setattr(train, 'load_fibers', lambda *a, **kw: [fiber])
+    # Synthetic plumbing check: supply a diagnostic seed without a real holdout.
+    monkeypatch.setattr(train, 'split_fibers', lambda *a: ([fiber], [fiber]))
+    monkeypatch.setattr(evaluate, 'make_seeds', lambda *a, **kw: [dict(pos=points[8], heading=np.array([1., 0., 0.]))])
+    diagnostic_models = []
+    def check_diagnostic(tracer, *args, **kwargs):
+        assert not tracer.model.training
+        assert all(not p.requires_grad for p in tracer.model.parameters())
+        diagnostic_models.append(tracer.model)
+        return dict(coverage_mean=0., diverged=0, length_precision=0., unknown_length_fraction=0.)
+    monkeypatch.setattr(diag, 'rollout_diag', check_diagnostic)
+    monkeypatch.setattr(diag, 'plot_batch', lambda *a, **kw: None)
+    monkeypatch.setattr(diag, 'plot_curves', lambda *a, **kw: None)
+    metric_steps = []
+    original_loss = train.loss_fn
+    def check_metric_schedule(*args, **kwargs):
+        metric_steps.append(kwargs['compute_metrics'])
+        return original_loss(*args, **kwargs)
+    monkeypatch.setattr(train, 'loss_fn', check_metric_schedule)
     args = [
         '--fiber-zarrs', vol.spec.fiber_zarr_dir, '--fibers', str(tmp_path), '--ct', vol.spec.ct_zarr,
         '--ct-level', '0', '--ct-grid-scale', '4', '--inputs', 'ct+presence',
-        '--out-root', str(tmp_path / 'runs'), '--name', 'smoke', '--steps', '2', '--batch', '2',
-        '--device', 'cpu', '--workers', '0', '--dagger-every', '0', '--diag-every', '0',
-        '--log-every', '1', '--ckpt-every', '2', '--crop-depth', '16', '--crop-width', '9',
+        '--out-root', str(tmp_path / 'runs'), '--name', 'smoke', '--steps', '3', '--batch', '2',
+        '--device', 'cpu', '--workers', '0', '--dagger-every', '0', '--diag-every', '1',
+        '--log-every', str(log_every), '--ckpt-every', '2', '--crop-depth', '16', '--crop-width', '9',
         '--crop-behind', '6', '--crop-spacing', '.5', '--n-history', '8', '--hist-points', '4',
         '--hist-stride', '2', '--recent-history-points', '4', '--flow-layers', '1', '--flow-heads', '2',
-        '--flow-steps', '2', '--flow-samples', '4', '--flow-draws', '2',
+        '--flow-steps', '2', '--flow-samples', '4', '--flow-draws', '2', '--flow-stencil-radius', '.5',
         '--n-future', '4', '--future-step', '1',
         '--flow-calibration-states', '32', '--widths', '8', '16', '--hidden', '16',
         '--norm', 'group', '--history-render', 'segments', '--history-jitter', '0']
     path = train.main(args)
     model, _, _, spec, ck = load_checkpoint(path, 'cpu')
-    assert spec.mode == 'ct+presence' and model.cfg.in_channels == 3 and ck['step'] == 2
+    assert spec.mode == 'ct+presence' and model.cfg.in_channels == 3 and ck['step'] == 3
+    expected_steps = [step for step in range(1, 4) if step % log_every == 0 or step == 3]
+    assert metric_steps == [step in expected_steps for step in range(1, 4)]
     records = [json.loads(line) for line in (tmp_path / 'runs/smoke/log.jsonl').read_text().splitlines()]
     training = [r for r in records if 'loss' in r]
-    assert len(training) == 2 and all(np.isfinite(r['loss']) for r in training)
+    assert [r['step'] for r in training] == expected_steps
+    assert all(np.isfinite(r['loss']) for r in training)
     assert all('observed_tangent_error_deg_count' in r for r in training)
-    assert ck['ema_updates'] == 2 and ck['flow_calibration']['states'] == 32
+    assert ck['ema_updates'] == 3 and ck['flow_calibration']['states'] == 32
     assert len(ck['model_cfg']['flow_sigma']) == 4
     config_json = json.loads((tmp_path / 'runs/smoke/config.json').read_text())
     assert config_json['model_cfg']['flow_sigma'] == [list(row) for row in model.cfg.flow_sigma]
     assert any(not torch.equal(ck['model'][k], ck['ema'][k]) for k in ck['model'])
+    assert len(diagnostic_models) == 3
+    for key, value in diagnostic_models[-1].state_dict().items():
+        torch.testing.assert_close(value, ck['ema'][key])
     for key, value in model.state_dict().items():
         torch.testing.assert_close(value, ck['ema'][key])
     # Initializing a new optimizer restores live weights and both calibrated scales
@@ -343,7 +370,8 @@ def test_training_entrypoint_writes_presence_history_run(tmp_path, monkeypatch):
     monkeypatch.setattr(train, 'optimizer_step', check_live_weights)
     initialized = train.main(args+['--name', 'initialized', '--steps', '1', '--init', path])
     _, _, _, _, restored = load_checkpoint(initialized, 'cpu')
-    assert checked and restored['ema_updates'] == 3
+    assert checked and restored['ema_updates'] == 4
+    assert metric_steps[-1]  # Final-step metrics even when log_every exceeds steps.
     assert restored['flow_calibration'] == ck['flow_calibration']
 
 
