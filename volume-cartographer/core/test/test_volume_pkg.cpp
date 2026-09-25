@@ -460,6 +460,51 @@ TEST_CASE("VolumePkg: selected_lasagna_dataset round-trips through save/load")
     fs::remove_all(d);
 }
 
+TEST_CASE("VolumePkg: selected_raw_scan round-trips through save/load and is absent when unset")
+{
+    auto d = tmpDir("raw_scan_roundtrip");
+    auto jsonPath = d / "project.json";
+    {
+        auto p = VolumePkg::newEmpty();
+        CHECK(p->selectedRawScan().empty());
+        p->save(jsonPath);
+        const auto written = utils::Json::parse_file(jsonPath);
+        CHECK_FALSE(written.contains("selected_raw_scan"));
+        p->setSelectedRawScan("20260319101107");
+        CHECK(p->selectedRawScan() == "20260319101107");
+        p->save(jsonPath);
+    }
+    auto loaded = VolumePkg::load(jsonPath);
+    REQUIRE(loaded);
+    CHECK(loaded->selectedRawScan() == "20260319101107");
+    loaded->clearSelectedRawScan();
+    CHECK(loaded->selectedRawScan().empty());
+    loaded->save(jsonPath);
+    CHECK_FALSE(utils::Json::parse_file(jsonPath).contains("selected_raw_scan"));
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg: selected_surface_volume round-trips and is absent when unset")
+{
+    auto d = tmpDir("surface_roundtrip");
+    auto jsonPath = d / "project.json";
+    {
+        auto p = VolumePkg::newEmpty();
+        CHECK(p->selectedSurfaceVolume().empty());
+        p->save(jsonPath);
+        CHECK_FALSE(utils::Json::parse_file(jsonPath).contains("selected_surface_volume"));
+        p->setSelectedSurfaceVolume("surface-m7");
+        p->save(jsonPath);
+    }
+    auto loaded = VolumePkg::load(jsonPath);
+    REQUIRE(loaded);
+    CHECK(loaded->selectedSurfaceVolume() == "surface-m7");
+    loaded->clearSelectedSurfaceVolume();
+    loaded->save(jsonPath);
+    CHECK_FALSE(utils::Json::parse_file(jsonPath).contains("selected_surface_volume"));
+    fs::remove_all(d);
+}
+
 TEST_CASE("VolumePkg: selectedLasagnaDatasetPath resolves relative to project file")
 {
     auto d = tmpDir("lasagna_relative");
@@ -936,5 +981,40 @@ TEST_CASE("VolumePkg canonicalizes virtual locators and deduplicates explicit ba
     CHECK(pkg->volumeEntries()[0].location == "s3://bucket/source.zarr");
     CHECK(pkg->volumeEntries()[1].location ==
           "https://bucket.s3.us-east-1.amazonaws.com/source.zarr#vc-base-scale=2");
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg: a rewrite keeps top-level fields it does not model and drops cleared optionals")
+{
+    auto d = tmpDir("unknown_fields");
+    auto jsonPath = d / "project.json";
+    {
+        std::ofstream out(jsonPath);
+        out << R"({
+  "name": "p",
+  "version": 1,
+  "volumes": ["/data/scan.zarr"],
+  "remote_cache_root": "/nvme/cache",
+  "some_tool": {"nested": [1, 2, 3]},
+  "selected_lasagna_dataset": "/data/a.lasagna.json",
+  "fiber_inference_datasets": [{"location": "/data/f.lasagna.json", "tags": []}]
+})";
+    }
+    auto loaded = VolumePkg::load(jsonPath, vc::project::LoadOptions{.deferResolution = true});
+    REQUIRE(loaded);
+    loaded->setSelectedRawScan("20260319101107");
+    loaded->clearSelectedLasagnaDataset();
+    loaded->save(jsonPath);
+    const auto written = utils::Json::parse_file(jsonPath);
+    CHECK(written.value("remote_cache_root", std::string{}) == "/nvme/cache");
+    REQUIRE(written.contains("some_tool"));
+    CHECK(written.at("some_tool").at("nested").size() == 3);
+    CHECK(written.value("selected_raw_scan", std::string{}) == "20260319101107");
+    CHECK_FALSE(written.contains("selected_lasagna_dataset"));
+    // The legacy collection was merged into lasagna_datasets and is not written back.
+    CHECK_FALSE(written.contains("fiber_inference_datasets"));
+    REQUIRE(written.contains("lasagna_datasets"));
+    CHECK(written.at("lasagna_datasets").size() == 1);
+    CHECK(written.at("volumes").size() == 1);
     fs::remove_all(d);
 }

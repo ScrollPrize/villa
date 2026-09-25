@@ -16,6 +16,22 @@ VC projects store both regular and fiber inference manifests in
 regular Lasagna data. `selected_lasagna_dataset` and
 `selected_fiber_inference_dataset` independently select each role.
 
+`selected_raw_scan` names the scan the line annotation workspace works on: the
+loaded volume id of the scan's level-0 entry, or, for open-data projects, the
+scan id its downsampled twins share (`vc-open-data-volume-id`). Lasagna and
+fiber datasets are grouped under the scan they were published against; the
+workspace greys out datasets of other scans and lists only the selected scan's
+volumes. Absent, the workspace derives a default from the selected fiber
+dataset, then the Lasagna dataset, then the scan with the most derived data.
+
+`selected_surface_volume` is the loaded volume id of the surface prediction the
+workspace lists for the selected scan (one at a time). Absent, the newest
+prediction of that scan is used.
+
+Top-level fields VC3D does not model are carried over unchanged when it
+rewrites the file, so another tool's fields survive a selection change made in
+VC3D. Fields inside an entry other than `location` and `tags` are not.
+
 Older project files may contain `fiber_inference_datasets`. The reader adds the
 fiber role tag and merges those entries into `lasagna_datasets`; subsequent
 writes use only the canonical collection. The old field is a project-schema

@@ -1496,6 +1496,52 @@ void VolumePkg::clearSelectedFiberInferenceDataset()
     persistProjectState();
 }
 
+std::string VolumePkg::selectedRawScan() const
+{
+    return selectedRawScan_.value_or(std::string{});
+}
+
+void VolumePkg::setSelectedRawScan(std::string scanKey)
+{
+    if (scanKey.empty()) {
+        clearSelectedRawScan();
+        return;
+    }
+    if (selectedRawScan_ && *selectedRawScan_ == scanKey) return;
+    selectedRawScan_ = std::move(scanKey);
+    persistProjectState();
+}
+
+void VolumePkg::clearSelectedRawScan()
+{
+    if (!selectedRawScan_) return;
+    selectedRawScan_.reset();
+    persistProjectState();
+}
+
+std::string VolumePkg::selectedSurfaceVolume() const
+{
+    return selectedSurfaceVolume_.value_or(std::string{});
+}
+
+void VolumePkg::setSelectedSurfaceVolume(std::string volumeId)
+{
+    if (volumeId.empty()) {
+        clearSelectedSurfaceVolume();
+        return;
+    }
+    if (selectedSurfaceVolume_ && *selectedSurfaceVolume_ == volumeId) return;
+    selectedSurfaceVolume_ = std::move(volumeId);
+    persistProjectState();
+}
+
+void VolumePkg::clearSelectedSurfaceVolume()
+{
+    if (!selectedSurfaceVolume_) return;
+    selectedSurfaceVolume_.reset();
+    persistProjectState();
+}
+
 fs::path VolumePkg::selectedFiberInferenceDatasetPath() const
 {
     if (!selectedFiberInferenceDataset_) return {};
@@ -2232,7 +2278,18 @@ void VolumePkg::resolveNormalGridEntry(const vc::project::Entry& e)
 
 utils::Json VolumePkg::toJson() const
 {
-    auto j = utils::Json::object();
+    // Start from the document as read: fields this class does not model are
+    // carried over unchanged, the modelled ones are rewritten below, and an
+    // optional that was cleared is removed rather than left stale.
+    auto j = sourceJson_.is_object() ? sourceJson_ : utils::Json::object();
+    for (const char* legacy : {"fiber_inference_datasets"}) {
+        if (j.contains(legacy)) j.erase(legacy);
+    }
+    for (const char* optional :
+         {"output_segments", "selected_lasagna_dataset", "selected_fiber_inference_dataset",
+          "selected_raw_scan", "selected_surface_volume", "umbilicus"}) {
+        if (j.contains(optional)) j.erase(optional);
+    }
     j["name"] = name_;
     j["version"] = version_;
     j["volumes"] = entriesToJson(volumes_);
@@ -2242,12 +2299,15 @@ utils::Json VolumePkg::toJson() const
     if (outputSegments_) j["output_segments"] = *outputSegments_;
     if (selectedLasagnaDataset_) j["selected_lasagna_dataset"] = *selectedLasagnaDataset_;
     if (selectedFiberInferenceDataset_) j["selected_fiber_inference_dataset"] = *selectedFiberInferenceDataset_;
+    if (selectedRawScan_) j["selected_raw_scan"] = *selectedRawScan_;
+    if (selectedSurfaceVolume_) j["selected_surface_volume"] = *selectedSurfaceVolume_;
     if (umbilicus_) j["umbilicus"] = *umbilicus_;
     return j;
 }
 
 void VolumePkg::fromJson(const utils::Json& j)
 {
+    sourceJson_ = j.is_object() ? j : utils::Json::object();
     name_ = j.value("name", std::string("Untitled"));
     version_ = j.value("version", 1);
     if (j.contains("volumes")) volumes_ = entriesFromJson(j.at("volumes"));
@@ -2282,6 +2342,14 @@ void VolumePkg::fromJson(const utils::Json& j)
     if (j.contains("selected_fiber_inference_dataset")) {
         selectedFiberInferenceDataset_ = j.at("selected_fiber_inference_dataset").get_string();
         if (selectedFiberInferenceDataset_->empty()) selectedFiberInferenceDataset_.reset();
+    }
+    if (j.contains("selected_raw_scan")) {
+        selectedRawScan_ = j.at("selected_raw_scan").get_string();
+        if (selectedRawScan_->empty()) selectedRawScan_.reset();
+    }
+    if (j.contains("selected_surface_volume")) {
+        selectedSurfaceVolume_ = j.at("selected_surface_volume").get_string();
+        if (selectedSurfaceVolume_->empty()) selectedSurfaceVolume_.reset();
     }
     if (j.contains("umbilicus")) {
         umbilicus_ = j.at("umbilicus").get_string();
