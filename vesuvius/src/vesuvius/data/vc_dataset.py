@@ -46,6 +46,8 @@ class VCDataset(Dataset):
             skip_empty_patches: bool = True,  # Whether to skip empty (homogeneous) patches
             anon: bool = False,  # Use anonymous (unsigned) requests for S3 input paths
             read_retries: int = 4,  # Attempts per read, forwarded to Volume
+            cache: bool = False,
+            cache_size_mb: int = 256,
             ):
         """
         Dataset for nnUNet inference using the Volume class for data access and preprocessing.
@@ -87,6 +89,10 @@ class VCDataset(Dataset):
             read_retries: Attempts per read, forwarded to Volume (default 4). Transient
                 remote failures are retried with exponential backoff so one dropped
                 connection does not abort a long streaming run. Pass 1 to disable.
+            cache: Keep an in-memory LRU cache of fetched chunks, forwarded to Volume.
+                Overlapping patches then reuse chunks instead of fetching them again.
+                Requires zarr 3.
+            cache_size_mb: Size bound of that cache in megabytes (default 256).
         """
         self.input_path = input_path
         self.input_format = input_format # Keep for informational purposes
@@ -233,6 +239,8 @@ class VCDataset(Dataset):
                 path=use_path,
                 anon=self.anon,
                 read_retries=read_retries,
+                cache=cache,
+                cache_size_mb=cache_size_mb,
             )
 
             # Get shape and dtype from the primary resolution level (0)
