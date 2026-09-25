@@ -86,6 +86,27 @@ a 6,000-voxel cap, threshold .7, and eight exploration calls. Diagnostics use th
 original monitor fibers at thresholds .5 and .85. Images show observed history,
 GT, the final curve, and successive denoising updates.
 
+Terminal logs show readable loss, throughput, confidence and refinement tables;
+`log.jsonl` retains one complete JSON record per line for analysis. On logging
+updates (`--log-every`, default 50, and the final update), `refinement.by_drift`
+records first-four-point lateral Euclidean error at initialization and after
+each midpoint update. It reuses the detached training rollout with no extra
+model evaluations, and measures the full effective batch before the optimizer
+update. These are sampled training states, not a fixed validation set.
+
+Drift bands are `<1`, `1-1.5`, `1.5-2`, `2-3.5`, `>=3.5`, plus `unknown` and
+an `all` aggregate. Drift uses the current position's original-fiber GT
+correspondence. Departed states are excluded; error uses the same annotated,
+crop-observable crossing mask at every step. Each band stores `state_count`,
+`known_point_count`, and per-step `error_sum`, `point_count`, `error_mean`, and
+`nonfinite_point_count`. Empty means are JSON null (terminal `--`). Pool error
+sums and point counts across records before dividing; nonfinite predictions
+are excluded from those sums/counts and reported separately. `improved_count`,
+`worsened_count` and `comparison_count` have one entry per update relative to
+the preceding curve, using per-state mean error on identical known points and
+a 1e-6 voxel change tolerance. States with nonfinite errors in either curve
+are excluded from that comparison. GT history is used only for diagnostics.
+
 ## Evaluation
 
 The frozen manifest retains the original 32 monitor fibers and 48 assessment

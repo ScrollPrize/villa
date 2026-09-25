@@ -290,11 +290,13 @@ class FollowNet(SpatialEncoder):
         return y, curves
 
     @torch.no_grad()
-    def generate_training_curve(self,x,hist,hmask):
+    def generate_training_curve(self,x,hist,hmask,*,return_steps=False):
+        """Detached rollout, optionally retaining its initial curve and updates."""
         features,context,deep = self.encode(x,hist,hmask,return_deep=True)
         fixed = self.flow.conditioning(features,deep,hist,hmask,self.sampling_grid)
-        y,_ = self.refine(features,context,fixed)
-        return self.flow.to_voxels(y,fixed['mu'])[:,0]
+        y,curves = self.refine(features,context,fixed,return_steps=return_steps)
+        points = self.flow.to_voxels(y,fixed['mu'])[:,0]
+        return (points,torch.stack(curves,1)) if return_steps else points
 
     def training_forward(self,x,hist,hmask,targets,points):
         return self._forward(x,hist,hmask,targets=targets,training_points=points.detach())

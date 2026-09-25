@@ -27,16 +27,17 @@ def prepare_run_dir(out_root, name) -> Path:
 
 
 class RunLog:
-    """Appends one JSON object per line to ``log.jsonl`` and echoes it."""
+    """Append JSON lines; optionally format a separate terminal representation."""
 
-    def __init__(self, path):
+    def __init__(self, path, *, formatter=None):
         self._file = Path(path).open('a')
+        self._formatter = formatter
 
     def record(self, values: dict):
         line = json.dumps(values)
-        print(line, flush=True)
         self._file.write(line + '\n')
         self._file.flush()
+        print(self._formatter(values) if self._formatter else line, flush=True)
 
     def close(self):
         self._file.close()

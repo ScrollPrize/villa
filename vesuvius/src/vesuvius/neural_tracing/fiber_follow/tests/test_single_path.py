@@ -212,12 +212,16 @@ def test_accumulation_steps_once_and_ema_matches_effective_batch(monkeypatch):
         out['flow_loss']=(out['confidence_logits'].square()*mask).sum()/mask.sum().clamp_min(1)
         out['flow_known_count']=mask.sum()
         return out
-    monkeypatch.setattr(FollowNet,'generate_training_curve',lambda self,x,hist,hmask:forward(self,x,hist,hmask)['points'])
+    def generate(self,x,hist,hmask,*,return_steps=False):
+        points=forward(self,x,hist,hmask)['points']
+        return (points,points[:,None].expand(-1,cfg.flow_steps+1,-1,-1)) if return_steps else points
+    monkeypatch.setattr(FollowNet,'generate_training_curve',generate)
     monkeypatch.setattr(FollowNet,'training_forward',training_forward)
     oa=torch.optim.SGD(a.parameters(),lr=.01);ob=torch.optim.SGD(b.parameters(),lr=.01)
-    optimizer_update(a,ea,oa,[data],2000,.01,device='cpu')
+    _,stats_a,_=optimizer_update(a,ea,oa,[data],2000,.01,device='cpu')
     micro=[{k:v[i:i+2] for k,v in data.items()} for i in range(0,8,2)]
-    optimizer_update(b,eb,ob,micro,2000,.01,device='cpu')
+    _,stats_b,_=optimizer_update(b,eb,ob,micro,2000,.01,device='cpu')
+    assert stats_a['refinement']==stats_b['refinement']
     for x,y in zip(a.parameters(),b.parameters()): torch.testing.assert_close(x,y)
     for x,y in zip(ea.parameters(),eb.parameters()): torch.testing.assert_close(x,y)
 

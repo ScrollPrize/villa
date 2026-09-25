@@ -24,9 +24,10 @@ from vesuvius.neural_tracing.fiber_follow.runloop import (
     read_checkpoint as _read_checkpoint, save_checkpoint as _save_checkpoint,
 )
 from vesuvius.neural_tracing.fiber_follow.trace import DEFAULT_CONFIDENCE
-from vesuvius.neural_tracing.fiber_follow.supervision import loss_fn, prefix_labels
+from vesuvius.neural_tracing.fiber_follow.supervision import loss_fn, prefix_labels, refinement_metrics
 from vesuvius.neural_tracing.fiber_follow.policy import DEFAULT_MAX_RECOVERY_DISTANCE
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.training_log import format_training_log
 
 
 def save_checkpoint(path, model, ema, vol_spec, sample_cfg, extra=None):
@@ -112,17 +113,29 @@ def optimizer_update(model, ema, opt, batches, update, lr, *, device, tolerance=
     # features for flow matching and the final confidence evaluation.
     normalizers = dict(flow=0.,near=0.,full=0.)
     curves=[]
+    refinement_steps=[]
     with torch.no_grad():
         for cpu in batches:
             x,hist,hmask = (cpu[k].to(device) for k in ('x','hist','hmask'))
             with torch.autocast('cuda',dtype=torch.bfloat16,enabled=str(device).startswith('cuda')):
-                points=model.generate_training_curve(x.float(),hist,hmask).float().cpu()
+                if compute_metrics:
+                    points,steps=model.generate_training_curve(x.float(),hist,hmask,return_steps=True)
+                    refinement_steps.append(steps.float().cpu())
+                    del steps
+                else:
+                    points=model.generate_training_curve(x.float(),hist,hmask)
+                points=points.float().cpu()
             curves.append(points)
             _,mask,_=prefix_labels(points,cpu,tolerance,model.cfg.max_recovery_distance)
             normalizers['near'] += mask[:,:4].sum().item()
             normalizers['full'] += mask.sum().item()
             normalizers['flow'] += flow_targets(cpu,model.cfg)[1].sum().item()
         del x,hist,hmask
+    if compute_metrics:
+        targets={key:torch.cat([b[key] for b in batches]) for key in
+                 ('plane_ab','plane_mask','offtrack','gt_history','gt_history_mask')}
+        metrics['refinement']=refinement_metrics(torch.cat(refinement_steps),targets,model.cfg)
+        del refinement_steps,targets
     for cpu,points in zip(batches,curves):
         batch={k:v.to(device) for k,v in cpu.items()}
         weight=len(batch['hist'])/total
@@ -253,7 +266,7 @@ def main(argv=None):
         from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume
         tracer=ModelTracer(ema,FiberVolume(spec,cache_bytes=2<<30),crop,128,TraceParams(),device=args.device)
         (out/'images').mkdir(exist_ok=True)
-    log=RunLog(out/'log.jsonl'); start=time.monotonic(); replay_seen=0
+    log=RunLog(out/'log.jsonl',formatter=format_training_log); start=time.monotonic(); replay_seen=0
     try:
         for step in range(1,args.steps+1):
             event=collector.poll()
