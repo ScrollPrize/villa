@@ -54,6 +54,7 @@ def _live_context():
         lasagna_scale=4,
         normal_zarr_group="4",
         spiral_outward_sense="CW",
+        z_direction_is_top_to_bottom=False,
         base_shape_zyx=(100, 200, 300),
         paths=SimpleNamespace(dataset_root="/data/scroll1"),
         winding_model_mode=False,
@@ -166,6 +167,7 @@ class CheckpointPreflightTests(unittest.TestCase):
                 ({"lasagna_scale": 2}, "lasagna_scale"),
                 ({"lasagna_group": "8"}, "Lasagna group"),
                 ({"spiral_outward_sense": "CCW"}, "outward sense"),
+                ({"z_direction_is_top_to_bottom": True}, "z direction"),
                 ({"input_manifest": {"dataset_root": "/data/other"}},
                  "written against dataset"),
         ):
@@ -175,6 +177,8 @@ class CheckpointPreflightTests(unittest.TestCase):
                 self.assertIn(expected, verdict.message())
 
         self.assertTrue(_inspect(_checkpoint()).accepted)
+        self.assertTrue(_inspect(
+            _checkpoint(z_direction_is_top_to_bottom=False)).accepted)
         self.assertTrue(_inspect(
             _checkpoint(base_shape_zyx=[100, 200, 300])).accepted)
         verdict = _inspect(_checkpoint(base_shape_zyx=[100, 201, 300]))
