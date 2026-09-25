@@ -420,7 +420,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     statusBar()->addPermanentWidget(copyProgress);
     copyLabel->hide();
     copyProgress->hide();
-    connect(_service, &SpiralServiceManager::inputCopyProgress, this,
+    // copyLabel is deleted before copyProgress, so it bounds both captures.
+    connect(_service, &SpiralServiceManager::inputCopyProgress, copyLabel,
             [copyLabel, copyProgress](int active, const QString& message) {
                 copyLabel->setText(message);
                 copyLabel->setVisible(active > 0);
