@@ -3572,7 +3572,6 @@ class FitContext:
             'z_begin': self.model_z_begin,
             'z_end': self.model_z_end,
             'spiral_outward_sense': self.spiral_outward_sense,
-            # So an offline exporter writes grids in the same layout.
             'z_direction_is_top_to_bottom': self.z_direction_is_top_to_bottom,
             'numpy_rng_state': np.random.get_state(),
             'torch_cpu_rng_state': torch.random.get_rng_state(),

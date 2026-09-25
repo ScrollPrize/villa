@@ -94,9 +94,8 @@ This is not covered by scrollprize.org/tutorial_spiral. Required keys:
 - `schema_version` — must equal `1`.
 - `name`, `voxel_size_um` — required, no validation beyond presence.
 - `z_direction_is_top_to_bottom`, `left_handed_coordinates` — the fitted
-  volume's two properties from the open-data catalog (`metadata.json`;
-  `metadata.min.json` omits them), copied verbatim as `true`/`false`. Together
-  they fix the spiral's sense under the catalog convention that every scroll
+  volume's two properties from the open-data catalog (`metadata.json`), copied 
+- verbatim as `true`/`false`. Together they fix the spiral's sense under the catalog convention that every scroll
   shows the same spiral seen from its top: `"CW"` when they are equal, `"ACW"`
   when they differ. The z direction also orients exported surfaces (below).
 - `spiral_outward_sense` — `"CW"` or `"ACW"` (case-insensitive). Derived from
