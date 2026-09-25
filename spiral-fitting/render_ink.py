@@ -119,11 +119,11 @@ def concat_meshes(mesh_paths):
     the -1 invalid sentinel so heights match. Meshes written outermost wrap first are
     concatenated outermost winding first, so the result keeps their layout. Returns
     the combined zyxs array in zyx order and their layout record."""
-    layouts = {json.dumps(mesh_layout_metadata(p), sort_keys=True) for p in mesh_paths}
-    if len(layouts) != 1:
+    layout = mesh_layout_metadata(mesh_paths[0])
+    mixed = [p for p in mesh_paths if mesh_layout_metadata(p) != layout]
+    if mixed:
         raise click.ClickException(
-            'Cannot concatenate meshes written in different layouts: ' + ', '.join(layouts))
-    layout = json.loads(layouts.pop())
+            f'Cannot concatenate meshes written in different layouts: {mesh_paths[0]} vs {mixed[0]}')
     if layout is not None:
         mesh_paths = list(reversed(mesh_paths))
     grids = [load_tifxyz(p).zyxs.cpu().numpy() for p in mesh_paths]
