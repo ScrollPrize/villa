@@ -68,6 +68,24 @@ def list_files():
     return data
 
 
+def describe_scroll_config(config_data: Dict, scroll_id: Optional[Union[int, str]]) -> str:
+    """Describe what the config offers for a scroll, for a lookup that missed."""
+    scroll_data = config_data.get(str(scroll_id))
+    if not isinstance(scroll_data, dict):
+        listed = ", ".join(sorted(str(key) for key in config_data))
+        return f"scroll {scroll_id} is not in the config, which lists scrolls: {listed}"
+    scans = [
+        f"energy={energy}, resolution={resolution}"
+        for energy, resolutions in scroll_data.items()
+        if isinstance(resolutions, dict)
+        for resolution, entry in resolutions.items()
+        if isinstance(entry, dict) and entry.get("volume")
+    ]
+    if not scans:
+        return f"the config lists no volume for scroll {scroll_id}"
+    return f"the config lists for scroll {scroll_id}: " + "; ".join(scans)
+
+
 def is_aws_ec2_instance():
     """Determine if the current system is an AWS EC2 instance."""
     try:
@@ -570,7 +588,8 @@ class Volume:
                 url = res_data.get("volume")
                 if url is None:
                     raise ValueError(
-                        f"URL not found in config for scroll={self.scroll_id}, energy={self.energy}, resolution={self.resolution}")
+                        f"URL not found in config for scroll={self.scroll_id}, energy={self.energy}, resolution={self.resolution}; "
+                        f"{describe_scroll_config(config_data, self.scroll_id)}")
             elif self.type == 'segment':
                 url = res_data.get("segments", {}).get(str(self.segment_id))
                 if url is None:
@@ -1126,7 +1145,7 @@ class Volume:
 
         resolution_mapping = {
             "1": 7.91, "1b": 7.91, "2": 7.91, "2b": 7.91, "2c": 7.91,
-            "3": 3.24, "4": 3.24, "5": 7.91
+            "3": 7.91, "4": 3.24, "5": 7.91
         }
         return resolution_mapping.get(scroll_id_key)
 
