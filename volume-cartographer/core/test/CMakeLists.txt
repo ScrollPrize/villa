@@ -968,6 +968,8 @@ vc_add_test(NAME test_quadsurface_components)
 
 vc_add_test(NAME test_volume_local)
 
+vc_add_test(NAME test_seed_scan_check)
+
 vc_add_test(NAME test_zarr_helpers)
 
 vc_add_test(NAME test_chunked_plane_sampler)
