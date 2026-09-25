@@ -2236,6 +2236,24 @@ void copyCatalogSegmentToEditableDirectory(
     }
 }
 
+namespace {
+
+const std::vector<std::string> kOpenDataRoutingTagPrefixes{
+    "vc-open-data-coordinate-space:",
+    "vc-open-data-source-coordinate-level:",
+    "vc-open-data-source-volume-id:",
+    "vc-open-data-target-volume-id:"};
+
+bool isOpenDataRoutingTag(const std::string& tag)
+{
+    return std::any_of(
+        kOpenDataRoutingTagPrefixes.begin(),
+        kOpenDataRoutingTagPrefixes.end(),
+        [&](const std::string& prefix) { return tag.rfind(prefix, 0) == 0; });
+}
+
+} // namespace
+
 void attachEditableOpenDataSegmentRoot(
     VolumePkg& pkg,
     const std::filesystem::path& catalogSegmentDir,
@@ -2250,11 +2268,7 @@ void attachEditableOpenDataSegmentRoot(
     bool copiedRoutingTag = false;
     if (sourceEntry) {
         for (const auto& tag : sourceEntry->tags) {
-            const bool routingTag =
-                tag.rfind("vc-open-data-coordinate-space:", 0) == 0 ||
-                tag.rfind("vc-open-data-source-coordinate-level:", 0) == 0 ||
-                tag.rfind("vc-open-data-source-volume-id:", 0) == 0 ||
-                tag.rfind("vc-open-data-target-volume-id:", 0) == 0;
+            const bool routingTag = isOpenDataRoutingTag(tag);
             if (routingTag &&
                 std::find(tags.begin(), tags.end(), tag) == tags.end()) {
                 tags.push_back(tag);
@@ -2281,13 +2295,39 @@ void attachEditableOpenDataSegmentRoot(
     pkg.reconcileSegmentsEntryTags(
         persistedLocation,
         tags,
-        copiedRoutingTag
-            ? std::vector<std::string>{
-                  "vc-open-data-coordinate-space:",
-                  "vc-open-data-source-coordinate-level:",
-                  "vc-open-data-source-volume-id:",
-                  "vc-open-data-target-volume-id:"}
-            : std::vector<std::string>{});
+        copiedRoutingTag ? kOpenDataRoutingTagPrefixes
+                         : std::vector<std::string>{});
+}
+
+void attachOpenDataPatchesRoot(
+    VolumePkg& pkg,
+    const std::vector<std::string>& volumeTags,
+    const std::string& patchesRootLocation)
+{
+    const auto coordinateTag = std::find_if(
+        volumeTags.begin(), volumeTags.end(), [](const std::string& tag) {
+            return tag.rfind("vc-open-data-coordinate-space:", 0) == 0;
+        });
+
+    std::vector<std::string> tags{"growpatch", "open-data-patches"};
+    if (coordinateTag != volumeTags.end()) {
+        for (const auto& entry : pkg.segmentEntries()) {
+            if (!vc::project::hasEntryTag(entry, "immutable") ||
+                !vc::project::hasEntryTag(entry, *coordinateTag)) {
+                continue;
+            }
+            for (const auto& tag : entry.tags) {
+                if (isOpenDataRoutingTag(tag)) {
+                    tags.push_back(tag);
+                }
+            }
+            break;
+        }
+    }
+
+    pkg.addSegmentsEntry(patchesRootLocation, tags);
+    pkg.reconcileSegmentsEntryTags(
+        patchesRootLocation, tags, kOpenDataRoutingTagPrefixes);
 }
 
 OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(

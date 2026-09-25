@@ -3331,7 +3331,15 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
     }
 
     const QString segmentsEntry = segmentsEntryLocationForPath(outputDirPath, volpkgRoot);
-    _state->vpkg()->addSegmentsEntry(segmentsEntry.toStdString(), {"growpatch"});
+    const auto patchesRoot = openDataPatchesRootForVolume(*_state->vpkg(), selectedVolumeId);
+    if (patchesRoot && QDir::cleanPath(*patchesRoot) == outputDirPath) {
+        vc3d::opendata::attachOpenDataPatchesRoot(
+            *_state->vpkg(),
+            _state->vpkg()->volumeTags(selectedVolumeId.toStdString()),
+            segmentsEntry.toStdString());
+    } else {
+        _state->vpkg()->addSegmentsEntry(segmentsEntry.toStdString(), {"growpatch"});
+    }
     _state->vpkg()->setOutputSegments(segmentsEntry.toStdString());
 
     QJsonObject paramsJson;
