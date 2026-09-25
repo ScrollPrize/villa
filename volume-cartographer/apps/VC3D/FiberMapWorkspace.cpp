@@ -863,6 +863,8 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
                                      QWidget* parent)
     : QMainWindow(parent)
     , _controller(controller)
+    , _catalogOrientation(
+          std::make_shared<vc3d::opendata::CatalogVolumeOrientationLookup>())
 {
     setObjectName(QStringLiteral("fiberMapWorkspace"));
     setWindowTitle(tr("Fiber Map"));
@@ -1249,7 +1251,19 @@ FiberMapWorkspace::currentDependencies() const
     deps.umbilicusGeneration = _controller->umbilicusGeneration();
     deps.umbilicusFingerprint = _controller->umbilicusFingerprint();
     deps.frame = _controller->annotationFrame();
+    const std::string coordinateSpace = _controller->fiberMapCoordinateSpace();
+    deps.catalogVolume = QString::fromStdString(
+        vc3d::opendata::catalogVolumeOfCoordinateSpace(coordinateSpace));
+    deps.catalogManifestToken = catalogManifestTokenFor(coordinateSpace);
     return deps;
+}
+
+QString FiberMapWorkspace::catalogManifestTokenFor(const std::string& coordinateSpace) const
+{
+    if (!_catalogOrientation) {
+        return {};
+    }
+    return QString::fromStdString(_catalogOrientation->manifestToken(coordinateSpace));
 }
 
 vc3d::fiber_map::FiberMapDependencies
@@ -1261,12 +1275,17 @@ FiberMapWorkspace::layoutDependencies() const
     deps.umbilicusGeneration = _layoutUmbilicusGeneration;
     deps.umbilicusFingerprint = _layoutUmbilicusFingerprint;
     deps.frame = _layoutFrame;
+    deps.catalogVolume = _layoutCatalogVolume;
+    deps.catalogManifestToken = _layoutCatalogManifestToken;
     return deps;
 }
 
 vc3d::fiber_map::StaleVerdict FiberMapWorkspace::evaluateDependencies() const
 {
-    if (!_controller) {
+    // Nothing built compares against nothing (the verdict says so too);
+    // gathering the current dependencies first would still cost the frame
+    // derivation and the umbilicus fingerprint's stats on every gate.
+    if (!_controller || !_layoutBuilt) {
         return {};
     }
     return vc3d::fiber_map::staleVerdictFor(
@@ -1398,7 +1417,7 @@ void FiberMapWorkspace::scheduleAutoUpdate()
     // only race that dispatch.
     if (_rebuildQueue.state() !=
         vc3d::fiber_map::FiberMapRebuildQueue::State::Idle) {
-        (void)_rebuildQueue.request(false);
+        (void)_rebuildQueue.request(false, /*automatic=*/true);
         return;
     }
     if (_autoUpdateScheduled) {
@@ -1419,7 +1438,7 @@ void FiberMapWorkspace::scheduleAutoUpdate()
             (verdict.cause == StaleVerdict::Cause::Fibers ||
              verdict.cause == StaleVerdict::Cause::Umbilicus)) {
             // requestRebuild coalesces if a build started in the meantime.
-            requestRebuild(false);
+            requestRebuild(false, /*automatic=*/true);
         }
     });
 }
@@ -1431,6 +1450,9 @@ void FiberMapWorkspace::scheduleAutoUpdate()
 // the job started in still exists.
 struct FiberMapWorkspace::RebuildJobResult {
     bool fullRebuild = false;
+    // Armed by a staleness gate rather than asked for; a mid-flight retry
+    // of this build keeps its origin.
+    bool automatic = false;
     uint64_t epoch = 0;
     // The world as of the start, for apply-time validation.
     QString preReadUmbilicusFingerprint;
@@ -1441,6 +1463,17 @@ struct FiberMapWorkspace::RebuildJobResult {
     vc3d::fiber_map::GlobalLayoutParams params;
     bool hadFibers = false;
     bool hadUmbilicus = false;
+    // The catalog's orientation of the snapshot's volume, resolved by the
+    // worker (its first use parses the cached manifest): when it fixes the
+    // winding sense, params.solver.chiralityOverride carries it into the
+    // layout and the status line says so.
+    std::shared_ptr<vc3d::opendata::CatalogVolumeOrientationLookup> catalogOrientation;
+    bool senseFromCatalog = false;
+    // The manifest version the worker's catalog answer was read from
+    // (CatalogSense::manifestToken), a dependency watermark like the
+    // umbilicus fingerprint: compared at publication and by the staleness
+    // check afterwards, beside the snapshot's coordinateSpace.
+    QString catalogManifestToken;
     // The workspace's memoization cache, exclusive to the job in flight.
     vc3d::fiber_map::GlobalLayoutCache cache;
     // The gap heat map: wanted at job start (checkbox on), built with these
@@ -1502,6 +1535,40 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
                                                link.adjacentExplicit});
             }
             inputs.push_back(std::move(input));
+        }
+        // The winding sense is the scroll's, and the catalog states it for
+        // the volumes it orients; only without that does the layout fall
+        // back to solving both senses. Settled before the input digest,
+        // which covers the override, so a catalog answer that changes
+        // reads as changed inputs.
+        if (job->catalogOrientation && !job->snapshot.coordinateSpace.empty()) {
+            // One observation: the answer and the manifest version it came
+            // from, the latter the watermark publication compares against.
+            const auto catalog =
+                job->catalogOrientation->resolve(job->snapshot.coordinateSpace);
+            job->catalogManifestToken = QString::fromStdString(catalog.manifestToken);
+            const auto& orientation = catalog.orientation;
+            const auto sense = orientation
+                                   ? vc3d::opendata::windingChiralityOf(*orientation)
+                                   : std::nullopt;
+            if (sense) {
+                job->params.solver.chiralityOverride = *sense;
+                job->senseFromCatalog = true;
+                Logger()->info(
+                    "Fiber map: winding sense {:+d} from the catalog for {} "
+                    "(z top-to-bottom {}, left-handed {})",
+                    *sense,
+                    job->snapshot.coordinateSpace,
+                    *orientation->zTopToBottom,
+                    *orientation->leftHandedCoordinates);
+            } else {
+                Logger()->info(
+                    "Fiber map: the catalog does not orient {} ({}); solving "
+                    "both winding senses",
+                    job->snapshot.coordinateSpace,
+                    orientation ? "orientation properties unset"
+                                : "volume not in the cached manifest");
+            }
         }
         job->inputsDigest = vc3d::fiber_map::digestGlobalInputs(
             inputs, job->snapshot.umbilicusCenters, job->params);
@@ -1593,12 +1660,12 @@ void FiberMapWorkspace::showEvent(QShowEvent* event)
     }
 }
 
-void FiberMapWorkspace::requestRebuild(bool fullRebuild)
+void FiberMapWorkspace::requestRebuild(bool fullRebuild, bool automatic)
 {
     if (!_controller) {
         return;
     }
-    switch (_rebuildQueue.request(fullRebuild)) {
+    switch (_rebuildQueue.request(fullRebuild, automatic)) {
     case vc3d::fiber_map::FiberMapRebuildQueue::Request::Refused:
         return;
     case vc3d::fiber_map::FiberMapRebuildQueue::Request::Coalesced:
@@ -1606,12 +1673,12 @@ void FiberMapWorkspace::requestRebuild(bool fullRebuild)
         // dispatches it.
         return;
     case vc3d::fiber_map::FiberMapRebuildQueue::Request::Start:
-        startRebuild(fullRebuild);
+        startRebuild(fullRebuild, automatic);
         return;
     }
 }
 
-void FiberMapWorkspace::startRebuild(bool fullRebuild)
+void FiberMapWorkspace::startRebuild(bool fullRebuild, bool automatic)
 {
     // The queue granted a Start: every exit either launches the worker or
     // runs the epilogue so the queue returns to Idle.
@@ -1643,6 +1710,7 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild)
     try {
         job = std::make_shared<RebuildJobResult>();
         job->fullRebuild = fullRebuild;
+        job->automatic = automatic;
         // Captured after the pre-check: a clear above advanced the epoch, and
         // this job publishes into the world as it stands now.
         job->epoch = _rebuildQueue.epoch();
@@ -1658,6 +1726,7 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild)
         job->snapshotMs = snapshotTimer.elapsed();
         job->builtPackageGeneration = _controller->packageGeneration();
         job->builtUmbilicusGeneration = _controller->umbilicusGeneration();
+        job->catalogOrientation = _catalogOrientation;
         job->hadFibers = !job->snapshot.fibers.empty();
         job->hadUmbilicus = !job->snapshot.umbilicusCenters.empty();
         job->wantGapField = _gapsCheck && _gapsCheck->isChecked();
@@ -1797,17 +1866,34 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
         }
         return;
     }
-    // Fibers or the umbilicus changed mid-flight: publishing a result
-    // already known stale would put a wrong picture on screen, so the
-    // reviewer's rule is followed literally - discard and re-run. The job's
-    // cache IS kept: its slots are content-keyed digests, exact across
-    // edits, so the immediate re-run stays warm and cheap.
+    // The same policy for a same-grid switch to another catalog volume: the
+    // winding sense is read per catalog volume, and the user has usually
+    // only switched away for now. Another pyramid level of the same volume
+    // is the same catalog volume (the frame comparison above judged the
+    // grids).
+    const std::string coordinateSpace = _controller->fiberMapCoordinateSpace();
+    if (vc3d::opendata::catalogVolumeOfCoordinateSpace(coordinateSpace) !=
+        vc3d::opendata::catalogVolumeOfCoordinateSpace(job->snapshot.coordinateSpace)) {
+        _layoutCache = std::move(job->cache);
+        if (!refreshStaleState()) {
+            showStale(tr(
+                "viewing another catalog volume — switch back, or press Update"));
+        }
+        return;
+    }
+    // Fibers, the umbilicus or the catalog manifest the winding sense was
+    // read from changed mid-flight: publishing a result already known
+    // stale would put a wrong picture on screen, so the reviewer's rule is
+    // followed literally - discard and re-run. The job's cache IS kept: its
+    // slots are content-keyed digests, exact across edits, so the immediate
+    // re-run stays warm and cheap.
     if (_controller->fiberDataGeneration() != job->snapshot.generation ||
         _controller->umbilicusGeneration() != job->builtUmbilicusGeneration ||
-        _controller->umbilicusFingerprint() != job->preReadUmbilicusFingerprint) {
+        _controller->umbilicusFingerprint() != job->preReadUmbilicusFingerprint ||
+        catalogManifestTokenFor(coordinateSpace) != job->catalogManifestToken) {
         _layoutCache = std::move(job->cache);
         if (isVisible()) {
-            (void)_rebuildQueue.request(job->fullRebuild);
+            (void)_rebuildQueue.request(job->fullRebuild, job->automatic);
             showStale(tr("changed during update — updating…"));
         } else {
             // The visible-only contract: edits made while the workspace is
@@ -1849,6 +1935,9 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     _gapPublishedError = job.gapError;
     _gapFieldParams = job.gapParams;
     _layoutUmbilicusFingerprint = job.preReadUmbilicusFingerprint;
+    _layoutCatalogVolume = QString::fromStdString(
+        vc3d::opendata::catalogVolumeOfCoordinateSpace(job.snapshot.coordinateSpace));
+    _layoutCatalogManifestToken = job.catalogManifestToken;
     _layoutGeneration = job.snapshot.generation;
     _layoutFrame = job.snapshot.frame;
     _layoutPackageGeneration = job.builtPackageGeneration;
@@ -1978,6 +2067,38 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
             status += tr(" (%1 inferred)").arg(_layout.kollesisInferredCount);
         }
     }
+    // How the winding sense was settled, since a wrong sense is the one
+    // thing that turns a clean map into hundreds of errors at once.
+    const auto signed_ = [](int sense) {
+        return QString::fromUtf8(sense < 0 ? "−1" : "+1");
+    };
+    switch (_layout.chiralityBasis) {
+    case vc3d::fiber_map::ChiralityBasis::Override:
+        status += (job.senseFromCatalog ? tr(" · winding sense %1 from catalog")
+                                        : tr(" · winding sense %1 given"))
+                      .arg(signed_(_layout.chirality));
+        break;
+    case vc3d::fiber_map::ChiralityBasis::Comparison:
+        // The compared figures are crossing contradictions with the links
+        // left out (dropped crossings and group conflicts), this sense
+        // against the other; not the error count above.
+        status += tr(" · winding sense %1 by geometry (%2 vs %3 crossing contradictions)")
+                      .arg(signed_(_layout.chirality))
+                      .arg(_layout.comparedChiralityErrors)
+                      .arg(_layout.rejectedChiralityErrors);
+        break;
+    case vc3d::fiber_map::ChiralityBasis::Vote:
+        status += _layout.rejectedChiralityErrors >= 0
+                      ? tr(" · winding sense %1 by vote (geometry %2 vs %3)")
+                            .arg(signed_(_layout.chirality))
+                            .arg(_layout.comparedChiralityErrors)
+                            .arg(_layout.rejectedChiralityErrors)
+                      : tr(" · winding sense %1 by vote").arg(signed_(_layout.chirality));
+        break;
+    }
+    if (_layout.chiralityVote != _layout.chirality) {
+        status += tr(", vote said %1").arg(signed_(_layout.chiralityVote));
+    }
     const qint64 totalMs =
         job.snapshotMs + job.convertMs + job.layoutMs + job.gapMs + publishMs;
     if (job.stats.used && !job.fullRebuild) {
@@ -2040,6 +2161,8 @@ void FiberMapWorkspace::finishRebuild()
     if (_updateButton) {
         _updateButton->setEnabled(true);
     }
+    // Read before finishApply(), which consumes the slot.
+    const bool automatic = _rebuildQueue.pendingAutomatic();
     const auto pending = _rebuildQueue.finishApply();
     // Whatever this build did (published, discarded, failed), the tiles must
     // follow the checkbox against the layout that is published NOW: a toggle
@@ -2061,13 +2184,27 @@ void FiberMapWorkspace::finishRebuild()
     // captured them at its start and published while they moved leaves a
     // field the toolbar no longer describes, and that pending Update is
     // the one that fixes it.
-    if (!full && _layoutBuilt &&
-        evaluateDependencies().action ==
-            vc3d::fiber_map::StaleVerdict::Action::Fresh &&
-        gapSettingsMatchPublished()) {
-        return;
+    if (!full && _layoutBuilt) {
+        const StaleVerdict verdict = evaluateDependencies();
+        if (verdict.action == StaleVerdict::Action::Fresh && gapSettingsMatchPublished()) {
+            return;
+        }
+        // Nor into a volume the user has only switched to for now: the
+        // manual causes (Grid, Volume, VoxelSize) keep the map for the
+        // volume it was built in until they press Update, and a pending
+        // AUTOMATIC Update armed before the switch must not do it for
+        // them. One they asked for is honoured - in particular the retry
+        // of a build they asked for on this volume, which was discarded
+        // mid-flight and now reads as a manual cause only because the
+        // published map is still the other volume's.
+        if (automatic && verdict.action == StaleVerdict::Action::MarkStale &&
+            (verdict.cause == StaleVerdict::Cause::Grid ||
+             verdict.cause == StaleVerdict::Cause::Volume ||
+             verdict.cause == StaleVerdict::Cause::VoxelSize)) {
+            return;
+        }
     }
-    requestRebuild(full);
+    requestRebuild(full, automatic);
 }
 
 void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
