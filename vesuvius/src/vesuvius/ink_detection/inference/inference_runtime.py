@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import itertools
 import logging
 from pathlib import Path
@@ -133,7 +135,11 @@ def resolve_amp_dtype(
     checkpoint: Any,
     source: str | Path = "<memory>",
 ) -> torch.dtype | None:
-    """Resolve a CLI AMP request, with auto delegated to checkpoint config."""
+    """Resolve a CLI AMP request, with auto delegated to checkpoint config.
+
+    ``None`` means full precision: the caller must not open an autocast
+    context for it (``torch.autocast(dtype=None)`` would enable float16).
+    """
 
     normalized = str(requested).strip().lower()
     if normalized == "default":
@@ -145,6 +151,21 @@ def resolve_amp_dtype(
     if normalized == "auto":
         return checkpoint_amp_dtype(checkpoint, source)
     raise ValueError(f"Unsupported --amp-dtype value {requested!r}")
+
+
+def inference_autocast(device: torch.device, amp_dtype: torch.dtype | None):
+    """Autocast to ``amp_dtype`` on CUDA; ``None`` means full precision.
+
+    ``torch.autocast("cuda", dtype=None)`` does not switch autocast off: it
+    enables it with the device default, float16. So ``--amp-dtype default``
+    (and ``auto`` on a checkpoint trained without mixed precision) ran fp16
+    while reporting nothing, and there was no way to get fp32. Only a
+    resolved dtype opens the context.
+    """
+
+    if amp_dtype is None or device.type != "cuda":
+        return nullcontext()
+    return torch.autocast("cuda", dtype=amp_dtype)
 
 
 def maybe_compile_model(
