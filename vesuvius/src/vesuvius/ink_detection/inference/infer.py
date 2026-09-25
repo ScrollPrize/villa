@@ -952,6 +952,16 @@ def _volume_axes(array: Any) -> tuple[bool, int, int, int, int, int]:
     return depth_first, depth, height, width, chunk_h, chunk_w
 
 
+def open_flat_input(
+    input_zarr: str | Path, resolution: int | str
+) -> tuple[Any, Any, str]:
+    """Open a flat input root and its level; a bare array is always level 0."""
+
+    root = open_volume_root(input_zarr)
+    level = "0" if hasattr(root, "shape") else str(resolution)
+    return root, select_volume_level(root, level, source=str(input_zarr)), level
+
+
 def infer_single_zarr(
     *,
     args: argparse.Namespace,
@@ -963,9 +973,7 @@ def infer_single_zarr(
 ) -> None:
     """Run one direction over one surface-volume input and replace a TIFF."""
 
-    root = open_volume_root(input_zarr)
-    resolution = "0" if hasattr(root, "shape") else str(args.resolution)
-    volume = select_volume_level(root, resolution, source=str(input_zarr))
+    root, volume, resolution = open_flat_input(input_zarr, args.resolution)
     depth_first, depth, height, width, chunk_h, chunk_w = _volume_axes(volume)
     patch_size = configured_model.patch_size
     stride = resolve_patch_stride(
@@ -1292,18 +1300,9 @@ def normalize_inference_paths(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
-def parse_args(argv: Sequence[str] | None = None):
-    """Parse the frozen flat-inference CLI with separator aliases."""
+def add_flat_pass_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the options that control one flat pass, shared with the sweep CLI."""
 
-    parser = HyphenUnderscoreParser(
-        description="Run ink inference on a flat surface-volume Zarr"
-    )
-    parser.add_argument("input_zarr", nargs="?")
-    parser.add_argument("checkpoint", nargs="?", type=Path)
-    parser.add_argument("output_tiff", nargs="?", type=Path)
-    parser.add_argument("--folder", type=Path)
-    parser.add_argument("--checkpoint-path", type=Path)
-    parser.add_argument("--output-prefix", default="")
     parser.add_argument("--mask-path", type=Path)
     parser.add_argument("--resolution", default="0")
     parser.add_argument(
@@ -1326,12 +1325,7 @@ def parse_args(argv: Sequence[str] | None = None):
             "overlap, Hann otherwise."
         ),
     )
-    parser.add_argument("--layer-start", type=int)
-    parser.add_argument("--layer-end", type=int)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument(
-        "--direction", choices=("forward", "reverse", "both"), default="forward"
-    )
     parser.add_argument(
         "--amp-dtype",
         choices=("auto", "default", "fp16", "bf16"),
@@ -1343,7 +1337,13 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
     parser.set_defaults(compile_model=True)
-    args = parser.parse_args(argv)
+
+
+def validate_flat_pass_arguments(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Reject invalid shared pass options and resolve ``args.gpu_ids``."""
+
     if args.num_workers < 0:
         parser.error("--num-workers must be nonnegative")
     if args.prefetch_factor <= 0:
@@ -1356,6 +1356,28 @@ def parse_args(argv: Sequence[str] | None = None):
         args.gpu_ids = parse_gpu_ids(args.gpus)
     except ValueError as exc:
         parser.error(str(exc))
+
+
+def parse_args(argv: Sequence[str] | None = None):
+    """Parse the frozen flat-inference CLI with separator aliases."""
+
+    parser = HyphenUnderscoreParser(
+        description="Run ink inference on a flat surface-volume Zarr"
+    )
+    parser.add_argument("input_zarr", nargs="?")
+    parser.add_argument("checkpoint", nargs="?", type=Path)
+    parser.add_argument("output_tiff", nargs="?", type=Path)
+    parser.add_argument("--folder", type=Path)
+    parser.add_argument("--checkpoint-path", type=Path)
+    parser.add_argument("--output-prefix", default="")
+    add_flat_pass_arguments(parser)
+    parser.add_argument("--layer-start", type=int)
+    parser.add_argument("--layer-end", type=int)
+    parser.add_argument(
+        "--direction", choices=("forward", "reverse", "both"), default="forward"
+    )
+    args = parser.parse_args(argv)
+    validate_flat_pass_arguments(parser, args)
     return args
 
 
