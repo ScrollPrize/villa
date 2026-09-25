@@ -241,21 +241,74 @@ TEST_CASE("get_grid with a real (committed) GridStore file is read back")
     fs::remove_all(d);
 }
 
-TEST_CASE("Cache eviction: the entry cap holds, and an evicted slice reloads")
+// Writes `n` small xy slices (slice i is file i.grid) into a fresh directory.
+static fs::path makeSlices(const std::string& tag, int n)
 {
-    // Drives the cache well past its 512-entry cap so the eviction path runs
-    // hundreds of times, then re-reads a slice that must have been evicted.
-    // Evicting is only ever a timing decision -- the .grid files are
-    // immutable -- so every read must return the same content either way.
-    auto d = makeEmptyNgvDir("evict", /*sparseVolume=*/1);
-    const int kSlices = 700;
-    for (int i = 0; i < kSlices; ++i) {
+    auto d = makeEmptyNgvDir(tag, /*sparseVolume=*/1);
+    for (int i = 0; i < n; ++i) {
         vc::core::util::GridStore gs(cv::Rect(0, 0, 100, 100), 10);
         gs.add({cv::Point(0, 0), cv::Point(i % 50, 5), cv::Point(10, 10)});
         char name[64];
         snprintf(name, sizeof(name), "%06d.grid", i);
         gs.save((d / "xy" / name).string());
     }
+    return d;
+}
+
+// Sets an environment variable for one scope. The cache reads its limits when
+// the NormalGridVolume is constructed, so construct the volume inside the scope.
+struct ScopedEnv {
+    std::string name;
+    ScopedEnv(const char* n, const std::string& v) : name(n) { setenv(n, v.c_str(), 1); }
+    ~ScopedEnv() { unsetenv(name.c_str()); }
+};
+
+TEST_CASE("Default mode (no env): the cache holds 512 entries, as it always has")
+{
+    // The byte budget is OPT-IN. With neither variable set the behaviour must be
+    // the historical one: an entry cap of exactly 512.
+    unsetenv("VC_GRID_CACHE_BYTES");
+    unsetenv("VC_GRID_CACHE_ENTRIES");
+    const int kSlices = 700;
+    auto d = makeSlices("default_mode", kSlices);
+    NormalGridVolume v(d.string());
+    for (int i = 0; i < kSlices; ++i) {
+        auto g = v.get_grid(0, i);
+        REQUIRE(g != nullptr);
+        CHECK(g->numSegments() >= 1);
+    }
+    CHECK(v.cacheStats().liveGridEntries == 512);
+    // The first slice is long evicted: reading it is a miss, and still valid.
+    v.resetCacheStats();
+    auto again = v.get_grid(0, 0);
+    REQUIRE(again != nullptr);
+    CHECK(again->numSegments() >= 1);
+    CHECK(v.cacheStats().gridMisses == 1);
+    CHECK(v.cacheStats().liveGridEntries == 512);
+    fs::remove_all(d);
+}
+
+TEST_CASE("Opt-in byte budget: a large budget lifts the 512-entry cap")
+{
+    const int kSlices = 700;
+    auto d = makeSlices("bytes_lifts_cap", kSlices);
+    ScopedEnv b("VC_GRID_CACHE_BYTES", std::to_string(1ull << 30));
+    NormalGridVolume v(d.string());
+    for (int i = 0; i < kSlices; ++i) REQUIRE(v.get_grid(0, i) != nullptr);
+    CHECK(v.cacheStats().liveGridEntries == kSlices);   // 700 > 512: all resident
+    v.resetCacheStats();
+    for (int i = 0; i < kSlices; ++i) REQUIRE(v.get_grid(0, i) != nullptr);
+    CHECK(v.cacheStats().gridMisses == 0);
+    fs::remove_all(d);
+}
+
+TEST_CASE("Explicit VC_GRID_CACHE_ENTRIES: the cap holds, and an evicted slice reloads")
+{
+    // Evicting is only ever a timing decision -- the .grid files are
+    // immutable -- so every read must return the same content either way.
+    const int kSlices = 700;
+    auto d = makeSlices("evict", kSlices);
+    ScopedEnv cap("VC_GRID_CACHE_ENTRIES", "64");
 
     NormalGridVolume v(d.string());
     for (int i = 0; i < kSlices; ++i) {
@@ -263,9 +316,8 @@ TEST_CASE("Cache eviction: the entry cap holds, and an evicted slice reloads")
         REQUIRE(g != nullptr);
         CHECK(g->numSegments() >= 1);
     }
-    // The cap is enforced: the map did not grow to 700.
     auto stats = v.cacheStats();
-    CHECK(stats.liveGridEntries <= 512);
+    CHECK(stats.liveGridEntries <= 64);
     CHECK(stats.liveGridEntries > 0);
 
     // Slice 0 was inserted first, so it is long gone. Reading it again must
@@ -273,13 +325,88 @@ TEST_CASE("Cache eviction: the entry cap holds, and an evicted slice reloads")
     auto again = v.get_grid(0, 0);
     REQUIRE(again != nullptr);
     CHECK(again->numSegments() >= 1);
-    CHECK(v.cacheStats().liveGridEntries <= 512);
+    CHECK(v.cacheStats().liveGridEntries <= 64);
 
-    // A slice that is still resident reads back too, so eviction did not
-    // leave the map and the eviction order out of step.
-    auto recent = v.get_grid(0, kSlices - 1);
-    REQUIRE(recent != nullptr);
-    CHECK(recent->numSegments() >= 1);
+    fs::remove_all(d);
+}
 
+TEST_CASE("Opt-in byte budget: bytes, not entries, bound the cache")
+{
+    const int kSlices = 300;
+    auto d = makeSlices("bytes", kSlices);
+    const uint64_t one_file = fs::file_size(d / "xy" / "000000.grid");
+
+    SUBCASE("a small byte budget evicts down to roughly budget / file size")
+    {
+        // Every store is charged at least its mapped file, so a budget of 40
+        // files can hold at most 40 stores.
+        ScopedEnv b("VC_GRID_CACHE_BYTES", std::to_string(40 * one_file));
+        NormalGridVolume v(d.string());
+        for (int i = 0; i < kSlices; ++i) REQUIRE(v.get_grid(0, i) != nullptr);
+        const auto live = v.cacheStats().liveGridEntries;
+        CHECK(live <= 40);
+        CHECK(live >= 2);
+    }
+
+    SUBCASE("a small working set stays fully resident under a generous budget")
+    {
+        ScopedEnv big("VC_GRID_CACHE_BYTES", std::to_string(1ull << 30));
+        NormalGridVolume v(d.string());
+        for (int i = 0; i < kSlices; ++i) REQUIRE(v.get_grid(0, i) != nullptr);
+        CHECK(v.cacheStats().liveGridEntries == kSlices);
+        v.resetCacheStats();
+        for (int i = 0; i < kSlices; ++i) REQUIRE(v.get_grid(0, i) != nullptr);
+        const auto st = v.cacheStats();
+        CHECK(st.gridMisses == 0);          // no reopen: one construction per slice
+        CHECK(st.gridHits == kSlices);
+    }
+    fs::remove_all(d);
+}
+
+TEST_CASE("Opt-in byte budget: growth of a store's decoded cache after insertion is "
+          "re-counted even when nothing new is inserted")
+{
+    // A store's decoded-polyline cache grows on use, after it was charged. If
+    // the running total were only refreshed on insertions, a fully resident
+    // working set would drift past the budget forever.
+    const int kSlices = 200;
+    auto d = makeSlices("drift", kSlices);
+
+    // Measure what one store is charged before and after it decodes its paths.
+    size_t before = 0, after = 0;
+    {
+        NormalGridVolume probe(d.string());
+        auto g = probe.get_grid(0, 0);
+        REQUIRE(g != nullptr);
+        before = g->residentBytes();
+        (void)g->get_all();
+        after = g->residentBytes();
+    }
+    REQUIRE(after > before);   // otherwise this test cannot see the drift
+
+    // A budget that fits every store at its INSERTION charge but not once
+    // they have all decoded.
+    const size_t budget = kSlices * before + (kSlices * (after - before)) / 2;
+    ScopedEnv b("VC_GRID_CACHE_BYTES", std::to_string(budget));
+    NormalGridVolume v(d.string());
+    std::vector<std::shared_ptr<const vc::core::util::GridStore>> held;
+    for (int i = 0; i < kSlices; ++i) {
+        auto g = v.get_grid(0, i);
+        REQUIRE(g != nullptr);
+        held.push_back(g);
+    }
+    CHECK(v.cacheStats().liveGridEntries == kSlices);   // fits, for now
+    v.resetCacheStats();
+
+    for (auto& g : held) (void)g->get_all();            // every store decodes
+    // Reads only: no NEW slice is ever requested from here on, so the only way
+    // a read can miss is if the budget evicted something. 3 x 65536 reads
+    // guarantee the periodic re-count fires at least twice.
+    for (int i = 0; i < 3 * 65536; ++i) REQUIRE(v.get_grid(0, i % kSlices) != nullptr);
+
+    // With the drift ignored this is 0: everything stays resident and every
+    // read hits. With it re-counted, the budget evicts, and evicted slices are
+    // re-read from disk.
+    CHECK(v.cacheStats().gridMisses > 0);
     fs::remove_all(d);
 }
