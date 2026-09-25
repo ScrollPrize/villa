@@ -9,6 +9,8 @@ from typing import Any, Mapping, Sequence
 
 import torch
 from torch import nn
+from torch._dynamo.exc import BackendCompilerFailed
+from torch._inductor.exc import TritonMissing
 
 from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
 
@@ -148,16 +150,15 @@ def resolve_amp_dtype(
 
 
 class _CompiledWithEagerFallback(nn.Module):
-    """A compiled model that drops to eager if the backend fails when it first runs.
+    """A compiled model that drops to eager on a backend compilation failure.
 
     ``torch.compile`` compiles nothing when it is called: it returns a wrapper,
-    and the backend runs on the first forward. A backend that cannot build
-    therefore raises there rather than at the call ``maybe_compile_model``
-    guards, so on an install the backend cannot use -- any native-Windows one,
-    where the CUDA path finds no Triton and the CPU path finds no ``cl`` --
-    inference dies part way through a run instead of taking the eager fallback
-    this module already promises. Guarding the first forward keeps that promise,
-    and costs one attribute test per call until a forward has succeeded.
+    and the backend runs on a forward. A new batch shape can trigger another
+    compilation even after earlier forwards succeeded, so every compiled call
+    stays guarded. Compiler failures disable compilation for this wrapper;
+    ordinary model errors propagate without retrying the model in eager mode.
+    TritonMissing is raised directly by Inductor on some installations rather
+    than being wrapped in BackendCompilerFailed.
 
     The eager module is the registered child, so ``.to()`` and ``.eval()``
     behave as before; the compiled wrapper holds that same module, and
@@ -168,24 +169,19 @@ class _CompiledWithEagerFallback(nn.Module):
         super().__init__()
         self.model = eager_model
         object.__setattr__(self, "_compiled_model", compiled_model)
-        object.__setattr__(self, "_compiled_verified", False)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         compiled_model = self._compiled_model
         if compiled_model is None:
             return self.model(*args, **kwargs)
-        if self._compiled_verified:
-            return compiled_model(*args, **kwargs)
         try:
-            outputs = compiled_model(*args, **kwargs)
-        except Exception as exc:
+            return compiled_model(*args, **kwargs)
+        except (BackendCompilerFailed, TritonMissing) as exc:
             LOGGER.warning(
-                "torch.compile failed on the first forward (%s); continuing eagerly", exc
+                "torch.compile backend failed during forward (%s); continuing eagerly", exc
             )
             object.__setattr__(self, "_compiled_model", None)
             return self.model(*args, **kwargs)
-        object.__setattr__(self, "_compiled_verified", True)
-        return outputs
 
 
 def maybe_compile_model(

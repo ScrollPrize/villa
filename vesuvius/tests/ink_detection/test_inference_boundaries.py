@@ -10,6 +10,7 @@ import sys
 import pytest
 import torch
 from torch import nn
+from torch._dynamo.exc import BackendCompilerFailed
 import zarr
 
 from vesuvius.ink_detection.models.checkpoint import (
@@ -136,7 +137,11 @@ class _BackendThatFailsWhenItRuns(nn.Module):
 
     def forward(self, *args, **kwargs):
         self.calls += 1
-        raise RuntimeError("Cannot find a working triton installation")
+        raise BackendCompilerFailed(
+            lambda graph, inputs: None,
+            RuntimeError("Cannot find a working triton installation"),
+            first_useful_frame=None,
+        )
 
 
 def test_compile_falls_back_when_the_backend_fails_on_the_first_forward(monkeypatch, caplog):
