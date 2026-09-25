@@ -444,6 +444,10 @@ void byteswap_inplace(std::span<std::byte> data, std::size_t elem_size);
 void write_le64(std::byte* dst, std::uint64_t val);
 std::uint64_t read_le64(const std::byte* src);
 
+/// CRC-32C (Castagnoli), as the zarr v3 "crc32c" codec appends it (the
+/// 4-byte little-endian checksum follows the bytes it covers).
+[[nodiscard]] std::uint32_t crc32c(std::span<const std::byte> data) noexcept;
+
 // ----- Shard index -----
 
 /// Shard index entry: offset and nbytes for one inner chunk.
@@ -624,6 +628,9 @@ public:
     read_chunk_into(std::span<const std::size_t> chunk_indices,
                     std::span<std::byte> output) const;
 
+    /// Encode and store one chunk. On a sharded array the indices name an
+    /// inner chunk and it goes through write_inner_chunk_to_shard (local
+    /// arrays only).
     void write_chunk(std::span<const std::size_t> chunk_indices,
                      std::span<const std::byte> data);
 
@@ -689,9 +696,12 @@ public:
     void write_shard(std::span<const std::size_t> shard_indices,
                      std::span<const std::optional<std::vector<std::byte>>> inner_chunks);
 
-    /// Append a single chunk to its shard file. Index at start (fixed 8KB header).
-    /// Two tiny writes: (1) append chunk data at EOF, (2) update 16-byte index entry.
-    /// Creates shard with empty index if it doesn't exist.
+    /// Store one already-encoded inner chunk in its shard file (local arrays
+    /// only), creating the shard with an all-missing index if it doesn't exist.
+    /// index_location "start": append the data at EOF, then rewrite the index
+    /// entry in place (just those 16 bytes when there is no crc32c).
+    /// index_location "end": write the data over the old trailing index and
+    /// append the updated index (and its crc32c) after it.
     void write_inner_chunk_to_shard(std::span<const std::size_t> chunk_indices,
                                     std::span<const std::byte> data);
 
@@ -805,6 +815,22 @@ private:
     static constexpr std::size_t kShardMutexStripes = 64;
     mutable std::shared_ptr<std::array<std::mutex, kShardMutexStripes>>
         shard_write_mutexes_ = std::make_shared<std::array<std::mutex, kShardMutexStripes>>();
+
+    // Shard-index plumbing shared by every shard writer. Each honours
+    // index_location and a trailing crc32c index codec; the writers call
+    // check_shard_index_writable() before touching any file.
+    void check_shard_index_writable() const;
+    [[nodiscard]] std::vector<std::byte> encode_shard_index(const detail::ShardIndex& index) const;
+    [[nodiscard]] std::size_t linear_inner_index(std::span<const std::size_t> chunk_indices,
+                                                 std::vector<std::size_t>& shard_idx) const;
+    // Set index entry `linear` of the local shard at p. With a payload, the
+    // bytes are stored and the entry points at them; otherwise `entry` is
+    // written as is. Caller holds shard_mutex_for(p).
+    void set_shard_entry_locked(const std::filesystem::path& p, std::size_t linear,
+                                const std::span<const std::byte>* payload,
+                                detail::ShardIndexEntry entry);
+    [[nodiscard]] std::optional<detail::ShardIndexEntry>
+    read_shard_entry(const std::filesystem::path& p, std::size_t linear) const;
 
     [[nodiscard]] std::mutex& shard_mutex_for(const std::filesystem::path& p) const {
         // hash_value(path) instead of hash<string>(native()): path::native()

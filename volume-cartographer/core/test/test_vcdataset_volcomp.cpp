@@ -11,6 +11,7 @@
 #include "utils/zarr.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -196,6 +197,41 @@ TEST_CASE("volcomp: v3 sharded array with index_location=end and crc32c index")
     REQUIRE(whole.has_value());
     REQUIRE(whole->size() == N);
     CHECK(std::memcmp(whole->data(), out.data(), N) == 0);
+
+    // Writes keep the trailing index: fill the absent chunk 0 and replace
+    // chunk 1 through VcDataset (write_chunk -> encode -> shard), then read
+    // both back through a fresh dataset. The index stays the file's last
+    // bytes, followed by a valid crc32c.
+    auto src0 = synth(21), src1 = synth(22);
+    {
+        vc::VcDataset w(d / "arr");
+        CHECK(w.writeChunk(0, 0, 0, src0.data(), src0.size()));
+        CHECK(w.writeChunk(1, 0, 0, src1.data(), src1.size()));
+    }
+    {
+        vc::VcDataset r(d / "arr");
+        std::vector<uint8_t> a(N), b(N);
+        CHECK(r.readChunk(0, 0, 0, a.data()));
+        CHECK(r.readChunk(1, 0, 0, b.data()));
+        CHECK(psnr(src0, a) > 38.0);
+        CHECK(psnr(src1, b) > 38.0);
+    }
+    {
+        std::ifstream f(d / "arr" / "c" / "0" / "0" / "0", std::ios::binary);
+        std::vector<char> raw((std::istreambuf_iterator<char>(f)), {});
+        REQUIRE(raw.size() > 36);
+        const auto* idx = reinterpret_cast<const std::byte*>(raw.data()) + raw.size() - 36;
+        uint32_t crc = 0;
+        for (int i = 0; i < 4; ++i) crc |= uint32_t(uint8_t(raw[raw.size() - 4 + i])) << (8 * i);
+        CHECK(crc == utils::detail::crc32c(std::span<const std::byte>(idx, 32)));
+        for (int c = 0; c < 2; ++c) {
+            const auto off = utils::detail::read_le64(idx + c * 16);
+            const auto n = utils::detail::read_le64(idx + c * 16 + 8);
+            CHECK(off + n <= raw.size() - 36);
+            auto sp = std::span<const std::byte>(reinterpret_cast<const std::byte*>(raw.data()) + off, n);
+            CHECK(utils::is_volcomp_compressed(sp));
+        }
+    }
     fs::remove_all(d);
 }
 
