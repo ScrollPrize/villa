@@ -246,6 +246,7 @@ def _export_source_surface(
         step,
         voxel_size_um,
         source="flatten_spiral_checkpoint.py",
+        z_direction_is_top_to_bottom=checkpoint.get("z_direction_is_top_to_bottom"),
         first_winding=first,
         cleanup_erosion_cells=3,
         base_shape_zyx=checkpoint.get("base_shape_zyx"),

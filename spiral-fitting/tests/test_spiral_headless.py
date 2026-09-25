@@ -205,7 +205,8 @@ class HandoffTests(unittest.TestCase):
             destination = Path(temporary) / "generation-1"
             blocks = {winding: np.full((3, 2, 3), winding, dtype=np.float32)
                       for winding in range(10, 13)}
-            save_combined_tifxyz(blocks, destination, "preview", 20, 9.6, "test")
+            save_combined_tifxyz(blocks, destination, "preview", 20, 9.6, "test",
+                                 z_direction_is_top_to_bottom=None)
             metadata = json.loads((destination / "preview" / "meta.json").read_text())
             manifest = json.loads((destination / "manifest.json").read_text())
             self.assertEqual(manifest["schema_version"], 2)
@@ -213,11 +214,12 @@ class HandoffTests(unittest.TestCase):
                 metadata["winding_column_ranges"], [[0, 2], [2, 4], [4, 6]]
             )
             self.assertNotIn("components", metadata)
-            self.assertEqual(metadata["component_winding_ids"], [10, 11, 12])
+            # Outermost winding first.
+            self.assertEqual(metadata["component_winding_ids"], [12, 11, 10])
             from PIL import Image
             x = np.asarray(Image.open(destination / "preview" / "x.tif"))
             self.assertEqual(x.shape, (3, 6))
-            self.assertTrue(np.all(x[:, 1] == 10))
+            self.assertTrue(np.all(x[:, 1] == 12))
             self.assertTrue(np.all(x[:, 2] == 11))
 
     def test_combined_preview_cleanup_publishes_one_authoritative_component(self):
@@ -228,7 +230,7 @@ class HandoffTests(unittest.TestCase):
             block[5:13, 23:30] = [40.0, 50.0, 60.0]
             save_combined_tifxyz(
                 {10: block}, destination, "preview", 1, 9.6, "test",
-                cleanup_erosion_cells=3)
+                z_direction_is_top_to_bottom=None, cleanup_erosion_cells=3)
 
             metadata = json.loads(
                 (destination / "preview" / "meta.json").read_text())
@@ -246,8 +248,9 @@ class HandoffTests(unittest.TestCase):
             valid = np.isfinite(coordinates).all(axis=0) & ~np.all(
                 np.stack(coordinates, axis=-1) == -1.0, axis=-1)
             self.assertEqual(int(valid.sum()), 72)
-            self.assertTrue(valid[4:12, 4:13].all())
-            self.assertFalse(valid[:, 20:].any())
+            # Columns are written mirrored (outermost first).
+            self.assertTrue(valid[4:12, 19:28].all())
+            self.assertFalse(valid[:, :12].any())
 
 
 class PreviewRangeTests(unittest.TestCase):
@@ -328,7 +331,7 @@ class PreviewWindingBoundTests(unittest.TestCase):
             object(), torch.tensor(500.0), [], [], "/unused", cfg,
             z_begin=0, z_end=100, voxel_size_um=9.6,
             get_or_build_unattached_pcl_flat=lambda *_: None,
-            surface_id="surface")
+            surface_id="surface", z_direction_is_top_to_bottom=None)
 
     def test_a_configured_shell_index_is_taken_without_deriving_it(self):
         cfg = {"shell_outer_winding_idx": 130, "output_first_winding": 10,

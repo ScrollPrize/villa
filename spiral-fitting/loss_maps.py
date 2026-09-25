@@ -18,6 +18,8 @@ import re
 import numpy as np
 from PIL import Image
 
+from surface_orientation import GridLayout
+
 
 _active_recorder = None
 
@@ -74,11 +76,6 @@ class LossMapRecorder:
         ranges = preview_manifest.get(
             "winding_column_ranges", preview_manifest.get("components", [])
         )
-        self.components = {
-            int(winding): (int(bounds[0]), int(bounds[1]))
-            for winding, bounds in zip(preview_manifest["winding_ids"],
-                                       ranges)
-        }
         surface = self.generation_path / preview_manifest["surface_id"] / "x.tif"
         with Image.open(surface) as image:
             self.width, self.height = image.size
@@ -86,6 +83,15 @@ class LossMapRecorder:
             # of an invalid vertex.  One channel is sufficient to recover the
             # validity mask and avoids painting splats into black preview gaps.
             self.surface_valid = np.asarray(image).copy() != -1.0
+        # Samples are placed in spiral order (theta and z ascending) and then
+        # mapped into the layout the surface was written in.
+        self.layout = GridLayout.from_metadata(preview_manifest)
+        self.components = {
+            int(winding): tuple(self.layout.column_range(
+                int(bounds[0]), int(bounds[1]), self.width))
+            for winding, bounds in zip(preview_manifest["winding_ids"],
+                                       ranges)
+        }
         self._maps = {}
         self._stats = {}
 
@@ -163,8 +169,10 @@ class LossMapRecorder:
                          & (selected_cols >= first) & (selected_cols < end))
             if not in_bounds.any():
                 continue
-            projected_rows = selected_rows[in_bounds]
-            projected_cols = selected_cols[in_bounds]
+            projected_rows = self.layout.rows(
+                selected_rows[in_bounds], self.height)
+            projected_cols = self.layout.columns(
+                selected_cols[in_bounds], self.width)
             projected_values = values[selected][in_bounds]
             on_surface = self.surface_valid[projected_rows, projected_cols]
             stats["projected"] += int(len(projected_rows))
