@@ -133,6 +133,8 @@ You also need to provide a **`spiral-scroll.json`** in the dataset root, recordi
 }
 ```
 
+`python fit_spiral.py --dataset <root> --check` prints a copy of this file with everything it can read off the dataset already filled in, lists which inputs your configuration needs and which the dataset has, and exits without fitting; it needs no GPU, so it is worth running while the download is still going.
+
 `name` is free-form and is what appears in the generated run-folder name. `spiral_outward_sense` (`"CW"` or `"ACW"`) says which way the spiral turns as it winds outward. No automated method determines it: it is read off the CT data by a person in VC3D, or taken from an already-fitted spiral. The file can also carry a `paths` object naming individual inputs whose filenames don't match the conventional ones (`"tracks_dbm"` is the usual one), and `normal_zarr_group` / `lasagna_scale`, which choose the OME-Zarr pyramid level the lasagna normal stores are read at — these are easy to get wrong silently, so read the scale off the store's own `.zattrs` rather than copying another scroll's values. The [spiral-fitting README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md) documents the full schema.
 
 ##### The fit configuration
