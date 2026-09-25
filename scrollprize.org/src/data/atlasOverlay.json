@@ -142,7 +142,33 @@
         "textRank": 4,
         "unrolledPct": "To Be Estimated",
         "score": 4227.6,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/67a53a6c01000001019dbc46/view"
+        "wk": [
+          {
+            "name": "scroll1-new",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/67a53a6c01000001019dbc46/view"
+          },
+          {
+            "name": "scroll1a",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/6742cecc010000c300564082/view"
+          },
+          {
+            "name": "s1a-with-surfaces",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/685cb5b101000057025292db/view"
+          },
+          {
+            "name": "s1a-with-fibers",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/67923382010000bf00c7660e/view"
+          },
+          {
+            "name": "s1a-with-fibers-hzvt-05032025",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/67c8b710010000130592a777/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -188,7 +214,23 @@
         "textRank": 0,
         "unrolledPct": 0,
         "score": 7.6,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/67927bc30100003c00c76700/view"
+        "wk": [
+          {
+            "name": "scroll2a-standardized",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/67927bc30100003c00c76700/view"
+          },
+          {
+            "name": "scroll2b-standardized",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/67949f83010000b200a222ef/view"
+          },
+          {
+            "name": "scroll2c-standardized",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/6794a050010000b000a222f2/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -226,7 +268,28 @@
         "textRank": 1,
         "unrolledPct": 0,
         "score": 1017.6,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/67927b3f010000dd00c766fc/view"
+        "wk": [
+          {
+            "name": "scroll3-standardized",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/67927b3f010000dd00c766fc/view"
+          },
+          {
+            "name": "s3-53kev-3.24um",
+            "px": 3.24,
+            "url": "https://wk.aws.ash2txt.org/datasets/67d42183010000eb00fc9e28/view"
+          },
+          {
+            "name": "s3-with-fibers",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/67949438010000fe02a222e7/view"
+          },
+          {
+            "name": "s3-with-hzvt-highres",
+            "px": 3.24,
+            "url": "https://wk.aws.ash2txt.org/datasets/67d421e8010000eb00fc9e2b/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -262,7 +325,33 @@
         "textRank": 3,
         "unrolledPct": 100,
         "score": 3477.8,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/67a6261a010000ad009dbd0a/view"
+        "wk": [
+          {
+            "name": "scroll4-highres",
+            "px": 3.24,
+            "url": "https://wk.aws.ash2txt.org/datasets/67a6261a010000ad009dbd0a/view"
+          },
+          {
+            "name": "scroll4-standardized",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/67927b8a010000f503c766fe/view"
+          },
+          {
+            "name": "s4-with-surfaces",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/67b5eadd0100003d001961be/view"
+          },
+          {
+            "name": "s4-with-rectoverso-13032025",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/67d43b9f010000944dfc9e66/view"
+          },
+          {
+            "name": "s4-with-hzvt-13032025",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/67d43e9b010000944dfc9e6f/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -293,7 +382,23 @@
         "textRank": 2,
         "unrolledPct": 70,
         "score": 2352.1,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/67448b8e010000260a5640ce/view"
+        "wk": [
+          {
+            "name": "scroll5-full",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/67448b8e010000260a5640ce/view"
+          },
+          {
+            "name": "s5-with-fibers",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/6793feba010000a8009180f4/view"
+          },
+          {
+            "name": "s5-with-hzvt-11032025",
+            "px": 7.91,
+            "url": "https://wk.aws.ash2txt.org/datasets/67d08d1a010000c000fc8909/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -331,7 +436,13 @@
         "textRank": 0,
         "unrolledPct": 0,
         "score": 7.6,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/6867f181010000e800d2f8c7/view"
+        "wk": [
+          {
+            "name": "PHerc0009B-9um",
+            "px": 8.64,
+            "url": "https://wk.aws.ash2txt.org/datasets/6867f181010000e800d2f8c7/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -388,7 +499,13 @@
         "textRank": 2,
         "unrolledPct": 20,
         "score": 2131.9,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/68936bbf01000002015bf075/view"
+        "wk": [
+          {
+            "name": "PHerc0139",
+            "px": 9.362,
+            "url": "https://wk.aws.ash2txt.org/datasets/68936bbf01000002015bf075/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -595,8 +712,7 @@
         "textFound": "Scanned",
         "textRank": 0,
         "unrolledPct": 0,
-        "score": 1.4,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/6867f0ff010000e305d2f8c2/view"
+        "score": 1.4
       },
       "stages": {
         "scanned": true,
@@ -622,7 +738,18 @@
         "textRank": 0,
         "unrolledPct": 0,
         "score": 7.8,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/6867f0ff010000e305d2f8c2/view"
+        "wk": [
+          {
+            "name": "PHerc0343P-2um",
+            "px": 2.215,
+            "url": "https://wk.aws.ash2txt.org/datasets/6867f0de0100000806d2f8bf/view"
+          },
+          {
+            "name": "PHerc0343P-4um",
+            "px": 8.64,
+            "url": "https://wk.aws.ash2txt.org/datasets/6867f0ff010000e305d2f8c2/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
@@ -779,7 +906,18 @@
         "textRank": 0,
         "unrolledPct": 0,
         "score": 7.8,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/6867f042010000b000d2f8b6/view"
+        "wk": [
+          {
+            "name": "PHerc0500P2-2um",
+            "px": 2.215,
+            "url": "https://wk.aws.ash2txt.org/datasets/6867f042010000b000d2f8b6/view"
+          },
+          {
+            "name": "PHerc0500P2-4um",
+            "px": 4.317,
+            "url": "https://wk.aws.ash2txt.org/datasets/6867f07a010000ac00d2f8b9/view"
+          }
+        ]
       },
       "stages": {
         "scanned": true,
