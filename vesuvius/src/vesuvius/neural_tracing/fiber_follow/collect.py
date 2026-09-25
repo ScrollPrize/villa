@@ -22,7 +22,7 @@ from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume
 
 
 class DecisionCollector:
-    """Original-fiber, progress-bounded teacher, including pre-failure windows."""
+    """Original-fiber, progress-bounded labeler, including pre-failure windows."""
     def __init__(self, fiber, fiber_idx, t0, sign, cfg, band=None, off_dist=3.5,
                  before=48., after=24., stride=16., max_states=192):
         self.fiber, self.fi, self.t, self.sign = fiber, fiber_idx, t0, sign
@@ -86,9 +86,12 @@ class DecisionCollector:
                            t=self.t, reverse=sign < 0, offtrack=offtrack)
         if not training_state_allowed(item, self.cfg.crop, self.band):
             return False  # do not trace through held-out space and resume afterwards
-        row = {k: state[k] for k in ('pos', 'frame', 'hist', 'hmask', 'exploratory',
-                                      'candidates', 'chosen', 'confidence', 'rank_scores')}
-        row.update(fiber_idx=self.fi, t=self.t, reverse=sign < 0, offtrack=offtrack, hard=hard)
+        row = {k: state[k] for k in ('pos', 'frame', 'hist', 'hmask', 'exploratory')}
+        # Current-position error against the matched GT point, in trace-grid
+        # voxels; departed states have no correspondence. Lets replay stratify
+        # on recoverable drift without relabeling every state at load time.
+        drift = float('nan') if offtrack else float(np.linalg.norm(item['gt_history'][0]))
+        row.update(source_cache=-1, source_row=len(self.rows), fiber_idx=self.fi, t=self.t, reverse=sign < 0, offtrack=offtrack, hard=hard, drift=drift)
         self.rows.append(row)
         self.distances.append(travelled)
         self.last_travelled = travelled
@@ -134,8 +137,7 @@ def main(argv=None):
     torch.set_num_threads(args.threads)
     model, crop, n_hist, spec, ck = load_checkpoint(args.checkpoint, args.device)
     cfg = SampleConfig(crop=crop, n_history=n_hist, recent_history_points=model.cfg.recent_history_points,
-                       n_future=model.cfg.n_future, future_step=model.cfg.future_step,
-                       n_candidates=model.cfg.flow_samples)
+                       n_future=model.cfg.n_future, future_step=model.cfg.future_step)
     if args.fiber_zarrs:
         spec.fiber_zarr_dir = args.fiber_zarrs
     vol = FiberVolume(spec, cache_bytes=2 << 30)
@@ -146,9 +148,9 @@ def main(argv=None):
     rng = np.random.default_rng(args.seed)
     seeds = []
     for fi in rng.permutation(len(train_f)):
-        candidates = make_seeds([train_f[fi]], vol, per_fiber=args.seeds_per_fiber,
+        seed_pool = make_seeds([train_f[fi]], vol, per_fiber=args.seeds_per_fiber,
                                 min_presence=.8, seed=int(rng.integers(2**31)))
-        for seed in candidates:
+        for seed in seed_pool:
             seed['fiber'] = int(fi)
             if not band.lo-64 <= seed['pos'][2] < band.hi+64:
                 seeds.append(seed)
@@ -177,15 +179,16 @@ def main(argv=None):
                         provenance=dict(checkpoint=os.path.abspath(args.checkpoint), step=ck.get('step'),
                                         model_cfg=model.cfg.to_dict(), crop=asdict(crop),
                                         volume=spec.to_dict(), collection=vars(args)),
-                        **{key: np.asarray([row[key] for row in rows]) for key in OnPolicyStates.FIELDS})
+                        **{key: np.asarray([row[key] for row in rows])
+                           for key in OnPolicyStates.FIELDS + tuple(OnPolicyStates.OPTIONAL)})
     path = Path(args.out)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(path.stem+'.partial.npz')
     st.save(temp)
     # Pre-create mmap before publishing so multiple loader workers never race.
     OnPolicyStates.load(temp)
-    temp_mmap = Path(str(temp)[:-4]+'_mmap_v4')
-    final_mmap = Path(str(path)[:-4]+'_mmap_v4')
+    temp_mmap = Path(str(temp)[:-4]+'_mmap_v5')
+    final_mmap = Path(str(path)[:-4]+'_mmap_v5')
     os.replace(temp_mmap, final_mmap)
     os.replace(temp, path)
     print(json.dumps(dict(states=len(st), hard=int(st.hard.sum()), offtrack=int(st.offtrack.sum()), out=str(path))))

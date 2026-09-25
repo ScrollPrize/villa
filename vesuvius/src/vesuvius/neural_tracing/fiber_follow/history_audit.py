@@ -7,7 +7,7 @@ import torch
 from vesuvius.neural_tracing.fiber_follow.collect import DecisionCollector
 from vesuvius.neural_tracing.fiber_follow.data import SampleConfig, label_state
 from vesuvius.neural_tracing.fiber_follow.history_metrics import TANGENT_POINTS, observed_measurements
-from vesuvius.neural_tracing.fiber_follow.supervision import candidate_labels
+from vesuvius.neural_tracing.fiber_follow.supervision import prefix_labels
 
 
 class HistoryAudit:
@@ -20,7 +20,7 @@ class HistoryAudit:
     def __init__(self, tracer, tolerance=1.5):
         cfg = tracer.model.cfg
         self.cfg = SampleConfig(crop=tracer.crop, n_history=tracer.n_history, recent_history_points=cfg.recent_history_points,
-                                n_future=cfg.n_future, future_step=cfg.future_step, n_candidates=cfg.flow_samples)
+                                n_future=cfg.n_future, future_step=cfg.future_step)
         self.tangent_points, self.tolerance = TANGENT_POINTS, tolerance
         self.threshold = tracer.p.confidence
         self.max_recovery_distance = cfg.max_recovery_distance
@@ -47,12 +47,11 @@ class HistoryAudit:
                            self.cfg, t=collector.t, reverse=collector.sign < 0, offtrack=row['offtrack'])
         tensor = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32)[None]
         batch = {k: tensor(item[k]) for k in ('dense_ab', 'dense_mask', 'endpoint_known', 'end_local', 'offtrack')}
-        labels, masks, _, _ = candidate_labels(tensor(state['candidates']), batch, self.tolerance,
+        labels, masks, _ = prefix_labels(tensor(state['points']), batch, self.tolerance,
                                               self.max_recovery_distance)
-        chosen = state['chosen']
-        known = bool(masks[0, chosen, 0])
-        correct = bool(labels[0, chosen, 0])
-        gate_open = not state.get('recovery_blocked', False) and bool(state['confidence'][chosen, 0] >= self.threshold)
+        known = bool(masks[0, 0])
+        correct = bool(labels[0, 0])
+        gate_open = not state.get('recovery_blocked', False) and bool(state['confidence'][0] >= self.threshold)
         groups = ['all', 'offtrack' if row['offtrack'] else 'ontrack']
         if state.get('recovery_blocked', False):
             groups.append('recovery_blocked')
@@ -62,8 +61,6 @@ class HistoryAudit:
                 groups.append('false_stop_first')
             if not correct and gate_open:
                 groups.append('false_go_first')
-            if not row['offtrack'] and masks[0, :, 0].all() and not labels[0, :, 0].any():
-                groups.append('no_correct_candidate_first')
         measurements = observed_measurements(tensor(item['hist_local']), tensor(item['hmask']),
                                              tensor(item['gt_history']), tensor(item['gt_history_mask']),
                                              self.tangent_points)

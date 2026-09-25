@@ -18,7 +18,7 @@ from vesuvius.neural_tracing.fiber_follow.geometry import (
     normalize,
 )
 from vesuvius.neural_tracing.fiber_follow.model import FollowNet
-from vesuvius.neural_tracing.fiber_follow.policy import DEFAULT_CONFIDENCE, choose_candidate
+from vesuvius.neural_tracing.fiber_follow.policy import DEFAULT_CONFIDENCE, commit_prefix
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume
 
 
@@ -30,17 +30,17 @@ class TraceParams:
     loop_radius: float = 1.5
     loop_skip: int = 40
     explore_calls: int = 0  # collection only: bounded suffix after first would-stop
-    # Stop policy. A would-stop call (no candidate prefix clears ``confidence``)
+    # Stop policy. A would-stop call (the curve prefix clears ``confidence``)
     # ends the trace only after ``stop_patience`` consecutive such calls; the
-    # earlier ones commit a single point of the top-ranked candidate, provided
+    # earlier ones commit a single point of the predicted curve, provided
     # its first-point confidence reaches ``commit_floor`` (None: no floor).
     # Defaults reproduce the immediate stop.
     stop_patience: int = 1
     commit_floor: float | None = None
-    seed: int = 0  # seeds the flow sampler once per trace call, so rollouts are reproducible
+    seed: int = 0  # reserved for reproducible seed manifests; inference is deterministic
 
     def __post_init__(self):
-        if self.n_commit < 1 or self.max_len <= 0 or not 0 <= self.confidence <= 1 or self.explore_calls < 0:
+        if not 1 <= self.n_commit <= 4 or self.max_len <= 0 or not 0 <= self.confidence <= 1 or self.explore_calls < 0:
             raise ValueError('Invalid rollout parameters')
         if self.stop_patience < 1 or (self.commit_floor is not None and not 0 <= self.commit_floor <= 1):
             raise ValueError('stop_patience must be positive and commit_floor within [0, 1]')
@@ -98,7 +98,7 @@ class ModelTracer:
         self.pool.shutdown(wait=True)
 
     @torch.no_grad()
-    def trace(self, seeds_xyz, headings, histories=None, abort=None, on_decision=None):
+    def trace(self, seeds_xyz, headings, histories=None, abort=None, on_decision=None, initial_states=None):
         """Greedy rollout, checking supervised confidence before committing.
 
         on_decision(i, state) observes the exact inference input and proposals,
@@ -109,18 +109,25 @@ class ModelTracer:
         was_training = self.model.training
         self.model.eval()
         try:
-            return self._trace(seeds_xyz, headings, histories, abort, on_decision)
+            return self._trace(seeds_xyz, headings, histories, abort, on_decision, initial_states)
         finally:
             self.model.train(was_training)
 
-    def _trace(self, seeds_xyz, headings, histories, abort, on_decision):
+    def _trace(self, seeds_xyz, headings, histories, abort, on_decision, initial_states=None):
         from vesuvius.neural_tracing.fiber_follow.geometry import arclength, interp_at
         n = len(seeds_xyz)
         paths = [[np.asarray(s, np.float64)] for s in seeds_xyz]
         if histories is not None:
             paths = [list(np.asarray(h, np.float64))+[np.asarray(s, np.float64)] for h, s in zip(histories, seeds_xyz)]
+        if initial_states is not None:
+            if len(initial_states) != n:
+                raise ValueError('One initial observed state is required per seed')
+            paths = [list(np.asarray(s['hist'])[np.asarray(s['hmask'])>0][::-1])+[np.asarray(p,dtype=np.float64)]
+                     for s,p in zip(initial_states,seeds_xyz)]
         hist_start = [len(p)-1 for p in paths]
         frames = [frame_from_heading(h) for h in headings]
+        if initial_states is not None:
+            frames = [np.asarray(s['frame']).copy() for s in initial_states]
         active = np.ones(n, bool)
         reasons = ['']*n
         length = np.zeros(n)
@@ -128,8 +135,6 @@ class ModelTracer:
         stop_streak = np.zeros(n, int)
         last_segment = [np.asarray([p[-1]]) for p in paths]
         pp = self.p
-        generator = torch.Generator(device=self.device)
-        generator.manual_seed(pp.seed)
         while active.any():
             idx = np.flatnonzero(active)
             pos = np.stack([paths[i][-1] for i in idx])
@@ -138,6 +143,10 @@ class ModelTracer:
             hist_world = np.zeros((len(idx), H, 3))
             hm = np.zeros((len(idx), H), np.float32)
             for j, i in enumerate(idx):
+                if initial_states is not None and length[i] == 0:
+                    hist_world[j] = initial_states[i]['hist']
+                    hm[j] = initial_states[i]['hmask']
+                    continue
                 past = np.asarray(paths[i][-2*H-2:])
                 arc = arclength(past)
                 target = arc[-1]-np.arange(1, H+1)
@@ -155,24 +164,22 @@ class ModelTracer:
                 items = [dict(pos=p, frame=f) for p, f in zip(pos, fr)]
                 x = add_presence_input(x, items, self.vol, self.crop, self.grid, self.pool)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
-                out = self.model(x, tensor(hist).float(), tensor(hm), generator=generator)
-            selected, commits, allowed = choose_candidate(
-                out['candidates'], out['ranks'], out['confidence'], pp.confidence, pp.n_commit,
-                self.model.cfg.max_recovery_distance)
-            selected, commits, allowed = [v.cpu().numpy() for v in (selected, commits, allowed)]
-            candidates, ranks, confidence = [out[k].float().cpu().numpy() for k in ('candidates', 'ranks', 'confidence')]
+                out = self.model(x, tensor(hist).float(), tensor(hm))
+            commits, allowed = commit_prefix(out['points'], out['confidence'], pp.confidence, pp.n_commit,
+                                             self.model.cfg.max_recovery_distance)
+            commits, allowed = [v.cpu().numpy() for v in (commits, allowed)]
+            points, confidence = [out[k].float().cpu().numpy() for k in ('points', 'confidence')]
             for j, i in enumerate(idx):
                 conf = np.minimum.accumulate(confidence[j], axis=-1)
-                chosen, commit = int(selected[j]), int(commits[j])
-                recovery_blocked = not allowed[j].any()
+                commit = int(commits[j])
+                recovery_blocked = not allowed[j]
                 would_stop = commit == 0
                 if would_stop and not recovery_blocked and exploration[i] < 0 and pp.explore_calls:
                     exploration[i] = 0
                 exploratory = exploration[i] >= 0
                 state = dict(pos=pos[j].copy(), frame=fr[j].copy(), hist=hist_world[j].copy(), hmask=hm[j].copy(),
-                             candidates=candidates[j].copy(), rank_scores=ranks[j].copy(), confidence=conf.copy(),
-                             chosen=chosen, n_commit=commit, would_stop=would_stop, exploratory=exploratory,
-                             recovery_allowed=allowed[j].copy(), recovery_blocked=bool(recovery_blocked),
+                             points=points[j].copy(), confidence=conf.copy(), n_commit=commit, would_stop=would_stop, exploratory=exploratory,
+                             recovery_allowed=bool(allowed[j]), recovery_blocked=bool(recovery_blocked),
                              travelled=float(length[i]), last_segment=last_segment[i].copy())
                 if on_decision is not None and on_decision(int(i), state) is False:
                     active[i], reasons[i] = False, 'oracle'
@@ -185,7 +192,7 @@ class ModelTracer:
                     continue
                 if would_stop and not exploratory:
                     stop_streak[i] += 1
-                    below_floor = pp.commit_floor is not None and conf[chosen, 0] < pp.commit_floor
+                    below_floor = pp.commit_floor is not None and conf[0] < pp.commit_floor
                     if stop_streak[i] >= pp.stop_patience or below_floor:
                         active[i], reasons[i] = False, 'confidence'
                         continue
@@ -194,7 +201,7 @@ class ModelTracer:
                 if exploratory:
                     exploration[i] += 1
                 commit = max(1, commit)
-                world = pos[j]+candidates[j, chosen, :commit] @ fr[j].T
+                world = pos[j]+points[j, :commit] @ fr[j].T
                 seg = np.concatenate([pos[j][None], world])
                 new = []
                 remaining = pp.max_len-length[i]

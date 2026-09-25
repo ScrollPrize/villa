@@ -6,7 +6,7 @@ history (input channel and conditioning vector), and every candidate becomes a
 fixed-length polyline of ``k_back`` trunk points, the anchor, and ``k_fwd`` new
 points, all in the anchor's local frame. Labels compare only the new points
 with the annotated curve, using the same tolerance/prefix/censoring semantics
-as ``supervision.candidate_labels``.
+as the follower's dense prefix labels.
 """
 from __future__ import annotations
 

@@ -1,6 +1,6 @@
 # fiber_follow — how it works and what we've tried
 
-Status as of 2026-09-24. See `README.md` for file layout and commands.
+Status as of 2026-09-25. See `README.md` for file layout and commands.
 
 > **Historical results: pre-`controlled_spans_v2`.** The early experiments in the Historical implementation section used
 > extrapolated tails as labels, treated annotation ends as stop targets, and
@@ -8,6 +8,55 @@ Status as of 2026-09-24. See `README.md` for file layout and commands.
 > also omitted continuation after reaching an annotation endpoint. The current
 > loader/scorer fixes these issues; see `README.md` for the new semantics and
 > fresh-training commands. The numbers below are not a controlled-span benchmark.
+
+## Deterministic-path gate fine-tune, frozen arm: negative result (2026-09-25)
+
+Follow-up to the scorer ablation (`output/flow_v10_small_b8_d64/scorer_ablation_20260925/`),
+which found selection solved by the `y0 = 0` flow path and the remaining failures in the
+gate: at 1.5–2 voxels of drift the committed path is wrong 84% of the time and the gate
+closes on 5.5% of those states. The question was whether that is a supervision problem
+or a feature problem. `scripts/launch_det_gate.sh det_gate_frozen frozen` fine-tuned the
+50k EMA checkpoint for 10k steps (batch 8, lr 1e-4, cosine, 5.2 steps/s) with the encoder,
+history conditioning and flow frozen: rank loss off, slot 0 the `y0 = 0` path committed
+alone, half the confidence loss on that slot over the commit window, replay stratified
+50% fresh / 25% drift 1–2 vox / 15% other / 5% departed (gate-open ×3), collection at 0.7,
+diagnostics at 0.85. Run: `output/det_gate_frozen/`; sweep: `eval_det_gate/gate_sweep.txt`.
+
+**Training.** Losses were flat for the whole run (confidence BCE 0.29–0.44, committed-slot
+term 0.17–0.40, no trend). The head recalibrated downward: false stops on correct commits
+at 0.7 rose from 2% (source run) to 5–8% on training batches, the 32-seed rollout
+diagnostic fell from 0.60 coverage at step 500 to 0.08 from step 2,000 on (precision
+0.997), and 64-seed collections at 0.7 shrank from 4,045 states to 1,387–2,066 against
+2,100–3,000 for the source run. Five percent departed states was not enough of a
+reduction from v7's over-stopping recipe once the 25% drift stratum was added.
+
+**Paired sweep.** Both checkpoints were rolled out with the gate off on the same 48
+calibration traces (600-voxel cap, flow seed 0). Because the generator was frozen they commit
+the identical path from identical states: 5,870 paired decisions, 5,801 on track, 69 departed.
+At matched false-stop rates on correct sub-1-voxel states the fine-tuned head is no better:
+
+| model | threshold | false stops (<1 vox, correct) | closed at 1.5–2 vox | closed off-track |
+| --- | ---: | ---: | ---: | ---: |
+| baseline | 0.85 | 0.6% | 5.1% | 34.8% |
+| frozen | 0.30 | 0.7% | 7.0% | 30.4% |
+| baseline | 0.90 | 1.0% | 7.0% | 37.7% |
+| frozen | 0.50 | 1.6% | 15.3% | 40.6% |
+
+AUC of first-plane confidence for four-plane correctness: 0.695 → 0.662 overall, 0.913 →
+0.860 below 1 voxel, 0.648 → 0.613 at 1–1.5, 0.446 → 0.573 at 1.5–2 (157 states, both
+near chance). On-track vs departed AUC 0.690 → 0.686. Confidence fell by 0.10 on correct
+sub-1-voxel states and by 0.15–0.20 on drifted states whether the committed path was right
+or wrong: the head learned that drifted states look different, not which continuations
+fail, and even that does not move the operating curve.
+
+**Conclusion.** With fixed features, targeted gate supervision does not improve stopping.
+The gate is feature-limited: the flow's whole sample cloud leaves the fiber and the gate is
+asked to detect the model's own error from the features that produced it. The joint arm
+was not run. Deployable policy stays the 50k checkpoint with the deterministic path at
+0.85–0.90 (or conf4 ranking at 0.7). Next compute goes to reducing drift, starting with
+the backward-context crop from the assessment (45% of history tokens fall outside the
+current crop). Caveats: one flow seed, 48 traces, 600-voxel cap; the 1.5–2 and off-track
+bins hold 157 and 69 decisions.
 
 ## Normalized future flow and all-sample scoring (v10, 2026-09-24)
 
@@ -1009,3 +1058,84 @@ OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 .venv/bin/python -m vesuvius.neural_tracing.
 Completion timing and replay counts vary because collection is asynchronous.
 Look for `dagger_states` events followed by increasing `replay_samples_seen`.
 An unfinished final collection is explicitly discarded at training shutdown.
+
+
+## 2026-09-25: single_path_flow_v11 implementation and first run
+
+The active follower was replaced by a 16-point history-conditioned denoiser:
+176×96×96 level-1 CT/presence/history crop, 128 supplied history tokens,
+(24,64,128) spatial widths, six 256-wide / eight-head denoising blocks,
+coarse image cross-attention, four midpoint updates from zero, and a final
+confidence evaluation. No candidate/ranking/support/teacher path remains in the
+active follower. The shared encoder was extracted; a saved beam state dictionary
+loads strictly and reproduces its saved outputs exactly on CPU.
+
+The before-change source archive, original 50k EMA checkpoint hashes, original
+96-seed deterministic rollout results (thresholds .70/.85, cap 1200), and geometry
+identities are preserved under `output/single_path_v11_baseline/`. A CPU baseline
+fixture smoke evaluated four frozen augmented states at .5/.85; it is explicitly
+not the final comparison. Another fixture contains 48 actual observed baseline
+decisions from four calibration seeds with a 48-voxel cap. That initial fixture
+used fixed per-decision support RNG; the archived rollout adapter now resets the
+legacy sampling RNG once per trace, matching v10's original tracing behavior.
+A subsequent GPU fixture with the original per-trace RNG preserved 52 decisions
+from the same four seeds (`observed_recovery_trace_rng.npz`). The 384 augmented
+recovery states are independent of either model's outputs.
+
+`output/single_path_v11_preparation/` contains the frozen seed manifest and permanent
+bank. Import scanned 131,470 training decisions, rejected 2,017 for larger-footprint
+holdout overlap, removed six duplicates, and selected 20,000 unique states from
+129,447 eligible states. Each stored state retains original-fiber correspondence
+and source-cache/row provenance. Fixed/recent pools validate independently; the
+published collection smoke contains six decisions from two training seeds.
+
+Frozen evaluation groups: original 32 monitor fibers (32 seeds), original 48
+assessment fibers (96 seeds), and remaining 44 final fibers (176 seeds).
+The former deterministic evaluation script excluded assessment fibers alone;
+v11 also excludes monitor fibers from final evaluation. The manifest SHA256 is
+`1ae303f787f1ce611614c421b57ee44afc77bd759d192a0d277ff61239c62aaf`.
+
+Verification command (existing environment, current checkout on PYTHONPATH):
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=../../.. \
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 AGENTS_AGENT_MODE=1 \
+  /home/sean/Documents/villa/vesuvius/.venv/bin/python -m pytest tests -q \
+  -o cache_dir=/tmp/single-path-cuda-pytest
+```
+
+34 tests pass with GPU access; sandboxed CPU execution reports 33 passed and one
+CUDA skip. Tests cover masked/unsupported history, bidirectional dependencies,
+fixed coordinates, GT isolation, final-curve labels/gradient routes, exact masked
+accumulation across differing censoring/departure patterns, midpoint integration,
+replay import/rotation, checkpoint rejection/roundtrip, beam compatibility,
+collection and synthetic parallel-fiber recovery. The synthetic test reduces
+lateral MSE below .25 and below 15% of its initial value after 160 small-model
+updates; it is a learnability check, not evidence of held-out improvement.
+
+GPU preflight (requires access outside the sandbox):
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=../../.. AGENTS_AGENT_MODE=1 \
+  /home/sean/Documents/villa4/vesuvius/.venv/bin/python scripts/benchmark_single_path.py \
+  --manifest output/single_path_v11_preparation/seeds.json \
+  --out output/single_path_v11_preparation/benchmark_b2.json
+```
+
+RTX 5090, full crop, BF16, channels-last, 64 flow draws, microbatch 2 × four:
+peak allocated 9,873,314,304 bytes (9.20 GiB), reserved 10,756,292,608 bytes
+(10.02 GiB). Update times after warmup: .9131, .8988, .8999 seconds; cached-batch
+training throughput 8.85 states/second. A complete 64-voxel trace used 16 decisions
+in 1.3224 seconds (82.65 ms/decision), including crop I/O, history rendering,
+eight velocity evaluations and final confidence. This is not a controlled speed
+comparison to v10: architecture, crop, resolution and training objective changed.
+
+The fresh run `output/single_path_v11_run1` was launched using `scripts/launch.sh`
+with CT `/mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr` and absolute
+paths to the prepared bank, manifest and successful benchmark JSON. All remaining
+training defaults apply (50,000 optimizer updates, effective batch eight, 2,048
+calibration states, EMA .999, periodic replay and .5/.85 diagnostics). Its source
+snapshot and per-file hashes are saved in the run directory. Residual-scale calibration completed and the run reached optimizer update 50
+with finite losses at 7.94 sampled states/second including loading. The full
+training run and locked calibration/final acceptance study remain pending; no
+coverage or wrong-continuation improvement is claimed.

@@ -29,6 +29,7 @@ from vesuvius.neural_tracing.fiber_follow.geometry import (
     tangent_at,
 )
 from vesuvius.neural_tracing.fiber_follow.fast_sample import sample_crop
+from vesuvius.neural_tracing.fiber_follow.policy import DEFAULT_CONFIDENCE
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume, FiberVolumeSpec
 
 
@@ -196,20 +197,20 @@ def split_fibers(fibers: list[TracedFiber], val_band: ZBand):
 
 @dataclass
 class SampleConfig:
-    crop: CropSpec = field(default_factory=CropSpec)
-    n_candidates: int = 4
+    crop: CropSpec = field(default_factory=lambda: CropSpec(depth=176, width=96, behind=128, history_render="segments", history_sigma=.35))
     n_future: int = 16
-    future_step: float = 2.0
+    future_step: float = 1.0
     n_history: int = 128
-    recent_history_points: int = 8  # GT history for observed-state diagnostics only
+    recent_history_points: int = 128  # GT history for observed-state diagnostics only
     history_step: float = 1.0
     lateral_sigmas: tuple = (0.4, 1.0, 2.0)
     lateral_probs: tuple = (0.5, 0.35, 0.15)
-    angle_sigmas_deg: tuple = (4.0, 10.0, 20.0)
+    angle_sigmas_deg: tuple = (2.0, 5.0, 10.0)
     angle_probs: tuple = (0.5, 0.35, 0.15)
     no_history_prob: float = 0.1
-    history_jitter: float = 0.25  # independent point noise; disable for smooth history
-    history_wobble: float = 0.0  # max amplitude (voxels) of slow lateral wobble on the own-trace history
+    history_jitter: float = 0.0  # independent point noise; disable for smooth history
+    history_drift: float = 2.0  # accumulated lateral displacement, smooth over 16--64 voxels
+    history_wobble: float = 1.0  # max amplitude (voxels) of slow lateral wobble on the own-trace history
     dense_substeps: int = 4
 
     @property
@@ -327,6 +328,15 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
         w = amp * (np.sin(2 * np.pi * k[:, None] / lam + ph) - np.sin(ph))
         hist = hist + w[:, :1] * fr[:, 0] + w[:, 1:] * fr[:, 1]
 
+    # A smooth displacement accumulates near the present; old observations
+    # remain aligned. Include the endpoint displacement in the current point.
+    span = rng.uniform(16., 64.)
+    ramp = np.clip(1-k/span, 0, 1)
+    ramp = ramp*ramp*(3-2*ramp)
+    displacement = rng.normal(size=2)*cfg.history_drift
+    drift = fr[:,:2] @ displacement
+    hist += ramp[:,None]*drift
+    pos += drift
     return dict(pos=pos, frame=frame, hist_local=(hist-pos) @ frame, hmask=hmask,
                 **continuation_targets(fiber, t, reverse, pos, frame, cfg))
 
@@ -363,53 +373,77 @@ def continuation_targets(fiber, t, reverse, pos, frame, cfg, offtrack=False):
                 fut_local=(fut-pos) @ frame, fmask=fmask,
                 plane_ab=ab, plane_mask=mask, planes=cfg.future_s,
                 dense_ab=dense_ab, dense_mask=dense_mask, dense_planes=dense_planes,
-                end_local=end, endpoint_known=float(known), offtrack=float(offtrack),
-                replay_candidates=np.zeros((cfg.n_candidates, cfg.n_future, 3), np.float32),
-                replay_valid=np.zeros(cfg.n_candidates, np.float32))
+                end_local=end, endpoint_known=float(known), offtrack=float(offtrack))
+
+
+# Source is independent of the within-source drift/departure stratum.
+REPLAY_SOURCES = dict(fixed=1, recent=2)
+DRIFT_BANDS = ((0.,1.), (1.,1.5), (1.5,2.), (2.,3.5))
+
+
+def replay_pools(caches):
+    """Five strata, each grouped by fiber, across every cache of one source."""
+    pools = [dict() for _ in range(5)]
+    for op in caches:
+        off = np.asarray(op.offtrack,bool)
+        for band,(lo,hi) in enumerate((*DRIFT_BANDS,(0.,0.))):
+            member = off if band == 4 else (~off & (op.drift>=lo) & (op.drift<hi))
+            for fi in np.unique(op.fiber_idx[member]):
+                idx = np.flatnonzero(member & (op.fiber_idx==fi))
+                pools[band].setdefault(int(fi),[]).append((op,idx))
+    return pools
 
 
 class FollowDataset(torch.utils.data.IterableDataset):
-    """Fresh perturbations plus recent-weighted exact policy decisions.
+    """50% fresh, 25% permanent fixed bank, 25% rotating recent replay.
 
-    Defaults: 50% fresh, 30% ordinary replay, 20% hard replay when pools exist.
-    Missing pools fall back to fresh samples. Windows amortize volume reads.
+    Each replay allocation reserves 10% for confirmed departure; remaining
+    draws are uniform over drift bands and then fibers. Empty strata use fresh
+    augmentation. Every draw is relabeled and holdout checked before crop I/O.
     """
-    def __init__(self, fibers, vol_spec, cfg, exclude_band, chunk=32, seed=0,
-                 cache_bytes=1 << 30, onpolicy=None, onpolicy_prob=.3, hard_prob=.2,
+    def __init__(self, fibers, vol_spec, cfg, exclude_band, chunk=2, seed=0,
+                 cache_bytes=1 << 30, onpolicy=None, fixed=None,
                  window=256., pool_size=12, window_samples=192, replay_index=None, refresh_chunks=8):
         self.fibers, self.vol_spec, self.cfg, self.exclude = fibers, vol_spec, cfg, exclude_band
         self.chunk, self.seed, self.cache_bytes = chunk, seed, cache_bytes
         self.window, self.pool_size, self.window_samples = window, pool_size, window_samples
         self.replay_index, self.refresh_chunks = replay_index, refresh_chunks
         self._replay_paths = None
-        self.onpolicy = list(onpolicy or [])  # oldest -> newest
-        if onpolicy_prob < 0 or hard_prob < 0 or onpolicy_prob+hard_prob > 1:
-            raise ValueError('Replay fractions must be nonnegative and sum to at most one')
-        self.onpolicy_prob, self.hard_prob = onpolicy_prob, hard_prob
-        self._set_replay(self.onpolicy)
+        self.fixed = list(fixed or [])
+        self._validate(self.fixed)
+        self.fixed_pools = replay_pools(self.fixed)
+        self._set_replay(list(onpolicy or []))
         lengths = np.array([f.length for f in fibers])
         if not len(lengths):
             raise ValueError('No training fibers')
         self.weights = lengths / lengths.sum()
 
-    def _set_replay(self, caches):
-        self.pools = {False: [], True: []}
-        for age, op in enumerate(caches):
+    def _validate(self,caches):
+        for op in caches:
             op.validate_fibers(self.fibers)
             if op.hist.shape[1] != self.cfg.n_history:
                 raise ValueError('Replay history length must equal n_history')
-            for hard in (False, True):
-                indices = np.flatnonzero(op.hard == hard)
-                if len(indices):
-                    self.pools[hard].append((age+1, op, indices))
-            provenance = op.provenance
-            if provenance and (CropSpec(**provenance['crop']) != self.cfg.crop
-                               or FiberVolumeSpec(**provenance['volume']) != self.vol_spec):
-                raise ValueError('Replay crop or volume differs from the current run')
-            if op.candidates.shape[1:] != (self.cfg.n_candidates, self.cfg.n_future, 3):
-                raise ValueError('Replay candidate shape differs from the current run')
-            if provenance and provenance['model_cfg']['future_step'] != self.cfg.future_step:
-                raise ValueError('Replay forward plane spacing differs from the current run')
+            if op.provenance.get('volume',{}).get('grid_scale',8.) != self.vol_spec.grid_scale:
+                raise ValueError('Replay world coordinate scale differs from this run')
+
+    def _set_replay(self,caches):
+        self._validate(caches)
+        self.onpolicy = caches
+        self.recent_pools = replay_pools(caches)
+
+    def draw_replay(self,rng):
+        source = int(rng.choice(3,p=(.5,.25,.25)))
+        band = 4 if rng.random()<.1 else int(rng.integers(4))
+        if source == 0:
+            return None
+        pool = (self.fixed_pools if source == 1 else self.recent_pools)[band]
+        if not pool:
+            return None
+        fi = rng.choice(sorted(pool))
+        entries = pool[fi]
+        sizes = np.array([len(idx) for _,idx in entries])
+        op,idx = entries[rng.choice(len(entries),p=sizes/sizes.sum())]
+        return source,band,op,int(rng.choice(idx))
 
     def refresh_replay(self):
         if self.replay_index is None or not os.path.exists(self.replay_index):
@@ -417,8 +451,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
         with open(self.replay_index) as fh:
             paths = json.load(fh)
         if paths != self._replay_paths:
-            caches = [OnPolicyStates.load(path) for path in paths]
-            self._set_replay(caches)
+            self._set_replay([OnPolicyStates.load(path) for path in paths])
             self._replay_paths = paths
 
     def __iter__(self):
@@ -436,22 +469,18 @@ class FollowDataset(torch.utils.data.IterableDataset):
             chunks += 1
             items = []
             for attempt in range(max(10000, self.chunk*1000)):
-                u = rng.random()
-                hard = u < self.hard_prob
-                replay = u < self.hard_prob+self.onpolicy_prob and attempt < self.chunk*10
-                pool = self.pools[hard] if replay else []
-                if pool:
-                    weights = np.array([entry[0] for entry in pool], dtype=float)
-                    _, op, idx = pool[rng.choice(len(pool), p=weights/weights.sum())]
-                    j = rng.choice(idx)
+                draw = self.draw_replay(rng) if attempt < self.chunk*10 else None
+                item = None
+                if draw is not None:
+                    source,band,op,j = draw
                     item = label_state(self.fibers[op.fiber_idx[j]], op.pos[j], op.frame[j],
                                        op.hist[j], op.hmask[j], cfg, t=float(op.t[j]),
                                        reverse=bool(op.reverse[j]), offtrack=bool(op.offtrack[j]))
-                    item['source'] = 2 if hard else 1
-                    item['source_step'] = op.provenance.get('step', -1)
-                    item['replay_candidates'] = op.candidates[j]
-                    item['replay_valid'] = np.ones(cfg.n_candidates, np.float32)
-                else:
+                    item['source'],item['stratum'] = source,band
+                    item['source_step'] = op.provenance.get('step', -1) or -1
+                    if not training_state_allowed(item,cfg.crop,self.exclude):
+                        item = None
+                if item is None:
                     while len(windows) < self.pool_size:
                         f = self.fibers[rng.choice(len(self.fibers), p=self.weights)]
                         windows.append([f, rng.uniform(0, f.length), self.window_samples])
@@ -467,7 +496,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
                         original_t = np.clip(center+rng.uniform(-self.window/2, self.window/2), 0, f.length)
                         t = f.length-original_t if rev else original_t
                     item = make_sample(f, t, rev, cfg, rng)
-                    item['source'], item['source_step'] = 0, -1
+                    item['source'], item['source_step'], item['stratum'] = 0, -1, -1
                 if training_state_allowed(item, cfg.crop, self.exclude):
                     items.append(item)
                 if len(items) == self.chunk:
@@ -562,11 +591,12 @@ def collate_with_volume(items, vol: FiberVolume, crop: CropSpec, grid: torch.Ten
         out["gt_history_mask"] = st("gt_history_mask")
         out["plane_ab"] = st("plane_ab")
         out["plane_mask"] = st("plane_mask")
-        for key in ("dense_ab", "dense_mask", "end_local", "endpoint_known", "offtrack", "replay_candidates", "replay_valid"):
+        for key in ("dense_ab", "dense_mask", "end_local", "endpoint_known", "offtrack"):
             out[key] = st(key)
     if 'source' in items[0]:
         out['source'] = st('source')
         out['source_step'] = st('source_step')
+        out['stratum'] = st('stratum')
     return out
 
 
@@ -583,7 +613,7 @@ def label_state(fiber, pos, frame, hist_world, hmask, cfg, *, t, reverse, offtra
                 **continuation_targets(fiber, traversal_t, reverse, pos, frame, cfg, offtrack))
 
 
-STATE_VERSION = 4
+STATE_VERSION = 5
 
 class OnPolicyStates:
     """States (pos, heading, own-trace history) visited by a tracer on GT fibers.
@@ -592,12 +622,19 @@ class OnPolicyStates:
     (pickling sends only the directory path)."""
 
     FIELDS = ("fiber_idx", "t", "reverse", "pos", "frame", "hist", "hmask", "offtrack",
-              "hard", "exploratory", "candidates", "chosen", "confidence", "rank_scores")
+              "hard", "exploratory")
+    # Fields later collectors add; caches without them load with the default.
+    # drift: current-position error in trace-grid voxels (NaN when departed or unknown).
+    OPTIONAL = {"drift": lambda n: np.full(n, np.nan, np.float32),
+                "source_cache": lambda n: np.full(n, -1, np.int32),
+                "source_row": lambda n: np.full(n, -1, np.int64)}
 
     def __init__(self, *, manifest, provenance=None, **arrays):
         for key in self.FIELDS:
             setattr(self, key, np.asarray(arrays[key]))
-        if any(len(getattr(self, k)) != len(self.pos) for k in self.FIELDS):
+        for key, default in self.OPTIONAL.items():
+            setattr(self, key, np.asarray(arrays[key]) if key in arrays else default(len(self.pos)))
+        if any(len(getattr(self, k)) != len(self.pos) for k in self.FIELDS + tuple(self.OPTIONAL)):
             raise ValueError('Replay arrays have different lengths')
         self._dir = None
         self.manifest = manifest
@@ -608,7 +645,7 @@ class OnPolicyStates:
 
     def save(self, path):
         np.savez(path, __metadata__=json.dumps(dict(version=STATE_VERSION, fibers=self.manifest, provenance=self.provenance)),
-                 **{k: getattr(self, k) for k in self.FIELDS})
+                 **{k: getattr(self, k) for k in self.FIELDS + tuple(self.OPTIONAL)})
 
     def validate_fibers(self, fibers):
         if self.manifest != fiber_manifest(fibers):
@@ -626,13 +663,13 @@ class OnPolicyStates:
         """``path``: .npz from collect.py (converted once to a sibling ``_mmap/``
         dir of .npy files) or such a directory."""
         path = os.fspath(path)
-        d = path[:-4] + "_mmap_v4" if path.endswith(".npz") else path
+        d = path[:-4] + "_mmap_v5" if path.endswith(".npz") else path
         metadata_path = os.path.join(d, "metadata.json")
         if path.endswith(".npz"):
             with np.load(path, allow_pickle=False) as z:
                 metadata = json.loads(str(z["__metadata__"].item()))
                 if metadata["version"] != STATE_VERSION:
-                    raise ValueError("Incompatible on-policy cache version; recollect with collect.py")
+                    raise ValueError("Incompatible replay version; import old training states with scripts/import_replay.py")
                 # Include archive identity so an overwritten NPZ cannot reuse stale mmap arrays.
                 stat = os.stat(path)
                 metadata["archive"] = [stat.st_size, stat.st_mtime_ns]
@@ -640,10 +677,11 @@ class OnPolicyStates:
                 if os.path.exists(metadata_path):
                     with open(metadata_path) as fh:
                         existing = json.load(fh)
-                if existing != metadata or any(not os.path.exists(os.path.join(d, k + ".npy")) for k in cls.FIELDS):
+                if existing != metadata or any(not os.path.exists(os.path.join(d, k + ".npy"))
+                                               for k in cls.FIELDS + tuple(cls.OPTIONAL)):
                     os.makedirs(d, exist_ok=True)
-                    for k in cls.FIELDS:
-                        v = z[k]
+                    for k in cls.FIELDS + tuple(cls.OPTIONAL):
+                        v = z[k] if k in z.files else cls.OPTIONAL[k](len(z["pos"]))
                         if k != "t" and v.dtype == np.float64:
                             v = v.astype(np.float32)
                         np.save(os.path.join(d, k + ".npy"), v)
@@ -658,12 +696,15 @@ class OnPolicyStates:
         with open(metadata_path) as fh:
             metadata = json.load(fh)
         if metadata["version"] != STATE_VERSION:
-            raise ValueError("Incompatible on-policy cache version; recollect with collect.py")
+            raise ValueError("Incompatible replay version; import old training states with scripts/import_replay.py")
         self.manifest = metadata["fibers"]
         self.provenance = metadata["provenance"]
         self._dir = d
         for k in self.FIELDS:
             setattr(self, k, np.load(os.path.join(d, k + ".npy"), mmap_mode="r"))
+        for k, default in self.OPTIONAL.items():
+            file = os.path.join(d, k + ".npy")
+            setattr(self, k, np.load(file, mmap_mode="r") if os.path.exists(file) else default(len(self.pos)))
 
     def __getstate__(self):
         if self._dir is None:

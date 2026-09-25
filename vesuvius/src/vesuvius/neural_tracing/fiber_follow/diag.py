@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import matplotlib
 
@@ -46,7 +47,7 @@ def plot_batch(x, pred, fut, fmask, crop, path, observed, hmask, history_gt, his
     green = GT, orange = proposal. The dotted orange segment is the
     actual tracer's first step from the current point.
     Bounds stay fixed to the actual crop even when GT leaves it. The orange
-    path is the complete ranked proposal, not the confidence-gated commit.
+    path is the complete denoised curve before the confidence-gated commit.
     """
     source = source[:n].detach().cpu().numpy() if source is not None else None
     offtrack = offtrack[:n].detach().cpu().numpy() if offtrack is not None else None
@@ -109,7 +110,9 @@ def plot_batch(x, pred, fut, fmask, crop, path, observed, hmask, history_gt, his
         if offtrack is not None and offtrack[i]:
             title = 'OFF TRACK: reject continuation'
         if source is not None:
-            title = ('fresh', 'replay', 'hard replay')[int(source[i])] + '\n' + title
+            # Codes follow data.REPLAY_SOURCES; unknown codes still get a label.
+            names = {0: 'fresh', 1: 'fixed recovery', 2: 'recent replay'}
+            title = names.get(int(source[i]), f'source {int(source[i])}') + '\n' + title
         if confidence is not None:
             title += f'\nnext-step confidence {confidence[i, 0]:.2f}'
         ax[0, i].set_title(title, fontsize=8)
@@ -203,28 +206,34 @@ def rollout_diag(tracer, fibers, seeds, path, max_len=400.0, half=15, batch=8):
 
 
 def plot_curves(log_path, path):
-    recs = [json.loads(l) for l in open(log_path)]
-    tr = [r for r in recs if "oracle_error" in r and "selected_error" in r]
-    ro = [r for r in recs if "roll_coverage" in r]
-    fig, ax = plt.subplots(1, 3, figsize=(13, 3.2))
-    st = [r["step"] for r in tr]
-    ax[0].plot(st, [r["oracle_error"] for r in tr], label="best proposal")
-    ax[0].plot(st, [r["selected_error"] for r in tr], label="selected proposal")
-    ax[0].set_ylim(0, None)
-    ax[0].legend()
-    ax[0].set_title("train point error (voxels)")
-    ax[1].plot(st, [r["confidence"] for r in tr])
-    ax[1].set_title("prefix confidence BCE")
-    if ro:
-        ax[2].plot([r["step"] for r in ro], [r["roll_coverage"] for r in ro], "o-", label="coverage")
-        ax[2].plot([r["step"] for r in ro], [r["roll_diverged"] for r in ro], "o-", label="diverged")
-        if "roll_precision" in ro[-1]:
-            ax[2].plot([r["step"] for r in ro], [r.get("roll_precision", np.nan) for r in ro], "o-", label="scored precision")
-        if "roll_unknown_fraction" in ro[-1]:
-            ax[2].plot([r["step"] for r in ro], [r.get("roll_unknown_fraction", np.nan) for r in ro], "o-", label="unknown fraction")
-        ax[2].set_ylim(0, 1)
-        ax[2].legend()
-    ax[2].set_title("val rollouts")
-    fig.tight_layout()
-    fig.savefig(path, dpi=80)
-    plt.close(fig)
+    recs = [json.loads(line) for line in Path(log_path).read_text().splitlines()]
+    training = [r for r in recs if 'flow' in r]
+    rollout = [r for r in recs if 'roll_coverage' in r]
+    fig,axes = plt.subplots(1,3,figsize=(13,3.2))
+    steps = [r['step'] for r in training]
+    axes[0].plot(steps,[r['flow'] for r in training],label='normalized flow loss')
+    axes[1].plot(steps,[r['confidence_loss'] for r in training],label='prefix confidence BCE')
+    for threshold in (.5,.85):
+        selected = [r for r in rollout if r['threshold']==threshold]
+        for name in ('coverage','precision','diverged'):
+            axes[2].plot([r['step'] for r in selected],[r['roll_'+name] for r in selected],label=f'{name} @ {threshold}')
+    for ax in axes:
+        ax.legend(fontsize=7);ax.set_xlabel('optimizer updates')
+    axes[2].set_ylim(0,1)
+    fig.tight_layout();fig.savefig(path,dpi=100);plt.close(fig)
+
+
+def plot_denoising(curves, history, hmask, path):
+    """Fixed observed history plus zero initialization and every midpoint update."""
+    curves=curves.detach().float().cpu().numpy()
+    history=history.detach().float().cpu().numpy()
+    mask=hmask.detach().cpu().numpy().astype(bool)
+    fig,axes=plt.subplots(2,len(curves),figsize=(4*len(curves),9),squeeze=False)
+    for b in range(len(curves)):
+        for lateral in (0,1):
+            ax=axes[lateral,b]
+            ax.plot(history[b,mask[b],lateral],history[b,mask[b],2],'r.-',label='observed history')
+            for step,curve in enumerate(curves[b]):
+                ax.plot(curve[:,lateral],curve[:,2],'.-',label=f'update {step}',alpha=.4+.6*step/max(1,len(curves[b])-1))
+            ax.set_xlabel('lateral voxels');ax.set_ylabel('forward voxels');ax.legend(fontsize=7)
+    fig.tight_layout();fig.savefig(path,dpi=130);plt.close(fig)

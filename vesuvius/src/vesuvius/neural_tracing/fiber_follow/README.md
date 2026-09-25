@@ -1,268 +1,162 @@
 # fiber_follow
 
-## Current experiment: normalized future flow with fixed observed history (v10)
+The active follower is `single_path_flow_v11`: one jointly denoised future curve,
+trained from scratch. Historical v10 results and the pre-migration source remain
+in `output/single_path_v11_baseline/`; old follower checkpoints are rejected by
+training/inference. The independent beam model keeps its checkpoint names.
 
-`future_flow_v10` generates only the 64 future coordinates. The current point
-and actual trace history are fixed conditioning inputs; no history or anchor
-correction is predicted, averaged, or applied to the trace. CT, fiber presence,
-and the smooth rendering of observed history remain the image inputs.
+## Model and tracing
 
-The production preset in `scripts/launch_ct_flow.sh` uses:
+- CT level 1 (`ct_grid_scale=8`), presence, and rendered observed history.
+- One 176 × 96 × 96 crop at spacing 1: 128 voxels behind, 47 ahead,
+  ±47.5 laterally. All 128 one-voxel history observations condition the model.
+- Shared encoder-decoder widths (24, 64, 128), group norm, geometric-history
+  FiLM. History tokens include coordinates, age, validity and local features;
+  a separate support flag distinguishes out-of-crop observations.
+- Six pre-norm blocks, width 256, eight heads, FFN width 1024. Bidirectional
+  self-attention joins history and future tokens. Cross-attention reads spatial
+  tokens pooled another factor of two from the deepest features of this crop.
+- One 16-point future curve starts at normalized lateral residual zero. Four
+  midpoint steps require eight velocity evaluations. A ninth evaluation at
+  the final coordinates and `t=1` supplies confidence. Local patches refresh
+  during refinement; static image/history features and image keys/values cache
+  within a decision.
+- The public output is `points [B,16,3]`, `confidence_logits [B,16]`, and
+  monotone `confidence [B,16]`. Inference is deterministic for fixed inputs and
+  execution settings. No forecast is carried into the next decision.
+- Commit at most four points, respecting the six-voxel first connection limit,
+  bounds, loops, stop patience, and bounded collection exploration. History
+  coordinates and previous commits remain fixed.
 
-| Setting | Value |
-| --- | --- |
-| Inputs | Native level-0 CT, fiber presence, observed history |
-| Crop | 208 × 128 × 128 at 0.5 trace-voxel spacing |
-| Visual support | 32 voxels behind, 71.5 ahead, ±31.75 laterally |
-| Forecast | 64 future planes at one forward voxel spacing |
-| Fixed tokens | Current point + up to 32 history points + 64 prior-mean observations |
-| Flow | 4 transformer blocks, 4 heads, hidden 128; 4 midpoint steps (8 evaluations) |
-| Residual scales | Per-plane lateral standard deviations fitted from 2,048 training states; floor 1 voxel |
-| Flow patches | 3 × 3 lateral features at 2 trace-voxel pitch, independent of crop spacing |
-| Samples / candidates | All 16 samples scored; support radius 1.5 voxels RMS |
-| Training draws | 16 stratified (time, noise) draws per state against shared image features |
-| Geometry history | Up to 128 previous points |
-| Encoder widths / hidden size | 24, 64, 128 / 128; group norm |
-| Train / collector / diagnostic batch | 2 / 1 / 1 |
-| Training | 50,000 steps; 100,000 sampled states; 1,000-step warmup |
-| EMA | Decay ramps to 0.999; collection, diagnostics and inference use EMA |
-| Diagnostics | Every 500 steps, 32 seeds |
+Flow matching retains 64 stratified time/noise draws per state. Residual scales
+are fitted from 2,048 masked training states. Confidence labels describe the
+actually generated curve at tolerance 1.5; generated coordinates and labels are
+detached, while the final evaluation trains the shared features and denoiser.
+Confidence loss is half masked BCE over prefixes 1–4 and half over all 16.
+Its coefficient ramps from zero to one over 2,000 optimizer updates. Unknown
+annotation endings are censored; confirmed departures have confidence negatives
+and no localization loss. GT history is diagnostic data only.
 
-CT and presence are independently sampled in the same oriented frame and
-scaled by 255. Presence is an input cue; annotated fibers supply labels.
-The crop's forward axis follows the actual trace heading.
+## Data and first run
 
-### Start and watch
+The mixture is 50% fresh augmentation, 25% permanent recovery bank and 25%
+recent replay. Each replay source reserves 10% of draws for confirmed departures;
+other draws balance the drift bands <1, 1–1.5, 1.5–2, 2–3.5 and fibers within each
+band. Missing strata fall back to fresh states. Logs contain realized source
+fractions and stratum counts. A smooth accumulated displacement over a uniformly
+sampled 16–64 history voxels augments existing drift, heading, wobble, missing
+and truncated histories.
 
-From this directory, with the existing project environment:
+Replay v5 stores observed states and original-fiber correspondence, independently
+of prediction shapes. The one-time importer discards predictions, relabels drift,
+checks the larger crop/holdout footprint, preserves source provenance, deduplicates
+states, and samples up to 20,000 unique eligible states. The fixed bank never
+rotates out with the latest four completed caches. Every training replay draw is
+relabeled and checked again before recropping. The original 48-voxel holdout
+position guard and complete crop/history/target exclusion remain in force.
 
-```bash
-bash scripts/launch_ct_flow.sh ct0_presence_flow_v10
-tail -F output/logs/ct0_presence_flow_v10.log
-```
-
-The launcher starts a background process. Run names must be new. Checkpoints,
-`config.json`, `log.jsonl`, images and replay archives live in
-`output/ct0_presence_flow_v10/`. Additional training options go after the name.
-This architecture requires fresh training. Checkpoints store live weights in `model`,
-EMA weights in `ema`, and fitted scales in `model_cfg.flow_sigma`.
-`--init` restores both weight copies and the fitted scales with an exact configuration
-match, then starts a new optimizer. Collection, evaluation and inference load EMA.
-`--flow-steps` controls midpoint steps; each step evaluates the flow twice.
-`--flow-calibration-states` controls the initial scale-fitting sample count.
-`--flow-stencil-radius` specifies lateral patch pitch/radius in trace voxels.
-
-## Architecture and supervision
-
-1. A 3D encoder-decoder produces spatial features from CT, presence, observed
-   history rendering and local coordinates, conditioned on geometric history.
-2. **Future flow** (`PathFlow`). The transformer reads fixed current/history
-   tokens, one always-valid observation token per future plane at the prior mean,
-   and noisy future tokens. Each token carries a 3 × 3 lateral feature patch,
-   voxel coordinates, token type, time and position embeddings, and history
-   context. Static patches are sampled once and reused across training draws
-   and midpoint stages. Only noisy future tokens emit lateral velocities;
-   forward coordinates remain pinned to their planes. Missing history tokens
-   are excluded from attention.
-3. **Flow objective.** The prior mean is straight ahead along the trace
-   heading at the fixed forward planes. The frame already follows the trace,
-   and on the training data a backward tangent extrapolated forward lowered no
-   per-plane residual scale while raising the near-plane ones (see
-   `EXPERIMENTS.md`). Per-plane lateral residual standard deviations are fitted
-   once from training-loader states, excluding unknown, departed and censored
-   targets, and floored at one trace voxel. Training uses
-   `y_1 = (x_1 - mu) / sigma`, `y_0 ~ N(0, I)`,
-   `y_t = (1-t) y_0 + t y_1`, and MSE against `y_1 - y_0` over known lateral
-   coordinates. Times are stratified as `(d + uniform()) / draws` per state.
-   Integration stays in normalized coordinates; feature queries and returned
-   paths use `x = mu + sigma * y`. Partial annotations retain their existing
-   behavior: unknown future tokens are excluded from attention keys and loss;
-   all observation tokens stay valid. Sampling generates the full horizon.
-   **Crop censoring.** A target is supervised only while every annotated plane
-   up to it lies within the crop half-width minus `--flow-stencil-radius`; once
-   the curve leaves that extent, later crossings are censored even if it
-   re-enters. Scale calibration applies the same rule. Dense scorer labels are
-   unaffected. `flow_censored_fraction` reports the censored share of annotated
-   tokens. Departed states provide no flow supervision but retain confidence
-   negatives. GT history is used only for diagnostics.
-4. **Candidate support.** Every generated sample is scored, including coincident
-   paths. Support is the fraction of generated samples within `--support-radius`
-   RMS lateral distance over the first four planes. Generated candidates exclude
-   their own vote and use the remaining sample count as denominator. Teachers
-   and replay candidates receive measured support against the generated sample
-   set; they do not contribute votes. Support is an input feature for both
-   ranking and confidence, not a correctness label.
-5. **Scoring and tracing.** The bidirectional scorer uses the actual observed
-   history and each future. Its first-step geometry is relative to the actual
-   current point. Generated candidates receive no scorer gradients; ranking
-   and prefix-confidence losses still train the shared spatial features.
-   The tracer commits a confident prefix from its existing current point.
-
-`--recent-history-points` controls the dense observed history seen by the flow and scorer. It does not create history targets
-for learning. The first predicted point can recover from a displaced current
-position. `--max-recovery-distance` bounds the full 3D connection from the actual
-current point to the first prediction (default: 6 trace-grid voxels, independent
-of crop spacing). Longer connections receive negative prefix labels and are
-ineligible for tracing, including exploration and stop-patience overrides.
-If no connection is eligible, the trace stops with `recovery_limit`. The limit
-is saved in the model configuration. Within this recovery segment, departure
-from GT is permitted; dense GT agreement starts at the first prediction.
-
-Total loss is `--flow-weight` × flow + ranking + prefix confidence. Detailed
-metrics are computed only every `--log-every` steps and on the final step;
-other steps compute the same loss without diagnostic scalar extraction.
-Useful measurements include:
-
-- `flow`, `flow_known_fraction`, `flow_censored_fraction`: future velocity loss,
-  supervised fraction, and the censored share of annotated tokens.
-- `observed_current_error`, `observed_history_error`,
-  `observed_tangent_error_deg`: input drift diagnostics, not learned cleaning.
-- `candidate_support`, `selected_support`: sample agreement; low agreement
-  can reflect ambiguity, sampling error, or an undertrained generator.
-- `first_plane_error`, `first_step_length_max`: recovery placement and jumps.
-- `candidate_recovery_reject_fraction`, `recovery_blocked_fraction`,
-  `target_recovery_reject_fraction`: rejected connections, states with no
-  eligible connection, and annotated targets outside the recovery limit.
-- `oracle_error`, `oracle_recall`: all generated candidates, excluding teachers
-  and replay extras. Recall checks the commit horizon and recovery limit;
-  error is mean lateral error at annotated future crossings, clipped at 8
-  voxels as in ranking. `oracle_recall_known_fraction` reports the fraction of
-  eligible states with a known oracle recall outcome.
-- `selected_error`: the tracer's confidence-gated, recovery-eligible choice,
-  including its diagnostic fallback when it stops. `accepted_selected_error`
-  covers accepted choices only; `selected_accept_fraction` reports their share.
-  Training metrics and EMA diagnostic plots/rollouts use `--confidence`.
-- `target_crop_oob`, `target_crop_edge`: missing visual support, not endpoints.
-- Gate false stops/continues at thresholds 0.3, 0.5 and 0.7.
-
-Sampling is stochastic. Training uses the global seed; rollouts seed one
-sampler per `trace()` call using `TraceParams.seed`. Reproduction requires the
-same seeds and batch composition. Compare averaged held-out measurements and
-rollout precision/coverage, not isolated batch-two recall values. Validation
-thresholds from older architectures do not calibrate this one.
-
-## Validation
-
-From this directory, using an environment with the project dependencies and pytest:
+From this directory, using an existing environment with the project dependencies:
 
 ```bash
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=../../.. python -m pytest tests -q -o cache_dir=/tmp/fiber-flow-pytest-cache
+export PYTHONPATH=../../..
+python scripts/prepare_single_path.py
+python scripts/import_replay.py output/flow_v10_small_b8_d64/dagger/decisions_*.npz \
+  output/replay_bootstrap/*.npz \
+  --out output/single_path_v11_preparation/fixed_recovery.npz
+bash scripts/launch_single_path.sh single_path_v11_run1
 ```
 
-The focused tests cover normalized flow, masked scale calibration, midpoint
-convergence, observation tokens, support features, group-norm train/eval behavior,
-EMA loading/diagnostics, and a synthetic curved-path learning run. CUDA-specific
-recovery tests skip when CUDA is unavailable. Production throughput and held-out
-rollout quality require a fresh training run.
+Preparation refuses to overwrite a bank and reuses a matching frozen seed manifest.
+These preparation artifacts already exist in this workspace. The launcher benchmarks
+before starting training. If microbatch 2 exhausts GPU memory, rerun with
+`MICROBATCH=1`; effective batch remains eight and the crop remains full sized.
+The benchmark reports GPU peak allocated/reserved memory, training throughput and
+complete tracing latency, including data preparation and final confidence.
 
-## Ground truth
+Training defaults: 50,000 optimizer updates; microbatch 2 with four accumulation
+steps; AdamW, peak LR 1e-3, weight decay 1e-4, 1,000-update warmup/cosine decay,
+gradient clipping at 1, EMA decay .999, CUDA BF16 and channels-last convolutions.
+A detached curve pass establishes masked-loss denominators across the effective
+batch; each microbatch then re-encodes for flow/confidence gradients. Censoring
+and departures therefore do not change the objective when switching microbatch
+size. Inference still encodes once per decision.
+Checkpoints save every 1,000 updates and at completion. One background collector
+refreshes replay every 1,000 updates when idle, using EMA, 64 training seeds,
+a 6,000-voxel cap, threshold .7, and eight exploration calls. Diagnostics use the
+original monitor fibers at thresholds .5 and .85. Images show observed history,
+GT, the final curve, and successive denoising updates.
 
-**Every line point between the first and last control points of every fiber is
-valid ground truth.** Line points and control points have the same authority.
-The `reviewed` tag has no meaning for loading, sampling, weighting, losses, or
-DAgger. Interpolation provenance does not change supervision either.
+## Evaluation
 
-The loader preserves every interior line vertex and subdivides longer segments
-to at most one trace-grid voxel. It excludes exterior tails and fibers with
-fewer than two controls. All dense geometry, including low-presence regions,
-trains point placement. Presence selects strong starting seeds; it supplies
-neither pseudo-labels nor stop targets.
-
-An outer annotation boundary is unknown continuation, unless explicitly marked
-`kollesis_termination`. Missing targets beyond unknown boundaries are censored.
-Tagged physical endpoints supply negative continuation labels. Control/span
-metadata and source hashes are retained for reproducibility, without confidence
-weights. Geometry identities invalidate stale seed and replay caches.
-
-Coordinates are trace-grid voxels: one voxel is eight base voxels on this dataset.
-The spatial split uses the arclength-weighted centroid of the controlled curve.
-After augmentation, every training state must exclude the held-out z band from
-its crop read block, active history, and dense targets, with an additional
-48-voxel position guard. The same filter applies to replay and collection.
-
-## GPU execution
-
-CUDA training and checkpoint loading use channels-last storage for 3D
-convolutions. The tensor dimensions, weights, losses, batch size, and BF16
-training precision are unchanged. Fixed-size training batches enable cuDNN
-kernel tuning; diagnostic rollouts disable tuning because active batch sizes
-change. Independent inference and collection do not enable tuning. CPU execution
-keeps its regular tensor layout.
-
-The selected kernels can introduce floating-point rounding differences and
-change choices between nearly tied proposals. Fixed seeds do not imply a
-bit-identical optimization trajectory across layouts or kernel choices. Run
-configuration records `cuda_channels_last_3d` and `cudnn_benchmark_training`.
-See `EXPERIMENTS.md` for timing and numerical checks.
-
-## Continuous DAgger
-
-Training keeps one optimizer running. Every `--dagger-every` steps (default 500),
-if the collector is idle, it saves a policy snapshot and starts a background
-collection process. It does not wait for collection. Completed caches are
-published atomically; persistent loader workers refresh replay every eight
-chunks, with normal loader prefetch delay. A busy collector skips that snapshot
-opportunity and launches at a later interval.
-
-Collection uses high-presence seeds, records the exact input frame and actual
-trace history before each decision, and matches progress against the seed's
-original fiber. It marks the preceding 48 voxels as hard near departure or a
-would-stop decision, retains up to 24 voxels after departure, and optionally
-explores eight additional calls after a confidence stop. Exploratory states are
-explicitly marked. Unknown endpoint crossings and held-out space censor
-collection. Ordinary decisions are thinned to 16-voxel spacing; each trace
-contributes at most 192 states.
-
-With both replay pools available, sampling targets 50% fresh perturbed states,
-30% ordinary replay, and 20% hard replay. Missing pools fall back to fresh data.
-The latest four completed collections are active by default; newer collections
-receive linearly greater sampling weight. Each archive records its checkpoint,
-training step, collection settings, crop, volume, and fiber identities. Logs
-report actual sample fractions and cumulative replay samples consumed. Older
-archives remain on disk for auditing or explicit reuse.
-
-`--dagger-device` can place collection on another GPU or on CPU; its default is
-the training device, where the two processes share compute and memory. Start
-with a small `--dagger-batch` if memory is constrained. Asynchronous completion
-changes the exact sample ordering across runs. Use recorded fixed caches with
-`--dagger-every 0` for controlled replay experiments. Training shutdown stops an
-unfinished collector and reports it; incomplete collections are never published.
-
-## Evaluation and checks
-
-From the `vesuvius/` project root:
+The frozen manifest retains the original 32 monitor fibers and 48 assessment
+fibers. The remaining 44 validation fibers form the final split; monitor fibers
+are excluded as well as assessment fibers. Current seed counts are 32 monitor,
+96 calibration and 176 final. Geometry hashes and source identities are stored.
 
 ```bash
-FF=src/vesuvius/neural_tracing/fiber_follow
-.venv/bin/python "$FF/scripts/eval_ckpt.py" field --seeds-only --rebuild-seeds
-.venv/bin/python "$FF/scripts/eval_ckpt.py" \
-  "$FF/output/ct0_presence_flow_v10/last.pt" --tag presence_flow_v10 \
-  --history-audit --batch 1 --params '{"confidence":0.7,"n_commit":4}'
+python scripts/evaluate_recovery.py output/RUN/last.pt \
+  --fixtures output/single_path_v11_preparation/calibration_recovery.npz \
+  --out output/RUN/recovery.json
+python scripts/evaluate_single_path.py calibrate \
+  --manifest output/single_path_v11_preparation/seeds.json --out output/RUN/calibration \
+  --checkpoints output/RUN/ckpt_*.pt
+python scripts/evaluate_single_path.py final \
+  --manifest output/single_path_v11_preparation/seeds.json --out output/RUN/final \
+  --selection output/RUN/calibration/selection.json
 ```
 
-Evaluation conserves `correct + offtrack + unknown == length`. Read scored
-length precision together with coverage, unknown length fraction and verified
-length fraction. Unknown tails are not credited as verified continuation.
+Calibration selects the greatest coverage among checkpoint/threshold pairs
+reaching 95% scored precision, then locks the checkpoint hash and threshold.
+Final evaluation enforces that choice and uses actual 6,000-voxel rollouts.
+Reports include drift-band counts, four-plane correctness, false stops,
+departure continuations, coverage, divergence, total wrong length and its
+per-trace distribution. Fixed-state evaluation also measures subsequent recovery
+toward the original fiber from identical observed histories. Existing rollout
+scoring semantics (3-voxel tolerance, sustained departure) are preserved; dense
+prefix confidence labels use 1.5 voxels. Unknown length receives no verified
+continuation credit.
 
-Focused tests in this directory:
+Pass paired final baseline rows via `--baseline-rows` to compute fiber bootstrap
+intervals. Baseline and new rows must have identical seed identities. The target
+is ≥20% relative coverage improvement at matched 95% precision with no worse
+sustained wrong continuations; no improvement is assumed from confidence shifts.
+
+`evaluate_recovery.py --baseline-archive output/single_path_v11_baseline/source_before_v11.tar.gz`
+loads the archived v10 implementation only for baseline evaluation. Use
+`collect_baseline_fixtures.py --help` to preserve its actual observed decisions.
+The archived deterministic rollouts have a 1,200-voxel cap and do not substitute
+for the locked final comparison. `evaluate_single_path.py` also accepts
+`--baseline-archive` for baseline calibration and locked final rollouts; calibrate
+the baseline separately, using the same frozen seeds. Both final reports are
+needed before making a matched-precision improvement claim.
+
+## Verification and current status
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q \
-  tests/test_history_confidence.py tests/test_future_flow.py
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=../../.. \
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q \
+  -o cache_dir=/tmp/single-path-pytest
 ```
 
-Use an environment with PyTorch and pytest and this checkout on `PYTHONPATH`.
-CUDA-only recovery and metric regressions (skipped if CUDA is unavailable):
+Tests cover attention across futures and full history, masked and unsupported
+observations, GT isolation, endpoint censoring, departed states, confidence gradient
+routes, recovery limits, coordinate transforms, deterministic inference, midpoint
+integration, replay import/rotation, checkpoint round trips, beam compatibility,
+accumulation, collection and synthetic parallel-fiber identity recovery.
 
-```bash
-AGENTS_AGENT_MODE=1 python -m pytest -q -p no:cacheprovider tests/test_recovery_policy.py
-```
+The full-crop RTX 5090 benchmark passed: microbatch 2, effective batch 8,
+9.20 GiB peak allocated / 10.02 GiB reserved, 8.85 samples/second (cached-batch
+training, including accumulation and optimizer updates), and 82.7 ms per complete
+tracing decision over a 64-voxel rollout. There are three measured updates after
+warmup. `output/single_path_v11_preparation/benchmark_b2.json` holds raw timings.
+GPU access requires execution outside this session's filesystem sandbox.
 
-The focused suite covers fixed observed history, future-plane pinning,
-masked-token isolation, distinct candidate selection, gradient separation,
-synthetic curve fitting, and training/checkpoint/tracing integration. See
-`EXPERIMENTS.md` for checks performed on each architecture; historical GPU
-measurements are not measurements of v9.
+All 34 tests pass with CUDA access. A real-data two-update training/checkpoint
+smoke and two-seed replay publication also passed. Full-crop prediction and
+denoising images are in the preparation directory. `single_path_v11_run1` is the
+fresh 50,000-update run; watch `output/logs/single_path_v11_run1.log`. Training and
+experimental acceptance are still in progress. CT level 1 losing fine neighboring
+fiber detail remains an experimental risk.
 
 ## Beam re-ranker (`beam/`): learning to choose the VC3D tracer's paths
 

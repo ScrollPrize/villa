@@ -24,8 +24,8 @@ class OnlineCollector:
     reported and does not publish incomplete data. A still-running collector is
     terminated when training ends; already published caches remain reusable.
     """
-    def __init__(self, directory, fibers, val_z, device, every=500, max_seeds=64,
-                 batch=8, explore_calls=8, seed=0, replay_keep=4, initial=(),
+    def __init__(self, directory, fibers, val_z, device, every=1000, max_seeds=64,
+                 batch=1, explore_calls=8, seed=0, replay_keep=4, initial=(),
                  trace_len=6000., confidence=DEFAULT_CONFIDENCE):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
