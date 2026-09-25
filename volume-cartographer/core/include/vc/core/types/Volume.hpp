@@ -98,6 +98,20 @@ public:
     // data belongs to the preparing module.
     static std::shared_ptr<Volume> NewFromPreparedChunkedSource(std::function<vc::render::OpenedChunkedZarr()> sourceFactory, const utils::Json& metadata);
 
+    // A view of `source` whose level 0 is the source's level `baseScaleLevel`
+    // (its shape is the source's divided by 2^baseScaleLevel). Unlike the
+    // #vc-base-scale locator selector this accepts pyramids whose fine levels
+    // are absent, such as a prediction published from /3 upward: the view only
+    // drops the levels finer than the new base, and levels missing in the
+    // source stay missing in the view. Chunks come from the source's own
+    // opener, so a remote source keeps its auth and disk cache. Level 0
+    // returns `source` itself.
+    static std::shared_ptr<Volume> NewRebasedView(
+        const std::shared_ptr<Volume>& source, int baseScaleLevel);
+
+    // Freshly opens the chunk source this volume renders from.
+    [[nodiscard]] vc::render::OpenedChunkedZarr openChunkedSource() const;
+
     [[nodiscard]] bool isRemote() const noexcept { return isRemote_; }
     [[nodiscard]] std::string id() const;
     [[nodiscard]] std::string name() const;
@@ -122,6 +136,10 @@ public:
     [[nodiscard]] std::array<int, 3> shape(int level) const;
     [[nodiscard]] std::array<int, 3> levelShape(int level) const;
     [[nodiscard]] std::array<int, 3> chunkShape(int level) const;
+    // Outer storage chunk of a level: equals chunkShape() for plain arrays,
+    // the shard for sharded ones. Exporters pad a level out to whole storage
+    // chunks, so this is the tolerance for shape comparisons.
+    [[nodiscard]] std::array<int, 3> storageChunkShape(int level) const;
     [[nodiscard]] std::array<int, 3> chunkGridShape(int level) const;
     [[nodiscard]] size_t chunkCount(int level) const;
     // Coordinate/UI order: [x, y, z] = [width, height, slices].
@@ -305,4 +323,7 @@ protected:
     std::filesystem::path remoteCacheRoot_;
     size_t remoteNumScales_ = 0;
     std::function<vc::render::OpenedChunkedZarr()> preparedSourceFactory_;
+    // Process-unique for prepared volumes; part of the chunk-cache identity so
+    // a freed instance's address being reused never revives its cache state.
+    std::uint64_t preparedInstanceId_ = 0;
 };

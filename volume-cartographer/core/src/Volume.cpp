@@ -1080,6 +1080,8 @@ utils::Json Volume::rootAttributes() const
 {
     if (isRemote())
         throw std::runtime_error("Volume::rootAttributes is only supported for local zarr volumes");
+    if (preparedSourceFactory_)
+        throw std::runtime_error("Volume::rootAttributes is not supported for prepared volume views (no storage path)");
     const auto attrsPath = path_ / ".zattrs";
     if (!std::filesystem::exists(attrsPath))
         return utils::Json::object();
@@ -1498,6 +1500,8 @@ std::shared_ptr<Volume> Volume::NewFromPreparedChunkedSource(std::function<vc::r
     volume->zarrFillValue_ = opened.fillValue;
     volume->remoteNumScales_ = opened.shapes.size();
     volume->preparedSourceFactory_ = std::move(sourceFactory);
+    static std::atomic<std::uint64_t> nextPreparedInstanceId{1};
+    volume->preparedInstanceId_ = nextPreparedInstanceId.fetch_add(1, std::memory_order_relaxed);
     return volume;
 }
 
@@ -1550,6 +1554,20 @@ std::array<int, 3> Volume::chunkShape(int level) const
         throw std::runtime_error("Volume::chunkShape encountered invalid zarr chunk shape");
     }
     return chunkShapeZYX;
+}
+
+std::array<int, 3> Volume::storageChunkShape(int level) const
+{
+    const auto inner = chunkShape(level);
+    const auto index = static_cast<std::size_t>(level);
+    if (index >= zarrLevelStorageChunkShapes_.size()) {
+        return inner;
+    }
+    const auto storage = zarrLevelStorageChunkShapes_[index];
+    if (storage[0] <= 0 || storage[1] <= 0 || storage[2] <= 0) {
+        return inner;
+    }
+    return storage;
 }
 
 std::array<int, 3> Volume::chunkGridShape(int level) const
@@ -1671,17 +1689,7 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
         options.persistentCacheBudgetRoot = remoteCacheRoot_;
     }
 
-    vc::render::OpenedChunkedZarr opened;
-    if (preparedSourceFactory_) {
-        opened = preparedSourceFactory_();
-    } else if (isRemote_) {
-        opened = baseScaleLevel_ > 0
-            ? vc::render::openHttpZarrPyramid(
-                  remoteUrl_, remoteAuth_, baseScaleLevel_)
-            : vc::render::openHttpZarrPyramid(remoteUrl_, remoteAuth_);
-    } else {
-        opened = vc::render::openLocalZarrPyramid(path_);
-    }
+    vc::render::OpenedChunkedZarr opened = openChunkedSource();
 
     if (opened.fetchers.empty()) {
         return nullptr;
@@ -1693,6 +1701,103 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
         chunkCacheSourceIdentity(), std::move(levels),
         std::move(opened.fetchers), opened.fillValue, opened.dtype,
         std::move(options));
+}
+
+vc::render::OpenedChunkedZarr Volume::openChunkedSource() const
+{
+    if (preparedSourceFactory_) {
+        return preparedSourceFactory_();
+    }
+    if (isRemote_) {
+        return baseScaleLevel_ > 0
+            ? vc::render::openHttpZarrPyramid(
+                  remoteUrl_, remoteAuth_, baseScaleLevel_)
+            : vc::render::openHttpZarrPyramid(remoteUrl_, remoteAuth_);
+    }
+    return vc::render::openLocalZarrPyramid(path_);
+}
+
+std::shared_ptr<Volume> Volume::NewRebasedView(
+    const std::shared_ptr<Volume>& source, int baseScaleLevel)
+{
+    if (!source) {
+        throw std::invalid_argument("rebased volume view requires a source volume");
+    }
+    if (baseScaleLevel < 0 || baseScaleLevel > vc::kMaxRemoteVolumeBaseScale) {
+        throw std::invalid_argument(
+            "rebased volume view base scale must be from 0 through " +
+            std::to_string(vc::kMaxRemoteVolumeBaseScale));
+    }
+    if (baseScaleLevel == 0) {
+        return source;
+    }
+    const auto presentLevels = source->presentScaleLevels();
+    if (presentLevels.empty() || presentLevels.back() < baseScaleLevel) {
+        throw std::runtime_error(
+            "volume '" + source->id() + "' has no scale level at or below " +
+            std::to_string(baseScaleLevel) + " to rebase onto");
+    }
+
+    const auto factory = [source, baseScaleLevel]() {
+        auto opened = source->openChunkedSource();
+        const auto dropped = static_cast<std::size_t>(baseScaleLevel);
+        if (opened.shapes.size() <= dropped) {
+            throw std::runtime_error(
+                "volume '" + source->id() + "' pyramid has no level " +
+                std::to_string(baseScaleLevel));
+        }
+        const auto erasePrefix = [dropped](auto& values) {
+            if (values.size() >= dropped) {
+                values.erase(values.begin(), values.begin() + dropped);
+            }
+        };
+        erasePrefix(opened.levelNumbers);
+        erasePrefix(opened.transforms);
+        erasePrefix(opened.shapes);
+        erasePrefix(opened.chunkShapes);
+        erasePrefix(opened.storageChunkShapes);
+        erasePrefix(opened.fetchers);
+        erasePrefix(opened.fillValues);
+        opened.levelNumbers.resize(opened.shapes.size());
+        opened.transforms.resize(opened.shapes.size());
+        for (std::size_t level = 0; level < opened.shapes.size(); ++level) {
+            opened.levelNumbers[level] = static_cast<int>(level);
+            const double invScale =
+                1.0 / static_cast<double>(std::uint64_t{1} << level);
+            opened.transforms[level].scaleFromLevel0 = {invScale, invScale, invScale};
+        }
+        return opened;
+    };
+
+    utils::Json metadata = utils::Json::object();
+    metadata["uuid"] = source->id() + "-vc-base-" + std::to_string(baseScaleLevel);
+    // A prepared or remote source may carry no name; fall back to its id.
+    const std::string sourceName =
+        source->metadata().contains("name") && source->metadata()["name"].is_string()
+            ? source->name()
+            : source->id();
+    metadata["name"] = sourceName + " (L" + std::to_string(baseScaleLevel) + ")";
+    // The logical frame is the source's, downsampled by the pyramid's ceiling
+    // rule, not re-synthesized from the first stored level: that level is
+    // padded to whole storage chunks (2602 x 8 = 20816 for a 20812 scroll),
+    // and the padding would otherwise leak into the view's shape.
+    metadata["slices"] = ceilDivPow2(source->numSlices(), baseScaleLevel);
+    metadata["height"] = ceilDivPow2(source->sliceHeight(), baseScaleLevel);
+    metadata["width"] = ceilDivPow2(source->sliceWidth(), baseScaleLevel);
+    if (const double voxelSize = source->voxelSize(); voxelSize > 0.0) {
+        metadata["voxelsize"] =
+            voxelSize * static_cast<double>(std::uint64_t{1} << baseScaleLevel);
+    }
+    auto view = NewFromPreparedChunkedSource(factory, metadata);
+    // Keep the remote identity so the view gets its own persistent chunk cache
+    // under the same cache root; the factory above still does the opening.
+    view->isRemote_ = source->isRemote_;
+    view->remoteUrl_ = source->remoteUrl_;
+    view->remoteLocator_ = source->remoteLocator_;
+    view->remoteAuth_ = source->remoteAuth_;
+    view->remoteCacheRoot_ = source->remoteCacheRoot_;
+    view->baseScaleLevel_ = source->baseScaleLevel_ + baseScaleLevel;
+    return view;
 }
 
 std::string Volume::chunkCacheSourceIdentity() const
@@ -1714,8 +1819,7 @@ std::string Volume::chunkCacheSourceIdentity() const
         return identity;
     }
     if (preparedSourceFactory_) {
-        return "prepared|" + id() + "|instance=" +
-               std::to_string(reinterpret_cast<std::uintptr_t>(this));
+        return "prepared|" + id() + "|instance=" + std::to_string(preparedInstanceId_);
     }
     std::error_code ec;
     auto sourcePath = std::filesystem::weakly_canonical(path_, ec);
@@ -2055,6 +2159,8 @@ std::optional<std::vector<std::byte>> Volume::readChunk(
 {
     if (isRemote())
         throw std::runtime_error("Volume::readChunk is only supported for local zarr volumes");
+    if (preparedSourceFactory_)
+        throw std::runtime_error("Volume::readChunk is not supported for prepared volume views (no storage path)");
     if (level < 0)
         throw std::out_of_range("Volume::readChunk level must be non-negative");
     if (!hasScaleLevel(level))
@@ -2071,6 +2177,8 @@ bool Volume::readChunkInto(
 {
     if (isRemote())
         throw std::runtime_error("Volume::readChunkInto is only supported for local zarr volumes");
+    if (preparedSourceFactory_)
+        throw std::runtime_error("Volume::readChunkInto is not supported for prepared volume views (no storage path)");
     if (level < 0)
         throw std::out_of_range("Volume::readChunkInto level must be non-negative");
     if (!hasScaleLevel(level))
@@ -2104,6 +2212,8 @@ bool Volume::chunkExists(
 {
     if (isRemote())
         throw std::runtime_error("Volume::chunkExists is only supported for local zarr volumes");
+    if (preparedSourceFactory_)
+        throw std::runtime_error("Volume::chunkExists is not supported for prepared volume views (no storage path)");
     if (level < 0)
         throw std::out_of_range("Volume::chunkExists level must be non-negative");
     if (!hasScaleLevel(level))
