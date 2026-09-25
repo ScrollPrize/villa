@@ -17,11 +17,18 @@ import torch
 from vesuvius.neural_tracing.fiber_follow.data import DATA_POLICY
 
 
-def prepare_run_dir(out_root, name) -> Path:
-    """Create ``out_root/name``; refuse to reuse a directory that holds a run."""
+def prepare_run_dir(out_root, name, resume=False) -> Path:
+    """Create ``out_root/name``; refuse to reuse a directory that holds a run.
+
+    With ``resume`` the directory must already hold a run and is reused.
+    """
     out = Path(out_root) / name
+    if resume:
+        if not (out / 'config.json').exists():
+            raise FileNotFoundError(f'{out} holds no run to resume')
+        return out
     if (out / 'config.json').exists():
-        raise FileExistsError(f'{out} already contains a run; use a new --name')
+        raise FileExistsError(f'{out} already contains a run; use a new --name or --resume')
     out.mkdir(parents=True, exist_ok=True)
     return out
 

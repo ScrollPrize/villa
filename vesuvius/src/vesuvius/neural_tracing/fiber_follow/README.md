@@ -75,12 +75,22 @@ complete tracing latency, including data preparation and final confidence.
 
 Training defaults: 50,000 optimizer updates; microbatch 2 with four accumulation
 steps; AdamW, peak LR 1e-3, weight decay 1e-4, 1,000-update warmup/cosine decay,
-gradient clipping at 1, EMA decay .999, CUDA BF16 and channels-last convolutions.
+gradient clipping at 1, EMA decay .999, CUDA BF16 and contiguous convolutions.
+The v11 convolution layout was selected by full-crop CUDA measurements; the beam
+model retains channels-last. See [PERFORMANCE.md](PERFORMANCE.md) for results,
+numerical checks, and commands to compare layouts on another GPU.
 A detached curve pass establishes masked-loss denominators across the effective
 batch; each microbatch then re-encodes for flow/confidence gradients. Censoring
 and departures therefore do not change the objective when switching microbatch
 size. Inference still encodes once per decision.
-Checkpoints save every 1,000 updates and at completion. One background collector
+Checkpoints save every 1,000 updates and at completion. `ckpt_*.pt` and
+`last.pt` also hold the optimizer and RNG state; an interrupted run continues
+in place with `--resume output/NAME/last.pt` and the same `--name` and options
+(residual scales come from the checkpoint, the log is appended, and replay
+continues from the caches the run had published). Collector snapshots under
+`dagger/` are not resumable. Loader workers restart their own streams, so the
+sampled states after a resume differ from an uninterrupted run. The EMA decay
+ramps from .1 toward .999 over the first updates. One background collector
 refreshes replay every 1,000 updates when idle, using EMA, 64 training seeds,
 a 6,000-voxel cap, threshold .7, and eight exploration calls. Diagnostics use the
 original monitor fibers at thresholds .5 and .85. Images show observed history,

@@ -88,12 +88,47 @@ def fit_flow_sigma(batches, cfg, states, progress=None):
 
 @torch.no_grad()
 def update_ema(ema, model, step, decay):
-    """Update EMA once per optimizer update."""
-    effective_decay = decay
+    """Update EMA once per optimizer update, ramping the decay in early updates.
+
+    Without the ramp the average still carries 37% of the random initialization
+    after 1,000 updates, which is what the first collector and diagnostics use.
+    """
+    effective_decay = min(decay, (1+step)/(10+step))
     for average, current in zip(ema.parameters(), model.parameters(), strict=True):
         average.lerp_(current.detach(), 1-effective_decay)
     for average, current in zip(ema.buffers(), model.buffers(), strict=True):
         average.copy_(current)
+
+
+def training_rng_state():
+    state = dict(torch=torch.get_rng_state(), numpy=np.random.get_state())
+    if torch.cuda.is_available():
+        state['cuda'] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_training_rng(state):
+    torch.set_rng_state(state['torch'].cpu())
+    np.random.set_state(state['numpy'])
+    if 'cuda' in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([s.cpu() for s in state['cuda']])
+
+
+def resume_training(ck, model, ema, opt):
+    """Restore weights, EMA, optimizer and RNG from a resumable checkpoint.
+
+    Only ``ckpt_*.pt``/``last.pt`` written by training carry optimizer state;
+    collector snapshots do not. Loader workers restart their own streams, so
+    the sampled data sequence after a resume differs from an uninterrupted run.
+    Returns the completed update count and replay samples seen so far.
+    """
+    if 'optimizer' not in ck:
+        raise ValueError('Checkpoint holds no optimizer state; resume from ckpt_*.pt or last.pt of a run')
+    model.load_state_dict(ck['model'])
+    ema.load_state_dict(ck['ema'])
+    opt.load_state_dict(ck['optimizer'])
+    restore_training_rng(ck['rng'])
+    return int(ck['step']), int(ck.get('replay_seen', 0))
 
 
 def optimizer_update(model, ema, opt, batches, update, lr, *, device, tolerance=1.5, decay=.999, compute_metrics=True):
@@ -202,6 +237,7 @@ def build_parser():
     ap.add_argument('--replay-keep',type=int,default=4)
     ap.add_argument('--manifest',required=True,help='Frozen monitor, calibration and final seed manifest')
     ap.add_argument('--benchmark',required=True,help='Preflight JSON from scripts/benchmark_single_path.py')
+    ap.add_argument('--resume',help='ckpt_*.pt or last.pt inside output/NAME; continues that run in place')
     # Intentionally no legacy fine-tune, sampling, ranking or teacher options.
     return ap
 
@@ -236,28 +272,49 @@ def main(argv=None):
     if manifest['fibers']!=fiber_manifest(val_f) or manifest['volume']!=spec.to_dict():
         raise ValueError('Frozen manifest does not match run geometry/volume')
     fixed=OnPolicyStates.load(args.fixed_bank)
-    caches=[OnPolicyStates.load(p) for p in args.onpolicy]
-    out=prepare_run_dir(args.out_root,args.name)
+    resume=read_checkpoint(args.resume,args.device) if args.resume else None
+    out=prepare_run_dir(args.out_root,args.name,resume=resume is not None)
+    published=out/'dagger'/'replay.json'
+    if resume is not None:
+        if Path(args.resume).resolve().parent!=out.resolve():
+            raise ValueError('--resume must name a checkpoint inside the run directory given by --name')
+        if resume.get('seed_manifest_sha256')!=manifest['sha256']:
+            raise ValueError('Resumed checkpoint was trained against a different frozen manifest')
+        # Continue from the caches the interrupted run had published, not the initial ones.
+        replay_paths=json.loads(published.read_text()) if published.exists() else list(args.onpolicy)
+    else:
+        replay_paths=list(args.onpolicy)
+    caches=[OnPolicyStates.load(p) for p in replay_paths]
     collector=OnlineCollector(out/'dagger',args.fibers,args.val_z,args.dagger_device or args.device,
                               every=args.dagger_every,max_seeds=args.dagger_seeds,batch=args.dagger_batch,
                               explore_calls=args.dagger_explore_calls,seed=args.seed,replay_keep=args.replay_keep,
                               initial=[c._dir for c in caches],trace_len=args.dagger_trace_len,confidence=.7)
-    ds=FollowDataset(train_f,spec,sample_cfg,band,chunk=args.microbatch,seed=args.seed,
+    # A resumed run reseeds its loader workers so it does not replay the run's first states.
+    ds=FollowDataset(train_f,spec,sample_cfg,band,chunk=args.microbatch,seed=args.seed+(resume['step'] if resume else 0),
                      cache_bytes=int(args.worker_cache_gb*(1<<30)),fixed=[fixed],onpolicy=caches,replay_index=str(collector.index))
     kwargs=dict(num_workers=args.workers,batch_size=None)
     if args.workers: kwargs.update(prefetch_factor=2,persistent_workers=True)
     loader=torch.utils.data.DataLoader(ds,**kwargs); it=iter(loader)
-    print(f'Fitting residual scales from {args.flow_calibration_states} training states...',flush=True)
-    model_cfg.flow_sigma,calibration=fit_flow_sigma(it,model_cfg,args.flow_calibration_states,
-        progress=lambda seen:print(json.dumps(dict(calibration_states=seen,total=args.flow_calibration_states)),flush=True))
+    if resume is None:
+        print(f'Fitting residual scales from {args.flow_calibration_states} training states...',flush=True)
+        model_cfg.flow_sigma,calibration=fit_flow_sigma(it,model_cfg,args.flow_calibration_states,
+            progress=lambda seen:print(json.dumps(dict(calibration_states=seen,total=args.flow_calibration_states)),flush=True))
+    else:
+        model_cfg=FollowNetConfig(**resume['model_cfg']); calibration=resume['flow_calibration']
     model=prepare_model(FollowNet(model_cfg),args.device)
     ema=copy.deepcopy(model).requires_grad_(False).eval()
     opt=torch.optim.AdamW(model.parameters(),lr=args.lr,weight_decay=1e-4)
-    (out/'config.json').write_text(json.dumps(dict(vars(args),architecture=ARCHITECTURE,model_cfg=model_cfg.to_dict(),
+    first=1; replay_seen=0
+    if resume is not None:
+        done,replay_seen=resume_training(resume,model,ema,opt); first=done+1
+        del resume
+    else: (out/'config.json').write_text(json.dumps(dict(vars(args),architecture=ARCHITECTURE,model_cfg=model_cfg.to_dict(),
          sample_cfg=dataclasses.asdict(sample_cfg),vol_spec=spec.to_dict(),flow_calibration=calibration,
          accumulation_steps=args.batch//args.microbatch,data_policy=DATA_POLICY,fiber_manifest=fiber_manifest(fibers),
          train=[f.name for f in train_f],val=[f.name for f in val_f],seed_manifest=manifest,
-         cuda_channels_last_3d=args.device.startswith('cuda'),cudnn_benchmark_training=args.device.startswith('cuda')),indent=2))
+         cuda_channels_last_3d=(args.device.startswith('cuda') and
+                               model.encoders[0][0].weight.is_contiguous(memory_format=torch.channels_last_3d)),
+         cudnn_benchmark_training=args.device.startswith('cuda')),indent=2))
     tracer=None
     seeds=manifest['monitor']
     if args.diag_every and seeds:
@@ -266,9 +323,10 @@ def main(argv=None):
         from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume
         tracer=ModelTracer(ema,FiberVolume(spec,cache_bytes=2<<30),crop,128,TraceParams(),device=args.device)
         (out/'images').mkdir(exist_ok=True)
-    log=RunLog(out/'log.jsonl',formatter=format_training_log); start=time.monotonic(); replay_seen=0
+    log=RunLog(out/'log.jsonl',formatter=format_training_log); start=time.monotonic()
+    if first>1: log.record(dict(step=first,resumed_from=args.resume,replay_caches=len(caches)))
     try:
-        for step in range(1,args.steps+1):
+        for step in range(first,args.steps+1):
             event=collector.poll()
             if event: log.record(dict(step=step,**event))
             batches=[next(it) for _ in range(args.batch//args.microbatch)]
@@ -280,11 +338,13 @@ def main(argv=None):
             replay_seen+=metrics.pop('replay_samples')
             if log_step:
                 log.record(dict(step=step,loss=loss,lr=lr,replay_samples_seen=replay_seen,
-                                samples_per_second=step*args.batch/(time.monotonic()-start),**metrics))
-            def save(path):
-                save_checkpoint(path,model,ema,spec,sample_cfg,dict(step=step,tolerance=args.tolerance,
-                    seed=args.seed,ema_decay=args.ema_decay,ema_updates=step,flow_calibration=calibration,
-                    seed_manifest_sha256=manifest['sha256']))
+                                samples_per_second=(step-first+1)*args.batch/(time.monotonic()-start),**metrics))
+            def save(path,resumable=False):
+                extra=dict(step=step,tolerance=args.tolerance,seed=args.seed,ema_decay=args.ema_decay,ema_updates=step,
+                           flow_calibration=calibration,seed_manifest_sha256=manifest['sha256'],replay_seen=replay_seen)
+                if resumable:  # collector snapshots stay light; training checkpoints can continue the run
+                    extra.update(optimizer=opt.state_dict(),rng=training_rng_state())
+                save_checkpoint(path,model,ema,spec,sample_cfg,extra)
             if step<args.steps and collector.launch(step,save): log.record(dict(step=step,dagger_launched=True))
             if tracer is not None and step%args.diag_every==0:
                 torch.backends.cudnn.benchmark=False
@@ -302,7 +362,7 @@ def main(argv=None):
                                     roll_precision=summary['length_precision'],roll_diverged=summary['diverged']))
                 plot_curves(out/'log.jsonl',out/'curves.png')
             if step%args.ckpt_every==0 or step==args.steps:
-                save(out/f'ckpt_{step:06d}.pt'); save(out/'last.pt')
+                save(out/f'ckpt_{step:06d}.pt',resumable=True); save(out/'last.pt',resumable=True)
     finally:
         event=collector.close()
         if event: log.record(event)

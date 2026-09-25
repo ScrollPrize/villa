@@ -354,3 +354,37 @@ def test_count_aggregation_and_paired_bootstrap():
     row.update(fiber=0,t0=30,sign=1)
     result=paired_bootstrap([row],[row],repeats=20)
     assert all(v==[0.,0.,0.] for v in result.values())
+
+
+def test_ema_ramp_and_resumable_checkpoint(tmp_path):
+    from vesuvius.neural_tracing.fiber_follow.train import (
+        update_ema,resume_training,training_rng_state,read_checkpoint)
+    from vesuvius.neural_tracing.fiber_follow.runloop import prepare_run_dir
+    cfg=config();m=FollowNet(cfg);e=copy.deepcopy(m)
+    with torch.no_grad():
+        for p in m.parameters(): p.add_(1.)
+    update_ema(e,m,0,.999)  # ramped decay .1 at the first update, not .999
+    for a,b in zip(e.parameters(),m.parameters()): torch.testing.assert_close(a,b-.1)
+    update_ema(e,m,10**6,.999)
+    for a,b in zip(e.parameters(),m.parameters()): torch.testing.assert_close(a,b-.1*.999)
+    b=batch(cfg,1);opt=torch.optim.AdamW(m.parameters(),lr=1e-3)
+    run(m,b,targets=b)['flow_loss'].backward();opt.step()
+    crop=CropSpec(depth=20,width=12,behind=10)
+    sample=D.SampleConfig(crop=crop,n_history=8,recent_history_points=8,n_future=4)
+    spec=FiberVolumeSpec('unused',ct_zarr='unused',ct_level=1,ct_grid_scale=8,inputs='ct+presence')
+    torch.manual_seed(5);expected=torch.rand(3)
+    torch.manual_seed(5)
+    save_checkpoint(tmp_path/'last.pt',m,e,spec,sample,dict(step=7,replay_seen=3,optimizer=opt.state_dict(),rng=training_rng_state()))
+    save_checkpoint(tmp_path/'source.pt',m,e,spec,sample,dict(step=7))
+    m2=FollowNet(cfg);e2=copy.deepcopy(m2);opt2=torch.optim.AdamW(m2.parameters(),lr=1e-3)
+    with pytest.raises(ValueError,match='optimizer'): resume_training(read_checkpoint(tmp_path/'source.pt','cpu'),m2,e2,opt2)
+    assert resume_training(read_checkpoint(tmp_path/'last.pt','cpu'),m2,e2,opt2)==(7,3)
+    torch.testing.assert_close(torch.rand(3),expected)
+    for a,c in zip(m.parameters(),m2.parameters()): torch.testing.assert_close(a,c,rtol=0,atol=0)
+    for a,c in zip(e.parameters(),e2.parameters()): torch.testing.assert_close(a,c,rtol=0,atol=0)
+    for s,t in zip(opt.state_dict()['state'].values(),opt2.state_dict()['state'].values()):
+        torch.testing.assert_close(s['exp_avg'],t['exp_avg'],rtol=0,atol=0)
+    with pytest.raises(FileNotFoundError): prepare_run_dir(tmp_path,'missing',resume=True)
+    (tmp_path/'run').mkdir();(tmp_path/'run'/'config.json').write_text('{}')
+    with pytest.raises(FileExistsError): prepare_run_dir(tmp_path,'run')
+    assert prepare_run_dir(tmp_path,'run',resume=True)==tmp_path/'run'

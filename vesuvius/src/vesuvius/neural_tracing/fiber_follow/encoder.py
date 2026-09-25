@@ -6,10 +6,11 @@ import torch.nn.functional as F
 from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec, crop_local_grid
 
 def prepare_model(model, device):
-    """Use CUDA's efficient 3D convolution layout without changing precision."""
+    """Apply the model's measured CUDA layout without changing precision."""
     model = model.to(device)
     if torch.device(device).type == 'cuda':
-        nn.utils.convert_conv3d_weight_memory_format(model, torch.channels_last_3d)
+        layout = getattr(model, 'cuda_memory_format', torch.channels_last_3d)
+        nn.utils.convert_conv3d_weight_memory_format(model, layout)
     return model
 
 

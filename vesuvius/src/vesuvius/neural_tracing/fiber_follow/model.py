@@ -240,6 +240,10 @@ class PathFlow(nn.Module):
 
 
 class FollowNet(SpatialEncoder):
+    # The full v11 crop is faster without repeated channels-last conversions
+    # around group normalization and interpolation. See PERFORMANCE.md.
+    cuda_memory_format = torch.contiguous_format
+
     def __init__(self,cfg):
         super().__init__(cfg)
         self.flow = PathFlow(cfg,cfg.widths[0])
