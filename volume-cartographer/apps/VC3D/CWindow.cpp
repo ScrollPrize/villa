@@ -2676,6 +2676,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             _lineAnnotationController.get());
     _lineAnnotationController->setVolumeSelectorFactory(
         [this](QWidget* parent) { return createAnnotationVolumeSelector(parent); });
+    // The line annotation workspace lists a filtered, relabelled subset of the
+    // volumes in its own selector; switching goes through the same path as
+    // the toolbar selector so every control stays in step.
+    _lineAnnotationController->setVolumeSwitchHandler(
+        [this](const std::string& volumeId) { selectVolumeById(QString::fromStdString(volumeId)); });
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::atlasCreated,
             this,
@@ -9026,21 +9031,31 @@ void CWindow::connectVolumeSelector(QComboBox* selector)
             QOverload<int>::of(&QComboBox::currentIndexChanged),
             this,
             [this, selector](const int& index) {
-                auto vpkg = _state->vpkg();
-                if (vpkg && index >= 0) {
-                    const QString volumeId = selector->currentData().toString();
-                    std::shared_ptr<Volume> newVolume;
-                    try {
-                        newVolume = vpkg->volume(volumeId.toStdString());
-                    } catch (const std::out_of_range&) {
-                        QMessageBox::warning(this, "Error", "Could not load volume.");
-                        syncVolumeSelectionControls();
-                        return;
-                    }
-                    setVolume(newVolume);
-                    syncVolumeSelectionControls(volumeId);
+                if (index >= 0) {
+                    selectVolumeById(selector->currentData().toString());
                 }
             });
+}
+
+void CWindow::selectVolumeById(const QString& volumeId)
+{
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg || volumeId.isEmpty()) {
+        return;
+    }
+    std::shared_ptr<Volume> newVolume;
+    try {
+        newVolume = vpkg->volume(volumeId.toStdString());
+    } catch (const std::out_of_range&) {
+        newVolume = nullptr;
+    }
+    if (!newVolume) {
+        QMessageBox::warning(this, "Error", "Could not load volume.");
+        syncVolumeSelectionControls();
+        return;
+    }
+    setVolume(newVolume);
+    syncVolumeSelectionControls(volumeId);
 }
 
 QString CWindow::lastVolumeSettingKeyForCurrentPackage() const

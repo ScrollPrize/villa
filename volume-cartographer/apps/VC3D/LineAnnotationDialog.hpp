@@ -117,8 +117,50 @@ public:
     using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
 
     explicit LineAnnotationDialog(ViewerManager* viewerManager,
-                                  VolumeSelectorFactory volumeSelectorFactory = {},
                                   QWidget* parent = nullptr);
+
+    // A dataset menu entry: greyed out (with the tooltip saying why) when it
+    // was published against another scan than the selected one.
+    struct DatasetMenuOption {
+        std::string location;
+        std::string label;
+        bool applicable = true;
+        std::string tooltip;
+    };
+    // Raw scan submenu entries (scan key, label).
+    struct RawScanMenuOption {
+        std::string scanKey;
+        std::string label;
+        std::string tooltip;
+    };
+    // Top-bar volume selector entries (volume id, readable label, tooltip).
+    struct VolumeSelectorEntry {
+        std::string id;
+        std::string label;
+        std::string tooltip;
+    };
+    // Level entries of the selected scan ("Level 1 (4.798 µm)"), shown under
+    // the scans in the Raw scan submenu; `currentLevel` is checked.
+    struct RawScanLevelOption {
+        int level = 0;
+        std::string label;
+    };
+    void setRawScanOptions(std::vector<RawScanMenuOption> options,
+                           const std::string& selectedScanKey,
+                           std::vector<RawScanLevelOption> levels,
+                           int currentLevel);
+    // Replaces the top-bar volume list; `currentVolumeId` is selected without
+    // emitting volumeSelectionRequested.
+    void setVolumeSelectorEntries(std::vector<VolumeSelectorEntry> entries,
+                                  const std::string& currentVolumeId);
+    void setCurrentVolumeId(const std::string& volumeId);
+    // Surface dataset submenu: the project's surface predictions (volume id as
+    // location), greyed when published against another scan.
+    void setSurfaceOptions(std::vector<DatasetMenuOption> options, const std::string& selectedVolumeId);
+    // "Advanced volume selector" in the hamburger: the selector lists every
+    // project volume under its raw name, and the pane overlay is in its
+    // any-volume mode. One persisted flag drives both.
+    bool advancedVolumeSelector() const;
 
     void showWithSavedGeometry();
     CChunkedVolumeViewer* addPane(const std::string& surfaceName,
@@ -162,10 +204,10 @@ public:
     vc3d::line_annotation::FiberOptimizationMode fiberOptimizationMode() const;
     void setFiberOptimizationMode(vc3d::line_annotation::FiberOptimizationMode mode);
     void setLasagnaDatasetOptions(
-        std::vector<std::pair<std::string, std::string>> options,
+        std::vector<DatasetMenuOption> options,
         const std::string& selectedLocation);
     void setFiberInferenceDatasetOptions(
-        std::vector<std::pair<std::string, std::string>> options,
+        std::vector<DatasetMenuOption> options,
         const std::string& selectedLocation);
     // Fiber presence overlay on the four generated panes. Dialog-local: the
     // panes leave the app-wide Overlay panel and draw only this. The dialog
@@ -309,6 +351,14 @@ signals:
         vc3d::line_annotation::FiberOptimizationMode mode);
     void lasagnaDatasetSelectionChanged(const std::string& location);
     void fiberInferenceDatasetSelectionChanged(const std::string& location);
+    void rawScanSelectionChanged(const std::string& scanKey);
+    void surfaceSelectionChanged(const std::string& volumeId);
+    // A level of the selected scan was picked in the Raw scan submenu.
+    void rawScanLevelSelectionChanged(int level);
+    // The user picked a volume in the top-bar selector.
+    void volumeSelectionRequested(const std::string& volumeId);
+    // Advanced mode toggled; the controller re-sends the selector entries.
+    void volumeSelectorScopeChanged();
     void extrapolationDistanceChanged(int distanceVx);
     // The user switched the presence overlay on or off (button, menu or "P").
     // On enable the controller resolves the volume and calls
@@ -531,12 +581,24 @@ private:
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
     QComboBox* _fiberOptimizationCombo = nullptr;
+    QMenu* _rawScanMenu = nullptr;
     QMenu* _lasagnaDatasetMenu = nullptr;
     QMenu* _fiberInferenceDatasetMenu = nullptr;
-    std::vector<std::pair<std::string, std::string>> _lasagnaDatasetOptions;
-    std::vector<std::pair<std::string, std::string>> _fiberInferenceDatasetOptions;
+    std::vector<RawScanMenuOption> _rawScanOptions;
+    std::string _selectedRawScanKey;
+    std::vector<RawScanLevelOption> _rawScanLevelOptions;
+    int _selectedRawScanLevel = 0;
+    std::vector<DatasetMenuOption> _lasagnaDatasetOptions;
+    std::vector<DatasetMenuOption> _fiberInferenceDatasetOptions;
     std::string _selectedLasagnaDatasetLocation;
     std::string _selectedFiberInferenceDatasetLocation;
+    QMenu* _surfaceMenu = nullptr;
+    std::vector<DatasetMenuOption> _surfaceOptions;
+    std::string _selectedSurfaceVolumeId;
+    QComboBox* _volumeSelect = nullptr;
+    QAction* _advancedAction = nullptr;
+    // One switch for the raw-name selector and the overlay's any-volume mode.
+    void setAdvancedMode(bool advanced);
     // Checked = auto-reoptimize after each edit; unchecked = no optimization.
     QAction* _autoReoptimizeAction = nullptr;
     QAction* _showAsMeshAction = nullptr;

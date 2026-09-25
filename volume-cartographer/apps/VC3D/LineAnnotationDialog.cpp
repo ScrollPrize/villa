@@ -674,7 +674,6 @@ private:
 } // namespace
 
 LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
-                                           VolumeSelectorFactory volumeSelectorFactory,
                                            QWidget* parent)
     : QMainWindow(parent)
     , _viewerManager(viewerManager)
@@ -733,6 +732,35 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
         emit showAsMeshRequested();
     });
     annotationMenu->addSeparator();
+    // Advanced: the selector shows every volume under its raw name (twins
+    // included) and the pane overlay takes any volume; off, the selector shows
+    // the selected dataset set under readable names and the overlay is the
+    // fiber presence. One persisted flag, shared with the overlay flyout.
+    _advancedAction = annotationMenu->addAction(tr("Advanced volume selector"));
+    _advancedAction->setCheckable(true);
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _advancedAction->setChecked(
+            settings.value(vc3d::settings::line_annotation::PRESENCE_OVERLAY_ADVANCED,
+                           vc3d::settings::line_annotation::PRESENCE_OVERLAY_ADVANCED_DEFAULT)
+                .toBool());
+    }
+    _advancedAction->setToolTip(
+        tr("Checked: the volume selector lists every volume in the project by its raw "
+           "name, and the pane overlay can show any volume.\n"
+           "Unchecked: the selector shows the selected raw scan's set (scan, Lasagna "
+           "and fiber channels, surface) and the overlay shows the fiber presence."));
+    connect(_advancedAction, &QAction::toggled, this, [this](bool checked) {
+        setAdvancedMode(checked);
+    });
+    // The raw scan is the root of a dataset set: the Lasagna, fiber and
+    // surface menus grey out datasets published against another scan, and the
+    // top-bar volume selector lists only the selected set.
+    _rawScanMenu = annotationMenu->addMenu(tr("Raw scan"));
+    _rawScanMenu->setToolTipsVisible(true);
+    _rawScanMenu->menuAction()->setToolTip(
+        tr("Select the scan to work on. Datasets of other scans are greyed out "
+           "and the volume selector shows this scan's set."));
     _lasagnaDatasetMenu = annotationMenu->addMenu(tr("Lasagna dataset"));
     _lasagnaDatasetMenu->setToolTipsVisible(true);
     _lasagnaDatasetMenu->menuAction()->setToolTip(
@@ -741,6 +769,45 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _fiberInferenceDatasetMenu->setToolTipsVisible(true);
     _fiberInferenceDatasetMenu->menuAction()->setToolTip(
         tr("Select the fiber inference dataset used for line annotation."));
+    _surfaceMenu = annotationMenu->addMenu(tr("Surface dataset"));
+    _surfaceMenu->setToolTipsVisible(true);
+    _surfaceMenu->menuAction()->setToolTip(
+        tr("Select the surface prediction listed in the volume selector (one at a time)."));
+    // Optimizer (Lasagna vs fiber model): rarely changed, so an embedded row
+    // here rather than a permanent combo in the top bar. The combo object is
+    // unchanged (name, items, signal) for the controller and tests.
+    _fiberOptimizationCombo = new QComboBox;
+    _fiberOptimizationCombo->setObjectName(
+        QStringLiteral("lineAnnotationFiberOptimizationModeCombo"));
+    _fiberOptimizationCombo->addItem(
+        tr("Lasagna"),
+        static_cast<int>(vc3d::line_annotation::FiberOptimizationMode::Lasagna));
+    _fiberOptimizationCombo->addItem(
+        tr("Fiber model"),
+        static_cast<int>(vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d));
+    installComboEventFilter(_fiberOptimizationCombo, this);
+    connect(_fiberOptimizationCombo,
+            qOverload<int>(&QComboBox::currentIndexChanged),
+            this,
+            [this](int) {
+                emit fiberOptimizationModeChanged(fiberOptimizationMode());
+            });
+    {
+        auto* row = new QWidget(annotationMenu);
+        auto* rowLayout = new QHBoxLayout(row);
+        rowLayout->setContentsMargins(28, 3, 12, 3);
+        rowLayout->setSpacing(8);
+        auto* label = new QLabel(tr("Optimizer"), row);
+        label->setToolTip(tr("Lasagna: optimize the line on the Lasagna dataset.\n"
+                             "Fiber model: trace with the fiber inference dataset."));
+        rowLayout->addWidget(label);
+        rowLayout->addStretch(1);
+        _fiberOptimizationCombo->setParent(row);
+        rowLayout->addWidget(_fiberOptimizationCombo);
+        auto* action = new QWidgetAction(annotationMenu);
+        action->setDefaultWidget(row);
+        annotationMenu->addAction(action);
+    }
     annotationMenu->addSeparator();
     // Length / Extrapolation live in the menu as embedded label+spinbox rows
     // (QWidgetAction); editing them does not close the menu. Spinbox edits are
@@ -916,30 +983,30 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     annotationMenuButton->setMenu(annotationMenu);
     buttonLayout->addWidget(annotationMenuButton);
 
-    if (volumeSelectorFactory) {
-        if (auto* volumeSelector = volumeSelectorFactory(buttonRow)) {
-            volumeSelector->installEventFilter(this);
-            buttonLayout->addWidget(volumeSelector);
+    // The dialog owns its volume selector: the controller fills it with the
+    // selected dataset set under readable labels (the main window's selectors
+    // keep listing every volume), and a pick goes back through the controller
+    // to the main window's volume switch so every selector stays in step.
+    _volumeSelect = new QComboBox(buttonRow);
+    _volumeSelect->setObjectName(QStringLiteral("annotationVolumeSelect"));
+    _volumeSelect->setMinimumWidth(130);
+    _volumeSelect->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+    _volumeSelect->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    installComboEventFilter(_volumeSelect, this);
+    buttonLayout->addWidget(_volumeSelect);
+    connect(_volumeSelect, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index < 0 || !_volumeSelect) {
+            return;
         }
-    }
-
-    _fiberOptimizationCombo = new QComboBox(buttonRow);
-    _fiberOptimizationCombo->setObjectName(
-        QStringLiteral("lineAnnotationFiberOptimizationModeCombo"));
-    _fiberOptimizationCombo->addItem(
-        tr("Lasagna"),
-        static_cast<int>(vc3d::line_annotation::FiberOptimizationMode::Lasagna));
-    _fiberOptimizationCombo->addItem(
-        tr("Fiber model"),
-        static_cast<int>(vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d));
-    installComboEventFilter(_fiberOptimizationCombo, this);
-    buttonLayout->addWidget(_fiberOptimizationCombo);
-    connect(_fiberOptimizationCombo,
-            qOverload<int>(&QComboBox::currentIndexChanged),
-            this,
-            [this](int) {
-                emit fiberOptimizationModeChanged(fiberOptimizationMode());
-            });
+        const std::string id = _volumeSelect->itemData(index).toString().toStdString();
+        if (id.empty()) {
+            return;
+        }
+        // Queued: the switch ends in the controller repopulating this very
+        // combo, which must not happen inside its own currentIndexChanged.
+        QMetaObject::invokeMethod(
+            this, [this, id]() { emit volumeSelectionRequested(id); }, Qt::QueuedConnection);
+    });
 
     rebuildDatasetMenus();
 
@@ -1056,15 +1123,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
                "dataset's presence channel."));
         grid->addWidget(_presenceAdvancedCheck, 4, 0, 1, 3);
         connect(_presenceAdvancedCheck, &QCheckBox::toggled, this, [this](bool checked) {
-            if (_presenceOverlay.advanced == checked) {
-                return;
-            }
-            _presenceOverlay.advanced = checked;
-            savePresenceOverlaySettings();
-            updatePresenceOverlayUi();
-            if (_presenceOverlay.enabled) {
-                emit presenceOverlaySourceChanged();
-            }
+            setAdvancedMode(checked);
         });
         _presenceVolumeLabel = new QLabel(tr("Volume"), flyout);
         grid->addWidget(_presenceVolumeLabel, 5, 0);
@@ -1274,7 +1333,7 @@ void LineAnnotationDialog::setFiberOptimizationMode(
 }
 
 void LineAnnotationDialog::setLasagnaDatasetOptions(
-    std::vector<std::pair<std::string, std::string>> options,
+    std::vector<DatasetMenuOption> options,
     const std::string& selectedLocation)
 {
     _lasagnaDatasetOptions = std::move(options);
@@ -1283,7 +1342,7 @@ void LineAnnotationDialog::setLasagnaDatasetOptions(
 }
 
 void LineAnnotationDialog::setFiberInferenceDatasetOptions(
-    std::vector<std::pair<std::string, std::string>> options,
+    std::vector<DatasetMenuOption> options,
     const std::string& selectedLocation)
 {
     _fiberInferenceDatasetOptions = std::move(options);
@@ -1291,11 +1350,142 @@ void LineAnnotationDialog::setFiberInferenceDatasetOptions(
     rebuildDatasetMenus();
 }
 
+void LineAnnotationDialog::setRawScanOptions(std::vector<RawScanMenuOption> options,
+                                             const std::string& selectedScanKey,
+                                             std::vector<RawScanLevelOption> levels,
+                                             int currentLevel)
+{
+    _rawScanOptions = std::move(options);
+    _selectedRawScanKey = selectedScanKey;
+    _rawScanLevelOptions = std::move(levels);
+    _selectedRawScanLevel = currentLevel;
+    rebuildDatasetMenus();
+}
+
+void LineAnnotationDialog::setVolumeSelectorEntries(std::vector<VolumeSelectorEntry> entries,
+                                                    const std::string& currentVolumeId)
+{
+    if (!_volumeSelect) {
+        return;
+    }
+    const QSignalBlocker blocker(_volumeSelect);
+    _volumeSelect->clear();
+    int current = -1;
+    for (const auto& entry : entries) {
+        _volumeSelect->addItem(QString::fromStdString(entry.label),
+                               QString::fromStdString(entry.id));
+        const int row = _volumeSelect->count() - 1;
+        _volumeSelect->setItemData(row, QString::fromStdString(entry.tooltip), Qt::ToolTipRole);
+        if (entry.id == currentVolumeId) {
+            current = row;
+        }
+    }
+    _volumeSelect->setCurrentIndex(current);
+    _volumeSelect->setEnabled(_volumeSelect->count() > 0);
+}
+
+void LineAnnotationDialog::setCurrentVolumeId(const std::string& volumeId)
+{
+    if (!_volumeSelect) {
+        return;
+    }
+    const int index = _volumeSelect->findData(QString::fromStdString(volumeId));
+    if (index >= 0 && index != _volumeSelect->currentIndex()) {
+        const QSignalBlocker blocker(_volumeSelect);
+        _volumeSelect->setCurrentIndex(index);
+    }
+}
+
+bool LineAnnotationDialog::advancedVolumeSelector() const
+{
+    return _presenceOverlay.advanced;
+}
+
+void LineAnnotationDialog::setAdvancedMode(bool advanced)
+{
+    if (_presenceOverlay.advanced != advanced) {
+        _presenceOverlay.advanced = advanced;
+        savePresenceOverlaySettings();
+    }
+    if (_advancedAction && _advancedAction->isChecked() != advanced) {
+        const QSignalBlocker blocker(_advancedAction);
+        _advancedAction->setChecked(advanced);
+    }
+    // Repopulates the flyout (its advanced checkbox and volume row) and, when
+    // the overlay is on, re-resolves its source in the new mode.
+    updatePresenceOverlayUi();
+    if (_presenceOverlay.enabled) {
+        emit presenceOverlaySourceChanged();
+    }
+    emit volumeSelectorScopeChanged();
+}
+
+void LineAnnotationDialog::setSurfaceOptions(std::vector<DatasetMenuOption> options,
+                                             const std::string& selectedVolumeId)
+{
+    _surfaceOptions = std::move(options);
+    _selectedSurfaceVolumeId = selectedVolumeId;
+    rebuildDatasetMenus();
+}
+
 void LineAnnotationDialog::rebuildDatasetMenus()
 {
+    if (_rawScanMenu) {
+        _rawScanMenu->clear();
+        if (_rawScanOptions.empty()) {
+            auto* action = _rawScanMenu->addAction(tr("No scans in the project"));
+            action->setEnabled(false);
+        }
+        for (const auto& option : _rawScanOptions) {
+            auto* action = _rawScanMenu->addAction(QString::fromStdString(option.label));
+            action->setCheckable(true);
+            action->setChecked(option.scanKey == _selectedRawScanKey);
+            action->setToolTip(QString::fromStdString(option.tooltip));
+            const std::string scanKey = option.scanKey;
+            connect(action, &QAction::triggered, this, [this, scanKey]() {
+                emit rawScanSelectionChanged(scanKey);
+            });
+        }
+        // The selected scan's pyramid levels: the level decides the frame the
+        // panes are built in (and how much data they pull); the volume
+        // selector lists the scan once and follows this choice.
+        if (!_rawScanLevelOptions.empty()) {
+            _rawScanMenu->addSeparator();
+            auto* heading = _rawScanMenu->addAction(tr("Level of the selected scan"));
+            heading->setEnabled(false);
+            for (const auto& option : _rawScanLevelOptions) {
+                auto* action = _rawScanMenu->addAction(QString::fromStdString(option.label));
+                action->setCheckable(true);
+                action->setChecked(option.level == _selectedRawScanLevel);
+                const int level = option.level;
+                connect(action, &QAction::triggered, this, [this, level]() {
+                    emit rawScanLevelSelectionChanged(level);
+                });
+            }
+        }
+    }
+    if (_surfaceMenu) {
+        _surfaceMenu->clear();
+        if (_surfaceOptions.empty()) {
+            auto* action = _surfaceMenu->addAction(tr("No surface predictions in the project"));
+            action->setEnabled(false);
+        }
+        for (const auto& option : _surfaceOptions) {
+            auto* action = _surfaceMenu->addAction(QString::fromStdString(option.label));
+            action->setCheckable(true);
+            action->setChecked(option.location == _selectedSurfaceVolumeId);
+            action->setEnabled(option.applicable || option.location == _selectedSurfaceVolumeId);
+            action->setToolTip(QString::fromStdString(
+                option.tooltip.empty() ? option.location : option.tooltip));
+            const std::string id = option.location;
+            connect(action, &QAction::triggered, this, [this, id]() {
+                emit surfaceSelectionChanged(id);
+            });
+        }
+    }
     auto populateMenu =
         [this](QMenu* menu,
-               const std::vector<std::pair<std::string, std::string>>& options,
+               const std::vector<DatasetMenuOption>& options,
                const std::string& selected,
                bool fiberMenu) {
             if (!menu) {
@@ -1309,11 +1499,17 @@ void LineAnnotationDialog::rebuildDatasetMenus()
                 action->setEnabled(false);
                 return;
             }
-            for (const auto& [location, label] : options) {
-                auto* action = menu->addAction(QString::fromStdString(label));
+            for (const auto& option : options) {
+                auto* action = menu->addAction(QString::fromStdString(option.label));
                 action->setCheckable(true);
-                action->setChecked(location == selected);
-                action->setToolTip(QString::fromStdString(location));
+                action->setChecked(option.location == selected);
+                // Greyed entries stay listed so the user sees what exists and
+                // why it cannot be picked here; the selected one stays enabled
+                // even when it no longer applies, so it can be seen and changed.
+                action->setEnabled(option.applicable || option.location == selected);
+                action->setToolTip(QString::fromStdString(
+                    option.tooltip.empty() ? option.location : option.tooltip));
+                const std::string location = option.location;
                 connect(action, &QAction::triggered, this, [this, location, fiberMenu]() {
                     if (fiberMenu) {
                         emit fiberInferenceDatasetSelectionChanged(location);

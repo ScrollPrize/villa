@@ -31,6 +31,7 @@
 
 #include "AnnotationFrame.hpp"
 #include "UmbilicusOrientationFreshness.hpp"
+#include "LineAnnotationDatasetSets.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberDeletion.hpp"
 #include "LineAnnotationFiberSegments.hpp"
@@ -389,6 +390,18 @@ public:
     // Holders of derived geometry compare it to know whether what they built is
     // still in a frame that means anything.
     [[nodiscard]] vc3d::annotation::AnnotationFrame annotationFrame() const;
+    // The volume whose grid frames fiber geometry and the umbilicus: the
+    // active volume when it is a raw scan (at whatever pyramid level), else
+    // the selected raw scan at level 0, which is the frame every Lasagna,
+    // fiber and surface channel is opened in (their pyramids' level 0 is the
+    // manifest base grid, padded to whole chunks). A channel shown in the
+    // panes must not redefine the frame: its padded extent fits no manifest
+    // and carries no voxel size. Null with its id empty when nothing applies.
+    struct FrameVolume {
+        std::shared_ptr<Volume> volume;
+        std::string id;
+    };
+    [[nodiscard]] FrameVolume frameVolume() const;
     // Cheap token over everything resolveScrollUmbilicus() depends on: the
     // project's field plus a stat() of each path the resolver's own scan reports,
     // and no JSON parse. Size and mtime, so it is a metadata token rather than a
@@ -469,6 +482,10 @@ public:
             vc3d::line_annotation::FiberOptimizationMode,
             vc3d::line_annotation::FiberOptimizationMode)> picker);
     void setVolumeSelectorFactory(VolumeSelectorFactory factory);
+    // Makes a package volume the active one (the main window's switch, so
+    // every selector follows). The dialog's own volume selector goes through it.
+    using VolumeSwitchHandler = std::function<void(const std::string& volumeId)>;
+    void setVolumeSwitchHandler(VolumeSwitchHandler handler);
     void setSurfacePanel(SurfacePanelController* panel);
     void setCurrentAtlasDirectory(std::optional<std::filesystem::path> atlasDir);
 
@@ -688,6 +705,7 @@ private:
     };
 
     VolumeSelectorFactory _volumeSelectorFactory;
+    VolumeSwitchHandler _volumeSwitchHandler;
 
     std::string nextSurfaceName();
     void cleanupSurfaceName(const std::string& surfaceName);
@@ -907,6 +925,38 @@ private:
     bool ensureFiberInferenceDatasetForSession(LineAnnotationSession& session);
     void refreshLineAnnotationDatasetMenus() const;
     void refreshLineAnnotationDatasetMenu(LineAnnotationDialog* dialog) const;
+    // The project's volumes and datasets classified into raw-scan sets (see
+    // LineAnnotationDatasetSets.hpp), computed from the package on demand.
+    // selectedScanKey is the recorded scan, or the derived default when none
+    // is recorded (or the recorded one is gone).
+    struct DatasetSets {
+        std::vector<vc3d::line_annotation::ClassifiedVolume> volumes;
+        std::vector<vc3d::line_annotation::RawScanOption> scans;
+        std::vector<vc3d::line_annotation::DatasetInfo> lasagnaDatasets;
+        std::vector<vc3d::line_annotation::DatasetInfo> fiberDatasets;
+        std::string selectedScanKey;
+        // The recorded surface prediction when it belongs to the selected
+        // scan, else that scan's default (newest), else empty.
+        std::string selectedSurfaceVolumeId;
+    };
+    [[nodiscard]] DatasetSets datasetSets() const;
+    // Writes the derived default scan (and surface) into the project when
+    // none is recorded.
+    void recordDefaultRawScan();
+    // Surface dataset submenu: records the surface prediction to list.
+    void handleSurfaceSelectionChanged(const std::string& volumeId);
+    // Raw scan submenu: records the scan, auto-selects the newest Lasagna and
+    // fiber datasets published against it (or none), and switches the active
+    // volume to that scan at the current level.
+    void handleRawScanSelectionChanged(const std::string& scanKey);
+    // Raw scan submenu level entry: switches the active volume to the selected
+    // scan at that pyramid level.
+    void handleRawScanLevelSelectionChanged(int level);
+    // The pyramid level the workspace is on: the active volume's level when it
+    // is one of the selected scan's, else the last level used, else 0.
+    [[nodiscard]] int currentRawScanLevel(const DatasetSets& sets) const;
+    void pushVolumeSelectorEntries(LineAnnotationDialog* dialog, const DatasetSets& sets) const;
+    // An empty location clears the selection.
     void handleLasagnaDatasetSelectionChanged(const std::string& location);
     void handleFiberInferenceDatasetSelectionChanged(const std::string& location);
     // Fiber presence overlay: the selected fiber dataset's presence channel,
@@ -1389,6 +1439,9 @@ private:
         std::shared_ptr<Volume> view;
     };
     std::map<std::string, RebasedPresenceView> _rebasedPresenceVolumes;
+    // Last raw-scan level the workspace used (survives a switch to a
+    // Lasagna or fiber volume, which has no level of its own).
+    int _lastRawScanLevel = 0;
     bool _presenceOverlayRefreshQueued = false;
     // Why the package's umbilicus could not be used, for the strip notice.
     // Empty when one was applied, and when none exists to complain about.

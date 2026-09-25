@@ -11,6 +11,7 @@
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSaveJob.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
+#include "LineAnnotationDatasetSets.hpp"
 #include "LineAnnotationPresenceOverlay.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "LineAnnotationDialog.hpp"
@@ -2106,6 +2107,16 @@ LineAnnotationController::LineAnnotationController(CState* state,
                         return;
                     }
                     _lastVolumeChangedId = volumeId;
+                    {
+                        const auto sets = datasetSets();
+                        if (const auto level = vc3d::line_annotation::rawScanLevelOfVolume(
+                                sets.volumes, volumeId)) {
+                            _lastRawScanLevel = *level;
+                        }
+                    }
+                    // The dialogs' selectors follow the active volume, and a
+                    // volume outside the selected set is listed as such.
+                    refreshLineAnnotationDatasetMenus();
                     onActiveVolumeChanged();
                 });
         // Without this an attach or detach would not reach normal orientation
@@ -2263,6 +2274,11 @@ LineAnnotationController::pickMergeOptimizationMode(
 void LineAnnotationController::setVolumeSelectorFactory(VolumeSelectorFactory factory)
 {
     _volumeSelectorFactory = std::move(factory);
+}
+
+void LineAnnotationController::setVolumeSwitchHandler(VolumeSwitchHandler handler)
+{
+    _volumeSwitchHandler = std::move(handler);
 }
 
 void LineAnnotationController::setSurfacePanel(SurfacePanelController* panel)
@@ -2506,7 +2522,7 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
 
     session->deferShowUntilGenerated = deferShowUntilGenerated;
     _state->setSurface(surfaceName, std::move(sourceSurface));
-    auto* dialog = new LineAnnotationDialog(_viewerManager, _volumeSelectorFactory, nullptr);
+    auto* dialog = new LineAnnotationDialog(_viewerManager, nullptr);
     dialog->setFiberDisplayName(fiberDisplayNameFromFileName(session->fiberFileName));
     dialog->setFiberOptimizationMode(session->fiberOptimizationMode);
     refreshLineAnnotationDatasetMenu(dialog);
@@ -2565,6 +2581,44 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
             [this](const std::string& location) {
                 handleFiberInferenceDatasetSelectionChanged(location);
             });
+    connect(dialog,
+            &LineAnnotationDialog::rawScanSelectionChanged,
+            this,
+            [this](const std::string& scanKey) {
+                handleRawScanSelectionChanged(scanKey);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::surfaceSelectionChanged,
+            this,
+            [this](const std::string& volumeId) {
+                handleSurfaceSelectionChanged(volumeId);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::rawScanLevelSelectionChanged,
+            this,
+            [this](int level) {
+                handleRawScanLevelSelectionChanged(level);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::volumeSelectionRequested,
+            this,
+            [this](const std::string& volumeId) {
+                if (_volumeSwitchHandler) {
+                    _volumeSwitchHandler(volumeId);
+                }
+            });
+    connect(dialog,
+            &LineAnnotationDialog::volumeSelectorScopeChanged,
+            this,
+            [this, surfaceName]() {
+                if (auto* pane = paneForSurface(surfaceName)) {
+                    refreshLineAnnotationDatasetMenu(pane->dialog);
+                }
+            });
+    // A project that never recorded a scan gets the derived default now, so
+    // the menus, the selector and the project file agree from the first open.
+    recordDefaultRawScan();
+    refreshLineAnnotationDatasetMenu(dialog);
     connect(dialog,
             &LineAnnotationDialog::presenceOverlayEnabledChanged,
             this,
@@ -2968,7 +3022,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     double fiberBaseToVolumeScale = 1.0;
     if (coordinateBaseShapeZYX) {
         try {
-            const auto volume = _state ? _state->currentVolume() : nullptr;
+            const auto volume = _state ? frameVolume().volume : nullptr;
             if (!volume) {
                 throw std::runtime_error("no active volume is loaded");
             }
@@ -10110,45 +10164,329 @@ void LineAnnotationController::refreshLineAnnotationDatasetMenus() const
     }
 }
 
+LineAnnotationController::DatasetSets LineAnnotationController::datasetSets() const
+{
+    using namespace vc3d::line_annotation;
+    DatasetSets sets;
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg) {
+        return sets;
+    }
+    const auto fiberEntries = vpkg->fiberInferenceDatasetEntries();
+    std::vector<std::string> fiberLocations;
+    for (const auto& entry : fiberEntries) {
+        fiberLocations.push_back(entry.location);
+    }
+    std::vector<ProjectVolumeInfo> infos;
+    for (const auto& id : vpkg->volumeIDs()) {
+        ProjectVolumeInfo info;
+        info.id = id;
+        info.tags = vpkg->volumeTags(id);
+        if (const auto volume = vpkg->volume(id)) {
+            if (volume->metadata().contains("name") && volume->metadata()["name"].is_string()) {
+                info.name = volume->name();
+            }
+            const auto shape = volume->shape();
+            for (std::size_t axis = 0; axis < 3; ++axis) {
+                info.shapeZYX[axis] = static_cast<std::size_t>(std::max(0, shape[axis]));
+            }
+            info.voxelSizeUm = volume->voxelSize();
+        }
+        infos.push_back(std::move(info));
+    }
+    sets.volumes = classifyProjectVolumes(infos, fiberLocations);
+    sets.scans = rawScanOptions(sets.volumes);
+    // Datasets: the open-data scan id tag places them; a local dataset is
+    // placed by its manifest frame, which means parsing the (cached) manifest.
+    const auto describe = [&](const vc::project::Entry& entry) {
+        DatasetInfo info;
+        info.location = entry.location;
+        info.tags = entry.tags;
+        if (!tagValue(entry.tags, kOpenDataVolumeIdTagPrefix)) {
+            try {
+                info.baseShapeZYX = openLasagnaManifestForOverlay(entry.location).baseShapeZYX;
+            } catch (const std::exception& ex) {
+                Logger()->warn("Line annotation: manifest '{}' unreadable while grouping datasets: {}",
+                               entry.location, ex.what());
+            }
+        }
+        return info;
+    };
+    for (const auto& entry : vpkg->lasagnaDatasetEntries()) {
+        sets.lasagnaDatasets.push_back(describe(entry));
+    }
+    for (const auto& entry : fiberEntries) {
+        sets.fiberDatasets.push_back(describe(entry));
+    }
+    // Channel volumes sit with the scan their dataset was published against.
+    assignDatasetScansToChannels(sets.volumes, sets.lasagnaDatasets, sets.scans);
+    assignDatasetScansToChannels(sets.volumes, sets.fiberDatasets, sets.scans);
+    const auto scanKeyOfSelected = [&](const std::vector<DatasetInfo>& datasets,
+                                       const std::string& selected) {
+        for (const auto& dataset : datasets) {
+            if (dataset.location == selected) {
+                return datasetScanKey(dataset, sets.scans);
+            }
+        }
+        return std::string{};
+    };
+    std::vector<std::string> allKeys;
+    for (const auto* list : {&sets.lasagnaDatasets, &sets.fiberDatasets}) {
+        for (const auto& dataset : *list) {
+            allKeys.push_back(datasetScanKey(dataset, sets.scans));
+        }
+    }
+    const std::string recorded = vpkg->selectedRawScan();
+    const bool recordedKnown = std::any_of(sets.scans.begin(), sets.scans.end(),
+                                           [&](const auto& s) { return s.scanKey == recorded; });
+    sets.selectedScanKey = recordedKnown
+        ? recorded
+        : defaultRawScanKey(sets.scans,
+                            scanKeyOfSelected(sets.fiberDatasets, vpkg->selectedFiberInferenceDataset()),
+                            scanKeyOfSelected(sets.lasagnaDatasets, vpkg->selectedLasagnaDataset()),
+                            allKeys);
+    const std::string recordedSurface = vpkg->selectedSurfaceVolume();
+    const bool surfaceOfScan = std::any_of(
+        sets.volumes.begin(), sets.volumes.end(), [&](const auto& v) {
+            return v.id == recordedSurface && v.kind == ProjectVolumeKind::SurfacePrediction &&
+                   v.scanKey == sets.selectedScanKey;
+        });
+    sets.selectedSurfaceVolumeId = surfaceOfScan
+        ? recordedSurface
+        : defaultSurfaceVolumeId(sets.volumes, sets.selectedScanKey).value_or(std::string{});
+    return sets;
+}
+
+void LineAnnotationController::recordDefaultRawScan()
+{
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg) {
+        return;
+    }
+    if (vpkg->selectedRawScan().empty() || vpkg->selectedSurfaceVolume().empty()) {
+        const auto sets = datasetSets();
+        if (vpkg->selectedRawScan().empty() && !sets.selectedScanKey.empty()) {
+            vpkg->setSelectedRawScan(sets.selectedScanKey);
+        }
+        if (vpkg->selectedSurfaceVolume().empty() && !sets.selectedSurfaceVolumeId.empty()) {
+            vpkg->setSelectedSurfaceVolume(sets.selectedSurfaceVolumeId);
+        }
+    }
+}
+
+void LineAnnotationController::handleSurfaceSelectionChanged(const std::string& volumeId)
+{
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg) {
+        return;
+    }
+    vpkg->setSelectedSurfaceVolume(volumeId);
+    refreshLineAnnotationDatasetMenus();
+}
+
+void LineAnnotationController::pushVolumeSelectorEntries(LineAnnotationDialog* dialog,
+                                                         const DatasetSets& sets) const
+{
+    using namespace vc3d::line_annotation;
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!dialog || !vpkg) {
+        return;
+    }
+    const std::string current = _state->currentVolumeId();
+    const auto options = dialog->advancedVolumeSelector()
+        ? rawVolumeSelectorOptions(sets.volumes)
+        : volumeSelectorOptions(
+              sets.volumes, sets.scans, sets.selectedScanKey,
+              vpkg->selectedLasagnaDataset(), vpkg->selectedFiberInferenceDataset(),
+              sets.selectedSurfaceVolumeId, current, currentRawScanLevel(sets));
+    std::vector<LineAnnotationDialog::VolumeSelectorEntry> entries;
+    for (const auto& option : options) {
+        entries.push_back({option.id, option.label, option.tooltip});
+    }
+    dialog->setVolumeSelectorEntries(std::move(entries), current);
+}
+
 void LineAnnotationController::refreshLineAnnotationDatasetMenu(
     LineAnnotationDialog* dialog) const
 {
+    using namespace vc3d::line_annotation;
     if (!dialog || !_state || !_state->vpkg()) {
         return;
     }
     auto vpkg = _state->vpkg();
-    std::vector<std::pair<std::string, std::string>> lasagnaOptions;
-    for (const auto& entry : vpkg->lasagnaDatasetEntries()) {
-        lasagnaOptions.emplace_back(entry.location, datasetEntryMenuLabel(entry));
+    const auto sets = datasetSets();
+
+    std::vector<LineAnnotationDialog::RawScanMenuOption> scanOptions;
+    for (const auto& scan : sets.scans) {
+        std::size_t lasagnaCount = 0;
+        std::size_t fiberCount = 0;
+        for (const auto& dataset : sets.lasagnaDatasets) {
+            lasagnaCount += datasetScanKey(dataset, sets.scans) == scan.scanKey ? 1 : 0;
+        }
+        for (const auto& dataset : sets.fiberDatasets) {
+            fiberCount += datasetScanKey(dataset, sets.scans) == scan.scanKey ? 1 : 0;
+        }
+        const QString tooltip =
+            tr("%1 level(s); %2 Lasagna and %3 fiber dataset(s) published against it")
+                .arg(scan.levels.size()).arg(lasagnaCount).arg(fiberCount);
+        scanOptions.push_back({scan.scanKey, scan.label, tooltip.toStdString()});
     }
-    std::vector<std::pair<std::string, std::string>> fiberOptions;
-    for (const auto& entry : vpkg->fiberInferenceDatasetEntries()) {
-        fiberOptions.emplace_back(entry.location, datasetEntryMenuLabel(entry));
+    std::vector<LineAnnotationDialog::RawScanLevelOption> levelOptions;
+    for (const auto& scan : sets.scans) {
+        if (scan.scanKey != sets.selectedScanKey) {
+            continue;
+        }
+        for (const auto& [level, id] : scan.levels) {
+            levelOptions.push_back({level, rawScanLevelLabel(scan, level)});
+        }
     }
+    dialog->setRawScanOptions(std::move(scanOptions), sets.selectedScanKey,
+                              std::move(levelOptions), currentRawScanLevel(sets));
+
+    const auto menuOptions = [&](const std::vector<vc::project::Entry>& entries,
+                                 const std::vector<DatasetInfo>& datasets) {
+        std::vector<LineAnnotationDialog::DatasetMenuOption> options;
+        for (std::size_t i = 0; i < entries.size() && i < datasets.size(); ++i) {
+            const std::string key = datasetScanKey(datasets[i], sets.scans);
+            LineAnnotationDialog::DatasetMenuOption option;
+            option.location = entries[i].location;
+            option.label = datasetEntryMenuLabel(entries[i]);
+            option.applicable = datasetAppliesToScan(key, sets.selectedScanKey);
+            option.tooltip = option.applicable
+                ? entries[i].location
+                : tr("%1\nPublished against scan %2, not the selected raw scan.")
+                      .arg(QString::fromStdString(entries[i].location),
+                           QString::fromStdString(key))
+                      .toStdString();
+            options.push_back(std::move(option));
+        }
+        return options;
+    };
     dialog->setLasagnaDatasetOptions(
-        std::move(lasagnaOptions),
+        menuOptions(vpkg->lasagnaDatasetEntries(), sets.lasagnaDatasets),
         vpkg->selectedLasagnaDataset());
     dialog->setFiberInferenceDatasetOptions(
-        std::move(fiberOptions),
+        menuOptions(vpkg->fiberInferenceDatasetEntries(), sets.fiberDatasets),
         vpkg->selectedFiberInferenceDataset());
-    // Advanced pane-overlay list: every attached volume, "name (id)" like the
-    // main Overlay panel, unfiltered since the fit is decided per grid.
+
+    // Surface dataset submenu: every surface prediction, greyed when it
+    // belongs to another scan.
+    std::vector<LineAnnotationDialog::DatasetMenuOption> surfaceOptions;
+    for (const auto& v : sets.volumes) {
+        if (v.kind != ProjectVolumeKind::SurfacePrediction) {
+            continue;
+        }
+        LineAnnotationDialog::DatasetMenuOption option;
+        option.location = v.id;
+        option.label = surfaceMenuLabel(v);
+        option.applicable = v.scanKey == sets.selectedScanKey;
+        option.tooltip = option.applicable
+            ? (v.name.empty() ? v.id : v.name + " (" + v.id + ")")
+            : tr("%1\nPublished against scan %2, not the selected raw scan.")
+                  .arg(QString::fromStdString(v.name.empty() ? v.id : v.name),
+                       QString::fromStdString(v.scanKey))
+                  .toStdString();
+        surfaceOptions.push_back(std::move(option));
+    }
+    dialog->setSurfaceOptions(std::move(surfaceOptions), sets.selectedSurfaceVolumeId);
+
+    pushVolumeSelectorEntries(dialog, sets);
+
+    // Advanced pane-overlay list: every attached volume by raw name, the same
+    // list the advanced selector shows; the fit is decided per grid.
     std::vector<std::pair<std::string, QString>> volumeOptions;
-    for (const auto& id : vpkg->volumeIDs()) {
-        const auto volume = vpkg->volume(id);
-        const QString name = volume ? QString::fromStdString(volume->name()) : QString();
-        volumeOptions.emplace_back(
-            id, name.isEmpty()
-                    ? QString::fromStdString(id)
-                    : QStringLiteral("%1 (%2)").arg(name, QString::fromStdString(id)));
+    for (const auto& option : rawVolumeSelectorOptions(sets.volumes)) {
+        volumeOptions.emplace_back(option.id, QString::fromStdString(option.label));
     }
     dialog->setPresenceOverlayVolumeOptions(std::move(volumeOptions));
+}
+
+void LineAnnotationController::handleRawScanSelectionChanged(const std::string& scanKey)
+{
+    using namespace vc3d::line_annotation;
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg || scanKey.empty()) {
+        return;
+    }
+    if (vpkg->selectedRawScan() == scanKey) {
+        refreshLineAnnotationDatasetMenus();
+        return;
+    }
+    for (const auto& pane : _panes) {
+        if (pane.session &&
+            pane.session->taskState == LineAnnotationSession::TaskState::Running) {
+            showError(tr("Line optimization is already running."),
+                      pane.session->suppressErrorDialogs);
+            refreshLineAnnotationDatasetMenus();
+            return;
+        }
+    }
+    vpkg->setSelectedRawScan(scanKey);
+    const auto sets = datasetSets();
+    const auto scanIt = std::find_if(sets.scans.begin(), sets.scans.end(),
+                                     [&](const auto& s) { return s.scanKey == scanKey; });
+    if (scanIt == sets.scans.end()) {
+        Logger()->warn("Line annotation: raw scan '{}' is not in the project", scanKey);
+        refreshLineAnnotationDatasetMenus();
+        return;
+    }
+    // Datasets of another scan cannot drive this one: switch each role to the
+    // newest dataset published against the new scan, or to none.
+    const auto lasagna = newestDatasetForScan(sets.lasagnaDatasets, sets.scans, scanKey);
+    handleLasagnaDatasetSelectionChanged(lasagna.value_or(std::string{}));
+    const auto fiber = newestDatasetForScan(sets.fiberDatasets, sets.scans, scanKey);
+    handleFiberInferenceDatasetSelectionChanged(fiber.value_or(std::string{}));
+    vpkg->setSelectedSurfaceVolume(
+        defaultSurfaceVolumeId(sets.volumes, scanKey).value_or(std::string{}));
+    Logger()->info("Line annotation: raw scan {} selected; Lasagna dataset '{}', fiber dataset '{}'",
+                   scanKey, lasagna.value_or("none"), fiber.value_or("none"));
+    // The panes are built on the active volume: move it onto the new scan at
+    // the level currently in use when the scan has it, else its finest level.
+    const std::string current = _state->currentVolumeId();
+    const std::string target = scanVolumeIdAtLevel(*scanIt, currentRawScanLevel(sets));
+    if (!target.empty() && target != current && _volumeSwitchHandler) {
+        _volumeSwitchHandler(target);
+    }
+    refreshLineAnnotationDatasetMenus();
+}
+
+int LineAnnotationController::currentRawScanLevel(const DatasetSets& sets) const
+{
+    using namespace vc3d::line_annotation;
+    if (!_state) {
+        return _lastRawScanLevel;
+    }
+    if (const auto level = rawScanLevelOfVolume(sets.volumes, _state->currentVolumeId())) {
+        return *level;
+    }
+    return _lastRawScanLevel;
+}
+
+void LineAnnotationController::handleRawScanLevelSelectionChanged(int level)
+{
+    using namespace vc3d::line_annotation;
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg) {
+        return;
+    }
+    const auto sets = datasetSets();
+    const auto scanIt = std::find_if(sets.scans.begin(), sets.scans.end(),
+                                     [&](const auto& s) { return s.scanKey == sets.selectedScanKey; });
+    if (scanIt == sets.scans.end()) {
+        return;
+    }
+    const std::string target = scanVolumeIdAtLevel(*scanIt, level);
+    _lastRawScanLevel = level;
+    if (!target.empty() && target != _state->currentVolumeId() && _volumeSwitchHandler) {
+        _volumeSwitchHandler(target);
+    }
+    refreshLineAnnotationDatasetMenus();
 }
 
 void LineAnnotationController::handleLasagnaDatasetSelectionChanged(
     const std::string& location)
 {
-    if (!_state || !_state->vpkg() || location.empty()) {
+    if (!_state || !_state->vpkg()) {
         return;
     }
     for (const auto& pane : _panes) {
@@ -10187,7 +10525,7 @@ void LineAnnotationController::handleLasagnaDatasetSelectionChanged(
 void LineAnnotationController::handleFiberInferenceDatasetSelectionChanged(
     const std::string& location)
 {
-    if (!_state || !_state->vpkg() || location.empty()) {
+    if (!_state || !_state->vpkg()) {
         return;
     }
     for (const auto& pane : _panes) {
@@ -10247,8 +10585,7 @@ LineAnnotationController::resolvePresenceOverlaySource()
     if (!vpkg) {
         throw std::runtime_error(tr("no project is open").toStdString());
     }
-    const auto active = _state->currentVolume();
-    if (!active) {
+    if (!frameVolume().volume) {
         throw std::runtime_error(tr("no active volume").toStdString());
     }
 
@@ -10377,7 +10714,9 @@ LineAnnotationController::fitOverlayVolumeToActiveGrid(
     const std::optional<std::array<std::size_t, 3>>& exactFrameZYX,
     const QString& label)
 {
-    const auto active = _state ? _state->currentVolume() : nullptr;
+    // The panes sample the active volume, but a channel shown there is in the
+    // scan's level-0 frame, so the fit is against the frame volume.
+    const auto active = _state ? frameVolume().volume : nullptr;
     if (!active) {
         throw std::runtime_error(tr("no active volume").toStdString());
     }
@@ -10536,6 +10875,7 @@ void LineAnnotationController::onPackageContentsRefreshed()
     if (!_state || !_state->vpkg()) {
         return;
     }
+    recordDefaultRawScan();
     refreshLineAnnotationDatasetMenus();
     refreshPresenceOverlays();
 }
@@ -12060,8 +12400,8 @@ LineAnnotationController::makeFiberModeOptimizationRequest(
     request.globalGoalsOnly = globalGoalsOnly;
     request.traceConfig.traceToBaseScale = session.fiberTraceToBaseScale;
     try {
-        if (_state && _state->currentVolume()) {
-            const double voxelSizeUm = _state->currentVolume()->voxelSize();
+        if (const auto frame = _state ? frameVolume().volume : nullptr) {
+            const double voxelSizeUm = frame->voxelSize();
             if (voxelSizeUm > 0.0 && std::isfinite(voxelSizeUm)) {
                 request.traceConfig.baseVoxelSizeUm = voxelSizeUm;
             }
@@ -12882,7 +13222,7 @@ QString LineAnnotationController::umbilicusCacheToken() const
     // orientation input of its own: editing it in place changes where a
     // legacy-read umbilicus lands while every candidate file stays untouched.
     try {
-        if (const auto volume = _state->currentVolume();
+        if (const auto volume = frameVolume().volume;
             volume && volume->baseScaleLevel() == 0) {
             fs::path transform = volume->path() / "transform.json";
             if (!fs::exists(transform)) {
@@ -13043,13 +13383,85 @@ void LineAnnotationController::publishUmbilicusNotice()
     }
 }
 
+LineAnnotationController::FrameVolume LineAnnotationController::frameVolume() const
+{
+    using namespace vc3d::line_annotation;
+    FrameVolume result;
+    if (!_state) {
+        return result;
+    }
+    std::shared_ptr<Volume> current;
+    try {
+        current = _state->currentVolume();
+    } catch (...) {
+        current.reset();
+    }
+    auto vpkg = _state->vpkg();
+    if (!vpkg) {
+        result.volume = current;
+        result.id = _state->currentVolumeId();
+        return result;
+    }
+    // Tag/name classification only: no manifest is opened here, this runs on
+    // every staleness check.
+    const auto describe = [&](const std::string& id) {
+        ProjectVolumeInfo info;
+        info.id = id;
+        info.tags = vpkg->volumeTags(id);
+        if (const auto volume = vpkg->volume(id)) {
+            if (volume->metadata().contains("name") && volume->metadata()["name"].is_string()) {
+                info.name = volume->name();
+            }
+        }
+        return info;
+    };
+    std::vector<std::string> fiberLocations;
+    for (const auto& entry : vpkg->fiberInferenceDatasetEntries()) {
+        fiberLocations.push_back(entry.location);
+    }
+    std::vector<ProjectVolumeInfo> infos;
+    for (const auto& id : vpkg->volumeIDs()) {
+        infos.push_back(describe(id));
+    }
+    const auto volumes = classifyProjectVolumes(infos, fiberLocations);
+    const std::string currentId = _state->currentVolumeId();
+    const auto currentIt = std::find_if(volumes.begin(), volumes.end(),
+                                        [&](const auto& v) { return v.id == currentId; });
+    if (current && currentIt != volumes.end() && currentIt->kind == ProjectVolumeKind::RawScan) {
+        result.volume = current;
+        result.id = currentId;
+        return result;
+    }
+    // A channel (or nothing) is active: the selected scan at level 0 frames
+    // the geometry; the derived default stands in when none is recorded.
+    const auto scans = rawScanOptions(volumes);
+    std::string scanKey = vpkg->selectedRawScan();
+    if (!std::any_of(scans.begin(), scans.end(), [&](const auto& s) { return s.scanKey == scanKey; })) {
+        scanKey = defaultRawScanKey(scans, {}, {}, {});
+    }
+    for (const auto& scan : scans) {
+        if (scan.scanKey != scanKey) {
+            continue;
+        }
+        const std::string id = scanVolumeIdAtLevel(scan, 0);
+        if (auto volume = vpkg->volume(id)) {
+            result.volume = std::move(volume);
+            result.id = id;
+            return result;
+        }
+    }
+    result.volume = current;
+    result.id = currentId;
+    return result;
+}
+
 vc3d::annotation::AnnotationFrame LineAnnotationController::annotationFrame() const
 {
     if (!_state) {
         return {};
     }
     try {
-        const auto volume = _state->currentVolume();
+        const auto [volume, volumeId] = frameVolume();
         if (!volume) {
             return {};
         }
@@ -13062,9 +13474,9 @@ vc3d::annotation::AnnotationFrame LineAnnotationController::annotationFrame() co
         // from it.
         std::optional<double> exactFactor;
         std::optional<double> stampedResolution;
-        if (_state->vpkg() && !_state->currentVolumeId().empty()) {
+        if (_state->vpkg() && !volumeId.empty()) {
             if (const auto identity = vc3d::opendata::coordinateIdentityFromTags(
-                    _state->vpkg()->volumeTags(_state->currentVolumeId()))) {
+                    _state->vpkg()->volumeTags(volumeId))) {
                 exactFactor =
                     static_cast<double>(identity->sourceCoordinateScaleFactor);
                 if (identity->sourceOriginalResolution > 0.0) {
@@ -13090,7 +13502,7 @@ LineAnnotationController::ensureScrollUmbilicusLoaded()
 {
     std::shared_ptr<Volume> volume;
     try {
-        volume = _state ? _state->currentVolume() : nullptr;
+        volume = _state ? frameVolume().volume : nullptr;
     } catch (...) {
         volume.reset();
     }
@@ -13432,7 +13844,7 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
 
     std::shared_ptr<Volume> volume;
     try {
-        volume = _state ? _state->currentVolume() : nullptr;
+        volume = _state ? frameVolume().volume : nullptr;
     } catch (...) {
         volume.reset();
     }
@@ -13530,7 +13942,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
 
     if (session.coordinateBaseShapeZYX) {
         try {
-            const auto volume = _state->currentVolume();
+            const auto volume = frameVolume().volume;
             if (!volume) {
                 throw std::runtime_error("no active volume is loaded");
             }
@@ -13666,7 +14078,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
             static_cast<float>(annotationFrame().factor);
         cv::Vec2f volumeCenterXY{kNanF, kNanF};
         try {
-            if (const auto volume = _state->currentVolume()) {
+            if (const auto volume = frameVolume().volume) {
                 volumeCenterXY = {static_cast<float>(volume->sliceWidth()) * 0.5f * volumeToAnnotationScale,
                                   static_cast<float>(volume->sliceHeight()) * 0.5f * volumeToAnnotationScale};
             }

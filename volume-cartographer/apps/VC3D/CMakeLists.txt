@@ -52,6 +52,7 @@ set(srcs
     LineAnnotationFiberSegments.cpp
     LineAnnotationFiberSegments.hpp
     LineAnnotationPresenceOverlay.hpp
+    LineAnnotationDatasetSets.hpp
     LineAnnotationDialog.cpp
     LineAnnotationDialog.hpp
     LineAnnotationGeneratedViews.cpp
