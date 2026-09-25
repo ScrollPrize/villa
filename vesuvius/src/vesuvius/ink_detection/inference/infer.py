@@ -35,6 +35,13 @@ from vesuvius.ink_detection.inference.inference_runtime import (
     prepare_model_for_inference,
     resolve_amp_dtype,
 )
+from vesuvius.ink_detection.inference.provenance import (
+    build_provenance,
+    physical_scale_from_root,
+    provenance_description,
+    resolution_tags,
+    sha256_file,
+)
 from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
     ZARR_V3,
@@ -70,13 +77,18 @@ class ChunkKey:
 
 @dataclass(frozen=True)
 class ConfiguredModel:
-    """The checkpoint-derived flat model and preprocessing contract."""
+    """The checkpoint-derived flat model and preprocessing contract.
+
+    ``checkpoint`` identifies what was loaded (file name, sha256, size,
+    state container, training step) for the output TIFF's provenance.
+    """
 
     model: nn.Module
     patch_size: int
     input_depth: int
     preprocessing: str
     amp_dtype: torch.dtype | None
+    checkpoint: Mapping[str, Any] | None = None
 
 
 def flat_preprocessing_from_config(config: NormalizationConfig) -> str:
@@ -817,10 +829,26 @@ def write_output_tiff(
     weight_sum_store: Any,
     output_path: Path,
     tile_shape: tuple[int, int],
+    *,
+    description: str | None = None,
+    resolution: tuple[Any, Any] | None = None,
+    resolutionunit: str | None = None,
 ) -> None:
-    """Write one tiled, LZW, BigTIFF-compatible flat probability image."""
+    """Write one tiled, LZW, BigTIFF-compatible flat probability image.
+
+    ``description`` lands in the ``ImageDescription`` tag and
+    ``resolution``/``resolutionunit`` in the resolution tags; the pixel
+    data is written identically whether or not they are given.
+    """
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    extra: dict[str, Any] = {}
+    if description is not None:
+        extra["description"] = description
+    if resolution is not None:
+        extra["resolution"] = resolution
+        if resolutionunit is not None:
+            extra["resolutionunit"] = resolutionunit
     tifffile.imwrite(
         output_path,
         iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape),
@@ -831,6 +859,7 @@ def write_output_tiff(
         bigtiff=True,
         metadata=None,
         software="vesuvius.ink_detection.inference.infer",
+        **extra,
     )
 
 
@@ -934,7 +963,31 @@ def configure_model(args: argparse.Namespace) -> ConfiguredModel:
         input_depth=crop_z,
         preprocessing=flat_preprocessing_from_config(config.data.normalization),
         amp_dtype=resolve_amp_dtype(args.amp_dtype, payload, args.checkpoint),
+        checkpoint=describe_checkpoint(
+            args.checkpoint, payload, weights=selected_state
+        ),
     )
+
+
+def describe_checkpoint(
+    checkpoint_path: str | Path,
+    payload: Mapping[str, Any],
+    *,
+    weights: str,
+) -> dict[str, Any]:
+    """Identify the checkpoint bytes and state used, for the output TIFF."""
+
+    path = Path(checkpoint_path)
+    record: dict[str, Any] = {
+        "name": path.name,
+        "sha256": sha256_file(path) if path.is_file() else None,
+        "size_bytes": path.stat().st_size if path.is_file() else None,
+        "weights": str(weights),
+    }
+    step = payload.get("step")
+    if isinstance(step, (int, float)) and not isinstance(step, bool):
+        record["step"] = int(step)
+    return record
 
 
 def _volume_axes(array: Any) -> tuple[bool, int, int, int, int, int]:
@@ -1131,11 +1184,82 @@ def infer_single_zarr(
             LOGGER.warning(
                 "No occupied blocks were found; writing an all-zero output"
             )
+        physical_scale = physical_scale_from_root(
+            root, resolution, depth_axis_first=depth_first
+        )
+        if physical_scale is None:
+            LOGGER.info(
+                "No OME multiscale scale metadata for level=%s of %s; the "
+                "output TIFF gets provenance but no resolution tags",
+                resolution,
+                input_zarr,
+            )
+        elif physical_scale.get("um_per_px_y") is None:
+            LOGGER.warning(
+                "Level=%s of %s declares scale=%s in unit %r; resolution tags "
+                "are written only for micrometre units, so the output TIFF "
+                "records the scale but gets no resolution tags",
+                resolution,
+                input_zarr,
+                physical_scale.get("scale"),
+                physical_scale.get("unit"),
+            )
+        else:
+            LOGGER.info(
+                "Physical scale for level=%s: %.6g um/px (y) x %.6g um/px (x), "
+                "declared unit %r",
+                resolution,
+                physical_scale["um_per_px_y"],
+                physical_scale["um_per_px_x"],
+                physical_scale.get("unit"),
+            )
+        tags = (
+            None
+            if physical_scale is None
+            else resolution_tags(
+                physical_scale.get("um_per_px_y"),
+                physical_scale.get("um_per_px_x"),
+            )
+        )
+        amp_dtype = configured_model.amp_dtype
+        provenance = build_provenance(
+            checkpoint=configured_model.checkpoint
+            or {"name": Path(args.checkpoint).name},
+            input_zarr=input_zarr,
+            level=resolution,
+            input_shape=(depth, height, width),
+            depth_axis_first=depth_first,
+            layer_indices=layer_indices,
+            layer_start=args.layer_start,
+            layer_end=args.layer_end,
+            direction=layer_direction,
+            patch_size=patch_size,
+            stride=stride,
+            overlap=float(args.overlap),
+            blend_mode=blend_mode,
+            tta_mirror=bool(args.tta_mirror),
+            amp_dtype=(
+                None
+                if amp_dtype is None or device.type != "cuda"
+                else str(amp_dtype).replace("torch.", "")
+            ),
+            compile_requested=bool(args.compile_model),
+            compile_mode=args.compile_mode,
+            batch_size=int(args.batch_size),
+            device=str(device),
+            torch_version=torch.__version__,
+            mask_name=None if args.mask_path is None else Path(args.mask_path).name,
+            physical_scale=physical_scale,
+            preprocessing=configured_model.preprocessing,
+        )
         write_output_tiff(
             probability_sum,
             weight_sum,
             output_tiff,
             tile_shape,
+            description=provenance_description(provenance),
+            resolution=None if tags is None else tags[0],
+            resolutionunit=None if tags is None else tags[1],
         )
     finally:
         shutil.rmtree(temporary, ignore_errors=True)

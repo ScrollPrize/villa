@@ -562,6 +562,8 @@ uv run --extra models python -m vesuvius.ink_detection.inference.infer \
 
 The `--batch-size 32` assumes a large GPU; drop it to 4 or 1 if you run out of memory.
 
+The output TIFF records how it was made: its `ImageDescription` holds a small JSON record (checkpoint name and SHA-256, input volume and pyramid level, the layer window and direction, stride, blend mode, TTA and precision settings), and when the surface volume's OME-Zarr metadata declares a micrometre scale, the TIFF's resolution tags carry that pixel size too. `tiffcomment predictions/w035_9um.tif` (installed with tifffile) prints the record.
+
 Checkpoints embed their training config, so inference rebuilds the model and its normalization automatically. Two things to know when reading the output:
 
 * **The models are sensitive to depth offsets.** If a checkpoint doesn't respond well on your data, the surface may sit at a slightly different depth than the model expects. Try shifting the window with `--layer-start` / `--layer-end`, or average the predictions over a few nearby windows as a simple ensemble. Training jitters the depth window, so the models tolerate small offsets; larger ones can still throw them off.
