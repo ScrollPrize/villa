@@ -201,7 +201,32 @@ static auto load_direction_fields(Json const&params, std::filesystem::path const
     return direction_fields;
 }
 
+// A remote chunk fetch that fails after its retries ends in a std::runtime_error. run_main catches
+// it only around tracer(), so elsewhere, as at the seed point, it would abort the process. Catch
+// what reaches main here (a throw inside an OpenMP loop may not), report it and exit non-zero, as
+// #1817 does for vc_render_tifxyz. run_main is main's old body, moved unchanged.
+static int run_main(int argc, char *argv[]);
+
 int main(int argc, char *argv[])
+{
+    try {
+        return run_main(argc, argv);
+    } catch (const std::exception& e) {
+        // An HTTP status error carries the server's response body in its message; for a 503 that is
+        // a whole HTML page. Keep the first line, as #1817 does for vc_render_tifxyz.
+        std::string what = e.what();
+        if (auto nl = what.find('\n'); nl != std::string::npos) {
+            what.erase(nl);
+            while (!what.empty() && (what.back() == '\r' || what.back() == ' '))
+                what.pop_back();
+            what += " [...]";
+        }
+        std::cerr << "\nError: " << what << std::endl;
+        return EXIT_FAILURE;
+    }
+}
+
+static int run_main(int argc, char *argv[])
 {
     std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path;
     cv::Vec3d origin;
