@@ -13,6 +13,7 @@
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include <random>
 #include <chrono>
 #include <atomic>
@@ -27,6 +28,10 @@
     struct CacheEntry {
         std::shared_ptr<GridStore> grid_store;
         uint64_t generation;
+        // Index of this entry's key in pimpl::cache_keys. Keeping it here is
+        // what lets eviction sample and erase in O(1) instead of rebuilding
+        // the key list from the map every time.
+        size_t key_slot = 0;
     };
 
      struct NormalGridVolume::pimpl {
@@ -39,6 +44,11 @@
          bool multiscale = false;
          mutable std::shared_mutex mutex;
          mutable std::unordered_map<cv::Vec2i, CacheEntry> grid_cache;
+         // Dense, unordered view of the resident keys, kept in step with
+         // grid_cache so eviction can draw its random sample by index. Erase
+         // is the usual swap-with-last, which is why each entry remembers its
+         // own slot.
+         mutable std::vector<cv::Vec2i> cache_keys;
          mutable uint64_t generation_counter = 0;
          // Cap at 512 entries. Each cached GridStore holds up to 2 MiB of
          // decoded seglists (GridStore.cpp:813) plus metadata, so 512 ≈
@@ -46,6 +56,10 @@
          // reached 8 GiB if every slot held a fully-populated store.
          size_t max_cache_size = 512;
          size_t eviction_sample_size = 10;
+         // Seeded once. This used to be constructed -- 2.5 KiB of state,
+         // seeded from std::random_device -- on every single eviction, while
+         // holding the exclusive cache lock.
+         mutable std::mt19937 eviction_rng{std::random_device{}()};
         
          mutable std::atomic<uint64_t> cache_hits{0};
          mutable std::atomic<uint64_t> cache_misses{0};
@@ -378,7 +392,7 @@
             }
             if (!ensure_local_file(rel)) {
                 std::unique_lock<std::shared_mutex> lock(mutex);
-                grid_cache[key] = {nullptr, ++generation_counter};
+                insert_locked(key, nullptr);
                 return nullptr;
             }
  
@@ -404,40 +418,71 @@
                     return it->second.grid_store;
                 }
  
-                grid_cache[key] = {grid_store, ++generation_counter};
+                insert_locked(key, grid_store);
 
-                // Eviction logic
                 if (grid_cache.size() > max_cache_size) {
-                    std::vector<cv::Vec2i> keys;
-                    keys.reserve(grid_cache.size());
-                    for (const auto& pair : grid_cache) {
-                        keys.push_back(pair.first);
-                    }
-
-                    std::mt19937 gen(std::random_device{}());
-                    std::uniform_int_distribution<size_t> dist(0, keys.size() - 1);
-
-                    cv::Vec2i key_to_evict;
-                    uint64_t min_generation = std::numeric_limits<uint64_t>::max();
-
-                    for (size_t i = 0; i < eviction_sample_size && !keys.empty(); ++i) {
-                        size_t rand_idx = dist(gen);
-                        const auto& key = keys[rand_idx];
-                        const auto& entry = grid_cache.at(key);
-                        if (entry.generation < min_generation) {
-                            min_generation = entry.generation;
-                            key_to_evict = key;
-                        }
-                    }
-
-                    if (min_generation != std::numeric_limits<uint64_t>::max()) {
-                        grid_cache.erase(key_to_evict);
-                    }
+                    evict_one_locked();
                 }
 
                 check_print_stats();
             }
             return grid_store;
+        }
+
+        // Caller must hold the exclusive lock.
+        void insert_locked(const cv::Vec2i& key, std::shared_ptr<GridStore> store) const
+        {
+            auto it = grid_cache.find(key);
+            if (it != grid_cache.end()) {
+                it->second.grid_store = std::move(store);
+                it->second.generation = ++generation_counter;
+                return;
+            }
+            cache_keys.push_back(key);
+            grid_cache.emplace(key,
+                CacheEntry{std::move(store), ++generation_counter, cache_keys.size() - 1});
+        }
+
+        // Caller must hold the exclusive lock. Erases in O(1) by swapping the
+        // victim's slot with the last key rather than searching cache_keys.
+        void erase_locked(std::unordered_map<cv::Vec2i, CacheEntry>::iterator it) const
+        {
+            const size_t slot = it->second.key_slot;
+            const cv::Vec2i moved = cache_keys.back();
+            cache_keys[slot] = moved;
+            cache_keys.pop_back();
+            if (moved != it->first) {
+                grid_cache.at(moved).key_slot = slot;
+            }
+            grid_cache.erase(it);
+        }
+
+        // Caller must hold the exclusive lock. Same policy as before -- draw
+        // eviction_sample_size keys uniformly at random and drop the one with
+        // the oldest generation stamp -- but the sample is now drawn straight
+        // from cache_keys, so it costs O(sample) instead of O(cache size).
+        //
+        // Evicting is always safe: the cache is transparent, so a dropped
+        // store is reloaded from the same immutable .grid file on the next
+        // miss. Eviction policy affects timing, never results.
+        void evict_one_locked() const
+        {
+            if (cache_keys.empty()) {
+                return;
+            }
+            std::uniform_int_distribution<size_t> dist(0, cache_keys.size() - 1);
+            auto victim = grid_cache.end();
+            uint64_t min_generation = std::numeric_limits<uint64_t>::max();
+            for (size_t i = 0; i < eviction_sample_size; ++i) {
+                auto it = grid_cache.find(cache_keys[dist(eviction_rng)]);
+                if (it != grid_cache.end() && it->second.generation < min_generation) {
+                    min_generation = it->second.generation;
+                    victim = it;
+                }
+            }
+            if (victim != grid_cache.end()) {
+                erase_locked(victim);
+            }
         }
 
         NormalGridVolume::CacheStats cacheStats() const {

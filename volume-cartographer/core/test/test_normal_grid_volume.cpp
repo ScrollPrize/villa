@@ -240,3 +240,46 @@ TEST_CASE("get_grid with a real (committed) GridStore file is read back")
     CHECK(stats_after.gridHits > stats_before.gridHits);
     fs::remove_all(d);
 }
+
+TEST_CASE("Cache eviction: the entry cap holds, and an evicted slice reloads")
+{
+    // Drives the cache well past its 512-entry cap so the eviction path runs
+    // hundreds of times, then re-reads a slice that must have been evicted.
+    // Evicting is only ever a timing decision -- the .grid files are
+    // immutable -- so every read must return the same content either way.
+    auto d = makeEmptyNgvDir("evict", /*sparseVolume=*/1);
+    const int kSlices = 700;
+    for (int i = 0; i < kSlices; ++i) {
+        vc::core::util::GridStore gs(cv::Rect(0, 0, 100, 100), 10);
+        gs.add({cv::Point(0, 0), cv::Point(i % 50, 5), cv::Point(10, 10)});
+        char name[64];
+        snprintf(name, sizeof(name), "%06d.grid", i);
+        gs.save((d / "xy" / name).string());
+    }
+
+    NormalGridVolume v(d.string());
+    for (int i = 0; i < kSlices; ++i) {
+        auto g = v.get_grid(0, i);
+        REQUIRE(g != nullptr);
+        CHECK(g->numSegments() >= 1);
+    }
+    // The cap is enforced: the map did not grow to 700.
+    auto stats = v.cacheStats();
+    CHECK(stats.liveGridEntries <= 512);
+    CHECK(stats.liveGridEntries > 0);
+
+    // Slice 0 was inserted first, so it is long gone. Reading it again must
+    // still produce a valid store, and must not disturb the cap.
+    auto again = v.get_grid(0, 0);
+    REQUIRE(again != nullptr);
+    CHECK(again->numSegments() >= 1);
+    CHECK(v.cacheStats().liveGridEntries <= 512);
+
+    // A slice that is still resident reads back too, so eviction did not
+    // leave the map and the eviction order out of step.
+    auto recent = v.get_grid(0, kSlices - 1);
+    REQUIRE(recent != nullptr);
+    CHECK(recent->numSegments() >= 1);
+
+    fs::remove_all(d);
+}
