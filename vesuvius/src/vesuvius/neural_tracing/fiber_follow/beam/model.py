@@ -70,15 +70,20 @@ class BeamRankNet(SpatialEncoder):
         delta[:, :, 1:] *= (point_mask[:, :, 1:]*point_mask[:, :, :-1])[..., None]
         geom = torch.cat([candidates/128, delta, point_mask[..., None]], -1)
         tokens = self.path_net(torch.cat([sampled, geom.reshape(B*P, K, 7).transpose(1, 2)], 1))
-        # Skip padded history, rather than allowing GRU biases to invent it.
+        # Skip padded history, rather than allowing GRU biases to invent it:
+        # move each path's valid tokens to the front (in order) and read the
+        # GRU output after its last valid token. One sequence call equals the
+        # masked per-step recurrence from a zero state.
         tokens = tokens.transpose(1, 2)
-        mask = point_mask.reshape(B*P, K)
-        h = tokens.new_zeros(1, B*P, self.cfg.hidden)
-        for k in range(K):
-            _, new = self.path_context(tokens[:, k:k+1].contiguous(), h)
-            h = torch.where(mask[:, k][None, :, None] > 0, new, h)
+        valid = point_mask.reshape(B*P, K) > 0
+        order = torch.argsort((~valid).to(torch.uint8), dim=1, stable=True)
+        tokens = tokens.gather(1, order[..., None].expand(-1, -1, tokens.shape[-1]))
+        states, _ = self.path_context(tokens.contiguous())
+        count = valid.sum(1)
+        h = states.gather(1, (count-1).clamp_min(0)[:, None, None].expand(-1, 1, states.shape[-1]))[:, 0]
+        h = torch.where(count[:, None] > 0, h, 0.)
         global_context = context[:, None].expand(-1, P, -1).reshape(B*P, -1)
-        logits = self.cost_head(torch.cat([h[0], global_context], -1)).reshape(B, P).float()
+        logits = self.cost_head(torch.cat([h, global_context], -1)).reshape(B, P).float()
         return logits
 
     def forward(self, x, hist, hmask, candidates, point_mask):

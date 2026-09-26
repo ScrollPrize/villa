@@ -89,6 +89,9 @@ def build_parser():
     ap.add_argument('--diag-fibers', type=int, default=8)
     ap.add_argument('--diag-max-len', type=float, default=400., help='Open rollout length in trace-grid voxels')
     ap.add_argument('--diag-confidence', type=float, default=.5, help='Model rollout stop threshold')
+    ap.add_argument('--diag-reencode', type=float, default=8.,
+                    help='Diagnostics reuse an encoded crop while the beam stays within this many grid voxels '
+                         'of its centre (0 re-encodes every generation)')
     ap.add_argument('--crop-depth', type=int, default=192)
     ap.add_argument('--crop-width', type=int, default=96)
     ap.add_argument('--crop-behind', type=int, default=128)
@@ -124,7 +127,8 @@ def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
     if min(args.steps, args.batch, args.ckpt_every, args.log_every, args.k_back, args.score_chunk, args.pool_size,
-           args.lookahead_width, args.states_per_trace) < 1 or args.workers < 0 or args.diag_every < 0:
+           args.lookahead_width, args.states_per_trace) < 1 or args.workers < 0 or args.diag_every < 0 \
+            or args.diag_reencode < 0:
         ap.error('Steps, batch, intervals, path points, pool size, hook cadence and states must be positive')
     if args.n_history < args.hist_points * args.hist_stride or args.n_history < args.k_back:
         ap.error('n-history must cover hist-points * hist-stride and k-back')
@@ -205,7 +209,8 @@ def main(argv=None):
         diag_fibers = [val_f[i] for i in rng.choice(len(val_f), min(args.diag_fibers, len(val_f)), replace=False)]
         vol = FiberVolume(spec, cache_bytes=2 << 30)
         beam = NativeBeam(beam_spec, spec.grid_scale)
-        hook = ModelBeamHook(model, vol, state_cfg, device=args.device)
+        hook = ModelBeamHook(model, vol, state_cfg, device=args.device, compile=args.compile,
+                             reencode_distance=args.diag_reencode)
         seeds = make_seeds(diag_fibers, vol, per_fiber=1, seed=123)
         diag = dict(plot_pool=plot_pool, span_diag=span_diag, rollout_images=rollout_images,
                     fibers=diag_fibers, seeds=seeds, vol=vol, beam=beam, hook=hook)

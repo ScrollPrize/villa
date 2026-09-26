@@ -38,10 +38,10 @@ STACK_KEYS = ('candidates', 'point_mask', 'cand_mask', 'hand_loss', 'parent_loss
 CANDIDATE_KEYS = set(STACK_KEYS) - {'source'}
 
 
-def collate_beam(items, vol, crop, grid=None, pad_to=None):
+def collate_beam(items, vol, crop, grid=None, pad_to=None, parallel=False):
     # Same tight-block, mmap-backed fused sampler used by direct/. Only CT
     # at the selected level plus rendered history, no second image resolution.
-    out = dict(x=scalar_crops(items, vol, crop, history=True).half(),
+    out = dict(x=scalar_crops(items, vol, crop, history=True, parallel=parallel).half(),
                hist=torch.as_tensor(np.stack([it['hist_local'] for it in items]), dtype=torch.float32),
                hmask=torch.as_tensor(np.stack([it['hmask'] for it in items]), dtype=torch.float32))
     size = pad_to or max(len(it['candidates']) for it in items)

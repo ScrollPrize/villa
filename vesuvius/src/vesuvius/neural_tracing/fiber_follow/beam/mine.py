@@ -8,7 +8,7 @@ cached as JSON bound to the fiber geometry identities.
 """
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import dataclasses
 import json
 import multiprocessing
@@ -45,29 +45,34 @@ def mine_hard_spans(beam: NativeBeam, fibers, grid_scale: float, error_threshold
     hard = {}
     total = 0
     start = time.time()
-    if workers > 1:
-        spec = dataclasses.replace(beam.spec, parallel_threads=1)
-        pool = ProcessPoolExecutor(max(1, min(workers, len(fibers))), mp_context=multiprocessing.get_context('forkserver'),
-                                   initializer=_init_worker, initargs=(spec, grid_scale))
-        # Longest fibers first, so a few long ones do not finish last; results keep fiber order.
-        futures = {}
-        for i in sorted(range(len(fibers)), key=lambda i: -len(fibers[i].points)):
-            futures[i] = pool.submit(_worker_failed_spans, fibers[i], grid_scale, error_threshold_base)
-        results = (futures[i].result() for i in range(len(fibers)))
-    else:
-        pool = None
-        results = (_failed_spans(beam, fiber, grid_scale, error_threshold_base) for fiber in fibers)
-    try:
-        for k, (fiber, failed) in enumerate(zip(fibers, results)):
-            total += len(failed)
-            if failed:
-                hard[fiber.name] = failed
-            if progress and (k + 1) % 25 == 0:
-                progress(dict(fibers=k + 1, hard_spans=total, seconds=round(time.time() - start, 1)))
-    finally:
-        if pool is not None:
+
+    def record(fiber, failed, done):
+        nonlocal total
+        total += len(failed)
+        if failed:
+            hard[fiber.name] = failed
+        if progress and done % 25 == 0:
+            progress(dict(fibers=done, hard_spans=total, seconds=round(time.time() - start, 1)))
+
+    if workers <= 1:
+        for k, fiber in enumerate(fibers):
+            record(fiber, _failed_spans(beam, fiber, grid_scale, error_threshold_base), k + 1)
+        return hard
+    spec = dataclasses.replace(beam.spec, parallel_threads=1)
+    with ProcessPoolExecutor(max(1, min(workers, len(fibers))), mp_context=multiprocessing.get_context('forkserver'),
+                             initializer=_init_worker, initargs=(spec, grid_scale)) as pool:
+        # Longest fibers first, so a few long ones do not finish last. Progress
+        # counts completions; the result is keyed by fiber and order-independent.
+        futures = {pool.submit(_worker_failed_spans, fibers[i], grid_scale, error_threshold_base): i
+                   for i in sorted(range(len(fibers)), key=lambda i: -len(fibers[i].points))}
+        try:
+            for done, future in enumerate(as_completed(futures), 1):
+                record(fibers[futures[future]], future.result(), done)
+        except BaseException:
             pool.shutdown(cancel_futures=True)
-    return hard
+            raise
+    # Same key order as in-process mining (the JSON cache is then identical).
+    return {f.name: hard[f.name] for f in fibers if f.name in hard}
 
 
 def load_or_mine_hard_spans(path, beam: NativeBeam, fibers, grid_scale: float, *, error_threshold_base=20.0,

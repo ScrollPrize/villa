@@ -11,7 +11,7 @@ from .data import _grid_flat, read_tight_blocks, render_count
 from .fast_sample import sample_crop
 
 
-def scalar_crops(items, vol, crop, pool=None, *, presence=False, history=False):
+def scalar_crops(items, vol, crop, pool=None, *, presence=False, history=False, parallel=False):
     grid = _grid_flat(crop)
     empty = np.empty((0, 3), np.float32)
     mask = np.empty(0, np.float32)
@@ -23,6 +23,6 @@ def scalar_crops(items, vol, crop, pool=None, *, presence=False, history=False):
         hist = item['hist_local'][:render_count(crop)] if history else empty
         hmask = item['hmask'][:render_count(crop)] if history else mask
         sampled = sample_crop(raw[j], starts[j], item['pos']*scale, item['frame']*scale,
-                              grid, False, hist, hmask, 2, crop.history_sigma, crop.history_render)
+                              grid, False, hist, hmask, 2, crop.history_sigma, crop.history_render, parallel)
         result[j] = sampled[:channels].reshape(channels, crop.depth, crop.width, crop.width)
     return torch.from_numpy(result)

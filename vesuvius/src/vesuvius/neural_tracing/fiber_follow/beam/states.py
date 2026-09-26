@@ -107,11 +107,14 @@ def segment_labels(parents, endpoints, fiber, sign, tree, cfg):
     return targets, knowns, errors
 
 
-def pool_state(pool, cfg, fiber=None, sign=1., tree=None, rng=None, indices=None, anchor_index=None):
+def pool_state(pool, cfg, fiber=None, sign=1., tree=None, rng=None, indices=None, anchor_index=None,
+               crop_pos=None, crop_frame=None):
     """Use the best parent's current endpoint, never an old common ancestor.
 
     `indices` can subsample proposals for training, without changing the shared
     crop/history. Inference omits it and has no candidate count cap.
+    `crop_pos`/`crop_frame` express the proposals in an existing crop instead
+    (an already encoded scene); its history and footprint are not rebuilt.
     """
     paths = pool.paths
     if not len(pool) or paths.lengths.min() < 2:
@@ -125,6 +128,8 @@ def pool_state(pool, cfg, fiber=None, sign=1., tree=None, rng=None, indices=None
     frame = frame_from_heading(normalize(heading))
     if rng is not None:
         frame = random_rotation_about(frame, rng.uniform(0, 2*np.pi))
+    if crop_pos is not None:
+        pos, frame = np.asarray(crop_pos, np.float64), np.asarray(crop_frame, np.float64)
     hist, hmask = _behind(reference, cfg.n_history)
     ids = np.arange(len(pool)) if indices is None else np.asarray(indices)
     starts, ends = paths.parent_bounds(ids)
