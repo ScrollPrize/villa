@@ -57,7 +57,8 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
         cpu = batch_builder([item], vol) if batch_builder else collate_with_volume([item],vol,sample.crop,grid)
         b = move(cpu)
         sampling={}
-        if getattr(model.cfg,'sampler_mode','zero')=='gaussian':
+        if (getattr(model.cfg,'sampler_mode','zero')=='gaussian'
+                or getattr(model.cfg,'gaussian_candidates',0)>0):
             from vesuvius.neural_tracing.fiber_follow.flow_matching.sampling import trace_generator,trace_noise
             generator=trace_generator(sampling_seed,states.pos[j],states.frame[j,:,2])
             sampling['initial_noise']=trace_noise(model.cfg,[generator],device)
