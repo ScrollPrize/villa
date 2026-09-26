@@ -22,6 +22,7 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/Umbilicus.hpp"
 #include "vc/tracer/CostFunctions.hpp"
+#include "ReferenceRayOcclusionCost.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
@@ -791,118 +792,6 @@ private:
     cv::Vec3d target_;
     double min_clearance_;
     double weight_;
-};
-
-class ReferenceRayOcclusionCost {
-public:
-    ReferenceRayOcclusionCost(Chunked3d<uint8_t, passTroughComputor>* volume,
-                              const cv::Vec3d& target,
-                              double threshold,
-                              double weight,
-                              double step,
-                              double max_distance) :
-        volume_(volume),
-        target_(target),
-        threshold_(threshold),
-        weight_(weight),
-        step_(step > 0.0 ? step : 1.0),
-        max_distance_(max_distance)
-    {}
-
-    bool operator()(const double* candidate, double* residual) const {
-        if (!volume_ || weight_ <= 0.0) {
-            residual[0] = 0.0;
-            return true;
-        }
-
-        const cv::Vec3d start{candidate[0], candidate[1], candidate[2]};
-        const double distance = cv::norm(target_ - start);
-        if (distance <= 1e-6) {
-            residual[0] = 0.0;
-            return true;
-        }
-
-        if (max_distance_ > 0.0 && distance > max_distance_) {
-            residual[0] = 0.0;
-            return true;
-        }
-
-        const int steps = std::max(1, static_cast<int>(std::ceil(distance / step_)));
-        const cv::Vec3d delta = (target_ - start) / static_cast<double>(steps + 1);
-
-        double max_value = std::numeric_limits<double>::lowest();
-        bool hit_threshold = false;
-        cv::Vec3d current = start;
-
-        const double start_value = sample(start);
-        int begin_step = 1;
-        if (std::isfinite(start_value) && start_value >= threshold_) {
-            bool exited_material = false;
-            for (; begin_step <= steps; ++begin_step) {
-                current += delta;
-                const double value = sample(current);
-                if (!std::isfinite(value)) {
-                    continue;
-                }
-                if (value < threshold_) {
-                    exited_material = true;
-                    ++begin_step;  // start checking one step beyond the exit.
-                    break;
-                }
-            }
-            if (!exited_material) {
-                residual[0] = 0.0;
-                return true;
-            }
-        } else {
-            current = start;
-        }
-
-        for (int i = begin_step; i <= steps; ++i) {
-            current += delta;
-            const double value = sample(current);
-            if (!std::isfinite(value)) {
-                continue;
-            }
-
-            max_value = std::max(max_value, value);
-            if (value >= threshold_) {
-                hit_threshold = true;
-                break;
-            }
-        }
-
-        if (!hit_threshold) {
-            residual[0] = 0.0;
-            return true;
-        }
-
-        if (!std::isfinite(max_value) || max_value < 0.0) {
-            max_value = 0.0;
-        }
-
-        const double diff = std::max(0.0, threshold_ - max_value);
-        residual[0] = weight_ * diff;
-        return true;
-    }
-
-private:
-    double sample(const cv::Vec3d& xyz) const {
-        if (!interp_) {
-            interp_ = std::make_unique<CachedChunked3dInterpolator<uint8_t, passTroughComputor>>(*volume_);
-        }
-        double value = 0.0;
-        interp_->Evaluate(xyz[2], xyz[1], xyz[0], &value);
-        return value;
-    }
-
-    Chunked3d<uint8_t, passTroughComputor>* volume_;
-    cv::Vec3d target_;
-    double threshold_;
-    double weight_;
-    double step_;
-    double max_distance_;
-    mutable std::unique_ptr<CachedChunked3dInterpolator<uint8_t, passTroughComputor>> interp_;
 };
 
 struct SDTChunk {
@@ -1732,14 +1621,13 @@ static int gen_reference_ray_loss(ceres::Problem &problem, const cv::Vec2i &p,
     const cv::Vec3d target{nearest[0], nearest[1], nearest[2]};
 
     {
-        auto* functor = new ReferenceRayOcclusionCost(trace_data.raw_volume,
-                                                      target,
-                                                      settings.reference_raycast.voxel_threshold,
-                                                      static_cast<double>(w),
-                                                      settings.reference_raycast.sample_step,
-                                                      settings.reference_raycast.max_distance);
-
-        auto* cost = new ceres::NumericDiffCostFunction<ReferenceRayOcclusionCost, ceres::CENTRAL, 1, 3>(functor);
+        // One march per evaluation instead of the seven of NumericDiffCostFunction CENTRAL.
+        auto* cost = new ReferenceRayOcclusionAnalyticCost(trace_data.raw_volume,
+                                                           target,
+                                                           settings.reference_raycast.voxel_threshold,
+                                                           static_cast<double>(w),
+                                                           settings.reference_raycast.sample_step,
+                                                           settings.reference_raycast.max_distance);
         problem.AddResidualBlock(cost, nullptr, &params.dpoints(p)[0]);
     }
 
