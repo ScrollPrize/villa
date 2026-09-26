@@ -116,6 +116,59 @@ const OverlayColormapSpec& resolve(const std::string& id)
     return allSpecs.front();
 }
 
+std::string tintColormapId(uint8_t r, uint8_t g, uint8_t b)
+{
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string id(kTintColormapIdPrefix);
+    for (const uint8_t channel : {r, g, b}) {
+        id.push_back(kHex[channel >> 4]);
+        id.push_back(kHex[channel & 0x0F]);
+    }
+    return id;
+}
+
+std::optional<cv::Vec3f> parseTintColormapId(std::string_view id)
+{
+    if (id.size() != kTintColormapIdPrefix.size() + 6 ||
+        id.substr(0, kTintColormapIdPrefix.size()) != kTintColormapIdPrefix) {
+        return std::nullopt;
+    }
+    const auto hexValue = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::array<float, 3> rgb{};
+    const std::string_view hex = id.substr(kTintColormapIdPrefix.size());
+    for (std::size_t channel = 0; channel < 3; ++channel) {
+        const int hi = hexValue(hex[channel * 2]);
+        const int lo = hexValue(hex[channel * 2 + 1]);
+        if (hi < 0 || lo < 0) {
+            return std::nullopt;
+        }
+        rgb[channel] = static_cast<float>(hi * 16 + lo) / 255.0f;
+    }
+    return cv::Vec3f(rgb[0], rgb[1], rgb[2]);
+}
+
+std::optional<cv::Vec3f> colormapTint(const std::string& id)
+{
+    if (auto parsed = parseTintColormapId(id)) {
+        return parsed;
+    }
+    // resolve() falls back to the first spec for unknown ids, so the id has to
+    // be matched exactly here rather than trusting the returned kind.
+    for (const auto& spec : specs()) {
+        if (spec.id == id) {
+            return spec.kind == OverlayColormapKind::Tint
+                ? std::optional<cv::Vec3f>(spec.tint)
+                : std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
 void makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec,
                 uint32_t* outBuf, int outStride)
 {

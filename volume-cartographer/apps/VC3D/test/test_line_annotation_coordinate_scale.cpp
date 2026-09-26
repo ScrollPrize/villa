@@ -13,6 +13,7 @@ private slots:
     void rejectsIncompatibleDomains();
     void ordersManifestCandidatesFiberFirstThenSelection();
     void omitsEmptyAndDuplicateManifestCandidates();
+    void channelFrameSubstitutionMustResolveAtTheOpenedLevel();
 };
 
 void TestLineAnnotationCoordinateScale::ordersManifestCandidatesFiberFirstThenSelection()
@@ -109,6 +110,29 @@ void TestLineAnnotationCoordinateScale::rejectsIncompatibleDomains()
         vc3d::line_annotation::resolveFiberNormalCoordinateScales(
             normalShape, fiberShape, 1.0),
         std::runtime_error);
+}
+
+void TestLineAnnotationCoordinateScale::channelFrameSubstitutionMustResolveAtTheOpenedLevel()
+{
+    using vc3d::line_annotation::resolveFiberBaseToVolumeScale;
+    // frameVolume() may stand a channel opened at level 1 onto the scan's
+    // level-1 twin only when the fiber's base frame (the manifest's) maps
+    // onto that twin: exactly the ceiling or floor at a non-zero level.
+    const std::optional<std::array<std::size_t, 3>> manifest{{59944, 20812, 20812}};
+    QCOMPARE(resolveFiberBaseToVolumeScale(manifest, {29972, 10406, 10406}), 0.5);
+    // A scan recorded one voxel larger (20813 -> 10407 at level 1) agrees
+    // with the manifest within one voxel after ceiling division, which the
+    // pyramid predicate accepts, but no fiber maps onto it: substituting it
+    // would fail every consumer, so the channel keeps its own frame.
+    bool threw = false;
+    try {
+        (void)resolveFiberBaseToVolumeScale(manifest, {29972, 10407, 10407});
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    QVERIFY(threw);
+    // At level 0 the one-voxel convention difference is accepted.
+    QCOMPARE(resolveFiberBaseToVolumeScale(manifest, {59944, 20813, 20813}), 1.0);
 }
 
 QTEST_APPLESS_MAIN(TestLineAnnotationCoordinateScale)

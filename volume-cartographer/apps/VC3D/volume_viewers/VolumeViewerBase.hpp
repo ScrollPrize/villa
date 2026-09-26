@@ -158,6 +158,14 @@ public:
     virtual void setOverlayWindow(float low, float high) = 0;
     virtual void setOverlayMaxDisplayedResolution(int level) = 0;
     virtual void setOverlayComposite(const OverlayCompositeSettings& settings) = 0;
+    // A locally managed overlay belongs to the viewer's host (a dialog that
+    // drives the setters above itself). ViewerManager leaves such viewers out
+    // when it fans out the app-wide Overlay panel state.
+    virtual void setOverlayLocallyManaged(bool) {}
+    virtual bool overlayLocallyManaged() const { return false; }
+    // Scale the overlay alpha by the windowed value (0 at window low, the full
+    // opacity at window high) instead of blending at constant opacity.
+    virtual void setOverlayValueWeightedAlpha(bool) {}
     virtual void reloadPerfSettings() = 0;
 
     // SurfaceCache budgets for the flattened segmentation view (base, overlay).

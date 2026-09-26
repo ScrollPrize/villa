@@ -183,6 +183,18 @@ public:
     void setSelectedFiberInferenceDataset(std::string location);
     void clearSelectedFiberInferenceDataset();
     [[nodiscard]] std::filesystem::path selectedFiberInferenceDatasetPath() const;
+    // The scan (loaded volume id of its level-0 entry, or the open-data scan
+    // id shared by its downsampled twins) the line annotation workspace works
+    // on. Lasagna and fiber datasets are grouped under scans; the workspace
+    // greys out datasets that belong to another scan.
+    [[nodiscard]] std::string selectedRawScan() const;
+    void setSelectedRawScan(std::string scanKey);
+    void clearSelectedRawScan();
+    // The surface prediction volume (loaded volume id) the line annotation
+    // workspace lists for the selected scan; one at a time.
+    [[nodiscard]] std::string selectedSurfaceVolume() const;
+    void setSelectedSurfaceVolume(std::string volumeId);
+    void clearSelectedSurfaceVolume();
 
     // The project's umbilicus polyline, if one has been attached explicitly.
     // Declaring it here removes the ambiguity of searching directories for
@@ -259,7 +271,13 @@ private:
     std::optional<std::string> outputSegments_;
     std::optional<std::string> selectedLasagnaDataset_;
     std::optional<std::string> selectedFiberInferenceDataset_;
+    std::optional<std::string> selectedRawScan_;
+    std::optional<std::string> selectedSurfaceVolume_;
     std::optional<std::string> umbilicus_;
+    // The document as read, so a rewrite keeps top-level fields this class
+    // does not model (a tool's `remote_cache_root`, say) instead of dropping
+    // them on the first selection change.
+    utils::Json sourceJson_;
 
     std::map<std::string, std::shared_ptr<Volume>> loadedVolumes_;
     std::map<std::string, std::vector<std::string>> volumeTagsByID_;

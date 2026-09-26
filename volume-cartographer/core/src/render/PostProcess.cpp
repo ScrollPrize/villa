@@ -40,21 +40,12 @@ void buildWindowLevelColormapLut(std::array<uint32_t, 256>& lut,
         return;
     }
 
-    const OverlayColormapSpec& spec = vc::resolve(colormapId);
     constexpr uint32_t kBlack = 0xFF000000u;
 
-    if (spec.kind == OverlayColormapKind::DiscreteLut && spec.discreteLut) {
-        // Apply window/level to index, then look up discrete palette.
-        for (int i = 0; i < 256; ++i) {
-            uint8_t mapped = static_cast<uint8_t>(wl[i] & 0xFF);  // gray value
-            lut[i] = spec.discreteLut[mapped];
-        }
-        lut[0] = kBlack;
-        return;
-    }
-
-    if (spec.kind == OverlayColormapKind::Tint) {
-        const float r = spec.tint[0], g = spec.tint[1], b = spec.tint[2];
+    // Single-colour tints (preset or free tint:RRGGBB): the windowed gray value
+    // scales the colour, so the LUT runs black -> colour across the window.
+    if (const auto tint = vc::colormapTint(colormapId)) {
+        const float r = (*tint)[0], g = (*tint)[1], b = (*tint)[2];
         for (int i = 0; i < 256; ++i) {
             uint8_t v = static_cast<uint8_t>(wl[i] & 0xFF);
             uint8_t R = static_cast<uint8_t>(v * r);
@@ -64,6 +55,18 @@ void buildWindowLevelColormapLut(std::array<uint32_t, 256>& lut,
                    | (static_cast<uint32_t>(R) << 16)
                    | (static_cast<uint32_t>(G) << 8)
                    | static_cast<uint32_t>(B);
+        }
+        lut[0] = kBlack;
+        return;
+    }
+
+    const OverlayColormapSpec& spec = vc::resolve(colormapId);
+
+    if (spec.kind == OverlayColormapKind::DiscreteLut && spec.discreteLut) {
+        // Apply window/level to index, then look up discrete palette.
+        for (int i = 0; i < 256; ++i) {
+            uint8_t mapped = static_cast<uint8_t>(wl[i] & 0xFF);  // gray value
+            lut[i] = spec.discreteLut[mapped];
         }
         lut[0] = kBlack;
         return;

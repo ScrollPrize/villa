@@ -14,6 +14,8 @@
 #include "overlays/SegmentationOverlayController.hpp"
 #include "vc/core/render/Colormaps.hpp"
 #include "vc/core/render/PostProcess.hpp"
+#include "volume_viewers/OverlayBlendLut.hpp"
+#include "volume_viewers/OverlayLevelSelection.hpp"
 #include "render/ChunkCache.hpp"
 #include "vc/core/render/SurfaceCache.hpp"
 #include "vc/core/types/Volume.hpp"
@@ -1169,17 +1171,17 @@ void CChunkedVolumeViewer::ensureSurfaceCaches()
     QPointer<CChunkedVolumeViewer> guard(this);
     std::weak_ptr<vc::render::SurfaceCache> cacheWeak = _overlaySurfaceCache;
     auto notificationQueued = std::make_shared<std::atomic_bool>(false);
+    // The generation is captured here, on the GUI thread. The listener runs on
+    // a cache worker after the registration was copied out under the cache
+    // mutex, so it may fire after this viewer was destroyed and the listener
+    // removed: it must not touch the viewer at all, only queue to the GUI
+    // thread, where the QPointer check is safe.
+    const auto generation = _overlayGeneration.load(std::memory_order_acquire);
     _overlaySurfaceTileCbId = _overlaySurfaceCache->addTileReadyListener(
-        [guard, cacheWeak, notificationQueued]() {
+        [guard, cacheWeak, notificationQueued, generation]() {
             // Keep overlay tile bursts bounded to one queued UI notification too.
             if (notificationQueued->exchange(true, std::memory_order_acq_rel))
                 return;
-            if (!guard) {
-                notificationQueued->store(false, std::memory_order_release);
-                return;
-            }
-            const auto generation = guard->_overlayGeneration.load(
-                std::memory_order_acquire);
             QMetaObject::invokeMethod(qApp, [guard, cacheWeak, notificationQueued, generation]() {
                 const auto source = cacheWeak.lock();
                 if (!guard || !source || guard->_overlaySurfaceCache != source ||
@@ -1904,7 +1906,17 @@ int CChunkedVolumeViewer::overlayRenderStartLevel(bool preferSurfaceResolution) 
         level -= kSurfaceResolutionLevelBias;
     }
     level = std::max(level, _overlayMaxDisplayedResolution);
-    return std::clamp(level, 0, _overlayChunkArray->numLevels() - 1);
+    level = std::clamp(level, 0, _overlayChunkArray->numLevels() - 1);
+    // A sparse pyramid (a prediction published from /3 upward, or /6 upward,
+    // beyond the UI's 0-5 resolution range) has no fetcher at its fine levels;
+    // sampling there would wait on chunks that never arrive. Fall to the first
+    // stored level at or coarser than the requested one.
+    const auto& overlay = *_overlayChunkArray;
+    return vc3d::overlay_level::presentLevelAtOrCoarser(
+        level, overlay.numLevels(), [&overlay](int candidate) {
+            const auto shape = overlay.shape(candidate);
+            return shape[0] > 0 && shape[1] > 0 && shape[2] > 0;
+        });
 }
 
 void CChunkedVolumeViewer::markInteractiveMotion(double)
@@ -2066,6 +2078,7 @@ struct CChunkedVolumeViewer::RenderContext {
     std::string overlayColormapId;
     float overlayWindowLow = 0.0f;
     float overlayWindowHigh = 255.0f;
+    bool overlayValueWeightedAlpha = false;
     OverlayCompositeSettings overlayComposite;
     std::shared_ptr<vc::render::SurfaceCache> surfaceCache;
     std::shared_ptr<vc::render::SurfaceCache> overlaySurfaceCache;
@@ -3299,12 +3312,20 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     if (profilePhases) phaseTimer.restart();
     std::array<uint32_t, 256> lut{};
     vc::buildWindowLevelColormapLut(lut, ctx.windowLow, ctx.windowHigh, ctx.baseColormapId);
-    std::array<uint32_t, 256> overlayLut{};
+    vc3d::overlay_blend::Luts overlayBlend;
     const bool hasOverlay = !overlayValues.empty() && !overlayCoverage.empty() &&
                             ctx.overlayOpacity > 0.0f;
     if (hasOverlay) {
+        std::array<uint32_t, 256> overlayLut{};
         vc::buildWindowLevelColormapLut(
             overlayLut, ctx.overlayWindowLow, ctx.overlayWindowHigh, ctx.overlayColormapId);
+        std::optional<std::array<float, 3>> tint;
+        if (const auto rgb = vc::colormapTint(ctx.overlayColormapId)) {
+            tint = std::array<float, 3>{(*rgb)[0], (*rgb)[1], (*rgb)[2]};
+        }
+        vc3d::overlay_blend::build(overlayBlend, overlayLut, ctx.overlayOpacity,
+                                   ctx.overlayWindowLow, ctx.overlayWindowHigh,
+                                   ctx.overlayValueWeightedAlpha, tint);
     }
     auto* fbBits = reinterpret_cast<uint32_t*>(result.framebuffer.bits());
     const int fbStride = result.framebuffer.bytesPerLine() / 4;
@@ -3331,7 +3352,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                     : lut[src[x]];
             if (hasOverlay && overlayCov[x] &&
                 overlaySrc[x] >= ctx.overlayWindowLow && overlaySrc[x] <= ctx.overlayWindowHigh) {
-                pixel = alphaBlendArgb(pixel, overlayLut[overlaySrc[x]], ctx.overlayOpacity);
+                pixel = alphaBlendArgb(pixel, overlayBlend.color[overlaySrc[x]],
+                                       overlayBlend.alpha[overlaySrc[x]]);
             }
             if (focusInside && !focusInside[x]) {
                 pixel = (pixel & 0xFF000000u) |
@@ -3395,6 +3417,7 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.overlayColormapId = _overlayColormapId;
     job.overlayWindowLow = _overlayWindowLow;
     job.overlayWindowHigh = _overlayWindowHigh;
+    job.overlayValueWeightedAlpha = _overlayValueWeightedAlpha;
     job.overlayComposite = _overlayComposite;
     job.chunkContentEpoch = _chunkContentEpoch;
     job.surfaceGeometryEpoch = _surfaceGeometryEpoch;
@@ -3464,6 +3487,7 @@ bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,
            a.overlayColormapId == b.overlayColormapId &&
            a.overlayWindowLow == b.overlayWindowLow &&
            a.overlayWindowHigh == b.overlayWindowHigh &&
+           a.overlayValueWeightedAlpha == b.overlayValueWeightedAlpha &&
            a.overlayComposite == b.overlayComposite &&
            a.surfaceGeometryEpoch == b.surfaceGeometryEpoch &&
            a.surfaceCache.get() == b.surfaceCache.get() &&
@@ -3537,6 +3561,7 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     ctx.overlayColormapId = job.overlayColormapId;
     ctx.overlayWindowLow = job.overlayWindowLow;
     ctx.overlayWindowHigh = job.overlayWindowHigh;
+    ctx.overlayValueWeightedAlpha = job.overlayValueWeightedAlpha;
     ctx.overlayComposite = job.overlayComposite;
     ctx.surfaceCache = job.surfaceCache;
     ctx.overlaySurfaceCache = job.overlaySurfaceCache;
@@ -3824,11 +3849,13 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
         if (_overlayChunkArray) {
             QPointer<CChunkedVolumeViewer> guard(this);
             std::weak_ptr<Volume> overlayVolumeWeak = _overlayVolume;
-            _overlayChunkCbId = _overlayChunkArray->addChunkReadyListener([guard, overlayVolumeWeak]() {
-                if (!guard)
-                    return;
-                const auto generation = guard->_overlayGeneration.load(
-                    std::memory_order_acquire);
+            // Captured on the GUI thread: the listeners below run on cache
+            // workers after being copied out of the listener table, possibly
+            // after this viewer is gone, so they only queue to the GUI thread
+            // and never dereference the viewer themselves.
+            const auto generation = _overlayGeneration.load(std::memory_order_acquire);
+            _overlayChunkCbId = _overlayChunkArray->addChunkReadyListener(
+                [guard, overlayVolumeWeak, generation]() {
                 QMetaObject::invokeMethod(qApp, [guard, overlayVolumeWeak, generation]() {
                     if (!guard)
                         return;
@@ -3844,12 +3871,8 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
             if (_state && _state->debugDownloadQueueEnabled()) {
                 _overlayRemoteFetchCbId =
                     _overlayChunkArray->addRemoteFetchActivityListener(
-                        [guard, overlayVolumeWeak](
+                        [guard, overlayVolumeWeak, generation](
                             const vc::render::ChunkKey&, bool) {
-                            if (!guard)
-                                return;
-                            const auto generation = guard->_overlayGeneration.load(
-                                std::memory_order_acquire);
                             QMetaObject::invokeMethod(
                                 qApp, [guard, overlayVolumeWeak, generation]() {
                                     if (!guard)
@@ -3879,8 +3902,11 @@ void CChunkedVolumeViewer::setOverlayOpacity(float opacity)
     const float nextOpacity = std::clamp(opacity, 0.0f, 1.0f);
     if (_overlayOpacity == nextOpacity)
         return;
-    if ((_overlayOpacity > 0.0f) != (nextOpacity > 0.0f))
-        _overlayGeneration.fetch_add(1, std::memory_order_acq_rel);
+    // Deliberately no _overlayGeneration bump here: the generation identifies
+    // the listener registration (setOverlayVolume), and the listeners' GUI
+    // callbacks already drop notifications while the opacity is zero. Bumping
+    // it on a zero crossing would strand every registered listener once the
+    // opacity comes back, leaving refinements unpainted.
     _overlayOpacity = nextOpacity;
     if (_overlayOpacity <= 0.0f && _overlayChunkArray &&
         (!_chunkArray || _overlayChunkArray->sourceId() != _chunkArray->sourceId())) {
@@ -3969,6 +3995,18 @@ void CChunkedVolumeViewer::setOverlayComposite(const OverlayCompositeSettings& s
 
     _overlayComposite = settings;
     submitRender("overlay composite changed");
+}
+
+void CChunkedVolumeViewer::setOverlayValueWeightedAlpha(bool enabled)
+{
+    if (_closing) {
+        return;
+    }
+    if (_overlayValueWeightedAlpha == enabled) {
+        return;
+    }
+    _overlayValueWeightedAlpha = enabled;
+    submitRender("overlay alpha weighting changed");
 }
 
 void CChunkedVolumeViewer::panByF(float dx, float dy)

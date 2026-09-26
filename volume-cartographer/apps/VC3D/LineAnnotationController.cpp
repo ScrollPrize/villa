@@ -11,6 +11,9 @@
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSaveJob.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
+#include "LineAnnotationDatasetSets.hpp"
+#include "LineAnnotationPresenceOverlay.hpp"
+#include "LineAnnotationOverlayManifest.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "SurfacePanelController.hpp"
@@ -206,6 +209,10 @@ struct LineAnnotationController::LineAnnotationSession {
     std::optional<std::vector<size_t>> runningSolveControlMap;
     std::vector<size_t> runningSolveEditedSpans;
     bool runningSolveConfigChanged = false;
+    // The dataset the running solve was launched with was rejected (its
+    // manifest resolved to another scan) while it ran: its result is
+    // discarded wholesale at landing, no span merge and no re-dispatch.
+    bool runningSolveDatasetRejected = false;
     // A debounced dispatch of the queue's pending solve is scheduled.
     bool solveDispatchScheduled = false;
     // A debounced session autosave is scheduled (see scheduleSessionAutoSave).
@@ -357,15 +364,6 @@ namespace {
 // such a span would be drawn stretched to a full column).
 constexpr double kMinimumControlPointSpacingBaseVoxels =
     vc::lasagna::kLineViewAlongSamplingDistanceBaseVoxels;
-
-std::optional<vc3d::opendata::CoordinateIdentity> coordinateIdentityForState(
-    const CState* state)
-{
-    if (!state || !state->vpkg() || state->currentVolumeId().empty())
-        return std::nullopt;
-    return vc3d::opendata::coordinateIdentityForVolume(
-        *state->vpkg(), state->currentVolumeId());
-}
 
 // The attached volume an umbilicus stamp names by store directory name, so the
 // stamp can be checked against it. Remote volumes are skipped: the check needs
@@ -2072,6 +2070,10 @@ LineAnnotationController::LineAnnotationController(CState* state,
     // Background work must not compete with interactive rendering at normal
     // OS priority (review guidance: run it low, publish late results).
     _lineSolvePool.setThreadPriority(QThread::LowPriority);
+    if (_viewerManager) {
+        connect(_viewerManager, &ViewerManager::volumeGeometryUpdateRequested,
+                this, &LineAnnotationController::refreshStaleGeneratedViews);
+    }
     if (_state) {
         connect(_state,
                 &CState::surfaceChanged,
@@ -2096,9 +2098,26 @@ LineAnnotationController::LineAnnotationController(CState* state,
                     // re-emission. Cleared on package change, since two
                     // projects can name a volume identically.
                     if (volumeId == _lastVolumeChangedId) {
+                        // A package UI refresh (attach, catalog reload) re-emits
+                        // for the current volume: the dialogs' volume lists and
+                        // an overlay whose source was replaced under the same
+                        // id have to follow, the generated views do not.
+                        refreshLineAnnotationDatasetMenus();
+                        refreshPresenceOverlays();
                         return;
                     }
                     _lastVolumeChangedId = volumeId;
+                    {
+                        const auto sets = datasetSets();
+                        if (const auto level = vc3d::line_annotation::rawScanLevelOfVolume(
+                                sets.volumes, volumeId)) {
+                            _lastRawScanLevel = *level;
+                        }
+                    }
+                    // The dialogs' selectors follow the active volume, and a
+                    // volume outside the selected set is listed as such.
+                    refreshLineAnnotationDatasetMenus();
+                    prefetchRemoteManifestFrames();
                     onActiveVolumeChanged();
                 });
         // Without this an attach or detach would not reach normal orientation
@@ -2122,6 +2141,8 @@ LineAnnotationController::LineAnnotationController(CState* state,
 
 LineAnnotationController::~LineAnnotationController()
 {
+    _tearingDown = true;
+    _pendingPersistenceWarnings.clear();
     flushAllPendingSessionAutoSaves();
     waitForFiberSaves();
     // Bounded teardown of in-flight line solves: request cooperative
@@ -2256,6 +2277,11 @@ LineAnnotationController::pickMergeOptimizationMode(
 void LineAnnotationController::setVolumeSelectorFactory(VolumeSelectorFactory factory)
 {
     _volumeSelectorFactory = std::move(factory);
+}
+
+void LineAnnotationController::setVolumeSwitchHandler(VolumeSwitchHandler handler)
+{
+    _volumeSwitchHandler = std::move(handler);
 }
 
 void LineAnnotationController::setSurfacePanel(SurfacePanelController* panel)
@@ -2499,7 +2525,7 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
 
     session->deferShowUntilGenerated = deferShowUntilGenerated;
     _state->setSurface(surfaceName, std::move(sourceSurface));
-    auto* dialog = new LineAnnotationDialog(_viewerManager, _volumeSelectorFactory, nullptr);
+    auto* dialog = new LineAnnotationDialog(_viewerManager, nullptr);
     dialog->setFiberDisplayName(fiberDisplayNameFromFileName(session->fiberFileName));
     dialog->setFiberOptimizationMode(session->fiberOptimizationMode);
     refreshLineAnnotationDatasetMenu(dialog);
@@ -2558,6 +2584,65 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
             [this](const std::string& location) {
                 handleFiberInferenceDatasetSelectionChanged(location);
             });
+    connect(dialog,
+            &LineAnnotationDialog::rawScanSelectionChanged,
+            this,
+            [this](const std::string& scanKey) {
+                handleRawScanSelectionChanged(scanKey);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::surfaceSelectionChanged,
+            this,
+            [this](const std::string& volumeId) {
+                handleSurfaceSelectionChanged(volumeId);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::rawScanLevelSelectionChanged,
+            this,
+            [this](int level) {
+                handleRawScanLevelSelectionChanged(level);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::volumeSelectionRequested,
+            this,
+            [this](const std::string& volumeId) {
+                if (_volumeSwitchHandler) {
+                    _volumeSwitchHandler(volumeId);
+                }
+            });
+    connect(dialog,
+            &LineAnnotationDialog::volumeSelectorScopeChanged,
+            this,
+            [this, surfaceName]() {
+                if (auto* pane = paneForSurface(surfaceName)) {
+                    refreshLineAnnotationDatasetMenu(pane->dialog);
+                }
+            });
+    refreshLineAnnotationDatasetMenu(dialog);
+    prefetchRemoteManifestFrames();
+    connect(dialog,
+            &LineAnnotationDialog::presenceOverlayEnabledChanged,
+            this,
+            [this, surfaceName](bool enabled) {
+                // Off is handled inside the dialog (it clears its panes).
+                if (!enabled) {
+                    return;
+                }
+                if (auto* pane = paneForSurface(surfaceName)) {
+                    refreshPresenceOverlay(*pane);
+                }
+            });
+    connect(dialog,
+            &LineAnnotationDialog::presenceOverlaySourceChanged,
+            this,
+            [this, surfaceName]() {
+                if (auto* pane = paneForSurface(surfaceName)) {
+                    refreshPresenceOverlay(*pane);
+                }
+            });
+    // A persisted "on" wants its volume before the generated panes exist;
+    // the dialog holds it until they do.
+    refreshPresenceOverlay(_panes.back());
     connect(dialog,
             &LineAnnotationDialog::generatedControlPointRequested,
             this,
@@ -2938,7 +3023,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     double fiberBaseToVolumeScale = 1.0;
     if (coordinateBaseShapeZYX) {
         try {
-            const auto volume = _state ? _state->currentVolume() : nullptr;
+            const auto volume = _state ? frameVolume().volume : nullptr;
             if (!volume) {
                 throw std::runtime_error("no active volume is loaded");
             }
@@ -3749,7 +3834,7 @@ bool LineAnnotationController::exportFibersToPath(const fs::path& exportPath,
         root["type"] = "vc3d_fiber_collection";
         root["version"] = 1;
         root["scale"] = scale;
-        copyCoordinateIdentityToJson(root, coordinateIdentityForState(_state));
+        copyCoordinateIdentityToJson(root, frameCoordinateIdentity());
         root["point_collections"] = nlohmann::json::array();
         for (const auto& fiber : _fibers) {
             root["point_collections"].push_back(fiberToJson(fiber, scale));
@@ -4109,7 +4194,7 @@ fs::path LineAnnotationController::createAtlasFromFiberCore(uint64_t fiberId)
                                                    selected,
                                                    zeroWindingColumn,
                                                    std::move(mapping));
-    const auto coordinateIdentity = coordinateIdentityForState(_state);
+    const auto coordinateIdentity = frameCoordinateIdentity();
     copyCoordinateIdentityToJson(
         atlas.metadata.coordinateMetadata, coordinateIdentity);
     vc3d::opendata::copyCoordinateIdentityToSurface(
@@ -6394,8 +6479,10 @@ LineAnnotationController::resolveAlignmentMetricsManifestPath()
 
     auto vpkg = _state->vpkg();
     try {
+        // The effective selection, never the recorded one: a recorded dataset
+        // rejected as another scan's must not drive the metrics either.
         if (const auto resolved = vc3d::opendata::resolveLasagnaForVolume(
-                *vpkg, _state->currentVolumeId())) {
+                *vpkg, frameVolume().id, effectiveLasagnaDataset())) {
             return std::pair{resolved->manifestPath, resolved->workingToBaseScale};
         }
     } catch (const std::exception& ex) {
@@ -6403,8 +6490,8 @@ LineAnnotationController::resolveAlignmentMetricsManifestPath()
                       .arg(QString::fromStdString(ex.what())));
         return std::nullopt;
     }
-    std::string selected = vpkg->selectedLasagnaDataset();
-    fs::path manifestPath = vpkg->selectedLasagnaDatasetPath();
+    std::string selected = effectiveLasagnaDataset();
+    fs::path manifestPath = selected.empty() ? fs::path{} : vpkg->selectedLasagnaDatasetPath();
     if (!selected.empty() && !manifestPath.empty()) {
         return std::pair{manifestPath, 1.0};
     }
@@ -7457,6 +7544,11 @@ void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg>
     // the new one, so that save is exactly the wrong-target write this exists
     // to prevent. A session's work was persisted into its own package by the
     // save-on-mutation paths while it was being edited.
+    _manifestBaseShapeCache.clear();
+    ++_manifestPrefetchEpoch;
+    // A write failure reported for the old project is not this project's.
+    _pendingPersistenceWarnings.clear();
+    _pendingPersistenceReason.clear();
     if (_intersectionInspection) {
         cleanupIntersectionInspectionSurfaces();
         _intersectionInspection.reset();
@@ -7521,6 +7613,8 @@ void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg>
     // The volume-reselection guard must not carry an id across packages: two
     // projects can name a volume identically.
     _lastVolumeChangedId.clear();
+    // Rebased presence views belong to the old package's volumes.
+    _rebasedPresenceVolumes.clear();
     // Dropped outright rather than left to the frame comparison: two projects can
     // sit in one directory with identical grids, so both halves of the cache key
     // can match while the umbilicus file behind them differs.
@@ -7579,7 +7673,7 @@ void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
             : 0;
         if (vc3d::line_annotation::shouldRunNativeSeedTrace(
                 session.fiberOptimizationMode,
-                vpkg && !vpkg->selectedFiberInferenceDataset().empty(),
+                vpkg && !effectiveFiberDataset().empty(),
                 fiberInferenceEntryCount)) {
             if (!ensureFiberInferenceDatasetForSession(session)) {
                 return;
@@ -9970,8 +10064,8 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
     std::string selectedIdentity;
     fs::path manifestPath;
     double workingToBaseScale = 1.0;
-    if (!vpkg->selectedLasagnaDataset().empty()) {
-        selected = vpkg->selectedLasagnaDataset();
+    if (!effectiveLasagnaDataset().empty()) {
+        selected = effectiveLasagnaDataset();
         selectedIdentity = selected;
         const auto entries = vpkg->lasagnaDatasetEntries();
         const auto selectedEntry = std::find_if(
@@ -9987,12 +10081,14 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         }
     } else {
         try {
+            // No effective selection: the catalog pairing only, never the
+            // recorded manual selection (which was rejected above).
             if (const auto resolved = vc3d::opendata::resolveLasagnaForVolume(
-                    *vpkg, _state->currentVolumeId())) {
+                    *vpkg, _state->currentVolumeId(), std::string{})) {
                 manifestPath = resolved->manifestPath;
                 selected = resolved->manifestBacked
                     ? manifestPath.string()
-                    : vpkg->selectedLasagnaDataset();
+                    : effectiveLasagnaDataset();
                 selectedIdentity = resolved->sourceManifestLocation;
                 workingToBaseScale = resolved->workingToBaseScale;
             }
@@ -10078,33 +10174,640 @@ void LineAnnotationController::refreshLineAnnotationDatasetMenus() const
     }
 }
 
+LineAnnotationController::DatasetSets LineAnnotationController::datasetSets() const
+{
+    using namespace vc3d::line_annotation;
+    DatasetSets sets;
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg) {
+        return sets;
+    }
+    const auto fiberEntries = vpkg->fiberInferenceDatasetEntries();
+    std::vector<std::string> fiberLocations;
+    for (const auto& entry : fiberEntries) {
+        fiberLocations.push_back(entry.location);
+    }
+    std::vector<ProjectVolumeInfo> infos;
+    for (const auto& id : vpkg->volumeIDs()) {
+        ProjectVolumeInfo info;
+        info.id = id;
+        info.tags = vpkg->volumeTags(id);
+        if (const auto volume = vpkg->volume(id)) {
+            if (volume->metadata().contains("name") && volume->metadata()["name"].is_string()) {
+                info.name = volume->name();
+            }
+            const auto shape = volume->shape();
+            for (std::size_t axis = 0; axis < 3; ++axis) {
+                info.shapeZYX[axis] = static_cast<std::size_t>(std::max(0, shape[axis]));
+            }
+            info.voxelSizeUm = volume->voxelSize();
+            info.openedLevel = volume->baseScaleLevel();
+        }
+        infos.push_back(std::move(info));
+    }
+    sets.volumes = classifyProjectVolumes(infos, fiberLocations);
+    sets.scans = rawScanOptions(sets.volumes);
+    // Datasets: the open-data scan id tag places them; an untagged dataset
+    // is placed by its manifest frame (a local file read here; a remote one
+    // only once prefetchRemoteManifestFrames() has cached it, unknown until
+    // then). A tagged dataset's frame is read only when frameVolume()
+    // validates a channel of it.
+    const auto describe = [&](const vc::project::Entry& entry) {
+        DatasetInfo info;
+        info.location = entry.location;
+        info.tags = entry.tags;
+        if (!tagValue(entry.tags, kOpenDataVolumeIdTagPrefix)) {
+            info.baseShapeZYX = manifestBaseFrame(entry.location);
+            info.framePending = !info.baseShapeZYX &&
+                                vc::project::isLocationRemote(entry.location) &&
+                                !_manifestBaseShapeCache.count(entry.location);
+        }
+        return info;
+    };
+    for (const auto& entry : vpkg->lasagnaDatasetEntries()) {
+        sets.lasagnaDatasets.push_back(describe(entry));
+    }
+    for (const auto& entry : fiberEntries) {
+        sets.fiberDatasets.push_back(describe(entry));
+    }
+    // Channel volumes sit with the scan their dataset was published against.
+    assignDatasetScansToChannels(sets.volumes, sets.lasagnaDatasets, sets.scans);
+    assignDatasetScansToChannels(sets.volumes, sets.fiberDatasets, sets.scans);
+    const auto scanKeyOfSelected = [&](const std::vector<DatasetInfo>& datasets,
+                                       const std::string& selected) {
+        for (const auto& dataset : datasets) {
+            if (dataset.location == selected) {
+                return datasetScanKey(dataset, sets.scans);
+            }
+        }
+        return std::string{};
+    };
+    std::vector<std::string> allKeys;
+    for (const auto* list : {&sets.lasagnaDatasets, &sets.fiberDatasets}) {
+        for (const auto& dataset : *list) {
+            allKeys.push_back(datasetScanKey(dataset, sets.scans));
+        }
+    }
+    const std::string recorded = vpkg->selectedRawScan();
+    const bool recordedKnown = std::any_of(sets.scans.begin(), sets.scans.end(),
+                                           [&](const auto& s) { return s.scanKey == recorded; });
+    sets.selectedScanKey = recordedKnown
+        ? recorded
+        : defaultRawScanKey(sets.scans,
+                            scanKeyOfSelected(sets.fiberDatasets, vpkg->selectedFiberInferenceDataset()),
+                            scanKeyOfSelected(sets.lasagnaDatasets, vpkg->selectedLasagnaDataset()),
+                            allKeys);
+    const std::string recordedSurface = vpkg->selectedSurfaceVolume();
+    const bool surfaceOfScan = std::any_of(
+        sets.volumes.begin(), sets.volumes.end(), [&](const auto& v) {
+            return v.id == recordedSurface && v.kind == ProjectVolumeKind::SurfacePrediction &&
+                   v.scanKey == sets.selectedScanKey;
+        });
+    sets.selectedSurfaceVolumeId = surfaceOfScan
+        ? recordedSurface
+        : defaultSurfaceVolumeId(sets.volumes, sets.selectedScanKey).value_or(std::string{});
+    const auto effective = [&](const std::vector<DatasetInfo>& datasets, const std::string& recorded) {
+        for (const auto& dataset : datasets) {
+            if (dataset.location == recorded) {
+                return datasetAppliesToScan(datasetScanMatch(dataset, sets.scans), sets.selectedScanKey)
+                    ? recorded
+                    : std::string{};
+            }
+        }
+        // A recorded location that is not an attached entry is a manual
+        // file pick: there is no scan evidence to reject it on, so it
+        // stands (as it did before the sets existed).
+        return recorded;
+    };
+    sets.selectedLasagnaLocation = effective(sets.lasagnaDatasets, vpkg->selectedLasagnaDataset());
+    sets.selectedFiberLocation = effective(sets.fiberDatasets, vpkg->selectedFiberInferenceDataset());
+    return sets;
+}
+
+std::string LineAnnotationController::effectiveLasagnaDataset() const
+{
+    return datasetSets().selectedLasagnaLocation;
+}
+
+std::string LineAnnotationController::effectiveFiberDataset() const
+{
+    return datasetSets().selectedFiberLocation;
+}
+
+void LineAnnotationController::discardRunningSolveForDatasetChange(LineAnnotationSession& session)
+{
+    if (session.taskState != LineAnnotationSession::TaskState::Running) {
+        return;
+    }
+    // The worker keeps the samplers it captured at launch, so its result
+    // would describe the rejected dataset. Refuse publication through the
+    // epoch, cancel cooperatively, and mark the solve so its landing neither
+    // merges solved spans nor re-dispatches (a new solve would resolve the
+    // datasets afresh, possibly through a picker, from a background event).
+    session.solveQueue.noteSessionMutated();
+    if (session.runningSolveCancel) {
+        session.runningSolveCancel->store(true);
+    }
+    session.runningSolveDatasetRejected = true;
+}
+
+void LineAnnotationController::invalidateSessionLasagnaDatasets()
+{
+    // Alignment metrics in flight were requested against the previous
+    // normal dataset: retire their tokens and generation so neither their
+    // incremental nor their final publication lands (fibers without an open
+    // pane included).
+    if (!_pendingFiberAlignmentMetrics.empty() || _fiberMetricsPending) {
+        const std::vector<uint64_t> cancelled(_pendingFiberAlignmentMetrics.begin(),
+                                              _pendingFiberAlignmentMetrics.end());
+        _pendingFiberAlignmentMetrics.clear();
+        _pendingFiberAlignmentMetricTokens.clear();
+        ++_nextFiberAlignmentMetricToken;
+        ++_fiberMetricsGeneration;
+        _fiberMetricsPending = false;
+        // The rows and generated views were told "sampling"; tell them the
+        // metrics are unavailable instead (published ones are untouched),
+        // without a global summary refresh that would re-request at once.
+        for (const uint64_t fiberId : cancelled) {
+            publishUnavailableFiberAlignmentMetrics(fiberId);
+        }
+    }
+    for (const auto& pane : _panes) {
+        if (!pane.session) {
+            continue;
+        }
+        auto& session = *pane.session;
+        discardRunningSolveForDatasetChange(session);
+        session.dataset.reset();
+        session.normalSampler.reset();
+        session.traceNormalDataset.reset();
+        session.traceNormalSampler.reset();
+        session.selectedDatasetLocation.clear();
+        session.traceNormalDatasetLocation.clear();
+        if (!session.optimizedLine.points.empty() && !session.controlPoints.empty()) {
+            setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+        }
+    }
+}
+
+void LineAnnotationController::invalidateSessionFiberDatasets()
+{
+    for (const auto& pane : _panes) {
+        if (!pane.session) {
+            continue;
+        }
+        auto& session = *pane.session;
+        discardRunningSolveForDatasetChange(session);
+        session.fiberInferenceDataset.reset();
+        session.fiberPredictionField.reset();
+        session.selectedFiberInferenceDatasetLocation.clear();
+        if (!session.optimizedLine.points.empty() && !session.controlPoints.empty()) {
+            setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+        }
+    }
+}
+
+std::optional<std::array<std::size_t, 3>> LineAnnotationController::manifestBaseFrame(
+    const std::string& location) const
+{
+    auto cached = _manifestBaseShapeCache.find(location);
+    if (cached != _manifestBaseShapeCache.end()) {
+        return cached->second;
+    }
+    if (vc::project::isLocationRemote(location)) {
+        // Never fetched here: a stalled server would freeze the window.
+        // prefetchRemoteManifestFrames() fills the cache from a worker.
+        return std::nullopt;
+    }
+    std::optional<std::array<std::size_t, 3>> frame;
+    try {
+        frame = openLasagnaManifestForOverlay(location)->baseShapeZYX;
+    } catch (const std::exception& ex) {
+        // Cached as unknown: a bad manifest is not re-read on every call
+        // (the cache is dropped on content refresh).
+        Logger()->warn("Line annotation: manifest '{}' unreadable: {}", location, ex.what());
+    }
+    _manifestBaseShapeCache.emplace(location, frame);
+    return frame;
+}
+
+void LineAnnotationController::prefetchRemoteManifestFrames(const std::string& overlayLocation)
+{
+    using namespace vc3d::line_annotation;
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg || _tearingDown) {
+        return;
+    }
+    const auto sets = datasetSets();
+    std::vector<std::string> wanted;
+    const auto want = [&](const std::string& location) {
+        if (!vc::project::isLocationRemote(location) || _manifestBaseShapeCache.count(location) ||
+            _manifestFramePrefetching.count(location) ||
+            std::find(wanted.begin(), wanted.end(), location) != wanted.end()) {
+            return;
+        }
+        wanted.push_back(location);
+    };
+    // An enabled overlay may need a tagged dataset or an arbitrary volume
+    // whose manifest is not otherwise needed for frame selection.
+    want(overlayLocation);
+    // Untagged datasets are grouped by their frame.
+    for (const auto* datasets : {&sets.lasagnaDatasets, &sets.fiberDatasets}) {
+        for (const auto& dataset : *datasets) {
+            if (!tagValue(dataset.tags, kOpenDataVolumeIdTagPrefix)) {
+                want(dataset.location);
+            }
+        }
+    }
+    // The active channel's memberships gate its stand-in scan.
+    const std::string activeId = _state->currentVolumeId();
+    const auto activeIt = std::find_if(sets.volumes.begin(), sets.volumes.end(),
+                                       [&](const auto& v) { return v.id == activeId; });
+    if (activeIt != sets.volumes.end() &&
+        (activeIt->kind == ProjectVolumeKind::Lasagna || activeIt->kind == ProjectVolumeKind::Fiber)) {
+        for (const std::string& location : activeIt->manifestLocations) {
+            want(location);
+        }
+    }
+    for (const std::string& location : wanted) {
+        _manifestFramePrefetching.insert(location);
+        // Everything the worker needs is captured by value: it must not
+        // touch the controller or the package.
+        vc::lasagna::LasagnaDatasetOpenOptions options;
+        options.remoteCacheRoot = vc3d::remoteCachePathFs();
+        const std::uint64_t epoch = _manifestPrefetchEpoch;
+        auto* watcher = new QFutureWatcher<std::optional<std::array<std::size_t, 3>>>(this);
+        connect(watcher, &QFutureWatcherBase::finished, this,
+                [this, watcher, location, epoch]() {
+                    watcher->deleteLater();
+                    _manifestFramePrefetching.erase(location);
+                    // The destructor's save-wait loop can deliver this.
+                    if (_tearingDown) {
+                        return;
+                    }
+                    if (epoch != _manifestPrefetchEpoch) {
+                        // Another package, or the cache was dropped while this
+                        // was in flight: the result is stale, and the request
+                        // it displaced was skipped because this location was
+                        // in flight, so ask again for what is wanted now.
+                        prefetchRemoteManifestFrames();
+                        schedulePresenceOverlayRefresh();
+                        return;
+                    }
+                    if (!_state || !_state->vpkg()) {
+                        _manifestBaseShapeCache[location] = watcher->result();
+                        return;
+                    }
+                    // A frame arriving can change three derived things: which
+                    // datasets apply (a selection made while it was pending
+                    // may now resolve to another scan), the derived default
+                    // scan, and so the active channel's frame. Compare each
+                    // before and after, and invalidate exactly what changed;
+                    // the project is never written from here.
+                    const auto before = datasetSets();
+                    const std::string frameBefore = frameVolume().id;
+                    _manifestBaseShapeCache[location] = watcher->result();
+                    const auto after = datasetSets();
+                    if (after.selectedLasagnaLocation != before.selectedLasagnaLocation) {
+                        invalidateSessionLasagnaDatasets();
+                    }
+                    if (after.selectedFiberLocation != before.selectedFiberLocation) {
+                        invalidateSessionFiberDatasets();
+                    }
+                    refreshLineAnnotationDatasetMenus();
+                    if (frameVolume().id != frameBefore ||
+                        after.selectedScanKey != before.selectedScanKey) {
+                        // Rebuild what depends on the frame, exactly as a
+                        // volume switch does.
+                        onActiveVolumeChanged();
+                    }
+                    // Also retry overlays when only the manifest arrived (the
+                    // selected dataset and active frame need not have changed).
+                    schedulePresenceOverlayRefresh();
+                });
+        watcher->setFuture(QtConcurrent::run([location, options]() {
+            std::optional<std::array<std::size_t, 3>> frame;
+            try {
+                frame = vc::lasagna::LasagnaDataset::openLocation(location, options)
+                            .manifest().baseShapeZYX;
+            } catch (const std::exception& ex) {
+                Logger()->warn("Line annotation: remote manifest '{}' unreadable: {}",
+                               location, ex.what());
+            }
+            return frame;
+        }));
+    }
+}
+
+bool LineAnnotationController::recordProjectSelection(
+    const QString& what, const std::function<void()>& apply)
+{
+    try {
+        apply();
+        return true;
+    } catch (const std::exception& ex) {
+        // The setter changed the in-memory selection before the write failed,
+        // so the choice stands for this session. A scan switch records up to
+        // four selections and must run to completion (dataset clearing,
+        // session invalidation, volume switch) before anything modal opens.
+        Logger()->warn("Line annotation: {} could not be recorded in the project file: {}",
+                       what.toStdString(), ex.what());
+        _pendingPersistenceWarnings.push_back(what);
+        _pendingPersistenceReason = QString::fromStdString(ex.what());
+        _pendingPersistenceProjectPath = _state && _state->vpkg() ? _state->vpkg()->path() : fs::path{};
+        if (!_persistenceWarningQueued) {
+            _persistenceWarningQueued = true;
+            QMetaObject::invokeMethod(this, [this]() { flushPersistenceWarnings(); },
+                                      Qt::QueuedConnection);
+        }
+        return false;
+    }
+}
+
+void LineAnnotationController::flushPersistenceWarnings()
+{
+    _persistenceWarningQueued = false;
+    if (_pendingPersistenceWarnings.empty()) {
+        return;
+    }
+    // The warning describes a selection in the project it was made in; if
+    // another project has been opened since (or the controller is being torn
+    // down, when the destructor's save-wait loop can run this), the message
+    // would be about the wrong project: the log already has it.
+    const fs::path currentPath = _state && _state->vpkg() ? _state->vpkg()->path() : fs::path{};
+    if (_tearingDown || currentPath != _pendingPersistenceProjectPath) {
+        _pendingPersistenceWarnings.clear();
+        _pendingPersistenceReason.clear();
+        return;
+    }
+    QStringList items;
+    for (const auto& what : _pendingPersistenceWarnings) {
+        if (!items.contains(what)) {
+            items << what;
+        }
+    }
+    const QString reason = _pendingPersistenceReason;
+    _pendingPersistenceWarnings.clear();
+    _pendingPersistenceReason.clear();
+    showError(tr("%1 appl%2 for this session but could not be recorded in the "
+                 "project file: %3")
+                  .arg(items.join(QStringLiteral(", ")),
+                       items.size() == 1 ? QStringLiteral("ies") : QStringLiteral("y"),
+                       reason),
+              _errorDialogsSuppressed);
+}
+
+std::optional<std::string> LineAnnotationController::soleApplicableFiberDataset(
+    const DatasetSets& sets) const
+{
+    using namespace vc3d::line_annotation;
+    if (sets.fiberDatasets.size() != 1) {
+        return std::nullopt;
+    }
+    const auto& dataset = sets.fiberDatasets.front();
+    if (!datasetAppliesToScan(datasetScanMatch(dataset, sets.scans), sets.selectedScanKey)) {
+        return std::nullopt;
+    }
+    return dataset.location;
+}
+
+void LineAnnotationController::handleSurfaceSelectionChanged(const std::string& volumeId)
+{
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg) {
+        return;
+    }
+    recordProjectSelection(tr("The surface dataset"),
+                           [&]() { vpkg->setSelectedSurfaceVolume(volumeId); });
+    refreshLineAnnotationDatasetMenus();
+}
+
+void LineAnnotationController::pushVolumeSelectorEntries(LineAnnotationDialog* dialog,
+                                                         const DatasetSets& sets) const
+{
+    using namespace vc3d::line_annotation;
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!dialog || !vpkg) {
+        return;
+    }
+    const std::string current = _state->currentVolumeId();
+    const auto options = dialog->advancedVolumeSelector()
+        ? rawVolumeSelectorOptions(sets.volumes)
+        : volumeSelectorOptions(
+              sets.volumes, sets.scans, sets.selectedScanKey,
+              sets.selectedLasagnaLocation, sets.selectedFiberLocation,
+              sets.selectedSurfaceVolumeId, current, currentRawScanLevel(sets));
+    std::vector<LineAnnotationDialog::VolumeSelectorEntry> entries;
+    for (const auto& option : options) {
+        entries.push_back({option.id, option.label, option.tooltip});
+    }
+    dialog->setVolumeSelectorEntries(std::move(entries), current);
+}
+
 void LineAnnotationController::refreshLineAnnotationDatasetMenu(
     LineAnnotationDialog* dialog) const
 {
+    using namespace vc3d::line_annotation;
     if (!dialog || !_state || !_state->vpkg()) {
         return;
     }
     auto vpkg = _state->vpkg();
-    std::vector<std::pair<std::string, std::string>> lasagnaOptions;
-    for (const auto& entry : vpkg->lasagnaDatasetEntries()) {
-        lasagnaOptions.emplace_back(entry.location, datasetEntryMenuLabel(entry));
+    const auto sets = datasetSets();
+
+    std::vector<LineAnnotationDialog::RawScanMenuOption> scanOptions;
+    for (const auto& scan : sets.scans) {
+        std::size_t lasagnaCount = 0;
+        std::size_t fiberCount = 0;
+        for (const auto& dataset : sets.lasagnaDatasets) {
+            lasagnaCount += datasetScanKey(dataset, sets.scans) == scan.scanKey ? 1 : 0;
+        }
+        for (const auto& dataset : sets.fiberDatasets) {
+            fiberCount += datasetScanKey(dataset, sets.scans) == scan.scanKey ? 1 : 0;
+        }
+        const QString tooltip =
+            tr("%1 level(s); %2 Lasagna and %3 fiber dataset(s) published against it")
+                .arg(scan.levels.size()).arg(lasagnaCount).arg(fiberCount);
+        scanOptions.push_back({scan.scanKey, scan.label, tooltip.toStdString()});
     }
-    std::vector<std::pair<std::string, std::string>> fiberOptions;
-    for (const auto& entry : vpkg->fiberInferenceDatasetEntries()) {
-        fiberOptions.emplace_back(entry.location, datasetEntryMenuLabel(entry));
+    std::vector<LineAnnotationDialog::RawScanLevelOption> levelOptions;
+    for (const auto& scan : sets.scans) {
+        if (scan.scanKey != sets.selectedScanKey) {
+            continue;
+        }
+        for (const auto& [level, id] : scan.levels) {
+            levelOptions.push_back({level, rawScanLevelLabel(scan, level)});
+        }
     }
+    dialog->setRawScanOptions(std::move(scanOptions), sets.selectedScanKey,
+                              std::move(levelOptions), currentRawScanLevel(sets));
+
+    const auto menuOptions = [&](const std::vector<vc::project::Entry>& entries,
+                                 const std::vector<DatasetInfo>& datasets) {
+        std::vector<LineAnnotationDialog::DatasetMenuOption> options;
+        for (std::size_t i = 0; i < entries.size() && i < datasets.size(); ++i) {
+            const auto match = datasetScanMatch(datasets[i], sets.scans);
+            LineAnnotationDialog::DatasetMenuOption option;
+            option.location = entries[i].location;
+            option.label = datasetEntryMenuLabel(entries[i]);
+            option.applicable = datasetAppliesToScan(match, sets.selectedScanKey);
+            const QString location = QString::fromStdString(entries[i].location);
+            if (match.kind == DatasetScanMatch::Kind::Pending) {
+                option.tooltip =
+                    tr("%1\nIts manifest is being read; which scan it belongs to is not "
+                       "known yet.")
+                        .arg(location)
+                        .toStdString();
+            } else if (option.applicable) {
+                option.tooltip = entries[i].location;
+            } else if (match.kind == DatasetScanMatch::Kind::Incompatible) {
+                const auto& frame = *datasets[i].baseShapeZYX;
+                option.tooltip =
+                    tr("%1\nIts manifest frame %2 x %3 x %4 (z, y, x) matches none of the "
+                       "project's raw scans.")
+                        .arg(location)
+                        .arg(frame[0]).arg(frame[1]).arg(frame[2])
+                        .toStdString();
+            } else {
+                QStringList keys;
+                for (const auto& key : match.scanKeys) {
+                    keys << QString::fromStdString(key);
+                }
+                option.tooltip =
+                    tr("%1\nPublished against scan %2, not the selected raw scan.")
+                        .arg(location, keys.join(QStringLiteral(" / ")))
+                        .toStdString();
+            }
+            options.push_back(std::move(option));
+        }
+        return options;
+    };
     dialog->setLasagnaDatasetOptions(
-        std::move(lasagnaOptions),
-        vpkg->selectedLasagnaDataset());
+        menuOptions(vpkg->lasagnaDatasetEntries(), sets.lasagnaDatasets),
+        sets.selectedLasagnaLocation);
     dialog->setFiberInferenceDatasetOptions(
-        std::move(fiberOptions),
-        vpkg->selectedFiberInferenceDataset());
+        menuOptions(vpkg->fiberInferenceDatasetEntries(), sets.fiberDatasets),
+        sets.selectedFiberLocation);
+
+    // Surface dataset submenu: every surface prediction, greyed when it
+    // belongs to another scan.
+    std::vector<LineAnnotationDialog::DatasetMenuOption> surfaceOptions;
+    for (const auto& v : sets.volumes) {
+        if (v.kind != ProjectVolumeKind::SurfacePrediction) {
+            continue;
+        }
+        LineAnnotationDialog::DatasetMenuOption option;
+        option.location = v.id;
+        option.label = surfaceMenuLabel(v);
+        option.applicable = v.scanKey == sets.selectedScanKey;
+        option.tooltip = option.applicable
+            ? (v.name.empty() ? v.id : v.name + " (" + v.id + ")")
+            : tr("%1\nPublished against scan %2, not the selected raw scan.")
+                  .arg(QString::fromStdString(v.name.empty() ? v.id : v.name),
+                       QString::fromStdString(v.scanKey))
+                  .toStdString();
+        surfaceOptions.push_back(std::move(option));
+    }
+    dialog->setSurfaceOptions(std::move(surfaceOptions), sets.selectedSurfaceVolumeId);
+
+    pushVolumeSelectorEntries(dialog, sets);
+
+    // Advanced pane-overlay list: every attached volume by raw name, the same
+    // list the advanced selector shows; the fit is decided per grid.
+    std::vector<std::pair<std::string, QString>> volumeOptions;
+    for (const auto& option : rawVolumeSelectorOptions(sets.volumes)) {
+        volumeOptions.emplace_back(option.id, QString::fromStdString(option.label));
+    }
+    dialog->setPresenceOverlayVolumeOptions(std::move(volumeOptions));
+}
+
+void LineAnnotationController::handleRawScanSelectionChanged(const std::string& scanKey)
+{
+    using namespace vc3d::line_annotation;
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg || scanKey.empty()) {
+        return;
+    }
+    if (vpkg->selectedRawScan() == scanKey) {
+        refreshLineAnnotationDatasetMenus();
+        return;
+    }
+    for (const auto& pane : _panes) {
+        if (pane.session &&
+            pane.session->taskState == LineAnnotationSession::TaskState::Running) {
+            showError(tr("Line optimization is already running."),
+                      pane.session->suppressErrorDialogs);
+            refreshLineAnnotationDatasetMenus();
+            return;
+        }
+    }
+    recordProjectSelection(tr("The raw scan"), [&]() { vpkg->setSelectedRawScan(scanKey); });
+    const auto sets = datasetSets();
+    const auto scanIt = std::find_if(sets.scans.begin(), sets.scans.end(),
+                                     [&](const auto& s) { return s.scanKey == scanKey; });
+    if (scanIt == sets.scans.end()) {
+        Logger()->warn("Line annotation: raw scan '{}' is not in the project", scanKey);
+        refreshLineAnnotationDatasetMenus();
+        return;
+    }
+    // Datasets of another scan cannot drive this one: switch each role to the
+    // newest dataset published against the new scan, or to none.
+    const auto lasagna = newestDatasetForScan(sets.lasagnaDatasets, sets.scans, scanKey);
+    handleLasagnaDatasetSelectionChanged(lasagna.value_or(std::string{}));
+    const auto fiber = newestDatasetForScan(sets.fiberDatasets, sets.scans, scanKey);
+    handleFiberInferenceDatasetSelectionChanged(fiber.value_or(std::string{}));
+    recordProjectSelection(tr("The surface dataset"), [&]() {
+        vpkg->setSelectedSurfaceVolume(
+            defaultSurfaceVolumeId(sets.volumes, scanKey).value_or(std::string{}));
+    });
+    Logger()->info("Line annotation: raw scan {} selected; Lasagna dataset '{}', fiber dataset '{}'",
+                   scanKey, lasagna.value_or("none"), fiber.value_or("none"));
+    // The panes are built on the active volume: move it onto the new scan at
+    // the level currently in use when the scan has it, else its finest level.
+    const std::string current = _state->currentVolumeId();
+    const std::string target = scanVolumeIdAtLevel(*scanIt, currentRawScanLevel(sets));
+    if (!target.empty() && target != current && _volumeSwitchHandler) {
+        _volumeSwitchHandler(target);
+    }
+    refreshLineAnnotationDatasetMenus();
+}
+
+int LineAnnotationController::currentRawScanLevel(const DatasetSets& sets) const
+{
+    using namespace vc3d::line_annotation;
+    if (!_state) {
+        return _lastRawScanLevel;
+    }
+    if (const auto level = rawScanLevelOfVolume(sets.volumes, _state->currentVolumeId())) {
+        return *level;
+    }
+    return _lastRawScanLevel;
+}
+
+void LineAnnotationController::handleRawScanLevelSelectionChanged(int level)
+{
+    using namespace vc3d::line_annotation;
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg) {
+        return;
+    }
+    const auto sets = datasetSets();
+    const auto scanIt = std::find_if(sets.scans.begin(), sets.scans.end(),
+                                     [&](const auto& s) { return s.scanKey == sets.selectedScanKey; });
+    if (scanIt == sets.scans.end()) {
+        return;
+    }
+    const std::string target = scanVolumeIdAtLevel(*scanIt, level);
+    _lastRawScanLevel = level;
+    if (!target.empty() && target != _state->currentVolumeId() && _volumeSwitchHandler) {
+        _volumeSwitchHandler(target);
+    }
+    refreshLineAnnotationDatasetMenus();
 }
 
 void LineAnnotationController::handleLasagnaDatasetSelectionChanged(
     const std::string& location)
 {
-    if (!_state || !_state->vpkg() || location.empty()) {
+    if (!_state || !_state->vpkg()) {
         return;
     }
     for (const auto& pane : _panes) {
@@ -10121,29 +10824,16 @@ void LineAnnotationController::handleLasagnaDatasetSelectionChanged(
     if (vpkg->selectedLasagnaDataset() == location) {
         return;
     }
-    vpkg->setSelectedLasagnaDataset(location);
-    for (const auto& pane : _panes) {
-        if (!pane.session) {
-            continue;
-        }
-        auto& session = *pane.session;
-        session.dataset.reset();
-        session.normalSampler.reset();
-        session.traceNormalDataset.reset();
-        session.traceNormalSampler.reset();
-        session.selectedDatasetLocation.clear();
-        session.traceNormalDatasetLocation.clear();
-        if (!session.optimizedLine.points.empty() && !session.controlPoints.empty()) {
-            setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
-        }
-    }
+    recordProjectSelection(tr("The Lasagna dataset"),
+                           [&]() { vpkg->setSelectedLasagnaDataset(location); });
+    invalidateSessionLasagnaDatasets();
     refreshLineAnnotationDatasetMenus();
 }
 
 void LineAnnotationController::handleFiberInferenceDatasetSelectionChanged(
     const std::string& location)
 {
-    if (!_state || !_state->vpkg() || location.empty()) {
+    if (!_state || !_state->vpkg()) {
         return;
     }
     for (const auto& pane : _panes) {
@@ -10158,23 +10848,388 @@ void LineAnnotationController::handleFiberInferenceDatasetSelectionChanged(
 
     auto vpkg = _state->vpkg();
     if (vpkg->selectedFiberInferenceDataset() == location) {
+        // Re-picking the current dataset is the user's way to retry an overlay
+        // that could not resolve earlier (e.g. before the dataset was attached).
+        refreshPresenceOverlays();
         return;
     }
-    vpkg->setSelectedFiberInferenceDataset(location);
-    for (const auto& pane : _panes) {
-        if (!pane.session) {
-            continue;
+    recordProjectSelection(tr("The fiber dataset"),
+                           [&]() { vpkg->setSelectedFiberInferenceDataset(location); });
+    invalidateSessionFiberDatasets();
+    refreshLineAnnotationDatasetMenus();
+    // The overlay follows the dataset menu: a different model, or one without
+    // a presence group (which clears the panes with the reason shown).
+    refreshPresenceOverlays();
+}
+
+namespace
+{
+
+// A volume's level-0 frame as the size_t triple the dyadic matcher takes.
+std::array<std::size_t, 3> volumeFrameShapeZYX(const Volume& volume)
+{
+    const auto shape = volume.shape();
+    return {static_cast<std::size_t>(std::max(0, shape[0])),
+            static_cast<std::size_t>(std::max(0, shape[1])),
+            static_cast<std::size_t>(std::max(0, shape[2]))};
+}
+
+// The stored pyramid levels of a volume with their storage chunk shapes, as
+// the frame-consistency check takes them. Throws when a level is unreadable.
+std::vector<vc3d::line_annotation::StoredPyramidLevel> storedPyramidLevels(const Volume& volume)
+{
+    std::vector<vc3d::line_annotation::StoredPyramidLevel> storedLevels;
+    for (const int level : volume.presentScaleLevels()) {
+        storedLevels.push_back({level, volume.shape(level), volume.storageChunkShape(level)});
+    }
+    return storedLevels;
+}
+
+}  // namespace
+
+LineAnnotationController::PresenceOverlaySource
+LineAnnotationController::resolvePresenceOverlaySource()
+{
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg) {
+        throw std::runtime_error(tr("no project is open").toStdString());
+    }
+    if (!frameVolume().volume) {
+        throw std::runtime_error(tr("no active volume").toStdString());
+    }
+
+    const auto sets = datasetSets();
+    std::string selected = sets.selectedFiberLocation;
+    const auto fiberEntries = vpkg->fiberInferenceDatasetEntries();
+    if (selected.empty()) {
+        // A lone dataset needs no pick, unless it belongs to another scan: a
+        // selection cleared by a scan switch stays cleared.
+        selected = soleApplicableFiberDataset(sets).value_or(std::string{});
+    }
+    if (selected.empty()) {
+        throw std::runtime_error(
+            tr("no fiber dataset is selected (menu > Fiber dataset)").toStdString());
+    }
+    // The presence volume was tagged with the location the dataset was
+    // attached under; a catalogue entry may also be known by its public URL.
+    std::vector<std::string> manifestCandidates{selected};
+    QString label = QString::fromStdString(fs::path(selected).stem().string());
+    const auto entryIt = std::find_if(
+        fiberEntries.begin(), fiberEntries.end(),
+        [&](const auto& entry) { return entry.location == selected; });
+    if (entryIt != fiberEntries.end()) {
+        const std::string identity = vc3d::opendata::lasagnaSourceManifestLocation(*entryIt);
+        if (!identity.empty() && identity != selected) {
+            manifestCandidates.push_back(identity);
         }
-        auto& session = *pane.session;
-        session.fiberInferenceDataset.reset();
-        session.fiberPredictionField.reset();
-        session.selectedFiberInferenceDatasetLocation.clear();
-        if (!session.optimizedLine.points.empty() && !session.controlPoints.empty()) {
-            setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+        label = QString::fromStdString(datasetEntryMenuLabel(*entryIt));
+    }
+
+    // The manifest names the presence group.
+    std::string presenceGroup;
+    // The manifest's base grid is the exact scroll frame the model was run on.
+    // The presence pyramid itself only implies it: its stored level times 2^k
+    // reverses a ceiling division (2602 x 8 = 20816 for a 20812 scroll), which
+    // the dyadic matcher rightly refuses.
+    std::optional<std::array<std::size_t, 3>> baseShapeZYX;
+    const auto readManifest = [&](const vc::lasagna::LasagnaDatasetManifest& manifest) {
+        if (const auto* group = manifest.groupForChannel("presence")) {
+            presenceGroup = group->name;
+        }
+        baseShapeZYX = manifest.baseShapeZYX;
+    };
+    // Always re-parsed from the (cached) manifest file rather than reused from
+    // the session's open dataset: a re-attach of the same location may have
+    // rewritten the file (a presence group added, a frame corrected), and the
+    // session keeps its old manifest until its next solve.
+    prefetchRemoteManifestFrames(selected);
+    const auto manifest = openLasagnaManifestForOverlay(selected);
+    if (!manifest) {
+        return {nullptr, 0, tr("Loading fiber manifest...")};
+    }
+    readManifest(*manifest);
+    if (presenceGroup.empty()) {
+        throw std::runtime_error(
+            tr("%1 has no presence channel").arg(label).toStdString());
+    }
+
+    std::vector<vc3d::line_annotation::TaggedVolumeId> volumes;
+    for (const auto& id : vpkg->volumeIDs()) {
+        volumes.push_back({id, vpkg->volumeTags(id)});
+    }
+    const auto volumeId = vc3d::line_annotation::findLasagnaGroupVolumeId(
+        volumes, manifestCandidates, presenceGroup);
+    if (!volumeId) {
+        throw std::runtime_error(
+            tr("the presence volume of %1 is not attached to this project "
+               "(re-attach the fiber dataset)").arg(label).toStdString());
+    }
+    auto presence = vpkg->volume(*volumeId);
+    if (!presence) {
+        throw std::runtime_error(
+            tr("the presence volume of %1 could not be opened").arg(label).toStdString());
+    }
+
+    // The presence pyramid's level-0 frame is the fiber manifest's base grid.
+    return fitOverlayVolumeToActiveGrid(presence, *volumeId, baseShapeZYX, label);
+}
+
+LineAnnotationController::PresenceOverlaySource
+LineAnnotationController::resolveVolumeOverlaySource(const std::string& volumeId)
+{
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg) {
+        throw std::runtime_error(tr("no project is open").toStdString());
+    }
+    if (volumeId.empty()) {
+        throw std::runtime_error(tr("no volume chosen (advanced mode)").toStdString());
+    }
+    auto volume = vpkg->volume(volumeId);
+    if (!volume) {
+        throw std::runtime_error(
+            tr("volume %1 is not attached to this project")
+                .arg(QString::fromStdString(volumeId)).toStdString());
+    }
+    const QString label = QStringLiteral("%1 (%2)")
+        .arg(QString::fromStdString(volume->name()), QString::fromStdString(volumeId));
+    // A Lasagna-attached volume (presence, nx, ny, grad_mag...) was published
+    // against its manifest's base grid; read that exact frame the same way the
+    // simple mode does. Other volumes fit by their stored level alone.
+    std::optional<std::array<std::size_t, 3>> exactFrame;
+    for (const auto& tag : vpkg->volumeTags(volumeId)) {
+        constexpr std::string_view prefix = vc3d::line_annotation::kLasagnaManifestTagPrefix;
+        if (tag.rfind(prefix, 0) == 0) {
+            try {
+                const std::string location = tag.substr(prefix.size());
+                prefetchRemoteManifestFrames(location);
+                const auto manifest = openLasagnaManifestForOverlay(location);
+                if (!manifest) {
+                    // Do not fit without the binding manifest frame while its
+                    // download is pending.
+                    return {nullptr, 0, tr("Loading overlay manifest...")};
+                }
+                exactFrame = manifest->baseShapeZYX;
+            } catch (const std::exception& ex) {
+                Logger()->warn("Presence overlay: manifest of volume '{}' unreadable: {}",
+                               volumeId, ex.what());
+            }
+            break;
         }
     }
-    refreshLineAnnotationDatasetMenus();
+    return fitOverlayVolumeToActiveGrid(volume, volumeId, exactFrame, label);
 }
+
+std::optional<vc::lasagna::LasagnaDatasetManifest>
+LineAnnotationController::openLasagnaManifestForOverlay(const std::string& location) const
+{
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    return vc3d::line_annotation::readOverlayManifest(
+        location, vpkg ? vpkg->path().parent_path() : fs::path{},
+        vc3d::remoteCachePathFs(), _manifestBaseShapeCache.count(location) != 0);
+}
+
+LineAnnotationController::PresenceOverlaySource
+LineAnnotationController::fitOverlayVolumeToActiveGrid(
+    const std::shared_ptr<Volume>& volume,
+    const std::string& volumeId,
+    const std::optional<std::array<std::size_t, 3>>& exactFrameZYX,
+    const QString& label)
+{
+    // The panes sample the active volume, but a channel shown there is in the
+    // scan's level-0 frame, so the fit is against the frame volume.
+    const auto active = _state ? frameVolume().volume : nullptr;
+    if (!active) {
+        throw std::runtime_error(tr("no active volume").toStdString());
+    }
+    const auto activeShape = active->shape();
+    const std::array<std::size_t, 3> activeZYX{
+        static_cast<std::size_t>(std::max(0, activeShape[0])),
+        static_cast<std::size_t>(std::max(0, activeShape[1])),
+        static_cast<std::size_t>(std::max(0, activeShape[2]))};
+
+    int rebaseLevel = 0;
+    if (volume != active) {
+        // Two independent readings of how the volume sits on the active grid.
+        // (a) Its finest stored level must fit some level of a view whose
+        //     level 0 is the active grid; this is what the pixels are.
+        // (b) The exact frame it was published against, when known, gives the
+        //     dyadic scale directly.
+        // (a) alone is enough for a normal pyramid; (b) disambiguates tiny
+        // shapes; and when both exist they must agree, otherwise the volume is
+        // not what its manifest says (a single stored level attached as level
+        // 0, for instance) and drawing it would put presence on the wrong
+        // voxels.
+        std::vector<vc3d::line_annotation::StoredPyramidLevel> storedLevels;
+        try {
+            storedLevels = storedPyramidLevels(*volume);
+        } catch (const std::exception& ex) {
+            throw std::runtime_error(
+                tr("%1 has no readable pyramid level: %2")
+                    .arg(label, QString::fromUtf8(ex.what())).toStdString());
+        }
+        if (exactFrameZYX) {
+            // A known frame is binding. The dyadic matcher gives the rebase
+            // level and tolerates the one-voxel count/inclusive-maximum
+            // difference between frame conventions; the stored levels must then
+            // be that frame's pyramid at their own indices (a single level
+            // attached as level 0 is not). Falling back to the stored-level fit
+            // alone would accept a volume whose manifest says it belongs
+            // elsewhere.
+            std::optional<int> fromFrame;
+            std::string frameProblem;
+            try {
+                const double scale = vc3d::line_annotation::resolveFiberBaseToVolumeScale(
+                    exactFrameZYX, activeShape);
+                fromFrame = vc3d::line_annotation::presenceRebaseLevel(scale);
+                if (!fromFrame) {
+                    frameProblem = tr("the active volume is finer than the frame "
+                                      "(scale %1)").arg(scale).toStdString();
+                }
+            } catch (const std::exception& ex) {
+                frameProblem = ex.what();
+            }
+            if (!fromFrame) {
+                throw std::runtime_error(
+                    tr("%1 was published against a grid that does not match the "
+                       "active volume: %2")
+                        .arg(label, QString::fromStdString(frameProblem)).toStdString());
+            }
+            if (!vc3d::line_annotation::storedLevelsConsistentWithFrame(
+                    *exactFrameZYX, storedLevels)) {
+                throw std::runtime_error(
+                    tr("%1's stored levels are not the pyramid of the frame its "
+                       "manifest records (a single level attached as level 0?); "
+                       "re-attach the dataset")
+                        .arg(label).toStdString());
+            }
+            rebaseLevel = *fromFrame;
+        } else {
+            // No recorded frame: the stored levels themselves must fit the
+            // active grid at exactly one rebase level.
+            const auto fits =
+                vc3d::line_annotation::rebaseLevelsFittingPyramid(activeZYX, storedLevels);
+            if (fits.empty()) {
+                throw std::runtime_error(
+                    tr("%1's stored levels do not fit the active volume at any "
+                       "pyramid level (different scroll, a finer active volume, or a "
+                       "single level attached as level 0)")
+                        .arg(label).toStdString());
+            }
+            if (fits.size() != 1) {
+                throw std::runtime_error(
+                    tr("%1 fits the active volume at several pyramid levels and "
+                       "records no frame to decide")
+                        .arg(label).toStdString());
+            }
+            rebaseLevel = fits.front();
+        }
+    }
+
+    PresenceOverlaySource source;
+    source.volume = volume;
+    source.description = label;
+    if (rebaseLevel > 0) {
+        // Keyed by id and level, but a package reload can replace the Volume
+        // behind an id: a view is only reused for the source it was built on.
+        const std::string key = volumeId + "#" + std::to_string(rebaseLevel);
+        auto cached = _rebasedPresenceVolumes.find(key);
+        if (cached == _rebasedPresenceVolumes.end() || cached->second.source != volume) {
+            RebasedPresenceView entry;
+            entry.source = volume;
+            entry.view = Volume::NewRebasedView(volume, rebaseLevel);
+            cached = _rebasedPresenceVolumes.insert_or_assign(key, std::move(entry)).first;
+        }
+        source.volume = cached->second.view;
+        source.description += tr(" (rebased %1 level(s))").arg(rebaseLevel);
+    }
+    // Exports may start at a coarse level; asking the renderer for finer
+    // levels would wait on chunks that do not exist.
+    source.maxDisplayedResolution = source.volume->firstPresentScaleLevel();
+    return source;
+}
+
+void LineAnnotationController::refreshPresenceOverlay(const PaneRecord& pane)
+{
+    if (!pane.dialog || !pane.dialog->presenceOverlayEnabled()) {
+        return;
+    }
+    try {
+        auto source = pane.dialog->presenceOverlayAdvanced()
+            ? resolveVolumeOverlaySource(pane.dialog->presenceOverlayVolumeId())
+            : resolvePresenceOverlaySource();
+        pane.dialog->setPresenceOverlaySource(
+            std::move(source.volume), source.maxDisplayedResolution, source.description);
+    } catch (const std::exception& ex) {
+        // Not a modal error: the flyout header carries the reason, and the
+        // overlay simply stays empty until the cause is fixed.
+        Logger()->warn("Line annotation presence overlay unavailable: {}", ex.what());
+        pane.dialog->setPresenceOverlaySource(nullptr, 0, QString::fromUtf8(ex.what()));
+    }
+}
+
+void LineAnnotationController::refreshPresenceOverlays()
+{
+    // Snapshot: a dialog's setter re-enters nothing here today, but the
+    // pattern elsewhere in this controller is to never iterate _panes live.
+    std::vector<QPointer<LineAnnotationDialog>> dialogs;
+    std::vector<std::shared_ptr<LineAnnotationSession>> sessions;
+    for (const auto& pane : _panes) {
+        dialogs.push_back(pane.dialog);
+        sessions.push_back(pane.session);
+    }
+    for (std::size_t i = 0; i < dialogs.size(); ++i) {
+        if (!dialogs[i]) {
+            continue;
+        }
+        PaneRecord snapshot;
+        snapshot.dialog = dialogs[i];
+        snapshot.session = sessions[i];
+        refreshPresenceOverlay(snapshot);
+    }
+}
+
+void LineAnnotationController::onPackageContentsRefreshed()
+{
+    if (!_state || !_state->vpkg()) {
+        return;
+    }
+    // A dataset may have been re-attached under a location seen before.
+    _manifestBaseShapeCache.clear();
+    ++_manifestPrefetchEpoch;
+    refreshLineAnnotationDatasetMenus();
+    prefetchRemoteManifestFrames();
+    refreshPresenceOverlays();
+}
+
+void LineAnnotationController::clearPresenceOverlaysForRefit()
+{
+    std::vector<QPointer<LineAnnotationDialog>> dialogs;
+    for (const auto& pane : _panes) {
+        dialogs.push_back(pane.dialog);
+    }
+    for (const auto& dialog : dialogs) {
+        if (dialog && dialog->presenceOverlayEnabled()) {
+            dialog->setPresenceOverlaySource(
+                nullptr, 0, tr("re-fitting to the active volume..."));
+        }
+    }
+}
+
+void LineAnnotationController::schedulePresenceOverlayRefresh()
+{
+    if (_presenceOverlayRefreshQueued) {
+        return;
+    }
+    _presenceOverlayRefreshQueued = true;
+    QMetaObject::invokeMethod(
+        this,
+        [this]() {
+            _presenceOverlayRefreshQueued = false;
+            refreshPresenceOverlays();
+        },
+        Qt::QueuedConnection);
+}
+
 
 bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
     LineAnnotationSession& session)
@@ -10186,11 +11241,17 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
     }
 
     auto vpkg = _state->vpkg();
-    std::string selected = vpkg->selectedFiberInferenceDataset();
+    std::string selected = effectiveFiberDataset();
     const auto fiberEntries = vpkg->fiberInferenceDatasetEntries();
-    if (selected.empty() && fiberEntries.size() == 1) {
-        selected = fiberEntries.front().location;
-        vpkg->setSelectedFiberInferenceDataset(selected);
+    if (selected.empty()) {
+        // As in resolvePresenceOverlaySource(): the lone dataset only when it
+        // applies to the selected scan.
+        if (const auto sole = soleApplicableFiberDataset(datasetSets())) {
+            selected = *sole;
+            recordProjectSelection(tr("The fiber dataset"), [&]() {
+                vpkg->setSelectedFiberInferenceDataset(selected);
+            });
+        }
     }
     std::string selectedIdentity = selected;
     const auto selectedEntry = std::find_if(
@@ -10251,7 +11312,14 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
                 return false;
             }
             manifestPath = openedDataset.manifest().manifestPath;
+            // Attached here rather than through the main window's package
+            // refresh: the manifest may replace one cached under this location.
+            _manifestBaseShapeCache.clear();
+            ++_manifestPrefetchEpoch;
             refreshLineAnnotationDatasetMenus();
+            prefetchRemoteManifestFrames();
+            // The dataset the overlay was waiting for just arrived.
+            refreshPresenceOverlays();
         } catch (const std::exception& error) {
             showError(QString::fromUtf8(error.what()), headless);
             return false;
@@ -11664,8 +12732,8 @@ LineAnnotationController::makeFiberModeOptimizationRequest(
     request.globalGoalsOnly = globalGoalsOnly;
     request.traceConfig.traceToBaseScale = session.fiberTraceToBaseScale;
     try {
-        if (_state && _state->currentVolume()) {
-            const double voxelSizeUm = _state->currentVolume()->voxelSize();
+        if (const auto frame = _state ? frameVolume().volume : nullptr) {
+            const double voxelSizeUm = frame->voxelSize();
             if (voxelSizeUm > 0.0 && std::isfinite(voxelSizeUm)) {
                 request.traceConfig.baseVoxelSizeUm = voxelSizeUm;
             }
@@ -12007,7 +13075,9 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         const bool hadEditsDuringSolve =
             session.runningSolveControlMap.has_value() &&
             !session.runningSolveEditedSpans.empty();
-        const bool mergeAttempted = task.ok &&
+        const bool datasetRejected = session.runningSolveDatasetRejected;
+        session.runningSolveDatasetRejected = false;
+        const bool mergeAttempted = task.ok && !datasetRejected &&
             session.runningSolveControlMap.has_value() &&
             !session.optimizedLine.points.empty() &&
             !session.controlPoints.empty();
@@ -12130,9 +13200,28 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         session.runningSolveDirtySegments.clear();
         session.nativeSeedTracePending = false;
         if (!mergePublished) {
-            session.taskState = LineAnnotationSession::TaskState::Idle;
+            // A solve discarded because its dataset was rejected is not
+            // re-dispatched (below), so the session must stay eligible for
+            // save-on-exit and pane-close saving, which finalize Succeeded
+            // sessions with geometry: the provisional edits are the geometry
+            // worth keeping, marked unoptimized by the invalidation.
+            const bool keepsGeometry = datasetRejected &&
+                !session.optimizedLine.points.empty() && !session.controlPoints.empty();
+            session.taskState = keepsGeometry ? LineAnnotationSession::TaskState::Succeeded
+                                              : LineAnnotationSession::TaskState::Idle;
         }
         auto pending = session.solveQueue.finishSolve();
+        if (datasetRejected) {
+            // The datasets have to be resolved anew (a menu pick, or the
+            // picker) before any solve can run: keep the spans queued for
+            // the next explicit or automatic pass rather than launching one
+            // from a background completion.
+            Logger()->info("Line annotation solve discarded: its dataset was rejected while it ran");
+            if (pending.requested) {
+                session.solveQueue.addPending(pending.dirtySegments, pending.fullLine);
+            }
+            pending = vc3d::line_annotation::OptimizationCoalescingQueue::PendingSolve{};
+        }
         const bool autoReoptimize = !pane->dialog ||
             pane->dialog->reoptimizationMode() ==
                 LineAnnotationDialog::ReoptimizationMode::AutoReoptimize;
@@ -12486,7 +13575,7 @@ QString LineAnnotationController::umbilicusCacheToken() const
     // orientation input of its own: editing it in place changes where a
     // legacy-read umbilicus lands while every candidate file stays untouched.
     try {
-        if (const auto volume = _state->currentVolume();
+        if (const auto volume = frameVolume().volume;
             volume && volume->baseScaleLevel() == 0) {
             fs::path transform = volume->path() / "transform.json";
             if (!fs::exists(transform)) {
@@ -12529,6 +13618,18 @@ void LineAnnotationController::onActiveVolumeChanged()
     // through its own frame comparison.
     ++_orientationEpoch;
     scheduleStaleViewRefresh();
+    // A downsample-level switch changes which rebased presence view the panes
+    // need, and every render job must pair a base volume with the view fitted
+    // to it. This slot runs inside the volumeChanged emission, before the
+    // panes' OnVolumeChanged (the controller connected in its constructor,
+    // the panes connect at creation), so the panes still hold the old base:
+    // installing the new view now would render old base + new view, and
+    // deferring everything would render new base + old view. Hence two steps:
+    // clear the overlay synchronously (old base, no overlay; then new base,
+    // no overlay), and install the re-fitted view on the next event-loop turn,
+    // once every pane has adopted the new base.
+    clearPresenceOverlaysForRefit();
+    schedulePresenceOverlayRefresh();
 }
 
 void LineAnnotationController::scheduleStaleViewRefresh()
@@ -12537,10 +13638,9 @@ void LineAnnotationController::scheduleStaleViewRefresh()
         return;
     }
     _staleViewRefreshQueued = true;
-    // Next event-loop turn: CState emits volumeChanged from inside
-    // ViewerManager::switchVolume(), before it restores focus and navigation,
-    // and materialization reads pane camera state. Deferring also collapses
-    // rapid switching into one rebuild.
+    // Coalesce attachment/metadata changes and direct CState updates.
+    // ViewerManager's switch path flushes stale geometry synchronously before
+    // restoring navigation; this queued pass then has nothing left to rebuild.
     QMetaObject::invokeMethod(
         this,
         [this]() {
@@ -12635,13 +13735,150 @@ void LineAnnotationController::publishUmbilicusNotice()
     }
 }
 
+LineAnnotationController::FrameVolume LineAnnotationController::frameVolume() const
+{
+    using namespace vc3d::line_annotation;
+    FrameVolume result;
+    if (!_state) {
+        return result;
+    }
+    std::shared_ptr<Volume> current;
+    try {
+        current = _state->currentVolume();
+    } catch (...) {
+        current.reset();
+    }
+    result.volume = current;
+    result.id = _state->currentVolumeId();
+    auto vpkg = _state->vpkg();
+    if (!vpkg || !current) {
+        return result;
+    }
+    // One resolver for the effective scan: the same sets the menus show.
+    const auto sets = datasetSets();
+    const auto currentIt = std::find_if(sets.volumes.begin(), sets.volumes.end(),
+                                        [&](const auto& v) { return v.id == result.id; });
+    if (currentIt == sets.volumes.end()) {
+        return result;
+    }
+    const ClassifiedVolume& active = *currentIt;
+    if (active.kind != ProjectVolumeKind::Lasagna && active.kind != ProjectVolumeKind::Fiber) {
+        // A raw scan, a surface prediction (published at a scan level it is
+        // tagged with) or an unclassified volume is its own frame.
+        return result;
+    }
+    // A channel: its dataset must be placed under the selected scan, and the
+    // scan must be attached at the very level the channel is opened at (a
+    // coarser twin has other coordinates than the channel the panes sample).
+    if (active.scanKey.empty() || active.scanKey != sets.selectedScanKey) {
+        return result;
+    }
+    const auto scanIt = std::find_if(sets.scans.begin(), sets.scans.end(),
+                                     [&](const auto& s) { return s.scanKey == active.scanKey; });
+    if (scanIt == sets.scans.end()) {
+        return result;
+    }
+    const std::string scanId = scanVolumeIdAtExactLevel(*scanIt, active.level);
+    auto scanVolume = scanId.empty() ? nullptr : vpkg->volume(scanId);
+    if (!scanVolume) {
+        return result;
+    }
+    // The channel's stored levels must be the pyramid of the frame it was
+    // published against: each stored extent is that frame's ceiling-divided
+    // count at its level, padded by less than one storage chunk (a /3 stored
+    // as 2624 = 41 x 64 rows for a 20812 scan, say). The manifest base frame
+    // is that frame where known; it may record the scan's extent as an
+    // inclusive maximum (20811 for 20812), which the dataset placement
+    // already tolerates and this check must not undo. Anything else is not
+    // the channel the dataset placement says it is.
+    // A channel shared by two manifests may know two frames that differ by
+    // the recording convention: any one that validates establishes it. The
+    // fiber's base frame is the manifest's, so a tagged dataset's manifest
+    // (not read while grouping) is read now, for this channel only: a local
+    // file directly, a remote one only from the cache, which
+    // prefetchRemoteManifestFrames() fills off the GUI thread when the
+    // channel becomes active (a stalled server must not freeze the window).
+    // Until then the manifest counts as unreadable.
+    auto lasagnaDatasets = sets.lasagnaDatasets;
+    auto fiberDatasets = sets.fiberDatasets;
+    for (auto* datasets : {&lasagnaDatasets, &fiberDatasets}) {
+        for (auto& dataset : *datasets) {
+            if (!dataset.baseShapeZYX && volumeBelongsToDataset(active, dataset.location)) {
+                dataset.baseShapeZYX = manifestBaseFrame(dataset.location);
+            }
+        }
+    }
+    std::vector<std::optional<std::array<std::size_t, 3>>> frameCandidates;
+    for (const auto& frame : channelManifestFrameCandidates(
+             active, lasagnaDatasets, fiberDatasets, sets.scans, active.scanKey)) {
+        frameCandidates.emplace_back(frame);
+    }
+    if (frameCandidates.empty()) {
+        frameCandidates.emplace_back(std::nullopt);
+    }
+    bool consistent = false;
+    try {
+        const auto scanFrame = volumeFrameShapeZYX(*scanVolume);
+        const auto storedLevels = storedPyramidLevels(*current);
+        // The fiber's base frame is the manifest's, so the scan twin is only
+        // a usable frame if the same resolver that later maps the fiber onto
+        // it (resolveFiberBaseToVolumeScale, exact ceiling/floor at a
+        // non-zero level) identifies the opened level between the two; a
+        // pair that only agrees within one voxel after ceiling division
+        // (20812 -> 10406 against a 10407 twin) would pass the pyramid
+        // check and then fail every consumer.
+        const double expectedScale = std::ldexp(1.0, -active.level);
+        const auto fiberMapsOntoTwin = [&](const std::array<std::size_t, 3>& manifestBase) {
+            try {
+                const double scale = vc3d::line_annotation::resolveFiberBaseToVolumeScale(
+                    manifestBase, scanVolume->shape());
+                return std::abs(scale - expectedScale) <= 1e-12;
+            } catch (const std::exception&) {
+                return false;
+            }
+        };
+        consistent = std::any_of(
+            frameCandidates.begin(), frameCandidates.end(), [&](const auto& candidate) {
+                if (candidate && !fiberMapsOntoTwin(*candidate)) {
+                    return false;
+                }
+                return channelPyramidMatchesScan(scanFrame, candidate, active.level, storedLevels);
+            });
+    } catch (const std::exception& ex) {
+        Logger()->warn("Line annotation: channel '{}' has no readable pyramid level: {}",
+                       active.id, ex.what());
+    }
+    if (!consistent) {
+        Logger()->warn("Line annotation: channel '{}' is not the pyramid of scan '{}'; "
+                       "framing on the channel itself",
+                       active.id, scanId);
+        return result;
+    }
+    result.volume = std::move(scanVolume);
+    result.id = scanId;
+    return result;
+}
+
+std::optional<vc3d::opendata::CoordinateIdentity>
+LineAnnotationController::frameCoordinateIdentity() const
+{
+    if (!_state || !_state->vpkg()) {
+        return std::nullopt;
+    }
+    const std::string id = frameVolume().id;
+    if (id.empty()) {
+        return std::nullopt;
+    }
+    return vc3d::opendata::coordinateIdentityForVolume(*_state->vpkg(), id);
+}
+
 vc3d::annotation::AnnotationFrame LineAnnotationController::annotationFrame() const
 {
     if (!_state) {
         return {};
     }
     try {
-        const auto volume = _state->currentVolume();
+        const auto [volume, volumeId] = frameVolume();
         if (!volume) {
             return {};
         }
@@ -12654,9 +13891,9 @@ vc3d::annotation::AnnotationFrame LineAnnotationController::annotationFrame() co
         // from it.
         std::optional<double> exactFactor;
         std::optional<double> stampedResolution;
-        if (_state->vpkg() && !_state->currentVolumeId().empty()) {
+        if (_state->vpkg() && !volumeId.empty()) {
             if (const auto identity = vc3d::opendata::coordinateIdentityFromTags(
-                    _state->vpkg()->volumeTags(_state->currentVolumeId()))) {
+                    _state->vpkg()->volumeTags(volumeId))) {
                 exactFactor =
                     static_cast<double>(identity->sourceCoordinateScaleFactor);
                 if (identity->sourceOriginalResolution > 0.0) {
@@ -12682,7 +13919,7 @@ LineAnnotationController::ensureScrollUmbilicusLoaded()
 {
     std::shared_ptr<Volume> volume;
     try {
-        volume = _state ? _state->currentVolume() : nullptr;
+        volume = _state ? frameVolume().volume : nullptr;
     } catch (...) {
         volume.reset();
     }
@@ -13024,7 +14261,7 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
 
     std::shared_ptr<Volume> volume;
     try {
-        volume = _state ? _state->currentVolume() : nullptr;
+        volume = _state ? frameVolume().volume : nullptr;
     } catch (...) {
         volume.reset();
     }
@@ -13122,7 +14359,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
 
     if (session.coordinateBaseShapeZYX) {
         try {
-            const auto volume = _state->currentVolume();
+            const auto volume = frameVolume().volume;
             if (!volume) {
                 throw std::runtime_error("no active volume is loaded");
             }
@@ -13188,7 +14425,8 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
             views.lineSurface.get(),
             views.lineSideSlice.get(),
             views.stripPositionMap,
-            linePoints);
+            linePoints,
+            session.fiberBaseToVolumeScale);
     }
 
     // Everything the session currently shows, retained so a failed install can
@@ -13242,6 +14480,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.lineSideSliceName = session.generatedLineSideSliceName;
     generatedViews.lineSideSliceTitle = tr("Line Side Slice");
     generatedViews.lineSideSlice = views.lineSideSlice;
+    generatedViews.fiberBaseToVolumeScale = session.fiberBaseToVolumeScale;
     generatedViews.linePoints = std::move(linePoints);
     generatedViews.lineUpVectors = views.lineUpVectors;
     generatedViews.stripPositionMap = views.stripPositionMap;
@@ -13258,7 +14497,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
             static_cast<float>(annotationFrame().factor);
         cv::Vec2f volumeCenterXY{kNanF, kNanF};
         try {
-            if (const auto volume = _state->currentVolume()) {
+            if (const auto volume = frameVolume().volume) {
                 volumeCenterXY = {static_cast<float>(volume->sliceWidth()) * 0.5f * volumeToAnnotationScale,
                                   static_cast<float>(volume->sliceHeight()) * 0.5f * volumeToAnnotationScale};
             }
@@ -13534,7 +14773,7 @@ std::vector<fs::path> LineAnnotationController::saveGeneratedQuadMeshes(LineAnno
         auto clone = std::make_shared<QuadSurface>(surface->rawPoints().clone(), surface->scale());
         clone->meta = surface->meta;
         vc3d::opendata::copyCoordinateIdentityToSurface(
-            *clone, coordinateIdentityForState(_state));
+            *clone, frameCoordinateIdentity());
 
         const fs::path outputPath = nextMeshExportPath(pathsDir, stem);
         const std::string outputName = outputPath.filename().string();
@@ -14486,7 +15725,7 @@ LineAnnotationController::resolveStoredFiberCoordinateBaseShape(
     const auto candidates =
         vc3d::line_annotation::fiberBaseShapeManifestCandidates(
             fiberManifestLocation,
-            _state->vpkg()->selectedFiberInferenceDataset());
+            effectiveFiberDataset());
     for (const auto& candidate : candidates) {
         if (const auto shape = fiberManifestBaseShape(candidate)) {
             return shape;
@@ -14699,6 +15938,8 @@ void LineAnnotationController::unregisterExternalFiberSource(const fs::path& sou
 
 std::optional<LineAnnotationController::ResolvedFiberOptimizationInputs>
 LineAnnotationController::resolveFiberOptimizationInputs(
+    const std::string& selectedNormalLocation,
+    const std::string& selectedFiberLocation,
     const std::string& fallbackNormalLocation,
     const std::string& fallbackFiberLocation,
     QString* errorMessage) const
@@ -14720,7 +15961,7 @@ LineAnnotationController::resolveFiberOptimizationInputs(
     ResolvedFiberOptimizationInputs result;
     QStringList failures;
     const std::vector<std::string> fiberCandidates = {
-        vpkg->selectedFiberInferenceDataset(), fallbackFiberLocation};
+        selectedFiberLocation, fallbackFiberLocation};
     for (const auto& candidate : fiberCandidates) {
         if (candidate.empty() || result.fiberDataset) continue;
         try {
@@ -14746,7 +15987,7 @@ LineAnnotationController::resolveFiberOptimizationInputs(
     }
 
     const std::vector<std::string> normalCandidates = {
-        vpkg->selectedLasagnaDataset(), fallbackNormalLocation};
+        selectedNormalLocation, fallbackNormalLocation};
     for (const auto& candidate : normalCandidates) {
         if (candidate.empty() || result.normalDataset || !result.fiberDataset)
             continue;
@@ -17459,7 +18700,7 @@ nlohmann::json LineAnnotationController::fiberToJson(const StoredFiber& fiber, d
 
     FiberSaveSnapshot snapshot;
     snapshot.fiber = std::move(serialized);
-    copyCoordinateIdentityToJson(snapshot.coordinateIdentity, coordinateIdentityForState(_state));
+    copyCoordinateIdentityToJson(snapshot.coordinateIdentity, frameCoordinateIdentity());
     return fiberSaveSnapshotToJson(snapshot, scale);
 }
 
@@ -17599,7 +18840,7 @@ LineAnnotationController::makeFiberSaveSnapshot(const StoredFiber& fiber) const
             branch.branchFileName = branchFileNameForId(branch.branchFiberId);
         }
     }
-    copyCoordinateIdentityToJson(snapshot.coordinateIdentity, coordinateIdentityForState(_state));
+    copyCoordinateIdentityToJson(snapshot.coordinateIdentity, frameCoordinateIdentity());
     if (snapshot.path.empty()) {
         throw std::runtime_error("No volume package is loaded");
     }

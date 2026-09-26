@@ -84,9 +84,15 @@ int attachOpenDataLasagna(VolumePkg& pkg,
                           std::vector<std::string>* messages = nullptr,
                           const OpenDataResourceSelection* selection = nullptr);
 
+// `manualLocation` overrides the project's recorded Lasagna selection as the
+// manual fallback (an empty string means "no manual selection"); the line
+// annotation workspace passes its effective selection, which may reject the
+// recorded one as belonging to another scan. Absent, the recorded selection
+// is used, as every other workspace expects.
 [[nodiscard]] std::optional<ResolvedOpenDataLasagna> resolveLasagnaForVolume(
     const VolumePkg& pkg,
-    const std::string& loadedVolumeId);
+    const std::string& loadedVolumeId,
+    const std::optional<std::string>& manualLocation = std::nullopt);
 
 // Public for non-GUI consumers and deterministic pairing tests. The tags must
 // describe one catalog coordinate identity; no affine or cross-volume pairing

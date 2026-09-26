@@ -339,6 +339,8 @@ private slots:
     VolumeViewerBase* activeBaseViewer() const;
     std::vector<QComboBox*> volumeSelectionControls() const;
     void connectVolumeSelector(QComboBox* selector);
+    // Makes the package volume with this id the active volume (all selectors follow).
+    void selectVolumeById(const QString& volumeId);
     void clearSurfaceSelection();
     QString lastVolumeSettingKeyForCurrentPackage() const;
     QString rememberedVolumeIdForCurrentPackage() const;

@@ -31,6 +31,7 @@
 
 #include "AnnotationFrame.hpp"
 #include "UmbilicusOrientationFreshness.hpp"
+#include "LineAnnotationDatasetSets.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberDeletion.hpp"
 #include "LineAnnotationFiberSegments.hpp"
@@ -53,7 +54,12 @@ class SurfacePanelController;
 class ViewerManager;
 class VolumePkg;
 class QWidget;
-namespace vc::lasagna { class LasagnaDataset; class LasagnaNormalSampler; }
+
+namespace vc3d::opendata
+{
+struct CoordinateIdentity;
+}
+namespace vc::lasagna { class LasagnaDataset; class LasagnaNormalSampler; struct LasagnaDatasetManifest; }
 namespace vc::fiber_tracer { class FiberPredictionField; }
 
 class LineAnnotationController : public QObject
@@ -65,6 +71,11 @@ public:
         Sideways,
         ZInOut,
     };
+
+    // The package's contents changed without a volume switch (a Lasagna or
+    // fiber dataset attached, a catalog reload): open dialogs refresh their
+    // dataset/volume lists and re-resolve their pane overlays.
+    void onPackageContentsRefreshed();
 
     struct OptimizationTaskResult {
         bool ok = false;
@@ -384,6 +395,25 @@ public:
     // Holders of derived geometry compare it to know whether what they built is
     // still in a frame that means anything.
     [[nodiscard]] vc3d::annotation::AnnotationFrame annotationFrame() const;
+    // The volume whose grid frames fiber geometry and the umbilicus: the
+    // active volume when it is a raw scan (at whatever pyramid level), else
+    // the selected raw scan at the level a Lasagna or fiber channel is opened
+    // at, once that channel's dataset is placed under the selected scan: a
+    // channel pyramid's level 0 is the manifest base grid padded to whole
+    // chunks, same origin and voxel unit as the scan's, only the extent
+    // differs, and it carries no voxel size, so it must not define the frame
+    // itself. A surface prediction is its own frame (it is published at a
+    // scan level and tagged with it). Anything not established stays on the
+    // active volume. Null with its id empty when nothing is active.
+    struct FrameVolume {
+        std::shared_ptr<Volume> volume;
+        std::string id;
+    };
+    [[nodiscard]] FrameVolume frameVolume() const;
+    // The open-data coordinate identity of the frame volume, stamped into
+    // exports and saved fibers.
+    [[nodiscard]] std::optional<vc3d::opendata::CoordinateIdentity>
+    frameCoordinateIdentity() const;
     // Cheap token over everything resolveScrollUmbilicus() depends on: the
     // project's field plus a stat() of each path the resolver's own scan reports,
     // and no JSON parse. Size and mtime, so it is a metadata token rather than a
@@ -464,6 +494,10 @@ public:
             vc3d::line_annotation::FiberOptimizationMode,
             vc3d::line_annotation::FiberOptimizationMode)> picker);
     void setVolumeSelectorFactory(VolumeSelectorFactory factory);
+    // Makes a package volume the active one (the main window's switch, so
+    // every selector follows). The dialog's own volume selector goes through it.
+    using VolumeSwitchHandler = std::function<void(const std::string& volumeId)>;
+    void setVolumeSwitchHandler(VolumeSwitchHandler handler);
     void setSurfacePanel(SurfacePanelController* panel);
     void setCurrentAtlasDirectory(std::optional<std::filesystem::path> atlasDir);
 
@@ -479,8 +513,14 @@ public:
     bool redirectFiberSource(const std::filesystem::path& source,
                              const std::filesystem::path& workingCopy,
                              QString* errorMessage = nullptr);
+    // The caller names the project selections to try first (before the
+    // fallbacks): the Spiral workspace passes the project's recorded
+    // selections, the line annotation workspace would pass its effective
+    // ones (scoped to its selected raw scan).
     [[nodiscard]] std::optional<ResolvedFiberOptimizationInputs>
         resolveFiberOptimizationInputs(
+            const std::string& selectedNormalLocation,
+            const std::string& selectedFiberLocation,
             const std::string& fallbackNormalLocation,
             const std::string& fallbackFiberLocation,
             QString* errorMessage = nullptr) const;
@@ -683,6 +723,7 @@ private:
     };
 
     VolumeSelectorFactory _volumeSelectorFactory;
+    VolumeSwitchHandler _volumeSwitchHandler;
 
     std::string nextSurfaceName();
     void cleanupSurfaceName(const std::string& surfaceName);
@@ -902,8 +943,119 @@ private:
     bool ensureFiberInferenceDatasetForSession(LineAnnotationSession& session);
     void refreshLineAnnotationDatasetMenus() const;
     void refreshLineAnnotationDatasetMenu(LineAnnotationDialog* dialog) const;
+    // The project's volumes and datasets classified into raw-scan sets (see
+    // LineAnnotationDatasetSets.hpp), computed from the package on demand.
+    // selectedScanKey is the recorded scan, or the derived default when none
+    // is recorded (or the recorded one is gone). The one resolver of the
+    // effective scan: menus, the selector and frameVolume() all read it.
+    // Manifest frames are cached per location, so this is cheap enough for
+    // the map's staleness checks; nothing is written to the project here.
+    struct DatasetSets {
+        std::vector<vc3d::line_annotation::ClassifiedVolume> volumes;
+        std::vector<vc3d::line_annotation::RawScanOption> scans;
+        std::vector<vc3d::line_annotation::DatasetInfo> lasagnaDatasets;
+        std::vector<vc3d::line_annotation::DatasetInfo> fiberDatasets;
+        std::string selectedScanKey;
+        // The recorded surface prediction when it belongs to the selected
+        // scan, else that scan's default (newest), else empty.
+        std::string selectedSurfaceVolumeId;
+        // The recorded Lasagna / fiber dataset when it applies to the
+        // selected scan (a frame still being fetched counts as applying),
+        // else empty: what every consumer of "the selected dataset" uses.
+        // A recorded dataset that resolves to another scan is thereby
+        // rejected in memory, without writing the project.
+        std::string selectedLasagnaLocation;
+        std::string selectedFiberLocation;
+    };
+    [[nodiscard]] DatasetSets datasetSets() const;
+    [[nodiscard]] std::string effectiveLasagnaDataset() const;
+    [[nodiscard]] std::string effectiveFiberDataset() const;
+    // Drops the sessions' cached dataset handles (samplers, fields) after
+    // the effective Lasagna / fiber dataset changed, marking optimized
+    // lines stale.
+    void invalidateSessionLasagnaDatasets();
+    void invalidateSessionFiberDatasets();
+    void discardRunningSolveForDatasetChange(LineAnnotationSession& session);
+    // A dataset manifest's base frame from the per-location cache. A local
+    // manifest not cached yet is read here (a file read); a remote one is
+    // never read on the GUI thread: it is unknown until
+    // prefetchRemoteManifestFrames() has fetched it on a worker.
+    [[nodiscard]] std::optional<std::array<std::size_t, 3>> manifestBaseFrame(
+        const std::string& location) const;
+    // Fetches, off the GUI thread, every remote manifest frame the workspace
+    // wants and does not have: the untagged datasets (grouped by frame) and
+    // the active channel's memberships (its stand-in scan is gated by the
+    // frame), plus an explicitly requested overlay manifest. On completion
+    // overlays and menus are refreshed and, when the active
+    // volume is a channel of that dataset, the frame-dependent views are
+    // rebuilt; a completion from a superseded epoch re-requests instead.
+    void prefetchRemoteManifestFrames(const std::string& overlayLocation = {});
+    // The project's only fiber dataset when it applies to the selected scan:
+    // the one case where no menu pick is needed.
+    [[nodiscard]] std::optional<std::string> soleApplicableFiberDataset(
+        const DatasetSets& sets) const;
+    // Applies a project selection setter; the selection holds for the session
+    // even when the project file cannot be written (read-only folder). The
+    // failure is queued and reported once after the current transition
+    // completes (never a nested event loop inside a menu handler).
+    bool recordProjectSelection(const QString& what, const std::function<void()>& apply);
+    void flushPersistenceWarnings();
+    // Surface dataset submenu: records the surface prediction to list.
+    void handleSurfaceSelectionChanged(const std::string& volumeId);
+    // Raw scan submenu: records the scan, auto-selects the newest Lasagna and
+    // fiber datasets published against it (or none), and switches the active
+    // volume to that scan at the current level.
+    void handleRawScanSelectionChanged(const std::string& scanKey);
+    // Raw scan submenu level entry: switches the active volume to the selected
+    // scan at that pyramid level.
+    void handleRawScanLevelSelectionChanged(int level);
+    // The pyramid level the workspace is on: the active volume's level when it
+    // is one of the selected scan's, else the last level used, else 0.
+    [[nodiscard]] int currentRawScanLevel(const DatasetSets& sets) const;
+    void pushVolumeSelectorEntries(LineAnnotationDialog* dialog, const DatasetSets& sets) const;
+    // An empty location clears the selection.
     void handleLasagnaDatasetSelectionChanged(const std::string& location);
     void handleFiberInferenceDatasetSelectionChanged(const std::string& location);
+    // Fiber presence overlay: the selected fiber dataset's presence channel,
+    // as a Volume on the active volume's grid, for the dialog's panes.
+    struct PresenceOverlaySource {
+        std::shared_ptr<Volume> volume;
+        // Finest pyramid level the volume stores (exports start coarse).
+        int maxDisplayedResolution = 0;
+        QString description;
+    };
+    // Throws std::runtime_error with a user-readable reason when there is
+    // nothing to show (no dataset, no presence group, volume not attached,
+    // grids not dyadically related).
+    [[nodiscard]] PresenceOverlaySource resolvePresenceOverlaySource();
+    // Advanced mode: any attached volume by id, fitted to the active grid the
+    // same way. Throws like resolvePresenceOverlaySource.
+    [[nodiscard]] PresenceOverlaySource resolveVolumeOverlaySource(
+        const std::string& volumeId);
+    // Shared tail: how many pyramid levels separate the volume from the active
+    // grid (from its finest stored level, cross-checked against the exact
+    // frame it was published against when `exactFrameZYX` is known), a cached
+    // rebased view when the active volume is coarser, and the finest stored
+    // level. Throws with a reason when the volume does not fit.
+    [[nodiscard]] PresenceOverlaySource fitOverlayVolumeToActiveGrid(
+        const std::shared_ptr<Volume>& volume,
+        const std::string& volumeId,
+        const std::optional<std::array<std::size_t, 3>>& exactFrameZYX,
+        const QString& label);
+    // Reads only local files, including the remote cache. Null while a remote
+    // manifest is being fetched by prefetchRemoteManifestFrames().
+    [[nodiscard]] std::optional<vc::lasagna::LasagnaDatasetManifest> openLasagnaManifestForOverlay(
+        const std::string& location) const;
+    // Re-resolves and hands the result (or the reason) to a pane's dialog
+    // when its overlay is on; a no-op for dialogs with the overlay off.
+    void refreshPresenceOverlay(const PaneRecord& pane);
+    void refreshPresenceOverlays();
+    // Active-volume switch, step one: every enabled dialog drops its overlay
+    // synchronously so no pane renders the old view against the new base.
+    void clearPresenceOverlaysForRefit();
+    // Step two, on the next event-loop turn, once every pane has adopted the
+    // new base: resolve and install the re-fitted view. Coalesced.
+    void schedulePresenceOverlayRefresh();
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     bool finalizeSessionOptimizationSynchronously(LineAnnotationSession& session,
                                                   bool fireSuccessCallback);
@@ -948,10 +1100,8 @@ private:
     // inspection's strips, which have no generated-view sessions of their own.
     // Failures are logged per pane and do not stop the others.
     void refreshStaleGeneratedViews();
-    // Coalesces refreshStaleGeneratedViews() onto the next event-loop turn:
-    // CState emits volumeChanged from inside ViewerManager::switchVolume(),
-    // before focus and navigation are restored, and materialization reads pane
-    // camera state. Also collapses rapid switching into one rebuild.
+    // Coalesces attachment/metadata changes and direct CState updates.
+    // ViewerManager switches flush stale views before restoring navigation.
     void scheduleStaleViewRefresh();
     // Cheap fingerprint over everything the resolved umbilicus was read from: a
     // stat() of every resolver candidate (the attached file when the project
@@ -1338,6 +1488,33 @@ private:
     // reselection of the current volume is not treated as a switch. Cleared on
     // package change.
     std::string _lastVolumeChangedId;
+    // Presence volumes rebased onto a downsampled active volume, keyed by
+    // "<presence volume id>#<levels>". Dropped with the package.
+    struct RebasedPresenceView {
+        std::shared_ptr<Volume> source;
+        std::shared_ptr<Volume> view;
+    };
+    std::map<std::string, RebasedPresenceView> _rebasedPresenceVolumes;
+    // Last raw-scan level the workspace used (survives a switch to a
+    // Lasagna or fiber volume, which has no level of its own).
+    int _lastRawScanLevel = 0;
+    bool _presenceOverlayRefreshQueued = false;
+    // Manifest base frames by dataset location, for datasetSets(); dropped on
+    // package change and content refresh.
+    mutable std::unordered_map<std::string, std::optional<std::array<std::size_t, 3>>>
+        _manifestBaseShapeCache;
+    // Selections that applied in memory but could not be written; reported
+    // together from the event loop.
+    // Remote manifest reads in flight (by location) and the epoch they were
+    // started in; a result from an earlier epoch (another package, or a
+    // content refresh that dropped the cache) is discarded.
+    std::set<std::string> _manifestFramePrefetching;
+    std::uint64_t _manifestPrefetchEpoch = 0;
+    std::vector<QString> _pendingPersistenceWarnings;
+    QString _pendingPersistenceReason;
+    std::filesystem::path _pendingPersistenceProjectPath;
+    bool _persistenceWarningQueued = false;
+    bool _tearingDown = false;
     // Why the package's umbilicus could not be used, for the strip notice.
     // Empty when one was applied, and when none exists to complain about.
     // Orienting off the volume centre instead is exactly the silent degradation

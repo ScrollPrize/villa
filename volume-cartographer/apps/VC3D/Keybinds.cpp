@@ -577,6 +577,7 @@ QString buildKeybindsHelpText()
         { kSectionLineAnnotation, "Snap the panes to the overview-bar cursor", HelpKeyType::Literal, nullptr, nullptr, "R" },
         { kSectionLineAnnotation, "Reset the side cut and strip normal offsets", HelpKeyType::Literal, nullptr, nullptr, "B" },
         { kSectionLineAnnotation, "Toggle the current cut following the strip mouse", HelpKeyType::Literal, nullptr, nullptr, "Space" },
+        { kSectionLineAnnotation, "Toggle the pane overlay (fiber presence, or any volume in advanced mode)", HelpKeyType::Literal, nullptr, nullptr, "P" },
         { kSectionLineAnnotation, "Close the workspace", HelpKeyType::Literal, nullptr, nullptr, "Esc" },
         { kSectionLineAnnotation, "Step along the line (current cut) or the normal offset (side cut, strips)", HelpKeyType::Literal, nullptr, nullptr, "Shift+Scroll Wheel" },
     };

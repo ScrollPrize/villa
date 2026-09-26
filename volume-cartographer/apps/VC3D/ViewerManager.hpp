@@ -233,6 +233,9 @@ public:
     double zScrollSensitivity() const { return _zScrollSensitivity; }
 
     void forEachBaseViewer(const std::function<void(VolumeViewerBase*)>& fn) const;
+    // The viewers that follow the app-wide Overlay panel: every registered
+    // viewer except those whose overlay is locally managed by their host.
+    void forEachGlobalOverlayViewer(const std::function<void(VolumeViewerBase*)>& fn) const;
     void setIntersectionThickness(float thickness);
     float intersectionThickness() const { return _intersectionThickness; }
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
@@ -252,6 +255,9 @@ signals:
     void baseViewerCreated(VolumeViewerBase* viewer);
     void baseViewerClosing(VolumeViewerBase* viewer);
     void currentVolumeChanged();
+    // Synchronous rebuild point: viewers have adopted the new volume, but
+    // saved navigation has not yet been projected onto their surfaces.
+    void volumeGeometryUpdateRequested();
     // Emitted whenever the user explicitly places the focus (Ctrl+click,
     // focus-on-cursor key, point activation, ...).
     void focusCenteredByUser(const cv::Vec3f& position);

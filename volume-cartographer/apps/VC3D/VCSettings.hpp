@@ -320,6 +320,23 @@ namespace line_annotation {
     constexpr auto CURRENT_CUT_ZOOM = "lineAnnotation/current_cut_zoom";
     constexpr auto SIDE_CUT_ZOOM = "lineAnnotation/side_cut_zoom";
     constexpr auto STRIP_ZOOMS = "lineAnnotation/strip_zooms";
+    // Fiber presence overlay on the generated panes: the selected fiber
+    // dataset's presence channel, dialog-local (independent of the app-wide
+    // Overlay panel). Colour is a "#rrggbb" string; opacity is 0..1; the
+    // threshold is the overlay window low (0..254) below which nothing draws.
+    constexpr auto PRESENCE_OVERLAY_ENABLED = "lineAnnotation/presence_overlay_enabled";
+    constexpr bool PRESENCE_OVERLAY_ENABLED_DEFAULT = false;
+    constexpr auto PRESENCE_OVERLAY_OPACITY = "lineAnnotation/presence_overlay_opacity";
+    constexpr double PRESENCE_OVERLAY_OPACITY_DEFAULT = 0.6;
+    constexpr auto PRESENCE_OVERLAY_COLOR = "lineAnnotation/presence_overlay_color";
+    constexpr auto PRESENCE_OVERLAY_COLOR_DEFAULT = "#ff00ff";
+    constexpr auto PRESENCE_OVERLAY_THRESHOLD = "lineAnnotation/presence_overlay_threshold";
+    constexpr int PRESENCE_OVERLAY_THRESHOLD_DEFAULT = 16;
+    // Advanced mode: the overlay source is any project volume (by id) instead
+    // of the selected fiber dataset's presence channel.
+    constexpr auto PRESENCE_OVERLAY_ADVANCED = "lineAnnotation/presence_overlay_advanced";
+    constexpr bool PRESENCE_OVERLAY_ADVANCED_DEFAULT = false;
+    constexpr auto PRESENCE_OVERLAY_VOLUME_ID = "lineAnnotation/presence_overlay_volume_id";
 }
 
 // -----------------------------------------------------------------------------

@@ -56,6 +56,37 @@ vc_register_test_target(test_line_annotation_coordinate_scale)
 vc_register_ctest(line_annotation_coordinate_scale
     test_line_annotation_coordinate_scale)
 
+add_executable(test_line_annotation_presence_overlay
+    test_line_annotation_presence_overlay.cpp)
+set_target_properties(test_line_annotation_presence_overlay PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_line_annotation_presence_overlay PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_line_annotation_presence_overlay PRIVATE
+    vc_lasagna
+    Qt6::Core
+    Qt6::Test)
+add_test(NAME line_annotation_presence_overlay
+    COMMAND test_line_annotation_presence_overlay)
+vc_register_test_target(test_line_annotation_presence_overlay)
+vc_register_ctest(line_annotation_presence_overlay
+    test_line_annotation_presence_overlay)
+
+add_executable(test_line_annotation_dataset_sets
+    test_line_annotation_dataset_sets.cpp)
+set_target_properties(test_line_annotation_dataset_sets PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_line_annotation_dataset_sets PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_line_annotation_dataset_sets PRIVATE
+    Qt6::Core
+    Qt6::Test)
+add_test(NAME line_annotation_dataset_sets
+    COMMAND test_line_annotation_dataset_sets)
+vc_register_test_target(test_line_annotation_dataset_sets)
+vc_register_ctest(line_annotation_dataset_sets
+    test_line_annotation_dataset_sets)
+
 add_executable(test_surface_rotation_transform
     test_surface_rotation_transform.cpp)
 

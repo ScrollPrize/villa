@@ -19,6 +19,7 @@
 
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationFiberSegments.hpp"
+#include "LineAnnotationPresenceOverlay.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
 #include <opencv2/core/mat.hpp>
@@ -41,8 +42,13 @@ class QResizeEvent;
 class QTimer;
 class QVariantAnimation;
 class QVBoxLayout;
+class QWidgetAction;
 class QSplitter;
 class QSpinBox;
+class QSlider;
+class QPushButton;
+class QToolButton;
+class Volume;
 class ViewerManager;
 class PlaneSurface;
 class QuadSurface;
@@ -111,8 +117,50 @@ public:
     using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
 
     explicit LineAnnotationDialog(ViewerManager* viewerManager,
-                                  VolumeSelectorFactory volumeSelectorFactory = {},
                                   QWidget* parent = nullptr);
+
+    // A dataset menu entry: greyed out (with the tooltip saying why) when it
+    // was published against another scan than the selected one.
+    struct DatasetMenuOption {
+        std::string location;
+        std::string label;
+        bool applicable = true;
+        std::string tooltip;
+    };
+    // Raw scan submenu entries (scan key, label).
+    struct RawScanMenuOption {
+        std::string scanKey;
+        std::string label;
+        std::string tooltip;
+    };
+    // Top-bar volume selector entries (volume id, readable label, tooltip).
+    struct VolumeSelectorEntry {
+        std::string id;
+        std::string label;
+        std::string tooltip;
+    };
+    // Level entries of the selected scan ("Level 1 (4.798 µm)"), shown under
+    // the scans in the Raw scan submenu; `currentLevel` is checked.
+    struct RawScanLevelOption {
+        int level = 0;
+        std::string label;
+    };
+    void setRawScanOptions(std::vector<RawScanMenuOption> options,
+                           const std::string& selectedScanKey,
+                           std::vector<RawScanLevelOption> levels,
+                           int currentLevel);
+    // Replaces the top-bar volume list; `currentVolumeId` is selected without
+    // emitting volumeSelectionRequested.
+    void setVolumeSelectorEntries(std::vector<VolumeSelectorEntry> entries,
+                                  const std::string& currentVolumeId);
+    void setCurrentVolumeId(const std::string& volumeId);
+    // Surface dataset submenu: the project's surface predictions (volume id as
+    // location), greyed when published against another scan.
+    void setSurfaceOptions(std::vector<DatasetMenuOption> options, const std::string& selectedVolumeId);
+    // "Advanced volume selector" in the hamburger: the selector lists every
+    // project volume under its raw name, and the pane overlay is in its
+    // any-volume mode. One persisted flag drives both.
+    bool advancedVolumeSelector() const;
 
     void showWithSavedGeometry();
     CChunkedVolumeViewer* addPane(const std::string& surfaceName,
@@ -138,7 +186,8 @@ public:
         QuadSurface* newLineSurface,
         QuadSurface* newLineSideSlice,
         const vc::lasagna::LineStripPositionMap& newPositionMap,
-        const std::vector<cv::Vec3f>& newLinePoints) const;
+        const std::vector<cv::Vec3f>& newLinePoints,
+        double newFiberBaseToVolumeScale) const;
     GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         const std::string& surfaceName,
         CChunkedVolumeViewer* viewer,
@@ -156,11 +205,32 @@ public:
     vc3d::line_annotation::FiberOptimizationMode fiberOptimizationMode() const;
     void setFiberOptimizationMode(vc3d::line_annotation::FiberOptimizationMode mode);
     void setLasagnaDatasetOptions(
-        std::vector<std::pair<std::string, std::string>> options,
+        std::vector<DatasetMenuOption> options,
         const std::string& selectedLocation);
     void setFiberInferenceDatasetOptions(
-        std::vector<std::pair<std::string, std::string>> options,
+        std::vector<DatasetMenuOption> options,
         const std::string& selectedLocation);
+    // Fiber presence overlay on the four generated panes. Dialog-local: the
+    // panes leave the app-wide Overlay panel and draw only this. The dialog
+    // owns visibility, colour, opacity and threshold; the controller supplies
+    // the volume through setPresenceOverlaySource().
+    bool presenceOverlayEnabled() const;
+    // Advanced mode: any project volume, chosen by id from the flyout's
+    // volume list, instead of the fiber presence channel.
+    bool presenceOverlayAdvanced() const;
+    const std::string& presenceOverlayVolumeId() const;
+    // (id, label) pairs for the advanced volume list; the controller refreshes
+    // them with the dataset menus. A persisted id that is no longer listed
+    // stays selected in the settings but shows as unavailable.
+    void setPresenceOverlayVolumeOptions(std::vector<std::pair<std::string, QString>> options);
+    // `volume` is the selected fiber dataset's presence channel already on the
+    // active volume's grid, and `maxDisplayedResolution` the finest pyramid
+    // level it actually stores (exports start at /3, so finer levels do not
+    // exist to fetch). A null volume clears the panes; `description` then says
+    // why and is shown in the flyout instead of the dataset name.
+    void setPresenceOverlaySource(std::shared_ptr<Volume> volume,
+                                  int maxDisplayedResolution,
+                                  const QString& description);
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
     void setGeneratedBranchLinePoints(std::vector<std::vector<cv::Vec3f>> branchLinePoints);
     void setGeneratedBranchLinks(std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks);
@@ -282,7 +352,23 @@ signals:
         vc3d::line_annotation::FiberOptimizationMode mode);
     void lasagnaDatasetSelectionChanged(const std::string& location);
     void fiberInferenceDatasetSelectionChanged(const std::string& location);
+    void rawScanSelectionChanged(const std::string& scanKey);
+    void surfaceSelectionChanged(const std::string& volumeId);
+    // A level of the selected scan was picked in the Raw scan submenu.
+    void rawScanLevelSelectionChanged(int level);
+    // The user picked a volume in the top-bar selector.
+    void volumeSelectionRequested(const std::string& volumeId);
+    // Advanced mode toggled; the controller re-sends the selector entries.
+    void volumeSelectorScopeChanged();
     void extrapolationDistanceChanged(int distanceVx);
+    // The user switched the presence overlay on or off (button, menu or "P").
+    // On enable the controller resolves the volume and calls
+    // setPresenceOverlaySource(); on disable the dialog has already cleared
+    // the panes itself.
+    void presenceOverlayEnabledChanged(bool enabled);
+    // The source changed while the overlay is on (advanced mode toggled, or
+    // another volume picked); the controller re-resolves it.
+    void presenceOverlaySourceChanged();
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -353,6 +439,11 @@ private:
     // window/app (the key-up is delivered elsewhere; don't render unattended).
     void stopArrowPanForFocusLoss();
     void tickArrowPan();
+    // "P" is also the app-wide raw-points-overlay QShortcut. Shortcuts are
+    // resolved at ShortcutOverride, before any key press is delivered, so the
+    // dialog claims the override while its panes have focus; the press then
+    // reaches handleKeyPress. True when the event was claimed.
+    bool claimPresenceOverlayShortcut(QEvent* event);
     void finishArrowPan(double position);
     void cancelArrowPan();
     // Up/Down: scale the cruise speed (persisted) and flash the badge.
@@ -472,16 +563,47 @@ private:
     void saveWindowGeometry() const;
     void restoreGeneratedViewStateSettings();
     void saveGeneratedViewStateSettings();
+    // Presence overlay: the four generated panes it applies to (never the seed
+    // pane, which keeps following the app-wide overlay).
+    std::vector<CChunkedVolumeViewer*> presenceOverlayPanes() const;
+    // Marks the pane as locally managed and pushes the current settings and
+    // volume (or clears the overlay when off / unresolved).
+    void applyPresenceOverlayToPane(CChunkedVolumeViewer* viewer);
+    void applyPresenceOverlayToPanes();
+    // Swatch icon, checked state, tooltip, flyout header and control positions.
+    void updatePresenceOverlayUi();
+    void savePresenceOverlaySettings() const;
+    // A QMenu lays out its embedded widget once, at popup, so a row shown or
+    // a header wrapped afterwards sits outside the frame and is clipped.
+    // While the flyout is open and its content height no longer matches,
+    // re-pop it at the same spot so it is sized for what it now holds.
+    void relayoutPresenceOverlayFlyout();
 
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
     QComboBox* _fiberOptimizationCombo = nullptr;
+    // The hamburger menu; its submenus are not rebuilt while it is open (a
+    // rebuild drops the highlighted action), only once it hides.
+    QMenu* _annotationMenu = nullptr;
+    bool _datasetMenusStale = false;
+    QMenu* _rawScanMenu = nullptr;
     QMenu* _lasagnaDatasetMenu = nullptr;
     QMenu* _fiberInferenceDatasetMenu = nullptr;
-    std::vector<std::pair<std::string, std::string>> _lasagnaDatasetOptions;
-    std::vector<std::pair<std::string, std::string>> _fiberInferenceDatasetOptions;
+    std::vector<RawScanMenuOption> _rawScanOptions;
+    std::string _selectedRawScanKey;
+    std::vector<RawScanLevelOption> _rawScanLevelOptions;
+    int _selectedRawScanLevel = 0;
+    std::vector<DatasetMenuOption> _lasagnaDatasetOptions;
+    std::vector<DatasetMenuOption> _fiberInferenceDatasetOptions;
     std::string _selectedLasagnaDatasetLocation;
     std::string _selectedFiberInferenceDatasetLocation;
+    QMenu* _surfaceMenu = nullptr;
+    std::vector<DatasetMenuOption> _surfaceOptions;
+    std::string _selectedSurfaceVolumeId;
+    QComboBox* _volumeSelect = nullptr;
+    QAction* _advancedAction = nullptr;
+    // One switch for the raw-name selector and the overlay's any-volume mode.
+    void setAdvancedMode(bool advanced);
     // Checked = auto-reoptimize after each edit; unchecked = no optimization.
     QAction* _autoReoptimizeAction = nullptr;
     QAction* _showAsMeshAction = nullptr;
@@ -505,6 +627,25 @@ private:
     QWidget* _tagRowWidget = nullptr;
     QHBoxLayout* _tagRowLayout = nullptr;
     QProgressBar* _sideStripIntersectionProgress = nullptr;
+    // Fiber presence overlay state. The action is shared by the toolbar split
+    // button and the hamburger menu so both show one checked state.
+    vc3d::line_annotation::PresenceOverlaySettings _presenceOverlay;
+    std::shared_ptr<Volume> _presenceOverlayVolume;
+    int _presenceOverlayMaxDisplayedResolution = 0;
+    QString _presenceOverlayDescription;
+    QAction* _presenceOverlayAction = nullptr;
+    QToolButton* _presenceOverlayButton = nullptr;
+    QLabel* _presenceOverlayHeader = nullptr;
+    QSlider* _presenceOpacitySlider = nullptr;
+    QLabel* _presenceOpacityValue = nullptr;
+    QPushButton* _presenceColorButton = nullptr;
+    QSlider* _presenceThresholdSlider = nullptr;
+    QLabel* _presenceThresholdValue = nullptr;
+    QComboBox* _presenceVolumeCombo = nullptr;
+    // The flyout's QWidgetAction: QMenu caches an action's size, so a row
+    // shown or hidden later has to be announced through it.
+    QWidgetAction* _presenceFlyoutAction = nullptr;
+    std::vector<std::pair<std::string, QString>> _presenceVolumeOptions;
     QAction* _mirrorCursorAction = nullptr;
     QAction* _resetViewsAction = nullptr;
     QPointer<QWidget> _optimizationOverlay;

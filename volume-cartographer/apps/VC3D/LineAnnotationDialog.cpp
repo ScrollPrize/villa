@@ -9,6 +9,8 @@
 #include "LineAnnotationShiftScroll.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
+#include "vc/core/render/Colormaps.hpp"
+#include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -19,8 +21,14 @@
 #include <QApplication>
 #include <QBrush>
 #include <QCloseEvent>
+#include <QColor>
+#include <QColorDialog>
 #include <QComboBox>
 #include <QCursor>
+#include <QGridLayout>
+#include <QIcon>
+#include <QPixmap>
+#include <QSlider>
 #include <QEvent>
 #include <QFont>
 #include <QMenu>
@@ -665,7 +673,6 @@ private:
 } // namespace
 
 LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
-                                           VolumeSelectorFactory volumeSelectorFactory,
                                            QWidget* parent)
     : QMainWindow(parent)
     , _viewerManager(viewerManager)
@@ -702,6 +709,18 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     annotationMenuButton->installEventFilter(this);
     auto* annotationMenu = new QMenu(annotationMenuButton);
     annotationMenu->setToolTipsVisible(true);
+    _annotationMenu = annotationMenu;
+    connect(annotationMenu, &QMenu::aboutToHide, this, [this]() {
+        if (_datasetMenusStale) {
+            // Deferred from a background refresh that arrived while the
+            // menu was open; the actions are safe to replace once it hides.
+            QMetaObject::invokeMethod(this, [this]() {
+                if (_datasetMenusStale) {
+                    rebuildDatasetMenus();
+                }
+            }, Qt::QueuedConnection);
+        }
+    });
     _autoReoptimizeAction = annotationMenu->addAction(tr("Auto-reoptimize"));
     _autoReoptimizeAction->setCheckable(true);
     _autoReoptimizeAction->setChecked(true);
@@ -724,6 +743,35 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
         emit showAsMeshRequested();
     });
     annotationMenu->addSeparator();
+    // Advanced: the selector shows every volume under its raw name (twins
+    // included) and the pane overlay takes any volume; off, the selector shows
+    // the selected dataset set under readable names and the overlay is the
+    // fiber presence. One persisted flag, shared with the overlay flyout.
+    _advancedAction = annotationMenu->addAction(tr("Advanced volume selector (show all)"));
+    _advancedAction->setCheckable(true);
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _advancedAction->setChecked(
+            settings.value(vc3d::settings::line_annotation::PRESENCE_OVERLAY_ADVANCED,
+                           vc3d::settings::line_annotation::PRESENCE_OVERLAY_ADVANCED_DEFAULT)
+                .toBool());
+    }
+    _advancedAction->setToolTip(
+        tr("Checked: the volume selector lists every volume in the project by its raw "
+           "name, and the pane overlay can show any volume.\n"
+           "Unchecked: the selector shows the selected raw scan's set (scan, Lasagna "
+           "and fiber channels, surface) and the overlay shows the fiber presence."));
+    connect(_advancedAction, &QAction::toggled, this, [this](bool checked) {
+        setAdvancedMode(checked);
+    });
+    // The raw scan is the root of a dataset set: the Lasagna, fiber and
+    // surface menus grey out datasets published against another scan, and the
+    // top-bar volume selector lists only the selected set.
+    _rawScanMenu = annotationMenu->addMenu(tr("Raw scan"));
+    _rawScanMenu->setToolTipsVisible(true);
+    _rawScanMenu->menuAction()->setToolTip(
+        tr("Select the scan to work on. Datasets of other scans are greyed out "
+           "and the volume selector shows this scan's set."));
     _lasagnaDatasetMenu = annotationMenu->addMenu(tr("Lasagna dataset"));
     _lasagnaDatasetMenu->setToolTipsVisible(true);
     _lasagnaDatasetMenu->menuAction()->setToolTip(
@@ -732,6 +780,45 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _fiberInferenceDatasetMenu->setToolTipsVisible(true);
     _fiberInferenceDatasetMenu->menuAction()->setToolTip(
         tr("Select the fiber inference dataset used for line annotation."));
+    _surfaceMenu = annotationMenu->addMenu(tr("Surface dataset"));
+    _surfaceMenu->setToolTipsVisible(true);
+    _surfaceMenu->menuAction()->setToolTip(
+        tr("Select the surface prediction listed in the volume selector (one at a time)."));
+    // Optimizer (Lasagna vs fiber model): rarely changed, so an embedded row
+    // here rather than a permanent combo in the top bar. The combo object is
+    // unchanged (name, items, signal) for the controller and tests.
+    _fiberOptimizationCombo = new QComboBox;
+    _fiberOptimizationCombo->setObjectName(
+        QStringLiteral("lineAnnotationFiberOptimizationModeCombo"));
+    _fiberOptimizationCombo->addItem(
+        tr("Lasagna"),
+        static_cast<int>(vc3d::line_annotation::FiberOptimizationMode::Lasagna));
+    _fiberOptimizationCombo->addItem(
+        tr("Fiber model"),
+        static_cast<int>(vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d));
+    installComboEventFilter(_fiberOptimizationCombo, this);
+    connect(_fiberOptimizationCombo,
+            qOverload<int>(&QComboBox::currentIndexChanged),
+            this,
+            [this](int) {
+                emit fiberOptimizationModeChanged(fiberOptimizationMode());
+            });
+    {
+        auto* row = new QWidget(annotationMenu);
+        auto* rowLayout = new QHBoxLayout(row);
+        rowLayout->setContentsMargins(28, 3, 12, 3);
+        rowLayout->setSpacing(8);
+        auto* label = new QLabel(tr("Optimizer"), row);
+        label->setToolTip(tr("Lasagna: optimize the line on the Lasagna dataset.\n"
+                             "Fiber model: trace with the fiber inference dataset."));
+        rowLayout->addWidget(label);
+        rowLayout->addStretch(1);
+        _fiberOptimizationCombo->setParent(row);
+        rowLayout->addWidget(_fiberOptimizationCombo);
+        auto* action = new QWidgetAction(annotationMenu);
+        action->setDefaultWidget(row);
+        annotationMenu->addAction(action);
+    }
     annotationMenu->addSeparator();
     // Length / Extrapolation live in the menu as embedded label+spinbox rows
     // (QWidgetAction); editing them does not close the menu. Spinbox edits are
@@ -847,6 +934,58 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
         settings.setValue(vc3d::settings::line_annotation::MIRROR_CURSOR_ACROSS_PANES, checked);
         applyLinkedCursorMirroringToPanes();
     });
+    // Fiber presence overlay. One checkable action serves the hamburger entry
+    // here and the toolbar split button below, so both show one state; "P"
+    // toggles it too. Settings are read before the flyout exists so the
+    // controls can be built at their persisted positions.
+    {
+        using namespace vc3d::settings::line_annotation;
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _presenceOverlay.enabled =
+            settings.value(PRESENCE_OVERLAY_ENABLED, PRESENCE_OVERLAY_ENABLED_DEFAULT).toBool();
+        const double opacity =
+            settings.value(PRESENCE_OVERLAY_OPACITY, PRESENCE_OVERLAY_OPACITY_DEFAULT).toDouble();
+        _presenceOverlay.opacity = std::isfinite(opacity)
+            ? std::clamp(opacity, 0.0, 1.0)
+            : PRESENCE_OVERLAY_OPACITY_DEFAULT;
+        const QColor color(
+            settings.value(PRESENCE_OVERLAY_COLOR, PRESENCE_OVERLAY_COLOR_DEFAULT).toString());
+        _presenceOverlay.colorHex = (color.isValid() ? color : QColor(PRESENCE_OVERLAY_COLOR_DEFAULT))
+                                        .name(QColor::HexRgb)
+                                        .toStdString();
+        _presenceOverlay.threshold = std::clamp(
+            settings.value(PRESENCE_OVERLAY_THRESHOLD, PRESENCE_OVERLAY_THRESHOLD_DEFAULT).toInt(),
+            0, 254);
+        _presenceOverlay.advanced =
+            settings.value(PRESENCE_OVERLAY_ADVANCED, PRESENCE_OVERLAY_ADVANCED_DEFAULT).toBool();
+        _presenceOverlay.volumeId =
+            settings.value(PRESENCE_OVERLAY_VOLUME_ID, QString()).toString().toStdString();
+    }
+    _presenceOverlayAction = new QAction(tr("Overlay on panes"), this);
+    _presenceOverlayAction->setObjectName(QStringLiteral("lineAnnotationPresenceOverlayAction"));
+    _presenceOverlayAction->setCheckable(true);
+    _presenceOverlayAction->setChecked(_presenceOverlay.enabled);
+    connect(_presenceOverlayAction, &QAction::toggled, this, [this](bool checked) {
+        if (_presenceOverlay.enabled == checked) {
+            return;
+        }
+        _presenceOverlay.enabled = checked;
+        savePresenceOverlaySettings();
+        // The dialog never keeps a volume while off: the dataset or the
+        // active volume may change in the meantime, and a retained view would
+        // be installed on re-enable before the controller resolved the
+        // current source, i.e. drawn against the wrong grid. Off clears the
+        // panes here; on installs nothing and waits for
+        // setPresenceOverlaySource() from the controller.
+        if (!checked) {
+            _presenceOverlayVolume.reset();
+            _presenceOverlayDescription.clear();
+        }
+        updatePresenceOverlayUi();
+        applyPresenceOverlayToPanes();
+        emit presenceOverlayEnabledChanged(checked);
+    });
+    annotationMenu->addAction(_presenceOverlayAction);
     _resetViewsAction = annotationMenu->addAction(tr("Reset views"));
     _resetViewsAction->setEnabled(false);
     connect(_resetViewsAction, &QAction::triggered, this, [this]() {
@@ -855,32 +994,192 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     annotationMenuButton->setMenu(annotationMenu);
     buttonLayout->addWidget(annotationMenuButton);
 
-    if (volumeSelectorFactory) {
-        if (auto* volumeSelector = volumeSelectorFactory(buttonRow)) {
-            volumeSelector->installEventFilter(this);
-            buttonLayout->addWidget(volumeSelector);
+    // The dialog owns its volume selector: the controller fills it with the
+    // selected dataset set under readable labels (the main window's selectors
+    // keep listing every volume), and a pick goes back through the controller
+    // to the main window's volume switch so every selector stays in step.
+    _volumeSelect = new QComboBox(buttonRow);
+    _volumeSelect->setObjectName(QStringLiteral("annotationVolumeSelect"));
+    _volumeSelect->setMinimumWidth(130);
+    _volumeSelect->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+    _volumeSelect->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    installComboEventFilter(_volumeSelect, this);
+    buttonLayout->addWidget(_volumeSelect);
+    connect(_volumeSelect, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index < 0 || !_volumeSelect) {
+            return;
         }
-    }
-
-    _fiberOptimizationCombo = new QComboBox(buttonRow);
-    _fiberOptimizationCombo->setObjectName(
-        QStringLiteral("lineAnnotationFiberOptimizationModeCombo"));
-    _fiberOptimizationCombo->addItem(
-        tr("Lasagna"),
-        static_cast<int>(vc3d::line_annotation::FiberOptimizationMode::Lasagna));
-    _fiberOptimizationCombo->addItem(
-        tr("Fiber model"),
-        static_cast<int>(vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d));
-    installComboEventFilter(_fiberOptimizationCombo, this);
-    buttonLayout->addWidget(_fiberOptimizationCombo);
-    connect(_fiberOptimizationCombo,
-            qOverload<int>(&QComboBox::currentIndexChanged),
-            this,
-            [this](int) {
-                emit fiberOptimizationModeChanged(fiberOptimizationMode());
-            });
+        const std::string id = _volumeSelect->itemData(index).toString().toStdString();
+        if (id.empty()) {
+            return;
+        }
+        // Queued: the switch ends in the controller repopulating this very
+        // combo, which must not happen inside its own currentIndexChanged.
+        QMetaObject::invokeMethod(
+            this, [this, id]() { emit volumeSelectionRequested(id); }, Qt::QueuedConnection);
+    });
 
     rebuildDatasetMenus();
+
+    // Presence overlay split button: the swatch face toggles (it is the
+    // action's checked state), the arrow opens a flyout with opacity, colour
+    // and threshold. MenuButtonPopup keeps the two apart so a toggle never
+    // opens the menu and a slider drag never flips visibility.
+    _presenceOverlayButton = new QToolButton(buttonRow);
+    _presenceOverlayButton->setObjectName(QStringLiteral("lineAnnotationPresenceOverlayButton"));
+    _presenceOverlayButton->setDefaultAction(_presenceOverlayAction);
+    _presenceOverlayButton->setPopupMode(QToolButton::MenuButtonPopup);
+    _presenceOverlayButton->setToolButtonStyle(Qt::ToolButtonIconOnly);
+    _presenceOverlayButton->installEventFilter(this);
+    {
+        auto* flyoutMenu = new QMenu(_presenceOverlayButton);
+        auto* flyout = new QWidget(flyoutMenu);
+        auto* grid = new QGridLayout(flyout);
+        grid->setSizeConstraint(QLayout::SetMinimumSize);
+        grid->setContentsMargins(12, 8, 12, 8);
+        grid->setHorizontalSpacing(10);
+        grid->setVerticalSpacing(6);
+        // A fixed title ("Fiber Overlay", or "Overlay" in the advanced mode);
+        // what is actually shown, or why nothing is, sits in its tooltip and
+        // in the toolbar button's.
+        _presenceOverlayHeader = new QLabel(flyout);
+        _presenceOverlayHeader->setObjectName(QStringLiteral("lineAnnotationPresenceOverlayHeader"));
+        {
+            QFont font = _presenceOverlayHeader->font();
+            font.setBold(true);
+            _presenceOverlayHeader->setFont(font);
+        }
+        grid->addWidget(_presenceOverlayHeader, 0, 0, 1, 3);
+
+        // Advanced mode: any project volume instead of the presence channel,
+        // picked right under the title by its full file name. The row only
+        // shows while advanced is on, so the default flyout stays the
+        // three-row presence panel.
+        _presenceVolumeCombo = new QComboBox(flyout);
+        _presenceVolumeCombo->setObjectName(QStringLiteral("lineAnnotationPresenceVolumeCombo"));
+        _presenceVolumeCombo->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+        _presenceVolumeCombo->setMaximumWidth(560);
+        _presenceVolumeCombo->setToolTip(tr("Any volume attached to the project."));
+        installComboEventFilter(_presenceVolumeCombo, this);
+        grid->addWidget(_presenceVolumeCombo, 1, 0, 1, 3);
+        connect(_presenceVolumeCombo, qOverload<int>(&QComboBox::currentIndexChanged), this,
+                [this](int index) {
+                    if (!_presenceVolumeCombo || index < 0) {
+                        return;
+                    }
+                    const std::string id =
+                        _presenceVolumeCombo->itemData(index).toString().toStdString();
+                    if (id.empty() || id == _presenceOverlay.volumeId) {
+                        return;
+                    }
+                    _presenceOverlay.volumeId = id;
+                    savePresenceOverlaySettings();
+                    updatePresenceOverlayUi();
+                    if (_presenceOverlay.enabled && _presenceOverlay.advanced) {
+                        emit presenceOverlaySourceChanged();
+                    }
+                });
+
+        const auto addSliderRow = [&](int row, const QString& label, int maximum,
+                                      QSlider*& slider, QLabel*& value,
+                                      const QString& tooltip) {
+            auto* rowLabel = new QLabel(label, flyout);
+            rowLabel->setToolTip(tooltip);
+            grid->addWidget(rowLabel, row, 0);
+            slider = new QSlider(Qt::Horizontal, flyout);
+            slider->setRange(0, maximum);
+            slider->setFixedWidth(140);
+            slider->setToolTip(tooltip);
+            grid->addWidget(slider, row, 1);
+            value = new QLabel(flyout);
+            value->setMinimumWidth(36);
+            value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            grid->addWidget(value, row, 2);
+        };
+        addSliderRow(2, tr("Opacity"), 100, _presenceOpacitySlider, _presenceOpacityValue,
+                     tr("Blend opacity where presence is strongest. Weaker presence fades "
+                        "toward transparent."));
+        _presenceOpacitySlider->setObjectName(QStringLiteral("lineAnnotationPresenceOpacitySlider"));
+        // Sliders apply live on every tick; the settings file is written once
+        // per drag (on release) or per keyboard/wheel step.
+        connect(_presenceOpacitySlider, &QSlider::valueChanged, this, [this](int value) {
+            _presenceOverlay.opacity = std::clamp(value / 100.0, 0.0, 1.0);
+            if (_presenceOpacityValue) {
+                _presenceOpacityValue->setText(QStringLiteral("%1%").arg(value));
+            }
+            if (!_presenceOpacitySlider->isSliderDown()) {
+                savePresenceOverlaySettings();
+            }
+            applyPresenceOverlayToPanes();
+        });
+        connect(_presenceOpacitySlider, &QSlider::sliderReleased, this, [this]() {
+            savePresenceOverlaySettings();
+        });
+
+        auto* colorLabel = new QLabel(tr("Colour"), flyout);
+        grid->addWidget(colorLabel, 3, 0);
+        _presenceColorButton = new QPushButton(flyout);
+        _presenceColorButton->setObjectName(QStringLiteral("lineAnnotationPresenceColorButton"));
+        _presenceColorButton->setFixedSize(44, 20);
+        _presenceColorButton->setToolTip(tr("Choose the overlay colour."));
+        grid->addWidget(_presenceColorButton, 3, 1, Qt::AlignLeft);
+        connect(_presenceColorButton, &QPushButton::clicked, this, [this]() {
+            const QColor chosen = QColorDialog::getColor(
+                QColor(QString::fromStdString(_presenceOverlay.colorHex)),
+                this,
+                tr("Fiber presence colour"));
+            if (!chosen.isValid()) {
+                return;
+            }
+            _presenceOverlay.colorHex = chosen.name(QColor::HexRgb).toStdString();
+            savePresenceOverlaySettings();
+            updatePresenceOverlayUi();
+            applyPresenceOverlayToPanes();
+        });
+
+        addSliderRow(4, tr("Threshold"), 254, _presenceThresholdSlider, _presenceThresholdValue,
+                     tr("Presence below this value (0-255) is not drawn at all; the fade "
+                        "starts here."));
+        _presenceThresholdSlider->setObjectName(
+            QStringLiteral("lineAnnotationPresenceThresholdSlider"));
+        connect(_presenceThresholdSlider, &QSlider::valueChanged, this, [this](int value) {
+            _presenceOverlay.threshold = std::clamp(value, 0, 254);
+            if (_presenceThresholdValue) {
+                _presenceThresholdValue->setText(QString::number(value));
+            }
+            if (!_presenceThresholdSlider->isSliderDown()) {
+                savePresenceOverlaySettings();
+            }
+            applyPresenceOverlayToPanes();
+        });
+        connect(_presenceThresholdSlider, &QSlider::sliderReleased, this, [this]() {
+            savePresenceOverlaySettings();
+        });
+
+        auto* flyoutAction = new QWidgetAction(flyoutMenu);
+        flyoutAction->setDefaultWidget(flyout);
+        flyoutMenu->addAction(flyoutAction);
+        _presenceFlyoutAction = flyoutAction;
+        _presenceOverlayButton->setMenu(flyoutMenu);
+        // The popup owns the keyboard while it is open, so the dialog's key
+        // handling never sees a "P" typed there. These objects get the
+        // dialog's filter, restricted (by the property) to the overlay toggle
+        // so the menu keeps its arrow/Escape handling and the sliders theirs.
+        for (QObject* object : std::initializer_list<QObject*>{
+                 flyoutMenu, flyout, _presenceOverlayHeader, _presenceOpacitySlider,
+                 _presenceColorButton, _presenceThresholdSlider, _presenceVolumeCombo,
+                 // installComboEventFilter() also filters the popup list; its
+                 // Escape must dismiss the list, not close the dialog.
+                 _presenceVolumeCombo ? static_cast<QObject*>(_presenceVolumeCombo->view())
+                                      : nullptr}) {
+            if (object) {
+                object->setProperty("vc_presence_flyout", true);
+                object->installEventFilter(this);
+            }
+        }
+    }
+    buttonLayout->addWidget(_presenceOverlayButton);
+    updatePresenceOverlayUi();
 
     auto* maxDistanceLabel = new QLabel(tr("Max extrap CP dist"), buttonRow);
     const QString maxDistanceTooltip = tr(
@@ -1038,7 +1337,7 @@ void LineAnnotationDialog::setFiberOptimizationMode(
 }
 
 void LineAnnotationDialog::setLasagnaDatasetOptions(
-    std::vector<std::pair<std::string, std::string>> options,
+    std::vector<DatasetMenuOption> options,
     const std::string& selectedLocation)
 {
     _lasagnaDatasetOptions = std::move(options);
@@ -1047,7 +1346,7 @@ void LineAnnotationDialog::setLasagnaDatasetOptions(
 }
 
 void LineAnnotationDialog::setFiberInferenceDatasetOptions(
-    std::vector<std::pair<std::string, std::string>> options,
+    std::vector<DatasetMenuOption> options,
     const std::string& selectedLocation)
 {
     _fiberInferenceDatasetOptions = std::move(options);
@@ -1055,11 +1354,150 @@ void LineAnnotationDialog::setFiberInferenceDatasetOptions(
     rebuildDatasetMenus();
 }
 
+void LineAnnotationDialog::setRawScanOptions(std::vector<RawScanMenuOption> options,
+                                             const std::string& selectedScanKey,
+                                             std::vector<RawScanLevelOption> levels,
+                                             int currentLevel)
+{
+    _rawScanOptions = std::move(options);
+    _selectedRawScanKey = selectedScanKey;
+    _rawScanLevelOptions = std::move(levels);
+    _selectedRawScanLevel = currentLevel;
+    rebuildDatasetMenus();
+}
+
+void LineAnnotationDialog::setVolumeSelectorEntries(std::vector<VolumeSelectorEntry> entries,
+                                                    const std::string& currentVolumeId)
+{
+    if (!_volumeSelect) {
+        return;
+    }
+    const QSignalBlocker blocker(_volumeSelect);
+    _volumeSelect->clear();
+    int current = -1;
+    for (const auto& entry : entries) {
+        _volumeSelect->addItem(QString::fromStdString(entry.label),
+                               QString::fromStdString(entry.id));
+        const int row = _volumeSelect->count() - 1;
+        _volumeSelect->setItemData(row, QString::fromStdString(entry.tooltip), Qt::ToolTipRole);
+        if (entry.id == currentVolumeId) {
+            current = row;
+        }
+    }
+    _volumeSelect->setCurrentIndex(current);
+    _volumeSelect->setEnabled(_volumeSelect->count() > 0);
+}
+
+void LineAnnotationDialog::setCurrentVolumeId(const std::string& volumeId)
+{
+    if (!_volumeSelect) {
+        return;
+    }
+    const int index = _volumeSelect->findData(QString::fromStdString(volumeId));
+    if (index >= 0 && index != _volumeSelect->currentIndex()) {
+        const QSignalBlocker blocker(_volumeSelect);
+        _volumeSelect->setCurrentIndex(index);
+    }
+}
+
+bool LineAnnotationDialog::advancedVolumeSelector() const
+{
+    return _presenceOverlay.advanced;
+}
+
+void LineAnnotationDialog::setAdvancedMode(bool advanced)
+{
+    if (_presenceOverlay.advanced != advanced) {
+        _presenceOverlay.advanced = advanced;
+        savePresenceOverlaySettings();
+    }
+    if (_advancedAction && _advancedAction->isChecked() != advanced) {
+        const QSignalBlocker blocker(_advancedAction);
+        _advancedAction->setChecked(advanced);
+    }
+    // Repopulates the flyout (its title and volume row) and, when the
+    // overlay is on, re-resolves its source in the new mode.
+    updatePresenceOverlayUi();
+    if (_presenceOverlay.enabled) {
+        emit presenceOverlaySourceChanged();
+    }
+    emit volumeSelectorScopeChanged();
+}
+
+void LineAnnotationDialog::setSurfaceOptions(std::vector<DatasetMenuOption> options,
+                                             const std::string& selectedVolumeId)
+{
+    _surfaceOptions = std::move(options);
+    _selectedSurfaceVolumeId = selectedVolumeId;
+    rebuildDatasetMenus();
+}
+
 void LineAnnotationDialog::rebuildDatasetMenus()
 {
+    if (_annotationMenu && _annotationMenu->isVisible()) {
+        // Replacing the actions under an open popup discards the highlighted
+        // one (Enter would then activate the wrong entry). The stored options
+        // are current; the rebuild runs when the menu hides.
+        _datasetMenusStale = true;
+        return;
+    }
+    _datasetMenusStale = false;
+    if (_rawScanMenu) {
+        _rawScanMenu->clear();
+        if (_rawScanOptions.empty()) {
+            auto* action = _rawScanMenu->addAction(tr("No scans in the project"));
+            action->setEnabled(false);
+        }
+        for (const auto& option : _rawScanOptions) {
+            auto* action = _rawScanMenu->addAction(QString::fromStdString(option.label));
+            action->setCheckable(true);
+            action->setChecked(option.scanKey == _selectedRawScanKey);
+            action->setToolTip(QString::fromStdString(option.tooltip));
+            const std::string scanKey = option.scanKey;
+            connect(action, &QAction::triggered, this, [this, scanKey]() {
+                emit rawScanSelectionChanged(scanKey);
+            });
+        }
+        // The selected scan's pyramid levels: the level decides the frame the
+        // panes are built in (and how much data they pull); the volume
+        // selector lists the scan once and follows this choice.
+        if (!_rawScanLevelOptions.empty()) {
+            _rawScanMenu->addSeparator();
+            auto* heading = _rawScanMenu->addAction(tr("Level of the selected scan"));
+            heading->setEnabled(false);
+            for (const auto& option : _rawScanLevelOptions) {
+                auto* action = _rawScanMenu->addAction(QString::fromStdString(option.label));
+                action->setCheckable(true);
+                action->setChecked(option.level == _selectedRawScanLevel);
+                const int level = option.level;
+                connect(action, &QAction::triggered, this, [this, level]() {
+                    emit rawScanLevelSelectionChanged(level);
+                });
+            }
+        }
+    }
+    if (_surfaceMenu) {
+        _surfaceMenu->clear();
+        if (_surfaceOptions.empty()) {
+            auto* action = _surfaceMenu->addAction(tr("No surface predictions in the project"));
+            action->setEnabled(false);
+        }
+        for (const auto& option : _surfaceOptions) {
+            auto* action = _surfaceMenu->addAction(QString::fromStdString(option.label));
+            action->setCheckable(true);
+            action->setChecked(option.location == _selectedSurfaceVolumeId);
+            action->setEnabled(option.applicable || option.location == _selectedSurfaceVolumeId);
+            action->setToolTip(QString::fromStdString(
+                option.tooltip.empty() ? option.location : option.tooltip));
+            const std::string id = option.location;
+            connect(action, &QAction::triggered, this, [this, id]() {
+                emit surfaceSelectionChanged(id);
+            });
+        }
+    }
     auto populateMenu =
         [this](QMenu* menu,
-               const std::vector<std::pair<std::string, std::string>>& options,
+               const std::vector<DatasetMenuOption>& options,
                const std::string& selected,
                bool fiberMenu) {
             if (!menu) {
@@ -1073,11 +1511,17 @@ void LineAnnotationDialog::rebuildDatasetMenus()
                 action->setEnabled(false);
                 return;
             }
-            for (const auto& [location, label] : options) {
-                auto* action = menu->addAction(QString::fromStdString(label));
+            for (const auto& option : options) {
+                auto* action = menu->addAction(QString::fromStdString(option.label));
                 action->setCheckable(true);
-                action->setChecked(location == selected);
-                action->setToolTip(QString::fromStdString(location));
+                action->setChecked(option.location == selected);
+                // Greyed entries stay listed so the user sees what exists and
+                // why it cannot be picked here; the selected one stays enabled
+                // even when it no longer applies, so it can be seen and changed.
+                action->setEnabled(option.applicable || option.location == selected);
+                action->setToolTip(QString::fromStdString(
+                    option.tooltip.empty() ? option.location : option.tooltip));
+                const std::string location = option.location;
                 connect(action, &QAction::triggered, this, [this, location, fiberMenu]() {
                     if (fiberMenu) {
                         emit fiberInferenceDatasetSelectionChanged(location);
@@ -1690,6 +2134,238 @@ void LineAnnotationDialog::applyLinkedCursorMirroringToPanes()
     }
 }
 
+bool LineAnnotationDialog::presenceOverlayEnabled() const
+{
+    return _presenceOverlay.enabled;
+}
+
+void LineAnnotationDialog::setPresenceOverlaySource(std::shared_ptr<Volume> volume,
+                                                    int maxDisplayedResolution,
+                                                    const QString& description)
+{
+    _presenceOverlayVolume = std::move(volume);
+    _presenceOverlayMaxDisplayedResolution = std::clamp(maxDisplayedResolution, 0, 5);
+    _presenceOverlayDescription = description;
+    updatePresenceOverlayUi();
+    applyPresenceOverlayToPanes();
+}
+
+std::vector<CChunkedVolumeViewer*> LineAnnotationDialog::presenceOverlayPanes() const
+{
+    std::vector<CChunkedVolumeViewer*> panes;
+    if (_currentCutViewer) {
+        panes.push_back(_currentCutViewer.data());
+    }
+    if (_sideCutViewer) {
+        panes.push_back(_sideCutViewer.data());
+    }
+    for (const auto& strip : _stripViewers) {
+        if (strip) {
+            panes.push_back(strip.data());
+        }
+    }
+    return panes;
+}
+
+void LineAnnotationDialog::applyPresenceOverlayToPane(CChunkedVolumeViewer* viewer)
+{
+    if (!viewer) {
+        return;
+    }
+    // From here on the app-wide Overlay panel no longer reaches this pane;
+    // whatever it pushed at creation is replaced below.
+    viewer->setOverlayLocallyManaged(true);
+    // setOverlayVolume drops and rebuilds the overlay surface cache even for
+    // the volume already assigned, so it is only called on an actual change;
+    // the blend parameters below are cheap to re-set.
+    const bool volumeChanged = viewer->overlayVolume() != _presenceOverlayVolume;
+    if (!_presenceOverlay.enabled || !_presenceOverlayVolume) {
+        if (viewer->overlayVolume()) {
+            viewer->setOverlayVolume(nullptr);
+        }
+        return;
+    }
+    const QColor color(QString::fromStdString(_presenceOverlay.colorHex));
+    viewer->setOverlayValueWeightedAlpha(true);
+    // Presence is read at the cut/strip surface itself; no layer compositing.
+    viewer->setOverlayComposite(OverlayCompositeSettings{});
+    // The export is 8x coarser than the scroll; trilinear hides the blocks.
+    viewer->setOverlaySamplingMethod(vc::Sampling::Trilinear);
+    viewer->setOverlayMaxDisplayedResolution(_presenceOverlayMaxDisplayedResolution);
+    viewer->setOverlayColormap(vc::tintColormapId(
+        static_cast<uint8_t>(color.red()),
+        static_cast<uint8_t>(color.green()),
+        static_cast<uint8_t>(color.blue())));
+    viewer->setOverlayWindow(static_cast<float>(_presenceOverlay.threshold), 255.0f);
+    viewer->setOverlayOpacity(static_cast<float>(_presenceOverlay.opacity));
+    // Volume last: its render sees every setting above in one pass.
+    if (volumeChanged) {
+        viewer->setOverlayVolume(_presenceOverlayVolume);
+    }
+}
+
+void LineAnnotationDialog::applyPresenceOverlayToPanes()
+{
+    for (auto* viewer : presenceOverlayPanes()) {
+        applyPresenceOverlayToPane(viewer);
+    }
+}
+
+void LineAnnotationDialog::updatePresenceOverlayUi()
+{
+    const QColor color(QString::fromStdString(_presenceOverlay.colorHex));
+    if (_presenceOverlayAction) {
+        {
+            const QSignalBlocker blocker(_presenceOverlayAction);
+            _presenceOverlayAction->setChecked(_presenceOverlay.enabled);
+        }
+        // Swatch icon: the current colour with a thin border so a light colour
+        // still reads as a button face.
+        QPixmap swatch(14, 14);
+        swatch.fill(Qt::transparent);
+        {
+            QPainter painter(&swatch);
+            painter.setPen(QPen(QColor(0, 0, 0, 160), 1));
+            painter.setBrush(color);
+            painter.drawRect(0, 0, 13, 13);
+        }
+        _presenceOverlayAction->setIcon(QIcon(swatch));
+        QString tooltip = _presenceOverlay.advanced
+            ? tr("Overlay on panes (P): the chosen volume on the four panes.")
+            : tr("Overlay on panes (P): the selected fiber dataset's presence "
+                 "channel on the four panes.");
+        if (!_presenceOverlayDescription.isEmpty()) {
+            tooltip += QStringLiteral("\n") + _presenceOverlayDescription;
+        }
+        _presenceOverlayAction->setToolTip(tooltip);
+    }
+    if (_presenceOverlayHeader) {
+        _presenceOverlayHeader->setText(_presenceOverlay.advanced ? tr("Overlay")
+                                                                  : tr("Fiber Overlay"));
+        QString status;
+        if (!_presenceOverlay.enabled) {
+            status = tr("Off (P toggles it).");
+        } else if (_presenceOverlayVolume) {
+            status = _presenceOverlayDescription.isEmpty()
+                ? tr("Shown on the four panes.")
+                : _presenceOverlayDescription;
+        } else if (!_presenceOverlayDescription.isEmpty()) {
+            status = tr("Not shown: %1").arg(_presenceOverlayDescription);
+        } else {
+            status = tr("Resolving the overlay volume...");
+        }
+        _presenceOverlayHeader->setToolTip(status);
+    }
+    if (_presenceVolumeCombo) {
+        const QSignalBlocker blocker(_presenceVolumeCombo);
+        const bool rowChanged =
+            _presenceVolumeCombo->isVisibleTo(_presenceVolumeCombo->parentWidget()) !=
+            _presenceOverlay.advanced;
+        _presenceVolumeCombo->setVisible(_presenceOverlay.advanced);
+        if (rowChanged && _presenceFlyoutAction) {
+            // QMenu lays its items out from sizes cached when the action was
+            // added; showing or hiding a row must invalidate that cache (an
+            // action's visibility change does), or the popup keeps its old
+            // height and the rows crowd. The re-pop below applies it when the
+            // flyout is open.
+            _presenceVolumeCombo->parentWidget()->adjustSize();
+            _presenceFlyoutAction->setVisible(false);
+            _presenceFlyoutAction->setVisible(true);
+        }
+        _presenceVolumeCombo->clear();
+        int selectedIndex = -1;
+        for (const auto& [id, label] : _presenceVolumeOptions) {
+            _presenceVolumeCombo->addItem(label, QString::fromStdString(id));
+            if (id == _presenceOverlay.volumeId) {
+                selectedIndex = _presenceVolumeCombo->count() - 1;
+            }
+        }
+        if (selectedIndex < 0 && !_presenceOverlay.volumeId.empty()) {
+            // Persisted from another project: keep the choice visible rather
+            // than silently switching volumes.
+            _presenceVolumeCombo->addItem(
+                tr("%1 (not in this project)").arg(QString::fromStdString(_presenceOverlay.volumeId)),
+                QString::fromStdString(_presenceOverlay.volumeId));
+            selectedIndex = _presenceVolumeCombo->count() - 1;
+        }
+        if (selectedIndex < 0 && _presenceVolumeCombo->count() > 0) {
+            _presenceVolumeCombo->insertItem(0, tr("(choose a volume)"), QString());
+            selectedIndex = 0;
+        }
+        _presenceVolumeCombo->setCurrentIndex(selectedIndex);
+        _presenceVolumeCombo->setEnabled(_presenceVolumeCombo->count() > 0);
+    }
+    if (_presenceOpacitySlider) {
+        const QSignalBlocker blocker(_presenceOpacitySlider);
+        _presenceOpacitySlider->setValue(
+            static_cast<int>(std::lround(_presenceOverlay.opacity * 100.0)));
+    }
+    if (_presenceOpacityValue) {
+        _presenceOpacityValue->setText(QStringLiteral("%1%").arg(
+            static_cast<int>(std::lround(_presenceOverlay.opacity * 100.0))));
+    }
+    if (_presenceThresholdSlider) {
+        const QSignalBlocker blocker(_presenceThresholdSlider);
+        _presenceThresholdSlider->setValue(_presenceOverlay.threshold);
+    }
+    if (_presenceThresholdValue) {
+        _presenceThresholdValue->setText(QString::number(_presenceOverlay.threshold));
+    }
+    if (_presenceColorButton) {
+        _presenceColorButton->setStyleSheet(
+            QStringLiteral("background-color: %1; border: 1px solid #888;")
+                .arg(color.name(QColor::HexRgb)));
+    }
+    relayoutPresenceOverlayFlyout();
+}
+
+void LineAnnotationDialog::relayoutPresenceOverlayFlyout()
+{
+    auto* menu = _presenceOverlayButton ? _presenceOverlayButton->menu() : nullptr;
+    auto* flyout = _presenceVolumeCombo ? _presenceVolumeCombo->parentWidget() : nullptr;
+    if (!menu || !flyout || !menu->isVisible()) {
+        return;
+    }
+    // Let pending show/hide and text changes settle into the size hint first.
+    flyout->updateGeometry();
+    if (flyout->sizeHint().height() == flyout->height() &&
+        flyout->sizeHint().width() <= flyout->width()) {
+        return;
+    }
+    const QPoint pos = menu->pos();
+    menu->hide();
+    QTimer::singleShot(0, menu, [menu, pos]() { menu->popup(pos); });
+}
+
+void LineAnnotationDialog::savePresenceOverlaySettings() const
+{
+    using namespace vc3d::settings::line_annotation;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(PRESENCE_OVERLAY_ENABLED, _presenceOverlay.enabled);
+    settings.setValue(PRESENCE_OVERLAY_OPACITY, _presenceOverlay.opacity);
+    settings.setValue(PRESENCE_OVERLAY_COLOR, QString::fromStdString(_presenceOverlay.colorHex));
+    settings.setValue(PRESENCE_OVERLAY_THRESHOLD, _presenceOverlay.threshold);
+    settings.setValue(PRESENCE_OVERLAY_ADVANCED, _presenceOverlay.advanced);
+    settings.setValue(PRESENCE_OVERLAY_VOLUME_ID, QString::fromStdString(_presenceOverlay.volumeId));
+}
+
+bool LineAnnotationDialog::presenceOverlayAdvanced() const
+{
+    return _presenceOverlay.advanced;
+}
+
+const std::string& LineAnnotationDialog::presenceOverlayVolumeId() const
+{
+    return _presenceOverlay.volumeId;
+}
+
+void LineAnnotationDialog::setPresenceOverlayVolumeOptions(
+    std::vector<std::pair<std::string, QString>> options)
+{
+    _presenceVolumeOptions = std::move(options);
+    updatePresenceOverlayUi();
+}
+
 void LineAnnotationDialog::requestLinkedCursorMirror(CChunkedVolumeViewer* source,
                                                      const std::optional<cv::Vec3f>& point)
 {
@@ -1763,7 +2439,8 @@ void LineAnnotationDialog::anchorGeneratedStripSurfacesForUpdate(
     QuadSurface* newLineSurface,
     QuadSurface* newLineSideSlice,
     const vc::lasagna::LineStripPositionMap& newPositionMap,
-    const std::vector<cv::Vec3f>& newLinePoints) const
+    const std::vector<cv::Vec3f>& newLinePoints,
+    double newFiberBaseToVolumeScale) const
 {
     if (!_hasGeneratedViews || _stripViewers.size() != 2 || newLinePoints.empty()) {
         return;
@@ -1797,7 +2474,8 @@ void LineAnnotationDialog::anchorGeneratedStripSurfacesForUpdate(
         // under the new strip's (un-shifted) parameterization.
         const double newPosition =
             vc3d::line_annotation::remappedGeneratedLinePosition(
-                _generatedViews.linePoints, newLinePoints, oldPosition);
+                _generatedViews.linePoints, newLinePoints, oldPosition,
+                newFiberBaseToVolumeScale / _generatedViews.fiberBaseToVolumeScale);
         const auto* points = newQuad->rawPointsPtr();
         if (!points || points->empty()) {
             continue;
@@ -1889,7 +2567,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             vc3d::line_annotation::remappedGeneratedLinePosition(
                 _heldGeneratedViews.linePoints,
                 _generatedViews.linePoints,
-                previousLinePosition);
+                previousLinePosition,
+                _generatedViews.fiberBaseToVolumeScale /
+                    _heldGeneratedViews.fiberBaseToVolumeScale);
         _currentLinePosition =
             std::clamp(targetLinePosition, 0.0, maxLinePosition);
         // The one step of the in-place update that can fail, validated before
@@ -2202,6 +2882,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             });
     topSplitter->addWidget(currentViewer);
     _currentCutViewer = currentViewer;
+    applyPresenceOverlayToPane(currentViewer);
     _panes.push_back(Pane{views.currentCutName, currentViewer, {}});
     connectGeneratedOverlayRefresh(currentViewer);
 
@@ -2262,6 +2943,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             });
     topSplitter->addWidget(sideViewer);
     _sideCutViewer = sideViewer;
+    applyPresenceOverlayToPane(sideViewer);
     _panes.push_back(Pane{views.sideCutName, sideViewer, {}});
     connectGeneratedOverlayRefresh(sideViewer);
     topSplitter->setStretchFactor(0, 1);
@@ -2385,6 +3067,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                 });
         stripSplitter->addWidget(viewer);
         _stripViewers.push_back(viewer);
+        applyPresenceOverlayToPane(viewer);
         _panes.push_back(Pane{surfaceName, viewer, {}});
         connectGeneratedOverlayRefresh(viewer);
         // Strips share their along-line position and zoom; overlaysUpdated is
@@ -5043,7 +5726,24 @@ bool LineAnnotationDialog::event(QEvent* event)
     if (event && event->type() == QEvent::WindowDeactivate) {
         stopArrowPanForFocusLoss();
     }
+    if (claimPresenceOverlayShortcut(event)) {
+        return true;
+    }
     return QMainWindow::event(event);
+}
+
+bool LineAnnotationDialog::claimPresenceOverlayShortcut(QEvent* event)
+{
+    if (!event || event->type() != QEvent::ShortcutOverride || !_presenceOverlayAction) {
+        return false;
+    }
+    auto* keyEvent = static_cast<QKeyEvent*>(event);
+    if (keyEvent->key() != Qt::Key_P || keyEvent->modifiers() != Qt::NoModifier ||
+        keyboardFocusIsTextEntry()) {
+        return false;
+    }
+    keyEvent->accept();
+    return true;
 }
 
 void LineAnnotationDialog::stopArrowPanForFocusLoss()
@@ -5127,6 +5827,13 @@ bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
     if (event->key() == Qt::Key_B && event->modifiers() == Qt::NoModifier &&
         !event->isAutoRepeat()) {
         resetGeneratedNormalOffsets();
+        event->accept();
+        return true;
+    }
+    // "P" flips the presence overlay; typed into a text widget it stays text.
+    if (event->key() == Qt::Key_P && event->modifiers() == Qt::NoModifier &&
+        !event->isAutoRepeat() && !keyboardFocusIsTextEntry() && _presenceOverlayAction) {
+        _presenceOverlayAction->toggle();
         event->accept();
         return true;
     }
@@ -5240,6 +5947,24 @@ bool LineAnnotationDialog::handleKeyRelease(QKeyEvent* event)
 
 bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
 {
+    if (watched && watched->property("vc_presence_flyout").toBool()) {
+        // Flyout popup objects: only the overlay toggle key is handled here;
+        // everything else stays with the menu and its controls.
+        if (claimPresenceOverlayShortcut(event)) {
+            return true;
+        }
+        if (event->type() == QEvent::KeyPress) {
+            auto* keyEvent = static_cast<QKeyEvent*>(event);
+            if (keyEvent->key() == Qt::Key_P && keyEvent->modifiers() == Qt::NoModifier &&
+                !keyEvent->isAutoRepeat() && !keyboardFocusIsTextEntry() &&
+                _presenceOverlayAction) {
+                _presenceOverlayAction->toggle();
+                keyEvent->accept();
+                return true;
+            }
+        }
+        return QMainWindow::eventFilter(watched, event);
+    }
     if (watched == _fiberNameLabel && event->type() == QEvent::Resize) {
         updateFiberNameLabel();
     }
@@ -5255,6 +5980,9 @@ bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
     if (_arrowPanSpeedLabel && watched == _arrowPanSpeedLabel->parentWidget() &&
         event->type() == QEvent::Resize) {
         updateArrowPanSpeedIndicator();
+    }
+    if (claimPresenceOverlayShortcut(event)) {
+        return true;
     }
     if (event->type() == QEvent::KeyPress) {
         auto* keyEvent = static_cast<QKeyEvent*>(event);

@@ -146,3 +146,31 @@ TEST_CASE("buildWindowLevelColormapLut: unknown id falls back to first spec")
     CHECK(fire == unknown);
 }
 
+
+TEST_CASE("buildWindowLevelColormapLut: a free tint matches the preset of the same colour")
+{
+    LUT preset{};
+    LUT free{};
+    vc::buildWindowLevelColormapLut(preset, 16.0f, 255.0f, "magenta");
+    vc::buildWindowLevelColormapLut(free, 16.0f, 255.0f, "tint:ff00ff");
+    CHECK(preset == free);
+    // Black at zero, full colour at the window top, ramping in between.
+    CHECK(free[0] == kAlpha);
+    CHECK(R(free[255]) == 255);
+    CHECK(G(free[255]) == 0);
+    CHECK(B(free[255]) == 255);
+    CHECK(R(free[16]) == 0);
+    CHECK(R(free[136]) > 0);
+    CHECK(R(free[136]) < 255);
+}
+
+TEST_CASE("buildWindowLevelColormapLut: a free tint scales each channel by its value")
+{
+    LUT lut{};
+    vc::buildWindowLevelColormapLut(lut, 0.0f, 255.0f, "tint:ff8000");
+    CHECK(R(lut[255]) == 255);
+    CHECK(G(lut[255]) == 128);
+    CHECK(B(lut[255]) == 0);
+    CHECK(R(lut[128]) == 128);
+    CHECK(G(lut[128]) == 64);
+}
