@@ -56,23 +56,6 @@ def _direct_training_lines(row):
 
 def format_training_log(row):
     step = f"Step {row['step']:,}" if 'step' in row else 'Training'
-    if 'beam_rollout' in row:
-        threshold = row['threshold']
-        gate = f" @ {threshold:.2f}" if threshold is not None else ''
-        return (f"\n{step} | beam rollout {row['beam_rollout']}{gate} | {row['n']} seeds\n"
-                f"  coverage {row['coverage_mean']:.1%} | precision {row['length_precision']:.1%}"
-                f" | diverged {row['diverged']:.1%}\n"
-                f"  image: {row['image']}")
-    if 'span_fibers' in row:
-        if not row['span_fibers']:
-            return f'\n{step} | beam spans | no held-out fibers'
-        lines = [f"\n{step} | beam spans | {row['span_fibers']} fibers"
-                 f" | {row['span_segments']} spans | {row['span_length_grid']:.1f} voxels"]
-        for method in ('hand', 'model'):
-            if f'span_success_{method}' in row:
-                lines.append(f"  {method}: success {row[f'span_success_{method}']:.1%}"
-                             f" | restarts / 1,000 voxels {row[f'span_restarts_kvx_{method}']:.3f}")
-        return '\n'.join(lines)
     if 'recovery' in row:
         report = row['recovery']
         lines = [f"\n{step} | monitor recovery | {report['states']} states"]

@@ -10,7 +10,7 @@ existing rollouts. These defaults perform considerably more work.
 
 The measured improvement changes v11 convolution weights from forced
 `channels_last_3d` to contiguous layout. The shared preparation helper respects
-v11's layout preference and retains channels-last for the beam/legacy models.
+v11's layout preference and retains channels-last for legacy models.
 Architecture, checkpoint keys, crop, batch sizes, precision, sampling and loss
 remain unchanged. Training configuration logs now report the actual layout.
 

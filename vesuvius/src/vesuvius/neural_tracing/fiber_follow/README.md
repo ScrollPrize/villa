@@ -8,7 +8,7 @@ The active follower is `single_path_flow_v11`: a jointly denoised future curve,
 with optional mixed proposals and passage scoring, trained from scratch.
 Historical v10 results and the pre-migration source remain
 in `output/single_path_v11_baseline/`; old follower checkpoints are rejected by
-training/inference. The independent beam model keeps its checkpoint names.
+training/inference.
 
 ## Model and tracing
 
@@ -118,7 +118,7 @@ The launcher runs the full-size GPU preflight in the foreground, then starts
 training in the background. The existing preparation artifacts are reused.
 Preflight and training raise the soft open-file limit before opening mmap
 caches or starting loader workers, using the same shared helper as the direct
-and beam trainers. The system hard limit is unchanged; workers inherit the
+trainer. The system hard limit is unchanged; workers inherit the
 raised limit. This avoids descriptor exhaustion from cached mapped chunks.
 Both generator and scorer learn from scratch; the Gaussian flow-matching loss
 retains its 64 time/noise draws and the image encoder is shared.
@@ -171,8 +171,7 @@ compile after restoring weights/optimizer state. See
 [PERFORMANCE_COMPILE.md](PERFORMANCE_COMPILE.md) for the measured 32% reduction
 in update time and roughly halved allocated GPU memory compared with eager
 training using encoder reuse.
-The v11 convolution layout was selected by full-crop CUDA measurements; the beam
-model retains channels-last. See [PERFORMANCE.md](PERFORMANCE.md) for results,
+The v11 convolution layout was selected by full-crop CUDA measurements. See [PERFORMANCE.md](PERFORMANCE.md) for results,
 numerical checks, and commands to compare layouts on another GPU.
 A detached curve pass establishes masked-loss denominators across the effective
 batch; each microbatch reuses its encoder graph for flow/confidence gradients. Censoring
@@ -289,7 +288,7 @@ Tests cover attention across futures and full history, masked and unsupported
 observations, GT isolation, endpoint censoring, departed states, confidence gradient
 routes, recovery limits, coordinate transforms, seeded Gaussian inference, legacy
 zero-start inference, independence from batch grouping and diagnostic RNG, midpoint
-integration, replay import/rotation, checkpoint round trips, beam compatibility,
+integration, replay import/rotation, checkpoint round trips,
 accumulation, collection and synthetic parallel-fiber identity recovery.
 
 The original zero-start full-crop RTX 5090 benchmark passed: microbatch 2, effective batch 8,
@@ -307,16 +306,3 @@ produced a resumable Gaussian checkpoint; two short traces from that checkpoint
 published nine replay states. These are implementation checks; no accuracy improvement from
 Gaussian sampling is claimed. CT level 1 losing fine neighboring fiber detail
 remains an experimental risk.
-
-## Learned beam scoring (`beam/`)
-
-The untrained beam model now replaces native candidate step costs before
-heuristic pruning. It scores every valid cone proposal using a single level-1
-CT crop (192 × 96 × 96; 128 voxels behind and 63 ahead), candidate-specific
-recent paths, and observed history. C++ retains search, endpoint constraints,
-and fusion. CT loading shares the direct model's tight-block, mmap-backed
-sampler. There is no coordinate decoder or tube objective.
-
-See [`beam/README.md`](beam/README.md) for the scoring contract, build and
-training commands, validation, and limitations. New checkpoints use
-`beam_step_cost_v3`; previous beam checkpoints are incompatible.

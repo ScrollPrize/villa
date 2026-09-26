@@ -1,6 +1,6 @@
 """Method-agnostic pieces of a fiber_follow training run.
 
-Shared by the flow follower, direct follower and beam re-ranker:
+Shared by the flow follower and direct follower:
 run directory creation, the JSON-lines log, the
 warmup-cosine schedule, one guarded optimizer step, and checkpoint I/O that
 records which architecture and data policy produced the weights.
@@ -22,8 +22,8 @@ from vesuvius.neural_tracing.fiber_follow.data import DATA_POLICY
 def raise_open_file_limit():
     """Raise the soft descriptor limit before opening mmap caches or workers.
 
-    Workers and collector subprocesses inherit this limit. Keep the beam
-    trainer's macOS cap and leave the system hard limit unchanged.
+    Workers and collector subprocesses inherit this limit. Keep the macOS
+    cap and leave the system hard limit unchanged.
     """
     try:
         import resource

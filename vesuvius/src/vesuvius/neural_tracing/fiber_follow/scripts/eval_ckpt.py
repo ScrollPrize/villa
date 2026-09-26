@@ -2,12 +2,6 @@
 
   python scripts/eval_ckpt.py field --seeds-only
   python scripts/eval_ckpt.py output/controlled_v2/ckpt_001500.pt --tag controlled_v2
-  python scripts/eval_ckpt.py hand --tag hand_beam            # VC beam, no model
-  python scripts/eval_ckpt.py output/beam_run/last.pt --tag beam_run --params '{"confidence": 0.5}'
-
-Beam scorer checkpoints (``beam_step_cost_v3``) and ``hand`` trace open-ended with
-the volume-cartographer beam through ``BeamTracer``; ``--params`` then accepts
-``max_len`` and ``confidence`` (on-fiber stop threshold).
 """
 from __future__ import annotations
 
@@ -29,13 +23,6 @@ from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume, FiberVolume
 
 FF = Path(__file__).resolve().parents[1]
 LOCAL = '/mnt/raid_nvme/spiral_dataset_working/fiber_zarrs'
-DEFAULT_PREDICTION = LOCAL + '/PHercParis4-20260411134726-las-sd1-7ff0ce6c.lasagna.json'
-DEFAULT_NORMALS = '/mnt/raid_nvme/volpkgs/s1_2um.volpkg/las_008_s1_full/las_008.lasagna.json'
-
-
-def checkpoint_architecture(path):
-    import torch
-    return torch.load(path, map_location='cpu', weights_only=False)['architecture']
 
 
 def main(argv=None):
@@ -54,25 +41,9 @@ def main(argv=None):
     ap.add_argument('--seeds', type=Path, default=None)
     ap.add_argument('--rebuild-seeds', action='store_true')
     ap.add_argument('--seeds-only', action='store_true', help='prepare fixed v2 seeds without running a tracer')
-    ap.add_argument('--prediction-manifest', default=DEFAULT_PREDICTION, help='hand beam only')
-    ap.add_argument('--normal-manifest', default=DEFAULT_NORMALS, help='hand beam only')
-    ap.add_argument('--ct', default=None, help='override the CT zarr of a beam checkpoint')
     args = ap.parse_args(argv)
-    from vesuvius.neural_tracing.fiber_follow.beam.model import ARCHITECTURE as BEAM_ARCHITECTURE
-    beam_ckpt = None
     if args.ckpt == 'field':
         spec = FiberVolumeSpec(args.fiber_zarrs or LOCAL)
-    elif args.ckpt == 'hand':
-        from vesuvius.neural_tracing.fiber_follow.beam.native import BeamSpec
-        spec = FiberVolumeSpec(args.fiber_zarrs or LOCAL)
-        beam_spec = BeamSpec(args.prediction_manifest, args.normal_manifest)
-    elif checkpoint_architecture(args.ckpt) == BEAM_ARCHITECTURE:
-        from vesuvius.neural_tracing.fiber_follow.beam.train import load_beam_checkpoint
-        model, state_cfg, spec, beam_spec, beam_ckpt = load_beam_checkpoint(args.ckpt, 'cpu' if args.seeds_only else args.device)
-        if args.fiber_zarrs:
-            spec.fiber_zarr_dir = args.fiber_zarrs
-        if args.ct:
-            spec.ct_zarr = args.ct
     else:
         model, crop, nh, spec, checkpoint = load_checkpoint(args.ckpt, device='cpu' if args.seeds_only else args.device)
         if args.fiber_zarrs:
@@ -96,15 +67,6 @@ def main(argv=None):
         if params:
             ap.error('--params applies only to ModelTracer')
         tracer = FieldTracer(vol)
-    elif args.ckpt == 'hand' or beam_ckpt is not None:
-        from vesuvius.neural_tracing.fiber_follow.beam.native import NativeBeam
-        from vesuvius.neural_tracing.fiber_follow.beam.trace import BeamTracer
-        hook = None
-        if beam_ckpt is not None:
-            from vesuvius.neural_tracing.fiber_follow.beam.hook import ModelBeamHook
-            hook = ModelBeamHook(model, vol, state_cfg, device=args.device,
-                                 stop_threshold=params.get('confidence'))
-        tracer = BeamTracer(NativeBeam(beam_spec, spec.grid_scale), hook=hook, max_len=params.get('max_len', 6000.))
     else:
         tracer = ModelTracer(model, vol, crop, nh, TraceParams(**params), device=args.device)
     audit = None
@@ -127,7 +89,7 @@ def main(argv=None):
                    reasons=dict(collections.Counter(r['reason'] for r in rows)),
                    seeds_path=str(seeds_path), volume=spec.to_dict(), val_band=dataclasses.asdict(band),
                    fiber_manifest=fiber_manifest(val))
-    tag = args.tag or (args.ckpt if args.ckpt in ('field', 'hand') else Path(args.ckpt).parent.name)
+    tag = args.tag or (args.ckpt if args.ckpt == 'field' else Path(args.ckpt).parent.name)
     if Path(tag).name != tag:
         ap.error('--tag must be a filename component')
     with open(args.out_dir / f'rows_v2_{tag}.pkl', 'wb') as fh:

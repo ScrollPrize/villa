@@ -1,4 +1,4 @@
-"""Shared spatial encoder; root module names preserve beam checkpoints."""
+"""Shared spatial encoder."""
 import math
 import torch
 from torch import nn

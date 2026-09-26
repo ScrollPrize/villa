@@ -50,7 +50,7 @@ set_target_properties(vc_lasagna_amgx PROPERTIES
 
 target_link_libraries(vc_lasagna_amgx PRIVATE vc_lasagna)
 
-set_target_properties(vc_core vc_lasagna vc_fiber_tracer utils utils_c3d_codec c3d PROPERTIES
+set_target_properties(vc_core vc_lasagna utils utils_c3d_codec c3d PROPERTIES
     INSTALL_RPATH "$ORIGIN"
 )
 
@@ -80,19 +80,6 @@ set_target_properties(vc_surface_index PROPERTIES
 target_link_libraries(vc_surface_index PRIVATE vc_core)
 target_compile_features(vc_surface_index PRIVATE cxx_std_23)
 
-nanobind_add_module(vc_fiber_trace
-    NOMINSIZE
-    vc/fiber_trace.cpp
-)
-set_target_properties(vc_fiber_trace PROPERTIES
-    OUTPUT_NAME fiber_trace
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
-    # See vc_volume above: libs are one dir up in site-packages root.
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
-)
-target_link_libraries(vc_fiber_trace PRIVATE vc_fiber_tracer)
-target_compile_features(vc_fiber_trace PRIVATE cxx_std_23)
-
 nanobind_add_module(vc_grid_raycast
     NOMINSIZE
     vc/grid_raycast.cpp
@@ -113,13 +100,13 @@ install(TARGETS vc_lasagna_amgx
     RUNTIME DESTINATION .
 )
 
-install(TARGETS vc_core vc_lasagna vc_fiber_tracer utils utils_c3d_codec c3d
+install(TARGETS vc_core vc_lasagna utils utils_c3d_codec c3d
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
     ARCHIVE DESTINATION .
 )
 
-install(TARGETS vc_volume vc_surface_index vc_grid_raycast vc_fiber_trace
+install(TARGETS vc_volume vc_surface_index vc_grid_raycast
     LIBRARY DESTINATION vc
     RUNTIME DESTINATION vc
 )

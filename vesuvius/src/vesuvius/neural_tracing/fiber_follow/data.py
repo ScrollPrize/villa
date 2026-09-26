@@ -257,10 +257,6 @@ def training_state_allowed(item, crop: CropSpec, band: ZBand | None):
             zs.append((loc @ frame.T + pos)[:, 2])
     if 'tube_segments' in item and len(item['tube_segments']):
         zs.append((item['tube_segments'].reshape(-1, 3) @ frame.T + pos)[:, 2])
-    if 'extra_world' in item and len(item['extra_world']):
-        # World-space geometry a method used to build this state (for example
-        # every beam candidate path), which must also avoid the held-out band.
-        zs.append(np.asarray(item['extra_world'])[:, 2])
     z = np.concatenate(zs)
     return not (z.min() < band.hi and z.max() >= band.lo)
 

@@ -1,4 +1,4 @@
-"""Fast scalar crops shared by the direct follower and the learned beam.
+"""Fast scalar crops for the direct follower.
 
 Read only each oriented crop's tight source block. ChunkedArray memory-maps
 uncompressed Zarr chunks; the fused Numba kernel interpolates and optionally

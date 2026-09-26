@@ -147,7 +147,7 @@ def test_first_connection_and_unknown_end(distance,allowed):
     assert commit_prefix(long,conf,.7)[0].item()==8 and commit_prefix(long,conf,.7,n_commit=16)[0].item()==10
 
 
-def test_checkpoint_roundtrip_rejects_legacy_and_beam_parameter_names(tmp_path):
+def test_checkpoint_roundtrip_rejects_legacy_parameter_names(tmp_path):
     cfg=config();m=FollowNet(cfg).eval();b=batch(cfg,1);expected=run(m,b)
     crop=CropSpec(depth=20,width=12,behind=10)
     sample=D.SampleConfig(crop=crop,n_history=8,recent_history_points=8,n_future=4)
@@ -157,11 +157,6 @@ def test_checkpoint_roundtrip_rejects_legacy_and_beam_parameter_names(tmp_path):
     torch.testing.assert_close(expected['points'],actual['points'],rtol=0,atol=0)
     ck=torch.load(path,weights_only=False);ck['architecture']='future_flow_v10';torch.save(ck,path)
     with pytest.raises(ValueError,match='single_path_flow_v11'): load_checkpoint(path,'cpu')
-    from vesuvius.neural_tracing.fiber_follow.beam.train import load_beam_checkpoint
-    old_beam=tmp_path/'old_beam.pt'
-    torch.save(dict(architecture='beam_rerank_v2',data_policy=D.DATA_POLICY),old_beam)
-    with pytest.raises(ValueError,match='beam_step_cost_v3'):
-        load_beam_checkpoint(old_beam,'cpu')
 
 
 def fiber():

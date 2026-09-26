@@ -541,14 +541,6 @@ void requireNormalSamplerForNormalAwareSmoothness(
         "Lasagna normal sampler is required for tangent/normal fiber trace smoothness");
 }
 
-void validateBeamHookOptions(const FiberTraceBeamHookOptions& options)
-{
-    if (options.everyRounds < 1)
-        throw std::invalid_argument("beam hook every-rounds must be positive");
-    if (options.poolSize < 1)
-        throw std::invalid_argument("beam hook pool size must be positive");
-}
-
 void validateTraceConfig(const FiberTraceConfig& config)
 {
     auto requireFinite = [](double value, const char* name) {
@@ -1847,105 +1839,6 @@ void updateTargetPlaneCrossings(
     return out;
 }
 
-struct BeamHookOutcome {
-    bool fired = false;
-    bool stop = false;
-};
-
-// Selects the hook pool with the same diversity rule as pruning (width =
-// max(poolSize, beamWidth)), materializes it, and calls the hook. When the hook
-// returns replacement losses they are written into `frontier` in place and
-// every non-pool candidate is marked invalid, so the subsequent
-// width-`beamWidth` prune runs over the pool only. Without replacement losses
-// `frontier` is left untouched: the width-`beamWidth` selection is a prefix of
-// the pool selection (selectFrontierCandidateIndices is greedy in a strict
-// total order), so the result is identical to not having called the hook.
-[[nodiscard]] BeamHookOutcome invokeBeamHook(
-    const FiberTraceBeamHookOptions& options,
-    int round,
-    int step,
-    int maxSteps,
-    const std::string& phase,
-    const TraceVec& start,
-    const TraceVec& target,
-    std::vector<FrontierCandidate>& frontier,
-    const std::vector<BeamState>& parents,
-    const std::vector<CandidateTask>& tasks,
-    const std::vector<CandidateScore>& scores,
-    const FiberTraceConfig& config)
-{
-    const int poolWidth = std::max(options.poolSize, config.beamWidth);
-    std::vector<size_t> poolIndices;
-    if (config.learnedScoring) {
-        // No hand-cost sorting, parent cap, or endpoint diversity filter before
-        // the scorer. Retain task order so equal learned scores are stable.
-        for (size_t i = 0; i < frontier.size(); ++i)
-            if (frontier[i].valid && std::isfinite(frontier[i].loss))
-                poolIndices.push_back(i);
-    } else {
-        poolIndices = selectFrontierCandidateIndices(
-            frontier, poolWidth, config.beamPruneDistanceVoxels);
-    }
-    if (poolIndices.empty())
-        return {};
-
-    FiberTraceBeamHookEvent event;
-    event.round = round;
-    event.step = step;
-    event.maxSteps = maxSteps;
-    event.phase = phase;
-    event.startPoint = toVec3d(start);
-    event.targetPoint = toVec3d(target);
-    event.pool.reserve(poolIndices.size());
-    // Candidates share their parent's path: materialize each parent path once.
-    std::vector<size_t> parentSlot(parents.size(), std::numeric_limits<size_t>::max());
-    for (const size_t index : poolIndices) {
-        const BeamState state = beamStateFromFrontierCandidate(
-            parents, tasks, scores, index, frontier[index], config);
-        FiberTraceBeamHookCandidate candidate;
-        const size_t beamIndex = tasks[index].beamIndex;
-        if (parentSlot[beamIndex] == std::numeric_limits<size_t>::max()) {
-            parentSlot[beamIndex] = event.parentPaths.size();
-            event.parentPaths.push_back(beamPathPoints(parents[beamIndex]));
-        }
-        candidate.parentIndex = parentSlot[beamIndex];
-        candidate.endpoint = toVec3d(beamEndpoint(state));
-        candidate.loss = state.loss;
-        const BeamState& parent = parents[beamIndex];
-        candidate.parentLoss = parent.loss;
-        candidate.stepLength = cv::norm(frontier[index].point - beamEndpoint(parent));
-        candidate.depth = state.depth;
-        candidate.tracedLength = static_cast<double>(state.tracedLength);
-        candidate.reached = state.reached;
-        candidate.previousStepDirection = toVec3d(state.previousStepDirection);
-        candidate.currentSampleDirection = toVec3d(state.currentSampleDirection);
-        candidate.historyDirection = toVec3d(state.historyDirection);
-        event.pool.push_back(std::move(candidate));
-    }
-
-    const FiberTraceBeamHookResponse response = options.hook(event);
-    BeamHookOutcome outcome{true, response.stop};
-    if (!response.losses.has_value())
-        return outcome;
-    if (response.losses->size() != poolIndices.size()) {
-        throw std::invalid_argument(
-            "beam hook returned " + std::to_string(response.losses->size()) +
-            " losses for a pool of " + std::to_string(poolIndices.size()));
-    }
-    std::vector<unsigned char> inPool(frontier.size(), 0);
-    for (size_t position = 0; position < poolIndices.size(); ++position) {
-        frontier[poolIndices[position]].loss = (*response.losses)[position];
-        if (!std::isfinite((*response.losses)[position]))
-            frontier[poolIndices[position]].valid = false;
-        inPool[poolIndices[position]] = 1;
-    }
-    for (size_t index = 0; index < frontier.size(); ++index) {
-        if (!inPool[index])
-            frontier[index].valid = false;
-    }
-    return outcome;
-}
-
 [[nodiscard]] size_t exactLookaheadRequiredParentCount(
     const std::vector<BeamState>& parents,
     std::optional<float> resultThreshold,
@@ -2041,7 +1934,6 @@ template <typename LossAt>
     const TraceTargetPlaneSet& targetPlanes,
     std::optional<float> acceptThresholdVoxels,
     const FiberTraceConfig& config,
-    int selectionWidth,
     int lookaheadDepth,
     CandidateScoringScratch& scratch,
     FiberTraceProfile* profile)
@@ -2136,9 +2028,9 @@ template <typename LossAt>
         } else {
             const auto selected = selectFrontierCandidateIndices(
                 frontier,
-                selectionWidth,
+                config.beamWidth,
                 config.beamPruneDistanceVoxels);
-            if (selected.size() >= static_cast<size_t>(selectionWidth)) {
+            if (selected.size() >= static_cast<size_t>(config.beamWidth)) {
                 threshold = 0.0f;
                 for (const size_t index : selected) {
                     threshold = std::max(
@@ -2389,24 +2281,11 @@ template <typename LossAt>
         : legacyGridConeOffsets(
               request.config.coneAngleDegrees,
               request.config.coneGridSize);
-    const FiberTraceBeamHookOptions& hookOptions = request.beamHook;
-    const bool learnedScoring = request.config.learnedScoring && bool(hookOptions.hook);
-    if (learnedScoring && request.config.learnedLookaheadWidth < request.config.beamWidth)
-        throw std::invalid_argument("learned_lookahead_width must cover beam_width");
-    int hookRound = 0;
-    bool hookStopped = false;
     int stepIndex = 0;
     while (stepIndex < maxSteps) {
         std::vector<BeamState> expanded = beams;
         int advanced = 0;
         bool prunedFinalFrontier = false;
-        const bool hookFires = static_cast<bool>(hookOptions.hook) &&
-            (learnedScoring || hookRound % hookOptions.everyRounds == 0);
-        // In hook rounds the lazy lookahead must make the whole pool exact,
-        // not only the top beamWidth; the beamWidth prefix is unchanged.
-        const int lazySelectionWidth = hookFires
-            ? std::max(request.config.beamWidth, hookOptions.poolSize)
-            : request.config.beamWidth;
         for (; advanced < lookaheadSteps && stepIndex + advanced < maxSteps; ++advanced) {
             if (profile != nullptr)
                 ++profile->generations;
@@ -2426,7 +2305,7 @@ template <typename LossAt>
                 stepIndex + advanced + 1 >= maxSteps;
             const bool lazyFinalGeneration =
                 finalLookaheadGeneration && advanced > 0 &&
-                request.config.lazyLookahead && !learnedScoring;
+                request.config.lazyLookahead;
             const std::vector<CandidateTask>* tasksPtr = nullptr;
             const std::vector<TraceVec>* candidatePointsPtr = nullptr;
             const std::vector<CandidateScore>* scoresPtr = nullptr;
@@ -2444,7 +2323,6 @@ template <typename LossAt>
                         targetPlanes,
                         acceptThresholdVoxels,
                         request.config,
-                        lazySelectionWidth,
                         advanced + 1,
                         scoringScratch,
                         profile);
@@ -2467,7 +2345,7 @@ template <typename LossAt>
                 candidatePointsPtr = &scoringScratch.candidatePoints;
                 FrontierScoreOutput frontierOutput;
                 const FrontierScoreOutput* frontierOutputPtr = nullptr;
-                if (finalLookaheadGeneration || learnedScoring) {
+                if (finalLookaheadGeneration) {
                     auto& frontier = scoringScratch.frontierCandidates;
                     frontier.clear();
                     frontier.resize(scoringScratch.tasks.size());
@@ -2497,18 +2375,11 @@ template <typename LossAt>
             const auto& tasks = *tasksPtr;
             const auto& scores = *scoresPtr;
 
-            if (finalLookaheadGeneration || learnedScoring) {
+            if (finalLookaheadGeneration) {
                 auto& frontier = scoringScratch.frontierCandidates;
-                BeamHookOutcome hookOutcome;
-                if (learnedScoring) {
-                    hookOutcome = invokeBeamHook(
-                        hookOptions, hookRound++, stepIndex + advanced + 1,
-                        maxSteps, phase, start, target, frontier, expanded,
-                        tasks, scores, request.config);
-                }
                 const auto bestReachedIndex =
                     bestReachedFrontierCandidateIndex(frontier);
-                if (bestReachedIndex.has_value() && !hookOutcome.stop) {
+                if (bestReachedIndex.has_value()) {
                     if (advanced > 0) {
                         recordExactLookaheadPotential(
                             profile,
@@ -2544,22 +2415,6 @@ template <typename LossAt>
                         request.snapTraceToSelectedCrossing,
                         traceLengthLimitVoxels);
                 }
-                if (hookFires && !learnedScoring) {
-                    hookOutcome = invokeBeamHook(
-                        hookOptions,
-                        hookRound,
-                        stepIndex + advanced + 1,
-                        maxSteps,
-                        phase,
-                        start,
-                        target,
-                        frontier,
-                        expanded,
-                        tasks,
-                        scores,
-                        request.config);
-                }
-                if (!learnedScoring) ++hookRound;
                 const auto pruneStart = TraceClock::now();
                 std::vector<size_t> selectedIndices;
                 beams = pruneFrontierCandidates(
@@ -2567,8 +2422,7 @@ template <typename LossAt>
                     expanded,
                     tasks,
                     scores,
-                    learnedScoring && !finalLookaheadGeneration
-                        ? request.config.learnedLookaheadWidth : request.config.beamWidth,
+                    request.config.beamWidth,
                     request.config.beamPruneDistanceVoxels,
                     request.config,
                     advanced > 0 ? &selectedIndices : nullptr);
@@ -2600,14 +2454,6 @@ template <typename LossAt>
                     reason = "no_valid_candidates";
                     expanded.clear();
                     break;
-                }
-                if (hookOutcome.stop) {
-                    reason = "hook_stop";
-                    hookStopped = true;
-                }
-                if (learnedScoring && !finalLookaheadGeneration && !hookStopped) {
-                    expanded = beams;
-                    continue;
                 }
                 prunedFinalFrontier = true;
                 ++advanced;
@@ -2710,8 +2556,6 @@ template <typename LossAt>
                 : (beams.front().reached ? beams.front().reason : reason);
             progress(event);
         }
-        if (hookStopped)
-            break;
     }
 
     if (beams.empty()) {
@@ -4814,7 +4658,6 @@ FiberTraceOneWayResult traceFiberOneWay(
         throw std::invalid_argument("fiber trace one-way request endpoints must differ");
     }
     validateTraceConfig(request.config);
-    validateBeamHookOptions(request.beamHook);
     requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
     return traceOneWayCore(
         predictions, request, normalSampler, progress, "trace");
@@ -4827,10 +4670,8 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     double distanceVoxels,
     const FiberTraceConfig& config,
     const vc::lasagna::NormalSampler* normalSampler,
-    const FiberTraceProgressCallback& progress,
-    const FiberTraceBeamHookOptions& beamHook)
+    const FiberTraceProgressCallback& progress)
 {
-    validateBeamHookOptions(beamHook);
     if (!finitePoint(startPoint) || !finitePoint(outwardDirection)) {
         throw std::invalid_argument(
             "fiber extrapolation request contains a non-finite point or direction");
@@ -4855,7 +4696,6 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     // to "reach", so the span-bounded endpoint threshold of traceFiberSegment
     // deliberately does not apply.
     request.config = config;
-    request.beamHook = beamHook;
     return traceOneWayCore(
         predictions,
         request,
@@ -4890,7 +4730,6 @@ FiberTraceSegmentResult traceFiberSegment(
     if (request.startIndex == request.targetIndex)
         throw std::invalid_argument("fiber trace request start and target indices must differ");
     validateTraceConfig(request.config);
-    validateBeamHookOptions(request.beamHook);
     requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
 
     FiberTraceSegmentResult result;
@@ -4923,7 +4762,6 @@ FiberTraceSegmentResult traceFiberSegment(
     forwardOneWay.snapTraceToSelectedCrossing = false;
     forwardOneWay.budgetSpanVoxels = span;
     forwardOneWay.config = config;
-    forwardOneWay.beamHook = request.beamHook;
     FiberTraceOneWayRequest reverseOneWay;
     reverseOneWay.startPoint = target;
     reverseOneWay.targetPoint = start;
@@ -4940,7 +4778,6 @@ FiberTraceSegmentResult traceFiberSegment(
     reverseOneWay.snapTraceToSelectedCrossing = false;
     reverseOneWay.budgetSpanVoxels = span;
     reverseOneWay.config = config;
-    reverseOneWay.beamHook = request.beamHook;
 
     result.forward = traceOneWayCore(
         predictions, forwardOneWay, normalSampler, progress, "forward");
@@ -5014,7 +4851,6 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
             "whole-fiber metric control-point line-index count mismatch");
     }
     validateTraceConfig(request.config);
-    validateBeamHookOptions(request.beamHook);
     requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
 
     const auto lineWorking =
@@ -5109,7 +4945,6 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
         oneWay.snapTraceToSelectedCrossing = false;
         oneWay.budgetSpanVoxels = budgetSpan;
         oneWay.config = request.config;
-        oneWay.beamHook = request.beamHook;
 
         FiberTraceWholeFiberSegmentResult segment;
         segment.startControlPointIndex = cpIndex;
