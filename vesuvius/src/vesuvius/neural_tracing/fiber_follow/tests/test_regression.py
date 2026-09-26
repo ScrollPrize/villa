@@ -521,7 +521,7 @@ def test_tight_blocks_match_rotation_invariant_blocks_at_array_edges():
             scale = 1. if use_presence else vol.input_scale
             for j, item in enumerate(items):
                 out[j, int(use_presence)] = sample_crop(raw[j], starts[j], item['pos']*scale, item['frame']*scale, grid,
-                    False, empty, mask, 2, 1., 'points')[0].reshape(crop.depth, crop.width, crop.width)
+                    empty, mask, 2, 1., 'points')[0].reshape(crop.depth, crop.width, crop.width)
         return torch.from_numpy(out)
 
     items = []

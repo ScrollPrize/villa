@@ -19,6 +19,6 @@ def scalar_crops(items, vol, crop, pool=None, *, presence=False):
     result = np.empty((len(items), 1, crop.depth, crop.width, crop.width), np.float32)
     for j, item in enumerate(items):
         sampled = sample_crop(raw[j], starts[j], item['pos']*scale, item['frame']*scale,
-                              grid, False, empty, mask, 2, crop.history_sigma, crop.history_render)
+                              grid, empty, mask, 2, crop.history_sigma, crop.history_render)
         result[j] = sampled[:1].reshape(1, crop.depth, crop.width, crop.width)
     return torch.from_numpy(result)

@@ -21,8 +21,7 @@ class CropSpec:
     width: int = 64  # samples along u and v
     behind: int = 16  # samples behind the current point
     spacing: float = 1.0
-    # multiply the direction (axis-tensor) channels by presence so direction
-    # is only "loud" on fibers (the field is dense noise in empty space)
+    # Retired direction-field option; kept so saved crops still load.
     gate_direction: bool = False
     history_render: str = 'points'
     history_sigma: float = 1.0  # trace-grid voxels
@@ -30,6 +29,8 @@ class CropSpec:
     def __post_init__(self):
         if self.history_render not in ('points', 'segments') or not np.isfinite(self.history_sigma) or self.history_sigma <= 0:
             raise ValueError('Invalid history rendering mode or sigma')
+        if self.gate_direction:
+            raise ValueError('Direction-field inputs are no longer supported')
 
     @property
     def forward_coords(self) -> np.ndarray:
@@ -156,35 +157,12 @@ def sample_oriented_fast(
     pos_xyz: torch.Tensor,
     frames: torch.Tensor,
     local_grid: torch.Tensor,
-    gate_direction: bool = False,
 ) -> torch.Tensor:
-    """Oriented crop straight from raw uint8 blocks (presence, nx, ny[, ct]).
-
-    Presence/CT are trilinear; the fiber axis is taken from the nearest voxel
-    and decoded only at crop points, then expressed in the local frame as
-    (uu, vv, ff, uv, uf, vf). Channels: presence, 6 axis-tensor terms, [ct].
-    """
-    B, S = raw.shape[0], raw.shape[-1]
+    """Oriented trilinear crop straight from raw uint8 (B, 1, S, S, S) blocks."""
+    if raw.shape[1] != 1:
+        raise ValueError('Oriented sampling reads one scalar channel')
+    S = raw.shape[-1]
     world = pos_xyz[:, None, None, None, :] + torch.einsum("bij,dhwj->bdhwi", frames, local_grid)
     idx = world - starts_zyx.flip(-1)[:, None, None, None, :].to(world.dtype)
     grid = idx * (2.0 / (S - 1)) - 1.0
-    r = raw.float()
-    if raw.shape[1] == 1:  # CT-only input
-        return F.grid_sample(r, grid, mode="bilinear", padding_mode="zeros", align_corners=True) * (1.0 / 255.0)
-    lin = [0] + ([3] if raw.shape[1] > 3 else [])
-    lin_s = F.grid_sample(r[:, lin], grid, mode="bilinear", padding_mode="zeros", align_corners=True) * (1.0 / 255.0)
-    dn = F.grid_sample(r[:, 1:3], grid, mode="nearest", padding_mode="border", align_corners=True)
-    nx = (dn[:, 0] - 128.0) * (1.0 / 127.0)
-    ny = (dn[:, 1] - 128.0) * (1.0 / 127.0)
-    nz = torch.sqrt(torch.clamp(1.0 - nx * nx - ny * ny, min=0.0))
-    n = torch.stack([nx, ny, nz], -1)
-    n = n * torch.rsqrt(torch.clamp((n * n).sum(-1, keepdim=True), min=1e-12))
-    nl = torch.einsum("bdhwi,bij->bdhwj", n, frames)  # local (u, v, f) components
-    a, b, c = nl.unbind(-1)
-    t6 = torch.stack([a * a, b * b, c * c, a * b, a * c, b * c], 1)
-    if gate_direction:
-        t6 = t6 * lin_s[:, :1]
-    out = [lin_s[:, :1], t6]
-    if len(lin) > 1:
-        out.append(lin_s[:, 1:])
-    return torch.cat(out, 1)
+    return F.grid_sample(raw.float(), grid, mode="bilinear", padding_mode="zeros", align_corners=True) * (1.0 / 255.0)

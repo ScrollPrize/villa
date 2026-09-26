@@ -52,35 +52,22 @@ def point_samples(vol: FiberVolume, pts_xyz: np.ndarray) -> np.ndarray:
 
 
 def field_axis(vol: FiberVolume, p_xyz: np.ndarray) -> tuple[np.ndarray, float]:
-    """Trilinear axis tensor + presence at a point -> (principal axis xyz, presence)."""
-    if getattr(getattr(vol, 'spec', None), 'mode', None) in ('ct', 'ct+presence'):
-        # Initialization only: estimate a local ridge axis from presence, never
-        # load or expose the predicted direction vectors to CT-only tracing.
-        offsets = np.stack(np.meshgrid(*[np.arange(-3, 4)]*3, indexing='ij'), -1).reshape(-1, 3)
-        points = p_xyz[None]+offsets
-        presence = vol.presence_for_seeding() if hasattr(vol, 'presence_for_seeding') else vol.presence
-        weights = presence.sample_nearest(points[:, ::-1]).astype(float)/255
-        weights = np.where(weights >= .5*weights.max(), weights**2, 0)
-        if weights.sum() <= 1e-8:
-            raise ValueError('No presence support for a seed heading; supply an explicit heading')
-        center = np.average(points, axis=0, weights=weights)
-        delta = points-center
-        covariance = (delta*weights[:, None]).T @ delta/weights.sum()
-        _, axes = np.linalg.eigh(covariance)
-        return axes[:, -1], float(weights.max()**.5)
-    base = np.floor(p_xyz[::-1]).astype(np.int64)
-    raw = vol.fiber_raw_block(base, (2, 2, 2))
-    from vesuvius.neural_tracing.fiber_follow.shared.volume import decode_raw
+    """Local ridge axis of presence at a point -> (principal axis xyz, peak presence strength).
 
-    d = decode_raw(torch.from_numpy(raw[None]))[0].numpy()  # C,2,2,2
-    fz, fy, fx = p_xyz[::-1] - base
-    w = np.array([1 - fz, fz])[:, None, None] * np.array([1 - fy, fy])[None, :, None] * np.array([1 - fx, fx])[None, None, :]
-    v = (d * w[None]).sum((1, 2, 3))
-    xx, yy, zz, xy, xz, yz = v[1:7]
-    T = np.array([[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]])
-    ev, evec = np.linalg.eigh(T)
-    return evec[:, -1], float(v[0])
-
+    Initialization only; the model never sees presence-derived directions.
+    """
+    offsets = np.stack(np.meshgrid(*[np.arange(-3, 4)]*3, indexing='ij'), -1).reshape(-1, 3)
+    points = p_xyz[None]+offsets
+    presence = vol.presence_for_seeding() if hasattr(vol, 'presence_for_seeding') else vol.presence
+    weights = presence.sample_nearest(points[:, ::-1]).astype(float)/255
+    weights = np.where(weights >= .5*weights.max(), weights**2, 0)
+    if weights.sum() <= 1e-8:
+        raise ValueError('No presence support for a seed heading; supply an explicit heading')
+    center = np.average(points, axis=0, weights=weights)
+    delta = points-center
+    covariance = (delta*weights[:, None]).T @ delta/weights.sum()
+    _, axes = np.linalg.eigh(covariance)
+    return axes[:, -1], float(weights.max()**.5)
 
 class ModelTracer:
     def __init__(self, model: FollowNet, vol: FiberVolume, crop: CropSpec, n_history: int = 128,
@@ -103,7 +90,7 @@ class ModelTracer:
         tensor = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(self.device)
         x = build_inputs(tensor(raw), tensor(starts).float(), tensor(pos).float(), tensor(frames).float(),
                          tensor(hist).float(), tensor(hmask), self.grid, n_render=render_count(self.crop),
-                         gate_direction=self.crop.gate_direction, input_scale=getattr(self.vol, 'input_scale', 1.),
+                         input_scale=getattr(self.vol, 'input_scale', 1.),
                          history_sigma=self.crop.history_sigma, history_render=self.crop.history_render)
         if self.vol.spec.mode == 'ct+presence':
             from vesuvius.neural_tracing.fiber_follow.shared.data import add_presence_input

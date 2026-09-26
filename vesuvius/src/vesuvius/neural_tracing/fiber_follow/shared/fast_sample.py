@@ -1,9 +1,8 @@
 """Fused CPU crop sampler (numba) for DataLoader workers.
 
 Same output as ``geometry.sample_oriented_fast`` + ``geometry.render_history``
-for one sample, without converting the whole block to float: presence/CT
-trilinear (zero padding), fiber axis from the nearest voxel (border clamp),
-decoded, rotated into the local frame, optionally gated by presence.
+for one sample, without converting the whole block to float: one scalar
+channel, trilinear with zero padding, followed by rendered history.
 """
 
 from __future__ import annotations
@@ -18,8 +17,8 @@ def trilinear_weight(fz, fy, fx, dz, dy, dx):
 
 
 @numba.njit(cache=True, fastmath=False, inline="always")
-def _point(p, raw, start_zyx, pos, frame, grid, gate, hist, hmask, out, sigma, segments,
-           S0, S1, S2, has_dir, ct_ch, lin_out_ct, H, hist_ch, hmax_c, lo, hi):
+def _point(p, raw, start_zyx, pos, frame, grid, hist, hmask, out, sigma, segments,
+           S0, S1, S2, H, hist_ch, hmax_c, lo, hi):
     ga, gb, gc = grid[p, 0], grid[p, 1], grid[p, 2]
     wx = pos[0] + frame[0, 0] * ga + frame[0, 1] * gb + frame[0, 2] * gc
     wy = pos[1] + frame[1, 0] * ga + frame[1, 1] * gb + frame[1, 2] * gc
@@ -27,14 +26,13 @@ def _point(p, raw, start_zyx, pos, frame, grid, gate, hist, hmask, out, sigma, s
     qz = wz - start_zyx[0]
     qy = wy - start_zyx[1]
     qx = wx - start_zyx[2]
-    # trilinear (zeros outside) for presence / CT
+    # trilinear (zeros outside)
     z0 = int(np.floor(qz))
     y0 = int(np.floor(qy))
     x0 = int(np.floor(qx))
     fz = qz - z0
     fy = qy - y0
     fx = qx - x0
-    pres = 0.0
     ctv = 0.0
     for dz in range(2):
         zz = z0 + dz
@@ -51,40 +49,8 @@ def _point(p, raw, start_zyx, pos, frame, grid, gate, hist, hmask, out, sigma, s
                 if xx < 0 or xx >= S2:
                     continue
                 w = trilinear_weight(fz, fy, fx, dz, dy, dx)
-                if has_dir:
-                    pres += w * raw[0, zz, yy, xx]
-                if ct_ch >= 0:
-                    ctv += w * raw[ct_ch, zz, yy, xx]
-    if has_dir:
-        pres *= 1.0 / 255.0
-        out[0, p] = pres
-        # nearest voxel (round half to even, clamped) for the axis
-        iz = min(max(int(np.rint(qz)), 0), S0 - 1)
-        iy = min(max(int(np.rint(qy)), 0), S1 - 1)
-        ix = min(max(int(np.rint(qx)), 0), S2 - 1)
-        nx = (raw[1, iz, iy, ix] - 128.0) * (1.0 / 127.0)
-        ny = (raw[2, iz, iy, ix] - 128.0) * (1.0 / 127.0)
-        nz2 = 1.0 - nx * nx - ny * ny
-        nz = np.sqrt(nz2) if nz2 > 0.0 else 0.0
-        nn = nx * nx + ny * ny + nz * nz
-        inv = 1.0 / np.sqrt(nn if nn > 1e-12 else 1e-12)
-        nx *= inv
-        ny *= inv
-        nz *= inv
-        a = nx * frame[0, 0] + ny * frame[1, 0] + nz * frame[2, 0]
-        b = nx * frame[0, 1] + ny * frame[1, 1] + nz * frame[2, 1]
-        c = nx * frame[0, 2] + ny * frame[1, 2] + nz * frame[2, 2]
-        g = pres if gate else 1.0
-        out[1, p] = a * a * g
-        out[2, p] = b * b * g
-        out[3, p] = c * c * g
-        out[4, p] = a * b * g
-        out[5, p] = a * c * g
-        out[6, p] = b * c * g
-        if ct_ch >= 0:
-            out[lin_out_ct, p] = ctv * (1.0 / 255.0)
-    else:
-        out[0, p] = ctv * (1.0 / 255.0)
+                ctv += w * raw[0, zz, yy, xx]
+    out[0, p] = ctv * (1.0 / 255.0)
     # Own history: nearest point or connected segment, including the current origin.
     best = 1e30
     if (gc - hmax_c > 7.1*sigma or ga < lo[0] or ga > hi[0]
@@ -113,13 +79,9 @@ def _point(p, raw, start_zyx, pos, frame, grid, gate, hist, hmask, out, sigma, s
 
 
 @numba.njit(cache=True, fastmath=False)
-def _sample(raw, start_zyx, pos, frame, grid, gate, hist, hmask, out, sigma, segments):
-    C = raw.shape[0]
+def _sample(raw, start_zyx, pos, frame, grid, hist, hmask, out, sigma, segments):
     S0, S1, S2 = raw.shape[1], raw.shape[2], raw.shape[3]
     P = grid.shape[0]
-    has_dir = C >= 3
-    ct_ch = 3 if C == 4 else (0 if C == 1 else -1)
-    lin_out_ct = 7 if C == 4 else 0
     H = hist.shape[0]
     hist_ch = out.shape[0] - 1
     # history lies behind/near the current point: crop points further than
@@ -147,16 +109,19 @@ def _sample(raw, start_zyx, pos, frame, grid, gate, hist, hmask, out, sigma, seg
     lo -= 16.0*sigma
     hi += 16.0*sigma
     for p in range(P):
-        _point(p, raw, start_zyx, pos, frame, grid, gate, hist, hmask, out, sigma, segments,
-               S0, S1, S2, has_dir, ct_ch, lin_out_ct, H, hist_ch, hmax_c, lo, hi)
+        _point(p, raw, start_zyx, pos, frame, grid, hist, hmask, out, sigma, segments,
+               S0, S1, S2, H, hist_ch, hmax_c, lo, hi)
 
 
-def sample_crop(raw, start_zyx, pos, frame, grid_flat, gate, hist, hmask, n_out, history_sigma=1.0, history_render='points'):
-    """raw (C, S, S, S) uint8; grid_flat (P, 3) float64 local (a, b, c);
-    hist (N, 3) local, hmask (N,). Returns (n_out, P) float32."""
+def sample_crop(raw, start_zyx, pos, frame, grid_flat, hist, hmask, n_out, history_sigma=1.0, history_render='points'):
+    """raw (1, S, S, S) uint8; grid_flat (P, 3) float64 local (a, b, c);
+    hist (N, 3) local, hmask (N,). Returns (n_out, P) float32: the sampled
+    channel first and rendered history last."""
     if history_render not in ('points', 'segments') or not np.isfinite(history_sigma) or history_sigma <= 0:
         raise ValueError('Invalid history rendering mode or sigma')
+    if raw.shape[0] != 1:
+        raise ValueError('The fused sampler reads one scalar channel')
     out = np.empty((n_out, grid_flat.shape[0]), np.float32)
     _sample(raw, np.asarray(start_zyx, np.float64), np.asarray(pos, np.float64), np.asarray(frame, np.float64),
-            grid_flat, bool(gate), np.asarray(hist, np.float64), np.asarray(hmask, np.float64), out, float(history_sigma), history_render == 'segments')
+            grid_flat, np.asarray(hist, np.float64), np.asarray(hmask, np.float64), out, float(history_sigma), history_render == 'segments')
     return out

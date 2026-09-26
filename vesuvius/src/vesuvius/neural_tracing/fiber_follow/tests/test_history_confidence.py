@@ -42,7 +42,6 @@ def volume(tmp_path):
 @pytest.mark.parametrize('fused', [False, True])
 def test_native_ct_and_presence_sample_the_same_world_positions(tmp_path, monkeypatch, fused):
     vol = volume(tmp_path)
-    assert vol.nx is None and vol.ny is None
     assert vol.input_scale == 2 and vol.channels == 2
     crop = CropSpec(depth=8, width=7, behind=3, spacing=.5, history_render='segments')
     frame = frame_from_heading(np.array([1., 2., 3.]))

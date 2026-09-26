@@ -34,9 +34,8 @@ def ct_volume(tmp_path):
 
 def test_native_ct_sampling_matches_source_coordinates_in_both_samplers(tmp_path, monkeypatch):
     vol = ct_volume(tmp_path)
-    assert vol.nx is None and vol.ny is None
-    assert vol.input_scale == 2 and vol.channels == vol.raw_channels == 1
-    # No direction arrays exist. Presence becomes unavailable after initialization.
+    assert vol.input_scale == 2 and vol.channels == 1
+    # Presence becomes unavailable after initialization.
     heading, strength = field_axis(vol, np.array([4.,4.,4.]))
     assert abs(heading[0]) > .999 and strength == 1
     monkeypatch.setattr(vol.presence, 'read', lambda *args: pytest.fail('presence read during model sampling'))
@@ -74,7 +73,7 @@ def test_connected_history_torch_matches_fused_sampler(mask):
     hist = np.array([[0.,0.,-1.],[1.,0.,-3.],[0.,0.,-5.]])
     actual = render_history(torch.tensor(hist[None]),torch.tensor([mask]),torch.tensor(grid),.35,'segments')[0,0]
     fused = sample_crop(np.zeros((1,16,16,16),np.uint8),np.zeros(3),np.ones(3)*8,np.eye(3),
-                        grid.reshape(-1,3),False,hist,np.array(mask),2,.35,'segments')[-1].reshape(actual.shape)
+                        grid.reshape(-1,3),hist,np.array(mask),2,.35,'segments')[-1].reshape(actual.shape)
     np.testing.assert_allclose(actual,fused,atol=1e-7,rtol=1e-6)
     if not any(mask):
         assert not actual.any()

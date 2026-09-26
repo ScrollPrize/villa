@@ -557,11 +557,10 @@ def render_count(crop: CropSpec) -> int:
 
 
 def build_inputs(raw, starts, pos, frames, hist, hmask, grid: torch.Tensor, n_render: int | None = None,
-                 gate_direction: bool = False, input_scale: float = 1.,
-                 history_sigma: float = 1., history_render: str = 'points') -> torch.Tensor:
+                 input_scale: float = 1., history_sigma: float = 1., history_render: str = 'points') -> torch.Tensor:
     """Tensors (any device) -> model input (B, C, D, H, W). Only the nearest
     ``n_render`` history points are rendered (the rest lie behind the crop)."""
-    x = sample_oriented_fast(raw, starts.float(), pos*input_scale, frames*input_scale, grid, gate_direction=gate_direction)
+    x = sample_oriented_fast(raw, starts.float(), pos*input_scale, frames*input_scale, grid)
     if n_render is not None:
         hist, hmask = hist[:, :n_render], hmask[:, :n_render]
     return torch.cat([x, render_history(hist, hmask, grid, history_sigma, history_render)], 1)
@@ -582,15 +581,14 @@ def collate_with_volume(items, vol: FiberVolume, crop: CropSpec, grid: torch.Ten
             # one fused numba pass per sample (see fast_sample.py); same values as build_inputs
             nr = render_count(crop)
             gf = _grid_flat(crop)
-            C = {"ct": 1, "ct+presence": 1, "fiber": 7, "fiber+ct": 8}[vol.spec.mode] + 1
-            x = np.empty((len(items), C, crop.depth, crop.width, crop.width), np.float16)
+            x = np.empty((len(items), 2, crop.depth, crop.width, crop.width), np.float16)
             for j, it in enumerate(items):
-                x[j] = sample_crop(raw[j], starts[j], it["pos"]*scale, it["frame"]*scale, gf, crop.gate_direction,
-                                   it["hist_local"][:nr], it["hmask"][:nr], C, crop.history_sigma, crop.history_render).reshape(x.shape[1:])
+                x[j] = sample_crop(raw[j], starts[j], it["pos"]*scale, it["frame"]*scale, gf,
+                                   it["hist_local"][:nr], it["hmask"][:nr], 2, crop.history_sigma, crop.history_render).reshape(x.shape[1:])
             out = dict(x=torch.from_numpy(x), hist=out["hist"], hmask=out["hmask"])
         else:
             x = build_inputs(out.pop("raw"), out.pop("starts"), out["pos"], out["frames"], out["hist"], out["hmask"],
-                             grid, n_render=render_count(crop), gate_direction=crop.gate_direction, input_scale=scale,
+                             grid, n_render=render_count(crop), input_scale=scale,
                              history_sigma=crop.history_sigma, history_render=crop.history_render)
             out = dict(x=x.half(), hist=out["hist"], hmask=out["hmask"])
         if vol.spec.mode == 'ct+presence':
