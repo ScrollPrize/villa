@@ -6,7 +6,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from vesuvius.neural_tracing.fiber_follow.flow_matching.encoder import SpatialEncoder, prepare_model
-from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_MAX_RECOVERY_DISTANCE, recovery_allowed
+from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_MAX_RECOVERY_DISTANCE, select_candidate
 from vesuvius.neural_tracing.fiber_follow.flow_matching.passage_scorer import PassageScorer, sample_path_features
 
 ARCHITECTURE = 'single_path_flow_v11'
@@ -40,6 +40,8 @@ class FollowNetConfig:
     scorer: str = 'legacy'
     gaussian_candidates: int = 0
     selection_horizon: int = 8
+    # Missing in old checkpoints: retain their original selection policy.
+    candidate_selection: str = 'prefix'
 
     def __post_init__(self):
         self.widths = tuple(self.widths)
@@ -48,6 +50,8 @@ class FollowNetConfig:
             raise ValueError('sampler_mode must be zero or gaussian')
         if self.scorer not in ('legacy', 'passage'):
             raise ValueError('scorer must be legacy or passage')
+        if self.candidate_selection not in ('prefix', 'stop_fallback'):
+            raise ValueError('candidate_selection must be prefix or stop_fallback')
         if not isinstance(self.gaussian_candidates, int) or self.gaussian_candidates < 0 or self.selection_horizon < 1:
             raise ValueError('Invalid candidate count or selection horizon')
         if self.gaussian_candidates and (self.scorer != 'passage' or self.sampler_mode != 'zero'):
@@ -367,10 +371,13 @@ class FollowNet(SpatialEncoder):
         evidence = torch.cat((local.reshape(b, k, n, -1), deep.reshape(b, k, n, -1)), -1)
         return self.flow.confidence_head(evidence, context, candidates, points.new_zeros(b, 3))
 
-    def forward(self,x,hist,hmask,*,targets=None,generator=None,return_steps=False,initial_noise=None):
-        return self._forward(x,hist,hmask,targets=targets,generator=generator,return_steps=return_steps,initial_noise=initial_noise)
+    def forward(self,x,hist,hmask,*,targets=None,generator=None,return_steps=False,initial_noise=None,
+                confidence_threshold=None,n_commit=None):
+        return self._forward(x,hist,hmask,targets=targets,generator=generator,return_steps=return_steps,
+                             initial_noise=initial_noise,confidence_threshold=confidence_threshold,n_commit=n_commit)
 
-    def _forward(self,x,hist,hmask,*,targets=None,generator=None,return_steps=False,training_points=None,encoding=None,initial_noise=None):
+    def _forward(self,x,hist,hmask,*,targets=None,generator=None,return_steps=False,training_points=None,encoding=None,initial_noise=None,
+                 confidence_threshold=None,n_commit=None):
         features,context,fixed = self.encode_conditioning(x,hist,hmask) if encoding is None else encoding
         out = {}
         if targets is not None:
@@ -389,11 +396,11 @@ class FollowNet(SpatialEncoder):
         if self.cfg.scorer == 'passage':
             candidate_logits = self.score_candidates(features,fixed,final,candidates)
             candidate_confidence = candidate_logits.sigmoid().cummin(-1).values
-            eligible = recovery_allowed(candidates,self.cfg.max_recovery_distance)
-            horizon = min(self.cfg.selection_horizon,self.cfg.n_future)-1
-            # argmax keeps the deterministic candidate on ties. Ranking and
-            # acceptance both describe the commit prefix, not a distant exit.
-            selected = candidate_confidence[...,horizon].masked_fill(~eligible,-torch.inf).argmax(-1)
+            # Training retains threshold-independent ranking metrics. Tracing
+            # supplies its actual gate threshold and commit cap.
+            selected = select_candidate(candidates,candidate_confidence,
+                self.cfg.selection_horizon if n_commit is None else n_commit,self.cfg.max_recovery_distance,
+                stop_threshold=confidence_threshold if self.cfg.candidate_selection=='stop_fallback' else None)
             out.update(candidate_points=candidates,candidate_logits=candidate_logits,
                        candidate_confidence=candidate_confidence,selected_candidate=selected)
             logits = candidate_logits[torch.arange(len(y),device=y.device),selected]

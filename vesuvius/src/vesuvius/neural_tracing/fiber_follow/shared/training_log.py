@@ -115,6 +115,10 @@ def format_training_log(row):
                      +rate(f'false_stop_count_{threshold}',f'correct_first_count_{threshold}')
                      +' | departed continues '
                      +rate(f'departed_continue_count_{threshold}',f'departed_count_{threshold}'))
+        if f'candidate_fallback_count_{threshold}' in row:
+            lines.append(f"    alternative-prefix fallbacks {int(row[f'candidate_fallback_count_{threshold}'])}"
+                         +' | correct first point '+rate(f'candidate_fallback_correct_{threshold}',
+                                                        f'candidate_fallback_known_{threshold}'))
     if 'refinement' in row:
         refinement = row['refinement']
         bands = refinement['by_drift']

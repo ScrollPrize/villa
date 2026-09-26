@@ -156,6 +156,22 @@ inference refinement plots follow the selected candidate.
 `--scorer legacy` remains the default and preserves old checkpoints exactly.
 `--scorer passage --gaussian-candidates 0` changes only the confidence head.
 Extra Gaussian candidates require `--sampler-mode zero --scorer passage`.
+`--candidate-selection stop_fallback` retains the eight-point winner whenever
+it can advance at the tracing threshold. If it would stop, it selects another
+eligible candidate with the longest acceptable prefix, then highest confidence
+at that prefix (candidate zero wins remaining ties). It never lowers the gate
+threshold or recovery limit. Old checkpoints default to `prefix`; the policy
+can be explicitly changed on resume and is saved in subsequent checkpoints.
+Training ranking metrics remain threshold independent. Gate metrics use the
+actual fallback policy and report how often the alternate first point is correct.
+
+To broaden online replay, `--dagger-seeds-per-fiber 1 --dagger-seeds 128` collects
+one seed position in both directions per fiber, targeting about 64 distinct
+fibers per collection instead of about 16 under the defaults. Replay publication
+logs include distinct fiber, hard-state and exploratory-state counts. Each
+resume writes its effective options to `resume_STEP.json` alongside the original
+run configuration.
+
 Scorer type, pool size, and selection horizon are saved in checkpoints and
 verified by preflight/resume; changing scorer architecture requires fresh training.
 Mixed-pool tracing has reproducible per-trace random streams and calibration

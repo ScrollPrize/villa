@@ -70,14 +70,19 @@ def resolve_scorer_options(scorer=None, gaussian_candidates=None, resume=None):
     return result
 
 
+def resolve_candidate_selection(requested=None, checkpoint=None):
+    """Selection can be explicitly changed on resume without changing weights."""
+    return requested or (checkpoint or {}).get('model_cfg',{}).get('candidate_selection','prefix')
+
+
 def initialized_config(checkpoint, expected):
     """Reuse architecture/scales, changing draws and inference policy only."""
     source=FollowNetConfig(**checkpoint['model_cfg'])
     for key,value in expected.to_dict().items():
-        if key not in ('flow_sigma','flow_draws','sampler_mode','selection_horizon') and source.to_dict()[key] != value:
+        if key not in ('flow_sigma','flow_draws','sampler_mode','selection_horizon','candidate_selection') and source.to_dict()[key] != value:
             raise ValueError(f'Initialization architecture differs: {key}')
     return dataclasses.replace(source,flow_draws=expected.flow_draws,sampler_mode=expected.sampler_mode,
-                               selection_horizon=expected.selection_horizon)
+                               selection_horizon=expected.selection_horizon,candidate_selection=expected.candidate_selection)
 
 
 @torch.no_grad()
@@ -261,6 +266,8 @@ def build_parser():
     ap.add_argument('--dagger-every',type=int,default=1000)
     ap.add_argument('--dagger-device')
     ap.add_argument('--dagger-seeds',type=int,default=64)
+    ap.add_argument('--dagger-seeds-per-fiber',type=int,default=2,
+                    help='Seed positions per fiber, each traced in both directions; use 1 for broader coverage')
     ap.add_argument('--dagger-batch',type=int,default=1)
     ap.add_argument('--dagger-explore-calls',type=int,default=8)
     ap.add_argument('--dagger-trace-len',type=float,default=6000.)
@@ -275,6 +282,8 @@ def build_parser():
                     help='Confidence head; passage uses dedicated path evidence/attention and prefix pooling')
     ap.add_argument('--gaussian-candidates',type=int,default=None,
                     help='Extra Gaussian alternatives beside the zero-start path (requires --scorer passage --sampler-mode zero)')
+    ap.add_argument('--candidate-selection',choices=('prefix','stop_fallback'),default=None,
+                    help='Explicitly override the saved selection policy; stop_fallback tries an acceptable alternative before stopping')
     return ap
 
 
@@ -289,6 +298,8 @@ def main(argv=None):
         raise ValueError('Update counts, cadences and dimensions must be positive')
     if min(args.workers,args.diag_every,args.dagger_every,args.warmup)<0 or not 0<=args.ema_decay<1:
         raise ValueError('Invalid training settings')
+    if args.dagger_seeds_per_fiber < 1:
+        raise ValueError('dagger-seeds-per-fiber must be positive')
     if str(args.device).startswith('cuda') and not torch.cuda.is_available():
         raise RuntimeError('CUDA unavailable; full training requires a working GPU')
     torch.manual_seed(args.seed); np.random.seed(args.seed)
@@ -302,8 +313,9 @@ def main(argv=None):
     args.sampler_mode=resolve_sampler_mode(args.sampler_mode,resume)
     scoring=resolve_scorer_options(args.scorer,args.gaussian_candidates,resume)
     args.scorer,args.gaussian_candidates=scoring['scorer'],scoring['gaussian_candidates']
+    args.candidate_selection=resolve_candidate_selection(args.candidate_selection,resume or initial)
     model_cfg=FollowNetConfig(flow_draws=args.flow_draws,sampler_mode=args.sampler_mode,
-                             selection_horizon=args.n_commit,**scoring)
+                             selection_horizon=args.n_commit,candidate_selection=args.candidate_selection,**scoring)
     if not 1 <= args.n_commit <= model_cfg.n_future:
         raise ValueError('n_commit must lie within the model horizon')
     if resume is not None and args.gaussian_candidates and resume['model_cfg'].get('selection_horizon',8)!=args.n_commit:
@@ -317,6 +329,7 @@ def main(argv=None):
         or benchmark.get('sampler_mode','zero')!=args.sampler_mode
         or benchmark.get('scorer','legacy')!=args.scorer
         or benchmark.get('gaussian_candidates',0)!=args.gaussian_candidates
+        or benchmark.get('candidate_selection','prefix')!=args.candidate_selection
         or (args.gaussian_candidates and benchmark.get('selection_horizon',8)!=args.n_commit)
         or benchmark.get('crop')!=[176,96,96]):
         raise ValueError('A successful matching full-crop benchmark is required before training')
@@ -351,7 +364,8 @@ def main(argv=None):
     collector=OnlineCollector(out/'dagger',args.fibers,args.val_z,args.dagger_device or args.device,
                               every=args.dagger_every,max_seeds=args.dagger_seeds,batch=args.dagger_batch,
                               explore_calls=args.dagger_explore_calls,seed=args.seed,replay_keep=args.replay_keep,
-                              initial=[c._dir for c in caches],trace_len=args.dagger_trace_len,confidence=.7,n_commit=args.n_commit)
+                              initial=[c._dir for c in caches],trace_len=args.dagger_trace_len,confidence=.7,n_commit=args.n_commit,
+                              seeds_per_fiber=args.dagger_seeds_per_fiber)
     # A resumed run reseeds its loader workers so it does not replay the run's first states.
     ds=FollowDataset(train_f,spec,sample_cfg,band,chunk=args.microbatch,seed=args.seed+(resume['step'] if resume else 0),
                      cache_bytes=int(args.worker_cache_gb*(1<<30)),fixed=[fixed],onpolicy=caches,replay_index=str(collector.index))
@@ -363,7 +377,8 @@ def main(argv=None):
         model_cfg.flow_sigma,calibration=fit_flow_sigma(it,model_cfg,args.flow_calibration_states,
             progress=lambda seen:print(json.dumps(dict(calibration_states=seen,total=args.flow_calibration_states)),flush=True))
     elif resume is not None:
-        model_cfg=FollowNetConfig(**resume['model_cfg']); calibration=resume['flow_calibration']
+        model_cfg=dataclasses.replace(FollowNetConfig(**resume['model_cfg']),candidate_selection=args.candidate_selection)
+        calibration=resume['flow_calibration']
     else:
         calibration=initial['flow_calibration']
     model=prepare_model(FollowNet(model_cfg),args.device)
@@ -379,6 +394,7 @@ def main(argv=None):
     if resume is not None:
         done,replay_seen=resume_training(resume,model,ema,opt); first=done+1
         del resume
+        (out/f'resume_{done:06d}.json').write_text(json.dumps(dict(vars(args),model_cfg=model_cfg.to_dict()),indent=2))
     else: (out/'config.json').write_text(json.dumps(dict(vars(args),architecture=ARCHITECTURE,model_cfg=model_cfg.to_dict(),
          compile_model=compile_model,
          sample_cfg=dataclasses.asdict(sample_cfg),vol_spec=spec.to_dict(),flow_calibration=calibration,initialization=initialization,
@@ -400,7 +416,9 @@ def main(argv=None):
         (out/'images').mkdir(exist_ok=True)
     log=RunLog(out/'log.jsonl',formatter=format_training_log); start=time.monotonic()
     if first>1: log.record(dict(step=first,resumed_from=args.resume,replay_caches=len(caches),
-                              compile_model=compile_model,cache_training_encoding=args.cache_training_encoding))
+                              compile_model=compile_model,cache_training_encoding=args.cache_training_encoding,
+                              candidate_selection=args.candidate_selection,dagger_seeds=args.dagger_seeds,
+                              dagger_seeds_per_fiber=args.dagger_seeds_per_fiber))
     try:
         for step in range(first,args.steps+1):
             event=collector.poll()

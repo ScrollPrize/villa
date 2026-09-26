@@ -15,6 +15,7 @@ train_args=("$@")
 sampler_mode=""
 scorer=""
 gaussian_candidates=""
+candidate_selection=""
 n_commit=8
 resume=""
 flow_draws=64
@@ -30,6 +31,8 @@ for ((i=0; i<${#train_args[@]}; i++)); do
         --scorer=*) scorer=${arg#*=} ;;
         --gaussian-candidates) gaussian_candidates=${train_args[$((++i))]} ;;
         --gaussian-candidates=*) gaussian_candidates=${arg#*=} ;;
+        --candidate-selection) candidate_selection=${train_args[$((++i))]} ;;
+        --candidate-selection=*) candidate_selection=${arg#*=} ;;
         --n-commit) n_commit=${train_args[$((++i))]} ;;
         --n-commit=*) n_commit=${arg#*=} ;;
         --microbatch) MICROBATCH=${train_args[$((++i))]} ;;
@@ -50,18 +53,20 @@ for ((i=0; i<${#train_args[@]}; i++)); do
 done
 resolved_options=$("$PYTHON" -c '
 import sys
-from vesuvius.neural_tracing.fiber_follow.flow_matching.train import read_checkpoint, resolve_sampler_mode, resolve_scorer_options
+from vesuvius.neural_tracing.fiber_follow.flow_matching.train import read_checkpoint, resolve_sampler_mode, resolve_scorer_options, resolve_candidate_selection
 checkpoint=read_checkpoint(sys.argv[1], "cpu") if sys.argv[1] else None
 options=resolve_scorer_options(sys.argv[3] or None, int(sys.argv[4]) if sys.argv[4] else None, checkpoint)
-print(resolve_sampler_mode(sys.argv[2] or None, checkpoint), options["scorer"], options["gaussian_candidates"])
-' "$resume" "$sampler_mode" "$scorer" "$gaussian_candidates")
-read -r sampler_mode scorer gaussian_candidates <<< "$resolved_options"
-benchmark="$FF/output/preflight/${name}_b${MICROBATCH}_${sampler_mode}_${scorer}_g${gaussian_candidates}.json"
+print(resolve_sampler_mode(sys.argv[2] or None, checkpoint), options["scorer"], options["gaussian_candidates"],
+      resolve_candidate_selection(sys.argv[5] or None, checkpoint))
+' "$resume" "$sampler_mode" "$scorer" "$gaussian_candidates" "$candidate_selection")
+read -r sampler_mode scorer gaussian_candidates candidate_selection <<< "$resolved_options"
+benchmark="$FF/output/preflight/${name}_b${MICROBATCH}_${sampler_mode}_${scorer}_g${gaussian_candidates}_${candidate_selection}.json"
 "$PYTHON" "$FF/scripts/benchmark_single_path.py" --manifest "$manifest" \
     --microbatch "$MICROBATCH" --flow-draws "$flow_draws" --sampler-mode "$sampler_mode" \
     --scorer "$scorer" --gaussian-candidates "$gaussian_candidates" --n-commit "$n_commit" \
+    --candidate-selection "$candidate_selection" \
     "${perf_args[@]}" --out "$benchmark"
 PYTHON="$PYTHON" bash "$FF/scripts/launch.sh" "$name" --ct "$CT_ZARR" --microbatch "$MICROBATCH" \
     --fixed-bank "$PREPARATION/fixed_recovery.npz" --manifest "$PREPARATION/seeds.json" \
     --benchmark "$benchmark" --sampler-mode "$sampler_mode" --scorer "$scorer" \
-    --gaussian-candidates "$gaussian_candidates" "${train_args[@]}"
+    --gaussian-candidates "$gaussian_candidates" --candidate-selection "$candidate_selection" "${train_args[@]}"

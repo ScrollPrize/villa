@@ -32,6 +32,7 @@ def main(argv=None):
     ap.add_argument('--sampler-mode',choices=('zero','gaussian'),default='gaussian')
     ap.add_argument('--scorer',choices=('legacy','passage'),default='legacy')
     ap.add_argument('--gaussian-candidates',type=int,default=0)
+    ap.add_argument('--candidate-selection',choices=('prefix','stop_fallback'),default='prefix')
     ap.add_argument('--n-commit',type=int,default=8)
     ap.add_argument('--updates',type=int,default=3)
     ap.add_argument('--warmup',type=int,default=1)
@@ -41,7 +42,8 @@ def main(argv=None):
     result=dict(architecture=ARCHITECTURE,device=args.device,microbatch=args.microbatch,
                 effective_batch=8,flow_draws=args.flow_draws,crop=[176,96,96],passed=False,
                 cache_training_encoding=args.cache_training_encoding,compile_model=args.compile_model,sampler_mode=args.sampler_mode,
-                scorer=args.scorer,gaussian_candidates=args.gaussian_candidates,selection_horizon=args.n_commit)
+                scorer=args.scorer,gaussian_candidates=args.gaussian_candidates,selection_horizon=args.n_commit,
+                candidate_selection=args.candidate_selection)
     try:
         if not args.device.startswith('cuda') or not torch.cuda.is_available():
             raise RuntimeError('Preflight requires a working CUDA device; CPU smoke tests do not qualify')
@@ -52,7 +54,8 @@ def main(argv=None):
         fibers=load_fibers(args.fibers,grid_scale=spec.grid_scale)
         train,val=split_fibers(fibers,ZBand(45000/spec.grid_scale,48500/spec.grid_scale))
         cfg=FollowNetConfig(flow_sigma=((1.,1.),)*16,flow_draws=args.flow_draws,sampler_mode=args.sampler_mode,
-                           scorer=args.scorer,gaussian_candidates=args.gaussian_candidates,selection_horizon=args.n_commit)
+                           scorer=args.scorer,gaussian_candidates=args.gaussian_candidates,selection_horizon=args.n_commit,
+                           candidate_selection=args.candidate_selection)
         sample=SampleConfig(crop=CropSpec(depth=176,width=96,behind=128,history_render='segments',history_sigma=.35))
         batch=next(iter(FollowDataset(train,spec,sample,ZBand(45000/8,48500/8),chunk=8)))
         micro=[{k:v[i:i+args.microbatch] for k,v in batch.items()} for i in range(0,8,args.microbatch)]

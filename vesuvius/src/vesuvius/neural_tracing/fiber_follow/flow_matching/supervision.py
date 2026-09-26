@@ -1,7 +1,7 @@
 """Dense prefix correctness of the one curve actually generated."""
 import torch
 import torch.nn.functional as F
-from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_MAX_RECOVERY_DISTANCE, DEFAULT_N_COMMIT, recovery_allowed
+from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_MAX_RECOVERY_DISTANCE, DEFAULT_N_COMMIT, recovery_allowed, select_candidate
 from vesuvius.neural_tracing.fiber_follow.flow_matching.model import flow_targets
 from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
 
@@ -117,10 +117,23 @@ def loss_fn(output, batch, cfg, tolerance=1.5, *, update=0, confidence_ramp=2000
                 candidate_rescues=(selected_correct & ~zero_correct & common).sum().item(),
                 candidate_spoiled=(~selected_correct & zero_correct & common).sum().item())
         for threshold in (.5,.85):
-            eligible = recovery_allowed(output['points'],cfg.max_recovery_distance)
-            open_gate = eligible & (output['confidence'][:,0]>=threshold)
-            known = mask[:,0].bool()
-            correct = target[:,0].bool()
+            points, confidence, gate_target, gate_mask = output['points'],output['confidence'],target,mask
+            if 'candidate_logits' in output and cfg.candidate_selection == 'stop_fallback':
+                pool_confidence=output['candidate_logits'].sigmoid().cummin(-1).values
+                selected=select_candidate(output['candidate_points'],pool_confidence,window,cfg.max_recovery_distance,
+                                          stop_threshold=threshold)
+                row=torch.arange(len(selected),device=selected.device)
+                points,confidence=output['candidate_points'][row,selected],pool_confidence[row,selected]
+                gate_target,gate_mask=loss_target[row,selected],loss_mask[row,selected]
+                original=select_candidate(output['candidate_points'],pool_confidence,window,cfg.max_recovery_distance)
+                fallback=selected != original
+                metrics.update({f'candidate_fallback_count_{threshold}':fallback.sum().item(),
+                    f'candidate_fallback_known_{threshold}':(fallback & gate_mask[:,0].bool()).sum().item(),
+                    f'candidate_fallback_correct_{threshold}':(fallback & gate_mask[:,0].bool() & gate_target[:,0].bool()).sum().item()})
+            eligible = recovery_allowed(points,cfg.max_recovery_distance)
+            open_gate = eligible & (confidence[:,0]>=threshold)
+            known = gate_mask[:,0].bool()
+            correct = gate_target[:,0].bool()
             metrics.update({f'false_stop_count_{threshold}': (known & correct & ~open_gate).sum().item(),
                             f'correct_first_count_{threshold}': (known & correct).sum().item(),
                             f'departed_continue_count_{threshold}': (batch['offtrack'].bool() & open_gate).sum().item(),

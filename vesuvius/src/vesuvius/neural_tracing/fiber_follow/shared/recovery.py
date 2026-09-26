@@ -8,6 +8,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.data import (
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import crop_local_grid
 from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams
+from vesuvius.neural_tracing.fiber_follow.shared.policy import select_candidate
 
 
 def make_recovery_states(fibers, seeds, cfg, provenance, seed=20260925):
@@ -59,7 +60,8 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
         sampling={}
         if archived:
             model.generator.manual_seed(sampling_seed)
-        elif getattr(model.cfg,'sampler_mode','zero')=='gaussian':
+        elif (getattr(model.cfg,'sampler_mode','zero')=='gaussian'
+              or getattr(model.cfg,'gaussian_candidates',0)>0):
             from vesuvius.neural_tracing.fiber_follow.flow_matching.sampling import trace_generator,trace_noise
             generator=trace_generator(sampling_seed,states.pos[j],states.frame[j,:,2])
             sampling['initial_noise']=trace_noise(model.cfg,[generator],device)
@@ -73,6 +75,14 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
         labels,masks,error=prefix_labels(output['points'],b,tolerance,model.cfg.max_recovery_distance)
         prediction=output['points'][0].float().cpu().numpy();predictions.append(prediction)
         for threshold in thresholds:
+            confidence=output['confidence']
+            if getattr(model.cfg,'candidate_selection','prefix')=='stop_fallback' and 'candidate_points' in output:
+                selected=select_candidate(output['candidate_points'],output['candidate_confidence'],n_commit,
+                                          model.cfg.max_recovery_distance,stop_threshold=threshold)
+                index=torch.arange(len(selected),device=selected.device)
+                points=output['candidate_points'][index,selected]
+                confidence=output['candidate_confidence'][index,selected]
+                labels,masks,error=prefix_labels(points,b,tolerance,model.cfg.max_recovery_distance)
             tracer=tracer_class(model,vol,sample.crop,sample.n_history,
                 TraceParams(max_len=recovery_length,confidence=threshold,seed=sampling_seed,
                             n_commit=n_commit),device=device)
@@ -88,7 +98,7 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
             row=dict(state=j,fiber=fi,sampling_seed=sampling_seed,drift=float(states.drift[j]),departed=bool(states.offtrack[j]),
                 four_correct=bool(labels[0,min(3,model.cfg.n_future-1)]),four_known=bool(masks[0,min(3,model.cfg.n_future-1)]),first_correct=bool(labels[0,0]),
                 first_known=bool(masks[0,0]),would_stop=len(path)==1,commit=max(0,len(path)-1),
-                error=float(error[0]),confidence4=float(output['confidence'][0,min(3,model.cfg.n_future-1)]),threshold=threshold,
+                error=float(error[0]),confidence4=float(confidence[0,min(3,model.cfg.n_future-1)]),threshold=threshold,
                 end_error=end_error,recovered=bool(len(path)>1 and end_error<=1.5),
                 error_reduced=bool(len(path)>1 and end_error<states.drift[j]),reason=reasons[0])
             rows.append(row)

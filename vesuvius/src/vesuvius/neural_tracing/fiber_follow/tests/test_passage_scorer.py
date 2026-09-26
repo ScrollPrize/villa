@@ -153,7 +153,7 @@ def test_all_candidates_receive_censored_prefix_supervision():
 
 def test_mixed_training_cache_equivalence_and_checkpoint_roundtrip(tmp_path):
     torch.manual_seed(7)
-    cfg=mixed_config(); a=FollowNet(cfg); b=copy.deepcopy(a)
+    cfg=mixed_config(candidate_selection='stop_fallback'); a=FollowNet(cfg); b=copy.deepcopy(a)
     averages=[copy.deepcopy(m).requires_grad_(False).eval() for m in (a,b)]
     optimizers=[torch.optim.AdamW(m.parameters(),lr=.001) for m in (a,b)]
     data=batch(cfg,4); data['offtrack'][1]=1; data['dense_mask'][2,5:]=0
@@ -174,6 +174,7 @@ def test_mixed_training_cache_equivalence_and_checkpoint_roundtrip(tmp_path):
     loaded,*_=load_checkpoint(path,'cpu')
     loaded.requires_grad_(False)  # Match EMA inference kernel dispatch as well as its weights.
     assert loaded.cfg.scorer=='passage' and loaded.cfg.gaussian_candidates==4
+    assert loaded.cfg.candidate_selection=='stop_fallback'
     noise=initial_residuals(cfg,4,'cpu')
     with torch.no_grad():
         torch.testing.assert_close(run(loaded,data,initial_noise=noise)['candidate_logits'],
@@ -195,7 +196,7 @@ def test_legacy_checkpoint_defaults_and_new_resume_guard(tmp_path):
     path=tmp_path/'legacy.pt'
     save_checkpoint(path,model,model,FiberVolumeSpec('unused'),sample)
     ck=torch.load(path,weights_only=False)
-    for key in ('scorer','gaussian_candidates','selection_horizon'): ck['model_cfg'].pop(key)
+    for key in ('scorer','gaussian_candidates','selection_horizon','candidate_selection'): ck['model_cfg'].pop(key)
     torch.save(ck,path)
     loaded,*_=load_checkpoint(path,'cpu')
     torch.testing.assert_close(run(model,data)['confidence'],run(loaded,data)['confidence'],rtol=0,atol=0)
@@ -219,7 +220,7 @@ def test_mixed_sampling_streams_and_evaluation_repeats():
     assert module.evaluation_sampling_seeds('zero',gaussian_candidates=4)==[0,1,2]
 
 
-@pytest.mark.parametrize('field,value',[('scorer','legacy'),('gaussian_candidates',0),('selection_horizon',4)])
+@pytest.mark.parametrize('field,value',[('scorer','legacy'),('gaussian_candidates',0),('selection_horizon',4),('candidate_selection','stop_fallback')])
 def test_preflight_rejects_different_scorer_configuration(tmp_path,field,value):
     bench=dict(architecture=ARCHITECTURE,passed=True,microbatch=2,flow_draws=64,crop=[176,96,96],
                cache_training_encoding=True,compile_model=False,sampler_mode='zero',scorer='passage',
@@ -239,7 +240,8 @@ def test_launcher_forwards_scorer_settings_to_preflight_without_starting_trainin
         f'open({str(capture)!r},"w").write(json.dumps(sys.argv[1:]))\nsys.exit(42)\n')
     wrapper.chmod(0o755)
     script=Path(__file__).parents[1]/'scripts/launch_single_path.sh'
-    options={'--scorer':'passage','--gaussian-candidates':'4','--sampler-mode':'zero','--n-commit':'4'}
+    options={'--scorer':'passage','--gaussian-candidates':'4','--sampler-mode':'zero','--n-commit':'4',
+             '--candidate-selection':'stop_fallback'}
     args=[f'{key}={value}' for key,value in options.items()] if joined else [v for pair in options.items() for v in pair]
     result=subprocess.run(['bash',str(script),'test_scorer_launcher',*args],env=dict(os.environ,PYTHON=str(wrapper)),capture_output=True,text=True)
     assert result.returncode==42, result.stderr
@@ -251,7 +253,7 @@ def test_launcher_forwards_scorer_settings_to_preflight_without_starting_trainin
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA unavailable')
 def test_compiled_mixed_training_and_inference():
     torch.manual_seed(5)
-    model=FollowNet(mixed_config()).cuda(); ema=copy.deepcopy(model)
+    model=FollowNet(mixed_config(candidate_selection='stop_fallback')).cuda(); ema=copy.deepcopy(model)
     data=batch(model.cfg); gpu={k:v.cuda() for k,v in data.items()}
     noise=initial_residuals(model.cfg,2,'cuda')
     with torch.no_grad(),torch.autocast('cuda',dtype=torch.bfloat16):
@@ -264,3 +266,4 @@ def test_compiled_mixed_training_and_inference():
     for step in (2000,2001):
         loss,metrics,_=optimizer_update(model,ema,optimizer,[data],step,.001,device='cuda',n_commit=2)
         assert torch.isfinite(torch.tensor(loss)) and 'candidate_rescues' in metrics
+        assert 'candidate_fallback_count_0.5' in metrics

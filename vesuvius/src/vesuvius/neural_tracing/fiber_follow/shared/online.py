@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import numpy as np
+
 from vesuvius.neural_tracing.fiber_follow.shared.data import OnPolicyStates
 from vesuvius.neural_tracing.fiber_follow.shared.trace import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT
 
@@ -27,7 +29,7 @@ class OnlineCollector:
     def __init__(self, directory, fibers, val_z, device, every=1000, max_seeds=64,
                  batch=1, explore_calls=8, seed=0, replay_keep=4, initial=(),
                  trace_len=6000., confidence=DEFAULT_CONFIDENCE, n_commit=DEFAULT_N_COMMIT,
-                 collector_module='vesuvius.neural_tracing.fiber_follow.flow_matching.collect'):
+                 collector_module='vesuvius.neural_tracing.fiber_follow.flow_matching.collect', seeds_per_fiber=2):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.index = self.directory/'replay.json'
@@ -35,6 +37,7 @@ class OnlineCollector:
         self.every, self.max_seeds, self.batch = every, max_seeds, batch
         self.explore_calls, self.seed, self.replay_keep = explore_calls, seed, replay_keep
         self.trace_len, self.confidence, self.n_commit = trace_len, confidence, n_commit
+        self.seeds_per_fiber = seeds_per_fiber
         self.collector_module = collector_module
         self.paths = list(initial)
         self.process = self.log = None
@@ -53,7 +56,10 @@ class OnlineCollector:
         self.paths = (self.paths+[states._dir])[-self.replay_keep:]
         publish_replay(self.index, self.paths)
         return dict(dagger_states=len(states), dagger_source_step=states.provenance['step'],
-                    dagger_caches=len(self.paths), dagger_cache=str(self.output))
+                    dagger_caches=len(self.paths), dagger_cache=str(self.output),
+                    dagger_fibers=int(len(np.unique(states.fiber_idx))),
+                    dagger_hard=int(np.count_nonzero(states.hard)),
+                    dagger_exploratory=int(np.count_nonzero(states.exploratory)))
 
     def launch(self, step, save):
         if not self.every or step % self.every or self.process is not None:
@@ -65,6 +71,7 @@ class OnlineCollector:
                    '--checkpoint', str(checkpoint), '--fibers', self.fibers,
                    '--val-z', *map(str, self.val_z), '--device', self.device,
                    '--max-seeds', str(self.max_seeds), '--batch', str(self.batch),
+                   '--seeds-per-fiber', str(self.seeds_per_fiber),
                    '--explore-calls', str(self.explore_calls), '--trace-len', str(self.trace_len),
                    '--confidence', str(self.confidence), '--n-commit', str(self.n_commit),
                    '--seed', str(self.seed+step), '--out', str(self.output)]

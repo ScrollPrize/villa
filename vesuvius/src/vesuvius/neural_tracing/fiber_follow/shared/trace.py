@@ -184,6 +184,8 @@ class ModelTracer:
             sampling = {}
             if stochastic:
                 sampling['initial_noise'] = trace_noise(self.model.cfg, [generators[i] for i in idx], self.device)
+            if getattr(self.model.cfg, 'candidate_selection', 'prefix') == 'stop_fallback':
+                sampling.update(confidence_threshold=pp.confidence,n_commit=pp.n_commit)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
                 out = self.model(x, tensor(hist).float(), tensor(hm), **sampling)
             commits, allowed = commit_prefix(out['points'], out['confidence'], pp.confidence, pp.n_commit,
