@@ -19,8 +19,13 @@
 
 #include <omp.h>
 
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <optional>
@@ -32,6 +37,37 @@ using shape = std::vector<size_t>;
 
 
 using Json = utils::Json;
+
+// The tracer's Ceres solves go through CHOLMOD, whose BLAS calls land in the
+// process-wide OpenBLAS pool. The pthreads build of OpenBLAS sizes that pool
+// from the core count when the library is loaded and the idle workers
+// spin-wait (sched_yield) between jobs; the tracer issues many small
+// factorizations, so on an N-core machine the pool burns N-1 cores for
+// nothing, and neither thread_limit nor omp_set_num_threads() reaches it.
+// Measured on a 14C/28T Xeon: thread_limit=1 took 189 CPU-s for 16.6 s of
+// wall with the pool and 13 CPU-s / 12.7 s with it capped. VC3D's
+// "Create Segment (GrowPatch)" runs this tool with thread_limit 1 and does
+// not set OMP_NUM_THREADS, so it gets the full pool too (40 generations on a
+// remote volume: 1705 CPU-s uncapped, 226 capped).
+// Only the thread count is capped. Retiring the workers as well
+// (blas_shutdown(), which VCAppMain.cpp calls for VC3D itself) made this tool
+// crash in the exit handlers after the surface had been saved, and saved no
+// measurable CPU on top of the cap. An explicit OPENBLAS_NUM_THREADS /
+// GOTO_NUM_THREADS in the environment wins: OpenBLAS already honoured it.
+static void cap_blas_thread_pool()
+{
+#ifndef _WIN32
+    if (std::getenv("OPENBLAS_NUM_THREADS") || std::getenv("GOTO_NUM_THREADS"))
+        return;
+    const int omp_threads = omp_get_max_threads();
+    if (auto fn = reinterpret_cast<void (*)(int)>(dlsym(RTLD_DEFAULT, "openblas_set_num_threads")))
+        fn(1);
+    // OpenMP builds of OpenBLAS up to 0.3.0 forwarded the call above to
+    // omp_set_num_threads(); the tracer's own thread count stays as it was.
+    if (omp_get_max_threads() != omp_threads)
+        omp_set_num_threads(omp_threads);
+#endif
+}
 
 static bool is_remote_volume_path(const std::string& path)
 {
@@ -203,6 +239,9 @@ static auto load_direction_fields(Json const&params, std::filesystem::path const
 
 int main(int argc, char *argv[])
 {
+    // First, before anything can issue a BLAS call.
+    cap_blas_thread_pool();
+
     std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path;
     cv::Vec3d origin;
     Json params;
