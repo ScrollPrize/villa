@@ -36,8 +36,11 @@ def sample_path_features(features, points, crop, stride=1):
     grid = 2*index/stride/(shape-1).clamp_min(1)-1
     supported = torch.isfinite(grid).all(-1) & (grid.abs() <= 1).all(-1)
     values = F.grid_sample(features.float(), grid[:, :, None, None], align_corners=True)
-    values = values[:, :, :, 0, 0].transpose(1, 2)
-    return torch.cat((values, supported[..., None].float()), -1)
+    # Append support in the sampler's channel-major layout, then transpose.
+    # Concatenating after the transpose lets Inductor miscompile the downstream
+    # stencil reshape as contiguous, scrambling evidence and reading padding.
+    values = values[:, :, :, 0, 0]
+    return torch.cat((values, supported[:, None].float()), 1).transpose(1, 2)
 
 
 class PassageScorer(nn.Module):

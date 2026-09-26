@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from test_single_path import config, batch, run
-from vesuvius.neural_tracing.fiber_follow.model import FollowNet, initial_residuals, ARCHITECTURE
+from vesuvius.neural_tracing.fiber_follow.model import FollowNet, FollowNetConfig, initial_residuals, ARCHITECTURE
 from vesuvius.neural_tracing.fiber_follow.passage_scorer import PassageScorer, sample_path_features
 from vesuvius.neural_tracing.fiber_follow.supervision import candidate_prefix_labels, prefix_labels, loss_fn
 from vesuvius.neural_tracing.fiber_follow.train import (
@@ -54,6 +54,39 @@ def test_deep_evidence_samples_actual_stride_centers_and_support():
     sampled = sample_path_features(features, points, crop, stride=4)
     torch.testing.assert_close(sampled[0,0], torch.tensor([211.,1.]))
     assert sampled[0,1,-1] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA unavailable')
+def test_compiled_scorer_preserves_stencil_feature_layout_and_gradients(monkeypatch):
+    # Keep production feature widths and 5 x 16 paths: smaller smoke-test
+    # shapes miss the compiled transpose/cat/reshape layout error. The spatial
+    # grid can be smaller because it does not change that stencil grouping.
+    import torch._functorch.config
+    monkeypatch.setattr(torch._functorch.config,'backward_pass_autocast','off')
+    torch.manual_seed(4)
+    cfg=FollowNetConfig(depth=40,width=16,behind=20,scorer='passage',gaussian_candidates=4,
+                       flow_sigma=((1.,1.),)*16)
+    model=FollowNet(cfg).cuda()
+    features=torch.randn(2,24,40,16,16,device='cuda',requires_grad=True)
+    deep=torch.randn(2,128,10,4,4,device='cuda',requires_grad=True)
+    context=torch.randn(2,5,16,256,device='cuda',requires_grad=True)
+    points=torch.randn(2,5,16,3,device='cuda')
+    points[...,2]=torch.arange(1,17,device='cuda')
+    args=(features,{'score_deep':deep},context,points)
+    compiled=torch.compile(model.score_candidates)
+    with torch.autocast('cuda',dtype=torch.bfloat16):
+        expected=model.score_candidates(*args)
+        actual=compiled(*args)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual,expected,atol=.003,rtol=.01)
+    inputs=(features,deep,context,*model.flow.confidence_head.parameters())
+    eager_grads=torch.autograd.grad(expected.sum(),inputs)
+    compiled_grads=torch.autograd.grad(actual.sum(),inputs)
+    for eager,compiled in zip(eager_grads,compiled_grads):
+        assert torch.isfinite(compiled).all()
+        # BF16 rounding can change which near-tied token wins prefix max, so
+        # compare whole gradient vectors rather than individual near-zero entries.
+        assert (compiled-eager).norm() <= .05*eager.norm()+1e-6
 
 
 def test_mixed_proposals_keep_zero_and_train_all_heads_without_coordinate_gradients():

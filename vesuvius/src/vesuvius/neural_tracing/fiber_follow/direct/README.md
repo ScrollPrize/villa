@@ -115,7 +115,7 @@ python -m vesuvius.neural_tracing.fiber_follow.direct.train \
   --fixed-bank output/single_path_v11_preparation/fixed_recovery.npz
 ```
 
-Defaults are 50,000 updates, effective batch eight, microbatch two, AdamW at
+Defaults are 50,000 updates, effective batch 24 in one microbatch, six loader workers, AdamW at
 3e-4 peak learning rate, 500-update warmup/cosine schedule, gradient clipping
 at one, and EMA 0.999 with the existing early-update ramp. CUDA uses BF16;
 CPU uses FP32. No compilation is required. `--batch` and `--microbatch` are

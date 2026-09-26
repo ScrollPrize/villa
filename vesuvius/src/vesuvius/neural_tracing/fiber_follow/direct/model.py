@@ -32,7 +32,6 @@ class DirectConfig:
     correction: bool = True
     correction_limit: float = 1.  # maximum adjustment per refinement, trace voxels
     correction_steps: int = 2
-    rich_path_context: bool = True
 
     def __post_init__(self):
         for name in ('fine', 'coarse'):
@@ -136,8 +135,6 @@ class ImageContext(nn.Module):
 
     def path_features(self, fine, fine_deep, coarse_deep, points):
         """Inspect the actual path at three longitudinal slices and two scales."""
-        if not self.cfg.rich_path_context:
-            return self.patches(fine, points)
         b, k, _ = points.shape
         local, support = sample_features(fine,
             (points[:, :, None]+self.path_stencil).reshape(b, k*27, 3), self.cfg.fine)
@@ -182,13 +179,11 @@ class DirectFollower(ImageContext):
         nn.init.zeros_(self.coordinates.bias)
         # Rich evidence: 27 local samples with support flags, plus the deep
         # fine/coarse feature at each proposed point and its support flag.
-        evidence_width = 27*(c+1)+2*(4*c+1) if cfg.rich_path_context else 9*c
+        evidence_width = 27*(c+1)+2*(4*c+1)
         def path_layers():
-            layers = [nn.Linear(h+evidence_width+3, h), nn.SiLU()]
-            if cfg.rich_path_context:
-                layers.append(nn.TransformerEncoderLayer(h, cfg.heads, 2*h, dropout=0.,
-                    activation='gelu', batch_first=True, norm_first=True))
-            return layers
+            return [nn.Linear(h+evidence_width+3, h), nn.SiLU(),
+                    nn.TransformerEncoderLayer(h, cfg.heads, 2*h, dropout=0.,
+                        activation='gelu', batch_first=True, norm_first=True)]
         if cfg.correction:
             self.correction_head = nn.Sequential(*path_layers(), nn.Linear(h, 2))
             nn.init.normal_(self.correction_head[-1].weight, std=.001)

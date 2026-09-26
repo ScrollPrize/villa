@@ -350,7 +350,7 @@ def test_startup_sampling_and_history_diagnostics():
 
 @pytest.mark.parametrize('correction', [False, True])
 def test_compact_config_checkpoint_inference(tmp_path, correction):
-    cfg = replace(config(), correction=correction, correction_steps=1, rich_path_context=False)
+    cfg = replace(config(), correction=correction, correction_steps=1)
     m = DirectFollower(cfg).eval()
     b = batch(cfg)
     assert hasattr(m, 'correction_head') == correction
@@ -361,7 +361,7 @@ def test_compact_config_checkpoint_inference(tmp_path, correction):
     path = tmp_path/'compact.pt'
     save_checkpoint(path, m, m, spec, SampleConfig(crop=cfg.fine, n_history=cfg.n_history))
     loaded = load_checkpoint(path, 'cpu')[0]
-    assert loaded.cfg.correction == correction and not loaded.cfg.rich_path_context
+    assert loaded.cfg.correction == correction
     assert loaded.cfg.correction_steps == 1
     for key, value in forward(loaded, b).items():
         torch.testing.assert_close(value, out[key], rtol=0, atol=0)
