@@ -213,7 +213,6 @@ class SampleConfig:
     history_drift: float = 2.0  # accumulated lateral displacement, smooth over 16--64 voxels
     history_wobble: float = 1.0  # max amplitude (voxels) of slow lateral wobble on the own-trace history
     dense_substeps: int = 4
-    unique_crossings: bool = False
 
     @property
     def future_s(self) -> np.ndarray:
@@ -231,8 +230,6 @@ def training_state_allowed(item, crop: CropSpec, band: ZBand | None):
     crop's read footprint (including interpolation support). Applied before I/O
     to fresh and cached states, after their random roll/offset is selected.
     """
-    if item.get('spatial_excluded', False):
-        return False
     if band is None:
         return True
     pos, frame = item["pos"], item["frame"]
@@ -268,7 +265,7 @@ def training_state_allowed(item, crop: CropSpec, band: ZBand | None):
     return not (z.min() < band.hi and z.max() >= band.lo)
 
 
-def plane_targets(p, s, t, t_end, pos, frame, planes, require_unique=False):
+def plane_targets(p, s, t, t_end, pos, frame, planes):
     """Where the GT curve (traversal arc ``s``, from ``t`` up to ``t_end``)
     first crosses each local forward plane c = planes[k]. Returns lateral
     (a, b) per plane (K, 2) and a validity mask (K,)."""
@@ -281,19 +278,8 @@ def plane_targets(p, s, t, t_end, pos, frame, planes, require_unique=False):
     arc = np.r_[t, s[(s > t) & (s < t+span)], t+span]
     loc = (interp_at(p, s, arc) - pos) @ frame
     c = loc[:, 2]
-    # Only the local passage up to the first final-plane crossing is relevant.
-    # A later return from outside the horizon is a different tracing decision.
-    if require_unique:
-        end_hit = np.flatnonzero((c[:-1] < planes[-1]) & (c[1:] >= planes[-1]))
-        if len(end_hit):
-            loc, c = loc[:end_hit[0]+2], c[:end_hit[0]+2]
     for k, ck in enumerate(planes):
         hit = np.nonzero((c[:-1] < ck) & (c[1:] >= ck))[0]
-        if require_unique:
-            backward = (c[:-1] >= ck) & (c[1:] < ck)
-            flat = np.isclose(c[:-1], ck, atol=1e-6) & np.isclose(c[1:], ck, atol=1e-6)
-            if len(hit) != 1 or backward.any() or flat.any():
-                continue
         if len(hit):
             i = hit[0]
             w = (ck - c[i]) / max(c[i + 1] - c[i], 1e-9)
@@ -379,8 +365,8 @@ def continuation_targets(fiber, t, reverse, pos, frame, cfg, offtrack=False):
         gt_history_mask[:] = 0
     dense_planes = np.linspace(cfg.future_step, cfg.future_s[-1],
                                (cfg.n_future-1)*cfg.dense_substeps+1)
-    ab, mask = plane_targets(p, s, t, s[-1], pos, frame, cfg.future_s, cfg.unique_crossings)
-    dense_ab, dense_mask = plane_targets(p, s, t, s[-1], pos, frame, dense_planes, cfg.unique_crossings)
+    ab, mask = plane_targets(p, s, t, s[-1], pos, frame, cfg.future_s)
+    dense_ab, dense_mask = plane_targets(p, s, t, s[-1], pos, frame, dense_planes)
     fmask = (tf <= s[-1]).astype(np.float32)
     if offtrack:
         mask[:] = 0
@@ -496,8 +482,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
             if chunks % self.refresh_chunks == 0:
                 self.refresh_replay()
             chunks += 1
-            items = (self.batch_builder.contact_batch(rng, self.chunk)
-                     if hasattr(self.batch_builder, 'contact_batch') else [])
+            items = []
             for attempt in range(max(10000, self.chunk*1000)):
                 if len(items) == self.chunk:
                     break
@@ -510,13 +495,6 @@ class FollowDataset(torch.utils.data.IterableDataset):
                                        reverse=bool(op.reverse[j]), offtrack=bool(op.offtrack[j]))
                     item['source'],item['stratum'] = source,band
                     item['source_step'] = op.provenance.get('step', -1) or -1
-                    if hasattr(self.batch_builder, 'prepare_sample'):
-                        item = self.batch_builder.prepare_sample(item, self.fibers[op.fiber_idx[j]],
-                            float(op.t[j]), bool(op.reverse[j]), rng, replay=op, replay_row=j)
-                    if self.batch_builder is not None and hasattr(self.batch_builder, 'slices') and op.judge_trace[j] >= 0:
-                        from .direct.judge_archive import PathArchive
-                        item['judge_context'] = PathArchive.from_replay(op).context(int(op.judge_trace[j]), float(op.judge_cutoff[j]),
-                                                                         self.fibers[op.fiber_idx[j]], int(op.judge_revision[j]))
                     if not self.state_allowed(item):
                         item = None
                 if item is None:
@@ -535,13 +513,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
                         original_t = np.clip(center+rng.uniform(-self.window/2, self.window/2), 0, f.length)
                         t = f.length-original_t if rev else original_t
                     item = make_sample(f, t, rev, cfg, rng)
-                    if self.batch_builder is not None and hasattr(self.batch_builder, 'slices'):
-                        from .direct.judge_supervision import fresh_context
-                        item['judge_context'] = fresh_context(item, f, t, rev)
                     item['source'], item['source_step'], item['stratum'] = 0, -1, -1
-                    if hasattr(self.batch_builder, 'prepare_sample'):
-                        original_t = f.length-t if rev else t
-                        item = self.batch_builder.prepare_sample(item, f, original_t, rev, rng)
                 if self.state_allowed(item):
                     items.append(item)
                 if len(items) == self.chunk:
@@ -724,11 +696,8 @@ class OnPolicyStates:
     # Fields later collectors add; caches without them load with the default.
     # drift: current-position error in trace-grid voxels (NaN when departed or unknown).
     # Arc positions compared against float64 trace geometry keep full precision.
-    FLOAT64_FIELDS = ("t", "judge_cutoff")
+    FLOAT64_FIELDS = ("t",)
     OPTIONAL = {"drift": lambda n: np.full(n, np.nan, np.float32),
-                "judge_revision": lambda n: np.full(n, -1, np.int64),
-                "judge_trace": lambda n: np.full(n, -1, np.int64),
-                "judge_cutoff": lambda n: np.full(n, np.nan, np.float64),
                 "source_cache": lambda n: np.full(n, -1, np.int32),
                 "source_row": lambda n: np.full(n, -1, np.int64)}
 

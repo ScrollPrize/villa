@@ -46,14 +46,14 @@ class RecoveryAudit(HistoryAudit):
 
 
 
-def evaluation_sampling_seeds(sampler_mode, requested=None, selection=None):
+def evaluation_sampling_seeds(sampler_mode, requested=None, selection=None, *, gaussian_candidates=0):
     """Final repeats are locked with calibration, just like threshold/checkpoint."""
     if selection is not None:
         seeds=selection.get('sampling_seeds',[0])
         if requested is not None and requested!=seeds:
             raise ValueError('Final sampling seeds must match the locked calibration selection')
     else:
-        seeds=requested if requested is not None else ([0,1,2] if sampler_mode=='gaussian' else [0])
+        seeds=requested if requested is not None else ([0,1,2] if sampler_mode=='gaussian' or gaussian_candidates else [0])
     if not seeds or len(set(seeds))!=len(seeds) or any(s<0 or s>=2**63 for s in seeds):
         raise ValueError('Sampling seeds must be distinct integers in [0, 2**63)')
     return seeds
@@ -109,7 +109,8 @@ def main(argv=None, *, checkpoint_loader=None, model_tracer=None, volume_validat
         _,val=split_fibers(load_fibers(args.fibers,grid_scale=spec.grid_scale),ZBand(45000/spec.grid_scale,48500/spec.grid_scale))
         if fiber_manifest(val)!=manifest['fibers']: raise ValueError('Geometry differs from frozen manifest')
         sampler_mode=getattr(model.cfg,'sampler_mode','zero')
-        sampling_seeds=evaluation_sampling_seeds(sampler_mode,args.sampling_seeds,selection)
+        gaussian_candidates=getattr(model.cfg,'gaussian_candidates',0)
+        sampling_seeds=evaluation_sampling_seeds(sampler_mode,args.sampling_seeds,selection,gaussian_candidates=gaussian_candidates)
         tracer=tracer_class(model,FiberVolume(spec),crop,nh,TraceParams(max_len=6000,confidence=threshold,
             n_commit=ck.get('n_commit',8)),device=args.device)
         start=time.monotonic();rows=[];audit_rows=[];seed_summaries=[]
@@ -131,6 +132,7 @@ def main(argv=None, *, checkpoint_loader=None, model_tracer=None, volume_validat
             manifest_sha256=manifest['sha256'],split=split,threshold=threshold,max_len=6000,
             architecture=ck.get('architecture'),vol_spec=spec.to_dict(),n_commit=tracer.p.n_commit,
             sampler_mode=sampler_mode,sampling_seeds=sampling_seeds,sampling_seed_summaries=seed_summaries,
+            scorer=getattr(model.cfg,'scorer','legacy'),gaussian_candidates=gaussian_candidates,
             recovery=recovery_counts(audit_rows),seconds=time.monotonic()-start,step=ck['step'],
             baseline_archive=str(args.baseline_archive.resolve()) if args.baseline_archive else None)
         report['coverage_at_95_scored_precision']=report['length_weighted_coverage'] if report['length_precision']>=.95 else None

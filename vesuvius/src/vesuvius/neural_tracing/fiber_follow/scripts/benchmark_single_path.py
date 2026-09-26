@@ -13,9 +13,11 @@ from vesuvius.neural_tracing.fiber_follow.model import ARCHITECTURE,FollowNet,Fo
 from vesuvius.neural_tracing.fiber_follow.train import optimizer_update,compile_training_model
 from vesuvius.neural_tracing.fiber_follow.trace import ModelTracer,TraceParams
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume,FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.runloop import raise_open_file_limit
 
 
 def main(argv=None):
+    raise_open_file_limit()
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--out',type=Path,required=True)
     ap.add_argument('--manifest',type=Path,required=True)
@@ -28,6 +30,9 @@ def main(argv=None):
                     help='Compile CUDA training methods (default: enabled)')
     ap.add_argument('--flow-draws',type=int,default=64)
     ap.add_argument('--sampler-mode',choices=('zero','gaussian'),default='gaussian')
+    ap.add_argument('--scorer',choices=('legacy','passage'),default='legacy')
+    ap.add_argument('--gaussian-candidates',type=int,default=0)
+    ap.add_argument('--n-commit',type=int,default=8)
     ap.add_argument('--updates',type=int,default=3)
     ap.add_argument('--warmup',type=int,default=1)
     ap.add_argument('--conv-memory-format',choices=('contiguous','channels_last_3d'),
@@ -35,7 +40,8 @@ def main(argv=None):
     args=ap.parse_args(argv)
     result=dict(architecture=ARCHITECTURE,device=args.device,microbatch=args.microbatch,
                 effective_batch=8,flow_draws=args.flow_draws,crop=[176,96,96],passed=False,
-                cache_training_encoding=args.cache_training_encoding,compile_model=args.compile_model,sampler_mode=args.sampler_mode)
+                cache_training_encoding=args.cache_training_encoding,compile_model=args.compile_model,sampler_mode=args.sampler_mode,
+                scorer=args.scorer,gaussian_candidates=args.gaussian_candidates,selection_horizon=args.n_commit)
     try:
         if not args.device.startswith('cuda') or not torch.cuda.is_available():
             raise RuntimeError('Preflight requires a working CUDA device; CPU smoke tests do not qualify')
@@ -45,7 +51,8 @@ def main(argv=None):
         manifest=read_manifest(args.manifest);spec=FiberVolumeSpec(**manifest['volume'])
         fibers=load_fibers(args.fibers,grid_scale=spec.grid_scale)
         train,val=split_fibers(fibers,ZBand(45000/spec.grid_scale,48500/spec.grid_scale))
-        cfg=FollowNetConfig(flow_sigma=((1.,1.),)*16,flow_draws=args.flow_draws,sampler_mode=args.sampler_mode)
+        cfg=FollowNetConfig(flow_sigma=((1.,1.),)*16,flow_draws=args.flow_draws,sampler_mode=args.sampler_mode,
+                           scorer=args.scorer,gaussian_candidates=args.gaussian_candidates,selection_horizon=args.n_commit)
         sample=SampleConfig(crop=CropSpec(depth=176,width=96,behind=128,history_render='segments',history_sigma=.35))
         batch=next(iter(FollowDataset(train,spec,sample,ZBand(45000/8,48500/8),chunk=8)))
         micro=[{k:v[i:i+args.microbatch] for k,v in batch.items()} for i in range(0,8,args.microbatch)]
@@ -70,7 +77,7 @@ def main(argv=None):
         for i in range(args.updates+args.warmup):
             torch.cuda.synchronize();start=time.perf_counter()
             optimizer_update(model,ema,opt,micro,2000+i,1e-3,device=args.device,compute_metrics=False,
-                             cache_training_encoding=args.cache_training_encoding)
+                             cache_training_encoding=args.cache_training_encoding,n_commit=args.n_commit)
             torch.cuda.synchronize()
             elapsed=time.perf_counter()-start
             if i>=args.warmup: times.append(elapsed)
@@ -84,7 +91,7 @@ def main(argv=None):
         # evaluations and the final confidence evaluation, frame/loop checks.
         torch.backends.cudnn.benchmark=False
         tracer=ModelTracer(ema,FiberVolume(spec),sample.crop,128,
-                           TraceParams(max_len=64,confidence=0.),device=args.device)
+                           TraceParams(max_len=64,confidence=0.,n_commit=args.n_commit),device=args.device)
         seeds=manifest['monitor'][:1];decisions=[]
         try:
             torch.cuda.synchronize();start=time.perf_counter()

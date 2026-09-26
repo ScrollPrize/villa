@@ -92,6 +92,17 @@ def masked_bce(logits, target, mask, denominator=None):
     return (loss*mask).sum()/denominator.clamp_min(1)
 
 
+def candidate_prefix_labels(points, batch, tolerance=1.5, max_recovery_distance=DEFAULT_MAX_RECOVERY_DISTANCE):
+    """Label each generated alternative with the same original-fiber semantics."""
+    if points.ndim == 3:
+        return prefix_labels(points, batch, tolerance, max_recovery_distance)
+    b, k, n, _ = points.shape
+    expanded = {key: batch[key].repeat_interleave(k, dim=0) for key in
+                ('dense_ab', 'dense_mask', 'offtrack', 'endpoint_known', 'end_local')}
+    labels, known, error = prefix_labels(points.reshape(b*k, n, 3), expanded, tolerance, max_recovery_distance)
+    return labels.reshape(b, k, n), known.reshape(b, k, n), error.reshape(b, k)
+
+
 def loss_fn(output, batch, cfg, tolerance=1.5, *, update=0, confidence_ramp=2000, compute_metrics=True, normalizers=None,
             n_commit=DEFAULT_N_COMMIT):
     """Flow loss plus confidence BCE, half over the commit window and half over the full horizon.
@@ -103,8 +114,12 @@ def loss_fn(output, batch, cfg, tolerance=1.5, *, update=0, confidence_ramp=2000
     logits = output['confidence_logits']
     normalizers = normalizers or {}
     window = min(n_commit, logits.shape[1])
-    near = masked_bce(logits[:,:window],target[:,:window],mask[:,:window],normalizers.get('near'))
-    full = masked_bce(logits,target,mask,normalizers.get('full'))
+    loss_target, loss_mask = target, mask
+    if 'candidate_logits' in output:
+        loss_target, loss_mask, _ = candidate_prefix_labels(output['candidate_points'],batch,tolerance,cfg.max_recovery_distance)
+        logits = output['candidate_logits']
+    near = masked_bce(logits[...,:window],loss_target[...,:window],loss_mask[...,:window],normalizers.get('near'))
+    full = masked_bce(logits,loss_target,loss_mask,normalizers.get('full'))
     flow = output['flow_loss']
     if 'flow' in normalizers:
         flow = flow*output['flow_known_count']/max(1.,normalizers['flow'])
@@ -120,6 +135,20 @@ def loss_fn(output, batch, cfg, tolerance=1.5, *, update=0, confidence_ramp=2000
                        flow_censored_fraction=output['flow_censored_fraction'].item(),
                        commit_correct_count=(target[:,window-1]*mask[:,window-1]).sum().item(),
                        commit_known_count=mask[:,window-1].sum().item())
+        if 'candidate_logits' in output:
+            known = loss_mask[...,window-1].bool()
+            correct = loss_target[...,window-1].bool() & known
+            eligible = recovery_allowed(output['candidate_points'],cfg.max_recovery_distance)
+            correct &= eligible
+            common = known.all(1)
+            oracle = correct.any(1) & common
+            selected_correct = target[:,window-1].bool() & mask[:,window-1].bool()
+            zero_correct = correct[:,0]
+            metrics.update(candidate_states=common.sum().item(),candidate_oracle_correct=oracle.sum().item(),
+                candidate_selected_correct=(selected_correct & common).sum().item(),
+                candidate_zero_correct=(zero_correct & common).sum().item(),
+                candidate_rescues=(selected_correct & ~zero_correct & common).sum().item(),
+                candidate_spoiled=(~selected_correct & zero_correct & common).sum().item())
         for threshold in (.5,.85):
             eligible = recovery_allowed(output['points'],cfg.max_recovery_distance)
             open_gate = eligible & (output['confidence'][:,0]>=threshold)

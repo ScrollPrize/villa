@@ -22,9 +22,10 @@ from vesuvius.neural_tracing.fiber_follow.online import OnlineCollector
 from vesuvius.neural_tracing.fiber_follow.runloop import (
     RunLog, lr_at, prepare_run_dir, update_ema, training_rng_state, restore_training_rng, resume_training,
     read_checkpoint as _read_checkpoint, save_checkpoint as _save_checkpoint,
+    raise_open_file_limit,
 )
 from vesuvius.neural_tracing.fiber_follow.trace import DEFAULT_CONFIDENCE
-from vesuvius.neural_tracing.fiber_follow.supervision import loss_fn, prefix_labels, refinement_metrics
+from vesuvius.neural_tracing.fiber_follow.supervision import loss_fn, candidate_prefix_labels, refinement_metrics
 from vesuvius.neural_tracing.fiber_follow.policy import DEFAULT_MAX_RECOVERY_DISTANCE, DEFAULT_N_COMMIT
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.training_log import format_training_log
@@ -58,13 +59,25 @@ def resolve_sampler_mode(requested=None, resume=None):
     return saved if saved is not None else (requested or 'gaussian')
 
 
+def resolve_scorer_options(scorer=None, gaussian_candidates=None, resume=None):
+    """Old checkpoints use the original head; resumed policies cannot change."""
+    result = {}
+    for key, requested, default in (('scorer',scorer,'legacy'),('gaussian_candidates',gaussian_candidates,0)):
+        saved = resume['model_cfg'].get(key,default) if resume is not None else default
+        if resume is not None and requested is not None and requested != saved:
+            raise ValueError(f'Cannot change {key} on resume; start a new run')
+        result[key] = saved if requested is None else requested
+    return result
+
+
 def initialized_config(checkpoint, expected):
-    """Reuse v11 architecture/scales, changing only draws and sampler policy."""
+    """Reuse architecture/scales, changing draws and inference policy only."""
     source=FollowNetConfig(**checkpoint['model_cfg'])
     for key,value in expected.to_dict().items():
-        if key not in ('flow_sigma','flow_draws','sampler_mode') and source.to_dict()[key] != value:
+        if key not in ('flow_sigma','flow_draws','sampler_mode','selection_horizon') and source.to_dict()[key] != value:
             raise ValueError(f'Initialization architecture differs: {key}')
-    return dataclasses.replace(source,flow_draws=expected.flow_draws,sampler_mode=expected.sampler_mode)
+    return dataclasses.replace(source,flow_draws=expected.flow_draws,sampler_mode=expected.sampler_mode,
+                               selection_horizon=expected.selection_horizon)
 
 
 @torch.no_grad()
@@ -170,8 +183,8 @@ def optimizer_update(model, ema, opt, batches, update, lr, *, device, tolerance=
                     points=model.generate_training_curve(x.float(),hist,hmask,**encoding_args,**sampling_args)
                 points=points.float().cpu()
             curves.append(points)
-            _,mask,_=prefix_labels(points,cpu,tolerance,model.cfg.max_recovery_distance)
-            normalizers['near'] += mask[:,:n_commit].sum().item()
+            _,mask,_=candidate_prefix_labels(points,cpu,tolerance,model.cfg.max_recovery_distance)
+            normalizers['near'] += mask[...,:n_commit].sum().item()
             normalizers['full'] += mask.sum().item()
             normalizers['flow'] += flow_targets(cpu,model.cfg)[1].sum().item()
         del x,hist,hmask,encoding_args
@@ -193,7 +206,7 @@ def optimizer_update(model, ema, opt, batches, update, lr, *, device, tolerance=
         loss.backward()
         total_loss+=loss.detach().item()
         for key,value in stats.items():
-            metrics[key]=metrics.get(key,0.)+value*(weight if key in ('confidence_coefficient','flow_known_fraction','flow_censored_fraction') else 1.)
+            metrics[key]=metrics.get(key,0.)+value*(weight if key in ('confidence_coefficient','flow_known_fraction','flow_censored_fraction','commit_window') else 1.)
         if 'source' in cpu:
             for source in range(3):
                 sources[source]+=int((cpu['source']==source).sum())
@@ -258,11 +271,15 @@ def build_parser():
     ap.add_argument('--init-from',help='Start a new run from v11 EMA weights/scales, with fresh optimizer and schedule')
     ap.add_argument('--sampler-mode',choices=('zero','gaussian'),default=None,
                     help='New runs default to gaussian; resume inherits its checkpoint policy')
-    # One sampled curve; no candidate ranking or teacher-path options.
+    ap.add_argument('--scorer',choices=('legacy','passage'),default=None,
+                    help='Confidence head; passage uses dedicated path evidence/attention and prefix pooling')
+    ap.add_argument('--gaussian-candidates',type=int,default=None,
+                    help='Extra Gaussian alternatives beside the zero-start path (requires --scorer passage --sampler-mode zero)')
     return ap
 
 
 def main(argv=None):
+    raise_open_file_limit()
     args=build_parser().parse_args(argv)
     if args.resume and args.init_from:
         raise ValueError('--resume and --init-from are mutually exclusive')
@@ -283,7 +300,14 @@ def main(argv=None):
     resume=read_checkpoint(args.resume,'cpu') if args.resume else None
     initial=read_checkpoint(args.init_from,'cpu') if args.init_from else None
     args.sampler_mode=resolve_sampler_mode(args.sampler_mode,resume)
-    model_cfg=FollowNetConfig(flow_draws=args.flow_draws,sampler_mode=args.sampler_mode)
+    scoring=resolve_scorer_options(args.scorer,args.gaussian_candidates,resume)
+    args.scorer,args.gaussian_candidates=scoring['scorer'],scoring['gaussian_candidates']
+    model_cfg=FollowNetConfig(flow_draws=args.flow_draws,sampler_mode=args.sampler_mode,
+                             selection_horizon=args.n_commit,**scoring)
+    if not 1 <= args.n_commit <= model_cfg.n_future:
+        raise ValueError('n_commit must lie within the model horizon')
+    if resume is not None and args.gaussian_candidates and resume['model_cfg'].get('selection_horizon',8)!=args.n_commit:
+        raise ValueError('Cannot change the candidate selection horizon on resume')
     compile_model=args.compile_model and torch.device(args.device).type=='cuda'
     benchmark=json.loads(Path(args.benchmark).read_text())
     if (benchmark.get('architecture')!=ARCHITECTURE or not benchmark.get('passed')
@@ -291,6 +315,9 @@ def main(argv=None):
         or benchmark.get('cache_training_encoding',False)!=args.cache_training_encoding
         or benchmark.get('compile_model',False)!=compile_model
         or benchmark.get('sampler_mode','zero')!=args.sampler_mode
+        or benchmark.get('scorer','legacy')!=args.scorer
+        or benchmark.get('gaussian_candidates',0)!=args.gaussian_candidates
+        or (args.gaussian_candidates and benchmark.get('selection_horizon',8)!=args.n_commit)
         or benchmark.get('crop')!=[176,96,96]):
         raise ValueError('A successful matching full-crop benchmark is required before training')
     fibers=load_fibers(args.fibers,grid_scale=spec.grid_scale)

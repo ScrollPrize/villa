@@ -42,8 +42,8 @@ Beam and direct now call the same `crop_sampling.scalar_crops` helper: the
 It reads the smallest axis-aligned block enclosing each oriented crop rather
 than the older rotation-invariant cube. `ChunkedArray` memory-maps uncompressed
 Zarr chunks. The existing local `s1_ds2.zarr/1/.zarray` has `compressor: null`;
-no new decoding or data rewriting is required. The direct CT judge's sparse
-2D-plane sampler is separate; this model uses the direct follower's 3D crop path.
+no new decoding or data rewriting is required. This model uses the direct
+follower's 3D crop path.
 
 ## Training
 

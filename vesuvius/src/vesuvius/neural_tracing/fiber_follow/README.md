@@ -4,8 +4,9 @@ An independent directly supervised alternative is in [`direct/`](direct/README.m
 It uses fine level-0 CT, coarse backward context, and a direct curve decoder with two bounded local corrections.
 Train it separately with `bash scripts/launch_direct.sh NAME`.
 
-The active follower is `single_path_flow_v11`: one jointly denoised future curve,
-trained from scratch. Historical v10 results and the pre-migration source remain
+The active follower is `single_path_flow_v11`: a jointly denoised future curve,
+with optional mixed proposals and passage scoring, trained from scratch.
+Historical v10 results and the pre-migration source remain
 in `output/single_path_v11_baseline/`; old follower checkpoints are rejected by
 training/inference. The independent beam model keeps its checkpoint names.
 
@@ -28,7 +29,7 @@ training/inference. The independent beam model keeps its checkpoint names.
   during refinement; static image/history features and image keys/values cache
   within a decision.
 - The public output is `points [B,16,3]`, `confidence_logits [B,16]`, and
-  monotone `confidence [B,16]`. Each decision samples one curve, with no ranking
+  monotone `confidence [B,16]`. By default each decision samples one curve, with no ranking
   or averaging. A private RNG stream per directed trace seed makes its initial
   noise reproducible independently of batching or other traces stopping. Numerical
   model outputs can still vary across devices and batch shapes. No forecast is
@@ -40,7 +41,7 @@ training/inference. The independent beam model keeps its checkpoint names.
 
 Flow matching retains 64 stratified time/noise draws per state. Residual scales
 are fitted from 2,048 masked training states. Confidence labels describe the
-actually generated Gaussian-start curve at tolerance 1.5, using the same four
+actually generated curve at tolerance 1.5, using the same four
 midpoint steps as inference, diagnostics and replay collection. The curve is
 sampled once per training state and reused for its labels and confidence loss;
 generated coordinates and labels are
@@ -101,6 +102,63 @@ Checkpoints without that field retain their historical zero initialization.
 `--resume` preserves the checkpoint's mode and rejects a conflicting override;
 use `--init-from` to change it. `--sampler-mode zero` remains available for
 controlled comparisons. The launcher writes a separate matching preflight per run.
+
+### Optional general passage scorer
+
+To train from scratch with one deterministic proposal and four Gaussian alternatives:
+
+```bash
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 bash scripts/launch_single_path.sh flow_scorer_run1 \
+  --sampler-mode zero --scorer passage --gaussian-candidates 4 \
+  --n-commit 8 --steps 50000 --lr 1e-3 --workers 6
+tail -f output/logs/flow_scorer_run1.log
+```
+
+The launcher runs the full-size GPU preflight in the foreground, then starts
+training in the background. The existing preparation artifacts are reused.
+Preflight and training raise the soft open-file limit before opening mmap
+caches or starting loader workers, using the same shared helper as the direct
+and beam trainers. The system hard limit is unchanged; workers inherit the
+raised limit. This avoids descriptor exhaustion from cached mapped chunks.
+Both generator and scorer learn from scratch; the Gaussian flow-matching loss
+retains its 64 time/noise draws and the image encoder is shared.
+
+`PassageScorer` in [`passage_scorer.py`](passage_scorer.py) is independent of the
+generator, encoder, candidate count, and horizon. It accepts path evidence,
+context, geometry, and a frontier. It uses dedicated path attention and prefix
+mean/max pooling. The flow adapter supplies a 27-location feature
+stencil, deep image features/support, final history-conditioned flow tokens,
+and path geometry. This uses the flow model's existing CT/presence/history
+features.
+
+The mixed pool always includes a zero-start candidate in slot zero. All five
+generated paths receive masked prefix-correctness BCE, half over prefixes 1–8
+and half over the full 16-point horizon, with the existing confidence ramp.
+There are no teacher candidates or pairwise loss. Paths and labels are detached;
+scoring gradients train the shared image/context features and dedicated scorer.
+Selection uses prefix confidence through `--n-commit`, excludes candidates with
+an invalid first connection, and prefers slot zero on ties. The selected path
+then uses the existing confidence gate and partial-commit policy. Training logs
+report deterministic/selected/oracle correctness and rescues versus spoiled
+deterministic answers. Training refinement diagnostics follow candidate zero;
+inference refinement plots follow the selected candidate.
+
+`--scorer legacy` remains the default and preserves old checkpoints exactly.
+`--scorer passage --gaussian-candidates 0` changes only the confidence head.
+Extra Gaussian candidates require `--sampler-mode zero --scorer passage`.
+Scorer type, pool size, and selection horizon are saved in checkpoints and
+verified by preflight/resume; changing scorer architecture requires fresh training.
+Mixed-pool tracing has reproducible per-trace random streams and calibration
+defaults to three sampling seeds, even though the primary candidate starts at zero.
+
+Validation for this option: 117 CPU tests passed (four CUDA tests skipped in the
+sandbox), plus a full-crop compiled RTX 5090 preflight and two real-data training
+updates from scratch with a reloadable optimizer/RNG checkpoint. The mixed-pool
+preflight measured 13.48 GiB peak allocated, 14.29 GiB reserved, and 19.42
+samples/second over two measured effective-batch-eight updates after one warmup.
+These are cached-batch timings, not end-to-end training throughput or an accuracy
+result. Artifacts: `output/preflight/passage_scorer_check.json` and
+`output/flow_scorer_smoke_20260926/`.
 
 Training defaults: 50,000 optimizer updates; microbatch 2 with four accumulation
 steps; AdamW, peak LR 1e-3, weight decay 1e-4, 1,000-update warmup/cosine decay,

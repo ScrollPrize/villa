@@ -49,24 +49,6 @@ def _direct_training_lines(row):
              f" | mean error {row['error_mean']:.3f} voxels | prefix correct {row['prefix_correct_fraction']:.1%}",
              f"  data: fresh {row['fresh_fraction']:.0%} | fixed {row['fixed_fraction']:.0%}"
              f" | recent {row['recent_fraction']:.0%}"]
-    if 'passage_states' in row:
-        lines.append('  passages: recall before pruning '+_rate(row['proposal_recall_before_count'], row['passage_states'])
-                     +' | after '+_rate(row['proposal_recall_after_count'], row['passage_states'])
-                     +' | selection '+_rate(row['selected_valid_count'], row['selection_opportunities']))
-        lines.append('    all-invalid rejection '+_rate(row['all_invalid_rejected'], row['all_invalid_sets'])
-                     +f" | contact states {int(row['contact_states'])} | censored planes {int(row['plane_censored'])}")
-    if 'judge_source_fractions' in row:
-        lines.append(f"  judge: loss {row['judge_loss']:.4f} | sequences {row['judge_sequences']}"
-                     f" | positive {row['judge_positive']} | departed {row['judge_departed']}"
-                     f" | unknown {row['judge_unknown']}")
-        lines.append('    sources: '+' | '.join(f"{key.replace('_', ' ')} {value:.0%}"
-                     for key, value in row['judge_source_fractions'].items()))
-        lines.append(f"    synthetic: attempts {row['judge_synthetic_attempts']}"
-                     f" | fallback {row['judge_synthetic_fallback']}")
-        if 'judge_replay_requested' in row:
-            lines.append(f"    departed replay: added {row['judge_replay_added']}/{row['judge_replay_requested']}"
-                         f" | attempts {row['judge_replay_attempts']} | pool {row['judge_replay_pool_rows']} rows"
-                         f" / {row['judge_replay_pool_fibers']} fibers")
     if 'decisions' in row:
         lines.extend(_decision_lines(row['decisions']))
     return lines
@@ -102,14 +84,6 @@ def format_training_log(row):
                                  +f" | false stops {stats['false_stops']}")
         lines.extend(_decision_lines(report['decisions']))
         return '\n'.join(lines)
-    if 'judge' in row and isinstance(row['judge'], dict):
-        report = row['judge']
-        return (f"\n{step} | monitor judge @ {row['threshold']:.2f}\n"
-                f"  precision {_number(report['precision'], '.1%')}"
-                f" | wrong reduction {_number(report['wrong_reduction'], '.1%')}"
-                f" | correct loss {_number(report['correct_loss'], '.1%')}\n"
-                f"  false stops / 10,000 voxels {_number(report['false_stops_per_10000'])}"
-                f" | unknown stops {report['unknown_stops']} | missing source {report['missing_source']}")
     if 'length_weighted_coverage' in row:
         return (f"\n{step} | monitor rollout @ {row['threshold']:.2f}\n"
                 f"  coverage {row['length_weighted_coverage']:.1%} | precision {row['length_precision']:.1%}"
@@ -148,6 +122,11 @@ def format_training_log(row):
         return _rate(row[numerator], row[denominator])
 
     lines.append(f"  {int(row.get('commit_window',0)) or 'commit'}-point correctness: "+rate('commit_correct_count','commit_known_count'))
+    if 'candidate_states' in row:
+        lines.append('  candidates: zero '+rate('candidate_zero_correct','candidate_states')
+                     +' | selected '+rate('candidate_selected_correct','candidate_states')
+                     +' | oracle '+rate('candidate_oracle_correct','candidate_states'))
+        lines.append(f"    rescued {int(row['candidate_rescues'])} | spoiled {int(row['candidate_spoiled'])}")
     for threshold in (.5,.85):
         lines.append(f'  gate @ {threshold:.2f}: false stops '
                      +rate(f'false_stop_count_{threshold}',f'correct_first_count_{threshold}')
@@ -157,7 +136,8 @@ def format_training_log(row):
         refinement = row['refinement']
         bands = refinement['by_drift']
         stages = len(bands['all']['error_mean'])
-        lines.append(f"  refinement: first {refinement['first_n']} points, mean lateral error in voxels"
+        label = 'candidate-zero refinement' if 'candidate_states' in row else 'refinement'
+        lines.append(f"  {label}: first {refinement['first_n']} points, mean lateral error in voxels"
                      f" ({refinement['departed_count']} departed excluded)")
         lines.append('    drift      states  GT pts  '+' '.join(f'{name:>7}' for name in
                      ['initial']+[f'step {i}' for i in range(1,stages)]))

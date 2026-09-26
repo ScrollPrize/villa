@@ -349,7 +349,7 @@ def test_startup_sampling_and_history_diagnostics():
 
 
 @pytest.mark.parametrize('correction', [False, True])
-def test_legacy_checkpoint_inference(tmp_path, correction):
+def test_compact_config_checkpoint_inference(tmp_path, correction):
     cfg = replace(config(), correction=correction, correction_steps=1, rich_path_context=False)
     m = DirectFollower(cfg).eval()
     b = batch(cfg)
@@ -358,13 +358,8 @@ def test_legacy_checkpoint_inference(tmp_path, correction):
     if not correction:
         torch.testing.assert_close(out['initial_points'], out['points'], rtol=0, atol=0)
     spec = FiberVolumeSpec('unused', ct_zarr='unused', ct_level=0, ct_grid_scale=4., inputs='ct+presence')
-    path = tmp_path/'legacy.pt'
+    path = tmp_path/'compact.pt'
     save_checkpoint(path, m, m, spec, SampleConfig(crop=cfg.fine, n_history=cfg.n_history))
-    ck = torch.load(path, weights_only=False)
-    del ck['model_cfg']['correction_steps'], ck['model_cfg']['rich_path_context']
-    if not correction:
-        del ck['model_cfg']['correction'], ck['model_cfg']['correction_limit']
-    torch.save(ck, path)
     loaded = load_checkpoint(path, 'cpu')[0]
     assert loaded.cfg.correction == correction and not loaded.cfg.rich_path_context
     assert loaded.cfg.correction_steps == 1

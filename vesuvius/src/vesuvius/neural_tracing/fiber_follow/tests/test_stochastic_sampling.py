@@ -80,9 +80,11 @@ def test_trace_streams_independent_of_batching_other_traces_and_global_rng():
     assert not torch.equal(grouped[:1],trace_noise(cfg,[trace_generator(53,seeds[0],heads[0])],'cpu'))
 
 
-def test_tracer_delivers_same_noise_when_batch_regrouped_or_another_trace_stops(tmp_path,monkeypatch):
+@pytest.mark.parametrize('sampling',[dict(sampler_mode='gaussian'),
+    dict(sampler_mode='zero',scorer='passage',gaussian_candidates=4)])
+def test_tracer_delivers_same_noise_when_batch_regrouped_or_another_trace_stops(tmp_path,monkeypatch,sampling):
     from test_history_confidence import volume
-    vol=volume(tmp_path);m=FollowNet(config(sampler_mode='gaussian'))
+    vol=volume(tmp_path);m=FollowNet(config(**sampling))
     seen=[]
     def forward(x,hist,hmask,*,initial_noise):
         seen.append(initial_noise.clone())

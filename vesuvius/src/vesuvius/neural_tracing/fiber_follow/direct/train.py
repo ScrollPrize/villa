@@ -16,11 +16,10 @@ from vesuvius.neural_tracing.fiber_follow.experiment import read_manifest
 from vesuvius.neural_tracing.fiber_follow.online import OnlineCollector
 from vesuvius.neural_tracing.fiber_follow.runloop import (
     RunLog, lr_at, prepare_run_dir, read_checkpoint, save_checkpoint as write_checkpoint,
-    update_ema, training_rng_state, resume_training,
+    update_ema, training_rng_state, resume_training, raise_open_file_limit,
 )
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.direct.model import ARCHITECTURE, DirectConfig, DirectFollower
-from vesuvius.neural_tracing.fiber_follow.direct.spatial_model import SPATIAL_ARCHITECTURE, SpatialConfig, SpatialFollower
 from vesuvius.neural_tracing.fiber_follow.direct.data import ObservationBuilder, DirectTracer
 from vesuvius.neural_tracing.fiber_follow.direct.supervision import commit_window, loss_terms
 from vesuvius.neural_tracing.fiber_follow.direct.diagnostics import decision_rows, summarize_decisions
@@ -28,11 +27,9 @@ from vesuvius.neural_tracing.fiber_follow.direct.recovery import monitor_fixture
 from vesuvius.neural_tracing.fiber_follow.training_log import format_training_log
 
 
-def validate_volume_source(spec, manifest, ct_only=False):
+def validate_volume_source(spec, manifest):
     """Allow a different CT pyramid level, retaining frozen physical data/seeds."""
     for key in ('fiber_zarr_dir', 'ct_zarr', 'fiber_level', 'grid_scale', 'inputs'):
-        if key == 'inputs' and ct_only and spec.inputs == 'ct' and manifest['volume'][key] == 'ct+presence':
-            continue
         if spec.to_dict()[key] != manifest['volume'][key]:
             raise ValueError(f'Volume source {key} differs from frozen manifest')
 
@@ -66,33 +63,10 @@ def match_optimizer_layout(opt):
                 state[key] = torch.empty_like(param).copy_(value)
 
 
-def compile_training_judge(judge):
-    """Compile CNN batches and sequence decoding after EMA copy/resume.
-
-    Leave the view-batch loop outside the graph: growing histories change its
-    iteration count. Dynamic shapes cover the final batch and query count.
-    Bound methods share the original parameters and preserve checkpoint keys.
-    """
-    import torch._functorch.config
-    # optimizer_update performs backward outside its forward autocast context.
-    torch._functorch.config.backward_pass_autocast = 'off'
-    for name in ('encode_views', 'decode'):
-        setattr(judge, name, torch.compile(getattr(judge, name), dynamic=True))
-    return judge
-
-
 def load_checkpoint(path, device='cuda'):
-    ck = read_checkpoint(path, (ARCHITECTURE, SPATIAL_ARCHITECTURE), device)
-    # Historical checkpoints retain their exact one-pass/one-correction model,
-    # including the old path heads. Active legacy collectors still load these.
-    if ck['architecture'] == SPATIAL_ARCHITECTURE:
-        cfg = SpatialConfig(**ck['model_cfg'])
-        model = SpatialFollower(cfg)
-    else:
-        cfg = DirectConfig(**{'correction': False, 'correction_steps': 1,
-                              'rich_path_context': False, **ck['model_cfg']})
-        model = DirectFollower(cfg)
-    model = model.to(device, memory_format=conv_memory_format(device))
+    ck = read_checkpoint(path, (ARCHITECTURE,), device)
+    cfg = DirectConfig(**ck['model_cfg'])
+    model = DirectFollower(cfg).to(device, memory_format=conv_memory_format(device))
     model.load_state_dict(ck['ema'])
     model.eval()
     if ck.get('coarse_ct_level') != 1 or ck.get('coarse_ct_grid_scale') != 8.:
@@ -100,26 +74,14 @@ def load_checkpoint(path, device='cuda'):
     return model, cfg.fine, cfg.n_history, FiberVolumeSpec(**ck['vol_spec']), ck
 
 
-def raise_open_file_limit():
-    """Many loader workers share tensors through file descriptors; use the hard limit."""
-    try:
-        import resource
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        if hard > soft:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
-    except (ImportError, ValueError, OSError):
-        pass
-
-
 def move_batch(batch, device):
     # Pinned loader batches copy asynchronously; the compute stream orders later use.
-    return {k: move_batch(v, device) if isinstance(v, dict) else [move_batch(s, device) for s in v] if isinstance(v, list) else v.to(device, non_blocking=True)
+    return {k: move_batch(v, device) if isinstance(v, dict) else v.to(device, non_blocking=True)
             for k, v in batch.items()}
 
 
 @torch.no_grad()
-def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device,
-                         judge=None, judge_slices=None, judge_policy=None):
+def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device):
     """Plot EMA proposals and the same monitor rollouts used for logged metrics."""
     from vesuvius.neural_tracing.fiber_follow.diag import plot_batch, plot_curves, plot_refinement, plot_rollouts
     from vesuvius.neural_tracing.fiber_follow.evaluate import evaluate
@@ -129,7 +91,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
     images.mkdir(exist_ok=True)
     # Bound image size even when training with larger microbatches.
     def take(value):
-        return {k: take(v) for k, v in value.items() if k != 'judge'} if isinstance(value, dict) else value[:6]
+        return {k: take(v) for k, v in value.items()} if isinstance(value, dict) else value[:6]
     batch = move_batch(take(cpu_batch), device)
     was_training = model.training
     threshold_before = tracer.p.confidence
@@ -165,40 +127,6 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
                           images/f'rollout_{step:06d}_c{threshold}.png', tracer.p.max_len, rows=rows)
             log.record(dict(step=step, split='monitor', threshold=threshold,
                             coverage_max_len=tracer.p.max_len, **rollout_summary(rows)))
-            if judge is not None:
-                from .judge_evaluation import paired_monitor
-                from .judge_model import sequence_tensors
-                from .diagnostics import plot_judge_sequence, plot_judge_path
-                judged = DirectTracer(model, tracer.vol, tracer.crop, tracer.n_history, tracer.p,
-                                      device=device, judge=judge, judge_slices=judge_slices, judge_policy=judge_policy)
-                try:
-                    report, audits = paired_monitor(judged, fibers, seeds, paths)
-                    log.record(dict(step=step, split='monitor', threshold=threshold, judge=report['metrics']))
-                    (images/f'judge_rollouts_{step:06d}_c{threshold}.json').write_text(json.dumps(report, default=lambda x: x.item() if isinstance(x,np.generic) else x.tolist()))
-                    for index, state in enumerate(audits[:3]):
-                        sequence = sequence_tensors(state['records'], device)
-                        logits = judge(**sequence)
-                        target, known = state['events'].labels([r['arc'] for r in state['records']])
-                        sequence.update(target=torch.as_tensor(target)[None], known=torch.as_tensor(known)[None])
-                        plot_judge_sequence(sequence, logits, images/f'judge_rollout_{step:06d}_c{threshold}_{index}.png',
-                                            audit=state['policy'].audit[-1])
-                        plot_judge_path(state['observed_path'], state['policy'].accepted, state['events'],
-                                        images/f'judge_path_{step:06d}_c{threshold}_{index}.png')
-                finally:
-                    judged.close()
-        if hasattr(tracer, 'contact_monitor'):
-            from .spatial_supervision import spatial_loss_terms
-            builder, items = tracer.contact_monitor
-            totals = {}
-            for offset in range(0, len(items), 2):
-                observed = move_batch(builder(items[offset:offset+2], tracer.vol), device)
-                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-                    prediction = model(observed['x'], observed['hist'], observed['hmask'])
-                    metrics = spatial_loss_terms(prediction, observed, model.cfg)['spatial_metrics']
-                for key, value in metrics.items():
-                    totals[key] = totals.get(key, 0)+value.item()
-            log.record(dict(step=step, split='monitor_contacts', states=len(items),
-                            episodes=len(set(i['contact_episode'] for i in items)), **totals))
         plot_curves(Path(out)/'log.jsonl', Path(out)/'curves.png', loss_key='geometry')
     finally:
         model.train(was_training)
@@ -206,8 +134,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
 
 
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
-                     confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True,
-                     judge=None, judge_ema=None, judge_weight=.5):
+                     confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True):
     """Equal weight per observed state, independent of microbatch boundaries.
 
     Within a state each loss averages over its known points; fully unknown
@@ -223,57 +150,20 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 correct_count=0., confidence_count=0.)
     sources = np.zeros(3, dtype=np.int64)
     decisions = []
-    judge_total = sum(len(b.get('judge', [])) for b in batches)
-    sums.update(judge_loss=0., judge_sequences=judge_total, judge_positive=0, judge_departed=0, judge_unknown=0)
-    judge_sources = np.zeros(5, dtype=int)
-    allocation = sum((b.get('judge_allocation', torch.zeros(3)).numpy() for b in batches), np.zeros(3))
-    sums['judge_synthetic_attempts'], sums['judge_synthetic_fallback'] = map(int, allocation[1:])
-    departed_allocations = [b['judge_departed_allocation'].numpy() for b in batches if 'judge_departed_allocation' in b]
-    if departed_allocations:
-        allocations = np.stack(departed_allocations)
-        sums.update(zip(('judge_replay_requested', 'judge_replay_added', 'judge_replay_attempts'),
-                        map(int, allocations[:, :3].sum(0))))
-        sums.update(zip(('judge_replay_pool_rows', 'judge_replay_pool_fibers'),
-                        map(int, allocations[:, 3:].max(0))))
-    if judge is not None:
-        judge.train()
     model.train()
-    spatial = isinstance(model.cfg, SpatialConfig)
     for cpu in batches:
         batch = move_batch(cpu, device)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-            if spatial:
-                from .spatial_supervision import teaching_candidates, spatial_loss_terms
-                output = model(batch['x'], batch['hist'], batch['hmask'],
-                               training_candidates=teaching_candidates(batch, model.cfg))
-                terms = spatial_loss_terms(output, batch, model.cfg, tolerance,
-                                           n_commit=n_commit or 4, compute_metrics=compute_metrics)
-            else:
-                output = model(batch['x'], batch['hist'], batch['hmask'])
-                terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit)
+            output = model(batch['x'], batch['hist'], batch['hmask'])
+            terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit)
             geometry = terms['geometry_per_state'].sum()/total
             confidence = terms['confidence_per_state'].sum()/total
             loss = geometry + confidence_weight*confidence
         if not torch.isfinite(loss):
             raise FloatingPointError(f'Nonfinite loss at step {step}')
         loss.backward()
-        if judge is not None:
-            from .judge_supervision import masked_bce
-            for sequence in batch.get('judge', []):
-                judge_sources[int(sequence.get('source', torch.tensor([0]))[0])] += 1
-                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-                    logits = judge(**{k: sequence[k] for k in ('images', 'metadata', 'valid', 'queries')})
-                    jl = masked_bce(logits, sequence['target'], sequence['known'], sequence['eligible']).sum()/max(1, judge_total)
-                (judge_weight*jl).backward()
-                sums['judge_loss'] += jl.detach().item()
-                mask = sequence['known'] & sequence['eligible']
-                sums['judge_positive'] += int((mask & (sequence['target'] > .5)).sum())
-                sums['judge_departed'] += int((mask & (sequence['target'] <= .5)).sum())
-                sums['judge_unknown'] += int((~mask).sum())
-        if compute_metrics and not spatial:
+        if compute_metrics:
             decisions.extend(decision_rows(output, batch, model.cfg, n_commit, tolerance))
-        for key, value in terms.get('spatial_metrics', {}).items():
-            sums[key] = sums.get(key, 0.)+value.item()
         for key, value in (('loss', loss), ('geometry', geometry), ('confidence_loss', confidence)):
             sums[key] += value.detach().item()
         for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count'):
@@ -282,20 +172,13 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             for source in range(3):
                 sources[source] += int((cpu['source'] == source).sum())
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
-    if judge is not None:
-        torch.nn.utils.clip_grad_norm_(judge.parameters(), 1., error_if_nonfinite=True)
     opt.step()
     update_ema(ema, model, step, ema_decay)
-    if judge is not None:
-        update_ema(judge_ema, judge, step, ema_decay)
-        sums['loss'] += judge_weight*sums['judge_loss']
-        sums['judge_source_fractions'] = dict(zip(('fresh','fixed','recent','synthetic_switch','matched_contact'),
-                                                  (judge_sources/max(1,judge_total)).tolist()))
     sums.update(error_mean=sums['error_sum']/max(1., sums['geometry_count']),
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']),
                 fresh_fraction=float(sources[0]/total), fixed_fraction=float(sources[1]/total),
                 recent_fraction=float(sources[2]/total))
-    if compute_metrics and not spatial:
+    if compute_metrics:
         sums['decisions'] = summarize_decisions(decisions, commit_window(model.cfg, n_commit))
     return sums
 
@@ -333,7 +216,7 @@ def build_parser():
     ap.add_argument('--short-history-prob', type=float, default=.4,
                     help='Given history is present, probability of a balanced 1-8/9-32 point startup history')
     ap.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True,
-                    help='Compile follower and judge training on CUDA (EMA, diagnostics and collection stay eager)')
+                    help='Compile follower training on CUDA (EMA, diagnostics and collection stay eager)')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--val-z', type=float, nargs=2, default=(45000., 48500.))
     ap.add_argument('--log-every', type=int, default=50)
@@ -352,15 +235,6 @@ def build_parser():
     ap.add_argument('--replay-keep', type=int, default=4)
     ap.add_argument('--resume', help='Resume last.pt inside this run with the same training options')
     ap.add_argument('--init-tracer', help='Initialize a new run from saved EMA follower weights')
-    ap.add_argument('--spatial', action='store_true', help='CT-only plane heatmaps and passage scoring')
-    ap.add_argument('--fine-depth', type=int, default=160)
-    ap.add_argument('--fine-width', type=int, default=96)
-    ap.add_argument('--fine-behind', type=int, default=48, help='Native .5-voxel samples behind origin')
-    ap.add_argument('--horizon', type=int, default=48)
-    ap.add_argument('--candidates', type=int, default=8)
-    ap.add_argument('--contact-fraction', type=float, default=.35)
-    from .judge_options import add_judge_options
-    add_judge_options(ap)
     return ap
 
 
@@ -371,19 +245,9 @@ def main(argv=None):
     def progress(message):
         print(f'[{args.name} +{time.monotonic()-launch_started:.1f}s] {message}', flush=True)
 
-    progress(f'Starting training: device={args.device}, workers={args.workers}, judge={args.judge}')
+    progress(f'Starting training: device={args.device}, workers={args.workers}')
     if args.resume and args.init_tracer:
         raise ValueError('--init-tracer starts a new run and cannot be combined with --resume')
-    if args.spatial and (args.judge or args.init_tracer):
-        raise ValueError('Spatial passage training starts a new architecture and replaces the old judge')
-    if not 0 <= args.contact_fraction <= 1:
-        raise ValueError('Contact fraction must be in [0, 1]')
-    if min(args.judge_loss_weight, args.judge_synthetic_fraction) < 0:
-        raise ValueError('Judge allocations and loss weight must be nonnegative')
-    if not np.isfinite(args.judge_departed_fraction) or args.judge_departed_fraction < 0:
-        raise ValueError('--judge-departed-fraction must be finite and nonnegative')
-    if args.judge_departed_fraction and not args.judge:
-        raise ValueError('--judge-departed-fraction requires --judge')
     if min(args.steps, args.batch, args.microbatch, args.log_every, args.ckpt_every,
            args.threads, args.replay_keep, args.dagger_seeds, args.recovery_seeds) < 1 or args.batch % args.microbatch:
         raise ValueError('Positive counts required; microbatch must divide effective batch')
@@ -405,11 +269,6 @@ def main(argv=None):
     cfg = DirectConfig(channels=args.channels, layers=args.decoder_layers,
                        correction=args.correction, correction_limit=args.correction_limit,
                        correction_steps=args.correction_steps)
-    if args.spatial:
-        from ..geometry import CropSpec
-        cfg = SpatialConfig(channels=args.channels, layers=args.decoder_layers,
-                            fine=CropSpec(depth=args.fine_depth, width=args.fine_width, behind=args.fine_behind, spacing=.5),
-                            n_future=args.horizon, candidates=args.candidates)
     initialized = None
     if args.init_tracer:
         progress(f'Loading follower weights from {args.init_tracer}')
@@ -417,40 +276,31 @@ def main(argv=None):
         cfg = initialized.cfg
     if args.resume:
         progress(f'Loading resume checkpoint from {args.resume}')
-        resume_config = read_checkpoint(args.resume, (ARCHITECTURE, SPATIAL_ARCHITECTURE), args.device)
-        cfg = (SpatialConfig if resume_config['architecture'] == SPATIAL_ARCHITECTURE else DirectConfig)(**resume_config['model_cfg'])
-        if isinstance(cfg, SpatialConfig) != args.spatial:
-            raise ValueError('Resume must preserve --spatial architecture selection')
+        cfg = DirectConfig(**read_checkpoint(args.resume, (ARCHITECTURE,), args.device)['model_cfg'])
     if not 1 <= args.n_commit <= cfg.n_future:
         raise ValueError('Commit window must fit forecast')
     # Native fine imagery, independently read coarse level-1 imagery.
     spec = FiberVolumeSpec(args.fiber_zarrs, ct_zarr=args.ct, ct_level=0, ct_grid_scale=4.,
-                           inputs='ct' if args.spatial else 'ct+presence', load_presence=not args.spatial)
+                           inputs='ct+presence')
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future,
                           future_step=cfg.future_step, recent_history_points=cfg.n_history,
-                          no_history_prob=args.no_history_prob, short_history_prob=args.short_history_prob,
-                          unique_crossings=args.spatial)
+                          no_history_prob=args.no_history_prob, short_history_prob=args.short_history_prob)
     progress('Loading manifest and fiber annotations')
     manifest = read_manifest(args.manifest)
-    validate_volume_source(spec, manifest, ct_only=args.spatial)
+    validate_volume_source(spec, manifest)
     fibers = load_fibers(args.fibers, grid_scale=spec.grid_scale)
     band = ZBand(*(v/spec.grid_scale for v in args.val_z))
     train_f, val_f = split_fibers(fibers, band)
     progress(f'Loaded {len(train_f)} training fibers and {len(val_f)} validation fibers')
     if fiber_manifest(val_f) != manifest['fibers']:
         raise ValueError('Frozen validation geometry differs from dataset/holdout')
-    resume = read_checkpoint(args.resume, (ARCHITECTURE, SPATIAL_ARCHITECTURE), args.device) if args.resume else None
+    resume = read_checkpoint(args.resume, (ARCHITECTURE,), args.device) if args.resume else None
     if resume:
         # The run directory may move; the checkpoint must still sit inside the named run.
         ignored = {'resume', 'out_root', 'device', 'batch', 'microbatch', 'workers', 'threads', 'worker_cache_gb',
-                   'log_every', 'ckpt_every', 'diag_every', 'dagger_device', 'compile', 'init_tracer',
-                   'judge_departed_fraction'}
+                   'log_every', 'ckpt_every', 'diag_every', 'dagger_device', 'compile', 'init_tracer'}
         for key, value in vars(args).items():
-            if key in ('spatial', 'fine_depth', 'fine_width', 'fine_behind', 'horizon', 'candidates', 'contact_fraction') and key not in resume['training_options'] and not args.spatial:
-                continue
             if key in ('long_diag_every', 'long_diag_max_len') and key not in resume['training_options'] and not args.long_diag_every:
-                continue
-            if key.startswith('judge') and key not in resume['training_options'] and not args.judge:
                 continue
             if key not in ignored and resume['training_options'].get(key) != value:
                 raise ValueError(f'Resume option differs: {key}')
@@ -469,33 +319,14 @@ def main(argv=None):
         if resume and resume.get('monitor_recovery_sha256') != recovery_hash:
             raise ValueError('Monitor recovery fixture changed since checkpoint')
     progress('Initializing models and optimizer')
-    model = initialized if initialized is not None else (SpatialFollower(cfg) if args.spatial else DirectFollower(cfg)).to(args.device, memory_format=conv_memory_format(args.device))
+    model = initialized if initialized is not None else DirectFollower(cfg).to(args.device, memory_format=conv_memory_format(args.device))
     ema = copy.deepcopy(model).requires_grad_(False).eval()
-    judge = judge_ema = slices = policy = None
-    if args.judge:
-        from .judge_options import configs
-        from .judge_model import CTJudge
-        slices, judge_cfg, policy = configs(args, spec)
-        progress(f'Opening judge CT: {slices.source}, level={slices.level}, pixel spacing={slices.spacing:g}')
-        judge_source = slices.open().identity
-        if resume and resume.get('judge_source_sha256') != judge_source:
-            raise ValueError('Resume native CT source metadata changed')
-        judge = CTJudge(judge_cfg).to(args.device)
-        judge_ema = copy.deepcopy(judge).requires_grad_(False).eval()
-        if resume:
-            judge.load_state_dict(resume['judge'])
-            judge_ema.load_state_dict(resume['judge_ema'])
-    groups = [dict(params=model.parameters())]
-    if judge is not None:
-        groups.append(dict(params=judge.parameters()))
-    opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     done = resume_training(resume, model, ema, opt)[0] if resume else 0
     match_optimizer_layout(opt)
     # The compiled wrapper shares the module's parameters, so EMA updates, gradient
     # clipping and checkpoints keep using ``model``; only the training forward is compiled.
     trainable = torch.compile(model) if args.compile and torch.device(args.device).type == 'cuda' else model
-    if judge is not None and args.compile and torch.device(args.device).type == 'cuda':
-        compile_training_judge(judge)
     if args.compile and torch.device(args.device).type == 'cuda':
         progress('Compilation enabled; first forward/backward passes will compile lazily and may take several minutes')
     if done >= args.steps:
@@ -510,19 +341,6 @@ def main(argv=None):
         initial=[c._dir for c in caches], trace_len=args.dagger_trace_len, n_commit=args.n_commit,
         collector_module='vesuvius.neural_tracing.fiber_follow.direct.collect')
     builder = ObservationBuilder(cfg)
-    contact_summary = None
-    if args.spatial:
-        from .contacts import ContactIndex, SpatialObservationBuilder
-        progress('Indexing validated training contacts')
-        contacts = ContactIndex(train_f, band, out/'contacts.json')
-        contact_summary = contacts.summary(cfg.n_future*cfg.future_step)
-        (out/'contact_summary.json').write_text(json.dumps(contact_summary, indent=2))
-        progress(f'Contact index: {contact_summary}')
-        builder = SpatialObservationBuilder(cfg, sample, train_f, band, contacts, args.contact_fraction)
-    if args.judge:
-        from .judge_supervision import JointObservationBuilder
-        builder = JointObservationBuilder(builder, slices, band, args.judge_synthetic_fraction, train_f,
-                                          departed_fraction=args.judge_departed_fraction, seed=args.seed+done)
     dataset = FollowDataset(train_f, spec, sample, band, chunk=args.microbatch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), fixed=fixed, onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, additional_crops=(cfg.coarse,))
@@ -539,12 +357,6 @@ def main(argv=None):
             seed_manifest_sha256=manifest['sha256'], fiber_manifest=fiber_manifest(fibers),
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
     log = RunLog(out/'log.jsonl', formatter=format_training_log)
-    if contact_summary is not None:
-        log.record(dict(step=done, contact_index=contact_summary))
-    if args.judge:
-        log.record(dict(step=done, judge_departed_fraction=args.judge_departed_fraction,
-                        previous_judge_departed_fraction=resume['training_options'].get('judge_departed_fraction', 0.)
-                        if resume else None))
     tracer = None
     recovery_vol = FiberVolume(spec) if recovery_states is not None else None
     started = time.monotonic()
@@ -553,12 +365,6 @@ def main(argv=None):
             from vesuvius.neural_tracing.fiber_follow.trace import TraceParams
             tracer = DirectTracer(ema, FiberVolume(spec), cfg.fine, cfg.n_history,
                 TraceParams(n_commit=args.n_commit, max_len=args.diag_max_len), device=args.device)
-            if args.spatial:
-                from .contacts import contact_monitor
-                progress('Preparing fixed contacts from monitor fibers only')
-                tracer.contact_monitor = contact_monitor(cfg, sample,
-                    [val_f[i] for i in manifest['monitor_fibers']], band, out/'monitor_contacts.json')
-                progress(f'Fixed held-out contact states: {len(tracer.contact_monitor[1])}')
         progress(f'Starting data loader; waiting for {args.batch//args.microbatch} microbatches for update {done+1}')
         iterator = iter(loader)
         for step in range(done+1, args.steps+1):
@@ -581,7 +387,6 @@ def main(argv=None):
             lr = lr_at(step, args.lr, args.warmup, args.steps)
             metrics = optimizer_update(trainable, ema, opt, batches, step, lr, device=args.device,
                 tolerance=args.tolerance, confidence_weight=args.confidence_weight, ema_decay=args.ema_decay,
-                judge=judge, judge_ema=judge_ema, judge_weight=args.judge_loss_weight,
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps)
             if early:
                 progress(f'Update {step} complete in {time.monotonic()-update_started:.1f}s; loss={metrics["loss"]:.5f}')
@@ -603,15 +408,6 @@ def main(argv=None):
                 elif resume and 'init_tracer_sha256' in resume:
                     extra['init_tracer_sha256'] = resume['init_tracer_sha256']
                     extra['init_tracer_path'] = resume.get('init_tracer_path')
-                if judge is not None:
-                    from .judge_model import JUDGE_ARCHITECTURE
-                    from ..events import EVENT_VERSION
-                    from .judge_slices import SLICE_VERSION
-                    extra.update(judge=judge.state_dict(), judge_ema=judge_ema.state_dict(),
-                                 judge_architecture=JUDGE_ARCHITECTURE, judge_cfg=judge.cfg.to_dict(),
-                                 judge_slices=slices.to_dict(), judge_policy=policy.to_dict(),
-                                 judge_source_sha256=judge_source,
-                                 judge_event_version=EVENT_VERSION, judge_slice_version=SLICE_VERSION)
                 if resumable:
                     extra.update(optimizer=opt.state_dict(), rng=training_rng_state())
                 save_checkpoint(path, model, ema, spec, sample, extra)
@@ -622,14 +418,7 @@ def main(argv=None):
             if tracer is not None and args.diag_every and step % args.diag_every == 0:
                 began = time.monotonic()
                 training_diagnostics(ema, batches[-1], tracer, val_f, manifest['monitor'], out, step, log,
-                                     device=args.device, judge=judge_ema, judge_slices=slices, judge_policy=policy)
-                if judge_ema is not None:
-                    from .diagnostics import plot_judge_sequence
-                    with torch.no_grad():
-                        for index, sequence in enumerate(batches[-1].get('judge', [])[:3]):
-                            device_sequence = move_batch(sequence, args.device)
-                            logits = judge_ema(**{k: device_sequence[k] for k in ('images','metadata','valid','queries')})
-                            plot_judge_sequence(sequence, logits, out/'images'/f'judge_{step:06d}_{index}.png')
+                                     device=args.device)
                 periodic['diagnostics_seconds'] = time.monotonic()-began
             if tracer is not None and args.long_diag_every and step % args.long_diag_every == 0:
                 from ..evaluate import evaluate

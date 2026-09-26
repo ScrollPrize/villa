@@ -33,7 +33,6 @@ class DecisionCollector:
         self.departed = None
         self.last_travelled = 0.
         self.boundary_crossed = False
-        self.seed_t = float(t0)
 
     def __call__(self, state):
         f, sign = self.fiber, self.sign
@@ -78,7 +77,7 @@ class DecisionCollector:
         offtrack = self.departed is not None
         if offtrack and travelled-self.departed > self.after:
             return False
-        hard = offtrack or state['would_stop'] or state['exploratory'] or state.get('judge_alarm', False)
+        hard = offtrack or state['would_stop'] or state['exploratory']
         if hard:
             for row, distance in zip(reversed(self.rows), reversed(self.distances)):
                 if travelled-distance > self.before:
@@ -94,8 +93,7 @@ class DecisionCollector:
         # voxels; departed states have no correspondence. Lets replay stratify
         # on recoverable drift without relabeling every state at load time.
         drift = float('nan') if offtrack else float(np.linalg.norm(item['gt_history'][0]))
-        row.update(source_cache=-1, source_row=len(self.rows), fiber_idx=self.fi, t=self.t, reverse=sign < 0, offtrack=offtrack, hard=hard, drift=drift,
-                   judge_trace=-1, judge_cutoff=float(travelled), judge_revision=state.get('judge_revision', -1))
+        row.update(source_cache=-1, source_row=len(self.rows), fiber_idx=self.fi, t=self.t, reverse=sign < 0, offtrack=offtrack, hard=hard, drift=drift)
         self.rows.append(row)
         self.distances.append(travelled)
         self.last_travelled = travelled
@@ -117,7 +115,7 @@ class DecisionCollector:
         return kept
 
 
-def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTracer, configure_tracer=None):
+def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTracer):
     ap = argparse.ArgumentParser()
     ap.add_argument('--checkpoint', required=True)
     ap.add_argument('--fibers', required=True)
@@ -141,12 +139,10 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTrac
     args = ap.parse_args(argv)
     torch.set_num_threads(args.threads)
     model, crop, n_hist, spec, ck = checkpoint_loader(args.checkpoint, args.device)
-    tracer_options = configure_tracer(args, ck) if configure_tracer is not None else {}
     if args.n_commit is None:
         args.n_commit = ck.get('n_commit', DEFAULT_N_COMMIT)
     cfg = SampleConfig(crop=crop, n_history=n_hist, recent_history_points=model.cfg.recent_history_points,
-                       n_future=model.cfg.n_future, future_step=model.cfg.future_step,
-                       unique_crossings=hasattr(model.cfg, 'seed_crop'))
+                       n_future=model.cfg.n_future, future_step=model.cfg.future_step)
     if args.fiber_zarrs:
         spec.fiber_zarr_dir = args.fiber_zarrs
     vol = FiberVolume(spec, cache_bytes=2 << 30)
@@ -169,57 +165,25 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTrac
     tracer = tracer_class(model, vol, crop, n_hist,
                          TraceParams(max_len=args.trace_len, confidence=args.confidence, explore_calls=args.explore_calls,
                                      n_commit=args.n_commit, seed=args.seed),
-                         device=args.device, **tracer_options)
-    rows, judge_paths = [], []
+                         device=args.device)
+    rows = []
     try:
         for offset in range(0, len(seeds), args.batch):
             chunk = seeds[offset:offset+args.batch]
             collectors = [DecisionCollector(train_f[s['fiber']], s['fiber'], s['t'], s['sign'], cfg, band,
                                            args.off_dist, args.before, args.after, args.stride,
                                            additional_crops=getattr(tracer, 'additional_crops', ())) for s in chunk]
-            paths, _ = tracer.trace(np.stack([s['pos'] for s in chunk]), np.stack([s['heading'] for s in chunk]),
+            tracer.trace(np.stack([s['pos'] for s in chunk]), np.stack([s['heading'] for s in chunk]),
                          on_decision=lambda i, state: collectors[i](state))
-            from vesuvius.neural_tracing.fiber_follow.events import label_path
-            from vesuvius.neural_tracing.fiber_follow.geometry import frame_from_heading
-            for trace_index, (collector, polyline, seed) in enumerate(zip(collectors, paths, chunk)):
-                state = getattr(tracer, 'observed_states', [None]*len(paths))[trace_index]
-                if state is not None:
-                    polyline = state['observed_path']
-                f = collector.fiber
-                reverse = collector.sign < 0
-                q0 = f.length-collector.seed_t if reverse else collector.seed_t
-                events = label_path(polyline, f.points[::-1] if reverse else f.points, q0,
-                                    f.endpoint_stop[0 if reverse else 1])
-                kept = collector.finish()
-                for row in kept:
-                    row['judge_trace'] = len(judge_paths)
-                judge_paths.append(dict(path=polyline, seed_frame=frame_from_heading(seed['heading']),
-                                        q0=q0, reverse=reverse, fiber=collector.fi,
-                                        path_step=4. if state is None else state['stream'].cfg.path_step,
-                                        events=events.to_dict(), ledger=[] if state is None else state['policy'].ledger,
-                                        event_samples=np.asarray(events.samples, np.float64).reshape(-1,3),
-                                        audits=[] if state is None else state['policy'].audit))
-                rows.extend(kept)
+            for collector in collectors:
+                rows.extend(collector.finish())
             print(json.dumps(dict(traces=offset+len(chunk), total=len(seeds), states=len(rows))), flush=True)
     finally:
         tracer.close()
     if not rows:
         raise ValueError('No eligible decision states; no cache was published')
-    from vesuvius.neural_tracing.fiber_follow.direct.judge_archive import save_archive
-    import hashlib
-    identity = hashlib.sha256()
-    for trace in judge_paths:
-        identity.update(np.asarray(trace['path'], np.float64).tobytes())
-        identity.update(np.asarray(trace['seed_frame'], np.float64).tobytes())
-        identity.update(str((trace['q0'], trace['reverse'], trace['fiber'])).encode())
-        identity.update(json.dumps(trace.get('audits', []), sort_keys=True).encode())
-    archive_path = Path(args.out).resolve().with_suffix(f'.paths.{identity.hexdigest()[:20]}.npz')
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
-    save_archive(archive_path, judge_paths)
     st = OnPolicyStates(manifest=fiber_manifest(train_f),
                         provenance=dict(checkpoint=os.path.abspath(args.checkpoint), step=ck.get('step'),
-                                        judge_archive=str(archive_path),
-                                        judge_archive_sha256=hashlib.sha256(archive_path.read_bytes()).hexdigest(),
                                         model_cfg=model.cfg.to_dict(), crop=asdict(crop),
                                         sampler_mode=getattr(model.cfg, 'sampler_mode', 'zero'),
                                         volume=spec.to_dict(), collection=vars(args)),

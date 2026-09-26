@@ -105,20 +105,14 @@ def trace_bidirectional(tracer: ModelTracer, vol: FiberVolume, seeds_grid_xyz: n
     seeds = np.stack([snap_to_presence(vol, s) for s in seeds_grid_xyz])
     axes = np.stack([field_axis(vol, s)[0] for s in seeds]) if headings is None else np.asarray(headings)
     fw, rf = tracer.trace(seeds, axes)
-    def audits():
-        return [None if s is None else dict(ledger=s['policy'].ledger, calls=s['policy'].audit,
-                                            accepted=s['policy'].accepted, alarm=s['policy'].alarm)
-                for s in getattr(tracer, 'observed_states', [None]*len(seeds))]
-    forward_audits = audits()
     bw, rb = tracer.trace(seeds, -axes)
-    tracer.bidirectional_audits = list(zip(audits(), forward_audits))
     out = []
     for f, b, a, c in zip(fw, bw, rf, rb):
         out.append((np.concatenate([b[::-1], f[1:]], 0), (c, a)))
     return out
 
 
-def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTracer, configure_parser=None, configure_tracer=None):
+def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTracer):
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--fiber-zarrs", default=None, help="override the checkpoint's fiber zarr dir")
@@ -139,12 +133,9 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTrac
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--sampling-seed", type=int, default=0, help="Reproducible per-trace sampling noise")
-    if configure_parser is not None:
-        configure_parser(ap)
     args = ap.parse_args(argv)
 
     model, crop, n_hist, spec, ck = checkpoint_loader(args.checkpoint, args.device)
-    tracer_options = configure_tracer(args, ck) if configure_tracer is not None else {}
     if args.n_commit is None:
         args.n_commit = ck.get('n_commit', DEFAULT_N_COMMIT)
     if args.fiber_zarrs:
@@ -153,7 +144,7 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTrac
         spec.ct_zarr = args.ct
     vol = FiberVolume(spec, cache_bytes=8 << 30)
     tracer = tracer_class(model, vol, crop, n_hist, TraceParams(max_len=args.max_len, confidence=args.confidence,
-        n_commit=args.n_commit, seed=args.sampling_seed), device=args.device, **tracer_options)
+        n_commit=args.n_commit, seed=args.sampling_seed), device=args.device)
     g = spec.grid_scale
 
     seeds = [np.array([float(v) for v in s.split(",")]) for s in args.seed]
@@ -194,7 +185,7 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTrac
                 chunk_headings = chunk_headings[keep]
             if not len(chunk):
                 continue
-        for trace_index, (poly, reasons) in enumerate(trace_bidirectional(tracer, vol, chunk, chunk_headings)):
+        for poly, reasons in trace_bidirectional(tracer, vol, chunk, chunk_headings):
             base = resample_polyline(poly * g, g)  # 1 grid voxel spacing, like VC3D traces
             L = arclength(base)[-1]
             if L < args.min_length:
@@ -212,11 +203,6 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTrac
                                                                            "sampling_seed": args.sampling_seed,
                                                                            "sampler_mode": getattr(model.cfg, 'sampler_mode', 'zero'),
                                                                            "checkpoint": os.path.abspath(args.checkpoint)}))
-            audit = getattr(tracer, 'bidirectional_audits', [None]*len(chunk))[trace_index]
-            if audit is not None and any(a is not None for a in audit):
-                audit_path = os.path.join(args.out, name.replace('.json', '.judge.json'))
-                with open(audit_path, 'w') as fh:
-                    json.dump(dict(directions=audit, checkpoint=os.path.abspath(args.checkpoint)), fh)
             with open(os.path.join(args.out, name), "w") as fh:
                 json.dump(obj, fh)
             written.append(name)

@@ -101,23 +101,6 @@ class ModelTracer:
     def close(self):
         self.pool.shutdown(wait=True)
 
-    def begin_observed(self, frames):
-        """Optional retrospective policy, initialized once per directed trace."""
-        return [None for _ in frames]
-
-    def inspect_observed(self, state, path, final=False):
-        return None
-
-    def export_observed(self, state, path, reason):
-        return path, reason
-
-    def observed_decision(self, state):
-        return {}
-
-    def condition_inputs(self, x, pos, frames, indices):
-        """Optional immutable prompt conditioning, separate from proposed paths."""
-        return x
-
     def build_inputs(self, pos, frames, hist, hmask):
         """Read this model's observation; subclasses can supply other image scales."""
         items = [dict(pos=p, frame=f) for p, f in zip(pos, frames)]
@@ -161,13 +144,13 @@ class ModelTracer:
                      for s,p in zip(initial_states,seeds_xyz)]
         hist_start = [len(p)-1 for p in paths]
         frames = [frame_from_heading(h) for h in headings]
-        stochastic = getattr(self.model.cfg, 'sampler_mode', 'zero') == 'gaussian'
+        stochastic = (getattr(self.model.cfg, 'sampler_mode', 'zero') == 'gaussian'
+                      or getattr(self.model.cfg, 'gaussian_candidates', 0) > 0)
         if stochastic:
             from vesuvius.neural_tracing.fiber_follow.sampling import trace_generator, trace_noise
             generators = [trace_generator(self.p.seed, p, h) for p, h in zip(seeds_xyz, headings)]
         if initial_states is not None:
             frames = [np.asarray(s['frame']).copy() for s in initial_states]
-        observed = self.begin_observed(frames)
         active = np.ones(n, bool)
         reasons = ['']*n
         length = np.zeros(n)
@@ -176,12 +159,6 @@ class ModelTracer:
         last_segment = [np.asarray([p[-1]]) for p in paths]
         pp = self.p
         while active.any():
-            for i in np.flatnonzero(active):
-                stop = self.inspect_observed(observed[i], np.asarray(paths[i][hist_start[i]:]))
-                if stop:
-                    active[i], reasons[i] = False, stop
-            if not active.any():
-                break
             idx = np.flatnonzero(active)
             pos = np.stack([paths[i][-1] for i in idx])
             fr = np.stack([frames[i] for i in idx])
@@ -201,7 +178,6 @@ class ModelTracer:
             hist = np.einsum('bhi,bij->bhj', hist_world-pos[:, None], fr)
             tensor = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(self.device)
             x = self.build_inputs(pos, fr, hist, hm)
-            x = self.condition_inputs(x, pos, fr, idx)
             sampling = {}
             if stochastic:
                 sampling['initial_noise'] = trace_noise(self.model.cfg, [generators[i] for i in idx], self.device)
@@ -223,7 +199,6 @@ class ModelTracer:
                              points=points[j].copy(), confidence=conf.copy(), n_commit=commit, would_stop=would_stop, exploratory=exploratory,
                              recovery_allowed=bool(allowed[j]), recovery_blocked=bool(recovery_blocked),
                              travelled=float(length[i]), last_segment=last_segment[i].copy())
-                state.update(self.observed_decision(observed[i]))
                 if on_decision is not None and on_decision(int(i), state) is False:
                     active[i], reasons[i] = False, 'oracle'
                     continue
@@ -280,14 +255,7 @@ class ModelTracer:
                     active[i], reasons[i] = False, 'abort'
                 elif length[i] >= pp.max_len-1e-6:
                     active[i], reasons[i] = False, 'max_len'
-        result = []
-        for i, (p, h) in enumerate(zip(paths, hist_start)):
-            path = np.asarray(p[h:])
-            self.inspect_observed(observed[i], path, final=True)
-            path, reasons[i] = self.export_observed(observed[i], path, reasons[i])
-            result.append(path)
-        self.observed_states = observed
-        return result, reasons
+        return [np.asarray(p[h:]) for p, h in zip(paths, hist_start)], reasons
 
 
 class FieldTracer:

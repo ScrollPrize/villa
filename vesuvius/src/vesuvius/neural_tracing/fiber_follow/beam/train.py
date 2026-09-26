@@ -14,7 +14,6 @@ import hashlib
 import json
 import math
 from pathlib import Path
-import sys
 import time
 
 import numpy as np
@@ -29,7 +28,7 @@ from vesuvius.neural_tracing.fiber_follow.data import DATA_POLICY, ZBand, fiber_
 from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.model import prepare_model
 from vesuvius.neural_tracing.fiber_follow.runloop import (
-    RunLog, lr_at, optimizer_step, prepare_run_dir, read_checkpoint, save_checkpoint,
+    RunLog, lr_at, optimizer_step, prepare_run_dir, read_checkpoint, save_checkpoint, raise_open_file_limit,
 )
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.training_log import format_training_log
@@ -122,25 +121,6 @@ def build_parser():
     ap.add_argument('--rank-weight', type=float, default=1.)
     ap.add_argument('--onfiber-weight', type=float, default=1.)
     return ap
-
-
-def raise_open_file_limit():
-    """Memory-mapped CT chunks each hold a file descriptor while cached; the
-    diagnostic volume's cache alone can exceed a 1024 soft limit."""
-    try:
-        import resource
-    except ImportError:  # pragma: no cover - non-POSIX
-        return
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    target = hard if hard != resource.RLIM_INFINITY else max(soft, 1 << 20)
-    if sys.platform == 'darwin':
-        target = min(target, 10240)  # OPEN_MAX; macOS rejects larger soft limits
-    if soft == resource.RLIM_INFINITY or soft >= target:
-        return
-    try:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
-    except (ValueError, OSError):
-        pass
 
 
 def main(argv=None):

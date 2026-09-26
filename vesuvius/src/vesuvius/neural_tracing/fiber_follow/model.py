@@ -1,4 +1,4 @@
-"""One history-conditioned curve sampled with a checkpointed initial distribution."""
+"""History-conditioned flow proposals with checkpointed sampling and scoring."""
 from __future__ import annotations
 from dataclasses import asdict, dataclass
 import math
@@ -6,7 +6,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from vesuvius.neural_tracing.fiber_follow.encoder import SpatialEncoder, prepare_model
-from vesuvius.neural_tracing.fiber_follow.policy import DEFAULT_MAX_RECOVERY_DISTANCE
+from vesuvius.neural_tracing.fiber_follow.policy import DEFAULT_MAX_RECOVERY_DISTANCE, recovery_allowed
+from vesuvius.neural_tracing.fiber_follow.passage_scorer import PassageScorer, sample_path_features
 
 ARCHITECTURE = 'single_path_flow_v11'
 
@@ -35,12 +36,22 @@ class FollowNetConfig:
     # Missing in old checkpoints: retain their original deterministic behavior.
     # New training runs explicitly select gaussian.
     sampler_mode: str = 'zero'
+    # Missing fields retain the original single-path confidence head/checkpoints.
+    scorer: str = 'legacy'
+    gaussian_candidates: int = 0
+    selection_horizon: int = 8
 
     def __post_init__(self):
         self.widths = tuple(self.widths)
         self.flow_sigma = tuple(tuple(row) for row in self.flow_sigma)
         if self.sampler_mode not in ('zero', 'gaussian'):
             raise ValueError('sampler_mode must be zero or gaussian')
+        if self.scorer not in ('legacy', 'passage'):
+            raise ValueError('scorer must be legacy or passage')
+        if not isinstance(self.gaussian_candidates, int) or self.gaussian_candidates < 0 or self.selection_horizon < 1:
+            raise ValueError('Invalid candidate count or selection horizon')
+        if self.gaussian_candidates and (self.scorer != 'passage' or self.sampler_mode != 'zero'):
+            raise ValueError('Gaussian alternatives require scorer=passage and sampler_mode=zero')
         if min(self.hist_points, self.hist_stride, self.n_future, self.flow_layers,
                self.flow_heads, self.flow_steps, self.flow_draws) < 1 or self.hidden % self.flow_heads:
             raise ValueError('Positive dimensions required; hidden must divide by heads')
@@ -91,12 +102,15 @@ def future_planes(cfg, device=None):
 
 
 def initial_residuals(cfg, batch, device, generator=None):
-    """One normalized curve per state; gaussian matches the flow-loss prior.
+    """Primary start and optional Gaussian alternatives; zero stays in slot zero.
 
     Call outside compiled training methods so RNG consumption is explicit.
     Per-plane physical scales are applied only by PathFlow.to_voxels.
     """
     shape = (batch, 1, cfg.n_future, 2)
+    if cfg.gaussian_candidates:
+        return torch.cat((torch.zeros(shape, device=device), torch.randn(
+            batch, cfg.gaussian_candidates, cfg.n_future, 2, device=device, generator=generator)), 1)
     if cfg.sampler_mode == 'zero':
         return torch.zeros(shape, device=device, dtype=torch.float32)
     return torch.randn(shape, device=device, dtype=torch.float32, generator=generator)
@@ -191,7 +205,12 @@ class PathFlow(nn.Module):
         self.blocks = nn.ModuleList([DenoisingBlock(h,cfg.flow_heads) for _ in range(cfg.flow_layers)])
         self.final = nn.LayerNorm(h)
         self.velocity = nn.Linear(h,2)
-        self.confidence_head = nn.Linear(h,1)
+        self.confidence_head = nn.Linear(h,1) if cfg.scorer == 'legacy' else PassageScorer(
+            27*(feature_channels+1)+cfg.widths[-1]+1, h, h, cfg.flow_heads)
+        if cfg.scorer == 'passage':
+            radius = cfg.flow_stencil_radius
+            self.register_buffer('path_stencil', torch.tensor([[a*radius, b*radius, z]
+                for z in (-1., 0., 1.) for a in (-1., 0., 1.) for b in (-1., 0., 1.)]), persistent=False)
         nn.init.normal_(self.velocity.weight,std=.01)
         nn.init.zeros_(self.velocity.bias)
 
@@ -300,23 +319,26 @@ class FollowNet(SpatialEncoder):
     def refine(self, features, context, fixed, *, return_steps=False, initial_noise=None, generator=None):
         B,P,_ = fixed['mu'].shape
         y = initial_residuals(self.cfg, B, features.device, generator) if initial_noise is None else initial_noise
-        if y.shape != (B, 1, P, 2):
-            raise ValueError('initial_noise must have shape [batch, 1, n_future, 2]')
+        candidates = 1+self.cfg.gaussian_candidates
+        if y.shape != (B, candidates, P, 2):
+            raise ValueError('initial_noise must have shape [batch, 1+gaussian_candidates, n_future, 2]')
         y = y.detach().to(device=features.device, dtype=torch.float32)
-        curves = [self.flow.to_voxels(y,fixed['mu'])[:,0]] if return_steps else []
+        curves = [self.flow.to_voxels(y,fixed['mu'])] if return_steps else []
         T = self.cfg.flow_steps
         for i in range(T):
-            t = y.new_full((B,1),i/T)
+            t = y.new_full((B,candidates),i/T)
             v = self.flow(features,context,y,t,fixed,self.sampling_grid)
             y = y + self.flow(features,context,y+v/(2*T),t+1/(2*T),fixed,self.sampling_grid)/T
             if return_steps:
-                curves.append(self.flow.to_voxels(y,fixed['mu'])[:,0])
+                curves.append(self.flow.to_voxels(y,fixed['mu']))
         return y, curves
 
     def encode_conditioning(self,x,hist,hmask):
         """Spatial and static flow features, optionally shared across training passes."""
         features,context,deep = self.encode(x,hist,hmask,return_deep=True)
         fixed = self.flow.conditioning(features,deep,hist,hmask,self.sampling_grid)
+        if self.cfg.scorer == 'passage':
+            fixed['score_deep'] = deep
         return features,context,fixed
 
     @torch.no_grad()
@@ -324,11 +346,26 @@ class FollowNet(SpatialEncoder):
         """Detached rollout, optionally retaining its initial curve and updates."""
         features,context,fixed = self.encode_conditioning(x,hist,hmask) if encoding is None else encoding
         y,curves = self.refine(features,context,fixed,return_steps=return_steps,initial_noise=initial_noise,generator=generator)
-        points = self.flow.to_voxels(y,fixed['mu'])[:,0]
-        return (points,torch.stack(curves,1)) if return_steps else points
+        points = self.flow.to_voxels(y,fixed['mu'])
+        if not self.cfg.gaussian_candidates:
+            points = points[:,0]
+        # Refinement training diagnostics follow candidate zero; selection is
+        # evaluated separately after scoring the complete generated pool.
+        return (points,torch.stack(curves,1)[:,:,0]) if return_steps else points
 
     def training_forward(self,x,hist,hmask,targets,points,*,encoding=None):
         return self._forward(x,hist,hmask,targets=targets,training_points=points.detach(),encoding=encoding)
+
+    def score_candidates(self, features, fixed, context, candidates):
+        """Adapt this encoder's fine/deep evidence to the general passage scorer."""
+        b, k, n, _ = candidates.shape
+        points = candidates.detach().reshape(b, k*n, 3)
+        local = sample_path_features(features,
+            (points[:, :, None]+self.flow.path_stencil).reshape(b, -1, 3), self.crop)
+        deep = sample_path_features(fixed['score_deep'], points, self.crop,
+                                    stride=2**(len(self.cfg.widths)-1))
+        evidence = torch.cat((local.reshape(b, k, n, -1), deep.reshape(b, k, n, -1)), -1)
+        return self.flow.confidence_head(evidence, context, candidates, points.new_zeros(b, 3))
 
     def forward(self,x,hist,hmask,*,targets=None,generator=None,return_steps=False,initial_noise=None):
         return self._forward(x,hist,hmask,targets=targets,generator=generator,return_steps=return_steps,initial_noise=initial_noise)
@@ -341,15 +378,30 @@ class FollowNet(SpatialEncoder):
         if training_points is None:
             y,curves = self.refine(features,context,fixed,return_steps=return_steps,initial_noise=initial_noise,generator=generator)
         else:
-            y = ((training_points[...,:2]-fixed['mu'][...,:2])/self.flow.sigma)[:,None]
+            pool = training_points[:,None] if training_points.ndim == 3 else training_points
+            y = (pool[...,:2]-fixed['mu'][:,None,:,:2])/self.flow.sigma
             curves = []
         # Coordinates/labels are detached; the final evaluation and cached image
         # and history features retain their gradient route into the shared model.
-        _,final = self.flow(features,context,y.detach(),y.new_ones(len(y),1),fixed,self.sampling_grid,return_features=True)
-        logits = self.flow.confidence_head(final[:,0]).squeeze(-1).float()
-        points = self.flow.to_voxels(y,fixed['mu'])[:,0].detach() if training_points is None else training_points.detach()
+        _,final = self.flow(features,context,y.detach(),y.new_ones(y.shape[:2]),fixed,self.sampling_grid,return_features=True)
+        candidates = self.flow.to_voxels(y,fixed['mu']).detach() if training_points is None else pool.detach()
+        selected = torch.zeros(len(y), device=y.device, dtype=torch.long)
+        if self.cfg.scorer == 'passage':
+            candidate_logits = self.score_candidates(features,fixed,final,candidates)
+            candidate_confidence = candidate_logits.sigmoid().cummin(-1).values
+            eligible = recovery_allowed(candidates,self.cfg.max_recovery_distance)
+            horizon = min(self.cfg.selection_horizon,self.cfg.n_future)-1
+            # argmax keeps the deterministic candidate on ties. Ranking and
+            # acceptance both describe the commit prefix, not a distant exit.
+            selected = candidate_confidence[...,horizon].masked_fill(~eligible,-torch.inf).argmax(-1)
+            out.update(candidate_points=candidates,candidate_logits=candidate_logits,
+                       candidate_confidence=candidate_confidence,selected_candidate=selected)
+            logits = candidate_logits[torch.arange(len(y),device=y.device),selected]
+        else:
+            logits = self.flow.confidence_head(final[:,0]).squeeze(-1).float()
+        points = candidates[torch.arange(len(y),device=y.device),selected]
         out.update(points=points,confidence_logits=logits,
                    confidence=logits.sigmoid().cummin(-1).values)
         if return_steps:
-            out['denoising_steps'] = torch.stack(curves,1)
+            out['denoising_steps'] = torch.stack(curves,1)[torch.arange(len(y),device=y.device),:,selected]
         return out
