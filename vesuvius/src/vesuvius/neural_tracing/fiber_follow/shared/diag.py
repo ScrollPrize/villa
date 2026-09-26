@@ -190,9 +190,6 @@ def plot_rollouts(vol, fibers, seeds, paths, reasons, path, max_len=400., half=1
             a.imshow(img, origin="lower", aspect="auto", cmap="gray", vmin=0, vmax=1,
                      extent=(-half - 0.5, half + 0.5, -0.5, len(g) - 0.5))
             a.axvline(0, color="lime", lw=1.5, alpha=0.5)
-            if f.brk is not None:
-                bk = np.interp(arc, f.s, f.brk.astype(float)) > 0.5
-                a.plot(np.where(bk, 0.0, np.nan), np.arange(len(arc)), color="red", lw=3)
             ok = d < half
             a.plot(np.where(ok, off[:, c], np.nan), j, "-", color="orange", lw=1)
             a.set_xticks([])

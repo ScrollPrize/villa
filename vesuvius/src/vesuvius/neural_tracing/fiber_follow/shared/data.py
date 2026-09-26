@@ -29,8 +29,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
     tangent_at,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.fast_sample import sample_crop
-from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENCE
-from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
 
 
 DATA_VERSION = 2
@@ -50,7 +49,6 @@ class TracedFiber:
     points: np.ndarray  # (N, 3) trace-grid xyz; all annotated vertices, gaps <= 1 voxel
     s: np.ndarray
     tag: str
-    brk: np.ndarray | None = None  # (N,) bool: point lies in a low-presence break
     spans: tuple[FiberSpan, ...] = ()
     endpoint_stop: tuple[bool, bool] = (False, False)
     source_hash: str = ""
@@ -130,49 +128,6 @@ def fiber_manifest(fibers):
     return [dict(name=f.name, source_hash=f.source_hash,
                  geometry_hash=hashlib.sha256(np.asarray(f.points, dtype="<f8").tobytes()).hexdigest(),
                  endpoint_stop=list(f.endpoint_stop)) for f in fibers]
-
-
-def _presence_identity(fibers, vol):
-    spec = getattr(vol, "spec", None)
-    source = spec.to_dict() if spec is not None else {}
-    return json.dumps(dict(version=DATA_VERSION, fibers=fiber_manifest(fibers), volume=source), sort_keys=True)
-
-
-def gt_presence(fibers: list[TracedFiber], vol: FiberVolume, cache_path: str | None = None) -> dict:
-    """Max presence (0..1) in the 3x3x3 neighbourhood of every GT point."""
-    cached = {}
-    identity = _presence_identity(fibers, vol)
-    if cache_path and os.path.exists(cache_path):
-        with np.load(cache_path, allow_pickle=False) as z:
-            if "__identity__" in z.files and str(z["__identity__"].item()) == identity:
-                cached = {k: z[k] for k in z.files if k != "__identity__"}
-    off = np.stack(np.meshgrid(*[np.arange(-1, 2)] * 3, indexing="ij"), -1).reshape(-1, 3)
-    out, new = {}, False
-    for f in fibers:
-        p = cached.get(f.name)
-        if p is None or len(p) != len(f.points):
-            q = f.points[:, None, ::-1] + off[None]
-            p = vol.presence.sample_nearest(q).max(1).astype(np.float32) / 255.0
-            new = True
-        out[f.name] = p
-    if cache_path and new:
-        np.savez_compressed(cache_path, __identity__=identity, **out)
-    return out
-
-
-def mark_breaks(fibers: list[TracedFiber], presence: dict, thr: float = 0.1, min_len: int = 8) -> None:
-    """Flag low-prediction-support stretches, not confirmed physical breaks."""
-    for f in fibers:
-        low = presence[f.name] < thr
-        b = np.concatenate([[0], low.astype(np.int8), [0]])
-        d = np.diff(b)
-        brk = np.zeros(len(low), bool)
-        for a, e in zip(np.nonzero(d == 1)[0], np.nonzero(d == -1)[0]):
-            # CP anchors and final samples can be closer than one grid voxel.
-            end_s = f.s[e] if e < len(f.s) else f.length
-            if end_s - f.s[a] >= min_len:
-                brk[a:e] = True
-        f.brk = brk
 
 
 @dataclass(frozen=True)
@@ -255,8 +210,6 @@ def training_state_allowed(item, crop: CropSpec, band: ZBand | None):
         loc = np.c_[item["dense_ab"], item["dense_planes"]][item["dense_mask"] > 0]
         if len(loc):
             zs.append((loc @ frame.T + pos)[:, 2])
-    if 'tube_segments' in item and len(item['tube_segments']):
-        zs.append((item['tube_segments'].reshape(-1, 3) @ frame.T + pos)[:, 2])
     z = np.concatenate(zs)
     return not (z.min() < band.hi and z.max() >= band.lo)
 
@@ -604,11 +557,10 @@ def render_count(crop: CropSpec) -> int:
 
 
 def build_inputs(raw, starts, pos, frames, hist, hmask, grid: torch.Tensor, n_render: int | None = None,
-                 gate_direction: bool = False, input_scale: float = 1.,
-                 history_sigma: float = 1., history_render: str = 'points') -> torch.Tensor:
+                 input_scale: float = 1., history_sigma: float = 1., history_render: str = 'points') -> torch.Tensor:
     """Tensors (any device) -> model input (B, C, D, H, W). Only the nearest
     ``n_render`` history points are rendered (the rest lie behind the crop)."""
-    x = sample_oriented_fast(raw, starts.float(), pos*input_scale, frames*input_scale, grid, gate_direction=gate_direction)
+    x = sample_oriented_fast(raw, starts.float(), pos*input_scale, frames*input_scale, grid)
     if n_render is not None:
         hist, hmask = hist[:, :n_render], hmask[:, :n_render]
     return torch.cat([x, render_history(hist, hmask, grid, history_sigma, history_render)], 1)
@@ -629,15 +581,14 @@ def collate_with_volume(items, vol: FiberVolume, crop: CropSpec, grid: torch.Ten
             # one fused numba pass per sample (see fast_sample.py); same values as build_inputs
             nr = render_count(crop)
             gf = _grid_flat(crop)
-            C = {"ct": 1, "ct+presence": 1, "fiber": 7, "fiber+ct": 8}[vol.spec.mode] + 1
-            x = np.empty((len(items), C, crop.depth, crop.width, crop.width), np.float16)
+            x = np.empty((len(items), 2, crop.depth, crop.width, crop.width), np.float16)
             for j, it in enumerate(items):
-                x[j] = sample_crop(raw[j], starts[j], it["pos"]*scale, it["frame"]*scale, gf, crop.gate_direction,
-                                   it["hist_local"][:nr], it["hmask"][:nr], C, crop.history_sigma, crop.history_render).reshape(x.shape[1:])
+                x[j] = sample_crop(raw[j], starts[j], it["pos"]*scale, it["frame"]*scale, gf,
+                                   it["hist_local"][:nr], it["hmask"][:nr], 2, crop.history_sigma, crop.history_render).reshape(x.shape[1:])
             out = dict(x=torch.from_numpy(x), hist=out["hist"], hmask=out["hmask"])
         else:
             x = build_inputs(out.pop("raw"), out.pop("starts"), out["pos"], out["frames"], out["hist"], out["hmask"],
-                             grid, n_render=render_count(crop), gate_direction=crop.gate_direction, input_scale=scale,
+                             grid, n_render=render_count(crop), input_scale=scale,
                              history_sigma=crop.history_sigma, history_render=crop.history_render)
             out = dict(x=x.half(), hist=out["hist"], hmask=out["hmask"])
         if vol.spec.mode == 'ct+presence':
@@ -737,7 +688,7 @@ class OnPolicyStates:
             with np.load(path, allow_pickle=False) as z:
                 metadata = json.loads(str(z["__metadata__"].item()))
                 if metadata["version"] != STATE_VERSION:
-                    raise ValueError("Incompatible replay version; import old training states with scripts/import_replay.py")
+                    raise ValueError(f"Incompatible replay version {metadata['version']}; expected {STATE_VERSION}")
                 # Include archive identity so an overwritten NPZ cannot reuse stale mmap arrays.
                 stat = os.stat(path)
                 metadata["archive"] = [stat.st_size, stat.st_mtime_ns]
@@ -766,7 +717,7 @@ class OnPolicyStates:
         with open(metadata_path) as fh:
             metadata = json.load(fh)
         if metadata["version"] != STATE_VERSION:
-            raise ValueError("Incompatible replay version; import old training states with scripts/import_replay.py")
+            raise ValueError(f"Incompatible replay version {metadata['version']}; expected {STATE_VERSION}")
         self.manifest = metadata["fibers"]
         self.provenance = metadata["provenance"]
         self._dir = d

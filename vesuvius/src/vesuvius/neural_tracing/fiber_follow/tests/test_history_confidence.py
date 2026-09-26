@@ -1,47 +1,22 @@
-import copy
-
-
-from dataclasses import replace
-
-
 import json
-
 
 from types import SimpleNamespace
 
-
 import numpy as np
-
 
 import pytest
 
-
 import torch
-
 
 from vesuvius.neural_tracing.fiber_follow.shared import data as D
 
-
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength, crop_local_grid, frame_from_heading
-
-
-from vesuvius.neural_tracing.fiber_follow.flow_matching.history_audit import HistoryAudit
-
 
 from vesuvius.neural_tracing.fiber_follow.flow_matching.history_metrics import observed_measurements
 
+from vesuvius.neural_tracing.fiber_follow.flow_matching.model import history_tangent
 
-from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet, FollowNetConfig, history_tangent
-
-
-from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import loss_fn
-
-
-from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams, field_axis
-
-
-from vesuvius.neural_tracing.fiber_follow.flow_matching.train import load_checkpoint, save_checkpoint
-
+from vesuvius.neural_tracing.fiber_follow.shared.trace import field_axis
 
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 
@@ -67,7 +42,6 @@ def volume(tmp_path):
 @pytest.mark.parametrize('fused', [False, True])
 def test_native_ct_and_presence_sample_the_same_world_positions(tmp_path, monkeypatch, fused):
     vol = volume(tmp_path)
-    assert vol.nx is None and vol.ny is None
     assert vol.input_scale == 2 and vol.channels == 2
     crop = CropSpec(depth=8, width=7, behind=3, spacing=.5, history_render='segments')
     frame = frame_from_heading(np.array([1., 2., 3.]))

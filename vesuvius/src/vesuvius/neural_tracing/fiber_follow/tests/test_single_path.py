@@ -1,9 +1,7 @@
 """Single-path architecture, supervision, tracing, replay and learning regressions."""
 import copy
-from dataclasses import replace,asdict
 import json
 from pathlib import Path
-from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
@@ -15,7 +13,6 @@ from vesuvius.neural_tracing.fiber_follow.flow_matching.train import load_checkp
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec,arclength,frame_from_heading
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer,TraceParams
 from vesuvius.neural_tracing.fiber_follow.shared.collect import DecisionCollector
-from vesuvius.neural_tracing.fiber_follow.shared.replay import import_states
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 
@@ -172,20 +169,16 @@ def states(f,n=10):
         offtrack=np.arange(n)%5==4,hard=np.ones(n,bool),exploratory=np.zeros(n,bool))
 
 
-def test_replay_import_discards_predictions_deduplicates_checks_holdout_and_provenance(tmp_path):
+def test_replay_rejects_old_versions_and_mixes_fixed_and_recent_sources(tmp_path):
     f=fiber();arrays=states(f);old=tmp_path/'old.npz'
     np.savez(old,__metadata__=json.dumps(dict(version=4,fibers=D.fiber_manifest([f]),provenance={})),
              candidates=np.zeros((10,7,64,3)),**arrays)
-    with pytest.raises(ValueError,match='import'): D.OnPolicyStates.load(old)
+    with pytest.raises(ValueError,match='Incompatible replay version 4'): D.OnPolicyStates.load(old)
     spec=FiberVolumeSpec('unused');cfg=D.SampleConfig(crop=CropSpec(depth=20,width=12,behind=10),n_history=8,recent_history_points=8,n_future=4)
-    bank=import_states([old,old],[f],cfg,None,spec,limit=20000)
-    assert len(bank)==10 and bank.provenance['counts']['duplicate']==10
-    assert not hasattr(bank,'candidates') and np.isfinite(bank.drift[~bank.offtrack]).all()
-    np.testing.assert_array_equal(np.sort(bank.source_row),np.arange(10))
+    drift=np.where(arrays['offtrack'],np.nan,np.linalg.norm(arrays['pos']-f.points[arrays['t'].astype(int)],axis=-1))
+    bank=D.OnPolicyStates(manifest=D.fiber_manifest([f]),provenance={},drift=drift,**arrays)
     path=tmp_path/'bank.npz';bank.save(path);bank=D.OnPolicyStates.load(path)
     bank.validate_fibers([f]);assert bank.hist.shape==(10,8,3)
-    with pytest.raises(ValueError,match='No unique eligible'):
-        import_states([old],[f],cfg,D.ZBand(0,1000),spec)
     pools=D.replay_pools([bank]);assert all(pools)
     ds=D.FollowDataset([f],spec,cfg,None,fixed=[bank],onpolicy=[bank])
     rng=np.random.default_rng(3);counts=np.zeros(3,int);departed=np.zeros(3,int)
@@ -309,6 +302,7 @@ def test_end_to_end_trace_collection_and_state_roundtrip(tmp_path,monkeypatch):
     assert len(loaded)==len(rows)
 
 
+@pytest.mark.slow
 def test_synthetic_parallel_fibers_learn_identity_recovery():
     torch.manual_seed(91)
     cfg=config(depth=44,behind=32,hist_points=32,recent_history_points=32,flow_draws=4,flow_layers=1)
@@ -329,7 +323,7 @@ def test_synthetic_parallel_fibers_learn_identity_recovery():
         opt.zero_grad(set_to_none=True)
         f,c,d=m.encode(b['x'],b['hist'],b['hmask'],return_deep=True)
         fixed=m.flow.conditioning(f,d,b['hist'],b['hmask'],m.sampling_grid)
-        loss=m.flow_loss(f,c,b['hist'],b['hmask'],b,fixed=fixed)['flow_loss']
+        loss=m.flow_loss(f,c,b,fixed=fixed)['flow_loss']
         loss.backward();torch.nn.utils.clip_grad_norm_(m.parameters(),1);opt.step()
     with torch.no_grad():after=(run(m,b)['points'][...,:2]-target).square().mean().item()
     assert after<before*.15 and after<.25,(before,after)

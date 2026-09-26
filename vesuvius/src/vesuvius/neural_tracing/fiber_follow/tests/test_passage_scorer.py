@@ -14,9 +14,10 @@ from test_single_path import config, batch, run
 from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet, FollowNetConfig, initial_residuals, ARCHITECTURE
 from vesuvius.neural_tracing.fiber_follow.flow_matching.passage_scorer import PassageScorer, sample_path_features
 from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import candidate_prefix_labels, prefix_labels, loss_fn
+from vesuvius.neural_tracing.fiber_follow.shared.runloop import restore_training_rng
 from vesuvius.neural_tracing.fiber_follow.flow_matching.train import (
     optimizer_update, save_checkpoint, load_checkpoint, resolve_scorer_options,
-    compile_training_model, main, training_rng_state, restore_training_rng, resume_training,
+    compile_training_model, main, training_rng_state, resume_training,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec

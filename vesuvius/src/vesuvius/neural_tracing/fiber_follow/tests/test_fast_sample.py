@@ -58,5 +58,5 @@ def test_history_bounds_match_exhaustive_float32(mode,sigma,case):
                          np.array([[r*sigma,0.,-1.] for r in (7.,14.,14.3,14.5,15.9,16.,16.1,20.)]),
                          np.array([[0.,0.,0.],[20.,15.,-10.],[40.,30.,-20.]])])
     result=sample_crop(np.zeros((1,3,3,3),np.uint8),np.zeros(3),np.zeros(3),np.eye(3),
-                       grid,False,hist,mask,2,sigma,mode)
+                       grid,hist,mask,2,sigma,mode)
     np.testing.assert_array_equal(result[-1],brute_history(grid,hist,mask,sigma,mode=='segments'))

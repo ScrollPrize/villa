@@ -17,7 +17,9 @@ try:
 except psutil.NoSuchProcess:
     print(f'{name}: training process already stopped')
     raise SystemExit(0)
-if ('vesuvius.neural_tracing.fiber_follow.flow_matching.train' not in args
+trainers = ('vesuvius.neural_tracing.fiber_follow.flow_matching.train',
+            'vesuvius.neural_tracing.fiber_follow.regression.train')
+if (not any(t in args for t in trainers)
         or '--name' not in args or args[args.index('--name')+1] != name):
     raise SystemExit(f'Refusing to stop PID {pid}: it does not match run {name}')
 # Freeze the parent before enumerating to prevent it starting another collector.

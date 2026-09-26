@@ -76,18 +76,6 @@ def lr_at(step: int, base_lr: float, warmup: int, total_steps: int) -> float:
     return base_lr * min(1., step / max(1, warmup)) * .5 * (1 + math.cos(math.pi * (step - 1) / total_steps))
 
 
-def optimizer_step(model, opt, loss, step: int, lr: float):
-    """Sets the learning rate, checks the loss, clips gradients, and steps."""
-    for group in opt.param_groups:
-        group['lr'] = lr
-    if not torch.isfinite(loss):
-        raise FloatingPointError(f'Non-finite training loss at step {step}')
-    opt.zero_grad(set_to_none=True)
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
-    opt.step()
-
-
 def save_checkpoint(path, model, vol_spec, crop, n_history, architecture, extra=None):
     torch.save(dict(architecture=architecture, data_policy=DATA_POLICY, model=model.state_dict(),
                     model_cfg=model.cfg.to_dict(), crop=dataclasses.asdict(crop),

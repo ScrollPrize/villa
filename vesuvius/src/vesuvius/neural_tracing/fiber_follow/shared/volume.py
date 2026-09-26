@@ -14,11 +14,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
-import numba
-import numba.typed
 import numcodecs
 import numpy as np
-import torch
 
 _VCZ1_REGISTERED = False
 _MISSING = object()
@@ -167,7 +164,8 @@ class FiberVolumeSpec:
     ct_grid_scale: float = 8.0  # base voxels per selected CT voxel; s1_ds2 level 0 = 4
     # base voxels per trace-grid voxel (fiber OME level 3 -> 8)
     grid_scale: float = 8.0
-    # "ct+presence" samples each scalar field on its own grid, without axes.
+    # "ct" or "ct+presence" (each scalar field sampled on its own grid). The
+    # retired "fiber" default is kept so older metadata compares unchanged.
     inputs: str = "fiber"
     load_presence: bool = True  # False: CT metadata alone defines tracing bounds.
 
@@ -189,46 +187,36 @@ def _find_channel_zarr(root: str, channel: str) -> str:
 class FiberVolume:
     """Model-image readers plus presence for seed initialization.
 
-    CT and CT + presence open no predicted direction arrays and read CT at its
-    native resolution. External positions and ``shape`` remain in trace units.
+    CT is read at its native resolution. External positions and ``shape``
+    remain in trace units.
     """
 
     def __init__(self, spec: FiberVolumeSpec, cache_bytes: int = 3 << 30) -> None:
         self.spec = spec
-        if spec.mode not in ('fiber', 'fiber+ct', 'ct', 'ct+presence') or min(spec.grid_scale, spec.ct_grid_scale) <= 0:
-            raise ValueError('Invalid input mode or voxel scale')
+        if spec.mode not in ('ct', 'ct+presence') or min(spec.grid_scale, spec.ct_grid_scale) <= 0:
+            raise ValueError('Invalid input mode or voxel scale; direction-field inputs are no longer supported')
         lvl = str(spec.fiber_level)
-        per = cache_bytes // (4 if spec.ct_zarr else 3)
         if not spec.load_presence and spec.mode != 'ct':
             raise ValueError('Presence-free volume reading requires CT-only inputs')
-        self.presence = (ChunkedArray(os.path.join(_find_channel_zarr(spec.fiber_zarr_dir, "presence"), lvl), per)
+        self.presence = (ChunkedArray(os.path.join(_find_channel_zarr(spec.fiber_zarr_dir, "presence"), lvl), cache_bytes // 4)
                          if spec.load_presence else None)
         self._seed_presence = None
-        self.nx = self.ny = None
-        if spec.mode in ('fiber', 'fiber+ct'):
-            self.nx = ChunkedArray(os.path.join(_find_channel_zarr(spec.fiber_zarr_dir, "nx"), lvl), per)
-            self.ny = ChunkedArray(os.path.join(_find_channel_zarr(spec.fiber_zarr_dir, "ny"), lvl), per)
-        self.ct = None
-        self.input_scale = spec.grid_scale/spec.ct_grid_scale if spec.mode in ('ct', 'ct+presence') else 1.
+        self.input_scale = spec.grid_scale/spec.ct_grid_scale
         if not self.input_scale.is_integer():
             raise ValueError('CT sampling currently requires an integer number of CT voxels per trace voxel')
-        if spec.mode in ('ct', 'ct+presence', 'fiber+ct') and not spec.ct_zarr:
+        if not spec.ct_zarr:
             raise ValueError("CT input mode needs ct_zarr")
-        if spec.ct_zarr:
-            # Native CT is the larger field; presence keeps its own cache.
-            ct = ChunkedArray(os.path.join(spec.ct_zarr, str(spec.ct_level)),
-                              int(cache_bytes * 0.75) if spec.mode in ('ct', 'ct+presence') else per)
-            expected = np.asarray(self.presence.shape)*spec.grid_scale/spec.ct_grid_scale if self.presence is not None else np.asarray(ct.shape)
-            if np.any(np.abs(np.asarray(ct.shape)-expected) > 1):
-                raise ValueError(
-                    f"CT shape {ct.shape} and voxel scale {spec.ct_grid_scale} do not align "
-                    f"with presence shape {self.presence.shape} at scale {spec.grid_scale}"
-                )
-            if spec.mode == 'fiber+ct' and (ct.shape != self.presence.shape or spec.ct_grid_scale != spec.grid_scale):
-                raise ValueError('fiber+ct requires CT on the fiber grid; use ct mode for native-resolution CT')
-            if ct.dtype != np.dtype('uint8'):
-                raise ValueError('CT intensity normalization currently requires uint8 data')
-            self.ct = ct
+        # Native CT is the larger field; presence keeps its own cache.
+        ct = ChunkedArray(os.path.join(spec.ct_zarr, str(spec.ct_level)), int(cache_bytes * 0.75))
+        expected = np.asarray(self.presence.shape)*spec.grid_scale/spec.ct_grid_scale if self.presence is not None else np.asarray(ct.shape)
+        if np.any(np.abs(np.asarray(ct.shape)-expected) > 1):
+            raise ValueError(
+                f"CT shape {ct.shape} and voxel scale {spec.ct_grid_scale} do not align "
+                f"with presence shape {self.presence.shape} at scale {spec.grid_scale}"
+            )
+        if ct.dtype != np.dtype('uint8'):
+            raise ValueError('CT intensity normalization currently requires uint8 data')
+        self.ct = ct
         self.shape = (self.presence.shape if self.presence is not None else
                       tuple(np.ceil(np.asarray(self.ct.shape)/self.input_scale).astype(int)))
 
@@ -242,175 +230,14 @@ class FiberVolume:
         return self._seed_presence
 
     @property
-    def raw_channels(self) -> int:
-        if self.spec.mode in ('ct', 'ct+presence'):
-            return 1
-        return 4 if self.ct is not None else 3
-
-    @property
     def channels(self) -> int:
         """Image input channels, including independently sampled presence."""
-        if self.spec.mode in ('ct', 'ct+presence'):
-            return 2 if self.spec.mode == 'ct+presence' else 1
-        return self.raw_channels + 4
-
-    def fiber_raw_block(self, start, size) -> np.ndarray:
-        """uint8 (presence, nx, ny) block, zyx, regardless of model inputs."""
-        if self.nx is None:
-            raise ValueError('CT-only mode does not open predicted direction fields')
-        return np.stack([self.presence.read(start, size), self.nx.read(start, size), self.ny.read(start, size)], 0)
+        return 2 if self.spec.mode == 'ct+presence' else 1
 
     def raw_block(self, start, size) -> np.ndarray:
-        """Model-input uint8 block in source-array coordinates (native CT in ct mode)."""
-        if self.spec.mode in ('ct', 'ct+presence'):
-            return self.ct.read(start, size)[None]
-        chans = [self.presence.read(start, size), self.nx.read(start, size), self.ny.read(start, size)]
-        if self.ct is not None:
-            chans.append(self.ct.read(start, size))
-        return np.stack(chans, 0)
+        """Model-input uint8 (1, ...) native CT block in source-array coordinates."""
+        return self.ct.read(start, size)[None]
 
     def sample_image_nearest(self, points_zyx):
-        """Diagnostic intensities at trace-grid coordinates, with no extra fields."""
-        array = self.ct if self.spec.mode in ('ct', 'ct+presence') else self.presence
-        return array.sample_nearest(np.asarray(points_zyx)*self.input_scale)
-
-
-def decode_raw(raw: torch.Tensor) -> torch.Tensor:
-    """(B, 3|4, ...) uint8 -> (B, 7|8, ...) float:
-    presence, axis tensor (xx, yy, zz, xy, xz, yz), [ct]."""
-    r = raw.float()
-    pres = r[:, 0] * (1.0 / 255.0)
-    nx = (r[:, 1] - 128.0) * (1.0 / 127.0)
-    ny = (r[:, 2] - 128.0) * (1.0 / 127.0)
-    nz = torch.sqrt(torch.clamp(1.0 - nx * nx - ny * ny, min=0.0))
-    inv = torch.rsqrt(torch.clamp(nx * nx + ny * ny + nz * nz, min=1e-12))
-    nx, ny, nz = nx * inv, ny * inv, nz * inv
-    chans = [pres, nx * nx, ny * ny, nz * nz, nx * ny, nx * nz, ny * nz]
-    if r.shape[1] > 3:
-        chans.append(r[:, 3] * (1.0 / 255.0))
-    return torch.stack(chans, 1)
-
-
-class NativeCT(ChunkedArray):
-    """Support-aware local/HTTP zarr-v2 CT; only requested chunks are fetched.
-
-    A cache is bound to the URL and metadata hash, never just array dimensions.
-    Failed reads remain unsupported and are retried on a later observation.
-    """
-    def __init__(self, source, level=0, cache=None, cache_bytes=256 << 20):
-        import hashlib
-        import urllib.request
-        self.remote = str(source).startswith(('https://', 'http://'))
-        self.url = str(source).rstrip('/')+'/'+str(level)
-        if self.remote:
-            if cache is None:
-                raise ValueError('Remote native CT requires a persistent cache directory')
-            root = Path(cache)/hashlib.sha256(self.url.encode()).hexdigest()
-            root.mkdir(parents=True, exist_ok=True)
-            metadata_path = root/'.zarray'
-            if not metadata_path.exists():
-                raw = urllib.request.urlopen(self.url+'/.zarray', timeout=30).read()
-                self._publish(metadata_path, raw)
-            raw = metadata_path.read_bytes()
-        else:
-            root = Path(source)
-            if not (root/'.zarray').exists():
-                root /= str(level)
-            raw = (root/'.zarray').read_bytes()
-        self.identity = hashlib.sha256(self.url.encode()+raw).hexdigest()
-        if self.remote:
-            identity_file = root/'source.json'
-            identity = dict(source=self.url, metadata_sha256=hashlib.sha256(raw).hexdigest())
-            if identity_file.exists() and json.loads(identity_file.read_text()) != identity:
-                raise ValueError('Native CT cache source metadata changed')
-            self._publish(identity_file, json.dumps(identity).encode())
-        super().__init__(root, cache_bytes)
-        meta = json.loads(raw)
-        if self.dtype != np.dtype('uint8') or len(self.shape) != 3 or meta.get('order', 'C') != 'C' or meta.get('filters'):
-            raise ValueError('Native CT requires C-order unfiltered uint8 zarr-v2')
-        self.read_stats = dict(chunks=0, downloads=0, failed=0, pixels=0)
-
-    @staticmethod
-    def _publish(path, raw):
-        import tempfile
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as f:
-            temporary = f.name
-            f.write(raw)
-        os.replace(temporary, path)
-
-    def _load(self, key):
-        import urllib.request
-        name = self.sep.join(map(str, key))
-        path = Path(self.path)/name
-        if self.remote and not path.exists():
-            for attempt in range(3):
-                try:
-                    raw = urllib.request.urlopen(self.url+'/'+name, timeout=30).read()
-                    # Validate the entire chunk before publishing it.
-                    decoded = raw if self.codec is None else self.codec.decode(raw)
-                    if memoryview(decoded).nbytes != self._chunk_nbytes:
-                        raise ValueError('Incomplete native chunk')
-                    self._publish(path, raw)
-                    import hashlib
-                    self._publish(Path(str(path)+'.sha256'), hashlib.sha256(raw).hexdigest().encode())
-                    self._count('downloads')
-                    break
-                except (OSError, ValueError):
-                    if attempt == 2:
-                        self._count('failed')
-                        return None
-        self._count('chunks')
-        try:
-            return super()._load(key)
-        except (OSError, ValueError, RuntimeError):
-            self._count('failed')
-            return None
-
-    def _count(self, name, n=1):
-        # Planes of one observation are sampled from concurrent threads.
-        with self._lock:
-            self.read_stats[name] += n
-
-    def sample_supported(self, xyz):
-        return sample_supported(self, xyz)
-
-    def chunk(self, key):
-        value = super().chunk(key)
-        if value is None:
-            with self._lock:
-                if key in self._cache and self._cache[key] is None:
-                    self._cache.pop(key)
-                    self._cached -= 64
-        return value
-
-
-def sample_supported(reader, xyz):
-    """Thin-plane gather: load only chunks containing interpolation corners.
-
-    Pack each point's eight corners into a 2-cube and use the same scalar
-    interpolation kernel as the crop sampler. Memory is bounded by plane size.
-    Zero-weight corners do not require source support.
-    """
-    from .fast_sample import supported_corner_chunks, interpolate_supported
-    xyz = np.ascontiguousarray(xyz, np.float64).reshape(-1, 3)
-    if hasattr(reader, 'read_stats'):
-        reader._count('pixels', len(xyz))
-    shape, chunks = np.asarray(reader.shape, np.int64), np.asarray(reader.chunks, np.int64)
-    keys, group = supported_corner_chunks(xyz, shape, chunks)
-    arrays = numba.typed.List.empty_list(_CHUNK_TYPE)
-    present = np.zeros(len(keys), np.bool_)
-    for j, key in enumerate(keys):
-        try:
-            chunk = reader.chunk(tuple(key))
-        except (OSError, ValueError, RuntimeError):
-            chunk = None
-        present[j] = chunk is not None
-        arrays.append(_EMPTY_CHUNK if chunk is None else np.ascontiguousarray(chunk, np.uint8))
-    values, supported = interpolate_supported(xyz, shape, chunks, keys, group, arrays, present)
-    return values/255., supported
-
-
-_EMPTY_CHUNK = np.zeros((1, 1, 1), np.uint8)
-_CHUNK_TYPE = numba.types.Array(numba.uint8, 3, "C", readonly=True)  # memory-mapped chunks are read-only
+        """Diagnostic CT intensities at trace-grid coordinates."""
+        return self.ct.sample_nearest(np.asarray(points_zyx)*self.input_scale)

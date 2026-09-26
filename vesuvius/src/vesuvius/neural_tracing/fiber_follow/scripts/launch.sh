@@ -1,6 +1,7 @@
 #!/bin/bash
-# Launch a fiber_follow training run in the background (own process group).
-#   scripts/launch.sh NAME [train.py args...]
+# Internal helper for launch_single_path.sh, which supplies the required
+# --ct/--manifest/--fixed-bank/--benchmark options. Starts flow training in the
+# background (own process group).
 # Outputs: output/NAME/ (ckpts, images, log.jsonl), stdout in output/logs/NAME.log
 FF="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 VES="$(cd "$FF/../../../.." && pwd)"           # vesuvius/ project root

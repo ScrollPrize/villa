@@ -5,8 +5,6 @@ import argparse
 import copy
 import dataclasses
 import json
-import math
-import os
 from pathlib import Path
 import time
 
@@ -20,13 +18,12 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.flow_matching.model import ARCHITECTURE, FollowNet, FollowNetConfig, flow_targets, prepare_model, prior_mean, initial_residuals
 from vesuvius.neural_tracing.fiber_follow.shared.online import OnlineCollector
 from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
-    RunLog, lr_at, prepare_run_dir, update_ema, training_rng_state, restore_training_rng, resume_training,
+    RunLog, lr_at, prepare_run_dir, update_ema, training_rng_state, resume_training,
     read_checkpoint as _read_checkpoint, save_checkpoint as _save_checkpoint,
     raise_open_file_limit,
 )
-from vesuvius.neural_tracing.fiber_follow.shared.trace import DEFAULT_CONFIDENCE
 from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import loss_fn, candidate_prefix_labels, refinement_metrics
-from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_MAX_RECOVERY_DISTANCE, DEFAULT_N_COMMIT
+from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_N_COMMIT
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.shared.training_log import format_training_log
 

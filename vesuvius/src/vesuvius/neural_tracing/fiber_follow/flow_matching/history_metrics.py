@@ -29,12 +29,3 @@ def observed_measurements(hist, hmask, target, target_mask, tangent_points=TANGE
     angle = lambda direction: torch.rad2deg(torch.acos((direction * truth).sum(-1).clamp(-1, 1)))
     result.update(observed_tangent_error_deg=(angle(before), valid))
     return result
-
-
-def summarize_history(measurements):
-    result = {}
-    for name, (value, valid) in measurements.items():
-        count = valid.sum()
-        result[name] = (value * valid).sum().item() / max(1, count.item())
-        result[name + '_count'] = int(count.item())
-    return result

@@ -10,9 +10,10 @@ import torch
 from test_single_path import batch, config, run
 from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet, initial_residuals
 from vesuvius.neural_tracing.fiber_follow.flow_matching.sampling import trace_generator, trace_noise
+from vesuvius.neural_tracing.fiber_follow.shared.runloop import restore_training_rng
 from vesuvius.neural_tracing.fiber_follow.flow_matching.train import (
     load_checkpoint, save_checkpoint, resolve_sampler_mode, initialized_config, optimizer_update,
-    compile_training_model, training_rng_state, restore_training_rng, resume_training,
+    compile_training_model, training_rng_state, resume_training,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
@@ -164,3 +165,27 @@ def test_gaussian_compiled_training_and_explicit_noise_agree():
         loss,_,_=optimizer_update(m,ema,opt,[b],step,.001,device='cuda')
         assert np.isfinite(loss)
     assert m.flow.velocity.weight.grad.abs().sum()>0
+
+
+@pytest.mark.parametrize('sampling',[dict(sampler_mode='gaussian'),
+    dict(sampler_mode='zero',scorer='passage',gaussian_candidates=4)])
+def test_recovery_evaluation_uses_the_tracer_per_state_noise(sampling):
+    from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber
+    from vesuvius.neural_tracing.fiber_follow.shared.recovery import make_recovery_states, evaluate_recovery_states
+    m=FollowNet(config(**sampling));seen=[]
+    def forward(x,hist,hmask,*,initial_noise):
+        seen.append(initial_noise.clone())
+        points=torch.zeros(len(hist),4,3);points[...,2]=torch.arange(1,5)
+        return dict(points=points,confidence=torch.ones(len(hist),4))
+    m.forward=forward
+    arc=np.arange(300,dtype=float);fiber=TracedFiber('line',np.c_[arc*0,arc*0,arc],arc,'')
+    sample=SampleConfig(crop=CropSpec(depth=20,width=12,behind=10),n_history=8,recent_history_points=8,n_future=4)
+    states=make_recovery_states([fiber],[dict(fiber=0,t=150.,sign=1)],sample,dict(split='monitor'))
+    class Tracer:
+        def __init__(self,*args,**kwargs):pass
+        def trace(self,pos,heading,initial_states):return [np.stack((pos[0],pos[0]+[0,0,1]))],['max_len']
+        def close(self):pass
+    evaluate_recovery_states(m,None,states,[fiber],sample,batch_builder=lambda items,vol:batch(m.cfg,1),
+        tracer_class=Tracer,n_commit=1,limit=1,thresholds=(.5,),sampling_seed=7)
+    expected=trace_noise(m.cfg,[trace_generator(7,states.pos[0],states.frame[0,:,2])],'cpu')
+    torch.testing.assert_close(seen[0],expected,rtol=0,atol=0)

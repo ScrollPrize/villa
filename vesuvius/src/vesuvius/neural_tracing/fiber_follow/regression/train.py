@@ -38,7 +38,7 @@ def save_checkpoint(path, model, ema, spec, sample, extra=None):
     # Atomic publication: collectors must never open a partial checkpoint.
     path = Path(path)
     temporary = path.with_suffix('.partial.pt')
-    write_checkpoint(temporary, model, spec, sample.crop, sample.n_history, getattr(model, 'architecture', ARCHITECTURE),
+    write_checkpoint(temporary, model, spec, sample.crop, sample.n_history, ARCHITECTURE,
                      dict({'n_commit': commit_window(model.cfg, None), **(extra or {})},
                           ema=ema.state_dict(), sample_cfg=asdict(sample),
                           coarse_ct_level=1, coarse_ct_grid_scale=8.))
@@ -350,7 +350,7 @@ def main(argv=None):
         loader_args.update(prefetch_factor=2, persistent_workers=True)
     loader = torch.utils.data.DataLoader(dataset, **loader_args)
     if not resume:
-        (out/'config.json').write_text(json.dumps(dict(vars(args), architecture=getattr(model, 'architecture', ARCHITECTURE),
+        (out/'config.json').write_text(json.dumps(dict(vars(args), architecture=ARCHITECTURE,
             model_cfg=cfg.to_dict(), sample_cfg=asdict(sample), vol_spec=spec.to_dict(),
             coarse_ct_level=1, coarse_ct_grid_scale=8., data_policy=DATA_POLICY,
             monitor_recovery_sha256=recovery_hash,

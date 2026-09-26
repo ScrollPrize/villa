@@ -133,10 +133,9 @@ def test_flow_rollout_and_denoising_plot_contract_is_preserved(tmp_path):
 ])
 def test_shared_monitor_denominator_keeps_precision_fields(available, followed, cap, expected):
     row = dict(avail=available, followed=followed, coverage=followed/max(available, 1e-6),
-               avail_nb=available, coverage_nb=followed/max(available, 1e-6),
                correct=80., offtrack=20., length=100., diverged=True)
     before = dict(row)
     result = monitor_coverage(row, cap)
     assert row == before
-    assert result['coverage'] == result['coverage_nb'] == expected
+    assert result['coverage'] == expected
     assert all(result[k] == row[k] for k in ('correct', 'offtrack', 'length', 'diverged'))

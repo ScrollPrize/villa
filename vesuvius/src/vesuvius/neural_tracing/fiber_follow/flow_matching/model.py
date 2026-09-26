@@ -288,12 +288,7 @@ class FollowNet(SpatialEncoder):
         super().__init__(cfg)
         self.flow = PathFlow(cfg,cfg.widths[0])
 
-    def future_targets(self, batch):
-        """Observable annotated crossings and their token mask; see ``flow_targets``."""
-        x1, token_mask, _ = flow_targets(batch, self.cfg)
-        return x1, token_mask
-
-    def flow_loss(self, features, context, hist, hmask, batch, generator=None, fixed=None):
+    def flow_loss(self, features, context, batch, generator=None, fixed=None):
         """Stratified flow matching on observable normalized lateral residuals.
 
         Missing and crop-censored futures are excluded as attention keys and
@@ -381,7 +376,7 @@ class FollowNet(SpatialEncoder):
         features,context,fixed = self.encode_conditioning(x,hist,hmask) if encoding is None else encoding
         out = {}
         if targets is not None:
-            out.update(self.flow_loss(features,context,hist,hmask,targets,generator,fixed))
+            out.update(self.flow_loss(features,context,targets,generator,fixed))
         if training_points is None:
             y,curves = self.refine(features,context,fixed,return_steps=return_steps,initial_noise=initial_noise,generator=generator)
         else:

@@ -1,10 +1,8 @@
 from dataclasses import replace
 
 
-import copy
 
 
-import math
 
 
 import numpy as np
@@ -27,10 +25,9 @@ from vesuvius.neural_tracing.fiber_follow.flow_matching.model import (
 )
 
 
-from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import loss_fn
 
 
-from vesuvius.neural_tracing.fiber_follow.flow_matching.train import fit_flow_sigma, update_ema
+from vesuvius.neural_tracing.fiber_follow.flow_matching.train import fit_flow_sigma
 
 
 def config():
