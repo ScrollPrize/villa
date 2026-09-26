@@ -1122,7 +1122,10 @@ int main(int argc, char *argv[])
         ("num-slices,n", po::value<int>()->default_value(1), "Number of slices to render")
         ("slice-step", po::value<float>()->default_value(1.0f), "Spacing between slices along normal")
         ("accum", po::value<float>()->default_value(0.0f), "Accumulation sub-step (0 = disabled)")
-        ("accum-type", po::value<std::string>()->default_value("max"), "Reducer: max, mean, median, alpha, beerlambert")
+        ("accum-type", po::value<std::string>()->default_value("max"),
+            "Reducer: max, mean, median, alpha, beerlambert. max/mean/median only take effect with "
+            "--accum or --composite-collapse; alpha and beerlambert always collapse the band into one "
+            "composite image (see --composite-collapse).")
         ("crop-x", po::value<int>()->default_value(0), "Crop X") ("crop-y", po::value<int>()->default_value(0), "Crop Y")
         ("crop-width", po::value<int>()->default_value(0), "Crop width") ("crop-height", po::value<int>()->default_value(0), "Crop height")
         ("auto-crop", po::bool_switch()->default_value(false), "Auto-crop to valid surface bbox")
@@ -1299,6 +1302,13 @@ int main(int argc, char *argv[])
     const bool requestComposite = parsed["composite-collapse"].as<bool>();
     const bool isCompositeMode = requestComposite
         || accumType == AccumType::Alpha || accumType == AccumType::BeerLambert;
+
+    // Without a band to reduce, processRawSlices passes each raw slice through and never reads
+    // accumType, so an explicit max/mean/median here changes nothing. Say so rather than stay quiet.
+    if (accum_step <= 0 && !isCompositeMode
+        && parsed.count("accum-type") > 0 && !parsed["accum-type"].defaulted())
+        logPrintf(stderr, "Warning: --accum-type %s has no effect without --accum or --composite-collapse\n",
+                  accum_type_str.c_str());
     int compositeStart = 0, compositeEnd = num_slices - 1;
 
     CompositeParams compositeParams;
