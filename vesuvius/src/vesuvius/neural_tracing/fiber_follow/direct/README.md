@@ -147,8 +147,8 @@ hold memory maps, so the budget bounds live mappings rather than private memory.
 Every 1,000 updates an idle background collector uses EMA weights and the direct
 observation builder to collect up to 64 training seeds, with bounded exploration
 after the gate closes. It publishes standard v5 replay for the live workers. Set
-`--dagger-every 0` to disable it. Monitor diagnostics run at thresholds 0.5 and
-0.85, with a 400-voxel cap by default, matching the flow trainer;
+`--dagger-every 0` to disable it. Monitor diagnostics run at threshold 0.5,
+with a 400-voxel cap by default;
 set `--diag-every 0` to disable them.
 Monitor traces do not select the final checkpoint.
 
@@ -160,7 +160,7 @@ Every `--diag-every` updates (default 1,000), EMA diagnostics also write:
   showing longer history context.
 - `images/correction_STEP.png`: initial, intermediate and final proposals against
   GT (one proposal when correction is disabled).
-- `images/rollout_STEP_c0.5.png` and `images/rollout_STEP_c0.85.png`: the evaluated
+- `images/rollout_STEP_c0.5.png`: the evaluated
   monitor traces straightened along their GT fibers, with stop reasons.
 - `curves.png`: geometry loss, confidence loss, dense coordinate error and
   monitor coverage/precision/divergence over training.
@@ -202,7 +202,7 @@ config/checkpoints and checked on resume. A private RNG constructs them, and
 fresh/resumed evaluation uses identical float32 geometry. Calibration and final
 fibers are excluded. These synthetic fixtures contain no confirmed departures;
 departure rejection is measured on training/replay states and rollout audits.
-Diagnostics trace up to `--recovery-length` (default 32) at thresholds 0.5/0.85,
+Diagnostics trace up to `--recovery-length` (default 32) at threshold 0.5,
 report endpoint recovery against the original fiber, and save full rows under
 `recovery/monitor_STEP.json`. Endpoint recovery alone does not certify the whole
 rollout. Set `--recovery-every 0` to disable this study independently of ordinary
@@ -385,3 +385,142 @@ The model remains a small deterministic predictor: regression can still average
 ambiguous continuations, and a confidence head can share the predictor's blind
 spots. Further refinement or multiple hypotheses should be motivated by measured
 failures.
+
+## Native CT sequence judge
+
+`ct_slice_judge_v1` adds an independent encoder/decoder trained in the same job.
+It samples three native 129 × 129 CT planes every four observed trace voxels,
+keeps immutable seed views, and predicts intact-prefix logits. The loss is a
+sequence-normalized masked BCE with weight 0.5. Judge inputs never include
+forecast coordinates or annotation identity. The CNN uses the architecture in
+[CT_SLICE_JUDGE_PLAN.md](CT_SLICE_JUDGE_PLAN.md): widths 16/32/64, native center
+features, 64 neighborhood and 25 center tokens per view, and two query-attention
+blocks. The benchmark's faster alternative encoders are not substituted.
+
+`--compile` (enabled by default on CUDA) compiles both follower and judge training.
+For the judge, the bounded CNN view batches and sequence decoder are compiled
+separately with dynamic shapes, so changing history length does not unroll a new
+whole-sequence CNN loop. EMA, diagnostics, collection and inference remain eager;
+checkpoint keys and optimizer parameters are unchanged. `--no-compile` disables
+compilation for both branches. The first training calls incur compilation cost.
+
+Start a new joint run using saved follower EMA weights:
+
+```bash
+bash scripts/launch_direct.sh direct_ct_judge_run1 \
+  --init-tracer output/direct_corrected_run1/ckpt_009000.pt \
+  --judge \
+  --judge-pixels 129 \
+  --judge-path-step 4 --judge-history-length 128 --judge-loss-weight 0.5
+```
+
+The judge defaults to the follower `--ct` store at level 0. The launcher uses
+`/mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr/0`, with four
+base-grid voxels per CT voxel. Pixel spacing defaults to one source voxel:
+0.5 trace voxels per pixel and a 64 × 64 trace-voxel field of view for the default
+129 pixels.
+Finer pixel spacing is rejected: CT is never upsampled. Oriented planes still
+use trilinear interpolation at the source voxel pitch. No downloads or download
+cache are needed for this local store.
+`--judge-ct`, `--judge-ct-level`, `--judge-ct-grid-scale`, and
+`--judge-ct-origin X Y Z` explicitly configure aligned source coordinates.
+Origin is in base-grid xyz; source coordinates are `(trace_xyz*8-origin)/scale`.
+A different source or level requires an explicit `--judge-ct-grid-scale`.
+Explicit HTTP sources require `--judge-ct-cache`; local arrays work without it.
+The reader fetches interpolation corners only, distinguishes unavailable chunks
+from valid black CT, bounds its decoded cache, and atomically publishes validated
+chunks into a source-specific cache. No volume-wide download is performed.
+
+Resume with `--resume RUN/last.pt` and the original joint options; omit
+`--init-tracer`. Checkpoints include both models/EMAs, optimizer/RNG state,
+sampling/architecture versions, source metadata identity, and initialization hash.
+As with the existing trainer, loader streams restart on resume; optimizer/RNG
+restoration does not promise an identical uninterrupted data sequence.
+
+Collector replay now includes immutable `.paths.<hash>.npz` sidecars with a whole
+visited path, regular sample geometry, event onset/confirmation/censoring, and
+policy audit revisions. Replay rows reference cutoffs rather than copying paths.
+Old replay retains follower supervision and supplies no invented judge labels.
+Joint collectors can explore a bounded suffix after an alarm; exported inference
+paths always stop at the accepted boundary. Fresh and replay targets use the
+shared `events.py` contract, independently of legacy `offtrack` labels. Synthetic
+extras construct real paths near contacts, reject likely duplicate annotations,
+and include matched valid contact paths; unsuccessful construction is logged.
+
+Enforcement is off unless explicitly requested or supplied by a qualifying locked
+selection. Development inference uses `--judge` (accept 0.9, alarm 0.5). The policy
+keeps an eight-voxel provisional delay, stops if the unaccepted tail exceeds 32,
+and audits every exit, including partial final commits. Alarms can retract an
+earlier accepted interval. Missing support or a missing overlap cannot certify
+new geometry. Short unsupported starts export only the seed. Exported traces
+have `.judge.json` audit sidecars; distances remain in trace-grid units.
+
+```bash
+python scripts/evaluate_direct.py calibrate --judge \
+  --manifest output/single_path_v11_preparation/seeds.json \
+  --out output/direct_ct_judge_run1/calibration \
+  --checkpoints output/direct_ct_judge_run1/ckpt_*.pt
+python scripts/evaluate_direct.py final \
+  --manifest output/single_path_v11_preparation/seeds.json \
+  --out output/direct_ct_judge_run1/final \
+  --selection output/direct_ct_judge_run1/calibration/selection.json
+python -m vesuvius.neural_tracing.fiber_follow.direct.infer \
+  --checkpoint output/direct_ct_judge_run1/last.pt --judge \
+  --seed 18529.9,13044.9,51234.1 --out output/judged_traces
+```
+
+Calibration freezes the checkpoint list and threshold grid in `protocol.json`
+before rollouts. Each enabled result is paired with its exact forecast-only
+threshold and checked for path-prefix agreement. Correct/wrong/unknown lengths
+come from the complete baseline event partition, even when retraction removes
+the confirmation suffix. Selection implements the plan's budgets, deterministic
+ties, 2,000 paired fiber-bootstrap intervals and zero-event exposure diagnostic.
+A failed calibration writes `failed_calibration.json` and leaves forecast-only
+defaults. A locked selection must travel with its `protocol.json`; inference
+accepts it via `--selection`, with `--judge` required for opt-in policies.
+`--forecast-only` retains the selected follower threshold without opening judge CT.
+
+Monitor diagnostics include exact slice inputs, labels/masks, supported real
+rollouts, event misses and detection latency, retained/discarded lengths, and
+legacy geometry metrics. A calibration result is evidence about the trained
+checkpoint; implementing the sweep does not establish detection accuracy.
+
+Bounded validation with the existing environment (no downloads):
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 NUMBA_CACHE_DIR=/tmp/ct-judge-numba \
+MPLCONFIGDIR=/tmp/ct-judge-mpl PYTHONPATH=../../.. \
+/home/sean/Documents/villa/vesuvius/.venv/bin/python -m pytest \
+  tests -q -o cache_dir=/tmp/ct-judge-pytest
+
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+NUMBA_CACHE_DIR=/tmp/ct-judge-numba MPLCONFIGDIR=/tmp/ct-judge-mpl PYTHONPATH=../../.. \
+/home/sean/Documents/villa/vesuvius/.venv/bin/python scripts/smoke_ct_judge.py \
+  --out /tmp/ct-judge-joint-smoke
+```
+
+The smoke uses the follower's local level-0 CT at native voxel pitch and the
+preview's actual annotated path. It performs two full-architecture joint updates, exact EMA
+reload and optimizer/RNG resume, and writes a report plus input panel. It is not
+a detection benchmark or calibrated production policy. The store-decoding test
+requires local multiprocessing sockets, which restricted sandboxes may block.
+
+Implementation validation on 2026-09-25: 155 CPU tests passed with six CUDA-only
+skips; the separate store-decoding regression also passed with local socket
+access. The production preview matched the original centers, frames, markers
+and support exactly; normalized CT differed by at most `5.96e-8`.
+Two real-CT joint updates with EMA/reload/resume passed. On the nine-position
+historical public-source CPU smoke (before the local-source correction), sampling took 5.48 seconds with an empty decoded LRU and
+5.34 seconds with a warm decoded LRU; encoding 27 views took about 0.16 seconds.
+Reusing the same acquired views/features encoded zero views and took 0.004 seconds
+including the decoder. These are single-run diagnostics, not a throughput claim:
+the OS page cache was not flushed, and no GPU or remote-download latency was
+measured. The raw input occupied 21,399,876 bytes and cached tokens 1,230,336 bytes.
+Native gathering, rather than decoder compute, dominated this CPU example.
+
+After the local-source correction, the CPU suite passed 157 tests with six CUDA
+skips. The local level-0 preview produced 27 fully supported views from 37 chunks,
+with exactly one CT voxel per pixel, 0.5-trace-voxel spacing and a 128-voxel field
+of view. The two-update joint/EMA/resume smoke passed against that same local
+source with zero downloads. The sampler rejects finer-than-source pixel spacing.

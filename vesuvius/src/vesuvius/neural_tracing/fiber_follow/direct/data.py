@@ -60,10 +60,71 @@ class ObservationBuilder:
 
 
 class DirectTracer(ModelTracer):
-    def __init__(self, model, *args, **kwargs):
+    def __init__(self, model, *args, judge=None, judge_slices=None, judge_policy=None, judge_explore_calls=0, **kwargs):
         super().__init__(model, *args, **kwargs)
         self.additional_crops = (model.cfg.coarse,)
         self.observations = ObservationBuilder(model.cfg)
+        self.judge, self.judge_slices, self.judge_policy = judge, judge_slices, judge_policy
+        self.judge_reader = None
+        self.judge_explore_calls = judge_explore_calls
+
+    def begin_observed(self, frames):
+        if self.judge is None:
+            return super().begin_observed(frames)
+        from .judge_slices import SliceStream
+        from .judge_policy import JudgePolicy
+        from .judge_model import FeatureCache
+        if self.judge_reader is None:
+            self.judge_reader = self.judge_slices.open()
+        self.judge.eval()
+        return [dict(stream=SliceStream(self.judge_reader, self.judge_slices, f),
+                     policy=JudgePolicy(self.judge_policy, path_step=self.judge_slices.path_step), cache=FeatureCache()) for f in frames]
+
+    def inspect_observed(self, state, path, final=False):
+        if state is None:
+            return None
+        from .judge_model import sequence_tensors
+        import time
+        began = time.perf_counter()
+        policy = state['policy']
+        if policy.alarm is not None:
+            if not final and state.get('explored', 0) < self.judge_explore_calls:
+                state['explored'] = state.get('explored', 0)+1
+                return None
+            return policy.reason
+        records = state['stream'].update(path, policy.accepted)
+        sampled = time.perf_counter()
+        batch = sequence_tensors(records, self.device, policy.anchor(records) or 0.)
+        with torch.no_grad():
+            encoded_before = state['cache'].encoded_views
+            tokens = state['cache'].tokens(self.judge, records, self.device)
+            if self.device.startswith('cuda'):
+                torch.cuda.synchronize()
+            encoded = time.perf_counter()
+            logits = self.judge.decode(tokens, batch['metadata'], batch['valid'], batch['queries'])
+            scores = logits.sigmoid()[0].cpu().numpy()
+        state['records'] = records
+        result = policy.decide(records, scores, final)
+        state.setdefault('timings', []).append(dict(sample_seconds=sampled-began, encode_seconds=encoded-sampled,
+                    decoder_seconds=time.perf_counter()-encoded, total_seconds=time.perf_counter()-began,
+                    encoded_views=state['cache'].encoded_views-encoded_before,
+                    cached_token_bytes=sum(v.numel()*v.element_size() for v in state['cache'].entries.values())))
+        if result and self.judge_explore_calls and not final and state.get('explored', 0) < self.judge_explore_calls:
+            state['explored'] = state.get('explored', 0)+1
+            return None
+        return result
+
+    def export_observed(self, state, path, reason):
+        if state is not None:
+            state['observed_path'] = path.copy()
+        return super().export_observed(state, path, reason) if state is None else state['policy'].export(path, reason)
+
+    def observed_decision(self, state):
+        if state is None:
+            return {}
+        return dict(judge_revision=len(state['policy'].audit)-1,
+                    judge_accepted=state['policy'].accepted,
+                    judge_alarm=state['policy'].alarm is not None)
 
     def build_inputs(self, pos, frames, hist, hmask):
         items = [dict(pos=p, frame=f) for p, f in zip(pos, frames)]

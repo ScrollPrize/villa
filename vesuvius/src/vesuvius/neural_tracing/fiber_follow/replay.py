@@ -85,6 +85,7 @@ def import_states(paths, fibers, cfg, band, volume, *, limit=20000, seed=0):
     provenance = dict(import_sources=sources,selection_seed=seed,counts=counts,
                       crop=asdict(cfg.crop),volume=volume.to_dict(),format='geometry_only',step=-1)
     result = OnPolicyStates(manifest=manifest,provenance=provenance,
-                            **{k:np.asarray([r[k] for r in rows]) for k in OnPolicyStates.FIELDS+tuple(OnPolicyStates.OPTIONAL)})
+                                **{k:np.asarray([r[k] for r in rows]) for k in OnPolicyStates.FIELDS},
+                                **{k:np.asarray([r[k] for r in rows]) for k in OnPolicyStates.OPTIONAL if k in rows[0]})
     result.validate_fibers(fibers)
     return result

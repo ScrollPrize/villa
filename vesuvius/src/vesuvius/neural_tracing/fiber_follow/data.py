@@ -491,6 +491,16 @@ class FollowDataset(torch.utils.data.IterableDataset):
                                        reverse=bool(op.reverse[j]), offtrack=bool(op.offtrack[j]))
                     item['source'],item['stratum'] = source,band
                     item['source_step'] = op.provenance.get('step', -1) or -1
+                    if self.batch_builder is not None and hasattr(self.batch_builder, 'slices') and op.judge_trace[j] >= 0:
+                        from .direct.judge_archive import PathArchive
+                        if not hasattr(op, '_judge_archive'):
+                            import hashlib
+                            from pathlib import Path
+                            if hashlib.sha256(Path(op.provenance['judge_archive']).read_bytes()).hexdigest() != op.provenance['judge_archive_sha256']:
+                                raise ValueError('Replay judge path archive changed')
+                            op._judge_archive = PathArchive(op.provenance['judge_archive'])
+                        item['judge_context'] = op._judge_archive.context(int(op.judge_trace[j]), float(op.judge_cutoff[j]),
+                                                                         self.fibers[op.fiber_idx[j]], int(op.judge_revision[j]))
                     if not self.state_allowed(item):
                         item = None
                 if item is None:
@@ -509,6 +519,9 @@ class FollowDataset(torch.utils.data.IterableDataset):
                         original_t = np.clip(center+rng.uniform(-self.window/2, self.window/2), 0, f.length)
                         t = f.length-original_t if rev else original_t
                     item = make_sample(f, t, rev, cfg, rng)
+                    if self.batch_builder is not None and hasattr(self.batch_builder, 'slices'):
+                        from .direct.judge_supervision import fresh_context
+                        item['judge_context'] = fresh_context(item, f, t, rev)
                     item['source'], item['source_step'], item['stratum'] = 0, -1, -1
                 if self.state_allowed(item):
                     items.append(item)
@@ -691,7 +704,12 @@ class OnPolicyStates:
               "hard", "exploratory")
     # Fields later collectors add; caches without them load with the default.
     # drift: current-position error in trace-grid voxels (NaN when departed or unknown).
+    # Arc positions compared against float64 trace geometry keep full precision.
+    FLOAT64_FIELDS = ("t", "judge_cutoff")
     OPTIONAL = {"drift": lambda n: np.full(n, np.nan, np.float32),
+                "judge_revision": lambda n: np.full(n, -1, np.int64),
+                "judge_trace": lambda n: np.full(n, -1, np.int64),
+                "judge_cutoff": lambda n: np.full(n, np.nan, np.float64),
                 "source_cache": lambda n: np.full(n, -1, np.int32),
                 "source_row": lambda n: np.full(n, -1, np.int64)}
 
@@ -739,6 +757,8 @@ class OnPolicyStates:
                 # Include archive identity so an overwritten NPZ cannot reuse stale mmap arrays.
                 stat = os.stat(path)
                 metadata["archive"] = [stat.st_size, stat.st_mtime_ns]
+                # Recorded so mirrors written with other precisions are rebuilt.
+                metadata["float64_fields"] = list(cls.FLOAT64_FIELDS)
                 existing = None
                 if os.path.exists(metadata_path):
                     with open(metadata_path) as fh:
@@ -748,7 +768,7 @@ class OnPolicyStates:
                     os.makedirs(d, exist_ok=True)
                     for k in cls.FIELDS + tuple(cls.OPTIONAL):
                         v = z[k] if k in z.files else cls.OPTIONAL[k](len(z["pos"]))
-                        if k != "t" and v.dtype == np.float64:
+                        if k not in cls.FLOAT64_FIELDS and v.dtype == np.float64:
                             v = v.astype(np.float32)
                         np.save(os.path.join(d, k + ".npy"), v)
                     with open(metadata_path, "w") as fh:

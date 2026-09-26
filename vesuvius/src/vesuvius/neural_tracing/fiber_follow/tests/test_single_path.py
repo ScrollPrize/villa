@@ -314,6 +314,9 @@ def test_end_to_end_trace_collection_and_state_roundtrip(tmp_path,monkeypatch):
     bank=D.OnPolicyStates(manifest=D.fiber_manifest([f]),**{k:np.asarray([r[k] for r in rows]) for k in D.OnPolicyStates.FIELDS+tuple(D.OnPolicyStates.OPTIONAL)})
     path=tmp_path/'collected.npz';bank.save(path);loaded=D.OnPolicyStates.load(path);loaded.validate_fibers([f])
     assert len(loaded)==len(rows)
+    # Judge cutoffs are compared with float64 audit endpoints; float32 would round some down.
+    bank.judge_cutoff=np.full(len(rows),8.21379008057726);bank.save(path)
+    assert D.OnPolicyStates.load(path).judge_cutoff.tolist()==bank.judge_cutoff.tolist()
 
 
 def test_synthetic_parallel_fibers_learn_identity_recovery():

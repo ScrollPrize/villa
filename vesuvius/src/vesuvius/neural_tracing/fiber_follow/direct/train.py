@@ -62,6 +62,21 @@ def match_optimizer_layout(opt):
                 state[key] = torch.empty_like(param).copy_(value)
 
 
+def compile_training_judge(judge):
+    """Compile CNN batches and sequence decoding after EMA copy/resume.
+
+    Leave the view-batch loop outside the graph: growing histories change its
+    iteration count. Dynamic shapes cover the final batch and query count.
+    Bound methods share the original parameters and preserve checkpoint keys.
+    """
+    import torch._functorch.config
+    # optimizer_update performs backward outside its forward autocast context.
+    torch._functorch.config.backward_pass_autocast = 'off'
+    for name in ('encode_views', 'decode'):
+        setattr(judge, name, torch.compile(getattr(judge, name), dynamic=True))
+    return judge
+
+
 def load_checkpoint(path, device='cuda'):
     ck = read_checkpoint(path, ARCHITECTURE, device)
     # Historical checkpoints retain their exact one-pass/one-correction model,
@@ -89,12 +104,13 @@ def raise_open_file_limit():
 
 def move_batch(batch, device):
     # Pinned loader batches copy asynchronously; the compute stream orders later use.
-    return {k: move_batch(v, device) if isinstance(v, dict) else v.to(device, non_blocking=True)
+    return {k: move_batch(v, device) if isinstance(v, dict) else [move_batch(s, device) for s in v] if isinstance(v, list) else v.to(device, non_blocking=True)
             for k, v in batch.items()}
 
 
 @torch.no_grad()
-def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device):
+def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log, *, device,
+                         judge=None, judge_slices=None, judge_policy=None):
     """Plot EMA proposals and the same monitor rollouts used for logged metrics."""
     from vesuvius.neural_tracing.fiber_follow.diag import plot_batch, plot_curves, plot_refinement, plot_rollouts
     from vesuvius.neural_tracing.fiber_follow.evaluate import evaluate
@@ -104,7 +120,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
     images.mkdir(exist_ok=True)
     # Bound image size even when training with larger microbatches.
     def take(value):
-        return {k: take(v) for k, v in value.items()} if isinstance(value, dict) else value[:6]
+        return {k: take(v) for k, v in value.items() if k != 'judge'} if isinstance(value, dict) else value[:6]
     batch = move_batch(take(cpu_batch), device)
     was_training = model.training
     threshold_before = tracer.p.confidence
@@ -127,7 +143,7 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
                         images/f'correction_{step:06d}.png',
                         labels=labels,
                         target=target, target_mask=batch['plane_mask'])
-        for threshold in (.5, .85):
+        for threshold in (.5,):
             if not seeds:
                 break
             tracer.p.confidence = threshold
@@ -140,6 +156,27 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
                           images/f'rollout_{step:06d}_c{threshold}.png', tracer.p.max_len, rows=rows)
             log.record(dict(step=step, split='monitor', threshold=threshold,
                             coverage_max_len=tracer.p.max_len, **rollout_summary(rows)))
+            if judge is not None:
+                from .judge_evaluation import paired_monitor
+                from .judge_model import sequence_tensors
+                from .diagnostics import plot_judge_sequence, plot_judge_path
+                judged = DirectTracer(model, tracer.vol, tracer.crop, tracer.n_history, tracer.p,
+                                      device=device, judge=judge, judge_slices=judge_slices, judge_policy=judge_policy)
+                try:
+                    report, audits = paired_monitor(judged, fibers, seeds, paths)
+                    log.record(dict(step=step, split='monitor', threshold=threshold, judge=report['metrics']))
+                    (images/f'judge_rollouts_{step:06d}_c{threshold}.json').write_text(json.dumps(report, default=lambda x: x.item() if isinstance(x,np.generic) else x.tolist()))
+                    for index, state in enumerate(audits[:3]):
+                        sequence = sequence_tensors(state['records'], device)
+                        logits = judge(**sequence)
+                        target, known = state['events'].labels([r['arc'] for r in state['records']])
+                        sequence.update(target=torch.as_tensor(target)[None], known=torch.as_tensor(known)[None])
+                        plot_judge_sequence(sequence, logits, images/f'judge_rollout_{step:06d}_c{threshold}_{index}.png',
+                                            audit=state['policy'].audit[-1])
+                        plot_judge_path(state['observed_path'], state['policy'].accepted, state['events'],
+                                        images/f'judge_path_{step:06d}_c{threshold}_{index}.png')
+                finally:
+                    judged.close()
         plot_curves(Path(out)/'log.jsonl', Path(out)/'curves.png', loss_key='geometry')
     finally:
         model.train(was_training)
@@ -147,7 +184,8 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
 
 
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
-                     confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True):
+                     confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True,
+                     judge=None, judge_ema=None, judge_weight=.5):
     """Equal weight per observed state, independent of microbatch boundaries.
 
     Within a state each loss averages over its known points; fully unknown
@@ -163,6 +201,13 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 correct_count=0., confidence_count=0.)
     sources = np.zeros(3, dtype=np.int64)
     decisions = []
+    judge_total = sum(len(b.get('judge', [])) for b in batches)
+    sums.update(judge_loss=0., judge_sequences=judge_total, judge_positive=0, judge_departed=0, judge_unknown=0)
+    judge_sources = np.zeros(5, dtype=int)
+    allocation = sum((b.get('judge_allocation', torch.zeros(3)).numpy() for b in batches), np.zeros(3))
+    sums['judge_synthetic_attempts'], sums['judge_synthetic_fallback'] = map(int, allocation[1:])
+    if judge is not None:
+        judge.train()
     model.train()
     for cpu in batches:
         batch = move_batch(cpu, device)
@@ -175,6 +220,19 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         if not torch.isfinite(loss):
             raise FloatingPointError(f'Nonfinite loss at step {step}')
         loss.backward()
+        if judge is not None:
+            from .judge_supervision import masked_bce
+            for sequence in batch.get('judge', []):
+                judge_sources[int(sequence.get('source', torch.tensor([0]))[0])] += 1
+                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
+                    logits = judge(**{k: sequence[k] for k in ('images', 'metadata', 'valid', 'queries')})
+                    jl = masked_bce(logits, sequence['target'], sequence['known'], sequence['eligible']).sum()/max(1, judge_total)
+                (judge_weight*jl).backward()
+                sums['judge_loss'] += jl.detach().item()
+                mask = sequence['known'] & sequence['eligible']
+                sums['judge_positive'] += int((mask & (sequence['target'] > .5)).sum())
+                sums['judge_departed'] += int((mask & (sequence['target'] <= .5)).sum())
+                sums['judge_unknown'] += int((~mask).sum())
         if compute_metrics:
             decisions.extend(decision_rows(output, batch, model.cfg, n_commit, tolerance))
         for key, value in (('loss', loss), ('geometry', geometry), ('confidence_loss', confidence)):
@@ -185,8 +243,15 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             for source in range(3):
                 sources[source] += int((cpu['source'] == source).sum())
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
+    if judge is not None:
+        torch.nn.utils.clip_grad_norm_(judge.parameters(), 1., error_if_nonfinite=True)
     opt.step()
     update_ema(ema, model, step, ema_decay)
+    if judge is not None:
+        update_ema(judge_ema, judge, step, ema_decay)
+        sums['loss'] += judge_weight*sums['judge_loss']
+        sums['judge_source_fractions'] = dict(zip(('fresh','fixed','recent','synthetic_switch','matched_contact'),
+                                                  (judge_sources/max(1,judge_total)).tolist()))
     sums.update(error_mean=sums['error_sum']/max(1., sums['geometry_count']),
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']),
                 fresh_fraction=float(sources[0]/total), fixed_fraction=float(sources[1]/total),
@@ -229,7 +294,7 @@ def build_parser():
     ap.add_argument('--short-history-prob', type=float, default=.4,
                     help='Given history is present, probability of a balanced 1-8/9-32 point startup history')
     ap.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True,
-                    help='torch.compile the training forward on CUDA (EMA, diagnostics and collection stay eager)')
+                    help='Compile follower and judge training on CUDA (EMA, diagnostics and collection stay eager)')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--val-z', type=float, nargs=2, default=(45000., 48500.))
     ap.add_argument('--log-every', type=int, default=50)
@@ -245,11 +310,24 @@ def build_parser():
     ap.add_argument('--dagger-trace-len', type=float, default=6000.)
     ap.add_argument('--replay-keep', type=int, default=4)
     ap.add_argument('--resume', help='Resume last.pt inside this run with the same training options')
+    ap.add_argument('--init-tracer', help='Initialize a new run from saved EMA follower weights')
+    from .judge_options import add_judge_options
+    add_judge_options(ap)
     return ap
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    launch_started = time.monotonic()
+
+    def progress(message):
+        print(f'[{args.name} +{time.monotonic()-launch_started:.1f}s] {message}', flush=True)
+
+    progress(f'Starting training: device={args.device}, workers={args.workers}, judge={args.judge}')
+    if args.resume and args.init_tracer:
+        raise ValueError('--init-tracer starts a new run and cannot be combined with --resume')
+    if min(args.judge_loss_weight, args.judge_synthetic_fraction) < 0:
+        raise ValueError('Judge allocations and loss weight must be nonnegative')
     if min(args.steps, args.batch, args.microbatch, args.log_every, args.ckpt_every,
            args.threads, args.replay_keep, args.dagger_seeds, args.recovery_seeds) < 1 or args.batch % args.microbatch:
         raise ValueError('Positive counts required; microbatch must divide effective batch')
@@ -271,6 +349,15 @@ def main(argv=None):
     cfg = DirectConfig(channels=args.channels, layers=args.decoder_layers,
                        correction=args.correction, correction_limit=args.correction_limit,
                        correction_steps=args.correction_steps)
+    initialized = None
+    if args.init_tracer:
+        progress(f'Loading follower weights from {args.init_tracer}')
+        initialized, _, _, _, _ = load_checkpoint(args.init_tracer, args.device)
+        cfg = initialized.cfg
+    if args.resume:
+        progress(f'Loading resume checkpoint from {args.resume}')
+        resume_config = read_checkpoint(args.resume, ARCHITECTURE, args.device)
+        cfg = DirectConfig(**resume_config['model_cfg'])
     if not 1 <= args.n_commit <= cfg.n_future:
         raise ValueError('Commit window must fit forecast')
     # Native fine imagery, independently read coarse level-1 imagery.
@@ -278,19 +365,23 @@ def main(argv=None):
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future,
                           future_step=cfg.future_step, recent_history_points=cfg.n_history,
                           no_history_prob=args.no_history_prob, short_history_prob=args.short_history_prob)
+    progress('Loading manifest and fiber annotations')
     manifest = read_manifest(args.manifest)
     validate_volume_source(spec, manifest)
     fibers = load_fibers(args.fibers, grid_scale=spec.grid_scale)
     band = ZBand(*(v/spec.grid_scale for v in args.val_z))
     train_f, val_f = split_fibers(fibers, band)
+    progress(f'Loaded {len(train_f)} training fibers and {len(val_f)} validation fibers')
     if fiber_manifest(val_f) != manifest['fibers']:
         raise ValueError('Frozen validation geometry differs from dataset/holdout')
     resume = read_checkpoint(args.resume, ARCHITECTURE, args.device) if args.resume else None
     if resume:
         # The run directory may move; the checkpoint must still sit inside the named run.
         ignored = {'resume', 'out_root', 'device', 'batch', 'microbatch', 'workers', 'threads', 'worker_cache_gb',
-                   'log_every', 'ckpt_every', 'diag_every', 'dagger_device', 'compile'}
+                   'log_every', 'ckpt_every', 'diag_every', 'dagger_device', 'compile', 'init_tracer'}
         for key, value in vars(args).items():
+            if key.startswith('judge') and key not in resume['training_options'] and not args.judge:
+                continue
             if key not in ignored and resume['training_options'].get(key) != value:
                 raise ValueError(f'Resume option differs: {key}')
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
@@ -300,33 +391,61 @@ def main(argv=None):
         raise ValueError('Resume checkpoint must be inside the named run')
     recovery_states = recovery_hash = None
     if args.recovery_every:
+        progress('Preparing monitor recovery fixture')
         if resume and not (out/'monitor_recovery.npz').exists():
             raise ValueError('Resume requires the original monitor recovery fixture')
         recovery_states, recovery_hash = monitor_fixture(out/'monitor_recovery.npz', val_f, manifest,
                                                          sample, spec, args.recovery_seeds)
         if resume and resume.get('monitor_recovery_sha256') != recovery_hash:
             raise ValueError('Monitor recovery fixture changed since checkpoint')
-    model = DirectFollower(cfg).to(args.device, memory_format=conv_memory_format(args.device))
+    progress('Initializing models and optimizer')
+    model = initialized if initialized is not None else DirectFollower(cfg).to(args.device, memory_format=conv_memory_format(args.device))
     ema = copy.deepcopy(model).requires_grad_(False).eval()
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    judge = judge_ema = slices = policy = None
+    if args.judge:
+        from .judge_options import configs
+        from .judge_model import CTJudge
+        slices, judge_cfg, policy = configs(args, spec)
+        progress(f'Opening judge CT: {slices.source}, level={slices.level}, pixel spacing={slices.spacing:g}')
+        judge_source = slices.open().identity
+        if resume and resume.get('judge_source_sha256') != judge_source:
+            raise ValueError('Resume native CT source metadata changed')
+        judge = CTJudge(judge_cfg).to(args.device)
+        judge_ema = copy.deepcopy(judge).requires_grad_(False).eval()
+        if resume:
+            judge.load_state_dict(resume['judge'])
+            judge_ema.load_state_dict(resume['judge_ema'])
+    groups = [dict(params=model.parameters())]
+    if judge is not None:
+        groups.append(dict(params=judge.parameters()))
+    opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=1e-4)
     done = resume_training(resume, model, ema, opt)[0] if resume else 0
     match_optimizer_layout(opt)
     # The compiled wrapper shares the module's parameters, so EMA updates, gradient
     # clipping and checkpoints keep using ``model``; only the training forward is compiled.
     trainable = torch.compile(model) if args.compile and torch.device(args.device).type == 'cuda' else model
+    if judge is not None and args.compile and torch.device(args.device).type == 'cuda':
+        compile_training_judge(judge)
+    if args.compile and torch.device(args.device).type == 'cuda':
+        progress('Compilation enabled; first forward/backward passes will compile lazily and may take several minutes')
     if done >= args.steps:
         raise ValueError('Run has already reached its requested update count')
     replay_index = out/'dagger'/'replay.json'
     replay_paths = json.loads(replay_index.read_text()) if resume and replay_index.exists() else args.onpolicy
+    progress('Loading replay banks and preparing data loader')
     caches = [OnPolicyStates.load(p) for p in replay_paths]
     fixed = [OnPolicyStates.load(args.fixed_bank)] if args.fixed_bank else []
     collector = OnlineCollector(out/'dagger', args.fibers, args.val_z, args.dagger_device or args.device,
         every=args.dagger_every, max_seeds=args.dagger_seeds, seed=args.seed, replay_keep=args.replay_keep,
         initial=[c._dir for c in caches], trace_len=args.dagger_trace_len, n_commit=args.n_commit,
         collector_module='vesuvius.neural_tracing.fiber_follow.direct.collect')
+    builder = ObservationBuilder(cfg)
+    if args.judge:
+        from .judge_supervision import JointObservationBuilder
+        builder = JointObservationBuilder(builder, slices, band, args.judge_synthetic_fraction, train_f)
     dataset = FollowDataset(train_f, spec, sample, band, chunk=args.microbatch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), fixed=fixed, onpolicy=caches,
-        replay_index=str(collector.index), batch_builder=ObservationBuilder(cfg), additional_crops=(cfg.coarse,))
+        replay_index=str(collector.index), batch_builder=builder, additional_crops=(cfg.coarse,))
     loader_args = dict(batch_size=None, num_workers=args.workers,
                        pin_memory=torch.device(args.device).type == 'cuda')
     if args.workers:
@@ -348,16 +467,34 @@ def main(argv=None):
             from vesuvius.neural_tracing.fiber_follow.trace import TraceParams
             tracer = DirectTracer(ema, FiberVolume(spec), cfg.fine, cfg.n_history,
                 TraceParams(n_commit=args.n_commit, max_len=args.diag_max_len), device=args.device)
+        progress(f'Starting data loader; waiting for {args.batch//args.microbatch} microbatches for update {done+1}')
         iterator = iter(loader)
         for step in range(done+1, args.steps+1):
             event = collector.poll()
             if event:
                 log.record(dict(step=step, **event))
-            batches = [next(iterator) for _ in range(args.batch//args.microbatch)]
+            early = step <= done+5
+            batch_started = time.monotonic()
+            if early and step != done+1:
+                progress(f'Update {step}: waiting for data')
+            batches = []
+            for index in range(args.batch//args.microbatch):
+                batches.append(next(iterator))
+                if step == done+1:
+                    progress(f'Update {step}: received microbatch {index+1}/{args.batch//args.microbatch}')
+            data_seconds = time.monotonic()-batch_started
+            update_started = time.monotonic()
+            if early:
+                progress(f'Update {step}: data ready in {data_seconds:.1f}s; running forward/backward and optimizer')
             lr = lr_at(step, args.lr, args.warmup, args.steps)
             metrics = optimizer_update(trainable, ema, opt, batches, step, lr, device=args.device,
                 tolerance=args.tolerance, confidence_weight=args.confidence_weight, ema_decay=args.ema_decay,
+                judge=judge, judge_ema=judge_ema, judge_weight=args.judge_loss_weight,
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps)
+            if early:
+                progress(f'Update {step} complete in {time.monotonic()-update_started:.1f}s; loss={metrics["loss"]:.5f}')
+                if step == done+5:
+                    progress(f'Startup progress complete; regular metrics every {args.log_every} updates')
             if step % args.log_every == 0 or step == args.steps:
                 log.record(dict(step=step, lr=lr, **metrics,
                     samples_per_second=(step-done)*args.batch/(time.monotonic()-started)))
@@ -367,6 +504,22 @@ def main(argv=None):
                     seed_manifest_sha256=manifest['sha256'], training_options=vars(args),
                     monitor_recovery_sha256=recovery_hash,
                     fiber_manifest=fiber_manifest(fibers))
+                if args.init_tracer:
+                    import hashlib
+                    extra['init_tracer_sha256'] = hashlib.sha256(Path(args.init_tracer).read_bytes()).hexdigest()
+                    extra['init_tracer_path'] = str(Path(args.init_tracer).resolve())
+                elif resume and 'init_tracer_sha256' in resume:
+                    extra['init_tracer_sha256'] = resume['init_tracer_sha256']
+                    extra['init_tracer_path'] = resume.get('init_tracer_path')
+                if judge is not None:
+                    from .judge_model import JUDGE_ARCHITECTURE
+                    from ..events import EVENT_VERSION
+                    from .judge_slices import SLICE_VERSION
+                    extra.update(judge=judge.state_dict(), judge_ema=judge_ema.state_dict(),
+                                 judge_architecture=JUDGE_ARCHITECTURE, judge_cfg=judge.cfg.to_dict(),
+                                 judge_slices=slices.to_dict(), judge_policy=policy.to_dict(),
+                                 judge_source_sha256=judge_source,
+                                 judge_event_version=EVENT_VERSION, judge_slice_version=SLICE_VERSION)
                 if resumable:
                     extra.update(optimizer=opt.state_dict(), rng=training_rng_state())
                 save_checkpoint(path, model, ema, spec, sample, extra)
@@ -377,7 +530,14 @@ def main(argv=None):
             if tracer is not None and step % args.diag_every == 0:
                 began = time.monotonic()
                 training_diagnostics(ema, batches[-1], tracer, val_f, manifest['monitor'], out, step, log,
-                                     device=args.device)
+                                     device=args.device, judge=judge_ema, judge_slices=slices, judge_policy=policy)
+                if judge_ema is not None:
+                    from .diagnostics import plot_judge_sequence
+                    with torch.no_grad():
+                        for index, sequence in enumerate(batches[-1].get('judge', [])[:3]):
+                            device_sequence = move_batch(sequence, args.device)
+                            logits = judge_ema(**{k: device_sequence[k] for k in ('images','metadata','valid','queries')})
+                            plot_judge_sequence(sequence, logits, out/'images'/f'judge_{step:06d}_{index}.png')
                 periodic['diagnostics_seconds'] = time.monotonic()-began
             if recovery_states is not None and step % args.recovery_every == 0:
                 began = time.monotonic()

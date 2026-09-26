@@ -37,7 +37,7 @@ def monitor_fixture(path, fibers, manifest, sample, spec, seed_count=8):
 def evaluate_monitor(model, vol, states, fibers, sample, *, device, n_commit=4,
                      tolerance=1.5, recovery_length=32.):
     decisions = []
-    thresholds = (.5, .85)
+    thresholds = (.5,)
     rows, _ = evaluate_recovery_states(model, vol, states, fibers, sample, device=device,
         tracer_class=DirectTracer, batch_builder=ObservationBuilder(model.cfg),
         n_commit=n_commit, tolerance=tolerance, thresholds=thresholds, recovery_length=recovery_length,

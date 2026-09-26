@@ -1,8 +1,10 @@
 # CT slice sequence judge for the direct fiber follower
 
-Status: implementation-ready design, 2026-09-25. The slice examples and their
-reproduction script exist; the judge, training integration, and rollback policy
-described below are not implemented yet.
+Status: implemented, 2026-09-25. Native sampling, the independent judge, joint
+training/checkpoints, path archives, rollback, monitoring, and locked paired
+calibration are available. See [README.md](README.md#native-ct-sequence-judge)
+for commands and validation. Enforcement remains opt-in until a trained checkpoint
+passes calibration; the implementation smoke is not an accuracy claim.
 
 This replaces the proposed architecture in [RETROSPECTIVE_JUDGE_PLAN.md](RETROSPECTIVE_JUDGE_PLAN.md).
 Retain that document as background for the label, replay, and rollback problems.
@@ -57,7 +59,12 @@ alone does not increase correctly followed length or recover the right branch.
 The first version stops after rollback; retracing and multiple proposals are
 future work. Shared failure modes remain possible even with separate encoders.
 
-## 2. Actual CT examples
+## 2. Historical CT examples
+
+These saved illustrations use the original public source. Per the user correction,
+training, inference and new previews now use the follower CT store at level 0,
+with one source voxel per slice pixel. The illustrations and benchmark timings
+below do not describe the corrected default source or field of view.
 
 Open the [interactive slice viewer](ct_slice_judge_examples/index.html), the
 [full contact sheet](ct_slice_judge_examples/contact_sheet.png), or the
@@ -109,11 +116,11 @@ defaults or establish equivalent detection accuracy.
 
 | Setting | Initial value |
 | --- | --- |
-| Judge CT | Native source above, level 0, one base-grid voxel per CT voxel |
-| Coordinate conversion | One trace voxel = eight base-grid voxels; native xyz = trace xyz × 8 |
+| Judge CT | Same store as follower `--ct`, level 0; local `s1_ds2.zarr` has four base-grid voxels per CT voxel |
+| Coordinate conversion | One trace voxel = eight base-grid voxels; local level-0 xyz = trace xyz × 2 |
 | Slice size | 257 × 257 pixels; odd size gives an exact center pixel |
-| Pixel spacing | 0.125 trace voxels, one native CT voxel |
-| Field of view | 32 × 32 trace voxels between outer pixel centers |
+| Pixel spacing | One source CT voxel, 0.5 trace voxels for the local store; upsampling is rejected |
+| Field of view | 128 × 128 trace voxels between outer pixel centers |
 | Views per sampled position | u-v, u-f, v-f; shared 2D encoder with view identifiers |
 | Sampling interval along path | Four trace voxels, measured by actual path arclength |
 | Recent sequence | Up to 33 regular samples spanning 128 trace voxels |
@@ -132,9 +139,10 @@ defaults or establish equivalent detection accuracy.
 | Development accept/alarm thresholds | Intact ≥ 0.9 / intact ≤ 0.5, provisional until calibrated |
 
 The current direct fine input samples CT at 0.5 trace voxels from a source with
-four base voxels per CT voxel. The judge therefore uses four times the linear
-sampling resolution of that input, and eight times that of its coarse input.
-This is real source resolution, not upsampling the existing CT crop.
+four base voxels per CT voxel. The judge now uses the same source resolution
+as that fine input, with a larger field of view and its own observed-path encoder.
+Pixel pitch is derived from the selected source scale; it is never made finer
+than the source voxels.
 
 ## 4. Shared slice sampler and CT access
 
@@ -168,7 +176,7 @@ Sampling rules:
    displacement for the sequence model.
 5. Obtain each plane's small axis-aligned read bounds, transform trace xyz to
    source xyz using explicit scale/origin metadata, then sample trilinearly in
-   source zyx. The present dataset uses zero origin and scale eight. Reject
+   source zyx. The local level-0 store uses zero origin and scale two (trace to CT coordinates). Reject
    unsupported transforms rather than silently assuming alignment.
 6. Include only sampled positions already reached by the path. Static CT in a
    longitudinal slice may extend ahead of its center: that CT is available at
@@ -212,8 +220,8 @@ tokens must not be produced merely by upsampling an already coarsened map.
 Use two token groups per view:
 
 - Pool the final feature map to an 8 × 8 spatial grid for the full neighborhood.
-  Each pooling region spans approximately four trace voxels per axis, compared
-  with eight for a 4 × 4 grid. These are pooling extents, not hard limits on the
+  Each pooling region spans approximately 16 trace voxels per axis, compared
+  with 32 for a 4 × 4 grid at the corrected local-source spacing. These are pooling extents, not hard limits on the
   detail represented in feature channels. Pool feature coordinates with the
   same cells so positional metadata matches the actual pooling geometry.
 - Bilinearly sample the first-stage feature map at a 5 × 5 grid with in-plane
@@ -738,7 +746,7 @@ raw-result locations, and exact reproduction commands, and
 disposable prototype. The current architecture remains the baseline in sections
 3 and 5; the faster variants are recorded as measured options.
 
-## 10. Reproduce this plan's examples
+## 10. Preview the local CT
 
 From `fiber_follow/`, using the existing environment:
 
@@ -746,19 +754,21 @@ From `fiber_follow/`, using the existing environment:
 PYTHONDONTWRITEBYTECODE=1 NUMBA_CACHE_DIR=/tmp/ct-judge-numba \
 MPLCONFIGDIR=/tmp/ct-judge-mpl PYTHONPATH=../../.. \
 /home/sean/Documents/villa/vesuvius/.venv/bin/python \
-  scripts/preview_ct_judge.py --download-native
+  scripts/preview_ct_judge.py --out /tmp/ct-judge-local-preview
 ```
 
-Omit `--download-native` to reuse the temporary CT chunk cache without network.
-The preview caps its source requirement at 160 native chunks and fails on any
-missing interpolation support. It writes the contact sheet, raw/display PNGs,
+The preview defaults to the same local level-0 CT at one source voxel per pixel.
+It performs no downloads and fails on missing interpolation support. To reproduce
+the historical saved examples from their existing cache, explicitly pass
+`--ct-array /tmp/ct-slice-judge-source/0 --ct-grid-scale 1 --spacing 0.125`.
+Remote fetching requires both an explicit `--source` and `--ct-array` destination. It writes the contact sheet, raw/display PNGs,
 interactive HTML viewer, numerical arrays, and source/sampling manifest under
 `direct/ct_slice_judge_examples/`. It does not modify annotations, model weights,
 the active training run, or the original CT stores.
 
-The production sampler will extend this preview contract to actual observed
-paths, persistent stream state, per-pixel support, batch loading, and split
-exclusions. The preview is not a finished training dataset implementation.
+The production sampler in `direct/judge_slices.py` now supplies the preview and
+actual observed-path inputs, persistent stream state, per-pixel support, and split
+exclusions. The preview remains a presentation wrapper, not a training dataset.
 
 Preview verification completed on 2026-09-25: all 27 views have full source
 support; 3,072 sampled pixels from six views agreed with independent SciPy
@@ -778,8 +788,7 @@ MPLCONFIGDIR=/tmp/ct-judge-mpl PYTHONPATH=../../.. \
 
 ## 11. Proposed user workflow after implementation
 
-The following commands specify the intended interface; the judge flags and
-native-source reader are not implemented by the preview script or this plan.
+The following commands are implemented by the direct trainer and native-source reader.
 `--init-tracer` initializes from the saved EMA tracer weights and records the
 source checkpoint hash; it starts a new optimizer schedule and run. Full
 `--resume` instead restores both branches and their training state.
@@ -788,10 +797,8 @@ source checkpoint hash; it starts a new optimizer schedule and run. Full
 bash scripts/launch_direct.sh direct_ct_judge_run1 \
   --init-tracer output/direct_corrected_run1/ckpt_009000.pt \
   --judge \
-  --judge-ct https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr \
-  --judge-ct-level 0 --judge-ct-grid-scale 1 \
-  --judge-ct-cache output/ct_judge_native_cache \
-  --judge-pixels 257 --judge-pixel-spacing 0.125 \
+  --judge-ct-level 0 \
+  --judge-pixels 257 \
   --judge-path-step 4 --judge-history-length 128 \
   --judge-loss-weight 0.5
 ```

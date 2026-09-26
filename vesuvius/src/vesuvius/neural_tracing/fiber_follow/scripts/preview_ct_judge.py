@@ -27,8 +27,7 @@ from vesuvius.neural_tracing.fiber_follow.geometry import (
 )
 from vesuvius.neural_tracing.fiber_follow.volume import ChunkedArray
 
-SOURCE = ('https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/'
-          'PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr')
+LOCAL_CT = '/mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr/0'
 FIBER = '/mnt/raid_nvme/spiral_dataset_working/fibers/anon_20260815T014816946_000002.json'
 
 
@@ -38,18 +37,9 @@ def views(fiber, start, count, step, pixels, spacing):
     if start < 4 or arcs[-1] > fiber.length:
         raise ValueError('Requested sequence must lie inside the annotated path')
     centers = interp_at(fiber.points, fiber.s, arcs)
-    # Transport from the fiber start, rather than reset orientation per window.
-    # The seed direction is supplied by construction; later headings are causal.
+    from vesuvius.neural_tracing.fiber_follow.direct.judge_slices import transported_frames
     seed = interp_at(fiber.points, fiber.s, np.array([0., min(1., fiber.length)]))
-    frame = frame_from_heading(seed[1]-seed[0])
-    frames = []
-    queries = np.unique(np.r_[np.arange(1., arcs[-1], 1.), arcs])
-    wanted = set(arcs.tolist())
-    for s in queries:
-        pair = interp_at(fiber.points, fiber.s, np.array([max(0., s-4.), s]))
-        frame = frame_from_heading(pair[1]-pair[0], frame[:, 0])
-        if s in wanted:
-            frames.append(frame.copy())
+    frames = transported_frames(fiber.points, frame_from_heading(seed[1]-seed[0]), arcs)
     crop = CropSpec(depth=1, width=pixels, behind=0, spacing=spacing)
     grid = crop_local_grid(crop).reshape(-1, 3)
     records = []
@@ -76,15 +66,23 @@ def needed_keys(record, grid, scale, meta):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--fiber-json', default=FIBER)
-    ap.add_argument('--ct-array', default='/tmp/ct-slice-judge-source/0')
+    ap.add_argument('--ct-array', help='Local CT array (default: follower s1_ds2.zarr/0)')
+    ap.add_argument('--ct-grid-scale', type=float, default=4.)
+    ap.add_argument('--source', help='Explicit remote zarr root, only used with --download-native')
     ap.add_argument('--download-native', action='store_true')
     ap.add_argument('--out', default='direct/ct_slice_judge_examples')
     ap.add_argument('--start', type=float, default=200.)
     ap.add_argument('--count', type=int, default=9)
     ap.add_argument('--step', type=float, default=4.)
     ap.add_argument('--pixels', type=int, default=257)
-    ap.add_argument('--spacing', type=float, default=.125)
+    ap.add_argument('--spacing', type=float, help='Default: one source CT voxel per pixel')
     args = ap.parse_args()
+    if args.download_native and (not args.source or not args.ct_array):
+        ap.error('--download-native requires an explicit --source and --ct-array cache destination')
+    args.ct_array = args.ct_array or LOCAL_CT
+    from vesuvius.neural_tracing.fiber_follow.direct.judge_slices import SliceConfig, sample_planes
+    cfg = SliceConfig(source=args.ct_array, grid_scale=args.ct_grid_scale, pixels=args.pixels, spacing=args.spacing)
+    args.spacing = cfg.spacing
     if args.count < 1 or args.step <= 0 or args.pixels < 3 or args.pixels % 2 != 1 or args.spacing <= 0:
         ap.error('Use positive sampling settings and an odd image width >= 3')
     with tempfile.TemporaryDirectory(prefix='ct-judge-fiber-') as folder:
@@ -92,15 +90,15 @@ def main():
         fiber, = load_fibers(folder)
     records, crop, grid = views(fiber, args.start, args.count, args.step, args.pixels, args.spacing)
     # Coordinates in fiber JSON are base-grid xyz; one trace voxel = 8 base voxels.
-    scale = 8.
+    scale = cfg.trace_scale/cfg.grid_scale
     root = Path(args.ct_array)
     if args.download_native:
         root.mkdir(parents=True, exist_ok=True)
-        metadata = urllib.request.urlopen(SOURCE+'/0/.zarray', timeout=30).read()
+        metadata = urllib.request.urlopen(args.source.rstrip('/')+'/0/.zarray', timeout=30).read()
         (root/'.zarray').write_bytes(metadata)
     meta = json.loads((root/'.zarray').read_text())
-    if tuple(meta['shape']) != (75784, 32693, 32693) or meta['dtype'] != '|u1':
-        raise ValueError('Preview expects the aligned native uint8 CT source')
+    if len(meta['shape']) != 3 or meta['dtype'] != '|u1':
+        raise ValueError('Preview expects an aligned three-dimensional uint8 CT source')
     keys_by_view = [needed_keys(r, grid, scale, meta) for r in records]
     keys = sorted(set().union(*keys_by_view))
     sep = meta.get('dimension_separator', '.')
@@ -112,7 +110,7 @@ def main():
     if missing and not args.download_native:
         raise ValueError('Source coverage incomplete; use --download-native to fetch required chunks')
     def fetch(name):
-        raw = urllib.request.urlopen(SOURCE+'/0/'+name, timeout=60).read()
+        raw = urllib.request.urlopen(args.source.rstrip('/')+'/0/'+name, timeout=60).read()
         path = root/name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(raw)
@@ -122,25 +120,18 @@ def main():
             sizes = list(pool.map(fetch, missing))
         print(f'Downloaded {sum(sizes)/2**20:.1f} MiB into {root}', flush=True)
     reader = ChunkedArray(root, cache_bytes=256 << 20)
-    empty, mask = np.empty((0, 3)), np.empty(0)
     images = []
-    for r, support_keys in zip(records, keys_by_view):
-        # Missing chunks must never turn into valid black CT in these examples.
-        if any(reader.chunk(key) is None for key in support_keys):
+    for r in records[::3]:
+        planes = sample_planes(reader, r['center'], r['frame'], cfg)
+        if not planes[:, 2].all():
             raise ValueError('Missing source support')
-        world = (r['center']+grid @ r['frame'].T)*scale
-        if np.any(world < 0) or np.any(world >= np.asarray(meta['shape'])[::-1]-1):
-            raise ValueError('Preview requires complete in-bounds interpolation support')
-        start, size = tight_block(r['center'], r['frame'], crop, scale)
-        raw = reader.read(start, size)[None]
-        img = sample_crop(raw, start, r['center']*scale, r['frame']*scale,
-                          grid, False, empty, mask, 2)[0].reshape(args.pixels, args.pixels)
-        images.append(img)
+        images.extend(planes[:, 0])
     images = np.asarray(images).reshape(args.count, 3, args.pixels, args.pixels)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     yy, xx = np.mgrid[:args.pixels, :args.pixels] - args.pixels//2
-    marker = np.exp(-(xx*xx+yy*yy)/(2*2.**2)).astype(np.float32)
+    sigma = 2/(scale*args.spacing)
+    marker = np.exp(-(xx*xx+yy*yy)/(2*sigma**2)).astype(np.float32)
     # Training-ready raw CT, separate center marker and explicit support, no colored overlays.
     np.savez_compressed(out/'slices.npz', ct=images, marker=marker,
                         support=np.ones_like(images, dtype=np.uint8),
@@ -177,11 +168,11 @@ def main():
     plt.close(fig)
     manifest = dict(kind='annotated positive illustration, not a departure or accuracy test',
                     fiber=fiber.name, fiber_source_sha256=fiber.source_hash,
-                    source_url=SOURCE, ct_array=str(root), ct_shape=meta['shape'],
+                    source_url=args.source, ct_array=str(root), ct_shape=meta['shape'],
                     source_metadata_sha256=hashlib.sha256((root/'.zarray').read_bytes()).hexdigest(),
                     source_chunk_count=len(keys), source_chunks=names,
                     source_chunk_sha256={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in names},
-                    trace_grid_scale=8., ct_grid_scale=1., native_voxels_per_pixel=args.spacing*scale,
+                    trace_grid_scale=cfg.trace_scale, ct_grid_scale=cfg.grid_scale, native_voxels_per_pixel=args.spacing*scale,
                     slice_spacing_trace=args.spacing, pixels=args.pixels,
                     path_step_trace=args.step, start_arc_trace=args.start, count=args.count,
                     view_names=['uv','uf','vf'], input_normalization='uint8 / 255',

@@ -80,7 +80,7 @@ def test_direct_images_preserve_scores_rng_and_parameters(tmp_path, monkeypatch,
         training_diagnostics(model, data, tracer, fibers, seeds, tmp_path, 1000, log, device='cpu')
     finally:
         log.close()
-    assert tracer.calls == 4  # Two seeds at two thresholds, no repeat for images.
+    assert tracer.calls == 2  # Two seeds at one threshold, no repeat for images.
     assert tracer.p.confidence == .7 and tracer.p.max_len == 8.
     assert model.training
     torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
@@ -97,7 +97,7 @@ def test_direct_images_preserve_scores_rng_and_parameters(tmp_path, monkeypatch,
     for pixels in rgb:
         np.testing.assert_allclose(pixels, .2, atol=1e-7)
     expected_images = ['batch_001000.png', 'batch_coarse_001000.png', 'correction_001000.png',
-                       'rollout_001000_c0.5.png', 'rollout_001000_c0.85.png']
+                       'rollout_001000_c0.5.png']
     for path in [tmp_path/'images'/name for name in expected_images]+[tmp_path/'curves.png']:
         with Image.open(path) as image:
             assert image.format == 'PNG' and min(image.size) > 100
