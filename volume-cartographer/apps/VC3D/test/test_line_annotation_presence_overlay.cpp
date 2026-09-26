@@ -1,6 +1,9 @@
 #include <QtTest/QtTest>
 
 #include "LineAnnotationPresenceOverlay.hpp"
+#include "LineAnnotationOverlayManifest.hpp"
+
+#include <fstream>
 #include "volume_viewers/OverlayBlendLut.hpp"
 #include "volume_viewers/OverlayLevelSelection.hpp"
 
@@ -11,6 +14,8 @@ class TestLineAnnotationPresenceOverlay : public QObject {
     Q_OBJECT
 
 private slots:
+    void remoteManifestsWaitForPrefetchAndNeverFetchInline();
+    void localManifestsResolveRelativeToTheProject();
     void findsTheVolumeTaggedWithManifestAndGroup();
     void prefersTheStoredManifestLocationOverAliases();
     void rebaseLevelFollowsDyadicDownsampling();
@@ -310,6 +315,55 @@ void TestLineAnnotationPresenceOverlay::channelPyramidMatchesTheScanUnderBothCon
     const Levels twoShort{{0, {59944, 20810, 20810}, {64, 64, 64}}};
     QVERIFY(!channelPyramidMatchesScan(scan, std::nullopt, 0, twoShort));
     QVERIFY(!channelPyramidMatchesScan(scan, std::nullopt, 0, Levels{}));
+}
+
+void TestLineAnnotationPresenceOverlay::remoteManifestsWaitForPrefetchAndNeverFetchInline()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const std::filesystem::path cache(temporary.path().toStdString());
+    const std::string location = "https://example.invalid/fiber.lasagna.json";
+    const auto path = cache / vc::core::util::remoteFileCachePath(location);
+    using vc3d::line_annotation::readOverlayManifest;
+
+    // A cold cache must return immediately, without trying the remote URL.
+    QVERIFY(!readOverlayManifest(location, {}, cache, false));
+    // A failed fetch must report the local cache miss, not fetch on the GUI.
+    try {
+        (void)readOverlayManifest(location, {}, cache, true);
+        QFAIL("Expected a missing cached manifest");
+    } catch (const std::exception& ex) {
+        QVERIFY(QString::fromUtf8(ex.what()).contains(QString::fromStdString(path.string())));
+    }
+
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream(path) << R"({"version":2,"base_shape_zyx":[59944,20812,20812],
+        "groups":{"presence":{"zarr":"presence.zarr/3","scaledown":3,
+        "channels":["presence"]}}})";
+    // Even a file already on disk waits for the worker's validation.
+    QVERIFY(!readOverlayManifest(location, {}, cache, false));
+    const auto manifest = readOverlayManifest(location, {}, cache, true);
+    QVERIFY(manifest.has_value());
+    QVERIFY(manifest->groupForChannel("presence"));
+    QVERIFY(manifest->baseShapeZYX == (std::array<std::size_t, 3>{59944, 20812, 20812}));
+
+    // Corruption after prefetch cannot trigger an inline cache repair either.
+    std::ofstream(path) << "invalid json";
+    QVERIFY_EXCEPTION_THROWN(readOverlayManifest(location, {}, cache, true), std::exception);
+}
+
+void TestLineAnnotationPresenceOverlay::localManifestsResolveRelativeToTheProject()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const std::filesystem::path project(temporary.path().toStdString());
+    std::ofstream(project / "fiber.lasagna.json") << R"({"version":2,
+        "groups":{"presence":{"zarr":"presence.zarr/3","scaledown":3,
+        "channels":["presence"]}}})";
+    const auto manifest = vc3d::line_annotation::readOverlayManifest(
+        "fiber.lasagna.json", project, {}, false);
+    QVERIFY(manifest.has_value());
+    QVERIFY(manifest->groupForChannel("presence"));
 }
 
 QTEST_APPLESS_MAIN(TestLineAnnotationPresenceOverlay)

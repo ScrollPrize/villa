@@ -13,6 +13,7 @@
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationDatasetSets.hpp"
 #include "LineAnnotationPresenceOverlay.hpp"
+#include "LineAnnotationOverlayManifest.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "SurfacePanelController.hpp"
@@ -10376,7 +10377,7 @@ std::optional<std::array<std::size_t, 3>> LineAnnotationController::manifestBase
     }
     std::optional<std::array<std::size_t, 3>> frame;
     try {
-        frame = openLasagnaManifestForOverlay(location).baseShapeZYX;
+        frame = openLasagnaManifestForOverlay(location)->baseShapeZYX;
     } catch (const std::exception& ex) {
         // Cached as unknown: a bad manifest is not re-read on every call
         // (the cache is dropped on content refresh).
@@ -10386,7 +10387,7 @@ std::optional<std::array<std::size_t, 3>> LineAnnotationController::manifestBase
     return frame;
 }
 
-void LineAnnotationController::prefetchRemoteManifestFrames()
+void LineAnnotationController::prefetchRemoteManifestFrames(const std::string& overlayLocation)
 {
     using namespace vc3d::line_annotation;
     auto vpkg = _state ? _state->vpkg() : nullptr;
@@ -10403,6 +10404,9 @@ void LineAnnotationController::prefetchRemoteManifestFrames()
         }
         wanted.push_back(location);
     };
+    // An enabled overlay may need a tagged dataset or an arbitrary volume
+    // whose manifest is not otherwise needed for frame selection.
+    want(overlayLocation);
     // Untagged datasets are grouped by their frame.
     for (const auto* datasets : {&sets.lasagnaDatasets, &sets.fiberDatasets}) {
         for (const auto& dataset : *datasets) {
@@ -10443,6 +10447,7 @@ void LineAnnotationController::prefetchRemoteManifestFrames()
                         // it displaced was skipped because this location was
                         // in flight, so ask again for what is wanted now.
                         prefetchRemoteManifestFrames();
+                        schedulePresenceOverlayRefresh();
                         return;
                     }
                     if (!_state || !_state->vpkg()) {
@@ -10464,7 +10469,6 @@ void LineAnnotationController::prefetchRemoteManifestFrames()
                     }
                     if (after.selectedFiberLocation != before.selectedFiberLocation) {
                         invalidateSessionFiberDatasets();
-                        refreshPresenceOverlays();
                     }
                     refreshLineAnnotationDatasetMenus();
                     if (frameVolume().id != frameBefore ||
@@ -10473,6 +10477,9 @@ void LineAnnotationController::prefetchRemoteManifestFrames()
                         // volume switch does.
                         onActiveVolumeChanged();
                     }
+                    // Also retry overlays when only the manifest arrived (the
+                    // selected dataset and active frame need not have changed).
+                    schedulePresenceOverlayRefresh();
                 });
         watcher->setFuture(QtConcurrent::run([location, options]() {
             std::optional<std::array<std::size_t, 3>> frame;
@@ -10931,7 +10938,12 @@ LineAnnotationController::resolvePresenceOverlaySource()
     // the session's open dataset: a re-attach of the same location may have
     // rewritten the file (a presence group added, a frame corrected), and the
     // session keeps its old manifest until its next solve.
-    readManifest(openLasagnaManifestForOverlay(selected));
+    prefetchRemoteManifestFrames(selected);
+    const auto manifest = openLasagnaManifestForOverlay(selected);
+    if (!manifest) {
+        return {nullptr, 0, tr("Loading fiber manifest...")};
+    }
+    readManifest(*manifest);
     if (presenceGroup.empty()) {
         throw std::runtime_error(
             tr("%1 has no presence channel").arg(label).toStdString());
@@ -10984,7 +10996,15 @@ LineAnnotationController::resolveVolumeOverlaySource(const std::string& volumeId
         constexpr std::string_view prefix = vc3d::line_annotation::kLasagnaManifestTagPrefix;
         if (tag.rfind(prefix, 0) == 0) {
             try {
-                exactFrame = openLasagnaManifestForOverlay(tag.substr(prefix.size())).baseShapeZYX;
+                const std::string location = tag.substr(prefix.size());
+                prefetchRemoteManifestFrames(location);
+                const auto manifest = openLasagnaManifestForOverlay(location);
+                if (!manifest) {
+                    // Do not fit without the binding manifest frame while its
+                    // download is pending.
+                    return {nullptr, 0, tr("Loading overlay manifest...")};
+                }
+                exactFrame = manifest->baseShapeZYX;
             } catch (const std::exception& ex) {
                 Logger()->warn("Presence overlay: manifest of volume '{}' unreadable: {}",
                                volumeId, ex.what());
@@ -10995,17 +11015,13 @@ LineAnnotationController::resolveVolumeOverlaySource(const std::string& volumeId
     return fitOverlayVolumeToActiveGrid(volume, volumeId, exactFrame, label);
 }
 
-vc::lasagna::LasagnaDatasetManifest
+std::optional<vc::lasagna::LasagnaDatasetManifest>
 LineAnnotationController::openLasagnaManifestForOverlay(const std::string& location) const
 {
     auto vpkg = _state ? _state->vpkg() : nullptr;
-    vc::lasagna::LasagnaDatasetOpenOptions options;
-    options.remoteCacheRoot = vc3d::remoteCachePathFs();
-    const std::string resolved = vc::project::isLocationRemote(location)
-        ? location
-        : vc::project::resolveLocalPath(
-              location, vpkg ? vpkg->path().parent_path() : fs::path{}).string();
-    return vc::lasagna::LasagnaDataset::openLocation(resolved, options).manifest();
+    return vc3d::line_annotation::readOverlayManifest(
+        location, vpkg ? vpkg->path().parent_path() : fs::path{},
+        vc3d::remoteCachePathFs(), _manifestBaseShapeCache.count(location) != 0);
 }
 
 LineAnnotationController::PresenceOverlaySource

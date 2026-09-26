@@ -985,10 +985,11 @@ private:
     // Fetches, off the GUI thread, every remote manifest frame the workspace
     // wants and does not have: the untagged datasets (grouped by frame) and
     // the active channel's memberships (its stand-in scan is gated by the
-    // frame). On completion the menus are redrawn and, when the active
+    // frame), plus an explicitly requested overlay manifest. On completion
+    // overlays and menus are refreshed and, when the active
     // volume is a channel of that dataset, the frame-dependent views are
     // rebuilt; a completion from a superseded epoch re-requests instead.
-    void prefetchRemoteManifestFrames();
+    void prefetchRemoteManifestFrames(const std::string& overlayLocation = {});
     // The project's only fiber dataset when it applies to the selected scan:
     // the one case where no menu pick is needed.
     [[nodiscard]] std::optional<std::string> soleApplicableFiberDataset(
@@ -1041,8 +1042,9 @@ private:
         const std::string& volumeId,
         const std::optional<std::array<std::size_t, 3>>& exactFrameZYX,
         const QString& label);
-    // Parses a (cached) Lasagna manifest by project location.
-    [[nodiscard]] vc::lasagna::LasagnaDatasetManifest openLasagnaManifestForOverlay(
+    // Reads only local files, including the remote cache. Null while a remote
+    // manifest is being fetched by prefetchRemoteManifestFrames().
+    [[nodiscard]] std::optional<vc::lasagna::LasagnaDatasetManifest> openLasagnaManifestForOverlay(
         const std::string& location) const;
     // Re-resolves and hands the result (or the reason) to a pane's dialog
     // when its overlay is on; a no-op for dialogs with the overlay off.
