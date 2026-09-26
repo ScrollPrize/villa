@@ -237,14 +237,15 @@ def _interpolate_point(xyz, shape, chunks, lookup, arrays, present, out, support
     out[i] = value
 
 
-@numba.njit(cache=True, fastmath=False, nogil=True)
+@numba.njit(cache=True, fastmath=False, nogil=True, boundscheck=True)
 def interpolate_supported(xyz, shape, chunks, chunk_keys, group, arrays, present):
     """Scalar trilinear interpolation reading corners directly from loaded chunks.
 
     Corners outside the volume or in missing chunks contribute zero and clear
     support; zero-weight corners do not affect support. ``chunk_keys`` and
-    ``group`` come from ``supported_corner_chunks``. Single-chunk points are
-    visited chunk by chunk, which keeps reads local.
+    ``group`` come from ``supported_corner_chunks``. Visit points directly:
+    constructing an unchecked bucket permutation here produced unwritten indices
+    in a worker crash. Bounds checks also turn invalid inputs into exceptions.
     """
     lookup = {(0, 0, 0): 0}
     lookup.clear()
@@ -253,36 +254,33 @@ def interpolate_supported(xyz, shape, chunks, chunk_keys, group, arrays, present
     n = len(xyz)
     out = np.zeros(n, np.float32)
     supported = np.ones(n, np.bool_)
-    counts = np.zeros(len(chunk_keys)+1, np.int64)
-    for i in range(n):
-        if group[i] >= 0:
-            counts[group[i]+1] += 1
-        else:
+    i = 0
+    while i < n:
+        j = group[i]
+        if j < 0:
             _interpolate_point(xyz, shape, chunks, lookup, arrays, present, out, supported, i)
-    for j in range(len(chunk_keys)):
-        counts[j+1] += counts[j]
-    order = np.empty(counts[-1], np.int64)
-    cursor = counts[:-1].copy()
-    for i in range(n):
-        if group[i] >= 0:
-            order[cursor[group[i]]] = i
-            cursor[group[i]] += 1
-    for j in range(len(chunk_keys)):
+            i += 1
+            continue
+        # Neighboring pixels usually share a chunk. Load its array once per
+        # contiguous run, without constructing a separate point-index table.
+        end = i+1
+        while end < n and group[end] == j:
+            end += 1
+        if not present[j]:
+            supported[i:end] = False
+            i = end
+            continue
         array = arrays[j]
         oz, oy, ox = chunk_keys[j, 0]*chunks[0], chunk_keys[j, 1]*chunks[1], chunk_keys[j, 2]*chunks[2]
-        for k in range(counts[j], counts[j+1]):
-            i = order[k]
-            if not present[j]:
-                supported[i] = False
-                continue  # every read sample is zero, as is the interpolated value
-            z, y, x = np.floor(xyz[i, 2]), np.floor(xyz[i, 1]), np.floor(xyz[i, 0])
-            fz, fy, fx = xyz[i, 2]-z, xyz[i, 1]-y, xyz[i, 0]-x
+        for point in range(i, end):
+            z, y, x = np.floor(xyz[point, 2]), np.floor(xyz[point, 1]), np.floor(xyz[point, 0])
+            fz, fy, fx = xyz[point, 2]-z, xyz[point, 1]-y, xyz[point, 0]-x
             lz, ly, lx = np.int64(z)-oz, np.int64(y)-oy, np.int64(x)-ox
-            # All corners lie in this chunk, so zero-weight corners may be read:
-            # they add exactly zero, as in the per-corner path.
+            # Preserve the scalar corner order and float32 sample conversion.
             value = 0.
             for corner in range(8):
                 dz, dy, dx = corner//4, (corner//2) % 2, corner % 2
                 value += trilinear_weight(fz, fy, fx, dz, dy, dx)*np.float32(array[lz+dz, ly+dy, lx+dx])
-            out[i] = value
+            out[point] = value
+        i = end
     return out, supported

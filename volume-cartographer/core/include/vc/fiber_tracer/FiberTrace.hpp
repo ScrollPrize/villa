@@ -89,6 +89,10 @@ struct FiberTraceConfig {
     int beamWidth = 8;
     double beamPruneDistanceVoxels = 1.0;
     int beamLookaheadSteps = 2;
+    // With a hook: score every valid proposal at every generation, before
+    // pruning or target acceptance. Intermediate lookahead uses learned scores.
+    bool learnedScoring = false;
+    int learnedLookaheadWidth = 32;
     bool lazyLookahead = true;
     size_t lookaheadParentCap = 32;
     size_t lookaheadRetryParentCap = 0;
@@ -349,9 +353,19 @@ private:
 // hook that returns no losses, the search is bit-identical to the plain search
 // (the width-`beamWidth` selection is a prefix of the pool selection). The hook
 // is never called on a round whose frontier already reached the target planes.
+// Exception: config.learnedScoring scores ALL valid candidates at EVERY generation,
+// including reached candidates, before selection. poolSize/everyRounds do not
+// restrict this mode; intermediate generations retain learnedLookaheadWidth.
+// A response supplies cumulative costs (parentLoss + learned cost of this step).
+// Candidate paths are not materialized individually: every candidate extends
+// one parent beam by one point, so its path is parentPaths[parentIndex] followed
+// by endpoint (see FiberTraceBeamHookEvent::candidatePath).
 struct FiberTraceBeamHookCandidate {
-    std::vector<cv::Vec3d> path;  // trace voxels, trace start through this endpoint
-    float loss = 0.0f;            // cumulative hand loss
+    size_t parentIndex = 0;        // into FiberTraceBeamHookEvent::parentPaths
+    cv::Vec3d endpoint{0.0, 0.0, 0.0};  // trace voxels
+    float loss = 0.0f;            // parent search cost + hand step cost
+    float parentLoss = 0.0f;      // excludes this proposed step
+    double stepLength = 0.0;     // trace voxels
     int depth = 0;
     double tracedLength = 0.0;
     bool reached = false;
@@ -368,6 +382,17 @@ struct FiberTraceBeamHookEvent {
     cv::Vec3d startPoint{0.0, 0.0, 0.0};
     cv::Vec3d targetPoint{0.0, 0.0, 0.0};
     std::vector<FiberTraceBeamHookCandidate> pool;  // best hand loss first
+    // Distinct parent paths (trace voxels, trace start through the parent endpoint).
+    std::vector<std::vector<cv::Vec3d>> parentPaths;
+
+    // Trace start through the candidate endpoint.
+    [[nodiscard]] std::vector<cv::Vec3d> candidatePath(size_t index) const
+    {
+        const auto& candidate = pool.at(index);
+        std::vector<cv::Vec3d> path = parentPaths.at(candidate.parentIndex);
+        path.push_back(candidate.endpoint);
+        return path;
+    }
 };
 
 struct FiberTraceBeamHookResponse {

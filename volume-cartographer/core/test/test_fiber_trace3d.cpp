@@ -1528,8 +1528,9 @@ TEST_CASE("native fiber tracer beam hook observe and identity replacement match 
         for (size_t position = 0; position < event.pool.size(); ++position) {
             const auto& candidate = event.pool[position];
             CHECK(candidate.depth == event.step);
-            CHECK(candidate.path.size() == static_cast<size_t>(event.step + 1));
-            CHECK(candidate.path.front() == request.startPoint);
+            const auto path = event.candidatePath(position);
+            CHECK(path.size() == static_cast<size_t>(event.step + 1));
+            CHECK(path.front() == request.startPoint);
             CHECK_FALSE(candidate.reached);
             if (position > 0)
                 CHECK(candidate.loss >= event.pool[position - 1].loss);
@@ -1575,7 +1576,7 @@ TEST_CASE("native fiber tracer beam hook replacement losses drive the prune and 
         response.losses.emplace();
         for (size_t position = 0; position < event.pool.size(); ++position)
             response.losses->push_back(-static_cast<float>(position));
-        expectedPath = event.pool.back().path;
+        expectedPath = event.candidatePath(event.pool.size() - 1);
         response.stop = true;
         return response;
     };

@@ -28,6 +28,17 @@ def save_archive(path, traces):
 
 
 class PathArchive:
+    @classmethod
+    def from_replay(cls, replay):
+        """Verify and cache the immutable path archive associated with a bank."""
+        if not hasattr(replay, '_judge_archive'):
+            import hashlib
+            path = Path(replay.provenance['judge_archive'])
+            if hashlib.sha256(path.read_bytes()).hexdigest() != replay.provenance['judge_archive_sha256']:
+                raise ValueError('Replay judge path archive changed')
+            replay._judge_archive = cls(path)
+        return replay._judge_archive
+
     def __init__(self, path):
         with np.load(path, allow_pickle=False) as data:
             meta = json.loads(str(data['metadata']))

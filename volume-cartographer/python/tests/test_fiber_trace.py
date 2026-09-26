@@ -226,3 +226,42 @@ def test_extrapolation_and_whole_fiber_metric(dataset):
     assert metric.restart_count == 0
     assert all(segment.success for segment in metric.segments)
     assert metric.stitched_trace.shape[1] == 3
+
+
+def test_learned_scoring_precedes_caps_diversity_and_target_acceptance(dataset):
+    _, field, normals = dataset
+    calls = []
+    def score(pool):
+        calls.append((pool.step, len(pool), np.asarray(pool.reached).any()))
+        assert np.isfinite(pool.parent_losses).all()
+        assert (pool.step_lengths > 0).all()
+        # Learned unit-distance cost, independent of the hand loss.
+        return (np.asarray(pool.parent_losses + pool.step_lengths, np.float32), False)
+    result = fiber_trace.trace_one_way(
+        field, START, TARGET, (1.,0.,0.),
+        [fiber_trace.TargetPlane('explicit', TARGET, (1.,0.,0.))],
+        accept_threshold_voxels=4., budget_span_voxels=48.,
+        config=config(learned_scoring=True, learned_lookahead_width=32,
+                      lookahead_parent_cap=1), normal_sampler=normals,
+        hook=score, hook_pool_size=1, hook_every_rounds=999)
+    assert result.reached_target_plane
+    assert calls[0][1] == 81
+    assert max(n for _,n,_ in calls) > 32*8  # neither old top32 nor parent cap1
+    assert [s for s,_,_ in calls] == list(range(1,len(calls)+1))
+    assert calls[-1][2]  # final candidates were scored too
+
+
+def test_learned_hook_can_veto_reached_candidates(dataset):
+    _, field, normals = dataset
+    reached = []
+    def score(pool):
+        if np.asarray(pool.reached).any():
+            reached.append(True)
+            return np.full(len(pool), np.inf, np.float32), False
+        return np.asarray(pool.parent_losses + pool.step_lengths, np.float32), False
+    result = fiber_trace.trace_one_way(
+        field, START, TARGET, (1.,0.,0.),
+        [fiber_trace.TargetPlane('explicit', TARGET, (1.,0.,0.))],
+        accept_threshold_voxels=4., budget_span_voxels=48.,
+        config=config(learned_scoring=True), normal_sampler=normals, hook=score)
+    assert reached and not result.reached_target_plane

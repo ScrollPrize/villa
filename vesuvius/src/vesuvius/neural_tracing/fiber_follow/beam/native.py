@@ -1,7 +1,8 @@
 """The volume-cartographer beam tracer, driven from fiber_follow trace-grid units.
 
-Everything the C++ tracer does (cone candidates, hand loss, lookahead, pruning,
-target planes, meeting fusion, restarts) stays in ``vc.fiber_trace``. This
+Cone proposals, lookahead, diversity pruning, target planes, fusion and
+restarts stay in ``vc.fiber_trace``. With a hook, each generation is exposed
+before pruning; without one, the original hand-scored search runs unchanged. This
 module only converts coordinates (fiber_follow grid voxels <-> VC trace voxels)
 and hands the tracer's prune-time candidate pools to Python hooks.
 """
@@ -21,9 +22,10 @@ class BeamSpec:
     cache_bytes: int = 512 << 20
     scaledown_power: int = 2
     config: dict = field(default_factory=dict)  # ``TraceConfig`` overrides, VC key names
-    hook_every_rounds: int = 4
+    hook_every_rounds: int = 1
     hook_pool_size: int = 32
     parallel_threads: int = 1
+    learned_lookahead_width: int = 32
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -31,6 +33,54 @@ class BeamSpec:
     @classmethod
     def from_dict(cls, values: dict) -> "BeamSpec":
         return cls(**values)
+
+
+class PathList:
+    """Candidate paths as shared parent paths plus one endpoint each.
+
+    Path ``i`` is ``parent_points[parent_offsets[k]:parent_offsets[k+1]]`` for
+    ``k = parent_index[i]``, followed by ``endpoints[i]``; ``paths[i]`` builds it.
+    """
+
+    def __init__(self, parent_points, parent_offsets, parent_index, endpoints):
+        self.parent_points = np.asarray(parent_points, np.float64).reshape(-1, 3)
+        self.parent_offsets = np.asarray(parent_offsets, np.int64)
+        self.parent_index = np.asarray(parent_index, np.int64)
+        self.endpoints = np.asarray(endpoints, np.float64).reshape(-1, 3)
+
+    @classmethod
+    def from_list(cls, paths):
+        paths = [np.asarray(p, np.float64).reshape(-1, 3) for p in paths]
+        if any(len(p) < 1 for p in paths):
+            raise ValueError('empty candidate path')
+        offsets = np.zeros(len(paths)+1, np.int64)
+        np.cumsum([len(p)-1 for p in paths], out=offsets[1:])
+        parents = np.concatenate([p[:-1] for p in paths], 0) if paths else np.zeros((0, 3))
+        ends = np.stack([p[-1] for p in paths]) if paths else np.zeros((0, 3))
+        return cls(parents, offsets, np.arange(len(paths)), ends)
+
+    def parent_bounds(self, ids):
+        """[start, end) of each candidate's parent path in ``parent_points``."""
+        k = self.parent_index[ids]
+        return self.parent_offsets[k], self.parent_offsets[k+1]
+
+    @property
+    def lengths(self):
+        return np.diff(self.parent_offsets)[self.parent_index]+1
+
+    def __len__(self):
+        return len(self.parent_index)
+
+    def __getitem__(self, index):
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        start, end = self.parent_bounds(index)
+        return np.concatenate([self.parent_points[start:end], self.endpoints[index][None]], 0)
+
+    def __iter__(self):
+        return (self[i] for i in range(len(self)))
 
 
 @dataclass
@@ -41,12 +91,18 @@ class Pool:
     phase: str
     start: np.ndarray
     target: np.ndarray
-    paths: list  # (n_i, 3) arrays from the trace start through each candidate endpoint
-    losses: np.ndarray  # float32 cumulative hand loss, ascending
+    paths: PathList  # (n_i, 3) paths from the trace start through each candidate endpoint
+    losses: np.ndarray  # parent search cost + hand step cost (diagnostic only)
+    parent_losses: np.ndarray
+    step_lengths: np.ndarray
     depth: np.ndarray
     traced_length: np.ndarray
     reached: np.ndarray
     step_directions: np.ndarray  # (P, 3) unit direction of each candidate's last step
+
+    def __post_init__(self):
+        if not isinstance(self.paths, PathList):
+            self.paths = PathList.from_list(self.paths)
 
     def __len__(self):
         return len(self.losses)
@@ -119,11 +175,13 @@ class NativeBeam:
     def grid_to_trace(self) -> float:
         return self.grid_scale / self.trace_to_base
 
-    def config(self):
+    def config(self, hook=None):
         ft = self._ensure()
         values = dict(self.spec.config)
         values.setdefault('parallel_threads', self.spec.parallel_threads)
         values['trace_to_base_scale'] = self.trace_to_base
+        values['learned_scoring'] = hook is not None
+        values['learned_lookahead_width'] = self.spec.learned_lookahead_width
         return ft.TraceConfig(**values)
 
     def to_trace(self, grid):
@@ -136,8 +194,11 @@ class NativeBeam:
         scale = self.grid_to_trace
         return Pool(round=int(raw.round), step=int(raw.step), phase=str(raw.phase),
                     start=np.asarray(raw.start) / scale, target=np.asarray(raw.target) / scale,
-                    paths=[np.asarray(p) / scale for p in raw.paths()],
-                    losses=np.asarray(raw.losses, np.float32), depth=np.asarray(raw.depth),
+                    paths=PathList(np.asarray(raw.parent_path_points) / scale, raw.parent_path_offsets,
+                                   raw.parent_index, np.asarray(raw.endpoints) / scale),
+                    losses=np.asarray(raw.losses, np.float32),
+                    parent_losses=np.asarray(raw.parent_losses, np.float32),
+                    step_lengths=np.asarray(raw.step_lengths, np.float32) / scale, depth=np.asarray(raw.depth),
                     traced_length=np.asarray(raw.traced_length) / scale, reached=np.asarray(raw.reached, bool),
                     step_directions=np.asarray(raw.previous_step_direction))
 
@@ -166,7 +227,7 @@ class NativeBeam:
             direction = np.asarray(initial_direction, np.float64)
         planes = ft.target_local_planes(self._field, line, target_index, start_index, target)
         span = float(np.linalg.norm(target - line[start_index]))
-        cfg = self.config()
+        cfg = self.config(hook)
         if accept_threshold_base is None:
             accept_threshold_base = ft.effective_endpoint_accept_threshold_base_voxels(cfg, span * self.trace_to_base)
         result = ft.trace_one_way(self._field, start, target, direction, planes,
@@ -180,7 +241,7 @@ class NativeBeam:
     def trace_segment(self, line_grid, start_index: int, target_index: int, hook=None):
         """Bidirectional span trace with meeting fusion, as the VC3D window does."""
         ft = self._ensure()
-        result = ft.trace_segment(self._field, self.to_trace(line_grid), start_index, target_index, self.config(),
+        result = ft.trace_segment(self._field, self.to_trace(line_grid), start_index, target_index, self.config(hook),
                                   normal_sampler=self._normals, **self._hook_kwargs(hook))
         return dict(points=self.to_grid(result.fused_line), accepted=bool(result.accepted), reason=result.reason,
                     detail=result.detail, meeting_error_base=float(result.meeting_error_base_voxels))
@@ -189,7 +250,7 @@ class NativeBeam:
         """Open-ended trace (no target planes) for ``distance_grid`` grid voxels."""
         ft = self._ensure()
         result = ft.trace_extrapolation(self._field, self.to_trace(start_grid), np.asarray(direction, np.float64),
-                                        float(distance_grid) * self.grid_to_trace, self.config(),
+                                        float(distance_grid) * self.grid_to_trace, self.config(hook),
                                         normal_sampler=self._normals, **self._hook_kwargs(hook))
         return self.to_grid(result.points), result.reason, bool(result.reached_trace_length)
 
@@ -202,7 +263,7 @@ class NativeBeam:
         if isinstance(fiber, str):
             fiber = ft.load_fiber_json(fiber)
         result = ft.trace_whole_fiber_metric(self._field, fiber, working_to_base_scale=self.trace_to_base,
-                                             error_threshold_base_voxels=error_threshold_base, config=self.config(),
+                                             error_threshold_base_voxels=error_threshold_base, config=self.config(hook),
                                              normal_sampler=self._normals, **self._hook_kwargs(hook))
         return dict(restart_count=int(result.restart_count), segment_count=int(result.segment_count),
                     restarts_per_kvx=float(result.restarts_per_kvx),

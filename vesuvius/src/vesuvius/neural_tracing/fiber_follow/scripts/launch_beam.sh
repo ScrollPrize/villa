@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch a beam re-ranker training run in the background (own process group).
+# Launch a learned beam step-scorer training run in the background (own process group).
 #   scripts/launch_beam.sh NAME [beam/train.py args...]
 # Outputs: output/NAME/ (ckpts, images, log.jsonl), stdout in output/logs/NAME.log
 # Stop with scripts/stop.sh NAME.
@@ -19,7 +19,7 @@ export MALLOC_MMAP_THRESHOLD_=268435456 MALLOC_TRIM_THRESHOLD_=1073741824 MALLOC
 export OMP_WAIT_POLICY=${OMP_WAIT_POLICY:-passive}
 mkdir -p "$FF/output/logs"
 setsid nohup .venv/bin/python -u -m vesuvius.neural_tracing.fiber_follow.beam.train \
-    --fiber-zarrs "$FIBER_ZARRS" --fibers "$FIBERS" --ct "$CT_ZARR" --ct-level 0 --ct-grid-scale 4 \
+    --fiber-zarrs "$FIBER_ZARRS" --fibers "$FIBERS" --ct "$CT_ZARR" --ct-level 1 --ct-grid-scale 8 \
     --prediction-manifest "$PREDICTION_MANIFEST" --normal-manifest "$NORMAL_MANIFEST" \
     --name "$name" "$@" \
     > "$FF/output/logs/$name.log" 2>&1 &

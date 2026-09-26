@@ -1,57 +1,44 @@
-"""A trained re-ranker as a beam hook."""
-from __future__ import annotations
-
+"""Replace native step costs before any proposal pruning."""
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_follow.beam.data import collate_beam
-from vesuvius.neural_tracing.fiber_follow.beam.states import BeamStateConfig, pool_state
-from vesuvius.neural_tracing.fiber_follow.geometry import crop_local_grid
-
-HOOK_MODES = ('additive', 'replace')
+from vesuvius.neural_tracing.fiber_follow.beam.states import supported_states
 
 
 class ModelBeamHook:
-    """Re-scores each prune-time pool with one model forward.
-
-    ``additive``: loss = hand loss + weight * (-log p_onfiber). Keeps the hand
-    loss scale so later hand-scored rounds stay comparable.
-    ``replace``: loss = -rank logit (pure learned order within the pool).
-    In open-ended tracing the hook stops the search when no candidate reaches
-    ``stop_threshold`` on-fiber probability.
-    """
-
-    def __init__(self, model, vol, cfg: BeamStateConfig, device='cuda', mode='additive', weight=1.0,
-                 stop_threshold: float | None = None):
-        if mode not in HOOK_MODES:
-            raise ValueError(f'hook mode must be one of {HOOK_MODES}')
-        self.model, self.vol, self.cfg, self.device = model, vol, cfg, torch.device(device)
-        self.mode, self.weight, self.stop_threshold = mode, float(weight), stop_threshold
-        self.grid = torch.from_numpy(crop_local_grid(cfg.crop)).float()
-        self.calls = 0
-        self.last = None
+    def __init__(self, model, vol, cfg, device='cuda', stop_threshold=None):
+        self.model, self.vol, self.cfg = model, vol, cfg
+        self.device, self.stop_threshold = torch.device(device), stop_threshold
+        self.calls, self.last = 0, None
 
     @torch.no_grad()
     def scores(self, pool):
-        item = pool_state(pool, self.cfg)
-        batch = {k: v.to(self.device) for k, v in collate_beam([item], self.vol, self.cfg.crop, self.grid).items()}
+        result = torch.empty(len(pool), dtype=torch.float32)
         self.model.eval()
-        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.type == 'cuda'):
-            out = self.model(batch['x'].float(), batch['hist'], batch['hmask'], batch['candidates'],
-                             batch['point_mask'], batch['hand_rel'])
-        n = len(pool)
-        return (out['ranks'][0, :n].float().cpu().numpy(),
-                out['onfiber_logits'][0, :n].float().cpu().numpy())
+        for ids, item in supported_states(pool, self.cfg):
+            batch = {k: v.to(self.device) for k, v in collate_beam([item], self.vol, self.cfg.crop).items()}
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.type == 'cuda'):
+                # Shared encoder once per crop; score every proposal in chunks.
+                features, context = self.model.encode_scene(batch['x'].float(), batch['hist'], batch['hmask'])
+                logits = torch.cat([self.model.score_paths(features, context,
+                                    batch['candidates'][:, a:a+self.model.cfg.score_chunk],
+                                    batch['point_mask'][:, a:a+self.model.cfg.score_chunk])
+                                    for a in range(0, len(ids), self.model.cfg.score_chunk)], 1)[0]
+            result[ids] = logits.float().cpu()
+        if not torch.isfinite(result).all():
+            raise ValueError('Nonfinite learned beam scores')
+        return result
 
     def __call__(self, pool):
-        ranks, onfiber = self.scores(pool)
+        logits = self.scores(pool)
         self.calls += 1
-        p = 1 / (1 + np.exp(-onfiber.astype(np.float64)))
-        if self.mode == 'additive':
-            losses = pool.losses.astype(np.float64) + self.weight * (-F.logsigmoid(torch.from_numpy(onfiber)).numpy())
-        else:
-            losses = -ranks.astype(np.float64)
-        stop = self.stop_threshold is not None and float(p.max()) < self.stop_threshold
-        self.last = dict(ranks=ranks, onfiber=p, losses=losses, stop=stop)
+        probabilities = logits.sigmoid().numpy()
+        costs = F.softplus(-logits).numpy()*pool.step_lengths
+        # Parent already includes earlier learned increments. The hand-scored
+        # proposed step is replaced, never added back or double-counted.
+        losses = pool.parent_losses.astype(np.float64) + costs
+        stop = self.stop_threshold is not None and float(probabilities.max()) < self.stop_threshold
+        self.last = dict(ranks=logits.numpy(), onfiber=probabilities, losses=losses, stop=stop)
         return losses.astype(np.float32), bool(stop)

@@ -21,9 +21,14 @@ class DepartureEvents:
         self.cfg = cfg or EventConfig()
         self.annotation = np.asarray(annotation, float)
         self.q = arclength(self.annotation)
-        if len(self.q) < 2 or self.q[-1] <= 0 or not 0 <= q0 <= self.q[-1]:
+        # Reversing an annotation changes the summation order of segment
+        # lengths. A seed at the original endpoint can then sit a few ulps
+        # beyond the recomputed endpoint. Only absorb endpoint roundoff;
+        # genuinely out-of-range correspondence must still fail.
+        if (len(self.q) < 2 or not np.isfinite(self.q[-1]) or self.q[-1] <= 0
+                or not np.isfinite(q0) or not -1e-7 <= q0 <= self.q[-1]+1e-7):
             raise ValueError('Invalid annotation correspondence')
-        self.h, self.s_good = float(q0), 0.
+        self.h, self.s_good = float(np.clip(q0, 0., self.q[-1])), 0.
         self.physical_end = bool(physical_end)
         nonzero = np.flatnonzero(np.diff(self.q) > 0)
         self.tangent = np.diff(self.annotation, axis=0)[nonzero[-1]] / np.diff(self.q)[nonzero[-1]]

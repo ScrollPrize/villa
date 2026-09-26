@@ -5,9 +5,9 @@
   python scripts/eval_ckpt.py hand --tag hand_beam            # VC beam, no model
   python scripts/eval_ckpt.py output/beam_run/last.pt --tag beam_run --params '{"confidence": 0.5}'
 
-Beam re-ranker checkpoints (``beam_rerank_v1``) and ``hand`` trace open-ended with
+Beam scorer checkpoints (``beam_step_cost_v3``) and ``hand`` trace open-ended with
 the volume-cartographer beam through ``BeamTracer``; ``--params`` then accepts
-``max_len``, ``confidence`` (on-fiber stop threshold), ``hook_mode`` and ``hook_weight``.
+``max_len`` and ``confidence`` (on-fiber stop threshold).
 """
 from __future__ import annotations
 
@@ -103,8 +103,6 @@ def main(argv=None):
         if beam_ckpt is not None:
             from vesuvius.neural_tracing.fiber_follow.beam.hook import ModelBeamHook
             hook = ModelBeamHook(model, vol, state_cfg, device=args.device,
-                                 mode=params.get('hook_mode', beam_ckpt.get('hook_mode', 'additive')),
-                                 weight=params.get('hook_weight', beam_ckpt.get('hook_weight', 1.)),
                                  stop_threshold=params.get('confidence'))
         tracer = BeamTracer(NativeBeam(beam_spec, spec.grid_scale), hook=hook, max_len=params.get('max_len', 6000.))
     else:

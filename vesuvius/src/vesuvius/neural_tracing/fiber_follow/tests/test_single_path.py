@@ -157,13 +157,11 @@ def test_checkpoint_roundtrip_rejects_legacy_and_beam_parameter_names(tmp_path):
     torch.testing.assert_close(expected['points'],actual['points'],rtol=0,atol=0)
     ck=torch.load(path,weights_only=False);ck['architecture']='future_flow_v10';torch.save(ck,path)
     with pytest.raises(ValueError,match='single_path_flow_v11'): load_checkpoint(path,'cpu')
-    from vesuvius.neural_tracing.fiber_follow.beam.model import BeamRankNet,BeamNetConfig
-    old=Path(__file__).parents[1]/'output/single_path_v11_baseline/beam_compatibility.pt'
-    if old.exists():
-        fixture=torch.load(old,weights_only=False)
-        beam=BeamRankNet(BeamNetConfig(**fixture['cfg'])).eval();beam.load_state_dict(fixture['weights'])
-        for key,value in beam(*fixture['inputs']).items():
-            torch.testing.assert_close(value,fixture['output'][key],rtol=0,atol=0)
+    from vesuvius.neural_tracing.fiber_follow.beam.train import load_beam_checkpoint
+    old_beam=tmp_path/'old_beam.pt'
+    torch.save(dict(architecture='beam_rerank_v2',data_policy=D.DATA_POLICY),old_beam)
+    with pytest.raises(ValueError,match='beam_step_cost_v3'):
+        load_beam_checkpoint(old_beam,'cpu')
 
 
 def fiber():

@@ -24,6 +24,7 @@ from vesuvius.neural_tracing.fiber_follow.direct.data import ObservationBuilder,
 from vesuvius.neural_tracing.fiber_follow.direct.supervision import commit_window, loss_terms
 from vesuvius.neural_tracing.fiber_follow.direct.diagnostics import decision_rows, summarize_decisions
 from vesuvius.neural_tracing.fiber_follow.direct.recovery import monitor_fixture, evaluate_monitor
+from vesuvius.neural_tracing.fiber_follow.training_log import format_training_log
 
 
 def validate_volume_source(spec, manifest):
@@ -206,6 +207,13 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     judge_sources = np.zeros(5, dtype=int)
     allocation = sum((b.get('judge_allocation', torch.zeros(3)).numpy() for b in batches), np.zeros(3))
     sums['judge_synthetic_attempts'], sums['judge_synthetic_fallback'] = map(int, allocation[1:])
+    departed_allocations = [b['judge_departed_allocation'].numpy() for b in batches if 'judge_departed_allocation' in b]
+    if departed_allocations:
+        allocations = np.stack(departed_allocations)
+        sums.update(zip(('judge_replay_requested', 'judge_replay_added', 'judge_replay_attempts'),
+                        map(int, allocations[:, :3].sum(0))))
+        sums.update(zip(('judge_replay_pool_rows', 'judge_replay_pool_fibers'),
+                        map(int, allocations[:, 3:].max(0))))
     if judge is not None:
         judge.train()
     model.train()
@@ -328,6 +336,10 @@ def main(argv=None):
         raise ValueError('--init-tracer starts a new run and cannot be combined with --resume')
     if min(args.judge_loss_weight, args.judge_synthetic_fraction) < 0:
         raise ValueError('Judge allocations and loss weight must be nonnegative')
+    if not np.isfinite(args.judge_departed_fraction) or args.judge_departed_fraction < 0:
+        raise ValueError('--judge-departed-fraction must be finite and nonnegative')
+    if args.judge_departed_fraction and not args.judge:
+        raise ValueError('--judge-departed-fraction requires --judge')
     if min(args.steps, args.batch, args.microbatch, args.log_every, args.ckpt_every,
            args.threads, args.replay_keep, args.dagger_seeds, args.recovery_seeds) < 1 or args.batch % args.microbatch:
         raise ValueError('Positive counts required; microbatch must divide effective batch')
@@ -378,7 +390,8 @@ def main(argv=None):
     if resume:
         # The run directory may move; the checkpoint must still sit inside the named run.
         ignored = {'resume', 'out_root', 'device', 'batch', 'microbatch', 'workers', 'threads', 'worker_cache_gb',
-                   'log_every', 'ckpt_every', 'diag_every', 'dagger_device', 'compile', 'init_tracer'}
+                   'log_every', 'ckpt_every', 'diag_every', 'dagger_device', 'compile', 'init_tracer',
+                   'judge_departed_fraction'}
         for key, value in vars(args).items():
             if key.startswith('judge') and key not in resume['training_options'] and not args.judge:
                 continue
@@ -442,7 +455,8 @@ def main(argv=None):
     builder = ObservationBuilder(cfg)
     if args.judge:
         from .judge_supervision import JointObservationBuilder
-        builder = JointObservationBuilder(builder, slices, band, args.judge_synthetic_fraction, train_f)
+        builder = JointObservationBuilder(builder, slices, band, args.judge_synthetic_fraction, train_f,
+                                          departed_fraction=args.judge_departed_fraction, seed=args.seed+done)
     dataset = FollowDataset(train_f, spec, sample, band, chunk=args.microbatch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), fixed=fixed, onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, additional_crops=(cfg.coarse,))
@@ -458,7 +472,11 @@ def main(argv=None):
             monitor_recovery_sha256=recovery_hash,
             seed_manifest_sha256=manifest['sha256'], fiber_manifest=fiber_manifest(fibers),
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
-    log = RunLog(out/'log.jsonl')
+    log = RunLog(out/'log.jsonl', formatter=format_training_log)
+    if args.judge:
+        log.record(dict(step=done, judge_departed_fraction=args.judge_departed_fraction,
+                        previous_judge_departed_fraction=resume['training_options'].get('judge_departed_fraction', 0.)
+                        if resume else None))
     tracer = None
     recovery_vol = FiberVolume(spec) if recovery_states is not None else None
     started = time.monotonic()

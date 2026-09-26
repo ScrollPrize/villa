@@ -19,11 +19,10 @@ from vesuvius.neural_tracing.fiber_follow import data as D
 from vesuvius.neural_tracing.fiber_follow.beam import states as S
 from vesuvius.neural_tracing.fiber_follow.beam.data import BeamDataset, collate_beam, record_pools
 from vesuvius.neural_tracing.fiber_follow.beam.hook import ModelBeamHook
-from vesuvius.neural_tracing.fiber_follow.beam.model import ARCHITECTURE, BeamRankNet
+from vesuvius.neural_tracing.fiber_follow.beam.model import ARCHITECTURE, BeamRankNet, BeamNetConfig
 from vesuvius.neural_tracing.fiber_follow.beam.native import BeamSpec, NativeBeam, fiber_input_from_traced
 from vesuvius.neural_tracing.fiber_follow.beam.supervision import beam_loss
 from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec, crop_local_grid
-from vesuvius.neural_tracing.fiber_follow.model import FollowNetConfig
 from vesuvius.neural_tracing.fiber_follow.runloop import read_checkpoint, save_checkpoint
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume, FiberVolumeSpec
 
@@ -104,9 +103,9 @@ def scene(tmp_path_factory):
 
 
 def state_config():
-    return S.BeamStateConfig(crop=CropSpec(depth=24, width=17, behind=6, spacing=.5, history_render='segments',
+    return S.BeamStateConfig(crop=CropSpec(depth=24, width=17, behind=12, spacing=1., history_render='segments',
                                            history_sigma=.35),
-                             n_history=16, k_back=4, k_fwd=4, pool_size=16, tube_sigma=.35)
+                             n_history=16, k_back=4, pool_size=16)
 
 
 def test_native_beam_units_and_hand_beam_takes_the_decoy(scene):
@@ -121,8 +120,8 @@ def test_native_beam_units_and_hand_beam_takes_the_decoy(scene):
     assert abs(result.points[-1, 0] - fiber.points[straight_end, 0]) < 3
     # The bend: the hand beam prefers the straight decoy and misses the target.
     pools, result = record_pools(beam, fiber, straight_end, len(fiber.points) - 1)
-    assert pools and all(len(p) >= 8 and len(p) <= 16 for p in pools)
-    assert pools[0].round == 0 and pools[1].round == 2
+    assert pools and len(pools[0]) == 81 and max(map(len, pools)) > 256
+    assert pools[0].round == 0 and pools[1].round == 1
     assert all(np.allclose(p.paths[0][0], fiber.points[straight_end]) for p in pools)
     assert not result.reached
     assert result.points[-1, 1] < Y0 + 2.0
@@ -139,21 +138,14 @@ def test_pool_state_labels_separate_fiber_from_decoy(scene):
                 and (it['label_mask'] - it['onfiber']).sum() >= 1]
     assert junction, 'expected a pool with both on-fiber and decoy candidates'
     it = junction[0]
-    assert it['candidates'].shape == (16, cfg.k_points, 3)
-    assert it['point_mask'][:, cfg.k_back] .all() or True
-    # The anchor point sits at the local origin and the hand-best candidate is first.
-    assert np.allclose(it['candidates'][0, cfg.k_back], 0)
-    assert it['hand_rel'][0] == 0 and np.all(np.diff(it['hand_loss'][: int(it['cand_mask'].sum())]) >= 0)
-    # Prefix failure persists to the end of a candidate.
-    for row in np.nonzero(it['label_mask'])[0]:
-        target = it['prefix_target'][row][it['prefix_mask'][row] > 0]
-        assert np.all(np.diff(target) <= 0)
-        assert it['onfiber'][row] == target[-1]
-    assert 'tube_segments' in it and len(it['tube_segments'])
-    # Departed anchors supply negatives only and no tube position supervision.
-    off = [s for s in labeled_states if s['offtrack'] > 0]
-    if off:
-        assert off[0]['onfiber'].sum() == 0 and not off[0]['tube_supervised']
+    assert it['candidates'].shape[1:] == (cfg.k_points, 3)
+    assert it['point_mask'][:, cfg.k_back].all()
+    # Each proposal includes its own live parent and endpoint; labels concern
+    # the new segment, not the first few points after a stale shared ancestor.
+    assert it['point_mask'][:, -2:].all()
+    assert 'tube_segments' not in it
+    assert np.isin(it['onfiber'], [0., 1.]).all()
+    assert np.isfinite(it['quality']).all()
 
 
 def test_holdout_rejects_candidates_inside_the_band(scene):
@@ -175,23 +167,20 @@ def test_dataset_model_loss_checkpoint_and_hook(scene, tmp_path):
     batch = next(iter(ds))
     assert batch['x'].shape == (4, 2, 24, 17, 17)
     assert batch['candidates'].shape == (4, 16, cfg.k_points, 3)
-    for key in ('hist', 'hmask', 'point_mask', 'cand_mask', 'hand_rel', 'prefix_target', 'prefix_mask', 'onfiber',
-                'label_mask', 'quality', 'offtrack', 'tube_target', 'tube_mask', 'source'):
+    for key in ('hist', 'hmask', 'point_mask', 'cand_mask', 'parent_loss', 'step_length', 'onfiber',
+                'label_mask', 'quality', 'supported', 'source'):
         assert key in batch, key
-    assert batch['tube_target'].shape == (4, 24, 17, 17)
-    model_cfg = FollowNetConfig(in_channels=2, depth=24, width=17, behind=6, spacing=.5, widths=(8, 16), hidden=16,
-                                n_future=4, future_step=1., hist_points=4, hist_stride=4, clean_points=4,
-                                heat_bins=9, heat_spacing=.5, n_candidates=2, norm='group', heatmap_target='tube',
-                                tube_sigma=.35)
+    model_cfg = BeamNetConfig(in_channels=2, depth=24, width=17, behind=12, spacing=1., widths=(8, 16), hidden=16,
+                              hist_points=4, hist_stride=4, norm='group', score_chunk=64)
     model = BeamRankNet(model_cfg)
-    out = model(batch['x'].float(), batch['hist'], batch['hmask'], batch['candidates'], batch['point_mask'], batch['hand_rel'])
-    assert out['ranks'].shape == (4, 16) and out['prefix_logits'].shape == (4, 16, cfg.k_points)
-    loss, metrics = beam_loss(out, batch, cfg.k_back)
+    out = model(batch['x'].float(), batch['hist'], batch['hmask'], batch['candidates'], batch['point_mask'])
+    assert out['ranks'].shape == (4, 16) and out['step_cost'].shape == (4, 16)
+    loss, metrics = beam_loss(out, batch)
     assert torch.isfinite(loss)
     loss.backward()
-    for layer in (model.encoders[0][0], model.rank_head, model.onfiber_head, model.confidence_head, model.heat_head):
+    for layer in (model.encoders[0][0], model.cost_head[-1], model.spatial_context[1]):
         assert layer.weight.grad is not None and torch.isfinite(layer.weight.grad).all()
-    assert {'ranking', 'onfiber', 'prefix', 'tube', 'hand_top1_onfiber', 'model_top1_onfiber', 'oracle_onfiber'} <= set(metrics)
+    assert {'ranking', 'onfiber', 'model_top1_onfiber', 'oracle_onfiber'} <= set(metrics)
 
     path = tmp_path / 'beam.pt'
     save_checkpoint(path, model, scene['vol_spec'], cfg.crop, cfg.n_history, ARCHITECTURE, dict(k_back=cfg.k_back))
@@ -200,17 +189,17 @@ def test_dataset_model_loss_checkpoint_and_hook(scene, tmp_path):
     with pytest.raises(ValueError):
         read_checkpoint(path, 'spatial_candidates_v3', 'cpu')
 
-    # An additive hook with zero weight reproduces the hand beam exactly.
+    # The plain tracer remains available; the learned hook owns all step costs.
     vol = FiberVolume(scene['vol_spec'], cache_bytes=8 << 20)
     beam = NativeBeam(scene['spec'], grid_scale=8.)
     fiber = scene['fiber']
     end = int(np.abs(fiber.s - fiber.spans[0].end).argmin())
     plain = beam.trace_span(fiber.points, 0, end)
-    hook = ModelBeamHook(model, vol, cfg, device='cpu', mode='additive', weight=0.)
+    hook = ModelBeamHook(model, vol, cfg, device='cpu')
     same = beam.trace_span(fiber.points, 0, end, hook=hook)
     assert hook.calls >= 1
-    np.testing.assert_array_equal(same.points, plain.points)
-    replace = ModelBeamHook(model, vol, cfg, device='cpu', mode='replace')
+    assert plain.reached and same.points.shape[1] == 3
+    replace = ModelBeamHook(model, vol, cfg, device='cpu')
     result = beam.trace_span(fiber.points, 0, end, hook=replace)
     assert result.points.shape[1] == 3 and replace.calls >= 1
 
@@ -227,12 +216,13 @@ def test_train_smoke_writes_checkpoint_and_span_diagnostics(scene, tmp_path):
     out_root = tmp_path / 'runs'
     last = T.main(['--fiber-zarrs', str(root / 'fields'), '--fibers', str(root / 'fibers'), '--ct', str(root / 'ct'),
                    '--prediction-manifest', str(root / 'fields' / 'scene.lasagna.json'),
-                   '--beam-config', json.dumps(scene['spec'].config), '--hook-every-rounds', '2', '--pool-size', '16',
-                   '--k-back', '4', '--k-fwd', '4', '--n-history', '16', '--hist-points', '4', '--hist-stride', '4',
+                   '--beam-config', json.dumps(scene['spec'].config), '--pool-size', '16',
+                   '--ct-level', '0', '--ct-grid-scale', '4',
+                   '--k-back', '4', '--n-history', '16', '--hist-points', '4', '--hist-stride', '4',
                    '--name', 'smoke', '--out-root', str(out_root), '--device', 'cpu', '--steps', '2', '--batch', '4',
                    '--workers', '0', '--worker-cache-gb', '.01', '--beam-cache-gb', '.05', '--val-z', '1000000', '1000001',
                    '--warmup', '1', '--ckpt-every', '2', '--log-every', '1', '--diag-every', '2', '--diag-fibers', '1',
-                   '--crop-depth', '24', '--crop-width', '17', '--crop-behind', '6', '--widths', '8', '16', '--hidden', '16',
+                   '--crop-depth', '24', '--crop-width', '17', '--crop-behind', '12', '--widths', '8', '16', '--hidden', '16',
                    '--norm', 'group', '--states-per-trace', '4'])
     run = out_root / 'smoke'
     assert (run / 'config.json').exists() and Path(last).exists()
@@ -241,7 +231,7 @@ def test_train_smoke_writes_checkpoint_and_span_diagnostics(scene, tmp_path):
     assert any('model_top1_onfiber' in r for r in records)
     assert (run / 'images' / 'pool_000002.png').exists()
     model, state_cfg, vol_spec, beam_spec, ck = T.load_beam_checkpoint(last, 'cpu')
-    assert state_cfg.k_back == 4 and beam_spec.hook_pool_size == 16 and ck['hook_mode'] == 'additive'
+    assert state_cfg.k_back == 4 and beam_spec.learned_lookahead_width == 32 and ck['architecture'] == ARCHITECTURE
     # Open-ended tracing through the evaluate() interface.
     fiber = scene['fiber']
     tracer = BeamTracer(NativeBeam(beam_spec, vol_spec.grid_scale), max_len=40)

@@ -1875,8 +1875,17 @@ struct BeamHookOutcome {
     const FiberTraceConfig& config)
 {
     const int poolWidth = std::max(options.poolSize, config.beamWidth);
-    const std::vector<size_t> poolIndices = selectFrontierCandidateIndices(
-        frontier, poolWidth, config.beamPruneDistanceVoxels);
+    std::vector<size_t> poolIndices;
+    if (config.learnedScoring) {
+        // No hand-cost sorting, parent cap, or endpoint diversity filter before
+        // the scorer. Retain task order so equal learned scores are stable.
+        for (size_t i = 0; i < frontier.size(); ++i)
+            if (frontier[i].valid && std::isfinite(frontier[i].loss))
+                poolIndices.push_back(i);
+    } else {
+        poolIndices = selectFrontierCandidateIndices(
+            frontier, poolWidth, config.beamPruneDistanceVoxels);
+    }
     if (poolIndices.empty())
         return {};
 
@@ -1888,12 +1897,23 @@ struct BeamHookOutcome {
     event.startPoint = toVec3d(start);
     event.targetPoint = toVec3d(target);
     event.pool.reserve(poolIndices.size());
+    // Candidates share their parent's path: materialize each parent path once.
+    std::vector<size_t> parentSlot(parents.size(), std::numeric_limits<size_t>::max());
     for (const size_t index : poolIndices) {
         const BeamState state = beamStateFromFrontierCandidate(
             parents, tasks, scores, index, frontier[index], config);
         FiberTraceBeamHookCandidate candidate;
-        candidate.path = beamPathPoints(state);
+        const size_t beamIndex = tasks[index].beamIndex;
+        if (parentSlot[beamIndex] == std::numeric_limits<size_t>::max()) {
+            parentSlot[beamIndex] = event.parentPaths.size();
+            event.parentPaths.push_back(beamPathPoints(parents[beamIndex]));
+        }
+        candidate.parentIndex = parentSlot[beamIndex];
+        candidate.endpoint = toVec3d(beamEndpoint(state));
         candidate.loss = state.loss;
+        const BeamState& parent = parents[beamIndex];
+        candidate.parentLoss = parent.loss;
+        candidate.stepLength = cv::norm(frontier[index].point - beamEndpoint(parent));
         candidate.depth = state.depth;
         candidate.tracedLength = static_cast<double>(state.tracedLength);
         candidate.reached = state.reached;
@@ -1915,6 +1935,8 @@ struct BeamHookOutcome {
     std::vector<unsigned char> inPool(frontier.size(), 0);
     for (size_t position = 0; position < poolIndices.size(); ++position) {
         frontier[poolIndices[position]].loss = (*response.losses)[position];
+        if (!std::isfinite((*response.losses)[position]))
+            frontier[poolIndices[position]].valid = false;
         inPool[poolIndices[position]] = 1;
     }
     for (size_t index = 0; index < frontier.size(); ++index) {
@@ -2368,6 +2390,9 @@ template <typename LossAt>
               request.config.coneAngleDegrees,
               request.config.coneGridSize);
     const FiberTraceBeamHookOptions& hookOptions = request.beamHook;
+    const bool learnedScoring = request.config.learnedScoring && bool(hookOptions.hook);
+    if (learnedScoring && request.config.learnedLookaheadWidth < request.config.beamWidth)
+        throw std::invalid_argument("learned_lookahead_width must cover beam_width");
     int hookRound = 0;
     bool hookStopped = false;
     int stepIndex = 0;
@@ -2376,7 +2401,7 @@ template <typename LossAt>
         int advanced = 0;
         bool prunedFinalFrontier = false;
         const bool hookFires = static_cast<bool>(hookOptions.hook) &&
-            hookRound % hookOptions.everyRounds == 0;
+            (learnedScoring || hookRound % hookOptions.everyRounds == 0);
         // In hook rounds the lazy lookahead must make the whole pool exact,
         // not only the top beamWidth; the beamWidth prefix is unchanged.
         const int lazySelectionWidth = hookFires
@@ -2401,7 +2426,7 @@ template <typename LossAt>
                 stepIndex + advanced + 1 >= maxSteps;
             const bool lazyFinalGeneration =
                 finalLookaheadGeneration && advanced > 0 &&
-                request.config.lazyLookahead;
+                request.config.lazyLookahead && !learnedScoring;
             const std::vector<CandidateTask>* tasksPtr = nullptr;
             const std::vector<TraceVec>* candidatePointsPtr = nullptr;
             const std::vector<CandidateScore>* scoresPtr = nullptr;
@@ -2442,7 +2467,7 @@ template <typename LossAt>
                 candidatePointsPtr = &scoringScratch.candidatePoints;
                 FrontierScoreOutput frontierOutput;
                 const FrontierScoreOutput* frontierOutputPtr = nullptr;
-                if (finalLookaheadGeneration) {
+                if (finalLookaheadGeneration || learnedScoring) {
                     auto& frontier = scoringScratch.frontierCandidates;
                     frontier.clear();
                     frontier.resize(scoringScratch.tasks.size());
@@ -2472,11 +2497,18 @@ template <typename LossAt>
             const auto& tasks = *tasksPtr;
             const auto& scores = *scoresPtr;
 
-            if (finalLookaheadGeneration) {
+            if (finalLookaheadGeneration || learnedScoring) {
                 auto& frontier = scoringScratch.frontierCandidates;
+                BeamHookOutcome hookOutcome;
+                if (learnedScoring) {
+                    hookOutcome = invokeBeamHook(
+                        hookOptions, hookRound++, stepIndex + advanced + 1,
+                        maxSteps, phase, start, target, frontier, expanded,
+                        tasks, scores, request.config);
+                }
                 const auto bestReachedIndex =
                     bestReachedFrontierCandidateIndex(frontier);
-                if (bestReachedIndex.has_value()) {
+                if (bestReachedIndex.has_value() && !hookOutcome.stop) {
                     if (advanced > 0) {
                         recordExactLookaheadPotential(
                             profile,
@@ -2512,8 +2544,7 @@ template <typename LossAt>
                         request.snapTraceToSelectedCrossing,
                         traceLengthLimitVoxels);
                 }
-                BeamHookOutcome hookOutcome;
-                if (hookFires) {
+                if (hookFires && !learnedScoring) {
                     hookOutcome = invokeBeamHook(
                         hookOptions,
                         hookRound,
@@ -2528,7 +2559,7 @@ template <typename LossAt>
                         scores,
                         request.config);
                 }
-                ++hookRound;
+                if (!learnedScoring) ++hookRound;
                 const auto pruneStart = TraceClock::now();
                 std::vector<size_t> selectedIndices;
                 beams = pruneFrontierCandidates(
@@ -2536,7 +2567,8 @@ template <typename LossAt>
                     expanded,
                     tasks,
                     scores,
-                    request.config.beamWidth,
+                    learnedScoring && !finalLookaheadGeneration
+                        ? request.config.learnedLookaheadWidth : request.config.beamWidth,
                     request.config.beamPruneDistanceVoxels,
                     request.config,
                     advanced > 0 ? &selectedIndices : nullptr);
@@ -2572,6 +2604,10 @@ template <typename LossAt>
                 if (hookOutcome.stop) {
                     reason = "hook_stop";
                     hookStopped = true;
+                }
+                if (learnedScoring && !finalLookaheadGeneration && !hookStopped) {
+                    expanded = beams;
+                    continue;
                 }
                 prunedFinalFrontier = true;
                 ++advanced;

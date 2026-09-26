@@ -1,5 +1,59 @@
 # CT judge data preparation: September 25, 2026
 
+## September 26 worker crash fix
+
+The `direct_ct_judge_run2` worker core dump after step 12,700 located SIGSEGV
+in `interpolate_supported`, reading a point through an uninitialized bucket
+permutation entry. Its saved input coordinates and chunk assignments were valid,
+but the internal bucket counts disagreed with those assignments. Replaying the
+inputs alone did not reproduce the corruption. The sampler now visits contiguous
+runs of points sharing a chunk, eliminating that scratch permutation, and enables
+native bounds checks. Loading the chunk once per run avoids the per-pixel typed
+list lookup overhead of the initial fix.
+Chunk discovery, corner order, precision, and missing-support semantics are unchanged.
+The historical chunk-order timings below therefore describe the earlier kernel.
+
+Validation used the recovered 129-by-129 plane (16,641 points, six 128-cubed
+chunks) from local `s1_ds2.zarr/0` in the production Python 3.14 environment.
+Patched values and support were bit-identical to the prior kernel. Production
+Python 3.14 / Numba 0.66, fast math disabled, 50 warmup calls followed by 1,000
+serial timed calls per variant gave the following milliseconds (mean / p50 / p95):
+
+| Measurement | Original kernel | Initial fix | Contiguous runs with bounds checks |
+| --- | ---: | ---: | ---: |
+| Interpolation kernel | 0.356 / 0.356 / 0.361 | 0.833 / 0.835 / 0.839 | 0.322 / 0.322 / 0.324 |
+| Full `sample_supported`, warm chunk cache | 0.590 / 0.590 / 0.599 | 1.089 / 1.078 / 1.192 | 0.557 / 0.557 / 0.567 |
+
+These measure CPU sampling, not complete training throughput. A cProfile pass of
+500 calls per variant attributed 93–96% of time to `sample_supported` itself
+(including its native kernels); Python chunk-cache lookup took about 1% or less.
+The temporary harness, recovered inputs, JSON report, and profiles are under
+`/tmp/fiber-worker-core-42bvz8q9`. Reproduce on this machine with:
+
+```bash
+AGENTS_AGENT_MODE=1 CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 NUMBA_CACHE_DIR=/tmp/direct-numba \
+MPLCONFIGDIR=/tmp/direct-mpl PYTHONPATH=../../.. \
+/home/sean/Documents/villa4/vesuvius/.venv/bin/python \
+  /tmp/fiber-worker-core-42bvz8q9/benchmark_runs.py
+```
+
+Another 3,000 real-CT calls passed with three threads and a one-chunk reader cache
+to force concurrent mmap eviction (1.225 seconds). The targeted suite passed 94
+tests with one CUDA skip, including invalid-index rejection and concurrent mmap
+sampling:
+
+```bash
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 NUMBA_CACHE_DIR=/tmp/direct-numba \
+MPLCONFIGDIR=/tmp/direct-mpl PYTHONPATH=../../.. \
+/home/sean/Documents/villa/vesuvius/.venv/bin/python -m pytest \
+  tests/test_ct_judge.py tests/test_fast_sample.py -q -o cache_dir=/tmp/ct-judge-pytest
+```
+
+Restart existing workers to load this fix. The crash dump identified the failing
+access; the bounded checks above do not establish long-run stability.
+
 The reported 30-second training stalls were caused by CPU slice gathering.
 A profile of eight production microbatches spent 111.36 of 114.56 seconds in
 `sample_supported`, including 91.19 seconds in `numpy.unique` (85.07 seconds

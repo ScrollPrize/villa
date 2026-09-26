@@ -1,8 +1,8 @@
-"""Trace with the volume-cartographer beam plus a trained re-ranker.
+"""Trace with the volume-cartographer beam plus a trained step scorer.
 
 Span mode re-traces every control-point span of an existing VC3D fiber JSON
 the way the annotation window does (bidirectional trace + meeting fusion), with
-the model re-ranking the beam, and writes a new fiber JSON with the same
+the model scoring every proposed step, and writes a new fiber JSON with the same
 control points:
 
   python -m vesuvius.neural_tracing.fiber_follow.beam.infer output/RUN/last.pt \\
@@ -67,14 +67,12 @@ def retrace_spans(beam: NativeBeam, fiber_json: str, hook=None):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('checkpoint', help='beam re-ranker checkpoint, or hand')
+    ap.add_argument('checkpoint', help='beam step scorer checkpoint, or hand')
     ap.add_argument('--fiber-json', action='append', default=[], help='span mode input (repeatable)')
     ap.add_argument('--seed', action='append', default=[], help='open mode: base-voxel x,y,z (repeatable)')
     ap.add_argument('--heading', action='append', default=[], help='open mode: x,y,z per seed (required)')
     ap.add_argument('--max-len', type=float, default=6000., help='open mode per-direction limit, trace-grid voxels')
     ap.add_argument('--confidence', type=float, default=None, help='open mode on-fiber stop threshold')
-    ap.add_argument('--hook-mode', choices=('additive', 'replace'))
-    ap.add_argument('--hook-weight', type=float)
     ap.add_argument('--prediction-manifest')
     ap.add_argument('--normal-manifest')
     ap.add_argument('--fiber-zarrs')
@@ -100,8 +98,6 @@ def main(argv=None):
         if args.ct:
             spec.ct_zarr = args.ct
         hook = ModelBeamHook(model, FiberVolume(spec, cache_bytes=4 << 30), state_cfg, device=args.device,
-                             mode=args.hook_mode or ck.get('hook_mode', 'additive'),
-                             weight=args.hook_weight if args.hook_weight is not None else ck.get('hook_weight', 1.),
                              stop_threshold=args.confidence)
     beam = NativeBeam(beam_spec, spec.grid_scale)
     g = spec.grid_scale

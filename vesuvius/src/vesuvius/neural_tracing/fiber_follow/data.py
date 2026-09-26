@@ -439,6 +439,8 @@ class FollowDataset(torch.utils.data.IterableDataset):
         self._validate(caches)
         self.onpolicy = caches
         self.recent_pools = replay_pools(caches)
+        if hasattr(self.batch_builder, 'set_replay'):
+            self.batch_builder.set_replay(caches)
 
     def draw_replay(self,rng):
         source = int(rng.choice(3,p=(.5,.25,.25)))
@@ -493,13 +495,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     item['source_step'] = op.provenance.get('step', -1) or -1
                     if self.batch_builder is not None and hasattr(self.batch_builder, 'slices') and op.judge_trace[j] >= 0:
                         from .direct.judge_archive import PathArchive
-                        if not hasattr(op, '_judge_archive'):
-                            import hashlib
-                            from pathlib import Path
-                            if hashlib.sha256(Path(op.provenance['judge_archive']).read_bytes()).hexdigest() != op.provenance['judge_archive_sha256']:
-                                raise ValueError('Replay judge path archive changed')
-                            op._judge_archive = PathArchive(op.provenance['judge_archive'])
-                        item['judge_context'] = op._judge_archive.context(int(op.judge_trace[j]), float(op.judge_cutoff[j]),
+                        item['judge_context'] = PathArchive.from_replay(op).context(int(op.judge_trace[j]), float(op.judge_cutoff[j]),
                                                                          self.fibers[op.fiber_idx[j]], int(op.judge_revision[j]))
                     if not self.state_allowed(item):
                         item = None

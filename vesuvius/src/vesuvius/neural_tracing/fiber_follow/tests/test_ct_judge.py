@@ -26,6 +26,32 @@ def test_continuous_correspondence_and_tie():
     assert e.correspondence(np.array([3,0,0]), 0)[0] == 3
 
 
+def test_reversed_fresh_endpoint_roundoff():
+    from vesuvius.neural_tracing.fiber_follow.data import TracedFiber, SampleConfig, make_sample
+    from vesuvius.neural_tracing.fiber_follow.direct.judge_supervision import fresh_context
+    points = np.cumsum(np.random.default_rng(1).normal(size=(100, 3)), axis=0)
+    fiber = TracedFiber('roundoff', points, arclength(points), '')
+    # Reproduce the loader's endpoint draw with a dropped history.
+    item = make_sample(fiber, fiber.length, True, SampleConfig(no_history_prob=1.),
+                       np.random.default_rng(0))
+    context = fresh_context(item, fiber, fiber.length, True)
+    end = arclength(context['annotation'])[-1]
+    assert context['q0'] > end
+    events = label_path(context['path'], context['annotation'], context['q0'])
+    assert events.h == end
+
+
+@pytest.mark.parametrize('q0, expected', [(-1e-10, 0.), (10.+1e-10, 10.), (4., 4.)])
+def test_correspondence_clamps_only_endpoint_roundoff(q0, expected):
+    assert DepartureEvents(line(10), q0).h == expected
+
+
+@pytest.mark.parametrize('q0', [-1e-4, 10.+1e-4, np.nan, np.inf, -np.inf])
+def test_invalid_correspondence_still_rejected(q0):
+    with pytest.raises(ValueError, match='Invalid annotation correspondence'):
+        DepartureEvents(line(10), q0)
+
+
 def test_seven_grid_samples_confirm_six_do_not_and_return_latches():
     # Ramp finishes at arc 4, then six off-fiber samples through 6.5.
     p = np.array([[0,0,0],[0,4,0],[2.5,4,0]],float)
@@ -127,6 +153,41 @@ def test_native_corner_buckets_match_scalar_reference(missing):
     assert reader.keys == keys
     empty, empty_support = sample_supported(reader, np.empty((0, 3)))
     assert empty.shape == empty_support.shape == (0,)
+
+
+def test_native_interpolation_rejects_invalid_group_indices():
+    import numba.typed
+    from vesuvius.neural_tracing.fiber_follow.fast_sample import interpolate_supported
+    from vesuvius.neural_tracing.fiber_follow.volume import _CHUNK_TYPE
+    arrays = numba.typed.List.empty_list(_CHUNK_TYPE)
+    arrays.append(np.zeros((8,8,8), np.uint8))
+    # A malformed chunk assignment must raise, never index unchecked native memory.
+    with pytest.raises(IndexError):
+        interpolate_supported(np.array([[2.,2.,2.]]), np.array([8,8,8]), np.array([8,8,8]),
+                              np.array([[0,0,0]]), np.array([1]), arrays, np.array([True]))
+
+
+def test_native_threaded_planes_match_serial_with_mmap_eviction(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from vesuvius.neural_tracing.fiber_follow.geometry import frame_from_heading
+    # Force eviction while different planes hold chunks in their native samplers.
+    chunk_size = 16
+    (tmp_path/'.zarray').write_text(json.dumps(dict(shape=[64]*3, chunks=[chunk_size]*3,
+        dtype='|u1', fill_value=0, order='C', filters=None, compressor=None, zarr_format=2)))
+    z,y,x = np.mgrid[:chunk_size,:chunk_size,:chunk_size]
+    for key in np.ndindex(4,4,4):
+        values = (x+key[2]*chunk_size+y+key[1]*chunk_size+z+key[0]*chunk_size).astype(np.uint8)
+        values.tofile(tmp_path/'.'.join(map(str, key)))
+    reader = ChunkedArray(tmp_path, cache_bytes=chunk_size**3)
+    rng = np.random.default_rng(17)
+    cfg = SliceConfig(pixels=33, spacing=1, grid_scale=1, trace_scale=1)
+    cases = [(rng.uniform(28,36,3), frame_from_heading(rng.normal(size=3))) for _ in range(12)]
+    expected = [sample_planes(reader, center, frame, cfg) for center, frame in cases]
+    def sample(i):
+        center, frame = cases[i % len(cases)]
+        np.testing.assert_array_equal(sample_planes(reader, center, frame, cfg), expected[i % len(cases)])
+    with ThreadPoolExecutor(3) as pool:
+        list(pool.map(sample, range(48)))
 
 
 def test_slice_transform_planes_and_thin_reads():
@@ -254,6 +315,76 @@ def test_replay_archive_preserves_cutoff_and_complete_labels(tmp_path):
     save_archive(tmp_path/'paths.npz',[dict(path=path,seed_frame=np.eye(3),q0=0,reverse=False,ledger=[])])
     context = PathArchive(tmp_path/'paths.npz').context(0,5,f)
     assert arclength(context['path'])[-1] == 5 and arclength(context['complete_path'])[-1] == 9
+
+
+def departed_replay_fixture(tmp_path, *, cutoff=None):
+    import hashlib
+    from vesuvius.neural_tracing.fiber_follow.direct.judge_archive import save_archive
+    from vesuvius.neural_tracing.fiber_follow.direct.judge_supervision import JointObservationBuilder
+    path = np.array([[16,16,16], [32,16,16], [40,22,16], [64,22,16]], float)
+    archive = tmp_path/'departed.npz'
+    save_archive(archive, [dict(path=path, seed_frame=frame_from_heading([1.,0,0]), q0=0,
+                               reverse=False, audits=[])])
+    fiber = SimpleNamespace(points=np.array([[16,16,16], [90,16,16]], float), endpoint_stop=(False,False))
+    replay = SimpleNamespace(provenance=dict(judge_archive=str(archive),
+                                            judge_archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest()),
+                             fiber_idx=np.array([0]), offtrack=np.array([True]),
+                             judge_trace=np.array([0]), judge_revision=np.array([-1]),
+                             judge_cutoff=np.array([arclength(path)[-1] if cutoff is None else cutoff]))
+    cfg = SliceConfig(pixels=5, spacing=1, grid_scale=1, trace_scale=1)
+    builder = JointObservationBuilder(lambda items, vol: dict(follower_count=len(items)), cfg,
+                                      synthetic_fraction=0, fibers=[fiber], departed_fraction=.5)
+    builder.reader = ArrayReader(np.zeros((96,96,96), np.uint8))
+    return replay, builder
+
+
+def test_departed_replay_adds_only_eligible_negatives_and_refreshes(tmp_path):
+    from vesuvius.neural_tracing.fiber_follow.data import FollowDataset
+    replay, builder = departed_replay_fixture(tmp_path)
+    # Exercise the same refresh hook used by the worker's rotating replay index.
+    dataset = object.__new__(FollowDataset)
+    dataset._validate = lambda caches: None
+    dataset.batch_builder = builder
+    replay.drift = np.array([np.nan])
+    dataset._set_replay([replay])
+    for expected in (1, 2):
+        result = builder([{}, {}, {}], None)
+        assert result['follower_count'] == 3
+        assert result['judge_departed_allocation'].tolist() == [expected, expected, expected, 1, 1]
+        assert len(result['judge']) == expected
+        for sequence in result['judge']:
+            assert (sequence['known'] & sequence['eligible'] & (sequence['target'] == 0)).any()
+            assert sequence['source'].item() == 2
+    dataset._set_replay([])
+    assert not builder.departed_pools
+    result = builder([{}, {}], None)
+    assert result['judge_departed_allocation'].tolist() == [1, 0, 0, 0, 0]
+
+
+@pytest.mark.parametrize('rejection', ['before_departure', 'holdout', 'unsupported'])
+def test_departed_replay_rejects_unusable_negatives_with_bounded_retries(tmp_path, rejection):
+    from vesuvius.neural_tracing.fiber_follow.data import ZBand
+    replay, builder = departed_replay_fixture(tmp_path, cutoff=12 if rejection == 'before_departure' else None)
+    if rejection == 'holdout':
+        builder.band = ZBand(15, 17)
+    if rejection == 'unsupported':
+        builder.reader = ArrayReader(np.zeros((8,8,8), np.uint8))
+    builder.set_replay([replay])
+    result = builder([{}, {}], None)
+    assert not result['judge']
+    assert result['judge_departed_allocation'].tolist() == [1, 0, 4, 1, 1]
+
+
+def test_departed_replay_excludes_legacy_banks_and_checks_archive_hash(tmp_path):
+    replay, builder = departed_replay_fixture(tmp_path)
+    legacy = copy.copy(replay)
+    legacy.provenance = {}
+    builder.set_replay([legacy])
+    assert not builder.departed_pools
+    builder.set_replay([replay])
+    replay.provenance['judge_archive_sha256'] = 'wrong'
+    with pytest.raises(ValueError, match='archive changed'):
+        builder([{}, {}], None)
 
 
 def test_joint_microbatch_equivalence_and_independent_gradient_routes():

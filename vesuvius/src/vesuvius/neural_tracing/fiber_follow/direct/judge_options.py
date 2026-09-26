@@ -22,6 +22,8 @@ def add_judge_options(ap):
     ap.add_argument('--judge-view-batch', type=int, default=16)
     ap.add_argument('--judge-loss-weight', type=float, default=.5)
     ap.add_argument('--judge-synthetic-fraction', type=float, default=.25)
+    ap.add_argument('--judge-departed-fraction', type=float, default=0.,
+                    help='Extra departed DAgger judge sequences per follower sample (0.5 requests 12 for batch 24)')
     ap.add_argument('--judge-accept', type=float, default=.9)
     ap.add_argument('--judge-alarm', type=float, default=.5)
     ap.add_argument('--judge-provisional', type=float, default=32.)

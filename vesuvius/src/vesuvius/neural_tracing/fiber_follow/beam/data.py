@@ -1,10 +1,10 @@
-"""Training states for the beam re-ranker, produced by running the real beam.
+"""Training states for the beam step scorer, produced by running the real beam.
 
 Each sample runs the C++ tracer over one span of a training fiber (optionally
 from a perturbed start) with an observing hook, records the candidate pools at
-every hook round, and turns a subset of them into states with GT labels. The
-beam never sees GT, so it wanders exactly as it does in production and the
-recorded pools carry on-distribution mistakes.
+every generation, and turns a subset into states with GT labels. Bootstrap
+collection follows hand costs; model-guided rollouts can visit different
+states after training. Neither search nor model inputs receive GT.
 
 Every line vertex between a fiber's first and last control point is user
 verified, so span endpoints are arbitrary vertices of that trimmed line (the
@@ -21,32 +21,39 @@ import torch
 from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.fiber_follow.beam.native import BeamSpec, NativeBeam
-from vesuvius.neural_tracing.fiber_follow.beam.states import BeamStateConfig, pool_state
+from vesuvius.neural_tracing.fiber_follow.crop_sampling import scalar_crops
+from vesuvius.neural_tracing.fiber_follow.beam.states import BeamStateConfig, supported_states
 from vesuvius.neural_tracing.fiber_follow.data import (
-    FiberVolume, TracedFiber, ZBand, collate_with_volume, training_state_allowed,
+    FiberVolume, TracedFiber, ZBand, training_state_allowed,
 )
 from vesuvius.neural_tracing.fiber_follow.geometry import (
-    crop_local_grid, frame_from_heading, normalize, tangent_at,
+    frame_from_heading, normalize, tangent_at,
 )
 
 MIN_SPAN_GRID = 12.0  # VC3D traces spans of at least kMinimumTraceSteps steps (1 grid voxel each)
 MAX_SPAN_GRID = 512.0
 
-STACK_KEYS = ('candidates', 'point_mask', 'cand_mask', 'hand_loss', 'hand_rel', 'prefix_target', 'prefix_mask',
-              'onfiber', 'label_mask', 'quality', 'offtrack', 'fwd_error', 'source')
+STACK_KEYS = ('candidates', 'point_mask', 'cand_mask', 'hand_loss', 'parent_loss', 'step_length',
+              'supported', 'onfiber', 'label_mask', 'quality', 'fwd_error', 'source')
+CANDIDATE_KEYS = set(STACK_KEYS) - {'source'}
 
 
-def collate_beam(items, vol, crop, grid):
-    """Crop inputs via the shared samplers, plus the stacked pool tensors."""
-    out = collate_with_volume(items, vol, crop, grid)
-    if 'tube_segments' in items[0]:
-        from vesuvius.neural_tracing.fiber_follow.beam.tube import render_tube
-        tubes = [render_tube(it, crop, it['tube_sigma']) for it in items]
-        out['tube_target'] = torch.from_numpy(np.stack([t[0] for t in tubes]))
-        out['tube_mask'] = torch.from_numpy(np.stack([t[1] for t in tubes]))
+def collate_beam(items, vol, crop, grid=None, pad_to=None):
+    # Same tight-block, mmap-backed fused sampler used by direct/. Only CT
+    # at the selected level plus rendered history, no second image resolution.
+    out = dict(x=scalar_crops(items, vol, crop, history=True).half(),
+               hist=torch.as_tensor(np.stack([it['hist_local'] for it in items]), dtype=torch.float32),
+               hmask=torch.as_tensor(np.stack([it['hmask'] for it in items]), dtype=torch.float32))
+    size = pad_to or max(len(it['candidates']) for it in items)
     for key in STACK_KEYS:
         if key in items[0]:
-            out[key] = torch.from_numpy(np.stack([np.asarray(it[key], np.float32) for it in items]))
+            values = []
+            for it in items:
+                value = np.asarray(it[key], np.float32)
+                if key in CANDIDATE_KEYS:
+                    value = np.pad(value, [(0, size-len(value))] + [(0, 0)]*(value.ndim-1))
+                values.append(value)
+            out[key] = torch.from_numpy(np.stack(values))
     return out
 
 
@@ -134,19 +141,47 @@ class BeamDataset(torch.utils.data.IterableDataset):
         start_point = initial_direction = None
         if rng.random() < self.p_perturb:
             start_point, initial_direction = perturbed_start(fiber, start_index, sign, self.cfg, rng)
-        try:
-            pools, _ = record_pools(beam, fiber, start_index, target_index,
-                                    start_point=start_point, initial_direction=initial_direction)
-        except ValueError:
-            return []
-        if not pools:
-            return []
         if fiber.name not in trees:
             trees[fiber.name] = cKDTree(fiber.points)
-        items = [pool_state(p, self.cfg, fiber, sign=sign, tree=trees[fiber.name], rng=rng) for p in pools]
-        items = [it for it in items if training_state_allowed(it, self.cfg.crop, self.exclude)]
-        hard = [it for it in items if it['onfiber'][0] == 0]
-        easy = [it for it in items if it['onfiber'][0] != 0]
+        hard, easy = [], []
+        seen = [0, 0]
+
+        def is_hard(it):
+            best = int(np.argmin(it['hand_loss']))
+            return it['label_mask'][best] > 0 and it['onfiber'][best] == 0
+
+        def observe(pool):
+            # Stream states: retaining every full frontier path for a long trace
+            # would consume gigabytes. Each stratum has a bounded reservoir.
+            ids = np.arange(len(pool))
+            if len(ids) > self.cfg.pool_size:
+                ids = rng.choice(ids, self.cfg.pool_size, replace=False)
+            for _, item in supported_states(pool, self.cfg, fiber=fiber, sign=sign,
+                                             tree=trees[fiber.name], rng=rng, indices=ids):
+                if not training_state_allowed(item, self.cfg.crop, self.exclude):
+                    continue
+                # The footprint has already been checked; do not retain full paths.
+                item.pop('extra_world')
+                kind = int(is_hard(item))
+                reservoir = hard if kind else easy
+                seen[kind] += 1
+                if len(reservoir) < self.max_states:
+                    reservoir.append(item)
+                else:
+                    slot = int(rng.integers(seen[kind]))
+                    if slot < self.max_states:
+                        reservoir[slot] = item
+            return None
+
+        try:
+            beam.trace_span(fiber.points, start_index, target_index, start_point=start_point,
+                            initial_direction=initial_direction, hook=observe)
+        except ValueError as exc:
+            # Perturbations can land outside prediction support. Do not hide
+            # malformed crop settings, callback failures or other native errors.
+            if 'start point has no valid prediction direction' in str(exc):
+                return []
+            raise
         rng.shuffle(hard)
         rng.shuffle(easy)
         n_hard = min(len(hard), int(round(self.max_states * self.hard_prob)) if easy else self.max_states)
@@ -154,7 +189,7 @@ class BeamDataset(torch.utils.data.IterableDataset):
         for it in chosen:
             # source 2 marks hard states (hand tracer's choice is off-fiber), as in the follower's replay;
             # source 1 marks states from mined hard spans whose hand choice is still on-fiber.
-            it['source'] = np.float32(2 if it['onfiber'][0] == 0 else (1 if mined else 0))
+            it['source'] = np.float32(2 if is_hard(it) else (1 if mined else 0))
             it['source_step'] = np.float32(0)
         return chosen
 
@@ -165,7 +200,6 @@ class BeamDataset(torch.utils.data.IterableDataset):
         torch.set_num_threads(1)
         vol = FiberVolume(self.vol_spec, cache_bytes=self.cache_bytes)
         beam = NativeBeam(self.beam_spec, self.vol_spec.grid_scale)
-        grid = torch.from_numpy(crop_local_grid(self.cfg.crop)).float()
         trees = {}
         pending = []
         while True:
@@ -176,4 +210,4 @@ class BeamDataset(torch.utils.data.IterableDataset):
                 if attempts > 200 and not pending:
                     raise ValueError('Could not produce beam training states; check the beam spec and fibers')
             items, pending = pending[:self.chunk], pending[self.chunk:]
-            yield collate_beam(items, vol, self.cfg.crop, grid)
+            yield collate_beam(items, vol, self.cfg.crop, pad_to=self.cfg.pool_size)

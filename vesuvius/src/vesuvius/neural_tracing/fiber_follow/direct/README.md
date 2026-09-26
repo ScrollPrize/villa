@@ -209,7 +209,11 @@ rollout. Set `--recovery-every 0` to disable this study independently of ordinar
 monitor rollouts. No confidence ramp or smoothness penalty is enabled.
 
 Training also logs loss, actual coordinate error, prefix correctness and realized
-data-source fractions. Atomic checkpoints contain model/EMA weights,
+data-source fractions. Terminal output (including `output/logs/NAME.log`) uses
+formatted metric blocks and drift/history tables, with judge metrics when enabled.
+The complete metrics remain in `RUN/log.jsonl` for analysis and plotting.
+Running trainers pick up formatting changes after restarting from a checkpoint.
+Atomic checkpoints contain model/EMA weights,
 optimizer/RNG state, geometry identities, source settings and training options.
 Historical checkpoints still load their original one-pass or single-correction
 architecture for inference and collection. Missing `rich_path_context` and
@@ -436,6 +440,25 @@ Resume with `--resume RUN/last.pt` and the original joint options; omit
 sampling/architecture versions, source metadata identity, and initialization hash.
 As with the existing trainer, loader streams restart on resume; optimizer/RNG
 restoration does not promise an identical uninterrupted data sequence.
+
+To give the judge more real departure examples, add `--judge-departed-fraction 0.5`.
+This requests one extra judge sequence per two follower samples (12 extras at
+batch 24), drawn from departed states in the current recent DAgger banks.
+Sampling is uniform over available fibers, then rows within each fiber. Each
+extra uses the original saved path, observation cutoff and policy ledger and
+must contain at least one known, eligible negative after relabeling and holdout
+checks. Legacy banks without judge archives are excluded. Four attempts per
+requested extra bound the work when candidates are unusable; unfilled requests
+are skipped. The follower's batch composition is unchanged. Additional CT
+sampling and judge passes increase update time.
+
+The default is zero. This option may change on resume, including from existing
+checkpoints; restart the trainer with its original options plus
+`--resume RUN/last.pt --judge-departed-fraction 0.5`. The changed allocation is
+recorded in the log and subsequent checkpoints. `departed replay: added A/B`
+reports successful extras versus requested extras, along with attempts and
+candidate pool size. Extras retain the `recent` source label. Their fraction is
+an allocation of sequences, not a guaranteed fraction of negative observations.
 
 Collector replay now includes immutable `.paths.<hash>.npz` sidecars with a whole
 visited path, regular sample geometry, event onset/confirmation/censoring, and

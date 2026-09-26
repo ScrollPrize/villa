@@ -250,95 +250,15 @@ published nine replay states. These are implementation checks; no accuracy impro
 Gaussian sampling is claimed. CT level 1 losing fine neighboring fiber detail
 remains an experimental risk.
 
-## Beam re-ranker (`beam/`): learning to choose the VC3D tracer's paths
+## Learned beam scoring (`beam/`)
 
-A second training method. The volume-cartographer line-annotation window
-traces control point to control point with a C++ beam search over the fiber
-prediction volume (81-direction cone, width 8, lookahead 2, hand loss from
-presence and direction agreement plus Lasagna-normal smoothness). `beam/`
-keeps that tracer as is and trains a model to re-rank its candidate pools.
+The untrained beam model now replaces native candidate step costs before
+heuristic pruning. It scores every valid cone proposal using a single level-1
+CT crop (192 × 96 × 96; 128 voxels behind and 63 ahead), candidate-specific
+recent paths, and observed history. C++ retains search, endpoint constraints,
+and fusion. CT loading shares the direct model's tight-block, mmap-backed
+sampler. There is no coordinate decoder or tube objective.
 
-The C++ tracer is driven through new nanobind bindings, `vc.fiber_trace`
-(`volume-cartographer/python/vc/fiber_trace.cpp`). The tracer gained a
-per-request *beam hook*: at prune time it hands the best `pool_size` (32)
-frontier candidates, each as a full path from the trace start with its
-cumulative hand loss, to a callback that may return replacement losses and a
-stop flag. The standard width-8 diversity prune then runs inside the pool.
-With no hook, or a hook that returns nothing, the search is bit-identical to
-the plain tracer (the width-8 selection is a prefix of the pool selection), so
-observed pools are exactly what the annotation window would see.
-
-**Units.** Everything in `beam/` is in fiber_follow trace-grid voxels (8 base
-voxels). VC trace voxels are `prediction_to_base / 2**scaledown_power` = 2 base
-voxels on this dataset, so one VC step (4 trace voxels) is one grid voxel. The
-conversion factor is read from the opened field (`NativeBeam.grid_to_trace`),
-never hard-coded. VC's default smoothness needs the Lasagna normal dataset;
-training and evaluation take `--normal-manifest` (default in the launcher:
-`las_008_s1_full/las_008.lasagna.json`).
-
-**States and labels** (`beam/states.py`). Each pool is anchored at the end of
-the candidates' common trunk. The trunk is the history (CT crop channel and
-conditioning), and every candidate becomes `k_back` trunk points, the anchor
-and `k_fwd` new points (defaults 16 + 1 + 8 at one-voxel spacing) in the
-anchor's local frame, with its hand loss relative to the pool's best as an
-extra feature. Only the new points are labeled against the dense annotated
-curve: a point fails when it is more than `--tolerance` from the curve or
-regresses along it; failure persists along the prefix; continuation past an
-untagged annotation end is censored; anchors more than 3.5 voxels from the
-curve supply negatives only, with no tube supervision. Per candidate the
-model learns a listwise rank (soft target from prefix quality), an on-fiber
-logit for the last new point, and per-point prefix logits; a dense CT tube
-head (`tube_loss`) is an auxiliary target unless `--no-tube`.
-
-**Data** (`beam/data.py`). Every loader worker opens the prediction field
-and normal sampler itself (their readers keep process-global state, so the
-DataLoader uses the forkserver context) and runs the beam over a random span
-of a training fiber, optionally from a laterally/angularly perturbed start.
-Every vertex between a fiber's first and last control point is user verified,
-so span endpoints are arbitrary vertices of that trimmed line (12 to
-`--max-span` grid voxels, log-uniform length); the annotated control points
-are only special for mining and for the evaluation metric. An observing hook
-records every pool (`--hook-every-rounds 4` rounds = 8 grid voxels of new
-path per decision); up to `--states-per-trace` pools are kept per trace with
-hard pools (hand tracer's choice off-fiber) oversampled by `--hard-prob`.
-Because the hand beam succeeds on about 95% of spans, `beam/mine.py` first
-runs VC's restart metric over the training fibers (cached under
-`output/hard_spans_<digest>.json`, `--hard-spans none` to skip) and the
-dataset traces one of the failing spans with `--hard-span-prob`. Held-out
-band filtering also covers every candidate path.
-
-**Hook at inference** (`beam/hook.py`). `additive` (default) sets
-`loss = hand_loss + w * (-log p_onfiber)`; `replace` uses `-rank` directly.
-Open-ended traces stop when no candidate reaches the `--confidence`
-probability.
-
-```bash
-# Train (CT level 0, forkserver workers, span diagnostics every 500 steps).
-bash src/vesuvius/neural_tracing/fiber_follow/scripts/launch_beam.sh beam_v2 --steps 20000 --batch 32
-
-# VC's restart metric on held-out fibers, hand beam and model in the loop.
-.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.beam.evaluate_spans hand --tag hand
-.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.beam.evaluate_spans output/beam_v2/last.pt --tag beam_v2
-
-# Open-ended seed evaluation through the existing harness (hand beam or model).
-.venv/bin/python "$FF/scripts/eval_ckpt.py" hand --tag hand_beam
-.venv/bin/python "$FF/scripts/eval_ckpt.py" output/beam_v2/last.pt --tag beam_v2 --params '{"confidence": 0.5}'
-
-# Re-trace the spans of an annotated fiber with the model, or trace from seeds.
-.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.beam.infer output/beam_v2/last.pt --fiber-json fiber.json --out /tmp/retraced
-
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run --no-sync --with pytest python -m pytest -q \
-  tests/neural_tracing/test_fiber_follow_beam.py ../volume-cartographer/python/tests/test_fiber_trace.py
-```
-
-The bindings must be present in the environment: rebuild and reinstall
-volume-cartographer (`uv pip install --python .venv/bin/python --no-deps --reinstall
---config-settings build-dir=../volume-cartographer/build-py -e ../volume-cartographer`).
-For development against a CMake build tree configured with `VC_BUILD_PYTHON=ON`,
-set `VC_PYTHON_BUILD_DIR=<build tree>` when running the tests; the tests are
-skipped when `vc.fiber_trace` cannot be imported.
-
-Beam checkpoints carry `architecture = beam_rerank_v2`, the `BeamSpec`
-(manifests, trace config overrides, hook cadence and pool size) and the state
-configuration; `runloop.py` holds the run-directory, logging, schedule and
-checkpoint helpers shared with `train.py`.
+See [`beam/README.md`](beam/README.md) for the scoring contract, build and
+training commands, validation, and limitations. New checkpoints use
+`beam_step_cost_v3`; previous beam checkpoints are incompatible.

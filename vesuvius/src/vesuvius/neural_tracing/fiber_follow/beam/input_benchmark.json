@@ -1,0 +1,38 @@
+{
+  "ct": "/mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr",
+  "level": 1,
+  "crop": [
+    192,
+    96,
+    96
+  ],
+  "position": [
+    2000.0,
+    2000.0,
+    5500.0
+  ],
+  "iterations": 12,
+  "bit_identical": true,
+  "threads": 1,
+  "reader_cache_bytes": 268435456,
+  "cubic": {
+    "mean_ms": 159.7082975010077,
+    "p50_ms": 37.53786929883063,
+    "p95_ms": 611.0853189602492
+  },
+  "tight_shared_direct": {
+    "mean_ms": 92.46705565601587,
+    "p50_ms": 29.307469492778182,
+    "p95_ms": 330.9834806947034
+  },
+  "tight_source_voxels": [
+    1911195,
+    8237537,
+    5724500
+  ],
+  "cubic_source_voxels": 13481272,
+  "mapped_chunks": 27,
+  "compressed": false,
+  "warmup": "one exact-equality check per orientation, each reader; shared OS and reader caches",
+  "scope": "CPU crop preparation only, no network or native search"
+}

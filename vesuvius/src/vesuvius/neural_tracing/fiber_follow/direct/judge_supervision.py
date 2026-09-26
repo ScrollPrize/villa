@@ -78,9 +78,16 @@ def fresh_context(item, fiber, t, reverse):
 
 
 class JointObservationBuilder:
-    def __init__(self, follower, slices, band=None, synthetic_fraction=.25, fibers=()):
+    def __init__(self, follower, slices, band=None, synthetic_fraction=.25, fibers=(),
+                 departed_fraction=0., seed=0):
+        if not np.isfinite(departed_fraction) or departed_fraction < 0:
+            raise ValueError('Judge departed fraction must be finite and nonnegative')
         self.follower, self.slices, self.band = follower, slices, band
         self.synthetic_fraction, self.fibers = synthetic_fraction, fibers
+        self.departed_fraction, self.seed = departed_fraction, seed
+        self.departed_accumulator = 0.
+        self.departed_pools = {}
+        self.departed_rng = None
         self.reader = None
         self.extra_accumulator = 0.
         self.rng = np.random.default_rng(0)
@@ -88,6 +95,47 @@ class JointObservationBuilder:
 
     def __getstate__(self):
         return dict(self.__dict__, reader=None, contact_cache={})
+
+    def set_replay(self, caches):
+        """Recent DAgger only; legacy departure flags alone cannot train the judge."""
+        pools = {}
+        if self.departed_fraction:
+            for replay in caches:
+                if not replay.provenance.get('judge_archive'):
+                    continue
+                member = np.asarray(replay.offtrack, bool) & (replay.judge_trace >= 0)
+                for fi in np.unique(replay.fiber_idx[member]):
+                    indices = np.flatnonzero(member & (replay.fiber_idx == fi))
+                    pools.setdefault(int(fi), []).append((replay, indices))
+        self.departed_pools = pools
+
+    def departed_sequences(self, count):
+        """Uniform fibers, then rows; retain only relabeled eligible negatives.
+
+        Bounded retries keep unusable/missing replay from stalling the loader.
+        The ordinary follower sampler and its RNG are independent of these draws.
+        """
+        from .judge_archive import PathArchive
+        if self.departed_rng is None:
+            worker = torch.utils.data.get_worker_info()
+            self.departed_rng = np.random.default_rng(self.seed*1000+(worker.id if worker else 0))
+        rng = self.departed_rng
+        sequences, attempts = [], 0
+        fibers = sorted(self.departed_pools)
+        while fibers and len(sequences) < count and attempts < count*4:
+            attempts += 1
+            fi = int(rng.choice(fibers))
+            entries = self.departed_pools[fi]
+            sizes = np.array([len(indices) for _, indices in entries])
+            replay, indices = entries[rng.choice(len(entries), p=sizes/sizes.sum())]
+            j = int(rng.choice(indices))
+            context = PathArchive.from_replay(replay).context(
+                int(replay.judge_trace[j]), float(replay.judge_cutoff[j]),
+                self.fibers[fi], int(replay.judge_revision[j]))
+            sequence = make_sequence(dict(judge_context=context, source=2), self.reader, self.slices, self.band)
+            if sequence is not None and (sequence['known'] & sequence['eligible'] & (sequence['target'] <= .5)).any():
+                sequences.append(sequence)
+        return sequences, attempts
 
     def __call__(self, items, vol):
         if self.reader is None:
@@ -109,6 +157,14 @@ class JointObservationBuilder:
                     fallback += 1
             else:
                 fallback += 1
+        self.departed_accumulator += len(items)*self.departed_fraction
+        requested = int(self.departed_accumulator)
+        self.departed_accumulator -= requested
+        extras, replay_attempts = self.departed_sequences(requested) if requested else ([], 0)
+        sequences.extend(extras)
+        pool_rows = sum(len(indices) for entries in self.departed_pools.values() for _, indices in entries)
+        batch['judge_departed_allocation'] = torch.tensor(
+            [requested, len(extras), replay_attempts, pool_rows, len(self.departed_pools)])
         batch['judge'] = sequences
         for sequence in sequences:
             gain = self.rng.uniform(1-self.slices.photometric_gain, 1+self.slices.photometric_gain)

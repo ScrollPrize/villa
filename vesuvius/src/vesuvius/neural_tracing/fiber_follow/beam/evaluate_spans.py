@@ -27,7 +27,7 @@ DEFAULT_NORMALS = '/mnt/raid_nvme/volpkgs/s1_2um.volpkg/las_008_s1_full/las_008.
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('ckpt', help='beam re-ranker checkpoint, or hand')
+    ap.add_argument('ckpt', help='beam step scorer checkpoint, or hand')
     ap.add_argument('--tag', default='')
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--fibers', default='/mnt/raid_nvme/spiral_dataset_working/fibers')
@@ -37,8 +37,6 @@ def main(argv=None):
     ap.add_argument('--prediction-manifest', default=DEFAULT_PREDICTION, help='hand mode only')
     ap.add_argument('--normal-manifest', default=DEFAULT_NORMALS, help='hand mode only')
     ap.add_argument('--beam-config', default='{}', help='hand mode only: JSON TraceConfig overrides')
-    ap.add_argument('--hook-mode', choices=('additive', 'replace'))
-    ap.add_argument('--hook-weight', type=float)
     ap.add_argument('--threads', type=int, default=0, help='C++ candidate scoring threads; 0 = OpenMP default')
     ap.add_argument('--out-dir', type=Path, default=FF / 'output' / 'eval')
     args = ap.parse_args(argv)
@@ -54,9 +52,7 @@ def main(argv=None):
         model, state_cfg, vol_spec, beam_spec, ck = load_beam_checkpoint(args.ckpt, args.device)
         beam_spec = dataclasses.replace(beam_spec, parallel_threads=args.threads)
         grid_scale = vol_spec.grid_scale
-        hook = ModelBeamHook(model, FiberVolume(vol_spec, cache_bytes=4 << 30), state_cfg, device=args.device,
-                             mode=args.hook_mode or ck.get('hook_mode', 'additive'),
-                             weight=args.hook_weight if args.hook_weight is not None else ck.get('hook_weight', 1.))
+        hook = ModelBeamHook(model, FiberVolume(vol_spec, cache_bytes=4 << 30), state_cfg, device=args.device)
     fibers = load_fibers(args.fibers, grid_scale=grid_scale)
     band = ZBand(args.val_z[0] / grid_scale, args.val_z[1] / grid_scale)
     _, val = split_fibers(fibers, band)

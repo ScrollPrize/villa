@@ -4,8 +4,8 @@ from dataclasses import replace
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.data import _grid_flat, collate_targets, read_tight_blocks
-from vesuvius.neural_tracing.fiber_follow.fast_sample import sample_crop
+from vesuvius.neural_tracing.fiber_follow.data import collate_targets
+from vesuvius.neural_tracing.fiber_follow.crop_sampling import scalar_crops
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.trace import ModelTracer
 
@@ -18,18 +18,9 @@ def image_crop(items, vol, crop, pool=None):
     and tracing, including the independently resolved presence grid.
     Each item reads only the axis-aligned block its own oriented crop needs.
     """
-    grid = _grid_flat(crop)
-    empty = np.empty((0, 3), np.float32)
-    mask = np.empty(0, np.float32)
-    result = np.empty((len(items), 2, crop.depth, crop.width, crop.width), np.float32)
-    for presence in (False, True):
-        raw, starts = read_tight_blocks(items, vol, crop, pool, presence=presence)
-        scale = 1. if presence else vol.input_scale
-        for j, item in enumerate(items):
-            sampled = sample_crop(raw[j], starts[j], item['pos']*scale, item['frame']*scale,
-                                  grid, False, empty, mask, 2, 1., 'points')[0]
-            result[j, int(presence)] = sampled.reshape(crop.depth, crop.width, crop.width)
-    return torch.from_numpy(result)
+    return torch.stack([scalar_crops(items, vol, crop, pool, presence=presence)[:, 0]
+                        for presence in (False, True)], 1)
+
 
 
 class ObservationBuilder:

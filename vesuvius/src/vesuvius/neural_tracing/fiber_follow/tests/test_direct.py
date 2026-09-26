@@ -180,7 +180,7 @@ def test_both_crops_are_excluded_from_holdout():
 
 
 def test_image_sampler_matches_reference_at_fine_and_coarse_resolution(monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow.direct import data as module
+    from vesuvius.neural_tracing.fiber_follow import crop_sampling as module
     rng = np.random.default_rng(3)
     raw = rng.integers(0, 256, (1, 1, 40, 40, 40), dtype=np.uint8)
     starts = np.zeros((1, 3), np.int64)

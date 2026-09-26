@@ -203,6 +203,8 @@ const std::vector<ConfigField>& configFields()
         field<int, &ft::FiberTraceConfig::beamWidth>("beam_width"),
         field<double, &ft::FiberTraceConfig::beamPruneDistanceVoxels>("beam_prune_distance_voxels"),
         field<int, &ft::FiberTraceConfig::beamLookaheadSteps>("beam_lookahead_steps"),
+        field<bool, &ft::FiberTraceConfig::learnedScoring>("learned_scoring"),
+        field<int, &ft::FiberTraceConfig::learnedLookaheadWidth>("learned_lookahead_width"),
         field<bool, &ft::FiberTraceConfig::lazyLookahead>("lazy_lookahead"),
         field<size_t, &ft::FiberTraceConfig::lookaheadParentCap>("lookahead_parent_cap"),
         field<size_t, &ft::FiberTraceConfig::lookaheadRetryParentCap>("lookahead_retry_parent_cap"),
@@ -265,9 +267,14 @@ struct HookPool {
     std::string phase;
     cv::Vec3d start;
     cv::Vec3d target;
-    std::vector<cv::Vec3d> pathPoints;
-    std::vector<int64_t> pathOffsets;
+    // Candidate i's path is parent path parentIndex[i] followed by endpoints[i].
+    std::vector<cv::Vec3d> parentPathPoints;
+    std::vector<int64_t> parentPathOffsets;
+    std::vector<int64_t> parentIndex;
+    std::vector<cv::Vec3d> endpoints;
     std::vector<float> losses;
+    std::vector<float> parentLosses;
+    std::vector<double> stepLengths;
     std::vector<int32_t> depth;
     std::vector<double> tracedLength;
     std::vector<bool> reached;
@@ -283,11 +290,17 @@ struct HookPool {
         , start(event.startPoint)
         , target(event.targetPoint)
     {
-        pathOffsets.push_back(0);
+        parentPathOffsets.push_back(0);
+        for (const auto& path : event.parentPaths) {
+            parentPathPoints.insert(parentPathPoints.end(), path.begin(), path.end());
+            parentPathOffsets.push_back(static_cast<int64_t>(parentPathPoints.size()));
+        }
         for (const auto& candidate : event.pool) {
-            pathPoints.insert(pathPoints.end(), candidate.path.begin(), candidate.path.end());
-            pathOffsets.push_back(static_cast<int64_t>(pathPoints.size()));
+            parentIndex.push_back(static_cast<int64_t>(candidate.parentIndex));
+            endpoints.push_back(candidate.endpoint);
             losses.push_back(candidate.loss);
+            parentLosses.push_back(candidate.parentLoss);
+            stepLengths.push_back(candidate.stepLength);
             depth.push_back(candidate.depth);
             tracedLength.push_back(candidate.tracedLength);
             reached.push_back(candidate.reached);
@@ -298,6 +311,22 @@ struct HookPool {
     }
 
     [[nodiscard]] size_t size() const { return losses.size(); }
+
+    // Full candidate paths, flattened (materialized on request only).
+    [[nodiscard]] std::pair<std::vector<cv::Vec3d>, std::vector<int64_t>> flatPaths() const
+    {
+        std::vector<cv::Vec3d> points;
+        std::vector<int64_t> offsets{0};
+        for (size_t index = 0; index < size(); ++index) {
+            const auto parent = static_cast<size_t>(parentIndex[index]);
+            points.insert(points.end(),
+                          parentPathPoints.begin() + parentPathOffsets[parent],
+                          parentPathPoints.begin() + parentPathOffsets[parent + 1]);
+            points.push_back(endpoints[index]);
+            offsets.push_back(static_cast<int64_t>(points.size()));
+        }
+        return {std::move(points), std::move(offsets)};
+    }
 };
 
 struct CallbackBridge {
@@ -647,6 +676,8 @@ NB_MODULE(fiber_trace, m)
         .def_rw("beam_width", &ft::FiberTraceConfig::beamWidth)
         .def_rw("beam_prune_distance_voxels", &ft::FiberTraceConfig::beamPruneDistanceVoxels)
         .def_rw("beam_lookahead_steps", &ft::FiberTraceConfig::beamLookaheadSteps)
+        .def_rw("learned_scoring", &ft::FiberTraceConfig::learnedScoring)
+        .def_rw("learned_lookahead_width", &ft::FiberTraceConfig::learnedLookaheadWidth)
         .def_rw("lazy_lookahead", &ft::FiberTraceConfig::lazyLookahead)
         .def_rw("lookahead_parent_cap", &ft::FiberTraceConfig::lookaheadParentCap)
         .def_rw("lookahead_retry_parent_cap", &ft::FiberTraceConfig::lookaheadRetryParentCap)
@@ -785,20 +816,34 @@ NB_MODULE(fiber_trace, m)
         .def_ro("phase", &HookPool::phase)
         .def_prop_ro("start", [](const HookPool& self) { return vecArray(self.start); })
         .def_prop_ro("target", [](const HookPool& self) { return vecArray(self.target); })
-        .def_prop_ro("path_points", [](const HookPool& self) { return pointsArray(self.pathPoints); })
+        .def_prop_ro("parent_path_points",
+                     [](const HookPool& self) { return pointsArray(self.parentPathPoints); },
+                     "Distinct parent paths, flattened (trace start through each parent endpoint).")
+        .def_prop_ro("parent_path_offsets",
+                     [](const HookPool& self) {
+                         return ownedArray(std::vector<int64_t>(self.parentPathOffsets),
+                                           {self.parentPathOffsets.size()});
+                     })
+        .def_prop_ro("parent_index",
+                     [](const HookPool& self) {
+                         return ownedArray(std::vector<int64_t>(self.parentIndex), {self.parentIndex.size()});
+                     },
+                     "Per candidate: its parent path; the candidate path appends its endpoint.")
+        .def_prop_ro("endpoints", [](const HookPool& self) { return pointsArray(self.endpoints); })
+        .def_prop_ro("path_points", [](const HookPool& self) { return pointsArray(self.flatPaths().first); })
         .def_prop_ro("path_offsets",
                      [](const HookPool& self) {
-                         return ownedArray(std::vector<int64_t>(self.pathOffsets), {self.pathOffsets.size()});
+                         auto offsets = self.flatPaths().second;
+                         const size_t count = offsets.size();
+                         return ownedArray(std::move(offsets), {count});
                      })
         .def("paths",
              [](const HookPool& self) {
+                 const auto [points, offsets] = self.flatPaths();
                  nb::list out;
                  for (size_t index = 0; index < self.size(); ++index) {
-                     const auto begin = static_cast<size_t>(self.pathOffsets[index]);
-                     const auto end = static_cast<size_t>(self.pathOffsets[index + 1]);
                      out.append(pointsArray(std::vector<cv::Vec3d>(
-                         self.pathPoints.begin() + static_cast<std::ptrdiff_t>(begin),
-                         self.pathPoints.begin() + static_cast<std::ptrdiff_t>(end))));
+                         points.begin() + offsets[index], points.begin() + offsets[index + 1])));
                  }
                  return out;
              },
@@ -807,6 +852,12 @@ NB_MODULE(fiber_trace, m)
                      [](const HookPool& self) {
                          return ownedArray(std::vector<float>(self.losses), {self.losses.size()});
                      })
+        .def_prop_ro("parent_losses", [](const HookPool& self) {
+            return ownedArray(std::vector<float>(self.parentLosses), {self.size()});
+        })
+        .def_prop_ro("step_lengths", [](const HookPool& self) {
+            return ownedArray(std::vector<double>(self.stepLengths), {self.size()});
+        })
         .def_prop_ro("depth",
                      [](const HookPool& self) {
                          return ownedArray(std::vector<int32_t>(self.depth), {self.depth.size()});

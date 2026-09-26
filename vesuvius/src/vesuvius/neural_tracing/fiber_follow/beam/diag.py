@@ -1,4 +1,4 @@
-"""Diagnostics for the beam re-ranker: pool images and the span restart metric."""
+"""Diagnostics for the beam step scorer: pool images and the span restart metric."""
 from __future__ import annotations
 
 import matplotlib
@@ -6,15 +6,52 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from pathlib import Path
 
 from vesuvius.neural_tracing.fiber_follow.beam.native import fiber_input_from_traced
+
+
+def rollout_images(beam, hook, vol, fibers, seeds, images, step, *, max_len=400., confidence=.5):
+    """Plot and score the same open traces, paired on fixed held-out seeds.
+
+    Unlike the span metric, these traces have no target or control-point resets.
+    Reuse the common straightened CT/GT renderer; never trace again for images.
+    """
+    if not seeds:
+        return []
+    from vesuvius.neural_tracing.fiber_follow.beam.trace import BeamTracer
+    from vesuvius.neural_tracing.fiber_follow.diag import plot_rollouts
+    from vesuvius.neural_tracing.fiber_follow.evaluate import evaluate
+
+    images = Path(images)
+    images.mkdir(parents=True, exist_ok=True)
+    was_training, old_threshold = hook.model.training, hook.stop_threshold
+    old_calls, old_last = hook.calls, hook.last
+    reports = []
+    try:
+        hook.model.eval()
+        hook.stop_threshold = confidence
+        for method, active_hook in (('hand', None), ('model', hook)):
+            tracer = BeamTracer(beam, active_hook, max_len=max_len)
+            traces = []
+            rows, summary = evaluate(tracer, fibers, seeds, batch=1, coverage_max_len=max_len,
+                                     on_trace=lambda seed, path, reason: traces.append((path, reason)))
+            paths, reasons = zip(*traces)
+            destination = images / f'rollout_{step:06d}_{method}.png'
+            plot_rollouts(vol, fibers, seeds, paths, reasons, destination, max_len=max_len, rows=rows)
+            reports.append(dict(beam_rollout=method, threshold=confidence if active_hook else None,
+                                coverage_max_len=max_len, image=str(destination), **summary))
+    finally:
+        hook.model.train(was_training)
+        hook.stop_threshold, hook.calls, hook.last = old_threshold, old_calls, old_last
+    return reports
 
 
 def plot_pool(batch, output, crop, path, k_back, n=6):
     """Per state: two max projections of the CT crop with every candidate.
 
     Green: on-fiber label, red: off, grey: unlabeled. Orange ring marks the
-    hand tracer's choice (pool index 0), cyan ring the model's argmax.
+    lowest hand-cost sampled candidate, cyan ring the model's argmax.
     """
     B = min(n, len(batch['x']))
     fig, axes = plt.subplots(B, 2, figsize=(7, 3.2 * B), squeeze=False)
@@ -25,10 +62,12 @@ def plot_pool(batch, output, crop, path, k_back, n=6):
     on = batch['onfiber'].cpu().numpy()
     labeled = batch['label_mask'].cpu().numpy()
     ranks = output['ranks'].detach().float().cpu().numpy()
+    hand_losses = batch['hand_loss'].cpu().numpy()
     mid = (crop.width - 1) / 2
     for i in range(B):
         valid = cmask[i] > 0
         model_pick = int(np.argmax(np.where(valid, ranks[i], -np.inf)))
+        hand_pick = int(np.argmin(np.where(valid, hand_losses[i], np.inf)))
         for j, (axis, lat) in enumerate(((1, 0), (2, 1))):  # project over v -> show u; over u -> show v
             ax = axes[i, j]
             img = x[i].max(axis)  # (D, W)
@@ -39,12 +78,12 @@ def plot_pool(batch, output, crop, path, k_back, n=6):
                 pts = cands[i, c][pmask[i, c] > 0]
                 col = 'lime' if on[i, c] > 0 else ('red' if labeled[i, c] > 0 else '0.6')
                 ax.plot(pts[:, lat] / crop.spacing + mid, pts[:, 2] / crop.spacing + crop.behind, color=col, lw=.8, alpha=.8)
-                if c == 0 or c == model_pick:
+                if c == hand_pick or c == model_pick:
                     end = pts[-1]
                     ax.scatter([end[lat] / crop.spacing + mid], [end[2] / crop.spacing + crop.behind], s=60,
-                               facecolors='none', edgecolors='orange' if c == 0 else 'cyan', lw=1.5)
-            ax.set_title(f"state {i} {'u' if lat == 0 else 'v'}-f  off={int(batch['offtrack'][i])} "
-                         f"hand_on={int(on[i, 0])} model_on={int(on[i, model_pick])}", fontsize=8)
+                               facecolors='none', edgecolors='orange' if c == hand_pick else 'cyan', lw=1.5)
+            ax.set_title(f"state {i} {'u' if lat == 0 else 'v'}-f  "
+                         f"hand_on={int(on[i, hand_pick])} model_on={int(on[i, model_pick])}", fontsize=8)
             ax.set_xticks([])
             ax.set_yticks([])
     fig.tight_layout()
