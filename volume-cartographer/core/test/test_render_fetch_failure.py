@@ -380,7 +380,8 @@ class FetchFailureTests(unittest.TestCase):
         self.assertEqual(attrs["source_zarr"], url)
         self.assertEqual(p["schema_version"], 1)
         self.assertEqual(p["tool"], "vc_render_tifxyz")
-        self.assertEqual(len(p["tool_git_commit"]), 40)
+        # A build without git history records "Untracked" instead of a commit.
+        self.assertRegex(p["tool_git_commit"], r"^([0-9a-f]{40}|Untracked)$")
         self.assertEqual(p["source_volume"]["input_url"], url)
         self.assertFalse(p["source_volume"]["input_url_redacted"])
         self.assertNotIn("local_path", p["source_volume"])
