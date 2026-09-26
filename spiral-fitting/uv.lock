@@ -146,6 +146,20 @@ wheels = [
 ]
 
 [[package]]
+name = "brook-cu12"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "sys_platform == 'linux'" },
+    { name = "osteoid", version = "0.7.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "packaging", marker = "sys_platform == 'linux'" },
+    { name = "tqdm", marker = "sys_platform == 'linux'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/00/57/1b4b8a6afef8db5f2f9beeef4e331b1d0a14cdd20caec7d48ffbddae62b8/brook_cu12-0.1.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1591191656bcefa75d308bc4e40c5156d89023588879fed5536d0a063de2dff6", size = 23879974, upload-time = "2026-09-24T19:59:06.833Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2026.7.22"
 source = { registry = "https://pypi.org/simple" }
@@ -350,6 +364,23 @@ wheels = [
 ]
 
 [[package]]
+name = "cucim-cu12"
+version = "26.8.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click", marker = "sys_platform == 'linux'" },
+    { name = "cupy-cuda12x", extra = ["ctk"], marker = "sys_platform == 'linux'" },
+    { name = "lazy-loader", marker = "sys_platform == 'linux'" },
+    { name = "numpy", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nvimgcodec-cu12", marker = "sys_platform == 'linux'" },
+    { name = "scikit-image", marker = "sys_platform == 'linux'" },
+    { name = "scipy", marker = "sys_platform == 'linux'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/82/6b/0315cf96c2347eea6823b6e19c0d61fcc9faf519b9d612fbb2bbc9d61ae2/cucim_cu12-26.8.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:94a7835ca5bd200d3b13336418f6a81c960ffecdae9e17faf9bf6cfdd71bcf38", size = 18053880, upload-time = "2026-08-06T18:06:29.825Z" },
+]
+
+[[package]]
 name = "cuda-bindings"
 version = "12.9.7"
 source = { registry = "https://pypi.org/simple" }
@@ -412,6 +443,24 @@ nvrtc = [
 ]
 nvtx = [
     { name = "nvidia-nvtx-cu12" },
+]
+
+[[package]]
+name = "cupy-cuda12x"
+version = "14.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cuda-pathfinder", marker = "sys_platform == 'linux'" },
+    { name = "numpy", marker = "sys_platform == 'linux'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/04/5e/e6134253265fefc0a35356adcebc4e3ffa81f6c9a2a74f8f9e2de32b3018/cupy_cuda12x-14.2.0-cp314-cp314-manylinux2014_x86_64.whl", hash = "sha256:db802e4b9a85ed84fd3e84790586c06e808ee45e0214cd4e80734c09fcf93073", size = 135091580, upload-time = "2026-08-20T02:40:33.351Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/c9/73227968a5b01ac31eaf1d5c58b4318e4b83654ed6dac3c310c7b2075c36/cupy_cuda12x-14.2.0-cp314-cp314t-manylinux2014_x86_64.whl", hash = "sha256:8cbbd48c9cfd6b78d0a833ebbafda3e1b057c38d6acc3c6e54de0735a7364e27", size = 135455541, upload-time = "2026-08-20T02:40:46.804Z" },
+]
+
+[package.optional-dependencies]
+ctk = [
+    { name = "cuda-toolkit", extra = ["cublas", "cudart", "cufft", "curand", "cusolver", "cusparse", "nvrtc"], marker = "sys_platform == 'linux'" },
 ]
 
 [[package]]
@@ -712,7 +761,8 @@ dependencies = [
     { name = "fill-voids" },
     { name = "networkx" },
     { name = "numpy" },
-    { name = "osteoid" },
+    { name = "osteoid", version = "0.6.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+    { name = "osteoid", version = "0.7.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
     { name = "pathos" },
     { name = "posix-ipc", marker = "sys_platform != 'win32'" },
     { name = "psutil", marker = "sys_platform != 'win32'" },
@@ -819,6 +869,18 @@ wheels = [
 ]
 
 [[package]]
+name = "lazy-loader"
+version = "0.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging", marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/19/8c/0f2ff2a8b7513e68871a74740c17a504b0488c679b379e6445ebb7bd78dc/lazy_loader-0.6.tar.gz", hash = "sha256:2f4b7824d6401958639008a0cae20c776b61dff619accd6890693e2de8260167", size = 18438, upload-time = "2026-09-21T21:31:32.982Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/23/93/4e45e37f26c820216704b36b8e67cc55c490a7abd287a78a26a2c0e21386/lazy_loader-0.6-py3-none-any.whl", hash = "sha256:77253be3391b06124a0e16105bd663b6c54470af1a9ca8e1cf026f38d58ed056", size = 8791, upload-time = "2026-09-21T21:31:31.632Z" },
+]
+
+[[package]]
 name = "libigl"
 version = "2.6.3"
 source = { registry = "https://pypi.org/simple" }
@@ -833,6 +895,16 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/6a/88/d964fc9e6ee297793b8c65937f1bbe1365f3faaa29fc22054aa51a1e05a1/libigl-2.6.3-cp312-abi3-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:98952af1bc41e363a642c880465e91f951164a6ee23ca62e8e8449d00a31e2d0", size = 13158545, upload-time = "2026-09-01T02:46:25.196Z" },
     { url = "https://files.pythonhosted.org/packages/f6/c2/8641402402fbfa553c51615825434802de9c3b60b2580acdaad5312af396/libigl-2.6.3-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4a1d28aebfeb8b232a58943b1af318ec61a1fff7650a9d25a1396ba8fa1ef6d6", size = 13889363, upload-time = "2026-09-01T02:46:41.414Z" },
     { url = "https://files.pythonhosted.org/packages/0c/13/6893321d8fc1a742a276a5de796e1818cae33a0589b46f487a6cba2547c5/libigl-2.6.3-cp312-abi3-win_amd64.whl", hash = "sha256:1d91745ed0e78c56a04539e3231ce6faff49ae0dbe123caa2034e1886fcb2e7d", size = 20239839, upload-time = "2026-09-01T02:47:07.712Z" },
+]
+
+[[package]]
+name = "llvmlite"
+version = "0.49.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/43/27/72ae94ea5c8f7349ec1c229d4cd058feb799cbd0833ad6d1b47c919b37b7/llvmlite-0.49.0.tar.gz", hash = "sha256:00f16db782f4a13c78c5804aedc434e46794a77e89999a168f9401106270e50a", size = 194467, upload-time = "2026-08-11T16:26:00.489Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3a/61/0b23849141a4c4e7091fcd158ebb45195896974bebca3e58fee7cad4b4f4/llvmlite-0.49.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:4281a0171d66d2098adce4ba706b8c550b1b10718650f682d64cde16e84e4de5", size = 59890659, upload-time = "2026-08-11T16:25:08.733Z" },
+    { url = "https://files.pythonhosted.org/packages/98/07/a2c4f04e2111ccc274b4d5e3331398a9dcf6d6e5e55d6444b1ad9d6381cf/llvmlite-0.49.0-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:d5555ea1d63928481cbf7fcb1d67452b216c7e5b393a4eb7aa1401e67f2a4fc4", size = 59890658, upload-time = "2026-08-11T16:25:43.294Z" },
 ]
 
 [[package]]
@@ -1036,6 +1108,20 @@ wheels = [
 ]
 
 [[package]]
+name = "numba"
+version = "0.67.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "llvmlite", marker = "sys_platform == 'linux'" },
+    { name = "numpy", marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/7a/90/2544f4e3a61e501d6c9a5418fd4b905323222693d54a02cab0106a0af865/numba-0.67.0.tar.gz", hash = "sha256:cd75aa535b33fa05d9d930b1ae8af9f97a2881e96d72dfb38ec9b78284d9f851", size = 2836515, upload-time = "2026-08-11T23:04:00.174Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1b/36/e614ba2bc0f005ed0f37a6413f08fe705210297ddb9a37a475a8b9fdab61/numba-0.67.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:5269245a675abdd3e2c35ec6bb2f250355effa9032514d8f2354f0d2d10854bd", size = 3861040, upload-time = "2026-08-11T23:03:43.842Z" },
+    { url = "https://files.pythonhosted.org/packages/74/62/b8174ca95a4cc1a7ba1520767734e016991545590b8fbde521b681701a9f/numba-0.67.0-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:aa5f002f665bec321b950dacaa26ee009e1d720f6ac9d9856eed5efe1caa03a6", size = 3896986, upload-time = "2026-08-11T23:03:53.752Z" },
+]
+
+[[package]]
 name = "numcodecs"
 version = "0.16.5"
 source = { registry = "https://pypi.org/simple" }
@@ -1226,6 +1312,14 @@ wheels = [
 ]
 
 [[package]]
+name = "nvidia-nvimgcodec-cu12"
+version = "0.9.0.20"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ff/40/46399708f195b8926ec1eadc7f0bca118cc4e3e06a202af34d892f588027/nvidia_nvimgcodec_cu12-0.9.0.20-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:00627d63501ff83a7578683f784f03d07c6b69a1db6017fdabfacb0fc1c4cb8a", size = 32056593, upload-time = "2026-07-14T17:36:11.219Z" },
+]
+
+[[package]]
 name = "nvidia-nvjitlink-cu12"
 version = "12.8.93"
 source = { registry = "https://pypi.org/simple" }
@@ -1296,26 +1390,55 @@ wheels = [
 name = "osteoid"
 version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "sys_platform == 'win32'",
+    "sys_platform != 'linux' and sys_platform != 'win32'",
+]
 dependencies = [
-    { name = "fastremap" },
-    { name = "networkx" },
-    { name = "numpy" },
-    { name = "pybind11" },
+    { name = "fastremap", marker = "sys_platform != 'linux'" },
+    { name = "networkx", marker = "sys_platform != 'linux'" },
+    { name = "numpy", marker = "sys_platform != 'linux'" },
+    { name = "pybind11", marker = "sys_platform != 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/e9/e0/abbf7fe327cf560da5d222b5a9a27efab541666dcf61c3daf04fad9dd17d/osteoid-0.6.0.tar.gz", hash = "sha256:9f1db97939ee746c64dfac0b6cc980512cc193cd27cab39917852e09fd5799eb", size = 416141, upload-time = "2025-12-06T05:08:25.808Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3d/17/7728ceba72f967db96dfd99c9af63705ef09dcaa0fa335cb309fac9db984/osteoid-0.6.0-cp314-cp314-macosx_10_13_x86_64.whl", hash = "sha256:317ee8115d633ad943e186bea556ff5bde1ee90b7cac24826add072c1c9d0dcf", size = 143326, upload-time = "2025-12-06T05:08:08.552Z" },
     { url = "https://files.pythonhosted.org/packages/11/af/b5633ab1d4f7c8372b6eb15d76d51d8f2a17546c5b17bf2ec00c11388365/osteoid-0.6.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:3e7a7530ce75df2187ea8137814a969acaf7d4ff66146f740340e66b2dce7fb2", size = 126423, upload-time = "2025-12-06T05:08:09.91Z" },
-    { url = "https://files.pythonhosted.org/packages/6e/a2/90780f037beb26ef03a623320236fb05076cf225b2cbd5a00574125103e2/osteoid-0.6.0-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2564300e2c4518e86d07da509ae2e9388a3fdf458b9c78f08c5175d624abf0d1", size = 146084, upload-time = "2025-12-06T05:08:11.009Z" },
-    { url = "https://files.pythonhosted.org/packages/1f/43/a604d3292b286f593503cc19990219ce74c8a52aea4491badc80363adad9/osteoid-0.6.0-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0d35aff7a3769d3f1a75403f07d4e32feff373cbcccfb27de5cdff4c74d7502e", size = 154547, upload-time = "2025-12-06T05:08:11.852Z" },
     { url = "https://files.pythonhosted.org/packages/6a/1f/58128d77b691e53e8a836e7393e534b5197c040b48b8be89f4ec9fcaf025/osteoid-0.6.0-cp314-cp314-win32.whl", hash = "sha256:846720595180fd62f0a6351fe5c6b6915e858dee46d0b39b5fe84bb46507994b", size = 120460, upload-time = "2025-12-06T05:08:13.806Z" },
     { url = "https://files.pythonhosted.org/packages/76/33/8bfb2d63dcb7fffb6430cccd8dba78e794e2b8fd0ae5742be2ecf39ac6ce/osteoid-0.6.0-cp314-cp314-win_amd64.whl", hash = "sha256:28f97f358788bd9d2e2d53b285637e402341b8e3903146e23711dc7b518672d7", size = 127807, upload-time = "2025-12-06T05:08:13.027Z" },
     { url = "https://files.pythonhosted.org/packages/8c/d5/65367ce9253df52dfb3cd03c6843f3c884fcddbb30a4e04d8b92a6c5bf6d/osteoid-0.6.0-cp314-cp314t-macosx_10_13_x86_64.whl", hash = "sha256:bf2c79d492bdece1d0f925da9599fc5f914a8d9f78934f6d39a8d855060247ca", size = 146967, upload-time = "2025-12-06T05:08:14.596Z" },
     { url = "https://files.pythonhosted.org/packages/47/1b/2af426c74befbc40a0e02893379b3def305eef29fc3d1e5323c6f0acfb35/osteoid-0.6.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:8ec131e4148b50147c7fa4d4ef99e65c13fb1ab02fbbcc97808545501bb122dd", size = 130496, upload-time = "2025-12-06T05:08:15.79Z" },
-    { url = "https://files.pythonhosted.org/packages/e6/d3/075fa6cc2893c3fe3117c07d632f5175824ffc4a3668c3946214e7c91d58/osteoid-0.6.0-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a2f65dd94c4d4e5a96baeb6b48838892ea2a9cd91bca0979c02978c81bf41026", size = 149216, upload-time = "2025-12-06T05:08:16.901Z" },
-    { url = "https://files.pythonhosted.org/packages/90/74/6f1b200d25bab5b4a60892eff3e7f4076b41f816938bf83b8653127c82f9/osteoid-0.6.0-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5a4e9a4be2f0a7d91b664aa10e02c2ac6616078208d451c4c352a918a6356006", size = 157185, upload-time = "2025-12-06T05:08:17.794Z" },
     { url = "https://files.pythonhosted.org/packages/56/b6/13128d51ff558b5b9cb30cb08388cc36954f112e37d3e05207f3a4c8f289/osteoid-0.6.0-cp314-cp314t-win32.whl", hash = "sha256:9aa71243dfe822959d2e8644a925633277d71ddc8c24d490c37b9ec60c2a667c", size = 126608, upload-time = "2025-12-06T05:08:19.532Z" },
     { url = "https://files.pythonhosted.org/packages/c3/55/f02d8836afa9d4f472c904f7ccea792ddde1099be7dd7c500e052e420b92/osteoid-0.6.0-cp314-cp314t-win_amd64.whl", hash = "sha256:df9a8b377cfc8c20ecca0d1ce6ecfba4793eb37a67f1819e9e0f5b74c1747f1d", size = 136012, upload-time = "2025-12-06T05:08:18.711Z" },
+]
+
+[[package]]
+name = "osteoid"
+version = "0.7.3"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "sys_platform == 'linux'",
+]
+dependencies = [
+    { name = "fastremap", marker = "sys_platform == 'linux'" },
+    { name = "networkx", marker = "sys_platform == 'linux'" },
+    { name = "numpy", marker = "sys_platform == 'linux'" },
+    { name = "pybind11", marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5f/e9/f559dc4a35579728a21205542491af8a9ed7224bdedd0aea7094a70db1ae/osteoid-0.7.3.tar.gz", hash = "sha256:1d0f46fe9f3a1fab0a8c7abbd378bf859e87fd81167fb6a7ef880eb9b8a897f8", size = 418294, upload-time = "2026-09-02T18:48:53.623Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/65/f1/f143fd6d5565e9456a698cdafa5ab1c591137e31ffe7a7f84c0d8c437bb1/osteoid-0.7.3-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:42e672f6b9afd98e819de6c9050dbb08bc933754c5ea0f5e4dfb2ff2142907e4", size = 154887, upload-time = "2026-09-02T18:48:25.197Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/1f/f019e103951c283ce9fc1498dd049206ca25ca1d5f8feba912677d8d6060/osteoid-0.7.3-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3bc01d6c777d07382ccba6bdf57c71e93e2a8df0449f6821e06dc49bd26c93ca", size = 163870, upload-time = "2026-09-02T18:48:26.184Z" },
+    { url = "https://files.pythonhosted.org/packages/57/69/c0165f397db9a7d8c4f24f80a0999ca8bc80fd0f8bd1d419784fb1f3a2c3/osteoid-0.7.3-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:a6a30018503e8425104a5656f765b5bfde2ac03a92c87ab5738ecebf13c5f216", size = 1141626, upload-time = "2026-09-02T18:48:27.624Z" },
+    { url = "https://files.pythonhosted.org/packages/53/ca/2faf249b7cfafdb8d7506df1b6614807f93929d2edd5613d049ea712df98/osteoid-0.7.3-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:53d3cba7e10da6fba096e962f6a2434e3c705481668bc18f2a45c62bedc59238", size = 1196641, upload-time = "2026-09-02T18:48:29.325Z" },
+    { url = "https://files.pythonhosted.org/packages/66/73/a4861e5e4e10fa85f685362417279452edf8314a7097a45b2efa42f56fdd/osteoid-0.7.3-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:5abac7b73fd045dca9633ccd742ad69637f65548711b409fd09698059d86e631", size = 158890, upload-time = "2026-09-02T18:48:33.256Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/c8/f54bcd5f71d30944835e0fadd762d6ec4ab1950d3c4f38ed20830bd6eb15/osteoid-0.7.3-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:95ff7ef6afafcae2a92aa3f16fc185362f84111f066c75fbf69ed0e43b80ce1d", size = 166861, upload-time = "2026-09-02T18:48:34.151Z" },
+    { url = "https://files.pythonhosted.org/packages/a2/d9/86dc35a48ddc3a5edbcc61747516545653d2054486fa00d90fcb54c4b77d/osteoid-0.7.3-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:9bef4b3618c40bef2defd00d543a27d7de8cd0efb313386c9515228eefbf5b56", size = 1144801, upload-time = "2026-09-02T18:48:35.306Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/cc/d150fe1857c1e566f9abe04b5cc6a8db9956bf9288968ccc238c682c628c/osteoid-0.7.3-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:89e241f21ea4f48aef010c47da84e34721b597df15b54708809660307fa8cf32", size = 1198802, upload-time = "2026-09-02T18:48:36.703Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/3c/135d0424e2ea844c9eb93da8bf7f1525835940cf37a58b43a35850e15e0a/osteoid-0.7.3-cp315-cp315-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:cf3c909d2215037f861ec6d95dd89c83b82c9f0c22c9dfd751ada18fa3e72d9f", size = 155065, upload-time = "2026-09-02T18:48:40.705Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/68/0d24224d6e42d0137b5a999a772eeda109a216123341f3ac1dea6d379003/osteoid-0.7.3-cp315-cp315-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5773fe57c97345b7240c77904e50acf1519a7be074468d292ffcf629b8d0a7e1", size = 165575, upload-time = "2026-09-02T18:48:41.601Z" },
+    { url = "https://files.pythonhosted.org/packages/52/a6/30fd2d929ceb7d77ff79f9921eafd62694f4dae41d0fc1eaa1d68025a933/osteoid-0.7.3-cp315-cp315-musllinux_1_2_aarch64.whl", hash = "sha256:91f349840361fb15fae2999ac3857e6ca723ab5aad21e9420a4eee6d35749756", size = 1141813, upload-time = "2026-09-02T18:48:42.613Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/3d/c35343b14de41d8323a3794c2dfcce3f9730f35886f772908088a1763828/osteoid-0.7.3-cp315-cp315-musllinux_1_2_x86_64.whl", hash = "sha256:83b7f53621ddc5623e66daae47bf4486e0ee6380868bf41333e9dbe3d93198bf", size = 1197367, upload-time = "2026-09-02T18:48:44.108Z" },
 ]
 
 [[package]]
@@ -1770,6 +1893,28 @@ wheels = [
 ]
 
 [[package]]
+name = "scikit-image"
+version = "0.26.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "imageio", marker = "sys_platform == 'linux'" },
+    { name = "lazy-loader", marker = "sys_platform == 'linux'" },
+    { name = "networkx", marker = "sys_platform == 'linux'" },
+    { name = "numpy", marker = "sys_platform == 'linux'" },
+    { name = "packaging", marker = "sys_platform == 'linux'" },
+    { name = "pillow", marker = "sys_platform == 'linux'" },
+    { name = "scipy", marker = "sys_platform == 'linux'" },
+    { name = "tifffile", marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a1/b4/2528bb43c67d48053a7a649a9666432dc307d66ba02e3a6d5c40f46655df/scikit_image-0.26.0.tar.gz", hash = "sha256:f5f970ab04efad85c24714321fcc91613fcb64ef2a892a13167df2f3e59199fa", size = 22729739, upload-time = "2025-12-20T17:12:21.824Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/73/c3/cec6a3cbaadfdcc02bd6ff02f3abfe09eaa7f4d4e0a525a1e3a3f4bce49c/scikit_image-0.26.0-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c6624a76c6085218248154cc7e1500e6b488edcd9499004dd0d35040607d7505", size = 13684340, upload-time = "2025-12-20T17:11:53.708Z" },
+    { url = "https://files.pythonhosted.org/packages/ee/25/2514df226bbcedfe9b2caafa1ba7bc87231a0c339066981b182b08340e06/scikit_image-0.26.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:ede4d6d255cc5da9faeb2f9ba7fedbc990abbc652db429f40a16b22e770bb578", size = 14770021, upload-time = "2025-12-20T17:11:58.014Z" },
+    { url = "https://files.pythonhosted.org/packages/48/b4/612d354f946c9600e7dea012723c11d47e8d455384e530f6daaaeb9bf62c/scikit_image-0.26.0-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3268f13310e6857508bd87202620df996199a016a1d281b309441d227c822394", size = 13272431, upload-time = "2025-12-20T17:12:10.255Z" },
+    { url = "https://files.pythonhosted.org/packages/47/88/00a90402e1775634043c2a0af8a3c76ad450866d9fa444efcc43b553ba2d/scikit_image-0.26.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:2c1e7bd342f43e7a97e571b3f03ba4c1293ea1a35c3f13f41efdc8a81c1dc8f2", size = 14364151, upload-time = "2025-12-20T17:12:14.909Z" },
+]
+
+[[package]]
 name = "scipy"
 version = "1.18.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1836,19 +1981,26 @@ name = "spiral"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "brook-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "click" },
+    { name = "connected-components-3d" },
     { name = "crackle-codec" },
+    { name = "cucim-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "cupy-cuda12x", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "einops" },
     { name = "imageio" },
-    { name = "kimimaro", extra = ["all"] },
+    { name = "kimimaro", extra = ["all"], marker = "platform_machine != 'x86_64' or sys_platform != 'linux'" },
     { name = "kornia" },
     { name = "libigl" },
     { name = "matplotlib" },
     { name = "networkx" },
+    { name = "numba", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "numcodecs" },
     { name = "numpy" },
     { name = "opencv-python-headless" },
     { name = "pillow" },
     { name = "posix-ipc", marker = "sys_platform != 'win32'" },
+    { name = "pynrrd" },
     { name = "pyro-ppl" },
     { name = "rustworkx" },
     { name = "s3fs" },
@@ -1867,21 +2019,39 @@ dependencies = [
     { name = "zarr" },
 ]
 
+[package.optional-dependencies]
+cpu = [
+    { name = "kimimaro", extra = ["all"] },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
 [package.metadata]
 requires-dist = [
+    { name = "brook-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=0.1.0" },
     { name = "click", specifier = ">=8.4.2" },
+    { name = "connected-components-3d", specifier = ">=4.0.0" },
     { name = "crackle-codec", specifier = ">=0.42.0" },
+    { name = "cucim-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=26.8.0" },
+    { name = "cupy-cuda12x", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=14.2.0" },
     { name = "einops", specifier = ">=0.8.2" },
     { name = "imageio", specifier = ">=2.37.3" },
-    { name = "kimimaro", extras = ["all"], specifier = ">=5.8.1" },
+    { name = "kimimaro", extras = ["all"], marker = "platform_machine != 'x86_64' or sys_platform != 'linux'", specifier = ">=5.8.1" },
+    { name = "kimimaro", extras = ["all"], marker = "extra == 'cpu'", specifier = ">=5.8.1" },
     { name = "kornia", specifier = ">=0.8.3" },
     { name = "libigl", specifier = ">=2.6.3" },
     { name = "matplotlib", specifier = ">=3.11.0" },
     { name = "networkx", specifier = ">=3.6.1" },
+    { name = "numba", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=0.67.0" },
+    { name = "numcodecs", specifier = ">=0.16.0" },
     { name = "numpy", specifier = ">=2.5.0" },
     { name = "opencv-python-headless", specifier = ">=4.13.0.92" },
     { name = "pillow", specifier = ">=12.2.0" },
     { name = "posix-ipc", marker = "sys_platform != 'win32'", specifier = ">=1.3.2" },
+    { name = "pynrrd", specifier = ">=1.1.3" },
     { name = "pyro-ppl", specifier = ">=1.9.1" },
     { name = "rustworkx", specifier = ">=0.18.0" },
     { name = "s3fs", specifier = ">=2026.6.0" },
@@ -1899,6 +2069,10 @@ requires-dist = [
     { name = "wandb", specifier = ">=0.28.0" },
     { name = "zarr", specifier = ">=3.2.1" },
 ]
+provides-extras = ["cpu"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9.1.1" }]
 
 [[package]]
 name = "sympy"
