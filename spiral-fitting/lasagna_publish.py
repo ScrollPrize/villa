@@ -49,6 +49,8 @@ import numpy as np
 from PIL import Image
 import scipy.ndimage
 
+from surface_orientation import GridLayout
+
 LASAGNA_PREVIEW_OUTPUT_STEP_VX = 20.0
 LASAGNA_CONFIG_NAME = "flatten_fast_nofilter.json"
 # Lasagna prints this once the optimizer loop is done and the flatten model is
@@ -394,6 +396,13 @@ def _raw_run_diff_rgba(previous_manifest, current_manifest, *,
         current_xyz, current_valid = current_surface_data
     rgba = np.zeros((*current_valid.shape, 4), dtype=np.uint8)
     if previous_manifest is None:
+        return rgba, 0
+    # Cells are paired by index within each winding, so a preview in another
+    # layout (from before the export layout, or a spec whose z direction
+    # changed) would pair mirrored cells: it is not compared, which affects
+    # one generation.
+    if (GridLayout.from_metadata(previous_manifest)
+            != GridLayout.from_metadata(current_manifest)):
         return rgba, 0
     previous_xyz, previous_valid = _surface_xyz(
         Path(previous_manifest["surface_path"]))

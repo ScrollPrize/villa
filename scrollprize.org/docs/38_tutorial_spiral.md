@@ -102,6 +102,8 @@ uv sync
 
 Everything the fit needs is declared in the project's own [`pyproject.toml`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/pyproject.toml), `torch` included — on Linux it comes from the CUDA 12.8 wheel index, so there is no separate torch install to get right. `uv sync` also builds `vc_spiral`, a small C++ extension the fit uses to link point annotations to patch surfaces, so the machine needs cmake and a C++ toolchain; you no longer need a volume-cartographer Python install.
 
+On Windows, `uv sync` also installs `triton-windows`, a community build of Triton, because PyTorch publishes no `triton` wheel there and the fit's fused kernels need one. The first run compiles those kernels once.
+
 #### Get the dataset
 
 Ready-made inputs are published in the [`spiral-input` dataset](data_datasets#spiral-input-2026-07), which lives on the dl.ash2txt.org data server : [Spiral Datasets](https://dl.ash2txt.org/datasets/spiral_datasets/PHercParis4/) (~90 GB):

@@ -39,6 +39,7 @@ import json
 import glob
 import shutil
 import subprocess
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import click
@@ -50,6 +51,7 @@ from PIL import Image
 # decompression-bomb guard so max_composite can open them.
 Image.MAX_IMAGE_PIXELS = None
 
+from surface_orientation import METADATA_KEY as LAYOUT_METADATA_KEY
 from tifxyz import load_tifxyz, save_tifxyz
 
 
@@ -105,10 +107,25 @@ def read_step_and_voxel(meta_path):
     return step_size, voxel_size_um
 
 
+def mesh_layout_metadata(mesh_path):
+    """The mesh's export-layout record, or None for a spiral-order mesh."""
+    with open(os.path.join(mesh_path, 'meta.json'), 'r') as f:
+        return json.load(f).get(LAYOUT_METADATA_KEY)
+
+
 def concat_meshes(mesh_paths):
-    """Load the given tifxyz meshes and concatenate their zyxs grids along the
-    theta/width axis (axis=1), padding shorter grids with the -1 invalid sentinel so
-    heights match. Returns the combined zyxs array in zyx order."""
+    """Load the given tifxyz meshes, in ascending winding order, and concatenate
+    their zyxs grids along the theta/width axis (axis=1), padding shorter grids with
+    the -1 invalid sentinel so heights match. Meshes written outermost wrap first are
+    concatenated outermost winding first, so the result keeps their layout. Returns
+    the combined zyxs array in zyx order and their layout record."""
+    layout = mesh_layout_metadata(mesh_paths[0])
+    mixed = [p for p in mesh_paths if mesh_layout_metadata(p) != layout]
+    if mixed:
+        raise click.ClickException(
+            f'Cannot concatenate meshes written in different layouts: {mesh_paths[0]} vs {mixed[0]}')
+    if layout is not None:
+        mesh_paths = list(reversed(mesh_paths))
     grids = [load_tifxyz(p).zyxs.cpu().numpy() for p in mesh_paths]
     max_h = max(g.shape[0] for g in grids)
     padded = [
@@ -116,7 +133,7 @@ def concat_meshes(mesh_paths):
         else np.pad(g, ((0, max_h - g.shape[0]), (0, 0), (0, 0)), constant_values=-1.0)
         for g in grids
     ]
-    return np.concatenate(padded, axis=1).astype(np.float32)
+    return np.concatenate(padded, axis=1).astype(np.float32), layout
 
 
 def clean_concat_zyxs(zyxs, erode_cells, keep_largest):
@@ -241,14 +258,14 @@ def set_tifxyz_id(tifxyz_path, new_id):
 
 
 def build_full_concat(meshes_dir, meshes, concat_dir, step_size, voxel_size_um):
-    """Concatenate *every* _spliced winding mesh (in ascending winding order) into a
+    """Concatenate *every* _spliced winding mesh (see concat_meshes for the order) into a
     single full-scroll tifxyz written to concat/, named `wLLL-HHH`. Returns
     (name, concat_path, width_px)."""
     ordered = sorted(meshes, key=lambda wc: wc[0])
     lo, hi = ordered[0][0], ordered[-1][0]
     name = f'w{lo:03d}-{hi:03d}'
     mesh_paths = [os.path.join(meshes_dir, nm) for _, nm in ordered]
-    concat_zyxs = concat_meshes(mesh_paths)
+    concat_zyxs, layout = concat_meshes(mesh_paths)
     save_tifxyz(
         concat_zyxs,
         concat_dir,
@@ -256,6 +273,7 @@ def build_full_concat(meshes_dir, meshes, concat_dir, step_size, voxel_size_um):
         step_size=step_size,
         voxel_size_um=voxel_size_um,
         source=f'render_ink full-scroll concat {os.path.basename(meshes_dir.rstrip("/"))}',
+        layout_metadata=layout,
     )
     return name, os.path.join(concat_dir, name), int(concat_zyxs.shape[1])
 
@@ -325,12 +343,75 @@ def max_composite(tif_paths):
     return composite
 
 
+def strip_jpg_paths(collect_dir, name):
+    """Return the primary image and numbered tiles currently belonging to a strip."""
+    tile_prefix = f'{name}.'
+    paths = []
+    for entry in os.scandir(collect_dir):
+        if not entry.is_file():
+            continue
+        filename = entry.name
+        if filename == f'{name}.jpg':
+            paths.append(entry.path)
+            continue
+        tile_index = (
+            filename[len(tile_prefix):-4]
+            if filename.startswith(tile_prefix) and filename.endswith('.jpg')
+            else ''
+        )
+        if tile_index.isdigit():
+            paths.append(entry.path)
+    return paths
+
+
+def remove_strip_jpgs(collect_dir, name):
+    for path in strip_jpg_paths(collect_dir, name):
+        os.remove(path)
+
+
+def write_strip_jpgs(strip8, name, collect_dir, max_strip_width):
+    """Stage all JPEG tiles before replacing this strip's previous outputs."""
+    width = strip8.shape[1]
+    with tempfile.TemporaryDirectory(prefix='.render-', dir=collect_dir) as staging_dir:
+        if width <= max_strip_width:
+            staged = os.path.join(staging_dir, f'{name}.jpg')
+            Image.fromarray(strip8).save(staged, quality=95)
+        else:
+            n_tiles = (width + max_strip_width - 1) // max_strip_width
+            for tile_idx in range(n_tiles):
+                x0 = tile_idx * max_strip_width
+                x1 = min(width, x0 + max_strip_width)
+                staged = os.path.join(staging_dir, f'{name}.{tile_idx:03d}.jpg')
+                Image.fromarray(strip8[:, x0:x1]).save(staged, quality=95)
+
+        # Don't discard a previous usable render until every replacement image is ready.
+        remove_strip_jpgs(collect_dir, name)
+        for filename in sorted(os.listdir(staging_dir)):
+            os.replace(
+                os.path.join(staging_dir, filename),
+                os.path.join(collect_dir, filename),
+            )
+    return width
+
+
+def publish_render_tifs(per_mesh_ink, tif_paths):
+    """Replace cached slice TIFFs only after vc_render_tifxyz completed successfully."""
+    for filename in os.listdir(per_mesh_ink):
+        if filename.lower().endswith('.tif'):
+            path = os.path.join(per_mesh_ink, filename)
+            if os.path.isfile(path):
+                os.remove(path)
+    for tif_path in tif_paths:
+        shutil.move(tif_path, os.path.join(per_mesh_ink, os.path.basename(tif_path)))
+
+
 @click.command(help=__doc__)
 @click.argument('meshes_dir', type=click.Path(exists=True, file_okay=False))
 @click.option('--volume', required=True, help='Ink volume zarr path')
 @click.option('--remote-url', default='', help='Remote OME-Zarr URL for --volume, passed through to vc_render_tifxyz as --remote-url. Required when --volume is a not-yet-populated local cache dir for a scroll that only exists remotely; omit once the cache already records the URL (vc_render_tifxyz --help)')
 @click.option('--vc-render-bin', default='vc_render_tifxyz', show_default=True, help='Path to the vc_render_tifxyz binary')
 @click.option('--scale', type=float, default=0.25, show_default=True)
+@click.option('--scale-segmentation', type=float, default=1.0, show_default=True, help='Passed through to vc_render_tifxyz as --scale-segmentation: multiply mesh coordinates by this factor before sampling, for meshes traced in a different-resolution frame than --volume (e.g. 4 for a mesh in a 4x downsampled frame)')
 @click.option('--group-idx', type=int, default=1, show_default=True)
 @click.option('--num-slices', type=int, default=5, show_default=True)
 @click.option('--num-processes', '-j', type=int, default=1, show_default=True, help='Number of meshes to render (and flatten) concurrently')
@@ -352,17 +433,18 @@ def max_composite(tif_paths):
 @click.option('--full-scroll/--no-full-scroll', default=True, show_default=True, help='Concatenate ALL windings into one full-scroll mesh, flatten it with the lasagna forward flattener (not flatboi), and ink-render it')
 @click.option('--max-strip-width', type=int, default=16384, show_default=True, help='Max width (px) of each saved ink jpg. Strips wider than this are chopped into <name>.NNN.jpg tiles of this width (no downsampling); narrower strips stay a single <name>.jpg')
 @click.option('--full-scroll-trim/--no-full-scroll-trim', default=True, show_default=True, help='After the lasagna flatten, trim the flattened tifxyz to its valid-cell bounding box (removes the flatten output-margin border that renders as black bands) with vc_tifxyz_trim')
+@click.option('--fail-on-empty/--no-fail-on-empty', default=True, show_default=True, help='Fail (exit 1) if any rendered strip is entirely zero, which almost always means the mesh does not intersect --volume (wrong frame/resolution; see --scale-segmentation, --scale, --group-idx). --no-fail-on-empty restores writing the black strip with a warning')
 @click.option('--tifxyz-trim-bin', default='vc_tifxyz_trim', show_default=True, help='Path to the vc_tifxyz_trim binary (crops a tifxyz to its valid-cell bbox in place)')
 @click.option('--lasagna-dir', default='', help='Path to the lasagna repo dir (holds fit.py). Default: <this script>/../lasagna')
 @click.option('--lasagna-config', default='', help='Base lasagna flatten config json. Default: <lasagna-dir>/configs/flatten_fast_nofilter.json')
 @click.option('--lasagna-fit-script', default='', help='Lasagna fit entrypoint run for the full-scroll flatten. Default: _run_flatten_threaded.py if present, else fit.py')
 @click.option('--lasagna-device', default='cuda', show_default=True, help='--device passed to the lasagna flattener for the full-scroll flatten')
-def main(meshes_dir, volume, remote_url, vc_render_bin, scale, group_idx, num_slices, num_processes,
+def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentation, group_idx, num_slices, num_processes,
          flatten, flatboi_bin, tifxyz2obj_bin, obj2tifxyz_bin, uv_lift_bin, flatten_keep,
          flatten_iters, flatten_energy, flatten_tol, flatten_inpaint, pre_erode,
          keep_largest, flatboi_threads,
          openblas_coretype, strips, full_scroll, max_strip_width, full_scroll_trim,
-         tifxyz_trim_bin, lasagna_dir, lasagna_config, lasagna_fit_script, lasagna_device):
+         fail_on_empty, tifxyz_trim_bin, lasagna_dir, lasagna_config, lasagna_fit_script, lasagna_device):
     meshes = sorted(
         (winding_idx(name), name)
         for name in os.listdir(meshes_dir)
@@ -401,7 +483,7 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, group_idx, num_sl
             lo, hi = chunk[0][0], chunk[-1][0]
             name = f'w{lo:03d}-{hi:03d}'
             mesh_paths = [os.path.join(meshes_dir, nm) for _, nm in chunk]
-            concat_zyxs = concat_meshes(mesh_paths)
+            concat_zyxs, layout = concat_meshes(mesh_paths)
             # Clean the per-strip concat before it is flatboi-flattened: erode ragged
             # edges and drop dust/fragments that make SLIM diverge. Strips only — the
             # full-scroll concat below goes to the lasagna flattener, which handles
@@ -421,6 +503,7 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, group_idx, num_sl
                 step_size=step_size,
                 voxel_size_um=voxel_size_um,
                 source=f'render_ink concat {os.path.basename(meshes_dir.rstrip("/"))}',
+                layout_metadata=layout,
             )
             concat_path = os.path.join(concat_dir, name)
             chunks.append((name, concat_path))
@@ -520,55 +603,76 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, group_idx, num_sl
     def render(name, concat_path):
         per_mesh_ink = os.path.join(concat_path, 'ink')
         os.makedirs(per_mesh_ink, exist_ok=True)
-        render_cmd = [
-            vc_render_bin,
-            '--segmentation', concat_path,
-            '--scale', str(scale),
-            '--group-idx', str(group_idx),
-            '--volume', volume,
-            '--tif-output', per_mesh_ink,
-            '--num-slices', str(num_slices),
-        ]
-        if remote_url:
-            render_cmd += ['--remote-url', remote_url]
-        subprocess.run(render_cmd, check=True)
-        tif_paths = sorted(glob.glob(os.path.join(per_mesh_ink, '*.tif')))
-        if not tif_paths:
-            return None
-        return max_composite(tif_paths)
+        # Render to a private staging directory. If vc_render_tifxyz fails, retain the
+        # previous TIFFs/JPGs; a successful empty render replaces the old TIFFs below,
+        # so stale nonzero slices cannot make the max-composite look valid.
+        with tempfile.TemporaryDirectory(prefix='.render-', dir=per_mesh_ink) as staging_dir:
+            render_cmd = [
+                vc_render_bin,
+                '--segmentation', concat_path,
+                '--scale', str(scale),
+                '--group-idx', str(group_idx),
+                '--volume', volume,
+                '--tif-output', staging_dir,
+                '--num-slices', str(num_slices),
+            ]
+            if scale_segmentation != 1.0:
+                render_cmd += ['--scale-segmentation', str(scale_segmentation)]
+            if remote_url:
+                render_cmd += ['--remote-url', remote_url]
+            subprocess.run(render_cmd, check=True)
+            tif_paths = sorted(glob.glob(os.path.join(staging_dir, '*.tif')))
+            comp = max_composite(tif_paths) if tif_paths else None
+            publish_render_tifs(per_mesh_ink, tif_paths)
+        return comp
 
     rendered_strips = 0
+    empty_strips = []
     with ThreadPoolExecutor(max_workers=max(1, num_processes)) as pool:
         futures = {pool.submit(render, name, cp): name for name, cp in render_items}
         for n, future in enumerate(as_completed(futures)):
             name = futures[future]
             comp = future.result()
             if comp is None:
+                remove_strip_jpgs(collect_dir, name)
                 print(f'[{n + 1}/{len(render_items)}] {name}: WARNING no tifs produced, skipping')
                 continue
+            empty = not np.any(comp)
+            if empty:
+                severity = 'ERROR' if fail_on_empty else 'WARNING'
+                print(f'[{n + 1}/{len(render_items)}] {name}: {severity} rendered strip is entirely zero '
+                      f'({comp.shape[1]}px wide): the mesh does not appear to intersect {volume}. '
+                      'Check the mesh/volume frames (--scale-segmentation, --scale, --group-idx)')
+                empty_strips.append(name)
+                if fail_on_empty:
+                    # This render completed, so any prior image no longer represents its
+                    # current output. Remove it rather than leave a stale success artifact.
+                    remove_strip_jpgs(collect_dir, name)
+                    continue
             strip = comp.astype(np.float32)
             p95 = np.percentile(strip, 95)
             strip = np.clip(strip / p95, 0, 1) * 255 if p95 > 0 else strip
             strip8 = strip.astype(np.uint8)
-            width = strip8.shape[1]
-            # Chop strips wider than --max-strip-width into fixed-width jpg tiles
-            # (<name>.NNN.jpg) without downsampling; narrower strips stay one <name>.jpg.
+            # Stage all JPGs before replacing old outputs. This keeps the last usable
+            # strip if image encoding fails midway through writing a tiled result.
+            width = write_strip_jpgs(strip8, name, collect_dir, max_strip_width)
             if width <= max_strip_width:
                 out_path = os.path.join(collect_dir, f'{name}.jpg')
-                Image.fromarray(strip8).save(out_path, quality=95)
                 print(f'[{n + 1}/{len(render_items)}] wrote {out_path} '
                       f'({width}px wide, p95={p95:.1f})')
             else:
                 n_tiles = (width + max_strip_width - 1) // max_strip_width
-                for t in range(n_tiles):
-                    x0 = t * max_strip_width
-                    x1 = min(width, x0 + max_strip_width)
-                    tile_path = os.path.join(collect_dir, f'{name}.{t:03d}.jpg')
-                    Image.fromarray(strip8[:, x0:x1]).save(tile_path, quality=95)
                 print(f'[{n + 1}/{len(render_items)}] wrote {n_tiles} tiles '
                       f'{name}.000-{n_tiles - 1:03d}.jpg ({width}px wide total, '
                       f'p95={p95:.1f})')
             rendered_strips += 1
+
+    if empty_strips and fail_on_empty:
+        raise click.ClickException(
+            f'{len(empty_strips)} of {len(render_items)} ink strip(s) rendered entirely zero: '
+            f'{", ".join(sorted(empty_strips))}. The mesh does not appear to intersect {volume}; '
+            'check the mesh/volume frames (--scale-segmentation, --scale, --group-idx) or '
+            'pass --no-fail-on-empty to keep black strips')
 
     if rendered_strips == 0:
         raise click.ClickException(
