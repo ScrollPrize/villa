@@ -852,7 +852,7 @@ Ownership changed as follows:
   global Lasagna spans; all new saves write version 3. The unpublished file
   version 2 and its pre-v3 descriptors are rejected. The C++ strict readers,
   Python loader, Lasagna probe, Atlas reader, and merge validator accept only
-  file versions 1 and 3 and strictly validate v3 enums and mode-specific
+  file versions 1, 3 and 4 (version 4 is version 3 plus optional span tags) and strictly validate v3 enums and mode-specific
   fields. Version 3 also requires a valid top-level `optimization_mode`; no
   reader synthesizes either field or repairs malformed v3 input. Version 3's
   current `tracer_version: 2` remains part of that strict
