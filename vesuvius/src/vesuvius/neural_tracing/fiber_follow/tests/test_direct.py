@@ -99,6 +99,28 @@ def test_feature_coordinates_respect_even_sized_strided_lattice():
     torch.testing.assert_close(grid, torch.tensor([[[1., 0., 1.]]]))
 
 
+def test_path_evidence_samples_longitudinal_slices_and_both_deep_lattices():
+    cfg = config()
+    model = DirectFollower(cfg)
+    def z_features(crop, channels, stride):
+        shape = tuple((size+stride-1)//stride for size in (crop.depth, crop.width, crop.width))
+        z = (torch.arange(shape[0])*stride-crop.behind)*crop.spacing
+        return z[None, None, :, None, None].expand(1, channels, *shape).contiguous()
+    fine = z_features(cfg.fine, cfg.channels, 1)
+    deep = z_features(cfg.fine, 4*cfg.channels, 4)
+    coarse = z_features(cfg.coarse, 4*cfg.channels, 4)
+    points = torch.tensor([[[0., 0., 2.], [100., 0., 2.]]])
+    features = model.path_features(fine, deep, coarse, points)
+    local_width = 27*(cfg.channels+1)
+    local = features[0, 0, :local_width].reshape(3, 9, cfg.channels+1)
+    torch.testing.assert_close(local[..., :-1], torch.tensor([1., 2., 3.])[:, None, None].expand(3, 9, cfg.channels))
+    assert local[..., -1].eq(1).all()
+    for chunk in features[0, 0, local_width:].reshape(2, -1):
+        torch.testing.assert_close(chunk[:-1], torch.full((4*cfg.channels,), 2.))
+        assert chunk[-1] == 1
+    assert features[0, 1].eq(0).all()  # Outside both crops, including support flags.
+
+
 def test_microbatch_partition_keeps_objective_and_update():
     torch.manual_seed(3)
     cfg = config()
@@ -162,7 +184,7 @@ def test_image_sampler_matches_reference_at_fine_and_coarse_resolution(monkeypat
     rng = np.random.default_rng(3)
     raw = rng.integers(0, 256, (1, 1, 40, 40, 40), dtype=np.uint8)
     starts = np.zeros((1, 3), np.int64)
-    monkeypatch.setattr(module, 'read_blocks', lambda *a, **kw: (raw, starts))
+    monkeypatch.setattr(module, 'read_tight_blocks', lambda *a, **kw: (raw, starts))
     items = [dict(pos=np.array([8., 8., 8.]), frame=np.eye(3))]
     crop = CropSpec(depth=12, width=10, behind=4, spacing=.5)
     vol = SimpleNamespace(input_scale=2.)
@@ -229,17 +251,24 @@ def test_local_correction_is_bounded_and_confidence_cannot_train_its_coordinates
     m = DirectFollower(cfg)
     b = batch(cfg)
     seen = []
-    original = m.patches
-    def patches(features, points):
+    original = m.path_features
+    def patches(fine, fine_deep, coarse_deep, points):
         seen.append(points.detach().clone())
-        return original(features, points)
-    m.patches = patches
+        return original(fine, fine_deep, coarse_deep, points)
+    m.path_features = patches
+    encodings = []
+    handles = [encoder.register_forward_hook(lambda *args: encodings.append(1))
+               for encoder in (m.fine_encoder, m.coarse_encoder)]
     out = forward(m, b)
-    assert len(seen) == 3  # axis, proposal, corrected confidence evidence
-    torch.testing.assert_close(seen[1], out['initial_points'])
-    torch.testing.assert_close(seen[2], out['points'])
-    delta = out['points']-out['initial_points']
-    assert delta[..., :2].norm(dim=-1).max() <= cfg.correction_limit
+    for handle in handles:
+        handle.remove()
+    assert len(encodings) == 2  # Each crop encoded once despite two corrections.
+    assert len(seen) == cfg.correction_steps+1
+    assert out['refinement_points'].shape == (2, 3, 4, 3)
+    for i, coordinates in enumerate(seen):
+        torch.testing.assert_close(coordinates, out['refinement_points'][:, i])
+    delta = out['refinement_points'][:, 1:]-out['refinement_points'][:, :-1]
+    assert delta[..., :2].norm(dim=-1).max() <= cfg.correction_limit+1e-6
     assert delta[..., 2].count_nonzero() == 0
     assert out['points'][..., :2].abs().max() <= cfg.lateral_limit
     loss_terms(out, b, cfg, n_commit=2)['geometry_per_state'].mean().backward()
@@ -279,21 +308,66 @@ def test_commit_window_loss_and_auxiliary_proposal_supervision():
         loss_terms(out, b, cfg, n_commit=5)
 
 
-def test_legacy_one_pass_checkpoint_inference(tmp_path):
-    cfg = replace(config(), correction=False)
+def test_every_refinement_receives_auxiliary_geometry_supervision():
+    cfg = config()
+    b = batch(cfg, 1)
+    b['dense_ab'].zero_()
+    curves = []
+    for error in (3., 2., 1.):
+        curve = torch.tensor([[[error, 0., float(z)] for z in range(1, 5)]], requires_grad=True)
+        curves.append(curve)
+    out = dict(points=curves[-1], initial_points=curves[0], refinement_points=torch.stack(curves, 1),
+               confidence_logits=torch.zeros(1, 4))
+    terms = loss_terms(out, b, cfg)
+    # Smooth L1 averaged over x,y; first two stages share the 25% auxiliary term.
+    expected = .75*.25+.25*((3-.5)/2+(2-.5)/2)/2
+    torch.testing.assert_close(terms['geometry_per_state'], torch.tensor([expected]))
+    terms['geometry_per_state'].sum().backward()
+    assert all(curve.grad[..., 0].abs().sum() > 0 for curve in curves)
+
+
+def test_startup_sampling_and_history_diagnostics():
+    from vesuvius.neural_tracing.fiber_follow.data import TracedFiber, make_sample
+    from vesuvius.neural_tracing.fiber_follow.direct.diagnostics import decision_rows, summarize_decisions
+    arc = np.arange(400, dtype=float)
+    fiber = TracedFiber('line', np.c_[arc*0, arc*0, arc], arc, '')
+    sample = SampleConfig(no_history_prob=0., short_history_prob=1.)
+    rng = np.random.default_rng(17)
+    counts = [int(make_sample(fiber, 200., False, sample, rng)['hmask'].sum()) for _ in range(200)]
+    assert all(1 <= n <= 32 for n in counts)
+    assert 70 < sum(n <= 8 for n in counts) < 130
+    assert make_sample(fiber, 200., False, replace(sample, no_history_prob=1.), rng)['hmask'].sum() == 0
+    # Grouping measures what the model actually receives, including replay.
+    cfg = replace(config(), n_history=64)
+    b = batch(cfg, 4)
+    for row, length in zip(b['hmask'], (0, 4, 16, 64)):
+        row[length:] = 0
+    m = DirectFollower(cfg)
+    stats = summarize_decisions(decision_rows(forward(m, b), b, cfg), 4)
+    assert {k: v['states'] for k, v in stats['by_history'].items()} == {'0': 1, '1-8': 1, '9-32': 1, '>32': 1}
+    assert all(0 <= v['first_confidence_mean'] <= 1 for v in stats['by_history'].values())
+
+
+@pytest.mark.parametrize('correction', [False, True])
+def test_legacy_checkpoint_inference(tmp_path, correction):
+    cfg = replace(config(), correction=correction, correction_steps=1, rich_path_context=False)
     m = DirectFollower(cfg).eval()
     b = batch(cfg)
-    assert not hasattr(m, 'correction_head')
+    assert hasattr(m, 'correction_head') == correction
     out = forward(m, b)
-    torch.testing.assert_close(out['initial_points'], out['points'], rtol=0, atol=0)
+    if not correction:
+        torch.testing.assert_close(out['initial_points'], out['points'], rtol=0, atol=0)
     spec = FiberVolumeSpec('unused', ct_zarr='unused', ct_level=0, ct_grid_scale=4., inputs='ct+presence')
     path = tmp_path/'legacy.pt'
     save_checkpoint(path, m, m, spec, SampleConfig(crop=cfg.fine, n_history=cfg.n_history))
     ck = torch.load(path, weights_only=False)
-    del ck['model_cfg']['correction'], ck['model_cfg']['correction_limit']
+    del ck['model_cfg']['correction_steps'], ck['model_cfg']['rich_path_context']
+    if not correction:
+        del ck['model_cfg']['correction'], ck['model_cfg']['correction_limit']
     torch.save(ck, path)
     loaded = load_checkpoint(path, 'cpu')[0]
-    assert loaded.cfg.correction is False
+    assert loaded.cfg.correction == correction and not loaded.cfg.rich_path_context
+    assert loaded.cfg.correction_steps == 1
     for key, value in forward(loaded, b).items():
         torch.testing.assert_close(value, out[key], rtol=0, atol=0)
 
@@ -420,3 +494,47 @@ def test_shared_recovery_evaluator_preserves_float_inputs_and_observed_states(ne
     assert predictions.shape == (1, 4, 3) and len(rows) == len(audited) == len(closed) == 1
     for key in ('hist', 'hmask', 'frame'):
         np.testing.assert_array_equal(traced[0][key], getattr(states, key)[0])
+
+
+def test_tight_blocks_match_rotation_invariant_blocks_at_array_edges():
+    """Per-item minimal blocks read the same values, including zero fill beyond the array."""
+    from vesuvius.neural_tracing.fiber_follow.data import _grid_flat, read_blocks
+    from vesuvius.neural_tracing.fiber_follow.fast_sample import sample_crop
+    rng = np.random.default_rng(11)
+
+    class Array:
+        def __init__(self, shape):
+            self.data = rng.integers(1, 256, shape, dtype=np.uint8)
+
+        def read(self, start, size):
+            out = np.zeros(tuple(size), np.uint8)
+            lo, hi = np.maximum(start, 0), np.minimum(start+size, self.data.shape)
+            if np.all(hi > lo):
+                out[tuple(slice(a-s, b-s) for a, b, s in zip(lo, hi, start))] = self.data[tuple(map(slice, lo, hi))]
+            return out
+
+    ct, presence = Array((70, 60, 64)), Array((35, 30, 32))
+    vol = SimpleNamespace(presence=presence, input_scale=2., raw_block=lambda s, z: ct.read(s, z)[None])
+    crop = CropSpec(depth=14, width=10, behind=5, spacing=.5)
+
+    def reference(items):
+        grid, empty, mask = _grid_flat(crop), np.empty((0, 3), np.float32), np.empty(0, np.float32)
+        out = np.empty((len(items), 2, crop.depth, crop.width, crop.width), np.float32)
+        for use_presence in (False, True):
+            raw, starts = read_blocks(items, vol, crop, presence=use_presence)
+            scale = 1. if use_presence else vol.input_scale
+            for j, item in enumerate(items):
+                out[j, int(use_presence)] = sample_crop(raw[j], starts[j], item['pos']*scale, item['frame']*scale, grid,
+                    False, empty, mask, 2, 1., 'points')[0].reshape(crop.depth, crop.width, crop.width)
+        return torch.from_numpy(out)
+
+    items = []
+    for _ in range(24):
+        # Interior, straddling each face, and fully outside; arbitrary orientation.
+        q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+        pos = rng.uniform(-6, 38, 3)
+        items.append(dict(pos=pos, frame=q*np.sign(np.linalg.det(q))))
+    image = image_crop(items, vol, crop)
+    expected = reference(items)
+    assert torch.equal(image, expected)
+    assert 0 < float((expected != 0).float().mean()) < 1

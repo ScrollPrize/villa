@@ -38,6 +38,8 @@ def decision_rows(output, batch, cfg, n_commit=None, tolerance=1.5, thresholds=(
             value = float(batch['gt_history'][i, 0].norm())
             drift = value if math.isfinite(value) else None
         row = dict(drift=drift, departed=bool(batch['offtrack'][i]), states=1,
+                   history_points=int(batch['hmask'][i].sum()),
+                   first_confidence_sum=float(output['confidence'][i, 0]),
                    first_known=int(known[i, 0]), first_correct=int(known[i, 0]*labels[i, 0]),
                    commit_known=int(known[i, window-1]), commit_correct=int(known[i, window-1]*labels[i, window-1]),
                    positive_prefixes=int((labels[i]*known[i]).sum()), known_prefixes=int(known[i].sum()),
@@ -74,23 +76,26 @@ def summarize_decisions(rows, n_commit):
         groups[name] = [r for r in rows if not r['departed'] and r['drift'] is not None and lo <= r['drift'] < hi]
     groups['unknown'] = [r for r in rows if not r['departed'] and r['drift'] is None]
     groups['departed'] = [r for r in rows if r['departed']]
+    history_groups = {name: [r for r in rows if lo <= r['history_points'] <= hi]
+                      for name, lo, hi in (('0', 0, 0), ('1-8', 1, 8), ('9-32', 9, 32), ('>32', 33, math.inf))}
 
     def add(total, row):
         for key, value in row.items():
-            if key in ('drift', 'departed'):
+            if key in ('drift', 'departed', 'history_points'):
                 continue
             if isinstance(value, dict):
                 add(total.setdefault(key, {}), value)
             else:
                 total[key] = total.get(key, 0)+value
 
-    result = {}
-    for name, members in groups.items():
+    def summarize(members):
         sums = {'states': 0}
         for row in members:
             add(sums, row)
         for stage in ('initial', 'final'):
             count = sums.get(stage+'_error_count', 0)
             sums[stage+'_error_mean'] = sums[stage+'_error_sum']/count if count else None
-        result[name] = sums
-    return dict(n_commit=n_commit, by_drift=result)
+        sums['first_confidence_mean'] = sums.get('first_confidence_sum', 0)/len(members) if members else None
+        return sums
+    return dict(n_commit=n_commit, by_drift={name: summarize(members) for name, members in groups.items()},
+                by_history={name: summarize(members) for name, members in history_groups.items()})

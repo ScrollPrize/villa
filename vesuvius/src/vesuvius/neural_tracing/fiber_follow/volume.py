@@ -39,7 +39,11 @@ class ChunkedArray:
     """Minimal zarr-v2 reader with an LRU cache of decoded chunks.
 
     Bypasses zarr-python so reads of small, arbitrary blocks are cheap and
-    worker-process friendly (only the path is pickled).
+    worker-process friendly (only the path is pickled). Uncompressed arrays
+    (see ``decode_store.py``) are memory-mapped chunk by chunk, so processes
+    share them through the page cache and the cache bounds live mappings
+    rather than private memory. Each mapping holds a file descriptor, so the
+    trainer raises its soft open-file limit at startup.
     """
 
     def __init__(self, path: str | Path, cache_bytes: int = 2 << 30) -> None:
@@ -73,6 +77,11 @@ class ChunkedArray:
 
     def _load(self, key: tuple[int, int, int]) -> np.ndarray | None:
         fn = os.path.join(self.path, self.sep.join(str(k) for k in key))
+        if self.codec is None:
+            try:
+                return np.memmap(fn, dtype=self.dtype, mode="r", shape=self.chunks)
+            except FileNotFoundError:
+                return None
         try:
             with open(fn, "rb") as fh:
                 raw = fh.read()

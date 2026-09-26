@@ -130,7 +130,7 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTrac
     ap.add_argument('--after', type=float, default=24.)
     ap.add_argument('--stride', type=float, default=16.)
     ap.add_argument('--confidence', type=float, default=DEFAULT_CONFIDENCE)
-    ap.add_argument('--n-commit', type=int, default=DEFAULT_N_COMMIT)
+    ap.add_argument('--n-commit', type=int, help='Default: checkpoint commit window')
     ap.add_argument('--explore-calls', type=int, default=8)
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--threads', type=int, default=2)
@@ -139,6 +139,8 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTrac
     args = ap.parse_args(argv)
     torch.set_num_threads(args.threads)
     model, crop, n_hist, spec, ck = checkpoint_loader(args.checkpoint, args.device)
+    if args.n_commit is None:
+        args.n_commit = ck.get('n_commit', DEFAULT_N_COMMIT)
     cfg = SampleConfig(crop=crop, n_history=n_hist, recent_history_points=model.cfg.recent_history_points,
                        n_future=model.cfg.n_future, future_step=model.cfg.future_step)
     if args.fiber_zarrs:

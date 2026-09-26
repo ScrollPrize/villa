@@ -128,14 +128,16 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTrac
     ap.add_argument("--cp-every", type=float, default=800.0, help="control-point spacing, base voxels")
     ap.add_argument("--max-len", type=float, default=6000.0, help="per-direction limit, trace-grid voxels")
     ap.add_argument("--confidence", type=float, default=DEFAULT_CONFIDENCE)
-    ap.add_argument("--n-commit", type=int, default=DEFAULT_N_COMMIT, help="max points committed per decision (<= model n_future)")
+    ap.add_argument("--n-commit", type=int, help="max points committed per decision (default: checkpoint setting)")
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--sampling-seed", type=int, default=0, help="Reproducible per-trace sampling noise")
     args = ap.parse_args(argv)
 
-    model, crop, n_hist, spec, _ = checkpoint_loader(args.checkpoint, args.device)
+    model, crop, n_hist, spec, ck = checkpoint_loader(args.checkpoint, args.device)
+    if args.n_commit is None:
+        args.n_commit = ck.get('n_commit', DEFAULT_N_COMMIT)
     if args.fiber_zarrs:
         spec.fiber_zarr_dir = args.fiber_zarrs
     if args.ct:

@@ -4,8 +4,7 @@ from dataclasses import replace
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.data import collate_targets, read_blocks
-from vesuvius.neural_tracing.fiber_follow.geometry import crop_local_grid
+from vesuvius.neural_tracing.fiber_follow.data import _grid_flat, collate_targets, read_tight_blocks
 from vesuvius.neural_tracing.fiber_follow.fast_sample import sample_crop
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.trace import ModelTracer
@@ -17,13 +16,14 @@ def image_crop(items, vol, crop, pool=None):
     The scalar sampler normalizes both channels to [0,1]. An empty history
     skips rendering. Sampling is identical in training
     and tracing, including the independently resolved presence grid.
+    Each item reads only the axis-aligned block its own oriented crop needs.
     """
-    grid = crop_local_grid(crop).reshape(-1, 3).astype(np.float64)
+    grid = _grid_flat(crop)
     empty = np.empty((0, 3), np.float32)
     mask = np.empty(0, np.float32)
     result = np.empty((len(items), 2, crop.depth, crop.width, crop.width), np.float32)
     for presence in (False, True):
-        raw, starts = read_blocks(items, vol, crop, pool, presence=presence)
+        raw, starts = read_tight_blocks(items, vol, crop, pool, presence=presence)
         scale = 1. if presence else vol.input_scale
         for j, item in enumerate(items):
             sampled = sample_crop(raw[j], starts[j], item['pos']*scale, item['frame']*scale,
@@ -45,6 +45,10 @@ class ObservationBuilder:
         if self._coarse is None:
             spec = replace(vol.spec, ct_level=self.coarse_level, ct_grid_scale=self.coarse_grid_scale)
             self._coarse = FiberVolume(spec, cache_bytes=vol.ct.cache_bytes)
+            # Both scales sample the same presence array. One reader with the
+            # combined budget lets the wider coarse footprint serve the fine crop.
+            vol.presence.cache_bytes += self._coarse.presence.cache_bytes
+            self._coarse.presence = vol.presence
         return dict(fine=image_crop(items, vol, self.cfg.fine, pool),
                     coarse=image_crop(items, self._coarse, self.cfg.coarse, pool))
 

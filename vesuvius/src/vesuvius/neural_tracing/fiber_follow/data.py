@@ -208,6 +208,7 @@ class SampleConfig:
     angle_sigmas_deg: tuple = (2.0, 5.0, 10.0)
     angle_probs: tuple = (0.5, 0.35, 0.15)
     no_history_prob: float = 0.1
+    short_history_prob: float = 0.0  # conditional on history being present; opt-in for direct training
     history_jitter: float = 0.0  # independent point noise; disable for smooth history
     history_drift: float = 2.0  # accumulated lateral displacement, smooth over 16--64 voxels
     history_wobble: float = 1.0  # max amplitude (voxels) of slow lateral wobble on the own-trace history
@@ -314,8 +315,13 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     if rng.random() < cfg.no_history_prob:
         hmask[:] = 0
     else:
-        # random truncated history (trace just started)
-        if rng.random() < 0.2:
+        # Balance very short and intermediate startup histories. With this
+        # option off, retain the existing sampler's random draws exactly.
+        if cfg.short_history_prob > 0 and rng.random() < cfg.short_history_prob:
+            split = min(8, cfg.n_history)
+            lo, hi = (1, split) if cfg.n_history <= 8 or rng.random() < .5 else (9, min(32, cfg.n_history))
+            hmask[int(rng.integers(lo, hi+1)):] = 0
+        elif rng.random() < 0.2:
             hmask[int(rng.integers(0, cfg.n_history)):] = 0
     hist = interp_at(p, s, np.clip(th, 0, L))
     ramp = np.clip(1.0 - k / (cfg.n_history * cfg.history_step), 0, 1)[:, None]
@@ -532,6 +538,50 @@ def read_blocks(items, vol: FiberVolume, crop: CropSpec, pool=None, *, presence=
     read = lambda st: vol.presence.read(st, (S, S, S))[None] if presence else vol.raw_block(st, (S, S, S))
     raw = np.stack(list(map(read, starts) if pool is None else pool.map(read, starts)))
     return raw, starts
+
+
+_CORNER_CACHE: dict = {}
+
+
+def crop_corners(crop: CropSpec) -> np.ndarray:
+    """Eight local (a, b, c) corners; the crop's sample points are their convex hull."""
+    corners = _CORNER_CACHE.get(crop)
+    if corners is None:
+        lc, fc = crop.lateral_coords, crop.forward_coords
+        corners = _CORNER_CACHE[crop] = np.array([(a, b, c) for a in (lc[0], lc[-1])
+                                                  for b in (lc[0], lc[-1]) for c in (fc[0], fc[-1])], np.float64)
+    return corners
+
+
+def tight_block(pos, frame, crop: CropSpec, scale: float = 1.):
+    """zyx start and size of the smallest axis-aligned block around one oriented crop.
+
+    Source-array coordinates (``scale`` source voxels per trace voxel). The block
+    holds every sample point plus the trilinear/nearest support voxel above it
+    and one guard voxel on each side, so a per-sample sampler that zero-pads
+    beyond the block reads exactly the values it reads from the larger
+    rotation-invariant ``block_start`` block (arrays fill outside with zero too).
+    Unlike ``block_start`` the footprint depends on the frame, so the holdout
+    guard keeps using the rotation-invariant block.
+    """
+    world = np.asarray(pos, np.float64)*scale + crop_corners(crop) @ (np.asarray(frame, np.float64)*scale).T
+    zyx = world[:, ::-1]
+    lo = np.floor(zyx.min(0)).astype(np.int64) - 1
+    hi = np.floor(zyx.max(0)).astype(np.int64) + 3
+    return lo, hi - lo
+
+
+def read_tight_blocks(items, vol: FiberVolume, crop: CropSpec, pool=None, *, presence=False):
+    """Per-item minimal blocks for per-sample CPU sampling: (list of raw, list of zyx starts).
+
+    Same values as ``read_blocks`` at every sample point, reading roughly a
+    third of the voxels and touching about half the chunks per item.
+    """
+    scale = 1. if presence else getattr(vol, 'input_scale', 1.)
+    bounds = [tight_block(it["pos"], it["frame"], crop, scale) for it in items]
+    read = lambda b: vol.presence.read(b[0], b[1])[None] if presence else vol.raw_block(b[0], b[1])
+    raw = list(map(read, bounds) if pool is None else pool.map(read, bounds))
+    return raw, [start for start, _ in bounds]
 
 
 def add_presence_input(x, items, vol, crop, grid, pool=None):

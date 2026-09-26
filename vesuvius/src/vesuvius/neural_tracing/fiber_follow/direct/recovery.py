@@ -34,7 +34,7 @@ def monitor_fixture(path, fibers, manifest, sample, spec, seed_count=8):
     return states, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def evaluate_monitor(model, vol, states, fibers, sample, *, device, n_commit=8,
+def evaluate_monitor(model, vol, states, fibers, sample, *, device, n_commit=4,
                      tolerance=1.5, recovery_length=32.):
     decisions = []
     thresholds = (.5, .85)

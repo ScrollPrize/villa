@@ -13,7 +13,7 @@ def geometry_mask(batch, cfg):
 
 
 def commit_window(cfg, n_commit):
-    window = min(8, cfg.n_future) if n_commit is None else n_commit
+    window = min(4, cfg.n_future) if n_commit is None else n_commit
     if not 1 <= window <= cfg.n_future:
         raise ValueError('Commit window must fit forecast')
     return window
@@ -52,8 +52,19 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
                                 size=mask.shape[1], mode='linear', align_corners=True).transpose(1, 2)
         initial_error = F.smooth_l1_loss(initial, target, beta=1., reduction='none').mean(-1)
         initial_geometry = window_mean(initial_error, mask, near)
-        # Keep the overall geometry scale fixed for the one-pass comparison.
-        geometry = .75*geometry+.25*initial_geometry
+        # Supervise every earlier proposal without increasing the total loss
+        # weight as refinement steps are added. The final curve gets 75%.
+        auxiliary = initial_geometry
+        if 'refinement_points' in output:
+            earlier = output['refinement_points'][:, :-1]
+            losses = []
+            for curve in earlier.unbind(1):
+                dense = F.interpolate(curve[..., :2].transpose(1, 2),
+                    size=mask.shape[1], mode='linear', align_corners=True).transpose(1, 2)
+                errors = F.smooth_l1_loss(dense, target, beta=1., reduction='none').mean(-1)
+                losses.append(window_mean(errors, mask, near))
+            auxiliary = torch.stack(losses).mean(0)
+        geometry = .75*geometry+.25*auxiliary
     labels, known, _ = prefix_labels(output['points'], batch, tolerance, cfg.max_recovery_distance)
     bce = F.binary_cross_entropy_with_logits(output['confidence_logits'], labels, reduction='none')
     return dict(geometry_per_state=geometry, initial_geometry_per_state=initial_geometry,

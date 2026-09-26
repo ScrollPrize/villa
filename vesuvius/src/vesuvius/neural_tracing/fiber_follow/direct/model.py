@@ -19,10 +19,10 @@ ARCHITECTURE = 'direct_curve_v1'
 class DirectConfig:
     fine: CropSpec = field(default_factory=lambda: CropSpec(depth=80, width=48, behind=32, spacing=.5))
     coarse: CropSpec = field(default_factory=lambda: CropSpec(depth=88, width=32, behind=64, spacing=2.))
-    channels: int = 16
+    channels: int = 24
     hidden: int = 128
     heads: int = 4
-    layers: int = 2
+    layers: int = 4
     n_future: int = 16
     future_step: float = 1.
     n_history: int = 128
@@ -30,7 +30,9 @@ class DirectConfig:
     max_recovery_distance: float = 6.
     patch_radius: float = 1.
     correction: bool = True
-    correction_limit: float = 1.  # maximum lateral Euclidean adjustment, trace voxels
+    correction_limit: float = 1.  # maximum adjustment per refinement, trace voxels
+    correction_steps: int = 2
+    rich_path_context: bool = True
 
     def __post_init__(self):
         for name in ('fine', 'coarse'):
@@ -50,6 +52,8 @@ class DirectConfig:
             raise ValueError('Local observation patch must fit fine crop')
         if not math.isfinite(self.correction_limit) or self.correction_limit <= 0:
             raise ValueError('Correction limit must be finite and positive')
+        if not isinstance(self.correction_steps, int) or self.correction_steps < 1:
+            raise ValueError('Correction steps must be a positive integer')
         if self.n_future*self.future_step > (self.fine.depth-self.fine.behind-1)*self.fine.spacing:
             raise ValueError('Future horizon exceeds fine image')
 
@@ -77,8 +81,8 @@ def feature_grid(points, crop, shape, stride=1):
     return 2*(points-origin)/(crop.spacing*stride*(size-1))-1
 
 
-def sample_features(features, points, crop):
-    grid = feature_grid(points.float(), crop, features.shape[-3:])
+def sample_features(features, points, crop, stride=1):
+    grid = feature_grid(points.float(), crop, features.shape[-3:], stride)
     supported = (grid.abs() <= 1).all(-1) & torch.isfinite(grid).all(-1)
     grid = torch.where(supported[..., None], grid, 0.)
     values = F.grid_sample(features.float(), grid[:, :, None, None], align_corners=True)
@@ -119,14 +123,26 @@ class DirectFollower(nn.Module):
         self.coordinates = nn.Linear(h, 2)
         nn.init.normal_(self.coordinates.weight, std=.005)
         nn.init.zeros_(self.coordinates.bias)
+        # Rich evidence: 27 local samples with support flags, plus the deep
+        # fine/coarse feature at each proposed point and its support flag.
+        evidence_width = 27*(c+1)+2*(4*c+1) if cfg.rich_path_context else 9*c
+        def path_layers():
+            layers = [nn.Linear(h+evidence_width+3, h), nn.SiLU()]
+            if cfg.rich_path_context:
+                layers.append(nn.TransformerEncoderLayer(h, cfg.heads, 2*h, dropout=0.,
+                    activation='gelu', batch_first=True, norm_first=True))
+            return layers
         if cfg.correction:
-            self.correction_head = nn.Sequential(nn.Linear(h+9*c+3, h), nn.SiLU(), nn.Linear(h, 2))
+            self.correction_head = nn.Sequential(*path_layers(), nn.Linear(h, 2))
             nn.init.normal_(self.correction_head[-1].weight, std=.001)
             nn.init.zeros_(self.correction_head[-1].bias)
-        self.path_evidence = nn.Sequential(nn.Linear(h+9*c+3, h), nn.SiLU())
+        self.path_evidence = nn.Sequential(*path_layers())
         self.confidence_head = nn.Sequential(nn.Linear(2*h, h), nn.SiLU(), nn.Linear(h, 1))
         stencil = torch.tensor([[a, b, 0.] for a in (-1., 0., 1.) for b in (-1., 0., 1.)])
         self.register_buffer('stencil', stencil*cfg.patch_radius, persistent=False)
+        path_stencil = torch.tensor([[a*cfg.patch_radius, b*cfg.patch_radius, z]
+                                    for z in (-1., 0., 1.) for a in (-1., 0., 1.) for b in (-1., 0., 1.)])
+        self.register_buffer('path_stencil', path_stencil, persistent=False)
         self.register_buffer('planes', torch.arange(1, cfg.n_future+1).float()*cfg.future_step, persistent=False)
 
     def image_tokens(self, deep, crop, scale):
@@ -145,6 +161,19 @@ class DirectFollower(nn.Module):
         b, k, _ = points.shape
         values, _ = sample_features(features, (points[:, :, None]+self.stencil).reshape(b, k*9, 3), self.cfg.fine)
         return values.reshape(b, k, -1)
+
+    def path_features(self, fine, fine_deep, coarse_deep, points):
+        """Inspect the actual path at three longitudinal slices and two scales."""
+        if not self.cfg.rich_path_context:
+            return self.patches(fine, points)
+        b, k, _ = points.shape
+        local, support = sample_features(fine,
+            (points[:, :, None]+self.path_stencil).reshape(b, k*27, 3), self.cfg.fine)
+        local = torch.cat((local, support[..., None].float()), -1).reshape(b, k, -1)
+        deep_fine, fine_support = sample_features(fine_deep, points, self.cfg.fine, stride=4)
+        deep_coarse, coarse_support = sample_features(coarse_deep, points, self.cfg.coarse, stride=4)
+        return torch.cat((local, deep_fine, fine_support[..., None].float(),
+                          deep_coarse, coarse_support[..., None].float()), -1)
 
     def forward(self, x, hist, hmask):
         cfg = self.cfg
@@ -174,20 +203,25 @@ class DirectFollower(nn.Module):
         lateral = cfg.lateral_limit*torch.tanh(self.coordinates(decoded).float())
         points = torch.cat((lateral, initial[..., 2:]), -1)
         initial_points = points
+        refinements = [points]
         if cfg.correction:
-            # Decoder features retain history/identity conditioning. The small
-            # residual reads fine evidence at the proposal, without re-encoding.
-            correction = self.correction_head(torch.cat((decoded, self.patches(fine, points), points/16), -1))
-            correction = correction.float().tanh()*(cfg.correction_limit/math.sqrt(2))
-            lateral = (lateral+correction).clamp(-cfg.lateral_limit, cfg.lateral_limit)
-            points = torch.cat((lateral, initial[..., 2:]), -1)
+            # Train the shared refiner through each update; refresh evidence
+            # at the new coordinates while encoding both images only once.
+            for _ in range(cfg.correction_steps):
+                evidence = self.path_features(fine, fine_deep, coarse_deep, points)
+                correction = self.correction_head(torch.cat((decoded, evidence, points/16), -1))
+                correction = correction.float().tanh()*(cfg.correction_limit/math.sqrt(2))
+                lateral = (lateral+correction).clamp(-cfg.lateral_limit, cfg.lateral_limit)
+                points = torch.cat((lateral, initial[..., 2:]), -1)
+                refinements.append(points)
         # Confidence inspects the actual prediction. Its labels and coordinate
         # sampling are detached; coordinate regression retains its own gradient.
-        evidence = self.path_evidence(torch.cat((decoded, self.patches(fine, points.detach()),
+        evidence = self.path_evidence(torch.cat((decoded, self.path_features(fine, fine_deep, coarse_deep, points.detach()),
                                                  points.detach()/16), -1))
         count = torch.arange(1, cfg.n_future+1, device=hist.device)[None, :, None]
         prefix_mean = evidence.cumsum(1)/count
         prefix_max = evidence.cummax(1).values
         logits = self.confidence_head(torch.cat((prefix_mean, prefix_max), -1)).squeeze(-1).float()
         return dict(points=points, initial_points=initial_points,
+                    refinement_points=torch.stack(refinements, 1),
                     confidence_logits=logits, confidence=logits.sigmoid().cummin(-1).values)

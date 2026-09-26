@@ -133,7 +133,26 @@ def score_trace(path: np.ndarray, fiber: TracedFiber, t0: float, sign: float, to
                 endpoint_known=bool(endpoint_known), diverged=bool(diverged), err=err)
 
 
-def evaluate(tracer, fibers, seeds, batch: int = 256, history_audit=None):
+def monitor_coverage(row, max_len):
+    """Normalize monitor coverage to the trace budget, shared by both trainers.
+
+    Keep all precision, departure and endpoint scoring from score_trace.
+    Calibration/final evaluation retains its full-annotation denominator.
+    """
+    if not np.isfinite(max_len) or max_len <= 0:
+        raise ValueError('Monitor length must be finite and positive')
+    row = dict(row)
+    row['avail'] = min(row['avail'], max_len)
+    row['followed'] = min(row['followed'], max_len)
+    row['coverage'] = row['followed'] / max(row['avail'], 1e-6)
+    row['avail_nb'] = min(row['avail_nb'], max_len)
+    row['coverage_nb'] = min(row['followed'], row['avail_nb']) / max(row['avail_nb'], 1e-6)
+    return row
+
+
+def evaluate(tracer, fibers, seeds, batch: int = 256, history_audit=None, on_trace=None,
+             coverage_max_len=None):
+    """Score rollouts; optionally apply monitor normalization or expose paths."""
     trees = {}
     rows = []
     for b in range(0, len(seeds), batch):
@@ -148,11 +167,15 @@ def evaluate(tracer, fibers, seeds, batch: int = 256, history_audit=None):
             if s["fiber"] not in trees:
                 trees[s["fiber"]] = cKDTree(f.points)
             m = score_trace(p, f, s["t"], s["sign"], tree=trees[s["fiber"]])
+            if coverage_max_len is not None:
+                m = monitor_coverage(m, coverage_max_len)
             span = next((span for span in f.spans if span.start <= s["t"] <= span.end), None)
             m.update(reason=r, fiber=s["fiber"], fiber_name=f.name,
                      seed_span_mode=span.provenance.interp_mode if span else None,
                      t0=s["t"], sign=s["sign"])
             rows.append(m)
+            if on_trace is not None:
+                on_trace(s, p, r)
     return rows, summarize(rows)
 
 

@@ -1,7 +1,7 @@
 # fiber_follow
 
 An independent directly supervised alternative is in [`direct/`](direct/README.md).
-It uses fine level-0 CT, coarse backward context, and a direct curve decoder with one bounded local correction.
+It uses fine level-0 CT, coarse backward context, and a direct curve decoder with two bounded local corrections.
 Train it separately with `bash scripts/launch_direct.sh NAME`.
 
 The active follower is `single_path_flow_v11`: one jointly denoised future curve,

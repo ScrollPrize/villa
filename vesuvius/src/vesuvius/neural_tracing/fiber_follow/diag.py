@@ -13,7 +13,7 @@ import matplotlib.patheffects as pe
 import numpy as np
 from scipy.spatial import cKDTree
 
-from vesuvius.neural_tracing.fiber_follow.evaluate import score_trace, summarize
+from vesuvius.neural_tracing.fiber_follow.evaluate import monitor_coverage, score_trace, summarize
 from vesuvius.neural_tracing.fiber_follow.geometry import frame_from_heading, interp_at
 
 
@@ -38,7 +38,7 @@ def _curved_slab(vol, centers, axis, half=2):
 
 
 def plot_batch(x, pred, fut, fmask, crop, path, observed, hmask, history_gt, history_mask,
-               n=6, source=None, offtrack=None, confidence=None):
+               n=6, source=None, offtrack=None, confidence=None, history_channel=-1):
     """Crops exactly as the model sees them (sample-index space, forward = up).
 
     Each panel is a thin curved slab (+-2 samples) that follows the GT fiber
@@ -47,7 +47,8 @@ def plot_batch(x, pred, fut, fmask, crop, path, observed, hmask, history_gt, his
     green = GT, orange = proposal. The dotted orange segment is the
     actual tracer's first step from the current point.
     Bounds stay fixed to the actual crop even when GT leaves it. The orange
-    path is the complete denoised curve before the confidence-gated commit.
+    path is the complete predicted curve before the confidence-gated commit.
+    Set history_channel=None for inputs without a rendered history channel.
     """
     source = source[:n].detach().cpu().numpy() if source is not None else None
     offtrack = offtrack[:n].detach().cpu().numpy() if offtrack is not None else None
@@ -79,7 +80,8 @@ def plot_batch(x, pred, fut, fmask, crop, path, observed, hmask, history_gt, his
             other = 1 - comp
             cen = np.interp(rows, rr, np.concatenate([[mid], gi[:, other]]))
             pres = _curved_slab(x[i, 0], cen, axis)
-            hist = _curved_slab(x[i, -1], cen, axis)
+            hist = (_curved_slab(x[i, history_channel], cen, axis)
+                    if history_channel is not None else np.zeros_like(pres))
             alpha = .8*hist[..., None]
             rgb = ((1-alpha)*pres[..., None] + alpha*np.array([1., .1, .1])).clip(0, 1)
             a = ax[r, i]
@@ -150,22 +152,29 @@ def rollout_diag(tracer, fibers, seeds, path, max_len=400.0, half=15, batch=8):
             reasons.extend(r)
     finally:
         tracer.p.max_len = old
-    rows = []
+    return plot_rollouts(tracer.vol, fibers, seeds, paths, reasons, path, max_len, half)
+
+
+def plot_rollouts(vol, fibers, seeds, paths, reasons, path, max_len=400., half=15, *, rows=None):
+    """Render existing traces without tracing again.
+
+    Supplied score rows are used unchanged. Without rows, retain the flow
+    monitor's historical coverage normalization to the diagnostic length cap.
+    """
+    if not seeds:
+        raise ValueError('No seeds to plot')
+    if rows is None:
+        rows = []
+        for s, p in zip(seeds, paths):
+            m = score_trace(p, fibers[s['fiber']], s['t'], s['sign'])
+            rows.append(monitor_coverage(m, max_len))
     n = len(seeds)
     per_row = min(n, 8)
     nr = int(np.ceil(n / per_row))
     fig, ax = plt.subplots(nr, 2 * per_row, figsize=(1.1 * 2 * per_row, 7.5 * nr), squeeze=False)
     lat = np.arange(-half, half + 1, dtype=np.float64)
-    vol = tracer.vol
-    for k, (s, p, r) in enumerate(zip(seeds, paths, reasons)):
+    for k, (s, p, r, m) in enumerate(zip(seeds, paths, reasons, rows)):
         f = fibers[s["fiber"]]
-        m = score_trace(p, f, s["t"], s["sign"], tree=cKDTree(f.points))
-        m["avail"] = min(m["avail"], max_len)
-        m["followed"] = min(m["followed"], max_len)
-        m["coverage"] = m["followed"] / max(m["avail"], 1e-6)
-        m["avail_nb"] = min(m["avail_nb"], max_len)
-        m["coverage_nb"] = min(m["followed"], m["avail_nb"]) / max(m["avail_nb"], 1e-6)
-        rows.append(m)
         # Mark prediction-support gaps for diagnosis; their annotated geometry is still GT.
         arc = s["t"] + s["sign"] * np.arange(0, max_len + 20)
         arc = arc[(arc >= 0) & (arc <= f.length)]
@@ -205,35 +214,57 @@ def rollout_diag(tracer, fibers, seeds, path, max_len=400.0, half=15, batch=8):
     return summ
 
 
-def plot_curves(log_path, path):
+def plot_curves(log_path, path, *, loss_key='flow'):
     recs = [json.loads(line) for line in Path(log_path).read_text().splitlines()]
-    training = [r for r in recs if 'flow' in r]
-    rollout = [r for r in recs if 'roll_coverage' in r]
-    fig,axes = plt.subplots(1,3,figsize=(13,3.2))
+    training = [r for r in recs if loss_key in r]
+    rollout = [r for r in recs if 'roll_coverage' in r or ('coverage_mean' in r and 'threshold' in r)]
+    direct = loss_key == 'geometry'
+    if direct:
+        # Earlier direct logs used full annotation lengths for monitor coverage.
+        # Do not connect those incompatible points to the corrected series.
+        rollout = [r for r in rollout if 'coverage_max_len' in r]
+    fig,axes = plt.subplots(1,4 if direct else 3,figsize=(16 if direct else 13,3.2))
     steps = [r['step'] for r in training]
-    axes[0].plot(steps,[r['flow'] for r in training],label='normalized flow loss')
+    axes[0].plot(steps,[r[loss_key] for r in training],label='geometry loss' if direct else 'normalized flow loss')
     axes[1].plot(steps,[r['confidence_loss'] for r in training],label='prefix confidence BCE')
+    if direct:
+        axes[2].plot(steps,[r['error_mean'] for r in training],label='dense curve error (voxels)')
     for threshold in (.5,.85):
         selected = [r for r in rollout if r['threshold']==threshold]
         for name in ('coverage','precision','diverged'):
-            axes[2].plot([r['step'] for r in selected],[r['roll_'+name] for r in selected],label=f'{name} @ {threshold}')
+            key = dict(coverage='coverage_mean', precision='length_precision', diverged='diverged')[name]
+            axes[-1].plot([r['step'] for r in selected],
+                          [r['roll_'+name] if 'roll_'+name in r else r[key] for r in selected],
+                          label=f'{name} @ {threshold}')
     for ax in axes:
         ax.legend(fontsize=7);ax.set_xlabel('optimizer updates')
-    axes[2].set_ylim(0,1)
+    axes[-1].set_ylim(0,1)
     fig.tight_layout();fig.savefig(path,dpi=100);plt.close(fig)
 
 
 def plot_denoising(curves, history, hmask, path):
     """Fixed observed history plus the actual sampled initialization and midpoint updates."""
+    plot_refinement(curves, history, hmask, path)
+
+
+def plot_refinement(curves, history, hmask, path, *, labels=None, target=None, target_mask=None):
+    """Compare successive proposals in physical coordinates, optionally against GT."""
     curves=curves.detach().float().cpu().numpy()
     history=history.detach().float().cpu().numpy()
     mask=hmask.detach().cpu().numpy().astype(bool)
+    labels = labels if labels is not None else [f'update {i}' for i in range(curves.shape[1])]
+    if target is not None:
+        target = target.detach().float().cpu().numpy()
+        target_mask = target_mask.detach().cpu().numpy().astype(bool)
     fig,axes=plt.subplots(2,len(curves),figsize=(4*len(curves),9),squeeze=False)
     for b in range(len(curves)):
         for lateral in (0,1):
             ax=axes[lateral,b]
             ax.plot(history[b,mask[b],lateral],history[b,mask[b],2],'r.-',label='observed history')
+            if target is not None:
+                gt = np.where(target_mask[b, :, None], target[b], np.nan)
+                ax.plot(gt[:,lateral],gt[:,2],'g--',label='GT')
             for step,curve in enumerate(curves[b]):
-                ax.plot(curve[:,lateral],curve[:,2],'.-',label=f'update {step}',alpha=.4+.6*step/max(1,len(curves[b])-1))
+                ax.plot(curve[:,lateral],curve[:,2],'.-',label=labels[step],alpha=.4+.6*step/max(1,len(curves[b])-1))
             ax.set_xlabel('lateral voxels');ax.set_ylabel('forward voxels');ax.legend(fontsize=7)
     fig.tight_layout();fig.savefig(path,dpi=130);plt.close(fig)
