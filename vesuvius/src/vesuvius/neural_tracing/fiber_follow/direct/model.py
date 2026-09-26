@@ -92,14 +92,14 @@ def sample_features(features, points, crop, stride=1):
 
 class ImageEncoder(nn.Module):
     """Small image pyramid; no full-resolution decoder or history modulation."""
-    def __init__(self, channels):
+    def __init__(self, channels, inputs=2):
         super().__init__()
         def stage(a, b, stride):
             return nn.Sequential(nn.Conv3d(a, b, 3, stride=stride, padding=1, bias=False),
                                  nn.GroupNorm(math.gcd(8, b), b), nn.SiLU(),
                                  nn.Conv3d(b, b, 3, padding=1, bias=False),
                                  nn.GroupNorm(math.gcd(8, b), b), nn.SiLU())
-        self.local = stage(2, channels, 1)
+        self.local = stage(inputs, channels, 1)
         self.down = nn.Sequential(stage(channels, 2*channels, 2), stage(2*channels, 4*channels, 2))
 
     def forward(self, x):
@@ -107,43 +107,15 @@ class ImageEncoder(nn.Module):
         return local, self.down(local)
 
 
-class DirectFollower(nn.Module):
-    def __init__(self, cfg: DirectConfig):
+class ImageContext(nn.Module):
+    def __init__(self, cfg: DirectConfig, inputs=2):
         super().__init__()
         self.cfg = cfg
         c, h = cfg.channels, cfg.hidden
-        self.fine_encoder = ImageEncoder(c)
-        self.coarse_encoder = ImageEncoder(c)
+        self.fine_encoder = ImageEncoder(c, inputs)
+        self.coarse_encoder = ImageEncoder(c, inputs)
         self.image_token = nn.Linear(4*c+4, h)  # features, physical xyz, scale flag
         self.history_token = nn.Sequential(nn.Linear(2*c+6, h), nn.SiLU(), nn.Linear(h, h))
-        self.query = nn.Sequential(nn.Linear(9*c+1, h), nn.SiLU(), nn.Linear(h, h))
-        layer = nn.TransformerDecoderLayer(h, cfg.heads, 2*h, dropout=0., activation='gelu',
-                                           batch_first=True, norm_first=True)
-        self.decoder = nn.TransformerDecoder(layer, cfg.layers, norm=nn.LayerNorm(h))
-        self.coordinates = nn.Linear(h, 2)
-        nn.init.normal_(self.coordinates.weight, std=.005)
-        nn.init.zeros_(self.coordinates.bias)
-        # Rich evidence: 27 local samples with support flags, plus the deep
-        # fine/coarse feature at each proposed point and its support flag.
-        evidence_width = 27*(c+1)+2*(4*c+1) if cfg.rich_path_context else 9*c
-        def path_layers():
-            layers = [nn.Linear(h+evidence_width+3, h), nn.SiLU()]
-            if cfg.rich_path_context:
-                layers.append(nn.TransformerEncoderLayer(h, cfg.heads, 2*h, dropout=0.,
-                    activation='gelu', batch_first=True, norm_first=True))
-            return layers
-        if cfg.correction:
-            self.correction_head = nn.Sequential(*path_layers(), nn.Linear(h, 2))
-            nn.init.normal_(self.correction_head[-1].weight, std=.001)
-            nn.init.zeros_(self.correction_head[-1].bias)
-        self.path_evidence = nn.Sequential(*path_layers())
-        self.confidence_head = nn.Sequential(nn.Linear(2*h, h), nn.SiLU(), nn.Linear(h, 1))
-        stencil = torch.tensor([[a, b, 0.] for a in (-1., 0., 1.) for b in (-1., 0., 1.)])
-        self.register_buffer('stencil', stencil*cfg.patch_radius, persistent=False)
-        path_stencil = torch.tensor([[a*cfg.patch_radius, b*cfg.patch_radius, z]
-                                    for z in (-1., 0., 1.) for a in (-1., 0., 1.) for b in (-1., 0., 1.)])
-        self.register_buffer('path_stencil', path_stencil, persistent=False)
-        self.register_buffer('planes', torch.arange(1, cfg.n_future+1).float()*cfg.future_step, persistent=False)
 
     def image_tokens(self, deep, crop, scale):
         # Pool coordinates with exactly the same cells as features.
@@ -175,7 +147,7 @@ class DirectFollower(nn.Module):
         return torch.cat((local, deep_fine, fine_support[..., None].float(),
                           deep_coarse, coarse_support[..., None].float()), -1)
 
-    def forward(self, x, hist, hmask):
+    def encode_context(self, x, hist, hmask):
         cfg = self.cfg
         fine, fine_deep = self.fine_encoder(x['fine'])
         coarse, coarse_deep = self.coarse_encoder(x['coarse'])
@@ -195,6 +167,44 @@ class DirectFollower(nn.Module):
                            self.image_tokens(coarse_deep, cfg.coarse, 1.)), 1)
         memory = torch.cat((image, ht), 1)
         padding = torch.cat((torch.zeros(image.shape[:2], dtype=torch.bool, device=hist.device), ~valid), 1)
+        return fine, fine_deep, coarse_deep, memory, padding
+
+class DirectFollower(ImageContext):
+    def __init__(self, cfg: DirectConfig):
+        super().__init__(cfg)
+        c, h = cfg.channels, cfg.hidden
+        self.query = nn.Sequential(nn.Linear(9*c+1, h), nn.SiLU(), nn.Linear(h, h))
+        layer = nn.TransformerDecoderLayer(h, cfg.heads, 2*h, dropout=0., activation='gelu',
+                                           batch_first=True, norm_first=True)
+        self.decoder = nn.TransformerDecoder(layer, cfg.layers, norm=nn.LayerNorm(h))
+        self.coordinates = nn.Linear(h, 2)
+        nn.init.normal_(self.coordinates.weight, std=.005)
+        nn.init.zeros_(self.coordinates.bias)
+        # Rich evidence: 27 local samples with support flags, plus the deep
+        # fine/coarse feature at each proposed point and its support flag.
+        evidence_width = 27*(c+1)+2*(4*c+1) if cfg.rich_path_context else 9*c
+        def path_layers():
+            layers = [nn.Linear(h+evidence_width+3, h), nn.SiLU()]
+            if cfg.rich_path_context:
+                layers.append(nn.TransformerEncoderLayer(h, cfg.heads, 2*h, dropout=0.,
+                    activation='gelu', batch_first=True, norm_first=True))
+            return layers
+        if cfg.correction:
+            self.correction_head = nn.Sequential(*path_layers(), nn.Linear(h, 2))
+            nn.init.normal_(self.correction_head[-1].weight, std=.001)
+            nn.init.zeros_(self.correction_head[-1].bias)
+        self.path_evidence = nn.Sequential(*path_layers())
+        self.confidence_head = nn.Sequential(nn.Linear(2*h, h), nn.SiLU(), nn.Linear(h, 1))
+        stencil = torch.tensor([[a, b, 0.] for a in (-1., 0., 1.) for b in (-1., 0., 1.)])
+        self.register_buffer('stencil', stencil*cfg.patch_radius, persistent=False)
+        path_stencil = torch.tensor([[a*cfg.patch_radius, b*cfg.patch_radius, z]
+                                    for z in (-1., 0., 1.) for a in (-1., 0., 1.) for b in (-1., 0., 1.)])
+        self.register_buffer('path_stencil', path_stencil, persistent=False)
+        self.register_buffer('planes', torch.arange(1, cfg.n_future+1).float()*cfg.future_step, persistent=False)
+
+    def forward(self, x, hist, hmask):
+        cfg = self.cfg
+        fine, fine_deep, coarse_deep, memory, padding = self.encode_context(x, hist, hmask)
         initial = hist.new_zeros(len(hist), cfg.n_future, 3)
         initial[..., 2] = self.planes
         query = self.query(torch.cat((self.patches(fine, initial),

@@ -298,11 +298,11 @@ def main(argv=None):
     train_f,val_f=split_fibers(fibers,band)
     from vesuvius.neural_tracing.fiber_follow.experiment import read_manifest
     manifest=read_manifest(args.manifest)
-    if manifest['fibers']!=fiber_manifest(val_f) or manifest['volume']!=spec.to_dict():
+    if manifest['fibers']!=fiber_manifest(val_f) or FiberVolumeSpec(**manifest['volume'])!=spec:
         raise ValueError('Frozen manifest does not match run geometry/volume')
     fixed=OnPolicyStates.load(args.fixed_bank)
     if initial is not None:
-        if initial['vol_spec']!=spec.to_dict() or CropSpec(**initial['crop'])!=crop or initial['n_history']!=128:
+        if FiberVolumeSpec(**initial['vol_spec'])!=spec or CropSpec(**initial['crop'])!=crop or initial['n_history']!=128:
             raise ValueError('Initialization volume/crop/history differs from this run')
         if initial.get('seed_manifest_sha256')!=manifest['sha256']:
             raise ValueError('Initialization must use the same frozen evaluation split')
@@ -314,7 +314,7 @@ def main(argv=None):
             raise ValueError('--resume must name a checkpoint inside the run directory given by --name')
         if resume.get('seed_manifest_sha256')!=manifest['sha256']:
             raise ValueError('Resumed checkpoint was trained against a different frozen manifest')
-        if resume['model_cfg']['flow_draws']!=args.flow_draws or resume['vol_spec']!=spec.to_dict():
+        if resume['model_cfg']['flow_draws']!=args.flow_draws or FiberVolumeSpec(**resume['vol_spec'])!=spec:
             raise ValueError('Resumed draws/volume differ from checkpoint')
         # Continue from the caches the interrupted run had published, not the initial ones.
         replay_paths=json.loads(published.read_text()) if published.exists() else list(args.onpolicy)

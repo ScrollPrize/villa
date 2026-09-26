@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 from vesuvius.neural_tracing.fiber_follow.data import fiber_manifest
 from vesuvius.neural_tracing.fiber_follow.evaluate import make_seeds, summarize
+from vesuvius.neural_tracing.fiber_follow.volume import FiberVolumeSpec
 
 
 def jsonable(x):
@@ -25,7 +26,7 @@ def freeze_manifest(path, fibers, vol, assessment, original_config):
         raise ValueError('Annotation geometry differs from the assessment')
     if path.exists():
         saved=json.loads(path.read_text())
-        if saved['fibers'] != identities or saved['volume'] != vol.spec.to_dict():
+        if saved['fibers'] != identities or FiberVolumeSpec(**saved['volume']) != vol.spec:
             raise ValueError('Frozen evaluation manifest differs from current geometry/volume')
         return saved
     calibration=json.loads(Path(assessment).read_text())

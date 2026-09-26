@@ -10,7 +10,7 @@ from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.trace import ModelTracer
 
 
-def image_crop(items, vol, crop, pool=None):
+def image_crop(items, vol, crop, pool=None, ct_only=False):
     """CT and presence only. Reuse the existing physical-coordinate sampler.
 
     The scalar sampler normalizes both channels to [0,1]. An empty history
@@ -18,6 +18,8 @@ def image_crop(items, vol, crop, pool=None):
     and tracing, including the independently resolved presence grid.
     Each item reads only the axis-aligned block its own oriented crop needs.
     """
+    if ct_only:
+        return scalar_crops(items, vol, crop, pool)
     return torch.stack([scalar_crops(items, vol, crop, pool, presence=presence)[:, 0]
                         for presence in (False, True)], 1)
 
@@ -38,13 +40,35 @@ class ObservationBuilder:
             self._coarse = FiberVolume(spec, cache_bytes=vol.ct.cache_bytes)
             # Both scales sample the same presence array. One reader with the
             # combined budget lets the wider coarse footprint serve the fine crop.
-            vol.presence.cache_bytes += self._coarse.presence.cache_bytes
-            self._coarse.presence = vol.presence
-        return dict(fine=image_crop(items, vol, self.cfg.fine, pool),
-                    coarse=image_crop(items, self._coarse, self.cfg.coarse, pool))
+            if vol.presence is not None:
+                vol.presence.cache_bytes += self._coarse.presence.cache_bytes
+                self._coarse.presence = vol.presence
+        ct_only = hasattr(self.cfg, 'seed_crop')
+        return dict(fine=image_crop(items, vol, self.cfg.fine, pool, ct_only),
+                    coarse=image_crop(items, self._coarse, self.cfg.coarse, pool, ct_only))
+
+    def conditioning(self, items, vol):
+        cfg = self.cfg
+        seeds, metadata = [], []
+        for item in items:
+            valid = bool(item.get('seed_valid', False))
+            if valid:
+                seed = dict(pos=item['seed_pos'], frame=item['seed_frame'])
+                seeds.append(scalar_crops([seed], vol, cfg.seed_crop)[0])
+                metadata.append(np.r_[(seed['pos']-item['pos']) @ item['frame']/128,
+                                     item['frame'].T @ seed['frame'][:, 2], 1.])
+            else:
+                seeds.append(torch.zeros(1, cfg.seed_crop.depth, cfg.seed_crop.width, cfg.seed_crop.width))
+                metadata.append(np.zeros(7))
+        return dict(seed_ct=torch.stack(seeds), seed_metadata=torch.as_tensor(np.stack(metadata), dtype=torch.float32),
+                    frontier=torch.as_tensor(np.stack([i.get('frontier', np.zeros(3)) for i in items]), dtype=torch.float32),
+                    frontier_direction=torch.as_tensor(np.stack([i.get('frontier_direction', [0., 0., 1.]) for i in items]), dtype=torch.float32))
 
     def __call__(self, items, vol):
-        return dict(x=self.images(items, vol),
+        x = self.images(items, vol)
+        if hasattr(self.cfg, 'seed_crop'):
+            x.update(self.conditioning(items, vol))
+        return dict(x=x,
                     hist=torch.as_tensor(np.stack([i['hist_local'] for i in items]), dtype=torch.float32),
                     hmask=torch.as_tensor(np.stack([i['hmask'] for i in items]), dtype=torch.float32),
                     **collate_targets(items))
@@ -58,8 +82,11 @@ class DirectTracer(ModelTracer):
         self.judge, self.judge_slices, self.judge_policy = judge, judge_slices, judge_policy
         self.judge_reader = None
         self.judge_explore_calls = judge_explore_calls
+        if hasattr(model.cfg, 'seed_crop') and judge is not None:
+            raise ValueError('Spatial passage scoring replaces the old judge')
 
     def begin_observed(self, frames):
+        self._spatial_seeds = [None for _ in frames]
         if self.judge is None:
             return super().begin_observed(frames)
         from .judge_slices import SliceStream
@@ -120,3 +147,21 @@ class DirectTracer(ModelTracer):
     def build_inputs(self, pos, frames, hist, hmask):
         items = [dict(pos=p, frame=f) for p, f in zip(pos, frames)]
         return {k: v.to(self.device) for k, v in self.observations.images(items, self.vol, self.pool).items()}
+
+    def condition_inputs(self, x, pos, frames, indices):
+        if not hasattr(self.model.cfg, 'seed_crop'):
+            return x
+        seed_ct, metadata = [], []
+        for p, frame, i in zip(pos, frames, indices):
+            seed = self._spatial_seeds[i]
+            if seed is None:
+                seed = dict(pos=p.copy(), frame=frame.copy())
+                seed['ct'] = scalar_crops([seed], self.vol, self.model.cfg.seed_crop)[0]
+                self._spatial_seeds[i] = seed
+            seed_ct.append(seed['ct'])
+            metadata.append(np.r_[(seed['pos']-p) @ frame/128, frame.T @ seed['frame'][:, 2], 1.])
+        x.update(seed_ct=torch.stack(seed_ct).to(self.device),
+                 seed_metadata=torch.as_tensor(np.stack(metadata), device=self.device, dtype=torch.float32),
+                 frontier=torch.zeros(len(pos), 3, device=self.device),
+                 frontier_direction=torch.tensor([0., 0., 1.], device=self.device).expand(len(pos), -1))
+        return x

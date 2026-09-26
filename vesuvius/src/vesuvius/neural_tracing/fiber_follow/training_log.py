@@ -49,7 +49,13 @@ def _direct_training_lines(row):
              f" | mean error {row['error_mean']:.3f} voxels | prefix correct {row['prefix_correct_fraction']:.1%}",
              f"  data: fresh {row['fresh_fraction']:.0%} | fixed {row['fixed_fraction']:.0%}"
              f" | recent {row['recent_fraction']:.0%}"]
-    if 'judge_loss' in row:
+    if 'passage_states' in row:
+        lines.append('  passages: recall before pruning '+_rate(row['proposal_recall_before_count'], row['passage_states'])
+                     +' | after '+_rate(row['proposal_recall_after_count'], row['passage_states'])
+                     +' | selection '+_rate(row['selected_valid_count'], row['selection_opportunities']))
+        lines.append('    all-invalid rejection '+_rate(row['all_invalid_rejected'], row['all_invalid_sets'])
+                     +f" | contact states {int(row['contact_states'])} | censored planes {int(row['plane_censored'])}")
+    if 'judge_source_fractions' in row:
         lines.append(f"  judge: loss {row['judge_loss']:.4f} | sequences {row['judge_sequences']}"
                      f" | positive {row['judge_positive']} | departed {row['judge_departed']}"
                      f" | unknown {row['judge_unknown']}")

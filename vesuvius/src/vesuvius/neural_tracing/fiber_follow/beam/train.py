@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import sys
 import time
 
 import numpy as np
@@ -123,7 +124,27 @@ def build_parser():
     return ap
 
 
+def raise_open_file_limit():
+    """Memory-mapped CT chunks each hold a file descriptor while cached; the
+    diagnostic volume's cache alone can exceed a 1024 soft limit."""
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - non-POSIX
+        return
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = hard if hard != resource.RLIM_INFINITY else max(soft, 1 << 20)
+    if sys.platform == 'darwin':
+        target = min(target, 10240)  # OPEN_MAX; macOS rejects larger soft limits
+    if soft == resource.RLIM_INFINITY or soft >= target:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (ValueError, OSError):
+        pass
+
+
 def main(argv=None):
+    raise_open_file_limit()
     ap = build_parser()
     args = ap.parse_args(argv)
     if min(args.steps, args.batch, args.ckpt_every, args.log_every, args.k_back, args.score_chunk, args.pool_size,

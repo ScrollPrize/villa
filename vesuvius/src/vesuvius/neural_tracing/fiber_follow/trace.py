@@ -51,7 +51,8 @@ def point_samples(vol: FiberVolume, pts_xyz: np.ndarray) -> np.ndarray:
     out = np.zeros(len(pts_xyz), np.float32)
     zyx = np.round(pts_xyz[:, ::-1]).astype(np.int64)
     for i, q in enumerate(zyx):
-        out[i] = vol.presence.read(q, (1, 1, 1))[0, 0, 0] / 255.0
+        presence = vol.presence_for_seeding() if hasattr(vol, 'presence_for_seeding') else vol.presence
+        out[i] = presence.read(q, (1, 1, 1))[0, 0, 0] / 255.0
     return out
 
 
@@ -62,7 +63,8 @@ def field_axis(vol: FiberVolume, p_xyz: np.ndarray) -> tuple[np.ndarray, float]:
         # load or expose the predicted direction vectors to CT-only tracing.
         offsets = np.stack(np.meshgrid(*[np.arange(-3, 4)]*3, indexing='ij'), -1).reshape(-1, 3)
         points = p_xyz[None]+offsets
-        weights = vol.presence.sample_nearest(points[:, ::-1]).astype(float)/255
+        presence = vol.presence_for_seeding() if hasattr(vol, 'presence_for_seeding') else vol.presence
+        weights = presence.sample_nearest(points[:, ::-1]).astype(float)/255
         weights = np.where(weights >= .5*weights.max(), weights**2, 0)
         if weights.sum() <= 1e-8:
             raise ValueError('No presence support for a seed heading; supply an explicit heading')
@@ -111,6 +113,10 @@ class ModelTracer:
 
     def observed_decision(self, state):
         return {}
+
+    def condition_inputs(self, x, pos, frames, indices):
+        """Optional immutable prompt conditioning, separate from proposed paths."""
+        return x
 
     def build_inputs(self, pos, frames, hist, hmask):
         """Read this model's observation; subclasses can supply other image scales."""
@@ -195,6 +201,7 @@ class ModelTracer:
             hist = np.einsum('bhi,bij->bhj', hist_world-pos[:, None], fr)
             tensor = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(self.device)
             x = self.build_inputs(pos, fr, hist, hm)
+            x = self.condition_inputs(x, pos, fr, idx)
             sampling = {}
             if stochastic:
                 sampling['initial_noise'] = trace_noise(self.model.cfg, [generators[i] for i in idx], self.device)

@@ -20,6 +20,7 @@ from vesuvius.neural_tracing.fiber_follow.runloop import (
 )
 from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.direct.model import ARCHITECTURE, DirectConfig, DirectFollower
+from vesuvius.neural_tracing.fiber_follow.direct.spatial_model import SPATIAL_ARCHITECTURE, SpatialConfig, SpatialFollower
 from vesuvius.neural_tracing.fiber_follow.direct.data import ObservationBuilder, DirectTracer
 from vesuvius.neural_tracing.fiber_follow.direct.supervision import commit_window, loss_terms
 from vesuvius.neural_tracing.fiber_follow.direct.diagnostics import decision_rows, summarize_decisions
@@ -27,9 +28,11 @@ from vesuvius.neural_tracing.fiber_follow.direct.recovery import monitor_fixture
 from vesuvius.neural_tracing.fiber_follow.training_log import format_training_log
 
 
-def validate_volume_source(spec, manifest):
+def validate_volume_source(spec, manifest, ct_only=False):
     """Allow a different CT pyramid level, retaining frozen physical data/seeds."""
     for key in ('fiber_zarr_dir', 'ct_zarr', 'fiber_level', 'grid_scale', 'inputs'):
+        if key == 'inputs' and ct_only and spec.inputs == 'ct' and manifest['volume'][key] == 'ct+presence':
+            continue
         if spec.to_dict()[key] != manifest['volume'][key]:
             raise ValueError(f'Volume source {key} differs from frozen manifest')
 
@@ -38,7 +41,7 @@ def save_checkpoint(path, model, ema, spec, sample, extra=None):
     # Atomic publication: collectors must never open a partial checkpoint.
     path = Path(path)
     temporary = path.with_suffix('.partial.pt')
-    write_checkpoint(temporary, model, spec, sample.crop, sample.n_history, ARCHITECTURE,
+    write_checkpoint(temporary, model, spec, sample.crop, sample.n_history, getattr(model, 'architecture', ARCHITECTURE),
                      dict({'n_commit': commit_window(model.cfg, None), **(extra or {})},
                           ema=ema.state_dict(), sample_cfg=asdict(sample),
                           coarse_ct_level=1, coarse_ct_grid_scale=8.))
@@ -79,12 +82,17 @@ def compile_training_judge(judge):
 
 
 def load_checkpoint(path, device='cuda'):
-    ck = read_checkpoint(path, ARCHITECTURE, device)
+    ck = read_checkpoint(path, (ARCHITECTURE, SPATIAL_ARCHITECTURE), device)
     # Historical checkpoints retain their exact one-pass/one-correction model,
     # including the old path heads. Active legacy collectors still load these.
-    cfg = DirectConfig(**{'correction': False, 'correction_steps': 1,
-                          'rich_path_context': False, **ck['model_cfg']})
-    model = DirectFollower(cfg).to(device, memory_format=conv_memory_format(device))
+    if ck['architecture'] == SPATIAL_ARCHITECTURE:
+        cfg = SpatialConfig(**ck['model_cfg'])
+        model = SpatialFollower(cfg)
+    else:
+        cfg = DirectConfig(**{'correction': False, 'correction_steps': 1,
+                              'rich_path_context': False, **ck['model_cfg']})
+        model = DirectFollower(cfg)
+    model = model.to(device, memory_format=conv_memory_format(device))
     model.load_state_dict(ck['ema'])
     model.eval()
     if ck.get('coarse_ct_level') != 1 or ck.get('coarse_ct_grid_scale') != 8.:
@@ -178,6 +186,19 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
                                         images/f'judge_path_{step:06d}_c{threshold}_{index}.png')
                 finally:
                     judged.close()
+        if hasattr(tracer, 'contact_monitor'):
+            from .spatial_supervision import spatial_loss_terms
+            builder, items = tracer.contact_monitor
+            totals = {}
+            for offset in range(0, len(items), 2):
+                observed = move_batch(builder(items[offset:offset+2], tracer.vol), device)
+                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
+                    prediction = model(observed['x'], observed['hist'], observed['hmask'])
+                    metrics = spatial_loss_terms(prediction, observed, model.cfg)['spatial_metrics']
+                for key, value in metrics.items():
+                    totals[key] = totals.get(key, 0)+value.item()
+            log.record(dict(step=step, split='monitor_contacts', states=len(items),
+                            episodes=len(set(i['contact_episode'] for i in items)), **totals))
         plot_curves(Path(out)/'log.jsonl', Path(out)/'curves.png', loss_key='geometry')
     finally:
         model.train(was_training)
@@ -217,11 +238,19 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     if judge is not None:
         judge.train()
     model.train()
+    spatial = isinstance(model.cfg, SpatialConfig)
     for cpu in batches:
         batch = move_batch(cpu, device)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-            output = model(batch['x'], batch['hist'], batch['hmask'])
-            terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit)
+            if spatial:
+                from .spatial_supervision import teaching_candidates, spatial_loss_terms
+                output = model(batch['x'], batch['hist'], batch['hmask'],
+                               training_candidates=teaching_candidates(batch, model.cfg))
+                terms = spatial_loss_terms(output, batch, model.cfg, tolerance,
+                                           n_commit=n_commit or 4, compute_metrics=compute_metrics)
+            else:
+                output = model(batch['x'], batch['hist'], batch['hmask'])
+                terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit)
             geometry = terms['geometry_per_state'].sum()/total
             confidence = terms['confidence_per_state'].sum()/total
             loss = geometry + confidence_weight*confidence
@@ -241,8 +270,10 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 sums['judge_positive'] += int((mask & (sequence['target'] > .5)).sum())
                 sums['judge_departed'] += int((mask & (sequence['target'] <= .5)).sum())
                 sums['judge_unknown'] += int((~mask).sum())
-        if compute_metrics:
+        if compute_metrics and not spatial:
             decisions.extend(decision_rows(output, batch, model.cfg, n_commit, tolerance))
+        for key, value in terms.get('spatial_metrics', {}).items():
+            sums[key] = sums.get(key, 0.)+value.item()
         for key, value in (('loss', loss), ('geometry', geometry), ('confidence_loss', confidence)):
             sums[key] += value.detach().item()
         for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count'):
@@ -264,7 +295,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']),
                 fresh_fraction=float(sources[0]/total), fixed_fraction=float(sources[1]/total),
                 recent_fraction=float(sources[2]/total))
-    if compute_metrics:
+    if compute_metrics and not spatial:
         sums['decisions'] = summarize_decisions(decisions, commit_window(model.cfg, n_commit))
     return sums
 
@@ -309,6 +340,8 @@ def build_parser():
     ap.add_argument('--ckpt-every', type=int, default=1000)
     ap.add_argument('--diag-every', type=int, default=1000)
     ap.add_argument('--diag-max-len', type=float, default=400.)
+    ap.add_argument('--long-diag-every', type=int, default=0, help='Additional long monitor rollouts; 0 disables')
+    ap.add_argument('--long-diag-max-len', type=float, default=1200.)
     ap.add_argument('--recovery-every', type=int, default=1000, help='Fixed monitor recovery diagnostic cadence; 0 disables')
     ap.add_argument('--recovery-seeds', type=int, default=8, help='First N frozen monitor seeds, four drift bands each')
     ap.add_argument('--recovery-length', type=float, default=32.)
@@ -319,6 +352,13 @@ def build_parser():
     ap.add_argument('--replay-keep', type=int, default=4)
     ap.add_argument('--resume', help='Resume last.pt inside this run with the same training options')
     ap.add_argument('--init-tracer', help='Initialize a new run from saved EMA follower weights')
+    ap.add_argument('--spatial', action='store_true', help='CT-only plane heatmaps and passage scoring')
+    ap.add_argument('--fine-depth', type=int, default=160)
+    ap.add_argument('--fine-width', type=int, default=96)
+    ap.add_argument('--fine-behind', type=int, default=48, help='Native .5-voxel samples behind origin')
+    ap.add_argument('--horizon', type=int, default=48)
+    ap.add_argument('--candidates', type=int, default=8)
+    ap.add_argument('--contact-fraction', type=float, default=.35)
     from .judge_options import add_judge_options
     add_judge_options(ap)
     return ap
@@ -334,6 +374,10 @@ def main(argv=None):
     progress(f'Starting training: device={args.device}, workers={args.workers}, judge={args.judge}')
     if args.resume and args.init_tracer:
         raise ValueError('--init-tracer starts a new run and cannot be combined with --resume')
+    if args.spatial and (args.judge or args.init_tracer):
+        raise ValueError('Spatial passage training starts a new architecture and replaces the old judge')
+    if not 0 <= args.contact_fraction <= 1:
+        raise ValueError('Contact fraction must be in [0, 1]')
     if min(args.judge_loss_weight, args.judge_synthetic_fraction) < 0:
         raise ValueError('Judge allocations and loss weight must be nonnegative')
     if not np.isfinite(args.judge_departed_fraction) or args.judge_departed_fraction < 0:
@@ -343,10 +387,10 @@ def main(argv=None):
     if min(args.steps, args.batch, args.microbatch, args.log_every, args.ckpt_every,
            args.threads, args.replay_keep, args.dagger_seeds, args.recovery_seeds) < 1 or args.batch % args.microbatch:
         raise ValueError('Positive counts required; microbatch must divide effective batch')
-    if min(args.workers, args.warmup, args.diag_every, args.dagger_every, args.recovery_every, args.confidence_weight) < 0:
+    if min(args.workers, args.warmup, args.diag_every, args.long_diag_every, args.dagger_every, args.recovery_every, args.confidence_weight) < 0:
         raise ValueError('Invalid training settings')
     if not 0 <= args.ema_decay < 1 or min(args.lr, args.tolerance, args.worker_cache_gb,
-                                       args.diag_max_len, args.dagger_trace_len, args.recovery_length) <= 0:
+                                       args.diag_max_len, args.long_diag_max_len, args.dagger_trace_len, args.recovery_length) <= 0:
         raise ValueError('Invalid loss, learning rate, cache, or rollout settings')
     if args.val_z[0] >= args.val_z[1]:
         raise ValueError('Holdout interval must be increasing')
@@ -361,6 +405,11 @@ def main(argv=None):
     cfg = DirectConfig(channels=args.channels, layers=args.decoder_layers,
                        correction=args.correction, correction_limit=args.correction_limit,
                        correction_steps=args.correction_steps)
+    if args.spatial:
+        from ..geometry import CropSpec
+        cfg = SpatialConfig(channels=args.channels, layers=args.decoder_layers,
+                            fine=CropSpec(depth=args.fine_depth, width=args.fine_width, behind=args.fine_behind, spacing=.5),
+                            n_future=args.horizon, candidates=args.candidates)
     initialized = None
     if args.init_tracer:
         progress(f'Loading follower weights from {args.init_tracer}')
@@ -368,31 +417,39 @@ def main(argv=None):
         cfg = initialized.cfg
     if args.resume:
         progress(f'Loading resume checkpoint from {args.resume}')
-        resume_config = read_checkpoint(args.resume, ARCHITECTURE, args.device)
-        cfg = DirectConfig(**resume_config['model_cfg'])
+        resume_config = read_checkpoint(args.resume, (ARCHITECTURE, SPATIAL_ARCHITECTURE), args.device)
+        cfg = (SpatialConfig if resume_config['architecture'] == SPATIAL_ARCHITECTURE else DirectConfig)(**resume_config['model_cfg'])
+        if isinstance(cfg, SpatialConfig) != args.spatial:
+            raise ValueError('Resume must preserve --spatial architecture selection')
     if not 1 <= args.n_commit <= cfg.n_future:
         raise ValueError('Commit window must fit forecast')
     # Native fine imagery, independently read coarse level-1 imagery.
-    spec = FiberVolumeSpec(args.fiber_zarrs, ct_zarr=args.ct, ct_level=0, ct_grid_scale=4., inputs='ct+presence')
+    spec = FiberVolumeSpec(args.fiber_zarrs, ct_zarr=args.ct, ct_level=0, ct_grid_scale=4.,
+                           inputs='ct' if args.spatial else 'ct+presence', load_presence=not args.spatial)
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future,
                           future_step=cfg.future_step, recent_history_points=cfg.n_history,
-                          no_history_prob=args.no_history_prob, short_history_prob=args.short_history_prob)
+                          no_history_prob=args.no_history_prob, short_history_prob=args.short_history_prob,
+                          unique_crossings=args.spatial)
     progress('Loading manifest and fiber annotations')
     manifest = read_manifest(args.manifest)
-    validate_volume_source(spec, manifest)
+    validate_volume_source(spec, manifest, ct_only=args.spatial)
     fibers = load_fibers(args.fibers, grid_scale=spec.grid_scale)
     band = ZBand(*(v/spec.grid_scale for v in args.val_z))
     train_f, val_f = split_fibers(fibers, band)
     progress(f'Loaded {len(train_f)} training fibers and {len(val_f)} validation fibers')
     if fiber_manifest(val_f) != manifest['fibers']:
         raise ValueError('Frozen validation geometry differs from dataset/holdout')
-    resume = read_checkpoint(args.resume, ARCHITECTURE, args.device) if args.resume else None
+    resume = read_checkpoint(args.resume, (ARCHITECTURE, SPATIAL_ARCHITECTURE), args.device) if args.resume else None
     if resume:
         # The run directory may move; the checkpoint must still sit inside the named run.
         ignored = {'resume', 'out_root', 'device', 'batch', 'microbatch', 'workers', 'threads', 'worker_cache_gb',
                    'log_every', 'ckpt_every', 'diag_every', 'dagger_device', 'compile', 'init_tracer',
                    'judge_departed_fraction'}
         for key, value in vars(args).items():
+            if key in ('spatial', 'fine_depth', 'fine_width', 'fine_behind', 'horizon', 'candidates', 'contact_fraction') and key not in resume['training_options'] and not args.spatial:
+                continue
+            if key in ('long_diag_every', 'long_diag_max_len') and key not in resume['training_options'] and not args.long_diag_every:
+                continue
             if key.startswith('judge') and key not in resume['training_options'] and not args.judge:
                 continue
             if key not in ignored and resume['training_options'].get(key) != value:
@@ -412,7 +469,7 @@ def main(argv=None):
         if resume and resume.get('monitor_recovery_sha256') != recovery_hash:
             raise ValueError('Monitor recovery fixture changed since checkpoint')
     progress('Initializing models and optimizer')
-    model = initialized if initialized is not None else DirectFollower(cfg).to(args.device, memory_format=conv_memory_format(args.device))
+    model = initialized if initialized is not None else (SpatialFollower(cfg) if args.spatial else DirectFollower(cfg)).to(args.device, memory_format=conv_memory_format(args.device))
     ema = copy.deepcopy(model).requires_grad_(False).eval()
     judge = judge_ema = slices = policy = None
     if args.judge:
@@ -453,6 +510,15 @@ def main(argv=None):
         initial=[c._dir for c in caches], trace_len=args.dagger_trace_len, n_commit=args.n_commit,
         collector_module='vesuvius.neural_tracing.fiber_follow.direct.collect')
     builder = ObservationBuilder(cfg)
+    contact_summary = None
+    if args.spatial:
+        from .contacts import ContactIndex, SpatialObservationBuilder
+        progress('Indexing validated training contacts')
+        contacts = ContactIndex(train_f, band, out/'contacts.json')
+        contact_summary = contacts.summary(cfg.n_future*cfg.future_step)
+        (out/'contact_summary.json').write_text(json.dumps(contact_summary, indent=2))
+        progress(f'Contact index: {contact_summary}')
+        builder = SpatialObservationBuilder(cfg, sample, train_f, band, contacts, args.contact_fraction)
     if args.judge:
         from .judge_supervision import JointObservationBuilder
         builder = JointObservationBuilder(builder, slices, band, args.judge_synthetic_fraction, train_f,
@@ -466,13 +532,15 @@ def main(argv=None):
         loader_args.update(prefetch_factor=2, persistent_workers=True)
     loader = torch.utils.data.DataLoader(dataset, **loader_args)
     if not resume:
-        (out/'config.json').write_text(json.dumps(dict(vars(args), architecture=ARCHITECTURE,
+        (out/'config.json').write_text(json.dumps(dict(vars(args), architecture=getattr(model, 'architecture', ARCHITECTURE),
             model_cfg=cfg.to_dict(), sample_cfg=asdict(sample), vol_spec=spec.to_dict(),
             coarse_ct_level=1, coarse_ct_grid_scale=8., data_policy=DATA_POLICY,
             monitor_recovery_sha256=recovery_hash,
             seed_manifest_sha256=manifest['sha256'], fiber_manifest=fiber_manifest(fibers),
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
     log = RunLog(out/'log.jsonl', formatter=format_training_log)
+    if contact_summary is not None:
+        log.record(dict(step=done, contact_index=contact_summary))
     if args.judge:
         log.record(dict(step=done, judge_departed_fraction=args.judge_departed_fraction,
                         previous_judge_departed_fraction=resume['training_options'].get('judge_departed_fraction', 0.)
@@ -481,10 +549,16 @@ def main(argv=None):
     recovery_vol = FiberVolume(spec) if recovery_states is not None else None
     started = time.monotonic()
     try:
-        if args.diag_every:
+        if args.diag_every or args.long_diag_every:
             from vesuvius.neural_tracing.fiber_follow.trace import TraceParams
             tracer = DirectTracer(ema, FiberVolume(spec), cfg.fine, cfg.n_history,
                 TraceParams(n_commit=args.n_commit, max_len=args.diag_max_len), device=args.device)
+            if args.spatial:
+                from .contacts import contact_monitor
+                progress('Preparing fixed contacts from monitor fibers only')
+                tracer.contact_monitor = contact_monitor(cfg, sample,
+                    [val_f[i] for i in manifest['monitor_fibers']], band, out/'monitor_contacts.json')
+                progress(f'Fixed held-out contact states: {len(tracer.contact_monitor[1])}')
         progress(f'Starting data loader; waiting for {args.batch//args.microbatch} microbatches for update {done+1}')
         iterator = iter(loader)
         for step in range(done+1, args.steps+1):
@@ -545,7 +619,7 @@ def main(argv=None):
             if step < args.steps and collector.launch(step, save):
                 log.record(dict(step=step, dagger_launched=True))
             periodic = {}
-            if tracer is not None and step % args.diag_every == 0:
+            if tracer is not None and args.diag_every and step % args.diag_every == 0:
                 began = time.monotonic()
                 training_diagnostics(ema, batches[-1], tracer, val_f, manifest['monitor'], out, step, log,
                                      device=args.device, judge=judge_ema, judge_slices=slices, judge_policy=policy)
@@ -557,6 +631,28 @@ def main(argv=None):
                             logits = judge_ema(**{k: device_sequence[k] for k in ('images','metadata','valid','queries')})
                             plot_judge_sequence(sequence, logits, out/'images'/f'judge_{step:06d}_{index}.png')
                 periodic['diagnostics_seconds'] = time.monotonic()-began
+            if tracer is not None and args.long_diag_every and step % args.long_diag_every == 0:
+                from ..evaluate import evaluate
+                from ..experiment import rollout_summary
+                from ..diag import plot_rollouts
+                began = time.monotonic()
+                original_length, original_threshold = tracer.p.max_len, tracer.p.confidence
+                tracer.p.max_len, tracer.p.confidence = args.long_diag_max_len, .5
+                traces = []
+                try:
+                    rows, _ = evaluate(tracer, val_f, manifest['monitor'], batch=1,
+                        coverage_max_len=args.long_diag_max_len,
+                        on_trace=lambda seed, path, reason: traces.append((path, reason)))
+                    log.record(dict(step=step, split='monitor_long', threshold=.5,
+                                    coverage_max_len=args.long_diag_max_len, **rollout_summary(rows)))
+                    if traces:
+                        paths, reasons = zip(*traces)
+                        (out/'images').mkdir(exist_ok=True)
+                        plot_rollouts(tracer.vol, val_f, manifest['monitor'], paths, reasons,
+                            out/'images'/f'rollout_long_{step:06d}_c0.5.png', args.long_diag_max_len, rows=rows)
+                finally:
+                    tracer.p.max_len, tracer.p.confidence = original_length, original_threshold
+                periodic['long_diagnostics_seconds'] = time.monotonic()-began
             if recovery_states is not None and step % args.recovery_every == 0:
                 began = time.monotonic()
                 report = evaluate_monitor(ema, recovery_vol, recovery_states, val_f, sample, device=args.device,

@@ -145,7 +145,8 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=ModelTrac
     if args.n_commit is None:
         args.n_commit = ck.get('n_commit', DEFAULT_N_COMMIT)
     cfg = SampleConfig(crop=crop, n_history=n_hist, recent_history_points=model.cfg.recent_history_points,
-                       n_future=model.cfg.n_future, future_step=model.cfg.future_step)
+                       n_future=model.cfg.n_future, future_step=model.cfg.future_step,
+                       unique_crossings=hasattr(model.cfg, 'seed_crop'))
     if args.fiber_zarrs:
         spec.fiber_zarr_dir = args.fiber_zarrs
     vol = FiberVolume(spec, cache_bytes=2 << 30)

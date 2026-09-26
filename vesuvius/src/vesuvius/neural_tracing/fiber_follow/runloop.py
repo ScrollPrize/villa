@@ -76,7 +76,8 @@ def save_checkpoint(path, model, vol_spec, crop, n_history, architecture, extra=
 
 def read_checkpoint(path, architecture, device='cuda'):
     ck = torch.load(path, map_location=device, weights_only=False)
-    if ck['architecture'] != architecture or ck['data_policy'] != DATA_POLICY:
+    accepted = (architecture,) if isinstance(architecture, str) else tuple(architecture)
+    if ck['architecture'] not in accepted or ck['data_policy'] != DATA_POLICY:
         raise ValueError(f'Checkpoint {path} is {ck["architecture"]}/{ck["data_policy"]}, '
                          f'not {architecture}/{DATA_POLICY}')
     return ck

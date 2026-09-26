@@ -5,6 +5,40 @@ curve in one decoder pass followed by two bounded local corrections, directly
 supervised against annotated geometry.
 The flow model and its training commands remain available separately.
 
+## CT-only spatial passage experiment
+
+`--spatial` selects `direct_spatial_passages_v1`: a 160 × 96 × 96 native CT crop,
+48 conditioned forward-plane heatmaps, up to eight coherent passages, and one
+shared scorer for prefix/full-passage validity. It commits up to four supported
+points and recomputes. Presence is used only for explicit seed selection, never
+for model crops. Legacy direct checkpoints and commands remain supported.
+
+The experiment adds indexed validated contacts, paired prompts in a common CT
+frame, explicit frontier/seed provenance, known-neighbor identity labels, and
+masked BCE without a separate ranking loss. See [EXPERIMENTAL_CHANGES.md](EXPERIMENTAL_CHANGES.md)
+for the exact contracts, limitations, measurements, and production command.
+
+```bash
+bash scripts/launch_direct.sh direct_ct_spatial_run1 --spatial \
+  --batch 24 --microbatch 8 --workers 6 --no-compile --n-commit 4 \
+  --long-diag-every 5000 --long-diag-max-len 1200
+tail -f output/logs/direct_ct_spatial_run1.log
+```
+
+The launcher uses the existing environment and data paths. Spatial checkpoints
+work with `direct.infer` and `direct.collect`. Training metrics include candidate
+recall before/after pruning, selection given a valid candidate, all-invalid-set
+rejection, and contact allocation. Fixed contact monitoring uses monitor fibers
+only; calibration and final evaluation remain separate.
+
+Run the bounded real-CT preflight with the project environment:
+
+```bash
+PYTHONPATH=../../.. ../../../../.venv/bin/python -m \
+  vesuvius.neural_tracing.fiber_follow.direct.spatial_preflight \
+  --fit-steps 200 --microbatch 8
+```
+
 ## Design
 
 The task is to continue the original fiber from an imperfect observed path.

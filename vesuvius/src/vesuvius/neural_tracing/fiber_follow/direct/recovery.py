@@ -23,7 +23,10 @@ def monitor_fixture(path, fibers, manifest, sample, spec, seed_count=8):
     if path.exists():
         states = OnPolicyStates.load(path)
         states.validate_fibers(fibers)
-        if states.provenance != provenance:
+        recorded = json.loads(json.dumps(states.provenance))
+        recorded.get('sample_cfg', {}).setdefault('unique_crossings', False)
+        recorded.get('volume', {}).setdefault('load_presence', True)
+        if recorded != provenance:
             raise ValueError('Monitor recovery fixture settings changed')
     else:
         states = make_recovery_states(fibers, seeds, sample, provenance)

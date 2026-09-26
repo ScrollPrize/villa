@@ -213,6 +213,7 @@ class SampleConfig:
     history_drift: float = 2.0  # accumulated lateral displacement, smooth over 16--64 voxels
     history_wobble: float = 1.0  # max amplitude (voxels) of slow lateral wobble on the own-trace history
     dense_substeps: int = 4
+    unique_crossings: bool = False
 
     @property
     def future_s(self) -> np.ndarray:
@@ -230,6 +231,8 @@ def training_state_allowed(item, crop: CropSpec, band: ZBand | None):
     crop's read footprint (including interpolation support). Applied before I/O
     to fresh and cached states, after their random roll/offset is selected.
     """
+    if item.get('spatial_excluded', False):
+        return False
     if band is None:
         return True
     pos, frame = item["pos"], item["frame"]
@@ -265,7 +268,7 @@ def training_state_allowed(item, crop: CropSpec, band: ZBand | None):
     return not (z.min() < band.hi and z.max() >= band.lo)
 
 
-def plane_targets(p, s, t, t_end, pos, frame, planes):
+def plane_targets(p, s, t, t_end, pos, frame, planes, require_unique=False):
     """Where the GT curve (traversal arc ``s``, from ``t`` up to ``t_end``)
     first crosses each local forward plane c = planes[k]. Returns lateral
     (a, b) per plane (K, 2) and a validity mask (K,)."""
@@ -278,8 +281,19 @@ def plane_targets(p, s, t, t_end, pos, frame, planes):
     arc = np.r_[t, s[(s > t) & (s < t+span)], t+span]
     loc = (interp_at(p, s, arc) - pos) @ frame
     c = loc[:, 2]
+    # Only the local passage up to the first final-plane crossing is relevant.
+    # A later return from outside the horizon is a different tracing decision.
+    if require_unique:
+        end_hit = np.flatnonzero((c[:-1] < planes[-1]) & (c[1:] >= planes[-1]))
+        if len(end_hit):
+            loc, c = loc[:end_hit[0]+2], c[:end_hit[0]+2]
     for k, ck in enumerate(planes):
         hit = np.nonzero((c[:-1] < ck) & (c[1:] >= ck))[0]
+        if require_unique:
+            backward = (c[:-1] >= ck) & (c[1:] < ck)
+            flat = np.isclose(c[:-1], ck, atol=1e-6) & np.isclose(c[1:], ck, atol=1e-6)
+            if len(hit) != 1 or backward.any() or flat.any():
+                continue
         if len(hit):
             i = hit[0]
             w = (ck - c[i]) / max(c[i + 1] - c[i], 1e-9)
@@ -365,8 +379,8 @@ def continuation_targets(fiber, t, reverse, pos, frame, cfg, offtrack=False):
         gt_history_mask[:] = 0
     dense_planes = np.linspace(cfg.future_step, cfg.future_s[-1],
                                (cfg.n_future-1)*cfg.dense_substeps+1)
-    ab, mask = plane_targets(p, s, t, s[-1], pos, frame, cfg.future_s)
-    dense_ab, dense_mask = plane_targets(p, s, t, s[-1], pos, frame, dense_planes)
+    ab, mask = plane_targets(p, s, t, s[-1], pos, frame, cfg.future_s, cfg.unique_crossings)
+    dense_ab, dense_mask = plane_targets(p, s, t, s[-1], pos, frame, dense_planes, cfg.unique_crossings)
     fmask = (tf <= s[-1]).astype(np.float32)
     if offtrack:
         mask[:] = 0
@@ -482,8 +496,11 @@ class FollowDataset(torch.utils.data.IterableDataset):
             if chunks % self.refresh_chunks == 0:
                 self.refresh_replay()
             chunks += 1
-            items = []
+            items = (self.batch_builder.contact_batch(rng, self.chunk)
+                     if hasattr(self.batch_builder, 'contact_batch') else [])
             for attempt in range(max(10000, self.chunk*1000)):
+                if len(items) == self.chunk:
+                    break
                 draw = self.draw_replay(rng) if attempt < self.chunk*10 else None
                 item = None
                 if draw is not None:
@@ -493,6 +510,9 @@ class FollowDataset(torch.utils.data.IterableDataset):
                                        reverse=bool(op.reverse[j]), offtrack=bool(op.offtrack[j]))
                     item['source'],item['stratum'] = source,band
                     item['source_step'] = op.provenance.get('step', -1) or -1
+                    if hasattr(self.batch_builder, 'prepare_sample'):
+                        item = self.batch_builder.prepare_sample(item, self.fibers[op.fiber_idx[j]],
+                            float(op.t[j]), bool(op.reverse[j]), rng, replay=op, replay_row=j)
                     if self.batch_builder is not None and hasattr(self.batch_builder, 'slices') and op.judge_trace[j] >= 0:
                         from .direct.judge_archive import PathArchive
                         item['judge_context'] = PathArchive.from_replay(op).context(int(op.judge_trace[j]), float(op.judge_cutoff[j]),
@@ -519,6 +539,9 @@ class FollowDataset(torch.utils.data.IterableDataset):
                         from .direct.judge_supervision import fresh_context
                         item['judge_context'] = fresh_context(item, f, t, rev)
                     item['source'], item['source_step'], item['stratum'] = 0, -1, -1
+                    if hasattr(self.batch_builder, 'prepare_sample'):
+                        original_t = f.length-t if rev else t
+                        item = self.batch_builder.prepare_sample(item, f, original_t, rev, rng)
                 if self.state_allowed(item):
                     items.append(item)
                 if len(items) == self.chunk:

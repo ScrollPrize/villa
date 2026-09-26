@@ -169,6 +169,7 @@ class FiberVolumeSpec:
     grid_scale: float = 8.0
     # "ct+presence" samples each scalar field on its own grid, without axes.
     inputs: str = "fiber"
+    load_presence: bool = True  # False: CT metadata alone defines tracing bounds.
 
     @property
     def mode(self) -> str:
@@ -198,7 +199,11 @@ class FiberVolume:
             raise ValueError('Invalid input mode or voxel scale')
         lvl = str(spec.fiber_level)
         per = cache_bytes // (4 if spec.ct_zarr else 3)
-        self.presence = ChunkedArray(os.path.join(_find_channel_zarr(spec.fiber_zarr_dir, "presence"), lvl), per)
+        if not spec.load_presence and spec.mode != 'ct':
+            raise ValueError('Presence-free volume reading requires CT-only inputs')
+        self.presence = (ChunkedArray(os.path.join(_find_channel_zarr(spec.fiber_zarr_dir, "presence"), lvl), per)
+                         if spec.load_presence else None)
+        self._seed_presence = None
         self.nx = self.ny = None
         if spec.mode in ('fiber', 'fiber+ct'):
             self.nx = ChunkedArray(os.path.join(_find_channel_zarr(spec.fiber_zarr_dir, "nx"), lvl), per)
@@ -213,7 +218,7 @@ class FiberVolume:
             # Native CT is the larger field; presence keeps its own cache.
             ct = ChunkedArray(os.path.join(spec.ct_zarr, str(spec.ct_level)),
                               int(cache_bytes * 0.75) if spec.mode in ('ct', 'ct+presence') else per)
-            expected = np.asarray(self.presence.shape)*spec.grid_scale/spec.ct_grid_scale
+            expected = np.asarray(self.presence.shape)*spec.grid_scale/spec.ct_grid_scale if self.presence is not None else np.asarray(ct.shape)
             if np.any(np.abs(np.asarray(ct.shape)-expected) > 1):
                 raise ValueError(
                     f"CT shape {ct.shape} and voxel scale {spec.ct_grid_scale} do not align "
@@ -224,7 +229,17 @@ class FiberVolume:
             if ct.dtype != np.dtype('uint8'):
                 raise ValueError('CT intensity normalization currently requires uint8 data')
             self.ct = ct
-        self.shape = self.presence.shape
+        self.shape = (self.presence.shape if self.presence is not None else
+                      tuple(np.ceil(np.asarray(self.ct.shape)/self.input_scale).astype(int)))
+
+    def presence_for_seeding(self):
+        """Explicit seed-selection dependency, never opened for CT-only model crops."""
+        if self.presence is not None:
+            return self.presence
+        if self._seed_presence is None:
+            self._seed_presence = ChunkedArray(os.path.join(
+                _find_channel_zarr(self.spec.fiber_zarr_dir, 'presence'), str(self.spec.fiber_level)), 64 << 20)
+        return self._seed_presence
 
     @property
     def raw_channels(self) -> int:

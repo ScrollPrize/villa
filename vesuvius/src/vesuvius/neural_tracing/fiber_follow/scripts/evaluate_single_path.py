@@ -20,7 +20,7 @@ from vesuvius.neural_tracing.fiber_follow.history_audit import HistoryAudit
 from vesuvius.neural_tracing.fiber_follow.supervision import prefix_labels
 from vesuvius.neural_tracing.fiber_follow.trace import ModelTracer,TraceParams
 from vesuvius.neural_tracing.fiber_follow.train import load_checkpoint
-from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume
+from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume, FiberVolumeSpec
 
 
 class RecoveryAudit(HistoryAudit):
@@ -105,7 +105,7 @@ def main(argv=None, *, checkpoint_loader=None, model_tracer=None, volume_validat
             model,crop,nh,spec,ck=(checkpoint_loader or load_checkpoint)(checkpoint,args.device)
             if volume_validator is not None:
                 volume_validator(spec,manifest)
-            elif spec.to_dict()!=manifest['volume']: raise ValueError('Volume differs from frozen manifest')
+            elif spec!=FiberVolumeSpec(**manifest['volume']): raise ValueError('Volume differs from frozen manifest')
         _,val=split_fibers(load_fibers(args.fibers,grid_scale=spec.grid_scale),ZBand(45000/spec.grid_scale,48500/spec.grid_scale))
         if fiber_manifest(val)!=manifest['fibers']: raise ValueError('Geometry differs from frozen manifest')
         sampler_mode=getattr(model.cfg,'sampler_mode','zero')
