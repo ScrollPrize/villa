@@ -2070,6 +2070,10 @@ LineAnnotationController::LineAnnotationController(CState* state,
     // Background work must not compete with interactive rendering at normal
     // OS priority (review guidance: run it low, publish late results).
     _lineSolvePool.setThreadPriority(QThread::LowPriority);
+    if (_viewerManager) {
+        connect(_viewerManager, &ViewerManager::volumeGeometryUpdateRequested,
+                this, &LineAnnotationController::refreshStaleGeneratedViews);
+    }
     if (_state) {
         connect(_state,
                 &CState::surfaceChanged,
@@ -13634,10 +13638,9 @@ void LineAnnotationController::scheduleStaleViewRefresh()
         return;
     }
     _staleViewRefreshQueued = true;
-    // Next event-loop turn: CState emits volumeChanged from inside
-    // ViewerManager::switchVolume(), before it restores focus and navigation,
-    // and materialization reads pane camera state. Deferring also collapses
-    // rapid switching into one rebuild.
+    // Coalesce attachment/metadata changes and direct CState updates.
+    // ViewerManager's switch path flushes stale geometry synchronously before
+    // restoring navigation; this queued pass then has nothing left to rebuild.
     QMetaObject::invokeMethod(
         this,
         [this]() {
@@ -14422,7 +14425,8 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
             views.lineSurface.get(),
             views.lineSideSlice.get(),
             views.stripPositionMap,
-            linePoints);
+            linePoints,
+            session.fiberBaseToVolumeScale);
     }
 
     // Everything the session currently shows, retained so a failed install can
@@ -14476,6 +14480,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.lineSideSliceName = session.generatedLineSideSliceName;
     generatedViews.lineSideSliceTitle = tr("Line Side Slice");
     generatedViews.lineSideSlice = views.lineSideSlice;
+    generatedViews.fiberBaseToVolumeScale = session.fiberBaseToVolumeScale;
     generatedViews.linePoints = std::move(linePoints);
     generatedViews.lineUpVectors = views.lineUpVectors;
     generatedViews.stripPositionMap = views.stripPositionMap;

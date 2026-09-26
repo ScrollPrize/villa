@@ -1100,10 +1100,8 @@ private:
     // inspection's strips, which have no generated-view sessions of their own.
     // Failures are logged per pane and do not stop the others.
     void refreshStaleGeneratedViews();
-    // Coalesces refreshStaleGeneratedViews() onto the next event-loop turn:
-    // CState emits volumeChanged from inside ViewerManager::switchVolume(),
-    // before focus and navigation are restored, and materialization reads pane
-    // camera state. Also collapses rapid switching into one rebuild.
+    // Coalesces attachment/metadata changes and direct CState updates.
+    // ViewerManager switches flush stale views before restoring navigation.
     void scheduleStaleViewRefresh();
     // Cheap fingerprint over everything the resolved umbilicus was read from: a
     // stat() of every resolver candidate (the attached file when the project

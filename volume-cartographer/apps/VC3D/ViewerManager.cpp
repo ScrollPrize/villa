@@ -989,6 +989,7 @@ void ViewerManager::switchVolume(std::shared_ptr<Volume> volume,
     _state->setCurrentVolume(std::move(volume));
 
     resetFocusForVolumeChange(!hadVolume, transformedFocusPoint, transformedFocusNormal);
+    emit volumeGeometryUpdateRequested();
 
     if (snapshot && navigationTransform) {
         restoreNavigation(snapshot, *navigationTransform);

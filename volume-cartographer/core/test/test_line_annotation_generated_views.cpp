@@ -1197,6 +1197,26 @@ TEST_CASE("line annotation remapped line position follows the same fiber spot")
     }
 }
 
+TEST_CASE("line annotation remaps the same fiber spot across display levels")
+{
+    using vc3d::line_annotation::remappedGeneratedLinePosition;
+    // PHerc1451 fiber dj_20260921T015942266_000033, around point 1300.
+    const std::vector<cv::Vec3f> raw{
+        {9017.146484375f, 5997.52978515625f, 49588.625f},
+        {9009.509025872716f, 5999.865458828011f, 49589.08724335998f},
+        {9002.015753767275f, 6002.578473100049f, 49589.78744221551f}};
+    std::vector<cv::Vec3f> surface;
+    for (const auto& p : raw) {
+        surface.push_back(p * 0.25f);
+    }
+    for (double position : {0.0, 0.5, 1.0, 1.25, 2.0}) {
+        CHECK(remappedGeneratedLinePosition(raw, surface, position, 0.25) ==
+              doctest::Approx(position).epsilon(0.001));
+        CHECK(remappedGeneratedLinePosition(surface, raw, position, 4.0) ==
+              doctest::Approx(position).epsilon(0.001));
+    }
+}
+
 TEST_CASE("line annotation anchor remap keeps a pane position on its own fiber pass")
 {
     using vc3d::line_annotation::remappedGeneratedLinePositionFromAnchor;

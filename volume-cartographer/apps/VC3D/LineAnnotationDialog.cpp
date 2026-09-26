@@ -2439,7 +2439,8 @@ void LineAnnotationDialog::anchorGeneratedStripSurfacesForUpdate(
     QuadSurface* newLineSurface,
     QuadSurface* newLineSideSlice,
     const vc::lasagna::LineStripPositionMap& newPositionMap,
-    const std::vector<cv::Vec3f>& newLinePoints) const
+    const std::vector<cv::Vec3f>& newLinePoints,
+    double newFiberBaseToVolumeScale) const
 {
     if (!_hasGeneratedViews || _stripViewers.size() != 2 || newLinePoints.empty()) {
         return;
@@ -2473,7 +2474,8 @@ void LineAnnotationDialog::anchorGeneratedStripSurfacesForUpdate(
         // under the new strip's (un-shifted) parameterization.
         const double newPosition =
             vc3d::line_annotation::remappedGeneratedLinePosition(
-                _generatedViews.linePoints, newLinePoints, oldPosition);
+                _generatedViews.linePoints, newLinePoints, oldPosition,
+                newFiberBaseToVolumeScale / _generatedViews.fiberBaseToVolumeScale);
         const auto* points = newQuad->rawPointsPtr();
         if (!points || points->empty()) {
             continue;
@@ -2565,7 +2567,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             vc3d::line_annotation::remappedGeneratedLinePosition(
                 _heldGeneratedViews.linePoints,
                 _generatedViews.linePoints,
-                previousLinePosition);
+                previousLinePosition,
+                _generatedViews.fiberBaseToVolumeScale /
+                    _heldGeneratedViews.fiberBaseToVolumeScale);
         _currentLinePosition =
             std::clamp(targetLinePosition, 0.0, maxLinePosition);
         // The one step of the in-place update that can fail, validated before

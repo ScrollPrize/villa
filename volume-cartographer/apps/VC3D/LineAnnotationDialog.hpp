@@ -186,7 +186,8 @@ public:
         QuadSurface* newLineSurface,
         QuadSurface* newLineSideSlice,
         const vc::lasagna::LineStripPositionMap& newPositionMap,
-        const std::vector<cv::Vec3f>& newLinePoints) const;
+        const std::vector<cv::Vec3f>& newLinePoints,
+        double newFiberBaseToVolumeScale) const;
     GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         const std::string& surfaceName,
         CChunkedVolumeViewer* viewer,

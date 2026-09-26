@@ -255,6 +255,9 @@ signals:
     void baseViewerCreated(VolumeViewerBase* viewer);
     void baseViewerClosing(VolumeViewerBase* viewer);
     void currentVolumeChanged();
+    // Synchronous rebuild point: viewers have adopted the new volume, but
+    // saved navigation has not yet been projected onto their surfaces.
+    void volumeGeometryUpdateRequested();
     // Emitted whenever the user explicitly places the focus (Ctrl+click,
     // focus-on-cursor key, point activation, ...).
     void focusCenteredByUser(const cv::Vec3f& position);

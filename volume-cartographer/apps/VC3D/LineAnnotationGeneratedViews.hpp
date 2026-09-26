@@ -242,6 +242,8 @@ struct GeneratedViews {
     std::shared_ptr<PlaneSurface> currentCutSurface;
     std::string sideCutName;
     std::shared_ptr<PlaneSurface> sideCutSurface;
+    // The display grid can change when switching raw/prediction levels.
+    double fiberBaseToVolumeScale = 1.0;
     std::vector<cv::Vec3f> linePoints;
     std::vector<cv::Vec3f> lineUpVectors;
     vc::lasagna::LineStripPositionMap stripPositionMap;
@@ -744,12 +746,15 @@ inline double remappedGeneratedLinePositionFromAnchor(const std::vector<Point>& 
 
 inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLinePoints,
                                             const std::vector<cv::Vec3f>& newLinePoints,
-                                            double oldPosition)
+                                            double oldPosition,
+                                            double oldToNewScale = 1.0)
 {
     if (newLinePoints.empty() || !std::isfinite(oldPosition)) {
         return 0.0;
     }
-    const cv::Vec3f anchor = interpolatedGeneratedLinePoint(oldLinePoints, oldPosition);
+    // Compare in the new display grid, including when only its level changed.
+    const cv::Vec3f anchor = interpolatedGeneratedLinePoint(oldLinePoints, oldPosition)
+                            * static_cast<float>(oldToNewScale);
     return remappedGeneratedLinePositionFromAnchor(newLinePoints, anchor, oldPosition);
 }
 
