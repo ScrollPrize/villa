@@ -9,18 +9,18 @@ import hashlib
 import json
 from pathlib import Path
 import time
-from vesuvius.neural_tracing.fiber_follow.experiment import read_manifest
-from vesuvius.neural_tracing.fiber_follow.recovery import recovery_counts
+from vesuvius.neural_tracing.fiber_follow.shared.experiment import read_manifest
+from vesuvius.neural_tracing.fiber_follow.shared.recovery import recovery_counts
 import numpy as np
 import torch
-from vesuvius.neural_tracing.fiber_follow.data import ZBand,fiber_manifest,load_fibers,split_fibers,label_state
-from vesuvius.neural_tracing.fiber_follow.evaluate import evaluate
-from vesuvius.neural_tracing.fiber_follow.experiment import jsonable,rollout_summary,paired_bootstrap
-from vesuvius.neural_tracing.fiber_follow.history_audit import HistoryAudit
-from vesuvius.neural_tracing.fiber_follow.supervision import prefix_labels
-from vesuvius.neural_tracing.fiber_follow.trace import ModelTracer,TraceParams
-from vesuvius.neural_tracing.fiber_follow.train import load_checkpoint
-from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume, FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.shared.data import ZBand,fiber_manifest,load_fibers,split_fibers,label_state
+from vesuvius.neural_tracing.fiber_follow.shared.evaluate import evaluate
+from vesuvius.neural_tracing.fiber_follow.shared.experiment import jsonable,rollout_summary,paired_bootstrap
+from vesuvius.neural_tracing.fiber_follow.flow_matching.history_audit import HistoryAudit
+from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
+from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer,TraceParams
+from vesuvius.neural_tracing.fiber_follow.flow_matching.train import load_checkpoint
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 
 
 class RecoveryAudit(HistoryAudit):

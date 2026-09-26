@@ -13,7 +13,7 @@ export LD_LIBRARY_PATH="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_pa
 export MALLOC_MMAP_THRESHOLD_=268435456 MALLOC_TRIM_THRESHOLD_=1073741824 MALLOC_ARENA_MAX=2
 name=$1; shift
 mkdir -p "$FF/output/logs"
-setsid nohup "$PYTHON" -u -m vesuvius.neural_tracing.fiber_follow.train \
+setsid nohup "$PYTHON" -u -m vesuvius.neural_tracing.fiber_follow.flow_matching.train \
     --fiber-zarrs "$FIBER_ZARRS" --fibers "$FIBERS" --name "$name" "$@" \
     > "$FF/output/logs/$name.log" 2>&1 &
 echo $! > "$FF/output/logs/$name.pid"

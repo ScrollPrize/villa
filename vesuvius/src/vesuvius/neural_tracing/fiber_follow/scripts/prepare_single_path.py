@@ -2,13 +2,13 @@
 import argparse
 import json
 from pathlib import Path
-from vesuvius.neural_tracing.fiber_follow.data import (
+from vesuvius.neural_tracing.fiber_follow.shared.data import (
     SampleConfig,ZBand,load_fibers,split_fibers,
 )
-from vesuvius.neural_tracing.fiber_follow.experiment import freeze_manifest
-from vesuvius.neural_tracing.fiber_follow.recovery import make_recovery_states
-from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec
-from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume,FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.shared.experiment import freeze_manifest
+from vesuvius.neural_tracing.fiber_follow.shared.recovery import make_recovery_states
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume,FiberVolumeSpec
 
 
 def main(argv=None):

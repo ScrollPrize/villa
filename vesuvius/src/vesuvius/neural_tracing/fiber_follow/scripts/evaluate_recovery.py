@@ -14,16 +14,16 @@ import types
 import hashlib
 import numpy as np
 import torch
-from vesuvius.neural_tracing.fiber_follow.data import (
+from vesuvius.neural_tracing.fiber_follow.shared.data import (
     OnPolicyStates,SampleConfig,ZBand,load_fibers,split_fibers,
 )
-from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec
-from vesuvius.neural_tracing.fiber_follow.model import prepare_model
-from vesuvius.neural_tracing.fiber_follow.trace import ModelTracer
-from vesuvius.neural_tracing.fiber_follow.train import load_checkpoint
-from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume,FiberVolumeSpec
-from vesuvius.neural_tracing.fiber_follow.experiment import jsonable
-from vesuvius.neural_tracing.fiber_follow.recovery import recovery_counts, evaluate_recovery_states
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
+from vesuvius.neural_tracing.fiber_follow.flow_matching.model import prepare_model
+from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer
+from vesuvius.neural_tracing.fiber_follow.flow_matching.train import load_checkpoint
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume,FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.shared.experiment import jsonable
+from vesuvius.neural_tracing.fiber_follow.shared.recovery import recovery_counts, evaluate_recovery_states
 
 
 def load_archived_baseline(path,archive,device):

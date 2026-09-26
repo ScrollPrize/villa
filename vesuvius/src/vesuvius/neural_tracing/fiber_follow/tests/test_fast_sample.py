@@ -4,7 +4,7 @@ import math
 import numpy as np
 import pytest
 
-from vesuvius.neural_tracing.fiber_follow.fast_sample import sample_crop
+from vesuvius.neural_tracing.fiber_follow.shared.fast_sample import sample_crop
 
 
 def brute_history(grid, hist, mask, sigma, segments):

@@ -5,11 +5,11 @@ import json
 import torch
 
 from test_single_path import batch, config
-from vesuvius.neural_tracing.fiber_follow.model import FollowNet
-from vesuvius.neural_tracing.fiber_follow.runloop import RunLog
-from vesuvius.neural_tracing.fiber_follow.supervision import refinement_metrics
-from vesuvius.neural_tracing.fiber_follow.train import optimizer_update
-from vesuvius.neural_tracing.fiber_follow.training_log import format_training_log
+from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet
+from vesuvius.neural_tracing.fiber_follow.shared.runloop import RunLog
+from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import refinement_metrics
+from vesuvius.neural_tracing.fiber_follow.flow_matching.train import optimizer_update
+from vesuvius.neural_tracing.fiber_follow.shared.training_log import format_training_log
 
 
 def test_refinement_masks_drift_boundaries_empty_bins_and_nonfinite_predictions():

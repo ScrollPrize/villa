@@ -7,14 +7,14 @@ import pytest
 import torch
 
 from test_single_path import config,batch
-from vesuvius.neural_tracing.fiber_follow.model import ARCHITECTURE,FollowNet,prepare_model
-from vesuvius.neural_tracing.fiber_follow.train import (
+from vesuvius.neural_tracing.fiber_follow.flow_matching.model import ARCHITECTURE,FollowNet,prepare_model
+from vesuvius.neural_tracing.fiber_follow.flow_matching.train import (
     compile_training_model,main,optimizer_update,read_checkpoint,resume_training,
     save_checkpoint,training_rng_state,
 )
-from vesuvius.neural_tracing.fiber_follow.data import SampleConfig
-from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec
-from vesuvius.neural_tracing.fiber_follow.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 
 def test_compile_entrypoints_preserve_parameters_and_eager_ema(monkeypatch):

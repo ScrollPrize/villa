@@ -19,31 +19,31 @@ import pytest
 import torch
 
 
-from vesuvius.neural_tracing.fiber_follow import data as D
+from vesuvius.neural_tracing.fiber_follow.shared import data as D
 
 
-from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec, arclength, crop_local_grid, frame_from_heading
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength, crop_local_grid, frame_from_heading
 
 
-from vesuvius.neural_tracing.fiber_follow.history_audit import HistoryAudit
+from vesuvius.neural_tracing.fiber_follow.flow_matching.history_audit import HistoryAudit
 
 
-from vesuvius.neural_tracing.fiber_follow.history_metrics import observed_measurements
+from vesuvius.neural_tracing.fiber_follow.flow_matching.history_metrics import observed_measurements
 
 
-from vesuvius.neural_tracing.fiber_follow.model import FollowNet, FollowNetConfig, history_tangent
+from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet, FollowNetConfig, history_tangent
 
 
-from vesuvius.neural_tracing.fiber_follow.supervision import loss_fn
+from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import loss_fn
 
 
-from vesuvius.neural_tracing.fiber_follow.trace import ModelTracer, TraceParams, field_axis
+from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams, field_axis
 
 
-from vesuvius.neural_tracing.fiber_follow.train import load_checkpoint, save_checkpoint
+from vesuvius.neural_tracing.fiber_follow.flow_matching.train import load_checkpoint, save_checkpoint
 
 
-from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume, FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 
 
 def array_at(path, values):
@@ -129,7 +129,7 @@ def test_observed_measurements_ignore_absent_and_departed_geometry():
 
 
 def test_diagnostic_batching_preserves_all_seeds_and_metrics(tmp_path):
-    from vesuvius.neural_tracing.fiber_follow.diag import rollout_diag
+    from vesuvius.neural_tracing.fiber_follow.shared.diag import rollout_diag
     points = np.array([[float(x), 0., 0.] for x in range(21)])
     fiber = D.TracedFiber('line', points, arclength(points), '')
     seeds = [dict(fiber=0, t=float(t), sign=1., pos=np.array([t, 0., 0.]),

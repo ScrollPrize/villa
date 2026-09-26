@@ -1,0 +1,128 @@
+"""Dense prefix correctness of the one curve actually generated."""
+import torch
+import torch.nn.functional as F
+from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_MAX_RECOVERY_DISTANCE, DEFAULT_N_COMMIT, recovery_allowed
+from vesuvius.neural_tracing.fiber_follow.flow_matching.model import flow_targets
+from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
+
+
+@torch.no_grad()
+def refinement_metrics(steps, batch, cfg, n_commit=DEFAULT_N_COMMIT):
+    """Commit-window crossing error for the initial curve and every midpoint update.
+
+    Use the same observable GT mask at every step. Drift is the distance from
+    the current origin to its original-fiber correspondence, not the nearest
+    fiber. Departed states are excluded. Sums/counts support pooling log rows;
+    nonfinite predictions are counted separately, never replaced with zero error.
+    """
+    near = min(n_commit, cfg.n_future)
+    target, mask, _ = flow_targets(batch, cfg)
+    known = mask[:, :near].bool()
+    error = (steps[:, :, :near, :2].float()-target[:, None, :near, :2]).norm(dim=-1)
+    finite = torch.isfinite(error)
+    valid = known[:, None] & finite
+    safe_error = torch.where(valid, error, 0.)
+    current = batch['gt_history'][:, 0].float()
+    drift = current.norm(dim=-1)
+    drift_known = (batch['gt_history_mask'][:, 0] > 0) & torch.isfinite(drift)
+    eligible = ~batch['offtrack'].bool()
+    bands = {'all': eligible}
+    for name, lo, hi in (('<1',0.,1.), ('1-1.5',1.,1.5), ('1.5-2',1.5,2.),
+                         ('2-3.5',2.,3.5), ('>=3.5',3.5,float('inf'))):
+        bands[name] = eligible & drift_known & (drift >= lo) & (drift < hi)
+    bands['unknown'] = eligible & ~drift_known
+    # Compare state means only when all known points are finite in both steps.
+    state_error = safe_error.sum(-1)/known.sum(-1)[:, None].clamp_min(1)
+    complete = (finite | ~known[:, None]).all(-1) & known.any(-1)[:, None]
+    comparable = complete[:, 1:] & complete[:, :-1]
+    delta = state_error[:, 1:]-state_error[:, :-1]
+    result = {}
+    for name, member in bands.items():
+        selected = member[:, None, None]
+        counts = (valid & selected).sum((0, 2))
+        sums = torch.where(selected, safe_error, 0.).double().sum((0, 2))
+        pairs = comparable & member[:, None]
+        result[name] = dict(
+            state_count=int(member.sum()),
+            known_point_count=int((known & member[:, None]).sum()),
+            point_count=counts.tolist(), error_sum=sums.tolist(),
+            error_mean=[float(s/n) if n else None for s,n in zip(sums,counts)],
+            nonfinite_point_count=(known[:, None] & ~finite & selected).sum((0, 2)).tolist(),
+            comparison_count=pairs.sum(0).tolist(),
+            improved_count=(pairs & (delta < -1e-6)).sum(0).tolist(),
+            worsened_count=(pairs & (delta > 1e-6)).sum(0).tolist())
+    return dict(first_n=near, departed_count=int((~eligible).sum()), by_drift=result)
+
+def masked_bce(logits, target, mask, denominator=None):
+    loss = F.binary_cross_entropy_with_logits(logits.float(), target, reduction='none')
+    denominator = mask.sum() if denominator is None else mask.new_tensor(denominator)
+    return (loss*mask).sum()/denominator.clamp_min(1)
+
+
+def candidate_prefix_labels(points, batch, tolerance=1.5, max_recovery_distance=DEFAULT_MAX_RECOVERY_DISTANCE):
+    """Label each generated alternative with the same original-fiber semantics."""
+    if points.ndim == 3:
+        return prefix_labels(points, batch, tolerance, max_recovery_distance)
+    b, k, n, _ = points.shape
+    expanded = {key: batch[key].repeat_interleave(k, dim=0) for key in
+                ('dense_ab', 'dense_mask', 'offtrack', 'endpoint_known', 'end_local')}
+    labels, known, error = prefix_labels(points.reshape(b*k, n, 3), expanded, tolerance, max_recovery_distance)
+    return labels.reshape(b, k, n), known.reshape(b, k, n), error.reshape(b, k)
+
+
+def loss_fn(output, batch, cfg, tolerance=1.5, *, update=0, confidence_ramp=2000, compute_metrics=True, normalizers=None,
+            n_commit=DEFAULT_N_COMMIT):
+    """Flow loss plus confidence BCE, half over the commit window and half over the full horizon.
+
+    ``n_commit`` is the rollout commit limit; the near term covers exactly the prefixes a
+    decision can commit, clipped to the model horizon.
+    """
+    target, mask, error = prefix_labels(output['points'],batch,tolerance,cfg.max_recovery_distance)
+    logits = output['confidence_logits']
+    normalizers = normalizers or {}
+    window = min(n_commit, logits.shape[1])
+    loss_target, loss_mask = target, mask
+    if 'candidate_logits' in output:
+        loss_target, loss_mask, _ = candidate_prefix_labels(output['candidate_points'],batch,tolerance,cfg.max_recovery_distance)
+        logits = output['candidate_logits']
+    near = masked_bce(logits[...,:window],loss_target[...,:window],loss_mask[...,:window],normalizers.get('near'))
+    full = masked_bce(logits,loss_target,loss_mask,normalizers.get('full'))
+    flow = output['flow_loss']
+    if 'flow' in normalizers:
+        flow = flow*output['flow_known_count']/max(1.,normalizers['flow'])
+    confidence = .5*near+.5*full
+    coefficient = min(1., max(0.,update/max(1,confidence_ramp)))
+    total = flow+coefficient*confidence
+    metrics = {}
+    if compute_metrics:
+        metrics = dict(flow=flow.item(), confidence_loss=confidence.item(),
+                       confidence_commit=near.item(),confidence_all=full.item(),confidence_coefficient=coefficient,
+                       commit_window=window,
+                       flow_known_fraction=output['flow_known_fraction'].item(),
+                       flow_censored_fraction=output['flow_censored_fraction'].item(),
+                       commit_correct_count=(target[:,window-1]*mask[:,window-1]).sum().item(),
+                       commit_known_count=mask[:,window-1].sum().item())
+        if 'candidate_logits' in output:
+            known = loss_mask[...,window-1].bool()
+            correct = loss_target[...,window-1].bool() & known
+            eligible = recovery_allowed(output['candidate_points'],cfg.max_recovery_distance)
+            correct &= eligible
+            common = known.all(1)
+            oracle = correct.any(1) & common
+            selected_correct = target[:,window-1].bool() & mask[:,window-1].bool()
+            zero_correct = correct[:,0]
+            metrics.update(candidate_states=common.sum().item(),candidate_oracle_correct=oracle.sum().item(),
+                candidate_selected_correct=(selected_correct & common).sum().item(),
+                candidate_zero_correct=(zero_correct & common).sum().item(),
+                candidate_rescues=(selected_correct & ~zero_correct & common).sum().item(),
+                candidate_spoiled=(~selected_correct & zero_correct & common).sum().item())
+        for threshold in (.5,.85):
+            eligible = recovery_allowed(output['points'],cfg.max_recovery_distance)
+            open_gate = eligible & (output['confidence'][:,0]>=threshold)
+            known = mask[:,0].bool()
+            correct = target[:,0].bool()
+            metrics.update({f'false_stop_count_{threshold}': (known & correct & ~open_gate).sum().item(),
+                            f'correct_first_count_{threshold}': (known & correct).sum().item(),
+                            f'departed_continue_count_{threshold}': (batch['offtrack'].bool() & open_gate).sum().item(),
+                            f'departed_count_{threshold}': batch['offtrack'].sum().item()})
+    return total,metrics

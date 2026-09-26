@@ -10,13 +10,13 @@ import torch
 from scipy.spatial import cKDTree
 
 from vc3d_fiber_format import legacy_lasagna_segments
-from vesuvius.neural_tracing.fiber_follow import data as D
-from vesuvius.neural_tracing.fiber_follow.collect import DecisionCollector
-from vesuvius.neural_tracing.fiber_follow.evaluate import load_or_make_seeds, score_trace, summarize
-from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec, arclength
-from vesuvius.neural_tracing.fiber_follow.train import loss_fn, load_checkpoint, save_checkpoint
-from vesuvius.neural_tracing.fiber_follow.model import FollowNet, FollowNetConfig
-from vesuvius.neural_tracing.fiber_follow.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.shared import data as D
+from vesuvius.neural_tracing.fiber_follow.shared.collect import DecisionCollector
+from vesuvius.neural_tracing.fiber_follow.shared.evaluate import load_or_make_seeds, score_trace, summarize
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength
+from vesuvius.neural_tracing.fiber_follow.flow_matching.train import loss_fn, load_checkpoint, save_checkpoint
+from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet, FollowNetConfig
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 
 def fiber(length=100, z=0, endpoints=(False, False)):
@@ -247,7 +247,7 @@ def test_summary_accounts_for_all_length_and_unknown_is_not_verified():
 
 
 def test_seed_cache_requires_matching_identity(tmp_path, monkeypatch):
-    import vesuvius.neural_tracing.fiber_follow.evaluate as E
+    import vesuvius.neural_tracing.fiber_follow.shared.evaluate as E
     f = fiber()
     vol = SimpleNamespace(spec=FiberVolumeSpec('unused'))
     path = tmp_path / 'seeds.pkl'
@@ -260,10 +260,10 @@ def test_seed_cache_requires_matching_identity(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match='Incompatible seed cache'):
         load_or_make_seeds(path, [replace(f, points=f.points+1)], vol, D.ZBand(0, 1))
 
-from vesuvius.neural_tracing.fiber_follow.geometry import frame_from_heading
-from vesuvius.neural_tracing.fiber_follow.supervision import candidate_labels, teacher_candidates
-from vesuvius.neural_tracing.fiber_follow.trace import ModelTracer, TraceParams
-from vesuvius.neural_tracing.fiber_follow.online import publish_replay, OnlineCollector
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading
+from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import candidate_labels, teacher_candidates
+from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams
+from vesuvius.neural_tracing.fiber_follow.shared.online import publish_replay, OnlineCollector
 
 
 def small_config():
@@ -375,7 +375,7 @@ def test_spatial_network_and_all_three_supervised_heads_backpropagate():
 
 
 def test_decoder_retains_distinct_coherent_modes():
-    from vesuvius.neural_tracing.fiber_follow.model import decode_candidates
+    from vesuvius.neural_tracing.fiber_follow.flow_matching.model import decode_candidates
     cfg = small_config()
     cfg.heat_bins = 15
     logits = torch.full((1, 4, 15, 15), -20.)
@@ -471,7 +471,7 @@ class FixedPolicy(torch.nn.Module):
 
 
 def fake_tracer(confidence, params, monkeypatch):
-    import vesuvius.neural_tracing.fiber_follow.trace as T
+    import vesuvius.neural_tracing.fiber_follow.shared.trace as T
     monkeypatch.setattr(T, 'build_inputs', lambda raw, *a, **kw: torch.zeros(len(raw),8,12,9,9))
     vol = SimpleNamespace(spec=SimpleNamespace(mode='fiber'), shape=(1000,1000,1000), raw_block=lambda st, size: np.zeros((1,1,1,1), np.uint8))
     return ModelTracer(FixedPolicy(confidence), vol, sample_config().crop, 4, params, device='cpu')
@@ -565,7 +565,7 @@ def test_collector_stops_on_holdout_and_preserves_original_frame():
 
 
 def test_online_collection_does_not_wait_and_publishes_only_complete_caches(tmp_path, monkeypatch):
-    import vesuvius.neural_tracing.fiber_follow.online as online
+    import vesuvius.neural_tracing.fiber_follow.shared.online as online
     class Process:
         returncode = None
         def poll(self): return self.returncode
@@ -651,7 +651,7 @@ def test_prefix_context_gets_supervised_gradients_and_resets_between_calls():
 
 
 def test_confidence_threshold_default_is_shared_by_rollout_and_collection(tmp_path):
-    from vesuvius.neural_tracing.fiber_follow.trace import DEFAULT_CONFIDENCE
+    from vesuvius.neural_tracing.fiber_follow.shared.trace import DEFAULT_CONFIDENCE
     assert TraceParams().confidence == DEFAULT_CONFIDENCE == .7
     collector = OnlineCollector(tmp_path/'collector', 'fibers', [100, 200], 'cpu')
     assert collector.confidence == DEFAULT_CONFIDENCE
@@ -683,8 +683,8 @@ def test_default_cube_has_uniform_spacing_and_encloses_proposal_stencil():
 
 
 def test_proposals_and_loss_cover_visible_targets_beyond_previous_range():
-    from vesuvius.neural_tracing.fiber_follow.model import decode_candidates
-    from vesuvius.neural_tracing.fiber_follow.supervision import heatmap_loss
+    from vesuvius.neural_tracing.fiber_follow.flow_matching.model import decode_candidates
+    from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import heatmap_loss
     cfg = replace(FollowNetConfig(), n_candidates=1, peaks_per_plane=1)
     logits = torch.full((1, 16, 61, 61), -20.)
     logits[:, :, 30, 52] = 10.  # x = +22 voxels, well outside the former ±12
@@ -706,7 +706,7 @@ def test_proposal_support_cannot_exceed_input_crop():
 
 
 def test_batch_diagnostic_keeps_crop_bounds_and_marks_outside_gt(tmp_path, monkeypatch):
-    from vesuvius.neural_tracing.fiber_follow import diag
+    from vesuvius.neural_tracing.fiber_follow.shared import diag
     crop = CropSpec(depth=12, width=9, behind=2)
     x = torch.zeros(1, 8, 12, 9, 9)
     gt = torch.tensor([[[0., 0., 2.], [20., 0., 4.]]])
@@ -725,7 +725,7 @@ def test_batch_diagnostic_keeps_crop_bounds_and_marks_outside_gt(tmp_path, monke
 
 def test_channels_last_layout_preserves_predictions_and_supervised_gradients():
     import copy
-    from vesuvius.neural_tracing.fiber_follow.model import prepare_model
+    from vesuvius.neural_tracing.fiber_follow.flow_matching.model import prepare_model
     torch.manual_seed(452)
     cfg = small_config()
     reference = prepare_model(FollowNet(cfg), 'cpu').eval()

@@ -8,14 +8,14 @@ from PIL import Image
 import pytest
 import torch
 
-from test_direct import batch, config
-from vesuvius.neural_tracing.fiber_follow.data import TracedFiber
-from vesuvius.neural_tracing.fiber_follow.diag import plot_denoising, rollout_diag
-from vesuvius.neural_tracing.fiber_follow.direct.model import DirectFollower
-from vesuvius.neural_tracing.fiber_follow.direct.train import training_diagnostics
-from vesuvius.neural_tracing.fiber_follow.evaluate import evaluate, monitor_coverage
-from vesuvius.neural_tracing.fiber_follow.experiment import rollout_summary
-from vesuvius.neural_tracing.fiber_follow.runloop import RunLog
+from test_regression import batch, config
+from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber
+from vesuvius.neural_tracing.fiber_follow.shared.diag import plot_denoising, rollout_diag
+from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower
+from vesuvius.neural_tracing.fiber_follow.regression.train import training_diagnostics
+from vesuvius.neural_tracing.fiber_follow.shared.evaluate import evaluate, monitor_coverage
+from vesuvius.neural_tracing.fiber_follow.shared.experiment import rollout_summary
+from vesuvius.neural_tracing.fiber_follow.shared.runloop import RunLog
 
 
 class Tracer:

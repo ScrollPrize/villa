@@ -8,16 +8,16 @@ import pytest
 import torch
 
 from test_single_path import batch, config, run
-from vesuvius.neural_tracing.fiber_follow.model import FollowNet, initial_residuals
-from vesuvius.neural_tracing.fiber_follow.sampling import trace_generator, trace_noise
-from vesuvius.neural_tracing.fiber_follow.train import (
+from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet, initial_residuals
+from vesuvius.neural_tracing.fiber_follow.flow_matching.sampling import trace_generator, trace_noise
+from vesuvius.neural_tracing.fiber_follow.flow_matching.train import (
     load_checkpoint, save_checkpoint, resolve_sampler_mode, initialized_config, optimizer_update,
     compile_training_model, training_rng_state, restore_training_rng, resume_training,
 )
-from vesuvius.neural_tracing.fiber_follow.data import SampleConfig
-from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec
-from vesuvius.neural_tracing.fiber_follow.volume import FiberVolumeSpec
-from vesuvius.neural_tracing.fiber_follow.trace import ModelTracer, TraceParams
+from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams
 
 
 def test_prior_and_shared_training_inference_curve():
@@ -143,7 +143,7 @@ def test_calibration_locks_sampling_repeats_and_bootstrap_retains_them():
     assert choose('gaussian',selection={'sampling_seeds':[8,9]})==[8,9]
     with pytest.raises(ValueError,match='locked'):choose('gaussian',[0],{'sampling_seeds':[8,9]})
     with pytest.raises(ValueError,match='distinct'):choose('gaussian',[1,1])
-    from vesuvius.neural_tracing.fiber_follow.experiment import paired_bootstrap
+    from vesuvius.neural_tracing.fiber_follow.shared.experiment import paired_bootstrap
     with pytest.raises(ValueError,match='Duplicate'):
         paired_bootstrap([dict(fiber=0,t0=0,sign=1)]*2,[dict(fiber=0,t0=0,sign=1)]*2)
 

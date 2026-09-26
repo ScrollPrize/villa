@@ -690,7 +690,7 @@ saving normally. Output: `/tmp/fiber-follow-perf64/runs/optimized_smoke`.
 
 Command, with the project codec library path set:
 ```bash
-.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.train \
+.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.flow_matching.train \
   --fiber-zarrs /home/sean/Documents/volpkgs/s1_2um.volpkg/20260411134726-fibers-20260915212757-L1_masked \
   --fibers /tmp/fiber-follow-supervised/smoke_fibers \
   --out-root /tmp/fiber-follow-perf64/runs --name optimized_smoke \
@@ -1042,7 +1042,7 @@ directory. They intentionally used a small model and a 12-voxel rollout budget.
 For a new temporary output/run name:
 
 ```bash
-OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 .venv/bin/python -m vesuvius.neural_tracing.fiber_follow.train \
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 .venv/bin/python -m vesuvius.neural_tracing.fiber_follow.flow_matching.train \
   --name pipeline_smoke --out-root /tmp/fiber-follow-checks \
   --fiber-zarrs /home/sean/Documents/volpkgs/s1_2um.volpkg/20260411134726-fibers-20260915212757-L1_masked \
   --fibers /tmp/fiber-follow-smoke-annotations --device cpu \

@@ -16,21 +16,21 @@ import pytest
 import torch
 
 
-from vesuvius.neural_tracing.fiber_follow.data import SampleConfig, TracedFiber, continuation_targets
+from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig, TracedFiber, continuation_targets
 
 
-from vesuvius.neural_tracing.fiber_follow.geometry import arclength, frame_from_heading
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, frame_from_heading
 
 
-from vesuvius.neural_tracing.fiber_follow.model import (
+from vesuvius.neural_tracing.fiber_follow.flow_matching.model import (
     FollowNet, FollowNetConfig, flow_targets, observable_half_width, prior_mean,
 )
 
 
-from vesuvius.neural_tracing.fiber_follow.supervision import loss_fn
+from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import loss_fn
 
 
-from vesuvius.neural_tracing.fiber_follow.train import fit_flow_sigma, update_ema
+from vesuvius.neural_tracing.fiber_follow.flow_matching.train import fit_flow_sigma, update_ema
 
 
 def config():

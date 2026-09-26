@@ -13,13 +13,13 @@ import pickle
 import time
 from pathlib import Path
 
-from vesuvius.neural_tracing.fiber_follow.data import (
+from vesuvius.neural_tracing.fiber_follow.shared.data import (
     DATA_POLICY, ZBand, fiber_manifest, gt_presence, load_fibers, mark_breaks, split_fibers,
 )
-from vesuvius.neural_tracing.fiber_follow.evaluate import evaluate, load_or_make_seeds
-from vesuvius.neural_tracing.fiber_follow.trace import FieldTracer, ModelTracer, TraceParams
-from vesuvius.neural_tracing.fiber_follow.train import load_checkpoint
-from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume, FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.shared.evaluate import evaluate, load_or_make_seeds
+from vesuvius.neural_tracing.fiber_follow.shared.trace import FieldTracer, ModelTracer, TraceParams
+from vesuvius.neural_tracing.fiber_follow.flow_matching.train import load_checkpoint
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 
 FF = Path(__file__).resolve().parents[1]
 LOCAL = '/mnt/raid_nvme/spiral_dataset_working/fiber_zarrs'
@@ -73,7 +73,7 @@ def main(argv=None):
     if args.history_audit:
         if not isinstance(tracer, ModelTracer):
             ap.error('--history-audit requires a spatial follower checkpoint')
-        from vesuvius.neural_tracing.fiber_follow.history_audit import HistoryAudit
+        from vesuvius.neural_tracing.fiber_follow.flow_matching.history_audit import HistoryAudit
         audit = HistoryAudit(tracer, tolerance=checkpoint['tolerance'])
     start = time.time()
     try:

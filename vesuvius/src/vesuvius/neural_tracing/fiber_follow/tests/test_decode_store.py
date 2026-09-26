@@ -5,8 +5,8 @@ import os
 import numcodecs
 import numpy as np
 
-from vesuvius.neural_tracing.fiber_follow.decode_store import RAW_SUFFIX, chunk_file, chunk_keys, decode_in_place
-from vesuvius.neural_tracing.fiber_follow.volume import ChunkedArray
+from vesuvius.neural_tracing.fiber_follow.shared.decode_store import RAW_SUFFIX, chunk_file, chunk_keys, decode_in_place
+from vesuvius.neural_tracing.fiber_follow.shared.volume import ChunkedArray
 
 
 def write_array(path, data, chunks, sep):

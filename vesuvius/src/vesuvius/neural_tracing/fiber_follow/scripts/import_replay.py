@@ -1,10 +1,10 @@
 """Build the permanent v11 recovery bank from existing training collections."""
 import argparse
 from pathlib import Path
-from vesuvius.neural_tracing.fiber_follow.data import SampleConfig, ZBand, load_fibers, split_fibers
-from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec
-from vesuvius.neural_tracing.fiber_follow.replay import import_states
-from vesuvius.neural_tracing.fiber_follow.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig, ZBand, load_fibers, split_fibers
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
+from vesuvius.neural_tracing.fiber_follow.shared.replay import import_states
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 
 def main(argv=None):

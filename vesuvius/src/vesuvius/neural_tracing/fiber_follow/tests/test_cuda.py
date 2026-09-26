@@ -3,8 +3,8 @@ import copy
 import pytest
 import torch
 from test_single_path import config,batch,run
-from vesuvius.neural_tracing.fiber_follow.model import FollowNet,prepare_model
-from vesuvius.neural_tracing.fiber_follow.supervision import loss_fn
+from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet,prepare_model
+from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import loss_fn
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA unavailable in this environment')

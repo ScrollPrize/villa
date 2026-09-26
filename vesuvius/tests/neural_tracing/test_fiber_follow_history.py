@@ -2,9 +2,9 @@ from dataclasses import replace
 import numpy as np
 import pytest
 import torch
-from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec, crop_local_grid, render_history, arclength
-from vesuvius.neural_tracing.fiber_follow.fast_sample import sample_crop
-from vesuvius.neural_tracing.fiber_follow.data import SampleConfig, TracedFiber, make_sample
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, render_history, arclength
+from vesuvius.neural_tracing.fiber_follow.shared.fast_sample import sample_crop
+from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig, TracedFiber, make_sample
 
 
 @pytest.mark.parametrize('mask', [[1,1,1],[1,0,1],[0,1,1],[0,0,0]])

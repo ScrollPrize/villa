@@ -3,15 +3,15 @@
 import os, sys, time
 import numpy as np, torch
 if __name__ == "__main__":
-    from vesuvius.neural_tracing.fiber_follow import train as T
+    from vesuvius.neural_tracing.fiber_follow.flow_matching import train as T
     nw, secs = int(sys.argv[1]), float(sys.argv[2])
     argv = sys.argv[sys.argv.index("--") + 1:]
     ap_args = ["--fiber-zarrs", "/mnt/raid_nvme/spiral_dataset_working/fiber_zarrs",
                "--fibers", "/mnt/raid_nvme/spiral_dataset_working/fibers", "--name", "_bench"] + argv
-    from vesuvius.neural_tracing.fiber_follow.data import (FollowDataset, OnPolicyStates, SampleConfig, ZBand,
+    from vesuvius.neural_tracing.fiber_follow.shared.data import (FollowDataset, OnPolicyStates, SampleConfig, ZBand,
                                                            gt_presence, load_fibers, mark_breaks, split_fibers)
-    from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec
-    from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume, FiberVolumeSpec
+    from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
+    from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
     import argparse
     p = argparse.ArgumentParser(); [p.add_argument(a) for a in ()]
     kv = dict(zip(argv[::2], argv[1::2]))

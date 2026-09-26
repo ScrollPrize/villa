@@ -135,7 +135,7 @@ Production startup/checkpoint smoke command (use a fresh run name):
 AGENTS_AGENT_MODE=1 PYTHONPATH=../../.. \
 TORCHINDUCTOR_CACHE_DIR=/tmp/fiber_compile_inductor \
 TRITON_CACHE_DIR=/tmp/fiber_compile_triton \
-../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.train \
+../../../../.venv/bin/python -m vesuvius.neural_tracing.fiber_follow.flow_matching.train \
   --fiber-zarrs /mnt/raid_nvme/spiral_dataset_working/fiber_zarrs \
   --fibers /mnt/raid_nvme/spiral_dataset_working/fibers \
   --ct /mnt/raid_nvme/volpkgs/s1_2um_ds2.volpkg/volumes/s1_ds2.zarr \

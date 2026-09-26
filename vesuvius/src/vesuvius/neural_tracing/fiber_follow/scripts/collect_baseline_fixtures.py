@@ -2,14 +2,14 @@
 import argparse
 import json
 from pathlib import Path
-from vesuvius.neural_tracing.fiber_follow.experiment import read_manifest
+from vesuvius.neural_tracing.fiber_follow.shared.experiment import read_manifest
 import numpy as np
 import torch
 from evaluate_recovery import load_archived_baseline,ArchivedTracer
-from vesuvius.neural_tracing.fiber_follow.collect import DecisionCollector
-from vesuvius.neural_tracing.fiber_follow.data import SampleConfig,OnPolicyStates,ZBand,load_fibers,split_fibers,fiber_manifest
-from vesuvius.neural_tracing.fiber_follow.trace import ModelTracer,TraceParams
-from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume
+from vesuvius.neural_tracing.fiber_follow.shared.collect import DecisionCollector
+from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig,OnPolicyStates,ZBand,load_fibers,split_fibers,fiber_manifest
+from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer,TraceParams
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
 
 
 def main(argv=None):

@@ -50,7 +50,7 @@ for ((i=0; i<${#train_args[@]}; i++)); do
 done
 resolved_options=$("$PYTHON" -c '
 import sys
-from vesuvius.neural_tracing.fiber_follow.train import read_checkpoint, resolve_sampler_mode, resolve_scorer_options
+from vesuvius.neural_tracing.fiber_follow.flow_matching.train import read_checkpoint, resolve_sampler_mode, resolve_scorer_options
 checkpoint=read_checkpoint(sys.argv[1], "cpu") if sys.argv[1] else None
 options=resolve_scorer_options(sys.argv[3] or None, int(sys.argv[4]) if sys.argv[4] else None, checkpoint)
 print(resolve_sampler_mode(sys.argv[2] or None, checkpoint), options["scorer"], options["gaussian_candidates"])

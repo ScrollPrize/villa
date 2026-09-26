@@ -6,14 +6,14 @@ import numpy as np
 import pytest
 import torch
 
-from vesuvius.neural_tracing.fiber_follow import data as D
-from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec, arclength, crop_local_grid, frame_from_heading
-from vesuvius.neural_tracing.fiber_follow.model import FollowNet, FollowNetConfig
-from vesuvius.neural_tracing.fiber_follow.supervision import tube_loss, teacher_candidates, loss_fn
+from vesuvius.neural_tracing.fiber_follow.shared import data as D
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength, crop_local_grid, frame_from_heading
+from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet, FollowNetConfig
+from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import tube_loss, teacher_candidates, loss_fn
 from vesuvius.neural_tracing.fiber_follow.tube import tube_geometry, render_tube
-from vesuvius.neural_tracing.fiber_follow.volume import FiberVolume, FiberVolumeSpec
-from vesuvius.neural_tracing.fiber_follow.trace import field_axis, ModelTracer, TraceParams
-from vesuvius.neural_tracing.fiber_follow.train import save_checkpoint, load_checkpoint
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.shared.trace import field_axis, ModelTracer, TraceParams
+from vesuvius.neural_tracing.fiber_follow.flow_matching.train import save_checkpoint, load_checkpoint
 
 
 def array_at(path, values):

@@ -9,12 +9,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vesuvius.neural_tracing.fiber_follow import train
-from vesuvius.neural_tracing.fiber_follow.data import DATA_POLICY
-from vesuvius.neural_tracing.fiber_follow.experiment import freeze_manifest, read_manifest
-from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec
-from vesuvius.neural_tracing.fiber_follow.model import ARCHITECTURE, FollowNetConfig
-from vesuvius.neural_tracing.fiber_follow.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.flow_matching import train
+from vesuvius.neural_tracing.fiber_follow.shared.data import DATA_POLICY
+from vesuvius.neural_tracing.fiber_follow.shared.experiment import freeze_manifest, read_manifest
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
+from vesuvius.neural_tracing.fiber_follow.flow_matching.model import ARCHITECTURE, FollowNetConfig
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 
 class StartupValidated(Exception):

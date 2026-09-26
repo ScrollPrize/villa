@@ -9,7 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from vesuvius.neural_tracing.fiber_follow import runloop, train
+from vesuvius.neural_tracing.fiber_follow.shared import runloop
+
+from vesuvius.neural_tracing.fiber_follow.flow_matching import train
 
 
 @pytest.mark.parametrize('platform,soft,hard,expected', [
@@ -67,7 +69,7 @@ import resource
 import sys
 import numpy as np
 import torch
-from vesuvius.neural_tracing.fiber_follow import train
+from vesuvius.neural_tracing.fiber_follow.flow_matching import train
 
 class Maps(torch.utils.data.IterableDataset):
     def __init__(self,path): self.path=path

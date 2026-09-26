@@ -7,16 +7,16 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from vesuvius.neural_tracing.fiber_follow import data as D
-from vesuvius.neural_tracing.fiber_follow.model import FollowNet,FollowNetConfig,ARCHITECTURE,flow_targets
-from vesuvius.neural_tracing.fiber_follow.policy import commit_prefix,recovery_allowed
-from vesuvius.neural_tracing.fiber_follow.supervision import prefix_labels,loss_fn,masked_bce
-from vesuvius.neural_tracing.fiber_follow.train import load_checkpoint,save_checkpoint,optimizer_update
-from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec,arclength,frame_from_heading
-from vesuvius.neural_tracing.fiber_follow.trace import ModelTracer,TraceParams
-from vesuvius.neural_tracing.fiber_follow.collect import DecisionCollector
-from vesuvius.neural_tracing.fiber_follow.replay import import_states
-from vesuvius.neural_tracing.fiber_follow.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.shared import data as D
+from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet,FollowNetConfig,ARCHITECTURE,flow_targets
+from vesuvius.neural_tracing.fiber_follow.shared.policy import commit_prefix,recovery_allowed
+from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import prefix_labels,loss_fn,masked_bce
+from vesuvius.neural_tracing.fiber_follow.flow_matching.train import load_checkpoint,save_checkpoint,optimizer_update
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec,arclength,frame_from_heading
+from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer,TraceParams
+from vesuvius.neural_tracing.fiber_follow.shared.collect import DecisionCollector
+from vesuvius.neural_tracing.fiber_follow.shared.replay import import_states
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 
 def config(**kw):
@@ -274,7 +274,7 @@ def test_cached_training_encoding_rejects_stateful_normalization():
 
 @pytest.mark.parametrize('cached_benchmark',[False,True])
 def test_preflight_must_match_encoding_cache_mode(tmp_path,cached_benchmark):
-    from vesuvius.neural_tracing.fiber_follow.train import main
+    from vesuvius.neural_tracing.fiber_follow.flow_matching.train import main
     benchmark=dict(architecture=ARCHITECTURE,passed=True,microbatch=2,flow_draws=64,crop=[176,96,96])
     if cached_benchmark: benchmark['cache_training_encoding']=True
     path=tmp_path/'benchmark.json';path.write_text(json.dumps(benchmark))
@@ -407,8 +407,8 @@ def test_count_aggregation_and_paired_bootstrap():
     table=mod.recovery_counts(rows)
     assert table['1-1.5']['four_known']==1 and table['1-1.5']['false_stops']==1
     assert table['2-3.5']['states']==0 and table['2-3.5']['four_known']==0
-    from vesuvius.neural_tracing.fiber_follow.evaluate import score_trace
-    from vesuvius.neural_tracing.fiber_follow.experiment import paired_bootstrap
+    from vesuvius.neural_tracing.fiber_follow.shared.evaluate import score_trace
+    from vesuvius.neural_tracing.fiber_follow.shared.experiment import paired_bootstrap
     f=fiber();row=score_trace(f.points[30:60],f,30,1)
     row.update(fiber=0,t0=30,sign=1)
     result=paired_bootstrap([row],[row],repeats=20)
@@ -416,9 +416,9 @@ def test_count_aggregation_and_paired_bootstrap():
 
 
 def test_ema_ramp_and_resumable_checkpoint(tmp_path):
-    from vesuvius.neural_tracing.fiber_follow.train import (
+    from vesuvius.neural_tracing.fiber_follow.flow_matching.train import (
         update_ema,resume_training,training_rng_state,read_checkpoint)
-    from vesuvius.neural_tracing.fiber_follow.runloop import prepare_run_dir
+    from vesuvius.neural_tracing.fiber_follow.shared.runloop import prepare_run_dir
     cfg=config();m=FollowNet(cfg);e=copy.deepcopy(m)
     with torch.no_grad():
         for p in m.parameters(): p.add_(1.)

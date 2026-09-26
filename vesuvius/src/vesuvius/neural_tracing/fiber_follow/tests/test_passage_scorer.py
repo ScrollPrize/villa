@@ -11,17 +11,17 @@ import pytest
 import torch
 
 from test_single_path import config, batch, run
-from vesuvius.neural_tracing.fiber_follow.model import FollowNet, FollowNetConfig, initial_residuals, ARCHITECTURE
-from vesuvius.neural_tracing.fiber_follow.passage_scorer import PassageScorer, sample_path_features
-from vesuvius.neural_tracing.fiber_follow.supervision import candidate_prefix_labels, prefix_labels, loss_fn
-from vesuvius.neural_tracing.fiber_follow.train import (
+from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet, FollowNetConfig, initial_residuals, ARCHITECTURE
+from vesuvius.neural_tracing.fiber_follow.flow_matching.passage_scorer import PassageScorer, sample_path_features
+from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import candidate_prefix_labels, prefix_labels, loss_fn
+from vesuvius.neural_tracing.fiber_follow.flow_matching.train import (
     optimizer_update, save_checkpoint, load_checkpoint, resolve_scorer_options,
     compile_training_model, main, training_rng_state, restore_training_rng, resume_training,
 )
-from vesuvius.neural_tracing.fiber_follow.data import SampleConfig
-from vesuvius.neural_tracing.fiber_follow.geometry import CropSpec
-from vesuvius.neural_tracing.fiber_follow.volume import FiberVolumeSpec
-from vesuvius.neural_tracing.fiber_follow.sampling import trace_generator, trace_noise
+from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
+from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
+from vesuvius.neural_tracing.fiber_follow.flow_matching.sampling import trace_generator, trace_noise
 
 
 def mixed_config(**kwargs):

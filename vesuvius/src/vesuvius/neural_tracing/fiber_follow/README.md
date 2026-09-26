@@ -1,8 +1,18 @@
 # fiber_follow
 
-An independent directly supervised alternative is in [`direct/`](direct/README.md).
-It uses fine level-0 CT, coarse backward context, and a direct curve decoder with two bounded local corrections.
-Train it separately with `bash scripts/launch_direct.sh NAME`.
+Layout:
+
+- `flow_matching/`: the flow-matching follower (model, losses, `train`, and
+  `collect`/`infer` entry points). Launch with `bash scripts/launch.sh NAME`.
+- `regression/`: an independent directly supervised alternative
+  ([README](regression/README.md)). It uses fine level-0 CT, coarse backward
+  context, and a direct curve decoder with two bounded local corrections.
+  Launch with `bash scripts/launch_regression.sh NAME`.
+- `shared/`: volume access, sampling, data, tracing, evaluation, diagnostics and
+  run-loop code used by both. `shared/` never imports `flow_matching/` at module
+  load; the model families pass their checkpoint loaders to `shared.collect` and
+  `shared.infer`.
+- `output/` stays at this level for both trainers.
 
 The active follower is `single_path_flow_v11`: a jointly denoised future curve,
 with optional mixed proposals and passage scoring, trained from scratch.
