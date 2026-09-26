@@ -1,47 +1,22 @@
-import copy
-
-
-from dataclasses import replace
-
-
 import json
-
 
 from types import SimpleNamespace
 
-
 import numpy as np
-
 
 import pytest
 
-
 import torch
-
 
 from vesuvius.neural_tracing.fiber_follow.shared import data as D
 
-
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, arclength, crop_local_grid, frame_from_heading
-
-
-from vesuvius.neural_tracing.fiber_follow.flow_matching.history_audit import HistoryAudit
-
 
 from vesuvius.neural_tracing.fiber_follow.flow_matching.history_metrics import observed_measurements
 
+from vesuvius.neural_tracing.fiber_follow.flow_matching.model import history_tangent
 
-from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet, FollowNetConfig, history_tangent
-
-
-from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import loss_fn
-
-
-from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams, field_axis
-
-
-from vesuvius.neural_tracing.fiber_follow.flow_matching.train import load_checkpoint, save_checkpoint
-
+from vesuvius.neural_tracing.fiber_follow.shared.trace import field_axis
 
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 

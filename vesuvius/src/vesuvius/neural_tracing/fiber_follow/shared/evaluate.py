@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
-import json
-import os
-import pickle
-import tempfile
-from dataclasses import asdict
 
 import numpy as np
 from scipy.spatial import cKDTree
 
-from vesuvius.neural_tracing.fiber_follow.shared.data import DATA_VERSION, TracedFiber, fiber_manifest
+from vesuvius.neural_tracing.fiber_follow.shared.data import DATA_VERSION, TracedFiber
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at, tangent_at
 from vesuvius.neural_tracing.fiber_follow.shared.trace import field_axis, point_samples
 
@@ -116,14 +111,7 @@ def score_trace(path: np.ndarray, fiber: TracedFiber, t0: float, sign: float, to
     if crossing is not None:
         err_mask &= lengths <= crossing
     err = float(d[err_mask].mean()) if err_mask.any() else float("nan")
-    avail_nb = avail
-    if fiber.brk is not None and fiber.brk.any():
-        ahead = (fiber.s[fiber.brk] - t0) * sign
-        ahead = ahead[ahead >= 0]
-        if len(ahead):
-            avail_nb = float(ahead.min())
     return dict(followed=followed, avail=avail, coverage=followed / max(avail, 1e-6),
-                avail_nb=avail_nb, coverage_nb=min(followed, avail_nb) / max(avail_nb, 1e-6),
                 correct=correct, offtrack=offtrack, unknown=unknown, endpoint_overrun=overrun,
                 scored_length=correct + offtrack, length=total,
                 precision=correct / max(correct + offtrack, 1e-6),
@@ -145,8 +133,6 @@ def monitor_coverage(row, max_len):
     row['avail'] = min(row['avail'], max_len)
     row['followed'] = min(row['followed'], max_len)
     row['coverage'] = row['followed'] / max(row['avail'], 1e-6)
-    row['avail_nb'] = min(row['avail_nb'], max_len)
-    row['coverage_nb'] = min(row['followed'], row['avail_nb']) / max(row['avail_nb'], 1e-6)
     return row
 
 
@@ -199,7 +185,6 @@ def summarize(rows):
         followed_median=float(np.median(fol)),
         offtrack_mean=wrong / len(rows), wrong_len_mean=wrong / len(rows),
         err_mean=float(errors[np.isfinite(errors)].mean()) if np.isfinite(errors).any() else float("nan"),
-        coverage_nb_mean=float(np.mean([r["coverage_nb"] for r in rows])),
         precision_mean=float(np.mean([r["precision"] for r in rows])),
         length_precision=correct / max(correct + wrong, 1e-6),
         correct_length=correct, wrong_length=wrong, unknown_length=unknown,
@@ -209,25 +194,3 @@ def summarize(rows):
         endpoint_overrun_length=sum(r["endpoint_overrun"] for r in rows),
         known_endpoint_traces=sum(r["endpoint_known"] for r in rows),
     )
-
-
-def load_or_make_seeds(path, fibers, vol, band, *, rebuild=False, per_fiber=2, seed=0):
-    """Fixed seeds bound to the current geometry, volume, and selection policy."""
-    metadata = dict(version=DATA_VERSION, fibers=fiber_manifest(fibers),
-                    volume=vol.spec.to_dict(), band=asdict(band), per_fiber=per_fiber,
-                    seed=seed, min_presence=0.8, margin=32.0)
-    if os.path.exists(path) and not rebuild:
-        with open(path, "rb") as fh:
-            cached = pickle.load(fh)
-        if cached.get("metadata") != metadata:
-            raise ValueError("Incompatible seed cache (labels, volume, or policy changed); "
-                             "use a new --seeds path or --rebuild-seeds")
-        return cached["seeds"]
-    seeds = make_seeds(fibers, vol, per_fiber=per_fiber, seed=seed)
-    parent = os.path.dirname(os.path.abspath(path))
-    os.makedirs(parent, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=parent, delete=False) as fh:
-        tmp = fh.name
-        pickle.dump(dict(metadata=metadata, seeds=seeds), fh)
-    os.replace(tmp, path)
-    return seeds

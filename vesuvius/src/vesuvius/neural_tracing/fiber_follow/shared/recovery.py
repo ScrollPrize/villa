@@ -40,7 +40,7 @@ def make_recovery_states(fibers, seeds, cfg, provenance, seed=20260925):
 def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu',
                              tracer_class=ModelTracer, batch_builder=None, thresholds=(.5, .85),
                              recovery_length=32., n_commit=8, tolerance=1.5, sampling_seed=0,
-                             limit=0, archived=False, on_prediction=None, progress=None):
+                             limit=0, on_prediction=None, progress=None):
     """Evaluate identical observed states; optional adapters change only model I/O."""
     states.validate_fibers(fibers)
     count = len(states) if limit == 0 else min(limit, len(states))
@@ -57,9 +57,7 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
         cpu = batch_builder([item], vol) if batch_builder else collate_with_volume([item],vol,sample.crop,grid)
         b = move(cpu)
         sampling={}
-        if archived:
-            model.generator.manual_seed(sampling_seed)
-        elif getattr(model.cfg,'sampler_mode','zero')=='gaussian':
+        if getattr(model.cfg,'sampler_mode','zero')=='gaussian':
             from vesuvius.neural_tracing.fiber_follow.flow_matching.sampling import trace_generator,trace_noise
             generator=trace_generator(sampling_seed,states.pos[j],states.frame[j,:,2])
             sampling['initial_noise']=trace_noise(model.cfg,[generator],device)

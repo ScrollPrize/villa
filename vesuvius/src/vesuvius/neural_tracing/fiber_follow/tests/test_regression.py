@@ -12,7 +12,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.supervision import geometry
 from vesuvius.neural_tracing.fiber_follow.regression.train import (
     optimizer_update, save_checkpoint, load_checkpoint, validate_volume_source,
 )
-from vesuvius.neural_tracing.fiber_follow.regression.data import image_crop, DirectTracer
+from vesuvius.neural_tracing.fiber_follow.regression.data import image_crop
 from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, SampleConfig, ZBand, training_state_allowed
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, sample_oriented_fast
 from vesuvius.neural_tracing.fiber_follow.shared.runloop import training_rng_state, resume_training
@@ -88,7 +88,7 @@ def test_departures_unknown_ends_and_crop_censoring():
     assert torch.equal(terms['geometry_per_state'][:2], torch.zeros(2))
     assert terms['confidence_per_state'][0] > 0
     assert terms['confidence_per_state'][1] == 0
-    assert torch.isfinite(terms['geometry_sum'])
+    assert torch.isfinite(terms['error_sum'])
 
 
 def test_feature_coordinates_respect_even_sized_strided_lattice():
@@ -205,6 +205,7 @@ def test_manifest_allows_resolution_change_but_not_source_change():
         validate_volume_source(replace(fine, ct_zarr='different'), manifest)
 
 
+@pytest.mark.slow
 def test_parallel_fibers_learn_recovery_from_older_observed_history():
     torch.manual_seed(91)
     cfg = config()

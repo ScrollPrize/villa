@@ -67,9 +67,8 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
         geometry = .75*geometry+.25*auxiliary
     labels, known, _ = prefix_labels(output['points'], batch, tolerance, cfg.max_recovery_distance)
     bce = F.binary_cross_entropy_with_logits(output['confidence_logits'], labels, reduction='none')
-    return dict(geometry_per_state=geometry, initial_geometry_per_state=initial_geometry,
+    return dict(geometry_per_state=geometry,
                 confidence_per_state=window_mean(bce, known.bool(), torch.arange(cfg.n_future, device=mask.device)<window),
-                geometry_sum=torch.where(mask, error, 0.).sum(), geometry_count=mask.sum(),
-                confidence_sum=(bce*known).sum(), confidence_count=known.sum(),
+                geometry_count=mask.sum(), confidence_count=known.sum(),
                 error_sum=torch.where(mask, (predicted-target).norm(dim=-1), 0.).sum(),
                 correct_count=(labels*known).sum())

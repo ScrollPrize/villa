@@ -3,7 +3,7 @@
 Layout:
 
 - `flow_matching/`: the flow-matching follower (model, losses, `train`, and
-  `collect`/`infer` entry points). Launch with `bash scripts/launch.sh NAME`.
+  `collect`/`infer` entry points). Launch with `bash scripts/launch_single_path.sh NAME`.
 - `regression/`: an independent directly supervised alternative
   ([README](regression/README.md)). It uses fine level-0 CT, coarse backward
   context, and a direct curve decoder with two bounded local corrections.
@@ -16,9 +16,7 @@ Layout:
 
 The active follower is `single_path_flow_v11`: a jointly denoised future curve,
 with optional mixed proposals and passage scoring, trained from scratch.
-Historical v10 results and the pre-migration source remain
-in `output/single_path_v11_baseline/`; old follower checkpoints are rejected by
-training/inference.
+Old follower checkpoints are rejected by training/inference.
 
 ## Model and tracing
 
@@ -73,9 +71,9 @@ sampled 16–64 history voxels augments existing drift, heading, wobble, missing
 and truncated histories.
 
 Replay v5 stores observed states and original-fiber correspondence, independently
-of prediction shapes. The one-time importer discards predictions, relabels drift,
-checks the larger crop/holdout footprint, preserves source provenance, deduplicates
-states, and samples up to 20,000 unique eligible states. The fixed bank never
+of prediction shapes. The one-time importer that built the fixed bank discarded
+predictions, relabeled drift, checked the larger crop/holdout footprint, preserved
+source provenance, deduplicated states, and sampled up to 20,000 unique eligible states. The fixed bank never
 rotates out with the latest four completed caches. Every training replay draw is
 relabeled and checked again before recropping. The original 48-voxel holdout
 position guard and complete crop/history/target exclusion remain in force.
@@ -84,15 +82,14 @@ From this directory, using an existing environment with the project dependencies
 
 ```bash
 export PYTHONPATH=../../..
-python scripts/prepare_single_path.py
-python scripts/import_replay.py output/flow_v10_small_b8_d64/dagger/decisions_*.npz \
-  output/replay_bootstrap/*.npz \
-  --out output/single_path_v11_preparation/fixed_recovery.npz
 bash scripts/launch_single_path.sh single_path_v11_run1
 ```
 
-Preparation refuses to overwrite a bank and reuses a matching frozen seed manifest.
-These preparation artifacts already exist in this workspace. The launcher benchmarks
+The frozen seed manifest (`output/single_path_v11_preparation/seeds.json`) and
+permanent recovery bank (`fixed_recovery.npz`) already exist in this workspace.
+They were derived once from v10 runs; the one-off preparation scripts are in git
+history. Stop a run from either trainer with `bash scripts/stop.sh NAME`.
+The launcher benchmarks
 before starting training. If microbatch 2 exhausts GPU memory, rerun with
 `MICROBATCH=1`; effective batch remains eight and the crop remains full sized.
 The benchmark reports GPU peak allocated/reserved memory, training throughput and
@@ -276,15 +273,6 @@ intervals. Baseline and new rows must have identical physical and sampling seed
 identities; bootstrap resampling groups all repeats of each fiber together. The target
 is ≥20% relative coverage improvement at matched 95% precision with no worse
 sustained wrong continuations; no improvement is assumed from confidence shifts.
-
-`evaluate_recovery.py --baseline-archive output/single_path_v11_baseline/source_before_v11.tar.gz`
-loads the archived v10 implementation only for baseline evaluation. Use
-`collect_baseline_fixtures.py --help` to preserve its actual observed decisions.
-The archived deterministic rollouts have a 1,200-voxel cap and do not substitute
-for the locked final comparison. `evaluate_single_path.py` also accepts
-`--baseline-archive` for baseline calibration and locked final rollouts; calibrate
-the baseline separately, using the same frozen seeds. Both final reports are
-needed before making a matched-precision improvement claim.
 
 ## Verification and current status
 

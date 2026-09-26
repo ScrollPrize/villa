@@ -73,7 +73,6 @@ def main(argv=None, *, checkpoint_loader=None, model_tracer=None, volume_validat
     ap.add_argument('--sampling-seeds',type=int,nargs='+',
                     help='Gaussian default: 0 1 2; deterministic default: 0. Locked at calibration.')
     ap.add_argument('--baseline-rows',type=Path)
-    ap.add_argument('--baseline-archive',type=Path,help='Archived v10 implementation, for baseline calibration/final rollouts only')
     args=ap.parse_args(argv);torch.set_num_threads(4)
     manifest=read_manifest(args.manifest);args.out.mkdir(parents=True,exist_ok=True)
     selection=None
@@ -86,8 +85,6 @@ def main(argv=None, *, checkpoint_loader=None, model_tracer=None, volume_validat
         checkpoint=Path(selection['checkpoint'])
         if hashlib.sha256(checkpoint.read_bytes()).hexdigest()!=selection['checkpoint_sha256']:
             raise ValueError('Selected checkpoint changed')
-        if selection.get('baseline_archive') != (str(args.baseline_archive.resolve()) if args.baseline_archive else None):
-            raise ValueError('Final baseline implementation must match calibration selection')
         choices=[(str(checkpoint),selection['threshold'])]
     else:
         if not args.checkpoints:ap.error('Calibration needs --checkpoints')
@@ -95,17 +92,10 @@ def main(argv=None, *, checkpoint_loader=None, model_tracer=None, volume_validat
     split='final' if args.mode=='final' else 'calibration';reports=[]
     for checkpoint,threshold in choices:
         tracer_class=model_tracer or ModelTracer
-        if args.baseline_archive:
-            from evaluate_recovery import load_archived_baseline,ArchivedTracer
-            model,crop,nh,spec,ck=load_archived_baseline(checkpoint,args.baseline_archive,args.device)
-            tracer_class=ArchivedTracer
-            for key in ('fiber_zarr_dir','ct_zarr','grid_scale'):
-                if spec.to_dict()[key]!=manifest['volume'][key]: raise ValueError('Baseline data source differs from manifest')
-        else:
-            model,crop,nh,spec,ck=(checkpoint_loader or load_checkpoint)(checkpoint,args.device)
-            if volume_validator is not None:
-                volume_validator(spec,manifest)
-            elif spec!=FiberVolumeSpec(**manifest['volume']): raise ValueError('Volume differs from frozen manifest')
+        model,crop,nh,spec,ck=(checkpoint_loader or load_checkpoint)(checkpoint,args.device)
+        if volume_validator is not None:
+            volume_validator(spec,manifest)
+        elif spec!=FiberVolumeSpec(**manifest['volume']): raise ValueError('Volume differs from frozen manifest')
         _,val=split_fibers(load_fibers(args.fibers,grid_scale=spec.grid_scale),ZBand(45000/spec.grid_scale,48500/spec.grid_scale))
         if fiber_manifest(val)!=manifest['fibers']: raise ValueError('Geometry differs from frozen manifest')
         sampler_mode=getattr(model.cfg,'sampler_mode','zero')
@@ -133,8 +123,7 @@ def main(argv=None, *, checkpoint_loader=None, model_tracer=None, volume_validat
             architecture=ck.get('architecture'),vol_spec=spec.to_dict(),n_commit=tracer.p.n_commit,
             sampler_mode=sampler_mode,sampling_seeds=sampling_seeds,sampling_seed_summaries=seed_summaries,
             scorer=getattr(model.cfg,'scorer','legacy'),gaussian_candidates=gaussian_candidates,
-            recovery=recovery_counts(audit_rows),seconds=time.monotonic()-start,step=ck['step'],
-            baseline_archive=str(args.baseline_archive.resolve()) if args.baseline_archive else None)
+            recovery=recovery_counts(audit_rows),seconds=time.monotonic()-start,step=ck['step'])
         report['coverage_at_95_scored_precision']=report['length_weighted_coverage'] if report['length_precision']>=.95 else None
         if args.baseline_rows:
             base_rows=json.loads(args.baseline_rows.read_text())

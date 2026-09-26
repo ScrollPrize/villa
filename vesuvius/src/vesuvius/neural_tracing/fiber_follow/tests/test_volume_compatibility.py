@@ -11,7 +11,7 @@ import torch
 
 from vesuvius.neural_tracing.fiber_follow.flow_matching import train
 from vesuvius.neural_tracing.fiber_follow.shared.data import DATA_POLICY
-from vesuvius.neural_tracing.fiber_follow.shared.experiment import freeze_manifest, read_manifest
+from vesuvius.neural_tracing.fiber_follow.shared.experiment import read_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 from vesuvius.neural_tracing.fiber_follow.flow_matching.model import ARCHITECTURE, FollowNetConfig
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
@@ -85,19 +85,6 @@ def test_training_startup_with_legacy_volume_metadata(tmp_path, monkeypatch, leg
             train.main(args)
         assert manifest_path.read_bytes() == original_manifest
         assert read_manifest(manifest_path)['sha256'] == manifest['sha256']
-
-
-def test_reusing_legacy_manifest_preserves_hash_and_rejects_changed_volume(tmp_path, legacy_manifest):
-    spec, path, payload = legacy_manifest
-    original = tmp_path/'original.json'
-    original.write_text(json.dumps(dict(val=[], fiber_manifest=[])))
-    before = path.read_bytes()
-    saved = freeze_manifest(path, [], SimpleNamespace(spec=spec), 'unused', original)
-    assert saved == payload and path.read_bytes() == before
-    for change in ({'load_presence': False}, {'ct_zarr': 'other'}, {'ct_grid_scale': 4.}):
-        with pytest.raises(ValueError, match='geometry/volume'):
-            freeze_manifest(path, [], SimpleNamespace(spec=replace(spec, **change)), 'unused', original)
-    assert read_manifest(path)['sha256'] == payload['sha256']
 
 
 @pytest.mark.parametrize('change', [None, {'load_presence': False}, {'ct_zarr': 'other'}, {'ct_grid_scale': 4.}])

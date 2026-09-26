@@ -79,17 +79,6 @@ def format_training_log(row):
         details = ' | '.join(f'{key}: {json.dumps(value)}' for key,value in row.items() if key != 'step')
         return f'{step} | {details}'
 
-    if 'ranking' in row:
-        return '\n'.join([
-            f"\n{step} | loss {row['loss']:.4f} | lr {row['lr']:.2e}"
-            f" | {row['samples_per_second']:.2f} samples/s",
-            f"  ranking {row['ranking']:.4f} | on-fiber {row['onfiber']:.4f}",
-            f"  candidate correctness: model top-1 {row['model_top1_onfiber']:.1%}"
-            f" | oracle {row['oracle_onfiber']:.1%}"
-            f" | labeled candidates/state {row['labeled_candidates']:.1f}",
-            f"  data: hard {row['hard_fraction']:.0%} | mined or hard {row['mined_fraction']:.0%}",
-        ])
-
     if 'geometry' in row:
         return '\n'.join([f"\n{step} | loss {row['loss']:.4f} | lr {row['lr']:.2e}"
                           f" | {row['samples_per_second']:.2f} samples/s", *_direct_training_lines(row)])

@@ -10,9 +10,10 @@ import torch
 from test_single_path import batch, config, run
 from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet, initial_residuals
 from vesuvius.neural_tracing.fiber_follow.flow_matching.sampling import trace_generator, trace_noise
+from vesuvius.neural_tracing.fiber_follow.shared.runloop import restore_training_rng
 from vesuvius.neural_tracing.fiber_follow.flow_matching.train import (
     load_checkpoint, save_checkpoint, resolve_sampler_mode, initialized_config, optimizer_update,
-    compile_training_model, training_rng_state, restore_training_rng, resume_training,
+    compile_training_model, training_rng_state, resume_training,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
@@ -164,3 +165,4 @@ def test_gaussian_compiled_training_and_explicit_noise_agree():
         loss,_,_=optimizer_update(m,ema,opt,[b],step,.001,device='cuda')
         assert np.isfinite(loss)
     assert m.flow.velocity.weight.grad.abs().sum()>0
+

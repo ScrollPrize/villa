@@ -11,13 +11,7 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import build_inputs, read_blocks, render_count
-from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
-    CropSpec,
-    block_start,
-    crop_local_grid,
-    frame_from_heading,
-    normalize,
-)
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, frame_from_heading, normalize
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, commit_prefix
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
 
@@ -35,18 +29,16 @@ class TraceParams:
     explore_calls: int = 0  # collection only: bounded suffix after first would-stop
     # Stop policy. A would-stop call (the curve prefix clears ``confidence``)
     # ends the trace only after ``stop_patience`` consecutive such calls; the
-    # earlier ones commit a single point of the predicted curve, provided
-    # its first-point confidence reaches ``commit_floor`` (None: no floor).
+    # earlier ones commit a single point of the predicted curve.
     # Defaults reproduce the immediate stop.
     stop_patience: int = 1
-    commit_floor: float | None = None
     seed: int = 0  # stochastic sampler seed; each directed trace has its own stream
 
     def __post_init__(self):
         if self.n_commit < 1 or self.max_len <= 0 or not 0 <= self.confidence <= 1 or self.explore_calls < 0:
             raise ValueError('Invalid rollout parameters')
-        if self.stop_patience < 1 or (self.commit_floor is not None and not 0 <= self.commit_floor <= 1):
-            raise ValueError('stop_patience must be positive and commit_floor within [0, 1]')
+        if self.stop_patience < 1:
+            raise ValueError('stop_patience must be positive')
 
 
 def point_samples(vol: FiberVolume, pts_xyz: np.ndarray) -> np.ndarray:
@@ -213,8 +205,7 @@ class ModelTracer:
                     continue
                 if would_stop and not exploratory:
                     stop_streak[i] += 1
-                    below_floor = pp.commit_floor is not None and conf[0] < pp.commit_floor
-                    if stop_streak[i] >= pp.stop_patience or below_floor:
+                    if stop_streak[i] >= pp.stop_patience:
                         active[i], reasons[i] = False, 'confidence'
                         continue
                 elif not would_stop:
@@ -259,63 +250,3 @@ class ModelTracer:
                 elif length[i] >= pp.max_len-1e-6:
                     active[i], reasons[i] = False, 'max_len'
         return [np.asarray(p[h:]) for p, h in zip(paths, hist_start)], reasons
-
-
-class FieldTracer:
-    """Baseline: integrate the predicted fiber axis field with presence re-centring."""
-
-    def __init__(self, vol: FiberVolume, step: float = 1.0, inertia: float = 0.5, recenter: float = 0.5,
-                 min_presence: float = 0.12, patience: int = 12, max_len: float = 6000.0):
-        self.vol = vol
-        self.step, self.inertia, self.recenter = step, inertia, recenter
-        self.min_presence, self.patience, self.max_len = min_presence, patience, max_len
-        g = np.linspace(-1.5, 1.5, 7)
-        self.plane = np.stack(np.meshgrid(g, g, indexing="ij"), -1).reshape(-1, 2)
-
-    def _pres(self, pts):
-        base = np.floor(pts.min(0)[::-1]).astype(np.int64)
-        size = np.floor(pts.max(0)[::-1]).astype(np.int64) - base + 2
-        blk = self.vol.presence.read(base, size).astype(np.float32) / 255.0
-        q = pts[:, ::-1] - base
-        i0 = np.floor(q).astype(int)
-        f = q - i0
-        out = 0
-        for dz in (0, 1):
-            for dy in (0, 1):
-                for dx in (0, 1):
-                    w = (f[:, 0] if dz else 1 - f[:, 0]) * (f[:, 1] if dy else 1 - f[:, 1]) * (f[:, 2] if dx else 1 - f[:, 2])
-                    out = out + w * blk[i0[:, 0] + dz, i0[:, 1] + dy, i0[:, 2] + dx]
-        return out
-
-    def trace_one(self, seed, heading):
-        p = np.asarray(seed, np.float64)
-        h = normalize(np.asarray(heading, np.float64))
-        path = [p]
-        low = 0
-        for _ in range(int(self.max_len / self.step)):
-            e, _ = field_axis(self.vol, p)
-            if np.dot(e, h) < 0:
-                e = -e
-            h = normalize(self.inertia * h + (1 - self.inertia) * e)
-            q = p + self.step * h
-            fr = frame_from_heading(h)
-            cand = q + self.plane[:, :1] * fr[:, 0] + self.plane[:, 1:] * fr[:, 1]
-            w = self._pres(cand) ** 2
-            if w.sum() > 1e-6:
-                c = (cand * w[:, None]).sum(0) / w.sum()
-                q = q + self.recenter * (c - q)
-            pr = self._pres(q[None])[0]
-            low = low + 1 if pr < self.min_presence else 0
-            if low >= self.patience:
-                del path[-(low - 1):]
-                return np.asarray(path), "presence"
-            if np.any(q < 0) or np.any(q[::-1] >= np.asarray(self.vol.shape)):
-                return np.asarray(path), "bounds"
-            h = normalize(q - p)
-            p = q
-            path.append(p)
-        return np.asarray(path), "max_len"
-
-    def trace(self, seeds, headings, histories=None):
-        res = [self.trace_one(s, h) for s, h in zip(seeds, headings)]
-        return [r[0] for r in res], [r[1] for r in res]
