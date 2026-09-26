@@ -9,6 +9,7 @@
 #include <opencv2/core/mat.hpp>
 
 namespace vc { class VcDataset; }
+namespace utils { class Json; }
 
 // Map a tile index through rotation + flip (pure integer tile coordinate transform).
 // Used by both zarr and tif writers.
@@ -95,7 +96,8 @@ void writeZarrAttrs(const std::filesystem::path& outFile,
                     const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
                     double baseVoxelSize = 1.0,
                     const std::string& voxelUnit = "",
-                    double pixelsPerVoxel = 1.0);
+                    double pixelsPerVoxel = 1.0,
+                    const utils::Json* extraAttributes = nullptr);
 
 // Write a dense uint8 ZYX subregion into a freshly created dataset via
 // writeChunk(). Chunks overlapping the region are materialized; untouched

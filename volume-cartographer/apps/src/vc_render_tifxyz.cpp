@@ -11,6 +11,7 @@
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VcDataset.hpp"
+#include "vc/core/Version.hpp"
 #include "utils/Json.hpp"
 #include "utils/http_fetch.hpp"
 
@@ -20,6 +21,7 @@
 #include <sstream>
 #include <algorithm>
 #include <atomic>
+#include <boost/uuid/detail/sha1.hpp>
 #include <boost/program_options.hpp>
 #include <limits>
 #include <mutex>
@@ -131,6 +133,49 @@ static bool invertAffineInPlace(AffineTransform& T)
     T.matrix(3,0) = T.matrix(3,1) = T.matrix(3,2) = 0.0;
     T.matrix(3,3) = 1.0;
     return true;
+}
+
+static std::string effectiveSurfaceSha1(const cv::Mat_<cv::Vec3f>& points,
+                                        const cv::Vec2f& scale)
+{
+    // Hash the geometry that the renderer actually consumes rather than
+    // rereading the tifxyz files. This includes mask/sentinel handling and an
+    // optional in-process flatten, while avoiding another pass over very large
+    // source files.
+    boost::uuids::detail::sha1 hash;
+    const int shape[] = {points.rows, points.cols, points.type()};
+    hash.process_bytes(shape, sizeof(shape));
+    hash.process_bytes(scale.val, sizeof(scale.val));
+    for (int row = 0; row < points.rows; ++row)
+        hash.process_bytes(points.ptr(row), size_t(points.cols) * points.elemSize());
+
+    boost::uuids::detail::sha1::digest_type digest{};
+    hash.get_digest(digest);
+    std::ostringstream out;
+    out << std::hex << std::setfill('0');
+    for (const auto value : digest)
+        out << std::setw(int(sizeof(value) * 2))
+            << static_cast<unsigned long long>(value);
+    return out.str();
+}
+
+static std::string provenanceSafeUrl(std::string url)
+{
+    // A remote Zarr locator can be a presigned URL. Preserve enough to identify
+    // the public source without copying credentials, signatures, or fragments
+    // into an output that may itself be published.
+    const auto scheme = url.find("://");
+    if (scheme != std::string::npos) {
+        const auto authority = scheme + 3;
+        const auto authorityEnd = url.find_first_of("/?#", authority);
+        const auto userInfoEnd = url.find('@', authority);
+        if (userInfoEnd != std::string::npos &&
+            (authorityEnd == std::string::npos || userInfoEnd < authorityEnd))
+            url.erase(authority, userInfoEnd - authority + 1);
+    }
+    if (const auto privatePart = url.find_first_of("?#"); privatePart != std::string::npos)
+        url.erase(privatePart);
+    return url;
 }
 
 static AffineTransform loadAffineTransform(const std::string& filename)
@@ -1255,7 +1300,8 @@ int main(int argc, char *argv[])
         return mergeTiffParts(tifOutputArg, numParts) ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
-    std::filesystem::path vol_path = parsed["volume"].as<std::string>();
+    const std::string volumeInput = parsed["volume"].as<std::string>();
+    std::filesystem::path vol_path = volumeInput;
     const bool prefetchRemote = parsed["prefetch-remote"].as<bool>();
     std::string remoteUrl = parsed.count("remote-url") ? parsed["remote-url"].as<std::string>() : "";
     if (remoteUrl.empty()) {
@@ -1582,6 +1628,8 @@ int main(int argc, char *argv[])
             for (int i = 0; i < raw_points->cols; i++)
                 if ((*raw_points)(j,i)[0] == -1) (*raw_points)(j,i) = {NAN,NAN,NAN};
 
+        const std::string surfaceSha1 = effectiveSurfaceSha1(*raw_points, surf->_scale);
+
         // Bounding box of valid points
         int col_min = raw_points->cols, col_max = -1, row_min = raw_points->rows, row_max = -1;
         for (int j = 0; j < raw_points->rows; j++)
@@ -1642,6 +1690,100 @@ int main(int argc, char *argv[])
 
         const int rotQuad = rotQuadGlobal;
 
+        Json provenance = Json::object();
+        provenance["schema_version"] = 1;
+        provenance["tool"] = "vc_render_tifxyz";
+        provenance["tool_git_commit"] = ProjectInfo::RepositoryHash();
+
+        Json source = Json::object();
+        const bool volumeInputIsUrl = volumeInput.find("://") != std::string::npos;
+        const auto safeVolumeInput = volumeInputIsUrl ? provenanceSafeUrl(volumeInput) : volumeInput;
+        if (volumeInputIsUrl) {
+            source["input_url"] = safeVolumeInput;
+            source["input_url_redacted"] = safeVolumeInput != volumeInput;
+        } else {
+            source["local_path"] = safeVolumeInput;
+        }
+        source["group_index"] = group_idx;
+        if (!remoteUrl.empty()) {
+            const auto safeRemoteUrl = provenanceSafeUrl(remoteUrl);
+            source["remote_url"] = safeRemoteUrl;
+            source["remote_url_redacted"] = safeRemoteUrl != remoteUrl;
+        }
+        provenance["source_volume"] = std::move(source);
+
+        Json surface = Json::object();
+        surface["path"] = seg_folder.generic_string();
+        surface["effective_geometry_sha1"] = surfaceSha1;
+        surface["grid_width"] = raw_points->cols;
+        surface["grid_height"] = raw_points->rows;
+        Json surfaceScale = Json::array();
+        surfaceScale.push_back(double(surf->_scale[0]));
+        surfaceScale.push_back(double(surf->_scale[1]));
+        surface["grid_scale"] = std::move(surfaceScale);
+        provenance["surface"] = std::move(surface);
+
+        Json affine = Json::object();
+        affine["applied"] = hasAffine;
+        Json affineInputs = Json::array();
+        for (const auto& [path, inverted] : affineSpecs) {
+            Json input = Json::object();
+            input["path"] = path;
+            input["inverted"] = inverted;
+            affineInputs.push_back(std::move(input));
+        }
+        affine["inputs"] = std::move(affineInputs);
+        Json matrix = Json::array();
+        for (int row = 0; row < 4; ++row) {
+            Json values = Json::array();
+            for (int col = 0; col < 4; ++col)
+                values.push_back(double(affineTransform.matrix(row, col)));
+            matrix.push_back(std::move(values));
+        }
+        affine["composed_matrix"] = std::move(matrix);
+        provenance["affine"] = std::move(affine);
+
+        Json render = Json::object();
+        render["pixels_per_level_voxel"] = double(tgt_scale);
+        render["segmentation_scale"] = double(scale_seg);
+        render["effective_render_scale"] = render_scale;
+        render["num_slices"] = num_slices;
+        render["slice_step"] = slice_step;
+        render["accumulation_step"] = accum_step;
+        render["accumulation_type"] = accum_type_str;
+        render["accumulation_samples"] = int(accumOffsets.size());
+        render["composite"] = isCompositeMode;
+        render["composite_start"] = compositeStart;
+        render["composite_end"] = compositeEnd;
+        render["alpha_min"] = double(compositeParams.alphaMin);
+        render["alpha_max"] = double(compositeParams.alphaMax);
+        render["alpha_opacity"] = double(compositeParams.alphaOpacity);
+        render["alpha_cutoff"] = double(compositeParams.alphaCutoff);
+        render["beer_lambert_extinction"] = double(compositeParams.blExtinction);
+        render["beer_lambert_emission"] = double(compositeParams.blEmission);
+        render["beer_lambert_ambient"] = double(compositeParams.blAmbient);
+        render["isovalue_cutoff"] = int(compositeParams.isoCutoff);
+        render["rotation_degrees"] = rotate_angle;
+        render["flip_axis"] = flip_axis;
+        render["flip_normals"] = g_flipNormals;
+        render["flatten"] = parsed["flatten"].as<bool>();
+        render["flatten_iterations"] = parsed["flatten-iterations"].as<int>();
+        render["flatten_downsample"] = parsed["flatten-downsample"].as<int>();
+        render["auto_crop"] = autoCrop;
+        Json cropJson = Json::array();
+        cropJson.push_back(crop.x); cropJson.push_back(crop.y);
+        cropJson.push_back(crop.width); cropJson.push_back(crop.height);
+        render["crop_xywh"] = std::move(cropJson);
+        Json fullCanvas = Json::array();
+        fullCanvas.push_back(full_size.width); fullCanvas.push_back(full_size.height);
+        render["full_canvas_size"] = std::move(fullCanvas);
+        render["output_dtype"] = output_is_u16 && !isCompositeMode ? "uint16" : "uint8";
+        provenance["render"] = std::move(render);
+
+        Json extraAttributes = Json::object();
+        extraAttributes["render_provenance"] = std::move(provenance);
+        const std::filesystem::path attrsVolumePath(safeVolumeInput);
+
         // Determine output dtype
         const bool useU16 = output_is_u16 && !isCompositeMode;
         const int cvType = useU16 ? CV_16UC1 : CV_8UC1;
@@ -1676,9 +1818,10 @@ int main(int argc, char *argv[])
 
                 cv::Size attrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
-                writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
+                writeZarrAttrs(outFilePath, attrsVolumePath, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
-                               render_level_voxel_size, voxel_unit, tgt_scale);
+                               render_level_voxel_size, voxel_unit, tgt_scale,
+                               &extraAttributes);
                 return true;
             } else if (numParts > 1) {
                 if (!std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
@@ -1897,9 +2040,10 @@ int main(int argc, char *argv[])
             if (numParts <= 1) {
                 cv::Size attrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
-                writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
+                writeZarrAttrs(outFilePath, attrsVolumePath, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
-                               render_level_voxel_size, voxel_unit, tgt_scale);
+                               render_level_voxel_size, voxel_unit, tgt_scale,
+                               &extraAttributes);
             }
         }
         return true;
