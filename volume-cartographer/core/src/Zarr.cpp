@@ -345,7 +345,8 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
                     const std::string& accumTypeStr, size_t accumSamples,
                     const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
                     double baseVoxelSize, const std::string& voxelUnit,
-                    double pixelsPerVoxel)
+                    double pixelsPerVoxel,
+                    const utils::Json* extraAttributes)
 {
     Json attrs;
     attrs["source_zarr"] = volPath.string();
@@ -406,6 +407,12 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
     Json multiscales = Json::array();
     multiscales.push_back(std::move(ms));
     attrs["multiscales"] = std::move(multiscales);
+
+    if (extraAttributes) {
+        if (!extraAttributes->is_object())
+            throw std::invalid_argument("writeZarrAttrs extra attributes must be a JSON object");
+        attrs.update(*extraAttributes);
+    }
 
     vc::writeZarrAttributes(outDir, attrs);
 }

@@ -370,6 +370,40 @@ class FetchFailureTests(unittest.TestCase):
                            "every pixel of the reference render is the same value, so the surface "
                            "is probably outside the volume and nothing was sampled")
 
+    def test_zarr_output_records_render_provenance(self):
+        url = self.serving(0, NEVER_FAIL)
+        out = self.root / "provenance.zarr"
+        r = self.render(url, "--zarr-output", out, extra=("--pyramid", "false"))
+        self.assertEqual(r.returncode, 0, "the provenance render failed: %s" % r.stderr[-400:])
+        attrs = json.loads((out / ".zattrs").read_text())
+        p = attrs["render_provenance"]
+        self.assertEqual(attrs["source_zarr"], url)
+        self.assertEqual(p["schema_version"], 1)
+        self.assertEqual(p["tool"], "vc_render_tifxyz")
+        self.assertEqual(len(p["tool_git_commit"]), 40)
+        self.assertEqual(p["source_volume"]["input_url"], url)
+        self.assertFalse(p["source_volume"]["input_url_redacted"])
+        self.assertNotIn("local_path", p["source_volume"])
+        self.assertEqual(p["source_volume"]["remote_url"], url)
+        self.assertFalse(p["source_volume"]["remote_url_redacted"])
+        self.assertEqual(p["source_volume"]["group_index"], 0)
+        self.assertEqual(p["surface"]["path"], str(self.surface))
+        self.assertRegex(p["surface"]["effective_geometry_sha1"], r"^[0-9a-f]{40}$")
+        self.assertEqual(p["surface"]["grid_width"], SURF_N)
+        self.assertEqual(p["surface"]["grid_height"], SURF_N)
+        self.assertEqual(p["render"]["pixels_per_level_voxel"], 1.0)
+        self.assertEqual(p["render"]["num_slices"], 3)
+        self.assertFalse(p["render"]["composite"])
+        self.assertFalse(p["render"]["flip_normals"])
+        self.assertFalse(p["render"]["flatten"])
+        self.assertEqual(p["render"]["output_dtype"], "uint8")
+        self.assertEqual(p["affine"]["composed_matrix"], [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
+
     def test_transient_failures_still_recover(self):
         url = self.serving(2)
         out = self.root / "recovered"

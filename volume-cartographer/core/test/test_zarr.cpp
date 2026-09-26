@@ -162,6 +162,32 @@ TEST_CASE("writeZarrAttrs derives per-axis scale from slice step and pixel densi
     fs::remove_all(d);
 }
 
+TEST_CASE("writeZarrAttrs preserves caller-supplied provenance")
+{
+    auto d = tmpDir("attrs_provenance");
+    utils::Json provenance = utils::Json::object();
+    provenance["render_provenance"] = utils::Json{
+        {"schema_version", 1},
+        {"tool", "vc_render_tifxyz"},
+        {"surface", utils::Json{{"effective_geometry_sha1", "abc123"}}},
+    };
+    writeZarrAttrs(/*outDir=*/d, /*volPath=*/d,
+                   /*groupIdx=*/0, /*baseZ=*/1,
+                   /*sliceStep=*/1.0, /*accumStep=*/0.0,
+                   /*accumTypeStr=*/"max", /*accumSamples=*/0,
+                   /*canvasSize=*/cv::Size(16, 16),
+                   /*CZ=*/1, /*CH=*/16, /*CW=*/16,
+                   /*baseVoxelSize=*/1.0, /*voxelUnit=*/"um",
+                   /*pixelsPerVoxel=*/1.0, /*extraAttributes=*/&provenance);
+    auto j = utils::Json::parse_file(d / ".zattrs");
+    REQUIRE(j.contains("render_provenance"));
+    CHECK(j["render_provenance"]["schema_version"].get_int() == 1);
+    CHECK(j["render_provenance"]["tool"].get_string() == "vc_render_tifxyz");
+    CHECK(j["render_provenance"]["surface"]["effective_geometry_sha1"].get_string()
+          == "abc123");
+    fs::remove_all(d);
+}
+
 TEST_CASE("writeZarrRegionU8ByChunk writes data into multiple chunks")
 {
     auto d = tmpDir("region_chunks");
