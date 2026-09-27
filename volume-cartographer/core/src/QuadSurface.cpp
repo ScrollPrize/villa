@@ -758,40 +758,58 @@ void warpBilinearConstVec3f(const cv::Mat_<cv::Vec3f>& src,
     }
 }
 
-// Bicubic (Catmull-Rom) position warp with analytically differentiated normals
-// -- the Smooth mode of QuadSurface::gen().
+// Cubic Hermite basis for a unit cell. `p` weights endpoint values and `m`
+// weights endpoint derivatives; the d* fields are their derivatives with
+// respect to t.
+struct HermiteBasis {
+    float p0, m0, p1, m1;
+    float dp0, dm0, dp1, dm1;
+};
+
+inline HermiteBasis hermiteBasis(float t)
+{
+    const float t2 = t * t;
+    const float t3 = t2 * t;
+    return {
+        2.f*t3 - 3.f*t2 + 1.f,
+        t3 - 2.f*t2 + t,
+        -2.f*t3 + 3.f*t2,
+        t3 - t2,
+        6.f*t2 - 6.f*t,
+        3.f*t2 - 4.f*t + 1.f,
+        -6.f*t2 + 6.f*t,
+        3.f*t2 - 2.f*t
+    };
+}
+
+inline bool completeQuad(const cv::Mat_<uint8_t>& valid, int y0, int x0)
+{
+    if (valid.empty() || y0 < 0 || x0 < 0 ||
+        y0 + 1 >= valid.rows || x0 + 1 >= valid.cols)
+        return false;
+    return valid(y0, x0) && valid(y0, x0 + 1) &&
+           valid(y0 + 1, x0) && valid(y0 + 1, x0 + 1);
+}
+
+// Smooth-mode warp. Every complete 2x2 quad is a bicubic Hermite patch whose
+// corner derivatives come from a shared source-grid cache. Adjacent patches
+// therefore use exactly the same edge values, tangents and cross-tangents: the
+// position and its first derivatives agree at the edge (C1), including where
+// centered interior differences change to one-sided border/hole differences.
 //
-// Positions come from the usual 4x4 Catmull-Rom stencil, and the normal is
-// dP/du x dP/dv evaluated over that *same* stencil using the basis' derivative
-// weights. So the normal is the true normal of the C1 interpolated surface
-// rather than a resampled per-vertex normal, and it varies continuously: no
-// steps at source-cell boundaries, which is what makes offsetting along it
-// (p + t*n, the slice stack) free of the kinks the Linear path produces.
-//
-// Pixels whose 4x4 support is incomplete -- hole-adjacent, or within one cell
-// of the grid border -- fall back to the exact bilinear result and the
-// nearest-neighbour cached normal, i.e. precisely what Linear mode emits there.
-// The valid footprint is therefore identical in both modes; only the values
-// inside it differ.
-//
-//   cubicOk   : source-grid support mask from buildCubicSupportMask(); a set
-//               entry guarantees rows/cols [i-1, i+2] are in range and valid,
-//               so the taps below need no bounds checks. Empty => all fallback.
-//   normalSrc : _normalCache, read only at fallback pixels. May be empty when
-//               dstNormals is null.
-//   dstNormals: null when the caller does not need normals.
-//
-// kConstBorder mirrors the two bilinear variants: false replicates the source
-// edge (single-component), true emits `border` outside it (per-component, so
-// interpolation never crosses a component seam).
+// The four position values plus the three derivatives at each corner are the
+// same 16 Vec3 reads as the old 4x4 Catmull-Rom kernel. In a fully supported
+// interior the cached derivatives are centered differences, making this the
+// same Catmull-Rom surface expressed in Hermite form.
 template <bool kConstBorder>
-void warpBicubicVec3fImpl(const cv::Mat_<cv::Vec3f>& src,
-                          const cv::Mat_<uint8_t>& cubicOk,
-                          const cv::Mat_<cv::Vec3f>& normalSrc,
+void warpHermiteVec3fImpl(const cv::Mat_<cv::Vec3f>& src,
+                          const cv::Mat_<uint8_t>& valid,
+                          const cv::Mat_<cv::Vec3f>& du,
+                          const cv::Mat_<cv::Vec3f>& dv,
+                          const cv::Mat_<cv::Vec3f>& duv,
                           cv::Mat_<cv::Vec3f>& dstCoords,
                           cv::Mat_<cv::Vec3f>* dstNormals,
-                          double ox, double oy,
-                          double sx, double sy,
+                          double ox, double oy, double sx, double sy,
                           const cv::Vec3f& border)
 {
     const int sc = src.cols, sr = src.rows;
@@ -806,37 +824,28 @@ void warpBicubicVec3fImpl(const cv::Mat_<cv::Vec3f>& src,
     const float fox = float(ox), foy = float(oy);
     const float fsx = float(sx), fsy = float(sy);
     const bool wantNormals = (dstNormals != nullptr);
-    const bool haveCubic = !cubicOk.empty();
-    const bool haveNormalSrc = !normalSrc.empty();
 
-    // Separable, like every other warp in this file: the source x sample
-    // depends only on dx, so precompute the whole x axis once instead of per
-    // pixel. Plain locals (not thread_local): the parallel row loop below reads
-    // them from every worker thread.
-    //   x0v : floor cell, also the cubic stencil anchor (-1 => outside, const
-    //         border only). x1v/wxv complete the bilinear fallback cell.
-    //   nxv : nearest source column for the fallback normal, from the
-    //         *unclamped* coordinate -- matches warpNearestConstVec3f.
-    //   wxv4/dwxv4 : Catmull-Rom value and derivative weights, 4 per column.
-    std::vector<int> x0v(dw), x1v(dw), nxv(dw);
+    // Separable mapping: precompute the source cell and Hermite basis once per
+    // output column. At the replicated right edge use the final real cell at
+    // t=1 rather than a zero-width [last,last] cell.
+    std::vector<int> x0v(dw), x1v(dw);
     std::vector<float> wxv(dw);
-    std::vector<float> wxv4(size_t(dw) * 4), dwxv4(size_t(dw) * 4);
+    std::vector<HermiteBasis> bxv(dw);
     for (int dx = 0; dx < dw; ++dx) {
         const float fxRaw = fox + float(dx) * fsx;
-        nxv[dx] = int(std::lround(fxRaw));
         float fx = fxRaw;
         if (kConstBorder) {
             if (fx < 0.0f || fx > sxmax) { x0v[dx] = -1; continue; }
         } else {
             fx = fx < 0.0f ? 0.0f : (fx > sxmax ? sxmax : fx);
         }
-        const int x0 = int(fx);
-        int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
+        int x0 = int(fx);
+        if (sc >= 2 && x0 >= sc - 1) x0 = sc - 2;
+        int x1 = std::min(x0 + 1, sc - 1);
         x0v[dx] = x0; x1v[dx] = x1;
         const float f = fx - float(x0);
         wxv[dx] = f;
-        vc::interp::catmullRomWeights4WithDerivative(f, &wxv4[size_t(dx) * 4],
-                                                        &dwxv4[size_t(dx) * 4]);
+        bxv[dx] = hermiteBasis(f);
     }
 
     #pragma omp parallel for schedule(dynamic, 8)
@@ -857,22 +866,14 @@ void warpBicubicVec3fImpl(const cv::Mat_<cv::Vec3f>& src,
         } else {
             fy = fy < 0.0f ? 0.0f : (fy > symax ? symax : fy);
         }
-        const int y0 = int(fy);
-        int y1 = y0 + 1; if (y1 > sr - 1) y1 = sr - 1;
+        int y0 = int(fy);
+        if (sr >= 2 && y0 >= sr - 1) y0 = sr - 2;
+        int y1 = std::min(y0 + 1, sr - 1);
         const float wy = fy - float(y0);
-        float wy4[4], dwy4[4];
-        vc::interp::catmullRomWeights4WithDerivative(wy, wy4, dwy4);
+        const HermiteBasis by = hermiteBasis(wy);
 
         const cv::Vec3f* row0 = src[y0];
         const cv::Vec3f* row1 = src[y1];
-        // Cubic tap rows. Only dereferenced when cubicOk says the stencil is
-        // complete, which already implies 1 <= y0 <= sr-3.
-        const bool rowsInRange = (y0 >= 1 && y0 <= sr - 3);
-        const uint8_t* okRow = (haveCubic && rowsInRange) ? cubicOk[y0] : nullptr;
-
-        const int ny = int(std::lround(fyRaw));
-        const cv::Vec3f* nsrcRow =
-            (haveNormalSrc && ny >= 0 && ny < normalSrc.rows) ? normalSrc[ny] : nullptr;
 
         for (int dx = 0; dx < dw; ++dx) {
             const int x0 = x0v[dx];
@@ -881,34 +882,37 @@ void warpBicubicVec3fImpl(const cv::Mat_<cv::Vec3f>& src,
                 if (nrow) nrow[dx] = border;
                 continue;
             }
+            const int x1 = x1v[dx];
 
-            if (okRow && okRow[x0]) {
-                const float* wx4 = &wxv4[size_t(dx) * 4];
-                const float* dwx4 = &dwxv4[size_t(dx) * 4];
-                // Row-sum factorisation: read the 16 taps once, accumulating
-                // both the value and the d/dcol combination per row.
-                cv::Vec3f rowP[4], rowD[4];
-                for (int j = 0; j < 4; ++j) {
-                    const cv::Vec3f* r = src[y0 - 1 + j] + (x0 - 1);
-                    cv::Vec3f p(0.f, 0.f, 0.f), d(0.f, 0.f, 0.f);
-                    for (int i = 0; i < 4; ++i) {
-                        p += r[i] * wx4[i];
-                        d += r[i] * dwx4[i];
-                    }
-                    rowP[j] = p;
-                    rowD[j] = d;
-                }
-                cv::Vec3f P(0.f, 0.f, 0.f), Pu(0.f, 0.f, 0.f), Pv(0.f, 0.f, 0.f);
-                for (int j = 0; j < 4; ++j) {
-                    P  += rowP[j] * wy4[j];
-                    Pu += rowD[j] * wy4[j];    // d/dcol
-                    Pv += rowP[j] * dwy4[j];   // d/drow
-                }
+            if (sc >= 2 && sr >= 2 && completeQuad(valid, y0, x0)) {
+                const HermiteBasis& bx = bxv[dx];
+                const cv::Vec3f& p00 = row0[x0];
+                const cv::Vec3f& p01 = row0[x1];
+                const cv::Vec3f& p10 = row1[x0];
+                const cv::Vec3f& p11 = row1[x1];
+
+                const cv::Vec3f q0 = p00*bx.p0 + du(y0,x0)*bx.m0
+                                   + p01*bx.p1 + du(y0,x1)*bx.m1;
+                const cv::Vec3f q1 = p10*bx.p0 + du(y1,x0)*bx.m0
+                                   + p11*bx.p1 + du(y1,x1)*bx.m1;
+                const cv::Vec3f r0 = dv(y0,x0)*bx.p0 + duv(y0,x0)*bx.m0
+                                   + dv(y0,x1)*bx.p1 + duv(y0,x1)*bx.m1;
+                const cv::Vec3f r1 = dv(y1,x0)*bx.p0 + duv(y1,x0)*bx.m0
+                                   + dv(y1,x1)*bx.p1 + duv(y1,x1)*bx.m1;
+                const cv::Vec3f q0u = p00*bx.dp0 + du(y0,x0)*bx.dm0
+                                    + p01*bx.dp1 + du(y0,x1)*bx.dm1;
+                const cv::Vec3f q1u = p10*bx.dp0 + du(y1,x0)*bx.dm0
+                                    + p11*bx.dp1 + du(y1,x1)*bx.dm1;
+                const cv::Vec3f r0u = dv(y0,x0)*bx.dp0 + duv(y0,x0)*bx.dm0
+                                    + dv(y0,x1)*bx.dp1 + duv(y0,x1)*bx.dm1;
+                const cv::Vec3f r1u = dv(y1,x0)*bx.dp0 + duv(y1,x0)*bx.dm0
+                                    + dv(y1,x1)*bx.dp1 + duv(y1,x1)*bx.dm1;
+
+                const cv::Vec3f P = q0*by.p0 + r0*by.m0 + q1*by.p1 + r1*by.m1;
+                const cv::Vec3f Pu = q0u*by.p0 + r0u*by.m0 + q1u*by.p1 + r1u*by.m1;
+                const cv::Vec3f Pv = q0*by.dp0 + r0*by.dm0 + q1*by.dp1 + r1*by.dm1;
                 crow[dx] = P;
                 if (nrow) {
-                    // Pu x Pv keeps grid_normal_int's operand order (xv x yv),
-                    // so the normal's sign -- and with it --flip-normals and
-                    // the slice ordering -- is unchanged from the Linear path.
                     cv::Vec3f n{
                         Pu[1]*Pv[2] - Pu[2]*Pv[1],
                         Pu[2]*Pv[0] - Pu[0]*Pv[2],
@@ -927,94 +931,43 @@ void warpBicubicVec3fImpl(const cv::Mat_<cv::Vec3f>& src,
                 continue;
             }
 
-            // Fallback: exactly what Linear mode emits at this pixel.
-            const int x1 = x1v[dx];
+            // An incomplete 2x2 cell cannot define a surface patch. Preserve
+            // the legacy coordinate behavior; the validity pass normally masks
+            // these samples. There is deliberately no fallback between complete
+            // renderable cells, which is what prevents a new seam.
             const float wx = wxv[dx];
             crow[dx] = bilerpVec3f(row0[x0], row0[x1], row1[x0], row1[x1], wx, wy);
-            if (nrow) {
-                const int nx = nxv[dx];
-                nrow[dx] = (nsrcRow && nx >= 0 && nx < normalSrc.cols)
-                    ? nsrcRow[nx] : border;
-            }
+            if (nrow) nrow[dx] = border;
         }
     }
 }
 
-void warpBicubicReplicateVec3f(const cv::Mat_<cv::Vec3f>& src,
-                               const cv::Mat_<uint8_t>& cubicOk,
-                               const cv::Mat_<cv::Vec3f>& normalSrc,
+void warpHermiteReplicateVec3f(const cv::Mat_<cv::Vec3f>& src,
+                               const cv::Mat_<uint8_t>& valid,
+                               const cv::Mat_<cv::Vec3f>& du,
+                               const cv::Mat_<cv::Vec3f>& dv,
+                               const cv::Mat_<cv::Vec3f>& duv,
                                cv::Mat_<cv::Vec3f>& dstCoords,
                                cv::Mat_<cv::Vec3f>* dstNormals,
                                double ox, double oy, double sx, double sy,
                                const cv::Vec3f& normalBorder)
 {
-    warpBicubicVec3fImpl<false>(src, cubicOk, normalSrc, dstCoords, dstNormals,
+    warpHermiteVec3fImpl<false>(src, valid, du, dv, duv, dstCoords, dstNormals,
                                 ox, oy, sx, sy, normalBorder);
 }
 
-void warpBicubicConstVec3f(const cv::Mat_<cv::Vec3f>& src,
-                           const cv::Mat_<uint8_t>& cubicOk,
-                           const cv::Mat_<cv::Vec3f>& normalSrc,
+void warpHermiteConstVec3f(const cv::Mat_<cv::Vec3f>& src,
+                           const cv::Mat_<uint8_t>& valid,
+                           const cv::Mat_<cv::Vec3f>& du,
+                           const cv::Mat_<cv::Vec3f>& dv,
+                           const cv::Mat_<cv::Vec3f>& duv,
                            cv::Mat_<cv::Vec3f>& dstCoords,
                            cv::Mat_<cv::Vec3f>* dstNormals,
                            double ox, double oy, double sx, double sy,
                            const cv::Vec3f& border)
 {
-    warpBicubicVec3fImpl<true>(src, cubicOk, normalSrc, dstCoords, dstNormals,
+    warpHermiteVec3fImpl<true>(src, valid, du, dv, duv, dstCoords, dstNormals,
                                ox, oy, sx, sy, border);
-}
-
-// 4x4 box-AND of the vertex validity mask: cubicOk(r,c) != 0 iff the
-// Catmull-Rom stencil anchored at floor cell (r,c) -- rows/cols [r-1, r+2] --
-// is entirely in range and valid. Lets the warp above decide per pixel with a
-// single byte load instead of testing sixteen points.
-//
-// `components` are the [col_start, col_end) ranges of disconnected surface
-// components. A stencil is never allowed to span a seam, so cells within one
-// cell of a component edge are cleared -- those pixels fall back to bilinear,
-// which the per-component warp already confines to one component.
-//
-// Separable: a horizontal 4-run AND followed by a vertical one, O(rows*cols).
-cv::Mat_<uint8_t> buildCubicSupportMask(const cv::Mat_<uint8_t>& valid,
-                                        const std::vector<std::pair<int,int>>& components)
-{
-    const int rows = valid.rows, cols = valid.cols;
-    cv::Mat_<uint8_t> out(rows, cols, uint8_t(0));
-    if (rows < 4 || cols < 4) return out;
-
-    // Horizontal pass: h(r,c) = AND of valid(r, c-1 .. c+2).
-    cv::Mat_<uint8_t> h(rows, cols, uint8_t(0));
-    #pragma omp parallel for schedule(dynamic, 16)
-    for (int r = 0; r < rows; ++r) {
-        const uint8_t* v = valid[r];
-        uint8_t* d = h[r];
-        for (int c = 1; c <= cols - 3; ++c)
-            d[c] = (v[c-1] && v[c] && v[c+1] && v[c+2]) ? uint8_t(255) : uint8_t(0);
-    }
-
-    // Vertical pass over the horizontal runs.
-    #pragma omp parallel for schedule(dynamic, 16)
-    for (int r = 1; r <= rows - 3; ++r) {
-        const uint8_t* a = h[r-1];
-        const uint8_t* b = h[r];
-        const uint8_t* c2 = h[r+1];
-        const uint8_t* d2 = h[r+2];
-        uint8_t* o = out[r];
-        for (int c = 1; c <= cols - 3; ++c)
-            o[c] = (a[c] && b[c] && c2[c] && d2[c]) ? uint8_t(255) : uint8_t(0);
-    }
-
-    // Clear stencils that would straddle a component seam.
-    for (const auto& [c0, c1] : components) {
-        for (int r = 0; r < rows; ++r) {
-            uint8_t* o = out[r];
-            // A stencil anchored at c reads [c-1, c+2], so it must satisfy
-            // c0 <= c-1 and c+2 <= c1-1.
-            for (int c = std::max(0, c0); c < std::min(cols, c0 + 1); ++c) o[c] = 0;
-            for (int c = std::max(0, c1 - 2); c < std::min(cols, c1); ++c) o[c] = 0;
-        }
-    }
-    return out;
 }
 
 } // namespace
@@ -1431,7 +1384,9 @@ void QuadSurface::unloadPoints()
         _validMaskCache = cv::Mat_<uint8_t>();
         _validMaskAllValid = false;
         _normalCache = cv::Mat_<cv::Vec3f>();
-        _cubicSupportCache = cv::Mat_<uint8_t>();
+        _smoothDuCache.release();
+        _smoothDvCache.release();
+        _smoothDuvCache.release();
     }
     _needsLoad = true;
     if (DebugLoggingEnabled()) {
@@ -1446,7 +1401,9 @@ void QuadSurface::unloadCaches()
         _validMaskCache = cv::Mat_<uint8_t>();
         _validMaskAllValid = false;
         _normalCache = cv::Mat_<cv::Vec3f>();
-        _cubicSupportCache = cv::Mat_<uint8_t>();
+        _smoothDuCache.release();
+        _smoothDvCache.release();
+        _smoothDuvCache.release();
     }
     // Release loaded channel pixel data but keep the keys so channel(name)
     // still knows which channels exist on disk and can lazy-reload them.
@@ -1516,31 +1473,125 @@ cv::Mat_<uint8_t> QuadSurface::validMaskSnapshot(bool* allValid) const
     return mask;
 }
 
-cv::Mat_<uint8_t> QuadSurface::cubicSupportSnapshot() const
+void QuadSurface::smoothDerivativeSnapshots(cv::Mat_<cv::Vec3f>& du,
+                                            cv::Mat_<cv::Vec3f>& dv,
+                                            cv::Mat_<cv::Vec3f>& duv) const
 {
     const_cast<QuadSurface*>(this)->ensureLoaded();
     if (!_points || _points->empty()) {
-        return cv::Mat_<uint8_t>();
+        du.release(); dv.release(); duv.release();
+        return;
     }
-    // Built from the validity mask rather than a raw sentinel test: callers
-    // such as vc_render_tifxyz rewrite the -1 sentinel to NaN before rendering,
-    // and validMaskSnapshot() already treats both spellings as invalid.
-    cv::Mat_<uint8_t> valid = validMaskSnapshot(nullptr);
-    if (valid.empty()) {
-        return cv::Mat_<uint8_t>();
+    const cv::Mat_<uint8_t> valid = validMaskSnapshot(nullptr);
+
+    std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+    if (!_smoothDuCache.empty() && _smoothDuCache.size() == _points->size()) {
+        du = _smoothDuCache; dv = _smoothDvCache; duv = _smoothDuvCache;
+        return;
     }
 
-    // Same guard as the other derived caches: gen() calls this concurrently
-    // from the renderer's OMP tile loop. Readers keep the ref-counted Mat after
-    // unlocking, so eviction can drop it without freeing in-flight data.
-    std::lock_guard<std::mutex> cacheLock(_cacheMutex);
-    if (!_cubicSupportCache.empty() &&
-        _cubicSupportCache.rows == _points->rows &&
-        _cubicSupportCache.cols == _points->cols) {
-        return _cubicSupportCache;
+    const int rows = _points->rows, cols = _points->cols;
+    _smoothDuCache = cv::Mat_<cv::Vec3f>(rows, cols, cv::Vec3f(0,0,0));
+    _smoothDvCache = cv::Mat_<cv::Vec3f>(rows, cols, cv::Vec3f(0,0,0));
+    _smoothDuvCache = cv::Mat_<cv::Vec3f>(rows, cols, cv::Vec3f(0,0,0));
+
+    // Component bounds per column. Unlisted columns in a component-described
+    // surface stay disabled, so no derivative can cross a component seam.
+    std::vector<int> compBegin(cols, 0), compEnd(cols, cols);
+    if (!_components.empty()) {
+        std::fill(compBegin.begin(), compBegin.end(), -1);
+        std::fill(compEnd.begin(), compEnd.end(), -1);
+        for (const auto& [raw0, raw1] : _components) {
+            const int c0 = std::clamp(raw0, 0, cols);
+            const int c1 = std::clamp(raw1, 0, cols);
+            for (int c = c0; c < c1; ++c) {
+                compBegin[c] = c0;
+                compEnd[c] = c1;
+            }
+        }
     }
-    _cubicSupportCache = buildCubicSupportMask(valid, _components);
-    return _cubicSupportCache;
+
+    auto isValid = [&](int r, int c) {
+        return r >= 0 && r < rows && c >= 0 && c < cols &&
+               compBegin[c] >= 0 && valid(r,c) != 0;
+    };
+
+    // First derivatives. A complete quad guarantees that each corner has at
+    // least one neighbor on both axes; isolated valid vertices retain zero and
+    // are never consumed by the Hermite warp.
+#pragma omp parallel for schedule(dynamic, 16)
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            if (!isValid(r,c)) continue;
+            const cv::Vec3f& p = (*_points)(r,c);
+            const bool left = c > compBegin[c] && isValid(r,c-1);
+            const bool right = c + 1 < compEnd[c] && isValid(r,c+1);
+            if (left && right)
+                _smoothDuCache(r,c) = ((*_points)(r,c+1) - (*_points)(r,c-1)) * 0.5f;
+            else if (right)
+                _smoothDuCache(r,c) = (*_points)(r,c+1) - p;
+            else if (left)
+                _smoothDuCache(r,c) = p - (*_points)(r,c-1);
+
+            const bool up = isValid(r-1,c);
+            const bool down = isValid(r+1,c);
+            if (up && down)
+                _smoothDvCache(r,c) = ((*_points)(r+1,c) - (*_points)(r-1,c)) * 0.5f;
+            else if (down)
+                _smoothDvCache(r,c) = (*_points)(r+1,c) - p;
+            else if (up)
+                _smoothDvCache(r,c) = p - (*_points)(r-1,c);
+        }
+    }
+
+    // Mixed derivatives are also shared per vertex. The diagonal fast path is
+    // the standard Catmull-Rom central mixed difference. Near missing support,
+    // differentiate du along rows and dv along columns using the same
+    // centered/one-sided rule, then average the available estimates.
+#pragma omp parallel for schedule(dynamic, 16)
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            if (!isValid(r,c)) continue;
+            const bool left = c > compBegin[c] && isValid(r,c-1);
+            const bool right = c + 1 < compEnd[c] && isValid(r,c+1);
+            const bool up = isValid(r-1,c);
+            const bool down = isValid(r+1,c);
+            if (left && right && up && down &&
+                isValid(r-1,c-1) && isValid(r-1,c+1) &&
+                isValid(r+1,c-1) && isValid(r+1,c+1)) {
+                _smoothDuvCache(r,c) =
+                    ((*_points)(r+1,c+1) - (*_points)(r+1,c-1)
+                     - (*_points)(r-1,c+1) + (*_points)(r-1,c-1)) * 0.25f;
+                continue;
+            }
+
+            cv::Vec3f sum(0,0,0);
+            int count = 0;
+            if (up && down) {
+                sum += (_smoothDuCache(r+1,c) - _smoothDuCache(r-1,c)) * 0.5f;
+                ++count;
+            } else if (down) {
+                sum += _smoothDuCache(r+1,c) - _smoothDuCache(r,c);
+                ++count;
+            } else if (up) {
+                sum += _smoothDuCache(r,c) - _smoothDuCache(r-1,c);
+                ++count;
+            }
+            if (left && right) {
+                sum += (_smoothDvCache(r,c+1) - _smoothDvCache(r,c-1)) * 0.5f;
+                ++count;
+            } else if (right) {
+                sum += _smoothDvCache(r,c+1) - _smoothDvCache(r,c);
+                ++count;
+            } else if (left) {
+                sum += _smoothDvCache(r,c) - _smoothDvCache(r,c-1);
+                ++count;
+            }
+            if (count) _smoothDuvCache(r,c) = sum * (1.0f / float(count));
+        }
+    }
+
+    du = _smoothDuCache; dv = _smoothDvCache; duv = _smoothDuvCache;
 }
 
 void QuadSurface::writeValidMask(const cv::Mat& img)
@@ -1575,7 +1626,9 @@ void QuadSurface::invalidateCache()
     _validMaskCache = cv::Mat_<uint8_t>();
     _validMaskAllValid = false;
     _normalCache = cv::Mat_<cv::Vec3f>();
-    _cubicSupportCache = cv::Mat_<uint8_t>();
+    _smoothDuCache.release();
+    _smoothDvCache.release();
+    _smoothDuvCache.release();
 }
 
 void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
@@ -1624,25 +1677,20 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
 
     // Interpolation mode is carried on the surface (see setGenInterpolation).
     const bool smooth = (_genInterpolation == GenInterpolation::Smooth);
-    // Per-cell 4x4 support mask: tells the bicubic warp, pixel by pixel,
-    // whether the smooth stencil is backed by real points or whether it must
-    // fall back to the exact Linear result. Built lazily, Smooth mode only, so
-    // Linear allocates and computes nothing new.
-    const cv::Mat_<uint8_t> cubic_src =
-        smooth ? cubicSupportSnapshot() : cv::Mat_<uint8_t>();
+    cv::Mat_<cv::Vec3f> smooth_du, smooth_dv, smooth_duv;
+    if (smooth)
+        smoothDerivativeSnapshots(smooth_du, smooth_dv, smooth_duv);
     const cv::Vec3f qnVec(std::numeric_limits<float>::quiet_NaN(),
                           std::numeric_limits<float>::quiet_NaN(),
                           std::numeric_limits<float>::quiet_NaN());
 
     // --- normals: source-grid normal cache ---------------------------
-    // Hoisted above the coords warp because Smooth mode fuses positions and
-    // normals into a single pass and still needs this cache for the fallback
-    // pixels where the 4x4 cubic stencil is incomplete. Linear mode warps it
-    // separately, after the coords warp, exactly as before.
+    // Linear mode warps cached vertex normals separately. Smooth mode derives
+    // normals from the Hermite surface and never builds this cache.
     thread_local cv::Mat_<cv::Vec3f> normals_scratch_tls;
     cv::Mat_<cv::Vec3f>& normals_big = normals_scratch_tls;
     cv::Mat_<cv::Vec3f> normal_src;
-    if (need_normals) {
+    if (need_normals && !smooth) {
         // Build source-grid normal cache once per surface. Subsequent gen()
         // calls (panning, zooming) reuse it. Cleared by unloadCaches() when
         // a different surface becomes active. Snapshot under the same mutex
@@ -1679,8 +1727,8 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
             }
             normal_src = _normalCache;
         }
-        normals_big.create(h + 8, w + 8);
     }
+    if (need_normals) normals_big.create(h + 8, w + 8);
     cv::Mat_<cv::Vec3f>* normals_out = need_normals ? &normals_big : nullptr;
 
     if (!_components.empty()) {
@@ -1712,15 +1760,11 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
                 // component, so neither the cubic stencil nor the normal ever
                 // reads across a seam. (The Linear path below still warps
                 // normals from the whole-grid cache, as it always has.)
-                cv::Mat_<cv::Vec3f> compNormalSrc;
-                if (need_normals && !normal_src.empty())
-                    compNormalSrc = normal_src(cv::Rect(c0, 0, cw, rows));
                 if (need_normals) compNormals.create(h + 8, w + 8);
-                cv::Mat_<uint8_t> compCubic;
-                if (!cubic_src.empty())
-                    compCubic = cubic_src(cv::Rect(c0, 0, cw, rows));
-                warpBicubicConstVec3f(compPts, compCubic,
-                                      compNormalSrc, compCoords,
+                const cv::Rect compRect(c0, 0, cw, rows);
+                warpHermiteConstVec3f(compPts, valid_src(compRect),
+                                      smooth_du(compRect), smooth_dv(compRect),
+                                      smooth_duv(compRect), compCoords,
                                       need_normals ? &compNormals : nullptr,
                                       ox - c0, oy, sx, sy, nanV);
             } else {
@@ -1767,7 +1811,8 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
         // invalidation pass below sets them to NaN (black edges).
         coords_big.create(h + 8, w + 8);
         if (smooth) {
-            warpBicubicReplicateVec3f(*_points, cubic_src, normal_src,
+            warpHermiteReplicateVec3f(*_points, valid_src,
+                                      smooth_du, smooth_dv, smooth_duv,
                                       coords_big, normals_out,
                                       ox, oy, sx, sy, qnVec);
         } else {

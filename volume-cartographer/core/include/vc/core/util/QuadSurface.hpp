@@ -346,11 +346,10 @@ public:
     //           coarser than the render (scale 0.05 => one cell spans ~20x20
     //           output pixels), so the normal is piecewise-constant over those
     //           blocks and any surface offset along it steps at cell edges.
-    // Smooth  — bicubic (Catmull-Rom) positions with the normal differentiated
-    //           analytically from the same basis, so the position field is C1
-    //           and the normal field is continuous. Pixels whose 4x4 support is
-    //           incomplete (holes, grid border) fall back to the exact Linear
-    //           result, so the valid footprint is unchanged.
+    // Smooth  — bicubic Hermite positions with the normal differentiated from
+    //           the same basis. Centered derivatives reproduce Catmull-Rom in
+    //           the interior; shared one-sided derivatives keep the surface C1
+    //           next to holes, grid borders and component boundaries.
     //
     // Set this before any concurrent gen(); like setStrictQuadRenderValidity it
     // is not synchronized against in-flight renders.
@@ -400,6 +399,10 @@ public:
     void setComponents(std::vector<std::pair<int, int>> components)
     {
         _components = std::move(components);
+        std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+        _smoothDuCache.release();
+        _smoothDvCache.release();
+        _smoothDuvCache.release();
     }
 
     // Drop _points and all derived caches; ensureLoaded() will re-read from
@@ -455,11 +458,12 @@ public:
     // because gen() can be called from concurrent OMP threads.
     mutable std::atomic<bool> _validMaskAllValid{false};
     mutable cv::Mat_<cv::Vec3f> _normalCache;
-    // 4x4 Catmull-Rom support mask over the source grid, built lazily and only
-    // in Smooth mode. cubicOk(r,c) != 0 iff the stencil anchored at floor cell
-    // (r,c) is complete, so gen() can pick interpolant per pixel with one load
-    // instead of testing sixteen points.
-    mutable cv::Mat_<uint8_t> _cubicSupportCache;
+    // Per-vertex derivatives for the Smooth Hermite surface. Adjacent patches
+    // share these values, which makes both position and first derivatives agree
+    // at their common edge. Built lazily and only in Smooth mode.
+    mutable cv::Mat_<cv::Vec3f> _smoothDuCache;
+    mutable cv::Mat_<cv::Vec3f> _smoothDvCache;
+    mutable cv::Mat_<cv::Vec3f> _smoothDuvCache;
     // Guards derived-cache construction, invalidation and snapshot acquisition.
     // Readers retain immutable, reference-counted Mat snapshots after unlocking,
     // so unloadCaches() can evict the cache without freeing in-flight data.
@@ -550,8 +554,11 @@ protected:
 
 private:
     cv::Mat_<uint8_t> validMaskSnapshot(bool* allValid) const;
-    // Lazily built, _cacheMutex-guarded snapshot of _cubicSupportCache.
-    cv::Mat_<uint8_t> cubicSupportSnapshot() const;
+    // Lazily build and acquire ref-counted snapshots of the Smooth derivative
+    // caches. All three outputs have the same shape as _points.
+    void smoothDerivativeSnapshots(cv::Mat_<cv::Vec3f>& du,
+                                   cv::Mat_<cv::Vec3f>& dv,
+                                   cv::Mat_<cv::Vec3f>& duv) const;
 
     // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.
     void writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel = "");

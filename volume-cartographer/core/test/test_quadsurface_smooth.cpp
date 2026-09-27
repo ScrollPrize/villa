@@ -136,14 +136,21 @@ cv::Vec2d sourceCoordOf(const QuadSurface& s, cv::Size size, float scale, int dx
              uly + double(dy) * (double(gs[1]) / double(scale)) };
 }
 
-// Whether this output pixel takes the cubic path rather than the bilinear
-// fallback. Quality claims only apply where the cubic stencil actually runs:
-// on the fallback ring smooth output is *deliberately* identical to linear.
-bool cubicSupported(const QuadSurface& s, const cv::Mat_<cv::Vec3f>& pts,
-                   cv::Size size, float scale, int dx, int dy)
+// Whether all derivatives around this sample use centered Catmull-Rom
+// differences. Analytic accuracy comparisons exclude the one-sided outer ring;
+// continuity tests deliberately include it.
+bool centeredSupported(const QuadSurface& s, const cv::Mat_<cv::Vec3f>& pts,
+                       cv::Size size, float scale, int dx, int dy)
 {
     const cv::Vec2d src = sourceCoordOf(s, size, scale, dx, dy);
-    return loc_valid_cubic(pts, cv::Vec2d(src[1], src[0]));   // [y, x]
+    const int col = int(std::floor(src[0]));
+    const int row = int(std::floor(src[1]));
+    if (row < 1 || row > pts.rows - 3 || col < 1 || col > pts.cols - 3)
+        return false;
+    for (int r = row - 1; r <= row + 2; ++r)
+        for (int c = col - 1; c <= col + 2; ++c)
+            if (!finiteVec(pts(r,c)) || pts(r,c) == cv::Vec3f(-1,-1,-1)) return false;
+    return true;
 }
 
 float angleBetween(const cv::Vec3f& a, const cv::Vec3f& b)
@@ -287,6 +294,36 @@ TEST_CASE("smooth mode reproduces a plane exactly, with the exact constant norma
     REQUIRE(checked > 1000);
 }
 
+TEST_CASE("Hermite smooth mode matches Catmull-Rom in fully supported interiors")
+{
+    auto pts = makeWavyGrid(20, 20);
+    QuadSurface s(pts, cv::Vec2f(1.f, 1.f));
+    s.setGenInterpolation(GenInterpolation::Smooth);
+    const cv::Size size(120, 120);
+    const float scale = 6.0f;
+    auto g = genBoth(s, size, scale);
+
+    int checked = 0;
+    for (int r = 0; r < size.height; ++r) {
+        for (int c = 0; c < size.width; ++c) {
+            if (!centeredSupported(s, pts, size, scale, c, r)) continue;
+            const cv::Vec2d src = sourceCoordOf(s, size, scale, c, r);
+            const int x0 = int(std::floor(src[0]));
+            const int y0 = int(std::floor(src[1]));
+            float wx[4], wy[4];
+            vc::interp::catmullRomWeights4(float(src[0] - x0), wx);
+            vc::interp::catmullRomWeights4(float(src[1] - y0), wy);
+            cv::Vec3f reference(0,0,0);
+            for (int j = 0; j < 4; ++j)
+                for (int i = 0; i < 4; ++i)
+                    reference += pts(y0 - 1 + j, x0 - 1 + i) * (wx[i] * wy[j]);
+            CHECK(cv::norm(g.coords(r,c) - reference) < 2e-4);
+            ++checked;
+        }
+    }
+    CHECK(checked > 1000);
+}
+
 TEST_CASE("smooth normals track a cylinder's analytic normal far better than linear")
 {
     const float R = 40.0f, du = 0.05f;
@@ -306,7 +343,7 @@ TEST_CASE("smooth normals track a cylinder's analytic normal far better than lin
             const cv::Vec3f& p = gs.coords(r, c);
             if (!finiteVec(p) || !finiteVec(gs.normals(r, c))
                 || !finiteVec(gl.normals(r, c))) continue;
-            if (!cubicSupported(smo, pts, cv::Size(200, 100), 5.0f, c, r)) continue;
+            if (!centeredSupported(smo, pts, cv::Size(200, 100), 5.0f, c, r)) continue;
             // dP/du x dP/dv points outward, so the expected normal is radial
             // and outward — this pins the sign, not just the axis.
             cv::Vec3f radial(p[0], p[1], 0.f);
@@ -344,7 +381,7 @@ TEST_CASE("smooth normals track a sphere's analytic normal, with the right sign"
             const cv::Vec3f& p = gs.coords(r, c);
             if (!finiteVec(p) || !finiteVec(gs.normals(r, c))
                 || !finiteVec(gl.normals(r, c))) continue;
-            if (!cubicSupported(smo, pts, cv::Size(160, 160), 8.0f, c, r)) continue;
+            if (!centeredSupported(smo, pts, cv::Size(160, 160), 8.0f, c, r)) continue;
             cv::Vec3f radial = p / float(cv::norm(p));
             // Both modes must agree on orientation; compare each against the
             // radial axis, allowing a consistent global sign.
@@ -375,16 +412,12 @@ TEST_CASE("smooth normals are continuous across source-cell boundaries")
     auto gl = genBoth(lin, cv::Size(120, 120), scale);
     auto gs = genBoth(smo, cv::Size(120, 120), scale);
 
-    // Only the cubic interior: on the fallback ring smooth deliberately
-    // reproduces linear, including its step.
     auto maxJumpAlongRow = [&](const cv::Mat_<cv::Vec3f>& nrm, int row, int* n) {
         double worst = 0.0;
         for (int c = 1; c < nrm.cols; ++c) {
             const cv::Vec3f& a = nrm(row, c - 1);
             const cv::Vec3f& b = nrm(row, c);
             if (!finiteVec(a) || !finiteVec(b)) continue;
-            if (!cubicSupported(smo, pts, cv::Size(120, 120), scale, c, row)
-                || !cubicSupported(smo, pts, cv::Size(120, 120), scale, c - 1, row)) continue;
             ++*n;
             worst = std::max(worst, double(cv::norm(b - a)));
         }
@@ -429,8 +462,6 @@ TEST_CASE("offset layers are continuous in smooth mode")
             if (!finiteVec(g.coords(row, c)) || !finiteVec(g.normals(row, c))
                 || !finiteVec(g.coords(row, c - 1)) || !finiteVec(g.normals(row, c - 1)))
                 return worst;  // keep the scan contiguous
-            if (!cubicSupported(smo, pts, size, scale, c, row)
-                || !cubicSupported(smo, pts, size, scale, c - 1, row)) continue;
             worst = std::max(worst, double(cv::norm(layer(c) - layer(c - 1))));
         }
         return worst;
@@ -478,73 +509,83 @@ TEST_CASE("smooth mode leaves the valid footprint unchanged")
     }
 }
 
-TEST_CASE("pixels without complete 4x4 support fall back to the exact Linear result")
+TEST_CASE("smooth mode is continuous across the former border fallback boundary")
 {
     auto pts = makeWavyGrid(20, 20);
-    pts(9, 9) = cv::Vec3f(-1.f, -1.f, -1.f);
-
-    QuadSurface lin(pts, cv::Vec2f(1.f, 1.f));
     QuadSurface smo(pts, cv::Vec2f(1.f, 1.f));
     smo.setGenInterpolation(GenInterpolation::Smooth);
 
-    const float scale = 5.0f;
-    auto gl = genBoth(lin, cv::Size(100, 100), scale);
-    auto gs = genBoth(smo, cv::Size(100, 100), scale);
+    const float scale = 20.0f;
+    const cv::Size size(381, 381);
+    auto g = genBoth(smo, size, scale);
+    const int row = size.height / 2;
 
-    int fallbackPixels = 0, cubicPixels = 0;
-    for (int r = 0; r < gs.coords.rows; ++r)
-        for (int c = 0; c < gs.coords.cols; ++c) {
-            const cv::Vec2d src = sourceCoordOf(smo, cv::Size(100, 100), scale, c, r);
-            // loc_valid_cubic takes [y, x].
-            const bool supported = loc_valid_cubic(pts, cv::Vec2d(src[1], src[0]));
-            if (supported) { ++cubicPixels; continue; }
-            ++fallbackPixels;
-            for (int k = 0; k < 3; ++k) {
-                CHECK(sameOrBothNaN(gs.coords(r, c)[k], gl.coords(r, c)[k]));
-                CHECK(sameOrBothNaN(gs.normals(r, c)[k], gl.normals(r, c)[k]));
-            }
+    auto jump = [&](int a, int b, float offset) {
+        const cv::Vec3f pa = g.coords(row,a) + g.normals(row,a) * offset;
+        const cv::Vec3f pb = g.coords(row,b) + g.normals(row,b) * offset;
+        return double(cv::norm(pb - pa));
+    };
+
+    int seams = 0;
+    for (int c = 2; c + 1 < size.width; ++c) {
+        if (!finiteVec(g.coords(row,c-2)) || !finiteVec(g.normals(row,c-2)) ||
+            !finiteVec(g.coords(row,c+1)) || !finiteVec(g.normals(row,c+1))) continue;
+        const double xa = sourceCoordOf(smo, size, scale, c-1, row)[0];
+        const double xb = sourceCoordOf(smo, size, scale, c, row)[0];
+        const int edge = int(std::floor(xb));
+        if (std::floor(xa) == std::floor(xb) ||
+            (edge != 1 && edge != pts.cols - 2)) continue;
+        ++seams;
+        for (float offset : {0.0f, 25.0f}) {
+            const double at = jump(c-1, c, offset);
+            const double beside = std::max(jump(c-2, c-1, offset),
+                                           jump(c, c+1, offset));
+            INFO("edge=" << edge << " offset=" << offset
+                 << " seam=" << at << " neighboring=" << beside);
+            CHECK(at <= beside * 2.0 + 1e-4);
         }
-    // The hole plus the grid border must produce a meaningful fallback region,
-    // and the interior must actually take the cubic path.
-    REQUIRE(fallbackPixels > 100);
-    REQUIRE(cubicPixels > 1000);
+    }
+    CHECK(seams == 2);
 }
 
-TEST_CASE("loc_valid_cubic rejects incomplete support, NaN and the -1 sentinel")
+TEST_CASE("one-sided derivatives remain continuous around a hole")
 {
-    auto pts = makeWavyGrid(10, 10);
-    // Interior with full support.
-    CHECK(loc_valid_cubic(pts, cv::Vec2d(4.5, 4.5)));
-    // The stencil reaches [i-1, i+2], so the outer ring has no support.
-    CHECK_FALSE(loc_valid_cubic(pts, cv::Vec2d(0.5, 4.5)));
-    CHECK_FALSE(loc_valid_cubic(pts, cv::Vec2d(4.5, 0.5)));
-    CHECK_FALSE(loc_valid_cubic(pts, cv::Vec2d(8.5, 4.5)));
-    CHECK_FALSE(loc_valid_cubic(pts, cv::Vec2d(4.5, 8.5)));
-    // Too small a grid entirely.
-    CHECK_FALSE(loc_valid_cubic(makeWavyGrid(3, 3), cv::Vec2d(1.5, 1.5)));
-    // Non-finite input.
-    CHECK_FALSE(loc_valid_cubic(pts, cv::Vec2d(std::nan(""), 4.5)));
+    auto pts = makeWavyGrid(20, 20);
+    pts(10,10) = cv::Vec3f(-1.f, -1.f, -1.f);
+    QuadSurface smo(pts, cv::Vec2f(1.f, 1.f));
+    smo.setGenInterpolation(GenInterpolation::Smooth);
 
-    // Both spellings of "missing" must be rejected: vc_render_tifxyz rewrites
-    // the -1 sentinel to NaN before rendering, so both occur in practice.
-    auto sentinel = makeWavyGrid(10, 10);
-    sentinel(6, 6) = cv::Vec3f(-1.f, -1.f, -1.f);
-    CHECK_FALSE(loc_valid_cubic(sentinel, cv::Vec2d(4.5, 4.5)));   // 6 is in [3,6]
-    auto nanned = makeWavyGrid(10, 10);
-    nanned(6, 6) = cv::Vec3f(NAN, NAN, NAN);
-    CHECK_FALSE(loc_valid_cubic(nanned, cv::Vec2d(4.5, 4.5)));
+    const float scale = 20.0f;
+    const cv::Size size(381, 381);
+    auto g = genBoth(smo, size, scale);
 
-    // The xy-swapped form must agree with the coordinates transposed.
-    auto asym = makeWavyGrid(12, 12);
-    asym(3, 7) = cv::Vec3f(-1.f, -1.f, -1.f);
-    CHECK(loc_valid_cubic(asym, cv::Vec2d(4.5, 6.5))
-          == loc_valid_cubic_xy(asym, cv::Vec2d(6.5, 4.5)));
+    // Scan a row one source cell above the hole. All its quads are complete,
+    // but their derivative stencils transition from centered to one-sided and
+    // back. No jump there may dwarf its immediate neighbors.
+    int checked = 0;
+    for (int r = 0; r < size.height; ++r) {
+        const double sy = sourceCoordOf(smo, size, scale, 0, r)[1];
+        if (std::abs(sy - 9.5) > 0.026) continue;
+        for (int c = 2; c + 1 < size.width; ++c) {
+            const double sx = sourceCoordOf(smo, size, scale, c, r)[0];
+            if (sx < 7.0 || sx > 13.0) continue;
+            if (!finiteVec(g.coords(r,c-2)) || !finiteVec(g.normals(r,c-2)) ||
+                !finiteVec(g.coords(r,c+1)) || !finiteVec(g.normals(r,c+1))) continue;
+            auto layer = [&](int x) { return g.coords(r,x) + g.normals(r,x) * 25.f; };
+            const double at = cv::norm(layer(c) - layer(c-1));
+            const double beside = std::max(double(cv::norm(layer(c-1) - layer(c-2))),
+                                           double(cv::norm(layer(c+1) - layer(c))));
+            CHECK(at <= beside * 2.0 + 1e-4);
+            ++checked;
+        }
+    }
+    CHECK(checked > 50);
 }
 
 TEST_CASE("smooth mode does not blow up near holes")
 {
-    // Catmull-Rom overshoots on high-curvature data; the fallback rule is what
-    // keeps the riskiest neighbourhoods (hole edges) on the bilinear path.
+    // One-sided Hermite derivatives must not turn missing support into a wild
+    // excursion on the neighboring complete quads.
     auto pts = makeWavyGrid(24, 24);
     for (int r = 8; r < 12; ++r)
         for (int c = 8; c < 12; ++c) pts(r, c) = cv::Vec3f(-1.f, -1.f, -1.f);
@@ -607,7 +648,7 @@ TEST_CASE("smooth mode keeps component seams intact")
 TEST_CASE("smooth mode is safe under concurrent gen() calls")
 {
     // The renderer calls gen() per tile from an OMP parallel loop, so the new
-    // support-mask cache is built under contention exactly like _normalCache.
+    // derivative caches are built under contention exactly like _normalCache.
     auto pts = makeWavyGrid(40, 40);
     pts(10, 10) = cv::Vec3f(-1.f, -1.f, -1.f);
     QuadSurface s(pts, cv::Vec2f(1.f, 1.f));

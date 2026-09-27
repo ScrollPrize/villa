@@ -110,9 +110,9 @@ TEST_CASE("QuadSurface::gen bench: warm cache path is faster than cold")
 
 TEST_CASE("QuadSurface::gen bench: smooth mode cost relative to linear")
 {
-    // The Smooth (bicubic) mode reads 16 taps per pixel instead of 4, and
-    // differentiates the basis to get the normal, but it drops the separate
-    // nearest-normal warp and its second pass over the destination buffer.
+    // The Smooth (bicubic Hermite) mode reads four fields at four corners per
+    // pixel instead of 4 positions, and differentiates the same basis to get
+    // the normal, but drops the separate nearest-normal warp.
     // Both cases are WARM (caches built once), so this isolates the warp.
     const cv::Mat_<cv::Vec3f> grid = makeWavyGrid(kGrid, kGrid);
     const cv::Size tile(kTile, kTile);
@@ -122,7 +122,7 @@ TEST_CASE("QuadSurface::gen bench: smooth mode cost relative to linear")
     auto run = [&](GenInterpolation mode) {
         QuadSurface s(grid.clone(), cv::Vec2f(1.f, 1.f));
         s.setGenInterpolation(mode);
-        { // warm-up: build _normalCache, _validMaskCache and the support mask
+        { // warm-up: build validity and Smooth derivative caches
             cv::Mat_<cv::Vec3f> c, n;
             s.gen(&c, &n, tile, ptr, 1.0f, offset);
         }
@@ -146,7 +146,7 @@ TEST_CASE("QuadSurface::gen bench: smooth mode cost relative to linear")
     std::printf("  smooth / linear: %.2fx\n\n", tSmooth / tLinear);
 
     // A deliberately loose bound: it is there to catch an algorithmic blunder
-    // (an accidental per-pixel allocation, or the support mask being rebuilt
+    // (an accidental per-pixel allocation, or derivative caches being rebuilt
     // every call), not to pin a ratio on shared CI hardware.
     CHECK(tSmooth < tLinear * 12.0);
 }
