@@ -1521,12 +1521,22 @@ int main(int argc, char *argv[])
     // chunk failure), the check reports that it could not run and the surface
     // is kept; strict mode discards and fails instead, since the surface is
     // unverified.
+    // Filesystem cleanup must not throw: this lambda runs inside the sampling
+    // try/catch below, so a throwing cleanup would be misreported as a
+    // sampling failure on the first call and escape uncaught on the second.
     auto discard_seg_and_fail = [&]() -> int {
-        std::cerr << "discarding generated surface because "
-                     "require_on_prediction_support is set"
-                  << std::endl;
-        if (std::filesystem::exists(seg_dir)) {
-            std::filesystem::remove_all(seg_dir);
+        std::error_code ec;
+        if (std::filesystem::exists(seg_dir, ec) && !ec) {
+            std::filesystem::remove_all(seg_dir, ec);
+        }
+        if (ec) {
+            std::cerr << "WARNING: vc_grow_seg_from_seed: could not discard "
+                      << seg_dir << " (" << ec.message()
+                      << "); the rejected surface was left on disk" << std::endl;
+        } else {
+            std::cerr << "discarding generated surface because "
+                         "require_on_prediction_support is set"
+                      << std::endl;
         }
 #if defined(_WIN32)
         // See end of main(): skip CRT teardown, worker threads deadlock it.
@@ -1563,6 +1573,7 @@ int main(int argc, char *argv[])
         // already loaded by the growth itself. Fixed seed keeps the estimate
         // reproducible run to run.
         vc::surface::OnPredictionSupport background;
+        const char* bg_unavailable_reason = "no valid vertices to sample around";
         cv::Vec3f bb_lo, bb_hi;
         if (vc::surface::validVertexBounds(pts, bb_lo, bb_hi)) {
             constexpr float kBackgroundDilate = 64.0f;
@@ -1576,6 +1587,14 @@ int main(int argc, char *argv[])
                 std::min(static_cast<float>(volume_shape_zyx[1]), bb_hi[1] + kBackgroundDilate);
             const float hi_z =
                 std::min(static_cast<float>(volume_shape_zyx[0]), bb_hi[2] + kBackgroundDilate);
+            if (lo_x >= hi_x || lo_y >= hi_y || lo_z >= hi_z) {
+                // The dilated neighborhood does not intersect the volume
+                // (every valid vertex lies outside it): there is nothing to
+                // sample, so leave the background unavailable instead of
+                // constructing distributions with reversed bounds.
+                bg_unavailable_reason =
+                    "surface neighborhood does not intersect the volume";
+            } else {
             cv::Mat_<cv::Vec3f> bg_pts(kBackgroundSamples, 1);
             std::mt19937 bg_rng(42);
             std::uniform_real_distribution<float> bg_x(lo_x, hi_x);
@@ -1585,14 +1604,16 @@ int main(int argc, char *argv[])
                 bg_pts(i, 0) = cv::Vec3f(bg_x(bg_rng), bg_y(bg_rng), bg_z(bg_rng));
             }
             background = vc::surface::onPredictionSupport(bg_pts, sample_prediction);
+            bg_unavailable_reason = nullptr;
+            }
         }
         std::cout << "on-prediction support: " << std::fixed << std::setprecision(1)
                   << (support.fraction * 100.0) << "% (" << support.on << "/"
                   << support.total << " vertices on nonzero prediction; ";
         if (background.total == 0) {
-            // No valid vertices, so no neighborhood was sampled: report the
-            // background as unavailable rather than the default 1.0 fraction.
-            std::cout << "background unavailable: no valid vertices to sample around)";
+            // No neighborhood was sampled: report the background as
+            // unavailable rather than the default 1.0 fraction.
+            std::cout << "background unavailable (" << bg_unavailable_reason << ")";
         } else {
             std::cout << "background " << (background.fraction * 100.0) << "% over "
                       << background.total
