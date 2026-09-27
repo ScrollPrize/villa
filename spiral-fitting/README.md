@@ -103,6 +103,12 @@ This is not covered by scrollprize.org/tutorial_spiral. Required keys:
   cross-check (a mismatch is an error). Without them it is required and is
   read off the CT data by a person in VC3D, or from an already-fitted spiral.
 
+  > A fitted spiral carries the sense it was fitted with; fitting both
+  > senses and comparing `satisfied_tracks_fraction` did not discriminate
+  > them in the tested configuration (tracks-only, two scrolls, 1,500 and
+  > 30,000 steps). Five eligible First Letters volumes have no catalog
+  > z-direction and need a person in VC3D.
+
 Exported surfaces (the per-winding `meshes/`, the combined preview and
 `flatten_spiral_checkpoint.py`'s source surface) read like the scroll: column 0
 is the outermost wrap, U running outside to inside as orient-segment
