@@ -123,6 +123,7 @@ TEST_CASE("noBetterThanChance: flags surfaces at or below the background rate")
     auto make = [](double fraction) {
         OnPredictionSupport s;
         s.fraction = fraction;
+        s.total = 1000;  // a measured background: total != 0
         return s;
     };
     CHECK(noBetterThanChance(make(0.08), make(0.08)));   // equal: no better
@@ -147,6 +148,21 @@ TEST_CASE("onPredictionSupport: background rate matches prediction density")
     CHECK(res.fraction == doctest::Approx(1.0 / 8.0).epsilon(0.05));
 }
 
+TEST_CASE("noBetterThanChance: unmeasured background never warns")
+{
+    using vc::surface::noBetterThanChance;
+    using vc::surface::OnPredictionSupport;
+    // An empty surface leaves the background at its default (total 0,
+    // fraction 1.0); comparing two default 1.0 fractions must not warn.
+    const OnPredictionSupport empty;
+    CHECK(!noBetterThanChance(empty, empty));
+    CHECK(!noBetterThanChance(empty, OnPredictionSupport{0.03, 60, 2000}));
+    // Sanity: a measured background still behaves as before.
+    CHECK(noBetterThanChance(OnPredictionSupport{0.05, 50, 1000},
+                             OnPredictionSupport{0.06, 120, 2000}));
+    CHECK(!noBetterThanChance(OnPredictionSupport{0.7, 700, 1000},
+                              OnPredictionSupport{0.03, 60, 2000}));
+}
 TEST_CASE("isValidVertex: rejects sentinels and non-finite coordinates")
 {
     using vc::surface::isValidVertex;

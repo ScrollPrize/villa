@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 
@@ -61,10 +62,15 @@ inline bool validVertexBounds(const cv::Mat_<cv::Vec3f>& points, cv::Vec3f& lo, 
 // uniform random points in the surface's neighborhood. Absolute thresholds
 // cannot catch this on dense predictions, where even a random surface scores
 // high.
+//
+// A background with total == 0 was never measured (e.g. the surface had no
+// valid vertices, so there was no neighborhood to sample); without a measured
+// background there is nothing to compare against, so this returns false
+// rather than comparing two default 1.0 fractions.
 inline bool noBetterThanChance(const OnPredictionSupport& support,
                                const OnPredictionSupport& background)
 {
-    return support.fraction <= background.fraction;
+    return background.total != 0 && support.fraction <= background.fraction;
 }
 
 // Fraction of valid surface vertices that land on nonzero voxels of the
