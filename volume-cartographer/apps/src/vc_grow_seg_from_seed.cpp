@@ -1512,7 +1512,11 @@ int main(int argc, char *argv[])
             // Route this pre-existing unconditional cleanup through the same
             // shared-directory guard as the support check: with
             // --segment-name, seg_dir IS the shared target directory and
-            // must never be deleted.
+            // must never be deleted. A rejection is not an error, so a clean
+            // cleanup keeps the pre-existing exit-0 behavior; but a failed
+            // deletion leaves debris on disk, so report it as a tool failure
+            // (see #1906 review: a failed deletion must not report success).
+            bool discard_failed = false;
             switch (vc::surface::tryDiscardSegDir(segment_name, seg_dir,
                                                   owns_seg_dir)) {
                 case vc::surface::SegDirCleanup::Deleted:
@@ -1522,6 +1526,7 @@ int main(int argc, char *argv[])
                     std::cerr << "WARNING: vc_grow_seg_from_seed: could not "
                                  "discard "
                               << seg_dir << std::endl;
+                    discard_failed = true;
                     break;
                 case vc::surface::SegDirCleanup::Skipped:
                     std::cerr << "WARNING: vc_grow_seg_from_seed: the directory "
@@ -1536,9 +1541,9 @@ int main(int argc, char *argv[])
             // See end of main(): skip CRT teardown, worker threads deadlock it.
             std::cout.flush();
             std::cerr.flush();
-            std::_Exit(EXIT_SUCCESS);
+            std::_Exit(discard_failed ? EXIT_FAILURE : EXIT_SUCCESS);
 #else
-            return EXIT_SUCCESS;
+            return discard_failed ? EXIT_FAILURE : EXIT_SUCCESS;
 #endif
         }
     }
