@@ -65,6 +65,28 @@ def test_patch_embedding_equals_dense_map_at_the_same_place(version, expected_sh
         torch.testing.assert_close(encoder(patch, same=False)[0, :, 0, 0, 0].double(), dense[0, :, z, y, x].double())
 
 
+def test_infonce_embeddings_are_ct_only_and_query_order_has_no_effect():
+    torch.manual_seed(23)
+    model = IdentityFollower(config()).eval()
+    original = batch(model.cfg,1)
+    altered = copy.deepcopy(original)
+    permutation = torch.randperm(original['identity_points'].shape[1])
+    altered['identity_points'] = altered['identity_points'][:,permutation]
+    altered['x']['fine'][:,1] = 0.
+    altered['x']['coarse'].normal_()
+    altered['x']['patch_geometry'].normal_()
+    altered['hist'].normal_()
+    # Labels and bank membership never enter the model's image embedding path.
+    altered['foreign'].fill_(1)
+    altered['positive_mask'].zero_()
+    altered['negative_mask'].zero_()
+    with torch.no_grad():
+        a,b = forward(model,original),forward(model,altered)
+    torch.testing.assert_close(b['query_embedding'],a['query_embedding'][:,permutation])
+    torch.testing.assert_close(b['query_support'],a['query_support'][:,permutation])
+    torch.testing.assert_close(b['history_embedding'],a['history_embedding'])
+
+
 def test_default_fine_crop_fits_negative_patches_at_the_lateral_limit():
     cfg, rule = IdentityConfig(), ComponentRule()
     curve = np.c_[np.zeros(21), np.zeros(21), np.arange(21.)]

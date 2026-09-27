@@ -179,7 +179,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     opt.zero_grad(set_to_none=True)
     sums = dict(loss=0., geometry=0., confidence_loss=0., error_sum=0., geometry_count=0.,
                 correct_count=0., confidence_count=0.)
-    sources = np.zeros(3, dtype=np.int64)
+    sources = np.zeros(4, dtype=np.int64)
     identity = {}
     decisions, rankings = [], []
     model.train()
@@ -210,6 +210,10 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         for key in ('presence_dropped', 'foreign_components'):
             if key in cpu:
                 identity[key] = identity.get(key, 0.)+float((cpu[key] > 0).sum())
+        if 'negative_bank_shards' in cpu:
+            low,high = int(cpu['negative_bank_shards'].min()),int(cpu['negative_bank_shards'].max())
+            identity['negative_bank_shards_min'] = min(identity.get('negative_bank_shards_min',low),low)
+            identity['negative_bank_shards_max'] = max(identity.get('negative_bank_shards_max',high),high)
         if 'location_source' in cpu:
             for index, name in enumerate(LOCATION_SOURCES):
                 key = f'location_{name}'
@@ -219,7 +223,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count'):
             sums[key] += terms[key].detach().item()
         if 'source' in cpu:
-            for source in range(3):
+            for source in range(4):
                 sources[source] += int((cpu['source'] == source).sum())
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
     opt.step()
@@ -227,7 +231,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     sums.update(error_mean=sums['error_sum']/max(1., sums['geometry_count']),
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']),
                 fresh_fraction=float(sources[0]/total), fixed_fraction=float(sources[1]/total),
-                recent_fraction=float(sources[2]/total))
+                recent_fraction=float(sources[2]/total),bank_wrong_continuation_fraction=float(sources[3]/total))
     if identity:
         # Versioned separately from the distance metrics above.
         identity.update(identity_version=1, pair_sampling_version=PAIR_SAMPLING_VERSION,
@@ -283,6 +287,11 @@ def build_parser():
     ap.add_argument('--appearance-channels', type=int, default=32)
     ap.add_argument('--embedding', type=int, default=32)
     ap.add_argument('--negative-threshold', type=float, default=ComponentRule().threshold, help='Presence threshold for components')
+    ap.add_argument('--negative-bank', help='Live native-traced negative bank directory (or bank.json); use its validated paths for identity negatives')
+    ap.add_argument('--negative-bank-refresh-seconds', type=float, default=30., help='Each loader worker checks for completed new negative shards at this interval')
+    ap.add_argument('--negative-bank-cache-mb', type=float, default=64., help='Maximum cached negative geometry per loader worker')
+    ap.add_argument('--bank-wrong-continuation-probability', type=float, default=.75,
+                    help='Fraction of recent DAgger departure draws to replace with safe bank continuations when available')
     ap.add_argument('--presence-dropout', type=float, default=.25, help='Probability of zeroing both presence crops')
     ap.add_argument('--anchor-prob', type=float, default=.75, help='Training states given seed-segment anchors')
     ap.add_argument('--contacts', help='Mined contact episodes of the training fibers (oversampled)')
@@ -349,9 +358,8 @@ def main(argv=None):
     identity_sampling = IdentitySampling(
         rule=ComponentRule(threshold=args.negative_threshold), anchor_prob=args.anchor_prob,
         presence_dropout=args.presence_dropout, contact_fraction=args.contact_fraction,
-        hard_span_fraction=args.hard_span_fraction, lateral_fraction=args.lateral_fraction)
-    if min(args.identity_weight, args.identity_temperature) <= 0 and args.identity:
-        raise ValueError('Identity weight and temperature must be positive')
+        hard_span_fraction=args.hard_span_fraction, lateral_fraction=args.lateral_fraction,
+        bank_wrong_continuation_probability=args.bank_wrong_continuation_probability)
     initialized = None
     if args.init_tracer:
         progress(f'Loading follower weights from {args.init_tracer}')
@@ -360,6 +368,11 @@ def main(argv=None):
     if args.resume:
         progress(f'Loading resume checkpoint from {args.resume}')
         cfg = checkpoint_config(read_checkpoint(args.resume, ARCHITECTURES, args.device))
+    identity_enabled = isinstance(cfg,IdentityConfig)
+    if min(args.identity_weight,args.identity_temperature) <= 0 and identity_enabled:
+        raise ValueError('Identity weight and temperature must be positive')
+    if args.negative_bank and not identity_enabled:
+        raise ValueError('--negative-bank requires an identity follower')
     if not 1 <= args.n_commit <= cfg.n_future:
         raise ValueError('Commit window must fit forecast')
     # Native fine imagery, independently read coarse level-1 imagery.
@@ -378,16 +391,30 @@ def main(argv=None):
     if fiber_manifest(val_f) != manifest['fibers']:
         raise ValueError('Frozen validation geometry differs from dataset/holdout')
     resume = read_checkpoint(args.resume, ARCHITECTURES, args.device) if args.resume else None
+    negative_bank = None
+    if args.negative_bank:
+        from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
+        negative_bank = NeighborBank(args.negative_bank,train_f,band,grid_scale=spec.grid_scale,
+            refresh_seconds=args.negative_bank_refresh_seconds,cache_bytes=int(args.negative_bank_cache_mb*(1 << 20)))
+        negative_bank.validate_volume(spec)
+        if resume and (resume.get('negative_bank_provenance') is not None or resume['training_options'].get('negative_bank')):
+            negative_bank.validate_resume(resume.get('negative_bank_provenance'))
+        progress(f'Live negative bank: {negative_bank.shard_count} published shards, refresh every {args.negative_bank_refresh_seconds:g}s per worker')
     if resume:
         # The run directory may move; the checkpoint must still sit inside the named run.
         ignored = {'resume', 'out_root', 'device', 'batch', 'microbatch', 'workers', 'threads', 'worker_cache_gb',
-                   'log_every', 'ckpt_every', 'diag_every', 'dagger_device', 'compile', 'init_tracer'}
+                   'log_every', 'ckpt_every', 'diag_every', 'dagger_device', 'compile', 'init_tracer',
+                   'negative_bank_refresh_seconds','negative_bank_cache_mb'}
         parser = build_parser()
         for key, value in vars(args).items():
             if key in ('long_diag_every', 'long_diag_max_len') and key not in resume['training_options'] and not args.long_diag_every:
                 continue
             # Options added after a run started resume at their defaults.
             if key not in resume['training_options'] and value == parser.get_default(key):
+                continue
+            # Explicitly attaching a bank to an older run is permitted. Once
+            # attached, its immutable run identity is checked on every resume.
+            if key == 'negative_bank' and not resume['training_options'].get(key) and value:
                 continue
             if key not in ignored and resume['training_options'].get(key) != value:
                 raise ValueError(f'Resume option differs: {key}')
@@ -428,12 +455,12 @@ def main(argv=None):
         every=args.dagger_every, max_seeds=args.dagger_seeds, seed=args.seed, replay_keep=args.replay_keep,
         initial=[c._dir for c in caches], trace_len=args.dagger_trace_len, n_commit=args.n_commit,
         collector_module='vesuvius.neural_tracing.fiber_follow.regression.collect')
-    if args.identity:
+    if identity_enabled:
         contacts = load_contacts(args.contacts, train_f, band) if args.contacts else ()
         hard_spans = load_hard_spans(args.hard_spans, train_f) if args.hard_spans else ()
         progress(f'Identity sampling: {len(contacts)} contact episodes, {len(hard_spans)} hard spans')
         builder = IdentityObservationBuilder(cfg, train_f, identity_sampling, contacts=contacts,
-                                             hard_spans=hard_spans, augment=True)
+                                             hard_spans=hard_spans, augment=True,negative_bank=negative_bank)
     else:
         builder = ObservationBuilder(cfg)
     dataset = FollowDataset(train_f, spec, sample, band, chunk=args.microbatch, seed=args.seed+done,
@@ -446,16 +473,19 @@ def main(argv=None):
     loader = torch.utils.data.DataLoader(dataset, **loader_args)
     if not resume:
         (out/'config.json').write_text(json.dumps(dict(vars(args), architecture=model.architecture,
-            identity_sampling=asdict(identity_sampling) if args.identity else None,
+            identity_sampling=asdict(identity_sampling) if identity_enabled else None,
+            negative_bank_provenance=negative_bank.provenance() if negative_bank else None,
             model_cfg=cfg.to_dict(), sample_cfg=asdict(sample), vol_spec=spec.to_dict(),
             coarse_ct_level=1, coarse_ct_grid_scale=8., data_policy=DATA_POLICY,
             monitor_recovery_sha256=recovery_hash,
             seed_manifest_sha256=manifest['sha256'], fiber_manifest=fiber_manifest(fibers),
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
     log = RunLog(out/'log.jsonl', formatter=format_training_log)
-    if args.identity:
+    if identity_enabled:
         log.record(dict(step=done, event='identity_sampling', pair_sampling_version=PAIR_SAMPLING_VERSION,
-                        resume=args.resume, history_policy='full_shared_target_history'))
+                        resume=args.resume, history_policy='full_shared_target_history',
+                        negative_source='native_path_bank_v1' if negative_bank else 'crop_components',
+                        negative_bank_provenance=negative_bank.provenance() if negative_bank else None))
     tracer = None
     recovery_vol = FiberVolume(spec) if recovery_states is not None else None
     started = time.monotonic()
@@ -499,7 +529,8 @@ def main(argv=None):
 
             def save(path, resumable=False):
                 extra = dict(step=step, tolerance=args.tolerance, n_commit=args.n_commit,
-                    identity_sampling=asdict(identity_sampling) if args.identity else None,
+                    identity_sampling=asdict(identity_sampling) if identity_enabled else None,
+                    negative_bank_provenance=negative_bank.provenance() if negative_bank else None,
                     seed_manifest_sha256=manifest['sha256'], training_options=vars(args),
                     monitor_recovery_sha256=recovery_hash,
                     fiber_manifest=fiber_manifest(fibers))

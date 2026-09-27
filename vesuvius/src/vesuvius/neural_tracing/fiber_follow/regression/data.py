@@ -80,6 +80,7 @@ class IdentitySampling:
     hard_span_fraction: float = .1
     lateral_fraction: float = .1  # near earlier fresh states that had lateral components
     lateral_memory: int = 1024
+    bank_wrong_continuation_probability: float = .75
 
     def __post_init__(self):
         if isinstance(self.rule, dict):
@@ -90,6 +91,8 @@ class IdentitySampling:
             raise ValueError('Identity sampling probabilities must lie in [0, 1]; oversampling at most 1')
         if min(self.positives, self.negatives, self.lateral_memory) < 1 or self.contrast < 1:
             raise ValueError('Invalid identity sample counts or augmentation')
+        if not 0 <= self.bank_wrong_continuation_probability <= 1:
+            raise ValueError('Bank wrong-continuation probability must be in [0,1]')
 
 
 # Oversampled fresh locations, recorded per state.
@@ -214,14 +217,16 @@ class IdentityObservationBuilder(ObservationBuilder):
 
     Tracing and training call the same ``images``. Training additionally
     ``prepare``s each state (seed-segment anchors drawn from annotation,
-    augmentation draws) and receives identity targets from presence
-    components of the fine crop, computed before any presence dropout.
+    augmentation draws) and receives identity targets from a live validated
+    path bank when supplied, otherwise from fine-crop presence components.
+    Both sources are sampled before any presence dropout.
     """
     def __init__(self, cfg: IdentityConfig, fibers=None, sampling=IdentitySampling(), *,
-                 contacts=(), hard_spans=(), augment=False):
+                 contacts=(), hard_spans=(), augment=False, negative_bank=None):
         super().__init__(cfg)
         self.fibers, self.sampling, self.augment = fibers, sampling, augment
         self.contacts, self.hard_spans = list(contacts), list(hard_spans)
+        self.negative_bank = negative_bank
         self.lateral = deque(maxlen=sampling.lateral_memory)
         self.stats = dict(patch_seconds=0., patches=0, calls=0)
 
@@ -254,6 +259,18 @@ class IdentityObservationBuilder(ObservationBuilder):
         return x
 
     # -- training
+
+    def replace_replay(self, source, stratum, sample_cfg, rng):
+        """Prefer bank departures only within the recent DAgger departure slot."""
+        if (source != 2 or stratum != 4 or self.negative_bank is None
+                or rng.random() >= self.sampling.bank_wrong_continuation_probability):
+            return None
+        from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import wrong_continuation
+        for _ in range(3):
+            item = wrong_continuation(self.negative_bank,sample_cfg,rng)
+            if item is not None:
+                return item
+        return None
     def fresh_location(self, rng):
         s = self.sampling
         u = rng.random()
@@ -333,14 +350,18 @@ class IdentityObservationBuilder(ObservationBuilder):
                    identity_points=np.zeros((B, K*(1+M), 3), np.float32), patch_on_fiber=np.zeros((B, P), np.float32),
                    foreign=np.zeros((B, *shape), np.uint8), presence_dropped=np.zeros(B, np.float32),
                    location_source=np.zeros(B, np.float32), foreign_components=np.zeros(B, np.float32))
+        if self.negative_bank is not None:
+            out['negative_bank_shards'] = np.zeros(B, np.int64)
         presence = x['fine'][:, 1].numpy()
         for j, item in enumerate(items):
             if 'identity_curve' not in item:
                 continue
             rng = np.random.default_rng(item['identity_seed'])
-            found = lateral_components(presence[j], cfg.fine, item['identity_curve'], s.rule)
+            bank = self.negative_bank
+            found = (bank.candidates(item,cfg.fine,presence[j],s.rule) if bank is not None else
+                     lateral_components(presence[j], cfg.fine, item['identity_curve'], s.rule))
             extra = None
-            if item.get('offtrack'):
+            if bank is None and item.get('offtrack'):
                 # A departed head is a negative relative to its earlier history.
                 origin = np.zeros((1, 3))
                 label = volume_at(found['labels'], cfg.fine, origin)[0]
@@ -349,9 +370,18 @@ class IdentityObservationBuilder(ObservationBuilder):
             pos, pos_mask, neg, neg_mask = sample_pairs(
                 item['identity_curve'], presence[j], cfg.fine, found['local'], found['nearest'], rng,
                 positives=K, negatives=M, margin=(cfg.patch_crop.width-1)*cfg.fine.spacing/2,
-                rule=s.rule, extra_negative=extra, component_labels=found['labels'],
+                rule=s.rule, extra_negative=extra, component_labels=found.get('labels'),
+                centerlines=bank is not None,
                 appearance_crop=cfg.appearance_crop,
                 along_margin=(cfg.patch_crop.depth-1)*cfg.fine.spacing/2)
+            if bank is not None:
+                # Recheck float32 query coordinates against the whole target,
+                # including geometry outside this crop.
+                valid = neg_mask > 0
+                if valid.any():
+                    world = neg[valid] @ np.asarray(item['frame']).T+item['pos']
+                    neg_mask[valid] *= bank.clear_of_target(item['fiber_ref'][0],world)
+                out['negative_bank_shards'][j] = bank.shard_count
             out['positive_mask'][j], out['negative_mask'][j] = pos_mask, neg_mask
             out['identity_points'][j] = np.concatenate((pos, neg.reshape(-1, 3)))
             out['patch_on_fiber'][j] = item['patch_on_fiber']

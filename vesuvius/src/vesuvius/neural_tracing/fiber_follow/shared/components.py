@@ -14,7 +14,7 @@ from scipy.spatial import cKDTree
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid
 
 
-PAIR_SAMPLING_VERSION = 2
+PAIR_SAMPLING_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -71,7 +71,7 @@ def lateral_components(presence, crop: CropSpec, curve, rule: ComponentRule = Co
 
 def sample_pairs(curve, presence, crop, foreign_local, foreign_nearest, rng, *, positives=4, negatives=8,
                  forward=(1., 20.), margin=4., rule: ComponentRule = ComponentRule(), extra_negative=None,
-                 appearance_crop=None, along_margin=0., component_labels=None):
+                 appearance_crop=None, along_margin=0., component_labels=None, centerlines=False):
     """Positives on the annotation ahead, each with negatives beside it.
 
     Positives are spread over annotated points ``forward`` voxels ahead whose
@@ -83,6 +83,9 @@ def sample_pairs(curve, presence, crop, foreign_local, foreign_nearest, rng, *, 
     snapped back to the grid. Positives and their history are unchanged.
     ``extra_negative`` (e.g. a departed head) uses the same phase and support
     checks, but is exempt from the lateral/arc window; its component is required.
+    With ``centerlines``, both classes are sampled uniformly on their supplied
+    polylines with the same presence/support checks, without any grid snapping
+    or phase adjustment. This preserves the native-traced negative geometry.
     """
     curve = np.asarray(curve, np.float64)
     foreign_local = np.asarray(foreign_local, np.float64).reshape(-1, 3)
@@ -98,6 +101,8 @@ def sample_pairs(curve, presence, crop, foreign_local, foreign_nearest, rng, *, 
     neg = np.zeros((positives, negatives, 3), np.float32)
     neg_mask = np.zeros((positives, negatives), np.float32)
     eligible = np.flatnonzero((curve[:, 2] >= forward[0]) & (curve[:, 2] <= forward[1]) & supported(curve))
+    if centerlines:
+        eligible = eligible[volume_at(presence,crop,curve[eligible],order=1) >= rule.threshold]
     if not len(eligible) or len(curve) < 3:
         return pos, pos_mask, neg, neg_mask
     tree = cKDTree(curve)
@@ -105,7 +110,7 @@ def sample_pairs(curve, presence, crop, foreign_local, foreign_nearest, rng, *, 
     tangent = np.gradient(curve, axis=0)
     tangent /= np.maximum(np.linalg.norm(tangent, axis=-1, keepdims=True), 1e-9)
     foreign = np.zeros(np.shape(presence), np.float32)
-    if len(foreign_local):
+    if len(foreign_local) and not centerlines:
         index = np.rint(crop_indices(crop, foreign_local)).astype(np.int64)
         foreign[tuple(index.T)] = 1.
     extra_component = None
@@ -129,7 +134,7 @@ def sample_pairs(curve, presence, crop, foreign_local, foreign_nearest, rng, *, 
                     and volume_at(extra_component, crop, [point], order=1)[0] >= rule.threshold):
                 neg[k, 0], neg_mask[k, 0] = point, 1.
                 slots = 1
-        shifted = foreign_local+phase
+        shifted = foreign_local if centerlines else foreign_local+phase
         distance, nearest = tree.query(shifted)
         offset = shifted-curve[nearest]
         along = (offset*tangent[nearest]).sum(-1)
@@ -138,13 +143,14 @@ def sample_pairs(curve, presence, crop, foreign_local, foreign_nearest, rng, *, 
         keep = (supported(shifted) & (distance > rule.own_radius)
                 & (nearest > 0) & (nearest < len(curve)-1) & (lateral <= rule.lateral_max)
                 & (np.abs(arc[nearest]-arc[j]) <= rule.along_window)
-                & (weights >= rule.threshold)
-                & (volume_at(foreign, crop, shifted, order=1) >= rule.threshold))
+                & (weights >= rule.threshold))
+        if not centerlines:
+            keep &= volume_at(foreign,crop,shifted,order=1) >= rule.threshold
         candidates = np.flatnonzero(keep)
         take = min(negatives-slots, len(candidates))
         if take:
             p = weights[candidates]+1e-6
-            chosen = rng.choice(candidates, size=take, replace=False, p=p/p.sum())
+            chosen = rng.choice(candidates, size=take, replace=False, p=None if centerlines else p/p.sum())
             neg[k, slots:slots+take] = shifted[chosen]
             neg_mask[k, slots:slots+take] = 1.
     return pos, pos_mask, neg, neg_mask

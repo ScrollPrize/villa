@@ -4672,6 +4672,8 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     const vc::lasagna::NormalSampler* normalSampler,
     const FiberTraceProgressCallback& progress)
 {
+    validateTraceConfig(config);
+    requireNormalSamplerForNormalAwareSmoothness(config, normalSampler);
     if (!finitePoint(startPoint) || !finitePoint(outwardDirection)) {
         throw std::invalid_argument(
             "fiber extrapolation request contains a non-finite point or direction");

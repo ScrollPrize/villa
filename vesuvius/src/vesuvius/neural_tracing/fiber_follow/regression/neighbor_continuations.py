@@ -1,0 +1,73 @@
+"""Synthetic wrong-fiber history: annotated prefix, smooth bridge, traced tail."""
+import numpy as np
+
+from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import exact_nearest
+from vesuvius.neural_tracing.fiber_follow.shared.data import label_state
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
+    arclength, interp_at, frame_from_heading, random_rotation_about,
+)
+
+
+def wrong_continuation(bank, cfg, rng):
+    """No tracing or volume I/O; abstain if a safe connected history cannot fit.
+
+    Only the head and tail on the verified neighbor are labeled as departed.
+    The artificial bridge is observed history, never a positive future target.
+    """
+    draw = bank.draw_path(rng)
+    if draw is None:
+        return None
+    fi,line,arc_range = draw
+    fiber = bank.fibers[fi]
+    # Limit projection to the already validated target correspondence window.
+    lo = max(0,int(np.searchsorted(fiber.s,arc_range[0]))-2)
+    hi = min(len(fiber.s),int(np.searchsorted(fiber.s,arc_range[1]))+3)
+    target = fiber.points[lo:hi]
+    if len(target) < 2:
+        return None
+    _,_,segment,u = exact_nearest(line,target)
+    matched = fiber.s[lo+segment]+u*np.diff(fiber.s[lo:hi])[segment]
+    if matched[-1] < matched[0]:
+        line,matched = line[::-1],matched[::-1]
+    if np.any(np.diff(matched) < -1e-5):
+        return None
+    reverse = bool(rng.integers(2))
+    if reverse:
+        line,matched = line[::-1],matched[::-1]
+    own_points = fiber.points[::-1] if reverse else fiber.points
+    own_arc = fiber.length-fiber.s[::-1] if reverse else fiber.s
+    matched = fiber.length-matched if reverse else matched
+    s = arclength(line)
+    bridge_length = float(rng.uniform(16.,24.))
+    tail_length = float(rng.uniform(4.,12.))
+    if s[-1] < bridge_length+tail_length+4:
+        return None
+    start = float(rng.uniform(0.,s[-1]-bridge_length-tail_length-4))
+    finish,head = start+bridge_length,start+bridge_length+tail_length
+    samples = np.r_[np.arange(start,head,.25),head]
+    own_t = np.interp(samples,s,matched)
+    own = interp_at(own_points,own_arc,own_t)
+    neighbor = interp_at(line,s,samples)
+    phase = np.clip((samples-start)/bridge_length,0,1)
+    weight = phase**3*(10+phase*(-15+6*phase))  # zero first/second derivatives at both joins
+    transition = own*(1-weight[:,None])+neighbor*weight[:,None]
+    prefix_t = np.arange(max(0.,own_t[0]-cfg.n_history*cfg.history_step-4),own_t[0],.25)
+    path = np.concatenate((interp_at(own_points,own_arc,prefix_t),transition))
+    distance = arclength(path)
+    back = distance[-1]-np.arange(1,cfg.n_history+1)*cfg.history_step
+    mask = (back >= 0).astype(np.float32)
+    history = interp_at(path,distance,np.clip(back,0,distance[-1]))
+    pos = path[-1]
+    # The head and its recent tail must still be on the validated wrong fiber.
+    tail = interp_at(line,s,np.arange(finish,head+1e-9,.25))
+    if not bank.clear_of_target(fi,np.concatenate((tail,pos[None]))).all():
+        return None
+    heading = pos-interp_at(path,distance,np.array([distance[-1]-2]))[0]
+    if np.linalg.norm(heading) < 1e-6:
+        return None
+    frame = random_rotation_about(frame_from_heading(heading),rng.uniform(0,2*np.pi))
+    original_t = fiber.length-own_t[-1] if reverse else own_t[-1]
+    item = label_state(fiber,pos,frame,history,mask,cfg,t=original_t,reverse=reverse,offtrack=True)
+    item.update(fiber_ref=(fi,float(own_t[-1]),reverse),source=3,source_step=-1,stratum=4,
+                bank_transition_length=bridge_length,bank_tail_length=tail_length)
+    return item

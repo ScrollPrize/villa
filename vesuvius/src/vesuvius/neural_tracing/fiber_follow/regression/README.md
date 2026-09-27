@@ -281,8 +281,18 @@ Identity objective (`--identity-weight .5`, `--identity-temperature .1`):
 InfoNCE between the mean of the recent on-fiber history embeddings (at least
 two; on-fiber means within 1.5 voxels of the annotation) and four annotated
 positives 1–20 voxels ahead. Each positive competes only with up to eight
-negatives beside it (within two voxels along the fiber). Negatives come from
-fine-crop presence components (threshold `--negative-threshold .7`,
+negatives beside it (within two voxels along the fiber).
+
+For the validated native-traced neighbors, add
+`--negative-bank output/neighbor_negatives_bulk_v1`. Persistent loader workers
+discover completed new shards every 30 seconds, so the bank can grow while
+training runs. Unknown coverage stays masked, and held-out candidates are
+excluded. Cached geometry uses at most 64 MiB per worker by default. See
+[live bank usage and validation](neighbor_mining.md#live-training-integration),
+including attaching the bank when resuming an existing identity checkpoint.
+
+Without a bank, negatives come from fine-crop presence components
+(threshold `--negative-threshold .7`,
 26-connected). A component is the traced fiber's own if it comes within 1.5
 trace voxels of the annotation, so touching neighbors never become negatives.
 Other components qualify within 10 trace voxels laterally and count only where

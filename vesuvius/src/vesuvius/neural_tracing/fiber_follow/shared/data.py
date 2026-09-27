@@ -426,6 +426,23 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 and (not hasattr(self.batch_builder, 'footprint_allowed')
                      or self.batch_builder.footprint_allowed(item, self.exclude)))
 
+    def replay_item(self, draw, rng):
+        source,band,op,j = draw
+        if hasattr(self.batch_builder,'replace_replay'):
+            replacement = self.batch_builder.replace_replay(source,band,self.cfg,rng)
+            if replacement is not None:
+                replacement = self.prepare(replacement,rng)
+                if self.state_allowed(replacement):
+                    return replacement
+        # A missing/unsafe bank proposal preserves the original replay draw.
+        fi,t,reverse = int(op.fiber_idx[j]),float(op.t[j]),bool(op.reverse[j])
+        item = label_state(self.fibers[fi],op.pos[j],op.frame[j],op.hist[j],op.hmask[j],self.cfg,
+                           t=t,reverse=reverse,offtrack=bool(op.offtrack[j]))
+        item.update(source=source,stratum=band,source_step=op.provenance.get('step',-1) or -1,
+                    fiber_ref=(fi,self.fibers[fi].length-t if reverse else t,reverse))
+        item = self.prepare(item,rng)
+        return item if self.state_allowed(item) else None
+
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
         rng = np.random.default_rng(self.seed*1000 + (0 if info is None else info.id))
@@ -446,17 +463,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 draw = self.draw_replay(rng) if attempt < self.chunk*10 else None
                 item = None
                 if draw is not None:
-                    source,band,op,j = draw
-                    item = label_state(self.fibers[op.fiber_idx[j]], op.pos[j], op.frame[j],
-                                       op.hist[j], op.hmask[j], cfg, t=float(op.t[j]),
-                                       reverse=bool(op.reverse[j]), offtrack=bool(op.offtrack[j]))
-                    item['source'],item['stratum'] = source,band
-                    item['source_step'] = op.provenance.get('step', -1) or -1
-                    fi, t = int(op.fiber_idx[j]), float(op.t[j])
-                    item['fiber_ref'] = (fi, self.fibers[fi].length-t if op.reverse[j] else t, bool(op.reverse[j]))
-                    item = self.prepare(item, rng)
-                    if not self.state_allowed(item):
-                        item = None
+                    item = self.replay_item(draw,rng)
                 if item is None:
                     # A builder may oversample chosen locations; otherwise draw windows.
                     location = (self.batch_builder.fresh_location(rng)
