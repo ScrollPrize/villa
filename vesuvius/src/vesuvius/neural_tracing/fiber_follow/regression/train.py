@@ -179,7 +179,8 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     opt.zero_grad(set_to_none=True)
     sums = dict(loss=0., geometry=0., confidence_loss=0., error_sum=0., geometry_count=0.,
                 correct_count=0., confidence_count=0.)
-    sources = np.zeros(4, dtype=np.int64)
+    sources = np.zeros(5, dtype=np.int64)
+    bank_tails = []
     identity = {}
     decisions, rankings = [], []
     model.train()
@@ -223,15 +224,21 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count'):
             sums[key] += terms[key].detach().item()
         if 'source' in cpu:
-            for source in range(4):
+            for source in range(len(sources)):
                 sources[source] += int((cpu['source'] == source).sum())
+            if 'bank_tail_length' in cpu:
+                bank_tails.extend(cpu['bank_tail_length'][cpu['source'] == 3].tolist())
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
     opt.step()
     update_ema(ema, model, step, ema_decay)
     sums.update(error_mean=sums['error_sum']/max(1., sums['geometry_count']),
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']),
                 fresh_fraction=float(sources[0]/total), fixed_fraction=float(sources[1]/total),
-                recent_fraction=float(sources[2]/total),bank_wrong_continuation_fraction=float(sources[3]/total))
+                recent_fraction=float(sources[2]/total),bank_wrong_continuation_fraction=float(sources[3]/total),
+                bank_following_fraction=float(sources[4]/total))
+    sums.update(bank_wrong_continuation_tail_mean=float(np.mean(bank_tails)) if bank_tails else None,
+                bank_wrong_continuation_tail_min=min(bank_tails) if bank_tails else None,
+                bank_wrong_continuation_tail_max=max(bank_tails) if bank_tails else None)
     if identity:
         # Versioned separately from the distance metrics above.
         identity.update(identity_version=1, pair_sampling_version=PAIR_SAMPLING_VERSION,
@@ -246,6 +253,25 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         if rankings:
             sums['identity']['ranking'] = summarize_ranking(rankings)
     return sums
+
+
+def resolve_bank_tail_range(requested, resume=None):
+    """Old checkpoints keep their 4–12 voxel tails; new runs default to 4–128."""
+    from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import validate_tail_range
+    saved = resume['training_options'].get('bank_wrong_continuation_tail', (4., 12.)) if resume else None
+    value = validate_tail_range(requested if requested is not None else saved or (4., 128.))
+    if saved is not None and value != validate_tail_range(saved):
+        raise ValueError('Resume option differs: bank_wrong_continuation_tail')
+    return list(value)
+
+
+def resolve_bank_option(requested, resume, name, default, legacy):
+    """Resolve a new sampling option without silently changing old resumes."""
+    saved = resume['training_options'].get(name,legacy) if resume else None
+    value = requested if requested is not None else (saved if resume else default)
+    if resume and value != saved:
+        raise ValueError(f'Resume option differs: {name}')
+    return value
 
 
 def build_parser():
@@ -286,12 +312,20 @@ def build_parser():
     ap.add_argument('--identity-temperature', type=float, default=.1)
     ap.add_argument('--appearance-channels', type=int, default=32)
     ap.add_argument('--embedding', type=int, default=32)
-    ap.add_argument('--negative-threshold', type=float, default=ComponentRule().threshold, help='Presence threshold for components')
-    ap.add_argument('--negative-bank', help='Live native-traced negative bank directory (or bank.json); use its validated paths for identity negatives')
+    ap.add_argument('--negative-threshold', type=float, default=ComponentRule().threshold, help='Minimum interpolated presence for centerline pairs')
+    ap.add_argument('--negative-bank', help='Shared live bank for InfoNCE negatives, wrong continuations and following supervision')
+    ap.add_argument('--negative-lateral-max', type=float,
+                    help='Maximum identity-negative distance (new patch-query runs: inferred from the shared bank)')
+    ap.add_argument('--identity-query-patches', action=argparse.BooleanOptionalAction, default=None,
+                    help='Read matching CT patches for positive and negative queries, including outside the main crop (new identity runs: enabled)')
     ap.add_argument('--negative-bank-refresh-seconds', type=float, default=30., help='Each loader worker checks for completed new negative shards at this interval')
     ap.add_argument('--negative-bank-cache-mb', type=float, default=64., help='Maximum cached negative geometry per loader worker')
     ap.add_argument('--bank-wrong-continuation-probability', type=float, default=.75,
                     help='Fraction of recent DAgger departure draws to replace with safe bank continuations when available')
+    ap.add_argument('--bank-wrong-continuation-tail', type=float, nargs=2, metavar=('MIN', 'MAX'),
+                    help='Wrong-fiber tail range in trace voxels (new runs: 4 128; resume: saved range). Equal bounds fix the length.')
+    ap.add_argument('--bank-following-probability', type=float,
+                    help='Fraction of fresh draws from bank paths with ordinary following loss (new identity runs: 0.1; old resumes: 0)')
     ap.add_argument('--presence-dropout', type=float, default=.25, help='Probability of zeroing both presence crops')
     ap.add_argument('--anchor-prob', type=float, default=.75, help='Training states given seed-segment anchors')
     ap.add_argument('--contacts', help='Mined contact episodes of the training fibers (oversampled)')
@@ -299,7 +333,7 @@ def build_parser():
     ap.add_argument('--contact-fraction', type=float, default=.2, help='Fresh draws near contact episodes')
     ap.add_argument('--hard-span-fraction', type=float, default=.1)
     ap.add_argument('--lateral-fraction', type=float, default=.1,
-                    help='Fresh draws near earlier states with lateral presence components')
+                    help='Fresh draws near earlier states with bank negatives')
     ap.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True,
                     help='Compile follower training on CUDA (EMA, diagnostics and collection stay eager)')
     ap.add_argument('--seed', type=int, default=0)
@@ -355,24 +389,39 @@ def main(argv=None):
                    correction_limit=args.correction_limit, correction_steps=args.correction_steps)
     cfg = (IdentityConfig(**options, appearance_channels=args.appearance_channels, embedding=args.embedding)
            if args.identity else DirectConfig(**options))
-    identity_sampling = IdentitySampling(
-        rule=ComponentRule(threshold=args.negative_threshold), anchor_prob=args.anchor_prob,
-        presence_dropout=args.presence_dropout, contact_fraction=args.contact_fraction,
-        hard_span_fraction=args.hard_span_fraction, lateral_fraction=args.lateral_fraction,
-        bank_wrong_continuation_probability=args.bank_wrong_continuation_probability)
     initialized = None
+    resume = None
     if args.init_tracer:
         progress(f'Loading follower weights from {args.init_tracer}')
         initialized, _, _, _, _ = load_checkpoint(args.init_tracer, args.device)
         cfg = initialized.cfg
     if args.resume:
         progress(f'Loading resume checkpoint from {args.resume}')
-        cfg = checkpoint_config(read_checkpoint(args.resume, ARCHITECTURES, args.device))
+        resume = read_checkpoint(args.resume, ARCHITECTURES, args.device)
+        cfg = checkpoint_config(resume)
+    args.bank_wrong_continuation_tail = resolve_bank_tail_range(args.bank_wrong_continuation_tail, resume)
     identity_enabled = isinstance(cfg,IdentityConfig)
+    args.bank_following_probability = resolve_bank_option(args.bank_following_probability,resume,
+        'bank_following_probability',.1 if identity_enabled else 0.,0.)
+    args.identity_query_patches = resolve_bank_option(args.identity_query_patches,resume,
+        'identity_query_patches',identity_enabled,False)
+    identity_sampling = IdentitySampling(
+        rule=ComponentRule(threshold=args.negative_threshold), anchor_prob=args.anchor_prob,
+        presence_dropout=args.presence_dropout, contact_fraction=args.contact_fraction,
+        hard_span_fraction=args.hard_span_fraction, lateral_fraction=args.lateral_fraction,
+        bank_wrong_continuation_probability=args.bank_wrong_continuation_probability,
+        bank_wrong_continuation_tail=args.bank_wrong_continuation_tail,
+        bank_following_probability=args.bank_following_probability,query_patches=args.identity_query_patches)
+    if identity_enabled and not args.negative_bank:
+        raise ValueError('Identity training requires --negative-bank; presence-component negatives are retired')
     if min(args.identity_weight,args.identity_temperature) <= 0 and identity_enabled:
         raise ValueError('Identity weight and temperature must be positive')
     if args.negative_bank and not identity_enabled:
         raise ValueError('--negative-bank requires an identity follower')
+    if args.bank_following_probability and not args.negative_bank:
+        raise ValueError('--bank-following-probability requires --negative-bank')
+    if args.identity_query_patches and not identity_enabled:
+        raise ValueError('--identity-query-patches requires an identity follower')
     if not 1 <= args.n_commit <= cfg.n_future:
         raise ValueError('Commit window must fit forecast')
     # Native fine imagery, independently read coarse level-1 imagery.
@@ -390,7 +439,6 @@ def main(argv=None):
     progress(f'Loaded {len(train_f)} training fibers and {len(val_f)} validation fibers')
     if fiber_manifest(val_f) != manifest['fibers']:
         raise ValueError('Frozen validation geometry differs from dataset/holdout')
-    resume = read_checkpoint(args.resume, ARCHITECTURES, args.device) if args.resume else None
     negative_bank = None
     if args.negative_bank:
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
@@ -400,11 +448,21 @@ def main(argv=None):
         if resume and (resume.get('negative_bank_provenance') is not None or resume['training_options'].get('negative_bank')):
             negative_bank.validate_resume(resume.get('negative_bank_provenance'))
         progress(f'Live negative bank: {negative_bank.shard_count} published shards, refresh every {args.negative_bank_refresh_seconds:g}s per worker')
+    inferred_radius = (negative_bank.run['mining']['max_distance']
+                       if negative_bank is not None and args.identity_query_patches else ComponentRule().lateral_max)
+    args.negative_lateral_max = resolve_bank_option(args.negative_lateral_max,resume,
+        'negative_lateral_max',inferred_radius,ComponentRule().lateral_max)
+    identity_sampling = IdentitySampling(**{**asdict(identity_sampling),
+        'rule':ComponentRule(threshold=args.negative_threshold,lateral_max=args.negative_lateral_max)})
+    if args.negative_lateral_max > ComponentRule().lateral_max and not args.identity_query_patches:
+        raise ValueError('Outer-bank negatives require --identity-query-patches for full CT support')
     if resume:
         # The run directory may move; the checkpoint must still sit inside the named run.
         ignored = {'resume', 'out_root', 'device', 'batch', 'microbatch', 'workers', 'threads', 'worker_cache_gb',
                    'log_every', 'ckpt_every', 'diag_every', 'dagger_device', 'compile', 'init_tracer',
-                   'negative_bank_refresh_seconds','negative_bank_cache_mb'}
+                   'negative_bank_refresh_seconds','negative_bank_cache_mb',
+                   'bank_wrong_continuation_tail','bank_following_probability',
+                   'identity_query_patches','negative_lateral_max'}  # resolved and checked above
         parser = build_parser()
         for key, value in vars(args).items():
             if key in ('long_diag_every', 'long_diag_max_len') and key not in resume['training_options'] and not args.long_diag_every:
@@ -458,7 +516,7 @@ def main(argv=None):
     if identity_enabled:
         contacts = load_contacts(args.contacts, train_f, band) if args.contacts else ()
         hard_spans = load_hard_spans(args.hard_spans, train_f) if args.hard_spans else ()
-        progress(f'Identity sampling: {len(contacts)} contact episodes, {len(hard_spans)} hard spans')
+        progress(f'Identity sampling: {len(contacts)} contact episodes, {len(hard_spans)} hard spans; maximum negative lateral distance {identity_sampling.rule.lateral_max:g} voxels')
         builder = IdentityObservationBuilder(cfg, train_f, identity_sampling, contacts=contacts,
                                              hard_spans=hard_spans, augment=True,negative_bank=negative_bank)
     else:
@@ -483,8 +541,11 @@ def main(argv=None):
     log = RunLog(out/'log.jsonl', formatter=format_training_log)
     if identity_enabled:
         log.record(dict(step=done, event='identity_sampling', pair_sampling_version=PAIR_SAMPLING_VERSION,
+                        negative_lateral_max=identity_sampling.rule.lateral_max,
+                        bank_following_probability=identity_sampling.bank_following_probability,
+                        identity_query_patches=identity_sampling.query_patches,
                         resume=args.resume, history_policy='full_shared_target_history',
-                        negative_source='native_path_bank_v1' if negative_bank else 'crop_components',
+                        negative_source='native_path_bank_v1',negative_bank_path=str(negative_bank.root),
                         negative_bank_provenance=negative_bank.provenance() if negative_bank else None))
     tracer = None
     recovery_vol = FiberVolume(spec) if recovery_states is not None else None

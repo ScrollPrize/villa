@@ -115,7 +115,7 @@ def spot_images(items, batch, cfg, threshold, path, count=12):
 
 
 def read_cost(builder, items, vol, repeats=3):
-    """Wall time and source voxels for crops versus path patches, per decision."""
+    """Main-crop and history-patch read costs, excluding training query I/O."""
     cfg = builder.cfg
     crops = dict(fine=[], coarse=[], patches=[])
     for _ in range(repeats):
@@ -186,12 +186,14 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--contacts', required=True)
+    ap.add_argument('--negative-bank', required=True)
     ap.add_argument('--fibers', default=DATA['fibers'])
     ap.add_argument('--fiber-zarrs', default=DATA['fiber_zarrs'])
     ap.add_argument('--ct', default=DATA['ct'])
     ap.add_argument('--episodes', type=int, default=150)
     ap.add_argument('--uniform', type=int, default=150, help='Ordinary fresh states for comparison')
     ap.add_argument('--negative-threshold', type=float, default=ComponentRule().threshold)
+    ap.add_argument('--identity-query-patches', action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument('--gpu', action=argparse.BooleanOptionalAction, default=torch.cuda.is_available())
     ap.add_argument('--microbatch', type=int, default=16)
     ap.add_argument('--seed', type=int, default=0)
@@ -204,8 +206,13 @@ def main(argv=None):
     train, _ = split_fibers(fibers, band)
     contacts = load_contacts(args.contacts, train, band)
     cfg = IdentityConfig()
-    sampling = IdentitySampling(rule=ComponentRule(threshold=args.negative_threshold))
-    builder = IdentityObservationBuilder(cfg, train, sampling, contacts=contacts)
+    from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
+    bank = NeighborBank(args.negative_bank,train,band,grid_scale=spec.grid_scale)
+    bank.validate_volume(spec)
+    radius = bank.run['mining']['max_distance'] if args.identity_query_patches else ComponentRule().lateral_max
+    sampling = IdentitySampling(rule=ComponentRule(threshold=args.negative_threshold,lateral_max=radius),
+                                query_patches=args.identity_query_patches)
+    builder = IdentityObservationBuilder(cfg, train, sampling, contacts=contacts,negative_bank=bank)
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future, future_step=cfg.future_step,
                           recent_history_points=cfg.n_history, no_history_prob=0., short_history_prob=0.)
     vol = FiberVolume(spec, cache_bytes=2 << 30)

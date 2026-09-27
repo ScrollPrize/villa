@@ -33,7 +33,7 @@ def window_mean(values, mask, near):
 
 
 def foreign_failures(points, batch, cfg, count):
-    """Dense predicted points lying on a presence component beside the traced fiber."""
+    """Dense predictions in cells occupied by a validated neighboring path."""
     dense = F.interpolate(points.detach().float().transpose(1, 2), size=count, mode='linear',
                           align_corners=True).transpose(1, 2)
     foreign = batch['foreign']
@@ -47,7 +47,7 @@ def identity_terms(output, batch, cfg, temperature=.1):
 
     The anchor is the normalized mean over recent patches lying on the annotated
     fiber (at least two). Each annotated positive must outscore only the
-    presence-component negatives beside it (and a departed head); it never
+    validated centerline negatives beside it; it never
     has to reach similarity one. States without a scored positive contribute zero.
     """
     R = cfg.recent_patches
@@ -105,7 +105,7 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_tem
             auxiliary = torch.stack(losses).mean(0)
         geometry = .75*geometry+.25*auxiliary
     labels, known, _ = prefix_labels(output['points'], batch, tolerance, cfg.max_recovery_distance)
-    # Identity-aware labels: a point on a component beside the traced fiber is
+    # Identity-aware labels: a point on a validated neighboring fiber is
     # wrong even within the distance tolerance. Distance metrics keep their names.
     identity = 'foreign' in batch
     supervised, supervised_known = labels, known

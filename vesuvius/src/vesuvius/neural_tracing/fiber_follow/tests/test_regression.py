@@ -129,6 +129,8 @@ def test_microbatch_partition_keeps_objective_and_update():
     data = batch(cfg, 3)
     data['dense_mask'][0, 5:] = 0
     data['offtrack'][1] = 1
+    data['source'] = torch.tensor([3, 0, 3])
+    data['bank_tail_length'] = torch.tensor([16., 0., 128.])
     def take(value, sl):
         return {k: take(v, sl) for k, v in value.items()} if isinstance(value, dict) else value[sl]
     averages = [copy.deepcopy(m) for m in (a, bmodel)]
@@ -137,6 +139,11 @@ def test_microbatch_partition_keeps_objective_and_update():
                optimizer_update(bmodel, averages[1], optimizers[1],
                                 [take(data, slice(0, 1)), take(data, slice(1, 3))], 1, .001)]
     assert results[0]['loss'] == pytest.approx(results[1]['loss'], rel=2e-6)
+    for result in results:
+        assert result['bank_wrong_continuation_fraction'] == pytest.approx(2/3)
+        assert result['bank_wrong_continuation_tail_mean'] == 72.
+        assert result['bank_wrong_continuation_tail_min'] == 16.
+        assert result['bank_wrong_continuation_tail_max'] == 128.
     for p, q in zip(a.parameters(), bmodel.parameters()):
         torch.testing.assert_close(p, q, rtol=2e-5, atol=2e-7)
 

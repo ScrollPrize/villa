@@ -256,7 +256,7 @@ architecture is unchanged and its checkpoints load as before (the retired
 | Component | Default |
 | --- | --- |
 | History patches | Fine CT, 9 × 41 × 41 samples (±2 along, ±10 lateral trace voxels) in each point's own path frame |
-| Fine crop | 80 × 81 × 81 samples (±20 laterally, versus ±11.75), so candidates to ±10 see a full receptive field; lateral limit ±19 |
+| Fine crop | 80 × 81 × 81 samples (±20 laterally); prediction lateral limit ±19; training query patches can extend beyond this crop |
 | Patch layout | 32 recent patches every 4 voxels over 128; four seed-segment anchors every 4 voxels once the head is ≥144 voxels past the seed |
 | Patch tokens | Embedding plus centre, tangent and u axis in the head frame, log age, anchor flag |
 | Appearance encoder | CT only; stem and three pre-activation residual blocks (lateral dilations 1–6), width 32, per-voxel channel LayerNorm, 32-d L2-normalized output |
@@ -266,8 +266,12 @@ architecture is unchanged and its checkpoints load as before (the retired
 The encoder's receptive field is exactly one patch (9 × 41 × 41), and its norm never pools
 space. As a result, a patch's embedding equals the dense appearance map over
 the fine crop at the same place (a test checks this). Candidate, positive and
-negative embeddings are lookups in that map; patches are read once per
-decision from the committed path. Training anchors come from annotation
+negative embeddings in new runs come from separate, identical CT patches
+centered at each query (`--identity-query-patches`, enabled by default).
+Both classes use the head frame, the same 9 × 41 × 41 patch, encoder, and
+photometric augmentation. The main fine crop and transformer token sizes stay
+unchanged. Prediction evidence still uses the dense map; committed-path
+patches are read once per decision. Training anchors come from annotation
 144–2048 voxels behind (probability 0.75), while tracing uses the actual
 seed segment.
 
@@ -277,43 +281,94 @@ resumed, or used with `--init-tracer`. Start a fresh identity run to use the
 larger appearance encoder. The patch array contains about twice as many samples,
 and the fine crop about 55% more; rerun preflight for the intended microbatch.
 
+New runs sample smooth wrong-fiber tails over 4–128 trace voxels with
+`--bank-wrong-continuation-tail 4 128`; equal bounds fix the length. Use the
+shared bank `output/neighbor_negatives_bulk_r12_32_l80_160_v1` for all three
+bank roles. Bridges span 16–24 voxels for nearby paths; for paths more than
+12 voxels away, the bridge is at least twice the maximum separation.
+A stored path must fit the bridge, drawn tail, and margin: the 80–160 range
+does not guarantee a 128-voxel tail on every draw. Seed anchors stay on the original prefix; recent
+history may be entirely on the wrong fiber for long tails. Such states teach
+rejection but do not receive InfoNCE without enough recent on-target patches.
+Existing checkpoints resume with their saved range (4–12 for checkpoints made
+before this option). See [bank generation](neighbor_mining.md) for the launcher.
+
 Identity objective (`--identity-weight .5`, `--identity-temperature .1`):
 InfoNCE between the mean of the recent on-fiber history embeddings (at least
 two; on-fiber means within 1.5 voxels of the annotation) and four annotated
 positives 1–20 voxels ahead. Each positive competes only with up to eight
 negatives beside it (within two voxels along the fiber).
 
-For the validated native-traced neighbors, add
-`--negative-bank output/neighbor_negatives_bulk_v1`. Persistent loader workers
+Identity training requires the validated native-traced neighbors: add
+`--negative-bank output/neighbor_negatives_bulk_r12_32_l80_160_v1`. Persistent loader workers
 discover completed new shards every 30 seconds, so the bank can grow while
 training runs. Unknown coverage stays masked, and held-out candidates are
 excluded. Cached geometry uses at most 64 MiB per worker by default. See
 [live bank usage and validation](neighbor_mining.md#live-training-integration),
 including attaching the bank when resuming an existing identity checkpoint.
 
-Without a bank, negatives come from fine-crop presence components
-(threshold `--negative-threshold .7`,
-26-connected). A component is the traced fiber's own if it comes within 1.5
-trace voxels of the annotation, so touching neighbors never become negatives.
-Other components qualify within 10 trace voxels laterally and count only where
-their nearest annotation point is interior; that excludes gaps ahead or behind
-and space past unannotated ends. A departed
-replay head on presence is an extra negative. Confidence labels are
-identity-aware: a predicted point on such a component is wrong even inside the
-1.5-voxel tolerance. Distance metrics keep their names; identity metrics sit
-under `identity` in `log.jsonl` (`identity_version: 1`), including
-history-vs-neighbor ranking by patch age.
+Pair sampling version 3 uses exact centerline points for both classes. Target
+annotations and bank paths are interpolated at quarter-voxel arclength intervals,
+sampled uniformly, and checked against the same interpolated presence threshold
+(`--negative-threshold .7`) and full appearance receptive-field bounds. New
+runs infer `--negative-lateral-max` from the bank (32 for this outer bank).
+A wider presence-only search crop locates candidates; CT is read in the small
+query patches. The full read footprint is checked against the holdout before
+volume I/O. Paths are never expanded into tubes and neither class is snapped or phase-shifted
+off its line. Both use the same CT interpolation and appearance encoder.
+Fractional interpolation weights follow each line's
+actual coordinates; they are not forced to match by displacing the negatives.
+The pure-presence component sampler and arbitrary departed-head negatives have
+been removed. Ranking values from earlier sampling versions are not directly
+comparable.
 
-Pair sampling version 2 matches every negative's fractional feature-grid
-coordinates to its positive, including departed-head negatives. Both candidate
-embeddings therefore use the same trilinear interpolation weights. After shifting,
-negatives must retain interpolated presence and foreign-component membership,
-annotation separation and full appearance receptive-field support; lateral
-negatives also retain their arc and lateral bounds. Invalid negatives are masked
-instead of snapped to voxel centers. This fixes a positive/negative interpolation
-shortcut without changing model weights or checkpoint structure. The version is
-recorded in training metrics, sampling settings and a start/resume log event;
-ranking before and after this change is not directly comparable.
+Existing checkpoints retain their saved sampling mode; checkpoints made before
+these options use dense-map queries, a 12-voxel radius and no bank-following
+draws. To change those settings, start a new run, optionally with
+`--init-tracer CHECKPOINT`. Embedding evaluation uses the checkpoint's saved mode.
+
+The same bank supplies ordinary following supervision with
+`--bank-following-probability .1`: 10% of fresh draws attempt a training-eligible
+mined path (about 5% of all states when the 50/25/25 replay mixture is full).
+These states receive the same augmentation and geometry/confidence loss weights
+as primary annotations. Cut path ends are unknown, not stop labels; each state
+also passes the usual crop/history/label holdout checks. Its own mined path is
+the positive target, and the original annotated parent can supply negatives.
+An empty bank falls back to primary annotations. Logs report the realized
+`bank_following_fraction` (source 4).
+
+Confidence labels rasterize only cells containing validated centerline samples;
+each cell must entirely clear the original annotation's exclusion tube. The
+continuous query coordinates remain unchanged. Distance metrics keep their
+names; identity metrics sit under `identity` in `log.jsonl`.
+
+Bank paths also supply synthetic wrong-fiber continuations: an annotated prefix
+smoothly blends onto a verified neighbor, followed by a requested 4–128
+voxels on that neighbor. The bridge is observed history only; departed states
+have zero positive geometry supervision and teach confidence rejection.
+`--bank-wrong-continuation-probability .75` attempts this replacement for 75% of
+**recent DAgger departure draws**. Other drift strata, fixed replay and fresh
+allocations are unchanged. Unsafe or unavailable proposals retain the original
+replay sample. `bank_wrong_continuation_fraction` reports the actual batch share.
+
+Launch a fresh run using this single bank with:
+
+```bash
+bash scripts/launch_identity_shared_bank.sh
+```
+
+This uses effective batch 16, microbatch 4 and 12 loader workers while the
+five-worker miner runs at nice 19. It refuses to overwrite its run directory. Additional
+training options can be appended; `RUN_NAME` selects a different fresh run name.
+
+Real-data verification on 2026-09-27 used this bank and the CT/presence volumes
+listed in the launcher. `output/shared_bank_training_probe.py` exercised all
+three roles in one GPU optimizer update, including 23 primary-state negatives
+outside the main crop. Both following states had 61 geometry targets, and the
+wrong-continuation state had none and received known rejection labels.
+The report is `output/shared_bank_training_probe.json`. Its snapshot audit found
+519 stored paths in the 80–160 length range and zero duplicates under the
+configured overlap rule. This is a plumbing check, not a training-quality result.
 
 The complete available target history remains the shared anchor for every
 positive and negative in a comparison. Neighbor candidates are local patches;
@@ -327,9 +382,10 @@ Data: presence is zeroed in both crops for `--presence-dropout .25` of
 states, after identity targets are computed. Photometric contrast (×1/1.4–1.4),
 brightness (±0.1) and noise (σ ≤ 0.03) are drawn independently for the
 appearance copy of the fine crop and for the history patches; the
-localization crops are not augmented. Fresh draws are 20% near mined contact
+query patches share the appearance crop's augmentation parameters.
+The localization crops are not augmented. Primary fresh draws are 20% near mined contact
 episodes (`--contacts`), 10% on hard spans (`--hard-spans`), and 10% near
-earlier fresh states that had lateral components. Both files are checked
+earlier fresh states that had bank negatives. Both files are checked
 against the current fiber geometry. Every patch footprint and the identity
 label geometry pass the holdout check.
 
@@ -350,6 +406,7 @@ patch/crop sizes and negative-sampling defaults, in
 
 ```bash
 bash scripts/launch_regression.sh direct_identity_run1 --identity \
+  --negative-bank output/neighbor_negatives_bulk_v1 \
   --contacts "$PWD/output/direct_ct_spatial_run1/contacts.json" \
   --hard-spans "$PWD/output/hard_spans_8a0bb01095fa.json" \
   --batch 64 --microbatch 16 --workers 10
@@ -365,7 +422,7 @@ its quantiles, per-decision on-track vs departed confidence AUC (the stage-B
 definition), false stops and positions, latency, patch-read time and peak
 memory. It also writes a coverage-risk curve over `--thresholds` and paired
 fiber-bootstrap deltas against `--baseline-rows`. For identity checkpoints,
-`embedding` reports held-out ranking by history age, plus the prediction and
+`embedding --negative-bank BANK` reads evaluation-only paths and reports held-out ranking by history age, plus the prediction and
 confidence shifts when appearance tokens are masked or shuffled.
 
 ## Throughput

@@ -417,7 +417,10 @@ class FollowDataset(torch.utils.data.IterableDataset):
     def prepare(self, item, rng):
         """Let the batch builder attach geometry it reads later (e.g. path patches)."""
         if hasattr(self.batch_builder, 'prepare'):
-            return self.batch_builder.prepare(item, self.fibers[item['fiber_ref'][0]], rng)
+            fiber = item.get('supervision_fiber')
+            if fiber is None:
+                fiber = self.fibers[item['fiber_ref'][0]]
+            return self.batch_builder.prepare(item, fiber, rng)
         return item
 
     def state_allowed(self, item):
@@ -464,6 +467,10 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 item = None
                 if draw is not None:
                     item = self.replay_item(draw,rng)
+                if item is None and hasattr(self.batch_builder, 'replace_fresh'):
+                    item = self.batch_builder.replace_fresh(cfg,rng)
+                    if item is not None:
+                        item = self.prepare(item,rng)
                 if item is None:
                     # A builder may oversample chosen locations; otherwise draw windows.
                     location = (self.batch_builder.fresh_location(rng)

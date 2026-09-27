@@ -118,3 +118,20 @@ def test_terminal_blocks_preserve_json_and_format_events(tmp_path, capsys):
     assert 'dagger_launched: true' in printed and 'precision 95.0%' in printed
     assert '"refinement"' not in printed
     assert format_training_log(dict(dagger_discarded=True)) == 'Training | dagger_discarded: true'
+
+
+def test_bank_startup_prints_summary_but_keeps_complete_json_provenance(tmp_path,capsys):
+    row = dict(step=20000,event='identity_sampling',pair_sampling_version=3,
+               negative_bank_path='/data/neighbor_bank',
+               negative_bank_provenance=dict(run_digest='a'*64,
+                   shard_hashes={f'shards/{i:06d}':'b'*64 for i in range(1000)}))
+    path = tmp_path/'log.jsonl'
+    log = RunLog(path,formatter=format_training_log)
+    try:
+        log.record(row)
+    finally:
+        log.close()
+    printed = capsys.readouterr().out
+    assert len(printed) < 200 and '1,000 published shards' in printed
+    assert '/data/neighbor_bank' in printed and 'shards/000000' not in printed
+    assert json.loads(path.read_text()) == row

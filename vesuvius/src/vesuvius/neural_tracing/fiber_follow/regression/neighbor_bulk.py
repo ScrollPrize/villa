@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, OrderedDict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
 import hashlib
 import html
@@ -11,17 +11,18 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import shutil
 import time
 
 import numpy as np
-from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber, ZBand, fiber_manifest, load_fibers, split_fibers
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at, tangent_at
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import (
     MiningConfig, MiningResources, PolylineIndex, prediction_manifest, review_image,
-    seed_pairs, trace_controls, validate_path,
+    seed_pairs, trace_controls, validated_path,
 )
+from vesuvius.neural_tracing.fiber_follow.regression.neighbor_dedup import PathCoverage
 
 
 BANK_VERSION = 1
@@ -91,13 +92,18 @@ def shard_job(job):
     root, run, cfg, res = (_WORK[k] for k in ('root', 'run', 'cfg', 'resources'))
     fiber, index = worker_fiber(fi)
     record = run['fibers'][fi]
-    directory = root/'shards'/f'{fi:04d}'/f'{begin:06d}'
+    # Workers propose; only the coordinator may publish globally deduplicated
+    # shards. Unpublished proposals can be reused after an interruption.
+    relative = Path('shards')/f'{fi:04d}'/f'{begin:06d}'
+    directory = root/'pending'/relative.relative_to('shards')
     directory.mkdir(parents=True, exist_ok=True)
-    done = directory/'done.json'
+    done = directory/'proposal.json'
     if done.exists():
         result = json.loads(done.read_text())
         if result['run_digest'] != run['digest']:
             raise ValueError(f'Incompatible completed shard: {directory}')
+        if hashlib.sha256((directory/'bank.npz').read_bytes()).hexdigest() != result['bank_sha256']:
+            raise ValueError(f'Damaged proposal: {directory}')
         return result
     positions = anchor_positions(fiber.length, run['stride'], cfg)[begin:end]
     paths, ranges, eligible, anchors, rows, timings = [], [], [], [], [], []
@@ -117,17 +123,12 @@ def shard_job(job):
             elapsed = time.perf_counter()-before
             timings.append(elapsed)
             detail = native_detail
-            ok = False
             if path is not None:
-                ok, detail = validate_path(path, fiber.points, fiber.s, origin, presence, directions, support,
-                                           support_id, cfg, target_index=index)
-            if not ok:
+                path, detail = validated_path(path, fiber.points, fiber.s, origin, presence, directions, support,
+                                              support_id, cfg, target_index=index,
+                                              seed_center_arc=native_detail.get('seed_center_arc'))
+            if path is None:
                 rejected[detail['reason']] += 1
-                continue
-            # Do not fill the bank with repeat proposals of the same short path.
-            nearby = [k for k,a in enumerate(anchors) if abs(a-t) < cfg.seed_spacing+2*cfg.extrapolation]
-            if any(cKDTree(paths[k]).query(path)[0].max() < 2. for k in nearby):
-                rejected['duplicate'] += 1
                 continue
             name = f'a{ai:06d}_c{component:05d}'
             train = training_eligible(record['training_fiber'], origin, cfg, _WORK['band'])
@@ -149,13 +150,72 @@ def shard_job(job):
         np.savez(stream, **pack_paths(paths, ranges, eligible, anchors))
     bank.with_suffix('.tmp').replace(bank)
     write_json(directory/'candidates.json', rows)
-    relative = str(directory.relative_to(root))
-    result = dict(run_digest=run['digest'], fiber=fi, begin=begin, end=end, path=relative,
+    result = dict(run_digest=run['digest'], fiber=fi, begin=begin, end=end, path=str(relative),
                   anchor_range=[float(positions[0]), float(positions[-1])], anchors=len(positions),
                   candidates=len(paths), training_candidates=sum(eligible), attempted_traces=len(timings),
                   rejected=dict(rejected), seconds=time.perf_counter()-started,
                   native_seconds=timings, bank_sha256=hashlib.sha256(bank.read_bytes()).hexdigest())
-    write_json(done, result)  # Commit marker is last: interrupted shards safely rerun.
+    write_json(done, result)  # Proposal marker is last: incomplete work reruns.
+    return result
+
+
+def restore_coverage(root, completed, options):
+    """Rebuild from committed geometry only, never from in-flight proposals."""
+    coverage = PathCoverage(**options)
+    for row in sorted(completed,key=lambda r:(r['fiber'],r['begin'])):
+        bank = root/row['path']/'bank.npz'
+        if hashlib.sha256(bank.read_bytes()).hexdigest() != row['bank_sha256']:
+            raise ValueError(f'Damaged shard {bank}')
+        with np.load(bank,allow_pickle=False) as data:
+            for a,b in zip(data['offsets'][:-1],data['offsets'][1:]):
+                coverage.add(data['points'][a:b])
+    coverage.flush()
+    return coverage
+
+
+def commit_shard(root, run, proposal, coverage):
+    """The single coordinator accepts proposals in stable annotation/arc order.
+
+    A committed shard is immutable. This ordering and restoring its geometry
+    on resume make duplicate decisions independent of worker completion order.
+    """
+    if proposal['run_digest'] != run['digest']:
+        raise ValueError('Proposal run differs')
+    relative = Path(proposal['path'])
+    source = root/'pending'/relative.relative_to('shards')
+    destination = root/relative
+    if (destination/'done.json').exists():
+        raise FileExistsError(f'Shard already committed: {destination}')
+    if hashlib.sha256((source/'bank.npz').read_bytes()).hexdigest() != proposal['bank_sha256']:
+        raise ValueError(f'Damaged proposal {source}')
+    rows = json.loads((source/'candidates.json').read_text())
+    paths, ranges, eligible, anchors, kept = [], [], [], [], []
+    with np.load(source/'bank.npz',allow_pickle=False) as data:
+        for i,row in enumerate(rows):
+            path = data['points'][data['offsets'][i]:data['offsets'][i+1]]
+            if coverage.duplicate(path):
+                continue
+            coverage.add(path)
+            paths.append(path.copy())
+            ranges.append(data['arc_ranges'][i])
+            eligible.append(bool(data['train_eligible'][i]))
+            anchors.append(float(data['anchors'][i]))
+            kept.append(row)
+    destination.mkdir(parents=True,exist_ok=True)
+    for row in kept:
+        for suffix in ('.json','.png'):
+            shutil.copyfile(source/(row['id']+suffix),destination/(row['id']+suffix))
+    bank = destination/'bank.npz'
+    with bank.with_suffix('.tmp').open('wb') as stream:
+        np.savez(stream,**pack_paths(paths,ranges,eligible,anchors))
+    bank.with_suffix('.tmp').replace(bank)
+    write_json(destination/'candidates.json',kept)
+    rejected = Counter(proposal['rejected'])
+    rejected['duplicate'] += len(rows)-len(kept)
+    result = dict(proposal,candidates=len(kept),training_candidates=sum(eligible),rejected=dict(rejected),
+                  bank_sha256=hashlib.sha256(bank.read_bytes()).hexdigest())
+    write_json(destination/'done.json',result)  # Atomic commit after all outputs.
+    shutil.rmtree(source)
     return result
 
 
@@ -216,7 +276,7 @@ def fiber_gallery(root, run, fi, completed):
         f'<a href="../../index.html">All annotations</a><h1>{title}</h1><p>Both large panels show the same pair. Cyan: target annotation. Orange: proposed negative. Bottom: 3D separation.</p>'+''.join(entries))
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--fibers', required=True)
     ap.add_argument('--fiber-zarrs', required=True)
@@ -227,15 +287,29 @@ def main():
     ap.add_argument('--stride', type=float, default=8.)
     ap.add_argument('--workers', type=int, default=16)
     ap.add_argument('--anchors-per-shard', type=int, default=64)
+    ap.add_argument('--seed-spacing', type=float, default=20., help='Distance between tracing controls, in fiber-grid voxels')
+    ap.add_argument('--extrapolation', type=float, default=10., help='Trace length beyond each control, in fiber-grid voxels')
+    ap.add_argument('--min-path-length', type=float, help='Minimum retained path arclength; requires --max-path-length')
+    ap.add_argument('--max-path-length', type=float, help='Maximum retained path arclength; overrides --extrapolation')
+    ap.add_argument('--block-size', type=int, default=80, help='Validation cube side; at least maximum path length + 8')
+    ap.add_argument('--min-distance', type=float, default=0., help='Inner search radius from the target, in trace-grid voxels')
+    ap.add_argument('--max-distance', type=float, default=12., help='Outer search radius from the target, in trace-grid voxels')
     ap.add_argument('--val-z', type=float, nargs=2, default=(45000.,48500.))
     ap.add_argument('--resume', action='store_true')
     ap.add_argument('--max-shards', type=int, help='Bound a pilot; resume without this flag for the full sweep')
-    args = ap.parse_args()
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
+    args = ap.parse_args(argv)
     if not np.isfinite(args.stride) or args.stride <= 0 or min(args.workers,args.anchors_per_shard) < 1:
         ap.error('Stride and worker/shard sizes must be positive')
     if args.max_shards is not None and args.max_shards < 1:
         ap.error('max-shards must be positive')
-    cfg = MiningConfig()
+    cfg = MiningConfig(seed_spacing=args.seed_spacing, extrapolation=args.extrapolation, block_size=args.block_size,
+                       min_path_length=args.min_path_length, max_path_length=args.max_path_length,
+                       min_distance=args.min_distance, max_distance=args.max_distance)
     root = args.output.resolve()
     fibers = load_fibers(args.fibers, grid_scale=cfg.grid_scale)
     band = ZBand(*(np.asarray(args.val_z)/cfg.grid_scale))
@@ -244,12 +318,14 @@ def main():
     records = [dict(entry, length=f.length, tag=f.tag, training_fiber=f.name in train_names,
                     geometry=f'fibers/{i:04d}/geometry.npz') for i,(entry,f) in enumerate(zip(fiber_manifest(fibers), fibers))]
     pred = prediction_manifest(args.fiber_zarrs)
-    policy_files = [Path(__file__), Path(__file__).with_name('neighbor_mining.py')]
+    policy_files = [Path(__file__), Path(__file__).with_name('neighbor_mining.py'),
+                    Path(__file__).with_name('neighbor_dedup.py')]
     run = dict(version=BANK_VERSION, mining=asdict(cfg), stride=args.stride, anchors_per_shard=args.anchors_per_shard,
                excluded_z=[band.lo, band.hi], fibers=records, prediction_manifest=pred,
                ct=str(Path(args.ct).resolve()), ct_grid_scale=args.ct_grid_scale,
                native_build_python=str(Path(args.native_build_python).resolve()),
                implementation_sha256={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in policy_files},
+               deduplication=dict(distance=2.,overlap=.8,sample_step=1.,max_angle=25.),
                total_anchors=sum(len(anchor_positions(f.length,args.stride,cfg)) for f in fibers))
     run['digest'] = digest(run)
     root.mkdir(parents=True, exist_ok=True)
@@ -267,11 +343,14 @@ def main():
             destination.parent.mkdir(parents=True,exist_ok=True)
             np.savez(destination, points=fiber.points, s=fiber.s)
     jobs, completed = [], []
+    missing = False
     for fi, fiber in enumerate(fibers):
         count = len(anchor_positions(fiber.length,args.stride,cfg))
         for begin in range(0,count,args.anchors_per_shard):
             done = root/'shards'/f'{fi:04d}'/f'{begin:06d}'/'done.json'
             if done.exists():
+                if missing:
+                    raise ValueError('Committed shards must form an ordered prefix for deterministic deduplication')
                 row = json.loads(done.read_text())
                 if row['run_digest'] != run['digest']:
                     raise ValueError(f'Incompatible shard {done}')
@@ -280,6 +359,7 @@ def main():
                     raise ValueError(f'Damaged shard {bank}')
                 completed.append(row)
             else:
+                missing = True
                 jobs.append((fi,begin,min(count,begin+args.anchors_per_shard)))
     total_jobs = len(jobs)+len(completed)
     if args.max_shards:
@@ -288,11 +368,12 @@ def main():
     publish(root,run,completed,total_jobs,0.)
     print(f'{len(fibers)} annotations, {run["total_anchors"]:,} anchors; {len(jobs)} pending shards, {args.workers} workers',flush=True)
     changed = set()
+    coverage = restore_coverage(root,completed,run['deduplication'])
     with ProcessPoolExecutor(max_workers=args.workers, mp_context=multiprocessing.get_context('spawn'),
                              initializer=worker_init, initargs=(str(root),)) as pool:
         futures = [pool.submit(shard_job,job) for job in jobs]
-        for future in as_completed(futures):
-            row = future.result()
+        for future in futures:
+            row = commit_shard(root,run,future.result(),coverage)
             completed.append(row)
             changed.add(row['fiber'])
             now = time.perf_counter()

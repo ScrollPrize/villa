@@ -24,7 +24,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, inte
 
 class NeighborBank:
     """A live append-only bank; safe with persistent fork/spawn loader workers."""
-    def __init__(self, path, fibers, band, *, grid_scale=8., refresh_seconds=30., cache_bytes=64 << 20):
+    def __init__(self, path, fibers, band, *, grid_scale=8., refresh_seconds=30., cache_bytes=64 << 20, training=True):
         if not np.isfinite(refresh_seconds) or refresh_seconds < 0 or cache_bytes < 1:
             raise ValueError('Invalid negative-bank refresh interval or cache size')
         self.root = Path(path).resolve()
@@ -38,12 +38,12 @@ class NeighborBank:
         if band is None or self.run['excluded_z'] != [band.lo, band.hi]:
             raise ValueError('Negative-bank holdout differs from training')
         records = {r['name']:(i,r) for i,r in enumerate(self.run['fibers'])}
-        self.fibers, self.band = fibers, band
+        self.fibers, self.band, self.training = fibers, band, training
         self.fiber_ids = []
         for current in fiber_manifest(fibers):
             entry = records.get(current['name'])
-            if entry is None or not entry[1]['training_fiber']:
-                raise ValueError(f'Negative bank has no training annotation {current["name"]}')
+            if entry is None or entry[1]['training_fiber'] != training:
+                raise ValueError(f'Negative bank has no {"training" if training else "evaluation"} annotation {current["name"]}')
             if any(entry[1].get(k) != v for k,v in current.items()):
                 raise ValueError(f'Negative-bank annotation changed: {current["name"]}')
             self.fiber_ids.append(entry[0])
@@ -103,7 +103,8 @@ class NeighborBank:
                 raise ValueError('Invalid negative-bank fiber index')
             if shard['training_candidates'] and not self.run['fibers'][fi]['training_fiber']:
                 raise ValueError('Held-out annotation marked training eligible')
-            if shard['training_candidates']:
+            available = shard['training_candidates'] if self.training else shard['candidates']-shard['training_candidates']
+            if available:
                 by_fiber.setdefault(fi,[]).append(shard)
         for rows in by_fiber.values():
             rows.sort(key=lambda s:(s['begin'],s['path']))
@@ -155,9 +156,9 @@ class NeighborBank:
                 or int(eligible.sum()) != entry['training_candidates'] or data['anchors'].shape != (n,)):
             raise ValueError(f'Invalid negative-bank geometry: {key}')
         lines = {}
-        for i in np.flatnonzero(eligible):
+        for i in np.flatnonzero(eligible if self.training else ~eligible):
             line = p[offsets[i]:offsets[i+1]]
-            if line[:,2].min()-2 < self.band.hi and line[:,2].max()+2 >= self.band.lo:
+            if self.training and line[:,2].min()-2 < self.band.hi and line[:,2].max()+2 >= self.band.lo:
                 raise ValueError(f'Training negative crosses holdout: {key}')
             arc = arclength(line)
             # Same quarter-voxel arclength interpolation as the target annotation.
@@ -190,6 +191,8 @@ class NeighborBank:
 
     def draw_path(self, rng):
         """Uniform over published training paths belonging to this dataset."""
+        if not self.training:
+            return None
         self.refresh()
         local_ids = {global_id:local_id for local_id,global_id in enumerate(self.fiber_ids)}
         shards = [s for fi,rows in self._by_fiber.items() if fi in local_ids for s in rows]
@@ -214,7 +217,21 @@ class NeighborBank:
         tree,gap = self._target_tree(fi)
         return tree.query(np.asarray(world).reshape(-1,3))[0]-gap > self.exclusion
 
-    def candidates(self, item, crop, presence, rule):
+    def state_target_tree(self, item):
+        """Bank-following states are supervised against their own mined path."""
+        fiber = item.get('supervision_fiber')
+        if fiber is None:
+            return self._target_tree(item['fiber_ref'][0])
+        if '_supervision_tree' not in item:
+            item['_supervision_tree'] = (cKDTree(fiber.points),
+                float(np.linalg.norm(np.diff(fiber.points,axis=0),axis=1).max()/2))
+        return item['_supervision_tree']
+
+    def clear_of_state(self, item, world):
+        tree,gap = self.state_target_tree(item)
+        return tree.query(np.asarray(world).reshape(-1,3))[0]-gap > self.exclusion
+
+    def candidates(self, item, crop, presence, rule, *, mask_crop=None):
         """Exact centerline queries, with whole-annotation clearance.
 
         Confidence labels rasterize only cells containing these line samples;
@@ -223,8 +240,16 @@ class NeighborBank:
         """
         fi,t,reverse = item['fiber_ref']
         fiber = self.fibers[fi]
-        lines = self.paths(fi,fiber.length-t if reverse else t)
-        shape = (crop.depth,crop.width,crop.width)
+        if 'supervision_fiber' in item:
+            # The original annotated parent is a certified different fiber.
+            # Do not turn the mined positive itself into a negative by querying
+            # the parent's bank with this different path's arclength.
+            a,b = item['bank_parent_arc_range']
+            lines = [interp_at(fiber.points,fiber.s,np.arange(max(0.,a),min(fiber.length,b)+1e-9,.25))]
+        else:
+            lines = self.paths(fi,fiber.length-t if reverse else t)
+        mask_crop = crop if mask_crop is None else mask_crop
+        shape = (mask_crop.depth,mask_crop.width,mask_crop.width)
         mask = np.zeros(shape,bool)
         empty = dict(foreign=mask, local=np.empty((0,3)), nearest=np.empty(0,np.int64),
                      counts=dict(foreign_components=0))
@@ -233,19 +258,20 @@ class NeighborBank:
         pos, frame = np.asarray(item['pos']), np.asarray(item['frame'])
         local = np.concatenate([(p-pos) @ frame for p in lines])
         indices = crop_indices(crop,local)
-        near = np.all((indices >= 0) & (indices <= np.asarray(shape)-1),axis=1)
+        near = np.all((indices >= 0) & (indices <= np.asarray(presence.shape)-1),axis=1)
         local,indices = local[near],indices[near]
         if not len(local):
             return empty
-        tree, gap = self._target_tree(fi)
+        tree, gap = self.state_target_tree(item)
         keep = volume_at(presence,crop,local,order=1) >= rule.threshold
         keep &= tree.query(local @ frame.T+pos)[0]-gap > max(self.exclusion,rule.own_radius)
         nearest = cKDTree(item['identity_curve']).query(local)[1]
         keep &= (nearest > 0) & (nearest < len(item['identity_curve'])-1)
         local,nearest = local[keep],nearest[keep]
-        voxels = np.unique(np.rint(indices[keep]).astype(int),axis=0)
-        points = crop_local_grid(crop)[tuple(voxels.T)]
-        half_cell = np.sqrt(3)*crop.spacing/2
+        voxels = np.unique(np.rint(crop_indices(mask_crop,local)).astype(int),axis=0)
+        voxels = voxels[np.all((voxels >= 0) & (voxels < np.asarray(shape)),axis=1)]
+        points = crop_local_grid(mask_crop)[tuple(voxels.T)]
+        half_cell = np.sqrt(3)*mask_crop.spacing/2
         keep = tree.query(points @ frame.T+pos)[0]-gap-half_cell > max(self.exclusion,rule.own_radius)
         mask[tuple(voxels[keep].T)] = True
         return dict(foreign=mask, local=local, nearest=nearest,

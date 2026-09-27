@@ -1,4 +1,4 @@
-"""Regression checks for label-independent interpolation and full history anchors."""
+"""Regression checks for centerline sampling and full history anchors."""
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,72 +7,50 @@ import torch
 
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import identity_terms
 from vesuvius.neural_tracing.fiber_follow.shared.components import (
-    ComponentRule, crop_indices, lateral_components, sample_pairs, volume_at,
+    ComponentRule, sample_pairs,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid
 
 
 def fixture(width=41):
     crop = CropSpec(depth=45, width=width, behind=8, spacing=.5)
-    grid = crop_local_grid(crop)
     curve = np.c_[np.full(81, .13), np.full(81, -.17), np.linspace(-3.87, 12.13, 81)]
-    presence = ((np.abs(grid[..., 0]-4.) <= .8) & (np.abs(grid[..., 1]) <= .8)).astype(np.float32)
-    found = lateral_components(presence, crop, curve)
-    return crop, curve, presence, found
+    foreign = curve+np.array([4.06,.04,0.])
+    presence = np.ones((crop.depth,crop.width,crop.width),np.float32)
+    return crop,curve,presence,foreign
 
 
 @pytest.mark.parametrize('width', [40, 41])
-def test_negative_interpolation_weights_match_positive_and_keep_valid_support(width):
-    crop, curve, presence, found = fixture(width)
-    kwargs = dict(positives=4, negatives=8, margin=2., along_margin=1.,
-                  component_labels=found['labels'])
-    result = sample_pairs(curve, presence, crop, found['local'], found['nearest'],
-                          np.random.default_rng(7), **kwargs)
-    repeated = sample_pairs(curve, presence, crop, found['local'], found['nearest'],
-                            np.random.default_rng(7), **kwargs)
-    for a, b in zip(result, repeated):
-        np.testing.assert_array_equal(a, b)
-    pos, pm, neg, nm = result
+def test_centerline_queries_are_not_displaced_and_keep_valid_support(width):
+    crop,curve,presence,foreign = fixture(width)
+    kwargs = dict(positives=4, negatives=8, margin=2., along_margin=1.)
+    result = sample_pairs(curve,presence,crop,foreign,np.arange(len(foreign)),np.random.default_rng(7),**kwargs)
+    repeated = sample_pairs(curve,presence,crop,foreign,np.arange(len(foreign)),np.random.default_rng(7),**kwargs)
+    for a,b in zip(result,repeated):
+        np.testing.assert_array_equal(a,b)
+    pos,pm,neg,nm = result
     assert pm.all() and nm.all()
-    for p, points in zip(pos, neg):
-        assert np.linalg.norm(curve-p, axis=1).min() < 1e-6  # positive stays on annotation
-        difference = crop_indices(crop, points)-crop_indices(crop, [p])
-        np.testing.assert_allclose(difference, np.rint(difference), atol=2e-6)
-        assert np.all(volume_at(presence, crop, points, order=1) >= .7)
-        assert np.all(volume_at(found['foreign'], crop, points, order=1) >= .7)
-        assert np.all(np.linalg.norm(points[:, None]-curve[None], axis=-1).min(-1) > 1.5)
-        assert np.max(np.abs(points[:, 2]-p[2])) <= ComponentRule().along_window+.11
+    for p,points in zip(pos,neg):
+        assert np.linalg.norm(curve-p,axis=1).min() < 1e-6
+        assert (np.linalg.norm(foreign[:,None]-points[None],axis=-1).min(0) < 1e-6).all()
+        assert np.max(np.abs(points[:,2]-p[2])) <= ComponentRule().along_window+1e-6
     bounds = crop_local_grid(crop)
-    assert np.all(neg[..., 2] >= bounds[..., 2].min()+1.)
-    assert np.all(neg[..., 2] <= bounds[..., 2].max()-1.)
+    assert np.all(neg[...,2] >= bounds[...,2].min()+1.)
+    assert np.all(neg[...,2] <= bounds[...,2].max()-1.)
 
 
-def test_reject_shifted_negative_without_snapping_when_interpolated_presence_is_low():
-    crop = CropSpec(depth=25, width=25, behind=4, spacing=.5)
-    grid = crop_local_grid(crop)
-    curve = np.c_[np.full(30, .24), np.zeros(30), np.arange(30)*.25]
-    presence = ((grid[..., 0] == 4.) & (grid[..., 1] == 0.)).astype(np.float32)
-    found = lateral_components(presence, crop, curve)
-    assert len(found['local']) > 0
-    pos, pm, neg, nm = sample_pairs(curve, presence, crop, found['local'], found['nearest'],
-                                   np.random.default_rng(2), margin=0.)
-    assert pm.all() and not nm.any()  # shifted presence is at most .52, despite grid presence 1
+def test_same_presence_threshold_applies_to_positive_and_negative_queries():
+    crop,curve,presence,foreign = fixture()
+    presence.fill(.69)
+    _,pm,_,nm = sample_pairs(curve,presence,crop,foreign,np.arange(len(foreign)),np.random.default_rng(7))
+    assert not pm.any() and not nm.any()
 
 
-def test_departed_head_uses_same_phase_and_checks_component_and_receptive_field():
-    crop, curve, presence, found = fixture()
-    kwargs = dict(positives=2, negatives=1, margin=2., along_margin=1.,
-                  extra_negative=np.array([4., 0., 0.]), component_labels=found['labels'])
-    pos, pm, neg, nm = sample_pairs(curve, presence, crop, np.empty((0, 3)), np.empty(0, int),
-                                   np.random.default_rng(2), **kwargs)
-    assert pm.all() and nm.all()
-    diff = crop_indices(crop, neg[:, 0])-crop_indices(crop, pos)
-    np.testing.assert_allclose(diff, np.rint(diff), atol=2e-6)
-    # A head outside the appearance crop's full receptive field cannot supply a negative.
-    kwargs['appearance_crop'] = CropSpec(depth=30, width=41, behind=0, spacing=.5)
-    _, pm, _, nm = sample_pairs(curve, presence, crop, np.empty((0, 3)), np.empty(0, int),
-                                np.random.default_rng(2), **kwargs)
-    assert pm.any() and not nm.any()
+def test_missing_paths_and_receptive_field_exclusions_stay_unknown():
+    crop,curve,presence,foreign = fixture()
+    for points in (np.empty((0,3)),foreign+np.array([5.,0.,0.])):
+        _,pm,_,nm = sample_pairs(curve,presence,crop,points,np.empty(0,int),np.random.default_rng(7),margin=2.)
+        assert pm.all() and not nm.any()
 
 
 def test_full_target_history_scores_all_candidates_and_padding_has_no_effect():

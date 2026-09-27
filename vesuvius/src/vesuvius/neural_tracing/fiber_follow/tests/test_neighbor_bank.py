@@ -22,12 +22,12 @@ from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber, ZBand,
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, crop_local_grid
 
 
-def make_bank(root, *, refresh_seconds=0., with_path=False):
+def make_bank(root, *, refresh_seconds=0., with_path=False, training=True):
     root.mkdir(exist_ok=True)
     points = np.c_[np.zeros(201),np.zeros(201),np.arange(201.)]
     fiber = TracedFiber('target.json',points,arclength(points),'H',source_hash='source-hash')
     band = ZBand(1000.,1100.)
-    record = dict(fiber_manifest([fiber])[0],training_fiber=True,length=fiber.length,tag='H')
+    record = dict(fiber_manifest([fiber])[0],training_fiber=training,length=fiber.length,tag='H')
     run = dict(version=1,mining=asdict(MiningConfig()),excluded_z=[band.lo,band.hi],fibers=[record],
                prediction_manifest={'groups':{c:dict(zarr=f'/data/preds/{c}.ome.zarr/3')
                                                for c in ('presence','nx','ny')}},ct='/data/ct.zarr/1')
@@ -35,8 +35,8 @@ def make_bank(root, *, refresh_seconds=0., with_path=False):
     write_json(root/'run.json',run)
     publish(root,[])
     if with_path:
-        publish(root,[add_shard(root,0)])
-    return NeighborBank(root,[fiber],band,refresh_seconds=refresh_seconds),fiber
+        publish(root,[add_shard(root,0,eligible=training)])
+    return NeighborBank(root,[fiber],band,refresh_seconds=refresh_seconds,training=training),fiber
 
 
 def publish(root,shards):
@@ -47,14 +47,15 @@ def publish(root,shards):
     write_json(root/'bank.json',value)
 
 
-def add_shard(root,number,*,x=6.,eligible=True):
+def add_shard(root,number,*,x=6.,eligible=True,z_range=(72.,112.)):
     directory = root/'shards'/f'{number:04d}'
     directory.mkdir(parents=True,exist_ok=True)
-    points = np.array([[x,0.,72.],[x,0.,112.]])
+    lo,hi = z_range
+    points = np.array([[x,0.,lo],[x,0.,hi]])
     with (directory/'bank.npz').open('wb') as stream:
-        np.savez(stream,**pack_paths([points],[[72.,112.]],[eligible],[92.]))
+        np.savez(stream,**pack_paths([points],[[lo,hi]],[eligible],[(lo+hi)/2]))
     return dict(path=str(directory.relative_to(root)),fiber=0,begin=number,end=number+1,
-                anchor_range=[92.,92.],candidates=1,training_candidates=int(eligible),
+                anchor_range=[(lo+hi)/2]*2,candidates=1,training_candidates=int(eligible),
                 bank_sha256=hashlib.sha256((directory/'bank.npz').read_bytes()).hexdigest())
 
 
@@ -97,6 +98,24 @@ def test_unpublished_and_heldout_shards_are_not_training_negatives(tmp_path):
     assert not bank.paths(0,80.)
     publish(tmp_path,[heldout,first])
     assert len(bank.paths(0,80.)) == 1
+
+
+def test_evaluation_paths_are_available_only_in_explicit_evaluation_mode(tmp_path):
+    bank,fiber = make_bank(tmp_path,with_path=True,training=False)
+    assert len(bank.paths(0,80.)) == 1
+    assert bank.draw_path(np.random.default_rng(0)) is None
+    with pytest.raises(ValueError,match='no training annotation'):
+        NeighborBank(tmp_path,[fiber],bank.band)
+
+
+def test_identity_supervision_and_training_cli_require_a_bank():
+    builder = IdentityObservationBuilder(IdentityConfig())
+    with pytest.raises(ValueError,match='requires a negative bank'):
+        builder.identity_targets([], {})
+    from vesuvius.neural_tracing.fiber_follow.regression.train import main
+    with pytest.raises(ValueError,match='requires --negative-bank'):
+        main(['--name','unused','--fiber-zarrs','unused','--fibers','unused','--ct','unused',
+              '--manifest','unused','--device','cpu','--threads','1','--identity'])
 
 
 def test_changed_published_shards_fail_closed_and_resume_allows_growth(tmp_path):
@@ -160,14 +179,11 @@ def test_training_targets_stay_exactly_on_both_centerlines(tmp_path,reverse,angl
     rotation = np.array([[np.cos(angle),-np.sin(angle),0.],[np.sin(angle),np.cos(angle),0.],[0.,0.,1.]])
     state['frame'] = state['frame'] @ rotation
     state['identity_curve'] = state['identity_curve'] @ rotation
-    # The legacy component sampler would label the other tube. Bank mode must
-    # abstain until the producer actually publishes a validated negative.
+    # Presence alone must not supply negatives before a validated path arrives.
     images = {'fine':torch.ones(1,2,cfg.fine.depth,cfg.fine.width,cfg.fine.width)}
     world = crop_local_grid(cfg.fine) @ state['frame'].T+state['pos']
     tubes = ((abs(world[...,0]) < .85) | (abs(world[...,0]-6.) < .85)) & (abs(world[...,1]) < .85)
     images['fine'][0,1] = torch.from_numpy(tubes.astype(np.float32))
-    legacy = IdentityObservationBuilder(cfg,[fiber]).identity_targets([state],images)
-    assert legacy['negative_mask'].any()
     empty = builder.identity_targets([state],images)
     assert not empty['negative_mask'].any() and not empty['foreign'].any()
     publish(tmp_path,[add_shard(tmp_path,0,x=6.13)])
@@ -253,17 +269,23 @@ def test_foreign_cell_extent_cannot_reach_target_exclusion_tube(tmp_path):
 
 
 class BankProbe(torch.utils.data.Dataset):
-    def __init__(self,bank):
-        self.bank = bank
+    def __init__(self,bank,continuations=False):
+        self.bank,self.continuations = bank,continuations
     def __len__(self):
         return 1
     def __getitem__(self,index):
+        if self.continuations:
+            from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import wrong_continuation
+            from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
+            state = wrong_continuation(self.bank,SampleConfig(),np.random.default_rng(8),tail_length_range=(4.,12.))
+            return os.getpid(),int(state is not None)
         return os.getpid(),len(self.bank.paths(0,80.))
 
 
-def test_persistent_loader_worker_discovers_appended_paths_without_restart(tmp_path):
+@pytest.mark.parametrize('continuations',[False,True])
+def test_persistent_loader_worker_discovers_appended_paths_without_restart(tmp_path,continuations):
     bank,_ = make_bank(tmp_path)
-    loader = torch.utils.data.DataLoader(BankProbe(bank),batch_size=None,num_workers=1,
+    loader = torch.utils.data.DataLoader(BankProbe(bank,continuations),batch_size=None,num_workers=1,
         persistent_workers=True,prefetch_factor=1,multiprocessing_context='spawn')
     try:
         pid,before = next(iter(loader))

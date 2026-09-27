@@ -240,7 +240,13 @@ def run_embedding(args):
         raise ValueError('Embedding diagnostics need an identity checkpoint')
     _, val = load_split(args.fibers, manifest, spec.grid_scale)
     cfg = model.cfg
-    builder = IdentityObservationBuilder(cfg, val)
+    from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
+    bank = NeighborBank(args.negative_bank,val,ZBand(45000/spec.grid_scale,48500/spec.grid_scale),
+                        grid_scale=spec.grid_scale,training=False)
+    bank.validate_volume(spec)
+    from vesuvius.neural_tracing.fiber_follow.regression.data import IdentitySampling
+    sampling = IdentitySampling(**(ck.get('identity_sampling') or {}))
+    builder = IdentityObservationBuilder(cfg, val,sampling,negative_bank=bank)
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future, recent_history_points=cfg.n_history,
                           no_history_prob=0., short_history_prob=0.)
     rng = np.random.default_rng(20260926)
@@ -275,7 +281,8 @@ def run_embedding(args):
                     points=(other['points'][:, :4, :2]-out['points'][:, :4, :2]).float().norm(dim=-1).mean(1).cpu(),
                     confidence=(other['confidence'][:, 3]-out['confidence'][:, 3]).float().abs().cpu()))
     report = dict(identity_version=IDENTITY_VERSION, checkpoint=str(Path(args.checkpoint).resolve()), step=ck.get('step'),
-                  split=args.split, states=len(items), heldout_ranking=summarize_ranking(rankings))
+                  split=args.split, states=len(items), identity_query_patches=sampling.query_patches,
+                  negative_lateral_max=sampling.rule.lateral_max, heldout_ranking=summarize_ranking(rankings))
     for name, values in shifts.items():
         points = torch.cat([v['points'] for v in values]).numpy()
         confidence = torch.cat([v['confidence'] for v in values]).numpy()
@@ -294,6 +301,7 @@ def main(argv=None):
     ap.add_argument('--fibers', default=FIBERS)
     ap.add_argument('--subset', type=Path)
     ap.add_argument('--checkpoint')
+    ap.add_argument('--negative-bank', help='Required for embedding diagnostics; reads evaluation-only paths')
     ap.add_argument('--split', default='calibration', choices=('calibration', 'final'))
     ap.add_argument('--max-len', type=float, default=400.)
     ap.add_argument('--radius', type=float, default=6., help='Subset: proximity to another annotated fiber')
@@ -306,6 +314,8 @@ def main(argv=None):
         return make_subset(args)
     if args.subset is None or args.checkpoint is None:
         ap.error('rollouts and embedding need --subset and --checkpoint')
+    if args.mode == 'embedding' and not args.negative_bank:
+        ap.error('embedding requires --negative-bank')
     return run_rollouts(args) if args.mode == 'rollouts' else run_embedding(args)
 
 

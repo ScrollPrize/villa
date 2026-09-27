@@ -51,6 +51,10 @@ def _direct_training_lines(row):
              f" | mean error {row['error_mean']:.3f} voxels | prefix correct {row['prefix_correct_fraction']:.1%}",
              f"  data: fresh {row['fresh_fraction']:.0%} | fixed {row['fixed_fraction']:.0%}"
              f" | recent {row['recent_fraction']:.0%}"]
+    if 'bank_wrong_continuation_fraction' in row:
+        lines[-1] += f" | bank departures {row['bank_wrong_continuation_fraction']:.0%}"
+    if 'bank_following_fraction' in row:
+        lines[-1] += f" | bank following {row['bank_following_fraction']:.0%}"
     if 'identity' in row:
         lines.extend(_identity_lines(row['identity']))
     if 'decisions' in row:
@@ -65,7 +69,7 @@ def _identity_lines(stats):
              +f" | identity-aware prefix correct {stats.get('identity_prefix_correct_fraction', 0.):.1%}"
              +f" | labels flipped {int(stats.get('identity_flipped_count', 0))}",
              f"  identity data: presence dropped {stats.get('presence_dropped_fraction', 0.):.0%}"
-             f" | lateral components {stats.get('foreign_components_fraction', 0.):.0%}"
+             f" | neighbor coverage {stats.get('foreign_components_fraction', 0.):.0%}"
              +''.join(f" | {key[9:-9]} {value:.0%}" for key, value in stats.items()
                       if key.startswith('location_') and key.endswith('_fraction'))]
     if 'ranking' in stats:
@@ -76,6 +80,12 @@ def _identity_lines(stats):
 
 def format_training_log(row):
     step = f"Step {row['step']:,}" if 'step' in row else 'Training'
+    if row.get('event') == 'identity_sampling':
+        bank = row.get('negative_bank_provenance') or {}
+        return (f"{step} | identity sampling v{row.get('pair_sampling_version', '?')}"
+                f" | bank {row.get('negative_bank_path', '(see run configuration)')}"
+                f" | {len(bank.get('shard_hashes', {})):,} published shards"
+                f" | run {bank.get('run_digest', 'unknown')[:12]}")
     if 'recovery' in row:
         report = row['recovery']
         lines = [f"\n{step} | monitor recovery | {report['states']} states"]

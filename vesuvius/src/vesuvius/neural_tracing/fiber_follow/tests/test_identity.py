@@ -1,4 +1,4 @@
-"""Visual identity: path patches, lateral-component negatives, augmentation, holdout and gradients."""
+"""Visual identity: path patches, centerline negatives, augmentation, holdout and gradients."""
 import copy
 from dataclasses import replace
 from types import SimpleNamespace
@@ -15,7 +15,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.model import (
 )
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.train import load_checkpoint, optimizer_update, save_checkpoint
-from vesuvius.neural_tracing.fiber_follow.shared.components import ComponentRule, lateral_components, sample_pairs
+from vesuvius.neural_tracing.fiber_follow.shared.components import ComponentRule, sample_pairs
 from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig, TracedFiber, ZBand, crop_corners
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, sample_oriented_fast
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
@@ -87,17 +87,23 @@ def test_infonce_embeddings_are_ct_only_and_query_order_has_no_effect():
     torch.testing.assert_close(b['history_embedding'],a['history_embedding'])
 
 
-def test_default_fine_crop_fits_negative_patches_at_the_lateral_limit():
+def test_bank_radius_keeps_supported_diagonals_and_rejects_crop_edge_patches():
     cfg, rule = IdentityConfig(), ComponentRule()
+    from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import MiningConfig
+    assert rule.lateral_max == MiningConfig().max_distance
     curve = np.c_[np.zeros(21), np.zeros(21), np.arange(21.)]
-    foreign = np.array([[-rule.lateral_max, 0., 10.], [rule.lateral_max, 0., 10.]])
+    diagonal = rule.lateral_max/np.sqrt(2.)
+    foreign = np.array([[-diagonal, -diagonal, 10.], [diagonal, diagonal, 10.],
+                        [rule.lateral_max, 0., 10.], [9., 9., 10.]])
     presence = np.ones((cfg.fine.depth, cfg.fine.width, cfg.fine.width), np.float32)
     _, positive_mask, negative, negative_mask = sample_pairs(
-        curve, presence, cfg.fine, foreign, np.full(2, 10), np.random.default_rng(0),
-        positives=1, negatives=2, forward=(10., 10.),
+        curve, presence, cfg.fine, foreign, np.full(len(foreign), 10), np.random.default_rng(0),
+        positives=1, negatives=4, forward=(10., 10.),
         margin=(cfg.patch_crop.width-1)*cfg.patch_crop.spacing/2, rule=rule)
-    assert positive_mask.all() and negative_mask.all()
-    corners = negative[0, :, None]+crop_corners(cfg.patch_crop)[None]
+    assert positive_mask.all() and negative_mask.sum() == 2
+    selected = negative[0, negative_mask[0] > 0]
+    np.testing.assert_allclose(np.linalg.norm(selected[:,:2],axis=1),12.,atol=1e-6)
+    corners = selected[:, None]+crop_corners(cfg.patch_crop)[None]
     bounds = crop_corners(cfg.fine)
     assert (corners >= bounds.min(0)).all() and (corners <= bounds.max(0)).all()
 
@@ -145,36 +151,13 @@ def tube(shape, crop, center, radius=.9, along=None):
     return inside
 
 
-def test_lateral_rule_gap_touching_neighbor_and_disconnected_neighbor():
-    crop = CropSpec(depth=48, width=32, behind=8, spacing=.5)
-    shape = (crop.depth, crop.width, crop.width)
-    curve = np.stack((np.zeros(121), np.zeros(121), np.linspace(-4, 12, 121)), -1)  # annotation ends at c=12
-    presence = np.zeros(shape, np.float32)
-    presence[tube(shape, crop, (0, 0), along=(-4, 3))] = 1  # traced fiber ...
-    presence[tube(shape, crop, (0, 0), along=(4.5, 16))] = 1  # ... gap, then continuation past the annotation
-    presence[tube(shape, crop, (2, 0), along=(-4, 12))] = 1  # touching neighbor merges with the traced fiber
-    presence[tube(shape, crop, (-4, 0), along=(-4, 12))] = 1  # disconnected lateral neighbor
-    presence[tube(shape, crop, (0, -4), along=(14, 19))] = 1  # disconnected piece only ahead of the annotation end
-    found = lateral_components(presence, crop, curve, ComponentRule(lateral_max=6.))
-    foreign = found['foreign']
-    grid = crop_local_grid(crop)
-    assert foreign.any()
-    lateral = grid[foreign]
-    np.testing.assert_allclose(lateral[:, 0].mean(), -4, atol=.2)  # only the disconnected neighbor
-    assert not foreign[tube(shape, crop, (0, 0), along=(4.5, 16))].any()  # gap continuation is never negative
-    assert not foreign[tube(shape, crop, (2, 0))].any()
-    assert not foreign[tube(shape, crop, (0, -4), along=(14, 19))].any()  # ahead of the end is excluded
-    assert lateral[:, 2].max() < 12.01
-    rng = np.random.default_rng(0)
-    pos, pos_mask, neg, neg_mask = sample_pairs(curve, presence, crop, found['local'], found['nearest'], rng,
-                                                positives=3, negatives=4, margin=2.)
-    assert pos_mask.all() and neg_mask.all()
-    np.testing.assert_allclose(neg[..., 0], -4, atol=1.)
-    assert np.abs(neg[..., 2]-pos[:, None, 2]).max() <= 2.+crop.spacing/2  # same place along the fiber (voxel rounding)
-
-
 def real_like_builder(cfg, fibers, augment, **kwargs):
-    return IdentityObservationBuilder(cfg, fibers, IdentitySampling(**kwargs), augment=augment)
+    class EmptyBank:
+        shard_count = 0
+        def candidates(self,item,crop,presence,rule):
+            return dict(foreign=np.zeros_like(presence,bool),local=np.empty((0,3)),nearest=np.empty(0,int),
+                        counts=dict(foreign_components=0))
+    return IdentityObservationBuilder(cfg, fibers, IdentitySampling(**kwargs), augment=augment,negative_bank=EmptyBank())
 
 
 def fake_images(builder, items):
@@ -247,6 +230,19 @@ def test_presence_dropout_after_targets(monkeypatch):
     out = builder(items, None)
     assert seen[0] > 0 and out['x']['fine'][:, 1].abs().sum() == 0 and out['x']['coarse'][:, 1].abs().sum() == 0
     assert out['presence_dropped'].tolist() == [1.]
+
+
+def test_monitor_observations_need_no_negative_bank_or_identity_labels(monkeypatch):
+    from vesuvius.neural_tracing.fiber_follow.shared.data import make_sample
+    cfg = config()
+    builder = IdentityObservationBuilder(cfg)
+    sample = SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=cfg.n_future)
+    items = [make_sample(line_fiber(),400.,False,sample,np.random.default_rng(0))]
+    images = fake_images(builder,items)
+    monkeypatch.setattr(IdentityObservationBuilder,'images',lambda *a,**kw:images)
+    result = builder(items,None)
+    assert 'patches' in result['x'] and 'dense_mask' in result
+    assert 'identity_points' not in result and 'negative_mask' not in result
 
 
 def test_holdout_excludes_patch_footprints_beyond_the_crops():

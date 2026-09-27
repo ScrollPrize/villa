@@ -415,6 +415,9 @@ class IdentityFollower(DirectFollower):
     copy of the fine CT channel (training only). The decoder memory, the
     correction head and the confidence head attend to the appearance tokens.
     ``queries`` (B, N, 3) returns appearance embeddings for the identity loss.
+    Training may supply ``identity_query_patches`` (B, N, D, W, W) and
+    ``identity_query_mask`` for full CT support beyond the main crop. Both
+    query classes use the same encoder and patch geometry.
     """
     architecture = IDENTITY_ARCHITECTURE
 
@@ -466,7 +469,14 @@ class IdentityFollower(DirectFollower):
         out = self.predict(ctx, hist)
         out.update(history_embedding=ctx['history_embedding'], patch_mask=ctx['patch_mask'].float())
         if queries is not None:
-            values, support = sample_features(ctx['appearance'], queries.float(), self.cfg.appearance_crop)
+            if 'identity_query_patches' in x:
+                patches = x['identity_query_patches']
+                b,q = patches.shape[:2]
+                values = self.appearance(patches.reshape(b*q,1,*patches.shape[2:]).to(ctx['fine'].dtype),same=False)
+                values = values.reshape(b,q,-1)
+                support = x['identity_query_mask'] > 0
+            else:
+                values, support = sample_features(ctx['appearance'], queries.float(), self.cfg.appearance_crop)
             out.update(query_embedding=F.normalize(values, dim=-1), query_support=support.float())
         return out
 

@@ -8,12 +8,20 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
 )
 
 
-def wrong_continuation(bank, cfg, rng):
+def validate_tail_range(lengths):
+    if len(lengths) != 2 or not np.isfinite(lengths).all() or not 0 < lengths[0] <= lengths[1]:
+        raise ValueError('Wrong-continuation tail lengths must be finite, positive and ordered')
+    return tuple(float(v) for v in lengths)
+
+
+def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 128.)):
     """No tracing or volume I/O; abstain if a safe connected history cannot fit.
 
     Only the head and tail on the verified neighbor are labeled as departed.
     The artificial bridge is observed history, never a positive future target.
+    An undersized path is rejected, rather than shortening the requested tail.
     """
+    tail_length_range = validate_tail_range(tail_length_range)
     draw = bank.draw_path(rng)
     if draw is None:
         return None
@@ -25,7 +33,7 @@ def wrong_continuation(bank, cfg, rng):
     target = fiber.points[lo:hi]
     if len(target) < 2:
         return None
-    _,_,segment,u = exact_nearest(line,target)
+    separation,_,segment,u = exact_nearest(line,target)
     matched = fiber.s[lo+segment]+u*np.diff(fiber.s[lo:hi])[segment]
     if matched[-1] < matched[0]:
         line,matched = line[::-1],matched[::-1]
@@ -39,12 +47,17 @@ def wrong_continuation(bank, cfg, rng):
     matched = fiber.length-matched if reverse else matched
     s = arclength(line)
     bridge_length = float(rng.uniform(16.,24.))
-    tail_length = float(rng.uniform(4.,12.))
+    # Preserve the established bridge for nearby paths. Outer-band neighbors
+    # need more forward travel to make a smooth lateral transition.
+    if separation.max() > 12.:
+        bridge_length = max(bridge_length,2*float(separation.max()))
+    tail_length = float(rng.uniform(*tail_length_range))
     if s[-1] < bridge_length+tail_length+4:
         return None
     start = float(rng.uniform(0.,s[-1]-bridge_length-tail_length-4))
     finish,head = start+bridge_length,start+bridge_length+tail_length
-    samples = np.r_[np.arange(start,head,.25),head]
+    # Preserve the exact bridge/tail join when lengths are not multiples of .25.
+    samples = np.unique(np.r_[np.arange(start,head,.25),finish,head])
     own_t = np.interp(samples,s,matched)
     own = interp_at(own_points,own_arc,own_t)
     neighbor = interp_at(line,s,samples)
@@ -69,5 +82,6 @@ def wrong_continuation(bank, cfg, rng):
     original_t = fiber.length-own_t[-1] if reverse else own_t[-1]
     item = label_state(fiber,pos,frame,history,mask,cfg,t=original_t,reverse=reverse,offtrack=True)
     item.update(fiber_ref=(fi,float(own_t[-1]),reverse),source=3,source_step=-1,stratum=4,
-                bank_transition_length=bridge_length,bank_tail_length=tail_length)
+                bank_transition_length=bridge_length,bank_tail_length=tail_length,
+                bank_prefix_end_t=float(own_t[0]))
     return item

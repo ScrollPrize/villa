@@ -31,22 +31,35 @@ class MiningConfig:
     seed_spacing: float = 20.
     extrapolation: float = 10.  # at each end
     exclusion: float = 2.5
+    min_distance: float = 0.  # optional inner boundary of the search band
     max_distance: float = 12.
     block_size: int = 80
     sample_step: float = .25
     grid_scale: float = 8.
+    min_path_length: float | None = None
+    max_path_length: float | None = None
 
     def __post_init__(self):
-        if not all(np.isfinite(v) for v in asdict(self).values()):
+        if not all(np.isfinite(v) for v in asdict(self).values() if v is not None):
             raise ValueError('Mining parameters must be finite')
         if not 0 < self.path_presence <= self.seed_presence <= 1:
             raise ValueError('Require 0 < path_presence <= seed_presence <= 1')
         if not (0 < self.max_angle < 90 and 0 < self.exclusion < self.max_distance):
             raise ValueError('Invalid direction angle or separation limits')
+        if not 0 <= self.min_distance < self.max_distance:
+            raise ValueError('Require 0 <= min_distance < max_distance')
         if min(self.seed_spacing, self.sample_step, self.grid_scale) <= 0 or self.extrapolation < 0:
             raise ValueError('Invalid seed spacing, sampling step or extrapolation')
-        if self.block_size < self.seed_spacing + 2*self.extrapolation + 8:
+        if (self.min_path_length is None) != (self.max_path_length is None):
+            raise ValueError('Supply both min_path_length and max_path_length')
+        if self.min_path_length is not None and not self.seed_spacing <= self.min_path_length <= self.max_path_length:
+            raise ValueError('Require seed_spacing <= min_path_length <= max_path_length')
+        if self.block_size < self.path_length_limit + 8:
             raise ValueError('Block must contain the full seed and extrapolation, with a margin')
+
+    @property
+    def path_length_limit(self):
+        return self.max_path_length if self.max_path_length is not None else self.seed_spacing+2*self.extrapolation
 
 
 def load_native(build_python=None):
@@ -219,7 +232,8 @@ def seed_pairs(presence, directions, origin_xyz, center, tangent, target, cfg, *
         displacement = pair[1]-pair[0]
         if np.linalg.norm(displacement) < cfg.seed_spacing-2 or abs(normalize(displacement) @ tangent) < np.cos(np.deg2rad(cfg.max_angle)):
             continue
-        if tree.query(pair)[0].max() > cfg.max_distance:
+        seed_distance = tree.query(pair)[0]
+        if seed_distance.max() > cfg.max_distance or seed_distance.min()-.25 < cfg.min_distance:
             continue
         support_id = int(low_labels[tuple(local[choices[0]])])
         candidates.append((float(tree.query(pair)[0].mean()), pair, component, support_id))
@@ -246,20 +260,87 @@ def trace_controls(native, field, controls, native_config, cfg):
         meeting.append(float(result.meeting_error_trace_voxels/scale))
     trunk = np.concatenate(parts)
     out = trunk
-    if cfg.extrapolation:
-        s = arclength(trunk)
+    s = arclength(trunk)
+    seed_center = s[-1]/2
+    extension = cfg.extrapolation if cfg.max_path_length is None else max(0., (cfg.max_path_length-s[-1])/2)
+    if extension:
         if s[-1] < 2:
             return None, {'reason': 'native_short_seed'}
         tangents = (trunk[0]-interp_at(trunk, s, [min(4., s[-1])])[0],
                     trunk[-1]-interp_at(trunk, s, [max(0., s[-1]-4.)])[0])
         tails = []
         for p, direction in zip(trunk[[0, -1]], tangents):
-            tail = native.trace_extrapolation(field, p*scale, normalize(direction), cfg.extrapolation*scale, native_config)
-            if not tail.reached_trace_length:
+            tail = native.trace_extrapolation(field, p*scale, normalize(direction), extension*scale, native_config)
+            if not tail.reached_trace_length and cfg.min_path_length is None:
                 return None, {'reason': 'native_tail_'+tail.reason}
-            tails.append(tail.points/scale)
+            points = np.asarray(tail.points)/scale
+            # A stopped extrapolation may still supply a usable prefix. Its
+            # retained geometry must pass all ordinary path checks below.
+            if not len(points):
+                points = p[None]
+            if (points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all()
+                    or not np.allclose(points[0], p, atol=1e-6, rtol=0)):
+                return None, {'reason': 'native_invalid_tail'}
+            tails.append(points)
         out = np.concatenate([tails[0][:0:-1], trunk, tails[1][1:]])
-    return out, {'reason': 'traced', 'meeting_errors': meeting}
+        seed_center += arclength(tails[0])[-1]
+    detail = {'reason': 'traced', 'meeting_errors': meeting}
+    if cfg.min_path_length is not None:
+        detail['seed_center_arc'] = float(seed_center)
+    return out, detail
+
+
+def clip_path(path, start, length):
+    """Cut at exact arclengths without shortcutting any original corners."""
+    s = arclength(path)
+    endpoints = interp_at(path, s, [start, start+length])
+    return np.concatenate([endpoints[:1], path[(s > start) & (s < start+length)], endpoints[1:]])
+
+
+def validated_path(path, target, target_s, origin_xyz, presence, directions, support_labels, support_id, cfg,
+                   *, target_index=None, seed_center_arc=None):
+    """Prefer a long validated seed-centered window, with an optional minimum.
+
+    Shortening never bypasses validation. Bisection is a conservative search,
+    not a guarantee of finding every possible valid subpath or window position.
+    """
+    def check(candidate):
+        return validate_path(candidate, target, target_s, origin_xyz, presence, directions,
+                             support_labels, support_id, cfg, target_index=target_index)
+    if cfg.min_path_length is None:
+        ok, detail = check(path)
+        return (path if ok else None), detail
+    total = float(arclength(path)[-1])
+    if total < cfg.min_path_length:
+        return None, dict(reason='path_too_short', length=total)
+    center = total/2 if seed_center_arc is None else seed_center_arc
+    def window(length):
+        return clip_path(path, float(np.clip(center-length/2, 0, total-length)), length)
+    high = min(total, cfg.max_path_length)
+    candidate = window(high)
+    ok, detail = check(candidate)
+    attempts, maximum_rejection = 1, None
+    if not ok:
+        maximum_rejection = detail['reason']
+        low = cfg.min_path_length
+        if high == low:
+            return None, detail
+        candidate = window(low)
+        ok, detail = check(candidate)
+        attempts += 1
+        if not ok:
+            return None, dict(detail, max_length_rejection=maximum_rejection)
+        while high-low > cfg.sample_step:
+            mid = (low+high)/2
+            trial = window(mid)
+            passed, trial_detail = check(trial)
+            attempts += 1
+            if passed:
+                low, candidate, detail = mid, trial, trial_detail
+            else:
+                high = mid
+    return candidate, dict(detail, untrimmed_length=total, validation_attempts=attempts,
+                           max_length_rejection=maximum_rejection)
 
 
 def validate_path(path, target, target_s, origin_xyz, presence, directions, support_labels, support_id, cfg, *, target_index=None):
@@ -290,6 +371,8 @@ def validate_path(path, target, target_s, origin_xyz, presence, directions, supp
     lower_bound = float(distances.min()-half_step)
     if lower_bound <= cfg.exclusion:
         return False, {'reason': 'target_exclusion', 'min_distance_lower_bound': lower_bound}
+    if lower_bound < cfg.min_distance:
+        return False, {'reason': 'inside_search_band', 'min_distance_lower_bound': lower_bound}
     if distances.max()+half_step > cfg.max_distance:
         return False, {'reason': 'not_nearby'}
     arc = target_s[seg]+fraction*np.diff(target_s)[seg]
@@ -411,8 +494,15 @@ def main():
     ap.add_argument('--val-z', nargs=2, type=float, default=(45000., 48500.), help='Excluded band in base voxels')
     ap.add_argument('--seed-spacing', type=float, default=20.)
     ap.add_argument('--extrapolation', type=float, default=10.)
+    ap.add_argument('--min-path-length', type=float, help='Minimum retained path arclength; requires --max-path-length')
+    ap.add_argument('--max-path-length', type=float, help='Maximum retained path arclength; overrides --extrapolation')
+    ap.add_argument('--block-size', type=int, default=80)
+    ap.add_argument('--min-distance', type=float, default=0., help='Inner search radius from the target, in trace-grid voxels')
+    ap.add_argument('--max-distance', type=float, default=12., help='Outer search radius from the target, in trace-grid voxels')
     args = ap.parse_args()
-    cfg = MiningConfig(seed_spacing=args.seed_spacing, extrapolation=args.extrapolation)
+    cfg = MiningConfig(seed_spacing=args.seed_spacing, extrapolation=args.extrapolation, block_size=args.block_size,
+                       min_path_length=args.min_path_length, max_path_length=args.max_path_length,
+                       min_distance=args.min_distance, max_distance=args.max_distance)
     if args.count <= 0 or args.max_anchors <= 0 or args.ct_grid_scale <= 0 or args.val_z[0] >= args.val_z[1]:
         ap.error('Counts, scales and validation band must be valid')
     args.output.mkdir(parents=True, exist_ok=True)
@@ -452,11 +542,11 @@ def main():
             path, detail = trace_controls(native, field, controls, native_cfg, cfg)
             elapsed = time.perf_counter()-before
             timings.append(elapsed)
-            ok = False
             if path is not None:
-                ok, detail = validate_path(path, f.points, f.s, origin, raw['presence'], directions, support, support_id, cfg)
+                path, detail = validated_path(path, f.points, f.s, origin, raw['presence'], directions, support,
+                                              support_id, cfg, seed_center_arc=detail.get('seed_center_arc'))
             attempts.append(dict(target=f.name, target_arc=t, seeds_xyz=controls.tolist(), native_seconds=elapsed, **detail))
-            if not ok:
+            if path is None:
                 rejected[detail['reason']] += 1
                 continue
             # Suppress repeat discoveries of the same nearby traced span.
