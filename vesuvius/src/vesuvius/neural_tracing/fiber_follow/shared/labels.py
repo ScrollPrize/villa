@@ -6,13 +6,15 @@ from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_MAX_RECOV
 
 @torch.no_grad()
 def prefix_labels(points, batch, tolerance=1.5,
-                     max_recovery_distance=DEFAULT_MAX_RECOVERY_DISTANCE):
+                     max_recovery_distance=DEFAULT_MAX_RECOVERY_DISTANCE, extra_failure=None):
     """Prefix agreement sampled every 0.25 forward voxel with the default config.
 
     A prefix is positive only when every sampled crossing is annotated and
     within tolerance. A known failure is negative even if later GT is missing.
     Unknown ends are censored. Tagged physical endpoints and already departed
-    states supply explicit negatives. The origin-to-first-point connection must
+    states supply explicit negatives. ``extra_failure`` (B, Q) marks further
+    known failures, such as points on another fiber within tolerance.
+    The origin-to-first-point connection must
     obey the same recovery distance limit as tracing. Within that limit, the
     first point may recover from a displaced origin; GT agreement begins there.
     """
@@ -30,6 +32,8 @@ def prefix_labels(points, batch, tolerance=1.5,
     bad_recovery = ~recovery_allowed(points, max_recovery_distance)
     failed = ((known & ((error > tolerance) | ~torch.isfinite(error))) | beyond_end
               | batch['offtrack'][:, None].bool() | bad_recovery[..., None])
+    if extra_failure is not None:
+        failed = failed | extra_failure.bool()
     failure_prefix = failed.cumsum(-1) > 0
     known_prefix = (known | beyond_end).int().cummin(-1).values.bool()
     indices = torch.linspace(0, Q-1, K, device=points.device).round().long()

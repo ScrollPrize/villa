@@ -19,10 +19,19 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
     update_ema, training_rng_state, resume_training, raise_open_file_limit,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
-from vesuvius.neural_tracing.fiber_follow.regression.model import ARCHITECTURE, DirectConfig, DirectFollower
-from vesuvius.neural_tracing.fiber_follow.regression.data import ObservationBuilder, DirectTracer
+from vesuvius.neural_tracing.fiber_follow.regression.model import (
+    ARCHITECTURE, IDENTITY_ARCHITECTURE, DirectConfig, DirectFollower, IdentityConfig, IdentityFollower,
+    config_class, follower_class,
+)
+from vesuvius.neural_tracing.fiber_follow.regression.data import (
+    IdentityObservationBuilder, IdentitySampling, ObservationBuilder, DirectTracer, LOCATION_SOURCES,
+    load_contacts, load_hard_spans,
+)
+from vesuvius.neural_tracing.fiber_follow.shared.components import PAIR_SAMPLING_VERSION, ComponentRule
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import commit_window, loss_terms
-from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import decision_rows, summarize_decisions
+from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import (
+    decision_rows, summarize_decisions, identity_ranking, summarize_ranking,
+)
 from vesuvius.neural_tracing.fiber_follow.regression.recovery import monitor_fixture, evaluate_monitor
 from vesuvius.neural_tracing.fiber_follow.shared.training_log import format_training_log
 
@@ -38,7 +47,7 @@ def save_checkpoint(path, model, ema, spec, sample, extra=None):
     # Atomic publication: collectors must never open a partial checkpoint.
     path = Path(path)
     temporary = path.with_suffix('.partial.pt')
-    write_checkpoint(temporary, model, spec, sample.crop, sample.n_history, ARCHITECTURE,
+    write_checkpoint(temporary, model, spec, sample.crop, sample.n_history, model.architecture,
                      dict({'n_commit': commit_window(model.cfg, None), **(extra or {})},
                           ema=ema.state_dict(), sample_cfg=asdict(sample),
                           coarse_ct_level=1, coarse_ct_grid_scale=8.))
@@ -63,10 +72,27 @@ def match_optimizer_layout(opt):
                 state[key] = torch.empty_like(param).copy_(value)
 
 
+ARCHITECTURES = (ARCHITECTURE, IDENTITY_ARCHITECTURE)
+
+
+def checkpoint_config(ck):
+    """Model configuration of either direct architecture.
+
+    ``rich_path_context`` was retired with its ``True`` behavior kept; older
+    checkpoints recording that value load unchanged.
+    """
+    values = dict(ck['model_cfg'])
+    if values.pop('rich_path_context', True) is not True:
+        raise ValueError('Checkpoints without rich path context are no longer supported')
+    if ck['architecture'] == IDENTITY_ARCHITECTURE:
+        values.setdefault('appearance_version', 1)
+    return config_class(ck['architecture'])(**values)
+
+
 def load_checkpoint(path, device='cuda'):
-    ck = read_checkpoint(path, (ARCHITECTURE,), device)
-    cfg = DirectConfig(**ck['model_cfg'])
-    model = DirectFollower(cfg).to(device, memory_format=conv_memory_format(device))
+    ck = read_checkpoint(path, ARCHITECTURES, device)
+    cfg = checkpoint_config(ck)
+    model = follower_class(ck['architecture'])(cfg).to(device, memory_format=conv_memory_format(device))
     model.load_state_dict(ck['ema'])
     model.eval()
     if ck.get('coarse_ct_level') != 1 or ck.get('coarse_ct_grid_scale') != 8.:
@@ -133,8 +159,13 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
         tracer.p.confidence = threshold_before
 
 
+IDENTITY_SUMS = ('identity_count', 'identity_states', 'identity_rank_correct', 'identity_correct_count',
+                 'identity_flipped_count')
+
+
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
-                     confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True):
+                     confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True,
+                     identity_weight=.5, identity_temperature=.1):
     """Equal weight per observed state, independent of microbatch boundaries.
 
     Within a state each loss averages over its known points; fully unknown
@@ -149,21 +180,40 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     sums = dict(loss=0., geometry=0., confidence_loss=0., error_sum=0., geometry_count=0.,
                 correct_count=0., confidence_count=0.)
     sources = np.zeros(3, dtype=np.int64)
-    decisions = []
+    identity = {}
+    decisions, rankings = [], []
     model.train()
     for cpu in batches:
         batch = move_batch(cpu, device)
+        queries = dict(queries=batch['identity_points']) if 'identity_points' in batch else {}
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
-            output = model(batch['x'], batch['hist'], batch['hmask'])
-            terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit)
+            output = model(batch['x'], batch['hist'], batch['hmask'], **queries)
+            terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit,
+                               identity_temperature=identity_temperature)
             geometry = terms['geometry_per_state'].sum()/total
             confidence = terms['confidence_per_state'].sum()/total
             loss = geometry + confidence_weight*confidence
+            if 'identity_per_state' in terms:
+                identity_loss = terms['identity_per_state'].sum()/total
+                loss = loss + identity_weight*identity_loss
+                identity['identity_loss'] = identity.get('identity_loss', 0.)+identity_loss.detach().item()
         if not torch.isfinite(loss):
             raise FloatingPointError(f'Nonfinite loss at step {step}')
         loss.backward()
         if compute_metrics:
             decisions.extend(decision_rows(output, batch, model.cfg, n_commit, tolerance))
+            if 'query_embedding' in output:
+                rankings.append(identity_ranking(output, batch, model.cfg))
+        for key in IDENTITY_SUMS:
+            if key in terms:
+                identity[key] = identity.get(key, 0.)+terms[key].detach().item()
+        for key in ('presence_dropped', 'foreign_components'):
+            if key in cpu:
+                identity[key] = identity.get(key, 0.)+float((cpu[key] > 0).sum())
+        if 'location_source' in cpu:
+            for index, name in enumerate(LOCATION_SOURCES):
+                key = f'location_{name}'
+                identity[key] = identity.get(key, 0.)+float((cpu['location_source'] == index).sum())
         for key, value in (('loss', loss), ('geometry', geometry), ('confidence_loss', confidence)):
             sums[key] += value.detach().item()
         for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count'):
@@ -178,8 +228,19 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']),
                 fresh_fraction=float(sources[0]/total), fixed_fraction=float(sources[1]/total),
                 recent_fraction=float(sources[2]/total))
+    if identity:
+        # Versioned separately from the distance metrics above.
+        identity.update(identity_version=1, pair_sampling_version=PAIR_SAMPLING_VERSION,
+                        identity_rank_accuracy=identity.get('identity_rank_correct', 0.)/max(1., identity.get('identity_count', 0.)),
+                        identity_prefix_correct_fraction=identity.get('identity_correct_count', 0.)/max(1., sums['confidence_count']))
+        for key in ('presence_dropped', 'foreign_components', *(f'location_{n}' for n in LOCATION_SOURCES)):
+            if key in identity:
+                identity[key+'_fraction'] = identity.pop(key)/total
+        sums['identity'] = identity
     if compute_metrics:
         sums['decisions'] = summarize_decisions(decisions, commit_window(model.cfg, n_commit))
+        if rankings:
+            sums['identity']['ranking'] = summarize_ranking(rankings)
     return sums
 
 
@@ -215,6 +276,21 @@ def build_parser():
     ap.add_argument('--no-history-prob', type=float, default=.15, help='Fresh-state probability of absent observed history')
     ap.add_argument('--short-history-prob', type=float, default=.4,
                     help='Given history is present, probability of a balanced 1-8/9-32 point startup history')
+    ap.add_argument('--identity', action=argparse.BooleanOptionalAction, default=False,
+                    help=f'Train {IDENTITY_ARCHITECTURE}: CT-only visual history and identity objective')
+    ap.add_argument('--identity-weight', type=float, default=.5, help='InfoNCE coefficient')
+    ap.add_argument('--identity-temperature', type=float, default=.1)
+    ap.add_argument('--appearance-channels', type=int, default=32)
+    ap.add_argument('--embedding', type=int, default=32)
+    ap.add_argument('--negative-threshold', type=float, default=ComponentRule().threshold, help='Presence threshold for components')
+    ap.add_argument('--presence-dropout', type=float, default=.25, help='Probability of zeroing both presence crops')
+    ap.add_argument('--anchor-prob', type=float, default=.75, help='Training states given seed-segment anchors')
+    ap.add_argument('--contacts', help='Mined contact episodes of the training fibers (oversampled)')
+    ap.add_argument('--hard-spans', help='Hard controlled spans by fiber name (oversampled)')
+    ap.add_argument('--contact-fraction', type=float, default=.2, help='Fresh draws near contact episodes')
+    ap.add_argument('--hard-span-fraction', type=float, default=.1)
+    ap.add_argument('--lateral-fraction', type=float, default=.1,
+                    help='Fresh draws near earlier states with lateral presence components')
     ap.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True,
                     help='Compile follower training on CUDA (EMA, diagnostics and collection stay eager)')
     ap.add_argument('--seed', type=int, default=0)
@@ -266,9 +342,16 @@ def main(argv=None):
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    cfg = DirectConfig(channels=args.channels, layers=args.decoder_layers,
-                       correction=args.correction, correction_limit=args.correction_limit,
-                       correction_steps=args.correction_steps)
+    options = dict(channels=args.channels, layers=args.decoder_layers, correction=args.correction,
+                   correction_limit=args.correction_limit, correction_steps=args.correction_steps)
+    cfg = (IdentityConfig(**options, appearance_channels=args.appearance_channels, embedding=args.embedding)
+           if args.identity else DirectConfig(**options))
+    identity_sampling = IdentitySampling(
+        rule=ComponentRule(threshold=args.negative_threshold), anchor_prob=args.anchor_prob,
+        presence_dropout=args.presence_dropout, contact_fraction=args.contact_fraction,
+        hard_span_fraction=args.hard_span_fraction, lateral_fraction=args.lateral_fraction)
+    if min(args.identity_weight, args.identity_temperature) <= 0 and args.identity:
+        raise ValueError('Identity weight and temperature must be positive')
     initialized = None
     if args.init_tracer:
         progress(f'Loading follower weights from {args.init_tracer}')
@@ -276,7 +359,7 @@ def main(argv=None):
         cfg = initialized.cfg
     if args.resume:
         progress(f'Loading resume checkpoint from {args.resume}')
-        cfg = DirectConfig(**read_checkpoint(args.resume, (ARCHITECTURE,), args.device)['model_cfg'])
+        cfg = checkpoint_config(read_checkpoint(args.resume, ARCHITECTURES, args.device))
     if not 1 <= args.n_commit <= cfg.n_future:
         raise ValueError('Commit window must fit forecast')
     # Native fine imagery, independently read coarse level-1 imagery.
@@ -294,13 +377,17 @@ def main(argv=None):
     progress(f'Loaded {len(train_f)} training fibers and {len(val_f)} validation fibers')
     if fiber_manifest(val_f) != manifest['fibers']:
         raise ValueError('Frozen validation geometry differs from dataset/holdout')
-    resume = read_checkpoint(args.resume, (ARCHITECTURE,), args.device) if args.resume else None
+    resume = read_checkpoint(args.resume, ARCHITECTURES, args.device) if args.resume else None
     if resume:
         # The run directory may move; the checkpoint must still sit inside the named run.
         ignored = {'resume', 'out_root', 'device', 'batch', 'microbatch', 'workers', 'threads', 'worker_cache_gb',
                    'log_every', 'ckpt_every', 'diag_every', 'dagger_device', 'compile', 'init_tracer'}
+        parser = build_parser()
         for key, value in vars(args).items():
             if key in ('long_diag_every', 'long_diag_max_len') and key not in resume['training_options'] and not args.long_diag_every:
+                continue
+            # Options added after a run started resume at their defaults.
+            if key not in resume['training_options'] and value == parser.get_default(key):
                 continue
             if key not in ignored and resume['training_options'].get(key) != value:
                 raise ValueError(f'Resume option differs: {key}')
@@ -319,7 +406,8 @@ def main(argv=None):
         if resume and resume.get('monitor_recovery_sha256') != recovery_hash:
             raise ValueError('Monitor recovery fixture changed since checkpoint')
     progress('Initializing models and optimizer')
-    model = initialized if initialized is not None else DirectFollower(cfg).to(args.device, memory_format=conv_memory_format(args.device))
+    follower = IdentityFollower if isinstance(cfg, IdentityConfig) else DirectFollower
+    model = initialized if initialized is not None else follower(cfg).to(args.device, memory_format=conv_memory_format(args.device))
     ema = copy.deepcopy(model).requires_grad_(False).eval()
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     done = resume_training(resume, model, ema, opt)[0] if resume else 0
@@ -340,7 +428,14 @@ def main(argv=None):
         every=args.dagger_every, max_seeds=args.dagger_seeds, seed=args.seed, replay_keep=args.replay_keep,
         initial=[c._dir for c in caches], trace_len=args.dagger_trace_len, n_commit=args.n_commit,
         collector_module='vesuvius.neural_tracing.fiber_follow.regression.collect')
-    builder = ObservationBuilder(cfg)
+    if args.identity:
+        contacts = load_contacts(args.contacts, train_f, band) if args.contacts else ()
+        hard_spans = load_hard_spans(args.hard_spans, train_f) if args.hard_spans else ()
+        progress(f'Identity sampling: {len(contacts)} contact episodes, {len(hard_spans)} hard spans')
+        builder = IdentityObservationBuilder(cfg, train_f, identity_sampling, contacts=contacts,
+                                             hard_spans=hard_spans, augment=True)
+    else:
+        builder = ObservationBuilder(cfg)
     dataset = FollowDataset(train_f, spec, sample, band, chunk=args.microbatch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), fixed=fixed, onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, additional_crops=(cfg.coarse,))
@@ -350,13 +445,17 @@ def main(argv=None):
         loader_args.update(prefetch_factor=2, persistent_workers=True)
     loader = torch.utils.data.DataLoader(dataset, **loader_args)
     if not resume:
-        (out/'config.json').write_text(json.dumps(dict(vars(args), architecture=ARCHITECTURE,
+        (out/'config.json').write_text(json.dumps(dict(vars(args), architecture=model.architecture,
+            identity_sampling=asdict(identity_sampling) if args.identity else None,
             model_cfg=cfg.to_dict(), sample_cfg=asdict(sample), vol_spec=spec.to_dict(),
             coarse_ct_level=1, coarse_ct_grid_scale=8., data_policy=DATA_POLICY,
             monitor_recovery_sha256=recovery_hash,
             seed_manifest_sha256=manifest['sha256'], fiber_manifest=fiber_manifest(fibers),
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
     log = RunLog(out/'log.jsonl', formatter=format_training_log)
+    if args.identity:
+        log.record(dict(step=done, event='identity_sampling', pair_sampling_version=PAIR_SAMPLING_VERSION,
+                        resume=args.resume, history_policy='full_shared_target_history'))
     tracer = None
     recovery_vol = FiberVolume(spec) if recovery_states is not None else None
     started = time.monotonic()
@@ -387,17 +486,20 @@ def main(argv=None):
             lr = lr_at(step, args.lr, args.warmup, args.steps)
             metrics = optimizer_update(trainable, ema, opt, batches, step, lr, device=args.device,
                 tolerance=args.tolerance, confidence_weight=args.confidence_weight, ema_decay=args.ema_decay,
-                n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps)
+                n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
+                identity_weight=args.identity_weight, identity_temperature=args.identity_temperature)
             if early:
                 progress(f'Update {step} complete in {time.monotonic()-update_started:.1f}s; loss={metrics["loss"]:.5f}')
                 if step == done+5:
                     progress(f'Startup progress complete; regular metrics every {args.log_every} updates')
             if step % args.log_every == 0 or step == args.steps:
-                log.record(dict(step=step, lr=lr, **metrics,
+                log.record(dict(step=step, lr=lr, **metrics, samples_seen=step*args.batch,
+                    train_seconds=time.monotonic()-started,
                     samples_per_second=(step-done)*args.batch/(time.monotonic()-started)))
 
             def save(path, resumable=False):
                 extra = dict(step=step, tolerance=args.tolerance, n_commit=args.n_commit,
+                    identity_sampling=asdict(identity_sampling) if args.identity else None,
                     seed_manifest_sha256=manifest['sha256'], training_options=vars(args),
                     monitor_recovery_sha256=recovery_hash,
                     fiber_manifest=fiber_manifest(fibers))

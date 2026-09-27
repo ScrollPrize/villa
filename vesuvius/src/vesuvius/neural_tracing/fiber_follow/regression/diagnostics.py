@@ -100,3 +100,50 @@ def summarize_decisions(rows, n_commit):
     return dict(n_commit=n_commit, by_drift={name: summarize(members) for name, members in groups.items()},
                 by_history={name: summarize(members) for name, members in history_groups.items()})
 
+
+
+# History patch age bins (voxels behind the head); seed anchors are reported separately.
+RANKING_BINS = (('4-16', 0, 16), ('17-48', 17, 48), ('49-128', 49, 128))
+
+
+@torch.no_grad()
+def identity_ranking(output, batch, cfg):
+    """Does each on-fiber history patch prefer its fiber ahead over the negatives beside it?
+
+    Counts per history-patch age bin and per positive forward distance, for
+    diagnostics only; the model never receives a hand-computed similarity.
+    """
+    R, K = cfg.recent_patches, batch['positive_mask'].shape[1]
+    M = batch['negative_mask'].shape[2]
+    history = output['history_embedding'].float()
+    on = (batch['patch_on_fiber']*output['patch_mask']).bool()
+    query, support = output['query_embedding'].float(), output['query_support'].bool()
+    positive, negative = query[:, :K], query[:, K:].reshape(len(query), K, M, -1)
+    positive_ok = batch['positive_mask'].bool() & support[:, :K]
+    negative_ok = batch['negative_mask'].bool() & support[:, K:].reshape(len(query), K, M)
+    scored = positive_ok & negative_ok.any(-1)
+    similarity = torch.einsum('bpe,bke->bpk', history, positive)
+    competitor = torch.einsum('bpe,bkme->bpkm', history, negative).masked_fill(~negative_ok[:, None], -2.).amax(-1)
+    correct = similarity > competitor
+    valid = on[:, :, None] & scored[:, None]
+    ages = torch.arange(1, R+1, device=query.device)*cfg.patch_every
+    rows = {}
+    for name, lo, hi in RANKING_BINS:
+        member = valid[:, :R] & ((ages >= lo) & (ages <= hi))[None, :, None]
+        rows[name] = (int((correct[:, :R] & member).sum()), int(member.sum()))
+    anchors = valid[:, R:]
+    rows['anchor'] = (int((correct[:, R:] & anchors).sum()), int(anchors.sum()))
+    forward = batch['identity_points'][:, :K, 2]
+    for name, lo, hi in (('ahead 1-8', 1, 8), ('ahead 8-20', 8, 20.01)):
+        member = valid & ((forward >= lo) & (forward < hi))[:, None]
+        rows[name] = (int((correct & member).sum()), int(member.sum()))
+    return rows
+
+
+def summarize_ranking(rows):
+    total = {}
+    for row in rows:
+        for name, (correct, count) in row.items():
+            a, b = total.get(name, (0, 0))
+            total[name] = (a+correct, b+count)
+    return {name: dict(correct=a, pairs=b, accuracy=a/b if b else None) for name, (a, b) in total.items()}

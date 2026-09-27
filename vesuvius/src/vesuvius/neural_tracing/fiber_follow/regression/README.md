@@ -247,6 +247,117 @@ bash scripts/launch_regression.sh direct_onepass --seed 0 --no-correction
 The baseline has the new loss weighting too, so this comparison isolates the
 correction stage rather than changing its objective at the same time.
 
+## Visual identity (`direct_identity_v1`)
+
+`--identity` trains the design in `IDENTITY_REPAIR_PLAN.md`. The existing
+architecture is unchanged and its checkpoints load as before (the retired
+`rich_path_context: true` entry is accepted).
+
+| Component | Default |
+| --- | --- |
+| History patches | Fine CT, 9 × 41 × 41 samples (±2 along, ±10 lateral trace voxels) in each point's own path frame |
+| Fine crop | 80 × 81 × 81 samples (±20 laterally, versus ±11.75), so candidates to ±10 see a full receptive field; lateral limit ±19 |
+| Patch layout | 32 recent patches every 4 voxels over 128; four seed-segment anchors every 4 voxels once the head is ≥144 voxels past the seed |
+| Patch tokens | Embedding plus centre, tangent and u axis in the head frame, log age, anchor flag |
+| Appearance encoder | CT only; stem and three pre-activation residual blocks (lateral dilations 1–6), width 32, per-voxel channel LayerNorm, 32-d L2-normalized output |
+| Where identity enters | Decoder memory and queries; correction and confidence heads cross-attend from appearance at proposed points to the tokens (null token when none) |
+| Total parameters | 2,951,845 |
+
+The encoder's receptive field is exactly one patch (9 × 41 × 41), and its norm never pools
+space. As a result, a patch's embedding equals the dense appearance map over
+the fine crop at the same place (a test checks this). Candidate, positive and
+negative embeddings are lookups in that map; patches are read once per
+decision from the committed path. Training anchors come from annotation
+144–2048 voxels behind (probability 0.75), while tracing uses the actual
+seed segment.
+
+New models save `appearance_version: 2`. Older checkpoints without that field
+retain version 1's 7 × 33 × 33 patches and their saved fine crop when loaded,
+resumed, or used with `--init-tracer`. Start a fresh identity run to use the
+larger appearance encoder. The patch array contains about twice as many samples,
+and the fine crop about 55% more; rerun preflight for the intended microbatch.
+
+Identity objective (`--identity-weight .5`, `--identity-temperature .1`):
+InfoNCE between the mean of the recent on-fiber history embeddings (at least
+two; on-fiber means within 1.5 voxels of the annotation) and four annotated
+positives 1–20 voxels ahead. Each positive competes only with up to eight
+negatives beside it (within two voxels along the fiber). Negatives come from
+fine-crop presence components (threshold `--negative-threshold .7`,
+26-connected). A component is the traced fiber's own if it comes within 1.5
+trace voxels of the annotation, so touching neighbors never become negatives.
+Other components qualify within 10 trace voxels laterally and count only where
+their nearest annotation point is interior; that excludes gaps ahead or behind
+and space past unannotated ends. A departed
+replay head on presence is an extra negative. Confidence labels are
+identity-aware: a predicted point on such a component is wrong even inside the
+1.5-voxel tolerance. Distance metrics keep their names; identity metrics sit
+under `identity` in `log.jsonl` (`identity_version: 1`), including
+history-vs-neighbor ranking by patch age.
+
+Pair sampling version 2 matches every negative's fractional feature-grid
+coordinates to its positive, including departed-head negatives. Both candidate
+embeddings therefore use the same trilinear interpolation weights. After shifting,
+negatives must retain interpolated presence and foreign-component membership,
+annotation separation and full appearance receptive-field support; lateral
+negatives also retain their arc and lateral bounds. Invalid negatives are masked
+instead of snapped to voxel centers. This fixes a positive/negative interpolation
+shortcut without changing model weights or checkpoint structure. The version is
+recorded in training metrics, sampling settings and a start/resume log event;
+ranking before and after this change is not directly comparable.
+
+The complete available target history remains the shared anchor for every
+positive and negative in a comparison. Neighbor candidates are local patches;
+they do not require their own traced histories. A neighbor with little or no
+known history can therefore remain a negative without shortening the target's
+history or inventing padding evidence. Unavailable candidates are masked, and
+states without two valid target-history patches or any valid negatives receive
+no identity loss. Geometry and confidence training continue on those states.
+
+Data: presence is zeroed in both crops for `--presence-dropout .25` of
+states, after identity targets are computed. Photometric contrast (×1/1.4–1.4),
+brightness (±0.1) and noise (σ ≤ 0.03) are drawn independently for the
+appearance copy of the fine crop and for the history patches; the
+localization crops are not augmented. Fresh draws are 20% near mined contact
+episodes (`--contacts`), 10% on hard spans (`--hard-spans`), and 10% near
+earlier fresh states that had lateral components. Both files are checked
+against the current fiber geometry. Every patch footprint and the identity
+label geometry pass the holdout check.
+
+Before the first run, `regression/identity_preflight.py` measured the previous
+patch/crop sizes and negative-sampling defaults, in
+`output/identity_preflight_20260926/`. These results predate the larger patches:
+
+| Check | Result |
+| --- | --- |
+| Contact states with a scored positive | 94% (254 states, 144 episodes; 95% of episodes yield) |
+| Negatives per contact state | 23.6; 27% within 2 voxels of the other annotated fiber, 0.5% within 1.5 of the traced fiber's own annotation |
+| Ordinary fresh states with a scored positive | 91% (most neighbors unannotated: 2.2% near another annotation) |
+| Read cost per decision | patches +12 ms over 41 ms fine+coarse crop reads; +1.64M source voxels over 1.16M (32 patches) |
+| GPU, microbatch 16, eager BF16 | 17.1 GiB allocated / 18.8 GiB reserved; about 0.24 s per update |
+| Single-decision forward (eager) | 10.7 ms, against 6.3 ms for `direct_curve_v1` |
+
+`negatives.png` holds the visual spot-checks.
+
+```bash
+bash scripts/launch_regression.sh direct_identity_run1 --identity \
+  --contacts "$PWD/output/direct_ct_spatial_run1/contacts.json" \
+  --hard-spans "$PWD/output/hard_spans_8a0bb01095fa.json" \
+  --batch 64 --microbatch 16 --workers 10
+```
+
+Evaluation (`regression/identity_eval.py`) freezes an ambiguous subset once:
+seeds whose annotated continuation within 400 voxels passes within 6 voxels of
+another annotated fiber. That is 42 of 96 calibration and 75 of 176 final
+seeds (`output/identity_eval_20260926/ambiguous.json`). `rollouts` reports all
+seeds and the subset: identity switches (a departure followed by ≥8 of the next
+32 points within 3 voxels of another annotated fiber), incorrect length and
+its quantiles, per-decision on-track vs departed confidence AUC (the stage-B
+definition), false stops and positions, latency, patch-read time and peak
+memory. It also writes a coverage-risk curve over `--thresholds` and paired
+fiber-bootstrap deltas against `--baseline-rows`. For identity checkpoints,
+`embedding` reports held-out ranking by history age, plus the prediction and
+confidence shifts when appearance tokens are masked or shuffled.
+
 ## Throughput
 
 Data loading, not the GPU, bounded the original trainer: every 128³ CT chunk

@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
+from vesuvius.neural_tracing.fiber_follow.regression.model import feature_grid
 
 
 def geometry_mask(batch, cfg):
@@ -31,7 +32,45 @@ def window_mean(values, mask, near):
     return .5*mean(mask & near)+.5*mean(mask)
 
 
-def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
+def foreign_failures(points, batch, cfg, count):
+    """Dense predicted points lying on a presence component beside the traced fiber."""
+    dense = F.interpolate(points.detach().float().transpose(1, 2), size=count, mode='linear',
+                          align_corners=True).transpose(1, 2)
+    foreign = batch['foreign']
+    grid = feature_grid(dense, cfg.fine, foreign.shape[-3:])
+    values = F.grid_sample(foreign[:, None].float(), grid[:, :, None, None], mode='nearest', align_corners=True)
+    return values[:, 0, :, 0, 0] > .5
+
+
+def identity_terms(output, batch, cfg, temperature=.1):
+    """InfoNCE between pooled on-fiber recent history and appearance ahead.
+
+    The anchor is the normalized mean over recent patches lying on the annotated
+    fiber (at least two). Each annotated positive must outscore only the
+    presence-component negatives beside it (and a departed head); it never
+    has to reach similarity one. States without a scored positive contribute zero.
+    """
+    R = cfg.recent_patches
+    on = batch['patch_on_fiber'][:, :R]*output['patch_mask'][:, :R]
+    anchor = F.normalize((output['history_embedding'][:, :R].float()*on[..., None]).sum(1), dim=-1)
+    K = batch['positive_mask'].shape[1]
+    M = batch['negative_mask'].shape[2]
+    query = output['query_embedding'].float()
+    support = output['query_support'].bool()
+    positive, negative = query[:, :K], query[:, K:].reshape(len(query), K, M, -1)
+    positive_ok = batch['positive_mask'].bool() & support[:, :K]
+    negative_ok = batch['negative_mask'].bool() & support[:, K:].reshape(len(query), K, M)
+    valid = positive_ok & negative_ok.any(-1) & (on.sum(1) >= 2)[:, None]
+    positive_logit = (anchor[:, None]*positive).sum(-1)/temperature
+    negative_logit = ((anchor[:, None, None]*negative).sum(-1)/temperature).masked_fill(~negative_ok, float('-inf'))
+    loss = torch.logsumexp(torch.cat((positive_logit[..., None], negative_logit), -1), -1)-positive_logit
+    loss = torch.where(valid, loss, 0.)
+    return dict(identity_per_state=loss.sum(-1)/valid.sum(-1).clamp_min(1),
+                identity_count=valid.sum(), identity_states=valid.any(-1).sum(),
+                identity_rank_correct=(valid & (positive_logit > negative_logit.amax(-1))).sum())
+
+
+def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_temperature=.1):
     """Return numerators/counts so effective-batch means are independent of microbatch.
 
     Unknown/crop-censored targets and departed states do not teach localization.
@@ -66,9 +105,24 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None):
             auxiliary = torch.stack(losses).mean(0)
         geometry = .75*geometry+.25*auxiliary
     labels, known, _ = prefix_labels(output['points'], batch, tolerance, cfg.max_recovery_distance)
-    bce = F.binary_cross_entropy_with_logits(output['confidence_logits'], labels, reduction='none')
-    return dict(geometry_per_state=geometry,
-                confidence_per_state=window_mean(bce, known.bool(), torch.arange(cfg.n_future, device=mask.device)<window),
-                geometry_count=mask.sum(), confidence_count=known.sum(),
-                error_sum=torch.where(mask, (predicted-target).norm(dim=-1), 0.).sum(),
-                correct_count=(labels*known).sum())
+    # Identity-aware labels: a point on a component beside the traced fiber is
+    # wrong even within the distance tolerance. Distance metrics keep their names.
+    identity = 'foreign' in batch
+    supervised, supervised_known = labels, known
+    if identity:
+        extra = foreign_failures(output['points'], batch, cfg, mask.shape[1])
+        supervised, supervised_known, _ = prefix_labels(output['points'], batch, tolerance,
+                                                        cfg.max_recovery_distance, extra_failure=extra)
+    bce = F.binary_cross_entropy_with_logits(output['confidence_logits'], supervised, reduction='none')
+    terms = dict(geometry_per_state=geometry,
+                 confidence_per_state=window_mean(bce, supervised_known.bool(),
+                                                  torch.arange(cfg.n_future, device=mask.device) < window),
+                 geometry_count=mask.sum(), confidence_count=supervised_known.sum(),
+                 error_sum=torch.where(mask, (predicted-target).norm(dim=-1), 0.).sum(),
+                 correct_count=(labels*known).sum())
+    if identity:
+        terms.update(identity_correct_count=(supervised*supervised_known).sum(),
+                     identity_flipped_count=(labels*known*(1-supervised)).sum())
+    if 'query_embedding' in output and 'positive_mask' in batch:
+        terms.update(identity_terms(output, batch, cfg, identity_temperature))
+    return terms

@@ -70,6 +70,9 @@ def field_axis(vol: FiberVolume, p_xyz: np.ndarray) -> tuple[np.ndarray, float]:
     return axes[:, -1], float(weights.max()**.5)
 
 class ModelTracer:
+    # When set, build_inputs also receives each trace's seed segment and length.
+    path_context = False
+
     def __init__(self, model: FollowNet, vol: FiberVolume, crop: CropSpec, n_history: int = 128,
                  params: TraceParams | None = None, device: str = "cuda"):
         self.model, self.vol, self.crop = model, vol, crop
@@ -159,7 +162,11 @@ class ModelTracer:
                 hist_world[j] = interp_at(past, arc, target.clip(0))
             hist = np.einsum('bhi,bij->bhj', hist_world-pos[:, None], fr)
             tensor = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(self.device)
-            x = self.build_inputs(pos, fr, hist, hm)
+            context = {}
+            if self.path_context:
+                context['paths'] = [dict(seed_segment=np.asarray(paths[i][hist_start[i]:hist_start[i]+64]),
+                                         travelled=float(length[i])) for i in idx]
+            x = self.build_inputs(pos, fr, hist, hm, **context)
             sampling = {}
             if stochastic:
                 sampling['initial_noise'] = trace_noise(self.model.cfg, [generators[i] for i in idx], self.device)

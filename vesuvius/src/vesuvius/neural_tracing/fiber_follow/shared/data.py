@@ -414,9 +414,17 @@ class FollowDataset(torch.utils.data.IterableDataset):
             self._set_replay([OnPolicyStates.load(path) for path in paths])
             self._replay_paths = paths
 
+    def prepare(self, item, rng):
+        """Let the batch builder attach geometry it reads later (e.g. path patches)."""
+        if hasattr(self.batch_builder, 'prepare'):
+            return self.batch_builder.prepare(item, self.fibers[item['fiber_ref'][0]], rng)
+        return item
+
     def state_allowed(self, item):
-        return all(training_state_allowed(item, crop, self.exclude)
-                   for crop in (self.cfg.crop, *self.additional_crops))
+        return (all(training_state_allowed(item, crop, self.exclude)
+                    for crop in (self.cfg.crop, *self.additional_crops))
+                and (not hasattr(self.batch_builder, 'footprint_allowed')
+                     or self.batch_builder.footprint_allowed(item, self.exclude)))
 
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
@@ -444,25 +452,38 @@ class FollowDataset(torch.utils.data.IterableDataset):
                                        reverse=bool(op.reverse[j]), offtrack=bool(op.offtrack[j]))
                     item['source'],item['stratum'] = source,band
                     item['source_step'] = op.provenance.get('step', -1) or -1
+                    fi, t = int(op.fiber_idx[j]), float(op.t[j])
+                    item['fiber_ref'] = (fi, self.fibers[fi].length-t if op.reverse[j] else t, bool(op.reverse[j]))
+                    item = self.prepare(item, rng)
                     if not self.state_allowed(item):
                         item = None
                 if item is None:
-                    while len(windows) < self.pool_size:
-                        f = self.fibers[rng.choice(len(self.fibers), p=self.weights)]
-                        windows.append([f, rng.uniform(0, f.length), self.window_samples])
-                    wi = rng.integers(len(windows))
-                    f, center, _ = windows[wi]
-                    windows[wi][2] -= 1
-                    if windows[wi][2] <= 0:
-                        windows.pop(wi)
-                    rev = bool(rng.integers(2))
-                    if rng.random() < .1:
-                        t = max(0, f.length-rng.uniform(0, cfg.future_s[-1]*1.5))
+                    # A builder may oversample chosen locations; otherwise draw windows.
+                    location = (self.batch_builder.fresh_location(rng)
+                                if hasattr(self.batch_builder, 'fresh_location') else None)
+                    if location is None:
+                        while len(windows) < self.pool_size:
+                            fi = rng.choice(len(self.fibers), p=self.weights)
+                            windows.append([fi, rng.uniform(0, self.fibers[fi].length), self.window_samples])
+                        wi = rng.integers(len(windows))
+                        fi, center, _ = windows[wi]
+                        f = self.fibers[fi]
+                        windows[wi][2] -= 1
+                        if windows[wi][2] <= 0:
+                            windows.pop(wi)
+                        rev = bool(rng.integers(2))
+                        if rng.random() < .1:
+                            t = max(0, f.length-rng.uniform(0, cfg.future_s[-1]*1.5))
+                        else:
+                            original_t = np.clip(center+rng.uniform(-self.window/2, self.window/2), 0, f.length)
+                            t = f.length-original_t if rev else original_t
                     else:
-                        original_t = np.clip(center+rng.uniform(-self.window/2, self.window/2), 0, f.length)
-                        t = f.length-original_t if rev else original_t
-                    item = make_sample(f, t, rev, cfg, rng)
+                        fi, t, rev = location['fiber'], location['t'], location['reverse']
+                    item = make_sample(self.fibers[fi], t, rev, cfg, rng)
                     item['source'], item['source_step'], item['stratum'] = 0, -1, -1
+                    item['fiber_ref'] = (int(fi), float(t), bool(rev))
+                    item['location_source'] = location['source'] if location else 0
+                    item = self.prepare(item, rng)
                 if self.state_allowed(item):
                     items.append(item)
                 if len(items) == self.chunk:
