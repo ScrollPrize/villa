@@ -91,6 +91,12 @@ jobs:
       - name: Build
         run: ninja -C build/ci-windows-mingw
 
+      - name: Test unified browser Windows paths
+        run: |
+          cmake --preset ci-windows-mingw -DVC_USE_SCCACHE=ON -DSCCACHE_PROGRAM="${SCCACHE_PATH}" -DVC_TESTING=ON
+          ninja -C build/ci-windows-mingw test_unified_browser_dialog
+          ctest --test-dir build/ci-windows-mingw --no-tests=error --output-on-failure -R '^unified_browser_dialog$'
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'

@@ -4196,3 +4196,377 @@ TEST_CASE("kollesis terminations sit on fiber ends and block placement beyond th
     CHECK(!generatedLinePositionBeyondTaggedEnd(positions, {true}, 100.0));
     CHECK(!generatedLinePositionBeyondTaggedEnd({}, {}, 5.0));
 }
+
+TEST_CASE("break tags make gap spans between consecutive tagged points")
+{
+    using namespace vc3d::line_annotation;
+
+    // The tag string loads through both readers like any other tag, and a
+    // point with both tags is a conflict the toggles and the collapse refuse.
+    StoredControlPoint stored{{1.0, 2.0, 3.0}};
+    CHECK(setControlPointTag(stored.tags, kBreakTag, true));
+    const auto json = storedControlPointToJson(stored);
+    REQUIRE(json.contains("tags"));
+    CHECK(json["tags"] == nlohmann::json::array({"break"}));
+    CHECK(storedControlPointFromJson(json, 3).tags == std::vector<std::string>{"break"});
+    const nlohmann::json root = {{"control_points", nlohmann::json::array({json})}};
+    CHECK_NOTHROW(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+        root, "control_points", 3, "test fiber"));
+    CHECK(!controlPointTagsConflict(stored.tags));
+    CHECK(controlPointTagsConflict(
+        mergedControlPointTags(stored.tags, {kKollesisTerminationTag})));
+
+    // Gap spans over control lists: both endpoints tagged, by index.
+    std::vector<LineControlPoint> controls{
+        LineControlPoint{0.0, cv::Vec3d(0.0, 0.0, 0.0), true, 0},
+        LineControlPoint{10.0, cv::Vec3d(10.0, 0.0, 0.0), false, 10},
+        LineControlPoint{20.0, cv::Vec3d(20.0, 0.0, 0.0), false, 20},
+        LineControlPoint{30.0, cv::Vec3d(30.0, 0.0, 0.0), false, 30},
+        LineControlPoint{40.0, cv::Vec3d(40.0, 0.0, 0.0), false, 40}};
+    using Spans = std::vector<std::pair<size_t, size_t>>;
+    CHECK(gapSpansForControls(controls).empty());
+    controls[1].tags = {kBreakTag};
+    // A lone break point makes no gap.
+    CHECK(gapSpansForControls(controls).empty());
+    controls[2].tags = {kBreakTag};
+    CHECK(gapSpansForControls(controls) == Spans{{1, 2}});
+    // Three in a row: two consecutive gap spans.
+    controls[3].tags = {kBreakTag};
+    CHECK(gapSpansForControls(controls) == Spans{{1, 2}, {2, 3}});
+    // A break at either fiber end alone changes nothing.
+    controls[4].tags = {kBreakTag};
+    controls[3].tags.clear();
+    CHECK(gapSpansForControls(controls) == Spans{{1, 2}});
+    // Neighbours are taken in LINE-POSITION order, not vector order, and the
+    // pair is named lower-position first: a session whose controls were
+    // reopened out of order still gates and owns the same span the overlays
+    // draw.
+    {
+        std::vector<LineControlPoint> shuffled{
+            LineControlPoint{0.0, cv::Vec3d(0.0, 0.0, 0.0), true, 0},
+            LineControlPoint{20.0, cv::Vec3d(20.0, 0.0, 0.0), false, 20},
+            LineControlPoint{10.0, cv::Vec3d(10.0, 0.0, 0.0), false, 10},
+            LineControlPoint{40.0, cv::Vec3d(40.0, 0.0, 0.0), false, 40}};
+        shuffled[1].tags = {kBreakTag};
+        shuffled[2].tags = {kBreakTag};
+        CHECK(gapSpansForControls(shuffled) == Spans{{2, 1}});
+        // A break at 40 is not a neighbour of the one at 20 in either order.
+        shuffled[3].tags = {kBreakTag};
+        shuffled[2].tags.clear();
+        CHECK(gapSpansForControls(shuffled) == Spans{{1, 3}});
+        // NaN positions take no part.
+        shuffled[1].linePosition = std::numeric_limits<double>::quiet_NaN();
+        CHECK(gapSpansForControls(shuffled).empty());
+    }
+
+    // Overlay markers read the gap from the SPAN tag (hasGapToNext), which
+    // syncGapSpanTags puts in step with the break tags; the ranges run from
+    // the owner to the next control in line-position order. Then the
+    // placement gate: strictly inside a gap is blocked, the endpoints and
+    // everything else stay open.
+    {
+        const auto sync = syncGapSpanTags(controls);
+        CHECK(sync.formed == std::vector<size_t>{1});
+        CHECK(sync.dissolved.empty());
+        CHECK(spanIsGap(controls[1].segmentToNext));
+        CHECK(!spanIsGap(controls[0].segmentToNext));
+        CHECK(!spanIsGap(controls[2].segmentToNext));
+        // Idempotent.
+        CHECK(!syncGapSpanTags(controls).changed());
+    }
+    std::vector<GeneratedOverlay::ControlPointMarker> markers;
+    for (size_t i = 0; i < controls.size(); ++i) {
+        GeneratedOverlay::ControlPointMarker m;
+        m.controlIndex = i;
+        m.linePosition = controls[i].linePosition;
+        m.isBreak = hasControlPointTag(controls[i].tags, kBreakTag);
+        m.hasGapToNext = spanIsGap(controls[i].segmentToNext);
+        markers.push_back(m);
+    }
+    const auto ranges = generatedGapLineRanges(markers);
+    REQUIRE(ranges.size() == 1);
+    CHECK(ranges[0].first == 10.0);
+    CHECK(ranges[0].second == 20.0);
+    CHECK(generatedLinePositionInsideGap(ranges, 15.0));
+    CHECK(generatedLinePositionInsideGap(ranges, 10.5));
+    CHECK(!generatedLinePositionInsideGap(ranges, 10.0));
+    CHECK(!generatedLinePositionInsideGap(ranges, 20.0));
+    CHECK(!generatedLinePositionInsideGap(ranges, 25.0));
+    CHECK(!generatedLinePositionInsideGap(ranges, std::numeric_limits<double>::quiet_NaN()));
+    // Dense segments: every one between the two controls is in the gap, the
+    // neighbours outside are not.
+    CHECK(generatedLineSegmentInGap(10.0, 11.0, ranges));
+    CHECK(generatedLineSegmentInGap(19.0, 20.0, ranges));
+    CHECK(!generatedLineSegmentInGap(9.0, 10.0, ranges));
+    CHECK(!generatedLineSegmentInGap(20.0, 21.0, ranges));
+
+    // Two rings without the span tag are NOT a gap for the overlays: the
+    // drawn line reports the span metadata, so a file whose span tag is
+    // missing shows rings and no amber line until the load heal fixes it.
+    markers[1].hasGapToNext = false;
+    CHECK(generatedGapLineRanges(markers).empty());
+    markers[1].hasGapToNext = true;
+    // The ranges come from the full list: filtering the markers (as the
+    // cross-slice overlay does by plane distance) must not move a range's
+    // end to the next VISIBLE control. Here 20 is hidden, so a filtered
+    // caller would span 10..40.
+    std::vector<GeneratedOverlay::ControlPointMarker> filtered{markers[1], markers[4]};
+    CHECK(generatedGapLineRanges(filtered)[0].second == 40.0);
+    CHECK(generatedGapLineRanges(markers)[0].second == 20.0);
+    // Reversed order in the vector does not matter: sorted by line position.
+    std::reverse(markers.begin(), markers.end());
+    const auto reversedRanges = generatedGapLineRanges(markers);
+    REQUIRE(reversedRanges.size() == 1);
+    CHECK(reversedRanges[0].first == 10.0);
+    CHECK(reversedRanges[0].second == 20.0);
+
+    // Dissolving: removing a break clears the span tag, and the goal policy
+    // for structural edits returns a cspline span to global (any other goal
+    // is left alone).
+    controls[1].segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+    controls[2].tags.clear();
+    const auto dissolved = applyGapSpanPolicy(controls);
+    CHECK(dissolved.dissolved == std::vector<size_t>{1});
+    CHECK(!spanIsGap(controls[1].segmentToNext));
+    CHECK(controls[1].segmentToNext->interpGoal == SegmentInterpolationGoal::Global);
+    controls[2].tags = {kBreakTag};
+    controls[1].segmentToNext->interpGoal = SegmentInterpolationGoal::Trace;
+    const auto formed = applyGapSpanPolicy(controls);
+    CHECK(formed.formed == std::vector<size_t>{1});
+    CHECK(controls[1].segmentToNext->interpGoal == SegmentInterpolationGoal::Cspline);
+    controls[2].tags.clear();
+    controls[1].segmentToNext->interpGoal = SegmentInterpolationGoal::Lasagna;
+    applyGapSpanPolicy(controls);
+    CHECK(controls[1].segmentToNext->interpGoal == SegmentInterpolationGoal::Lasagna);
+}
+
+TEST_CASE("version 4 carries span tags; version 3 spans may not")
+{
+    using namespace vc3d::line_annotation;
+    CHECK(kFiberFormatVersion == 4);
+
+    StoredControlPoint owner{{0.0, 0.0, 0.0}};
+    owner.segmentToNext.emplace();
+    owner.segmentToNext->interpMode = SegmentInterpolationMode::Lasagna;
+    owner.segmentToNext->message = "lasagna";
+    // No tags: the span serializes exactly as in version 3 (no "tags" key).
+    CHECK(!storedControlPointToJson(owner)["segment_to_next"].contains("tags"));
+    CHECK(setControlPointTag(owner.segmentToNext->tags, kGapSpanTag, true));
+    const auto json = storedControlPointToJson(owner);
+    REQUIRE(json["segment_to_next"].contains("tags"));
+    CHECK(json["segment_to_next"]["tags"] == nlohmann::json::array({"gap"}));
+    // Round trip under version 4; rejected as an unknown field under 3.
+    const auto parsed = storedControlPointFromJson(json, 4);
+    REQUIRE(parsed.segmentToNext);
+    CHECK(parsed.segmentToNext->tags == std::vector<std::string>{"gap"});
+    CHECK(spanIsGap(parsed.segmentToNext));
+    CHECK_THROWS_AS(storedControlPointFromJson(json, 3), std::runtime_error);
+    // Malformed shapes.
+    nlohmann::json bad = json;
+    bad["segment_to_next"]["tags"] = "gap";
+    CHECK_THROWS_AS(storedControlPointFromJson(bad, 4), std::runtime_error);
+    bad["segment_to_next"]["tags"] = nlohmann::json::array({1});
+    CHECK_THROWS_AS(storedControlPointFromJson(bad, 4), std::runtime_error);
+
+    // The shared core reader: same rules, per version.
+    StoredControlPoint last{{10.0, 0.0, 0.0}};
+    const nlohmann::json root = {
+        {"control_points", nlohmann::json::array({json, storedControlPointToJson(last)})}};
+    CHECK_NOTHROW(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+        root, "control_points", 4, "test fiber"));
+    CHECK_THROWS_AS(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+                        root, "control_points", 3, "test fiber"),
+                    std::runtime_error);
+    const nlohmann::json badRoot = {
+        {"control_points", nlohmann::json::array({bad, storedControlPointToJson(last)})}};
+    CHECK_THROWS_AS(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+                        badRoot, "control_points", 4, "test fiber"),
+                    std::runtime_error);
+
+    // Load heal over stored controls: two consecutive breaks without the
+    // span tag get it (and a stale tag goes away); nothing else changes.
+    std::vector<StoredControlPoint> stored{StoredControlPoint{cv::Vec3d(0.0, 0.0, 0.0)},
+                                           StoredControlPoint{cv::Vec3d(5.0, 0.0, 0.0)},
+                                           StoredControlPoint{cv::Vec3d(10.0, 0.0, 0.0)},
+                                           StoredControlPoint{cv::Vec3d(15.0, 0.0, 0.0)}};
+    for (size_t i = 0; i + 1 < stored.size(); ++i) {
+        stored[i].segmentToNext.emplace();
+        stored[i].segmentToNext->interpMode = SegmentInterpolationMode::Lasagna;
+        stored[i].segmentToNext->message = "lasagna";
+    }
+    CHECK(!syncGapSpanTags(stored));
+    stored[1].tags = {kBreakTag};
+    stored[2].tags = {kBreakTag};
+    setControlPointTag(stored[0].segmentToNext->tags, kGapSpanTag, true);  // stale
+    CHECK(syncGapSpanTags(stored));
+    CHECK(spanIsGap(stored[1].segmentToNext));
+    CHECK(!spanIsGap(stored[0].segmentToNext));
+    CHECK(!spanIsGap(stored[2].segmentToNext));
+    CHECK(!syncGapSpanTags(stored));
+    // A reverse keeps the gap on the same span (descriptors shift with it).
+    const auto reversed = reversedStoredControlPoints(stored);
+    REQUIRE(reversed.size() == 4);
+    CHECK(spanIsGap(reversed[1].segmentToNext));
+    CHECK(!syncGapSpanTags(const_cast<std::vector<StoredControlPoint>&>(reversed)));
+}
+
+TEST_CASE("damaged span tag: display only, never on a gap span, alternating ranges")
+{
+    using namespace vc3d::line_annotation;
+
+    std::vector<LineControlPoint> controls{
+        LineControlPoint{0.0, cv::Vec3d(0.0, 0.0, 0.0), true, 0},
+        LineControlPoint{10.0, cv::Vec3d(10.0, 0.0, 0.0), false, 10},
+        LineControlPoint{20.0, cv::Vec3d(20.0, 0.0, 0.0), false, 20},
+        LineControlPoint{30.0, cv::Vec3d(30.0, 0.0, 0.0), false, 30}};
+    // setSpanTag never creates a descriptor (a control without one owns no
+    // span: the final control, or a peer's control whose span is gone).
+    CHECK(!controls[1].segmentToNext);
+    CHECK(!setSpanTag(controls[1].segmentToNext, kDamagedSpanTag, true));
+    CHECK(!controls[1].segmentToNext);
+    controls[1].segmentToNext.emplace();
+    controls[1].segmentToNext->interpMode = SegmentInterpolationMode::Lasagna;
+    controls[1].segmentToNext->message = "lasagna";
+    CHECK(setSpanTag(controls[1].segmentToNext, kDamagedSpanTag, true));
+    CHECK(spanIsDamaged(controls[1].segmentToNext));
+    CHECK(!setSpanTag(controls[1].segmentToNext, kDamagedSpanTag, true));
+    // Clearing a tag on a span without a descriptor is a no-op.
+    CHECK(!setSpanTag(controls[2].segmentToNext, kDamagedSpanTag, false));
+    CHECK(!controls[2].segmentToNext);
+    // Nothing else about the span changed: no goal, no point tags.
+    CHECK(controls[1].segmentToNext->interpGoal == SegmentInterpolationGoal::Global);
+    CHECK(controls[1].tags.empty());
+
+    // A gap wins: when the span becomes a gap the damaged tag goes away.
+    controls[1].tags = {kBreakTag};
+    controls[2].tags = {kBreakTag};
+    const auto sync = syncGapSpanTags(controls);
+    CHECK(sync.formed == std::vector<size_t>{1});
+    CHECK(spanIsGap(controls[1].segmentToNext));
+    CHECK(!spanIsDamaged(controls[1].segmentToNext));
+    // Same over stored controls.
+    std::vector<StoredControlPoint> stored{StoredControlPoint{cv::Vec3d(0.0, 0.0, 0.0)},
+                                           StoredControlPoint{cv::Vec3d(5.0, 0.0, 0.0)},
+                                           StoredControlPoint{cv::Vec3d(10.0, 0.0, 0.0)}};
+    for (size_t i = 0; i + 1 < stored.size(); ++i) {
+        stored[i].segmentToNext.emplace();
+        stored[i].segmentToNext->interpMode = SegmentInterpolationMode::Lasagna;
+        stored[i].segmentToNext->message = "lasagna";
+    }
+    setControlPointTag(stored[0].segmentToNext->tags, kDamagedSpanTag, true);
+    stored[0].tags = {kBreakTag};
+    stored[1].tags = {kBreakTag};
+    CHECK(syncGapSpanTags(stored));
+    CHECK(spanIsGap(stored[0].segmentToNext));
+    CHECK(!spanIsDamaged(stored[0].segmentToNext));
+    // Round trip under version 4.
+    const auto json = storedControlPointToJson(stored[0]);
+    CHECK(json["segment_to_next"]["tags"] == nlohmann::json::array({"gap"}));
+    StoredControlPoint damagedOnly{{0.0, 0.0, 0.0}};
+    damagedOnly.segmentToNext.emplace();
+    damagedOnly.segmentToNext->interpMode = SegmentInterpolationMode::Lasagna;
+    damagedOnly.segmentToNext->message = "lasagna";
+    setSpanTag(damagedOnly.segmentToNext, kDamagedSpanTag, true);
+    const auto parsed = storedControlPointFromJson(storedControlPointToJson(damagedOnly), 4);
+    CHECK(spanIsDamaged(parsed.segmentToNext));
+
+    // Overlay ranges: damaged spans by the span flag, never where the span is
+    // also a gap; the placement gate ignores damaged spans.
+    std::vector<GeneratedOverlay::ControlPointMarker> markers(4);
+    for (size_t i = 0; i < 4; ++i) {
+        markers[i].controlIndex = i;
+        markers[i].linePosition = 10.0 * static_cast<double>(i);
+    }
+    markers[0].hasDamagedToNext = true;
+    markers[1].hasDamagedToNext = true;
+    markers[1].hasGapToNext = true;
+    const auto damaged = generatedDamagedLineRanges(markers);
+    REQUIRE(damaged.size() == 1);
+    CHECK(damaged[0].first == 0.0);
+    CHECK(damaged[0].second == 10.0);
+    const auto gaps = generatedGapLineRanges(markers);
+    REQUIRE(gaps.size() == 1);
+    CHECK(gaps[0].first == 10.0);
+    CHECK(!generatedLinePositionInsideGap(gaps, 5.0));
+    CHECK(generatedLinePositionInsideGap(gaps, 15.0));
+
+    // A break is refused at or next to a kollesis termination: the
+    // line-order neighbour test the menus use.
+    markers[3].isKollesisTermination = true;
+    CHECK(generatedLineOrderNeighbourIsKollesisTermination(markers, 2));
+    CHECK(!generatedLineOrderNeighbourIsKollesisTermination(markers, 1));
+    CHECK(!generatedLineOrderNeighbourIsKollesisTermination(markers, 0));
+    // Order is by line position, not vector order.
+    std::swap(markers[2], markers[3]);
+    CHECK(generatedLineOrderNeighbourIsKollesisTermination(markers, 2));
+    CHECK(!generatedLineOrderNeighbourIsKollesisTermination(markers, 1));
+}
+
+TEST_CASE("stored gap policy: a merge join between two breaks becomes a cspline gap")
+{
+    using namespace vc3d::line_annotation;
+    std::vector<StoredControlPoint> stored{StoredControlPoint{cv::Vec3d(0.0, 0.0, 0.0)},
+                                           StoredControlPoint{cv::Vec3d(5.0, 0.0, 0.0)},
+                                           StoredControlPoint{cv::Vec3d(10.0, 0.0, 0.0)},
+                                           StoredControlPoint{cv::Vec3d(15.0, 0.0, 0.0)}};
+    for (size_t i = 0; i + 1 < stored.size(); ++i) {
+        stored[i].segmentToNext.emplace();
+        stored[i].segmentToNext->interpMode = SegmentInterpolationMode::Lasagna;
+        stored[i].segmentToNext->message = "lasagna";
+    }
+    CHECK(!applyGapSpanPolicy(stored));
+    stored[1].tags = {kBreakTag};
+    stored[2].tags = {kBreakTag};
+    setControlPointTag(stored[1].segmentToNext->tags, kDamagedSpanTag, true);
+    CHECK(applyGapSpanPolicy(stored));
+    CHECK(spanIsGap(stored[1].segmentToNext));
+    CHECK(!spanIsDamaged(stored[1].segmentToNext));
+    CHECK(stored[1].segmentToNext->interpGoal == SegmentInterpolationGoal::Cspline);
+    CHECK(stored[0].segmentToNext->interpGoal == SegmentInterpolationGoal::Global);
+    // Dissolving returns a still-cspline span to global; an explicit other
+    // goal is left alone.
+    stored[2].tags.clear();
+    CHECK(applyGapSpanPolicy(stored));
+    CHECK(!spanIsGap(stored[1].segmentToNext));
+    CHECK(stored[1].segmentToNext->interpGoal == SegmentInterpolationGoal::Global);
+    stored[2].tags = {kBreakTag};
+    stored[1].segmentToNext->interpGoal = SegmentInterpolationGoal::Trace;
+    applyGapSpanPolicy(stored);
+    stored[2].tags.clear();
+    stored[1].segmentToNext->interpGoal = SegmentInterpolationGoal::Lasagna;
+    applyGapSpanPolicy(stored);
+    CHECK(stored[1].segmentToNext->interpGoal == SegmentInterpolationGoal::Lasagna);
+}
+
+TEST_CASE("the JSON-level gap normalisation agrees with the typed sync")
+{
+    using namespace vc3d::line_annotation;
+    // Typed side: two breaks around span 1, a stale gap on span 0, damaged on
+    // span 1 (which the gap must clear) and an unrelated tag on span 2.
+    std::vector<StoredControlPoint> stored{StoredControlPoint{cv::Vec3d(0.0, 0.0, 0.0)},
+                                           StoredControlPoint{cv::Vec3d(5.0, 0.0, 0.0)},
+                                           StoredControlPoint{cv::Vec3d(10.0, 0.0, 0.0)},
+                                           StoredControlPoint{cv::Vec3d(15.0, 0.0, 0.0)}};
+    for (size_t i = 0; i + 1 < stored.size(); ++i) {
+        stored[i].segmentToNext.emplace();
+        stored[i].segmentToNext->interpMode = SegmentInterpolationMode::Lasagna;
+        stored[i].segmentToNext->message = "lasagna";
+    }
+    stored[1].tags = {kBreakTag};
+    stored[2].tags = {kBreakTag};
+    setControlPointTag(stored[0].segmentToNext->tags, kGapSpanTag, true);
+    setControlPointTag(stored[1].segmentToNext->tags, kDamagedSpanTag, true);
+    setControlPointTag(stored[2].segmentToNext->tags, "other", true);
+    nlohmann::json controls = nlohmann::json::array();
+    for (const auto& control : stored) {
+        controls.push_back(storedControlPointToJson(control));
+    }
+    vc::fiber_tracer::normalizeGapSpanTagsJson(controls);
+    syncGapSpanTags(stored);
+    for (size_t i = 0; i < stored.size(); ++i) {
+        CHECK(controls[i] == storedControlPointToJson(stored[i]));
+    }
+    CHECK(!controls[0]["segment_to_next"].contains("tags"));
+    CHECK(controls[1]["segment_to_next"]["tags"] == nlohmann::json::array({"gap"}));
+    CHECK(controls[2]["segment_to_next"]["tags"] == nlohmann::json::array({"other"}));
+}

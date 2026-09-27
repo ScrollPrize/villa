@@ -54,6 +54,9 @@ class FiberTraceSegmentMetadata:
     lasagna_failure_code: str
     lasagna_failure_detail: str
     config: dict[str, float | int]
+    # Span tags (format version 4, e.g. "gap"): strings describing the span
+    # itself; empty for version-3 files.
+    tags: tuple[str, ...] = ()
 
     @property
     def max_endpoint_error_base_voxels(self) -> float:
@@ -98,8 +101,21 @@ def _points(raw: Any, *, label: str) -> tuple[tuple[float, float, float], ...]:
     return tuple(result)
 
 
-def parse_segment_metadata(raw: Any) -> FiberTraceSegmentMetadata:
-    if not isinstance(raw, dict) or set(raw) != _SEGMENT_KEYS_V3:
+def parse_segment_metadata(raw: Any, *, version: int = 3) -> FiberTraceSegmentMetadata:
+    """version: the file's vc3d_fiber version. Version 4 adds an optional span
+    `tags` array of strings (omitted when empty); a version-3 span carrying it
+    is an unknown field."""
+    if not isinstance(raw, dict):
+        raise ValueError("segment_to_next has missing or unknown fields")
+    keys = set(raw)
+    tags: tuple[str, ...] = ()
+    if version >= 4 and "tags" in keys:
+        raw_tags = raw["tags"]
+        if not (isinstance(raw_tags, list) and all(isinstance(tag, str) for tag in raw_tags)):
+            raise ValueError("segment_to_next tags must be a list of strings")
+        tags = tuple(raw_tags)
+        keys.discard("tags")
+    if keys != _SEGMENT_KEYS_V3:
         raise ValueError("segment_to_next has missing or unknown fields")
     if raw["optimizer"] != "native_fiber_trace3d":
         raise ValueError(f"unsupported segment_to_next optimizer: {raw['optimizer']!r}")
@@ -190,6 +206,7 @@ def parse_segment_metadata(raw: Any) -> FiberTraceSegmentMetadata:
         lasagna_failure_code=raw["lasagna_failure_code"],
         lasagna_failure_detail=raw["lasagna_failure_detail"],
         config=normalized_config,
+        tags=tags,
     )
 
 
@@ -217,13 +234,14 @@ def parse_vc3d_fiber_format(
     if obj.get("type", "vc3d_fiber") != "vc3d_fiber":
         raise ValueError(f"{label} type must be 'vc3d_fiber'")
     version = obj.get("version", 1)
-    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 3}:
-        raise ValueError(f"only vc3d_fiber versions 1 and 3 are supported, got {version!r}")
-    if version == 3 and "type" not in obj:
-        raise ValueError("version-3 vc3d_fiber is missing type")
+    # Version 4 = version 3 plus optional span tags (see parse_segment_metadata).
+    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 3, 4}:
+        raise ValueError(f"only vc3d_fiber versions 1, 3 and 4 are supported, got {version!r}")
+    if version >= 3 and "type" not in obj:
+        raise ValueError("version-3/4 vc3d_fiber is missing type")
 
-    if version == 3 and "optimization_mode" not in obj:
-        raise ValueError("version-3 vc3d_fiber is missing optimization_mode")
+    if version >= 3 and "optimization_mode" not in obj:
+        raise ValueError("version-3/4 vc3d_fiber is missing optimization_mode")
     optimization_mode = obj.get("optimization_mode", "lasagna")
     if not isinstance(optimization_mode, str) or optimization_mode not in {
         "lasagna", "native_fiber_trace3d"
@@ -242,16 +260,16 @@ def parse_vc3d_fiber_format(
         parsed_segments: list[FiberTraceSegmentMetadata | None] = []
         for index, control in enumerate(raw_controls):
             if not isinstance(control, dict) or not set(control) <= {"position", "segment_to_next", "tags"}:
-                raise ValueError("version-3 control points must contain only position, segment_to_next and tags")
+                raise ValueError("version-3/4 control points must contain only position, segment_to_next and tags")
             if "position" not in control:
-                raise ValueError("version-3 control point is missing position")
+                raise ValueError("version-3/4 control point is missing position")
             # Optional per-control-point tags (VC3D writes e.g. "kollesis_termination",
             # only when non-empty). Validated for shape, not consumed here.
             if "tags" in control and not (
                 isinstance(control["tags"], list)
                 and all(isinstance(tag, str) for tag in control["tags"])
             ):
-                raise ValueError("version-3 control point tags must be a list of strings")
+                raise ValueError("version-3/4 control point tags must be a list of strings")
             positions.append(control["position"])
             if index + 1 == len(raw_controls):
                 if "segment_to_next" in control:
@@ -260,12 +278,13 @@ def parse_vc3d_fiber_format(
             else:
                 if "segment_to_next" not in control:
                     raise ValueError("a non-final control point is missing segment_to_next")
-                parsed_segments.append(parse_segment_metadata(control["segment_to_next"]))
+                parsed_segments.append(
+                    parse_segment_metadata(control["segment_to_next"], version=version))
         control_points = _points(positions, label=f"{label} control_points")
         segments = tuple(parsed_segments)
 
     generation = obj.get("generation", 1)
-    if version == 3:
+    if version >= 3:
         if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
             raise ValueError("vc3d_fiber generation must be a non-negative integer")
     else:

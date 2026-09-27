@@ -8,8 +8,9 @@ import torch
 import torch.nn.functional as F
 
 
-GAP_PARAMETERIZATION_VERSION = 2
-LEGACY_EXPONENT_SCALE = 200.0
+# d(log gap)/d(effective_latent) at zero latent: the gap's relative
+# sensitivity to its latent where the gap equals the nominal spacing.
+GAP_LOG_SLOPE_AT_IDENTITY = 200.0
 DR_PARAMETER_SCALE = 12.0
 
 
@@ -27,12 +28,13 @@ def calibrated_gap_softplus_scale(
     min_gap: float,
     bias: float,
 ) -> float:
-    """Match the legacy exponential's derivative at the identity.
+    """Softplus scale giving ``d(log gap)/d(effective_latent)`` of 200 at zero latent.
 
     The transform's effective latent value already includes
-    ``model_gap_expander_lr_scale``.  This scale therefore preserves the old
-    ``d(gap)/d(effective_latent) = 200 * dr`` at latent zero without retaining
-    the exponential's overflow or zero-gap tails.
+    ``model_gap_expander_lr_scale``; this scale fixes the gap's relative
+    sensitivity to it at the identity, where the gap equals the nominal
+    spacing, so the absolute slope there is GAP_LOG_SLOPE_AT_IDENTITY times
+    ``nominal_dr``.
     """
     if not (0.0 < min_gap < nominal_dr):
         raise ValueError(
@@ -41,7 +43,7 @@ def calibrated_gap_softplus_scale(
     softplus_bias = math.log1p(math.exp(-abs(bias))) + max(bias, 0.0)
     sigmoid_bias = 1.0 / (1.0 + math.exp(-bias))
     return (
-        LEGACY_EXPONENT_SCALE
+        GAP_LOG_SLOPE_AT_IDENTITY
         * nominal_dr / (nominal_dr - min_gap)
         * softplus_bias / sigmoid_bias
     )
