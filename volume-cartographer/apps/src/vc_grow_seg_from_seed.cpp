@@ -1509,9 +1509,13 @@ int main(int argc, char *argv[])
     // ~6-10% (indistinguishable from random points in the volume), while true
     // sheets land at ~100%, so the default 0.5 threshold separates them with
     // wide margin. The background rate (same fraction over uniform random
-    // points) is reported alongside: a surface at or below background follows
-    // the prediction no better than chance, which the absolute threshold
-    // cannot catch on dense predictions. Warn-only by default; set
+    // points in the surface's neighborhood) is reported alongside: a surface
+    // at or below background follows the prediction no better than chance,
+    // which the absolute threshold cannot catch on dense predictions. The
+    // neighborhood is the bounding box of valid vertices dilated by 64
+    // voxels, so its chunks were already loaded by the growth itself (no
+    // volume-wide scattered reads, which would be punitive on remote
+    // volumes). Warn-only by default; set
     // "require_on_prediction_support" to discard the surface and fail instead.
     {
         const cv::Mat_<cv::Vec3f> pts = surf->rawPoints();
@@ -1526,23 +1530,42 @@ int main(int argc, char *argv[])
         };
         const vc::surface::OnPredictionSupport support =
             vc::surface::onPredictionSupport(pts, sample_prediction);
-        // Background rate over uniform random points in the volume, fixed
-        // seed so the estimate is reproducible run to run.
-        cv::Mat_<cv::Vec3f> bg_pts(2000, 1);
-        std::mt19937 bg_rng(42);
-        std::uniform_real_distribution<float> bg_x(0.0f, static_cast<float>(volume_shape_zyx[2]));
-        std::uniform_real_distribution<float> bg_y(0.0f, static_cast<float>(volume_shape_zyx[1]));
-        std::uniform_real_distribution<float> bg_z(0.0f, static_cast<float>(volume_shape_zyx[0]));
-        for (int i = 0; i < bg_pts.rows; ++i) {
-            bg_pts(i, 0) = cv::Vec3f(bg_x(bg_rng), bg_y(bg_rng), bg_z(bg_rng));
+        // Background rate: the same fraction over uniform random points in
+        // the surface's neighborhood (bounding box of valid vertices, dilated
+        // by 64 voxels and clamped to the volume). Volume-wide uniform points
+        // would scatter one read per chunk -- up to ~2000 extra chunk fetches
+        // on remote (http/s3) volumes -- while the neighborhood's chunks were
+        // already loaded by the growth itself. Fixed seed keeps the estimate
+        // reproducible run to run.
+        vc::surface::OnPredictionSupport background;
+        cv::Vec3f bb_lo, bb_hi;
+        if (vc::surface::validVertexBounds(pts, bb_lo, bb_hi)) {
+            constexpr float kBackgroundDilate = 64.0f;
+            constexpr int kBackgroundSamples = 2000;
+            const float lo_x = std::max(0.0f, bb_lo[0] - kBackgroundDilate);
+            const float lo_y = std::max(0.0f, bb_lo[1] - kBackgroundDilate);
+            const float lo_z = std::max(0.0f, bb_lo[2] - kBackgroundDilate);
+            const float hi_x =
+                std::min(static_cast<float>(volume_shape_zyx[2]), bb_hi[0] + kBackgroundDilate);
+            const float hi_y =
+                std::min(static_cast<float>(volume_shape_zyx[1]), bb_hi[1] + kBackgroundDilate);
+            const float hi_z =
+                std::min(static_cast<float>(volume_shape_zyx[0]), bb_hi[2] + kBackgroundDilate);
+            cv::Mat_<cv::Vec3f> bg_pts(kBackgroundSamples, 1);
+            std::mt19937 bg_rng(42);
+            std::uniform_real_distribution<float> bg_x(lo_x, hi_x);
+            std::uniform_real_distribution<float> bg_y(lo_y, hi_y);
+            std::uniform_real_distribution<float> bg_z(lo_z, hi_z);
+            for (int i = 0; i < bg_pts.rows; ++i) {
+                bg_pts(i, 0) = cv::Vec3f(bg_x(bg_rng), bg_y(bg_rng), bg_z(bg_rng));
+            }
+            background = vc::surface::onPredictionSupport(bg_pts, sample_prediction);
         }
-        const vc::surface::OnPredictionSupport background =
-            vc::surface::onPredictionSupport(bg_pts, sample_prediction);
         std::cout << "on-prediction support: " << std::fixed << std::setprecision(1)
                   << (support.fraction * 100.0) << "% (" << support.on << "/"
                   << support.total << " vertices on nonzero prediction; background "
                   << (background.fraction * 100.0) << "% over " << background.total
-                  << " random points)" << std::endl;
+                  << " random points in the surface neighborhood)" << std::endl;
         bool support_rejected = false;
         if (support.fraction < min_on_prediction_support) {
             std::cerr << "WARNING: vc_grow_seg_from_seed: on-prediction support "
@@ -1561,8 +1584,9 @@ int main(int argc, char *argv[])
                       << (support.fraction * 100.0)
                       << "% is no better than the background rate "
                       << (background.fraction * 100.0)
-                      << "% for random points in the volume; the surface "
-                         "follows the prediction no more than chance (#1675)."
+                      << "% for random points in the surface neighborhood; the "
+                         "surface follows the prediction no more than chance "
+                         "(#1675)."
                       << std::endl;
             support_rejected = true;
         }

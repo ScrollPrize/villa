@@ -13,11 +13,14 @@ vertex (native frame) and reports the **on-prediction support** fraction. A
 surface that follows its prediction scores ~100%; one that cut across windings
 instead of following a sheet scores ~6-10% (indistinguishable from random
 points in the volume). Alongside the fraction, the tool reports the **background
-rate**: the same fraction measured on 2000 uniform random points in the volume
-(fixed seed, reproducible). A surface at or below the background rate follows
-the prediction no better than chance and triggers its own warning; this catches
+rate**: the same fraction measured on 2000 uniform random points in the
+surface's neighborhood (bounding box of valid vertices, dilated by 64 voxels,
+fixed seed). A surface at or below the background rate follows the prediction
+no better than chance and triggers its own warning; this catches
 dense-prediction cases where even a random surface would clear the absolute
-threshold. Params:
+threshold. Sampling is confined to the neighborhood so its chunks are the ones
+the growth already loaded -- volume-wide scattered reads would cost up to
+~2000 extra chunk fetches on remote (http/s3) volumes. Params:
 
 - `min_on_prediction_support` (default 0.5): warn when the fraction is below this.
   Must be within [0, 1]; anything else is rejected before tracing starts.

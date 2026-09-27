@@ -146,3 +146,38 @@ TEST_CASE("onPredictionSupport: background rate matches prediction density")
     CHECK(res.total == 2000);
     CHECK(res.fraction == doctest::Approx(1.0 / 8.0).epsilon(0.05));
 }
+
+TEST_CASE("isValidVertex: rejects sentinels and non-finite coordinates")
+{
+    using vc::surface::isValidVertex;
+    CHECK(isValidVertex(cv::Vec3f(1.f, 2.f, 3.f)));
+    CHECK(!isValidVertex(cv::Vec3f(-1.f, 2.f, 3.f)));
+    CHECK(!isValidVertex(cv::Vec3f(1.f, -1.f, 3.f)));
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    CHECK(!isValidVertex(cv::Vec3f(nan, 2.f, 3.f)));
+    CHECK(!isValidVertex(cv::Vec3f(1.f, inf, 3.f)));
+}
+
+TEST_CASE("validVertexBounds: bounds of valid vertices, false when empty")
+{
+    using vc::surface::validVertexBounds;
+    cv::Mat_<cv::Vec3f> pts(4, 1);
+    pts(0, 0) = cv::Vec3f(1.f, 5.f, 3.f);
+    pts(1, 0) = cv::Vec3f(4.f, 2.f, 7.f);
+    pts(2, 0) = cv::Vec3f(-1.f, -1.f, -1.f);  // invalid sentinel
+    pts(3, 0) = cv::Vec3f(std::numeric_limits<float>::quiet_NaN(), 0.f, 0.f);
+    cv::Vec3f lo, hi;
+    CHECK(validVertexBounds(pts, lo, hi));
+    CHECK(lo[0] == 1.f);
+    CHECK(lo[1] == 2.f);
+    CHECK(lo[2] == 3.f);
+    CHECK(hi[0] == 4.f);
+    CHECK(hi[1] == 5.f);
+    CHECK(hi[2] == 7.f);
+
+    cv::Mat_<cv::Vec3f> empty(2, 1);
+    empty(0, 0) = cv::Vec3f(-1.f, -1.f, -1.f);
+    empty(1, 0) = cv::Vec3f(-1.f, -1.f, -1.f);
+    CHECK(!validVertexBounds(empty, lo, hi));
+}

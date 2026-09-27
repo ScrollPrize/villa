@@ -23,10 +23,44 @@ inline bool validSupportThreshold(double t)
     return std::isfinite(t) && t >= 0.0 && t <= 1.0;
 }
 
+// A vertex is valid when no component is the -1 invalid sentinel and all
+// components are finite (std::lround on NaN/Inf is undefined behavior).
+inline bool isValidVertex(const cv::Vec3f& p)
+{
+    return p[0] != -1.f && p[1] != -1.f && p[2] != -1.f && std::isfinite(p[0]) &&
+           std::isfinite(p[1]) && std::isfinite(p[2]);
+}
+
+// Axis-aligned bounds of the valid vertices in points (x, y, z order).
+// Returns false when there are no valid vertices.
+inline bool validVertexBounds(const cv::Mat_<cv::Vec3f>& points, cv::Vec3f& lo, cv::Vec3f& hi)
+{
+    bool any = false;
+    for (int r = 0; r < points.rows; ++r) {
+        for (int c = 0; c < points.cols; ++c) {
+            const cv::Vec3f p = points(r, c);
+            if (!isValidVertex(p)) {
+                continue;
+            }
+            if (!any) {
+                lo = hi = p;
+                any = true;
+            } else {
+                for (int i = 0; i < 3; ++i) {
+                    lo[i] = std::min(lo[i], p[i]);
+                    hi[i] = std::max(hi[i], p[i]);
+                }
+            }
+        }
+    }
+    return any;
+}
+
 // True when the grown surface tracks the prediction no better than chance:
 // its on-prediction fraction is at or below the background rate measured on
-// uniform random points in the same volume. Absolute thresholds cannot catch
-// this on dense predictions, where even a random surface scores high.
+// uniform random points in the surface's neighborhood. Absolute thresholds
+// cannot catch this on dense predictions, where even a random surface scores
+// high.
 inline bool noBetterThanChance(const OnPredictionSupport& support,
                                const OnPredictionSupport& background)
 {
@@ -57,8 +91,7 @@ OnPredictionSupport onPredictionSupport(const cv::Mat_<cv::Vec3f>& points, Sampl
             // -1 marks invalid vertices; non-finite coordinates must also be
             // skipped before std::lround (which is UB on NaN/Inf), matching
             // QuadSurface's isValidPointSample.
-            if (p[0] == -1.f || p[1] == -1.f || p[2] == -1.f || !std::isfinite(p[0]) ||
-                !std::isfinite(p[1]) || !std::isfinite(p[2])) {
+            if (!isValidVertex(p)) {
                 continue;
             }
             ++res.total;
