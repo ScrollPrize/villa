@@ -26,7 +26,9 @@ the growth already loaded -- volume-wide scattered reads would cost up to
   Must be within [0, 1]; anything else is rejected before tracing starts.
 - `require_on_prediction_support` (default false): when true, a surface below
   the threshold (or no better than background) is discarded and the tool exits
-  non-zero instead of just warning.
+  non-zero instead of just warning. With `--segment-name` the tool writes into
+  the target directory directly, so strict mode leaves that shared directory in
+  place rather than deleting it (the rejected surface is still not saved).
 
 The check is warn-only by default so sparse but legitimate predictions are not
 rejected; opt into strict mode once the threshold is validated for a pipeline.

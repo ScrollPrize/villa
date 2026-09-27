@@ -1526,16 +1526,34 @@ int main(int argc, char *argv[])
     // sampling failure on the first call and escape uncaught on the second.
     auto discard_seg_and_fail = [&]() -> int {
         std::error_code ec;
-        if (std::filesystem::exists(seg_dir, ec) && !ec) {
-            std::filesystem::remove_all(seg_dir, ec);
-        }
-        if (ec) {
-            std::cerr << "WARNING: vc_grow_seg_from_seed: could not discard "
-                      << seg_dir << " (" << ec.message()
-                      << "); the rejected surface was left on disk" << std::endl;
+        // With --segment-name, seg_dir IS tgt_dir: the shared target
+        // directory, which this run did not create and which may hold
+        // pre-existing segments. Strict-mode cleanup must never delete it, so
+        // only remove the segment directory in the default layout, where the
+        // tool created a fresh timestamped subfolder for this run. Either way
+        // the rejected surface is not saved (this runs before the save) and
+        // the tool exits non-zero.
+        const bool can_delete_seg_dir = segment_name.empty();
+        if (can_delete_seg_dir) {
+            if (std::filesystem::exists(seg_dir, ec) && !ec) {
+                std::filesystem::remove_all(seg_dir, ec);
+            }
+            if (ec) {
+                std::cerr << "WARNING: vc_grow_seg_from_seed: could not discard "
+                          << seg_dir << " (" << ec.message()
+                          << "); the rejected surface was left on disk" << std::endl;
+            } else {
+                std::cerr << "discarding generated surface because "
+                             "require_on_prediction_support is set"
+                          << std::endl;
+            }
         } else {
-            std::cerr << "discarding generated surface because "
-                         "require_on_prediction_support is set"
+            std::cerr << "WARNING: vc_grow_seg_from_seed: strict mode rejects "
+                         "the surface, but --segment-name writes into the "
+                         "target directory directly, so the shared directory "
+                      << seg_dir
+                      << " was left in place (tracer snapshots from this run "
+                         "may remain); the final surface was not saved"
                       << std::endl;
         }
 #if defined(_WIN32)
@@ -1613,7 +1631,7 @@ int main(int argc, char *argv[])
         if (background.total == 0) {
             // No neighborhood was sampled: report the background as
             // unavailable rather than the default 1.0 fraction.
-            std::cout << "background unavailable (" << bg_unavailable_reason << ")";
+            std::cout << "background unavailable (" << bg_unavailable_reason << "))";
         } else {
             std::cout << "background " << (background.fraction * 100.0) << "% over "
                       << background.total
