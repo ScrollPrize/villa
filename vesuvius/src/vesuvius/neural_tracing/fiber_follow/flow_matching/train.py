@@ -23,7 +23,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
     raise_open_file_limit,
 )
 from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import loss_fn, candidate_prefix_labels, refinement_metrics
-from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_N_COMMIT
+from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, DIAGNOSTIC_THRESHOLDS
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.shared.training_log import format_training_log
 
@@ -361,7 +361,7 @@ def main(argv=None):
     collector=OnlineCollector(out/'dagger',args.fibers,args.val_z,args.dagger_device or args.device,
                               every=args.dagger_every,max_seeds=args.dagger_seeds,batch=args.dagger_batch,
                               explore_calls=args.dagger_explore_calls,seed=args.seed,replay_keep=args.replay_keep,
-                              initial=[c._dir for c in caches],trace_len=args.dagger_trace_len,confidence=.7,n_commit=args.n_commit,
+                              initial=[c._dir for c in caches],trace_len=args.dagger_trace_len,confidence=DEFAULT_CONFIDENCE,n_commit=args.n_commit,
                               seeds_per_fiber=args.dagger_seeds_per_fiber)
     # A resumed run reseeds its loader workers so it does not replay the run's first states.
     ds=FollowDataset(train_f,spec,sample_cfg,band,chunk=args.microbatch,seed=args.seed+(resume['step'] if resume else 0),
@@ -451,7 +451,7 @@ def main(argv=None):
                            batch['hist'],batch['hmask'],batch['gt_history'],batch['gt_history_mask'],
                            source=batch['source'],offtrack=batch['offtrack'],confidence=diagnostic['confidence'])
                 plot_denoising(diagnostic['denoising_steps'],batch['hist'],batch['hmask'],out/'images'/f'denoising_{step:06d}.png')
-                for threshold in (.5,.85):
+                for threshold in DIAGNOSTIC_THRESHOLDS:
                     tracer.p.confidence=threshold
                     summary=rollout_diag(tracer,val_f,seeds,out/'images'/f'rollout_{step:06d}_c{threshold}.png',batch=args.diag_batch)
                     log.record(dict(step=step,threshold=threshold,roll_coverage=summary['coverage_mean'],

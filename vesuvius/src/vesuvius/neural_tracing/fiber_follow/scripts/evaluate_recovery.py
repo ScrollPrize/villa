@@ -18,6 +18,7 @@ from vesuvius.neural_tracing.fiber_follow.flow_matching.train import load_checkp
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.shared.experiment import jsonable
 from vesuvius.neural_tracing.fiber_follow.shared.recovery import recovery_counts, evaluate_recovery_states
+from vesuvius.neural_tracing.fiber_follow.shared.policy import DIAGNOSTIC_THRESHOLDS
 
 
 def main(argv=None, *, checkpoint_loader=None, model_tracer=None, batch_builder_factory=None):
@@ -28,7 +29,7 @@ def main(argv=None, *, checkpoint_loader=None, model_tracer=None, batch_builder_
     ap.add_argument('--fibers',default='/mnt/raid_nvme/spiral_dataset_working/fibers')
     ap.add_argument('--device',default='cuda')
     ap.add_argument('--limit',type=int,default=0)
-    ap.add_argument('--thresholds',type=float,nargs='+',default=(.5,.85))
+    ap.add_argument('--thresholds',type=float,nargs='+',default=DIAGNOSTIC_THRESHOLDS)
     ap.add_argument('--recovery-length',type=float,default=32)
     ap.add_argument('--sampling-seed',type=int,default=0)
     args=ap.parse_args(argv);torch.set_num_threads(4)

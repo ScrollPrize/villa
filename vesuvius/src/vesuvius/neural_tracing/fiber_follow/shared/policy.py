@@ -2,9 +2,13 @@
 import torch
 
 
-DEFAULT_CONFIDENCE = 0.7
+DEFAULT_CONFIDENCE = 0.5
 DEFAULT_N_COMMIT = 8
 DEFAULT_MAX_RECOVERY_DISTANCE = 6.0
+# Gate thresholds at which training logs, monitor rollouts, recovery studies
+# and curve plots report. Calibration sweeps its own grid; nothing here is
+# an operating point.
+DIAGNOSTIC_THRESHOLDS = (.5,)
 
 
 def recovery_allowed(points, max_distance=DEFAULT_MAX_RECOVERY_DISTANCE):

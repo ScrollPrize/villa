@@ -293,7 +293,7 @@ def test_online_collection_does_not_wait_and_publishes_only_complete_caches(tmp_
 
 def test_confidence_threshold_default_is_shared_by_rollout_and_collection(tmp_path):
     from vesuvius.neural_tracing.fiber_follow.shared.trace import DEFAULT_CONFIDENCE
-    assert TraceParams().confidence == DEFAULT_CONFIDENCE == .7
+    assert TraceParams().confidence == DEFAULT_CONFIDENCE == .5
     collector = OnlineCollector(tmp_path/'collector', 'fibers', [100, 200], 'cpu')
     assert collector.confidence == DEFAULT_CONFIDENCE
     collector.close()

@@ -10,6 +10,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import RunLog
 from vesuvius.neural_tracing.fiber_follow.flow_matching.supervision import refinement_metrics
 from vesuvius.neural_tracing.fiber_follow.flow_matching.train import optimizer_update
 from vesuvius.neural_tracing.fiber_follow.shared.training_log import format_training_log
+from vesuvius.neural_tracing.fiber_follow.shared.policy import DIAGNOSTIC_THRESHOLDS
 
 
 def test_refinement_masks_drift_boundaries_empty_bins_and_nonfinite_predictions():
@@ -97,11 +98,11 @@ def test_terminal_blocks_preserve_json_and_format_events(tmp_path, capsys):
                fresh_fraction=.5, fixed_fraction=.25, recent_fraction=.25,
                replay_samples_seen=5000, commit_correct_count=3, commit_known_count=4, commit_window=8,
                refinement=metrics)
-    for threshold in (.5, .85):
+    for threshold in DIAGNOSTIC_THRESHOLDS:
         row.update({f'false_stop_count_{threshold}': 1, f'correct_first_count_{threshold}': 4,
                     f'departed_continue_count_{threshold}': 0, f'departed_count_{threshold}': 0})
     event = dict(step=1250, dagger_launched=True)
-    rollout = dict(step=1250, threshold=.85, roll_coverage=.5, roll_precision=.95, roll_diverged=.1)
+    rollout = dict(step=1250, threshold=.5, roll_coverage=.5, roll_precision=.95, roll_diverged=.1)
     path = tmp_path/'log.jsonl'
     log = RunLog(path, formatter=format_training_log)
     try:

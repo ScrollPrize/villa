@@ -222,8 +222,8 @@ continues from the caches the run had published). Collector snapshots under
 sampled states after a resume differ from an uninterrupted run. The EMA decay
 ramps from .1 toward .999 over the first updates. One background collector
 refreshes replay every 1,000 updates when idle, using EMA, 64 training seeds,
-a 6,000-voxel cap, threshold .7, and eight exploration calls. Diagnostics use the
-original monitor fibers at thresholds .5 and .85. Images show observed history,
+a 6,000-voxel cap, the default confidence .5, and eight exploration calls. Diagnostics use the
+original monitor fibers at the diagnostic threshold .5 (`DIAGNOSTIC_THRESHOLDS`). Images show observed history,
 GT, the final curve, and successive denoising updates.
 Diagnostics have private RNG streams and do not advance training's noise stream.
 Inference exposes `--sampling-seed`; collection uses its existing `--seed` for

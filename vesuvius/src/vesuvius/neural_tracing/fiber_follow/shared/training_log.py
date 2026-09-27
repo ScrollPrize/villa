@@ -1,6 +1,8 @@
 """Terminal formatting for follower training; JSON remains the analysis format."""
 import json
 
+from vesuvius.neural_tracing.fiber_follow.shared.policy import DIAGNOSTIC_THRESHOLDS
+
 
 def _rate(n, d):
     n, d = int(n), int(d)
@@ -99,7 +101,7 @@ def format_training_log(row):
                      +' | selected '+rate('candidate_selected_correct','candidate_states')
                      +' | oracle '+rate('candidate_oracle_correct','candidate_states'))
         lines.append(f"    rescued {int(row['candidate_rescues'])} | spoiled {int(row['candidate_spoiled'])}")
-    for threshold in (.5,.85):
+    for threshold in DIAGNOSTIC_THRESHOLDS:
         lines.append(f'  gate @ {threshold:.2f}: false stops '
                      +rate(f'false_stop_count_{threshold}',f'correct_first_count_{threshold}')
                      +' | departed continues '

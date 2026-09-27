@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.fiber_follow.shared.policy import commit_prefix, recovery_allowed
+from vesuvius.neural_tracing.fiber_follow.shared.policy import DIAGNOSTIC_THRESHOLDS, commit_prefix, recovery_allowed
 from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import (
     commit_window, dense_commit_mask, geometry_mask,
@@ -12,7 +12,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.supervision import (
 
 
 @torch.no_grad()
-def decision_rows(output, batch, cfg, n_commit=None, tolerance=1.5, thresholds=(.5, .85)):
+def decision_rows(output, batch, cfg, n_commit=None, tolerance=1.5, thresholds=DIAGNOSTIC_THRESHOLDS):
     """Small CPU records; no forward pass or random draws. Unknowns stay unknown."""
     output = {k: v.detach().float().cpu() for k, v in output.items()}
     batch = {k: v.detach().cpu() for k, v in batch.items() if isinstance(v, torch.Tensor)}

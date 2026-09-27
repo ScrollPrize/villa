@@ -183,7 +183,7 @@ raised on resume when updates are fast; `--recovery-every` must match the run.
 On logging updates, `log.jsonl` also records `decisions.by_drift`: initial and
 corrected commit-window error sums/counts, correction improvements/regressions,
 first-point and committed-prefix correctness, positive confidence-label counts,
-crop censoring, blocked recovery connections, and gate decisions at 0.5/0.85.
+crop censoring, blocked recovery connections, and gate decisions at the diagnostic threshold 0.5 (`DIAGNOSTIC_THRESHOLDS`).
 Accepted-wrong counts score the actual accepted prefix, including shorter commits;
 unknown accepted prefixes are separate. Counts pool across the effective batch
 before division. Empty error means are JSON null. These are training states,

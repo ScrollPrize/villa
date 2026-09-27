@@ -8,7 +8,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.data import (
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import crop_local_grid
 from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams
-from vesuvius.neural_tracing.fiber_follow.shared.policy import select_candidate
+from vesuvius.neural_tracing.fiber_follow.shared.policy import DIAGNOSTIC_THRESHOLDS, select_candidate
 
 
 def make_recovery_states(fibers, seeds, cfg, provenance, seed=20260925):
@@ -39,7 +39,7 @@ def make_recovery_states(fibers, seeds, cfg, provenance, seed=20260925):
 
 @torch.no_grad()
 def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu',
-                             tracer_class=ModelTracer, batch_builder=None, thresholds=(.5, .85),
+                             tracer_class=ModelTracer, batch_builder=None, thresholds=DIAGNOSTIC_THRESHOLDS,
                              recovery_length=32., n_commit=8, tolerance=1.5, sampling_seed=0,
                              limit=0, on_prediction=None, progress=None):
     """Evaluate identical observed states; optional adapters change only model I/O."""

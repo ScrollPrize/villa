@@ -15,6 +15,7 @@ from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.fiber_follow.shared.evaluate import monitor_coverage, score_trace, summarize
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import frame_from_heading, interp_at
+from vesuvius.neural_tracing.fiber_follow.shared.policy import DIAGNOSTIC_THRESHOLDS
 
 
 def _to_index(pts, crop):
@@ -226,7 +227,7 @@ def plot_curves(log_path, path, *, loss_key='flow'):
     axes[1].plot(steps,[r['confidence_loss'] for r in training],label='prefix confidence BCE')
     if direct:
         axes[2].plot(steps,[r['error_mean'] for r in training],label='dense curve error (voxels)')
-    for threshold in (.5,.85):
+    for threshold in DIAGNOSTIC_THRESHOLDS:
         selected = [r for r in rollout if r['threshold']==threshold]
         for name in ('coverage','precision','diverged'):
             key = dict(coverage='coverage_mean', precision='length_precision', diverged='diverged')[name]
