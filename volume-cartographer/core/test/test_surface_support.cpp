@@ -299,8 +299,18 @@ TEST_CASE("claimFreshRunDir: concurrent-safe unique directory claims")
     // claim is returned uncreated so cleanup will not delete it.
     auto failed = claimFreshRunDir(root / "no-such-parent", "base");
     CHECK(!failed.created);
+    CHECK(!failed.failed);
     CHECK(failed.name == "base");
     CHECK(failed.dir == root / "no-such-parent" / "base");
+
+    // When every candidate name is taken, the claim fails and the caller
+    // must abort instead of saving into the occupied fallback path.
+    fs::create_directories(tgt / "crowded");
+    fs::create_directories(tgt / "crowded_1");
+    auto exhausted = claimFreshRunDir(tgt, "crowded", 2);
+    CHECK(!exhausted.created);
+    CHECK(exhausted.failed);
+    CHECK(exhausted.name == "crowded");
 
     std::error_code ec;
     fs::remove_all(root, ec);

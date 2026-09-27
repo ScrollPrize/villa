@@ -112,11 +112,15 @@ inline bool strictCleanupMayDeleteSegDir(const std::string& segment_name)
 
 // A freshly claimed per-run segment directory. created is true only when this
 // call atomically created dir; only then may a later cleanup delete it (a
-// directory this run did not create may belong to a concurrent run).
+// directory this run did not create may belong to a concurrent run). failed
+// is true when every candidate name collided with an existing directory: the
+// returned dir may belong to another run, so the caller must abort instead
+// of saving into it (see #1906 review).
 struct ClaimedRunDir {
     std::string name;
     std::filesystem::path dir;
     bool created = false;
+    bool failed = false;
 };
 
 // Claim a fresh per-run segment directory under tgt_dir: atomically create
@@ -128,13 +132,16 @@ struct ClaimedRunDir {
 // directory instead. Never throws; when the directory cannot be created at
 // all (e.g. a missing parent), the claim is returned uncreated and the
 // caller keeps the old lazy behavior, except that cleanup will not delete a
-// directory it does not own.
+// directory it does not own. When every candidate collides, failed is set
+// and the fallback path must not be used: writing into it could overwrite
+// another run's output.
 inline ClaimedRunDir claimFreshRunDir(const std::filesystem::path& tgt_dir,
-                                      const std::string& base_name)
+                                      const std::string& base_name,
+                                      int max_attempts = 1000)
 {
-    ClaimedRunDir claim{base_name, tgt_dir / base_name, false};
+    ClaimedRunDir claim{base_name, tgt_dir / base_name, false, false};
     std::error_code ec;
-    for (int attempt = 0; attempt < 1000; ++attempt) {
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
         if (attempt > 0) {
             claim.name = base_name + "_" + std::to_string(attempt);
             claim.dir = tgt_dir / claim.name;
@@ -154,8 +161,13 @@ inline ClaimedRunDir claimFreshRunDir(const std::filesystem::path& tgt_dir,
         // The directory already existed: another (possibly concurrent) run
         // owns this name, so try the next suffix.
     }
+    // Exhausted: every candidate was already taken, so the base directory
+    // may belong to another run. Mark the claim failed so the caller aborts
+    // before tracing or saving instead of falling back to a possibly
+    // occupied path.
     claim.name = base_name;
     claim.dir = tgt_dir / base_name;
+    claim.failed = true;
     return claim;
 }
 

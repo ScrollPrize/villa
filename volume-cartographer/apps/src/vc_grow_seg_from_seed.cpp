@@ -658,19 +658,6 @@ int main(int argc, char *argv[])
     // claimFreshRunDir): rejection cleanup may only delete directories it
     // owns, never a shared directory or a concurrent run's output.
     bool owns_seg_dir = false;
-    if (!segment_name.empty()) {
-        // Use target-dir directly with custom segment name
-        uuid = segment_name;
-        seg_dir = tgt_dir;
-    } else {
-        // Default: claim a fresh timestamped subfolder for this run, so two
-        // runs started in the same millisecond cannot share one directory.
-        const auto claim =
-            vc::surface::claimFreshRunDir(tgt_dir, name_prefix + time_str());
-        uuid = claim.name;
-        seg_dir = claim.dir;
-        owns_seg_dir = claim.created;
-    }
 
     //
     // gen_neighbor mode: project a source tifxyz surface "in" or "out" along its vertex normals
@@ -1474,6 +1461,32 @@ int main(int argc, char *argv[])
 
         // Done
         return EXIT_SUCCESS;
+    }
+
+    // Growth-path segment directory: allocated only now, after the
+    // gen_neighbor early return, so that mode never creates an unused
+    // auto_grown_* directory (its result is written under neighbor_*).
+    if (!segment_name.empty()) {
+        // Use target-dir directly with custom segment name
+        uuid = segment_name;
+        seg_dir = tgt_dir;
+    } else {
+        // Default: claim a fresh timestamped subfolder for this run, so two
+        // runs started in the same millisecond cannot share one directory.
+        const auto claim =
+            vc::surface::claimFreshRunDir(tgt_dir, name_prefix + time_str());
+        if (claim.failed) {
+            // Every candidate name was already taken: the fallback path may
+            // belong to another run. Abort before tracing/saving instead of
+            // writing into it.
+            std::cerr << "ERROR: could not claim a fresh segment directory "
+                         "under "
+                      << tgt_dir << std::endl;
+            return EXIT_FAILURE;
+        }
+        uuid = claim.name;
+        seg_dir = claim.dir;
+        owns_seg_dir = claim.created;
     }
 
     QuadSurface *surf = nullptr;
