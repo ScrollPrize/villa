@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <string>
 
 #include <opencv2/core.hpp>
 
@@ -71,6 +72,53 @@ inline bool noBetterThanChance(const OnPredictionSupport& support,
                                const OnPredictionSupport& background)
 {
     return background.total != 0 && support.fraction <= background.fraction;
+}
+
+// Outcome of the post-growth on-prediction acceptance decision. Accept means
+// the surface passes and is saved; Warn means it should be reported but still
+// saved; Reject means strict mode requires discarding it (exit non-zero).
+enum class SupportVerdict { Accept, Warn, Reject };
+
+// Decides what to do with a grown surface. A rejected check is advisory by
+// default (Warn: report and keep the surface) and discards the surface only
+// in strict mode. The two warning messages are printed by the caller; this is
+// the pure branch logic, extracted so warn-vs-strict behavior is unit
+// testable (see #1675).
+inline SupportVerdict supportVerdict(bool rejected, bool strict)
+{
+    if (!rejected) {
+        return SupportVerdict::Accept;
+    }
+    return strict ? SupportVerdict::Reject : SupportVerdict::Warn;
+}
+
+// A sampling failure leaves the surface unverified: strict mode treats that
+// like a rejected check (discard it), default mode keeps it.
+inline SupportVerdict samplingFailureVerdict(bool strict)
+{
+    return supportVerdict(/*rejected=*/true, strict);
+}
+
+// Strict-mode cleanup must never delete the target directory when
+// --segment-name is used: then seg_dir IS the shared target directory, which
+// the tool did not create and which may hold pre-existing segments. Only the
+// default layout (a fresh per-run subfolder) may be removed.
+inline bool strictCleanupMayDeleteSegDir(const std::string& segment_name)
+{
+    return segment_name.empty();
+}
+
+// Upper bound for uniform background sampling on one axis. The caller passes
+// the dimension length and the (dilated, volume-clamped) neighborhood edge;
+// the returned value is the largest sampling coordinate whose rounded voxel
+// index stays in range: dimension length minus half a voxel. Coordinates in the
+// last half-voxel would round to `shape`, fall outside the volume, and be
+// counted as off-prediction, biasing the background rate downward near volume
+// edges (for a one-voxel dimension, roughly half the samples). The caller
+// treats hi <= lo as "nothing to sample" (covers empty volumes).
+inline float backgroundSampleHiBound(int dim_length, float neighborhood_hi)
+{
+    return std::min(static_cast<float>(dim_length) - 0.5f, neighborhood_hi);
 }
 
 // Fraction of valid surface vertices that land on nonzero voxels of the

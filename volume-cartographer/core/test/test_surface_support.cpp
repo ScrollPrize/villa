@@ -197,3 +197,68 @@ TEST_CASE("validVertexBounds: bounds of valid vertices, false when empty")
     empty(1, 0) = cv::Vec3f(-1.f, -1.f, -1.f);
     CHECK(!validVertexBounds(empty, lo, hi));
 }
+
+TEST_CASE("supportVerdict: rejected checks warn by default, discard in strict mode")
+{
+    using vc::surface::supportVerdict;
+    using vc::surface::SupportVerdict;
+    // A passing check always saves the surface.
+    CHECK(supportVerdict(false, false) == SupportVerdict::Accept);
+    CHECK(supportVerdict(false, true) == SupportVerdict::Accept);
+    // A rejected check (below threshold or no better than chance) is advisory
+    // by default: warn and keep the surface.
+    CHECK(supportVerdict(true, false) == SupportVerdict::Warn);
+    // Strict mode turns a rejected check into a discard.
+    CHECK(supportVerdict(true, true) == SupportVerdict::Reject);
+}
+
+TEST_CASE("samplingFailureVerdict: unverified surface discarded only in strict mode")
+{
+    using vc::surface::samplingFailureVerdict;
+    using vc::surface::SupportVerdict;
+    // Default mode: warn that the check could not run, but keep the surface.
+    CHECK(samplingFailureVerdict(false) == SupportVerdict::Warn);
+    // Strict mode: the surface is unverified, discard it like a rejection.
+    CHECK(samplingFailureVerdict(true) == SupportVerdict::Reject);
+}
+
+TEST_CASE("strictCleanupMayDeleteSegDir: --segment-name protects the shared target dir")
+{
+    using vc::surface::strictCleanupMayDeleteSegDir;
+    // Default layout: the tool created a fresh per-run subfolder, so strict
+    // cleanup may remove it.
+    CHECK(strictCleanupMayDeleteSegDir(""));
+    // With --segment-name, seg_dir IS the shared target directory (not created
+    // by this run, may hold pre-existing segments): strict cleanup must leave
+    // it in place; the rejected surface is simply not saved.
+    CHECK(!strictCleanupMayDeleteSegDir("seg01"));
+}
+
+TEST_CASE("backgroundSampleHiBound: rounded samples always land inside the volume")
+{
+    using vc::surface::backgroundSampleHiBound;
+    // 8-voxel dimension with a neighborhood far beyond the volume: the old
+    // bound (8.0) let coordinates in (7.5, 8) round to 8, outside the volume,
+    // where they were counted as off-prediction.
+    CHECK(backgroundSampleHiBound(8, 72.0f) == doctest::Approx(7.5f));
+    // A one-voxel dimension: roughly half the samples would previously round
+    // to 1 and be miscounted.
+    CHECK(backgroundSampleHiBound(1, 65.0f) == doctest::Approx(0.5f));
+    // The neighborhood still wins when it is the tighter bound.
+    CHECK(backgroundSampleHiBound(1000, 100.0f) == doctest::Approx(100.0f));
+    // Empty dimension: hi lands below any lo >= 0, so the existing lo >= hi
+    // guard reports "nothing to sample" instead of building a reversed
+    // distribution.
+    CHECK(backgroundSampleHiBound(0, 64.0f) < 0.0f);
+
+    // End-to-end on the formula: 5000 uniform samples in [0, hi) never round
+    // out of bounds.
+    std::mt19937 rng(7);
+    const float hi = backgroundSampleHiBound(8, 72.0f);
+    std::uniform_real_distribution<float> dist(0.0f, hi);
+    for (int i = 0; i < 5000; ++i) {
+        const int r = static_cast<int>(std::lround(dist(rng)));
+        CHECK(r >= 0);
+        CHECK(r < 8);
+    }
+}

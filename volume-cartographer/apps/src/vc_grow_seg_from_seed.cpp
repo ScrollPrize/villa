@@ -1533,7 +1533,8 @@ int main(int argc, char *argv[])
         // tool created a fresh timestamped subfolder for this run. Either way
         // the rejected surface is not saved (this runs before the save) and
         // the tool exits non-zero.
-        const bool can_delete_seg_dir = segment_name.empty();
+        const bool can_delete_seg_dir =
+            vc::surface::strictCleanupMayDeleteSegDir(segment_name);
         if (can_delete_seg_dir) {
             if (std::filesystem::exists(seg_dir, ec) && !ec) {
                 std::filesystem::remove_all(seg_dir, ec);
@@ -1599,12 +1600,17 @@ int main(int argc, char *argv[])
             const float lo_x = std::max(0.0f, bb_lo[0] - kBackgroundDilate);
             const float lo_y = std::max(0.0f, bb_lo[1] - kBackgroundDilate);
             const float lo_z = std::max(0.0f, bb_lo[2] - kBackgroundDilate);
-            const float hi_x =
-                std::min(static_cast<float>(volume_shape_zyx[2]), bb_hi[0] + kBackgroundDilate);
-            const float hi_y =
-                std::min(static_cast<float>(volume_shape_zyx[1]), bb_hi[1] + kBackgroundDilate);
-            const float hi_z =
-                std::min(static_cast<float>(volume_shape_zyx[0]), bb_hi[2] + kBackgroundDilate);
+            // The hi bounds are the dimension length minus half a voxel (see
+            // backgroundSampleHiBound): uniform_real_distribution yields
+            // [lo, hi), and a sampled coordinate in the last half-voxel would
+            // round to `shape`, miss the volume, and be counted as
+            // off-prediction, biasing the background rate near volume edges.
+            const float hi_x = vc::surface::backgroundSampleHiBound(
+                volume_shape_zyx[2], bb_hi[0] + kBackgroundDilate);
+            const float hi_y = vc::surface::backgroundSampleHiBound(
+                volume_shape_zyx[1], bb_hi[1] + kBackgroundDilate);
+            const float hi_z = vc::surface::backgroundSampleHiBound(
+                volume_shape_zyx[0], bb_hi[2] + kBackgroundDilate);
             if (lo_x >= hi_x || lo_y >= hi_y || lo_z >= hi_z) {
                 // The dilated neighborhood does not intersect the volume
                 // (every valid vertex lies outside it): there is nothing to
@@ -1662,7 +1668,9 @@ int main(int argc, char *argv[])
                       << std::endl;
             support_rejected = true;
         }
-        if (support_rejected && require_on_prediction_support) {
+        if (vc::surface::supportVerdict(support_rejected,
+                                        require_on_prediction_support) ==
+            vc::surface::SupportVerdict::Reject) {
             return discard_seg_and_fail();
         }
         } catch (const std::exception& e) {
@@ -1675,7 +1683,8 @@ int main(int argc, char *argv[])
                       << e.what()
                       << "); continuing without the acceptance check (#1675)."
                       << std::endl;
-            if (require_on_prediction_support) {
+            if (vc::surface::samplingFailureVerdict(require_on_prediction_support) ==
+                vc::surface::SupportVerdict::Reject) {
                 return discard_seg_and_fail();
             }
         }
