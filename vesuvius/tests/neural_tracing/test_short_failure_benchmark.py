@@ -1,6 +1,44 @@
 import pytest
 from vesuvius.neural_tracing.fiber_trace_3d.short_failure_benchmark import (
-    slice_line, same_location, audit_failure, merge_failure_intervals)
+    slice_line, same_location, audit_failure, merge_failure_intervals, cropped_control_metadata)
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+@pytest.mark.parametrize('lo,hi', [(5, 25), (10, 20), (12, 18)])
+def test_crop_preserves_source_controls_and_segment_constraints(lo, hi, reverse):
+    from copy import deepcopy
+    line = [[x, 0, 0] for x in range(31)]
+    source = dict(version=3, line_points=line, optimization_mode='native_fiber_trace3d',
+                  control_points=[dict(position=line[x], **({'segment_to_next': {
+                      'interp_mode': 'trace', 'interp_goal': 'global',
+                      'config': {'beam_width': x + 1}, 'metric': x}}
+                      if x < 30 else {})) for x in (0, 10, 20, 30)])
+    before = deepcopy(source)
+    points = slice_line(line, lo, hi)
+    if reverse:
+        points.reverse()
+    result = cropped_control_metadata(source, lo, hi, points, reverse=reverse)
+    expected_x = [lo, *[x for x in (10, 20) if lo < x < hi], hi]
+    widths = [int(((a+b)/2)//10)*10+1 for a,b in zip(expected_x, expected_x[1:])]
+    if reverse:
+        expected_x.reverse()
+        widths.reverse()
+    assert [c['position'][0] for c in result['control_points']] == expected_x
+    assert [c['segment_to_next']['config']['beam_width']
+            for c in result['control_points'][:-1]] == widths
+    assert 'segment_to_next' not in result['control_points'][-1]
+    result['control_points'][0]['segment_to_next']['config']['beam_width'] = 999
+    assert source == before
+
+
+def test_crop_does_not_invent_trace_metadata_for_legacy_or_extrapolation():
+    source = dict(version=1, line_points=[[x, 0, 0] for x in range(31)],
+                  control_points=[[5, 0, 0], [25, 0, 0]], optimization_mode='lasagna')
+    result = cropped_control_metadata(source, 10, 20, [[10, 0, 0], [20, 0, 0]])
+    assert result == dict(version=1, control_points=[[10, 0, 0], [20, 0, 0]],
+                          optimization_mode='lasagna')
+    with pytest.raises(ValueError, match='outside'):
+        cropped_control_metadata(source, 0, 20, [[0, 0, 0], [20, 0, 0]])
 
 
 def test_exact_slice_and_duplicate_vertices():

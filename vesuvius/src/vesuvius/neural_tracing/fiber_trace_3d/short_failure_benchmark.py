@@ -59,6 +59,51 @@ def merge_failure_intervals(intervals, merge_distance=PROTOCOL['dedup_distance']
     return [tuple(pair) for pair in merged]
 
 
+def cropped_control_metadata(original, lo, hi, points, *, reverse=False):
+    """Retain source CPs and outgoing constraints, clipping only the endpoints.
+
+    Arcs refer to the original (forward) polyline, including its extrapolation.
+    Metadata describes the source fit, not a new optimization of the crop.
+    ``points`` is the unchanged exported polyline in its output direction.
+    """
+    from ..fiber_trace_2d.strip_geometry import _line_index_for_control_point
+
+    line = np.asarray(original['line_points'], dtype=np.float64)
+    arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(line, axis=0), axis=1))]
+    version = original['version']
+    if version not in (1, 3):
+        raise ValueError(f'unsupported source fiber version: {version}')
+    controls = original['control_points']
+    positions = [c['position'] if version == 3 else c for c in controls]
+    cp_arcs = np.array([arc[_line_index_for_control_point(line, np.asarray(p))]
+                        for p in positions])
+    if len(cp_arcs) < 2 or np.any(np.diff(cp_arcs) <= 0):
+        raise ValueError('source control points must be ordered along the polyline')
+    if not cp_arcs[0] - 1e-6 <= lo < hi <= cp_arcs[-1] + 1e-6:
+        raise ValueError('extracted interval extends outside source control-point spans')
+    interior = [i for i, a in enumerate(cp_arcs) if lo + 1e-6 < a < hi - 1e-6]
+    knots = [lo, *(float(cp_arcs[i]) for i in interior), hi]
+    forward_points = points[::-1] if reverse else points
+    cropped = [{'position': deepcopy(forward_points[0])},
+               *[{'position': deepcopy(positions[i])} for i in interior],
+               {'position': deepcopy(forward_points[-1])}]
+    segments = []
+    for a, b in zip(knots, knots[1:]):
+        source_index = int(np.searchsorted(cp_arcs, (a + b) / 2, side='right') - 1)
+        segments.append(deepcopy(controls[source_index]['segment_to_next'])
+                        if version == 3 else None)
+    if reverse:
+        cropped.reverse()
+        segments.reverse()
+    if version == 3:
+        for control, segment in zip(cropped, segments):
+            control['segment_to_next'] = segment
+    else:
+        cropped = [c['position'] for c in cropped]
+    return dict(version=version, control_points=cropped,
+                optimization_mode=original.get('optimization_mode', 'lasagna'))
+
+
 class TrialJobs:
     """Bounded jobs with disjoint GPU lanes and cache-writer ownership.
 
@@ -680,6 +725,8 @@ def run(workload, *, devices='0', time_limit_seconds=None):
         original=json.loads(Path(c['fiber']).read_text())
         annotation=dict(type='vc3d_fiber',version=1,line_points=points,control_points=[points[0],points[-1]],
             optimization_mode='native_fiber_trace3d', evaluation_direction='forward', benchmark_provenance=item)
+        annotation.update(cropped_control_metadata(original, lo, hi, points,
+                                                   reverse=trial['direction'] == 'reverse'))
         for key in ('vc_open_data_coordinate_space','vc_open_data_source_original_resolution'):
             if key in original: annotation[key]=original[key]
         path=root/'fibers'/f'{i:03d}_{c["id"]}.json'
@@ -1142,11 +1189,26 @@ def run_union(workload):
                 'merge_distance_base_voxels': merge_distance,
             },
         }
-        path = annotation_dir / f'{index:04d}_{Path(item["fiber_path"]).stem}_run{item["run_index"]}.json'
+        original = json.loads(Path(item['fiber_path']).read_text())
+        annotation.update(cropped_control_metadata(original, *item['interval'], item['points']))
+        name = f'{index:04d}_{Path(item["fiber_path"]).stem}_run{item["run_index"]}.json'
+        path = annotation_dir / _canonical_source_label(item['input_volume']) / name
+        # Also support an interrupted older export before per-scroll relocation.
+        if not path.exists() and (annotation_dir / name).is_file():
+            path = annotation_dir / name
         # The extractor is safely restartable.  Keeping already completed
         # reference-only files avoids repeating an fsync-heavy write after a
         # runner interruption; their content is deterministic for this config.
-        if not path.is_file():
+        if path.is_file():
+            existing = json.loads(path.read_text())
+            legacy = dict(annotation, version=1,
+                          control_points=[item['points'][0], item['points'][-1]],
+                          optimization_mode='native_fiber_trace3d')
+            if existing == legacy and existing != annotation:
+                atomic_write(path, annotation, durable=False)
+            elif existing != annotation:
+                raise ValueError(f'refusing to replace changed annotation: {path}')
+        else:
             atomic_write(path, annotation, durable=False)
         annotations.append({
             'index': index, 'path': str(path), 'sha256': sha256_file(path),
