@@ -14,14 +14,33 @@ struct OnPredictionSupport {
     std::size_t total = 0;
 };
 
+// A min_on_prediction_support threshold is valid only when it is a finite
+// fraction in [0, 1]. Anything else is a configuration error: fail fast instead
+// of silently disabling the check (negative or NaN can never trigger) or
+// rejecting every surface (above 1). See #1675.
+inline bool validSupportThreshold(double t)
+{
+    return std::isfinite(t) && t >= 0.0 && t <= 1.0;
+}
+
+// True when the grown surface tracks the prediction no better than chance:
+// its on-prediction fraction is at or below the background rate measured on
+// uniform random points in the same volume. Absolute thresholds cannot catch
+// this on dense predictions, where even a random surface scores high.
+inline bool noBetterThanChance(const OnPredictionSupport& support,
+                               const OnPredictionSupport& background)
+{
+    return support.fraction <= background.fraction;
+}
+
 // Fraction of valid surface vertices that land on nonzero voxels of the
 // prediction the surface was grown from, sampled nearest-neighbor in the
 // prediction's native voxel frame.
 //
 // points holds (x, y, z) vertex positions; a vertex with any component == -1
-// is invalid and skipped. sample(z, y, x) returns the prediction voxel value
-// at integer coordinates; the caller is responsible for bounds handling (the
-// helper calls it for every rounded valid vertex).
+// or non-finite is invalid and skipped. sample(z, y, x) returns the prediction
+// voxel value at integer coordinates; the caller is responsible for bounds
+// handling (the helper calls it for every rounded valid vertex).
 //
 // fraction is 1.0 when there are no valid vertices: an empty surface has
 // nothing to judge. See #1675: grown surfaces that cut across windings instead
@@ -35,7 +54,11 @@ OnPredictionSupport onPredictionSupport(const cv::Mat_<cv::Vec3f>& points, Sampl
     for (int r = 0; r < points.rows; ++r) {
         for (int c = 0; c < points.cols; ++c) {
             const cv::Vec3f p = points(r, c);
-            if (p[0] == -1.f || p[1] == -1.f || p[2] == -1.f) {
+            // -1 marks invalid vertices; non-finite coordinates must also be
+            // skipped before std::lround (which is UB on NaN/Inf), matching
+            // QuadSurface's isValidPointSample.
+            if (p[0] == -1.f || p[1] == -1.f || p[2] == -1.f || !std::isfinite(p[0]) ||
+                !std::isfinite(p[1]) || !std::isfinite(p[2])) {
                 continue;
             }
             ++res.total;

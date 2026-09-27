@@ -327,6 +327,18 @@ int main(int argc, char *argv[])
         set_space_tracing_use_cuda(true);
     }
 
+    // Validate the on-prediction support threshold before doing any expensive
+    // work: an out-of-range value is a configuration error, not something to
+    // silently ignore (a negative or NaN threshold would disable the #1675
+    // safety check entirely).
+    const double min_on_prediction_support = params.value("min_on_prediction_support", 0.5);
+    const bool require_on_prediction_support = params.value("require_on_prediction_support", false);
+    if (!vc::surface::validSupportThreshold(min_on_prediction_support)) {
+        std::cerr << "ERROR: vc_grow_seg_from_seed: min_on_prediction_support must be within [0, 1]; got "
+                  << min_on_prediction_support << std::endl;
+        return EXIT_FAILURE;
+    }
+
     const std::string volume_arg = vol_path.string();
     const bool remote_volume = is_remote_volume_path(volume_arg);
     const double requested_voxelsize = params.value("voxelsize", 0.0);
@@ -373,8 +385,6 @@ int main(int argc, char *argv[])
     std::string name_prefix = "auto_grown_";
     int tgt_overlap_count = params.value("tgt_overlap_count", 20);
     float min_area_cm = params.value("min_area_cm", 0.3);
-    double min_on_prediction_support = params.value("min_on_prediction_support", 0.5);
-    bool require_on_prediction_support = params.value("require_on_prediction_support", false);
     int search_effort = params.value("search_effort", 10);
     int thread_limit = params.value("thread_limit", 0);
 
@@ -1498,25 +1508,42 @@ int main(int argc, char *argv[])
     // Surfaces that cut across windings instead of following a sheet land at
     // ~6-10% (indistinguishable from random points in the volume), while true
     // sheets land at ~100%, so the default 0.5 threshold separates them with
-    // wide margin. Warn-only by default; set "require_on_prediction_support"
-    // to discard the surface and fail instead.
+    // wide margin. The background rate (same fraction over uniform random
+    // points) is reported alongside: a surface at or below background follows
+    // the prediction no better than chance, which the absolute threshold
+    // cannot catch on dense predictions. Warn-only by default; set
+    // "require_on_prediction_support" to discard the surface and fail instead.
     {
         const cv::Mat_<cv::Vec3f> pts = surf->rawPoints();
         auto accessor = Chunked3dAccessor<uint8_t, passTroughComputor>::create(tensor);
+        auto sample_prediction = [&accessor, &volume_shape_zyx](int z, int y, int x) -> uint8_t {
+            if (z < 0 || z >= volume_shape_zyx[0] || y < 0 ||
+                y >= volume_shape_zyx[1] || x < 0 ||
+                x >= volume_shape_zyx[2]) {
+                return 0;
+            }
+            return accessor(z, y, x);
+        };
         const vc::surface::OnPredictionSupport support =
-            vc::surface::onPredictionSupport(
-                pts,
-                [&accessor, &volume_shape_zyx](int z, int y, int x) -> uint8_t {
-                    if (z < 0 || z >= volume_shape_zyx[0] || y < 0 ||
-                        y >= volume_shape_zyx[1] || x < 0 ||
-                        x >= volume_shape_zyx[2]) {
-                        return 0;
-                    }
-                    return accessor(z, y, x);
-                });
+            vc::surface::onPredictionSupport(pts, sample_prediction);
+        // Background rate over uniform random points in the volume, fixed
+        // seed so the estimate is reproducible run to run.
+        cv::Mat_<cv::Vec3f> bg_pts(2000, 1);
+        std::mt19937 bg_rng(42);
+        std::uniform_real_distribution<float> bg_x(0.0f, static_cast<float>(volume_shape_zyx[2]));
+        std::uniform_real_distribution<float> bg_y(0.0f, static_cast<float>(volume_shape_zyx[1]));
+        std::uniform_real_distribution<float> bg_z(0.0f, static_cast<float>(volume_shape_zyx[0]));
+        for (int i = 0; i < bg_pts.rows; ++i) {
+            bg_pts(i, 0) = cv::Vec3f(bg_x(bg_rng), bg_y(bg_rng), bg_z(bg_rng));
+        }
+        const vc::surface::OnPredictionSupport background =
+            vc::surface::onPredictionSupport(bg_pts, sample_prediction);
         std::cout << "on-prediction support: " << std::fixed << std::setprecision(1)
                   << (support.fraction * 100.0) << "% (" << support.on << "/"
-                  << support.total << " vertices on nonzero prediction)" << std::endl;
+                  << support.total << " vertices on nonzero prediction; background "
+                  << (background.fraction * 100.0) << "% over " << background.total
+                  << " random points)" << std::endl;
+        bool support_rejected = false;
         if (support.fraction < min_on_prediction_support) {
             std::cerr << "WARNING: vc_grow_seg_from_seed: on-prediction support "
                       << std::fixed << std::setprecision(1)
@@ -1526,22 +1553,34 @@ int main(int argc, char *argv[])
                       << "%; the surface may cut across windings instead of "
                          "following a sheet (#1675)."
                       << std::endl;
-            if (require_on_prediction_support) {
-                std::cerr << "discarding generated surface because "
-                             "require_on_prediction_support is set"
-                          << std::endl;
-                if (std::filesystem::exists(seg_dir)) {
-                    std::filesystem::remove_all(seg_dir);
-                }
-#if defined(_WIN32)
-                // See end of main(): skip CRT teardown, worker threads deadlock it.
-                std::cout.flush();
-                std::cerr.flush();
-                std::_Exit(EXIT_FAILURE);
-#else
-                return EXIT_FAILURE;
-#endif
+            support_rejected = true;
+        }
+        if (vc::surface::noBetterThanChance(support, background)) {
+            std::cerr << "WARNING: vc_grow_seg_from_seed: on-prediction support "
+                      << std::fixed << std::setprecision(1)
+                      << (support.fraction * 100.0)
+                      << "% is no better than the background rate "
+                      << (background.fraction * 100.0)
+                      << "% for random points in the volume; the surface "
+                         "follows the prediction no more than chance (#1675)."
+                      << std::endl;
+            support_rejected = true;
+        }
+        if (support_rejected && require_on_prediction_support) {
+            std::cerr << "discarding generated surface because "
+                         "require_on_prediction_support is set"
+                      << std::endl;
+            if (std::filesystem::exists(seg_dir)) {
+                std::filesystem::remove_all(seg_dir);
             }
+#if defined(_WIN32)
+            // See end of main(): skip CRT teardown, worker threads deadlock it.
+            std::cout.flush();
+            std::cerr.flush();
+            std::_Exit(EXIT_FAILURE);
+#else
+            return EXIT_FAILURE;
+#endif
         }
     }
 

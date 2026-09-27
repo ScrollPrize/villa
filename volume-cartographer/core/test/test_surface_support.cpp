@@ -8,6 +8,8 @@
 
 #include "vc/core/util/SurfaceSupport.hpp"
 
+#include <limits>
+#include <random>
 #include <vector>
 
 using vc::surface::onPredictionSupport;
@@ -84,4 +86,63 @@ TEST_CASE("onPredictionSupport: samples the nearest voxel")
     auto pts = make_points(1, 2, cv::Vec3f(2.f, 2.f, 3.4f));  // rounds to z=3
     pts(0, 1) = cv::Vec3f(2.f, 2.f, 3.6f);                   // rounds to z=4
     CHECK(onPredictionSupport(pts, pred).fraction == doctest::Approx(0.5));
+}
+
+TEST_CASE("onPredictionSupport: non-finite vertices are skipped, not rounded")
+{
+    ToyPrediction pred;
+    auto pts = make_points(2, 2, cv::Vec3f(2.f, 2.f, 3.f));  // on the sheet
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    pts(0, 0) = cv::Vec3f(nan, 2.f, 3.f);  // NaN: invalid, must not reach lround
+    pts(0, 1) = cv::Vec3f(2.f, inf, 3.f);   // Inf: invalid, must not reach lround
+    pts(1, 0) = cv::Vec3f(2.f, 2.f, nan);  // NaN in z: invalid
+    // only pts(1, 1) is valid and on the sheet
+    const auto res = onPredictionSupport(pts, pred);
+    CHECK(res.total == 1);
+    CHECK(res.on == 1);
+    CHECK(res.fraction == doctest::Approx(1.0));
+}
+
+TEST_CASE("validSupportThreshold: accepts only finite fractions in [0, 1]")
+{
+    using vc::surface::validSupportThreshold;
+    CHECK(validSupportThreshold(0.0));
+    CHECK(validSupportThreshold(0.5));
+    CHECK(validSupportThreshold(1.0));
+    CHECK(!validSupportThreshold(-0.1));   // would silently disable the check
+    CHECK(!validSupportThreshold(1.1));    // would reject even a perfect surface
+    CHECK(!validSupportThreshold(std::numeric_limits<double>::quiet_NaN()));
+    CHECK(!validSupportThreshold(std::numeric_limits<double>::infinity()));
+}
+
+TEST_CASE("noBetterThanChance: flags surfaces at or below the background rate")
+{
+    using vc::surface::noBetterThanChance;
+    using vc::surface::OnPredictionSupport;
+    auto make = [](double fraction) {
+        OnPredictionSupport s;
+        s.fraction = fraction;
+        return s;
+    };
+    CHECK(noBetterThanChance(make(0.08), make(0.08)));   // equal: no better
+    CHECK(noBetterThanChance(make(0.05), make(0.60)));   // below: no better
+    CHECK(!noBetterThanChance(make(0.65), make(0.60)));  // above background: tracking
+    CHECK(!noBetterThanChance(make(1.0), make(0.05)));   // clearly tracking
+}
+
+TEST_CASE("onPredictionSupport: background rate matches prediction density")
+{
+    // Uniform random points over the toy volume should land on the sheet at
+    // roughly the sheet's share of voxels (1/8 of the 8x8x8 volume).
+    ToyPrediction pred;
+    cv::Mat_<cv::Vec3f> bg(2000, 1);
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(0.0f, 8.0f);
+    for (int i = 0; i < bg.rows; ++i) {
+        bg(i, 0) = cv::Vec3f(dist(rng), dist(rng), dist(rng));
+    }
+    const auto res = onPredictionSupport(bg, pred);
+    CHECK(res.total == 2000);
+    CHECK(res.fraction == doctest::Approx(1.0 / 8.0).epsilon(0.05));
 }
