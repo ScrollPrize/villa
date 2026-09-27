@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <filesystem>
 #include <string>
+#include <system_error>
 
 #include <opencv2/core.hpp>
 
@@ -106,6 +108,80 @@ inline SupportVerdict samplingFailureVerdict(bool strict)
 inline bool strictCleanupMayDeleteSegDir(const std::string& segment_name)
 {
     return segment_name.empty();
+}
+
+// A freshly claimed per-run segment directory. created is true only when this
+// call atomically created dir; only then may a later cleanup delete it (a
+// directory this run did not create may belong to a concurrent run).
+struct ClaimedRunDir {
+    std::string name;
+    std::filesystem::path dir;
+    bool created = false;
+};
+
+// Claim a fresh per-run segment directory under tgt_dir: atomically create
+// tgt_dir/base_name, appending a numeric suffix while the name is taken. The
+// default segment name is a millisecond-resolution timestamp, so two runs
+// started in the same millisecond would otherwise share one directory, and a
+// strict-mode rejection in one run could then delete the other run's
+// snapshots. The atomic create_directory loop makes each run own a distinct
+// directory instead. Never throws; when the directory cannot be created at
+// all (e.g. a missing parent), the claim is returned uncreated and the
+// caller keeps the old lazy behavior, except that cleanup will not delete a
+// directory it does not own.
+inline ClaimedRunDir claimFreshRunDir(const std::filesystem::path& tgt_dir,
+                                      const std::string& base_name)
+{
+    ClaimedRunDir claim{base_name, tgt_dir / base_name, false};
+    std::error_code ec;
+    for (int attempt = 0; attempt < 1000; ++attempt) {
+        if (attempt > 0) {
+            claim.name = base_name + "_" + std::to_string(attempt);
+            claim.dir = tgt_dir / claim.name;
+        }
+        ec.clear();
+        if (std::filesystem::create_directory(claim.dir, ec)) {
+            claim.created = true;
+            return claim;
+        }
+        if (ec) {
+            // Not a name collision (e.g. missing parent or no permission):
+            // leave downstream code to behave as before, unclaimed.
+            claim.name = base_name;
+            claim.dir = tgt_dir / base_name;
+            return claim;
+        }
+        // The directory already existed: another (possibly concurrent) run
+        // owns this name, so try the next suffix.
+    }
+    claim.name = base_name;
+    claim.dir = tgt_dir / base_name;
+    return claim;
+}
+
+// Outcome of attempting rejection cleanup of a segment directory.
+enum class SegDirCleanup { Deleted, Missing, Skipped, DeleteFailed };
+
+// Delete seg_dir for a rejected surface, honoring the shared-directory guard:
+// with --segment-name the tool writes into the shared target directory and
+// must never remove it. Only pass owns_dir=true when this run atomically
+// created seg_dir (see claimFreshRunDir); a directory owned by someone else
+// (e.g. a concurrent run that won the same timestamp) is left alone.
+// Never throws; a failed deletion is reported through the returned outcome
+// so the caller can warn instead of escaping as an uncaught exception.
+inline SegDirCleanup tryDiscardSegDir(const std::string& segment_name,
+                                      const std::filesystem::path& seg_dir,
+                                      bool owns_dir)
+{
+    if (!strictCleanupMayDeleteSegDir(segment_name) || !owns_dir) {
+        return SegDirCleanup::Skipped;
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(seg_dir, ec) || ec) {
+        return ec ? SegDirCleanup::DeleteFailed : SegDirCleanup::Missing;
+    }
+    std::filesystem::remove_all(seg_dir, ec);
+    return ec ? SegDirCleanup::DeleteFailed : SegDirCleanup::Deleted;
 }
 
 // Upper bound for uniform background sampling on one axis. The caller passes

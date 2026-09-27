@@ -654,14 +654,22 @@ int main(int argc, char *argv[])
 
     std::string uuid;
     std::filesystem::path seg_dir;
+    // True only when this run atomically created seg_dir (see
+    // claimFreshRunDir): rejection cleanup may only delete directories it
+    // owns, never a shared directory or a concurrent run's output.
+    bool owns_seg_dir = false;
     if (!segment_name.empty()) {
         // Use target-dir directly with custom segment name
         uuid = segment_name;
         seg_dir = tgt_dir;
     } else {
-        // Default: create timestamped subfolder
-        uuid = name_prefix + time_str();
-        seg_dir = tgt_dir / uuid;
+        // Default: claim a fresh timestamped subfolder for this run, so two
+        // runs started in the same millisecond cannot share one directory.
+        const auto claim =
+            vc::surface::claimFreshRunDir(tgt_dir, name_prefix + time_str());
+        uuid = claim.name;
+        seg_dir = claim.dir;
+        owns_seg_dir = claim.created;
     }
 
     //
@@ -1488,8 +1496,28 @@ int main(int argc, char *argv[])
         if (area_cm2 < min_area_cm) {
             std::cout << "discarding generated surface because area_cm2 " << area_cm2
                       << " is below min_area_cm " << min_area_cm << std::endl;
-            if (std::filesystem::exists(seg_dir)) {
-                std::filesystem::remove_all(seg_dir);
+            // Route this pre-existing unconditional cleanup through the same
+            // shared-directory guard as the support check: with
+            // --segment-name, seg_dir IS the shared target directory and
+            // must never be deleted.
+            switch (vc::surface::tryDiscardSegDir(segment_name, seg_dir,
+                                                  owns_seg_dir)) {
+                case vc::surface::SegDirCleanup::Deleted:
+                case vc::surface::SegDirCleanup::Missing:
+                    break;
+                case vc::surface::SegDirCleanup::DeleteFailed:
+                    std::cerr << "WARNING: vc_grow_seg_from_seed: could not "
+                                 "discard "
+                              << seg_dir << std::endl;
+                    break;
+                case vc::surface::SegDirCleanup::Skipped:
+                    std::cerr << "WARNING: vc_grow_seg_from_seed: the directory "
+                              << seg_dir
+                              << " is shared (--segment-name) or was not "
+                                 "created by this run, so it was left in "
+                                 "place; the rejected surface was not saved"
+                              << std::endl;
+                    break;
             }
 #if defined(_WIN32)
             // See end of main(): skip CRT teardown, worker threads deadlock it.
@@ -1525,37 +1553,41 @@ int main(int argc, char *argv[])
     // try/catch below, so a throwing cleanup would be misreported as a
     // sampling failure on the first call and escape uncaught on the second.
     auto discard_seg_and_fail = [&]() -> int {
-        std::error_code ec;
         // With --segment-name, seg_dir IS tgt_dir: the shared target
         // directory, which this run did not create and which may hold
         // pre-existing segments. Strict-mode cleanup must never delete it, so
-        // only remove the segment directory in the default layout, where the
-        // tool created a fresh timestamped subfolder for this run. Either way
-        // the rejected surface is not saved (this runs before the save) and
-        // the tool exits non-zero.
-        const bool can_delete_seg_dir =
-            vc::surface::strictCleanupMayDeleteSegDir(segment_name);
-        if (can_delete_seg_dir) {
-            if (std::filesystem::exists(seg_dir, ec) && !ec) {
-                std::filesystem::remove_all(seg_dir, ec);
-            }
-            if (ec) {
-                std::cerr << "WARNING: vc_grow_seg_from_seed: could not discard "
-                          << seg_dir << " (" << ec.message()
-                          << "); the rejected surface was left on disk" << std::endl;
-            } else {
+        // only remove a segment directory this run atomically created (see
+        // claimFreshRunDir), which also protects concurrent runs that share
+        // a millisecond timestamp. Either way the rejected surface is not
+        // saved (this runs before the save) and the tool exits non-zero.
+        // The cleanup helper never throws, so a deletion failure cannot be
+        // misreported as a sampling failure or escape uncaught.
+        switch (vc::surface::tryDiscardSegDir(segment_name, seg_dir,
+                                               owns_seg_dir)) {
+            case vc::surface::SegDirCleanup::Deleted:
+            case vc::surface::SegDirCleanup::Missing:
                 std::cerr << "discarding generated surface because "
                              "require_on_prediction_support is set"
                           << std::endl;
-            }
-        } else {
-            std::cerr << "WARNING: vc_grow_seg_from_seed: strict mode rejects "
-                         "the surface, but --segment-name writes into the "
-                         "target directory directly, so the shared directory "
-                      << seg_dir
-                      << " was left in place (tracer snapshots from this run "
-                         "may remain); the final surface was not saved"
-                      << std::endl;
+                break;
+            case vc::surface::SegDirCleanup::DeleteFailed:
+                std::cerr << "WARNING: vc_grow_seg_from_seed: could not "
+                             "discard "
+                          << seg_dir
+                          << "; the rejected surface was left on disk"
+                          << std::endl;
+                break;
+            case vc::surface::SegDirCleanup::Skipped:
+                std::cerr
+                    << "WARNING: vc_grow_seg_from_seed: strict mode rejects "
+                       "the surface, but the directory "
+                    << seg_dir
+                    << " is shared (--segment-name) or was not created by "
+                       "this run, so it was left in place (tracer snapshots "
+                       "from this run may remain); the final surface was not "
+                       "saved"
+                    << std::endl;
+                break;
         }
 #if defined(_WIN32)
         // See end of main(): skip CRT teardown, worker threads deadlock it.

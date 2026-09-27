@@ -8,6 +8,8 @@
 
 #include "vc/core/util/SurfaceSupport.hpp"
 
+#include <chrono>
+#include <fstream>
 #include <limits>
 #include <random>
 #include <vector>
@@ -261,4 +263,90 @@ TEST_CASE("backgroundSampleHiBound: rounded samples always land inside the volum
         CHECK(r >= 0);
         CHECK(r < 8);
     }
+}
+
+TEST_CASE("claimFreshRunDir: concurrent-safe unique directory claims")
+{
+    using vc::surface::claimFreshRunDir;
+    namespace fs = std::filesystem;
+    // A unique scratch root, so parallel test binaries cannot collide.
+    const fs::path root = fs::temp_directory_path() /
+                          ("surface_support_claim_" +
+                           std::to_string(std::chrono::steady_clock::now()
+                                              .time_since_epoch()
+                                              .count()));
+    fs::create_directories(root);
+    const fs::path tgt = root / "tgt";
+    fs::create_directories(tgt);
+
+    // First claim wins the bare name and owns the directory.
+    auto first = claimFreshRunDir(tgt, "auto_grown_20260927000000000");
+    CHECK(first.created);
+    CHECK(first.name == "auto_grown_20260927000000000");
+    CHECK(first.dir == tgt / "auto_grown_20260927000000000");
+    CHECK(fs::is_directory(first.dir));
+
+    // A second claim for the same base (the millisecond-timestamp collision)
+    // gets a suffixed name and owns a distinct directory: neither run can
+    // later delete the other's output.
+    auto second = claimFreshRunDir(tgt, "auto_grown_20260927000000000");
+    CHECK(second.created);
+    CHECK(second.name != first.name);
+    CHECK(second.dir != first.dir);
+    CHECK(fs::is_directory(second.dir));
+
+    // When the directory cannot be created at all (missing parent), the
+    // claim is returned uncreated so cleanup will not delete it.
+    auto failed = claimFreshRunDir(root / "no-such-parent", "base");
+    CHECK(!failed.created);
+    CHECK(failed.name == "base");
+    CHECK(failed.dir == root / "no-such-parent" / "base");
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+TEST_CASE("tryDiscardSegDir: deletes only directories this run owns")
+{
+    using vc::surface::tryDiscardSegDir;
+    using vc::surface::SegDirCleanup;
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() /
+                          ("surface_support_discard_" +
+                           std::to_string(std::chrono::steady_clock::now()
+                                              .time_since_epoch()
+                                              .count()));
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    fs::create_directories(root);
+
+    // Default layout, owned by this run: the directory is removed.
+    const fs::path owned = root / "owned";
+    fs::create_directories(owned);
+    CHECK(tryDiscardSegDir("", owned, /*owns_dir=*/true) ==
+          SegDirCleanup::Deleted);
+    CHECK(!fs::exists(owned));
+
+    // Owned but already gone (e.g. never written): nothing to delete, and
+    // crucially no exception escapes.
+    CHECK(tryDiscardSegDir("", owned, /*owns_dir=*/true) ==
+          SegDirCleanup::Missing);
+
+    // With --segment-name the directory is shared (seg_dir IS the target
+    // directory): it must survive, pre-existing content and all.
+    const fs::path shared = root / "shared";
+    fs::create_directories(shared);
+    std::ofstream(shared / "pre-existing.txt") << "keep me";
+    CHECK(tryDiscardSegDir("seg01", shared, /*owns_dir=*/false) ==
+          SegDirCleanup::Skipped);
+    CHECK(fs::exists(shared / "pre-existing.txt"));
+
+    // Default layout but not owned by this run (e.g. a concurrent run won
+    // the timestamp): left in place rather than deleting another run's
+    // snapshots.
+    CHECK(tryDiscardSegDir("", shared, /*owns_dir=*/false) ==
+          SegDirCleanup::Skipped);
+    CHECK(fs::is_directory(shared));
+
+    fs::remove_all(root, ec);
 }
