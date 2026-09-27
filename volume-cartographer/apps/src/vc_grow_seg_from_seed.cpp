@@ -1,9 +1,11 @@
+#include <iomanip>
 #include <iostream>
 #include <random>
 
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceSupport.hpp"
 #include "vc/core/util/Geometry.hpp"
 
 #include <opencv2/imgproc.hpp>
@@ -371,6 +373,8 @@ int main(int argc, char *argv[])
     std::string name_prefix = "auto_grown_";
     int tgt_overlap_count = params.value("tgt_overlap_count", 20);
     float min_area_cm = params.value("min_area_cm", 0.3);
+    double min_on_prediction_support = params.value("min_on_prediction_support", 0.5);
+    bool require_on_prediction_support = params.value("require_on_prediction_support", false);
     int search_effort = params.value("search_effort", 10);
     int thread_limit = params.value("thread_limit", 0);
 
@@ -392,6 +396,7 @@ int main(int argc, char *argv[])
     std::cout << "mode: " << mode << std::endl;
     std::cout << "step size: " << params.value("step_size", 20.0f) << std::endl;
     std::cout << "min_area_cm: " << min_area_cm << std::endl;
+    std::cout << "min_on_prediction_support: " << min_on_prediction_support << std::endl;
     std::cout << "voxelsize: " << voxelsize << std::endl;
     std::cout << "tgt_overlap_count: " << tgt_overlap_count << std::endl;
 
@@ -1484,6 +1489,59 @@ int main(int argc, char *argv[])
 #else
             return EXIT_SUCCESS;
 #endif
+        }
+    }
+
+    // #1675: post-growth acceptance check. A grown surface should follow the
+    // prediction it was traced from: sample the input prediction at each valid
+    // mesh vertex (native frame) and report the on-prediction fraction.
+    // Surfaces that cut across windings instead of following a sheet land at
+    // ~6-10% (indistinguishable from random points in the volume), while true
+    // sheets land at ~100%, so the default 0.5 threshold separates them with
+    // wide margin. Warn-only by default; set "require_on_prediction_support"
+    // to discard the surface and fail instead.
+    {
+        const cv::Mat_<cv::Vec3f> pts = surf->rawPoints();
+        auto accessor = Chunked3dAccessor<uint8_t, passTroughComputor>::create(tensor);
+        const vc::surface::OnPredictionSupport support =
+            vc::surface::onPredictionSupport(
+                pts,
+                [&accessor, &volume_shape_zyx](int z, int y, int x) -> uint8_t {
+                    if (z < 0 || z >= volume_shape_zyx[0] || y < 0 ||
+                        y >= volume_shape_zyx[1] || x < 0 ||
+                        x >= volume_shape_zyx[2]) {
+                        return 0;
+                    }
+                    return accessor(z, y, x);
+                });
+        std::cout << "on-prediction support: " << std::fixed << std::setprecision(1)
+                  << (support.fraction * 100.0) << "% (" << support.on << "/"
+                  << support.total << " vertices on nonzero prediction)" << std::endl;
+        if (support.fraction < min_on_prediction_support) {
+            std::cerr << "WARNING: vc_grow_seg_from_seed: on-prediction support "
+                      << std::fixed << std::setprecision(1)
+                      << (support.fraction * 100.0)
+                      << "% is below min_on_prediction_support "
+                      << (min_on_prediction_support * 100.0)
+                      << "%; the surface may cut across windings instead of "
+                         "following a sheet (#1675)."
+                      << std::endl;
+            if (require_on_prediction_support) {
+                std::cerr << "discarding generated surface because "
+                             "require_on_prediction_support is set"
+                          << std::endl;
+                if (std::filesystem::exists(seg_dir)) {
+                    std::filesystem::remove_all(seg_dir);
+                }
+#if defined(_WIN32)
+                // See end of main(): skip CRT teardown, worker threads deadlock it.
+                std::cout.flush();
+                std::cerr.flush();
+                std::_Exit(EXIT_FAILURE);
+#else
+                return EXIT_FAILURE;
+#endif
+            }
         }
     }
 

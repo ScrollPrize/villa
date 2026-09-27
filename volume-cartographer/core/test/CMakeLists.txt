@@ -69,6 +69,7 @@ vc_add_test(NAME test_smoke LIBS doctest::doctest)
 vc_add_test(NAME test_omp_thread_point_collection)
 
 vc_add_test(NAME test_surface_area_units)
+vc_add_test(NAME test_surface_support)
 
 vc_add_test(NAME test_voxel_size_metadata)
 

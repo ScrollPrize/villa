@@ -6,6 +6,21 @@
 - starting point for patch tracing - the seeding logic is here (and might need improvements/debugging)
 - calls space_tracing_quad_phys from surface_helpers.cpp to run actual patch tracer
 
+### Post-growth acceptance check (#1675)
+
+After tracing, the tool samples the input prediction at each valid grown mesh
+vertex (native frame) and reports the **on-prediction support** fraction. A
+surface that follows its prediction scores ~100%; one that cut across windings
+instead of following a sheet scores ~6-10% (indistinguishable from random
+points in the volume). Params:
+
+- `min_on_prediction_support` (default 0.5): warn when the fraction is below this.
+- `require_on_prediction_support` (default false): when true, a surface below
+  the threshold is discarded and the tool exits non-zero instead of just warning.
+
+The check is warn-only by default so sparse but legitimate predictions are not
+rejected; opt into strict mode once the threshold is validated for a pipeline.
+
 ## space_tracing_quad_phys() (surface_helpers.cpp)
 
 - general process: optimize a surface from a thresholded surface prediction (using CachedChunked3dInterpolator<uint8_t,thresholdedDistance> interp(proc_tensor))
