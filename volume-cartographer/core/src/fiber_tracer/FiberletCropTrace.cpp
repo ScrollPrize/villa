@@ -678,6 +678,7 @@ struct SideTrace {
 
     std::vector<cv::Vec3d> points;
     std::vector<double> cumulativeCosts;
+    std::vector<double> originalStepCosts;
     std::vector<Boundary> boundaries;
     std::string termination = "graph_exhausted";
     std::size_t fiberlets = 0;
@@ -870,6 +871,16 @@ void verifyDenseCandidate(
             line.pointsBaseXYZ = slicePolylineArc(geometry, it->begin, it->end);
             line.pathLengthPredictionVoxels = (it->end - it->begin) / predictionToBaseScale;
             line.totalMetricCost = costAt(it->end) - costAt(it->begin);
+            if (config.captureStepCosts) {
+                const auto local = makePolylineArcGeometry(line.pointsBaseXYZ);
+                for (std::size_t j = 1; j < local.vertexArcs.size(); ++j) {
+                    const double a = it->begin + local.vertexArcs[j - 1];
+                    const double b = it->begin + local.vertexArcs[j];
+                    line.segmentMetricCosts.push_back(costAt(b) - costAt(a));
+                    const auto source = samplePolylineArc(geometry, (a + b) * 0.5).segmentIndex;
+                    line.segmentOriginalStepCosts.push_back(side.originalStepCosts.at(source));
+                }
+            }
             line.seedBaseXYZ = line.pointsBaseXYZ.front();
             if (it->begin > kEpsilon)
                 line.originalSeedBaseXYZ = candidate.line.seedBaseXYZ;
@@ -878,6 +889,8 @@ void verifyDenseCandidate(
             const auto steps = line.pointsBaseXYZ.size() - 1;
             if (sign < 0) {
                 std::reverse(line.pointsBaseXYZ.begin(), line.pointsBaseXYZ.end());
+                std::reverse(line.segmentMetricCosts.begin(), line.segmentMetricCosts.end());
+                std::reverse(line.segmentOriginalStepCosts.begin(), line.segmentOriginalStepCosts.end());
                 std::swap(line.negativeTermination, line.positiveTermination);
                 line.negativeFiberlets = steps;
             } else {
@@ -894,6 +907,10 @@ void verifyDenseCandidate(
         joined.pointsBaseXYZ.insert(joined.pointsBaseXYZ.end(),
             std::next(positive.pointsBaseXYZ.begin()), positive.pointsBaseXYZ.end());
         joined.totalMetricCost += positive.totalMetricCost;
+        joined.segmentMetricCosts.insert(joined.segmentMetricCosts.end(),
+            positive.segmentMetricCosts.begin(), positive.segmentMetricCosts.end());
+        joined.segmentOriginalStepCosts.insert(joined.segmentOriginalStepCosts.end(),
+            positive.segmentOriginalStepCosts.begin(), positive.segmentOriginalStepCosts.end());
         joined.pathLengthPredictionVoxels += positive.pathLengthPredictionVoxels;
         joined.positiveTermination = positive.positiveTermination;
         joined.positiveFiberlets = positive.positiveFiberlets;
@@ -947,6 +964,15 @@ FiberletCropTraceLine finalizeCandidate(TraceCandidate& candidate)
     line.pointsBaseXYZ.insert(
         line.pointsBaseXYZ.end(), std::next(positive.points.begin()),
         positive.points.end());
+    if (!negative.originalStepCosts.empty() || !positive.originalStepCosts.empty()) {
+        for (std::size_t i = negative.cumulativeCosts.size(); i > 1; --i)
+            line.segmentMetricCosts.push_back(negative.cumulativeCosts[i - 1] - negative.cumulativeCosts[i - 2]);
+        for (std::size_t i = 1; i < positive.cumulativeCosts.size(); ++i)
+            line.segmentMetricCosts.push_back(positive.cumulativeCosts[i] - positive.cumulativeCosts[i - 1]);
+        line.segmentOriginalStepCosts.assign(negative.originalStepCosts.rbegin(), negative.originalStepCosts.rend());
+        line.segmentOriginalStepCosts.insert(line.segmentOriginalStepCosts.end(),
+            positive.originalStepCosts.begin(), positive.originalStepCosts.end());
+    }
     return std::move(line);
 }
 
@@ -1581,7 +1607,7 @@ FiberletCropTraceResult traceDenseBeamCrop(
             for (int sign : {-1, 1}) {
                 auto& side = sign < 0 ? candidate.negative : candidate.positive;
                 side.points.push_back(candidate.line.seedBaseXYZ);
-                if (config.reverseConsistency)
+                if (config.reverseConsistency || config.captureStepCosts)
                     side.cumulativeCosts.push_back(0.0);
                 double previousLoss = 0.0;
                 bool exited = false;
@@ -1607,10 +1633,12 @@ FiberletCropTraceResult traceDenseBeamCrop(
                             exited = true;
                         }
                         side.totalMetricCost += (cumulativeLoss - previousLoss) * fraction;
+                        if (config.captureStepCosts)
+                            side.originalStepCosts.push_back(cumulativeLoss - previousLoss);
                         previousLoss = cumulativeLoss;
                         side.pathLengthPredictionVoxels += length(retained - previous) / predictionToBaseScale;
                         side.points.push_back(retained);
-                        if (config.reverseConsistency)
+                        if (config.reverseConsistency || config.captureStepCosts)
                             side.cumulativeCosts.push_back(side.totalMetricCost);
                         ++side.fiberlets;
                         return !exited;

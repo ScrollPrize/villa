@@ -69,7 +69,7 @@ struct FiberTraceWindingLeastSquaresReport {
     std::vector<FiberTraceWindingLeastSquaresState> states;
     std::vector<std::size_t> componentByPiece;
     std::vector<std::size_t> gaugePieces;
-    std::vector<std::size_t> incidentEffectiveConstraints;
+    std::vector<double> incidentEffectiveConstraints;
     std::vector<FiberTraceWindingFactorDiagnostic> factorDiagnostics;
     FiberTraceWindingLeastSquaresCostSummary initialCosts;
     FiberTraceWindingLeastSquaresCostSummary finalCosts;

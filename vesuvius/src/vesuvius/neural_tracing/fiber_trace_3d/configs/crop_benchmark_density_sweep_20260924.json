@@ -1,0 +1,9 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260924_density_sweep",
+  "density_sweep": {
+    "template": "/home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/crop_benchmark_defect_density_20260924.json",
+    "previous_control": "/ephemeral/hendrik/fiber_crop_bench/20260924_defect_density/reverse-density-control",
+    "threads": 32,
+    "workers": 4
+  }
+}

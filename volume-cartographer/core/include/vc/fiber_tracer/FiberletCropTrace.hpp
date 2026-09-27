@@ -38,6 +38,7 @@ struct FiberletCropTraceConfig {
     std::size_t parallelThreads = 0;
     std::size_t maximumAttempts = 0;
     std::size_t maximumFibers = 0;
+    bool captureStepCosts = false; // Dense tracing diagnostics only; not serialized.
 };
 
 struct FiberletCropTraceSearchBox {
@@ -58,6 +59,8 @@ struct FiberletCropTraceLine {
   double totalMetricCost = 0.0;
   double pathLengthPredictionVoxels = 0.0;
     std::vector<cv::Vec3d> pointsBaseXYZ;
+    std::vector<double> segmentMetricCosts;
+    std::vector<double> segmentOriginalStepCosts;
     std::string negativeTermination;
     std::string positiveTermination;
     std::size_t negativeFiberlets = 0;

@@ -51,6 +51,18 @@ def bp_metrics(log):
 
 
 def run(config):
+    if 'local_cost_sweep' in config:
+        from .local_cost_sweep import run_sweep
+        return run_sweep(config)
+    if 'local_event_report' in config:
+        from .local_constraint_report import report
+        return report(config)
+    if 'density_alternatives' in config:
+        from .density_alternatives import run_alternatives
+        return run_alternatives(config)
+    if 'density_sweep' in config:
+        from .density_penalty_sweep import run_sweep
+        return run_sweep(config)
     repo = Path(__file__).resolve().parents[5]
     binaries = repo / 'volume-cartographer/build/fiber-evaluation/bin'
     output = Path(config['output_root'])

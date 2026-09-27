@@ -1,0 +1,8 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_certified_splits_v3",
+  "local_cost_sweep": {
+    "report_only": true,
+    "certified_splits": true,
+    "report_destination": "volume-cartographer/docs/fiber_benchmark_runs/2026-09-27-certified-splits"
+  }
+}

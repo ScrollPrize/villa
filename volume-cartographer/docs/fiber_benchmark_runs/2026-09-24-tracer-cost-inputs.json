@@ -1,0 +1,17 @@
+[
+  {
+    "label": "Classic1024",
+    "prefix": "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/bp-beam-classic",
+    "steps": "/ephemeral/hendrik/fiber_crop_bench/20260924_cost_audit/beam-crop-classic_step_costs.csv"
+  },
+  {
+    "label": "New1024",
+    "prefix": "/ephemeral/hendrik/fiber_crop_bench/20260923_v1/bp-beam-new",
+    "steps": "/ephemeral/hendrik/fiber_crop_bench/20260924_cost_audit/beam-crop-new_step_costs.csv"
+  },
+  {
+    "label": "NewReverse2048",
+    "prefix": "/ephemeral/hendrik/fiber_crop_bench/20260923_beam2048_v1/bp-beam-new2048-coverage40x80-angle45-reverse-v2",
+    "steps": "/ephemeral/hendrik/fiber_crop_bench/20260924_cost_audit/beam-crop-new2048-coverage40x80-angle45-reverse-v2_step_costs.csv"
+  }
+]

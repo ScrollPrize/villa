@@ -29,13 +29,14 @@ struct Factor {
     double sameCost = 0.0;
     double differentCost = 0.0;
     std::size_t measurements = 0;
+    double measurementMass = 0.;
     bool hardContinuity = false;
 };
 
 struct Graph {
     std::vector<Factor> factors;
     std::vector<std::vector<std::size_t>> adjacency;
-    std::vector<std::size_t> incidentMeasurements;
+    std::vector<double> incidentMeasurements;
     std::size_t measurements = 0;
     std::size_t neutralFactors = 0;
     std::size_t neutralMeasurements = 0;
@@ -134,8 +135,11 @@ Graph buildGraph(
             factor.a = key.first;
             factor.b = key.second;
         }
-        factor.sameCost += 1.0 - constraint.parallelScore;
-        factor.differentCost += constraint.parallelScore;
+        if(!std::isfinite(constraint.evidenceWeight) || constraint.evidenceWeight<=0.)
+            throw std::invalid_argument("Constraint evidence weight must be positive");
+        factor.sameCost += constraint.evidenceWeight * (1.0 - constraint.parallelScore);
+        factor.differentCost += constraint.evidenceWeight * constraint.parallelScore;
+        factor.measurementMass += constraint.evidenceWeight;
         ++factor.measurements;
         factor.hardContinuity = factor.hardContinuity ||
             (enforceHardSplitContinuity && constraint.hardContinuity);
@@ -167,8 +171,8 @@ Graph buildGraph(
         graph.factors.push_back(normalized);
         graph.adjacency[normalized.a].push_back(index);
         graph.adjacency[normalized.b].push_back(index);
-        graph.incidentMeasurements[normalized.a] += normalized.measurements;
-        graph.incidentMeasurements[normalized.b] += normalized.measurements;
+        graph.incidentMeasurements[normalized.a] += normalized.measurementMass;
+        graph.incidentMeasurements[normalized.b] += normalized.measurementMass;
         graph.measurements += normalized.measurements;
     }
 

@@ -1,5 +1,83 @@
 # Fiberlet crop tracing
 
+## Distance-weighted continuation (experimental)
+
+Use `--winding-continuity-step-cost L` instead of the flat cut option to keep
+a soft continuation potential `L * abs(q_b-q_a)`, with q equal to integer
+winding plus calibrated H/V phase offset. There is no cap or independent
+free-cut switch. Half-winding differences cost L/2 at phase 0.5. Defect
+endpoints retain their usual piece cost and do not pay an extra continuation
+cost. Both cost flags are mutually exclusive; defaults remain unchanged.
+
+The existing `continuity_map_cut` diagnostic means unequal active endpoints
+in this mode, **not removal of their BP coupling**. The conditioned inlier
+benchmark still excludes violated equalities; judge initial winding/ladder
+accuracy separately. Reported continuation energy uses the actual displacement.
+
+Run the matched D10/parallel-off six-setting experiment with the approved
+runner and config `crop_benchmark_local_step_costs_20260927.json`; regenerate
+its report without solving using `crop_benchmark_local_step_costs_report_20260927.json`.
+
+## Independent piece and continuation disabling (experimental)
+
+Direction-ablation joint-grid mixed BP accepts `--winding-continuity-cut-cost C`
+(finite, nonnegative). For each continuation link, keeping it requires equal
+active orientation and integer winding; cutting it costs C and leaves both
+pieces and their ordinary constraints intact. A Defect endpoint already
+disconnects the link, with no extra cut cost. This minimizes the binary switch
+(Potts energy); it does not marginalize a latent keep/cut variable. C=0 removes
+continuity from graph coupling, incidence and gauges. The default remains hard
+continuity. Do not combine this option with nonzero `--piece-break-cost` (the
+older, different active/Defect boundary penalty).
+
+`--winding-defect-cost D` independently sets the existing piece Defect unary
+per incident evidence mass. Use joint orientation inference (omit
+`--winding-fixed-orientation`) to allow H/V changes across a cut. The reference
+pruning diagnostic now also supports joint orientations. Diagnostics include
+`continuity_map_cut` in factor CSVs and cut counts/energy in logs. Cut links are
+excluded from conditioned inlier connectivity and count as disabled constraints
+in the removal benchmark; they do not count as fulfilled evidence.
+
+The approved evaluation runner's `crop-benchmark` command accepts
+`crop_benchmark_local_costs_20260927.json` for the resumable 24-point matrix,
+and `crop_benchmark_local_costs_report_20260927.json` to regenerate its report
+without rerunning native evaluation. Both configs live under
+`vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/`.
+
+For experimental loss-aware winding disablement, direction-ablation joint-grid
+mixed BP accepts `--winding-defect-multipliers input.json`. Version1JSON contains
+`trace_artifact` and a nonempty ordered `pieces` array with `piece`,
+`original_trace`, `begin_arc_base`, `end_arc_base`, and `multiplier` in `(0,1]`.
+Artifact path and every piece identity must match exactly. Factors attach to
+piece descriptors and survive subsetting/reference conditioning; reference
+pieces default to1. Only winding defect penalties change, not orientation BP
+or pairwise constraints. The multiplier is exported in consistency CSVs.
+`--reference-initial-readout` adds the existing independent reference readout
+of the original frozen BP solution alongside removal diagnostics, without
+feeding those assignments back to the solver.
+
+The first controlled experiment uses mean, length-weighted median, or maximum
+native forward loss per prediction voxel, with `max(0.1,0.5/(0.5+d))`.
+`scripts/prepare_defect_density_inputs.py` prepares these inputs from the
+audited step-cost CSV and original consistency CSV without reading reference
+removal labels. The default without this option remains multiplier1.
+
+Dense tracing can optionally audit historical cost data with
+`--trace-cost-reference /path/to/saved.zarr`. It captures original forward-step
+losses without changing tracing, requires exact geometry/order/aggregate-cost
+agreement against that saved artifact, and writes `<output-stem>_step_costs.csv`.
+The CSV includes original (unclipped) step costs and retained segment costs;
+segment arrays are transient, not added to the artifact storage format. See
+[the cost/removal benchmark](fiber_benchmark_runs/2026-09-24-tracer-cost-removal.md)
+for reproducing piece-local means and maxima using saved BP removal labels.
+
+For controlled winding-BP iteration sweeps, use
+`--bp-message-iterations 500` to hold normal-lattice alignment and orientation
+fixed while varying `--winding-message-iterations`. Without the optional override,
+winding retains the existing behavior of sharing the BP limit. The
+override is positive and supported only for direction-ablation joint-grid
+mixed BP runs; unsupported solvers are rejected rather than ignoring it.
+
 The complete frozen PHercParis4 1024-crop evaluation workflow, including
 prediction and Fiberlet generation, is documented in
 [`fiber_pruning_benchmark.md`](fiber_pruning_benchmark.md).
@@ -2260,3 +2338,89 @@ backoff, per-piece terminations and reverse attempts/failures/skipped length.
 Counters describe active committed candidates, excluding discarded speculative
 work. Existing readers predating this extension may reject the new optional
 metadata; existing artifacts remain readable by the updated reader.
+
+## Experimental BP retention alternatives
+
+### Local events and non-overlapping pieces
+
+`--local-constraint-events` is an opt-in alternative to fixed 512/128
+piece/overlap subdivision. It uses the same source traces, spatial index,
+polyline projection, batched normal-distance sampler and BP solvers.
+
+Candidate identities are source trace/arc pairs, discovered before subdivision.
+Incoming/outgoing 16-base-voxel secants are checked separately (all available
+side combinations must agree: parallel within 30 degrees, orthogonal within
+30 degrees of perpendicular). Original uncut traces require both sides;
+reference cross-extraction on already-cut pieces accepts independently certified
+existing sides and preserves the input piece IDs.
+
+Parallel correspondences repeat every 64 base voxels, walk 32 and 64 voxels on
+each side, and must be locally reciprocal within 8 voxels. Correspondence search
+is bounded in arc; it cannot jump to an arbitrary distant part of a folded trace.
+Orthogonal encounters use shorter 8/16-voxel independent probes on each trace.
+Every connector must agree with the base connector's distance category and be
+within 0.25 winding units; nonzero signed distances must agree in sign and normal
+component. Extra samples certify the base measurement, not average it away.
+Near-identical encounters are deduplicated within 8 voxels on both source arcs
+(parallel repeats retain their distinct A arcs).
+
+Consecutive accepted orthogonal event locations induce midpoint cuts. Parallel
+relation/category/sign changes also induce midpoint cuts across a bounded
+ambiguous band. Two rounds of finer sampling target changes between valid/invalid
+or differently classified nearby candidates. This is a bounded local search,
+not a guarantee to find every event between samples.
+
+Pieces cover the complete original trace, share only their boundary point, and
+have **zero overlapping arc length**. Continuation factors retain the existing
+break/defect semantics. Every certified event survives subdivision unchanged:
+only its owning piece IDs are remapped using its base-point arcs. Its support
+may cross either or both piece boundaries; subdivision never revalidates,
+clips or drops that measurement. The earlier post-split support filter was a
+bug and its benchmark results do not evaluate the intended formulation.
+
+Repeated parallel finite costs and defect incidence are weighted by represented
+arc length, divided by a fixed 128-base-voxel unit, before subdivision on the
+original source-trace pair. Voronoi intervals partition
+neighboring samples; this avoids simply multiplying evidence when sampling more
+densely. Hard sign constraints remain hard. Orthogonal events retain unit weight.
+Factor CSVs include the base arcs, immutable certified support and evidence weight.
+Extraction reports certified and retained-certified counts; these must agree
+apart from explicitly omitted parallel factors. Regression tests verify that
+adding crossing-induced splits preserves existing events and weights.
+
+Reference-to-BP cross events follow the same source-first rule: certify on full
+reference/source fibers and use the shared arc-to-piece remapper. The evaluator
+retains its canonical per-piece interface, but does not re-certify tiny pieces.
+An event whose owning interval was removed during component selection is
+explicitly counted as `missing_owner`; a gap is never mapped to the next piece.
+
+`--local-no-parallel` removes ordinary parallel factors **after** the shared
+event extraction and subdivision; continuation factors remain. Thus the paired
+experiment uses identical piece geometry. `--local-event-spacing N` and
+`--local-parallel-span N` configure sampling/support. Existing piece multipliers
+or explicit cut hints cannot be combined with local subdivision.
+
+Run the corrected experiment through the approved evaluation runner with
+`crop_benchmark_certified_splits_20260927.json`
+under the fiber_trace_3d configs directory. No inference or retracing is needed.
+
+These opt-in diagnostics do not change production defaults. See the
+[controlled trial protocol](fiber_benchmark_runs/2026-09-27-density-alternatives.md).
+
+- `--winding-defect-multipliers JSON`: positive finite per-piece factors (including
+  factors above one). Optional `length_measure` and `length_blend` interpolate the
+  incident-count defect measure with a fixed calibrated length measure. The
+  JSON's trace and original-piece identities must match; calibration is supplied
+  once and is not recomputed during conditioning/pruning.
+- `--piece-cut-hints JSON`: direction-ablation extra boundaries, in base-voxel arc
+  coordinates, keyed by original trace ID. Version 1 contains `trace_artifact`
+  and `cuts: {"trace-id": [arc, ...]}`. Arcs must be finite, ascending and interior.
+  Partitions use shared native subdivision and continuity handling. Cannot be
+  combined with old per-piece multipliers because piece identities change.
+- `--winding-measurement-disable-cost C`: joint-grid mixed BP only; positive
+  finite cost for an ordinary measurement's latent off alternative. Sum-product
+  marginalizes the switch; it does not merely scale a hard/infinite penalty.
+  Hard continuity and conditioned reference evidence remain non-disableable.
+  MAP-off measurements do not drive endpoint pruning, but count as problematic
+  in the removal benchmark. Diagnostics distinguish initial, conditioned and
+  fresh solves; off probabilities are conditional on decoded endpoint states.

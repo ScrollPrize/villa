@@ -1,0 +1,58 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_local_costs_fixed_v1",
+  "local_cost_sweep": {
+    "template": "/home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/crop_benchmark_local_events_local-parallel_20260927.json",
+    "workers": 2,
+    "threads": 48,
+    "points": [
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": "hard",
+        "fixed_orientation": true
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 0.1,
+        "fixed_orientation": true
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 10,
+        "fixed_orientation": true
+      },
+      {
+        "parallel": false,
+        "defect": 100,
+        "cut": "hard",
+        "fixed_orientation": true
+      },
+      {
+        "parallel": false,
+        "defect": 100,
+        "cut": 0.1,
+        "fixed_orientation": true
+      },
+      {
+        "parallel": false,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true
+      },
+      {
+        "parallel": false,
+        "defect": 100,
+        "cut": 10,
+        "fixed_orientation": true
+      }
+    ]
+  }
+}

@@ -31,8 +31,30 @@ using Measurement = FiberTracePreparedWindingMeasurement;
 using Edge = FiberTracePreparedWindingEdge;
 using PreparedWinding = FiberTracePreparedWindingModel;
 
+double scaledDefectCost(const PreparedWinding& problem, std::size_t node, double base)
+{
+    return base * problem.defectCostMultipliers.at(node);
+}
+
+double defectMeasure(const PreparedWinding& problem, std::size_t node, double incident)
+{
+    const double blend = problem.defectLengthBlends.at(node);
+    if (blend == 0.0)
+        return static_cast<double>(incident);
+    return (1.0 - blend) * static_cast<double>(incident) +
+        blend * problem.defectLengthMeasures.at(node);
+}
+
 void validateConfig(const FiberTraceWindingBeliefPropagationConfig& config)
 {
+    if (config.continuityCostByDistance && !config.continuityCutCost)
+        throw std::invalid_argument("Distance continuation requires a configured cost");
+    if (config.continuityCutCost &&
+        (!std::isfinite(*config.continuityCutCost) || *config.continuityCutCost < 0.0))
+        throw std::invalid_argument("Continuity cut cost must be finite and nonnegative");
+    if (config.measurementDisableCost &&
+        (!std::isfinite(*config.measurementDisableCost) || *config.measurementDisableCost <= 0.0))
+        throw std::invalid_argument("Measurement disable cost must be finite and positive");
     const bool validDecisionConfidence =
         config.decisionConfidence ==
             FiberTraceWindingDecisionConfidence::Legacy ||
@@ -422,7 +444,20 @@ PreparedWinding prepareWinding(
     result.preparedMeasurementScale = measurementScale;
     result.pieceToNode.resize(constraints.pieces.size());
     result.piecesByNode.resize(constraints.pieces.size());
+    result.defectCostMultipliers.resize(constraints.pieces.size());
+    result.defectLengthMeasures.resize(constraints.pieces.size());
+    result.defectLengthBlends.resize(constraints.pieces.size());
     for (std::size_t piece = 0; piece < constraints.pieces.size(); ++piece) {
+        const double multiplier = constraints.pieces[piece].windingDefectCostMultiplier;
+        if (!std::isfinite(multiplier) || multiplier <= 0.0)
+            throw std::invalid_argument("Winding defect multiplier must be positive and finite");
+        result.defectCostMultipliers[piece] = multiplier;
+        const auto& descriptor = constraints.pieces[piece];
+        if (!std::isfinite(descriptor.windingDefectLengthMeasure) || descriptor.windingDefectLengthMeasure < 0.0 ||
+            !std::isfinite(descriptor.windingDefectLengthBlend) || descriptor.windingDefectLengthBlend < 0.0 || descriptor.windingDefectLengthBlend > 1.0)
+            throw std::invalid_argument("Invalid winding defect length measure/blend");
+        result.defectLengthMeasures[piece] = descriptor.windingDefectLengthMeasure;
+        result.defectLengthBlends[piece] = descriptor.windingDefectLengthBlend;
         result.pieceToNode[piece] = piece;
         result.piecesByNode[piece].push_back(piece);
     }
@@ -473,13 +508,16 @@ PreparedWinding prepareWinding(
             : normalConfidenceMultiplier(
                   config.normalConfidence, selectedAlignment);
         const double selectedConfidence =
-            selectedDecisionConfidence * selectedNormalConfidence;
+            constraint.evidenceWeight * selectedDecisionConfidence * selectedNormalConfidence;
         const bool finiteSigns = config.finiteSignInfringementCost.has_value();
         const bool alignmentPromotesHardSign =
             hardSignPromotedByAlignment(config, selectedAlignment);
 
         Measurement rawMeasurement;
         rawMeasurement.constraintIndex = index;
+        if(!std::isfinite(constraint.evidenceWeight) || constraint.evidenceWeight<=0.)
+            throw std::invalid_argument("Constraint evidence weight must be positive");
+        rawMeasurement.evidenceWeight = constraint.evidenceWeight;
         rawMeasurement.a = a;
         rawMeasurement.b = b;
         rawMeasurement.parallel = constraint.parallelScore;
@@ -496,6 +534,7 @@ PreparedWinding prepareWinding(
         rawMeasurement.selectedNormalAlignment = selectedAlignment;
         rawMeasurement.selectedConfidence = selectedConfidence;
         rawMeasurement.continuity = continuity;
+        rawMeasurement.allowMeasurementDisable = constraint.allowMeasurementDisable;
         rawMeasurement.quantizeTargets = quantizeComponentTargets;
         rawMeasurement.parallelDominant = parallelDominant;
         rawMeasurement.perpendicularDominant = perpendicularDominant;
@@ -571,6 +610,10 @@ PreparedWinding prepareWinding(
             perpendicularSignEnabled && finiteSigns &&
             alignmentPromotesHardSign;
         result.diagnostics.push_back(std::move(diagnostic));
+        // An always-free cut must be exactly equivalent to removing the edge,
+        // including its incidence, components and gauge selection.
+        if (continuity && config.continuityCutCost == 0.0)
+            return;
         const std::pair<std::size_t, std::size_t> key{a, b};
         inputPairs.insert(key);
         ++result.inputMeasurements;
@@ -615,8 +658,8 @@ PreparedWinding prepareWinding(
                 measurement.hardPerpendicularSign;
             if (measurement.parallel > 0.0 ||
                 measurement.perpendicular > 0.0) {
-                ++result.incidentMeasurements[result.edges[edge].a];
-                ++result.incidentMeasurements[result.edges[edge].b];
+                result.incidentMeasurements[result.edges[edge].a] += measurement.evidenceWeight;
+                result.incidentMeasurements[result.edges[edge].b] += measurement.evidenceWeight;
             }
             if (parallelWindingWeight(measurement) > 0.0 ||
                 perpendicularWindingWeight(measurement) > 0.0 ||
@@ -624,8 +667,8 @@ PreparedWinding prepareWinding(
                 measurement.perpendicularSignPenalty > 0.0 ||
                 measurement.hardParallelSign ||
                 measurement.hardPerpendicularSign) {
-                ++result.incidentWindingMeasurements[result.edges[edge].a];
-                ++result.incidentWindingMeasurements[result.edges[edge].b];
+                result.incidentWindingMeasurements[result.edges[edge].a] += measurement.evidenceWeight;
+                result.incidentWindingMeasurements[result.edges[edge].b] += measurement.evidenceWeight;
             }
         }
         if (factorPositive) {
@@ -1449,7 +1492,7 @@ InitialJointStates initialJointStates(
         const auto& b = result.byNode[edge.b];
         const bool active = a.orientation != JointClass::Mixed &&
             b.orientation != JointClass::Mixed;
-        if (config.enforceHardSplitContinuity &&
+        if (config.enforceHardSplitContinuity && !config.continuityCutCost &&
             edge.containsHardContinuity && active &&
             (a.orientation != b.orientation || a.winding != b.winding)) {
             throw std::invalid_argument(
@@ -1594,6 +1637,8 @@ bool hardWindingSignCompatible(
         edge.measurements.begin(),
         edge.measurements.end(),
         [&](const Measurement& measurement) {
+            if (config.measurementDisableCost && !measurement.continuity && measurement.allowMeasurementDisable)
+                return true;
             return hardWindingSignCompatible(
                 materializeMeasurement(measurement, config, measurementScale),
                 predictedDelta);
@@ -1865,8 +1910,8 @@ JointAdaptiveRound solveJointAdaptive(
                     }
                 }
             } else if (fixedOrientations[node] != JointClass::Mixed) {
-                logUnary[node][0] = -config.mixedUnaryCost *
-                    static_cast<double>(
+                logUnary[node][0] = -scaledDefectCost(problem, node, config.mixedUnaryCost) *
+                    defectMeasure(problem, node,
                         problem.incidentWindingMeasurements[node]) /
                     config.orientationTemperature;
             }
@@ -2390,7 +2435,7 @@ double decodedJointEnergy(
             energy -= std::log(std::max(prior, kEpsilon));
         } else if (decoded[node].orientation == JointClass::Mixed &&
                    fixedOrientations[node] != JointClass::Mixed) {
-            energy += config.mixedUnaryCost * static_cast<double>(
+            energy += scaledDefectCost(problem, node, config.mixedUnaryCost) * defectMeasure(problem, node,
                 problem.incidentWindingMeasurements[node]) /
                 config.orientationTemperature;
         }
@@ -2630,8 +2675,16 @@ double gridWindingEnergy(
     };
     double result = 0.0;
     for (const auto& raw : edge.measurements) {
+        if (raw.continuity && config.continuityCutCost) {
+            if (config.continuityCostByDistance)
+                result += *config.continuityCutCost * std::abs(delta);
+            else if (a.orientation != b.orientation || a.winding != b.winding)
+                result += *config.continuityCutCost;
+            continue;
+        }
         const auto measurement = materializeMeasurement(
             raw, config, measurementScale);
+        const double previousEnergy = result;
         if (!raw.continuity) {
             result += config.localSpanCost *
                 measurement.selectedConfidence * std::abs(predictedDelta);
@@ -2642,7 +2695,7 @@ double gridWindingEnergy(
                 : *measurement.parallelSignedDelta;
             const double targetSign = std::copysign(1.0, target);
             const double signedDelta = targetSign * predictedDelta;
-            result += config.hardSignSlackCost * std::max(
+            result += measurement.evidenceWeight * config.hardSignSlackCost * std::max(
                 0.0, signedDelta - minimumPositiveDelta(targetSign));
         }
         result += parallelWindingWeight(measurement) *
@@ -2653,6 +2706,17 @@ double gridWindingEnergy(
                     measurement, predictedDelta));
         }
         result += finiteSignPenalty(measurement, predictedDelta);
+        if (config.measurementDisableCost && !raw.continuity && raw.allowMeasurementDisable) {
+            const double energy = hardWindingSignCompatible(measurement, predictedDelta)
+                ? result - previousEnergy : std::numeric_limits<double>::infinity();
+            const double cap = *config.measurementDisableCost;
+            const double low = std::min(energy, cap);
+            const double high = std::max(energy, cap);
+            // Normalize the binary on/off mixture so an E=0 factor stays exactly neutral.
+            const double marginal = low - config.temperature * std::log1p(std::exp(-(high-low)/config.temperature)) +
+                config.temperature * std::log1p(std::exp(-cap/config.temperature));
+            result = previousEnergy + marginal;
+        }
     }
     return result;
 }
@@ -2660,12 +2724,15 @@ double gridWindingEnergy(
 double gridOrientationEnergy(
     const Edge& edge,
     JointClass a,
-    JointClass b)
+    JointClass b,
+    const FiberTraceJointGridWindingConfig& config)
 {
     const bool same = a == b;
     double result = 0.0;
     for (const auto& measurement : edge.measurements) {
-        result += same ? measurement.perpendicular : measurement.parallel;
+        if (measurement.continuity && config.continuityCutCost)
+            continue;
+        result += measurement.evidenceWeight * (same ? measurement.perpendicular : measurement.parallel);
     }
     return result;
 }
@@ -2691,8 +2758,8 @@ double gridDecodedEnergy(
         if (decoded[node].orientation == JointClass::Mixed &&
             (fixedOrientations.empty() ||
              fixedOrientations[node] != JointClass::Mixed)) {
-            result += config.mixedUnaryCost *
-                static_cast<double>(incident[node]);
+            result += scaledDefectCost(problem, node, config.mixedUnaryCost) *
+                defectMeasure(problem, node, incident[node]);
         } else if (decoded[node].orientation != JointClass::Mixed &&
                    !continuousNodes.empty()) {
             result += config.continuousCoordinateCost *
@@ -2709,13 +2776,13 @@ double gridDecodedEnergy(
             const bool exactlyOneDefect =
                 (a.orientation == JointClass::Mixed) !=
                 (b.orientation == JointClass::Mixed);
-            if (edge.containsHardContinuity && exactlyOneDefect)
+            if (edge.containsHardContinuity && exactlyOneDefect && !config.continuityCutCost)
                 result += config.pieceBreakCost;
             continue;
         }
         if (fixedOrientations.empty()) {
             result += gridOrientationEnergy(
-                edge, a.orientation, b.orientation);
+                edge, a.orientation, b.orientation, config);
         }
         result += gridWindingEnergy(
             edge,
@@ -2739,11 +2806,13 @@ double gridLogPotential(
     bool includeOrientationEnergy)
 {
     if (!hardContinuityCompatible(
-            edge, a, b, config.enforceHardSplitContinuity)) {
+            edge, a, b, config.enforceHardSplitContinuity && !config.continuityCutCost)) {
         return -std::numeric_limits<double>::infinity();
     }
     if (a.orientation == JointClass::Mixed ||
         b.orientation == JointClass::Mixed) {
+        if (config.continuityCutCost)
+            return 0.0;
         if (config.enforceHardSplitContinuity && edge.containsHardContinuity)
             return 0.0;
         return pieceBreakLogPotential(
@@ -2764,7 +2833,7 @@ double gridLogPotential(
     double result = -windingEnergy / config.temperature;
     if (includeOrientationEnergy) {
         result -= gridOrientationEnergy(
-            edge, a.orientation, b.orientation) /
+            edge, a.orientation, b.orientation, config) /
             config.orientationTemperature;
     }
     return result;
@@ -3036,8 +3105,8 @@ GridLogTotals buildGridTotals(
                 (round.fixedOrientations.empty() ||
                  round.fixedOrientations[node] != JointClass::Mixed);
             double logUnary = chargeDefect
-                ? -config.mixedUnaryCost *
-                      static_cast<double>(incident[node]) /
+                ? -scaledDefectCost(problem, node, config.mixedUnaryCost) *
+                      defectMeasure(problem, node, incident[node]) /
                       config.orientationTemperature
                 : 0.0;
             if (!chargeDefect &&
@@ -4088,7 +4157,7 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
         1.0 / selectedCalibration.gain,
         predictedDelta,
         round.fixedStates);
-    if (config.enforceHardSplitContinuity) {
+    if (config.enforceHardSplitContinuity && !config.continuityCutCost) {
         projectDecodedHardContinuity(
             prepared, decoded, activeConfidence, round.fixedStates);
         report.hardSignProjectedDefects += projectDecodedHardSigns(
@@ -4118,6 +4187,27 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
         if (!active)
             report.mapProbability[piece] = report.mixedProbability[piece];
     }
+    std::map<std::size_t, std::size_t> diagnosticByConstraint;
+    if (config.continuityCutCost) {
+        for (auto& diagnostic : report.factorDiagnostics) {
+            if (!constraints.constraints.at(diagnostic.constraintIndex).hardContinuity)
+                continue;
+            const auto a = diagnostic.pieceA, b = diagnostic.pieceB;
+            const bool active = report.windingValid[a] && report.windingValid[b];
+            diagnostic.continuityMapCut = *config.continuityCutCost == 0.0 ||
+                (active && (report.mapOrientationByPiece[a] != report.mapOrientationByPiece[b] ||
+                            report.mapWinding[a] != report.mapWinding[b]));
+            report.continuityCutEligible += active;
+            report.continuityMapCuts += active && diagnostic.continuityMapCut;
+            if (active && diagnostic.continuityMapCut)
+                report.continuityCutEnergy += *config.continuityCutCost *
+                    (config.continuityCostByDistance
+                        ? std::abs(report.mapLatentCoordinate[b] - report.mapLatentCoordinate[a]) : 1.0);
+        }
+    }
+    if (config.measurementDisableCost || config.continuityCutCost)
+        for (std::size_t i = 0; i < report.factorDiagnostics.size(); ++i)
+            diagnosticByConstraint.emplace(report.factorDiagnostics[i].constraintIndex, i);
     report.decodedEnergy = 0.0;
     report.orientationMode = round.fixedOrientations.empty()
         ? FiberTraceWindingOrientationMode::Joint
@@ -4148,8 +4238,8 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
             const auto& incident = round.fixedOrientations.empty()
                 ? prepared.incidentMeasurements
                 : prepared.incidentWindingMeasurements;
-            report.decodedEnergy += config.mixedUnaryCost *
-                static_cast<double>(incident[node]);
+            report.decodedEnergy += scaledDefectCost(prepared, node, config.mixedUnaryCost) *
+                defectMeasure(prepared, node, incident[node]);
         }
     }
     for (const auto& edge : prepared.edges) {
@@ -4161,12 +4251,12 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
             const bool exactlyOneDefect =
                 (a.orientation == JointClass::Mixed) !=
                 (b.orientation == JointClass::Mixed);
-            if (edge.containsHardContinuity && exactlyOneDefect)
+            if (edge.containsHardContinuity && exactlyOneDefect && !config.continuityCutCost)
                 report.decodedEnergy += config.pieceBreakCost;
         } else {
             if (round.fixedOrientations.empty()) {
                 report.decodedEnergy += gridOrientationEnergy(
-                    edge, a.orientation, b.orientation);
+                    edge, a.orientation, b.orientation, config);
             }
             report.decodedEnergy += gridWindingEnergy(
                 edge,
@@ -4188,6 +4278,23 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
             for (const auto& raw : edge.measurements) {
                 if (raw.continuity)
                     continue;
+                if (config.measurementDisableCost && raw.allowMeasurementDisable) {
+                    auto enabledConfig = config;
+                    enabledConfig.measurementDisableCost.reset();
+                    Edge single;
+                    single.measurements.push_back(raw);
+                    const double enabledEnergy = gridWindingEnergy(single, a, b,
+                        report.componentPhaseSign[component], selectedCalibration.gain,
+                        selectedCalibration.phase, enabledConfig);
+                    const double x = (*config.measurementDisableCost - enabledEnergy) / config.temperature;
+                    const double off = x >= 0.0 ? std::exp(-x)/(1.0+std::exp(-x)) : 1.0/(1.0+std::exp(x));
+                    ++report.measurementDisableEligible;
+                    report.measurementDisableMapOff += enabledEnergy > *config.measurementDisableCost;
+                    report.measurementDisableConditionalPosteriorSum += off;
+                    auto& diagnostic = report.factorDiagnostics.at(diagnosticByConstraint.at(raw.constraintIndex));
+                    diagnostic.measurementMapOff = enabledEnergy > *config.measurementDisableCost;
+                    diagnostic.measurementConditionalOffProbability = off;
+                }
                 const auto measurement = materializeMeasurement(
                     raw, config, 1.0 / selectedCalibration.gain);
                 report.localSpanEnergy += config.localSpanCost *
@@ -4209,7 +4316,7 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
                     double minimum = offset - std::floor(offset);
                     if (minimum <= 1.0e-12)
                         minimum = 1.0;
-                    report.hardSignSlackEnergy += config.hardSignSlackCost *
+                    report.hardSignSlackEnergy += measurement.evidenceWeight * config.hardSignSlackCost *
                         std::max(0.0, targetSign * latentDelta - minimum);
                 }
             }
@@ -4588,6 +4695,8 @@ FiberTraceConditionedOffenderSelection selectFiberTraceConditionedInliers(
         }
         const auto& constraint =
             conditionedConstraints.constraints[diagnostic.constraintIndex];
+        if (diagnostic.continuityMapCut || (diagnostic.measurementMapOff && !constraint.hardContinuity))
+            continue;
         if (constraint.hardContinuity) {
             edges.push_back({
                 nodeByPiece[diagnostic.canonicalNodeA],
@@ -7051,6 +7160,10 @@ summarizeFiberTracePruningConstraintBenchmark(
     }
     const auto agreement = summarizeFiberTraceConstraintAgreement(
         conditionedConstraints, conditionedWinding);
+    std::set<std::size_t> explicitlyDisabled;
+    for (const auto& diagnostic : conditionedWinding.factorDiagnostics)
+        if (diagnostic.measurementMapOff || diagnostic.continuityMapCut)
+            explicitlyDisabled.insert(diagnostic.constraintIndex);
     FiberTracePruningConstraintBenchmark result;
     result.initialConstraints = initialConstraints;
     result.removedIncidentConstraints =
@@ -7062,7 +7175,9 @@ summarizeFiberTracePruningConstraintBenchmark(
             throw std::invalid_argument(
                 "Retained constraint has no factor diagnostic");
         }
-        if (state.defectNeutralized) {
+        if (explicitlyDisabled.contains(ordinaryConstraintOffset + constraint)) {
+            ++result.retainedDisabledConstraints;
+        } else if (state.defectNeutralized) {
             ++result.retainedDefectConstraints;
         } else if (state.infringed) {
             ++result.retainedInfringedConstraints;
@@ -7073,7 +7188,7 @@ summarizeFiberTracePruningConstraintBenchmark(
     result.problematicConstraints =
         result.removedIncidentConstraints +
         result.retainedInfringedConstraints +
-        result.retainedDefectConstraints;
+        result.retainedDefectConstraints + result.retainedDisabledConstraints;
     return result;
 }
 
@@ -7718,7 +7833,7 @@ FiberTraceReferenceWindingObservation makeFiberTraceReferenceWindingObservation(
             : constraint.parallelNormalAlignment);
     const double selectedConfidence =
         observation.decisionConfidenceMultiplier *
-        observation.normalConfidenceMultiplier;
+        observation.normalConfidenceMultiplier * constraint.evidenceWeight;
     const bool finiteSigns = config.finiteSignInfringementCost.has_value();
     observation.exactWindingFactor = true;
     observation.bpLatentCoordinate = active
@@ -8421,7 +8536,7 @@ solveFiberTraceJointGridWindingBeliefPropagation(
             const auto& a = *exactStates.byNode[edge.a];
             const auto& b = *exactStates.byNode[edge.b];
             if (!hardContinuityCompatible(
-                    edge, a, b, config.enforceHardSplitContinuity)) {
+                    edge, a, b, config.enforceHardSplitContinuity && !config.continuityCutCost)) {
                 throw std::runtime_error(
                     "Fixed winding states violate hard continuity");
             }
@@ -8535,6 +8650,8 @@ FiberTraceWindingBeliefPropagationReport solveFiberTraceWindingBeliefPropagation
     const FiberTraceBeliefTopology& topology,
     const FiberTraceWindingBeliefPropagationConfig& config)
 {
+    if (config.measurementDisableCost || config.continuityCutCost)
+        throw std::invalid_argument("Measurement disable mode requires joint-grid solver");
     validateConfig(config);
     const auto prepared = prepareWinding(constraints, topology, config);
     FiberTraceWindingBeliefPropagationReport report;
@@ -8696,6 +8813,8 @@ solveFiberTraceInterleavedWindingBeliefPropagation(
     const FiberTraceInterleavedWindingProgressCallback& progress,
     std::span<const FiberTraceFixedOrientation> fixedOrientations)
 {
+    if (config.measurementDisableCost || config.continuityCutCost)
+        throw std::invalid_argument("Measurement disable mode requires joint-grid solver");
     const auto progressStarted = std::chrono::steady_clock::now();
     validateConfig(config);
     const std::size_t pieceCount = constraints.pieces.size();

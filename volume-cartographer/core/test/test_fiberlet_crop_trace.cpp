@@ -454,9 +454,26 @@ TEST_CASE("Dense reverse consistency preserves a reversible route and its cost")
         anchor(key(1), {16, 16, 16}, {1, 0, 0}, 1)};
     const auto original = traceDenseBeamCrop(field, anchors, 8, normals, dense, config);
     REQUIRE(original.lines.size() == 1);
+    config.captureStepCosts = true;
+    const auto diagnostic = traceDenseBeamCrop(field, anchors, 8, normals, dense, config);
+    CHECK(diagnostic.lines.front().pointsBaseXYZ == original.lines.front().pointsBaseXYZ);
+    CHECK(diagnostic.lines.front().totalMetricCost == original.lines.front().totalMetricCost);
+    const auto checkCosts = [](const FiberletCropTraceLine& line) {
+        REQUIRE(line.segmentMetricCosts.size() + 1 == line.pointsBaseXYZ.size());
+        REQUIRE(line.segmentOriginalStepCosts.size() == line.segmentMetricCosts.size());
+        double sum = 0;
+        for (std::size_t i = 0; i < line.segmentMetricCosts.size(); ++i) {
+            sum += line.segmentMetricCosts[i];
+            CHECK(line.segmentMetricCosts[i] >= 0);
+            CHECK(line.segmentOriginalStepCosts[i] + 1e-9 >= line.segmentMetricCosts[i]);
+        }
+        CHECK(sum == doctest::Approx(line.totalMetricCost));
+    };
+    checkCosts(diagnostic.lines.front());
     config.reverseConsistency = true;
     const auto checked = traceDenseBeamCrop(field, anchors, 8, normals, dense, config);
     REQUIRE(checked.lines.size() == 1);
+    checkCosts(checked.lines.front());
     CHECK(checked.reverseAttempts == 2);
     CHECK(checked.reverseFailures == 0);
     CHECK(checked.reverseSkippedLengthBaseVoxels == 0);
@@ -499,6 +516,7 @@ TEST_CASE("Dense reverse consistency preserves gaps and split provenance")
     config.maximumBaseXYZ = {256, 256, 256};
     config.parallelThreads = 1;
     config.reverseConsistency = true;
+    config.captureStepCosts = true;
     FiberTraceConfig dense;
     dense.coneGridSize = 5;
     const std::vector<FiberletStoredAnchor> anchors{
@@ -511,6 +529,15 @@ TEST_CASE("Dense reverse consistency preserves gaps and split provenance")
     std::size_t relocatedSeeds = 0;
     for (const auto& line : checked.lines) {
         retained += line.pathLengthPredictionVoxels;
+        REQUIRE(line.segmentMetricCosts.size() + 1 == line.pointsBaseXYZ.size());
+        REQUIRE(line.segmentOriginalStepCosts.size() == line.segmentMetricCosts.size());
+        double segmentSum = 0.0;
+        for (std::size_t i = 0; i < line.segmentMetricCosts.size(); ++i) {
+            segmentSum += line.segmentMetricCosts[i];
+            CHECK(line.segmentMetricCosts[i] >= -1e-9);
+            CHECK(line.segmentMetricCosts[i] <= line.segmentOriginalStepCosts[i] + 1e-9);
+        }
+        CHECK(segmentSum == doctest::Approx(line.totalMetricCost));
         CHECK(line.totalMetricCost >= 0);
         CHECK(std::find(line.pointsBaseXYZ.begin(), line.pointsBaseXYZ.end(), line.seedBaseXYZ) != line.pointsBaseXYZ.end());
         if (line.originalSeedBaseXYZ) {

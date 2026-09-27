@@ -150,6 +150,15 @@ enum class FiberTraceWindingNormalConfidence : unsigned char {
     FiberTraceWindingNormalConfidence mode) noexcept;
 
 struct FiberTraceWindingBeliefPropagationConfig {
+    // Experimental joint-grid winding-measurement on/off prior; continuity is never disabled.
+    std::optional<double> measurementDisableCost;
+    // Joint-grid only: minimize a binary continuation keep/cut choice.
+    // Keep requires identical active H/V and integer winding; cut costs C.
+    // A Defect endpoint already disconnects it, without an extra charge.
+    std::optional<double> continuityCutCost;
+    // With a cost configured, penalize physical winding distance instead of
+    // a constant cut: C*abs(delta integer winding + calibrated H/V offset).
+    bool continuityCostByDistance = false;
     double temperature = 0.25;
     double messageDamping = 0.5;
     double messageResidualTolerance = 1.0e-8;
@@ -300,6 +309,9 @@ using FiberTraceInterleavedWindingProgressCallback =
     std::function<void(const FiberTraceInterleavedWindingProgress&)>;
 
 struct FiberTraceWindingFactorDiagnostic {
+    bool measurementMapOff = false;
+    bool continuityMapCut = false;
+    double measurementConditionalOffProbability = 0.0;
     std::size_t constraintIndex = 0;
     std::size_t pieceA = 0;
     std::size_t pieceB = 0;
@@ -365,7 +377,9 @@ struct FiberTracePreparedWindingMeasurement {
     std::optional<double> rawPerpendicularSignedDelta;
     std::optional<double> selectedNormalAlignment;
     double selectedConfidence = 1.0;
+    double evidenceWeight = 1.0;
     bool continuity = false;
+    bool allowMeasurementDisable = true;
     bool quantizeTargets = true;
     bool parallelDominant = false;
     bool perpendicularDominant = false;
@@ -389,8 +403,11 @@ struct FiberTracePreparedWindingModel {
     std::vector<std::vector<std::size_t>> piecesByNode;
     std::vector<FiberTracePreparedWindingEdge> edges;
     std::vector<std::vector<std::size_t>> adjacency;
-    std::vector<std::size_t> incidentMeasurements;
-    std::vector<std::size_t> incidentWindingMeasurements;
+    std::vector<double> incidentMeasurements;
+    std::vector<double> incidentWindingMeasurements;
+    std::vector<double> defectCostMultipliers;
+    std::vector<double> defectLengthMeasures;
+    std::vector<double> defectLengthBlends;
     std::vector<std::size_t> componentByNode;
     std::vector<std::size_t> integerGaugeByNode;
     std::vector<std::size_t> gaugeNodeByComponent;
@@ -591,6 +608,12 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
     std::size_t calibrationGridShifts = 0;
     std::size_t calibrationIterations = 0;
     std::size_t hardSignProjectedDefects = 0;
+    std::size_t measurementDisableEligible = 0;
+    std::size_t continuityCutEligible = 0;
+    std::size_t continuityMapCuts = 0;
+    double continuityCutEnergy = 0.0;
+    std::size_t measurementDisableMapOff = 0;
+    double measurementDisableConditionalPosteriorSum = 0.0;
     std::size_t initialDefectGaugeComponents = 0;
     std::size_t selectedInitialization = 0;
     std::size_t rankDeficientUpdates = 0;
@@ -892,6 +915,7 @@ summarizeFiberTraceReferenceRangeBenchmark(
     double maximumReferenceWinding);
 
 struct FiberTracePruningConstraintBenchmark {
+    std::size_t retainedDisabledConstraints = 0;
     std::size_t initialConstraints = 0;
     std::size_t removedIncidentConstraints = 0;
     std::size_t retainedFulfilledConstraints = 0;
