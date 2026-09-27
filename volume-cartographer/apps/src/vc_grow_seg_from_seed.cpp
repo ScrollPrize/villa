@@ -1517,7 +1517,32 @@ int main(int argc, char *argv[])
     // volume-wide scattered reads, which would be punitive on remote
     // volumes). Warn-only by default; set
     // "require_on_prediction_support" to discard the surface and fail instead.
+    // If the prediction cannot be sampled at all (e.g. a transient remote
+    // chunk failure), the check reports that it could not run and the surface
+    // is kept; strict mode discards and fails instead, since the surface is
+    // unverified.
+    auto discard_seg_and_fail = [&]() -> int {
+        std::cerr << "discarding generated surface because "
+                     "require_on_prediction_support is set"
+                  << std::endl;
+        if (std::filesystem::exists(seg_dir)) {
+            std::filesystem::remove_all(seg_dir);
+        }
+#if defined(_WIN32)
+        // See end of main(): skip CRT teardown, worker threads deadlock it.
+        std::cout.flush();
+        std::cerr.flush();
+        std::_Exit(EXIT_FAILURE);
+#else
+        return EXIT_FAILURE;
+#endif
+    };
     {
+        // Sampling reads prediction chunks, which can throw on I/O failure
+        // (e.g. a transient remote fetch). That must not escape as an
+        // uncaught exception (SIGABRT): the try/catch around tracer() above
+        // exists for exactly this reason.
+        try {
         const cv::Mat_<cv::Vec3f> pts = surf->rawPoints();
         auto accessor = Chunked3dAccessor<uint8_t, passTroughComputor>::create(tensor);
         auto sample_prediction = [&accessor, &volume_shape_zyx](int z, int y, int x) -> uint8_t {
@@ -1563,9 +1588,17 @@ int main(int argc, char *argv[])
         }
         std::cout << "on-prediction support: " << std::fixed << std::setprecision(1)
                   << (support.fraction * 100.0) << "% (" << support.on << "/"
-                  << support.total << " vertices on nonzero prediction; background "
-                  << (background.fraction * 100.0) << "% over " << background.total
-                  << " random points in the surface neighborhood)" << std::endl;
+                  << support.total << " vertices on nonzero prediction; ";
+        if (background.total == 0) {
+            // No valid vertices, so no neighborhood was sampled: report the
+            // background as unavailable rather than the default 1.0 fraction.
+            std::cout << "background unavailable: no valid vertices to sample around)";
+        } else {
+            std::cout << "background " << (background.fraction * 100.0) << "% over "
+                      << background.total
+                      << " random points in the surface neighborhood)";
+        }
+        std::cout << std::endl;
         bool support_rejected = false;
         if (support.fraction < min_on_prediction_support) {
             std::cerr << "WARNING: vc_grow_seg_from_seed: on-prediction support "
@@ -1591,20 +1624,21 @@ int main(int argc, char *argv[])
             support_rejected = true;
         }
         if (support_rejected && require_on_prediction_support) {
-            std::cerr << "discarding generated surface because "
-                         "require_on_prediction_support is set"
+            return discard_seg_and_fail();
+        }
+        } catch (const std::exception& e) {
+            // The check is advisory by default: a sampling failure must not
+            // fail a successful growth. Report that the check could not run
+            // and continue with the save. In strict mode the surface is
+            // unverified, so discard it and fail like a rejected surface.
+            std::cerr << "WARNING: vc_grow_seg_from_seed: on-prediction support "
+                         "check could not be performed ("
+                      << e.what()
+                      << "); continuing without the acceptance check (#1675)."
                       << std::endl;
-            if (std::filesystem::exists(seg_dir)) {
-                std::filesystem::remove_all(seg_dir);
+            if (require_on_prediction_support) {
+                return discard_seg_and_fail();
             }
-#if defined(_WIN32)
-            // See end of main(): skip CRT teardown, worker threads deadlock it.
-            std::cout.flush();
-            std::cerr.flush();
-            std::_Exit(EXIT_FAILURE);
-#else
-            return EXIT_FAILURE;
-#endif
         }
     }
 

@@ -30,6 +30,9 @@ the growth already loaded -- volume-wide scattered reads would cost up to
 
 The check is warn-only by default so sparse but legitimate predictions are not
 rejected; opt into strict mode once the threshold is validated for a pipeline.
+If the prediction cannot be sampled at all (e.g. a transient remote chunk
+failure), the tool warns that the check could not run and keeps the surface;
+in strict mode it discards the unverified surface and exits non-zero.
 
 ## space_tracing_quad_phys() (surface_helpers.cpp)
 
