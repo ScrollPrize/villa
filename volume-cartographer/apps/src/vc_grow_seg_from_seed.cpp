@@ -330,12 +330,28 @@ int main(int argc, char *argv[])
     // Validate the on-prediction support threshold before doing any expensive
     // work: an out-of-range value is a configuration error, not something to
     // silently ignore (a negative or NaN threshold would disable the #1675
-    // safety check entirely).
-    const double min_on_prediction_support = params.value("min_on_prediction_support", 0.5);
+    // safety check entirely). The 0.4 default separates the observed real
+    // sample (good 44.8-62.7%, bad 25.9-34.8% on 65 eye-labelled patches),
+    // but the good sample is small (n=5): keep the threshold configurable.
+    const double min_on_prediction_support = params.value("min_on_prediction_support", 0.4);
     const bool require_on_prediction_support = params.value("require_on_prediction_support", false);
     if (!vc::surface::validSupportThreshold(min_on_prediction_support)) {
         std::cerr << "ERROR: vc_grow_seg_from_seed: min_on_prediction_support must be within [0, 1]; got "
                   << min_on_prediction_support << std::endl;
+        return EXIT_FAILURE;
+    }
+    // Margin above the measured background rate for the relative ("no better
+    // than chance") check: warn when support is within this margin of
+    // background. Real bad patches can score above the raw background rate
+    // (~20% background vs 25.9-34.8% bad patches), so a flat comparison is
+    // too weak; a +11 to +23 point margin separates the observed sample.
+    // Validated under the same rule as the threshold (finite, in [0, 1]).
+    const double min_support_margin_above_background =
+        params.value("min_support_margin_above_background", 0.1);
+    if (!vc::surface::validSupportThreshold(min_support_margin_above_background)) {
+        std::cerr << "ERROR: vc_grow_seg_from_seed: min_support_margin_above_background must be within "
+                     "[0, 1]; got "
+                  << min_support_margin_above_background << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -407,6 +423,7 @@ int main(int argc, char *argv[])
     std::cout << "step size: " << params.value("step_size", 20.0f) << std::endl;
     std::cout << "min_area_cm: " << min_area_cm << std::endl;
     std::cout << "min_on_prediction_support: " << min_on_prediction_support << std::endl;
+    std::cout << "min_support_margin_above_background: " << min_support_margin_above_background << std::endl;
     std::cout << "voxelsize: " << voxelsize << std::endl;
     std::cout << "tgt_overlap_count: " << tgt_overlap_count << std::endl;
 
@@ -1551,14 +1568,18 @@ int main(int argc, char *argv[])
     // #1675: post-growth acceptance check. A grown surface should follow the
     // prediction it was traced from: sample the input prediction at each valid
     // mesh vertex (native frame) and report the on-prediction fraction.
-    // Surfaces that cut across windings instead of following a sheet land at
-    // ~6-10% (indistinguishable from random points in the volume), while true
-    // sheets land at ~100%, so the default 0.5 threshold separates them with
-    // wide margin. The background rate (same fraction over uniform random
-    // points in the surface's neighborhood) is reported alongside: a surface
-    // at or below background follows the prediction no better than chance,
-    // which the absolute threshold cannot catch on dense predictions. The
-    // neighborhood is the bounding box of valid vertices dilated by 64
+    // On 65 eye-labelled real patches from 21 scrolls, bad (swirl-only)
+    // patches scored 25.9-34.8% and good (sheet-following) patches 44.8-62.7%,
+    // so the default 0.4 threshold separates the observed sample (good n=5 is
+    // small; keep it configurable). The background rate (same fraction over
+    // uniform random points in the surface's neighborhood) is reported
+    // alongside: a surface no more than min_support_margin_above_background
+    // above background follows the prediction no better than chance, which the
+    // absolute threshold cannot catch on dense predictions. The flat
+    // at-or-below-background comparison is too weak on real data (~20%
+    // background vs 25.9-34.8% bad patches flags only 3/21); the default 0.1
+    // margin sits just under the observed +11 to +23 point separating margin.
+    // The neighborhood is the bounding box of valid vertices dilated by 64
     // voxels, so its chunks were already loaded by the growth itself (no
     // volume-wide scattered reads, which would be punitive on remote
     // volumes). Warn-only by default; set
@@ -1706,11 +1727,14 @@ int main(int argc, char *argv[])
                       << std::endl;
             support_rejected = true;
         }
-        if (vc::surface::noBetterThanChance(support, background)) {
+        if (vc::surface::noBetterThanChance(support, background,
+                                                min_support_margin_above_background)) {
             std::cerr << "WARNING: vc_grow_seg_from_seed: on-prediction support "
                       << std::fixed << std::setprecision(1)
                       << (support.fraction * 100.0)
-                      << "% is no better than the background rate "
+                      << "% is no more than "
+                      << (min_support_margin_above_background * 100.0)
+                      << " points above the background rate "
                       << (background.fraction * 100.0)
                       << "% for random points in the surface neighborhood; the "
                          "surface follows the prediction no more than chance "

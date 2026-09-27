@@ -128,10 +128,35 @@ TEST_CASE("noBetterThanChance: flags surfaces at or below the background rate")
         s.total = 1000;  // a measured background: total != 0
         return s;
     };
-    CHECK(noBetterThanChance(make(0.08), make(0.08)));   // equal: no better
-    CHECK(noBetterThanChance(make(0.05), make(0.60)));   // below: no better
-    CHECK(!noBetterThanChance(make(0.65), make(0.60)));  // above background: tracking
-    CHECK(!noBetterThanChance(make(1.0), make(0.05)));   // clearly tracking
+    constexpr double kNoMargin = 0.0;
+    CHECK(noBetterThanChance(make(0.08), make(0.08), kNoMargin));   // equal: no better
+    CHECK(noBetterThanChance(make(0.05), make(0.60), kNoMargin));   // below: no better
+    CHECK(!noBetterThanChance(make(0.65), make(0.60), kNoMargin));  // above background: tracking
+    CHECK(!noBetterThanChance(make(1.0), make(0.05), kNoMargin));   // clearly tracking
+}
+
+TEST_CASE("noBetterThanChance: margin above background catches real bad patches")
+{
+    // Real-mesh validation (65 eye-labelled patches from 21 scrolls): bad
+    // (swirl-only) patches scored 25.9-34.8% against a ~20% background, so a
+    // flat at-or-below comparison misses most of them. A 0.1 margin flags the
+    // bulk of the bad range while good patches (44.8%+) stay clear.
+    using vc::surface::noBetterThanChance;
+    using vc::surface::OnPredictionSupport;
+    auto make = [](double fraction) {
+        OnPredictionSupport s;
+        s.fraction = fraction;
+        s.total = 1000;
+        return s;
+    };
+    const auto background = make(0.20);
+    CHECK(noBetterThanChance(make(0.259), background, 0.1));   // worst bad patch: flagged
+    CHECK(noBetterThanChance(make(0.30), background, 0.1));    // mid bad patch: flagged
+    CHECK(!noBetterThanChance(make(0.348), background, 0.1));  // best bad patch: just outside margin
+    CHECK(!noBetterThanChance(make(0.448), background, 0.1));  // worst good patch: clear
+    CHECK(!noBetterThanChance(make(0.627), background, 0.1));  // best good patch: clear
+    // Zero margin keeps the old flat behavior.
+    CHECK(!noBetterThanChance(make(0.30), background, 0.0));
 }
 
 TEST_CASE("onPredictionSupport: background rate matches prediction density")
@@ -157,13 +182,13 @@ TEST_CASE("noBetterThanChance: unmeasured background never warns")
     // An empty surface leaves the background at its default (total 0,
     // fraction 1.0); comparing two default 1.0 fractions must not warn.
     const OnPredictionSupport empty;
-    CHECK(!noBetterThanChance(empty, empty));
-    CHECK(!noBetterThanChance(empty, OnPredictionSupport{0.03, 60, 2000}));
+    CHECK(!noBetterThanChance(empty, empty, 0.1));
+    CHECK(!noBetterThanChance(empty, OnPredictionSupport{0.03, 60, 2000}, 0.1));
     // Sanity: a measured background still behaves as before.
     CHECK(noBetterThanChance(OnPredictionSupport{0.05, 50, 1000},
-                             OnPredictionSupport{0.06, 120, 2000}));
+                             OnPredictionSupport{0.06, 120, 2000}, 0.1));
     CHECK(!noBetterThanChance(OnPredictionSupport{0.7, 700, 1000},
-                              OnPredictionSupport{0.03, 60, 2000}));
+                              OnPredictionSupport{0.03, 60, 2000}, 0.1));
 }
 TEST_CASE("isValidVertex: rejects sentinels and non-finite coordinates")
 {

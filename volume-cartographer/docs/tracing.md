@@ -15,15 +15,27 @@ instead of following a sheet scores ~6-10% (indistinguishable from random
 points in the volume). Alongside the fraction, the tool reports the **background
 rate**: the same fraction measured on 2000 uniform random points in the
 surface's neighborhood (bounding box of valid vertices, dilated by 64 voxels,
-fixed seed). A surface at or below the background rate follows the prediction
-no better than chance and triggers its own warning; this catches
-dense-prediction cases where even a random surface would clear the absolute
-threshold. Sampling is confined to the neighborhood so its chunks are the ones
+fixed seed). A surface no more than `min_support_margin_above_background`
+above the background rate follows the prediction no better than chance and
+triggers its own warning; this catches dense-prediction cases where even a
+random surface would clear the absolute threshold. The margin is needed because real bad
+patches can score above the raw background rate: on 65 eye-labelled patches
+from 21 scrolls, bad (swirl-only) patches scored 25.9-34.8% against a ~20%
+background, while good (sheet-following) patches scored 44.8-62.7% -- a +11 to
++23 point margin above background separates them, but a flat at-or-below
+comparison flags only 3/21 bad patches. Sampling is confined to the
+neighborhood so its chunks are the ones
 the growth already loaded -- volume-wide scattered reads would cost up to
 ~2000 extra chunk fetches on remote (http/s3) volumes. Params:
 
-- `min_on_prediction_support` (default 0.5): warn when the fraction is below this.
+- `min_on_prediction_support` (default 0.4): warn when the fraction is below this.
   Must be within [0, 1]; anything else is rejected before tracing starts.
+  The 0.4 default separates the observed real sample above (good 44.8-62.7%,
+  bad 25.9-34.8%), but the good sample is small (n=5): treat it as a starting
+  point, not a proven separator.
+- `min_support_margin_above_background` (default 0.1): warn when the fraction
+  is within this margin of the background rate. Must be within [0, 1];
+  anything else is rejected before tracing starts.
 - `require_on_prediction_support` (default false): when true, a surface below
   the threshold (or no better than background) is discarded and the tool exits
   non-zero instead of just warning. With `--segment-name` the tool writes into

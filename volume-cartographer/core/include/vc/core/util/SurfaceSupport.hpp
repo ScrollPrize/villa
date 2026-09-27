@@ -61,19 +61,25 @@ inline bool validVertexBounds(const cv::Mat_<cv::Vec3f>& points, cv::Vec3f& lo, 
 }
 
 // True when the grown surface tracks the prediction no better than chance:
-// its on-prediction fraction is at or below the background rate measured on
-// uniform random points in the surface's neighborhood. Absolute thresholds
-// cannot catch this on dense predictions, where even a random surface scores
-// high.
+// its on-prediction fraction is no more than `margin` above the background
+// rate measured on uniform random points in the surface's neighborhood. Absolute
+// thresholds cannot catch this on dense predictions, where even a random
+// surface scores high. The margin is needed because real bad surfaces can sit
+// above the raw background rate: on 65 eye-labelled patches from 21 scrolls,
+// bad (swirl-only) patches scored 25.9-34.8% against a ~20% background, while
+// good (sheet-following) patches scored 44.8-62.7% -- a +11 to +23 point
+// margin above background separates them, but a flat at-or-below-background
+// comparison flags only 3/21 bad patches.
 //
 // A background with total == 0 was never measured (e.g. the surface had no
 // valid vertices, so there was no neighborhood to sample); without a measured
 // background there is nothing to compare against, so this returns false
 // rather than comparing two default 1.0 fractions.
 inline bool noBetterThanChance(const OnPredictionSupport& support,
-                               const OnPredictionSupport& background)
+                               const OnPredictionSupport& background,
+                               double margin)
 {
-    return background.total != 0 && support.fraction <= background.fraction;
+    return background.total != 0 && support.fraction <= background.fraction + margin;
 }
 
 // Outcome of the post-growth on-prediction acceptance decision. Accept means
@@ -219,10 +225,14 @@ inline float backgroundSampleHiBound(int dim_length, float neighborhood_hi)
 // handling (the helper calls it for every rounded valid vertex).
 //
 // fraction is 1.0 when there are no valid vertices: an empty surface has
-// nothing to judge. See #1675: grown surfaces that cut across windings instead
-// of following a sheet land at ~6-10% (indistinguishable from random points in
-// the volume), while true sheets land at ~100%, so a threshold around 0.5
-// separates them with wide margin on real data.
+// nothing to judge. See #1675: on synthetic data, grown surfaces that cut
+// across windings instead of following a sheet land at ~6-10%
+// (indistinguishable from random points in the volume), while true sheets
+// land at ~100%. On 65 eye-labelled real patches from 21 scrolls, bad
+// (swirl-only) patches scored 25.9-34.8% and good (sheet-following) patches
+// 44.8-62.7%, so the default 0.4 threshold separates the observed real sample
+// (good n=5 is small; treat the default as a starting point, not a proven
+// separator).
 template <typename Sampler>
 OnPredictionSupport onPredictionSupport(const cv::Mat_<cv::Vec3f>& points, Sampler&& sample)
 {
