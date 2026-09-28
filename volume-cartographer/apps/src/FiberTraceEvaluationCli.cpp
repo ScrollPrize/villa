@@ -955,8 +955,18 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 trialArcCache.emplace(cacheKey, std::move(arc));
             }
             const double distance = trial.at("distance").get<double>();
-            const double lo = trial.value("lo", 0.0);
-            const double hi = trial.value("hi", 0.0);
+            if (trial.value("coordinate_contract", "") != "original-fiber-arclength-v2")
+                throw std::invalid_argument("failure trial requires original-fiber-arclength-v2 coordinates");
+            const double lo = trial.at("original_fiber_arc_start_base").get<double>();
+            const double hi = trial.at("original_fiber_arc_end_base").get<double>();
+            for (const auto* key : {"expected_start_base_xyz", "expected_end_base_xyz"}) {
+                const auto& xyz = trial.at(key);
+                if (!xyz.is_array() || xyz.size() != 3)
+                    throw std::invalid_argument("failure trial requires expected endpoint XYZ");
+                for (const auto& v : xyz)
+                    if (!std::isfinite(v.get<double>()))
+                        throw std::invalid_argument("failure trial expected endpoint must be finite");
+            }
             if (!(hi > lo)) throw std::invalid_argument("trial requires lo < hi");
             Json provenance = trial;
             provenance["global_trial"] = true;
@@ -1258,6 +1268,15 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 if (item.trialFull) {
                     item.points = sliceFiberLine(*item.trialFull, *item.trialArc, item.trialLo, item.trialHi);
                     if (item.reverse) std::reverse(item.points.begin(), item.points.end());
+                    const auto& start = item.selection.at("expected_start_base_xyz");
+                    const auto& end = item.selection.at("expected_end_base_xyz");
+                    const cv::Vec3d expectedStart(start[0].get<double>(), start[1].get<double>(), start[2].get<double>());
+                    const cv::Vec3d expectedEnd(end[0].get<double>(), end[1].get<double>(), end[2].get<double>());
+                    constexpr double endpointToleranceBase = 0.25;
+                    if (cv::norm(item.points.front()-expectedStart) > endpointToleranceBase ||
+                        cv::norm(item.points.back()-expectedEnd) > endpointToleranceBase)
+                        throw std::invalid_argument("failure trial endpoint mismatch for candidate " +
+                            item.selection.at("candidate_id").get<std::string>());
                 }
                 const auto& source = sources[item.source];
                 FiberCaseCpuPermit permit(cpuPermits);

@@ -175,6 +175,31 @@ def test_anchor_only_coverage_does_not_construct_fiberlets(replay_fixture, fit):
     assert result["anchor_cases"] == warm["anchor_cases"]
 
 
+@pytest.mark.parametrize('direction', ['forward', 'reverse'])
+@pytest.mark.parametrize('broken', [False, True])
+def test_global_failure_trial_original_arcs_and_endpoint_guard(replay_fixture, direction, broken):
+    from vesuvius.neural_tracing.fiber_trace_3d.short_failure_benchmark import failure_trial_descriptor
+    root, config, run = replay_fixture
+    # Original annotation is x=8..24. Eligible segment starts four voxels in.
+    candidate = dict(id='nonzero-offset', piece_key=[str(root/'annotation.json')],
+        source_id='synthetic', target=8, run=dict(original_arcs_base=[4, 14]))
+    trial = failure_trial_descriptor(candidate, direction, 2,
+        np.array([[12., 16., 16.], [22., 16., 16.]]), np.array([0., 10.]))
+    if broken:
+        trial['original_fiber_arc_start_base'] -= 4
+        trial['original_fiber_arc_end_base'] -= 4
+    config.update(backend='beam', failure_search_trials_only=True, failure_search_trials=[trial])
+    (root/'evaluation.json').write_text(json.dumps(config))
+    result = run('replay-set', '--config', root/'evaluation.json', check=not broken)
+    if broken:
+        assert result.returncode != 0
+        assert 'endpoint mismatch' in result.stderr + result.stdout
+    else:
+        doc = json.loads((root/'evaluation/cases/0/trace.json').read_text())
+        np.testing.assert_allclose(doc['reference_points_base_xyz'][0], trial['expected_start_base_xyz'], atol=1e-6)
+        np.testing.assert_allclose(doc['reference_points_base_xyz'][-1], trial['expected_end_base_xyz'], atol=1e-6)
+
+
 def test_fiberlet_backend_canonical_cache_resume(replay_fixture):
     import hashlib
     root, config, run = replay_fixture
