@@ -54,7 +54,7 @@ def stratified_history(own, budget):
 class UnifiedFollower(nn.Module):
     architecture = UNIFIED_ARCHITECTURE
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, *, point_queries=False):
         super().__init__()
         self.cfg = cfg
         c, h = cfg.channels, cfg.hidden
@@ -69,7 +69,8 @@ class UnifiedFollower(nn.Module):
         self.write_gate = nn.Linear(2*h, h)
         self.write_proposal = nn.Linear(2*h, h)
         nn.init.constant_(self.write_gate.bias, -2.)
-        self.query = nn.Sequential(nn.Linear(27*(c+1)+3, h), nn.SiLU(), nn.Linear(h, h))
+        query_width = c+4 if point_queries else 27*(c+1)+3
+        self.query = nn.Sequential(nn.Linear(query_width, h), nn.SiLU(), nn.Linear(h, h))
         self.identity_value = nn.Linear(c, h, bias=False)
         self.identity_null = nn.Parameter(torch.zeros(h))
         # Shared by geometry, confidence, supplied candidates, and per-write probes.
@@ -83,8 +84,9 @@ class UnifiedFollower(nn.Module):
         for head in (self.coordinates, self.correction):
             nn.init.normal_(head.weight, std=.001)
             nn.init.zeros_(head.bias)
-        self.register_buffer('stencil', torch.tensor([[a*cfg.patch_radius,b*cfg.patch_radius,z]
-            for z in (-1.,0.,1.) for a in (-1.,0.,1.) for b in (-1.,0.,1.)]), persistent=False)
+        if not point_queries:
+            self.register_buffer('stencil', torch.tensor([[a*cfg.patch_radius,b*cfg.patch_radius,z]
+                for z in (-1.,0.,1.) for a in (-1.,0.,1.) for b in (-1.,0.,1.)]), persistent=False)
         self.register_buffer('planes', torch.arange(1, cfg.n_future+1).float()*cfg.future_step, persistent=False)
 
     def initial_memory(self, batch, device):
@@ -171,6 +173,11 @@ class UnifiedFollower(nn.Module):
         query = self.query(torch.cat((spatial,points/16),-1))
         query = query+self.identity_read(patches[:,:,13],refs,ref_valid,roles)
         return self.decoder(query,tokens,memory_key_padding_mask=~valid)
+
+    def candidate_features(self, dense, points):
+        b,k,_ = points.shape
+        values,support = sample_features(dense,(points[:,:,None]+self.stencil).reshape(b,k*27,3),self.cfg.fine)
+        return values.reshape(b,k,27,-1),support.reshape(b,k,27)
 
     def write(self, obs, active, position, frame, state, *, probe=True):
         # Sequence slices have different strides from the current observation.
@@ -356,9 +363,8 @@ class UnifiedFollower(nn.Module):
         roles = torch.cat((roles,self.role[3:4].expand(self.cfg.n_history,-1)),0)
 
         def evaluate(points):
-            b,k,_ = points.shape
-            values,support = sample_features(dense,(points[:,:,None]+self.stencil).reshape(b,k*27,3),self.cfg.fine)
-            return self.evaluate(points,values.reshape(b,k,27,-1),support.reshape(b,k,27),tokens,valid,refs,ref_valid,roles)
+            values,support = self.candidate_features(dense,points)
+            return self.evaluate(points,values,support,tokens,valid,refs,ref_valid,roles)
 
         points = hist.new_zeros(len(hist),self.cfg.n_future,3)
         points[...,2] = self.planes

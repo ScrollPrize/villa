@@ -2,17 +2,25 @@
 
 ## Spatial history retrieval (memory version 4)
 
-`axial_fiber_spatial_memory_v1` keeps the existing shared axial encoder and
+`axial_fiber_spatial_memory_v2` keeps the existing shared axial encoder and
 replaces the historical descriptor bottleneck with spatial memory. It is a
 separate checkpoint architecture; existing crop, patch-memory and unified
 checkpoints still load through their original models.
 
 Each observation retains its complete axial token grid (39,015 × 128 at the
-production crop), its pose and age, and the 27 fine head descriptors. Those
-fine samples remain useful for identity supervision, but are no longer the
-only evidence available from past crops. This implementation still computes
-the dense decoder to obtain those fine samples; it does not claim an encoding
-speedup or equivalence to a cheaper observation encoder.
+production crop), its pose and age, and one fine descriptor at the observed
+head. The descriptor preserves the supervised identity space and fine detail
+from the encoder's full-resolution skip connection; the grid supplies spatial
+context. Candidate queries likewise use one fine descriptor, one support flag,
+and the point's coordinates. Geometry, corrections, confidence and historical
+probes use this same point-based evaluator, with no 27-point stencil. Supported
+points may reach the crop edges; the legacy `patch_radius` margin does not apply
+to spatial memory, including its training evidence sampling.
+
+The dense decoder still computes the fine descriptors; this change does not
+claim an encoding speedup. Spatial v1 checkpoints cannot resume as v2 because
+the query weights and observation layout changed. Start a fresh spatial run;
+crop, patch-memory and unified checkpoint architectures remain unchanged.
 
 The seed grid is immutable and always readable, with the seed origin/direction
 defined by its observation frame. Current image tokens, visible observed-path
@@ -80,7 +88,7 @@ bash scripts/launch_spatial_memory.sh
 Its default destination is `output/axial_spatial_memory_run1`; it does not resume
 or alter the existing unified experiment. To initialize just the shared encoder
 and compatible identity projection, append `--init-encoder output/OLD/last.pt`.
-Only identity-independent unified/spatial encoders with matching geometry and
+Only identity-independent unified/spatial-v2 encoders with matching geometry and
 encoder dimensions are accepted. Memory, path decoder and optimizer start fresh.
 `--resume` is for checkpoints of the new architecture, with matching options.
 
@@ -95,7 +103,7 @@ PYTHONPATH=../../.. python -m vesuvius.neural_tracing.fiber_follow.regression.id
   --trajectory-window 4 --memory-switch-probability .15 --activation-checkpointing
 ```
 
-Tests cover spatial evidence outside the head stencil, immutable seeds, archive
+Tests cover point descriptors and crop-edge support, remote spatial evidence, immutable seeds, archive
 eviction, streaming/unroll parity, relative poses, candidate isolation,
 padding/empty memories, gradients through retrieval, checkpoint loading,
 window supervision/holdout/crop reuse, and re-encoding after parameter updates:

@@ -413,7 +413,7 @@ class IdentityObservationBuilder(ObservationBuilder):
                 additional_banks=([self.near_negative_bank] if self.near_negative_bank is not None and self.near_negative_bank is not bank else ()))
             pos, pos_mask, neg, neg_mask, metadata = sample_pairs(
                 item['identity_curve'], presence[j], crop, found['local'], found['nearest'], rng,
-                positives=K, negatives=M, margin=cfg.patch_radius,
+                positives=K, negatives=M, margin=cfg.evidence_margin,
                 rule=s.rule,
                 appearance_crop=cfg.fine,
                 along_margin=cfg.fine.spacing,

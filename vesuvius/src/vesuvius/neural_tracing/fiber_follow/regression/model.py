@@ -19,7 +19,7 @@ ARCHITECTURE = 'axial_fiber_v3'
 MEMORY_ARCHITECTURE = 'axial_fiber_memory_v2'
 MEMORY_ARCHITECTURE_V1 = 'axial_fiber_memory_v1'  # no probe; loadable, not trained further
 UNIFIED_ARCHITECTURE = 'axial_fiber_unified_v1'
-SPATIAL_MEMORY_ARCHITECTURE = 'axial_fiber_spatial_memory_v1'
+SPATIAL_MEMORY_ARCHITECTURE = 'axial_fiber_spatial_memory_v2'
 TOKEN_STRIDE = (8, 2, 2)  # z, y, x in input samples
 TOKEN_OFFSET = (3, 0, 0)  # centre of four stride-two stem positions
 IDENTITY_EVIDENCE_WIDTH = 8  # point/mean/min/coverage for seed and history separately
@@ -55,7 +55,7 @@ class DirectConfig:
     # gradient-window history, up to this budget per state. Scale by stratum
     # size for an unbiased encoder gradient. Writes keep gradients. 0: all.
     memory_encoder_grad_steps: int = 4
-    memory_version: int = 2  # 1: no probe; 2: legacy patch memory; 3: unified full-crop model
+    memory_version: int = 2  # 1: no probe; 2: patch memory; 3: unified; 4: spatial memory
     spatial_recent: int = 2  # always-readable observations, excluding the current crop
     spatial_archive: int = 8  # additional full observations, oldest evicted first
     spatial_retrieve: int = 2  # older observations read per candidate curve
@@ -74,7 +74,7 @@ class DirectConfig:
             raise ValueError('Positive dimensions required; hidden must divide by heads')
         if not 0 < self.future_step <= self.max_recovery_distance or not math.isfinite(self.max_recovery_distance):
             raise ValueError('Invalid forward spacing or connection limit')
-        if not 0 < self.patch_radius < (c.width-1)*c.spacing/2:
+        if self.memory_version != 4 and not 0 < self.patch_radius < (c.width-1)*c.spacing/2:
             raise ValueError('Local observation patch must fit fine crop')
         if not math.isfinite(self.correction_limit) or self.correction_limit <= 0:
             raise ValueError('Invalid correction limit')
@@ -113,8 +113,13 @@ class DirectConfig:
         return self.n_history
 
     @property
+    def evidence_margin(self):
+        # Spatial memory samples only the queried point, including crop edges.
+        return 0. if self.memory_version == 4 else self.patch_radius
+
+    @property
     def lateral_limit(self):
-        return (self.fine.width-1)*self.fine.spacing/2-self.patch_radius
+        return (self.fine.width-1)*self.fine.spacing/2-self.evidence_margin
 
     @property
     def token_shape(self):

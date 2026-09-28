@@ -7,7 +7,7 @@ import torch
 import numpy as np
 
 from test_unified import scene, state
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower, SPATIAL_MEMORY_ARCHITECTURE
+from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower, SPATIAL_MEMORY_ARCHITECTURE, sample_features
 from vesuvius.neural_tracing.fiber_follow.regression.train import checkpoint_config, initialize_encoder, compile_training_model
 
 
@@ -24,19 +24,53 @@ def test_full_grid_is_retained_and_remote_spatial_evidence_affects_predictions()
     with torch.no_grad():
         out = model(data['x'],data['hist'],data['hmask'])
         memory = state(out,model)
-        assert memory['bank'].shape[2] == model.spatial_count+27
+        assert memory['bank'].shape[2] == model.spatial_count+1
         context,valid,refs,ref_valid,roles = model.retained(memory,memory['position'],memory['frame'])
         obs = model.observation(data['x']['fine'])
         context.update(current=model.spatial_tokens(obs),current_valid=torch.ones(obs.shape[:2],dtype=torch.bool))
         points = torch.zeros(1,cfg.n_future,3)
-        patches = model.head_patches(obs)[:,None].expand(-1,cfg.n_future,-1,-1)
-        support = torch.ones(1,cfg.n_future,27,dtype=torch.bool)
-        baseline = model.evaluate(points,patches,support,context,valid,refs,ref_valid,roles)
-        # Change only spatial evidence away from the fixed 27 head descriptors.
+        features = model.head_descriptor(obs).expand(-1,cfg.n_future,-1)
+        support = torch.ones(1,cfg.n_future,dtype=torch.bool)
+        baseline = model.evaluate(points,features,support,context,valid,refs,ref_valid,roles)
+        # Change only spatial evidence, preserving the fine head descriptor.
         changed = copy.deepcopy(context)
         changed['state']['anchor'][:,:model.spatial_count] += torch.randn_like(memory['anchor'][:,:model.spatial_count])*3
-        result = model.evaluate(points,patches,support,changed,valid,refs,ref_valid,roles)
+        result = model.evaluate(points,features,support,changed,valid,refs,ref_valid,roles)
         assert not torch.allclose(baseline,result)
+
+
+def test_point_queries_keep_fine_identity_and_support_without_a_stencil():
+    cfg,data = spatial_scene()
+    model = DirectFollower(cfg).eval()
+    assert not hasattr(model,'stencil')
+    assert model.query[0].in_features == cfg.channels+4
+    with torch.no_grad():
+        dense,_,grid = model.encode(data['x']['fine'])
+        obs = model.observation_features(dense,grid)
+        torch.testing.assert_close(obs[:,:model.spatial_count],grid)
+        # Includes a fractional location, crop edge, and unsupported location.
+        edge = (cfg.fine.width-1)*cfg.fine.spacing/2
+        points = torch.tensor([[[0.,0.,0.],[.25,-.25,1.],[edge,0.,0.],[edge+1,0.,0.]]])
+        features,support = model.candidate_features(dense,points)
+        expected,expected_support = sample_features(dense,points,cfg.fine)
+        assert features.shape == (1,4,cfg.channels)
+        assert support.tolist() == [[True,True,True,False]]
+        torch.testing.assert_close(features,expected)
+        torch.testing.assert_close(support,expected_support)
+        torch.testing.assert_close(model.head_descriptor(obs),features[:,:1])
+        # Fine evidence remains available even when the spatial grid is fixed.
+        fine_change = model.observation_features(dense+1,grid)
+        torch.testing.assert_close(fine_change[:,:model.spatial_count],grid)
+        torch.testing.assert_close(model.head_descriptor(fine_change),features[:,:1]+1)
+        memory = model.initial_memory(1,'cpu')
+        memory['anchor'] = obs
+        memory['anchor_valid'].fill_(True)
+        memory,_ = model.write(obs,torch.ones(1,dtype=torch.bool),memory['position'],memory['frame'],memory,probe=False)
+        _,_,refs,valid,_ = model.retained(memory,memory['position'],memory['frame'])
+        torch.testing.assert_close(refs[:,:2],features[:,:1].expand(-1,2,-1))
+        assert valid[:,:2].all()
+    assert cfg.lateral_limit == edge
+    assert replace(cfg,patch_radius=0.).lateral_limit == edge
 
 
 def test_streaming_matches_unroll_through_archive_eviction_and_seed_stays_fixed():
@@ -72,7 +106,8 @@ def test_training_reaches_spatial_encoder_seed_and_archive_router(checkpointing)
     data['x']['history_crops'].requires_grad_()
     out = model(data['x'],data['hist'],data['hmask'])
     (out['points'].square().sum()+out['confidence_logits'].square().sum()+out['memory_probe'].square().sum()).backward()
-    for param in (model.encoder.compress.weight,model.retrieval_key.weight,model.retrieval_query.weight,
+    for param in (model.encoder.compress.weight,model.encoder.dense_decoder[-1].weight,model.embedding.weight,
+                  model.query[0].weight,model.retrieval_key.weight,model.retrieval_query.weight,
                   model.summary_query,model.archive_attention.in_proj_weight,model.write_gate.weight):
         assert param.grad is not None and torch.isfinite(param.grad).all() and param.grad.abs().sum() > 0
     assert data['x']['seed_crop'].grad.abs().sum() > 0
@@ -111,6 +146,7 @@ def test_candidates_read_independently_without_writing_memory():
 def test_checkpoint_version_and_explicit_encoder_transfer(tmp_path):
     cfg,data = spatial_scene()
     model = DirectFollower(cfg)
+    assert model.architecture == SPATIAL_MEMORY_ARCHITECTURE == 'axial_fiber_spatial_memory_v2'
     source = DirectFollower(replace(cfg,memory_version=3))
     before = model.retrieval_key.weight.detach().clone()
     initialize_encoder(model,source)
@@ -128,6 +164,9 @@ def test_checkpoint_version_and_explicit_encoder_transfer(tmp_path):
         torch.testing.assert_close(model(data['x'],data['hist'],data['hmask'])['points'],
                                    other(data['x'],data['hist'],data['hmask'])['points'])
     restored['architecture'] = source.architecture
+    with pytest.raises(ValueError,match='disagree'):
+        checkpoint_config(restored)
+    restored['architecture'] = 'axial_fiber_spatial_memory_v1'
     with pytest.raises(ValueError,match='disagree'):
         checkpoint_config(restored)
 

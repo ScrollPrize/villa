@@ -20,7 +20,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
     recent observations. Only certified bank relationships are used.
     """
     choice = bool(rng.integers(2))
-    tails = [v for v in (4.,8.,12.) if v+8+model.patch_radius < model.fine.behind*model.fine.spacing]
+    tails = [v for v in (4.,8.,12.) if v+8+model.evidence_margin < model.fine.behind*model.fine.spacing]
     if not tails:
         return None
     tail = float(rng.choice(tails))
@@ -70,7 +70,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
         targets = [continuation_targets(parent, ta, reverse, pos, frame, sample),
                    continuation_targets(neighbor, head, False, pos, frame, sample)]
         curves = np.stack([np.c_[t['plane_ab'], sample.future_s] for t in targets]).astype(np.float32)
-        # Candidate evidence must have an observable local stencil. Unknown
+        # Candidate evidence must fit within the appearance crop. Unknown
         # prefixes and invalid connections are never positive training labels.
         supported = np.stack([t['plane_mask'] for t in targets]).astype(bool)
         supported &= np.abs(curves[..., :2]).max(-1) <= model.lateral_limit
@@ -93,7 +93,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
         tangents = [tangent_at(parent.points, parent.s, reference_a)*(-1 if reverse else 1),
                     tangent_at(line, s, reference_b)]
         from vesuvius.neural_tracing.fiber_follow.regression.data import visible_points
-        if not visible_points((np.asarray(refs)-pos) @ frame,model.fine,model.patch_radius).all():
+        if not visible_points((np.asarray(refs)-pos) @ frame,model.fine,model.evidence_margin).all():
             continue
         rows = []
         for target in range(2):

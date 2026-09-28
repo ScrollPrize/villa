@@ -12,7 +12,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from .model import SPATIAL_MEMORY_ARCHITECTURE
+from .model import SPATIAL_MEMORY_ARCHITECTURE, sample_features
 from .unified import UnifiedFollower
 
 
@@ -23,7 +23,7 @@ class SpatialMemoryFollower(UnifiedFollower):
                    'age','position','frame','seen')
 
     def __init__(self, cfg):
-        super().__init__(cfg)
+        super().__init__(cfg, point_queries=True)
         h = cfg.hidden
         self.spatial_count = math.prod(cfg.token_shape)
         # Slot zero is the current head. It is excluded when decoding that head.
@@ -37,19 +37,22 @@ class SpatialMemoryFollower(UnifiedFollower):
         self.retrieval_norm = nn.LayerNorm(h)
 
     def observation_features(self, dense, tokens):
-        # Fine head samples supplement the full spatial grid and retain the
-        # existing supervised identity space. They are not the history bottleneck.
-        fine = super().observation_features(dense, tokens)
+        # One contextual fine descriptor identifies the observed head; the grid
+        # supplies its surroundings. Keep the supervised identity feature space.
+        fine,_ = sample_features(dense, dense.new_zeros(len(dense),1,3), self.cfg.fine)
         return torch.cat((tokens, F.pad(fine, (0,self.cfg.hidden-self.cfg.channels))),1)
 
-    def head_patches(self, observation):
+    def head_descriptor(self, observation):
         return observation[...,self.spatial_count:,:self.cfg.channels]
 
     def seed_descriptor(self, state):
-        return self.head_patches(state['anchor'])[:,13:14]
+        return self.head_descriptor(state['anchor'])
+
+    def candidate_features(self, dense, points):
+        return sample_features(dense, points, self.cfg.fine)
 
     def initial_memory(self, batch, device):
-        h, n, cap = self.cfg.hidden, self.spatial_count+27, self.capacity
+        h, n, cap = self.cfg.hidden, self.spatial_count+1, self.capacity
         # Use parameter precision for storage, regardless of whether the state
         # is created inside (training) or outside (tracing) an autocast context.
         # Otherwise the same observation is rounded differently in the two paths.
@@ -65,14 +68,14 @@ class SpatialMemoryFollower(UnifiedFollower):
             seen=zeros().bool())
 
     def spatial_tokens(self, observation):
-        fine = self.observation_projection(self.head_patches(observation))
+        fine = self.observation_projection(self.head_descriptor(observation))
         return torch.cat((observation[...,:self.spatial_count,:],fine),-2)
 
     def located(self, observation, positions, frames, position, frame, age, role):
         """Place full observation grids in the current query's coordinate frame."""
         # [B,O,N,H], with explicit observation origin, orientation and age.
         features = self.spatial_tokens(observation)
-        xyz = torch.cat((self.encoder.token_xyz,self.stencil),0)
+        xyz = torch.cat((self.encoder.token_xyz,self.encoder.token_xyz.new_zeros(1,3)),0)
         world_offset = torch.einsum('ni,boji->bonj',xyz,frames)
         local_offset = torch.einsum('boni,bij->bonj',world_offset,frame)/16
         pose = self.pose(positions,frames,position,frame,age)
@@ -80,7 +83,7 @@ class SpatialMemoryFollower(UnifiedFollower):
 
     def retained(self, state, position, frame):
         # Only explicit head descriptors participate in pointwise InfoNCE space.
-        refs = torch.cat((self.seed_descriptor(state),self.head_patches(state['bank'])[:,:,13]),1)
+        refs = torch.cat((self.seed_descriptor(state),self.head_descriptor(state['bank']).squeeze(-2)),1)
         valid = torch.cat((state['anchor_valid'][:,None],state['bank_valid']),1)
         roles = torch.cat((self.role[0:1],self.role[1:2].expand(self.capacity,-1)),0)
         return dict(state=state,position=position,frame=frame,start=1),None,refs,valid,roles
@@ -113,7 +116,7 @@ class SpatialMemoryFollower(UnifiedFollower):
                                         need_weights=False)[0]
         pair = torch.cat((state['slots'],evidence),-1)
         slots = state['slots']+self.write_gate(pair).sigmoid()*(self.write_proposal(pair).tanh()-state['slots'])
-        head = self.observation_projection(self.head_patches(obs)[:,13:14])
+        head = self.observation_projection(self.head_descriptor(obs))
         summary = self.summary_attention(self.summary_query[None]+head,observed,observed,need_weights=False)[0][:,0]
 
         result = obs.new_zeros(len(obs),4)
@@ -122,8 +125,8 @@ class SpatialMemoryFollower(UnifiedFollower):
             # descriptor. This uses exactly the path evaluator used at inference.
             context,_,refs,valid,roles = self.retained(state,position,frame)
             context.update(start=0,current=observed,current_valid=torch.ones(observed.shape[:2],device=obs.device,dtype=torch.bool))
-            decoded = self.evaluate(obs.new_zeros(len(obs),1,3),self.head_patches(obs)[:,None],
-                torch.ones(len(obs),1,27,device=obs.device,dtype=torch.bool),context,None,refs,valid,roles)
+            decoded = self.evaluate(obs.new_zeros(len(obs),1,3),self.head_descriptor(obs),
+                torch.ones(len(obs),1,device=obs.device,dtype=torch.bool),context,None,refs,valid,roles)
             result = self.probe_head(decoded[:,0]).float()
         updated = dict(state)
         updated['slots'] = torch.where(active[:,None,None],slots,state['slots'])
@@ -148,7 +151,7 @@ class SpatialMemoryFollower(UnifiedFollower):
         slots = state['slots']+self.role[2]+self.pose(state['position'][:,None],state['frame'][:,None],
             position,frame,position.new_zeros(b,1))
         tokens = torch.cat((context['current'],seed,nearby,slots),1)
-        n = self.spatial_count+27
+        n = self.spatial_count+1
         valid = torch.cat((context['current_valid'],state['anchor_valid'][:,None].expand(-1,n),
             state['bank_valid'][:,recent,None].expand(-1,-1,n).flatten(1),
             state['seen'][:,None].expand(-1,self.cfg.memory_slots)),1)
@@ -178,10 +181,9 @@ class SpatialMemoryFollower(UnifiedFollower):
             reads = reads+read*weight.to(read.dtype)
         return self.decoder(query+reads,tokens,memory_key_padding_mask=~valid)
 
-    def evaluate(self, points, patches, support, tokens, valid, refs, ref_valid, roles):
-        spatial = torch.cat((patches,support[...,None]),-1).flatten(-2)
-        query = self.query(torch.cat((spatial,points/16),-1))
-        query = query+self.identity_read(patches[:,:,13],refs,ref_valid,roles)
+    def evaluate(self, points, features, support, tokens, valid, refs, ref_valid, roles):
+        query = self.query(torch.cat((features,support[...,None],points/16),-1))
+        query = query+self.identity_read(features,refs,ref_valid,roles)
         if self.training and self.cfg.activation_checkpointing and torch.is_grad_enabled():
             return checkpoint(self._decode_spatial,query,tokens,use_reentrant=False)
         return self._decode_spatial(query,tokens)
