@@ -2489,12 +2489,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _workspaceTabs = new QTabWidget(this);
     _workspaceTabs->setObjectName(QStringLiteral("workspaceTabs"));
-    _volumeNameLabel = new QLabel(_workspaceTabs);
-    _volumeNameLabel->setObjectName(QStringLiteral("currentVolumeName"));
-    _volumeNameLabel->setTextFormat(Qt::PlainText);
-    _volumeNameLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    _volumeNameLabel->setContentsMargins(8, 0, 8, 0);
-    _workspaceTabs->setCornerWidget(_volumeNameLabel, Qt::TopRightCorner);
+    _projectNameLabel = new QLabel(_workspaceTabs);
+    _projectNameLabel->setObjectName(QStringLiteral("currentProjectName"));
+    _projectNameLabel->setTextFormat(Qt::PlainText);
+    _projectNameLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    _projectNameLabel->setContentsMargins(8, 0, 8, 0);
+    _workspaceTabs->setCornerWidget(_projectNameLabel, Qt::TopRightCorner);
     _workspaceTabs->setTabsClosable(true);
     _workspaceTabs->addTab(_segmentWorkspaceWindow, tr("main"));
     _workspaceTabs->addTab(_lasagnaWorkspaceWindow, tr("Lasagna"));
@@ -2540,7 +2540,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(_workspaceTabs, &QTabWidget::currentChanged, this, [this]() {
         scheduleWindowStateSave();
         updateActiveWorkspaceViewerControls();
-        QTimer::singleShot(0, this, &CWindow::updateVolumeNameLabel);
+        QTimer::singleShot(0, this, &CWindow::updateProjectNameLabel);
     });
     connect(_workspaceTabs, &QTabWidget::tabCloseRequested, this, [this](int index) {
         if (!_workspaceTabs) {
@@ -2569,8 +2569,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     vc::render::processChunkCacheService()->configureDecodedByteCapacity(
         _cacheSizeBytes);
     _state = new CState(this, _benchOptions.debugDownloadQueue);
-    connect(_state, &CState::volumeChanged, this, &CWindow::updateVolumeNameLabel);
-    updateVolumeNameLabel();
+    connect(_state, &CState::vpkgChanged, this, &CWindow::updateProjectNameLabel);
+    updateProjectNameLabel();
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
     connect(_state, &CState::vpkgChanged, this,
@@ -4126,28 +4126,24 @@ void CWindow::updateActiveWorkspaceViewerControls()
     // Only navigation and other workspace-local controls follow the active tab.
 }
 
-void CWindow::updateVolumeNameLabel()
+void CWindow::updateProjectNameLabel()
 {
-    if (!_volumeNameLabel || !_workspaceTabs) return;
-    const auto volume = _state ? _state->currentVolume() : nullptr;
-    if (!volume) {
-        _volumeNameLabel->clear();
-        _volumeNameLabel->setToolTip({});
-        _volumeNameLabel->setFixedWidth(0);
+    if (!_projectNameLabel || !_workspaceTabs) return;
+    const auto project = _state ? _state->vpkg() : nullptr;
+    if (!project) {
+        _projectNameLabel->clear();
+        _projectNameLabel->setToolTip({});
+        _projectNameLabel->setFixedWidth(0);
         return;
     }
-    const QString location = getCurrentVolumePath();
-    QString path = volume->isRemote() ? QUrl(location).path() : location;
-    while (path.endsWith('/')) path.chop(1);
-    QString name = QFileInfo(path).fileName();
-    if (name.isEmpty()) name = QString::fromStdString(volume->name());
-    _volumeNameLabel->setToolTip(name);
+    const QString name = QString::fromStdString(project->name());
+    _projectNameLabel->setToolTip(QString::fromStdString(project->path().string()));
     const int available = std::max(0, _workspaceTabs->width() -
         _workspaceTabs->tabBar()->sizeHint().width() - 8);
-    const auto metrics = _volumeNameLabel->fontMetrics();
-    _volumeNameLabel->setFixedWidth(std::min(available, metrics.horizontalAdvance(name) + 16));
-    _volumeNameLabel->setText(metrics.elidedText(
-        name, Qt::ElideMiddle, std::max(0, _volumeNameLabel->width() - 16)));
+    const auto metrics = _projectNameLabel->fontMetrics();
+    _projectNameLabel->setFixedWidth(std::min(available, metrics.horizontalAdvance(name) + 16));
+    _projectNameLabel->setText(metrics.elidedText(
+        name, Qt::ElideMiddle, std::max(0, _projectNameLabel->width() - 16)));
 }
 
 void CWindow::resetSegmentationViews(bool persistLayout)
@@ -8645,7 +8641,7 @@ void CWindow::keyReleaseEvent(QKeyEvent* event)
 void CWindow::resizeEvent(QResizeEvent* event)
 {
     QMainWindow::resizeEvent(event);
-    QTimer::singleShot(0, this, &CWindow::updateVolumeNameLabel);
+    QTimer::singleShot(0, this, &CWindow::updateProjectNameLabel);
     scheduleWindowStateSave();
 }
 
