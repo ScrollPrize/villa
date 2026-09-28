@@ -589,11 +589,7 @@ private:
 
 std::filesystem::path openDataCatalogManifestCachePath()
 {
-    QString base = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
-    if (base.isEmpty()) {
-        base = QDir::home().filePath(QStringLiteral(".VC3D"));
-    }
-    return std::filesystem::path(base.toStdString()) / "open-data-catalog" / "metadata.json";
+    return vc3d::opendata::cachedOpenDataManifestPath();
 }
 
 QString formatAtlasCoveredSize(const vc::atlas::AtlasCoveredSize& size)

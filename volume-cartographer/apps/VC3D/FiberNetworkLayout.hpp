@@ -6,7 +6,9 @@
 #include <opencv2/core/matx.hpp>
 
 #include <cstdint>
+#include <algorithm>
 #include <map>
+#include <tuple>
 #include <string>
 #include <utility>
 #include <vector>
@@ -356,6 +358,46 @@ struct UnplacedFiber {
     char hvTag = '?';
 };
 
+// How a layout's winding sense was settled. The sense is a property of the
+// scroll, not of the annotation, and a handful of fibers' geometry is a poor
+// witness to it (a fiber drifting in z over a turn compares radii at
+// different heights, and one one-turn fiber can tip a close vote), so unless
+// the caller states it both senses are solved and the map that contradicts
+// itself less is kept.
+enum class ChiralityBasis {
+    // The caller set SolverParams::chiralityOverride.
+    Override,
+    // Both senses were solved on the geometry alone (links left out); this
+    // one had fewer crossing contradictions by the margin of
+    // chiralityComparisonDecisive.
+    Comparison,
+    // Both senses were solved on the geometry alone and their crossing
+    // contradictions were within that margin (or nothing was solvable);
+    // the data's vote decided.
+    Vote,
+};
+
+// Whether `fewer` crossing contradictions against `more` in the other sense
+// is a mirrored map rather than noise. The counts are independent ones -
+// dropped crossings and group conflicts, from a solve with the links left
+// out - not the rings drawn for them (one group conflict rings at every
+// member) and not links.
+//
+// A wrong sense contradicts every ordering between different turns (a V
+// fiber that crosses an H fiber's first turn on one side and its second on
+// the other), so it shows as a multiple of the true sense's count, not as
+// a handful more; the true sense contradicts only where the sheet is not a
+// spiral (folds, seams). Links stay out of the decision: a link to the wrong
+// turn of an H fiber is a contradiction in the true sense and none in the
+// mirror, so a few of them, or several on one fiber, would decide for the
+// mirror. So the other sense must show more than twice the crossing
+// contradictions, and at least three more. A map with no ordering between
+// turns at all cannot be decided this way, and is not.
+[[nodiscard]] inline bool chiralityComparisonDecisive(int fewer, int more)
+{
+    return more > 2 * fewer && more - fewer >= 3;
+}
+
 struct GlobalResult {
     // Ordered by (label, fileName, id), every placeable fiber of the input;
     // fileName before the runtime id so the order survives id reassignment
@@ -374,7 +416,20 @@ struct GlobalResult {
     double x1Vx = 0.0;
     double yMinVx = 0.0;
     double yMaxVx = 0.0;
+    // The winding sense the map is laid out in (+1: the winding grows with
+    // theta = atan2(dy, dx) about the umbilicus, -1: against it) and how it
+    // was settled. chiralityVote and chiralityNetVotes are what the data's
+    // own vote (winding::tallyChirality) said whichever way the map went;
+    // comparedChiralityErrors and rejectedChiralityErrors are the crossing
+    // contradictions (dropped crossings + group conflicts, links left out:
+    // the figures chiralityComparisonDecisive compared) of this sense and
+    // of the other, -1 when the senses were never compared.
     int chirality = 1;
+    ChiralityBasis chiralityBasis = ChiralityBasis::Vote;
+    int chiralityVote = 1;
+    int chiralityNetVotes = 0;
+    int comparedChiralityErrors = -1;
+    int rejectedChiralityErrors = -1;
     int islandCount = 0;
     int unresolvedCount = 0;
     int tieCount = 0;
@@ -454,7 +509,8 @@ struct ContentDigest {
 // each cached artifact consumes - never on anyone's generation counters:
 //
 //   prep slot  (per fileName):  H(fiber geometry fields, umbilicus)
-//   pair slot  (per H,V pair):  H(prepKey_H, prepKey_V, chirality,
+//   pair slot  (per H,V pair and winding sense):
+//                               H(prepKey_H, prepKey_V, chirality,
 //                                 detection params)
 //
 // Fiber identity across builds is the stored fileName; runtime ids are
@@ -473,6 +529,16 @@ struct ContentDigest {
 // necessarily differ; digestGlobalResult() defines the semantic field set.
 class GlobalLayoutCache;
 
+// With params.solver.chiralityOverride == 0 the winding sense is decided on
+// the geometry alone: both senses are solved with the links left out, the
+// one with decisively fewer crossing contradictions is taken
+// (chiralityComparisonDecisive), the data's vote deciding otherwise, and
+// the map is then built in that sense with the links
+// (GlobalResult::chiralityBasis). That is three solves, and two detections
+// with a cache (the third build finds its sense's shards there; without
+// one, three); a caller that knows the scroll's sense (the open-data
+// catalog states it, see OpenDataVolumeOrientation.hpp) sets the override
+// and pays for one of each.
 [[nodiscard]] GlobalResult buildGlobalLayout(
     const std::vector<InputFiber>& fibers,
     const std::vector<cv::Vec3f>& umbilicusCenters,
@@ -483,6 +549,12 @@ class GlobalLayoutCache {
 public:
     void clear();
 
+    // When a build decides the winding sense itself, the fiber counts are
+    // the first sense's run's (the later runs find every preparation
+    // already there) and the pair counts the kept sense's deciding run's:
+    // pair shards are keyed by sense and are link-free, so each sense's
+    // counts stand alone, and the run that detected for the kept map is
+    // reported (the final, linked solve of that sense reuses them all).
     struct Stats {
         bool used = false;
         int fibersReused = 0;
@@ -491,8 +563,9 @@ public:
         int pairsRecomputed = 0;
     };
     [[nodiscard]] const Stats& lastStats() const { return _stats; }
-    // The cached detection shards in (H file, V file) order, for tests of the
-    // contract that a cached shard is the fresh one bit for bit.
+    // The cached detection shards in (H file, V file, winding sense) order,
+    // for tests of the contract that a cached shard is the fresh one bit for
+    // bit.
     [[nodiscard]] std::vector<const winding::PairDetections*> cachedDetections() const;
 
 private:
@@ -511,7 +584,10 @@ private:
         winding::PairDetections detection;
     };
     std::map<std::string, PrepSlot> _prep;
-    std::map<std::pair<std::string, std::string>, PairSlot> _pairs;
+    // One slot per (H file, V file, winding sense): the two senses of one
+    // pair are different detections, and a build that solves both must
+    // leave both behind or every later build recomputes one of them.
+    std::map<std::tuple<std::string, std::string, int>, PairSlot> _pairs;
     Stats _stats;
 };
 
