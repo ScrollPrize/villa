@@ -30,12 +30,18 @@ def main(argv=None):
     ap.add_argument('--forward',action='store_true')
     ap.add_argument('--compile',action='store_true')
     ap.add_argument('--memory-slots',type=int,default=0)
-    ap.add_argument('--memory-version',type=int,choices=(2,3),default=3)
+    ap.add_argument('--memory-version',type=int,choices=(2,3,4),default=3)
+    ap.add_argument('--spatial-recent',type=int,default=DirectConfig.spatial_recent)
+    ap.add_argument('--spatial-archive',type=int,default=DirectConfig.spatial_archive)
+    ap.add_argument('--spatial-retrieve',type=int,default=DirectConfig.spatial_retrieve)
+    ap.add_argument('--trajectory-window',type=int,default=DirectConfig.trajectory_window)
     ap.add_argument('--activation-checkpointing',action='store_true')
     ap.add_argument('--memory-steps',type=int,default=32)
     ap.add_argument('--memory-stride',type=int,default=4)
     ap.add_argument('--memory-patch-size',type=int,default=17)
     ap.add_argument('--memory-grad-steps',type=int,default=32)
+    ap.add_argument('--memory-encoder-grad-steps',type=int,default=DirectConfig.memory_encoder_grad_steps,
+                    help='Unified model: stratified history encoder gradient budget per state; 0 keeps all')
     ap.add_argument('--memory-switch-probability',type=float,default=0.)
     ap.add_argument('--memory-switch-tail',type=float,nargs=2,default=(16.,96.))
     ap.add_argument('--onpolicy',nargs='*',default=[],help='Replay caches, e.g. collected with observed tracks')
@@ -44,6 +50,10 @@ def main(argv=None):
     cfg=DirectConfig(memory_slots=args.memory_slots,memory_steps=args.memory_steps,
                      memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size,
                      memory_grad_steps=args.memory_grad_steps,memory_version=args.memory_version,
+                     memory_encoder_grad_steps=args.memory_encoder_grad_steps,
+                     spatial_recent=args.spatial_recent,spatial_archive=args.spatial_archive,
+                     spatial_retrieve=args.spatial_retrieve,
+                     trajectory_window=args.trajectory_window,
                      activation_checkpointing=args.activation_checkpointing)
     spec=FiberVolumeSpec(args.fiber_zarrs,ct_zarr=args.ct,ct_level=0,ct_grid_scale=4.,inputs='ct+presence')
     band=ZBand(45000/spec.grid_scale,48500/spec.grid_scale)
@@ -67,7 +77,7 @@ def main(argv=None):
         assert {'fine','seed','seed_mask','seed_age','seed_tangent'} <= set(cpu['x'])
         if cfg.memory_slots:
             assert cpu['x']['memory_mask'][:,-1].all()
-            assert torch.isfinite(cpu['x']['history_crops' if cfg.memory_version == 3 else 'memory_patches']).all()
+            assert torch.isfinite(cpu['x']['history_crops' if cfg.memory_version >= 3 else 'memory_patches']).all()
             if cfg.memory_version >= 2:
                 assert all(torch.isfinite(cpu[k]).all() for k in ('memory_target_identity','memory_target_offset'))
         valid=torch.cat((cpu['positive_mask'],cpu['negative_mask'].flatten(1)),1).bool()
@@ -84,20 +94,32 @@ def main(argv=None):
                        memory_departed_writes=int((cpu['memory_target_identity_mask'] & (cpu['memory_target_identity'] < .5)).sum()),
                        memory_switch=int((cpu['location_source'] == 7).sum()),recent_replay=int((cpu['source'] == 2).sum()))
         if model is not None:
-            b=move_batch(cpu,args.device);model.zero_grad(set_to_none=True)
-            with torch.autocast('cuda',dtype=torch.bfloat16,enabled=args.device.startswith('cuda')):
-                out=model(b['x'],b['hist'],b['hmask'],queries=b['identity_points'],candidates=b['candidate_points'])
-                terms=loss_terms(out,b,cfg)
-                loss=terms['geometry_per_state'].mean()+.5*terms['confidence_per_state'].mean()+.5*terms['identity_per_state'].mean()+terms['candidate_per_state'].mean()
-                if 'memory_probe' in out:
-                    probe=memory_probe_terms(out,b)
-                    loss=loss+.5*(probe['memory_identity_per_state'].mean()+probe['memory_offset_per_state'].mean())
-            assert torch.isfinite(loss)
-            loss.backward()
-            for name,param in model.named_parameters():
-                if param.grad is not None:assert torch.isfinite(param.grad).all(),name
-            assert model.encoder.compress.weight.grad.abs().sum()>0
-            row.update(loss=float(loss.detach()),identity_pairs=int(terms['identity_count']))
+            if 'trajectory_windows' in cpu:
+                import copy
+                from .train import optimizer_update
+                metrics = optimizer_update(model,copy.deepcopy(model).requires_grad_(False),
+                    torch.optim.SGD(model.parameters(),lr=0.),[cpu],1,0.,device=args.device,compute_metrics=False)
+                row.update(loss=metrics['loss'],supervised_decisions=metrics['supervised_decisions'])
+                assert model.encoder.compress.weight.grad.abs().sum()>0
+            else:
+                b=move_batch(cpu,args.device);model.zero_grad(set_to_none=True)
+                kwargs = {}
+                if cfg.memory_slots and cfg.memory_version >= 3:
+                    kwargs['probe_mask'] = cpu['memory_target_identity_mask'] | cpu['memory_target_offset_mask']
+                    kwargs['candidate_mask'] = cpu['candidate_mask']
+                with torch.autocast('cuda',dtype=torch.bfloat16,enabled=args.device.startswith('cuda')):
+                    out=model(b['x'],b['hist'],b['hmask'],queries=b['identity_points'],candidates=b['candidate_points'],**kwargs)
+                    terms=loss_terms(out,b,cfg)
+                    loss=terms['geometry_per_state'].mean()+.5*terms['confidence_per_state'].mean()+.5*terms['identity_per_state'].mean()+terms['candidate_per_state'].mean()
+                    if 'memory_probe' in out:
+                        probe=memory_probe_terms(out,b)
+                        loss=loss+.5*(probe['memory_identity_per_state'].mean()+probe['memory_offset_per_state'].mean())
+                assert torch.isfinite(loss)
+                loss.backward()
+                for name,param in model.named_parameters():
+                    if param.grad is not None:assert torch.isfinite(param.grad).all(),name
+                assert model.encoder.compress.weight.grad.abs().sum()>0
+                row.update(loss=float(loss.detach()),identity_pairs=int(terms['identity_count']))
             if args.device.startswith('cuda'):
                 torch.cuda.synchronize()
                 row.update(peak_allocated_gib=torch.cuda.max_memory_allocated()/2**30,

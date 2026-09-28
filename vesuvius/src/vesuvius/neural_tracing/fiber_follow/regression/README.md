@@ -1,5 +1,117 @@
 # Axial fiber follower
 
+## Spatial history retrieval (memory version 4)
+
+`axial_fiber_spatial_memory_v1` keeps the existing shared axial encoder and
+replaces the historical descriptor bottleneck with spatial memory. It is a
+separate checkpoint architecture; existing crop, patch-memory and unified
+checkpoints still load through their original models.
+
+Each observation retains its complete axial token grid (39,015 × 128 at the
+production crop), its pose and age, and the 27 fine head descriptors. Those
+fine samples remain useful for identity supervision, but are no longer the
+only evidence available from past crops. This implementation still computes
+the dense decoder to obtain those fine samples; it does not claim an encoding
+speedup or equivalence to a cheaper observation encoder.
+
+The seed grid is immutable and always readable, with the seed origin/direction
+defined by its observation frame. Current image tokens, visible observed-path
+tokens with explicit ages, and the two most recent historical grids are always
+readable. A learned summary of each older grid supplies an archive retrieval
+key. Each candidate's seed-conditioned path queries score those keys. The
+highest-scoring two observation blocks are read at full spatial resolution,
+with separate attention weights for each path point. A soft read over all
+archive summaries trains the routing parameters, including unselected entries.
+Selection is bounded per curve, not an independent top-k for every point;
+stable ties prefer newer observations. Geometry, corrections, confidence,
+candidate evaluation and historical probes use the same evaluator.
+
+Defaults retain two recent observations and eight additional older grids.
+The current head occupies a separate bank slot and is not duplicated among
+the recent history when decoding it. Oldest archive entries are evicted first.
+Sixteen learned recurrent slots read the full observation grid and preserve
+compressed context after eviction. Evicted spatial detail is not recoverable:
+this is a bounded archive, not an unlimited historical store. Capacities are
+explicit via `--spatial-recent`, `--spatial-archive`, `--spatial-retrieve` and
+`--memory-slots`. World poses remain float32; feature storage follows the
+model's parameter dtype, independent of the surrounding autocast context. The default bank plus
+seed alone is about 229 MiB per trace in float32, before activations or temporary
+copies (about 114 MiB in BF16).
+
+### Training windows and feature lifetime
+
+`--trajectory-window 4` supervises up to four consecutive decisions for states
+with explicitly labeled observed tracks. The original sampled state is always
+included. States without suitable track labels and matched-candidate states
+retain their original single-state supervision. Extra decisions use only the
+observed track prefix, the original seed, and separately constructed original-
+fiber targets; target offsets/departure labels never enter model inputs. Every
+extra state's crop/target footprint is checked against the holdout before I/O.
+
+All crops are sampled once into the original batch. Window images are views
+of those buffers and share its photometric augmentation. The first decision
+encodes the seed and earlier history; subsequent decisions encode only their
+new crop and carry differentiable memory forward. Activation checkpointing
+can recompute encodings during backward. Losses average over decisions within
+each window, then over originally sampled states, so longer tracked windows do
+not increase their source's loss weight or dilute matched-candidate examples.
+Logs include `supervised_decisions`; detailed decision diagnostic groups count
+the actual decisions evaluated.
+
+**No learned encodings survive a training optimizer update.** Every window
+starts with empty carried memory. All of its encodings use the current weights;
+one backward pass accumulates its losses, and memory is discarded before the
+optimizer steps. The next update re-encodes both seed and history. Burn-in and
+stratified encoder-gradient sampling still compute fresh forward features;
+`no_grad` is not a feature cache. Checkpoints contain weights/optimizer/RNG,
+not observation memories. Replay stores observed geometry and labels, not old
+encoder activations. Inference carries features within a trace while its loaded
+model weights stay fixed; a new trace/checkpoint starts new memory.
+
+### Running and validation
+
+To launch a **new** experiment after reviewing the change and completing a
+production-device preflight:
+
+```bash
+bash scripts/launch_spatial_memory.sh
+```
+
+Its default destination is `output/axial_spatial_memory_run1`; it does not resume
+or alter the existing unified experiment. To initialize just the shared encoder
+and compatible identity projection, append `--init-encoder output/OLD/last.pt`.
+Only identity-independent unified/spatial encoders with matching geometry and
+encoder dimensions are accepted. Memory, path decoder and optimizer start fresh.
+`--resume` is for checkpoints of the new architecture, with matching options.
+
+Production preflight (also exercises the window optimizer with zero LR):
+
+```bash
+PYTHONPATH=../../.. python -m vesuvius.neural_tracing.fiber_follow.regression.identity_preflight \
+  --out output/spatial_memory_preflight --device cuda --forward --compile \
+  --microbatch 2 --batches 2 --memory-version 4 --memory-slots 16 \
+  --memory-steps 64 --memory-grad-steps 32 --memory-encoder-grad-steps 4 \
+  --spatial-recent 2 --spatial-archive 8 --spatial-retrieve 2 \
+  --trajectory-window 4 --memory-switch-probability .15 --activation-checkpointing
+```
+
+Tests cover spatial evidence outside the head stencil, immutable seeds, archive
+eviction, streaming/unroll parity, relative poses, candidate isolation,
+padding/empty memories, gradients through retrieval, checkpoint loading,
+window supervision/holdout/crop reuse, and re-encoding after parameter updates:
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=../../.. \
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_spatial_memory.py \
+  tests/test_unified.py tests/test_learned_memory.py tests/test_memory_sequences.py \
+  -q -o cache_dir=/tmp/spatial-memory-pytest
+```
+
+This is an architectural implementation, not a measured accuracy or speed
+improvement. Production CUDA memory, throughput, compilation and tracing quality
+still require validation before a long run. The encoder/decoder compile in place;
+archive routing and the CPU observation/window schedule remain eager.
+
 ## Unified recurrent architecture
 
 New memory training defaults to `--memory-version 3`, checkpoint architecture
@@ -34,7 +146,14 @@ filter losses only, never the model's observed references. Adaptive slots are
 context, not falsely treated as individual contrastive fiber descriptors.
 
 Training re-encodes full historical crops with current weights, oldest first.
-Old observations form no-gradient burn-in; recent encodings use activation
+Old observations form no-gradient burn-in. Within the gradient window, valid
+history observations are divided chronologically into up to four balanced groups
+per state, with one random encoding per group retaining encoder gradients.
+Its gradient is multiplied by the group size to preserve the expected raw encoder
+gradient; uneven groups receive their own weights. All writes within the window
+remain differentiable, and the seed and current crop always retain gradients.
+`--memory-encoder-grad-steps` controls this budget (default 4; 0 keeps all).
+Sampling uses the checkpointed Torch RNG. Encodings with gradients use activation
 recomputation. Historical images stay on the CPU until each observation is
 encoded. The current crop is read/encoded only once, and full seed/history crop
 footprints are checked against the holdout before I/O. Replay uses saved observed
@@ -42,7 +161,8 @@ frames; history reconstruction is a fallback for older caches. Inference carries
 only the bounded state and encodes one new full crop per decision after startup.
 
 The launcher uses effective batch size 8, microbatches of 2, 64 historical
-observations and 32 gradient-bearing history steps. It uses 12 loader workers
+observations, 32 gradient-bearing history writes and four sampled history encoder
+gradients per state. It uses 12 loader workers
 and activation checkpointing. The encoder and shared decoder are compiled;
 the CPU-streamed sequence scheduling stays eager. In-place module compilation
 preserves the same checkpoint parameter names and EMA updates.
@@ -55,7 +175,73 @@ Full-crop replay is substantially more expensive than the legacy patch unroll.
 Legacy checkpoint architectures remain loadable; they cannot initialize this
 architecture. Use `--memory-version 2` explicitly for legacy memory training.
 
-Validation on the RTX 5090 (PyTorch 2.12.1, BF16 autocast, full 120×101×101
+The writer materializes initial state tensors with recurrent-state layouts and
+packs sequences in time-major order once before the write loop. Burn-in,
+differentiable writes and writes with auxiliary probes use separate compiled entry
+points, with scheduling outside the graphs. Non-probe graphs can discard unused
+probe features. This avoids exhausting the compilation cache on initial/recurrent
+strides, seed availability, gradient transitions and probe flags. Parameter names,
+checkpoint format and the seed's gradient path are unchanged.
+
+Training and preflight also pass CPU candidate masks as scheduling metadata.
+A candidate curve is skipped only when every point in that candidate's entire
+microbatch is unlabeled; the result retains its usual shape with zero placeholders
+for skipped curves. Any labeled point retains the complete evaluation, including
+points outside the loss commit window used by diagnostics. Masks do not enter the
+evaluator, memory writes or primary predictions. Calls without a scheduling mask
+(including inference) continue to evaluate all supplied candidates.
+
+The component benchmark and before-change source snapshots are under
+`output/unified_speed_validation/`. Reproduce from this directory with:
+
+```bash
+PYTHONPATH=../../.. TORCHINDUCTOR_COMPILE_THREADS=2 ../../../../.venv/bin/python \
+  output/unified_speed_validation/benchmark.py
+```
+
+It measures compiled BF16 writer forward/backward across seed/burn-in variants,
+and repeated production-size path evaluation with two wholly masked candidates.
+It excludes the crop encoder, data loading, optimizer and EMA. Tests cover
+unchanged supervised losses, parameter gradients, candidate metrics, checkpoint
+names and stable compilation after warming all writer variants. Existing running
+Python processes pick up these changes only after restart; checkpoints remain
+compatible.
+
+RTX 5090 component results with training stopped (PyTorch 2.12.1, BF16,
+microbatch 2; mean / p50 / p95 milliseconds):
+
+| Workload | Before | After |
+| --- | --- | --- |
+| 65-write recurrence, equal mix of four seed/burn cases, 48 measurements | 77.63 / 81.61 / 85.95 | 73.04 / 74.02 / 83.78 |
+| Six evaluator calls versus four, two candidates wholly unlabeled, 12 measurements | 49.91 / 50.05 / 51.45 | 32.16 / 32.14 / 33.85 |
+
+The writer benefit depends on the case: seedless burn-in fell from 83.16 to
+63.28 ms, while already-cached seeded burn-in changed from 62.22 to 64.26 ms.
+The original writer hit its recompilation limit during warmup; the revised
+entry points completed all variants with full-graph compilation. CPU tests retain
+the mathematical loss/gradient behavior. CUDA BF16 before/after gradients differ
+by 1.19–1.45% in aggregate relative L2 in this synthetic recurrence, comparable
+to the existing eager/compiled rounding differences; all tested gradients were
+finite. These component savings are not whole-training speedup claims.
+
+A complete optimizer-update comparison is recorded in
+`output/unified_speed_validation/update_results.json`. It uses the cached real CT
+batch `output/unified_validation/batch.pt` (33 valid observations per state, both
+seeds present, no labeled candidate curves), repeated over four microbatches of
+two for effective batch eight. After three warmup updates, eight measured updates
+include forward, losses, backward, clipping, AdamW and EMA, but exclude loading
+and diagnostics. Mean / p50 / p95 update time was **4.902 / 4.896 / 4.958 s before**
+and **4.815 / 4.805 / 4.884 s after**, a 1.8% mean time reduction. This batch does
+not exercise the seedless writer fallback; full-crop encoding still dominates.
+Reproduce with:
+
+```bash
+PYTHONPATH=../../.. TORCHINDUCTOR_COMPILE_THREADS=2 ../../../../.venv/bin/python \
+  output/unified_speed_validation/benchmark_update.py
+```
+
+Validation before stratified encoder sampling, with all history encoder gradients
+in the window enabled, on the RTX 5090 (PyTorch 2.12.1, BF16 autocast, full 120×101×101
 crops, microbatch 2, 64 historical writes, 32 gradient-bearing history writes):
 
 | Execution | Forward/backward + AdamW | Peak allocated VRAM |
@@ -85,6 +271,7 @@ TORCHINDUCTOR_COMPILE_THREADS=4 PYTHONPATH=../../.. ../../../../.venv/bin/python
   -m vesuvius.neural_tracing.fiber_follow.regression.identity_preflight \
   --out output/unified_preflight --device cuda --forward --compile \
   --memory-version 3 --memory-slots 16 --memory-steps 64 --memory-grad-steps 32 \
+  --memory-encoder-grad-steps 4 \
   --activation-checkpointing --microbatch 2 --batches 2
 ```
 

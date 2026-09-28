@@ -20,7 +20,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
 )
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
-    ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, UNIFIED_ARCHITECTURE, DirectConfig, DirectFollower,
+    ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, UNIFIED_ARCHITECTURE, SPATIAL_MEMORY_ARCHITECTURE, DirectConfig, DirectFollower,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES,
@@ -73,26 +73,34 @@ def match_optimizer_layout(opt):
 
 def compile_training_model(model, **kwargs):
     """Compile tensor modules while keeping streamed CPU scheduling outside Dynamo."""
-    if model.architecture == UNIFIED_ARCHITECTURE:
+    if model.architecture in (UNIFIED_ARCHITECTURE, SPATIAL_MEMORY_ARCHITECTURE):
         # In-place compilation preserves checkpoint/EMA parameter names.
         model.encoder.compile(**kwargs)
         model.decoder.compile(**kwargs)
         # The per-observation memory update; the streamed schedule stays eager.
-        model.write = torch.compile(model.write, **kwargs)
+        if model.architecture == SPATIAL_MEMORY_ARCHITECTURE:
+            # Retrieval and sequence scheduling stay eager; compile the shared
+            # encoder/decoder without capturing large carried archive dictionaries.
+            return model
+        model._write_grad = torch.compile(model._write_grad, **kwargs)
+        model._write_burn = torch.compile(model._write_burn, **kwargs)
+        model._write_probe = torch.compile(model._write_probe, **kwargs)
         return model
     return torch.compile(model, **kwargs)
 
 
-ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, UNIFIED_ARCHITECTURE)
-MEMORY_OPTIONS = ('memory_slots','memory_steps','memory_stride','memory_patch_size','memory_grad_steps','memory_encoder_grad_steps','memory_version')
+ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, UNIFIED_ARCHITECTURE, SPATIAL_MEMORY_ARCHITECTURE)
+MEMORY_OPTIONS = ('memory_slots','memory_steps','memory_stride','memory_patch_size','memory_grad_steps','memory_encoder_grad_steps','memory_version',
+                  'spatial_recent','spatial_archive','spatial_retrieve','trajectory_window')
 
 
 def checkpoint_config(ck):
     model_cfg = dict(ck['model_cfg'])
+    model_cfg.setdefault('memory_encoder_grad_steps', 0)  # older runs encoded all history with gradients
     if ck['architecture'] == MEMORY_ARCHITECTURE_V1:
         model_cfg.setdefault('memory_version', 1)  # saved before versions were recorded
     cfg = DirectConfig(**model_cfg)
-    expected = (({1:MEMORY_ARCHITECTURE_V1,2:MEMORY_ARCHITECTURE,3:UNIFIED_ARCHITECTURE}[cfg.memory_version])
+    expected = (({1:MEMORY_ARCHITECTURE_V1,2:MEMORY_ARCHITECTURE,3:UNIFIED_ARCHITECTURE,4:SPATIAL_MEMORY_ARCHITECTURE}[cfg.memory_version])
                 if cfg.memory_slots else ARCHITECTURE)
     if ck['architecture'] != expected:
         raise ValueError('Checkpoint architecture and memory configuration disagree')
@@ -108,10 +116,22 @@ def load_checkpoint(path,device='cuda'):
     return model,cfg.fine,cfg.n_history,FiberVolumeSpec(**ck['vol_spec']),ck
 
 
+def initialize_encoder(model, source):
+    """Transfer appearance weights only; memory, decoder and optimizer start fresh."""
+    for key in ('fine','channels','hidden','heads','layers'):
+        if getattr(model.cfg,key) != getattr(source.cfg,key):
+            raise ValueError(f'Encoder initialization differs in {key}')
+    if model.architecture != SPATIAL_MEMORY_ARCHITECTURE or source.encoder.condition is not None:
+        raise ValueError('Encoder transfer requires an identity-independent unified/spatial source and a spatial target')
+    model.encoder.load_state_dict(source.encoder.state_dict(),strict=True)
+    if model.cfg.embedding == source.cfg.embedding:
+        model.embedding.load_state_dict(source.embedding.state_dict(),strict=True)
+
+
 def move_batch(batch, device):
     # Pinned loader batches copy asynchronously; the compute stream orders later use.
     return {k: v if k in ('history_crops','seed_crop') else move_batch(v, device) if isinstance(v, dict) else v.to(device, non_blocking=True)
-            for k, v in batch.items()}
+            for k, v in batch.items() if k != 'trajectory_windows'}
 
 
 @torch.no_grad()
@@ -174,12 +194,14 @@ IDENTITY_SUMS = ('identity_count', 'identity_states', 'identity_rank_correct', '
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
                      confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True,
                      identity_weight=.5, identity_temperature=.1, candidate_weight=1., memory_probe_weight=.5):
-    """Equal weight per observed state, independent of microbatch boundaries.
+    """Equal weight per sampled state/window, independent of microbatch boundaries.
 
     Within a state each loss averages over its known points; fully unknown
     states contribute zero. Geometry and confidence are evaluated in one pass.
     """
-    total = sum(len(b['hist']) for b in batches)
+    windows = [window for batch in batches for window in batch.get('trajectory_windows',[[batch]])]
+    total = sum(len(window[-1]['hist']) for window in windows)
+    supervised_decisions = sum(len(b['hist']) for window in windows for b in window)
     if total < 1:
         raise ValueError('An update needs at least one state')
     for group in opt.param_groups:
@@ -187,7 +209,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     opt.zero_grad(set_to_none=True)
     sums = dict(loss=0., geometry=0., confidence_loss=0., error_sum=0., geometry_count=0.,
                 correct_count=0., confidence_count=0.)
-    sources = np.zeros(6, dtype=np.int64)
+    sources = np.zeros(6, dtype=np.float64)
     bank_tails = []
     identity = {}
     identity_groups = {}
@@ -197,52 +219,72 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     decisions, rankings = [], []
     memory = {}
     model.train()
-    for cpu in batches:
+    # Windows never cross an optimizer boundary. Rebuild all seed/history
+    # features with these weights, retain the graph until the window's last
+    # loss, then discard the carry before advancing to another trajectory.
+    scheduled = [(cpu,index == 0,index == len(window)-1,1/len(window)) for window in windows for index,cpu in enumerate(window)]
+    carry = None
+    window_loss = None
+    for cpu,first,last,weight in scheduled:
+        if first:
+            carry = None
         if 'pair_sampling_version' in cpu:
             pair_version = int(cpu['pair_sampling_version'][0])
         batch = move_batch(cpu, device)
         if model.cfg.memory_slots:
-            sums['memory_observations_mean'] = sums.get('memory_observations_mean', 0.)+float(cpu['x']['memory_mask'].sum())/total
+            sums['memory_observations_mean'] = sums.get('memory_observations_mean', 0.)+weight*float(cpu['x']['memory_mask'].sum())/total
             if 'memory_target_identity_mask' in cpu:
                 labeled = cpu['memory_target_identity_mask']
-                memory['labeled_writes'] = memory.get('labeled_writes', 0.)+float(labeled.sum())
-                memory['labeled_states'] = memory.get('labeled_states', 0.)+float(labeled.any(-1).sum())
-                memory['departed_states'] = memory.get('departed_states', 0.)+float(
+                memory['labeled_writes'] = memory.get('labeled_writes', 0.)+weight*float(labeled.sum())
+                memory['labeled_states'] = memory.get('labeled_states', 0.)+weight*float(labeled.any(-1).sum())
+                memory['departed_states'] = memory.get('departed_states', 0.)+weight*float(
                     (labeled & (cpu['memory_target_identity'] < .5)).any(-1).sum())
-            sums['memory_anchor_fraction'] = sums.get('memory_anchor_fraction', 0.)+float(cpu['x']['memory_seed_valid'].sum())/total
+            sums['memory_anchor_fraction'] = sums.get('memory_anchor_fraction', 0.)+weight*float(cpu['x']['memory_seed_valid'].sum())/total
         queries = dict(queries=batch['identity_points']) if 'identity_points' in batch else {}
-        if model.cfg.memory_slots and model.cfg.memory_version == 3 and 'memory_target_identity_mask' in cpu:
+        if carry is not None:
+            queries['memory'] = carry
+        if model.cfg.memory_slots and model.cfg.memory_version >= 3 and 'memory_target_identity_mask' in cpu:
             # This only schedules auxiliary computations; it is never input to
             # the encoder, writer or deployed path evaluator.
             queries['probe_mask'] = cpu['memory_target_identity_mask'] | cpu['memory_target_offset_mask']
         if 'candidate_points' in batch:
             queries['candidates'] = batch['candidate_points']
+            if model.architecture in (UNIFIED_ARCHITECTURE, SPATIAL_MEMORY_ARCHITECTURE):
+                queries['candidate_mask'] = cpu['candidate_mask']
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
             output = model(batch['x'], batch['hist'], batch['hmask'], **queries)
+            if not last:
+                # Key names come from the model's state contract, without
+                # allocating another full spatial bank just to discover them.
+                carry = {key:output['memory_'+key] for key in model.memory_keys}
             terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit,
                                identity_temperature=identity_temperature)
-            geometry = terms['geometry_per_state'].sum()/total
-            confidence = terms['confidence_per_state'].sum()/total
+            geometry = weight*terms['geometry_per_state'].sum()/total
+            confidence = weight*terms['confidence_per_state'].sum()/total
             loss = geometry + confidence_weight*confidence
             if 'identity_per_state' in terms:
-                identity_loss = terms['identity_per_state'].sum()/total
+                identity_loss = weight*terms['identity_per_state'].sum()/total
                 loss = loss + identity_weight*identity_loss
                 identity['identity_loss'] = identity.get('identity_loss', 0.)+identity_loss.detach().item()
             if 'candidate_per_state' in terms:
-                candidate_loss = terms['candidate_per_state'].sum()/total
+                candidate_loss = weight*terms['candidate_per_state'].sum()/total
                 loss = loss+candidate_weight*candidate_loss
                 identity['candidate_loss'] = identity.get('candidate_loss', 0.)+candidate_loss.detach().item()
             if 'memory_probe' in output and 'memory_target_identity' in batch:
                 probe = memory_probe_terms(output, batch)
-                identity_probe = probe['memory_identity_per_state'].sum()/total
-                offset_probe = probe['memory_offset_per_state'].sum()/total
+                identity_probe = weight*probe['memory_identity_per_state'].sum()/total
+                offset_probe = weight*probe['memory_offset_per_state'].sum()/total
                 loss = loss+memory_probe_weight*(identity_probe+offset_probe)
                 for key, value in (('probe_identity_loss', identity_probe), ('probe_offset_loss', offset_probe),
-                                   *((k.removeprefix('memory_'), v) for k, v in probe.items() if not k.endswith('_per_state'))):
+                                   *((k.removeprefix('memory_'), weight*v) for k, v in probe.items() if not k.endswith('_per_state'))):
                     memory[key] = memory.get(key, 0.)+value.detach().item()
         if not torch.isfinite(loss):
             raise FloatingPointError(f'Nonfinite loss at step {step}')
-        loss.backward()
+        window_loss = loss if first else window_loss+loss
+        if last:
+            window_loss.backward()
+            window_loss = None
+            carry = None
         if compute_metrics:
             decisions.extend(decision_rows(output, batch, model.cfg, n_commit, tolerance))
             if 'candidate_confidence_logits' in output:
@@ -258,12 +300,12 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                         group[key] = group.get(key,0)+value
         for key in IDENTITY_SUMS:
             if key in terms:
-                identity[key] = identity.get(key, 0.)+terms[key].detach().item()
+                identity[key] = identity.get(key, 0.)+weight*terms[key].detach().item()
         for key in ('presence_dropped', 'foreign_components', 'seed_present', 'identity_observable'):
             if key in cpu:
-                identity[key] = identity.get(key, 0.)+float((cpu[key] > 0).sum())
+                identity[key] = identity.get(key, 0.)+weight*float((cpu[key] > 0).sum())
         if 'decision_requested' in cpu:
-            requested_decisions += float(cpu['decision_requested'].sum())
+            requested_decisions += weight*float(cpu['decision_requested'].sum())
         if 'negative_bank_shards' in cpu:
             low,high = int(cpu['negative_bank_shards'].min()),int(cpu['negative_bank_shards'].max())
             identity['negative_bank_shards_min'] = min(identity.get('negative_bank_shards_min',low),low)
@@ -271,20 +313,21 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         if 'location_source' in cpu:
             for index, name in enumerate(LOCATION_SOURCES):
                 key = f'location_{name}'
-                identity[key] = identity.get(key, 0.)+float((cpu['location_source'] == index).sum())
+                identity[key] = identity.get(key, 0.)+weight*float((cpu['location_source'] == index).sum())
         for key, value in (('loss', loss), ('geometry', geometry), ('confidence_loss', confidence)):
             sums[key] += value.detach().item()
         for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count'):
-            sums[key] += terms[key].detach().item()
+            sums[key] += weight*terms[key].detach().item()
         if 'source' in cpu:
             for source in range(len(sources)):
-                sources[source] += int((cpu['source'] == source).sum())
+                sources[source] += weight*int((cpu['source'] == source).sum())
             if 'bank_tail_length' in cpu:
                 bank_tails.extend(cpu['bank_tail_length'][cpu['source'] == 3].tolist())
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
     opt.step()
     update_ema(ema, model, step, ema_decay)
     sums.update(error_mean=sums['error_sum']/max(1., sums['geometry_count']),
+                supervised_decisions=supervised_decisions,
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']),
                 fresh_fraction=float(sources[0]/total), fixed_fraction=float(sources[1]/total),
                 recent_fraction=float(sources[2]/total),bank_wrong_continuation_fraction=float(sources[3]/total),
@@ -353,8 +396,13 @@ def build_parser():
     ap.add_argument('--hidden', type=int, default=128)
     ap.add_argument('--memory-slots', type=int, default=0,
                     help='Learned recurrent memory slots; 0 preserves the crop-only model')
-    ap.add_argument('--memory-version', type=int, choices=(2,3), default=3,
-                    help='3: unified full-crop recurrent model; 2: legacy patch-memory model')
+    ap.add_argument('--memory-version', type=int, choices=(2,3,4), default=3,
+                    help='4: spatial retrieval; 3: unified descriptors; 2: legacy patch memory')
+    ap.add_argument('--spatial-recent', type=int, default=DirectConfig.spatial_recent)
+    ap.add_argument('--spatial-archive', type=int, default=DirectConfig.spatial_archive)
+    ap.add_argument('--spatial-retrieve', type=int, default=DirectConfig.spatial_retrieve)
+    ap.add_argument('--trajectory-window', type=int, default=DirectConfig.trajectory_window,
+                    help='Spatial model: consecutive labeled track decisions per window; encodings expire at each optimizer update')
     ap.add_argument('--memory-steps', type=int, default=32,
                     help='Past observed patches unrolled before the supervised current decision')
     ap.add_argument('--memory-stride', type=int, default=4,
@@ -363,9 +411,9 @@ def build_parser():
                     help='Odd CT/presence patch size for the memory writer')
     ap.add_argument('--memory-grad-steps', type=int, default=32,
                     help='Newest observations that backpropagate; older ones are a no-grad burn-in')
-    ap.add_argument('--memory-encoder-grad-steps', type=int, default=0,
-                    help='Unified model: random gradient-window history encodings per state that '
-                         'backpropagate into the encoder (gradient scaled n/k); 0 keeps all')
+    ap.add_argument('--memory-encoder-grad-steps', type=int, default=DirectConfig.memory_encoder_grad_steps,
+                    help='Unified model: stratified gradient-window history encodings per state that '
+                         'backpropagate into the encoder (gradient scaled by stratum size); 0 keeps all')
     ap.add_argument('--memory-probe-weight', type=float, default=.5,
                     help='Per-write departure/offset probe coefficient (memory models)')
     ap.add_argument('--memory-switch-probability', type=float, default=0.,
@@ -434,6 +482,7 @@ def build_parser():
     ap.add_argument('--replay-keep', type=int, default=4)
     ap.add_argument('--resume', help='Resume last.pt inside this run with the same training options')
     ap.add_argument('--init-tracer', help='Initialize a new run from saved EMA follower weights')
+    ap.add_argument('--init-encoder', help='Spatial memory: initialize only the shared encoder/identity projection from unified EMA weights')
     return ap
 
 
@@ -447,6 +496,8 @@ def main(argv=None):
     progress(f'Starting training: device={args.device}, workers={args.workers}')
     if args.resume and args.init_tracer:
         raise ValueError('--init-tracer starts a new run and cannot be combined with --resume')
+    if args.init_encoder and (args.resume or args.init_tracer):
+        raise ValueError('--init-encoder requires a fresh run without --init-tracer')
     if min(args.steps, args.batch, args.microbatch, args.log_every, args.ckpt_every,
            args.threads, args.replay_keep, args.dagger_seeds, args.recovery_seeds) < 1 or args.batch % args.microbatch:
         raise ValueError('Positive counts required; microbatch must divide effective batch')
@@ -475,11 +526,16 @@ def main(argv=None):
                        memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size,
                        memory_grad_steps=args.memory_grad_steps,memory_version=args.memory_version,
                        memory_encoder_grad_steps=args.memory_encoder_grad_steps,
+                       spatial_recent=args.spatial_recent,spatial_archive=args.spatial_archive,
+                       spatial_retrieve=args.spatial_retrieve,
+                       trajectory_window=args.trajectory_window,
                        identity_temperature=args.identity_temperature)
     initialized = None
     resume = None
     if args.init_tracer:
         initialized,_,_,_,_ = load_checkpoint(args.init_tracer,args.device)
+        if cfg.memory_version == 4 and initialized.architecture != SPATIAL_MEMORY_ARCHITECTURE:
+            raise ValueError('Spatial memory requires a fresh run; use --init-encoder to transfer appearance weights')
         if cfg.memory_slots and cfg.memory_version == 3 and initialized.architecture != UNIFIED_ARCHITECTURE:
             raise ValueError('The unified architecture must start fresh; legacy weights cannot initialize it')
         if args.memory_slots and not initialized.cfg.memory_slots:
@@ -569,13 +625,15 @@ def main(argv=None):
         return {role:bank.provenance() for role,bank in role_banks.items()}
     if resume:
         ignored = {'resume','out_root','device','batch','microbatch','workers','threads','worker_cache_gb',
-                   'log_every','ckpt_every','diag_every','dagger_device','compile','init_tracer',
+                   'log_every','ckpt_every','diag_every','dagger_device','compile','init_tracer','init_encoder',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing'}
         defaults = build_parser()
         for key,value in vars(args).items():
             # Options added after a run started had their default behavior.
             recorded = resume['training_options'].get(key, getattr(DirectConfig, key, defaults.get_default(key))
                                                        if key.startswith('memory_') else defaults.get_default(key))
+            if key == 'memory_encoder_grad_steps' and key not in resume['training_options']:
+                recorded = 0
             if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
                 raise ValueError(f'Resume option differs: {key}')
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
@@ -594,6 +652,12 @@ def main(argv=None):
             raise ValueError('Monitor recovery fixture changed since checkpoint')
     progress('Initializing models and optimizer')
     model = initialized if initialized is not None else DirectFollower(cfg).to(args.device, memory_format=conv_memory_format(args.device))
+    if args.init_encoder:
+        source,_,_,source_spec,_ = load_checkpoint(args.init_encoder,'cpu')
+        if source_spec.to_dict() != spec.to_dict():
+            raise ValueError('Encoder initialization volume differs')
+        initialize_encoder(model,source)
+        del source
     ema = copy.deepcopy(model).requires_grad_(False).eval()
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     done = resume_training(resume, model, ema, opt)[0] if resume else 0

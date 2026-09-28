@@ -19,6 +19,7 @@ ARCHITECTURE = 'axial_fiber_v3'
 MEMORY_ARCHITECTURE = 'axial_fiber_memory_v2'
 MEMORY_ARCHITECTURE_V1 = 'axial_fiber_memory_v1'  # no probe; loadable, not trained further
 UNIFIED_ARCHITECTURE = 'axial_fiber_unified_v1'
+SPATIAL_MEMORY_ARCHITECTURE = 'axial_fiber_spatial_memory_v1'
 TOKEN_STRIDE = (8, 2, 2)  # z, y, x in input samples
 TOKEN_OFFSET = (3, 0, 0)  # centre of four stride-two stem positions
 IDENTITY_EVIDENCE_WIDTH = 8  # point/mean/min/coverage for seed and history separately
@@ -50,11 +51,15 @@ class DirectConfig:
     # The newest memory_grad_steps observations (and the head) backpropagate;
     # older ones are a no-grad burn-in. At least memory_steps: no burn-in.
     memory_grad_steps: int = 32
-    # Unified model: per state, only this many random gradient-window history
-    # encodings backpropagate into the encoder, with gradient scaled by n/k so
-    # the encoder gradient stays unbiased. Writes keep gradients. 0: all.
-    memory_encoder_grad_steps: int = 0
+    # Unified model: one random encoding per chronological stratum of valid
+    # gradient-window history, up to this budget per state. Scale by stratum
+    # size for an unbiased encoder gradient. Writes keep gradients. 0: all.
+    memory_encoder_grad_steps: int = 4
     memory_version: int = 2  # 1: no probe; 2: legacy patch memory; 3: unified full-crop model
+    spatial_recent: int = 2  # always-readable observations, excluding the current crop
+    spatial_archive: int = 8  # additional full observations, oldest evicted first
+    spatial_retrieve: int = 2  # older observations read per candidate curve
+    trajectory_window: int = 1  # supervised decisions reused within one optimizer update
 
     def __post_init__(self):
         if isinstance(self.fine, dict):
@@ -84,10 +89,24 @@ class DirectConfig:
                 raise ValueError('Memory sequence dimensions must be positive integers')
             if not isinstance(self.memory_encoder_grad_steps, int) or self.memory_encoder_grad_steps < 0:
                 raise ValueError('Memory encoder gradient steps must be a nonnegative integer')
-            if self.memory_version not in (1, 2, 3):
+            if self.memory_version not in (1, 2, 3, 4):
                 raise ValueError('Unknown memory version')
             if not isinstance(self.memory_patch_size, int) or self.memory_patch_size < 5 or self.memory_patch_size % 2 != 1:
                 raise ValueError('Memory patch size must be odd and at least five')
+        if self.memory_version == 4:
+            if not self.memory_slots:
+                raise ValueError('Spatial memory requires positive memory_slots')
+            if any(not isinstance(v, int) or v < 1 for v in
+                   (self.spatial_recent, self.spatial_archive, self.spatial_retrieve)):
+                raise ValueError('Spatial memory capacities must be positive integers')
+            if self.spatial_retrieve > self.spatial_archive:
+                raise ValueError('Spatial retrieval exceeds archive capacity')
+            if self.hidden < self.channels:
+                raise ValueError('Spatial memory hidden width must cover fine feature channels')
+        if not isinstance(self.trajectory_window,int) or self.trajectory_window < 1:
+            raise ValueError('Trajectory window must be a positive integer')
+        if self.trajectory_window > 1 and self.memory_version != 4:
+            raise ValueError('Trajectory windows require spatial memory')
 
     @property
     def recent_history_points(self):
@@ -215,7 +234,7 @@ class AxialEncoder(nn.Module):
         self.compress = nn.Conv3d(4*c,h,(4,1,1),stride=(4,1,1))
         self.position = nn.Linear(3,h)
         # Observed path occupancy, mean age and seed occupancy. No annotation masks.
-        self.condition = None if cfg.memory_slots and cfg.memory_version == 3 else nn.Linear(3,h,bias=False)
+        self.condition = None if cfg.memory_slots and cfg.memory_version >= 3 else nn.Linear(3,h,bias=False)
         self.blocks = nn.ModuleList(AxialBlock(h,cfg.heads) for _ in range(cfg.layers))
         self.norm = nn.LayerNorm(h)
         self.dense_projection = nn.Conv3d(h,c,1)
@@ -445,6 +464,9 @@ class CropFollower(nn.Module):
 
 def DirectFollower(cfg):
     """Checkpoint-aware constructor; legacy architectures retain their weights."""
+    if cfg.memory_slots and cfg.memory_version == 4:
+        from .spatial_memory import SpatialMemoryFollower
+        return SpatialMemoryFollower(cfg)
     if cfg.memory_slots and cfg.memory_version == 3:
         from .unified import UnifiedFollower
         return UnifiedFollower(cfg)

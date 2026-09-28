@@ -15,7 +15,7 @@ TRACK_KEYS = ('pos', 'frame', 'offtrack', 'offset')  # offset: world vector to t
 
 
 def memory_crop(cfg):
-    if cfg.memory_version == 3:
+    if cfg.memory_version >= 3:
         return cfg.fine
     n = cfg.memory_patch_size
     return CropSpec(depth=n, width=n, behind=n//2, spacing=cfg.fine.spacing)
@@ -43,7 +43,7 @@ def memory_layout(item, cfg):
         for i in range(max(0, n-cfg.memory_steps), n):
             point, heading = np.asarray(track['pos'][i], np.float64), np.asarray(track['frame'][i], np.float64)[:, 2]
             if np.isfinite(point).all() and np.isfinite(heading).all() and np.linalg.norm(heading) > 1e-6:
-                observation_frame = (np.asarray(track['frame'][i]) if cfg.memory_version == 3
+                observation_frame = (np.asarray(track['frame'][i]) if cfg.memory_version >= 3
                                      else frame_from_heading(normalize(heading)))
                 observations.append(dict(pos=point, frame=observation_frame, track=i))
     elif not warm:
@@ -61,7 +61,7 @@ def memory_layout(item, cfg):
             if not np.isfinite(heading).all() or np.linalg.norm(heading) < 1e-6:
                 heading = frame[:, 2]
             observations.append(dict(pos=hist[i], frame=frame_from_heading(normalize(heading))))
-    observations.append(dict(pos=pos, frame=frame if cfg.memory_version == 3 else frame_from_heading(frame[:, 2])))
+    observations.append(dict(pos=pos, frame=frame if cfg.memory_version >= 3 else frame_from_heading(frame[:, 2])))
     seed = None
     if not warm and item.get('seed_valid', False):
         point = np.asarray(item['seed_pos'])
@@ -81,7 +81,7 @@ def memory_images(items, vol, cfg, image_crop, pool=None):
     layouts = [memory_layout(i, cfg) for i in items]
     count = memory_count(items, cfg)
     b, n = len(items), cfg.memory_patch_size
-    unified = cfg.memory_version == 3
+    unified = cfg.memory_version >= 3
     shape = (cfg.fine.depth,cfg.fine.width,cfg.fine.width) if unified else (n,n,n)
     patches = torch.zeros(b, count-1 if unified else count, 2, *shape)
     mask = torch.zeros(b, count, dtype=torch.bool)
