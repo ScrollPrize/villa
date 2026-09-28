@@ -186,7 +186,35 @@ def physical_scale_from_root(
     if unit and str(unit).lower() in _MICROMETRE_UNITS and "y" in by_axis and "x" in by_axis:
         result["um_per_px_y"] = float(by_axis["y"])
         result["um_per_px_x"] = float(by_axis["x"])
+    result["note"] = renderer_default_note(result)
     return result
+
+
+def renderer_default_note(scale_record: Mapping[str, Any]) -> str | None:
+    """Name the case where the scale metadata is the renderer's placeholder.
+
+    ``vc_render_tifxyz`` defaults ``--voxel-unit`` to ``nanometer`` and, when
+    it has no ``meta.json`` (the usual ``--remote-url`` case), writes a scale
+    of 1.0; with a ``meta.json`` it writes the micrometre value under the
+    nanometre label (villa #1893). Neither is a usable physical scale, so no
+    resolution tags are written; this note says why and what fixes it.
+    """
+
+    unit = str(scale_record.get("unit") or "").lower()
+    if unit not in ("nanometer", "nanometre", "nm"):
+        return None
+    scale = scale_record.get("scale") or []
+    if scale and all(abs(float(value) - 1.0) < 1e-9 for value in scale):
+        return (
+            "scale 1.0 nanometer is vc_render_tifxyz's placeholder when no "
+            "meta.json is available (villa #1893); re-render with "
+            "--voxel-size <um> --voxel-unit micrometer to get resolution tags"
+        )
+    return (
+        "unit nanometer is vc_render_tifxyz's default label; if the value is "
+        "really micrometres (villa #1893), re-render with --voxel-unit "
+        "micrometer to get resolution tags"
+    )
 
 
 def _pixels_per_inch(um: float) -> tuple[int, int] | None:

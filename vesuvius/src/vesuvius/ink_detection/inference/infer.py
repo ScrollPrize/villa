@@ -1198,11 +1198,12 @@ def infer_single_zarr(
             LOGGER.warning(
                 "Level=%s of %s declares scale=%s in unit %r; resolution tags "
                 "are written only for micrometre units, so the output TIFF "
-                "records the scale but gets no resolution tags",
+                "records the scale but gets no resolution tags%s",
                 resolution,
                 input_zarr,
                 physical_scale.get("scale"),
                 physical_scale.get("unit"),
+                (" (" + physical_scale["note"] + ")") if physical_scale.get("note") else "",
             )
         else:
             LOGGER.info(

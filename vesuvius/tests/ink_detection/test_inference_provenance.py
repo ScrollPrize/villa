@@ -122,6 +122,28 @@ def test_non_micrometre_units_are_recorded_but_produce_no_resolution(tmp_path, u
     assert resolution_tags(record["um_per_px_y"], record["um_per_px_x"]) is None
 
 
+@pytest.mark.parametrize(
+    "scale, expect",
+    [
+        ([1.0, 1.0, 1.0], "placeholder when no meta.json"),  # --remote-url render, no meta.json
+        ([9.362, 9.362, 9.362], "default label"),  # meta.json value under the nanometer label
+    ],
+)
+def test_renderer_nanometer_cases_get_no_tags_and_a_named_reason(tmp_path, scale, expect):
+    # The two outputs khj1222 measured from the released VC3D build (villa #1893).
+    root = _ome_root(tmp_path, {"0": scale}, unit="nanometer")
+    record = physical_scale_from_root(root, "0", depth_axis_first=True)
+    assert record["um_per_px_y"] is None
+    assert resolution_tags(record["um_per_px_y"], record["um_per_px_x"]) is None
+    assert expect in record["note"]
+    assert "--voxel-unit micrometer" in record["note"]
+
+
+def test_micrometre_scale_carries_no_note(tmp_path):
+    root = _ome_root(tmp_path, {"0": [9.362, 9.362, 9.362]})
+    assert physical_scale_from_root(root, "0", depth_axis_first=True)["note"] is None
+
+
 def test_ome_0_5_layout_is_read_too(tmp_path):
     root = zarr.open_group(str(tmp_path / "ome5.zarr"), mode="w")
     root.create_array("0", shape=(3, 8, 8), chunks=(3, 8, 8), dtype="uint8")
