@@ -72,6 +72,17 @@ struct InputFiber {
     // the cached detection, so it is not part of the cache keys; empty or
     // mismatched means no tags.
     std::vector<bool> kollesisTerminations;
+    // Per control point: tagged break (the points get a dotted rim). Display
+    // only; read when the placed fiber is built from the fresh input, so not
+    // part of the cache keys. Empty or mismatched means no tags.
+    std::vector<bool> breaks;
+    // Per control-point span: the span descriptor carries the gap span tag
+    // (drawn as a dotted amber run). Display only, same rules; empty or
+    // mismatched means no gaps.
+    std::vector<bool> gapSegments;
+    // Per control-point span: the damaged span tag (alternating amber and
+    // red dashes). Display only, same rules.
+    std::vector<bool> damagedSegments;
     // Raw directed refs; the layout dedupes reciprocal pairs.
     std::vector<InputLink> links;
 };
@@ -103,9 +114,22 @@ struct LayoutParams {
     double minGapVx = 4167.0;
 };
 
-// One styling run of a fiber, in voxels with +y = +z.
+// One styling run of a fiber, in voxels with +y = +z. Exactly one of the
+// three styles applies: gap (both endpoint controls tagged break) outranks
+// traced / interpolated. The points carry the layout's own geometry, with the
+// one-sample overlap past each bounding control that lets neighbouring runs
+// join visually; the gap heat map seeds from these, so they are the same
+// whether or not any break is tagged. Drawing a gap exactly is the drawer's
+// job: see displayRunPoints.
 struct Run {
     bool traced = true;
+    bool gap = false;
+    // The damaged span tag; never together with gap (the gap wins).
+    bool damaged = false;
+    // The controls (indices into PlacedFiber::controlPoints) bounding the
+    // run's spans; -1 when the run is the whole fiber without span flags.
+    int firstControl = -1;
+    int lastControl = -1;
     std::vector<QPointF> points;
 };
 
@@ -121,7 +145,17 @@ struct PlacedFiber {
     // Parallel to controlPoints: the point carries the kollesis_termination
     // tag (copied from the input; always sized to controlPoints).
     std::vector<bool> kollesisTerminations;
+    // Parallel to controlPoints: the point carries the break tag (same rule).
+    std::vector<bool> breaks;
 };
+
+// The points to DRAW for fiber.runs[runIndex]: the run's own points, except
+// that a gap or damaged run, and any run next to one, ends exactly at the
+// shared control's position on the curve instead of one sample past it, so
+// the dashes cover their span and nothing else and no solid stroke runs on
+// underneath them. Runs away from every gap or damaged span are unchanged.
+[[nodiscard]] std::vector<QPointF> displayRunPoints(const PlacedFiber& fiber,
+                                                    std::size_t runIndex);
 
 struct PlacedLink {
     uint64_t fiberA = 0;

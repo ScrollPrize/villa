@@ -329,6 +329,10 @@ QString spanAlignmentMetricText(
     QString firstLine(QChar(metric.modeMarker));
     if (!value.isEmpty())
         firstLine += QStringLiteral(" ") + value;
+    if (metric.gap)
+        firstLine += QObject::tr(" gap");
+    else if (metric.damaged)
+        firstLine += QObject::tr(" damaged");
     if (!metric.message.empty())
         return firstLine + QStringLiteral("\n") + QString::fromStdString(metric.message);
     return firstLine;
@@ -485,6 +489,8 @@ public:
         QColor color;
         // Edge colour; unset draws the fill's darker shade (the default look).
         std::optional<QColor> edge;
+        // Dotted edge (the break ring).
+        bool dottedEdge = false;
         qreal radius = 4.5;
         // Adjacent-winding link (or adjacent candidate): drawn as a triangle.
         bool triangle = false;
@@ -494,10 +500,15 @@ public:
 
     std::function<void(double, QPoint)> controlContextRequested;
 
-    void setLineData(size_t linePointCount, std::vector<ControlDot> dots)
+    void setLineData(size_t linePointCount,
+                     std::vector<ControlDot> dots,
+                     std::vector<std::pair<double, double>> gapLineRanges,
+                     std::vector<std::pair<double, double>> damagedLineRanges)
     {
         _linePointCount = linePointCount;
         _dots = std::move(dots);
+        _gapLineRanges = std::move(gapLineRanges);
+        _damagedLineRanges = std::move(damagedLineRanges);
         update();
     }
 
@@ -529,9 +540,53 @@ protected:
         }
         painter.setRenderHint(QPainter::Antialiasing, true);
         const qreal midY = height() * 0.5;
-        painter.setPen(QPen(QColor(190, 190, 190), 2.0));
-        painter.drawLine(QPointF(kMarginPx, midY),
-                         QPointF(width() - kMarginPx, midY));
+        // The baseline, with each gap span replaced (not overdrawn) by the
+        // dotted amber of the cut views and each damaged span by their
+        // alternating amber and red dashes: no solid pixels remain inside.
+        struct Piece {
+            qreal x0;
+            qreal x1;
+            bool damaged;
+            bool operator<(const Piece& other) const { return x0 < other.x0; }
+        };
+        std::vector<Piece> pieces;
+        for (const auto& [first, second] : _gapLineRanges) {
+            if (std::isfinite(first) && std::isfinite(second) && second > first) {
+                pieces.push_back({xForLinePosition(first), xForLinePosition(second), false});
+            }
+        }
+        for (const auto& [first, second] : _damagedLineRanges) {
+            if (std::isfinite(first) && std::isfinite(second) && second > first) {
+                pieces.push_back({xForLinePosition(first), xForLinePosition(second), true});
+            }
+        }
+        std::sort(pieces.begin(), pieces.end());
+        const QPen basePen(QColor(190, 190, 190), 2.0);
+        QPen gapPen(vc3d::line_annotation::generatedGapLineColor(255), 2.0);
+        gapPen.setCapStyle(Qt::FlatCap);
+        gapPen.setStyle(Qt::CustomDashLine);
+        gapPen.setDashPattern({vc3d::line_annotation::kSpanDashOn,
+                               vc3d::line_annotation::kSpanDashOff});
+        QPen damagedPen = gapPen;
+        damagedPen.setColor(vc3d::line_annotation::generatedDamagedColor(255));
+        qreal cursorX = kMarginPx;
+        const qreal lineEndX = width() - kMarginPx;
+        for (const auto& piece : pieces) {
+            if (piece.x0 > cursorX) {
+                painter.setPen(basePen);
+                painter.drawLine(QPointF(cursorX, midY), QPointF(piece.x0, midY));
+            }
+            const qreal from = std::max(cursorX, piece.x0);
+            if (piece.x1 > from) {
+                painter.setPen(piece.damaged ? damagedPen : gapPen);
+                painter.drawLine(QPointF(from, midY), QPointF(piece.x1, midY));
+            }
+            cursorX = std::max(cursorX, piece.x1);
+        }
+        if (lineEndX > cursorX) {
+            painter.setPen(basePen);
+            painter.drawLine(QPointF(cursorX, midY), QPointF(lineEndX, midY));
+        }
 
         if (std::isfinite(_currentPosition)) {
             painter.setPen(QPen(_currentColor, 2.0));
@@ -544,8 +599,11 @@ protected:
                 continue;
             }
             const qreal x = xForLinePosition(dot.linePosition);
-            painter.setPen(dot.edge ? QPen(*dot.edge, 1.5)
-                                    : QPen(dot.color.darker(150), 1.0));
+            QPen edgePen = dot.edge ? QPen(*dot.edge, 1.5) : QPen(dot.color.darker(150), 1.0);
+            if (dot.dottedEdge) {
+                edgePen.setStyle(Qt::DotLine);
+            }
+            painter.setPen(edgePen);
             painter.setBrush(dot.color);
             if (dot.triangle) {
                 painter.drawPath(vc3d::line_annotation::generatedTriangleMarkerPath(
@@ -598,6 +656,8 @@ private:
 
     size_t _linePointCount = 0;
     std::vector<ControlDot> _dots;
+    std::vector<std::pair<double, double>> _gapLineRanges;
+    std::vector<std::pair<double, double>> _damagedLineRanges;
     double _currentPosition = std::numeric_limits<double>::quiet_NaN();
     QColor _currentColor{0, 245, 255};
 };
@@ -2384,8 +2444,6 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     const QPointF& scenePoint,
     const QPoint& globalPos,
     const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState,
-    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitCandidateState,
-    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitAndLinkCandidateState,
     const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState,
     const vc3d::line_annotation::GeneratedLinkCandidateMenuState& newLinkedToCandidateState,
     std::function<QString(uint64_t)> fiberDisplayNameForId)
@@ -2401,6 +2459,13 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     } else {
         for (size_t i = 0; i < _stripViewers.size(); ++i) {
             if (viewer == _stripViewers[i]) {
+                // While this strip still shows the held frame (its
+                // re-optimized frame is not displayed yet), the click would be
+                // resolved against geometry that is not on screen: no menu
+                // until the swap lands.
+                if (i < _stripOverlaySwapPending.size() && _stripOverlaySwapPending[i]) {
+                    return GeneratedControlPointContextResult::None;
+                }
                 linePosition = linePositionFromStripScene(viewer, scenePoint);
                 break;
             }
@@ -2458,9 +2523,6 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     options.linkWithCandidateLabel = linkCandidateState.label;
     options.mergeWithCandidateEnabled = mergeCandidateState.enabled;
     options.mergeWithCandidateLabel = mergeCandidateState.label;
-    options.splitFromCandidateEnabled = splitCandidateState.enabled;
-    options.splitFromCandidateLabel = splitCandidateState.label;
-    options.splitFromCandidateAndLinkLabel = splitAndLinkCandidateState.label;
     options.newLinkedToCandidateLabel = newLinkedToCandidateState.label;
     options.fiberDisplayNameForId = std::move(fiberDisplayNameForId);
     options.branchLinkDirection = branchLinkDirectionForViewer(viewer, linePosition);
@@ -2503,23 +2565,14 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
                                                               controlPointIndex,
                                                               volumePoint);
     };
-    options.designateSplitCandidate = [this, surfaceName](size_t controlPointIndex,
-                                                          cv::Vec3f volumePoint) {
-        emit generatedControlPointSplitCandidateRequested(surfaceName,
-                                                          controlPointIndex,
-                                                          volumePoint);
+    options.splitSpan = [this, surfaceName](size_t first, size_t second, bool linkHalves) {
+        emit generatedSpanSplitRequested(surfaceName, first, second, linkHalves);
     };
-    options.splitFromCandidate = [this, surfaceName](size_t controlPointIndex,
-                                                     cv::Vec3f volumePoint) {
-        emit generatedControlPointSplitFromCandidateRequested(surfaceName,
-                                                              controlPointIndex,
-                                                              volumePoint);
+    options.setSpanGap = [this, surfaceName](size_t first, size_t second, bool enabled) {
+        emit generatedSpanGapChangeRequested(surfaceName, first, second, enabled);
     };
-    options.splitFromCandidateAndLink = [this, surfaceName](size_t controlPointIndex,
-                                                            cv::Vec3f volumePoint) {
-        emit generatedControlPointSplitAndLinkFromCandidateRequested(surfaceName,
-                                                                     controlPointIndex,
-                                                                     volumePoint);
+    options.setSpanDamaged = [this, surfaceName](size_t first, size_t second, bool enabled) {
+        emit generatedSpanDamagedChangeRequested(surfaceName, first, second, enabled);
     };
     options.openNearbyAnnotation = [this](uint64_t fiberId, cv::Vec3f volumePoint) {
         emit generatedNearbyAnnotationOpenRequested(fiberId, volumePoint);
@@ -2556,6 +2609,9 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
         emit generatedControlPointKollesisTerminationChangeRequested(surfaceName,
                                                                      controlPointIndex,
                                                                      enabled);
+    };
+    options.setBreak = [this, surfaceName](size_t controlPointIndex, bool enabled) {
+        emit generatedControlPointBreakChangeRequested(surfaceName, controlPointIndex, enabled);
     };
     return vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
 }
@@ -3572,6 +3628,13 @@ bool LineAnnotationDialog::controlPointPlacementAllowedAt(double linePosition) c
             _generatedViews.controlPoints, linePosition)) {
         return false;
     }
+    // Nothing goes inside a gap span (two consecutive break points) either:
+    // unflag a break first.
+    if (vc3d::line_annotation::generatedLinePositionInsideGap(
+            vc3d::line_annotation::generatedGapLineRanges(_generatedViews.controlPoints),
+            linePosition)) {
+        return false;
+    }
     std::vector<double> controlLinePositions;
     controlLinePositions.reserve(_generatedViews.controlPoints.size());
     for (const auto& control : _generatedViews.controlPoints) {
@@ -3588,7 +3651,10 @@ vc3d::line_annotation::GeneratedCurrentLineMarkerState
 LineAnnotationDialog::currentLineMarkerState() const
 {
     if (vc3d::line_annotation::generatedLinePositionBeyondKollesisTermination(
-            _generatedViews.controlPoints, _currentLinePosition)) {
+            _generatedViews.controlPoints, _currentLinePosition) ||
+        vc3d::line_annotation::generatedLinePositionInsideGap(
+            vc3d::line_annotation::generatedGapLineRanges(_generatedViews.controlPoints),
+            _currentLinePosition)) {
         return vc3d::line_annotation::GeneratedCurrentLineMarkerState::Blocked;
     }
     if (maxControlPointExtrapolationDistanceVx() <= 0) {
@@ -3931,15 +3997,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
 
     const auto markerColorForState =
         [](vc3d::line_annotation::GeneratedCurrentLineMarkerState state) {
-            switch (state) {
-            case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Allowed:
-                return QColor(40, 220, 120, 245);
-            case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Blocked:
-                return QColor(255, 70, 70, 245);
-            case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Neutral:
-            default:
-                return QColor(0, 245, 255, 245);
-            }
+            return vc3d::line_annotation::generatedCurrentLineMarkerColor(state, 245);
         };
 
     const auto ensureStripItems =
@@ -4296,12 +4354,12 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         !_fastCurrentCutOverlayItems.controlPoints ||
         !_fastCurrentCutOverlayItems.seedPoints ||
         !_fastCurrentCutOverlayItems.linkCandidatePoints ||
-        !_fastCurrentCutOverlayItems.splitCandidatePoints ||
         !_fastCurrentCutOverlayItems.branchControlPoints ||
         !_fastCurrentCutOverlayItems.pendingBranchControlPoints ||
         !_fastCurrentCutOverlayItems.sameHvBranchControlPoints ||
         !_fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints ||
         !_fastCurrentCutOverlayItems.kollesisRings ||
+        !_fastCurrentCutOverlayItems.breakRings ||
         !_fastCurrentCutOverlayItems.fiberIntersections ||
         !_fastCurrentCutOverlayItems.linkCandidateFiberIntersections ||
         std::any_of(_fastCurrentCutOverlayItems.branchLinkFiberIntersections.begin(),
@@ -4346,13 +4404,6 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.linkCandidatePoints->setBrush(linkCandidateBrush);
         _fastCurrentCutOverlayItems.linkCandidatePoints->setZValue(163.0);
 
-        QPen splitCandidatePen(QColor(235, 60, 60, 245));
-        splitCandidatePen.setWidthF(2.0);
-        QBrush splitCandidateBrush(QColor(235, 60, 60, 175));
-        _fastCurrentCutOverlayItems.splitCandidatePoints = new QGraphicsPathItem();
-        _fastCurrentCutOverlayItems.splitCandidatePoints->setPen(splitCandidatePen);
-        _fastCurrentCutOverlayItems.splitCandidatePoints->setBrush(splitCandidateBrush);
-        _fastCurrentCutOverlayItems.splitCandidatePoints->setZValue(163.5);
 
         QPen branchControlPen(QColor(210, 95, 255, 245));
         branchControlPen.setWidthF(2.0);
@@ -4398,6 +4449,15 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.kollesisRings->setPen(kollesisRingPen);
         _fastCurrentCutOverlayItems.kollesisRings->setBrush(Qt::NoBrush);
         _fastCurrentCutOverlayItems.kollesisRings->setZValue(162.75);
+
+        // The break ring: dotted amber, layered like the kollesis ring.
+        QPen breakRingPen(vc3d::line_annotation::generatedBreakColor(245));
+        breakRingPen.setWidthF(2.5);
+        breakRingPen.setStyle(Qt::DotLine);
+        _fastCurrentCutOverlayItems.breakRings = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.breakRings->setPen(breakRingPen);
+        _fastCurrentCutOverlayItems.breakRings->setBrush(Qt::NoBrush);
+        _fastCurrentCutOverlayItems.breakRings->setZValue(162.75);
 
         QPen fiberIntersectionPen(QColor(255, 245, 75, 245));
         fiberIntersectionPen.setWidthF(1.25);
@@ -4462,12 +4522,12 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             _fastCurrentCutOverlayItems.controlPoints,
             _fastCurrentCutOverlayItems.seedPoints,
             _fastCurrentCutOverlayItems.linkCandidatePoints,
-            _fastCurrentCutOverlayItems.splitCandidatePoints,
             _fastCurrentCutOverlayItems.branchControlPoints,
             _fastCurrentCutOverlayItems.pendingBranchControlPoints,
             _fastCurrentCutOverlayItems.sameHvBranchControlPoints,
             _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints,
             _fastCurrentCutOverlayItems.kollesisRings,
+            _fastCurrentCutOverlayItems.breakRings,
             _fastCurrentCutOverlayItems.fiberIntersections,
             _fastCurrentCutOverlayItems.linkCandidateFiberIntersections};
         for (auto* item : _fastCurrentCutOverlayItems.branchLinkFiberIntersections) {
@@ -4503,16 +4563,31 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         centerPath.addEllipse(centerScenePoint, 2.5, 2.5);
     }
     _fastCurrentCutOverlayItems.centerPoint->setPath(centerPath);
+    // The marker takes the blocked colour where nothing may be placed: inside
+    // a gap span or beyond a kollesis termination, judged on the DISPLAYED
+    // controls and position (a pending swap shows the held views), like the
+    // strip marker and the overview bar do from the dialog's state.
+    {
+        const auto centerState = vc3d::line_annotation::generatedBlockedLineMarkerState(
+            cutViews.controlPoints,
+            vc3d::line_annotation::generatedGapLineRanges(cutViews.controlPoints),
+            cutPosition);
+        QPen centerPen(vc3d::line_annotation::generatedCurrentLineMarkerColor(centerState, 245));
+        centerPen.setWidthF(1.5);
+        _fastCurrentCutOverlayItems.centerPoint->setPen(centerPen);
+        _fastCurrentCutOverlayItems.centerPoint->setBrush(
+            QBrush(vc3d::line_annotation::generatedCurrentLineMarkerColor(centerState, 210)));
+    }
 
     QPainterPath controlPath;
     QPainterPath seedPath;
     QPainterPath linkCandidatePath;
-    QPainterPath splitCandidatePath;
     QPainterPath branchControlPath;
     QPainterPath pendingBranchControlPath;
     QPainterPath sameHvBranchControlPath;
     QPainterPath sameHvPendingBranchControlPath;
     QPainterPath kollesisRingPath;
+    QPainterPath breakRingPath;
     const double lineRadius =
         std::max(0.5, (_viewerManager ? _viewerManager->zScrollSensitivity() : 1.0) * 0.5);
     const double lower = cutPosition - lineRadius;
@@ -4553,11 +4628,6 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         // replaces the plain fill when the point is unlinked.
         const bool linked = control.hasPendingLinks || control.hasBranches;
         const double baseRadius = linked ? 12.0 : (control.isSeed ? 11.0 : 10.0);
-        if (control.isSplitCandidate) {
-            splitCandidatePath.addEllipse(scenePoint, control.isSeed ? 11.0 : 10.0,
-                                          control.isSeed ? 11.0 : 10.0);
-            continue;
-        }
         if (control.isLinkCandidate) {
             const double candidateRadius = control.isSeed ? 11.0 : 10.0;
             if (control.isAdjacentLinkCandidate) {
@@ -4570,6 +4640,13 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         }
         if (control.isKollesisTermination) {
             kollesisRingPath.addEllipse(scenePoint, baseRadius + 2.0, baseRadius + 2.0);
+            if (!linked) {
+                continue;
+            }
+        } else if (control.isBreak) {
+            // Same ring geometry in the dotted amber pen (a point with both
+            // tags, from an edited file, draws as the kollesis termination).
+            breakRingPath.addEllipse(scenePoint, baseRadius + 2.0, baseRadius + 2.0);
             if (!linked) {
                 continue;
             }
@@ -4598,13 +4675,13 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     _fastCurrentCutOverlayItems.controlPoints->setPath(controlPath);
     _fastCurrentCutOverlayItems.seedPoints->setPath(seedPath);
     _fastCurrentCutOverlayItems.linkCandidatePoints->setPath(linkCandidatePath);
-    _fastCurrentCutOverlayItems.splitCandidatePoints->setPath(splitCandidatePath);
     _fastCurrentCutOverlayItems.branchControlPoints->setPath(branchControlPath);
     _fastCurrentCutOverlayItems.pendingBranchControlPoints->setPath(pendingBranchControlPath);
     _fastCurrentCutOverlayItems.sameHvBranchControlPoints->setPath(sameHvBranchControlPath);
     _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setPath(
         sameHvPendingBranchControlPath);
     _fastCurrentCutOverlayItems.kollesisRings->setPath(kollesisRingPath);
+    _fastCurrentCutOverlayItems.breakRings->setPath(breakRingPath);
 
     // Parallax ghosts: the nearest control point behind and ahead of the cursor
     // within the visibility distance slide in horizontally from the side they
@@ -5213,9 +5290,7 @@ void LineAnnotationDialog::updateOverviewBar()
         LineAnnotationOverviewBar::ControlDot dot;
         dot.linePosition = control.linePosition;
         // Same state palette as the cut-view overlays.
-        if (control.isSplitCandidate) {
-            dot.color = QColor(235, 60, 60);
-        } else if (control.isLinkCandidate) {
+        if (control.isLinkCandidate) {
             dot.color = QColor(60, 235, 120);
         } else if (control.hasPendingLinks) {
             dot.color = control.hasSameHvPendingLinks ? QColor(255, 190, 120)
@@ -5227,11 +5302,9 @@ void LineAnnotationDialog::updateOverviewBar()
             dot.color = QColor(255, 230, 0);
         }
         dot.radius = control.isSeed ? 6.0 : 4.5;
-        dot.triangle = !control.isSplitCandidate &&
-                       (control.isAdjacentLinkCandidate ||
-                        (control.hasAdjacentLinks && !control.isLinkCandidate));
-        if (control.isKollesisTermination && !control.isSplitCandidate &&
-            !control.isLinkCandidate) {
+        dot.triangle = control.isAdjacentLinkCandidate ||
+                       (control.hasAdjacentLinks && !control.isLinkCandidate);
+        if (control.isKollesisTermination && !control.isLinkCandidate) {
             // As in the cut views: a hollow yellow ring when unlinked, the
             // link fill inside a yellow ring when linked.
             if (!control.hasPendingLinks && !control.hasBranches) {
@@ -5239,10 +5312,21 @@ void LineAnnotationDialog::updateOverviewBar()
             }
             dot.edge = vc3d::line_annotation::generatedKollesisTerminationColor(255);
             dot.radius += 1.0;
+        } else if (control.isBreak && !control.isLinkCandidate) {
+            // The break ring: dotted amber, hollow when unlinked.
+            if (!control.hasPendingLinks && !control.hasBranches) {
+                dot.color = Qt::transparent;
+            }
+            dot.edge = vc3d::line_annotation::generatedBreakColor(255);
+            dot.dottedEdge = true;
+            dot.radius += 1.0;
         }
         dots.push_back(dot);
     }
-    bar->setLineData(_generatedViews.linePoints.size(), std::move(dots));
+    bar->setLineData(_generatedViews.linePoints.size(),
+                     std::move(dots),
+                     vc3d::line_annotation::generatedGapLineRanges(_generatedViews.controlPoints),
+                     vc3d::line_annotation::generatedDamagedLineRanges(_generatedViews.controlPoints));
 
     QColor markerColor(0, 245, 255);
     switch (currentLineMarkerState()) {

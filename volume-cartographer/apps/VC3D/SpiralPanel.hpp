@@ -76,7 +76,6 @@ private:
                           bool directory);
     void addPclItem(const QString& path, const QString& role, bool required = false);
     QJsonObject sessionRequest() const;
-    QJsonObject influenceConfig() const;
     QJsonObject sessionAdvancedConfig() const;
     QJsonObject runAdvancedConfig() const;
     void applyTrackSamplingConfig(QJsonObject& config) const;
@@ -131,7 +130,6 @@ private:
     QSpinBox* _iterations = nullptr;
     QCheckBox* _backgroundPreview = nullptr;
     QSpinBox* _previewCadence = nullptr;
-    QSpinBox* _legacyCheckpointStep = nullptr;
     QSpinBox* _renderVolumeScale = nullptr;
     // Read-only reports of what spiral-scroll.json specifies.
     QLabel* _scrollSummary = nullptr;
@@ -156,11 +154,6 @@ private:
     QDoubleSpinBox* _trackMediumWeight = nullptr;
     QDoubleSpinBox* _trackLongWeight = nullptr;
     QSpinBox* _maxTrackCrossings = nullptr;
-    QCheckBox* _influenceEnabled = nullptr;
-    QSpinBox* _influenceZ = nullptr;
-    QDoubleSpinBox* _influenceWindings = nullptr;
-    QSpinBox* _influenceThetaPct = nullptr;
-    QDoubleSpinBox* _influenceAnchorWeight = nullptr;
     SpiralConfigProfileEditor* _advancedProfiles = nullptr;
     QPlainTextEdit* _advanced = nullptr;
     VolumeSelector* _volumeSelector = nullptr;

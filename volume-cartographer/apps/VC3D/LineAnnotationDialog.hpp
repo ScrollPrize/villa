@@ -83,7 +83,6 @@ public:
         QGraphicsPathItem* controlPoints = nullptr;
         QGraphicsPathItem* seedPoints = nullptr;
         QGraphicsPathItem* linkCandidatePoints = nullptr;
-        QGraphicsPathItem* splitCandidatePoints = nullptr;
         QGraphicsPathItem* branchControlPoints = nullptr;
         QGraphicsPathItem* pendingBranchControlPoints = nullptr;
         QGraphicsPathItem* sameHvBranchControlPoints = nullptr;
@@ -92,6 +91,8 @@ public:
         // fill (link state) the point keeps; an unlinked tagged point has no
         // fill at all.
         QGraphicsPathItem* kollesisRings = nullptr;
+        // Dotted amber rings of break-tagged points, same layering rule.
+        QGraphicsPathItem* breakRings = nullptr;
         QGraphicsPathItem* fiberIntersections = nullptr;
         QGraphicsPathItem* linkCandidateFiberIntersections = nullptr;
         // One item per link state (kLinkStateCount, indexed by
@@ -144,8 +145,6 @@ public:
         const QPointF& scenePoint,
         const QPoint& globalPos,
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState = {},
-        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitCandidateState = {},
-        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitAndLinkCandidateState = {},
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState = {},
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& newLinkedToCandidateState = {},
         std::function<QString(uint64_t)> fiberDisplayNameForId = {});
@@ -238,15 +237,19 @@ signals:
     void generatedControlPointMergeWithCandidateRequested(const std::string& surfaceName,
                                                           size_t controlPointIndex,
                                                           cv::Vec3f volumePoint);
-    void generatedControlPointSplitCandidateRequested(const std::string& surfaceName,
-                                                      size_t controlPointIndex,
-                                                      cv::Vec3f volumePoint);
-    void generatedControlPointSplitFromCandidateRequested(const std::string& surfaceName,
-                                                          size_t controlPointIndex,
-                                                          cv::Vec3f volumePoint);
-    void generatedControlPointSplitAndLinkFromCandidateRequested(const std::string& surfaceName,
-                                                                 size_t controlPointIndex,
-                                                                 cv::Vec3f volumePoint);
+    // Span menu (strips): the two controls of the span in line-position order.
+    void generatedSpanSplitRequested(const std::string& surfaceName,
+                                     size_t firstControlPointIndex,
+                                     size_t secondControlPointIndex,
+                                     bool linkHalves);
+    void generatedSpanGapChangeRequested(const std::string& surfaceName,
+                                         size_t firstControlPointIndex,
+                                         size_t secondControlPointIndex,
+                                         bool enabled);
+    void generatedSpanDamagedChangeRequested(const std::string& surfaceName,
+                                             size_t firstControlPointIndex,
+                                             size_t secondControlPointIndex,
+                                             bool enabled);
     void generatedNearbyAnnotationOpenRequested(uint64_t fiberId, cv::Vec3f volumePoint);
     void generatedControlPointUnlinkRequested(const std::string& surfaceName,
                                               size_t controlPointIndex,
@@ -264,6 +267,9 @@ signals:
     void generatedControlPointKollesisTerminationChangeRequested(const std::string& surfaceName,
                                                                  size_t controlPointIndex,
                                                                  bool enabled);
+    void generatedControlPointBreakChangeRequested(const std::string& surfaceName,
+                                                   size_t controlPointIndex,
+                                                   bool enabled);
     void generatedPredSnapPointRequested(const std::string& surfaceName,
                                          cv::Vec3f volumePoint);
     void generatedSideStripIntersectionQueryRequested(const std::string& surfaceName);
