@@ -1840,6 +1840,23 @@ def test_width_gap_defaults_and_three_way_merge():
     assert not merge_fibers(base, local, remote)['ok']
 
 
+def test_cp_directions_merge_validate_and_preserve_sign():
+    base = make_v3_fiber(BASE_CPS)
+    local, remote = copy.deepcopy(base), copy.deepcopy(base)
+    local['control_points'][0]['direction'] = [1, 0, 0]
+    remote['control_points'][0]['direction'] = [1, 0, 0]
+    remote['width'] = 20
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['control_points'][0]['direction'] == [1, 0, 0]
+    assert result['merged']['width'] == 20
+    remote['control_points'][0]['direction'] = [-1, 0, 0]
+    assert not merge_fibers(base, local, remote)['ok']
+    for invalid in ([0, 0, 0], [1, 2], [float('nan'), 0, 1]):
+        local['control_points'][0]['direction'] = invalid
+        assert not fiber_merge.is_fiber_doc(local)
+
+
 def test_v3_tagging_and_refitting_the_same_final_span_is_a_manual_conflict():
     base = make_v3_fiber(BASE_CPS)
     local = copy.deepcopy(base)

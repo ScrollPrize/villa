@@ -28,6 +28,47 @@
 #include <string>
 #include <vector>
 
+TEST_CASE("Clearing CP corrections leaves other controls and span metadata intact")
+{
+    using namespace vc3d::line_annotation;
+    std::vector<LineControlPoint> controls(3);
+    for (auto& cp : controls) {
+        cp.direction = cv::Vec3d(1,0,0);
+        cp.displayNormal = cv::Vec3d(0,1,0);
+        cp.displayNormalSource = "manual";
+        cp.segmentToNext.emplace();
+        cp.segmentToNext->interpGoal = SegmentInterpolationGoal::Trace;
+    }
+    clearControlPointCorrections(controls[1]);
+    CHECK_FALSE(controls[1].direction);
+    CHECK_FALSE(controls[1].displayNormal);
+    CHECK(controls[1].displayNormalSource == "unknown");
+    CHECK(controls[0].direction.has_value());
+    CHECK(controls[2].displayNormal.has_value());
+    CHECK(controls[1].segmentToNext->interpGoal == SegmentInterpolationGoal::Trace);
+    for (auto& cp : controls) clearControlPointCorrections(cp);
+    for (const auto& cp : controls) {
+        CHECK_FALSE(cp.direction);
+        CHECK_FALSE(cp.displayNormal);
+        CHECK(cp.segmentToNext->interpGoal == SegmentInterpolationGoal::Trace);
+    }
+}
+
+TEST_CASE("Direction handles use a valid local frame even on two-column strips")
+{
+    cv::Mat_<cv::Vec3f> points(7,2);
+    for (int y=0;y<7;++y)
+        for (int x=0;x<2;++x) points(y,x)={float(x*10),float(y-3),0};
+    QuadSurface surface(points,{1,1});
+    const auto frame=vc3d::line_annotation::generatedStripFrame(
+        &surface,surface.gridToSurface({0.5,3}));
+    REQUIRE(frame);
+    CHECK(cv::norm(frame->along-cv::Vec3d(1,0,0))<1e-6);
+    CHECK(cv::norm(frame->across-cv::Vec3d(0,1,0))<1e-6);
+    CHECK(cv::norm(frame->normal-cv::Vec3d(0,0,1))<1e-6);
+    CHECK_FALSE(vc3d::line_annotation::generatedStripFrame(nullptr,{0,0}));
+}
+
 TEST_CASE("Arclength Hermite preserves samples and has continuous analytic tangents")
 {
     const std::vector<cv::Vec3d> p{{0,0,0},{10,0,0},{10,20,0},{20,30,0}};
@@ -181,6 +222,20 @@ TEST_CASE("New control points inherit the existing interpolated display correcti
         }
         auto inserted = collapseControlPointsAtClick(controls, {}, position, displayVectorAt(points, position));
         inserted.controlPoints[inserted.replacementIndex].displayNormal = inherited;
+        auto& created = inserted.controlPoints[inserted.replacementIndex];
+        created.displayNormalSource = "interpolated";
+        created.direction = editControlDirection({1,0,0}, {0,0,1}, {1,0.2,0});
+        REQUIRE(created.direction);
+        StoredControlPoint stored(created.volumePoint);
+        stored.displayNormal = created.displayNormal;
+        stored.displayNormalSource = created.displayNormalSource;
+        stored.direction = created.direction;
+        const auto restored = storedControlPointFromJson(storedControlPointToJson(stored), 3);
+        REQUIRE(restored.direction);
+        REQUIRE(restored.displayNormal);
+        CHECK(cv::norm(*restored.direction - *created.direction) < 1e-9);
+        CHECK(cv::norm(*restored.displayNormal - *inherited) < 1e-9);
+        CHECK(restored.displayNormalSource == "interpolated");
         std::vector<double> newPositions;
         std::vector<std::optional<cv::Vec3d>> newNormals;
         for (const auto& cp : inserted.controlPoints) {
@@ -611,6 +666,83 @@ TEST_CASE("Display normal override rotates both ribbons without changing model n
     CHECK(cv::norm(corrected.lineUpVectors.front() - cv::Vec3f(0, 1, 0)) < 1e-5);
     const auto after = vc::lasagna::buildLineViewSurfaces(model);
     CHECK(cv::norm(*baseline.lineSurface->rawPointsPtr(), *after.lineSurface->rawPointsPtr()) == 0);
+}
+
+TEST_CASE("CP direction editing preserves the unedited component and round trips")
+{
+    using namespace vc::fiber_tracer;
+    const auto axis=*displayUnit({1,0,0.5});
+    const auto edited=editControlDirection(axis,{0,0,1},{1,1,99});
+    REQUIRE(edited);
+    CHECK((*edited)[2] == doctest::Approx(axis[2]));
+    CHECK((*edited)[0] == doctest::Approx((*edited)[1]));
+    CHECK(cv::norm(*edited) == doctest::Approx(1));
+    const auto reversed=editControlDirection(-axis,{0,0,1},{-1,-1,0});
+    REQUIRE(reversed);
+    CHECK(cv::norm(*reversed+*edited)<1e-9);
+    const auto oppositeDrag=editControlDirection(axis,{0,0,1},{-1,-1,0},cv::Vec3d(1,0,0));
+    REQUIRE(oppositeDrag);
+    CHECK(cv::norm(*oppositeDrag-*edited)<1e-9);
+    CHECK_FALSE(editControlDirection(axis,{0,0,1},{0,0,1}));
+    vc3d::line_annotation::StoredControlPoint cp;
+    cp.direction=*edited;
+    auto json=vc3d::line_annotation::storedControlPointToJson(cp);
+    const auto loaded=vc3d::line_annotation::storedControlPointFromJson(json,3);
+    REQUIRE(loaded.direction);
+    CHECK(cv::norm(*loaded.direction-*edited)<1e-9);
+    const auto reversedControls=vc3d::line_annotation::reversedStoredControlPoints({cp});
+    REQUIRE(reversedControls.front().direction);
+    CHECK(cv::norm(*reversedControls.front().direction+*edited)<1e-9);
+    json["direction"]={0,0,0};
+    CHECK_THROWS(vc3d::line_annotation::storedControlPointFromJson(json,3));
+}
+
+TEST_CASE("Spline uses signed annotated interior tangents")
+{
+    vc::lasagna::LineSplineRequest request;
+    request.controlPoints={{0,0,0},{10,0,0},{20,0,0}};
+    request.sampleSpacing=0.01;
+    request.controlDirections={std::nullopt,cv::Vec3d(1,0.5,0),std::nullopt};
+    const auto result=vc::lasagna::interpolateLineControlPoints(request);
+    const int k=result.controlPointIndices[1];
+    const auto tangent=*vc::fiber_tracer::displayUnit(result.points[k+1]-result.points[k-1]);
+    CHECK(tangent.dot(*vc::fiber_tracer::displayUnit({1,0.5,0}))>0.999);
+    request.controlDirections[1]=cv::Vec3d(-1,-0.5,0);
+    std::reverse(request.controlPoints.begin(),request.controlPoints.end());
+    const auto reversed=vc::lasagna::interpolateLineControlPoints(request);
+    const int j=reversed.controlPointIndices[1];
+    CHECK(vc::fiber_tracer::displayUnit(reversed.points[j+1]-reversed.points[j-1])->dot(-tangent)>0.999);
+}
+
+TEST_CASE("Fiber mode forwards CP axes into spline runs and Lasagna constraints")
+{
+    FiberModeNormalSampler sampler;
+    for (const auto goal : {vc3d::line_annotation::SegmentInterpolationGoal::Cspline,
+                           vc3d::line_annotation::SegmentInterpolationGoal::Lasagna}) {
+        vc3d::line_annotation::FiberModeOptimizationRequest request;
+        request.baseNormalSampler=&sampler;
+        request.globalMode=vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+        for (int i=0;i<=20;++i) request.linePointsBase.push_back({double(i),0,0});
+        request.controlPoints={{0,{0,0,0},true,0},{10,{10,0,0},false,10},{20,{20,0,0},false,20}};
+        request.controlPoints[1].direction=cv::Vec3d(1,0.2,0);
+        for (size_t i=0;i<2;++i) {
+            request.controlPoints[i].segmentToNext.emplace();
+            request.controlPoints[i].segmentToNext->interpGoal=goal;
+        }
+        request.lasagnaConfig.segmentLength=0.5;
+        request.lasagnaConfig.maxIterations=20;
+        request.lasagnaConfig.printSolverProgress=false;
+        request.extrapolationDistanceBaseVoxels=0;
+        request.retainOpenTails=false;
+        const auto result=vc3d::line_annotation::optimizeFiberWithNativeFallback(request);
+        REQUIRE(result.controlPoints[1].direction);
+        const int k=result.controlPoints[1].optimizedIndex;
+        REQUIRE(k>0);
+        REQUIRE(k+1<int(result.optimization.line.points.size()));
+        const auto direction=*vc::fiber_tracer::displayUnit(
+            result.optimization.line.points[k+1].position-result.optimization.line.points[k-1].position);
+        CHECK(direction.dot(*vc::fiber_tracer::displayUnit({1,0.2,0}))>0.98);
+    }
 }
 
 TEST_CASE("Display normal axes choose the short rotation for either saved sign")

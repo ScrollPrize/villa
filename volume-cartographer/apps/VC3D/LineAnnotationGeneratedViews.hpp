@@ -2,6 +2,7 @@
 
 #include "vc/lasagna/LineViewBuilder.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core/types.hpp>
 
@@ -30,6 +31,31 @@ class QuadSurface;
 class QWidget;
 
 namespace vc3d::line_annotation {
+
+struct GeneratedStripFrame {
+    cv::Vec3d along, across, normal;
+};
+inline std::optional<GeneratedStripFrame> generatedStripFrame(QuadSurface* surface,
+                                                            const cv::Vec2d& uv)
+{
+    if (!surface || !surface->rawPointsPtr() || surface->rawPointsPtr()->empty())
+        return std::nullopt;
+    const cv::Vec3f ptr{float(uv[0]*surface->scale()[0]),
+                       float(uv[1]*surface->scale()[1]),0};
+    const auto across=vc::fiber_tracer::displayUnit(cv::Vec3d(
+        surface->coord(ptr,{0,1,0})-surface->coord(ptr,{0,-1,0})));
+    const double col=surface->surfaceToGrid(uv)[0];
+    const double row=surface->rawPointsPtr()->rows/2;
+    const auto left=surface->gridToSurface({std::max(0.0,col-0.5),row});
+    const auto right=surface->gridToSurface({
+        std::min(double(surface->rawPointsPtr()->cols-1),col+0.5),row});
+    const auto along=vc::fiber_tracer::displayUnit(cv::Vec3d(
+        surface->sampleAtSurface(right).volume-surface->sampleAtSurface(left).volume));
+    const auto normal=across && along ?
+        vc::fiber_tracer::displayUnit(along->cross(*across)) : std::nullopt;
+    if (!normal) return std::nullopt;
+    return GeneratedStripFrame{across->cross(*normal),*across,*normal};
+}
 
 enum class GeneratedControlPointContextResult {
     None,
@@ -82,6 +108,7 @@ struct GeneratedOverlay {
         char interpolationModeMarker = 'L';
         std::vector<uint64_t> branchIds;
         std::vector<BranchLink> branchLinks;
+        std::optional<cv::Vec3d> direction;
     };
 
     struct PredSnapMarker {
@@ -1620,6 +1647,7 @@ struct GeneratedControlPointContextMenuOptions {
     // Fiber file stem for menu labels, resolved when the menu opens.
     std::function<QString(uint64_t)> fiberDisplayNameForId;
     std::function<void(double, cv::Vec3f)> deleteControlPoint;
+    std::function<void(size_t)> clearControlCorrections;
     // (clicked volume point, link direction): start a new fiber seeded at the
     // click whose seed control point is linked to the designated candidate.
     std::function<void(cv::Vec3f, cv::Vec3f)> newLineAnnotationLinkedToCandidate;

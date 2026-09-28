@@ -1,6 +1,23 @@
 # Changelog
 
+## 2026-09-27
+
+- The workspace tab bar now shows the project name rather than the current
+  volume filename, with the project path as its tooltip.
+
+- Split correction reset into a selected-CP action at the bottom of the context
+  menu and a whole-fiber action in the annotation window menu.
+
 ## 2026-09-24
+
+- Added persisted CP direction axes, Shift-drag editing from either strip,
+  cross-section orientation, trace/Lasagna constraints and interior spline
+  tangents, with three-way sync conflict handling.
+  Added persistent strip direction markers and a whole-fiber direction/normal
+  correction reset in the Ctrl-right-click menu.
+  Directions are signed by fiber order; only explicit annotations fix native
+  first steps and fused endpoint headings. Existing direction hints retain
+  prediction selection. Reversal negates annotations; markers are 80 pixels.
 
 - Unified corrections with ordinary normal-input alignment and strip construction;
   shared the regular line tangent and interpolated targets in a transported frame

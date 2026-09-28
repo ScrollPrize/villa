@@ -220,10 +220,12 @@ def is_fiber_doc(doc):
     else:
         for index, cp in enumerate(control_points):
             if (not isinstance(cp, dict) or
-                    not set(cp) <= {'position', 'segment_to_next', 'tags', 'display_normal', 'display_normal_source'} or
+                    not set(cp) <= {'position', 'segment_to_next', 'tags', 'display_normal', 'display_normal_source', 'direction'} or
                     not _finite_point(cp.get('position'))):
                 return False
             if 'display_normal' in cp and _normalized(cp['display_normal']) is None:
+                return False
+            if 'direction' in cp and _normalized(cp['direction']) is None:
                 return False
             if 'display_normal_source' in cp and (
                     'display_normal' not in cp or cp['display_normal_source'] not in
@@ -1057,6 +1059,29 @@ def _merge_display_annotations(base, local, remote, merged):
                     pos_eq(_cp_position(p), _cp_position(cp)) for p in merged['control_points']):
                 raise ValueError('display normal edited on a removed or moved CP')
 
+    def direction_at(doc, cp):
+        for p in doc['control_points']:
+            if pos_eq(_cp_position(p), _cp_position(cp)) and isinstance(p, dict):
+                v = _normalized(p.get('direction'))
+                if v is not None:
+                    return v
+        return None
+
+    for cp in merged['control_points']:
+        if not isinstance(cp, dict):
+            continue
+        direction = choose(*(direction_at(doc, cp) for doc in (base, local, remote)),
+                           'CP directions')
+        if direction is None:
+            cp.pop('direction', None)
+        else:
+            cp['direction'] = direction
+    for doc in (local, remote):
+        for cp in doc['control_points']:
+            if direction_at(doc, cp) != direction_at(base, cp) and not any(
+                    pos_eq(_cp_position(p), _cp_position(cp)) for p in merged['control_points']):
+                raise ValueError('direction edited on a removed or moved CP')
+
 
 def _without_display_normals(doc):
     doc = copy.deepcopy(doc)
@@ -1064,6 +1089,7 @@ def _without_display_normals(doc):
         if isinstance(cp, dict):
             cp.pop('display_normal', None)
             cp.pop('display_normal_source', None)
+            cp.pop('direction', None)
     return doc
 
 
@@ -1282,6 +1308,25 @@ def merge_fibers(base, local, remote):
     merged['line_points'] = copy.deepcopy(carrier['line_points'])
     try:
         _merge_display_annotations(base, local, remote, merged)
+        def same_direction(a, b):
+            if a is None or b is None:
+                return a is b
+            a, b = _normalized(a), _normalized(b)
+            return a is not None and b is not None and sum(x*y for x, y in zip(a, b)) > 1-1e-12
+
+        def directions_match(doc):
+            for cp in merged['control_points']:
+                if not isinstance(cp, dict):
+                    continue
+                match = next((p for p in doc['control_points']
+                              if pos_eq(_cp_position(p), _cp_position(cp))), None)
+                if not same_direction(cp.get('direction'),
+                                      match.get('direction') if isinstance(match, dict) else None):
+                    return False
+            return True
+
+        if not (directions_match(local) and directions_match(remote)):
+            reoptimize = True
     except ValueError as exc:
         result['conflicts'] = [str(exc)]
         return result

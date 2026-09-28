@@ -139,6 +139,35 @@ inline cv::Vec3d displayVectorAt(const std::vector<cv::Vec3f>& values, double po
     return cv::Vec3d(values[i]) * (1 - t) + cv::Vec3d(values[j]) * t;
 }
 
+inline std::optional<cv::Vec3d> controlDirectionFromJson(const nlohmann::json& control)
+{
+    if (!control.contains("direction")) return std::nullopt;
+    const auto& a = control.at("direction");
+    if (!a.is_array() || a.size()!=3 || !a[0].is_number() ||
+        !a[1].is_number() || !a[2].is_number())
+        throw std::runtime_error("CP direction must be three finite nonzero components");
+    const auto result = displayUnit({a[0].get<double>(),a[1].get<double>(),a[2].get<double>()});
+    if (!result) throw std::runtime_error("CP direction must be finite and nonzero");
+    return result;
+}
+
+// Edit a signed direction, retaining its normal component. The strip's
+// increasing-column direction chooses the heading sign, never the drag sign.
+inline std::optional<cv::Vec3d> editControlDirection(
+    cv::Vec3d current, cv::Vec3d planeNormal, cv::Vec3d dragged,
+    std::optional<cv::Vec3d> forward = std::nullopt)
+{
+    const auto axis=displayUnit(current), normal=displayUnit(planeNormal);
+    if (!axis || !normal) return std::nullopt;
+    auto heading=projectDisplayNormal(dragged,*normal);
+    if (!heading) return std::nullopt;
+    if (heading->dot(forward.value_or(*axis))<0) *heading *= -1;
+    const double height=std::clamp(axis->dot(*normal),-1.0,1.0);
+    const double radius=std::sqrt(std::max(0.0,1-height*height));
+    if (radius<1e-6) return std::nullopt;
+    return *heading*radius + *normal*height;
+}
+
 // Use the regular line-view tangent, including at correction controls.
 inline cv::Vec3d displayTangentAt(const std::vector<cv::Vec3f>& points, double position)
 {
@@ -193,7 +222,8 @@ inline std::optional<cv::Vec3d> inheritedFiberDisplayNormal(
 inline FiberDisplayField fiberDisplayField(
     const std::vector<cv::Vec3f>& points, const std::vector<cv::Vec3f>& normals,
     const std::vector<double>& positions,
-    const std::vector<std::optional<cv::Vec3d>>& manualNormals)
+    const std::vector<std::optional<cv::Vec3d>>& manualNormals,
+    const std::vector<std::optional<cv::Vec3d>>& controlDirections = {})
 {
     FiberDisplayField out;
     out.normals = normals;
@@ -222,7 +252,11 @@ inline FiberDisplayField fiberDisplayField(
         const double p = std::clamp(positions[i], 0.0, double(points.size() - 1));
         const size_t k = size_t(p), j = std::min(k + 1, points.size() - 1);
         controlArcs.push_back(arcs[k] + (p - double(k)) * (arcs[j] - arcs[k]));
-        const auto tangent = displayUnit(displayTangentAt(points, p));
+        auto tangent = displayUnit(displayTangentAt(points, p));
+        if (controlDirections.size()==positions.size() && controlDirections[i]) {
+            auto axis=displayUnit(*controlDirections[i]);
+            if (axis) tangent=axis;
+        }
         const auto baseline = projectDisplayNormal(displayVectorAt(normals, p), tangent.value_or(cv::Vec3d{}));
         out.controlBaselines.push_back(baseline.value_or(cv::Vec3d{}));
         out.controlTangents.push_back(tangent.value_or(cv::Vec3d{}));

@@ -1049,6 +1049,9 @@ TEST_CASE("native fiber tracer fuses a straight cp-to-cp segment")
     request.config.endpointAcceptThresholdBaseVoxels = 20.0;
     request.config.traceToBaseScale = 4.0;
     request.config.baseVoxelSizeUm = 2.0;
+    // Both annotations point forward in reference-line order.
+    request.startDirection = cv::Vec3d(1,0,0);
+    request.targetDirection = cv::Vec3d(1,0,0);
 
     const auto result =
         vc::fiber_tracer::traceFiberSegment(predictions, request, &normals);
@@ -1078,6 +1081,28 @@ TEST_CASE("native fiber tracer fuses a straight cp-to-cp segment")
     const auto resultWithoutPhysicalSize =
         vc::fiber_tracer::traceFiberSegment(predictions, request, &normals);
     CHECK(resultWithoutPhysicalSize.accepted);
+    request.referenceLine.insert(request.referenceLine.begin()+1,cv::Vec3d(4,4,0));
+    request.targetIndex=2;
+    const auto annotated=vc::fiber_tracer::traceFiberSegment(predictions,request,&normals);
+    REQUIRE(annotated.forward.points.size()>1);
+    CHECK(annotated.forward.points[1][0]>0);
+    CHECK(std::abs(annotated.forward.points[1][1])<1e-5);
+    request.startDirection=cv::Vec3d(1,0,0.2);
+    request.targetDirection=cv::Vec3d(1,0,-0.2);
+    request.config.coneAngleDegrees=15;
+    const auto forced=vc::fiber_tracer::traceFiberSegment(predictions,request,&normals);
+    const auto unit=[](cv::Vec3d v) { return v/cv::norm(v); };
+    REQUIRE(forced.forward.points.size()>1);
+    REQUIRE(forced.reverse.points.size()>1);
+    CHECK(cv::norm(unit(forced.forward.points[1]-forced.forward.points[0])-unit(*request.startDirection))<1e-6);
+    CHECK(cv::norm(unit(forced.reverse.points[1]-forced.reverse.points[0])+unit(*request.targetDirection))<1e-6);
+    REQUIRE(forced.fusedLine.size()>3);
+    CHECK(cv::norm(unit(forced.fusedLine[1]-forced.fusedLine[0])-unit(*request.startDirection))<1e-6);
+    CHECK(cv::norm(unit(forced.fusedLine.back()-forced.fusedLine[forced.fusedLine.size()-2])-unit(*request.targetDirection))<1e-6);
+    const auto hinted=vc::fiber_tracer::traceFiberExtrapolation(predictions,{0,0,0},{1,0,0.2},16,
+        request.config,&normals);
+    REQUIRE(hinted.points.size()>1);
+    CHECK(std::abs(hinted.points[1][2])<1e-6);
     CHECK_FALSE(resultWithoutPhysicalSize.maxEndpointErrorUm.has_value());
 }
 

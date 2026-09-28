@@ -1,5 +1,42 @@
 # VC3D Line Annotation Fibers
 
+## CP direction annotations
+
+Shift-drag near an existing CP in either strip to edit its forward direction.
+The live cyan handle points from the CP to the cursor; release commits, Escape
+cancels. The local strip frame includes normal corrections. Editing preserves
+the component perpendicular to that strip and changes only the in-plane heading.
+A click without movement does not change the annotation.
+Away from a CP, a completed drag inserts a CP at the drag-start volume point.
+It inherits the interpolated normal correction through ordinary CP placement;
+the direction is applied before the edit is published or optimization scheduled.
+Escape cancels creation as well as direction editing.
+Annotated CPs have a cyan 80-pixel direction marker in both strips (hover edge
+ticks are 12 pixels). Markers and dragging share the corrected local strip frame.
+The bottom of the Ctrl-right-click menu offers "Clear CP normals and dirs"
+for the selected CP. The annotation window menu offers "Clear all normals and dirs"
+for the entire current fiber. Both clear manual and inherited normal corrections
+and direction axes, but leaves fiber width/gap unchanged. Removing direction
+constraints queues reoptimization of the affected adjacent spans using the current auto/manual mode.
+
+The optional CP field `direction: [x,y,z]` is a finite nonzero signed forward
+direction in base coordinates. Placement chooses its sign from increasing
+strip-column/fiber order, not the user's drag sign. Reversal negates it;
+save/load and remote merge preserve its sign. Opposite signed edits conflict.
+
+Annotations apply independently of span length and interpolation choice:
+native tracing fixes its first step to the annotation for forward tracing and
+its negation for backward tracing (by fiber order, not endpoint displacement).
+Ordinary initial-direction hints still select/sign-align the prediction. After
+the fixed first step, ordinary candidate search resumes. For annotated endpoints
+only, fusion restores the endpoint edge direction and smoothly fades the
+positional adjustment into the interior;
+Lasagna uses per-side endpoint direction constraints; cubic spline runs use
+annotated endpoint and interior tangents. At the CP, the annotation also defines
+the cross-section plane normal. Existing auto/manual optimization scheduling is
+retained; edits dirty adjacent spans and connected spline runs follow the normal
+optimization path. Saved display-normal corrections remain separate.
+
 VC3D writes line annotations as `vc3d_fiber` JSON. Version 3 stores
 `control_points` as objects with a required `position`. Every non-final control
 point owns a required `segment_to_next` descriptor for its span to control point

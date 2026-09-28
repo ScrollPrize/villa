@@ -72,6 +72,15 @@ LineSplineResult interpolateLineControlPoints(const LineSplineRequest& request)
         derivatives[i] = tangent * handle;
     }
 
+    if (!request.controlDirections.empty()) {
+        if (request.controlDirections.size()!=count)
+            throw std::invalid_argument("spline control direction count mismatch");
+        for (size_t i=0; i<count; ++i) {
+            if (!request.controlDirections[i]) continue;
+            auto axis=unit(*request.controlDirections[i],"control spline direction");
+            derivatives[i]=axis*cv::norm(derivatives[i]);
+        }
+    }
     LineSplineResult result;
     result.controlPointIndices.reserve(count);
     result.points.push_back(request.controlPoints.front());

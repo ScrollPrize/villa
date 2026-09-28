@@ -213,6 +213,11 @@ signals:
     void volumeOverlayToggleRequested();
     void fiberWidthChanged(double baseVoxels);
     void controlDisplayAngleChanged(size_t controlIndex, double degrees);
+    void controlDirectionChanged(size_t controlIndex, cv::Vec3f direction);
+    void clearFiberCorrectionsRequested();
+    void clearControlCorrectionsRequested(size_t controlIndex);
+    void controlDirectionCreated(cv::Vec3f point, double linePosition,
+                                 cv::Vec3f lineAnchor, cv::Vec3f direction);
     void crossSectionDragFinished(const std::string& surfaceName, cv::Vec3f point,
                                   double linePosition, cv::Vec3f lineAnchor,
                                   cv::Vec3f normal, bool edge);
@@ -517,6 +522,23 @@ private:
     std::optional<CrossSectionDrag> _crossSectionDrag;
     QPointer<QObject> _crossSectionDragPreview;
     bool handleCrossSectionDragEvent(QObject* watched, QEvent* event);
+    struct DirectionDrag {
+        QPointer<CChunkedVolumeViewer> viewer;
+        size_t controlIndex = 0;
+        QPointF origin;
+        QPoint pressPixel;
+        bool moved = false;
+        bool createControl = false;
+        double linePosition = 0;
+        cv::Vec3f point, lineAnchor;
+        cv::Vec3d axis, normal, along, across;
+        cv::Vec2f surfaceOrigin;
+        std::optional<cv::Vec3d> result;
+    };
+    std::optional<DirectionDrag> _directionDrag;
+    QPointer<QObject> _directionPreview;
+    bool handleDirectionDragEvent(QObject* watched, QEvent* event);
+    void cancelDirectionDrag();
     void cancelCrossSectionDrag();
     void finishCrossSectionDrag();
     void drawCrossSectionDragPreview(const vc::fiber_tracer::FiberWidthDragResult& result);

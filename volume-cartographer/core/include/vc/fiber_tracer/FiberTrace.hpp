@@ -336,6 +336,9 @@ struct FiberTraceSegmentRequest {
     size_t startIndex = 0;
     size_t targetIndex = 0;
     FiberTraceConfig config;
+    // Signed directions in increasing reference-line index order.
+    std::optional<cv::Vec3d> startDirection;
+    std::optional<cv::Vec3d> targetDirection;
 };
 
 struct FiberTraceTargetPlane {
@@ -359,6 +362,9 @@ struct FiberTraceOneWayRequest {
     bool snapTraceToSelectedCrossing = true;
     double budgetSpanVoxels = 0.0;
     FiberTraceConfig config;
+    // Default initialDirection is only a prediction-selection hint.
+    // Explicit annotations fix the signed first step instead.
+    bool fixInitialDirection = false;
 };
 
 struct FiberTraceOneWayResult {
@@ -538,7 +544,8 @@ struct CandidateScoreDebug {
     double distanceVoxels,
     const FiberTraceConfig& config,
     const vc::lasagna::NormalSampler* normalSampler = nullptr,
-    const FiberTraceProgressCallback& progress = {});
+    const FiberTraceProgressCallback& progress = {},
+    bool fixInitialDirection = false);
 
 // Fraction of a segment's start-to-target distance that bounds the endpoint
 // acceptance threshold for that segment. The fixed threshold

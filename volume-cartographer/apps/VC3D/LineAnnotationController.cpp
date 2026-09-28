@@ -1486,6 +1486,7 @@ generatedControlMarkers(
         marker.point = toVec3f(control.volumePoint);
         marker.linePosition = control.linePosition;
         marker.controlIndex = i;
+        marker.direction = control.direction;
         marker.isSeed = control.isSeed;
         marker.isKollesisTermination = vc3d::line_annotation::hasControlPointTag(
             control.tags, vc3d::line_annotation::kKollesisTerminationTag);
@@ -2552,6 +2553,83 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
         }
         saveFiberDisplayAnnotations(session);
     });
+    const auto clearCorrections = [this, surfaceName](std::optional<size_t> index) {
+        auto* pane=paneForSurface(surfaceName);
+        if (!pane || !pane->session) return;
+        auto& session=*pane->session;
+        if (index && *index >= session.controlPoints.size()) return;
+        const std::optional<cv::Vec3d> point = index
+            ? std::make_optional(session.controlPoints[*index].volumePoint) : std::nullopt;
+        bool directionsChanged=false;
+        std::vector<size_t> dirty;
+        for (size_t i=0; i<session.controlPoints.size(); ++i) {
+            if (index && i != *index) continue;
+            if (!session.controlPoints[i].direction) continue;
+            directionsChanged=true;
+            if (i>0) dirty.push_back(i-1);
+            if (i+1<session.controlPoints.size()) dirty.push_back(i);
+        }
+        std::sort(dirty.begin(), dirty.end());
+        dirty.erase(std::unique(dirty.begin(), dirty.end()), dirty.end());
+        for (auto& other : _panes) {
+            if (!other.session || (other.session!=pane->session &&
+                (!session.fiberId || other.session->fiberId!=session.fiberId))) continue;
+            for (auto& cp : other.session->controlPoints) {
+                if (point && !pointsApproximatelyEqual(cp.volumePoint,*point)) continue;
+                vc3d::line_annotation::clearControlPointCorrections(cp);
+            }
+            ++other.session->lineRevision;
+            materializeGeneratedViews(*other.session);
+        }
+        saveFiberDisplayAnnotations(session);
+        if (directionsChanged) {
+            session.fiberMetricsMatchStoredFiber=false;
+            invalidateFiberAlignmentMetrics(session.fiberId,true);
+            session.stripReviewedTagOnSave=true;
+            setSessionOptimizationState(session,SessionOptimizationState::Unoptimized);
+            session.solveQueue.addPending(dirty,false);
+            scheduleSolveDispatch(session);
+        }
+    };
+    connect(dialog, &LineAnnotationDialog::clearFiberCorrectionsRequested, this,
+            [clearCorrections]() { clearCorrections(std::nullopt); });
+    connect(dialog, &LineAnnotationDialog::clearControlCorrectionsRequested, this,
+            [clearCorrections](size_t index) { clearCorrections(index); });
+    connect(dialog, &LineAnnotationDialog::controlDirectionCreated, this,
+            [this, surfaceName](cv::Vec3f point, double position,
+                                cv::Vec3f anchor, cv::Vec3f direction) {
+        handleGeneratedControlPoint(surfaceName,
+            fiberBasePointFromViewer(surfaceName, point), position,
+            fiberBasePointFromViewer(surfaceName, anchor), std::nullopt,
+            vc::fiber_tracer::displayUnit(cv::Vec3d(direction)));
+    });
+    connect(dialog, &LineAnnotationDialog::controlDirectionChanged, this,
+            [this, surfaceName](size_t index, cv::Vec3f value) {
+        auto* pane = paneForSurface(surfaceName);
+        if (!pane || !pane->session) return;
+        auto& session=*pane->session;
+        const auto axis=vc::fiber_tracer::displayUnit(cv::Vec3d(value));
+        if (!axis || index>=session.controlPoints.size()) return;
+        const auto point=session.controlPoints[index].volumePoint;
+        for (auto& other : _panes) {
+            if (!other.session || (other.session!=pane->session &&
+                (!session.fiberId || other.session->fiberId!=session.fiberId))) continue;
+            for (auto& cp : other.session->controlPoints)
+                if (pointsApproximatelyEqual(cp.volumePoint,point)) cp.direction=*axis;
+            materializeGeneratedViews(*other.session);
+        }
+        ++session.lineRevision;
+        session.fiberMetricsMatchStoredFiber=false;
+        invalidateFiberAlignmentMetrics(session.fiberId, true);
+        session.stripReviewedTagOnSave=true;
+        setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+        std::vector<size_t> dirty;
+        if (index>0) dirty.push_back(index-1);
+        if (index+1<session.controlPoints.size()) dirty.push_back(index);
+        session.solveQueue.addPending(dirty,false);
+        scheduleSessionAutoSave(session);
+        scheduleSolveDispatch(session);
+    });
     connect(dialog, &LineAnnotationDialog::paneClosed, this, [this](const std::string& name) {
         cleanupSurfaceName(name);
     });
@@ -3102,6 +3180,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
         control.segmentToNext = it->controlPoints[i].segmentToNext;
         control.tags = it->controlPoints[i].tags;
         control.displayNormal = it->controlPoints[i].displayNormal;
+        control.direction = it->controlPoints[i].direction;
         control.displayNormalSource = it->controlPoints[i].displayNormalSource;
         session->controlPoints.push_back(control);
 
@@ -7711,7 +7790,8 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                                                           cv::Vec3f volumePoint,
                                                           double linePosition,
                                                           std::optional<cv::Vec3f> lineAnchor,
-                                                          std::optional<cv::Vec3d> displayNormal)
+                                                          std::optional<cv::Vec3d> displayNormal,
+                                                          std::optional<cv::Vec3d> direction)
 {
     auto* pane = paneForSurface(surfaceName);
     if (!pane || !pane->session) {
@@ -7923,6 +8003,8 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         prepared.controlPoints[prepared.replacementIndex].displayNormalSource =
             manualDisplayNormal ? "manual" : "interpolated";
     }
+    if (direction)
+        prepared.controlPoints[prepared.replacementIndex].direction = direction;
     session.controlPoints = std::move(prepared.controlPoints);
     remapCollapsedBranchControlPointIndices(prepared.oldToNewIndices,
                                             session.branches);
@@ -10817,6 +10899,7 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
                 }
                 control.tags = branchRemapControls[i].tags;
                 control.displayNormal = branchRemapControls[i].displayNormal;
+                control.direction = branchRemapControls[i].direction;
                 control.displayNormalSource = branchRemapControls[i].displayNormalSource;
                 donated[i] = true;
                 break;
@@ -12783,15 +12866,17 @@ vc::fiber_tracer::FiberDisplayField LineAnnotationController::displayFieldForSes
     std::vector<cv::Vec3f> displayPoints;
     std::vector<double> displayControlPositions;
     std::vector<std::optional<cv::Vec3d>> manualNormals;
+    std::vector<std::optional<cv::Vec3d>> controlDirections;
     displayPoints.reserve(session.optimizedLine.points.size());
     for (const auto& point : session.optimizedLine.points)
         displayPoints.push_back(cv::Vec3f(point.position));
     for (const auto& control : session.controlPoints) {
         displayControlPositions.push_back(control.linePosition);
         manualNormals.push_back(control.displayNormal);
+        controlDirections.push_back(control.direction);
     }
     return vc::fiber_tracer::fiberDisplayField(
-        displayPoints, orientedNormals, displayControlPositions, manualNormals);
+        displayPoints, orientedNormals, displayControlPositions, manualNormals, controlDirections);
 }
 
 bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& session)
@@ -14605,6 +14690,7 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
                         stored.segmentToNext = std::move(control.segmentToNext);
                         stored.tags = std::move(control.tags);
                         stored.displayNormal = control.displayNormal;
+                        stored.direction = control.direction;
                         stored.displayNormalSource = control.displayNormalSource;
                         fiber.controlPoints.push_back(std::move(stored));
                     }
@@ -16699,6 +16785,7 @@ LineAnnotationController::makeIntersectionLineSession(
         control.segmentToNext = fiber.controlPoints[i].segmentToNext;
         control.tags = fiber.controlPoints[i].tags;
         control.displayNormal = fiber.controlPoints[i].displayNormal;
+        control.direction = fiber.controlPoints[i].direction;
         control.displayNormalSource = fiber.controlPoints[i].displayNormalSource;
         session->controlPoints.push_back(control);
         const double distance = std::abs(control.linePosition - session->focusedLinePosition);
@@ -16828,6 +16915,7 @@ LineAnnotationController::makeStoredFiberSessionSnapshot(LineAnnotationSession& 
         stored.segmentToNext = session.controlPoints[sessionIndex].segmentToNext;
         stored.tags = session.controlPoints[sessionIndex].tags;
         stored.displayNormal = session.controlPoints[sessionIndex].displayNormal;
+        stored.direction = session.controlPoints[sessionIndex].direction;
         stored.displayNormalSource = session.controlPoints[sessionIndex].displayNormalSource;
         fiber.controlPoints.push_back(std::move(stored));
     }
@@ -16914,6 +17002,7 @@ void LineAnnotationController::saveFiberDisplayAnnotations(LineAnnotationSession
                 [&](const auto& point) { return pointsApproximatelyEqual(point.volumePoint, stored); });
             if (cp != session.controlPoints.end()) {
                 stored.displayNormal = cp->displayNormal;
+                stored.direction = cp->direction;
                 stored.displayNormalSource = cp->displayNormalSource;
             }
         }

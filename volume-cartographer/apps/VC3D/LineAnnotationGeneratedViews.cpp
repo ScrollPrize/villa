@@ -18,6 +18,7 @@
 #include <array>
 
 namespace vc3d::line_annotation {
+
 namespace {
 
 bool finiteScenePoint(const QPointF& point)
@@ -524,6 +525,30 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                     generatedStripControlPointToScene(viewer, quad, control,
                                                       overlay.stripPositionMap);
                 if (finiteScenePoint(controlScene)) {
+                    if (control.direction) {
+                        const double col=overlay.stripPositionMap.valid()
+                            ? overlay.stripPositionMap.originalPositionToStripGridColumn(control.linePosition)
+                            : control.linePosition;
+                        const auto uv=quad->gridToSurface({col,double(quad->rawPointsPtr()->rows/2)});
+                        if (const auto frame=generatedStripFrame(quad,uv)) {
+                            const QPointF origin=viewer->surfaceCoordsToScene(uv[0],uv[1]);
+                            const QPointF projected=viewer->surfaceCoordsToScene(
+                                uv[0]+control.direction->dot(frame->along),
+                                uv[1]+control.direction->dot(frame->across))-origin;
+                            const auto transform=viewer->graphicsView()->viewportTransform();
+                            const QPointF pixels=transform.map(origin+projected)-transform.map(origin);
+                            const double length=std::hypot(pixels.x(),pixels.y());
+                            if (length>1e-6) {
+                                const QPointF half=projected*(40.0/length);
+                                auto style=lineStyle;
+                                style.penColor=QColor(0,245,255);
+                                style.penWidth=1.5;
+                                style.z=170;
+                                primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                                    {controlScene-half,controlScene+half},false,style});
+                            }
+                        }
+                    }
                     const qreal radius =
                         (control.hasBranches ? 6.25 : (control.isSeed ? 5.5 : 5.0)) +
                         (drawsKollesisRing(control) ? 1.0 : 0.0);
@@ -1149,9 +1174,20 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             QWidget::tr("Go to nearby annotation (%1)")
                 .arg(fiberName(nearbyIntersection->fiberId)));
     }
+    QAction* clearCorrectionsAction = nullptr;
+    if (options.clearControlCorrections) {
+        menu.addSeparator();
+        clearCorrectionsAction = menu.addAction(QWidget::tr("Clear CP normals and dirs"));
+        clearCorrectionsAction->setEnabled(
+            selectedControlIndex != std::numeric_limits<size_t>::max());
+    }
     QAction* selected = menu.exec(options.globalPos);
     clearGeneratedControlPointContextPreview(options.viewer, options.surfaceName);
 
+    if (clearCorrectionsAction && selected == clearCorrectionsAction) {
+        options.clearControlCorrections(selectedControlIndex);
+        return GeneratedControlPointContextResult::Handled;
+    }
     if (selected == deleteAction && deleteAction->isEnabled()) {
         if (options.deleteControlPoint) {
             options.deleteControlPoint(selectedControl.linePosition, selectedControl.point);

@@ -352,6 +352,25 @@ CP correction and cross views share the ordinary central-chord tangent.
 CP displacement remains cubic,
 with zero derivatives at stationary controls and outer local-edit boundaries.
 
+CP `direction` annotations are signed forward vectors in fiber order, unlike
+sign-agnostic display normals. Placement aligns their sign with increasing strip
+columns, regardless of drag sign; reversing a fiber negates them. Shift-drag in either
+strip edits the local in-plane heading while preserving the perpendicular
+component. They apply to native trace starts, Lasagna per-side constraints and
+all spline CP tangents, irrespective of span length. At an annotated CP they
+also define the cross-section normal; save/sync and CP lifecycle preserve them.
+Ordinary tracer initial directions remain prediction-selection hints. Only an
+explicit annotation fixes the first step (forward vector or its backward
+negation). Fusion must preserve those explicit endpoint directions; ordinary
+unannotated fusion is unchanged. Direction markers are 80 pixels long.
+Away from a CP, Shift-drag inserts one at the drag start on release, through
+ordinary placement including inherited normal correction. Direction and creation
+are one edit; cancelling or clicking without dragging creates nothing.
+Direction annotations have short persistent strip markers sharing the editing
+frame. Ctrl-right-click clears only the selected CP's direction and normal
+corrections. The annotation window menu clears them for the whole fiber,
+including interpolated normal corrections, without changing width/gap.
+
 Display normals are sign-ambiguous axes, including stored CP corrections.
 Offset recovery and interpolation use the shortest rotation modulo pi.
 Interpolate target axes in a common transported reference, never by adding

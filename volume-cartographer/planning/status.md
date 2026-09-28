@@ -1,8 +1,8 @@
 # Status
 
-- [x] Inspect correction and ordinary construction paths
-- [x] Share regular tangent and transport
-- [x] Remove post-construction correction path
-- [x] Add short-span and baseline-half-turn regression tests
-- [x] Six focused C++ suites and 127 Python tests passed
-- [x] Final VC3D rebuild
+- [x] Inspect menus and reset/save path
+- [x] Plan and local review
+- [x] Implement both scopes with shared controller logic
+- [x] Update docs and regression coverage
+- [x] Build VC3D and run focused tests
+- [ ] Live GUI validation

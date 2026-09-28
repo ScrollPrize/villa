@@ -703,7 +703,8 @@ private:
                                      cv::Vec3f volumePoint,
                                      double linePosition,
                                      std::optional<cv::Vec3f> lineAnchor = std::nullopt,
-                                     std::optional<cv::Vec3d> displayNormal = std::nullopt);
+                                     std::optional<cv::Vec3d> displayNormal = std::nullopt,
+                                     std::optional<cv::Vec3d> direction = std::nullopt);
     void handleGeneratedControlPointDelete(const std::string& surfaceName,
                                            double linePosition,
                                            cv::Vec3f volumePoint);
