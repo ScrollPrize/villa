@@ -822,10 +822,12 @@ foreach(_dir IN LISTS _vc_install_dirs)
                     RUNTIME DESTINATION "VC3D.app/Contents/MacOS"
                     LIBRARY DESTINATION "VC3D.app/Contents/Frameworks")
             else()
+                # OPTIONAL: the Docker image may build a single target
+                # (VC_BUILD_TARGET), leaving the other targets unbuilt.
                 install(TARGETS ${_tgt}
                     COMPONENT vc_runtime
-                    RUNTIME DESTINATION bin
-                    LIBRARY DESTINATION lib)
+                    RUNTIME DESTINATION bin OPTIONAL
+                    LIBRARY DESTINATION lib OPTIONAL)
             endif()
         endif()
     endforeach()

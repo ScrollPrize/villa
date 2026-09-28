@@ -21,8 +21,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 FROM builder AS build
 COPY . /src
 WORKDIR /src
+# Set to one target (e.g. vc_render_tifxyz) to build and install only that
+# binary and the libraries it links.
+ARG VC_BUILD_TARGET=all
 RUN cmake --preset ci-release-gcc \
- && cmake --build --preset ci-release-gcc \
+ && cmake --build --preset ci-release-gcc --target ${VC_BUILD_TARGET} \
  # Lay the tree out as /usr/local/{bin,lib}. The apps resolve their internal
  # shared libs via the install RPATH ($ORIGIN/../lib, set in CMakeLists.txt).
  && cmake --install build/ci-release-gcc --prefix /usr/local --component vc_runtime
