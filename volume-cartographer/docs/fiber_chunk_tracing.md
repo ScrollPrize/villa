@@ -2424,3 +2424,46 @@ These opt-in diagnostics do not change production defaults. See the
   MAP-off measurements do not drive endpoint pruning, but count as problematic
   in the removal benchmark. Diagnostics distinguish initial, conditioned and
   fresh solves; off probabilities are conditional on decoded endpoint states.
+
+### Finite winding-step continuation experiments
+
+`--winding-continuity-step-cost L` uses `L*abs(q_b-q_a)` across each
+added piece boundary, where q includes the calibrated H/V phase. A half winding
+costs L/2 at phase0.5. Positive-cost nonzero steps remain active factors, not
+disabled/cut edges; `continuity_step` reports their count and energy separately.
+L=0 removes the factor entirely, including downstream connectivity.
+The old `--winding-continuity-cut-cost` is a distinct flat keep/cut model.
+
+`--continuity-defect-mass all|ordinary|winding-ordinary|prepass-ordinary`
+controls whether synthetic continuation contributes to the piece's defect unary
+incidence in both stages or only one. Default `all` preserves earlier behavior.
+This is a modeling ablation: it does not remove or weaken pair factors. With
+exclusion, continuation-only pieces have zero data-derived defect mass; no hidden
+minimum is added. Fixed H/V still uses its prepass and may irreversibly mark
+ambiguous pieces Mixed. Joint H/V is a separate comparison.
+
+The `crop_benchmark_step_tuning_*_20260927.json` configs use the existing approved
+`run_classic_fiber_evaluation.py crop-benchmark --config CONFIG` entrypoint.
+Screening keeps initial-reference readout but omits reference-assisted solves;
+missing conditioned/removal scores are null. Matched full-run ladders validate
+the shortcut. Final candidates must receive the full benchmark. All trials use
+the same certified graph, frozen traces and500-message budget. See
+[winding-step search](fiber_benchmark_runs/2026-09-27-winding-step-search.md).
+### Optional winding decode repair
+
+`--winding-decode-repair N` performs at most N deterministic coordinate-descent
+sweeps after the joint-grid decoder's hard-sign projection (default 0, unchanged).
+Each move strictly lowers the normalized negative log BP objective, including
+the distinct winding and orientation temperatures. All incident pair factors
+are evaluated; reference labels are never consulted. Calibration, component
+phase, candidate supports, exact fixed states and the entire selected gauge
+state are frozen. Active labels can change winding; eligible defects can be
+restored. Fixed prepass Mixed states cannot be restored.
+
+The `decode_repair` diagnostic records normalized objective before/after,
+sweeps, changes, restorations, disablements and time. Counts are transitions,
+not unique pieces (one piece can move repeatedly). Posterior marginals remain
+the original BP marginals; decoded labels and their marginal probability are
+updated. This is a local MAP experiment, not an exact global solver: a group
+of pieces may require a coordinated move that single-piece descent cannot make.
+Lower objective is not a guarantee of better reference accuracy.

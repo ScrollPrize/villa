@@ -13,6 +13,8 @@ def matrix():
 
 
 def trial_config(template, root, point, threads):
+    if point.get('options') and not point.get('variant'):
+        raise ValueError('option overrides require a distinct variant name')
     case = copy.deepcopy(template['commands'][0])
     name = f"{'parallel' if point['parallel'] else 'orthogonal'}-d{point['defect']}-c{point['cut']}".replace('.', 'p')
     if point.get('fixed_orientation'):
@@ -21,7 +23,20 @@ def trial_config(template, root, point, threads):
         name += '-distance'
     if point.get('local_events') is False:
         name += '-legacy'
+    if point.get('screen_only'):
+        name += '-screen'
+    if point.get('variant'):
+        name += '-' + point['variant']
     args = case['args']
+    if point.get('screen_only'):
+        for flag, count in (('--reference-prune-offenders', 0),
+                            ('--reference-prune-policy', 1),
+                            ('--reference-oracle-magnitude-weight', 1),
+                            ('--reference-oracle-accept-message-limit', 0),
+                            ('--reference-oracle-rounds', 1)):
+            if flag in args:
+                index = args.index(flag)
+                del args[index:index + count + 1]
     if point.get('local_events') is False and '--local-constraint-events' in args:
         args.remove('--local-constraint-events')
     if '--winding-fixed-orientation' in args and not point.get('fixed_orientation'):
@@ -35,6 +50,11 @@ def trial_config(template, root, point, threads):
         args += ['--winding-continuity-step-cost' if point.get('distance_cost') else '--winding-continuity-cut-cost', str(point['cut'])]
     if not point['parallel'] and point.get('local_events') is not False:
         args += ['--local-no-parallel']
+    for flag, value in point.get('options', {}).items():
+        if flag in args:
+            args[args.index(flag) + 1] = str(value)
+        else:
+            args += [flag, str(value)]
     case['name'] = name
     return dict(output_root=str(root), reference_dir=template['reference_dir'],
                 input_files=template['input_files'], commands=[case])
@@ -79,20 +99,33 @@ def validate_certified_counts(audit):
         raise ValueError('certified constraints rejected for split support')
 
 
-def collect(prefix):
-    from .density_penalty_sweep import metrics
+def collect(prefix, screen_only=False):
+    from .density_penalty_sweep import metrics, independent_metrics
     from .crop_benchmark import bp_metrics
     log = prefix.with_suffix('.log').read_text()
-    try:
-        result = metrics(prefix)
-    except (ValueError, IndexError, KeyError) as error:
-        result = bp_metrics(log)
-        result.update(metric_warning=str(error), independent_percent=None)
+    if screen_only:
+        result = independent_metrics(log)
+        result.update(constraint_score_percent=None, reference_score_percent=None)
+    else:
+        try:
+            result = metrics(prefix)
+        except (ValueError, IndexError, KeyError) as error:
+            result = bp_metrics(log)
+            result.update(metric_warning=str(error), independent_percent=None)
     states = list(csv.DictReader(Path(str(prefix) + '_consistency.csv').open()))
+    from collections import Counter
+    result['prepass_classes'] = dict(Counter(r.get('winding_prepass_class', 'unknown') for r in states))
+    result['final_classes'] = dict(Counter(r['winding_final_class'] for r in states))
+    result['prepass_hv_ties'] = sum(float(r.get('p_h', 0)) == float(r.get('p_v', 0)) > float(r.get('p_mixed', 0)) for r in states)
     result['defect_percent'] = 100 * sum(r['winding_final_class'] == 'defect' for r in states) / len(states)
     cuts = re.findall(r'continuity_cut eligible=(\d+) map_cut=(\d+) energy=([^\s]+)', log)
     result['cut_reports'] = [dict(eligible=int(a), cuts=int(b), energy=float(c),
                                   cut_percent=100 * int(b) / int(a) if int(a) else 0.) for a, b, c in cuts]
+    steps = re.findall(r'continuity_step eligible=(\d+) nonzero=(\d+) energy=([^\s]+)', log)
+    result['step_reports'] = [dict(eligible=int(a), nonzero=int(b), energy=float(c),
+                                   nonzero_percent=100 * int(b) / int(a) if int(a) else 0.) for a, b, c in steps]
+    result['decode_repair'] = [{k: float(v) for k, v in re.findall(r'(\w+)=([^\s]+)', line)}
+                               for line in log.splitlines() if line.startswith('decode_repair ')]
     result['wall_seconds'] = json.loads(prefix.with_suffix('.run.json').read_text())['wall_seconds']
     result['winding_statuses'] = re.findall(r'fiber winding BP\n[^\n]*\n(\w+)', log)
     result['initial_readout_status'] = re.findall(r'frozen_initial_bp=1[^\n]*bp_status=(\w+)', log)
@@ -108,6 +141,9 @@ def collect(prefix):
         if audit['certified'] != audit['retained'] + audit['missing_owner']:
             raise ValueError('reference remapping lost certified events')
     result.update(ladder_shift_metrics(result.get('ladder', [])))
+    if result.get('independent_missing'):
+        result.update(ladder_shifts=None, ladder_shift_percent=None,
+                      metric_warning='incomplete ladder: shift score not comparable')
     return result
 
 
@@ -119,6 +155,8 @@ def run_sweep(config):
     from .density_penalty_sweep import native_patch, resumable
     cfg = config['local_cost_sweep']
     if cfg.get('report_only'):
+        if cfg.get('screen_report'):
+            return publish_screen_report(config)
         return publish_report(config)
     template = json.loads(Path(cfg['template']).read_text())
     root = Path(config['output_root'])
@@ -153,7 +191,7 @@ def run_sweep(config):
         try:
             if not reuse:
                 run(local)
-            result.update(collect(prefix), status='complete',
+            result.update(collect(prefix, point.get('screen_only', False)), status='complete',
                           geometry_sha256=sha256_file(Path(str(prefix) + '_local_event_pieces.csv')) if point.get('local_events') is not False else None)
         except (ValueError, RuntimeError, IndexError, KeyError, OSError, subprocess.CalledProcessError) as error:
             result.update(status='failed', error=str(error))
@@ -162,6 +200,8 @@ def run_sweep(config):
 
     points = cfg.get('points', matrix())
     names = {trial_config(template, root, p, cfg.get('threads', 48))['commands'][0]['name'] for p in points}
+    if len(names) != len(points):
+        raise ValueError('duplicate trial names would overwrite benchmark artifacts')
     results = []
     if (root / 'summary.json').exists():
         results = [r for r in json.loads((root / 'summary.json').read_text())['results'] if r['name'] not in names]
@@ -175,6 +215,69 @@ def run_sweep(config):
                 raise RuntimeError('pre-BP geometry changed between cost trials')
             atomic_write(root / 'summary.json', dict(results=sorted(results, key=lambda r: r['name']),
                          complete=len(results) == total), durable=False)
+
+
+def publish_screen_report(config):
+    """Persist screening ladders without implying reference-assisted scores exist."""
+    from html import escape
+    from lasagna.inference_provenance import atomic_write
+    cfg = config['local_cost_sweep']
+    roots = [config['output_root'], *cfg.get('supplemental_roots', [])]
+    rows = []
+    complete = True
+    pending_roots = []
+    for root in roots:
+        summary = Path(root) / 'summary.json'
+        if not summary.exists():
+            pending_roots.append(root)
+            complete = False
+            continue
+        document = json.loads(summary.read_text())
+        complete = complete and document['complete']
+        rows.extend(dict(r, artifact_root=root) for r in document['results'])
+    for row in rows:
+        if row['status'] == 'complete' and cfg.get('reparse_metrics', True):
+            row.update(collect(Path(row['artifact_root']) / row['name'], row.get('screen_only', False)))
+    repo = Path(__file__).resolve().parents[5]
+    destination = repo / cfg['report_destination']
+    lines = ['# Winding-step continuation search', '',
+             'Same frozen Paris4 2048 traces and26reference windings. Finite continuation energy is lambda*abs(winding displacement), including H/V half steps. No inference or retracing;500messages, message-limit accepted. Screening omits only reference-assisted solves. Null scores mean not measured, never zero.', '',
+             'Legacy grouped baseline:38.4615% initial accuracy,73.0769% shift score. Higher is better. Shift score=100*(1-K/26), K adjacent changes in predicted-minus-reference offset; global offset is ignored. All trials and failures retained below. No default promotion.', '',
+             '| Trial | Initial accuracy | Shift score | Steps nonzero | Seconds |', '|---|---:|---:|---:|---:|']
+    def pct(v):
+        return 'n/a' if v is None else f'{v:.4f}%'
+    for r in rows:
+        if r['status'] != 'complete':
+            lines.append(f"| {r['name']} | FAILED:{r.get('error')} | — | — | — |")
+            continue
+        step = (r.get('step_reports') or [{}])[0]
+        lines.append(f"| {r['name']} | {pct(r.get('independent_percent'))} | {pct(r.get('ladder_shift_percent'))} | {pct(step.get('nonzero_percent'))} | {r['wall_seconds']:.1f} |")
+    full = [r for r in rows if r['status'] == 'complete' and not r.get('screen_only', False)]
+    if full:
+        lines += ['', '## Full benchmark (not screening)', '',
+                  'Reference-assisted accuracy is not deployment accuracy. Removal is negative problematic/fulfilled percent (closer to zero is better); different graph sizes make legacy a contextual rather than matched removal comparison.', '',
+                  '| Trial | Initial accuracy | Shift score | Reference-assisted accuracy | Removal score |',
+                  '|---|---:|---:|---:|---:|']
+        for r in full:
+            lines.append(f"| {r['name']} | {pct(r.get('independent_percent'))} | {pct(r.get('ladder_shift_percent'))} | {pct(r.get('reference_score_percent'))} | {pct(r.get('constraint_score_percent'))} |")
+    lines += ['', '## Recorded settings and cohorts', '']
+    for r in rows:
+        if r['status'] == 'complete':
+            lines.append(f"- {r['name']}: options={r.get('options', {})}; prepass={r.get('prepass_classes', {})}; H/V ties={r.get('prepass_hv_ties')}; final={r.get('final_classes', {})}; missing references={r.get('independent_missing')}; retention={r.get('extraction_audits', [])}; decoder={r.get('decode_repair', [])}.")
+    lines += ['', '## Provenance', '', 'JSON preserves exact commands, hashes, ladders and certified-retention audits for every row. Four concurrent runs ×48threads unless the recorded command says otherwise; timings are contended, not standalone throughput. Native build: bash vesuvius/scripts/run_fiber3d_native_build. Evaluation entrypoint: /home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py crop-benchmark --config CONFIG.', '', *[f'- `{r}`' for r in roots]]
+    if pending_roots:
+        lines += ['', 'Pending roots (no completed summary yet):', *[f'- `{r}`' for r in pending_roots]]
+    atomic_write(destination.with_suffix('.json'), dict(complete=complete, results=rows, pending_roots=pending_roots), durable=False)
+    destination.with_suffix('.md').write_text('\n'.join(lines) + '\n')
+    svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="{60+len(rows)*27}"><g font-family="sans-serif" font-size="12"><text x="10" y="20">Winding step search: initial accuracy (green), shift score (blue), reference-assisted accuracy if measured (purple), all percent</text>']
+    for i, r in enumerate(rows):
+        y = 45+i*27
+        svg.append(f'<text x="10" y="{y+10}">{escape(r["name"])}</text>')
+        for j, (key, color) in enumerate((('independent_percent', '#289b65'), ('ladder_shift_percent', '#3984cf'), ('reference_score_percent', '#9759b5'))):
+            if r.get(key) is not None:
+                x = 650+j*300
+                svg.append(f'<rect x="{x}" y="{y}" width="{r[key]*2}" height="14" fill="{color}"/><text x="{x+205}" y="{y+11}">{r[key]:.2f}%</text>')
+    destination.with_suffix('.svg').write_text('\n'.join(svg)+ '</g></svg>\n')
 
 
 def publish_report(config):

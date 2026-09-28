@@ -5823,6 +5823,146 @@ TEST_CASE("Continuation cuts retain active pieces and ordinary evidence on the s
     CHECK_THROWS(solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint, {}, {}, fixed));
 }
 
+TEST_CASE("Decode repair uses normalized BP energy and preserves fixed states")
+{
+    const auto source=lines(3);
+    auto report=pieces(3);
+    auto graph=topology(source,report);
+    for(std::size_t i=0;i<2;++i) {
+        FiberTraceConstraint c;
+        c.pieceA=i; c.pieceB=i+1; c.parallelScore=1.; c.hardContinuity=true; c.signedWindingDelta=0.;
+        report.constraints.push_back(c); graph.hardConstraintIndices.push_back(i);
+    }
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint)=config();
+    joint.fixedPhaseMagnitude=.5; joint.fixedMeasurementScale=1.;
+    joint.continuityCutCost=2.; joint.continuityCostByDistance=true;
+    joint.temperature=.25; joint.orientationTemperature=2.; joint.mixedUnaryCost=5.;
+    joint.decodeRepairSweeps=5;
+    const std::vector<FiberTraceFixedWindingState> fixed{
+        {true,FiberTraceFixedOrientation::Horizontal,0,1},
+        {true,FiberTraceFixedOrientation::Horizontal,1,1},
+        {true,FiberTraceFixedOrientation::Horizontal,1,1}};
+    const auto result=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint,{}, {}, fixed);
+    CHECK(result.decodeRepairChanges==0);
+    CHECK(result.decodeRepairObjectiveBefore==doctest::Approx(2./.25));
+    CHECK(result.decodeRepairObjectiveAfter==result.decodeRepairObjectiveBefore);
+    CHECK(result.mapWinding[0]==0); CHECK(result.mapWinding[1]==1); CHECK(result.windingValid[2]==1);
+}
+
+TEST_CASE("Decode repair chooses according to unequal BP temperatures rather than raw costs")
+{
+    const auto source=lines(2);
+    auto report=pieces(2);
+    addMeasured(report,0,1,1.,1.);
+    auto graph=topology(source,report);
+    FiberTraceConstraint c;
+    c.pieceA=0; c.pieceB=1; c.parallelScore=1.; c.hardContinuity=true; c.signedWindingDelta=0.;
+    report.constraints.push_back(c); graph.hardConstraintIndices.push_back(1);
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint)=config();
+    joint.fixedPhaseMagnitude=.5; joint.fixedMeasurementScale=1.;
+    joint.continuityCutCost=1.; joint.continuityCostByDistance=true;
+    joint.enforceParallelWindingSign=true; joint.mixedUnaryCost=1.5;
+    joint.hardSignMinimumNormalAlignment.reset();
+    joint.orientationTemperature=1.; joint.decodeRepairSweeps=5;
+    const std::vector<FiberTraceFixedOrientation> orientations(2,FiberTraceFixedOrientation::Horizontal);
+    const std::vector<FiberTraceFixedWindingState> fixed{
+        {true,FiberTraceFixedOrientation::Horizontal,0,1}, {}};
+    joint.temperature=.1;
+    const auto cold=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint,{},orientations,fixed);
+    CHECK(cold.windingValid[1]==0);
+    joint.temperature=2.;
+    const auto warm=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint,{},orientations,fixed);
+    CHECK(warm.windingValid[1]==1);
+    CHECK(warm.mapWinding[1]==1);
+}
+
+TEST_CASE("Decode repair restores projected pieces through valid winding changes")
+{
+    const auto source=lines(3);
+    auto report=pieces(3);
+    for(std::size_t i=0;i<2;++i) addMeasured(report,i,i+1,1.,1.);
+    // Shortcut magnitude disagrees with the three strictly ordered steps.
+    // The hard signs remain jointly feasible; the independent decode need not.
+    addMeasured(report,0,2,1.,1.);
+    for(int i=0;i<4;++i) addMeasured(report,0,1,1.,1.);
+    const auto graph=topology(source,report);
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint)=config();
+    joint.fixedPhaseMagnitude=.5; joint.fixedMeasurementScale=1.;
+    joint.enforceParallelWindingSign=true; joint.maximumMessageIterations=1;
+    joint.hardSignMinimumNormalAlignment.reset();
+    joint.mixedUnaryCost=100.;
+    const std::vector<FiberTraceFixedOrientation> orientations(3,FiberTraceFixedOrientation::Horizontal);
+    const std::vector<FiberTraceJointGridInitialState> initial;
+    const auto baseline=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint,{},orientations,{},initial);
+    joint.decodeRepairSweeps=5;
+    const auto result=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint,{},orientations,{},initial);
+    const auto repeat=solveFiberTraceJointGridWindingBeliefPropagation(report,graph,joint,{},orientations,{},initial);
+    CHECK(result.decodeRepairObjectiveAfter<=result.decodeRepairObjectiveBefore);
+    CHECK(result.decodeRepairRestored>0);
+    CHECK(result.mapWinding==repeat.mapWinding);
+    CHECK(result.windingValid==repeat.windingValid);
+    CHECK(result.classAProbability==baseline.classAProbability);
+    CHECK(result.mixedProbability==baseline.mixedProbability);
+    for(const auto& edge:report.constraints)
+        if(result.windingValid[edge.pieceA] && result.windingValid[edge.pieceB])
+            CHECK(result.mapWinding[edge.pieceB]>result.mapWinding[edge.pieceA]);
+}
+
+TEST_CASE("Synthetic continuation can be excluded from defect mass without losing pair factors")
+{
+    const auto source = lines(2);
+    auto report = pieces(2);
+    addMeasured(report, 0, 1, 0., .5);
+    auto graph = topology(source, report);
+    auto cfg = config();
+    cfg.continuityCutCost = 1.;
+    cfg.continuityCostByDistance = true;
+    cfg.includeContinuityInDefectMass = false;
+    const auto before = prepareFiberTraceWindingModel(report, graph, cfg);
+    FiberTraceConstraint c;
+    c.pieceA=0; c.pieceB=1; c.parallelScore=1.; c.hardContinuity=true; c.signedWindingDelta=0.;
+    report.constraints.push_back(c);
+    graph.hardConstraintIndices.push_back(1);
+    const auto after = prepareFiberTraceWindingModel(report, graph, cfg);
+    CHECK(after.incidentMeasurements == before.incidentMeasurements);
+    CHECK(after.incidentWindingMeasurements == before.incidentWindingMeasurements);
+    CHECK(after.edges.front().measurements.size() == before.edges.front().measurements.size()+1);
+    cfg.includeContinuityInDefectMass = true;
+    const auto legacy = prepareFiberTraceWindingModel(report, graph, cfg);
+    CHECK(legacy.incidentMeasurements.front() > after.incidentMeasurements.front());
+
+    // Continuation-only nodes explicitly have no data-derived defect mass.
+    report.constraints.erase(report.constraints.begin());
+    graph.hardConstraintIndices = {0};
+    graph.softConstraintIndices.clear();
+    cfg.includeContinuityInDefectMass = false;
+    const auto emptyMass = prepareFiberTraceWindingModel(report, graph, cfg);
+    CHECK(emptyMass.incidentMeasurements == std::vector<double>{0.,0.});
+    REQUIRE(emptyMass.edges.size() == 1);
+    // The prepass validates canonical adjacent pieces of one source trace.
+    report.pieces[0].endArcBaseVoxels=3.;
+    report.pieces[1].traceIndex=0; report.pieces[1].pieceIndex=1;
+    report.pieces[1].beginArcBaseVoxels=3.;
+    report.constraints[0].windingDistance=0.;
+    report.constraints[0].parallelWindingDistance=0.;
+    report.constraints[0].closestDistanceBaseVoxels=0.;
+    report.constraints[0].arcABaseVoxels=3.; report.constraints[0].arcBBaseVoxels=3.;
+    report.inputTraces=1;
+    const auto singleSource=lines(1);
+    FiberTraceBeliefPropagationConfig orientation;
+    orientation.mixedUnaryCost=2.;
+    orientation.cropMinimumBaseXYZ={-5.,-5.,-5.};
+    orientation.cropMaximumBaseXYZ={5.,5.,5.};
+    const auto withMass = solveFiberTraceMixedSumProduct(singleSource, report, orientation);
+    orientation.includeContinuityInDefectMass=false;
+    const auto withoutMass = solveFiberTraceMixedSumProduct(singleSource, report, orientation);
+    CHECK(withoutMass.mixedProbability[1] > withMass.mixedProbability[1]);
+    CHECK(withoutMass.factors == withMass.factors);
+}
+
 TEST_CASE("Distance continuation charges winding displacement without a cap")
 {
     const auto source = lines(2);
@@ -5848,7 +5988,12 @@ TEST_CASE("Distance continuation charges winding displacement without a cap")
                 const auto result = solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint, {}, {}, fixed);
                 const double delta = winding + (orientation == FiberTraceFixedOrientation::Vertical ? sign * .5 : 0.);
                 CHECK(result.decodedEnergy == doctest::Approx(2. * std::abs(delta)));
-                CHECK(result.continuityCutEnergy == doctest::Approx(2. * std::abs(delta)));
+                CHECK(result.continuityStepEnergy == doctest::Approx(2. * std::abs(delta)));
+                CHECK(result.continuityCutEnergy == 0.);
+                CHECK(result.continuityMapCuts == 0);
+                CHECK(result.continuityStepEligible == 1);
+                CHECK(result.continuityNonzeroSteps == (delta != 0.));
+                CHECK_FALSE(result.factorDiagnostics.front().continuityMapCut);
             }
         }
     }
@@ -5884,6 +6029,14 @@ TEST_CASE("Free continuation cuts are exactly absent from the solver graph")
     CHECK(result.mapWinding == baseline.mapWinding);
     CHECK(result.decodedEnergy == baseline.decodedEnergy);
     CHECK(result.retainedFactors == baseline.retainedFactors);
+    joint.continuityCostByDistance = true;
+    const auto zeroStep = solveFiberTraceJointGridWindingBeliefPropagation(report, graph, joint);
+    CHECK(zeroStep.mixedProbability == baseline.mixedProbability);
+    CHECK(zeroStep.mapWinding == baseline.mapWinding);
+    CHECK(zeroStep.retainedFactors == baseline.retainedFactors);
+    for (const auto& diagnostic : zeroStep.factorDiagnostics)
+        if (diagnostic.constraintIndex == 1)
+            CHECK(diagnostic.continuityMapCut);
 }
 
 TEST_CASE("Free cuts do not connect independent gauges and defects do not pay cut cost")

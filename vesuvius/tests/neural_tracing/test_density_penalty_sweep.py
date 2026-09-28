@@ -46,3 +46,18 @@ def test_resume_patch_excludes_reports():
     native = b'diff --git a/volume-cartographer/core/a.cpp b/volume-cartographer/core/a.cpp\nchange\n'
     report = b'diff --git a/volume-cartographer/docs/report.md b/volume-cartographer/docs/report.md\ntext\n'
     assert module.native_patch(native + report) == native
+
+
+def test_initial_only_metrics_validate_reference_coverage():
+    header = 'independent_reference_summary\nreference,calibrated\n'
+    candidates = 'independent_reference_candidates\nreference,winding,rank,hard_sign_errors\n'
+    end = 'independent_reference_end\n'
+    good = header+'0,1\n0.5,1\n'+candidates+'0,0,1,0\n0.5,0.5,1,0\n'+end
+    assert module.independent_metrics(good)['independent_percent'] == 100
+    missing = header+'0,1\n0.5,1\n'+candidates+'0,0,1,0\n'+end
+    assert module.independent_metrics(missing)['independent_missing'] == 1
+    assert module.independent_metrics(missing)['independent_percent'] == 50
+    for bad in (header+candidates+end, good.replace('0.5,0.5,1,0', '2,2,1,0'),
+                good.replace('0.5,0.5,1,0', '0.5,nan,1,0')):
+        with pytest.raises(ValueError):
+            module.independent_metrics(bad)

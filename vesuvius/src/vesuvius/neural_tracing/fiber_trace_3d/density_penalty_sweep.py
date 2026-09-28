@@ -31,15 +31,18 @@ def refine(scale, floor, tested, iteration):
             (scale, math.sqrt(lower * floor)), (scale, math.sqrt(upper * floor))]
 
 
-def metrics(prefix):
-    from .crop_benchmark import bp_metrics
-    log = prefix.with_suffix('.log').read_text()
-    result = bp_metrics(log)
-    if not math.isfinite(result['constraint_score_percent']):
-        raise ValueError('nonfinite removal score')
+def independent_metrics(log):
+    """Read initial winding assignments without requiring a reference-assisted solve."""
+    result = {}
     rows = [r for r in csv.DictReader(io.StringIO(log.split('independent_reference_candidates\n')[1].split('independent_reference_end')[0])) if r['rank'] == '1']
     summaries = list(csv.DictReader(io.StringIO(log.split('independent_reference_summary\n')[1].split('independent_reference_candidates')[0])))
     expected = {r['reference'] for r in summaries}
+    if not expected:
+        raise ValueError('empty independent reference summary')
+    if not {r['reference'] for r in rows} <= expected:
+        raise ValueError('unexpected independent reference candidate')
+    if any(not math.isfinite(float(r[k])) for r in rows for k in ('reference', 'winding')):
+        raise ValueError('nonfinite independent reference winding')
     if len(expected) != len(summaries) or len({r['reference'] for r in rows}) != len(rows):
         raise ValueError('multiple independent gauges per reference require explicit reporting')
     if any(r['calibrated'] != '1' for r in summaries):
@@ -47,6 +50,16 @@ def metrics(prefix):
     result['ladder'] = [{k: r[k] for k in ('reference', 'winding', 'hard_sign_errors')} for r in rows]
     result['independent_percent'] = 100 * sum(float(r['reference']) == float(r['winding']) for r in rows) / len(expected)
     result['independent_missing'] = len(expected - {r['reference'] for r in rows})
+    return result
+
+
+def metrics(prefix):
+    from .crop_benchmark import bp_metrics
+    log = prefix.with_suffix('.log').read_text()
+    result = bp_metrics(log)
+    if not math.isfinite(result['constraint_score_percent']):
+        raise ValueError('nonfinite removal score')
+    result.update(independent_metrics(log))
     pieces = list(csv.DictReader(Path(str(prefix) + '_consistency.csv').open()))
     result['defect_percent'] = 100 * sum(r['winding_final_class'] == 'defect' for r in pieces) / len(pieces)
     result['wall_seconds'] = json.loads(prefix.with_suffix('.run.json').read_text())['wall_seconds']

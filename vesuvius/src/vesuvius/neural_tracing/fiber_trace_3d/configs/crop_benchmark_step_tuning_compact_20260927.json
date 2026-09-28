@@ -1,0 +1,82 @@
+{
+  "output_root": "/ephemeral/hendrik/fiber_crop_bench/20260927_step_tuning_compact_v1",
+  "local_cost_sweep": {
+    "template": "/home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/crop_benchmark_local_events_local-parallel_20260927.json",
+    "workers": 3,
+    "threads": 48,
+    "points": [
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "slack0p1",
+        "options": {
+          "--winding-hard-sign-slack-cost": 0.1
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "slack1",
+        "options": {
+          "--winding-hard-sign-slack-cost": 1
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "slack10",
+        "options": {
+          "--winding-hard-sign-slack-cost": 10
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "span0p01",
+        "options": {
+          "--winding-local-span-cost": 0.01
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "span0p1",
+        "options": {
+          "--winding-local-span-cost": 0.1
+        }
+      },
+      {
+        "parallel": true,
+        "defect": 100,
+        "cut": 1,
+        "fixed_orientation": true,
+        "distance_cost": true,
+        "screen_only": true,
+        "variant": "span1",
+        "options": {
+          "--winding-local-span-cost": 1
+        }
+      }
+    ]
+  }
+}

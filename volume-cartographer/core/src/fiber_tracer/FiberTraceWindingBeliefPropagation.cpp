@@ -656,17 +656,18 @@ PreparedWinding prepareWinding(
                 measurement.perpendicularSignPenalty > 0.0 ||
                 measurement.hardParallelSign ||
                 measurement.hardPerpendicularSign;
-            if (measurement.parallel > 0.0 ||
-                measurement.perpendicular > 0.0) {
+            if ((!measurement.continuity || config.includeContinuityInDefectMass) &&
+                (measurement.parallel > 0.0 || measurement.perpendicular > 0.0)) {
                 result.incidentMeasurements[result.edges[edge].a] += measurement.evidenceWeight;
                 result.incidentMeasurements[result.edges[edge].b] += measurement.evidenceWeight;
             }
-            if (parallelWindingWeight(measurement) > 0.0 ||
+            if ((!measurement.continuity || config.includeContinuityInDefectMass) &&
+                (parallelWindingWeight(measurement) > 0.0 ||
                 perpendicularWindingWeight(measurement) > 0.0 ||
                 measurement.parallelSignPenalty > 0.0 ||
                 measurement.perpendicularSignPenalty > 0.0 ||
                 measurement.hardParallelSign ||
-                measurement.hardPerpendicularSign) {
+                measurement.hardPerpendicularSign)) {
                 result.incidentWindingMeasurements[result.edges[edge].a] += measurement.evidenceWeight;
                 result.incidentWindingMeasurements[result.edges[edge].b] += measurement.evidenceWeight;
             }
@@ -3071,6 +3072,101 @@ void initializeGridMessagesFromState(
     }
 }
 
+double gridUnaryLogPotential(
+    const PreparedWinding& problem, const GridRound& round, std::size_t node,
+    const JointState& decoded, const FiberTraceJointGridWindingConfig& config)
+{
+    const bool chargeDefect = decoded.orientation == JointClass::Mixed &&
+        (round.fixedOrientations.empty() || round.fixedOrientations[node] != JointClass::Mixed);
+    if (chargeDefect) {
+        const auto& incident = round.fixedOrientations.empty()
+            ? problem.incidentMeasurements : problem.incidentWindingMeasurements;
+        return -scaledDefectCost(problem, node, config.mixedUnaryCost) *
+            defectMeasure(problem, node, incident[node]) / config.orientationTemperature;
+    }
+    if (decoded.orientation != JointClass::Mixed && config.continuousCoordinateCost > 0.0)
+        return -config.continuousCoordinateCost * std::abs(
+            static_cast<double>(decoded.winding) - std::round(round.continuousNodes.at(node))) /
+            config.temperature;
+    return 0.0;
+}
+
+// Optimize exactly the BP log potentials, not the differently scaled raw-energy
+// diagnostic. Calibration, phase, candidate supports and gauges stay fixed.
+void repairGridDecode(
+    const PreparedWinding& problem, const GridRound& round,
+    const GridCalibrationCell& calibration, std::span<const int> phaseSigns,
+    const FiberTraceJointGridWindingConfig& config, std::vector<JointState>& decoded,
+    FiberTraceInterleavedWindingReport& report)
+{
+    if (config.decodeRepairSweeps == 0)
+        return;
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<std::vector<std::size_t>> incident(decoded.size());
+    for (std::size_t i=0; i<problem.edges.size(); ++i) {
+        incident[problem.edges[i].a].push_back(i);
+        incident[problem.edges[i].b].push_back(i);
+    }
+    const auto edgeEnergy = [&](const Edge& edge, const JointState& a, const JointState& b) {
+        return -gridLogPotential(edge, a, b, phaseSigns[problem.componentByNode[edge.a]],
+            calibration, config, round.fixedOrientations.empty());
+    };
+    const auto objective = [&] {
+        double energy=0.0;
+        for (std::size_t n=0; n<decoded.size(); ++n)
+            energy -= gridUnaryLogPotential(problem, round, n, decoded[n], config);
+        for (const auto& edge : problem.edges)
+            energy += edgeEnergy(edge, decoded[edge.a], decoded[edge.b]);
+        return energy;
+    };
+    report.decodeRepairObjectiveBefore=objective();
+    if (!std::isfinite(report.decodeRepairObjectiveBefore))
+        throw std::logic_error("Decode repair requires a feasible projected assignment");
+    for (std::size_t sweep=0; sweep<config.decodeRepairSweeps; ++sweep) {
+        std::size_t changes=0;
+        for (std::size_t index=0; index<decoded.size(); ++index) {
+            const std::size_t node = sweep%2 == 0 ? index : decoded.size()-1-index;
+            if (round.gauge[node] != 0 || (!round.fixedStates.empty() && round.fixedStates[node]))
+                continue;
+            const auto localEnergy = [&](const JointState& state) {
+                double energy=-gridUnaryLogPotential(problem, round, node, state, config);
+                for (const auto i : incident[node]) {
+                    const auto& edge=problem.edges[i];
+                    energy += edgeEnergy(edge, edge.a==node ? state : decoded[edge.a],
+                        edge.b==node ? state : decoded[edge.b]);
+                    if (!std::isfinite(energy)) break;
+                }
+                return energy;
+            };
+            JointState best=decoded[node];
+            double bestEnergy=localEnergy(best);
+            const auto count=gridPieceStateCount(node, round.lower, round.upper, round.gauge,
+                round.fixedOrientations, round.fixedStates);
+            for (std::size_t i=0; i<count; ++i) {
+                const auto candidate=gridPieceState(node, i, round.lower, round.gauge,
+                    round.fixedOrientations, round.fixedStates);
+                const double energy=localEnergy(candidate);
+                if (energy<bestEnergy) { best=candidate; bestEnergy=energy; }
+            }
+            if (best.orientation!=decoded[node].orientation || best.winding!=decoded[node].winding) {
+                report.decodeRepairRestored += decoded[node].orientation==JointClass::Mixed && best.orientation!=JointClass::Mixed;
+                report.decodeRepairDisabled += decoded[node].orientation!=JointClass::Mixed && best.orientation==JointClass::Mixed;
+                decoded[node]=best;
+                ++changes;
+            }
+        }
+        ++report.decodeRepairIterations;
+        report.decodeRepairChanges += changes;
+        if (changes==0) break;
+    }
+    report.decodeRepairObjectiveAfter=objective();
+    const double roundoff=1.0e-9*std::max(1.0,std::abs(report.decodeRepairObjectiveBefore));
+    if (!std::isfinite(report.decodeRepairObjectiveAfter) ||
+        report.decodeRepairObjectiveAfter > report.decodeRepairObjectiveBefore+roundoff)
+        throw std::logic_error("Decode repair increased normalized objective");
+    report.decodeRepairSeconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+}
+
 GridLogTotals buildGridTotals(
     const PreparedWinding& problem,
     const GridRound& round,
@@ -3079,9 +3175,6 @@ GridLogTotals buildGridTotals(
     GridLogTotals totals;
     totals.pieceAccumulators.resize(problem.piecesByNode.size());
     totals.pieceValues.resize(problem.piecesByNode.size());
-    const auto& incident = round.fixedOrientations.empty()
-        ? problem.incidentMeasurements
-        : problem.incidentWindingMeasurements;
     for (std::size_t node = 0; node < problem.piecesByNode.size(); ++node) {
         const std::size_t stateCount = gridPieceStateCount(
             node,
@@ -3100,24 +3193,7 @@ GridLogTotals buildGridTotals(
                 round.gauge,
                 round.fixedOrientations,
                 round.fixedStates);
-            const bool chargeDefect =
-                decoded.orientation == JointClass::Mixed &&
-                (round.fixedOrientations.empty() ||
-                 round.fixedOrientations[node] != JointClass::Mixed);
-            double logUnary = chargeDefect
-                ? -scaledDefectCost(problem, node, config.mixedUnaryCost) *
-                      defectMeasure(problem, node, incident[node]) /
-                      config.orientationTemperature
-                : 0.0;
-            if (!chargeDefect &&
-                decoded.orientation != JointClass::Mixed &&
-                config.continuousCoordinateCost > 0.0) {
-                logUnary -= config.continuousCoordinateCost *
-                    std::abs(
-                        static_cast<double>(decoded.winding) -
-                        std::round(round.continuousNodes.at(node))) /
-                    config.temperature;
-            }
+            const double logUnary = gridUnaryLogPotential(problem, round, node, decoded, config);
             addLogFactor(totals.pieceAccumulators[node][state], logUnary);
         }
     }
@@ -4170,6 +4246,8 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
         projectDecodedHardContinuity(
             prepared, decoded, activeConfidence, round.fixedStates);
     }
+    repairGridDecode(prepared, round, selectedCalibration, report.componentPhaseSign,
+        config, decoded, report);
     for (std::size_t piece = 0; piece < pieceCount; ++piece) {
         const std::size_t node = prepared.pieceToNode[piece];
         const auto& state = decoded[node];
@@ -4186,6 +4264,17 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
                    : std::numeric_limits<double>::quiet_NaN();
         if (!active)
             report.mapProbability[piece] = report.mixedProbability[piece];
+        else if (config.decodeRepairSweeps != 0) {
+            const auto& probabilities=round.pieceProbabilities[node];
+            for (std::size_t i=0; i<probabilities.size(); ++i) {
+                const auto candidate=gridPieceState(node, i, round.lower, round.gauge,
+                    round.fixedOrientations, round.fixedStates);
+                if (candidate.orientation==state.orientation && candidate.winding==state.winding) {
+                    report.mapProbability[piece]=probabilities[i];
+                    break;
+                }
+            }
+        }
     }
     std::map<std::size_t, std::size_t> diagnosticByConstraint;
     if (config.continuityCutCost) {
@@ -4194,15 +4283,28 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
                 continue;
             const auto a = diagnostic.pieceA, b = diagnostic.pieceB;
             const bool active = report.windingValid[a] && report.windingValid[b];
+            if (config.continuityCostByDistance) {
+                // A finite step pays energy but never disables the connection.
+                // In particular, downstream inlier extraction must retain it.
+                // Exactly zero energy is an absent factor, including in
+                // downstream inlier connectivity; positive steps stay active.
+                diagnostic.continuityMapCut = *config.continuityCutCost == 0.0;
+                report.continuityStepEligible += active;
+                if (active) {
+                    const double distance = std::abs(
+                        report.mapLatentCoordinate[b] - report.mapLatentCoordinate[a]);
+                    report.continuityNonzeroSteps += distance > 0.0;
+                    report.continuityStepEnergy += *config.continuityCutCost * distance;
+                }
+                continue;
+            }
             diagnostic.continuityMapCut = *config.continuityCutCost == 0.0 ||
                 (active && (report.mapOrientationByPiece[a] != report.mapOrientationByPiece[b] ||
                             report.mapWinding[a] != report.mapWinding[b]));
             report.continuityCutEligible += active;
             report.continuityMapCuts += active && diagnostic.continuityMapCut;
             if (active && diagnostic.continuityMapCut)
-                report.continuityCutEnergy += *config.continuityCutCost *
-                    (config.continuityCostByDistance
-                        ? std::abs(report.mapLatentCoordinate[b] - report.mapLatentCoordinate[a]) : 1.0);
+                report.continuityCutEnergy += *config.continuityCutCost;
         }
     }
     if (config.measurementDisableCost || config.continuityCutCost)

@@ -3270,3 +3270,19 @@ identity remains unconfirmed. Global-assignment experiments not yet implemented.
 
 - Added manager-owned, SHA-256-bound snapshot imports and required stable
   external model identifiers for new inference runs.
+## 2026-09-27 — Finite winding-step audit and parameter search
+
+- Checkpoint before tuning: `dd8c1331e`. New candidates use finite physical
+  winding-step costs, not hard continuation equality or flat break penalties.
+- Corrected downstream diagnostics: positive finite steps are charged, not
+  reported as removed connections. Zero-cost edges retain absent-factor behavior.
+- Added default-off local normalized-MAP decode repair and default-preserving
+  continuation defect-mass ablations. Decoder keeps calibration/gauges/supports
+  fixed and can restore defects, but objective improvement is not accuracy.
+- Reproducible screening skips only reference-assisted solves, validated against
+  full initial ladders. All trials/provenance retained in
+  `volume-cartographer/docs/fiber_benchmark_runs/2026-09-27-winding-step-search.*`.
+- Native122 and Python26 tests pass.48completed trials; best finite initial
+  accuracy26.92% versus legacy38.46%, no candidate promoted. Remaining runs
+  blocked intermittently by md0 filesystem transaction waits. Latest status
+  table: `2026-09-27-winding-step-search-status.md`; task remains incomplete.

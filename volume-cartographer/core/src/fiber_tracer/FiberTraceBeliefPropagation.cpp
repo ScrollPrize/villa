@@ -30,6 +30,7 @@ struct Factor {
     double differentCost = 0.0;
     std::size_t measurements = 0;
     double measurementMass = 0.;
+    double defectMass = 0.;
     bool hardContinuity = false;
 };
 
@@ -37,6 +38,7 @@ struct Graph {
     std::vector<Factor> factors;
     std::vector<std::vector<std::size_t>> adjacency;
     std::vector<double> incidentMeasurements;
+    std::vector<double> defectMass;
     std::size_t measurements = 0;
     std::size_t neutralFactors = 0;
     std::size_t neutralMeasurements = 0;
@@ -103,7 +105,8 @@ void validateConfig(const FiberTraceBeliefPropagationConfig& config)
 Graph buildGraph(
     std::size_t pieceCount,
     const FiberTraceConstraintReport& constraints,
-    bool enforceHardSplitContinuity = false)
+    bool enforceHardSplitContinuity = false,
+    bool includeContinuityInDefectMass = true)
 {
     if (pieceCount != constraints.pieces.size())
         throw std::logic_error("BP graph size does not match constraints");
@@ -140,6 +143,8 @@ Graph buildGraph(
         factor.sameCost += constraint.evidenceWeight * (1.0 - constraint.parallelScore);
         factor.differentCost += constraint.evidenceWeight * constraint.parallelScore;
         factor.measurementMass += constraint.evidenceWeight;
+        if (!constraint.hardContinuity || includeContinuityInDefectMass)
+            factor.defectMass += constraint.evidenceWeight;
         ++factor.measurements;
         factor.hardContinuity = factor.hardContinuity ||
             (enforceHardSplitContinuity && constraint.hardContinuity);
@@ -148,6 +153,7 @@ Graph buildGraph(
     Graph graph;
     graph.adjacency.resize(pieceCount);
     graph.incidentMeasurements.assign(pieceCount, 0);
+    graph.defectMass.assign(pieceCount, 0);
     graph.factors.reserve(merged.size());
     for (const auto& [key, factor] : merged) {
         (void)key;
@@ -173,6 +179,8 @@ Graph buildGraph(
         graph.adjacency[normalized.b].push_back(index);
         graph.incidentMeasurements[normalized.a] += normalized.measurementMass;
         graph.incidentMeasurements[normalized.b] += normalized.measurementMass;
+        graph.defectMass[normalized.a] += normalized.defectMass;
+        graph.defectMass[normalized.b] += normalized.defectMass;
         graph.measurements += normalized.measurements;
     }
 
@@ -219,7 +227,8 @@ PreparedProblem prepareProblem(
     problem.graph = buildGraph(
         topology.pieceLines.size(),
         constraints,
-        config.enforceHardSplitContinuity);
+        config.enforceHardSplitContinuity,
+        config.includeContinuityInDefectMass);
     problem.normalizedArcWeights = topology.normalizedArcWeights;
     return problem;
 }
@@ -1073,7 +1082,7 @@ FiberTraceBeliefPropagationReport solveFiberTraceMixedSumProduct(
         logUnary[node] = {
             0.0,
             -config.mixedUnaryCost *
-                static_cast<double>(graph.incidentMeasurements[node]) /
+                graph.defectMass[node] /
                 temperature,
             0.0};
         if (!std::isfinite(logUnary[node][1])) {

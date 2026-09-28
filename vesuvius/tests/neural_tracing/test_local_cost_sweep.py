@@ -67,3 +67,47 @@ def test_legacy_control_does_not_enable_local_extraction():
     cfg = module.trial_config(template, '/tmp/trials', dict(parallel=True, defect=100, cut='hard', fixed_orientation=True, local_events=False), 48)
     assert cfg['commands'][0]['name'].endswith('-legacy')
     assert '--local-constraint-events' not in cfg['commands'][0]['args']
+
+
+def test_screening_removes_only_reference_assisted_options():
+    template = dict(reference_dir='refs', input_files=[], commands=[dict(args=[
+        'direction-ablation', 'trace', '--output', 'old', '--threads', '64',
+        '--reference-prune-offenders', '--reference-prune-policy', 'oracle-inliers',
+        '--reference-oracle-magnitude-weight', '1', '--reference-oracle-accept-message-limit',
+        '--reference-oracle-rounds', '1', '--reference-initial-readout'])])
+    cfg = module.trial_config(template, '/tmp/trials', dict(parallel=True, defect=100, cut=1,
+                             distance_cost=True, screen_only=True), 48)
+    args = cfg['commands'][0]['args']
+    assert '--reference-initial-readout' in args
+    assert not any(x.startswith('--reference-prune') or x.startswith('--reference-oracle') for x in args)
+    assert '--winding-continuity-step-cost' in args
+    assert cfg['commands'][0]['name'].endswith('-distance-screen')
+
+
+def test_option_overrides_require_distinct_artifact_identity():
+    template = dict(reference_dir='refs', input_files=[], commands=[dict(args=[
+        'direction-ablation', 'trace', '--output', 'old', '--threads', '64', '--bp-mixed-cost', '1'])])
+    point = dict(parallel=True, defect=100, cut=1, distance_cost=True, options={'--bp-mixed-cost': 10})
+    with pytest.raises(ValueError):
+        module.trial_config(template, '/tmp/trials', point, 48)
+    point['variant'] = 'mixed10'
+    args = module.trial_config(template, '/tmp/trials', point, 48)['commands'][0]['args']
+    assert args.count('--bp-mixed-cost') == 1
+    assert args[args.index('--bp-mixed-cost')+1] == '10'
+
+
+def test_partial_report_marks_missing_roots_incomplete(tmp_path, monkeypatch):
+    import json
+    import sys
+    from types import SimpleNamespace
+    monkeypatch.setitem(sys.modules, 'lasagna.inference_provenance', SimpleNamespace(
+        atomic_write=lambda path, value, **kwargs: path.write_text(json.dumps(value))))
+    destination = tmp_path / 'report'
+    missing = str(tmp_path / 'pending')
+    module.publish_screen_report(dict(output_root=missing, local_cost_sweep=dict(
+        report_destination=str(destination))))
+    result = json.loads(destination.with_suffix('.json').read_text())
+    assert result['complete'] is False
+    assert result['pending_roots'] == [missing]
+    assert result['results'] == []
+    assert 'Pending roots' in destination.with_suffix('.md').read_text()

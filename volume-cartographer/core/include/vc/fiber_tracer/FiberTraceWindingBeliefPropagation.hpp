@@ -159,6 +159,10 @@ struct FiberTraceWindingBeliefPropagationConfig {
     // With a cost configured, penalize physical winding distance instead of
     // a constant cut: C*abs(delta integer winding + calibrated H/V offset).
     bool continuityCostByDistance = false;
+    // Experimental prior: synthetic boundaries need not add evidence mass.
+    bool includeContinuityInDefectMass = true;
+    // Opt-in deterministic coordinate descent of the decoded BP objective.
+    std::size_t decodeRepairSweeps = 0;
     double temperature = 0.25;
     double messageDamping = 0.5;
     double messageResidualTolerance = 1.0e-8;
@@ -612,6 +616,16 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
     std::size_t continuityCutEligible = 0;
     std::size_t continuityMapCuts = 0;
     double continuityCutEnergy = 0.0;
+    std::size_t continuityStepEligible = 0;
+    std::size_t continuityNonzeroSteps = 0;
+    double continuityStepEnergy = 0.0;
+    std::size_t decodeRepairIterations = 0;
+    std::size_t decodeRepairChanges = 0;
+    std::size_t decodeRepairRestored = 0;
+    std::size_t decodeRepairDisabled = 0;
+    double decodeRepairObjectiveBefore = 0.0;
+    double decodeRepairObjectiveAfter = 0.0;
+    double decodeRepairSeconds = 0.0;
     std::size_t measurementDisableMapOff = 0;
     double measurementDisableConditionalPosteriorSum = 0.0;
     std::size_t initialDefectGaugeComponents = 0;

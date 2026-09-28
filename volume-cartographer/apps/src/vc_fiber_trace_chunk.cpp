@@ -209,6 +209,7 @@ struct Options {
     std::optional<double> windingMeasurementDisableCost;
     std::optional<double> windingContinuityCutCost;
     bool windingContinuityCostByDistance = false;
+    bool windingIncludeContinuityInDefectMass = true;
     std::array<double, 5> windingWeights =
         vc::fiber_tracer::kDefaultFiberTraceWindingClassWeights;
     std::array<double, 2> windingSignWeights =
@@ -467,6 +468,8 @@ void usage(const char* executable)
               << "  --winding-solver MODE     joint-grid, alternating, ceres, or ordered-cuts [joint-grid]\n"
               << "  --winding-fixed-orientation  solve H/V/Mixed first, then only winding\n"
               << "  --winding-defect-cost F   winding-stage Defect cost per constraint [100]\n"
+              << "  --continuity-defect-mass all|ordinary|winding-ordinary|prepass-ordinary [all]\n"
+              << "  --winding-decode-repair N deterministic local label optimization sweeps [0]\n"
               << "  --split-continuity MODE   hard or finite [hard]\n"
               << "  --piece-break-cost F      finite-mode same-trace boundary cost [0]\n"
               << "  --winding-continuous-cost F\n"
@@ -1222,6 +1225,19 @@ Options parse(int argc, char** argv)
                 fail("--winding-defect-cost must be finite and nonnegative");
             }
             options.hasWindingDefectCostOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-decode-repair") {
+            options.jointGrid.decodeRepairSweeps = count(index, argc, argv, "--winding-decode-repair");
+            options.hasJointGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--continuity-defect-mass") {
+            const auto mode = value(index, argc, argv, "--continuity-defect-mass");
+            if (mode != "all" && mode != "ordinary" && mode != "winding-ordinary" && mode != "prepass-ordinary")
+                fail("Invalid continuity-defect-mass mode");
+            options.bp.includeContinuityInDefectMass = mode != "ordinary" && mode != "prepass-ordinary";
+            options.windingIncludeContinuityInDefectMass = mode != "ordinary" && mode != "winding-ordinary";
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--piece-break-cost") {
@@ -3108,6 +3124,16 @@ void writeAndPrintBpReport(
         std::cout << "continuity_cut eligible=" << interleaved->continuityCutEligible
                   << " map_cut=" << interleaved->continuityMapCuts
                   << " energy=" << interleaved->continuityCutEnergy << '\n';
+        std::cout << "continuity_step eligible=" << interleaved->continuityStepEligible
+                  << " nonzero=" << interleaved->continuityNonzeroSteps
+                  << " energy=" << interleaved->continuityStepEnergy << '\n';
+        std::cout << "decode_repair sweeps=" << interleaved->decodeRepairIterations
+                  << " changes=" << interleaved->decodeRepairChanges
+                  << " restored=" << interleaved->decodeRepairRestored
+                  << " disabled=" << interleaved->decodeRepairDisabled
+                  << " before=" << interleaved->decodeRepairObjectiveBefore
+                  << " after=" << interleaved->decodeRepairObjectiveAfter
+                  << " seconds=" << interleaved->decodeRepairSeconds << '\n';
         csvOutput << ",winding_latent_mean,winding_phase,winding_scale,"
                      "winding_defect_cost_per_constraint,"
                      "winding_piece_break_cost,"
@@ -8211,6 +8237,8 @@ int main(int argc, char** argv)
                             windingConfig.measurementDisableCost = options.windingMeasurementDisableCost;
                             windingConfig.continuityCutCost = options.windingContinuityCutCost;
                             windingConfig.continuityCostByDistance = options.windingContinuityCostByDistance;
+                            windingConfig.includeContinuityInDefectMass = options.windingIncludeContinuityInDefectMass;
+                            windingConfig.decodeRepairSweeps = options.jointGrid.decodeRepairSweeps;
                             windingConfig.maximumTotalCandidateStates =
                                 options.windingMaximumCandidateStates;
                             windingConfig.messageResidualTolerance =
@@ -10733,6 +10761,8 @@ int main(int argc, char** argv)
                                     windingConfig;
                             windingConfig.temperature =
                                 options.bp.horizontalnessTemperature;
+                            windingConfig.includeContinuityInDefectMass =
+                                options.windingIncludeContinuityInDefectMass;
                             windingConfig.messageDamping =
                                 options.bp.messageDamping;
                             windingConfig.maximumTotalCandidateStates =
