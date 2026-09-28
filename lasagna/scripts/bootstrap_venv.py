@@ -180,6 +180,37 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def environment_check_script(backend: str, skip_cuda_check: bool) -> str:
+    """Python source run inside the new venv to report the install.
+
+    torch.cuda.is_available() only reports that a driver and a device are
+    present; it stays True on a GPU whose compute capability the wheel has
+    no kernels for. Launch one real kernel so a mismatch surfaces here
+    rather than part-way through a fit. With --skip-cuda-check or the CPU
+    backend the GPU is not touched at all.
+    """
+    lines = [
+        "import json, torch",
+        "import vesuvius.neural_tracing.fiber_trace_3d.infer as fiber_infer",
+        "print(json.dumps({'torch': torch.__version__,"
+        " 'torch_cuda': torch.version.cuda,"
+        " 'cuda_available': torch.cuda.is_available(),"
+        " 'fiber_infer': fiber_infer.__file__}))",
+    ]
+    if backend != "cpu" and not skip_cuda_check:
+        lines += [
+            "ok = torch.cuda.is_available()",
+            "if ok:",
+            "    try:",
+            "        (torch.ones(8, device='cuda') * 2).sum().item()",
+            "    except Exception as exc:",
+            "        print('CUDA smoke test failed:', exc)",
+            "        ok = False",
+            "raise SystemExit(0 if ok else 1)",
+        ]
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     uv = shutil.which("uv")
@@ -232,26 +263,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         return 0
-    # torch.cuda.is_available() only reports that a driver and a device are
-    # present; it stays True on a GPU whose compute capability the wheel has
-    # no kernels for. Launch one real kernel so a mismatch surfaces here
-    # rather than part-way through a fit.
-    check = "\n".join([
-        "import json, torch",
-        "import vesuvius.neural_tracing.fiber_trace_3d.infer as fiber_infer",
-        "print(json.dumps({'torch': torch.__version__,"
-        " 'torch_cuda': torch.version.cuda,"
-        " 'cuda_available': torch.cuda.is_available(),"
-        " 'fiber_infer': fiber_infer.__file__}))",
-        "ok = torch.cuda.is_available()",
-        "if ok:",
-        "    try:",
-        "        (torch.ones(8, device='cuda') * 2).sum().item()",
-        "    except Exception as exc:",
-        "        print('CUDA smoke test failed:', exc)",
-        "        ok = False",
-        f"raise SystemExit(0 if {backend == 'cpu' or args.skip_cuda_check!r} or ok else 1)",
-    ])
+    check = environment_check_script(backend, args.skip_cuda_check)
     check_environment = dict(os.environ)
     check_environment.pop("PYTHONPATH", None)
     result = subprocess.run(
