@@ -1513,11 +1513,28 @@ static inline cv::Vec2f mul(const cv::Vec2f &a, const cv::Vec2f &b)
     return{a[0]*b[0],a[1]*b[1]};
 }
 
+static bool pointSearchAxisContains(float value, int size)
+{
+    // Narrow ribbons have no interior margin, but still contain bilinear cells.
+    if (size <= 3)
+        return size >= 2 && value >= 0 && value < size - 1;
+    const int rounded = cvRound(value);
+    return rounded >= 1 && rounded < size - 1;
+}
+
+static float pointSearchAxisSeed(int size)
+{
+    return size <= 3 ? 0.5f * (size - 1) : float(1 + rand() % (size - 3));
+}
+
 template <typename E>
 static float search_min_loc(const cv::Mat_<E> &points, cv::Vec2f &loc, cv::Vec3f &out, cv::Vec3f tgt, cv::Vec2f init_step, float min_step_x)
 {
-    cv::Rect boundary(1,1,points.cols-2,points.rows-2);
-    if (!boundary.contains(cv::Point(loc))) {
+    const auto contains = [&](const cv::Vec2f& p) {
+        return pointSearchAxisContains(p[0], points.cols) &&
+               pointSearchAxisContains(p[1], points.rows);
+    };
+    if (!contains(loc)) {
         out = {-1,-1,-1};
         return -1;
     }
@@ -1544,7 +1561,7 @@ static float search_min_loc(const cv::Mat_<E> &points, cv::Vec2f &loc, cv::Vec3f
             cv::Vec2f cand = loc+mul(off,step);
 
             //just skip if out of bounds
-            if (!boundary.contains(cv::Point(cand)))
+            if (!contains(cand))
                 continue;
 
             val = at_int(points, cand);
@@ -1575,15 +1592,14 @@ static float search_min_loc(const cv::Mat_<E> &points, cv::Vec2f &loc, cv::Vec3f
 template <typename E>
 static float pointTo_(cv::Vec2f &loc, const cv::Mat_<E> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale)
 {
+    if (points.cols < 2 || points.rows < 2)
+        return -1;
     loc = cv::Vec2f(points.cols/2,points.rows/2);
     cv::Vec3f _out;
 
     cv::Vec2f step_small = {std::max(1.0f,scale),std::max(1.0f,scale)};
     float min_mul = std::min(0.1*points.cols/scale,0.1*points.rows/scale);
     cv::Vec2f step_large = {min_mul*scale,min_mul*scale};
-
-    assert(points.cols > 3);
-    assert(points.rows > 3);
 
     float dist = search_min_loc(points, loc, _out, tgt, step_small, scale*0.1);
 
@@ -1600,7 +1616,7 @@ static float pointTo_(cv::Vec2f &loc, const cv::Mat_<E> &points, const cv::Vec3f
     int r_full = 0;
     for(int r=0;r<10*max_iters && r_full < max_iters;r++) {
         //FIXME skipn invalid init locs!
-        loc = {static_cast<float>(1 + (rand() % (points.cols-3))), static_cast<float>(1 + (rand() % (points.rows-3)))};
+        loc = {pointSearchAxisSeed(points.cols), pointSearchAxisSeed(points.rows)};
 
         if (points(loc[1],loc[0])[0] == -1)
             continue;
@@ -1658,6 +1674,8 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
                            SurfacePatchIndex* surfaceIndex, PointIndex* pointIndex)
 {
     ensureLoaded();
+    if (_points->cols < 2 || _points->rows < 2)
+        return -1;
     cv::Vec2f loc = cv::Vec2f(ptr[0], ptr[1]) + cv::Vec2f(_center[0]*_scale[0], _center[1]*_scale[1]);
     cv::Vec3f _out;
 
@@ -1720,7 +1738,7 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
     int r_full = 0;
     int skip_count = 0;
     for(int r=0; r<10*max_iters && r_full<max_iters; r++) {
-        loc = {static_cast<float>(1 + (rand() % (_points->cols-3))), static_cast<float>(1 + (rand() % (_points->rows-3)))};
+        loc = {pointSearchAxisSeed(_points->cols), pointSearchAxisSeed(_points->rows)};
 
         if ((*_points)(loc[1],loc[0])[0] == -1) {
             skip_count++;

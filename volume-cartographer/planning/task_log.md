@@ -1,5 +1,28 @@
 # Task Log
 
+## 2026-09-28 PR 1918 CI investigation
+
+- Fast-forwarded to the user's main merge, 12bcd5600. Reproduced the specialized
+  test crash with Clang QuickBuild. GDB identifies integer division by zero in
+  QuadSurface::pointTo's random seed selection when a ribbon has three columns.
+- Support two/three-sample axes in the shared picking search and seed selection;
+  reject grids without bilinear cells. Preserve existing bounds and random seed
+  selection for larger axes. Rendering interpolation is unchanged.
+- Added regression coverage for both narrow axes, shifted origins, off-plane
+  restarts, and float/double free pointTo overloads. Clang specialized shard:
+  18/18 passed. Four QuadSurface CTest targets passed. GCC VC3D rebuilt and
+  generated-view/QuadSurface tests passed.
+- Rendering CI failed parallel/mixed_correlated at 1.071912x reference with the
+  correct checksum. The first local GCC Release/Valgrind full matrix passed;
+  that case was 0.994493x. A second local run failed mixed_shuffled at 1.05259x
+  (first run: 1.02521x). The PR does not modify sampler/benchmark sources.
+  Benchmark variation remains unresolved; no threshold/reference changes made.
+  Requested a rerun of the failing CI rendering job without code changes.
+- The large-PR gate requires an independent approving review, not a code fix.
+- Commands: cmake --build volume-cartographer/build/dev-quickbuild-clang --target vc_test_specialized test_quadsurface_basics -j16;
+  ctest --test-dir volume-cartographer/build/dev-quickbuild-clang --output-on-failure --parallel 4 -L '^vc-specialized$';
+  cmake --build volume-cartographer/build/ci-render-benchmark --target render_valgrind_ci -j8.
+
 ## 2026-09-28 Commit and integrate main
 
 - Committed signed CP direction annotations/reset menus as 160ff1ac6 and
