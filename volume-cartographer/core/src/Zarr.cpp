@@ -340,7 +340,12 @@ void createPyramidDatasets(const std::filesystem::path& outDir,
         chunks[xd] = std::min(CW, shape[xd]);
 
         std::vector<size_t> shard;
-        if (shardFullWidth) { shard = chunks; shard[xd] = shape[xd]; }
+        // Round out to whole chunks: a shard may overhang the array (the grid is
+        // ceil(shape/shard)) but must be an exact multiple of the chunk shape.
+        if (shardFullWidth) {
+            shard = chunks;
+            shard[xd] = ((shape[xd] + chunks[xd] - 1) / chunks[xd]) * chunks[xd];
+        }
 
         vc::createZarrDataset(outDir, std::to_string(level), shape, chunks, dtype,
                               compressor, dimensionSeparator, 0, compressionLevel, shard);

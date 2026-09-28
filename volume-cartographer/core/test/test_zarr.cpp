@@ -243,3 +243,25 @@ TEST_CASE("createPyramidDatasets: rank-2 shape0 produces rank-2 levels")
     }
     std::filesystem::remove_all(d);
 }
+
+// Full-width shards on a width that does not divide by the chunk width: each
+// level's shard must still be an exact multiple of that level's chunk width.
+TEST_CASE("createPyramidDatasets: full-width shards round out to whole chunks")
+{
+    auto d = tmpDir("pyr_shard");
+    createPyramidDatasets(d, /*shape0=*/{1024, 3000}, /*CH=*/128, /*CW=*/256,
+                          /*isU16=*/false, /*compressor=*/"zstd",
+                          /*compressionLevel=*/3, /*dimensionSeparator=*/"/",
+                          /*shardFullWidth=*/true);
+    for (int level = 1; level <= 5; level++) {
+        auto meta = utils::Json::parse_file(d / std::to_string(level) / "zarr.json");
+        const int shardW = meta["chunk_grid"]["configuration"]["chunk_shape"][1].get_int();
+        const int chunkW =
+            meta["codecs"][0]["configuration"]["chunk_shape"][1].get_int();
+        const int width = meta["shape"][1].get_int();
+        CHECK(shardW % chunkW == 0);
+        CHECK(shardW >= width);
+        CHECK(shardW - width < chunkW);
+    }
+    std::filesystem::remove_all(d);
+}

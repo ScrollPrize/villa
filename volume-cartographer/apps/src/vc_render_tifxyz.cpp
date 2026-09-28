@@ -1776,8 +1776,14 @@ int main(int argc, char *argv[])
             }
             // One shard per band row: a shard is never split across bands, so
             // partition boundaries (which fall on band rows) never share one.
+            // The width rounds out to whole chunks -- the shard may overhang the
+            // array, but it must be an exact multiple of the chunk shape.
             std::vector<size_t> shard0;
-            if (zarrShard) { shard0 = dsChunks; shard0.back() = dsShape.back(); }
+            if (zarrShard) {
+                shard0 = dsChunks;
+                const size_t cw = dsChunks.back();
+                shard0.back() = ((dsShape.back() + cw - 1) / cw) * cw;
+            }
             auto vcDtype = useU16 ? vc::VcDtype::uint16 : vc::VcDtype::uint8;
 
             // v2 arrays carry .zarray, v3 (sharded) arrays carry zarr.json.

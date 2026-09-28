@@ -1146,6 +1146,19 @@ std::unique_ptr<VcDataset> createZarrDataset(
     meta.fill_value = static_cast<double>(fillValue);
 
     if (!shardShape.empty()) {
+        // Every reader derives the inner-chunk grid as shard/chunk per dimension,
+        // so a shard that is not a whole number of chunks silently addresses a
+        // phantom extra shard column and the store stops being readable outside
+        // vc3d. Callers round up; anything else is a bug worth failing on.
+        for (size_t d = 0; d < shardShape.size(); ++d) {
+            if (chunks[d] == 0 || shardShape[d] % chunks[d] != 0) {
+                throw std::runtime_error(
+                    "createZarrDataset: shard shape " + std::to_string(shardShape[d]) +
+                    " is not a multiple of chunk shape " + std::to_string(chunks[d]) +
+                    " in dimension " + std::to_string(d));
+            }
+        }
+
         meta.version = utils::ZarrVersion::v3;
         meta.node_type = "array";
         meta.chunk_key_encoding = "default";

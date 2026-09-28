@@ -260,9 +260,12 @@ TEST_CASE("VcDataset: zstd compressor path")
 TEST_CASE("createZarrDataset: sharded v3 round-trips through the shard index")
 {
     auto d = tmpDir("shard");
-    const std::vector<size_t> shape{1, 256, 1024};
+    // Width deliberately does NOT divide by the chunk width: a real render is
+    // 37860 px wide against 2048 px chunks. The shard rounds out to whole chunks
+    // and overhangs the array, which is what keeps the inner-chunk grid addressable.
+    const std::vector<size_t> shape{1, 256, 1000};
     const std::vector<size_t> chunks{1, 128, 256};   // inner
-    const std::vector<size_t> shard{1, 128, 1024};   // one band row per shard
+    const std::vector<size_t> shard{1, 128, 1024};   // one band row per shard, 4 chunks
 
     auto ds = vc::createZarrDataset(d, "arr", shape, chunks, vc::VcDtype::uint8,
                                     /*compressor=*/"zstd", /*dimensionSeparator=*/"/",
@@ -279,7 +282,9 @@ TEST_CASE("createZarrDataset: sharded v3 round-trips through the shard index")
     std::vector<uint8_t> in(ds->defaultChunkSize());
     for (size_t i = 0; i < in.size(); ++i) in[i] = uint8_t((i * 7 + 13) % 251);
 
-    // Two inner chunks of the same shard, plus one in the next shard row.
+    // Two inner chunks of the same shard -- including the LAST column, which a
+    // shard sized to the ragged array width would have pushed into a phantom
+    // second shard column -- plus one in the next shard row.
     CHECK(!ds->chunkExists(0, 0, 0));
     REQUIRE(ds->writeChunk(0, 0, 0, in.data(), in.size()));
     REQUIRE(ds->writeChunk(0, 0, 3, in.data(), in.size()));
@@ -344,5 +349,20 @@ TEST_CASE("VcDataset: rank-2 array is addressed as a single ZYX plane")
     // The chunk key has two components, not three.
     CHECK(fs::exists(d / "arr" / "1" / "1"));
 
+    fs::remove_all(d);
+}
+
+// The inner-chunk grid within a shard is derived as shard/chunk per dimension,
+// so a shard that is not a whole number of chunks addresses a shard column that
+// the grid does not have. Refuse to write such a store rather than produce one
+// only vc3d can read back.
+TEST_CASE("createZarrDataset: rejects a shard that is not whole chunks")
+{
+    auto d = tmpDir("shard_ragged");
+    CHECK_THROWS_AS(
+        vc::createZarrDataset(d, "arr", /*shape=*/{1, 256, 1000},
+                              /*chunks=*/{1, 128, 256}, vc::VcDtype::uint8,
+                              "zstd", "/", 0, 3, /*shardShape=*/{1, 128, 1000}),
+        std::runtime_error);
     fs::remove_all(d);
 }
