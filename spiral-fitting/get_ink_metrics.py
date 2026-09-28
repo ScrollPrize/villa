@@ -129,6 +129,7 @@ def run_worker(argv):
     ap.add_argument('--step', type=float, default=0.5, help='tile_step_size')
     ap.add_argument('--no-tta', action='store_true', help='disable mirroring TTA (faster)')
     ap.add_argument('--procs', type=int, default=8)
+    ap.add_argument('--device', choices=('cuda', 'mps', 'cpu'), default='cuda')
     args = ap.parse_args(argv)
 
     # nnU-Net was written assuming the fork start method; Python 3.14 defaults to
@@ -144,12 +145,14 @@ def run_worker(argv):
     import torch
     from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 
+    # CUDA_VISIBLE_DEVICES already narrowed CUDA to one GPU.
+    device = torch.device('cuda', 0) if args.device == 'cuda' else torch.device(args.device)
     predictor = nnUNetPredictor(
         tile_step_size=args.step,
         use_gaussian=True,
         use_mirroring=not args.no_tta,
-        perform_everything_on_device=True,
-        device=torch.device('cuda', 0),  # CUDA_VISIBLE_DEVICES already narrowed to one GPU
+        perform_everything_on_device=device.type == 'cuda',
+        device=device,
         verbose=False,
         verbose_preprocessing=False,
         allow_tqdm=False,
@@ -464,6 +467,9 @@ def run_main(argv):
                     help='comma list of folds to ensemble (default: all present)')
     ap.add_argument('--gpus', default=None,
                     help='comma list of GPU ids to spread folds across (default: auto)')
+    ap.add_argument('--device', choices=('cuda', 'mps', 'cpu'), default=None,
+                    help='torch device for the nnU-Net folds (default: cuda if available, '
+                         'else mps, else cpu)')
     ap.add_argument('--fg-threshold', type=float, default=0.5,
                     help='ensemble foreground-probability threshold for the mask '
                          '(0.5 == argmax; lower = more permissive)')
@@ -506,6 +512,8 @@ def run_main(argv):
     if not folds:
         ap.error(f'no folds found in {model_dir}')
     gpus = [g.strip() for g in args.gpus.split(',')] if args.gpus else detect_gpus()
+    from devices import fit_device
+    device = fit_device(args.device).type
 
     print(f'ink_dir : {ink_dir}')
     print(f'strip   : {name}  ({len(tiles)} tile(s) concatenated)')
@@ -539,7 +547,7 @@ def run_main(argv):
         cmd = [sys.executable, os.path.abspath(__file__), '__worker__',
                '--fold', str(fold), '--model', model_dir, '--checkpoint', args.checkpoint,
                '--input', in_dir, '--output', fold_out[fold], '--step', str(args.step),
-               '--procs', str(args.procs)]
+               '--procs', str(args.procs), '--device', device]
         if args.no_tta:
             cmd.append('--no-tta')
         logf = open(os.path.join(log_dir, f'fold_{fold}.log'), 'w')

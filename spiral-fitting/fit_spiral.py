@@ -31,7 +31,6 @@ import numpy as np
 import scipy.ndimage
 import scipy.sparse
 import scipy.sparse.csgraph
-import torch.nn.functional as F
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
@@ -50,6 +49,7 @@ from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, FitConfig,
                     SHELL_ATLAS_KEYS)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    tolerate_checkpoint_config)
+from devices import fit_device
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, EDITABLE_PCL_ROLE_VALUES,
                          RUN_MUTABLE_PCL_ROLES,
                          fit_input, input_source_enabled, pcl_input_enabled,
@@ -76,7 +76,7 @@ from checkpoint_io import load_checkpoint_cpu, model_state_sha256
 from fiber_direction_samples import load_fiber_direction_samples
 from spiral_sampling import load_spiral_sampling
 from tifxyz import load_tifxyz, patch_from_payload
-from geom_utils import bilinear_atlas_lookup, interp1d
+from geom_utils import bilinear_atlas_lookup, grid_sample_border, interp1d
 from point_collection import (
     PatchLinkOptions,
     SIDE_BEHIND,
@@ -326,12 +326,9 @@ class ShellPolarMap:
         z_normalised = (scan_zyx[..., 0] - self.z_min) / (self.z_max - self.z_min) * 2 - 1
         theta_normalised = theta / (2 * torch.pi) * 2 - 1
         grid = torch.stack([theta_normalised, z_normalised], dim=-1).view(1, -1, 1, 2)
-        sampled = F.grid_sample(
+        sampled = grid_sample_border(
             self.lookup_table[None],
             grid,
-            mode='bilinear',
-            padding_mode='border',
-            align_corners=True,
         ).view(2, -1)
         target_radius = sampled[0].view(scan_zyx.shape[:-1])
         confidence = sampled[1].view(scan_zyx.shape[:-1])
@@ -1367,6 +1364,8 @@ class FitContext:
         # single-rank context when nothing joined one). Nothing below reads
         # RANK/WORLD_SIZE from the environment.
         self.dist = dist_context or process_context()
+        # The device every session tensor lives on (devices.fit_device).
+        self.device = fit_device()
 
         # Scroll physical facts.
         self.scroll_name = scroll.name
@@ -1963,6 +1962,8 @@ class FitContext:
 
     def check_cuda_ready(self):
         """Create the CUDA context before input reads increase host cache pressure."""
+        if getattr(self, 'device', torch.device('cuda')).type != 'cuda':
+            return
         progress_or_null(self.progress).begin('loading', 'Checking CUDA availability')
         try:
             # Use the current device selected by the distributed driver. Keep
@@ -2251,7 +2252,7 @@ class FitContext:
         # run has no verified patches.  Device setup and theta-topology
         # registration deliberately consume an empty atlas without special
         # casing, and interactive patch incorporation can append to it later.
-        patch_atlas = PatchAtlas(verified_patches, device='cuda')
+        patch_atlas = PatchAtlas(verified_patches, device=self.device)
         if verified_patches:
             print(f'patch atlas: {patch_atlas.memory_mb():.1f} MB')
             topology_stats = patch_atlas.topology_memory_stats()
@@ -2840,7 +2841,7 @@ class FitContext:
         if not stats and not clip_stats:
             return lines, payload
         ranges = (self.spiral_and_transform.flow_max_corner_zyx
-                  - self.spiral_and_transform.flow_min_corner_zyx).to(torch.float64).cpu()
+                  - self.spiral_and_transform.flow_min_corner_zyx).cpu().to(torch.float64)
         cylindrical = self.config['model_flow_field_type'] in ('cylindrical', 'bspline_cylindrical')
         component_names = ('z', 'r', 't') if cylindrical else ('z', 'y', 'x')
         # Component 0 is z; the in-plane components (radial and tangential,
@@ -2977,6 +2978,7 @@ class FitContext:
             lasagna_scale=self.lasagna_scale,
             storage_backend=self.lasagna_storage_backend,
             cache_directory=self.cache_path,
+            device=self.device,
             progress=progress,
         )
         if interactive_driver is not None and self.lasagna_volume:
@@ -2995,7 +2997,7 @@ class FitContext:
                     self.winding_inference_path)))
             self.winding_inference = load_winding_inference_store(
                 self.winding_inference_path,
-                torch.device('cuda'),
+                self.device,
                 verify=os.environ.get(
                     'FIT_SPIRAL_VERIFY_WINDING_INFERENCE', '1') != '0',
                 z_range=(self.z_begin, self.z_end),
@@ -3199,7 +3201,6 @@ class FitContext:
         interactive_driver = self.interactive_driver
         progress = progress_or_null(self.progress)
 
-        self.device = torch.device('cuda')
         progress.begin(
             'loading', 'Building verified-patch GPU atlas',
             detail=f'{len(self.verified_patches):,} patches')
@@ -3578,6 +3579,8 @@ class FitContext:
             'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
             'input_manifest': dict(getattr(self.interactive_driver, 'input_manifest', {})),
             'preview_first_winding': 10,
+            **({'torch_mps_rng_state': torch.mps.get_rng_state()}
+               if self.device.type == 'mps' else {}),
         }
 
     def save_checkpoint(self, path, completed_iterations):
@@ -3895,6 +3898,9 @@ class FitContext:
                       f'{min(len(saved_cuda_states), local_device_count)}')
             for device_index, state in enumerate(saved_cuda_states[:local_device_count]):
                 torch.cuda.set_rng_state(state, device_index)
+        if (checkpoint.get('torch_mps_rng_state') is not None
+                and self.device.type == 'mps'):
+            torch.mps.set_rng_state(checkpoint['torch_mps_rng_state'])
 
     def load_checkpoint(self, checkpoint):
         checkpoint, _ = tolerate_checkpoint_config(checkpoint)
@@ -4022,6 +4028,7 @@ class FitContext:
         numpy_state = np.random.get_state()
         torch_state = torch.random.get_rng_state()
         cuda_states = torch.cuda.get_rng_state_all()
+        mps_state = torch.mps.get_rng_state() if self.device.type == 'mps' else None
         try:
             # The preview surface must land in true scroll space, so after
             # any constraint bake it is pulled back through the composed
@@ -4173,6 +4180,8 @@ class FitContext:
             np.random.set_state(numpy_state)
             torch.random.set_rng_state(torch_state)
             torch.cuda.set_rng_state_all(cuda_states)
+            if mps_state is not None:
+                torch.mps.set_rng_state(mps_state)
             self._release_export_arena()
 
     def _release_export_arena(self):
@@ -4220,6 +4229,7 @@ class FitContext:
         numpy_state = np.random.get_state()
         torch_state = torch.random.get_rng_state()
         cuda_states = torch.cuda.get_rng_state_all()
+        mps_state = torch.mps.get_rng_state() if self.device.type == 'mps' else None
         try:
             candidate = copy.copy(self)
             candidate._preparing_inputs = True
@@ -4403,6 +4413,8 @@ class FitContext:
             np.random.set_state(numpy_state)
             torch.random.set_rng_state(torch_state)
             torch.cuda.set_rng_state_all(cuda_states)
+            if mps_state is not None:
+                torch.mps.set_rng_state(mps_state)
 
     def install_input_changes(self, candidate):
         """Install a successfully prepared candidate on the fitter thread."""
@@ -4944,7 +4956,7 @@ class FitContext:
                     self.config['dt_target_floating_threshold'],
                 ))
             if compute_unattached_pcl_dt and self.config['loss_weight_unattached_pcl_dt'] > 0 and self.unattached_pcl_strips:
-                pcl_flat = get_or_build_unattached_pcl_flat(self.unattached_pcl_strips, torch.device('cuda'))
+                pcl_flat = get_or_build_unattached_pcl_flat(self.unattached_pcl_strips, self.device)
                 if pcl_flat is not None:
                     unattached_pcl_dt_target_cache = self.dt_target_cache_manager.get('unattached_pcl', iteration, lambda: compute_strip_dt_target_cache(
                         self.slice_to_spiral_transform, self.dr_per_winding,
