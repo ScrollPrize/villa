@@ -44,7 +44,8 @@ def test_smooth_bridge_retains_own_history_and_rejects_wrong_tail(tmp_path,seed)
     on=state['reference_on_fiber']
     assert on[:cfg.n_history].sum() >= 1
     assert state['identity_observable'] == bool(on[:-1].sum() >= 2 or on[-1])
-    assert not on[state['reference_mask']==0].any()
+    assert not on[:-1][state['reference_mask'][:-1]==0].any()
+    assert on[-1]  # immutable seed remains a reference outside the current crop
     assert state['reference_on_fiber'][0] == 0
     points = torch.zeros(1,4,3)
     points[0,:,2] = torch.arange(1,5)
@@ -99,7 +100,7 @@ def test_unsafe_synthetic_departure_falls_back_to_original_replay(tmp_path):
 
 
 @pytest.mark.parametrize('seed',range(6))
-def test_long_departure_without_visible_reference_is_not_supervised(tmp_path,seed):
+def test_long_departure_uses_remote_seed_for_supervision(tmp_path,seed):
     bank,fiber = make_bank(tmp_path)
     publish(tmp_path,[add_shard(tmp_path,0,z_range=(20.,180.))])
     cfg = DirectConfig(n_future=4)
@@ -114,9 +115,12 @@ def test_long_departure_without_visible_reference_is_not_supervised(tmp_path,see
     assert state['hmask'].all() and not state['dense_mask'].any()
     builder.prepare(state,fiber,np.random.default_rng(seed))
     assert not state['reference_on_fiber'][:cfg.n_history].any()
-    assert not state['reference_on_fiber'].any()
-    assert not state['identity_observable']
+    assert state['reference_on_fiber'][-1]
+    assert state['identity_observable']
     assert not state['visible_seed_mask'].any()
+    state['seed_valid'] = False
+    builder.prepare(state,fiber,np.random.default_rng(seed))
+    assert not state['identity_observable']
 
 
 def test_variable_tails_reach_128_and_short_paths_are_not_silently_substituted(tmp_path):
