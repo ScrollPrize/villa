@@ -41,18 +41,58 @@ footprints are checked against the holdout before I/O. Replay uses saved observe
 frames; history reconstruction is a fallback for older caches. Inference carries
 only the bounded state and encodes one new full crop per decision after startup.
 
-The launcher retains 16 effective batch size, 64 historical observations and 32
-gradient-bearing history steps, using microbatches of 2, two loader workers,
-activation checkpointing, and eager execution for the streamed sequence loop.
+The launcher uses effective batch size 8, microbatches of 2, 64 historical
+observations and 32 gradient-bearing history steps. It uses 12 loader workers
+and activation checkpointing. The encoder and shared decoder are compiled;
+the CPU-streamed sequence scheduling stays eager. In-place module compilation
+preserves the same checkpoint parameter names and EMA updates.
+Historical encodings have one whole-observation checkpoint boundary, avoiding
+nested axial-block recomputation. Auxiliary queries run only for labeled writes
+during training, never for burn-in or inference. Their scheduling mask does not
+enter the writer or the path inputs. Sequence validity is transferred to the CPU
+once for scheduling, avoiding a GPU synchronization at each historical write.
 Full-crop replay is substantially more expensive than the legacy patch unroll.
 Legacy checkpoint architectures remain loadable; they cannot initialize this
 architecture. Use `--memory-version 2` explicitly for legacy memory training.
+
+Validation on the RTX 5090 (PyTorch 2.12.1, BF16 autocast, full 120×101×101
+crops, microbatch 2, 64 historical writes, 32 gradient-bearing history writes):
+
+| Execution | Forward/backward + AdamW | Peak allocated VRAM |
+| --- | ---: | ---: |
+| Eager after redundant-work removal, one update | 9.13 s | 12.75 GiB |
+| Compiled first update, including compilation | 52.29 s | 8.73 GiB |
+| Compiled next two updates, mean / median | 4.60 s | 8.76 GiB |
+
+The two warmed compiled updates took 4.595 and 4.604 seconds. These capacity
+checks repeat a real crop across a fully populated sequence and exercise all
+losses; they measure computation rather than tracing quality or loader time.
+Initial eager/compiled loss was 3.495929/3.493718 (compilation changes rounding
+under the same BF16 autocast policy). All gradients were finite and production
+checkpoint save/load preserved parameter values exactly. Real-data preflights,
+CPU recurrence/gradient tests, and raw profiler summaries are also available;
+run artifacts are under `output/unified_validation/`.
+
+A compiled microbatch of 4 took 9.035/9.098 seconds and used 17.29 GiB allocated,
+19.76 GiB reserved, and about 20.4 GiB total process VRAM. The launcher therefore
+uses microbatch 2 with four-step gradient accumulation to respect the 20 GiB
+process budget; microbatch 4 offered little throughput improvement per sample.
+
+For a reproducible real-data check with the same compiled modules:
+
+```bash
+TORCHINDUCTOR_COMPILE_THREADS=4 PYTHONPATH=../../.. ../../../../.venv/bin/python \
+  -m vesuvius.neural_tracing.fiber_follow.regression.identity_preflight \
+  --out output/unified_preflight --device cuda --forward --compile \
+  --memory-version 3 --memory-slots 16 --memory-steps 64 --memory-grad-steps 32 \
+  --activation-checkpointing --microbatch 2 --batches 2
+```
 
 The remaining architecture description documents the crop-only and legacy
 patch-memory models.
 
 This model follows a marked fiber through a single heading-aligned CT crop. The
-default architecture is `axial_fiber_v3`. Set `--memory-slots 16` to use
+default crop-only architecture is `axial_fiber_v3`. Set `--memory-slots 16 --memory-version 2` to use
 `axial_fiber_memory_v2`, described below. Existing v3 and `axial_fiber_memory_v1`
 checkpoints remain loadable; v1 checkpoints cannot initialize new runs.
 

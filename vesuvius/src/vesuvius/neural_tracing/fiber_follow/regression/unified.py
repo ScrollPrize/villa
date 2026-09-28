@@ -15,6 +15,29 @@ from torch.utils.checkpoint import checkpoint
 from .model import AxialEncoder, PathDecoderLayer, UNIFIED_ARCHITECTURE, sample_features, crop_support
 
 
+def to_device(value, device):
+    # Pageable host-to-device copies synchronize the stream; pinned ones queue.
+    if torch.device(device).type == 'cuda':
+        return value.pin_memory().to(device, non_blocking=True)
+    return value.to(device)
+
+
+class _ScaleGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, scale):
+        ctx.save_for_backward(scale)
+        return value.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad*ctx.saved_tensors[0].to(grad.dtype), None
+
+
+def scale_gradient(value, scale):
+    """Identity in the forward pass; multiplies the incoming gradient by ``scale``."""
+    return _ScaleGradient.apply(value, scale)
+
+
 class UnifiedFollower(nn.Module):
     architecture = UNIFIED_ARCHITECTURE
 
@@ -154,43 +177,106 @@ class UnifiedFollower(nn.Module):
             result = self.probe_head(decoded[:,0]).float()
         return state,result
 
-    def observe(self, x, current, state=None):
+    def schedule(self, x, state=None, probe_mask=None):
+        """CPU scheduling metadata, copied once per forward before any encoding."""
+        seed = x['memory_seed_valid'].detach().cpu().bool()
+        if state is not None:
+            seed = seed & ~state['anchor_valid'].detach().cpu()
+        return dict(active=x['memory_mask'].detach().cpu().bool(), seed=seed,
+                    probe=None if probe_mask is None else probe_mask.detach().cpu().bool())
+
+    # Crops per batched encoding without/with gradients. Checkpoint recompute
+    # holds a whole-crop activation stack (about 2.5 GiB per crop in production).
+    observation_batch = (8, 1)
+
+    def encode_observations(self, crops, device, gradients):
+        """Encode independent full crops (CPU views) in bounded batches.
+
+        An observation depends only on its own crop, so batching changes values
+        only by kernel rounding. Pinned loader views copy asynchronously.
+        """
+        parts = []
+        size = self.observation_batch[bool(gradients)]
+        for i in range(0, len(crops), size):
+            images = torch.stack([c.to(device, non_blocking=True) for c in crops[i:i+size]])
+            parts.append(self.encode_observation(images, device, gradients))
+        return torch.cat(parts)
+
+    def observe(self, x, current, state=None, probe_mask=None, schedule=None):
         b, t = x['memory_mask'].shape
         device = current.device
+        schedule = self.schedule(x, state, probe_mask) if schedule is None else schedule
         state = self.initial_memory(b,device) if state is None else state
-        valid_seed = x['memory_seed_valid'].bool() & ~state['anchor_valid']
-        if valid_seed.any():
-            clean = torch.where(valid_seed.cpu()[:,None,None,None,None],x['seed_crop'].cpu(),0.)
-            seed = self.encode_observation(clean,device,True)
-            state = dict(state)
-            state['anchor'] = torch.where(valid_seed[:,None,None],seed,state['anchor'])
-            state['anchor_position'] = torch.where(valid_seed[:,None],x['memory_seed_position'],state['anchor_position'])
-            state['anchor_frame'] = torch.where(valid_seed[:,None,None],x['memory_seed_frame'],state['anchor_frame'])
-            state['anchor_valid'] = state['anchor_valid'] | valid_seed
+        active_cpu = schedule['active']
         burn = max(0,t-self.cfg.memory_grad_steps-1)
+        # Inactive (state, step) pairs never reach memory, so they are not encoded.
+        seeds = schedule['seed'].nonzero()[:,0].tolist()
+        history = [(i,j) for j in range(t-1) for i in range(b) if active_cpu[i,j]]
+        old = [(i,j) for i,j in history if j < burn]
+        new = [(i,j) for i,j in history if j >= burn]
+        k = self.cfg.memory_encoder_grad_steps
+        detached, scale = [], None
+        if k and self.training and torch.is_grad_enabled():
+            # Sampled from the seeded global generator, so runs stay reproducible.
+            keep = set()
+            for i in range(b):
+                own = [pair for pair in new if pair[0] == i]
+                keep.update(own[p] for p in torch.randperm(len(own))[:k].tolist())
+            detached = [pair for pair in new if pair not in keep]
+            counts = {i: sum(pair[0] == i for pair in new) for i in range(b)}
+            new = [pair for pair in new if pair in keep]
+            scale = torch.tensor([counts[i]/min(k,counts[i]) for i,_ in new])
+        index = lambda pairs: tuple(to_device(torch.tensor(v),device) for v in zip(*pairs))
+        observed = current.new_zeros(b,max(t-1,0),*current.shape[1:])
+        if old:
+            with torch.no_grad():
+                encoded = self.encode_observations([x['history_crops'][i,j] for i,j in old],device,False)
+            observed = observed.index_put(index(old),encoded)
+        if detached:
+            # Gradient-window writes still backpropagate; this encoder input does not.
+            with torch.no_grad():
+                encoded = self.encode_observations([x['history_crops'][i,j] for i,j in detached],device,False)
+            observed = observed.index_put(index(detached),encoded)
+        if seeds or new:
+            encoded = self.encode_observations([x['seed_crop'][i] for i in seeds]+
+                                               [x['history_crops'][i,j] for i,j in new],device,True)
+            if new:
+                encoded_new = encoded[len(seeds):]
+                if scale is not None:
+                    encoded_new = scale_gradient(encoded_new,to_device(scale,device)[:,None,None])
+                observed = observed.index_put(index(new),encoded_new)
+            if seeds:
+                valid_seed = torch.zeros(b,dtype=torch.bool)
+                valid_seed[seeds] = True
+                valid_seed = to_device(valid_seed,device)
+                seed = current.new_zeros(b,*current.shape[1:]).index_put(index([(i,) for i in seeds]),encoded[:len(seeds)])
+                state = dict(state)
+                state['anchor'] = torch.where(valid_seed[:,None,None],seed,state['anchor'])
+                state['anchor_position'] = torch.where(valid_seed[:,None],x['memory_seed_position'],state['anchor_position'])
+                state['anchor_frame'] = torch.where(valid_seed[:,None,None],x['memory_seed_frame'],state['anchor_frame'])
+                state['anchor_valid'] = state['anchor_valid'] | valid_seed
+        active_steps = active_cpu.any(0).tolist()
+        probe_steps = [self.training]*t if schedule['probe'] is None else schedule['probe'].any(0).tolist()
         probes = []
         for j in range(t):
             active = x['memory_mask'][:,j].bool()
-            if not active.any():
+            if not active_steps[j]:
                 probes.append(current.new_zeros(b,4))
                 continue
             with torch.set_grad_enabled(torch.is_grad_enabled() and j >= burn):
-                if j == t-1:
-                    obs = current
-                else:
-                    image = x['history_crops'][:,j]
-                    clean = torch.where(active.cpu()[:,None,None,None,None],image.cpu(),0.)
-                    obs = self.encode_observation(clean,device,j >= burn)
+                obs = current if j == t-1 else observed[:,j]
                 state,probe = self.write(obs,active,x['memory_positions'][:,j],x['memory_frames'][:,j],state,
-                                        probe=self.training and j >= burn)
+                                        probe=self.training and j >= burn and probe_steps[j])
             probes.append(probe)
         return state,torch.stack(probes,1)
 
-    def forward(self, x, hist, hmask, queries=None, candidates=None, memory=None):
+    def forward(self, x, hist, hmask, queries=None, candidates=None, memory=None, probe_mask=None):
+        # Synchronize for scheduling before queueing GPU work, not behind it.
+        schedule = self.schedule(x, memory, probe_mask)
         dense, _, image_tokens = self.encode(x['fine'])
         current = sample_features(dense,self.stencil[None].expand(len(hist),-1,-1),self.cfg.fine)[0]
         # Write the observed head once. Hypothetical candidate scoring never writes.
-        state,probes = self.observe(x,current,memory)
+        state,probes = self.observe(x,current,memory,probe_mask,schedule)
         tokens,valid,refs,ref_valid,roles = self.retained(state,state['position'],state['frame'])
         references = torch.cat((hist,x['seed']),1)
         mask = torch.cat((hmask.bool(),x['seed_mask'].bool()),1) & crop_support(references,self.cfg.fine)

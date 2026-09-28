@@ -9,7 +9,7 @@ from test_identity import config, batch
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower, UNIFIED_ARCHITECTURE
 from vesuvius.neural_tracing.fiber_follow.regression.memory_data import memory_images, memory_allowed
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import identity_terms
-from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch, checkpoint_config
+from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch, checkpoint_config, compile_training_model
 from vesuvius.neural_tracing.fiber_follow.shared.data import ZBand
 
 
@@ -189,3 +189,60 @@ def test_whole_observation_checkpoint_matches_nested_checkpoint_values_and_gradi
     torch.testing.assert_close(before,after,rtol=0,atol=0)
     for old,new in zip(old_grads,new_grads):
         torch.testing.assert_close(old,new,rtol=0,atol=0)
+
+
+def test_scheduling_only_labeled_probes_preserves_task_outputs_and_gradients():
+    cfg,data = scene()
+    model = DirectFollower(cfg)
+    out = model(data['x'],data['hist'],data['hmask'])
+    loss = out['points'].square().sum()+out['memory_probe'][:,-1].square().sum()
+    before = torch.autograd.grad(loss,tuple(model.parameters()),allow_unused=True)
+    mask = torch.zeros_like(data['x']['memory_mask'])
+    mask[:,-1] = True
+    scheduled = model(data['x'],data['hist'],data['hmask'],probe_mask=mask)
+    loss = scheduled['points'].square().sum()+scheduled['memory_probe'][:,-1].square().sum()
+    after = torch.autograd.grad(loss,tuple(model.parameters()),allow_unused=True)
+    for k in ('points','confidence_logits'):
+        torch.testing.assert_close(out[k],scheduled[k],rtol=0,atol=0)
+    torch.testing.assert_close(out['memory_probe'][:,-1],scheduled['memory_probe'][:,-1],rtol=0,atol=0)
+    for a,b in zip(before,after):
+        if a is None:
+            assert b is None
+        else:
+            torch.testing.assert_close(a,b,rtol=1e-5,atol=1e-6)
+
+
+def test_compiled_tensor_modules_preserve_checkpoint_names_and_training_gradients():
+    cfg,data = scene(steps=1)
+    model = DirectFollower(cfg)
+    keys = set(model.state_dict())
+    compiled = compile_training_model(model,backend='eager')
+    assert compiled is model and set(compiled.state_dict()) == keys
+    out = compiled(data['x'],data['hist'],data['hmask'])
+    out['points'].square().sum().backward()
+    assert model.encoder.stem[0].weight.grad.abs().sum() > 0
+    assert model.decoder.layers[0].multihead_attn.in_proj_weight.grad.abs().sum() > 0
+
+
+def test_sampled_encoder_gradients_keep_outputs_and_write_gradients():
+    torch.manual_seed(5)
+    cfg,data = scene(steps=4,grad=4)
+    full = DirectFollower(cfg)
+    sampled = DirectFollower(replace(cfg,memory_encoder_grad_steps=1))
+    sampled.load_state_dict(full.state_dict())
+    outputs, grads = [], []
+    for model in (full,sampled):
+        data['x']['history_crops'].requires_grad_()
+        data['x']['history_crops'].grad = None
+        out = model(data['x'],data['hist'],data['hmask'])
+        out['points'].square().sum().backward()
+        outputs.append(out['points'].detach())
+        grads.append((data['x']['history_crops'].grad.clone(),model.write_gate.weight.grad.clone()))
+    # Values differ only by encode-batch rounding.
+    torch.testing.assert_close(outputs[0],outputs[1])
+    torch.testing.assert_close(grads[0][1],grads[1][1],rtol=1e-4,atol=1e-7)  # writes keep full gradients
+    # Exactly one of four history crops receives encoder gradient, scaled by 4.
+    reached = grads[1][0].flatten(2).abs().sum(-1) > 0
+    assert reached.sum().item() == 1
+    j = reached[0].nonzero()[0,0]
+    torch.testing.assert_close(grads[1][0][:,j],4*grads[0][0][:,j],rtol=1e-4,atol=1e-7)

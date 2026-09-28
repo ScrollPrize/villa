@@ -11,7 +11,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig,D
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder,IdentitySampling
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms,memory_probe_terms
-from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch,conv_memory_format
+from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch,conv_memory_format,compile_training_model
 from vesuvius.neural_tracing.fiber_follow.shared.components import ComponentRule
 from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset,OnPolicyStates,SampleConfig,ZBand,load_fibers,split_fibers
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
@@ -28,6 +28,7 @@ def main(argv=None):
     ap.add_argument('--microbatch',type=int,default=4)
     ap.add_argument('--batches',type=int,default=4)
     ap.add_argument('--forward',action='store_true')
+    ap.add_argument('--compile',action='store_true')
     ap.add_argument('--memory-slots',type=int,default=0)
     ap.add_argument('--memory-version',type=int,choices=(2,3),default=3)
     ap.add_argument('--activation-checkpointing',action='store_true')
@@ -58,6 +59,8 @@ def main(argv=None):
                      onpolicy=[OnPolicyStates.load(p) for p in args.onpolicy])
     it=iter(ds);args.out.mkdir(parents=True,exist_ok=True)
     model=DirectFollower(cfg).to(args.device,memory_format=conv_memory_format(args.device)) if args.forward else None
+    if model is not None and args.compile:
+        model=compile_training_model(model)
     rows=[]
     for index in range(args.batches):
         started=time.perf_counter();cpu=next(it)

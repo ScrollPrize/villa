@@ -50,7 +50,11 @@ class DirectConfig:
     # The newest memory_grad_steps observations (and the head) backpropagate;
     # older ones are a no-grad burn-in. At least memory_steps: no burn-in.
     memory_grad_steps: int = 32
-    memory_version: int = 2  # 1: legacy checkpoints without the probe
+    # Unified model: per state, only this many random gradient-window history
+    # encodings backpropagate into the encoder, with gradient scaled by n/k so
+    # the encoder gradient stays unbiased. Writes keep gradients. 0: all.
+    memory_encoder_grad_steps: int = 0
+    memory_version: int = 2  # 1: no probe; 2: legacy patch memory; 3: unified full-crop model
 
     def __post_init__(self):
         if isinstance(self.fine, dict):
@@ -78,6 +82,8 @@ class DirectConfig:
         if self.memory_slots:
             if any(not isinstance(v, int) or v < 1 for v in (self.memory_steps, self.memory_stride, self.memory_grad_steps)):
                 raise ValueError('Memory sequence dimensions must be positive integers')
+            if not isinstance(self.memory_encoder_grad_steps, int) or self.memory_encoder_grad_steps < 0:
+                raise ValueError('Memory encoder gradient steps must be a nonnegative integer')
             if self.memory_version not in (1, 2, 3):
                 raise ValueError('Unknown memory version')
             if not isinstance(self.memory_patch_size, int) or self.memory_patch_size < 5 or self.memory_patch_size % 2 != 1:

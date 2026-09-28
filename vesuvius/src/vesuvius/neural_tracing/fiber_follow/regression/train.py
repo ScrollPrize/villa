@@ -71,8 +71,20 @@ def match_optimizer_layout(opt):
                 state[key] = torch.empty_like(param).copy_(value)
 
 
+def compile_training_model(model, **kwargs):
+    """Compile tensor modules while keeping streamed CPU scheduling outside Dynamo."""
+    if model.architecture == UNIFIED_ARCHITECTURE:
+        # In-place compilation preserves checkpoint/EMA parameter names.
+        model.encoder.compile(**kwargs)
+        model.decoder.compile(**kwargs)
+        # The per-observation memory update; the streamed schedule stays eager.
+        model.write = torch.compile(model.write, **kwargs)
+        return model
+    return torch.compile(model, **kwargs)
+
+
 ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, UNIFIED_ARCHITECTURE)
-MEMORY_OPTIONS = ('memory_slots','memory_steps','memory_stride','memory_patch_size','memory_grad_steps','memory_version')
+MEMORY_OPTIONS = ('memory_slots','memory_steps','memory_stride','memory_patch_size','memory_grad_steps','memory_encoder_grad_steps','memory_version')
 
 
 def checkpoint_config(ck):
@@ -199,6 +211,10 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                     (labeled & (cpu['memory_target_identity'] < .5)).any(-1).sum())
             sums['memory_anchor_fraction'] = sums.get('memory_anchor_fraction', 0.)+float(cpu['x']['memory_seed_valid'].sum())/total
         queries = dict(queries=batch['identity_points']) if 'identity_points' in batch else {}
+        if model.cfg.memory_slots and model.cfg.memory_version == 3 and 'memory_target_identity_mask' in cpu:
+            # This only schedules auxiliary computations; it is never input to
+            # the encoder, writer or deployed path evaluator.
+            queries['probe_mask'] = cpu['memory_target_identity_mask'] | cpu['memory_target_offset_mask']
         if 'candidate_points' in batch:
             queries['candidates'] = batch['candidate_points']
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
@@ -347,6 +363,9 @@ def build_parser():
                     help='Odd CT/presence patch size for the memory writer')
     ap.add_argument('--memory-grad-steps', type=int, default=32,
                     help='Newest observations that backpropagate; older ones are a no-grad burn-in')
+    ap.add_argument('--memory-encoder-grad-steps', type=int, default=0,
+                    help='Unified model: random gradient-window history encodings per state that '
+                         'backpropagate into the encoder (gradient scaled n/k); 0 keeps all')
     ap.add_argument('--memory-probe-weight', type=float, default=.5,
                     help='Per-write departure/offset probe coefficient (memory models)')
     ap.add_argument('--memory-switch-probability', type=float, default=0.,
@@ -446,6 +465,8 @@ def main(argv=None):
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    # Autotuned 3-D convolution algorithms; results may differ by rounding only.
+    torch.backends.cudnn.benchmark = torch.device(args.device).type == 'cuda'
     cfg = DirectConfig(channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
                        decoder_layers=args.decoder_layers,embedding=args.embedding,
                        activation_checkpointing=args.activation_checkpointing,correction=args.correction,
@@ -453,6 +474,7 @@ def main(argv=None):
                        memory_slots=args.memory_slots,memory_steps=args.memory_steps,
                        memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size,
                        memory_grad_steps=args.memory_grad_steps,memory_version=args.memory_version,
+                       memory_encoder_grad_steps=args.memory_encoder_grad_steps,
                        identity_temperature=args.identity_temperature)
     initialized = None
     resume = None
@@ -578,7 +600,11 @@ def main(argv=None):
     match_optimizer_layout(opt)
     # The compiled wrapper shares the module's parameters, so EMA updates, gradient
     # clipping and checkpoints keep using ``model``; only the training forward is compiled.
-    trainable = torch.compile(model) if args.compile and torch.device(args.device).type == 'cuda' else model
+    trainable = model
+    if args.compile and torch.device(args.device).type == 'cuda':
+        if model.architecture == UNIFIED_ARCHITECTURE:
+            progress('Compiling shared encoder and path decoder; observation scheduling stays eager')
+        trainable = compile_training_model(model)
     if args.compile and torch.device(args.device).type == 'cuda':
         progress('Compilation enabled; first forward/backward passes will compile lazily and may take several minutes')
     if done >= args.steps:
