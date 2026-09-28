@@ -50,7 +50,7 @@ def test_direct_images_preserve_scores_rng_and_parameters(tmp_path, monkeypatch,
     data['plane_mask'][1] = 0
     data['plane_ab'][1] = float('nan')
     data['hmask'][1] = 0
-    for x in (data['x']['fine'], data['x']['seed_crop']):
+    for x in (data['x']['fine'],):
         x[:, 0] = .2
         x[:, 1] = 1.  # Presence must not be mistaken for rendered history.
     rgb = []

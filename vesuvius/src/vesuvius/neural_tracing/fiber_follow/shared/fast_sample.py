@@ -17,8 +17,7 @@ def trilinear_weight(fz, fy, fx, dz, dy, dx):
 
 
 @numba.njit(cache=True, fastmath=False, inline="always")
-def _point(p, raw, start_zyx, pos, frame, grid, hist, hmask, out, sigma, segments,
-           S0, S1, S2, H, hist_ch, hmax_c, lo, hi):
+def _scalar_point(p, raw, start_zyx, pos, frame, grid):
     ga, gb, gc = grid[p, 0], grid[p, 1], grid[p, 2]
     wx = pos[0] + frame[0, 0] * ga + frame[0, 1] * gb + frame[0, 2] * gc
     wy = pos[1] + frame[1, 0] * ga + frame[1, 1] * gb + frame[1, 2] * gc
@@ -33,7 +32,16 @@ def _point(p, raw, start_zyx, pos, frame, grid, hist, hmask, out, sigma, segment
     fz = qz - z0
     fy = qy - y0
     fx = qx - x0
+    S0, S1, S2 = raw.shape[1:]
     ctv = 0.0
+    # Most samples lie strictly inside the tight source block. Unroll the
+    # eight neighbours there; retain the exact summation order and weights.
+    if 0 <= z0 < S0-1 and 0 <= y0 < S1-1 and 0 <= x0 < S2-1:
+        for dz in numba.literal_unroll((0, 1)):
+            for dy in numba.literal_unroll((0, 1)):
+                for dx in numba.literal_unroll((0, 1)):
+                    ctv += trilinear_weight(fz, fy, fx, dz, dy, dx)*raw[0,z0+dz,y0+dy,x0+dx]
+        return ctv*(1.0/255.0)
     for dz in range(2):
         zz = z0 + dz
         if zz < 0 or zz >= S0:
@@ -50,7 +58,14 @@ def _point(p, raw, start_zyx, pos, frame, grid, hist, hmask, out, sigma, segment
                     continue
                 w = trilinear_weight(fz, fy, fx, dz, dy, dx)
                 ctv += w * raw[0, zz, yy, xx]
-    out[0, p] = ctv * (1.0 / 255.0)
+    return ctv * (1.0 / 255.0)
+
+
+@numba.njit(cache=True, fastmath=False, inline="always")
+def _point(p, raw, start_zyx, pos, frame, grid, hist, hmask, out, sigma, segments,
+           S0, S1, S2, H, hist_ch, hmax_c, lo, hi):
+    out[0, p] = _scalar_point(p, raw, start_zyx, pos, frame, grid)
+    ga, gb, gc = grid[p, 0], grid[p, 1], grid[p, 2]
     # Own history: nearest point or connected segment, including the current origin.
     best = 1e30
     if (gc - hmax_c > 7.1*sigma or ga < lo[0] or ga > hi[0]
@@ -125,3 +140,17 @@ def sample_crop(raw, start_zyx, pos, frame, grid_flat, hist, hmask, n_out, histo
     _sample(raw, np.asarray(start_zyx, np.float64), np.asarray(pos, np.float64), np.asarray(frame, np.float64),
             grid_flat, np.asarray(hist, np.float64), np.asarray(hmask, np.float64), out, float(history_sigma), history_render == 'segments')
     return out
+
+
+@numba.njit(cache=True, fastmath=False, nogil=True)
+def _sample_scalar(raw, start, pos, frame, grid, out):
+    for p in range(len(grid)):
+        out[p] = _scalar_point(p, raw, start, pos, frame, grid)
+
+
+def sample_scalar_crop(raw, start_zyx, pos, frame, grid_flat, out):
+    """Write the scalar channel directly, with identical interpolation and no history."""
+    if raw.shape[0] != 1:
+        raise ValueError('The fused sampler reads one scalar channel')
+    _sample_scalar(raw, np.asarray(start_zyx, np.float64), np.asarray(pos, np.float64),
+                   np.asarray(frame, np.float64), grid_flat, out.reshape(-1))

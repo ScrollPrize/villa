@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 import torch
 
-from test_identity import memory_inputs
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig, DirectFollower, feature_grid
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import geometry_mask, loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.train import (
@@ -22,24 +21,18 @@ from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 def config():
     return DirectConfig(fine=CropSpec(depth=16, width=12, behind=7),
-                        channels=4, hidden=16, heads=2, layers=1, decoder_layers=1, activation_checkpointing=False, n_future=4, n_history=32,
-                        memory_slots=3,memory_steps=2,spatial_recent=1,spatial_archive=2,spatial_retrieve=1)
+                        channels=4, hidden=16, heads=2, layers=1, decoder_layers=1, activation_checkpointing=False, n_future=4, n_history=32)
 
 
 def batch(cfg, b=2):
     hist = torch.zeros(b, cfg.n_history, 3)
     hist[..., 2] = -torch.arange(1, cfg.n_history+1)
     q = 4*(cfg.n_future-1)+1
-    result = dict(x={name: torch.rand(b, 2, crop.depth, crop.width, crop.width)
+    return dict(x={name: torch.rand(b, 2, crop.depth, crop.width, crop.width)
                    for name, crop in (('fine', cfg.fine),)},
                 hist=hist, hmask=torch.ones(b, cfg.n_history), dense_ab=torch.ones(b, q, 2),
                 dense_mask=torch.ones(b, q), offtrack=torch.zeros(b), endpoint_known=torch.zeros(b),
                 end_local=torch.zeros(b, 3), source=torch.zeros(b))
-    x = result['x']
-    x.update(seed=torch.zeros(b,1,3),seed_mask=torch.zeros(b,1))
-    x.update(memory_inputs(cfg,x['fine']))
-    x['memory_seed_valid'].zero_()
-    return result
 
 
 def forward(m, b):
@@ -58,7 +51,7 @@ def test_prediction_is_deterministic_and_geometry_trains_actual_coordinates():
     assert (out['confidence'][:, 1:] <= out['confidence'][:, :-1]).all()
     terms = loss_terms(out, b, m.cfg)
     terms['geometry_per_state'].mean().backward()
-    for module in (m.coordinates, m.encoder.stem[0], m.encoder.compress, m.observation_projection):
+    for module in (m.coordinates, m.encoder.stem[0], m.encoder.compress, m.reference_token[0]):
         assert module.weight.grad is not None and module.weight.grad.abs().sum() > 0
     assert m.confidence_head[-1].weight.grad is None
     m.zero_grad(set_to_none=True)
@@ -236,11 +229,11 @@ def test_local_correction_is_bounded_and_confidence_cannot_train_its_coordinates
     m = DirectFollower(cfg)
     b = batch(cfg)
     seen = []
-    original = m.candidate_features
-    def samples(dense, points):
+    original = m.evidence
+    def patches(ctx, points, stage):
         seen.append(points.detach().clone())
-        return original(dense, points)
-    m.candidate_features = samples
+        return original(ctx, points, stage)
+    m.evidence = patches
     encodings = []
     handles = [encoder.register_forward_hook(lambda *args: encodings.append(1))
                for encoder in (m.encoder,)]
@@ -248,22 +241,21 @@ def test_local_correction_is_bounded_and_confidence_cannot_train_its_coordinates
     for handle in handles:
         handle.remove()
     assert len(encodings) == 1  # One encoding despite repeated correction.
-    assert len(seen) == cfg.correction_steps+2
+    assert len(seen) == cfg.correction_steps+1
     assert out['refinement_points'].shape == (2, 3, 4, 3)
-    assert seen[0][..., :2].eq(0).all()  # straight initial query precedes the proposal
-    for i, coordinates in enumerate(seen[1:]):
+    for i, coordinates in enumerate(seen):
         torch.testing.assert_close(coordinates, out['refinement_points'][:, i])
     delta = out['refinement_points'][:, 1:]-out['refinement_points'][:, :-1]
     assert delta[..., :2].norm(dim=-1).max() <= cfg.correction_limit+1e-6
     assert delta[..., 2].count_nonzero() == 0
     assert out['points'][..., :2].abs().max() <= cfg.lateral_limit
     loss_terms(out, b, cfg, n_commit=2)['geometry_per_state'].mean().backward()
-    assert m.correction.weight.grad.abs().sum() > 0
+    assert m.correction_head[-1].weight.grad.abs().sum() > 0
     assert m.coordinates.weight.grad.abs().sum() > 0
     assert m.encoder.stem[0].weight.grad.abs().sum() > 0
     m.zero_grad(set_to_none=True)
     loss_terms(forward(m, b), b, cfg, n_commit=2)['confidence_per_state'].mean().backward()
-    assert m.correction.weight.grad is None
+    assert m.correction_head[-1].weight.grad is None
     assert m.coordinates.weight.grad is None
 
 
@@ -339,6 +331,7 @@ def test_compact_config_checkpoint_inference(tmp_path, correction):
     cfg = replace(config(), correction=correction, correction_steps=1)
     m = DirectFollower(cfg).eval()
     b = batch(cfg)
+    assert hasattr(m, 'correction_head') == correction
     out = forward(m, b)
     if not correction:
         torch.testing.assert_close(out['initial_points'], out['points'], rtol=0, atol=0)

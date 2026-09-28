@@ -51,6 +51,10 @@ def _direct_training_lines(row):
              f" | mean error {row['error_mean']:.3f} voxels | prefix correct {row['prefix_correct_fraction']:.1%}",
              f"  data: fresh {row['fresh_fraction']:.0%} | fixed {row['fixed_fraction']:.0%}"
              f" | recent {row['recent_fraction']:.0%}"]
+    if 'interval_samples_per_second' in row:
+        lines.insert(0, f"  recent speed {row['interval_samples_per_second']:.2f} samples/s"
+                        f" | data wait {row['interval_data_seconds']:.2f}s"
+                        f" | optimizer {row['interval_update_seconds']:.2f}s per logging interval")
     if 'bank_wrong_continuation_fraction' in row:
         lines[-1] += f" | bank departures {row['bank_wrong_continuation_fraction']:.0%}"
     if 'bank_following_fraction' in row:

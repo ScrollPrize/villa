@@ -4,7 +4,31 @@ import math
 import numpy as np
 import pytest
 
-from vesuvius.neural_tracing.fiber_follow.shared.fast_sample import sample_crop
+from vesuvius.neural_tracing.fiber_follow.shared.fast_sample import sample_crop, sample_scalar_crop
+
+
+@pytest.mark.parametrize('shape', [(9,11,7), (1,3,1)])
+def test_scalar_interpolation_exact_inside_and_across_zero_padded_edges(shape):
+    rng = np.random.default_rng(17)
+    raw = rng.integers(0,256,(1,*shape),dtype=np.uint8)
+    grid = rng.uniform(-3,12,(400,3))
+    grid = np.concatenate((grid, [[0,0,0], [shape[2]-1,shape[1]-1,shape[0]-1]]))
+    expected = np.zeros(len(grid),np.float32)
+    for i,xyz in enumerate(grid):
+        z,y,x = xyz[::-1]
+        iz,iy,ix = math.floor(z),math.floor(y),math.floor(x)
+        fz,fy,fx = z-iz,y-iy,x-ix
+        value = 0.
+        for dz in (0,1):
+            for dy in (0,1):
+                for dx in (0,1):
+                    if 0 <= iz+dz < shape[0] and 0 <= iy+dy < shape[1] and 0 <= ix+dx < shape[2]:
+                        weight = (fz if dz else 1-fz)*(fy if dy else 1-fy)*(fx if dx else 1-fx)
+                        value += weight*raw[0,iz+dz,iy+dy,ix+dx]
+        expected[i] = value*(1./255.)
+    out = np.empty(len(grid),np.float32)
+    sample_scalar_crop(raw,np.zeros(3),np.zeros(3),np.eye(3),grid,out)
+    np.testing.assert_array_equal(out,expected)
 
 
 def brute_history(grid, hist, mask, sigma, segments):

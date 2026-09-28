@@ -48,7 +48,7 @@ def identity_terms(output, batch, cfg, temperature=.1):
     """InfoNCE between pooled on-fiber recent history and appearance ahead.
 
     The anchor is the normalized mean over visible reference positions lying on the annotated
-    fiber (at least two). The immutable observed seed supplies the
+    fiber (at least two). A visible observed seed supplies the
     reference if recent history is insufficient; the two references are never
     added as separate losses. Each annotated positive must outscore only the
     validated centerline negatives beside it; it never

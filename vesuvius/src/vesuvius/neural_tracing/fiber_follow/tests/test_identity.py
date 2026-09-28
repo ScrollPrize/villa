@@ -22,22 +22,9 @@ from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 def config(**kwargs):
     options=dict(fine=CropSpec(depth=24,width=17,behind=8),channels=4,hidden=16,
-        heads=2,layers=1,decoder_layers=1,n_future=4,n_history=32,embedding=8,activation_checkpointing=False,
-        memory_slots=3,memory_steps=2,spatial_recent=1,spatial_archive=2,spatial_retrieve=1)
+        heads=2,layers=1,decoder_layers=1,n_future=4,n_history=32,embedding=8,activation_checkpointing=False)
     options.update(kwargs)
     return DirectConfig(**options)
-
-
-def memory_inputs(cfg, fine):
-    """Padded history with one current head and an immutable seed observation."""
-    b = len(fine)
-    t = cfg.memory_steps+1
-    mask = torch.zeros(b,t,dtype=torch.bool)
-    mask[:,-1] = True
-    return dict(history_crops=fine.new_zeros(b,t-1,*fine.shape[1:]),seed_crop=fine.clone(),
-        memory_mask=mask,memory_positions=torch.zeros(b,t,3),
-        memory_frames=torch.eye(3).expand(b,t,-1,-1).clone(),memory_seed_valid=torch.ones(b,dtype=torch.bool),
-        memory_seed_position=torch.zeros(b,3),memory_seed_frame=torch.eye(3).expand(b,-1,-1).clone())
 
 
 def batch(cfg,b=2):
@@ -48,7 +35,6 @@ def batch(cfg,b=2):
     x=dict(fine=torch.rand(b,2,cfg.fine.depth,cfg.fine.width,cfg.fine.width),
         seed=torch.zeros(b,1,3),seed_mask=torch.ones(b,1),seed_tangent=torch.tensor([0.,0.,1.]).expand(b,-1),
         seed_age=torch.zeros(b))
-    x.update(memory_inputs(cfg,x['fine']))
     points=torch.zeros(b,K*(1+M),3)
     points[:,:K,2]=torch.tensor([2.,3.])
     points[:,K:,0],points[:,K:,2]=3.,2.
@@ -67,7 +53,7 @@ def forward(m, b):
 
 
 
-def test_bank_radius_keeps_supported_diagonals_and_points_inside_crop():
+def test_bank_radius_keeps_supported_diagonals_and_rejects_crop_edge_patches():
     cfg, rule = DirectConfig(), ComponentRule()
     from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import MiningConfig
     assert rule.lateral_max == MiningConfig().max_distance
@@ -79,11 +65,11 @@ def test_bank_radius_keeps_supported_diagonals_and_points_inside_crop():
     _, positive_mask, negative, negative_mask = sample_pairs(
         curve, presence, cfg.fine, foreign, np.full(len(foreign), 10), np.random.default_rng(0),
         positives=1, negatives=4, forward=(10., 10.),
-        margin=0., rule=rule)
+        margin=cfg.patch_radius, rule=rule)
     assert positive_mask.all() and negative_mask.sum() == 3
     selected = negative[0, negative_mask[0] > 0]
     np.testing.assert_allclose(np.linalg.norm(selected[:,:2],axis=1),12.,atol=1e-6)
-    corners = selected[:, None]
+    corners = selected[:, None]+np.array([[-1,-1,-1],[1,1,1]])[None]*cfg.patch_radius
     bounds = crop_corners(cfg.fine)
     assert (corners >= bounds.min(0)).all() and (corners <= bounds.max(0)).all()
 
@@ -113,10 +99,8 @@ def fake_images(builder,items):
     cfg=builder.cfg
     for item in items: reference_layout(item,cfg)
     stack=lambda key: torch.from_numpy(np.stack([i[key] for i in items]).astype(np.float32))
-    x = dict(fine=torch.from_numpy(np.random.default_rng(3).random((len(items),2,cfg.fine.depth,cfg.fine.width,cfg.fine.width),np.float32)),
+    return dict(fine=torch.from_numpy(np.random.default_rng(3).random((len(items),2,cfg.fine.depth,cfg.fine.width,cfg.fine.width),np.float32)),
         seed=stack('visible_seed'),seed_mask=stack('visible_seed_mask'),seed_tangent=stack('visible_seed_tangent'),seed_age=stack('visible_seed_age'))
-    x.update(memory_inputs(cfg,x['fine']))
-    return x
 
 
 def line_fiber(length=600.):
@@ -163,8 +147,7 @@ def test_monitor_observations_need_no_negative_bank_or_identity_labels(monkeypat
     images = fake_images(builder,items)
     monkeypatch.setattr(IdentityObservationBuilder,'images',lambda *a,**kw:images)
     result = builder(items,None)
-    assert {'fine','seed','seed_mask','seed_age','seed_tangent','history_crops','seed_crop'} <= set(result['x'])
-    assert 'dense_mask' in result
+    assert set(result['x']) == {'fine','seed','seed_mask','seed_age','seed_tangent'} and 'dense_mask' in result
     assert 'identity_points' not in result and 'negative_mask' not in result
 
 

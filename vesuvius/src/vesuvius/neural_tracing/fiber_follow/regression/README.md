@@ -1,160 +1,86 @@
 # Axial fiber follower
 
-## Model and memory
+The training launcher uses `axial_fiber_memory_v2`, the model from
+`output/axial_memory_seq_run1`. The model, memory writer, observation construction
+and losses were restored from revision `28f69ae6a`. Its saved configuration has
+4,803,129 parameters and its checkpoint loads strictly, without renamed or missing
+weights. A fresh launch initializes random weights; it does not load that checkpoint.
 
-The direct regression model is `axial_fiber_spatial_memory_v2`, implemented by
-`DirectFollower` in `model.py`. It uses a shared axial encoder, point-based curve
-queries, and spatial observation memory. Memory is always enabled; its capacity
-and training schedule are configurable.
+## Model
 
-Each observation retains its complete axial token grid (39,015 × 128 at the
-production crop), its pose and age, and one fine descriptor at the observed
-head. The descriptor preserves the supervised identity space and fine detail
-from the encoder's full-resolution skip connection; the grid supplies spatial
-context. Candidate queries likewise use one fine descriptor, one support flag,
-and the point's coordinates. Geometry, corrections, confidence and historical
-probes use this same point-based evaluator. Supported points may reach the crop
-edges. The dense decoder computes the fine descriptors for every observation.
+The current 120 × 101 × 101 CT/presence crop at spacing .5 passes through the axial
+encoder once. Visible observed history and the seed condition the spatial tokens.
+One curve decoder predicts 16 forward points. Smaller local heads apply two bounded
+lateral corrections and predict prefix confidence. Supplied candidate curves use
+that confidence head without writing hypothetical observations to memory.
 
-The seed grid is immutable and always readable, with the seed origin/direction
-defined by its observation frame. Current image tokens, visible observed-path
-tokens with explicit ages, and the two most recent historical grids are always
-readable. A learned summary of each older grid supplies an archive retrieval
-key. Each candidate's seed-conditioned path queries score those keys. The
-highest-scoring two observation blocks are read at full spatial resolution,
-with separate attention weights for each path point. A soft read over all
-archive summaries trains the routing parameters, including unselected entries.
-Selection is bounded per curve, not an independent top-k for every point;
-stable ties prefer newer observations. Geometry, corrections, confidence,
-candidate evaluation and historical probes use the same evaluator.
+Historical CT uses a separate small encoder: two stride-two 3-D convolutions over
+17 × 17 × 17 CT/presence patches, pooled to eight 128-channel observation tokens.
+A gated recurrent writer updates 16 learned memory slots. Eight seed tokens remain
+immutable for the trace. Relative motion and seed pose enter the writer, and curve
+queries read the slots and seed through attention.
 
-Defaults retain two recent observations and eight additional older grids.
-The current head occupies a separate bank slot and is not duplicated among
-the recent history when decoding it. Oldest archive entries are evicted first.
-Sixteen learned recurrent slots read the full observation grid and preserve
-compressed context after eviction. Evicted spatial detail is not recoverable:
-this is a bounded archive, not an unlimited historical store. Capacities are
-explicit via `--spatial-recent`, `--spatial-archive`, `--spatial-retrieve` and
-`--memory-slots`. World poses remain float32; feature storage follows the
-model's parameter dtype, independent of the surrounding autocast context. The default bank plus
-seed alone is about 229 MiB per trace in float32, before activations or temporary
-copies (about 114 MiB in BF16).
+Training reconstructs up to 64 historical observations, plus the current head.
+Reconstructed observations are spaced four trace voxels apart. Recorded replay
+tracks retain their actual observation positions. The newest 32 historical writes
+and the current head backpropagate; earlier writes build the state without gradients.
+An auxiliary per-write head predicts departure from, and offset to, the original
+fiber. Its targets never enter model inputs. The memory read initially contributes
+zero; the auxiliary head trains the writer from the first update.
 
-### Training windows and feature lifetime
+Each sampled state rebuilds memory with current weights. During tracing, each trace
+carries its own slots and immutable seed, and subsequent decisions read only the new
+head patch. Replay stores observed geometry and supervision rather than learned
+features. Crop, seed and historical patch footprints are checked against holdouts.
 
-`--trajectory-window 4` supervises up to four consecutive decisions for states
-with explicitly labeled observed tracks. The original sampled state is always
-included. States without suitable track labels and matched-candidate states
-retain their original single-state supervision. Extra decisions use only the
-observed track prefix, the original seed, and separately constructed original-
-fiber targets; target offsets/departure labels never enter model inputs. Every
-extra state's crop/target footprint is checked against the holdout before I/O.
+Geometry, prefix-confidence, candidate, visible-reference identity and memory-probe
+losses match the original run. CT features outside the current crop reach the model
+through recurrent patch memory. The explicit identity loss uses visible references.
 
-All crops are sampled once into the original batch. Window images are views
-of those buffers and share its photometric augmentation. The first decision
-encodes the seed and earlier history; subsequent decisions encode only their
-new crop and carry differentiable memory forward. Activation checkpointing
-can recompute encodings during backward. Losses average over decisions within
-each window, then over originally sampled states, so longer tracked windows do
-not increase their source's loss weight or dilute matched-candidate examples.
-Logs include `supervised_decisions`; detailed decision diagnostic groups count
-the actual decisions evaluated.
+## Training
 
-**No learned encodings survive a training optimizer update.** Every window
-starts with empty carried memory. All of its encodings use the current weights;
-one backward pass accumulates its losses, and memory is discarded before the
-optimizer steps. The next update re-encodes both seed and history. Burn-in and
-stratified encoder-gradient sampling still compute fresh forward features;
-`no_grad` is not a feature cache. Checkpoints contain weights/optimizer/RNG,
-not observation memories. Replay stores observed geometry and labels, not old
-encoder activations. Inference carries features within a trace while its loaded
-model weights stay fixed; a new trace/checkpoint starts new memory.
-
-### Running and validation
-
-To launch a **new** experiment after reviewing the change and completing a
-production-device preflight:
+From `fiber_follow`, using the existing project environment:
 
 ```bash
-bash scripts/launch_spatial_memory.sh
+bash scripts/launch_memory.sh
+tail -F output/logs/axial_memory_seq_run2.log
 ```
 
-Its default destination is `output/axial_spatial_memory_run1`; set `RUN_NAME` to
-choose another destination. The launcher refuses an existing run directory.
-`bash scripts/launch_regression.sh NAME [options]` exposes the same model with
-trainer defaults. `--init-tracer output/RUN/last.pt` initializes a fresh run from
-saved EMA weights. `--init-encoder output/RUN/last.pt` transfers only the encoder
-and compatible identity projection; memory, path decoder and optimizer start
-fresh. `--resume output/RUN/last.pt` continues a run with its optimizer, RNG state,
-and matching training options. Checkpoints must use the direct architecture and
-its current configuration schema.
+The launcher reproduces the original recipe: effective batch 16, microbatch 4,
+12 loader workers, learning rate .0003, 500 warmup updates, 100,000 total updates,
+BF16 CUDA autocast, compilation, and no activation checkpointing. It uses the same
+data paths, split, neighbor bank, sampling, recovery monitoring and online replay
+settings. Existing shared sampler optimizations and interval timing logs are retained.
+The live neighbor bank can grow, so this is the same recipe, not an identical data
+snapshot or a promise of bitwise reproduction.
 
-Production preflight (also exercises the window optimizer with zero LR):
+The default destination is `output/axial_memory_seq_run2`. The launcher refuses an
+existing run directory or log. Set `RUN_NAME` for another fresh run:
 
 ```bash
-PYTHONPATH=../../.. python -m vesuvius.neural_tracing.fiber_follow.regression.identity_preflight \
-  --out output/spatial_memory_preflight --device cuda --forward --compile \
-  --microbatch 2 --batches 2 --memory-slots 16 \
-  --memory-steps 64 --memory-grad-steps 32 --memory-encoder-grad-steps 4 \
-  --spatial-recent 2 --spatial-archive 8 --spatial-retrieve 2 \
-  --trajectory-window 4 --memory-switch-probability .15 --activation-checkpointing
+RUN_NAME=axial_memory_seq_run3 bash scripts/launch_memory.sh
 ```
 
-Tests cover point descriptors and crop-edge support, remote spatial evidence, immutable seeds, archive
-eviction, streaming/unroll parity, relative poses, candidate isolation,
-padding/empty memories, gradients through retrieval, checkpoint loading,
-window supervision/holdout/crop reuse, and re-encoding after parameter updates:
+Stop a named run and its workers with `bash scripts/stop.sh NAME` before launching
+another. `scripts/launch_regression.sh NAME [options]` exposes the trainer directly;
+its memory defaults are also 16 slots and 64 historical observations. Resuming uses
+`--resume` and the original matching options. Neither `--resume` nor `--init-tracer`
+is used by the fresh-run recipe.
+
+## Validation
 
 ```bash
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=../../.. \
-  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_spatial_memory.py \
-  tests/test_memory_training.py tests/test_memory_data.py tests/test_memory_sequences.py \
-  -q -o cache_dir=/tmp/spatial-memory-pytest
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q \
+  -o cache_dir=/tmp/memory-pytest
 ```
 
-This is an architectural implementation, not a measured accuracy or speed
-improvement. Production CUDA memory, throughput, compilation and tracing quality
-still require validation before a long run. The encoder/decoder compile in place;
-archive routing and the CPU observation/window schedule remain eager.
+Tests cover writer gradients, burn-in boundaries, immutable seeds, padded inputs,
+coordinate transforms, streaming/reconstruction parity, active-trace ownership,
+holdouts, per-write supervision, microbatch weighting and checkpoint round trips.
+The full-size training launch also exercises real-data loading, compiled CUDA
+forward/backward, optimizer updates and finite-loss checks.
 
-## Training and evaluation
-
-The encoder consumes fine CT and presence, with a default 120 × 101 × 101 crop
-at spacing .5. Axial tokens have an 8 × 2 × 2 sample stride; a full-resolution
-skip connection feeds the dense feature decoder. Observed geometry and seed
-identity enter the memory reader, not the image encoder. The model predicts
-16 forward points and performs two bounded lateral corrections by default.
-Confidence scores the resulting prefix; supplied candidate curves use the same
-reader and confidence head without writing to memory.
-
-Losses combine direct curve regression, prefix confidence, matched candidate
-BCE, pointwise identity features, and per-observation departure/offset probes.
-InfoNCE pools labeled original-fiber visible history references, falling back
-to the immutable seed descriptor when history is insufficient. Annotation
-membership selects supervised terms only; the model sees every observed crop,
-including contaminated history. Unknown annotation endings are censored;
-confirmed departures have no geometry target. Departure supervision requires
-an observable original-fiber reference in current or historical observations.
-
-The default launcher uses `output/neighbor_samples_r0_32_l80_160_v2`. Its miner
-can publish shards independently. Contrastive query points must lie inside the
-current crop and pass the presence and neighbor-validation checks. Matched
-candidate examples share a crop/history but have different observed seeds.
-Memory-switch examples retain an original-fiber prefix followed by a neighboring
-fiber tail. Replay retains observed tracks; input crops and labels are rebuilt
-with full holdout checks before I/O.
-
-Training logs report geometry, confidence, identity and memory-probe
-diagnostics. Checkpoint and evaluation entry points are:
-
-```bash
-PYTHONPATH=../../.. python -m vesuvius.neural_tracing.fiber_follow.regression.train --help
-PYTHONPATH=../../.. python -m vesuvius.neural_tracing.fiber_follow.regression.identity_preflight --help
-python scripts/evaluate_regression.py --help
-python scripts/evaluate_regression_recovery.py --help
-```
-
-The training window never caches learned features across optimizer updates.
-Inference retains them within one trace under fixed model weights. Deterministic
-CPU fixture tests cover sampling, memory eviction, geometry and gradient paths;
-production tracing quality and GPU throughput require measurement on real data.
+Evaluation uses `scripts/evaluate_regression.py` and
+`scripts/evaluate_regression_recovery.py` with the frozen calibration/final protocol.
+Implementation checks do not establish trained tracing quality.

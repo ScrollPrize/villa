@@ -32,7 +32,7 @@ def image_crop(items, vol, crop, pool=None):
 
 
 class ObservationBuilder:
-    """Current, historical and seed observations, shared by training and tracing."""
+    """One crop and only visible observed references, shared by training/tracing."""
     def __init__(self,cfg):
         self.cfg = cfg
 
@@ -43,8 +43,9 @@ class ObservationBuilder:
         x = dict(fine=image_crop(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
                  seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
                  seed_tangent=stack('visible_seed_tangent'))
-        from .memory_data import memory_images
-        x.update(memory_images(items, vol, self.cfg, image_crop, pool))
+        if self.cfg.memory_slots:
+            from .memory_data import memory_images
+            x.update(memory_images(items, vol, self.cfg, image_crop, pool))
         return x
 
     def __call__(self,items,vol):
@@ -261,6 +262,8 @@ class IdentityObservationBuilder(ObservationBuilder):
     def memory_switch(self, sample_cfg, rng):
         """Original fiber, bridge, then a long neighbor tail, observed along the way."""
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import wrong_continuation
+        if not self.cfg.memory_slots:
+            raise ValueError('Memory-switch sequences require a memory model')
         for _ in range(3):
             item = wrong_continuation(self.continuation_bank or self.negative_bank,sample_cfg,rng,
                                       tail_length_range=self.sampling.memory_switch_tail,prefer_long=True,
@@ -332,19 +335,16 @@ class IdentityObservationBuilder(ObservationBuilder):
         else:
             on = np.zeros(cfg.n_history+1,bool)
         item['reference_on_fiber'] = on.astype(np.float32)
-        if item.get('seed_valid',False):
-            from scipy.spatial import cKDTree
-            item['reference_on_fiber'][-1] = float(cKDTree(fiber.points).query(item['seed_pos'])[0] <= s.on_fiber_tolerance)
         item['identity_reference_valid'] = bool(on[:-1].sum() >= 2 or on[-1])
         # Confirmed old departures with no visible original-fiber evidence cannot
         # be distinguished from ordinary following of the neighboring fiber.
         item['identity_observable'] = bool(not item.get('offtrack',False) or item['identity_reference_valid'])
-        if item.get('offtrack', False):
+        if cfg.memory_slots and item.get('offtrack', False):
             from .memory_data import memory_layout
             observations, seed = memory_layout(item, cfg)
             observations = observations[:-1]  # head alone is not original-fiber history
             # Annotation membership controls supervision only. The memory
-            # writer receives every observed crop, including contaminated ones.
+            # writer receives every observed patch, including contaminated ones.
             if seed is not None:
                 observations = observations+[seed]
             if observations:
@@ -360,24 +360,17 @@ class IdentityObservationBuilder(ObservationBuilder):
             item.update(photometric=draw,drop_presence=bool(rng.random() < s.presence_dropout))
         item['identity_seed'] = int(rng.integers(2**63))
         item.setdefault('location_source',0)
-        if cfg.trajectory_window > 1:
-            from .trajectory_windows import prepare_window
-            prepare_window(self,item,fiber)
         return item
 
     def footprint_allowed(self,item,band):
-        if item.get('_trajectory_children'):
-            from vesuvius.neural_tracing.fiber_follow.shared.data import training_state_allowed
-            if any(not training_state_allowed(child,self.cfg.fine,band) or not self.footprint_allowed(child,band)
-                   for child in item['_trajectory_children']):
-                return False
         # CT is restricted to the main crop, whose footprint FollowDataset checks.
         # Also reject matched labels if their distinguishing seed is not visible.
         if item.get('source') == 5 and not item['visible_seed_mask'].any():
             return False
-        from .memory_data import memory_allowed
-        if not memory_allowed(item, self.cfg, band):
-            return False
+        if self.cfg.memory_slots:
+            from .memory_data import memory_allowed
+            if not memory_allowed(item, self.cfg, band):
+                return False
         if band is None:
             return True
         z = np.asarray(item.get('identity_label_z',np.asarray(item['pos'])[2:3]))
@@ -409,7 +402,7 @@ class IdentityObservationBuilder(ObservationBuilder):
                 additional_banks=([self.near_negative_bank] if self.near_negative_bank is not None and self.near_negative_bank is not bank else ()))
             pos, pos_mask, neg, neg_mask, metadata = sample_pairs(
                 item['identity_curve'], presence[j], crop, found['local'], found['nearest'], rng,
-                positives=K, negatives=M, margin=0.,
+                positives=K, negatives=M, margin=cfg.patch_radius,
                 rule=s.rule,
                 appearance_crop=cfg.fine,
                 along_margin=cfg.fine.spacing,
@@ -436,15 +429,16 @@ class IdentityObservationBuilder(ObservationBuilder):
                 self.lateral.append(item['fiber_ref'])
         return {k: torch.from_numpy(v) for k, v in out.items()}
 
-    def supervise(self,items,batch):
-        """Attach targets to already sampled images (also used by trajectory windows)."""
+    def __call__(self,items,vol):
+        batch = super().__call__(items,vol)
         if self.fibers is None and not self.augment and not any('identity_curve' in i for i in items):
             return batch
         batch.update(self.identity_targets(items,batch['x']))
         batch['identity_observable'] = torch.tensor([i.get('identity_observable',True) for i in items])
         batch['bank_tail_length'] = torch.tensor([i.get('bank_tail_length',0.) for i in items],dtype=torch.float32)
-        from .memory_data import memory_targets
-        batch.update(memory_targets(items, self.cfg))
+        if self.cfg.memory_slots and self.cfg.memory_version >= 2:
+            from .memory_data import memory_targets
+            batch.update(memory_targets(items, self.cfg))
         if self.sampling.decision_fraction:
             shape = (2,self.cfg.n_future)
             for key,trailing in (('candidate_points',(3,)),('candidate_mask',()),('candidate_labels',())):
@@ -452,13 +446,6 @@ class IdentityObservationBuilder(ObservationBuilder):
             for key in ('decision_kind','decision_tail'):
                 batch[key] = torch.tensor([i.get(key,0) for i in items],dtype=torch.float32)
         batch['seed_present'] = batch['x']['seed_mask'].flatten()
-        return batch
-
-    def __call__(self,items,vol):
-        batch = self.supervise(items,super().__call__(items,vol))
-        if self.cfg.trajectory_window > 1 and self.fibers is not None:
-            from .trajectory_windows import build_windows
-            batch['trajectory_windows'] = build_windows(self,items,batch)
         if self.augment:
             for j,item in enumerate(items):
                 if 'photometric' not in item:
@@ -468,19 +455,18 @@ class IdentityObservationBuilder(ObservationBuilder):
                 if item['drop_presence']:
                     batch['x']['fine'][j,1] = 0
                     batch['presence_dropped'][j] = 1
-                x = batch['x']
-                crops = x['history_crops']
-                seed_crop = x['seed_crop']
-                for k in torch.nonzero(x['memory_mask'][j]).flatten().tolist():
-                    if k < crops.shape[1]:
-                        crops[j,k,0] = torch.from_numpy(photometric(
-                            crops[j,k,0].numpy(), item['photometric'], rng))
-                if x['memory_seed_valid'][j]:
-                    seed_crop[j,0] = torch.from_numpy(photometric(
-                        seed_crop[j,0].numpy(), item['photometric'], rng))
-                if item['drop_presence']:
-                    crops[j,:,1] = 0
-                    seed_crop[j,1] = 0
+                if self.cfg.memory_slots:
+                    # Same augmentation parameters along the observation sequence.
+                    x = batch['x']
+                    for k in torch.nonzero(x['memory_mask'][j]).flatten().tolist():
+                        x['memory_patches'][j,k,0] = torch.from_numpy(photometric(
+                            x['memory_patches'][j,k,0].numpy(), item['photometric'], rng))
+                    if x['memory_seed_valid'][j]:
+                        x['memory_seed_patch'][j,0] = torch.from_numpy(photometric(
+                            x['memory_seed_patch'][j,0].numpy(), item['photometric'], rng))
+                    if item['drop_presence']:
+                        x['memory_patches'][j,:,1] = 0
+                        x['memory_seed_patch'][j,1] = 0
         return batch
 
 
@@ -502,5 +488,4 @@ class DirectTracer(ModelTracer):
             for item,path in zip(items,paths):
                 item.update({k:path[k] for k in SEED_FIELDS if k in path})
                 item['memory_warm'] = path.get('memory_warm', False)
-        return {k:v if k in ('history_crops','seed_crop') else v.to(self.device)
-                for k,v in self.observations.images(items,self.vol,self.pool).items()}
+        return {k:v.to(self.device) for k,v in self.observations.images(items,self.vol,self.pool).items()}
