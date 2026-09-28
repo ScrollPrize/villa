@@ -1,6 +1,53 @@
 import pytest
+import json
+from pathlib import Path
 from vesuvius.neural_tracing.fiber_trace_3d.short_failure_benchmark import (
     slice_line, same_location, audit_failure, merge_failure_intervals, cropped_control_metadata)
+
+
+def test_inspection_model_can_be_independent_of_failure_sources(tmp_path, monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d import short_failure_benchmark as m
+    from vesuvius.neural_tracing.fiber_trace_3d import cached_trace_profile as cached
+    evaluation = tmp_path / 'inspection'
+    full = evaluation / 'full'
+    full.mkdir(parents=True)
+    cache = tmp_path / 'cache'
+    checkpoint = tmp_path / 'snapshot.pt'
+    checkpoint.write_bytes(b'fixture')
+    summary = full / 'summary.json'
+    summary.write_text(json.dumps({'completed': True, 'config': {
+        'sources': [{'id': 's', 'fiber_manifest': str(cache / 'inference.lasagna.json')}],
+        'inference': {'input_workers': 1}}}))
+    (evaluation / 'full_bindings.json').write_text(json.dumps({
+        'checkpoint': str(checkpoint), 'checkpoint_sha256': m.sha256_file(checkpoint)}))
+    observed = {}
+    class Session:
+        def __init__(self, config, binary, checkpoint, **kwargs):
+            observed.update(config=config, **kwargs)
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def fill_chunks(self, requests):
+            observed['requests'] = requests
+            return {'completed': True}
+    monkeypatch.setattr(cached, 'CachedReplaySession', Session)
+    workload = {'native_binary': 'unused', 'failure_union': {'evaluations': [
+        {'name': 'lowres', 'summary': 'must-not-read'}]}}
+    m._fill_union_corridor(workload, {'evaluation_name': 'fullres', 'summary': str(summary),
+        'devices': '0,1,2,3,4,5,6,7', 'inference_overrides': {'input_workers': 128}},
+        {str(cache): {(1,2,3)}}, tmp_path)
+    assert observed['config']['inference']['input_workers'] == 128
+    assert observed['devices'] == '0,1,2,3,4,5,6,7'
+    assert observed['requests'] == {str(cache): [(1,2,3)]}
+
+
+def test_training_mining_selects_only_lowres_failures():
+    configs = Path(__file__).resolve().parents[2] / 'src/vesuvius/neural_tracing/fiber_trace_3d/configs'
+    settings = json.loads((configs / 'failure_union_training_20260927.json').read_text())['failure_union']
+    assert [e['name'] for e in settings['evaluations']] == ['lowres']
+    assert settings['baseline_name'] == settings['best_name'] == 'lowres'
+    assert settings['run_reproduction_search'] is True
+    assert settings['context_base_voxels'] == 500
+    assert settings['fill_missing_inference']['evaluation_name'] == 'fullres'
 
 
 @pytest.mark.parametrize('reverse', [False, True])
@@ -44,6 +91,54 @@ def test_crop_does_not_invent_trace_metadata_for_legacy_or_extrapolation():
 def test_exact_slice_and_duplicate_vertices():
     assert slice_line([[0,0,0],[0,0,0],[100,0,0],[200,0,0]],50,150) == [[50.,0.,0.],[100.,0.,0.],[150.,0.,0.]]
     with pytest.raises(ValueError): slice_line([[0,0,0],[10,0,0]],-1,5)
+
+
+def test_scroll_subsets_link_only_selected_chunks_and_preserve_cache(tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.short_failure_benchmark import _export_scroll_subsets
+    channels = ('fiber_presence.ome.zarr', 'fiber_nx.ome.zarr', 'fiber_ny.ome.zarr')
+    roots = {}
+    required = {}
+    for scroll in ('PHercParis4', 'PHerc1299'):
+        root = tmp_path / 'cache' / scroll
+        roots[f's3://bucket/{scroll}/volumes/scan.zarr'] = root
+        required[str(root.resolve())] = {(0, 0, 1)}
+        for channel in channels:
+            array = root / channel
+            (array / '1/0/0').mkdir(parents=True)
+            (array / '.zgroup').write_text('{}')
+            (array / '1/.zarray').write_text('{}')
+            (array / 'scratch.bin').write_bytes(b'not exported')
+            for x in (1, 2):
+                (array / f'1/0/0/{x}').write_bytes(bytes([x]))
+    output = tmp_path / 'export'
+    settings = {'export_chunk_subsets': {'chunk_mode': 'symlink'}}
+    for _ in range(2):
+        result = _export_scroll_subsets(settings, output, roots, required)
+        assert set(result) == {'PHercParis4', 'PHerc1299'}
+    for scroll in result:
+        for channel in channels:
+            array = output / 'vc3d_channels' / scroll / channel
+            assert (array / '1/0/0/1').is_symlink()
+            assert (array / '1/0/0/1').read_bytes() == b'\x01'
+            assert not (array / '1/0/0/2').exists()
+            assert not (array / 'scratch.bin').exists()
+
+
+def test_all_failures_keeps_models_worse_than_classic(tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.short_failure_benchmark import inventory
+    rows = []
+    for name, failures in [('classic', 1), ('best', 0), ('other', 2)]:
+        root = tmp_path / name
+        root.mkdir()
+        summary = {'completed': True, 'config': {}, 'sources': []}
+        (root / 'summary.json').write_text(json.dumps(summary))
+        rows.append({'name': name, 'path': str(root / 'summary.json'),
+                     'metrics': {'global_result': {'failures': failures}}})
+    report = tmp_path / 'report.json'
+    report.write_text(json.dumps({'rows': rows}))
+    models, _ = inventory(report, baseline_name='classic', best_name='best',
+                          evaluation_names=['classic', 'best', 'other'], include_all_failures=True)
+    assert {m['name'] for m in models.values()} == {'classic', 'best', 'other'}
 
 
 def test_location_dedup_respects_eligible_span():

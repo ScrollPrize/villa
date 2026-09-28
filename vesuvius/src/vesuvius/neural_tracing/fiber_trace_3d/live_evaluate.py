@@ -40,6 +40,11 @@ from vesuvius.neural_tracing.fiber_trace_3d.infer import _checkpoint_config_for_
 
 def finalize_native_summary(summary):
     """Placement diagnostics have no trace/restart partitions to correct."""
+    if summary.get('backend') == 'failure_search':
+        if (not summary.get('completed') or
+                summary['evaluated_cases'] + summary['cancelled_cases'] != summary['cases']):
+            raise ValueError('incomplete failure-search summary')
+        return summary
     if summary.get('backend') == 'anchors':
         if not summary.get('completed') or len(summary['anchor_cases']) != summary['cases']:
             raise ValueError('incomplete anchor summary')
@@ -105,44 +110,7 @@ def freeze_checkpoint(path, cache_root):
     return destination, digest
 
 
-def reference_chunks(points_base, factor, shape, chunk):
-    """Exact segment crossings of interpolation-support chunk boundaries.
-
-    Both a chunk boundary and its preceding voxel can change the corner-chunk
-    set. Visit each interval's midpoint and endpoints, not just annotations.
-    """
-    points = np.asarray(points_base, dtype=np.float64) / factor
-    result = set()
-    for left, right in zip(points[:-1], points[1:]):
-        delta = right - left
-        breaks = {0.0, 1.0}
-        for xyz in range(3):
-            if delta[xyz] == 0:
-                continue
-            lo, hi = sorted((left[xyz], right[xyz]))
-            # Clip traversal ranges to the actual array, not out-of-volume
-            # annotation extents. Shape is ZYX; points are XYZ.
-            n = shape[2 - xyz]
-            for boundary in (0, n - 1):
-                t = (boundary - left[xyz]) / delta[xyz]
-                if 0 < t < 1:
-                    breaks.add(float(t))
-            for k in range(max(0, math.floor(lo / chunk)), min(math.ceil(hi / chunk) + 2, math.ceil(n / chunk) + 1)):
-                for boundary in (k * chunk, k * chunk - 1):
-                    t = (boundary - left[xyz]) / delta[xyz]
-                    if 0 < t < 1:
-                        breaks.add(float(t))
-        ordered = sorted(breaks)
-        samples = ordered + [(a + b) * 0.5 for a, b in zip(ordered[:-1], ordered[1:])]
-        for t in samples:
-            p = (left + t * delta)[::-1]
-            if np.any(p < 0) or np.any(p > np.asarray(shape) - 1):
-                continue
-            floor = np.floor(p).astype(np.int64)
-            for corner in itertools.product((0, 1), repeat=3):
-                index = np.minimum(floor + corner, np.asarray(shape) - 1) // chunk
-                result.add(tuple(int(v) for v in index))
-    return result
+from .reference_chunk_geometry import reference_chunks, reference_chunk_job
 
 
 def tube_chunks(points_base, margin_base, factor, shape, chunk):
@@ -528,6 +496,12 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
     connection = None
     pool = None
     with ExitStack() as cleanup:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        import multiprocessing
+        prefetch_workers = min(32, max(1, int(config.get('workers', 32))))
+        prefetch_pool = cleanup.enter_context(ProcessPoolExecutor(
+            max_workers=prefetch_workers, mp_context=multiprocessing.get_context('spawn')))
+        prefetch_jobs = {}
         for source_index, source in enumerate(config["sources"]):
             source_id = source["id"]
             if source_id in source_to_store:
@@ -572,13 +546,15 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
                     group["keys"].append(key)
                 if config.get("resume_visualization", False):
                     for points in resume_points.get(source_id, ()):
-                        backgrounds[key].update(reference_chunks(points,
+                        job = prefetch_pool.submit(reference_chunk_job, (points,
                             (1 << level) * model["scale"], geometry.output_shape, model["chunk"]))
+                        prefetch_jobs[job] = key
                 else:
                     for fiber in references["sources"][source_index]["fibers"]:
                         for run in fiber["runs"]:
-                            backgrounds[key].update(reference_chunks(run["points_base_xyz"],
+                            job = prefetch_pool.submit(reference_chunk_job, (run["points_base_xyz"],
                                 (1 << level) * model["scale"], geometry.output_shape, model["chunk"]))
+                            prefetch_jobs[job] = key
             source_to_store[source_id] = role_keys if mixed is not None else role_keys[0]
             entry = dict(source)
             # Scientific producer identity, independent of manifests' runtime locations.
@@ -602,6 +578,11 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
                 entry["ct_base_volume"] = True
             entry["fibers"] = [location(base, f) for f in source["fibers"]]
             evaluation["sources"].append(entry)
+        for done, job in enumerate(as_completed(prefetch_jobs), 1):
+            backgrounds[prefetch_jobs[job]].update(job.result())
+            if done % 100 == 0 or done == len(prefetch_jobs):
+                print(f'reference-prefetch preparation={done}/{len(prefetch_jobs)} workers={prefetch_workers}', flush=True)
+        prefetch_pool.shutdown(wait=True)
         if any(sha256_file(Path(path)) != digest for path, digest in annotation_hashes.items()):
             raise ValueError("annotation changed before native evaluation launch")
         runtime_settings = runtime_inference_settings(settings, adaptive_manager)
@@ -783,6 +764,11 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                             # validation. Prefetch is required even for a case
                             # that terminates without issuing a sample demand.
                             background_queues = {key: deque(sorted(indices)) for key, indices in backgrounds.items()}
+                            if math.isinf(background_cap):
+                                demand.prepare_background_requests(
+                                    stores, background_queues,
+                                    workers=int(settings.get("input_workers", 128)),
+                                    check_cancelled=check_cancelled)
                             top_up_backgrounds()
                             continue
                         if message.get("type") != "demand" or message["request_id"] in waiters:

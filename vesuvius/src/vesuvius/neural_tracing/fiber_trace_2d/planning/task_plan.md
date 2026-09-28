@@ -1,15 +1,15 @@
-# Plan: portable cache manifests
+# Plan
 
-Reuse original inference manifests and provenance. Validate relative channel paths, exact base dimensions and array shapes. Use Paris4 subset source metadata with local subset channels. Integrate into normal export and expose metadata-only refresh through the approved runner. Preserve fiber filenames.
+Stop inefficient current run safely; preserve inference. Bound coroutine stacks to a small multiple of workers and reuse allocations. Global native trials stay compact until admitted. Order by trial distance ascending; once two neighboring distances reproduce with existing audit semantics, skip larger pending trials (in-flight trials may finish safely). Keep Python authoritative geometry/audit and retain artifacts for successful trials. Add explicit cancelled count/compact trial summary and live progress. Preserve ordinary evaluation ordering. Remove inference overrides; set extraction CPU grant to192 (leaves32 logical cores for IO/manager), same as fullres stage. Existing inference128 workers unchanged.
 
 ## Spec update
 
-The exported channel view includes portable inference.lasagna.json and inference.json in each scroll directory.
+No spec.md. No scientific parameters changed. Native pruning requires two adjacent valid audits, preserves every smaller trial. Partial interrupted trial config remains archived/revisioned.
+
+## Tests
+
+Native bounded queue tests including 300k tasks, wait/wakeup, stack reuse, exceptions. Trial pruning tests. Existing replay tests and Python extraction regression. Approved build/run only. Measure progress and utilization after resume.
 
 ## Docs updates
 
-Document use and regeneration in docs/benchmarks/failure_union_vc3d_manifests.md; record results and durable changelog.
-
-## Validation
-
-Generate all five files using approved runner; validate 15 array bindings; rerun metadata export to verify repeatability. Independent review covers portability and rerun behavior.
+Log findings, tests, timings, operational changes and any limitations; update benchmark doc and changelog.

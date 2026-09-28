@@ -243,7 +243,8 @@ def audit_failure(document, target, grace):
                 outside_travel_base=outside, failure=failure)
 
 
-def inventory(report, excluded=(), *, baseline_name='Classic', best_name=None, evaluation_names=None):
+def inventory(report, excluded=(), *, baseline_name='Classic', best_name=None, evaluation_names=None,
+              include_all_failures=False):
     rows = json.loads(Path(report).read_text())['rows']
     classic_row = next(r for r in rows if r['name'] == baseline_name)
     best_row = (next(r for r in rows if r['name']==best_name) if best_name else
@@ -252,6 +253,8 @@ def inventory(report, excluded=(), *, baseline_name='Classic', best_name=None, e
                 and ('tuned' not in r['name'] if evaluation_names is None else r['name'] in evaluation_names)]
     if classic_row not in selected: selected.append(classic_row)
     if best_row not in selected: selected.append(best_row)
+    if include_all_failures:
+        selected = [r for r in rows if evaluation_names is None or r['name'] in evaluation_names]
     summaries, candidates, classic_events = {}, [], defaultdict(list)
     classic_complete = defaultdict(set)
     verified = {}
@@ -293,7 +296,7 @@ def inventory(report, excluded=(), *, baseline_name='Classic', best_name=None, e
                     candidates.append(c)
                 index += 1
     # An unreported/suppressed Classic failure still disqualifies a local success.
-    candidates = [c for c in candidates if c['category'] != 'other' or
+    candidates = [c for c in candidates if include_all_failures or c['category'] != 'other' or
                   (classic_complete[tuple(c['piece_key'])] == {'forward','reverse'} and
                    not any(abs(c['target']-x) <= 200 for x in classic_events[tuple(c['piece_key'])]))]
     candidates.sort(key=lambda c: (dict(best=0, other=1, classic=2)[c['category']],
@@ -337,7 +340,12 @@ def run(workload, *, devices='0', time_limit_seconds=None):
     excluded = self_proximity_filter(settings,root,binary)
     models, candidates = inventory(settings['history_report'], excluded,
         baseline_name=settings.get('baseline_name','Classic'),best_name=settings.get('best_name'),
-        evaluation_names=settings.get('evaluation_names'))
+        evaluation_names=settings.get('evaluation_names'),
+        include_all_failures=settings.get('extract_all', False))
+    if settings.get('extract_all', False):
+        # A data-derived upper bound, not an arbitrary quota. Every candidate
+        # can succeed at most once; scheduling and dedup remain unchanged.
+        total_cases = best_quota = other_quota = len(candidates) + 1
     fill_missing=settings.get('fill_missing',True)
     checkpoints={}
     if fill_missing:
@@ -453,13 +461,8 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                               workers=min(max(1, len(requests)), worker_budget),
                               max_live_cases=max(256, len(requests)),
                               decoded_cache_bytes=(64 << 30)//lane_count)
-            # Operational limits only: keep model/tile/precision/tracing semantics.
-            inference = evaluation['inference']
-            for key in ('input_workers', 'accumulator_workers', 'flush_workers'):
-                inference[key] = min(int(inference.get(key) or worker_budget), worker_budget)
-            inference['input_io_threads'] = min(int(inference.get('input_io_threads', 16)), worker_budget)
-            inference['input_slots'] = max(int(inference.get('max_batch_size', 8)), 256//lane_count)
-            inference['result_slots'] = max(int(inference.get('max_batch_size', 8)), 128//lane_count)
+            # Reuse producer inference settings verbatim; trace worker budgets
+            # must not silently reduce loader/accumulator/publication resources.
             sources = {s['id']: deepcopy(s) for s in evaluation['sources']}
             if global_worklist:
                 # Native replay slices the original annotation directly.  Do
@@ -537,18 +540,31 @@ def run(workload, *, devices='0', time_limit_seconds=None):
             summary = json.loads((result_root/'summary.json').read_text())
             if not summary['completed'] or summary['cases'] != len(requests):
                 raise ValueError('trial batch incomplete')
+            cancelled = summary.get('cancelled_cases', 0)
+            evaluated = summary.get('evaluated_cases', len(requests))
+            if evaluated + cancelled != len(requests):
+                raise ValueError('trial batch cancellation accounting mismatch')
+            seen = set()
             for path in (result_root/'cases').glob('*/trace.json'):
                 doc = json.loads(path.read_text())
                 if global_worklist:
                     provenance = doc['provenance']
                     key = (provenance['candidate_id'], provenance['direction'],
                            float(provenance['target_distance_base']))
+                    if key in seen:
+                        raise ValueError('duplicate trial artifact')
+                    seen.add(key)
                     c,direction,distance,cache,lo,hi = expected[key]
                 else:
                     c,direction,distance,cache,lo,hi = expected[doc['provenance']['fiber_path']]
                 audit = audit_failure(doc, distance, evaluation.get('excursion_grace_base_voxels',0))
+                if global_worklist and 'native_reproduced' in doc['provenance']:
+                    if doc['provenance']['native_reproduced'] != audit['valid']:
+                        raise ValueError('native pruning audit disagrees with saved-geometry audit')
                 _write_json_ephemeral(cache, dict(**audit, artifact=str(path), direction=direction,
                     distance=distance, original_arcs_base=[lo,hi]))
+            if global_worklist and len(seen) != evaluated:
+                raise ValueError('trial artifact count differs from completed trial count')
             print(f"short-benchmark batch={batch_key} trials={len(requests)} model={models[model]['name']}", flush=True)
 
     def result(c,d,n):
@@ -739,7 +755,7 @@ def run(workload, *, devices='0', time_limit_seconds=None):
     # the same worker budget as trial-reference preparation.
     with ThreadPoolExecutor(max_workers=min(128, max(1, len(selected)))) as writer:
         exported = list(writer.map(export_case, enumerate(selected)))
-    atomic_write(root/'manifest.json',dict(version=1,completed=len(exported)==total_cases,case_count=len(exported),
+    atomic_write(root/'manifest.json',dict(version=1,completed=settings.get('extract_all', False) or len(exported)==total_cases,case_count=len(exported),
         total_base_voxels=sum(x['length_base_voxels'] for x in exported),
         total_mm=sum(x['length_mm'] for x in exported),protocol=PROTOCOL,identity=identity_hash, cases=exported))
     print(json.dumps(dict(case_count=len(exported),total_mm=sum(x['length_mm'] for x in exported),output=str(root))),flush=True)
@@ -865,6 +881,8 @@ def _fill_union_corridor(workload, fill, required_by_root, output):
     name = fill.get('evaluation_name')
     selected = next((x for x in workload['failure_union']['evaluations']
                      if x.get('name') == name), None)
+    if fill.get('summary'):
+        selected = {'summary': fill['summary']}
     if selected is None:
         raise ValueError('fill_missing_inference evaluation_name is not configured')
     summary_path = _summary_path(selected['summary'])
@@ -889,8 +907,9 @@ def _fill_union_corridor(workload, fill, required_by_root, output):
     requests = {}
     for root, indices in required_by_root.items():
         canonical = str(Path(root).resolve())
-        if canonical in source_roots:
-            requests[canonical] = sorted(indices)
+        if canonical not in source_roots:
+            raise ValueError(f'inspection source missing requested cache root: {canonical}')
+        requests[canonical] = sorted(indices)
     if not requests:
         raise ValueError('selected high-resolution evaluation has no requested cache roots')
     from .cached_trace_profile import CachedReplaySession
@@ -915,21 +934,23 @@ def _fill_union_corridor(workload, fill, required_by_root, output):
     print(json.dumps({'coverage_fill_complete': result}), flush=True)
 
 
-def _export_channel_subset(source_root, destination, keys, channels):
+def _export_channel_subset(source_root, destination, keys, channels, *, chunk_mode='copy'):
     """Copy Zarr metadata and only selected level-1 chunks for inspection."""
     source_root, destination = Path(source_root), Path(destination)
+    if chunk_mode not in ('copy', 'symlink'):
+        raise ValueError('chunk_mode must be copy or symlink')
     destination.mkdir(parents=True, exist_ok=True)
     for channel in channels:
         source = source_root / channel
         target = destination / channel
         target.mkdir(parents=True, exist_ok=True)
         for metadata in source.glob('*'):
-            if metadata.is_file():
+            if metadata.name in ('.zarray', '.zattrs', '.zgroup', '.zmetadata') and metadata.is_file():
                 shutil.copy2(metadata, target / metadata.name)
         source_level, target_level = source / '1', target / '1'
         target_level.mkdir(exist_ok=True)
         for metadata in source_level.glob('*'):
-            if metadata.is_file():
+            if metadata.name in ('.zarray', '.zattrs', '.zgroup', '.zmetadata') and metadata.is_file():
                 shutil.copy2(metadata, target_level / metadata.name)
         for z, y, x in sorted(keys):
             source_chunk = source_level / str(z) / str(y) / str(x)
@@ -937,13 +958,40 @@ def _export_channel_subset(source_root, destination, keys, channels):
                 raise FileNotFoundError(f'missing source chunk: {source_chunk}')
             target_chunk = target_level / str(z) / str(y) / str(x)
             target_chunk.parent.mkdir(parents=True, exist_ok=True)
-            if not target_chunk.exists():
+            if chunk_mode == 'symlink':
+                _safe_symlink(source_chunk, target_chunk)
+            elif not target_chunk.exists():
                 shutil.copy2(source_chunk, target_chunk)
     atomic_write(destination / 'subset_manifest.json', {
         'version': 1, 'source_root': str(source_root),
         'level': 1, 'channels': list(channels),
         'chunk_count': len(keys),
+        'chunk_mode': chunk_mode,
     }, durable=False)
+
+
+def _export_scroll_subsets(settings, output, cache_by_locator, required_by_root):
+    spec = settings.get('export_chunk_subsets')
+    if spec is None:
+        return {}
+    roots = {}
+    for locator, root in cache_by_locator.items():
+        root = Path(root).resolve()
+        if str(root) not in required_by_root:
+            continue
+        label = _canonical_source_label(locator)
+        if label in roots and roots[label] != root:
+            raise ValueError(f'multiple cache roots for physical scroll {label}')
+        roots[label] = root
+    results = {}
+    for label, root in sorted(roots.items()):
+        destination = Path(output) / 'chunk_subsets' / label
+        _export_channel_subset(root, destination, required_by_root[str(root)],
+            ('fiber_presence.ome.zarr', 'fiber_nx.ome.zarr', 'fiber_ny.ome.zarr'),
+            chunk_mode=spec.get('chunk_mode', 'symlink'))
+        _safe_symlink(destination, Path(output) / 'vc3d_channels' / label)
+        results[label] = destination
+    return results
 
 
 def _export_paris4_subset(settings, output, cache_by_locator, required_by_root):
@@ -1045,6 +1093,9 @@ def run_union(workload):
         # remain in ``run`` above.
         base_config = Path(settings['reproduction_base_config'])
         reproduction = json.loads(base_config.read_text())
+        if 'trace_cpu_cores' in settings:
+            reproduction['evaluation']['gpu_manager']['cpu_cores'] = int(settings['trace_cpu_cores'])
+        reproduction['devices'] = settings.get('devices', reproduction.get('devices', '0'))
         report_path = output / 'reproduction_history_report.json'
         rows = []
         for evaluation in settings['evaluations']:
@@ -1062,9 +1113,7 @@ def run_union(workload):
             'baseline_name': settings.get('baseline_name', 'Classic'),
             'best_name': settings.get('best_name') or min(rows, key=lambda row: row['metrics']['global_result']['failures'])['name'],
             'evaluation_names': [row['name'] for row in rows],
-            'total_cases': 100000,
-            'best_quota': 100000,
-            'other_quota': 100000,
+            'extract_all': True,
             # The three published evaluations are the source of truth.  Missing
             # corridor chunks are filled on demand by the shared inference
             # queue; cached chunks are reused.  This is required for a complete
@@ -1251,6 +1300,7 @@ def run_union(workload):
     if fill:
         _fill_union_corridor(workload, fill, required_by_root, output)
     paris4_subset = _export_paris4_subset(settings, output, cache_by_locator, required_by_root)
+    scroll_subsets = _export_scroll_subsets(settings, output, cache_by_locator, required_by_root)
 
     coverage = []
     missing_total = 0
@@ -1286,6 +1336,11 @@ def run_union(workload):
         if not source_ids:
             continue
         for source_id in source_ids:
+            if source_id in scroll_subsets:
+                destination = scroll_subsets[source_id]
+                link_manifest.append({'source_id': source_id, 'input_volume': locator,
+                                      'cache_root': str(destination), 'subset': True})
+                continue
             if source_id == 'PHercParis4' and paris4_subset is not None:
                 destination = Path(paris4_subset['output_root'])
                 link_manifest.append({'source_id': source_id, 'input_volume': locator,

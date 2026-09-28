@@ -40,14 +40,16 @@ def load_workload(path):
     return config
 
 
-def validate_locked_membership(split_root, collection):
+def validate_locked_membership(split_root, collection, split="test"):
     """Reject changed test membership/content, including replaced symlinks."""
     from lasagna.inference_provenance import sha256_file
     manifest = json.loads((split_root / "manifest.json").read_text())
     expected = {row["path"]: row["sha256"] for row in manifest["files"]
-                if row["source"] == collection and row["split"] == "test"}
-    actual = {str(p.relative_to(split_root / "test")): p
-              for p in (split_root / "test" / collection).glob("*.json")}
+                if row["source"] == collection and row["split"] == split}
+    if split not in {"train", "test"}:
+        raise ValueError("split must be train or test")
+    actual = {str(p.relative_to(split_root / split)): p
+              for p in (split_root / split / collection).glob("*.json")}
     if actual.keys() != expected.keys():
         raise ValueError(f"locked test membership changed: {collection}")
     for name, path in actual.items():
@@ -112,10 +114,12 @@ def prepare(workload, *, pilot_only=False):
              "workload_sha256": json_digest(workload), "sources": []}
     sources, resolved = [], {}
     for binding in workload["sources"]:
-        collection, sample, scan, count = (binding[k] for k in ("id", "sample_id", "volume_id", "expected_test_count"))
+        split = workload.get("split", "test")
+        collection, sample, scan = (binding[k] for k in ("id", "sample_id", "volume_id"))
+        count = binding[f"expected_{split}_count"]
         if pilot_only and collection != workload["pilot_source_id"]:
             continue
-        validate_locked_membership(SPLIT, collection)
+        validate_locked_membership(SPLIT, collection, split)
         print(f"preflight {collection}: {sample}/{scan}", flush=True)
         matches = [v for v in volumes if (v.sample_id, v.volume_id) == (sample, scan)]
         if len(matches) != 1 or not matches[0].s3_url:
@@ -140,11 +144,14 @@ def prepare(workload, *, pilot_only=False):
                 raise ValueError("normal/base CT extents disagree")
             resolved[resolve_key] = normal, shape
         normal, shape = resolved[resolve_key]
-        files = sorted((SPLIT / "test" / collection).glob("*.json"))
+        files = sorted((SPLIT / split / collection).glob("*.json"))
         if len(files) != count:
             raise ValueError(f"locked test count changed for {collection}")
         files = select_test_files(files, binding.get("test_fibers"))
-        fibers = []
+        if "fiber_order_seed" in workload:
+            import random
+            random.Random(f"{workload['fiber_order_seed']}:{collection}").shuffle(files)
+        fibers, excluded = [], []
         for path in files:
             document = json.loads(path.read_text())
             if document.get("vc_open_data_coordinate_space", coordinate_space) != coordinate_space:
@@ -154,8 +161,18 @@ def prepare(workload, *, pilot_only=False):
             if abs(document.get("vc_open_data_source_original_resolution", volume.pixel_size_um) - volume.pixel_size_um) > 1e-6:
                 raise ValueError(f"physical spacing mismatch: {path}")
             fiber, = load_fiber_file(path)
+            if len(fiber.control_points_xyz) < 2:
+                excluded.append({'path': str(path), 'sha256': sha256_file(path),
+                                 'reason': 'no_control_point_bounded_span'})
+                continue
             points = np.asarray(fiber.line_points_xyz, dtype=np.float64)
-            if not np.isfinite(points).all() or np.any(points < 0) or np.any(points > np.array(shape[::-1])-1):
+            # Evaluation excludes extrapolated tails outside the CP span. A
+            # tail may extend beyond the scan without invalidating its GT span.
+            from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_line_index
+            cp_indices = [control_point_line_index(fiber, i)
+                          for i in range(len(fiber.control_points_xyz))]
+            bounded = points[min(cp_indices):max(cp_indices)+1] if cp_indices else points
+            if not np.isfinite(points).all() or np.any(bounded < 0) or np.any(bounded > np.array(shape[::-1])-1):
                 raise ValueError(f"nonfinite/out-of-bounds reference: {path}")
             length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
             if length <= 0:
@@ -166,10 +183,11 @@ def prepare(workload, *, pilot_only=False):
         sources.append({"id": collection, "coordinate_space": coordinate_space,
                         "input_volume": binding["input_volume"].rstrip("/"), "input_level": input_level,
                         "normal_manifest": str(normal["manifest_path"]),
-                        "base_voxel_size_um": volume.pixel_size_um, "fibers": [str(f) for f in files]})
+                        "base_voxel_size_um": volume.pixel_size_um, "fibers": [f['path'] for f in fibers]})
         audit["sources"].append({"collection": collection, "sample": sample, "scan": scan,
                                  "base_shape_zyx": shape, "normal_manifest_url": normal["manifest_url"],
-                                 "normal_manifest_sha256": normal["manifest_sha256"], "fibers": fibers})
+                                 "normal_manifest_sha256": normal["manifest_sha256"], "fibers": fibers,
+                                 "excluded_fibers": excluded})
     config = {**workload["evaluation"], "sources": sources, "output": str(ROOT / "full")}
     # Shortest unambiguous WHOLE held-out fiber; no shortened/cropped reference.
     choices = [(f["length_base_voxels"], s["collection"], f["path"]) for s in audit["sources"]
@@ -277,6 +295,10 @@ def main():
         run(workload, devices=devices, time_limit_seconds=args.extraction_time_limit_seconds)
         return 0
     if args.mode == "failure-union":
+        if args.devices:
+            workload['failure_union']['devices'] = args.devices
+            if workload['failure_union'].get('fill_missing_inference'):
+                workload['failure_union']['fill_missing_inference']['devices'] = args.devices
         if args.export_manifests_only:
             from vesuvius.neural_tracing.fiber_trace_3d.short_failure_benchmark import export_union_lasagna_manifests
             export_union_lasagna_manifests(workload['output_root'])
@@ -364,7 +386,7 @@ def main():
     if args.mode == "profile":
         if workload.get("profile", {}).get("kind") == "cached-trace":
             for source in workload["sources"]:
-                validate_locked_membership(Path(workload["split_root"]), source["id"])
+                validate_locked_membership(Path(workload["split_root"]), source["id"], workload.get("split", "test"))
             from vesuvius.neural_tracing.fiber_trace_3d.cached_trace_profile import run
             run(workload)
             return 0
@@ -393,7 +415,7 @@ def main():
     if sha256_file(CHECKPOINT) != audit["checkpoint_sha256"] or sha256_file(SPLIT / "manifest.json") != audit["split_sha256"]:
         raise ValueError("checkpoint or split changed after preparation")
     for source in audit["sources"]:
-        validate_locked_membership(SPLIT, source["collection"])
+        validate_locked_membership(SPLIT, source["collection"], workload.get("split", "test"))
         for fiber in source["fibers"]:
             if sha256_file(fiber["path"]) != fiber["sha256"]:
                 raise ValueError(f"annotation changed: {fiber['path']}")

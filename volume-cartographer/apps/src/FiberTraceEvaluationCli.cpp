@@ -1,6 +1,7 @@
 #include "FiberTraceEvaluationCli.hpp"
 #include "FiberTraceCli.hpp"
 #include "FiberLiveBridge.hpp"
+#include "FiberTrialPruning.hpp"
 #include "vc/fiber_tracer/FiberReplay.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberReferenceReplayBenchmark.hpp"
@@ -219,6 +220,9 @@ struct Case {
     size_t run = 0;
     Json selection;
     std::vector<std::vector<cv::Vec3d>> contrastChoices;
+    std::shared_ptr<std::vector<cv::Vec3d>> trialFull;
+    std::shared_ptr<std::vector<double>> trialArc;
+    double trialLo = 0, trialHi = 0;
 };
 
 // Global failure-search trials are initially only compact interval
@@ -965,47 +969,16 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         }
     }
 
-    // Slice all global trials concurrently before starting tracing.  The
-    // source JSON and arc geometry are shared once per path; only the compact
-    // interval copy is per trial.  Preserve descriptor order when appending
-    // Cases so provenance/case indices remain reproducible.
-    if (!deferredTrials.empty()) {
-        const size_t prepWorkers = std::min(
-            deferredTrials.size(),
-            requestedWorkers ? size_t(requestedWorkers)
-                              : size_t(std::max(1u, std::thread::hardware_concurrency())));
-        std::vector<std::vector<cv::Vec3d>> materialized(deferredTrials.size());
-        std::atomic<size_t> nextTrial{0};
-        std::mutex prepErrorMutex;
-        std::exception_ptr prepError;
-        std::vector<std::jthread> prepPool;
-        prepPool.reserve(prepWorkers);
-        for (size_t w = 0; w < prepWorkers; ++w) prepPool.emplace_back([&] {
-            try {
-                while (true) {
-                    const size_t index = nextTrial.fetch_add(1);
-                    if (index >= deferredTrials.size()) break;
-                    const auto& trial = deferredTrials[index];
-                    auto points = sliceFiberLine(*trial.full, *trial.arc, trial.lo, trial.hi);
-                    if (trial.reverse) std::reverse(points.begin(), points.end());
-                    materialized[index] = std::move(points);
-                }
-            } catch (...) {
-                std::lock_guard lock(prepErrorMutex);
-                if (!prepError) prepError = std::current_exception();
-            }
-        });
-        prepPool.clear();
-        if (prepError) std::rethrow_exception(prepError);
-        for (size_t i = 0; i < deferredTrials.size(); ++i) {
-            auto& trial = deferredTrials[i];
-            cases.push_back({trial.source, cases.size(), trial.reverse,
-                trial.fiberPath, std::move(materialized[i]), trial.hi-trial.lo,
-                0, std::move(trial.provenance), {}});
-        }
+    // Keep trial polylines shared until a bounded execution context admits them.
+    for (auto& trial : deferredTrials) {
+        cases.push_back({trial.source, cases.size(), trial.reverse, trial.fiberPath,
+            {}, trial.hi-trial.lo, 0, std::move(trial.provenance), {},
+            trial.full, trial.arc, trial.lo, trial.hi});
     }
+    const bool trialSearch = config.value("failure_search_trials_only", false);
     const size_t workers = std::min(cases.size(), requestedWorkers ? size_t(requestedWorkers) : size_t(std::max(1u, std::thread::hardware_concurrency())));
-    if (live && cases.size() > config.value("max_live_cases", size_t{256}))
+    const bool queuedCases = (live || trialSearch) && !fiberletBackend && !anchorBackend;
+    if (live && !queuedCases && cases.size() > config.value("max_live_cases", size_t{256}))
         throw std::invalid_argument("live case count exceeds explicit stack-preserving thread budget");
     std::unique_ptr<FiberLiveBridge> bridge;
     if (live) bridge = std::make_unique<FiberLiveBridge>(config.at("live_endpoint"));
@@ -1215,7 +1188,13 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     }
     std::vector<size_t> order(cases.size());
     std::iota(order.begin(), order.end(), size_t{0});
-    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return cases[a].length > cases[b].length; });
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        if (trialSearch) return cases[a].selection.at("target_distance_base").get<double>() <
+                                cases[b].selection.at("target_distance_base").get<double>();
+        return cases[a].length > cases[b].length;
+    });
+    FiberTrialPruning trialPruning;
+    std::atomic<size_t> skippedTrials{0};
     std::atomic<size_t> next{0}, completed{0};
     std::atomic<bool> failed{false};
     std::mutex errorMutex;
@@ -1260,13 +1239,26 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     }
     const auto start = std::chrono::steady_clock::now();
     std::vector<std::jthread> pool;
-    for (size_t w = 0; w < (live ? cases.size() : workers); ++w) pool.emplace_back([&] {
+    const auto caseWork = [&] {
         try {
             while (!failed.load()) {
                 const size_t rank = next.fetch_add(1);
                 if (rank >= order.size()) break;
                 const size_t index = order[rank];
-                const auto& item = cases[index];
+                auto& item = cases[index];
+                const std::string trialKey = trialSearch ? item.selection.at("candidate_id").get<std::string>() +
+                    (item.reverse ? ":reverse" : ":forward") : "";
+                const double trialDistance = trialSearch ? item.selection.at("target_distance_base").get<double>() : 0;
+                if (trialSearch && trialPruning.skip(trialKey, trialDistance)) {
+                    ++skippedTrials;
+                    ++completed;
+                    caseRemaining[index].store(0);
+                    return; // One trial per reusable context invocation.
+                }
+                if (item.trialFull) {
+                    item.points = sliceFiberLine(*item.trialFull, *item.trialArc, item.trialLo, item.trialHi);
+                    if (item.reverse) std::reverse(item.points.begin(), item.points.end());
+                }
                 const auto& source = sources[item.source];
                 FiberCaseCpuPermit permit(cpuPermits);
                 if (failed.load()) break;
@@ -1532,8 +1524,37 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                         << lastGraphProgressArc << '\n';
                     continue;
                 }
-                if (!resumeVisualization)
+                if (!resumeVisualization && !trialSearch)
                     writeFiberReplayTraceArtifacts(output / "cases" / std::to_string(index), item.points, replay, threshold, provenance);
+                if (trialSearch) {
+                    bool valid = !replay.failures.empty() && !replay.segments.empty() &&
+                        replay.failures.front().segmentIndex == 0 &&
+                        std::abs(replay.failures.front().referenceArcBase - trialDistance) <= 100;
+                    std::optional<double> outside;
+                    if (valid) {
+                        const auto& segment = replay.segments.front();
+                        for (const auto& match : segment.matches) {
+                            if (match.thresholdMeasurement.thresholdErrorRatio > 1) {
+                                if (!outside) outside = 0.;
+                                else if (match.tracePointIndex > 0)
+                                    *outside += cv::norm(segment.tracePointsBase.at(match.tracePointIndex) -
+                                                       segment.tracePointsBase.at(match.tracePointIndex - 1));
+                            } else outside.reset();
+                        }
+                    }
+                    valid = valid && outside && *outside + 1e-7 >= excursionGrace;
+                    provenance.update(item.selection);
+                    provenance["native_reproduced"] = valid;
+                    writeFiberReplayTraceArtifacts(output / "cases" / std::to_string(index), item.points, replay, threshold, provenance);
+                    trialPruning.record(trialKey, trialDistance, valid);
+                    caseRemaining[index].store(0);
+                    std::vector<cv::Vec3d>().swap(item.points);
+                    const auto done = ++completed;
+                    if (done % 100 == 0)
+                        std::osyncstream(std::cout) << "trial progress=" << done << '/' << cases.size()
+                            << " skipped=" << skippedTrials.load() << std::endl;
+                    return;
+                }
                 if (graphReplay)
                     vc::core::util::atomicWriteString(output / "cases" / std::to_string(index) / "graph.json",
                         fiberletGraphReplayJson(*graphReplay, graphConfig).dump(2) + "\n");
@@ -1647,7 +1668,17 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             std::lock_guard lock(errorMutex);
             if (!error) error = std::current_exception();
         }
-    });
+    };
+    std::unique_ptr<FiberCaseQueue> caseQueue;
+    if (queuedCases) {
+        std::osyncstream(std::cout) << "live case queue: cases=" << cases.size()
+            << " workers=" << workers << std::endl;
+        // Each reusable coroutine drains the shared atomic case queue.
+        caseQueue = std::make_unique<FiberCaseQueue>(workers,
+            trialSearch ? cases.size() : std::min(cases.size(), workers * 8), caseWork);
+    } else {
+        for (size_t w = 0; w < (live ? cases.size() : workers); ++w) pool.emplace_back(caseWork);
+    }
     std::vector<std::jthread> referencePrefetchers;
     referencePrefetchers.reserve(referencePrefetchGroups.size());
     for (auto& group : referencePrefetchGroups) {
@@ -1696,6 +1727,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         });
     }
     pool.clear(); // join before consuming results or propagating errors
+    if (caseQueue) caseQueue->join();
     referencePrefetchers.clear();
     for (auto& source : sources) if (source.fiberlets) source.fiberlets->shutdown();
     if (error) {
@@ -1720,6 +1752,17 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         return 0;
     }
     Json summaries = Json::array();
+    if (trialSearch) {
+        if (completed.load() != cases.size())
+            throw std::runtime_error("incomplete failure-search work queue");
+        vc::core::util::atomicWriteString(output / "summary.json", Json{
+            {"completed", true}, {"backend", "failure_search"}, {"cases", cases.size()},
+            {"evaluated_cases", completed.load() - skippedTrials.load()},
+            {"cancelled_cases", skippedTrials.load()}, {"workers", workers},
+            {"wall_seconds", std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()}
+        }.dump(2) + "\n");
+        return 0;
+    }
     if (anchorBackend) {
         double lengthMm = 0;
         for (const auto& row : anchorOutcomes)

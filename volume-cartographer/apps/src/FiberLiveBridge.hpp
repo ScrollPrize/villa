@@ -6,6 +6,7 @@
 #include <semaphore>
 #include <chrono>
 #include <unordered_set>
+#include "FiberCaseQueue.hpp"
 
 struct FiberReadinessProfile {
     size_t calls = 0, localHits = 0, bridgeCalls = 0, submittedDependencies = 0, cacheClears = 0;
@@ -91,18 +92,31 @@ private:
 
 class FiberCaseCpuPermit {
 public:
-    explicit FiberCaseCpuPermit(std::counting_semaphore<>& pool) : pool_(pool) { pool_.acquire(); }
-    ~FiberCaseCpuPermit() { pool_.release(); }
+    explicit FiberCaseCpuPermit(std::counting_semaphore<>& pool) : pool_(pool) { acquire(); }
+    ~FiberCaseCpuPermit() { if (held_) { pool_.release(); FiberCaseQueue::notify(); } }
     FiberCaseCpuPermit(const FiberCaseCpuPermit&) = delete;
     // Called only by this case's thread; nested candidate pools are disabled.
     template <typename Wait> void suspend(Wait&& wait) {
         pool_.release();
+        held_ = false;
+        FiberCaseQueue::notify();
         try { wait(); }
-        catch (...) { pool_.acquire(); throw; }
-        pool_.acquire();
+        catch (...) {
+            // Preserve the blocking API's permit contract. Stackful cases
+            // unwind without a permit rather than switching in a catch.
+            if (!FiberCaseQueue::active()) acquire();
+            throw;
+        }
+        acquire();
     }
 private:
     std::counting_semaphore<>& pool_;
+    bool held_ = false;
+    void acquire() {
+        if (FiberCaseQueue::active()) FiberCaseQueue::await([this] { return pool_.try_acquire(); });
+        else pool_.acquire();
+        held_ = true;
+    }
 };
 
 // Construction and replay share admission, but not dependency-waiting threads.

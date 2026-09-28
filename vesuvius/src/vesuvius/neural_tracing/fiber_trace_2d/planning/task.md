@@ -1,3 +1,3 @@
-# Task
+# Bounded parallel failure search
 
-Export portable Lasagna manifests and provenance for all five generated failure-piece cache volumes, usable after rsync in VC3D.
+Fix native trial admission to use lightweight queued jobs and bounded reusable stacks. Shortest trials first; prune larger distances after valid minimal/padded reproduction. Restore producer inference settings without extractor clamps. Use available manager-granted CPUs, preserve inference cache/numerics, rebuild via approved runner and resume lowres-only mining with highres inspection.

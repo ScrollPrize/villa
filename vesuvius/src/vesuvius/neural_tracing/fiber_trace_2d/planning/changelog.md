@@ -1,3 +1,42 @@
+## 2026-09-28 — Bounded native failure-search queue
+
+- Replace per-trial eager coroutine stacks with bounded reusable contexts;
+  materialize geometry on admission, search shortest-first and prune larger
+  queued distances after a valid adjacent failure/padding pair. Preserve
+  ordinary evaluation ordering. Record cancelled counts and validate artifacts.
+- Remove extraction-specific inference resource clamps; use producer settings
+  unchanged. Explicit192-CPU tracing budget, all8 GPUs. Native/Python tests pass.
+
+## 2026-09-28 — Lowres-only training hard mining
+
+- Failure sources restricted to best lowres; independent fullres inspection
+  producer reuses shared caches and fills only exported corridors. Preserve
+  reproduction, expansion, union and parallel scheduling. Resume on all8 GPUs.
+
+## 2026-09-28 — Parallel live-cache startup
+
+- Parallel cache validation/decode and dependency preparation using existing
+  input workers, with bounded batches and deterministic coordinator merge.
+  Keep startup barrier and capped background semantics; active run untouched.
+  Regression tests cover concurrency, corruption, missing chunks and errors.
+
+## 2026-09-28 — Resume training hard mining after kernel upgrade
+
+- Resume approved workflow on GPUs0–7, preserving completed Classic/lowres and
+  published inference. Archive interrupted fullres trace output under workflow
+  lock without changing scheduling, inference tuning or prepared evidence.
+  Five regression tests cover archival safety. Kernel now 6.8.0-1062-oracle;
+  ephemeral write/fsync probe passed.
+
+## 2026-09-28 — Diagnose md0/ext4 allocator stall
+
+- Matched Ubuntu Oracle kernel binary to running perf build ID and confirmed
+  missing stripe-aligned allocation fallback (upstream 1f6bc02f1848). Perf
+  executes the exact affected branch; group-search CPU dominates. Recorded
+  journal/write-probe evidence and uncertainty about repeated live allocation
+  groups. No kernel/filesystem or inference-setting changes. See
+  docs/benchmarks/ext4_allocation_stall_20260928.md.
+
 ## 2026-09-19 — Skeleton backend: sub-ports, kept variants, per-sub-port routing
 
 - Measured what the thresholded fibre presence constrains. Its section is a

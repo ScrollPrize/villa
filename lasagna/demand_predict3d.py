@@ -44,6 +44,53 @@ MMAP_SHARD_TARGET_BYTES = 128 << 30
 MAX_MMAP_FILE_BYTES = 8 << 40
 
 
+def prepare_background_requests(stores, backgrounds, *, workers, check_cancelled=lambda: None):
+    """Prepare uncapped startup requests in parallel before any pool is pumped.
+
+    Workers only read caches/geometry. The coordinator installs records in
+    request order; ordinary request() subsequently owns heap/publication updates.
+    Bounded batches avoid one future per chunk and unlimited completed results.
+    """
+    if type(workers) is not int or workers < 1:
+        raise ValueError("startup workers must be a positive integer")
+    local = threading.local()
+
+    def prepare(item):
+        key, index = item
+        store = stores[key]
+        origin = store.geometry.origin(index)
+        if origin in store.chunks:
+            return key, origin, None
+        if not hasattr(local, "arrays"):
+            local.arrays = {}
+        ready = store._cached_chunk_complete(origin, read_arrays=local.arrays)
+        dependencies = None if ready else store.geometry.contributors(origin)
+        return key, origin, (ready, dependencies)
+
+    requests = ((key, index) for key, indices in backgrounds.items() for index in indices)
+    count = 0
+    started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cache-startup") as pool:
+        while batch := list(itertools.islice(requests, workers * 4)):
+            check_cancelled()
+            # Materialize before installing so workers never race dictionary writes.
+            prepared = list(pool.map(prepare, batch))
+            for key, origin, result in prepared:
+                store = stores[key]
+                if result is None or origin in store.chunks:
+                    continue
+                ready, dependencies = result
+                if ready:
+                    store.chunks[origin] = {"ready": True}
+                    store.stats["warm_chunks"] += 1
+                else:
+                    store._register_missing(origin, dependencies)
+            count += len(batch)
+            if count % (workers * 40) == 0:
+                print(f"cache-startup prepared={count} workers={workers} elapsed={time.monotonic()-started:.1f}s", flush=True)
+    print(f"cache-startup complete prepared={count} workers={workers} elapsed={time.monotonic()-started:.1f}s", flush=True)
+
+
 def cleanup_stale_live_tmp(channel_paths: Iterable[Path]) -> int:
     """Remove abandoned accumulator sessions from known channel roots.
 
@@ -259,20 +306,21 @@ class DemandStore:
             index = tuple(v // product.chunk_size for v in origin)
             yield Path(tiled._zarr_chunk_path(str(Path(channel.relative_path) / str(product.level)), sep, *index))
 
-    def _cached_chunk_complete(self, origin):
+    def _cached_chunk_complete(self, origin, *, read_arrays=None):
         # Existing shared completeness checks require actual files, including
         # explicit zero chunks. A missing sibling must never become Zarr fill.
         if not all(self.output_adapter.product_chunk_complete(product, chunk_origin_zyx=origin)
                    for product in self.products):
             return False
         import zarr
+        read_arrays = self._read_arrays if read_arrays is None else read_arrays
         region = tuple(slice(o, min(o + self.geometry.chunk, n)) for o, n in zip(origin, self.geometry.output_shape))
         try:
             for channel, product, _ in self._channel_metadata:
                 path = str(Path(channel.relative_path) / str(product.level))
-                if path not in self._read_arrays:
-                    self._read_arrays[path] = zarr.open_array(path, mode="r")
-                array = self._read_arrays[path]
+                if path not in read_arrays:
+                    read_arrays[path] = zarr.open_array(path, mode="r")
+                array = read_arrays[path]
                 if (tuple(array.shape) != self.geometry.output_shape or array.dtype != np.dtype(product.dtype)
                         or tuple(array.chunks) != (self.geometry.chunk,) * 3):
                     return False
@@ -315,9 +363,12 @@ class DemandStore:
             return
         if origin not in self.chunks:
             dependencies = self.geometry.contributors(origin)
-            self.chunks[origin] = {"ready": False, "dependencies": dependencies,
-                                   "applied": set(), "pending": set(), "requested": False,
-                                   "publishing": False}
+            self._register_missing(origin, dependencies)
+
+    def _register_missing(self, origin, dependencies):
+        self.chunks[origin] = {"ready": False, "dependencies": dependencies,
+                               "applied": set(), "pending": set(), "requested": False,
+                               "publishing": False}
 
     def request(self, index, *, remaining=0.0, background=False):
         origin = self.geometry.origin(index)

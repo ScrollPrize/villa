@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <limits>
 #include <stdexcept>
 
 namespace vc::fiber_tracer
@@ -14,6 +15,40 @@ namespace
 {
 
 constexpr double kEpsilon = 1.0e-9;
+
+// The selection length can be a difference of prefix sums, while replay
+// sums the selected segments afresh (and in reverse for reverse cases).
+// Allow accumulated floating-point roundoff, not a geometric tolerance.
+double intervalRoundoff(const FiberReferenceReplayCase& replayCase)
+{
+    return std::max(kEpsilon,
+        8.0 * std::numeric_limits<double>::epsilon() *
+        std::max(std::size_t{1}, replayCase.pointsBaseXYZ.size()) *
+        std::max(1.0, replayCase.referenceLengthBaseVoxels));
+}
+
+template <class Replay>
+void validateInterval(const FiberReferenceReplayCase& replayCase, const Replay& replay)
+{
+    if (!std::isfinite(replay.referenceBeginArcBase) ||
+        !std::isfinite(replay.referenceEndArcBase) ||
+        !std::isfinite(replay.completedReferenceArcBase) ||
+        std::abs(replay.referenceBeginArcBase) > kEpsilon ||
+        std::abs(replay.referenceEndArcBase - replayCase.referenceLengthBaseVoxels) > intervalRoundoff(replayCase)) {
+        throw std::invalid_argument("reference replay result interval does not match its case");
+    }
+}
+
+template <class Replay>
+double evaluatedLength(const FiberReferenceReplayCase& replayCase, const Replay& replay)
+{
+    // Completion is relative to replay's own endpoint. Once reached, credit
+    // the canonical case length, avoiding a second false incomplete error.
+    if (replay.completedReferenceArcBase >= replay.referenceEndArcBase - kEpsilon)
+        return replayCase.referenceLengthBaseVoxels;
+    return std::clamp(replay.completedReferenceArcBase - replay.referenceBeginArcBase,
+        0.0, replayCase.referenceLengthBaseVoxels);
+}
 
 double polylineLength(const std::vector<cv::Vec3d>& points)
 {
@@ -63,17 +98,14 @@ FiberReferenceReplayOutcome measureFiberReferenceReplayOutcome(const FiberRefere
     if (!(replayCase.referenceLengthBaseVoxels > 0.0) || !std::isfinite(replayCase.referenceLengthBaseVoxels)) {
         throw std::invalid_argument("reference replay case length must be positive and finite");
     }
-    if (std::abs(replay.referenceBeginArcBase) > kEpsilon || std::abs(replay.referenceEndArcBase - replayCase.referenceLengthBaseVoxels) > kEpsilon) {
-        throw std::invalid_argument("reference replay result interval does not match its case");
-    }
+    validateInterval(replayCase, replay);
 
     FiberReferenceReplayOutcome outcome;
     outcome.sourceIndex = replayCase.sourceIndex;
     outcome.runIndex = replayCase.runIndex;
     outcome.reverse = replayCase.reverse;
     outcome.referenceLengthBaseVoxels = replayCase.referenceLengthBaseVoxels;
-    outcome.evaluatedThroughBaseVoxels =
-        std::clamp(replay.completedReferenceArcBase - replay.referenceBeginArcBase, 0.0, replayCase.referenceLengthBaseVoxels);
+    outcome.evaluatedThroughBaseVoxels = evaluatedLength(replayCase, replay);
     outcome.evaluationComplete = outcome.evaluatedThroughBaseVoxels >= replayCase.referenceLengthBaseVoxels - kEpsilon;
     outcome.failureFree = replay.failures.empty();
 
@@ -139,21 +171,14 @@ FiberReferenceReplayOutcome measureFiberReferenceReplayOutcome(
         throw std::invalid_argument(
             "reference replay case length must be positive and finite");
     }
-    if (std::abs(replay.referenceBeginArcBase) > kEpsilon ||
-        std::abs(replay.referenceEndArcBase -
-                 replayCase.referenceLengthBaseVoxels) > kEpsilon) {
-        throw std::invalid_argument(
-            "reference replay result interval does not match its case");
-    }
+    validateInterval(replayCase, replay);
 
     FiberReferenceReplayOutcome outcome;
     outcome.sourceIndex = replayCase.sourceIndex;
     outcome.runIndex = replayCase.runIndex;
     outcome.reverse = replayCase.reverse;
     outcome.referenceLengthBaseVoxels = replayCase.referenceLengthBaseVoxels;
-    outcome.evaluatedThroughBaseVoxels = std::clamp(
-        replay.completedReferenceArcBase - replay.referenceBeginArcBase,
-        0.0, replayCase.referenceLengthBaseVoxels);
+    outcome.evaluatedThroughBaseVoxels = evaluatedLength(replayCase, replay);
     outcome.evaluationComplete = outcome.evaluatedThroughBaseVoxels >=
         replayCase.referenceLengthBaseVoxels - kEpsilon;
     outcome.failureFree = replay.failures.empty();

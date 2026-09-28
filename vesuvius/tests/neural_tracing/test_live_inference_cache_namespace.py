@@ -75,3 +75,11 @@ def test_namespace_file_is_not_replaced(tmp_path):
     with pytest.raises(FileExistsError):
         inference_cache_root(tmp_path, "test")
     assert namespace.read_bytes() == b"keep"
+def test_failure_search_summary_accounts_for_cancelled_trials():
+    import pytest
+    from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import finalize_native_summary
+    good = dict(backend='failure_search', completed=True, cases=100,
+                evaluated_cases=20, cancelled_cases=80)
+    assert finalize_native_summary(good) == good
+    with pytest.raises(ValueError, match='incomplete'):
+        finalize_native_summary(dict(good, cancelled_cases=79))

@@ -115,23 +115,24 @@ def test_configured_local_normals_validate_exact_source(monkeypatch):
         module.resolve_normal_binding(None, {**binding, "volume_id": "wrong-scan"}, [])
 
 
-def test_locked_membership_rejects_changed_content_and_membership(tmp_path):
+@pytest.mark.parametrize('split', ['train', 'test'])
+def test_locked_membership_rejects_changed_content_and_membership(tmp_path, split):
     script = Path(__file__).resolve().parents[2] / "scripts/run_classic_fiber_evaluation.py"
     spec = importlib.util.spec_from_file_location("classic_eval", script)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    directory = tmp_path / "test/source"
+    directory = tmp_path / split / "source"
     directory.mkdir(parents=True)
     annotation = directory / "fiber.json"
     annotation.write_text("{}")
     (tmp_path / "manifest.json").write_text(json.dumps({"files": [{
-        "source": "source", "split": "test", "path": "source/fiber.json",
+        "source": "source", "split": split, "path": "source/fiber.json",
         "sha256": hashlib.sha256(b"{}").hexdigest()}]}))
-    module.validate_locked_membership(tmp_path, "source")
+    module.validate_locked_membership(tmp_path, "source", split)
     annotation.write_text("[]")
     with pytest.raises(ValueError, match="hash mismatch"):
-        module.validate_locked_membership(tmp_path, "source")
+        module.validate_locked_membership(tmp_path, "source", split)
     annotation.write_text("{}")
     annotation.rename(directory / "swapped.json")
     with pytest.raises(ValueError, match="membership changed"):
-        module.validate_locked_membership(tmp_path, "source")
+        module.validate_locked_membership(tmp_path, "source", split)

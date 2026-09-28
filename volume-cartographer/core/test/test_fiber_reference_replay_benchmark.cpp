@@ -8,6 +8,7 @@
 #include "vc/lasagna/LineOptimizer.hpp"
 
 #include <cmath>
+#include <limits>
 
 namespace
 {
@@ -32,6 +33,32 @@ private:
 };
 
 }  // namespace
+
+TEST_CASE("reference replay interval tolerates accumulated roundoff but not missing coverage")
+{
+    using namespace vc::fiber_tracer;
+    FiberReferenceReplayCase replayCase;
+    // Actual training case 2293: a 19,394-vertex reverse Paris4 run.
+    replayCase.referenceLengthBaseVoxels = 154719.34786287573;
+    replayCase.pointsBaseXYZ.resize(19394);
+    const auto check = [&](auto replay) {
+        replay.referenceEndArcBase = 154719.3478628727;
+        replay.completedReferenceArcBase = replay.referenceEndArcBase;
+        auto outcome = measureFiberReferenceReplayOutcome(replayCase, replay);
+        CHECK(outcome.evaluationComplete);
+        CHECK(outcome.evaluatedThroughBaseVoxels == replayCase.referenceLengthBaseVoxels);
+        const std::vector<FiberReferenceReplayOutcome> outcomes{outcome};
+        CHECK_NOTHROW(summarizeFiberReferenceReplay(1, outcomes, 2.4));
+        replay.completedReferenceArcBase -= 0.01;
+        CHECK_FALSE(measureFiberReferenceReplayOutcome(replayCase, replay).evaluationComplete);
+        replay.referenceEndArcBase -= 0.01;
+        CHECK_THROWS_AS(measureFiberReferenceReplayOutcome(replayCase, replay), std::invalid_argument);
+        replay.referenceEndArcBase = std::numeric_limits<double>::quiet_NaN();
+        CHECK_THROWS_AS(measureFiberReferenceReplayOutcome(replayCase, replay), std::invalid_argument);
+    };
+    check(FiberReplayTraceResult{});
+    check(FiberletGraphReplayResult{});
+}
 
 TEST_CASE("anchor coverage uses ellipse flat caps and arclength gaps")
 {

@@ -19,6 +19,89 @@ LAYOUT_CASES = [("flat", False), ("chunk-major", False),
         not tiled.sys.platform.startswith("linux"), reason="Linux writable-prefault experiment"))]
 
 
+def test_parallel_startup_matches_serial_registration(tmp_path):
+    from lasagna.demand_predict3d import prepare_background_requests
+    geometry = DemandGeometry((12, 4, 4), 4, 0, 0, 1, 4)
+    adapter, output = outputs(tmp_path, geometry.shape, 4)
+    with DemandStore(tmp_path, {}, geometry, adapter, output):
+        pass  # Establish provenance before writing cached fixture payloads.
+    array = zarr.open_array(str(tmp_path / "value.zarr/0"), mode="r+")
+    array[0:4] = 23
+    array[4:8] = 42
+    (tmp_path / "value.zarr/0/1/0/0").write_bytes(b"broken")
+    indices = [(0,0,0), (1,0,0), (2,0,0), (0,0,0)]
+    def snapshot(store):
+        return (store.chunks, store.stats, store.priorities,
+                store._pending_priorities, list(store.publications))
+    with DemandStore(tmp_path, {}, geometry, adapter, output) as store:
+        for index in indices:
+            store.request(index, background=True)
+        expected = snapshot(store)
+    with DemandStore(tmp_path, {}, geometry, adapter, output) as store:
+        prepare_background_requests({'s': store}, {'s': indices}, workers=4)
+        for index in indices:
+            store.request(index, background=True)
+        assert snapshot(store) == expected
+        assert store.stats['warm_chunks'] == 1
+
+
+def test_parallel_startup_concurrency_and_failure(tmp_path, monkeypatch):
+    import threading
+    from lasagna.demand_predict3d import prepare_background_requests
+    geometry = DemandGeometry((16, 4, 4), 4, 0, 0, 1, 4)
+    adapter, output = outputs(tmp_path, geometry.shape, 4)
+    with DemandStore(tmp_path, {}, geometry, adapter, output) as store:
+        barrier = threading.Barrier(4)
+        handles = []
+        def check(origin, *, read_arrays):
+            handles.append(read_arrays)
+            barrier.wait(timeout=5)
+            return False
+        monkeypatch.setattr(store, '_cached_chunk_complete', check)
+        prepare_background_requests({'s': store}, {'s': [(z,0,0) for z in range(4)]}, workers=4)
+        assert len({id(h) for h in handles}) == 4
+        assert len(store.chunks) == 4
+        store.chunks.clear()
+        def failed(*args, **kwargs):
+            raise MemoryError('startup allocation')
+        monkeypatch.setattr(store, '_cached_chunk_complete', failed)
+        with pytest.raises(MemoryError, match='startup allocation'):
+            prepare_background_requests({'s': store}, {'s': [(0,0,0)]}, workers=4)
+        assert not store.chunks
+
+
+def test_parallel_startup_latency_benchmark(tmp_path, monkeypatch):
+    """Controlled I/O-latency benchmark, not a production speed estimate."""
+    from lasagna.demand_predict3d import prepare_background_requests
+    geometry = DemandGeometry((1024, 4, 4), 4, 0, 0, 1, 4)
+    adapter, output = outputs(tmp_path, geometry.shape, 4)
+    indices = [(z, 0, 0) for z in range(256)]
+    timings = {'serial': [], 'parallel': []}
+    with DemandStore(tmp_path, {}, geometry, adapter, output) as store:
+        def check(*args, **kwargs):
+            time.sleep(.002)  # Model blocking cache I/O; deliberately synthetic.
+            return False
+        monkeypatch.setattr(store, '_cached_chunk_complete', check)
+        expected = None
+        for _ in range(3):
+            for mode in timings:
+                store.chunks.clear()
+                store.priorities.clear()
+                store._pending_priorities.clear()
+                started = time.perf_counter()
+                if mode == 'parallel':
+                    prepare_background_requests({'s': store}, {'s': indices}, workers=16)
+                for index in indices:
+                    store.request(index, background=True)
+                timings[mode].append(time.perf_counter() - started)
+                actual = (dict(store.chunks), dict(store.priorities), list(store._pending_priorities))
+                if expected is None:
+                    expected = actual
+                assert actual == expected
+    for mode, values in timings.items():
+        print(f'{mode}: mean={np.mean(values):.4f}s min/median/max={min(values):.4f}/{np.median(values):.4f}/{max(values):.4f}s')
+
+
 def _spawn_spill_roundtrip(requests, response, segment_stride, scratch_dir, result):
     from lasagna.chunk_accumulator_arena import ChunkAccumulatorArena
     def acquire():

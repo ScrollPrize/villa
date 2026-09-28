@@ -45,8 +45,11 @@ TEST_CASE("Construction and tracing share CPU admission without holding it durin
 
 TEST_CASE("live heartbeat keeps paused demand pending, never marks it ready") {
     bool keepalive = true;
+    bool queued = false;
     SUBCASE("live coordinator may wait beyond request deadline") {}
     SUBCASE("stopped heartbeats still time out") { keepalive = false; }
+    SUBCASE("stackful queued wait survives heartbeats") { queued = true; }
+    SUBCASE("stackful queued wait times out") { queued = true; keepalive = false; }
     const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE(listener >= 0);
     sockaddr_in address{};
@@ -90,12 +93,17 @@ TEST_CASE("live heartbeat keeps paused demand pending, never marks it ready") {
         FiberLiveBridge bridge({{"port", ntohs(address.sin_port)}, {"token", "test"},
                                 {"timeout_seconds", 1}, {"heartbeat_wait", true}});
         const auto start = std::chrono::steady_clock::now();
+        auto await = [&] {
+            auto work = [&] { bridge.await("test", 0, 0, {{"test.zarr", {0,0,0}}}); };
+            if (queued) { FiberCaseQueue queue(1, 1, work); queue.join(); }
+            else work();
+        };
         if (keepalive) {
-            bridge.await("test", 0, 0, {{"test.zarr", {0,0,0}}});
+            await();
             CHECK(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(1500));
         } else {
             bool failed = false;
-            try { bridge.await("test", 0, 0, {{"test.zarr", {0,0,0}}}); }
+            try { await(); }
             catch (const std::runtime_error& error) {
                 failed = true;
                 CHECK(std::string(error.what()) == "timed out waiting for inference chunks");
