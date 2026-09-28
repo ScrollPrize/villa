@@ -16,7 +16,8 @@ from torch.utils.checkpoint import checkpoint
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 
 ARCHITECTURE = 'axial_fiber_v3'
-MEMORY_ARCHITECTURE = 'axial_fiber_memory_v1'
+MEMORY_ARCHITECTURE = 'axial_fiber_memory_v2'
+MEMORY_ARCHITECTURE_V1 = 'axial_fiber_memory_v1'  # no probe; loadable, not trained further
 TOKEN_STRIDE = (8, 2, 2)  # z, y, x in input samples
 TOKEN_OFFSET = (3, 0, 0)  # centre of four stride-two stem positions
 IDENTITY_EVIDENCE_WIDTH = 8  # point/mean/min/coverage for seed and history separately
@@ -42,8 +43,12 @@ class DirectConfig:
     correction_steps: int = 2
     memory_slots: int = 0  # zero preserves the crop-only architecture and weights
     memory_steps: int = 32  # preceding observed patches, plus the current head
-    memory_stride: int = 4  # historical observation spacing in trace voxels
+    memory_stride: int = 4  # reconstructed-history observation spacing in trace voxels
     memory_patch_size: int = 17  # 8-voxel-wide patch at the production .5 spacing
+    # The newest memory_grad_steps observations (and the head) backpropagate;
+    # older ones are a no-grad burn-in. At least memory_steps: no burn-in.
+    memory_grad_steps: int = 32
+    memory_version: int = 2  # 1: legacy checkpoints without the probe
 
     def __post_init__(self):
         if isinstance(self.fine, dict):
@@ -67,10 +72,10 @@ class DirectConfig:
         if not isinstance(self.memory_slots, int) or self.memory_slots < 0:
             raise ValueError('Memory slots must be a nonnegative integer')
         if self.memory_slots:
-            if any(not isinstance(v, int) or v < 1 for v in (self.memory_steps, self.memory_stride)):
+            if any(not isinstance(v, int) or v < 1 for v in (self.memory_steps, self.memory_stride, self.memory_grad_steps)):
                 raise ValueError('Memory sequence dimensions must be positive integers')
-            if self.memory_steps*self.memory_stride > self.n_history:
-                raise ValueError('Memory sequence exceeds the saved observed history')
+            if self.memory_version not in (1, 2):
+                raise ValueError('Unknown memory version')
             if not isinstance(self.memory_patch_size, int) or self.memory_patch_size < 5 or self.memory_patch_size % 2 != 1:
                 raise ValueError('Memory patch size must be odd and at least five')
 
@@ -293,7 +298,7 @@ class DirectFollower(nn.Module):
         if cfg.memory_slots:
             from .memory import LearnedMemory
             self.recurrent_memory = LearnedMemory(cfg)
-            self.architecture = MEMORY_ARCHITECTURE
+            self.architecture = MEMORY_ARCHITECTURE if cfg.memory_version == 2 else MEMORY_ARCHITECTURE_V1
 
     def context(self, x, hist, hmask):
         cfg = self.cfg

@@ -14,12 +14,15 @@ def validate_tail_range(lengths):
     return tuple(float(v) for v in lengths)
 
 
-def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 128.), prefer_long=False):
+def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 128.), prefer_long=False,
+                       prefix_length=0., track_stride=None):
     """No tracing or volume I/O; abstain if a safe connected history cannot fit.
 
     Only the head and tail on the verified neighbor are labeled as departed.
     The artificial bridge is observed history, never a positive future target.
     An undersized path is rejected, rather than shortening the requested tail.
+    ``prefix_length`` extends the original-fiber prefix (and moves the seed back);
+    ``track_stride`` also returns ``memory_track`` observations along the path.
     """
     tail_length_range = validate_tail_range(tail_length_range)
     requested_tail = float(rng.uniform(*tail_length_range)) if prefer_long else None
@@ -66,7 +69,7 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 128.), prefer_l
     phase = np.clip((samples-start)/bridge_length,0,1)
     weight = phase**3*(10+phase*(-15+6*phase))  # zero first/second derivatives at both joins
     transition = own*(1-weight[:,None])+neighbor*weight[:,None]
-    prefix_t = np.arange(max(0.,own_t[0]-cfg.n_history*cfg.history_step-4),own_t[0],.25)
+    prefix_t = np.arange(max(0.,own_t[0]-max(cfg.n_history*cfg.history_step+4,prefix_length)),own_t[0],.25)
     path = np.concatenate((interp_at(own_points,own_arc,prefix_t),transition))
     distance = arclength(path)
     back = distance[-1]-np.arange(1,cfg.n_history+1)*cfg.history_step
@@ -87,4 +90,27 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 128.), prefer_l
                 bank_transition_length=bridge_length,bank_tail_length=tail_length,
                 bank_prefix_end_t=float(own_t[0]), seed_pos=path[0].copy(),
                 seed_tangent=normalize(path[1]-path[0]),seed_age=float(distance[-1]),seed_valid=True)
+    if track_stride:
+        item['memory_track'] = continuation_track(path,distance,len(prefix_t),samples,start,finish,track_stride)
     return item
+
+
+def continuation_track(path, distance, prefix_count, samples, start, finish, stride):
+    """Observed heads every ``stride`` voxels behind the head, oldest first.
+
+    Identity is known only on the original prefix and after the bridge has
+    fully reached the neighbor; the partial bridge is unlabeled. Before it the
+    path lies on the original fiber, so the offset target is zero.
+    """
+    arcs = distance[-1]-stride*np.arange(1,int(distance[-1]//stride)+1)
+    arcs = arcs[arcs >= 0][::-1]
+    points = interp_at(path,distance,arcs)
+    behind = interp_at(path,distance,np.clip(arcs-1.,0,None))
+    ahead = interp_at(path,distance,np.minimum(arcs+1.,distance[-1]))
+    frames = np.stack([frame_from_heading(normalize(a-b)) for a,b in zip(ahead,behind)])
+    # Path arclength where the bridge leaves the original and reaches the neighbor.
+    leave = distance[prefix_count]
+    reach = distance[prefix_count+int(np.searchsorted(samples,finish))]
+    offtrack = np.where(arcs <= leave+1e-6,0.,np.where(arcs >= reach-1e-6,1.,np.nan)).astype(np.float32)
+    offset = np.where((offtrack == 0)[:,None],np.zeros((len(arcs),3)),np.nan).astype(np.float32)
+    return dict(pos=points.astype(np.float32),frame=frames.astype(np.float32),offtrack=offtrack,offset=offset)

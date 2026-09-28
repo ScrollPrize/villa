@@ -30,6 +30,8 @@ class DecisionCollector:
         self.before, self.after, self.stride, self.max_states = before, after, stride, max_states
         self.additional_crops = tuple(additional_crops)
         self.rows, self.distances = [], []
+        # Every recorded decision's observed head, in order (before thinning).
+        self.track = []
         self.departed = None
         self.last_travelled = 0.
         self.boundary_crossed = False
@@ -95,6 +97,10 @@ class DecisionCollector:
         # on recoverable drift without relabeling every state at load time.
         drift = float('nan') if offtrack else float(np.linalg.norm(item['gt_history'][0]))
         row.update(source_cache=-1, source_row=len(self.rows), fiber_idx=self.fi, t=self.t, reverse=sign < 0, offtrack=offtrack, hard=hard, drift=drift)
+        # Offset from the head to its matched original-fiber point (world).
+        offset = (np.asarray(state['frame']) @ item['gt_history'][0] if not offtrack and item['gt_history_mask'][0] > 0
+                  else np.full(3, np.nan))
+        self.track.append(dict(pos=state['pos'], frame=state['frame'], offtrack=float(offtrack), offset=offset))
         self.rows.append(row)
         self.distances.append(travelled)
         self.last_travelled = travelled
@@ -114,6 +120,20 @@ class DecisionCollector:
             select = lambda rows, n: [rows[i] for i in np.linspace(0, len(rows)-1, n).astype(int)] if n else []
             kept = select(hard, nh)+select(ordinary, min(len(ordinary), self.max_states-nh))
         return kept
+
+
+def append_traces(collectors, rows, track):
+    """Kept rows reference their own trace's earlier heads in the shared track."""
+    for collector in collectors:
+        for row in collector.finish():
+            row.update(seq_start=len(track), seq_end=len(track)+row['source_row'])
+            rows.append(row)
+        track.extend(collector.track)
+
+
+def track_arrays(track):
+    return {'track_'+key: np.asarray([step[key] for step in track], np.float32).reshape(len(track), *shape)
+            for key, shape in (('pos', (3,)), ('frame', (3, 3)), ('offtrack', ()), ('offset', (3,)))}
 
 
 def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
@@ -167,7 +187,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
                          TraceParams(max_len=args.trace_len, confidence=args.confidence, explore_calls=args.explore_calls,
                                      n_commit=args.n_commit, seed=args.seed),
                          device=args.device)
-    rows = []
+    rows, track = [], []
     try:
         for offset in range(0, len(seeds), args.batch):
             chunk = seeds[offset:offset+args.batch]
@@ -176,8 +196,7 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
                                            additional_crops=getattr(tracer, 'additional_crops', ())) for s in chunk]
             tracer.trace(np.stack([s['pos'] for s in chunk]), np.stack([s['heading'] for s in chunk]),
                          on_decision=lambda i, state: collectors[i](state))
-            for collector in collectors:
-                rows.extend(collector.finish())
+            append_traces(collectors, rows, track)
             print(json.dumps(dict(traces=offset+len(chunk), total=len(seeds), states=len(rows))), flush=True)
     finally:
         tracer.close()
@@ -189,7 +208,8 @@ def main(argv=None, *, checkpoint_loader, tracer_class=ModelTracer):
                                         sampler_mode=getattr(model.cfg, 'sampler_mode', 'zero'),
                                         volume=spec.to_dict(), collection=vars(args)),
                         **{key: np.asarray([row[key] for row in rows])
-                           for key in OnPolicyStates.FIELDS + tuple(OnPolicyStates.OPTIONAL)})
+                           for key in OnPolicyStates.FIELDS + tuple(OnPolicyStates.OPTIONAL) + tuple(OnPolicyStates.ROW_TRACK)},
+                        **track_arrays(track))
     path = Path(args.out)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(path.stem+'.partial.npz')

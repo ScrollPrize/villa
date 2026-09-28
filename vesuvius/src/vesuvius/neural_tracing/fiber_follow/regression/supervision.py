@@ -153,3 +153,28 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_tem
         terms['candidate_per_state'] = per_candidate.sum(-1)/valid.sum(-1).clamp_min(1)
         terms['candidate_states'] = valid.any(-1).sum()
     return terms
+
+
+def memory_probe_terms(output, batch):
+    """Per-write departure and original-fiber offset probe on the recurrent memory.
+
+    Targets are annotation-derived and never enter the writer. Each state
+    averages over its labeled writes, so a long track weighs as much as a head.
+    """
+    probe = output['memory_probe'].float()
+    identity_mask = batch['memory_target_identity_mask'].bool()
+    target = batch['memory_target_identity'].float()
+    bce = F.binary_cross_entropy_with_logits(probe[..., 0], target, reduction='none')
+    identity = torch.where(identity_mask, bce, 0.).sum(-1)/identity_mask.sum(-1).clamp_min(1)
+    offset_mask = batch['memory_target_offset_mask'].bool()
+    offset_target = batch['memory_target_offset'].float()
+    error = F.smooth_l1_loss(probe[..., 1:], offset_target, beta=1., reduction='none').sum(-1)
+    offset = torch.where(offset_mask, error, 0.).sum(-1)/offset_mask.sum(-1).clamp_min(1)
+    correct = ((probe[..., 0] > 0) == (target > .5)) & identity_mask
+    departed = identity_mask & (target < .5)
+    distance = (probe[..., 1:]-offset_target).norm(dim=-1)
+    return dict(memory_identity_per_state=identity, memory_offset_per_state=offset,
+                memory_identity_count=identity_mask.sum(), memory_identity_correct=correct.sum(),
+                memory_departed_count=departed.sum(), memory_departed_correct=(correct & departed).sum(),
+                memory_offset_count=offset_mask.sum(),
+                memory_offset_error_sum=torch.where(offset_mask, distance, 0.).sum())

@@ -29,7 +29,8 @@ class OnlineCollector:
     def __init__(self, directory, fibers, val_z, device, every=1000, max_seeds=64,
                  batch=1, explore_calls=8, seed=0, replay_keep=4, initial=(),
                  trace_len=6000., confidence=DEFAULT_CONFIDENCE, n_commit=DEFAULT_N_COMMIT,
-                 collector_module='vesuvius.neural_tracing.fiber_follow.flow_matching.collect', seeds_per_fiber=2):
+                 collector_module='vesuvius.neural_tracing.fiber_follow.flow_matching.collect', seeds_per_fiber=2,
+                 extra_args=()):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.index = self.directory/'replay.json'
@@ -39,6 +40,7 @@ class OnlineCollector:
         self.trace_len, self.confidence, self.n_commit = trace_len, confidence, n_commit
         self.seeds_per_fiber = seeds_per_fiber
         self.collector_module = collector_module
+        self.extra_args = [str(v) for v in extra_args]
         self.paths = list(initial)
         self.process = self.log = None
         self.output = None
@@ -74,7 +76,7 @@ class OnlineCollector:
                    '--seeds-per-fiber', str(self.seeds_per_fiber),
                    '--explore-calls', str(self.explore_calls), '--trace-len', str(self.trace_len),
                    '--confidence', str(self.confidence), '--n-commit', str(self.n_commit),
-                   '--seed', str(self.seed+step), '--out', str(self.output)]
+                   '--seed', str(self.seed+step), '--out', str(self.output), *self.extra_args]
         self.log = self.output.with_suffix('.log').open('w')
         self.process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT)
         return True

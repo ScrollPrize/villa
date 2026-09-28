@@ -445,6 +445,9 @@ class FollowDataset(torch.utils.data.IterableDataset):
         item.update(source=source,stratum=band,source_step=op.provenance.get('step',-1) or -1,
                     fiber_ref=(fi,self.fibers[fi].length-t if reverse else t,reverse))
         item.update({k: getattr(op, k)[j] for k in SEED_FIELDS if hasattr(op, k)})
+        track = op.track(j) if hasattr(op, 'track') else None
+        if track is not None:
+            item['memory_track'] = track
         item = self.prepare(item,rng)
         return item if self.state_allowed(item) else None
 
@@ -699,14 +702,32 @@ class OnPolicyStates:
     OPTIONAL = {"drift": lambda n: np.full(n, np.nan, np.float32),
                 "source_cache": lambda n: np.full(n, -1, np.int32),
                 "source_row": lambda n: np.full(n, -1, np.int64), **SEED_DEFAULTS}
+    # Optional observed tracks: every earlier head of a state's trace, one per
+    # decision. Row i's heads are track_*[seq_start[i]:seq_end[i]]; -1 means
+    # none. Offsets/departure are relabeled annotation targets, never inputs.
+    ROW_TRACK = {"seq_start": lambda n: np.full(n, -1, np.int64),
+                 "seq_end": lambda n: np.full(n, -1, np.int64)}
+    TRACK = {"track_pos": lambda n: np.zeros((n, 3), np.float32),
+             "track_frame": lambda n: np.zeros((n, 3, 3), np.float32),
+             "track_offtrack": lambda n: np.zeros(n, np.float32),
+             "track_offset": lambda n: np.zeros((n, 3), np.float32)}
 
     def __init__(self, *, manifest, provenance=None, **arrays):
         for key in self.FIELDS:
             setattr(self, key, np.asarray(arrays[key]))
         for key, default in self.OPTIONAL.items():
             setattr(self, key, np.asarray(arrays[key]) if key in arrays else default(len(self.pos)))
-        if any(len(getattr(self, k)) != len(self.pos) for k in self.FIELDS + tuple(self.OPTIONAL)):
+        for key, default in self.ROW_TRACK.items():
+            setattr(self, key, np.asarray(arrays[key]) if key in arrays else default(len(self.pos)))
+        for key, default in self.TRACK.items():
+            setattr(self, key, np.asarray(arrays[key]) if key in arrays else default(0))
+        if any(len(getattr(self, k)) != len(self.pos) for k in self.FIELDS + tuple(self.OPTIONAL) + tuple(self.ROW_TRACK)):
             raise ValueError('Replay arrays have different lengths')
+        if any(len(getattr(self, k)) != len(self.track_pos) for k in self.TRACK):
+            raise ValueError('Replay track arrays have different lengths')
+        present = self.seq_end >= 0
+        if np.any(present & ((self.seq_start < 0) | (self.seq_start > self.seq_end) | (self.seq_end > len(self.track_pos)))):
+            raise ValueError('Replay rows reference tracks outside the saved tracks')
         self._dir = None
         self.manifest = manifest
         self.provenance = provenance or {}
@@ -714,9 +735,17 @@ class OnPolicyStates:
     def __len__(self):
         return len(self.pos)
 
+    def track(self, j):
+        """Earlier observed heads of row ``j``'s trace (oldest first), or None."""
+        if self.seq_end[j] < 0:
+            return None
+        sl = slice(int(self.seq_start[j]), int(self.seq_end[j]))
+        return dict(pos=self.track_pos[sl], frame=self.track_frame[sl],
+                    offtrack=self.track_offtrack[sl], offset=self.track_offset[sl])
+
     def save(self, path):
         np.savez(path, __metadata__=json.dumps(dict(version=STATE_VERSION, fibers=self.manifest, provenance=self.provenance)),
-                 **{k: getattr(self, k) for k in self.FIELDS + tuple(self.OPTIONAL)})
+                 **{k: getattr(self, k) for k in self.FIELDS + tuple(self.OPTIONAL) + tuple(self.ROW_TRACK) + tuple(self.TRACK)})
 
     def validate_fibers(self, fibers):
         if self.manifest != fiber_manifest(fibers):
@@ -750,10 +779,12 @@ class OnPolicyStates:
                 if os.path.exists(metadata_path):
                     with open(metadata_path) as fh:
                         existing = json.load(fh)
+                # Track arrays are mirrored only when the archive has them.
+                tracks = tuple(k for k in (*cls.ROW_TRACK, *cls.TRACK) if k in z.files)
                 if existing != metadata or any(not os.path.exists(os.path.join(d, k + ".npy"))
-                                               for k in cls.FIELDS + tuple(cls.OPTIONAL)):
+                                               for k in cls.FIELDS + tuple(cls.OPTIONAL) + tracks):
                     os.makedirs(d, exist_ok=True)
-                    for k in cls.FIELDS + tuple(cls.OPTIONAL):
+                    for k in cls.FIELDS + tuple(cls.OPTIONAL) + tracks:
                         v = z[k] if k in z.files else cls.OPTIONAL[k](len(z["pos"]))
                         if k not in cls.FLOAT64_FIELDS and v.dtype == np.float64:
                             v = v.astype(np.float32)
@@ -778,6 +809,12 @@ class OnPolicyStates:
         for k, default in self.OPTIONAL.items():
             file = os.path.join(d, k + ".npy")
             setattr(self, k, np.load(file, mmap_mode="r") if os.path.exists(file) else default(len(self.pos)))
+        for k, default in self.ROW_TRACK.items():
+            file = os.path.join(d, k + ".npy")
+            setattr(self, k, np.load(file, mmap_mode="r") if os.path.exists(file) else default(len(self.pos)))
+        for k, default in self.TRACK.items():
+            file = os.path.join(d, k + ".npy")
+            setattr(self, k, np.load(file, mmap_mode="r") if os.path.exists(file) else default(0))
 
     def __getstate__(self):
         if self._dir is None:

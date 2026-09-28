@@ -2,7 +2,8 @@
 
 This model follows a marked fiber through a single heading-aligned CT crop. The
 default architecture is `axial_fiber_v3`. Set `--memory-slots 16` to use
-`axial_fiber_memory_v1`, described below. Existing v3 checkpoints remain supported.
+`axial_fiber_memory_v2`, described below. Existing v3 and `axial_fiber_memory_v1`
+checkpoints remain loadable; v1 checkpoints cannot initialize new runs.
 
 ## Architecture
 
@@ -110,6 +111,43 @@ resets it. Writes use observed heads, never predicted future points. The tracer
 automatically enables memory when loading a memory checkpoint; there is no
 inference switch to accidentally leave it disabled.
 
+### Long observed sequences (memory v2)
+
+The v2 memory trains its recurrence on the model's own trajectories, where it
+can drift or move onto a neighbor while its history looks plausible:
+
+- **Observed tracks.** Online collection records every decision's observed head,
+  in order, with its relabeled original-fiber status. Each replay row stores the
+  slice of earlier heads in its own trace (`seq_start`/`seq_end` over `track_*`
+  arrays in the replay archive). Training replays exactly the writes the tracer
+  made, at its real per-decision cadence, starting from the original seed.
+  Caches without tracks load unchanged and fall back to the reconstruction above.
+  `--dagger-after` (default 24) sets how far collected traces continue past a
+  confirmed departure; longer values record long wrong continuations.
+- **Burn-in.** `--memory-steps` bounds the sequence (reconstructed histories still
+  supply at most `n_history/memory_stride` observations). Only the newest
+  `--memory-grad-steps` writes and the head backpropagate; older writes build
+  the state without gradients. Equal values reproduce the v1 behavior.
+- **Per-write probe.** After each write, a small head reads the slots and seed
+  anchor and predicts whether the trace is still on its original fiber and the
+  offset back to it (within the recovery distance), in that observation's frame.
+  Tracks label every write; other states label only the head. The partial
+  bridge of a switch, burn-in writes and states whose memory cannot distinguish
+  the original fiber are unlabeled. Targets are auxiliary losses only
+  (`--memory-probe-weight`, default 0.5) and never enter the writer.
+- **Switch sequences.** `--memory-switch-probability` replaces that fraction of
+  fresh draws with an original-fiber prefix as long as the memory sequence,
+  a smooth bridge, and a `--memory-switch-tail` neighbor tail from the live bank.
+  The head is a confirmed departure; the original seed lies behind the prefix.
+- **Identity read at initialization.** The decoder's memory read starts at zero,
+  so initializing from a crop-only checkpoint leaves its predictions unchanged
+  until training moves it. The probe trains the writer from the first update.
+
+Logs add a `memory probe` line: identity loss and accuracy, departed-write
+recall, offset loss and error, labeled writes per state, and the fraction of
+states with a departed label. Tracked replay appears after the first
+online collection completes (`dagger_states`).
+
 All historical and seed patch read footprints are checked against the holdout
 before training I/O. Confirmed departures can receive decision supervision when
 an original-fiber observation is available in memory even if it is outside the
@@ -119,9 +157,10 @@ dropout and photometric augmentation also apply to memory patches.
 Start a **new** memory experiment using the existing launch configuration:
 
 ```bash
-RUN_NAME=axial_memory_run1 bash scripts/launch_axial.sh \
-  --memory-slots 16 --memory-steps 32 --memory-stride 4 \
-  --memory-patch-size 17 --no-compile
+RUN_NAME=axial_memory_seq_run1 bash scripts/launch_axial.sh \
+  --memory-slots 16 --memory-steps 64 --memory-grad-steps 32 --memory-stride 4 \
+  --memory-patch-size 17 --memory-probe-weight 0.5 \
+  --memory-switch-probability 0.15 --memory-switch-tail 16 96 --dagger-after 96
 ```
 
 To initialize its existing backbone/decoder/scorer from a trained crop-only
@@ -132,8 +171,8 @@ model, append:
 ```
 
 This copies the source EMA weights, initializes the new memory parameters, and
-starts a new optimizer/schedule in the new output directory. The memory branch
-can change predictions immediately; initialization is not a quality guarantee.
+starts a new optimizer/schedule in the new output directory. The v2 memory read
+starts at zero, so initial predictions match the source; this is not a quality guarantee.
 Use the existing resume workflow with the same memory options to continue a
 memory run. A memory checkpoint cannot be silently converted to crop-only.
 The original run is not migrated or modified by these commands.
@@ -143,8 +182,11 @@ Input validation, with no training job started:
 ```bash
 PYTHONPATH=../../.. ../../../../.venv/bin/python \
   -m vesuvius.neural_tracing.fiber_follow.regression.identity_preflight \
-  --out output/memory_preflight --memory-slots 16 --microbatch 2 --batches 1
+  --out output/memory_preflight --memory-slots 16 --memory-steps 64 --memory-grad-steps 32 \
+  --memory-switch-probability 0.15 --microbatch 4 --batches 8
 ```
+
+`--onpolicy <decisions.npz>` adds replay caches, for example ones with tracks.
 
 Add `--forward --device cuda` when a GPU is available to check full-crop
 forward/backward. The memory path has CPU gradient, streaming/unroll parity,

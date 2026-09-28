@@ -79,6 +79,9 @@ class IdentitySampling:
     bank_coverage_probability: float = 0.  # reserved fresh slots on covered parent spans
     prefer_long_continuations: bool = False
     decision_fraction: float = 0.  # fraction of all states reserved for matched pairs
+    # Fresh draws replaced by long original-then-neighbor memory sequences.
+    memory_switch_probability: float = 0.
+    memory_switch_tail: tuple = (16., 96.)
 
     def __post_init__(self):
         if isinstance(self.rule, dict):
@@ -99,16 +102,20 @@ class IdentitySampling:
             raise ValueError('Decision fraction must be in [0,1]')
         if not 0 <= self.bank_coverage_probability <= 1-self.bank_following_probability:
             raise ValueError('Following and covered fresh probabilities must sum to at most one')
+        if not 0 <= self.memory_switch_probability <= 1-self.bank_following_probability-self.bank_coverage_probability:
+            raise ValueError('Following, covered and memory-switch fresh probabilities must sum to at most one')
         if self.negative_near_fraction is not None and not 0 <= self.negative_near_fraction <= 1:
             raise ValueError('Near-negative fraction must be in [0,1]')
         if not np.isfinite(self.negative_near_distance) or self.negative_near_distance <= self.rule.own_radius:
             raise ValueError('Near-negative distance must exceed own-fiber radius')
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import validate_tail_range
         object.__setattr__(self, 'bank_wrong_continuation_tail', validate_tail_range(self.bank_wrong_continuation_tail))
+        object.__setattr__(self, 'memory_switch_tail', validate_tail_range(self.memory_switch_tail))
 
 
 # Oversampled fresh locations, recorded per state.
-LOCATION_SOURCES = ('uniform', 'contact', 'hard_span', 'lateral', 'bank_following', 'bank_covered', 'decision_pair')
+LOCATION_SOURCES = ('uniform', 'contact', 'hard_span', 'lateral', 'bank_following', 'bank_covered', 'decision_pair',
+                    'memory_switch')
 
 
 def contact_index_sha256(fibers, band, spacing=4., radius=6.):
@@ -217,13 +224,16 @@ class IdentityObservationBuilder(ObservationBuilder):
     def replace_fresh(self, sample_cfg, rng):
         """Reserve fresh slots for following and covered annotation locations."""
         s = self.sampling
-        if self.negative_bank is None or s.bank_following_probability+s.bank_coverage_probability == 0:
+        reserved = s.bank_following_probability+s.bank_coverage_probability
+        if self.negative_bank is None or reserved+s.memory_switch_probability == 0:
             return None
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_following import following_sample
         u = rng.random()
         if u < s.bank_following_probability:
             return following_sample(self.following_bank or self.negative_bank,sample_cfg,rng)
-        if u >= s.bank_following_probability+s.bank_coverage_probability:
+        if u >= reserved:
+            if u < reserved+s.memory_switch_probability:
+                return self.memory_switch(sample_cfg,rng)
             return None
         from vesuvius.neural_tracing.fiber_follow.shared.data import make_sample
         banks = [self.negative_bank]+([self.near_negative_bank]
@@ -246,6 +256,21 @@ class IdentityObservationBuilder(ObservationBuilder):
             self.prepare(item,bank.fibers[fi],rng)
             if item['reference_on_fiber'][:-1].sum() >= 2:
                 item['_identity_prepared'] = True
+                return item
+        return None
+
+    def memory_switch(self, sample_cfg, rng):
+        """Original fiber, bridge, then a long neighbor tail, observed along the way."""
+        from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import wrong_continuation
+        if not self.cfg.memory_slots:
+            raise ValueError('Memory-switch sequences require a memory model')
+        for _ in range(3):
+            item = wrong_continuation(self.continuation_bank or self.negative_bank,sample_cfg,rng,
+                                      tail_length_range=self.sampling.memory_switch_tail,prefer_long=True,
+                                      prefix_length=self.cfg.memory_steps*self.cfg.memory_stride,
+                                      track_stride=self.cfg.memory_stride)
+            if item is not None:
+                item['location_source'] = LOCATION_SOURCES.index('memory_switch')
                 return item
         return None
 
@@ -411,6 +436,9 @@ class IdentityObservationBuilder(ObservationBuilder):
         batch.update(self.identity_targets(items,batch['x']))
         batch['identity_observable'] = torch.tensor([i.get('identity_observable',True) for i in items])
         batch['bank_tail_length'] = torch.tensor([i.get('bank_tail_length',0.) for i in items],dtype=torch.float32)
+        if self.cfg.memory_slots and self.cfg.memory_version >= 2:
+            from .memory_data import memory_targets
+            batch.update(memory_targets(items, self.cfg))
         if self.sampling.decision_fraction:
             shape = (2,self.cfg.n_future)
             for key,trailing in (('candidate_points',(3,)),('candidate_mask',()),('candidate_labels',())):

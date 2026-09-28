@@ -20,14 +20,14 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
 )
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
-    ARCHITECTURE, MEMORY_ARCHITECTURE, DirectConfig, DirectFollower,
+    ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, DirectConfig, DirectFollower,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES,
     load_contacts, load_hard_spans,
 )
 from vesuvius.neural_tracing.fiber_follow.shared.components import PAIR_SAMPLING_VERSION, ComponentRule
-from vesuvius.neural_tracing.fiber_follow.regression.supervision import commit_window, loss_terms
+from vesuvius.neural_tracing.fiber_follow.regression.supervision import commit_window, loss_terms, memory_probe_terms
 from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import (
     decision_rows, summarize_decisions, identity_ranking, summarize_ranking,
     identity_training_groups, summarize_identity_groups,
@@ -71,12 +71,17 @@ def match_optimizer_layout(opt):
                 state[key] = torch.empty_like(param).copy_(value)
 
 
-ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE)
+ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1)
+MEMORY_OPTIONS = ('memory_slots','memory_steps','memory_stride','memory_patch_size','memory_grad_steps')
 
 
 def checkpoint_config(ck):
-    cfg = DirectConfig(**ck['model_cfg'])
-    expected = MEMORY_ARCHITECTURE if cfg.memory_slots else ARCHITECTURE
+    model_cfg = dict(ck['model_cfg'])
+    if ck['architecture'] == MEMORY_ARCHITECTURE_V1:
+        model_cfg.setdefault('memory_version', 1)  # saved before versions were recorded
+    cfg = DirectConfig(**model_cfg)
+    expected = ((MEMORY_ARCHITECTURE if cfg.memory_version == 2 else MEMORY_ARCHITECTURE_V1)
+                if cfg.memory_slots else ARCHITECTURE)
     if ck['architecture'] != expected:
         raise ValueError('Checkpoint architecture and memory configuration disagree')
     return cfg
@@ -156,7 +161,7 @@ IDENTITY_SUMS = ('identity_count', 'identity_states', 'identity_rank_correct', '
 
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
                      confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True,
-                     identity_weight=.5, identity_temperature=.1, candidate_weight=1.):
+                     identity_weight=.5, identity_temperature=.1, candidate_weight=1., memory_probe_weight=.5):
     """Equal weight per observed state, independent of microbatch boundaries.
 
     Within a state each loss averages over its known points; fully unknown
@@ -178,6 +183,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     requested_decisions = 0.
     pair_version = PAIR_SAMPLING_VERSION
     decisions, rankings = [], []
+    memory = {}
     model.train()
     for cpu in batches:
         if 'pair_sampling_version' in cpu:
@@ -185,6 +191,12 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         batch = move_batch(cpu, device)
         if model.cfg.memory_slots:
             sums['memory_observations_mean'] = sums.get('memory_observations_mean', 0.)+float(cpu['x']['memory_mask'].sum())/total
+            if 'memory_target_identity_mask' in cpu:
+                labeled = cpu['memory_target_identity_mask']
+                memory['labeled_writes'] = memory.get('labeled_writes', 0.)+float(labeled.sum())
+                memory['labeled_states'] = memory.get('labeled_states', 0.)+float(labeled.any(-1).sum())
+                memory['departed_states'] = memory.get('departed_states', 0.)+float(
+                    (labeled & (cpu['memory_target_identity'] < .5)).any(-1).sum())
             sums['memory_anchor_fraction'] = sums.get('memory_anchor_fraction', 0.)+float(cpu['x']['memory_seed_valid'].sum())/total
         queries = dict(queries=batch['identity_points']) if 'identity_points' in batch else {}
         if 'candidate_points' in batch:
@@ -204,6 +216,14 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 candidate_loss = terms['candidate_per_state'].sum()/total
                 loss = loss+candidate_weight*candidate_loss
                 identity['candidate_loss'] = identity.get('candidate_loss', 0.)+candidate_loss.detach().item()
+            if 'memory_probe' in output and 'memory_target_identity' in batch:
+                probe = memory_probe_terms(output, batch)
+                identity_probe = probe['memory_identity_per_state'].sum()/total
+                offset_probe = probe['memory_offset_per_state'].sum()/total
+                loss = loss+memory_probe_weight*(identity_probe+offset_probe)
+                for key, value in (('probe_identity_loss', identity_probe), ('probe_offset_loss', offset_probe),
+                                   *((k.removeprefix('memory_'), v) for k, v in probe.items() if not k.endswith('_per_state'))):
+                    memory[key] = memory.get(key, 0.)+value.detach().item()
         if not torch.isfinite(loss):
             raise FloatingPointError(f'Nonfinite loss at step {step}')
         loss.backward()
@@ -257,6 +277,14 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     sums.update(bank_wrong_continuation_tail_mean=float(np.mean(bank_tails)) if bank_tails else None,
                 bank_wrong_continuation_tail_min=min(bank_tails) if bank_tails else None,
                 bank_wrong_continuation_tail_max=max(bank_tails) if bank_tails else None)
+    if memory:
+        memory.update(probe_identity_accuracy=memory.get('identity_correct', 0.)/max(1., memory.get('identity_count', 0.)),
+                      probe_departed_recall=memory.get('departed_correct', 0.)/max(1., memory.get('departed_count', 0.)),
+                      probe_offset_error_mean=memory.get('offset_error_sum', 0.)/max(1., memory.get('offset_count', 0.)),
+                      labeled_writes_per_state=memory.get('labeled_writes', 0.)/total,
+                      labeled_state_fraction=memory.get('labeled_states', 0.)/total,
+                      departed_state_fraction=memory.get('departed_states', 0.)/total)
+        sums['memory'] = memory
     if identity:
         # Versioned separately from the distance metrics above.
         identity.update(identity_version=1, pair_sampling_version=pair_version,
@@ -315,6 +343,14 @@ def build_parser():
                     help='Spacing of reconstructed historical observations in trace voxels')
     ap.add_argument('--memory-patch-size', type=int, default=17,
                     help='Odd CT/presence patch size for the memory writer')
+    ap.add_argument('--memory-grad-steps', type=int, default=32,
+                    help='Newest observations that backpropagate; older ones are a no-grad burn-in')
+    ap.add_argument('--memory-probe-weight', type=float, default=.5,
+                    help='Per-write departure/offset probe coefficient (memory models)')
+    ap.add_argument('--memory-switch-probability', type=float, default=0.,
+                    help='Fresh draws replaced by original-then-neighbor memory sequences')
+    ap.add_argument('--memory-switch-tail', type=float, nargs=2, default=(16.,96.), metavar=('MIN', 'MAX'),
+                    help='Neighbor tail length of memory-switch sequences in trace voxels')
     ap.add_argument('--activation-checkpointing', action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument('--correction', action=argparse.BooleanOptionalAction, default=True,
                     help='Refine the curve using refreshed local and deep image evidence')
@@ -372,6 +408,8 @@ def build_parser():
     ap.add_argument('--dagger-seeds', type=int, default=64)
     ap.add_argument('--dagger-device')
     ap.add_argument('--dagger-trace-len', type=float, default=6000.)
+    ap.add_argument('--dagger-after', type=float, default=24.,
+                    help='Replay states recorded after a confirmed departure, in trace voxels')
     ap.add_argument('--replay-keep', type=int, default=4)
     ap.add_argument('--resume', help='Resume last.pt inside this run with the same training options')
     ap.add_argument('--init-tracer', help='Initialize a new run from saved EMA follower weights')
@@ -411,25 +449,26 @@ def main(argv=None):
                        activation_checkpointing=args.activation_checkpointing,correction=args.correction,
                        correction_limit=args.correction_limit,correction_steps=args.correction_steps,
                        memory_slots=args.memory_slots,memory_steps=args.memory_steps,
-                       memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size)
+                       memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size,
+                       memory_grad_steps=args.memory_grad_steps)
     initialized = None
     resume = None
     if args.init_tracer:
         initialized,_,_,_,_ = load_checkpoint(args.init_tracer,args.device)
         if args.memory_slots and not initialized.cfg.memory_slots:
-            cfg = replace(initialized.cfg, memory_slots=args.memory_slots, memory_steps=args.memory_steps,
-                          memory_stride=args.memory_stride, memory_patch_size=args.memory_patch_size)
+            cfg = replace(initialized.cfg, **{k: getattr(args, k) for k in MEMORY_OPTIONS})
             upgraded = DirectFollower(cfg).to(args.device, memory_format=conv_memory_format(args.device))
             incompatible = upgraded.load_state_dict(initialized.state_dict(), strict=False)
             if incompatible.unexpected_keys or any(not k.startswith('recurrent_memory.') for k in incompatible.missing_keys):
                 raise ValueError('Unexpected parameter mismatch initializing memory model')
             initialized = upgraded
         else:
-            if args.memory_slots and any(getattr(args,k) != getattr(initialized.cfg,k)
-                                        for k in ('memory_slots','memory_steps','memory_stride','memory_patch_size')):
+            if args.memory_slots and any(getattr(args,k) != getattr(initialized.cfg,k) for k in MEMORY_OPTIONS):
                 raise ValueError('--init-tracer memory configuration differs from existing memory checkpoint')
+            if initialized.cfg.memory_slots and initialized.cfg.memory_version != 2:
+                raise ValueError('Legacy v1 memory checkpoints cannot initialize new runs')
             cfg = initialized.cfg
-        for key in ('memory_slots','memory_steps','memory_stride','memory_patch_size'):
+        for key in MEMORY_OPTIONS:
             setattr(args, key, getattr(cfg, key))
     if args.resume:
         resume = read_checkpoint(args.resume,ARCHITECTURES,args.device)
@@ -438,6 +477,10 @@ def main(argv=None):
         raise ValueError('Matched decisions require an even microbatch')
     if not np.isfinite(args.candidate_weight) or args.candidate_weight <= 0:
         raise ValueError('Candidate weight must be finite and positive')
+    if not np.isfinite(args.memory_probe_weight) or args.memory_probe_weight < 0 or args.dagger_after <= 0:
+        raise ValueError('Memory probe weight must be nonnegative; --dagger-after positive')
+    if args.memory_switch_probability and not cfg.memory_slots:
+        raise ValueError('Memory-switch sequences require --memory-slots')
     identity_sampling = IdentitySampling(
         rule=ComponentRule(threshold=args.negative_threshold,lateral_max=args.negative_lateral_max),
         presence_dropout=args.presence_dropout,contact_fraction=args.contact_fraction,
@@ -447,7 +490,8 @@ def main(argv=None):
         bank_following_probability=args.bank_following_probability,
         decision_fraction=args.decision_fraction,negative_near_fraction=args.negative_near_fraction,
         negative_near_distance=args.negative_near_distance,bank_coverage_probability=args.bank_coverage_probability,
-        prefer_long_continuations=args.prefer_long_continuations)
+        prefer_long_continuations=args.prefer_long_continuations,
+        memory_switch_probability=args.memory_switch_probability,memory_switch_tail=args.memory_switch_tail)
     if not args.negative_bank:
         raise ValueError('Training requires --negative-bank')
     if min(args.identity_weight,args.identity_temperature) <= 0:
@@ -500,9 +544,11 @@ def main(argv=None):
         ignored = {'resume','out_root','device','batch','microbatch','workers','threads','worker_cache_gb',
                    'log_every','ckpt_every','diag_every','dagger_device','compile','init_tracer',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing'}
+        defaults = build_parser()
         for key,value in vars(args).items():
-            recorded = resume['training_options'].get(key, getattr(DirectConfig, key, None)
-                                                       if key.startswith('memory_') else None)
+            # Options added after a run started had their default behavior.
+            recorded = resume['training_options'].get(key, getattr(DirectConfig, key, defaults.get_default(key))
+                                                       if key.startswith('memory_') else defaults.get_default(key))
             if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
                 raise ValueError(f'Resume option differs: {key}')
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
@@ -540,7 +586,8 @@ def main(argv=None):
     collector = OnlineCollector(out/'dagger', args.fibers, args.val_z, args.dagger_device or args.device,
         every=args.dagger_every, max_seeds=args.dagger_seeds, seed=args.seed, replay_keep=args.replay_keep,
         initial=[c._dir for c in caches], trace_len=args.dagger_trace_len, n_commit=args.n_commit,
-        collector_module='vesuvius.neural_tracing.fiber_follow.regression.collect')
+        collector_module='vesuvius.neural_tracing.fiber_follow.regression.collect',
+        extra_args=('--after', args.dagger_after))
     contacts = load_contacts(args.contacts,train_f,band) if args.contacts else ()
     hard_spans = load_hard_spans(args.hard_spans,train_f) if args.hard_spans else ()
     progress(f'Sampling: {len(contacts)} contacts, {len(hard_spans)} hard spans; memory slots={cfg.memory_slots}')
@@ -602,7 +649,7 @@ def main(argv=None):
                 tolerance=args.tolerance, confidence_weight=args.confidence_weight, ema_decay=args.ema_decay,
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
                 identity_weight=args.identity_weight, identity_temperature=args.identity_temperature,
-                candidate_weight=args.candidate_weight)
+                candidate_weight=args.candidate_weight, memory_probe_weight=args.memory_probe_weight)
             if early:
                 progress(f'Update {step} complete in {time.monotonic()-update_started:.1f}s; loss={metrics["loss"]:.5f}')
                 if step == done+5:

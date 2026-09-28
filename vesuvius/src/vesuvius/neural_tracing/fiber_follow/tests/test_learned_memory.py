@@ -37,6 +37,12 @@ def memory_batch(cfg, b=2):
     return data
 
 
+def open_read(model):
+    """Version-2 reads start as identities; emulate a partly trained read."""
+    torch.nn.init.xavier_uniform_(model.recurrent_memory.read_attention.out_proj.weight)
+    return model
+
+
 def take(value, sl):
     return {k: take(v, sl) for k,v in value.items()} if isinstance(value, dict) else value[sl]
 
@@ -48,7 +54,7 @@ def state_from(out):
 def test_geometry_and_confidence_train_the_writer_and_old_observations():
     torch.manual_seed(25)
     cfg = memory_config()
-    model = DirectFollower(cfg)
+    model = open_read(DirectFollower(cfg))
     data = memory_batch(cfg)
     data['x']['memory_patches'].requires_grad_()
     data['x']['memory_seed_patch'].requires_grad_()
@@ -69,7 +75,7 @@ def test_geometry_and_confidence_train_the_writer_and_old_observations():
 def test_seed_survives_later_updates_and_memory_changes_both_outputs():
     torch.manual_seed(2)
     cfg = memory_config()
-    model = DirectFollower(cfg).eval()
+    model = open_read(DirectFollower(cfg)).eval()
     data = memory_batch(cfg, 1)
     first = model(data['x'], data['hist'], data['hmask'])
     state = state_from(first)
@@ -91,12 +97,14 @@ def test_streaming_writes_equal_sequence_unroll_and_batches_are_independent():
     memory = LearnedMemory(cfg).eval()
     x = memory_batch(cfg)['x']
     sequence = memory.observe(x)
-    state = None
+    state, probes = None, []
     for t in range(x['memory_patches'].shape[1]):
         chunk = {k: v[:,t:t+1] if k in ('memory_patches','memory_mask','memory_positions','memory_frames') else v
                  for k,v in x.items()}
         state = memory.observe(chunk, state)
-    for k in sequence:
+        probes.append(state.pop('probe'))
+    torch.testing.assert_close(torch.cat(probes, 1), sequence['probe'], rtol=2e-5, atol=2e-6)
+    for k in state:
         torch.testing.assert_close(state[k], sequence[k], rtol=2e-5, atol=2e-6)
         split = torch.cat([memory.observe(take(x,slice(i,i+1)))[k] for i in range(2)])
         torch.testing.assert_close(split, sequence[k], rtol=2e-5, atol=2e-6)
@@ -234,7 +242,7 @@ def test_optimizer_accumulation_preserves_sequence_loss_and_update():
 
 def test_memory_training_forward_can_be_captured_without_graph_breaks():
     torch.manual_seed(71)
-    model = DirectFollower(memory_config())
+    model = open_read(DirectFollower(memory_config(memory_grad_steps=2)))  # includes a no-grad burn-in
     data = memory_batch(model.cfg, 1)
     compiled = torch.compile(model, backend='eager', fullgraph=True)
     out = compiled(data['x'], data['hist'], data['hmask'])
@@ -326,6 +334,7 @@ def test_direct_tracer_reads_seed_once_and_streams_one_observation_per_decision(
     assert inputs[1][0].shape == (1,1) and not inputs[1][1].any()
 
 
-@pytest.mark.parametrize('kwargs', [dict(memory_slots=-1),dict(memory_steps=33),dict(memory_stride=0),dict(memory_patch_size=4)])
+@pytest.mark.parametrize('kwargs', [dict(memory_slots=-1),dict(memory_grad_steps=0),dict(memory_stride=0),
+                                    dict(memory_patch_size=4),dict(memory_version=3)])
 def test_invalid_memory_config(kwargs):
     with pytest.raises(ValueError): memory_config(**kwargs)

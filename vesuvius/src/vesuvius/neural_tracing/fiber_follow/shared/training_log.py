@@ -59,6 +59,14 @@ def _direct_training_lines(row):
         lines[-1] += f" | identity pairs {row['decision_pair_fraction']:.0%} (requested {row.get('decision_requested_fraction', 0.):.0%})"
     if 'identity' in row:
         lines.extend(_identity_lines(row['identity']))
+    if 'memory' in row:
+        m = row['memory']
+        lines.append(f"  memory probe: identity {m.get('probe_identity_loss', 0.):.4f}"
+                     f" (acc {m.get('probe_identity_accuracy', 0.):.1%}, departed recall "
+                     +_rate(m.get('departed_correct', 0), m.get('departed_count', 0))+")"
+                     f" | offset {m.get('probe_offset_loss', 0.):.4f} ({m.get('probe_offset_error_mean', 0.):.2f} vox)"
+                     f" | labeled writes/state {m.get('labeled_writes_per_state', 0.):.1f}"
+                     f" | departed states {m.get('departed_state_fraction', 0.):.0%}")
     if 'decisions' in row:
         lines.extend(_decision_lines(row['decisions']))
     return lines
