@@ -1692,27 +1692,27 @@ bool ZarrArray::read_chunk_into(std::span<const std::size_t> chunk_indices,
     return true;
 }
 
+std::vector<std::byte>
+ZarrArray::encode_chunk_payload(std::span<const std::byte> raw) const {
+    std::vector<std::byte> data(raw.begin(), raw.end());
+
+    // Apply v2 filters (forward order).
+    if (meta_.version == ZarrVersion::v2) {
+        for (const auto& f : meta_.filters) {
+            data = f.encode(data);
+        }
+    }
+
+    if (codec_.compress && needs_compression()) {
+        data = codec_.compress(data);
+    }
+
+    return data;
+}
+
 void ZarrArray::write_chunk(std::span<const std::size_t> chunk_indices,
                             std::span<const std::byte> data) {
-    // Apply v2 filters (forward order).
-    std::vector<std::byte> buf;
-    std::span<const std::byte> write_data = data;
-    if (meta_.version == ZarrVersion::v2 && !meta_.filters.empty()) {
-        buf.assign(data.begin(), data.end());
-        for (const auto& f : meta_.filters) {
-            buf = f.encode(buf);
-        }
-        write_data = buf;
-    }
-
-    // Compress.
-    std::vector<std::byte> compressed;
-    if (codec_.compress && needs_compression()) {
-        compressed = codec_.compress(write_data);
-        write_data = compressed;
-    }
-
-    write_chunk_raw(chunk_indices, write_data);
+    write_chunk_raw(chunk_indices, encode_chunk_payload(data));
 }
 
 bool ZarrArray::chunk_exists(std::span<const std::size_t> chunk_indices) const {

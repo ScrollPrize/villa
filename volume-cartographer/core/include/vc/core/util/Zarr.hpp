@@ -78,12 +78,16 @@ void buildPyramidLevel(const std::filesystem::path& outFile, int level,
 // Called by --pre so that multi-part workers can open existing datasets.
 // compressor/compressionLevel/dimensionSeparator are forwarded to
 // createZarrDataset so the pyramid matches L0.
+// shardFullWidth packs each band row (full level width x CH) into one zarr v3
+// shard, so CH/CW stay the granularity the renderer writes while the object
+// count drops to one per band row.
 void createPyramidDatasets(const std::filesystem::path& outFile,
                            const std::vector<size_t>& shape0,
                            size_t CH, size_t CW, bool isU16,
                            const std::string& compressor = "blosc",
                            int compressionLevel = -1,
-                           const std::string& dimensionSeparator = ".");
+                           const std::string& dimensionSeparator = ".",
+                           bool shardFullWidth = false);
 
 // Write OME-Zarr .zattrs multiscales JSON. The declared scale is per-axis:
 // Z = baseVoxelSize * sliceStep, Y/X = baseVoxelSize / pixelsPerVoxel

@@ -116,7 +116,11 @@ std::unique_ptr<VcDataset> createZarrDataset(
     const std::string& compressor = "blosc",
     const std::string& dimensionSeparator = ".",
     std::int64_t fillValue = 0,
-    int compressionLevel = -1);  // <=0 uses the compressor's built-in default
+    int compressionLevel = -1,   // <=0 uses the compressor's built-in default
+    // Non-empty selects zarr v3 with sharding: `shardShape` is the shard (the
+    // v3 chunk) and `chunks` becomes the inner chunk shape, so `chunks` keeps
+    // meaning the finest granularity written and read either way.
+    const std::vector<size_t>& shardShape = {});
 
 // buildZarrCodecRegistry() is declared in utils/zarr.hpp so its CodecRegistry
 // return type doesn't pull zarr.hpp into every VcDataset.hpp includer.

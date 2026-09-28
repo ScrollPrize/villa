@@ -1228,6 +1228,8 @@ int main(int argc, char *argv[])
         ("zarr-compressor", po::value<std::string>()->default_value("blosc"), "Zarr compressor: blosc, zstd, gzip, lz4, none")
         ("zarr-compression-level", po::value<int>()->default_value(-1), "Zarr compression level (<=0 = compressor default)")
         ("zarr-separator", po::value<std::string>()->default_value("/"), "Zarr chunk dimension separator: / or .")
+        ("zarr-chunk-width", po::value<int>()->default_value(128), "Zarr chunk width in px; the chunk height is fixed at the render band height")
+        ("zarr-shard", po::bool_switch()->default_value(false), "Write zarr v3 and pack each band row (full width x band height) into a single shard")
         ("tif-output", po::value<std::string>(), "Output path for per-slice TIFFs (optional)")
         ("quick-tif", po::bool_switch()->default_value(false), "Fast TIF: PACKBITS + zero low nibble")
         ("flatten", po::bool_switch()->default_value(false), "ABF++ flattening")
@@ -1318,7 +1320,13 @@ int main(int argc, char *argv[])
     std::string zarrCompressor = parsed["zarr-compressor"].as<std::string>();
     const int zarrCompressionLevel = parsed["zarr-compression-level"].as<int>();
     const std::string zarrSeparator = parsed["zarr-separator"].as<std::string>();
+    const int zarrChunkWidth = parsed["zarr-chunk-width"].as<int>();
+    const bool zarrShard = parsed["zarr-shard"].as<bool>();
     {
+        if (zarrChunkWidth <= 0) {
+            logPrintf(stderr, "Error: --zarr-chunk-width must be positive\n");
+            return EXIT_FAILURE;
+        }
         static const std::set<std::string> kComp{"blosc", "zstd", "gzip", "lz4", "none"};
         if (kComp.find(zarrCompressor) == kComp.end()) {
             logPrintf(stderr, "Error: --zarr-compressor must be one of blosc, zstd, gzip, lz4, none\n");
@@ -1740,7 +1748,9 @@ int main(int argc, char *argv[])
         const int cvType = useU16 ? CV_16UC1 : CV_8UC1;
 
         // ---- Zarr setup (if requested) ----
-        const size_t CH = 128, CW = 128;
+        // CH is the render band height: a band is produced and written straight
+        // through, so the chunk cannot be taller without buffering whole bands.
+        const size_t CH = 128, CW = size_t(zarrChunkWidth);
         size_t baseZ = isCompositeMode ? 1 : size_t(std::max(1, num_slices));
         std::vector<size_t> chunks0;
         std::unique_ptr<vc::VcDataset> dsOut;
@@ -1755,17 +1765,27 @@ int main(int argc, char *argv[])
             outFilePath = zarrOutputArg;
             std::vector<size_t> shape0 = {baseZ, baseY, baseX};
             chunks0 = {shape0[0], std::min(CH, shape0[1]), std::min(CW, shape0[2])};
+            // One shard per band row: a shard is never split across bands, so
+            // partition boundaries (which fall on band rows) never share one.
+            std::vector<size_t> shard0;
+            if (zarrShard) shard0 = {shape0[0], std::min(CH, shape0[1]), shape0[2]};
             auto vcDtype = useU16 ? vc::VcDtype::uint16 : vc::VcDtype::uint8;
+
+            // v2 arrays carry .zarray, v3 (sharded) arrays carry zarr.json.
+            auto level0Exists = [&](const std::filesystem::path& root) {
+                return std::filesystem::exists(root / "0" / ".zarray")
+                    || std::filesystem::exists(root / "0" / "zarr.json");
+            };
 
             if (pre_flag) {
                 logPrintf(stdout, "[pre] creating zarr + all levels...\n");
                 std::filesystem::create_directories(outFilePath);
                 vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype,
-                                      zarrCompressor, zarrSeparator, 0, zarrCompressionLevel);
+                                      zarrCompressor, zarrSeparator, 0, zarrCompressionLevel, shard0);
                 logPrintf(stdout, "[pre] L0 shape: [%zu,%zu,%zu]\n", shape0[0], shape0[1], shape0[2]);
                 if (wantPyramid)
                     createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
-                                          zarrCompressor, zarrCompressionLevel, zarrSeparator);
+                                          zarrCompressor, zarrCompressionLevel, zarrSeparator, zarrShard);
 
                 cv::Size attrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
@@ -1774,17 +1794,17 @@ int main(int argc, char *argv[])
                                render_level_voxel_size, voxel_unit, tgt_scale);
                 return true;
             } else if (numParts > 1) {
-                if (!std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
+                if (!level0Exists(zarrOutputArg)) {
                     logPrintf(stderr, "Error: run --pre first in multi-part mode\n"); return false;
                 }
                 dsOut = std::make_unique<vc::VcDataset>(outFilePath / "0");
-            } else if (resumeFlag && std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
+            } else if (resumeFlag && level0Exists(zarrOutputArg)) {
                 dsOut = std::make_unique<vc::VcDataset>(outFilePath / "0");
                 logPrintf(stdout, "[resume] opening existing zarr\n");
             } else {
                 std::filesystem::create_directories(outFilePath);
                 dsOut = vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype,
-                                              zarrCompressor, zarrSeparator, 0, zarrCompressionLevel);
+                                              zarrCompressor, zarrSeparator, 0, zarrCompressionLevel, shard0);
             }
 
             tilesYSrc = (tgt_size.height + CH - 1) / CH;
@@ -1858,7 +1878,7 @@ int main(int argc, char *argv[])
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(zarrXY.width, zarrXY.height);
                 std::vector<size_t> shape0 = {baseZ, size_t(zarrXY.height), size_t(zarrXY.width)};
                 createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
-                                      zarrCompressor, zarrCompressionLevel, zarrSeparator);
+                                      zarrCompressor, zarrCompressionLevel, zarrSeparator, zarrShard);
             }
             if (inlinePyramid) {
                 for (int level = 1; level <= 5; level++) {

@@ -578,6 +578,13 @@ public:
     [[nodiscard]] std::vector<std::byte>
     decode_chunk_payload(std::span<const std::byte> payload) const;
 
+    /// Encode a raw chunk payload exactly as write_chunk would (v2 filters,
+    /// then compression). Callers that place the bytes themselves need this:
+    /// write_inner_chunk_to_shard stores the payload verbatim, so it must be
+    /// handed already-encoded data.
+    [[nodiscard]] std::vector<std::byte>
+    encode_chunk_payload(std::span<const std::byte> raw) const;
+
     [[nodiscard]] bool stores_chunks_with_codec(std::string_view codec_name) const noexcept;
 
     /// Read a chunk and decompress it directly into the caller-provided

@@ -680,12 +680,11 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
 
 bool VcDataset::chunkExists(size_t iz, size_t iy, size_t ix) const
 {
-    // Build chunk path: <basepath>/<iz><delim><iy><delim><ix>
-    auto p = impl_->fsPath /
-        (std::to_string(iz) + impl_->delimiter_ +
-         std::to_string(iy) + impl_->delimiter_ +
-         std::to_string(ix));
-    return std::filesystem::exists(p);
+    std::array<size_t, 3> indices = {iz, iy, ix};
+    // A sharded array has no per-chunk file: presence lives in the shard index.
+    if (impl_->zarrArray_->is_sharded())
+        return impl_->zarrArray_->inner_chunk_exists(indices);
+    return impl_->zarrArray_->chunk_exists(indices);
 }
 
 bool VcDataset::readChunk(size_t iz, size_t iy, size_t ix, void* output) const
@@ -719,7 +718,14 @@ bool VcDataset::writeChunk(size_t iz, size_t iy, size_t ix,
     std::array<size_t, 3> indices = {iz, iy, ix};
     auto data = std::span<const std::byte>(
         static_cast<const std::byte*>(input), nbytes);
-    impl_->zarrArray_->write_chunk(indices, data);
+    if (impl_->zarrArray_->is_sharded()) {
+        // write_inner_chunk_to_shard stores the payload verbatim (the shard
+        // index records its byte length), so the codec must run here.
+        impl_->zarrArray_->write_inner_chunk_to_shard(
+            indices, impl_->zarrArray_->encode_chunk_payload(data));
+    } else {
+        impl_->zarrArray_->write_chunk(indices, data);
+    }
     return true;
 }
 
@@ -751,10 +757,14 @@ bool VcDataset::writeChunkSkipEmpty(size_t iz, size_t iy, size_t ix,
 
 bool VcDataset::removeChunk(size_t iz, size_t iy, size_t ix)
 {
-    auto p = impl_->fsPath /
-        (std::to_string(iz) + impl_->delimiter_ +
-         std::to_string(iy) + impl_->delimiter_ +
-         std::to_string(ix));
+    std::array<size_t, 3> indices = {iz, iy, ix};
+    if (impl_->zarrArray_->is_sharded()) {
+        const bool existed = impl_->zarrArray_->inner_chunk_exists(indices);
+        impl_->zarrArray_->mark_inner_chunk_empty(indices);
+        return existed;
+    }
+
+    auto p = impl_->zarrArray_->chunk_path(indices);
 
     std::error_code ec;
     const bool removed = std::filesystem::remove(p, ec);
@@ -1012,8 +1022,9 @@ std::vector<std::unique_ptr<VcDataset>> openZarrLevels(
             for (const auto& ds : ms0["datasets"]) {
                 if (ds.contains("path")) {
                     std::string p = ds["path"].get_string();
-                    // Verify the array actually exists on disk
-                    if (std::filesystem::exists(zarrRoot / p / ".zarray")) {
+                    // Verify the array actually exists on disk (v2 .zarray or v3 zarr.json)
+                    if (std::filesystem::exists(zarrRoot / p / ".zarray")
+                        || std::filesystem::exists(zarrRoot / p / "zarr.json")) {
                         levelNames.push_back(std::move(p));
                     }
                 }
@@ -1027,7 +1038,8 @@ std::vector<std::unique_ptr<VcDataset>> openZarrLevels(
         for (auto& entry : std::filesystem::directory_iterator(zarrRoot)) {
             if (!entry.is_directory()) continue;
             auto p = entry.path();
-            if (std::filesystem::exists(p / ".zarray")) {
+            if (std::filesystem::exists(p / ".zarray")
+                || std::filesystem::exists(p / "zarr.json")) {
                 levelNames.push_back(p.filename().string());
             }
         }
@@ -1055,18 +1067,37 @@ std::vector<std::unique_ptr<VcDataset>> openZarrLevels(
 utils::Json readZarrAttributes(const std::filesystem::path& groupPath)
 {
     auto attrsPath = groupPath / ".zattrs";
-    if (!std::filesystem::exists(attrsPath)) {
-        return utils::Json::object();
+    if (std::filesystem::exists(attrsPath)) {
+        return utils::Json::parse_file(attrsPath);
     }
-    return utils::Json::parse_file(attrsPath);
+    // v3 keeps group attributes inside the group's zarr.json.
+    auto v3Path = groupPath / "zarr.json";
+    if (std::filesystem::exists(v3Path)) {
+        auto root = utils::Json::parse_file(v3Path);
+        if (root.contains("attributes")) {
+            return root["attributes"];
+        }
+    }
+    return utils::Json::object();
 }
 
 void writeZarrAttributes(const std::filesystem::path& groupPath,
                           const utils::Json& attrs)
 {
-    auto attrsPath = groupPath / ".zattrs";
     std::filesystem::create_directories(groupPath);
-    std::ofstream f(attrsPath);
+
+    // A v3 group carries its attributes in zarr.json; keep the rest of that
+    // document (node_type, zarr_format) intact.
+    auto v3Path = groupPath / "zarr.json";
+    if (std::filesystem::exists(v3Path)) {
+        auto root = utils::Json::parse_file(v3Path);
+        root["attributes"] = attrs;
+        std::ofstream f(v3Path);
+        f << root.dump(2) << '\n';
+        return;
+    }
+
+    std::ofstream f(groupPath / ".zattrs");
     f << attrs.dump(2) << '\n';
 }
 
@@ -1079,35 +1110,72 @@ std::unique_ptr<VcDataset> createZarrDataset(
     const std::string& compressor,
     const std::string& dimensionSeparator,
     std::int64_t fillValue,
-    int compressionLevel)
+    int compressionLevel,
+    const std::vector<size_t>& shardShape)
 {
     namespace fs = std::filesystem;
     fs::path dsPath = parentPath / name;
+    const bool compressed = !(compressor.empty() || compressor == "none");
+    // Default level 3 (blosc/zstd) preserves prior behaviour; an explicit
+    // compressionLevel > 0 overrides it.
+    const int level = compressionLevel > 0 ? compressionLevel : 3;
 
     utils::ZarrMetadata meta;
-    meta.version = utils::ZarrVersion::v2;
     meta.shape.assign(shape.begin(), shape.end());
-    meta.chunks.assign(chunks.begin(), chunks.end());
     meta.dtype = (dtype == VcDtype::uint8) ? utils::ZarrDtype::uint8
                                            : utils::ZarrDtype::uint16;
     meta.fill_value = static_cast<double>(fillValue);
-    meta.dimension_separator = dimensionSeparator;
-    if (compressor.empty() || compressor == "none") {
-        meta.compressor_id.clear();
+
+    if (!shardShape.empty()) {
+        meta.version = utils::ZarrVersion::v3;
+        meta.node_type = "array";
+        meta.chunk_key_encoding = "default";
+        meta.chunks.assign(shardShape.begin(), shardShape.end());
+
+        utils::ShardConfig sc;
+        sc.sub_chunks.assign(chunks.begin(), chunks.end());
+        // v3 pipelines start with an array->bytes codec; the compressor is a
+        // bytes->bytes stage after it.
+        utils::ZarrCodecConfig bytesCodec;
+        bytesCodec.name = "bytes";
+        bytesCodec.configuration = std::make_shared<utils::JsonValue>(
+            utils::JsonValue{{"endian", utils::Json("little")}});
+        sc.sub_codecs.push_back(std::move(bytesCodec));
+        if (compressed) {
+            utils::ZarrCodecConfig compCodec;
+            compCodec.name = compressor;
+            compCodec.configuration = std::make_shared<utils::JsonValue>(
+                utils::JsonValue{{"level", utils::Json(level)}});
+            sc.sub_codecs.push_back(std::move(compCodec));
+        }
+        meta.shard_config = std::move(sc);
     } else {
-        meta.compressor_id = compressor;
-        // Default level 3 (blosc/zstd) preserves prior behaviour; an explicit
-        // compressionLevel > 0 overrides it.
-        meta.compression_level = compressionLevel > 0 ? compressionLevel : 3;
+        meta.version = utils::ZarrVersion::v2;
+        meta.chunks.assign(chunks.begin(), chunks.end());
+        meta.dimension_separator = dimensionSeparator;
+        if (compressed) {
+            meta.compressor_id = compressor;
+            meta.compression_level = level;
+        } else {
+            meta.compressor_id.clear();
+        }
     }
 
-    // ZarrArray::create writes the .zarray file for us.
+    // ZarrArray::create writes .zarray (v2) or zarr.json (v3) for us.
     utils::ZarrArray::create(dsPath, meta);
 
-    auto zgroupPath = parentPath / ".zgroup";
-    if (!fs::exists(zgroupPath)) {
-        std::ofstream g(zgroupPath);
-        g << R"({"zarr_format": 2})" << '\n';
+    if (!shardShape.empty()) {
+        auto groupPath = parentPath / "zarr.json";
+        if (!fs::exists(groupPath)) {
+            std::ofstream g(groupPath);
+            g << R"({"zarr_format": 3, "node_type": "group"})" << '\n';
+        }
+    } else {
+        auto zgroupPath = parentPath / ".zgroup";
+        if (!fs::exists(zgroupPath)) {
+            std::ofstream g(zgroupPath);
+            g << R"({"zarr_format": 2})" << '\n';
+        }
     }
 
     return std::make_unique<VcDataset>(dsPath);

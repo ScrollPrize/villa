@@ -253,3 +253,60 @@ TEST_CASE("VcDataset: zstd compressor path")
     }
     fs::remove_all(d);
 }
+
+// A sharded array stores encoded inner chunks inside one shard object, so the
+// write path has to run the codec itself (write_inner_chunk_to_shard stores
+// what it is given verbatim). Round-tripping compressed data is what proves it.
+TEST_CASE("createZarrDataset: sharded v3 round-trips through the shard index")
+{
+    auto d = tmpDir("shard");
+    const std::vector<size_t> shape{1, 256, 1024};
+    const std::vector<size_t> chunks{1, 128, 256};   // inner
+    const std::vector<size_t> shard{1, 128, 1024};   // one band row per shard
+
+    auto ds = vc::createZarrDataset(d, "arr", shape, chunks, vc::VcDtype::uint8,
+                                    /*compressor=*/"zstd", /*dimensionSeparator=*/"/",
+                                    /*fillValue=*/0, /*compressionLevel=*/3, shard);
+    REQUIRE(ds);
+    // chunks still describe the finest granularity, not the shard.
+    CHECK(ds->defaultChunkShape() == chunks);
+    CHECK(ds->defaultChunkSize() == 128u * 256u);
+    // v3 array + v3 group metadata, and no v2 leftovers.
+    CHECK(fs::exists(d / "arr" / "zarr.json"));
+    CHECK(!fs::exists(d / "arr" / ".zarray"));
+    CHECK(fs::exists(d / "zarr.json"));
+
+    std::vector<uint8_t> in(ds->defaultChunkSize());
+    for (size_t i = 0; i < in.size(); ++i) in[i] = uint8_t((i * 7 + 13) % 251);
+
+    // Two inner chunks of the same shard, plus one in the next shard row.
+    CHECK(!ds->chunkExists(0, 0, 0));
+    REQUIRE(ds->writeChunk(0, 0, 0, in.data(), in.size()));
+    REQUIRE(ds->writeChunk(0, 0, 3, in.data(), in.size()));
+    REQUIRE(ds->writeChunk(0, 1, 2, in.data(), in.size()));
+    CHECK(ds->chunkExists(0, 0, 0));
+    CHECK(ds->chunkExists(0, 0, 3));
+    CHECK(!ds->chunkExists(0, 0, 1));
+
+    for (auto idx : {std::array<size_t, 3>{0, 0, 0},
+                     std::array<size_t, 3>{0, 0, 3},
+                     std::array<size_t, 3>{0, 1, 2}}) {
+        std::vector<uint8_t> out(in.size(), 0);
+        REQUIRE(ds->readChunk(idx[0], idx[1], idx[2], out.data()));
+        CHECK(std::memcmp(out.data(), in.data(), in.size()) == 0);
+    }
+
+    // The shard must be one object holding both inner chunks, and compression
+    // must actually have run, so it is far smaller than the raw payloads.
+    auto shardFile = d / "arr" / "c" / "0" / "0" / "0";
+    REQUIRE(fs::exists(shardFile));
+    CHECK(fs::file_size(shardFile) < 2 * in.size());
+
+    // Clearing an inner chunk is an index edit, not an unlink.
+    CHECK(ds->removeChunk(0, 0, 3));
+    CHECK(!ds->chunkExists(0, 0, 3));
+    CHECK(fs::exists(shardFile));
+    CHECK(ds->chunkExists(0, 0, 0));
+
+    fs::remove_all(d);
+}
