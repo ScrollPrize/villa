@@ -9,8 +9,8 @@ from test_identity import config, batch
 from test_neighbor_bank import make_bank, add_shard, publish
 from test_neighbor_following import clean_sample
 from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import decision_pair
-from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, seed_anchor, patch_layout
-from vesuvius.neural_tracing.fiber_follow.regression.model import IdentityConfig, IdentityFollower
+from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, reference_layout
+from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig, DirectFollower
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms, identity_terms
 from vesuvius.neural_tracing.fiber_follow.regression.train import optimizer_update
 from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, OnPolicyStates, fiber_manifest
@@ -21,7 +21,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, Trace
 def test_matched_decisions_change_ownership_and_geometry_with_only_reference(tmp_path):
     bank, parent = make_bank(tmp_path)
     publish(tmp_path, [add_shard(tmp_path, 0, x=4., z_range=(20., 180.))])
-    cfg = IdentityConfig(persistent_seed=True)
+    cfg = DirectConfig()
     builder = IdentityObservationBuilder(cfg, [parent], negative_bank=bank)
     rng = np.random.default_rng(7)
     kinds, tails = set(), set()
@@ -45,10 +45,10 @@ def test_matched_decisions_change_ownership_and_geometry_with_only_reference(tmp
             kinds.add('choice')
         for row in rows:
             prepared = builder.prepare(row, row.get('supervision_fiber', parent), rng)
-            assert prepared['patch_mask'][cfg.recent_patches:].sum() == 1
+            assert prepared['reference_mask'][-1:].sum() == 1
             assert prepared['identity_reference_valid']
             assert builder.footprint_allowed(prepared, bank.band)
-    assert kinds == {'choice', 'departed'} and 128. in tails
+    assert kinds == {'choice', 'departed'} and max(tails) <= 12.
 
 
 def candidate_batch(cfg):
@@ -65,7 +65,7 @@ def candidate_batch(cfg):
 
 def test_candidates_share_deployed_head_and_train_identity_attention():
     torch.manual_seed(17)
-    model = IdentityFollower(config(persistent_seed=True)).eval()
+    model = DirectFollower(config()).eval()
     data = candidate_batch(model.cfg)
     def forward(candidates):
         return model(data['x'], data['hist'], data['hmask'], candidates=candidates)
@@ -76,7 +76,7 @@ def test_candidates_share_deployed_head_and_train_identity_attention():
     torch.testing.assert_close(predicted['candidate_confidence_logits'][:, 0], predicted['confidence_logits'])
     terms = loss_terms(out, data, model.cfg)
     terms['candidate_per_state'].sum().backward()
-    for module in (model.confidence_identity, model.appearance_token, model.appearance,
+    for module in (model.reference_token, model.encoder,
                    model.decoder, model.confidence_head):
         assert sum(float(p.grad.abs().sum()) for p in module.parameters() if p.grad is not None) > 0
     assert model.coordinates.weight.grad is None  # candidate coordinates are labels
@@ -86,7 +86,7 @@ def test_candidates_share_deployed_head_and_train_identity_attention():
 
 def test_candidate_update_independent_of_microbatch_boundaries():
     torch.manual_seed(4)
-    a = IdentityFollower(config(persistent_seed=True))
+    a = DirectFollower(config())
     b = copy.deepcopy(a)
     data = candidate_batch(a.cfg)
     data['candidate_mask'][1] = 0  # unknown states contribute zero, not a new denominator
@@ -103,32 +103,31 @@ def test_candidate_update_independent_of_microbatch_boundaries():
 
 
 def test_observed_seed_at_start_and_single_seed_infonce():
-    cfg = config(persistent_seed=True)
+    cfg = config()
     state = dict(pos=np.array([20., 30., 40.]), frame=np.eye(3),
                  hist_local=np.zeros((cfg.n_history, 3)), hmask=np.zeros(cfg.n_history))
     state.update(observed_seed(**state))
-    state.update(seed_anchor(state, cfg))
-    patch_layout(state, cfg)
-    assert state['patch_mask'].sum() == 1
-    np.testing.assert_array_equal(state['patch_centers'][cfg.recent_patches], 0.)
-    model = IdentityFollower(cfg)
+    reference_layout(state, cfg)
+    assert state['reference_mask'].sum() == 1
+    np.testing.assert_array_equal(state['reference_points'][cfg.n_history], 0.)
+    model = DirectFollower(cfg)
     data = batch(cfg, 1)
-    data['x']['patch_mask'].zero_()
-    data['x']['patch_mask'][:, cfg.recent_patches] = 1.
-    data['patch_on_fiber'] = data['x']['patch_mask'].clone()
+    data['hmask'].zero_()
+    data['reference_on_fiber'].zero_()
+    data['reference_on_fiber'][:,-1]=1.
     data['identity_seed_fallback'] = torch.ones(1, dtype=torch.bool)
     out = model(data['x'], data['hist'], data['hmask'], queries=data['identity_points'])
     assert identity_terms(out, data, cfg)['identity_states'] == 1
 
 
-def test_replay_roundtrip_preserves_seed_and_legacy_replay_stays_unknown(tmp_path):
+def test_replay_preserves_seed_but_distant_seed_is_not_observable(tmp_path):
     bank, parent = make_bank(tmp_path/'bank')
-    cfg = IdentityConfig(persistent_seed=True)
+    cfg = DirectConfig()
     arrays = dict(fiber_idx=[0], t=[100.], reverse=[False], pos=[[0., 0., 100.]],
                   frame=[np.eye(3)], hist=np.zeros((1, cfg.n_history, 3)), hmask=np.zeros((1, cfg.n_history)),
                   offtrack=[False], hard=[False], exploratory=[False])
     ds = object.__new__(FollowDataset)
-    ds.fibers, ds.cfg, ds.exclude, ds.additional_crops = [parent], clean_sample(cfg), bank.band, (cfg.coarse,)
+    ds.fibers, ds.cfg, ds.exclude, ds.additional_crops = [parent], clean_sample(cfg), bank.band, ()
     ds.batch_builder = IdentityObservationBuilder(cfg, [parent], negative_bank=bank)
     for valid in (False, True):
         seed = dict(seed_pos=[[0., 0., 20.]], seed_tangent=[[0., 0., 1.]], seed_age=[80.], seed_valid=[True]) if valid else {}
@@ -138,7 +137,7 @@ def test_replay_roundtrip_preserves_seed_and_legacy_replay_stays_unknown(tmp_pat
         loaded = OnPolicyStates.load(path)
         row = ds.replay_item((1, 0, loaded, 0), np.random.default_rng(0))
         assert bool(row['seed_valid']) == valid
-        assert row['patch_mask'][cfg.recent_patches:].sum() == int(valid)
+        assert row['reference_mask'][cfg.n_history:].sum() == 0  # distant seed is preserved in replay, masked in the crop
         for field in SEED_FIELDS:
             np.testing.assert_array_equal(getattr(loaded, field), getattr(states, field))
 

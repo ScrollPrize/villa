@@ -93,10 +93,10 @@ def test_direct_images_preserve_scores_rng_and_parameters(tmp_path, monkeypatch,
         assert {k: record[k] for k in expected} == expected
     assert expected['coverage_mean'] == 1.
     assert all(record['coverage_max_len'] == 8. for record in records[1:])
-    assert len(rgb) == 8
+    assert len(rgb) == 4
     for pixels in rgb:
         np.testing.assert_allclose(pixels, .2, atol=1e-7)
-    expected_images = ['batch_001000.png', 'batch_coarse_001000.png', 'correction_001000.png',
+    expected_images = ['batch_001000.png', 'correction_001000.png',
                        'rollout_001000_c0.5.png']
     for path in [tmp_path/'images'/name for name in expected_images]+[tmp_path/'curves.png']:
         with Image.open(path) as image:

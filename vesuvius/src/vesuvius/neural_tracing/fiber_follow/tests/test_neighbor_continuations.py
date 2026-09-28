@@ -7,14 +7,14 @@ import torch
 
 from test_neighbor_bank import make_bank, add_shard, publish
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
-from vesuvius.neural_tracing.fiber_follow.regression.model import IdentityConfig
+from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import wrong_continuation
 from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, SampleConfig, collate_targets
 from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
 
 
 def configuration():
-    model = IdentityConfig(n_history=64,patch_span=64,n_future=4,anchor_patches=0)
+    model = DirectConfig(n_history=64,n_future=4)
     sample = SampleConfig(crop=model.fine,n_history=64,recent_history_points=64,n_future=4)
     return model,sample
 
@@ -41,8 +41,11 @@ def test_smooth_bridge_retains_own_history_and_rejects_wrong_tail(tmp_path,seed)
     assert (directions[1:]*directions[:-1]).sum(1).min() > .97
     builder = IdentityObservationBuilder(cfg,[fiber],negative_bank=bank)
     builder.prepare(state,fiber,rng)
-    assert state['patch_on_fiber'][:cfg.recent_patches].sum() >= 2
-    assert state['patch_on_fiber'][0] == 0
+    on=state['reference_on_fiber']
+    assert on[:cfg.n_history].sum() >= 1
+    assert state['identity_observable'] == bool(on[:-1].sum() >= 2 or on[-1])
+    assert not on[state['reference_mask']==0].any()
+    assert state['reference_on_fiber'][0] == 0
     points = torch.zeros(1,4,3)
     points[0,:,2] = torch.arange(1,5)
     target,known,_ = prefix_labels(points,collate_targets([state]))
@@ -96,13 +99,13 @@ def test_unsafe_synthetic_departure_falls_back_to_original_replay(tmp_path):
 
 
 @pytest.mark.parametrize('seed',range(6))
-def test_128_voxel_tail_rejects_with_only_seed_anchors_on_original_fiber(tmp_path,seed):
+def test_long_departure_without_visible_reference_is_not_supervised(tmp_path,seed):
     bank,fiber = make_bank(tmp_path)
     publish(tmp_path,[add_shard(tmp_path,0,z_range=(20.,180.))])
-    cfg = IdentityConfig(n_future=4)
+    cfg = DirectConfig(n_future=4)
     sample = SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=4)
     builder = IdentityObservationBuilder(cfg,[fiber],negative_bank=bank,
-        sampling=IdentitySampling(anchor_prob=1.,bank_wrong_continuation_probability=1.,
+        sampling=IdentitySampling(bank_wrong_continuation_probability=1.,
                                   bank_wrong_continuation_tail=(128.,128.)))
     state = builder.replace_replay(2,4,sample,np.random.default_rng(seed))
     assert state is not None and state['bank_tail_length'] == 128.
@@ -110,15 +113,10 @@ def test_128_voxel_tail_rejects_with_only_seed_anchors_on_original_fiber(tmp_pat
     np.testing.assert_allclose(history[:,0],6.,atol=1e-5)
     assert state['hmask'].all() and not state['dense_mask'].any()
     builder.prepare(state,fiber,np.random.default_rng(seed))
-    assert not state['patch_on_fiber'][:cfg.recent_patches].any()
-    assert state['patch_on_fiber'][cfg.recent_patches:].all()
-    # Every anchor belongs to the real on-target prefix, before the bridge.
-    fi,t,reverse = state['fiber_ref']
-    anchor_t = t-state['anchor_age']
-    assert anchor_t.max() <= state['bank_prefix_end_t']+1e-8
-    np.testing.assert_allclose(state['anchor_world'][:,:2],0.,atol=1e-8)
-    target,known,_ = prefix_labels(torch.zeros(1,4,3),collate_targets([state]))
-    assert not target.any() and known.all()
+    assert not state['reference_on_fiber'][:cfg.n_history].any()
+    assert not state['reference_on_fiber'].any()
+    assert not state['identity_observable']
+    assert not state['visible_seed_mask'].any()
 
 
 def test_variable_tails_reach_128_and_short_paths_are_not_silently_substituted(tmp_path):
@@ -134,27 +132,6 @@ def test_variable_tails_reach_128_and_short_paths_are_not_silently_substituted(t
     assert wrong_continuation(short,sample,rng,tail_length_range=(128.,128.)) is None
 
 
-def test_long_departure_forces_original_reference_or_falls_back(tmp_path):
-    bank,fiber = make_bank(tmp_path)
-    publish(tmp_path,[add_shard(tmp_path,0,z_range=(20.,180.))])
-    cfg = IdentityConfig(n_future=4)
-    sample = SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=4)
-    sampling = IdentitySampling(anchor_prob=0.,require_departure_reference=True,
-        prefer_long_continuations=True,bank_wrong_continuation_probability=1.,
-        bank_wrong_continuation_tail=(128.,128.))
-    builder = IdentityObservationBuilder(cfg,[fiber],negative_bank=bank,sampling=sampling)
-    rng = np.random.default_rng(2)
-    state = builder.replace_replay(2,4,sample,rng)
-    builder.prepare(state,fiber,rng)
-    assert not state['patch_on_fiber'][:cfg.recent_patches].any()
-    assert state['patch_on_fiber'][cfg.recent_patches:].sum() >= 2
-    assert builder.footprint_allowed(state,None)
-    no_anchors = IdentityConfig(n_future=4,anchor_patches=0)
-    builder = IdentityObservationBuilder(no_anchors,[fiber],negative_bank=bank,sampling=sampling)
-    state = builder.replace_replay(2,4,sample,rng)
-    builder.prepare(state,fiber,rng)
-    assert not state['identity_reference_valid']
-    assert not builder.footprint_allowed(state,None)
 
 
 def test_length_filter_discovers_long_paths_among_short_shards(tmp_path):
@@ -176,17 +153,3 @@ def test_length_filter_discovers_long_paths_among_short_shards(tmp_path):
 def test_invalid_tail_ranges_fail_closed(lengths):
     with pytest.raises(ValueError,match='tail lengths'):
         IdentitySampling(bank_wrong_continuation_tail=lengths)
-
-
-def test_tail_options_preserve_old_and_new_checkpoint_sampling():
-    from vesuvius.neural_tracing.fiber_follow.regression.train import resolve_bank_tail_range
-    old = {'training_options':{}}
-    new = {'training_options':{'bank_wrong_continuation_tail':[64.,128.]}}
-    assert resolve_bank_tail_range(None) == [4.,128.]
-    assert resolve_bank_tail_range([128.,128.]) == [128.,128.]
-    assert resolve_bank_tail_range(None,old) == [4.,12.]
-    assert resolve_bank_tail_range(None,new) == [64.,128.]
-    assert resolve_bank_tail_range([64.,128.],new) == [64.,128.]
-    for checkpoint in (old,new):
-        with pytest.raises(ValueError,match='Resume option differs'):
-            resolve_bank_tail_range([4.,128.],checkpoint)

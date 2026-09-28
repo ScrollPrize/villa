@@ -21,8 +21,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 
 def config():
     return DirectConfig(fine=CropSpec(depth=16, width=12, behind=7),
-                        coarse=CropSpec(depth=24, width=12, behind=18, spacing=2.),
-                        channels=4, hidden=16, heads=2, layers=1, n_future=4, n_history=32)
+                        channels=4, hidden=16, heads=2, layers=1, decoder_layers=1, activation_checkpointing=False, n_future=4, n_history=32)
 
 
 def batch(cfg, b=2):
@@ -30,7 +29,7 @@ def batch(cfg, b=2):
     hist[..., 2] = -torch.arange(1, cfg.n_history+1)
     q = 4*(cfg.n_future-1)+1
     return dict(x={name: torch.rand(b, 2, crop.depth, crop.width, crop.width)
-                   for name, crop in (('fine', cfg.fine), ('coarse', cfg.coarse))},
+                   for name, crop in (('fine', cfg.fine),)},
                 hist=hist, hmask=torch.ones(b, cfg.n_history), dense_ab=torch.ones(b, q, 2),
                 dense_mask=torch.ones(b, q), offtrack=torch.zeros(b), endpoint_known=torch.zeros(b),
                 end_local=torch.zeros(b, 3), source=torch.zeros(b))
@@ -52,7 +51,7 @@ def test_prediction_is_deterministic_and_geometry_trains_actual_coordinates():
     assert (out['confidence'][:, 1:] <= out['confidence'][:, :-1]).all()
     terms = loss_terms(out, b, m.cfg)
     terms['geometry_per_state'].mean().backward()
-    for module in (m.coordinates, m.fine_encoder.local[0], m.coarse_encoder.local[0], m.history_token[0]):
+    for module in (m.coordinates, m.encoder.stem[0], m.encoder.compress, m.reference_token[0]):
         assert module.weight.grad is not None and module.weight.grad.abs().sum() > 0
     assert m.confidence_head[-1].weight.grad is None
     m.zero_grad(set_to_none=True)
@@ -99,26 +98,6 @@ def test_feature_coordinates_respect_even_sized_strided_lattice():
     torch.testing.assert_close(grid, torch.tensor([[[1., 0., 1.]]]))
 
 
-def test_path_evidence_samples_longitudinal_slices_and_both_deep_lattices():
-    cfg = config()
-    model = DirectFollower(cfg)
-    def z_features(crop, channels, stride):
-        shape = tuple((size+stride-1)//stride for size in (crop.depth, crop.width, crop.width))
-        z = (torch.arange(shape[0])*stride-crop.behind)*crop.spacing
-        return z[None, None, :, None, None].expand(1, channels, *shape).contiguous()
-    fine = z_features(cfg.fine, cfg.channels, 1)
-    deep = z_features(cfg.fine, 4*cfg.channels, 4)
-    coarse = z_features(cfg.coarse, 4*cfg.channels, 4)
-    points = torch.tensor([[[0., 0., 2.], [100., 0., 2.]]])
-    features = model.path_features(fine, deep, coarse, points)
-    local_width = 27*(cfg.channels+1)
-    local = features[0, 0, :local_width].reshape(3, 9, cfg.channels+1)
-    torch.testing.assert_close(local[..., :-1], torch.tensor([1., 2., 3.])[:, None, None].expand(3, 9, cfg.channels))
-    assert local[..., -1].eq(1).all()
-    for chunk in features[0, 0, local_width:].reshape(2, -1):
-        torch.testing.assert_close(chunk[:-1], torch.full((4*cfg.channels,), 2.))
-        assert chunk[-1] == 1
-    assert features[0, 1].eq(0).all()  # Outside both crops, including support flags.
 
 
 def test_microbatch_partition_keeps_objective_and_update():
@@ -175,15 +154,6 @@ def test_checkpoint_roundtrip_and_resume_optimizer_rng(tmp_path):
         torch.testing.assert_close(p, q, rtol=0, atol=0)
 
 
-def test_both_crops_are_excluded_from_holdout():
-    cfg = DirectConfig()
-    ds = object.__new__(FollowDataset)
-    ds.cfg = SampleConfig(crop=cfg.fine)
-    ds.additional_crops = (cfg.coarse,)
-    ds.exclude = ZBand(100., 120.)
-    item = dict(pos=np.array([0., 0., 49.]), frame=np.diag([1., -1., -1.]))
-    assert training_state_allowed(item, cfg.fine, ds.exclude)
-    assert not ds.state_allowed(item)
 
 
 def test_image_sampler_matches_reference_at_fine_and_coarse_resolution(monkeypatch):
@@ -219,7 +189,7 @@ def test_parallel_fibers_learn_recovery_from_older_observed_history():
     m = DirectFollower(cfg)
     b = batch(cfg)
     sign = torch.tensor([-1., 1.])
-    for name, crop in (('fine', cfg.fine), ('coarse', cfg.coarse)):
+    for name, crop in (('fine', cfg.fine),):
         axis = torch.tensor(crop.lateral_coords)
         image = torch.exp(-((axis-2)/.6)**2)+torch.exp(-((axis+2)/.6)**2)
         b['x'][name] = image.float()[None, None, None, None].expand(2, 2, crop.depth, crop.width, -1).clone()
@@ -259,18 +229,18 @@ def test_local_correction_is_bounded_and_confidence_cannot_train_its_coordinates
     m = DirectFollower(cfg)
     b = batch(cfg)
     seen = []
-    original = m.path_features
-    def patches(fine, fine_deep, coarse_deep, points):
+    original = m.evidence
+    def patches(ctx, points, stage):
         seen.append(points.detach().clone())
-        return original(fine, fine_deep, coarse_deep, points)
-    m.path_features = patches
+        return original(ctx, points, stage)
+    m.evidence = patches
     encodings = []
     handles = [encoder.register_forward_hook(lambda *args: encodings.append(1))
-               for encoder in (m.fine_encoder, m.coarse_encoder)]
+               for encoder in (m.encoder,)]
     out = forward(m, b)
     for handle in handles:
         handle.remove()
-    assert len(encodings) == 2  # Each crop encoded once despite two corrections.
+    assert len(encodings) == 1  # One encoding despite repeated correction.
     assert len(seen) == cfg.correction_steps+1
     assert out['refinement_points'].shape == (2, 3, 4, 3)
     for i, coordinates in enumerate(seen):
@@ -282,7 +252,7 @@ def test_local_correction_is_bounded_and_confidence_cannot_train_its_coordinates
     loss_terms(out, b, cfg, n_commit=2)['geometry_per_state'].mean().backward()
     assert m.correction_head[-1].weight.grad.abs().sum() > 0
     assert m.coordinates.weight.grad.abs().sum() > 0
-    assert m.fine_encoder.local[0].weight.grad.abs().sum() > 0
+    assert m.encoder.stem[0].weight.grad.abs().sum() > 0
     m.zero_grad(set_to_none=True)
     loss_terms(forward(m, b), b, cfg, n_commit=2)['confidence_per_state'].mean().backward()
     assert m.correction_head[-1].weight.grad is None

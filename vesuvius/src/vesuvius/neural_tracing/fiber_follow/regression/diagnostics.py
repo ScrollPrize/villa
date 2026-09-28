@@ -102,21 +102,21 @@ def summarize_decisions(rows, n_commit):
 
 
 
-# History patch age bins (voxels behind the head); seed anchors are reported separately.
+# Visible reference age bins (voxels behind the head); seed anchors are reported separately.
 RANKING_BINS = (('4-16', 0, 16), ('17-48', 17, 48), ('49-128', 49, 128))
 
 
 @torch.no_grad()
 def identity_ranking(output, batch, cfg):
-    """Does each on-fiber history patch prefer its fiber ahead over the negatives beside it?
+    """Does each on-fiber visible reference prefer its fiber ahead over the negatives beside it?
 
-    Counts per history-patch age bin and per positive forward distance, for
+    Counts per reference age bin and per positive forward distance, for
     diagnostics only; the model never receives a hand-computed similarity.
     """
-    R, K = cfg.recent_patches, batch['positive_mask'].shape[1]
+    R, K = cfg.n_history, batch['positive_mask'].shape[1]
     M = batch['negative_mask'].shape[2]
-    history = output['history_embedding'].float()
-    on = (batch['patch_on_fiber']*output['patch_mask']).bool()
+    history = output['reference_embedding'].float()
+    on = (batch['reference_on_fiber']*output['reference_mask']).bool()
     query, support = output['query_embedding'].float(), output['query_support'].bool()
     positive, negative = query[:, :K], query[:, K:].reshape(len(query), K, M, -1)
     positive_ok = batch['positive_mask'].bool() & support[:, :K]
@@ -126,7 +126,7 @@ def identity_ranking(output, batch, cfg):
     competitor = torch.einsum('bpe,bkme->bpkm', history, negative).masked_fill(~negative_ok[:, None], -2.).amax(-1)
     correct = similarity > competitor
     valid = on[:, :, None] & scored[:, None]
-    ages = torch.arange(1, R+1, device=query.device)*cfg.patch_every
+    ages = torch.arange(1, R+1, device=query.device)
     rows = {}
     for name, lo, hi in RANKING_BINS:
         member = valid[:, :R] & ((ages >= lo) & (ages <= hi))[None, :, None]

@@ -42,20 +42,22 @@ def test_near_outer_slots_visit_distinct_paths_before_reusing_one():
 
 
 def test_seed_reference_fallback_supplies_gradients_without_doubling_loss():
-    cfg = SimpleNamespace(recent_patches=2)
+    cfg = SimpleNamespace(n_history=2)
     history = torch.tensor([[[.8,.6],[.8,.6],[.6,.8],[.6,.8]]],requires_grad=True)
     query = torch.tensor([[[1.,0.],[0.,1.]]],requires_grad=True)
-    output = dict(history_embedding=history,patch_mask=torch.ones(1,4),query_embedding=query,query_support=torch.ones(1,2))
-    batch = dict(patch_on_fiber=torch.tensor([[0.,0.,1.,1.]]),positive_mask=torch.ones(1,1),
+    output = dict(reference_embedding=history,reference_mask=torch.ones(1,4),query_embedding=query,query_support=torch.ones(1,2))
+    batch = dict(reference_on_fiber=torch.tensor([[0.,0.,1.,1.]]),positive_mask=torch.ones(1,1),
                  negative_mask=torch.ones(1,1,1),identity_seed_fallback=torch.tensor([True]))
     terms = identity_terms(output,batch,cfg)
     assert terms['identity_count'] == 1 and terms['identity_anchor_source'].item() == 2
     terms['identity_per_state'].sum().backward()
     assert history.grad[:,:2].abs().sum() == 0 and history.grad[:,2:].abs().sum() > 0
     assert query.grad.abs().sum() > 0
-    batch['identity_seed_fallback'].zero_()
+    saved=output['reference_mask'].clone()
+    output['reference_mask'][:,2:]=0
     assert identity_terms(output,batch,cfg)['identity_count'] == 0
-    batch['patch_on_fiber'].fill_(1)
+    output['reference_mask']=saved
+    batch['reference_on_fiber'].fill_(1)
     legacy = identity_terms(output,batch,cfg)['identity_per_state']
     batch['identity_seed_fallback'].fill_(True)
     current = identity_terms(output,batch,cfg)
@@ -65,10 +67,10 @@ def test_seed_reference_fallback_supplies_gradients_without_doubling_loss():
 
 def test_identity_source_and_distance_metrics_pool_across_microbatches():
     from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import identity_training_groups
-    cfg = SimpleNamespace(recent_patches=2)
-    output = dict(history_embedding=torch.tensor([[[1.,0.]]*4]*3),patch_mask=torch.ones(3,4),
+    cfg = SimpleNamespace(n_history=2)
+    output = dict(reference_embedding=torch.tensor([[[1.,0.]]*4]*3),reference_mask=torch.ones(3,4),
         query_embedding=torch.tensor([[[1.,0.],[0.,1.],[-1.,0.]]]*3),query_support=torch.ones(3,3))
-    batch = dict(patch_on_fiber=torch.tensor([[1.,1.,0.,0.],[0.,0.,1.,1.],[0.,0.,0.,0.]]),
+    batch = dict(reference_on_fiber=torch.tensor([[1.,1.,0.,0.],[0.,0.,1.,1.],[0.,0.,0.,0.]]),
         positive_mask=torch.ones(3,1),negative_mask=torch.ones(3,1,2),
         identity_seed_fallback=torch.ones(3,dtype=torch.bool),source=torch.tensor([0,3,0]),
         location_source=torch.tensor([5,0,0]),negative_path_ids=torch.tensor([[[2,3]]]*3),
@@ -127,19 +129,19 @@ def test_missing_paths_and_receptive_field_exclusions_stay_unknown():
 
 
 def test_full_target_history_scores_all_candidates_and_padding_has_no_effect():
-    cfg = SimpleNamespace(recent_patches=4)
+    cfg = SimpleNamespace(n_history=4)
     history = torch.tensor([[[1., 0.], [1., 0.], [0., 1.], [0., 1.]]], requires_grad=True)
-    output = dict(history_embedding=history, patch_mask=torch.ones(1, 4),
+    output = dict(reference_embedding=history, reference_mask=torch.ones(1, 4),
                   query_embedding=torch.tensor([[[0., 1.], [1., 0.], [-1., 0.]]]),
                   query_support=torch.ones(1, 3, dtype=torch.bool))
-    batch = dict(patch_on_fiber=torch.ones(1, 4), positive_mask=torch.ones(1, 1),
+    batch = dict(reference_on_fiber=torch.ones(1, 4), positive_mask=torch.ones(1, 1),
                  negative_mask=torch.tensor([[[1., 0.]]]))
     full = identity_terms(output, batch, cfg)['identity_per_state']
     full.sum().backward()
     assert (history.grad.norm(dim=-1) > 0).all()  # includes all older positive-history patches
     output['query_embedding'][0, 2] = torch.tensor([1000., -1000.])
     torch.testing.assert_close(identity_terms(output, batch, cfg)['identity_per_state'], full)
-    output['patch_mask'] = torch.tensor([[1., 1., 0., 0.]])
+    output['reference_mask'] = torch.tensor([[1., 1., 0., 0.]])
     short = identity_terms(output, batch, cfg)['identity_per_state']
     assert short.item() > full.item()+1.  # truncation really would weaken this positive; we do not do it
     batch['negative_mask'].zero_()

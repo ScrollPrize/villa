@@ -8,6 +8,8 @@ from vesuvius.neural_tracing.fiber_follow.regression.model import feature_grid
 
 def geometry_mask(batch, cfg):
     annotated = batch['dense_mask'].bool() & ~batch['offtrack'][:, None].bool()
+    if 'identity_observable' in batch:
+        annotated &= batch['identity_observable'][:, None].bool()
     target = torch.where(annotated[..., None], batch['dense_ab'], 0.)
     observable = (target.abs().amax(-1) <= cfg.lateral_limit).int().cummin(-1).values.bool()
     return annotated & observable
@@ -45,21 +47,20 @@ def foreign_failures(points, batch, cfg, count):
 def identity_terms(output, batch, cfg, temperature=.1):
     """InfoNCE between pooled on-fiber recent history and appearance ahead.
 
-    The anchor is the normalized mean over recent patches lying on the annotated
-    fiber (at least two). When enabled, trustworthy seed anchors supply the
+    The anchor is the normalized mean over visible reference positions lying on the annotated
+    fiber (at least two). A visible observed seed supplies the
     reference if recent history is insufficient; the two references are never
     added as separate losses. Each annotated positive must outscore only the
     validated centerline negatives beside it; it never
     has to reach similarity one. States without a scored positive contribute zero.
     """
-    R = cfg.recent_patches
-    on = batch['patch_on_fiber'][:, :R]*output['patch_mask'][:, :R]
+    R = cfg.n_history
+    on = batch['reference_on_fiber'][:, :R]*output['reference_mask'][:, :R]
     recent_ok = on.sum(1) >= 2
-    seed_on = batch['patch_on_fiber'][:, R:]*output['patch_mask'][:, R:]
-    seed_ok = (~recent_ok & (seed_on.sum(1) >= (1 if getattr(cfg, 'persistent_seed', False) else 2))
-               & batch.get('identity_seed_fallback',torch.zeros_like(recent_ok)).bool())
-    recent = (output['history_embedding'][:, :R].float()*on[..., None]).sum(1)
-    seed = (output['history_embedding'][:, R:].float()*seed_on[..., None]).sum(1)
+    seed_on = batch['reference_on_fiber'][:, R:]*output['reference_mask'][:, R:]
+    seed_ok = ~recent_ok & (seed_on.sum(1) >= 1)
+    recent = (output['reference_embedding'][:, :R].float()*on[..., None]).sum(1)
+    seed = (output['reference_embedding'][:, R:].float()*seed_on[..., None]).sum(1)
     anchor = F.normalize(torch.where(seed_ok[:,None],seed,recent),dim=-1)
     K = batch['positive_mask'].shape[1]
     M = batch['negative_mask'].shape[2]
@@ -69,6 +70,8 @@ def identity_terms(output, batch, cfg, temperature=.1):
     positive_ok = batch['positive_mask'].bool() & support[:, :K]
     negative_ok = batch['negative_mask'].bool() & support[:, K:].reshape(len(query), K, M)
     valid = positive_ok & negative_ok.any(-1) & (recent_ok | seed_ok)[:, None]
+    if 'identity_observable' in batch:
+        valid &= batch['identity_observable'][:,None]
     positive_logit = (anchor[:, None]*positive).sum(-1)/temperature
     negative_logit = ((anchor[:, None, None]*negative).sum(-1)/temperature).masked_fill(~negative_ok, float('-inf'))
     loss = torch.logsumexp(torch.cat((positive_logit[..., None], negative_logit), -1), -1)-positive_logit
@@ -123,6 +126,10 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_tem
         extra = foreign_failures(output['points'], batch, cfg, mask.shape[1])
         supervised, supervised_known, _ = prefix_labels(output['points'], batch, tolerance,
                                                         cfg.max_recovery_distance, extra_failure=extra)
+    if 'identity_observable' in batch:
+        observed = batch['identity_observable'][:,None]
+        known = known*observed
+        supervised_known = supervised_known*observed
     bce = F.binary_cross_entropy_with_logits(output['confidence_logits'], supervised, reduction='none')
     terms = dict(geometry_per_state=geometry,
                  confidence_per_state=window_mean(bce, supervised_known.bool(),
@@ -137,6 +144,8 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_tem
         terms.update(identity_terms(output, batch, cfg, identity_temperature))
     if 'candidate_confidence_logits' in output:
         mask = batch['candidate_mask'].bool()
+        if 'identity_observable' in batch:
+            mask = mask & batch['identity_observable'][:,None,None]
         labels = batch['candidate_labels'].float()
         bce = F.binary_cross_entropy_with_logits(output['candidate_confidence_logits'], labels, reduction='none')
         per_candidate = window_mean(bce, mask, torch.arange(cfg.n_future, device=mask.device) < window)

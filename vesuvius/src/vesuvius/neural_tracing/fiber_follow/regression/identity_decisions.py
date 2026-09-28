@@ -1,4 +1,4 @@
-"""Matched decisions: identical current evidence, different original-fiber seeds."""
+"""Matched decisions distinguished by observed seeds inside the current crop."""
 import numpy as np
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import continuation_targets, label_state
@@ -17,10 +17,13 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
     pairs share a real B tail: B's seed permits following, A's seed requires
     stopping. References precede the shared history and are actual seed
     observations of the simulated paths, not replacements of contaminated
-    recent patches. Only certified bank relationships are used.
+    recent observations. Only certified bank relationships are used.
     """
     choice = bool(rng.integers(2))
-    tail = float(rng.choice((4, 8, 16, 32) if choice else (8, 32, 64, 96, 128)))
+    tails = [v for v in (4.,8.,12.) if v+8+model.patch_radius < model.fine.behind*model.fine.spacing]
+    if not tails:
+        return None
+    tail = float(rng.choice(tails))
     horizon = sample.future_s[-1]
     for _ in range(attempts):
         draw = bank.draw_path(rng, unique=False, min_length=tail+horizon+12)
@@ -89,6 +92,9 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
                 interp_at(line, s, np.array([reference_b]))[0]]
         tangents = [tangent_at(parent.points, parent.s, reference_a)*(-1 if reverse else 1),
                     tangent_at(line, s, reference_b)]
+        from vesuvius.neural_tracing.fiber_follow.regression.data import visible_points
+        if not visible_points((np.asarray(refs)-pos) @ frame,model.fine,model.patch_radius).all():
+            continue
         rows = []
         for target in range(2):
             offtrack = not choice and target == 0

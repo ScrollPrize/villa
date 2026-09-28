@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, IdentitySampling
-from vesuvius.neural_tracing.fiber_follow.regression.model import IdentityConfig, AppearanceEncoder, sample_features
+from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig, sample_features
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import identity_terms
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bulk import digest, pack_paths, write_json
@@ -67,7 +67,7 @@ def item(cfg, reverse=False):
     world = np.c_[along*0,along*0,80.+sign*along]
     return dict(pos=pos,frame=frame,fiber_ref=(0,120. if reverse else 80.,reverse),
                 identity_curve=(world-pos) @ frame,identity_seed=19,
-                patch_on_fiber=np.ones(cfg.n_patches,np.float32),source=0,offtrack=False)
+                reference_on_fiber=np.ones((cfg.n_history+1),np.float32),source=0,offtrack=False)
 
 
 def test_live_refresh_obeys_interval_and_sees_new_shards_after_empty_lookup(tmp_path,monkeypatch):
@@ -109,13 +109,13 @@ def test_evaluation_paths_are_available_only_in_explicit_evaluation_mode(tmp_pat
 
 
 def test_identity_supervision_and_training_cli_require_a_bank():
-    builder = IdentityObservationBuilder(IdentityConfig())
+    builder = IdentityObservationBuilder(DirectConfig())
     with pytest.raises(ValueError,match='requires a negative bank'):
         builder.identity_targets([], {})
     from vesuvius.neural_tracing.fiber_follow.regression.train import main
     with pytest.raises(ValueError,match='requires --negative-bank'):
         main(['--name','unused','--fiber-zarrs','unused','--fibers','unused','--ct','unused',
-              '--manifest','unused','--device','cpu','--threads','1','--identity'])
+              '--manifest','unused','--device','cpu','--threads','1'])
 
 
 def test_changed_published_shards_fail_closed_and_resume_allows_growth(tmp_path):
@@ -173,7 +173,7 @@ def test_prediction_and_ct_sources_must_match_training(tmp_path):
 @pytest.mark.parametrize('angle',[0.,.37])
 def test_training_targets_stay_exactly_on_both_centerlines(tmp_path,reverse,angle):
     bank,fiber = make_bank(tmp_path)
-    cfg = IdentityConfig()
+    cfg = DirectConfig()
     builder = IdentityObservationBuilder(cfg,[fiber],negative_bank=bank)
     state = item(cfg,reverse)
     rotation = np.array([[np.cos(angle),-np.sin(angle),0.],[np.sin(angle),np.cos(angle),0.],[0.,0.,1.]])
@@ -207,7 +207,7 @@ def test_training_targets_stay_exactly_on_both_centerlines(tmp_path,reverse,angl
 
 def test_bank_rasterization_marks_only_cells_containing_line_samples(tmp_path):
     bank,_ = make_bank(tmp_path,with_path=True)
-    cfg = IdentityConfig()
+    cfg = DirectConfig()
     state = item(cfg)
     presence = np.ones((cfg.fine.depth,cfg.fine.width,cfg.fine.width),np.float32)
     found = bank.candidates(state,cfg.fine,presence,ComponentRule())
@@ -217,28 +217,6 @@ def test_bank_rasterization_marks_only_cells_containing_line_samples(tmp_path):
     np.testing.assert_array_equal(found['foreign'],expected)
 
 
-def test_identical_ct_has_no_bank_label_or_padding_shortcut(tmp_path):
-    bank,fiber = make_bank(tmp_path)
-    publish(tmp_path,[add_shard(tmp_path,0,x=6.13)])
-    cfg = IdentityConfig()
-    builder = IdentityObservationBuilder(cfg,[fiber],negative_bank=bank)
-    images = {'fine':torch.ones(1,2,cfg.fine.depth,cfg.fine.width,cfg.fine.width)}
-    target = builder.identity_targets([item(cfg)],images)
-    assert target['negative_mask'].all() and target['positive_mask'].all()
-    torch.manual_seed(8)
-    encoder = AppearanceEncoder(4,8,cfg.appearance_version)
-    pc = cfg.patch_crop
-    with torch.no_grad():
-        dense = encoder(images['fine'][:,:1,cfg.appearance_start:])
-        query,support = sample_features(dense,target['identity_points'],cfg.appearance_crop)
-        history = encoder(torch.ones(1,1,pc.depth,pc.width,pc.width),same=False).flatten(1)
-    assert support.all()
-    torch.testing.assert_close(query,history[:,None].expand_as(query),atol=2e-6,rtol=2e-6)
-    output = dict(query_embedding=torch.nn.functional.normalize(query,dim=-1),query_support=support,
-                  history_embedding=history[:,None].expand(-1,cfg.n_patches,-1),
-                  patch_mask=torch.ones(1,cfg.n_patches))
-    terms = identity_terms(output,target,cfg)
-    assert terms['identity_per_state'].item() == pytest.approx(np.log(1+builder.sampling.negatives),abs=2e-6)
 
 
 def test_worker_rejects_a_replaced_run_instead_of_silently_relabeling(tmp_path):
@@ -254,7 +232,7 @@ def test_worker_rejects_a_replaced_run_instead_of_silently_relabeling(tmp_path):
 def test_foreign_cell_extent_cannot_reach_target_exclusion_tube(tmp_path):
     bank,_ = make_bank(tmp_path)
     publish(tmp_path,[add_shard(tmp_path,0,x=3.)])
-    cfg = IdentityConfig()
+    cfg = DirectConfig()
     state = item(cfg)
     presence = np.ones((cfg.fine.depth,cfg.fine.width,cfg.fine.width),np.float32)
     found = bank.candidates(state,cfg.fine,presence,ComponentRule())

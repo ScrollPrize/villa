@@ -1,4 +1,4 @@
-"""Collect original-fiber replay with the direct model and both crop exclusions."""
+"""Collect original-fiber replay with the direct model and the enlarged crop exclusion."""
 from vesuvius.neural_tracing.fiber_follow.shared.collect import main as collect
 from vesuvius.neural_tracing.fiber_follow.regression.train import load_checkpoint
 from vesuvius.neural_tracing.fiber_follow.regression.data import DirectTracer

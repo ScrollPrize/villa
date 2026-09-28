@@ -1,10 +1,9 @@
 """Shared training/rollout observation builder for the direct follower."""
 from collections import deque
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 from pathlib import Path
-import time
 
 import numpy as np
 import torch
@@ -12,13 +11,12 @@ import torch
 from vesuvius.neural_tracing.fiber_follow.shared.components import (
     PAIR_SAMPLING_VERSION, ComponentRule, sample_pairs,
 )
-from vesuvius.neural_tracing.fiber_follow.shared.data import collate_targets, crop_corners, fiber_manifest
+from vesuvius.neural_tracing.fiber_follow.shared.data import collate_targets, fiber_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_crops
-from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, interp_at, normalize, tangent_at
-from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer
 from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
-from vesuvius.neural_tracing.fiber_follow.regression.model import IdentityConfig
+from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
 
 
 def image_crop(items, vol, crop, pool=None):
@@ -34,34 +32,23 @@ def image_crop(items, vol, crop, pool=None):
 
 
 class ObservationBuilder:
-    """Lazy worker-local coarse-volume reader; fine CT uses the supplied volume."""
-    def __init__(self, cfg, coarse_level=1, coarse_grid_scale=8.):
-        self.cfg, self.coarse_level, self.coarse_grid_scale = cfg, coarse_level, coarse_grid_scale
-        self._coarse = None
+    """One crop and only visible observed references, shared by training/tracing."""
+    def __init__(self,cfg):
+        self.cfg = cfg
 
-    def __getstate__(self):
-        return dict(self.__dict__, _coarse=None)
+    def images(self,items,vol,pool=None):
+        for item in items:
+            reference_layout(item,self.cfg)
+        stack = lambda key: torch.from_numpy(np.stack([item[key] for item in items]).astype(np.float32))
+        return dict(fine=image_crop(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
+                    seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
+                    seed_tangent=stack('visible_seed_tangent'))
 
-    def images(self, items, vol, pool=None):
-        if self._coarse is None:
-            spec = replace(vol.spec, ct_level=self.coarse_level, ct_grid_scale=self.coarse_grid_scale)
-            self._coarse = FiberVolume(spec, cache_bytes=vol.ct.cache_bytes)
-            # Both scales sample the same presence array. One reader with the
-            # combined budget lets the wider coarse footprint serve the fine crop.
-            if vol.presence is not None:
-                vol.presence.cache_bytes += self._coarse.presence.cache_bytes
-                self._coarse.presence = vol.presence
-        return dict(fine=image_crop(items, vol, self.cfg.fine, pool),
-                    coarse=image_crop(items, self._coarse, self.cfg.coarse, pool))
-
-    def __call__(self, items, vol):
-        return dict(x=self.images(items, vol),
-                    hist=torch.as_tensor(np.stack([i['hist_local'] for i in items]), dtype=torch.float32),
-                    hmask=torch.as_tensor(np.stack([i['hmask'] for i in items]), dtype=torch.float32),
+    def __call__(self,items,vol):
+        return dict(x=self.images(items,vol),
+                    hist=torch.as_tensor(np.stack([i['hist_local'] for i in items]),dtype=torch.float32),
+                    hmask=torch.as_tensor(np.stack([i['hmask'] for i in items]),dtype=torch.float32),
                     **collate_targets(items))
-
-
-# ---------------------------------------------------------------- visual identity
 
 
 @dataclass(frozen=True)
@@ -71,8 +58,7 @@ class IdentitySampling:
     pair_sampling_version: int = PAIR_SAMPLING_VERSION
     positives: int = 4
     negatives: int = 8
-    on_fiber_tolerance: float = 1.5  # history patch counts toward the anchor within this of GT
-    anchor_prob: float = .75  # fresh/replay states given seed-segment anchor patches
+    on_fiber_tolerance: float = 1.5  # visible reference counts toward the anchor within this of GT
     presence_dropout: float = .25
     contrast: float = 1.4  # log-uniform contrast factor in [1/c, c]
     brightness: float = .1
@@ -82,23 +68,20 @@ class IdentitySampling:
     lateral_fraction: float = .1  # near earlier fresh states that had bank negatives
     lateral_memory: int = 1024
     bank_wrong_continuation_probability: float = .75
-    bank_wrong_continuation_tail: tuple = (4., 128.)
+    bank_wrong_continuation_tail: tuple = (4., 16.)
     bank_following_probability: float = 0.  # fraction of fresh draws; trainer opts in
-    query_patches: bool = False  # legacy dense-map queries remain checkpoint compatible
-    negative_near_fraction: float | None = None  # None preserves unstratified legacy draws
+    negative_near_fraction: float | None = None  # None samples without near/outer stratification
     negative_near_distance: float = 12.
     bank_coverage_probability: float = 0.  # reserved fresh slots on covered parent spans
-    seed_anchor_fallback: bool = False
-    require_departure_reference: bool = False
     prefer_long_continuations: bool = False
     decision_fraction: float = 0.  # fraction of all states reserved for matched pairs
 
     def __post_init__(self):
         if isinstance(self.rule, dict):
-            object.__setattr__(self, 'rule', ComponentRule(**{k:v for k,v in self.rule.items() if k != 'min_voxels'}))
-        fractions = (self.anchor_prob, self.presence_dropout, self.contact_fraction,
+            object.__setattr__(self, 'rule', ComponentRule(**self.rule))
+        fractions = (self.presence_dropout, self.contact_fraction,
                      self.hard_span_fraction, self.lateral_fraction)
-        if not all(0 <= f <= 1 for f in fractions) or sum(fractions[2:]) > 1:
+        if not all(0 <= f <= 1 for f in fractions) or sum(fractions[1:]) > 1:
             raise ValueError('Identity sampling probabilities must lie in [0, 1]; oversampling at most 1')
         if min(self.positives, self.negatives, self.lateral_memory) < 1 or self.contrast < 1:
             raise ValueError('Invalid identity sample counts or augmentation')
@@ -158,74 +141,34 @@ def traversal(fiber, reverse):
     return (fiber.points[::-1], fiber.length-fiber.s[::-1]) if reverse else (fiber.points, fiber.s)
 
 
-def local_frames(tangent):
-    """Head-local patch frames (columns u, v, tangent), u parallel to the head's u."""
-    t = normalize(np.asarray(tangent, np.float64))
-    u = np.array([1., 0., 0.])-t[:, :1]*t
-    fallback = np.linalg.norm(u, axis=-1) < 1e-3
-    u[fallback] = np.cross(np.array([0., 0., 1.]), t[fallback])
-    u = normalize(u)
-    return np.stack((u, np.cross(t, u), t), -1)
+def visible_points(points,crop,margin=0.):
+    points = np.asarray(points)
+    half = (crop.width-1)*crop.spacing/2-margin
+    lo = np.array([-half,-half,-crop.behind*crop.spacing+margin])
+    hi = np.array([half,half,(crop.depth-1-crop.behind)*crop.spacing-margin])
+    return np.isfinite(points).all(-1) & (points >= lo).all(-1) & (points <= hi).all(-1)
 
 
-def path_anchor(segment, travelled, cfg):
-    """Seed-segment anchors of a trace, once the head has left them behind the recent span."""
-    segment = np.asarray(segment, np.float64).reshape(-1, 3)
-    offsets = np.arange(cfg.anchor_patches)*cfg.anchor_every
-    if not cfg.anchor_patches or travelled < cfg.anchor_offset or len(segment) < 2:
-        return {}
-    arc = arclength(segment)
-    if arc[-1] < offsets[-1]+2:
-        return {}
-    tangent = interp_at(segment, arc, offsets+2)-interp_at(segment, arc, np.maximum(offsets-2, 0))
-    return dict(anchor_world=interp_at(segment, arc, offsets), anchor_tangent=normalize(tangent),
-                anchor_age=travelled-offsets)
-
-
-def seed_anchor(item, cfg):
-    """An observed original seed occupies the first anchor slot from step zero."""
-    if not item.get('seed_valid', False):
-        return {}
-    world = np.zeros((cfg.anchor_patches, 3))
-    tangent = np.zeros_like(world)
-    age = np.zeros(cfg.anchor_patches)
-    mask = np.zeros(cfg.anchor_patches, np.float32)
-    world[0], tangent[0], age[0], mask[0] = item['seed_pos'], item['seed_tangent'], item['seed_age'], 1.
-    return dict(anchor_world=world, anchor_tangent=tangent, anchor_age=age, anchor_mask=mask)
-
-
-def patch_layout(item, cfg):
-    """Recent path patches every ``patch_every`` voxels, then any seed anchors.
-
-    Tangents come from the observed path itself (toward the head); each patch
-    frame keeps the head's u axis as far as possible. Geometry is head-local.
-    """
-    if 'patch_centers' in item:
-        return item
-    P, R, H = cfg.n_patches, cfg.recent_patches, cfg.n_history
-    centers = np.zeros((P, 3))
-    tangents = np.tile([0., 0., 1.], (P, 1))
-    ages, mask, anchor = np.zeros(P), np.zeros(P, np.float32), np.zeros(P, np.float32)
-    hist, hmask = item.get('hist_local'), item.get('hmask')
-    if hist is not None:
-        hist, hmask = np.asarray(hist, np.float64), np.asarray(hmask)
-        k = np.arange(R)*cfg.patch_every+cfg.patch_every-1
-        ahead = np.where((k >= 2)[:, None], hist[np.maximum(k-2, 0)], 0.)
-        back = np.minimum(k+2, H-1)
-        behind = np.where((hmask[back] > 0)[:, None], hist[back], hist[k])
-        centers[:R], tangents[:R], ages[:R] = hist[k], ahead-behind, k+1
-        mask[:R] = hmask[k] > 0
-    if 'anchor_world' in item:
-        frame, pos = np.asarray(item['frame']), np.asarray(item['pos'])
-        centers[R:] = (item['anchor_world']-pos) @ frame
-        tangents[R:] = item['anchor_tangent'] @ frame
-        ages[R:], mask[R:], anchor[R:] = item['anchor_age'], item.get('anchor_mask', 1.), 1.
-    tangents[np.linalg.norm(tangents, axis=-1) < 1e-6] = (0., 0., 1.)
-    frames = local_frames(tangents)
-    age = np.log1p(np.minimum(ages, cfg.max_patch_age))/np.log1p(cfg.max_patch_age)
-    geometry = np.concatenate((centers/16, frames[..., 2], frames[..., 0], age[:, None], anchor[:, None]), -1)
-    item.update(patch_centers=centers, patch_frames=frames, patch_mask=mask,
-                patch_geometry=np.where(mask[:, None] > 0, geometry, 0.).astype(np.float32))
+def reference_layout(item,cfg):
+    """All reference features come from the current crop; never read remote CT."""
+    points = np.zeros((cfg.n_history+1,3),np.float32)
+    mask = np.zeros(cfg.n_history+1,bool)
+    points[:-1] = item.get('hist_local',points[:-1])
+    mask[:-1] = np.asarray(item.get('hmask',mask[:-1])).astype(bool)
+    tangent = np.zeros(3,np.float32)
+    age = 0.
+    if item.get('seed_valid',False):
+        points[-1] = (np.asarray(item['seed_pos'])-item['pos']) @ item['frame']
+        mask[-1] = True
+        tangent = np.asarray(item['seed_tangent']) @ item['frame']
+        age = float(item['seed_age'])
+    mask &= visible_points(points,cfg.fine)
+    points[~mask] = 0.
+    if not mask[-1]:
+        tangent,age = np.zeros(3,np.float32),0.
+    item.update(reference_points=points,reference_mask=mask.astype(np.float32),
+                visible_seed=points[-1:],visible_seed_mask=mask[-1:].astype(np.float32),
+                visible_seed_tangent=tangent.astype(np.float32),visible_seed_age=np.float32(age))
     return item
 
 
@@ -250,85 +193,21 @@ def contact_location(fibers, episode, side, reverse, rng, approach=24.):
 
 
 class IdentityObservationBuilder(ObservationBuilder):
-    """Adds CT patches along the committed path to the direct observations.
-
-    Tracing and training call the same ``images``. Training additionally
-    ``prepare``s each state (seed-segment anchors drawn from annotation,
-    augmentation draws) and receives identity targets from a live validated
-    path bank. Targets are sampled before any presence dropout.
-    """
-    def __init__(self, cfg: IdentityConfig, fibers=None, sampling=IdentitySampling(), *,
-                 contacts=(), hard_spans=(), augment=False, negative_bank=None,
-                 near_negative_bank=None, following_bank=None, continuation_bank=None):
+    """Crop-only visual identity supervision from the shared neighboring-path bank."""
+    def __init__(self,cfg: DirectConfig,fibers=None,sampling=IdentitySampling(),*,
+                 contacts=(),hard_spans=(),augment=False,negative_bank=None,
+                 near_negative_bank=None,following_bank=None,continuation_bank=None):
         super().__init__(cfg)
-        self.fibers, self.sampling, self.augment = fibers, sampling, augment
-        self.contacts, self.hard_spans = list(contacts), list(hard_spans)
-        self.negative_bank = negative_bank
-        self.near_negative_bank = near_negative_bank
-        self.following_bank = following_bank
-        self.continuation_bank = continuation_bank
+        self.fibers,self.sampling,self.augment = fibers,sampling,augment
+        self.contacts,self.hard_spans = list(contacts),list(hard_spans)
+        self.negative_bank,self.near_negative_bank = negative_bank,near_negative_bank
+        self.following_bank,self.continuation_bank = following_bank,continuation_bank
         self.lateral = deque(maxlen=sampling.lateral_memory)
-        self.stats = dict(patch_seconds=0., patches=0, calls=0)
-
-    def patch_inputs(self, items, vol, pool=None):
-        cfg = self.cfg
-        P, crop = cfg.n_patches, cfg.patch_crop
-        patches = np.zeros((len(items), P, crop.depth, crop.width, crop.width), np.float32)
-        reads, where = [], []
-        for j, item in enumerate(items):
-            patch_layout(item, cfg)
-            frame, pos = np.asarray(item['frame']), np.asarray(item['pos'])
-            for p in np.flatnonzero(item['patch_mask']):
-                reads.append(dict(pos=pos+frame @ item['patch_centers'][p], frame=frame @ item['patch_frames'][p]))
-                where.append((j, p))
-        started = time.perf_counter()
-        if reads:
-            values = scalar_crops(reads, vol, crop, pool).numpy()[:, 0]
-            for (j, p), value in zip(where, values):
-                patches[j, p] = value
-        self.stats['patch_seconds'] += time.perf_counter()-started
-        self.stats['patches'] += len(reads)
-        self.stats['calls'] += 1
-        stack = lambda key: torch.from_numpy(np.stack([item[key] for item in items]).astype(np.float32))
-        return dict(patches=torch.from_numpy(patches), patch_geometry=stack('patch_geometry'),
-                    patch_mask=stack('patch_mask'))
-
-    def images(self, items, vol, pool=None):
-        if self.cfg.persistent_seed:
-            for item in items:
-                item.update(seed_anchor(item, self.cfg))
-        x = super().images(items, vol, pool)
-        x.update(self.patch_inputs(items, vol, pool))
-        return x
-
-    @property
-    def pair_crop(self):
-        """Presence-only search area; CT is read in identical per-query patches."""
-        half = max((self.cfg.fine.width-1)*self.cfg.fine.spacing/2,
-                   self.sampling.rule.lateral_max+self.cfg.max_recovery_distance)
-        return replace(self.cfg.fine,width=2*int(np.ceil(half/self.cfg.fine.spacing))+1)
-
-    def query_inputs(self, items, vol, points, valid):
-        crop = self.cfg.patch_crop
-        points,valid = points.numpy(),valid.numpy()
-        patches = np.zeros((*points.shape[:2],crop.depth,crop.width,crop.width),np.float32)
-        reads,where = [],[]
-        for j,item in enumerate(items):
-            for q in np.flatnonzero(valid[j]):
-                reads.append(dict(pos=item['pos']+item['frame'] @ points[j,q],frame=item['frame']))
-                where.append((j,q))
-        if reads:
-            values = scalar_crops(reads,vol,crop).numpy()[:,0]
-            for index,value in zip(where,values):
-                patches[index] = value
-        return dict(identity_query_patches=torch.from_numpy(patches),identity_query_mask=torch.from_numpy(valid))
-
-    # -- training
 
     def decision_pair(self, sample_cfg, rng):
         from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import decision_pair
-        if not self.cfg.persistent_seed or self.negative_bank is None:
-            raise ValueError('Matched decisions require persistent seed references and a bank')
+        if self.negative_bank is None:
+            raise ValueError('Matched decisions require a bank')
         return decision_pair(self.near_negative_bank or self.negative_bank, sample_cfg, self.cfg, rng)
 
     def replace_fresh(self, sample_cfg, rng):
@@ -361,7 +240,7 @@ class IdentityObservationBuilder(ObservationBuilder):
             item = make_sample(bank.fibers[fi],t,reverse,sample_cfg,rng)
             item.update(fiber_ref=(fi,t,reverse),source=0,source_step=-1,stratum=-1,location_source=5)
             self.prepare(item,bank.fibers[fi],rng)
-            if item['patch_on_fiber'][:self.cfg.recent_patches].sum() >= 2:
+            if item['reference_on_fiber'][:-1].sum() >= 2:
                 item['_identity_prepared'] = True
                 return item
         return None
@@ -404,102 +283,71 @@ class IdentityObservationBuilder(ObservationBuilder):
         original = float(np.clip(original, 0, length))
         return dict(fiber=int(fi), t=length-original if reverse else original, reverse=reverse, source=source)
 
-    def prepare(self, item, fiber, rng):
-        """Observed seed (or legacy anchors), label geometry and augmentation draws."""
+    def prepare(self,item,fiber,rng):
+        """Build observable references and labels; annotations never become inputs."""
         if item.pop('_identity_prepared',False):
             return item
-        cfg, s = self.cfg, self.sampling
-        _, t, reverse = item['fiber_ref']
-        p, arc = traversal(fiber, reverse)
-        pos, frame = np.asarray(item['pos']), np.asarray(item['frame'])
-        local = lambda arcs: (interp_at(p, arc, np.clip(arcs, 0, fiber.length))-pos) @ frame
-        behind = np.arange(max(0., t-cfg.patch_span-8), min(fiber.length, t+2)+1e-9, .5)
-        history_curve = local(behind) if len(behind) else np.zeros((1,3))+np.inf
-        recent_indices = np.arange(cfg.recent_patches)*cfg.patch_every+cfg.patch_every-1
-        centers = np.asarray(item.get('hist_local',np.zeros((cfg.n_history,3))))[recent_indices]
-        recent_on = (np.linalg.norm(centers[:,None]-history_curve[None],axis=-1).min(1) <= s.on_fiber_tolerance)
-        recent_on &= np.asarray(item.get('hmask',np.zeros(cfg.n_history)))[recent_indices] > 0
-        anchor_offset = cfg.anchor_offset
-        if 'bank_prefix_end_t' in item:
-            # Seed anchors must precede the synthetic switch, even when its tail
-            # has displaced the entire recent-history window onto the neighbor.
-            anchor_offset = max(anchor_offset, t-item['bank_prefix_end_t']+(cfg.anchor_patches-1)*cfg.anchor_every)
-        require_reference = s.require_departure_reference and 'bank_prefix_end_t' in item and recent_on.sum() < 2
-        if cfg.persistent_seed:
-            if 'seed_valid' not in item and item.get('source', 0) in (0, 4):
-                item.update(observed_seed(pos, frame, item['hist_local'], item['hmask']))
-            # Legacy replay without a recorded seed stays reference-missing.
-            item.update(seed_anchor(item, cfg))
-        elif cfg.anchor_patches and anchor_offset <= min(t, cfg.max_patch_age) and (require_reference or rng.random() < s.anchor_prob):
-            back = rng.uniform(anchor_offset, min(t, cfg.max_patch_age))
-            arcs = t-back+np.arange(cfg.anchor_patches)*cfg.anchor_every
-            item.update(anchor_world=interp_at(p, arc, arcs), anchor_age=t-arcs,
-                        anchor_tangent=np.stack([tangent_at(p, arc, a) for a in arcs]))
-        patch_layout(item, cfg)
-        # Annotation through the fine crop (quarter-voxel), and behind it for history flags.
-        ahead = np.arange(max(0., t-24), min(fiber.length, t+40)+1e-9, .25)
-        item['identity_curve'] = local(ahead) if len(ahead) > 2 else np.zeros((0, 3))
-        centers = item['patch_centers']
-        distance = np.linalg.norm(centers[:, None]-history_curve[None], axis=-1).min(1)
-        item['patch_on_fiber'] = ((distance <= s.on_fiber_tolerance) & (item['patch_mask'] > 0)).astype(np.float32)
-        item['patch_on_fiber'][cfg.recent_patches:] = item['patch_mask'][cfg.recent_patches:]
-        if cfg.persistent_seed and item.get('seed_valid', False):
-            seed_distance = np.linalg.norm(fiber.points-np.asarray(item['seed_pos']), axis=-1).min()
-            item['patch_on_fiber'][cfg.recent_patches] *= seed_distance <= s.on_fiber_tolerance
-        item['identity_reference_valid'] = bool(item['patch_on_fiber'][:cfg.recent_patches].sum() >= 2
-            or item['patch_on_fiber'][cfg.recent_patches:].sum() >= (1 if cfg.persistent_seed else 2))
-        labels = np.concatenate((item['identity_curve'], history_curve[np.isfinite(history_curve).all(-1)]))
-        item['identity_label_z'] = ((labels @ frame.T+pos)[:, 2] if len(labels) else pos[2:3]).astype(np.float64)
+        cfg,s = self.cfg,self.sampling
+        _,t,reverse = item['fiber_ref']
+        p,arc = traversal(fiber,reverse)
+        pos,frame = np.asarray(item['pos']),np.asarray(item['frame'])
+        local = lambda arcs: (interp_at(p,arc,np.clip(arcs,0,fiber.length))-pos) @ frame
+        if 'seed_valid' not in item and item.get('source',0) in (0,4):
+            item.update(observed_seed(pos,frame,item['hist_local'],item['hmask']))
+        reference_layout(item,cfg)
+        # Sample the label curve densely enough for reference membership, including
+        # recovery offsets. Only visible references are eligible for supervision.
+        extent = max(cfg.n_history,cfg.fine.depth*cfg.fine.spacing)+16
+        curve = local(np.arange(max(0.,t-extent),min(fiber.length,t+extent)+1e-9,.25))
+        if len(curve):
+            from scipy.spatial import cKDTree
+            distance = cKDTree(curve).query(item['reference_points'])[0]
+            on = (distance <= s.on_fiber_tolerance) & item['reference_mask'].astype(bool)
+        else:
+            on = np.zeros(cfg.n_history+1,bool)
+        item['reference_on_fiber'] = on.astype(np.float32)
+        item['identity_reference_valid'] = bool(on[:-1].sum() >= 2 or on[-1])
+        # Confirmed old departures with no visible original-fiber evidence cannot
+        # be distinguished from ordinary following of the neighboring fiber.
+        item['identity_observable'] = bool(not item.get('offtrack',False) or item['identity_reference_valid'])
+        item['identity_curve'] = curve
+        visible = visible_points(curve,cfg.fine)
+        item['identity_label_z'] = (curve[visible] @ frame.T+pos)[:,2] if visible.any() else pos[2:3]
         if self.augment:
-            draw = lambda: (float(np.exp(rng.uniform(-np.log(s.contrast), np.log(s.contrast)))),
-                            float(rng.uniform(-s.brightness, s.brightness)), float(rng.uniform(0, s.noise)))
-            item.update(photometric=(draw(), draw()), drop_presence=bool(rng.random() < s.presence_dropout))
+            draw = (float(np.exp(rng.uniform(-np.log(s.contrast),np.log(s.contrast)))),
+                    float(rng.uniform(-s.brightness,s.brightness)),float(rng.uniform(0,s.noise)))
+            item.update(photometric=draw,drop_presence=bool(rng.random() < s.presence_dropout))
         item['identity_seed'] = int(rng.integers(2**63))
-        item.setdefault('location_source', 0)
+        item.setdefault('location_source',0)
         return item
 
-    def footprint_allowed(self, item, band):
-        """Holdout check of every patch read footprint and of identity label geometry."""
-        if (self.sampling.require_departure_reference and 'bank_prefix_end_t' in item
-                and not item.get('identity_reference_valid',False)):
+    def footprint_allowed(self,item,band):
+        # CT is restricted to the main crop, whose footprint FollowDataset checks.
+        # Also reject matched labels if their distinguishing seed is not visible.
+        if item.get('source') == 5 and not item['visible_seed_mask'].any():
             return False
         if band is None:
             return True
-        patch_layout(item, self.cfg)
-        pos, frame = np.asarray(item['pos']), np.asarray(item['frame'])
-        corners = crop_corners(self.cfg.patch_crop)
-        zs = [np.asarray(item.get('identity_label_z', pos[2:3]))]
-        if self.sampling.query_patches:
-            # Include presence search and the full CT receptive field around
-            # every possible query before reading any volume data.
-            pair,patch = self.pair_crop,self.cfg.patch_crop
-            footprint = replace(pair,width=pair.width+patch.width-1,
-                                depth=pair.depth+patch.depth-1,behind=pair.behind+patch.behind)
-            zs.append((pos+crop_corners(footprint) @ frame.T)[:,2])
-        for p in np.flatnonzero(item['patch_mask']):
-            world = pos+frame @ item['patch_centers'][p]+corners @ (frame @ item['patch_frames'][p]).T
-            zs.append(world[:, 2])
-        z = np.concatenate(zs)
+        z = np.asarray(item.get('identity_label_z',np.asarray(item['pos'])[2:3]))
         return not (z.min()-2 < band.hi and z.max()+2 >= band.lo)
 
-    def identity_targets(self, items, x, pair_presence=None):
+    def identity_targets(self, items, x):
         if self.negative_bank is None:
             raise ValueError('Identity supervision requires a negative bank')
         cfg, s = self.cfg, self.sampling
-        B, K, M, P = len(items), s.positives, s.negatives, cfg.n_patches
+        B, K, M, P = len(items), s.positives, s.negatives, cfg.n_history+1
         shape = (cfg.fine.depth, cfg.fine.width, cfg.fine.width)
         out = dict(positive_mask=np.zeros((B, K), np.float32), negative_mask=np.zeros((B, K, M), np.float32),
-                   identity_points=np.zeros((B, K*(1+M), 3), np.float32), patch_on_fiber=np.zeros((B, P), np.float32),
+                   identity_points=np.zeros((B, K*(1+M), 3), np.float32), reference_on_fiber=np.zeros((B, P), np.float32),
                    foreign=np.zeros((B, *shape), np.uint8), presence_dropped=np.zeros(B, np.float32),
                    location_source=np.zeros(B, np.float32), foreign_components=np.zeros(B, np.float32))
         out.update(negative_path_ids=np.full((B,K,M),-1,np.int64),negative_distance=np.zeros((B,K,M),np.float32),
-                   identity_seed_fallback=np.full(B,s.seed_anchor_fallback,bool),
                    pair_sampling_version=np.full(B,s.pair_sampling_version,np.int64),
                    negative_near_distance=np.full(B,s.negative_near_distance,np.float32))
         if self.negative_bank is not None:
             out['negative_bank_shards'] = np.zeros(B, np.int64)
-        presence = x['fine'][:, 1].numpy() if pair_presence is None else pair_presence
-        crop = cfg.fine if pair_presence is None else self.pair_crop
+        presence = x['fine'][:, 1].numpy()
+        crop = cfg.fine
         for j, item in enumerate(items):
             if 'identity_curve' not in item:
                 continue
@@ -509,10 +357,10 @@ class IdentityObservationBuilder(ObservationBuilder):
                 additional_banks=([self.near_negative_bank] if self.near_negative_bank is not None and self.near_negative_bank is not bank else ()))
             pos, pos_mask, neg, neg_mask, metadata = sample_pairs(
                 item['identity_curve'], presence[j], crop, found['local'], found['nearest'], rng,
-                positives=K, negatives=M, margin=0. if s.query_patches else (cfg.patch_crop.width-1)*cfg.fine.spacing/2,
+                positives=K, negatives=M, margin=cfg.patch_radius,
                 rule=s.rule,
-                appearance_crop=crop if s.query_patches else cfg.appearance_crop,
-                along_margin=0. if s.query_patches else (cfg.patch_crop.depth-1)*cfg.fine.spacing/2,
+                appearance_crop=cfg.fine,
+                along_margin=cfg.fine.spacing,
                 path_ids=found['path_ids'],near_fraction=s.negative_near_fraction,
                 near_distance=s.negative_near_distance,return_metadata=True)
             if bank is not None:
@@ -528,7 +376,7 @@ class IdentityObservationBuilder(ObservationBuilder):
                 out[key][j] = value
             out['positive_mask'][j], out['negative_mask'][j] = pos_mask, neg_mask
             out['identity_points'][j] = np.concatenate((pos, neg.reshape(-1, 3)))
-            out['patch_on_fiber'][j] = item['patch_on_fiber']
+            out['reference_on_fiber'][j] = item['reference_on_fiber']
             out['foreign'][j] = found['foreign']
             out['foreign_components'][j] = found['counts']['foreign_components']
             out['location_source'][j] = item.get('location_source', 0)
@@ -536,73 +384,47 @@ class IdentityObservationBuilder(ObservationBuilder):
                 self.lateral.append(item['fiber_ref'])
         return {k: torch.from_numpy(v) for k, v in out.items()}
 
-    def __call__(self, items, vol):
-        batch = super().__call__(items, vol)
-        # Rollout/monitor observation-only builders produce no identity labels.
-        # Training and embedding evaluation provide fibers and prepared curves.
+    def __call__(self,items,vol):
+        batch = super().__call__(items,vol)
         if self.fibers is None and not self.augment and not any('identity_curve' in i for i in items):
             return batch
-        x = batch['x']
-        if self.sampling.query_patches:
-            presence = scalar_crops(items,vol,self.pair_crop,presence=True).numpy()[:,0]
-            batch.update(self.identity_targets(items,x,presence))
-            valid = torch.cat((batch['positive_mask'],batch['negative_mask'].flatten(1)),1)
-            x.update(self.query_inputs(items,vol,batch['identity_points'],valid))
-        else:
-            batch.update(self.identity_targets(items, x))
-        batch['bank_tail_length'] = torch.tensor([i.get('bank_tail_length', 0.) for i in items], dtype=torch.float32)
+        batch.update(self.identity_targets(items,batch['x']))
+        batch['identity_observable'] = torch.tensor([i.get('identity_observable',True) for i in items])
+        batch['bank_tail_length'] = torch.tensor([i.get('bank_tail_length',0.) for i in items],dtype=torch.float32)
         if self.sampling.decision_fraction:
-            shape = (2, self.cfg.n_future)
-            for key, trailing in (('candidate_points', (3,)), ('candidate_mask', ()), ('candidate_labels', ())):
-                batch[key] = torch.from_numpy(np.stack([i.get(key, np.zeros((*shape, *trailing), np.float32)) for i in items]))
-            for key in ('decision_kind', 'decision_tail'):
-                batch[key] = torch.tensor([i.get(key, 0) for i in items], dtype=torch.float32)
-        if self.cfg.persistent_seed:
-            batch['seed_present'] = torch.tensor([bool(i.get('seed_valid', False)) for i in items], dtype=torch.float32)
+            shape = (2,self.cfg.n_future)
+            for key,trailing in (('candidate_points',(3,)),('candidate_mask',()),('candidate_labels',())):
+                batch[key] = torch.from_numpy(np.stack([i.get(key,np.zeros((*shape,*trailing),np.float32)) for i in items]))
+            for key in ('decision_kind','decision_tail'):
+                batch[key] = torch.tensor([i.get(key,0) for i in items],dtype=torch.float32)
+        batch['seed_present'] = batch['x']['seed_mask'].flatten()
         if self.augment:
-            x['appearance'] = x['fine'][:, :1].clone()
-            for j, item in enumerate(items):
+            for j,item in enumerate(items):
                 if 'photometric' not in item:
                     continue
                 rng = np.random.default_rng(item['identity_seed']+1)
-                crop_params, patch_params = item['photometric']
-                x['appearance'][j, 0] = torch.from_numpy(photometric(x['appearance'][j, 0].numpy(), crop_params, rng))
-                if 'identity_query_patches' in x:
-                    queries = x['identity_query_mask'][j] > 0
-                    if queries.any():
-                        x['identity_query_patches'][j,queries] = torch.from_numpy(
-                            photometric(x['identity_query_patches'][j,queries].numpy(),crop_params,rng))
-                valid = x['patch_mask'][j] > 0
-                if valid.any():
-                    x['patches'][j, valid] = torch.from_numpy(photometric(x['patches'][j, valid].numpy(), patch_params, rng))
+                batch['x']['fine'][j,0] = torch.from_numpy(photometric(batch['x']['fine'][j,0].numpy(),item['photometric'],rng))
                 if item['drop_presence']:
-                    for scale in ('fine', 'coarse'):
-                        x[scale][j, 1] = 0
+                    batch['x']['fine'][j,1] = 0
                     batch['presence_dropped'][j] = 1
         return batch
 
 
-def observation_builder(cfg, **kwargs):
-    """Inference observation builder for either direct architecture."""
-    return IdentityObservationBuilder(cfg, **kwargs) if isinstance(cfg, IdentityConfig) else ObservationBuilder(cfg)
+def observation_builder(cfg,**kwargs):
+    return IdentityObservationBuilder(cfg,**kwargs)
 
 
 class DirectTracer(ModelTracer):
-    def __init__(self, model, *args, **kwargs):
-        super().__init__(model, *args, **kwargs)
-        self.additional_crops = (model.cfg.coarse,)
-        self.observations = observation_builder(model.cfg)
-        self.path_context = isinstance(model.cfg, IdentityConfig)
+    path_context = True
 
-    def build_inputs(self, pos, frames, hist, hmask, paths=None):
-        items = [dict(pos=p, frame=f) for p, f in zip(pos, frames)]
-        if self.path_context:
-            for j, item in enumerate(items):
-                item.update(hist_local=hist[j], hmask=hmask[j])
-                if paths is not None:
-                    if self.model.cfg.persistent_seed:
-                        item.update({k: paths[j][k] for k in SEED_FIELDS if k in paths[j]})
-                        item.update(seed_anchor(item, self.model.cfg))
-                    else:
-                        item.update(path_anchor(paths[j]['seed_segment'], paths[j]['travelled'], self.model.cfg))
-        return {k: v.to(self.device) for k, v in self.observations.images(items, self.vol, self.pool).items()}
+    def __init__(self,model,*args,**kwargs):
+        super().__init__(model,*args,**kwargs)
+        self.additional_crops = ()
+        self.observations = observation_builder(model.cfg)
+
+    def build_inputs(self,pos,frames,hist,hmask,paths=None):
+        items = [dict(pos=p,frame=f,hist_local=h,hmask=m) for p,f,h,m in zip(pos,frames,hist,hmask)]
+        if paths is not None:
+            for item,path in zip(items,paths):
+                item.update({k:path[k] for k in SEED_FIELDS if k in path})
+        return {k:v.to(self.device) for k,v in self.observations.images(items,self.vol,self.pool).items()}

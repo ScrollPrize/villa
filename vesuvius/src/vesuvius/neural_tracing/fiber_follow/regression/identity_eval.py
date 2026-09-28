@@ -32,7 +32,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.regression.data import DirectTracer, IdentityObservationBuilder, traversal
 from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import identity_ranking, summarize_ranking
-from vesuvius.neural_tracing.fiber_follow.regression.model import IdentityConfig
+from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
 from vesuvius.neural_tracing.fiber_follow.regression.train import load_checkpoint, move_batch, validate_volume_source
 
 IDENTITY_VERSION = 1
@@ -183,8 +183,7 @@ def run_rollouts(args):
                           checkpoint_sha256=hashlib.sha256(Path(args.checkpoint).read_bytes()).hexdigest(),
                           split=args.split, threshold=threshold, max_len=args.max_len, subset_sha256=subset['sha256'],
                           seconds=seconds, decisions=sum(map(len, logged)), seconds_per_decision=seconds/max(1, sum(map(len, logged))),
-                          peak_gpu_gib=torch.cuda.max_memory_allocated()/2**30 if torch.cuda.is_available() else None,
-                          patch_read=dict(getattr(tracer.observations, 'stats', {})))
+                          peak_gpu_gib=torch.cuda.max_memory_allocated()/2**30 if torch.cuda.is_available() else None)
             for name, members in (('all', rows), ('ambiguous', [r for r in rows if r['ambiguous']])):
                 report[name] = dict(rollout=rollout_summary(members) if members else None, identity=identity_summary(members))
             if args.baseline_rows:
@@ -236,8 +235,6 @@ def run_embedding(args):
     manifest = read_manifest(args.manifest)
     subset = read_subset(args.subset, manifest)
     model, crop, nh, spec, ck = load_checkpoint(args.checkpoint, args.device)
-    if not isinstance(model.cfg, IdentityConfig):
-        raise ValueError('Embedding diagnostics need an identity checkpoint')
     _, val = load_split(args.fibers, manifest, spec.grid_scale)
     cfg = model.cfg
     from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
@@ -264,24 +261,27 @@ def run_embedding(args):
             item.update(fiber_ref=(row['fiber'], t, reverse), source=0, source_step=-1, stratum=-1)
             items.append(builder.prepare(item, f, rng))
     rankings, shifts = [], dict(masked=[], shuffled=[])
-    for offset in range(0, len(items), 16):
-        batch = move_batch(builder(items[offset:offset+16], vol), args.device)
+    for offset in range(0, len(items), 4):
+        batch = move_batch(builder(items[offset:offset+4], vol), args.device)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.device.startswith('cuda')):
             out = model(batch['x'], batch['hist'], batch['hmask'], queries=batch['identity_points'])
             rankings.append(identity_ranking(out, batch, cfg))
             for name in shifts:
                 x = dict(batch['x'])
+                hist,hmask = batch['hist'],batch['hmask']
                 if name == 'masked':
-                    x['patch_mask'] = torch.zeros_like(x['patch_mask'])
+                    x['seed_mask'] = torch.zeros_like(x['seed_mask'])
+                    hmask = torch.zeros_like(hmask)
                 else:
-                    x.update(patches=x['patches'].roll(1, 0), patch_geometry=x['patch_geometry'].roll(1, 0),
-                             patch_mask=x['patch_mask'].roll(1, 0))
-                other = model(x, batch['hist'], batch['hmask'])
+                    for key in ('seed','seed_mask','seed_age','seed_tangent'):
+                        x[key] = x[key].roll(1,0)
+                    hist,hmask = hist.roll(1,0),hmask.roll(1,0)
+                other = model(x,hist,hmask)
                 shifts[name].append(dict(
                     points=(other['points'][:, :4, :2]-out['points'][:, :4, :2]).float().norm(dim=-1).mean(1).cpu(),
                     confidence=(other['confidence'][:, 3]-out['confidence'][:, 3]).float().abs().cpu()))
     report = dict(identity_version=IDENTITY_VERSION, checkpoint=str(Path(args.checkpoint).resolve()), step=ck.get('step'),
-                  split=args.split, states=len(items), identity_query_patches=sampling.query_patches,
+                  split=args.split, states=len(items), reference_policy="visible_crop_only",
                   negative_lateral_max=sampling.rule.lateral_max, heldout_ranking=summarize_ranking(rankings))
     for name, values in shifts.items():
         points = torch.cat([v['points'] for v in values]).numpy()

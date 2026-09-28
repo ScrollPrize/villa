@@ -1,7 +1,7 @@
-"""Direct curve regression and bounded local correction from CT and observed history.
+"""Crop-only fiber following: residual 3-D stem, 8x2x2 tokens, full axial attention.
 
-All coordinates are trace-grid voxels, regardless of image sampling resolution.
-There is no noise process, ODE, candidate ranking, or inherited flow backbone.
+All physical coordinates are trace-grid voxels; CT samples are half a trace voxel.
+There is one visual backbone and no persistent or out-of-crop appearance memory.
 """
 from dataclasses import asdict, dataclass, field
 import math
@@ -9,51 +9,54 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.utils.checkpoint import checkpoint
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 
-ARCHITECTURE = 'direct_curve_v1'
+ARCHITECTURE = 'axial_fiber_v3'
+TOKEN_STRIDE = (8, 2, 2)  # z, y, x in input samples
+TOKEN_OFFSET = (3, 0, 0)  # centre of four stride-two stem positions
+IDENTITY_EVIDENCE_WIDTH = 8  # point/mean/min/coverage for seed and history separately
 
 
 @dataclass
 class DirectConfig:
-    fine: CropSpec = field(default_factory=lambda: CropSpec(depth=80, width=48, behind=32, spacing=.5))
-    coarse: CropSpec = field(default_factory=lambda: CropSpec(depth=88, width=32, behind=64, spacing=2.))
-    channels: int = 24
+    fine: CropSpec = field(default_factory=lambda: CropSpec(depth=120, width=101, behind=48, spacing=.5))
+    channels: int = 32
     hidden: int = 128
     heads: int = 4
     layers: int = 4
+    decoder_layers: int = 4
+    embedding: int = 32
+    activation_checkpointing: bool = False
     n_future: int = 16
     future_step: float = 1.
     n_history: int = 128
-    history_stride: int = 4
     max_recovery_distance: float = 6.
     patch_radius: float = 1.
     correction: bool = True
-    correction_limit: float = 1.  # maximum adjustment per refinement, trace voxels
+    correction_limit: float = 1.
     correction_steps: int = 2
 
     def __post_init__(self):
-        for name in ('fine', 'coarse'):
-            if isinstance(getattr(self, name), dict):
-                setattr(self, name, CropSpec(**getattr(self, name)))
-            crop = getattr(self, name)
-            if min(crop.depth, crop.width) < 8 or not 0 <= crop.behind < crop.depth:
-                raise ValueError('Image crops must be at least eight samples wide/deep with an interior origin')
-            if not math.isfinite(crop.spacing) or crop.spacing <= 0:
-                raise ValueError('Crop spacing must be positive')
-        if min(self.channels, self.hidden, self.heads, self.layers, self.n_future,
-               self.n_history, self.history_stride) < 1 or self.hidden % self.heads:
+        if isinstance(self.fine, dict):
+            self.fine = CropSpec(**self.fine)
+        c = self.fine
+        if min(c.depth, c.width) < 8 or not 0 <= c.behind < c.depth or not math.isfinite(c.spacing) or c.spacing <= 0:
+            raise ValueError('Invalid fine crop')
+        if min(self.channels, self.hidden, self.heads, self.layers, self.decoder_layers,
+               self.embedding, self.n_future, self.n_history) < 1 or self.hidden % self.heads:
             raise ValueError('Positive dimensions required; hidden must divide by heads')
         if not 0 < self.future_step <= self.max_recovery_distance or not math.isfinite(self.max_recovery_distance):
             raise ValueError('Invalid forward spacing or connection limit')
-        if not 0 < self.patch_radius < (self.fine.width-1)*self.fine.spacing/2:
+        if not 0 < self.patch_radius < (c.width-1)*c.spacing/2:
             raise ValueError('Local observation patch must fit fine crop')
         if not math.isfinite(self.correction_limit) or self.correction_limit <= 0:
-            raise ValueError('Correction limit must be finite and positive')
+            raise ValueError('Invalid correction limit')
         if not isinstance(self.correction_steps, int) or self.correction_steps < 1:
-            raise ValueError('Correction steps must be a positive integer')
-        if self.n_future*self.future_step > (self.fine.depth-self.fine.behind-1)*self.fine.spacing:
+            raise ValueError('Invalid correction steps')
+        if self.n_future*self.future_step > (c.depth-c.behind-1)*c.spacing:
             raise ValueError('Future horizon exceeds fine image')
 
     @property
@@ -62,167 +65,303 @@ class DirectConfig:
 
     @property
     def lateral_limit(self):
-        return (self.fine.width-1)*self.fine.spacing/2 - self.patch_radius
+        return (self.fine.width-1)*self.fine.spacing/2-self.patch_radius
+
+    @property
+    def token_shape(self):
+        return tuple(math.ceil(n/s) for n,s in zip((self.fine.depth,self.fine.width,self.fine.width),TOKEN_STRIDE))
 
     def to_dict(self):
         return asdict(self)
 
 
-def feature_grid(points, crop, shape, stride=1):
-    """Map physical coordinates to a strided-convolution lattice, exactly.
-
-    Padding-one, kernel-three convolutions put element i at input i*stride;
-    feature endpoints need not coincide with crop endpoints for even sizes.
-    """
+def feature_grid(points, crop, shape, stride=1, offset=(0,0,0)):
+    """Exact physical coordinates for a feature lattice (stride/offset in zyx)."""
+    if isinstance(stride, (int, float)):
+        stride = (stride,)*3
     size = points.new_tensor(tuple(reversed(shape)))
+    scale = points.new_tensor(tuple(reversed(stride)))*crop.spacing
     origin = points.new_tensor((-(crop.width-1)*crop.spacing/2,
                                 -(crop.width-1)*crop.spacing/2, -crop.behind*crop.spacing))
-    return 2*(points-origin)/(crop.spacing*stride*(size-1))-1
+    origin = origin+points.new_tensor(tuple(reversed(offset)))*crop.spacing
+    return 2*(points-origin)/(scale*(size-1).clamp_min(1))-1
 
 
-def sample_features(features, points, crop, stride=1):
-    grid = feature_grid(points.float(), crop, features.shape[-3:], stride)
-    supported = (grid.abs() <= 1).all(-1) & torch.isfinite(grid).all(-1)
-    grid = torch.where(supported[..., None], grid, 0.)
-    values = F.grid_sample(features.float(), grid[:, :, None, None], align_corners=True)
-    values = values[:, :, :, 0, 0].transpose(1, 2)
-    return torch.where(supported[..., None], values, 0.), supported
+def crop_support(points, crop):
+    """Input support, independent of the coarser contextual-feature lattice."""
+    lo = points.new_tensor((-(crop.width-1)*crop.spacing/2,)*2+(-crop.behind*crop.spacing,))
+    hi = points.new_tensor(((crop.width-1)*crop.spacing/2,)*2+((crop.depth-1-crop.behind)*crop.spacing,))
+    return torch.isfinite(points).all(-1) & (points >= lo).all(-1) & (points <= hi).all(-1)
 
 
-class ImageEncoder(nn.Module):
-    """Small image pyramid; no full-resolution decoder or history modulation."""
-    def __init__(self, channels, inputs=2):
+def sample_features(features, points, crop, stride=1, offset=(0,0,0)):
+    supported = crop_support(points, crop)
+    points = torch.where(supported[...,None], points.float(), 0.)
+    grid = feature_grid(points, crop, features.shape[-3:], stride, offset)
+    # Border extrapolation covers the half-token margins of the input crop.
+    values = F.grid_sample(features.float(), grid[:,:,None,None], padding_mode='border', align_corners=True)
+    values = values[:,:,:,0,0].transpose(1,2)
+    return torch.where(supported[...,None],values,0.), supported
+
+
+class ResidualConv(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        def stage(a, b, stride):
-            return nn.Sequential(nn.Conv3d(a, b, 3, stride=stride, padding=1, bias=False),
-                                 nn.GroupNorm(math.gcd(8, b), b), nn.SiLU(),
-                                 nn.Conv3d(b, b, 3, padding=1, bias=False),
-                                 nn.GroupNorm(math.gcd(8, b), b), nn.SiLU())
-        self.local = stage(inputs, channels, 1)
-        self.down = nn.Sequential(stage(channels, 2*channels, 2), stage(2*channels, 4*channels, 2))
+        self.net = nn.Sequential(nn.GroupNorm(math.gcd(8,channels),channels),nn.SiLU(),
+            nn.Conv3d(channels,channels,3,padding=1,bias=False),
+            nn.GroupNorm(math.gcd(8,channels),channels),nn.SiLU(),
+            nn.Conv3d(channels,channels,3,padding=1,bias=False))
 
     def forward(self, x):
-        local = self.local(x)
-        return local, self.down(local)
+        return x+self.net(x)
 
 
-class ImageContext(nn.Module):
-    def __init__(self, cfg: DirectConfig, inputs=2):
+class AxisAttention(nn.Module):
+    """Unmasked attention along one whole spatial axis of a BDHWC tensor."""
+    def __init__(self, width, heads, axis):
+        super().__init__()
+        self.heads, self.axis = heads, axis
+        self.norm = nn.LayerNorm(width)
+        self.qkv = nn.Linear(width,3*width)
+        self.projection = nn.Linear(width,width)
+
+    def forward(self, x):
+        moved = x.movedim(self.axis,-2)
+        shape = moved.shape
+        seq = self.norm(moved).reshape(-1,shape[-2],shape[-1])
+        qkv = self.qkv(seq).reshape(seq.shape[0],seq.shape[1],3,self.heads,shape[-1]//self.heads)
+        q,k,v = qkv.permute(2,0,3,1,4).unbind(0)
+        attended = F.scaled_dot_product_attention(q,k,v,dropout_p=0.,is_causal=False)
+        attended = attended.transpose(1,2).reshape_as(seq)
+        return x+self.projection(attended).reshape(shape).movedim(-2,self.axis)
+
+
+class DepthwiseConv3d(nn.Conv3d):
+    """Use NCDHW for depthwise kernels; ordinary convolutions stay channels-last."""
+    def forward(self, x):
+        # A singleton input-channel dimension makes channels-last weights also
+        # report is_contiguous(). Clone explicitly to reset those strides: cuDNN
+        # otherwise chooses its slow channels-last path despite contiguous x.
+        weight = self.weight.clone(memory_format=torch.contiguous_format)
+        return self._conv_forward(x.contiguous(), weight, self.bias)
+
+
+class PathDecoderLayer(nn.TransformerDecoderLayer):
+    """Prefer cuDNN for short queries over long, padding-masked image memory."""
+    def _mha_block(self, x, mem, attn_mask, key_padding_mask, is_causal=False):
+        if x.is_cuda:
+            # Flash does not support this padding mask in the installed PyTorch.
+            # Retain the other backends for unsupported devices/dtypes/shapes.
+            with sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
+                              SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH], set_priority=True):
+                return super()._mha_block(x, mem, attn_mask, key_padding_mask, is_causal)
+        return super()._mha_block(x, mem, attn_mask, key_padding_mask, is_causal)
+
+
+class AxialBlock(nn.Module):
+    def __init__(self, width, heads):
+        super().__init__()
+        self.axes = nn.ModuleList(AxisAttention(width,heads,a) for a in (3,2,1))
+        self.norm = nn.LayerNorm(width)
+        self.mlp = nn.Sequential(nn.Linear(width,4*width),nn.GELU(),nn.Linear(4*width,width))
+        self.local = nn.Sequential(DepthwiseConv3d(width,width,3,padding=1,groups=width),
+                                   nn.SiLU(),nn.Conv3d(width,width,1))
+
+    def forward(self, x):
+        for axis in self.axes:
+            x = axis(x)
+        x = x+self.mlp(self.norm(x))
+        return x+self.local(x.permute(0,4,1,2,3)).permute(0,2,3,4,1)
+
+
+class AxialEncoder(nn.Module):
+    def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        c, h = cfg.channels, cfg.hidden
-        self.fine_encoder = ImageEncoder(c, inputs)
-        self.coarse_encoder = ImageEncoder(c, inputs)
-        self.image_token = nn.Linear(4*c+4, h)  # features, physical xyz, scale flag
-        self.history_token = nn.Sequential(nn.Linear(2*c+6, h), nn.SiLU(), nn.Linear(h, h))
+        c,h = cfg.channels,cfg.hidden
+        self.stem = nn.Sequential(nn.Conv3d(2,c,3,padding=1,bias=False),ResidualConv(c))
+        self.down = nn.Sequential(nn.Conv3d(c,2*c,3,stride=2,padding=1,bias=False),ResidualConv(2*c),
+                                  nn.Conv3d(2*c,4*c,3,padding=1,bias=False),nn.SiLU(),ResidualConv(4*c))
+        self.compress = nn.Conv3d(4*c,h,(4,1,1),stride=(4,1,1))
+        self.position = nn.Linear(3,h)
+        # Observed path occupancy, mean age and seed occupancy. No annotation masks.
+        self.condition = nn.Linear(3,h,bias=False)
+        self.blocks = nn.ModuleList(AxialBlock(h,cfg.heads) for _ in range(cfg.layers))
+        self.norm = nn.LayerNorm(h)
+        self.dense_projection = nn.Conv3d(h,c,1)
+        self.dense_decoder = nn.Sequential(nn.Conv3d(2*c,c,3,padding=1,bias=False),
+            nn.GroupNorm(math.gcd(8,c),c),nn.SiLU(),nn.Conv3d(c,c,3,padding=1,bias=False))
+        d,y,x = torch.meshgrid(*(torch.arange(n).float() for n in cfg.token_shape),indexing='ij')
+        xyz = torch.stack((2*x,2*y,8*d+3),-1)*cfg.fine.spacing
+        xyz -= xyz.new_tensor(((cfg.fine.width-1)*cfg.fine.spacing/2,)*2+(cfg.fine.behind*cfg.fine.spacing,))
+        self.register_buffer('token_xyz',xyz.reshape(-1,3),persistent=False)
+        d,y,x = torch.meshgrid(torch.arange(cfg.fine.depth).float(),
+            torch.arange(cfg.fine.width).float(),torch.arange(cfg.fine.width).float(),indexing='ij')
+        points = torch.stack((x,y,d),-1)*cfg.fine.spacing
+        points -= points.new_tensor(((cfg.fine.width-1)*cfg.fine.spacing/2,)*2+(cfg.fine.behind*cfg.fine.spacing,))
+        self.register_buffer('decode_grid',feature_grid(points,cfg.fine,cfg.token_shape,TOKEN_STRIDE,TOKEN_OFFSET)[None],persistent=False)
 
-    def image_tokens(self, deep, crop, scale):
-        # Pool coordinates with exactly the same cells as features.
-        d, y, x = deep.shape[-3:]
-        zyx = torch.meshgrid(*(torch.arange(n, device=deep.device).float() for n in (d, y, x)), indexing='ij')
-        xyz = torch.stack((zyx[2], zyx[1], zyx[0]), 0)*4*crop.spacing
-        xyz -= xyz.new_tensor(((crop.width-1)*crop.spacing/2,
-                              (crop.width-1)*crop.spacing/2, crop.behind*crop.spacing))[:, None, None, None]
-        xyz = xyz[None].expand(len(deep), -1, -1, -1, -1)/128
-        pooled = F.avg_pool3d(torch.cat((deep.float(), xyz), 1), 2)
-        tokens = pooled.flatten(2).transpose(1, 2)
-        return self.image_token(torch.cat((tokens, torch.full_like(tokens[..., :1], scale)), -1))
-
-    def patches(self, features, points):
-        b, k, _ = points.shape
-        values, _ = sample_features(features, (points[:, :, None]+self.stencil).reshape(b, k*9, 3), self.cfg.fine)
-        return values.reshape(b, k, -1)
-
-    def path_features(self, fine, fine_deep, coarse_deep, points):
-        """Inspect the actual path at three longitudinal slices and two scales."""
-        b, k, _ = points.shape
-        local, support = sample_features(fine,
-            (points[:, :, None]+self.path_stencil).reshape(b, k*27, 3), self.cfg.fine)
-        local = torch.cat((local, support[..., None].float()), -1).reshape(b, k, -1)
-        deep_fine, fine_support = sample_features(fine_deep, points, self.cfg.fine, stride=4)
-        deep_coarse, coarse_support = sample_features(coarse_deep, points, self.cfg.coarse, stride=4)
-        return torch.cat((local, deep_fine, fine_support[..., None].float(),
-                          deep_coarse, coarse_support[..., None].float()), -1)
-
-    def encode_context(self, x, hist, hmask):
+    def conditioning(self, references, mask):
         cfg = self.cfg
-        fine, fine_deep = self.fine_encoder(x['fine'])
-        coarse, coarse_deep = self.coarse_encoder(x['coarse'])
-        valid = hmask.bool()
-        observed = torch.where(valid[..., None], hist.float(), 0.)
-        # Keep eight most recent observations, then one every four voxels.
-        indices = torch.arange(cfg.n_history, device=hist.device)
-        indices = indices[(indices < 8) | (indices % cfg.history_stride == 0)]
-        observed, valid = observed[:, indices], valid[:, indices]
-        flocal, fsupport = sample_features(fine, observed, cfg.fine)
-        clocal, csupport = sample_features(coarse, observed, cfg.coarse)
-        age = (indices.float()+1)/cfg.n_history
-        ht = self.history_token(torch.cat((flocal, clocal, observed/128,
-            age[None, :, None].expand(len(hist), -1, -1), fsupport[..., None].float(),
-            csupport[..., None].float()), -1))
-        image = torch.cat((self.image_tokens(fine_deep, cfg.fine, 0.),
-                           self.image_tokens(coarse_deep, cfg.coarse, 1.)), 1)
-        memory = torch.cat((image, ht), 1)
-        padding = torch.cat((torch.zeros(image.shape[:2], dtype=torch.bool, device=hist.device), ~valid), 1)
-        return fine, fine_deep, coarse_deep, memory, padding
+        points = torch.where(mask[...,None],references,0.).float()
+        origin = points.new_tensor((-(cfg.fine.width-1)*cfg.fine.spacing/2,)*2+(-cfg.fine.behind*cfg.fine.spacing,))
+        offset = points.new_tensor((0,0,3))*cfg.fine.spacing
+        index = torch.round((points-origin-offset)/(points.new_tensor((2,2,8))*cfg.fine.spacing)).long()
+        d,y,x = cfg.token_shape
+        index = torch.stack((index[...,0].clamp(0,x-1),index[...,1].clamp(0,y-1),index[...,2].clamp(0,d-1)),-1)
+        flat = index[...,0]+x*(index[...,1]+y*index[...,2])
+        ages = torch.arange(1,cfg.n_history+2,device=points.device).float()/cfg.n_history
+        history = mask.clone()
+        history[:,-1] = False
+        seed = mask & ~history
+        values = torch.stack((history.float(),history*ages[None],seed.float()),-1)
+        rendered = points.new_zeros(len(points),d*y*x,3).scatter_add(1,flat[...,None].expand(-1,-1,3),values)
+        count = rendered[...,:1]
+        rendered = torch.cat((count.clamp_max(1),rendered[...,1:2]/count.clamp_min(1),rendered[...,2:].clamp_max(1)),-1)
+        return rendered.reshape(len(points),d,y,x,3)
 
-class DirectFollower(ImageContext):
+    def forward(self, image, references, mask):
+        fine = self.stem(image)
+        down = self.down(fine)
+        down = F.pad(down,(0,0,0,0,0,(-down.shape[2])%4))
+        tokens = self.compress(down).permute(0,2,3,4,1)
+        tokens = tokens+self.position(self.token_xyz/16).reshape(*self.cfg.token_shape,self.cfg.hidden).to(tokens.dtype)
+        tokens = tokens+self.condition(self.conditioning(references,mask)).to(tokens.dtype)
+        for block in self.blocks:
+            if self.cfg.activation_checkpointing and self.training and torch.is_grad_enabled():
+                tokens = checkpoint(block,tokens,use_reentrant=False)
+            else:
+                tokens = block(tokens)
+        tokens = self.norm(tokens)
+        deep = tokens.permute(0,4,1,2,3)
+        low = self.dense_projection(deep)
+        up = F.grid_sample(low.float(),self.decode_grid.expand(len(image),-1,-1,-1,-1),
+                           padding_mode='border',align_corners=True).to(fine.dtype)
+        dense = fine+self.dense_decoder(torch.cat((fine,up),1))
+        return dense, deep, tokens.flatten(1,3)
+
+
+class DirectFollower(nn.Module):
     architecture = ARCHITECTURE
 
-    def __init__(self, cfg: DirectConfig, extra_query=0, extra_evidence=0):
-        super().__init__(cfg)
-        c, h = cfg.channels, cfg.hidden
-        self.query = nn.Sequential(nn.Linear(9*c+1+extra_query, h), nn.SiLU(), nn.Linear(h, h))
-        layer = nn.TransformerDecoderLayer(h, cfg.heads, 2*h, dropout=0., activation='gelu',
-                                           batch_first=True, norm_first=True)
-        self.decoder = nn.TransformerDecoder(layer, cfg.layers, norm=nn.LayerNorm(h))
-        self.coordinates = nn.Linear(h, 2)
-        nn.init.normal_(self.coordinates.weight, std=.005)
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        c,h = cfg.channels,cfg.hidden
+        self.encoder = AxialEncoder(cfg)
+        self.embedding = nn.Linear(c,cfg.embedding)
+        self.reference_token = nn.Sequential(nn.Linear(c+8,h),nn.SiLU(),nn.Linear(h,h))
+        self.query = nn.Sequential(nn.Linear(9*c+1,h),nn.SiLU(),nn.Linear(h,h))
+        layer = PathDecoderLayer(h,cfg.heads,2*h,dropout=0.,activation='gelu',batch_first=True,norm_first=True)
+        self.decoder = nn.TransformerDecoder(layer,cfg.decoder_layers,norm=nn.LayerNorm(h))
+        self.coordinates = nn.Linear(h,2)
+        nn.init.normal_(self.coordinates.weight,std=.005)
         nn.init.zeros_(self.coordinates.bias)
-        # Rich evidence: 27 local samples with support flags, plus the deep
-        # fine/coarse feature at each proposed point and its support flag.
-        evidence_width = 27*(c+1)+2*(4*c+1)+extra_evidence
+        evidence_width = 27*(c+1)+h+1
         def path_layers():
-            return [nn.Linear(h+evidence_width+3, h), nn.SiLU(),
-                    nn.TransformerEncoderLayer(h, cfg.heads, 2*h, dropout=0.,
-                        activation='gelu', batch_first=True, norm_first=True)]
+            return [nn.Linear(h+evidence_width+3,h),nn.SiLU(),nn.TransformerEncoderLayer(
+                h,cfg.heads,2*h,dropout=0.,activation='gelu',batch_first=True,norm_first=True)]
         if cfg.correction:
-            self.correction_head = nn.Sequential(*path_layers(), nn.Linear(h, 2))
-            nn.init.normal_(self.correction_head[-1].weight, std=.001)
+            self.correction_head = nn.Sequential(*path_layers(),nn.Linear(h,2))
+            nn.init.normal_(self.correction_head[-1].weight,std=.001)
             nn.init.zeros_(self.correction_head[-1].bias)
         self.path_evidence = nn.Sequential(*path_layers())
-        self.confidence_head = nn.Sequential(nn.Linear(2*h, h), nn.SiLU(), nn.Linear(h, 1))
-        stencil = torch.tensor([[a, b, 0.] for a in (-1., 0., 1.) for b in (-1., 0., 1.)])
-        self.register_buffer('stencil', stencil*cfg.patch_radius, persistent=False)
-        path_stencil = torch.tensor([[a*cfg.patch_radius, b*cfg.patch_radius, z]
-                                    for z in (-1., 0., 1.) for a in (-1., 0., 1.) for b in (-1., 0., 1.)])
-        self.register_buffer('path_stencil', path_stencil, persistent=False)
-        self.register_buffer('planes', torch.arange(1, cfg.n_future+1).float()*cfg.future_step, persistent=False)
+        self.confidence_head = nn.Sequential(nn.Linear(2*h+IDENTITY_EVIDENCE_WIDTH,h),nn.SiLU(),nn.Linear(h,1))
+        # Start neutral; candidate/prefix BCE learns how to use the comparison.
+        # Zero new columns also permit a lossless one-time checkpoint expansion.
+        with torch.no_grad():
+            self.confidence_head[0].weight[:,2*h:].zero_()
+        self.register_buffer('stencil',torch.tensor([[a,b,0.] for a in (-1.,0.,1.) for b in (-1.,0.,1.)])*cfg.patch_radius,persistent=False)
+        self.register_buffer('path_stencil',torch.tensor([[a*cfg.patch_radius,b*cfg.patch_radius,z]
+            for z in (-1.,0.,1.) for a in (-1.,0.,1.) for b in (-1.,0.,1.)]),persistent=False)
+        self.register_buffer('planes',torch.arange(1,cfg.n_future+1).float()*cfg.future_step,persistent=False)
 
     def context(self, x, hist, hmask):
-        fine, fine_deep, coarse_deep, memory, padding = self.encode_context(x, hist, hmask)
-        return dict(fine=fine, fine_deep=fine_deep, coarse_deep=coarse_deep, memory=memory, padding=padding)
+        cfg = self.cfg
+        seed = x.get('seed',hist.new_zeros(len(hist),1,3))
+        seed_mask = x.get('seed_mask',hmask.new_zeros(len(hist),1)).bool()
+        references = torch.cat((hist,seed),1)
+        mask = torch.cat((hmask.bool(),seed_mask),1) & crop_support(references,cfg.fine)
+        references = torch.where(mask[...,None],references.float(),0.)
+        dense,deep,image_tokens = self.encoder(x['fine'],references,mask)
+        local,_ = sample_features(dense,references,cfg.fine)
+        embedded = F.normalize(self.embedding(local),dim=-1)
+        embedded = torch.where(mask[...,None],embedded,0.)
+        ages = torch.arange(1,cfg.n_history+2,device=hist.device).float()[None].expand(len(hist),-1).clone()
+        ages[:,-1] = x.get('seed_age',hist.new_zeros(len(hist))).reshape(-1)
+        anchor = torch.zeros_like(ages)
+        anchor[:,-1] = 1.
+        tangent = torch.zeros_like(references)
+        tangent[:,-1] = x.get('seed_tangent',hist.new_zeros(len(hist),3))
+        metadata = torch.cat((references/16,tangent,torch.log1p(ages.clamp(0,2048))[...,None]/math.log(2049),anchor[...,None]),-1)
+        metadata = torch.where(mask[...,None],metadata,0.)
+        ref_tokens = self.reference_token(torch.cat((local,metadata),-1))
+        memory = torch.cat((image_tokens,ref_tokens.to(image_tokens.dtype)),1)
+        padding = torch.cat((torch.zeros(image_tokens.shape[:2],device=hist.device,dtype=torch.bool),~mask),1)
+        return dict(fine=dense,deep=deep,memory=memory,padding=padding,
+                    reference_embedding=embedded,reference_mask=mask)
+
+    def patches(self, fine, points):
+        b,k,_ = points.shape
+        values,_ = sample_features(fine,(points[:,:,None]+self.stencil).reshape(b,k*9,3),self.cfg.fine)
+        return values.reshape(b,k,-1)
 
     def query_features(self, ctx, initial):
-        cfg = self.cfg
-        return torch.cat((self.patches(ctx['fine'], initial), initial[..., 2:]/(cfg.n_future*cfg.future_step)), -1)
+        return torch.cat((self.patches(ctx['fine'],initial),initial[...,2:]/(self.cfg.n_future*self.cfg.future_step)),-1)
 
     def evidence(self, ctx, points, stage):
-        """Path evidence for the ``'correction'`` or ``'confidence'`` stage."""
-        return self.path_features(ctx['fine'], ctx['fine_deep'], ctx['coarse_deep'], points)
+        b,k,_ = points.shape
+        local,support = sample_features(ctx['fine'],(points[:,:,None]+self.path_stencil).reshape(b,k*27,3),self.cfg.fine)
+        local = torch.cat((local,support[...,None]),-1).reshape(b,k,-1)
+        deep,valid = sample_features(ctx['deep'],points,self.cfg.fine,TOKEN_STRIDE,TOKEN_OFFSET)
+        return torch.cat((local,deep,valid[...,None]),-1)
 
-    def forward(self, x, hist, hmask):
-        return self.predict(self.context(x, hist, hmask), hist)
+    def forward(self, x, hist, hmask, queries=None, candidates=None):
+        ctx = self.context(x,hist,hmask)
+        out = self.predict(ctx,hist,candidates)
+        out.update(reference_embedding=ctx['reference_embedding'],reference_mask=ctx['reference_mask'])
+        if queries is not None:
+            values,support = sample_features(ctx['fine'],queries,self.cfg.fine)
+            out.update(query_embedding=F.normalize(self.embedding(values),dim=-1),query_support=support)
+        return out
+
+    def identity_evidence(self, ctx, values, support):
+        """Observed-reference cosine evidence for each prefix, without GT filtering.
+
+        Keep the seed separate from potentially contaminated recent history.
+        Missing references/unsupported samples have zero evidence and explicit
+        coverage, so missing information is distinguishable from a poor match.
+        """
+        candidate = F.normalize(self.embedding(values).float(),dim=-1)
+        refs,mask = ctx['reference_embedding'].float(),ctx['reference_mask'].bool()
+        history = F.normalize((refs[:,:-1]*mask[:,:-1,None]).sum(1),dim=-1)
+        seed = F.normalize(refs[:,-1],dim=-1)
+        anchors = torch.stack((seed,history),1)
+        available = torch.stack((mask[:,-1],mask[:,:-1].any(1)),1)
+        valid = support[:,:,None] & available[:,None]
+        similarity = (candidate[:,:,None]*anchors[:,None]).sum(-1).clamp(-1.,1.)
+        similarity = torch.where(valid,similarity,0.)
+        observed = valid.float().cumsum(1)
+        mean = similarity.cumsum(1)/observed.clamp_min(1.)
+        minimum = similarity.masked_fill(~valid,torch.inf).cummin(1).values
+        minimum = torch.where(observed > 0,minimum,0.)
+        count = torch.arange(1,values.shape[1]+1,device=values.device)[None,:,None]
+        return torch.cat((similarity,mean,minimum,observed/count),-1)
 
     def confidence_logits(self, ctx, decoded, points):
         """The same prefix classifier scores predictions and supervised candidates."""
         points = points.detach()
-        evidence = self.path_evidence(torch.cat((decoded, self.evidence(ctx, points, 'confidence'),
-                                                 points/16), -1))
+        spatial = self.evidence(ctx,points,'confidence')
+        evidence = self.path_evidence(torch.cat((decoded,spatial,points/16),-1))
         count = torch.arange(1, points.shape[1]+1, device=points.device)[None, :, None]
         prefix_mean = evidence.cumsum(1)/count
         prefix_max = evidence.cummax(1).values
-        return self.confidence_head(torch.cat((prefix_mean, prefix_max), -1)).squeeze(-1).float()
+        # The 3x3x3 evidence stencil already samples the exact candidate centre.
+        # Reuse it: another grid_sample would retain a full FP32 crop for backward.
+        c = self.cfg.channels
+        centre = (len(self.path_stencil)//2)*(c+1)
+        comparison = self.identity_evidence(ctx,spatial[...,centre:centre+c],spatial[...,centre+c].bool())
+        return self.confidence_head(torch.cat((prefix_mean,prefix_max,comparison),-1)).squeeze(-1).float()
 
     def predict(self, ctx, hist, candidates=None):
         cfg = self.cfg
@@ -236,7 +375,7 @@ class DirectFollower(ImageContext):
         refinements = [points]
         if cfg.correction:
             # Train the shared refiner through each update; refresh evidence
-            # at the new coordinates while encoding both images only once.
+            # at the new coordinates while encoding the crop only once.
             for _ in range(cfg.correction_steps):
                 evidence = self.evidence(ctx, points, 'correction')
                 correction = self.correction_head(torch.cat((decoded, evidence, points/16), -1))
@@ -254,248 +393,3 @@ class DirectFollower(ImageContext):
             out['candidate_confidence_logits'] = torch.stack([
                 self.confidence_logits(ctx, decoded, curve) for curve in candidates.unbind(1)], 1)
         return out
-
-
-# ---------------------------------------------------------------- visual identity
-
-IDENTITY_ARCHITECTURE = 'direct_identity_v1'
-# Appearance convolutions as (kernel along the path, lateral kernel, lateral
-# dilation): a stem, then pre-activation residual blocks. Their receptive field
-# is exactly one history patch. Version 2 uses 9 x 41 x 41 fine samples
-# (±2 along the path, ±10 trace voxels laterally); version 1 retains 7 x 33 x 33.
-APPEARANCE_STEM = (3, 3, 1)
-APPEARANCE_BLOCKS = {
-    1: (((3, 3, 1), (3, 3, 2)), ((1, 3, 2), (1, 3, 2)), ((1, 3, 4), (1, 3, 4))),
-    2: (((3, 3, 1), (3, 3, 2)), ((3, 3, 2), (1, 3, 2)), ((1, 3, 6), (1, 3, 6))),
-}
-# Centre xyz/16, tangent and lateral axis in the head frame, log age, anchor flag.
-PATCH_GEOMETRY = 11
-
-
-def appearance_receptive_field(version=2):
-    layers = (APPEARANCE_STEM,)+tuple(layer for block in APPEARANCE_BLOCKS[version] for layer in block)
-    return 1+sum(k-1 for k, _, _ in layers), 1+sum((k-1)*d for _, k, d in layers)
-
-
-@dataclass
-class IdentityConfig(DirectConfig):
-    # Wider fine crop (±20 trace voxels) so appearance at candidates up to ±10
-    # laterally still sees a whole patch-sized receptive field.
-    fine: CropSpec = field(default_factory=lambda: CropSpec(depth=80, width=81, behind=32, spacing=.5))
-    appearance_version: int = 2
-    appearance_channels: int = 32
-    embedding: int = 32
-    patch_every: int = 4  # history voxels between recent patches
-    patch_span: int = 128  # recent history covered by patches
-    anchor_patches: int = 4  # seed-segment patches, beyond the recent span
-    anchor_every: float = 4.
-    max_patch_age: float = 2048.
-    appearance_behind: float = 4.  # dense appearance map starts this far behind the head
-    persistent_seed: bool = False  # explicit observed seed, present from the first decision
-
-    def __post_init__(self):
-        super().__post_init__()
-        if self.appearance_version not in APPEARANCE_BLOCKS:
-            raise ValueError('Unsupported appearance encoder version')
-        if min(self.appearance_channels, self.embedding, self.patch_every, self.patch_span) < 1 or self.anchor_patches < 0:
-            raise ValueError('Identity dimensions must be positive')
-        if self.patch_span > self.n_history or self.patch_span % self.patch_every:
-            raise ValueError('Recent patches must evenly cover observed history')
-        if not (0 < self.anchor_every and 0 < self.max_patch_age):
-            raise ValueError('Invalid anchor spacing or age limit')
-        if not 0 <= self.appearance_start < self.fine.behind:
-            raise ValueError('Appearance map must start behind the head, inside the fine crop')
-        if self.persistent_seed and self.anchor_patches < 1:
-            raise ValueError('Persistent seed requires at least one anchor slot')
-
-    @property
-    def patch_crop(self):
-        depth, width = appearance_receptive_field(self.appearance_version)
-        return CropSpec(depth=depth, width=width, behind=depth//2, spacing=self.fine.spacing)
-
-    @property
-    def appearance_start(self):
-        return self.fine.behind-int(round(self.appearance_behind/self.fine.spacing))
-
-    @property
-    def appearance_crop(self):
-        start = self.appearance_start
-        return CropSpec(depth=self.fine.depth-start, width=self.fine.width,
-                        behind=self.fine.behind-start, spacing=self.fine.spacing)
-
-    @property
-    def recent_patches(self):
-        return self.patch_span//self.patch_every
-
-    @property
-    def n_patches(self):
-        return self.recent_patches+self.anchor_patches
-
-    @property
-    def anchor_offset(self):
-        """Minimum anchor age: every anchor patch lies behind the recent span."""
-        return self.patch_span+(self.anchor_patches-1)*self.anchor_every+4
-
-
-class ChannelNorm(nn.Module):
-    """LayerNorm over channels at each voxel. Unlike GroupNorm it never pools
-    space, so a patch centre and the same place in a larger crop are identical."""
-    def __init__(self, channels):
-        super().__init__()
-        self.norm = nn.LayerNorm(channels)
-
-    def forward(self, x):
-        return self.norm(x.movedim(1, -1)).movedim(-1, 1)
-
-
-class AppearanceConv(nn.Module):
-    def __init__(self, a, b, along, lateral, dilation):
-        super().__init__()
-        self.conv = nn.Conv3d(a, b, (along, lateral, lateral), dilation=(1, dilation, dilation), bias=False)
-        self.padding = ((along-1)//2, (lateral-1)*dilation//2, (lateral-1)*dilation//2)
-
-    def forward(self, x, same):
-        return F.conv3d(x, self.conv.weight, None, 1, self.padding if same else 0, self.conv.dilation)
-
-
-class AppearanceBlock(nn.Module):
-    def __init__(self, channels, layers):
-        super().__init__()
-        self.norms = nn.ModuleList(ChannelNorm(channels) for _ in layers)
-        self.convs = nn.ModuleList(AppearanceConv(channels, channels, *layer) for layer in layers)
-
-    def forward(self, x, same):
-        y = x
-        for norm, conv in zip(self.norms, self.convs):
-            y = conv(F.silu(norm(y)), same)
-        if not same:
-            trim = [(a-b)//2 for a, b in zip(x.shape[2:], y.shape[2:])]
-            x = x[:, :, trim[0]:trim[0]+y.shape[2], trim[1]:trim[1]+y.shape[3], trim[2]:trim[2]+y.shape[4]]
-        return x+y
-
-
-class AppearanceEncoder(nn.Module):
-    """CT-only residual encoder, L2-normalized embedding.
-
-    ``same=True`` gives a dense map over a crop; ``same=False`` gives the single
-    embedding at the centre of an exact receptive-field patch. Both apply the
-    same arithmetic to the same samples, so their embeddings are comparable.
-    """
-    def __init__(self, channels, embedding, version=2):
-        super().__init__()
-        self.stem = AppearanceConv(1, channels, *APPEARANCE_STEM)
-        self.blocks = nn.ModuleList(AppearanceBlock(channels, layers) for layers in APPEARANCE_BLOCKS[version])
-        self.norm = ChannelNorm(channels)
-        self.head = nn.Conv3d(channels, embedding, 1)
-
-    def forward(self, x, same=True):
-        x = self.stem(x, same)
-        for block in self.blocks:
-            x = block(x, same)
-        return F.normalize(self.head(F.silu(self.norm(x))).float(), dim=1)
-
-
-class IdentityAttention(nn.Module):
-    """Appearance at proposed points queries the traced fiber's appearance tokens.
-
-    No similarity is computed by hand; a learned null token keeps attention
-    defined when no history patch is available.
-    """
-    def __init__(self, cfg):
-        super().__init__()
-        h = cfg.hidden
-        self.query = nn.Sequential(nn.Linear(cfg.embedding+4, h), nn.SiLU(), nn.Linear(h, h))
-        self.null = nn.Parameter(torch.zeros(1, 1, h))
-        self.norm = nn.LayerNorm(h)
-        self.attention = nn.MultiheadAttention(h, cfg.heads, batch_first=True)
-        self.out = nn.Sequential(nn.Linear(2*h, h), nn.SiLU(), nn.Linear(h, h))
-
-    def forward(self, embedding, points, support, tokens, mask):
-        query = self.query(torch.cat((embedding, points/16, support[..., None].float()), -1))
-        keys = torch.cat((self.null.expand(len(tokens), -1, -1).to(tokens.dtype), tokens), 1)
-        padding = torch.cat((torch.zeros_like(mask[:, :1]), ~mask), 1)
-        attended = self.attention(self.norm(query), keys, keys, key_padding_mask=padding, need_weights=False)[0]
-        return self.out(torch.cat((query, attended), -1))
-
-
-class IdentityFollower(DirectFollower):
-    """Direct follower with a CT-only visual memory of the traveled path.
-
-    ``x`` additionally holds fine CT ``patches`` (B, P, D, W, W), sized by
-    ``cfg.patch_crop``, along the committed path in each patch's own frame, their ``patch_geometry`` and
-    ``patch_mask``, and optionally an independently augmented ``appearance``
-    copy of the fine CT channel (training only). The decoder memory, the
-    correction head and the confidence head attend to the appearance tokens.
-    ``queries`` (B, N, 3) returns appearance embeddings for the identity loss.
-    Training may supply ``identity_query_patches`` (B, N, D, W, W) and
-    ``identity_query_mask`` for full CT support beyond the main crop. Both
-    query classes use the same encoder and patch geometry.
-    """
-    architecture = IDENTITY_ARCHITECTURE
-
-    def __init__(self, cfg: IdentityConfig):
-        e, h = cfg.embedding, cfg.hidden
-        super().__init__(cfg, extra_query=9*e, extra_evidence=9*e+h)
-        self.appearance = AppearanceEncoder(cfg.appearance_channels, e, cfg.appearance_version)
-        self.appearance_token = nn.Sequential(nn.Linear(e+PATCH_GEOMETRY, h), nn.SiLU(), nn.Linear(h, h))
-        if cfg.correction:
-            self.correction_identity = IdentityAttention(cfg)
-        self.confidence_identity = IdentityAttention(cfg)
-
-    def context(self, x, hist, hmask):
-        ctx = super().context(x, hist, hmask)
-        cfg = self.cfg
-        image = x['appearance'] if 'appearance' in x else x['fine'][:, :1]
-        ctx['appearance'] = self.appearance(image[:, :, cfg.appearance_start:].to(ctx['fine'].dtype))
-        patches = x['patches']
-        b, p = patches.shape[:2]
-        embedded = self.appearance(patches.reshape(b*p, 1, *patches.shape[2:]).to(ctx['fine'].dtype), same=False)
-        embedded = embedded.reshape(b, p, -1)
-        mask = x['patch_mask'].bool()
-        tokens = self.appearance_token(torch.cat((embedded, x['patch_geometry'].float()), -1))
-        ctx.update(history_embedding=embedded, patch_mask=mask, patch_tokens=tokens,
-                   memory=torch.cat((ctx['memory'], tokens.to(ctx['memory'].dtype)), 1),
-                   padding=torch.cat((ctx['padding'], ~mask), 1))
-        return ctx
-
-    def appearance_stencil(self, ctx, points):
-        b, k, _ = points.shape
-        values, support = sample_features(ctx['appearance'], (points[:, :, None]+self.stencil).reshape(b, k*9, 3),
-                                          self.cfg.appearance_crop)
-        return values.reshape(b, k, 9, -1), support.reshape(b, k, 9)
-
-    def query_features(self, ctx, initial):
-        values, _ = self.appearance_stencil(ctx, initial)
-        return torch.cat((super().query_features(ctx, initial), values.flatten(2)), -1)
-
-    def evidence(self, ctx, points, stage):
-        values, support = self.appearance_stencil(ctx, points)
-        attention = self.correction_identity if stage == 'correction' else self.confidence_identity
-        # The stencil centre (index 4) is the appearance at the point itself.
-        identity = attention(F.normalize(values[:, :, 4], dim=-1), points.float(), support[:, :, 4],
-                             ctx['patch_tokens'], ctx['patch_mask'])
-        return torch.cat((super().evidence(ctx, points, stage), values.flatten(2), identity.float()), -1)
-
-    def forward(self, x, hist, hmask, queries=None, candidates=None):
-        ctx = self.context(x, hist, hmask)
-        out = self.predict(ctx, hist, candidates)
-        out.update(history_embedding=ctx['history_embedding'], patch_mask=ctx['patch_mask'].float())
-        if queries is not None:
-            if 'identity_query_patches' in x:
-                patches = x['identity_query_patches']
-                b,q = patches.shape[:2]
-                values = self.appearance(patches.reshape(b*q,1,*patches.shape[2:]).to(ctx['fine'].dtype),same=False)
-                values = values.reshape(b,q,-1)
-                support = x['identity_query_mask'] > 0
-            else:
-                values, support = sample_features(ctx['appearance'], queries.float(), self.cfg.appearance_crop)
-            out.update(query_embedding=F.normalize(values, dim=-1), query_support=support.float())
-        return out
-
-
-def config_class(architecture):
-    return IdentityConfig if architecture == IDENTITY_ARCHITECTURE else DirectConfig
-
-
-def follower_class(architecture):
-    return IdentityFollower if architecture == IDENTITY_ARCHITECTURE else DirectFollower
