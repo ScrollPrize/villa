@@ -768,6 +768,20 @@ static cv::Vec3f nominal_loc(const cv::Vec3f &nominal, const cv::Vec3f &internal
     return nominal + cv::Vec3f(internal[0]/scale[0], internal[1]/scale[1], internal[2]);
 }
 
+namespace {
+std::atomic<bool> gStrictQuadRenderValidityDefault{false};
+} // namespace
+
+void QuadSurface::setStrictQuadRenderValidityDefault(bool enabled)
+{
+    gStrictQuadRenderValidityDefault.store(enabled, std::memory_order_relaxed);
+}
+
+bool QuadSurface::strictQuadRenderValidityDefault()
+{
+    return gStrictQuadRenderValidityDefault.load(std::memory_order_relaxed);
+}
+
 QuadSurface::QuadSurface(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &scale)
 {
     _points = std::make_unique<cv::Mat_<cv::Vec3f>>(points.clone());

@@ -183,6 +183,25 @@ QColor kollesisColor(int alpha)
 }
 constexpr qreal kKollesisRimWidthPx = 2.0;
 
+// A control point tagged break is marked the same way in the break amber,
+// with a dotted rim; the span between two consecutive break points (a gap
+// span) draws as a dotted amber line in place of the fiber's stroke.
+QColor breakColor(int alpha)
+{
+    return vc3d::line_annotation::generatedBreakColor(alpha);
+}
+
+QColor gapLineColor(int alpha)
+{
+    return vc3d::line_annotation::generatedGapLineColor(alpha);
+}
+
+QColor damagedColor(int alpha)
+{
+    return vc3d::line_annotation::generatedDamagedColor(alpha);
+}
+
+
 // A link is same-type only when both fibers carry the same known H/V tag; an
 // unknown tag on either end falls back to the cross-type colours.
 const LinkPalette& linkPalette(char hvTagA, char hvTagB, bool pending)
@@ -311,6 +330,23 @@ QPen cosmeticPen(const QColor& color, qreal width)
     return pen;
 }
 
+// Dotted, for the gap spans and the break rims: distinct from the
+// interpolated dash by form, from every fiber colour by hue.
+QPen dottedPen(const QColor& color, qreal width)
+{
+    QPen pen = cosmeticPen(color, width);
+    pen.setStyle(Qt::DotLine);
+    return pen;
+}
+
+// The map keeps the fine dots for gap runs (the dialog's longer dashes are
+// sized for its 1.5 px line; the map's cosmetic runs read better dotted).
+QPen gapPen(const QColor& color, qreal width)
+{
+    return dottedPen(color, width);
+}
+
+
 QPen interpolatedPen(const QColor& color, qreal width)
 {
     QPen pen(color);
@@ -416,16 +452,37 @@ std::vector<QImage> colourGapTiles(const vc3d::fiber_map::gaps::GapField& field,
     return images;
 }
 
-QPainterPath pathForRuns(const vc3d::fiber_map::PlacedFiber& fiber, bool traced)
+// The three run styles are mutually exclusive: a gap run is neither traced
+// nor interpolated for drawing purposes.
+enum class RunKind { Traced, Interpolated, Gap, Damaged };
+
+RunKind runKind(const vc3d::fiber_map::Run& run)
+{
+    if (run.gap) {
+        return RunKind::Gap;
+    }
+    if (run.damaged) {
+        return RunKind::Damaged;
+    }
+    return run.traced ? RunKind::Traced : RunKind::Interpolated;
+}
+
+// Drawn from displayRunPoints: a gap run and its neighbours meet exactly at
+// their shared control, every other run keeps the layout's own overlap.
+QPainterPath pathForRuns(const vc3d::fiber_map::PlacedFiber& fiber, RunKind kind)
 {
     QPainterPath path;
-    for (const vc3d::fiber_map::Run& run : fiber.runs) {
-        if (run.traced != traced || run.points.size() < 2) {
+    for (std::size_t runIndex = 0; runIndex < fiber.runs.size(); ++runIndex) {
+        if (runKind(fiber.runs[runIndex]) != kind) {
             continue;
         }
-        path.moveTo(run.points.front());
-        for (std::size_t i = 1; i < run.points.size(); ++i) {
-            path.lineTo(run.points[i]);
+        const std::vector<QPointF> points = vc3d::fiber_map::displayRunPoints(fiber, runIndex);
+        if (points.size() < 2) {
+            continue;
+        }
+        path.moveTo(points.front());
+        for (std::size_t i = 1; i < points.size(); ++i) {
+            path.lineTo(points[i]);
         }
     }
     return path;
@@ -1431,6 +1488,9 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
             input.linePoints = std::move(fiber.linePoints);
             input.tracedSegments = std::move(fiber.tracedSegments);
             input.kollesisTerminations = std::move(fiber.kollesisTerminations);
+            input.breaks = std::move(fiber.breaks);
+            input.gapSegments = std::move(fiber.gapSegments);
+            input.damagedSegments = std::move(fiber.damagedSegments);
             input.links.reserve(fiber.links.size());
             for (const auto& link : fiber.links) {
                 input.links.push_back(
@@ -2074,14 +2134,28 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         const auto entry = _entries.constFind(fiberId);
         return entry == _entries.constEnd() ? '?' : entry->fiber.hvTag;
     };
-    const auto isKollesisTermination = [this](uint64_t fiberId, int controlIndex) {
+    const auto pointFlag = [this](uint64_t fiberId, int controlIndex, auto flagsOf) {
         const auto entry = _entries.constFind(fiberId);
         if (entry == _entries.constEnd() || controlIndex < 0) {
             return false;
         }
-        const auto& flags = entry->fiber.kollesisTerminations;
+        const std::vector<bool>& flags = flagsOf(entry->fiber);
         const auto index = static_cast<std::size_t>(controlIndex);
         return index < flags.size() && flags[index];
+    };
+    const auto isKollesisTermination = [&pointFlag](uint64_t fiberId, int controlIndex) {
+        return pointFlag(fiberId, controlIndex,
+                         [](const vc3d::fiber_map::PlacedFiber& fiber) -> const std::vector<bool>& {
+                             return fiber.kollesisTerminations;
+                         });
+    };
+    // A point with both tags (an edited file) reads as the kollesis termination.
+    const auto isBreak = [&pointFlag, &isKollesisTermination](uint64_t fiberId, int controlIndex) {
+        return !isKollesisTermination(fiberId, controlIndex) &&
+               pointFlag(fiberId, controlIndex,
+                         [](const vc3d::fiber_map::PlacedFiber& fiber) -> const std::vector<bool>& {
+                             return fiber.breaks;
+                         });
     };
 
     {
@@ -2135,17 +2209,28 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         // The path items only carry geometry: clicks resolve through
         // fiberAt()'s proximity search, never through the items themselves.
         const QColor color = fiberColor(entry.fiber.hvTag, theme);
-        const QPainterPath tracedPath = pathForRuns(entry.fiber, true);
+        const QPainterPath tracedPath = pathForRuns(entry.fiber, RunKind::Traced);
         if (!tracedPath.isEmpty()) {
             entry.tracedItem = _scene->addPath(tracedPath, cosmeticPen(color, kTracedWidth));
             entry.tracedItem->setZValue(kFiberZ);
         }
-        const QPainterPath interpolatedPath = pathForRuns(entry.fiber, false);
+        const QPainterPath interpolatedPath = pathForRuns(entry.fiber, RunKind::Interpolated);
         if (!interpolatedPath.isEmpty()) {
             entry.interpolatedItem = _scene->addPath(
                 interpolatedPath,
                 interpolatedPen(tint(color, theme.surface, 0.45), kInterpolatedWidth));
             entry.interpolatedItem->setZValue(kFiberZ);
+        }
+        const QPainterPath gapPath = pathForRuns(entry.fiber, RunKind::Gap);
+        if (!gapPath.isEmpty()) {
+            entry.gapItem = _scene->addPath(gapPath, gapPen(gapLineColor(255), kTracedWidth));
+            entry.gapItem->setZValue(kFiberZ);
+        }
+        const QPainterPath damagedPath = pathForRuns(entry.fiber, RunKind::Damaged);
+        if (!damagedPath.isEmpty()) {
+            entry.damagedItem =
+                _scene->addPath(damagedPath, gapPen(damagedColor(255), kTracedWidth));
+            entry.damagedItem->setZValue(kFiberZ);
         }
 
         // Label chip at whichever fiber end sits nearest a map edge
@@ -2231,13 +2316,17 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
             const std::array<bool, 2> tagged{
                 isKollesisTermination(link.fiberA, link.cpA),
                 isKollesisTermination(link.fiberB, link.cpB)};
+            const std::array<bool, 2> broken{
+                isBreak(link.fiberA, link.cpA),
+                isBreak(link.fiberB, link.cpB)};
             std::size_t endpointIndex = 0;
             for (const QPointF& endpoint : {a, b}) {
-                const bool kollesis = tagged[endpointIndex++];
+                const bool kollesis = tagged[endpointIndex];
+                const bool breakTag = broken[endpointIndex++];
                 auto* dot = new ScaledDot(QBrush(fill),
-                                          kollesis
-                                              ? cosmeticPen(kollesisColor(245), kKollesisRimWidthPx)
-                                              : cosmeticPen(palette.pen, 1.0),
+                                          kollesis   ? cosmeticPen(kollesisColor(245), kKollesisRimWidthPx)
+                                          : breakTag ? dottedPen(breakColor(245), kKollesisRimWidthPx)
+                                                     : cosmeticPen(palette.pen, 1.0),
                                           crossingDotRadius,
                                           kMinCrossingDotPx, kMaxCrossingDotPx,
                                           crossingDotBounds,
@@ -2246,7 +2335,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
                 dot->setPos(endpoint);
                 // A tagged endpoint sits above its untagged twin where the two
                 // overlap zoomed out, so the rim stays visible.
-                dot->setZValue(kollesis ? 4.1 : 4.0);
+                dot->setZValue(kollesis || breakTag ? 4.1 : 4.0);
             }
             continue;
         }
@@ -2289,17 +2378,19 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
             linkedEndpoints.emplace(link.fiberB, link.cpB);
         }
         const QPen rim = cosmeticPen(kollesisColor(245), kKollesisRimWidthPx);
+        const QPen breakRim = dottedPen(breakColor(245), kKollesisRimWidthPx);
         const QBrush fill(Qt::NoBrush);
         for (auto entry = _entries.constBegin(); entry != _entries.constEnd(); ++entry) {
             const vc3d::fiber_map::PlacedFiber& fiber = entry->fiber;
-            for (std::size_t i = 0;
-                 i < fiber.kollesisTerminations.size() && i < fiber.controlPoints.size();
-                 ++i) {
-                if (!fiber.kollesisTerminations[i] ||
+            for (std::size_t i = 0; i < fiber.controlPoints.size(); ++i) {
+                const bool kollesis =
+                    i < fiber.kollesisTerminations.size() && fiber.kollesisTerminations[i];
+                const bool breakTag = !kollesis && i < fiber.breaks.size() && fiber.breaks[i];
+                if ((!kollesis && !breakTag) ||
                     linkedEndpoints.count({fiber.id, static_cast<int>(i)}) != 0) {
                     continue;
                 }
-                auto* dot = new ScaledDot(fill, rim, crossingDotRadius,
+                auto* dot = new ScaledDot(fill, kollesis ? rim : breakRim, crossingDotRadius,
                                           kMinCrossingDotPx, kMaxCrossingDotPx,
                                           crossingDotBounds);
                 _scene->addItem(dot);
@@ -2771,6 +2862,16 @@ void FiberMapWorkspace::paintFiberEmphasis(FiberEntry& entry,
             selected ? kInterpolatedHighlightWidth : kInterpolatedWidth));
         entry.interpolatedItem->setZValue(selected ? kHighlightZ : kFiberZ);
     }
+    if (entry.gapItem) {
+        entry.gapItem->setPen(gapPen(
+            gapLineColor(255), selected ? kTracedHighlightWidth : kTracedWidth));
+        entry.gapItem->setZValue(selected ? kHighlightZ : kFiberZ);
+    }
+    if (entry.damagedItem) {
+        entry.damagedItem->setPen(gapPen(
+            damagedColor(255), selected ? kTracedHighlightWidth : kTracedWidth));
+        entry.damagedItem->setZValue(selected ? kHighlightZ : kFiberZ);
+    }
     // The network role adds a halo behind the unchanged lines; every other
     // role removes it. The halo strokes the fiber's whole geometry (traced
     // and interpolated runs alike) in one soft ribbon.
@@ -3092,13 +3193,17 @@ void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)
     for (std::size_t i = 0; i < entry->fiber.controlPoints.size(); ++i) {
         QBrush fill(color);
         QPen rim = cosmeticPen(theme.chipInk, 1.0);
-        if (i < entry->fiber.kollesisTerminations.size() && entry->fiber.kollesisTerminations[i]) {
+        const bool kollesis =
+            i < entry->fiber.kollesisTerminations.size() && entry->fiber.kollesisTerminations[i];
+        const bool breakTag = !kollesis && i < entry->fiber.breaks.size() && entry->fiber.breaks[i];
+        if (kollesis || breakTag) {
             if (const auto linkFill = linkFillFor(fiberId, static_cast<int>(i))) {
                 fill = QBrush(*linkFill);
             } else {
                 fill = QBrush(Qt::NoBrush);
             }
-            rim = cosmeticPen(kollesisColor(255), kKollesisRimWidthPx);
+            rim = kollesis ? cosmeticPen(kollesisColor(255), kKollesisRimWidthPx)
+                           : dottedPen(breakColor(255), kKollesisRimWidthPx);
         }
         auto* dot = new ScaledDot(fill, rim,
                                   kControlDotRadiusCm * vxPerCm, kMinControlDotPx,

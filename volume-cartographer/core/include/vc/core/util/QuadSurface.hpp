@@ -339,8 +339,18 @@ public:
     // Spiral's drawn-input view opts into the stricter contract that a rendered
     // location must be backed by a complete bilinear quad. The default remains
     // false so existing QuadSurface consumers retain their current behavior.
+    //
+    // Under the legacy contract a pixel whose bilinear cell touches an invalid
+    // (-1, -1, -1) vertex is still covered, and gen() blends its coordinate
+    // toward that sentinel: along ragged mask edges those points streak across
+    // the volume toward the origin.
     void setStrictQuadRenderValidity(bool enabled) { _strictQuadRenderValidity = enabled; }
     [[nodiscard]] bool strictQuadRenderValidity() const { return _strictQuadRenderValidity; }
+    // Process-wide initial value of strictQuadRenderValidity() for surfaces
+    // constructed afterwards. Applications set it once at startup, before
+    // loading surfaces (VC3D enables it); libraries and tools keep false.
+    static void setStrictQuadRenderValidityDefault(bool enabled);
+    [[nodiscard]] static bool strictQuadRenderValidityDefault();
 
     // Convert ptr-space coordinates to absolute grid row/col.
     // ptr-space stores (col - center.x*scale.x, row - center.y*scale.y, 0).
@@ -507,7 +517,7 @@ protected:
     // Column ranges of disconnected surface components (from meta.json "components").
     // Each pair is [col_start, col_end). Empty = single contiguous surface.
     std::vector<std::pair<int,int>> _components;
-    bool _strictQuadRenderValidity = false;
+    bool _strictQuadRenderValidity = strictQuadRenderValidityDefault();
     float dpi_ = 0.f;
 
 private:

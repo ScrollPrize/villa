@@ -30,6 +30,8 @@ import cv2
 import numpy as np
 import tifffile
 
+from surface_orientation import METADATA_KEY as LAYOUT_METADATA_KEY
+
 
 def concat_dir(run_dir):
     """Return the `.../meshes/*/concat` dir inside a run, or None."""
@@ -102,9 +104,15 @@ def step_from_meta(meta_path):
     return None
 
 
-def save_tifxyz(pts, out_winding_dir, uuid, step_size, voxel_um, source):
+def meta_of(winding_dir):
+    with open(os.path.join(winding_dir, "meta.json")) as f:
+        return json.load(f)
+
+
+def save_tifxyz(pts, out_winding_dir, uuid, step_size, voxel_um, source, layout_metadata):
     """Write x/y/z.tif + meta.json, mirroring spiral-fitting/tifxyz.py:save_tifxyz.
-    `pts` is (H,W,3) in x,y,z order with -1 for invalid."""
+    `pts` is (H,W,3) in x,y,z order with -1 for invalid, in the layout
+    `layout_metadata` records."""
     os.makedirs(out_winding_dir, exist_ok=True)
     tifffile.imwrite(os.path.join(out_winding_dir, "x.tif"), pts[..., 0].astype(np.float32))
     tifffile.imwrite(os.path.join(out_winding_dir, "y.tif"), pts[..., 1].astype(np.float32))
@@ -128,6 +136,8 @@ def save_tifxyz(pts, out_winding_dir, uuid, step_size, voxel_um, source):
         "uuid": uuid,
         "source": source,
     }
+    if layout_metadata is not None:
+        meta[LAYOUT_METADATA_KEY] = layout_metadata
     with open(os.path.join(out_winding_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=4)
     return area_vx2
@@ -193,6 +203,11 @@ def main():
 
         ref = next((p for d, p in wdirs if d == ref_run), wdirs[0][1])
         ref_shape = load_xyz(ref).shape[:2]
+        # Cells are merged by normalised index, so every run must share a layout.
+        ref_layout = meta_of(ref).get(LAYOUT_METADATA_KEY)
+        mixed = [p for d, p in wdirs if meta_of(p).get(LAYOUT_METADATA_KEY) != ref_layout]
+        if mixed:
+            raise SystemExit(f"{w}: runs written in different layouts: {ref} vs {mixed[0]}")
 
         stack, valids = [], []
         for d, p in wdirs:
@@ -209,7 +224,8 @@ def main():
         merged = merged.astype(np.float32)
 
         area = save_tifxyz(merged, os.path.join(args.out, w), w, step_size, voxel_um,
-                           f"merge_concat_runs {args.method} of {len(wdirs)} runs")
+                           f"merge_concat_runs {args.method} of {len(wdirs)} runs",
+                           ref_layout)
         n_pts = int((merged[..., 0] != -1).sum())
         print(f"{w}: runs={len(wdirs)} grid={ref_shape[0]}x{ref_shape[1]} "
               f"valid_pts={n_pts} max_overlap={int(n_valid.max())} area_vx2={area}")

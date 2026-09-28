@@ -7,8 +7,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -38,6 +40,32 @@ using vc::render::ChunkKey;
 using vc::render::ChunkResult;
 using vc::render::ChunkStatus;
 using vc::render::IChunkedArray;
+
+// An exception must not leave an OpenMP structured block: the runtime calls
+// std::terminate, which turned a failed chunk fetch (ChunkSampler::updateChunk
+// rethrowing the fetch error) into a core dump of the whole process. Rows record
+// the first failure here, the remaining rows are skipped, and the exception is
+// rethrown by the calling thread once the parallel region has joined.
+class ParallelFailure {
+public:
+    bool failed() const noexcept { return failed_.load(std::memory_order_relaxed); }
+
+    // Call from inside a catch handler.
+    void capture() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!first_) first_ = std::current_exception();
+        failed_.store(true, std::memory_order_relaxed);
+    }
+
+    void rethrow() {
+        if (first_) std::rethrow_exception(first_);
+    }
+
+private:
+    std::mutex mutex_;
+    std::exception_ptr first_;
+    std::atomic<bool> failed_{false};
+};
 
 VC_FORCE_INLINE bool isnan_bitwise(float f) {
     uint32_t u;
@@ -458,19 +486,26 @@ void readVolumeImpl(cv::Mat_<T>& out, IChunkedArray& cache, int level,
     if (out.size() != coords.size()) {
         out.create(coords.size());
     }
+    ParallelFailure failure;
     #pragma omp parallel
     {
         ChunkSampler<T> s(cache, level);
         #pragma omp for schedule(dynamic, 16)
         for (int y = 0; y < h; y++) {
-            const cv::Vec3f* row = coords.ptr<cv::Vec3f>(y);
-            T* outRow = out.template ptr<T>(y);
-            for (int x = 0; x < w; x++) {
-                const auto& c = row[x];
-                outRow[x] = sampleOne<T, Mode>(s, c[2], c[1], c[0]);
+            if (failure.failed()) continue;
+            try {
+                const cv::Vec3f* row = coords.ptr<cv::Vec3f>(y);
+                T* outRow = out.template ptr<T>(y);
+                for (int x = 0; x < w; x++) {
+                    const auto& c = row[x];
+                    outRow[x] = sampleOne<T, Mode>(s, c[2], c[1], c[0]);
+                }
+            } catch (...) {
+                failure.capture();
             }
         }
     }
+    failure.rethrow();
 }
 
 } // namespace
@@ -535,19 +570,26 @@ void samplePlaneImpl(cv::Mat_<uint8_t>& out, IChunkedArray& cache, int level,
                      int w, int h) {
     prefetchPlaneRegion(cache, level, origin, vx_step, vy_step, w, h);
 
+    ParallelFailure failure;
     #pragma omp parallel
     {
         ChunkSampler<uint8_t> s(cache, level);
         #pragma omp for schedule(dynamic, 16)
         for (int y = 0; y < h; y++) {
-            uint8_t* outRow = out.ptr<uint8_t>(y);
-            cv::Vec3f base = origin + vy_step * float(y);
-            for (int x = 0; x < w; x++) {
-                cv::Vec3f c = base + vx_step * float(x);
-                outRow[x] = sampleOne<uint8_t, Mode>(s, c[2], c[1], c[0]);
+            if (failure.failed()) continue;
+            try {
+                uint8_t* outRow = out.ptr<uint8_t>(y);
+                cv::Vec3f base = origin + vy_step * float(y);
+                for (int x = 0; x < w; x++) {
+                    cv::Vec3f c = base + vx_step * float(x);
+                    outRow[x] = sampleOne<uint8_t, Mode>(s, c[2], c[1], c[0]);
+                }
+            } catch (...) {
+                failure.capture();
             }
         }
     }
+    failure.rethrow();
 }
 
 } // namespace
@@ -606,6 +648,7 @@ void readCompositeFastImpl(
     // Approximation: bbox of baseCoords ± numLayers * zStep in each normal direction.
     prefetchCoordsRegion(cache, level, baseCoords);
 
+    ParallelFailure failure;
     #pragma omp parallel
     {
         ChunkSampler<T> s(cache, level);
@@ -615,67 +658,73 @@ void readCompositeFastImpl(
         if (mode == AccumMode::LayerStorage) stack.values.resize(numLayers);
         #pragma omp for schedule(dynamic, 16)
         for (int y = 0; y < h; y++) {
-            const cv::Vec3f* bRow = baseCoords.ptr<cv::Vec3f>(y);
-            const cv::Vec3f* nRow = normals.ptr<cv::Vec3f>(y);
-            uint8_t* outRow = out.ptr<uint8_t>(y);
-            for (int x = 0; x < w; x++) {
-                const cv::Vec3f& base = bRow[x];
-                const cv::Vec3f& n = nRow[x];
-                if (!isfinite_bitwise(base[0]) || !isfinite_bitwise(n[0])) continue;
+            if (failure.failed()) continue;
+            try {
+                const cv::Vec3f* bRow = baseCoords.ptr<cv::Vec3f>(y);
+                const cv::Vec3f* nRow = normals.ptr<cv::Vec3f>(y);
+                uint8_t* outRow = out.ptr<uint8_t>(y);
+                for (int x = 0; x < w; x++) {
+                    const cv::Vec3f& base = bRow[x];
+                    const cv::Vec3f& n = nRow[x];
+                    if (!isfinite_bitwise(base[0]) || !isfinite_bitwise(n[0])) continue;
 
-                float accum = 0.f, mx = 0.f, mn = float(std::numeric_limits<T>::max());
-                int count = 0;
-                for (int li = 0; li < numLayers; li++) {
-                    float z = float(zStart + li) * zStep;
-                    float vx = base[0] + n[0] * z;
-                    float vy = base[1] + n[1] * z;
-                    float vz = base[2] + n[2] * z;
-                    float v = float(sampleOne<T, Mode>(s, vz, vy, vx));
-                    if (v < isoCutoff) continue;
-                    switch (mode) {
-                        case AccumMode::Max: mx = std::max(mx, v); break;
-                        case AccumMode::Min: mn = std::min(mn, v); break;
-                        case AccumMode::Mean: accum += v; break;
-                        case AccumMode::LayerStorage: stack.values[count] = v; break;
-                    }
-                    count++;
-                }
-                if (count == 0) continue;
-
-                float val = 0.f;
-                switch (mode) {
-                    case AccumMode::Max:  val = mx; break;
-                    case AccumMode::Min:  val = mn; break;
-                    case AccumMode::Mean: val = accum / float(count); break;
-                    case AccumMode::LayerStorage: {
-                        if (params.method == "median") {
-                            // partial_sort matches the other median path
-                            // (Slicing.cpp composite) and beats nth_element
-                            // at the small N we run with (<=~65).
-                            std::partial_sort(stack.values.begin(),
-                                              stack.values.begin() + count / 2 + 1,
-                                              stack.values.begin() + count);
-                            val = stack.values[count / 2];
-                        } else if (params.method == "minabs") {
-                            float best = stack.values[0];
-                            for (int i = 1; i < count; i++)
-                                if (std::abs(stack.values[i] - 127.5f) < std::abs(best - 127.5f))
-                                    best = stack.values[i];
-                            val = best;
-                        } else {
-                            // alpha / beerLambert:
-                            // the same compositors the VC3D viewer runs.
-                            stack.validCount = count;
-                            val = compositeLayerStack(stack, params);
+                    float accum = 0.f, mx = 0.f, mn = float(std::numeric_limits<T>::max());
+                    int count = 0;
+                    for (int li = 0; li < numLayers; li++) {
+                        float z = float(zStart + li) * zStep;
+                        float vx = base[0] + n[0] * z;
+                        float vy = base[1] + n[1] * z;
+                        float vz = base[2] + n[2] * z;
+                        float v = float(sampleOne<T, Mode>(s, vz, vy, vx));
+                        if (v < isoCutoff) continue;
+                        switch (mode) {
+                            case AccumMode::Max: mx = std::max(mx, v); break;
+                            case AccumMode::Min: mn = std::min(mn, v); break;
+                            case AccumMode::Mean: accum += v; break;
+                            case AccumMode::LayerStorage: stack.values[count] = v; break;
                         }
-                        break;
+                        count++;
                     }
+                    if (count == 0) continue;
+
+                    float val = 0.f;
+                    switch (mode) {
+                        case AccumMode::Max:  val = mx; break;
+                        case AccumMode::Min:  val = mn; break;
+                        case AccumMode::Mean: val = accum / float(count); break;
+                        case AccumMode::LayerStorage: {
+                            if (params.method == "median") {
+                                // partial_sort matches the other median path
+                                // (Slicing.cpp composite) and beats nth_element
+                                // at the small N we run with (<=~65).
+                                std::partial_sort(stack.values.begin(),
+                                                  stack.values.begin() + count / 2 + 1,
+                                                  stack.values.begin() + count);
+                                val = stack.values[count / 2];
+                            } else if (params.method == "minabs") {
+                                float best = stack.values[0];
+                                for (int i = 1; i < count; i++)
+                                    if (std::abs(stack.values[i] - 127.5f) < std::abs(best - 127.5f))
+                                        best = stack.values[i];
+                                val = best;
+                            } else {
+                                // alpha / beerLambert:
+                                // the same compositors the VC3D viewer runs.
+                                stack.validCount = count;
+                                val = compositeLayerStack(stack, params);
+                            }
+                            break;
+                        }
+                    }
+                    if (val < 0.f) val = 0.f; if (val > 255.f) val = 255.f;
+                    outRow[x] = uint8_t(val);
                 }
-                if (val < 0.f) val = 0.f; if (val > 255.f) val = 255.f;
-                outRow[x] = uint8_t(val);
+            } catch (...) {
+                failure.capture();
             }
         }
     }
+    failure.rethrow();
 }
 
 } // namespace
@@ -748,34 +797,41 @@ void readMultiSliceImpl(
     if (maxVx >= minVx)
         prefetchRegion(*cache, level, minVx, minVy, minVz, maxVx, maxVy, maxVz);
 
+    ParallelFailure failure;
     #pragma omp parallel
     {
         ChunkSampler<T> s(*cache, level);
         #pragma omp for schedule(dynamic, 16)
         for (int y = 0; y < h; y++) {
-            const cv::Vec3f* bRow = basePoints.ptr<cv::Vec3f>(y);
-            const cv::Vec3f* sRow = stepDirs.ptr<cv::Vec3f>(y);
-            for (int x = 0; x < w; x++) {
-                const cv::Vec3f& b = bRow[x];
-                const cv::Vec3f& d = sRow[x];
-                for (int i = 0; i < nSlices; i++) {
-                    float off = offsets[i];
-                    float vx = b[0] + d[0] * off;
-                    float vy = b[1] + d[1] * off;
-                    float vz = b[2] + d[2] * off;
-                    T val = 0;
-                    if (s.inBounds(vz, vy, vx)) {
-                        float v = s.sampleTrilinear(vz, vy, vx);
-                        if (v < 0.f) v = 0.f;
-                        float maxV = float(std::numeric_limits<T>::max());
-                        if (v > maxV) v = maxV;
-                        val = T(v + (std::is_same_v<T, uint16_t> ? 0.5f : 0.f));
+            if (failure.failed()) continue;
+            try {
+                const cv::Vec3f* bRow = basePoints.ptr<cv::Vec3f>(y);
+                const cv::Vec3f* sRow = stepDirs.ptr<cv::Vec3f>(y);
+                for (int x = 0; x < w; x++) {
+                    const cv::Vec3f& b = bRow[x];
+                    const cv::Vec3f& d = sRow[x];
+                    for (int i = 0; i < nSlices; i++) {
+                        float off = offsets[i];
+                        float vx = b[0] + d[0] * off;
+                        float vy = b[1] + d[1] * off;
+                        float vz = b[2] + d[2] * off;
+                        T val = 0;
+                        if (s.inBounds(vz, vy, vx)) {
+                            float v = s.sampleTrilinear(vz, vy, vx);
+                            if (v < 0.f) v = 0.f;
+                            float maxV = float(std::numeric_limits<T>::max());
+                            if (v > maxV) v = maxV;
+                            val = T(v + (std::is_same_v<T, uint16_t> ? 0.5f : 0.f));
+                        }
+                        out[i].template ptr<T>(y)[x] = val;
                     }
-                    out[i].template ptr<T>(y)[x] = val;
                 }
+            } catch (...) {
+                failure.capture();
             }
         }
     }
+    failure.rethrow();
 }
 
 template<typename T>
