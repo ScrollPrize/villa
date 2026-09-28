@@ -90,12 +90,12 @@ def memory_images(items, vol, cfg, image_crop, pool=None):
         for k, obs in enumerate(observations, count-len(observations)):
             reads.append(obs); destinations.append((j, k))
             mask[j, k] = True
-            positions[j, k] = torch.as_tensor(obs['pos'], dtype=torch.float32)
-            frames[j, k] = torch.as_tensor(obs['frame'], dtype=torch.float32)
+            positions[j, k] = torch.from_numpy(np.array(obs['pos'], np.float32))  # copy: replay arrays are read-only mmaps
+            frames[j, k] = torch.from_numpy(np.array(obs['frame'], np.float32))
         if seed is not None:
             reads.append(seed); destinations.append((j, -1)); seed_valid[j] = True
-            seed_position[j] = torch.as_tensor(seed['pos'], dtype=torch.float32)
-            seed_frame[j] = torch.as_tensor(seed['frame'], dtype=torch.float32)
+            seed_position[j] = torch.from_numpy(np.array(seed['pos'], np.float32))
+            seed_frame[j] = torch.from_numpy(np.array(seed['frame'], np.float32))
     # Bound temporary source blocks for a production microbatch of sequences.
     for start in range(0, len(reads), 32):
         images = image_crop(reads[start:start+32], vol, memory_crop(cfg), pool)
