@@ -1,9 +1,4 @@
-"""Crop-only fiber following: residual 3-D stem, 8x2x2 tokens, full axial attention.
-
-All physical coordinates are trace-grid voxels; CT samples are half a trace voxel.
-The default is crop-only. Optional learned memory uses a small observation
-encoder and a bounded recurrent state, with a separate immutable seed anchor.
-"""
+"""Direct curve regression with one axial encoder and spatial observation memory."""
 from dataclasses import asdict, dataclass, field
 import math
 
@@ -15,14 +10,9 @@ from torch.utils.checkpoint import checkpoint
 
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 
-ARCHITECTURE = 'axial_fiber_v3'
-MEMORY_ARCHITECTURE = 'axial_fiber_memory_v2'
-MEMORY_ARCHITECTURE_V1 = 'axial_fiber_memory_v1'  # no probe; loadable, not trained further
-UNIFIED_ARCHITECTURE = 'axial_fiber_unified_v1'
-SPATIAL_MEMORY_ARCHITECTURE = 'axial_fiber_spatial_memory_v2'
+ARCHITECTURE = 'axial_fiber_spatial_memory_v2'
 TOKEN_STRIDE = (8, 2, 2)  # z, y, x in input samples
 TOKEN_OFFSET = (3, 0, 0)  # centre of four stride-two stem positions
-IDENTITY_EVIDENCE_WIDTH = 8  # point/mean/min/coverage for seed and history separately
 
 
 @dataclass
@@ -40,22 +30,19 @@ class DirectConfig:
     future_step: float = 1.
     n_history: int = 128
     max_recovery_distance: float = 6.
-    patch_radius: float = 1.
     correction: bool = True
     correction_limit: float = 1.
     correction_steps: int = 2
-    memory_slots: int = 0  # zero preserves the crop-only architecture and weights
-    memory_steps: int = 32  # preceding observed patches, plus the current head
+    memory_slots: int = 16  # recurrent context retained after spatial eviction
+    memory_steps: int = 32  # preceding full-crop observations, plus the current head
     memory_stride: int = 4  # reconstructed-history observation spacing in trace voxels
-    memory_patch_size: int = 17  # 8-voxel-wide patch at the production .5 spacing
     # The newest memory_grad_steps observations (and the head) backpropagate;
     # older ones are a no-grad burn-in. At least memory_steps: no burn-in.
     memory_grad_steps: int = 32
-    # Unified model: one random encoding per chronological stratum of valid
+    # One random encoding per chronological stratum of valid
     # gradient-window history, up to this budget per state. Scale by stratum
     # size for an unbiased encoder gradient. Writes keep gradients. 0: all.
     memory_encoder_grad_steps: int = 4
-    memory_version: int = 2  # 1: no probe; 2: patch memory; 3: unified; 4: spatial memory
     spatial_recent: int = 2  # always-readable observations, excluding the current crop
     spatial_archive: int = 8  # additional full observations, oldest evicted first
     spatial_retrieve: int = 2  # older observations read per candidate curve
@@ -74,52 +61,32 @@ class DirectConfig:
             raise ValueError('Positive dimensions required; hidden must divide by heads')
         if not 0 < self.future_step <= self.max_recovery_distance or not math.isfinite(self.max_recovery_distance):
             raise ValueError('Invalid forward spacing or connection limit')
-        if self.memory_version != 4 and not 0 < self.patch_radius < (c.width-1)*c.spacing/2:
-            raise ValueError('Local observation patch must fit fine crop')
         if not math.isfinite(self.correction_limit) or self.correction_limit <= 0:
             raise ValueError('Invalid correction limit')
         if not isinstance(self.correction_steps, int) or self.correction_steps < 1:
             raise ValueError('Invalid correction steps')
         if self.n_future*self.future_step > (c.depth-c.behind-1)*c.spacing:
             raise ValueError('Future horizon exceeds fine image')
-        if not isinstance(self.memory_slots, int) or self.memory_slots < 0:
-            raise ValueError('Memory slots must be a nonnegative integer')
-        if self.memory_slots:
-            if any(not isinstance(v, int) or v < 1 for v in (self.memory_steps, self.memory_stride, self.memory_grad_steps)):
-                raise ValueError('Memory sequence dimensions must be positive integers')
-            if not isinstance(self.memory_encoder_grad_steps, int) or self.memory_encoder_grad_steps < 0:
-                raise ValueError('Memory encoder gradient steps must be a nonnegative integer')
-            if self.memory_version not in (1, 2, 3, 4):
-                raise ValueError('Unknown memory version')
-            if not isinstance(self.memory_patch_size, int) or self.memory_patch_size < 5 or self.memory_patch_size % 2 != 1:
-                raise ValueError('Memory patch size must be odd and at least five')
-        if self.memory_version == 4:
-            if not self.memory_slots:
-                raise ValueError('Spatial memory requires positive memory_slots')
-            if any(not isinstance(v, int) or v < 1 for v in
-                   (self.spatial_recent, self.spatial_archive, self.spatial_retrieve)):
-                raise ValueError('Spatial memory capacities must be positive integers')
-            if self.spatial_retrieve > self.spatial_archive:
-                raise ValueError('Spatial retrieval exceeds archive capacity')
-            if self.hidden < self.channels:
-                raise ValueError('Spatial memory hidden width must cover fine feature channels')
+        if any(not isinstance(v, int) or v < 1 for v in
+               (self.memory_slots, self.memory_steps, self.memory_stride, self.memory_grad_steps,
+                self.spatial_recent, self.spatial_archive, self.spatial_retrieve)):
+            raise ValueError('Memory dimensions and capacities must be positive integers')
+        if not isinstance(self.memory_encoder_grad_steps, int) or self.memory_encoder_grad_steps < 0:
+            raise ValueError('Memory encoder gradient steps must be a nonnegative integer')
+        if self.spatial_retrieve > self.spatial_archive:
+            raise ValueError('Spatial retrieval exceeds archive capacity')
+        if self.hidden < self.channels:
+            raise ValueError('Memory hidden width must cover fine feature channels')
         if not isinstance(self.trajectory_window,int) or self.trajectory_window < 1:
             raise ValueError('Trajectory window must be a positive integer')
-        if self.trajectory_window > 1 and self.memory_version != 4:
-            raise ValueError('Trajectory windows require spatial memory')
 
     @property
     def recent_history_points(self):
         return self.n_history
 
     @property
-    def evidence_margin(self):
-        # Spatial memory samples only the queried point, including crop edges.
-        return 0. if self.memory_version == 4 else self.patch_radius
-
-    @property
     def lateral_limit(self):
-        return (self.fine.width-1)*self.fine.spacing/2-self.evidence_margin
+        return (self.fine.width-1)*self.fine.spacing/2
 
     @property
     def token_shape(self):
@@ -238,8 +205,6 @@ class AxialEncoder(nn.Module):
                                   nn.Conv3d(2*c,4*c,3,padding=1,bias=False),nn.SiLU(),ResidualConv(4*c))
         self.compress = nn.Conv3d(4*c,h,(4,1,1),stride=(4,1,1))
         self.position = nn.Linear(3,h)
-        # Observed path occupancy, mean age and seed occupancy. No annotation masks.
-        self.condition = None if cfg.memory_slots and cfg.memory_version >= 3 else nn.Linear(3,h,bias=False)
         self.blocks = nn.ModuleList(AxialBlock(h,cfg.heads) for _ in range(cfg.layers))
         self.norm = nn.LayerNorm(h)
         self.dense_projection = nn.Conv3d(h,c,1)
@@ -255,33 +220,12 @@ class AxialEncoder(nn.Module):
         points -= points.new_tensor(((cfg.fine.width-1)*cfg.fine.spacing/2,)*2+(cfg.fine.behind*cfg.fine.spacing,))
         self.register_buffer('decode_grid',feature_grid(points,cfg.fine,cfg.token_shape,TOKEN_STRIDE,TOKEN_OFFSET)[None],persistent=False)
 
-    def conditioning(self, references, mask):
-        cfg = self.cfg
-        points = torch.where(mask[...,None],references,0.).float()
-        origin = points.new_tensor((-(cfg.fine.width-1)*cfg.fine.spacing/2,)*2+(-cfg.fine.behind*cfg.fine.spacing,))
-        offset = points.new_tensor((0,0,3))*cfg.fine.spacing
-        index = torch.round((points-origin-offset)/(points.new_tensor((2,2,8))*cfg.fine.spacing)).long()
-        d,y,x = cfg.token_shape
-        index = torch.stack((index[...,0].clamp(0,x-1),index[...,1].clamp(0,y-1),index[...,2].clamp(0,d-1)),-1)
-        flat = index[...,0]+x*(index[...,1]+y*index[...,2])
-        ages = torch.arange(1,cfg.n_history+2,device=points.device).float()/cfg.n_history
-        history = mask.clone()
-        history[:,-1] = False
-        seed = mask & ~history
-        values = torch.stack((history.float(),history*ages[None],seed.float()),-1)
-        rendered = points.new_zeros(len(points),d*y*x,3).scatter_add(1,flat[...,None].expand(-1,-1,3),values)
-        count = rendered[...,:1]
-        rendered = torch.cat((count.clamp_max(1),rendered[...,1:2]/count.clamp_min(1),rendered[...,2:].clamp_max(1)),-1)
-        return rendered.reshape(len(points),d,y,x,3)
-
-    def forward(self, image, references, mask, *, checkpoint_blocks=True):
+    def forward(self, image, *, checkpoint_blocks=True):
         fine = self.stem(image)
         down = self.down(fine)
         down = F.pad(down,(0,0,0,0,0,(-down.shape[2])%4))
         tokens = self.compress(down).permute(0,2,3,4,1)
         tokens = tokens+self.position(self.token_xyz/16).reshape(*self.cfg.token_shape,self.cfg.hidden).to(tokens.dtype)
-        if self.condition is not None:
-            tokens = tokens+self.condition(self.conditioning(references,mask)).to(tokens.dtype)
         for block in self.blocks:
             if checkpoint_blocks and self.cfg.activation_checkpointing and self.training and torch.is_grad_enabled():
                 tokens = checkpoint(block,tokens,use_reentrant=False)
@@ -296,183 +240,443 @@ class AxialEncoder(nn.Module):
         return dense, deep, tokens.flatten(1,3)
 
 
-class CropFollower(nn.Module):
+def to_device(value, device):
+    # Pageable host-to-device copies synchronize the stream; pinned ones queue.
+    if torch.device(device).type == 'cuda':
+        return value.pin_memory().to(device, non_blocking=True)
+    return value.to(device)
+
+
+class _ScaleGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, scale):
+        ctx.save_for_backward(scale)
+        return value.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad*ctx.saved_tensors[0].to(grad.dtype), None
+
+
+def scale_gradient(value, scale):
+    """Identity in the forward pass; multiplies the incoming gradient by ``scale``."""
+    return _ScaleGradient.apply(value, scale)
+
+
+def stratified_history(own, budget):
+    """Sample chronological valid pairs; weights are inverse inclusion probabilities."""
+    n = len(own)
+    groups = min(n, budget)
+    selected = {}
+    for group in range(groups):
+        start, stop = group*n//groups, (group+1)*n//groups
+        # Use the checkpointed global CPU RNG. Singleton groups need no draw.
+        offset = int(torch.randint(stop-start, ())) if stop-start > 1 else 0
+        selected[own[start+offset]] = stop-start
+    return selected
+
+
+class DirectFollower(nn.Module):
+    """Point queries read full spatial observations and recurrent history."""
     architecture = ARCHITECTURE
+    memory_keys = ('slots','anchor','anchor_valid','anchor_position','anchor_frame',
+                   'bank','bank_summary','bank_valid','bank_position','bank_frame',
+                   'age','position','frame','seen')
+    # Bound full-crop activation memory for encodings without/with gradients.
+    observation_batch = (8, 1)
 
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        c,h = cfg.channels,cfg.hidden
+        c, h = cfg.channels, cfg.hidden
         self.encoder = AxialEncoder(cfg)
-        self.embedding = nn.Linear(c,cfg.embedding)
-        self.reference_token = nn.Sequential(nn.Linear(c+8,h),nn.SiLU(),nn.Linear(h,h))
-        self.query = nn.Sequential(nn.Linear(9*c+1,h),nn.SiLU(),nn.Linear(h,h))
-        layer = PathDecoderLayer(h,cfg.heads,2*h,dropout=0.,activation='gelu',batch_first=True,norm_first=True)
-        self.decoder = nn.TransformerDecoder(layer,cfg.decoder_layers,norm=nn.LayerNorm(h))
-        self.coordinates = nn.Linear(h,2)
-        nn.init.normal_(self.coordinates.weight,std=.005)
-        nn.init.zeros_(self.coordinates.bias)
-        evidence_width = 27*(c+1)+h+1
-        def path_layers():
-            return [nn.Linear(h+evidence_width+3,h),nn.SiLU(),nn.TransformerEncoderLayer(
-                h,cfg.heads,2*h,dropout=0.,activation='gelu',batch_first=True,norm_first=True)]
-        if cfg.correction:
-            self.correction_head = nn.Sequential(*path_layers(),nn.Linear(h,2))
-            nn.init.normal_(self.correction_head[-1].weight,std=.001)
-            nn.init.zeros_(self.correction_head[-1].bias)
-        self.path_evidence = nn.Sequential(*path_layers())
-        self.confidence_head = nn.Sequential(nn.Linear(2*h+IDENTITY_EVIDENCE_WIDTH,h),nn.SiLU(),nn.Linear(h,1))
-        # Start neutral; candidate/prefix BCE learns how to use the comparison.
-        # Zero new columns also permit a lossless one-time checkpoint expansion.
-        with torch.no_grad():
-            self.confidence_head[0].weight[:,2*h:].zero_()
-        self.register_buffer('stencil',torch.tensor([[a,b,0.] for a in (-1.,0.,1.) for b in (-1.,0.,1.)])*cfg.patch_radius,persistent=False)
-        self.register_buffer('path_stencil',torch.tensor([[a*cfg.patch_radius,b*cfg.patch_radius,z]
-            for z in (-1.,0.,1.) for a in (-1.,0.,1.) for b in (-1.,0.,1.)]),persistent=False)
-        self.register_buffer('planes',torch.arange(1,cfg.n_future+1).float()*cfg.future_step,persistent=False)
-        if cfg.memory_slots:
-            from .memory import LearnedMemory
-            self.recurrent_memory = LearnedMemory(cfg)
-            self.architecture = MEMORY_ARCHITECTURE if cfg.memory_version == 2 else MEMORY_ARCHITECTURE_V1
+        self.embedding = nn.Linear(c, cfg.embedding)
+        self.observation_projection = nn.Linear(c, h)
+        self.metadata = nn.Sequential(nn.Linear(13, h), nn.SiLU(), nn.Linear(h, h))
+        self.role = nn.Parameter(torch.randn(4, h)*.02)  # seed, recent, slots, visible history
+        self.initial_slots = nn.Parameter(torch.randn(cfg.memory_slots, h)*.02)
+        self.write_norm = nn.LayerNorm(h)
+        self.write_attention = nn.MultiheadAttention(h, cfg.heads, dropout=0., batch_first=True)
+        self.write_gate = nn.Linear(2*h, h)
+        self.write_proposal = nn.Linear(2*h, h)
+        nn.init.constant_(self.write_gate.bias, -2.)
+        self.query = nn.Sequential(nn.Linear(c+4, h), nn.SiLU(), nn.Linear(h, h))
+        self.identity_value = nn.Linear(c, h, bias=False)
+        self.identity_null = nn.Parameter(torch.zeros(h))
+        # Shared by geometry, confidence, supplied candidates, and per-write probes.
+        layer = PathDecoderLayer(h, cfg.heads, 2*h, dropout=0., activation='gelu',
+                                 batch_first=True, norm_first=True)
+        self.decoder = nn.TransformerDecoder(layer, cfg.decoder_layers, norm=nn.LayerNorm(h))
+        self.coordinates = nn.Linear(h, 2)
+        self.correction = nn.Linear(h, 2)
+        self.confidence_head = nn.Sequential(nn.Linear(2*h, h), nn.SiLU(), nn.Linear(h, 1))
+        self.probe_head = nn.Linear(h, 4)
+        for head in (self.coordinates, self.correction):
+            nn.init.normal_(head.weight, std=.001)
+            nn.init.zeros_(head.bias)
+        self.register_buffer('planes', torch.arange(1, cfg.n_future+1).float()*cfg.future_step, persistent=False)
 
-    def context(self, x, hist, hmask):
-        cfg = self.cfg
-        seed = x.get('seed',hist.new_zeros(len(hist),1,3))
-        seed_mask = x.get('seed_mask',hmask.new_zeros(len(hist),1)).bool()
-        references = torch.cat((hist,seed),1)
-        mask = torch.cat((hmask.bool(),seed_mask),1) & crop_support(references,cfg.fine)
-        references = torch.where(mask[...,None],references.float(),0.)
-        dense,deep,image_tokens = self.encoder(x['fine'],references,mask)
-        local,_ = sample_features(dense,references,cfg.fine)
-        embedded = F.normalize(self.embedding(local),dim=-1)
-        embedded = torch.where(mask[...,None],embedded,0.)
-        ages = torch.arange(1,cfg.n_history+2,device=hist.device).float()[None].expand(len(hist),-1).clone()
-        ages[:,-1] = x.get('seed_age',hist.new_zeros(len(hist))).reshape(-1)
-        anchor = torch.zeros_like(ages)
-        anchor[:,-1] = 1.
-        tangent = torch.zeros_like(references)
-        tangent[:,-1] = x.get('seed_tangent',hist.new_zeros(len(hist),3))
-        metadata = torch.cat((references/16,tangent,torch.log1p(ages.clamp(0,2048))[...,None]/math.log(2049),anchor[...,None]),-1)
-        metadata = torch.where(mask[...,None],metadata,0.)
-        ref_tokens = self.reference_token(torch.cat((local,metadata),-1))
-        memory = torch.cat((image_tokens,ref_tokens.to(image_tokens.dtype)),1)
-        padding = torch.cat((torch.zeros(image_tokens.shape[:2],device=hist.device,dtype=torch.bool),~mask),1)
-        return dict(fine=dense,deep=deep,memory=memory,padding=padding,
-                    reference_embedding=embedded,reference_mask=mask)
+        self.spatial_count = math.prod(cfg.token_shape)
+        # Slot zero is the current head. It is excluded when decoding that head.
+        self.capacity = 1+cfg.spatial_recent+cfg.spatial_archive
+        self.spatial_position = nn.Linear(3, h, bias=False)
+        self.summary_query = nn.Parameter(torch.randn(1, h)*.02)
+        self.summary_attention = nn.MultiheadAttention(h, cfg.heads, batch_first=True)
+        self.retrieval_query = nn.Linear(h, h, bias=False)
+        self.retrieval_key = nn.Linear(h, h, bias=False)
+        self.archive_attention = nn.MultiheadAttention(h, cfg.heads, batch_first=True)
+        self.retrieval_norm = nn.LayerNorm(h)
 
-    def patches(self, fine, points):
-        b,k,_ = points.shape
-        values,_ = sample_features(fine,(points[:,:,None]+self.stencil).reshape(b,k*9,3),self.cfg.fine)
-        return values.reshape(b,k,-1)
+    def encode(self, image, *, checkpoint_blocks=True):
+        # Appearance is independent of the claimed identity for every observation.
+        return self.encoder(image, checkpoint_blocks=checkpoint_blocks)
 
-    def query_features(self, ctx, initial):
-        return torch.cat((self.patches(ctx['fine'],initial),initial[...,2:]/(self.cfg.n_future*self.cfg.future_step)),-1)
+    def observation(self, image):
+        # The caller checkpoints this entire operation. Nested block checkpoints
+        # would recompute the axial stack a second time during backward.
+        dense, _, tokens = self.encode(image, checkpoint_blocks=False)
+        return self.observation_features(dense, tokens)
 
-    def evidence(self, ctx, points, stage):
-        b,k,_ = points.shape
-        local,support = sample_features(ctx['fine'],(points[:,:,None]+self.path_stencil).reshape(b,k*27,3),self.cfg.fine)
-        local = torch.cat((local,support[...,None]),-1).reshape(b,k,-1)
-        deep,valid = sample_features(ctx['deep'],points,self.cfg.fine,TOKEN_STRIDE,TOKEN_OFFSET)
-        return torch.cat((local,deep,valid[...,None]),-1)
+    def observation_features(self, dense, tokens):
+        # One contextual fine descriptor identifies the observed head; the grid
+        # supplies its surroundings. Keep the supervised identity feature space.
+        fine,_ = sample_features(dense, dense.new_zeros(len(dense),1,3), self.cfg.fine)
+        return torch.cat((tokens, F.pad(fine, (0,self.cfg.hidden-self.cfg.channels))),1)
 
-    def forward(self, x, hist, hmask, queries=None, candidates=None, memory=None):
-        ctx = self.context(x,hist,hmask)
-        if self.cfg.memory_slots:
-            ctx['recurrent'] = self.recurrent_memory.observe(x, memory)
-        elif memory is not None:
-            raise ValueError('Persistent memory requires a memory-enabled checkpoint')
-        out = self.predict(ctx,hist,candidates)
-        if self.cfg.memory_slots:
-            out.update({'memory_'+k: v for k,v in ctx['recurrent'].items()})
-        out.update(reference_embedding=ctx['reference_embedding'],reference_mask=ctx['reference_mask'])
-        if queries is not None:
-            values,support = sample_features(ctx['fine'],queries,self.cfg.fine)
-            out.update(query_embedding=F.normalize(self.embedding(values),dim=-1),query_support=support)
-        return out
+    def head_descriptor(self, observation):
+        return observation[...,self.spatial_count:,:self.cfg.channels]
+
+    def seed_descriptor(self, state):
+        return self.head_descriptor(state['anchor'])
+
+    def candidate_features(self, dense, points):
+        return sample_features(dense, points, self.cfg.fine)
 
     def initial_memory(self, batch, device):
-        if not self.cfg.memory_slots:
-            raise ValueError('This checkpoint has no persistent memory')
-        return self.recurrent_memory.initial_state(batch, device)
+        h, n, cap = self.cfg.hidden, self.spatial_count+1, self.capacity
+        # Use parameter precision for storage, regardless of whether the state
+        # is created inside (training) or outside (tracing) an autocast context.
+        # Otherwise the same observation is rounded differently in the two paths.
+        dtype = self.initial_slots.dtype
+        zeros = lambda *s: torch.zeros(batch,*s,device=device)
+        features = lambda *s: torch.zeros(batch,*s,device=device,dtype=dtype)
+        return dict(slots=self.initial_slots.to(device)[None].expand(batch,-1,-1).clone(),
+            anchor=features(n,h),anchor_valid=zeros().bool(),anchor_position=zeros(3),
+            anchor_frame=torch.eye(3,device=device)[None].expand(batch,-1,-1).clone(),
+            bank=features(cap,n,h),bank_summary=features(cap,h),bank_valid=zeros(cap).bool(),
+            bank_position=zeros(cap,3),bank_frame=torch.eye(3,device=device)[None,None].expand(batch,cap,-1,-1).clone(),
+            age=zeros(cap),position=zeros(3),frame=torch.eye(3,device=device)[None].expand(batch,-1,-1).clone(),
+            seen=zeros().bool())
 
-    def identity_evidence(self, ctx, values, support):
-        """Observed-reference cosine evidence for each prefix, without GT filtering.
+    def spatial_tokens(self, observation):
+        fine = self.observation_projection(self.head_descriptor(observation))
+        return torch.cat((observation[...,:self.spatial_count,:],fine),-2)
 
-        Keep the seed separate from potentially contaminated recent history.
-        Missing references/unsupported samples have zero evidence and explicit
-        coverage, so missing information is distinguishable from a poor match.
+    def located(self, observation, positions, frames, position, frame, age, role):
+        """Place full observation grids in the current query's coordinate frame."""
+        # [B,O,N,H], with explicit observation origin, orientation and age.
+        features = self.spatial_tokens(observation)
+        xyz = torch.cat((self.encoder.token_xyz,self.encoder.token_xyz.new_zeros(1,3)),0)
+        world_offset = torch.einsum('ni,boji->bonj',xyz,frames)
+        local_offset = torch.einsum('boni,bij->bonj',world_offset,frame)/16
+        pose = self.pose(positions,frames,position,frame,age)
+        return features+self.spatial_position(local_offset)+pose[:,:,None]+role
+
+    def pose(self, positions, frames, current_pos, current_frame, age):
+        delta = torch.einsum('bni,bij->bnj', positions-current_pos[:,None], current_frame)/16
+        delta = delta.sign()*torch.log1p(delta.abs())
+        rotation = torch.einsum('bji,bnjk->bnik', current_frame, frames).flatten(-2)
+        return self.metadata(torch.cat((delta, rotation, torch.log1p(age.clamp_min(0))[...,None]/8),-1))
+
+    def retained(self, state, position, frame):
+        # Only explicit head descriptors participate in pointwise InfoNCE space.
+        refs = torch.cat((self.seed_descriptor(state),self.head_descriptor(state['bank']).squeeze(-2)),1)
+        valid = torch.cat((state['anchor_valid'][:,None],state['bank_valid']),1)
+        roles = torch.cat((self.role[0:1],self.role[1:2].expand(self.capacity,-1)),0)
+        return dict(state=state,position=position,frame=frame,start=1),refs,valid,roles
+
+    def assemble_context(self, context, image_tokens, visible, mask):
+        context = dict(context)
+        context['current'] = torch.cat((image_tokens,visible),1)
+        context['current_valid'] = torch.cat((torch.ones(image_tokens.shape[:2],device=mask.device,dtype=torch.bool),mask),1)
+        return context
+
+    def visible_features(self, local, references):
+        meta = references.new_zeros(*references.shape[:2],13)
+        meta[...,:3] = references/16
+        meta[:,:-1,-1] = torch.arange(1,self.cfg.n_history+1,device=local.device).float().log1p()/8
+        return self.observation_projection(local)+self.metadata(meta)+self.role[3]
+
+    def identity_read(self, values, refs, valid, roles):
+        query = F.normalize(self.embedding(values).float(),dim=-1)
+        keys = F.normalize(self.embedding(refs).float(),dim=-1)
+        logits = torch.bmm(query,keys.transpose(1,2))/self.cfg.identity_temperature
+        logits = logits.masked_fill(~valid[:,None],-torch.inf)
+        logits = torch.cat((logits,logits.new_zeros(*logits.shape[:2],1)),-1)
+        v = self.identity_value(refs)+roles[None]
+        v = torch.cat((v,self.identity_null[None,None].expand(len(v),1,-1)),1)
+        return torch.bmm(logits.softmax(-1).to(v.dtype),v)
+
+    def encode_observation(self, image, device, gradients):
+        image = image.to(device, non_blocking=True)
+        if gradients and self.training and torch.is_grad_enabled():
+            # Retain only the spatial grid and fine head descriptor between observations.
+            return checkpoint(self.observation, image, use_reentrant=False)
+        return self.observation(image)
+
+    def schedule(self, x, state=None, probe_mask=None):
+        """CPU scheduling metadata, copied once per forward before any encoding."""
+        seed = x['memory_seed_valid'].detach().cpu().bool()
+        if state is not None:
+            seed = seed & ~state['anchor_valid'].detach().cpu()
+        return dict(active=x['memory_mask'].detach().cpu().bool(), seed=seed,
+                    probe=None if probe_mask is None else probe_mask.detach().cpu().bool())
+
+    def encode_observations(self, crops, device, gradients):
+        """Encode independent full crops (CPU views) in bounded batches.
+
+        An observation depends only on its own crop, so batching changes values
+        only by kernel rounding. Pinned loader views copy asynchronously.
         """
-        candidate = F.normalize(self.embedding(values).float(),dim=-1)
-        refs,mask = ctx['reference_embedding'].float(),ctx['reference_mask'].bool()
-        history = F.normalize((refs[:,:-1]*mask[:,:-1,None]).sum(1),dim=-1)
-        seed = F.normalize(refs[:,-1],dim=-1)
-        anchors = torch.stack((seed,history),1)
-        available = torch.stack((mask[:,-1],mask[:,:-1].any(1)),1)
-        valid = support[:,:,None] & available[:,None]
-        similarity = (candidate[:,:,None]*anchors[:,None]).sum(-1).clamp(-1.,1.)
-        similarity = torch.where(valid,similarity,0.)
-        observed = valid.float().cumsum(1)
-        mean = similarity.cumsum(1)/observed.clamp_min(1.)
-        minimum = similarity.masked_fill(~valid,torch.inf).cummin(1).values
-        minimum = torch.where(observed > 0,minimum,0.)
-        count = torch.arange(1,values.shape[1]+1,device=values.device)[None,:,None]
-        return torch.cat((similarity,mean,minimum,observed/count),-1)
+        parts = []
+        size = self.observation_batch[bool(gradients)]
+        for i in range(0, len(crops), size):
+            images = torch.stack([c.to(device, non_blocking=True) for c in crops[i:i+size]])
+            parts.append(self.encode_observation(images, device, gradients))
+        return torch.cat(parts)
 
-    def confidence_logits(self, ctx, decoded, points):
-        """The same prefix classifier scores predictions and supervised candidates."""
-        points = points.detach()
-        spatial = self.evidence(ctx,points,'confidence')
-        evidence = self.path_evidence(torch.cat((decoded,spatial,points/16),-1))
-        count = torch.arange(1, points.shape[1]+1, device=points.device)[None, :, None]
-        prefix_mean = evidence.cumsum(1)/count
-        prefix_max = evidence.cummax(1).values
-        # The 3x3x3 evidence stencil already samples the exact candidate centre.
-        # Reuse it: another grid_sample would retain a full FP32 crop for backward.
-        c = self.cfg.channels
-        centre = (len(self.path_stencil)//2)*(c+1)
-        comparison = self.identity_evidence(ctx,spatial[...,centre:centre+c],spatial[...,centre+c].bool())
-        return self.confidence_head(torch.cat((prefix_mean,prefix_max,comparison),-1)).squeeze(-1).float()
+    def observe(self, x, current, state=None, probe_mask=None, schedule=None):
+        b, t = x['memory_mask'].shape
+        device = current.device
+        schedule = self.schedule(x, state, probe_mask) if schedule is None else schedule
+        state = self.initial_memory(b,device) if state is None else state
+        active_cpu = schedule['active']
+        burn = max(0,t-self.cfg.memory_grad_steps-1)
+        # Inactive (state, step) pairs never reach memory, so they are not encoded.
+        seeds = schedule['seed'].nonzero()[:,0].tolist()
+        history = [(i,j) for j in range(t-1) for i in range(b) if active_cpu[i,j]]
+        old = [(i,j) for i,j in history if j < burn]
+        new = [(i,j) for i,j in history if j >= burn]
+        k = self.cfg.memory_encoder_grad_steps
+        detached, scale = [], None
+        if k and self.training and torch.is_grad_enabled():
+            # Sampled from the seeded global generator, so runs stay reproducible.
+            keep = {}
+            for i in range(b):
+                own = [pair for pair in new if pair[0] == i]
+                keep.update(stratified_history(own, k))
+            detached = [pair for pair in new if pair not in keep]
+            new = [pair for pair in new if pair in keep]
+            scale = torch.tensor([keep[pair] for pair in new], dtype=torch.float32)
+        index = lambda pairs: tuple(to_device(torch.tensor(v),device) for v in zip(*pairs))
+        observed = current.new_zeros(b,max(t-1,0),*current.shape[1:])
+        if old:
+            with torch.no_grad():
+                encoded = self.encode_observations([x['history_crops'][i,j] for i,j in old],device,False)
+            observed = observed.index_put(index(old),encoded)
+        if detached:
+            # Gradient-window writes still backpropagate; this encoder input does not.
+            with torch.no_grad():
+                encoded = self.encode_observations([x['history_crops'][i,j] for i,j in detached],device,False)
+            observed = observed.index_put(index(detached),encoded)
+        if seeds or new:
+            encoded = self.encode_observations([x['seed_crop'][i] for i in seeds]+
+                                               [x['history_crops'][i,j] for i,j in new],device,True)
+            if new:
+                encoded_new = encoded[len(seeds):]
+                if scale is not None:
+                    encoded_new = scale_gradient(encoded_new,to_device(scale,device)[:,None,None])
+                observed = observed.index_put(index(new),encoded_new)
+            if seeds:
+                valid_seed = torch.zeros(b,dtype=torch.bool)
+                valid_seed[seeds] = True
+                valid_seed = to_device(valid_seed,device)
+                seed = current.new_zeros(b,*current.shape[1:]).index_put(index([(i,) for i in seeds]),encoded[:len(seeds)])
+                state = dict(state)
+                state['anchor'] = torch.where(valid_seed[:,None,None],seed,state['anchor'])
+                state['anchor_position'] = torch.where(valid_seed[:,None],x['memory_seed_position'],state['anchor_position'])
+                state['anchor_frame'] = torch.where(valid_seed[:,None,None],x['memory_seed_frame'],state['anchor_frame'])
+                state['anchor_valid'] = state['anchor_valid'] | valid_seed
+        active_steps = active_cpu.any(0).tolist()
+        probe_steps = [self.training]*t if schedule['probe'] is None else schedule['probe'].any(0).tolist()
+        # Pack time-major once, instead of launching tiny contiguous copies at
+        # every write. Each step now has the same layout as the current head.
+        observed = observed.transpose(0,1).contiguous()
+        active_rows, position_rows, frame_rows = (
+            x[key].transpose(0,1).contiguous()
+            for key in ('memory_mask','memory_positions','memory_frames'))
+        probes = []
+        for j in range(t):
+            active = active_rows[j].bool()
+            if not active_steps[j]:
+                probes.append(current.new_zeros(b,4))
+                continue
+            with torch.set_grad_enabled(torch.is_grad_enabled() and j >= burn):
+                obs = current if j == t-1 else observed[j]
+                state,probe = self.write(obs,active,position_rows[j],frame_rows[j],state,
+                                        probe=self.training and j >= burn and probe_steps[j])
+            probes.append(probe)
+        return state,torch.stack(probes,1)
 
-    def predict(self, ctx, hist, candidates=None):
-        cfg = self.cfg
-        initial = hist.new_zeros(len(hist), cfg.n_future, 3)
-        initial[..., 2] = self.planes
-        query = self.query(self.query_features(ctx, initial))
-        decoded = self.decoder(query, ctx['memory'], memory_key_padding_mask=ctx['padding'])
-        if self.cfg.memory_slots:
-            decoded = self.recurrent_memory.read(decoded, ctx['recurrent'])
-        lateral = cfg.lateral_limit*torch.tanh(self.coordinates(decoded).float())
-        points = torch.cat((lateral, initial[..., 2:]), -1)
-        initial_points = points
+    def write(self, obs, active, position, frame, state, *, probe=True):
+        return self._write(obs, active, position, frame, state, probe=probe)
+
+    def write(self, obs, active, position, frame, state, *, probe=True):
+        position = torch.where(active[:,None],position,state['position'])
+        frame = torch.where(active[:,None,None],frame,state['frame'])
+        # Mask before any operation: inactive padding can contain NaN.
+        obs = torch.where(active[:,None,None],obs,0.)
+        observed = self.spatial_tokens(obs)
+        seed = self.observation_projection(self.seed_descriptor(state))
+        seed = seed*state['anchor_valid'][:,None,None]
+        seed = seed+self.pose(state['anchor_position'][:,None],state['anchor_frame'][:,None],
+            position,frame,position.new_zeros(len(obs),1))*state['anchor_valid'][:,None,None]
+        previous_pose = self.pose(state['position'][:,None],state['frame'][:,None],position,frame,position.new_zeros(len(obs),1))
+        previous_pose = previous_pose*state['seen'][:,None,None]
+        evidence = self.write_attention(self.write_norm(state['slots'])+seed+previous_pose,observed,observed,
+                                        need_weights=False)[0]
+        pair = torch.cat((state['slots'],evidence),-1)
+        slots = state['slots']+self.write_gate(pair).sigmoid()*(self.write_proposal(pair).tanh()-state['slots'])
+        head = self.observation_projection(self.head_descriptor(obs))
+        summary = self.summary_attention(self.summary_query[None]+head,observed,observed,need_weights=False)[0][:,0]
+
+        result = obs.new_zeros(len(obs),4)
+        if probe:
+            # Evaluate against pre-write evidence: no self-match to a just-added
+            # descriptor. This uses exactly the path evaluator used at inference.
+            context,refs,valid,roles = self.retained(state,position,frame)
+            context.update(start=0,current=observed,current_valid=torch.ones(observed.shape[:2],device=obs.device,dtype=torch.bool))
+            decoded = self.evaluate(obs.new_zeros(len(obs),1,3),self.head_descriptor(obs),
+                torch.ones(len(obs),1,device=obs.device,dtype=torch.bool),context,refs,valid,roles)
+            result = self.probe_head(decoded[:,0]).float()
+        updated = dict(state)
+        updated['slots'] = torch.where(active[:,None,None],slots,state['slots'])
+        for key,value in (('bank',obs),('bank_summary',summary),('bank_position',position),('bank_frame',frame)):
+            shifted = torch.cat((value[:,None].to(state[key].dtype),state[key][:,:-1]),1)
+            updated[key] = torch.where(active.reshape(len(active),*([1]*(shifted.ndim-1))),shifted,state[key])
+        updated['bank_valid'] = torch.where(active[:,None],torch.cat((active[:,None],state['bank_valid'][:,:-1]),1),state['bank_valid'])
+        updated['age'] = torch.where(active[:,None],torch.cat((state['age'].new_zeros(len(obs),1),state['age'][:,:-1]+1),1),state['age'])
+        updated.update(position=position,frame=frame,seen=state['seen'] | active)
+        return updated,result
+
+    def _decode_spatial(self, query, context):
+        state,position,frame = (context[k] for k in ('state','position','frame'))
+        b = len(query)
+        start = context['start']
+        recent = slice(start,start+self.cfg.spatial_recent)
+        archive = slice(start+self.cfg.spatial_recent,start+self.cfg.spatial_recent+self.cfg.spatial_archive)
+        seed = self.located(state['anchor'][:,None],state['anchor_position'][:,None],state['anchor_frame'][:,None],
+            position,frame,position.new_zeros(b,1),self.role[0])[:,0]
+        nearby = self.located(state['bank'][:,recent],state['bank_position'][:,recent],state['bank_frame'][:,recent],
+            position,frame,state['age'][:,recent],self.role[1]).flatten(1,2)
+        slots = state['slots']+self.role[2]+self.pose(state['position'][:,None],state['frame'][:,None],
+            position,frame,position.new_zeros(b,1))
+        tokens = torch.cat((context['current'],seed,nearby,slots),1)
+        n = self.spatial_count+1
+        valid = torch.cat((context['current_valid'],state['anchor_valid'][:,None].expand(-1,n),
+            state['bank_valid'][:,recent,None].expand(-1,-1,n).flatten(1),
+            state['seen'][:,None].expand(-1,self.cfg.memory_slots)),1)
+
+        # Cheap, seed-conditioned routing. Each path point has its own weights;
+        # the candidate reads the union approximated by its K highest-scoring
+        # observation blocks. Stable ordering resolves ties toward newer entries.
+        seed_query = self.observation_projection(self.seed_descriptor(state))*state['anchor_valid'][:,None,None]
+        query = query+seed_query
+        summaries = state['bank_summary'][:,archive]+self.pose(state['bank_position'][:,archive],
+            state['bank_frame'][:,archive],position,frame,state['age'][:,archive])+self.role[2]
+        scores = torch.bmm(self.retrieval_query(query).float(),self.retrieval_key(summaries).float().transpose(1,2))/math.sqrt(self.cfg.hidden)
+        archive_valid = state['bank_valid'][:,archive]
+        scores = scores.masked_fill(~archive_valid[:,None],-torch.inf)
+        # Null observation ensures an empty archive is finite and may be ignored.
+        weights = torch.cat((scores,scores.new_zeros(b,query.shape[1],1)),-1).softmax(-1)[...,:-1]
+        query = query+torch.bmm(weights.to(summaries.dtype),summaries)
+        selected = scores.amax(1).argsort(dim=-1,descending=True,stable=True)[:,:self.cfg.spatial_retrieve]
+        row = torch.arange(b,device=query.device)
+        reads = torch.zeros_like(query)
+        for k in range(self.cfg.spatial_retrieve):
+            index = selected[:,k]+start+self.cfg.spatial_recent
+            feature = self.located(state['bank'][row,index][:,None],state['bank_position'][row,index][:,None],
+                state['bank_frame'][row,index][:,None],position,frame,state['age'][row,index][:,None],self.role[2])[:,0]
+            read = self.archive_attention(self.retrieval_norm(query),feature,feature,need_weights=False)[0]
+            weight = weights.gather(2,selected[:,k,None,None].expand(-1,query.shape[1],1))
+            reads = reads+read*weight.to(read.dtype)
+        return self.decoder(query+reads,tokens,memory_key_padding_mask=~valid)
+
+    def evaluate(self, points, features, support, context, refs, ref_valid, roles):
+        query = self.query(torch.cat((features,support[...,None],points/16),-1))
+        query = query+self.identity_read(features,refs,ref_valid,roles)
+        if self.training and self.cfg.activation_checkpointing and torch.is_grad_enabled():
+            return checkpoint(self._decode_spatial,query,context,use_reentrant=False)
+        return self._decode_spatial(query,context)
+
+    def forward(self, x, hist, hmask, queries=None, candidates=None, memory=None, probe_mask=None,
+                candidate_mask=None):
+        # Synchronize for scheduling before queueing GPU work, not behind it.
+        schedule = self.schedule(x, memory, probe_mask)
+        # Training-only work scheduling, never an input to the evaluator. Keep
+        # whole curves whenever any point is labeled (including metric points).
+        score_candidates = None
+        if candidates is not None and candidate_mask is not None:
+            if candidate_mask.shape != candidates.shape[:-1]:
+                raise ValueError('Candidate scheduling mask must match candidate points')
+            score_candidates = candidate_mask.detach().cpu().bool().any(dim=(0,2)).tolist()
+        dense, _, image_tokens = self.encode(x['fine'])
+        current = self.observation_features(dense, image_tokens)
+        # Write the observed head once. Hypothetical candidate scoring never writes.
+        state,probes = self.observe(x,current,memory,probe_mask,schedule)
+        context,refs,ref_valid,roles = self.retained(state,state['position'],state['frame'])
+        references = torch.cat((hist,x['seed']),1)
+        mask = torch.cat((hmask.bool(),x['seed_mask'].bool()),1) & crop_support(references,self.cfg.fine)
+        references = torch.where(mask[...,None],references,0.)
+        local,_ = sample_features(dense,references,self.cfg.fine)
+        local = torch.where(mask[...,None],local,0.)
+        # The seed identity is always its immutable encoded observation, whether
+        # it remains visible or not; visible references retain spatial context.
+        reference_embedding = F.normalize(self.embedding(local).float(),dim=-1)
+        reference_embedding = torch.cat((reference_embedding[:,:-1],
+            F.normalize(self.embedding(self.seed_descriptor(state)).float(),dim=-1)),1)
+        reference_mask = torch.cat((mask[:,:-1],state['anchor_valid'][:,None]),1)
+        visible = self.visible_features(local,references)
+        context = self.assemble_context(context,image_tokens,visible,mask)
+        refs = torch.cat((refs,local[:,:-1]),1)
+        ref_valid = torch.cat((ref_valid,mask[:,:-1]),1)
+        roles = torch.cat((roles,self.role[3:4].expand(self.cfg.n_history,-1)),0)
+
+        def evaluate(points):
+            values,support = self.candidate_features(dense,points)
+            return self.evaluate(points,values,support,context,refs,ref_valid,roles)
+
+        points = hist.new_zeros(len(hist),self.cfg.n_future,3)
+        points[...,2] = self.planes
+        decoded = evaluate(points)
+        lateral = self.cfg.lateral_limit*self.coordinates(decoded).float().tanh()
+        points = torch.cat((lateral,points[...,2:]),-1)
+        initial = points
         refinements = [points]
-        if cfg.correction:
-            # Train the shared refiner through each update; refresh evidence
-            # at the new coordinates while encoding the crop only once.
-            for _ in range(cfg.correction_steps):
-                evidence = self.evidence(ctx, points, 'correction')
-                correction = self.correction_head(torch.cat((decoded, evidence, points/16), -1))
-                correction = correction.float().tanh()*(cfg.correction_limit/math.sqrt(2))
-                lateral = (lateral+correction).clamp(-cfg.lateral_limit, cfg.lateral_limit)
-                points = torch.cat((lateral, initial[..., 2:]), -1)
+        if self.cfg.correction:
+            for _ in range(self.cfg.correction_steps):
+                decoded = evaluate(points)
+                delta = self.correction(decoded).float().tanh()*(self.cfg.correction_limit/math.sqrt(2))
+                lateral = (points[...,:2]+delta).clamp(-self.cfg.lateral_limit,self.cfg.lateral_limit)
+                points = torch.cat((lateral,points[...,2:]),-1)
                 refinements.append(points)
-        # Confidence inspects the actual prediction. Its labels and coordinate
-        # sampling are detached; coordinate regression retains its own gradient.
-        logits = self.confidence_logits(ctx, decoded, points)
-        out = dict(points=points, initial_points=initial_points,
-                    refinement_points=torch.stack(refinements, 1),
-                    confidence_logits=logits, confidence=logits.sigmoid().cummin(-1).values)
+
+        def confidence(curve):
+            evidence = evaluate(curve.detach())
+            count = torch.arange(1,curve.shape[1]+1,device=curve.device)[None,:,None]
+            summary = torch.cat((evidence.cumsum(1)/count,evidence.cummax(1).values),-1)
+            return self.confidence_head(summary).squeeze(-1).float()
+
+        logits = confidence(points)
+        out = dict(points=points,initial_points=initial,refinement_points=torch.stack(refinements,1),
+            confidence_logits=logits,confidence=logits.sigmoid().cummin(-1).values,
+            reference_embedding=reference_embedding,reference_mask=reference_mask,
+            memory_probe=probes,**{'memory_'+k:v for k,v in state.items()})
         if candidates is not None:
             out['candidate_confidence_logits'] = torch.stack([
-                self.confidence_logits(ctx, decoded, curve) for curve in candidates.unbind(1)], 1)
+                confidence(c) if score_candidates is None or score_candidates[j] else logits.new_zeros(logits.shape)
+                for j,c in enumerate(candidates.unbind(1))],1)
+        if queries is not None:
+            features,support = sample_features(dense,queries,self.cfg.fine)
+            out.update(query_embedding=F.normalize(self.embedding(features).float(),dim=-1),query_support=support)
         return out
-
-
-def DirectFollower(cfg):
-    """Checkpoint-aware constructor; legacy architectures retain their weights."""
-    if cfg.memory_slots and cfg.memory_version == 4:
-        from .spatial_memory import SpatialMemoryFollower
-        return SpatialMemoryFollower(cfg)
-    if cfg.memory_slots and cfg.memory_version == 3:
-        from .unified import UnifiedFollower
-        return UnifiedFollower(cfg)
-    return CropFollower(cfg)

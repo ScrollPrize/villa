@@ -24,12 +24,12 @@ def test_production_grid_and_single_encoder():
     assert cfg.token_shape==(15,51,51) and np.prod(cfg.token_shape)==39015
     m=DirectFollower(cfg)
     assert cfg.channels==32 and cfg.hidden==128 and cfg.layers==4
+    assert cfg.memory_slots==16 and m.capacity==11
     assert m.encoder.stem[0].out_channels==32
     assert m.encoder.down[0].out_channels==64 and m.encoder.down[2].out_channels==128
     assert isinstance(m.encoder.down[-1],ResidualConv)
     assert m.encoder.down[-1].net[2].in_channels==128
     assert m.encoder.dense_projection.out_channels==32
-    assert sum(p.numel() for p in m.parameters())==4464453
     assert m.encoder.compress.kernel_size==(4,1,1)
     assert m.encoder.compress.stride==(4,1,1)
     assert not hasattr(m,'appearance') and not hasattr(m,'coarse_encoder')
@@ -96,10 +96,10 @@ def test_visible_reference_changes_context_without_oracle_inputs():
     torch.manual_seed(1)
     m=DirectFollower(config()).eval()
     b=batch(m.cfg,1)
-    a=m.context(b['x'],b['hist'],b['hmask'])
+    a=forward(m,b)
     b['x']['seed'][:,:,0]=4.
-    other=m.context(b['x'],b['hist'],b['hmask'])
-    assert not torch.equal(a['fine'],other['fine'])
+    other=forward(m,b)
+    assert not torch.equal(a['points'],other['points'])
     # Changing annotation-only tensors cannot alter the model's input or output.
     before=forward(m,b)
     b['reference_on_fiber'].zero_();b['foreign'].fill_(1);b['dense_ab'].fill_(float('nan'))
@@ -152,7 +152,7 @@ def test_reference_visibility_masks_seed_geometry_and_labels():
     assert a['visible_seed_mask'].all() and a['identity_observable']
     item['seed_pos'][2]=200.
     b=builder.prepare(item,fiber,np.random.default_rng(1))
-    assert not b['visible_seed_mask'].any() and not b['identity_observable']
+    assert not b['visible_seed_mask'].any() and b['identity_observable']
     assert not b['visible_seed'].any() and not b['visible_seed_tangent'].any() and b['visible_seed_age']==0
 
 
@@ -165,27 +165,15 @@ def test_observation_builder_reads_only_one_ct_and_presence_crop(monkeypatch):
     item=dict(pos=np.zeros(3),frame=np.eye(3),hist_local=np.zeros((cfg.n_history,3)),hmask=np.zeros(cfg.n_history))
     x=ObservationBuilder(cfg).images([item],None)
     assert calls==[(cfg.fine,False),(cfg.fine,True)]
-    assert set(x)=={'fine','seed','seed_mask','seed_age','seed_tangent'}
+    assert {'fine','seed','seed_mask','seed_age','seed_tangent','history_crops','seed_crop'} <= set(x)
 
 
-@pytest.mark.parametrize('old_architecture',['direct_identity_v1','axial_fiber_v1','axial_fiber_v2'])
-def test_new_checkpoint_roundtrip_and_reject_old_architecture(tmp_path,old_architecture):
+def test_checkpoint_roundtrip_and_reject_unknown_architecture(tmp_path):
     cfg=config();m=DirectFollower(cfg).eval();data=batch(cfg,1)
     sample=SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=cfg.n_future)
     path=tmp_path/'model.pt'
     save_checkpoint(path,m,m,FiberVolumeSpec('/unused'),sample)
     loaded,*_=load_checkpoint(path,'cpu')
     for key,value in forward(m,data).items():torch.testing.assert_close(value,forward(loaded,data)[key])
-    ck=torch.load(path,weights_only=False);ck['architecture']=old_architecture;torch.save(ck,path)
+    ck=torch.load(path,weights_only=False);ck['architecture']='unsupported';torch.save(ck,path)
     with pytest.raises(ValueError):load_checkpoint(path,'cpu')
-
-
-def test_history_cues_use_nearest_physical_token_centres():
-    cfg=config();model=DirectFollower(cfg)
-    refs=torch.zeros(1,cfg.n_history+1,3)
-    mask=torch.zeros(1,cfg.n_history+1,dtype=torch.bool);mask[:,-1]=True
-    # Input coordinates (x,y,z)=(1.5,1.5,7.5) are closer to token (1,1,1)
-    # with centre (2,2,11) than token (0,0,0) with centre (0,0,3).
-    refs[0,-1]=torch.tensor([-6.5,-6.5,-.5])
-    rendered=model.encoder.conditioning(refs,mask)
-    assert rendered[0,1,1,1,2]==1 and rendered[...,2].sum()==1

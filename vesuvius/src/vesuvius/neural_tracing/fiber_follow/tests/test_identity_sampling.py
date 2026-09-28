@@ -58,11 +58,11 @@ def test_seed_reference_fallback_supplies_gradients_without_doubling_loss():
     assert identity_terms(output,batch,cfg)['identity_count'] == 0
     output['reference_mask']=saved
     batch['reference_on_fiber'].fill_(1)
-    legacy = identity_terms(output,batch,cfg)['identity_per_state']
+    expected = identity_terms(output,batch,cfg)['identity_per_state']
     batch['identity_seed_fallback'].fill_(True)
     current = identity_terms(output,batch,cfg)
     assert current['identity_anchor_source'].item() == 1
-    torch.testing.assert_close(current['identity_per_state'],legacy)
+    torch.testing.assert_close(current['identity_per_state'],expected)
 
 
 def test_identity_source_and_distance_metrics_pool_across_microbatches():

@@ -20,7 +20,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
     recent observations. Only certified bank relationships are used.
     """
     choice = bool(rng.integers(2))
-    tails = [v for v in (4.,8.,12.) if v+8+model.evidence_margin < model.fine.behind*model.fine.spacing]
+    tails = [v for v in (4.,8.,12.) if v+8 < model.fine.behind*model.fine.spacing]
     if not tails:
         return None
     tail = float(rng.choice(tails))
@@ -93,7 +93,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
         tangents = [tangent_at(parent.points, parent.s, reference_a)*(-1 if reverse else 1),
                     tangent_at(line, s, reference_b)]
         from vesuvius.neural_tracing.fiber_follow.regression.data import visible_points
-        if not visible_points((np.asarray(refs)-pos) @ frame,model.fine,model.evidence_margin).all():
+        if not visible_points((np.asarray(refs)-pos) @ frame,model.fine).all():
             continue
         rows = []
         for target in range(2):

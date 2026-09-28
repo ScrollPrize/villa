@@ -44,7 +44,7 @@ def test_bank_following_uses_its_own_fiber_and_censors_cut_ends(tmp_path,seed):
     assert not end['endpoint_known'] and not end['fmask'][1:].any()
 
 
-def test_bank_following_probability_empty_bank_and_legacy_resume(tmp_path):
+def test_bank_following_probability_with_empty_and_populated_bank(tmp_path):
     bank,parent = make_bank(tmp_path)
     cfg = DirectConfig()
     builder = IdentityObservationBuilder(cfg,[parent],negative_bank=bank,

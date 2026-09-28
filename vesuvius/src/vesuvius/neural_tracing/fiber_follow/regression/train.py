@@ -1,7 +1,7 @@
 """Train a direct curve follower from scratch, with original-fiber online replay."""
 import argparse
 import copy
-from dataclasses import asdict, replace
+from dataclasses import asdict
 import json
 from pathlib import Path
 import time
@@ -20,7 +20,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
 )
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
-    ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, UNIFIED_ARCHITECTURE, SPATIAL_MEMORY_ARCHITECTURE, DirectConfig, DirectFollower,
+    ARCHITECTURE, DirectConfig, DirectFollower,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES,
@@ -72,43 +72,24 @@ def match_optimizer_layout(opt):
 
 
 def compile_training_model(model, **kwargs):
-    """Compile tensor modules while keeping streamed CPU scheduling outside Dynamo."""
-    if model.architecture in (UNIFIED_ARCHITECTURE, SPATIAL_MEMORY_ARCHITECTURE):
-        # In-place compilation preserves checkpoint/EMA parameter names.
-        model.encoder.compile(**kwargs)
-        model.decoder.compile(**kwargs)
-        # The per-observation memory update; the streamed schedule stays eager.
-        if model.architecture == SPATIAL_MEMORY_ARCHITECTURE:
-            # Retrieval and sequence scheduling stay eager; compile the shared
-            # encoder/decoder without capturing large carried archive dictionaries.
-            return model
-        model._write_grad = torch.compile(model._write_grad, **kwargs)
-        model._write_burn = torch.compile(model._write_burn, **kwargs)
-        model._write_probe = torch.compile(model._write_probe, **kwargs)
-        return model
-    return torch.compile(model, **kwargs)
+    """Compile the encoder and decoder; retrieval and observation scheduling stay eager."""
+    model.encoder.compile(**kwargs)
+    model.decoder.compile(**kwargs)
+    return model
 
 
-ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, UNIFIED_ARCHITECTURE, SPATIAL_MEMORY_ARCHITECTURE)
-MEMORY_OPTIONS = ('memory_slots','memory_steps','memory_stride','memory_patch_size','memory_grad_steps','memory_encoder_grad_steps','memory_version',
+MEMORY_OPTIONS = ('memory_slots','memory_steps','memory_stride','memory_grad_steps','memory_encoder_grad_steps',
                   'spatial_recent','spatial_archive','spatial_retrieve','trajectory_window')
 
 
 def checkpoint_config(ck):
-    model_cfg = dict(ck['model_cfg'])
-    model_cfg.setdefault('memory_encoder_grad_steps', 0)  # older runs encoded all history with gradients
-    if ck['architecture'] == MEMORY_ARCHITECTURE_V1:
-        model_cfg.setdefault('memory_version', 1)  # saved before versions were recorded
-    cfg = DirectConfig(**model_cfg)
-    expected = (({1:MEMORY_ARCHITECTURE_V1,2:MEMORY_ARCHITECTURE,3:UNIFIED_ARCHITECTURE,4:SPATIAL_MEMORY_ARCHITECTURE}[cfg.memory_version])
-                if cfg.memory_slots else ARCHITECTURE)
-    if ck['architecture'] != expected:
-        raise ValueError('Checkpoint architecture and memory configuration disagree')
-    return cfg
+    if ck['architecture'] != ARCHITECTURE:
+        raise ValueError('Checkpoint architecture does not match the direct follower')
+    return DirectConfig(**ck['model_cfg'])
 
 
 def load_checkpoint(path,device='cuda'):
-    ck = read_checkpoint(path,ARCHITECTURES,device)
+    ck = read_checkpoint(path,ARCHITECTURE,device)
     cfg = checkpoint_config(ck)
     model = DirectFollower(cfg).to(device,memory_format=conv_memory_format(device))
     model.load_state_dict(ck['ema'])
@@ -121,8 +102,6 @@ def initialize_encoder(model, source):
     for key in ('fine','channels','hidden','heads','layers'):
         if getattr(model.cfg,key) != getattr(source.cfg,key):
             raise ValueError(f'Encoder initialization differs in {key}')
-    if model.architecture != SPATIAL_MEMORY_ARCHITECTURE or source.encoder.condition is not None:
-        raise ValueError('Encoder transfer requires an identity-independent unified/spatial source and a spatial target')
     model.encoder.load_state_dict(source.encoder.state_dict(),strict=True)
     if model.cfg.embedding == source.cfg.embedding:
         model.embedding.load_state_dict(source.embedding.state_dict(),strict=True)
@@ -231,26 +210,24 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         if 'pair_sampling_version' in cpu:
             pair_version = int(cpu['pair_sampling_version'][0])
         batch = move_batch(cpu, device)
-        if model.cfg.memory_slots:
-            sums['memory_observations_mean'] = sums.get('memory_observations_mean', 0.)+weight*float(cpu['x']['memory_mask'].sum())/total
-            if 'memory_target_identity_mask' in cpu:
-                labeled = cpu['memory_target_identity_mask']
-                memory['labeled_writes'] = memory.get('labeled_writes', 0.)+weight*float(labeled.sum())
-                memory['labeled_states'] = memory.get('labeled_states', 0.)+weight*float(labeled.any(-1).sum())
-                memory['departed_states'] = memory.get('departed_states', 0.)+weight*float(
-                    (labeled & (cpu['memory_target_identity'] < .5)).any(-1).sum())
-            sums['memory_anchor_fraction'] = sums.get('memory_anchor_fraction', 0.)+weight*float(cpu['x']['memory_seed_valid'].sum())/total
+        sums['memory_observations_mean'] = sums.get('memory_observations_mean', 0.)+weight*float(cpu['x']['memory_mask'].sum())/total
+        if 'memory_target_identity_mask' in cpu:
+            labeled = cpu['memory_target_identity_mask']
+            memory['labeled_writes'] = memory.get('labeled_writes', 0.)+weight*float(labeled.sum())
+            memory['labeled_states'] = memory.get('labeled_states', 0.)+weight*float(labeled.any(-1).sum())
+            memory['departed_states'] = memory.get('departed_states', 0.)+weight*float(
+                (labeled & (cpu['memory_target_identity'] < .5)).any(-1).sum())
+        sums['memory_anchor_fraction'] = sums.get('memory_anchor_fraction', 0.)+weight*float(cpu['x']['memory_seed_valid'].sum())/total
         queries = dict(queries=batch['identity_points']) if 'identity_points' in batch else {}
         if carry is not None:
             queries['memory'] = carry
-        if model.cfg.memory_slots and model.cfg.memory_version >= 3 and 'memory_target_identity_mask' in cpu:
+        if 'memory_target_identity_mask' in cpu:
             # This only schedules auxiliary computations; it is never input to
             # the encoder, writer or deployed path evaluator.
             queries['probe_mask'] = cpu['memory_target_identity_mask'] | cpu['memory_target_offset_mask']
         if 'candidate_points' in batch:
             queries['candidates'] = batch['candidate_points']
-            if model.architecture in (UNIFIED_ARCHITECTURE, SPATIAL_MEMORY_ARCHITECTURE):
-                queries['candidate_mask'] = cpu['candidate_mask']
+            queries['candidate_mask'] = cpu['candidate_mask']
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
             output = model(batch['x'], batch['hist'], batch['hmask'], **queries)
             if not last:
@@ -394,28 +371,24 @@ def build_parser():
     ap.add_argument('--decoder-layers', type=int, default=4)
     ap.add_argument('--axial-layers', type=int, default=4)
     ap.add_argument('--hidden', type=int, default=128)
-    ap.add_argument('--memory-slots', type=int, default=0,
-                    help='Learned recurrent memory slots; 0 preserves the crop-only model')
-    ap.add_argument('--memory-version', type=int, choices=(2,3,4), default=3,
-                    help='4: spatial retrieval; 3: unified descriptors; 2: legacy patch memory')
+    ap.add_argument('--memory-slots', type=int, default=DirectConfig.memory_slots,
+                    help='Number of learned recurrent memory slots')
     ap.add_argument('--spatial-recent', type=int, default=DirectConfig.spatial_recent)
     ap.add_argument('--spatial-archive', type=int, default=DirectConfig.spatial_archive)
     ap.add_argument('--spatial-retrieve', type=int, default=DirectConfig.spatial_retrieve)
     ap.add_argument('--trajectory-window', type=int, default=DirectConfig.trajectory_window,
-                    help='Spatial model: consecutive labeled track decisions per window; encodings expire at each optimizer update')
+                    help='Consecutive labeled track decisions per window; encodings expire at each optimizer update')
     ap.add_argument('--memory-steps', type=int, default=32,
-                    help='Past observed patches unrolled before the supervised current decision')
+                    help='Past full-crop observations unrolled before the supervised current decision')
     ap.add_argument('--memory-stride', type=int, default=4,
                     help='Spacing of reconstructed historical observations in trace voxels')
-    ap.add_argument('--memory-patch-size', type=int, default=17,
-                    help='Odd CT/presence patch size for the memory writer')
     ap.add_argument('--memory-grad-steps', type=int, default=32,
                     help='Newest observations that backpropagate; older ones are a no-grad burn-in')
     ap.add_argument('--memory-encoder-grad-steps', type=int, default=DirectConfig.memory_encoder_grad_steps,
-                    help='Unified model: stratified gradient-window history encodings per state that '
+                    help='Stratified gradient-window history encodings per state that '
                          'backpropagate into the encoder (gradient scaled by stratum size); 0 keeps all')
     ap.add_argument('--memory-probe-weight', type=float, default=.5,
-                    help='Per-write departure/offset probe coefficient (memory models)')
+                    help='Per-write departure/offset probe coefficient')
     ap.add_argument('--memory-switch-probability', type=float, default=0.,
                     help='Fresh draws replaced by original-then-neighbor memory sequences')
     ap.add_argument('--memory-switch-tail', type=float, nargs=2, default=(16.,96.), metavar=('MIN', 'MAX'),
@@ -482,7 +455,7 @@ def build_parser():
     ap.add_argument('--replay-keep', type=int, default=4)
     ap.add_argument('--resume', help='Resume last.pt inside this run with the same training options')
     ap.add_argument('--init-tracer', help='Initialize a new run from saved EMA follower weights')
-    ap.add_argument('--init-encoder', help='Spatial memory: initialize only the shared encoder/identity projection from unified EMA weights')
+    ap.add_argument('--init-encoder', help='Initialize only the encoder and identity projection from direct follower EMA weights')
     return ap
 
 
@@ -523,8 +496,8 @@ def main(argv=None):
                        activation_checkpointing=args.activation_checkpointing,correction=args.correction,
                        correction_limit=args.correction_limit,correction_steps=args.correction_steps,
                        memory_slots=args.memory_slots,memory_steps=args.memory_steps,
-                       memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size,
-                       memory_grad_steps=args.memory_grad_steps,memory_version=args.memory_version,
+                       memory_stride=args.memory_stride,
+                       memory_grad_steps=args.memory_grad_steps,
                        memory_encoder_grad_steps=args.memory_encoder_grad_steps,
                        spatial_recent=args.spatial_recent,spatial_archive=args.spatial_archive,
                        spatial_retrieve=args.spatial_retrieve,
@@ -534,27 +507,13 @@ def main(argv=None):
     resume = None
     if args.init_tracer:
         initialized,_,_,_,_ = load_checkpoint(args.init_tracer,args.device)
-        if cfg.memory_version == 4 and initialized.architecture != SPATIAL_MEMORY_ARCHITECTURE:
-            raise ValueError('Spatial memory requires a fresh run; use --init-encoder to transfer appearance weights')
-        if cfg.memory_slots and cfg.memory_version == 3 and initialized.architecture != UNIFIED_ARCHITECTURE:
-            raise ValueError('The unified architecture must start fresh; legacy weights cannot initialize it')
-        if args.memory_slots and not initialized.cfg.memory_slots:
-            cfg = replace(initialized.cfg, **{k: getattr(args, k) for k in MEMORY_OPTIONS})
-            upgraded = DirectFollower(cfg).to(args.device, memory_format=conv_memory_format(args.device))
-            incompatible = upgraded.load_state_dict(initialized.state_dict(), strict=False)
-            if incompatible.unexpected_keys or any(not k.startswith('recurrent_memory.') for k in incompatible.missing_keys):
-                raise ValueError('Unexpected parameter mismatch initializing memory model')
-            initialized = upgraded
-        else:
-            if args.memory_slots and any(getattr(args,k) != getattr(initialized.cfg,k) for k in MEMORY_OPTIONS):
-                raise ValueError('--init-tracer memory configuration differs from existing memory checkpoint')
-            if initialized.cfg.memory_slots and initialized.cfg.memory_version == 1:
-                raise ValueError('Legacy v1 memory checkpoints cannot initialize new runs')
-            cfg = initialized.cfg
+        if any(getattr(args,k) != getattr(initialized.cfg,k) for k in MEMORY_OPTIONS):
+            raise ValueError('--init-tracer memory configuration differs from checkpoint')
+        cfg = initialized.cfg
         for key in MEMORY_OPTIONS:
             setattr(args, key, getattr(cfg, key))
     if args.resume:
-        resume = read_checkpoint(args.resume,ARCHITECTURES,args.device)
+        resume = read_checkpoint(args.resume,ARCHITECTURE,args.device)
         cfg = checkpoint_config(resume)
     if args.decision_fraction and args.microbatch % 2:
         raise ValueError('Matched decisions require an even microbatch')
@@ -562,8 +521,6 @@ def main(argv=None):
         raise ValueError('Candidate weight must be finite and positive')
     if not np.isfinite(args.memory_probe_weight) or args.memory_probe_weight < 0 or args.dagger_after <= 0:
         raise ValueError('Memory probe weight must be nonnegative; --dagger-after positive')
-    if args.memory_switch_probability and not cfg.memory_slots:
-        raise ValueError('Memory-switch sequences require --memory-slots')
     identity_sampling = IdentitySampling(
         rule=ComponentRule(threshold=args.negative_threshold,lateral_max=args.negative_lateral_max),
         presence_dropout=args.presence_dropout,contact_fraction=args.contact_fraction,
@@ -627,13 +584,8 @@ def main(argv=None):
         ignored = {'resume','out_root','device','batch','microbatch','workers','threads','worker_cache_gb',
                    'log_every','ckpt_every','diag_every','dagger_device','compile','init_tracer','init_encoder',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing'}
-        defaults = build_parser()
         for key,value in vars(args).items():
-            # Options added after a run started had their default behavior.
-            recorded = resume['training_options'].get(key, getattr(DirectConfig, key, defaults.get_default(key))
-                                                       if key.startswith('memory_') else defaults.get_default(key))
-            if key == 'memory_encoder_grad_steps' and key not in resume['training_options']:
-                recorded = 0
+            recorded = resume['training_options'][key]
             if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
                 raise ValueError(f'Resume option differs: {key}')
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
@@ -666,8 +618,7 @@ def main(argv=None):
     # clipping and checkpoints keep using ``model``; only the training forward is compiled.
     trainable = model
     if args.compile and torch.device(args.device).type == 'cuda':
-        if model.architecture == UNIFIED_ARCHITECTURE:
-            progress('Compiling shared encoder and path decoder; observation scheduling stays eager')
+        progress('Compiling shared encoder and path decoder; observation scheduling stays eager')
         trainable = compile_training_model(model)
     if args.compile and torch.device(args.device).type == 'cuda':
         progress('Compilation enabled; first forward/backward passes will compile lazily and may take several minutes')
@@ -694,7 +645,7 @@ def main(argv=None):
     loader_args = dict(batch_size=None, num_workers=args.workers,
                        pin_memory=torch.device(args.device).type == 'cuda')
     if args.workers:
-        loader_args.update(prefetch_factor=1 if cfg.memory_slots and cfg.memory_version == 3 else 2, persistent_workers=True)
+        loader_args.update(prefetch_factor=2, persistent_workers=True)
     loader = torch.utils.data.DataLoader(dataset, **loader_args)
     if not resume:
         (out/'config.json').write_text(json.dumps(dict(vars(args), architecture=model.architecture,
@@ -709,7 +660,7 @@ def main(argv=None):
     log = RunLog(out/'log.jsonl', formatter=format_training_log)
     log.record(dict(step=done,event='identity_sampling',architecture=model.architecture,
         pair_sampling_version=identity_sampling.pair_sampling_version,
-        history_policy='learned_observation_memory' if cfg.memory_slots else 'visible_crop_only',sampling=asdict(identity_sampling),
+        history_policy='spatial_observation_memory',sampling=asdict(identity_sampling),
         negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance(),
         bank_role_provenance=role_provenance()))
     tracer = None

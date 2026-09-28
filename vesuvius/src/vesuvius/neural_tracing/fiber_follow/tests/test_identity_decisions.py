@@ -76,7 +76,7 @@ def test_candidates_share_deployed_head_and_train_identity_attention():
     torch.testing.assert_close(predicted['candidate_confidence_logits'][:, 0], predicted['confidence_logits'])
     terms = loss_terms(out, data, model.cfg)
     terms['candidate_per_state'].sum().backward()
-    for module in (model.reference_token, model.encoder,
+    for module in (model.observation_projection, model.encoder,
                    model.decoder, model.confidence_head):
         assert sum(float(p.grad.abs().sum()) for p in module.parameters() if p.grad is not None) > 0
     assert model.coordinates.weight.grad is None  # candidate coordinates are labels

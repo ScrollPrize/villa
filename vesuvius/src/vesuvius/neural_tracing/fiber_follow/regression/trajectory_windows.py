@@ -25,7 +25,7 @@ def correspondence(fiber, point):
 
 def prepare_window(builder, item, fiber):
     cfg = builder.cfg
-    if cfg.memory_version != 4 or cfg.trajectory_window == 1 or item.get('_window_child') or item.get('source') == 5:
+    if cfg.trajectory_window == 1 or item.get('_window_child') or item.get('source') == 5:
         return
     track = item.get('memory_track')
     if track is None:

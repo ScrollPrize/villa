@@ -6,15 +6,15 @@ import pytest
 import torch
 import numpy as np
 
-from test_unified import scene, state
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower, SPATIAL_MEMORY_ARCHITECTURE, sample_features
+from test_memory_training import scene, state
+from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower, ARCHITECTURE, sample_features
 from vesuvius.neural_tracing.fiber_follow.regression.train import checkpoint_config, initialize_encoder, compile_training_model
 
 
 def spatial_scene(b=1, steps=4, **options):
     cfg,data = scene(b=b,steps=steps,grad=steps)
     options = dict(spatial_recent=1,spatial_archive=2,spatial_retrieve=1,**options)
-    return replace(cfg,memory_version=4,**options),data
+    return replace(cfg,**options),data
 
 
 def test_full_grid_is_retained_and_remote_spatial_evidence_affects_predictions():
@@ -25,17 +25,17 @@ def test_full_grid_is_retained_and_remote_spatial_evidence_affects_predictions()
         out = model(data['x'],data['hist'],data['hmask'])
         memory = state(out,model)
         assert memory['bank'].shape[2] == model.spatial_count+1
-        context,valid,refs,ref_valid,roles = model.retained(memory,memory['position'],memory['frame'])
+        context,refs,ref_valid,roles = model.retained(memory,memory['position'],memory['frame'])
         obs = model.observation(data['x']['fine'])
         context.update(current=model.spatial_tokens(obs),current_valid=torch.ones(obs.shape[:2],dtype=torch.bool))
         points = torch.zeros(1,cfg.n_future,3)
         features = model.head_descriptor(obs).expand(-1,cfg.n_future,-1)
         support = torch.ones(1,cfg.n_future,dtype=torch.bool)
-        baseline = model.evaluate(points,features,support,context,valid,refs,ref_valid,roles)
+        baseline = model.evaluate(points,features,support,context,refs,ref_valid,roles)
         # Change only spatial evidence, preserving the fine head descriptor.
         changed = copy.deepcopy(context)
         changed['state']['anchor'][:,:model.spatial_count] += torch.randn_like(memory['anchor'][:,:model.spatial_count])*3
-        result = model.evaluate(points,features,support,changed,valid,refs,ref_valid,roles)
+        result = model.evaluate(points,features,support,changed,refs,ref_valid,roles)
         assert not torch.allclose(baseline,result)
 
 
@@ -66,11 +66,10 @@ def test_point_queries_keep_fine_identity_and_support_without_a_stencil():
         memory['anchor'] = obs
         memory['anchor_valid'].fill_(True)
         memory,_ = model.write(obs,torch.ones(1,dtype=torch.bool),memory['position'],memory['frame'],memory,probe=False)
-        _,_,refs,valid,_ = model.retained(memory,memory['position'],memory['frame'])
+        _,refs,valid,_ = model.retained(memory,memory['position'],memory['frame'])
         torch.testing.assert_close(refs[:,:2],features[:,:1].expand(-1,2,-1))
         assert valid[:,:2].all()
     assert cfg.lateral_limit == edge
-    assert replace(cfg,patch_radius=0.).lateral_limit == edge
 
 
 def test_streaming_matches_unroll_through_archive_eviction_and_seed_stays_fixed():
@@ -146,8 +145,8 @@ def test_candidates_read_independently_without_writing_memory():
 def test_checkpoint_version_and_explicit_encoder_transfer(tmp_path):
     cfg,data = spatial_scene()
     model = DirectFollower(cfg)
-    assert model.architecture == SPATIAL_MEMORY_ARCHITECTURE == 'axial_fiber_spatial_memory_v2'
-    source = DirectFollower(replace(cfg,memory_version=3))
+    assert model.architecture == ARCHITECTURE == 'axial_fiber_spatial_memory_v2'
+    source = DirectFollower(cfg)
     before = model.retrieval_key.weight.detach().clone()
     initialize_encoder(model,source)
     torch.testing.assert_close(model.encoder.compress.weight,source.encoder.compress.weight)
@@ -163,11 +162,8 @@ def test_checkpoint_version_and_explicit_encoder_transfer(tmp_path):
     with torch.no_grad():
         torch.testing.assert_close(model(data['x'],data['hist'],data['hmask'])['points'],
                                    other(data['x'],data['hist'],data['hmask'])['points'])
-    restored['architecture'] = source.architecture
-    with pytest.raises(ValueError,match='disagree'):
-        checkpoint_config(restored)
-    restored['architecture'] = 'axial_fiber_spatial_memory_v1'
-    with pytest.raises(ValueError,match='disagree'):
+    restored['architecture'] = 'unsupported'
+    with pytest.raises(ValueError,match='architecture'):
         checkpoint_config(restored)
 
 
@@ -281,7 +277,8 @@ def test_global_frame_change_does_not_change_history_reads():
 def test_invalid_spatial_memory_budgets():
     cfg,_ = spatial_scene()
     for change in (dict(spatial_recent=0),dict(spatial_archive=0),dict(spatial_retrieve=3),
-                   dict(memory_slots=0),dict(trajectory_window=0)):
+                   dict(memory_slots=0),dict(memory_steps=0),dict(memory_stride=0),
+                   dict(memory_grad_steps=0),dict(memory_encoder_grad_steps=-1),dict(trajectory_window=0)):
         with pytest.raises(ValueError):
             replace(cfg,**change)
 

@@ -281,7 +281,7 @@ def run_embedding(args):
                     points=(other['points'][:, :4, :2]-out['points'][:, :4, :2]).float().norm(dim=-1).mean(1).cpu(),
                     confidence=(other['confidence'][:, 3]-out['confidence'][:, 3]).float().abs().cpu()))
     report = dict(identity_version=IDENTITY_VERSION, checkpoint=str(Path(args.checkpoint).resolve()), step=ck.get('step'),
-                  split=args.split, states=len(items), reference_policy="visible_crop_only",
+                  split=args.split, states=len(items), reference_policy="spatial_observation_memory",
                   negative_lateral_max=sampling.rule.lateral_max, heldout_ranking=summarize_ranking(rankings))
     for name, values in shifts.items():
         points = torch.cat([v['points'] for v in values]).numpy()

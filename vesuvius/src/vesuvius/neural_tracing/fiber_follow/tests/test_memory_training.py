@@ -8,16 +8,16 @@ import pytest
 import torch
 
 from test_identity import config, batch
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower, UNIFIED_ARCHITECTURE
+from vesuvius.neural_tracing.fiber_follow.regression.model import DirectFollower, ARCHITECTURE
 from vesuvius.neural_tracing.fiber_follow.regression.memory_data import memory_images, memory_allowed
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import identity_terms
-from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch, checkpoint_config, compile_training_model
-from vesuvius.neural_tracing.fiber_follow.regression.unified import stratified_history
+from vesuvius.neural_tracing.fiber_follow.regression.train import move_batch, compile_training_model
+from vesuvius.neural_tracing.fiber_follow.regression.model import stratified_history
 from vesuvius.neural_tracing.fiber_follow.shared.data import ZBand
 
 
 def scene(b=1, steps=2, grad=2):
-    cfg = config(memory_slots=3,memory_steps=steps,memory_grad_steps=grad,memory_version=3)
+    cfg = config(memory_slots=3,memory_steps=steps,memory_grad_steps=grad,spatial_recent=1,spatial_archive=2,spatial_retrieve=1)
     data = batch(cfg,b)
     x = data['x']
     t = steps+1
@@ -37,9 +37,7 @@ def test_one_encoder_and_shared_identity_reaches_geometry_confidence_and_seed():
     torch.manual_seed(4)
     cfg,data = scene()
     model = DirectFollower(cfg)
-    assert model.architecture == UNIFIED_ARCHITECTURE
-    assert model.encoder.condition is None
-    assert not hasattr(model,'recurrent_memory') and not hasattr(model,'path_evidence')
+    assert model.architecture == ARCHITECTURE
     data['x']['seed_crop'].requires_grad_()
     data['x']['history_crops'].requires_grad_()
     for key in ('points','confidence_logits','memory_probe'):
@@ -101,10 +99,11 @@ def test_candidates_read_memory_independently_without_writing_it_or_moving_coord
             torch.testing.assert_close(v,reverse['memory_'+k])
 
 
-def test_remote_seed_receives_infonce_even_with_visible_history():
+def test_remote_seed_receives_infonce_when_visible_history_is_absent():
     cfg,data = scene()
     model = DirectFollower(cfg)
     data['x']['seed_mask'].zero_()  # stored original seed is outside current crop
+    data['hmask'].zero_()
     data['x']['seed_crop'].requires_grad_()
     out = model(data['x'],data['hist'],data['hmask'],queries=data['identity_points'])
     assert out['reference_mask'][0,-1]
@@ -150,12 +149,6 @@ def test_full_crop_sampling_reuses_current_crop_and_checks_holdout():
     assert moved['history_crops'] is x['history_crops']
 
 
-def test_checkpoint_configuration_identifies_new_architecture():
-    cfg,_ = scene()
-    assert checkpoint_config(dict(architecture=UNIFIED_ARCHITECTURE,model_cfg=cfg.to_dict())) == cfg
-    old = cfg.to_dict()
-    del old['memory_encoder_grad_steps']
-    assert checkpoint_config(dict(architecture=UNIFIED_ARCHITECTURE,model_cfg=old)).memory_encoder_grad_steps == 0
 
 
 def test_missing_references_and_partially_padded_nan_observations_are_safe():
@@ -180,14 +173,13 @@ def test_missing_references_and_partially_padded_nan_observations_are_safe():
 
 def test_whole_observation_checkpoint_matches_nested_checkpoint_values_and_gradients():
     from torch.utils.checkpoint import checkpoint
-    from vesuvius.neural_tracing.fiber_follow.regression.model import sample_features
     cfg,data = scene(steps=1)
     cfg = replace(cfg,activation_checkpointing=True)
     model = DirectFollower(cfg)
     image = data['x']['fine'].requires_grad_()
     def nested(x):
-        dense,_,_ = model.encode(x)
-        return sample_features(dense,model.stencil[None].expand(len(x),-1,-1),cfg.fine)[0]
+        dense,_,tokens = model.encode(x)
+        return model.observation_features(dense,tokens)
     before = checkpoint(nested,image,use_reentrant=False)
     old_grads = torch.autograd.grad(before.square().sum(),(image,model.encoder.stem[0].weight,model.encoder.blocks[0].axes[0].qkv.weight))
     after = model.encode_observation(image,'cpu',True)
@@ -225,7 +217,6 @@ def test_compiled_tensor_modules_preserve_checkpoint_names_and_training_gradient
     keys = set(model.state_dict())
     compiled = compile_training_model(model,backend='eager')
     assert compiled is model and set(compiled.state_dict()) == keys
-    assert all('_write_'+kind in model.__dict__ for kind in ('grad','burn','probe'))
     out = compiled(data['x'],data['hist'],data['hmask'])
     out['points'].square().sum().backward()
     assert model.encoder.stem[0].weight.grad.abs().sum() > 0
@@ -233,57 +224,6 @@ def test_compiled_tensor_modules_preserve_checkpoint_names_and_training_gradient
     assert (data['x']['history_crops'].grad.flatten(2).abs().sum(-1) > 0).sum() == 4
 
 
-def test_writer_compilation_stabilizes_across_seed_burn_and_probe_transitions():
-    torch._dynamo.reset()
-    torch.manual_seed(21)
-    cfg,_ = scene(b=2)
-    eager = DirectFollower(cfg)
-    compiled = copy.deepcopy(eager)
-    graphs = {'grad':0,'burn':0,'probe':0}
-    def backend(kind):
-        def capture(gm,inputs):
-            graphs[kind] += 1
-            return gm.forward
-        return capture
-    for kind in graphs:
-        name = '_write_'+kind
-        setattr(compiled,name,torch.compile(getattr(compiled,name),backend=backend(kind),fullgraph=True))
-    try:
-        for repeat in range(2):
-            for seed,burn in product((False,True),(0,2)):
-                obs = torch.randn(2,5,27,cfg.channels,requires_grad=True)
-                anchor = torch.randn(2,27,cfg.channels,requires_grad=seed)
-                positions = torch.zeros(2,5,3)
-                frames = torch.eye(3).expand(2,5,-1,-1)
-                active = torch.ones(2,5,dtype=torch.bool)
-                active[0,1] = False
-                results,grads = [],[]
-                for model in (eager,compiled):
-                    memory = model.initial_memory(2,'cpu')
-                    memory['anchor'] = anchor
-                    memory['anchor_valid'].fill_(seed)
-                    for j in range(5):
-                        with torch.set_grad_enabled(j>=burn):
-                            memory,probe = model.write(obs[:,j],active[:,j],positions[:,j],frames[:,j],
-                                                       memory,probe=j%2==0)
-                    results.append((memory,probe))
-                    loss = memory['slots'].square().sum()+probe.square().sum()
-                    grads.append(torch.autograd.grad(loss,(obs,*model.parameters()),allow_unused=True))
-                for key in results[0][0]:
-                    torch.testing.assert_close(results[0][0][key],results[1][0][key])
-                torch.testing.assert_close(results[0][1],results[1][1])
-                for a,b in zip(*grads):
-                    if a is None:
-                        assert b is None
-                    else:
-                        torch.testing.assert_close(a,b)
-            if repeat == 0:
-                warmed = dict(graphs)
-                assert all(0 < n <= torch._dynamo.config.recompile_limit for n in warmed.values()), warmed
-            else:
-                assert graphs == warmed  # no further compilation or eager fallback
-    finally:
-        torch._dynamo.reset()
 
 
 @pytest.mark.parametrize('mask_kind',['empty','one_curve','mixed'])
@@ -453,7 +393,7 @@ def test_preflight_and_training_wire_encoder_gradient_budget(monkeypatch,tmp_pat
     def capture(**kwargs):
         raise Configured(DirectConfig(**kwargs))
     capture.memory_encoder_grad_steps = DirectConfig.memory_encoder_grad_steps
-    for key in ('spatial_recent','spatial_archive','spatial_retrieve','trajectory_window'):
+    for key in ('memory_slots','spatial_recent','spatial_archive','spatial_retrieve','trajectory_window'):
         setattr(capture,key,getattr(DirectConfig,key))
     monkeypatch.setattr(identity_preflight,'DirectConfig',capture)
     monkeypatch.setattr(torch,'set_num_threads',lambda _: None)
