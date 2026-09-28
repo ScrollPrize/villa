@@ -324,14 +324,24 @@ void createPyramidDatasets(const std::filesystem::path& outDir,
 {
     auto dtype = isU16 ? vc::VcDtype::uint16 : vc::VcDtype::uint8;
 
+    // shape0 is YX for a collapsed composite and ZYX otherwise; only the last
+    // two dimensions are downsampled either way (Z stays fixed - anisotropic).
+    const size_t yd = shape0.size() - 2, xd = shape0.size() - 1;
+
     std::vector<size_t> prevShape = shape0;
     for (int level = 1; level <= 5; level++) {
-        // Keep Z fixed and halve only Y/X at each level (anisotropic scaling).
-        std::vector<size_t> shape = {prevShape[0], (prevShape[1]+1)/2, (prevShape[2]+1)/2};
-        size_t chZ = std::min(shape[0], shape0[0]);
-        std::vector<size_t> chunks = {chZ, std::min(CH, shape[1]), std::min(CW, shape[2])};
+        std::vector<size_t> shape = prevShape;
+        shape[yd] = (shape[yd] + 1) / 2;
+        shape[xd] = (shape[xd] + 1) / 2;
+
+        std::vector<size_t> chunks = shape;
+        if (shape.size() == 3) chunks[0] = std::min(shape[0], shape0[0]);
+        chunks[yd] = std::min(CH, shape[yd]);
+        chunks[xd] = std::min(CW, shape[xd]);
+
         std::vector<size_t> shard;
-        if (shardFullWidth) shard = {chZ, std::min(CH, shape[1]), shape[2]};
+        if (shardFullWidth) { shard = chunks; shard[xd] = shape[xd]; }
+
         vc::createZarrDataset(outDir, std::to_string(level), shape, chunks, dtype,
                               compressor, dimensionSeparator, 0, compressionLevel, shard);
         prevShape = shape;
@@ -348,7 +358,7 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
                     const std::string& accumTypeStr, size_t accumSamples,
                     const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
                     double baseVoxelSize, const std::string& voxelUnit,
-                    double pixelsPerVoxel)
+                    double pixelsPerVoxel, bool rank2)
 {
     Json attrs;
     attrs["source_zarr"] = volPath.string();
@@ -365,10 +375,12 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
         attrs["canvas_size"] = std::move(cs);
     }
     {
-        Json ck = Json::array(); ck.push_back(int(CZ)); ck.push_back(int(CH)); ck.push_back(int(CW));
+        Json ck = Json::array();
+        if (!rank2) ck.push_back(int(CZ));
+        ck.push_back(int(CH)); ck.push_back(int(CW));
         attrs["chunk_size"] = std::move(ck);
     }
-    attrs["note_axes_order"] = "ZYX (slice, row, col)";
+    attrs["note_axes_order"] = rank2 ? "YX (row, col)" : "ZYX (slice, row, col)";
 
     Json ms;
     ms["version"] = "0.4"; ms["name"] = "render";
@@ -378,7 +390,7 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
         return ax;
     };
     Json axes = Json::array();
-    axes.push_back(makeAxis("z"));
+    if (!rank2) axes.push_back(makeAxis("z"));
     axes.push_back(makeAxis("y"));
     axes.push_back(makeAxis("x"));
     ms["axes"] = std::move(axes);
@@ -394,9 +406,10 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
         const double sYX = baseVoxelSize / px * std::pow(2.0, l);
         const double sZ = baseVoxelSize * step;
         Json scale_arr = Json::array();
-        scale_arr.push_back(sZ); scale_arr.push_back(sYX); scale_arr.push_back(sYX);
+        if (!rank2) scale_arr.push_back(sZ);
+        scale_arr.push_back(sYX); scale_arr.push_back(sYX);
         Json trans_arr = Json::array();
-        trans_arr.push_back(0.0); trans_arr.push_back(0.0); trans_arr.push_back(0.0);
+        for (size_t d = rank2 ? 2u : 3u; d > 0; --d) trans_arr.push_back(0.0);
         Json transforms = Json::array();
         transforms.push_back(Json{{"type","scale"},{"scale",std::move(scale_arr)}});
         transforms.push_back(Json{{"type","translation"},{"translation",std::move(trans_arr)}});

@@ -226,3 +226,20 @@ TEST_CASE("buildPyramidLevel: builds L1 from L0")
     }
     fs::remove_all(d);
 }
+
+// A collapsed composite passes a YX shape0; only the last two dimensions are
+// downsampled, and the levels stay rank-2.
+TEST_CASE("createPyramidDatasets: rank-2 shape0 produces rank-2 levels")
+{
+    auto d = tmpDir("pyr2");
+    createPyramidDatasets(d, /*shape0=*/{1024, 2048}, /*CH=*/128, /*CW=*/256,
+                              /*isU16=*/false, /*compressor=*/"none");
+    for (int level = 1; level <= 5; level++) {
+        auto meta = utils::Json::parse_file(d / std::to_string(level) / ".zarray");
+        REQUIRE(meta["shape"].size() == 2u);
+        CHECK(meta["shape"][0].get_int() == 1024 >> level);
+        CHECK(meta["shape"][1].get_int() == 2048 >> level);
+        CHECK(meta["chunks"].size() == 2u);
+    }
+    std::filesystem::remove_all(d);
+}

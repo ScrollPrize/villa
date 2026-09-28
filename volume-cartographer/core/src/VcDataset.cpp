@@ -504,6 +504,13 @@ struct VcDataset::Impl {
     std::string delimiter_ = ".";
     CompressorConfig compressor_;
     std::vector<uint8_t> fillValueBytes_;
+    // 1 for a rank-2 array, whose own indices are (y, x).
+    size_t rankOffset_ = 0;
+
+    // The public chunk API is ZYX; a rank-2 array drops the leading index.
+    std::span<const size_t> chunkIndices(const std::array<size_t, 3>& zyx) const {
+        return std::span<const size_t>(zyx.data() + rankOffset_, 3 - rankOffset_);
+    }
 
     // utils zarr array for chunk I/O
     std::shared_ptr<utils::FileSystemStore> store_;
@@ -556,6 +563,15 @@ struct VcDataset::Impl {
         } else {
             chunkShape_.assign(meta.chunks.begin(), meta.chunks.end());
         }
+        // A composite render is a single plane and is stored rank-2, but every
+        // caller here works in ZYX. Present it as one z-slice so shape(),
+        // defaultChunkShape() and the region helpers stay rank-3.
+        if (shape_.size() == 2) {
+            rankOffset_ = 1;
+            shape_.insert(shape_.begin(), 1);
+            chunkShape_.insert(chunkShape_.begin(), 1);
+        }
+
         chunkSize_ = 1;
         for (auto c : chunkShape_) chunkSize_ *= c;
 
@@ -680,7 +696,8 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
 
 bool VcDataset::chunkExists(size_t iz, size_t iy, size_t ix) const
 {
-    std::array<size_t, 3> indices = {iz, iy, ix};
+    const std::array<size_t, 3> zyx = {iz, iy, ix};
+    const auto indices = impl_->chunkIndices(zyx);
     // A sharded array has no per-chunk file: presence lives in the shard index.
     if (impl_->zarrArray_->is_sharded())
         return impl_->zarrArray_->inner_chunk_exists(indices);
@@ -689,8 +706,8 @@ bool VcDataset::chunkExists(size_t iz, size_t iy, size_t ix) const
 
 bool VcDataset::readChunk(size_t iz, size_t iy, size_t ix, void* output) const
 {
-    std::array<size_t, 3> indices = {iz, iy, ix};
-    auto result = impl_->zarrArray_->read_chunk(indices);
+    const std::array<size_t, 3> zyx = {iz, iy, ix};
+    auto result = impl_->zarrArray_->read_chunk(impl_->chunkIndices(zyx));
     if (!result) return false;
 
     const auto& bytes = *result;
@@ -715,7 +732,8 @@ bool VcDataset::readChunkOrFill(size_t iz, size_t iy, size_t ix, void* output) c
 bool VcDataset::writeChunk(size_t iz, size_t iy, size_t ix,
                             const void* input, size_t nbytes)
 {
-    std::array<size_t, 3> indices = {iz, iy, ix};
+    const std::array<size_t, 3> zyx = {iz, iy, ix};
+    const auto indices = impl_->chunkIndices(zyx);
     auto data = std::span<const std::byte>(
         static_cast<const std::byte*>(input), nbytes);
     if (impl_->zarrArray_->is_sharded()) {
@@ -757,7 +775,8 @@ bool VcDataset::writeChunkSkipEmpty(size_t iz, size_t iy, size_t ix,
 
 bool VcDataset::removeChunk(size_t iz, size_t iy, size_t ix)
 {
-    std::array<size_t, 3> indices = {iz, iy, ix};
+    const std::array<size_t, 3> zyx = {iz, iy, ix};
+    const auto indices = impl_->chunkIndices(zyx);
     if (impl_->zarrArray_->is_sharded()) {
         const bool existed = impl_->zarrArray_->inner_chunk_exists(indices);
         impl_->zarrArray_->mark_inner_chunk_empty(indices);

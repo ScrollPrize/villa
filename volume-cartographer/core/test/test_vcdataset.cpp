@@ -310,3 +310,39 @@ TEST_CASE("createZarrDataset: sharded v3 round-trips through the shard index")
 
     fs::remove_all(d);
 }
+
+// A collapsed composite is a YX image. It is stored rank-2, but every caller
+// in the render path addresses chunks as ZYX, so VcDataset presents it as a
+// single z-plane and drops the leading index when it talks to the array.
+TEST_CASE("VcDataset: rank-2 array is addressed as a single ZYX plane")
+{
+    auto d = tmpDir("rank2");
+    auto ds = vc::createZarrDataset(d, "arr", /*shape=*/{256, 512},
+                                    /*chunks=*/{128, 256}, vc::VcDtype::uint8,
+                                    /*compressor=*/"none");
+    REQUIRE(ds);
+
+    // On disk it is two-dimensional...
+    auto meta = utils::Json::parse_file(d / "arr" / ".zarray");
+    CHECK(meta["shape"].size() == 2u);
+    CHECK(meta["chunks"].size() == 2u);
+
+    // ...but the ZYX view carries a leading extent of 1.
+    CHECK(ds->shape() == std::vector<size_t>{1, 256, 512});
+    CHECK(ds->defaultChunkShape() == std::vector<size_t>{1, 128, 256});
+    CHECK(ds->defaultChunkSize() == 128u * 256u);
+
+    std::vector<uint8_t> in(ds->defaultChunkSize());
+    for (size_t i = 0; i < in.size(); ++i) in[i] = uint8_t(i % 255);
+    REQUIRE(ds->writeChunk(0, 1, 1, in.data(), in.size()));
+    CHECK(ds->chunkExists(0, 1, 1));
+
+    std::vector<uint8_t> out(in.size(), 0);
+    REQUIRE(ds->readChunk(0, 1, 1, out.data()));
+    CHECK(std::memcmp(out.data(), in.data(), in.size()) == 0);
+
+    // The chunk key has two components, not three.
+    CHECK(fs::exists(d / "arr" / "1" / "1"));
+
+    fs::remove_all(d);
+}

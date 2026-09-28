@@ -1765,10 +1765,19 @@ int main(int argc, char *argv[])
             outFilePath = zarrOutputArg;
             std::vector<size_t> shape0 = {baseZ, baseY, baseX};
             chunks0 = {shape0[0], std::min(CH, shape0[1]), std::min(CW, shape0[2])};
+
+            // A composite collapses the band to one image, so it is stored as a
+            // YX array rather than a ZYX stack of depth 1. The render itself
+            // stays ZYX (shape0/chunks0); only the dataset loses the axis.
+            std::vector<size_t> dsShape = shape0, dsChunks = chunks0;
+            if (isCompositeMode) {
+                dsShape.erase(dsShape.begin());
+                dsChunks.erase(dsChunks.begin());
+            }
             // One shard per band row: a shard is never split across bands, so
             // partition boundaries (which fall on band rows) never share one.
             std::vector<size_t> shard0;
-            if (zarrShard) shard0 = {shape0[0], std::min(CH, shape0[1]), shape0[2]};
+            if (zarrShard) { shard0 = dsChunks; shard0.back() = dsShape.back(); }
             auto vcDtype = useU16 ? vc::VcDtype::uint16 : vc::VcDtype::uint8;
 
             // v2 arrays carry .zarray, v3 (sharded) arrays carry zarr.json.
@@ -1780,18 +1789,22 @@ int main(int argc, char *argv[])
             if (pre_flag) {
                 logPrintf(stdout, "[pre] creating zarr + all levels...\n");
                 std::filesystem::create_directories(outFilePath);
-                vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype,
+                vc::createZarrDataset(outFilePath, "0", dsShape, dsChunks, vcDtype,
                                       zarrCompressor, zarrSeparator, 0, zarrCompressionLevel, shard0);
-                logPrintf(stdout, "[pre] L0 shape: [%zu,%zu,%zu]\n", shape0[0], shape0[1], shape0[2]);
+                if (isCompositeMode)
+                    logPrintf(stdout, "[pre] L0 shape: [%zu,%zu]\n", dsShape[0], dsShape[1]);
+                else
+                    logPrintf(stdout, "[pre] L0 shape: [%zu,%zu,%zu]\n", dsShape[0], dsShape[1], dsShape[2]);
                 if (wantPyramid)
-                    createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
+                    createPyramidDatasets(outFilePath, dsShape, CH, CW, useU16,
                                           zarrCompressor, zarrCompressionLevel, zarrSeparator, zarrShard);
 
                 cv::Size attrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
-                               render_level_voxel_size, voxel_unit, tgt_scale);
+                               render_level_voxel_size, voxel_unit, tgt_scale,
+                               isCompositeMode);
                 return true;
             } else if (numParts > 1) {
                 if (!level0Exists(zarrOutputArg)) {
@@ -1803,7 +1816,7 @@ int main(int argc, char *argv[])
                 logPrintf(stdout, "[resume] opening existing zarr\n");
             } else {
                 std::filesystem::create_directories(outFilePath);
-                dsOut = vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype,
+                dsOut = vc::createZarrDataset(outFilePath, "0", dsShape, dsChunks, vcDtype,
                                               zarrCompressor, zarrSeparator, 0, zarrCompressionLevel, shard0);
             }
 
@@ -1876,8 +1889,10 @@ int main(int argc, char *argv[])
             if (numParts <= 1 && !resumeFlag) {
                 cv::Size zarrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(zarrXY.width, zarrXY.height);
-                std::vector<size_t> shape0 = {baseZ, size_t(zarrXY.height), size_t(zarrXY.width)};
-                createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
+                std::vector<size_t> pyrShape = isCompositeMode
+                    ? std::vector<size_t>{size_t(zarrXY.height), size_t(zarrXY.width)}
+                    : std::vector<size_t>{baseZ, size_t(zarrXY.height), size_t(zarrXY.width)};
+                createPyramidDatasets(outFilePath, pyrShape, CH, CW, useU16,
                                       zarrCompressor, zarrCompressionLevel, zarrSeparator, zarrShard);
             }
             if (inlinePyramid) {
@@ -2012,7 +2027,8 @@ int main(int argc, char *argv[])
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
-                               render_level_voxel_size, voxel_unit, tgt_scale);
+                               render_level_voxel_size, voxel_unit, tgt_scale,
+                               isCompositeMode);
             }
         }
         return true;
