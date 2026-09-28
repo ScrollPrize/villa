@@ -63,6 +63,52 @@ def test_bank_following_probability_empty_bank_and_legacy_resume(tmp_path):
         resolve_bank_option(.1,saved,'bank_following_probability',.1,0.)
 
 
+def test_legacy_resume_recovers_effective_settings_from_identity_sampling():
+    saved = {'training_options':{},'identity_sampling':{
+        'rule':{'lateral_max':10.},'query_patches':True,'bank_following_probability':.2}}
+    assert resolve_bank_option(None,saved,'negative_lateral_max',32.,12.) == 10.
+    assert resolve_bank_option(None,saved,'identity_query_patches',False,False,sampling_name='query_patches')
+    assert resolve_bank_option(None,saved,'bank_following_probability',.1,0.) == .2
+    with pytest.raises(ValueError,match='Resume option differs'):
+        resolve_bank_option(12.,saved,'negative_lateral_max',32.,12.)
+
+
+def test_covered_primary_sampling_keeps_history_and_prepares_only_once(tmp_path):
+    bank,parent = make_bank(tmp_path)
+    publish(tmp_path,[add_shard(tmp_path,0,z_range=(60.,180.))])
+    cfg = IdentityConfig()
+    builder = IdentityObservationBuilder(cfg,[parent],negative_bank=bank,augment=True,
+        sampling=IdentitySampling(bank_coverage_probability=1.))
+    rng = np.random.default_rng(17)
+    state = builder.replace_fresh(clean_sample(cfg),rng)
+    assert state['source'] == 0 and state['location_source'] == 5
+    assert state['patch_on_fiber'][:cfg.recent_patches].sum() >= 2
+    assert 'supervision_fiber' not in state
+    seed = state['identity_seed']
+    builder.prepare(state,parent,rng)
+    assert state['identity_seed'] == seed and '_identity_prepared' not in state
+
+
+def test_separate_roles_supply_both_bands_without_changing_following_source(tmp_path):
+    bank,parent = make_bank(tmp_path/'outer')
+    near,_ = make_bank(tmp_path/'near')
+    publish(bank.root,[add_shard(bank.root,0,x=24.,z_range=(20.,180.))])
+    publish(near.root,[add_shard(near.root,0,x=6.,z_range=(20.,180.))])
+    cfg = IdentityConfig()
+    builder = IdentityObservationBuilder(cfg,[parent],negative_bank=bank,near_negative_bank=near,
+        following_bank=near,sampling=IdentitySampling(rule=ComponentRule(lateral_max=32.),
+            query_patches=True,negative_near_fraction=.5,bank_following_probability=1.))
+    state = item(cfg)
+    presence=np.ones((1,builder.pair_crop.depth,builder.pair_crop.width,builder.pair_crop.width),np.float32)
+    images={'fine':torch.ones(1,2,cfg.fine.depth,cfg.fine.width,cfg.fine.width)}
+    labels = builder.identity_targets([state],images,presence)
+    assert labels['negative_mask'].all()
+    assert (labels['negative_distance'][...,:4] <= 12).all()
+    assert (labels['negative_distance'][...,4:] > 12).all()
+    state = builder.replace_fresh(clean_sample(cfg),np.random.default_rng(3))
+    np.testing.assert_allclose(state['supervision_fiber'].points[:,0],6.)
+
+
 @pytest.mark.parametrize('reverse',[False,True])
 def test_outer_bank_supplies_identity_queries_outside_main_crop(tmp_path,reverse):
     bank,parent = make_bank(tmp_path)

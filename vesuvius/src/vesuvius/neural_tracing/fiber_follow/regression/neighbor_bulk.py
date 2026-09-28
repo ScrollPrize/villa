@@ -17,7 +17,7 @@ import time
 import numpy as np
 
 from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber, ZBand, fiber_manifest, load_fibers, split_fibers
-from vesuvius.neural_tracing.fiber_follow.shared.geometry import interp_at, tangent_at
+from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, interp_at, tangent_at
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import (
     MiningConfig, MiningResources, PolylineIndex, prediction_manifest, review_image,
     seed_pairs, trace_controls, validated_path,
@@ -25,7 +25,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import (
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_dedup import PathCoverage
 
 
-BANK_VERSION = 1
+BANK_VERSION = 2
 
 
 def digest(value):
@@ -51,11 +51,14 @@ def training_eligible(is_training_fiber, origin, cfg, band):
     return bool(is_training_fiber and not (lo < band.hi and hi > band.lo))
 
 
-def pack_paths(paths, ranges, eligible, anchors):
-    return dict(points=np.concatenate(paths) if paths else np.empty((0, 3), np.float64),
+def pack_paths(paths, ranges, eligible, anchors, *, draw_eligible=None):
+    data = dict(points=np.concatenate(paths) if paths else np.empty((0, 3), np.float64),
                 offsets=np.r_[0, np.cumsum([len(p) for p in paths])].astype(np.int64),
                 arc_ranges=np.asarray(ranges, np.float64).reshape(-1, 2),
                 train_eligible=np.asarray(eligible, bool), anchors=np.asarray(anchors, np.float64))
+    if draw_eligible is not None:
+        data['draw_eligible'] = np.asarray(draw_eligible, bool)
+    return data
 
 
 _WORK = None
@@ -92,8 +95,8 @@ def shard_job(job):
     root, run, cfg, res = (_WORK[k] for k in ('root', 'run', 'cfg', 'resources'))
     fiber, index = worker_fiber(fi)
     record = run['fibers'][fi]
-    # Workers propose; only the coordinator may publish globally deduplicated
-    # shards. Unpublished proposals can be reused after an interruption.
+    # Workers propose; only the coordinator publishes relationships and assigns
+    # globally deduplicated following draws. Pending proposals can be reused.
     relative = Path('shards')/f'{fi:04d}'/f'{begin:06d}'
     directory = root/'pending'/relative.relative_to('shards')
     directory.mkdir(parents=True, exist_ok=True)
@@ -167,8 +170,10 @@ def restore_coverage(root, completed, options):
         if hashlib.sha256(bank.read_bytes()).hexdigest() != row['bank_sha256']:
             raise ValueError(f'Damaged shard {bank}')
         with np.load(bank,allow_pickle=False) as data:
-            for a,b in zip(data['offsets'][:-1],data['offsets'][1:]):
-                coverage.add(data['points'][a:b])
+            selected = data['draw_eligible'] if 'draw_eligible' in data else data['train_eligible']
+            for i,(a,b) in enumerate(zip(data['offsets'][:-1],data['offsets'][1:])):
+                if selected[i]:
+                    coverage.add(data['points'][a:b])
     coverage.flush()
     return coverage
 
@@ -189,16 +194,21 @@ def commit_shard(root, run, proposal, coverage):
     if hashlib.sha256((source/'bank.npz').read_bytes()).hexdigest() != proposal['bank_sha256']:
         raise ValueError(f'Damaged proposal {source}')
     rows = json.loads((source/'candidates.json').read_text())
-    paths, ranges, eligible, anchors, kept = [], [], [], [], []
+    paths, ranges, eligible, anchors, kept, draws = [], [], [], [], [], []
     with np.load(source/'bank.npz',allow_pickle=False) as data:
         for i,row in enumerate(rows):
             path = data['points'][data['offsets'][i]:data['offsets'][i+1]]
-            if coverage.duplicate(path):
-                continue
-            coverage.add(path)
+            # Every validated target relationship retains its exact geometry.
+            # Approximate overlap is only a sampling decision: substituting an
+            # earlier nearby path could invalidate this parent's clearance.
+            train = bool(data['train_eligible'][i])
+            draw = train and not coverage.duplicate(path)
+            if draw:
+                coverage.add(path)
+            draws.append(draw)
             paths.append(path.copy())
             ranges.append(data['arc_ranges'][i])
-            eligible.append(bool(data['train_eligible'][i]))
+            eligible.append(train)
             anchors.append(float(data['anchors'][i]))
             kept.append(row)
     destination.mkdir(parents=True,exist_ok=True)
@@ -207,12 +217,15 @@ def commit_shard(root, run, proposal, coverage):
             shutil.copyfile(source/(row['id']+suffix),destination/(row['id']+suffix))
     bank = destination/'bank.npz'
     with bank.with_suffix('.tmp').open('wb') as stream:
-        np.savez(stream,**pack_paths(paths,ranges,eligible,anchors))
+        np.savez(stream,**pack_paths(paths,ranges,eligible,anchors,draw_eligible=draws))
     bank.with_suffix('.tmp').replace(bank)
     write_json(destination/'candidates.json',kept)
     rejected = Counter(proposal['rejected'])
-    rejected['duplicate'] += len(rows)-len(kept)
     result = dict(proposal,candidates=len(kept),training_candidates=sum(eligible),rejected=dict(rejected),
+                  draw_candidates=sum(draws), suppressed_draws=sum(eligible)-sum(draws),
+                  path_lengths=[float(arclength(p)[-1]) for p in paths],
+                  draw_indices=np.flatnonzero(draws).tolist(),
+                  training_indices=np.flatnonzero(eligible).tolist(),
                   bank_sha256=hashlib.sha256(bank.read_bytes()).hexdigest())
     write_json(destination/'done.json',result)  # Atomic commit after all outputs.
     shutil.rmtree(source)
@@ -230,13 +243,16 @@ def publish(root, run, completed, total_jobs, elapsed):
                   completed_anchors=sum(r['anchors'] for r in ordered), total_anchors=run['total_anchors'],
                   candidates=sum(r['candidates'] for r in ordered),
                   training_candidates=sum(r['training_candidates'] for r in ordered),
+                  draw_candidates=sum(r.get('draw_candidates',r['training_candidates']) for r in ordered),
+                  suppressed_draws=sum(r.get('suppressed_draws',0) for r in ordered),
                   evaluation_candidates=sum(r['candidates']-r['training_candidates'] for r in ordered),
                   annotations_with_candidates=len({r['fiber'] for r in ordered if r['candidates']}),
                   rejected=dict(counts), wall_seconds_this_session=elapsed,
                   native_ms=({k: float(v*1000) for k,v in zip(('mean','p50','p95'),
                               (np.mean(timings),np.median(timings),np.quantile(timings,.95)))} if timings else {}))
     write_json(root/'report.json', report)
-    shards = [{k:r[k] for k in ('fiber','begin','end','path','anchor_range','candidates','training_candidates','bank_sha256')} for r in ordered]
+    shards = [{k:r[k] for k in ('fiber','begin','end','path','anchor_range','candidates','training_candidates','bank_sha256',
+                                'draw_candidates','draw_indices','training_indices','path_lengths') if k in r} for r in ordered]
     manifest = dict(version=BANK_VERSION, complete=complete, run_digest=run['digest'], mining=run['mining'],
                     excluded_z=run['excluded_z'], fibers=run['fibers'], shards=shards)
     manifest['sha256'] = digest(manifest)

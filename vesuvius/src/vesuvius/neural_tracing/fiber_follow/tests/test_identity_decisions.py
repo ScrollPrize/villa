@@ -1,0 +1,173 @@
+"""Ownership decisions train the deployed classifier and retain observed references."""
+import copy
+from types import SimpleNamespace
+
+import numpy as np
+import torch
+
+from test_identity import config, batch
+from test_neighbor_bank import make_bank, add_shard, publish
+from test_neighbor_following import clean_sample
+from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import decision_pair
+from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder, seed_anchor, patch_layout
+from vesuvius.neural_tracing.fiber_follow.regression.model import IdentityConfig, IdentityFollower
+from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms, identity_terms
+from vesuvius.neural_tracing.fiber_follow.regression.train import optimizer_update
+from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, OnPolicyStates, fiber_manifest
+from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
+from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams
+
+
+def test_matched_decisions_change_ownership_and_geometry_with_only_reference(tmp_path):
+    bank, parent = make_bank(tmp_path)
+    publish(tmp_path, [add_shard(tmp_path, 0, x=4., z_range=(20., 180.))])
+    cfg = IdentityConfig(persistent_seed=True)
+    builder = IdentityObservationBuilder(cfg, [parent], negative_bank=bank)
+    rng = np.random.default_rng(7)
+    kinds, tails = set(), set()
+    for _ in range(40):
+        rows = decision_pair(bank, clean_sample(cfg), cfg, rng)
+        assert rows is not None
+        a, b = sorted(rows, key=lambda row: 'supervision_fiber' in row)
+        for key in ('pos', 'frame', 'hist_local', 'hmask', 'candidate_points', 'candidate_mask'):
+            np.testing.assert_array_equal(a[key], b[key])
+        assert np.linalg.norm(a['seed_pos']-b['seed_pos']) == 4.
+        assert b['candidate_labels'].sum() == cfg.n_future
+        assert not (a['candidate_labels']*b['candidate_labels']).any()
+        assert a['candidate_mask'].all() and b['candidate_mask'].all()
+        if a['offtrack']:
+            assert not a['candidate_labels'].any()
+            kinds.add('departed')
+            tails.add(a['decision_tail'])
+        else:
+            assert a['candidate_labels'].sum() == cfg.n_future
+            assert np.linalg.norm(a['plane_ab']-b['plane_ab'], axis=-1).min() > 3.9
+            kinds.add('choice')
+        for row in rows:
+            prepared = builder.prepare(row, row.get('supervision_fiber', parent), rng)
+            assert prepared['patch_mask'][cfg.recent_patches:].sum() == 1
+            assert prepared['identity_reference_valid']
+            assert builder.footprint_allowed(prepared, bank.band)
+    assert kinds == {'choice', 'departed'} and 128. in tails
+
+
+def candidate_batch(cfg):
+    data = batch(cfg)
+    curves = torch.zeros(2, 2, cfg.n_future, 3)
+    curves[..., 2] = torch.arange(1, cfg.n_future+1)
+    curves[:, 1, :, 0] = 2.
+    labels = torch.zeros(2, 2, cfg.n_future)
+    labels[0, 0], labels[1, 1] = 1., 1.
+    data.update(candidate_points=curves, candidate_labels=labels, candidate_mask=torch.ones_like(labels),
+                source=torch.full((2,), 5), decision_kind=torch.ones(2), decision_tail=torch.full((2,), 8.))
+    return data
+
+
+def test_candidates_share_deployed_head_and_train_identity_attention():
+    torch.manual_seed(17)
+    model = IdentityFollower(config(persistent_seed=True)).eval()
+    data = candidate_batch(model.cfg)
+    def forward(candidates):
+        return model(data['x'], data['hist'], data['hmask'], candidates=candidates)
+    out = forward(data['candidate_points'])
+    reordered = forward(data['candidate_points'].flip(1))
+    torch.testing.assert_close(out['candidate_confidence_logits'].flip(1), reordered['candidate_confidence_logits'])
+    predicted = forward(out['points'].detach()[:, None])
+    torch.testing.assert_close(predicted['candidate_confidence_logits'][:, 0], predicted['confidence_logits'])
+    terms = loss_terms(out, data, model.cfg)
+    terms['candidate_per_state'].sum().backward()
+    for module in (model.confidence_identity, model.appearance_token, model.appearance,
+                   model.decoder, model.confidence_head):
+        assert sum(float(p.grad.abs().sum()) for p in module.parameters() if p.grad is not None) > 0
+    assert model.coordinates.weight.grad is None  # candidate coordinates are labels
+    data['candidate_mask'].zero_()
+    assert loss_terms(out, data, model.cfg)['candidate_per_state'].eq(0).all()
+
+
+def test_candidate_update_independent_of_microbatch_boundaries():
+    torch.manual_seed(4)
+    a = IdentityFollower(config(persistent_seed=True))
+    b = copy.deepcopy(a)
+    data = candidate_batch(a.cfg)
+    data['candidate_mask'][1] = 0  # unknown states contribute zero, not a new denominator
+    def take(value, sl):
+        return {k: take(v, sl) for k, v in value.items()} if isinstance(value, dict) else value[sl]
+    results = []
+    for model, batches in ((a, [data]), (b, [take(data, slice(0, 1)), take(data, slice(1, 2))])):
+        results.append(optimizer_update(model, copy.deepcopy(model), torch.optim.SGD(model.parameters(), lr=.001),
+                                        batches, 1, .001, compute_metrics=True))
+    np.testing.assert_allclose(results[0]['loss'], results[1]['loss'], rtol=2e-5)
+    assert results[0]['identity']['candidate_states'] == results[1]['identity']['candidate_states'] == 1
+    for pa, pb in zip(a.parameters(), b.parameters()):
+        torch.testing.assert_close(pa, pb, rtol=2e-5, atol=1e-7)
+
+
+def test_observed_seed_at_start_and_single_seed_infonce():
+    cfg = config(persistent_seed=True)
+    state = dict(pos=np.array([20., 30., 40.]), frame=np.eye(3),
+                 hist_local=np.zeros((cfg.n_history, 3)), hmask=np.zeros(cfg.n_history))
+    state.update(observed_seed(**state))
+    state.update(seed_anchor(state, cfg))
+    patch_layout(state, cfg)
+    assert state['patch_mask'].sum() == 1
+    np.testing.assert_array_equal(state['patch_centers'][cfg.recent_patches], 0.)
+    model = IdentityFollower(cfg)
+    data = batch(cfg, 1)
+    data['x']['patch_mask'].zero_()
+    data['x']['patch_mask'][:, cfg.recent_patches] = 1.
+    data['patch_on_fiber'] = data['x']['patch_mask'].clone()
+    data['identity_seed_fallback'] = torch.ones(1, dtype=torch.bool)
+    out = model(data['x'], data['hist'], data['hmask'], queries=data['identity_points'])
+    assert identity_terms(out, data, cfg)['identity_states'] == 1
+
+
+def test_replay_roundtrip_preserves_seed_and_legacy_replay_stays_unknown(tmp_path):
+    bank, parent = make_bank(tmp_path/'bank')
+    cfg = IdentityConfig(persistent_seed=True)
+    arrays = dict(fiber_idx=[0], t=[100.], reverse=[False], pos=[[0., 0., 100.]],
+                  frame=[np.eye(3)], hist=np.zeros((1, cfg.n_history, 3)), hmask=np.zeros((1, cfg.n_history)),
+                  offtrack=[False], hard=[False], exploratory=[False])
+    ds = object.__new__(FollowDataset)
+    ds.fibers, ds.cfg, ds.exclude, ds.additional_crops = [parent], clean_sample(cfg), bank.band, (cfg.coarse,)
+    ds.batch_builder = IdentityObservationBuilder(cfg, [parent], negative_bank=bank)
+    for valid in (False, True):
+        seed = dict(seed_pos=[[0., 0., 20.]], seed_tangent=[[0., 0., 1.]], seed_age=[80.], seed_valid=[True]) if valid else {}
+        states = OnPolicyStates(manifest=fiber_manifest([parent]), **arrays, **seed)
+        path = tmp_path/f'{valid}.npz'
+        states.save(path)
+        loaded = OnPolicyStates.load(path)
+        row = ds.replay_item((1, 0, loaded, 0), np.random.default_rng(0))
+        assert bool(row['seed_valid']) == valid
+        assert row['patch_mask'][cfg.recent_patches:].sum() == int(valid)
+        for field in SEED_FIELDS:
+            np.testing.assert_array_equal(getattr(loaded, field), getattr(states, field))
+
+
+def test_trace_keeps_seed_from_first_decision_through_recovery():
+    class Model(torch.nn.Module):
+        cfg = SimpleNamespace(max_recovery_distance=4.)
+        def forward(self, x, hist, hmask):
+            points = torch.zeros(len(hist), 2, 3)
+            points[..., 2] = torch.tensor([1., 2.])
+            return dict(points=points, confidence=torch.ones(len(hist), 2))
+    class Tracer(ModelTracer):
+        path_context = True
+        def build_inputs(self, pos, fr, hist, hm, **context):
+            return {}
+    tracer = object.__new__(Tracer)
+    tracer.model, tracer.device, tracer.n_history = Model(), 'cpu', 8
+    tracer.vol = SimpleNamespace(shape=(1000, 1000, 1000))
+    tracer.p = TraceParams(n_commit=2, max_len=6.)
+    rows = []
+    tracer._trace(np.array([[10., 20., 30.]]), np.array([[0., 0., 1.]]), None, None,
+                  lambda i, state: rows.append(state))
+    assert len(rows) == 3 and [r['seed_age'] for r in rows] == [0., 2., 4.]
+    for row in rows:
+        np.testing.assert_array_equal(row['seed_pos'], [10., 20., 30.])
+        assert row['seed_valid']
+    recovered = dict(rows[1], seed_pos=np.array([1., 2., 3.]), seed_age=90.)
+    rows.clear()
+    tracer._trace(recovered['pos'][None], np.array([[0., 0., 1.]]), None, None,
+                  lambda i, state: rows.append(state), initial_states=[recovered])
+    np.testing.assert_array_equal(rows[-1]['seed_pos'], recovered['seed_pos'])
+    assert rows[-1]['seed_age'] == 94.

@@ -31,7 +31,7 @@ class NeighborBank:
         if self.root.name == 'bank.json':
             self.root = self.root.parent
         self.run = json.loads((self.root/'run.json').read_text())
-        if self.run.get('version') != BANK_VERSION or digest({k:v for k,v in self.run.items() if k != 'digest'}) != self.run.get('digest'):
+        if self.run.get('version') not in (1, BANK_VERSION) or digest({k:v for k,v in self.run.items() if k != 'digest'}) != self.run.get('digest'):
             raise ValueError('Invalid negative-bank run metadata')
         if self.run['mining']['grid_scale'] != grid_scale:
             raise ValueError('Negative-bank coordinate scale differs from training')
@@ -82,7 +82,7 @@ class NeighborBank:
         if signature == self._signature:
             return False
         value = json.loads(path.read_text())
-        if value.get('version') != BANK_VERSION or value.get('run_digest') != self.run['digest']:
+        if value.get('version') != self.run['version'] or value.get('run_digest') != self.run['digest']:
             raise ValueError('Negative-bank run changed during training')
         if value.get('sha256') != digest({k:v for k,v in value.items() if k != 'sha256'}):
             raise ValueError('Negative-bank index checksum mismatch')
@@ -147,6 +147,7 @@ class NeighborBank:
             raise ValueError(f'Negative-bank shard checksum mismatch: {key}')
         with np.load(io.BytesIO(raw), allow_pickle=False) as archive:
             data = {k:archive[k] for k in ('points','offsets','arc_ranges','train_eligible','anchors')}
+            data['draw_eligible'] = archive['draw_eligible'] if 'draw_eligible' in archive else data['train_eligible'].copy()
         p, offsets, ranges, eligible = (data[k] for k in ('points','offsets','arc_ranges','train_eligible'))
         n = entry['candidates']
         if (p.ndim != 2 or p.shape[1] != 3 or not np.isfinite(p).all() or offsets.shape != (n+1,)
@@ -155,6 +156,13 @@ class NeighborBank:
                 or np.any(ranges[:,0] >= ranges[:,1]) or eligible.shape != (n,) or eligible.dtype != np.dtype(bool)
                 or int(eligible.sum()) != entry['training_candidates'] or data['anchors'].shape != (n,)):
             raise ValueError(f'Invalid negative-bank geometry: {key}')
+        draws = data['draw_eligible']
+        if (draws.shape != (n,) or draws.dtype != np.dtype(bool) or np.any(draws & ~eligible)
+                or ('draw_candidates' in entry and int(draws.sum()) != entry['draw_candidates'])
+                or ('draw_indices' in entry and np.flatnonzero(draws).tolist() != entry['draw_indices'])):
+            raise ValueError(f'Invalid negative-bank draw eligibility: {key}')
+        if 'training_indices' in entry and np.flatnonzero(eligible).tolist() != entry['training_indices']:
+            raise ValueError(f'Invalid negative-bank training eligibility: {key}')
         lines = {}
         for i in np.flatnonzero(eligible if self.training else ~eligible):
             line = p[offsets[i]:offsets[i+1]]
@@ -189,8 +197,12 @@ class NeighborBank:
                     lines.append(line)
         return lines
 
-    def draw_path(self, rng):
-        """Uniform over published training paths belonging to this dataset."""
+    def draw_path(self, rng, *, unique=True, min_length=0.):
+        """Following draws use unique geometry; other roles may use all relationships.
+
+        Version-2 length metadata selects fitting paths before loading geometry.
+        Old shards use bounded rejection sampling without a full-bank scan.
+        """
         if not self.training:
             return None
         self.refresh()
@@ -198,11 +210,30 @@ class NeighborBank:
         shards = [s for fi,rows in self._by_fiber.items() if fi in local_ids for s in rows]
         if not shards:
             return None
-        sizes = np.array([s['training_candidates'] for s in shards],dtype=float)
-        entry = shards[int(rng.choice(len(shards),p=sizes/sizes.sum()))]
-        data = self._shard(entry)
-        i = int(rng.choice(list(data['lines'])))
-        return local_ids[entry['fiber']],data['lines'][i],data['arc_ranges'][i]
+        sizes = []
+        for s in shards:
+            count = s.get('draw_candidates',s['training_candidates']) if unique else s['training_candidates']
+            indices = s.get('draw_indices' if unique else 'training_indices')
+            if min_length and 'path_lengths' in s and indices is not None:
+                count = sum(s['path_lengths'][i] >= min_length for i in indices)
+            elif min_length and 'path_lengths' in s and max(s['path_lengths'],default=0.) < min_length:
+                count = 0
+            sizes.append(count)
+        sizes = np.asarray(sizes,float)
+        if not sizes.any():
+            return None
+        for _ in range(8 if min_length else 1):
+            entry = shards[int(rng.choice(len(shards),p=sizes/sizes.sum()))]
+            data = self._shard(entry)
+            ids = [i for i,p in data['lines'].items() if (not unique or data['draw_eligible'][i])
+                   and (not min_length or arclength(p)[-1] >= min_length)]
+            if ids:
+                i = int(rng.choice(ids))
+                return local_ids[entry['fiber']],data['lines'][i],data['arc_ranges'][i]
+            sizes[shards.index(entry)] = 0
+            if not sizes.any():
+                break
+        return None
 
     def _target_tree(self, fi):
         if fi not in self._trees:
@@ -231,7 +262,7 @@ class NeighborBank:
         tree,gap = self.state_target_tree(item)
         return tree.query(np.asarray(world).reshape(-1,3))[0]-gap > self.exclusion
 
-    def candidates(self, item, crop, presence, rule, *, mask_crop=None):
+    def candidates(self, item, crop, presence, rule, *, mask_crop=None, additional_banks=()):
         """Exact centerline queries, with whole-annotation clearance.
 
         Confidence labels rasterize only cells containing these line samples;
@@ -248,18 +279,21 @@ class NeighborBank:
             lines = [interp_at(fiber.points,fiber.s,np.arange(max(0.,a),min(fiber.length,b)+1e-9,.25))]
         else:
             lines = self.paths(fi,fiber.length-t if reverse else t)
+            for bank in additional_banks:
+                lines.extend(bank.paths(fi,fiber.length-t if reverse else t))
         mask_crop = crop if mask_crop is None else mask_crop
         shape = (mask_crop.depth,mask_crop.width,mask_crop.width)
         mask = np.zeros(shape,bool)
-        empty = dict(foreign=mask, local=np.empty((0,3)), nearest=np.empty(0,np.int64),
+        empty = dict(foreign=mask, local=np.empty((0,3)), nearest=np.empty(0,np.int64), path_ids=np.empty(0,np.int64),
                      counts=dict(foreign_components=0))
         if not lines or len(item['identity_curve']) < 3:
             return empty
         pos, frame = np.asarray(item['pos']), np.asarray(item['frame'])
         local = np.concatenate([(p-pos) @ frame for p in lines])
+        path_ids = np.repeat(np.arange(len(lines)),[len(p) for p in lines])
         indices = crop_indices(crop,local)
         near = np.all((indices >= 0) & (indices <= np.asarray(presence.shape)-1),axis=1)
-        local,indices = local[near],indices[near]
+        local,indices,path_ids = local[near],indices[near],path_ids[near]
         if not len(local):
             return empty
         tree, gap = self.state_target_tree(item)
@@ -267,12 +301,12 @@ class NeighborBank:
         keep &= tree.query(local @ frame.T+pos)[0]-gap > max(self.exclusion,rule.own_radius)
         nearest = cKDTree(item['identity_curve']).query(local)[1]
         keep &= (nearest > 0) & (nearest < len(item['identity_curve'])-1)
-        local,nearest = local[keep],nearest[keep]
+        local,nearest,path_ids = local[keep],nearest[keep],path_ids[keep]
         voxels = np.unique(np.rint(crop_indices(mask_crop,local)).astype(int),axis=0)
         voxels = voxels[np.all((voxels >= 0) & (voxels < np.asarray(shape)),axis=1)]
         points = crop_local_grid(mask_crop)[tuple(voxels.T)]
         half_cell = np.sqrt(3)*mask_crop.spacing/2
         keep = tree.query(points @ frame.T+pos)[0]-gap-half_cell > max(self.exclusion,rule.own_radius)
         mask[tuple(voxels[keep].T)] = True
-        return dict(foreign=mask, local=local, nearest=nearest,
+        return dict(foreign=mask, local=local, nearest=nearest, path_ids=path_ids,
                     counts=dict(foreign_components=int(bool(len(local)))))

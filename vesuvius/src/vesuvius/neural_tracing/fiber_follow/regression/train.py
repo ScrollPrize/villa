@@ -31,6 +31,8 @@ from vesuvius.neural_tracing.fiber_follow.shared.components import PAIR_SAMPLING
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import commit_window, loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import (
     decision_rows, summarize_decisions, identity_ranking, summarize_ranking,
+    identity_training_groups, summarize_identity_groups,
+    candidate_decisions, summarize_candidates,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.recovery import monitor_fixture, evaluate_monitor
 from vesuvius.neural_tracing.fiber_follow.shared.training_log import format_training_log
@@ -160,12 +162,12 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
 
 
 IDENTITY_SUMS = ('identity_count', 'identity_states', 'identity_rank_correct', 'identity_correct_count',
-                 'identity_flipped_count')
+                 'identity_flipped_count', 'candidate_states')
 
 
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
                      confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True,
-                     identity_weight=.5, identity_temperature=.1):
+                     identity_weight=.5, identity_temperature=.1, candidate_weight=1.):
     """Equal weight per observed state, independent of microbatch boundaries.
 
     Within a state each loss averages over its known points; fully unknown
@@ -179,14 +181,22 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
     opt.zero_grad(set_to_none=True)
     sums = dict(loss=0., geometry=0., confidence_loss=0., error_sum=0., geometry_count=0.,
                 correct_count=0., confidence_count=0.)
-    sources = np.zeros(5, dtype=np.int64)
+    sources = np.zeros(6, dtype=np.int64)
     bank_tails = []
     identity = {}
+    identity_groups = {}
+    candidate_groups = {}
+    requested_decisions = 0.
+    pair_version = PAIR_SAMPLING_VERSION
     decisions, rankings = [], []
     model.train()
     for cpu in batches:
+        if 'pair_sampling_version' in cpu:
+            pair_version = int(cpu['pair_sampling_version'][0])
         batch = move_batch(cpu, device)
         queries = dict(queries=batch['identity_points']) if 'identity_points' in batch else {}
+        if 'candidate_points' in batch:
+            queries['candidates'] = batch['candidate_points']
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=torch.device(device).type == 'cuda'):
             output = model(batch['x'], batch['hist'], batch['hmask'], **queries)
             terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit,
@@ -198,19 +208,34 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 identity_loss = terms['identity_per_state'].sum()/total
                 loss = loss + identity_weight*identity_loss
                 identity['identity_loss'] = identity.get('identity_loss', 0.)+identity_loss.detach().item()
+            if 'candidate_per_state' in terms:
+                candidate_loss = terms['candidate_per_state'].sum()/total
+                loss = loss+candidate_weight*candidate_loss
+                identity['candidate_loss'] = identity.get('candidate_loss', 0.)+candidate_loss.detach().item()
         if not torch.isfinite(loss):
             raise FloatingPointError(f'Nonfinite loss at step {step}')
         loss.backward()
         if compute_metrics:
             decisions.extend(decision_rows(output, batch, model.cfg, n_commit, tolerance))
+            if 'candidate_confidence_logits' in output:
+                for name, row in candidate_decisions(output, batch, model.cfg, n_commit).items():
+                    group = candidate_groups.setdefault(name, {})
+                    for key, value in row.items():
+                        group[key] = group.get(key, 0)+value
             if 'query_embedding' in output:
                 rankings.append(identity_ranking(output, batch, model.cfg))
+                for name,row in identity_training_groups(output,batch,terms,model.cfg,identity_temperature).items():
+                    group = identity_groups.setdefault(name,{})
+                    for key,value in row.items():
+                        group[key] = group.get(key,0)+value
         for key in IDENTITY_SUMS:
             if key in terms:
                 identity[key] = identity.get(key, 0.)+terms[key].detach().item()
-        for key in ('presence_dropped', 'foreign_components'):
+        for key in ('presence_dropped', 'foreign_components', 'seed_present'):
             if key in cpu:
                 identity[key] = identity.get(key, 0.)+float((cpu[key] > 0).sum())
+        if 'decision_requested' in cpu:
+            requested_decisions += float(cpu['decision_requested'].sum())
         if 'negative_bank_shards' in cpu:
             low,high = int(cpu['negative_bank_shards'].min()),int(cpu['negative_bank_shards'].max())
             identity['negative_bank_shards_min'] = min(identity.get('negative_bank_shards_min',low),low)
@@ -235,16 +260,21 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 prefix_correct_fraction=sums['correct_count']/max(1., sums['confidence_count']),
                 fresh_fraction=float(sources[0]/total), fixed_fraction=float(sources[1]/total),
                 recent_fraction=float(sources[2]/total),bank_wrong_continuation_fraction=float(sources[3]/total),
-                bank_following_fraction=float(sources[4]/total))
+                bank_following_fraction=float(sources[4]/total),
+                decision_pair_fraction=float(sources[5]/total), decision_requested_fraction=requested_decisions/total)
     sums.update(bank_wrong_continuation_tail_mean=float(np.mean(bank_tails)) if bank_tails else None,
                 bank_wrong_continuation_tail_min=min(bank_tails) if bank_tails else None,
                 bank_wrong_continuation_tail_max=max(bank_tails) if bank_tails else None)
     if identity:
         # Versioned separately from the distance metrics above.
-        identity.update(identity_version=1, pair_sampling_version=PAIR_SAMPLING_VERSION,
+        identity.update(identity_version=1, pair_sampling_version=pair_version,
+                        eligible_fraction=identity.get('identity_states',0.)/total,
                         identity_rank_accuracy=identity.get('identity_rank_correct', 0.)/max(1., identity.get('identity_count', 0.)),
                         identity_prefix_correct_fraction=identity.get('identity_correct_count', 0.)/max(1., sums['confidence_count']))
-        for key in ('presence_dropped', 'foreign_components', *(f'location_{n}' for n in LOCATION_SOURCES)):
+        identity['identity_loss_eligible'] = identity.get('identity_loss', 0.)*total/max(1., identity.get('identity_states', 0.))
+        if 'candidate_loss' in identity:
+            identity['candidate_loss_eligible'] = identity['candidate_loss']*total/max(1., identity.get('candidate_states', 0.))
+        for key in ('presence_dropped', 'foreign_components', 'seed_present', *(f'location_{n}' for n in LOCATION_SOURCES)):
             if key in identity:
                 identity[key+'_fraction'] = identity.pop(key)/total
         sums['identity'] = identity
@@ -252,26 +282,38 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         sums['decisions'] = summarize_decisions(decisions, commit_window(model.cfg, n_commit))
         if rankings:
             sums['identity']['ranking'] = summarize_ranking(rankings)
+            sums['identity']['training_groups'] = summarize_identity_groups(identity_groups)
+        if candidate_groups:
+            sums['identity']['candidate_decisions'] = summarize_candidates(candidate_groups)
     return sums
 
 
 def resolve_bank_tail_range(requested, resume=None):
     """Old checkpoints keep their 4–12 voxel tails; new runs default to 4–128."""
     from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import validate_tail_range
-    saved = resume['training_options'].get('bank_wrong_continuation_tail', (4., 12.)) if resume else None
+    saved = resume['training_options'].get('bank_wrong_continuation_tail',
+        (resume.get('identity_sampling') or {}).get('bank_wrong_continuation_tail',(4.,12.))) if resume else None
     value = validate_tail_range(requested if requested is not None else saved or (4., 128.))
     if saved is not None and value != validate_tail_range(saved):
         raise ValueError('Resume option differs: bank_wrong_continuation_tail')
     return list(value)
 
 
-def resolve_bank_option(requested, resume, name, default, legacy):
+def resolve_bank_option(requested, resume, name, default, legacy, *, sampling_name=None):
     """Resolve a new sampling option without silently changing old resumes."""
-    saved = resume['training_options'].get(name,legacy) if resume else None
+    sampling = (resume.get('identity_sampling') or {}) if resume else {}
+    fallback = (sampling.get('rule') or {}).get('lateral_max',legacy) if name == 'negative_lateral_max' else sampling.get(sampling_name or name,legacy)
+    saved = resume['training_options'].get(name,fallback) if resume else None
     value = requested if requested is not None else (saved if resume else default)
     if resume and value != saved:
         raise ValueError(f'Resume option differs: {name}')
     return value
+
+
+# New runs opt in; resumes without saved settings retain their sampling policy.
+BANK_SAMPLING_DEFAULTS = dict(negative_near_fraction=(.5,None),negative_near_distance=(12.,12.),
+    bank_coverage_probability=(.2,0.),seed_anchor_fallback=(True,False),
+    require_departure_reference=(True,False),prefer_long_continuations=(True,False))
 
 
 def build_parser():
@@ -310,10 +352,23 @@ def build_parser():
                     help=f'Train {IDENTITY_ARCHITECTURE}: CT-only visual history and identity objective')
     ap.add_argument('--identity-weight', type=float, default=.5, help='InfoNCE coefficient')
     ap.add_argument('--identity-temperature', type=float, default=.1)
+    ap.add_argument('--persistent-seed', action=argparse.BooleanOptionalAction, default=None,
+                    help='Keep the observed original seed from the first decision and preserve it in replay')
+    ap.add_argument('--decision-fraction', type=float,
+                    help='Fraction of all training states reserved for matched identity pairs (default: 0)')
+    ap.add_argument('--candidate-weight', type=float, default=1., help='Weight of candidate prefix BCE through the existing confidence head')
     ap.add_argument('--appearance-channels', type=int, default=32)
     ap.add_argument('--embedding', type=int, default=32)
     ap.add_argument('--negative-threshold', type=float, default=ComponentRule().threshold, help='Minimum interpolated presence for centerline pairs')
     ap.add_argument('--negative-bank', help='Shared live bank for InfoNCE negatives, wrong continuations and following supervision')
+    ap.add_argument('--near-negative-bank', help='Additional bank of validated nearby negative relationships')
+    ap.add_argument('--following-bank', help='Following path source (default: negative-bank)')
+    ap.add_argument('--continuation-bank', help='Wrong-continuation path source (default: negative-bank)')
+    ap.add_argument('--negative-near-fraction', type=float, help='Negative slots reserved for nearby paths (new runs: .5)')
+    ap.add_argument('--negative-near-distance', type=float, help='Near/outer split in trace voxels (default: 12)')
+    ap.add_argument('--bank-coverage-probability', type=float, help='Fresh slots reserved for covered parents with usable history (new runs: .2)')
+    for name in ('seed-anchor-fallback','require-departure-reference','prefer-long-continuations'):
+        ap.add_argument('--'+name,action=argparse.BooleanOptionalAction,default=None)
     ap.add_argument('--negative-lateral-max', type=float,
                     help='Maximum identity-negative distance (new patch-query runs: inferred from the shared bank)')
     ap.add_argument('--identity-query-patches', action=argparse.BooleanOptionalAction, default=None,
@@ -387,7 +442,8 @@ def main(argv=None):
     np.random.seed(args.seed)
     options = dict(channels=args.channels, layers=args.decoder_layers, correction=args.correction,
                    correction_limit=args.correction_limit, correction_steps=args.correction_steps)
-    cfg = (IdentityConfig(**options, appearance_channels=args.appearance_channels, embedding=args.embedding)
+    cfg = (IdentityConfig(**options, appearance_channels=args.appearance_channels, embedding=args.embedding,
+                          persistent_seed=bool(args.persistent_seed))
            if args.identity else DirectConfig(**options))
     initialized = None
     resume = None
@@ -401,22 +457,38 @@ def main(argv=None):
         cfg = checkpoint_config(resume)
     args.bank_wrong_continuation_tail = resolve_bank_tail_range(args.bank_wrong_continuation_tail, resume)
     identity_enabled = isinstance(cfg,IdentityConfig)
+    if args.persistent_seed is not None and args.persistent_seed != getattr(cfg, 'persistent_seed', False):
+        raise ValueError('Persistent seed setting differs from checkpoint architecture')
+    args.persistent_seed = getattr(cfg, 'persistent_seed', False)
+    args.decision_fraction = resolve_bank_option(args.decision_fraction, resume, 'decision_fraction', 0., 0.)
+    if args.decision_fraction and (not args.persistent_seed or args.microbatch % 2):
+        raise ValueError('Matched decisions require --persistent-seed and an even microbatch')
+    if not np.isfinite(args.candidate_weight) or args.candidate_weight <= 0:
+        raise ValueError('Candidate weight must be finite and positive')
     args.bank_following_probability = resolve_bank_option(args.bank_following_probability,resume,
         'bank_following_probability',.1 if identity_enabled else 0.,0.)
     args.identity_query_patches = resolve_bank_option(args.identity_query_patches,resume,
-        'identity_query_patches',identity_enabled,False)
+        'identity_query_patches',identity_enabled,False,sampling_name='query_patches')
+    sampling_options = {}
+    for name,(default,legacy) in BANK_SAMPLING_DEFAULTS.items():
+        value = resolve_bank_option(getattr(args,name),resume,name,default if identity_enabled else legacy,legacy)
+        setattr(args,name,value)
+        sampling_options[name] = value
     identity_sampling = IdentitySampling(
         rule=ComponentRule(threshold=args.negative_threshold), anchor_prob=args.anchor_prob,
         presence_dropout=args.presence_dropout, contact_fraction=args.contact_fraction,
         hard_span_fraction=args.hard_span_fraction, lateral_fraction=args.lateral_fraction,
         bank_wrong_continuation_probability=args.bank_wrong_continuation_probability,
         bank_wrong_continuation_tail=args.bank_wrong_continuation_tail,
-        bank_following_probability=args.bank_following_probability,query_patches=args.identity_query_patches)
+        bank_following_probability=args.bank_following_probability,query_patches=args.identity_query_patches,
+        decision_fraction=args.decision_fraction,
+        pair_sampling_version=(resume.get('identity_sampling') or {}).get('pair_sampling_version',3) if resume else PAIR_SAMPLING_VERSION,
+        **sampling_options)
     if identity_enabled and not args.negative_bank:
         raise ValueError('Identity training requires --negative-bank; presence-component negatives are retired')
     if min(args.identity_weight,args.identity_temperature) <= 0 and identity_enabled:
         raise ValueError('Identity weight and temperature must be positive')
-    if args.negative_bank and not identity_enabled:
+    if any((args.negative_bank,args.near_negative_bank,args.following_bank,args.continuation_bank)) and not identity_enabled:
         raise ValueError('--negative-bank requires an identity follower')
     if args.bank_following_probability and not args.negative_bank:
         raise ValueError('--bank-following-probability requires --negative-bank')
@@ -440,6 +512,7 @@ def main(argv=None):
     if fiber_manifest(val_f) != manifest['fibers']:
         raise ValueError('Frozen validation geometry differs from dataset/holdout')
     negative_bank = None
+    role_banks = {}
     if args.negative_bank:
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
         negative_bank = NeighborBank(args.negative_bank,train_f,band,grid_scale=spec.grid_scale,
@@ -448,10 +521,28 @@ def main(argv=None):
         if resume and (resume.get('negative_bank_provenance') is not None or resume['training_options'].get('negative_bank')):
             negative_bank.validate_resume(resume.get('negative_bank_provenance'))
         progress(f'Live negative bank: {negative_bank.shard_count} published shards, refresh every {args.negative_bank_refresh_seconds:g}s per worker')
-    inferred_radius = (negative_bank.run['mining']['max_distance']
+        by_path = {negative_bank.root:negative_bank}
+        for role in ('near_negative_bank','following_bank','continuation_bank'):
+            path = getattr(args,role)
+            if path is None:
+                continue
+            root = Path(path).resolve()
+            if root.name == 'bank.json':
+                root = root.parent
+            if root not in by_path:
+                by_path[root] = NeighborBank(root,train_f,band,grid_scale=spec.grid_scale,
+                    refresh_seconds=args.negative_bank_refresh_seconds,cache_bytes=int(args.negative_bank_cache_mb*(1 << 20)))
+                by_path[root].validate_volume(spec)
+            role_banks[role] = by_path[root]
+            if resume:
+                role_banks[role].validate_resume((resume.get('bank_role_provenance') or {}).get(role))
+    def role_provenance():
+        return {role:bank.provenance() for role,bank in role_banks.items()}
+    inferred_radius = (max(b.run['mining']['max_distance'] for b in
+                           [negative_bank]+([role_banks['near_negative_bank']] if 'near_negative_bank' in role_banks else []))
                        if negative_bank is not None and args.identity_query_patches else ComponentRule().lateral_max)
     args.negative_lateral_max = resolve_bank_option(args.negative_lateral_max,resume,
-        'negative_lateral_max',inferred_radius,ComponentRule().lateral_max)
+        'negative_lateral_max',inferred_radius,10.)
     identity_sampling = IdentitySampling(**{**asdict(identity_sampling),
         'rule':ComponentRule(threshold=args.negative_threshold,lateral_max=args.negative_lateral_max)})
     if args.negative_lateral_max > ComponentRule().lateral_max and not args.identity_query_patches:
@@ -462,7 +553,7 @@ def main(argv=None):
                    'log_every', 'ckpt_every', 'diag_every', 'dagger_device', 'compile', 'init_tracer',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb',
                    'bank_wrong_continuation_tail','bank_following_probability',
-                   'identity_query_patches','negative_lateral_max'}  # resolved and checked above
+                   'identity_query_patches','negative_lateral_max','persistent_seed','decision_fraction',*BANK_SAMPLING_DEFAULTS}  # resolved and checked above
         parser = build_parser()
         for key, value in vars(args).items():
             if key in ('long_diag_every', 'long_diag_max_len') and key not in resume['training_options'] and not args.long_diag_every:
@@ -518,7 +609,7 @@ def main(argv=None):
         hard_spans = load_hard_spans(args.hard_spans, train_f) if args.hard_spans else ()
         progress(f'Identity sampling: {len(contacts)} contact episodes, {len(hard_spans)} hard spans; maximum negative lateral distance {identity_sampling.rule.lateral_max:g} voxels')
         builder = IdentityObservationBuilder(cfg, train_f, identity_sampling, contacts=contacts,
-                                             hard_spans=hard_spans, augment=True,negative_bank=negative_bank)
+                                             hard_spans=hard_spans, augment=True,negative_bank=negative_bank,**role_banks)
     else:
         builder = ObservationBuilder(cfg)
     dataset = FollowDataset(train_f, spec, sample, band, chunk=args.microbatch, seed=args.seed+done,
@@ -533,6 +624,7 @@ def main(argv=None):
         (out/'config.json').write_text(json.dumps(dict(vars(args), architecture=model.architecture,
             identity_sampling=asdict(identity_sampling) if identity_enabled else None,
             negative_bank_provenance=negative_bank.provenance() if negative_bank else None,
+            bank_role_provenance=role_provenance(),
             model_cfg=cfg.to_dict(), sample_cfg=asdict(sample), vol_spec=spec.to_dict(),
             coarse_ct_level=1, coarse_ct_grid_scale=8., data_policy=DATA_POLICY,
             monitor_recovery_sha256=recovery_hash,
@@ -540,12 +632,14 @@ def main(argv=None):
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
     log = RunLog(out/'log.jsonl', formatter=format_training_log)
     if identity_enabled:
-        log.record(dict(step=done, event='identity_sampling', pair_sampling_version=PAIR_SAMPLING_VERSION,
+        log.record(dict(step=done, event='identity_sampling', pair_sampling_version=identity_sampling.pair_sampling_version,
                         negative_lateral_max=identity_sampling.rule.lateral_max,
                         bank_following_probability=identity_sampling.bank_following_probability,
                         identity_query_patches=identity_sampling.query_patches,
-                        resume=args.resume, history_policy='full_shared_target_history',
-                        negative_source='native_path_bank_v1',negative_bank_path=str(negative_bank.root),
+                        resume=args.resume, history_policy=('persistent_observed_seed' if args.persistent_seed
+                                                            else 'full_shared_target_history'),
+                        negative_source=f'native_path_bank_v{negative_bank.run["version"]}',negative_bank_path=str(negative_bank.root),
+                        bank_role_provenance=role_provenance(),sampling=asdict(identity_sampling),
                         negative_bank_provenance=negative_bank.provenance() if negative_bank else None))
     tracer = None
     recovery_vol = FiberVolume(spec) if recovery_states is not None else None
@@ -578,7 +672,8 @@ def main(argv=None):
             metrics = optimizer_update(trainable, ema, opt, batches, step, lr, device=args.device,
                 tolerance=args.tolerance, confidence_weight=args.confidence_weight, ema_decay=args.ema_decay,
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
-                identity_weight=args.identity_weight, identity_temperature=args.identity_temperature)
+                identity_weight=args.identity_weight, identity_temperature=args.identity_temperature,
+                candidate_weight=args.candidate_weight)
             if early:
                 progress(f'Update {step} complete in {time.monotonic()-update_started:.1f}s; loss={metrics["loss"]:.5f}')
                 if step == done+5:
@@ -592,6 +687,7 @@ def main(argv=None):
                 extra = dict(step=step, tolerance=args.tolerance, n_commit=args.n_commit,
                     identity_sampling=asdict(identity_sampling) if identity_enabled else None,
                     negative_bank_provenance=negative_bank.provenance() if negative_bank else None,
+                    bank_role_provenance=role_provenance(),
                     seed_manifest_sha256=manifest['sha256'], training_options=vars(args),
                     monitor_recovery_sha256=recovery_hash,
                     fiber_manifest=fiber_manifest(fibers))

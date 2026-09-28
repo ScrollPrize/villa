@@ -5,6 +5,49 @@ curve in one decoder pass followed by two bounded local corrections, directly
 supervised against annotated geometry.
 The flow model and its training commands remain available separately.
 
+## Explicit identity decisions
+
+Run the full identity experiment from fresh weights with:
+
+```bash
+bash scripts/launch_identity_decisions.sh
+tail -f output/logs/direct_identity_decisions_run1.log
+```
+
+This launcher retains the full dataset, live neighbor bank and 100,000-step
+schedule of `launch_identity_shared_bank.sh`. Its new options are
+`--persistent-seed --decision-fraction 0.25 --candidate-weight 1.0`.
+It disables the older replay-only wrong-continuation replacement because
+matched departure pairs now supply that supervision directly.
+
+Matched pairs share current position, frame, observed recent history and two
+candidate continuations. Changing the original seed changes which continuation
+belongs to the target. Choice pairs supervise both the appropriate geometry and
+candidate ownership. Departure pairs put recent history entirely on B: a B seed
+permits continuing B, while an A seed requires stopping. Wrong-tail lengths span
+8–128 trace voxels. Candidate order and pair order are randomized. Independent
+photometric augmentation still applies to each state.
+
+Candidate prefix BCE uses the existing prediction confidence head, including its
+identity attention. No additional decision head or inference candidate search is
+introduced. Loss is ordinary geometry + 0.5 prediction-confidence BCE + 0.5
+InfoNCE + 1.0 candidate BCE, averaged per observed state. Unsupported candidates
+are masked. About 25% of all states are requested as complete pairs; unavailable
+or held-out bank examples fall back to ordinary samples. Logs report both the
+requested and realized fractions, candidate acceptance/rejection by case and
+tail length, and InfoNCE averaged over eligible states as well as all states.
+
+The persistent reference is one CT patch at the observed seed, active from the
+first decision. Synthetic states use their observed path start; paired states
+explicitly simulate different original seeds. Traces and newly collected replay
+preserve the same seed position, direction and age. Old replay without a recorded
+seed keeps it absent instead of substituting annotation-derived history.
+The reference occupies the first existing anchor slot; other anchor slots are
+masked. Older checkpoints retain their old anchor behavior. Start fresh when
+switching to this convention. The new losses and logging test the intended
+learning signal; improved held-out tracing remains an experimental result to
+measure after training.
+
 ## Design
 
 The task is to continue the original fiber from an imperfect observed path.
@@ -283,13 +326,15 @@ and the fine crop about 55% more; rerun preflight for the intended microbatch.
 
 New runs sample smooth wrong-fiber tails over 4–128 trace voxels with
 `--bank-wrong-continuation-tail 4 128`; equal bounds fix the length. Use the
-shared bank `output/neighbor_negatives_bulk_r12_32_l80_160_v1` for all three
+shared bank `output/neighbor_samples_r0_32_l80_160_v2` for all three
 bank roles. Bridges span 16–24 voxels for nearby paths; for paths more than
 12 voxels away, the bridge is at least twice the maximum separation.
 A stored path must fit the bridge, drawn tail, and margin: the 80–160 range
 does not guarantee a 128-voxel tail on every draw. Seed anchors stay on the original prefix; recent
-history may be entirely on the wrong fiber for long tails. Such states teach
-rejection but do not receive InfoNCE without enough recent on-target patches.
+history may be entirely on the wrong fiber for long tails. New runs force original
+seed anchors when fewer than two recent on-target patches remain, and reject a
+synthetic replacement if neither reference is available. Long-continuation draws
+use stored path lengths to skip paths that cannot fit the requested tail.
 Existing checkpoints resume with their saved range (4–12 for checkpoints made
 before this option). See [bank generation](neighbor_mining.md) for the launcher.
 
@@ -297,21 +342,31 @@ Identity objective (`--identity-weight .5`, `--identity-temperature .1`):
 InfoNCE between the mean of the recent on-fiber history embeddings (at least
 two; on-fiber means within 1.5 voxels of the annotation) and four annotated
 positives 1–20 voxels ahead. Each positive competes only with up to eight
-negatives beside it (within two voxels along the fiber).
+negatives beside it (within two voxels along the fiber). With
+`--seed-anchor-fallback`, at least two valid seed patches provide the reference
+when recent history is insufficient. This replaces the recent reference; it does
+not add another loss. Each state still has one InfoNCE term and the effective
+batch, including ineligible states, remains the loss denominator.
 
 Identity training requires the validated native-traced neighbors: add
-`--negative-bank output/neighbor_negatives_bulk_r12_32_l80_160_v1`. Persistent loader workers
+`--negative-bank output/neighbor_samples_r0_32_l80_160_v2`. Persistent loader workers
 discover completed new shards every 30 seconds, so the bank can grow while
 training runs. Unknown coverage stays masked, and held-out candidates are
 excluded. Cached geometry uses at most 64 MiB per worker by default. See
 [live bank usage and validation](neighbor_mining.md#live-training-integration),
 including attaching the bank when resuming an existing identity checkpoint.
 
-Pair sampling version 3 uses exact centerline points for both classes. Target
+Pair sampling version 4 uses exact centerline points for both classes. Target
 annotations and bank paths are interpolated at quarter-voxel arclength intervals,
 sampled uniformly, and checked against the same interpolated presence threshold
 (`--negative-threshold .7`) and full appearance receptive-field bounds. New
-runs infer `--negative-lateral-max` from the bank (32 for this outer bank).
+runs infer `--negative-lateral-max` from the bank (32 for this shared bank).
+Four of eight negative slots are reserved for distances up to 12 voxels, four
+for outer paths. Within each band, visit distinct stored paths before reusing
+one. Missing slots remain masked; surplus outer points cannot consume near
+slots. Configure the split with `--negative-near-fraction` and
+`--negative-near-distance`. An optional `--near-negative-bank` adds a second
+source of certified relationships for primary states.
 A wider presence-only search crop locates candidates; CT is read in the small
 query patches. The full read footprint is checked against the holdout before
 volume I/O. Paths are never expanded into tubes and neither class is snapped or phase-shifted
@@ -323,8 +378,9 @@ been removed. Ranking values from earlier sampling versions are not directly
 comparable.
 
 Existing checkpoints retain their saved sampling mode; checkpoints made before
-these options use dense-map queries, a 12-voxel radius and no bank-following
-draws. To change those settings, start a new run, optionally with
+these options recover their radius and query mode from saved `identity_sampling`
+(the earliest radius defaults to 10) and retain their old unstratified sampling.
+To change those settings, start a new run, optionally with
 `--init-tracer CHECKPOINT`. Embedding evaluation uses the checkpoint's saved mode.
 
 The same bank supplies ordinary following supervision with
@@ -336,6 +392,17 @@ also passes the usual crop/history/label holdout checks. Its own mined path is
 the positive target, and the original annotated parent can supply negatives.
 An empty bank falls back to primary annotations. Logs report the realized
 `bank_following_fraction` (source 4).
+
+New runs reserve another 20% of fresh attempts for primary annotation locations
+covered by bank relationships, requiring at least two on-target recent patches
+(`--bank-coverage-probability .2`). The ordinary holdout checks still apply;
+missing coverage falls back to normal sampling, and image presence can still
+mask InfoNCE pairs. `--following-bank` and `--continuation-bank` can override
+the shared source for those roles. Following uses globally deduplicated draws;
+primary negatives and continuations retain every validated parent relationship.
+Logs break out eligible states, anchor source, distinct stored paths per
+positive, geometry, confidence and InfoNCE by source and near/outer distance.
+Distance-only InfoNCE is diagnostic and is not added to the training objective.
 
 Confidence labels rasterize only cells containing validated centerline samples;
 each cell must entirely clear the original annotation's exclusion tube. The
@@ -354,14 +421,17 @@ replay sample. `bank_wrong_continuation_fraction` reports the actual batch share
 Launch a fresh run using this single bank with:
 
 ```bash
-bash scripts/launch_identity_shared_bank.sh
+bash scripts/launch_neighbor_bank_shared.sh
+# Once the miner has written run.json; bank generation continues concurrently:
+bash scripts/launch_identity_shared_bank.sh --init-tracer output/PREVIOUS_RUN/last.pt
 ```
 
 This uses effective batch 16, microbatch 4 and 12 loader workers while the
 five-worker miner runs at nice 19. It refuses to overwrite its run directory. Additional
-training options can be appended; `RUN_NAME` selects a different fresh run name.
+training options can be appended; `RUN_NAME` selects a different fresh run name
+(default `direct_identity_shared_bank_run2`), and `BANK_PATH` selects its bank.
 
-Real-data verification on 2026-09-27 used this bank and the CT/presence volumes
+Earlier real-data verification on 2026-09-27 used the outer-only v1 bank and the CT/presence volumes
 listed in the launcher. `output/shared_bank_training_probe.py` exercised all
 three roles in one GPU optimizer update, including 23 primary-state negatives
 outside the main crop. Both following states had 61 geometry targets, and the
@@ -377,6 +447,18 @@ known history can therefore remain a negative without shortening the target's
 history or inventing padding evidence. Unavailable candidates are masked, and
 states without two valid target-history patches or any valid negatives receive
 no identity loss. Geometry and confidence training continue on those states.
+
+The v2 fixes were verified with 209 passing training/data/mining tests (three
+CUDA skips and one deselection in the CPU sandbox), including persistent-worker
+bank refresh, cross-parent relationship retention, role selection, near/outer
+slots, forced departure references, seed-reference gradients, legacy sampling
+restoration and additive microbatch diagnostics. A real CT/presence-backed CPU
+optimizer update exercised covered primary, bank following and 128-voxel
+departure states. The departure had zero recent on-target patches and four seed
+anchors; it received InfoNCE and confidence supervision with zero geometry
+targets. Script and metrics: `output/mined_bank_review_20260927/verify_fixes.py`
+and `verify_fixes.json`. These checks validate training plumbing, not eventual
+model quality.
 
 Data: presence is zeroed in both crops for `--presence-dropout .25` of
 states, after identity targets are computed. Photometric contrast (×1/1.4–1.4),

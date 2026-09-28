@@ -6,6 +6,13 @@ from vesuvius.neural_tracing.fiber_follow.shared.data import TracedFiber, make_s
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength
 
 
+def bank_fiber(parent, points):
+    """A validated bank path is a separate, conservatively censored target."""
+    identity = hashlib.sha256(points.tobytes()).hexdigest()
+    return TracedFiber('bank:'+identity,points,arclength(points),parent.tag,
+                       endpoint_stop=(False,False),source_hash=identity)
+
+
 def following_sample(bank, cfg, rng):
     draw = bank.draw_path(rng)
     if draw is None:
@@ -16,8 +23,7 @@ def following_sample(bank, cfg, rng):
     if end <= 8.:
         return None
     parent = bank.fibers[fi]
-    identity = hashlib.sha256(points.tobytes()).hexdigest()
-    fiber = TracedFiber('bank:'+identity,points,s,parent.tag,endpoint_stop=(False,False),source_hash=identity)
+    fiber = bank_fiber(parent, points)
     reverse = bool(rng.integers(2))
     t = float(rng.uniform(8.,end))
     item = make_sample(fiber,t,reverse,cfg,rng)

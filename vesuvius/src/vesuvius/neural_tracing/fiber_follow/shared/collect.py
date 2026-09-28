@@ -18,6 +18,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.evaluate import make_seeds
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, tangent_at
 from vesuvius.neural_tracing.fiber_follow.shared.trace import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, ModelTracer, TraceParams
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
+from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, SEED_DEFAULTS
 
 
 class DecisionCollector:
@@ -88,6 +89,7 @@ class DecisionCollector:
                    for crop in (self.cfg.crop, *self.additional_crops)):
             return False  # do not trace through held-out space and resume afterwards
         row = {k: state[k] for k in ('pos', 'frame', 'hist', 'hmask', 'exploratory')}
+        row.update({k: state[k] if k in state else SEED_DEFAULTS[k](1)[0] for k in SEED_FIELDS})
         # Current-position error against the matched GT point, in trace-grid
         # voxels; departed states have no correspondence. Lets replay stratify
         # on recoverable drift without relabeling every state at load time.

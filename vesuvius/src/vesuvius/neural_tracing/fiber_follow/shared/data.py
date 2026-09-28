@@ -30,6 +30,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
 )
 from vesuvius.neural_tracing.fiber_follow.shared.fast_sample import sample_crop
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
+from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, SEED_DEFAULTS
 
 
 DATA_VERSION = 2
@@ -443,6 +444,7 @@ class FollowDataset(torch.utils.data.IterableDataset):
                            t=t,reverse=reverse,offtrack=bool(op.offtrack[j]))
         item.update(source=source,stratum=band,source_step=op.provenance.get('step',-1) or -1,
                     fiber_ref=(fi,self.fibers[fi].length-t if reverse else t,reverse))
+        item.update({k: getattr(op, k)[j] for k in SEED_FIELDS if hasattr(op, k)})
         item = self.prepare(item,rng)
         return item if self.state_allowed(item) else None
 
@@ -460,6 +462,18 @@ class FollowDataset(torch.utils.data.IterableDataset):
                 self.refresh_replay()
             chunks += 1
             items = []
+            fraction = getattr(getattr(self.batch_builder, 'sampling', None), 'decision_fraction', 0.)
+            requested = 0
+            if fraction:
+                if self.chunk % 2:
+                    raise ValueError('Matched identity decisions require an even microbatch')
+                requested = int(rng.binomial(self.chunk//2, fraction))
+                for _ in range(requested):
+                    pair = self.batch_builder.decision_pair(cfg, rng)
+                    if pair is not None:
+                        pair = [self.prepare(item, rng) for item in pair]
+                        if all(self.state_allowed(item) for item in pair):
+                            items.extend(pair)
             for attempt in range(max(10000, self.chunk*1000)):
                 if len(items) == self.chunk:
                     break
@@ -504,8 +518,11 @@ class FollowDataset(torch.utils.data.IterableDataset):
                     break
             if len(items) != self.chunk:
                 raise ValueError('Could not fill a training batch outside the held-out band')
-            yield (self.batch_builder(items, vol) if self.batch_builder is not None
-                   else collate_with_volume(items, vol, cfg.crop, grid))
+            batch = (self.batch_builder(items, vol) if self.batch_builder is not None
+                     else collate_with_volume(items, vol, cfg.crop, grid))
+            if fraction:
+                batch['decision_requested'] = torch.full((self.chunk,), 2*requested/self.chunk)
+            yield batch
 
 
 FUSED_SAMPLER = os.environ.get("FIBER_FOLLOW_FUSED", "1") != "0"
@@ -681,7 +698,7 @@ class OnPolicyStates:
     FLOAT64_FIELDS = ("t",)
     OPTIONAL = {"drift": lambda n: np.full(n, np.nan, np.float32),
                 "source_cache": lambda n: np.full(n, -1, np.int32),
-                "source_row": lambda n: np.full(n, -1, np.int64)}
+                "source_row": lambda n: np.full(n, -1, np.int64), **SEED_DEFAULTS}
 
     def __init__(self, *, manifest, provenance=None, **arrays):
         for key in self.FIELDS:

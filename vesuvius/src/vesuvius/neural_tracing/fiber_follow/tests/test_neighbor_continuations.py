@@ -134,6 +134,44 @@ def test_variable_tails_reach_128_and_short_paths_are_not_silently_substituted(t
     assert wrong_continuation(short,sample,rng,tail_length_range=(128.,128.)) is None
 
 
+def test_long_departure_forces_original_reference_or_falls_back(tmp_path):
+    bank,fiber = make_bank(tmp_path)
+    publish(tmp_path,[add_shard(tmp_path,0,z_range=(20.,180.))])
+    cfg = IdentityConfig(n_future=4)
+    sample = SampleConfig(crop=cfg.fine,n_history=cfg.n_history,n_future=4)
+    sampling = IdentitySampling(anchor_prob=0.,require_departure_reference=True,
+        prefer_long_continuations=True,bank_wrong_continuation_probability=1.,
+        bank_wrong_continuation_tail=(128.,128.))
+    builder = IdentityObservationBuilder(cfg,[fiber],negative_bank=bank,sampling=sampling)
+    rng = np.random.default_rng(2)
+    state = builder.replace_replay(2,4,sample,rng)
+    builder.prepare(state,fiber,rng)
+    assert not state['patch_on_fiber'][:cfg.recent_patches].any()
+    assert state['patch_on_fiber'][cfg.recent_patches:].sum() >= 2
+    assert builder.footprint_allowed(state,None)
+    no_anchors = IdentityConfig(n_future=4,anchor_patches=0)
+    builder = IdentityObservationBuilder(no_anchors,[fiber],negative_bank=bank,sampling=sampling)
+    state = builder.replace_replay(2,4,sample,rng)
+    builder.prepare(state,fiber,rng)
+    assert not state['identity_reference_valid']
+    assert not builder.footprint_allowed(state,None)
+
+
+def test_length_filter_discovers_long_paths_among_short_shards(tmp_path):
+    bank,_ = make_bank(tmp_path)
+    shards = [add_shard(tmp_path,i,z_range=(20.,60.)) for i in range(20)]
+    shards.append(add_shard(tmp_path,20,z_range=(20.,180.)))
+    for shard in shards:
+        shard.update(path_lengths=[160. if shard['begin']==20 else 40.],training_indices=[0],
+                     draw_indices=[0],draw_candidates=1)
+    publish(tmp_path,shards)
+    _,sample = configuration()
+    for seed in range(10):
+        state = wrong_continuation(bank,sample,np.random.default_rng(seed),
+                                   tail_length_range=(128.,128.),prefer_long=True)
+        assert state is not None and state['bank_tail_length'] == 128.
+
+
 @pytest.mark.parametrize('lengths',[(0.,128.),(128.,4.),(4.,float('nan')),(4.,float('inf')),(4.,)])
 def test_invalid_tail_ranges_fail_closed(lengths):
     with pytest.raises(ValueError,match='tail lengths'):

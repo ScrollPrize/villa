@@ -141,14 +141,35 @@ and negative query locations. The main fine crop stays unchanged.
 Bulk workers write unpublished proposals under `pending/`. The coordinator
 accepts them in annotation/anchor order, applying one spatial coverage index
 across **all** shards and target annotations. Duplicate decisions therefore do
-not depend on worker completion order. A proposal is suppressed if at least
+not depend on worker completion order. An ordinary following draw is suppressed if at least
 80% of its uniformly sampled arclength lies within two voxels of previously
 accepted geometry with axis alignment within 25 degrees. Reversed traces,
 changes in vertex spacing, shifted rediscoveries and coverage split across
 several older paths are handled. Crossings and mostly new extensions remain
 eligible. This detects overlapping geometry, not the biological identity of
 disconnected spans; parallel fibers closer than the geometric tolerance can
-also be merged by this criterion.
+also be merged by this criterion for following draws only.
+
+Bank format v2 keeps every validated `(parent, arc range, eligibility)`
+relationship with its exact path, including overlapping rediscoveries. The
+`draw_eligible` mask applies global deduplication only to ordinary following
+sampling. Primary negatives and wrong continuations keep access to all certified
+relationships; approximate overlap never substitutes another parent's geometry.
+Evaluation paths do not suppress training draws. Shard metadata records training
+and draw indices plus path lengths for length-aware selection.
+
+Generate a fresh combined nearby/outer bank with:
+
+```bash
+bash scripts/launch_neighbor_bank_shared.sh
+```
+
+This writes `output/neighbor_samples_r0_32_l80_160_v2`, retains 80–160 voxel paths
+up to 32 voxels away, and uses five low-priority workers. The normal 2.5-voxel
+exclusion remains active. Start training once `run.json` exists; no completed
+shards are required at startup. Version-1 banks remain readable but cannot
+recover relationships discarded by their old producer. The changed format and
+source hashes require a new generation output path.
 
 Only the coordinator publishes immutable `shards/` entries. Completed shards
 form a deterministic prefix, and resume rebuilds the coverage index from their
@@ -296,8 +317,13 @@ positive geometry masks are zero, confidence teaches rejection, and the identity
 anchor includes only history patches still on the original annotation.
 Seed-segment anchors are drawn strictly from the original prefix before the
 synthetic bridge. A long tail can fill all 128 recent observations with the
-wrong fiber; such a state still teaches confidence rejection but receives no
-InfoNCE if fewer than two recent target-history patches remain.
+wrong fiber. New runs require original-fiber evidence: when fewer than two
+recent patches remain, seed anchors are forced from the original prefix. If
+these cannot fit, the synthetic state falls back to the original replay draw.
+InfoNCE uses at least two valid seed anchors as a fallback, keeping the same
+single per-state loss and effective-batch denominator. Legacy resumes retain
+their saved policy. Length-aware draws skip shards with no fitting training
+paths, and still check the actual bridge and tail after selecting geometry.
 The bridge itself is never treated as a positive future. Existing crop, history,
 patch and label holdout checks still apply before volume reads.
 
@@ -328,7 +354,7 @@ Checkpoints record the immutable mining-run identity and the published shard
 checksums seen at the checkpoint boundary. Resume allows additional shards while
 requiring the recorded shards to remain unchanged. An explicit `--negative-bank`
 can attach this source to a pre-bank checkpoint; subsequent checkpoints retain
-the provenance. Logs identify `negative_source: native_path_bank_v1` and report
+the provenance. Logs identify the bank format in `negative_source` and report
 `negative_bank_shards_min/max` across the loader batches, making worker refresh
 visible. Console startup output shows only the bank path, shard count and run ID;
 full provenance remains in structured logs and checkpoints. Live arrivals make the exact sample sequence dependent on publication

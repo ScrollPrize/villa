@@ -14,6 +14,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.data import build_inputs, read_
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec, crop_local_grid, frame_from_heading, normalize
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DEFAULT_CONFIDENCE, DEFAULT_N_COMMIT, commit_prefix
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
+from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS
 
 if TYPE_CHECKING:
     from vesuvius.neural_tracing.fiber_follow.flow_matching.model import FollowNet
@@ -136,6 +137,11 @@ class ModelTracer:
             generators = [trace_generator(self.p.seed, p, h) for p, h in zip(seeds_xyz, headings)]
         if initial_states is not None:
             frames = [np.asarray(s['frame']).copy() for s in initial_states]
+        references = [dict(seed_pos=np.asarray(p).copy(), seed_tangent=normalize(np.asarray(h)),
+                           seed_age=0., seed_valid=True) for p, h in zip(seeds_xyz, headings)]
+        if initial_states is not None:
+            for reference, state in zip(references, initial_states):
+                reference.update({k: state[k] for k in SEED_FIELDS if k in state})
         active = np.ones(n, bool)
         reasons = ['']*n
         length = np.zeros(n)
@@ -165,7 +171,8 @@ class ModelTracer:
             context = {}
             if self.path_context:
                 context['paths'] = [dict(seed_segment=np.asarray(paths[i][hist_start[i]:hist_start[i]+64]),
-                                         travelled=float(length[i])) for i in idx]
+                                         travelled=float(length[i]),
+                                         **{**references[i], 'seed_age': references[i]['seed_age']+float(length[i])}) for i in idx]
             x = self.build_inputs(pos, fr, hist, hm, **context)
             sampling = {}
             if stochastic:
@@ -190,6 +197,8 @@ class ModelTracer:
                              points=points[j].copy(), confidence=conf.copy(), n_commit=commit, would_stop=would_stop, exploratory=exploratory,
                              recovery_allowed=bool(allowed[j]), recovery_blocked=bool(recovery_blocked),
                              travelled=float(length[i]), last_segment=last_segment[i].copy())
+                if self.path_context:
+                    state.update({k: context['paths'][j][k] for k in SEED_FIELDS})
                 if on_decision is not None and on_decision(int(i), state) is False:
                     active[i], reasons[i] = False, 'oracle'
                     continue

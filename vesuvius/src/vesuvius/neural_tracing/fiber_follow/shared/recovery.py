@@ -9,6 +9,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import crop_local_grid
 from vesuvius.neural_tracing.fiber_follow.shared.labels import prefix_labels
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer, TraceParams
 from vesuvius.neural_tracing.fiber_follow.shared.policy import DIAGNOSTIC_THRESHOLDS, select_candidate
+from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
 
 
 def make_recovery_states(fibers, seeds, cfg, provenance, seed=20260925):
@@ -30,11 +31,12 @@ def make_recovery_states(fibers, seeds, cfg, provenance, seed=20260925):
                 raise ValueError('Could not draw fixture drift band')
             rows.append(dict(fiber_idx=fi, t=entry['t'], reverse=reverse, pos=item['pos'], frame=item['frame'],
                 hist=item['hist_local']@item['frame'].T+item['pos'], hmask=item['hmask'],
-                offtrack=False, hard=True, exploratory=False, drift=drift))
+                offtrack=False, hard=True, exploratory=False, drift=drift,
+                **observed_seed(item['pos'], item['frame'], item['hist_local'], item['hmask'])))
     if not rows:
         raise ValueError('Recovery fixtures need at least one seed')
     return OnPolicyStates(manifest=fiber_manifest(fibers), provenance=provenance,
-        **{k: np.asarray([r[k] for r in rows]) for k in OnPolicyStates.FIELDS+('drift',)})
+        **{k: np.asarray([r[k] for r in rows]) for k in OnPolicyStates.FIELDS+('drift',)+SEED_FIELDS})
 
 
 @torch.no_grad()
@@ -55,6 +57,7 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
         fi=int(states.fiber_idx[j]);f=fibers[fi]
         item=label_state(f,states.pos[j],states.frame[j],states.hist[j],states.hmask[j],sample,
                          t=float(states.t[j]),reverse=bool(states.reverse[j]),offtrack=bool(states.offtrack[j]))
+        item.update({k: getattr(states, k)[j] for k in SEED_FIELDS if hasattr(states, k)})
         cpu = batch_builder([item], vol) if batch_builder else collate_with_volume([item],vol,sample.crop,grid)
         b = move(cpu)
         sampling={}
@@ -85,6 +88,7 @@ def evaluate_recovery_states(model, vol, states, fibers, sample, *, device='cpu'
                 TraceParams(max_len=recovery_length,confidence=threshold,seed=sampling_seed,
                             n_commit=n_commit),device=device)
             state={k:getattr(states,k)[j] for k in ('hist','hmask','frame')}
+            state.update({k: getattr(states, k)[j] for k in SEED_FIELDS if hasattr(states, k)})
             try:
                 paths,reasons=tracer.trace(states.pos[j:j+1],states.frame[j:j+1,:,2],initial_states=[state])
             finally:tracer.close()

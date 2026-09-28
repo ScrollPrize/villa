@@ -154,8 +154,9 @@ def tube(shape, crop, center, radius=.9, along=None):
 def real_like_builder(cfg, fibers, augment, **kwargs):
     class EmptyBank:
         shard_count = 0
-        def candidates(self,item,crop,presence,rule):
+        def candidates(self,item,crop,presence,rule,**kwargs):
             return dict(foreign=np.zeros_like(presence,bool),local=np.empty((0,3)),nearest=np.empty(0,int),
+                        path_ids=np.empty(0,int),
                         counts=dict(foreign_components=0))
     return IdentityObservationBuilder(cfg, fibers, IdentitySampling(**kwargs), augment=augment,negative_bank=EmptyBank())
 

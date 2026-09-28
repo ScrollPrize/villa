@@ -214,7 +214,17 @@ class DirectFollower(ImageContext):
     def forward(self, x, hist, hmask):
         return self.predict(self.context(x, hist, hmask), hist)
 
-    def predict(self, ctx, hist):
+    def confidence_logits(self, ctx, decoded, points):
+        """The same prefix classifier scores predictions and supervised candidates."""
+        points = points.detach()
+        evidence = self.path_evidence(torch.cat((decoded, self.evidence(ctx, points, 'confidence'),
+                                                 points/16), -1))
+        count = torch.arange(1, points.shape[1]+1, device=points.device)[None, :, None]
+        prefix_mean = evidence.cumsum(1)/count
+        prefix_max = evidence.cummax(1).values
+        return self.confidence_head(torch.cat((prefix_mean, prefix_max), -1)).squeeze(-1).float()
+
+    def predict(self, ctx, hist, candidates=None):
         cfg = self.cfg
         initial = hist.new_zeros(len(hist), cfg.n_future, 3)
         initial[..., 2] = self.planes
@@ -236,15 +246,14 @@ class DirectFollower(ImageContext):
                 refinements.append(points)
         # Confidence inspects the actual prediction. Its labels and coordinate
         # sampling are detached; coordinate regression retains its own gradient.
-        evidence = self.path_evidence(torch.cat((decoded, self.evidence(ctx, points.detach(), 'confidence'),
-                                                 points.detach()/16), -1))
-        count = torch.arange(1, cfg.n_future+1, device=hist.device)[None, :, None]
-        prefix_mean = evidence.cumsum(1)/count
-        prefix_max = evidence.cummax(1).values
-        logits = self.confidence_head(torch.cat((prefix_mean, prefix_max), -1)).squeeze(-1).float()
-        return dict(points=points, initial_points=initial_points,
+        logits = self.confidence_logits(ctx, decoded, points)
+        out = dict(points=points, initial_points=initial_points,
                     refinement_points=torch.stack(refinements, 1),
                     confidence_logits=logits, confidence=logits.sigmoid().cummin(-1).values)
+        if candidates is not None:
+            out['candidate_confidence_logits'] = torch.stack([
+                self.confidence_logits(ctx, decoded, curve) for curve in candidates.unbind(1)], 1)
+        return out
 
 
 # ---------------------------------------------------------------- visual identity
@@ -282,6 +291,7 @@ class IdentityConfig(DirectConfig):
     anchor_every: float = 4.
     max_patch_age: float = 2048.
     appearance_behind: float = 4.  # dense appearance map starts this far behind the head
+    persistent_seed: bool = False  # explicit observed seed, present from the first decision
 
     def __post_init__(self):
         super().__post_init__()
@@ -295,6 +305,8 @@ class IdentityConfig(DirectConfig):
             raise ValueError('Invalid anchor spacing or age limit')
         if not 0 <= self.appearance_start < self.fine.behind:
             raise ValueError('Appearance map must start behind the head, inside the fine crop')
+        if self.persistent_seed and self.anchor_patches < 1:
+            raise ValueError('Persistent seed requires at least one anchor slot')
 
     @property
     def patch_crop(self):
@@ -464,9 +476,9 @@ class IdentityFollower(DirectFollower):
                              ctx['patch_tokens'], ctx['patch_mask'])
         return torch.cat((super().evidence(ctx, points, stage), values.flatten(2), identity.float()), -1)
 
-    def forward(self, x, hist, hmask, queries=None):
+    def forward(self, x, hist, hmask, queries=None, candidates=None):
         ctx = self.context(x, hist, hmask)
-        out = self.predict(ctx, hist)
+        out = self.predict(ctx, hist, candidates)
         out.update(history_embedding=ctx['history_embedding'], patch_mask=ctx['patch_mask'].float())
         if queries is not None:
             if 'identity_query_patches' in x:

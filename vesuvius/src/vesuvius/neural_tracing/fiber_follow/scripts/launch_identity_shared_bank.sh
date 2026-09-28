@@ -8,7 +8,8 @@ cd "$FF"
 export PYTHON="${PYTHON:-$VES/.venv/bin/python}"
 export AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 NUMBA_NUM_THREADS=1
-RUN_NAME=${RUN_NAME:-direct_identity_shared_bank_run1}
+RUN_NAME=${RUN_NAME:-direct_identity_shared_bank_run2}
+BANK_PATH=${BANK_PATH:-$FF/output/neighbor_samples_r0_32_l80_160_v2}
 if [[ -e "$FF/output/$RUN_NAME" || -e "$FF/output/logs/$RUN_NAME.log" ]]; then
     echo "Fresh run destination already exists: $RUN_NAME" >&2
     exit 1
@@ -32,8 +33,11 @@ exec bash "$FF/scripts/launch_regression.sh" "$RUN_NAME" \
     --long-diag-every 0 --long-diag-max-len 1200 \
     --recovery-every 1000 --recovery-seeds 8 --recovery-length 32 \
     --dagger-every 1000 --dagger-seeds 64 --dagger-trace-len 6000 --replay-keep 4 \
-    --negative-bank "$FF/output/neighbor_negatives_bulk_r12_32_l80_160_v1" \
+    --negative-bank "$BANK_PATH" \
     --negative-bank-refresh-seconds 30 --negative-bank-cache-mb 64 \
     --identity-query-patches --negative-lateral-max 32 \
+    --negative-near-fraction 0.5 --negative-near-distance 12 \
+    --bank-coverage-probability 0.2 --seed-anchor-fallback \
+    --require-departure-reference --prefer-long-continuations \
     --bank-following-probability 0.1 \
     --bank-wrong-continuation-probability 0.75 --bank-wrong-continuation-tail 4 128 "$@"

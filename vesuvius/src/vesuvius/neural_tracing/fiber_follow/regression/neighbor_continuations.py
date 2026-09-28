@@ -4,7 +4,7 @@ import numpy as np
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_mining import exact_nearest
 from vesuvius.neural_tracing.fiber_follow.shared.data import label_state
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import (
-    arclength, interp_at, frame_from_heading, random_rotation_about,
+    arclength, interp_at, frame_from_heading, random_rotation_about, normalize,
 )
 
 
@@ -14,7 +14,7 @@ def validate_tail_range(lengths):
     return tuple(float(v) for v in lengths)
 
 
-def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 128.)):
+def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 128.), prefer_long=False):
     """No tracing or volume I/O; abstain if a safe connected history cannot fit.
 
     Only the head and tail on the verified neighbor are labeled as departed.
@@ -22,7 +22,9 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 128.)):
     An undersized path is rejected, rather than shortening the requested tail.
     """
     tail_length_range = validate_tail_range(tail_length_range)
-    draw = bank.draw_path(rng)
+    requested_tail = float(rng.uniform(*tail_length_range)) if prefer_long else None
+    minimum = requested_tail+max(16.,2*bank.run['mining'].get('min_distance',0.))+4 if prefer_long else 0.
+    draw = bank.draw_path(rng,min_length=minimum,unique=False) if prefer_long else bank.draw_path(rng)
     if draw is None:
         return None
     fi,line,arc_range = draw
@@ -51,7 +53,7 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 128.)):
     # need more forward travel to make a smooth lateral transition.
     if separation.max() > 12.:
         bridge_length = max(bridge_length,2*float(separation.max()))
-    tail_length = float(rng.uniform(*tail_length_range))
+    tail_length = requested_tail if prefer_long else float(rng.uniform(*tail_length_range))
     if s[-1] < bridge_length+tail_length+4:
         return None
     start = float(rng.uniform(0.,s[-1]-bridge_length-tail_length-4))
@@ -83,5 +85,6 @@ def wrong_continuation(bank, cfg, rng, *, tail_length_range=(4., 128.)):
     item = label_state(fiber,pos,frame,history,mask,cfg,t=original_t,reverse=reverse,offtrack=True)
     item.update(fiber_ref=(fi,float(own_t[-1]),reverse),source=3,source_step=-1,stratum=4,
                 bank_transition_length=bridge_length,bank_tail_length=tail_length,
-                bank_prefix_end_t=float(own_t[0]))
+                bank_prefix_end_t=float(own_t[0]), seed_pos=path[0].copy(),
+                seed_tangent=normalize(path[1]-path[0]),seed_age=float(distance[-1]),seed_valid=True)
     return item

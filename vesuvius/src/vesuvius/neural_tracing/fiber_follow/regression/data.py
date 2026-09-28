@@ -17,6 +17,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.crop_sampling import scalar_cro
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, interp_at, normalize, tangent_at
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume
 from vesuvius.neural_tracing.fiber_follow.shared.trace import ModelTracer
+from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, observed_seed
 from vesuvius.neural_tracing.fiber_follow.regression.model import IdentityConfig
 
 
@@ -84,10 +85,17 @@ class IdentitySampling:
     bank_wrong_continuation_tail: tuple = (4., 128.)
     bank_following_probability: float = 0.  # fraction of fresh draws; trainer opts in
     query_patches: bool = False  # legacy dense-map queries remain checkpoint compatible
+    negative_near_fraction: float | None = None  # None preserves unstratified legacy draws
+    negative_near_distance: float = 12.
+    bank_coverage_probability: float = 0.  # reserved fresh slots on covered parent spans
+    seed_anchor_fallback: bool = False
+    require_departure_reference: bool = False
+    prefer_long_continuations: bool = False
+    decision_fraction: float = 0.  # fraction of all states reserved for matched pairs
 
     def __post_init__(self):
         if isinstance(self.rule, dict):
-            object.__setattr__(self, 'rule', ComponentRule(**self.rule))
+            object.__setattr__(self, 'rule', ComponentRule(**{k:v for k,v in self.rule.items() if k != 'min_voxels'}))
         fractions = (self.anchor_prob, self.presence_dropout, self.contact_fraction,
                      self.hard_span_fraction, self.lateral_fraction)
         if not all(0 <= f <= 1 for f in fractions) or sum(fractions[2:]) > 1:
@@ -100,12 +108,20 @@ class IdentitySampling:
             raise ValueError('Bank wrong-continuation probability must be in [0,1]')
         if not 0 <= self.bank_following_probability <= 1:
             raise ValueError('Bank following probability must be in [0,1]')
+        if not 0 <= self.decision_fraction <= 1:
+            raise ValueError('Decision fraction must be in [0,1]')
+        if not 0 <= self.bank_coverage_probability <= 1-self.bank_following_probability:
+            raise ValueError('Following and covered fresh probabilities must sum to at most one')
+        if self.negative_near_fraction is not None and not 0 <= self.negative_near_fraction <= 1:
+            raise ValueError('Near-negative fraction must be in [0,1]')
+        if not np.isfinite(self.negative_near_distance) or self.negative_near_distance <= self.rule.own_radius:
+            raise ValueError('Near-negative distance must exceed own-fiber radius')
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import validate_tail_range
         object.__setattr__(self, 'bank_wrong_continuation_tail', validate_tail_range(self.bank_wrong_continuation_tail))
 
 
 # Oversampled fresh locations, recorded per state.
-LOCATION_SOURCES = ('uniform', 'contact', 'hard_span', 'lateral', 'bank_following')
+LOCATION_SOURCES = ('uniform', 'contact', 'hard_span', 'lateral', 'bank_following', 'bank_covered', 'decision_pair')
 
 
 def contact_index_sha256(fibers, band, spacing=4., radius=6.):
@@ -166,6 +182,18 @@ def path_anchor(segment, travelled, cfg):
                 anchor_age=travelled-offsets)
 
 
+def seed_anchor(item, cfg):
+    """An observed original seed occupies the first anchor slot from step zero."""
+    if not item.get('seed_valid', False):
+        return {}
+    world = np.zeros((cfg.anchor_patches, 3))
+    tangent = np.zeros_like(world)
+    age = np.zeros(cfg.anchor_patches)
+    mask = np.zeros(cfg.anchor_patches, np.float32)
+    world[0], tangent[0], age[0], mask[0] = item['seed_pos'], item['seed_tangent'], item['seed_age'], 1.
+    return dict(anchor_world=world, anchor_tangent=tangent, anchor_age=age, anchor_mask=mask)
+
+
 def patch_layout(item, cfg):
     """Recent path patches every ``patch_every`` voxels, then any seed anchors.
 
@@ -191,7 +219,7 @@ def patch_layout(item, cfg):
         frame, pos = np.asarray(item['frame']), np.asarray(item['pos'])
         centers[R:] = (item['anchor_world']-pos) @ frame
         tangents[R:] = item['anchor_tangent'] @ frame
-        ages[R:], mask[R:], anchor[R:] = item['anchor_age'], 1., 1.
+        ages[R:], mask[R:], anchor[R:] = item['anchor_age'], item.get('anchor_mask', 1.), 1.
     tangents[np.linalg.norm(tangents, axis=-1) < 1e-6] = (0., 0., 1.)
     frames = local_frames(tangents)
     age = np.log1p(np.minimum(ages, cfg.max_patch_age))/np.log1p(cfg.max_patch_age)
@@ -230,11 +258,15 @@ class IdentityObservationBuilder(ObservationBuilder):
     path bank. Targets are sampled before any presence dropout.
     """
     def __init__(self, cfg: IdentityConfig, fibers=None, sampling=IdentitySampling(), *,
-                 contacts=(), hard_spans=(), augment=False, negative_bank=None):
+                 contacts=(), hard_spans=(), augment=False, negative_bank=None,
+                 near_negative_bank=None, following_bank=None, continuation_bank=None):
         super().__init__(cfg)
         self.fibers, self.sampling, self.augment = fibers, sampling, augment
         self.contacts, self.hard_spans = list(contacts), list(hard_spans)
         self.negative_bank = negative_bank
+        self.near_negative_bank = near_negative_bank
+        self.following_bank = following_bank
+        self.continuation_bank = continuation_bank
         self.lateral = deque(maxlen=sampling.lateral_memory)
         self.stats = dict(patch_seconds=0., patches=0, calls=0)
 
@@ -262,6 +294,9 @@ class IdentityObservationBuilder(ObservationBuilder):
                     patch_mask=stack('patch_mask'))
 
     def images(self, items, vol, pool=None):
+        if self.cfg.persistent_seed:
+            for item in items:
+                item.update(seed_anchor(item, self.cfg))
         x = super().images(items, vol, pool)
         x.update(self.patch_inputs(items, vol, pool))
         return x
@@ -290,13 +325,46 @@ class IdentityObservationBuilder(ObservationBuilder):
 
     # -- training
 
+    def decision_pair(self, sample_cfg, rng):
+        from vesuvius.neural_tracing.fiber_follow.regression.identity_decisions import decision_pair
+        if not self.cfg.persistent_seed or self.negative_bank is None:
+            raise ValueError('Matched decisions require persistent seed references and a bank')
+        return decision_pair(self.near_negative_bank or self.negative_bank, sample_cfg, self.cfg, rng)
+
     def replace_fresh(self, sample_cfg, rng):
-        """Occasional ordinary following supervision from the same live bank."""
-        if (self.negative_bank is None or self.sampling.bank_following_probability == 0
-                or rng.random() >= self.sampling.bank_following_probability):
+        """Reserve fresh slots for following and covered annotation locations."""
+        s = self.sampling
+        if self.negative_bank is None or s.bank_following_probability+s.bank_coverage_probability == 0:
             return None
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_following import following_sample
-        return following_sample(self.negative_bank,sample_cfg,rng)
+        u = rng.random()
+        if u < s.bank_following_probability:
+            return following_sample(self.following_bank or self.negative_bank,sample_cfg,rng)
+        if u >= s.bank_following_probability+s.bank_coverage_probability:
+            return None
+        from vesuvius.neural_tracing.fiber_follow.shared.data import make_sample
+        banks = [self.negative_bank]+([self.near_negative_bank]
+            if self.near_negative_bank is not None and self.near_negative_bank is not self.negative_bank else [])
+        for _ in range(3):
+            bank = banks[int(rng.integers(len(banks)))]
+            draw = bank.draw_path(rng,unique=False)
+            if draw is None:
+                continue
+            fi,_,(a,b) = draw
+            reverse = bool(rng.integers(2))
+            length = bank.fibers[fi].length
+            lo,hi = (length-b,length-a) if reverse else (a,b)
+            hi -= sample_cfg.future_s[-1]+2
+            if hi <= lo:
+                continue
+            t = float(rng.uniform(lo,hi))
+            item = make_sample(bank.fibers[fi],t,reverse,sample_cfg,rng)
+            item.update(fiber_ref=(fi,t,reverse),source=0,source_step=-1,stratum=-1,location_source=5)
+            self.prepare(item,bank.fibers[fi],rng)
+            if item['patch_on_fiber'][:self.cfg.recent_patches].sum() >= 2:
+                item['_identity_prepared'] = True
+                return item
+        return None
 
     def replace_replay(self, source, stratum, sample_cfg, rng):
         """Prefer bank departures only within the recent DAgger departure slot."""
@@ -305,8 +373,9 @@ class IdentityObservationBuilder(ObservationBuilder):
             return None
         from vesuvius.neural_tracing.fiber_follow.regression.neighbor_continuations import wrong_continuation
         for _ in range(3):
-            item = wrong_continuation(self.negative_bank,sample_cfg,rng,
-                                      tail_length_range=self.sampling.bank_wrong_continuation_tail)
+            item = wrong_continuation(self.continuation_bank or self.negative_bank,sample_cfg,rng,
+                                      tail_length_range=self.sampling.bank_wrong_continuation_tail,
+                                      prefer_long=self.sampling.prefer_long_continuations)
             if item is not None:
                 return item
         return None
@@ -336,32 +405,49 @@ class IdentityObservationBuilder(ObservationBuilder):
         return dict(fiber=int(fi), t=length-original if reverse else original, reverse=reverse, source=source)
 
     def prepare(self, item, fiber, rng):
-        """Annotation-derived anchors and label geometry; augmentation draws. No volume I/O."""
+        """Observed seed (or legacy anchors), label geometry and augmentation draws."""
+        if item.pop('_identity_prepared',False):
+            return item
         cfg, s = self.cfg, self.sampling
         _, t, reverse = item['fiber_ref']
         p, arc = traversal(fiber, reverse)
+        pos, frame = np.asarray(item['pos']), np.asarray(item['frame'])
+        local = lambda arcs: (interp_at(p, arc, np.clip(arcs, 0, fiber.length))-pos) @ frame
+        behind = np.arange(max(0., t-cfg.patch_span-8), min(fiber.length, t+2)+1e-9, .5)
+        history_curve = local(behind) if len(behind) else np.zeros((1,3))+np.inf
+        recent_indices = np.arange(cfg.recent_patches)*cfg.patch_every+cfg.patch_every-1
+        centers = np.asarray(item.get('hist_local',np.zeros((cfg.n_history,3))))[recent_indices]
+        recent_on = (np.linalg.norm(centers[:,None]-history_curve[None],axis=-1).min(1) <= s.on_fiber_tolerance)
+        recent_on &= np.asarray(item.get('hmask',np.zeros(cfg.n_history)))[recent_indices] > 0
         anchor_offset = cfg.anchor_offset
         if 'bank_prefix_end_t' in item:
             # Seed anchors must precede the synthetic switch, even when its tail
             # has displaced the entire recent-history window onto the neighbor.
             anchor_offset = max(anchor_offset, t-item['bank_prefix_end_t']+(cfg.anchor_patches-1)*cfg.anchor_every)
-        if cfg.anchor_patches and anchor_offset <= min(t, cfg.max_patch_age) and rng.random() < s.anchor_prob:
+        require_reference = s.require_departure_reference and 'bank_prefix_end_t' in item and recent_on.sum() < 2
+        if cfg.persistent_seed:
+            if 'seed_valid' not in item and item.get('source', 0) in (0, 4):
+                item.update(observed_seed(pos, frame, item['hist_local'], item['hmask']))
+            # Legacy replay without a recorded seed stays reference-missing.
+            item.update(seed_anchor(item, cfg))
+        elif cfg.anchor_patches and anchor_offset <= min(t, cfg.max_patch_age) and (require_reference or rng.random() < s.anchor_prob):
             back = rng.uniform(anchor_offset, min(t, cfg.max_patch_age))
             arcs = t-back+np.arange(cfg.anchor_patches)*cfg.anchor_every
             item.update(anchor_world=interp_at(p, arc, arcs), anchor_age=t-arcs,
                         anchor_tangent=np.stack([tangent_at(p, arc, a) for a in arcs]))
         patch_layout(item, cfg)
-        pos, frame = np.asarray(item['pos']), np.asarray(item['frame'])
-        local = lambda arcs: (interp_at(p, arc, np.clip(arcs, 0, fiber.length))-pos) @ frame
         # Annotation through the fine crop (quarter-voxel), and behind it for history flags.
         ahead = np.arange(max(0., t-24), min(fiber.length, t+40)+1e-9, .25)
-        behind = np.arange(max(0., t-cfg.patch_span-8), min(fiber.length, t+2)+1e-9, .5)
         item['identity_curve'] = local(ahead) if len(ahead) > 2 else np.zeros((0, 3))
-        history_curve = local(behind) if len(behind) else np.zeros((1, 3))+np.inf
         centers = item['patch_centers']
         distance = np.linalg.norm(centers[:, None]-history_curve[None], axis=-1).min(1)
         item['patch_on_fiber'] = ((distance <= s.on_fiber_tolerance) & (item['patch_mask'] > 0)).astype(np.float32)
         item['patch_on_fiber'][cfg.recent_patches:] = item['patch_mask'][cfg.recent_patches:]
+        if cfg.persistent_seed and item.get('seed_valid', False):
+            seed_distance = np.linalg.norm(fiber.points-np.asarray(item['seed_pos']), axis=-1).min()
+            item['patch_on_fiber'][cfg.recent_patches] *= seed_distance <= s.on_fiber_tolerance
+        item['identity_reference_valid'] = bool(item['patch_on_fiber'][:cfg.recent_patches].sum() >= 2
+            or item['patch_on_fiber'][cfg.recent_patches:].sum() >= (1 if cfg.persistent_seed else 2))
         labels = np.concatenate((item['identity_curve'], history_curve[np.isfinite(history_curve).all(-1)]))
         item['identity_label_z'] = ((labels @ frame.T+pos)[:, 2] if len(labels) else pos[2:3]).astype(np.float64)
         if self.augment:
@@ -374,6 +460,9 @@ class IdentityObservationBuilder(ObservationBuilder):
 
     def footprint_allowed(self, item, band):
         """Holdout check of every patch read footprint and of identity label geometry."""
+        if (self.sampling.require_departure_reference and 'bank_prefix_end_t' in item
+                and not item.get('identity_reference_valid',False)):
+            return False
         if band is None:
             return True
         patch_layout(item, self.cfg)
@@ -403,6 +492,10 @@ class IdentityObservationBuilder(ObservationBuilder):
                    identity_points=np.zeros((B, K*(1+M), 3), np.float32), patch_on_fiber=np.zeros((B, P), np.float32),
                    foreign=np.zeros((B, *shape), np.uint8), presence_dropped=np.zeros(B, np.float32),
                    location_source=np.zeros(B, np.float32), foreign_components=np.zeros(B, np.float32))
+        out.update(negative_path_ids=np.full((B,K,M),-1,np.int64),negative_distance=np.zeros((B,K,M),np.float32),
+                   identity_seed_fallback=np.full(B,s.seed_anchor_fallback,bool),
+                   pair_sampling_version=np.full(B,s.pair_sampling_version,np.int64),
+                   negative_near_distance=np.full(B,s.negative_near_distance,np.float32))
         if self.negative_bank is not None:
             out['negative_bank_shards'] = np.zeros(B, np.int64)
         presence = x['fine'][:, 1].numpy() if pair_presence is None else pair_presence
@@ -412,13 +505,16 @@ class IdentityObservationBuilder(ObservationBuilder):
                 continue
             rng = np.random.default_rng(item['identity_seed'])
             bank = self.negative_bank
-            found = bank.candidates(item,crop,presence[j],s.rule,mask_crop=cfg.fine) if pair_presence is not None else bank.candidates(item,crop,presence[j],s.rule)
-            pos, pos_mask, neg, neg_mask = sample_pairs(
+            found = bank.candidates(item,crop,presence[j],s.rule,mask_crop=cfg.fine,
+                additional_banks=([self.near_negative_bank] if self.near_negative_bank is not None and self.near_negative_bank is not bank else ()))
+            pos, pos_mask, neg, neg_mask, metadata = sample_pairs(
                 item['identity_curve'], presence[j], crop, found['local'], found['nearest'], rng,
                 positives=K, negatives=M, margin=0. if s.query_patches else (cfg.patch_crop.width-1)*cfg.fine.spacing/2,
                 rule=s.rule,
                 appearance_crop=crop if s.query_patches else cfg.appearance_crop,
-                along_margin=0. if s.query_patches else (cfg.patch_crop.depth-1)*cfg.fine.spacing/2)
+                along_margin=0. if s.query_patches else (cfg.patch_crop.depth-1)*cfg.fine.spacing/2,
+                path_ids=found['path_ids'],near_fraction=s.negative_near_fraction,
+                near_distance=s.negative_near_distance,return_metadata=True)
             if bank is not None:
                 # Recheck float32 query coordinates against the whole target,
                 # including geometry outside this crop.
@@ -426,7 +522,10 @@ class IdentityObservationBuilder(ObservationBuilder):
                 if valid.any():
                     world = neg[valid] @ np.asarray(item['frame']).T+item['pos']
                     neg_mask[valid] *= bank.clear_of_state(item,world)
-                out['negative_bank_shards'][j] = bank.shard_count
+                out['negative_bank_shards'][j] = bank.shard_count+(self.near_negative_bank.shard_count
+                    if self.near_negative_bank is not None and self.near_negative_bank is not bank else 0)
+            for key,value in metadata.items():
+                out[key][j] = value
             out['positive_mask'][j], out['negative_mask'][j] = pos_mask, neg_mask
             out['identity_points'][j] = np.concatenate((pos, neg.reshape(-1, 3)))
             out['patch_on_fiber'][j] = item['patch_on_fiber']
@@ -452,6 +551,14 @@ class IdentityObservationBuilder(ObservationBuilder):
         else:
             batch.update(self.identity_targets(items, x))
         batch['bank_tail_length'] = torch.tensor([i.get('bank_tail_length', 0.) for i in items], dtype=torch.float32)
+        if self.sampling.decision_fraction:
+            shape = (2, self.cfg.n_future)
+            for key, trailing in (('candidate_points', (3,)), ('candidate_mask', ()), ('candidate_labels', ())):
+                batch[key] = torch.from_numpy(np.stack([i.get(key, np.zeros((*shape, *trailing), np.float32)) for i in items]))
+            for key in ('decision_kind', 'decision_tail'):
+                batch[key] = torch.tensor([i.get(key, 0) for i in items], dtype=torch.float32)
+        if self.cfg.persistent_seed:
+            batch['seed_present'] = torch.tensor([bool(i.get('seed_valid', False)) for i in items], dtype=torch.float32)
         if self.augment:
             x['appearance'] = x['fine'][:, :1].clone()
             for j, item in enumerate(items):
@@ -493,5 +600,9 @@ class DirectTracer(ModelTracer):
             for j, item in enumerate(items):
                 item.update(hist_local=hist[j], hmask=hmask[j])
                 if paths is not None:
-                    item.update(path_anchor(paths[j]['seed_segment'], paths[j]['travelled'], self.model.cfg))
+                    if self.model.cfg.persistent_seed:
+                        item.update({k: paths[j][k] for k in SEED_FIELDS if k in paths[j]})
+                        item.update(seed_anchor(item, self.model.cfg))
+                    else:
+                        item.update(path_anchor(paths[j]['seed_segment'], paths[j]['travelled'], self.model.cfg))
         return {k: v.to(self.device) for k, v in self.observations.images(items, self.vol, self.pool).items()}

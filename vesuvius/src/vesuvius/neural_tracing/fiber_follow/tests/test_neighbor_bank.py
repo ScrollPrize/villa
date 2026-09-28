@@ -41,7 +41,7 @@ def make_bank(root, *, refresh_seconds=0., with_path=False, training=True):
 
 def publish(root,shards):
     run = json.loads((root/'run.json').read_text())
-    value = dict(version=1,run_digest=run['digest'],complete=False,mining=run['mining'],
+    value = dict(version=run['version'],run_digest=run['digest'],complete=False,mining=run['mining'],
                  excluded_z=run['excluded_z'],fibers=run['fibers'],shards=shards)
     value['sha256'] = digest(value)
     write_json(root/'bank.json',value)

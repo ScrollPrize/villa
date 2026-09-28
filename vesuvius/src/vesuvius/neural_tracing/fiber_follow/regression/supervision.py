@@ -46,13 +46,21 @@ def identity_terms(output, batch, cfg, temperature=.1):
     """InfoNCE between pooled on-fiber recent history and appearance ahead.
 
     The anchor is the normalized mean over recent patches lying on the annotated
-    fiber (at least two). Each annotated positive must outscore only the
+    fiber (at least two). When enabled, trustworthy seed anchors supply the
+    reference if recent history is insufficient; the two references are never
+    added as separate losses. Each annotated positive must outscore only the
     validated centerline negatives beside it; it never
     has to reach similarity one. States without a scored positive contribute zero.
     """
     R = cfg.recent_patches
     on = batch['patch_on_fiber'][:, :R]*output['patch_mask'][:, :R]
-    anchor = F.normalize((output['history_embedding'][:, :R].float()*on[..., None]).sum(1), dim=-1)
+    recent_ok = on.sum(1) >= 2
+    seed_on = batch['patch_on_fiber'][:, R:]*output['patch_mask'][:, R:]
+    seed_ok = (~recent_ok & (seed_on.sum(1) >= (1 if getattr(cfg, 'persistent_seed', False) else 2))
+               & batch.get('identity_seed_fallback',torch.zeros_like(recent_ok)).bool())
+    recent = (output['history_embedding'][:, :R].float()*on[..., None]).sum(1)
+    seed = (output['history_embedding'][:, R:].float()*seed_on[..., None]).sum(1)
+    anchor = F.normalize(torch.where(seed_ok[:,None],seed,recent),dim=-1)
     K = batch['positive_mask'].shape[1]
     M = batch['negative_mask'].shape[2]
     query = output['query_embedding'].float()
@@ -60,12 +68,14 @@ def identity_terms(output, batch, cfg, temperature=.1):
     positive, negative = query[:, :K], query[:, K:].reshape(len(query), K, M, -1)
     positive_ok = batch['positive_mask'].bool() & support[:, :K]
     negative_ok = batch['negative_mask'].bool() & support[:, K:].reshape(len(query), K, M)
-    valid = positive_ok & negative_ok.any(-1) & (on.sum(1) >= 2)[:, None]
+    valid = positive_ok & negative_ok.any(-1) & (recent_ok | seed_ok)[:, None]
     positive_logit = (anchor[:, None]*positive).sum(-1)/temperature
     negative_logit = ((anchor[:, None, None]*negative).sum(-1)/temperature).masked_fill(~negative_ok, float('-inf'))
     loss = torch.logsumexp(torch.cat((positive_logit[..., None], negative_logit), -1), -1)-positive_logit
     loss = torch.where(valid, loss, 0.)
     return dict(identity_per_state=loss.sum(-1)/valid.sum(-1).clamp_min(1),
+                identity_pair_valid=valid,identity_pair_loss=loss,
+                identity_anchor_source=recent_ok.long()+2*seed_ok.long(),
                 identity_count=valid.sum(), identity_states=valid.any(-1).sum(),
                 identity_rank_correct=(valid & (positive_logit > negative_logit.amax(-1))).sum())
 
@@ -125,4 +135,12 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_tem
                      identity_flipped_count=(labels*known*(1-supervised)).sum())
     if 'query_embedding' in output and 'positive_mask' in batch:
         terms.update(identity_terms(output, batch, cfg, identity_temperature))
+    if 'candidate_confidence_logits' in output:
+        mask = batch['candidate_mask'].bool()
+        labels = batch['candidate_labels'].float()
+        bce = F.binary_cross_entropy_with_logits(output['candidate_confidence_logits'], labels, reduction='none')
+        per_candidate = window_mean(bce, mask, torch.arange(cfg.n_future, device=mask.device) < window)
+        valid = mask.any(-1)
+        terms['candidate_per_state'] = per_candidate.sum(-1)/valid.sum(-1).clamp_min(1)
+        terms['candidate_states'] = valid.any(-1).sum()
     return terms

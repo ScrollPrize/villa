@@ -20,6 +20,79 @@ def fixture(width=41):
     return crop,curve,presence,foreign
 
 
+def test_near_outer_slots_visit_distinct_paths_before_reusing_one():
+    crop,curve,presence,_ = fixture(width=129)
+    lines = [curve+[x,0,0] for x in (4,6,8,10,16,18,20,22)]
+    points = np.concatenate(lines)
+    ids = np.repeat(np.arange(8),len(curve))
+    result = sample_pairs(curve,presence,crop,points,np.zeros(len(points)),np.random.default_rng(4),
+        margin=0.,rule=ComponentRule(lateral_max=32.),path_ids=ids,near_fraction=.5,return_metadata=True)
+    _,pm,_,nm,meta = result
+    assert pm.all() and nm.all()
+    assert (meta['negative_distance'][:,:4] <= 12).all()
+    assert (meta['negative_distance'][:,4:] > 12).all()
+    for row in meta['negative_path_ids']:
+        assert len(np.unique(row)) == 8
+    # A missing band stays masked, even if the other band has surplus points.
+    _,_,_,nm,meta = sample_pairs(curve,presence,crop,points[ids>=4],np.zeros((ids>=4).sum()),
+        np.random.default_rng(4),margin=0.,rule=ComponentRule(lateral_max=32.),path_ids=ids[ids>=4],
+        near_fraction=.5,return_metadata=True)
+    assert not nm[:,:4].any() and nm[:,4:].all()
+    assert (meta['negative_path_ids'][:,:4] == -1).all()
+
+
+def test_seed_reference_fallback_supplies_gradients_without_doubling_loss():
+    cfg = SimpleNamespace(recent_patches=2)
+    history = torch.tensor([[[.8,.6],[.8,.6],[.6,.8],[.6,.8]]],requires_grad=True)
+    query = torch.tensor([[[1.,0.],[0.,1.]]],requires_grad=True)
+    output = dict(history_embedding=history,patch_mask=torch.ones(1,4),query_embedding=query,query_support=torch.ones(1,2))
+    batch = dict(patch_on_fiber=torch.tensor([[0.,0.,1.,1.]]),positive_mask=torch.ones(1,1),
+                 negative_mask=torch.ones(1,1,1),identity_seed_fallback=torch.tensor([True]))
+    terms = identity_terms(output,batch,cfg)
+    assert terms['identity_count'] == 1 and terms['identity_anchor_source'].item() == 2
+    terms['identity_per_state'].sum().backward()
+    assert history.grad[:,:2].abs().sum() == 0 and history.grad[:,2:].abs().sum() > 0
+    assert query.grad.abs().sum() > 0
+    batch['identity_seed_fallback'].zero_()
+    assert identity_terms(output,batch,cfg)['identity_count'] == 0
+    batch['patch_on_fiber'].fill_(1)
+    legacy = identity_terms(output,batch,cfg)['identity_per_state']
+    batch['identity_seed_fallback'].fill_(True)
+    current = identity_terms(output,batch,cfg)
+    assert current['identity_anchor_source'].item() == 1
+    torch.testing.assert_close(current['identity_per_state'],legacy)
+
+
+def test_identity_source_and_distance_metrics_pool_across_microbatches():
+    from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import identity_training_groups
+    cfg = SimpleNamespace(recent_patches=2)
+    output = dict(history_embedding=torch.tensor([[[1.,0.]]*4]*3),patch_mask=torch.ones(3,4),
+        query_embedding=torch.tensor([[[1.,0.],[0.,1.],[-1.,0.]]]*3),query_support=torch.ones(3,3))
+    batch = dict(patch_on_fiber=torch.tensor([[1.,1.,0.,0.],[0.,0.,1.,1.],[0.,0.,0.,0.]]),
+        positive_mask=torch.ones(3,1),negative_mask=torch.ones(3,1,2),
+        identity_seed_fallback=torch.ones(3,dtype=torch.bool),source=torch.tensor([0,3,0]),
+        location_source=torch.tensor([5,0,0]),negative_path_ids=torch.tensor([[[2,3]]]*3),
+        negative_distance=torch.tensor([[[6.,24.]]]*3),negative_near_distance=torch.full((3,),12.))
+    def groups(out,labels):
+        terms = identity_terms(out,labels,cfg)
+        terms.update(geometry_per_state=torch.ones(len(labels['source'])),
+                     confidence_per_state=torch.full((len(labels['source']),),.5))
+        return identity_training_groups(out,labels,terms,cfg,.1)
+    full = groups(output,batch)
+    pooled = {}
+    for start,end in ((0,1),(1,3)):
+        part = groups({k:v[start:end] for k,v in output.items()},{k:v[start:end] for k,v in batch.items()})
+        for name,row in part.items():
+            target = pooled.setdefault(name,{})
+            for key,value in row.items():
+                target[key] = target.get(key,0)+value
+    for name,row in full.items():
+        assert row == pytest.approx(pooled[name])
+    assert full['source/fresh']['eligible_states'] == 1
+    assert full['source/wrong_continuation']['seed_states'] == 1
+    assert full['distance/near']['distinct_paths'] == 3
+
+
 @pytest.mark.parametrize('width', [40, 41])
 def test_centerline_queries_are_not_displaced_and_keep_valid_support(width):
     crop,curve,presence,foreign = fixture(width)

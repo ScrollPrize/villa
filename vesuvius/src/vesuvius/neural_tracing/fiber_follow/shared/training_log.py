@@ -55,6 +55,8 @@ def _direct_training_lines(row):
         lines[-1] += f" | bank departures {row['bank_wrong_continuation_fraction']:.0%}"
     if 'bank_following_fraction' in row:
         lines[-1] += f" | bank following {row['bank_following_fraction']:.0%}"
+    if 'decision_pair_fraction' in row:
+        lines[-1] += f" | identity pairs {row['decision_pair_fraction']:.0%} (requested {row.get('decision_requested_fraction', 0.):.0%})"
     if 'identity' in row:
         lines.extend(_identity_lines(row['identity']))
     if 'decisions' in row:
@@ -66,6 +68,7 @@ def _identity_lines(stats):
     lines = [f"  identity: InfoNCE {stats.get('identity_loss', 0.):.4f} | rank "
              +_rate(stats.get('identity_rank_correct', 0), stats.get('identity_count', 0))
              +f" | scored states {int(stats.get('identity_states', 0))}"
+             +f" ({stats.get('eligible_fraction', 0.):.1%} eligible)"
              +f" | identity-aware prefix correct {stats.get('identity_prefix_correct_fraction', 0.):.1%}"
              +f" | labels flipped {int(stats.get('identity_flipped_count', 0))}",
              f"  identity data: presence dropped {stats.get('presence_dropped_fraction', 0.):.0%}"
@@ -75,6 +78,24 @@ def _identity_lines(stats):
     if 'ranking' in stats:
         lines.append('  history-vs-neighbor ranking: '+' | '.join(
             f"{name} {_rate(v['correct'], v['pairs'])}" for name, v in stats['ranking'].items() if v['pairs']))
+    if 'identity_loss_eligible' in stats:
+        lines.append(f"  InfoNCE per eligible state {stats['identity_loss_eligible']:.4f}"
+                     +f" | observed seed present {stats.get('seed_present_fraction', 0.):.0%}")
+    if 'candidate_loss' in stats:
+        lines.append(f"  candidate BCE {stats['candidate_loss']:.4f}"
+                     +f" | per eligible state {stats['candidate_loss_eligible']:.4f}")
+    for name, group in stats.get('candidate_decisions', {}).items():
+        if group['states']:
+            lines.append(f"  identity decisions {name}: correct accepted "
+                         +_rate(group['accepted_positive'], group['positive'])
+                         +" | wrong rejected "+_rate(group['rejected_negative'], group['negative']))
+    for name,group in stats.get('training_groups',{}).items():
+        if group['states']:
+            lines.append(f"  identity {name}: {_rate(group['eligible_states'],group['states'])} eligible"
+                         f" | paths/positive {group['distinct_paths_per_positive']:.2f}"
+                         f" | recent/seed {group['recent_states']}/{group['seed_states']}"
+                         f" | geometry {group['geometry_mean']:.4f} | confidence {group['confidence_mean']:.4f}"
+                         f" | InfoNCE {group['identity_mean']:.4f}")
     return lines
 
 

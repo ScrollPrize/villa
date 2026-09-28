@@ -13,7 +13,7 @@ from scipy.spatial import cKDTree
 
 
 
-PAIR_SAMPLING_VERSION = 3
+PAIR_SAMPLING_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -27,7 +27,8 @@ class ComponentRule:
 
 def sample_pairs(curve, presence, crop, foreign_local, foreign_nearest, rng, *, positives=4, negatives=8,
                  forward=(1., 20.), margin=4., rule: ComponentRule = ComponentRule(),
-                 appearance_crop=None, along_margin=0.):
+                 appearance_crop=None, along_margin=0., path_ids=None, near_fraction=None,
+                 near_distance=12., return_metadata=False):
     """Sample both classes uniformly on their interpolated centerlines.
 
     Presence and full appearance support are checked identically for both.
@@ -46,10 +47,20 @@ def sample_pairs(curve, presence, crop, foreign_local, foreign_nearest, rng, *, 
     pos_mask = np.zeros(positives, np.float32)
     neg = np.zeros((positives, negatives, 3), np.float32)
     neg_mask = np.zeros((positives, negatives), np.float32)
+    metadata = dict(negative_path_ids=np.full((positives,negatives),-1,np.int64),
+                    negative_distance=np.zeros((positives,negatives),np.float32))
+    def result():
+        values = (pos,pos_mask,neg,neg_mask)
+        return (*values,metadata) if return_metadata else values
+    if near_fraction is not None and not 0 <= near_fraction <= 1:
+        raise ValueError('Near-negative fraction must be in [0,1]')
+    path_ids = np.asarray(path_ids if path_ids is not None else np.zeros(len(foreign_local)),np.int64)
+    if path_ids.shape != (len(foreign_local),):
+        raise ValueError('Every negative candidate needs a path ID')
     eligible = np.flatnonzero((curve[:, 2] >= forward[0]) & (curve[:, 2] <= forward[1])
                              & supported(curve) & (volume_at(presence,crop,curve,order=1) >= rule.threshold))
     if not len(eligible) or len(curve) < 3:
-        return pos, pos_mask, neg, neg_mask
+        return result()
     tree = cKDTree(curve)
     arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(curve, axis=0), axis=-1))]
     tangent = np.gradient(curve, axis=0)
@@ -67,11 +78,30 @@ def sample_pairs(curve, presence, crop, foreign_local, foreign_nearest, rng, *, 
         j = int(rng.choice(chunk))
         pos[k], pos_mask[k] = curve[j], 1.
         candidates = np.flatnonzero(usable & (np.abs(arc[nearest]-arc[j]) <= rule.along_window))
-        take = min(negatives, len(candidates))
-        if take:
-            chosen = rng.choice(candidates, size=take, replace=False)
-            neg[k, :take], neg_mask[k, :take] = foreign_local[chosen], 1.
-    return pos, pos_mask, neg, neg_mask
+        if near_fraction is None:
+            selections = [(0,rng.choice(candidates,size=min(negatives,len(candidates)),replace=False))] if len(candidates) else []
+        else:
+            near_count = int(np.floor(negatives*near_fraction+.5))
+            selections = []
+            for start,count,member in ((0,near_count,lateral <= near_distance),
+                                       (near_count,negatives-near_count,lateral > near_distance)):
+                ids = candidates[member[candidates]]
+                # Visit each stored path once before taking its next point.
+                groups = [list(rng.permutation(ids[path_ids[ids] == p])) for p in rng.permutation(np.unique(path_ids[ids]))]
+                chosen = []
+                while groups and len(chosen) < count:
+                    for group in groups:
+                        if len(chosen) == count:
+                            break
+                        chosen.append(group.pop())
+                    groups = [g for g in groups if g]
+                selections.append((start,np.asarray(chosen,np.int64)))
+        for start,chosen in selections:
+            slots = slice(start,start+len(chosen))
+            neg[k,slots],neg_mask[k,slots] = foreign_local[chosen],1.
+            metadata['negative_path_ids'][k,slots] = path_ids[chosen]
+            metadata['negative_distance'][k,slots] = lateral[chosen]
+    return result()
 
 
 def crop_indices(crop, local):

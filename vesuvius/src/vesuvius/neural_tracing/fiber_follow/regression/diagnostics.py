@@ -147,3 +147,86 @@ def summarize_ranking(rows):
             a, b = total.get(name, (0, 0))
             total[name] = (a+correct, b+count)
     return {name: dict(correct=a, pairs=b, accuracy=a/b if b else None) for name, (a, b) in total.items()}
+
+
+@torch.no_grad()
+def identity_training_groups(output, batch, terms, cfg, temperature):
+    """Additive counters for source coverage and near/outer contrastive tasks.
+
+    Distance-group identity losses recompute InfoNCE with only that band's
+    negatives. They are diagnostics, never extra optimization objectives.
+    """
+    from vesuvius.neural_tracing.fiber_follow.regression.supervision import identity_terms
+    if 'identity_pair_valid' not in terms or 'source' not in batch:
+        return {}
+    groups = {}
+    def record(name, member, labels, scored):
+        valid = scored['identity_pair_valid']
+        negative = labels['negative_mask'].bool() & labels['positive_mask'].bool()[...,None]
+        negative &= output['query_support'][:,labels['positive_mask'].shape[1]:].bool().reshape_as(negative)
+        distinct = slots = 0
+        if 'negative_path_ids' in labels:
+            ids = labels['negative_path_ids'][member].cpu()
+            masks = negative[member].cpu()
+            for row,mask in zip(ids.flatten(0,1),masks.flatten(0,1)):
+                if mask.any():
+                    distinct += len(torch.unique(row[mask]))
+                    slots += 1
+        eligible = valid.any(-1) & member
+        groups[name] = dict(states=int(member.sum()),eligible_states=int(eligible.sum()),
+            pairs=int(valid[member].sum()),negative_points=int(negative[member].sum()),
+            distinct_paths=distinct,positive_slots=slots,
+            geometry_sum=float(terms['geometry_per_state'][member].sum()),
+            confidence_sum=float(terms['confidence_per_state'][member].sum()),
+            identity_sum=float(scored['identity_per_state'][member].sum()),
+            recent_states=int((eligible & (scored['identity_anchor_source']==1)).sum()),
+            seed_states=int((eligible & (scored['identity_anchor_source']==2)).sum()))
+    for i,name in enumerate(('fresh','fixed','recent','wrong_continuation','bank_following','decision_pair')):
+        record('source/'+name,batch['source']==i,batch,terms)
+    if 'location_source' in batch:
+        record('source/bank_covered',batch['location_source']==5,batch,terms)
+    if 'negative_distance' in batch:
+        near = batch['negative_distance'] <= batch['negative_near_distance'][:,None,None]
+        for name,mask in (('near',near),('outer',~near)):
+            labels = dict(batch,negative_mask=batch['negative_mask']*mask)
+            scored = identity_terms(output,labels,cfg,temperature)
+            member = (labels['negative_mask'].bool() & labels['positive_mask'].bool()[...,None]).flatten(1).any(-1)
+            record('distance/'+name,member,labels,scored)
+    return groups
+
+
+def summarize_identity_groups(groups):
+    return {name:dict(row,eligible_fraction=row['eligible_states']/max(1,row['states']),
+                      geometry_mean=row['geometry_sum']/max(1,row['states']),
+                      confidence_mean=row['confidence_sum']/max(1,row['states']),
+                      identity_mean=row['identity_sum']/max(1,row['states']),
+                      distinct_paths_per_positive=row['distinct_paths']/max(1,row['positive_slots']))
+            for name,row in groups.items()}
+
+
+@torch.no_grad()
+def candidate_decisions(output, batch, cfg, n_commit=None):
+    """Counts for the deployed prefix classifier on supplied candidate curves."""
+    window = commit_window(cfg, n_commit)-1
+    confidence = output['candidate_confidence_logits'].float().sigmoid().cummin(-1).values[:, :, window]
+    known = batch['candidate_mask'][:, :, window].bool()
+    positive = batch['candidate_labels'][:, :, window].bool()
+    accepted = confidence >= .5
+    kind, tail = batch['decision_kind'], batch['decision_tail']
+    groups = {'all': kind > 0, 'choice': kind == 1, 'departed': kind == 2, 'own_tail': kind == 3}
+    for name, lo, hi in (('tail_1_16', 0, 16), ('tail_17_48', 16, 48), ('tail_49_96', 48, 96), ('tail_97_plus', 96, float('inf'))):
+        groups[name] = (kind > 0) & (tail > lo) & (tail <= hi)
+    rows = {}
+    for name, member in groups.items():
+        pos = known & positive & member[:, None]
+        neg = known & ~positive & member[:, None]
+        rows[name] = dict(states=int(member.sum()), positive=int(pos.sum()), negative=int(neg.sum()),
+                          accepted_positive=int((pos & accepted).sum()), rejected_negative=int((neg & ~accepted).sum()),
+                          positive_confidence_sum=float(confidence[pos].sum()), negative_confidence_sum=float(confidence[neg].sum()))
+    return rows
+
+
+def summarize_candidates(groups):
+    return {name: dict(row, correct_acceptance=row['accepted_positive']/row['positive'] if row['positive'] else None,
+                       wrong_rejection=row['rejected_negative']/row['negative'] if row['negative'] else None)
+            for name, row in groups.items()}
