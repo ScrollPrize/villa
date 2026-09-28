@@ -258,6 +258,9 @@ target_link_libraries(vc_zarr_recompress vc_core Blosc::blosc)
 add_executable(vc_zarr_download_bench src/vc_zarr_download_bench.cpp)
 target_link_libraries(vc_zarr_download_bench vc_core Boost::program_options)
 
+add_executable(vc_zarr_download_region src/vc_zarr_download_region.cpp)
+target_link_libraries(vc_zarr_download_region vc_core Boost::program_options)
+
 # Stable compile-coverage entry point for CI. Keep every command-line
 # executable here so the CLI shard cannot silently omit a newly added tool.
 set(VC_CLI_TARGETS
@@ -274,7 +277,8 @@ set(VC_CLI_TARGETS
     vc_volpkg_convert vc_transform_geom vc_gen_normalgrids vc_gen_umbilicus
     vc_ngrids
     vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning vc_tifxyz vc_project_tifxyz
-    vc_zarr_to_tiff vc_zarr_recompress vc_zarr_download_bench)
+    vc_zarr_to_tiff vc_zarr_recompress vc_zarr_download_bench
+    vc_zarr_download_region)
 get_property(_vc_apps_directory_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 list(FILTER _vc_apps_directory_targets INCLUDE REGEX "^vc_")
 set(_vc_expected_cli_targets ${VC_CLI_TARGETS})
@@ -304,7 +308,7 @@ if(VC_USE_PCH)
         vc_gen_normalgrids vc_gen_umbilicus vc_ngrids vc_tifxyz2rgb vc_rgb2tifxyz
         vc_thinning
         vc_tifxyz vc_project_tifxyz vc_zarr_to_tiff vc_zarr_recompress
-        vc_zarr_download_bench
+        vc_zarr_download_bench vc_zarr_download_region
         vc_straighten
     )
         target_precompile_headers(${_app} REUSE_FROM vc_common_pch)

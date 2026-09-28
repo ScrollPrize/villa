@@ -1205,10 +1205,14 @@ static std::vector<ChunkIndex> buildIsotropicPyramidLevel(const fs::path& outDir
                     : 0;
 
                 std::vector<uint8_t> srcBuf(srcActualZ * srcActualY * srcActualX, 0);
-                if (!srcBuf.empty()) {
-                    srcLocal.readRegion({srcZ0, srcY0, srcX0},
-                                       {srcActualZ, srcActualY, srcActualX},
-                                       srcBuf.data());
+                if (!srcBuf.empty() &&
+                    !srcLocal.readRegion({srcZ0, srcY0, srcX0},
+                                         {srcActualZ, srcActualY, srcActualX},
+                                         srcBuf.data())) {
+                    std::cerr << "pyramid read failed for level " << level << " chunk ["
+                              << cz << ", " << cy << ", " << cx << "]: region outside the source level\n";
+                    hadError.store(true);
+                    return;
                 }
 
                 std::fill(dstBuf.begin(), dstBuf.end(), 0);

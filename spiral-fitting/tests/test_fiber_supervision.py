@@ -176,14 +176,9 @@ def test_apply_config_refills_radial_offsets_and_drops_cached_bundle():
     context.unattached_pcl_strips = strips
     context.shell_map = None
     context.shell_outer_winding_idx = None
-    context.shell_valid_zyxs_gpu = None
     context.tracks = []
     context.prepared_main_tracks = None
     context.verified_patches_list = []
-    context.unverified_patches = None
-    context.unverified_patches_list = []
-    context.unverified_patch_sampling_probabilities = None
-    context.unverified_patch_atlas = None
     context.dt_target_cache_manager = SimpleNamespace(
         update_interval=100, reset=Mock())
     context.theta_crossing_map = SimpleNamespace(invalidate=Mock())
