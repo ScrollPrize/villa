@@ -54,6 +54,8 @@ def identity_terms(output, batch, cfg, temperature=.1):
     validated centerline negatives beside it; it never
     has to reach similarity one. States without a scored positive contribute zero.
     """
+    if getattr(cfg,'memory_slots',0) and cfg.memory_version == 3:
+        return unified_identity_terms(output,batch,cfg)
     R = cfg.n_history
     on = batch['reference_on_fiber'][:, :R]*output['reference_mask'][:, :R]
     recent_ok = on.sum(1) >= 2
@@ -81,6 +83,40 @@ def identity_terms(output, batch, cfg, temperature=.1):
                 identity_anchor_source=recent_ok.long()+2*seed_ok.long(),
                 identity_count=valid.sum(), identity_states=valid.any(-1).sum(),
                 identity_rank_correct=(valid & (positive_logit > negative_logit.amax(-1))).sum())
+
+
+def unified_identity_terms(output, batch, cfg):
+    """Supervise the decoder's actual cosine keys, including the remote seed.
+
+    Every labeled original-fiber reference contributes. Annotation membership
+    selects losses only; the forward reader still receives contaminated history.
+    Mean over references/positives keeps state weighting independent of count.
+    """
+    refs = output['reference_embedding'].float()
+    on = batch['reference_on_fiber'].bool() & output['reference_mask'].bool()
+    k,m = batch['positive_mask'].shape[1],batch['negative_mask'].shape[2]
+    query = output['query_embedding'].float()
+    support = output['query_support'].bool()
+    positive,negative = query[:,:k],query[:,k:].reshape(len(query),k,m,-1)
+    positive_ok = batch['positive_mask'].bool() & support[:,:k]
+    negative_ok = batch['negative_mask'].bool() & support[:,k:].reshape(len(query),k,m)
+    valid = positive_ok & negative_ok.any(-1) & on.any(1)[:,None]
+    if 'identity_observable' in batch:
+        valid &= batch['identity_observable'][:,None]
+    pos = torch.einsum('bre,bke->brk',refs,positive)/cfg.identity_temperature
+    neg = torch.einsum('bre,bkme->brkm',refs,negative)/cfg.identity_temperature
+    neg = neg.masked_fill(~negative_ok[:,None],-torch.inf)
+    loss = torch.logsumexp(torch.cat((pos[...,None],neg),-1),-1)-pos
+    loss = torch.where(on[:,:,None] & valid[:,None],loss,0.).sum(1)/on.sum(1).clamp_min(1)[:,None]
+    # Ranking uses the average logit of the same supervised reference set.
+    margin = pos-neg.amax(-1)
+    margin = torch.where(on[:,:,None],margin,0.).sum(1)/on.sum(1).clamp_min(1)[:,None]
+    recent = on[:,:-1].any(1)
+    return dict(identity_per_state=loss.sum(-1)/valid.sum(-1).clamp_min(1),
+        identity_pair_valid=valid,identity_pair_loss=loss,
+        identity_anchor_source=recent.long()+2*(~recent & on[:,-1]).long(),
+        identity_count=valid.sum(),identity_states=valid.any(-1).sum(),
+        identity_rank_correct=(valid & (margin > 0)).sum())
 
 
 def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_temperature=.1):

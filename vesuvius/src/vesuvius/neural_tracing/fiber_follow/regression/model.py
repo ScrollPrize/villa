@@ -18,6 +18,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 ARCHITECTURE = 'axial_fiber_v3'
 MEMORY_ARCHITECTURE = 'axial_fiber_memory_v2'
 MEMORY_ARCHITECTURE_V1 = 'axial_fiber_memory_v1'  # no probe; loadable, not trained further
+UNIFIED_ARCHITECTURE = 'axial_fiber_unified_v1'
 TOKEN_STRIDE = (8, 2, 2)  # z, y, x in input samples
 TOKEN_OFFSET = (3, 0, 0)  # centre of four stride-two stem positions
 IDENTITY_EVIDENCE_WIDTH = 8  # point/mean/min/coverage for seed and history separately
@@ -32,6 +33,7 @@ class DirectConfig:
     layers: int = 4
     decoder_layers: int = 4
     embedding: int = 32
+    identity_temperature: float = .1
     activation_checkpointing: bool = False
     n_future: int = 16
     future_step: float = 1.
@@ -54,6 +56,8 @@ class DirectConfig:
         if isinstance(self.fine, dict):
             self.fine = CropSpec(**self.fine)
         c = self.fine
+        if not math.isfinite(self.identity_temperature) or self.identity_temperature <= 0:
+            raise ValueError('Identity temperature must be finite and positive')
         if min(c.depth, c.width) < 8 or not 0 <= c.behind < c.depth or not math.isfinite(c.spacing) or c.spacing <= 0:
             raise ValueError('Invalid fine crop')
         if min(self.channels, self.hidden, self.heads, self.layers, self.decoder_layers,
@@ -74,7 +78,7 @@ class DirectConfig:
         if self.memory_slots:
             if any(not isinstance(v, int) or v < 1 for v in (self.memory_steps, self.memory_stride, self.memory_grad_steps)):
                 raise ValueError('Memory sequence dimensions must be positive integers')
-            if self.memory_version not in (1, 2):
+            if self.memory_version not in (1, 2, 3):
                 raise ValueError('Unknown memory version')
             if not isinstance(self.memory_patch_size, int) or self.memory_patch_size < 5 or self.memory_patch_size % 2 != 1:
                 raise ValueError('Memory patch size must be odd and at least five')
@@ -205,7 +209,7 @@ class AxialEncoder(nn.Module):
         self.compress = nn.Conv3d(4*c,h,(4,1,1),stride=(4,1,1))
         self.position = nn.Linear(3,h)
         # Observed path occupancy, mean age and seed occupancy. No annotation masks.
-        self.condition = nn.Linear(3,h,bias=False)
+        self.condition = None if cfg.memory_slots and cfg.memory_version == 3 else nn.Linear(3,h,bias=False)
         self.blocks = nn.ModuleList(AxialBlock(h,cfg.heads) for _ in range(cfg.layers))
         self.norm = nn.LayerNorm(h)
         self.dense_projection = nn.Conv3d(h,c,1)
@@ -240,15 +244,16 @@ class AxialEncoder(nn.Module):
         rendered = torch.cat((count.clamp_max(1),rendered[...,1:2]/count.clamp_min(1),rendered[...,2:].clamp_max(1)),-1)
         return rendered.reshape(len(points),d,y,x,3)
 
-    def forward(self, image, references, mask):
+    def forward(self, image, references, mask, *, checkpoint_blocks=True):
         fine = self.stem(image)
         down = self.down(fine)
         down = F.pad(down,(0,0,0,0,0,(-down.shape[2])%4))
         tokens = self.compress(down).permute(0,2,3,4,1)
         tokens = tokens+self.position(self.token_xyz/16).reshape(*self.cfg.token_shape,self.cfg.hidden).to(tokens.dtype)
-        tokens = tokens+self.condition(self.conditioning(references,mask)).to(tokens.dtype)
+        if self.condition is not None:
+            tokens = tokens+self.condition(self.conditioning(references,mask)).to(tokens.dtype)
         for block in self.blocks:
-            if self.cfg.activation_checkpointing and self.training and torch.is_grad_enabled():
+            if checkpoint_blocks and self.cfg.activation_checkpointing and self.training and torch.is_grad_enabled():
                 tokens = checkpoint(block,tokens,use_reentrant=False)
             else:
                 tokens = block(tokens)
@@ -261,7 +266,7 @@ class AxialEncoder(nn.Module):
         return dense, deep, tokens.flatten(1,3)
 
 
-class DirectFollower(nn.Module):
+class CropFollower(nn.Module):
     architecture = ARCHITECTURE
 
     def __init__(self, cfg):
@@ -430,3 +435,11 @@ class DirectFollower(nn.Module):
             out['candidate_confidence_logits'] = torch.stack([
                 self.confidence_logits(ctx, decoded, curve) for curve in candidates.unbind(1)], 1)
         return out
+
+
+def DirectFollower(cfg):
+    """Checkpoint-aware constructor; legacy architectures retain their weights."""
+    if cfg.memory_slots and cfg.memory_version == 3:
+        from .unified import UnifiedFollower
+        return UnifiedFollower(cfg)
+    return CropFollower(cfg)

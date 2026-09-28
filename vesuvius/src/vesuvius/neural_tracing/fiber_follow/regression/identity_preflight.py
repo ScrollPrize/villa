@@ -29,6 +29,8 @@ def main(argv=None):
     ap.add_argument('--batches',type=int,default=4)
     ap.add_argument('--forward',action='store_true')
     ap.add_argument('--memory-slots',type=int,default=0)
+    ap.add_argument('--memory-version',type=int,choices=(2,3),default=3)
+    ap.add_argument('--activation-checkpointing',action='store_true')
     ap.add_argument('--memory-steps',type=int,default=32)
     ap.add_argument('--memory-stride',type=int,default=4)
     ap.add_argument('--memory-patch-size',type=int,default=17)
@@ -40,7 +42,8 @@ def main(argv=None):
     torch.set_num_threads(4);torch.manual_seed(0)
     cfg=DirectConfig(memory_slots=args.memory_slots,memory_steps=args.memory_steps,
                      memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size,
-                     memory_grad_steps=args.memory_grad_steps)
+                     memory_grad_steps=args.memory_grad_steps,memory_version=args.memory_version,
+                     activation_checkpointing=args.activation_checkpointing)
     spec=FiberVolumeSpec(args.fiber_zarrs,ct_zarr=args.ct,ct_level=0,ct_grid_scale=4.,inputs='ct+presence')
     band=ZBand(45000/spec.grid_scale,48500/spec.grid_scale)
     fibers,_=split_fibers(load_fibers(args.fibers,grid_scale=spec.grid_scale),band)
@@ -61,7 +64,7 @@ def main(argv=None):
         assert {'fine','seed','seed_mask','seed_age','seed_tangent'} <= set(cpu['x'])
         if cfg.memory_slots:
             assert cpu['x']['memory_mask'][:,-1].all()
-            assert torch.isfinite(cpu['x']['memory_patches']).all()
+            assert torch.isfinite(cpu['x']['history_crops' if cfg.memory_version == 3 else 'memory_patches']).all()
             if cfg.memory_version >= 2:
                 assert all(torch.isfinite(cpu[k]).all() for k in ('memory_target_identity','memory_target_offset'))
         valid=torch.cat((cpu['positive_mask'],cpu['negative_mask'].flatten(1)),1).bool()
@@ -92,6 +95,11 @@ def main(argv=None):
                 if param.grad is not None:assert torch.isfinite(param.grad).all(),name
             assert model.encoder.compress.weight.grad.abs().sum()>0
             row.update(loss=float(loss.detach()),identity_pairs=int(terms['identity_count']))
+            if args.device.startswith('cuda'):
+                torch.cuda.synchronize()
+                row.update(peak_allocated_gib=torch.cuda.max_memory_allocated()/2**30,
+                           peak_reserved_gib=torch.cuda.max_memory_reserved()/2**30)
+            row['total_seconds'] = time.perf_counter()-started
         rows.append(row);print(json.dumps(row),flush=True)
     report=dict(config=cfg.to_dict(),sampling=asdict(sampling),bank=str(bank.root),bank_shards=bank.shard_count,rows=rows)
     (args.out/'report.json').write_text(json.dumps(report,indent=2))

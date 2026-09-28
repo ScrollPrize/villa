@@ -20,7 +20,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
 )
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
-    ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, DirectConfig, DirectFollower,
+    ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, UNIFIED_ARCHITECTURE, DirectConfig, DirectFollower,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES,
@@ -71,8 +71,8 @@ def match_optimizer_layout(opt):
                 state[key] = torch.empty_like(param).copy_(value)
 
 
-ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1)
-MEMORY_OPTIONS = ('memory_slots','memory_steps','memory_stride','memory_patch_size','memory_grad_steps')
+ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, UNIFIED_ARCHITECTURE)
+MEMORY_OPTIONS = ('memory_slots','memory_steps','memory_stride','memory_patch_size','memory_grad_steps','memory_version')
 
 
 def checkpoint_config(ck):
@@ -80,7 +80,7 @@ def checkpoint_config(ck):
     if ck['architecture'] == MEMORY_ARCHITECTURE_V1:
         model_cfg.setdefault('memory_version', 1)  # saved before versions were recorded
     cfg = DirectConfig(**model_cfg)
-    expected = ((MEMORY_ARCHITECTURE if cfg.memory_version == 2 else MEMORY_ARCHITECTURE_V1)
+    expected = (({1:MEMORY_ARCHITECTURE_V1,2:MEMORY_ARCHITECTURE,3:UNIFIED_ARCHITECTURE}[cfg.memory_version])
                 if cfg.memory_slots else ARCHITECTURE)
     if ck['architecture'] != expected:
         raise ValueError('Checkpoint architecture and memory configuration disagree')
@@ -98,7 +98,7 @@ def load_checkpoint(path,device='cuda'):
 
 def move_batch(batch, device):
     # Pinned loader batches copy asynchronously; the compute stream orders later use.
-    return {k: move_batch(v, device) if isinstance(v, dict) else v.to(device, non_blocking=True)
+    return {k: v if k in ('history_crops','seed_crop') else move_batch(v, device) if isinstance(v, dict) else v.to(device, non_blocking=True)
             for k, v in batch.items()}
 
 
@@ -337,6 +337,8 @@ def build_parser():
     ap.add_argument('--hidden', type=int, default=128)
     ap.add_argument('--memory-slots', type=int, default=0,
                     help='Learned recurrent memory slots; 0 preserves the crop-only model')
+    ap.add_argument('--memory-version', type=int, choices=(2,3), default=3,
+                    help='3: unified full-crop recurrent model; 2: legacy patch-memory model')
     ap.add_argument('--memory-steps', type=int, default=32,
                     help='Past observed patches unrolled before the supervised current decision')
     ap.add_argument('--memory-stride', type=int, default=4,
@@ -450,11 +452,14 @@ def main(argv=None):
                        correction_limit=args.correction_limit,correction_steps=args.correction_steps,
                        memory_slots=args.memory_slots,memory_steps=args.memory_steps,
                        memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size,
-                       memory_grad_steps=args.memory_grad_steps)
+                       memory_grad_steps=args.memory_grad_steps,memory_version=args.memory_version,
+                       identity_temperature=args.identity_temperature)
     initialized = None
     resume = None
     if args.init_tracer:
         initialized,_,_,_,_ = load_checkpoint(args.init_tracer,args.device)
+        if cfg.memory_slots and cfg.memory_version == 3 and initialized.architecture != UNIFIED_ARCHITECTURE:
+            raise ValueError('The unified architecture must start fresh; legacy weights cannot initialize it')
         if args.memory_slots and not initialized.cfg.memory_slots:
             cfg = replace(initialized.cfg, **{k: getattr(args, k) for k in MEMORY_OPTIONS})
             upgraded = DirectFollower(cfg).to(args.device, memory_format=conv_memory_format(args.device))
@@ -465,7 +470,7 @@ def main(argv=None):
         else:
             if args.memory_slots and any(getattr(args,k) != getattr(initialized.cfg,k) for k in MEMORY_OPTIONS):
                 raise ValueError('--init-tracer memory configuration differs from existing memory checkpoint')
-            if initialized.cfg.memory_slots and initialized.cfg.memory_version != 2:
+            if initialized.cfg.memory_slots and initialized.cfg.memory_version == 1:
                 raise ValueError('Legacy v1 memory checkpoints cannot initialize new runs')
             cfg = initialized.cfg
         for key in MEMORY_OPTIONS:
@@ -599,7 +604,7 @@ def main(argv=None):
     loader_args = dict(batch_size=None, num_workers=args.workers,
                        pin_memory=torch.device(args.device).type == 'cuda')
     if args.workers:
-        loader_args.update(prefetch_factor=2, persistent_workers=True)
+        loader_args.update(prefetch_factor=1 if cfg.memory_slots and cfg.memory_version == 3 else 2, persistent_workers=True)
     loader = torch.utils.data.DataLoader(dataset, **loader_args)
     if not resume:
         (out/'config.json').write_text(json.dumps(dict(vars(args), architecture=model.architecture,

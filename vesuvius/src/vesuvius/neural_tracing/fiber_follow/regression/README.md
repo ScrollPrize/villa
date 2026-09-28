@@ -1,5 +1,56 @@
 # Axial fiber follower
 
+## Unified recurrent architecture
+
+New memory training defaults to `--memory-version 3`, checkpoint architecture
+`axial_fiber_unified_v1`. Launch a fresh run with:
+
+```bash
+bash scripts/launch_unified.sh
+```
+
+The unified model has one full-crop axial observation encoder. It encodes the
+current crop, original seed crop, and historical crops with the same parameters,
+without fiber-identity conditioning in the appearance encoder. There is no
+separate patch encoder. The immutable seed retains a 27-point descriptor stencil;
+a bounded recent-observation queue retains head descriptors and poses; adaptive
+slots compress temporal context. Every descriptor comes from that same encoder.
+
+One path evaluator attends to the current image, visible observed path, seed,
+recent observations, and adaptive slots. It is reused for initial proposals,
+each coordinate correction, final prefix confidence, supplied candidate curves,
+and auxiliary per-observation identity/offset queries. Only the small output
+projections differ. Each candidate samples its own features and reads memory;
+scoring hypothetical curves never writes them into memory. Observed heads write
+once per decision. Confidence sampling coordinates remain detached from BCE.
+
+Cosine identity attention uses the same normalized embedding projection as
+InfoNCE, with the configured identity temperature and an explicit null key for
+unmatched observations. This evidence enters the shared evaluator before the
+geometry/confidence split. The confidence-only eight-feature shortcut is absent.
+InfoNCE supervises individual labeled original-fiber visible references and the
+stored original seed, including when the seed leaves the crop. Membership labels
+filter losses only, never the model's observed references. Adaptive slots are
+context, not falsely treated as individual contrastive fiber descriptors.
+
+Training re-encodes full historical crops with current weights, oldest first.
+Old observations form no-gradient burn-in; recent encodings use activation
+recomputation. Historical images stay on the CPU until each observation is
+encoded. The current crop is read/encoded only once, and full seed/history crop
+footprints are checked against the holdout before I/O. Replay uses saved observed
+frames; history reconstruction is a fallback for older caches. Inference carries
+only the bounded state and encodes one new full crop per decision after startup.
+
+The launcher retains 16 effective batch size, 64 historical observations and 32
+gradient-bearing history steps, using microbatches of 2, two loader workers,
+activation checkpointing, and eager execution for the streamed sequence loop.
+Full-crop replay is substantially more expensive than the legacy patch unroll.
+Legacy checkpoint architectures remain loadable; they cannot initialize this
+architecture. Use `--memory-version 2` explicitly for legacy memory training.
+
+The remaining architecture description documents the crop-only and legacy
+patch-memory models.
+
 This model follows a marked fiber through a single heading-aligned CT crop. The
 default architecture is `axial_fiber_v3`. Set `--memory-slots 16` to use
 `axial_fiber_memory_v2`, described below. Existing v3 and `axial_fiber_memory_v1`

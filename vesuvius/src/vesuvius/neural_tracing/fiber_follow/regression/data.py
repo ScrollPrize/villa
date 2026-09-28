@@ -335,6 +335,9 @@ class IdentityObservationBuilder(ObservationBuilder):
         else:
             on = np.zeros(cfg.n_history+1,bool)
         item['reference_on_fiber'] = on.astype(np.float32)
+        if cfg.memory_slots and cfg.memory_version == 3 and item.get('seed_valid',False):
+            from scipy.spatial import cKDTree
+            item['reference_on_fiber'][-1] = float(cKDTree(fiber.points).query(item['seed_pos'])[0] <= s.on_fiber_tolerance)
         item['identity_reference_valid'] = bool(on[:-1].sum() >= 2 or on[-1])
         # Confirmed old departures with no visible original-fiber evidence cannot
         # be distinguished from ordinary following of the neighboring fiber.
@@ -458,15 +461,18 @@ class IdentityObservationBuilder(ObservationBuilder):
                 if self.cfg.memory_slots:
                     # Same augmentation parameters along the observation sequence.
                     x = batch['x']
+                    patches = x['history_crops'] if self.cfg.memory_version == 3 else x['memory_patches']
+                    seed_patch = x['seed_crop'] if self.cfg.memory_version == 3 else x['memory_seed_patch']
                     for k in torch.nonzero(x['memory_mask'][j]).flatten().tolist():
-                        x['memory_patches'][j,k,0] = torch.from_numpy(photometric(
-                            x['memory_patches'][j,k,0].numpy(), item['photometric'], rng))
+                        if k < patches.shape[1]:
+                            patches[j,k,0] = torch.from_numpy(photometric(
+                                patches[j,k,0].numpy(), item['photometric'], rng))
                     if x['memory_seed_valid'][j]:
-                        x['memory_seed_patch'][j,0] = torch.from_numpy(photometric(
-                            x['memory_seed_patch'][j,0].numpy(), item['photometric'], rng))
+                        seed_patch[j,0] = torch.from_numpy(photometric(
+                            seed_patch[j,0].numpy(), item['photometric'], rng))
                     if item['drop_presence']:
-                        x['memory_patches'][j,:,1] = 0
-                        x['memory_seed_patch'][j,1] = 0
+                        patches[j,:,1] = 0
+                        seed_patch[j,1] = 0
         return batch
 
 
@@ -488,4 +494,5 @@ class DirectTracer(ModelTracer):
             for item,path in zip(items,paths):
                 item.update({k:path[k] for k in SEED_FIELDS if k in path})
                 item['memory_warm'] = path.get('memory_warm', False)
-        return {k:v.to(self.device) for k,v in self.observations.images(items,self.vol,self.pool).items()}
+        return {k:v if k in ('history_crops','seed_crop') else v.to(self.device)
+                for k,v in self.observations.images(items,self.vol,self.pool).items()}
