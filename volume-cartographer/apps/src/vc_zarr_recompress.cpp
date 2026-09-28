@@ -390,6 +390,9 @@ static std::string make_zarr_v3_metadata(const std::vector<size_t>& shape,
     // Sharding config: SHARD_DIM³ shards with CHUNK_DIM³ inner chunks.
     utils::ShardConfig sc;
     sc.sub_chunks = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
+    // Pinned: ShardConfig now defaults to the spec's "end", and changing where this
+    // tool puts the index would change the layout of every c3d store it has written.
+    sc.index_location = "start";
 
     utils::ZarrCodecConfig codec_cfg;
     codec_cfg.name = "c3d";

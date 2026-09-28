@@ -225,6 +225,10 @@ struct ShardConfig {
     std::vector<std::size_t> sub_chunks;   // inner chunk shape
     std::vector<ZarrCodecConfig> index_codecs;  // codecs for the shard index
     std::vector<ZarrCodecConfig> sub_codecs;    // codecs for inner chunks
+    // "end" (the spec default when the field is absent) or "start". Readers that
+    // hardcode one of the two are common -- zarrita only implements "end" -- so
+    // prefer the default unless something downstream needs otherwise.
+    std::string index_location = "end";
 };
 
 // ---------------------------------------------------------------------------

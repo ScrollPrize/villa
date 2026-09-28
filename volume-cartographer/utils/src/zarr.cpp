@@ -181,7 +181,9 @@ ZarrMetadata parse_zarr_json(std::string_view json_str) {
                 if (auto* cs = json_find(cfg, "chunk_shape"); cs && cs->is_array())
                     for (const auto& v : (*cs))
                         sc.sub_chunks.push_back(v.get_size_t());
-                // index_location is always "start" — ignore any "end" values
+                if (auto* il = json_find(cfg, "index_location");
+                    il && il->is_string() && il->get_string() == "start")
+                    sc.index_location = "start";
                 if (auto* ic = json_find(cfg, "index_codecs"); ic && ic->is_array())
                     for (const auto& icv : (*ic))
                         if (icv.is_object()) sc.index_codecs.push_back(parse_codec_config(icv));
@@ -265,7 +267,7 @@ std::string serialize_zarr_json(const ZarrMetadata& meta) {
                     sub_cs.push_back(JsonValue(c));
                 sc_cfg["chunk_shape"] = JsonValue(std::move(sub_cs));
             }
-            sc_cfg["index_location"] = JsonValue("start");
+            sc_cfg["index_location"] = JsonValue(meta.shard_config->index_location);
 
             {
                 JsonArray idx_codecs;
@@ -698,8 +700,10 @@ ZarrArray::extract_inner_chunk(std::span<const std::byte> shard_data,
     if (shard_data.size() < index_size)
         throw std::runtime_error("zarr: shard too small to contain index");
 
-    // Index is always at the start of the shard.
-    std::span<const std::byte> index_data = shard_data.subspan(0, index_size);
+    std::span<const std::byte> index_data =
+        sc.index_location == "start"
+            ? shard_data.subspan(0, index_size)
+            : shard_data.subspan(shard_data.size() - index_size, index_size);
 
     std::vector<std::byte> decoded_index;
     if (!sc.index_codecs.empty()) {
@@ -1873,9 +1877,10 @@ void ZarrArray::write_shard(std::span<const std::size_t> shard_indices,
     detail::ShardIndex index;
     index.entries.resize(n_inner);
 
-    // Index always at start — reserve space for it.
     const std::size_t index_size = n_inner * 16;
-    shard_data.resize(index_size);
+    const bool index_at_start = sc.index_location == "start";
+    // Reserve the leading index up front; an end index is appended after the data.
+    if (index_at_start) shard_data.resize(index_size);
 
     auto pad_to_align = [&]() {
         auto n = shard_data.size();
@@ -1906,12 +1911,24 @@ void ZarrArray::write_shard(std::span<const std::size_t> shard_indices,
         pad_to_align();
     }
 
-    // Write index at start.
     auto index_bytes = index.serialize();
-    std::memcpy(shard_data.data(), index_bytes.data(), index_size);
+    if (index_at_start)
+        std::memcpy(shard_data.data(), index_bytes.data(), index_size);
+    else
+        shard_data.insert(shard_data.end(), index_bytes.begin(), index_bytes.end());
 
     // Write shard file.
     write_chunk_raw(shard_indices, shard_data);
+}
+
+// Byte offset of the shard index within a shard file of `file_size` bytes.
+// "start" keeps it at 0 for the life of the file; "end" (the spec default) moves
+// it every time the shard grows, so it is always derived from the current size.
+static std::uint64_t shard_index_offset(const std::string& index_location,
+                                        std::uint64_t file_size,
+                                        std::size_t index_size) {
+    if (index_location == "start") return 0;
+    return file_size >= index_size ? file_size - index_size : 0;
 }
 
 void ZarrArray::write_inner_chunk_to_shard(std::span<const std::size_t> chunk_indices,
@@ -1964,24 +1981,45 @@ void ZarrArray::write_inner_chunk_to_shard(std::span<const std::size_t> chunk_in
     std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
     if (!f) return;
 
-    // 1. Seek to EOF, round up to next 4k boundary, append chunk data.
-    //    Padding bytes (if any) are left uninitialised — ext4 zero-fills
-    //    them on sparse extension, and readers never look at them.
-    f.seekp(0, std::ios::end);
-    auto eof_offset = static_cast<std::uint64_t>(f.tellp());
-    auto chunk_offset = (eof_offset + kShardChunkAlign - 1)
-                      & ~(kShardChunkAlign - 1);
-    if (chunk_offset != eof_offset) {
-        f.seekp(static_cast<std::streamoff>(chunk_offset));
+    const bool index_at_start = meta_.shard_config->index_location == "start";
+
+    f.seekg(0, std::ios::end);
+    const auto file_size = static_cast<std::uint64_t>(f.tellg());
+
+    // With the index at the end, the bytes it occupies are exactly where the next
+    // chunk goes: read it out, lay the chunk over it, then write it back after.
+    std::vector<std::byte> index_buf;
+    if (!index_at_start) {
+        index_buf.resize(index_size);
+        f.seekg(static_cast<std::streamoff>(
+            shard_index_offset("end", file_size, index_size)));
+        f.read(reinterpret_cast<char*>(index_buf.data()),
+               static_cast<std::streamsize>(index_size));
     }
+
+    // Round up to the next 4k boundary so decoders can mmap the shard and hand
+    // the codec a direct pointer. Padding is left uninitialised; ext4 zero-fills
+    // on sparse extension and readers never look at it.
+    const std::uint64_t append_at =
+        index_at_start ? file_size : file_size - index_size;
+    auto chunk_offset = (append_at + kShardChunkAlign - 1)
+                      & ~(kShardChunkAlign - 1);
+    f.seekp(static_cast<std::streamoff>(chunk_offset));
     f.write(reinterpret_cast<const char*>(data.data()),
             static_cast<std::streamsize>(data.size()));
 
-    // 2. Seek to index entry, write 16 bytes (offset + nbytes)
     auto nbytes = static_cast<std::uint64_t>(data.size());
-    f.seekp(static_cast<std::streamoff>(linear * 16));
-    f.write(reinterpret_cast<const char*>(&chunk_offset), 8);
-    f.write(reinterpret_cast<const char*>(&nbytes), 8);
+    if (index_at_start) {
+        f.seekp(static_cast<std::streamoff>(linear * 16));
+        f.write(reinterpret_cast<const char*>(&chunk_offset), 8);
+        f.write(reinterpret_cast<const char*>(&nbytes), 8);
+    } else {
+        std::memcpy(index_buf.data() + linear * 16, &chunk_offset, 8);
+        std::memcpy(index_buf.data() + linear * 16 + 8, &nbytes, 8);
+        f.seekp(static_cast<std::streamoff>(chunk_offset + data.size()));
+        f.write(reinterpret_cast<const char*>(index_buf.data()),
+                static_cast<std::streamsize>(index_size));
+    }
     f.flush();
 }
 
@@ -2008,7 +2046,12 @@ bool ZarrArray::inner_chunk_exists(std::span<const std::size_t> chunk_indices) c
     std::ifstream f(p, std::ios::binary);
     if (!f) return false;
 
-    f.seekg(static_cast<std::streamoff>(linear * 16));
+    f.seekg(0, std::ios::end);
+    const auto index_base = shard_index_offset(
+        meta_.shard_config->index_location,
+        static_cast<std::uint64_t>(f.tellg()),
+        meta_.total_sub_chunks_per_shard() * 16);
+    f.seekg(static_cast<std::streamoff>(index_base + linear * 16));
     std::uint64_t offset = 0, nbytes = 0;
     f.read(reinterpret_cast<char*>(&offset), 8);
     f.read(reinterpret_cast<char*>(&nbytes), 8);
@@ -2042,7 +2085,12 @@ bool ZarrArray::inner_chunk_is_empty(std::span<const std::size_t> chunk_indices)
     std::ifstream f(p, std::ios::binary);
     if (!f) return false;
 
-    f.seekg(static_cast<std::streamoff>(linear * 16));
+    f.seekg(0, std::ios::end);
+    const auto index_base = shard_index_offset(
+        meta_.shard_config->index_location,
+        static_cast<std::uint64_t>(f.tellg()),
+        meta_.total_sub_chunks_per_shard() * 16);
+    f.seekg(static_cast<std::streamoff>(index_base + linear * 16));
     std::uint64_t offset = 0, nbytes = 0;
     f.read(reinterpret_cast<char*>(&offset), 8);
     f.read(reinterpret_cast<char*>(&nbytes), 8);
@@ -2092,7 +2140,11 @@ void ZarrArray::mark_inner_chunk_empty(std::span<const std::size_t> chunk_indice
     // Write empty sentinel: (0xFF..FE, 0)
     std::uint64_t sentinel_offset = ~std::uint64_t(0) - 1;
     std::uint64_t sentinel_nbytes = 0;
-    f.seekp(static_cast<std::streamoff>(linear * 16));
+    f.seekg(0, std::ios::end);
+    const auto index_base = shard_index_offset(
+        meta_.shard_config->index_location,
+        static_cast<std::uint64_t>(f.tellg()), index_size);
+    f.seekp(static_cast<std::streamoff>(index_base + linear * 16));
     f.write(reinterpret_cast<const char*>(&sentinel_offset), 8);
     f.write(reinterpret_cast<const char*>(&sentinel_nbytes), 8);
     f.flush();
@@ -2209,7 +2261,7 @@ ZarrArray::read_inner_chunk_from_shard(std::span<const std::size_t> chunk_indice
     }
     if (linear > std::numeric_limits<std::size_t>::max() / 16)
         return std::nullopt;
-    const std::size_t index_offset = linear * 16;
+    const std::size_t index_offset = linear * 16;  // relative to the index base
     auto is_missing_or_empty = [](std::uint64_t offset, std::uint64_t nbytes) {
         return (offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0)) ||
                (offset == ~std::uint64_t(0) - 1 && nbytes == 0) ||
@@ -2217,7 +2269,15 @@ ZarrArray::read_inner_chunk_from_shard(std::span<const std::size_t> chunk_indice
     };
 
     auto key = chunk_key(shard_idx);
+    const bool index_at_start = meta_.shard_config->index_location == "start";
     if (store_) {
+        // Locating an end index needs the object size, and Store exposes neither a
+        // size query nor a suffix range. Refuse rather than read from offset 0 and
+        // hand back whatever chunk bytes happen to sit there.
+        if (!index_at_start)
+            throw std::runtime_error(
+                "zarr: reading a sharded array with index_location=end through a "
+                "remote store is not supported");
         auto full_key = array_key_.empty() ? key : array_key_ + "/" + key;
         auto entry = store_->get_partial(full_key, index_offset, 16);
         if (!entry || entry->size() < 16) return std::nullopt;
@@ -2245,10 +2305,14 @@ ZarrArray::read_inner_chunk_from_shard(std::span<const std::size_t> chunk_indice
     std::ifstream f(p, std::ios::binary);
     if (!f) return std::nullopt;
 
-    // Read 16-byte index entry at position linear*16
     if (index_offset > static_cast<std::size_t>(std::numeric_limits<std::streamoff>::max()))
         return std::nullopt;
-    f.seekg(static_cast<std::streamoff>(index_offset));
+    f.seekg(0, std::ios::end);
+    const auto index_base = shard_index_offset(
+        meta_.shard_config->index_location,
+        static_cast<std::uint64_t>(f.tellg()),
+        meta_.total_sub_chunks_per_shard() * 16);
+    f.seekg(static_cast<std::streamoff>(index_base + index_offset));
     std::uint64_t offset = 0, nbytes = 0;
     f.read(reinterpret_cast<char*>(&offset), 8);
     f.read(reinterpret_cast<char*>(&nbytes), 8);

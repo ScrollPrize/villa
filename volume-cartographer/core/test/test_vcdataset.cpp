@@ -307,6 +307,34 @@ TEST_CASE("createZarrDataset: sharded v3 round-trips through the shard index")
     REQUIRE(fs::exists(shardFile));
     CHECK(fs::file_size(shardFile) < 2 * in.size());
 
+    // The index must sit at the END of the shard. Clients commonly read it as a
+    // suffix range without consulting index_location -- zarrita only implements
+    // "end" -- so an index at the start decodes chunk bytes as (offset, length)
+    // and every range derived from it lands outside the object.
+    {
+        auto meta = utils::Json::parse_file(d / "arr" / "zarr.json");
+        auto shardCfg = meta["codecs"][0]["configuration"];
+        CHECK(shardCfg["index_location"].get_string() == "end");
+
+        const size_t nInner = 4;  // 1024/256 along x, 1 elsewhere
+        const size_t indexBytes = nInner * 16;
+        const auto size = fs::file_size(shardFile);
+        std::ifstream f(shardFile, std::ios::binary);
+        f.seekg(static_cast<std::streamoff>(size - indexBytes));
+        std::vector<uint64_t> entries(nInner * 2);
+        f.read(reinterpret_cast<char*>(entries.data()),
+               static_cast<std::streamsize>(indexBytes));
+        REQUIRE(f);
+        bool anyResolvable = false;
+        for (size_t i = 0; i < nInner; ++i) {
+            const uint64_t off = entries[2 * i], len = entries[2 * i + 1];
+            if (off == ~uint64_t(0) && len == ~uint64_t(0)) continue;  // absent
+            CHECK(off + len <= size);
+            anyResolvable = true;
+        }
+        CHECK(anyResolvable);
+    }
+
     // Clearing an inner chunk is an index edit, not an unlink.
     CHECK(ds->removeChunk(0, 0, 3));
     CHECK(!ds->chunkExists(0, 0, 3));
