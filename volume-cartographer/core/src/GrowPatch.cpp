@@ -3370,10 +3370,45 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
     if (patch_normals_requested) {
         try {
-            // volume.voxelSize() is the level-0 um/voxel figure; each
-            // pyramid level doubles the voxel edge.
-            const double level_voxelsize_um =
-                static_cast<double>(voxelsize) * (1 << level);
+            // voxelsize is the level-0 um/voxel figure. Derive this level's
+            // voxel size from the true level shapes instead of assuming a
+            // dyadic pyramid: Volume::shape(level) reports the on-disk shape
+            // and the pyramid policy allows non-dyadic per-level factors.
+            std::optional<double> level_voxelsize_um;
+            try {
+                const std::array<int, 3> shape0 = volume.shape(0);
+                double factor = 1.0;
+                bool usable = true;
+                for (int i = 0; usable && i < 3; ++i) {
+                    if (shape0[i] <= 0 || volume_shape_zyx[i] <= 0) {
+                        usable = false;
+                        break;
+                    }
+                    const double r =
+                        static_cast<double>(shape0[i]) /
+                        static_cast<double>(volume_shape_zyx[i]);
+                    if (!std::isfinite(r) || r <= 0.0) {
+                        usable = false;
+                        break;
+                    }
+                    if (i == 0) {
+                        factor = r;
+                    } else if (std::abs(r - factor) > 0.02 * factor) {
+                        // Anisotropic pyramid: no single um/voxel figure
+                        // describes this level, so leave a stamped voxel size
+                        // on the unverifiable path instead of guessing.
+                        usable = false;
+                        break;
+                    }
+                }
+                if (usable) {
+                    level_voxelsize_um =
+                        static_cast<double>(voxelsize) * factor;
+                }
+            } catch (const std::exception&) {
+                // Level-0 shape unavailable: leave the stamp unverifiable
+                // rather than guessing a scale.
+            }
             trace_data.patch_normals = load_patch_normal_context(
                 params, volume_shape_zyx, resume_surf, level_voxelsize_um);
         } catch (const std::exception& e) {
