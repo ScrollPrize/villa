@@ -93,9 +93,27 @@ This is not covered by scrollprize.org/tutorial_spiral. Required keys:
 
 - `schema_version` — must equal `1`.
 - `name`, `voxel_size_um` — required, no validation beyond presence.
-- `spiral_outward_sense` — must be `"CW"` or `"ACW"` (case-insensitive).
-  No automated method determines this; it is read off the CT data by a
-  person in VC3D, or computed from an already-fitted spiral.
+- `z_direction_is_top_to_bottom`, `left_handed_coordinates` — the fitted
+  volume's two properties from the open-data catalog (`metadata.json`), copied 
+- verbatim as `true`/`false`. Together they fix the spiral's sense under the catalog convention that every scroll
+  shows the same spiral seen from its top: `"CW"` when they are equal, `"ACW"`
+  when they differ. The z direction also orients exported surfaces (below).
+- `spiral_outward_sense` — `"CW"` or `"ACW"` (case-insensitive). Derived from
+  the two catalog properties when both are present, and then only needed as a
+  cross-check (a mismatch is an error). Without them it is required and is
+  read off the CT data by a person in VC3D, or from an already-fitted spiral.
+
+Exported surfaces (the per-winding `meshes/`, the combined preview and
+`flatten_spiral_checkpoint.py`'s source surface) read like the scroll: column 0
+is the outermost wrap, U running outside to inside as orient-segment
+normalises it, and row 0 is the top of the scroll when
+`z_direction_is_top_to_bottom` is known (rows stay in z order when it is
+not). Each `meta.json` and preview manifest records the z direction the
+layout was made with under `grid_orientation` (a grid without it is an older
+one in sampling order: innermost first, rows by z); `winding_column_ranges`
+are in the written grid, outermost winding first. `left_handed_coordinates` does not change the grid, only the
+direction of its cross-product normal, which renders correct with
+`flip-normals = not left_handed_coordinates`.
 
 Optional `paths` object for per-input overrides when a dataset's file names
 don't match the catalog's conventional defaults (e.g. `tracks_dbm`).
@@ -128,6 +146,33 @@ specifically):
   }
 }
 ```
+
+## Lasagna inputs must be packed first
+
+`fit_spiral.py` reads `normal_x`, `normal_y` and `gradient_magnitude` only
+through the resident-pool sidecars that `pack_resident_pools.py` writes
+(`lasagna_data.py`: there is no other loading path). Before the first fit on a
+dataset, pack the stores at the group named by `normal_zarr_group` in
+`spiral-scroll.json`:
+
+```sh
+python pack_resident_pools.py <dataset>/lasagna_inputs \
+    --what normals,grad_mag --normal-group 2
+```
+
+The packer looks for `*_nx.ome.zarr`, `*_ny.ome.zarr` and `*_grad_mag.ome.zarr`
+in that folder and writes `<store>.respool_g<group>_pair` (normals) and
+`<store>.respool_g<group>` (grad_mag) next to them. Without the sidecars the fit
+stops at input loading with
+
+```
+lasagna normals: resident-pool sidecar '.../PHercXXXX_nx.ome.zarr.respool_g2_pair' not found; build it with pack_resident_pools.py ...
+```
+
+The packer only iterates over chunk files that exist, so a store that holds only
+the z chunk rows of your fit window packs correctly; rows outside it read back
+as no-data. Pass `--ct <scroll zarr> --ct-group <group>` to drop bricks outside
+the CT mask.
 
 ## Sweep runner output
 

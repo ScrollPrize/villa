@@ -407,6 +407,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Improving scroll alignment with image registration](https://github.com/Paul-G2/VesuviusScrollAlignment) Scripts and a report showing how image registration can improve the alignment of scroll volumes scanned at different energies and resolutions, by Paul Geiger
 
+- [ARGUS](https://github.com/Cinder-Covenant/ARGUS): an independent local workbench that keeps every result tied to its physical scroll, source data, model and evidence receipt, and refuses when identities or inputs do not match. Runnable example ([docs/PUBLIC_RUN.md](https://github.com/Cinder-Covenant/ARGUS/blob/main/docs/PUBLIC_RUN.md)): `argus run pherc0139-w016-ink9um-control` acquires a bounded crop of public PHerc0139 data and scores Villa's released `ink_9um` checkpoint as a held-out control; a run without a single-use authorisation, or with a replayed one, is refused. Uses Villa's tools as providers, ships no CT data or model weights, Apache-2.0. By DarthCeltic and clexious
+
 ### 📦 Materials
 
 - [CT scanning campfire scrolls](https://dl.ash2txt.org/community-uploads/waynewaynehello/) Ahron Wayne replicated the carbonization process of a papyrus scroll and scanned it with his personal CT scanner
