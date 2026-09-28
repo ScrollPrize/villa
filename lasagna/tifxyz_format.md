@@ -111,7 +111,7 @@ Common fields produced by tools:
 `scale = [sx, sy]` is the grid density: grid cells per surface unit (voxel) along columns (`sx`) and rows (`sy`). It is the **reciprocal** of the vertex spacing, not the spacing itself.
 
 - A surface sampled every 20 voxels has `scale = [0.05, 0.05]`; one sampled every 12.5 voxels has `scale = [0.08, 0.08]`.
-- Surface coordinates (voxels) (measured from the surface origin) map to grid indices by multiplying, and back by dividing: `col = u * sx`, `row = v * sy`, and `u = col / sx`, `v = row / sy`.
+- Surface coordinates in voxels, measured from the surface origin, map to grid indices by multiplying, and back by dividing: `col = u * sx`, `row = v * sy`, and `u = col / sx`, `v = row / sy`.
 - The nominal surface size in voxels is therefore `(W / sx, H / sy)`, and a quad covers about `(1 / sx) * (1 / sy)` voxels².
 
 To stay compatible:
