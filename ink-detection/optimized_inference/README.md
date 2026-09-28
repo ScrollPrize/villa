@@ -36,6 +36,7 @@ GPU-accelerated, containerized inference for ink detection models. The GPU image
 | `USE_ZARR_COMPRESSION` | Enable zarr compression | `false` |
 | `COMPILE` | Enable torch.compile | `1` |
 | `COMPILE_MODE` | torch.compile mode | `reduce-overhead` |
+| `FORCE_REVERSE` | Read the layers in reverse order. Which order a segment needs is not known in advance — see *Which way to read the layers* below | `false` |
 
 **Inference Configuration Notes:**
 - `TILE_SIZE`: Sets both the tile extraction size and network input size. Larger values = more context but more memory. Should match training size for best results (typically 64)
@@ -58,6 +59,37 @@ s3://<bucket>/<prefix>/
 
 - Prediction is uploaded to: `s3://<bucket>/<prefix>/predictions/prediction_<MODEL>_<START>_<END>.png`
 - The S3 URI is written to: `/tmp/result_s3_url.txt`
+
+## Which way to read the layers
+
+`FORCE_REVERSE` flips the order the model reads a surface volume's layers in, and a new segment
+can need either. Comparing the two predictions does not settle it on a segment nobody has read:
+the amount of ink each order reports is not a signal (on PHerc0139 the wrong order reports 20×
+*less* ink than the right one; on a PHerc1451 surface, 8× *more*).
+
+`orientation_check.py` settles it without labels. It plants synthetic ink on one face of the
+sheet, then the other, and runs this inference both ways: the wrong order answers with nothing,
+the right order with ink on the wrong face answers negatively, and one combination answers
+positively.
+
+```bash
+python orientation_check.py SURFACE_VOLUME.zarr WEIGHTS.ckpt \
+    --model-type resnet3d-152-3d-decoder --start-layer 24 --end-layer 86
+```
+
+```
+  forward near   lift +0.041   baseline ink 1.99%
+  forward far    lift -0.233   baseline ink 1.99%
+  reverse near   lift +0.000   baseline ink 0.10%
+  reverse far    lift +0.000   baseline ink 0.10%
+read forward, ink on the near face  ->  FORCE_REVERSE=false
+```
+
+That is PHerc0139's published surface volume, which the team's ink map confirms reads forward.
+The same window flipped in depth gets `FORCE_REVERSE=true`. It reads one 1920 px window — the
+smallest that holds two lines of writing at 2.4 µm — from the middle of the volume, or from
+`--y/--x`. No verdict means no combination answered clearly: the window is blind both ways, or
+the answer is too close to act on.
 
 ## Quick start (local)
 
