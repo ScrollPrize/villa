@@ -69,3 +69,6 @@ volume-cartographer/AGENTS.md
 /spiral-fitting/plans
 /volume-cartographer/scripts/spiral/out
 /spiral-fitting/.claude
+
+# vesuvius.accept_terms used to write its record next to the module
+vesuvius/src/vesuvius/install/agreement.txt

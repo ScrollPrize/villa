@@ -38,11 +38,27 @@ def get_installation_path():
     return install_path
 
 
-def save_agreement():
-    # Create agreement file in the setup directory
-    setup_dir = os.path.dirname(os.path.abspath(__file__))
-    agreement_file_path = os.path.join(setup_dir, "agreement.txt")
+def agreement_path() -> Path:
+    """Where the licence acceptance is recorded: the user's config directory.
 
+    ``VESUVIUS_AGREEMENT_FILE`` overrides it. It used to be written next to
+    this module, which for the recommended editable install (``uv sync``) is
+    inside the git checkout and shows up as an untracked file in every
+    contributor's ``git status``, and for a wheel install is lost on upgrade.
+    """
+
+    override = os.environ.get("VESUVIUS_AGREEMENT_FILE")
+    if override:
+        return Path(override).expanduser()
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+    return Path(config_home) / "vesuvius" / "agreement.txt"
+
+
+def save_agreement():
+    agreement_file_path = agreement_path()
+    agreement_file_path.parent.mkdir(parents=True, exist_ok=True)
     with open(agreement_file_path, "w+") as file:
         file.write("yes")
     print(f"Agreement saved to {agreement_file_path}")
