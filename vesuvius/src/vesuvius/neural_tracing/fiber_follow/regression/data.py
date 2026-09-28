@@ -40,9 +40,13 @@ class ObservationBuilder:
         for item in items:
             reference_layout(item,self.cfg)
         stack = lambda key: torch.from_numpy(np.stack([item[key] for item in items]).astype(np.float32))
-        return dict(fine=image_crop(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
-                    seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
-                    seed_tangent=stack('visible_seed_tangent'))
+        x = dict(fine=image_crop(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
+                 seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
+                 seed_tangent=stack('visible_seed_tangent'))
+        if self.cfg.memory_slots:
+            from .memory_data import memory_images
+            x.update(memory_images(items, vol, self.cfg, image_crop, pool))
+        return x
 
     def __call__(self,items,vol):
         return dict(x=self.images(items,vol),
@@ -310,6 +314,18 @@ class IdentityObservationBuilder(ObservationBuilder):
         # Confirmed old departures with no visible original-fiber evidence cannot
         # be distinguished from ordinary following of the neighboring fiber.
         item['identity_observable'] = bool(not item.get('offtrack',False) or item['identity_reference_valid'])
+        if cfg.memory_slots and item.get('offtrack', False):
+            from .memory_data import memory_layout
+            observations, seed = memory_layout(item, cfg)
+            observations = observations[:-1]  # head alone is not original-fiber history
+            # Annotation membership controls supervision only. The memory
+            # writer receives every observed patch, including contaminated ones.
+            if seed is not None:
+                observations = observations+[seed]
+            if observations:
+                from scipy.spatial import cKDTree
+                distance = cKDTree(fiber.points).query(np.stack([o['pos'] for o in observations]))[0]
+                item['identity_observable'] |= bool((distance <= s.on_fiber_tolerance).any())
         item['identity_curve'] = curve
         visible = visible_points(curve,cfg.fine)
         item['identity_label_z'] = (curve[visible] @ frame.T+pos)[:,2] if visible.any() else pos[2:3]
@@ -326,6 +342,10 @@ class IdentityObservationBuilder(ObservationBuilder):
         # Also reject matched labels if their distinguishing seed is not visible.
         if item.get('source') == 5 and not item['visible_seed_mask'].any():
             return False
+        if self.cfg.memory_slots:
+            from .memory_data import memory_allowed
+            if not memory_allowed(item, self.cfg, band):
+                return False
         if band is None:
             return True
         z = np.asarray(item.get('identity_label_z',np.asarray(item['pos'])[2:3]))
@@ -407,6 +427,18 @@ class IdentityObservationBuilder(ObservationBuilder):
                 if item['drop_presence']:
                     batch['x']['fine'][j,1] = 0
                     batch['presence_dropped'][j] = 1
+                if self.cfg.memory_slots:
+                    # Same augmentation parameters along the observation sequence.
+                    x = batch['x']
+                    for k in torch.nonzero(x['memory_mask'][j]).flatten().tolist():
+                        x['memory_patches'][j,k,0] = torch.from_numpy(photometric(
+                            x['memory_patches'][j,k,0].numpy(), item['photometric'], rng))
+                    if x['memory_seed_valid'][j]:
+                        x['memory_seed_patch'][j,0] = torch.from_numpy(photometric(
+                            x['memory_seed_patch'][j,0].numpy(), item['photometric'], rng))
+                    if item['drop_presence']:
+                        x['memory_patches'][j,:,1] = 0
+                        x['memory_seed_patch'][j,1] = 0
         return batch
 
 
@@ -427,4 +459,5 @@ class DirectTracer(ModelTracer):
         if paths is not None:
             for item,path in zip(items,paths):
                 item.update({k:path[k] for k in SEED_FIELDS if k in path})
+                item['memory_warm'] = path.get('memory_warm', False)
         return {k:v.to(self.device) for k,v in self.observations.images(items,self.vol,self.pool).items()}

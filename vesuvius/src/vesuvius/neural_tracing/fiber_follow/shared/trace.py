@@ -148,6 +148,9 @@ class ModelTracer:
         exploration = np.full(n, -1, int)
         stop_streak = np.zeros(n, int)
         last_segment = [np.asarray([p[-1]]) for p in paths]
+        # Per-call/per-trace state, never shared between separate trace() calls.
+        memory = (self.model.initial_memory(n, self.device)
+                  if getattr(self.model.cfg, 'memory_slots', 0) else None)
         pp = self.p
         while active.any():
             idx = np.flatnonzero(active)
@@ -173,14 +176,26 @@ class ModelTracer:
                 context['paths'] = [dict(seed_segment=np.asarray(paths[i][hist_start[i]:hist_start[i]+64]),
                                          travelled=float(length[i]),
                                          **{**references[i], 'seed_age': references[i]['seed_age']+float(length[i])}) for i in idx]
+                if memory is not None:
+                    for j, i in enumerate(idx):
+                        context['paths'][j]['memory_warm'] = bool(memory['seen'][i])
             x = self.build_inputs(pos, fr, hist, hm, **context)
             sampling = {}
+            if memory is not None:
+                sampling['memory'] = {k: v[idx] for k,v in memory.items()}
             if stochastic:
                 sampling['initial_noise'] = trace_noise(self.model.cfg, [generators[i] for i in idx], self.device)
             if getattr(self.model.cfg, 'candidate_selection', 'prefix') == 'stop_fallback':
                 sampling.update(confidence_threshold=pp.confidence,n_commit=pp.n_commit)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
                 out = self.model(x, tensor(hist).float(), tensor(hm), **sampling)
+            if memory is not None:
+                # Writes describe the current observed head, never the uncommitted
+                # proposal. Retiring/reordering active traces preserves ownership.
+                for key, value in memory.items():
+                    updated = value.clone()
+                    updated[idx] = out['memory_'+key].detach().to(value.dtype)
+                    memory[key] = updated
             commits, allowed = commit_prefix(out['points'], out['confidence'], pp.confidence, pp.n_commit,
                                              self.model.cfg.max_recovery_distance)
             commits, allowed = [v.cpu().numpy() for v in (commits, allowed)]

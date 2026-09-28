@@ -1,7 +1,8 @@
 """Crop-only fiber following: residual 3-D stem, 8x2x2 tokens, full axial attention.
 
 All physical coordinates are trace-grid voxels; CT samples are half a trace voxel.
-There is one visual backbone and no persistent or out-of-crop appearance memory.
+The default is crop-only. Optional learned memory uses a small observation
+encoder and a bounded recurrent state, with a separate immutable seed anchor.
 """
 from dataclasses import asdict, dataclass, field
 import math
@@ -15,6 +16,7 @@ from torch.utils.checkpoint import checkpoint
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 
 ARCHITECTURE = 'axial_fiber_v3'
+MEMORY_ARCHITECTURE = 'axial_fiber_memory_v1'
 TOKEN_STRIDE = (8, 2, 2)  # z, y, x in input samples
 TOKEN_OFFSET = (3, 0, 0)  # centre of four stride-two stem positions
 IDENTITY_EVIDENCE_WIDTH = 8  # point/mean/min/coverage for seed and history separately
@@ -38,6 +40,10 @@ class DirectConfig:
     correction: bool = True
     correction_limit: float = 1.
     correction_steps: int = 2
+    memory_slots: int = 0  # zero preserves the crop-only architecture and weights
+    memory_steps: int = 32  # preceding observed patches, plus the current head
+    memory_stride: int = 4  # historical observation spacing in trace voxels
+    memory_patch_size: int = 17  # 8-voxel-wide patch at the production .5 spacing
 
     def __post_init__(self):
         if isinstance(self.fine, dict):
@@ -58,6 +64,15 @@ class DirectConfig:
             raise ValueError('Invalid correction steps')
         if self.n_future*self.future_step > (c.depth-c.behind-1)*c.spacing:
             raise ValueError('Future horizon exceeds fine image')
+        if not isinstance(self.memory_slots, int) or self.memory_slots < 0:
+            raise ValueError('Memory slots must be a nonnegative integer')
+        if self.memory_slots:
+            if any(not isinstance(v, int) or v < 1 for v in (self.memory_steps, self.memory_stride)):
+                raise ValueError('Memory sequence dimensions must be positive integers')
+            if self.memory_steps*self.memory_stride > self.n_history:
+                raise ValueError('Memory sequence exceeds the saved observed history')
+            if not isinstance(self.memory_patch_size, int) or self.memory_patch_size < 5 or self.memory_patch_size % 2 != 1:
+                raise ValueError('Memory patch size must be odd and at least five')
 
     @property
     def recent_history_points(self):
@@ -275,6 +290,10 @@ class DirectFollower(nn.Module):
         self.register_buffer('path_stencil',torch.tensor([[a*cfg.patch_radius,b*cfg.patch_radius,z]
             for z in (-1.,0.,1.) for a in (-1.,0.,1.) for b in (-1.,0.,1.)]),persistent=False)
         self.register_buffer('planes',torch.arange(1,cfg.n_future+1).float()*cfg.future_step,persistent=False)
+        if cfg.memory_slots:
+            from .memory import LearnedMemory
+            self.recurrent_memory = LearnedMemory(cfg)
+            self.architecture = MEMORY_ARCHITECTURE
 
     def context(self, x, hist, hmask):
         cfg = self.cfg
@@ -316,14 +335,25 @@ class DirectFollower(nn.Module):
         deep,valid = sample_features(ctx['deep'],points,self.cfg.fine,TOKEN_STRIDE,TOKEN_OFFSET)
         return torch.cat((local,deep,valid[...,None]),-1)
 
-    def forward(self, x, hist, hmask, queries=None, candidates=None):
+    def forward(self, x, hist, hmask, queries=None, candidates=None, memory=None):
         ctx = self.context(x,hist,hmask)
+        if self.cfg.memory_slots:
+            ctx['recurrent'] = self.recurrent_memory.observe(x, memory)
+        elif memory is not None:
+            raise ValueError('Persistent memory requires a memory-enabled checkpoint')
         out = self.predict(ctx,hist,candidates)
+        if self.cfg.memory_slots:
+            out.update({'memory_'+k: v for k,v in ctx['recurrent'].items()})
         out.update(reference_embedding=ctx['reference_embedding'],reference_mask=ctx['reference_mask'])
         if queries is not None:
             values,support = sample_features(ctx['fine'],queries,self.cfg.fine)
             out.update(query_embedding=F.normalize(self.embedding(values),dim=-1),query_support=support)
         return out
+
+    def initial_memory(self, batch, device):
+        if not self.cfg.memory_slots:
+            raise ValueError('This checkpoint has no persistent memory')
+        return self.recurrent_memory.initial_state(batch, device)
 
     def identity_evidence(self, ctx, values, support):
         """Observed-reference cosine evidence for each prefix, without GT filtering.
@@ -369,6 +399,8 @@ class DirectFollower(nn.Module):
         initial[..., 2] = self.planes
         query = self.query(self.query_features(ctx, initial))
         decoded = self.decoder(query, ctx['memory'], memory_key_padding_mask=ctx['padding'])
+        if self.cfg.memory_slots:
+            decoded = self.recurrent_memory.read(decoded, ctx['recurrent'])
         lateral = cfg.lateral_limit*torch.tanh(self.coordinates(decoded).float())
         points = torch.cat((lateral, initial[..., 2:]), -1)
         initial_points = points

@@ -1,8 +1,8 @@
-# Crop-only axial fiber follower
+# Axial fiber follower
 
 This model follows a marked fiber through a single heading-aligned CT crop. The
-current architecture is `axial_fiber_v3`; previous direct/identity architectures
-and their checkpoint loaders have been removed.
+default architecture is `axial_fiber_v3`. Set `--memory-slots 16` to use
+`axial_fiber_memory_v1`, described below. Existing v3 checkpoints remain supported.
 
 ## Architecture
 
@@ -42,8 +42,8 @@ the separate seed comparison. Predicted paths and supplied candidates use this
 same head. The eight added inputs start with zero weights and learn through
 prefix/candidate BCE, with gradients also reaching the shared embedding projection.
 
-There is no coarse image branch, separate appearance encoder, remote CT patch
-reader, or persistent embedding cache. History and seed features are sampled only
+The default crop-only model has no coarse image branch, separate appearance
+encoder, remote CT patch reader, or persistent embedding cache. Its history and seed features are sampled only
 inside the current crop. References outside it have their position, orientation,
 age and features masked out before they can influence the network. Seed metadata
 is retained in rollout/replay records so that visibility can be determined later;
@@ -70,11 +70,109 @@ confidence supervision masked, rather than receiving contradictory labels for
 indistinguishable inputs. Geometry is already masked for confirmed departures.
 The `identity_observable_fraction` metric records this coverage.
 
-This model learns local visual continuity. It cannot verify original-seed identity
+The default crop-only model learns local visual continuity. It cannot verify original-seed identity
 once every distinguishing observation has left its crop. Full tracing evaluation
 still measures departures from the original annotation, including this case.
 
 ## Launch and logs
+
+### Optional learned observation memory
+
+`--memory-slots 0` (the default) retains the existing crop-only parameters and
+computation. Positive slots enable a separate checkpoint architecture with:
+
+- A small shared CT/presence patch encoder: two strided 3D convolutions followed
+  by eight spatial tokens per observation. Default patches are 17³ samples at
+  spacing 0.5, covering eight trace voxels along each axis.
+- A learned bank of adaptive slots. Cross-attention reads observations and a
+  sigmoid gate learns which features to retain or replace in each slot.
+- Eight seed tokens retained separately, with immutable observed position and
+  tangent frame. An absent seed stays masked; replay without a saved original
+  seed does not invent one from possibly contaminated history.
+- Separate memory attention in the path decoder, before both coordinate and
+  confidence prediction. Relative motion and original-seed pose are expressed
+  in the current observation frame; world coordinates are not learned identifiers.
+
+Training reconstructs `--memory-steps 32` past observations at
+`--memory-stride 4` trace-voxel spacing from the existing saved observed history,
+then appends the current head. It re-reads these small patches from the static
+volume and backpropagates the current decision's task losses through the entire
+memory unroll and patch encoder. It does **not** unroll the expensive full-crop
+backbone or differentiate through the tracing policy. Missing history is padded
+and masked. Fresh, drifted, matched, and replay observations retain their
+existing sampling distributions. Geometry annotations never enter the writer;
+they only determine targets and supervision availability.
+
+Online tracing initializes from the original seed and any supplied history,
+then reads one new head patch per decision and carries the bounded latent state
+forward. Each directed trace has independent state; every new `trace()` call
+resets it. Writes use observed heads, never predicted future points. The tracer
+automatically enables memory when loading a memory checkpoint; there is no
+inference switch to accidentally leave it disabled.
+
+All historical and seed patch read footprints are checked against the holdout
+before training I/O. Confirmed departures can receive decision supervision when
+an original-fiber observation is available in memory even if it is outside the
+main crop. Supervision masks never filter the writer's observations. Presence
+dropout and photometric augmentation also apply to memory patches.
+
+Start a **new** memory experiment using the existing launch configuration:
+
+```bash
+RUN_NAME=axial_memory_run1 bash scripts/launch_axial.sh \
+  --memory-slots 16 --memory-steps 32 --memory-stride 4 \
+  --memory-patch-size 17 --no-compile
+```
+
+To initialize its existing backbone/decoder/scorer from a trained crop-only
+model, append:
+
+```bash
+  --init-tracer output/axial_crop_822_run2/ckpt_015000.pt
+```
+
+This copies the source EMA weights, initializes the new memory parameters, and
+starts a new optimizer/schedule in the new output directory. The memory branch
+can change predictions immediately; initialization is not a quality guarantee.
+Use the existing resume workflow with the same memory options to continue a
+memory run. A memory checkpoint cannot be silently converted to crop-only.
+The original run is not migrated or modified by these commands.
+
+Input validation, with no training job started:
+
+```bash
+PYTHONPATH=../../.. ../../../../.venv/bin/python \
+  -m vesuvius.neural_tracing.fiber_follow.regression.identity_preflight \
+  --out output/memory_preflight --memory-slots 16 --microbatch 2 --batches 1
+```
+
+Add `--forward --device cuda` when a GPU is available to check full-crop
+forward/backward. The memory path has CPU gradient, streaming/unroll parity,
+checkpoint, holdout, and Dynamo graph-capture tests. Production CUDA/BF16 and
+Inductor performance require a separate preflight; `--no-compile` above avoids
+assuming those measurements have been made.
+
+Implementation validation used 16 slots (238,960 extra parameters; 4,703,413
+total). A full-size CPU optimizer update on two real training examples initialized
+from the step-15,000 EMA produced finite gradients, including gradients reaching
+the earliest historical patches. Checkpoint weights reloaded exactly and predicted
+points agreed within 3.6e-7. The report and reproducible smoke script are in
+`output/memory_validation/`. A synthetic retention test also learns a distinction
+available only in an observation 32 voxels behind the head. These checks establish
+that the memory can train and persist; tracing quality has not yet been measured.
+
+`memory_observations_mean` and `memory_anchor_fraction` are logged alongside the
+existing task metrics. Sequence lengths affect CPU I/O and training activations;
+the number of memory slots bounds inference state size, not the sequence-training
+cost. The first version trains retention over at most the stored 128-voxel
+history. Inference can run longer, but long-range accuracy is unproven. Replay
+rebuilds memory from that bounded history plus the original seed, rather than
+reproducing latent states from the entire original rollout. Historical head
+frames are reconstructed from observed tangents; they may differ from the exact
+frames used by the collecting model. Longer sequences and more natural failure
+sampling remain separate experiments.
+
+### Crop-only default
 
 ```bash
 bash scripts/launch_axial.sh

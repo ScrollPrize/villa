@@ -1,4 +1,4 @@
-"""Check real full-size crop-only batches, supervision and model gradients."""
+"""Check real full-size axial batches, optional memory, and model gradients."""
 import argparse
 from dataclasses import asdict
 import json
@@ -28,9 +28,14 @@ def main(argv=None):
     ap.add_argument('--microbatch',type=int,default=4)
     ap.add_argument('--batches',type=int,default=4)
     ap.add_argument('--forward',action='store_true')
+    ap.add_argument('--memory-slots',type=int,default=0)
+    ap.add_argument('--memory-steps',type=int,default=32)
+    ap.add_argument('--memory-stride',type=int,default=4)
+    ap.add_argument('--memory-patch-size',type=int,default=17)
     args=ap.parse_args(argv)
     torch.set_num_threads(4);torch.manual_seed(0)
-    cfg=DirectConfig()
+    cfg=DirectConfig(memory_slots=args.memory_slots,memory_steps=args.memory_steps,
+                     memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size)
     spec=FiberVolumeSpec(args.fiber_zarrs,ct_zarr=args.ct,ct_level=0,ct_grid_scale=4.,inputs='ct+presence')
     band=ZBand(45000/spec.grid_scale,48500/spec.grid_scale)
     fibers,_=split_fibers(load_fibers(args.fibers,grid_scale=spec.grid_scale),band)
@@ -46,7 +51,10 @@ def main(argv=None):
     rows=[]
     for index in range(args.batches):
         started=time.perf_counter();cpu=next(it)
-        assert set(cpu['x'])=={'fine','seed','seed_mask','seed_age','seed_tangent'}
+        assert {'fine','seed','seed_mask','seed_age','seed_tangent'} <= set(cpu['x'])
+        if cfg.memory_slots:
+            assert cpu['x']['memory_mask'][:,-1].all()
+            assert torch.isfinite(cpu['x']['memory_patches']).all()
         valid=torch.cat((cpu['positive_mask'],cpu['negative_mask'].flatten(1)),1).bool()
         assert crop_support(cpu['identity_points'],cfg.fine)[valid].all()
         if index==0:torch.save(cpu,args.out/'batch.pt')
@@ -54,6 +62,9 @@ def main(argv=None):
             matched=int((cpu['source']==5).sum()),visible_seeds=int(cpu['seed_present'].sum()),
             observable=int(cpu['identity_observable'].sum()),positive_pairs=int(cpu['positive_mask'].sum()),
             negative_pairs=int(cpu['negative_mask'].sum()))
+        if cfg.memory_slots:
+            row.update(memory_observations=int(cpu['x']['memory_mask'].sum()),
+                       memory_anchors=int(cpu['x']['memory_seed_valid'].sum()))
         if model is not None:
             b=move_batch(cpu,args.device);model.zero_grad(set_to_none=True)
             with torch.autocast('cuda',dtype=torch.bfloat16,enabled=args.device.startswith('cuda')):

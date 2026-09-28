@@ -1,7 +1,7 @@
 """Train a direct curve follower from scratch, with original-fiber online replay."""
 import argparse
 import copy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import time
@@ -20,7 +20,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
 )
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
-    ARCHITECTURE, DirectConfig, DirectFollower,
+    ARCHITECTURE, MEMORY_ARCHITECTURE, DirectConfig, DirectFollower,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES,
@@ -71,11 +71,15 @@ def match_optimizer_layout(opt):
                 state[key] = torch.empty_like(param).copy_(value)
 
 
-ARCHITECTURES = (ARCHITECTURE,)
+ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE)
 
 
 def checkpoint_config(ck):
-    return DirectConfig(**ck['model_cfg'])
+    cfg = DirectConfig(**ck['model_cfg'])
+    expected = MEMORY_ARCHITECTURE if cfg.memory_slots else ARCHITECTURE
+    if ck['architecture'] != expected:
+        raise ValueError('Checkpoint architecture and memory configuration disagree')
+    return cfg
 
 
 def load_checkpoint(path,device='cuda'):
@@ -179,6 +183,9 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         if 'pair_sampling_version' in cpu:
             pair_version = int(cpu['pair_sampling_version'][0])
         batch = move_batch(cpu, device)
+        if model.cfg.memory_slots:
+            sums['memory_observations_mean'] = sums.get('memory_observations_mean', 0.)+float(cpu['x']['memory_mask'].sum())/total
+            sums['memory_anchor_fraction'] = sums.get('memory_anchor_fraction', 0.)+float(cpu['x']['memory_seed_valid'].sum())/total
         queries = dict(queries=batch['identity_points']) if 'identity_points' in batch else {}
         if 'candidate_points' in batch:
             queries['candidates'] = batch['candidate_points']
@@ -300,6 +307,14 @@ def build_parser():
     ap.add_argument('--decoder-layers', type=int, default=4)
     ap.add_argument('--axial-layers', type=int, default=4)
     ap.add_argument('--hidden', type=int, default=128)
+    ap.add_argument('--memory-slots', type=int, default=0,
+                    help='Learned recurrent memory slots; 0 preserves the crop-only model')
+    ap.add_argument('--memory-steps', type=int, default=32,
+                    help='Past observed patches unrolled before the supervised current decision')
+    ap.add_argument('--memory-stride', type=int, default=4,
+                    help='Spacing of reconstructed historical observations in trace voxels')
+    ap.add_argument('--memory-patch-size', type=int, default=17,
+                    help='Odd CT/presence patch size for the memory writer')
     ap.add_argument('--activation-checkpointing', action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument('--correction', action=argparse.BooleanOptionalAction, default=True,
                     help='Refine the curve using refreshed local and deep image evidence')
@@ -394,12 +409,28 @@ def main(argv=None):
     cfg = DirectConfig(channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
                        decoder_layers=args.decoder_layers,embedding=args.embedding,
                        activation_checkpointing=args.activation_checkpointing,correction=args.correction,
-                       correction_limit=args.correction_limit,correction_steps=args.correction_steps)
+                       correction_limit=args.correction_limit,correction_steps=args.correction_steps,
+                       memory_slots=args.memory_slots,memory_steps=args.memory_steps,
+                       memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size)
     initialized = None
     resume = None
     if args.init_tracer:
         initialized,_,_,_,_ = load_checkpoint(args.init_tracer,args.device)
-        cfg = initialized.cfg
+        if args.memory_slots and not initialized.cfg.memory_slots:
+            cfg = replace(initialized.cfg, memory_slots=args.memory_slots, memory_steps=args.memory_steps,
+                          memory_stride=args.memory_stride, memory_patch_size=args.memory_patch_size)
+            upgraded = DirectFollower(cfg).to(args.device, memory_format=conv_memory_format(args.device))
+            incompatible = upgraded.load_state_dict(initialized.state_dict(), strict=False)
+            if incompatible.unexpected_keys or any(not k.startswith('recurrent_memory.') for k in incompatible.missing_keys):
+                raise ValueError('Unexpected parameter mismatch initializing memory model')
+            initialized = upgraded
+        else:
+            if args.memory_slots and any(getattr(args,k) != getattr(initialized.cfg,k)
+                                        for k in ('memory_slots','memory_steps','memory_stride','memory_patch_size')):
+                raise ValueError('--init-tracer memory configuration differs from existing memory checkpoint')
+            cfg = initialized.cfg
+        for key in ('memory_slots','memory_steps','memory_stride','memory_patch_size'):
+            setattr(args, key, getattr(cfg, key))
     if args.resume:
         resume = read_checkpoint(args.resume,ARCHITECTURES,args.device)
         cfg = checkpoint_config(resume)
@@ -470,7 +501,8 @@ def main(argv=None):
                    'log_every','ckpt_every','diag_every','dagger_device','compile','init_tracer',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing'}
         for key,value in vars(args).items():
-            recorded = resume['training_options'].get(key)
+            recorded = resume['training_options'].get(key, getattr(DirectConfig, key, None)
+                                                       if key.startswith('memory_') else None)
             if key not in ignored and json.dumps(recorded,sort_keys=True) != json.dumps(value,sort_keys=True):
                 raise ValueError(f'Resume option differs: {key}')
         if resume['seed_manifest_sha256'] != manifest['sha256'] or resume['fiber_manifest'] != fiber_manifest(fibers):
@@ -511,7 +543,7 @@ def main(argv=None):
         collector_module='vesuvius.neural_tracing.fiber_follow.regression.collect')
     contacts = load_contacts(args.contacts,train_f,band) if args.contacts else ()
     hard_spans = load_hard_spans(args.hard_spans,train_f) if args.hard_spans else ()
-    progress(f'Crop-only sampling: {len(contacts)} contacts, {len(hard_spans)} hard spans')
+    progress(f'Sampling: {len(contacts)} contacts, {len(hard_spans)} hard spans; memory slots={cfg.memory_slots}')
     builder = IdentityObservationBuilder(cfg,train_f,identity_sampling,contacts=contacts,
         hard_spans=hard_spans,augment=True,negative_bank=negative_bank,**role_banks)
     dataset = FollowDataset(train_f, spec, sample, band, chunk=args.microbatch, seed=args.seed+done,
@@ -533,9 +565,9 @@ def main(argv=None):
             seed_manifest_sha256=manifest['sha256'], fiber_manifest=fiber_manifest(fibers),
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
     log = RunLog(out/'log.jsonl', formatter=format_training_log)
-    log.record(dict(step=done,event='identity_sampling',architecture=ARCHITECTURE,
+    log.record(dict(step=done,event='identity_sampling',architecture=model.architecture,
         pair_sampling_version=identity_sampling.pair_sampling_version,
-        history_policy='visible_crop_only',sampling=asdict(identity_sampling),
+        history_policy='learned_observation_memory' if cfg.memory_slots else 'visible_crop_only',sampling=asdict(identity_sampling),
         negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance(),
         bank_role_provenance=role_provenance()))
     tracer = None
