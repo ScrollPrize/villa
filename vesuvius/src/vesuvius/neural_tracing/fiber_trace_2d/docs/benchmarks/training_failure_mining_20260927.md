@@ -1,5 +1,29 @@
 # Training failure mining
 
+## Correction: original-fiber arc coordinates (2026-09-28)
+
+**Previous reproduction results are invalid and discarded.** The global trial descriptor subtracted the eligible run's starting arc, but native code sliced the full original annotation. This affected1277/1343 candidates and283298/286503 completed trials. Original full evaluations and inference caches are unaffected.
+
+Protocol v2 now sends `original_fiber_arc_start_base`/`original_fiber_arc_end_base` and independently derived `expected_start_base_xyz`/`expected_end_base_xyz`. Native validates endpoints before tracing and saved-artifact auditing checks them again (0.25 base-voxel tolerance). Real-data check:10016 endpoints over1343 candidates,max error3.63e-10 base voxels. Four native CLI regressions cover both directions and deliberately shifted intervals;127 other native tests and63 Python tests passed.
+
+The old `reproduction_search` tree was removed from active use and deletion completed; no inference directory was touched. Corrected workflow PID203564 restarted via the approved runner, using GPUs0–5 and192 tracing workers. Startup check:18100 trial positions handled,2729 pruned;128 saved-artifact endpoint/native-audit checks all passed. The full corrected result is not yet available. All earlier timing/result statements about the incorrect reproduction run must be interpreted accordingly.
+
+### Postprocessing performance
+
+Exact audit math moved to a CPU-only shared worker module. Bounded process tasks parse16 JSONs each, return compact audits, and publish using bounded threads. Keep audits in RAM during ordered selection. Resume recovery is restricted to the correct coordinate contract. Union reference parsing is process-parallel; annotation export/chunk links/coverage are concurrent, repeated coverage checks deduplicated, and identical corridor chunk boxes calculated only once.
+
+Audit benchmark on512 real saved JSON files (2,421,804,430 bytes),3 repetitions; first parallel iteration includes process startup. Outputs exactly equal:
+
+| Processes | Mean seconds | Median | Min | Max |
+|---:|---:|---:|---:|---:|
+|1|14.3651|14.3758|14.2099|14.5096|
+|16|1.7188|1.1822|1.0985|2.8757|
+|32|1.2022|0.5979|0.5969|2.4119|
+
+This measures parsing/auditing, not tracing or inference (~24x median improvement). Corridor benchmark on a seeded50000-point polyline,3 repetitions:mean0.129416→0.011093s,median0.129320→0.011018s; exact chunk-set equality. Full next-stage performance remains to be measured on the corrected extraction.
+
+Reusable command: `bash /home/hendrik/villa3/scripts/run_training_failure_mining`. Select `action` in `scripts/training_failure_mining_control.json`: `start`, `stop`, `build`, `benchmark_export` (latest completed batch), `validate_trial_geometry` (existing candidate inventory), or the one-time `discard_invalid_reproduction` (rejects protocol v2). Keep devices `0,1,2,3,4,5`,cpu_cores192. No installation or alternate elevated command required.
+
 ## Runtime update: bounded direct-trace scheduling
 
 The approved no-argument runner is now

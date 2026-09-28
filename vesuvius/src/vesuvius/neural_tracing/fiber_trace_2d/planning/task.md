@@ -1,3 +1,5 @@
-# Bounded parallel failure search
+# Parallel post-trace extraction
 
-Fix native trial admission to use lightweight queued jobs and bounded reusable stacks. Shortest trials first; prune larger distances after valid minimal/padded reproduction. Restore producer inference settings without extractor clamps. Use available manager-granted CPUs, preserve inference cache/numerics, rebuild via approved runner and resume lowres-only mining with highres inspection.
+Commit current work, parallelize saved-trace auditing and downstream exports. Preserve finished native trials, scientific selection, producer settings and GPU 0–5 allocation.
+
+User approved correction of the discovered run-local/full-fiber arc bug: discard old reproduction results (not inference), add independently expected start XYZ validation with a small tolerance, and rerun. Old incorrect trial results must not be recovered.

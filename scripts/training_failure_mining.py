@@ -8,6 +8,8 @@ import subprocess
 import signal
 import time
 import sys
+import shutil
+from concurrent.futures import ThreadPoolExecutor
 
 REPO = Path(__file__).resolve().parents[1]
 ROOT = Path('/ephemeral/hendrik/fiber3d_train2/evaluations/train_failure_union_20260927_v1')
@@ -38,6 +40,42 @@ def archive_incomplete_output(output):
         raise RuntimeError(f'archive already exists: {destination}')
     output.rename(destination)
     return destination
+
+
+def discard_invalid_reproduction(root):
+    """Invalidate only protocol-v1 trial artifacts; never traverse cache roots."""
+    root = Path(root)
+    source = root/'reproduction_search'
+    discarded = root/'discarded_reproduction_local_arcs_v1'
+    if source.is_symlink() or not source.is_dir() or discarded.exists():
+        raise RuntimeError('unexpected reproduction directory; refusing cleanup')
+    protocol = json.loads((source/'protocol.json').read_text())
+    if protocol['protocol']['version'] != 1:
+        raise RuntimeError('refusing to discard corrected reproduction protocol')
+    from lasagna.inference_provenance import atomic_write
+    atomic_write(root/'discarded_reproduction_report.json', dict(
+        reason='segment-local arcs incorrectly applied to full original fiber',
+        discarded_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        previous_protocol=protocol, inference_caches_preserved=True), durable=False)
+    source.rename(discarded)
+    return discarded
+
+
+def cleanup_discarded_reproduction():
+    from vesuvius.neural_tracing.fiber_trace_3d.failure_trial_audit import bounded_map
+    discarded = ROOT/'discarded_reproduction_local_arcs_v1'
+    if discarded.is_symlink() or not discarded.is_dir():
+        raise RuntimeError('unexpected discarded reproduction path')
+    # Parallelize independent case directories, not the cache or original GT.
+    with ThreadPoolExecutor(max_workers=128) as pool:
+        for cases in discarded.glob('batches/*/attempt*/full/cases'):
+            if (not cases.resolve().is_relative_to(discarded.resolve()) or
+                    any(p.is_symlink() for p in (cases, *cases.parents) if p != discarded.parent and discarded in (p, *p.parents))):
+                raise RuntimeError(f'refusing linked directory in discarded results: {cases}')
+            for _ in bounded_map(pool, shutil.rmtree, (p for p in cases.iterdir() if p.is_dir() and not p.is_symlink())):
+                pass
+    shutil.rmtree(discarded)
+    print('Deleted invalid reproduction trials/audits; inference caches untouched', flush=True)
 
 
 def worker():
@@ -123,9 +161,21 @@ if __name__ == '__main__':
     ROOT.mkdir(parents=True, exist_ok=True)
     if sys.argv[1:] == ['--worker']:
         worker()
+    elif sys.argv[1:] == ['--cleanup-invalid-reproduction']:
+        cleanup_discarded_reproduction()
     elif not sys.argv[1:]:
         control = REPO / 'scripts/training_failure_mining_control.json'
         action = json.loads(control.read_text()).get('action', 'start') if control.exists() else 'start'
+        if action == 'discard_invalid_reproduction':
+            with (ROOT/'workflow.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                discarded = discard_invalid_reproduction(ROOT)
+            with (ROOT/'discarded_reproduction_cleanup.log').open('a') as log:
+                process = subprocess.Popen([sys.executable, '-u', str(Path(__file__).resolve()),
+                    '--cleanup-invalid-reproduction'], cwd=REPO, stdout=log,
+                    stderr=subprocess.STDOUT, start_new_session=True)
+            print(f'Invalid results removed from active dataset: {discarded}; deletion PID {process.pid}')
+            raise SystemExit(0)
         if action == 'check_ephemeral_health':
             subprocess.run([sys.executable, '-u', str(REPO / 'scripts/check_ephemeral_health.py')], check=True)
             raise SystemExit(0)
@@ -182,6 +232,19 @@ if __name__ == '__main__':
             subprocess.run(['bash', str(REPO / 'vesuvius/scripts/run_fiber3d_native_build')], check=True)
             for test in ('test_fiber_replay', 'test_fiber_trace3d', 'test_fiber_reference_replay_benchmark'):
                 subprocess.run([str(REPO / 'volume-cartographer/build/fiber-evaluation/bin' / test)], check=True)
+            subprocess.run([sys.executable, '-m', 'pytest', '-o', f'pythonpath={REPO}/vesuvius/src', '-q',
+                'vesuvius/tests/neural_tracing/test_native_replay_evaluation.py',
+                '-k', 'global_failure_trial'], cwd=REPO, check=True,
+                env={**os.environ, 'VC_REPLAY_TEST_BINARY': str(REPO/'volume-cartographer/build/fiber-evaluation/bin/vc_fiber_trace_metric'),
+                     'OPENBLAS_NUM_THREADS': '1', 'OMP_NUM_THREADS': '1'})
+            raise SystemExit(0)
+        if action == 'benchmark_export':
+            subprocess.run([sys.executable, str(REPO/'scripts/benchmark_failure_export.py')],
+                cwd=REPO, env={**os.environ, 'OPENBLAS_NUM_THREADS': '1', 'OMP_NUM_THREADS': '1'}, check=True)
+            raise SystemExit(0)
+        if action == 'validate_trial_geometry':
+            subprocess.run([sys.executable, str(REPO/'scripts/validate_failure_trial_geometry.py')],
+                cwd=REPO, env={**os.environ, 'OPENBLAS_NUM_THREADS': '1', 'OMP_NUM_THREADS': '1'}, check=True)
             raise SystemExit(0)
         if action == 'stop':
             state = json.loads((ROOT / 'workflow_status.json').read_text())

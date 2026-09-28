@@ -1,8 +1,11 @@
 # Status
 
-- [x] Inspect current bottlenecks
-- [x] Independent review
-- [x] Implement bounded scheduler and trial pruning
-- [x] Tests/build (127 native tests, standalone queue tests,47 Python tests)
-- [x] Resume and measure;192 workers, all8 GPUs active,17200 trial progress
-- [ ] Background extraction complete (continues running)
+- [x] Commit previous code (8ed2c7911)
+- [x] Independent plan and implementation review
+- [x] Parallel audit and downstream export; measure equivalence/speed
+- [x] Fix discovered arc-coordinate bug with independently checked XYZ
+- [x] Native/Python regression tests and real-candidate endpoint validation
+- [x] Discard invalid reproduction data, preserve inference caches
+- [x] Restart corrected extraction, GPUs0–5 and192 trace workers
+- [x] Verify sustained native progress after startup (18100 trials handled;128 saved audits checked)
+- [ ] Corrected extraction finished (background run)

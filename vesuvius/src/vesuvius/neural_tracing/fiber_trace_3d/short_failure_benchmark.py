@@ -19,10 +19,36 @@ import numpy as np
 from lasagna.inference_provenance import atomic_write, json_digest, sha256_file
 from .cached_trace_profile import initialize_trial_worker, execute_trial_replay, close_trial_worker
 from .replay_metrics import _episode_indices
+from .failure_trial_audit import audit_failure, audit_trace_batch, bounded_map, load_trace_reference
 
-PROTOCOL = dict(version=1, start_step=100, start_padding=100, end_padding=100,
+PROTOCOL = dict(version=2, start_step=100, start_padding=100, end_padding=100,
                 match_tolerance=100, dedup_distance=200, first_failure_only=True,
                 require_exhausted_grace=True)
+
+
+def failure_trial_descriptor(candidate, direction, distance, points, arcs):
+    """Full-original-fiber arc interval plus independently derived endpoint XYZ.
+
+    ``points/arcs`` describe the historical eligible reference segment in its
+    forward direction. Only endpoint interpolation uses segment-local arcs.
+    The native reader slices the original annotation, hence its arcs are absolute.
+    """
+    a, b = candidate['run']['original_arcs_base']
+    target = candidate['target']
+    if direction not in ('forward', 'reverse'):
+        raise ValueError('invalid trial direction')
+    lo, hi = ((target-distance, min(b, target+100)) if direction == 'forward'
+              else (max(a, target-100), target+distance))
+    if not a <= lo < hi <= b:
+        raise ValueError('trial interval outside eligible reference segment')
+    def at(arc):
+        return [float(np.interp(arc-a, arcs, points[:, axis])) for axis in range(3)]
+    start, end = (at(lo), at(hi)) if direction == 'forward' else (at(hi), at(lo))
+    return dict(candidate_id=candidate['id'], direction=direction, distance=distance,
+        fiber_path=candidate['piece_key'][0], source_id=candidate['source_id'],
+        coordinate_contract='original-fiber-arclength-v2',
+        original_fiber_arc_start_base=lo, original_fiber_arc_end_base=hi,
+        original_arcs_base=[lo, hi], expected_start_base_xyz=start, expected_end_base_xyz=end)
 
 
 def _write_json_ephemeral(path, value):
@@ -220,27 +246,103 @@ def same_location(a, b):
     return a['piece_key'] == b['piece_key'] and abs(a['target']-b['target']) <= PROTOCOL['dedup_distance']
 
 
-def audit_failure(document, target, grace):
-    """Audit first failure and actual outside travel, excluding terminal artifacts."""
-    replay = document['replay']
-    if not replay['failures']:
-        return dict(valid=False, reason='no_failure')
-    failure = replay['failures'][0]
-    if failure['segment_index'] != 0 or abs(failure['reference_arc_base']-target) > PROTOCOL['match_tolerance']:
-        return dict(valid=False, reason='different_first_failure', failure=failure)
-    segment = replay['segments'][0]
-    points = np.asarray(segment['trace_points_base_xyz'], dtype=np.float64)
-    # Independent audit of the saved geometry, not a replacement tracer.
-    outside = None
-    for match in segment['matches']:
-        i = match['trace_point_index']
-        if match['threshold_error_ratio'] > 1:
-            outside = 0. if outside is None else outside + float(np.linalg.norm(points[i]-points[i-1]))
-        else:
-            outside = None
-    valid = outside is not None and outside + 1e-7 >= grace
-    return dict(valid=valid, reason='reproduced' if valid else 'terminal_unresolved_excursion',
-                outside_travel_base=outside, failure=failure)
+
+
+def audit_trial_artifacts(result_root, expected, *, grace, global_worklist, workers, result_cache=None):
+    """Audit completed native output without serial JSON parsing or unbounded IPC."""
+    import multiprocessing
+    from itertools import islice
+    result_root = Path(result_root)
+    summary = json.loads((result_root/'summary.json').read_text())
+    evaluated = summary.get('evaluated_cases', len(expected))
+    if (not summary['completed'] or summary['cases'] != len(expected) or
+            evaluated + summary.get('cancelled_cases', 0) != len(expected)):
+        raise ValueError('trial batch incomplete or cancellation accounting mismatch')
+    paths = (result_root/'cases').glob('*/trace.json')
+    targets = {} if global_worklist else {k: v[2] for k, v in expected.items()}
+    def tasks():
+        while batch := list(islice(paths, 16)):
+            yield ([str(p) for p in batch], grace, global_worklist, targets)
+    def publish(item):
+        cache, value = item
+        _write_json_ephemeral(cache, value)
+    seen = set()
+    started = last_report = time.monotonic()
+    workers = max(1, min(workers, math.ceil(max(1, evaluated)/16)))
+    with ProcessPoolExecutor(max_workers=workers,
+            mp_context=multiprocessing.get_context('spawn')) as cpu, \
+            ThreadPoolExecutor(max_workers=min(workers, 128)) as io:
+        def publications():
+            nonlocal last_report
+            for rows in bounded_map(cpu, audit_trace_batch, tasks(), pending=workers*2):
+                for key, path, audit in rows:
+                    if key in seen:
+                        raise ValueError('duplicate trial artifact')
+                    seen.add(key)
+                    c, direction, distance, cache, lo, hi = expected[key]
+                    value = dict(**audit, artifact=path, direction=direction,
+                                 distance=distance, original_arcs_base=[lo, hi])
+                    if result_cache is not None:
+                        result_cache[cache.name] = value
+                    yield cache, value
+                now = time.monotonic()
+                if now-last_report >= 5:
+                    print(f'trial-audit completed={len(seen)}/{evaluated} '
+                          f'workers={workers} rate={len(seen)/(now-started):.1f}/s', flush=True)
+                    last_report = now
+        for _ in bounded_map(io, publish, publications(), pending=workers*2):
+            pass
+    if len(seen) != evaluated:
+        raise ValueError('trial artifact count differs from completed trial count')
+    print(f'trial-audit complete={len(seen)} seconds={time.monotonic()-started:.3f}', flush=True)
+    return len(seen)
+
+
+def recover_completed_trial_batches(root, candidates, workers, result_cache=None):
+    """Recover finished work under the caller's already-validated protocol."""
+    root = Path(root)
+    by_id = {c['id']: c for c in candidates}
+    recovered = 0
+    for evaluation_path in sorted((root/'batches').glob('*/evaluation.json')):
+        evaluation = json.loads(evaluation_path.read_text())
+        trials = evaluation.get('failure_search_trials')
+        if not trials:
+            continue
+        completed = []
+        for summary_path in evaluation_path.parent.glob('attempt*/full/summary.json'):
+            summary = json.loads(summary_path.read_text())
+            if summary.get('completed'):
+                completed.append(summary_path)
+        if not completed:
+            continue
+        expected = {}
+        for trial in trials:
+            if trial.get('coordinate_contract') != 'original-fiber-arclength-v2':
+                raise ValueError('invalid legacy trial coordinates: discard old reproduction results')
+            c = by_id[trial['candidate_id']]
+            direction, distance = trial['direction'], trial['distance']
+            if direction not in ('forward', 'reverse') or distance <= 0 or distance % 100:
+                raise ValueError('invalid recovered trial direction/distance')
+            a, b = c['run']['original_arcs_base']; target = c['target']
+            lo, hi = ((target-distance, min(b, target+100)) if direction == 'forward'
+                      else (max(a, target-100), target+distance))
+            if (trial['fiber_path'] != c['piece_key'][0] or trial['source_id'] != c['source_id'] or
+                    trial['original_fiber_arc_start_base'] != lo or trial['original_fiber_arc_end_base'] != hi or
+                    trial['original_arcs_base'] != [lo, hi] or lo < a or hi > b):
+                raise ValueError('completed trial geometry differs from current candidate')
+            key = (c['id'], direction, float(distance))
+            if key in expected:
+                raise ValueError('duplicate completed trial specification')
+            cache = root/'trials'/f'{c["id"]}_{direction}_{int(distance)}.json'
+            expected[key] = (c, direction, distance, cache, lo, hi)
+        # The most recent completed attempt is sufficient. Incomplete attempts
+        # are never treated as results or retraced merely to recover auditing.
+        summary_path = max(completed, key=lambda p: p.stat().st_mtime_ns)
+        print(f'recovering completed native batch {summary_path.parent}', flush=True)
+        recovered += audit_trial_artifacts(summary_path.parent, expected,
+            grace=evaluation.get('excursion_grace_base_voxels', 0),
+            global_worklist=True, workers=workers, result_cache=result_cache)
+    return recovered
 
 
 def inventory(report, excluded=(), *, baseline_name='Classic', best_name=None, evaluation_names=None,
@@ -420,7 +522,13 @@ def run(workload, *, devices='0', time_limit_seconds=None):
         state = dict(identity=identity_hash, candidates={}, selected=[])
         atomic_write(root/'protocol.json', identity)
     atomic_write(root/'candidates.json', candidates)
+    audited_results = {}
+    if global_worklist:
+        recover_completed_trial_batches(root, candidates,
+            int(workload.get('evaluation', {}).get('gpu_manager', {}).get('cpu_cores') or 128),
+            result_cache=audited_results)
     point_cache = {}
+    arc_cache = {}
 
     def geometry(c):
         key = (c['model'], c['case'])
@@ -436,6 +544,8 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                 raise ValueError('historical case mapping mismatch')
             points = doc['reference_points_base_xyz']
             point_cache[key] = points[::-1] if c['reverse'] else points
+            array = np.asarray(point_cache[key], dtype=np.float64)
+            arc_cache[key] = (array, np.r_[0., np.cumsum(np.linalg.norm(np.diff(array, axis=0), axis=1))])
         return point_cache[key]
 
     def execute_batch(model, requests, job_devices):
@@ -479,10 +589,8 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                 lo, hi = ((target-distance, min(b, target+100)) if direction == 'forward'
                           else (max(a,target-100), target+distance))
                 if global_worklist:
-                    global_trials.append(dict(candidate_id=c['id'], direction=direction,
-                        distance=distance, fiber_path=c['piece_key'][0],
-                        source_id=c['source_id'], lo=lo-a, hi=hi-a,
-                        original_arcs_base=[lo,hi]))
+                    global_trials.append(failure_trial_descriptor(c, direction, distance,
+                        *arc_cache[(c['model'], c['case'])]))
                     expected[(c['id'], direction, float(distance))] = (c,direction,distance,cache,lo,hi)
                 else:
                     points = slice_line(geometry(c), lo-a, hi-a)
@@ -537,38 +645,15 @@ def run(workload, *, devices='0', time_limit_seconds=None):
                             c,d,n,tag,cache=requests[0]
                             _write_json_ephemeral(cache,dict(valid=False,reason='uncached_dependency',distance=n,direction=d,error=str(error)))
                         return
-            summary = json.loads((result_root/'summary.json').read_text())
-            if not summary['completed'] or summary['cases'] != len(requests):
-                raise ValueError('trial batch incomplete')
-            cancelled = summary.get('cancelled_cases', 0)
-            evaluated = summary.get('evaluated_cases', len(requests))
-            if evaluated + cancelled != len(requests):
-                raise ValueError('trial batch cancellation accounting mismatch')
-            seen = set()
-            for path in (result_root/'cases').glob('*/trace.json'):
-                doc = json.loads(path.read_text())
-                if global_worklist:
-                    provenance = doc['provenance']
-                    key = (provenance['candidate_id'], provenance['direction'],
-                           float(provenance['target_distance_base']))
-                    if key in seen:
-                        raise ValueError('duplicate trial artifact')
-                    seen.add(key)
-                    c,direction,distance,cache,lo,hi = expected[key]
-                else:
-                    c,direction,distance,cache,lo,hi = expected[doc['provenance']['fiber_path']]
-                audit = audit_failure(doc, distance, evaluation.get('excursion_grace_base_voxels',0))
-                if global_worklist and 'native_reproduced' in doc['provenance']:
-                    if doc['provenance']['native_reproduced'] != audit['valid']:
-                        raise ValueError('native pruning audit disagrees with saved-geometry audit')
-                _write_json_ephemeral(cache, dict(**audit, artifact=str(path), direction=direction,
-                    distance=distance, original_arcs_base=[lo,hi]))
-            if global_worklist and len(seen) != evaluated:
-                raise ValueError('trial artifact count differs from completed trial count')
+            audit_trial_artifacts(result_root, expected,
+                grace=evaluation.get('excursion_grace_base_voxels', 0),
+                global_worklist=global_worklist, workers=worker_budget, result_cache=audited_results)
             print(f"short-benchmark batch={batch_key} trials={len(requests)} model={models[model]['name']}", flush=True)
 
     def result(c,d,n):
         path = root/'trials'/f"{c['id']}_{d}_{n}.json"
+        if path.name in audited_results:
+            return audited_results[path.name]
         if not path.exists():
             return None
         try:
@@ -815,17 +900,19 @@ def _corridor_chunk_keys(points_xyz, root, radius_base):
             sampled = np.concatenate((sampled, points[-1:]), axis=0)
     else:
         sampled = points
-    for point_xyz in sampled:
-        centre_zyx = (np.asarray([point_xyz[2], point_xyz[1], point_xyz[0]]) /
-                      np.asarray([scale[0], scale[1], scale[2]]))
-        lo_zyx = np.maximum(np.floor(centre_zyx - radius_out[::-1]).astype(int), 0)
-        hi_zyx = np.minimum(np.floor(centre_zyx + radius_out[::-1]).astype(int),
-                            shape_zyx - 1)
-        if np.any(hi_zyx < lo_zyx):
-            continue
-        for cz in range(lo_zyx[0] // chunks[0], hi_zyx[0] // chunks[0] + 1):
-            for cy in range(lo_zyx[1] // chunks[1], hi_zyx[1] // chunks[1] + 1):
-                for cx in range(lo_zyx[2] // chunks[2], hi_zyx[2] // chunks[2] + 1):
+    # Identical arithmetic, but visit each distinct chunk bounding box once.
+    # Dense one-voxel polylines otherwise repeat these Python loops thousands
+    # of times for the same output chunks.
+    centres = sampled[:, ::-1] / np.asarray(scale)
+    lows = np.maximum(np.floor(centres-radius_out[::-1]).astype(int), 0)
+    highs = np.minimum(np.floor(centres+radius_out[::-1]).astype(int), shape_zyx-1)
+    valid = np.all(highs >= lows, axis=1)
+    boxes = np.unique(np.concatenate((lows[valid]//chunks, highs[valid]//chunks), axis=1), axis=0)
+    for box in boxes:
+        lo_zyx, hi_zyx = box[:3], box[3:]
+        for cz in range(lo_zyx[0], hi_zyx[0] + 1):
+            for cy in range(lo_zyx[1], hi_zyx[1] + 1):
+                for cx in range(lo_zyx[2], hi_zyx[2] + 1):
                     keys.add((cz, cy, cx))
     return keys
 
@@ -952,7 +1039,8 @@ def _export_channel_subset(source_root, destination, keys, channels, *, chunk_mo
         for metadata in source_level.glob('*'):
             if metadata.name in ('.zarray', '.zattrs', '.zgroup', '.zmetadata') and metadata.is_file():
                 shutil.copy2(metadata, target_level / metadata.name)
-        for z, y, x in sorted(keys):
+        def export_chunk(key):
+            z, y, x = key
             source_chunk = source_level / str(z) / str(y) / str(x)
             if not source_chunk.is_file():
                 raise FileNotFoundError(f'missing source chunk: {source_chunk}')
@@ -962,6 +1050,9 @@ def _export_channel_subset(source_root, destination, keys, channels, *, chunk_mo
                 _safe_symlink(source_chunk, target_chunk)
             elif not target_chunk.exists():
                 shutil.copy2(source_chunk, target_chunk)
+        with ThreadPoolExecutor(max_workers=128) as writer:
+            for _ in bounded_map(writer, export_chunk, sorted(keys)):
+                pass
     atomic_write(destination / 'subset_manifest.json', {
         'version': 1, 'source_root': str(source_root),
         'level': 1, 'channels': list(channels),
@@ -1066,6 +1157,14 @@ def export_union_lasagna_manifests(output):
     return exported
 
 
+def _reference_traces(root, count, workers):
+    import multiprocessing
+    with ProcessPoolExecutor(max_workers=min(workers, max(1, count)),
+            mp_context=multiprocessing.get_context('spawn')) as reader:
+        yield from bounded_map(reader, load_trace_reference,
+            (str(root/'cases'/str(i)/'trace.json') for i in range(count)), pending=workers*2)
+
+
 def run_union(workload):
     """Extract all deduplicated GT hard regions from completed evaluations.
 
@@ -1146,12 +1245,14 @@ def run_union(workload):
         input_audit.append({'name': item['name'], 'summary': str(summary_path),
                             'summary_sha256': sha256_file(summary_path)})
         global_case = 0
+        traces = _reference_traces(root, sum(len(s['cases']) for s in summary['sources']),
+                                   int(settings.get('trace_cpu_cores', 128)))
         for source in summary['sources']:
             for case in source['cases']:
                 trace_path = root / 'cases' / str(global_case) / 'trace.json'
                 if not trace_path.is_file():
                     raise FileNotFoundError(f'missing saved GT trace: {trace_path}')
-                trace = json.loads(trace_path.read_text())
+                trace = next(traces)
                 provenance = trace.get('provenance', {})
                 if provenance.get('case_index') != global_case:
                     raise ValueError(f'case index mismatch: {trace_path}')
@@ -1188,6 +1289,9 @@ def run_union(workload):
                         entry['intervals'].append((max(a, target - context), min(b, target + context)))
                         entry['episode_count'] += 1
                 global_case += 1
+        # Exhaust the generator to close the process pool before inference.
+        if next(traces, None) is not None:
+            raise ValueError('unexpected extra reference trace')
     if reproduction_manifest is not None:
         # Replace raw historical failure points with the already audited
         # minimal/padded intervals selected by the established extractor.
@@ -1220,7 +1324,8 @@ def run_union(workload):
                                   item['run_index'], item['interval'][0]))
     annotations = []
     annotation_dir = output / 'fibers'
-    for index, item in enumerate(merged):
+    def export_annotation(index_item):
+        index, item = index_item
         annotation = {
             'type': 'vc3d_fiber', 'version': 1,
             'line_points': item['points'],
@@ -1259,7 +1364,7 @@ def run_union(workload):
                 raise ValueError(f'refusing to replace changed annotation: {path}')
         else:
             atomic_write(path, annotation, durable=False)
-        annotations.append({
+        return {
             'index': index, 'path': str(path), 'sha256': sha256_file(path),
             'source_id': _canonical_source_label(item['input_volume']),
             'fiber_path': item['fiber_path'],
@@ -1268,7 +1373,9 @@ def run_union(workload):
             'reference_arcs_base_voxels': item['interval'],
             'length_base_voxels': float(item['interval'][1] - item['interval'][0]),
             'length_mm': float(item['interval'][1] - item['interval'][0]) * item['base_voxel_size_um'] / 1000,
-        })
+        }
+    with ThreadPoolExecutor(max_workers=128) as writer:
+        annotations = list(bounded_map(writer, export_annotation, enumerate(merged)))
     # Keep the exported corpus browsable by physical scroll.  The source label
     # is canonicalized above, so aliases cannot create duplicate directories.
     for item in annotations:
@@ -1289,13 +1396,18 @@ def run_union(workload):
     # Complete the exact inspection corridor, not another tracing workload.
     required_by_root = defaultdict(set)
     required_by_case = {}
-    for item, geometry_item in zip(annotations, merged):
+    def corridor(index_item):
+        item, geometry_item = index_item
         root = cache_by_locator.get(item['input_volume'].rstrip('/'))
         if root is None:
-            continue
+            return item['index'], None, set()
         keys = _corridor_chunk_keys(geometry_item['points'], root, radius)
-        required_by_case[item['index']] = keys
-        required_by_root[str(root.resolve())].update(keys)
+        return item['index'], str(root.resolve()), keys
+    with ThreadPoolExecutor(max_workers=128) as geometry_pool:
+        for index, root, keys in bounded_map(geometry_pool, corridor, zip(annotations, merged)):
+            required_by_case[index] = keys
+            if root is not None:
+                required_by_root[root].update(keys)
     fill = settings.get('fill_missing_inference')
     if fill:
         _fill_union_corridor(workload, fill, required_by_root, output)
@@ -1304,6 +1416,21 @@ def run_union(workload):
 
     coverage = []
     missing_total = 0
+    # Overlapping cases share chunks. Check each physical channel chunk once,
+    # concurrently, rather than stat-ing it serially for every annotation.
+    missing_by_root = defaultdict(set)
+    def chunk_requests():
+        for root, keys in required_by_root.items():
+            for channel in ('fiber_presence.ome.zarr', 'fiber_nx.ome.zarr', 'fiber_ny.ome.zarr'):
+                for key in sorted(keys):
+                    yield root, channel, key
+    def check_chunk(request):
+        root, channel, key = request
+        return request, _chunk_present(Path(root)/channel, key)
+    with ThreadPoolExecutor(max_workers=128) as reader:
+        for (root, channel, key), present in bounded_map(reader, check_chunk, chunk_requests()):
+            if not present:
+                missing_by_root[root].add((channel, key))
     for coverage_index, item in enumerate(annotations):
         root = cache_by_locator.get(item['input_volume'].rstrip('/'))
         missing = []
@@ -1313,10 +1440,10 @@ def run_union(workload):
         else:
             required_keys = required_by_case[item['index']]
             required = len(required_keys)
+            missing_keys = missing_by_root[str(root.resolve())]
             for channel in ('fiber_presence.ome.zarr', 'fiber_nx.ome.zarr', 'fiber_ny.ome.zarr'):
-                array_root = root / channel
                 for key in sorted(required_keys):
-                    if not _chunk_present(array_root, key):
+                    if (channel, key) in missing_keys:
                         missing.append(f'{channel}:{key[0]}/{key[1]}/{key[2]}')
         missing_total += len(missing)
         coverage.append({'index': item['index'], 'required_chunk_count': required,

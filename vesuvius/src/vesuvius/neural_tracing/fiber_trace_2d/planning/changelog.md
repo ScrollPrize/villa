@@ -1,3 +1,9 @@
+## 2026-09-28 — Correct failure-trial coordinates and parallel export
+
+- Fix run-local versus original-fiber arc mismatch in global reproduction trials; version coordinate contract and validate independent expected start/end XYZ within0.25 base voxel, both before tracing and when auditing saved results.
+- Discard invalid reproduction outputs only; preserve original evaluation and inference caches. Rerun on GPUs0–5 with192 trace workers.
+- Bounded process-pool audit and reference parsing; parallel annotation/chunk exports, vectorized exact corridor bounds and shared coverage checks.512-file audit median14.38s→0.60s at32 workers, identical results. Details and caveats in training_failure_mining_20260927.md.
+
 ## 2026-09-28 — Bounded native failure-search queue
 
 - Replace per-trial eager coroutine stacks with bounded reusable contexts;

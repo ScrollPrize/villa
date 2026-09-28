@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from training_failure_mining import archive_incomplete_output
+from training_failure_mining import archive_incomplete_output, discard_invalid_reproduction, cleanup_discarded_reproduction
 
 
 class ArchiveTests(unittest.TestCase):
@@ -63,6 +63,35 @@ class ArchiveTests(unittest.TestCase):
                 archive_incomplete_output(self.output)
         self.assertTrue(self.output.exists())
         self.assertTrue(target.exists())
+
+    def test_discard_only_old_reproduction(self):
+        root = self.output.parent
+        cache = root/'inference-cache'; cache.mkdir()
+        (cache/'chunk').write_bytes(b'keep')
+        source = root/'reproduction_search'; source.mkdir()
+        protocol = source/'protocol.json'
+        protocol.write_text(json.dumps({'protocol': {'version': 2}}))
+        with self.assertRaises(RuntimeError):
+            discard_invalid_reproduction(root)
+        protocol.write_text(json.dumps({'protocol': {'version': 1}}))
+        discarded = discard_invalid_reproduction(root)
+        self.assertFalse(source.exists())
+        self.assertTrue(discarded.is_dir())
+        self.assertEqual((cache/'chunk').read_bytes(), b'keep')
+        with self.assertRaises(RuntimeError):
+            discard_invalid_reproduction(root)
+
+    def test_cleanup_rejects_intermediate_symlink(self):
+        root = self.output.parent
+        discarded = root/'discarded_reproduction_local_arcs_v1'
+        batch = discarded/'batches/batch/attempt_0'; batch.mkdir(parents=True)
+        cache = root/'cache'; (cache/'cases/0').mkdir(parents=True)
+        chunk = cache/'cases/0/trace.json'; chunk.write_text('preserve')
+        (batch/'full').symlink_to(cache, target_is_directory=True)
+        with patch('training_failure_mining.ROOT', root):
+            with self.assertRaises(RuntimeError):
+                cleanup_discarded_reproduction()
+        self.assertEqual(chunk.read_text(), 'preserve')
 
 
 if __name__ == '__main__':
