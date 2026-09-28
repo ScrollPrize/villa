@@ -868,6 +868,10 @@ vc_add_test(NAME test_tifxyz_selfcross LIBS doctest::doctest opencv_core)
 
 vc_add_test(NAME test_seg_add_overlap_metrics)
 
+# The explicit seed test of vc_grow_seg_from_seed (header-only under apps/src,
+# shared with the command-line tool so the tested code is the shipped code).
+vc_add_test(NAME test_grow_seed_mode LIBS doctest::doctest opencv_core)
+
 # End-to-end CLI contract for the same tool: exit codes, report
 # serialization, collection envelope. Needs the binary, so it only exists
 # in configurations that build the apps -- the test shards configure with
