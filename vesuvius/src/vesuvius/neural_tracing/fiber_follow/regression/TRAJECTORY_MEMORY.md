@@ -403,3 +403,24 @@ crossing a checkpoint/evaluation/collector boundary, and saves the final tested
 weights/optimizer in the fresh output directory. Its sampling can differ across
 revisions because revision 2 supports longer streams; it is an integration and
 operational-cost check, not a matched-example accuracy experiment.
+
+### Training progress logs
+
+Every `--log-every` updates, the terminal reports counts pooled over all ordinary
+training crops since the previous log entry. Point correctness scores each of
+the predicted points independently at its annotated forward plane, within
+`--tolerance` trace-grid voxels (normally 1.5). An earlier wrong point does not
+invalidate later points, and confidence/commit length does not hide predictions.
+Known departures, endpoint overruns, and validated neighboring fibers are wrong;
+unknown identity and unannotated/crop-censored points are reported separately and
+excluded from the percentage. Re-encoded endpoint replay copies are not counted
+again. Prefix labels used to train confidence are unchanged.
+
+The compact block also reports crop-weighted losses, dense geometry error,
+update/data timing, session peak allocated VRAM, memory-probe and identity
+metrics, replay counts, data mix, and gradient clipping frequency. Detailed
+current-update diagnostics remain in `log.jsonl`; the new `interval` object
+contains the pooled metrics. `curves.png` refreshes atomically at every log entry
+and includes individual point accuracy. On resume, it omits rolled-back log
+records beyond the restored checkpoint. Full rollout/crop diagnostics retain
+their separate diagnostic schedule.

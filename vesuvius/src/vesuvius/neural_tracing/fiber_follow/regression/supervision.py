@@ -44,6 +44,38 @@ def foreign_failures(points, batch, cfg, count):
     return values[:, 0, :, 0, 0] > .5
 
 
+@torch.no_grad()
+def point_correctness(points, batch, cfg, tolerance, foreign=None):
+    """Independent predicted-point counts, not cumulative prefix labels.
+
+    Score every proposed point regardless of confidence. Unknown identity or
+    missing/crop-censored annotation is excluded; known departures/endpoints
+    and validated neighboring fibers are negatives. An earlier error does not
+    invalidate a later point. No origin-to-first-point policy is applied here.
+    """
+    points = points.detach().float()
+    indices = torch.linspace(0, batch['dense_ab'].shape[1]-1, points.shape[1],
+                             device=points.device).round().long()
+    target = batch.get('plane_ab', batch['dense_ab'][:, indices]).float()
+    annotated = batch.get('plane_mask', batch['dense_mask'][:, indices]).bool()
+    visible = target.abs().amax(-1) <= cfg.lateral_limit
+    annotated = annotated & visible & torch.isfinite(target).all(-1)
+    error = (points[..., :2]-target).norm(dim=-1)
+    departed = batch['offtrack'].bool()[:, None]
+    beyond_end = (batch['endpoint_known'].bool()[:, None]
+                  & (batch['end_local'][:, 2, None] >= 0)
+                  & (points[..., 2] > batch['end_local'][:, 2, None]+1e-4)
+                  & ~batch.get('plane_mask', batch['dense_mask'][:, indices]).bool())
+    neighbor = torch.zeros_like(annotated) if foreign is None else foreign[:, indices].bool()
+    known = annotated | departed | beyond_end | neighbor
+    if 'identity_observable' in batch:
+        known &= batch['identity_observable'].bool()[:, None]
+    correct = (known & annotated & (error <= tolerance) & torch.isfinite(points).all(-1)
+               & ~departed & ~beyond_end & ~neighbor)
+    return dict(point_correct_count=correct.sum(), point_wrong_count=(known & ~correct).sum(),
+                point_unknown_count=(~known).sum())
+
+
 def identity_terms(output, batch, cfg, temperature=.1):
     """InfoNCE between pooled on-fiber recent history and appearance ahead.
 
@@ -122,6 +154,7 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_tem
     # wrong even within the distance tolerance. Distance metrics keep their names.
     identity = 'foreign' in batch
     supervised, supervised_known = labels, known
+    extra = None
     if identity:
         extra = foreign_failures(output['points'], batch, cfg, mask.shape[1])
         supervised, supervised_known, _ = prefix_labels(output['points'], batch, tolerance,
@@ -137,6 +170,7 @@ def loss_terms(output, batch, cfg, tolerance=1.5, *, n_commit=None, identity_tem
                  geometry_count=mask.sum(), confidence_count=supervised_known.sum(),
                  error_sum=torch.where(mask, (predicted-target).norm(dim=-1), 0.).sum(),
                  correct_count=(labels*known).sum())
+    terms.update(point_correctness(output['points'], batch, cfg, tolerance, foreign=extra))
     if identity:
         terms.update(identity_correct_count=(supervised*supervised_known).sum(),
                      identity_flipped_count=(labels*known*(1-supervised)).sum())

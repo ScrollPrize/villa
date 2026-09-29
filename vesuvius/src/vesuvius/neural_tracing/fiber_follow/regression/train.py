@@ -37,7 +37,7 @@ from vesuvius.neural_tracing.fiber_follow.regression.diagnostics import (
 )
 from vesuvius.neural_tracing.fiber_follow.regression.recovery import monitor_fixture, evaluate_monitor
 from vesuvius.neural_tracing.fiber_follow.regression.feature_sequences import FEATURE_SAMPLING_REVISION
-from vesuvius.neural_tracing.fiber_follow.shared.training_log import format_training_log
+from vesuvius.neural_tracing.fiber_follow.shared.training_log import format_training_log, DirectTrainingInterval
 
 
 def validate_volume_source(spec, manifest):
@@ -437,7 +437,8 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                     identity[key] = identity.get(key, 0.)+float((cpu['location_source'] == index).sum())
             for key, value in (('loss', loss), ('geometry', geometry), ('confidence_loss', confidence)):
                 accumulate(sums, key, value)
-            for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count'):
+            for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count',
+                        'point_correct_count', 'point_wrong_count', 'point_unknown_count'):
                 accumulate(sums, key, terms[key])
             if 'source' in cpu:
                 for source in range(len(sources)):
@@ -913,6 +914,7 @@ def main(argv=None):
     started = time.monotonic()
     interval_started, interval_step = started, done
     interval_data_seconds = interval_update_seconds = 0.
+    interval_metrics = DirectTrainingInterval()
     try:
         if args.diag_every or args.long_diag_every:
             from vesuvius.neural_tracing.fiber_follow.shared.trace import TraceParams
@@ -958,6 +960,7 @@ def main(argv=None):
             update_seconds = time.monotonic()-update_started
             interval_data_seconds += data_seconds
             interval_update_seconds += update_seconds
+            interval_metrics.add(metrics)
             if early:
                 progress(f'Update {step} complete in {time.monotonic()-update_started:.1f}s; loss={metrics["loss"]:.5f}')
                 if step == done+5:
@@ -968,7 +971,14 @@ def main(argv=None):
                     train_seconds=now-started,
                     samples_per_second=observed_states/(now-started),
                     interval_samples_per_second=interval_states/(now-interval_started),
-                    interval_data_seconds=interval_data_seconds, interval_update_seconds=interval_update_seconds))
+                    interval_data_seconds=interval_data_seconds, interval_update_seconds=interval_update_seconds,
+                    interval=interval_metrics.summary(), n_future=cfg.n_future, tolerance=args.tolerance,
+                    interval_updates=step-interval_step,
+                    cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(args.device)/2**30
+                        if torch.device(args.device).type == 'cuda' else None))
+                from vesuvius.neural_tracing.fiber_follow.shared.diag import plot_curves
+                plot_curves(out/'log.jsonl', out/'curves.png', loss_key='geometry')
+                interval_metrics = DirectTrainingInterval()
                 interval_started, interval_step = now, step
                 interval_data_seconds = interval_update_seconds = 0.
                 interval_states = 0

@@ -13,12 +13,86 @@ def _number(value, spec='.3f'):
     return format(value, spec) if value is not None else '--'
 
 
+class DirectTrainingInterval:
+    """Pool every update's counts; weight per-crop means by actual crop count."""
+    means = ('loss', 'geometry', 'confidence_loss', 'replay_loss', 'fresh_fraction',
+             'fixed_fraction', 'recent_fraction', 'bank_wrong_continuation_fraction',
+             'bank_following_fraction', 'decision_pair_fraction')
+    counts = ('error_sum', 'geometry_count', 'point_correct_count', 'point_wrong_count',
+              'point_unknown_count', 'replay_endpoints', 'replay_observations', 'replay_encoder_crops')
+    nested_counts = {'identity': ('identity_count', 'identity_rank_correct', 'candidate_states'),
+                     'memory': ('identity_count', 'identity_correct', 'departed_count',
+                                'departed_correct', 'offset_count', 'offset_error_sum')}
+    nested_means = {'identity': ('identity_loss', 'candidate_loss'),
+                    'memory': ('probe_identity_loss', 'probe_offset_loss')}
+
+    def __init__(self):
+        self.values = dict(updates=0, crops=0)
+
+    def add(self, row):
+        crops = row['observed_states']
+        self.values['updates'] += 1
+        self.values['crops'] += crops
+        for key in self.means + self.counts:
+            self.values[key] = self.values.get(key, 0.)+row.get(key, 0.)*(crops if key in self.means else 1)
+        for section in self.nested_counts:
+            source = row.get(section, {})
+            for key in self.nested_counts[section] + self.nested_means[section]:
+                name = section+'_'+key
+                weight = crops if key in self.nested_means[section] else 1
+                self.values[name] = self.values.get(name, 0.)+source.get(key, 0.)*weight
+        for group in ('memory', 'rest'):
+            key = group+'_grad_norm'
+            self.values[key+'_max'] = max(self.values.get(key+'_max', 0.), row.get(key, 0.))
+            key = group+'_clipped_updates'
+            self.values[key] = self.values.get(key, 0)+int(row.get(group+'_grad_clip_scale', 1.) < 1.)
+
+    def summary(self):
+        result = dict(self.values)
+        means = list(self.means)+[s+'_'+k for s, keys in self.nested_means.items() for k in keys]
+        for key in means:
+            result[key] = result.get(key, 0.)/max(1, result['crops'])
+        result['error_mean'] = result.get('error_sum', 0.)/result['geometry_count'] if result.get('geometry_count') else None
+        return result
+
+
+def _interval_training_lines(row):
+    m = row['interval']
+    right, wrong, unknown = (int(m[k]) for k in ('point_correct_count', 'point_wrong_count', 'point_unknown_count'))
+    score = f'{right/(right+wrong):.1%}' if right+wrong else 'n/a'
+    updates = m['updates']
+    lines = [f"  points ({row['n_future']}/curve, tolerance {row['tolerance']:g} vox): "
+             f"{right:,} right / {wrong:,} wrong | {score} correct | {unknown:,} unknown",
+             f"  loss {m['loss']:.4f} | geometry {m['geometry']:.4f} | confidence {m['confidence_loss']:.4f}"
+             f" | mean error {_number(m['error_mean'])} vox",
+             f"  speed: {1000*row['interval_update_seconds']/updates:.0f} ms/update"
+             f" | data wait {1000*row['interval_data_seconds']/updates:.0f} ms/update"
+             f" | {row['interval_samples_per_second']:.1f} crops/s"]
+    if row.get('cuda_peak_allocated_gib') is not None:
+        lines[-1] += f" | peak allocated VRAM {row['cuda_peak_allocated_gib']:.2f} GiB (session)"
+    lines.append(f"  memory probe: correct {_rate(m['memory_identity_correct'], m['memory_identity_count'])}"
+                 f" | departed recall {_rate(m['memory_departed_correct'], m['memory_departed_count'])}"
+                 f" | replay {int(m['replay_endpoints'])} endpoints / {int(m['replay_encoder_crops'])} encoder crops"
+                 f" (loss {m['replay_loss']:.4f})")
+    lines.append(f"  identity: rank {_rate(m['identity_identity_rank_correct'], m['identity_identity_count'])}"
+                 f" | InfoNCE {m['identity_identity_loss']:.4f} | candidate BCE {m['identity_candidate_loss']:.4f}"
+                 f" ({int(m['identity_candidate_states'])} eligible crops)")
+    lines.append('  data: '+' / '.join(f'{name} {m[key]:.0%}' for name, key in
+                 (('fresh','fresh_fraction'), ('fixed','fixed_fraction'), ('recent','recent_fraction'),
+                  ('departures','bank_wrong_continuation_fraction'), ('following','bank_following_fraction'),
+                  ('pairs','decision_pair_fraction'))))
+    lines.append('  gradients: '+' | '.join(
+        f"{name} max {m[name+'_grad_norm_max']:.2g}, clipped {m[name+'_clipped_updates']}/{updates} updates"
+        for name in ('memory', 'rest')))
+    return lines
+
+
 def _decision_lines(decisions):
     bands = decisions['by_drift']
     stats = bands['all']
     if not stats['states']:
         return ['  decisions: no states']
-    lines = [f"  {decisions['n_commit']}-point correctness: "
+    lines = [f"  entire proposed {decisions['n_commit']}-point prefix correct (distance): "
              +_rate(stats['commit_correct'], stats['commit_known'])]
     for key, gate in stats.items():
         if not key.startswith('gate_'):
@@ -119,6 +193,12 @@ def _identity_lines(stats):
 
 def format_training_log(row):
     step = f"Step {row['step']:,}" if 'step' in row else 'Training'
+    if row.get('event') == 'resume_configuration':
+        options, cfg = row.get('training_options', {}), row.get('model_cfg', {})
+        return (f"{step} | resumed {row['checkpoint']}\n"
+                f"  commit {options.get('n_commit', '?')} | history spacing {cfg.get('memory_stride', '?')} vox"
+                f" | memory revision {cfg.get('feature_memory_revision', '?')}"
+                f" | batch {options.get('batch', '?')} / microbatch {options.get('microbatch', '?')}")
     if row.get('event') == 'identity_sampling':
         bank = row.get('negative_bank_provenance') or {}
         return (f"{step} | identity sampling v{row.get('pair_sampling_version', '?')}"
@@ -149,6 +229,10 @@ def format_training_log(row):
         return f'{step} | {details}'
 
     if 'geometry' in row:
+        if 'interval' in row:
+            m = row['interval']
+            return '\n'.join([f"\n{step} | last {m['updates']} updates / {m['crops']:,} crops"
+                              f" | lr {row['lr']:.2e}", *_interval_training_lines(row)])
         return '\n'.join([f"\n{step} | loss {row['loss']:.4f} | lr {row['lr']:.2e}"
                           f" | {row['samples_per_second']:.2f} samples/s", *_direct_training_lines(row)])
 

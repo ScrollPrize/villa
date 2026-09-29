@@ -63,7 +63,8 @@ def test_direct_images_preserve_scores_rng_and_parameters(tmp_path, monkeypatch,
         return original_imshow(self, image, *args, **kwargs)
 
     def capture_labels(self, path, *args, **kwargs):
-        labels[str(path)] = [line.get_label() for ax in self.axes for line in ax.lines]
+        # Curve plots publish atomically through curves.tmp.png.
+        labels[str(path).replace('curves.tmp.png', 'curves.png')] = [line.get_label() for ax in self.axes for line in ax.lines]
         return original_save(self, path, *args, **kwargs)
 
     monkeypatch.setattr(Axes, 'imshow', capture_image)

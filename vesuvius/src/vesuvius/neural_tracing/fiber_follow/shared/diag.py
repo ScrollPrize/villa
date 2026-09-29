@@ -213,7 +213,14 @@ def plot_rollouts(vol, fibers, seeds, paths, reasons, path, max_len=400., half=1
 
 
 def plot_curves(log_path, path, *, loss_key='flow'):
-    recs = [json.loads(line) for line in Path(log_path).read_text().splitlines()]
+    recs = []
+    for line in Path(log_path).read_text().splitlines():
+        row = json.loads(line)
+        if row.get('event') == 'resume_configuration':
+            # Appended logs retain interrupted work, but plots follow the resumed
+            # branch rather than joining rolled-back steps to the new run.
+            recs = [r for r in recs if r.get('step', 0) <= row['step']]
+        recs.append(row)
     training = [r for r in recs if loss_key in r]
     rollout = [r for r in recs if 'roll_coverage' in r or ('coverage_mean' in r and 'threshold' in r)]
     direct = loss_key == 'geometry'
@@ -221,12 +228,22 @@ def plot_curves(log_path, path, *, loss_key='flow'):
         # Earlier direct logs used full annotation lengths for monitor coverage.
         # Do not connect those incompatible points to the corrected series.
         rollout = [r for r in rollout if 'coverage_max_len' in r]
-    fig,axes = plt.subplots(1,4 if direct else 3,figsize=(16 if direct else 13,3.2))
+    fig,axes = plt.subplots(1,5 if direct else 3,figsize=(20 if direct else 13,3.2))
     steps = [r['step'] for r in training]
-    axes[0].plot(steps,[r[loss_key] for r in training],label='geometry loss' if direct else 'normalized flow loss')
-    axes[1].plot(steps,[r['confidence_loss'] for r in training],label='prefix confidence BCE')
+    def metric(row, key):
+        value = row.get('interval', row).get(key)
+        return float('nan') if value is None else value
+    axes[0].plot(steps,[metric(r,loss_key) for r in training],label='geometry loss' if direct else 'normalized flow loss')
+    axes[1].plot(steps,[metric(r,'confidence_loss') for r in training],label='prefix confidence BCE')
     if direct:
-        axes[2].plot(steps,[r['error_mean'] for r in training],label='dense curve error (voxels)')
+        axes[2].plot(steps,[metric(r,'error_mean') for r in training],label='dense curve error (voxels)')
+        scores = []
+        for row in training:
+            m = row.get('interval', {})
+            total = m.get('point_correct_count', 0)+m.get('point_wrong_count', 0)
+            scores.append(m['point_correct_count']/total if total else float('nan'))
+        axes[3].plot(steps,scores,label='individual points correct (interval)')
+        axes[3].set_ylim(0,1)
     for threshold in DIAGNOSTIC_THRESHOLDS:
         selected = [r for r in rollout if r['threshold']==threshold]
         for name in ('coverage','precision','diverged'):
@@ -237,7 +254,13 @@ def plot_curves(log_path, path, *, loss_key='flow'):
     for ax in axes:
         ax.legend(fontsize=7);ax.set_xlabel('optimizer updates')
     axes[-1].set_ylim(0,1)
-    fig.tight_layout();fig.savefig(path,dpi=100);plt.close(fig)
+    fig.tight_layout()
+    temporary = Path(path).with_name(Path(path).stem+'.tmp.png')
+    try:
+        fig.savefig(temporary,dpi=100)
+        temporary.replace(path)
+    finally:
+        plt.close(fig)
 
 
 def plot_denoising(curves, history, hmask, path):
