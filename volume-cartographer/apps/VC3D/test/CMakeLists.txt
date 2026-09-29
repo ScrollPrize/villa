@@ -398,6 +398,28 @@ add_test(NAME annotation_frame COMMAND test_annotation_frame)
 vc_register_test_target(test_annotation_frame)
 vc_register_ctest(annotation_frame test_annotation_frame)
 
+add_executable(test_open_data_volume_orientation
+    test_open_data_volume_orientation.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataVolumeOrientation.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataVolumeOrientation.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.hpp)
+
+set_target_properties(test_open_data_volume_orientation PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_open_data_volume_orientation PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_open_data_volume_orientation PRIVATE
+    vc_core
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME open_data_volume_orientation COMMAND test_open_data_volume_orientation)
+vc_register_test_target(test_open_data_volume_orientation)
+vc_register_ctest(open_data_volume_orientation test_open_data_volume_orientation)
+
 add_executable(test_fiber_map_staleness
     test_fiber_map_staleness.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapStaleness.hpp

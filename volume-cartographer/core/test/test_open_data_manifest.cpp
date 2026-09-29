@@ -453,7 +453,9 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
     openOptions.remoteCacheRoot = root;
     openOptions.remoteFileFetcher = [&](const std::string&, const std::filesystem::path& temporary) {
         ++fetches;
-        std::ofstream(temporary) << R"({"version":2,"groups":{}})";
+        std::ofstream(temporary) << R"({"version":2,"groups":{
+            "nx":{"zarr":"nx.ome.zarr/4","scaledown":4,"channels":["nx"]}
+        }})";
     };
     const auto cached = vc::lasagna::LasagnaDataset::openLocation(
         location, openOptions);
@@ -473,6 +475,18 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
     REQUIRE(resolved.has_value());
     CHECK(resolved->manifestPath == cached.manifest().manifestPath);
     CHECK(resolved->sourceManifestLocation == location);
+    // Alignment metrics must retain this remote dataset, not reopen its cached
+    // manifest as a local file and interpret the relative channel as local.
+    openOptions.workingToBaseScale = resolved->workingToBaseScale;
+    const auto metricsDataset = std::make_shared<vc::lasagna::LasagnaDataset>(
+        vc::lasagna::LasagnaDataset::openLocation(
+            resolved->sourceManifestLocation, openOptions));
+    REQUIRE(metricsDataset->manifest().groups.size() == 1);
+    const auto& channel = metricsDataset->manifest().groups.front();
+    CHECK(channel.isRemote());
+    CHECK(channel.remoteZarrBaseUrl == "https://example.test/manual");
+    CHECK(channel.remoteZarrKey == "nx.ome.zarr/4");
+    CHECK(metricsDataset->manifest().workingToBaseScale == resolved->workingToBaseScale);
     CHECK(fetches == 1);
     qputenv("VC3D_CONFIG_DIR", previousConfigDir);
     std::filesystem::remove_all(root);

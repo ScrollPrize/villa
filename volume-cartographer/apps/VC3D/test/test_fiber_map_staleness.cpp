@@ -58,6 +58,8 @@ namespace
         deps.umbilicusGeneration = 2;
         deps.umbilicusFingerprint = QStringLiteral("umb|1024:99");
         deps.frame = frameAt(9.596);
+        deps.catalogVolume = QStringLiteral("PHerc0139/20260102150214");
+        deps.catalogManifestToken = QStringLiteral("15642382:1757600000000000000");
         return deps;
     }
 
@@ -197,6 +199,45 @@ private slots:
         auto current = baseline();
         current.umbilicusFingerprint = QStringLiteral("umb|2048:101");
         QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::MarkStale);
+    }
+
+    // A same-grid store of another catalog volume (or an untagged one) is a
+    // volume switch the grid check cannot see: stale like Grid, reverting
+    // when the user switches back, and it outranks the auto-updatable
+    // causes so a fiber save while looking at the other volume does not
+    // rebuild the map in that volume's winding sense.
+    void anotherCatalogVolumeOnTheSameGridMarksStale()
+    {
+        auto current = baseline();
+        current.catalogVolume = QStringLiteral("PHerc0139/20250728140407");
+        StaleVerdict changed = verdict(baseline(), current);
+        QCOMPARE(changed.action, StaleVerdict::Action::MarkStale);
+        QCOMPARE(changed.cause, StaleVerdict::Cause::Volume);
+        current.catalogVolume.clear();
+        QCOMPARE(verdict(baseline(), current).cause, StaleVerdict::Cause::Volume);
+        current.fiberGeneration += 1;
+        QCOMPARE(verdict(baseline(), current).cause, StaleVerdict::Cause::Volume);
+        current = baseline();
+        current.fiberGeneration += 1;
+        QCOMPARE(verdict(baseline(), current).cause, StaleVerdict::Cause::Fibers);
+    }
+
+    // The cached catalog manifest is a dependency like the umbilicus file:
+    // replaced, the winding sense may read differently; the same file again
+    // is fresh. An untagged volume carries no token and never depends on it.
+    void aReplacedCatalogManifestMarksStale()
+    {
+        auto current = baseline();
+        current.catalogManifestToken = QStringLiteral("15700000:1758000000000000000");
+        const StaleVerdict changed = verdict(baseline(), current);
+        QCOMPARE(changed.action, StaleVerdict::Action::MarkStale);
+        QCOMPARE(changed.cause, StaleVerdict::Cause::Catalog);
+        current.catalogManifestToken = baseline().catalogManifestToken;
+        QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::Fresh);
+        auto untagged = baseline();
+        untagged.catalogVolume.clear();
+        untagged.catalogManifestToken.clear();
+        QCOMPARE(verdict(untagged, untagged).action, StaleVerdict::Action::Fresh);
     }
 
     // A latched reason stays, and keeps its original wording rather than being

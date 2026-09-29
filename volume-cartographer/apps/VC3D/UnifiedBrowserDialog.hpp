@@ -28,7 +28,7 @@ public:
     void setAcceptsFiles(bool v) { _acceptsFiles = v; }
     void setAcceptsDirs(bool v) { _acceptsDirs = v; }
     void setLocalNameFilters(const QStringList& globs) { _localFilters = globs; }
-    void setStartUri(const QString& uri);
+    void setStartUri(const QString& uri, bool isFile = false);
 
     using AuthResolver = std::function<bool(const QString& url,
                                              vc::HttpAuth* out,

@@ -1,5 +1,4 @@
-# Sharded Zarr Double Decode
+# Task
 
-Fix compressed Zarr inner chunks being decoded twice in the whole-storage-object
-path used by the viewer cache. Branch from current main and present the PR title
-and body for approval before publishing.
+Move whole-fiber normal/direction reset to the annotation window menu. Replace
+its Ctrl-right-click action with a selected-CP reset lower in the menu.
