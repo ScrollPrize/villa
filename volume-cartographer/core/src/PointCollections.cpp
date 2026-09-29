@@ -111,6 +111,7 @@ void to_json(Json& j, const PointCollections::Collection& c) {
     to_json(metadata_j, c.metadata);
 
     j = Json{
+        {"uuid", Json(c.uuid)},
         {"name", Json(c.name)},
         {"points", std::move(points_obj)},
         {"metadata", std::move(metadata_j)},
@@ -144,6 +145,13 @@ void to_json(Json& j, const PointCollections::Collection& c) {
 }
 
 void from_json(const Json& j, PointCollections::Collection& c) {
+    if (j.contains("uuid")) {
+        if (!j.at("uuid").is_string() ||
+            !vc::util::isUuid(j.at("uuid").get_string())) {
+            throw std::runtime_error("Point collection has an invalid uuid");
+        }
+        c.uuid = j.at("uuid").get_string();
+    }
     c.name = j.at("name").get_string();
 
     Json points_obj = j.at("points");  // copy — ref into at() cache gets evicted by nested at() calls

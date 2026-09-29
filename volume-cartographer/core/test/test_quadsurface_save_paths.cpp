@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/Uuid.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -36,6 +37,25 @@ cv::Mat_<cv::Vec3f> grid(int rows = 8, int cols = 8, float z = 0.f)
 }
 
 } // namespace
+
+TEST_CASE("new patch UUID survives metadata and geometry saves")
+{
+    auto root = tmpDir("identity");
+    auto segDir = root / "named_patch";
+    QuadSurface created(grid(), cv::Vec2f(1.f, 1.f));
+    created.save(segDir);
+    QuadSurface loaded(segDir);
+    const std::string uuid = loaded.meta["uuid"].get_string();
+    CHECK(vc::util::isUuid(uuid));
+    CHECK(loaded.id == "named_patch");
+    loaded.id = "changed_display_name";
+    loaded.save_meta();
+    CHECK(QuadSurface(segDir).meta["uuid"].get_string() == uuid);
+    loaded.ensureLoaded();
+    loaded.saveOverwrite();
+    CHECK(QuadSurface(segDir).meta["uuid"].get_string() == uuid);
+    fs::remove_all(root);
+}
 
 TEST_CASE("save(path, uuid, force_overwrite=true): atomic-exchange replaces existing")
 {

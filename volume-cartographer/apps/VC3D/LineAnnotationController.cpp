@@ -215,6 +215,7 @@ struct LineAnnotationController::LineAnnotationSession {
     uint64_t lineRevision = 0;
     bool deferShowUntilGenerated = false;
     uint64_t fiberId = 0;
+    std::string fiberUuid = vc::util::newUuid();
     std::string fiberUsername;
     std::string fiberStartedAt;
     uint64_t fiberSequence = 0;
@@ -2937,6 +2938,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     auto session = std::make_shared<LineAnnotationSession>();
     session->suppressErrorDialogs = _errorDialogsSuppressed;
     session->fiberId = it->id;
+    session->fiberUuid = it->uuid;
     session->fiberUsername = it->username;
     session->fiberStartedAt = it->startedAt;
     session->fiberSequence = it->sequence;
@@ -3645,6 +3647,7 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
         reservedNames.reserve(importedFibers.size());
         for (auto& fiber : importedFibers) {
             fiber.id = 0;
+            fiber.uuid = vc::util::newUuid();
             fiber.generation = std::max<uint64_t>(uint64_t{1}, fiber.generation);
             if (fiber.username.empty()) {
                 fiber.username = currentFiberUsername();
@@ -16450,6 +16453,7 @@ LineAnnotationController::makeIntersectionLineSession(
     session->surfaceName = surfaceName;
     session->sourceAnnotationSurfaceName = surfaceName;
     session->fiberId = fiber.id;
+    session->fiberUuid = fiber.uuid;
     session->fiberUsername = fiber.username;
     session->fiberStartedAt = fiber.startedAt;
     session->fiberSequence = fiber.sequence;
@@ -16604,6 +16608,7 @@ LineAnnotationController::makeStoredFiberSessionSnapshot(LineAnnotationSession& 
     fiber.id = existingIt == _fibers.end()
         ? (session.fiberId == 0 ? nextFiberId() : session.fiberId)
         : existingIt->id;
+    fiber.uuid = existingIt == _fibers.end() ? session.fiberUuid : existingIt->uuid;
     fiber.generation = existingIt == _fibers.end()
         ? uint64_t{1}
         : std::max<uint64_t>(uint64_t{1}, existingIt->generation + 1);
@@ -16993,6 +16998,7 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
     nlohmann::json root = nlohmann::json::object();
     root["type"] = "vc3d_fiber";
     root["version"] = 3;
+    root["uuid"] = serialized.uuid;
     root["username"] = serialized.username;
     root["started_at"] = serialized.startedAt;
     root["sequence"] = serialized.sequence;
@@ -17553,6 +17559,7 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
     const int fiberVersion = parsedFiber.version;
 
     StoredFiber fiber;
+    if (!parsedFiber.uuid.empty()) fiber.uuid = parsedFiber.uuid;
     fiber.optimizationMode =
         vc3d::line_annotation::fiberOptimizationModeFromString(
             parsedFiber.optimizationMode);

@@ -70,3 +70,5 @@ volume-cartographer/AGENTS.md
 /volume-cartographer/scripts/spiral/out
 /spiral-fitting/.claude
 /spiral-fitting/outputs
+/vesuvius/src/vesuvius/neural_tracing/fiber_follow/output
+/volume-cartographer/plans

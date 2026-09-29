@@ -8,11 +8,13 @@
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core/types.hpp>
+#include "vc/core/util/Uuid.hpp"
 
 namespace vc::fiber_tracer
 {
 struct Vc3dFiberJson {
     int version = 1;
+    std::string uuid;
     std::string optimizationMode = "lasagna";
     std::vector<cv::Vec3d> linePoints;
     std::vector<cv::Vec3d> controlPoints;
@@ -237,6 +239,13 @@ inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
         throw std::runtime_error(context + " is not a vc3d_fiber JSON object");
 
     Vc3dFiberJson fiber;
+    if (root.contains("uuid")) {
+        if (!root.at("uuid").is_string() ||
+            !vc::util::isUuid(root.at("uuid").get<std::string>())) {
+            throw std::runtime_error(context + " has an invalid uuid");
+        }
+        fiber.uuid = root.at("uuid").get<std::string>();
+    }
     fiber.version = root.value("version", 1);
     if (fiber.version != 1 && fiber.version != 3)
         throw std::runtime_error(context + " has unsupported vc3d_fiber version");

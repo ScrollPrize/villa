@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/PointCollections.hpp"
+#include "vc/core/util/Uuid.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -179,6 +180,7 @@ TEST_CASE("segment-path round-trip (anchored collections only)")
     c.addPoint("anchored", {1, 2, 3});
     c.addPoint("plain", {4, 5, 6});
     const uint64_t anchored = c.getCollectionId("anchored").value();
+    const std::string anchoredUuid = c.getAllCollections().at(anchored).uuid;
     c.setCollectionAnchor2d(anchored, cv::Vec2f(8, 9));
     REQUIRE(c.saveToSegmentPath(dir));
     CHECK(fs::exists(dir / "corrections.json"));
@@ -188,7 +190,10 @@ TEST_CASE("segment-path round-trip (anchored collections only)")
     // Only the anchored collection is persisted.
     bool has_anchored = false, has_plain = false;
     for (const auto& [id, col] : loaded.getAllCollections()) {
-        if (col.name == "anchored") has_anchored = true;
+        if (col.name == "anchored") {
+            has_anchored = true;
+            CHECK(col.uuid == anchoredUuid);
+        }
         if (col.name == "plain") has_plain = true;
     }
     CHECK(has_anchored);
@@ -204,6 +209,9 @@ TEST_CASE("JSON round-trip preserves data")
     c.addPoint("alpha", {4, 5, 6});
     c.addPoint("beta", {7, 8, 9});
     const uint64_t alpha = c.getCollectionId("alpha").value();
+    const std::string alphaUuid = c.getAllCollections().at(alpha).uuid;
+    CHECK(vc::util::isUuid(alphaUuid));
+    CHECK(c.getAllCollections().at(c.getCollectionId("beta").value()).uuid != alphaUuid);
     c.setCollectionColor(alpha, {0.1f, 0.2f, 0.3f});
     c.setCollectionTag(alpha, "kind", "correction");
 
@@ -218,9 +226,12 @@ TEST_CASE("JSON round-trip preserves data")
     CHECK(loaded.getAllCollections().size() == c.getAllCollections().size());
     const uint64_t la = loaded.getCollectionId("alpha").value();
     CHECK(la != 0);
+    CHECK(loaded.getAllCollections().at(la).uuid == alphaUuid);
     CHECK(loaded.getPoints("alpha").size() == 2);
     CHECK(loaded.getPoints("beta").size() == 1);
     CHECK(loaded.getCollectionTag(la, "kind") == std::optional<std::string>("correction"));
+    loaded.renameCollection(la, "renamed");
+    CHECK(loaded.getAllCollections().at(la).uuid == alphaUuid);
 }
 
 TEST_CASE("zero and duplicate point ids retain collection-local identity")
@@ -364,6 +375,12 @@ TEST_CASE("old point JSON defaults links and fiber direction")
 
     PointCollections loaded;
     REQUIRE(loaded.loadFromJSON(tmp.string()));
+    const std::string uuid = loaded.getAllCollections().begin()->second.uuid;
+    CHECK(vc::util::isUuid(uuid));
+    REQUIRE(loaded.saveToJSON(tmp.string()));
+    PointCollections reloaded;
+    REQUIRE(reloaded.loadFromJSON(tmp.string()));
+    CHECK(reloaded.getAllCollections().begin()->second.uuid == uuid);
     fs::remove(tmp);
 
     const auto points = loaded.getPoints("old");

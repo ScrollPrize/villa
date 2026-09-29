@@ -38,6 +38,7 @@
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
 #include "vc/core/util/ScrollUmbilicus.hpp"
+#include "vc/core/util/Uuid.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
@@ -525,6 +526,7 @@ private:
     };
     struct StoredFiber {
         uint64_t id = 0;
+        std::string uuid = vc::util::newUuid();
         std::string username;
         std::string startedAt;
         uint64_t sequence = 0;

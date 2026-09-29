@@ -7,6 +7,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/Tiff.hpp"
+#include "vc/core/util/Uuid.hpp"
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
@@ -1759,10 +1760,12 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
 
 void QuadSurface::save(const std::filesystem::path &path_, bool force_overwrite)
 {
-    if (path_.filename().empty())
-        save(path_, path_.parent_path().filename().string(), force_overwrite);
-    else
-        save(path_, path_.filename().string(), force_overwrite);
+    const std::string uuid = meta.is_object() && meta.contains("uuid") &&
+                                     meta["uuid"].is_string() &&
+                                     !meta["uuid"].get_string().empty()
+        ? meta["uuid"].get_string()
+        : vc::util::newUuid();
+    save(path_, uuid, force_overwrite);
 }
 
 std::recursive_mutex& QuadSurface::dirWriteMutex(const std::filesystem::path& dir)
@@ -1778,10 +1781,11 @@ void QuadSurface::saveOverwrite()
     std::lock_guard<std::recursive_mutex> dirLock(dirWriteMutex(path));
 
     std::filesystem::path final_path = path;
-    std::string uuid = !id.empty() ? id : final_path.filename().string();
-    if (uuid.empty()) {
-        throw std::runtime_error("QuadSurface::saveOverwrite() requires a non-empty uuid");
-    }
+    const std::string uuid = meta.is_object() && meta.contains("uuid") &&
+                                     meta["uuid"].is_string() &&
+                                     !meta["uuid"].get_string().empty()
+        ? meta["uuid"].get_string()
+        : vc::util::newUuid();
 
     // Snapshot the on-disk state before overwriting. saveSnapshot() writes
     // a rotating backup at <backupRoot>/backups/<segname>/{0..N-1}/ so a
@@ -1797,7 +1801,7 @@ void QuadSurface::saveOverwrite()
 
     save(final_path.string(), uuid, true);
     path = final_path;
-    id = uuid;
+    id = final_path.filename().string();
 }
 
 void QuadSurface::invalidateMask()
@@ -2214,7 +2218,7 @@ void QuadSurface::save(const std::filesystem::path &path_, const std::string &uu
 
     // Update the path to the final canonical location
     path = final_path;
-    id = uuid;
+    id = final_path.filename().string();
 }
 
 void QuadSurface::save_meta()
@@ -2228,10 +2232,10 @@ void QuadSurface::save_meta()
         throw std::runtime_error("can't save_meta() with non-object metadata!");
     }
 
-    const std::string uuid = !id.empty() ? id : path.filename().string();
-    if (uuid.empty()) {
-        throw std::runtime_error("QuadSurface::save_meta() requires a non-empty uuid");
-    }
+    const std::string uuid = meta.contains("uuid") && meta["uuid"].is_string() &&
+                                     !meta["uuid"].get_string().empty()
+        ? meta["uuid"].get_string()
+        : vc::util::newUuid();
 
     {
         // NB: deliberately no bbox recompute here, unlike save(). save_meta()
@@ -2629,7 +2633,7 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz_impl(
 
     auto surf = std::make_unique<QuadSurface>(points.release(), scale);
     if (!requestedRegion) surf->path = path;
-    surf->id   = metadata["uuid"].get_string();
+    surf->id   = path.filename().string();
     surf->meta = metadata;
 
     // Register extra channels lazily (left as OpenCV-based on-demand load).
