@@ -8,5 +8,7 @@
 - [x] Implement Gaussian tube materialization and soft presence loss.
 - [x] Add and run regression tests.
 - [x] Add production config and documentation.
+- [x] Extend direction supervision across Gaussian support with weighted normalization.
+- [x] Restrict managed production launch to GPUs 0-5.
 - [ ] Launch managed training from best EMA-0.999 and verify progress.
 - [ ] Commit the completed implementation.

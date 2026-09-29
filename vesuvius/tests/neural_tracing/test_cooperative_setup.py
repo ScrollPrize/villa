@@ -84,6 +84,25 @@ def test_missing_calibration_requests_exclusive_real_startup(monkeypatch, tmp_pa
     assert "memory_calibration" not in prepared["training"]["cooperative"]
 
 
+def test_missing_calibration_accepts_explicit_visible_managed_subset(monkeypatch, tmp_path):
+    from villa_gpu_manager import bootstrap
+    inventory = {
+        "cpu_cores": 224,
+        "gpus": {"GPU-a": 80 * 1024**3, "GPU-b": 80 * 1024**3},
+    }
+    monkeypatch.setattr(bootstrap, "ensure_manager", lambda path: (path, inventory))
+    monkeypatch.setattr(bootstrap, "visible_gpu_uuids", lambda: ["GPU-a"])
+    raw = fixture_config(tmp_path)
+    raw["training"].pop("cooperative")
+    raw["test_datasets"] = ["test-fixture"]
+    raw["training"]["test_interval"] = 10
+    prepared = prepare_settings(tmp_path / "config.json", raw)
+    request = prepared["training"]["cooperative"]["request"]
+    assert request["exclusive"]
+    assert request["max_gpus"] == 1
+    assert request["allowed_gpu_uuids"] == ["GPU-a"]
+
+
 def test_request_honors_calibrated_rank_coverage(monkeypatch, tmp_path):
     monkeypatch.setattr(torch.version, "cuda", "cpu-test")
     raw = fixture_config(tmp_path)

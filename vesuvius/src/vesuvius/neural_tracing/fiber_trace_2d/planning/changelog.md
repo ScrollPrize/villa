@@ -2,7 +2,8 @@
 
 - Added opt-in soft Gaussian tube targets around dense 3D fiber lines, using
   native Lasagna normals, exact augmentation covector transforms, 4:1
-  in-sheet/thickness sigma, bounded support, and target-only loss counts.
+  in-sheet/thickness sigma, bounded support, Gaussian-weighted direction
+  supervision throughout the tube, and target-only loss counts.
 - Updated the high-resolution refinement config to initialize from its best
   EMA-0.999 weights and saved refined geometry while continuing online
   refinement in a fresh managed training run.

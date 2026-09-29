@@ -26,3 +26,14 @@
 - Broader test files reach unrelated pre-existing distributed-test failures in
   this host environment (`Gloo` cannot resolve `127.0.0.1`); no Gaussian-path
   assertion failed before those infrastructure failures.
+- Follow-up: stopped the first Gaussian run at update 1,827. Expanded direction
+  supervision from the centerline to every nonzero Gaussian-support voxel. The
+  winning segment supplies the tangent; both direction loss and angle metrics
+  use the Gaussian falloff and normalize by its summed weight.
+- Kept soft-target BCE: its pointwise optimum is the requested Gaussian, while
+  separate support/background normalization prevents background domination.
+- Restricted the production launcher to physical GPUs 0-5. Startup calibration
+  now accepts an explicit visible subset of managed GPUs rather than requiring
+  the entire node.
+- Follow-up validation: arc/target and cooperative setup suites passed (44
+  passed, 2 CUDA-only skips).

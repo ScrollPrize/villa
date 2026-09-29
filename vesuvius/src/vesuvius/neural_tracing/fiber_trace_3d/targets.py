@@ -205,7 +205,7 @@ def _materialize_anisotropic_gaussian_presence(
     config: FiberTrace3DConfig,
     patch_shape: tuple[int, int, int],
     coordinate_scale: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Rasterize a soft tube in the local fiber/sheet frame.
 
     The local surface normal is the thickness axis. The in-sheet axis
@@ -237,8 +237,14 @@ def _materialize_anisotropic_gaussian_presence(
     target = torch.zeros(
         (int(batch.volume.shape[0]), *patch_shape), dtype=torch.float32, device=device
     )
+    tangent_target = torch.zeros(
+        (int(batch.volume.shape[0]), *patch_shape, 3), dtype=torch.float32, device=device
+    )
     if int(starts.shape[0]) == 0:
-        return target
+        empty_indices = torch.zeros((0, 4), dtype=torch.long, device=device)
+        empty_tangents = torch.zeros((0, 3), dtype=torch.float32, device=device)
+        empty_weights = torch.zeros((0,), dtype=torch.float32, device=device)
+        return target, empty_indices, empty_tangents, empty_weights
 
     scale = float(coordinate_scale)
     starts = starts / scale
@@ -285,8 +291,16 @@ def _materialize_anisotropic_gaussian_presence(
             torch.zeros_like(standardized2),
         )
         sample = int(sample_ids_cpu[segment])
-        target[sample][slices] = torch.maximum(target[sample][slices], probability)
-    return target
+        current = target[sample][slices]
+        replace = probability > current
+        target[sample][slices] = torch.where(replace, probability, current)
+        tangent_view = tangent_target[sample][slices]
+        tangent_target[sample][slices] = torch.where(
+            replace.unsqueeze(-1), tangent.view(1, 1, 1, 3), tangent_view
+        )
+    support = target > 0.0
+    indices_bzyx = torch.nonzero(support, as_tuple=False).to(dtype=torch.long)
+    return target, indices_bzyx, tangent_target[support], target[support]
 
 
 def _materialize_coarse_cp_only_sample(
@@ -393,7 +407,7 @@ def materialize_targets(
         coordinate_scale=output_stride,
         input_shape=input_shape,
     )
-    if int(line_indices.shape[0]) > 0:
+    if int(line_indices.shape[0]) > 0 and config.presence_target_mode != "anisotropic_gaussian":
         direction_indices.append(line_indices)
         direction_tangents.append(line_tangents)
     if profile:
@@ -440,14 +454,19 @@ def materialize_targets(
         timings["target_cp_points"] = float(cp_direction_points)
     scatter_start = time.perf_counter()
     if config.presence_target_mode == "anisotropic_gaussian":
-        presence = _materialize_anisotropic_gaussian_presence(
+        presence, gaussian_indices, gaussian_tangents, gaussian_falloff = _materialize_anisotropic_gaussian_presence(
             batch=geometry_batch,
             config=config,
             patch_shape=patch_shape,
             coordinate_scale=output_stride,
         )
+        if direction_indices:
+            raise ValueError("Gaussian direction support currently requires dense-line-only batches")
+        direction_indices.append(gaussian_indices)
+        direction_tangents.append(gaussian_tangents)
     else:
         presence = positive.to(dtype=torch.float32)
+        gaussian_falloff = None
     presence_target = presence.view(
         int(batch.volume.shape[0]),
         1,
@@ -469,6 +488,10 @@ def materialize_targets(
         tangent_xyz = tangents_zyx[:, [2, 1, 0]]
         direction_target_sparse = encode_lasagna_direction_3x2(tangent_xyz)
         direction_weight_sparse = projection_magnitude_weights_3x2(tangent_xyz)
+        if gaussian_falloff is not None:
+            if int(gaussian_falloff.shape[0]) != int(direction_weight_sparse.shape[0]):
+                raise ValueError("Gaussian direction falloff count mismatch")
+            direction_weight_sparse = direction_weight_sparse * gaussian_falloff[:, None]
     else:
         indices_bzyx = torch.zeros((0, 4), dtype=torch.long, device=device)
         tangents_zyx = torch.zeros((0, 3), dtype=torch.float32, device=device)

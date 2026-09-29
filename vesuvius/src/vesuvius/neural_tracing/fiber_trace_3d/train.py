@@ -1445,12 +1445,23 @@ def compute_losses(
         direction_error = (pred_selected - batch.direction_target_sparse) ** 2
         direction_error = direction_error * batch.direction_weight_sparse
         direction_sum = direction_error.sum()
-        direction_count = direction_error.new_tensor(direction_error.numel())
+        if batch.presence_target_mode == "anisotropic_gaussian":
+            direction_falloff = batch.presence_target[
+                indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]
+            ].to(dtype=direction_error.dtype)
+            direction_count = direction_falloff.sum() * int(direction_error.shape[-1])
+        else:
+            direction_falloff = None
+            direction_count = direction_error.new_tensor(direction_error.numel())
         selected_axis = pred_axis[row_index, selected_branch]
         agreement = torch.abs(torch.sum(selected_axis * target_axis, dim=-1)).clamp(0.0, 1.0)
         angle_values = torch.rad2deg(torch.acos(agreement))
-        angle_sum = angle_values.sum()
-        angle_count = angle_values.new_tensor(angle_values.numel())
+        if direction_falloff is None:
+            angle_sum = angle_values.sum()
+            angle_count = angle_values.new_tensor(angle_values.numel())
+        else:
+            angle_sum = (angle_values * direction_falloff).sum()
+            angle_count = direction_falloff.sum()
         selected_presence = pred_presence_sparse[row_index, selected_branch]
         positive_presence_bce = _safe_probability_bce(
             selected_presence.clamp(1.0e-6, 1.0 - 1.0e-6),
@@ -1660,7 +1671,18 @@ def compute_conditioned_losses(
             device=direction_error.device,
         )[:, None, :]
         direction_sum = direction_error.sum()
-        direction_count = direction_error.new_tensor(direction_error.numel())
+        if batch.presence_target_mode == "anisotropic_gaussian":
+            direction_falloff = batch.presence_target[
+                indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]
+            ].to(dtype=direction_error.dtype)
+            direction_count = (
+                direction_falloff.sum()
+                * int(direction_error.shape[1])
+                * int(direction_error.shape[2])
+            )
+        else:
+            direction_falloff = None
+            direction_count = direction_error.new_tensor(direction_error.numel())
         pred_axis = decode_lasagna_direction_3x2_analytic(pred_dirs.reshape(-1, 6)).reshape(
             int(indices.shape[0]),
             positive_query_count,
@@ -1671,8 +1693,12 @@ def compute_conditioned_losses(
             1.0,
         )
         angle_values = torch.rad2deg(torch.acos(agreement))
-        angle_sum = angle_values.sum()
-        angle_count = angle_values.new_tensor(angle_values.numel())
+        if direction_falloff is None:
+            angle_sum = angle_values.sum()
+            angle_count = angle_values.new_tensor(angle_values.numel())
+        else:
+            angle_sum = (angle_values * direction_falloff[:, None]).sum()
+            angle_count = direction_falloff.sum() * int(angle_values.shape[1])
         positive_presence_bce = _safe_probability_bce(
             pred_presence.clamp(1.0e-6, 1.0 - 1.0e-6),
             torch.ones_like(pred_presence),

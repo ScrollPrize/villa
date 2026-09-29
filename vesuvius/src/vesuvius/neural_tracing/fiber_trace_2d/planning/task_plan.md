@@ -12,8 +12,9 @@
 3. Materialize the soft tube on the training device from exact point-to-segment
    distances in the local tangent / in-sheet transverse / surface-normal frame.
    Evaluate output index `j` at input coordinate `j*output_stride`, merge
-   overlapping segment contributions by maximum probability, and keep sparse
-   direction targets on the centerline. Bound temporaries by cutoff-expanded
+   overlapping segment contributions by maximum probability. Assign every
+   nonzero-support voxel the tangent of its winning segment and use a
+   Gaussian-weighted direction mean. Bound temporaries by cutoff-expanded
    per-segment boxes rather than segment-by-full-volume tensors.
 4. Generalize ordinary presence loss statistics to apply soft-target BCE over
    the nonzero tube and zero-target BCE outside it, retaining per-patch
@@ -30,8 +31,9 @@
    `training.initialize_from` for the best EMA-0.999 weights (EMA snapshots are
    not optimizer-resumable), remove the inherited `training.resume`, preserve
    active online refinement, and record source path/hash/new run name. Launch
-   through the approved cooperative experiment runner and verify manager
-   allocation plus initial training/test progress.
+   through the approved cooperative experiment runner on physical GPUs 0-5 and
+   verify manager allocation plus initial training/test progress. Permit
+   automatic startup calibration on an explicit nonempty managed GPU subset.
 
 ## Spec update
 
@@ -55,8 +57,9 @@ Use deterministic synthetic segments/normals for numerical target assertions,
 then shared transport, stride-1/4, augmentation transform, target-prepass count,
 microbatch-equivalence, and existing CPU target/arc/refinement/single-backward
 suites. Include rotation/reflection/scale/smooth-warp normal transforms,
-sign-invariance, support tails, clipped edges, and unchanged centerline-only
-direction counts. Start the real managed run only after those pass.
+sign-invariance, support tails, clipped edges, complete direction support, and
+Gaussian-weighted direction normalization. Start the real managed run only
+after those pass.
 
 ## Changelog
 

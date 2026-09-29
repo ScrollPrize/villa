@@ -248,10 +248,22 @@ def test_anisotropic_gaussian_presence_has_four_to_one_local_sigma():
     y = center.clone(); y[1] += width_step
     assert target[tuple(z)] == pytest.approx(target[tuple(y)], abs=2.0e-5)
     assert 0.4 < float(target[tuple(z)]) < 0.8
-    assert torch.equal(
-        batch.direction_indices_bzyx,
-        materialize_targets(raw, replace(config, presence_target_mode="binary"), output_stride=stride).direction_indices_bzyx,
+    support_indices = torch.nonzero(target > 0.0, as_tuple=False)
+    assert torch.equal(batch.direction_indices_bzyx[:, 1:], support_indices)
+    assert int(batch.direction_indices_bzyx.shape[0]) > int(
+        materialize_targets(
+            raw, replace(config, presence_target_mode="binary"), output_stride=stride
+        ).direction_indices_bzyx.shape[0]
     )
+    center_row = torch.nonzero(
+        (batch.direction_indices_bzyx[:, 1:] == center).all(dim=1), as_tuple=False
+    ).item()
+    z_row = torch.nonzero(
+        (batch.direction_indices_bzyx[:, 1:] == z).all(dim=1), as_tuple=False
+    ).item()
+    center_weight = batch.direction_weight_sparse[center_row].sum()
+    z_weight = batch.direction_weight_sparse[z_row].sum()
+    assert z_weight / center_weight == pytest.approx(float(target[tuple(z)]), abs=2.0e-5)
 
 
 def test_anisotropic_gaussian_uses_input_voxel_units_at_stride_four():

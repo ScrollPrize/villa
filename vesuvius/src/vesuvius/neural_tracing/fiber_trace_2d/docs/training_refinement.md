@@ -84,7 +84,10 @@ voxel's closest point on a finite line segment, the target is
 `exp(-0.5*((d_normal/sigma_normal)^2 + (d_width/sigma_width)^2))`; finite end
 caps use the width sigma, overlapping segments combine by maximum, and values
 outside three sigma are exactly zero. Output-stride targets retain input-voxel
-units. Sparse direction supervision remains centerline-only.
+units. Direction supervision covers every nonzero tube voxel. Each voxel uses
+the tangent of the segment that supplied its maximum probability; its direction
+loss and angle metric are weighted by that probability and normalized by the
+sum of Gaussian weights, preserving the direction-loss scale.
 
 Normals come from the same native validity/encoding-aware Lasagna sampler as
 refinement. The loader transforms them through each affine and smooth
@@ -93,8 +96,10 @@ the transformed segment tangent. Invalid normals or singular transforms use
 the existing deterministic same-scroll sample replacement rather than a fake
 axis. Soft BCE is averaged over nonzero tube support per patch; pure-zero
 background is averaged separately, preserving the established equal
-positive/background patch weighting. The target-only macro-batch prepass uses
-the identical support/background group counts.
+positive/background patch weighting. BCE remains appropriate because its
+pointwise optimum is the configured Gaussian probability. The target-only
+macro-batch prepass uses the identical support/background group counts and
+Gaussian direction-weight sum.
 
 Optional direction guidance (default weight0, current trial0.1) penalizes
 `1-(unit_segment_tangent dot predicted_base_axis)^2` at the same segment quadrature.
