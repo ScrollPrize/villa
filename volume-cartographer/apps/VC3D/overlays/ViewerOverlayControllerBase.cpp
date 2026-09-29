@@ -58,6 +58,47 @@ bool isDisplacedBoundaryProjection(QuadSurface* surface,
     return nearBoundary;
 }
 
+// Distance from `point` to the surface as a viewer displays it, shifted by
+// `normalOffset` along the normal at `pointer` (the nominal surface point
+// nearest `point`). Negative when that normal is unusable.
+float offsetSurfaceDistance(QuadSurface* surface,
+                            const cv::Vec3f& pointer,
+                            const cv::Vec3f& point,
+                            float normalOffset)
+{
+    const cv::Vec3f coord = surface->coord(pointer);
+    const cv::Vec3f normal = surface->normal(pointer);
+    if (!std::isfinite(coord[0]) || !std::isfinite(coord[1]) || !std::isfinite(coord[2]) ||
+        !std::isfinite(normal[0]) || !std::isfinite(normal[1]) || !std::isfinite(normal[2])) {
+        return -1.0f;
+    }
+    return static_cast<float>(cv::norm(point - (coord + normal * normalOffset)));
+}
+
+// Distance from `point` to the viewer's displayed quad surface: the nominal
+// surface, or the surface shifted by the viewer's normal offset. Returns a
+// negative value or one above `tolerance` when there is no surface point in
+// range.
+float displayedQuadSurfaceDistance(QuadSurface* surface,
+                                   const cv::Vec3f& point,
+                                   float tolerance,
+                                   float normalOffset,
+                                   SurfacePatchIndex* patchIndex)
+{
+    cv::Vec3f ptr(0, 0, 0);
+    if (normalOffset == 0.0f) {
+        return surface->pointTo(ptr, point, tolerance, 100, patchIndex);
+    }
+    const float searchTolerance = tolerance + std::fabs(normalOffset);
+    const float dist = surface->pointTo(ptr, point, searchTolerance, 100, patchIndex);
+    // pointTo() signals a miss with a value around the tolerance without
+    // updating ptr.
+    if (dist < 0.0f || dist > searchTolerance) {
+        return -1.0f;
+    }
+    return offsetSurfaceDistance(surface, ptr, point, normalOffset);
+}
+
 } // namespace
 
 ViewerOverlayControllerBase::PathPrimitive
@@ -630,8 +671,11 @@ ViewerOverlayControllerBase::filterPointsNearViewerSurface(VolumeViewerBase* vie
     filter.clipToSurface = false;
     filter.requireSceneVisibility = requireSceneVisibility;
     filter.computeScenePoints = true;
-    filter.volumePredicate = [planeSurface, quadSurface, patchIndex, tolerance, &bounds,
-                              &pointOpacities](const cv::Vec3f& point, size_t index) {
+    // Distances are measured from the surface as displayed, including the
+    // viewer's normal offset.
+    const float normalOffset = viewer ? viewer->normalOffset() : 0.0f;
+    filter.volumePredicate = [planeSurface, quadSurface, patchIndex, tolerance, normalOffset,
+                              &bounds, &pointOpacities](const cv::Vec3f& point, size_t index) {
         if (bounds && !bounds->contains(point)) {
             pointOpacities[index] = 0.0f;
             return false;
@@ -647,10 +691,11 @@ ViewerOverlayControllerBase::filterPointsNearViewerSurface(VolumeViewerBase* vie
         };
         float opacity = 1.0f;
         if (planeSurface) {
-            opacity = opacityForDistance(std::fabs(planeSurface->pointDist(point)));
+            opacity = opacityForDistance(
+                std::fabs(planeSurface->scalarp(point) - normalOffset));
         } else if (quadSurface) {
-            cv::Vec3f ptr(0, 0, 0);
-            const float dist = quadSurface->pointTo(ptr, point, std::max(tolerance, 0.0f), 100, patchIndex);
+            const float dist = displayedQuadSurfaceDistance(
+                quadSurface, point, std::max(tolerance, 0.0f), normalOffset, patchIndex);
             opacity = opacityForDistance(dist);
         }
         pointOpacities[index] = opacity;
@@ -701,6 +746,9 @@ ViewerOverlayControllerBase::filterPointsNearViewerSurfaceCached(
         auto* quadSurface = dynamic_cast<QuadSurface*>(surface);
         auto* viewerManager = managerForViewer(viewer);
         auto* patchIndex = viewerManager ? viewerManager->surfacePatchIndex() : nullptr;
+        // The context's depth band includes the normal offset, so the cache
+        // already invalidates when it changes.
+        const float normalOffset = viewer->normalOffset();
 
         // Identical to the fade in filterPointsNearViewerSurface().
         auto opacityForDistance = [tolerance](float dist) {
@@ -727,11 +775,11 @@ ViewerOverlayControllerBase::filterPointsNearViewerSurfaceCached(
             const cv::Vec3f& point = points[index];
             float opacity = 1.0f;
             if (planeSurface) {
-                opacity = opacityForDistance(std::fabs(planeSurface->pointDist(point)));
+                opacity = opacityForDistance(
+                    std::fabs(planeSurface->scalarp(point) - normalOffset));
             } else if (quadSurface) {
-                cv::Vec3f ptr(0, 0, 0);
-                const float dist = quadSurface->pointTo(
-                    ptr, point, std::max(tolerance, 0.0f), 100, patchIndex);
+                const float dist = displayedQuadSurfaceDistance(
+                    quadSurface, point, std::max(tolerance, 0.0f), normalOffset, patchIndex);
                 opacity = opacityForDistance(dist);
             }
             if (opacity <= 0.0f) {
@@ -836,6 +884,9 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
     const cv::Vec3f planeOrigin = plane ? plane->origin() : cv::Vec3f{};
     const cv::Vec3f planeBasisX = plane ? plane->basisX() : cv::Vec3f{};
     const cv::Vec3f planeBasisY = plane ? plane->basisY() : cv::Vec3f{};
+    // The viewer displays the surface shifted along its normal by this
+    // amount; measure point distances from that displayed surface.
+    const float normalOffset = viewer->normalOffset();
 
     auto sameVector = [](const cv::Vec3f& a, const cv::Vec3f& b) {
         return a == b;
@@ -847,6 +898,7 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
                               cached.surface == surface &&
                               cached.surfaceGeneration == surfaceGeneration &&
                               cached.tolerance == tolerance &&
+                              cached.normalOffset == normalOffset &&
                               sameVector(cached.planeOrigin, planeOrigin) &&
                               sameVector(cached.planeBasisX, planeBasisX) &&
                               sameVector(cached.planeBasisY, planeBasisY);
@@ -858,6 +910,7 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
         entry.surface = surface;
         entry.surfaceGeneration = surfaceGeneration;
         entry.tolerance = tolerance;
+        entry.normalOffset = normalOffset;
         entry.planeOrigin = planeOrigin;
         entry.planeBasisX = planeBasisX;
         entry.planeBasisY = planeBasisY;
@@ -887,7 +940,7 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
             bool valid = true;
             bool lineEndpointOnly = false;
             if (plane) {
-                distance = std::fabs(plane->pointDist(point));
+                distance = std::fabs(plane->scalarp(point) - normalOffset);
                 const cv::Vec3f projected = plane->project(point, 1.0f, 1.0f);
                 surfacePoint = {projected[0], projected[1]};
             } else {
@@ -902,11 +955,14 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
                 } else {
                     SurfacePatchIndex::PointQuery query;
                     query.worldPoint = point;
-                    query.tolerance = std::max(tolerance, 1.0e-3f);
+                    query.tolerance =
+                        std::max(tolerance + std::fabs(normalOffset), 1.0e-3f);
                     query.surfaces.only = indexedQuad;
                     if (const auto hit = patchIndex->locate(query)) {
                         pointer = hit->ptr;
-                        distance = hit->distance;
+                        distance = normalOffset == 0.0f
+                            ? hit->distance
+                            : offsetSurfaceDistance(quad, pointer, point, normalOffset);
                     } else {
                         valid = false;
                     }

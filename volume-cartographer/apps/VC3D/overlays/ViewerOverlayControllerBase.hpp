@@ -470,6 +470,7 @@ private:
         Surface* surface{nullptr};
         std::uint64_t surfaceGeneration{0};
         float tolerance{0.0f};
+        float normalOffset{0.0f};
         cv::Vec3f planeOrigin{0.0f, 0.0f, 0.0f};
         cv::Vec3f planeBasisX{0.0f, 0.0f, 0.0f};
         cv::Vec3f planeBasisY{0.0f, 0.0f, 0.0f};

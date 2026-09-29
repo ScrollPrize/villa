@@ -4097,6 +4097,9 @@ void CChunkedVolumeViewer::setZOffset(float value)
     }
     _zOff = value;
     notifyNormalOffsetChanged();
+    // Overlays filtered by distance to the displayed surface (fibers, points)
+    // depend on the offset.
+    emit overlaysUpdated();
 }
 
 // Plane viewers draw a dashed copy of the segmentation intersection displaced
