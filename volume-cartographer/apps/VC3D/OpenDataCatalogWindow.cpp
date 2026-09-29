@@ -646,7 +646,7 @@ void OpenDataCatalogWindow::createSelectedProject()
     validate();
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
     connect(buttons, &QDialogButtonBox::accepted, &dialog, [&]() {
-        if (!path->text().trimmed().endsWith(".volpkg.json"))
+        if (!path->text().trimmed().endsWith(".volpkg.json", Qt::CaseInsensitive))
             path->setText(path->text().trimmed() + ".volpkg.json");
         if (QFileInfo::exists(path->text()) && QMessageBox::question(&dialog, tr("Overwrite Project File"),
                 tr("A project file already exists at:\n%1\n\nOverwrite this file on disk?").arg(path->text()), QMessageBox::Yes | QMessageBox::No,

@@ -125,6 +125,7 @@ private slots:
                 QVERIFY(selection.segmentIds.has_value());
                 QVERIFY(selection.segmentIds->empty());
                 QCOMPARE(project.name, std::string("my-selection"));
+                QCOMPARE(project.path.string(), temp.filePath("my-selection.VOLPKG.JSON").toStdString());
                 vc::project::LoadOptions options;
                 options.deferResolution = true;
                 auto pkg = VolumePkg::newDetached(options);
@@ -140,7 +141,7 @@ private slots:
                 QVERIFY(dialog);
                 auto* path = dialog->findChild<QLineEdit*>("catalogProjectPath");
                 QVERIFY(path);
-                path->setText(temp.filePath("my-selection.volpkg.json"));
+                path->setText(temp.filePath("my-selection.VOLPKG.JSON"));
                 auto trees = dialog->findChildren<QTreeWidget*>();
                 for (auto* tree : trees) {
                     if (tree->topLevelItem(0)->text(0) == "Source volumes")
