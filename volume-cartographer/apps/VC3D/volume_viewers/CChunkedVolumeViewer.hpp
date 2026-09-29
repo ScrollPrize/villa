@@ -258,6 +258,7 @@ public:
     // DISPLAYED frame was rendered from the current surface geometry (stale
     // in-flight frames adopt with an older epoch).
     std::uint64_t surfaceGeometryEpoch() const { return _surfaceGeometryEpoch; }
+    bool hasDisplayedRenderFrame() const { return _displayedRenderJob.has_value(); }
     std::uint64_t displayedSurfaceGeometryEpoch() const
     {
         return _displayedRenderJob ? _displayedRenderJob->surfaceGeometryEpoch : 0;

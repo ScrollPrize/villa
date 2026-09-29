@@ -135,6 +135,7 @@ struct LineAnnotationController::LineAnnotationSession {
     double workingToBaseScale = 1.0;
     std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> normalSampler;
+    bool inspectionFrameOnly = false;
     std::shared_ptr<vc::lasagna::LasagnaDataset> fiberInferenceDataset;
     std::shared_ptr<vc::fiber_tracer::FiberPredictionField> fiberPredictionField;
     std::string traceNormalDatasetLocation;
@@ -287,6 +288,7 @@ struct LineAnnotationController::LineAnnotationSession {
     LineAnnotationController::SessionOptimizationState optimizationStateBeforeTask =
         LineAnnotationController::SessionOptimizationState::Unoptimized;
     std::optional<std::pair<double, double>> initialStripLinePositionRange;
+    bool initialFitWholeLine = false;
     bool disableInitialGeneratedHoverFollow = false;
     std::function<void(LineAnnotationSession&)> optimizationSucceededCallback;
     bool fiberMetricsMatchStoredFiber = false;
@@ -2523,7 +2525,7 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     pushFiberUiState(_panes.back());
     // A pane opened after the umbilicus was resolved has to be told too; the
     // notice describes the package, not this pane's fiber.
-    dialog->setUmbilicusNotice(_umbilicusNotice);
+    publishUmbilicusNotice();
     connect(dialog, &LineAnnotationDialog::volumeOverlayToggleRequested,
             this, &LineAnnotationController::volumeOverlayToggleRequested);
     connect(dialog, &LineAnnotationDialog::fiberWidthChanged, this, [this, surfaceName](double width) {
@@ -3010,6 +3012,27 @@ void LineAnnotationController::openFiber(uint64_t fiberId)
     openFiberWithControlPoint(fiberId, std::nullopt, std::nullopt);
 }
 
+LineAnnotationDialog* LineAnnotationController::openCollectionFiber(uint64_t fiberId, QString* error)
+{
+    // The caller reports failures in its own status area.
+    QScopedValueRollback<bool> quiet(_errorDialogsSuppressed, true);
+    QScopedValueRollback<QString> previousError(_lastSuppressedError, QString{});
+    const QPointer<LineAnnotationDialog> previous = mostRecentLineAnnotationDialog();
+    openFiberWithControlPoint(fiberId, std::nullopt, std::nullopt, std::nullopt, true);
+    auto* dialog = mostRecentLineAnnotationDialog();
+    if (!_lastSuppressedError.isEmpty() || !dialog || dialog == previous ||
+        _panes.empty() || !_panes.back().session ||
+        _panes.back().session->fiberId != fiberId ||
+        _panes.back().session->generatedLineSurfaceName.empty()) {
+        if (error)
+            *error = _lastSuppressedError.isEmpty()
+                ? tr("Could not open the flattened fiber. The previous annotation may still be busy.")
+                : _lastSuppressedError;
+        return nullptr;
+    }
+    return dialog;
+}
+
 void LineAnnotationController::openFiberAtControlPoint(uint64_t fiberId, int controlPointIndex)
 {
     openFiberWithControlPoint(fiberId, controlPointIndex, std::nullopt);
@@ -3033,7 +3056,8 @@ void LineAnnotationController::openFiberSpan(uint64_t fiberId,
 void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
                                                          std::optional<int> controlPointIndex,
                                                          std::optional<int> linePointIndex,
-                                                         std::optional<std::pair<int, int>> spanControlIndices)
+                                                         std::optional<std::pair<int, int>> spanControlIndices,
+                                                         bool collectionInspection)
 {
     // The new session is built from _fibers; a debounced autosave for THIS
     // fiber's still-open session may not have landed there yet, and the
@@ -3096,6 +3120,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     session->disableInitialGeneratedHoverFollow =
         controlPointIndex.has_value() || linePointIndex.has_value() ||
         spanControlIndices.has_value();
+    session->initialFitWholeLine = collectionInspection;
 
     if (seedOnlyPoint) {
         const cv::Vec3d seedPoint = *seedOnlyPoint;
@@ -3144,12 +3169,15 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
         ? std::optional<cv::Vec3d>{}
         : std::optional<cv::Vec3d>{it->controlPoints[it->controlPoints.size() / 2]};
 
-    if (!ensureDatasetForSession(*session)) {
+    if (!ensureDatasetForSession(*session, !collectionInspection)) {
         return;
     }
 
     try {
-        session->optimizedLine = lineModelFromPoints(it->linePoints, session->normalSampler.get());
+        session->inspectionFrameOnly = !session->normalSampler;
+        session->optimizedLine = session->inspectionFrameOnly
+            ? vc::lasagna::lineModelForInspection(it->linePoints)
+            : lineModelFromPoints(it->linePoints, session->normalSampler.get());
         ++session->lineRevision;
         session->fiberMetricsMatchStoredFiber = true;
     } catch (const std::exception& ex) {
@@ -3649,8 +3677,11 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
                                                     double scale,
                                                     QString* errorMessage,
                                                     int* importedCount,
-                                                    int* skippedCount)
+                                                    int* skippedCount,
+                                                    std::vector<uint64_t>* importedIds)
 {
+    if (importedIds)
+        importedIds->clear();
     if (importedCount) {
         *importedCount = 0;
     }
@@ -3805,6 +3836,10 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
         }
 
         loadFibersForCurrentPackage();
+        if (importedIds)
+            for (const auto& fiber : importedFibers)
+                if (const auto id = fiberIdForFilePath(dir / fiber.fileName))
+                    importedIds->push_back(id);
         if (importedCount) {
             *importedCount = static_cast<int>(importedFibers.size());
         }
@@ -10143,7 +10178,7 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
     }
 }
 
-bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& session)
+bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& session, bool required)
 {
     const bool headless = session.suppressErrorDialogs || _errorDialogsSuppressed;
     if (!_state || !_state->vpkg()) {
@@ -10198,6 +10233,10 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         return vc::lasagna::LasagnaDataset::openLocation(resolved, options);
     };
 
+    // Without a dataset the session falls back to a display-only frame
+    // (lineModelForInspection); tracing and optimization still require one.
+    if (selected.empty() && !required)
+        return true;
     if (selected.empty()) {
         const fs::path startDir = vpkg->path().empty()
             ? fs::path{}
@@ -12535,7 +12574,7 @@ LineAnnotationController::generatedSpanAlignmentMetricsForSession(
     const LineAnnotationSession& session) const
 {
     std::vector<vc3d::line_annotation::GeneratedSpanAlignmentMetric> metrics;
-    if (session.controlPoints.size() < 2) {
+    if (session.inspectionFrameOnly || session.controlPoints.size() < 2) {
         return metrics;
     }
 
@@ -12819,7 +12858,12 @@ void LineAnnotationController::publishUmbilicusNotice()
     // than of any one fiber. Idempotent: the dialog ignores an unchanged notice.
     for (const auto& pane : _panes) {
         if (pane.dialog) {
-            pane.dialog->setUmbilicusNotice(_umbilicusNotice);
+            QString notice = _umbilicusNotice;
+            if (pane.session && pane.session->inspectionFrameOnly) {
+                if (!notice.isEmpty()) notice += "\n";
+                notice += tr("No Lasagna normals: cut orientation follows the curve, not the sheet.");
+            }
+            pane.dialog->setUmbilicusNotice(notice);
         }
     }
 }
@@ -13321,6 +13365,10 @@ vc::fiber_tracer::FiberDisplayField LineAnnotationController::displayFieldForSes
 
 bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& session)
 {
+    session.inspectionFrameOnly = std::any_of(
+        session.optimizedLine.points.begin(), session.optimizedLine.points.end(),
+        [](const auto& point) { return point.sampledNormal.reason == "display frame only"; });
+    publishUmbilicusNotice();
     if (!_state) {
         session.error = "No active application state.";
         showError(tr("Could not create line annotation views: no active application state."),
@@ -13557,6 +13605,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         session.initialStripLinePositionRange
             ? session.initialStripLinePositionRange
             : controlLinePositionRange;
+    generatedViews.initialFitWholeLine = session.initialFitWholeLine;
     generatedViews.spanAlignmentMetrics =
         generatedSpanAlignmentMetricsForSession(session);
 
@@ -13633,7 +13682,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
                   session.suppressErrorDialogs);
         return false;
     }
-    if (session.fiberId != 0 &&
+    if (!session.inspectionFrameOnly && session.fiberId != 0 &&
         session.fiberMetricsMatchStoredFiber &&
         !hasCachedAlignmentForFiber(session.fiberId) &&
         !isAlignmentPendingForFiber(session.fiberId)) {

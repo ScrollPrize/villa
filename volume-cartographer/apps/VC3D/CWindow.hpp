@@ -123,6 +123,7 @@ class SegmentationCommandHandler;
 class ViewerTransformsPanel;
 class LineAnnotationController;
 class FiberOverlayController;
+class FiberCollectionController;
 class WrapAnnotationWidget;
 class AtlasControlPointsDock;
 class StatusDockPanelHost;
@@ -142,6 +143,7 @@ class CWindow : public QMainWindow
     friend class AgentBridgeServer;
 
 public:
+    void openFiberCollection(const QString& path);
     // Starts an atlas fiber-intersection search without opening a dialog.
     // Progress and completion use the atlasSearch signals below.
     // Distinct name (not an overload): the slot is used as a member-function
@@ -493,6 +495,7 @@ private:
     std::unique_ptr<AtlasOverlayController> _atlasOverlay;
     std::unique_ptr<AtlasControlPointsOverlayController> _atlasControlOverlay;
     std::unique_ptr<FiberOverlayController> _fiberOverlay;
+    std::unique_ptr<FiberCollectionController> _fiberCollection;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<VolumeAttachmentController> _volumeAttachmentController;
