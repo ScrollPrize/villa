@@ -11,6 +11,7 @@
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
+#include "vc/fiber_tracer/FiberDisplay.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
@@ -26,6 +27,320 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+TEST_CASE("Clearing CP corrections leaves other controls and span metadata intact")
+{
+    using namespace vc3d::line_annotation;
+    std::vector<LineControlPoint> controls(3);
+    for (auto& cp : controls) {
+        cp.direction = cv::Vec3d(1,0,0);
+        cp.displayNormal = cv::Vec3d(0,1,0);
+        cp.displayNormalSource = "manual";
+        cp.segmentToNext.emplace();
+        cp.segmentToNext->interpGoal = SegmentInterpolationGoal::Trace;
+    }
+    clearControlPointCorrections(controls[1]);
+    CHECK_FALSE(controls[1].direction);
+    CHECK_FALSE(controls[1].displayNormal);
+    CHECK(controls[1].displayNormalSource == "unknown");
+    CHECK(controls[0].direction.has_value());
+    CHECK(controls[2].displayNormal.has_value());
+    CHECK(controls[1].segmentToNext->interpGoal == SegmentInterpolationGoal::Trace);
+    for (auto& cp : controls) clearControlPointCorrections(cp);
+    for (const auto& cp : controls) {
+        CHECK_FALSE(cp.direction);
+        CHECK_FALSE(cp.displayNormal);
+        CHECK(cp.segmentToNext->interpGoal == SegmentInterpolationGoal::Trace);
+    }
+}
+
+TEST_CASE("Direction handles use a valid local frame even on two-column strips")
+{
+    cv::Mat_<cv::Vec3f> points(7,2);
+    for (int y=0;y<7;++y)
+        for (int x=0;x<2;++x) points(y,x)={float(x*10),float(y-3),0};
+    QuadSurface surface(points,{1,1});
+    const auto frame=vc3d::line_annotation::generatedStripFrame(
+        &surface,surface.gridToSurface({0.5,3}));
+    REQUIRE(frame);
+    CHECK(cv::norm(frame->along-cv::Vec3d(1,0,0))<1e-6);
+    CHECK(cv::norm(frame->across-cv::Vec3d(0,1,0))<1e-6);
+    CHECK(cv::norm(frame->normal-cv::Vec3d(0,0,1))<1e-6);
+    CHECK_FALSE(vc3d::line_annotation::generatedStripFrame(nullptr,{0,0}));
+}
+
+TEST_CASE("Arclength Hermite preserves samples and has continuous analytic tangents")
+{
+    const std::vector<cv::Vec3d> p{{0,0,0},{10,0,0},{10,20,0},{20,30,0}};
+    for (size_t i=0;i<p.size();++i)
+        CHECK(cv::norm(vc::geometry::sampleLine(p,double(i)).value-p[i]) < 1e-12);
+    const auto mid=vc::geometry::sampleLine(p,0.5);
+    // Python _arc_derivatives: d0=(1,0,0), d1=(1/3,2/3,0).
+    CHECK(mid.value[0] == doctest::Approx(35.0/6));
+    CHECK(mid.value[1] == doctest::Approx(-5.0/6));
+    CHECK(cv::norm(vc::geometry::sampleLine(p,1-1e-7).derivative-
+                   vc::geometry::sampleLine(p,1+1e-7).derivative) < 1e-6);
+    const std::vector<cv::Vec3d> duplicates{{0,0,0},{10,0,0},{10,0,0},{20,0,0}};
+    CHECK(vc::geometry::sampleLine(duplicates,1).derivative[0] == doctest::Approx(1));
+}
+
+TEST_CASE("CP displacement field clamps outer derivatives without changing control displacements")
+{
+    const std::vector<double> arcs{0,10,30};
+    const std::vector<cv::Vec3d> values{{0,0,0},{0,5,0},{0,0,0}};
+    const std::vector<bool> flat{true,false,true};
+    for (size_t i=0;i<arcs.size();++i)
+        CHECK(cv::norm(vc::geometry::sampleField(arcs,values,arcs[i],flat)-values[i]) < 1e-12);
+    CHECK(cv::norm(vc::geometry::sampleField(arcs,values,1e-4,flat))/1e-4 < 1e-4);
+    CHECK(cv::norm(vc::geometry::sampleField(arcs,values,30-1e-4,flat))/1e-4 < 1e-4);
+    CHECK(vc::geometry::sampleField(arcs,values,-1,flat) == cv::Vec3d(0,0,0));
+    CHECK(vc::geometry::sampleField(arcs,values,31,flat) == cv::Vec3d(0,0,0));
+}
+
+TEST_CASE("Display normal provenance survives storage replacement and reversal")
+{
+    using namespace vc3d::line_annotation;
+    const nlohmann::json input{{"position",{1,2,3}}, {"display_normal",{0,1,0}},
+                               {"display_normal_source","interpolated"}};
+    const auto stored=storedControlPointFromJson(input,3);
+    CHECK(stored.displayNormalSource == "interpolated");
+    CHECK(storedControlPointToJson(stored).at("display_normal_source") == "interpolated");
+    CHECK(reversedStoredControlPoints({stored}).front().displayNormalSource == "interpolated");
+    LineControlPoint cp(0,{1,2,3},true,0);
+    cp.displayNormal=stored.displayNormal;
+    cp.displayNormalSource=stored.displayNormalSource;
+    const auto replacement=collapseControlPointsAtClick({cp},{0},0,{2,2,3});
+    CHECK(replacement.controlPoints.front().displayNormalSource == "interpolated");
+    auto legacy=input; legacy.erase("display_normal_source");
+    CHECK(storedControlPointFromJson(legacy,3).displayNormalSource == "unknown");
+    auto manual=input; manual["display_normal_source"]="manual";
+    CHECK(storedControlPointFromJson(manual,3).displayNormalSource == "manual");
+    manual.erase("display_normal");
+    CHECK_THROWS(storedControlPointFromJson(manual,3));
+}
+
+TEST_CASE("Cross section center drag translates without changing width or orientation")
+{
+    const auto result = vc::fiber_tracer::dragFiberWidth(
+        {10, 20, 30}, {0, 1, 0}, {1, 0, 0}, {0, 0, 1}, 8, 0, {3, -2, 7});
+    REQUIRE(result);
+    CHECK(cv::norm(result->center - cv::Vec3d(13, 18, 30)) < 1e-9);
+    CHECK(cv::norm(result->normal - cv::Vec3d(0, 1, 0)) < 1e-9);
+    CHECK(result->width == 8);
+    CHECK(vc::fiber_tracer::dragFiberWidth(
+        {0, 0, 0}, {0, 1, 0}, {1, 0, 0}, {0, 0, 1}, 0, 0, {1, 2, 0}).has_value());
+}
+
+TEST_CASE("Cross section edge drags preserve width and put the selected edge at the target")
+{
+    using namespace vc::fiber_tracer;
+    for (const int handle : {-1, 1}) {
+        for (const double scale : {1.0, 0.25}) {
+            // Non-axis-aligned cross plane, like a rotated annotation view.
+            const auto plane = *displayUnit({1, 2, 3});
+            const auto up = *projectDisplayNormal({0, 1, 0}, plane);
+            const auto axis = up.cross(plane);
+            const cv::Vec3d center = cv::Vec3d(17, 29, 31) * scale;
+            const double width = 8 * scale;
+            const cv::Vec3d delta = (axis * 3 + up * 4) * scale;
+            const auto result = dragFiberWidth(center, up, axis, plane, width, handle, delta);
+            REQUIRE(result);
+            const auto originalOpposite = center - axis * (handle * width / 2);
+            const auto target = center + axis * (handle * width / 2) + delta;
+            CHECK(cv::norm(result->edgeAxis * handle - *displayUnit(target - originalOpposite)) < 1e-9);
+            CHECK(cv::norm(result->center - (target - result->edgeAxis * (handle * width / 2))) < 1e-9);
+            CHECK(cv::norm((result->center + result->edgeAxis * (handle * result->width / 2)) -
+                           (center + axis * (handle * width / 2) + delta)) < 1e-9);
+            CHECK(std::abs(result->normal.dot(result->edgeAxis)) < 1e-9);
+            CHECK(cv::norm(result->normal.cross(plane) - result->edgeAxis) < 1e-9);
+            CHECK(result->width == width);
+            // Both tolerance pairs follow the dragged frame without resizing
+            // the nominal width, including fibers with a custom gap.
+            for (const double gap : {0.2, 0.35}) {
+                const auto offsets = fiberWidthEdgeOffsets(result->width, gap);
+                for (int side : {-1, 1}) {
+                    const size_t first = side < 0 ? 0 : 2;
+                    const auto innerOuterMidpoint = result->center + result->edgeAxis *
+                        ((offsets[first] + offsets[first + 1]) / 2);
+                    CHECK(cv::norm(innerOuterMidpoint -
+                        (result->center + result->edgeAxis * (side * width / 2))) < 1e-9);
+                    CHECK(offsets[first + 1] - offsets[first] == doctest::Approx(gap * width));
+                }
+            }
+        }
+    }
+    CHECK_FALSE(dragFiberWidth({0, 0, 0}, {0, 1, 0}, {1, 0, 0}, {0, 0, 1}, 8, 1, {-8, 0, 0}));
+    CHECK_FALSE(dragFiberWidth({0, 0, 0}, {0, 1, 0}, {1, 0, 0}, {0, 0, 1}, 0, 1, {1, 0, 0}));
+}
+
+TEST_CASE("Successive cross section drags build on the preview in the unchanged plane")
+{
+    using namespace vc::fiber_tracer;
+    const cv::Vec3d plane(0, 0, 1);
+    const auto first = dragFiberWidth({0, 0, 0}, {0, 1, 0}, {1, 0, 0}, plane, 8, 1, {0, 4, 0});
+    REQUIRE(first);
+    // A center stroke must retain the orientation from the preceding edge stroke.
+    const auto second = dragFiberWidth(first->center, first->normal, first->edgeAxis,
+        plane, first->width, 0, {3, -2, 0});
+    REQUIRE(second);
+    CHECK(cv::norm(second->normal - first->normal) < 1e-9);
+    CHECK(cv::norm(second->center - (first->center + cv::Vec3d(3, -2, 0))) < 1e-9);
+    const auto third = dragFiberWidth(second->center, second->normal, second->edgeAxis,
+        plane, second->width, -1, {-2, 1, 0});
+    REQUIRE(third);
+    CHECK(cv::norm(third->center - third->edgeAxis * 4 -
+        (second->center - second->edgeAxis * 4 + cv::Vec3d(-2, 1, 0))) < 1e-9);
+    CHECK(third->width == 8);
+    CHECK(cv::norm(third->normal.cross(plane) - third->edgeAxis) < 1e-9);
+}
+
+TEST_CASE("New control points inherit the existing interpolated display correction")
+{
+    using namespace vc::fiber_tracer;
+    using namespace vc3d::line_annotation;
+    std::vector<cv::Vec3f> points, normals;
+    for (int i = 0; i <= 30; ++i) {
+        points.emplace_back(float(i * i), 0, 0);
+        normals.emplace_back(0, 0, 1);
+    }
+    const std::vector<double> positions{0, 10, 20, 30};
+    const std::vector<double> arcs{0, 100, 400, 900};
+    const std::vector<std::optional<cv::Vec3d>> manual{
+        cv::Vec3d(0, -1, 0), std::nullopt, std::nullopt, std::nullopt};
+    const auto field = fiberDisplayField(points, normals, positions, manual);
+    for (double position : {5.0, 5.5}) {
+        const int i = int(position);
+        const double arc = i * i + (position - i) * ((i + 1) * (i + 1) - i * i);
+        const auto inherited = inheritedFiberDisplayNormal(field, arcs, arc, position);
+        REQUIRE(inherited);
+        CHECK(cv::norm(*inherited - *displayUnit(displayVectorAt(field.normals, position))) < 1e-9);
+        std::vector<LineControlPoint> controls(positions.size());
+        for (size_t k = 0; k < positions.size(); ++k) {
+            controls[k].linePosition = positions[k];
+            controls[k].volumePoint = displayVectorAt(points, positions[k]);
+            controls[k].displayNormal = manual[k];
+        }
+        auto inserted = collapseControlPointsAtClick(controls, {}, position, displayVectorAt(points, position));
+        inserted.controlPoints[inserted.replacementIndex].displayNormal = inherited;
+        auto& created = inserted.controlPoints[inserted.replacementIndex];
+        created.displayNormalSource = "interpolated";
+        created.direction = editControlDirection({1,0,0}, {0,0,1}, {1,0.2,0});
+        REQUIRE(created.direction);
+        StoredControlPoint stored(created.volumePoint);
+        stored.displayNormal = created.displayNormal;
+        stored.displayNormalSource = created.displayNormalSource;
+        stored.direction = created.direction;
+        const auto restored = storedControlPointFromJson(storedControlPointToJson(stored), 3);
+        REQUIRE(restored.direction);
+        REQUIRE(restored.displayNormal);
+        CHECK(cv::norm(*restored.direction - *created.direction) < 1e-9);
+        CHECK(cv::norm(*restored.displayNormal - *inherited) < 1e-9);
+        CHECK(restored.displayNormalSource == "interpolated");
+        std::vector<double> newPositions;
+        std::vector<std::optional<cv::Vec3d>> newNormals;
+        for (const auto& cp : inserted.controlPoints) {
+            newPositions.push_back(cp.linePosition);
+            newNormals.push_back(cp.displayNormal);
+        }
+        const auto updated = fiberDisplayField(points, normals, newPositions, newNormals);
+        CHECK(updated.controlOffsets[inserted.replacementIndex] == doctest::Approx(
+            *displayNormalOffset({0, 0, 1}, *inherited, {1, 0, 0})));
+        CHECK(std::abs(updated.controlOffsets[inserted.replacementIndex]) > 0.1);
+    }
+    // Uncorrected regions should remain unset and follow future Lasagna updates.
+    CHECK_FALSE(inheritedFiberDisplayNormal(field, arcs, 225, 15));
+    const auto baselineOnly = fiberDisplayField(points, normals, positions,
+        std::vector<std::optional<cv::Vec3d>>(positions.size()));
+    CHECK_FALSE(inheritedFiberDisplayNormal(baselineOnly, arcs, 25, 5));
+}
+
+TEST_CASE("Fiber display normals use the cut tangent and preserve unset controls")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<cv::Vec3f> points, normals;
+    for (int i = 0; i <= 20; ++i) {
+        points.emplace_back(float(i), 0, 0);
+        normals.emplace_back(0, 0, 1);
+    }
+    const auto original = normals;
+    const auto field = fiberDisplayField(points, normals, {0, 10, 20},
+        {std::nullopt, cv::Vec3d(0, -1, 0), std::nullopt});
+    CHECK(field.resetControls.empty());
+    CHECK(field.controlOffsets[1] == doctest::Approx(std::acos(-1.0) / 2));
+    CHECK(cv::norm(field.normals[0] - normals[0]) < 1e-6);
+    CHECK(cv::norm(field.normals[20] - normals[20]) < 1e-6);
+    CHECK(cv::norm(field.normals[10] - cv::Vec3f(0, -1, 0)) < 1e-6);
+    CHECK(normals == original);
+    const auto reset = fiberDisplayField(points, normals, {10}, {cv::Vec3d(1, 0, 0)});
+    REQUIRE(reset.resetControls.size() == 1);
+    CHECK(reset.resetControls[0] == 0);
+    points[12][1] = 5;
+    const auto tangent = displayTangentAt(points, 8.0);
+    CHECK(cv::norm(tangent - cv::Vec3d(1, 0, 0)) < 1e-6); // Regular central chord.
+    const auto moved = fiberDisplayField(points, normals, {8}, {cv::Vec3d(0, -1, 0)});
+    CHECK(cv::norm(moved.controlTangents[0] - *displayUnit(tangent)) < 1e-6);
+    const double pi = std::acos(-1.0);
+    CHECK(interpolateDisplayOffset({0, 10}, {170 * pi / 180, -170 * pi / 180}, 5)
+        == doctest::Approx(pi));
+    auto scaled = points;
+    for (auto& point : scaled) point *= 4;
+    const auto scaledField = fiberDisplayField(scaled, normals, {8}, {cv::Vec3d(0, -1, 0)});
+    CHECK(scaledField.controlOffsets[0] == doctest::Approx(moved.controlOffsets[0]));
+}
+
+TEST_CASE("Fiber display metadata validates and survives CP roundtrip and reversal")
+{
+    using namespace vc::fiber_tracer;
+    CHECK(fiberWidthFromJson(nlohmann::json::object()) == 0);
+    CHECK(fiberWidthFromJson({{"width", 12.5}}) == 12.5);
+    CHECK(fiberWidthGapFromJson(nlohmann::json::object()) == doctest::Approx(0.2));
+    CHECK(fiberWidthGapFromJson({{"width_gap_fraction", 0.35}}) == doctest::Approx(0.35));
+    CHECK(fiberWidthGapFromJson({{"width_gap_fraction", 0}}) == 0);
+    CHECK_THROWS(fiberWidthGapFromJson({{"width_gap_fraction", -0.1}}));
+    CHECK_THROWS(fiberWidthGapFromJson({{"width_gap_fraction", 1.1}}));
+    CHECK_THROWS(fiberWidthGapFromJson({{"width_gap_fraction", "20%"}}));
+    CHECK_THROWS(fiberWidthFromJson({{"width", -1}}));
+    CHECK_THROWS(displayNormalFromJson({{"display_normal", {0, 0, 0}}}));
+    vc3d::line_annotation::StoredControlPoint cp;
+    cp.displayNormal = cv::Vec3d(0, 1, 0);
+    const auto json = vc3d::line_annotation::storedControlPointToJson(cp);
+    const auto restored = vc3d::line_annotation::storedControlPointFromJson(json, 3);
+    REQUIRE(restored.displayNormal.has_value());
+    CHECK(cv::norm(*restored.displayNormal - *cp.displayNormal) < 1e-6);
+    const auto reversed = vc3d::line_annotation::reversedStoredControlPoints({cp, cp});
+    REQUIRE(reversed[0].displayNormal.has_value());
+    CHECK(cv::norm(*reversed[0].displayNormal - *cp.displayNormal) < 1e-6);
+    vc3d::line_annotation::LineControlPoint live;
+    live.displayNormal = cp.displayNormal;
+    const auto optimized = vc3d::line_annotation::mergeOptimizerControlPoints(
+        vc3d::line_annotation::optimizerControlPoints({live}), {live});
+    REQUIRE(optimized[0].displayNormal.has_value());
+    CHECK(cv::norm(*optimized[0].displayNormal - *cp.displayNormal) < 1e-6);
+    const auto collapsed = vc3d::line_annotation::collapseControlPointsAtClick(
+        {live}, {0}, 0.0, cv::Vec3d(1, 2, 3));
+    REQUIRE(collapsed.controlPoints[0].displayNormal.has_value());
+    CHECK(cv::norm(*collapsed.controlPoints[0].displayNormal - *cp.displayNormal) < 1e-6);
+}
+
+TEST_CASE("Fiber width tolerance guides bracket the full width by twenty percent")
+{
+    const auto offsets = vc::fiber_tracer::fiberWidthEdgeOffsets(40);
+    CHECK(offsets[0] == doctest::Approx(-24));
+    CHECK(offsets[1] == doctest::Approx(-16));
+    CHECK(offsets[2] == doctest::Approx(16));
+    CHECK(offsets[3] == doctest::Approx(24));
+    const auto scaled = vc::fiber_tracer::fiberWidthEdgeOffsets(10);
+    const auto unset = vc::fiber_tracer::fiberWidthEdgeOffsets(0);
+    const auto custom = vc::fiber_tracer::fiberWidthEdgeOffsets(40, 0.5);
+    CHECK(custom[0] == doctest::Approx(-30));
+    CHECK(custom[1] == doctest::Approx(-10));
+    CHECK(custom[2] == doctest::Approx(10));
+    CHECK(custom[3] == doctest::Approx(30));
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        CHECK(scaled[i] * 4 == doctest::Approx(offsets[i]));
+        CHECK(unset[i] == 0);
+    }
+}
 
 namespace {
 
@@ -327,6 +642,243 @@ TEST_CASE("line annotation generated runtime surfaces register and clean up")
     CHECK(state.surface("line_annotation_slice_1") == nullptr);
     for (const auto& name : generatedNames) {
         CHECK(state.surface(name) == nullptr);
+    }
+}
+
+TEST_CASE("Display normal override rotates both ribbons without changing model normals")
+{
+    const auto model = lineModel();
+    vc::lasagna::LineViewConfig config;
+    const auto baseline = vc::lasagna::buildLineViewSurfaces(model, config);
+    config.orientedPointNormals.assign(model.points.size(), cv::Vec3f(0, 0, 1));
+    config.displayPointNormals.assign(model.points.size(), cv::Vec3f(0, 1, 0));
+    const auto corrected = vc::lasagna::buildLineViewSurfaces(model, config);
+    const auto* top = corrected.lineSurface->rawPointsPtr();
+    const auto* side = corrected.lineSideSlice->rawPointsPtr();
+    REQUIRE(top != nullptr);
+    REQUIRE(side != nullptr);
+    const auto topAcross = (*top)(top->rows - 1, 0) - (*top)(0, 0);
+    const auto sideAcross = (*side)(side->rows - 1, 0) - (*side)(0, 0);
+    CHECK(std::abs(topAcross[2]) > 1);
+    CHECK(std::abs(topAcross[1]) < 1e-5);
+    CHECK(std::abs(sideAcross[1]) > 1);
+    CHECK(std::abs(sideAcross[2]) < 1e-5);
+    CHECK(cv::norm(corrected.lineUpVectors.front() - cv::Vec3f(0, 1, 0)) < 1e-5);
+    const auto after = vc::lasagna::buildLineViewSurfaces(model);
+    CHECK(cv::norm(*baseline.lineSurface->rawPointsPtr(), *after.lineSurface->rawPointsPtr()) == 0);
+}
+
+TEST_CASE("CP direction editing preserves the unedited component and round trips")
+{
+    using namespace vc::fiber_tracer;
+    const auto axis=*displayUnit({1,0,0.5});
+    const auto edited=editControlDirection(axis,{0,0,1},{1,1,99});
+    REQUIRE(edited);
+    CHECK((*edited)[2] == doctest::Approx(axis[2]));
+    CHECK((*edited)[0] == doctest::Approx((*edited)[1]));
+    CHECK(cv::norm(*edited) == doctest::Approx(1));
+    const auto reversed=editControlDirection(-axis,{0,0,1},{-1,-1,0});
+    REQUIRE(reversed);
+    CHECK(cv::norm(*reversed+*edited)<1e-9);
+    const auto oppositeDrag=editControlDirection(axis,{0,0,1},{-1,-1,0},cv::Vec3d(1,0,0));
+    REQUIRE(oppositeDrag);
+    CHECK(cv::norm(*oppositeDrag-*edited)<1e-9);
+    CHECK_FALSE(editControlDirection(axis,{0,0,1},{0,0,1}));
+    vc3d::line_annotation::StoredControlPoint cp;
+    cp.direction=*edited;
+    auto json=vc3d::line_annotation::storedControlPointToJson(cp);
+    const auto loaded=vc3d::line_annotation::storedControlPointFromJson(json,3);
+    REQUIRE(loaded.direction);
+    CHECK(cv::norm(*loaded.direction-*edited)<1e-9);
+    const auto reversedControls=vc3d::line_annotation::reversedStoredControlPoints({cp});
+    REQUIRE(reversedControls.front().direction);
+    CHECK(cv::norm(*reversedControls.front().direction+*edited)<1e-9);
+    json["direction"]={0,0,0};
+    CHECK_THROWS(vc3d::line_annotation::storedControlPointFromJson(json,3));
+}
+
+TEST_CASE("Spline uses signed annotated interior tangents")
+{
+    vc::lasagna::LineSplineRequest request;
+    request.controlPoints={{0,0,0},{10,0,0},{20,0,0}};
+    request.sampleSpacing=0.01;
+    request.controlDirections={std::nullopt,cv::Vec3d(1,0.5,0),std::nullopt};
+    const auto result=vc::lasagna::interpolateLineControlPoints(request);
+    const int k=result.controlPointIndices[1];
+    const auto tangent=*vc::fiber_tracer::displayUnit(result.points[k+1]-result.points[k-1]);
+    CHECK(tangent.dot(*vc::fiber_tracer::displayUnit({1,0.5,0}))>0.999);
+    request.controlDirections[1]=cv::Vec3d(-1,-0.5,0);
+    std::reverse(request.controlPoints.begin(),request.controlPoints.end());
+    const auto reversed=vc::lasagna::interpolateLineControlPoints(request);
+    const int j=reversed.controlPointIndices[1];
+    CHECK(vc::fiber_tracer::displayUnit(reversed.points[j+1]-reversed.points[j-1])->dot(-tangent)>0.999);
+}
+
+TEST_CASE("Fiber mode forwards CP axes into spline runs and Lasagna constraints")
+{
+    FiberModeNormalSampler sampler;
+    for (const auto goal : {vc3d::line_annotation::SegmentInterpolationGoal::Cspline,
+                           vc3d::line_annotation::SegmentInterpolationGoal::Lasagna}) {
+        vc3d::line_annotation::FiberModeOptimizationRequest request;
+        request.baseNormalSampler=&sampler;
+        request.globalMode=vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+        for (int i=0;i<=20;++i) request.linePointsBase.push_back({double(i),0,0});
+        request.controlPoints={{0,{0,0,0},true,0},{10,{10,0,0},false,10},{20,{20,0,0},false,20}};
+        request.controlPoints[1].direction=cv::Vec3d(1,0.2,0);
+        for (size_t i=0;i<2;++i) {
+            request.controlPoints[i].segmentToNext.emplace();
+            request.controlPoints[i].segmentToNext->interpGoal=goal;
+        }
+        request.lasagnaConfig.segmentLength=0.5;
+        request.lasagnaConfig.maxIterations=20;
+        request.lasagnaConfig.printSolverProgress=false;
+        request.extrapolationDistanceBaseVoxels=0;
+        request.retainOpenTails=false;
+        const auto result=vc3d::line_annotation::optimizeFiberWithNativeFallback(request);
+        REQUIRE(result.controlPoints[1].direction);
+        const int k=result.controlPoints[1].optimizedIndex;
+        REQUIRE(k>0);
+        REQUIRE(k+1<int(result.optimization.line.points.size()));
+        const auto direction=*vc::fiber_tracer::displayUnit(
+            result.optimization.line.points[k+1].position-result.optimization.line.points[k-1].position);
+        CHECK(direction.dot(*vc::fiber_tracer::displayUnit({1,0.2,0}))>0.98);
+    }
+}
+
+TEST_CASE("Display normal axes choose the short rotation for either saved sign")
+{
+    using namespace vc::fiber_tracer;
+    const double pi = std::acos(-1.0);
+    const cv::Vec3d tangent{1,0,0}, baseline{0,0,1};
+    const auto almostReversed = rotateDisplayNormal(baseline, tangent, 179*pi/180);
+    REQUIRE(displayNormalOffset(baseline, almostReversed, tangent));
+    CHECK(*displayNormalOffset(baseline, almostReversed, tangent) ==
+          doctest::Approx(-pi/180));
+    CHECK(*displayNormalOffset(baseline, -almostReversed, tangent) ==
+          doctest::Approx(-pi/180));
+    CHECK(interpolateDisplayOffset({0,1}, {85*pi/180,-85*pi/180}, 0.5) ==
+          doctest::Approx(pi/2));
+    std::vector<cv::Vec3f> points, normals;
+    for (int i=0; i<=20; ++i) {
+        points.emplace_back(i,0,0);
+        normals.emplace_back(0,0,1);
+    }
+    const auto a = fiberDisplayField(points,normals,{0,10,20},
+        {baseline,almostReversed,baseline});
+    const auto b = fiberDisplayField(points,normals,{0,10,20},
+        {-baseline,-almostReversed,-baseline});
+    for (size_t i=0; i<points.size(); ++i) {
+        CHECK(cv::norm(a.normals[i]-b.normals[i]) < 1e-5);
+        CHECK(a.normals[i].dot(normals[i]) > 0.99);
+    }
+    auto model = lineModel();
+    vc::lasagna::LineViewConfig config;
+    config.orientedPointNormals.assign(3, cv::Vec3f(baseline));
+    config.displayPointNormals = {cv::Vec3f(baseline),cv::Vec3f(almostReversed),cv::Vec3f(-baseline)};
+    const auto views = vc::lasagna::buildLineViewSurfaces(model,config);
+    for (auto surface : {views.lineSurface,views.lineSideSlice}) {
+        const auto& grid = *surface->rawPointsPtr();
+        for (int i=1; i<grid.cols; ++i)
+            CHECK((grid(6,i)-grid(0,i)).dot(grid(6,i-1)-grid(0,i-1)) > 0);
+    }
+}
+
+TEST_CASE("Corrected normals use exactly the ordinary construction pipeline")
+{
+    auto model = lineModel();
+    model.points[1].position = {1,0.2,0};
+    model.points[2].position = {2,0,0};
+    vc::lasagna::LineViewConfig config;
+    config.controlPointLinePositions = {0,1,2};
+    config.displayPointNormals = {{0,0,1},{0,0.4f,0.916515f},{0,0,-1}};
+    const auto corrected = vc::lasagna::buildLineViewSurfaces(model,config);
+    auto injected = model;
+    for (size_t i=0; i<model.points.size(); ++i)
+        injected.points[i].sampledNormal = {cv::Vec3d(config.displayPointNormals[i]),true,{}};
+    config.orientedPointNormals = config.displayPointNormals;
+    config.displayPointNormals.clear();
+    const auto ordinary = vc::lasagna::buildLineViewSurfaces(injected,config);
+    CHECK(cv::norm(*ordinary.lineSurface->rawPointsPtr(),
+                   *corrected.lineSurface->rawPointsPtr()) == 0);
+    CHECK(cv::norm(*ordinary.lineSideSlice->rawPointsPtr(),
+                   *corrected.lineSideSlice->rawPointsPtr()) == 0);
+    CHECK(ordinary.lineUpVectors == corrected.lineUpVectors);
+}
+
+TEST_CASE("Equal CP axes do not inherit a half turn from the sampled baseline")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<cv::Vec3f> points, normals;
+    const cv::Vec3d up{0,0,1}, tangent{1,0,0};
+    for (int i=0; i<=20; ++i) {
+        points.emplace_back(i*0.1f,0,0);
+        normals.emplace_back(rotateDisplayNormal(up,tangent,i*170.0/20*std::acos(-1.0)/180));
+    }
+    const auto field = fiberDisplayField(points,normals,{0,20},{up,-up});
+    for (const auto& n : field.normals) CHECK(std::abs(n.dot(cv::Vec3f(up))) > 0.99999);
+    const auto baseline = fiberDisplayField(points,normals,{0,20},{std::nullopt,std::nullopt});
+    for (size_t i=0; i<points.size(); ++i)
+        CHECK(std::abs(baseline.normals[i].dot(normals[i])) > 0.99999);
+}
+
+TEST_CASE("Zero display correction preserves smoothed ribbon geometry")
+{
+    auto model = lineModel();
+    vc::lasagna::LineViewConfig config;
+    config.orientedPointNormals = {{0,0,1}, {0,0.6f,0.8f}, {0,0,1}};
+    for (size_t i=0; i<model.points.size(); ++i)
+        model.points[i].sampledNormal.normal = cv::Vec3d(config.orientedPointNormals[i]);
+    const auto baseline = vc::lasagna::buildLineViewSurfaces(model, config);
+    config.displayPointNormals = config.orientedPointNormals;
+    const auto corrected = vc::lasagna::buildLineViewSurfaces(model, config);
+    CHECK(cv::norm(*baseline.lineSurface->rawPointsPtr(),
+                   *corrected.lineSurface->rawPointsPtr()) < 1e-5);
+    CHECK(cv::norm(*baseline.lineSideSlice->rawPointsPtr(),
+                   *corrected.lineSideSlice->rawPointsPtr()) < 1e-5);
+}
+
+TEST_CASE("Ribbons retain ordinary QuadSurface rendering and picking after origin shifts")
+{
+    auto model=lineModel();
+    model.points[2].position={10,20,0};
+    vc::lasagna::LineViewConfig config;
+    config.targetSpacingBaseVoxels=50; // Deliberately coarse support grid.
+    config.controlPointLinePositions={0,1,2};
+    config.displayPointNormals.assign(3,cv::Vec3f(0,0,1));
+    const auto views=vc::lasagna::buildLineViewSurfaces(model,config);
+    const std::vector<cv::Vec3f> p{{0,0,0},{10,0,0},{10,20,0}};
+    for (const auto& surface : {views.lineSurface,views.lineSideSlice}) {
+        CHECK(typeid(*surface) == typeid(QuadSurface));
+        surface->shiftSurfaceOrigin({123,-17});
+        const double col=views.stripPositionMap.originalPositionToStripGridColumn(0.5);
+        const auto uv=surface->gridToSurface({col,3});
+        const auto sample=surface->sampleAtSurface(uv);
+        REQUIRE(sample.valid());
+        const auto expected=cv::Vec3f(5,0,0);
+        CHECK(cv::norm(sample.volume-expected)<1e-5);
+        for (float scale : {0.5f,2.0f}) {
+            cv::Mat_<cv::Vec3f> coords,normals;
+            surface->gen(&coords,&normals,{1,1},{0,0,0},scale,
+                          {float(uv[0]*scale),float(uv[1]*scale),0});
+            CHECK(cv::norm(coords(0,0)-sample.volume)<1e-4);
+            CHECK(cv::norm(normals(0,0))==doctest::Approx(1));
+        }
+        cv::Vec3f ptr{float(uv[0]*surface->scale()[0]),float(uv[1]*surface->scale()[1]),0};
+        CHECK(cv::norm(surface->coord(ptr)-sample.volume)<1e-4);
+        CHECK(surface->pointTo(ptr,expected,0.01f)<0.001f);
+        CHECK(cv::norm(surface->coord(ptr)-expected)<0.001f);
+        CHECK_FALSE(surface->sampleAtSurface(surface->gridToSurface({-1,3})).valid());
+        // Off-center depth sampling must use the same geometry-derived normals
+        // as an ordinary surface, not a centerline frame extended across rows.
+        QuadSurface reference(*surface->rawPointsPtr(), surface->scale());
+        reference.shiftSurfaceOrigin({123,-17});
+        const auto edgeUV = surface->gridToSurface({col, 4.5});
+        cv::Mat_<cv::Vec3f> actualCoords, actualNormals, expectedCoords, expectedNormals;
+        const cv::Vec3f offset{float(edgeUV[0]), float(edgeUV[1]), 3.0f};
+        surface->gen(&actualCoords, &actualNormals, {1,1}, {0,0,0}, 1, offset);
+        reference.gen(&expectedCoords, &expectedNormals, {1,1}, {0,0,0}, 1, offset);
+        CHECK(cv::norm(actualCoords, expectedCoords) < 1e-5);
+        CHECK(cv::norm(actualNormals, expectedNormals) < 1e-5);
     }
 }
 

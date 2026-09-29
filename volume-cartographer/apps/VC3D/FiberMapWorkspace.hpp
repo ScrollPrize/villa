@@ -25,6 +25,7 @@
 #include "FiberMapRebuildQueue.hpp"
 #include "FiberMapStaleness.hpp"
 #include "FiberNetworkLayout.hpp"
+#include "OpenDataVolumeOrientation.hpp"
 
 class FiberMapRuler;
 struct FiberMapRulerModel;
@@ -166,8 +167,11 @@ private:
     // controller is GUI-only), everything from input conversion through the
     // solve runs on a dedicated worker, and the result is validated against
     // the world it was started in before it may publish. Requests while a
-    // build is in flight coalesce through FiberMapRebuildQueue.
-    void requestRebuild(bool fullRebuild = false);
+    // build is in flight coalesce through FiberMapRebuildQueue. automatic
+    // = armed by a staleness gate rather than asked for: such a request,
+    // pending behind a build, is dropped when the volume moved on
+    // meanwhile (finishRebuild), where an asked-for one is honoured.
+    void requestRebuild(bool fullRebuild = false, bool automatic = false);
     void rebuildScene(const QString& emptyMessage);
     void rebuildTree();
     // Hides every fiber row the search box does not match, and every group
@@ -198,6 +202,9 @@ private:
     using StaleVerdict = vc3d::fiber_map::StaleVerdict;
     [[nodiscard]] vc3d::fiber_map::FiberMapDependencies currentDependencies() const;
     [[nodiscard]] vc3d::fiber_map::FiberMapDependencies layoutDependencies() const;
+    // The cached catalog manifest's version for a coordinate space
+    // (FiberMapDependencies::catalogManifestToken): a stat, no parse.
+    [[nodiscard]] QString catalogManifestTokenFor(const std::string& coordinateSpace) const;
     // Cheap enough to guard interaction — integer compares, a few volume metadata
     // reads, and stats of the umbilicus candidates. Mutates nothing.
     [[nodiscard]] StaleVerdict evaluateDependencies() const;
@@ -220,7 +227,7 @@ private:
     // RebuildJobResult above) carries the snapshot, params, and the
     // memoization cache - moved out of the workspace at start, moved back
     // only on a validated publish.
-    void startRebuild(bool fullRebuild);
+    void startRebuild(bool fullRebuild, bool automatic);
     // Watcher-delivered completion: validate against the current world,
     // publish or discard, then run the one epilogue.
     void applyRebuild(const std::shared_ptr<RebuildJobResult>& job);
@@ -373,6 +380,11 @@ private:
     // rebuild's check.
     vc3d::fiber_map::GlobalLayoutCache _layoutCache;
     bool _memoizationDisabled = false;
+    // The catalog's say on the scroll's winding sense, consulted by the
+    // worker of every rebuild (the lookup memoizes its one manifest parse
+    // and locks internally; the job holds it by shared pointer so a
+    // workspace torn down mid-flight cannot pull it from under the worker).
+    std::shared_ptr<vc3d::opendata::CatalogVolumeOrientationLookup> _catalogOrientation;
     bool _haveLastDigests = false;
     vc3d::fiber_map::ContentDigest _lastInputsDigest;
     vc3d::fiber_map::ContentDigest _lastOutputDigest;
@@ -430,6 +442,8 @@ private:
     uint64_t _layoutGeneration = 0;
     vc3d::annotation::AnnotationFrame _layoutFrame;
     QString _layoutUmbilicusFingerprint;
+    QString _layoutCatalogVolume;
+    QString _layoutCatalogManifestToken;
     // Controller counters as of the build. Compared rather than observed, so that
     // this workspace existing costs annotation work nothing.
     uint64_t _layoutPackageGeneration = 0;

@@ -12,6 +12,8 @@ struct LineSplineRequest {
     std::optional<cv::Vec3d> leftDirection;
     std::optional<cv::Vec3d> rightDirection;
     double sampleSpacing = 1.0;
+    // Optional signed forward directions, indexed like controlPoints.
+    std::vector<std::optional<cv::Vec3d>> controlDirections;
 };
 
 struct LineSplineResult {

@@ -1373,6 +1373,8 @@ class FitContext:
         self.voxel_size_um = float(scroll.voxel_size_um)
         self.base_shape_zyx = scroll.base_shape_zyx
         self.spiral_outward_sense = scroll.spiral_outward_sense
+        # Decides whether exports are flipped so the scroll top is row 0.
+        self.z_direction_is_top_to_bottom = scroll.z_direction_is_top_to_bottom
         self.normal_zarr_group = scroll.normal_zarr_group
         self.lasagna_scale = int(scroll.lasagna_scale)
         umbilicus_path = paths.umbilicus
@@ -3570,6 +3572,7 @@ class FitContext:
             'z_begin': self.model_z_begin,
             'z_end': self.model_z_end,
             'spiral_outward_sense': self.spiral_outward_sense,
+            'z_direction_is_top_to_bottom': self.z_direction_is_top_to_bottom,
             'numpy_rng_state': np.random.get_state(),
             'torch_cpu_rng_state': torch.random.get_rng_state(),
             'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
@@ -3678,6 +3681,15 @@ class FitContext:
                 f'checkpoint outward sense '
                 f'{checkpoint.get("spiral_outward_sense")!r} does not '
                 f'match requested sense {self.spiral_outward_sense!r}')
+        # Checkpoints from before the z direction was saved carry no key.
+        if ('z_direction_is_top_to_bottom' in checkpoint
+                and checkpoint['z_direction_is_top_to_bottom']
+                != self.z_direction_is_top_to_bottom):
+            reasons.append(
+                f'checkpoint z direction (top to bottom: '
+                f'{checkpoint["z_direction_is_top_to_bottom"]!r}) does not '
+                f'match the scroll spec '
+                f'({self.z_direction_is_top_to_bottom!r})')
         checkpoint_base_shape = checkpoint.get('base_shape_zyx')
         if checkpoint_base_shape is not None:
             if (not isinstance(checkpoint_base_shape, (list, tuple))
@@ -4033,6 +4045,7 @@ class FitContext:
                 get_or_build_unattached_pcl_flat,
                 tracks=self.preview_extent_tracks,
                 surface_id=surface_id,
+                z_direction_is_top_to_bottom=self.z_direction_is_top_to_bottom,
                 base_shape_zyx=self.base_shape_zyx,
                 progress=progress,
                 input_extent_transform=live_transform,
@@ -5406,6 +5419,7 @@ class FitContext:
                 render_volume_scale=self.render_volume_scale,
                 voxel_size_um=self.voxel_size_um,
                 get_or_build_unattached_pcl_flat=get_or_build_unattached_pcl_flat,
+                z_direction_is_top_to_bottom=self.z_direction_is_top_to_bottom,
                 run_tag=self.run_tag,
                 save_png_visualizations=self.config.get('output_save_png_visualizations', False),
                 progress=progress,

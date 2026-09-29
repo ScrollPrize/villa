@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterable, Mapping
 import zipfile
 
 from config import Config
+from surface_orientation import spiral_outward_sense_for
 
 
 # Version 17 binds dataset/output/cache to the service connection: --dataset
@@ -619,6 +620,12 @@ class ScrollSpec:
     name: str
     voxel_size_um: float
     spiral_outward_sense: str
+    # The following are in the open-data catalog metadata; together they
+    # fix spiral_outward_sense (surface_orientation.spiral_outward_sense_for);
+    # the z direction also decides whether exported grids are flipped so row 0 is
+    # the scroll top. None when the spec leaves them out.
+    z_direction_is_top_to_bottom: bool | None = None
+    left_handed_coordinates: bool | None = None
     # Shape of the volume coordinate domain used by Spiral surfaces. This is
     # independent of physical voxel size and may be absent in legacy specs.
     base_shape_zyx: tuple[int, int, int] | None = None
@@ -653,9 +660,19 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
         raise ScrollSpecError(
             f"{source}: unsupported schema_version {document['schema_version']!r} "
             f"(this build supports {SCROLL_SPEC_SCHEMA_VERSION})")
-    missing = sorted(
-        key for key in ("name", "voxel_size_um", "spiral_outward_sense")
-        if key not in document)
+    catalog = {}
+    for key in ("z_direction_is_top_to_bottom", "left_handed_coordinates"):
+        value = document.get(key)
+        if value is not None and type(value) is not bool:
+            raise ScrollSpecError(f"{source}: {key} must be true or false")
+        catalog[key] = value
+    catalog_sense = (
+        spiral_outward_sense_for(**catalog)
+        if None not in catalog.values() else None)
+    required = ["name", "voxel_size_um"]
+    if catalog_sense is None:
+        required.append("spiral_outward_sense")
+    missing = sorted(key for key in required if key not in document)
     if missing:
         raise ScrollSpecError(f"{source}: missing required keys: {missing}")
 
@@ -678,9 +695,17 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
             raise ScrollSpecError(
                 f"{source}: base_shape_zyx must be a ZYX list of three positive integers")
         base_shape_zyx = tuple(base_shape_raw)
-    sense = str(document["spiral_outward_sense"]).upper()
+    sense = str(document.get("spiral_outward_sense", catalog_sense)).upper()
     if sense not in ("CW", "ACW"):
         raise ScrollSpecError(f"{source}: spiral_outward_sense must be CW or ACW")
+    if catalog_sense is not None and sense != catalog_sense:
+        raise ScrollSpecError(
+            f"{source}: spiral_outward_sense {sense} contradicts the catalog "
+            f"properties (z_direction_is_top_to_bottom="
+            f"{str(catalog['z_direction_is_top_to_bottom']).lower()}, "
+            f"left_handed_coordinates="
+            f"{str(catalog['left_handed_coordinates']).lower()} give "
+            f"{catalog_sense})")
 
     umbilicus = document.get("umbilicus", {})
     if not isinstance(umbilicus, Mapping):
@@ -717,6 +742,8 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
         name=name,
         voxel_size_um=voxel_size_um,
         spiral_outward_sense=sense,
+        z_direction_is_top_to_bottom=catalog["z_direction_is_top_to_bottom"],
+        left_handed_coordinates=catalog["left_handed_coordinates"],
         base_shape_zyx=base_shape_zyx,
         umbilicus_coordinate_scale=coordinate_scale,
         normal_zarr_group=str(document.get("normal_zarr_group", "4")),
@@ -746,7 +773,9 @@ def load_scroll_spec(dataset_root: str | os.PathLike[str],
         raise ScrollSpecError(
             f"No scroll specification found at {path}. Create {SCROLL_SPEC_FILENAME} "
             "in the dataset root with schema_version, name, voxel_size_um, and "
-            "spiral_outward_sense (plus any non-conventional path overrides).")
+            "either the volume's catalog properties z_direction_is_top_to_bottom "
+            "and left_handed_coordinates or spiral_outward_sense (plus any "
+            "non-conventional path overrides).")
     try:
         with path.open("r", encoding="utf-8") as stream:
             document = json.load(stream)
