@@ -1,6 +1,7 @@
 #include "UnifiedBrowserDialog.hpp"
 
 #include <QDir>
+#include <QCheckBox>
 #include <QFile>
 #include <QLineEdit>
 #include <QListWidget>
@@ -58,6 +59,43 @@ class UnifiedBrowserDialogTest : public QObject
     Q_OBJECT
 
 private slots:
+    void hiddenFilesToggle()
+    {
+        QTemporaryDir temporary(QDir::current().filePath("browser-hidden-XXXXXX"));
+        QVERIFY(temporary.isValid());
+        QFile hidden(temporary.filePath(".hidden.volpkg.json"));
+        QVERIFY(hidden.open(QIODevice::WriteOnly));
+        hidden.close();
+        QVERIFY(QDir(temporary.path()).mkdir(".hidden-dir"));
+        UnifiedBrowserDialog dialog;
+        dialog.setStartUri(temporary.path());
+        auto* list = dialog.findChild<QListWidget*>();
+        QCOMPARE(list->count(), 0);
+        auto* toggle = dialog.findChild<QCheckBox*>();
+        QVERIFY(toggle);
+        toggle->setChecked(true);
+        QCOMPARE(list->count(), 2);
+        toggle->setChecked(false);
+        QCOMPARE(list->count(), 0);
+    }
+
+    void directoryEnterOnlyNavigates()
+    {
+        QTemporaryDir temporary(QDir::current().filePath("browser-enter-XXXXXX"));
+        QVERIFY(temporary.isValid());
+        for (const auto suffix : {QString{}, QStringLiteral("/")}) {
+            UnifiedBrowserDialog dialog;
+            dialog.setAcceptsFiles(true);
+            dialog.setAcceptsDirs(true);
+            dialog.show();
+            QSignalSpy accepted(&dialog, &QDialog::accepted);
+            typePath(dialog, temporary.path() + suffix);
+            QTest::keyClick(pathBar(dialog), Qt::Key_Return);
+            QCOMPARE(accepted.count(), 0);
+            QCOMPARE(QDir::cleanPath(pathBar(dialog)->text()), temporary.path());
+        }
+    }
+
     void typedRemoteFileOpen_data()
     {
         QTest::addColumn<QString>("uri");
