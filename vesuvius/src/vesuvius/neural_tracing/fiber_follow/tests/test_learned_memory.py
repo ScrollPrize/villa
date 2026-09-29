@@ -350,7 +350,8 @@ def test_writer_learns_to_retain_an_old_disambiguating_observation():
     assert loss.item() < .02 and torch.equal(logits.argmax(-1),target)
     x['memory_patches'][:,0].fill_(.3)
     forgotten = head(memory.read(query,memory.observe(x))[:,0])
-    torch.testing.assert_close(forgotten[0],forgotten[1],rtol=0,atol=0)
+    # Batched CPU attention can differ by one FP32 ULP even for identical rows.
+    torch.testing.assert_close(forgotten[0],forgotten[1],rtol=0,atol=1e-6)
 
 
 def test_trace_state_isolated_on_retirement_and_reset_between_calls():
@@ -386,7 +387,7 @@ def test_direct_tracer_reads_seed_once_and_streams_one_observation_per_decision(
     with torch.no_grad():
         model.coordinates.weight.zero_(); model.coordinates.bias.zero_()
         model.confidence_head[-1].weight.zero_(); model.confidence_head[-1].bias.fill_(10.)
-    def images(items,vol,crop,pool=None):
+    def images(items,vol,crop,pool=None,**kwargs):
         return torch.stack([torch.full((2,crop.depth,crop.width,crop.width),float(i['pos'][2])/1000.) for i in items])
     monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.data.image_crop',images)
     inputs = []
@@ -408,6 +409,6 @@ def test_direct_tracer_reads_seed_once_and_streams_one_observation_per_decision(
 
 
 @pytest.mark.parametrize('kwargs', [dict(memory_slots=-1),dict(memory_grad_steps=0),dict(memory_stride=0),
-                                    dict(memory_patch_size=4),dict(memory_version=3)])
+                                    dict(memory_patch_size=4),dict(memory_version=4)])
 def test_invalid_memory_config(kwargs):
     with pytest.raises(ValueError): memory_config(**kwargs)

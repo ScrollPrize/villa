@@ -18,6 +18,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
 ARCHITECTURE = 'axial_fiber_v3'
 MEMORY_ARCHITECTURE = 'axial_fiber_memory_v2'
 MEMORY_ARCHITECTURE_V1 = 'axial_fiber_memory_v1'  # no probe; loadable, not trained further
+SPATIAL_MEMORY_ARCHITECTURE = 'axial_fiber_memory_v3'
 TOKEN_STRIDE = (8, 2, 2)  # z, y, x in input samples
 TOKEN_OFFSET = (3, 0, 0)  # centre of four stride-two stem positions
 IDENTITY_EVIDENCE_WIDTH = 8  # point/mean/min/coverage for seed and history separately
@@ -25,6 +26,7 @@ IDENTITY_EVIDENCE_WIDTH = 8  # point/mean/min/coverage for seed and history sepa
 
 @dataclass
 class DirectConfig:
+    direction_inputs: bool = False  # six local-frame second moments after CT/presence
     fine: CropSpec = field(default_factory=lambda: CropSpec(depth=120, width=101, behind=48, spacing=.5))
     channels: int = 32
     hidden: int = 128
@@ -49,8 +51,15 @@ class DirectConfig:
     # older ones are a no-grad burn-in. At least memory_steps: no burn-in.
     memory_grad_steps: int = 32
     memory_version: int = 2  # 1: legacy checkpoints without the probe
+    route_grid_step: float = 2.  # v3: maximum lateral lattice spacing, trace voxels
+    route_transition_radius: int = 1  # v3: connected lattice neighbors per plane
+    route_transition_cost: float = .25
+    route_loss_weight: float = 1.
+    route_sequence_weight: float = .5  # v3: additional earlier decision from an observed track
 
     def __post_init__(self):
+        if not isinstance(self.direction_inputs, bool):
+            raise ValueError('direction_inputs must be a boolean')
         if isinstance(self.fine, dict):
             self.fine = CropSpec(**self.fine)
         c = self.fine
@@ -74,10 +83,23 @@ class DirectConfig:
         if self.memory_slots:
             if any(not isinstance(v, int) or v < 1 for v in (self.memory_steps, self.memory_stride, self.memory_grad_steps)):
                 raise ValueError('Memory sequence dimensions must be positive integers')
-            if self.memory_version not in (1, 2):
+            if self.memory_version not in (1, 2, 3):
                 raise ValueError('Unknown memory version')
             if not isinstance(self.memory_patch_size, int) or self.memory_patch_size < 5 or self.memory_patch_size % 2 != 1:
                 raise ValueError('Memory patch size must be odd and at least five')
+        if self.memory_version == 3:
+            if not self.memory_slots:
+                raise ValueError('Spatial memory requires positive memory_slots')
+            if not math.isfinite(self.route_grid_step) or self.route_grid_step <= 0:
+                raise ValueError('Route grid spacing must be finite and positive')
+            if not isinstance(self.route_transition_radius, int) or self.route_transition_radius < 1:
+                raise ValueError('Route transition radius must be a positive integer')
+            if any(not math.isfinite(v) or v < 0 for v in (self.route_transition_cost, self.route_loss_weight, self.route_sequence_weight)):
+                raise ValueError('Route cost and loss weight must be finite and nonnegative')
+
+    @property
+    def input_channels(self):
+        return 8 if self.direction_inputs else 2
 
     @property
     def recent_history_points(self):
@@ -93,6 +115,14 @@ class DirectConfig:
 
     def to_dict(self):
         return asdict(self)
+
+
+def build_model(cfg):
+    """Explicit architecture dispatch; legacy constructors and weights stay intact."""
+    if cfg.memory_slots and cfg.memory_version == 3:
+        from .spatial_model import SpatialMemoryFollower
+        return SpatialMemoryFollower(cfg)
+    return DirectFollower(cfg)
 
 
 def device_vector(like, values):
@@ -205,7 +235,7 @@ class AxialEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         c,h = cfg.channels,cfg.hidden
-        self.stem = nn.Sequential(nn.Conv3d(2,c,3,padding=1,bias=False),ResidualConv(c))
+        self.stem = nn.Sequential(nn.Conv3d(cfg.input_channels,c,3,padding=1,bias=False),ResidualConv(c))
         self.down = nn.Sequential(nn.Conv3d(c,2*c,3,stride=2,padding=1,bias=False),ResidualConv(2*c),
                                   nn.Conv3d(2*c,4*c,3,padding=1,bias=False),nn.SiLU(),ResidualConv(4*c))
         self.compress = nn.Conv3d(4*c,h,(4,1,1),stride=(4,1,1))
@@ -272,6 +302,8 @@ class DirectFollower(nn.Module):
 
     def __init__(self, cfg):
         super().__init__()
+        if cfg.memory_version == 3:
+            raise ValueError('Use build_model(cfg) or SpatialMemoryFollower for memory v3')
         self.cfg = cfg
         c,h = cfg.channels,cfg.hidden
         self.encoder = AxialEncoder(cfg)

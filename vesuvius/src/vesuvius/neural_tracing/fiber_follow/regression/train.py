@@ -21,7 +21,7 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
 )
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
-    ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, DirectConfig, DirectFollower,
+    ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, SPATIAL_MEMORY_ARCHITECTURE, DirectConfig, DirectFollower, build_model,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES,
@@ -86,7 +86,8 @@ def match_optimizer_layout(opt):
                 state[key] = torch.empty_like(param).copy_(value)
 
 
-ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1)
+ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, SPATIAL_MEMORY_ARCHITECTURE)
+ROUTE_OPTIONS = ('route_grid_step','route_transition_radius','route_transition_cost','route_loss_weight','route_sequence_weight')
 MEMORY_OPTIONS = ('memory_slots','memory_steps','memory_stride','memory_patch_size','memory_grad_steps')
 MEMORY_GRAD_CLIP = 5.
 REST_GRAD_CLIP = 20.
@@ -97,7 +98,7 @@ def checkpoint_config(ck):
     if ck['architecture'] == MEMORY_ARCHITECTURE_V1:
         model_cfg.setdefault('memory_version', 1)  # saved before versions were recorded
     cfg = DirectConfig(**model_cfg)
-    expected = ((MEMORY_ARCHITECTURE if cfg.memory_version == 2 else MEMORY_ARCHITECTURE_V1)
+    expected = ({1: MEMORY_ARCHITECTURE_V1, 2: MEMORY_ARCHITECTURE, 3: SPATIAL_MEMORY_ARCHITECTURE}[cfg.memory_version]
                 if cfg.memory_slots else ARCHITECTURE)
     if ck['architecture'] != expected:
         raise ValueError('Checkpoint architecture and memory configuration disagree')
@@ -107,10 +108,51 @@ def checkpoint_config(ck):
 def load_checkpoint(path,device='cuda'):
     ck = read_checkpoint(path,ARCHITECTURES,device)
     cfg = checkpoint_config(ck)
-    model = DirectFollower(cfg).to(device,memory_format=conv_memory_format(device))
+    model = build_model(cfg).to(device,memory_format=conv_memory_format(device))
     model.load_state_dict(ck['ema'])
     model.eval()
     return model,cfg.fine,cfg.n_history,FiberVolumeSpec(**ck['vol_spec']),ck
+
+
+def add_direction_inputs(model):
+    """Expand CT/presence input weights with zeros for six direction channels.
+
+    All existing weights, including recurrent memory and its seed encoder, are
+    retained. This initializes a new run; optimizer/step state is not resumed.
+    """
+    if model.cfg.direction_inputs:
+        return model
+    cfg = replace(model.cfg, direction_inputs=True)
+    device = next(model.parameters()).device
+    expanded = build_model(cfg).to(device, memory_format=conv_memory_format(device))
+    state = model.state_dict()
+    keys = ['encoder.stem.0.weight']
+    if cfg.memory_slots:
+        keys.append('recurrent_memory.patch_encoder.0.weight')
+    target = expanded.state_dict()
+    for key in keys:
+        old, new = state[key], target[key]
+        if old.shape[1] != 2 or new.shape[1] != 8 or old.shape[:1]+old.shape[2:] != new.shape[:1]+new.shape[2:]:
+            raise ValueError(f'Unexpected input weight shape: {key}')
+        state[key] = torch.zeros_like(new)
+        state[key][:, :2].copy_(old)
+    expanded.load_state_dict(state, strict=True)
+    expanded.train(model.training)
+    return expanded
+
+
+def initialize_spatial_model(model, cfg):
+    """Explicit new-run migration; retain shared EMA weights, never optimizer state."""
+    if cfg.memory_version != 3:
+        raise ValueError('Spatial initialization requires memory version 3')
+    upgraded = build_model(cfg).to(next(model.parameters()).device,
+                                   memory_format=conv_memory_format(next(model.parameters()).device))
+    incompatible = upgraded.load_state_dict(model.state_dict(),strict=False)
+    allowed = ('route_',) if model.cfg.memory_slots else ('route_','recurrent_memory.')
+    if incompatible.unexpected_keys or any(not key.startswith(allowed) for key in incompatible.missing_keys):
+        raise ValueError(f'Unexpected spatial initialization mismatch: {incompatible}')
+    upgraded.train(model.training)
+    return upgraded
 
 
 def move_batch(batch, device):
@@ -270,6 +312,12 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             geometry = terms['geometry_per_state'].sum()/total
             confidence = terms['confidence_per_state'].sum()/total
             loss = geometry + confidence_weight*confidence
+            if 'route_per_state' in terms:
+                route_loss = terms['route_per_state'].sum()/total
+                loss = loss+model.cfg.route_loss_weight*route_loss
+                accumulate(memory, 'route_loss', route_loss)
+                for key in ('route_count','route_error_sum'):
+                    accumulate(memory,key,terms[key])
             if 'identity_per_state' in terms:
                 identity_loss = terms['identity_per_state'].sum()/total
                 loss = loss + identity_weight*identity_loss
@@ -287,6 +335,18 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                                    *((k.removeprefix('memory_'), v) for k, v in probe.items() if not k.endswith('_per_state'))):
                     accumulate(memory, key, value)
         loss.backward()
+        if 'route_sequence' in batch and model.cfg.memory_version == 3:
+            earlier = batch['route_sequence']
+            with torch.autocast('cuda',dtype=torch.bfloat16,enabled=torch.device(device).type == 'cuda'):
+                sequence_output = model(earlier['x'],earlier['hist'],earlier['hmask'])
+                sequence_terms = loss_terms(sequence_output,earlier,model.cfg,tolerance,n_commit=n_commit)
+                sequence_loss = model.cfg.route_sequence_weight*(
+                    model.cfg.route_loss_weight*sequence_terms['route_per_state']+
+                    sequence_terms['geometry_per_state']+confidence_weight*sequence_terms['confidence_per_state']).sum()/total
+            sequence_loss.backward()
+            accumulate(memory,'sequence_loss',sequence_loss)
+            memory['sequence_states'] = memory.get('sequence_states',0)+len(earlier['hist'])
+            loss = loss.detach()+sequence_loss.detach()
         if compute_metrics:
             decisions.extend(decision_rows(output, batch, model.cfg, n_commit, tolerance))
             if 'candidate_confidence_logits' in output:
@@ -400,9 +460,18 @@ def build_parser():
     ap.add_argument('--tolerance', type=float, default=1.5)
     ap.add_argument('--n-commit', type=int, default=4)
     ap.add_argument('--channels', type=int, default=DirectConfig.channels, help='Base image encoder width')
+    ap.add_argument('--direction-inputs', action=argparse.BooleanOptionalAction, default=False,
+                    help='Add six sign-invariant direction channels to main, memory and seed crops; no image augmentations on these channels')
     ap.add_argument('--decoder-layers', type=int, default=4)
     ap.add_argument('--axial-layers', type=int, default=4)
     ap.add_argument('--hidden', type=int, default=128)
+    ap.add_argument('--memory-version', type=int, choices=(2,3), default=2,
+                    help='2: existing recurrent follower; 3: spatial identity route model')
+    ap.add_argument('--route-grid-step', type=float, default=DirectConfig.route_grid_step)
+    ap.add_argument('--route-transition-radius', type=int, default=DirectConfig.route_transition_radius)
+    ap.add_argument('--route-transition-cost', type=float, default=DirectConfig.route_transition_cost)
+    ap.add_argument('--route-loss-weight', type=float, default=DirectConfig.route_loss_weight)
+    ap.add_argument('--route-sequence-weight', type=float, default=DirectConfig.route_sequence_weight)
     ap.add_argument('--memory-slots', type=int, default=16,
                     help='Learned recurrent memory slots; 0 preserves the crop-only model')
     ap.add_argument('--memory-steps', type=int, default=64,
@@ -522,20 +591,26 @@ def main(argv=None):
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    cfg = DirectConfig(channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
+    cfg = DirectConfig(direction_inputs=args.direction_inputs,channels=args.channels,hidden=args.hidden,layers=args.axial_layers,
                        decoder_layers=args.decoder_layers,embedding=args.embedding,
                        activation_checkpointing=args.activation_checkpointing,correction=args.correction,
                        correction_limit=args.correction_limit,correction_steps=args.correction_steps,
                        memory_slots=args.memory_slots,memory_steps=args.memory_steps,
                        memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size,
-                       memory_grad_steps=args.memory_grad_steps)
+                       memory_grad_steps=args.memory_grad_steps,memory_version=args.memory_version,
+                       **{k:getattr(args,k) for k in ROUTE_OPTIONS})
     initialized = None
     resume = None
     if args.init_tracer:
         initialized,_,_,_,_ = load_checkpoint(args.init_tracer,args.device)
-        if args.memory_slots and not initialized.cfg.memory_slots:
+        if args.memory_version == 3 and initialized.cfg.memory_version != 3:
+            cfg = replace(initialized.cfg,memory_version=3,
+                          **{k:getattr(args,k) for k in (*MEMORY_OPTIONS,*ROUTE_OPTIONS)})
+            initialized = initialize_spatial_model(initialized,cfg)
+            progress('Initialized spatial memory v3 from shared EMA weights; route head starts fresh')
+        elif args.memory_slots and not initialized.cfg.memory_slots:
             cfg = replace(initialized.cfg, **{k: getattr(args, k) for k in MEMORY_OPTIONS})
-            upgraded = DirectFollower(cfg).to(args.device, memory_format=conv_memory_format(args.device))
+            upgraded = build_model(cfg).to(args.device, memory_format=conv_memory_format(args.device))
             incompatible = upgraded.load_state_dict(initialized.state_dict(), strict=False)
             if incompatible.unexpected_keys or any(not k.startswith('recurrent_memory.') for k in incompatible.missing_keys):
                 raise ValueError('Unexpected parameter mismatch initializing memory model')
@@ -543,14 +618,21 @@ def main(argv=None):
         else:
             if args.memory_slots and any(getattr(args,k) != getattr(initialized.cfg,k) for k in MEMORY_OPTIONS):
                 raise ValueError('--init-tracer memory configuration differs from existing memory checkpoint')
-            if initialized.cfg.memory_slots and initialized.cfg.memory_version != 2:
+            if initialized.cfg.memory_slots and initialized.cfg.memory_version == 1:
                 raise ValueError('Legacy v1 memory checkpoints cannot initialize new runs')
             cfg = initialized.cfg
-        for key in MEMORY_OPTIONS:
+        for key in (*MEMORY_OPTIONS,'memory_version',*ROUTE_OPTIONS):
             setattr(args, key, getattr(cfg, key))
+        if args.direction_inputs and not cfg.direction_inputs:
+            initialized = add_direction_inputs(initialized)
+            cfg = initialized.cfg
+            progress('Initialized six direction inputs with zero weights; existing EMA weights retained')
+        args.direction_inputs = cfg.direction_inputs
     if args.resume:
         resume = read_checkpoint(args.resume,ARCHITECTURES,args.device)
         cfg = checkpoint_config(resume)
+        if args.direction_inputs != cfg.direction_inputs:
+            raise ValueError('Resume direction inputs differ; use --init-tracer for a new direction-enabled run')
     if args.decision_fraction and args.microbatch % 2:
         raise ValueError('Matched decisions require an even microbatch')
     if not np.isfinite(args.candidate_weight) or args.candidate_weight <= 0:
@@ -580,6 +662,9 @@ def main(argv=None):
     # Finest-level CT in a single enlarged crop.
     spec = FiberVolumeSpec(args.fiber_zarrs, ct_zarr=args.ct, ct_level=0, ct_grid_scale=4.,
                            inputs='ct+presence')
+    if cfg.direction_inputs:
+        # Validate sibling paths and grids before starting loaders or collectors.
+        FiberVolume(spec, cache_bytes=1 << 20).direction_fields()
     sample = SampleConfig(crop=cfg.fine, n_history=cfg.n_history, n_future=cfg.n_future,
                           future_step=cfg.future_step, recent_history_points=cfg.n_history,
                           no_history_prob=args.no_history_prob, short_history_prob=args.short_history_prob)
@@ -648,7 +733,7 @@ def main(argv=None):
             raise ValueError('Monitor recovery fixture changed since checkpoint')
     progress('Initializing models and optimizer')
     progress(f'Independent gradient clipping: memory={args.memory_grad_clip:g}, rest={args.rest_grad_clip:g} (0 disables clipping)')
-    model = initialized if initialized is not None else DirectFollower(cfg).to(args.device, memory_format=conv_memory_format(args.device))
+    model = initialized if initialized is not None else build_model(cfg).to(args.device, memory_format=conv_memory_format(args.device))
     ema = copy.deepcopy(model).requires_grad_(False).eval()
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     done = resume_training(resume, model, ema, opt)[0] if resume else 0

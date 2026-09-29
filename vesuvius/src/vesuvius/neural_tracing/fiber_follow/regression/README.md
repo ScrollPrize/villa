@@ -148,3 +148,121 @@ the per-group norms/scales as weights, batch size or loss weights change. See
 Evaluation uses `scripts/evaluate_regression.py` and
 `scripts/evaluate_regression_recovery.py` with the frozen calibration/final protocol.
 Implementation checks do not establish trained tracing quality.
+
+## Unsigned direction inputs
+
+`--direction-inputs` adds six local-frame second-moment channels to CT/presence
+in **all three observation paths**: the main crop, each causal memory patch,
+and the immutable seed patch. The eight channels are
+`CT, presence, uu, vv, ff, uv, uf, vf`, where `u,v,f` are the columns of the
+individual patch's world-xyz frame. All subsequent encoder widths, token counts
+and recurrent-state dimensions stay the same.
+
+The loader derives `*_nx.ome.zarr/<level>` and `*_ny.ome.zarr/<level>` from the
+exact selected `*_presence.ome.zarr/<level>` path. It validates shapes, uint8
+encoding, zero fill, and matching OME axes/scale/origin. These fields use the
+presence/trace grid, independently of the finer CT grid. Old two-channel
+checkpoints and default runs never open the direction files. The model config
+records the input flag; checkpoint loading and collectors reconstruct it.
+
+Geometry contract:
+
+- Decode source bytes as `(byte-128)/127` for world x/y and reconstruct positive
+  z, then normalize to handle uint8 rounding just outside the unit disk.
+  A zero byte is missing/masked data; its direction tensor is zero.
+- Rotate each source direction with the **particular patch's frame**, form
+  `R.T @ (n n.T) @ R`, then trilinearly interpolate its six components. This
+  equals rotating the interpolated tensor because the frame is constant within
+  a patch. It is invariant to replacing any source vector by its negative.
+- Never interpolate encoded bytes or signed vectors. In particular, crossing
+  the encoding's hemisphere seam must not invent an unrelated direction.
+- Tensor off-diagonals can be negative. Do not clip them to `[0,1]`, renormalize
+  interpolated mixtures, or gate them with augmented presence. Tensor trace
+  retains interpolated source validity; padding remains zero.
+- Blur, brightness, contrast, noise and presence dropout touch **only channels
+  0 and 1**. Direction channels receive no image augmentation or dropout. An
+  augmented observation pose still requires sampling at that pose and expressing
+  directions in its frame; that is coordinate conversion, not direction noise.
+
+The Lasagna checkout is not an installed dependency of this training environment.
+`shared/direction_fields.py` implements its compact byte-format equation locally;
+all 65,025 nonzero byte pairs were checked against that checkout's decoder.
+The sampler uses an exact table of all 65,536 byte pairs (768 KiB), scalar Numba
+interpolation with `fastmath=False`, and direct output buffers. This avoids
+per-output-voxel array allocations/BLAS calls and a full eight-channel copy.
+
+Start a **new run initialized from run4 checkpoint 32,000 EMA**:
+
+```bash
+bash scripts/launch_memory_directions.sh --dry-run
+bash scripts/launch_memory_directions.sh
+```
+
+The default destination is `output/axial_memory_directions_run1`. Override
+`RUN_NAME` or `INIT_TRACER` through the environment. Additional trainer arguments
+are passed through, e.g. `--lr 0.0001`. The script refuses an existing destination.
+It starts a new optimizer/schedule, retaining all old EMA weights and initializing
+only the six additional input weight slices in both encoders to zero. This is
+not a resume of the old optimizer. Low-precision kernels can produce small
+rounding differences when the input-channel count changes, even with zero new
+weights. To resume a direction-enabled checkpoint later, use the ordinary
+regression launcher with `--resume`, `--direction-inputs`, and its saved options.
+
+The wrapper matches the **checkpoint's actual training options**, which differ
+from run4's original `config.json`: batch16/microbatch4, twelve workers,
+commit8, presence dropout0, fresh fraction0.6, bank-following probability0.2,
+decision fraction0.1, 64 memory steps with32 gradient steps, and the existing
+CT/presence blur settings. No training was launched while implementing this.
+
+Validation:
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=../../.. \
+  ../../../../.venv/bin/python -m unittest discover -s tests -p test_direction_inputs.py -v
+AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=../../.. \
+  ../../../../.venv/bin/python -m unittest discover -s tests -p test_blur_augmentation.py -v
+```
+
+Tests cover sign flips, hemisphere seams, independent tensor/frame interpolation,
+missing data/borders, physical grid mismatches, batched direct writes, distinct
+main/history/seed frames, online/reconstructed observation parity, augmentation
+isolation, weight migration, gradients and checkpoint round trips. Production-size
+CUDA eager and compiled forward/backward checks also passed on real crops.
+The measured eager microbatch4 peak allocated memory increased by **211 MiB**
+(19.254 to19.460 GiB); this excludes optimizer state and data-loader host RAM.
+Compiled direction-enabled forward/backward used15.334 GiB in the same probe.
+Full training peaks can differ.
+
+The first CPU implementation cost about230 ms per sample versus25–27 ms for
+CT/presence. Profiling attributed about179 ms to the per-voxel sampling loop.
+Removing tiny array allocations and BLAS dispatch, reusing exact decoded byte
+values and writing channels directly into their final buffer reduced the full
+observation build to about65–72 ms across six fixed real starts (one CPU thread,
+warm reader caches, five timed repeats per start, main crop plus memory/seed).
+The original scalar crops are unchanged. In the six-start numerical comparison,
+one output component differed by7.45e-9 from the initial implementation; all
+other sampled values were identical. Tests also compare against an independent
+world-tensor interpolation reference. No reduced precision or approximate
+interpolation was introduced. Raw timing/validation artifacts are under
+`output/direction_input_validation/`; warm-cache CPU crop timings are not
+end-to-end training throughput measurements.
+
+A separate loader-plus-GPU probe used twelve workers, microbatch four, compiled
+forward/backward, twelve warmup microbatches and twenty-four measured batches.
+Mean time increased from **181.0 to 188.6 ms per microbatch (4.2%)**; mean loader
+wait was below 0.13 ms in both cases. Parallel loading hid the additional CPU
+sampling work in this probe. It repeatedly used six real locations with synthetic
+observed histories and warm caches, without bank sampling, augmentation or
+optimizer updates, so this is not a full training-throughput guarantee. See
+`pipeline_baseline.json`, `pipeline_directions.json` and `benchmark_pipeline.py`
+in the validation artifact directory. Training remains stopped.
+
+Both direction stores were already uncompressed at levels3 and4. Metadata and64
+raw chunks per channel/level were checked for memory-mapped access; no source
+Zarr rewrite was necessary. Compressed stores remain supported, but are slower.
+
+## Spatial identity memory v3
+
+The separate [spatial memory architecture](SPATIAL_MEMORY.md) adds direct
+memory-conditioned route selection and pre-write identity gating. Existing v2
+models remain loadable and trainable; the new launcher opts into v3 explicitly.

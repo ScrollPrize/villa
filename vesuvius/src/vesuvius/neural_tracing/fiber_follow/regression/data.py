@@ -1,6 +1,7 @@
 """Shared training/rollout observation builder for the direct follower."""
 from collections import deque
 from dataclasses import asdict, dataclass
+from functools import partial
 import hashlib
 import json
 from pathlib import Path
@@ -20,16 +21,25 @@ from vesuvius.neural_tracing.fiber_follow.shared.reference import SEED_FIELDS, o
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig
 
 
-def image_crop(items, vol, crop, pool=None):
-    """CT and presence only. Reuse the existing physical-coordinate sampler.
+def image_crop(items, vol, crop, pool=None, *, directions=False):
+    """CT/presence, optionally followed by six unsigned local direction moments.
 
     The scalar sampler normalizes both channels to [0,1]. An empty history
     skips rendering. Sampling is identical in training
     and tracing, including the independently resolved presence grid.
     Each item reads only the axis-aligned block its own oriented crop needs.
     """
-    return torch.stack([scalar_crops(items, vol, crop, pool, presence=presence)[:, 0]
-                        for presence in (False, True)], 1)
+    if not directions:
+        return torch.stack([scalar_crops(items, vol, crop, pool, presence=presence)[:, 0]
+                            for presence in (False, True)], 1)
+    from vesuvius.neural_tracing.fiber_follow.shared.direction_fields import direction_crops
+    # Write every channel directly into its final storage: concatenating eight
+    # full-resolution channels was an avoidable copy on every observation.
+    output = np.empty((len(items), 8, crop.depth, crop.width, crop.width), np.float32)
+    scalar_crops(items, vol, crop, pool, presence=False, out=output[:, :1])
+    scalar_crops(items, vol, crop, pool, presence=True, out=output[:, 1:2])
+    direction_crops(items, vol, crop, pool, out=output[:, 2:])
+    return torch.from_numpy(output)
 
 
 class ObservationBuilder:
@@ -41,12 +51,15 @@ class ObservationBuilder:
         for item in items:
             reference_layout(item,self.cfg)
         stack = lambda key: torch.from_numpy(np.stack([item[key] for item in items]).astype(np.float32))
-        x = dict(fine=image_crop(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
+        crop_images = partial(image_crop, directions=self.cfg.direction_inputs)
+        x = dict(fine=crop_images(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
                  seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
                  seed_tangent=stack('visible_seed_tangent'))
         if self.cfg.memory_slots:
             from .memory_data import memory_images
-            x.update(memory_images(items, vol, self.cfg, image_crop, pool))
+            x.update(memory_images(items, vol, self.cfg, crop_images, pool))
+            if self.cfg.memory_version == 3:
+                x['route_frame'] = stack('frame')
         return x
 
     def __call__(self,items,vol):
@@ -205,12 +218,12 @@ def photometric(image, params, rng):
 
 
 def augment_image_pair(image, params, rng, *, blur_sigma=0., drop_presence=False):
-    """Augment a CPU CT/presence pair in place, without mixing channels.
+    """Augment only CT/presence in place; extra direction channels are untouched.
 
     Blur both channels before adding CT intensity noise. Reflect padding keeps
     constant inputs constant; channel dropout remains exactly zero after blur.
     """
-    values = image.numpy()
+    values = image[:2].numpy()
     if blur_sigma > 0:
         gaussian_filter(values, sigma=(0., blur_sigma, blur_sigma, blur_sigma),
                         mode='reflect', output=values)
@@ -378,8 +391,15 @@ class IdentityObservationBuilder(ObservationBuilder):
                 distance = cKDTree(fiber.points).query(np.stack([o['pos'] for o in observations]))[0]
                 item['identity_observable'] |= bool((distance <= s.on_fiber_tolerance).any())
         item['identity_curve'] = curve
+        if cfg.memory_slots and cfg.memory_version == 3:
+            from .spatial_supervision import prepare_route_targets
+            prepare_route_targets(item, fiber, cfg)
         visible = visible_points(curve,cfg.fine)
         item['identity_label_z'] = (curve[visible] @ frame.T+pos)[:,2] if visible.any() else pos[2:3]
+        if cfg.memory_version == 3 and 'pair_observation_seed' in item:
+            # Matched local inputs stay identical after augmentation as well;
+            # the earlier observations must supply the distinguishing evidence.
+            rng = np.random.default_rng(item['pair_observation_seed'])
         if self.augment:
             draw = (float(np.exp(rng.uniform(-np.log(s.contrast),np.log(s.contrast)))),
                     float(rng.uniform(-s.brightness,s.brightness)),float(rng.uniform(0,s.noise)))
@@ -393,7 +413,7 @@ class IdentityObservationBuilder(ObservationBuilder):
     def footprint_allowed(self,item,band):
         # CT is restricted to the main crop, whose footprint FollowDataset checks.
         # Also reject matched labels if their distinguishing seed is not visible.
-        if item.get('source') == 5 and not item['visible_seed_mask'].any():
+        if item.get('source') == 5 and self.cfg.memory_version != 3 and not item['visible_seed_mask'].any():
             return False
         if self.cfg.memory_slots:
             from .memory_data import memory_allowed
@@ -463,6 +483,9 @@ class IdentityObservationBuilder(ObservationBuilder):
         batch.update(self.identity_targets(items))
         batch['identity_observable'] = torch.tensor([i.get('identity_observable',True) for i in items])
         batch['bank_tail_length'] = torch.tensor([i.get('bank_tail_length',0.) for i in items],dtype=torch.float32)
+        if self.cfg.memory_slots and self.cfg.memory_version == 3:
+            for key in ('route_ab','route_mask'):
+                batch[key] = torch.from_numpy(np.stack([i[key] for i in items]))
         if self.cfg.memory_slots and self.cfg.memory_version >= 2:
             from .memory_data import memory_targets
             batch.update(memory_targets(items, self.cfg))
@@ -494,6 +517,12 @@ class IdentityObservationBuilder(ObservationBuilder):
                     if item['drop_presence']:
                         x['memory_patches'][j,:,1] = 0
                         x['memory_seed_patch'][j,1] = 0
+        if (self.cfg.memory_version == 3 and self.cfg.route_sequence_weight > 0
+                and not any(i.get('_route_sequence_member',False) for i in items)):
+            from .spatial_sequences import earlier_decision
+            earlier = [row for item in items if (row := earlier_decision(item,self)) is not None]
+            if earlier:
+                batch['route_sequence'] = self(earlier,vol)
         return batch
 
 

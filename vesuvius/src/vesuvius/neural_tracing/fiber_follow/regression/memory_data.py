@@ -77,11 +77,11 @@ def memory_images(items, vol, cfg, image_crop, pool=None):
     layouts = [memory_layout(i, cfg) for i in items]
     count = memory_count(items, cfg)
     b, n = len(items), cfg.memory_patch_size
-    patches = torch.zeros(b, count, 2, n, n, n)
+    patches = torch.zeros(b, count, cfg.input_channels, n, n, n)
     mask = torch.zeros(b, count, dtype=torch.bool)
     positions = torch.zeros(b, count, 3)
     frames = torch.eye(3).expand(b, count, -1, -1).clone()
-    seed_patch = torch.zeros(b, 2, n, n, n)
+    seed_patch = torch.zeros(b, cfg.input_channels, n, n, n)
     seed_valid = torch.zeros(b, dtype=torch.bool)
     seed_position = torch.zeros(b, 3)
     seed_frame = torch.eye(3).expand(b, -1, -1).clone()

@@ -24,6 +24,9 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
     if not tails:
         return None
     tail = float(rng.choice(tails))
+    spatial = model.memory_slots and model.memory_version == 3
+    reference_gap = (max(8.,model.fine.behind*model.fine.spacing+
+                         model.memory_patch_size*model.fine.spacing/2+2.) if spatial else 8.)
     horizon = sample.future_s[-1]
     for _ in range(attempts):
         draw = bank.draw_path(rng, unique=False, min_length=tail+horizon+12)
@@ -45,7 +48,7 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
         if reverse:
             line, matched, separation = line[::-1], matched[::-1], separation[::-1]
         s = arclength(line)
-        heads = np.flatnonzero((s >= tail+8) & (s <= s[-1]-horizon-2))
+        heads = np.flatnonzero((s >= tail+reference_gap) & (s <= s[-1]-horizon-2))
         if choice:
             heads = heads[separation[heads] <= min(6., 2*(model.max_recovery_distance-1.))]
         if not len(heads):
@@ -86,16 +89,18 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
         order = rng.permutation(2)
         curves = curves[order]
         supported = supported[order].astype(np.float32)
-        reference_b = head-tail-8
+        reference_b = head-tail-reference_gap
         reference_a = float(np.interp(reference_b, s, matched))
         refs = [interp_at(parent.points, parent.s, np.array([reference_a]))[0],
                 interp_at(line, s, np.array([reference_b]))[0]]
         tangents = [tangent_at(parent.points, parent.s, reference_a)*(-1 if reverse else 1),
                     tangent_at(line, s, reference_b)]
         from vesuvius.neural_tracing.fiber_follow.regression.data import visible_points
-        if not visible_points((np.asarray(refs)-pos) @ frame,model.fine).all():
+        seed_visible = visible_points((np.asarray(refs)-pos) @ frame,model.fine)
+        if (not spatial and not seed_visible.all()) or (spatial and seed_visible.any()):
             continue
         rows = []
+        pair_observation_seed = int(rng.integers(2**63)) if spatial else None
         for target in range(2):
             offtrack = not choice and target == 0
             fiber, t, rev = (parent, own_t, reverse) if target == 0 else (neighbor, head, False)
@@ -111,6 +116,37 @@ def decision_pair(bank, sample, model, rng, *, attempts=32):
                        decision_tail=tail, bank_tail_length=tail if offtrack else 0.)
             if target == 1:
                 row.update(supervision_fiber=neighbor, bank_parent_arc_range=arc_range)
+            if spatial:
+                row['pair_observation_seed'] = pair_observation_seed
+                # Observed synthetic paths differ before the shared local tail.
+                # Labels are kept in memory_track, never in image/model inputs.
+                prefix_s = np.arange(reference_b,head-tail,.5)
+                prefix_b = interp_at(line,s,prefix_s)
+                prefix_a = interp_at(parent.points,parent.s,np.interp(prefix_s,s,matched))
+                prefix = prefix_a if target == 0 else prefix_b
+                common = (prefix_a+prefix_b)/2 if choice else prefix_b
+                blend = np.clip((prefix_s-(head-tail-8))/8,0,1)
+                blend = blend*blend*(3-2*blend)
+                prefix = prefix*(1-blend[:,None])+common*blend[:,None]
+                observed = np.concatenate((prefix,history[mask > 0][::-1],pos[None]))
+                observed_arc = arclength(observed)
+                arcs = np.arange(0,observed_arc[-1],model.memory_stride)
+                track_pos = interp_at(observed,observed_arc,arcs)
+                behind = interp_at(observed,observed_arc,np.maximum(0,arcs-.5))
+                heading0 = tangents[target]
+                track_frame = np.stack([frame_from_heading(normalize(p-q) if np.linalg.norm(p-q)>1e-6 else heading0)
+                                        for p,q in zip(track_pos,behind)])
+                # Only certain prefix and shared-tail membership is supervised;
+                # the interpolated bridge remains unknown.
+                pure_index = min(len(prefix_s)-1,int(np.searchsorted(prefix_s,head-tail-8.)))
+                pure = observed_arc[max(0,pure_index)]
+                on_tail = arcs >= observed_arc[-1]-tail+1e-5
+                off = np.where(arcs < pure,0.,np.nan)
+                if not choice:
+                    off[on_tail] = float(target == 0)
+                row['memory_track'] = dict(pos=track_pos,frame=track_frame,offtrack=off,
+                    offset=np.where((off == 0)[:,None],np.zeros((len(off),3)),np.nan))
+                row['seed_age'] = float(observed_arc[-1])
             rows.append(row)
         if rng.integers(2):
             rows.reverse()

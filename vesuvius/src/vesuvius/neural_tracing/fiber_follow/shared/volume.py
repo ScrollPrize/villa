@@ -184,6 +184,24 @@ def _find_channel_zarr(root: str, channel: str) -> str:
     raise FileNotFoundError(f"no *_{channel}.ome.zarr under {root}")
 
 
+def _grid_metadata(array_path: Path):
+    """Comparable OME grid declaration, when present (bare Zarr is also valid)."""
+    attrs = array_path.parent / '.zattrs'
+    if not attrs.exists():
+        return None
+    meta = json.loads(attrs.read_text()).get('multiscales', [])
+    if not meta:
+        return None
+    scale = meta[0]
+    axes = scale.get('axes', [])
+    if [a.get('name') if isinstance(a, dict) else a for a in axes] != ['z', 'y', 'x']:
+        raise ValueError(f'Expected z,y,x direction/presence axes: {array_path}')
+    dataset = next((d for d in scale['datasets'] if d['path'] == array_path.name), None)
+    if dataset is None:
+        raise ValueError(f'OME metadata does not declare level: {array_path}')
+    return axes, scale.get('coordinateTransformations'), dataset.get('coordinateTransformations')
+
+
 class FiberVolume:
     """Model-image readers plus presence for seed initialization.
 
@@ -193,6 +211,8 @@ class FiberVolume:
 
     def __init__(self, spec: FiberVolumeSpec, cache_bytes: int = 3 << 30) -> None:
         self.spec = spec
+        self._directions = None
+        self._cache_bytes = int(cache_bytes)
         if spec.mode not in ('ct', 'ct+presence') or min(spec.grid_scale, spec.ct_grid_scale) <= 0:
             raise ValueError('Invalid input mode or voxel scale; direction-field inputs are no longer supported')
         lvl = str(spec.fiber_level)
@@ -228,6 +248,34 @@ class FiberVolume:
             self._seed_presence = ChunkedArray(os.path.join(
                 _find_channel_zarr(self.spec.fiber_zarr_dir, 'presence'), str(self.spec.fiber_level)), 64 << 20)
         return self._seed_presence
+
+    def direction_fields(self):
+        """Lazily open nx/ny siblings of the selected presence store, on its grid.
+
+        Legacy CT/presence callers never open these files. Reallocate one quarter
+        of the reader budget from CT to the two direction caches when enabled.
+        """
+        if self._directions is None:
+            if self.presence is None:
+                raise ValueError('Direction inputs require a presence store')
+            presence = Path(self.presence.path)
+            suffix = '_presence.ome.zarr'
+            if not presence.parent.name.endswith(suffix):
+                raise ValueError('Cannot derive nx/ny siblings from presence store name')
+            prefix = presence.parent.name[:-len(suffix)]
+            grid = _grid_metadata(presence)
+            fields = []
+            for channel in ('nx', 'ny'):
+                path = presence.parent.with_name(f'{prefix}_{channel}.ome.zarr') / presence.name
+                field = ChunkedArray(path, self._cache_bytes // 8)
+                if field.shape != self.presence.shape or field.dtype != np.dtype('uint8') or field.fill != 0:
+                    raise ValueError(f'{channel}: expected uint8, zero fill and the presence grid shape')
+                if _grid_metadata(path) != grid:
+                    raise ValueError(f'{channel}: OME axes/scale/origin differ from the presence grid')
+                fields.append(field)
+            self.ct.cache_bytes = self._cache_bytes // 2
+            self._directions = tuple(fields)
+        return self._directions
 
     @property
     def channels(self) -> int:

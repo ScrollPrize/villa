@@ -20,7 +20,7 @@ class LearnedMemory(nn.Module):
         self.cfg = cfg
         h = cfg.hidden
         self.patch_encoder = nn.Sequential(
-            nn.Conv3d(2, 16, 3, stride=2, padding=1), nn.GroupNorm(4, 16), nn.SiLU(),
+            nn.Conv3d(cfg.input_channels, 16, 3, stride=2, padding=1), nn.GroupNorm(4, 16), nn.SiLU(),
             nn.Conv3d(16, 32, 3, stride=2, padding=1), nn.GroupNorm(8, 32), nn.SiLU(),
             nn.AdaptiveAvgPool3d((2, 2, 2)))
         self.patch_projection = nn.Linear(32, h)
@@ -76,8 +76,8 @@ class LearnedMemory(nn.Module):
                 state = {k: v.float() if v.is_floating_point() else v for k, v in state.items()}
             return self._observe(x, state)
 
-    def _observe(self, x, state):
-        """FP32 sequence unroll; returns state plus the per-write ``probe``."""
+    def prepare_sequence(self, x, state):
+        """Shared encoding/poses for legacy and spatial-memory state transitions."""
         patches = x['memory_patches']
         b, t = patches.shape[:2]
         valid = x['memory_mask'].bool()
@@ -99,6 +99,14 @@ class LearnedMemory(nn.Module):
         anchor_position = torch.where(seed_valid[:, None], x['memory_seed_position'], state['anchor_position'])
         anchor_frame = torch.where(seed_valid[:, None, None], x['memory_seed_frame'], state['anchor_frame'])
         pos, fr, previous, previous_frame, moved, seen = self.poses(x, valid, state)
+        return (state, valid, burn, encoded, anchor, anchor_valid, anchor_position,
+                anchor_frame, pos, fr, previous, previous_frame, moved, seen)
+
+    def _observe(self, x, state):
+        """FP32 sequence unroll; returns state plus the per-write ``probe``."""
+        (state, valid, burn, encoded, anchor, anchor_valid, anchor_position,
+         anchor_frame, pos, fr, previous, previous_frame, moved, seen) = self.prepare_sequence(x, state)
+        t = valid.shape[1]
         # Only the gated slot update is recurrent. Motion, seed pose and their
         # keys/values are formed for every write at once; the probe, which never
         # feeds back, reads the retained slots afterwards. Burn-in stays gradient-free.
@@ -106,7 +114,12 @@ class LearnedMemory(nn.Module):
         for lo, hi in ((0, burn), (burn, t)):
             if lo == hi:
                 continue
-            with torch.set_grad_enabled(torch.is_grad_enabled() and lo >= burn):
+            # A Python branch specializes symbolic sequence lengths. Passing a
+            # SymBool directly to set_grad_enabled breaks Dynamo recompilation.
+            backprop = torch.is_grad_enabled()
+            if lo < burn:
+                backprop = False
+            with torch.set_grad_enabled(backprop):
                 span = slice(lo, hi)
                 observations, anchor_tokens = self.write_inputs(
                     encoded[:, span], pos[:, span], fr[:, span], previous[:, span], previous_frame[:, span],
@@ -194,7 +207,7 @@ class LearnedMemory(nn.Module):
         pose = torch.where(valid[..., None], torch.cat((delta, rotation), -1), 0.)
         return self.motion(pose)
 
-    def read(self, decoded, state):
+    def read_tokens(self, state):
         slots = state['slots']+self.role[0]
         pose = self.relative_anchor(state['anchor_position'], state['anchor_frame'],
                                     state['position'], state['frame'], state['anchor_valid'])
@@ -202,5 +215,9 @@ class LearnedMemory(nn.Module):
         tokens = torch.cat((slots, anchor), 1)
         padding = torch.cat((torch.zeros(slots.shape[:2], device=slots.device, dtype=torch.bool),
                              ~state['anchor_valid'][:, None].bool().expand(-1, 8)), 1)
+        return tokens, padding
+
+    def read(self, decoded, state):
+        tokens, padding = self.read_tokens(state)
         return decoded+self.read_attention(self.read_norm(decoded), tokens, tokens,
                                            key_padding_mask=padding, need_weights=False)[0]

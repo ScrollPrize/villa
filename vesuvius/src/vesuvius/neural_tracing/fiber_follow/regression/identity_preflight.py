@@ -7,7 +7,7 @@ import time
 
 import torch
 
-from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig,DirectFollower,crop_support
+from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig,build_model,crop_support
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder,IdentitySampling
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bank import NeighborBank
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms,memory_probe_terms
@@ -28,6 +28,7 @@ def main(argv=None):
     ap.add_argument('--microbatch',type=int,default=4)
     ap.add_argument('--batches',type=int,default=4)
     ap.add_argument('--forward',action='store_true')
+    ap.add_argument('--memory-version',type=int,choices=(2,3),default=2)
     ap.add_argument('--memory-slots',type=int,default=0)
     ap.add_argument('--memory-steps',type=int,default=32)
     ap.add_argument('--memory-stride',type=int,default=4)
@@ -38,7 +39,7 @@ def main(argv=None):
     ap.add_argument('--onpolicy',nargs='*',default=[],help='Replay caches, e.g. collected with observed tracks')
     args=ap.parse_args(argv)
     torch.set_num_threads(4);torch.manual_seed(0)
-    cfg=DirectConfig(memory_slots=args.memory_slots,memory_steps=args.memory_steps,
+    cfg=DirectConfig(memory_version=args.memory_version,memory_slots=args.memory_slots,memory_steps=args.memory_steps,
                      memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size,
                      memory_grad_steps=args.memory_grad_steps)
     spec=FiberVolumeSpec(args.fiber_zarrs,ct_zarr=args.ct,ct_level=0,ct_grid_scale=4.,inputs='ct+presence')
@@ -54,7 +55,7 @@ def main(argv=None):
     ds=FollowDataset(fibers,spec,sample,band,chunk=args.microbatch,seed=37,batch_builder=builder,
                      onpolicy=[OnPolicyStates.load(p) for p in args.onpolicy])
     it=iter(ds);args.out.mkdir(parents=True,exist_ok=True)
-    model=DirectFollower(cfg).to(args.device,memory_format=conv_memory_format(args.device)) if args.forward else None
+    model=build_model(cfg).to(args.device,memory_format=conv_memory_format(args.device)) if args.forward else None
     rows=[]
     for index in range(args.batches):
         started=time.perf_counter();cpu=next(it)
@@ -83,6 +84,8 @@ def main(argv=None):
                 out=model(b['x'],b['hist'],b['hmask'],queries=b['identity_points'],candidates=b['candidate_points'])
                 terms=loss_terms(out,b,cfg)
                 loss=terms['geometry_per_state'].mean()+.5*terms['confidence_per_state'].mean()+.5*terms['identity_per_state'].mean()+terms['candidate_per_state'].mean()
+                if 'route_per_state' in terms:
+                    loss=loss+cfg.route_loss_weight*terms['route_per_state'].mean()
                 if 'memory_probe' in out:
                     probe=memory_probe_terms(out,b)
                     loss=loss+.5*(probe['memory_identity_per_state'].mean()+probe['memory_offset_per_state'].mean())

@@ -135,9 +135,9 @@ def test_presence_dropout_after_targets(monkeypatch):
     monkeypatch.setattr(IdentityObservationBuilder, 'images', lambda self, items, vol, pool=None: images)
     seen = []
     original = IdentityObservationBuilder.identity_targets
-    def targets(self, items, x):
-        seen.append(float(x['fine'][:, 1].abs().sum()))
-        return original(self, items, x)
+    def targets(self, items):
+        seen.append(float(images['fine'][:, 1].abs().sum()))
+        return original(self, items)
     monkeypatch.setattr(IdentityObservationBuilder, 'identity_targets', targets)
     out = builder(items, None)
     assert seen[0] > 0 and out['x']['fine'][:, 1].abs().sum() == 0
