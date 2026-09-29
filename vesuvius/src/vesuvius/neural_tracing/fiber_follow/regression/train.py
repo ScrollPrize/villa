@@ -21,7 +21,8 @@ from vesuvius.neural_tracing.fiber_follow.shared.runloop import (
 )
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolume, FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.regression.model import (
-    ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, SPATIAL_MEMORY_ARCHITECTURE, DirectConfig, DirectFollower, build_model,
+    ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, SPATIAL_MEMORY_ARCHITECTURE,
+    TRAJECTORY_MEMORY_ARCHITECTURE, DirectConfig, DirectFollower, build_model,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.data import (
     IdentityObservationBuilder, IdentitySampling, DirectTracer, LOCATION_SOURCES,
@@ -86,7 +87,8 @@ def match_optimizer_layout(opt):
                 state[key] = torch.empty_like(param).copy_(value)
 
 
-ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1, SPATIAL_MEMORY_ARCHITECTURE)
+ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1,
+                 SPATIAL_MEMORY_ARCHITECTURE, TRAJECTORY_MEMORY_ARCHITECTURE)
 ROUTE_OPTIONS = ('route_grid_step','route_transition_radius','route_transition_cost','route_loss_weight','route_sequence_weight')
 MEMORY_OPTIONS = ('memory_slots','memory_steps','memory_stride','memory_patch_size','memory_grad_steps')
 MEMORY_GRAD_CLIP = 5.
@@ -98,11 +100,21 @@ def checkpoint_config(ck):
     if ck['architecture'] == MEMORY_ARCHITECTURE_V1:
         model_cfg.setdefault('memory_version', 1)  # saved before versions were recorded
     cfg = DirectConfig(**model_cfg)
-    expected = ({1: MEMORY_ARCHITECTURE_V1, 2: MEMORY_ARCHITECTURE, 3: SPATIAL_MEMORY_ARCHITECTURE}[cfg.memory_version]
+    expected = ({1: MEMORY_ARCHITECTURE_V1, 2: MEMORY_ARCHITECTURE, 3: SPATIAL_MEMORY_ARCHITECTURE,
+                 4: TRAJECTORY_MEMORY_ARCHITECTURE}[cfg.memory_version]
                 if cfg.memory_slots else ARCHITECTURE)
     if ck['architecture'] != expected:
         raise ValueError('Checkpoint architecture and memory configuration disagree')
     return cfg
+
+
+def resolve_refinement_config(cfg, radius):
+    """An omitted override preserves the checkpoint's refinement behavior."""
+    if radius is None:
+        return cfg
+    if cfg.memory_version != 3 or not cfg.memory_slots:
+        raise ValueError('Route refinement radius requires spatial memory v3')
+    return replace(cfg, route_refinement_radius=radius)
 
 
 def load_checkpoint(path,device='cuda'):
@@ -151,6 +163,28 @@ def initialize_spatial_model(model, cfg):
     allowed = ('route_',) if model.cfg.memory_slots else ('route_','recurrent_memory.')
     if incompatible.unexpected_keys or any(not key.startswith(allowed) for key in incompatible.missing_keys):
         raise ValueError(f'Unexpected spatial initialization mismatch: {incompatible}')
+    upgraded.train(model.training)
+    return upgraded
+
+
+def initialize_trajectory_model(model, cfg):
+    """Start a v4 run from compatible weights, excluding lattice/refinement heads.
+
+This is an architectural migration, never an optimizer or RNG resume. Direct
+decoder attention to identity memory changes behavior even with shared weights.
+"""
+    if cfg.memory_version != 4:
+        raise ValueError('Trajectory initialization requires memory version 4')
+    if model.cfg.memory_slots and model.cfg.memory_version == 1:
+        raise ValueError('Legacy v1 memory checkpoints cannot initialize new runs')
+    device = next(model.parameters()).device
+    upgraded = build_model(cfg).to(device, memory_format=conv_memory_format(device))
+    state = {k: v for k, v in model.state_dict().items()
+             if not k.startswith(('route_', 'correction_head.'))}
+    incompatible = upgraded.load_state_dict(state, strict=False)
+    allowed = () if model.cfg.memory_slots else ('recurrent_memory.',)
+    if incompatible.unexpected_keys or any(not k.startswith(allowed) for k in incompatible.missing_keys):
+        raise ValueError(f'Unexpected trajectory initialization mismatch: {incompatible}')
     upgraded.train(model.training)
     return upgraded
 
@@ -335,13 +369,13 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                                    *((k.removeprefix('memory_'), v) for k, v in probe.items() if not k.endswith('_per_state'))):
                     accumulate(memory, key, value)
         loss.backward()
-        if 'route_sequence' in batch and model.cfg.memory_version == 3:
-            earlier = batch['route_sequence']
+        if model.cfg.memory_version in (3, 4) and model.cfg.sequence_key in batch:
+            earlier = batch[model.cfg.sequence_key]
             with torch.autocast('cuda',dtype=torch.bfloat16,enabled=torch.device(device).type == 'cuda'):
                 sequence_output = model(earlier['x'],earlier['hist'],earlier['hmask'])
                 sequence_terms = loss_terms(sequence_output,earlier,model.cfg,tolerance,n_commit=n_commit)
-                sequence_loss = model.cfg.route_sequence_weight*(
-                    model.cfg.route_loss_weight*sequence_terms['route_per_state']+
+                sequence_loss = model.cfg.sequence_weight*(
+                    model.cfg.route_loss_weight*sequence_terms.get('route_per_state', 0.)+
                     sequence_terms['geometry_per_state']+confidence_weight*sequence_terms['confidence_per_state']).sum()/total
             sequence_loss.backward()
             accumulate(memory,'sequence_loss',sequence_loss)
@@ -465,13 +499,17 @@ def build_parser():
     ap.add_argument('--decoder-layers', type=int, default=4)
     ap.add_argument('--axial-layers', type=int, default=4)
     ap.add_argument('--hidden', type=int, default=128)
-    ap.add_argument('--memory-version', type=int, choices=(2,3), default=2,
-                    help='2: existing recurrent follower; 3: spatial identity route model')
+    ap.add_argument('--memory-version', type=int, choices=(2,3,4), default=2,
+                    help='2: recurrent follower; 3: spatial lattice route; 4: continuous trajectory with direct identity attention (requires --no-correction)')
+    ap.add_argument('--trajectory-sequence-weight', type=float, default=DirectConfig.trajectory_sequence_weight,
+                    help='V4 additional geometry/confidence supervision at an earlier causal replay decision')
     ap.add_argument('--route-grid-step', type=float, default=DirectConfig.route_grid_step)
     ap.add_argument('--route-transition-radius', type=int, default=DirectConfig.route_transition_radius)
     ap.add_argument('--route-transition-cost', type=float, default=DirectConfig.route_transition_cost)
     ap.add_argument('--route-loss-weight', type=float, default=DirectConfig.route_loss_weight)
     ap.add_argument('--route-sequence-weight', type=float, default=DirectConfig.route_sequence_weight)
+    ap.add_argument('--route-refinement-radius', type=float,
+                    help='V3 total per-axis refinement bound in trace voxels; omitted preserves checkpoint value or legacy half-cell bound; may change on resume')
     ap.add_argument('--memory-slots', type=int, default=16,
                     help='Learned recurrent memory slots; 0 preserves the crop-only model')
     ap.add_argument('--memory-steps', type=int, default=64,
@@ -598,12 +636,19 @@ def main(argv=None):
                        memory_slots=args.memory_slots,memory_steps=args.memory_steps,
                        memory_stride=args.memory_stride,memory_patch_size=args.memory_patch_size,
                        memory_grad_steps=args.memory_grad_steps,memory_version=args.memory_version,
+                       trajectory_sequence_weight=args.trajectory_sequence_weight,
                        **{k:getattr(args,k) for k in ROUTE_OPTIONS})
     initialized = None
     resume = None
     if args.init_tracer:
         initialized,_,_,_,_ = load_checkpoint(args.init_tracer,args.device)
-        if args.memory_version == 3 and initialized.cfg.memory_version != 3:
+        if args.memory_version == 4 and initialized.cfg.memory_version != 4:
+            cfg = replace(initialized.cfg, memory_version=4, correction=False, route_refinement_radius=None,
+                          trajectory_sequence_weight=args.trajectory_sequence_weight,
+                          **{k: getattr(args,k) for k in MEMORY_OPTIONS})
+            initialized = initialize_trajectory_model(initialized, cfg)
+            progress('Initialized continuous trajectory memory v4 from shared EMA weights; lattice and refinement heads omitted')
+        elif args.memory_version == 3 and initialized.cfg.memory_version != 3:
             cfg = replace(initialized.cfg,memory_version=3,
                           **{k:getattr(args,k) for k in (*MEMORY_OPTIONS,*ROUTE_OPTIONS)})
             initialized = initialize_spatial_model(initialized,cfg)
@@ -621,7 +666,7 @@ def main(argv=None):
             if initialized.cfg.memory_slots and initialized.cfg.memory_version == 1:
                 raise ValueError('Legacy v1 memory checkpoints cannot initialize new runs')
             cfg = initialized.cfg
-        for key in (*MEMORY_OPTIONS,'memory_version',*ROUTE_OPTIONS):
+        for key in (*MEMORY_OPTIONS,'memory_version',*ROUTE_OPTIONS,'trajectory_sequence_weight'):
             setattr(args, key, getattr(cfg, key))
         if args.direction_inputs and not cfg.direction_inputs:
             initialized = add_direction_inputs(initialized)
@@ -633,6 +678,10 @@ def main(argv=None):
         cfg = checkpoint_config(resume)
         if args.direction_inputs != cfg.direction_inputs:
             raise ValueError('Resume direction inputs differ; use --init-tracer for a new direction-enabled run')
+    cfg = resolve_refinement_config(cfg, args.route_refinement_radius)
+    args.route_refinement_radius = cfg.route_refinement_radius
+    if initialized is not None:
+        initialized.cfg = cfg
     if args.decision_fraction and args.microbatch % 2:
         raise ValueError('Matched decisions require an even microbatch')
     if not np.isfinite(args.candidate_weight) or args.candidate_weight <= 0:
@@ -709,7 +758,7 @@ def main(argv=None):
                    'log_every','ckpt_every','diag_every','dagger_device','compile','init_tracer',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                    'memory_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
-                   'decision_fraction','bank_following_probability','fresh_fraction'}
+                   'decision_fraction','bank_following_probability','fresh_fraction','route_refinement_radius'}
         defaults = build_parser()
         for key,value in vars(args).items():
             # Options added after a run started had their default behavior.
@@ -779,6 +828,9 @@ def main(argv=None):
             seed_manifest_sha256=manifest['sha256'], fiber_manifest=fiber_manifest(fibers),
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
     log = RunLog(out/'log.jsonl', formatter=format_training_log)
+    if resume:
+        log.record(dict(step=done, event='resume_configuration', checkpoint=str(args.resume),
+                        training_options=vars(args), model_cfg=cfg.to_dict()))
     log.record(dict(step=done,event='identity_sampling',architecture=model.architecture,
         source_sampling=dict(fresh=args.fresh_fraction,fixed=(1-args.fresh_fraction)/2,recent=(1-args.fresh_fraction)/2),
         pair_sampling_version=identity_sampling.pair_sampling_version,

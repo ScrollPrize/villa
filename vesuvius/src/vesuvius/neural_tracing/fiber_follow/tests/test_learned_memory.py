@@ -409,6 +409,6 @@ def test_direct_tracer_reads_seed_once_and_streams_one_observation_per_decision(
 
 
 @pytest.mark.parametrize('kwargs', [dict(memory_slots=-1),dict(memory_grad_steps=0),dict(memory_stride=0),
-                                    dict(memory_patch_size=4),dict(memory_version=4)])
+                                    dict(memory_patch_size=4),dict(memory_version=5)])
 def test_invalid_memory_config(kwargs):
     with pytest.raises(ValueError): memory_config(**kwargs)

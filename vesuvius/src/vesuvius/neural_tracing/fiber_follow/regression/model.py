@@ -19,6 +19,7 @@ ARCHITECTURE = 'axial_fiber_v3'
 MEMORY_ARCHITECTURE = 'axial_fiber_memory_v2'
 MEMORY_ARCHITECTURE_V1 = 'axial_fiber_memory_v1'  # no probe; loadable, not trained further
 SPATIAL_MEMORY_ARCHITECTURE = 'axial_fiber_memory_v3'
+TRAJECTORY_MEMORY_ARCHITECTURE = 'axial_fiber_memory_v4'
 TOKEN_STRIDE = (8, 2, 2)  # z, y, x in input samples
 TOKEN_OFFSET = (3, 0, 0)  # centre of four stride-two stem positions
 IDENTITY_EVIDENCE_WIDTH = 8  # point/mean/min/coverage for seed and history separately
@@ -56,6 +57,8 @@ class DirectConfig:
     route_transition_cost: float = .25
     route_loss_weight: float = 1.
     route_sequence_weight: float = .5  # v3: additional earlier decision from an observed track
+    route_refinement_radius: float | None = None  # v3: per-axis displacement from selected cell; None keeps half-cell bound
+    trajectory_sequence_weight: float = .5  # v4: additional causal decision on an observed track
 
     def __post_init__(self):
         if not isinstance(self.direction_inputs, bool):
@@ -74,6 +77,8 @@ class DirectConfig:
             raise ValueError('Local observation patch must fit fine crop')
         if not math.isfinite(self.correction_limit) or self.correction_limit <= 0:
             raise ValueError('Invalid correction limit')
+        if self.route_refinement_radius is not None and (not math.isfinite(self.route_refinement_radius) or self.route_refinement_radius <= 0):
+            raise ValueError('Route refinement radius must be finite and positive')
         if not isinstance(self.correction_steps, int) or self.correction_steps < 1:
             raise ValueError('Invalid correction steps')
         if self.n_future*self.future_step > (c.depth-c.behind-1)*c.spacing:
@@ -83,7 +88,7 @@ class DirectConfig:
         if self.memory_slots:
             if any(not isinstance(v, int) or v < 1 for v in (self.memory_steps, self.memory_stride, self.memory_grad_steps)):
                 raise ValueError('Memory sequence dimensions must be positive integers')
-            if self.memory_version not in (1, 2, 3):
+            if self.memory_version not in (1, 2, 3, 4):
                 raise ValueError('Unknown memory version')
             if not isinstance(self.memory_patch_size, int) or self.memory_patch_size < 5 or self.memory_patch_size % 2 != 1:
                 raise ValueError('Memory patch size must be odd and at least five')
@@ -96,6 +101,21 @@ class DirectConfig:
                 raise ValueError('Route transition radius must be a positive integer')
             if any(not math.isfinite(v) or v < 0 for v in (self.route_transition_cost, self.route_loss_weight, self.route_sequence_weight)):
                 raise ValueError('Route cost and loss weight must be finite and nonnegative')
+        if self.memory_version == 4:
+            if not self.memory_slots:
+                raise ValueError('Continuous trajectory memory requires positive memory_slots')
+            if self.correction or self.route_refinement_radius is not None:
+                raise ValueError('Memory v4 uses one decoder pass; use --no-correction and no route refinement radius')
+            if not math.isfinite(self.trajectory_sequence_weight) or self.trajectory_sequence_weight < 0:
+                raise ValueError('Trajectory sequence weight must be finite and nonnegative')
+
+    @property
+    def sequence_weight(self):
+        return {3: self.route_sequence_weight, 4: self.trajectory_sequence_weight}.get(self.memory_version, 0.)
+
+    @property
+    def sequence_key(self):
+        return 'trajectory_sequence' if self.memory_version == 4 else 'route_sequence'
 
     @property
     def input_channels(self):
@@ -119,6 +139,9 @@ class DirectConfig:
 
 def build_model(cfg):
     """Explicit architecture dispatch; legacy constructors and weights stay intact."""
+    if cfg.memory_slots and cfg.memory_version == 4:
+        from .trajectory_model import TrajectoryMemoryFollower
+        return TrajectoryMemoryFollower(cfg)
     if cfg.memory_slots and cfg.memory_version == 3:
         from .spatial_model import SpatialMemoryFollower
         return SpatialMemoryFollower(cfg)
@@ -302,8 +325,8 @@ class DirectFollower(nn.Module):
 
     def __init__(self, cfg):
         super().__init__()
-        if cfg.memory_version == 3:
-            raise ValueError('Use build_model(cfg) or SpatialMemoryFollower for memory v3')
+        if cfg.memory_version in (3, 4):
+            raise ValueError('Use build_model(cfg) for memory v3/v4')
         self.cfg = cfg
         c,h = cfg.channels,cfg.hidden
         self.encoder = AxialEncoder(cfg)

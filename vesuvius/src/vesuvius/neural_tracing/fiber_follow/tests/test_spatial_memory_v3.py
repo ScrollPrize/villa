@@ -22,7 +22,9 @@ from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObserva
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.train import (
     optimizer_update, save_checkpoint, load_checkpoint, initialize_spatial_model, add_direction_inputs,
+    checkpoint_config, resolve_refinement_config, build_parser,
 )
+from vesuvius.neural_tracing.fiber_follow.shared.runloop import resume_training, training_rng_state
 from vesuvius.neural_tracing.fiber_follow.shared.data import SampleConfig
 from vesuvius.neural_tracing.fiber_follow.shared.volume import FiberVolumeSpec
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import CropSpec
@@ -80,6 +82,78 @@ def test_route_targets_can_localize_departed_heads_but_unknowns_have_no_gradient
     terms['route_per_state'].sum().backward()
     assert logits.grad[0].abs().sum() > 0 and logits.grad[1].abs().sum() == 0
     assert torch.isfinite(terms['route_per_state']).all()
+
+
+def test_wider_refinement_leaves_route_and_forward_planes_unchanged(monkeypatch):
+    torch.manual_seed(12)
+    model = build_model(cfg()).eval()
+    b = memory_batch(model.cfg,1)
+    # Fix the discrete route at the center and saturate the fine correction.
+    center = int(model.route_xy.square().sum(-1).argmin())
+    monkeypatch.setattr('vesuvius.neural_tracing.fiber_follow.regression.spatial_model.connected_route',
+                        lambda logits,*args: torch.full(logits.shape[:2],center,dtype=torch.long,device=logits.device))
+    with torch.no_grad():
+        model.correction_head[-1].weight.zero_()
+        model.correction_head[-1].bias.fill_(100.)
+        old = model(b['x'],b['hist'],b['hmask'])
+        model.cfg = resolve_refinement_config(model.cfg,1.5)
+        wide = model(b['x'],b['hist'],b['hmask'])
+    half_cell = model.cfg.lateral_limit/(model.route_width-1)
+    torch.testing.assert_close(old['points'][...,:2],torch.full_like(old['points'][...,:2],half_cell))
+    # Two unchanged unit-length steps reach sqrt(2) on each axis, below 1.5.
+    torch.testing.assert_close(wide['points'][...,:2],torch.full_like(wide['points'][...,:2],2**.5))
+    for key in ('initial_points','route_indices','route_logits','route_support'):
+        torch.testing.assert_close(wide[key],old[key],rtol=0,atol=0)
+    torch.testing.assert_close(wide['points'][...,2],old['points'][...,2],rtol=0,atol=0)
+    assert (wide['points'][:,:1].norm(dim=-1) <= model.cfg.max_recovery_distance).all()
+
+
+@pytest.mark.parametrize('radius',[0.,-1.,float('nan'),float('inf')])
+def test_invalid_refinement_radius_rejected(radius):
+    with pytest.raises(ValueError,match='refinement radius'):
+        cfg(route_refinement_radius=radius)
+
+
+def test_refinement_radius_legacy_load_resume_and_roundtrip(tmp_path):
+    torch.manual_seed(32)
+    model = build_model(cfg())
+    ema = copy.deepcopy(model)
+    opt = torch.optim.AdamW(model.parameters(),lr=.001)
+    b = memory_batch(model.cfg)
+    optimizer_update(model,ema,opt,[b],1,.001,device='cpu',compute_metrics=False)
+    old_cfg = model.cfg.to_dict()
+    old_cfg.pop('route_refinement_radius')
+    ck = dict(architecture=model.architecture,model_cfg=old_cfg,model=model.state_dict(),
+              ema=ema.state_dict(),optimizer=opt.state_dict(),rng=training_rng_state(),step=1)
+    legacy = checkpoint_config(ck)
+    assert legacy.route_refinement_radius is None
+    assert resolve_refinement_config(legacy,None) == legacy
+    expanded = resolve_refinement_config(legacy,1.5)
+    assert {k:v for k,v in expanded.to_dict().items() if k != 'route_refinement_radius'} == old_cfg
+    assert resolve_refinement_config(expanded,None).route_refinement_radius == 1.5
+    restored = build_model(expanded)
+    restored_ema = copy.deepcopy(restored)
+    restored_opt = torch.optim.AdamW(restored.parameters(),lr=.001)
+    assert resume_training(ck,restored,restored_ema,restored_opt)[0] == 1
+    for source,dest in [(model,restored),(ema,restored_ema)]:
+        for k,v in source.state_dict().items():
+            torch.testing.assert_close(dest.state_dict()[k],v,rtol=0,atol=0)
+    for key,state in opt.state_dict()['state'].items():
+        for name,value in state.items():
+            torch.testing.assert_close(restored_opt.state_dict()['state'][key][name],value,rtol=0,atol=0)
+    assert restored_opt.state_dict()['param_groups'] == opt.state_dict()['param_groups']
+    path = tmp_path/'wide.pt'
+    spec = FiberVolumeSpec('/tmp/presence',ct_zarr='/tmp/ct',inputs='ct+presence')
+    sample = SampleConfig(crop=expanded.fine,n_history=expanded.n_history,n_future=expanded.n_future)
+    save_checkpoint(path,restored,restored_ema,spec,sample)
+    loaded,*_ = load_checkpoint(path,'cpu')
+    assert loaded.cfg.route_refinement_radius == 1.5
+    with torch.no_grad():
+        torch.testing.assert_close(loaded(b['x'],b['hist'],b['hmask'])['points'],
+                                   restored_ema.eval()(b['x'],b['hist'],b['hmask'])['points'],rtol=0,atol=0)
+    assert build_parser().get_default('route_refinement_radius') is None
+    with pytest.raises(ValueError,match='spatial memory v3'):
+        resolve_refinement_config(memory_config(),1.5)
 
 
 def test_admission_is_prewrite_and_rejection_preserves_identity_but_keeps_recent():

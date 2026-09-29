@@ -12,8 +12,9 @@ loadable with its existing restrictions on further training.
   25 × 25 locations on each of 16 planes, at 2 trace voxels spacing.
 - A max-sum dynamic program chooses a connected route, constraining the first
   connection by the existing recovery distance. It selects a mode rather than
-  averaging separate fibers. The existing refiner moves at most half a lattice
-  spacing from each selected location; the first connection is projected back
+  averaging separate fibers. By default the refiner moves at most half a lattice
+  spacing per axis from each selected location. `--route-refinement-radius` can
+  override that total displacement bound; the first connection is projected back
   inside the distance limit if necessary.
 - The route receives its own spatial cross-entropy loss with bilinear targets.
   This loss directly trains the memory reader, writer and observation encoder.
@@ -50,19 +51,35 @@ state cannot be handed to a v3 tracer; each v3 trace initializes its own state.
 
 ## Launch and checkpoint compatibility
 
-The new launcher inherits the existing memory recipe and enables compilation:
+The new launcher uses the run4 training/sampling recipe and enables compilation:
+8 committed points, no presence dropout, 60% fresh samples, 10% matched
+decisions, and 20% bank-following probability. These defaults override the older
+recipe in `launch_memory.sh`; options supplied to the v3 launcher override them.
 
 ```bash
 RUN_NAME=axial_spatial_memory_v3_run1 bash scripts/launch_spatial_memory.sh \
-  --init-tracer output/axial_memory_seq_run4/ckpt_032000.pt
+  --init-tracer output/axial_memory_seq_run4/ckpt_032000.pt \
+  --direction-inputs
 ```
 
-Omit `--init-tracer` for a fresh model. Migration initializes a **new run**, keeps
+Use a fresh run name if that destination already exists. Omit `--direction-inputs`
+to keep the checkpoint's input channels. Omit `--init-tracer` for a fresh model.
+Migration initializes a **new run**, keeps
 compatible encoder/decoder/memory weights, and initializes the route head afresh;
-it does not resume v2 optimizer or step state. Existing input direction channels
+it does not resume v2 optimizer or step state or inherit its training/sampling
+options. Existing input direction channels
 are preserved, and `--direction-inputs` can still expand a two-channel checkpoint.
 Use the existing `--resume` mechanism with the v3 run's original options for a
 true resume. The checkpoint architecture and configuration must agree.
+
+`--route-refinement-radius 1.5` may be changed on a v3 resume without resetting
+weights, EMA, optimizer, or step count. It bounds total lateral displacement per
+axis from the selected lattice location, independently of `--correction-limit`
+(the maximum correction per iteration). With two unit-length correction steps,
+the reachable displacement per axis is at most sqrt(2), even with a 1.5 bound.
+Omitting the option preserves the saved value; older checkpoints retain the
+half-cell bound. The bound is saved in `model_cfg` for inference and collection.
+Resume logs record the effective model configuration and training options.
 
 Programmatic construction uses `build_model(cfg)`; it dispatches to v2 or v3.
 `load_checkpoint()` dispatches from the saved architecture. Direct construction
@@ -78,6 +95,7 @@ Controls saved in the checkpoint:
 | `--route-transition-cost` | 0.25 | Squared cell-displacement penalty during decoding |
 | `--route-loss-weight` | 1 | Direct spatial localization loss coefficient |
 | `--route-sequence-weight` | 0.5 | Additional earlier-decision loss coefficient |
+| `--route-refinement-radius` | half-cell / saved value | Total per-axis refinement displacement; may change on resume |
 
 ## Validation and timing
 

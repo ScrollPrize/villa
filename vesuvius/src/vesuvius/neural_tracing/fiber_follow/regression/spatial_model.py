@@ -2,7 +2,8 @@
 
 Route logits receive direct localization supervision. Discrete max-sum decoding
 preserves modes; it never averages distinct fibers. The existing fine refiner
-only moves within the selected lattice cell. No annotations enter this module.
+defaults to the selected lattice cell, with an optional wider refinement bound.
+No annotations enter this module.
 """
 from dataclasses import replace
 import math
@@ -101,11 +102,12 @@ class SpatialMemoryFollower(DirectFollower):
                                memory_key_padding_mask=local_padding)
         refinements = [points]
         half_cell = cfg.lateral_limit/(self.route_width-1)
+        refinement_radius = half_cell if cfg.route_refinement_radius is None else cfg.route_refinement_radius
         for _ in range(cfg.correction_steps if cfg.correction else 0):
             evidence = self.evidence(ctx,points,'correction')
             correction = self.correction_head(torch.cat((decoded,evidence,points/16),-1)).float().tanh()
             lateral = lateral+correction*(cfg.correction_limit/math.sqrt(2))
-            lateral = torch.maximum(torch.minimum(lateral,initial[...,:2]+half_cell),initial[...,:2]-half_cell)
+            lateral = torch.maximum(torch.minimum(lateral,initial[...,:2]+refinement_radius),initial[...,:2]-refinement_radius)
             lateral = lateral.clamp(-cfg.lateral_limit,cfg.lateral_limit)
             first = lateral[:,:1]
             first = first*(first_limit/first.norm(dim=-1,keepdim=True).clamp_min(1e-8)).clamp(max=1.)

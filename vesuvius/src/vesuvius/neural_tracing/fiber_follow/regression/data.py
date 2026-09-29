@@ -60,6 +60,8 @@ class ObservationBuilder:
             x.update(memory_images(items, vol, self.cfg, crop_images, pool))
             if self.cfg.memory_version == 3:
                 x['route_frame'] = stack('frame')
+            elif self.cfg.memory_version == 4:
+                x['query_frame'] = stack('frame')
         return x
 
     def __call__(self,items,vol):
@@ -396,7 +398,7 @@ class IdentityObservationBuilder(ObservationBuilder):
             prepare_route_targets(item, fiber, cfg)
         visible = visible_points(curve,cfg.fine)
         item['identity_label_z'] = (curve[visible] @ frame.T+pos)[:,2] if visible.any() else pos[2:3]
-        if cfg.memory_version == 3 and 'pair_observation_seed' in item:
+        if cfg.memory_version in (3, 4) and 'pair_observation_seed' in item:
             # Matched local inputs stay identical after augmentation as well;
             # the earlier observations must supply the distinguishing evidence.
             rng = np.random.default_rng(item['pair_observation_seed'])
@@ -413,7 +415,7 @@ class IdentityObservationBuilder(ObservationBuilder):
     def footprint_allowed(self,item,band):
         # CT is restricted to the main crop, whose footprint FollowDataset checks.
         # Also reject matched labels if their distinguishing seed is not visible.
-        if item.get('source') == 5 and self.cfg.memory_version != 3 and not item['visible_seed_mask'].any():
+        if item.get('source') == 5 and self.cfg.memory_version not in (3, 4) and not item['visible_seed_mask'].any():
             return False
         if self.cfg.memory_slots:
             from .memory_data import memory_allowed
@@ -517,12 +519,12 @@ class IdentityObservationBuilder(ObservationBuilder):
                     if item['drop_presence']:
                         x['memory_patches'][j,:,1] = 0
                         x['memory_seed_patch'][j,1] = 0
-        if (self.cfg.memory_version == 3 and self.cfg.route_sequence_weight > 0
+        if (self.cfg.memory_version in (3, 4) and self.cfg.sequence_weight > 0
                 and not any(i.get('_route_sequence_member',False) for i in items)):
             from .spatial_sequences import earlier_decision
             earlier = [row for item in items if (row := earlier_decision(item,self)) is not None]
             if earlier:
-                batch['route_sequence'] = self(earlier,vol)
+                batch[self.cfg.sequence_key] = self(earlier,vol)
         return batch
 
 
