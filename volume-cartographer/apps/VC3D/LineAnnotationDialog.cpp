@@ -486,6 +486,8 @@ public:
         // Edge colour; unset draws the fill's darker shade (the default look).
         std::optional<QColor> edge;
         qreal radius = 4.5;
+        // Adjacent-winding link (or adjacent candidate): drawn as a triangle.
+        bool triangle = false;
     };
 
     using QWidget::QWidget;
@@ -545,7 +547,12 @@ protected:
             painter.setPen(dot.edge ? QPen(*dot.edge, 1.5)
                                     : QPen(dot.color.darker(150), 1.0));
             painter.setBrush(dot.color);
-            painter.drawEllipse(QPointF(x, midY), dot.radius, dot.radius);
+            if (dot.triangle) {
+                painter.drawPath(vc3d::line_annotation::generatedTriangleMarkerPath(
+                    QPointF(x, midY), dot.radius));
+            } else {
+                painter.drawEllipse(QPointF(x, midY), dot.radius, dot.radius);
+            }
         }
     }
 
@@ -2477,6 +2484,12 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
         emit generatedControlPointLinkCandidateRequested(surfaceName,
                                                          controlPointIndex,
                                                          volumePoint);
+    };
+    options.designateAdjacentLinkCandidate = [this, surfaceName](size_t controlPointIndex,
+                                                                 cv::Vec3f volumePoint) {
+        emit generatedControlPointAdjacentLinkCandidateRequested(surfaceName,
+                                                                 controlPointIndex,
+                                                                 volumePoint);
     };
     options.linkWithCandidate = [this, surfaceName](size_t controlPointIndex,
                                                     cv::Vec3f volumePoint) {
@@ -4546,8 +4559,13 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             continue;
         }
         if (control.isLinkCandidate) {
-            linkCandidatePath.addEllipse(scenePoint, control.isSeed ? 11.0 : 10.0,
-                                         control.isSeed ? 11.0 : 10.0);
+            const double candidateRadius = control.isSeed ? 11.0 : 10.0;
+            if (control.isAdjacentLinkCandidate) {
+                linkCandidatePath.addPath(vc3d::line_annotation::generatedTriangleMarkerPath(
+                    scenePoint, candidateRadius));
+            } else {
+                linkCandidatePath.addEllipse(scenePoint, candidateRadius, candidateRadius);
+            }
             continue;
         }
         if (control.isKollesisTermination) {
@@ -4556,13 +4574,21 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                 continue;
             }
         }
+        // An adjacent-winding link is a triangle in the same state colour.
+        const auto addLinkedMarker = [&control, &scenePoint](QPainterPath& path) {
+            if (control.hasAdjacentLinks) {
+                path.addPath(
+                    vc3d::line_annotation::generatedTriangleMarkerPath(scenePoint, 12.0));
+            } else {
+                path.addEllipse(scenePoint, 12.0, 12.0);
+            }
+        };
         if (control.hasPendingLinks) {
-            (control.hasSameHvPendingLinks ? sameHvPendingBranchControlPath
-                                           : pendingBranchControlPath)
-                .addEllipse(scenePoint, 12.0, 12.0);
+            addLinkedMarker(control.hasSameHvPendingLinks ? sameHvPendingBranchControlPath
+                                                          : pendingBranchControlPath);
         } else if (control.hasBranches) {
-            (control.hasSameHvBranches ? sameHvBranchControlPath : branchControlPath)
-                .addEllipse(scenePoint, 12.0, 12.0);
+            addLinkedMarker(control.hasSameHvBranches ? sameHvBranchControlPath
+                                                      : branchControlPath);
         } else if (control.isSeed) {
             seedPath.addEllipse(scenePoint, 11.0, 11.0);
         } else {
@@ -5201,6 +5227,9 @@ void LineAnnotationDialog::updateOverviewBar()
             dot.color = QColor(255, 230, 0);
         }
         dot.radius = control.isSeed ? 6.0 : 4.5;
+        dot.triangle = !control.isSplitCandidate &&
+                       (control.isAdjacentLinkCandidate ||
+                        (control.hasAdjacentLinks && !control.isLinkCandidate));
         if (control.isKollesisTermination && !control.isSplitCandidate &&
             !control.isLinkCandidate) {
             // As in the cut views: a hollow yellow ring when unlinked, the

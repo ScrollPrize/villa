@@ -276,6 +276,71 @@ class TestAnalyzeChanges:
         assert actions['vol.tif'][0] == SyncAction.SKIP
 
 
+class TestLegacyRegressionUpload:
+    def test_stripped_fiber_is_a_conflict_not_an_upload(self, manager):
+        """The shadow had adjacent links; an older VC3D dropped their array. A plain
+        "local modified" upload would spread the loss: conflict instead."""
+        import test_fiber_merge as fm
+        knowing = fm.make_fiber(fm.BASE_CPS,
+                                branches=[fm.link('kb_a.json', fm.BASE_CPS[2], fm.OTHER, 2)])
+        knowing['adjacent_branches'], knowing['branches'] = knowing['branches'], []
+        write_local(manager, 'fibers/f.json', json.dumps(knowing))
+        manager._update_shadow('fibers/f.json')
+        base_info = local_info(manager, 'fibers/f.json')
+        stripped = copy.deepcopy(knowing)
+        stripped.pop('adjacent_branches')
+        stripped['generation'] = 2
+        write_local(manager, 'fibers/f.json', json.dumps(stripped))
+        info = local_info(manager, 'fibers/f.json')
+        remote = s3_info(base_info['local_size'], base_info['local_md5'])
+        track_row(manager, 'fibers/f.json', base_info['local_size'], base_info['local_mtime'],
+                  base_info['local_size'], base_info['local_md5'], base_info['local_md5'])
+        actions = manager.analyze_changes({'fibers/f.json': info}, {'fibers/f.json': remote})
+        assert actions['fibers/f.json'][0] == SyncAction.CONFLICT
+        assert 'older VC3D' in actions['fibers/f.json'][1]
+
+    def test_mixed_base_stripped_adjacent_link_is_a_conflict(self, manager):
+        """The shadow has both kinds of link; the local file lost the
+        adjacent array: still a conflict."""
+        import test_fiber_merge as fm
+        adjacent = fm.link('kb_a.json', fm.BASE_CPS[2], fm.OTHER, 2)
+        legacy = fm.link('kb_c.json', fm.BASE_CPS[4], [7.0, 7.0, 7.0], 4)
+        base = fm.make_fiber(fm.BASE_CPS, branches=[legacy], adjacent_branches=[adjacent])
+        write_local(manager, 'fibers/f.json', json.dumps(base))
+        manager._update_shadow('fibers/f.json')
+        base_info = local_info(manager, 'fibers/f.json')
+        stripped = copy.deepcopy(base)
+        stripped.pop('adjacent_branches')
+        stripped['generation'] = 2
+        write_local(manager, 'fibers/f.json', json.dumps(stripped))
+        info = local_info(manager, 'fibers/f.json')
+        remote = s3_info(base_info['local_size'], base_info['local_md5'])
+        track_row(manager, 'fibers/f.json', base_info['local_size'], base_info['local_mtime'],
+                  base_info['local_size'], base_info['local_md5'], base_info['local_md5'])
+        actions = manager.analyze_changes({'fibers/f.json': info}, {'fibers/f.json': remote})
+        assert actions['fibers/f.json'][0] == SyncAction.CONFLICT
+
+    def test_ordinary_edit_still_uploads(self, manager):
+        """The same setup with the array kept is a normal upload."""
+        import test_fiber_merge as fm
+        knowing = fm.make_fiber(fm.BASE_CPS,
+                                branches=[fm.link('kb_a.json', fm.BASE_CPS[2], fm.OTHER, 2)])
+        knowing['adjacent_branches'], knowing['branches'] = knowing['branches'], []
+        write_local(manager, 'fibers/f.json', json.dumps(knowing))
+        manager._update_shadow('fibers/f.json')
+        base_info = local_info(manager, 'fibers/f.json')
+        edited = copy.deepcopy(knowing)
+        edited['tags'] = ['reviewed']
+        edited['generation'] = 2
+        write_local(manager, 'fibers/f.json', json.dumps(edited))
+        info = local_info(manager, 'fibers/f.json')
+        remote = s3_info(base_info['local_size'], base_info['local_md5'])
+        track_row(manager, 'fibers/f.json', base_info['local_size'], base_info['local_mtime'],
+                  base_info['local_size'], base_info['local_md5'], base_info['local_md5'])
+        actions = manager.analyze_changes({'fibers/f.json': info}, {'fibers/f.json': remote})
+        assert actions['fibers/f.json'][0] == SyncAction.UPLOAD
+
+
 class TestShadow:
     def test_update_and_remove(self, manager):
         write_local(manager, 'fibers/f.json', '{"x": 1}')

@@ -162,7 +162,7 @@ export const creators = [
 export const sponsors = [
   {
     name: "Nat Friedman",
-    amount: 2250000,
+    amount: 2750000,
     href: "https://nat.org/",
     image: "/img/landing/nat.webp",
   },

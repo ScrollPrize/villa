@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Adjacent Fiber Links</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@400&display=swap">
+<style>
+:root{--bg:#f4f5f8;--surface:#ffffff;--ink:#16181d;--ink-soft:#5d6472;--line:#d8dce5;--accent:#5b2bd6;--code-bg:#eef0f5;color-scheme:light dark}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#14161b;--surface:#1c1f26;--ink:#e8eaf0;--ink-soft:#9aa3b5;--line:#2c313c;--accent:#a06cff;--code-bg:#232733}}
+:root[data-theme="dark"]{--bg:#14161b;--surface:#1c1f26;--ink:#e8eaf0;--ink-soft:#9aa3b5;--line:#2c313c;--accent:#a06cff;--code-bg:#232733}
+body{background:var(--bg);color:var(--ink);font-family:"IBM Plex Sans",system-ui,sans-serif;padding-inline:16px;padding-block:28px 48px;max-width:820px;margin:0 auto;line-height:1.5}
+h1{font-size:1.6rem;font-weight:600;margin:0 0 4px;text-wrap:balance}
+.sub{color:var(--ink-soft);margin:0 0 24px}
+h2{font-size:1.05rem;font-weight:600;margin:28px 0 8px;letter-spacing:.01em}
+p{margin:0 0 10px;max-width:70ch}
+pre{background:var(--code-bg);border:1px solid var(--line);border-radius:5px;padding:12px 14px;overflow-x:auto;font-family:"IBM Plex Mono",monospace;font-size:.82rem;line-height:1.45;margin:8px 0 14px}
+code{font-family:"IBM Plex Mono",monospace;font-size:.88em;background:var(--code-bg);padding:0 4px;border-radius:3px}
+pre code{background:none;padding:0}
+ul{margin:0 0 10px;padding-left:22px;max-width:72ch}li{margin:3px 0}
+table{border-collapse:collapse;margin:8px 0 14px;font-size:.92rem}th,td{text-align:left;padding:6px 12px 6px 0;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--ink-soft);font-weight:600;font-size:.8rem;letter-spacing:.05em;text-transform:uppercase}
+.key{color:var(--accent);font-weight:600}
+.note{border-left:3px solid var(--accent);padding:6px 12px;color:var(--ink-soft);margin:14px 0}
+</style>
+<h1>Adjacent fiber links</h1>
+<p class="sub">Proposal for PR #1829: adjacent links live in their own top-level <code>adjacent_branches</code> array. The array name is the kind; entries have exactly the existing <code>branches</code> schema.</p>
+
+<h2>What it means</h2>
+<p>An ordinary link ties two control points to the same winding of the sheet. An adjacent link ties a vertical fiber to a horizontal fiber one winding outside it: W<sub>V</sub> = W<sub>H</sub> − 1. The effective H/V tags determine which side is inside. An adjacent link between fibers that are not one H and one V remains stored, is flagged as an error in the fiber map, and contributes no winding constraint.</p>
+
+<h2>The file format</h2>
+<p>Ordinary links appear only in <code>branches</code>. Adjacent links appear only in <code>adjacent_branches</code>. Both entries of a reciprocal pair live in the same array on their respective files. There is no per-entry <code>adjacent</code> field.</p>
+<pre><code>{
+  "branches": [],
+  <span class="key">"adjacent_branches": [</span>
+    {
+      "branch_control_point_direction": [-0.024412605581528416, 0.13769928147742536, -0.9901731831196608],
+      "branch_control_point_index": 0,
+      "branch_control_point_position": [12871.478552834642, 10018.210630149675, 16662.399929928943],
+      "branch_fiber_id": 220,
+      "branch_file": "auto_20260911T045455583_000007.json",
+      "control_point_direction": [0.9963752036835241, 0.058142649700040565, 0.06209577900690697],
+      "control_point_index": 0,
+      "control_point_position": [12867.714596623457, 10041.881788022982, 16661.818795840572],
+      "pending": true
+    }
+  ]
+}</code></pre>
+<p class="sub">Link fields excerpted from a real open-data fiber entry. Other top-level fiber fields are omitted. Floats retain full precision; the runtime <code>branch_fiber_id</code> is rebound from <code>branch_file</code> at load. Approval removes <code>pending</code> as it does for an ordinary link.</p>
+
+<h2>Array presence is the compatibility signal</h2>
+<p>A current VC3D writer always writes <code>adjacent_branches</code>, including an empty array when there are no adjacent links. The sync merger also writes the array on merged documents and rewritten peers, after checking for a legacy regression.</p>
+<table>
+<tr><th>Array state</th><th>Meaning</th></tr>
+<tr><td>Absent</td><td>A legacy writer saved this file; it cannot express a decision about adjacent links.</td></tr>
+<tr><td>Present, empty</td><td>A writer that knows the kind deliberately has no adjacent links.</td></tr>
+<tr><td>Present, nonempty</td><td>These entries are the adjacent links.</td></tr>
+</table>
+<p>The strip check is simply “the base had adjacent entries, and this side lacks the array.” It runs before merge shortcuts and before vc_sync plans a plain local upload. An empty base array proves no lost links. Moving anchors or deleting ordinary links cannot hide a stripped nonempty array.</p>
+<p>Changing kind requires deleting and re-linking: the entry moves from one array to the other and starts pending again. The merge treats that as deletion of the old kind plus addition of the new kind. A deliberate re-link replaces the old review state; concurrent additions with different kinds at the same anchors conflict.</p>
+
+<h2>Loading and reciprocal repair</h2>
+<p>VC3D reads both arrays into its existing in-memory branch references, with the kind derived from the containing array. Its pairing predicate requires the same kind, reciprocal control-point indices, matching positions and compatible directions. An ordinary ref never satisfies an adjacent ref's reciprocity check.</p>
+<p>Before any cross-file validation or broken-link repair, the loader restores an adjacent reciprocal into a peer whose array was absent. It leaves a peer whose array was present alone, including an explicitly empty array. Multiple peers can restore entries into the same legacy file. Source-qualified paths prevent a working copy from healing a different copy with the same filename.</p>
+<p>A restored peer is marked for saving; the save is skipped if the file changed on disk since it was read. Healing must precede validation: otherwise the missing reciprocal can cause the strict loader to remove an entire connected network from the session.</p>
+<p><code>fiber_merge</code> runs the same branch merge, anchor rebinding, peer discovery, review-state refresh and base-aware reciprocal deletion machinery over both arrays. The merged file's decisions determine its peers' same-kind reciprocals. A base-authorized re-link moves the peer's entry between arrays. Without a base, a different-kind reciprocal is a conflict, not a pairing. A conflict leaves the peer unchanged.</p>
+
+<h2>What old software does</h2>
+<table>
+<tr><th>Consumer</th><th>Behavior</th></tr>
+<tr><td>spiral-fitting, vesuvius loader, HF publishing</td><td>Read <code>branches</code> and never see adjacent links. They cannot mistake these links for same-winding links or fuse the two windings through them. No changes to those readers are required.</td></tr>
+<tr><td>Old VC3D</td><td>Ignores <code>adjacent_branches</code> on load. It rebuilds the JSON from its own fields on save, dropping the array. A surviving reciprocal lets the current loader restore it; a synced base with adjacent entries lets the current merger or upload guard detect the loss.</td></tr>
+<tr><td>Old fiber_merge</td><td>Carries the array from whichever side it copies and does not merge the other side's changes to it. Array presence cannot detect this stale carry-through.</td></tr>
+</table>
+<div class="note">The remaining rollout question is the old merger: a hard version fence would have to make it reject the file. This proposal does not bump the fiber format version. If old VC3D saves both endpoints and no current sync base or surviving reciprocal remains, the lost adjacent links cannot be recovered from those files alone.</div>
+
+<h2>Map, solver and GUI</h2>
+<p>The existing map, solver and GUI behavior stays: adjacent candidates and links use triangles, created links are pending, H/V tags determine the one-turn offset, and adjacent links do not certify kollesis seams. The map's kind-disagreement flag remains available and such a disagreement contributes no winding constraint. Normal file loading additionally enforces same-kind reciprocity before a network reaches the map.</p>
+
+<h2>Verification</h2>
+<p>Python regressions exercise both arrays, missing versus empty, legacy saves on either or both sides, shortcut paths, re-links, approvals, geometry rebinding, opaque entries, peer discovery and reciprocal refresh. The C++ regression exercises the shared loader-heal and pairing helpers, including source isolation and multiple restoring peers.</p>
+<pre><code>AGENTS_AGENT_MODE=1 python -m pytest -q volume-cartographer/scripts/tests/test_fiber_merge.py volume-cartographer/scripts/tests/test_vc_sync_helpers.py
+AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target VC3D test_line_annotation_adjacent_links test_fiber_global_layout test_fiber_network_layout test_fiber_winding_solver --parallel 2
+AGENTS_AGENT_MODE=1 ctest --test-dir volume-cartographer/build -R '^(line_annotation_adjacent_links|fiber_global_layout|fiber_network_layout|fiber_winding_solver)$' --output-on-failure</code></pre>
+</html>

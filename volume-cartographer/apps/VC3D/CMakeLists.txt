@@ -40,6 +40,8 @@ set(srcs
     FiberMapRuler.cpp
     FiberMapRuler.hpp
     FiberMapRulerMath.hpp
+    FiberMapGapField.cpp
+    FiberMapGapField.hpp
     FiberNetworkLayout.cpp
     FiberNetworkLayout.hpp
     FiberWindingSolver.cpp

@@ -328,6 +328,10 @@ def _load_fiber_payload(path, coordinate_scale=0.25, min_point_spacing=20.0, *, 
     # junction (delta 0). Stored reciprocally in both fibers' JSONs (see VC3D
     # LineAnnotationController). Resolved to retained point ids downstream via
     # kept_orig_indices (see resolve_fiber_links).
+    adjacent_branches = data.get('adjacent_branches') or []
+    if adjacent_branches:
+        print(f'WARNING: ignoring {len(adjacent_branches)} adjacent fiber link(s) '
+              f'in {path}: spiral fitting only supports same-winding links')
     branches = []
     for br in (data.get('branches') or []):
         branch_file = br.get('branch_file')
@@ -604,7 +608,9 @@ def resolve_fiber_links(point_collections, include_pending=False,
         if basename is not None:
             by_basename.setdefault(basename, cid)
 
-    # Links are same-winding statements between unannotated collections; drop any
+    # Links are same-winding statements between unannotated collections; adjacent
+    # links are intentionally excluded by load_fiber_point_collection because this
+    # resolver has no winding-offset representation. Drop any
     # link touching an explicitly-annotated collection here, before the component
     # decomposition, so every consumer of the link graph (the cross-patch merge,
     # the unattached walk sampling) agrees on membership. Must run before

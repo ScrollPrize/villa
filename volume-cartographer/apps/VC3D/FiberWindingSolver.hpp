@@ -26,7 +26,8 @@
 //    noise. The weak inside form absorbs same-winding contacts at equality;
 //    a contact whose noise flips the sign costs a winding of separation,
 //    accepted rather than guessed away.
-//  - Links: annotated same-crossing ties between two fibers' control points,
+//  - Links: annotated ties between two fibers' control points - the same
+//    winding, or with LinkInput::windingOffset an adjacent one -
 //    an integer equality on k with confidence from the angular residual.
 //  - Local radial ordering: along any ray from the umbilicus the windings stay
 //    radially ordered even when crumpling destroys their spacing. This never
@@ -56,18 +57,36 @@
 namespace vc3d::fiber_map::winding
 {
 
+// "No sample": for the optional sample indices below.
+inline constexpr std::size_t kNoSample = static_cast<std::size_t>(-1);
+
 struct FiberTrace {
     char hvTag = '?';
     // At least one span of this fiber was traced by the fiber model. A fiber
     // with none is pure control-point interpolation: its line geometry - and
     // with it the unwrapped angle, which accumulates along that geometry -
-    // can be off by whole turns between controls. Untrusted fibers still
-    // take part in the solve (their crossings are the only evidence placing
-    // them), but their evidence is attenuated so it loses conflicts against
-    // model-traced geometry, and no winding error is ever declared over it:
-    // a contradiction involving an untrusted fiber is expected interpolation
-    // noise, not an annotation mistake worth flagging.
+    // can be off by whole turns between controls. Untrusted fibers take part
+    // in the solve like any other, but their evidence is attenuated so it
+    // loses conflicts against model-traced geometry. Declarations are not
+    // gated on trust: the annotation is taken as accurate, and a winding
+    // error over an interpolated span points at the span to trace.
     bool trusted = true;
+    // Kollesis: where two sheets are glued the outer sheet lies in front of
+    // (toward the core from) the inner sheet over the overlap, so the inner
+    // sheet's H fibers sit one thickness BEHIND the outer sheet's V fibers
+    // there, which the radial rule would read as a whole winding out. An H
+    // fiber's end tagged kollesis_termination marks such a seam; a V fiber is
+    // on a kollesis when the annotator has linked it to tagged H ends on
+    // both sides (derived by the layout, never guessed from geometry). At
+    // the seam encounter of a tagged H end with such a V, the crossing is
+    // read as "same winding or inward" whatever its radial sign - when the
+    // annotator has linked the H fiber to that V (at the crossing, as links
+    // are drawn). The tagged ends are the samples of the tagged first / last
+    // control point (the trace may run a sample beyond them); kNoSample when
+    // untagged.
+    std::size_t kollesisStartSample = kNoSample;
+    std::size_t kollesisEndSample = kNoSample;
+    bool onKollesis = false;
     // Parallel arrays over the fiber's visible (control-point-bounded) domain.
     std::vector<double> theta;
     std::vector<double> radius;
@@ -80,6 +99,15 @@ struct LinkInput {
     std::size_t pointA = 0;
     std::size_t fiberB = 0;
     std::size_t pointB = 0;
+    // The winding gap the link asserts, W_B(pointB) - W_A(pointA): 0 for an
+    // ordinary same-winding tie, -1 or +1 for an adjacent-winding link (the
+    // V fiber one winding inside the H fiber).
+    int windingOffset = 0;
+    // The link carries no constraint (an adjacent link between fibers that
+    // are not one H and one V: an annotation error the caller reports). It
+    // keeps its slot so per-link results stay index-aligned; its turn
+    // error stays unset.
+    bool skip = false;
 };
 
 // Lengths in voxels, like the layout's own parameters. Defaults are the
@@ -127,6 +155,14 @@ struct SolverParams {
     // violates it by at least this many windings. Measured violations are
     // bimodal at 0 and 1, so anything between the modes works.
     double declarationViolationTurns = 0.5;
+    // A traversal group (see CrossingGroup) is only eligible when the H
+    // trace's stretch at the V fiber's angle is entered and left with this
+    // much angular clearance on opposite sides, and a trace end inside that
+    // stretch clears the V fiber's angle at its height by the same amount:
+    // an H trace cut at the V fiber's angle may have been cut
+    // mid-traversal, and its crossing count is then incomplete. Intent: a
+    // few hundred voxels of arc at the scroll's radii.
+    double endpointClearanceTurns = 0.01;
     // 0 = infer from the data; +1 / -1 force the winding direction.
     int chiralityOverride = 0;
 };
@@ -134,14 +170,13 @@ struct SolverParams {
 // Tie is retained for the constraint/violation switch exhaustiveness but no
 // longer produced: classification is by the sign of deltaR alone.
 enum class CrossingKind { Inside, Outside, Tie };
-enum class CrossingStatus { Used, Dropped };
+// InGroup: the crossing did not constrain on its own; its traversal group did
+// (see CrossingGroup), and the group carries the status that matters.
+enum class CrossingStatus { Used, Dropped, InGroup };
 
 struct Crossing {
     std::size_t hFiber = 0;
     std::size_t vFiber = 0;
-    // Both fibers trusted: only such a crossing may be declared a winding
-    // error when dropped (an untrusted fiber's contradictions are expected).
-    bool declarable = true;
     // How far the FINAL map sits from what this crossing demanded, in
     // windings (0 when satisfied). Greedy cycle repair routinely drops
     // constraints the eventual placement satisfies anyway - the true culprit
@@ -160,6 +195,156 @@ struct Crossing {
     int mergedCount = 1;
     CrossingKind kind = CrossingKind::Inside;
     CrossingStatus status = CrossingStatus::Used;
+    // |sin| of the crossing angle in arc-scaled (psi, z); below
+    // params.minTransversality the event is `tangential`: it is counted as a
+    // traversal event (N, T below) and reported, but never constrains on its
+    // own, exactly as such passes were gated before they were recorded.
+    double transversality = 0.0;
+    bool tangential = false;
+    // Which way the H polyline crosses the V polyline in (psi, z), +1 or -1,
+    // both taken in their own polyline order (a V branch re-sorted to
+    // ascending z is walked back in its fiber's order). Two events of one
+    // pair with opposite orientation are a pass and return (a wobble or a
+    // touch), not a traversal; a traversal sums to an odd count.
+    int orientation = 0;
+    // Provenance: the H segment and its parameter, and the V vertex identity
+    // (Branch::vertexId) when the hit is at a V vertex (kNoSample otherwise).
+    // A V vertex shared by two branches is detected once per branch; the two
+    // records are one event when the ray test read the hit as a crossing (the
+    // H fiber passes through the apex between the limbs) and the proximity
+    // merge put both under one representative, and both stay `touch` when
+    // it read a touch: the V fiber comes up to the H fiber at its apex and
+    // retraces, which crosses nothing. Records of one apex under two
+    // representatives (a repeated apex sample at another radius, say) stay
+    // two events, each with its own. Touches are recorded and never
+    // counted; apex crossings are `apex` (see below).
+    static constexpr std::size_t kNoSample = static_cast<std::size_t>(-1);
+    std::size_t hSegment = 0;
+    double hT = 0.0;
+    std::size_t vSample = kNoSample;
+    // The seam encounter of a kollesis-tagged H end with a V fiber on that
+    // kollesis: annotation-classified as Inside (see FiberTrace), kept out
+    // of the traversal-group counts like a touch.
+    bool kollesis = false;
+    // A seam encounter read without a tag on this H fiber: on a V fiber the
+    // annotator certified as on a kollesis, an Outside crossing the rest of
+    // the evidence contradicted by exactly one turn, of an H fiber that ends
+    // within a turn past it (see `terminal`) - the glued inner sheet, one
+    // thickness behind the outer sheet's V. Implies `kollesis`.
+    bool kollesisInferred = false;
+    // The H fiber ends within one turn past this crossing, toward one of its
+    // ends, without meeting the V fiber again and without leaving the V
+    // branch's height range (so a further crossing could not have gone
+    // unseen, and no gated or unresolved segment on the way either): how an
+    // inner sheet's H fiber ends in a kollesis overlap. A
+    // property of the pair's geometry, no length in it. `terminalSides`
+    // says which way those ends lie from the crossing in canonical angle:
+    // bit 1 the +psi side, bit 2 the -psi side (a short H fiber may end
+    // within a turn both ways).
+    bool terminal = false;
+    int terminalSides = 0;
+    // A pass and return at a vertex of either polyline (both incident
+    // segments on one side of the other segment), or the two records of a V
+    // apex the ray test read as a touch: crosses nothing, counted by no
+    // group.
+    bool touch = false;
+    // A crossing exactly at a V fold apex, the shared end of two limbs: it
+    // lies on the edge of both limbs' radial curtains, so it belongs to
+    // neither limb's count. Counted by no group; both limbs' groups on its
+    // translate are `onCurtain` and take no verdict.
+    bool apex = false;
+    // The z-monotone V branch the event was found on.
+    std::size_t vBranch = 0;
+    // The raw detection this record came from (its position in the pair's
+    // detection order); unique per detection.
+    std::size_t detection = 0;
+    // On an event (PairCrossings::events): the representative in
+    // PairCrossings::crossings that stands for it in the legacy constraint
+    // path. On a representative: unused.
+    std::size_t representative = 0;
+    // On a representative: every detection it stands for belongs to a
+    // traversal group with a verdict, so the group constrains in its place
+    // (status InGroup in the solve). A representative standing for both
+    // covered and uncovered detections constrains for the uncovered ones,
+    // with its confidence recomputed over them.
+    bool coveredByGroups = false;
+    // Index into PairCrossings::groups / SolveResult::groups, or -1. On a
+    // representative: the group of its own detection, for display.
+    long long groupIndex = -1;
+};
+
+// The crossings of one (H, V) pair on one 2*pi translate n, read together.
+//
+// Each crossing compares radii at one point where the two polylines share
+// (psi, z). Where the sheet folds, one pair produces several such points on
+// one translate with contradictory radial signs, and each sign alone is
+// meaningless. What is meaningful is the count: the number of crossings at
+// which the H fiber lies radially inside the V fiber is the intersection
+// number of the H curve with the "radial curtain" swept from the umbilicus
+// out to the V fiber. An odd count means the H fiber passes between the V
+// fiber and the umbilicus (same winding or inward, the weak Inside claim);
+// an even count means it does not (strictly Outside). Crossings at
+// different heights are legitimately one count: they are intersections with
+// one surface. This is the user's picture - the V fiber sits inside or
+// outside the wiggly H arc - made exact.
+//
+// The count is taken per z-monotone V branch: a V fiber that folds back in
+// height sweeps a curtain that covers the same (theta, z) several times over,
+// and events on different limbs are not crossings of one separator. Each
+// branch is a graph over z, so its own curtain is single-sheeted; a folded V
+// fiber therefore contributes one group per limb, and its limbs' disagreement
+// surfaces as it always did.
+//
+// The verdict is only issued where it can change anything and where the
+// count is trustworthy: the signs must be mixed (a uniform group already
+// says what its members say, and keeps their individual constraints), the
+// signed orientation sum must be odd (a wobble crossing back and forth sums
+// to zero and is no traversal), no gated or degenerate geometry may have hid
+// an event on that translate, and the H trace must run from one side of the
+// V fiber's angular locus to the other with clearance (an H trace cut at the
+// V fiber's angle has an incomplete count). Otherwise the members constrain
+// individually, as they always did, and the group is reported for
+// inspection with the flag that stopped it.
+struct CrossingGroup {
+    std::size_t hFiber = 0;
+    std::size_t vFiber = 0;
+    long long n = 0;
+    std::size_t vBranch = 0;
+    // Indices into the EVENT list this group belongs to (PairCrossings::events
+    // in the shard, SolveResult::events in the solve), touches excluded.
+    std::vector<std::size_t> members;
+    // Counted events: one per resolved crossing, touches excluded.
+    int multiplicity = 0;
+    // N: events with r_h < r_v. T: sum of orientations. J: T over N's events.
+    int insideCount = 0;
+    int orientationSum = 0;
+    int insideOrientationSum = 0;
+    bool mixedSigns = false;
+    // Eligibility diagnostics (see above). onCurtain: an event on the edge
+    // of the radial curtain - exactly at the V fiber's radius, or a crossing
+    // at a fold apex shared with another limb - where the count is not of
+    // one traversal of this limb.
+    bool coverageGap = false;
+    bool unresolved = false;
+    bool onCurtain = false;
+    // The H trace's stretch at the branch's angle runs from one side of the
+    // angular window to the other with clearance and stays within the
+    // branch's height range throughout: the count is a complete traversal's.
+    bool traversalCovered = false;
+    // A kollesis seam encounter of this pair lies on this translate and
+    // branch. Seam events are read by annotation and left out of the count,
+    // so the count is of an incomplete traversal and proves nothing: no
+    // verdict.
+    bool seamed = false;
+    // Smallest |deltaR| over the events: the margin the verdict hangs on.
+    double minAbsDeltaR = 0.0;
+    double meanTransversality = 0.0;
+    // hasVerdict: the group constrains in place of its members.
+    bool hasVerdict = false;
+    CrossingKind verdict = CrossingKind::Inside;
+    double confidence = 0.0;
+    CrossingStatus status = CrossingStatus::Used;
+    double violationTurns = 0.0;
 };
 
 enum class ComponentAnchor {
@@ -194,6 +379,21 @@ struct SolveResult {
     // Every surviving traversal (post-merge representatives) plus every
     // dropped one, in deterministic order.
     std::vector<Crossing> crossings;
+    // Every resolved event (see PairCrossings::events), in shard order, with
+    // hFiber/vFiber bound and `representative` indexing `crossings`; its
+    // status mirrors its representative's.
+    std::vector<Crossing> events;
+    // Traversal groups in shard order; members index `events`. A group with
+    // hasVerdict constrained in place of its members' representatives (their
+    // status is InGroup).
+    std::vector<CrossingGroup> groups;
+    int droppedGroupCount = 0;
+    // Owner-segment pairs that were exactly parallel, summed over pairs.
+    int unresolvedIntersectionCount = 0;
+    // Events read as kollesis seam encounters.
+    int kollesisCrossingCount = 0;
+    // Of those, read from the solve contradiction rather than a tag.
+    int kollesisInferredCount = 0;
     // Indices into the input link list whose constraints were dropped by
     // cycle repair.
     std::vector<std::size_t> droppedLinks;
@@ -237,6 +437,9 @@ struct SolveResult {
 struct CanonicalTrace {
     char hvTag = '?';
     bool trusted = true;
+    std::size_t kollesisStartSample = kNoSample;
+    std::size_t kollesisEndSample = kNoSample;
+    bool onKollesis = false;
     long long gauge = 0;
     std::vector<double> psi;
     std::vector<double> radius;
@@ -245,6 +448,18 @@ struct CanonicalTrace {
         std::vector<double> psi;
         std::vector<double> z;
         std::vector<double> r;
+        // Vertex identity of each branch sample: the id of its run of
+        // consecutive original samples with identical (psi, z), so a vertex
+        // repeated in the projection - at a fold apex, say - is one vertex
+        // to both branches.
+        std::vector<std::size_t> vertexId;
+        // The original trace sample each branch sample came from, so a hit
+        // at a branch end (a fold apex) can be classified by the fiber's own
+        // incident rays rather than the branch's extension.
+        std::vector<std::size_t> sample;
+        // Walking the branch in its stored (ascending z) order follows the
+        // fiber's own polyline order.
+        bool forwardAscending = true;
         double psiMin = 0.0;
         double psiMax = 0.0;
     };
@@ -253,17 +468,99 @@ struct CanonicalTrace {
 [[nodiscard]] CanonicalTrace canonicalizeTrace(const FiberTrace& fiber,
                                                int chirality);
 
-// One (H, V) pair's merged crossings (hFiber/vFiber left unset - the pair is
-// implicit) plus the pair's gate tallies. Deterministic pure function of the
-// two canonical traces and the detection parameters.
-struct PairCrossings {
-    std::vector<Crossing> crossings;
+// The geometry half of a pair's detection, and what the layout's per-pair
+// cache stores: every raw detection with its provenance, plus the gate
+// tallies and the translates on which an event may have gone unseen. A pure
+// function of the two canonical traces and the detection parameters - no
+// annotation (link, tag) enters, so an annotation edit never invalidates a
+// shard. classifyPairCrossings turns it into the constraints, events and
+// groups the solve consumes.
+struct PairDetections {
+    std::vector<Crossing> raw;
+    std::vector<Crossing> shallow;
+    std::size_t detectionCount = 0;
+    // Sorted, unique.
+    std::vector<long long> gapTranslates;
+    std::vector<long long> unresolvedTranslates;
+    // H segments (by index) on which an encounter with this V may have gone
+    // unseen: the segment was gated, met a gated V segment in angle, or
+    // shared an unresolved collinear stretch. Sorted, unique.
+    std::vector<std::size_t> uncoveredSegments;
     int gatedSegmentCount = 0;
     int tangentialCount = 0;
+    int unresolvedCount = 0;
 };
-[[nodiscard]] PairCrossings detectPairCrossings(const CanonicalTrace& h,
-                                                const CanonicalTrace& v,
-                                                const SolverParams& params);
+[[nodiscard]] PairDetections detectPairCrossings(const CanonicalTrace& h,
+                                                 const CanonicalTrace& v,
+                                                 const SolverParams& params);
+// Field-by-field, bit-exact equality of two detection shards: the test of
+// the cache's contract that a cached shard IS the fresh one.
+[[nodiscard]] bool identicalPairDetections(const PairDetections& a, const PairDetections& b);
+
+struct PairCrossings {
+    // Representatives: the proximity-merged crossings the legacy constraint
+    // path is built from, exactly as before.
+    std::vector<Crossing> crossings;
+    // Every resolved event, one per crossing of the two polylines (exact
+    // vertex duplicates collapsed, apex touches kept and flagged), each
+    // pointing at its representative. The counts and the inspection records
+    // are over these.
+    std::vector<Crossing> events;
+    // Every (translate, V branch) with at least two counted events, verdict
+    // or not.
+    std::vector<CrossingGroup> groups;
+    int gatedSegmentCount = 0;
+    int tangentialCount = 0;
+    // Places where no intersection can be placed or trusted: collinear
+    // owner segments overlapping or sharing an endpoint, a radial step (zero
+    // projected length) through the other fiber's curtain, a hit on a level
+    // V segment (a fold's flat top). Disables the verdict on the translates
+    // it touched (recorded on the groups).
+    int unresolvedCount = 0;
+};
+// One tagged end of an H fiber, to be read against a V fiber on a kollesis,
+// through the link the annotator drew between the two: the tagged control's
+// sample on the H trace, and the link's samples on the H and V traces (the
+// link nearest the tagged end when the pair is linked more than once). The
+// link names the encounter: the V limbs holding the linked V sample's
+// vertex (two at a fold apex), on the translate that lifts the linked H
+// sample onto it. Where none of those limbs has a detection on that
+// translate (the annotator linked the V's nearest control, which sat on a
+// fold the H never reaches), the encounter is the pair's detection that
+// lifts the linked H sample best and sits nearest it along the H fiber,
+// whatever height the linked control is at. A detection on the linked limb on that translate, however far
+// along the H fiber, keeps the link in charge; a crossing of that limb on
+// another translate does not (it is another turn's encounter).
+struct SeamAnchor {
+    std::size_t hSample = kNoSample;
+    std::size_t hLinkSample = kNoSample;
+    std::size_t vSample = kNoSample;
+};
+// The seam anchors of the pair (h, v): one per tagged end of the H trace
+// that is linked to this V - empty unless the V is on a kollesis and the
+// pair is linked. A tagged H fiber is never read against a V it is not
+// linked to. `traces` and `links` index fibers the way hIndex / vIndex do.
+[[nodiscard]] std::vector<SeamAnchor> seamAnchors(const std::vector<CanonicalTrace>& traces,
+                                                  std::size_t hIndex, std::size_t vIndex,
+                                                  const std::vector<LinkInput>& links);
+// The classification half, run at solve time (never cached): the proximity
+// merge into representatives, the resolved events, the traversal groups -
+// and the readings that depend on annotation: the pair's seam anchors (see
+// SeamAnchor), which the caller derives from the traces' kollesis fields and
+// the links. Deterministic in its inputs, so fresh and cached builds
+// classify identically.
+// `inferredSeams`: detection ids (Crossing::detection) the caller has found
+// to be seam encounters by the solve itself - on a V on a kollesis, an
+// Outside crossing contradicted by one turn whose H fiber is `terminal`
+// there - read Inside like a tagged encounter and flagged kollesisInferred.
+// The layout supplies them from a first solve and solves again; the plain
+// solveWindings overload never infers.
+[[nodiscard]] PairCrossings classifyPairCrossings(const PairDetections& detections,
+                                                  const CanonicalTrace& h,
+                                                  const CanonicalTrace& v,
+                                                  const std::vector<SeamAnchor>& seams,
+                                                  const std::vector<std::size_t>& inferredSeams,
+                                                  const SolverParams& params);
 
 // A detection shard bound to the current build's fiber indices.
 struct PairDetection {
