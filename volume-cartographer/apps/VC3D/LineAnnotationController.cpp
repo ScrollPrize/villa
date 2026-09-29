@@ -1,4 +1,5 @@
 #include "LineAnnotationController.hpp"
+#include "ProjectFiberPaths.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include "CState.hpp"
@@ -1734,27 +1735,6 @@ std::string sanitizedEventName(std::string event)
         }
     }
     return event.empty() ? "event" : event;
-}
-
-std::string sanitizedProjectFiberDirName(const fs::path& projectPath,
-                                         const fs::path& volpkgRoot)
-{
-    std::string name = projectPath.empty()
-        ? volpkgRoot.filename().string()
-        : projectPath.filename().string();
-    for (char& ch : name) {
-        const auto c = static_cast<unsigned char>(ch);
-        if (!std::isalnum(c) && ch != '.' && ch != '-' && ch != '_') {
-            ch = '_';
-        }
-    }
-    while (!name.empty() && name.front() == '_') {
-        name.erase(name.begin());
-    }
-    while (!name.empty() && name.back() == '_') {
-        name.pop_back();
-    }
-    return name.empty() ? "project" : name;
 }
 
 void writeLineDebugJson(const std::string& eventName,
@@ -14755,7 +14735,7 @@ fs::path LineAnnotationController::fibersDir() const
         return {};
     }
     const auto vpkg = _state->vpkg();
-    const auto source = fs::weakly_canonical(root / "fibers" / sanitizedProjectFiberDirName(vpkg->path(), root));
+    const auto source = fs::weakly_canonical(vc3d::projectFiberDirectory(vpkg->path(), root));
     const auto redirected = _fiberSourceRedirects.find(source);
     return redirected == _fiberSourceRedirects.end() ? source : redirected->second;
 }

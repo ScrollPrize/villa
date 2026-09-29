@@ -1,23 +1,36 @@
 # Plan
 
-1. Replace context-menu callback with an indexed CP callback at the menu bottom.
-2. Expose whole-fiber reset through the annotation window menu.
-3. Share controller reset/save logic with optional CP scope. Mirror matching
-   peer-pane CPs and dirty adjacent spans only when a direction is removed.
-4. Test reset scope and metadata preservation; build VC3D and run focused tests.
+1. Add independent raw-volume and segment filters, preserving existing selection semantics.
+2. Add fresh project name/destination options to shared creation: bypass cached full-sample projects.
+3. Create Project beside Open Sample: initially unchecked resources grouped by
+   representation type; checkable individual entries and select all/none, name and destination browser;
+   confirm overwrite, then use existing asynchronous opening and session-save gates.
+4. Test empty selection, independent predictions, segment filtering, saved name/path
+   and isolation from cached projects. Verify immediate opening, cancellation and
+   save failure without closing the active project. Build VC3D and run catalog tests.
+5. Preserve representation coordinate metadata and channel attachments, but do
+   not attach unselected scans or rebased source views in selective creation.
+   Selected segments attach individual directories, not aggregate cache
+   roots, and must not mark unselected cached segments orphaned.
 
-## Spec Update
+## Spec update
 
-Distinguish CP-local context reset from whole-fiber annotation-menu reset.
+Follow-up: extract annotation fiber-path naming into one shared helper, use it
+in catalog and ordinary new-project creation, and test empty-directory creation
+and preservation of existing contents.
 
-## Docs Updates
+Document selective creation, empty defaults, required coordinate dependencies and global cache reuse.
 
-Update line_annotation_fibers.md with labels, scope and reoptimization behavior.
+## Docs updates
 
-## Review
-
-Local review; independent reviewer unavailable.
+Add catalog usage documentation and validation log.
 
 ## Changelog
 
-Record correction-reset menu scope change.
+Record new selective project creation action.
+
+## Review
+
+Independent review against task, spec and overarching plan before implementation.
+Reviewer identified dependency semantics and cancellation/save-failure coverage;
+these are explicit above. The render efficiency plan remains unchanged.

@@ -1,5 +1,19 @@
 # VC3D render and fetch specification
 
+## Selective catalog project creation
+
+Project creation eagerly creates the standard annotation fiber directory even if
+empty, using the same naming helper as annotation discovery. Preserve its contents.
+Create Project is additional to Open Sample. Start with nothing selected; support
+independent raw volumes, derived representations grouped by type, and segments.
+Save a fresh named JSON at the chosen path and immediately open it through normal
+project switching. Do not reuse cached full-sample projects. Preserve shared cache
+contents and use the global remote cache. Retain the existing attachment path's
+required coordinate views and channel volumes for selected representations.
+Selected segments attach individually, never through aggregate cache folders.
+Preparation must not overwrite the active autosave or close the current project
+on cancellation/save failure. Existing full-sample opening remains unchanged.
+
 ## Native Bidirectional Trace Fusion
 
 - All callers use the shared native fusion implementation. Meeting positions

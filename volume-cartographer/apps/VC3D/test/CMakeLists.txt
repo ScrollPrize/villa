@@ -1,5 +1,24 @@
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Network Test Widgets)
 
+add_executable(test_catalog_project_dialog
+    test_catalog_project_dialog.cpp
+    ../OpenDataCatalogWindow.cpp
+    ../OpenDataManifest.cpp
+    ../OpenDataSampleProject.cpp
+    ../OpenDataLasagna.cpp
+    ../OpenDataNormalGrids.cpp
+    ../OpenDataSegmentCache.cpp
+    ../OpenDataSegmentCacheIO.cpp)
+set_target_properties(test_catalog_project_dialog PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_catalog_project_dialog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_catalog_project_dialog PRIVATE
+    Qt6::Core Qt6::Widgets Qt6::Test Qt6::Concurrent vc_core vc_lasagna)
+add_test(NAME catalog_project_dialog COMMAND test_catalog_project_dialog)
+vc_register_test_target(test_catalog_project_dialog)
+vc_register_ctest(catalog_project_dialog test_catalog_project_dialog)
+set_tests_properties(catalog_project_dialog PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+
 add_executable(test_line_annotation_adjacent_links test_line_annotation_adjacent_links.cpp)
 set_target_properties(test_line_annotation_adjacent_links PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
