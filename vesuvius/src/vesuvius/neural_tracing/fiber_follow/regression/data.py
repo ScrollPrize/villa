@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.ndimage import gaussian_filter
 
 from vesuvius.neural_tracing.fiber_follow.shared.components import (
     PAIR_SAMPLING_VERSION, ComponentRule, sample_pairs,
@@ -67,6 +68,8 @@ class IdentitySampling:
     contrast: float = 1.4  # log-uniform contrast factor in [1/c, c]
     brightness: float = .1
     noise: float = .03  # maximum Gaussian noise standard deviation
+    blur_probability: float = .25
+    blur_sigma: tuple = (.5, 1.25)  # Gaussian sigma in sampled crop voxels
     contact_fraction: float = .2  # of fresh draws, near mined contact episodes
     hard_span_fraction: float = .1
     lateral_fraction: float = .1  # near earlier fresh states that had bank negatives
@@ -85,13 +88,21 @@ class IdentitySampling:
 
     def __post_init__(self):
         if isinstance(self.rule, dict):
-            object.__setattr__(self, 'rule', ComponentRule(**self.rule))
+            # Checkpoints before pair sampling v5 stored a presence threshold.
+            rule = {k: v for k, v in self.rule.items() if k != 'threshold'}
+            object.__setattr__(self, 'rule', ComponentRule(**rule))
         fractions = (self.presence_dropout, self.contact_fraction,
                      self.hard_span_fraction, self.lateral_fraction)
         if not all(0 <= f <= 1 for f in fractions) or sum(fractions[1:]) > 1:
             raise ValueError('Identity sampling probabilities must lie in [0, 1]; oversampling at most 1')
         if min(self.positives, self.negatives, self.lateral_memory) < 1 or self.contrast < 1:
             raise ValueError('Invalid identity sample counts or augmentation')
+        if not np.isfinite(self.blur_probability) or not 0 <= self.blur_probability <= 1:
+            raise ValueError('Blur probability must be in [0, 1]')
+        if (len(self.blur_sigma) != 2 or not all(np.isfinite(v) for v in self.blur_sigma)
+                or not 0 <= self.blur_sigma[0] <= self.blur_sigma[1]):
+            raise ValueError('Blur sigma must be a finite, nonnegative MIN MAX range')
+        object.__setattr__(self, 'blur_sigma', tuple(self.blur_sigma))
         if not np.isfinite(self.rule.lateral_max) or self.rule.lateral_max <= self.rule.own_radius:
             raise ValueError('Identity negative radius must exceed own-fiber radius')
         if not 0 <= self.bank_wrong_continuation_probability <= 1:
@@ -191,6 +202,21 @@ def photometric(image, params, rng):
     if noise > 0:
         out = out+rng.normal(0., noise, image.shape).astype(np.float32)
     return np.clip(out, 0., 1.).astype(np.float32)
+
+
+def augment_image_pair(image, params, rng, *, blur_sigma=0., drop_presence=False):
+    """Augment a CPU CT/presence pair in place, without mixing channels.
+
+    Blur both channels before adding CT intensity noise. Reflect padding keeps
+    constant inputs constant; channel dropout remains exactly zero after blur.
+    """
+    values = image.numpy()
+    if blur_sigma > 0:
+        gaussian_filter(values, sigma=(0., blur_sigma, blur_sigma, blur_sigma),
+                        mode='reflect', output=values)
+    values[0] = photometric(values[0], params, rng)
+    if drop_presence:
+        values[1] = 0
 
 
 def contact_location(fibers, episode, side, reverse, rng, approach=24.):
@@ -358,6 +384,8 @@ class IdentityObservationBuilder(ObservationBuilder):
             draw = (float(np.exp(rng.uniform(-np.log(s.contrast),np.log(s.contrast)))),
                     float(rng.uniform(-s.brightness,s.brightness)),float(rng.uniform(0,s.noise)))
             item.update(photometric=draw,drop_presence=bool(rng.random() < s.presence_dropout))
+            item['blur_sigma'] = (float(rng.uniform(*s.blur_sigma))
+                                  if s.blur_probability and rng.random() < s.blur_probability else 0.)
         item['identity_seed'] = int(rng.integers(2**63))
         item.setdefault('location_source',0)
         return item
@@ -376,7 +404,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         z = np.asarray(item.get('identity_label_z',np.asarray(item['pos'])[2:3]))
         return not (z.min()-2 < band.hi and z.max()+2 >= band.lo)
 
-    def identity_targets(self, items, x):
+    def identity_targets(self, items):
         if self.negative_bank is None:
             raise ValueError('Identity supervision requires a negative bank')
         cfg, s = self.cfg, self.sampling
@@ -391,17 +419,16 @@ class IdentityObservationBuilder(ObservationBuilder):
                    negative_near_distance=np.full(B,s.negative_near_distance,np.float32))
         if self.negative_bank is not None:
             out['negative_bank_shards'] = np.zeros(B, np.int64)
-        presence = x['fine'][:, 1].numpy()
         crop = cfg.fine
         for j, item in enumerate(items):
             if 'identity_curve' not in item:
                 continue
             rng = np.random.default_rng(item['identity_seed'])
             bank = self.negative_bank
-            found = bank.candidates(item,crop,presence[j],s.rule,mask_crop=cfg.fine,
+            found = bank.candidates(item,crop,s.rule,mask_crop=cfg.fine,
                 additional_banks=([self.near_negative_bank] if self.near_negative_bank is not None and self.near_negative_bank is not bank else ()))
             pos, pos_mask, neg, neg_mask, metadata = sample_pairs(
-                item['identity_curve'], presence[j], crop, found['local'], found['nearest'], rng,
+                item['identity_curve'], crop, found['local'], found['nearest'], rng,
                 positives=K, negatives=M, margin=cfg.patch_radius,
                 rule=s.rule,
                 appearance_crop=cfg.fine,
@@ -433,7 +460,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         batch = super().__call__(items,vol)
         if self.fibers is None and not self.augment and not any('identity_curve' in i for i in items):
             return batch
-        batch.update(self.identity_targets(items,batch['x']))
+        batch.update(self.identity_targets(items))
         batch['identity_observable'] = torch.tensor([i.get('identity_observable',True) for i in items])
         batch['bank_tail_length'] = torch.tensor([i.get('bank_tail_length',0.) for i in items],dtype=torch.float32)
         if self.cfg.memory_slots and self.cfg.memory_version >= 2:
@@ -447,23 +474,23 @@ class IdentityObservationBuilder(ObservationBuilder):
                 batch[key] = torch.tensor([i.get(key,0) for i in items],dtype=torch.float32)
         batch['seed_present'] = batch['x']['seed_mask'].flatten()
         if self.augment:
+            batch['blurred'] = torch.zeros(len(items))
             for j,item in enumerate(items):
                 if 'photometric' not in item:
                     continue
                 rng = np.random.default_rng(item['identity_seed']+1)
-                batch['x']['fine'][j,0] = torch.from_numpy(photometric(batch['x']['fine'][j,0].numpy(),item['photometric'],rng))
+                augmentation = dict(blur_sigma=item.get('blur_sigma', 0.), drop_presence=item['drop_presence'])
+                batch['blurred'][j] = augmentation['blur_sigma'] > 0
+                augment_image_pair(batch['x']['fine'][j], item['photometric'], rng, **augmentation)
                 if item['drop_presence']:
-                    batch['x']['fine'][j,1] = 0
                     batch['presence_dropped'][j] = 1
                 if self.cfg.memory_slots:
                     # Same augmentation parameters along the observation sequence.
                     x = batch['x']
                     for k in torch.nonzero(x['memory_mask'][j]).flatten().tolist():
-                        x['memory_patches'][j,k,0] = torch.from_numpy(photometric(
-                            x['memory_patches'][j,k,0].numpy(), item['photometric'], rng))
+                        augment_image_pair(x['memory_patches'][j,k], item['photometric'], rng, **augmentation)
                     if x['memory_seed_valid'][j]:
-                        x['memory_seed_patch'][j,0] = torch.from_numpy(photometric(
-                            x['memory_seed_patch'][j,0].numpy(), item['photometric'], rng))
+                        augment_image_pair(x['memory_seed_patch'][j], item['photometric'], rng, **augmentation)
                     if item['drop_presence']:
                         x['memory_patches'][j,:,1] = 0
                         x['memory_seed_patch'][j,1] = 0

@@ -17,7 +17,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.fiber_follow.regression.neighbor_bulk import BANK_VERSION, digest
-from vesuvius.neural_tracing.fiber_follow.shared.components import crop_indices, volume_at
+from vesuvius.neural_tracing.fiber_follow.shared.components import crop_indices
 from vesuvius.neural_tracing.fiber_follow.shared.data import fiber_manifest
 from vesuvius.neural_tracing.fiber_follow.shared.geometry import arclength, interp_at, crop_local_grid
 
@@ -262,8 +262,11 @@ class NeighborBank:
         tree,gap = self.state_target_tree(item)
         return tree.query(np.asarray(world).reshape(-1,3))[0]-gap > self.exclusion
 
-    def candidates(self, item, crop, presence, rule, *, mask_crop=None, additional_banks=()):
+    def candidates(self, item, crop, rule, *, mask_crop=None, additional_banks=()):
         """Exact centerline queries, with whole-annotation clearance.
+
+        Presence support was established when the bank was mined; it is not
+        re-checked on the training crop.
 
         Confidence labels rasterize only cells containing these line samples;
         their entire cell must clear the target exclusion tube. Query locations
@@ -292,13 +295,12 @@ class NeighborBank:
         local = np.concatenate([(p-pos) @ frame for p in lines])
         path_ids = np.repeat(np.arange(len(lines)),[len(p) for p in lines])
         indices = crop_indices(crop,local)
-        near = np.all((indices >= 0) & (indices <= np.asarray(presence.shape)-1),axis=1)
+        near = np.all((indices >= 0) & (indices <= np.array([crop.depth,crop.width,crop.width])-1),axis=1)
         local,indices,path_ids = local[near],indices[near],path_ids[near]
         if not len(local):
             return empty
         tree, gap = self.state_target_tree(item)
-        keep = volume_at(presence,crop,local,order=1) >= rule.threshold
-        keep &= tree.query(local @ frame.T+pos)[0]-gap > max(self.exclusion,rule.own_radius)
+        keep = tree.query(local @ frame.T+pos)[0]-gap > max(self.exclusion,rule.own_radius)
         nearest = cKDTree(item['identity_curve']).query(local)[1]
         keep &= (nearest > 0) & (nearest < len(item['identity_curve'])-1)
         local,nearest,path_ids = local[keep],nearest[keep],path_ids[keep]

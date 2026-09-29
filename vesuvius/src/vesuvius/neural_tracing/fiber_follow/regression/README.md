@@ -46,13 +46,23 @@ bash scripts/launch_memory.sh
 tail -F output/logs/axial_memory_seq_run2.log
 ```
 
-The launcher reproduces the original recipe: effective batch 16, microbatch 4,
+The launcher uses effective batch 16, microbatch 4,
 12 loader workers, learning rate .0003, 500 warmup updates, 100,000 total updates,
-BF16 CUDA autocast, compilation, and no activation checkpointing. It uses the same
-data paths, split, neighbor bank, sampling, recovery monitoring and online replay
+BF16 CUDA autocast outside memory observation/writing, compilation, and no
+activation checkpointing. Memory patch encoding, burn-in, recurrent writes and
+auxiliary probes run in FP32 during both training and tracing; memory reads remain
+under the caller's autocast. After accumulation, gradient norms are clipped
+independently: recurrent memory at 5, all other parameters at 20. Memory spikes
+therefore cannot scale encoder/decoder gradients. `--memory-grad-clip` and
+`--rest-grad-clip` override these limits; 0 disables that group's clipping while
+retaining finite-gradient checks. Both options may be changed on resume and are
+recorded in checkpoint training options. The terminal and JSON training logs
+report `memory_grad_norm`, `rest_grad_norm` and each group's `*_grad_clip_scale`;
+`grad_norm` is the combined pre-clipping norm, not a global clipping threshold.
+It retains the original data paths, split, neighbor bank, sampling, recovery monitoring and online replay
 settings. Existing shared sampler optimizations and interval timing logs are retained.
-The live neighbor bank can grow, so this is the same recipe, not an identical data
-snapshot or a promise of bitwise reproduction.
+The live neighbor bank can grow; launches do not use an identical data snapshot
+or promise bitwise reproduction.
 
 The default destination is `output/axial_memory_seq_run2`. The launcher refuses an
 existing run directory or log. Set `RUN_NAME` for another fresh run:
@@ -64,8 +74,39 @@ RUN_NAME=axial_memory_seq_run3 bash scripts/launch_memory.sh
 Stop a named run and its workers with `bash scripts/stop.sh NAME` before launching
 another. `scripts/launch_regression.sh NAME [options]` exposes the trainer directly;
 its memory defaults are also 16 slots and 64 historical observations. Resuming uses
-`--resume` and the original matching options. Neither `--resume` nor `--init-tracer`
+`--resume` and the original matching options. `--presence-dropout` may be changed
+on resume; the sampler event and subsequent checkpoints record the new probability,
+while `config.json` retains the original launch settings. Neither `--resume` nor `--init-tracer`
 is used by the fresh-run recipe.
+
+`--decision-fraction` reserves matched identity-pair slots first. For remaining
+draws, `--fresh-fraction` (default 0.5) selects fresh sampling, with the remainder
+split equally between fixed and recent replay. Bank following, covered locations,
+and memory switches are conditional on fresh sampling. Empty/rejected replay
+draws can fall back to fresh sampling, so observed ratios can differ.
+`--decision-fraction`, `--fresh-fraction`, and `--bank-following-probability` may
+be changed on resume; sampler events and subsequent checkpoints record them.
+For example, `--decision-fraction 0.1 --fresh-fraction 0.6
+--bank-following-probability 0.2` requests 10% pairs, 18% fixed replay, 18% recent
+replay, and 54% fresh opportunities, including 10.8% bank following, before
+rejection/fallback. Other fresh subtypes divide the remaining fresh slots.
+Source allocation checks can run without pytest:
+`PYTHONPATH=../../.. python -m unittest discover -s tests -p test_sampling_ratios.py -v`.
+
+The memory launcher applies shared Gaussian blur to CT and presence on 25% of
+training samples (`--blur-probability 0.25 --blur-sigma 0.5 1.25`). One sigma is
+drawn uniformly per sample, in sampled crop voxels, and used for both channels,
+the current crop, valid memory observations, and the seed patch. At crop spacing
+0.5 this is sigma 0.25–0.625 in trace-grid voxels. Blur operates separately on
+each channel with reflect padding, before CT brightness/contrast/noise and
+presence dropout. Supervision and evaluation inputs are unchanged. Both blur
+options may be changed on resume and are recorded in sampler events and
+checkpoints. The trainer also defaults to probability 0.25; use
+`--blur-probability 0` to disable blur explicitly.
+Training metrics report the observed `blurred_fraction` for each logged batch.
+
+Blur checks can run without pytest:
+`PYTHONPATH=../../.. python -m unittest discover -s tests -p test_blur_augmentation.py -v`.
 
 ## Validation
 
@@ -80,6 +121,29 @@ coordinate transforms, streaming/reconstruction parity, active-trace ownership,
 holdouts, per-write supervision, microbatch weighting and checkpoint round trips.
 The full-size training launch also exercises real-data loading, compiled CUDA
 forward/backward, optimizer updates and finite-loss checks.
+
+Compiled training enables Inductor's `emulate_precision_casts`. Without it,
+torch 2.12 returned encoder gradients 30-10,000 times the eager magnitude,
+uncorrelated between identical repeats, whenever candidate curves were scored.
+Forward values were unchanged. Small test configurations do not reproduce this;
+it needs trained weights and real batches. After a torch upgrade or a model change,
+compare eager and compiled gradients of one `optimizer_update` (learning rate 0) on a
+saved checkpoint and captured batches. Agreement is about 1e-2 or better in bf16.
+
+The FP32 memory path addresses a separate precision-sensitive recurrent-gradient
+spike reproduced in eager BF16 on a trained checkpoint and a 65-observation replay
+sample. Its memory-gradient norm dropped from about 7.6 million to 27.6 when only
+observation/writing moved to FP32. This is a measured workaround, not an established
+root cause or a guarantee of improved tracing quality.
+
+Clipping defaults were calibrated at step 7,000 with FP32 memory on real effective
+batches of 16. Memory still has genuine recurrent-gradient spikes. A memory cap
+of 5 limits a single update's increase in the saved AdamW aggregate second-moment
+energy to about 4.7%; a cap of 10 permits about 19%. The rest-of-model norms stayed
+below 20 in the calibration, so that cap acts as a safeguard rather than routine
+rescaling. These are measured starting values, not optimality guarantees; monitor
+the per-group norms/scales as weights, batch size or loss weights change. See
+`output/separate_clipping_calibration/` for the measurements and limitations.
 
 Evaluation uses `scripts/evaluate_regression.py` and
 `scripts/evaluate_regression_recovery.py` with the frozen calibration/final protocol.

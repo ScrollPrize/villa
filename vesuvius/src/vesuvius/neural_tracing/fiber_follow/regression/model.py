@@ -95,22 +95,28 @@ class DirectConfig:
         return asdict(self)
 
 
+def device_vector(like, values):
+    """``like.new_tensor(values)`` without a host-to-device copy, which would
+    synchronize with the queued GPU work (these run in eager losses and tracing)."""
+    return torch.stack([like.new_full((), v) for v in values])
+
+
 def feature_grid(points, crop, shape, stride=1, offset=(0,0,0)):
     """Exact physical coordinates for a feature lattice (stride/offset in zyx)."""
     if isinstance(stride, (int, float)):
         stride = (stride,)*3
-    size = points.new_tensor(tuple(reversed(shape)))
-    scale = points.new_tensor(tuple(reversed(stride)))*crop.spacing
-    origin = points.new_tensor((-(crop.width-1)*crop.spacing/2,
-                                -(crop.width-1)*crop.spacing/2, -crop.behind*crop.spacing))
-    origin = origin+points.new_tensor(tuple(reversed(offset)))*crop.spacing
+    size = device_vector(points, tuple(reversed(shape)))
+    scale = device_vector(points, tuple(reversed(stride)))*crop.spacing
+    origin = device_vector(points, (-(crop.width-1)*crop.spacing/2,
+                                    -(crop.width-1)*crop.spacing/2, -crop.behind*crop.spacing))
+    origin = origin+device_vector(points, tuple(reversed(offset)))*crop.spacing
     return 2*(points-origin)/(scale*(size-1).clamp_min(1))-1
 
 
 def crop_support(points, crop):
     """Input support, independent of the coarser contextual-feature lattice."""
-    lo = points.new_tensor((-(crop.width-1)*crop.spacing/2,)*2+(-crop.behind*crop.spacing,))
-    hi = points.new_tensor(((crop.width-1)*crop.spacing/2,)*2+((crop.depth-1-crop.behind)*crop.spacing,))
+    lo = device_vector(points, (-(crop.width-1)*crop.spacing/2,)*2+(-crop.behind*crop.spacing,))
+    hi = device_vector(points, ((crop.width-1)*crop.spacing/2,)*2+((crop.depth-1-crop.behind)*crop.spacing,))
     return torch.isfinite(points).all(-1) & (points >= lo).all(-1) & (points <= hi).all(-1)
 
 
@@ -224,9 +230,9 @@ class AxialEncoder(nn.Module):
     def conditioning(self, references, mask):
         cfg = self.cfg
         points = torch.where(mask[...,None],references,0.).float()
-        origin = points.new_tensor((-(cfg.fine.width-1)*cfg.fine.spacing/2,)*2+(-cfg.fine.behind*cfg.fine.spacing,))
-        offset = points.new_tensor((0,0,3))*cfg.fine.spacing
-        index = torch.round((points-origin-offset)/(points.new_tensor((2,2,8))*cfg.fine.spacing)).long()
+        origin = device_vector(points, (-(cfg.fine.width-1)*cfg.fine.spacing/2,)*2+(-cfg.fine.behind*cfg.fine.spacing,))
+        offset = device_vector(points, (0,0,3))*cfg.fine.spacing
+        index = torch.round((points-origin-offset)/(device_vector(points, (2,2,8))*cfg.fine.spacing)).long()
         d,y,x = cfg.token_shape
         index = torch.stack((index[...,0].clamp(0,x-1),index[...,1].clamp(0,y-1),index[...,2].clamp(0,d-1)),-1)
         flat = index[...,0]+x*(index[...,1]+y*index[...,2])

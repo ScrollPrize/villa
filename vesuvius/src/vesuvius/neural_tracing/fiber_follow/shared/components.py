@@ -8,31 +8,31 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy import ndimage
 from scipy.spatial import cKDTree
 
 
 
-PAIR_SAMPLING_VERSION = 4
+PAIR_SAMPLING_VERSION = 5
 
 
 @dataclass(frozen=True)
 class ComponentRule:
     """Pair support/clearance settings; the old component sampler is retired."""
-    threshold: float = .7  # presence in [0, 1]
     own_radius: float = 1.5  # minimum target clearance
     lateral_max: float = 12.  # matches the bank's mining radius; crop support still applies
     along_window: float = 2.  # negatives within this arc of their positive
 
 
-def sample_pairs(curve, presence, crop, foreign_local, foreign_nearest, rng, *, positives=4, negatives=8,
+def sample_pairs(curve, crop, foreign_local, foreign_nearest, rng, *, positives=4, negatives=8,
                  forward=(1., 20.), margin=4., rule: ComponentRule = ComponentRule(),
                  appearance_crop=None, along_margin=0., path_ids=None, near_fraction=None,
                  near_distance=12., return_metadata=False):
     """Sample both classes uniformly on their interpolated centerlines.
 
-    Presence and full appearance support are checked identically for both.
-    Negative candidates must come from a validated bank; no expansion, snapping,
+    Full appearance support is checked identically for both. Positives come from
+    the annotation and negatives from a validated bank, whose mining already
+    required presence support, so neither is re-filtered on the presence crop.
+    Negative candidates must come from that bank; no expansion, snapping,
     phase adjustment, independent image augmentation or invented history is used.
     """
     curve = np.asarray(curve, np.float64)
@@ -58,7 +58,7 @@ def sample_pairs(curve, presence, crop, foreign_local, foreign_nearest, rng, *, 
     if path_ids.shape != (len(foreign_local),):
         raise ValueError('Every negative candidate needs a path ID')
     eligible = np.flatnonzero((curve[:, 2] >= forward[0]) & (curve[:, 2] <= forward[1])
-                             & supported(curve) & (volume_at(presence,crop,curve,order=1) >= rule.threshold))
+                             & supported(curve))
     if not len(eligible) or len(curve) < 3:
         return result()
     tree = cKDTree(curve)
@@ -70,8 +70,7 @@ def sample_pairs(curve, presence, crop, foreign_local, foreign_nearest, rng, *, 
     along = (offset*tangent[nearest]).sum(-1)
     lateral = np.linalg.norm(offset-along[:, None]*tangent[nearest], axis=-1)
     usable = (supported(foreign_local) & (distance > rule.own_radius)
-              & (nearest > 0) & (nearest < len(curve)-1) & (lateral <= rule.lateral_max)
-              & (volume_at(presence,crop,foreign_local,order=1) >= rule.threshold))
+              & (nearest > 0) & (nearest < len(curve)-1) & (lateral <= rule.lateral_max))
     for k, chunk in enumerate(np.array_split(eligible, positives)):
         if not len(chunk):
             continue
@@ -109,18 +108,3 @@ def crop_indices(crop, local):
     local = np.asarray(local, np.float64).reshape(-1, 3)
     return np.c_[local[:, 2]/crop.spacing+crop.behind, local[:, 1]/crop.spacing+(crop.width-1)/2,
                  local[:, 0]/crop.spacing+(crop.width-1)/2]
-
-
-def volume_at(volume, crop, local, *, order=0):
-    """Nearest (default) or trilinear crop values at local points; zero outside."""
-    index = crop_indices(crop, local)
-    if order == 1:
-        return ndimage.map_coordinates(np.asarray(volume, np.float32), index.T, order=1,
-                                       mode='constant', cval=0., prefilter=False)
-    if order != 0:
-        raise ValueError('Only nearest or trilinear crop sampling is supported')
-    index = np.rint(index).astype(np.int64)
-    inside = np.all((index >= 0) & (index < np.asarray(np.shape(volume))), axis=1)
-    out = np.zeros(len(index), np.asarray(volume).dtype)
-    out[inside] = np.asarray(volume)[tuple(index[inside].T)]
-    return out

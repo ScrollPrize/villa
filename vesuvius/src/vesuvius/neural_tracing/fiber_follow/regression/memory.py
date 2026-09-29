@@ -9,6 +9,7 @@ Version 2 adds a per-write probe, supervised only as an auxiliary target.
 """
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 PROBE_OUTPUTS = 4  # on-original-fiber logit, offset to it in the observation frame
 
@@ -60,9 +61,23 @@ class LearnedMemory(nn.Module):
         return self.encode(patches.reshape(b*t, *patches.shape[2:])).reshape(b, t, 8, -1)
 
     def observe(self, x, state=None):
-        """Write each observation in order; returns the new state (plus ``probe``, b×t×4)."""
+        """Write observations in FP32, including under the caller's BF16 autocast.
+
+        Long recurrent unrolls can amplify BF16 rounding into enormous writer
+        gradients. Keep encoding, burn-in, writes and probes in FP32; the caller
+        can still read the resulting memory and decode curves under autocast.
+        """
         if 'memory_patches' not in x:
             raise ValueError('Memory model requires observed patch sequences from ObservationBuilder')
+        with torch.autocast(device_type=x['memory_patches'].device.type, enabled=False):
+            x = {k: v.float() if k.startswith('memory_') and v.is_floating_point() else v
+                 for k, v in x.items()}
+            if state is not None:
+                state = {k: v.float() if v.is_floating_point() else v for k, v in state.items()}
+            return self._observe(x, state)
+
+    def _observe(self, x, state):
+        """FP32 sequence unroll; returns state plus the per-write ``probe``."""
         patches = x['memory_patches']
         b, t = patches.shape[:2]
         valid = x['memory_mask'].bool()
@@ -83,66 +98,100 @@ class LearnedMemory(nn.Module):
         anchor_valid = state['anchor_valid'].bool() | seed_valid
         anchor_position = torch.where(seed_valid[:, None], x['memory_seed_position'], state['anchor_position'])
         anchor_frame = torch.where(seed_valid[:, None, None], x['memory_seed_frame'], state['anchor_frame'])
-        anchor_state = (anchor, anchor_valid, anchor_position, anchor_frame)
-        carry = tuple(state[k] for k in ('slots', 'position', 'frame', 'seen'))
-        probes = []
-        for j in range(t):
-            inputs = (encoded[:, j], valid[:, j], x['memory_positions'][:, j], x['memory_frames'][:, j])
-            if j < burn:
-                with torch.no_grad():
-                    carry, probe = self.write(inputs, carry, anchor_state)
-            else:
-                carry, probe = self.write(inputs, carry, anchor_state)
-            probes.append(probe)
-        slots, position, frame, seen = carry
+        pos, fr, previous, previous_frame, moved, seen = self.poses(x, valid, state)
+        # Only the gated slot update is recurrent. Motion, seed pose and their
+        # keys/values are formed for every write at once; the probe, which never
+        # feeds back, reads the retained slots afterwards. Burn-in stays gradient-free.
+        slots, probes = state['slots'], []
+        for lo, hi in ((0, burn), (burn, t)):
+            if lo == hi:
+                continue
+            with torch.set_grad_enabled(torch.is_grad_enabled() and lo >= burn):
+                span = slice(lo, hi)
+                observations, anchor_tokens = self.write_inputs(
+                    encoded[:, span], pos[:, span], fr[:, span], previous[:, span], previous_frame[:, span],
+                    moved[:, span], anchor, anchor_position, anchor_frame, anchor_valid)
+                key, value = self.write_keys(torch.cat((observations, anchor_tokens), 2))
+                retained = []
+                for j in range(hi-lo):
+                    slots = self.write(slots, key[:, j], value[:, j], valid[:, lo+j], anchor_valid)
+                    retained.append(slots)
+                if self.cfg.memory_version >= 2:
+                    probes.append(self.probe(observations, torch.stack(retained, 1), anchor_tokens, anchor_valid))
         out = dict(slots=slots, anchor=anchor, anchor_valid=anchor_valid,
                    anchor_position=anchor_position, anchor_frame=anchor_frame,
-                   position=position, frame=frame, seen=seen)
+                   position=pos[:, -1], frame=fr[:, -1], seen=seen)
         if self.cfg.memory_version >= 2:
-            out['probe'] = torch.stack(probes, 1)
+            out['probe'] = torch.cat(probes, 1)
         return out
 
-    def write(self, inputs, carry, anchor_state):
-        encoded, active, new_position, new_frame = inputs
-        slots, position, frame, seen = carry
-        anchor, anchor_valid, anchor_position, anchor_frame = anchor_state
-        b = len(slots)
-        pos = torch.where(active[:, None], new_position, position)
-        fr = torch.where(active[:, None, None], new_frame, frame)
-        displacement = torch.einsum('bi,bij->bj', pos-position, fr)/16.
-        rotation = torch.bmm(fr.transpose(1, 2), frame).flatten(1)
-        motion = torch.cat((displacement, rotation), -1)
-        motion = torch.where((active & seen.bool())[:, None], motion, 0.)
-        observations = encoded+self.motion(motion)[:, None]
-        seed_pose = self.relative_anchor(anchor_position, anchor_frame, pos, fr, anchor_valid)
-        anchor_tokens = anchor+self.role[1]+seed_pose[:, None]
-        context = torch.cat((observations, anchor_tokens), 1)
-        padding = torch.cat((torch.zeros(b, 8, device=slots.device, dtype=torch.bool),
-                             ~anchor_valid[:, None].expand(-1, 8)), 1)
-        evidence = self.write_attention(self.write_norm(slots), context, context,
-                                         key_padding_mask=padding, need_weights=False)[0]
+    @staticmethod
+    def poses(x, valid, state):
+        """Carried pose after each write and before it; inactive writes keep the pose."""
+        b, t = valid.shape
+        # Latest active write at or before each step; index zero is the incoming state.
+        latest = torch.where(valid, torch.arange(1, t+1, device=valid.device), 0).cummax(1).values
+        before = torch.cat((torch.zeros_like(latest[:, :1]), latest[:, :-1]), 1)
+        positions = torch.cat((state['position'][:, None],
+                               torch.where(valid[..., None], x['memory_positions'], 0.)), 1)
+        frames = torch.cat((state['frame'][:, None],
+                            torch.where(valid[..., None, None], x['memory_frames'], 0.)), 1)
+        def at(values, index):
+            return values.gather(1, index.reshape(b, t, *(1,)*(values.dim()-2)).expand(-1, -1, *values.shape[2:]))
+        seen = state['seen'].bool()[:, None] | (latest > 0)
+        seen_before = torch.cat((state['seen'].bool()[:, None], seen[:, :-1]), 1)
+        return (at(positions, latest), at(frames, latest), at(positions, before), at(frames, before),
+                valid & seen_before, seen[:, -1])
+
+    def write_inputs(self, encoded, pos, fr, previous, previous_frame, moved,
+                     anchor, anchor_position, anchor_frame, anchor_valid):
+        """Observation and seed tokens of each write (b×t×8×h), independent of the slots."""
+        displacement = torch.einsum('bti,btij->btj', pos-previous, fr)/16.
+        rotation = (fr.transpose(-1, -2) @ previous_frame).flatten(2)
+        motion = torch.where(moved[..., None], torch.cat((displacement, rotation), -1), 0.)
+        observations = encoded+self.motion(motion)[:, :, None]
+        seed_pose = self.relative_anchor(anchor_position[:, None], anchor_frame[:, None], pos, fr,
+                                         anchor_valid[:, None].expand(-1, pos.shape[1]))
+        anchor_tokens = anchor[:, None]+self.role[1]+seed_pose[:, :, None]
+        return observations, anchor_tokens
+
+    def write_keys(self, context):
+        """Write-attention keys and values, b×t×heads×16×d, for all writes at once."""
+        attention, h = self.write_attention, self.cfg.hidden
+        kv = F.linear(context, attention.in_proj_weight[h:], attention.in_proj_bias[h:])
+        return (v.unflatten(-1, (self.cfg.heads, -1)).transpose(-2, -3) for v in kv.chunk(2, -1))
+
+    def write(self, slots, key, value, active, anchor_valid):
+        """One gated update; equals ``write_attention`` over observation and seed tokens."""
+        attention, h = self.write_attention, self.cfg.hidden
+        query = F.linear(self.write_norm(slots), attention.in_proj_weight[:h], attention.in_proj_bias[:h])
+        query = query.unflatten(-1, (self.cfg.heads, -1)).transpose(1, 2)
+        visible = torch.cat((torch.ones_like(anchor_valid)[:, None].expand(-1, 8),
+                             anchor_valid[:, None].expand(-1, 8)), 1)
+        evidence = F.scaled_dot_product_attention(query, key, value, attn_mask=visible[:, None, None])
+        evidence = attention.out_proj(evidence.transpose(1, 2).flatten(2))
         pair = torch.cat((slots, evidence), -1)
         gate = self.gate(pair).sigmoid()
         proposal = self.proposal(pair).tanh()
         updated = slots+gate*(proposal-slots)
-        slots = torch.where(active[:, None, None], updated, slots)
-        probe = None
-        if self.cfg.memory_version >= 2:
-            # Judged from this observation and what memory now retains.
-            query = observations.mean(1, keepdim=True)
-            tokens = torch.cat((slots+self.role[0], anchor_tokens), 1)
-            retained = torch.cat((torch.zeros(slots.shape[:2], device=slots.device, dtype=torch.bool),
-                                  ~anchor_valid[:, None].expand(-1, 8)), 1)
-            read = self.probe_attention(self.probe_norm(query), tokens, tokens,
-                                        key_padding_mask=retained, need_weights=False)[0]
-            probe = self.probe_head(torch.cat((query, read), -1))[:, 0]
-        return (slots, pos, fr, seen.bool() | active), probe
+        return torch.where(active[:, None, None], updated, slots)
+
+    def probe(self, observations, slots, anchor_tokens, anchor_valid):
+        """Judged from each observation and what memory retained after writing it (b×t×4)."""
+        b, t = slots.shape[:2]
+        query = observations.mean(2, keepdim=True)
+        tokens = torch.cat((slots+self.role[0], anchor_tokens), 2).flatten(0, 1)
+        retained = torch.cat((torch.zeros(b, slots.shape[2], device=slots.device, dtype=torch.bool),
+                              ~anchor_valid[:, None].expand(-1, 8)), 1)
+        read = self.probe_attention(self.probe_norm(query).flatten(0, 1), tokens, tokens,
+                                    key_padding_mask=retained.repeat_interleave(t, 0), need_weights=False)[0]
+        return self.probe_head(torch.cat((query, read.unflatten(0, (b, t))), -1))[:, :, 0]
 
     def relative_anchor(self, anchor_position, anchor_frame, position, frame, valid):
-        delta = torch.einsum('bi,bij->bj', anchor_position-position, frame)/16.
+        delta = torch.einsum('...i,...ij->...j', anchor_position-position, frame)/16.
         delta = delta.sign()*torch.log1p(delta.abs())
-        rotation = torch.bmm(frame.transpose(1, 2), anchor_frame).flatten(1)
-        pose = torch.where(valid[:, None], torch.cat((delta, rotation), -1), 0.)
+        rotation = (frame.transpose(-1, -2) @ anchor_frame).flatten(-2)
+        pose = torch.where(valid[..., None], torch.cat((delta, rotation), -1), 0.)
         return self.motion(pose)
 
     def read(self, decoded, state):

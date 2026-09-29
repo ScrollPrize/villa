@@ -61,6 +61,10 @@ def _direct_training_lines(row):
         lines[-1] += f" | bank following {row['bank_following_fraction']:.0%}"
     if 'decision_pair_fraction' in row:
         lines[-1] += f" | identity pairs {row['decision_pair_fraction']:.0%} (requested {row.get('decision_requested_fraction', 0.):.0%})"
+    if 'memory_grad_norm' in row:
+        lines.append(f"  gradients before clipping: memory {row['memory_grad_norm']:.3g}"
+                     f" (scale {row['memory_grad_clip_scale']:.3g})"
+                     f" | rest {row['rest_grad_norm']:.3g} (scale {row['rest_grad_clip_scale']:.3g})")
     if 'identity' in row:
         lines.extend(_identity_lines(row['identity']))
     if 'memory' in row:
@@ -87,6 +91,8 @@ def _identity_lines(stats):
              f" | neighbor coverage {stats.get('foreign_components_fraction', 0.):.0%}"
              +''.join(f" | {key[9:-9]} {value:.0%}" for key, value in stats.items()
                       if key.startswith('location_') and key.endswith('_fraction'))]
+    if 'blurred_fraction' in stats:
+        lines[-1] += f" | blurred {stats['blurred_fraction']:.0%}"
     if 'ranking' in stats:
         lines.append('  history-vs-neighbor ranking: '+' | '.join(
             f"{name} {_rate(v['correct'], v['pairs'])}" for name, v in stats['ranking'].items() if v['pairs']))

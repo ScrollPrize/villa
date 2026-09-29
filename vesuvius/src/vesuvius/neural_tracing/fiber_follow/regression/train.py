@@ -3,6 +3,7 @@ import argparse
 import copy
 from dataclasses import asdict, replace
 import json
+import math
 from pathlib import Path
 import time
 
@@ -63,6 +64,20 @@ def conv_memory_format(device):
     return torch.channels_last_3d if torch.device(device).type == 'cuda' else torch.contiguous_format
 
 
+def compile_training_model(model):
+    """Compile the training forward; the module keeps its own parameters.
+
+    Inductor (torch 2.12) otherwise returns corrupted encoder gradients for this
+    graph whenever candidate curves are scored: 30-10,000x the eager magnitude and
+    uncorrelated between identical repeats, with forward values unchanged. Emulating
+    eager bf16 rounding restores eager-matching gradients (aot_eager was already
+    correct, which isolates the fault to inductor code generation).
+    """
+    import torch._inductor.config
+    torch._inductor.config.emulate_precision_casts = True
+    return torch.compile(model)
+
+
 def match_optimizer_layout(opt):
     """Resumed moment estimates take their parameter's memory format."""
     for param, state in opt.state.items():
@@ -73,6 +88,8 @@ def match_optimizer_layout(opt):
 
 ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1)
 MEMORY_OPTIONS = ('memory_slots','memory_steps','memory_stride','memory_patch_size','memory_grad_steps')
+MEMORY_GRAD_CLIP = 5.
+REST_GRAD_CLIP = 20.
 
 
 def checkpoint_config(ck):
@@ -155,17 +172,62 @@ def training_diagnostics(model, cpu_batch, tracer, fibers, seeds, out, step, log
         tracer.p.confidence = threshold_before
 
 
+def accumulate(table, key, value):
+    """Add a device scalar without synchronizing; ``resolve_device_sums`` reads them once."""
+    table[key] = table.get(key, 0.)+value.detach().double()
+
+
+def resolve_device_sums(*tables):
+    """Replace accumulated device scalars by Python floats with one transfer."""
+    entries = [(table, key) for table in tables for key, value in table.items() if torch.is_tensor(value)]
+    if entries:
+        for (table, key), value in zip(entries, torch.stack([t[k] for t, k in entries]).tolist()):
+            table[key] = value
+
+
 IDENTITY_SUMS = ('identity_count', 'identity_states', 'identity_rank_correct', 'identity_correct_count',
                  'identity_flipped_count', 'candidate_states')
 
 
+def clip_training_gradients(model, memory_max_norm=MEMORY_GRAD_CLIP, rest_max_norm=REST_GRAD_CLIP):
+    """Clip memory separately so its recurrent spikes cannot scale image gradients.
+
+    Zero disables clipping for a group, but never disables finite-gradient checks.
+    Identify parameters by object identity: compiled wrappers prefix their names.
+    Check both groups before modifying either group's gradients.
+    """
+    limits = dict(memory=memory_max_norm, rest=rest_max_norm)
+    if any(not math.isfinite(v) or v < 0 for v in limits.values()):
+        raise ValueError('Gradient clipping limits must be finite and nonnegative (0 disables clipping)')
+    parameters = list(model.parameters())
+    memory = getattr(model, 'recurrent_memory', None)
+    memory_ids = {id(p) for p in memory.parameters()} if memory is not None else set()
+    groups = dict(memory=[p for p in parameters if id(p) in memory_ids],
+                  rest=[p for p in parameters if id(p) not in memory_ids])
+    norms = {name: torch.nn.utils.get_total_norm(
+        [p.grad for p in params if p.grad is not None], error_if_nonfinite=True)
+        for name, params in groups.items()}
+    for name, params in groups.items():
+        if limits[name] > 0:
+            torch.nn.utils.clip_grads_with_norm_(params, limits[name], norms[name])
+    values = {name: float(norm) for name, norm in norms.items()}
+    metrics = dict(grad_norm=math.hypot(*values.values()))
+    for name, norm in values.items():
+        metrics[name+'_grad_norm'] = norm
+        metrics[name+'_grad_clip_scale'] = min(1., limits[name]/(norm+1e-6)) if limits[name] else 1.
+    return metrics
+
+
 def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolerance=1.5,
                      confidence_weight=.5, ema_decay=.999, n_commit=None, compute_metrics=True,
-                     identity_weight=.5, identity_temperature=.1, candidate_weight=1., memory_probe_weight=.5):
+                     identity_weight=.5, identity_temperature=.1, candidate_weight=1., memory_probe_weight=.5,
+                     memory_grad_clip=MEMORY_GRAD_CLIP, rest_grad_clip=REST_GRAD_CLIP):
     """Equal weight per observed state, independent of microbatch boundaries.
 
     Within a state each loss averages over its known points; fully unknown
     states contribute zero. Geometry and confidence are evaluated in one pass.
+    Loss sums stay on the device until every microbatch is queued, so the host
+    synchronizes once per update rather than once per microbatch.
     """
     total = sum(len(b['hist']) for b in batches)
     if total < 1:
@@ -211,11 +273,11 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
             if 'identity_per_state' in terms:
                 identity_loss = terms['identity_per_state'].sum()/total
                 loss = loss + identity_weight*identity_loss
-                identity['identity_loss'] = identity.get('identity_loss', 0.)+identity_loss.detach().item()
+                accumulate(identity, 'identity_loss', identity_loss)
             if 'candidate_per_state' in terms:
                 candidate_loss = terms['candidate_per_state'].sum()/total
                 loss = loss+candidate_weight*candidate_loss
-                identity['candidate_loss'] = identity.get('candidate_loss', 0.)+candidate_loss.detach().item()
+                accumulate(identity, 'candidate_loss', candidate_loss)
             if 'memory_probe' in output and 'memory_target_identity' in batch:
                 probe = memory_probe_terms(output, batch)
                 identity_probe = probe['memory_identity_per_state'].sum()/total
@@ -223,9 +285,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 loss = loss+memory_probe_weight*(identity_probe+offset_probe)
                 for key, value in (('probe_identity_loss', identity_probe), ('probe_offset_loss', offset_probe),
                                    *((k.removeprefix('memory_'), v) for k, v in probe.items() if not k.endswith('_per_state'))):
-                    memory[key] = memory.get(key, 0.)+value.detach().item()
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f'Nonfinite loss at step {step}')
+                    accumulate(memory, key, value)
         loss.backward()
         if compute_metrics:
             decisions.extend(decision_rows(output, batch, model.cfg, n_commit, tolerance))
@@ -242,8 +302,8 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                         group[key] = group.get(key,0)+value
         for key in IDENTITY_SUMS:
             if key in terms:
-                identity[key] = identity.get(key, 0.)+terms[key].detach().item()
-        for key in ('presence_dropped', 'foreign_components', 'seed_present', 'identity_observable'):
+                accumulate(identity, key, terms[key])
+        for key in ('presence_dropped', 'blurred', 'foreign_components', 'seed_present', 'identity_observable'):
             if key in cpu:
                 identity[key] = identity.get(key, 0.)+float((cpu[key] > 0).sum())
         if 'decision_requested' in cpu:
@@ -257,15 +317,19 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 key = f'location_{name}'
                 identity[key] = identity.get(key, 0.)+float((cpu['location_source'] == index).sum())
         for key, value in (('loss', loss), ('geometry', geometry), ('confidence_loss', confidence)):
-            sums[key] += value.detach().item()
+            accumulate(sums, key, value)
         for key in ('error_sum', 'geometry_count', 'correct_count', 'confidence_count'):
-            sums[key] += terms[key].detach().item()
+            accumulate(sums, key, terms[key])
         if 'source' in cpu:
             for source in range(len(sources)):
                 sources[source] += int((cpu['source'] == source).sum())
             if 'bank_tail_length' in cpu:
                 bank_tails.extend(cpu['bank_tail_length'][cpu['source'] == 3].tolist())
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
+    resolve_device_sums(sums, identity, memory)
+    # The summed loss is finite only if every microbatch loss was; checked before any update.
+    if not math.isfinite(sums['loss']):
+        raise FloatingPointError(f'Nonfinite loss at step {step}')
+    sums.update(clip_training_gradients(model, memory_grad_clip, rest_grad_clip))
     opt.step()
     update_ema(ema, model, step, ema_decay)
     sums.update(error_mean=sums['error_sum']/max(1., sums['geometry_count']),
@@ -294,7 +358,7 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         identity['identity_loss_eligible'] = identity.get('identity_loss', 0.)*total/max(1., identity.get('identity_states', 0.))
         if 'candidate_loss' in identity:
             identity['candidate_loss_eligible'] = identity['candidate_loss']*total/max(1., identity.get('candidate_states', 0.))
-        for key in ('presence_dropped', 'foreign_components', 'seed_present', 'identity_observable', *(f'location_{n}' for n in LOCATION_SOURCES)):
+        for key in ('presence_dropped', 'blurred', 'foreign_components', 'seed_present', 'identity_observable', *(f'location_{n}' for n in LOCATION_SOURCES)):
             if key in identity:
                 identity[key+'_fraction'] = identity.pop(key)/total
         sums['identity'] = identity
@@ -328,6 +392,10 @@ def build_parser():
     ap.add_argument('--lr', type=float, default=3e-4)
     ap.add_argument('--warmup', type=int, default=500)
     ap.add_argument('--ema-decay', type=float, default=.999)
+    ap.add_argument('--memory-grad-clip', type=float, default=MEMORY_GRAD_CLIP,
+                    help='Gradient-norm limit for recurrent memory only; 0 disables clipping')
+    ap.add_argument('--rest-grad-clip', type=float, default=REST_GRAD_CLIP,
+                    help='Independent gradient-norm limit for all other parameters; 0 disables clipping')
     ap.add_argument('--confidence-weight', type=float, default=.5)
     ap.add_argument('--tolerance', type=float, default=1.5)
     ap.add_argument('--n-commit', type=int, default=4)
@@ -364,8 +432,9 @@ def build_parser():
     ap.add_argument('--decision-fraction', type=float, default=.25,
                     help='Fraction reserved for matched pairs with visible reference seeds')
     ap.add_argument('--candidate-weight', type=float, default=1., help='Weight of candidate prefix BCE through the existing confidence head')
+    ap.add_argument('--fresh-fraction', type=float, default=.5,
+                    help='Fresh share of non-pair draws; remainder split equally between fixed/recent replay; may change on resume')
     ap.add_argument('--embedding', type=int, default=32)
-    ap.add_argument('--negative-threshold', type=float, default=ComponentRule().threshold, help='Minimum interpolated presence for centerline pairs')
     ap.add_argument('--negative-bank', help='Shared live bank for InfoNCE negatives, wrong continuations and following supervision')
     ap.add_argument('--near-negative-bank', help='Additional bank of validated nearby negative relationships')
     ap.add_argument('--following-bank', help='Following path source (default: negative-bank)')
@@ -384,7 +453,12 @@ def build_parser():
                     help='Wrong-fiber tail range in trace voxels (default: 4 16)')
     ap.add_argument('--bank-following-probability', type=float, default=.1,
                     help='Fraction of fresh draws following validated bank paths (default: .1)')
-    ap.add_argument('--presence-dropout', type=float, default=.25, help='Probability of zeroing the presence crop')
+    ap.add_argument('--presence-dropout', type=float, default=.25,
+                    help='Probability of zeroing the presence crop; may be changed on resume')
+    ap.add_argument('--blur-probability', type=float, default=.25,
+                    help='Probability of shared CT/presence Gaussian blur; may be changed on resume')
+    ap.add_argument('--blur-sigma', type=float, nargs=2, default=(.5, 1.25), metavar=('MIN', 'MAX'),
+                    help='Gaussian blur sigma range in sampled crop voxels; may be changed on resume')
     ap.add_argument('--contacts', help='Mined contact episodes of the training fibers (oversampled)')
     ap.add_argument('--hard-spans', help='Hard controlled spans by fiber name (oversampled)')
     ap.add_argument('--contact-fraction', type=float, default=.2, help='Fresh draws near contact episodes')
@@ -426,6 +500,10 @@ def main(argv=None):
     progress(f'Starting training: device={args.device}, workers={args.workers}')
     if args.resume and args.init_tracer:
         raise ValueError('--init-tracer starts a new run and cannot be combined with --resume')
+    if any(not math.isfinite(v) or v < 0 for v in (args.memory_grad_clip, args.rest_grad_clip)):
+        raise ValueError('Gradient clipping limits must be finite and nonnegative (0 disables clipping)')
+    if not math.isfinite(args.fresh_fraction) or not 0 <= args.fresh_fraction <= 1:
+        raise ValueError('Fresh fraction must be finite and in [0, 1]')
     if min(args.steps, args.batch, args.microbatch, args.log_every, args.ckpt_every,
            args.threads, args.replay_keep, args.dagger_seeds, args.recovery_seeds) < 1 or args.batch % args.microbatch:
         raise ValueError('Positive counts required; microbatch must divide effective batch')
@@ -482,8 +560,9 @@ def main(argv=None):
     if args.memory_switch_probability and not cfg.memory_slots:
         raise ValueError('Memory-switch sequences require --memory-slots')
     identity_sampling = IdentitySampling(
-        rule=ComponentRule(threshold=args.negative_threshold,lateral_max=args.negative_lateral_max),
+        rule=ComponentRule(lateral_max=args.negative_lateral_max),
         presence_dropout=args.presence_dropout,contact_fraction=args.contact_fraction,
+        blur_probability=args.blur_probability,blur_sigma=args.blur_sigma,
         hard_span_fraction=args.hard_span_fraction,lateral_fraction=args.lateral_fraction,
         bank_wrong_continuation_probability=args.bank_wrong_continuation_probability,
         bank_wrong_continuation_tail=args.bank_wrong_continuation_tail,
@@ -543,7 +622,9 @@ def main(argv=None):
     if resume:
         ignored = {'resume','out_root','device','batch','microbatch','workers','threads','worker_cache_gb',
                    'log_every','ckpt_every','diag_every','dagger_device','compile','init_tracer',
-                   'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing'}
+                   'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
+                   'memory_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
+                   'decision_fraction','bank_following_probability','fresh_fraction'}
         defaults = build_parser()
         for key,value in vars(args).items():
             # Options added after a run started had their default behavior.
@@ -566,6 +647,7 @@ def main(argv=None):
         if resume and resume.get('monitor_recovery_sha256') != recovery_hash:
             raise ValueError('Monitor recovery fixture changed since checkpoint')
     progress('Initializing models and optimizer')
+    progress(f'Independent gradient clipping: memory={args.memory_grad_clip:g}, rest={args.rest_grad_clip:g} (0 disables clipping)')
     model = initialized if initialized is not None else DirectFollower(cfg).to(args.device, memory_format=conv_memory_format(args.device))
     ema = copy.deepcopy(model).requires_grad_(False).eval()
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -573,7 +655,7 @@ def main(argv=None):
     match_optimizer_layout(opt)
     # The compiled wrapper shares the module's parameters, so EMA updates, gradient
     # clipping and checkpoints keep using ``model``; only the training forward is compiled.
-    trainable = torch.compile(model) if args.compile and torch.device(args.device).type == 'cuda' else model
+    trainable = compile_training_model(model) if args.compile and torch.device(args.device).type == 'cuda' else model
     if args.compile and torch.device(args.device).type == 'cuda':
         progress('Compilation enabled; first forward/backward passes will compile lazily and may take several minutes')
     if done >= args.steps:
@@ -595,7 +677,7 @@ def main(argv=None):
         hard_spans=hard_spans,augment=True,negative_bank=negative_bank,**role_banks)
     dataset = FollowDataset(train_f, spec, sample, band, chunk=args.microbatch, seed=args.seed+done,
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), fixed=fixed, onpolicy=caches,
-        replay_index=str(collector.index), batch_builder=builder, additional_crops=())
+        replay_index=str(collector.index), batch_builder=builder, additional_crops=(), fresh_fraction=args.fresh_fraction)
     loader_args = dict(batch_size=None, num_workers=args.workers,
                        pin_memory=torch.device(args.device).type == 'cuda')
     if args.workers:
@@ -613,6 +695,7 @@ def main(argv=None):
             parameter_count=sum(p.numel() for p in model.parameters())), indent=2))
     log = RunLog(out/'log.jsonl', formatter=format_training_log)
     log.record(dict(step=done,event='identity_sampling',architecture=model.architecture,
+        source_sampling=dict(fresh=args.fresh_fraction,fixed=(1-args.fresh_fraction)/2,recent=(1-args.fresh_fraction)/2),
         pair_sampling_version=identity_sampling.pair_sampling_version,
         history_policy='learned_observation_memory' if cfg.memory_slots else 'visible_crop_only',sampling=asdict(identity_sampling),
         negative_bank_path=str(negative_bank.root),negative_bank_provenance=negative_bank.provenance(),
@@ -651,7 +734,8 @@ def main(argv=None):
                 tolerance=args.tolerance, confidence_weight=args.confidence_weight, ema_decay=args.ema_decay,
                 n_commit=args.n_commit, compute_metrics=step % args.log_every == 0 or step == args.steps,
                 identity_weight=args.identity_weight, identity_temperature=args.identity_temperature,
-                candidate_weight=args.candidate_weight, memory_probe_weight=args.memory_probe_weight)
+                candidate_weight=args.candidate_weight, memory_probe_weight=args.memory_probe_weight,
+                memory_grad_clip=args.memory_grad_clip, rest_grad_clip=args.rest_grad_clip)
             update_seconds = time.monotonic()-update_started
             interval_data_seconds += data_seconds
             interval_update_seconds += update_seconds

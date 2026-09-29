@@ -61,9 +61,8 @@ def test_bank_radius_keeps_supported_diagonals_and_rejects_crop_edge_patches():
     diagonal = rule.lateral_max/np.sqrt(2.)
     foreign = np.array([[-diagonal, -diagonal, 10.], [diagonal, diagonal, 10.],
                         [rule.lateral_max, 0., 10.], [9., 9., 10.]])
-    presence = np.ones((cfg.fine.depth, cfg.fine.width, cfg.fine.width), np.float32)
     _, positive_mask, negative, negative_mask = sample_pairs(
-        curve, presence, cfg.fine, foreign, np.full(len(foreign), 10), np.random.default_rng(0),
+        curve, cfg.fine, foreign, np.full(len(foreign), 10), np.random.default_rng(0),
         positives=1, negatives=4, forward=(10., 10.),
         margin=cfg.patch_radius, rule=rule)
     assert positive_mask.all() and negative_mask.sum() == 3
@@ -74,6 +73,13 @@ def test_bank_radius_keeps_supported_diagonals_and_rejects_crop_edge_patches():
     assert (corners >= bounds.min(0)).all() and (corners <= bounds.max(0)).all()
 
 
+
+
+def test_saved_presence_threshold_loads_without_reapplying():
+    saved = dict(rule=dict(threshold=.7, own_radius=1.5, lateral_max=32., along_window=2.), pair_sampling_version=4)
+    sampling = IdentitySampling(**saved)
+    assert sampling.rule == ComponentRule(lateral_max=32.)
+    assert not hasattr(sampling.rule, 'threshold')
 
 
 def tube(shape, crop, center, radius=.9, along=None):
@@ -88,8 +94,8 @@ def tube(shape, crop, center, radius=.9, along=None):
 def real_like_builder(cfg, fibers, augment, **kwargs):
     class EmptyBank:
         shard_count = 0
-        def candidates(self,item,crop,presence,rule,**kwargs):
-            return dict(foreign=np.zeros_like(presence,bool),local=np.empty((0,3)),nearest=np.empty(0,int),
+        def candidates(self,item,crop,rule,**kwargs):
+            return dict(foreign=np.zeros((crop.depth,crop.width,crop.width),bool),local=np.empty((0,3)),nearest=np.empty(0,int),
                         path_ids=np.empty(0,int),
                         counts=dict(foreign_components=0))
     return IdentityObservationBuilder(cfg, fibers, IdentitySampling(**kwargs), augment=augment,negative_bank=EmptyBank())

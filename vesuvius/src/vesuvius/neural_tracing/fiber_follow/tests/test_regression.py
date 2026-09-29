@@ -10,7 +10,7 @@ import torch
 from vesuvius.neural_tracing.fiber_follow.regression.model import DirectConfig, DirectFollower, feature_grid
 from vesuvius.neural_tracing.fiber_follow.regression.supervision import geometry_mask, loss_terms
 from vesuvius.neural_tracing.fiber_follow.regression.train import (
-    optimizer_update, save_checkpoint, load_checkpoint, validate_volume_source,
+    optimizer_update, save_checkpoint, load_checkpoint, validate_volume_source, clip_training_gradients,
 )
 from vesuvius.neural_tracing.fiber_follow.regression.data import image_crop
 from vesuvius.neural_tracing.fiber_follow.shared.data import FollowDataset, SampleConfig, ZBand, training_state_allowed
@@ -125,6 +125,109 @@ def test_microbatch_partition_keeps_objective_and_update():
         assert result['bank_wrong_continuation_tail_max'] == 128.
     for p, q in zip(a.parameters(), bmodel.parameters()):
         torch.testing.assert_close(p, q, rtol=2e-5, atol=2e-7)
+
+
+def test_optimizer_update_clips_requested_group_norm_and_logs_preclip_norm():
+    torch.manual_seed(43)
+    model = DirectFollower(config())
+    ema = copy.deepcopy(model)
+    opt = torch.optim.SGD(model.parameters(), lr=.001)
+    metrics = optimizer_update(model, ema, opt, [batch(model.cfg)], 1, .001,
+                               confidence_weight=10000., compute_metrics=False, rest_grad_clip=5.)
+    norm = torch.linalg.vector_norm(torch.stack([
+        p.grad.norm() for p in model.parameters() if p.grad is not None]))
+    assert metrics['grad_norm'] > 5.
+    assert float(norm) == pytest.approx(5., rel=1e-5)
+    assert metrics['rest_grad_clip_scale'] == pytest.approx(5./(metrics['grad_norm']+1e-6))
+    assert metrics['memory_grad_norm'] == 0.
+
+
+@pytest.mark.parametrize('compiled', [False, True])
+def test_memory_spike_cannot_scale_other_gradients(compiled):
+    model = torch.nn.Module()
+    model.recurrent_memory = torch.nn.Linear(2, 1, bias=False)
+    model.encoder = torch.nn.Linear(2, 1, bias=False)
+    memory, rest = model.recurrent_memory.weight, model.encoder.weight
+    memory.grad = torch.tensor([[3e6, 4e6]])
+    rest.grad = torch.tensor([[3., 4.]])
+    if compiled:
+        model = torch.compile(model, backend='eager')
+    metrics = clip_training_gradients(model, 5., 20.)
+    torch.testing.assert_close(memory.grad, torch.tensor([[3., 4.]]))
+    torch.testing.assert_close(rest.grad, torch.tensor([[3., 4.]]), rtol=0, atol=0)
+    assert metrics['memory_grad_norm'] == pytest.approx(5e6)
+    assert metrics['rest_grad_norm'] == 5.
+    assert metrics['memory_grad_clip_scale'] == pytest.approx(1e-6)
+    assert metrics['rest_grad_clip_scale'] == 1.
+
+
+def test_clipping_can_be_disabled_independently():
+    model = torch.nn.Module()
+    model.recurrent_memory = torch.nn.Linear(2, 1, bias=False)
+    model.encoder = torch.nn.Linear(2, 1, bias=False)
+    for memory_cap, rest_cap in [(0., 20.), (5., 0.)]:
+        model.recurrent_memory.weight.grad = torch.tensor([[30., 40.]])
+        model.encoder.weight.grad = torch.tensor([[30., 40.]])
+        result = clip_training_gradients(model, memory_cap, rest_cap)
+        assert model.recurrent_memory.weight.grad.norm().item() == pytest.approx(memory_cap or 50.)
+        assert model.encoder.weight.grad.norm().item() == pytest.approx(rest_cap or 50.)
+        assert result['memory_grad_norm'] == result['rest_grad_norm'] == 50.
+
+
+@pytest.mark.parametrize('bad_group', ['recurrent_memory', 'encoder'])
+@pytest.mark.parametrize('cap', [0., 5.])
+def test_nonfinite_gradients_raise_before_clipping_either_group(bad_group, cap):
+    model = torch.nn.Module()
+    model.recurrent_memory = torch.nn.Linear(2, 1, bias=False)
+    model.encoder = torch.nn.Linear(2, 1, bias=False)
+    for p in model.parameters():
+        p.grad = torch.full_like(p, 100.)
+    getattr(model, bad_group).weight.grad.fill_(float('inf'))
+    with pytest.raises(RuntimeError, match='non-finite'):
+        clip_training_gradients(model, cap, cap)
+    for name in ('recurrent_memory', 'encoder'):
+        if name != bad_group:
+            assert (getattr(model, name).weight.grad == 100.).all()
+
+
+@pytest.mark.parametrize('bad', [-1., float('nan'), float('inf')])
+def test_invalid_gradient_clip_limits_are_rejected(bad):
+    model = torch.nn.Linear(2, 1)
+    with pytest.raises(ValueError, match='finite and nonnegative'):
+        clip_training_gradients(model, bad, 20.)
+    with pytest.raises(ValueError, match='finite and nonnegative'):
+        clip_training_gradients(model, 5., bad)
+
+
+def test_nonfinite_microbatch_loss_raises_before_any_update():
+    """Loss sums are read once per update; a nonfinite microbatch still blocks the step."""
+    torch.manual_seed(4)
+    cfg = config()
+    model = DirectFollower(cfg)
+    data = batch(cfg, 2)
+    def take(value, sl):
+        return {k: take(v, sl) for k, v in value.items()} if isinstance(value, dict) else value[sl]
+    poisoned = take(data, slice(1, 2))
+    poisoned['x']['fine'] = torch.full_like(poisoned['x']['fine'], float('nan'))
+    before = copy.deepcopy(model.state_dict())
+    ema = copy.deepcopy(model)
+    with pytest.raises(FloatingPointError, match='Nonfinite loss at step 7'):
+        optimizer_update(model, ema, torch.optim.SGD(model.parameters(), lr=.1),
+                         [take(data, slice(0, 1)), poisoned], 7, .1)
+    for key, value in model.state_dict().items():
+        assert torch.equal(value, before[key])
+
+
+def test_training_compilation_emulates_eager_bf16_rounding(monkeypatch):
+    import torch._inductor.config
+    from vesuvius.neural_tracing.fiber_follow.regression.train import compile_training_model
+    monkeypatch.setattr(torch._inductor.config, 'emulate_precision_casts', False)
+    compiled = []
+    monkeypatch.setattr(torch, 'compile', lambda module, **kwargs: compiled.append((module, kwargs)) or 'compiled')
+    model = DirectFollower(config())
+    assert compile_training_model(model) == 'compiled'
+    assert compiled == [(model, {})]
+    assert torch._inductor.config.emulate_precision_casts
 
 
 def test_checkpoint_roundtrip_and_resume_optimizer_rng(tmp_path):

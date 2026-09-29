@@ -3,7 +3,6 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
-import torch
 
 from test_neighbor_bank import make_bank,add_shard,publish,item
 from vesuvius.neural_tracing.fiber_follow.regression.data import IdentityObservationBuilder,IdentitySampling
@@ -82,8 +81,7 @@ def test_separate_roles_supply_both_bands_without_changing_following_source(tmp_
         following_bank=near,sampling=IdentitySampling(rule=ComponentRule(lateral_max=32.),
             negative_near_fraction=.5,bank_following_probability=1.))
     state = item(cfg)
-    images={'fine':torch.ones(1,2,cfg.fine.depth,cfg.fine.width,cfg.fine.width)}
-    labels = builder.identity_targets([state],images)
+    labels = builder.identity_targets([state])
     assert labels['negative_mask'].all()
     assert (labels['negative_distance'][...,:4] <= 12).all()
     assert (labels['negative_distance'][...,4:] > 12).all()
@@ -101,8 +99,7 @@ def test_positive_bank_path_uses_annotated_parent_as_negative(tmp_path):
         sampling=IdentitySampling(rule=ComponentRule(lateral_max=32.)))
     state=following_sample(bank,clean_sample(cfg),np.random.default_rng(20))
     state=builder.prepare(state,state['supervision_fiber'],np.random.default_rng(21))
-    images={'fine':torch.ones(1,2,cfg.fine.depth,cfg.fine.width,cfg.fine.width)}
-    labels=builder.identity_targets([state],images)
+    labels=builder.identity_targets([state])
     assert labels['positive_mask'].all() and labels['negative_mask'].all()
     world=labels['identity_points'][0].numpy() @ state['frame'].T+state['pos']
     np.testing.assert_allclose(world[:4,0],24.,atol=1e-6)

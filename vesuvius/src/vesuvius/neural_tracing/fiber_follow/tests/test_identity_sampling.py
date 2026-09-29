@@ -16,16 +16,15 @@ def fixture(width=41):
     crop = CropSpec(depth=45, width=width, behind=8, spacing=.5)
     curve = np.c_[np.full(81, .13), np.full(81, -.17), np.linspace(-3.87, 12.13, 81)]
     foreign = curve+np.array([4.06,.04,0.])
-    presence = np.ones((crop.depth,crop.width,crop.width),np.float32)
-    return crop,curve,presence,foreign
+    return crop,curve,foreign
 
 
 def test_near_outer_slots_visit_distinct_paths_before_reusing_one():
-    crop,curve,presence,_ = fixture(width=129)
+    crop,curve,_ = fixture(width=129)
     lines = [curve+[x,0,0] for x in (4,6,8,10,16,18,20,22)]
     points = np.concatenate(lines)
     ids = np.repeat(np.arange(8),len(curve))
-    result = sample_pairs(curve,presence,crop,points,np.zeros(len(points)),np.random.default_rng(4),
+    result = sample_pairs(curve,crop,points,np.zeros(len(points)),np.random.default_rng(4),
         margin=0.,rule=ComponentRule(lateral_max=32.),path_ids=ids,near_fraction=.5,return_metadata=True)
     _,pm,_,nm,meta = result
     assert pm.all() and nm.all()
@@ -34,7 +33,7 @@ def test_near_outer_slots_visit_distinct_paths_before_reusing_one():
     for row in meta['negative_path_ids']:
         assert len(np.unique(row)) == 8
     # A missing band stays masked, even if the other band has surplus points.
-    _,_,_,nm,meta = sample_pairs(curve,presence,crop,points[ids>=4],np.zeros((ids>=4).sum()),
+    _,_,_,nm,meta = sample_pairs(curve,crop,points[ids>=4],np.zeros((ids>=4).sum()),
         np.random.default_rng(4),margin=0.,rule=ComponentRule(lateral_max=32.),path_ids=ids[ids>=4],
         near_fraction=.5,return_metadata=True)
     assert not nm[:,:4].any() and nm[:,4:].all()
@@ -97,10 +96,10 @@ def test_identity_source_and_distance_metrics_pool_across_microbatches():
 
 @pytest.mark.parametrize('width', [40, 41])
 def test_centerline_queries_are_not_displaced_and_keep_valid_support(width):
-    crop,curve,presence,foreign = fixture(width)
+    crop,curve,foreign = fixture(width)
     kwargs = dict(positives=4, negatives=8, margin=2., along_margin=1.)
-    result = sample_pairs(curve,presence,crop,foreign,np.arange(len(foreign)),np.random.default_rng(7),**kwargs)
-    repeated = sample_pairs(curve,presence,crop,foreign,np.arange(len(foreign)),np.random.default_rng(7),**kwargs)
+    result = sample_pairs(curve,crop,foreign,np.arange(len(foreign)),np.random.default_rng(7),**kwargs)
+    repeated = sample_pairs(curve,crop,foreign,np.arange(len(foreign)),np.random.default_rng(7),**kwargs)
     for a,b in zip(result,repeated):
         np.testing.assert_array_equal(a,b)
     pos,pm,neg,nm = result
@@ -114,17 +113,10 @@ def test_centerline_queries_are_not_displaced_and_keep_valid_support(width):
     assert np.all(neg[...,2] <= bounds[...,2].max()-1.)
 
 
-def test_same_presence_threshold_applies_to_positive_and_negative_queries():
-    crop,curve,presence,foreign = fixture()
-    presence.fill(.69)
-    _,pm,_,nm = sample_pairs(curve,presence,crop,foreign,np.arange(len(foreign)),np.random.default_rng(7))
-    assert not pm.any() and not nm.any()
-
-
 def test_missing_paths_and_receptive_field_exclusions_stay_unknown():
-    crop,curve,presence,foreign = fixture()
+    crop,curve,foreign = fixture()
     for points in (np.empty((0,3)),foreign+np.array([5.,0.,0.])):
-        _,pm,_,nm = sample_pairs(curve,presence,crop,points,np.empty(0,int),np.random.default_rng(7),margin=2.)
+        _,pm,_,nm = sample_pairs(curve,crop,points,np.empty(0,int),np.random.default_rng(7),margin=2.)
         assert pm.all() and not nm.any()
 
 

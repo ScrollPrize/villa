@@ -111,7 +111,7 @@ def test_evaluation_paths_are_available_only_in_explicit_evaluation_mode(tmp_pat
 def test_identity_supervision_and_training_cli_require_a_bank():
     builder = IdentityObservationBuilder(DirectConfig())
     with pytest.raises(ValueError,match='requires a negative bank'):
-        builder.identity_targets([], {})
+        builder.identity_targets([])
     from vesuvius.neural_tracing.fiber_follow.regression.train import main
     with pytest.raises(ValueError,match='requires --negative-bank'):
         main(['--name','unused','--fiber-zarrs','unused','--fibers','unused','--ct','unused',
@@ -179,15 +179,11 @@ def test_training_targets_stay_exactly_on_both_centerlines(tmp_path,reverse,angl
     rotation = np.array([[np.cos(angle),-np.sin(angle),0.],[np.sin(angle),np.cos(angle),0.],[0.,0.,1.]])
     state['frame'] = state['frame'] @ rotation
     state['identity_curve'] = state['identity_curve'] @ rotation
-    # Presence alone must not supply negatives before a validated path arrives.
-    images = {'fine':torch.ones(1,2,cfg.fine.depth,cfg.fine.width,cfg.fine.width)}
-    world = crop_local_grid(cfg.fine) @ state['frame'].T+state['pos']
-    tubes = ((abs(world[...,0]) < .85) | (abs(world[...,0]-6.) < .85)) & (abs(world[...,1]) < .85)
-    images['fine'][0,1] = torch.from_numpy(tubes.astype(np.float32))
-    empty = builder.identity_targets([state],images)
+    # No negatives before a validated path arrives.
+    empty = builder.identity_targets([state])
     assert not empty['negative_mask'].any() and not empty['foreign'].any()
     publish(tmp_path,[add_shard(tmp_path,0,x=6.13)])
-    result = builder.identity_targets([state],images)
+    result = builder.identity_targets([state])
     assert result['negative_mask'].any() and result['foreign'].any()
     k,m = builder.sampling.positives,builder.sampling.negatives
     positive = result['identity_points'][0,:k].numpy()
@@ -209,8 +205,7 @@ def test_bank_rasterization_marks_only_cells_containing_line_samples(tmp_path):
     bank,_ = make_bank(tmp_path,with_path=True)
     cfg = DirectConfig()
     state = item(cfg)
-    presence = np.ones((cfg.fine.depth,cfg.fine.width,cfg.fine.width),np.float32)
-    found = bank.candidates(state,cfg.fine,presence,ComponentRule())
+    found = bank.candidates(state,cfg.fine,ComponentRule())
     indices = np.rint(crop_indices(cfg.fine,found['local'])).astype(int)
     expected = np.zeros_like(found['foreign'])
     expected[tuple(indices.T)] = True
@@ -234,8 +229,7 @@ def test_foreign_cell_extent_cannot_reach_target_exclusion_tube(tmp_path):
     publish(tmp_path,[add_shard(tmp_path,0,x=3.)])
     cfg = DirectConfig()
     state = item(cfg)
-    presence = np.ones((cfg.fine.depth,cfg.fine.width,cfg.fine.width),np.float32)
-    found = bank.candidates(state,cfg.fine,presence,ComponentRule())
+    found = bank.candidates(state,cfg.fine,ComponentRule())
     grid = crop_local_grid(cfg.fine)[found['foreign']]
     world = grid @ state['frame'].T+state['pos']
     # The straight target is the z axis; evaluate the most adverse cell corner.

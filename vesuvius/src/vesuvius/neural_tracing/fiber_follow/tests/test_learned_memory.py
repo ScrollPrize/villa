@@ -51,6 +51,43 @@ def state_from(out):
     return {k.removeprefix('memory_'): v for k,v in out.items() if k.startswith('memory_')}
 
 
+@pytest.mark.parametrize('device', ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason='CUDA unavailable'))])
+@pytest.mark.parametrize('warm', [False, True])
+def test_observation_outputs_and_gradients_stay_fp32_under_autocast(device, warm):
+    torch.manual_seed(41)
+    cfg = memory_config(memory_steps=6, memory_grad_steps=3)
+    memory = LearnedMemory(cfg).to(device)
+    x = {k: v.to(device) for k, v in memory_batch(cfg)['x'].items()}
+    # Exercise low-precision inputs/carried state, not just FP32 loader tensors.
+    x = {k: v.bfloat16() if k.startswith('memory_') and v.is_floating_point() else v
+         for k, v in x.items()}
+    state = memory.initial_state(2, device) if warm else None
+    if state is not None:
+        state = {k: v.detach().bfloat16() if v.is_floating_point() else v for k, v in state.items()}
+    expected_x = {k: v.float() if v.is_floating_point() else v for k, v in x.items()}
+    expected_state = None if state is None else {
+        k: v.float() if v.is_floating_point() else v for k, v in state.items()}
+    expected = memory.observe(expected_x, expected_state)
+    (expected['probe'].square().mean()+expected['slots'].square().mean()).backward()
+    gradients = {n: p.grad.clone() for n, p in memory.named_parameters() if p.grad is not None}
+    assert gradients['patch_encoder.0.weight'].abs().sum() > 0
+    memory.zero_grad(set_to_none=True)
+    with torch.autocast(device, dtype=torch.bfloat16):
+        actual = memory.observe(x, state)
+        assert torch.is_autocast_enabled(device)  # the caller's context is restored
+    for key, value in actual.items():
+        if value.is_floating_point():
+            assert value.dtype == torch.float32
+        torch.testing.assert_close(value, expected[key])
+    (actual['probe'].square().mean()+actual['slots'].square().mean()).backward()
+    for name, param in memory.named_parameters():
+        if name in gradients:
+            torch.testing.assert_close(param.grad, gradients[name])
+        else:
+            assert param.grad is None
+
+
 def test_geometry_and_confidence_train_the_writer_and_old_observations():
     torch.manual_seed(25)
     cfg = memory_config()
@@ -70,6 +107,42 @@ def test_geometry_and_confidence_train_the_writer_and_old_observations():
                        model.recurrent_memory.patch_encoder[0]):
             assert module.weight.grad.abs().sum() > 0
         assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
+def test_compiled_bf16_memory_update_matches_eager_with_separate_clipping():
+    from vesuvius.neural_tracing.fiber_follow.regression.train import compile_training_model, conv_memory_format
+    torch.manual_seed(44)
+    cfg = memory_config(memory_steps=6, memory_grad_steps=3)
+    eager = open_read(DirectFollower(cfg)).to('cuda', memory_format=conv_memory_format('cuda'))
+    compiled_model = copy.deepcopy(eager)
+    data = memory_batch(cfg, 4)
+    count = cfg.memory_steps+1
+    data.update(memory_target_identity=torch.ones(4, count),
+                memory_target_identity_mask=torch.ones(4, count, dtype=torch.bool),
+                memory_target_offset=torch.zeros(4, count, 3),
+                memory_target_offset_mask=torch.ones(4, count, dtype=torch.bool))
+    data['memory_target_identity_mask'][:, :3] = False
+    data['memory_target_offset_mask'][:, :3] = False
+    data['candidate_points'] = torch.zeros(4, 2, cfg.n_future, 3)
+    data['candidate_points'][..., 2] = torch.arange(1, cfg.n_future+1)
+    data['candidate_mask'] = torch.ones(4, 2, cfg.n_future, dtype=torch.bool)
+    data['candidate_labels'] = torch.zeros(4, 2, cfg.n_future)
+    data['candidate_labels'][:, 0] = 1
+    results = []
+    for model in (eager, compile_training_model(compiled_model)):
+        results.append(optimizer_update(model, copy.deepcopy(eager),
+            torch.optim.SGD(model.parameters(), lr=0.), [data], 1, 0., device='cuda',
+            compute_metrics=False, memory_grad_clip=5., rest_grad_clip=20.))
+    assert results[1]['loss'] == pytest.approx(results[0]['loss'], rel=.02)
+    for prefix in ('recurrent_memory.', 'encoder.'):
+        vectors = [torch.cat([p.grad.flatten() for name, p in model.named_parameters()
+                             if name.startswith(prefix) and p.grad is not None])
+                   for model in (eager, compiled_model)]
+        assert vectors[0].norm() > 0
+        assert (vectors[1]-vectors[0]).norm()/vectors[0].norm() < .03
+    for result in results:
+        assert result['memory_grad_norm'] > 0 and result['rest_grad_norm'] > 0
 
 
 def test_seed_survives_later_updates_and_memory_changes_both_outputs():
