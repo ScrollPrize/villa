@@ -323,7 +323,8 @@ class IdentityObservationBuilder(ObservationBuilder):
         for _ in range(3):
             item = wrong_continuation(self.continuation_bank or self.negative_bank,sample_cfg,rng,
                                       tail_length_range=self.sampling.memory_switch_tail,prefer_long=True,
-                                      prefix_length=self.cfg.memory_steps*self.cfg.memory_stride,
+                                      prefix_length=(self.cfg.feature_stream_steps if self.cfg.memory_version == 4 and self.cfg.feature_memory_revision == 2
+                                                     else self.cfg.memory_steps)*self.cfg.memory_stride,
                                       track_stride=self.cfg.memory_stride)
             if item is not None:
                 item['location_source'] = LOCATION_SOURCES.index('memory_switch')

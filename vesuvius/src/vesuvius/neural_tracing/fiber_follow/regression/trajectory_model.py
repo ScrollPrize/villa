@@ -10,6 +10,7 @@ import math
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from .feature_memory import FeatureMemory
 from .model import DirectFollower, TRAJECTORY_MEMORY_ARCHITECTURE
@@ -22,6 +23,17 @@ class TrajectoryMemoryFollower(DirectFollower):
         super().__init__(replace(cfg, memory_version=2, recurrent_refinement_steps=0))
         self.cfg, self.architecture = cfg, TRAJECTORY_MEMORY_ARCHITECTURE
         self.recurrent_memory = FeatureMemory(cfg, self.encoder.token_xyz)
+        if cfg.feature_memory_revision == 2:
+            from .detailed_memory import DetailedFeatureMemory
+            self.recurrent_memory = DetailedFeatureMemory(cfg, self.encoder.token_xyz)
+            self.encoder_memory_gate = nn.Parameter(torch.tensor(-4.))
+            self.encoder_memory_projection = nn.Linear(cfg.hidden, cfg.hidden)
+            width = 27*(cfg.channels+1)+cfg.hidden+1+3
+            self.confidence_memory_query = nn.Sequential(nn.Linear(width, cfg.hidden), nn.LayerNorm(cfg.hidden))
+            self.confidence_memory_attention = nn.MultiheadAttention(cfg.hidden, cfg.heads, dropout=0., batch_first=True)
+            self.confidence_memory_head = nn.Sequential(nn.Linear(3*cfg.hidden, cfg.hidden), nn.SiLU(), nn.Linear(cfg.hidden, 1))
+            nn.init.zeros_(self.confidence_memory_head[-1].weight)
+            nn.init.zeros_(self.confidence_memory_head[-1].bias)
         if cfg.recurrent_refinement_steps:
             width = 27*(cfg.channels+1)+cfg.hidden+1+3
             self.refinement_fusion = nn.Sequential(nn.Linear(width, cfg.hidden), nn.SiLU(),
@@ -45,10 +57,12 @@ class TrajectoryMemoryFollower(DirectFollower):
             seed_x = x['feature_seed_x']
             empty = torch.zeros_like(hmask)
             seed_ctx = self.context(seed_x, torch.zeros_like(hist), empty)
-            memory = self.recurrent_memory.observe_features(seed_ctx['deep'], seed_x, memory)
+            memory, _ = self.observe_context(seed_ctx, seed_x, torch.zeros_like(hist), empty, memory)
         ctx = self.context(x, hist, hmask)
-        ctx['recurrent'] = self.recurrent_memory.observe_features(ctx['deep'], x, memory)
+        ctx['recurrent'], observation = self.observe_context(ctx, x, hist, hmask, memory)
         out = self.predict(ctx, hist, candidates)
+        if observation is not None:
+            out.update(observation_tokens=observation[0], observation_xyz=observation[1], observation_valid=observation[2])
         out.update({'memory_'+k: v for k, v in ctx['recurrent'].items()})
         out.update(reference_embedding=ctx['reference_embedding'], reference_mask=ctx['reference_mask'])
         if queries is not None:
@@ -59,11 +73,45 @@ class TrajectoryMemoryFollower(DirectFollower):
             out.update(query_embedding=F.normalize(self.embedding(values), dim=-1), query_support=support)
         return out
 
+    def observation_features(self, x, hist, hmask):
+        """Re-encode a selected replay crop without decoding or reading memory."""
+        ctx = self.context(x, hist, hmask)
+        return self.recurrent_memory.extract(ctx['deep'], ctx.get('fine_fp32', ctx['fine']), hist, hmask)
+
+    def observe_context(self, ctx, x, hist, hmask, memory):
+        if self.cfg.feature_memory_revision == 1:
+            return self.recurrent_memory.observe_features(ctx['deep'], x, memory), None
+        observation = self.recurrent_memory.extract(ctx['deep'], ctx.get('fine_fp32', ctx['fine']), hist, hmask)
+        state, retrieved = self.recurrent_memory.observe_tokens(*observation, x, memory)
+        # A coarse spatial read broadcasts identity context to the deep lattice.
+        # This avoids 39k queries over the entire historical cache. Stored
+        # observation features above remain independent of this conditioning.
+        n = self.recurrent_memory.coarse_count
+        condition = self.encoder_memory_projection(retrieved[:, :n].to(ctx['deep'].dtype))
+        condition = condition.transpose(1, 2).reshape(len(hist), self.cfg.hidden, *self.cfg.feature_memory_grid)
+        condition = F.interpolate(condition, size=ctx['deep'].shape[-3:], mode='trilinear', align_corners=False)
+        deep = ctx['deep']+self.encoder_memory_gate.sigmoid()*condition
+        image_count = deep.shape[2]*deep.shape[3]*deep.shape[4]
+        ctx['deep'] = deep
+        if 'deep_fp32' in ctx:
+            ctx['deep_fp32'] = deep.float()
+        ctx['memory'] = torch.cat((deep.flatten(2).transpose(1, 2), ctx['memory'][:, image_count:]), 1)
+        return state, observation
+
+    def memory_confidence(self, ctx, spatial, points):
+        query = self.confidence_memory_query(torch.cat((spatial, points/16.), -1))
+        tokens = ctx['identity_tokens'].to(query.dtype)
+        retrieved = self.confidence_memory_attention(query, tokens, tokens,
+            key_padding_mask=ctx['identity_padding'], need_weights=False)[0]
+        return self.confidence_memory_head(torch.cat((query, retrieved, query*retrieved), -1))[..., 0].float()
+
     def predict(self, ctx, hist, candidates=None):
         cfg, state = self.cfg, ctx['recurrent']
         # Express retained spatial evidence in the actual crop frame, including roll.
         query_state = dict(state, frame=ctx.get('query_frame', state['frame']))
         identity, identity_padding = self.recurrent_memory.read_tokens(query_state)
+        if cfg.feature_memory_revision == 2:
+            ctx.update(identity_tokens=identity, identity_padding=identity_padding)
         memory = torch.cat((ctx['memory'], identity.to(ctx['memory'].dtype)), 1)
         padding = torch.cat((ctx['padding'], identity_padding), 1)
 

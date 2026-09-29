@@ -64,6 +64,9 @@ class DirectConfig:
     trajectory_sequence_weight: float = 0.  # obsolete v4 prefix-reconstruction objective
     feature_memory_grid: tuple = (2, 4, 4)  # v4 spatial tokens per encoded crop
     feature_sequence_length: int = 2  # v4 decisions per gradient chunk
+    feature_detail_tokens: int = 16  # revision 2: fine neighborhoods along observed history
+    feature_stream_steps: int = 128  # revision 2: historical observations before endpoint
+    feature_replay_weight: float = .5  # revision 2: stratified endpoint replay objective
     feature_memory_revision: int = 1
     recurrent_refinement_steps: int = 0  # v4 shared-decoder passes after the initial proposal
     recurrent_refinement_limit: float = 1.  # maximum lateral update norm per pass
@@ -127,8 +130,14 @@ class DirectConfig:
                 raise ValueError('Feature memory grid requires three positive integers')
             if not isinstance(self.feature_sequence_length, int) or self.feature_sequence_length < 2:
                 raise ValueError('Feature sequence length must be at least two')
-            if self.feature_memory_revision != 1:
+            if self.feature_memory_revision not in (1, 2):
                 raise ValueError('Unsupported feature memory revision')
+            if not isinstance(self.feature_detail_tokens, int) or self.feature_detail_tokens < 1:
+                raise ValueError('Positive detail token count required')
+            if self.feature_memory_revision == 2 and (not isinstance(self.feature_stream_steps, int) or self.feature_stream_steps < self.memory_steps):
+                raise ValueError('Feature stream must cover at least the cache horizon')
+            if not math.isfinite(self.feature_replay_weight) or self.feature_replay_weight < 0:
+                raise ValueError('Nonnegative finite replay weight required')
 
     @property
     def sequence_weight(self):
@@ -510,7 +519,10 @@ class DirectFollower(nn.Module):
         c = self.cfg.channels
         centre = (len(self.path_stencil)//2)*(c+1)
         comparison = self.identity_evidence(ctx,spatial[...,centre:centre+c],spatial[...,centre+c].bool())
-        return self.confidence_head(torch.cat((prefix_mean,prefix_max,comparison),-1)).squeeze(-1).float()
+        logits = self.confidence_head(torch.cat((prefix_mean,prefix_max,comparison),-1)).squeeze(-1).float()
+        if 'identity_tokens' in ctx:
+            logits = logits+self.memory_confidence(ctx, spatial, points)
+        return logits
 
     def predict(self, ctx, hist, candidates=None):
         cfg = self.cfg

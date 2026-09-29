@@ -40,9 +40,17 @@ def upgrade_checkpoint(ck, steps=1, limit=1.):
         state = {**{k: fresh[k].clone() for k in new_names}, **ck[key]}
         model.load_state_dict(state, strict=True)
         upgraded[key] = state
+    upgraded['optimizer'] = remap_optimizer(ck['optimizer'], old, model)
+    upgraded['refinement_upgrade'] = dict(source_step=ck['step'], new_parameters=sorted(new_names),
+        recurrent_refinement_steps=steps, recurrent_refinement_limit=limit,
+        optimizer='existing moments retained by parameter name; new parameters start without moments')
+    return upgraded
+
+
+def remap_optimizer(optimizer_state, old, model):
     # The trainer uses one AdamW group. Parameter registration order can change
     # when modules are added; map saved moment IDs through the old model names.
-    optimizer = copy.deepcopy(ck['optimizer'])
+    optimizer = copy.deepcopy(optimizer_state)
     if len(optimizer['param_groups']) != 1:
         raise ValueError('Expected the trainer single AdamW parameter group')
     group = optimizer['param_groups'][0]
@@ -54,11 +62,7 @@ def upgrade_checkpoint(ck, steps=1, limit=1.):
     optimizer['state'] = {i: optimizer['state'][by_name[name]] for i, name in enumerate(new_order)
                           if name in by_name and by_name[name] in optimizer['state']}
     group['params'] = list(range(len(new_order)))
-    upgraded['optimizer'] = optimizer
-    upgraded['refinement_upgrade'] = dict(source_step=ck['step'], new_parameters=sorted(new_names),
-        recurrent_refinement_steps=steps, recurrent_refinement_limit=limit,
-        optimizer='existing moments retained by parameter name; new parameters start without moments')
-    return upgraded
+    return optimizer
 
 
 def options_argv(options):

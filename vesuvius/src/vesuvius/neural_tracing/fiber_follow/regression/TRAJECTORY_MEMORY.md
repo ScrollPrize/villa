@@ -327,3 +327,79 @@ PYTHONPATH=/home/sean/Documents/villa4/vesuvius/src \
   --checkpoint output/axial_feature_memory_v4_run2/ckpt_008000.pt \
   --passes 1 --out output/recurrent_refinement_validation/refined.json
 ```
+
+## Feature-memory revision 2 experiment
+
+Revision 1 remains the default and loads old checkpoints unchanged. Revision 2
+adds 16 fine-detail tokens to the existing 32 pooled tokens. Detail locations
+are the current head and evenly spaced visible observed history; absent history
+is padded and masked. Each detail token projects a 3x3 fine-feature neighborhood
+and a sampled deep feature. Positions, orientation, age and per-token validity
+are retained. No extra image encoder or volume crop is used.
+
+The writer retrieves from the incoming spatial cache, seed and slots before
+judging admission. Cache entries retain the predicted admission probability as
+metadata; low-confidence observations are still stored. A gated projection of
+the retrieved coarse tokens is interpolated onto the deep encoder lattice for
+decoding. This bounds the query cost to the 48 observation tokens instead of
+querying history separately from all 39,015 image tokens. The stored image
+features are extracted before this conditioning. Candidate confidence has its
+own spatial queries into persistent memory; candidates no longer depend only on
+the proposed trajectory's shared decoder tokens for historical comparison.
+
+Ordinary two-decision gradient chunks are retained. At each stream's end, an
+additional replay loss (weight 0.5 per endpoint, normalized by the update's
+ordinary crop count) replays its chronological writes at current weights.
+One historical encoder is selected uniformly within each available age band:
+1–4, 5–16, and 17–oldest. These crops and the endpoint are re-encoded, with
+activation checkpointing for the historical encoders. Other observations use
+detached features computed earlier by the training model. This is explicitly a
+selective, stale-feature approximation, not full-history or unbiased BPTT.
+All intervening writer transitions remain differentiable, including after the
+selected observation is evicted from the explicit cache. Replay endpoints are
+processed individually after ordinary chunk backward, limiting peak VRAM.
+
+Revision-2 streams allow 128 historical observations plus seed and endpoint.
+Memory-switch generators request a correspondingly longer original prefix.
+Existing replay histories may be shorter; no missing history is fabricated.
+Only selected raw crops are retained on the CPU, and other observations retain
+compact detached tensors. The replay archives and carried state are ephemeral:
+resuming starts fresh streams, as in revision 1.
+
+A stopped resumable revision-1 checkpoint can be migrated into a separate run:
+
+```bash
+python -m vesuvius.neural_tracing.fiber_follow.regression.upgrade_feature_memory \
+  --checkpoint output/OLD_RUN/ckpt_010000.pt --out output/NEW_RUN
+```
+
+Existing model/EMA tensors, AdamW moments by parameter name, RNG and learning-rate
+schedule are retained; new parameters have fresh moments. The immutable monitor
+fixture and published replay index are copied. This changes behavior and the
+training objective; it is not a behavior-preserving continuation. The generated
+`resume_argv.json` contains the complete trainer arguments. Migration never
+launches training.
+
+Controlled full-size GPU measurements (BF16 encoder/decoder, FP32 memory,
+effective batch 8, microbatch 4, two concurrent traces) use:
+
+```bash
+python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_feature_revision \
+  --checkpoint output/RUN/ckpt_010000.pt --out output/ordinary.json
+python -m vesuvius.neural_tracing.fiber_follow.regression.benchmark_feature_revision \
+  --checkpoint output/NEW_RUN/ckpt_010000.pt --replay-length 128 --out output/replay128.json
+```
+
+The latter measures one additional endpoint replay *every update*. Report it
+separately from ordinary updates; actual average cost depends on stream lengths
+and endpoint frequency. Both include clipping, AdamW and EMA, and exclude data
+loading. The fixed synthetic fixture includes candidate confidence but excludes
+contrastive identity loss. Warm-up/compilation is excluded from measured steps.
+
+For a bounded real-data fork, with per-step allocated/reserved VRAM and replay
+counts, use `regression.benchmark_feature_training --checkpoint ... --out ...
+--updates 80 --workers 2`. It preserves the source schedule, stops without
+crossing a checkpoint/evaluation/collector boundary, and saves the final tested
+weights/optimizer in the fresh output directory. Its sampling can differ across
+revisions because revision 2 supports longer streams; it is an integration and
+operational-cost check, not a matched-example accuracy experiment.

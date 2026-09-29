@@ -92,6 +92,7 @@ ARCHITECTURES = (ARCHITECTURE, MEMORY_ARCHITECTURE, MEMORY_ARCHITECTURE_V1,
                  SPATIAL_MEMORY_ARCHITECTURE, TRAJECTORY_MEMORY_ARCHITECTURE)
 ROUTE_OPTIONS = ('route_grid_step','route_transition_radius','route_transition_cost','route_loss_weight','route_sequence_weight')
 MEMORY_OPTIONS = ('memory_slots','memory_steps','memory_stride','memory_patch_size','memory_grad_steps')
+FEATURE_OPTIONS = ('feature_memory_revision', 'feature_detail_tokens', 'feature_stream_steps', 'feature_replay_weight')
 MEMORY_GRAD_CLIP = 5.
 REST_GRAD_CLIP = 20.
 
@@ -360,6 +361,8 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
                 output = model(batch['x'], batch['hist'], batch['hmask'], memory=carried, **queries)
                 if carried is not None:
                     stream_states.update(cpu, output, carried)
+                    if model.cfg.feature_memory_revision == 2 and model.cfg.feature_replay_weight:
+                        stream_states.replay.record(cpu, output)
                 terms = loss_terms(output, batch, model.cfg, tolerance, n_commit=n_commit,
                                    identity_temperature=identity_temperature)
                 geometry = terms['geometry_per_state'].sum()/total
@@ -444,6 +447,13 @@ def optimizer_update(model, ema, opt, batches, step, lr, *, device='cpu', tolera
         if chunk_losses:
             torch.stack(chunk_losses).sum().backward()
             stream_states.detach()
+            if model.cfg.feature_memory_revision == 2 and model.cfg.feature_replay_weight:
+                replay = stream_states.replay.backward(model, total, device=device, tolerance=tolerance,
+                    n_commit=n_commit, confidence_weight=confidence_weight,
+                    candidate_weight=candidate_weight, memory_probe_weight=memory_probe_weight)
+                for key, value in replay.items():
+                    sums[key] = sums.get(key, 0.)+value
+                sums['loss'] = sums['loss']+replay['replay_loss']
     resolve_device_sums(sums, identity, memory)
     # The summed loss is finite only if every microbatch loss was; checked before any update.
     if not math.isfinite(sums['loss']):
@@ -531,6 +541,9 @@ def build_parser():
                     help='Obsolete v4 prefix loss; must be zero for feature-memory streams')
     ap.add_argument('--feature-sequence-length', type=int, default=DirectConfig.feature_sequence_length,
                     help='V4 decisions per gradient chunk; microbatch counts crops across time and traces')
+    for name in FEATURE_OPTIONS:
+        default = getattr(DirectConfig, name)
+        ap.add_argument('--'+name.replace('_', '-'), type=type(default), default=default)
     ap.add_argument('--feature-memory-grid', type=int, nargs=3, default=DirectConfig.feature_memory_grid,
                     help='V4 pooled main-encoder spatial grid, depth height width')
     ap.add_argument('--route-grid-step', type=float, default=DirectConfig.route_grid_step)
@@ -545,7 +558,7 @@ def build_parser():
     ap.add_argument('--memory-steps', type=int, default=64,
                     help='Past observed patches unrolled before the supervised current decision')
     ap.add_argument('--memory-stride', type=int, default=4,
-                    help='Spacing of reconstructed historical observations in trace voxels')
+                    help='Spacing of reconstructed historical observations in trace voxels; may change on resume')
     ap.add_argument('--memory-patch-size', type=int, default=17,
                     help='V2/v3 odd raw memory-patch size; v4 reuses main-encoder features')
     ap.add_argument('--memory-grad-steps', type=int, default=32,
@@ -674,7 +687,7 @@ def main(argv=None):
                        feature_sequence_length=args.feature_sequence_length, feature_memory_grid=args.feature_memory_grid,
                        recurrent_refinement_steps=args.recurrent_refinement_steps,
                        recurrent_refinement_limit=args.recurrent_refinement_limit,
-                       **{k:getattr(args,k) for k in ROUTE_OPTIONS})
+                       **{k:getattr(args,k) for k in (*ROUTE_OPTIONS, *FEATURE_OPTIONS)})
     initialized = None
     resume = None
     if args.init_tracer:
@@ -709,7 +722,7 @@ def main(argv=None):
         if args.recurrent_refinement_steps and args.recurrent_refinement_steps != cfg.recurrent_refinement_steps:
             raise ValueError('Adding recurrent refinement to a checkpoint requires upgrade_refinement')
         for key in (*MEMORY_OPTIONS,'memory_version',*ROUTE_OPTIONS,'trajectory_sequence_weight',
-                    'feature_sequence_length','feature_memory_grid','recurrent_refinement_steps','recurrent_refinement_limit'):
+                    'feature_sequence_length','feature_memory_grid','recurrent_refinement_steps','recurrent_refinement_limit',*FEATURE_OPTIONS):
             setattr(args, key, getattr(cfg, key))
         if args.direction_inputs and not cfg.direction_inputs:
             initialized = add_direction_inputs(initialized)
@@ -718,7 +731,8 @@ def main(argv=None):
         args.direction_inputs = cfg.direction_inputs
     if args.resume:
         resume = read_checkpoint(args.resume,ARCHITECTURES,args.device)
-        cfg = checkpoint_config(resume)
+        # Sampling spacing changes no parameter shapes; use the requested value.
+        cfg = replace(checkpoint_config(resume), memory_stride=args.memory_stride)
         if args.direction_inputs != cfg.direction_inputs:
             raise ValueError('Resume direction inputs differ; use --init-tracer for a new direction-enabled run')
     cfg = resolve_refinement_config(cfg, args.route_refinement_radius)
@@ -808,7 +822,8 @@ def main(argv=None):
                    'log_every','ckpt_every','diag_every','dagger_device','compile','init_tracer',
                    'negative_bank_refresh_seconds','negative_bank_cache_mb','activation_checkpointing',
                    'memory_grad_clip','rest_grad_clip','presence_dropout','blur_probability','blur_sigma',
-                   'decision_fraction','bank_following_probability','fresh_fraction','route_refinement_radius'}
+                   'decision_fraction','bank_following_probability','fresh_fraction','route_refinement_radius',
+                   'n_commit','memory_stride'}  # Sampling/commit policy; bounds are checked above.
         if cfg.memory_version != 4:
             ignored.update(('trajectory_sequence_weight', 'feature_sequence_length', 'feature_memory_grid'))
         defaults = build_parser()
@@ -975,8 +990,9 @@ def main(argv=None):
                 elif resume and 'init_tracer_sha256' in resume:
                     extra['init_tracer_sha256'] = resume['init_tracer_sha256']
                     extra['init_tracer_path'] = resume.get('init_tracer_path')
-                if resume and 'refinement_upgrade' in resume:
-                    extra['refinement_upgrade'] = resume['refinement_upgrade']
+                for upgrade in ('refinement_upgrade', 'feature_memory_upgrade'):
+                    if resume and upgrade in resume:
+                        extra[upgrade] = resume[upgrade]
                 if resumable:
                     extra.update(optimizer=opt.state_dict(), rng=training_rng_state())
                 save_checkpoint(path, model, ema, spec, sample, extra)
